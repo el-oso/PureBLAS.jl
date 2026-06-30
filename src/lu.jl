@@ -129,7 +129,18 @@ function getrf!(A::StridedMatrix{Float64}, ipiv::Vector{Int}; nb::Int = _LU_NB)
         b = _LU_PAD[]
         (size(b, 1) < R || size(b, 2) < n) && (b = _LU_PAD[] = Matrix{Float64}(undef, R, n))
         Mw = view(b, 1:m, 1:n)
-        copyto!(Mw, A); (_, _, info) = _getrf_core!(Mw, ipiv, nb); copyto!(A, Mw)
+        ld = stride(A, 2); sz = sizeof(eltype(A))
+        info = GC.@preserve A b begin
+            pA = pointer(A); pB = pointer(b)
+            @inbounds for j in 0:n-1                       # contiguous per-column copy in (A → scratch)
+                unsafe_copyto!(pB + j * R * sz, pA + j * ld * sz, m)
+            end
+            (_, _, i3) = _getrf_core!(Mw, ipiv, nb)
+            @inbounds for j in 0:n-1                       # and back
+                unsafe_copyto!(pA + j * ld * sz, pB + j * R * sz, m)
+            end
+            i3
+        end
         return A, ipiv, info
     end
     return _getrf_core!(A, ipiv, nb)
