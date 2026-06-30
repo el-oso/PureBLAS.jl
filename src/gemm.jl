@@ -39,7 +39,7 @@ end
 # straight-line (literal indices — never index a tuple with a runtime var; that boxes/allocates).
 # The k loop stays a runtime loop; its body is fully unrolled over (MR vectors)×(NR cols).
 @generated function _microkernel!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{MR}, ::Val{NR}) where {T, MR, NR}
+        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)) where {T, MR, NR, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     # prefetch the C output tile (NR columns) so the cold read-modify-write at the end overlaps the
@@ -64,14 +64,13 @@ end
         end
     end
     push!(body.args, :(for p in 0:(kc - 1); $inner; end))
-    # store: C[:, j] += accumulators
+    # store: C[:, j] += accumulators  (B0 ⇒ overwrite: C[:, j] = accumulators, skip the C read)
     for j in 1:NR
         push!(body.args, :(colp = C + $(j - 1) * ldc * $sz))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
-            push!(body.args, :(let q = colp + $((mi - 1) * W * sz)
-                vstore(vload($V, q) + $cs, q)
-            end))
+            st = B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q))
+            push!(body.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
         end
     end
     push!(body.args, :(return nothing))
@@ -84,7 +83,7 @@ end
 # as the full kernel; far faster than the old scalar fallback (which tanked non-multiple sizes,
 # e.g. n=100 was 0.40× OpenBLAS).
 @generated function _microkernel_masked!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        mre::Int, nre::Int, ::Val{MR}, ::Val{NR}) where {T, MR, NR}
+        mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)) where {T, MR, NR, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)
@@ -112,9 +111,8 @@ end
         push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j); mk = Symbol(:msk, mi)
-            push!(stores.args, :(let q = colp + $((mi - 1) * W * sz)
-                vstore(vload($V, q, $mk) + $cs, q, $mk)
-            end))
+            st = B0 ? :(vstore($cs, q, $mk)) : :(vstore(vload($V, q, $mk) + $cs, q, $mk))
+            push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
         end
         push!(body.args, :(if $(j - 1) < nre; $stores; end))
     end
