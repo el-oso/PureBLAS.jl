@@ -1,0 +1,18 @@
+[deps]
+AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PureBLAS = "cc9e14db-574f-4602-bf53-1167cc4b26d2"
+ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
+StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
+
+[sources]
+StrictMode = {rev = "master", url = "https://github.com/el-oso/StrictMode.jl"}
+
+[preferences.StrictMode]
+analysis = "full"
+checks_enabled = true
+fail_mode = "error"

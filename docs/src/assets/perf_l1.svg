@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" font-family="sans-serif">
+<rect width="900" height="420" fill="white"/>
+<text x="450.0" y="28" text-anchor="middle" font-size="18" font-weight="bold">BLAS-1: PureBLAS / OpenBLAS (Zen4, 1 thread, Float64)</text>
+<line x1="60" y1="350.0" x2="880" y2="350.0" stroke="#eee"/>
+<text x="52" y="354.0" text-anchor="end" font-size="11" fill="#666">0×</text>
+<line x1="60" y1="325.2229208125682" x2="880" y2="325.2229208125682" stroke="#eee"/>
+<text x="52" y="329.2229208125682" text-anchor="end" font-size="11" fill="#666">0.5×</text>
+<line x1="60" y1="300.4458416251364" x2="880" y2="300.4458416251364" stroke="#eee"/>
+<text x="52" y="304.4458416251364" text-anchor="end" font-size="11" fill="#666">1×</text>
+<line x1="60" y1="275.6687624377046" x2="880" y2="275.6687624377046" stroke="#eee"/>
+<text x="52" y="279.6687624377046" text-anchor="end" font-size="11" fill="#666">1.5×</text>
+<line x1="60" y1="300.4458416251364" x2="880" y2="300.4458416251364" stroke="#888" stroke-width="1"/>
+<line x1="60" y1="302.4280079601309" x2="880" y2="302.4280079601309" stroke="#d33" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="880" y="297.4280079601309" text-anchor="end" font-size="11" fill="#d33">0.96× gate</text>
+<rect x="87.33333333333331" y="300.48261918636854" width="81.99999999999999" height="49.51738081363146" fill="#2a8" opacity="0.85"/>
+<line x1="87.33333333333331" y1="301.81307289523943" x2="169.33333333333331" y2="301.81307289523943" stroke="#114" stroke-width="2"/>
+<text x="128.33333333333331" y="295.48261918636854" text-anchor="middle" font-size="11">1.00</text>
+<text x="128.33333333333331" y="368" text-anchor="middle" font-size="12">axpy</text>
+<rect x="224.0" y="300.00213137431535" width="81.99999999999999" height="49.997868625684646" fill="#2a8" opacity="0.85"/>
+<line x1="224.0" y1="300.7616957778804" x2="306.0" y2="300.7616957778804" stroke="#114" stroke-width="2"/>
+<text x="265.0" y="295.00213137431535" text-anchor="middle" font-size="11">1.01</text>
+<text x="265.0" y="368" text-anchor="middle" font-size="12">dot</text>
+<rect x="360.66666666666663" y="72.22222222222226" width="81.99999999999999" height="277.7777777777777" fill="#2a8" opacity="0.85"/>
+<line x1="360.66666666666663" y1="129.49069574982377" x2="442.66666666666663" y2="129.49069574982377" stroke="#114" stroke-width="2"/>
+<text x="401.66666666666663" y="67.22222222222226" text-anchor="middle" font-size="11">5.61</text>
+<text x="401.66666666666663" y="368" text-anchor="middle" font-size="12">nrm2</text>
+<rect x="497.33333333333326" y="296.11392769981137" width="81.99999999999999" height="53.88607230018863" fill="#2a8" opacity="0.85"/>
+<line x1="497.33333333333326" y1="301.45395138868145" x2="579.3333333333333" y2="301.45395138868145" stroke="#114" stroke-width="2"/>
+<text x="538.3333333333333" y="291.11392769981137" text-anchor="middle" font-size="11">1.09</text>
+<text x="538.3333333333333" y="368" text-anchor="middle" font-size="12">asum</text>
+<rect x="634.0" y="296.8360012023186" width="81.99999999999999" height="53.163998797681415" fill="#2a8" opacity="0.85"/>
+<line x1="634.0" y1="299.3488475739936" x2="716.0" y2="299.3488475739936" stroke="#114" stroke-width="2"/>
+<text x="675.0" y="291.8360012023186" text-anchor="middle" font-size="11">1.07</text>
+<text x="675.0" y="368" text-anchor="middle" font-size="12">scal</text>
+<rect x="770.6666666666666" y="281.6929100724201" width="81.99999999999999" height="68.30708992757991" fill="#2a8" opacity="0.85"/>
+<line x1="770.6666666666666" y1="290.8221036196934" x2="852.6666666666666" y2="290.8221036196934" stroke="#114" stroke-width="2"/>
+<text x="811.6666666666666" y="276.6929100724201" text-anchor="middle" font-size="11">1.38</text>
+<text x="811.6666666666666" y="368" text-anchor="middle" font-size="12">iamax</text>
+<text x="450.0" y="408" text-anchor="middle" font-size="11" fill="#666">bar = geomean ratio · dark tick = worst size · green = all sizes ≥ gate</text>
+</svg>
