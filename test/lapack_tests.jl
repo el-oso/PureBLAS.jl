@@ -3,7 +3,7 @@
     spd(T, n) = (M = randn(T, n, n); M * M' + n * I)
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 50
     @testset "$T n=$n" for T in (Float32, Float64),
-        n in (1, 2, 5, 31, 96, 256, 512, 513, 700, 1025)
+        n in (1, 2, 5, 31, 96, 256, 512, 513, 700, 1025, 1536, 2049)
 
         A = Matrix{T}(spd(T, n)); F = cholesky(A)              # LAPACK reference
         L = PureBLAS.potrf!(copy(A); uplo = 'L')
