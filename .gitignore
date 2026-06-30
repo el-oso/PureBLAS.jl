@@ -1,0 +1,21 @@
+# Julia
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+
+# Compiled artifacts (juliac --trim output)
+*.so
+*.dylib
+*.dll
+juliac/build/
+
+# Documenter / DocumenterVitepress / Node
+docs/build/
+**/.documenter/
+node_modules/
+package-lock.json
+.vitepress/cache/
+.vitepress/dist/
+
+.DS_Store
