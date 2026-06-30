@@ -289,7 +289,20 @@ the two big gemms (Y=TᵀW tiny → scalar). **Skipped faer's bespoke packed BLI
 microkernel entirely — PureBLAS has a gemm** → far less code, gates+beats dgeqrf. Float64 only (faer
 kernels Float64-specific); generic/AD QR deferred. n=768 borderline (0.962, noise). kb: `pureblas-qr`.
 
-### (historical) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
+## LAPACK — LU (getrf) — CORRECT; ⚠ PERF ~0.90–0.99, not fully gated at large n (2026-06-30)
+`src/lu.jl`. **BlazingPorts has no LU source** (only bench JSONs) → from scratch, but blocked
+right-looking = LAPACK dgetrf's own algorithm + PureBLAS trsm!/gemm!. Correct: matches LAPACK exactly
+(factor + ipiv), P·A=L·U ~1e-14, suite 7085/7085. **Big win: `_laswp!` loop order (cols-outer/pivots-inner,
+= dlaswp) cut row-swaps 108→18ms.** **DISPROVEN: faer-style recursive LU** (over-decomposes into many small
+gemm! calls — 0.83 vs blocked 0.89 @2048). nb=48 optimum; **gates n≤1024 (0.99) but ~0.90 @n≥2048** — the
+small-rank (nb) trailing gemm + irreducible pivot/panel/laswp overhead cap it (LU gets *harder* with n,
+unlike Cholesky/QR). To gate: faster small-rank gemm, panel cache-residence (à la Cholesky), or a fused
+recursive base. kb: `pureblas-lu`.
+## LAPACK — SVD — NOT STARTED (no BlazingPorts source; large from-scratch effort)
+Bidiagonalization (two-sided Householder) + iterative (implicit-QR / divide-and-conquer) + singular
+vectors. Weeks of work, not a port. Needs a scope decision before starting.
+
+### (historical, Cholesky) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
 First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
 factor A11, trsm the off-diagonal panel, syrk-downdate the trailing, recurse; unblocked `potf2` base
 (≤`_POTRF_BASE`=512, vectorized inner loop). Lower (L·Lᵀ) + upper (Uᵀ·U). **Generic over real T →
