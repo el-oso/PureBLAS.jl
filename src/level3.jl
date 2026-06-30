@@ -229,9 +229,8 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
                 _pack_B!(Bpf, B, pc, jc, kce, nce, false, nr, pb * bpf_blk)
                 pc += kc; pb += 1
             end
-            _scale_C!(view(B, 1:m, (jc + 1):(jc + nce)), m, nce, zero(T))   # Phase 2: zero the panel
-            pc = 0; pb = 0                                       # Phase 3: compute from Bpf
-            while pc < m
+            pc = 0; pb = 0                                       # Phase 2: compute from Bpf (no zero pass:
+            while pc < m                                          # each tile's FIRST contribution overwrites)
                 kce = min(kc, m - pc)
                 ic = 0
                 while ic < m
@@ -249,13 +248,18 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
                                 plo = stored ? 0 : (packed_upper ? max(0, r0 - pc) : 0)
                                 cnt = stored ? kce : (packed_upper ? kce - plo : min(kce, r0 + mre - pc))
                                 if cnt > 0
+                                    # this pc-block is the tile's FIRST contribution → overwrite (β=0),
+                                    # no zero pass + no C read. upper: first block = div(r0,kc); lower: pb 0.
+                                    ow = packed_upper ? (pb == div(r0, kc)) : (pb == 0)
                                     Apanel = App + (div(ir, mr) * mr * kce + plo * mr) * sz
                                     Bpanel = Bfp + (pb * bpf_blk + div(jr, nr) * nr * kce + plo * nr) * sz
-                                    Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
+                                    Cblk = Ptr{T}(Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz)
                                     if mre == mr && nre == nr
-                                        _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR))
+                                        ow ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR), Val(true)) :
+                                             _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR), Val(false))
                                     else
-                                        _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, mre, nre, Val(MRV), Val(_NR))
+                                        ow ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, mre, nre, Val(MRV), Val(_NR), Val(true)) :
+                                             _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, mre, nre, Val(MRV), Val(_NR), Val(false))
                                     end
                                 end
                                 ir += mr
