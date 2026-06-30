@@ -269,7 +269,18 @@ k=1024/1536/2048 all variants) and all other L3 routines gate. The benches there
   resident k, like gemm's `_use_unpacked` ≤448 path) — the most promising untried angle for small-k; or a
   cheaper/faster transpose pack. Reference: kb finding `pureblas-l3-syrk-syr2k-symm`.
 
-## LAPACK — Cholesky (potrf) — CORRECT + AD done (2026-06-30); PERF NOT yet gated
+## LAPACK — Cholesky (potrf) — ✅ CORRECT + AD + GATED (2026-06-30)
+**Float64 lower GATES: 0.985–1.12× LAPACK dpotrf across n=512–3072** (suite 7043/7043, relerr ~1e-15).
+The unlock was porting **faer 0.24.1's Cholesky** (el-oso/BlazingPorts.jl `src/Factorizations.jl`) onto
+PureBLAS's SIMD.jl layer: custom register-blocked kernels (left-looking base, fused trsm NB=4, fused syrk
+3×4=12 accs) — no packing overhead → fast at the small Cholesky block sizes where the generic recursion
+(below, maxed ~0.81) lost. Pure faer faded at large n (un-cache-blocked syrk re-streams), so a **hybrid**:
+halve, big off-diagonal via PureBLAS's cache-blocked `trsm!`/`syrk!`, faer kernels as the base (≤1024).
+Pad on `stride%512==0` (L1 set-aliasing; faer's `ispow2` missed 1536/2560). Float64 lower fast path;
+Float32/complex/Dual/upper keep the generic AD-traceable recursion. kb: `pureblas-cholesky`. Lesson: a
+faithful proven-fast port beat incremental tuning of the generic version. Below = the historical journey.
+
+### (historical) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
 First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
 factor A11, trsm the off-diagonal panel, syrk-downdate the trailing, recurse; unblocked `potf2` base
 (≤`_POTRF_BASE`=512, vectorized inner loop). Lower (L·Lᵀ) + upper (Uᵀ·U). **Generic over real T →
