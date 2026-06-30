@@ -8,9 +8,13 @@ const _LU_NB = 48       # blocked panel width (measured optimum on Zen4: small n
 
 # Unblocked panel LU with partial pivoting (LAPACK dgetf2) on an mp×pb panel whose rows are global
 # (offset roff). Fills ipiv[ioff+1 : ioff+pb] with GLOBAL 1-based pivot rows. Returns the first
-# zero-pivot global column (0 if none). Column-indexed so the inner loops auto-vectorize (columns
-# contiguous). Pivoting is a correctness boundary — do not simplify.
+# zero-pivot global column. Float64 contiguous-column panel → SIMD via PureBLAS's layer (vectorized
+# column scale + rank-1 update over contiguous rows; scalar argmax); else the generic fallback.
+# Pivoting is a correctness boundary — do not simplify.
 function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
+    if A isa StridedMatrix{Float64} && stride(A, 1) == 1
+        return GC.@preserve A _getf2_simd!(pointer(A), stride(A, 2), mp, pb, roff, ipiv, ioff)
+    end
     info = 0
     @inbounds for jl in 1:pb
         piv = jl; pmax = abs(A[jl, jl])                  # partial pivot: max |·| in column jl, rows jl:mp
@@ -37,20 +41,80 @@ function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     return info
 end
 
-# Apply row interchanges ipiv[k1:k2] to columns j1:j2 (LAPACK dlaswp), in sequence. Column-OUTER /
-# pivot-inner: each (contiguous) column gets all its swaps while resident → the matrix is streamed once,
-# not once per pivot (the row-outer order was the whole gap — strided, ~pb× the memory traffic).
+# SIMD panel (Float64, ld-strided columns, p = &panel[1,1]). Same math as above, vectorized over rows.
+function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
+    info = 0
+    @inbounds for jl in 1:pb
+        piv = jl; pmax = abs(unsafe_load(p, _clidx(jl, jl, ld)))      # argmax |·| in column jl, rows jl:mp
+        for il in (jl + 1):mp
+            a = abs(unsafe_load(p, _clidx(il, jl, ld))); a > pmax && (pmax = a; piv = il)
+        end
+        ipiv[ioff + jl] = roff + piv
+        d = unsafe_load(p, _clidx(piv, jl, ld))
+        if d != 0.0
+            if piv != jl                                              # swap rows jl ↔ piv across the panel
+                for jc in 1:pb
+                    a = unsafe_load(p, _clidx(jl, jc, ld))
+                    unsafe_store!(p, unsafe_load(p, _clidx(piv, jc, ld)), _clidx(jl, jc, ld))
+                    unsafe_store!(p, a, _clidx(piv, jc, ld))
+                end
+            end
+            invd = 1.0 / unsafe_load(p, _clidx(jl, jl, ld)); vinv = _CVF(invd)
+            i = jl + 1                                                # scale column below the diagonal
+            while i + _CHOLW - 1 <= mp
+                b = _cvptr(p, i, jl, ld); vstore(vload(_CVF, b) * vinv, b); i += _CHOLW
+            end
+            while i <= mp; unsafe_store!(p, unsafe_load(p, _clidx(i, jl, ld)) * invd, _clidx(i, jl, ld)); i += 1; end
+        elseif info == 0
+            info = roff + jl
+        end
+        for jc in (jl + 1):pb                                         # rank-1 update of the panel trailing
+            ajc = -unsafe_load(p, _clidx(jl, jc, ld)); vajc = _CVF(ajc)
+            i = jl + 1
+            while i + _CHOLW - 1 <= mp
+                bj = _cvptr(p, i, jc, ld)
+                vstore(muladd(vajc, vload(_CVF, _cvptr(p, i, jl, ld)), vload(_CVF, bj)), bj); i += _CHOLW
+            end
+            while i <= mp; unsafe_store!(p, muladd(ajc, unsafe_load(p, _clidx(i, jl, ld)), unsafe_load(p, _clidx(i, jc, ld))), _clidx(i, jc, ld)); i += 1; end
+        end
+    end
+    return info
+end
+
+# Apply row interchanges ipiv[k1:k2] to columns j1:j2 (LAPACK dlaswp), in sequence. Size-adaptive:
+# small m → column-outer (each contiguous column is L1-resident through all its swaps); large m → 32-col
+# blocked, pivots inner (each block ≤½ L2, pivot index/branch hoisted across it). Measured: small n wants
+# column-outer, large n wants blocked.
 function _laswp!(A, ipiv, k1::Int, k2::Int, j1::Int, j2::Int)
     j1 > j2 && return
-    @inbounds for j in j1:j2
-        for i in k1:k2
-            ip = ipiv[i]
-            if ip != i
-                A[i, j], A[ip, j] = A[ip, j], A[i, j]
+    if size(A, 1) < 1024
+        @inbounds for j in j1:j2
+            for i in k1:k2
+                ip = ipiv[i]
+                if ip != i
+                    A[i, j], A[ip, j] = A[ip, j], A[i, j]
+                end
+            end
+        end
+    else
+        @inbounds for jb in j1:32:j2
+            je = min(jb + 31, j2)
+            for i in k1:k2
+                ip = ipiv[i]
+                if ip != i
+                    for j in jb:je
+                        A[i, j], A[ip, j] = A[ip, j], A[i, j]
+                    end
+                end
             end
         end
     end
 end
+
+# Reusable padded scratch (like Cholesky): a po2 / stride%512==0 leading dim aliases cache sets, slowing
+# the panel + laswp at large n; factor in an ld=m+8 buffer and copy back.
+const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
+@inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
 # which over-decomposes into many small gemm! calls). Factor each nb-panel (getf2), swap the rest of the
@@ -60,6 +124,19 @@ function getrf!(A::StridedMatrix{Float64}, ipiv::Vector{Int}; nb::Int = _LU_NB)
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
+    if _lu_needs_pad(A, m)                                # factor in a non-conflicting (ld=m+8) scratch
+        R = m + 8
+        b = _LU_PAD[]
+        (size(b, 1) < R || size(b, 2) < n) && (b = _LU_PAD[] = Matrix{Float64}(undef, R, n))
+        Mw = view(b, 1:m, 1:n)
+        copyto!(Mw, A); (_, _, info) = _getrf_core!(Mw, ipiv, nb); copyto!(A, Mw)
+        return A, ipiv, info
+    end
+    return _getrf_core!(A, ipiv, nb)
+end
+
+function _getrf_core!(A, ipiv, nb::Int)
+    m, n = size(A); k = min(m, n)
     nb = clamp(nb, 1, k)
     info = 0; pc = 1
     @inbounds while pc <= k
