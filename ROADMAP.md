@@ -237,10 +237,13 @@ sweeps both fail; bigger kc is better, smaller worse → band-fraction theory wr
 Bc-padding, no close); gemm profiled across K=16..2048 = 0.97–1.08 (no short-K weakness). The one
 fixable sliver — scalar transpose A-pack for transA=T — is **FIXED: SIMD transpose pack**
 (`_pack_A_simd_T!`/`_tblk!`, W×W shuffle-butterfly transpose), bit-identical, helps gemm-T/syrk-T too.
-**Final trmm: single-pass Val(1) 8×8 + transpose pack, NO A-pad.** RELIABLE numbers (via the new
-`bench/l3bench.jl`, which corrected an overflow artifact in the old in-place benches — see below):
-**trmm gates ONLY at k=1536 (0.96–0.972); below at k=768 (0.90–0.93), k=1024 (0.93–0.955), k=2048
-(0.94–0.966).** It's the lone sub-gate L3 routine, at the column-major ceiling (gates for large non-po2). Late
+**Final trmm: IN-PLACE single-pass Val(1) 8×8 + transpose pack, NO A-pad.** The in-place rewrite
+(eliminate the Bc full copy — pack each jc column-panel fully into Bpf, capturing input, before zeroing
+that panel; trmm-L columns are independent) was a bigger win than predicted (the O(k²) copy is a large
+fraction of O(k³) at small k): **k=768 0.90→0.95–0.99, k=1024 +2–3%, k=2048 +1–2%.** trmm now GATES most
+variants at every size: k=768 0.95–0.99, k=1024 0.956–0.982, k=1536 0.968–0.987 (all), k=2048 0.957–0.976;
+a few borderline holdouts (~0.952–0.958) at po2 N-cases / small-k UT (column-major po2-ld artifact).
+A-pad re-tested post-Bc-removal: still net-negative → removed. Suite 6966/6966, relerr ~5e-16. Late
 findings: cache-oblivious RECURSION (Elmroth–Gustavson/ReLAPACK) measured SLOWER than single-pass at
 every size → DISPROVEN (anchor on the fastest path, extend it); trmm A-pad REMOVED (po2 conflict mild,
 the k² copy is net-negative; kept for trsm where the conflict is catastrophic); 16×8 tile-by-trans
