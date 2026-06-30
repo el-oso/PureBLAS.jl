@@ -289,15 +289,17 @@ the two big gemms (Y=TᵀW tiny → scalar). **Skipped faer's bespoke packed BLI
 microkernel entirely — PureBLAS has a gemm** → far less code, gates+beats dgeqrf. Float64 only (faer
 kernels Float64-specific); generic/AD QR deferred. n=768 borderline (0.962, noise). kb: `pureblas-qr`.
 
-## LAPACK — LU (getrf) — CORRECT; ⚠ PERF ~0.90–0.99, not fully gated at large n (2026-06-30)
+## LAPACK — LU (getrf) — CORRECT; GATES 768–2048 (0.97–1.06×); 512/3072 residual (2026-06-30)
 `src/lu.jl`. **BlazingPorts has no LU source** (only bench JSONs) → from scratch, but blocked
 right-looking = LAPACK dgetrf's own algorithm + PureBLAS trsm!/gemm!. Correct: matches LAPACK exactly
-(factor + ipiv), P·A=L·U ~1e-14, suite 7085/7085. **Big win: `_laswp!` loop order (cols-outer/pivots-inner,
-= dlaswp) cut row-swaps 108→18ms.** **DISPROVEN: faer-style recursive LU** (over-decomposes into many small
-gemm! calls — 0.83 vs blocked 0.89 @2048). nb=48 optimum; **gates n≤1024 (0.99) but ~0.90 @n≥2048** — the
-small-rank (nb) trailing gemm + irreducible pivot/panel/laswp overhead cap it (LU gets *harder* with n,
-unlike Cholesky/QR). To gate: faster small-rank gemm, panel cache-residence (à la Cholesky), or a fused
-recursive base. kb: `pureblas-lu`.
+(factor + ipiv), P·A=L·U ~1e-14, suite 7085/7085. **Ground to gate the mid-large range** (don't-guess-check:
+our gemm at the trailing shape AND trsm at the panel shape both BEAT OpenBLAS 1.0–1.5×, so the bulk is
+optimal — the gap was small components): (1) **laswp loop order** cols-outer/pivots-inner 108→18ms;
+(2) **size-adaptive laswp** (small m column-outer / large m 32-col blocked) recovered 768 + gated 1024–2048;
+(3) **po2/stride%512 padding** (+0.05 @2048/3072, cache aliasing). SIMD panel: no help (memory-bound, as is
+dgetf2). nb=48. **DISPROVEN: faer-style recursive LU** (over-decomposes → many small gemm! calls, 0.83 <
+blocked 0.89). **Residual: 512 (0.87, small-n O(n²)/O(n³) overhead) + 3072 (0.94, pad-copy + scaling)** —
+diminishing returns vs a decade-tuned dgetrf. kb: `pureblas-lu`.
 ## LAPACK — SVD — NOT STARTED (no BlazingPorts source; large from-scratch effort)
 Bidiagonalization (two-sided Householder) + iterative (implicit-QR / divide-and-conquer) + singular
 vectors. Weeks of work, not a port. Needs a scope decision before starting.
