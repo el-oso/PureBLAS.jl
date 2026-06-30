@@ -18,6 +18,7 @@ include("gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; gene
 include("level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
 include("lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
 include("qr.jl")            # LAPACK: QR (geqrf) — faer panel reduction + gemm! dlarfb
+include("lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm! trailing
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_forward
 

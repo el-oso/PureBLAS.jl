@@ -47,6 +47,34 @@ end
     @test_throws DimensionMismatch PureBLAS.geqrf!(randn(5, 5), zeros(2))
 end
 
+@testitem "getrf (LU) vs LAPACK — square/tall/wide, factor + ipiv + P·A=L·U" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.LAPACK
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    function recon(A0, F, ipiv)                       # P·A ≈ L·U
+        m, n = size(F); k = min(m, n)
+        L = [i > j ? F[i, j] : (i == j ? 1.0 : 0.0) for i in 1:m, j in 1:k]
+        U = [i <= j ? F[i, j] : 0.0 for i in 1:k, j in 1:n]
+        PA = copy(A0)
+        for i in 1:k
+            ip = ipiv[i]
+            if ip != i
+                tmp = PA[i, :]; PA[i, :] = PA[ip, :]; PA[ip, :] = tmp
+            end
+        end
+        maxe(L * U, PA)
+    end
+    @testset "$m×$n" for (m, n) in ((1, 1), (8, 8), (40, 25), (64, 64), (129, 96), (200, 200), (96, 160), (600, 513))
+        A0 = randn(m, n)
+        F = copy(A0); ip = zeros(Int, min(m, n)); PureBLAS.getrf!(F, ip)
+        Fl = copy(A0); _, ipl, _ = LAPACK.getrf!(Fl)                  # LAPACK reference
+        @test maxe(F, Fl) < 1e-11                                    # same factorization
+        @test ip == ipl                                             # same pivot sequence
+        @test recon(A0, F, ip) < 1e-11                              # P·A = L·U
+    end
+    @test_throws DimensionMismatch PureBLAS.getrf!(randn(5, 5), zeros(Int, 2))
+end
+
 @testitem "potrf — ForwardDiff AD through the factor" begin
     using PureBLAS, LinearAlgebra, ForwardDiff
     # L[1,1] of [[x+4, 1],[1, 3]] = sqrt(x+4); d/dx = 1/(2 sqrt(x+4))
