@@ -11,6 +11,16 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 # Measured sweet spot on Zen4: smaller bases pay more small-k trsm/syrk overhead, larger pay a
 # memory-bound unblocked panel. ponytail: hand-set; revisit when tuning Cholesky to the gate.
 
+# Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
+# columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
+# buffer, factoring there, and copying back streams contiguous memory (better prefetch/TLB).
+const _POTF2_BUF = IdDict{DataType, Matrix}()
+function _potf2_buf(::Type{T}, n::Int) where {T}
+    b = get(_POTF2_BUF, T, nothing)
+    if isnothing(b) || size(b, 1) < n; b = Matrix{T}(undef, n, n); _POTF2_BUF[T] = b; end
+    return view(b, 1:n, 1:n)
+end
+
 # Unblocked right-looking Cholesky of an n×n block, lower triangle. Throws PosDefException at the first
 # non-positive pivot (LAPACK's info>0). Reads/writes only the lower triangle.
 function _potf2_lower!(A, n::Int)
@@ -44,8 +54,22 @@ end
 # Recursive (cache-oblivious) Cholesky. Lower: split 2×2 — factor A11, solve the off-diagonal panel
 # A21·L11⁻ᵀ (trsm), downdate A22 -= A21·A21ᵀ (syrk), recurse A22. The top-level trsm/syrk are large-k
 # (half-matrix → the gated packed L3 paths); only the ≤_POTRF_BASE diagonal base is scalar potf2.
+# Factor a base block, via a contiguous buffer when A is a strided sub-block (better locality).
+@inline function _potf2b_lower!(A, n::Int)
+    if n >= 128 && A isa SubArray && stride(A, 2) > n
+        buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _potf2_lower!(buf, n); copyto!(A, buf); return A
+    end
+    return _potf2_lower!(A, n)
+end
+@inline function _potf2b_upper!(A, n::Int)
+    if n >= 128 && A isa SubArray && stride(A, 2) > n
+        buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _potf2_upper!(buf, n); copyto!(A, buf); return A
+    end
+    return _potf2_upper!(A, n)
+end
+
 function _potrf_lower!(A, n::Int, base::Int = _POTRF_BASE)
-    n <= base && return _potf2_lower!(A, n)
+    n <= base && return _potf2b_lower!(A, n)
     h = n ÷ 2
     _potrf_lower!(view(A, 1:h, 1:h), h, base)
     A21 = view(A, (h + 1):n, 1:h)
@@ -56,7 +80,7 @@ function _potrf_lower!(A, n::Int, base::Int = _POTRF_BASE)
 end
 # Upper: A = Uᵀ·U. Off-diagonal panel A12 = U11⁻ᵀ·A12 (trsm side-L), downdate A22 -= A12ᵀ·A12 (syrk).
 function _potrf_upper!(A, n::Int)
-    n <= _POTRF_BASE && return _potf2_upper!(A, n)
+    n <= _POTRF_BASE && return _potf2b_upper!(A, n)
     h = n ÷ 2
     _potrf_upper!(view(A, 1:h, 1:h), h)
     A12 = view(A, 1:h, (h + 1):n)
