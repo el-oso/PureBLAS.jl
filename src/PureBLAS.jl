@@ -16,6 +16,7 @@ include("backend.jl")       # SIMDBackend: high-level AbstractVector ops (Mode 2
 include("native.jl")        # bare native API → default backend
 include("gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
 include("level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
+include("lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_forward
 
