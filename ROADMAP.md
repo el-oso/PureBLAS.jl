@@ -275,13 +275,14 @@ factor A11, trsm the off-diagonal panel, syrk-downdate the trailing, recurse; un
 (≤`_POTRF_BASE`=512, vectorized inner loop). Lower (L·Lᵀ) + upper (Uᵀ·U). **Generic over real T →
 ForwardDiff-traceable** (the headline Mode-2 win: differentiable Cholesky, e.g. ∇logdet); BlasReal hits
 the SIMD trsm/syrk. PosDefException on non-PD. Correctness vs LAPACK `cholesky` ~1e-16, suite 7031/7031.
-**⚠ GATE NOT MET (revisit): ~0.42 (n=1024) → 0.81 (n=2048) vs LAPACK dpotrf.** Diagnosis: base-size
-sweep shows larger base wins (the recursion's small-k trsm/syrk are the cost, NOT the scalar potf2 whose
-inner rank-1 loop auto-vectorizes); base=512 the sweet spot at ~0.81. The residual is the memory-bound
-unblocked panel vs small-k-BLAS trade + LAPACK dpotrf being heavily optimized. **To revisit:** faster
-small-k trsm/syrk (so a smaller, compute-bound base works), or a blocked/compute-bound panel
-factorization; then re-bench to the gate. Like dgemm, it landed correct first; perf-tuning is the next
-phase.
+**⚠ GATE NOT MET (revisit): n=1024 0.57, n=2048 0.81, n=4096 0.90 vs LAPACK dpotrf** (after the
+contiguous-buffer panel below; efficiency grows with n as overhead amortizes). Decomposed (n=2048): trsm
+42ms / syrk 33ms (we MATCH LAPACK) / panel 26ms; the ~20ms gap = memory-bound panel (~11) + k=512 trsm
+(~9), not syrk. **Tuning done:** base=512 sweet spot (smaller→small-k trsm cost, larger→bigger panel);
+**contiguous-buffer panel** (copy strided base block→contiguous, factor, copy back) lifted n=2048
+0.70→0.81. **Remaining to gate:** (1) BLOCK the panel within the buffer (cache-REUSE, compute-bound — the
+buffered potf2 is still unblocked/memory-bound by volume); (2) the k=512 side-R trsm. Both real multi-step
+work; n≥4096 likely gates with just the panel fix. Like dgemm: correct first, dedicated tuning pass next.
 
 **Bench harness `bench/l3bench.jl` (2026-06-30): staged screen→full, faster + more correct.** SCREEN =
 one non-po2 size (k=1536) × all variants; full size sweep only on routines that fail the screen. Adaptive
