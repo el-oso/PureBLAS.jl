@@ -21,6 +21,32 @@ end
     @test_throws DimensionMismatch PureBLAS.potrf!(randn(3, 4))
 end
 
+@testitem "geqrf (QR) vs LAPACK — square/tall/wide, R + reconstruction" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.LAPACK
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    # reconstruct A = Q*R from faer-convention factored output (H_k = I − v vᵀ/τ, τ=Inf ⇒ identity)
+    function recon(F, tau)
+        m, n = size(F); k = min(m, n)
+        R = [i <= j ? F[i, j] : 0.0 for i in 1:m, j in 1:n]
+        for kk in k:-1:1
+            isfinite(tau[kk]) || continue
+            v = zeros(m); v[kk] = 1.0; v[kk+1:m] = F[kk+1:m, kk]
+            R .-= (v * (v' * R)) ./ tau[kk]
+        end
+        R
+    end
+    @testset "$m×$n" for (m, n) in ((1, 1), (8, 8), (40, 25), (64, 64), (129, 96), (200, 200), (96, 160), (600, 513))
+        A0 = randn(m, n)
+        F = copy(A0); tau = zeros(min(m, n)); PureBLAS.geqrf!(F, tau)
+        Fl = copy(A0); LAPACK.geqrf!(Fl)                                   # LAPACK reference
+        k = min(m, n)
+        @test maxe(abs.(triu(F)[1:k, :]), abs.(triu(Fl)[1:k, :])) < 1e-11   # |R| matches up to sign
+        @test maxe(recon(F, tau), A0) < 1e-11                              # Q·R ≈ A
+    end
+    @test_throws DimensionMismatch PureBLAS.geqrf!(randn(5, 5), zeros(2))
+end
+
 @testitem "potrf — ForwardDiff AD through the factor" begin
     using PureBLAS, LinearAlgebra, ForwardDiff
     # L[1,1] of [[x+4, 1],[1, 3]] = sqrt(x+4); d/dx = 1/(2 sqrt(x+4))
