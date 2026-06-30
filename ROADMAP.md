@@ -289,7 +289,16 @@ the two big gemms (Y=TᵀW tiny → scalar). **Skipped faer's bespoke packed BLI
 microkernel entirely — PureBLAS has a gemm** → far less code, gates+beats dgeqrf. Float64 only (faer
 kernels Float64-specific); generic/AD QR deferred. n=768 borderline (0.962, noise). kb: `pureblas-qr`.
 
-## LAPACK — LU (getrf) — CORRECT; GATES 768–2048 (0.97–1.06×); 512/3072 residual (2026-06-30)
+## LAPACK — LU (getrf) — CORRECT; GATES 512–2048 + non-po2 to ~3000; large-n tail gemm-limited (2026-06-30)
+**The 512 fix:** the pad's `copyto!` on SubArray views was the small-n killer (512=0.87); an explicit
+contiguous per-column `unsafe_copyto!` lifted 512→0.98 and all sizes. **LU GATES 512/768/1024/1536/2048
+(0.96–1.05×) + non-stride%512 to ~3000 (0.97).** **Large-n tail (3500+, po2 2560–4096) = 0.93–0.95 is
+BLOCKED ON THE LARGE-N GEMM:** sweep shows ALL sizes ≥3500 decline to ~0.95 even unpadded → our dgemm's
+known large-n residual (0.97–0.98 @2048/4096), which LU's irreducible panel/laswp overhead drops below
+0.96 (even zero LU overhead ⇒ LU ≤ gemm ≈0.97 there); po2 sizes additionally pay the ~0.02 pad-copy. To
+gate the largest sizes: improve the large-n dgemm (lifts dgemm's own gate too) — a separate deep task.
+
+### (older note) GATES 768–2048; 512/3072 residual — superseded by the 512 fix above
 `src/lu.jl`. **BlazingPorts has no LU source** (only bench JSONs) → from scratch, but blocked
 right-looking = LAPACK dgetrf's own algorithm + PureBLAS trsm!/gemm!. Correct: matches LAPACK exactly
 (factor + ipiv), P·A=L·U ~1e-14, suite 7085/7085. **Ground to gate the mid-large range** (don't-guess-check:
