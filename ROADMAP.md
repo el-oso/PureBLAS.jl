@@ -280,6 +280,15 @@ Pad on `stride%512==0` (L1 set-aliasing; faer's `ispow2` missed 1536/2560). Floa
 Float32/complex/Dual/upper keep the generic AD-traceable recursion. kb: `pureblas-cholesky`. Lesson: a
 faithful proven-fast port beat incremental tuning of the generic version. Below = the historical journey.
 
+## LAPACK — QR (geqrf) — ✅ CORRECT + GATED (2026-06-30)
+**Float64 GATES: 0.96–1.32× LAPACK dgeqrf across n=512–3072** (beats it at 5/6 sizes; suite 7060/7060,
+|R| & Q·R ~1e-15). `src/qr.jl`. Same recipe as Cholesky: port only the **irreducible** faer kernel —
+`qr_unblocked!`, the SIMD Householder panel reduction (el-oso/BlazingPorts.jl) — onto PureBLAS's SIMD.jl;
+drive the blocked **compact-WY** dlarfb (`C −= V·(Tᵀ·(Vᵀ·C))`, nb=32) with **PureBLAS's gated `gemm!`** for
+the two big gemms (Y=TᵀW tiny → scalar). **Skipped faer's bespoke packed BLIS gemm + `@generated`
+microkernel entirely — PureBLAS has a gemm** → far less code, gates+beats dgeqrf. Float64 only (faer
+kernels Float64-specific); generic/AD QR deferred. n=768 borderline (0.962, noise). kb: `pureblas-qr`.
+
 ### (historical) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
 First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
 factor A11, trsm the off-diagonal panel, syrk-downdate the trailing, recurse; unblocked `potf2` base
