@@ -300,9 +300,27 @@ optimal — the gap was small components): (1) **laswp loop order** cols-outer/p
 dgetf2). nb=48. **DISPROVEN: faer-style recursive LU** (over-decomposes → many small gemm! calls, 0.83 <
 blocked 0.89). **Residual: 512 (0.87, small-n O(n²)/O(n³) overhead) + 3072 (0.94, pad-copy + scaling)** —
 diminishing returns vs a decade-tuned dgetrf. kb: `pureblas-lu`.
-## LAPACK — SVD — NOT STARTED (no BlazingPorts source; large from-scratch effort)
-Bidiagonalization (two-sided Householder) + iterative (implicit-QR / divide-and-conquer) + singular
-vectors. Weeks of work, not a port. Needs a scope decision before starting.
+### LU residual (512/3072) — grinding tried, at the ceiling (2026-06-30)
+Grinding 512 (0.87) and 3072 (0.94) further: tried **panel-pad** (copy mp×pb panel to non-aliasing buffer
+per panel) and **column-temp** (copy pivot column to contiguous temp in `_getf2_simd!`) — BOTH backfired
+(po2 sizes 1024/2048 crashed to ~0.61). Reason: the whole-matrix pad isn't only for the panel — the LU
+**trsm and gemm also operate on po2-strided sub-blocks of A** and need the non-conflicting ld; a panel-only
+fix leaves them thrashing. So the whole-matrix pad is required, and its O(n²) copy (~15ms @3072) is the
+inherent residual at large n; 512 is small-n overhead (O(n²)/O(n³)). DON'T re-chase panel-only anti-alias.
+To gate 3072: a cheaper whole-matrix anti-alias (or overlap the copy); 512: lower fixed overhead. Both deep
+diminishing returns. kb: `pureblas-lu`.
+
+## LAPACK — SVD — NOT STARTED; scoped for a fresh session (port faer Rust + PureBLAS blocks)
+Per user: **port from faer's actual Rust** (`faer-rs` repo `faer/src/linalg/svd/`) using PureBLAS's
+`gemm!`/`trsm!` + the QR Householder kernels (`qr_unblocked!`) we already have. Layers (reuse the
+Cholesky/QR recipe — port the irreducible SIMD kernel, drive the blocked level with PureBLAS BLAS):
+1. **gebrd** — two-sided Householder bidiagonalization (A → U·B·Vᵀ, B upper-bidiagonal). The tractable
+   foundation; reuses the QR reflector kernel both sides. faer: `bidiag.rs`.
+2. **bidiagonal SVD** — implicit-QR (`bdsqr`) or divide-and-conquer (`bdsdc`) on B. The hard core. faer:
+   `svd/bidiag_svd.rs` (D&C).
+3. **back-transform** singular vectors through U/V (gemm). faer: `svd/mod.rs` driver.
+Oracle: LAPACK `gesdd`/`gesvd` (singular values; vectors up to sign/rotation). Big multi-file effort —
+start a fresh session with clean context. Fetch faer source via `gh api repos/sarah-quinones/faer-rs/...`.
 
 ### (historical, Cholesky) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
 First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
