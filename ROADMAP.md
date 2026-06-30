@@ -237,20 +237,22 @@ sweeps both fail; bigger kc is better, smaller worse → band-fraction theory wr
 Bc-padding, no close); gemm profiled across K=16..2048 = 0.97–1.08 (no short-K weakness). The one
 fixable sliver — scalar transpose A-pack for transA=T — is **FIXED: SIMD transpose pack**
 (`_pack_A_simd_T!`/`_tblk!`, W×W shuffle-butterfly transpose), bit-identical, helps gemm-T/syrk-T too.
-**Final trmm: IN-PLACE single-pass Val(1) 8×8 + transpose pack, NO A-pad.** The in-place rewrite
-(eliminate the Bc full copy — pack each jc column-panel fully into Bpf, capturing input, before zeroing
-that panel; trmm-L columns are independent) was a bigger win than predicted (the O(k²) copy is a large
-fraction of O(k³) at small k): **k=768 0.90→0.95–0.99, k=1024 +2–3%, k=2048 +1–2%.** trmm now GATES most
-variants at every size: k=768 0.95–0.99, k=1024 0.956–0.982, k=1536 0.968–0.987 (all), k=2048 0.957–0.976;
-a few borderline holdouts (~0.952–0.958) at po2 N-cases / small-k UT (column-major po2-ld artifact).
-A-pad re-tested post-Bc-removal: still net-negative → removed. Suite 6966/6966, relerr ~5e-16. Late
+**Final trmm: IN-PLACE single-pass + OVERWRITE-ON-FIRST (Val(1) 8×8 + transpose pack, NO A-pad).**
+Two structural wins (git branches, merged): (1) **in-place** — eliminate the Bc full copy by packing each
+jc panel into Bpf before overwriting (trmm-L columns independent); big at small k (k=768 0.90→0.95–0.99,
+the O(k²) copy is a large fraction of O(k³)). (2) **drop the zero pass** — each tile's first contributing
+pc-block writes β=0 (overwrite, no C read; first block div(r0,kc) upper / 0 lower), later accumulate;
+`Val{B0}` path added to the microkernels (default false → gemm/syrk unchanged). This closed the po2
+holdouts (k=2048 UN/LN 0.957→0.963). **trmm now GATES k=1024/1536/2048 (ALL variants, 0.963–0.994) and
+k=768 (3/4); only k=768 UT ~0.954 left** (small-k transpose, within noise). A-pad re-tested twice
+post-Bc-removal: still net-negative → removed. Suite 6966/6966, relerr ~5e-16. Late
 findings: cache-oblivious RECURSION (Elmroth–Gustavson/ReLAPACK) measured SLOWER than single-pass at
 every size → DISPROVEN (anchor on the fastest path, extend it); trmm A-pad REMOVED (po2 conflict mild,
 the k² copy is net-negative; kept for trsm where the conflict is catastrophic); 16×8 tile-by-trans
 non-robust → reverted. Matches OB per-flop (1.175 vs 1.162); hand-unrolled diagonal kernel DISPROVEN for
 MR=1 (triangle zeros are free vector lanes). **trmm ≈ column-major ceiling; non-po2 sizes gate.**
-Net: all 8 L3 correct; **trsm now GATES too** → syrk/herk/syr2k/her2k/symm/hemm/trsm at gate (complex via
-fallback); **trmm the lone sub-gate routine** (gates large non-po2 only). Packed infra:
+Net: all 8 L3 correct; **ALL routines effectively gate** — gemm/symm/syrk/syr2k/trsm fully (complex via
+fallback), trmm gates k=1024/1536/2048 (all variants) + k=768 (3/4), only k=768 UT ~0.954 left. Packed infra:
 `_microkernel_tri!`/`_microkernel_u!`/`_microkernel2!`, `_trgemm_packed{,2,_u,2_u}!`,
 `_pack_A_sym!`/`_pack_B_sym!`, `_pack_A_tri!` (+SIMD), `_pack_A_simd_T!`/`_tblk!` (SIMD transpose pack).
 
