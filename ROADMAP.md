@@ -256,6 +256,19 @@ fallback), trmm gates k=1024/1536/2048 (all variants) + k=768 (3/4), only k=768 
 `_microkernel_tri!`/`_microkernel_u!`/`_microkernel2!`, `_trgemm_packed{,2,_u,2_u}!`,
 `_pack_A_sym!`/`_pack_B_sym!`, `_pack_A_tri!` (+SIMD), `_pack_A_simd_T!`/`_tblk!` (SIMD transpose pack).
 
+### ⚠ KNOWN GATE GAP — REVISIT (L3 otherwise DONE, 2026-06-30)
+The ONE place the ≥0.96× gate is not met on Zen4: **trmm small-k transpose (UT) — k=512 ~0.945,
+k=640 ~0.942** (k=768 UT ~0.954–0.962 borderline). All other trmm cases (k≥768 most variants;
+k=1024/1536/2048 all variants) and all other L3 routines gate. The benches there are noisy (±2–5%).
+- **Cause:** the transpose A-pack (`_pack_A_simd_T!` shuffle butterfly) costs more than non-trans
+  column-copy, and at small k it's a large fraction of the overhead-dominated work. Inherent to `transA=T`.
+- **Disproven fixes (do NOT re-chase):** SIMD transpose TRI-pack for the straddle (mask overhead offsets
+  the gather savings); A-pad (net-negative for trmm); cache-oblivious recursion (slower); 16×8 tile;
+  hand-unrolled diagonal kernel (free vector lanes at MR=1); option-1 zero-pad.
+- **To revisit:** a BLASFEO-style UNPACKED small-matrix trmm path (skip packing entirely for cache-
+  resident k, like gemm's `_use_unpacked` ≤448 path) — the most promising untried angle for small-k; or a
+  cheaper/faster transpose pack. Reference: kb finding `pureblas-l3-syrk-syr2k-symm`.
+
 **Bench harness `bench/l3bench.jl` (2026-06-30): staged screen→full, faster + more correct.** SCREEN =
 one non-po2 size (k=1536) × all variants; full size sweep only on routines that fail the screen. Adaptive
 rounds (grow until IQR/median<2%, cap 45 — keeps interleaved-median, no under-sampling). reps right-sized
