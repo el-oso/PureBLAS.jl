@@ -269,6 +269,20 @@ k=1024/1536/2048 all variants) and all other L3 routines gate. The benches there
   resident k, like gemm's `_use_unpacked` ≤448 path) — the most promising untried angle for small-k; or a
   cheaper/faster transpose pack. Reference: kb finding `pureblas-l3-syrk-syr2k-symm`.
 
+## LAPACK — Cholesky (potrf) — CORRECT + AD done (2026-06-30); PERF NOT yet gated
+First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
+factor A11, trsm the off-diagonal panel, syrk-downdate the trailing, recurse; unblocked `potf2` base
+(≤`_POTRF_BASE`=512, vectorized inner loop). Lower (L·Lᵀ) + upper (Uᵀ·U). **Generic over real T →
+ForwardDiff-traceable** (the headline Mode-2 win: differentiable Cholesky, e.g. ∇logdet); BlasReal hits
+the SIMD trsm/syrk. PosDefException on non-PD. Correctness vs LAPACK `cholesky` ~1e-16, suite 7031/7031.
+**⚠ GATE NOT MET (revisit): ~0.42 (n=1024) → 0.81 (n=2048) vs LAPACK dpotrf.** Diagnosis: base-size
+sweep shows larger base wins (the recursion's small-k trsm/syrk are the cost, NOT the scalar potf2 whose
+inner rank-1 loop auto-vectorizes); base=512 the sweet spot at ~0.81. The residual is the memory-bound
+unblocked panel vs small-k-BLAS trade + LAPACK dpotrf being heavily optimized. **To revisit:** faster
+small-k trsm/syrk (so a smaller, compute-bound base works), or a blocked/compute-bound panel
+factorization; then re-bench to the gate. Like dgemm, it landed correct first; perf-tuning is the next
+phase.
+
 **Bench harness `bench/l3bench.jl` (2026-06-30): staged screen→full, faster + more correct.** SCREEN =
 one non-po2 size (k=1536) × all variants; full size sweep only on routines that fail the screen. Adaptive
 rounds (grow until IQR/median<2%, cap 45 — keeps interleaved-median, no under-sampling). reps right-sized
