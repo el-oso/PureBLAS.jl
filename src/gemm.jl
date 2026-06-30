@@ -254,11 +254,13 @@ function _pack_A!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bo
     return
 end
 
-# Pack a kc_eff×nc_eff block of op(B) into nr-col panels (zero-padded).
-function _pack_B!(Bp::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int) where {T}
+# Pack a kc_eff×nc_eff block of op(B) into nr-col panels (zero-padded). `boff` lets the block be written
+# into the middle of a larger panel buffer (used by the in-place trmm, which packs a whole B column-panel
+# across all pc-blocks before overwriting B). AbstractVector so a `view` into that buffer is accepted.
+function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
-        base = ji * nr * kce
+        base = boff + ji * nr * kce
         for p in 0:(kce - 1)
             for c in 0:(nr - 1)
                 lc = ji * nr + c

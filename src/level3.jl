@@ -198,32 +198,41 @@ end
 end
 
 # Single-pass packed trmm, side 'L': B := α·op(A)·B, A triangular m×m. = gemm(op(A_triangle), B) with
-# A's non-stored half packed as zero (so it's correct flops with the gemm microkernel). B is copied to
-# a scratch first (gemm reads the operand while overwriting C=B → would alias). Per A-panel: skip
+# A's non-stored half packed as zero (correct flops with the gemm microkernel). Per A-panel: skip
 # fully-zero, plain _pack_A! fully-stored, _pack_A_tri! diagonal-straddling. Real only; α into the pack.
-const _TRMM_BSCR = IdDict{DataType, Matrix}()
-function _trmm_bscr(::Type{T}, m::Int, n::Int) where {T}
-    b = get(_TRMM_BSCR, T, nothing)
-    if isnothing(b) || size(b, 1) < m || size(b, 2) < n; b = Matrix{T}(undef, m, n); _TRMM_BSCR[T] = b; end
-    return b
+# IN-PLACE (no full B-copy): trmm-L columns are independent, so per jc column-panel we pack ALL of its
+# pc-blocks into Bpf (capturing the input) BEFORE zeroing that panel of B — the pack itself is the copy,
+# so the separate Bc scratch is gone. (Bpf holds the whole panel: nblk pc-blocks × one packed block.)
+const _TRMM_BPF = IdDict{DataType, Vector}()
+function _trmm_bpf(::Type{T}, len::Int) where {T}
+    v = get!(() -> T[], _TRMM_BPF, T)::Vector{T}
+    length(v) < len && resize!(v, len)
+    return v
 end
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T<:BlasReal, MRV}
     m = size(B, 1); n = size(B, 2); W = _vwidth(T); mr = MRV * W; nr = _NR
     packed_upper = (up != tr)
-    Bc = view(_trmm_bscr(T, m, n), 1:m, 1:n); copyto!(Bc, B)
     kc = min(_KC, m); mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(B, m, n, zero(T))                          # B := 0, then accumulate op(A)·Bc
+    nblk = cld(m, kc); bpf_blk = cld(nc, nr) * nr * kc          # one packed pc-block slot (padded to kc)
+    Ap, _ = _gemm_scratch(T, cld(mc, mr) * mr * kc, 1)
+    Bpf = _trmm_bpf(T, nblk * bpf_blk)
     ldc = stride(B, 2); sz = sizeof(T)
-    GC.@preserve B Bc Ap Bp begin
-        Cp0 = pointer(B); App = pointer(Ap); Bpp = pointer(Bp)
+    GC.@preserve B Ap Bpf begin
+        Cp0 = pointer(B); App = pointer(Ap); Bfp = pointer(Bpf)
         jc = 0
         while jc < n
-            nce = min(nc, n - jc); pc = 0
+            nce = min(nc, n - jc)
+            pc = 0; pb = 0                                       # Phase 1: pack whole jc-panel of B
             while pc < m
                 kce = min(kc, m - pc)
-                _pack_B!(Bp, Bc, pc, jc, kce, nce, false, nr)
+                _pack_B!(Bpf, B, pc, jc, kce, nce, false, nr, pb * bpf_blk)
+                pc += kc; pb += 1
+            end
+            _scale_C!(view(B, 1:m, (jc + 1):(jc + nce)), m, nce, zero(T))   # Phase 2: zero the panel
+            pc = 0; pb = 0                                       # Phase 3: compute from Bpf
+            while pc < m
+                kce = min(kc, m - pc)
                 ic = 0
                 while ic < m
                     mce = min(mc, m - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
@@ -237,14 +246,11 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
                             nre = min(nr, nce - jr); ir = 0
                             while ir < mce
                                 mre = min(mr, mce - ir); r0 = ic + ir
-                                # K-range trim: a straddling tile contracts only its nonzero p-band, not
-                                # the full kce (the diagonal's zero band is the bulk of the waste).
-                                # packed_upper (nonzero p≥row): start at p=r0; lower (p≤row): end at r0+mre.
                                 plo = stored ? 0 : (packed_upper ? max(0, r0 - pc) : 0)
                                 cnt = stored ? kce : (packed_upper ? kce - plo : min(kce, r0 + mre - pc))
                                 if cnt > 0
                                     Apanel = App + (div(ir, mr) * mr * kce + plo * mr) * sz
-                                    Bpanel = Bpp + (div(jr, nr) * nr * kce + plo * nr) * sz
+                                    Bpanel = Bfp + (pb * bpf_blk + div(jr, nr) * nr * kce + plo * nr) * sz
                                     Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
                                     if mre == mr && nre == nr
                                         _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR))
@@ -259,7 +265,7 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
                     end
                     ic += mc
                 end
-                pc += kc
+                pc += kc; pb += 1
             end
             jc += nc
         end
