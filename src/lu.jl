@@ -154,10 +154,9 @@ function _getrf_core!(A, ipiv, nb::Int)
         pb = min(nb, k - pc + 1); mp = m - pc + 1
         pinfo = _getf2!(view(A, pc:m, pc:pc+pb-1), mp, pb, pc - 1, ipiv, pc - 1)
         (info == 0 && pinfo != 0) && (info = pinfo)
-        _laswp!(A, ipiv, pc, pc + pb - 1, 1, pc - 1)                 # swap the already-done left columns
         jt0 = pc + pb
         if jt0 <= n
-            _laswp!(A, ipiv, pc, pc + pb - 1, jt0, n)                # swap the trailing columns
+            _laswp!(A, ipiv, pc, pc + pb - 1, jt0, n)                # swap trailing columns (needed now)
             trsm!(view(A, pc:pc+pb-1, jt0:n), view(A, pc:pc+pb-1, pc:pc+pb-1);
                   side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = true)   # U12 = L11⁻¹ A12
             if pc + pb <= m
@@ -165,6 +164,15 @@ function _getrf_core!(A, ipiv, nb::Int)
                       alpha = -1, beta = true)                       # A22 −= L21 U12
             end
         end
+        pc += pb
+    end
+    # DEFERRED left-block pivots: each panel's columns get the LATER pivots, applied once at the end
+    # (cache-friendly — the in-loop version re-touched cold left columns at every subsequent panel, the
+    # large-n laswp killer). Same permutation, reordered: column j gets ipiv from panels after its own.
+    pc = 1
+    @inbounds while pc <= k
+        pb = min(nb, k - pc + 1); jt0 = pc + pb
+        jt0 <= k && _laswp!(A, ipiv, jt0, k, pc, pc + pb - 1)
         pc += pb
     end
     return A, ipiv, info
