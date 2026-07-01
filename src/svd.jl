@@ -408,12 +408,24 @@ end
 # explicit; roff = row offset of reflector i's support below its index) to C from the left, in place:
 # C := Q·C. Blocked compact-WY (dlarft + dlarfb) driven by PureBLAS gemm! — the BLAS-3 back-transform
 # that replaces explicit form-Q/P + combine. Vfull is M×k with the reflector vectors as its columns.
+# Cached T/G/W/Y workspace — fresh zeros(nb,nb)+3 allocs per call cost ~32 KB per gesvd (2 calls),
+# dominating tiny-n SVD. Regrown on nc; T's needed region is re-zeroed per use below.
+const _BT_WS = Ref{NTuple{4, Matrix{Float64}}}((zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0)))
+@inline function _bt_ws(nb::Int, nc::Int)
+    T, G, W, Yb = _BT_WS[]
+    if size(T, 1) < nb || size(W, 2) < nc
+        T = zeros(Float64, nb, nb); G = Matrix{Float64}(undef, nb, nb)
+        W = Matrix{Float64}(undef, nb, nc); Yb = Matrix{Float64}(undef, nb, nc)
+        _BT_WS[] = (T, G, W, Yb)
+    end
+    return T, G, W, Yb
+end
 function _apply_reflectors_left!(Vfull::AbstractMatrix{Float64}, tau::AbstractVector{Float64},
         C::AbstractMatrix{Float64}, k::Int, nb::Int, roff::Int)
     M = size(Vfull, 1); nc = size(C, 2)
     (k == 0 || nc == 0) && return C
-    T = zeros(Float64, nb, nb); G = Matrix{Float64}(undef, nb, nb)   # T lower triangle stays 0 (dlarft is upper)
-    W = Matrix{Float64}(undef, nb, nc); Yb = Matrix{Float64}(undef, nb, nc)
+    T, G, W, Yb = _bt_ws(nb, nc)
+    @inbounds for j in 1:nb, i in 1:nb; T[i, j] = 0.0; end   # gemm reads the full Tv (lower must be 0)
     nblk = cld(k, nb)
     @inbounds for b in nblk:-1:1                          # blocks right-to-left (apply H(k)…H(1))
         pc = (b - 1) * nb + 1

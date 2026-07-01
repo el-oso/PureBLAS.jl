@@ -347,9 +347,10 @@ end
 const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 const _CHOL_FAER_BASE = 1024     # ≤ this → faer kernels; above → halve with PureBLAS cache-blocked L3
 # Pad when columns alias L1 sets: Zen4 L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
-# (i.e. stride % 512 == 0) maps every column to the same sets. Covers po2 ≥512 AND 1536, 2560, … —
-# faer's plain ispow2 missed the non-po2 multiples. (po2 <512 don't alias, so no over-padding.)
-@inline _chol_needs_pad(A, n) = n >= 128 && stride(A, 2) % 512 == 0
+# (stride % 512 == 0) maps every column to the same sets. Covers po2 ≥512 AND 1536, 2560, … —
+# faer's plain ispow2 missed the non-po2 multiples. WIDENED to %256 (half-period, 2 sets/column):
+# lda=256 measured a 1.77× penalty in the faer right-looking kernel (287µs → 162µs at ld=264).
+@inline _chol_needs_pad(A, n) = n >= 128 && stride(A, 2) % 256 == 0
 
 # Hybrid driver: the faer kernels are fastest at small/medium n but their syrk isn't cache-blocked, so
 # they fade at large n (panel re-streamed). Recurse by halving — the big off-diagonal blocks go through
@@ -377,7 +378,18 @@ function _potrf_f64_lower!(A::StridedMatrix{Float64}, base::Int = _CHOL_FAER_BAS
         b = _CHOL_PAD[]
         (size(b, 1) < R || size(b, 2) < n) && (b = _CHOL_PAD[] = Matrix{Float64}(undef, R, n))
         Mw = view(b, 1:n, 1:n)
-        copyto!(Mw, A); _chol_hyb_f64!(Mw, n, base); copyto!(A, Mw)
+        # explicit contiguous per-column copies — copyto! on SubArrays is elementwise (the LU pad lesson)
+        lda = stride(A, 2); ldb = size(b, 1)
+        GC.@preserve A b begin
+            pa = pointer(A); pb = pointer(b)
+            @inbounds for j in 0:(n - 1)
+                unsafe_copyto!(pb + j * ldb * 8, pa + j * lda * 8, n)
+            end
+            _chol_hyb_f64!(Mw, n, base)
+            @inbounds for j in 0:(n - 1)
+                unsafe_copyto!(pa + j * lda * 8, pb + j * ldb * 8, n)
+            end
+        end
     else
         _chol_hyb_f64!(A, n, base)
     end
