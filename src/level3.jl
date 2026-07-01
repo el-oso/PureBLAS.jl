@@ -306,17 +306,17 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
-@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool) =
-    gemm!(C, A, B; alpha = -1, beta = true, transA = _opchar(tr, cj), transB = 'N')   # C -= op(A)·B
-@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool) =
-    gemm!(C, Bmat, A; alpha = -1, beta = true, transA = 'N', transB = _opchar(tr, cj))  # C -= B·op(A)
+@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool) =                                    # C -= op(A)·B
+    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false)
+@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool) =                                # C -= B·op(A)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj)
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
 # solve runs at gemm speed instead of scalar back-substitution. The recursion's off-diagonal updates
 # are already gemm!. Real only (stability fine for the well-conditioned diagonal blocks trsm assumes);
 # complex/conj keep the scalar trsv base.
-const _TRSM_BASE = 128
+const _TRSM_BASE = 32
 # Small real triangular inverse: V (same uplo as A) = inv(A). V[i,i]=1/A[i,i] (or 1 if unit);
 # off-diagonal V[i,j] = -V[i,i]·Σ A[i,l]V[l,j] over the stored band between i and j.
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool) where {}
@@ -367,11 +367,48 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
     copyto!(B, tmp); return B
 end
 
+# Direct triangular solve base (side L): rank-1 substitution, the eliminate-rows axpy dispatched to the gated
+# 4-way-unrolled `_axpy_simd!` (no-trans; trans strided → scalar). n³/2 flops (half of invert+gemm), no gemm
+# dispatch. Real non-conj; forward when up==tr. Used as the base ONLY when B is narrow — the per-column axpy
+# count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
+const _TRSM_NCUT = 96          # side-L: B width cut
+const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
+const _TRSM_DBASE = 16
+function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
+    k = size(A, 1); n = size(B, 2); T = eltype(B); sz = sizeof(T)
+    lda = stride(A, 2); ldb = stride(B, 2); fwd = (up == tr)
+    GC.@preserve A B begin
+        pA = pointer(A); pB = pointer(B)
+        @inbounds for i in (fwd ? (1:k) : (k:-1:1))
+            if !unit
+                d = inv(A[i, i]); for c in 1:n; B[i, c] *= d; end
+            end
+            rlen = fwd ? (k - i) : (i - 1); rlen == 0 && continue
+            rs = fwd ? (i + 1) : 1
+            if tr
+                rows = fwd ? ((i + 1):k) : (1:(i - 1))
+                for c in 1:n; bic = B[i, c]; @simd for r in rows; B[r, c] -= A[i, r] * bic; end; end
+            else
+                aptr = pA + ((i - 1) * lda + (rs - 1)) * sz
+                for c in 1:n
+                    _axpy_simd!(rlen, -B[i, c], aptr, pB + ((c - 1) * ldb + (rs - 1)) * sz)
+                end
+            end
+        end
+    end
+    return B
+end
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if eltype(B) <: BlasReal && !cj && k <= _TRSM_BASE
-        return _trsm_base_invL!(up, tr, unit, A, B)
+    if eltype(B) <: BlasReal && !cj
+        # narrow B → dense base (few axpy calls); wide B → invL base (gemm-efficient). n is invariant under
+        # the side-L row split, so the choice is consistent through the recursion.
+        if size(B, 2) <= _TRSM_NCUT
+            k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
+        elseif k <= _TRSM_BASE
+            return _trsm_base_invL!(up, tr, unit, A, B)
+        end
     elseif k <= _TRMM_BASE
         @inbounds for c in axes(B, 2)
             _trsv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
@@ -414,11 +451,36 @@ function _trsm_right_base!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, 
     return B
 end
 
+# Dense side-R base: solve X·op(A)=B column by column. Eliminate a solved column via _axpy_simd! over the
+# contiguous B columns (closure-free, unlike _trsm_right_base!); divide by the diagonal via _scal. Real
+# non-conj; ascending columns when up≠tr. Used only for narrow B (few rows) — few axpy calls.
+function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
+    m = size(B, 1); k = size(A, 2); T = eltype(B); sz = sizeof(T); ldb = stride(B, 2)
+    asc = (up != tr)
+    GC.@preserve A B begin
+        pB = pointer(B)
+        @inbounds for j in (asc ? (1:k) : (k:-1:1))
+            pj = pB + (j - 1) * ldb * sz
+            for l in (asc ? (1:(j - 1)) : ((j + 1):k))
+                coef = tr ? A[j, l] : A[l, j]
+                coef == zero(T) || _axpy_simd!(m, -coef, pB + (l - 1) * ldb * sz, pj)
+            end
+            unit || _scal_simd_ptr!(pj, m, inv(tr ? A[j, j] : A[j, j]))
+        end
+    end
+    return B
+end
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
 function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if eltype(B) <: BlasReal && !cj && k <= _TRSM_BASE
-        return _trsm_base_invR!(up, tr, unit, A, B)
+    if eltype(B) <: BlasReal && !cj
+        # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
+        # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
+        if size(B, 1) <= _TRSM_NCUT_R
+            k <= _TRSM_DBASE && return _trsm_dense_R!(up, tr, unit, A, B)
+        elseif k <= _TRSM_BASE
+            return _trsm_base_invR!(up, tr, unit, A, B)
+        end
     elseif k <= _TRMM_BASE
         return _trsm_right_base!(up, tr, cj, unit, k, A, B)
     end
@@ -463,6 +525,12 @@ function trsm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trsm!: A must be $k×$k"))
+    # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
+    # which dominates when the solve itself is only ~100ns) and go straight to the dense base kernel.
+    if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha)
+        up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
+        return sl ? _trsm_dense_L!(up, tr, unit, A, B) : _trsm_dense_R!(up, tr, unit, A, B)
+    end
     if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
        A isa StridedMatrix && stride(A, 1) == 1 && _badld(stride(A, 2))
         Apad = _l3_apad(eltype(B), k); copyto!(Apad, A)

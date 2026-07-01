@@ -629,6 +629,32 @@ In-place GEMM: `C := alpha·op(A)·op(B) + beta·C`, with `op` set by `transA`/`
 (`'N'`/`'T'`/`'C'`). Real dense (unit column stride) `C` uses the blocked SIMD path; everything
 else (complex, AD element types, strided `C`) uses the generic path.
 """
+# Dispatch core (no kwargs, no dim checks) — callers that already know shapes are valid (e.g. the trsm/trmm
+# recursion's off-diagonal updates) call this directly to skip gemm!'s public-entry overhead. `@inline` so
+# the branch cascade folds at the call site (the kb "call the inner kernel, skip the kwarg layer" fix).
+@inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
+    m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
+    if T <: BlasReal && C isa StridedMatrix && stride(C, 1) == 1
+        if A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
+                stride(B, 1) == 1 && _use_unpacked(m, n, k)
+            if !tA
+                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                    m, n, k, alpha, A, B, beta, C)
+            else
+                At, _ = _gemm_scratch(T, m * k, 0)
+                _transpose_dense!(At, A, m, k)
+                Am = reshape(view(At, 1:(m * k)), m, k)
+                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                    m, n, k, alpha, Am, B, beta, C)
+            end
+        else
+            _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
+        end
+    else
+        _gemm_generic!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
+    end
+    return C
+end
 function gemm!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N')
     T = eltype(C)
@@ -642,24 +668,7 @@ function gemm!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
     (tB ? size(B, 2) : size(B, 1)) == k ||
         throw(DimensionMismatch("gemm!: inner dimensions disagree (k=$k)"))
     if T <: BlasReal && C isa StridedMatrix && stride(C, 1) == 1
-        if A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
-                stride(B, 1) == 1 && _use_unpacked(m, n, k)
-            if !tA
-                # small, tA='N': skip packing, run the microkernel directly on column-major data
-                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, T(alpha), A, B, T(beta), C)
-            else
-                # tA='T': SIMD-transpose A→Aᵀ into scratch, then the unpacked N·N path — avoids packing
-                # the (often large) B operand that the blocked TN path pays for (e.g. SVD's VᵀC).
-                At, _ = _gemm_scratch(T, m * k, 0)
-                _transpose_dense!(At, A, m, k)
-                Am = reshape(view(At, 1:(m * k)), m, k)
-                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, T(alpha), Am, B, T(beta), C)
-            end
-        else
-            _gemm_blocked!(tA, tB, m, n, k, T(alpha), A, B, T(beta), C)
-        end
+        _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
     else
         _gemm_generic!(tA, tB, transA == 'C', transB == 'C', m, n, k, alpha, A, B, beta, C)
     end
