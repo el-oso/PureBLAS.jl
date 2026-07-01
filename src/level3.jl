@@ -5,21 +5,186 @@
 # decomposition: gemm carries the flops, the small triangular base carries the structure. α is applied
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
-const _TRMM_BASE = 32          # recursion base (block ≤ this → L2 per-column kernels)
+const _TRMM_BASE = 128        # ≤ this → _trmm_small! directly (capped by _L3_NB=128 M scratch)
+const _TRMM_RPANEL = 512       # side-R flat-loop panel width (fat off-diag gemms; diagonal recurses)
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
-# off-diagonal update C += op(A)·B  (transA from tr/cj; transB='N'), via the fast gemm!.
+# off-diagonal update C += op(A)·B — straight to the dispatch core (skip gemm!'s kwarg/check layer;
+# the recursion guarantees the shapes).
 @inline _gemm_acc!(C, A, B, tr::Bool, cj::Bool) =
-    gemm!(C, A, B; alpha = true, beta = true, transA = _opchar(tr, cj), transB = 'N')
+    _gemm_core!(C, A, B, one(eltype(C)), one(eltype(C)), tr, false, cj, false)
 
 # ── trmm side='L':  B := op(A)·B,  A k×k triangular (k=size(B,1)), unscaled ──────────────────────
 # NOTE: trmm! routes large real side-L to the single-pass `_trmm_packed!` (the proven-fastest path); a
 # cache-oblivious recursion here was measured SLOWER at every size, so this recursion is only the
 # fallback for complex / side-R / small. (See memory anchor-fastest-path.)
+# Dense small-k trmm base (side L): pivot-outer over contiguous columns of A and B — no per-column
+# view/call. N-cases in axpy form (B[i,c]'s contribution scattered to its column band BEFORE it is
+# overwritten: upper ascending / lower descending pivots); T-cases in dot form (B[i,c] rebuilt from the
+# still-original band: upper descending / lower ascending). Both hit the gated SIMD L1 kernels. Real only.
+function _trmm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
+    k = size(A, 1); n = size(B, 2); T = eltype(B); sz = sizeof(T)
+    lda = stride(A, 2); ldb = stride(B, 2)
+    GC.@preserve A B begin
+        pA = pointer(A); pB = pointer(B)
+        @inbounds if !tr
+            for i in (up ? (1:k) : (k:-1:1))
+                len = up ? (i - 1) : (k - i); rs = up ? 1 : (i + 1)
+                aptr = pA + ((i - 1) * lda + (rs - 1)) * sz
+                d = unit ? one(T) : A[i, i]
+                for c in 1:n
+                    t = B[i, c]
+                    len > 0 && _axpy_simd!(len, t, aptr, pB + ((c - 1) * ldb + (rs - 1)) * sz)
+                    B[i, c] = d * t
+                end
+            end
+        else
+            for i in (up ? (k:-1:1) : (1:k))
+                len = up ? (i - 1) : (k - i); rs = up ? 1 : (i + 1)
+                aptr = pA + ((i - 1) * lda + (rs - 1)) * sz
+                d = unit ? one(T) : A[i, i]
+                for c in 1:n
+                    s = len > 0 ? _dot_simd(len, aptr, pB + ((c - 1) * ldb + (rs - 1)) * sz, T) : zero(T)
+                    B[i, c] = muladd(d, B[i, c], s)
+                end
+            end
+        end
+    end
+    return B
+end
+# Materialized-triangle base: copy op(A)'s stored triangle into a dense scratch (other half zero, unit
+# diag → 1) and run ONE gemm — 2× the triangle's flops but at gemm throughput, with no per-column calls.
+# OB's trmm base is throughput-bound (a multiply, unlike trsm's sequential solve), so this is the base
+# that keeps up; the recursion's true gemm off-diagonals bound the waste to ~base/k. Real non-conj.
+function _mat_tri!(M, A, k::Int, up::Bool, tr::Bool, unit::Bool)
+    T = eltype(M)
+    @inbounds if !tr
+        for j in 1:k                             # N: per column, copy the stored segment + zero the rest
+            lo = up ? 1 : j; hi = up ? j : k     # (contiguous — the compiler vectorizes both loops)
+            @simd for i in 1:(lo - 1); M[i, j] = zero(T); end
+            @simd for i in lo:hi; M[i, j] = A[i, j]; end
+            @simd for i in (hi + 1):k; M[i, j] = zero(T); end
+            unit && (M[j, j] = one(T))
+        end
+    else                                         # T: transpose-on-store (strided source, scalar)
+        for j in 1:k
+            lo = up ? j : 1; hi = up ? k : j     # M column j = op(A) col j = A row j, stored part
+            @simd for i in 1:(lo - 1); M[i, j] = zero(T); end
+            for i in lo:hi; M[i, j] = A[j, i]; end
+            @simd for i in (hi + 1):k; M[i, j] = zero(T); end
+            unit && (M[j, j] = one(T))
+        end
+    end
+    return M
+end
+const _TRMM_DDIRECT = 4      # ≤ this → dense substitution kernel (beats everything at tiny k)
+# Small-k trmm at HALF flops and gemm throughput: materialize op(A) into a dense scratch (zeros in the
+# unstored half make every read safe), copy B to scratch (in-place source), then run the UNPACKED gemm
+# micro-kernels with a per-tile K-TRIM — each C-tile contracts only the p-range where M's triangle is
+# nonzero, so the only waste is the mr×mr (or nr×nr) diagonal straddle. No packing, no per-column calls.
+# Requires k ≤ _L3_NB (the M scratch); real non-conj.
+function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
+    T = eltype(B); k = size(A, 1)
+    upM = (up != tr)                                     # op(A)'s triangle after the on-store transpose
+    M = _l3_tmp(T); _mat_tri!(M, A, k, up, tr, unit)     # full matrix scratch: ldM = _L3_NB, no view
+    W = _vwidth(T); mr = _MR * W; nr = _NR; sz = sizeof(T)
+    ldM = _L3_NB; ldb = stride(B, 2)
+    if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
+        n = size(B, 2)                                   # upM → top-down row-tiles (each reads rows ≥ its
+        GC.@preserve M B begin                           # start, still untouched; registers hold the tile
+            Mp = pointer(M); Bp = pointer(B)             # between read and store). lower → bottom-up.
+            nt = cld(k, mr)
+            for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
+                ir = t * mr; mre = min(mr, k - ir)
+                plo = upM ? ir : 0
+                phi = upM ? k : min(k, ir + mre)
+                Ap = Mp + plo * ldM * sz; kc = phi - plo
+                jr = 0
+                while jr < n
+                    nre = min(nr, n - jr)
+                    # The B-operand aliases the store target. Full-strip kernels hold the whole tile in
+                    # registers (safe). The EDGE kernel is W-row-block serial: for upper M the zero triangle
+                    # exactly masks the stale rows; for lower M it does NOT — copy the strip's source
+                    # columns to scratch first.
+                    if mre == mr && nre == nr
+                        _microkernel_unpacked!(Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                            one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true))
+                    elseif nre == nr
+                        _microkernel_unpacked_mrows!(Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                            one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
+                            Val(_NR), Val(false), Val(true))
+                    elseif upM
+                        _microkernel_unpacked_edge!(Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                            one(T), zero(T), mre, nre, false, true)
+                    else
+                        Ec = _trsm_tmp(T, _L3_NB, nr)    # kc×nre source copy (dodges the serial aliasing)
+                        lde = size(Ec, 1)
+                        GC.@preserve Ec begin
+                            Ep = pointer(Ec)
+                            @inbounds for j in 0:(nre - 1), p in 0:(kc - 1)
+                                unsafe_store!(Ep, unsafe_load(Bp, plo + p + (jr + j) * ldb + 1), p + j * lde + 1)
+                            end
+                            _microkernel_unpacked_edge!(Bp, ldb, Ap, ldM, ir, Ep - jr * lde * sz, lde, jr, kc,
+                                one(T), zero(T), mre, nre, false, true)
+                        end
+                    end
+                    jr += nr
+                end
+            end
+        end
+    else                                                 # B(m×k) := B·M, IN PLACE: upM → column-tiles
+        m = size(B, 1)                                   # right-to-left (each reads cols ≤ its end, i.e.
+        GC.@preserve M B begin                           # untouched to its left); lower → left-to-right.
+            Mp = pointer(M); Bp = pointer(B)
+            nt = cld(k, nr)
+            # Row-blocks OUTER: the in-place hazard is row-local (each tile reads/writes only its own
+            # rows), so row-blocks are independent — hoisting them keeps the 16×k A-slab L1-resident
+            # across its column tiles instead of re-streaming all m×k per tile (the wide-m killer).
+            ir = 0
+            while ir < m
+                mre = min(mr, m - ir)
+                for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
+                    jr = t * nr; nre = min(nr, k - jr)
+                    plo = upM ? 0 : jr
+                    phi = upM ? min(k, jr + nre) : k
+                    Bsp = Mp + plo * sz; kc = phi - plo
+                    if mre == mr && nre == nr
+                        _microkernel_unpacked!(Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                            one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true))
+                    elseif nre == nr
+                        _microkernel_unpacked_mrows!(Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                            one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
+                            Val(_NR), Val(false), Val(true))
+                    else
+                        # Edge kernel is COLUMN-serial and the A-operand is B itself: column j+1's
+                        # contraction re-reads columns already stored (they're inside [plo,phi) on both
+                        # uplos). Compute the strip into a dest scratch, copy back after.
+                        Ec = _trsm_tmp(T, mr, nr); lde = size(Ec, 1)
+                        GC.@preserve Ec begin
+                            Ep = pointer(Ec)
+                            _microkernel_unpacked_edge!(Ep - (ir + jr * lde) * sz, lde,
+                                Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                one(T), zero(T), mre, nre, false, true)
+                            @inbounds for j in 0:(nre - 1), r in 0:(mre - 1)
+                                unsafe_store!(Bp, unsafe_load(Ep, r + j * lde + 1),
+                                    ir + r + (jr + j) * ldb + 1)
+                            end
+                        end
+                    end
+                end
+                ir += mr
+            end
+        end
+    end
+    return B
+end
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if k <= _TRMM_BASE                              # base: trmv on each B column (contiguous)
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
+        return k <= _TRMM_DDIRECT ? _trmm_dense_L!(up, tr, unit, A, B) :
+                                    _trmm_small!(true, up, tr, unit, A, B)
+    elseif k <= _TRMM_BASE                          # complex/AD: trmv on each B column (contiguous)
         @inbounds for c in axes(B, 2)
             _trmv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
         end
@@ -88,30 +253,71 @@ end
 
 function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
+        return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+                                    _trmm_small!(false, up, tr, unit, A, B)
+    elseif eltype(B) <: BlasReal && !cj
+        # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
+        # STORED rectangular A-view (transB carries op; no materialize) + a diagonal solved by the
+        # halving recursion (→ _trmm_small! bases). Big panels keep the gemms fat (skinny n=128 gemms
+        # measured 0.85 at 2048); the flat level touches B only twice. Diagonal FIRST (consumes the
+        # panel's ORIGINAL values), then += off-diagonal (reads other, still-original panels).
+        # upM → right-to-left; lower → left-to-right.
+        upM = (up != tr); P = _TRMM_RPANEL
+        np = cld(k, P)
+        for t in (upM ? ((np - 1):-1:0) : (0:(np - 1)))
+            jc = t * P; pc = min(P, k - jc)
+            Bpan = view(B, :, (jc + 1):(jc + pc))
+            Adia = view(A, (jc + 1):(jc + pc), (jc + 1):(jc + pc))
+            _trmm_right_recur!(up, tr, cj, unit, Adia, Bpan)
+            if upM && jc > 0                     # off-diag: Bpan += B[:,1:jc]·op(A)[1:jc, jc+1:jc+pc]
+                Ablk = tr ? view(A, (jc + 1):(jc + pc), 1:jc) : view(A, 1:jc, (jc + 1):(jc + pc))
+                _gemm_core!(Bpan, view(B, :, 1:jc), Ablk, one(eltype(B)), one(eltype(B)),
+                    false, tr, false, false)
+            elseif !upM && jc + pc < k           # off-diag: Bpan += B[:,jc+pc+1:k]·op(A)[jc+pc+1:k, …]
+                Ablk = tr ? view(A, (jc + 1):(jc + pc), (jc + pc + 1):k) :
+                            view(A, (jc + pc + 1):k, (jc + 1):(jc + pc))
+                _gemm_core!(Bpan, view(B, :, (jc + pc + 1):k), Ablk, one(eltype(B)), one(eltype(B)),
+                    false, tr, false, false)
+            end
+        end
+        return B
+    elseif k <= _TRMM_BASE
+        return _trmm_right_base!(up, tr, cj, unit, k, A, B)
+    end
+    return _trmm_right_recur!(up, tr, cj, unit, A, B)
+end
+# Halving recursion (diagonal blocks of the flat loop + the complex/AD path).
+function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+    k = size(A, 1)
     if k <= _TRMM_BASE
+        if eltype(B) <: BlasReal && !cj
+            return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+                                        _trmm_small!(false, up, tr, unit, A, B)
+        end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
     h = _trsplit(k)
     A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):k, (h + 1):k)
     B1 = view(B, :, 1:h); B2 = view(B, :, (h + 1):k)
-    # Mirror of left, with B column-blocks and transB carrying op(A). up≠tr → off-diagonal feeds B2
+    # Mirror of left, with B column-blocks and transB carrying op(A). up≠tr → the off-diagonal feeds B2
     # (process B2's diagonal first, gemm B2+=B1·off, then B1); up==tr → feeds B1.
     if up != tr
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trmm_right!(up, tr, cj, unit, A22, B2)
+        _trmm_right_recur!(up, tr, cj, unit, A22, B2)
         _gemm_accR!(B2, B1, off, tr, cj)
-        _trmm_right!(up, tr, cj, unit, A11, B1)
+        _trmm_right_recur!(up, tr, cj, unit, A11, B1)
     else
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trmm_right!(up, tr, cj, unit, A11, B1)
+        _trmm_right_recur!(up, tr, cj, unit, A11, B1)
         _gemm_accR!(B1, B2, off, tr, cj)
-        _trmm_right!(up, tr, cj, unit, A22, B2)
+        _trmm_right_recur!(up, tr, cj, unit, A22, B2)
     end
     return B
 end
-# C += B·op(A): gemm with transB carrying op(A) (B is the left "A" operand, untransposed).
+# C += B·op(A): straight to the dispatch core (transB carries op; shapes guaranteed by the recursion).
 @inline _gemm_accR!(C, Bmat, A, tr::Bool, cj::Bool) =
-    gemm!(C, Bmat, A; alpha = true, beta = true, transA = 'N', transB = _opchar(tr, cj))
+    _gemm_core!(C, Bmat, A, one(eltype(C)), one(eltype(C)), false, tr, false, cj)
 
 # x := op(A)·x / op(A)⁻¹·x entry: B := α·op(A)·B (side L) or α·B·op(A) (side R), A triangular.
 function _trmm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::Number, A, B)
@@ -559,6 +765,11 @@ end
 const _L3_NB = 128
 const _L3_TMP = IdDict{DataType, Matrix}()
 _l3_tmp(::Type{T}) where {T} = get!(() -> Matrix{T}(undef, _L3_NB, _L3_NB), _L3_TMP, T)::Matrix{T}
+# The IdDict lookup costs ~130 ns — more than an entire tiny trmm. Const-dispatch the gated types.
+const _L3_TMP_F64 = Matrix{Float64}(undef, _L3_NB, _L3_NB)
+const _L3_TMP_F32 = Matrix{Float32}(undef, _L3_NB, _L3_NB)
+@inline _l3_tmp(::Type{Float64}) = _L3_TMP_F64
+@inline _l3_tmp(::Type{Float32}) = _L3_TMP_F32
 
 # Triangular-store microkernel: same FMA as the gemm masked microkernel, but on store keeps only the
 # stored-triangle entries — for a diagonal-straddling C-tile whose top-left global offset is (r0,c0),
