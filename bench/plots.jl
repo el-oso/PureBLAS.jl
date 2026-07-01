@@ -1,10 +1,11 @@
 # Generates the performance plots embedded in docs/src/performance.md: per-op PureBLAS/OpenBLAS ratio
-# (single-thread, Float64) for BLAS-1 and BLAS-2, drawn as VIOLINS over the size sweep. Hand-written SVG —
-# no plotting dependency (keeps the bench env light, matches the pure/minimal ethos). Same interleaved-
-# paired methodology as the other bench scripts.
+# (single-thread, Float64). BLAS-1/2 as VIOLINS (ratio distribution over the size sweep); BLAS-3/LAPACK as
+# ratio-vs-size TREND lines on a log-y axis (their ratio has a strong size dependence — small n is
+# overhead-bound, large n gates). Hand-written SVG — no plotting dependency (keeps the bench env light,
+# matches the pure/minimal ethos). Interleaved-paired methodology, same as the other bench scripts.
 #
-# The measured ratio samples are CACHED to bench/plots_data_<host>.txt so the (slow) benchmark runs once
-# and re-plotting (styling tweaks) is instant. Usage (pinned):
+# Measured ratio samples are CACHED per-size to bench/plots_data_<host>.txt so the (slow) benchmark runs
+# once and re-plotting (styling tweaks) is instant. Usage (pinned):
 #   taskset -c 2 julia --project=bench bench/plots.jl          # use cache if present, else measure + cache
 #   taskset -c 2 julia --project=bench bench/plots.jl bench    # force re-measure (refresh the cache)
 #   julia --project=bench bench/plots.jl plot                  # plot from cache only (never measure)
@@ -13,37 +14,56 @@ import LinearAlgebra.BLAS as B
 BLAS.set_num_threads(1)
 const SINK = Ref(0.0); @noinline _run(f) = f()
 
-# Sweep an op over `sizes`, pooling every round's interleaved ratio into one sample vector (the violin's
-# data). Each round allocates a FRESH context (`mk(s)`) so the sample spans real address/alignment variation
-# — essential for `iamax`, where OpenBLAS's `idamax` timing swings ~60% by array address: reusing one buffer
-# would freeze the ratio at a single (possibly unlucky) alignment. Timing is interleaved (OpenBLAS then
-# PureBLAS back-to-back, drift cancels) and both are warmed on the fresh buffer first (page-fault fairness).
-# The gate verdict (geomean, worst) uses the per-SIZE medians — noise-robust, unlike a raw sample min.
-# repfn(s) sets reps/size so total work per round stays ~constant (O(s) L1, O(s²) L2).
+# name => per-size samples: [(size, [ratio,ratio,…]), …]. One data model feeds both plot types.
+const OpData = Pair{String,Vector{Tuple{Int,Vector{Float64}}}}
+sizemeds(op) = [(s, median(v)) for (s, v) in op]                    # per-size median ratio
+pooled(op) = reduce(vcat, (v for (_, v) in op); init = Float64[])   # all samples (for violins)
+geomin(op) = (m = [median(v) for (_, v) in op]; (exp(sum(log, m) / length(m)), minimum(m)))
+
+# L1/L2 sweep: each round is one fresh context (address/alignment varies — essential for iamax, whose
+# OpenBLAS idamax swings ~60% by address), interleaved OpenBLAS-then-PureBLAS timing (drift cancels).
 function sweep(mk, sizes, work_ob, work_pb, repfn; rounds = 20)
-    samples = Float64[]; sizemed = Float64[]
+    out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
         reps = repfn(s); rs = Float64[]
         for _ in 1:rounds
-            ctx = mk(s)                                              # fresh each round → varied alignment
-            _run(() -> work_ob(ctx, 1)); _run(() -> work_pb(ctx, 1))   # warm this buffer
+            ctx = mk(s)
+            _run(() -> work_ob(ctx, 1)); _run(() -> work_pb(ctx, 1))    # warm this buffer
             t0 = time_ns(); v1 = _run(() -> work_ob(ctx, reps)); t1 = time_ns()
             v2 = _run(() -> work_pb(ctx, reps)); t2 = time_ns()
-            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))     # OpenBLAS / PureBLAS
+            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))
         end
-        append!(samples, rs); push!(sizemed, median(rs))
+        push!(out, (s, rs))
     end
-    return (samples, exp(sum(log, sizemed) / length(sizemed)), minimum(sizemed))
+    return out
 end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 
-const OpData = Pair{String,Tuple{Vector{Float64},Float64,Float64}}   # name => (ratio samples, geomean, worst)
+# Heavy O(n³) sweep for L3 / LAPACK: `op1(ctx)` does ONE (often destructive) call; fresh input per round
+# (one call already dominates). Interleaved, fewer rounds (compute-bound → not alignment-volatile).
+function sweep_heavy(mk, ob1, pb1, sizes; rounds = 8)
+    out = Tuple{Int,Vector{Float64}}[]
+    for s in sizes
+        _run(() -> ob1(mk(s))); _run(() -> pb1(mk(s)))     # compile warm
+        rs = Float64[]
+        for _ in 1:rounds
+            co = mk(s); cp = mk(s)                          # fresh inputs (allocated OUTSIDE timing)
+            t0 = time_ns(); v1 = ob1(co); t1 = time_ns(); v2 = pb1(cp); t2 = time_ns()
+            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))
+        end
+        push!(out, (s, rs))
+    end
+    return out
+end
+
 const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 const L2SZ = (64, 128, 256, 512, 1024, 2048, 4096)
+const L3SZ = (128, 256, 512, 1024, 2048)          # O(n³) — small n is overhead-bound (shown honestly)
+const LPSZ = (128, 256, 512, 1024, 2048)          # LAPACK factorizations
 const TN = Char(78); const TT = Char(84); const U = Char(85)
 
-# Run the full benchmark sweep; returns (l1, l2) as vectors of OpData.
+# Run the full benchmark sweep; returns (l1, l2, l3, lp) as vectors of OpData.
 function run_benchmarks()
 # ── BLAS-1 ──────────────────────────────────────────────────────────────────────────────────────
 l1 = OpData[]
@@ -94,28 +114,76 @@ let
     add("sbmv", sbd, (c, m) -> (for _ in 1:m; B.sbmv!(U, c[4], 1.0, c[1], c[2], 0.0, c[3]); end; c[3][1]),
         (c, m) -> (for _ in 1:m; PureBLAS.sbmv!(c[3], c[1], c[2]; uplo = U, alpha = 1.0, beta = 0.0); end; c[3][1]))
 end
-    return l1, l2
+
+# ── BLAS-3 (O(n³), destructive trmm/trsm; fresh input per round) ──────────────────────────────────
+l3 = OpData[]
+let
+    NN = Char(78); LT = Char(76); UP = Char(85)
+    tri(s) = (A = randn(s, s) ./ (2s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; A)
+    addh(nm, mk, ob, pb) = push!(l3, nm => sweep_heavy(mk, ob, pb, L3SZ))
+    addh("gemm", s -> (randn(s, s), randn(s, s), zeros(s, s)),
+        c -> (B.gemm!(NN, NN, 1.0, c[1], c[2], 0.0, c[3]); c[3][1]),
+        c -> (PureBLAS.gemm!(c[3], c[1], c[2]); c[3][1]))
+    addh("symm", s -> (randn(s, s), randn(s, s), zeros(s, s)),
+        c -> (B.symm!(LT, UP, 1.0, c[1], c[2], 0.0, c[3]); c[3][1]),
+        c -> (PureBLAS.symm!(c[3], c[1], c[2]; side = LT, uplo = UP); c[3][1]))
+    addh("syrk", s -> (randn(s, s), zeros(s, s)),
+        c -> (B.syrk!(UP, NN, 1.0, c[1], 0.0, c[2]); c[2][1]),
+        c -> (PureBLAS.syrk!(c[2], c[1]; uplo = UP, trans = NN); c[2][1]))
+    addh("syr2k", s -> (randn(s, s), randn(s, s), zeros(s, s)),
+        c -> (B.syr2k!(UP, NN, 1.0, c[1], c[2], 0.0, c[3]); c[3][1]),
+        c -> (PureBLAS.syr2k!(c[3], c[1], c[2]; uplo = UP, trans = NN); c[3][1]))
+    addh("trmm", s -> (tri(s), randn(s, s)),
+        c -> (B.trmm!(LT, UP, NN, NN, 1.0, c[1], c[2]); c[2][1]),
+        c -> (PureBLAS.trmm!(c[2], c[1]; side = LT, uplo = UP); c[2][1]))
+    addh("trsm", s -> (tri(s), randn(s, s)),
+        c -> (B.trsm!(LT, UP, NN, NN, 1.0, c[1], c[2]); c[2][1]),
+        c -> (PureBLAS.trsm!(c[2], c[1]; side = LT, uplo = UP); c[2][1]))
 end
 
-# ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶geomean⟶TAB⟶worst⟶TAB⟶comma-joined samples» ─────
+# ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────
+lp = OpData[]
+let
+    LP = Char(76)
+    addh(nm, mk, ob, pb) = push!(lp, nm => sweep_heavy(mk, ob, pb, LPSZ; rounds = 6))
+    addh("potrf", s -> (A = randn(s, s); A * A' + s * I + zeros(s, s)),
+        c -> (LinearAlgebra.LAPACK.potrf!(LP, c); c[1, 1]),
+        c -> (PureBLAS.potrf!(c; uplo = LP); c[1, 1]))
+    addh("geqrf", s -> randn(s, s),
+        c -> (LinearAlgebra.LAPACK.geqrf!(c); c[1, 1]),
+        c -> (PureBLAS.geqrf!(c); c[1, 1]))
+    addh("getrf", s -> randn(s, s),
+        c -> (LinearAlgebra.LAPACK.getrf!(c); c[1, 1]),
+        c -> (PureBLAS.getrf!(c); c[1, 1]))
+    addh("gesvd", s -> randn(s, s),
+        c -> (LinearAlgebra.LAPACK.gesdd!(Char(65), c); c[1, 1]),
+        c -> (PureBLAS.gesvd!(c; want_vectors = true); 0.0))
+end
+    return l1, l2, l3, lp
+end
+
+# ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
 const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname()).txt")
-function save_cache(path, l1, l2)
+function save_cache(path, groups)
     open(path, "w") do io
-        for (lvl, d) in (("L1", l1), ("L2", l2)), (nm, (xs, geo, mn)) in d
-            println(io, lvl, "\t", nm, "\t", geo, "\t", mn, "\t", join(xs, ","))
+        for (lvl, d) in groups, (nm, op) in d
+            println(io, lvl, "\t", nm, "\t", join(("$(s)=$(join(v, ","))" for (s, v) in op), ";"))
         end
     end
     println("cached ratio data → $path")
 end
 function load_cache(path)
-    l1 = OpData[]; l2 = OpData[]
+    g = Dict{String,Vector{OpData}}()
     for ln in eachline(path)
         isempty(strip(ln)) && continue
-        lvl, nm, geo, mn, xss = split(ln, "\t")
-        entry = String(nm) => (parse.(Float64, split(xss, ",")), parse(Float64, geo), parse(Float64, mn))
-        push!(lvl == "L1" ? l1 : l2, entry)
+        lvl, nm, blocks = split(ln, "\t")
+        op = Tuple{Int,Vector{Float64}}[]
+        for blk in split(blocks, ";")
+            sp = split(blk, "="); push!(op, (parse(Int, sp[1]), parse.(Float64, split(sp[2], ","))))
+        end
+        push!(get!(g, String(lvl), OpData[]), String(nm) => op)
     end
-    return l1, l2
+    return g
 end
 
 # ── Gaussian KDE (Silverman bandwidth) — the violin's half-width profile ──────────────────────────
@@ -125,19 +193,19 @@ function kde(xs, ys)
     return [invn * sum(x -> (u = (y - x) / h; exp(-0.5 * u * u)), xs) for y in ys]
 end
 
-# ── SVG violins (KDE body + median line + worst-size tick, gate line at 0.96, parity at 1.0) ──────
+# ── SVG violins (BLAS-1/2): KDE body + median line + worst-size tick, gate at 0.96, parity at 1.0 ──
 function svg_violins(path, title, data)
     W = 900; H = 440; ml = 60; mr = 20; mt = 50; mb = 82
     n = length(data); pw = W - ml - mr; ph = H - mt - mb
-    # y-axis top covers the largest sample (nrm2 legitimately ~5× sets the L1 scale), floor 1.6.
-    ymax = max(1.6, maximum(maximum(d.second[1]) for d in data) * 1.06)
+    samps = [pooled(d.second) for d in data]
+    ymax = max(1.6, maximum(maximum(s) for s in samps) * 1.06)
     yof(v) = mt + ph * (1 - v / ymax)
     gap = pw / n; maxw = gap * 0.42; NY = 72
     io = IOBuffer()
     println(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$W" height="$H" font-family="sans-serif">""")
     println(io, """<rect width="$W" height="$H" fill="white"/>""")
     println(io, """<text x="$(W/2)" y="28" text-anchor="middle" font-size="18" font-weight="bold">$title</text>""")
-    for v in (0.0, 0.5, 1.0, 1.5)   # y gridlines + labels
+    for v in (0.0, 0.5, 1.0, 1.5)
         v > ymax && continue
         y = yof(v)
         println(io, """<line x1="$ml" y1="$y" x2="$(W-mr)" y2="$y" stroke="#eee"/>""")
@@ -148,43 +216,87 @@ function svg_violins(path, title, data)
     println(io, """<line x1="$ml" y1="$g96" x2="$(W-mr)" y2="$g96" stroke="#d33" stroke-width="1.5" stroke-dasharray="6 4"/>""")
     println(io, """<text x="$(W-mr)" y="$(g96-5)" text-anchor="end" font-size="11" fill="#d33">0.96× gate</text>""")
     for (i, d) in enumerate(data)
-        xs, geo, mn = d.second
+        xs = samps[i]; _, mn = geomin(d.second)
         cx = ml + (i - 0.5) * gap
         lo = minimum(xs); hi = maximum(xs); pad = 0.12 * (hi - lo) + 2e-3
-        ys = collect(range(max(0.0, lo - pad), min(ymax, hi + pad), length = NY))   # clip top to axis
+        ys = collect(range(max(0.0, lo - pad), min(ymax, hi + pad), length = NY))
         dens = kde(xs, ys); dm = maximum(dens); dm = dm == 0 ? 1.0 : dm
-        col = mn >= 0.96 ? "#2a8" : "#d33"                    # gate verdict = worst per-size median
-        # symmetric body: up the right edge, down the left edge
+        col = mn >= 0.96 ? "#2a8" : "#d33"
         pts = String[]
         for k in 1:NY; push!(pts, "$(round(cx + maxw*dens[k]/dm, digits=1)),$(round(yof(ys[k]), digits=1))"); end
         for k in NY:-1:1; push!(pts, "$(round(cx - maxw*dens[k]/dm, digits=1)),$(round(yof(ys[k]), digits=1))"); end
         println(io, """<polygon points="$(join(pts, " "))" fill="$col" opacity="0.5" stroke="$col" stroke-width="1"/>""")
-        med = median(xs); wmed = maxw * (kde(xs, [med])[1] / dm)
-        ymed = yof(med)
-        println(io, """<line x1="$(round(cx-wmed,digits=1))" y1="$ymed" x2="$(round(cx+wmed,digits=1))" y2="$ymed" stroke="#114" stroke-width="2"/>""")  # median
-        println(io, """<circle cx="$cx" cy="$(yof(mn))" r="2.4" fill="#114"/>""")                          # worst size
+        med = median(xs); wmed = maxw * (kde(xs, [med])[1] / dm); ymed = yof(med)
+        println(io, """<line x1="$(round(cx-wmed,digits=1))" y1="$ymed" x2="$(round(cx+wmed,digits=1))" y2="$ymed" stroke="#114" stroke-width="2"/>""")
+        println(io, """<circle cx="$cx" cy="$(yof(mn))" r="2.4" fill="#114"/>""")
         println(io, """<text x="$cx" y="$(yof(hi)-6)" text-anchor="middle" font-size="11">$(@sprintf("%.2f", med))</text>""")
         println(io, """<text x="$cx" y="$(H-mb+18)" text-anchor="middle" font-size="12">$(d.first)</text>""")
     end
     println(io, """<text x="$(W/2)" y="$(H-12)" text-anchor="middle" font-size="11" fill="#666">violin = ratio distribution over sizes · line = median · dark dot = worst size · green = every size ≥ gate</text>""")
-    println(io, "</svg>")
-    write(path, String(take!(io)))
-    println("wrote $path")
+    println(io, "</svg>"); write(path, String(take!(io))); println("wrote $path")
+end
+
+# ── SVG trend lines (BLAS-3/LAPACK): median ratio vs size, log-x, log-y — small n is overhead-bound ──
+function svg_trend(path, title, data)
+    W = 900; H = 460; ml = 62; mr = 132; mt = 50; mb = 60; pw = W - ml - mr; ph = H - mt - mb
+    allsz = sort(unique(reduce(vcat, [[s for (s, _) in d.second] for d in data])))
+    xlo = log2(minimum(allsz)); xhi = log2(maximum(allsz))
+    xof(s) = ml + pw * (log2(s) - xlo) / (xhi - xlo)
+    ylo = 0.25; yhi = 1.7; ln = log
+    yof(r) = mt + ph * (1 - (ln(clamp(r, ylo, yhi)) - ln(ylo)) / (ln(yhi) - ln(ylo)))
+    pal = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2"]
+    io = IOBuffer()
+    println(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$W" height="$H" font-family="sans-serif">""")
+    println(io, """<rect width="$W" height="$H" fill="white"/>""")
+    println(io, """<text x="$(W/2)" y="28" text-anchor="middle" font-size="18" font-weight="bold">$title</text>""")
+    for r in (0.3, 0.5, 0.7, 1.0, 1.2, 1.5)          # y gridlines (log)
+        y = yof(r)
+        println(io, """<line x1="$ml" y1="$y" x2="$(ml+pw)" y2="$y" stroke="#eee"/>""")
+        println(io, """<text x="$(ml-8)" y="$(y+4)" text-anchor="end" font-size="11" fill="#666">$(r)×</text>""")
+    end
+    for s in allsz                                   # x ticks (log2 sizes)
+        x = xof(s)
+        println(io, """<line x1="$x" y1="$mt" x2="$x" y2="$(mt+ph)" stroke="#f4f4f4"/>""")
+        println(io, """<text x="$x" y="$(mt+ph+18)" text-anchor="middle" font-size="11" fill="#444">$s</text>""")
+    end
+    println(io, """<line x1="$ml" y1="$(yof(1.0))" x2="$(ml+pw)" y2="$(yof(1.0))" stroke="#888"/>""")
+    yg = yof(0.96)
+    println(io, """<line x1="$ml" y1="$yg" x2="$(ml+pw)" y2="$yg" stroke="#d33" stroke-width="1.5" stroke-dasharray="6 4"/>""")
+    println(io, """<text x="$(ml+4)" y="$(yg-5)" font-size="11" fill="#d33">0.96× gate</text>""")
+    for (i, d) in enumerate(data)
+        col = pal[mod1(i, length(pal))]
+        pts = [(xof(s), yof(m)) for (s, m) in sizemeds(d.second)]
+        println(io, """<polyline points="$(join(("$(round(x,digits=1)),$(round(y,digits=1))" for (x,y) in pts), " "))" fill="none" stroke="$col" stroke-width="2"/>""")
+        for (s, m) in sizemeds(d.second)
+            println(io, """<circle cx="$(round(xof(s),digits=1))" cy="$(round(yof(m),digits=1))" r="3" fill="$col"/>""")
+        end
+        ly = mt + 6 + (i - 1) * 18                   # legend (right margin)
+        println(io, """<line x1="$(ml+pw+14)" y1="$ly" x2="$(ml+pw+34)" y2="$ly" stroke="$col" stroke-width="3"/>""")
+        println(io, """<text x="$(ml+pw+38)" y="$(ly+4)" font-size="12">$(d.first)</text>""")
+    end
+    println(io, """<text x="$(ml+pw/2)" y="$(H-10)" text-anchor="middle" font-size="11" fill="#666">matrix size n (log) · y = median ratio (log) · small n is overhead-bound; gates at large n</text>""")
+    println(io, "</svg>"); write(path, String(take!(io))); println("wrote $path")
 end
 
 # ── measure (and cache) or load from cache, then draw ────────────────────────────────────────────
-if "plot" in ARGS                                   # plot-only: cache must exist
+if "plot" in ARGS
     isfile(CACHE) || error("no cache at $CACHE — run without `plot` first to measure")
-    l1, l2 = load_cache(CACHE); println("loaded cached data ← $CACHE")
-elseif !("bench" in ARGS) && isfile(CACHE)          # default: reuse cache if present
-    l1, l2 = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
-else                                                # measure fresh and refresh the cache
-    l1, l2 = run_benchmarks(); save_cache(CACHE, l1, l2)
+    g = load_cache(CACHE); println("loaded cached data ← $CACHE")
+elseif !("bench" in ARGS) && isfile(CACHE)
+    g = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
+else
+    l1, l2, l3, lp = run_benchmarks()
+    g = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp)
+    save_cache(CACHE, ["L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp])
 end
 
 adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
-svg_violins(joinpath(adir, "perf_l1.svg"), "BLAS-1: PureBLAS / OpenBLAS (Zen4, 1 thread, Float64)", l1)
-svg_violins(joinpath(adir, "perf_l2.svg"), "BLAS-2: PureBLAS / OpenBLAS (Zen4, 1 thread, Float64)", l2)
-for (lvl, d) in (("L1", l1), ("L2", l2)), (nm, (xs, geo, mn)) in d
+const TITLE = "PureBLAS / OpenBLAS (Zen4, 1 thread, Float64)"
+svg_violins(joinpath(adir, "perf_l1.svg"), "BLAS-1: $TITLE", g["L1"])
+svg_violins(joinpath(adir, "perf_l2.svg"), "BLAS-2: $TITLE", g["L2"])
+svg_trend(joinpath(adir, "perf_l3.svg"), "BLAS-3: $TITLE", g["L3"])
+svg_trend(joinpath(adir, "perf_lapack.svg"), "LAPACK: $TITLE", g["LP"])
+for lvl in ("L1", "L2", "L3", "LP"), (nm, op) in get(g, lvl, OpData[])
+    geo, mn = geomin(op)
     @printf("%s %-7s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
 end

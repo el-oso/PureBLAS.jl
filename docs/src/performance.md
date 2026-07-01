@@ -36,6 +36,31 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 - **packed/banded** reuse the same per-column kernels (packed and band columns are contiguous);
   `gbmv` uses convolution-style kernels with BLASFEO-style register reuse for wide bands.
 
+## BLAS-3
+
+![BLAS-3 ratio vs OpenBLAS](assets/perf_l3.svg)
+
+The compute-bound level — shown as **median ratio vs size** (log-log), because the ratio has a strong
+size dependence: at small n these are overhead-bound (recursion base cases, packing/setup, tiny trailing
+`gemm`s) and dip below the gate; they climb to and past parity at the large-n regime they target
+(`trmm`/`trsm` gate at n ≥ 512–1024, the others across the range). `gemm` is the BLIS 5-loop with a SIMD
+micro-kernel (unpacked small-matrix path); the rest are built on it:
+
+- **syrk/syr2k/symm** pack the stored/symmetric triangle into `gemm`'s format in a single pass and
+  use a triangular-store micro-kernel at the diagonal (no materialize, no wasted flops).
+- **trmm/trsm** trim the contracted K-range over the zero band per tile; `trsm` inverts small diagonal
+  blocks and applies them as `gemm`s. Both factor/pack into a padded leading dim to dodge power-of-2
+  cache aliasing.
+
+## LAPACK
+
+![LAPACK ratio vs OpenBLAS](assets/perf_lapack.svg)
+
+Factorizations driven by the gated BLAS, again **median ratio vs size** (same small-n overhead story —
+they gate at n ≥ 512). `potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
+with PureBLAS `gemm!`/`trsm!`; `getrf` is blocked right-looking with deferred pivoting; `gesvd` is
+gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transform.
+
 ## Milestones
 
 | Milestone | Scope | Status |
@@ -43,6 +68,8 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 | **M1** | BLAS-1 (axpy, dot, nrm2, asum, scal, copy, swap, iamax; s/d/c/z) | ✅ gate met; LBT `.so` + native API |
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
+| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ gate met at n ≥ 512–1024; small n overhead-bound |
+| **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ gate met at n ≥ 512; small n overhead-bound |
 | **M4** | multithreading | deferred |
 
 Both consumption modes share one kernel set: the **native API** (`PureBLAS.gemv!(…)`, AD-traceable)
