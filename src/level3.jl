@@ -6,7 +6,9 @@
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
 const _TRMM_BASE = 128        # ≤ this → _trmm_small! directly (capped by _L3_NB=128 M scratch)
-const _TRMM_RPANEL = 512       # side-R flat-loop panel width (fat off-diag gemms; diagonal recurses)
+const _TRMM_RPANEL = 512
+const _TRMM_RKC = 384
+const _TRMM_RPACK = 448        # > this → packed single-pass side-R (mirrors the L cut at _GEMM_UNPACK_MAX)       # side-R flat-loop panel width (fat off-diag gemms; diagonal recurses)
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
@@ -251,11 +253,98 @@ end
     _scal!(n, s, p, 1)   # _scal! accepts a pointer (level1)
 end
 
+# Packed single-pass trmm side-R: B := B·op(A) as ONE K-trimmed blocked-gemm sweep (mirror of
+# _trmm_packed!). B is copied once to a contiguous scratch (kills the in-place aliasing outright,
+# O(mk) ≪ O(mk²/2)); op(A) packs per pc-block into nr-panels with zeros outside the triangle and only
+# the rows each column-tile actually contracts (per-tile K-trim at nr granularity — the trim that kept
+# the flat/recursion versions from gemm efficiency lived at panel granularity). Real non-conj.
+const _TRMM_BCR = Ref(Matrix{Float64}(undef, 0, 0))
+function _pack_B_triR!(Bp::Vector{T}, A, pc::Int, kce::Int, k::Int, upM::Bool, tr::Bool,
+        unit::Bool, nr::Int) where {T}
+    np = cld(k, nr)
+    @inbounds for jp in 0:(np - 1)
+        j0 = jp * nr
+        plo = upM ? 0 : max(0, j0 - pc)                              # rows this panel's tiles contract
+        phi = upM ? clamp(j0 + nr - pc, 0, kce) : kce
+        plo >= phi && continue
+        base = jp * nr * kce
+        for p in plo:(phi - 1)
+            gp = pc + p
+            for c in 0:(nr - 1)
+                gj = j0 + c
+                v = if gj < k && (upM ? (gp <= gj) : (gp >= gj))
+                    (unit && gp == gj) ? one(T) : (tr ? A[gj + 1, gp + 1] : A[gp + 1, gj + 1])
+                else
+                    zero(T)
+                end
+                Bp[base + p * nr + c + 1] = v
+            end
+        end
+    end
+    return
+end
+function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {T<:BlasReal}
+    m, k = size(B); W = _vwidth(T); mr = _MR * W; nr = _NR
+    upM = (up != tr)
+    kc = min(_TRMM_RKC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(k, nr) * nr * kc)
+    Bc = _TRMM_BCR[]
+    (size(Bc, 1) < m || size(Bc, 2) < k) && (Bc = _TRMM_BCR[] = Matrix{Float64}(undef, m, k))
+    ldb = stride(B, 2); ldc = stride(Bc, 2); sz = sizeof(T)
+    GC.@preserve B Bc Ap Bp begin
+        pB = pointer(B); pBc = pointer(Bc)
+        @inbounds for j in 0:(k - 1)                                 # capture B (contiguous per-column)
+            unsafe_copyto!(pBc + j * ldc * sz, pB + j * ldb * sz, m)
+        end
+        App = pointer(Ap); Bpp = pointer(Bp)
+        pc = 0; pb = 0
+        while pc < k
+            kce = min(kc, k - pc)
+            _pack_B_triR!(Bp, A, pc, kce, k, upM, tr, unit, nr)
+            ic = 0
+            while ic < m
+                mce = min(mc, m - ic)
+                _pack_A!(Ap, Bc, ic, pc, mce, kce, false, one(T), mr)
+                jr = 0
+                while jr < k
+                    nre = min(nr, k - jr)
+                    plo = upM ? 0 : max(0, jr - pc)                  # per-tile K-trim
+                    phi = upM ? min(kce, jr + nre - pc) : kce
+                    cnt = phi - plo
+                    if cnt > 0
+                        ow = upM ? (pb == 0) : (pb == div(jr, kc))   # first contributing block → β=0
+                        ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir)
+                            Apanel = App + (div(ir, mr) * mr * kce + plo * mr) * sz
+                            Bpanel = Bpp + (div(jr, nr) * nr * kce + plo * nr) * sz
+                            Cblk = pB + ((ic + ir) + jr * ldb) * sz
+                            if mre == mr && nre == nr
+                                ow ? _microkernel!(Ptr{T}(Cblk), ldb, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(_MR), Val(_NR), Val(true)) :
+                                     _microkernel!(Ptr{T}(Cblk), ldb, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(_MR), Val(_NR), Val(false))
+                            else
+                                ow ? _microkernel_masked!(Ptr{T}(Cblk), ldb, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                     _microkernel_masked!(Ptr{T}(Cblk), ldb, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, mre, nre, Val(_MR), Val(_NR), Val(false))
+                            end
+                            ir += mr
+                        end
+                    end
+                    jr += nr
+                end
+                ic += mc
+            end
+            pc += kc; pb += 1
+        end
+    end
+    return B
+end
 function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                                     _trmm_small!(false, up, tr, unit, A, B)
+    elseif B isa StridedMatrix{Float64} && stride(B, 1) == 1 && !cj && k > _TRMM_RPACK
+        return _trmm_packedR!(up, tr, unit, A, B, Float64)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
         # STORED rectangular A-view (transB carries op; no materialize) + a diagonal solved by the
