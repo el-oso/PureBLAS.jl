@@ -85,3 +85,23 @@ end
     gr = ForwardDiff.gradient(g, [1.0, 2.0])
     @test all(isfinite, gr)
 end
+
+@testitem "gesvd (SVD) vs LAPACK — square/tall/wide, σ + reconstruction + orthogonality" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(20)
+    maxe(A, B) = maximum(abs.(A .- B))
+    @testset "$m×$n" for (m, n) in ((1, 1), (2, 2), (8, 8), (40, 25), (64, 64),
+            (129, 96), (200, 200), (96, 160), (300, 257))
+        A0 = randn(m, n)
+        sref = svdvals(A0)
+        # full factorization
+        U, S, Vt = PureBLAS.gesvd!(copy(A0))
+        @test maxe(S, sref) / maximum(sref) < 1e-11                  # singular values match LAPACK
+        @test maxe(U * Diagonal(S) * Vt, A0) < 1e-10                 # A = U Σ Vᵀ
+        @test maxe(U' * U, Matrix(I, size(U, 2), size(U, 2))) < 1e-10   # U orthonormal columns
+        @test maxe(Vt * Vt', Matrix(I, size(Vt, 1), size(Vt, 1))) < 1e-10  # Vᵀ orthonormal rows
+        # values-only path
+        Sv = PureBLAS.gesvd!(copy(A0); want_vectors = false)[1]
+        @test maxe(Sv, sref) / maximum(sref) < 1e-11
+    end
+end
