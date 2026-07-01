@@ -1247,6 +1247,19 @@ function _symm_scr(::Type{T}, n::Int) where {T}
     if isnothing(m) || size(m, 1) < n; m = Matrix{T}(undef, n, n); _SYMM_SCR[T] = m; end
     return m
 end
+# Const-dispatch the gated types (the IdDict get costs ~130 ns — dominates tiny symm).
+const _SYMM_SCR_F64 = Ref(Matrix{Float64}(undef, 0, 0))
+const _SYMM_SCR_F32 = Ref(Matrix{Float32}(undef, 0, 0))
+@inline function _symm_scr(::Type{Float64}, n::Int)
+    m = _SYMM_SCR_F64[]
+    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); _SYMM_SCR_F64[] = m)
+    return m
+end
+@inline function _symm_scr(::Type{Float32}, n::Int)
+    m = _SYMM_SCR_F32[]
+    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); _SYMM_SCR_F32[] = m)
+    return m
+end
 # Branch-free symmetric/Hermitian → dense fill: copy the stored triangle (contiguous column segments),
 # then mirror it to the other triangle. No per-element uplo/diagonal branch in the hot path.
 function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
@@ -1417,7 +1430,13 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     end
     Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
-    side_left ? gemm!(C, Ad, B; alpha = α, beta = β) : gemm!(C, B, Ad; alpha = α, beta = β)
+    if eltype(C) <: BlasReal && !herm     # real: straight to the dispatch core (skip the kwarg layer)
+        T = eltype(C)
+        side_left ? _gemm_core!(C, Ad, B, T(α), T(β), false, false, false, false) :
+                    _gemm_core!(C, B, Ad, T(α), T(β), false, false, false, false)
+    else
+        side_left ? gemm!(C, Ad, B; alpha = α, beta = β) : gemm!(C, B, Ad; alpha = α, beta = β)
+    end
     return C
 end
 function _symm_check(side_left, A, B, C)
@@ -1441,7 +1460,17 @@ end
 # gemm-temp base (the gate path): both rank-k products into an n×n temp, then triangle-add.
 function _syr2k_base!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, n::Int, scr)
     α2 = herm ? conj(α) : α; tX = herm ? 'C' : 'T'; tmp = view(scr, 1:n, 1:n)
-    if !tr
+    if !herm && eltype(C) <: BlasReal
+        # Real: the second product IS the transpose of the first (B·Aᵀ = (A·Bᵀ)ᵀ, and Bᵀ·A = (Aᵀ·B)ᵀ),
+        # so ONE gemm + a symmetrized triangle-add — halves the base's gemm work. Dispatch-core direct.
+        T = eltype(C)
+        tr ? _gemm_core!(tmp, A, B, T(α), zero(T), true, false, false, false) :
+             _gemm_core!(tmp, A, B, T(α), zero(T), false, true, false, false)
+        @inbounds for j in 1:n, i in (up ? (1:j) : (j:n))
+            C[i, j] += tmp[i, j] + tmp[j, i]
+        end
+        return C
+    elseif !tr
         gemm!(tmp, A, B; alpha = α, beta = false, transB = tX); gemm!(tmp, B, A; alpha = α2, beta = true, transB = tX)
     else
         gemm!(tmp, A, B; alpha = α, beta = false, transA = tX); gemm!(tmp, B, A; alpha = α2, beta = true, transA = tX)
