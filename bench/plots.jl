@@ -13,26 +13,24 @@ import LinearAlgebra.BLAS as B
 BLAS.set_num_threads(1)
 const SINK = Ref(0.0); @noinline _run(f) = f()
 
-# Per-round interleaved ratio samples: each round times OpenBLAS then PureBLAS back-to-back (drift cancels)
-# and keeps the paired ratio o/p as one sample. Returns the vector of `rounds` ratios.
-function paired_ratios(ob, pb, rounds)
-    _run(ob); _run(pb)                          # warm (compile + caches)
-    rs = Float64[]
-    for _ in 1:rounds
-        t0 = time_ns(); v1 = _run(ob); t1 = time_ns(); v2 = _run(pb); t2 = time_ns()
-        SINK[] += v1 + v2
-        push!(rs, (t1 - t0) / (t2 - t1))        # OpenBLAS / PureBLAS
-    end
-    return rs
-end
-# Sweep an op over `sizes`, pooling every round's ratio into one sample vector (the violin's data).
-# The gate verdict (geomean, worst) is computed from the per-SIZE medians — noise-robust, unlike a raw
-# sample min. repfn(s) sets reps/size so total work per round stays ~constant (O(s) L1, O(s²) L2).
-function sweep(mk, sizes, work_ob, work_pb, repfn; rounds = 14)
+# Sweep an op over `sizes`, pooling every round's interleaved ratio into one sample vector (the violin's
+# data). Each round allocates a FRESH context (`mk(s)`) so the sample spans real address/alignment variation
+# — essential for `iamax`, where OpenBLAS's `idamax` timing swings ~60% by array address: reusing one buffer
+# would freeze the ratio at a single (possibly unlucky) alignment. Timing is interleaved (OpenBLAS then
+# PureBLAS back-to-back, drift cancels) and both are warmed on the fresh buffer first (page-fault fairness).
+# The gate verdict (geomean, worst) uses the per-SIZE medians — noise-robust, unlike a raw sample min.
+# repfn(s) sets reps/size so total work per round stays ~constant (O(s) L1, O(s²) L2).
+function sweep(mk, sizes, work_ob, work_pb, repfn; rounds = 20)
     samples = Float64[]; sizemed = Float64[]
     for s in sizes
-        ctx = mk(s); reps = repfn(s)
-        rs = paired_ratios(() -> work_ob(ctx, reps), () -> work_pb(ctx, reps), rounds)
+        reps = repfn(s); rs = Float64[]
+        for _ in 1:rounds
+            ctx = mk(s)                                              # fresh each round → varied alignment
+            _run(() -> work_ob(ctx, 1)); _run(() -> work_pb(ctx, 1))   # warm this buffer
+            t0 = time_ns(); v1 = _run(() -> work_ob(ctx, reps)); t1 = time_ns()
+            v2 = _run(() -> work_pb(ctx, reps)); t2 = time_ns()
+            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))     # OpenBLAS / PureBLAS
+        end
         append!(samples, rs); push!(sizemed, median(rs))
     end
     return (samples, exp(sum(log, sizemed) / length(sizemed)), minimum(sizemed))
