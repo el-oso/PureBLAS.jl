@@ -33,7 +33,19 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       (latency-bound otherwise); elementwise kernels 4-way unrolled; nrm2 = SIMD sum-of-squares with
       scaled-lassq fallback on overflow/underflow.
 - [ ] Re-run the gate per-machine on the rest of the fleet (Zen3 AVX2, Zen5 native-AVX512, M5 ARM).
-- [ ] (optional) `benchmark/` PkgBenchmark suite + JSON-saving `bench/` pipeline like PureFFT.
+- [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
+  1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
+     + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
+     `judge(PureBLAS, "HEAD", <base branch>)` on every PR and **BLOCKS the merge on a >25% slowdown** vs
+     base (coarse tol — GitHub runners are noisy/unpinned; catches gross regressions like the 2× back-
+     transform we hit by hand). Graceful skip if the base ref predates the suite. Verified: self=0
+     regressions, simulated 2×-slower ⇒ all 14 flagged.
+  2. **Absolute OpenBLAS gate** — `bench/lapackbench.jl` [save] [potrf geqrf getrf gesvd] [--sizes …]:
+     interleaved-median our/OpenBLAS ratio (≥0.96 gate) + correctness vs LAPACK + per-host ratio baseline
+     (`bench/lapack_baseline_<host>.txt`) that flags a ratio DROP even above the gate. Run pinned:
+     `taskset -c 2 julia --project=bench bench/lapackbench.jl`.
+  `bench/`: bench_gemm/bench_level1/l3bench (manual L1/L3 gate sweeps). Correctness is guarded by the
+  7130-item suite + StrictMode. `benchmark/base.json` is a machine-specific local baseline (wintermute).
 
 ### ⚠️ Key finding — LBT live-forward is blocked (juliac limitation, not a PureBLAS bug)
 
@@ -321,17 +333,64 @@ inherent residual at large n; 512 is small-n overhead (O(n²)/O(n³)). DON'T re-
 To gate 3072: a cheaper whole-matrix anti-alias (or overlap the copy); 512: lower fixed overhead. Both deep
 diminishing returns. kb: `pureblas-lu`.
 
-## LAPACK — SVD — NOT STARTED; scoped for a fresh session (port faer Rust + PureBLAS blocks)
-Per user: **port from faer's actual Rust** (`faer-rs` repo `faer/src/linalg/svd/`) using PureBLAS's
-`gemm!`/`trsm!` + the QR Householder kernels (`qr_unblocked!`) we already have. Layers (reuse the
-Cholesky/QR recipe — port the irreducible SIMD kernel, drive the blocked level with PureBLAS BLAS):
-1. **gebrd** — two-sided Householder bidiagonalization (A → U·B·Vᵀ, B upper-bidiagonal). The tractable
-   foundation; reuses the QR reflector kernel both sides. faer: `bidiag.rs`.
-2. **bidiagonal SVD** — implicit-QR (`bdsqr`) or divide-and-conquer (`bdsdc`) on B. The hard core. faer:
-   `svd/bidiag_svd.rs` (D&C).
-3. **back-transform** singular vectors through U/V (gemm). faer: `svd/mod.rs` driver.
-Oracle: LAPACK `gesdd`/`gesvd` (singular values; vectors up to sign/rotation). Big multi-file effort —
-start a fresh session with clean context. Fetch faer source via `gh api repos/sarah-quinones/faer-rs/...`.
+## LAPACK — SVD (gesvd!) — ✅ CORRECT (all shapes ~1e-14) + GATES ALL n 96–2048 (valley eliminated 2026-07-01)
+Fourth LAPACK routine. `src/svd.jl` (gebrd + bdsqr + driver + blocked back-transform) and `src/svd_dc.jl`
+(divide-and-conquer bidiagonal solver, faithful faer port). Two paths in `gesvd!(A; want_vectors)`:
+values-only → bdsqr (cheap); vectors → bdsdc D&C (per user's gate decision: oracle = `gesdd`, D&C).
+**Correct:** A=U·Σ·Vᵀ ~1e-14, σ vs LAPACK ~1e-15, U/Vᵀ orthonormal, square/tall/wide. Suite covers it.
+
+**Gate (vs `gesdd`, Zen4, interleaved-median): VECTORS gate ≥0.96× at EVERY n 96→1024 (worst 0.970 @168);
+VALUES gate ALL n (128 … 2048).** The old small-n VALLEY (144–224 = 0.88–0.95×, worst 0.73× @192) is GONE
+as of 2026-07-01 — three changes eliminated it (the whole gap was small-n `bdsdc`; `gebrd` already BEATS
+LAPACK 1.2–1.4× there, back-transform beats OB's ormbr):
+1. **`_compute_singular_vectors!` restructure** — compute each column's `o` nonzeros contiguously into `vbuf`
+   (divisions vectorize), norm O(n)→O(o), single scatter via precomputed `rowidx`; `vm` reuses `dgp*zhp`.
+   Fixed n=192 0.73→0.98.
+2. **`_SEC_BISECT_CAP` 4→0** (secular finder) — faer's pre-secant bounded bisection (5 iters) is only a
+   secant warm-start; secant + the `use_bisection` fallback already guarantee convergence, so CAP=0 saves
+   ~4 secular-eq evals/root with ZERO correctness change (stress: clustered/graded/repeated/tiny-gap spectra
+   n≤512 all ~1.7e-14). Cleared n=152–224. **Root-finding is ~45% of bdsdc (verified vs LAPACK `dbdsdc` +
+   inclusive-count profile) — this is the decisive lever, NOT the ~10% an earlier note wrongly claimed.**
+3. **`_SVD_DC_CROSS` 144→128** — with the merge cheap, bdsdc beats bdsqr at 136–144 (0.99× vs 0.92×) while
+   n=120 still prefers bdsqr. Fixed n=144.
+Also: `f_max` computed only when `last` (dead for non-last roots). See kb `pureblas-svd` for the sweep +
+disproven levers (threshold-down, crossover-up were disproven BEFORE the CAP cut, then the crossover optimum
+moved once the merge got cheaper — the coupled system is real).
+
+Earlier large-n gating history (2026-06-30..07-01) — **larfg SIMD-norm:**
+`_larfg!` used `hypot` in its norm loop → O(n²) Base.hypot in gebrd (the THIRD time hypot-in-a-loop bit,
+after the SVD-normalization and givens fixes). SIMD sum-of-squares + sqrt (scaled-hypot fallback on
+overflow only) → **gebrd 128 0.80→0.99, 256→1.36, 384 0.85→1.18**; lifted SVD VECTORS 384→gate and
+VALUES→gate everywhere.
+Two 2026-07-01 wins: **(1) gemm `transA='T'` unpacked path** — the back-transform's `W=VᵀC` (transA='T')
+forced blocked+PACKED (packs the large C) → 0.58× @256; added a transA='T' unpacked route in `gemm.jl`
+(SIMD-transpose A→Aᵀ via `_tblk!` into scratch, then the unpacked N·N kernel, no B-packing). Cross-cutting:
+gemm-T ≤448 now 0.98–1.16×; lifted SVD 384→0.92, 768→gate. **(2) po2-pad the back-transform accumulator** —
+`VᵀC`'s C is the SVD's own UA/Vmat; at n%256==0 its column stride thrashes ≤2 L1 sets (gcd(n/8,64)≥32).
+Pad the leading dim +8 (view into a padded buffer, no per-gemm copy) → **256 0.85→0.98, 512→1.18, 768→1.00
+GATE**. Grind (2026-06-30..07-01), driven by isolating `bdsdc!`
+vs `LAPACK.bdsdc!`: the unlock was the **`hypot`-in-a-loop singular-vector normalization** → SIMD
+sum-of-squares (**isolated bdsdc now 1.22× — BEATS LAPACK dbdsdc**); plus `_mkgivens`/`_givens` hypot→sqrt,
+bdsqr scale-to-O(1), `@simd` `_secular_eq`, SIMD Givens, crossover→96, **gebrd `_BRD_NB`→16 + direct `_gemv!`
+kernel in `_labrd` + decoupled back-transform `_BT_NB`=32**. (Correction: an earlier note here called the root
+finder "a red herring, ~10% of bdsdc" — that was WRONG; direct measurement showed ~45%, and the CAP=0 cut
+above is what closed the small-n valley.) See kb `pureblas-svd`.
+
+Three layers, the proven faer recipe (port the irreducible kernel, drive the blocked level with PureBLAS):
+1. **gebrd** (`gebrd!`/`_labrd!`) — blocked two-sided Householder bidiag (LAPACK dgebrd: dlabrd panel +
+   2 trailing `gemm!`). **Matches LAPACK (1.01× @512)** after the strided-row fix (route every row-vector
+   of A/X/Y through a contiguous buffer — the gemv kernels already match OpenBLAS; the 3× gap was the
+   strided access, same disease as formP). m<n handled by transpose.
+2. **bidiagonal SVD** — `bdsdc!`/`_dc!` (D&C, faer `bidiag_svd.rs`: secular-equation root finder, deflation
+   43/44, rank-one merge `compute_svd_of_m`, augmented (n+1)×(n+1) U) for vectors; `bdsqr!` (Golub-Kahan
+   implicit-QR) for values-only. D&C is compute-bound on the secular solver (the small/mid-n gate limiter —
+   LAPACK dlasd4's constant factor). Serial post-order ⇒ one shared scratch-buffer set across all nodes.
+3. **back-transform** — `_apply_reflectors_left!`: blocked compact-WY (dlarft + dlarfb via `gemm!`) applies
+   the gebrd reflectors directly to the bidiagonal singular vectors, FUSING form-Q/P + combine into one
+   BLAS-3 pass (replaced the old gemv-based `_form_Q!`/`_form_P!`). dlarft writes only T's upper triangle —
+   zero-init T (the full `gemm!(Y=T·W)` reads the lower triangle).
+**Remaining:** re-run the gate per-machine on the fleet (Zen3/Zen5/M5). Float64 vectors path only; generic
+`T<:Number`/AD SVD deferred. kb: `pureblas-svd`.
 
 ### (historical, Cholesky) generic recursion tuning — CORRECT + AD, maxed ~0.81 before the faer port
 First LAPACK routine, `src/lapack.jl`. Recursive (cache-oblivious) Cholesky on the gated L3: split 2×2 →
@@ -401,8 +460,13 @@ Dead ends: dense-routing (0.11–0.28×), per-diagonal/transpose (gather). tpmv/
 LinearAlgebra wrapper → ccall OpenBLAS `_64_` symbols for the gate.
 
 **Core L2 is complete:** gemv, ger, symv, hemv, trmv, trsv + the 9 packed/banded routines.
-Remaining L2 (optional): packed/full rank updates spr/spr2/hpr/hpr2.
-Then the rest of L3 (symm/syrk/herk/syr2k/her2k/trmm/trsm).
+**L2 rank updates DONE + GATED (2026-07-01):** spr/spr2 (symmetric packed rank-1/2, real) + hpr/hpr2
+(Hermitian packed, complex). `src/level2_packed.jl` — per-column contiguous packed-column axpy reusing
+`_axpy_simd!` (real SIMD path) + generic scalar (complex / AD). Correct vs OpenBLAS `spr` and a dense
+oracle ~1e-16 (upper/lower, s/d/c/z), ForwardDiff-traceable. **spr GATES 1.02–1.09×, spr2 1.01–1.12×
+(n=256–4096)**; hpr/hpr2 correct-but-generic (complex SIMD deferred to M5, like the other complex ops).
+Native API mirrors `ger!`: `spr!(α,x,AP;uplo)`, `spr2!(α,x,y,AP;uplo)`, `hpr!`/`hpr2!`. **BLAS L1/L2/L3
+now complete.** Next: LAPACK breadth (eigensolvers), or M4/M5/M6.
 
 ## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
 
