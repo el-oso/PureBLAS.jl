@@ -34,3 +34,22 @@ jobs:
           file: lcov.info
           format: lcov
           fail-on-error: false
+
+  perf:
+    name: Perf regression (PkgBenchmark judge)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # judge checks out the PR base ref → needs full history
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      # Blocks the merge on a >25% slowdown vs the base branch (coarse: shared runners are noisy — see
+      # benchmark/judge_ci.jl). Precise 0.96× OpenBLAS gating runs on a pinned self-hosted fleet runner.
+      - name: Judge performance vs base branch
+        run: julia --project=benchmark benchmark/judge_ci.jl
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
