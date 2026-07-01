@@ -68,13 +68,29 @@ const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune i
 # Blocked compact-WY QR. Reduce each nb-panel (qr_unblocked!), build V (unit-lower-trapezoid) + the
 # compact-WY T (dlarft), then apply Qᵀ to the trailing block: C −= V·(Tᵀ·(Vᵀ·C)) — the two big gemms via
 # PureBLAS's cache-blocked gemm! (VᵀV and the trailing get gemm; Y=TᵀW is tiny → scalar).
+# Cached blocked-QR workspace (V m×nb, Tm/G nb×nb, Wb/Yb nb×n) — a fresh 5-matrix alloc per call
+# dominated geqrf at n=32–64. Regrown on demand; single-thread (like the other L3/LAPACK scratches).
+const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0),
+    Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0)))
+@inline function _qr_ws(m::Int, n::Int, nb::Int)
+    V, Tm, G, Wb, Yb = _QR_WS[]
+    if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
+        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
+        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Yb = Matrix{Float64}(undef, nb, n)
+        _QR_WS[] = (V, Tm, G, Wb, Yb)
+    end
+    return V, Tm, G, Wb, Yb
+end
 function geqrf!(A::StridedMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
     nb = clamp(nb, 1, k)
-    V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
-    G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Yb = Matrix{Float64}(undef, nb, n)
+    if k <= nb && n <= nb                     # single panel, no trailing update — no workspace needed
+        qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
+        return A
+    end
+    V, Tm, G, Wb, Yb = _qr_ws(m, n, nb)
     pc = 1
     @inbounds while pc <= k
         pb = min(nb, k - pc + 1)

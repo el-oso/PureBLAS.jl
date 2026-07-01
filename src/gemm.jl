@@ -284,13 +284,28 @@ end
 # into the middle of a larger panel buffer (used by the in-place trmm, which packs a whole B column-panel
 # across all pc-blocks before overwriting B). AbstractVector so a `view` into that buffer is accepted.
 function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
-    if !tB && B isa StridedMatrix{T} && stride(B, 1) == 1 && T <: BlasReal && _vwidth(T) == nr &&
-       Bp isa Vector{T}
-        return _pack_B_simd!(Bp, B, pc, jc, kce, nce, nr, boff)
-    end
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * nr * kce
+        if ji * nr + nr <= nce                       # full panel: branch-free, `@simd ivdep` vectorizes the
+            j0 = jc + ji * nr                        # contiguous stores (reads stay elementwise — a wide
+            if tB                                    # vload here stalls on freshly-written C operands, e.g.
+                for p in 0:(kce - 1)                 # geqrf's trailing update: measured −25% with _tblk!).
+                    gp = pc + p
+                    @simd ivdep for c in 0:(nr - 1)
+                        Bp[base + p * nr + c + 1] = B[j0 + c + 1, gp + 1]
+                    end
+                end
+            else
+                for p in 0:(kce - 1)
+                    gp = pc + p
+                    @simd ivdep for c in 0:(nr - 1)
+                        Bp[base + p * nr + c + 1] = B[gp + 1, j0 + c + 1]
+                    end
+                end
+            end
+            continue
+        end
         for p in 0:(kce - 1)
             for c in 0:(nr - 1)
                 lc = ji * nr + c
@@ -305,40 +320,6 @@ function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int
     end
     return
 end
-# SIMD pack_B (tB='N', W==nr): each nr-column panel is the TRANSPOSE of a kce×nr B-block — lift it with
-# the W×W shuffle-transpose `_tblk!` instead of the scalar per-element gather (which cost ~2% of the
-# whole large-n gemm — the pack_A lesson repeated on the B side). Scalar k-tail + partial last panel.
-function _pack_B_simd!(Bp::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, nr::Int, boff::Int) where {T<:BlasReal}
-    W = nr; sz = sizeof(T); ldb = stride(B, 2)
-    np = cld(nce, nr); ov = Vec{W, T}(one(T)); kfull = (kce ÷ W) * W
-    GC.@preserve B Bp begin
-        Bptr = pointer(B); Pp = pointer(Bp)
-        @inbounds for ji in 0:(np - 1)
-            base = boff + ji * nr * kce; c0g = jc + ji * nr
-            if ji * nr + nr <= nce                     # full nr-wide panel
-                p = 0
-                while p < kfull
-                    _tblk!(Ptr{T}(Pp + (base + p * nr) * sz),
-                        Ptr{T}(Bptr + ((pc + p) + c0g * ldb) * sz), ldb, nr, ov, Val(W))
-                    p += W
-                end
-                while p < kce                          # k tail — scalar row
-                    for c in 0:(nr - 1)
-                        Bp[base + p * nr + c + 1] = B[pc + p + 1, c0g + c + 1]
-                    end
-                    p += 1
-                end
-            else                                       # partial last panel — scalar with zero fill
-                for p in 0:(kce - 1), c in 0:(nr - 1)
-                    lc = ji * nr + c
-                    Bp[base + p * nr + c + 1] = lc < nce ? B[pc + p + 1, jc + lc + 1] : zero(T)
-                end
-            end
-        end
-    end
-    return
-end
-
 function _scale_C!(C, m::Int, n::Int, beta::T) where {T}
     if iszero(beta)
         @inbounds for j in 1:n, i in 1:m
