@@ -2,8 +2,9 @@
 
 PureBLAS targets a hard, non-negotiable gate: **≥ 0.96× OpenBLAS**, measured per machine, single
 threaded. The plots below are the PureBLAS/OpenBLAS speed ratio (so **higher is better; 1.0× is
-parity; the dashed line is the 0.96× gate**). Each bar is the geometric mean across sizes; the dark
-tick is the *worst* size — a bar is green only when **every** size clears the gate.
+parity; the dashed line is the 0.96× gate**). Each **violin** is the distribution of the ratio across the
+size sweep (and rounds); the horizontal line is the median and the dark dot is the *worst* size — a violin
+is green only when **every** size clears the gate.
 
 Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64, native PureBLAS API
 vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS then PureBLAS back-to-back
