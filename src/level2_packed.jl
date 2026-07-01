@@ -247,3 +247,127 @@ function _tpsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, AP, x, inc
     end
     return x
 end
+
+# ── spr / spr2 (symmetric packed rank-1/2, real + AD) · hpr / hpr2 (Hermitian packed, complex) ───
+# Rank updates on packed triangular storage. Real spr/spr2 reuse the contiguous packed-column axpy
+# (`_axpy_simd!`); the Hermitian hpr/hpr2 use the generic scalar path (complex SIMD deferred) and force
+# the diagonal real. Convention matches the packed mat-vecs: A[i,j] at `_pkU(j)+i` (up) / `_pkL(j,n)+(i-j)+1`.
+
+# spr:  A := α·x·xᵀ + A
+@inline function _spr_simd!(up::Bool, n::Int, α::T, AP, x) where {T<:BlasReal}
+    sz = sizeof(T)
+    GC.@preserve AP x begin
+        Ap = pointer(AP); xp = pointer(x)
+        if up
+            @inbounds for j in 1:n
+                xj = unsafe_load(xp, j)
+                iszero(xj) || _axpy_simd!(j, α * xj, xp, Ap + _pkU(j) * sz)
+            end
+        else
+            @inbounds for j in 1:n
+                xj = unsafe_load(xp, j)
+                iszero(xj) || _axpy_simd!(n - j + 1, α * xj, xp + (j - 1) * sz, Ap + _pkL(j, n) * sz)
+            end
+        end
+    end
+    return AP
+end
+function _spr!(up::Bool, n::Integer, α::Number, x, incx::Integer, AP)
+    iszero(α) && return AP
+    _pk_simd_ok(AP, x, incx) && return _spr_simd!(up, Int(n), convert(eltype(AP), α), AP, x)
+    n = Int(n); sx = _start(n, incx)
+    @inbounds for j in 1:n
+        xj = _ld(x, sx + (j - 1) * incx)
+        if !iszero(xj)
+            tmp = α * xj; base = up ? _pkU(j) : _pkL(j, n)
+            for i in (up ? (1:j) : (j:n))
+                k = up ? base + i : base + (i - j) + 1
+                _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * tmp)
+            end
+        end
+    end
+    return AP
+end
+
+# spr2:  A := α·x·yᵀ + α·y·xᵀ + A
+@inline function _spr2_simd!(up::Bool, n::Int, α::T, AP, x, y) where {T<:BlasReal}
+    sz = sizeof(T)
+    GC.@preserve AP x y begin
+        Ap = pointer(AP); xp = pointer(x); yp = pointer(y)
+        @inbounds for j in 1:n
+            xj = unsafe_load(xp, j); yj = unsafe_load(yp, j)
+            (iszero(xj) && iszero(yj)) && continue
+            if up
+                cp = Ap + _pkU(j) * sz
+                _axpy_simd!(j, α * yj, xp, cp); _axpy_simd!(j, α * xj, yp, cp)
+            else
+                off = (j - 1) * sz; cp = Ap + _pkL(j, n) * sz; len = n - j + 1
+                _axpy_simd!(len, α * yj, xp + off, cp); _axpy_simd!(len, α * xj, yp + off, cp)
+            end
+        end
+    end
+    return AP
+end
+function _spr2!(up::Bool, n::Integer, α::Number, x, incx::Integer, y, incy::Integer, AP)
+    iszero(α) && return AP
+    _pk2_simd_ok(AP, x, y, incx, incy) && return _spr2_simd!(up, Int(n), convert(eltype(AP), α), AP, x, y)
+    n = Int(n); sx = _start(n, incx); sy = _start(n, incy)
+    @inbounds for j in 1:n
+        xj = _ld(x, sx + (j - 1) * incx); yj = _ld(y, sy + (j - 1) * incy)
+        if !(iszero(xj) && iszero(yj))
+            t1 = α * yj; t2 = α * xj; base = up ? _pkU(j) : _pkL(j, n)
+            for i in (up ? (1:j) : (j:n))
+                k = up ? base + i : base + (i - j) + 1
+                _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * t1 + _ld(y, sy + (i - 1) * incy) * t2)
+            end
+        end
+    end
+    return AP
+end
+
+# hpr:  A := α·x·xᴴ + A  (α real, A Hermitian; diagonal forced real)
+function _hpr!(up::Bool, n::Integer, α::Number, x, incx::Integer, AP)
+    n = Int(n); sx = _start(n, incx); a = real(α)
+    @inbounds for j in 1:n
+        xj = _ld(x, sx + (j - 1) * incx)
+        base = up ? _pkU(j) : _pkL(j, n); kd = up ? base + j : base + 1
+        if !iszero(xj)
+            tmp = a * conj(xj)
+            up && for i in 1:j-1
+                k = base + i; _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * tmp)
+            end
+            _st!(AP, kd, real(_ld(AP, kd)) + real(xj * tmp))
+            !up && for i in j+1:n
+                k = base + (i - j) + 1; _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * tmp)
+            end
+        else
+            _st!(AP, kd, real(_ld(AP, kd)))
+        end
+    end
+    return AP
+end
+
+# hpr2:  A := α·x·yᴴ + ᾱ·y·xᴴ + A  (A Hermitian; diagonal forced real)
+function _hpr2!(up::Bool, n::Integer, α::Number, x, incx::Integer, y, incy::Integer, AP)
+    iszero(α) && return AP
+    n = Int(n); sx = _start(n, incx); sy = _start(n, incy)
+    @inbounds for j in 1:n
+        xj = _ld(x, sx + (j - 1) * incx); yj = _ld(y, sy + (j - 1) * incy)
+        base = up ? _pkU(j) : _pkL(j, n); kd = up ? base + j : base + 1
+        if !(iszero(xj) && iszero(yj))
+            t1 = α * conj(yj); t2 = conj(α * xj)
+            up && for i in 1:j-1
+                k = base + i
+                _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * t1 + _ld(y, sy + (i - 1) * incy) * t2)
+            end
+            _st!(AP, kd, real(_ld(AP, kd)) + real(xj * t1 + yj * t2))
+            !up && for i in j+1:n
+                k = base + (i - j) + 1
+                _st!(AP, k, _ld(AP, k) + _ld(x, sx + (i - 1) * incx) * t1 + _ld(y, sy + (i - 1) * incy) * t2)
+            end
+        else
+            _st!(AP, kd, real(_ld(AP, kd)))
+        end
+    end
+    return AP
+end

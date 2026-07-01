@@ -47,6 +47,15 @@ end
     hpmv!(DEFAULT_BACKEND, y, AP, x; uplo, alpha, beta)
 @inline tpmv!(AP::AbstractVector, x::AbstractVector; uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N') =
     tpmv!(DEFAULT_BACKEND, AP, x; uplo, trans, diag)
+# packed rank-1/2 updates (mirror ger!'s arg order: scalar, vectors, matrix)
+@inline spr!(alpha::Number, x::AbstractVector, AP::AbstractVector; uplo::Char = 'U') =
+    spr!(DEFAULT_BACKEND, alpha, x, AP; uplo)
+@inline spr2!(alpha::Number, x::AbstractVector, y::AbstractVector, AP::AbstractVector; uplo::Char = 'U') =
+    spr2!(DEFAULT_BACKEND, alpha, x, y, AP; uplo)
+@inline hpr!(alpha::Number, x::AbstractVector, AP::AbstractVector; uplo::Char = 'U') =
+    hpr!(DEFAULT_BACKEND, alpha, x, AP; uplo)
+@inline hpr2!(alpha::Number, x::AbstractVector, y::AbstractVector, AP::AbstractVector; uplo::Char = 'U') =
+    hpr2!(DEFAULT_BACKEND, alpha, x, y, AP; uplo)
 @inline tpsv!(AP::AbstractVector, x::AbstractVector; uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N') =
     tpsv!(DEFAULT_BACKEND, AP, x; uplo, trans, diag)
 # Level 2 banded

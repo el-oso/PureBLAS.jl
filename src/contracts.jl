@@ -63,6 +63,10 @@ function sbmv! end  # y := α·A·x + β·y, A symmetric banded
 function hbmv! end  # y := α·A·x + β·y, A Hermitian banded
 function tbmv! end  # x := op(A)·x, A triangular banded
 function tbsv! end  # x := op(A)⁻¹·x, A triangular banded (solve)
+function spr! end   # A := α·x·xᵀ + A, A symmetric packed (rank-1)
+function spr2! end  # A := α·x·yᵀ + α·y·xᵀ + A, A symmetric packed (rank-2)
+function hpr! end   # A := α·x·xᴴ + A, A Hermitian packed (rank-1, α real)
+function hpr2! end  # A := α·x·yᴴ + ᾱ·y·xᴴ + A, A Hermitian packed (rank-2)
 
 @contract AbstractBLAS2 begin
     gemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
@@ -80,4 +84,8 @@ function tbsv! end  # x := op(A)⁻¹·x, A triangular banded (solve)
     hbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
     tbmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
     tbsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
+    spr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector
+    spr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
+    hpr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector
+    hpr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
 end
