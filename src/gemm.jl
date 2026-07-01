@@ -226,6 +226,34 @@ end
     return
 end
 
+# Transpose A (k×m, the transA='T' operand) into `At` (m×k, column-major) via the W×W SIMD block
+# transpose — so the unpacked microkernel can run it as a plain N·N product (no B-packing). At[i,p]=A[p,i].
+@inline function _transpose_dense!(At::Vector{T}, A::StridedMatrix{T}, m::Int, k::Int) where {T}
+    W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); ov = Vec{W, T}(one(T))
+    mfull = (m ÷ W) * W; kfull = (k ÷ W) * W
+    GC.@preserve A At begin
+        Aptr = pointer(A); Tptr = pointer(At)
+        i = 0
+        @inbounds while i < mfull
+            p = 0
+            while p < kfull                              # W×W transpose block: A[p:p+W, i:i+W] → At[i:i+W, p:p+W]
+                _tblk!(Ptr{T}(Tptr + (p * m + i) * sz), Ptr{T}(Aptr + (i * lda + p) * sz), lda, m, ov, Val(W))
+                p += W
+            end
+            while p < k                                  # contraction tail for this W-row block — scalar
+                for r in 0:(W - 1); At[p * m + i + r + 1] = A[p + 1, i + r + 1]; end
+                p += 1
+            end
+            i += W
+        end
+        @inbounds while i < m                            # row tail (m not a multiple of W) — scalar
+            for p in 0:(k - 1); At[p * m + i + 1] = A[p + 1, i + 1]; end
+            i += 1
+        end
+    end
+    return
+end
+
 # Pack a mc_eff×kc_eff block of op(A) into mr-row panels (zero-padded), scaling by alpha.
 function _pack_A!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bool, alpha::T, mr::Int) where {T}
     if !tA && A isa StridedMatrix{T} && stride(A, 1) == 1
@@ -614,11 +642,21 @@ function gemm!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
     (tB ? size(B, 2) : size(B, 1)) == k ||
         throw(DimensionMismatch("gemm!: inner dimensions disagree (k=$k)"))
     if T <: BlasReal && C isa StridedMatrix && stride(C, 1) == 1
-        if !tA && A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
+        if A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
                 stride(B, 1) == 1 && _use_unpacked(m, n, k)
-            # small, tA='N': skip packing, run the microkernel directly on column-major data
-            _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                m, n, k, T(alpha), A, B, T(beta), C)
+            if !tA
+                # small, tA='N': skip packing, run the microkernel directly on column-major data
+                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                    m, n, k, T(alpha), A, B, T(beta), C)
+            else
+                # tA='T': SIMD-transpose A→Aᵀ into scratch, then the unpacked N·N path — avoids packing
+                # the (often large) B operand that the blocked TN path pays for (e.g. SVD's VᵀC).
+                At, _ = _gemm_scratch(T, m * k, 0)
+                _transpose_dense!(At, A, m, k)
+                Am = reshape(view(At, 1:(m * k)), m, k)
+                _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                    m, n, k, T(alpha), Am, B, T(beta), C)
+            end
         else
             _gemm_blocked!(tA, tB, m, n, k, T(alpha), A, B, T(beta), C)
         end
