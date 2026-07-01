@@ -163,6 +163,27 @@ end
     _tpsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, AP, x, 1)
     return x
 end
+# packed rank updates: A := α·x·xᵀ(+…) + A (spr/spr2 symmetric) / x·xᴴ (hpr/hpr2 Hermitian)
+@inline function spr!(::SIMDBackend, alpha::Number, x::AbstractVector, AP::AbstractVector;
+        uplo::Char = 'U')::AbstractVector
+    n = length(x); _pkvec_dims(AP, x, n, "spr!"); _spr!(uplo == 'U', n, alpha, x, 1, AP); return AP
+end
+@inline function spr2!(::SIMDBackend, alpha::Number, x::AbstractVector, y::AbstractVector,
+        AP::AbstractVector; uplo::Char = 'U')::AbstractVector
+    n = length(x); _pkvec_dims(AP, x, n, "spr2!")
+    length(y) == n || throw(DimensionMismatch("spr2!: length(y)=$(length(y)) ≠ n=$n"))
+    _spr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
+end
+@inline function hpr!(::SIMDBackend, alpha::Number, x::AbstractVector, AP::AbstractVector;
+        uplo::Char = 'U')::AbstractVector
+    n = length(x); _pkvec_dims(AP, x, n, "hpr!"); _hpr!(uplo == 'U', n, alpha, x, 1, AP); return AP
+end
+@inline function hpr2!(::SIMDBackend, alpha::Number, x::AbstractVector, y::AbstractVector,
+        AP::AbstractVector; uplo::Char = 'U')::AbstractVector
+    n = length(x); _pkvec_dims(AP, x, n, "hpr2!")
+    length(y) == n || throw(DimensionMismatch("hpr2!: length(y)=$(length(y)) ≠ n=$n"))
+    _hpr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
+end
 
 # ── Level 2 band storage (AB::AbstractMatrix, leading dim = #band rows) ─────────────────────────
 @inline function gbmv!(::SIMDBackend, y::AbstractVector, AB::AbstractMatrix, x::AbstractVector,

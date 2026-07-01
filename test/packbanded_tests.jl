@@ -155,3 +155,42 @@ end
     f(t) = (b = b0 .+ t .* dx; PureBLAS.tpsv!(AP, b; uplo = 'L'); sum(b))
     @test ForwardDiff.derivative(f, 0.0) ≈ sum(LowerTriangular(A) \ dx)
 end
+
+@testitem "spr/spr2/hpr/hpr2 packed rank updates" setup = [PackBand] begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    pkU(j) = (j * (j - 1)) ÷ 2; pkL(j, n) = ((j - 1) * (2n - j)) ÷ 2
+    function unpk(AP, n, up, herm)
+        A = zeros(eltype(AP), n, n)
+        for j in 1:n, i in (up ? (1:j) : (j:n))
+            v = AP[up ? i + pkU(j) : i + pkL(j, n)]; A[i, j] = v; A[j, i] = herm ? conj(v) : v
+        end
+        A
+    end
+    @testset "spr/spr2 $T $ul n=$n" for T in (Float32, Float64), ul in ('U', 'L'), n in (1, 5, 16, 33)
+        up = ul == 'U'; pack = up ? packtri_U : packtri_L
+        As = Matrix(Symmetric(randn(T, n, n))); x = randn(T, n); y = randn(T, n); al = T(0.7)
+        AP = pack(As, n); PureBLAS.spr!(al, x, AP; uplo = ul)
+        @test l2err(unpk(AP, n, up, false), As .+ al .* (x * x')) < l2tol(T)
+        APb = pack(As, n); B.spr!(ul, al, x, APb)                 # vs OpenBLAS spr
+        @test l2err(AP, APb) < l2tol(T)
+        AP2 = pack(As, n); PureBLAS.spr2!(al, x, y, AP2; uplo = ul)
+        @test l2err(unpk(AP2, n, up, false), As .+ al .* (x * y' .+ y * x')) < l2tol(T)
+    end
+    @testset "hpr/hpr2 $T $ul n=$n" for T in (ComplexF32, ComplexF64), ul in ('U', 'L'), n in (1, 5, 16, 33)
+        up = ul == 'U'; pack = up ? packtri_U : packtri_L
+        Hd = Matrix(Hermitian(randn(T, n, n))); x = randn(T, n); y = randn(T, n); ar = real(T)(0.6)
+        APh = pack(Hd, n); PureBLAS.hpr!(ar, x, APh; uplo = ul)
+        @test l2err(unpk(APh, n, up, true), Hd .+ ar .* (x * x')) < l2tol(T)
+        ac = T(0.5 + 0.3im); APh2 = pack(Hd, n); PureBLAS.hpr2!(ac, x, y, APh2; uplo = ul)
+        @test l2err(unpk(APh2, n, up, true), Hd .+ ac .* (x * y') .+ conj(ac) .* (y * x')) < l2tol(T)
+    end
+    # dim checks + ForwardDiff (generic path) through spr
+    @test_throws DimensionMismatch PureBLAS.spr!(1.0, randn(5), zeros(9))          # AP too short (need 15)
+    @test_throws DimensionMismatch PureBLAS.spr2!(1.0, randn(5), randn(4), zeros(15))
+    let
+        using ForwardDiff
+        f(t) = (AP = zeros(eltype(t), 3); PureBLAS.spr!(t, [1.0, 2.0], AP; uplo = 'U'); AP[3])  # = t·x2² = 4t
+        @test ForwardDiff.derivative(f, 1.0) ≈ 4.0
+    end
+end
