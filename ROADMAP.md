@@ -205,13 +205,16 @@ Remaining / next:
 - [ ] (optional) SIMD `pack_B` (transpose-y; smaller total cost than pack_A); reduce C re-streaming.
 - [ ] C-ABI `dgemm_64_`/`sgemm_64_`: **char args (transA/transB) + hidden Fortran string-length
       args** at the @ccallable boundary (the L3 ABI complication M1 avoided).
-- [x] **Complex GEMM SIMD path DONE (2026-07-02, commits 283af9b, 845486f).** Was scalar (~0.2×);
-      now split-pack blocked (4-real-FMA MAC, conj via Val signs, interleave-add store) + an unpacked
-      small-n path (free MR, W=8 only). **wintermute (Zen4/W=8) BEATS OpenBLAS at every gate size**
-      (zC 1.11–1.41×, cC 1.04–1.45×). galen (Zen3/AVX2/W=4): large-n 0.94–0.98 (CNR=6 = exact 16-ymm
-      fit), small-n (8,32) 0.66–0.82 — Zen3 small-n grind (pack MEASURED at only 3.3%, so the gap is
-      the AVX2 FMA-ceiling kernel + a dedicated small-n AVX2 kernel: follow-on). zgemm added to the L3
-      gate. Full suite 7213/7213 both machines. Design + status: memory complex-gemm-implemented.
+- [x] **Complex GEMM SIMD path DONE (2026-07-02, commits 283af9b, 845486f, 813455f).** Was scalar
+      (~0.2×); now split-pack blocked (4-real-FMA MAC, conj via Val signs, interleave-add store,
+      vectorized packs, B0 overwrite for beta=0) + an unpacked tiny-n path. Tile W=8 2×4 / W=4 1×6
+      (12 accs = exact 16-ymm AVX2 fit). **wintermute (Zen4/W=8) BEATS OpenBLAS at EVERY gate size**
+      (zC 1.12–1.44×, cC 1.05–1.44×). galen (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.97–1.04, n=8
+      ~0.96, mid-small n=16–64 = 0.69–0.93 (residual AVX2 short-k grind: nr=6 column-masking + short-k
+      kernel — same partial status as the real ops). zgemm in the L3 gate. Full suite 7243/7243 both
+      machines. Details + disproven approaches (pack-A-stream-B, vgather packB): memory
+      complex-gemm-implemented. Follow-on for galen mid-small: a small-n-specific nr=4 kernel to kill
+      column-masking waste (untested).
 - [ ] **complex-return ABI** for the deferred c/zdotu,c/zdotc symbols (LBT NORMAL vs ARGUMENT retstyle).
 
 ## M3 — Level 2 (CORE COMPLETE ✅) + rest of Level 3 (IN PROGRESS)
