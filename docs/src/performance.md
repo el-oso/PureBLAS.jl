@@ -26,23 +26,28 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L1 iamax | ✓ 1.15 | ✗ 0.90 |
 | L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
 | L2 gemvN | ✗ 0.96 | ✗ 0.87 |
-| L3 gemm | ✗ 0.83 (n=8) | ✓ 1.00 |
-| **L3 zgemm (complex)** | **✓ 1.11** | ◐ 0.88 (n=32 cold; ~1.03 hot) |
-| **L3 trsm** (vectorized trtri + 0-alloc) | ✓ 1.02 | ◐ 0.85 (geomean 0.97; was 0.65) |
-| L3 syrk · syr2k · trmm · symm | ✓ 0.97–0.98 | ✗ 0.79–0.86 |
-| LAPACK geqrf · gesvd | ✓ 1.02–1.19 | ✓ 1.00–1.05 |
-| LAPACK potrf · getrf | ✓ 1.13 · ✗ 0.94 | ✗ 0.62 · ✓ 0.99 |
+| L3 gemm | ✗ 0.89 (n=8) | ✓ 1.01 |
+| **L3 syrk** (branch-free scaleC + small-n unified pack) | ✓ 0.98 | ✓ 1.00 |
+| **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.93 (n=32 cold; ~1.03 hot) |
+| **L3 trsm** (vectorized trtri + 0-alloc) | ✓ 1.00 | ◐ 0.86 (geomean 0.95; was 0.65) |
+| L3 syr2k · trmm · symm | ✓ 0.97 | ✗ 0.87–0.95 |
+| LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.07–1.08 |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.67 · 0.90 |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
-dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02; `getrf` worst 0.94 at n=256). On
-**AVX2**, BLAS-1/2 and real `gemm` gate; `trsm` was lifted this pass to geomean **0.97** (worst 0.85 at
-n=128) by vectorizing the small triangular inverse (`_trtri!` now solves `A·V=I` via the SIMD dense-L
-base instead of a scalar strided dot) and removing a per-recursion-leaf boxing (a non-concrete scratch
-return made the wide-B invL/invR `view` type-unstable) — and `getrf`, built on it, now gates at 0.99.
-Complex `zgemm` sits at the n=32 cold boundary (0.88 cold / **~1.03 hot** — cold small-complex is 2× the
-bytes and unrepresentative). The remaining ✗ are the other **triangular/symmetric L3** ops
-(`syrk`/`syr2k`/`trmm`/`symm`, worst 0.79–0.86) and `potrf` built on them — the in-progress Zen3 small-n
-campaign (the AVX2-register-pressure / overhead discipline isn't fully ported to those kernels yet).
+dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
+and now `syrk` gate. `syrk` was lifted from worst 0.79 to **1.00**: decomposition showed the *kernel*
+already gated at every size (0.99–1.02), so the gap was overhead around it — a full-n² `_syrk_scaleC!`
+pre-scale pass with a per-element branch (gemm folds β into its kernel), made branch-free and
+stored-triangle-only (gates n≥128), plus routing small n through the unified single-pack whose halved
+cold pack-traffic gates n=32 (0.90→1.19). `trsm` reached geomean **0.95** (worst 0.86) via the vectorized
+`_trtri!` (solve `A·V=I` on the SIMD dense-L base) and removing a per-recursion-leaf boxing (a
+non-concrete scratch return made the wide-B invL/invR `view` type-unstable). Complex `zgemm` sits at the
+n=32 cold boundary (0.93 cold / **~1.03 hot** — cold small-complex is 2× the bytes and unrepresentative).
+The remaining ✗ are the other **triangular/symmetric L3** ops
+(`syr2k` 0.95 · `trmm` 0.87 · `symm` 0.90) and `potrf`/`getrf` built on them — the in-progress Zen3
+small-n campaign (the same overhead-decomposition discipline that just gated `syrk` isn't fully ported to
+those kernels yet; `syr2k` shares `syrk`'s scaleC fix and is closest at 0.95).
 `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
 > **Measurement note (learned the hard way):** with CPU boost enabled, allocating between timed regions
@@ -136,7 +141,7 @@ gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transfor
 | **M1** | BLAS-1 (axpy, dot, nrm2, asum, scal, copy, swap, iamax; s/d/c/z) | ✅ gate met; LBT `.so` + native API |
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
-| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm, triangular ops WIP |
+| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm + syrk, other triangular ops WIP |
 | **L3 complex** | zgemm (ComplexF64 split-pack SIMD) | ✅ beats OpenBLAS on AVX-512; gates on AVX2 |
 | **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ AVX-512 gates all n; AVX2 geqrf/gesvd gate |
 | **M4** | multithreading | deferred |
