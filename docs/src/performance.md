@@ -26,21 +26,23 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L1 iamax | ✓ 1.15 | ✗ 0.90 |
 | L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
 | L2 gemvN | ✗ 0.96 | ✗ 0.87 |
-| L3 gemm | ✗ 0.87 (n=8) | ✓ 1.01 |
-| **L3 zgemm (complex)** | **✓ 1.13** | ◐ 0.94 (1.03 hot) |
-| L3 syr2k | ✓ 0.97 | ◐ 0.89 (was 0.65; n≥1024 gate) |
-| L3 syrk · trmm · trsm · symm | ✓ 0.96–1.00 | ✗ 0.65–0.89 |
-| LAPACK geqrf · gesvd | ✓ 1.06–1.16 | ✓ 1.06–1.11 |
-| LAPACK potrf · getrf | ✓ 0.96–1.08 | ✗ 0.68 · 0.89 |
+| L3 gemm | ✗ 0.83 (n=8) | ✓ 1.00 |
+| **L3 zgemm (complex)** | **✓ 1.11** | ◐ 0.88 (n=32 cold; ~1.03 hot) |
+| **L3 trsm** (vectorized trtri + 0-alloc) | ✓ 1.02 | ◐ 0.85 (geomean 0.97; was 0.65) |
+| L3 syrk · syr2k · trmm · symm | ✓ 0.97–0.98 | ✗ 0.79–0.86 |
+| LAPACK geqrf · gesvd | ✓ 1.02–1.19 | ✓ 1.00–1.05 |
+| LAPACK potrf · getrf | ✓ 1.13 · ✗ 0.94 | ✗ 0.62 · ✓ 0.99 |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
-dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02). On **AVX2**, BLAS-1/2 and real
-`gemm` gate; `syr2k` was just lifted from 0.65 → 0.89 (a fused-kernel register-spill fix — it holds 2·MR
-A-vectors, so its tile had to shrink below `gemm`'s on AVX2's 16 registers); complex `zgemm` sits right
-at the boundary (0.94 cold / **1.03 hot** — cold small-complex is 2× the bytes and unrepresentative). The
-remaining ✗ are the other **triangular/symmetric L3** ops (`syrk`/`trmm`/`trsm`/`symm`, worst 0.65) and
-the LAPACK factors built on them (`potrf`/`getrf`) — an in-progress Zen3 small-n campaign (the same
-AVX2-register-pressure discipline that fixed `gemm` and `syr2k` isn't ported to those kernels yet).
+dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02; `getrf` worst 0.94 at n=256). On
+**AVX2**, BLAS-1/2 and real `gemm` gate; `trsm` was lifted this pass to geomean **0.97** (worst 0.85 at
+n=128) by vectorizing the small triangular inverse (`_trtri!` now solves `A·V=I` via the SIMD dense-L
+base instead of a scalar strided dot) and removing a per-recursion-leaf boxing (a non-concrete scratch
+return made the wide-B invL/invR `view` type-unstable) — and `getrf`, built on it, now gates at 0.99.
+Complex `zgemm` sits at the n=32 cold boundary (0.88 cold / **~1.03 hot** — cold small-complex is 2× the
+bytes and unrepresentative). The remaining ✗ are the other **triangular/symmetric L3** ops
+(`syrk`/`syr2k`/`trmm`/`symm`, worst 0.79–0.86) and `potrf` built on them — the in-progress Zen3 small-n
+campaign (the AVX2-register-pressure / overhead discipline isn't fully ported to those kernels yet).
 `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
 > **Measurement note (learned the hard way):** with CPU boost enabled, allocating between timed regions
