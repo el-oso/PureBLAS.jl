@@ -52,14 +52,19 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       Lifted **geqrf/gesvd/iamax -> PASS**, symm 0.58->0.90, getrf 0.68->0.87. Full suite 7213/7213 on
       BOTH galen (AVX2) and wintermute (AVX-512). Microkernels were already `Val{MR,NR}`-parameterized;
       only driver consts changed.
-    - **REMAINING Zen3 gaps (next):** syrk 0.57 / syr2k 0.55 / trmm 0.59 / trsm 0.67 / potrf 0.67 /
-      getrf 0.87; L2 gemvN 0.78 / gbmvN 0.62. Root: syrk/syr2k/trmm use the **packed-triangular**
-      kernels (`_microkernel_tri!/_u!`, `_trgemm_packed{,_u,2_u}!`), NOT plain gemm — own W=4 tile
-      needed. Subtlety: `_unified_ok(T)=_vwidth(T)==_NR` (level3.jl:1166) now flips TRUE on galen
-      (NR=4=W) -> they route to the unified single-pack `Val(1)` path = only **4 accumulators** =
-      register-STARVED (opposite failure from spilling). The unified-pack trick couples nr to W, so
-      this needs a dedicated W=4 tile design, not a constant bump. potrf/getrf follow once syrk/trsm
-      gate. L2 gemvN/gbmvN are independent AVX2 kernel issues.
+    - **PROGRESS (2026-07-02, commit d1a748a) — syrk/syr2k/trmm structural fix (large-n gates).**
+      Root found: the unified single-pack (syrk/syr2k/trmm) needs mr=nr=W (MR=1) → exactly W
+      accumulators; on AVX2 that's 4 = latency-STARVED (opposite of gemm's spilling). Fixed:
+      `_unified_ok` now requires W>=8, so W=4 routes to the multi-pack `_trgemm_packed!` with the wider
+      `_MR×_NR`=12-acc tile. **syrk 0.57→geomean 0.98, syr2k 0.55→0.82, trmm 0.59→1.10** — all large-n
+      (n≥256) gate. W=8 unchanged (unified still on; wintermute 7213/7213). `_SYRK_DBASE` made
+      Preferences-overridable.
+    - **REMAINING Zen3 gaps:** **small-n (n≤128) syrk/syr2k** — recursion path: n=32 ~0.79, n=128 ~0.82
+      (the gemm-into-temp diagonal base wastes 2× flops; `syrk_dbase` swept 8..48, does NOT gate → needs
+      a dedicated small-n triangular kernel, like the wintermute small-n campaign built per op). trsm
+      0.68, symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk small-n + trsm gate). L2
+      gemvN 0.78 / gbmvN 0.62 are independent AVX2 kernel issues. This is the Zen3 analogue of the
+      wintermute small-n grind — a multi-op campaign.
 - [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
   1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
      + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
