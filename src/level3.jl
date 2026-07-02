@@ -916,7 +916,7 @@ const _L3_TMP_F32 = Matrix{Float32}(undef, _L3_NB, _L3_NB)
 # d0=c0-r0; upper keeps local row ≤ d0+j, lower keeps row ≥ d0+j (j = 0-based column). Accumulates into
 # C, so K-accumulation across the gemm pc-loop stays correct (no temp needed).
 @generated function _microkernel_tri!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}) where {T, MR, NR}
+        mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)) where {T, MR, NR, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     push!(body.args, :(lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...)))))
@@ -937,10 +937,11 @@ const _L3_TMP_F32 = Matrix{Float32}(undef, _L3_NB, _L3_NB)
         push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz)); push!(stores.args, :(thr = d0 + $(j - 1)))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
+            st = B0 ? :(vstore($cs, q, mk)) : :(vstore(vload($V, q, mk) + $cs, q, mk))
             push!(stores.args, :(let base = $((mi - 1) * W), q = colp + $((mi - 1) * W * sz)
                 rows = lanes + base
                 mk = (rows < mre) & (upper ? (rows <= thr) : (rows >= thr))
-                vstore(vload($V, q, mk) + $cs, q, mk)
+                $st
             end))
         end
         push!(body.args, :(if $(j - 1) < nre; $stores; end))
@@ -955,7 +956,7 @@ end
 # vs running two separate microkernels per tile. MODE picks the store: :full / :masked / :tri.
 @generated function _microkernel2!(C::Ptr{T}, ldc::Int, Ap1::Ptr{T}, Bp1::Ptr{T}, Ap2::Ptr{T},
         Bp2::Ptr{T}, kc::Int, alpha::T, mre::Int, nre::Int, d0::Int, upper::Bool,
-        ::Val{MR}, ::Val{NR}, ::Val{MODE}) where {T, MR, NR, MODE}
+        ::Val{MR}, ::Val{NR}, ::Val{MODE}, ::Val{B0} = Val(false)) where {T, MR, NR, MODE, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     push!(body.args, :(av = $V(alpha)))
@@ -986,15 +987,18 @@ end
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
             if MODE === :full
-                push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); vstore(muladd(av, $cs, vload($V, q)), q); end))
+                st = B0 ? :(vstore(av * $cs, q)) : :(vstore(muladd(av, $cs, vload($V, q)), q))
+                push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
             elseif MODE === :masked
+                st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
                 push!(stores.args, :(let q = colp + $((mi - 1) * W * sz)
-                    mk = (lanes + $((mi - 1) * W)) < mre; vstore(muladd(av, $cs, vload($V, q, mk)), q, mk); end))
+                    mk = (lanes + $((mi - 1) * W)) < mre; $st; end))
             else # :tri
+                st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
                 push!(stores.args, :(let q = colp + $((mi - 1) * W * sz)
                     rows = lanes + $((mi - 1) * W)
                     mk = (rows < mre) & (upper ? (rows <= thr) : (rows >= thr))
-                    vstore(muladd(av, $cs, vload($V, q, mk)), q, mk); end))
+                    $st; end))
             end
         end
         if MODE === :full
@@ -1011,7 +1015,7 @@ end
 # store (the unified path packs A once and reads it as both operands, so α cannot be folded into the
 # pack — both operands would pick it up, giving α²). MODE: :full / :masked / :tri.
 @generated function _microkernel_u!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
-        mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{MODE}) where {T, MR, NR, MODE}
+        mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{MODE}, ::Val{B0} = Val(false)) where {T, MR, NR, MODE, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     push!(body.args, :(av = $V(alpha)))
@@ -1039,15 +1043,18 @@ end
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
             if MODE === :full
-                push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); vstore(muladd(av, $cs, vload($V, q)), q); end))
+                st = B0 ? :(vstore(av * $cs, q)) : :(vstore(muladd(av, $cs, vload($V, q)), q))
+                push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
             elseif MODE === :masked
+                st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
                 push!(stores.args, :(let q = colp + $((mi - 1) * W * sz)
-                    mk = (lanes + $((mi - 1) * W)) < mre; vstore(muladd(av, $cs, vload($V, q, mk)), q, mk); end))
+                    mk = (lanes + $((mi - 1) * W)) < mre; $st; end))
             else # :tri
+                st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
                 push!(stores.args, :(let q = colp + $((mi - 1) * W * sz)
                     rows = lanes + $((mi - 1) * W)
                     mk = (rows < mre) & (upper ? (rows <= thr) : (rows >= thr))
-                    vstore(muladd(av, $cs, vload($V, q, mk)), q, mk); end))
+                    $st; end))
             end
         end
         if MODE === :full
@@ -1067,7 +1074,8 @@ end
 # into the packed A by _pack_A!. C's stored triangle must be β-pre-scaled by the caller.
 # General triangular-C gemm: C[uplo-triangle] += α·op(X)·op(Y) (X→A-operand, Y→B-operand), n×n result.
 # The reusable core behind syrk (Y=X) and syr2k (two passes). Real only; α folded into packed X.
-function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {T<:BlasReal}
+function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
+        ::Val{OV} = Val(false)) where {T<:BlasReal, OV}
     n = size(C, 1); W = _vwidth(T); mr = _MR * W; nr = _NR
     kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -1080,6 +1088,7 @@ function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int)
             nce = min(nc, n - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc)
+                b0 = OV && pc == 0             # overwrite C on the FIRST k-block (β=0 fast path), else add
                 _pack_B!(Bp, Y, pc, jc, kce, nce, tYp, nr)
                 ic = 0
                 while ic < n
@@ -1094,14 +1103,17 @@ function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int)
                             if !skip
                                 Apanel = App + (div(ir, mr) * mr * kce) * sz
                                 Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                                Cblk = Cp0 + (r0 + c0 * ldc) * sz
+                                Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                                 if full && mre == mr && nre == nr
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR))
+                                    b0 ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
+                                         _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
                                 elseif full
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR))
+                                    b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                         _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
                                 else
-                                    _microkernel_tri!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(_MR), Val(_NR))
+                                    b0 ? _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(_MR), Val(_NR), Val(true)) :
+                                         _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(_MR), Val(_NR), Val(false))
                                 end
                             end
                             ir += mr
@@ -1151,7 +1163,7 @@ end
 # vs OpenBLAS's ~1.93×. This fused tile-pass removes that second C round-trip.
 function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
         X2, tX2::Bool, Y2, tY2::Bool, C, k::Int, ::Val{MRV} = Val(_MR),
-        ::Val{NRV} = Val(_NR)) where {T<:BlasReal, MRV, NRV}
+        ::Val{NRV} = Val(_NR), ::Val{OV} = Val(false)) where {T<:BlasReal, MRV, NRV, OV}
     n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = NRV
     kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -1164,6 +1176,7 @@ function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
             nce = min(nc, n - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc)
+                b0 = OV && pc == 0             # overwrite C on the first k-block (β=0), else accumulate
                 _pack_B!(Bp1, Y1, pc, jc, kce, nce, tY1, nr)
                 _pack_B!(Bp2, Y2, pc, jc, kce, nce, tY2, nr)
                 ic = 0
@@ -1184,11 +1197,14 @@ function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
                                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                                 if full && mre == mr && nre == nr
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:full))
+                                    b0 ? _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:full), Val(true)) :
+                                         _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:full), Val(false))
                                 elseif full
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:masked))
+                                    b0 ? _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:masked), Val(true)) :
+                                         _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:masked), Val(false))
                                 else
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, c0 - r0, up, Val(MRV), Val(NRV), Val(:tri))
+                                    b0 ? _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, c0 - r0, up, Val(MRV), Val(NRV), Val(:tri), Val(true)) :
+                                         _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, c0 - r0, up, Val(MRV), Val(NRV), Val(:tri), Val(false))
                                 end
                             end
                             ir += mr
@@ -1324,10 +1340,36 @@ const _SYR2K_MR = @load_preference("syr2k_mr", _vwidth(Float64) == 4 ? 2 : _MR):
 # nr for the two-product tile (Preferences knob). Default _NR: widening to NR=5 with MR=2 was measured
 # NEUTRAL-to-worse on Zen3 (n=256 unchanged, n=1024 0.985→0.96) — the tile wasn't ILP-starved, so keep _NR.
 const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
-@inline _syr2k_packed!(up::Bool, tr::Bool, α::T, A, Bm, C, k::Int) where {T<:BlasReal} =
-    _unified_ok(T) ? _trgemm_packed2_u!(up, α, A, tr, Bm, tr, C, k) :
-        (tr ? _trgemm_packed2!(up, α, A, true, Bm, false, Bm, true, A, false, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR)) :
-              _trgemm_packed2!(up, α, A, false, Bm, true, Bm, false, A, true, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR)))
+# n above which syr2k does TWO full-kernel passes (OpenBLAS-style) instead of the fused two-product tile.
+# On AVX2 the fused MR=2 tile has only 8 accumulators (ILP-starved on 16 regs); two _trgemm_packed! passes
+# (12 accs each) win at n>128 despite 2× C traffic (measured: n=512 0.94→1.00, n=1024 0.95→1.02). AVX-512
+# keeps the fused unified path (32 regs, not starved). Overridable "syr2k_2pass".
+const _SYR2K_2PASS = @load_preference("syr2k_2pass", _vwidth(Float64) == 4 ? 128 : typemax(Int))::Int
+# Handles β internally: the two-pass path can OVERWRITE C on its first pass when β=0 (skipping the
+# separate scaleC zero-pass — measured the whole n=256 gate gap, since scaleC + 2 adds is 3 C-touches at
+# the L2-resonant size). The fused/unified paths ADD, so they need C β-pre-scaled (zeroed if β=0).
+@inline function _syr2k_packed!(up::Bool, tr::Bool, α::T, β::T, A, Bm, C, k::Int) where {T<:BlasReal}
+    if _unified_ok(T)
+        _syrk_scaleC!(C, up, β)
+        return _trgemm_packed2_u!(up, α, A, tr, Bm, tr, C, k)
+    elseif size(C, 1) > _SYR2K_2PASS      # C = α·op(A)·op(B)ᵀ + α·op(B)·op(A)ᵀ (+β·C) — two triangular gemms
+        β0 = iszero(β)
+        β0 || _syrk_scaleC!(C, up, β)      # β≠0: pre-scale; β=0: pass 1 overwrites (Val(true))
+        X1, tX1, Y1, tY1, X2, tX2, Y2, tY2 = tr ? (A, true, Bm, false, Bm, true, A, false) :
+                                                  (A, false, Bm, true, Bm, false, A, true)
+        β0 ? _trgemm_packed!(up, α, X1, tX1, Y1, tY1, C, k, Val(true)) :
+             _trgemm_packed!(up, α, X1, tX1, Y1, tY1, C, k, Val(false))
+        _trgemm_packed!(up, α, X2, tX2, Y2, tY2, C, k)
+        return C
+    end
+    β0 = iszero(β)
+    β0 || _syrk_scaleC!(C, up, β)          # fused kernel writes each C-tile ONCE → overwrite when β=0
+    X1, tX1, Y1, tY1, X2, tX2, Y2, tY2 = tr ? (A, true, Bm, false, Bm, true, A, false) :
+                                              (A, false, Bm, true, Bm, false, A, true)
+    return β0 ?
+        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(true)) :
+        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(false))
+end
 
 # Recursive blocked syrk/herk (the gate path): split into 2×2; the two diagonal blocks recurse and the
 # off-diagonal block is one large gemm! written straight into C's stored triangle (correct flops, no
@@ -1692,10 +1734,11 @@ end
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
 function syr2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false)
-    n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'; _syrk_scaleC!(C, up, beta)
+    n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
-        _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), A, Bm, C, k)
+        _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     else
+        _syrk_scaleC!(C, up, beta)
         _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k)
     end
     C
