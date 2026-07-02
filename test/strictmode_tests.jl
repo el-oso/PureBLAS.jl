@@ -87,7 +87,7 @@ end
         @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512) static = false
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
         @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32) static = false
-        @assert_noalloc P._syr2k_packed!(false, false, 0.8, As, Bs, Cs, 512) static = false
+        @assert_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512) static = false
         @assert_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs) static = false
         @test true
     end
