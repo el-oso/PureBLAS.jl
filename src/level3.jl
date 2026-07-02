@@ -1107,8 +1107,9 @@ end
 # instead touches every C-tile twice (the microkernel loads/stores C per call) — measured 2.05× a syrk
 # vs OpenBLAS's ~1.93×. This fused tile-pass removes that second C round-trip.
 function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
-        X2, tX2::Bool, Y2, tY2::Bool, C, k::Int, ::Val{MRV} = Val(_MR)) where {T<:BlasReal, MRV}
-    n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = _NR
+        X2, tX2::Bool, Y2, tY2::Bool, C, k::Int, ::Val{MRV} = Val(_MR),
+        ::Val{NRV} = Val(_NR)) where {T<:BlasReal, MRV, NRV}
+    n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = NRV
     kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap1, Bp1, Ap2, Bp2 = _syr2k_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
@@ -1140,11 +1141,11 @@ function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
                                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                                 if full && mre == mr && nre == nr
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(_NR), Val(:full))
+                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:full))
                                 elseif full
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(_NR), Val(:masked))
+                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, 0, up, Val(MRV), Val(NRV), Val(:masked))
                                 else
-                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, c0 - r0, up, Val(MRV), Val(_NR), Val(:tri))
+                                    _microkernel2!(Cblk, ldc, Ptr{T}(a1), Ptr{T}(b1), Ptr{T}(a2), Ptr{T}(b2), kce, α, mre, nre, c0 - r0, up, Val(MRV), Val(NRV), Val(:tri))
                                 end
                             end
                             ir += mr
@@ -1272,10 +1273,18 @@ function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::
     return C
 end
 
+# The two-product _microkernel2! holds 2·MR A-vectors (both products' A packs), so it needs a SMALLER
+# tile than gemm: MR·NR + 2·MR + 2 ≤ (vector registers). W=4/AVX2 (16 ymm): MR=2 → 8 accs+4+2=14 fits;
+# gemm's MR=3 gives 12+6+2=20 → SPILL (the 0.65 large-n syr2k). W=8 (32 zmm): _MR=2 → 16+4+2=22, fine.
+# Overridable "syr2k_mr". (syrk uses the single-product kernel, only MR A-vectors → gemm's tile fits.)
+const _SYR2K_MR = @load_preference("syr2k_mr", _vwidth(Float64) == 4 ? 2 : _MR)::Int
+# nr for the two-product tile (Preferences knob). Default _NR: widening to NR=5 with MR=2 was measured
+# NEUTRAL-to-worse on Zen3 (n=256 unchanged, n=1024 0.985→0.96) — the tile wasn't ILP-starved, so keep _NR.
+const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
 @inline _syr2k_packed!(up::Bool, tr::Bool, α::T, A, Bm, C, k::Int) where {T<:BlasReal} =
     _unified_ok(T) ? _trgemm_packed2_u!(up, α, A, tr, Bm, tr, C, k) :
-        (tr ? _trgemm_packed2!(up, α, A, true, Bm, false, Bm, true, A, false, C, k) :
-              _trgemm_packed2!(up, α, A, false, Bm, true, Bm, false, A, true, C, k))
+        (tr ? _trgemm_packed2!(up, α, A, true, Bm, false, Bm, true, A, false, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR)) :
+              _trgemm_packed2!(up, α, A, false, Bm, true, Bm, false, A, true, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR)))
 
 # Recursive blocked syrk/herk (the gate path): split into 2×2; the two diagonal blocks recurse and the
 # off-diagonal block is one large gemm! written straight into C's stored triangle (correct flops, no
