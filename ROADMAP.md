@@ -468,6 +468,26 @@ oracle ~1e-16 (upper/lower, s/d/c/z), ForwardDiff-traceable. **spr GATES 1.02–
 Native API mirrors `ger!`: `spr!(α,x,AP;uplo)`, `spr2!(α,x,y,AP;uplo)`, `hpr!`/`hpr2!`. **BLAS L1/L2/L3
 now complete.** Next: LAPACK breadth (eigensolvers), or M4/M5/M6.
 
+## Small-n gate campaign — ALL L3+LAPACK ops gate 0.96× at n=2–2048 (2026-07-02) ✅ (one cell pinned-pending)
+
+New standing requirement (user, 2026-07-01): every BLAS-3 and LAPACK routine must gate ≥0.96× OpenBLAS at
+EVERY size n=2…2048 — "smaller sizes usually indicate hidden unresolved overheads." Executed overnight
+(commits b75b3ff, e5375ff, 86b1db8, c6a5b28, 27e7ba6; suite 7213/7213 throughout).
+
+Final grid (typed harness, interleaved reps+reset medians, Zen4 unpinned — ±0.02 wobble):
+gemm/symm/syrk/syr2k/trsm(L,R)/trmm-L: gate at every size, most cells 1.1–3×.
+trmm-R: gates everywhere except **1024 ≈ 0.94** — our absolute equals OB's own side-L (25.7 vs 25.5 ms);
+OB-R is simply 4% faster than OB-L at po2-1024. potrf/geqrf/getrf/gesvd: gate at every size (geqrf tiny-n
+2–4×, gesvd n=4 0.40→1.35). **Certify the at-gate cells (trmm-R 512/1024/2048, getrf/gemm 2048, symm 512)
+with `sudo bench/cpufreq_lock.sh pin 4500` — the overnight box was thermally wobbling.**
+
+What fixed it (catalog in kb `pureblas-l3-syrk-syr2k-symm`): const-dispatch scratch lookups (IdDict get =
+130 ns), cached per-call workspaces (geqrf 5-matrix, gesvd back-transform 32 KB), `_gemm_core!` (kwarg-free
+dispatch core) for all internal gemm calls, `_trmm_small!` (materialized-M + K-trimmed unpacked microkernels,
+in-place dependency-ordered), syr2k's transpose identity (one gemm instead of two), potrf pad guard %512→%256
++ per-column pad copies, `@simd ivdep` pack_B (a wide-vload transpose pack DISPROVEN: −25% geqrf via
+store-forwarding stalls), packed single-pass trmm-R (`_trmm_packedR!`).
+
 ## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
 
 Parallelize the gemm jj-loop, threshold-gated (small sizes stay serial). Per-host tuning. This is
