@@ -62,9 +62,9 @@ Done & verified (426/426 tests passing as of 2026-06-28):
     - **REMAINING Zen3 gaps:** **small-n (n≤128) syrk/syr2k** — recursion path: n=32 ~0.79, n=128 ~0.82
       (the gemm-into-temp diagonal base wastes 2× flops; `syrk_dbase` swept 8..48, does NOT gate → needs
       a dedicated small-n triangular kernel, like the wintermute small-n campaign built per op). trsm
-      0.68, symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk small-n + trsm gate). L2
-      gemvN 0.78 / gbmvN 0.62 are independent AVX2 kernel issues. This is the Zen3 analogue of the
-      wintermute small-n grind — a multi-op campaign.
+      0.68 (small-n n≤256; large-n gates), symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk
+      small-n + trsm small-n gate). L2 gemvN / gbmvN **now done** (phase 1, see below). This is the Zen3
+      analogue of the wintermute small-n grind — a multi-op campaign.
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
@@ -73,16 +73,30 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       *gemm* fast. Correct (validated vs A·Aᵀ, all n/uplo/α) but slower than recursion → reverted. The
       recursion (which leans on our fast tiny gemm for the base) remains the best small-n path (~0.82).
     - **NEXT PHASES (planned 2026-07-02, in priority order):**
-      1. **Independent Zen3 ops (STARTED) — higher ROI, reuse the adaptive-tile playbook, no new research.**
-         L2 `gemvN` (0.78: `_GEMV_NP=8` stream count, `_GEMVN_RB=448` — Zen4 magic) and `gbmvN` (0.62:
-         `_GBMV_CONV_MAX=48`) are plain AVX2 kernel-tuning, unrelated to the triangular wall. `trsm` (0.68)
-         is built on the now-fast gemm + inverse base → may move a lot with modest tuning; if trsm gates,
-         **potrf/getrf likely follow** (built on trsm+syrk+gemm). Make the magic numbers width-adaptive +
-         Preferences-overridable, sweep on galen, W=8 preserved by construction.
+      1. **Independent Zen3 ops — DONE for gemvN + gbmvN (2026-07-02); trsm already optimal.** Reused the
+         width-adaptive-default playbook (W=8 default = old value → bit-identical; W=4 default = measured).
+         - **gbmvN GATES (0.62 → geomean ~1.08, every gate size ≥1.00).** Root cause (measured, not guessed):
+           the masked convolution kernel wins big on W=8 (band 33 → 1.32) but LOSES to per-column axpy on
+           AVX2 above band ~17 (band 33 conv 0.62–0.74 vs axpy 1.07–1.10). The conv↔axpy crossover is
+           band-based and stable across n=256…4096 (NOT an AB-cache effect — axpy wins at n=64 too; and NOT
+           latency — adding partial accumulators made it *worse*, both hypotheses tested & rejected). Fix:
+           `_GBMV_CONV_MAX` width-adaptive (`W==4 ? 20 : 48`), one-line threshold, kernel body unchanged.
+           `src/level2_banded.jl`. Correct on galen (264 cases, all bands/α/β).
+         - **gemvN 0.80 → geomean 0.98 (n=256 rowblock cliff 0.74→0.90 fixed).** Root cause: the row-block
+           path assumes A is cache-resident, but at n=256 A (512KB) exceeds Zen3's 512KB L2 → panel path
+           (streams A once) wins. `_GEMVN_RB` width-adaptive (`W==4 ? 192 : 448`, the cut where n²·8B crosses
+           L2). `_GEMV_NP=8` swept — optimal on both widths, left a plain const. `src/level2.jl`. Residual:
+           n=256/512 panel ~0.90 (noisy, panel-kernel limit, not routing) — geomean gates, per-size doesn't.
+         - **trsm — routing knobs already optimal, no change.** Swept `_TRSM_NCUT/_TRSM_BASE/_TRSM_DBASE`:
+           current values (96/32/16) are the best; raising NCUT or BASE *collapses* n=128 (0.45–0.55, dense
+           leaves lose to invL leaves). The trsm loss (n=32 0.66, n=128 0.76, n=256 0.79) is small-triangular
+           *kernel* efficiency (invL base + dense back-sub), not routing → **moved to phase 2**. Knobs reverted
+           (YAGNI; phase 2 re-adds the sweep surface). Large-n trsm (512+) already ~0.92–0.97.
       2. **Small-n triangular campaign (DELIBERATE — study first, no live iteration).** Start by studying
          how OpenBLAS structures its small syrk/trmm kernels (specifically how its diagonal handling avoids
          the masked-store cost that sank the unpacked attempt above), THEN design a Zen3 small-n triangular
-         kernel. Covers syrk/syr2k n≤128, then symm/trsm small-n. Hard; schedule as its own effort.
+         kernel. Covers syrk/syr2k n≤128, then symm/trsm small-n (**trsm n≤256: invL base + dense back-sub
+         kernel efficiency, folded in here from phase 1**). Hard; schedule as its own effort.
       3. **Empirically certify Zen4 (belt-and-suspenders).** Re-run the full Zen4 `plots.jl` gate once to
          confirm no regression from the adaptive-tile changes (they are unchanged-by-construction for W=8 —
          resolved consts identical + double full-suite — so this is confirmation, not discovery).

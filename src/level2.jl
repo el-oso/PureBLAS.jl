@@ -29,7 +29,7 @@ end
 const _GEMV_MR = 4   # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows)
 
 const _GEMV_NP = 8             # gemv-N column-panel width
-const _GEMVN_RB = 448          # gemv-N: n ≤ this → row-block; larger → column-panel (which, with an
+const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 192 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. Cut ≈ where A (n²·8B) exceeds L2 so rowblock's cache-resident-A assumption breaks: Zen4 1MB L2 → 448, Zen3 512KB L2 → 192. (which, with an
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
 # gemv-N (column-major A makes it transpose-like — see kb finding): two regimes —
