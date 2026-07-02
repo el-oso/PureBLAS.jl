@@ -132,6 +132,9 @@ let
     addh("gemm", s -> (randn(s, s), randn(s, s), zeros(s, s)),
         c -> (B.gemm!(NN, NN, 1.0, c[1], c[2], 0.0, c[3]); c[3][1]),
         c -> (PureBLAS.gemm!(c[3], c[1], c[2]); c[3][1]))
+    addh("zgemm", s -> (randn(ComplexF64, s, s), randn(ComplexF64, s, s), zeros(ComplexF64, s, s)),
+        c -> (B.gemm!(NN, NN, 1.0 + 0im, c[1], c[2], 0.0 + 0im, c[3]); real(c[3][1])),
+        c -> (PureBLAS.gemm!(c[3], c[1], c[2]); real(c[3][1])))
     addh("symm", s -> (randn(s, s), randn(s, s), zeros(s, s)),
         c -> (B.symm!(LT, UP, 1.0, c[1], c[2], 0.0, c[3]); c[3][1]),
         c -> (PureBLAS.symm!(c[3], c[1], c[2]; side = LT, uplo = UP); c[3][1]))

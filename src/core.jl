@@ -9,6 +9,7 @@
 # Element types BLAS names cover. `BlasReal` get the SIMD.jl fast path; everything else
 # (complex, and any other `T<:Number` such as ForwardDiff.Dual) uses the generic scalar loop.
 const BlasReal = Union{Float32, Float64}
+const BlasComplex = Union{ComplexF32, ComplexF64}
 const BlasFloat = Union{Float32, Float64, ComplexF32, ComplexF64}
 
 @inline _ld(p::Ptr, i::Integer) = unsafe_load(p, i)
