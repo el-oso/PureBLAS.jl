@@ -211,10 +211,13 @@ Remaining / next:
       (12 accs = exact 16-ymm AVX2 fit). **wintermute (Zen4/W=8) BEATS OpenBLAS at EVERY gate size**
       (zC 1.12–1.49×, cC 1.01–1.48×). galen (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
       F64 gates (1.18), F32 mid-small mostly gates; F64 mid-small n=16–64 = 0.81–0.92 residual (AVX2
-      short-k kernel ceiling — column-masking now removed by the size-adaptive nr=4 kernel, so it's
-      pure short-k efficiency). zgemm in the L3 gate. Full suite 7243/7243 both machines. Details +
-      disproven approaches (pack-A-stream-B, vgather packB): memory complex-gemm-implemented. Only a
-      deeper short-k kernel rewrite remains for the F64 mid-small residual (deferred).
+      short-k kernel ceiling — column-masking removed by the size-adaptive nr=4 kernel, plus the
+      alpha=1 store fast-path d041349). zgemm in the L3 gate. Full suite 7243/7243 both machines. The
+      F64 n=32 ~0.90 floor is STRUCTURAL (pack-volume overhead of the blocked design at small n) —
+      confirmed by rejecting every alternative WITH MEASUREMENT: pack-A-stream-B (~0.44), vgather packB
+      (slower on Zen3), packB-transpose stride (tB=N==tB=T), and a full PACKLESS kernel (0.76 at n=32,
+      worse — AVX2's 16 regs force tiling, tiling forces staging). Details: memory complex-gemm-implemented.
+      Complex GEMM is DONE; the F64 n=32 residual is a hardware floor, not a TODO.
 - [ ] **complex-return ABI** for the deferred c/zdotu,c/zdotc symbols (LBT NORMAL vs ARGUMENT retstyle).
 
 ## M3 — Level 2 (CORE COMPLETE ✅) + rest of Level 3 (IN PROGRESS)
