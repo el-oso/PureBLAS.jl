@@ -59,6 +59,38 @@ end
     end
 end
 
+@testitem "StrictMode dogfood: L3 trsm/syrk/symm scratch + driver" begin
+    using StrictMode, AllocCheck, JET, LinearAlgebra
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping L3 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        tri(s) = (M = tril(randn(s, s)); for i in 1:s; M[i, i] += s; end; M)
+        # ROOT-CAUSE guard, on the CONSUMER (not the accessor — passing `Float64` as a value infers over
+        # DataType, where T is unresolvable, a test artifact). Here T = eltype(B) is a concrete compile-
+        # time parameter, so :full-mode JET report_opt sees the real specialization: the invL/invR base
+        # holds the trtri+gemm scratch, and a non-concrete scratch return (view of an abstract
+        # IdDict{DataType,Matrix} value) shows up as internal runtime dispatch / boxing here. This is the
+        # check that was missing when the per-leaf boxing shipped — it passes only with concrete returns.
+        Atri = tri(32)
+        @assert_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
+        @assert_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
+        # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so this
+        # is the empirical warmed path (static=false); static AllocCheck would false-positive on the
+        # get!/IdDict lazy alloc. StrictMode macros reject kwargs, so we assert on the POSITIONAL
+        # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
+        # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
+        @assert_noalloc P._trsm_base_invL!(false, false, false, Atri, randn(32, 256)) static = false
+        @assert_noalloc P._trsm_base_invR!(false, false, false, Atri, randn(256, 32)) static = false
+        As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
+        @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512) static = false
+        @assert_noalloc P._syr2k_packed!(false, false, 0.8, As, Bs, Cs, 512) static = false
+        @assert_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs) static = false
+        @test true
+    end
+end
+
 @testitem "StrictMode dogfood: GEMM hot paths" begin
     using StrictMode, AllocCheck, JET
     if !StrictMode.checks_enabled()
