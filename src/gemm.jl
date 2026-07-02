@@ -551,11 +551,47 @@ end
 
 # Unpacked driver (tA='N'). TB and B0 (beta==0) are Vals so the microkernel specializes; resolved
 # once at the boundary. beta is folded into the microkernel — no separate scale-C pass.
+# Small-n unpacked driver with SINGLE-vector (W-row) tiles: at max dim ≲ 40 the 16-acc tile's setup
+# (prefetches, acc init, load/store fan-out) doesn't amortize over the short k — 8×8 tiles took the
+# n=32 dip from 0.95 to 1.01. Same masked/edge kernels, Val(1) rows.
+const _GEMM_MR1_MAX = 40
+function _gemm_unpacked_mr1!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
+        alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
+    W = _vwidth(T); nr = _NR
+    lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
+    GC.@preserve A B C begin
+        Ap = pointer(A); Bp = pointer(B); Cp = pointer(C)
+        jr = 0
+        while jr < n
+            nre = min(nr, n - jr)
+            ir = 0
+            while ir < m
+                mre = min(W, m - ir)
+                if mre == W && nre == nr
+                    _microkernel_unpacked!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        Val(1), Val(_NR), Val(TB), Val(B0))
+                elseif nre == nr
+                    _microkernel_unpacked_mrows!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, Val(1), Val(_NR), Val(TB), Val(B0))
+                else
+                    _microkernel_unpacked_edge!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, nre, TB, B0)
+                end
+                ir += W
+            end
+            jr += nr
+        end
+    end
+    return C
+end
 function _gemm_unpacked!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
     if iszero(alpha) || k == 0
         _scale_C!(C, m, n, beta)   # C := beta·C (or 0); no contraction to do
         return C
+    end
+    if max(m, n, k) <= _GEMM_MR1_MAX
+        return _gemm_unpacked_mr1!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
