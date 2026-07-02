@@ -450,7 +450,10 @@ end
 end
 
 @inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y) where {T<:BlasReal}
-    NB = _SYMV_NB
+    # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
+    # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
+    # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
+    NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve A x y begin
         base = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         jb = 0
