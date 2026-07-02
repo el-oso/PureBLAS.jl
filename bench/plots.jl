@@ -308,11 +308,16 @@ else
 end
 
 adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
-const TITLE = "PureBLAS / OpenBLAS (Zen4, 1 thread, Float64)"
-svg_violins(joinpath(adir, "perf_l1.svg"), "BLAS-1: $TITLE", g["L1"])
-svg_violins(joinpath(adir, "perf_l2.svg"), "BLAS-2: $TITLE", g["L2"])
-svg_trend(joinpath(adir, "perf_l3.svg"), "BLAS-3: $TITLE", g["L3"])
-svg_trend(joinpath(adir, "perf_lapack.svg"), "LAPACK: $TITLE", g["LP"])
+# ISA label/slug from the detected SIMD width so per-machine plots are self-labelled and don't collide
+# (the docs show AVX-512 and AVX2 side by side). AVX-512 W64=8, AVX2 W64=4, NEON W64=2.
+const _W64P = PureBLAS._vwidth(Float64)
+const ISA = _W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
+const SLUG = _W64P == 8 ? "avx512" : _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
+const TITLE = "PureBLAS / OpenBLAS ($ISA, 1 thread, Float64)"
+svg_violins(joinpath(adir, "perf_l1_$SLUG.svg"), "BLAS-1: $TITLE", g["L1"])
+svg_violins(joinpath(adir, "perf_l2_$SLUG.svg"), "BLAS-2: $TITLE", g["L2"])
+svg_trend(joinpath(adir, "perf_l3_$SLUG.svg"), "BLAS-3: $TITLE", g["L3"])
+svg_trend(joinpath(adir, "perf_lapack_$SLUG.svg"), "LAPACK: $TITLE", g["LP"])
 for lvl in ("L1", "L2", "L3", "LP"), (nm, op) in get(g, lvl, OpData[])
     geo, mn = geomin(op)
     @printf("%s %-7s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
