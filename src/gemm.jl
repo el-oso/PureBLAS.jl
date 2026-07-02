@@ -124,7 +124,7 @@ end
 # segment of A, so pack = vector load + scale + vector store. The scalar packing was the measured
 # large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). Partial last panel
 # (zero-padded) stays scalar.
-@inline function _pack_A_simd!(Ap::Vector{T}, A::StridedMatrix{T}, ic::Int, pc::Int, mce::Int,
+@inline function _pack_A_simd!(Ap::AbstractVector{T}, A::StridedMatrix{T}, ic::Int, pc::Int, mce::Int,
         kce::Int, alpha::T, mr::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2)
     np = cld(mce, mr)
@@ -255,7 +255,7 @@ end
 end
 
 # Pack a mc_eff×kc_eff block of op(A) into mr-row panels (zero-padded), scaling by alpha.
-function _pack_A!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bool, alpha::T, mr::Int) where {T}
+function _pack_A!(Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bool, alpha::T, mr::Int) where {T}
     if !tA && A isa StridedMatrix{T} && stride(A, 1) == 1
         return _pack_A_simd!(Ap, A, ic, pc, mce, kce, alpha, mr)
     end
