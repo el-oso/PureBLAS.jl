@@ -1160,10 +1160,12 @@ function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
     end
     return C
 end
-# Unified single-pack works only when the A-pack panel width (mr=W) equals the B-pack width (nr=_NR),
-# i.e. an 8×8 tile — true for Float64 on AVX-512 (W=8=_NR). Other ISAs/types fall back to the 16×8
-# multi-pack drivers.
-@inline _unified_ok(::Type{T}) where {T} = _vwidth(T) == _NR
+# Unified single-pack needs the A-pack panel width (mr=W) to equal the B-pack width (nr=_NR) — an
+# W×W tile, MR=1 — so it yields exactly W vector accumulators. That's a win only when W is large
+# enough to hide FMA latency (W>=8, AVX-512: 8 accs). On AVX2 (W=4) it's just 4 accs = latency-
+# STARVED, so there we fall to the multi-pack _trgemm_packed! with the wider _MR×_NR tile (12 accs
+# on Zen3) — it double-packs A but that's cheaper than starving. (Zen3-swept 2026-07-02.)
+@inline _unified_ok(::Type{T}) where {T} = _vwidth(T) == _NR && _vwidth(T) >= 8
 
 # Unified single-pack syrk: pack A ONCE into W-row panels; the A-operand (vector load, panel ir) and
 # the B-operand (scalar broadcast, panel jr) both read that one buffer. 8×8 tile (MR=1) so both packs'
@@ -1280,7 +1282,9 @@ end
 # temp). Only the small diagonal BASE (≤ _SYRK_DBASE) goes through a gemm→temp + triangle-add, so the
 # unavoidable "compute the full b×b but keep the triangle" waste is confined to tiny base blocks
 # (≈ 2·DBASE/n of the flops). Large off-diagonal gemms keep the bulk at peak.
-const _SYRK_DBASE = 32
+# Recursion base for the diagonal (gemm→temp + triangle-add wastes 2× flops on b×b; smaller base =
+# more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
+const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # Large real syrk → single-pass packed (gate); small / complex / herk → recursion (gemm-temp base).
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
     if !herm && eltype(C) <: BlasReal && size(C, 1) > _GEMM_UNPACK_MAX && k > 0
