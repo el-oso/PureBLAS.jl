@@ -703,6 +703,13 @@ end
 # FMA ports; CMR=2 or CNR=8 spill AVX2 and tank to ~0.5–0.67). Same 12-acc AVX2 lesson as real gemm.
 const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
 const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
+# Narrower nr for mid-small n: nr=6 doesn't divide most n → the last column-panel wastes compute on
+# masked (padded) columns. nr=4 divides 8,16,20,24,28,32,40,48,64 cleanly → no column masking; it trades
+# ~2 accumulator chains (worse large-n) for no-waste (better mid-small). W=4/AVX2 only (galen-swept:
+# nr=4 lifts n=20 0.71→0.79, n=32 0.78→0.86); on W=8 mid-small is the unpacked path's job → _CNR_SMALL
+# == _CNR makes the size branch a no-op. Crossover ≈ n=64.
+const _CNR_SMALL = @load_preference("cgemm_nr_small", _W64 == 4 ? 4 : _CNR)::Int
+const _CGEMM_NRSMALL_MAX = @load_preference("cgemm_nrsmall_max", _W64 == 4 ? 64 : 0)::Int
 # Small-n cutoff: below this the blocked machinery (pack + interleave-store) loses to the plain scalar
 # triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
 const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
@@ -861,8 +868,8 @@ function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
 end
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
-function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
-        alpha, A, B, beta, C) where {SA, SB}
+function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
+        alpha, A, B, beta, C) where {SA, SB, NR}
     Tc = eltype(C); T = real(Tc)
     b0 = iszero(beta)
     b0 || _scale_C!(C, m, n, convert(Tc, beta))   # beta=0 ⇒ first kc-block overwrites (no scale pass)
@@ -870,7 +877,7 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::
         b0 && _scale_C!(C, m, n, zero(Tc))
         return C
     end
-    W = _vwidth(T); mr = _CMR * W; nr = _CNR
+    W = _vwidth(T); mr = _CMR * W; nr = NR
     kc = min(_KC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -905,14 +912,14 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::
                             BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
                             if mre == mr && nre == nr
                                 ov ? _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(true)) :
+                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true)) :
                                      _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(false))
+                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false))
                             else
                                 ov ? _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, mre, nre, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(true)) :
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true)) :
                                      _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, mre, nre, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(false))
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false))
                             end
                             ir += mr
                         end
@@ -929,12 +936,23 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::
 end
 function _gemm_cmplx_blocked!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int,
         alpha, A, B, beta, C)
-    if cA
-        cB ? _gemm_cmplx_impl!(Val(-1), Val(-1), tA, tB, m, n, k, alpha, A, B, beta, C) :
-             _gemm_cmplx_impl!(Val(-1), Val(1), tA, tB, m, n, k, alpha, A, B, beta, C)
+    # Size-adaptive tile width: mid-small n use a narrower nr (fewer column-mask waste tiles, since nr=6
+    # doesn't divide most n), large n use the wider register-optimal nr. No-op where _CNR_SMALL==_CNR
+    # (W=8: small n is handled by the unpacked path, blocked only sees large n). galen-swept 2026-07-02.
+    if _CNR_SMALL != _CNR && max(m, n, k) <= _CGEMM_NRSMALL_MAX
+        _cmplx_blk_conj(Val(_CNR_SMALL), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
     else
-        cB ? _gemm_cmplx_impl!(Val(1), Val(-1), tA, tB, m, n, k, alpha, A, B, beta, C) :
-             _gemm_cmplx_impl!(Val(1), Val(1), tA, tB, m, n, k, alpha, A, B, beta, C)
+        _cmplx_blk_conj(Val(_CNR), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
+    end
+end
+@inline function _cmplx_blk_conj(::Val{NR}, tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int,
+        k::Int, alpha, A, B, beta, C) where {NR}
+    if cA
+        cB ? _gemm_cmplx_impl!(Val(-1), Val(-1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C) :
+             _gemm_cmplx_impl!(Val(-1), Val(1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C)
+    else
+        cB ? _gemm_cmplx_impl!(Val(1), Val(-1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C) :
+             _gemm_cmplx_impl!(Val(1), Val(1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C)
     end
 end
 
@@ -1053,7 +1071,7 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
     Tc = eltype(C); T = real(Tc)
     _scale_C!(C, m, n, convert(Tc, beta))
     (iszero(alpha) || k == 0) && return C
-    W = _vwidth(T); mr = _CMR * W; nr = _CNR
+    W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL
     a = convert(Tc, alpha); alr = real(a); ali = imag(a)
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
     GC.@preserve A B C begin
@@ -1068,10 +1086,10 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
                 nrv = cld(mre, W)
                 if nrv >= _CMR
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(_CNR), tb, Val(SA), Val(SB))
+                        Val(_CMR), Val(_CNR_SMALL), tb, Val(SA), Val(SB))
                 else
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(1), Val(_CNR), tb, Val(SA), Val(SB))
+                        Val(1), Val(_CNR_SMALL), tb, Val(SA), Val(SB))
                 end
                 ir += nrv >= _CMR ? mr : W
             end
