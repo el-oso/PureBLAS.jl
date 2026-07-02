@@ -1442,22 +1442,27 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     herm && @inbounds for i in 1:n; Ad[i, i] = real(Ad[i, i]); end
     return Ad
 end
-# Symmetric A-pack for a diagonal-straddling panel (real symm): stored side reads A[gi,gp], mirror
-# side A[gp,gi]. Off-diagonal panels use plain _pack_A! (stored: tA=false SIMD; mirror: tA=true).
+# Symmetric A-pack for a diagonal-straddling panel (real symm). BRANCHLESS (OpenBLAS-style): per column
+# the stored/mirror split is a single crossing, so each column packs a contiguous STORED run (reads A's
+# column gp, stride 1) then a MIRROR run (reads A's row gp, stride lda) — no per-element `i≤j` branch in
+# the hot loop. Off-diagonal panels use plain _pack_A! (stored: tA=false SIMD; mirror: tA=true).
 function _pack_A_sym!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, up::Bool, alpha::T, mr::Int) where {T}
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
-        base = pi * mr * kce
+        base = pi * mr * kce; pbase = pi * mr
+        rhi = min(mr, mce - pbase)                 # valid rows r ∈ [0,rhi); r ≥ rhi → pad zero
         for p in 0:(kce - 1)
-            for r in 0:(mr - 1)
-                lr = pi * mr + r
-                Ap[base + p * mr + r + 1] = if lr < mce
-                    gi = ic + lr; gp = pc + p
-                    alpha * ((up ? gi <= gp : gi >= gp) ? A[gi + 1, gp + 1] : A[gp + 1, gi + 1])
-                else
-                    zero(T)
-                end
+            gp = pc + p; o = base + p * mr; ls = gp - ic - pbase    # local diagonal crossing (in r)
+            if up                                  # stored r ∈ [0,st_end) (gi≤gp), mirror r ∈ [st_end,rhi)
+                st_end = clamp(ls + 1, 0, rhi)
+                for r in 0:(st_end - 1); Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]; end
+                for r in st_end:(rhi - 1); Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]; end
+            else                                   # stored r ∈ [st_start,rhi) (gi≥gp), mirror r ∈ [0,st_start)
+                st_start = clamp(ls, 0, rhi)
+                for r in 0:(st_start - 1); Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]; end
+                for r in st_start:(rhi - 1); Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]; end
             end
+            for r in rhi:(mr - 1); Ap[o + r + 1] = zero(T); end     # pad rows beyond mce
         end
     end
     return
@@ -1466,19 +1471,22 @@ end
 # gemm's RIGHT operand. Stored side reads A[gp,gj], mirror side A[gj,gp]. Off-diagonal panels use
 # plain _pack_B! (stored: tB=false; mirror: tB=true). No α here — α rides on the left operand's pack.
 function _pack_B_sym!(Bp::Vector{T}, A, pc::Int, jc::Int, kce::Int, nce::Int, up::Bool, nr::Int) where {T}
-    np = cld(nce, nr)
+    np = cld(nce, nr)                              # branchless (OpenBLAS-style): stored/mirror = one crossing
     @inbounds for ji in 0:(np - 1)
-        base = ji * nr * kce
+        base = ji * nr * kce; cbase = ji * nr
+        chi = min(nr, nce - cbase)                 # valid cols c ∈ [0,chi); c ≥ chi → pad zero
         for p in 0:(kce - 1)
-            for c in 0:(nr - 1)
-                lc = ji * nr + c
-                Bp[base + p * nr + c + 1] = if lc < nce
-                    gj = jc + lc; gp = pc + p
-                    (up ? gp <= gj : gp >= gj) ? A[gp + 1, gj + 1] : A[gj + 1, gp + 1]
-                else
-                    zero(T)
-                end
+            gp = pc + p; o = base + p * nr; ls = gp - jc - cbase
+            if up                                  # stored gj≥gp: c ∈ [st,chi) (A row gp, strided); mirror c<st (A col gp)
+                st = clamp(ls, 0, chi)
+                for c in 0:(st - 1); Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]; end
+                for c in st:(chi - 1); Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]; end
+            else                                   # stored gj≤gp: c ∈ [0,st) (A row gp, strided); mirror c≥st (A col gp)
+                st = clamp(ls + 1, 0, chi)
+                for c in 0:(st - 1); Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]; end
+                for c in st:(chi - 1); Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]; end
             end
+            for c in chi:(nr - 1); Bp[o + c + 1] = zero(T); end
         end
     end
     return
@@ -1586,9 +1594,13 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T<:BlasReal}
     return C
 end
 
+# n above which symm uses the single-pass packed kernel (branchless symmetric pack) vs materialize+gemm.
+# On AVX2 the branchless pack makes packed win from n=128 (0.97 vs materialize 0.95); AVX-512 unchanged
+# (materialize ≤ _GEMM_UNPACK_MAX, already gates). Overridable "symm_pack_cut".
+const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
-    if !herm && eltype(C) <: BlasReal && n > _GEMM_UNPACK_MAX
+    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT
         return side_left ?
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
