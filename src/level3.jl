@@ -1673,10 +1673,15 @@ function _syr2k_dims(C, A, B, trans)
     (trans == 'N' ? size(A, 1) : size(A, 2)) == n || throw(DimensionMismatch("syr2k!: op(A) rows ≠ n"))
     (n, k)
 end
+# n above which syr2k uses the single-pass fused packed kernel (else the gemm-temp recursion). On AVX2
+# _GEMM_UNPACK_MAX (128) was too high — n=128 fell to recursion (gate 0.95) while the packed kernel gates
+# (n=128 0.95→1.01). Cut to 96 there (n≥128 packed, ≤64 recursion). AVX-512 unchanged (already gates).
+# Overridable "syr2k_pack_cut".
+const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
 function syr2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false)
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'; _syrk_scaleC!(C, up, beta)
-    if eltype(C) <: BlasReal && n > _GEMM_UNPACK_MAX && k > 0
+    if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), A, Bm, C, k)
     else
         _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k)
