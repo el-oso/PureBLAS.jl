@@ -650,9 +650,65 @@ else (complex, AD element types, strided `C`) uses the generic path.
 # Dispatch core (no kwargs, no dim checks) — callers that already know shapes are valid (e.g. the trsm/trmm
 # recursion's off-diagonal updates) call this directly to skip gemm!'s public-entry overhead. `@inline` so
 # the branch cascade folds at the call site (the kb "call the inner kernel, skip the kwarg layer" fix).
+# Direct tiny GEMM (max dim ≤ _GEMM_TINY): a plain register-accumulated triple loop. The masked 16×8
+# unpacked micro-kernel costs ~100–135 ns on a 2×2..6×6 problem (mask setup + dead lanes) — more than
+# OpenBLAS's entire ccall; the naive loop wins below W-sized problems.
+const _GEMM_TINY = 6
+# !tA tiny path: each C column is ONE masked W-vector (m ≤ W). Per column: k masked A-column loads ×
+# broadcast B scalars — FMA chains are per-column (ILP across the j loop), no 16-row mask machinery.
+function _gemm_tiny_vec!(C, A, B, alpha::T, beta::T, tB::Bool, m::Int, n::Int, k::Int) where {T<:BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
+    lanes = Vec{W, Int}(ntuple(i -> i - 1, Val(W))); mask = lanes < m
+    av = V(alpha); b0 = iszero(beta)
+    GC.@preserve A B C begin
+        pA = pointer(A); pB = pointer(B); pC = pointer(C)
+        @inbounds for j in 0:(n - 1)
+            acc = zero(V)
+            for p in 0:(k - 1)
+                bsc = tB ? unsafe_load(pB, j + p * ldb + 1) : unsafe_load(pB, p + j * ldb + 1)
+                acc = muladd(vload(V, pA + p * lda * sz, mask), V(bsc), acc)
+            end
+            q = pC + j * ldc * sz
+            res = av * acc
+            b0 ? vstore(res, q, mask) : vstore(muladd(V(beta), vload(V, q, mask), res), q, mask)
+        end
+    end
+    return C
+end
+function _gemm_tiny_v!(C, A, B, alpha::T, beta::T, ::Val{TA}, ::Val{TB}, m::Int, n::Int, k::Int) where {T, TA, TB}
+    b0 = iszero(beta)
+    @inbounds for j in 1:n, i in 1:m
+        s = zero(T)
+        for p in 1:k
+            a = TA ? A[p, i] : A[i, p]
+            b = TB ? B[j, p] : B[p, j]
+            s = muladd(a, b, s)
+        end
+        C[i, j] = b0 ? alpha * s : muladd(beta, C[i, j], alpha * s)
+    end
+    return C
+end
+@inline function _gemm_tiny!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int) where {T}
+    if !tA && T <: BlasReal && A isa StridedMatrix{T} && B isa StridedMatrix{T} &&
+       stride(A, 1) == 1 && m <= _vwidth(T)
+        return _gemm_tiny_vec!(C, A, B, alpha, beta, tB, m, n, k)
+    end
+    if tA
+        tB ? _gemm_tiny_v!(C, A, B, alpha, beta, Val(true), Val(true), m, n, k) :
+             _gemm_tiny_v!(C, A, B, alpha, beta, Val(true), Val(false), m, n, k)
+    else
+        tB ? _gemm_tiny_v!(C, A, B, alpha, beta, Val(false), Val(true), m, n, k) :
+             _gemm_tiny_v!(C, A, B, alpha, beta, Val(false), Val(false), m, n, k)
+    end
+    return C
+end
 @inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     if T <: BlasReal && C isa StridedMatrix && stride(C, 1) == 1
+        if max(m, n, k) <= _GEMM_TINY && !cA && !cB
+            return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
+        end
         if A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
                 stride(B, 1) == 1 && _use_unpacked(m, n, k)
             if !tA
