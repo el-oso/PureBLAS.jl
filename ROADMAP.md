@@ -209,12 +209,12 @@ Remaining / next:
       (~0.2×); now split-pack blocked (4-real-FMA MAC, conj via Val signs, interleave-add store,
       vectorized packs, B0 overwrite for beta=0) + an unpacked tiny-n path. Tile W=8 2×4 / W=4 1×6
       (12 accs = exact 16-ymm AVX2 fit). **wintermute (Zen4/W=8) BEATS OpenBLAS at EVERY gate size**
-      (zC 1.12–1.44×, cC 1.05–1.44×). galen (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.97–1.04, n=8
-      ~0.96, mid-small n=16–64 = 0.69–0.93 (residual AVX2 short-k grind: nr=6 column-masking + short-k
-      kernel — same partial status as the real ops). zgemm in the L3 gate. Full suite 7243/7243 both
-      machines. Details + disproven approaches (pack-A-stream-B, vgather packB): memory
-      complex-gemm-implemented. Follow-on for galen mid-small: a small-n-specific nr=4 kernel to kill
-      column-masking waste (untested).
+      (zC 1.12–1.49×, cC 1.01–1.48×). galen (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
+      F64 gates (1.18), F32 mid-small mostly gates; F64 mid-small n=16–64 = 0.81–0.92 residual (AVX2
+      short-k kernel ceiling — column-masking now removed by the size-adaptive nr=4 kernel, so it's
+      pure short-k efficiency). zgemm in the L3 gate. Full suite 7243/7243 both machines. Details +
+      disproven approaches (pack-A-stream-B, vgather packB): memory complex-gemm-implemented. Only a
+      deeper short-k kernel rewrite remains for the F64 mid-small residual (deferred).
 - [ ] **complex-return ABI** for the deferred c/zdotu,c/zdotc symbols (LBT NORMAL vs ARGUMENT retstyle).
 
 ## M3 — Level 2 (CORE COMPLETE ✅) + rest of Level 3 (IN PROGRESS)
