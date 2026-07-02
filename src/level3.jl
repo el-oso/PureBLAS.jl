@@ -889,10 +889,16 @@ end
 const _SYRK_BASE = 48
 
 @inline _symstored(up::Bool, i, j) = up ? (i <= j) : (i >= j)
+# β-prescale C's stored triangle. Branch-free, contiguous, triangle-only (was: all n² with a per-element
+# _symstored branch — measured 22%/13%/8% of syrk! at n=32/128/256, the whole gate gap since the kernel
+# already gates). β=1 is a no-op (skip); β=0 zeroes only the stored half.
 function _syrk_scaleC!(C, up::Bool, β)
-    @inbounds for j in axes(C, 2), i in axes(C, 1)
-        _symstored(up, i, j) && (C[i, j] = iszero(β) ? zero(eltype(C)) : β * C[i, j])
+    isone(β) && return C
+    T = eltype(C); n = size(C, 2); z = iszero(β)
+    @inbounds for j in 1:n
+        for i in (up ? (1:j) : (j:n)); C[i, j] = z ? zero(T) : β * C[i, j]; end
     end
+    return C
 end
 # Reusable NB×NB scratch for L3 diagonal blocks (one per element type; thread-unsafe — single-thread
 # project for now). ponytail: per-type cached buffer; revisit for multithreading.
@@ -1118,9 +1124,14 @@ function _add_tri!(C, S, up::Bool, herm::Bool, b::Int)
     herm && @inbounds for i in 1:b; C[i, i] = real(C[i, i]); end
     return C
 end
+# Small-n unified single-pack cutoff. On AVX2 the multi-pack double-packs A (both operands) — its pack
+# traffic dominates in cold cache at small n (measured: n=32 multi 0.90 vs unified 1.19). The unified
+# single-pack halves that traffic and wins for small n, but is latency-starved (W=4 accs) at larger n
+# (n=128 unified 0.73 vs multi 1.02) — so cap it low. AVX-512 uses unified everywhere (_unified_ok).
+const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) == 4 ? 48 : 0)::Int
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T<:BlasReal} =
-    _unified_ok(T) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
+    (_unified_ok(T) || size(C, 1) <= _SYRK_UNIFIED_MAX) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
         _trgemm_packed!(up, α, A, tr, A, !tr, C, k)
 
 # Four-buffer scratch for the fused two-product syr2k driver (two A-packs, two B-packs). ponytail:
