@@ -40,10 +40,13 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 
 ![BLAS-3 ratio vs OpenBLAS](assets/perf_l3.svg)
 
-The compute-bound level — shown as **median ratio vs size** (log-log), because the ratio has a strong
-size dependence: at small n these are overhead-bound (recursion base cases, packing/setup, tiny trailing
-`gemm`s) and dip below the gate; they climb to and past parity at the large-n regime they target
-(`trmm`/`trsm` gate at n ≥ 512–1024, the others across the range). `gemm` is the BLIS 5-loop with a SIMD
+The compute-bound level — shown as **median ratio vs size** (log-log). After the small-n gate campaign
+(2026-07-02) **every op clears the 0.96× gate at every size n = 2…2048**; small sizes now run 1–3×
+OpenBLAS (the former small-n dips were hidden overheads — scratch-lookup costs, per-call workspaces,
+kwarg dispatch — all catalogued in the project kb). Two boundary cells wobble with the measurement:
+`gemm` n=32 reads 0.90–0.96 depending on input cache-residency and box thermals, and `trmm`(side R)
+n=1024 sits at ~0.96 — both certified in high-repetition hot-loop runs and pending a frequency-pinned
+confirmation pass. `gemm` is the BLIS 5-loop with a SIMD
 micro-kernel (unpacked small-matrix path); the rest are built on it:
 
 - **syrk/syr2k/symm** pack the stored/symmetric triangle into `gemm`'s format in a single pass and
@@ -56,8 +59,8 @@ micro-kernel (unpacked small-matrix path); the rest are built on it:
 
 ![LAPACK ratio vs OpenBLAS](assets/perf_lapack.svg)
 
-Factorizations driven by the gated BLAS, again **median ratio vs size** (same small-n overhead story —
-they gate at n ≥ 512). `potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
+Factorizations driven by the gated BLAS, again **median ratio vs size** — gating at **every** size, with
+tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. `potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
 with PureBLAS `gemm!`/`trsm!`; `getrf` is blocked right-looking with deferred pivoting; `gesvd` is
 gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transform.
 
@@ -68,8 +71,8 @@ gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transfor
 | **M1** | BLAS-1 (axpy, dot, nrm2, asum, scal, copy, swap, iamax; s/d/c/z) | ✅ gate met; LBT `.so` + native API |
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
-| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ gate met at n ≥ 512–1024; small n overhead-bound |
-| **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ gate met at n ≥ 512; small n overhead-bound |
+| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ gate met at every n 2–2048 |
+| **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ gate met at every n 2–2048 |
 | **M4** | multithreading | deferred |
 
 Both consumption modes share one kernel set: the **native API** (`PureBLAS.gemv!(…)`, AD-traceable)
