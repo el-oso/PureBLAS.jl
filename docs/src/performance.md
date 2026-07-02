@@ -6,11 +6,46 @@ parity; the dashed line is the 0.96× gate**). Each **violin** is the distributi
 size sweep (and rounds); the horizontal line is the median and the dark dot is the *worst* size — a violin
 is green only when **every** size clears the gate.
 
-Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64, native PureBLAS API
-vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS then PureBLAS back-to-back
-so frequency drift cancels), **median** of many rounds, core pinned with `taskset -c 2`. Reproduce:
-`taskset -c 2 julia --project=bench bench/plots.jl`. Numbers here are from a Zen4 (Ryzen, AVX-512
-double-pumped); the gate is re-evaluated per host on the dev fleet.
+Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64 (plus ComplexF64 for
+`zgemm`), native PureBLAS API vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS
+then PureBLAS back-to-back so frequency drift cancels), **median** of many rounds, core pinned with
+`taskset`, and — importantly — **CPU boost disabled** (a floating boost clock silently biases small-n
+ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.jl`. **The plots below are
+Zen4/AVX-512** (the primary tuning target); the gate is re-evaluated per host on the dev fleet.
+
+## Per-ISA gate (dev fleet)
+
+The 0.96× gate is **per machine**. The fleet spans double-pumped **AVX-512** (Zen4, the tuning target)
+and native **AVX2** (Zen3). Below is the full-stack `plots.jl bench` at pinned frequency, worst-size
+ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in text.
+
+| Op | AVX-512 (Zen4) | AVX2 (Zen3) |
+|----|:---:|:---:|
+| L1 axpy · dot · asum · scal | ✓ 0.99–1.06 | ✓ 0.99–1.33 |
+| L1 nrm2 (scaled-accum beats OpenBLAS) | ✓ 3.6× | ✓ 5.5× |
+| L1 iamax | ✓ 1.15 | ✗ 0.90 |
+| L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
+| L2 gemvN | ✗ 0.96 | ✗ 0.87 |
+| L3 gemm | ✗ 0.87 (n=8) | ✓ 0.99 |
+| **L3 zgemm (complex)** | **✓ 1.13** | **✓ 0.96** |
+| L3 symm | ✗ 0.96 | ✗ 0.89 |
+| L3 syrk · syr2k · trmm · trsm | ✓ 0.97–1.00 | ✗ 0.65–0.87 |
+| LAPACK geqrf · gesvd | ✓ 1.01–1.16 | ✓ 1.07–1.08 |
+| LAPACK potrf · getrf | ✓ 0.96–1.08 | ✗ 0.68 · 0.88 |
+
+On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
+dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02). On **AVX2**, BLAS-1/2 and both
+real and complex `gemm` gate; the remaining ✗ are the **triangular/symmetric L3** ops
+(`syrk`/`syr2k`/`trmm`/`trsm`/`symm`) and the LAPACK factors built on them (`potrf`/`getrf`) — an
+in-progress Zen3 small-n campaign (the AVX2-register-pressure tiling that fixed `gemm` isn't ported to
+those kernels yet). Complex `gemm` (`zgemm`) is a SIMD split-pack kernel that **beats OpenBLAS on
+AVX-512 and gates on AVX2**.
+
+> **Measurement note (learned the hard way):** with CPU boost enabled, allocating between timed regions
+> drops the core off boost mid-measurement, biasing whichever side is timed first — this once fabricated
+> a fake `zgemm` "n=32 hardware floor" that clean pinned-frequency measurement puts at 1.0–1.03. Always
+> disable boost (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`, `performance` governor)
+> before trusting a gate number.
 
 ## BLAS-1
 
@@ -40,14 +75,14 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 
 ![BLAS-3 ratio vs OpenBLAS](assets/perf_l3.svg)
 
-The compute-bound level — shown as **median ratio vs size** (log-log). After the small-n gate campaign
-(2026-07-02) **every op clears the 0.96× gate at every size n = 2…2048**; small sizes now run 1–3×
-OpenBLAS (the former small-n dips were hidden overheads — scratch-lookup costs, per-call workspaces,
-kwarg dispatch — all catalogued in the project kb). Two boundary cells wobble with the measurement:
-`gemm` n=32 reads 0.90–0.96 depending on input cache-residency and box thermals, and `trmm`(side R)
-n=1024 sits at ~0.96 — both certified in high-repetition hot-loop runs and pending a frequency-pinned
-confirmation pass. `gemm` is the BLIS 5-loop with a SIMD
-micro-kernel (unpacked small-matrix path); the rest are built on it:
+The compute-bound level — plots shown as **median ratio vs size** (log-log) for **Zen4/AVX-512**, where
+every op's geomean clears the 0.96× gate and small sizes run 1–3× OpenBLAS (the former small-n dips were
+hidden overheads — scratch-lookup costs, per-call workspaces, kwarg dispatch — all catalogued in the
+project kb). A few small-n **worst-size** cells still dip below the strict gate (`gemm` n=8 ≈ 0.87 from
+dispatch/cold-cache; `symm`, `gemvN` ≈ 0.96) — geomeans stay ≥1.0. On **AVX2** (see the fleet table
+above) `gemm` and complex `zgemm` gate, but the triangular/symmetric ops still carry a Zen3 small-n
+gap. `gemm` is the BLIS 5-loop with a SIMD micro-kernel (unpacked small-matrix path); `zgemm` is a
+complex split-pack kernel (real+imag panels, 4-real-FMA MAC); the rest are built on `gemm`:
 
 - **syrk/syr2k/symm** pack the stored/symmetric triangle into `gemm`'s format in a single pass and
   use a triangular-store micro-kernel at the diagonal (no materialize, no wasted flops).
@@ -59,8 +94,10 @@ micro-kernel (unpacked small-matrix path); the rest are built on it:
 
 ![LAPACK ratio vs OpenBLAS](assets/perf_lapack.svg)
 
-Factorizations driven by the gated BLAS, again **median ratio vs size** — gating at **every** size, with
-tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. `potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
+Factorizations driven by the gated BLAS, again **median ratio vs size** for **Zen4/AVX-512** — gating at
+every size, with tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. (On AVX2, `geqrf`/
+`gesvd` gate; `potrf`/`getrf` inherit the below-gate triangular L3 kernels — see the fleet table.)
+`potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
 with PureBLAS `gemm!`/`trsm!`; `getrf` is blocked right-looking with deferred pivoting; `gesvd` is
 gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transform.
 
@@ -71,8 +108,9 @@ gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transfor
 | **M1** | BLAS-1 (axpy, dot, nrm2, asum, scal, copy, swap, iamax; s/d/c/z) | ✅ gate met; LBT `.so` + native API |
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
-| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ gate met at every n 2–2048 |
-| **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ gate met at every n 2–2048 |
+| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm, triangular ops WIP |
+| **L3 complex** | zgemm (ComplexF64 split-pack SIMD) | ✅ beats OpenBLAS on AVX-512; gates on AVX2 |
+| **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ AVX-512 gates all n; AVX2 geqrf/gesvd gate |
 | **M4** | multithreading | deferred |
 
 Both consumption modes share one kernel set: the **native API** (`PureBLAS.gemv!(…)`, AD-traceable)
