@@ -508,6 +508,56 @@ Interleaved re/im SIMD for complex kernels. Runtime AVX-512/AVX2/NEON dispatch i
 `PureBLASChainRulesExt` (weakdep) + Enzyme rules so Mode 2 supports reverse-mode through the
 in-place ops. (Native path is already ForwardDiff-traceable today.)
 
+## M7 — GPU backend (CUDA-first; gate vs cuBLAS, CUTLASS as structural reference)
+
+Requested 2026-07-01 ("extend PureBLAS to run on GPU and match cuBLAS and CUTLASS"). Planned
+2026-07-02; **start after the pinned certification + Zen3/Zen5 fleet gate runs** (user decision).
+
+**Hardware:** GeForce RTX (consumer) — NOT Zen4 (verified: no NVIDIA device/driver, only the
+AMD Phoenix iGPU), so GPU dev/benching happens on the box that hosts the card. Consumer FP64 runs at
+1/64 rate — the FP64 gate is still fair (cuBLAS pays the same rate), but tensor-core paths are where
+the CUTLASS fight is.
+
+**Stack (no-Python-compatible, all pure Julia):** CUDA.jl — kernels are Julia source compiled via
+GPUCompiler→LLVM→PTX; cuBLAS ships in CUDA.jl's artifacts and its `CUBLAS` wrapper module is the
+correctness oracle + gate denominator (exact analogue of OpenBLAS-via-LinearAlgebra on CPU).
+Tensor cores via CUDA.jl's WMMA API. Prior art to MINE, not depend on: **GemmKernels.jl** (JuliaGPU;
+typically 50–80% of cuBLAS, sometimes parity — below our gate, but its layout/config abstractions are
+proven) and **cuTile.jl** (NVIDIA's 2025/26 tile-programming model for Julia, a CUTLASS-analogue —
+evaluate at G2 kickoff; if it reaches the gate it may replace hand-rolled WMMA scheduling).
+
+**Delivery: package extension `PureBLASCUDAExt`** (weakdep on CUDA, like the planned ChainRules ext).
+Core package stays CPU-only with zero new hard deps. Dispatch on `CuArray` methods of the SAME native
+API (`gemm!`, `axpy!`, …) + a `CUDABackend` for the contract layer. **Gate: ≥0.96× cuBLAS, per-GPU**
+(extends the per-machine rule; per-GPU baseline files like per-host now). Timing = CUDA events /
+`CUDA.@elapsed` with explicit sync + warmup — never CPU timers around async launches.
+
+**Gate scope (user decision): all four tiers** — FP64 SIMT, FP32 SIMT, TF32 tensor-core
+(FP32-in/out), FP16/BF16 tensor-core (mixed-precision accumulate). SIMT first (proves the
+structure), tensor cores second (the CUTLASS numbers).
+
+Phases (same de-risk logic as M1/M2 — plumbing on easy kernels first, then the flagship):
+- **G0 toolchain:** CUDA.jl on the RTX box, pick the cc target, repo CI story (GPU tests can't run
+  on GitHub runners — local/self-hosted or tagged-skip).
+- **G1 vertical slice:** extension + `CUDABackend` + BLAS-1 (axpy/dot/nrm2/scal…) as simple CUDA
+  kernels + a naive gemm. Correctness vs `CUBLAS.*`; event-based bench harness; **gate BLAS-1**
+  (bandwidth-bound → parity ≈ free, proves extension load, dispatch, harness, per-GPU baselines).
+- **G2 flagship gemm:** CUTLASS's hierarchy is the structure to match — threadblock tile in shared
+  memory (double-buffered async-copy pipeline) → warp tile → MMA/FMA fragment. FP32/FP64 SIMT first,
+  then WMMA TF32/FP16/BF16. Tile shapes autotuned per-GPU (Preferences knob, like CPU widths).
+- **G3 L3 breadth:** syrk/symm/trmm/trsm over the device gemm. ⚠ The CPU L3/LAPACK **drivers do NOT
+  port as code** — they lean on host scratch consts, `unsafe_copyto!` pad tricks, per-column scalar
+  loops (poison on GPU). The *structure* (recursion shapes, triangle-aware tiling, K-trim) ports;
+  the drivers are rewritten device-side with on-device workspaces.
+- **G4 LAPACK:** MAGMA-style hybrid (panel factorization on CPU, trailing update on GPU), gate vs
+  cuSOLVER — its own sub-project, after G3.
+
+**Portability note (fleet: future Mac M5 → Metal.jl, AMD → AMDGPU.jl):** kernels stay CUDA-native —
+a portability layer (KernelAbstractions.jl) typically taxes exactly the few % the gate lives in.
+Acceptable for bandwidth-bound L1/L2 if measured free; the tiling structure + test suite are what
+Metal/AMDGPU reuse later, not kernel code. GPU parallelism does not touch the CPU
+no-multithreading standing rule (that covers CPU threads).
+
 ## Later
 
 ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). LAPACK surface. SparseArrays
