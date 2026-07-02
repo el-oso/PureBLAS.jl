@@ -681,7 +681,56 @@ end
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
 const _TRSM_NCUT = 96          # side-L: B width cut
 const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
-const _TRSM_DBASE = 16
+# Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
+# 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
+# (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
+const _TRSM_DBASE = 32
+# Column-blocked rank-1 update for the dense trsm base (non-transpose): B[brow0.., c] -= B[irow0, c]·acol
+# over all n columns. Holds the A-column vector across a block of 4 B-columns (reuse) and does the short
+# rlen-remainder mask ONCE per row-block instead of once per column — the per-column `_axpy_simd!` (though
+# inlined) repeated both. `a` points at A[rs,i]; brow0/irow0 are 0-based B rows.
+@inline function _trsm_col_r1!(::Type{T}, rlen::Int, a::Ptr{T}, pB::Ptr{T}, irow0::Int, brow0::Int,
+        n::Int, ldb::Int) where {T<:BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lanes = Vec{W, Int}(ntuple(q -> q - 1, Val(W)))
+    rfull = (rlen ÷ W) * W; msk = (lanes + rfull) < rlen
+    @inbounds begin
+        c = 0
+        while c + 4 <= n
+            s0 = V(-unsafe_load(pB, irow0 + c * ldb + 1)); s1 = V(-unsafe_load(pB, irow0 + (c + 1) * ldb + 1))
+            s2 = V(-unsafe_load(pB, irow0 + (c + 2) * ldb + 1)); s3 = V(-unsafe_load(pB, irow0 + (c + 3) * ldb + 1))
+            b0 = pB + (brow0 + c * ldb) * sz; b1 = pB + (brow0 + (c + 1) * ldb) * sz
+            b2 = pB + (brow0 + (c + 2) * ldb) * sz; b3 = pB + (brow0 + (c + 3) * ldb) * sz
+            r = 0
+            while r < rfull
+                av = vload(V, a + r * sz)
+                q = b0 + r * sz; vstore(muladd(av, s0, vload(V, q)), q)
+                q = b1 + r * sz; vstore(muladd(av, s1, vload(V, q)), q)
+                q = b2 + r * sz; vstore(muladd(av, s2, vload(V, q)), q)
+                q = b3 + r * sz; vstore(muladd(av, s3, vload(V, q)), q); r += W
+            end
+            if rfull < rlen
+                av = vload(V, a + rfull * sz, msk)
+                q = b0 + rfull * sz; vstore(muladd(av, s0, vload(V, q, msk)), q, msk)
+                q = b1 + rfull * sz; vstore(muladd(av, s1, vload(V, q, msk)), q, msk)
+                q = b2 + rfull * sz; vstore(muladd(av, s2, vload(V, q, msk)), q, msk)
+                q = b3 + rfull * sz; vstore(muladd(av, s3, vload(V, q, msk)), q, msk)
+            end
+            c += 4
+        end
+        while c < n
+            s0 = V(-unsafe_load(pB, irow0 + c * ldb + 1)); b0 = pB + (brow0 + c * ldb) * sz
+            r = 0
+            while r < rfull
+                q = b0 + r * sz; vstore(muladd(vload(V, a + r * sz), s0, vload(V, q)), q); r += W
+            end
+            if rfull < rlen
+                q = b0 + rfull * sz; vstore(muladd(vload(V, a + rfull * sz, msk), s0, vload(V, q, msk)), q, msk)
+            end
+            c += 1
+        end
+    end
+    return
+end
 function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
     k = size(A, 1); n = size(B, 2); T = eltype(B); sz = sizeof(T)
     lda = stride(A, 2); ldb = stride(B, 2); fwd = (up == tr)
@@ -698,9 +747,7 @@ function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
                 for c in 1:n; bic = B[i, c]; @simd for r in rows; B[r, c] -= A[i, r] * bic; end; end
             else
                 aptr = pA + ((i - 1) * lda + (rs - 1)) * sz
-                for c in 1:n
-                    _axpy_simd!(rlen, -B[i, c], aptr, pB + ((c - 1) * ldb + (rs - 1)) * sz)
-                end
+                _trsm_col_r1!(T, rlen, Ptr{T}(aptr), pB, i - 1, rs - 1, n, ldb)
             end
         end
     end
