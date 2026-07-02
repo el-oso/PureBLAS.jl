@@ -40,17 +40,25 @@ end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 
-# Heavy O(n³) sweep for L3 / LAPACK: `op1(ctx)` does ONE (often destructive) call; fresh input per round
-# (one call already dominates). Interleaved, fewer rounds (compute-bound → not alignment-volatile).
+# Heavy O(n³) sweep for L3 / LAPACK, destructive-safe: per round, PRE-GENERATE `reps` fresh contexts
+# (outside timing) and time the loop over them — a single ~100 ns call at n=8 is pure timer quantization
+# (it fabricated a gemm 0.90 "fail" the high-reps harness measured at 1.2×). reps→1 at large n.
 function sweep_heavy(mk, ob1, pb1, sizes; rounds = 8)
     out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
         _run(() -> ob1(mk(s))); _run(() -> pb1(mk(s)))     # compile warm
+        t0w = time_ns(); while time_ns() - t0w < 50_000_000; end   # freq warm: an idle-parked core
+        reps = clamp(20_000_000 ÷ (s * s * s), 1, 512)             # (0.4 GHz) ramps THROUGH the first
+        # rounds otherwise, biasing whichever side is timed first.
         rs = Float64[]
         for _ in 1:rounds
-            co = mk(s); cp = mk(s)                          # fresh inputs (allocated OUTSIDE timing)
-            t0 = time_ns(); v1 = ob1(co); t1 = time_ns(); v2 = pb1(cp); t2 = time_ns()
-            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))
+            cos = [mk(s) for _ in 1:reps]; cps = [mk(s) for _ in 1:reps]
+            t0 = time_ns()
+            for c in cos; SINK[] += ob1(c); end
+            t1 = time_ns()
+            for c in cps; SINK[] += pb1(c); end
+            t2 = time_ns()
+            push!(rs, (t1 - t0) / (t2 - t1))
         end
         push!(out, (s, rs))
     end
@@ -59,8 +67,8 @@ end
 
 const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 const L2SZ = (64, 128, 256, 512, 1024, 2048, 4096)
-const L3SZ = (128, 256, 512, 1024, 2048)          # O(n³) — small n is overhead-bound (shown honestly)
-const LPSZ = (128, 256, 512, 1024, 2048)          # LAPACK factorizations
+const L3SZ = (8, 32, 128, 256, 512, 1024, 2048)   # O(n³); small n included — the 2–2048 gate campaign
+const LPSZ = (8, 32, 128, 256, 512, 1024, 2048)   # LAPACK factorizations
 const TN = Char(78); const TT = Char(84); const U = Char(85)
 
 # Run the full benchmark sweep; returns (l1, l2, l3, lp) as vectors of OpData.
@@ -236,20 +244,22 @@ function svg_violins(path, title, data)
     println(io, "</svg>"); write(path, String(take!(io))); println("wrote $path")
 end
 
-# ── SVG trend lines (BLAS-3/LAPACK): median ratio vs size, log-x, log-y — small n is overhead-bound ──
+# ── SVG trend lines (BLAS-3/LAPACK): median ratio vs size, log-x, log-y ──
 function svg_trend(path, title, data)
     W = 900; H = 460; ml = 62; mr = 132; mt = 50; mb = 60; pw = W - ml - mr; ph = H - mt - mb
     allsz = sort(unique(reduce(vcat, [[s for (s, _) in d.second] for d in data])))
     xlo = log2(minimum(allsz)); xhi = log2(maximum(allsz))
     xof(s) = ml + pw * (log2(s) - xlo) / (xhi - xlo)
-    ylo = 0.25; yhi = 1.7; ln = log
+    yhi = max(1.7, 1.15 * maximum(maximum(m for (_, m) in sizemeds(d.second)) for d in data))
+    ylo = 0.5; ln = log
     yof(r) = mt + ph * (1 - (ln(clamp(r, ylo, yhi)) - ln(ylo)) / (ln(yhi) - ln(ylo)))
     pal = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2"]
     io = IOBuffer()
     println(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$W" height="$H" font-family="sans-serif">""")
     println(io, """<rect width="$W" height="$H" fill="white"/>""")
     println(io, """<text x="$(W/2)" y="28" text-anchor="middle" font-size="18" font-weight="bold">$title</text>""")
-    for r in (0.3, 0.5, 0.7, 1.0, 1.2, 1.5)          # y gridlines (log)
+    for r in (0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0)  # y gridlines (log)
+        r > yhi && continue
         y = yof(r)
         println(io, """<line x1="$ml" y1="$y" x2="$(ml+pw)" y2="$y" stroke="#eee"/>""")
         println(io, """<text x="$(ml-8)" y="$(y+4)" text-anchor="end" font-size="11" fill="#666">$(r)×</text>""")
@@ -274,7 +284,7 @@ function svg_trend(path, title, data)
         println(io, """<line x1="$(ml+pw+14)" y1="$ly" x2="$(ml+pw+34)" y2="$ly" stroke="$col" stroke-width="3"/>""")
         println(io, """<text x="$(ml+pw+38)" y="$(ly+4)" font-size="12">$(d.first)</text>""")
     end
-    println(io, """<text x="$(ml+pw/2)" y="$(H-10)" text-anchor="middle" font-size="11" fill="#666">matrix size n (log) · y = median ratio (log) · small n is overhead-bound; gates at large n</text>""")
+    println(io, """<text x="$(ml+pw/2)" y="$(H-10)" text-anchor="middle" font-size="11" fill="#666">matrix size n (log) · y = median ratio (log) · dashed = the 0.96× gate</text>""")
     println(io, "</svg>"); write(path, String(take!(io))); println("wrote $path")
 end
 
