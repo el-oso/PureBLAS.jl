@@ -41,11 +41,25 @@ Done & verified (426/426 tests passing as of 2026-06-28):
     **ROOT CAUSE (grounded, not guessed):** the gemm microkernel tile is `_MR=2 × _NR=8 = 16 vector
     accumulators` — sized for AVX-512's 32 registers; on AVX2's **16 ymm** it spills accumulators to
     stack every FMA. All L3/LAPACK build on gemm ⇒ the whole stack inherits it. **Fix = an
-    architecture-adaptive tile (W=4 wants ~MR=1–2 × NR=6 = 6–12 accs, the classic AVX2 geometry),
-    then per-op threshold retune** — a Zen3 tuning campaign analogous to the wintermute small-n one.
-    `_MR/_NR/_MC/_NC/_KC` are currently compile-time consts (need Preferences/width-adaptive folding).
-    Baseline cache: `bench/plots_data_galen.txt` on galen. Gate is per-machine (unpinned run; cpufreq
-    pin needs sudo on galen).
+    architecture-adaptive tile, then per-op threshold retune** — a Zen3 tuning campaign analogous to
+    the wintermute small-n one. Baseline cache: `bench/plots_data_galen.txt` on galen. Per-machine gate
+    (unpinned; cpufreq pin needs sudo on galen).
+    - **PROGRESS (2026-07-02, commit 8706372) — gemm GATES on Zen3.** Made the gemm tile (`_MR/_NR`)
+      and unpacked-crossover (`_GEMM_UNPACK_MAX`) width-adaptive + Preferences-overridable
+      (`gemm_mr/gemm_nr/gemm_unpack_max` — the fleet calibration knob). Swept on galen:
+      **W=4 -> MR=3,NR=4 (12 accs, fits 16 ymm), unpack<=128**; W=8 unchanged (MR=2,NR=8,unpack<=448,
+      wintermute suite bit-identical). gemm worst **0.63->0.99**, geomean 1.18, gates every n=8..2048.
+      Lifted **geqrf/gesvd/iamax -> PASS**, symm 0.58->0.90, getrf 0.68->0.87. Full suite 7213/7213 on
+      BOTH galen (AVX2) and wintermute (AVX-512). Microkernels were already `Val{MR,NR}`-parameterized;
+      only driver consts changed.
+    - **REMAINING Zen3 gaps (next):** syrk 0.57 / syr2k 0.55 / trmm 0.59 / trsm 0.67 / potrf 0.67 /
+      getrf 0.87; L2 gemvN 0.78 / gbmvN 0.62. Root: syrk/syr2k/trmm use the **packed-triangular**
+      kernels (`_microkernel_tri!/_u!`, `_trgemm_packed{,_u,2_u}!`), NOT plain gemm — own W=4 tile
+      needed. Subtlety: `_unified_ok(T)=_vwidth(T)==_NR` (level3.jl:1166) now flips TRUE on galen
+      (NR=4=W) -> they route to the unified single-pack `Val(1)` path = only **4 accumulators** =
+      register-STARVED (opposite failure from spilling). The unified-pack trick couples nr to W, so
+      this needs a dedicated W=4 tile design, not a constant bump. potrf/getrf follow once syrk/trsm
+      gate. L2 gemvN/gbmvN are independent AVX2 kernel issues.
 - [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
   1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
      + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
