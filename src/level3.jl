@@ -625,39 +625,24 @@ end
 # are already gemm!. Real only (stability fine for the well-conditioned diagonal blocks trsm assumes);
 # complex/conj keep the scalar trsv base.
 const _TRSM_BASE = 32
-# Small real triangular inverse: V (same uplo as A) = inv(A). V[i,i]=1/A[i,i] (or 1 if unit);
-# off-diagonal V[i,j] = -V[i,i]·Σ A[i,l]V[l,j] over the stored band between i and j.
-function _trtri!(V, A, nb::Int, up::Bool, unit::Bool) where {}
+# Small real triangular inverse: V (same uplo as A) = inv(A). Cast as a trsm: V solves A·V = I, so
+# V := A⁻¹·I via the vectorized dense-L base (contiguous A-column axpys) instead of a scalar
+# strided-row dot — the scalar version was ~20× less efficient/flop and 44% of the invL base.
+# I is the identity (also zeroes the non-stored half; forward/back-substitution keeps it zero).
+# Always plain inv (tr=false): the invL/invR base applies any transpose at its gemm stage.
+function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
-    if up
-        @inbounds for j in 1:nb
-            for i in (j + 1):nb; V[i, j] = zero(T); end     # zero the non-stored (lower) half
-            V[j, j] = unit ? one(T) : inv(A[j, j])
-            for i in (j - 1):-1:1
-                s = zero(T)
-                for l in (i + 1):j; s += A[i, l] * V[l, j]; end
-                V[i, j] = -V[i, i] * s
-            end
-        end
-    else
-        @inbounds for j in nb:-1:1
-            for i in 1:(j - 1); V[i, j] = zero(T); end       # zero the non-stored (upper) half
-            V[j, j] = unit ? one(T) : inv(A[j, j])
-            for i in (j + 1):nb
-                s = zero(T)
-                for l in j:(i - 1); s += A[i, l] * V[l, j]; end
-                V[i, j] = -V[i, i] * s
-            end
-        end
-    end
+    fill!(V, zero(T))
+    @inbounds for i in 1:nb; V[i, i] = one(T); end
+    _trsm_dense_L!(up, false, unit, A, V)
     return V
 end
 const _TRSM_TMP = IdDict{DataType, Matrix}()
 function _trsm_tmp(::Type{T}, m::Int, n::Int) where {T}
     b = get(_TRSM_TMP, T, nothing)
     if isnothing(b) || size(b, 1) < m || size(b, 2) < n; b = Matrix{T}(undef, m, n); _TRSM_TMP[T] = b; end
-    return b
-end
+    return b::Matrix{T}   # concrete return: the IdDict stores abstract Matrix; without this the tmp view
+end                       # (and its gemm!) go type-unstable → per-leaf boxing in the invL/invR base.
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
 function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
@@ -871,8 +856,8 @@ const _L3_APAD = IdDict{DataType, Matrix}()
 function _l3_apad(::Type{T}, k::Int) where {T}
     b = get(_L3_APAD, T, nothing)
     if isnothing(b) || size(b, 1) < k + 8 || size(b, 2) < k; b = Matrix{T}(undef, k + 8, k); _L3_APAD[T] = b; end
-    return view(b, 1:k, 1:k)        # ld = k+8 (non-power-of-2)
-end
+    return view(b::Matrix{T}, 1:k, 1:k)   # ld = k+8 (non-po2). concrete parent: the IdDict stores abstract
+end                                       # Matrix, so without ::Matrix{T} the view type-unstable → boxes.
 
 # Public: B := α·op(A)⁻¹·B (side 'L') or α·B·op(A)⁻¹ (side 'R'); A k×k triangular (uplo/transA/diag).
 function trsm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
