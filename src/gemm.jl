@@ -9,9 +9,18 @@
 # Block sizes are a first cut for Zen4 (AVX-512, 8 Float64/vec) — tune via the calibration knobs.
 # ponytail: blocks hand-set for Zen4; lift into Preferences when tuning the fleet.
 
-const _MR = 2     # microkernel height in vectors  → mr = _MR * W rows (F64: 16, F32: 32)
-const _NR = 8     # microkernel width in columns (MR*NR = 16 accumulators — Zen4 sweet spot;
-#                   3×8=24 spilled and regressed, 2×6 left registers idle)
+# Register-blocked microkernel tile: _MR vector-rows × _NR columns = _MR*_NR vector accumulators.
+# The k-loop holds _MR*_NR accumulators + _MR A-vectors + 1 B-broadcast live at once, so the tile
+# must satisfy  _MR*_NR + _MR + 1 ≲ (vector registers).  Register count differs by ISA, so the tile
+# is WIDTH-ADAPTIVE (keyed on the Float64 lane count as an ISA proxy), Preferences-overridable per
+# host (the fleet calibration knob — see ROADMAP M7/Zen3 tuning):
+#   W64=8  AVX-512, 32 zmm : 2×8 = 16 accs  (Zen4/Zen5 — the tuned sweet spot, UNCHANGED)
+#   W64=4  AVX2,     16 ymm: 3×4 = 12 accs  (Zen3/galen — 2×8 spilled; 3×4 gates, galen-swept 2026-07-02)
+#   W64=2  NEON,     32 regs: 2×8            (placeholder; tune on M5 later)
+# ponytail: per-width defaults below; override via Preferences "gemm_mr"/"gemm_nr" to sweep.
+const _W64 = _vwidth(Float64)
+const _MR = @load_preference("gemm_mr", _W64 == 4 ? 3 : 2)::Int
+const _NR = @load_preference("gemm_nr", _W64 == 8 ? 8 : _W64 == 4 ? 4 : 8)::Int
 const _MC = 144   # A row block (L2); rounded down to a multiple of mr at runtime
 const _NC = 2040  # B col block (L3); rounded down to a multiple of nr
 const _KC = 256   # contraction block — sized so the B micropanel (kc·nr·8) ≈ ½ L1, per BLIS
@@ -409,7 +418,9 @@ end
 # from L2/L3) beats the blocked path until A no longer fits ~L2 (square n≈448; n=512 flips to
 # blocked). ponytail: crude max() heuristic; a rectangular A (m·k fits but n huge) would also prefer
 # unpacked — refine to an A-fits-L2 test if skewed shapes matter.
-const _GEMM_UNPACK_MAX = 448
+# Width-adaptive + Preferences-overridable (the unpacked path fits A in L2; the L2/register
+# tradeoff differs by ISA — Zen4 flips at n≈448, Zen3/AVX2 loses earlier). Override "gemm_unpack_max".
+const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _W64 == 8 ? 448 : _W64 == 4 ? 128 : 192)::Int
 @inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX
 
 # Unpacked microkernel: full mr×nr tile, reading A (tA='N') and op(B) directly. alpha applied at
