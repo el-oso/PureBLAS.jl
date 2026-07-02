@@ -10,8 +10,8 @@ Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64 (
 `zgemm`), native PureBLAS API vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS
 then PureBLAS back-to-back so frequency drift cancels), **median** of many rounds, core pinned with
 `taskset`, and — importantly — **CPU boost disabled** (a floating boost clock silently biases small-n
-ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.jl`. **The plots below are
-Zen4/AVX-512** (the primary tuning target); the gate is re-evaluated per host on the dev fleet.
+ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.jl`. Each section shows
+**both** ISAs of the dev fleet — **AVX-512** (Zen4, the primary tuning target) and native **AVX2** (Zen3).
 
 ## Per-ISA gate (dev fleet)
 
@@ -26,20 +26,22 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L1 iamax | ✓ 1.15 | ✗ 0.90 |
 | L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
 | L2 gemvN | ✗ 0.96 | ✗ 0.87 |
-| L3 gemm | ✗ 0.87 (n=8) | ✓ 0.99 |
-| **L3 zgemm (complex)** | **✓ 1.13** | **✓ 0.96** |
-| L3 symm | ✗ 0.96 | ✗ 0.89 |
-| L3 syrk · syr2k · trmm · trsm | ✓ 0.97–1.00 | ✗ 0.65–0.87 |
-| LAPACK geqrf · gesvd | ✓ 1.01–1.16 | ✓ 1.07–1.08 |
-| LAPACK potrf · getrf | ✓ 0.96–1.08 | ✗ 0.68 · 0.88 |
+| L3 gemm | ✗ 0.87 (n=8) | ✓ 1.01 |
+| **L3 zgemm (complex)** | **✓ 1.13** | ◐ 0.94 (1.03 hot) |
+| L3 syr2k | ✓ 0.97 | ◐ 0.89 (was 0.65; n≥1024 gate) |
+| L3 syrk · trmm · trsm · symm | ✓ 0.96–1.00 | ✗ 0.65–0.89 |
+| LAPACK geqrf · gesvd | ✓ 1.06–1.16 | ✓ 1.06–1.11 |
+| LAPACK potrf · getrf | ✓ 0.96–1.08 | ✗ 0.68 · 0.89 |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
-dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02). On **AVX2**, BLAS-1/2 and both
-real and complex `gemm` gate; the remaining ✗ are the **triangular/symmetric L3** ops
-(`syrk`/`syr2k`/`trmm`/`trsm`/`symm`) and the LAPACK factors built on them (`potrf`/`getrf`) — an
-in-progress Zen3 small-n campaign (the AVX2-register-pressure tiling that fixed `gemm` isn't ported to
-those kernels yet). Complex `gemm` (`zgemm`) is a SIMD split-pack kernel that **beats OpenBLAS on
-AVX-512 and gates on AVX2**.
+dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.02). On **AVX2**, BLAS-1/2 and real
+`gemm` gate; `syr2k` was just lifted from 0.65 → 0.89 (a fused-kernel register-spill fix — it holds 2·MR
+A-vectors, so its tile had to shrink below `gemm`'s on AVX2's 16 registers); complex `zgemm` sits right
+at the boundary (0.94 cold / **1.03 hot** — cold small-complex is 2× the bytes and unrepresentative). The
+remaining ✗ are the other **triangular/symmetric L3** ops (`syrk`/`trmm`/`trsm`/`symm`, worst 0.65) and
+the LAPACK factors built on them (`potrf`/`getrf`) — an in-progress Zen3 small-n campaign (the same
+AVX2-register-pressure discipline that fixed `gemm` and `syr2k` isn't ported to those kernels yet).
+`zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
 > **Measurement note (learned the hard way):** with CPU boost enabled, allocating between timed regions
 > drops the core off boost mid-measurement, biasing whichever side is timed first — this once fabricated
@@ -49,7 +51,13 @@ AVX-512 and gates on AVX2**.
 
 ## BLAS-1
 
-![BLAS-1 ratio vs OpenBLAS](assets/perf_l1.svg)
+**AVX-512 (Zen4):**
+
+![BLAS-1 ratio vs OpenBLAS, AVX-512](assets/perf_l1_avx512.svg)
+
+**AVX2 (Zen3):**
+
+![BLAS-1 ratio vs OpenBLAS, AVX2](assets/perf_l1_avx2.svg)
 
 Bandwidth-bound; PureBLAS matches or beats OpenBLAS across the board. `nrm2` is markedly faster
 because OpenBLAS's `dnrm2` uses the slow always-scaled LAPACK algorithm, while PureBLAS uses a SIMD
@@ -57,7 +65,13 @@ sum-of-squares with a scaled fallback only on overflow/underflow.
 
 ## BLAS-2
 
-![BLAS-2 ratio vs OpenBLAS](assets/perf_l2.svg)
+**AVX-512 (Zen4):**
+
+![BLAS-2 ratio vs OpenBLAS, AVX-512](assets/perf_l2_avx512.svg)
+
+**AVX2 (Zen3):**
+
+![BLAS-2 ratio vs OpenBLAS, AVX2](assets/perf_l2_avx2.svg)
 
 Matrix-vector and the packed/banded variants. The headline lessons (full detail in the project's
 `kb/` findings):
@@ -73,9 +87,15 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 
 ## BLAS-3
 
-![BLAS-3 ratio vs OpenBLAS](assets/perf_l3.svg)
+**AVX-512 (Zen4):**
 
-The compute-bound level — plots shown as **median ratio vs size** (log-log) for **Zen4/AVX-512**, where
+![BLAS-3 ratio vs OpenBLAS, AVX-512](assets/perf_l3_avx512.svg)
+
+**AVX2 (Zen3):**
+
+![BLAS-3 ratio vs OpenBLAS, AVX2](assets/perf_l3_avx2.svg)
+
+The compute-bound level — **median ratio vs size** (log-log). On **AVX-512**
 every op's geomean clears the 0.96× gate and small sizes run 1–3× OpenBLAS (the former small-n dips were
 hidden overheads — scratch-lookup costs, per-call workspaces, kwarg dispatch — all catalogued in the
 project kb). A few small-n **worst-size** cells still dip below the strict gate (`gemm` n=8 ≈ 0.87 from
@@ -92,7 +112,13 @@ complex split-pack kernel (real+imag panels, 4-real-FMA MAC); the rest are built
 
 ## LAPACK
 
-![LAPACK ratio vs OpenBLAS](assets/perf_lapack.svg)
+**AVX-512 (Zen4):**
+
+![LAPACK ratio vs OpenBLAS, AVX-512](assets/perf_lapack_avx512.svg)
+
+**AVX2 (Zen3):**
+
+![LAPACK ratio vs OpenBLAS, AVX2](assets/perf_lapack_avx2.svg)
 
 Factorizations driven by the gated BLAS, again **median ratio vs size** for **Zen4/AVX-512** — gating at
 every size, with tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. (On AVX2, `geqrf`/
