@@ -50,13 +50,15 @@ end
     @test all(isfinite, C) && gerr(C, A * B) < gtol(Float64)
 end
 
-@testitem "GEMM complex (generic) vs OpenBLAS" setup = [GemmOracle] begin
+@testitem "GEMM complex (SIMD split-pack + unpacked) vs OpenBLAS" setup = [GemmOracle] begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
-    @testset "$T $tA$tB" for T in (ComplexF32, ComplexF64),
-        (tA, tB) in (('N', 'N'), ('C', 'N'), ('N', 'C'), ('T', 'T'), ('C', 'C'))
+    # sizes span the routing: tiny→generic (5), unpacked small-n (23,40 — >nr cols & >mr rows to
+    # exercise the jr/ir tiling), and >_CGEMM_UNPACK_MAX→blocked (100). n>nr with jr>0 was a real bug.
+    @testset "$T $tA$tB $m×$n×$k" for T in (ComplexF32, ComplexF64),
+        (tA, tB) in (('N', 'N'), ('C', 'N'), ('N', 'C'), ('T', 'T'), ('C', 'C')),
+        (m, n, k) in ((23, 17, 19), (5, 5, 5), (40, 48, 33), (100, 96, 77))
 
-        m, n, k = 23, 17, 19
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         Bm = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
         C0 = randn(T, m, n); al = T(0.7, -0.3); be = T(1.4, 0.2)
