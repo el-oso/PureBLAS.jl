@@ -65,6 +65,27 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       0.68, symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk small-n + trsm gate). L2
       gemvN 0.78 / gbmvN 0.62 are independent AVX2 kernel issues. This is the Zen3 analogue of the
       wintermute small-n grind — a multi-op campaign.
+    - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
+      `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
+      no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
+      1.26→0.58, n=32 0.79→0.59, n=128 0.82→0.65. Reason: at small n most tiles straddle the diagonal →
+      *masked* triangular stores, which cost far more than the clean full-tile stores that make unpacked
+      *gemm* fast. Correct (validated vs A·Aᵀ, all n/uplo/α) but slower than recursion → reverted. The
+      recursion (which leans on our fast tiny gemm for the base) remains the best small-n path (~0.82).
+    - **NEXT PHASES (planned 2026-07-02, in priority order):**
+      1. **Independent Zen3 ops (STARTED) — higher ROI, reuse the adaptive-tile playbook, no new research.**
+         L2 `gemvN` (0.78: `_GEMV_NP=8` stream count, `_GEMVN_RB=448` — Zen4 magic) and `gbmvN` (0.62:
+         `_GBMV_CONV_MAX=48`) are plain AVX2 kernel-tuning, unrelated to the triangular wall. `trsm` (0.68)
+         is built on the now-fast gemm + inverse base → may move a lot with modest tuning; if trsm gates,
+         **potrf/getrf likely follow** (built on trsm+syrk+gemm). Make the magic numbers width-adaptive +
+         Preferences-overridable, sweep on galen, W=8 preserved by construction.
+      2. **Small-n triangular campaign (DELIBERATE — study first, no live iteration).** Start by studying
+         how OpenBLAS structures its small syrk/trmm kernels (specifically how its diagonal handling avoids
+         the masked-store cost that sank the unpacked attempt above), THEN design a Zen3 small-n triangular
+         kernel. Covers syrk/syr2k n≤128, then symm/trsm small-n. Hard; schedule as its own effort.
+      3. **Empirically certify Zen4 (belt-and-suspenders).** Re-run the full Zen4 `plots.jl` gate once to
+         confirm no regression from the adaptive-tile changes (they are unchanged-by-construction for W=8 —
+         resolved consts identical + double full-suite — so this is confirmation, not discovery).
 - [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
   1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
      + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
