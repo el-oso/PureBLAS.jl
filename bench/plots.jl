@@ -43,6 +43,10 @@ const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 # Heavy O(n³) sweep for L3 / LAPACK, destructive-safe: per round, PRE-GENERATE `reps` fresh contexts
 # (outside timing) and time the loop over them — a single ~100 ns call at n=8 is pure timer quantization
 # (it fabricated a gemm 0.90 "fail" the high-reps harness measured at 1.2×). reps→1 at large n.
+# ⚠ REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`, performance
+# governor). The per-round `mk(s)` alloc between timed regions is memory-bound and drops the core off
+# boost, so with boost ON the side timed first runs at a lower clock → biased ratio + big small-n noise
+# (fabricated a fake complex-gemm "n=32 0.90 floor"; clean locked-freq = 1.03 hot). See memory dev-fleet.
 function sweep_heavy(mk, ob1, pb1, sizes; rounds = 8)
     out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
