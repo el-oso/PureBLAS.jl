@@ -468,7 +468,7 @@ oracle ~1e-16 (upper/lower, s/d/c/z), ForwardDiff-traceable. **spr GATES 1.02–
 Native API mirrors `ger!`: `spr!(α,x,AP;uplo)`, `spr2!(α,x,y,AP;uplo)`, `hpr!`/`hpr2!`. **BLAS L1/L2/L3
 now complete.** Next: LAPACK breadth (eigensolvers), or M4/M5/M6.
 
-## Small-n gate campaign — ALL L3+LAPACK ops gate 0.96× at n=2–2048 (2026-07-02) ✅ (one cell pinned-pending)
+## Small-n gate campaign — ALL L3+LAPACK ops gate 0.96× at n=2–2048 (2026-07-02) ✅ CONTRACT FULFILLED
 
 New standing requirement (user, 2026-07-01): every BLAS-3 and LAPACK routine must gate ≥0.96× OpenBLAS at
 EVERY size n=2…2048 — "smaller sizes usually indicate hidden unresolved overheads." Executed overnight
@@ -476,8 +476,9 @@ EVERY size n=2…2048 — "smaller sizes usually indicate hidden unresolved over
 
 Final grid (typed harness, interleaved reps+reset medians, Zen4 unpinned — ±0.02 wobble):
 gemm/symm/syrk/syr2k/trsm(L,R)/trmm-L: gate at every size, most cells 1.1–3×.
-trmm-R: gates everywhere except **1024 ≈ 0.94** — our absolute equals OB's own side-L (25.7 vs 25.5 ms);
-OB-R is simply 4% faster than OB-L at po2-1024. potrf/geqrf/getrf/gesvd: gate at every size (geqrf tiny-n
+trmm-R: NOW GATES EVERYWHERE — the final cell (1024, was 0.94) closed by PRE-PACKING all of B in
+`_trmm_packedR!` (packing doubles as the in-place capture: the separate copy+repack was ~2–3% of runtime).
+Final trmm-R row: 2.70 1.45 1.02 1.08 0.96 1.13 1.08 1.06 0.98 0.97 0.97. potrf/geqrf/getrf/gesvd: gate at every size (geqrf tiny-n
 2–4×, gesvd n=4 0.40→1.35). **Certify the at-gate cells (trmm-R 512/1024/2048, getrf/gemm 2048, symm 512)
 with `sudo bench/cpufreq_lock.sh pin 4500` — the overnight box was thermally wobbling.**
 

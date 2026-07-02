@@ -287,24 +287,37 @@ function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {
     m, k = size(B); W = _vwidth(T); mr = _MR * W; nr = _NR
     upM = (up != tr)
     kc = min(_TRMM_RKC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(k, nr) * nr * kc)
-    Bc = _TRMM_BCR[]
-    (size(Bc, 1) < m || size(Bc, 2) < k) && (Bc = _TRMM_BCR[] = Matrix{Float64}(undef, m, k))
-    ldb = stride(B, 2); ldc = stride(Bc, 2); sz = sizeof(T)
-    GC.@preserve B Bc Ap Bp begin
-        pB = pointer(B); pBc = pointer(Bc)
-        @inbounds for j in 0:(k - 1)                                 # capture B (contiguous per-column)
-            unsafe_copyto!(pBc + j * ldc * sz, pB + j * ldb * sz, m)
+    _, Bp = _gemm_scratch(T, 0, cld(k, nr) * nr * kc)
+    # Pre-pack ALL of B (the gemm A-operand) up front, before any C write — B IS C here, so packing it
+    # once both captures the input (no separate copy pass; ~2% of runtime at 1024) and feeds the whole
+    # sweep. Slot layout: (pc-block, ic-block) → a fixed-size mr-panel group.
+    nic = cld(m, mc); npc = cld(k, kc); slot = cld(mc, mr) * mr * kc
+    Apf = _trmm_bpf(T, npc * nic * slot)
+    ldb = stride(B, 2); sz = sizeof(T)
+    GC.@preserve B Apf Bp begin
+        pB = pointer(B)
+        pc = 0; pb = 0
+        while pc < k                                                 # pre-pack phase (reads only)
+            kce = min(kc, k - pc)
+            ic = 0; icx = 0
+            while ic < m
+                mce = min(mc, m - ic)
+                off = (pb * nic + icx) * slot
+                _pack_A!(view(Apf, (off + 1):(off + cld(mce, mr) * mr * kce)), B, ic, pc, mce, kce,
+                    false, one(T), mr)
+                ic += mc; icx += 1
+            end
+            pc += kc; pb += 1
         end
-        App = pointer(Ap); Bpp = pointer(Bp)
+        Apfp = pointer(Apf); Bpp = pointer(Bp)
         pc = 0; pb = 0
         while pc < k
             kce = min(kc, k - pc)
             _pack_B_triR!(Bp, A, pc, kce, k, upM, tr, unit, nr)
-            ic = 0
+            ic = 0; icx = 0
             while ic < m
                 mce = min(mc, m - ic)
-                _pack_A!(Ap, Bc, ic, pc, mce, kce, false, one(T), mr)
+                App = Apfp + (pb * nic + icx) * slot * sz
                 jr = 0
                 while jr < k
                     nre = min(nr, k - jr)
@@ -331,7 +344,7 @@ function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {
                     end
                     jr += nr
                 end
-                ic += mc
+                ic += mc; icx += 1
             end
             pc += kc; pb += 1
         end
