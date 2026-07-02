@@ -703,19 +703,22 @@ end
 # FMA ports; CMR=2 or CNR=8 spill AVX2 and tank to ~0.5–0.67). Same 12-acc AVX2 lesson as real gemm.
 const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
 const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
-# Small-n cutoff: below this the O(n²) split-pack + interleave-store overhead loses to the plain
-# scalar triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
-const _CGEMM_TINY = @load_preference("cgemm_tiny", _W64 == 4 ? 6 : 6)::Int
-# Above _CGEMM_TINY but ≤ this (and tA='N'): the unpacked small-n complex path (no packing, free MR).
-# Complex is 2× the bytes of real so it fits L2 at smaller n than the real _GEMM_UNPACK_MAX. W=8: big
-# win to n≈192. W=4/AVX2: OFF (0) — the in-kernel deinterleave temps + CNR=6 accs spill 16 ymm, so
-# unpacked tanks F64 (~0.50); the packed blocked path is better small-n on AVX2. galen-swept 2026-07-02.
-const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 0 : 192)::Int
+# Small-n cutoff: below this the blocked machinery (pack + interleave-store) loses to the plain scalar
+# triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
+const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
+# _CGEMM_TINY < max(m,n,k) ≤ this (and tA='N'): the UNPACKED tiny-n path. W=8: unpacked (skip pack,
+# free MR) beats blocked broadly on Zen4/32-reg → 192. W=4/AVX2: unpacked's per-panel re-deinterleave
+# loses to the vectorized-pack blocked path by n≈16, and the CNR=6 tile + deinterleave temp spill, so
+# only the tiniest n win → 12. Above this, blocked (with vectorized packs). galen-swept 2026-07-02.
+const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 12 : 192)::Int
 
 # Split-pack op(A) into mr-row panels: real parts → ApR, imag → ApI (same panel layout as _pack_A!,
 # so the microkernel indexes both identically). No alpha (folded at store), no conj (kernel sign).
 function _pack_A_cmplx!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
         tA::Bool, mr::Int) where {T}
+    if !tA && A isa StridedMatrix && stride(A, 1) == 1     # contiguous columns → vectorized deinterleave
+        return _pack_A_cmplx_simd!(ApR, ApI, A, ic, pc, mce, kce, mr)
+    end
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
         base = pi * mr * kce
@@ -738,6 +741,22 @@ function _pack_B_cmplx!(BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = ji * nr * kce
+        if ji * nr + nr <= nce                   # full panel — branch-free; @simd ivdep vectorizes the
+            j0 = jc + ji * nr                    # contiguous BpR/BpI stores (reads split re/im per elt)
+            for p in 0:(kce - 1)
+                gp = pc + p
+                if tB
+                    @simd ivdep for c in 0:(nr - 1)
+                        v = B[j0 + c + 1, gp + 1]; BpR[base + p * nr + c + 1] = real(v); BpI[base + p * nr + c + 1] = imag(v)
+                    end
+                else
+                    @simd ivdep for c in 0:(nr - 1)
+                        v = B[gp + 1, j0 + c + 1]; BpR[base + p * nr + c + 1] = real(v); BpI[base + p * nr + c + 1] = imag(v)
+                    end
+                end
+            end
+            continue
+        end
         for p in 0:(kce - 1)
             for c in 0:(nr - 1)
                 lc = ji * nr + c; idx = base + p * nr + c + 1
@@ -802,14 +821,14 @@ function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
     return body
 end
 
-# Full mr×nr complex tile.
+# Full mr×nr complex tile. B0 ⇒ overwrite C (skip the read) — the first/only kc-block when beta=0.
 @generated function _microkernel_cmplx!(C::Ptr{T}, ldc::Int, ApR::Ptr{T}, ApI::Ptr{T},
         BpR::Ptr{T}, BpI::Ptr{T}, kc::Int, alr::T, ali::T,
-        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}) where {T, MR, NR, SA, SB}
+        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
     W = _vwidth(T)
-    storefn = (mi, j, q, st) -> quote
-        let qq = $q; $st; vstore(vload(Vec{$(2W), $T}, qq) + resv, qq); end
-    end
+    storefn = (mi, j, q, st) -> B0 ?
+        quote let qq = $q; $st; vstore(resv, qq); end end :
+        quote let qq = $q; $st; vstore(vload(Vec{$(2W), $T}, qq) + resv, qq); end end
     _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
 end
 
@@ -817,16 +836,16 @@ end
 # Packed panels are zero-padded so the full compute is correct; only the store is masked/guarded.
 @generated function _microkernel_cmplx_masked!(C::Ptr{T}, ldc::Int, ApR::Ptr{T}, ApI::Ptr{T},
         BpR::Ptr{T}, BpI::Ptr{T}, kc::Int, alr::T, ali::T, mre::Int, nre::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}) where {T, MR, NR, SA, SB}
+        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
     W = _vwidth(T)
     lanetuple = Expr(:tuple, (0:(2W - 1))...)
     # row mask: real lane l valid iff its complex row l÷2 is < the valid rows in THIS vector
-    # (mre − (mi−1)·W). Column guard j<nre. Store adds masked res into C (same interleave as full).
+    # (mre − (mi−1)·W). Column guard j<nre. B0 ⇒ masked overwrite (skip the C read).
     storefn = (mi, j, q, st) -> quote
         if $(j - 1) < nre
             let qq = $q, msk = (Vec{$(2W), Int}($lanetuple)) < 2 * (mre - $((mi - 1) * W))
                 $st
-                vstore(vload(Vec{$(2W), $T}, qq, msk) + resv, qq, msk)
+                $(B0 ? :(vstore(resv, qq, msk)) : :(vstore(vload(Vec{$(2W), $T}, qq, msk) + resv, qq, msk)))
             end
         end
     end
@@ -845,8 +864,12 @@ end
 function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
         alpha, A, B, beta, C) where {SA, SB}
     Tc = eltype(C); T = real(Tc)
-    _scale_C!(C, m, n, convert(Tc, beta))
-    (iszero(alpha) || k == 0) && return C
+    b0 = iszero(beta)
+    b0 || _scale_C!(C, m, n, convert(Tc, beta))   # beta=0 ⇒ first kc-block overwrites (no scale pass)
+    if iszero(alpha) || k == 0
+        b0 && _scale_C!(C, m, n, zero(Tc))
+        return C
+    end
     W = _vwidth(T); mr = _CMR * W; nr = _CNR
     kc = min(_KC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
@@ -863,6 +886,7 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::
             pc = 0
             while pc < k
                 kce = min(kc, k - pc)
+                ov = b0 && pc == 0        # overwrite C on the first kc-block (beta=0); else accumulate
                 _pack_B_cmplx!(BpR, BpI, B, pc, jc, kce, nce, tB, nr)
                 ic = 0
                 while ic < m
@@ -877,14 +901,18 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, tA::Bool, tB::Bool, m::Int, n::
                             aoff = div(ir, mr) * mr * kce * sz
                             boff = div(jr, nr) * nr * kce * sz
                             Cblk = Cp0 + (2 * (ic + ir) + (jc + jr) * ldc * 2) * sz
+                            AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
+                            BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
                             if mre == mr && nre == nr
-                                _microkernel_cmplx!(Ptr{T}(Cblk), ldc, Ptr{T}(ARp + aoff),
-                                    Ptr{T}(AIp + aoff), Ptr{T}(BRp + boff), Ptr{T}(BIp + boff),
-                                    kce, alr, ali, Val(_CMR), Val(_CNR), Val(SA), Val(SB))
+                                ov ? _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
+                                        kce, alr, ali, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(true)) :
+                                     _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
+                                        kce, alr, ali, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(false))
                             else
-                                _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(ARp + aoff),
-                                    Ptr{T}(AIp + aoff), Ptr{T}(BRp + boff), Ptr{T}(BIp + boff),
-                                    kce, alr, ali, mre, nre, Val(_CMR), Val(_CNR), Val(SA), Val(SB))
+                                ov ? _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(true)) :
+                                     _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(_CNR), Val(SA), Val(SB), Val(false))
                             end
                             ir += mr
                         end
@@ -910,13 +938,61 @@ function _gemm_cmplx_blocked!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n:
     end
 end
 
-# ── Complex UNPACKED path for small n (tA='N') ───────────────────────────────────────────────
-# Small cache-resident complex GEMM: skip packing (O(n²) de-interleave rivals the O(n³) compute)
-# and read A/B directly, de-interleaving A's interleaved [r i r i…] columns IN the k-loop (2 shuffles
-# per A-vector). Because addressing is via lda (not a packed panel), MR is free — the row remainder
-# uses a Val(1) single-vector tile, so masking waste is ≤ one W-vector total, not the packed path's
-# whole-tile waste (which sank n≈mr+ε). Requires tA='N' (contiguous A columns for the vector load).
-# One @generated kernel, always row-masked (mask=all-true when full); column guard nre.
+# ── Vectorized complex-pack helpers ──────────────────────────────────────────────────────────
+# The blocked path's small-n loss was pack+scale overhead (MEASURED 40% of runtime at n=32 F64, 84%
+# F32; only 3.3% at n=512). The packs are now vectorized: A's de-interleave is a contiguous Vec{2W}
+# load + shuffle (`_pack_A_cmplx_simd!`, used by `_pack_A_cmplx!`), B's is an `@simd ivdep` split into
+# the contiguous BpR/BpI panels. Structure stays blocked (pack B ONCE, reuse) — streaming B instead
+# was tried and LOST (re-reads B per row-tile: ~0.45 on galen). Complex `_scale_C!` is vectorized too.
+
+# Deinterleave a Vec{2W} [r i r i…] into (reals, imags) via one shuffle each (indices fold at compile).
+@generated function _deint_cmplx(av::Vec{N, T}) where {N, T}
+    W = N ÷ 2
+    ev = Expr(:tuple, (2 * (i - 1) for i in 1:W)...); od = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
+    :((shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
+end
+
+# Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
+# column, deinterleave → real panel ApR / imag panel ApI. Partial last panel stays scalar (zero-pad).
+function _pack_A_cmplx_simd!(ApR::Vector{T}, ApI::Vector{T}, A::StridedMatrix, ic::Int, pc::Int,
+        mce::Int, kce::Int, mr::Int) where {T}
+    W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); np = cld(mce, mr)
+    GC.@preserve A ApR ApI begin
+        Aptr = Ptr{T}(pointer(A)); PR = pointer(ApR); PI = pointer(ApI)
+        @inbounds for pi in 0:(np - 1)
+            base = pi * mr * kce; r0 = ic + pi * mr
+            if pi * mr + mr <= mce                       # full panel — vectorized deinterleave
+                for p in 0:(kce - 1)
+                    col = 2 * (r0 + (pc + p) * lda); dst = base + p * mr
+                    o = 0
+                    while o < mr
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, Aptr + (col + 2 * o) * sz))
+                        vstore(ar, PR + (dst + o) * sz); vstore(ai, PI + (dst + o) * sz)
+                        o += W
+                    end
+                end
+            else                                         # partial panel — scalar, zero-padded
+                for p in 0:(kce - 1), r in 0:(mr - 1)
+                    lr = pi * mr + r; idx = base + p * mr + r + 1
+                    if lr < mce
+                        v = A[ic + lr + 1, pc + p + 1]; ApR[idx] = real(v); ApI[idx] = imag(v)
+                    else
+                        ApR[idx] = zero(T); ApI[idx] = zero(T)
+                    end
+                end
+            end
+        end
+    end
+    return
+end
+
+# ── Complex UNPACKED path for TINY n (tA='N') ────────────────────────────────────────────────
+# For very small cache-resident complex GEMM the blocked machinery (pack + mr-tile masking) doesn't
+# amortize: read A/B directly and de-interleave A's [r i r i…] columns IN the k-loop (2 shuffles per
+# A-vector). Addressing via lda (not a packed panel) makes MR FREE → the row remainder uses a Val(1)
+# single-vector tile (masking waste ≤ one W-vector, not a whole padded mr-tile — decisive for tiny F32
+# where mr=32). Wins ONLY at tiny n (the per-panel re-deinterleave costs n/nr× — it loses to blocked by
+# n≈16 on AVX2), so the cutoff is small (esp. W=4). tA='N' required (contiguous A columns for the load).
 @generated function _uker_cmplx!(C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T, mre::Int, nre::Int,
         ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB}) where {T, MR, NR, TB, SA, SB}
@@ -926,7 +1002,7 @@ end
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
     lanetuple = Expr(:tuple, (0:(2W - 1))...)
     body = quote lanes2 = Vec{$(2W), Int}($lanetuple) end
-    for mi in 1:MR   # per-vector row mask: complex row (mi−1)W+l÷2 valid iff < mre
+    for mi in 1:MR
         push!(body.args, :($(Symbol(:m2, mi)) = lanes2 < 2 * (mre - $((mi - 1) * W))))
     end
     for mi in 1:MR, j in 1:NR
@@ -934,11 +1010,10 @@ end
         push!(body.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
     end
     inner = quote end
-    for mi in 1:MR   # load A[:, p] rows as interleaved Vec{2W}, deinterleave → ar,ai (2 shuffles)
+    for mi in 1:MR
         aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
         push!(inner.args, :($(Symbol(:av, mi)) = vload(Vec{$(2W), $T}, A + $aoff, $(Symbol(:m2, mi)))))
-        push!(inner.args, :($(Symbol(:ar, mi)) = shufflevector($(Symbol(:av, mi)), Val($evens))))
-        push!(inner.args, :($(Symbol(:ai, mi)) = shufflevector($(Symbol(:av, mi)), Val($odds))))
+        push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
     end
     for j in 1:NR
         boff = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
@@ -956,7 +1031,7 @@ end
     end
     push!(body.args, :(for p in 0:(k - 1); $inner; end))
     push!(body.args, :(avr = $V(alr); avi = $V(ali)))
-    for j in 1:NR   # column guard; masked add into interleaved C
+    for j in 1:NR
         stores = quote end
         for mi in 1:MR
             cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j); mk = Symbol(:m2, mi)
@@ -973,7 +1048,6 @@ end
     push!(body.args, :(return nothing))
     return body
 end
-
 function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k::Int,
         alpha, A, B, beta, C) where {SA, SB}
     Tc = eltype(C); T = real(Tc)
@@ -991,7 +1065,7 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
             ir = 0
             while ir < m
                 mre = min(mr, m - ir)
-                nrv = cld(mre, W)   # live row-vectors; shrink MR so masking waste ≤ one W-vector
+                nrv = cld(mre, W)
                 if nrv >= _CMR
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
                         Val(_CMR), Val(_CNR), tb, Val(SA), Val(SB))
@@ -1006,13 +1080,10 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
     end
     return C
 end
-# Unpacked dispatch: tA='N' ⇒ SA=1 (conj only rides transA='C', which sets tA); only cB matters.
+# tA='N' ⇒ SA=1 (conj only rides transA='C', which sets tA); only cB matters.
 function _gemm_cmplx_unpacked_go!(tB::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C)
-    if cB
-        _gemm_cmplx_unpacked!(Val(1), Val(-1), tB, m, n, k, alpha, A, B, beta, C)
-    else
-        _gemm_cmplx_unpacked!(Val(1), Val(1), tB, m, n, k, alpha, A, B, beta, C)
-    end
+    cB ? _gemm_cmplx_unpacked!(Val(1), Val(-1), tB, m, n, k, alpha, A, B, beta, C) :
+         _gemm_cmplx_unpacked!(Val(1), Val(1), tB, m, n, k, alpha, A, B, beta, C)
 end
 
 """
@@ -1020,7 +1091,7 @@ end
 
 In-place GEMM: `C := alpha·op(A)·op(B) + beta·C`, with `op` set by `transA`/`transB`
 (`'N'`/`'T'`/`'C'`). Real and complex dense (unit column stride) `C` use SIMD paths (real: blocked/
-unpacked; complex: split-pack blocked, or the unpacked small-n path); AD element types and strided
+unpacked; complex: split-pack blocked, or an unpacked tiny-n path); AD element types and strided
 `C` use the generic scalar path.
 """
 # Dispatch core (no kwargs, no dim checks) — callers that already know shapes are valid (e.g. the trsm/trmm
