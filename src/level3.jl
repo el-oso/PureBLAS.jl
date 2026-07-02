@@ -1285,9 +1285,16 @@ end
 # Recursion base for the diagonal (gemm→temp + triangle-add wastes 2× flops on b×b; smaller base =
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
+# n above which the single-pass packed syrk beats the gemm→temp recursion. On W=8 = _GEMM_UNPACK_MAX
+# (unchanged: recursion up to the gemm unpack size, packed above). On AVX2 the recursion base's 2×-flop
+# waste bites earlier and the packed path (per-microtile diagonal, no waste) wins from n≈24 — but the
+# tiny-n gemm base still wins below that (packing overhead dominates on n≤20). Overridable per machine.
+# (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
+# and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
+const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _vwidth(Float64) == 4 ? 23 : _GEMM_UNPACK_MAX)::Int
 # Large real syrk → single-pass packed (gate); small / complex / herk → recursion (gemm-temp base).
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
-    if !herm && eltype(C) <: BlasReal && size(C, 1) > _GEMM_UNPACK_MAX && k > 0
+    if !herm && eltype(C) <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
         return _syrk_packed!(up, tr, convert(eltype(C), α), A, C, k)
     end
     _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)))

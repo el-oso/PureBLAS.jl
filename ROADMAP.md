@@ -92,14 +92,31 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            leaves lose to invL leaves). The trsm loss (n=32 0.66, n=128 0.76, n=256 0.79) is small-triangular
            *kernel* efficiency (invL base + dense back-sub), not routing → **moved to phase 2**. Knobs reverted
            (YAGNI; phase 2 re-adds the sweep surface). Large-n trsm (512+) already ~0.92–0.97.
-      2. **Small-n triangular campaign (DELIBERATE — study first, no live iteration).** Start by studying
-         how OpenBLAS structures its small syrk/trmm kernels (specifically how its diagonal handling avoids
-         the masked-store cost that sank the unpacked attempt above), THEN design a Zen3 small-n triangular
-         kernel. Covers syrk/syr2k n≤128, then symm/trsm small-n (**trsm n≤256: invL base + dense back-sub
-         kernel efficiency, folded in here from phase 1**). Hard; schedule as its own effort.
-      3. **Empirically certify Zen4 (belt-and-suspenders).** Re-run the full Zen4 `plots.jl` gate once to
-         confirm no regression from the adaptive-tile changes (they are unchanged-by-construction for W=8 —
-         resolved consts identical + double full-suite — so this is confirmation, not discovery).
+      2. **Small-n triangular campaign (DELIBERATE — study first).** STUDY DONE (2026-07-02): read
+         OpenBLAS's syrk/trmm/trsm Level-3 drivers (memory `openblas-triangular-diagonal`). Key findings:
+         OpenBLAS has **NO small-n special path** (size only gates threading; the blocked driver is just
+         efficient at small n); its syrk diagonal tile is computed **dense into scratch then scalar
+         triangular copy-back** (no masks); trmm/trsm bake the triangle into the PACK (zero strict-tri /
+         set-or-invert diagonal) so the dense kernel runs unmasked.
+         - **syrk PARTIAL WIN (2026-07-02):** the recursion base wastes 2× flops (`gemm→temp + _add_tri`);
+           the packed path (`_trgemm_packed!`, per-microtile diagonal, no waste) beats it from n≈24.
+           Added `_SYRK_PACK_CUT` (W==4 → 23, W==8 = `_GEMM_UNPACK_MAX` so unchanged) routing 24≤n≤128 off
+           recursion onto packed: **n=32 0.75→0.80, n=128 0.75→0.88** (crossover measured n=12..32; recursion
+           still wins n≤20, e.g. n=16 1.08). Suite 7213/7213 on galen. `src/level3.jl`.
+         - **DISPROVEN (do NOT re-try): OpenBLAS scratch+copyback diagonal tile.** Implemented
+           `_microkernel_tri_scratch!` (dense tile → stack scratch → bounded scalar triangular copy-back)
+           and A/B-tested vs the existing masked `_microkernel_tri!` on galen: **EQUAL** (geomean 0.901 vs
+           0.902; n=32 0.83 vs 0.79, n=256 0.92 vs 0.94 — all noise). SIMD.jl masked stores on AVX2 are
+           already cheap; the masked-store cost was never the bottleneck. Reverted.
+         - **REMAINING:** n=32/128 syrk still ~0.80/0.88 (< gate) — the gap is general small-n kernel
+           efficiency (packing overhead + tile geometry), not diagonals. syr2k n≤128, symm/trsm small-n
+           (trsm n≤256 invL base) still open. Matching OpenBLAS's broadly-efficient small blocked kernel is
+           the real (hard) lever.
+      3. **Empirically certify Zen4 — DONE (2026-07-02): no regression.** Re-ran full `plots.jl` gate on
+         wintermute (Ryzen 5 7640U, Zen4, W=8) and diffed vs baseline: changed ops statistically identical
+         (gbmvN 1.34, gemvN 1.20 geomean; W=8 codegen bit-identical). The few sub-gate worst sizes (gemm n=8
+         0.82, gemvN n=512 0.95, getrf 0.93) PRE-EXIST in the baseline and are this mobile chip's noise
+         floor — not introduced by the phase-1/2 changes.
 - [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
   1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
      + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
