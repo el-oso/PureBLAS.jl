@@ -697,14 +697,20 @@ end
 #   * alpha (complex) applied at store; C pre-scaled by beta once (kc-blocked accumulation).
 # Complex is ~2× flops/byte of real → compute-bound; gating is FMA-port saturation, not bandwidth.
 # 2 accumulators/tile ⇒ HALVE the real tile dims for register pressure (_CMR/_CNR, overridable).
+# Register budget per tile: 2·CMR·CNR (Cr,Ci accs) + 2·CMR (ar,ai) + 2 (br,bi) ≤ (vector registers).
+# W=8 AVX-512 (32 regs): 2×4 = 16 accs (Zen4/5). W=4 AVX2 (16 ymm): 1×6 = 12 accs + 2 + 2 = 16, an
+# EXACT fit — galen-swept 2026-07-02 (CNR=6 beat 4 at large n: more independent chains saturate the
+# FMA ports; CMR=2 or CNR=8 spill AVX2 and tank to ~0.5–0.67). Same 12-acc AVX2 lesson as real gemm.
 const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
-const _CNR = @load_preference("cgemm_nr", 4)::Int
+const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
 # Small-n cutoff: below this the O(n²) split-pack + interleave-store overhead loses to the plain
 # scalar triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
 const _CGEMM_TINY = @load_preference("cgemm_tiny", _W64 == 4 ? 6 : 6)::Int
 # Above _CGEMM_TINY but ≤ this (and tA='N'): the unpacked small-n complex path (no packing, free MR).
-# Complex is 2× the bytes of real so it fits L2 at smaller n than the real _GEMM_UNPACK_MAX. Measured.
-const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 64 : 192)::Int
+# Complex is 2× the bytes of real so it fits L2 at smaller n than the real _GEMM_UNPACK_MAX. W=8: big
+# win to n≈192. W=4/AVX2: OFF (0) — the in-kernel deinterleave temps + CNR=6 accs spill 16 ymm, so
+# unpacked tanks F64 (~0.50); the packed blocked path is better small-n on AVX2. galen-swept 2026-07-02.
+const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 0 : 192)::Int
 
 # Split-pack op(A) into mr-row panels: real parts → ApR, imag → ApI (same panel layout as _pack_A!,
 # so the microkernel indexes both identically). No alpha (folded at store), no conj (kernel sign).
