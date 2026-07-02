@@ -584,8 +584,31 @@ single-threaded for now.**
 
 ## M5 — complex SIMD + multi-ISA dispatch
 
-Interleaved re/im SIMD for complex kernels. Runtime AVX-512/AVX2/NEON dispatch in one build
-(so a single artifact runs optimally across the Zen3/Zen4/Zen5/ARM fleet).
+Complex-SIMD for complex kernels (currently correct-but-scalar → the biggest beat-OpenBLAS
+opportunity). Runtime AVX-512/AVX2/NEON dispatch in one build (so a single artifact runs optimally
+across the Zen3/Zen4/Zen5/ARM fleet).
+
+**Design ready (OpenBLAS study 2026-07-02, memory `openblas-complex-simd-design`):** pack SPLIT
+(de-interleave `[Ar…][Ai…]` once at pack time, NOT interleaved+shuffle — the x86 `vmovsldup` trick
+isn't portable); one complex MAC = **4 real FMAs** on `Vec{N,T}` Cr/Ci accumulators; the 4 conj
+variants (N/C×N/C) are ONE kernel with the two imag-term signs passed as `Val` params (fma/fnma);
+**2 accumulators/tile** → halve the real tile dims for register pressure. Skip 3M/Karatsuba for v1.
+Keep the generic scalar path as oracle + AD path.
+
+## ⓘ OpenBLAS-source-informed opportunity scan (2026-07-02)
+
+Studied OpenBLAS `develop` for beat-OpenBLAS wins. Prioritized:
+1. **Complex SIMD GEMM (M5) — the standout.** Complex is scalar today; design above is ready. High
+   impact (whole complex L3/L2/L1 surface), high effort.
+2. **Tall-skinny GEMM — NOT a gap (verified, dismissed).** Hypothesis: our `_use_unpacked` gates on
+   `max(m,n,k)` while OpenBLAS gates on volume `M·N·K≤1e6`, so we'd pack tall-skinny that OB runs
+   direct. MEASURED on galen: PureBLAS already **beats** OB 1.14–2.64× on 4096×8×8-type shapes *despite*
+   packing → no action (a switch to volume-gating might help further but the gate is already met).
+3. **Small SQUARE gemm n=8 (~0.82 Zen4).** We already skip packing there (`max=8≤128`), so it's
+   dispatch/call overhead or mobile-chip noise, not packing — low ROI; revisit if it blocks a gate.
+4. **Operation fusion via Mode 2 (structural beat OB).** The native API (no ccall boundary) can fuse
+   `α·A·B+β·C` with a following op, gemm+activation, etc. — OpenBLAS can't fuse across its opaque
+   C-ABI. Real advantage, but API-design work; schedule when there's a consuming use case.
 
 ## M6 — AD rules
 
