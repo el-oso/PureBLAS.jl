@@ -32,7 +32,20 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       scal/copy/asum ≥ parity; axpy/dot at parity. Implementation: reductions use 4 accumulators
       (latency-bound otherwise); elementwise kernels 4-way unrolled; nrm2 = SIMD sum-of-squares with
       scaled-lassq fallback on overflow/underflow.
-- [ ] Re-run the gate per-machine on the rest of the fleet (Zen3 AVX2, Zen5 native-AVX512, M5 ARM).
+- [~] Re-run the gate per-machine on the rest of the fleet (Zen3 AVX2, Zen5 native-AVX512, M5 ARM).
+  - **Zen3 (galen, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
+    suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
+    symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
+    PASS except gemvN 0.80 / gbmvN 0.62, **all L3 FAIL (gemm 0.63, symm 0.58, syrk 0.59, syr2k 0.65,
+    trmm 0.64, trsm 0.64)**, all LAPACK FAIL (potrf 0.61, geqrf 0.82, getrf 0.68, gesvd 0.86).
+    **ROOT CAUSE (grounded, not guessed):** the gemm microkernel tile is `_MR=2 × _NR=8 = 16 vector
+    accumulators` — sized for AVX-512's 32 registers; on AVX2's **16 ymm** it spills accumulators to
+    stack every FMA. All L3/LAPACK build on gemm ⇒ the whole stack inherits it. **Fix = an
+    architecture-adaptive tile (W=4 wants ~MR=1–2 × NR=6 = 6–12 accs, the classic AVX2 geometry),
+    then per-op threshold retune** — a Zen3 tuning campaign analogous to the wintermute small-n one.
+    `_MR/_NR/_MC/_NC/_KC` are currently compile-time consts (need Preferences/width-adaptive folding).
+    Baseline cache: `bench/plots_data_galen.txt` on galen. Gate is per-machine (unpinned run; cpufreq
+    pin needs sudo on galen).
 - [x] Perf guardrails (2026-07-01) — TWO complementary tools + a CI gate:
   1. **Self-regression (`judge`)** — `benchmark/benchmarks.jl` PkgBenchmark suite (SVD + getrf/geqrf/potrf
      + gemm). **CI `perf` job** (`.github/workflows/CI.yml` → `benchmark/judge_ci.jl`) runs
