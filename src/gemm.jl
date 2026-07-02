@@ -782,7 +782,7 @@ end
 # The complex microkernel body (shared by full + masked). Emits the accumulator init, the 4-FMA
 # k-loop, and the store expressions; `storefn(mi,j,q,cr,ci)` builds the per-cell store statement so
 # the full (plain vstore) and masked (guarded, masked vstore) variants share everything else.
-function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
+function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1 = false)
     sz = sizeof(T); V = Vec{W, T}
     body = quote end
     for mi in 1:MR, j in 1:NR
@@ -815,13 +815,14 @@ function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
     # elementwise real add of the interleaved reps, so we only interleave `res` once (no deinterleave
     # of old C) and add straight into C. beta already applied to C. ilv: (r0,i0,r1,i1,…) from [resr;resi].
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
-    push!(body.args, :(avr = $V(alr); avi = $V(ali)))
+    A1 || push!(body.args, :(avr = $V(alr); avi = $V(ali)))
     for j in 1:NR, mi in 1:MR
         cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
         q = :(C + ($(j - 1) * ldc * 2 + $((mi - 1) * 2W)) * $sz)
-        st = quote
-            resv = shufflevector(avr * $cr - avi * $ci, avr * $ci + avi * $cr, Val($ilv))
-        end
+        # A1 (alpha==1): resv = interleave(cr,ci) directly — skip the complex-multiply-by-alpha (4
+        # muls + 2 adds/cell), which matters at short k where the store epilogue isn't amortized.
+        st = A1 ? :(resv = shufflevector($cr, $ci, Val($ilv))) :
+                  :(resv = shufflevector(avr * $cr - avi * $ci, avr * $ci + avi * $cr, Val($ilv)))
         push!(body.args, storefn(mi, j, q, st))
     end
     push!(body.args, :(return nothing))
@@ -831,19 +832,21 @@ end
 # Full mr×nr complex tile. B0 ⇒ overwrite C (skip the read) — the first/only kc-block when beta=0.
 @generated function _microkernel_cmplx!(C::Ptr{T}, ldc::Int, ApR::Ptr{T}, ApI::Ptr{T},
         BpR::Ptr{T}, BpI::Ptr{T}, kc::Int, alr::T, ali::T,
-        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
+        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false),
+        ::Val{A1} = Val(false)) where {T, MR, NR, SA, SB, B0, A1}
     W = _vwidth(T)
     storefn = (mi, j, q, st) -> B0 ?
         quote let qq = $q; $st; vstore(resv, qq); end end :
         quote let qq = $q; $st; vstore(vload(Vec{$(2W), $T}, qq) + resv, qq); end end
-    _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
+    _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
 end
 
 # Masked complex tile: mre valid complex rows (2·mre real lanes), nre valid columns (column guard).
 # Packed panels are zero-padded so the full compute is correct; only the store is masked/guarded.
 @generated function _microkernel_cmplx_masked!(C::Ptr{T}, ldc::Int, ApR::Ptr{T}, ApI::Ptr{T},
         BpR::Ptr{T}, BpI::Ptr{T}, kc::Int, alr::T, ali::T, mre::Int, nre::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
+        ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false),
+        ::Val{A1} = Val(false)) where {T, MR, NR, SA, SB, B0, A1}
     W = _vwidth(T)
     lanetuple = Expr(:tuple, (0:(2W - 1))...)
     # row mask: real lane l valid iff its complex row l÷2 is < the valid rows in THIS vector
@@ -856,7 +859,7 @@ end
             end
         end
     end
-    _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn)
+    _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
 end
 
 const _CGEMM_SCRATCH = Dict{DataType, NTuple{4, Vector}}()
@@ -868,8 +871,8 @@ function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
 end
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
-function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
-        alpha, A, B, beta, C) where {SA, SB, NR}
+function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, tA::Bool, tB::Bool,
+        m::Int, n::Int, k::Int, alpha, A, B, beta, C) where {SA, SB, NR, A1}
     Tc = eltype(C); T = real(Tc)
     b0 = iszero(beta)
     b0 || _scale_C!(C, m, n, convert(Tc, beta))   # beta=0 ⇒ first kc-block overwrites (no scale pass)
@@ -912,14 +915,14 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, tA::Bool, tB::Bool, 
                             BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
                             if mre == mr && nre == nr
                                 ov ? _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true)) :
+                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true), Val(A1)) :
                                      _microkernel_cmplx!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false))
+                                        kce, alr, ali, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false), Val(A1))
                             else
                                 ov ? _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true)) :
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(true), Val(A1)) :
                                      _microkernel_cmplx_masked!(Ptr{T}(Cblk), ldc, AR, AI, BR, BI,
-                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false))
+                                        kce, alr, ali, mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false), Val(A1))
                             end
                             ir += mr
                         end
@@ -939,20 +942,19 @@ function _gemm_cmplx_blocked!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n:
     # Size-adaptive tile width: mid-small n use a narrower nr (fewer column-mask waste tiles, since nr=6
     # doesn't divide most n), large n use the wider register-optimal nr. No-op where _CNR_SMALL==_CNR
     # (W=8: small n is handled by the unpacked path, blocked only sees large n). galen-swept 2026-07-02.
-    if _CNR_SMALL != _CNR && max(m, n, k) <= _CGEMM_NRSMALL_MAX
-        _cmplx_blk_conj(Val(_CNR_SMALL), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
-    else
-        _cmplx_blk_conj(Val(_CNR), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
-    end
+    a1 = isone(convert(eltype(C), alpha))    # alpha==1 ⇒ skip the store's complex-multiply-by-alpha
+    nr = (_CNR_SMALL != _CNR && max(m, n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
+    a1 ? _cmplx_blk_conj(nr, Val(true), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C) :
+         _cmplx_blk_conj(nr, Val(false), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
 end
-@inline function _cmplx_blk_conj(::Val{NR}, tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int,
-        k::Int, alpha, A, B, beta, C) where {NR}
+@inline function _cmplx_blk_conj(::Val{NR}, ::Val{A1}, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
+        m::Int, n::Int, k::Int, alpha, A, B, beta, C) where {NR, A1}
     if cA
-        cB ? _gemm_cmplx_impl!(Val(-1), Val(-1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C) :
-             _gemm_cmplx_impl!(Val(-1), Val(1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C)
+        cB ? _gemm_cmplx_impl!(Val(-1), Val(-1), Val(NR), Val(A1), tA, tB, m, n, k, alpha, A, B, beta, C) :
+             _gemm_cmplx_impl!(Val(-1), Val(1), Val(NR), Val(A1), tA, tB, m, n, k, alpha, A, B, beta, C)
     else
-        cB ? _gemm_cmplx_impl!(Val(1), Val(-1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C) :
-             _gemm_cmplx_impl!(Val(1), Val(1), Val(NR), tA, tB, m, n, k, alpha, A, B, beta, C)
+        cB ? _gemm_cmplx_impl!(Val(1), Val(-1), Val(NR), Val(A1), tA, tB, m, n, k, alpha, A, B, beta, C) :
+             _gemm_cmplx_impl!(Val(1), Val(1), Val(NR), Val(A1), tA, tB, m, n, k, alpha, A, B, beta, C)
     end
 end
 
