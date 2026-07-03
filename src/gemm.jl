@@ -688,7 +688,22 @@ function _gemm_unpacked!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
                     if mre == mr && nre == nr        # full tile — no masks
                         _microkernel_unpacked!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
                             Val(_MR), Val(_NR), Val(TB), Val(B0))
-                    elseif nre == nr                 # partial rows, full columns
+                    elseif nre == nr && rem(mre, W) == 0   # W-aligned partial rows → clean clipped kernel
+                        # the unpacked kernel reads A directly, so a smaller Val(vr) reads exactly the mre
+                        # live rows — no mask, no wasted vector (mirrors the packed clip; closes the same
+                        # misaligned-m penalty on the n≤_GEMM_UNPACK_MAX path, e.g. trsm off-diagonals).
+                        vr = div(mre, W)
+                        if vr == 1
+                            _microkernel_unpacked!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                                Val(1), Val(_NR), Val(TB), Val(B0))
+                        elseif vr == 2
+                            _microkernel_unpacked!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                                Val(2), Val(_NR), Val(TB), Val(B0))
+                        else
+                            _microkernel_unpacked_mrows!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                                mre, Val(_MR), Val(_NR), Val(TB), Val(B0))
+                        end
+                    elseif nre == nr                 # truly-partial rows (mre % W ≠ 0) → masked
                         if nv1
                             _microkernel_unpacked_mrows!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
                                 mre, Val(1), Val(_NR), Val(TB), Val(B0))
