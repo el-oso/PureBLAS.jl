@@ -8,32 +8,34 @@
 # every path, so :full is the right mode. Driver steady-state (allocates scratch once) is guarded
 # separately with runtime @allocated in gemm_tests.jl, where static AllocCheck would false-positive.
 
-@testitem "StrictMode dogfood: PureBLAS Level-1 perf guarantees" begin
+@testitem "StrictMode dogfood: BLAS-1 strict contract" begin
     using StrictMode, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping dogfood (enable in test/Project.toml to run)"
         @test_skip StrictMode.checks_enabled()
     else
-        P = PureBLAS
+        # `AbstractBLAS1` is a @strict_contract (src/contracts.jl). @verify_strict re-checks the
+        # method surface (TypeContracts.@verify) AND that each L1 backend call is type-stable and
+        # allocation-free — here in the test project's FULL mode, so @noalloc is a static AllocCheck
+        # all-paths proof (the backend is loaded at test runtime). Mirrors the fast-mode in-src check.
+        bk = PureBLAS.DEFAULT_BACKEND
         n = 1000
-        xd = randn(Float64, n); yd = randn(Float64, n)         # SIMD fast path
-        xz = randn(ComplexF64, n); yz = randn(ComplexF64, n)   # generic scalar path
-        # SIMD real path
-        @assert_typestable P._axpy!(n, 2.0, xd, 1, yd, 1)
-        @assert_noalloc P._axpy!(n, 2.0, xd, 1, yd, 1)
-        @assert_trim_safe P._axpy!(n, 2.0, xd, 1, yd, 1)
-        @assert_noalloc P._scal!(n, 2.0, xd, 1)
-        @assert_noalloc P._copy!(n, xd, 1, yd, 1)
-        @assert_typestable P._dotu(n, xd, 1, yd, 1)
-        @assert_noalloc P._dotu(n, xd, 1, yd, 1)
-        @assert_noalloc P._nrm2(n, xd, 1)
-        @assert_noalloc P._asum(n, xd, 1)
-        @assert_noalloc P._iamax(n, xd, 1)
-        # generic complex path
-        @assert_typestable P._axpy!(n, 2.0 + 1.0im, xz, 1, yz, 1)
-        @assert_noalloc P._axpy!(n, 2.0 + 1.0im, xz, 1, yz, 1)
-        @assert_typestable P._dotc(n, xz, 1, yz, 1)
-        @assert_noalloc P._nrm2(n, xz, 1)
+        xd = randn(n); yd = randn(n)                          # SIMD fast path
+        xz = randn(ComplexF64, n); yz = randn(ComplexF64, n)  # generic scalar path
+        @verify_strict PureBLAS.SIMDBackend begin
+            PureBLAS.axpy!(bk, yd, 2.0, xd)
+            PureBLAS.scal!(bk, 2.0, xd)
+            PureBLAS.blascopy!(bk, yd, xd)
+            PureBLAS.swap!(bk, xd, yd)
+            PureBLAS.dot(bk, xd, yd)
+            PureBLAS.dotu(bk, xd, yd)
+            PureBLAS.nrm2(bk, xd)
+            PureBLAS.asum(bk, xd)
+            PureBLAS.iamax(bk, xd)
+            PureBLAS.axpy!(bk, yz, 2.0 + 1.0im, xz)   # generic complex path
+            PureBLAS.dot(bk, xz, yz)
+            PureBLAS.nrm2(bk, xz)
+        end
         @test true
     end
 end

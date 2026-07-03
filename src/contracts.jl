@@ -8,6 +8,7 @@
 # methods carry explicit concrete return-type annotations so inference matches the contract.
 
 using TypeContracts
+using StrictMode  # @strict_contract / @verify_strict — the performance layer over the method surface
 
 """
     AbstractBLAS1
@@ -27,7 +28,11 @@ function nrm2 end       # Euclidean norm
 function asum end       # Σ|xᵢ| (complex: Σ|Re|+|Im|)
 function iamax end      # argmax|xᵢ|
 
-@contract AbstractBLAS1 begin
+# Level-1 is a *strict* contract: implementations must satisfy not just the method surface
+# (TypeContracts) but StrictMode's performance guarantees — type-stable and allocation-free. The
+# bandwidth-bound L1 kernels are where a stray allocation or type instability is most costly, so
+# they carry the hardest guarantee. Verified by `@verify_strict SIMDBackend` (backend.jl).
+@strict_contract AbstractBLAS1 begin
     axpy!(::Self, ::AbstractVector, ::Number, ::AbstractVector)::AbstractVector
     scal!(::Self, ::Number, ::AbstractVector)::AbstractVector
     blascopy!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector
