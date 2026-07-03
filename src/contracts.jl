@@ -73,7 +73,9 @@ function spr2! end  # A := α·x·yᵀ + α·y·xᵀ + A, A symmetric packed (ra
 function hpr! end   # A := α·x·xᴴ + A, A Hermitian packed (rank-1, α real)
 function hpr2! end  # A := α·x·yᴴ + ᾱ·y·xᴴ + A, A Hermitian packed (rank-2)
 
-@contract AbstractBLAS2 begin
+# Level-2 is also a *strict* contract: matrix-vector kernels must be type-stable and
+# allocation-free. Verified on the dense hot paths by `@verify_strict SIMDBackend` (backend.jl).
+@strict_contract AbstractBLAS2 begin
     gemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
     ger!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix
     symv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector

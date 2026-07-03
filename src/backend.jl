@@ -264,9 +264,12 @@ end
 # present. (Trim-safety of the C-ABI entries is covered exhaustively by TrimCheck.@validate.) Values
 # in a `let` — only their types matter, so `ones` (no Random dep).
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
-    let bk = DEFAULT_BACKEND, n = 1000,
-        xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n)
+    let bk = DEFAULT_BACKEND, n = 1000, m = 64,
+        xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
+        Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
+        uz = ones(ComplexF64, m), wz = ones(ComplexF64, m)
         @verify_strict SIMDBackend begin
+            # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
             axpy!(bk, yd, 2.0, xd)
             scal!(bk, 2.0, xd)
             blascopy!(bk, yd, xd)
@@ -276,9 +279,17 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             nrm2(bk, xd)
             asum(bk, xd)
             iamax(bk, xd)
-            axpy!(bk, yz, 2.0 + 1.0im, xz)   # generic complex path
+            axpy!(bk, yz, 2.0 + 1.0im, xz)
             dot(bk, xz, yz)
             nrm2(bk, xz)
+            # ── Level 2 (dense hot paths; real + complex)
+            gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'N')
+            gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'T')
+            ger!(bk, 1.5, um, vm, Ad)
+            symv!(bk, vm, Ad, um)
+            hemv!(bk, wz, Az, uz)
+            trmv!(bk, Ad, um)
+            trsv!(bk, Ad, um)
         end
     end
 end

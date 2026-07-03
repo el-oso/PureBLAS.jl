@@ -40,23 +40,27 @@
     end
 end
 
-@testitem "StrictMode dogfood: Level-2 gemv/ger" begin
+@testitem "StrictMode dogfood: BLAS-2 strict contract" begin
     using StrictMode, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L2 dogfood"
         @test_skip StrictMode.checks_enabled()
     else
-        P = PureBLAS
-        A = randn(64, 48); xN = randn(48); yN = randn(64); xT = randn(64); yT = randn(48)
-        @assert_typestable P._gemv!(false, false, 64, 48, 2.0, A, xN, 1, 1.0, yN, 1)
-        @assert_noalloc P._gemv!(false, false, 64, 48, 2.0, A, xN, 1, 1.0, yN, 1)
-        @assert_trim_safe P._gemv!(false, false, 64, 48, 2.0, A, xN, 1, 1.0, yN, 1)
-        @assert_typestable P._gemv!(true, false, 64, 48, 2.0, A, xT, 1, 1.0, yT, 1)
-        @assert_noalloc P._gemv!(true, false, 64, 48, 2.0, A, xT, 1, 1.0, yT, 1)
-        xg = randn(64); yg = randn(48); Ag = zeros(64, 48)
-        @assert_typestable P._ger!(false, 64, 48, 1.5, xg, 1, yg, 1, Ag)
-        @assert_noalloc P._ger!(false, 64, 48, 1.5, xg, 1, yg, 1, Ag)
-        @assert_trim_safe P._ger!(false, 64, 48, 1.5, xg, 1, yg, 1, Ag)
+        # `AbstractBLAS2` is a @strict_contract (src/contracts.jl). @verify_strict checks the method
+        # surface AND that each dense L2 backend call is type-stable and allocation-free — full mode
+        # here, so @noalloc is a static AllocCheck all-paths proof. Mirrors the fast-mode in-src check.
+        bk = PureBLAS.DEFAULT_BACKEND
+        Ad = randn(64, 64); Az = randn(ComplexF64, 64, 64)
+        um = randn(64); vm = randn(64); uz = randn(ComplexF64, 64); wz = randn(ComplexF64, 64)
+        @verify_strict PureBLAS.SIMDBackend begin
+            PureBLAS.gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'N')
+            PureBLAS.gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'T')
+            PureBLAS.ger!(bk, 1.5, um, vm, Ad)
+            PureBLAS.symv!(bk, vm, Ad, um)
+            PureBLAS.hemv!(bk, wz, Az, uz)
+            PureBLAS.trmv!(bk, Ad, um)
+            PureBLAS.trsv!(bk, Ad, um)
+        end
         @test true
     end
 end
