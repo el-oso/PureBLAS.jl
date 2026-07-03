@@ -86,6 +86,45 @@ end
     return body
 end
 
+# Clip kernel: a W-aligned partial row-tile (mre = VR·W < mr) reads the SAME mr-strided packed panel
+# (PMR = _MR vectors per k-step) but computes/stores only the VR live row-vectors — clean, no mask, no
+# wasted trailing-vector FMA. Closes the misaligned-m penalty (measured: aligned m ≈ 1.14× OB, m=32 with
+# an 8-row=2·W remainder ≈ 0.97; the masked kernel computed _MR vectors to use VR and paid masked stores).
+# Only for full columns (nre==nr); a column remainder still routes to the masked kernel.
+@generated function _microkernel_clip!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        ::Val{PMR}, ::Val{VR}, ::Val{NR}, ::Val{B0} = Val(false)) where {T, PMR, VR, NR, B0}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for j in 1:NR
+        push!(body.args, :(_prefetch(C + $(j - 1) * ldc * $sz)))
+    end
+    for mi in 1:VR, j in 1:NR
+        push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V)))
+    end
+    inner = quote end
+    for mi in 1:VR
+        push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $PMR + $(mi - 1)) * $(W * sz))))
+    end
+    for j in 1:NR
+        push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bp + (p * $NR + $(j - 1)) * $sz))))
+        for mi in 1:VR
+            cs = Symbol(:c, mi, :_, j)
+            push!(inner.args, :($cs = muladd($(Symbol(:a, mi)), $(Symbol(:b, j)), $cs)))
+        end
+    end
+    push!(body.args, :(for p in 0:(kc - 1); $inner; end))
+    for j in 1:NR
+        push!(body.args, :(colp = C + $(j - 1) * ldc * $sz))
+        for mi in 1:VR
+            cs = Symbol(:c, mi, :_, j)
+            st = B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q))
+            push!(body.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
 # Vectorized edge kernel for partial blocked tiles. The packed panels are zero-padded to mr×nr, so
 # the FULL MR×NR compute is correct (padded rows/cols give zero accumulators); we only mask the
 # accumulating store — rows via a SIMD mask (mre), columns via a guard (nre). Same register blocking
@@ -382,6 +421,18 @@ function _gemm_blocked!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
                             if mre == mr && nre == nr
                                 _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
                                     kce, Val(_MR), Val(_NR))
+                            elseif nre == nr && rem(mre, W) == 0   # W-aligned partial rows → clean clip (no mask)
+                                vr = div(mre, W)
+                                if vr == 1
+                                    _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                        kce, Val(_MR), Val(1), Val(_NR))
+                                elseif vr == 2
+                                    _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                        kce, Val(_MR), Val(2), Val(_NR))
+                                else
+                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                        kce, mre, nre, Val(_MR), Val(_NR))
+                                end
                             else
                                 _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
                                     kce, mre, nre, Val(_MR), Val(_NR))
