@@ -19,6 +19,7 @@ const _L3_NB = 128   # NB×NB diagonal-block scratch side (was in level3.jl); ca
 
 mutable struct L3Workspace{T}
     diag::Matrix{T}       # _l3_tmp:      fixed _L3_NB×_L3_NB diagonal-block scratch
+    trtri::Matrix{T}      # _trtri_tmp:   blocked-trtri off-block gemm scratch (≤ _TRSM_BASE/2 square)
     trsm_tmp::Matrix{T}   # _trsm_tmp:    trsm invL/invR copyback temp (grows m×n)
     apad::Matrix{T}       # _l3_apad:     trsm po2-ld A-pad, ld=k+8 (grows)
     potf2::Matrix{T}      # _potf2_buf:   potrf diagonal-base contiguous buffer (grows n×n)
@@ -28,7 +29,7 @@ mutable struct L3Workspace{T}
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
-    Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
 )
@@ -44,6 +45,14 @@ _l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER, T)::L3Wor
 
 # Per-role accessors (unchanged signatures — call sites are untouched). Each returns/grows one owned field.
 _l3_tmp(::Type{T}) where {T} = _l3ws(T).diag
+
+function _trtri_tmp(::Type{T}, m::Int, n::Int) where {T}
+    ws = _l3ws(T); b = ws.trtri
+    if size(b, 1) < m || size(b, 2) < n
+        b = Matrix{T}(undef, m, n); ws.trtri = b
+    end
+    return view(b, 1:m, 1:n)
+end
 
 function _trsm_tmp(::Type{T}, m::Int, n::Int) where {T}
     ws = _l3ws(T); b = ws.trsm_tmp

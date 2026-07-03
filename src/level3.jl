@@ -630,11 +630,39 @@ const _TRSM_BASE = 32
 # strided-row dot — the scalar version was ~20× less efficient/flop and 44% of the invL base.
 # I is the identity (also zeroes the non-stored half; forward/back-substitution keeps it zero).
 # Always plain inv (tr=false): the invL/invR base applies any transpose at its gemm stage.
+# Blocked triangular inverse V = A⁻¹ (V same uplo as A). Split A into 2×2 blocks and combine via the
+# (now clipped, fast) gemm instead of the O(nb³) scalar forward-substitution over the identity — which the
+# ceiling test showed to be ~20% of the invL leaf at n≈96. Lower (up=false): V21 = -V22·A21·V11; upper:
+# V12 = -V11·A12·V22; the opposite off-block is zeroed so V stays triangular (the invL base reads V dense).
+# Base blocks (≤ _TRTRI_BASE) use the identity-RHS dense solve. Diagonal blocks recurse with the same
+# uplo/unit; the off-diagonal block carries its actual (non-unit) values.
+const _TRTRI_BASE = 16
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
-    fill!(V, zero(T))
-    @inbounds for i in 1:nb; V[i, i] = one(T); end
-    _trsm_dense_L!(up, false, unit, A, V)
+    if nb <= _TRTRI_BASE
+        fill!(V, zero(T))
+        @inbounds for i in 1:nb; V[i, i] = one(T); end
+        _trsm_dense_L!(up, false, unit, A, V)
+        return V
+    end
+    h = nb ÷ 2; m = nb - h
+    A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):nb, (h + 1):nb)
+    V11 = view(V, 1:h, 1:h); V22 = view(V, (h + 1):nb, (h + 1):nb)
+    _trtri!(V11, A11, h, up, unit)
+    _trtri!(V22, A22, m, up, unit)
+    if up
+        A12 = view(A, 1:h, (h + 1):nb); V12 = view(V, 1:h, (h + 1):nb)
+        tmp = _trtri_tmp(T, h, m)
+        gemm!(tmp, A12, V22; alpha = true, beta = false)          # tmp = A12·V22   (h×m)
+        gemm!(V12, V11, tmp; alpha = -one(T), beta = false)       # V12 = -V11·tmp
+        fill!(view(V, (h + 1):nb, 1:h), zero(T))                  # strict-lower stays 0
+    else
+        A21 = view(A, (h + 1):nb, 1:h); V21 = view(V, (h + 1):nb, 1:h)
+        tmp = _trtri_tmp(T, m, h)
+        gemm!(tmp, A21, V11; alpha = true, beta = false)          # tmp = A21·V11   (m×h)
+        gemm!(V21, V22, tmp; alpha = -one(T), beta = false)       # V21 = -V22·tmp
+        fill!(view(V, 1:h, (h + 1):nb), zero(T))                  # strict-upper stays 0
+    end
     return V
 end
 # _trsm_tmp (invL/invR copyback temp) lives in the per-type L3Workspace (see src/workspace.jl).
