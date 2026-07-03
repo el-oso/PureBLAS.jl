@@ -119,12 +119,11 @@ function her2k! end  # C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, 
 function trmm! end   # B := α·op(A)·B / α·B·op(A),      A triangular
 function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular (solve)
 
-# Level-3 is a strict contract too. `@verify_strict SIMDBackend` (backend.jl) currently enforces the
-# allocation-free guarantee on the four ops that are 0-alloc today — gemm!/symm!/trmm!/trsm!. The
-# rank-k / hemm family (syrk!/herk!/syr2k!/her2k!/hemm!) carries a known ceiling: their divide-and-
-# conquer recursion heap-boxes the sub-block SubArrays it passes to the non-inlined recursive call
-# (O(log n) bytes, no effect on the perf gate). Upgrade path = rewrite those drivers to carry integer
-# offsets into the original arrays instead of fresh views; once 0-alloc they join the @verify_strict list.
+# Level-3 is a strict contract: every matrix-matrix op is type-stable and allocation-free, verified by
+# `@verify_strict SIMDBackend` (verify.jl). The rank-k/hemm family's divide-and-conquer drivers were
+# refactored to carry integer offsets into the original arrays (not fresh sub-block SubArrays, which
+# are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are
+# also built per concrete type, never as a Union, so they stay stack-allocated). All nine now gate 0-alloc.
 @strict_contract AbstractBLAS3 begin
     gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
     symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix

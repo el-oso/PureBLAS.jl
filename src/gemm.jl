@@ -613,7 +613,10 @@ function _gemm_unpacked_mr1!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
     W = _vwidth(T); nr = _NR
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
-    GC.@preserve A B C begin
+    # Preserve the parent arrays, not the (possibly SubArray) operands — GC.@preserve on a view forces
+    # the otherwise-stack SubArray onto the heap to root it (64 B/call); pointers are computed anyway.
+    parA = parent(A); parB = parent(B); parC = parent(C)
+    GC.@preserve parA parB parC begin
         Ap = pointer(A); Bp = pointer(B); Cp = pointer(C)
         jr = 0
         while jr < n
@@ -649,7 +652,8 @@ function _gemm_unpacked!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
-    GC.@preserve A B C begin
+    parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
+    GC.@preserve parA parB parC begin
         Ap = pointer(A); Bp = pointer(B); Cp = pointer(C)
         if B0 && n >= nr
             # β=0 path: walk full nr-column blocks; handle the column remainder by whichever is
@@ -1129,7 +1133,8 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL
     a = convert(Tc, alpha); alr = real(a); ali = imag(a)
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
-    GC.@preserve A B C begin
+    parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
+    GC.@preserve parA parB parC begin
         Ap = Ptr{T}(pointer(A)); Bp = Ptr{T}(pointer(B)); Cp = Ptr{T}(pointer(C))
         tb = tB ? Val(true) : Val(false)
         jr = 0
@@ -1181,7 +1186,8 @@ function _gemm_tiny_vec!(C, A, B, alpha::T, beta::T, tB::Bool, m::Int, n::Int, k
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
     lanes = Vec{W, Int}(ntuple(i -> i - 1, Val(W))); mask = lanes < m
     av = V(alpha); b0 = iszero(beta)
-    GC.@preserve A B C begin
+    parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
+    GC.@preserve parA parB parC begin
         pA = pointer(A); pB = pointer(B); pC = pointer(C)
         @inbounds for j in 0:(n - 1)
             acc = zero(V)
