@@ -673,7 +673,7 @@ end
 # 4-way-unrolled `_axpy_simd!` (no-trans; trans strided → scalar). n³/2 flops (half of invert+gemm), no gemm
 # dispatch. Real non-conj; forward when up==tr. Used as the base ONLY when B is narrow — the per-column axpy
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
-const _TRSM_NCUT = 96          # side-L: B width cut
+const _TRSM_NCUT = 64          # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
 const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
 # Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
