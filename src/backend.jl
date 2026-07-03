@@ -251,21 +251,18 @@ end
 @inline geqrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = geqrf!(A; kw...)
 @inline gesvd!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = gesvd!(A; kw...)
 
-# Assert at precompile time that SIMDBackend satisfies EVERY contract in its supertype chain
-# (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK) — method existence + declared return types. `trim_compat`
-# also scans each mandatory method's typed IR for known trim-unsafe calls (heuristic; TrimCheck's
-# @validate on the C-ABI entries is the exhaustive check). Trim-safe itself: runs during
-# precompilation, unreachable from any C-ABI entry point, eliminated by the trimmer.
-@verify SIMDBackend trim_compat=true
-
-# Level-1 is a @strict_contract (contracts.jl): its methods must also be type-stable and
-# allocation-free. @verify_strict runs @strict on each representative L1 call — both the SIMD real
-# path and the generic complex path — self-gating on the `checks_enabled` preference. The main
-# package ships fast mode (runtime @allocated / @inferred, no AllocCheck/JET dep) so this fires at
-# PureBLAS's OWN precompile. The guard skips it under full-mode environments (e.g. the test project)
-# where @strict demands the AllocCheck/JET backend, which is NOT loaded during PureBLAS's own
-# precompile — there the test suite's strictmode dogfood runs the deep static proof at test runtime
-# with the backend present. Values in a `let` — only their types matter, so `ones` (no Random dep).
+# Assert at precompile time that SIMDBackend satisfies every contract in its supertype chain.
+# @verify_strict is the single backend verifier: it runs TypeContracts.@verify SIMDBackend — method
+# existence + declared return types over the whole chain (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK) —
+# AND @strict on each representative L1 call (the SIMD real path and the generic complex path), since
+# AbstractBLAS1 is a @strict_contract (contracts.jl) demanding type-stability + no allocation. The
+# @strict calls self-gate on the `checks_enabled` preference; the main package ships fast mode
+# (runtime @allocated / @inferred, no AllocCheck/JET dep) so they fire at PureBLAS's OWN precompile.
+# The guard skips the whole thing under full-mode environments (e.g. the test project) where @strict
+# demands the AllocCheck/JET backend not loaded during PureBLAS's own precompile — there the test
+# suite's strictmode dogfood runs the interface + deep static proof at test runtime with the backend
+# present. (Trim-safety of the C-ABI entries is covered exhaustively by TrimCheck.@validate.) Values
+# in a `let` — only their types matter, so `ones` (no Random dep).
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
     let bk = DEFAULT_BACKEND, n = 1000,
         xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n)
