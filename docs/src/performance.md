@@ -29,10 +29,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L3 gemm | ✗ 0.83 (n=8 dispatch) | ✓ 1.03 (clip) |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
 | **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.02 | ◐ 0.91 (n=128); geomean 0.99 |
+| L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | **✓ 0.98** (geomean 1.03) |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ◐ 0.90 (n=128; geomean 1.26) |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.70 · ◐ 0.91 (geomean 1.28) |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
@@ -62,9 +62,12 @@ holding and several non-aligned sizes improving (AVX-512 too — pure gain, no r
 mirrored on the **unpacked** path (used at n ≤ `_GEMM_UNPACK_MAX`) — it closed the same penalty on trsm's
 n≤128 off-diagonals — and since the invL leaf's gemm is now cheap, the narrow-B dense cut `_TRSM_NCUT`
 dropped 96→64 (**trsm n=96 0.90→1.09**). Routing *unpacked* to the off-diagonal gemms of the wide path,
-by contrast, *regressed* (in-context cache thrash — the isolated micro-bench lied). Remaining AVX2 ✗:
-`trsm`/`getrf` **n=64/128** (~0.83/0.92 — the small-n dense base + invL trtri overhead; the worst-size is
-overhead-bound like AVX-512's n=8 gemm, geomeans clear), `trmm` n=8
+by contrast, *regressed* (in-context cache thrash — the isolated micro-bench lied). Finally, a ceiling test
+(stubbing the leaf's `trtri`) showed the O(nb³) scalar triangular-inverse was ~20% of the invL leaf, so it
+was replaced with a **blocked inverse** (recurse the two diagonal half-blocks, combine the off-block with
+the now-cheap gemm): **trsm n=128 0.92→0.98 and n=256 0.97→1.02, getrf n=128 0.92→0.98** — with which
+**`trsm` now clears the full worst-size gate on AVX2** (0.98, geomean 1.03). Remaining AVX2 ✗:
+`getrf` (worst ~0.91, geomean 1.28), `trmm` n=8
 (the 8×8 block is materialize-bound — every non-materializing kernel measured slower), and `potrf` (n=1024,
 rides trsm-side-R). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
@@ -165,7 +168,7 @@ gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transfor
 | **M1** | BLAS-1 (axpy, dot, nrm2, asum, scal, copy, swap, iamax; s/d/c/z) | ✅ gate met; LBT `.so` + native API |
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
-| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm + syrk + syr2k + symm; trsm n≥512, trmm/trsm n≤256 WIP |
+| **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm + syrk + syr2k + symm + **trsm**; trmm n=8 WIP |
 | **L3 complex** | zgemm (ComplexF64 split-pack SIMD) | ✅ beats OpenBLAS on AVX-512; gates on AVX2 |
 | **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ AVX-512 gates all n; AVX2 geqrf/gesvd gate |
 | **M4** | multithreading | deferred |
