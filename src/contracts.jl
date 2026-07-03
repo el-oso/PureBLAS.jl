@@ -156,7 +156,14 @@ function getrf! end  # LU w/ partial pivoting: P·A = L·U → (A, ipiv, info)
 function geqrf! end  # QR (Householder): A = Q·R → (A, tau)
 function gesvd! end  # SVD: A = U·Σ·Vᵀ → (U, S, Vᵀ)
 
-@contract AbstractLAPACK begin
+# LAPACK is a strict contract too. `@verify_strict SIMDBackend` (verify.jl) enforces the
+# type-stable + allocation-free guarantee on potrf!, which is 0-alloc in steady state — it factors
+# through its own pointer-based `_syrk_lower_f64!`/trsm kernels (lapack.jl), not the public syrk!
+# with the boxing recursion. The other three are NOT yet in the strict list: getrf!/geqrf! allocate
+# their pivot/τ workspace (~1 KB) and gesvd! allocates the U/S/Vᵀ outputs — inherent to their result
+# shape, not a fixable boxing bug. They stay interface-verified; strict-verifying them would need an
+# in-place / pre-allocated-workspace API variant first.
+@strict_contract AbstractLAPACK begin
     potrf!(::Self, ::AbstractMatrix)::AbstractMatrix
     getrf!(::Self, ::AbstractMatrix)::Tuple
     geqrf!(::Self, ::AbstractMatrix)::Tuple
