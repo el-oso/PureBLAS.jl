@@ -89,3 +89,37 @@ function hpr2! end  # A := α·x·yᴴ + ᾱ·y·xᴴ + A, A Hermitian packed (r
     hpr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector
     hpr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
 end
+
+"""
+    AbstractBLAS3 <: AbstractBLAS2
+
+Supertype of Level-3 backends (matrix-matrix); an L3 backend is also an L2 (and L1) backend. Concrete
+backends provide the matrix-matrix set below in addition to the Level-1/2 ops. The `@contract` is the
+single discoverable spec of what a swappable L3 backend must implement — a second backend (reference,
+GPU, …) that omits any op fails the precompile-time check. The high-level `op!(::Backend, …)` methods
+dispatch on the backend; the bare `op!(C, A, B; …)` entry points (gemm.jl / level3.jl) are the
+default-backend fast paths (kept backend-free so the hot L3 kernels take no extra dispatch).
+"""
+abstract type AbstractBLAS3 <: AbstractBLAS2 end
+
+function gemm! end   # C := β·C + α·op(A)·op(B)
+function symm! end   # C := β·C + α·A·B / α·B·A,  A symmetric
+function hemm! end   # C := β·C + α·A·B / α·B·A,  A Hermitian
+function syrk! end   # C := β·C + α·op(A)·op(A)ᵀ, C symmetric
+function herk! end   # C := β·C + α·op(A)·op(A)ᴴ, C Hermitian (α,β real)
+function syr2k! end  # C := β·C + α·(op(A)·op(B)ᵀ + op(B)·op(A)ᵀ), C symmetric
+function her2k! end  # C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, C Hermitian
+function trmm! end   # B := α·op(A)·B / α·B·op(A),      A triangular
+function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular (solve)
+
+@contract AbstractBLAS3 begin
+    gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    hemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    syrk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    herk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    syr2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    her2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    trmm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    trsm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+end

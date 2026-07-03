@@ -4,7 +4,7 @@
 # while strided/complex/AD-element vectors take the generic scalar loop. Return-type annotations
 # are explicit so inference matches the contract (zero-cost typeasserts).
 
-struct SIMDBackend <: AbstractBLAS2 end
+struct SIMDBackend <: AbstractBLAS3 end
 
 """Default Level-1 backend used by the bare native API in native.jl."""
 const DEFAULT_BACKEND = SIMDBackend()
@@ -226,3 +226,19 @@ end
     _tbsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, size(AB, 1) - 1, AB, x, 1)
     return x
 end
+
+# ── Level-3 backend surface (AbstractBLAS3 contract). The bare `op!(C, A, B; …)` entry points in
+# gemm.jl / level3.jl ARE the SIMD implementations and the hot path (internal L3/LAPACK callers use
+# them directly, taking no extra dispatch). These thin backend-dispatched wrappers exist so a second
+# backend can provide its own L3 via `op!(::OtherBackend, …)` and the contract enforces completeness.
+# @inline + a const singleton backend ⇒ compile-time resolved, zero-cost. (ponytail: the bare entry is
+# not yet routed through DEFAULT_BACKEND — add that forwarding when a real default-swap need appears.)
+@inline gemm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = gemm!(C, A, B; kw...)
+@inline symm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = symm!(C, A, B; kw...)
+@inline hemm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = hemm!(C, A, B; kw...)
+@inline syrk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = syrk!(C, A; kw...)
+@inline herk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = herk!(C, A; kw...)
+@inline syr2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = syr2k!(C, A, B; kw...)
+@inline her2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = her2k!(C, A, B; kw...)
+@inline trmm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trmm!(B, A; kw...)
+@inline trsm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trsm!(B, A; kw...)
