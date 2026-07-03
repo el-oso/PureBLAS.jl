@@ -14,12 +14,8 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 # Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
 # columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
 # buffer, factoring there, and copying back streams contiguous memory (better prefetch/TLB).
-const _POTF2_BUF = IdDict{DataType, Matrix}()
-function _potf2_buf(::Type{T}, n::Int) where {T}
-    b = get(_POTF2_BUF, T, nothing)
-    if isnothing(b) || size(b, 1) < n; b = Matrix{T}(undef, n, n); _POTF2_BUF[T] = b; end
-    return view(b, 1:n, 1:n)
-end
+# _potf2_buf (potrf diagonal-base contiguous buffer) is the per-type L3Workspace `potf2` field
+# (see src/workspace.jl).
 
 # Unblocked right-looking Cholesky of an n×n block, lower triangle. Throws PosDefException at the first
 # non-positive pivot (LAPACK's info>0). Reads/writes only the lower triangle.

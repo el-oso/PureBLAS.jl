@@ -14,6 +14,7 @@ include("level2_banded.jl") # Level-2 band storage: gbmv/sbmv/hbmv/tbmv/tbsv
 include("contracts.jl")     # TypeContracts AbstractBLAS1 / AbstractBLAS2 interfaces
 include("backend.jl")       # SIMDBackend: high-level AbstractVector ops (Mode 2)
 include("native.jl")        # bare native API → default backend
+include("workspace.jl")     # L3Workspace: owned per-type Level-3/LAPACK scratch (replaces global caches)
 include("gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
 include("level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
 include("lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
