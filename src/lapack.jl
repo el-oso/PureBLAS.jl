@@ -341,7 +341,11 @@ end
 # ~1.3–1.5× slower at n≥512). When A's stride is a po2, factor in a padded (ld+8) scratch and copy
 # back — bit-identical, ld is pure addressing. Reusable buffer (single-thread; project defers MT).
 const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
-const _CHOL_FAER_BASE = 1024     # ≤ this → faer kernels; above → halve with PureBLAS cache-blocked L3
+# ≤ this → faer kernels; above → halve, routing the O(n³) trailing update through the cache-blocked
+# gating syrk!/trsm!. AVX-512 (32 regs) runs the faer syrk to 1024 where it still wins; AVX2 (16 regs)
+# has no cache-blocked faer syrk so it fades by n≈256 — drop the base to 128 so large-n rides gating
+# syrk! (measured: n=1024 0.70→0.87, n=2048 0.85→0.91 on Zen3). ponytail: per-ISA knob.
+const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : 128
 # Pad when columns alias L1 sets: Zen4 L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. Covers po2 ≥512 AND 1536, 2560, … —
 # faer's plain ispow2 missed the non-po2 multiples. WIDENED to %256 (half-period, 2 sets/column):
