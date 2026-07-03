@@ -32,7 +32,7 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | **✓ 0.98** (geomean 1.03) |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.70 · ◐ 0.91 (geomean 1.28) |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.79 (n=128) · ◐ 0.93 (n=256, geomean 1.28) |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
@@ -66,10 +66,16 @@ by contrast, *regressed* (in-context cache thrash — the isolated micro-bench l
 (stubbing the leaf's `trtri`) showed the O(nb³) scalar triangular-inverse was ~20% of the invL leaf, so it
 was replaced with a **blocked inverse** (recurse the two diagonal half-blocks, combine the off-block with
 the now-cheap gemm): **trsm n=128 0.92→0.98 and n=256 0.97→1.02, getrf n=128 0.92→0.98** — with which
-**`trsm` now clears the full worst-size gate on AVX2** (0.98, geomean 1.03). Remaining AVX2 ✗:
-`getrf` (worst ~0.91, geomean 1.28), `trmm` n=8
-(the 8×8 block is materialize-bound — every non-materializing kernel measured slower), and `potrf` (n=1024,
-rides trsm-side-R). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
+**`trsm` now clears the full worst-size gate on AVX2** (0.98, geomean 1.03). Remaining AVX2 ✗ are all
+small/mid-n **factorization-panel** regimes (latency/per-call-overhead bound, where OpenBLAS's monolithic
+hand-tuned kernels structurally win): `potrf` (worst n=128 **0.79**, geomean 0.98 — the faer Cholesky
+`syrk` isn't cache-blocked so it fades on AVX2's 16 registers; the fix routes the O(n³) trailing update
+through the gating cache-blocked `syrk!` by dropping the faer base 1024→128 on AVX2, killing the old
+n=1024 0.70 cliff → 0.89), `getrf` (worst n=256 **0.93**, geomean 1.28 — decomposition confirms the
+trailing `gemm` gates and the panel `trsm` *beats* OpenBLAS 1.37×; the residual is aggregate overhead
+across the 6 small blocked panels, `nb=48` optimal, panel register-blocking and SIMD-argmax both measured
+and *regressed*), and `trmm` n=8 (the 8×8 block is materialize-bound — every non-materializing kernel
+measured slower). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
 All Level-3 scratch is owned by a single per-type `L3Workspace` (`src/workspace.jl`) — the seven former
 global buffer caches bundled into one concrete-field struct (const-dispatched for Float64/Float32, so no
@@ -156,7 +162,8 @@ complex split-pack kernel (real+imag panels, 4-real-FMA MAC); the rest are built
 
 Factorizations driven by the gated BLAS, again **median ratio vs size** for **Zen4/AVX-512** — gating at
 every size, with tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. (On AVX2, `geqrf`/
-`gesvd` gate; `potrf`/`getrf` inherit the below-gate triangular L3 kernels — see the fleet table.)
+`gesvd` gate and tiny-n `potrf`/`getrf` run 1.3–2.5×; the sub-gate cells are the small/mid-n panel
+regimes — `potrf` n=128–256, `getrf` n=256 — latency/overhead-bound, see the fleet table.)
 `potrf`/`geqrf` port the irreducible faer SIMD kernels and drive the blocked level
 with PureBLAS `gemm!`/`trsm!`; `getrf` is blocked right-looking with deferred pivoting; `gesvd` is
 gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transform.
