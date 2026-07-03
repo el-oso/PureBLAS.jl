@@ -92,6 +92,17 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            leaves lose to invL leaves). The trsm loss (n=32 0.66, n=128 0.76, n=256 0.79) is small-triangular
            *kernel* efficiency (invL base + dense back-sub), not routing → **moved to phase 2**. Knobs reverted
            (YAGNI; phase 2 re-adds the sweep surface). Large-n trsm (512+) already ~0.92–0.97.
+         - **trsm/getrf UPDATE (2026-07-03, commits 63268ae + 6b0b2ab).** Decomposed the invL/invR base on
+           an idle galen core: the n=256 gap is the leaf **GEMM** (18µs/leaf, dominant), NOT the copyback
+           (~1.5% — the prior "copyback restructure needed" claim was WRONG; do not rebuild a packed
+           `_trsm_kernel!`). The leaf shape is skewed (nb≤32 tiny, B wide) → routed its multiply through
+           `_gemm_unpacked!` (no B-pack, `Val{B0}` overwrite; 0.72× packed time). **trsm n=256 0.85→~0.93,
+           getrf n=256 0.91→0.98 (GATES).** Extending unpacked to the off-diagonal gemms REGRESSED (cache
+           thrash in context — isolated micro-bench lied). Profile now: off-diagonal packed gemms = 68% of
+           trsm n=256, unpacked leaf 22%, trtri minor. Remaining trsm n≤256 (~0.88–0.93) is the packed
+           off-diagonal gemm at skewed shapes. Also unified all 7 L3 scratch globals into one owned
+           `L3Workspace{T}` (`src/workspace.jl`, PureFFT plan-owned pattern) — kills the abstract-Matrix
+           boxing class, thread-ready, perf-neutral single-thread.
       2. **Small-n triangular campaign (DELIBERATE — study first).** STUDY DONE (2026-07-02): read
          OpenBLAS's syrk/trmm/trsm Level-3 drivers (memory `openblas-triangular-diagonal`). Key findings:
          OpenBLAS has **NO small-n special path** (size only gates threading; the blocked driver is just
