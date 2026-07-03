@@ -29,10 +29,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L3 gemm | ✗ 0.89 (n=8) | ✓ 1.01 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
 | **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (unpacked leaf; n≥192 gate) | ✓ 1.00 | ◐ 0.88–0.93 (n≤256 invL leaf) |
+| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.00 | ◐ 0.89 (n≤128); n=256 ~0.95 |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ✓ 0.98 |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ✓ ~1.02 |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
@@ -51,11 +51,18 @@ invR base on an idle core showed the gap is the leaf **GEMM** (18µs/leaf, domin
 (~1.5% — a prior mis-diagnosis). The leaf shape is skewed (nb ≤ 32 tiny, B wide), so the packed path pays
 a full B-pack + scaleC-zero pass for a k=32 contraction; routing the leaf multiply through the **unpacked**
 kernel (no B-pack, `Val{B0}` overwrite; 0.72× the packed time, beats OpenBLAS's own gemm there) lifts
-**trsm n=256 0.85→~0.93** and **getrf n=256 0.91→0.98 (now gates)**. The remaining AVX2 ✗: `trsm` **n≤256**
-(~0.88–0.93 — the invL leaf's trtri + recursion overhead; extending unpacked to the off-diagonal gemms
-*regressed* in context, cache thrash), `trmm` n=8 (the 8×8 block is materialize-bound — every
-non-materializing kernel measured slower), and `potrf` (n=1024, rides trsm-side-R). `zgemm` is a SIMD
-split-pack kernel that **beats OpenBLAS on AVX-512**.
+**trsm n=256 0.85→~0.93** and **getrf n=256 0.91→~1.0 (now gates)**. The residual then traced to the
+recursion's off-diagonal packed gemms at **skewed small-square shapes** (h=32/64, wide B — untested by
+the square-gemm gate): PB was 0.89–0.90× OB there purely from **m-alignment** (m a multiple of mr=12 ran
+1.10–1.16, but m=32 with an 8-row=2·W remainder only 0.97; k barely mattered). The packed path masked such
+remainders (computing all mr rows to use mre); a **clean clip kernel** (`_microkernel_clip!` — reads the
+mr-strided panel but computes only the mre÷W live row-vectors, unmasked) removes the penalty: misaligned
+**m=32 0.97→1.17**, and **trsm n=256 → ~0.95 (gate boundary), getrf n=256 → ~1.02**, with the square-gemm
+gate holding and several non-aligned sizes improving (AVX-512 too — pure gain, no regression). Extending
+*unpacked* to the off-diagonal gemms was tried and *regressed* (in-context cache thrash — the isolated
+micro-bench lied). Remaining AVX2 ✗: `trsm`/`getrf` **n≤128** (~0.89, small-n leaf overhead), `trmm` n=8
+(the 8×8 block is materialize-bound — every non-materializing kernel measured slower), and `potrf` (n=1024,
+rides trsm-side-R). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
 All Level-3 scratch is owned by a single per-type `L3Workspace` (`src/workspace.jl`) — the seven former
 global buffer caches bundled into one concrete-field struct (const-dispatched for Float64/Float32, so no

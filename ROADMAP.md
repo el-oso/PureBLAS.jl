@@ -103,6 +103,16 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            off-diagonal gemm at skewed shapes. Also unified all 7 L3 scratch globals into one owned
            `L3Workspace{T}` (`src/workspace.jl`, PureFFT plan-owned pattern) — kills the abstract-Matrix
            boxing class, thread-ready, perf-neutral single-thread.
+         - **gemm clip kernel (2026-07-03, commit 1712e75) — closes trsm n=256 + general small-m win.**
+           Traced the trsm off-diagonal gap to gemm **m-alignment**: PB packed gemm at h=32/64 (wide B,
+           untested by the square gate) was 0.89–0.90× OB *purely* because m wasn't a multiple of mr=12
+           (aligned m ran 1.10–1.16; k irrelevant). The packed path masked the W-aligned remainder tile
+           (computing all mr rows to use mre). Added `_microkernel_clip!` (reads the mr-strided panel,
+           computes only mre÷W live vectors, unmasked, literal Val(1)/Val(2); full-mr path untouched).
+           Result: **m=32 0.97→1.17**, **trsm n=256 0.93→~0.95 (gate boundary), getrf n=256 →~1.02**,
+           square-gemm gate holds + several non-aligned n improve, AVX-512 pure gain (n=24/32/40/100 all up,
+           no regression). Suite 57/57; clip in the StrictMode GEMM dogfood. Residual trsm/getrf n≤128
+           (~0.89) is small-n leaf overhead. **The clip is the general lever for any misaligned-m gemm.**
       2. **Small-n triangular campaign (DELIBERATE — study first).** STUDY DONE (2026-07-02): read
          OpenBLAS's syrk/trmm/trsm Level-3 drivers (memory `openblas-triangular-diagonal`). Key findings:
          OpenBLAS has **NO small-n special path** (size only gates threading; the blocked driver is just
