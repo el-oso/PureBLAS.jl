@@ -29,10 +29,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L3 gemm | ✗ 0.89 (n=8) | ✓ 1.01 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
 | **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.00 | ◐ 0.89 (n≤128); n=256 ~0.95 |
+| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.00 | ◐ 0.88 (n=128); geomean 1.00 |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ✓ ~1.02 |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ◐ 0.90 (n=128; geomean 1.21) |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
