@@ -118,6 +118,10 @@ end
             @assert_noalloc P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_trim_safe P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            # clip kernel: W-aligned partial row-tile (reads _MR-strided panel, computes 1 live vector)
+            @assert_typestable P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @assert_noalloc P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @assert_trim_safe P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
         end
         # unpacked microkernel (small-matrix path): A is mr×k, B is k×nr, column-major
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
