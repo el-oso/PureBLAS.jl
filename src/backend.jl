@@ -257,3 +257,31 @@ end
 # @validate on the C-ABI entries is the exhaustive check). Trim-safe itself: runs during
 # precompilation, unreachable from any C-ABI entry point, eliminated by the trimmer.
 @verify SIMDBackend trim_compat=true
+
+# Level-1 is a @strict_contract (contracts.jl): its methods must also be type-stable and
+# allocation-free. @verify_strict runs @strict on each representative L1 call — both the SIMD real
+# path and the generic complex path — self-gating on the `checks_enabled` preference. The main
+# package ships fast mode (runtime @allocated / @inferred, no AllocCheck/JET dep) so this fires at
+# PureBLAS's OWN precompile. The guard skips it under full-mode environments (e.g. the test project)
+# where @strict demands the AllocCheck/JET backend, which is NOT loaded during PureBLAS's own
+# precompile — there the test suite's strictmode dogfood runs the deep static proof at test runtime
+# with the backend present. Values in a `let` — only their types matter, so `ones` (no Random dep).
+if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
+    let bk = DEFAULT_BACKEND, n = 1000,
+        xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n)
+        @verify_strict SIMDBackend begin
+            axpy!(bk, yd, 2.0, xd)
+            scal!(bk, 2.0, xd)
+            blascopy!(bk, yd, xd)
+            swap!(bk, xd, yd)
+            dot(bk, xd, yd)
+            dotu(bk, xd, yd)
+            nrm2(bk, xd)
+            asum(bk, xd)
+            iamax(bk, xd)
+            axpy!(bk, yz, 2.0 + 1.0im, xz)   # generic complex path
+            dot(bk, xz, yz)
+            nrm2(bk, xz)
+        end
+    end
+end
