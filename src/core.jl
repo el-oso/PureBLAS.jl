@@ -15,6 +15,10 @@ const BlasFloat = Union{Float32, Float64, ComplexF32, ComplexF64}
 @inline _ld(p::Ptr, i::Integer) = unsafe_load(p, i)
 @inline _ld(a, i::Integer) = @inbounds a[i]
 @inline _st!(p::Ptr{T}, i::Integer, v::T) where {T} = (unsafe_store!(p, v, i); v)
+# Ptr store of a differently-typed value (e.g. a real diagonal into a complex buffer — hpr/hpr2):
+# convert to the pointee type, matching AbstractVector `setindex!`'s implicit convert. The exact-type
+# method above stays the (more specific) fast path.
+@inline _st!(p::Ptr{T}, i::Integer, v) where {T} = (unsafe_store!(p, convert(T, v), i); v)
 @inline _st!(a, i::Integer, v) = (@inbounds a[i] = v; v)
 
 @inline _et(::Ptr{T}) where {T} = T
