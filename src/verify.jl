@@ -16,6 +16,12 @@
 # target repeatedly. This probe re-seeds the SPD source (in-place copyto!, no allocation) before each
 # factorization, so it's a single 0-alloc, type-stable call @strict can invoke as many times as it likes.
 _strict_potrf_probe(bk, Aw, Apd) = (copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L'))
+# getrf!/geqrf! are 0-alloc through their IN-PLACE (pre-allocated ipiv/τ) forms — the convenience forms
+# allocate the pivot/τ output, which is inherent, not a bug. These probes re-seed the source and call the
+# in-place kernel; being proper (statically-resolved) functions they also avoid the call-site tuple box a
+# dynamically-dispatched call would add. Return nothing so the (A,ipiv,info)/(A,τ) tuple never escapes.
+_strict_getrf_probe(Gw, G0, ipiv) = (copyto!(Gw, G0); getrf!(Gw, ipiv); nothing)
+_strict_geqrf_probe(Gw, G0, tau) = (copyto!(Gw, G0); geqrf!(Gw, tau); nothing)
 
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
@@ -24,8 +30,10 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         uz = ones(ComplexF64, m), wz = ones(ComplexF64, m),
         C3 = ones(m, m), A3 = ones(m, m), B3 = ones(m, m), Bt = ones(m, m), At = ones(m, m),
         Cz3 = ones(ComplexF64, m, m), Az3 = ones(ComplexF64, m, m), Bz3 = ones(ComplexF64, m, m),
-        # SPD source (diagonally dominant: diag m+1, off-diag 1) + a working copy potrf! overwrites.
-        Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m)
+        # SPD/non-singular source (diagonally dominant: diag m+1, off-diag 1) + a working copy the
+        # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
+        Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
+        ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m)
         # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
         # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
         # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
@@ -39,6 +47,7 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
         hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
         copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L')
+        copyto!(Aw, Apd); getrf!(Aw, ipiv); copyto!(Aw, Apd); geqrf!(Aw, tau)
         @verify_strict SIMDBackend begin
             # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
             axpy!(bk, yd, 2.0, xd)
@@ -71,9 +80,13 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
             trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
-            # ── LAPACK: potrf! (0-alloc). Via the re-seeding probe so repeated @strict calls never
-            # re-factor an already-triangular matrix (which would throw PosDefException).
+            # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
+            # their in-place pre-allocated-ipiv/τ forms). Via re-seeding probes so repeated @strict calls
+            # always factor a fresh source (potrf would otherwise throw PosDefException on its L-output).
+            # gesvd! is NOT here — it allocates its U/S/Vᵀ outputs (inherent); it stays interface-@verify'd.
             _strict_potrf_probe(bk, Aw, Apd)
+            _strict_getrf_probe(Aw, Apd, ipiv)
+            _strict_geqrf_probe(Aw, Apd, tau)
         end
     end
 end
