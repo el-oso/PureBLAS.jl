@@ -637,12 +637,7 @@ function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     _trsm_dense_L!(up, false, unit, A, V)
     return V
 end
-const _TRSM_TMP = IdDict{DataType, Matrix}()
-function _trsm_tmp(::Type{T}, m::Int, n::Int) where {T}
-    b = get(_TRSM_TMP, T, nothing)
-    if isnothing(b) || size(b, 1) < m || size(b, 2) < n; b = Matrix{T}(undef, m, n); _TRSM_TMP[T] = b; end
-    return b::Matrix{T}   # concrete return: the IdDict stores abstract Matrix; without this the tmp view
-end                       # (and its gemm!) go type-unstable → per-leaf boxing in the invL/invR base.
+# _trsm_tmp (invL/invR copyback temp) lives in the per-type L3Workspace (see src/workspace.jl).
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
 function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
@@ -871,12 +866,7 @@ end
 # catastrophic 0.78→1.12, the copy pays" was a pre-clean (contended / pre-trtri-fix) measurement. Kept
 # for AVX-512/other (untested there; trsm already gates), disabled on AVX2.
 @inline _badld(ld::Int) = _vwidth(Float64) != 4 && ld >= 512 && (ld & (ld - 1)) == 0
-const _L3_APAD = IdDict{DataType, Matrix}()
-function _l3_apad(::Type{T}, k::Int) where {T}
-    b = get(_L3_APAD, T, nothing)
-    if isnothing(b) || size(b, 1) < k + 8 || size(b, 2) < k; b = Matrix{T}(undef, k + 8, k); _L3_APAD[T] = b; end
-    return view(b::Matrix{T}, 1:k, 1:k)   # ld = k+8 (non-po2). concrete parent: the IdDict stores abstract
-end                                       # Matrix, so without ::Matrix{T} the view type-unstable → boxes.
+# _l3_apad (po2-ld A-pad, ld=k+8) lives in the per-type L3Workspace (see src/workspace.jl).
 
 # Public: B := α·op(A)⁻¹·B (side 'L') or α·B·op(A)⁻¹ (side 'R'); A k×k triangular (uplo/transA/diag).
 function trsm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
@@ -919,16 +909,8 @@ function _syrk_scaleC!(C, up::Bool, β)
     end
     return C
 end
-# Reusable NB×NB scratch for L3 diagonal blocks (one per element type; thread-unsafe — single-thread
-# project for now). ponytail: per-type cached buffer; revisit for multithreading.
-const _L3_NB = 128
-const _L3_TMP = IdDict{DataType, Matrix}()
-_l3_tmp(::Type{T}) where {T} = get!(() -> Matrix{T}(undef, _L3_NB, _L3_NB), _L3_TMP, T)::Matrix{T}
-# The IdDict lookup costs ~130 ns — more than an entire tiny trmm. Const-dispatch the gated types.
-const _L3_TMP_F64 = Matrix{Float64}(undef, _L3_NB, _L3_NB)
-const _L3_TMP_F32 = Matrix{Float32}(undef, _L3_NB, _L3_NB)
-@inline _l3_tmp(::Type{Float64}) = _L3_TMP_F64
-@inline _l3_tmp(::Type{Float32}) = _L3_TMP_F32
+# _L3_NB and the NB×NB diagonal-block scratch `_l3_tmp(T)` (the workspace `diag` field) live in
+# src/workspace.jl — const-dispatched for Float64/Float32 so it stays a bare field load, no lookup.
 
 # Triangular-store microkernel: same FMA as the gemm masked microkernel, but on store keeps only the
 # stored-triangle entries — for a diagonal-straddling C-tile whose top-left global offset is (r0,c0),
@@ -1165,15 +1147,8 @@ const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) 
     (_unified_ok(T) || size(C, 1) <= _SYRK_UNIFIED_MAX) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
         _trgemm_packed!(up, α, A, tr, A, !tr, C, k)
 
-# Four-buffer scratch for the fused two-product syr2k driver (two A-packs, two B-packs). ponytail:
-# single global, single-thread; make task-local with the gemm scratch for M4 threading.
-const _SYR2K_SCRATCH = Dict{DataType, NTuple{4, Vector}}()
-function _syr2k_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
-    t = get!(() -> (T[], T[], T[], T[]), _SYR2K_SCRATCH, T)::NTuple{4, Vector{T}}
-    length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[3], lenA))
-    length(t[2]) < lenB && (resize!(t[2], lenB); resize!(t[4], lenB))
-    return t
-end
+# The fused two-product syr2k driver's four-buffer scratch (two A-packs, two B-packs) is the per-type
+# L3Workspace `s2` field — `_syr2k_scratch(T, lenA, lenB)` grows and returns it (see src/workspace.jl).
 
 # Fused two-product triangular-C gemm: C[tri] += α·op(X1)·op(Y1) + α·op(X2)·op(Y2). The core of syr2k.
 # Both products are packed (X1,Y1,X2,Y2) and each C-tile is visited ONCE: _microkernel2! accumulates

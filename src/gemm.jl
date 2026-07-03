@@ -342,16 +342,8 @@ function _scale_C!(C, m::Int, n::Int, beta::T) where {T}
     return
 end
 
-# Reusable packing buffers, keyed by element type, grown on demand — avoids a per-call ~MB malloc
-# that dominates small/medium GEMM. ponytail: single global scratch; make task-local for M4 threading
-# (and revisit if dgemm_64_ ever enters the trim build — a global Dict isn't trim-safe).
-const _GEMM_SCRATCH = Dict{DataType, Tuple{Vector, Vector}}()
-function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
-    Ap, Bp = get!(() -> (T[], T[]), _GEMM_SCRATCH, T)::Tuple{Vector{T}, Vector{T}}
-    length(Ap) < lenA && resize!(Ap, lenA)
-    length(Bp) < lenB && resize!(Bp, lenB)
-    return Ap, Bp
-end
+# Reusable GEMM packing buffers now live in the per-type L3Workspace (see src/workspace.jl):
+# `_gemm_scratch(T, lenA, lenB)` returns its `gpackA`/`gpackB` fields, grown on demand.
 
 # Blocked real GEMM (the optimized path). C must have unit column stride (pointer + vstore).
 function _gemm_blocked!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
@@ -862,13 +854,8 @@ end
     _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
 end
 
-const _CGEMM_SCRATCH = Dict{DataType, NTuple{4, Vector}}()
-function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
-    t = get!(() -> (T[], T[], T[], T[]), _CGEMM_SCRATCH, T)::NTuple{4, Vector{T}}
-    length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[2], lenA))
-    length(t[3]) < lenB && (resize!(t[3], lenB); resize!(t[4], lenB))
-    return t
-end
+# Complex split-pack buffers live in the per-type L3Workspace `cg` field (see src/workspace.jl);
+# `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
 function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, tA::Bool, tB::Bool,
