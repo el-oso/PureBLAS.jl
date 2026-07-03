@@ -89,6 +89,13 @@ end
         @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32) static = false
         @assert_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512) static = false
         @assert_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs) static = false
+        # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
+        # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
+        # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
+        @assert_typestable P.trsm!(copy(Bs), tri(512); side = 'L', uplo = 'L', diag = 'N', alpha = 1.0)
+        @assert_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+        @assert_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+        @assert_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
         @test true
     end
 end
