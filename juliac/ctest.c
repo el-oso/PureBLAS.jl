@@ -21,6 +21,9 @@ typedef double (*dnrm2_t)(int64_t *, double *, int64_t *);
  * string-length longs (the trailing `1, 1`). */
 typedef void (*dgemm_t)(char *, char *, int64_t *, int64_t *, int64_t *, double *, double *,
                         int64_t *, double *, int64_t *, double *, double *, int64_t *, long, long);
+/* dgemv_64_ (L2): one char arg (trans) + one trailing hidden length. y := alpha*op(A)*x + beta*y. */
+typedef void (*dgemv_t)(char *, int64_t *, int64_t *, double *, double *, int64_t *, double *,
+                        int64_t *, double *, double *, int64_t *, long);
 
 int main(void) {
     void *h = dlopen("juliac/build/libpureblas.so", RTLD_NOW | RTLD_GLOBAL);
@@ -47,5 +50,13 @@ int main(void) {
     double A[4] = {1, 2, 3, 4}, B[4] = {5, 6, 7, 8}, Cm[4] = {1, 1, 1, 1};
     dgemm(&N, &N, &m2, &n2, &k2, &alpha, A, &ld, B, &ld, &beta, Cm, &ld, 1, 1);
     printf("dgemm: %.1f %.1f %.1f %.1f\n", Cm[0], Cm[1], Cm[2], Cm[3]); /* 49 71 65 95 */
+
+    /* dgemv (L2, char-ABI): y := 1*A*x + 0*y, A = [1 3; 2 4] (col-major), x = {1,1}
+     *   A*x = [1+3; 2+4] = [4; 6] */
+    dgemv_t dgemv = (dgemv_t)dlsym(h, "dgemv_64_");
+    if (!dgemv) { printf("dlsym dgemv fail\n"); return 1; }
+    double one = 1.0, zero = 0.0, xv[2] = {1, 1}, yv[2] = {0, 0};
+    dgemv(&N, &m2, &n2, &one, A, &ld, xv, &i1, &zero, yv, &i1, 1);
+    printf("dgemv: %.1f %.1f\n", yv[0], yv[1]); /* 4.0 6.0 */
     return 0;
 }
