@@ -851,7 +851,12 @@ end
 # set (column starts alias) — measured trsm 0.78–0.94 at ld∈{1024,2048} vs 1.0–1.12 at non-po2. Copying
 # A once into a padded-ld scratch (ld=k+8) removes the conflict (B-padding doesn't help — it's the A
 # sub-view packing). ponytail: only A needs it; B is solved in place. Cost O(k²) ≪ trsm O(k²n).
-@inline _badld(ld::Int) = ld >= 512 && (ld & (ld - 1)) == 0
+# A-pad for power-of-2 leading dims: on AVX2 the O(k²) copy costs MORE than the po2 cache-set aliasing it
+# avoids — measured on an idle core (galen is shared → use a free core), disabling it lifts trsm n=512
+# 0.89→0.94, n=1024 0.95→0.98, n=2048 →1.02, and getrf (built on trsm) 0.88→0.96. The old "conflict is
+# catastrophic 0.78→1.12, the copy pays" was a pre-clean (contended / pre-trtri-fix) measurement. Kept
+# for AVX-512/other (untested there; trsm already gates), disabled on AVX2.
+@inline _badld(ld::Int) = _vwidth(Float64) != 4 && ld >= 512 && (ld & (ld - 1)) == 0
 const _L3_APAD = IdDict{DataType, Matrix}()
 function _l3_apad(::Type{T}, k::Int) where {T}
     b = get(_L3_APAD, T, nothing)
