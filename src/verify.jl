@@ -33,7 +33,10 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         # SPD/non-singular source (diagonally dominant: diag m+1, off-diag 1) + a working copy the
         # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
         Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
-        ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m)
+        ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
+        # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
+        kb = 8, APd = ones(m * (m + 1) ÷ 2), APz = ones(ComplexF64, m * (m + 1) ÷ 2),
+        ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m)
         # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
         # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
         # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
@@ -70,6 +73,21 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             hemv!(bk, wz, Az, uz)
             trmv!(bk, Ad, um)
             trsv!(bk, Ad, um)
+            # ── Level 2 packed storage (symmetric/Hermitian/triangular; rank-1/2 updates)
+            spmv!(bk, vm, APd, um; uplo = 'U', alpha = 2.0, beta = 1.0)
+            hpmv!(bk, wz, APz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)
+            tpmv!(bk, APd, um; uplo = 'U', trans = 'N', diag = 'N')
+            tpsv!(bk, APd, um; uplo = 'U', trans = 'N', diag = 'N')
+            spr!(bk, 1.5, um, APd; uplo = 'U')
+            spr2!(bk, 1.5, um, vm, APd; uplo = 'U')
+            hpr!(bk, 1.5, uz, APz; uplo = 'U')
+            hpr2!(bk, 1.5 + 0im, uz, wz, APz; uplo = 'U')
+            # ── Level 2 band storage (general/symmetric/Hermitian/triangular banded)
+            gbmv!(bk, vm, ABg, um, m, kb, kb; trans = 'N', alpha = 2.0, beta = 1.0)
+            sbmv!(bk, vm, ABs, um; uplo = 'U', alpha = 2.0, beta = 1.0)
+            hbmv!(bk, wz, ABz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)
+            tbmv!(bk, ABs, um; uplo = 'U', trans = 'N', diag = 'N')
+            tbsv!(bk, ABs, um; uplo = 'U', trans = 'N', diag = 'N')
             # ── Level 3 (all matrix-matrix ops; scratch pre-warmed above; real + complex)
             gemm!(bk, C3, A3, B3)
             symm!(bk, C3, A3, B3)
