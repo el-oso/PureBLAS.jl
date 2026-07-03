@@ -252,6 +252,8 @@ end
 @inline gesvd!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = gesvd!(A; kw...)
 
 # Assert at precompile time that SIMDBackend satisfies EVERY contract in its supertype chain
-# (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK) — method existence + declared return types. Trim-safe:
-# runs during precompilation, unreachable from any C-ABI entry point, eliminated by the trimmer.
-@verify SIMDBackend
+# (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK) — method existence + declared return types. `trim_compat`
+# also scans each mandatory method's typed IR for known trim-unsafe calls (heuristic; TrimCheck's
+# @validate on the C-ABI entries is the exhaustive check). Trim-safe itself: runs during
+# precompilation, unreachable from any C-ABI entry point, eliminated by the trimmer.
+@verify SIMDBackend trim_compat=true
