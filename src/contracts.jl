@@ -123,3 +123,29 @@ function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular
     trmm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
     trsm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
 end
+
+"""
+    AbstractLAPACK <: AbstractBLAS3
+
+Supertype of LAPACK backends (dense factorizations); a LAPACK backend is also an L3/L2/L1 backend
+(it builds the factorizations on the gated Level-3 kernels). Concrete backends provide the
+factorization set below. As with the BLAS levels this `@contract` is the single discoverable spec
+of a swappable LAPACK backend — a second backend (reference, GPU, …) that omits any factorization
+fails the precompile-time check. The high-level `fac!(::Backend, …)` methods dispatch on the
+backend; the bare `fac!(A; …)` entry points (lapack.jl / lu.jl / qr.jl / svd.jl) are the
+default-backend implementations. Factorizations that return multiple outputs (pivots, τ, U/S/Vᵀ)
+are typed `::Tuple`; potrf! overwrites-and-returns its matrix.
+"""
+abstract type AbstractLAPACK <: AbstractBLAS3 end
+
+function potrf! end  # Cholesky:  A = L·Lᴴ (or Uᴴ·U); overwrites the stored triangle
+function getrf! end  # LU w/ partial pivoting: P·A = L·U → (A, ipiv, info)
+function geqrf! end  # QR (Householder): A = Q·R → (A, tau)
+function gesvd! end  # SVD: A = U·Σ·Vᵀ → (U, S, Vᵀ)
+
+@contract AbstractLAPACK begin
+    potrf!(::Self, ::AbstractMatrix)::AbstractMatrix
+    getrf!(::Self, ::AbstractMatrix)::Tuple
+    geqrf!(::Self, ::AbstractMatrix)::Tuple
+    gesvd!(::Self, ::AbstractMatrix)::Tuple
+end

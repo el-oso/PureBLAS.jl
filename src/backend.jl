@@ -4,7 +4,7 @@
 # while strided/complex/AD-element vectors take the generic scalar loop. Return-type annotations
 # are explicit so inference matches the contract (zero-cost typeasserts).
 
-struct SIMDBackend <: AbstractBLAS3 end
+struct SIMDBackend <: AbstractLAPACK end
 
 """Default Level-1 backend used by the bare native API in native.jl."""
 const DEFAULT_BACKEND = SIMDBackend()
@@ -242,3 +242,16 @@ end
 @inline her2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = her2k!(C, A, B; kw...)
 @inline trmm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trmm!(B, A; kw...)
 @inline trsm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trsm!(B, A; kw...)
+
+# ── LAPACK backend surface (AbstractLAPACK contract). Same thin-wrapper form as L3: the bare
+# `fac!(A; …)` entry points (lapack.jl/lu.jl/qr.jl/svd.jl) are the implementations; these dispatch a
+# second backend's factorizations and let the contract enforce completeness. Zero-cost (inlined).
+@inline potrf!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = potrf!(A; kw...)
+@inline getrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = getrf!(A; kw...)
+@inline geqrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = geqrf!(A; kw...)
+@inline gesvd!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = gesvd!(A; kw...)
+
+# Assert at precompile time that SIMDBackend satisfies EVERY contract in its supertype chain
+# (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK) — method existence + declared return types. Trim-safe:
+# runs during precompilation, unreachable from any C-ABI entry point, eliminated by the trimmer.
+@verify SIMDBackend
