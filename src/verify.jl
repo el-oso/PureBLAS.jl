@@ -23,14 +23,21 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
         uz = ones(ComplexF64, m), wz = ones(ComplexF64, m),
         C3 = ones(m, m), A3 = ones(m, m), B3 = ones(m, m), Bt = ones(m, m), At = ones(m, m),
+        Cz3 = ones(ComplexF64, m, m), Az3 = ones(ComplexF64, m, m), Bz3 = ones(ComplexF64, m, m),
         # SPD source (diagonally dominant: diag m+1, off-diag 1) + a working copy potrf! overwrites.
         Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m)
         # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
-        # fast-mode runtime @noalloc below sees steady state. Only the 0-alloc ops are verified — the
-        # rank-k/hemm family still boxes recursion sub-blocks (see contracts.jl); they'll join once refactored.
+        # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
+        # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
+        # is verified below.
         gemm!(bk, C3, A3, B3); symm!(bk, C3, A3, B3)
         trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
         trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
+        syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+        herk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+        syr2k!(bk, C3, A3, B3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+        her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
+        hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
         copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L')
         @verify_strict SIMDBackend begin
             # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
@@ -54,9 +61,14 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             hemv!(bk, wz, Az, uz)
             trmv!(bk, Ad, um)
             trsv!(bk, Ad, um)
-            # ── Level 3 (the 0-alloc ops; scratch pre-warmed above)
+            # ── Level 3 (all matrix-matrix ops; scratch pre-warmed above; real + complex)
             gemm!(bk, C3, A3, B3)
             symm!(bk, C3, A3, B3)
+            hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
+            syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+            herk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+            syr2k!(bk, C3, A3, B3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+            her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
             trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             # ── LAPACK: potrf! (0-alloc). Via the re-seeding probe so repeated @strict calls never

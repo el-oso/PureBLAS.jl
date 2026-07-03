@@ -1160,7 +1160,9 @@ function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
 end
 
 # Add S's `uplo` triangle into C's; herm → force the diagonal real.
-function _add_tri!(C, S, up::Bool, herm::Bool, b::Int)
+# @inline so the (possibly SubArray) C/S args passed from the D&C recursion don't escape to a
+# non-inlined callee and heap-box — the recursion drivers rely on this to stay allocation-free.
+@inline function _add_tri!(C, S, up::Bool, herm::Bool, b::Int)
     @inbounds for j in 1:b, i in (up ? (1:j) : (j:b)); C[i, j] += S[i, j]; end
     herm && @inbounds for i in 1:b; C[i, i] = real(C[i, i]); end
     return C
@@ -1413,29 +1415,49 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
     if !herm && eltype(C) <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
         return _syrk_packed!(up, tr, convert(eltype(C), α), A, C, k)
     end
-    _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)))
+    _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)), 0, size(C, 1))
 end
-function _syrk_rec!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int, scr)
-    n = size(C, 1); tB = herm ? 'C' : 'T'
+# One gemm sub-block through the @inline `_gemm_core!` (not the non-inlined kwarg gemm!): tr=false ⇒
+# C += α·A·Bᵀ (transB), tr=true ⇒ C += α·Aᵀ·B (transA); cc conjugates for the herm (herk) case.
+@inline function _syrk_gemm!(C, A, B, α::T, β::T, tr::Bool, cc::Bool) where {T}
+    _gemm_core!(C, A, B, α, β, tr, !tr, tr && cc, !tr && cc)
+end
+# Divide-and-conquer syrk/herk. The recursion carries integer offsets into the ORIGINAL A and C (same
+# objects every level — free to pass) instead of fresh sub-block SubArrays, which are non-isbits and
+# would heap-box when handed to the non-inlined recursive call. Sub-blocks are materialized as views
+# only at the leaf / off-diagonal, feeding the @inline _syrk_gemm!/_add_tri! so they never escape.
+# The A block is A's rows for trans='N' (C=A·Aᵀ), columns for trans='T' (C=Aᵀ·A) — built inside an
+# `if tr` branch, NOT a `tr ? view(A,:,r) : view(A,r,:)` ternary: the two arms are different SubArray
+# types, and merging them makes a non-isbits Union value, which cannot live on the stack and heap-
+# boxes every view (this was the residual syrk/herk allocation). One concrete view type per arm stays
+# stack-allocated, exactly like the (single-typed) C views.
+function _syrk_rec!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int, scr, off::Int, n::Int)
+    T = eltype(C); a = convert(T, α); cc = herm
     if n <= _SYRK_DBASE
         tmp = view(scr, 1:n, 1:n)
-        tr ? gemm!(tmp, A, A; alpha = α, beta = false, transA = tB) :
-             gemm!(tmp, A, A; alpha = α, beta = false, transB = tB)
-        return _add_tri!(C, tmp, up, herm, n)
+        if tr
+            Ab = view(A, :, (off + 1):(off + n))
+            _syrk_gemm!(tmp, Ab, Ab, a, zero(T), true, cc)
+        else
+            Ab = view(A, (off + 1):(off + n), :)
+            _syrk_gemm!(tmp, Ab, Ab, a, zero(T), false, cc)
+        end
+        _add_tri!(view(C, (off + 1):(off + n), (off + 1):(off + n)), tmp, up, herm, n)
+        return C
     end
     h = _trsplit(n)
-    C11 = view(C, 1:h, 1:h); C22 = view(C, (h + 1):n, (h + 1):n)
-    A1 = tr ? view(A, :, 1:h) : view(A, 1:h, :); A2 = tr ? view(A, :, (h + 1):n) : view(A, (h + 1):n, :)
-    _syrk_rec!(up, tr, herm, α, A1, C11, k, scr)
-    _syrk_rec!(up, tr, herm, α, A2, C22, k, scr)
-    if up
-        Coff = view(C, 1:h, (h + 1):n)
-        tr ? gemm!(Coff, A1, A2; alpha = α, beta = true, transA = tB) :
-             gemm!(Coff, A1, A2; alpha = α, beta = true, transB = tB)
+    _syrk_rec!(up, tr, herm, α, A, C, k, scr, off, h)
+    _syrk_rec!(up, tr, herm, α, A, C, k, scr, off + h, n - h)
+    Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
+              view(C, (off + h + 1):(off + n), (off + 1):(off + h))    # arms — merge is concrete
+    if tr
+        A1 = view(A, :, (off + 1):(off + h)); A2 = view(A, :, (off + h + 1):(off + n))
+        up ? _syrk_gemm!(Co, A1, A2, a, one(T), true, cc) :
+             _syrk_gemm!(Co, A2, A1, a, one(T), true, cc)
     else
-        Coff = view(C, (h + 1):n, 1:h)
-        tr ? gemm!(Coff, A2, A1; alpha = α, beta = true, transA = tB) :
-             gemm!(Coff, A2, A1; alpha = α, beta = true, transB = tB)
+        A1 = view(A, (off + 1):(off + h), :); A2 = view(A, (off + h + 1):(off + n), :)
+        up ? _syrk_gemm!(Co, A1, A2, a, one(T), false, cc) :
+             _syrk_gemm!(Co, A2, A1, a, one(T), false, cc)
     end
     return C
 end
@@ -1474,7 +1496,7 @@ const _SYMM_SCR = IdDict{DataType, Matrix}()
 function _symm_scr(::Type{T}, n::Int) where {T}
     m = get(_SYMM_SCR, T, nothing)
     if isnothing(m) || size(m, 1) < n; m = Matrix{T}(undef, n, n); _SYMM_SCR[T] = m; end
-    return m
+    return m::Matrix{T}   # the IdDict values are abstract `Matrix` — assert or the view boxes (hemm 160 B)
 end
 # Const-dispatch the gated types (the IdDict get costs ~130 ns — dominates tiny symm).
 const _SYMM_SCR_F64 = Ref(Matrix{Float64}(undef, 0, 0))
@@ -1699,46 +1721,64 @@ end
 # trans 'N': A,B are n×k (A·Bᴴ + B·Aᴴ). 'T'/'C': A,B are k×n (Aᴴ·B + Bᴴ·A). her2k: conj + β real +
 # diagonal real, second term uses ᾱ. Diagonal blocks recurse; off-diagonal = two gemm!s.
 # gemm-temp base (the gate path): both rank-k products into an n×n temp, then triangle-add.
-function _syr2k_base!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, n::Int, scr)
-    α2 = herm ? conj(α) : α; tX = herm ? 'C' : 'T'; tmp = view(scr, 1:n, 1:n)
-    if !herm && eltype(C) <: BlasReal
-        # Real: the second product IS the transpose of the first (B·Aᵀ = (A·Bᵀ)ᵀ, and Bᵀ·A = (Aᵀ·B)ᵀ),
-        # so ONE gemm + a symmetrized triangle-add — halves the base's gemm work. Dispatch-core direct.
-        T = eltype(C)
-        tr ? _gemm_core!(tmp, A, B, T(α), zero(T), true, false, false, false) :
-             _gemm_core!(tmp, A, B, T(α), zero(T), false, true, false, false)
-        @inbounds for j in 1:n, i in (up ? (1:j) : (j:n))
-            C[i, j] += tmp[i, j] + tmp[j, i]
+# Same 0-alloc shape as _syrk_rec!: integer `off,n` into the ORIGINAL A/B/C (no fresh sub-block
+# SubArrays through the non-inlined recursive call), views materialized only at the leaf /
+# off-diagonal inside `if tr` branches (one concrete SubArray type per arm — the merged
+# `tr ? view(A,:,r) : view(A,r,:)` ternary is a non-isbits Union that heap-boxes), and all gemms
+# through the @inline _syrk_gemm! (not the non-inlined kwarg gemm!).
+function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr, off::Int, n::Int)
+    T = eltype(C); a = convert(T, α); a2 = herm ? conj(a) : a; cc = herm
+    if n <= _SYRK_DBASE
+        r = (off + 1):(off + n); tmp = view(scr, 1:n, 1:n)
+        if !herm && T <: BlasReal
+            # Real: the second product IS the transpose of the first (B·Aᵀ = (A·Bᵀ)ᵀ, Bᵀ·A = (Aᵀ·B)ᵀ),
+            # so ONE gemm + a symmetrized triangle-add — halves the base's gemm work.
+            if tr
+                Ab = view(A, :, r); Bb = view(B, :, r)
+                _gemm_core!(tmp, Ab, Bb, a, zero(T), true, false, false, false)
+            else
+                Ab = view(A, r, :); Bb = view(B, r, :)
+                _gemm_core!(tmp, Ab, Bb, a, zero(T), false, true, false, false)
+            end
+            Cd = view(C, r, r)
+            @inbounds for j in 1:n, i in (up ? (1:j) : (j:n))
+                Cd[i, j] += tmp[i, j] + tmp[j, i]
+            end
+            return C
         end
-        return C
-    elseif !tr
-        gemm!(tmp, A, B; alpha = α, beta = false, transB = tX); gemm!(tmp, B, A; alpha = α2, beta = true, transB = tX)
-    else
-        gemm!(tmp, A, B; alpha = α, beta = false, transA = tX); gemm!(tmp, B, A; alpha = α2, beta = true, transA = tX)
-    end
-    return _add_tri!(C, tmp, up, herm, n)
-end
-function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr = _l3_tmp(eltype(C)))
-    n = size(C, 1)
-    n <= _SYRK_DBASE && return _syr2k_base!(up, tr, herm, α, A, B, C, n, scr)
-    h = _trsplit(n); tX = herm ? 'C' : 'T'; α2 = herm ? conj(α) : α
-    C11 = view(C, 1:h, 1:h); C22 = view(C, (h + 1):n, (h + 1):n)
-    A1 = tr ? view(A, :, 1:h) : view(A, 1:h, :); A2 = tr ? view(A, :, (h + 1):n) : view(A, (h + 1):n, :)
-    B1 = tr ? view(B, :, 1:h) : view(B, 1:h, :); B2 = tr ? view(B, :, (h + 1):n) : view(B, (h + 1):n, :)
-    _syr2k_acc!(up, tr, herm, α, A1, B1, C11, k, scr); _syr2k_acc!(up, tr, herm, α, A2, B2, C22, k, scr)
-    if up
-        Coff = view(C, 1:h, (h + 1):n)            # C12 += α·op(A1)op(B2)ᴴ + α2·op(B1)op(A2)ᴴ
-        if !tr
-            gemm!(Coff, A1, B2; alpha = α, beta = true, transB = tX); gemm!(Coff, B1, A2; alpha = α2, beta = true, transB = tX)
+        if tr                                     # α·op(A)op(B)ᴴ + α2·op(B)op(A)ᴴ into tmp
+            Ab = view(A, :, r); Bb = view(B, :, r)
+            _syrk_gemm!(tmp, Ab, Bb, a, zero(T), true, cc)
+            _syrk_gemm!(tmp, Bb, Ab, a2, one(T), true, cc)
         else
-            gemm!(Coff, A1, B2; alpha = α, beta = true, transA = tX); gemm!(Coff, B1, A2; alpha = α2, beta = true, transA = tX)
+            Ab = view(A, r, :); Bb = view(B, r, :)
+            _syrk_gemm!(tmp, Ab, Bb, a, zero(T), false, cc)
+            _syrk_gemm!(tmp, Bb, Ab, a2, one(T), false, cc)
+        end
+        _add_tri!(view(C, r, r), tmp, up, herm, n)
+        return C           # NOT `return _add_tri!(...)`: that returns the SubArray, making the
+    end                    # recursion's return type Union{Matrix,SubArray} — boxes at every level
+    h = _trsplit(n)
+    _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off, h)
+    _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off + h, n - h)
+    Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
+              view(C, (off + h + 1):(off + n), (off + 1):(off + h))    # arms — merge is concrete
+    # up: C12 += α·op(A1)op(B2)ᴴ + α2·op(B1)op(A2)ᴴ; low: C21 += α·op(A2)op(B1)ᴴ + α2·op(B2)op(A1)ᴴ
+    if tr
+        A1 = view(A, :, (off + 1):(off + h)); A2 = view(A, :, (off + h + 1):(off + n))
+        B1 = view(B, :, (off + 1):(off + h)); B2 = view(B, :, (off + h + 1):(off + n))
+        if up
+            _syrk_gemm!(Co, A1, B2, a, one(T), true, cc); _syrk_gemm!(Co, B1, A2, a2, one(T), true, cc)
+        else
+            _syrk_gemm!(Co, A2, B1, a, one(T), true, cc); _syrk_gemm!(Co, B2, A1, a2, one(T), true, cc)
         end
     else
-        Coff = view(C, (h + 1):n, 1:h)            # C21 += α·op(A2)op(B1)ᴴ + α2·op(B2)op(A1)ᴴ
-        if !tr
-            gemm!(Coff, A2, B1; alpha = α, beta = true, transB = tX); gemm!(Coff, B2, A1; alpha = α2, beta = true, transB = tX)
+        A1 = view(A, (off + 1):(off + h), :); A2 = view(A, (off + h + 1):(off + n), :)
+        B1 = view(B, (off + 1):(off + h), :); B2 = view(B, (off + h + 1):(off + n), :)
+        if up
+            _syrk_gemm!(Co, A1, B2, a, one(T), false, cc); _syrk_gemm!(Co, B1, A2, a2, one(T), false, cc)
         else
-            gemm!(Coff, A2, B1; alpha = α, beta = true, transA = tX); gemm!(Coff, B2, A1; alpha = α2, beta = true, transA = tX)
+            _syrk_gemm!(Co, A2, B1, a, one(T), false, cc); _syrk_gemm!(Co, B2, A1, a2, one(T), false, cc)
         end
     end
     return C
@@ -1761,12 +1801,12 @@ function syr2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     else
         _syrk_scaleC!(C, up, beta)
-        _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k)
+        _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n)
     end
     C
 end
 function her2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Real = false)
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
-    _syrk_scaleC!(C, up, beta); _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k); C
+    _syrk_scaleC!(C, up, beta); _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n); C
 end
