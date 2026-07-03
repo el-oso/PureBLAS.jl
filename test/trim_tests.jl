@@ -20,5 +20,16 @@
         PureBLAS.dznrm2_64_(Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}),
         PureBLAS.dzasum_64_(Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}),
         PureBLAS.idamax_64_(Ptr{Int64}, Ptr{Float64}, Ptr{Int64}),
+        # Level-3 GEMM: char args (2× Ptr{UInt8}) + trailing Fortran string-length Clongs. Exercises the
+        # full blocked/unpacked/complex-split-pack path + the L3 workspace scratch (all const-dispatched
+        # for s/d/c/z, so the workspace IdDict fallback is never reached).
+        PureBLAS.dgemm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64},
+            Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Clong, Clong),
+        PureBLAS.sgemm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float32},
+            Ptr{Float32}, Ptr{Int64}, Ptr{Float32}, Ptr{Int64}, Ptr{Float32}, Ptr{Float32}, Ptr{Int64}, Clong, Clong),
+        PureBLAS.zgemm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64},
+            Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Clong, Clong),
+        PureBLAS.cgemm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF32},
+            Ptr{ComplexF32}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{ComplexF32}, Ptr{Int64}, Clong, Clong),
     )
 end

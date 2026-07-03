@@ -67,3 +67,49 @@ for (sym, T) in ((:isamax_64_, Float32), (:idamax_64_, Float64),
         return Int64(_iamax(unsafe_load(n), x, unsafe_load(incx)))
     end
 end
+
+# ── Level-3 GEMM: the character-argument ABI ─────────────────────────────────────────────────
+# First BLAS op with char args (transA/transB). Julia's LinearAlgebra ccalls dgemm_64_ as
+#   (Ref{UInt8}, Ref{UInt8}, Ref{Int64}×3, Ref{T}, Ptr{T}, Ref{Int64}, …, Clong, Clong)
+# i.e. two char args by reference FIRST, all by-ref scalars/arrays, then TWO trailing hidden Fortran
+# string-length Clongs (value 1 each — ignored). Deref chars with unsafe_load → UInt8 → Char.
+# ASCII-uppercase the char at the boundary (reference BLAS is case-insensitive via lsame; gemm!
+# checks `!= 'N'` and `== 'C'`, so a lowercase 'c' would transpose-without-conjugate — a bug). Manual
+# byte uppercase, not `uppercase(::Char)` (Unicode tables aren't trim-safe / 0-alloc).
+@inline function _cabi_char(p::Ptr{UInt8})
+    b = unsafe_load(p)
+    return b >= 0x61 ? Char(b - 0x20) : Char(b)
+end
+
+# Pointer→matrix bridge: unsafe_wrap the (ld × stored_cols) column-major buffer (own=false, non-owning
+# header), then view the top-left stored_rows×stored_cols operand. The view is a StridedMatrix with
+# stride(1)==1, stride(2)==ld — exactly what gemm!'s fast path wants. Trim-safe and (measured) 0-alloc:
+# the Array headers + SubArrays don't escape gemm!, so they stack-allocate.
+@inline function _gemm_cabi!(transa::Ptr{UInt8}, transb::Ptr{UInt8}, m::Int64, n::Int64, k::Int64,
+        alpha::T, A::Ptr{T}, lda::Int64, B::Ptr{T}, ldb::Int64,
+        beta::T, C::Ptr{T}, ldc::Int64) where {T}
+    ta = _cabi_char(transa); tb = _cabi_char(transb)
+    trA = ta != 'N'; trB = tb != 'N'
+    Arows = trA ? k : m; Acols = trA ? m : k    # op(A)=Aᵀ ⇒ A stored k×m; op(A)=A ⇒ m×k
+    Brows = trB ? n : k; Bcols = trB ? k : n
+    Am = view(unsafe_wrap(Array, A, (Int(lda), Int(Acols))), 1:Int(Arows), 1:Int(Acols))
+    Bm = view(unsafe_wrap(Array, B, (Int(ldb), Int(Bcols))), 1:Int(Brows), 1:Int(Bcols))
+    Cm = view(unsafe_wrap(Array, C, (Int(ldc), Int(n))),     1:Int(m),     1:Int(n))
+    # Call the @inline dispatch core directly (not the public kwarg `gemm!`): the kwarg entry boxes
+    # its keyword args (measured +64 B), and the hot L3 D&C path already routes through _gemm_core!.
+    _gemm_core!(Cm, Am, Bm, alpha, beta, trA, trB, ta == 'C', tb == 'C')
+    return
+end
+
+# s/d/c/z GEMM @ccallable entries — two Ptr{UInt8} chars, by-ref scalars/arrays, two trailing Clongs.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "gemm_64_"))(
+            transa::Ptr{UInt8}, transb::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, k::Ptr{Int64},
+            alpha::Ptr{$T}, A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64},
+            beta::Ptr{$T}, C::Ptr{$T}, ldc::Ptr{Int64}, len_ta::Clong, len_tb::Clong)::Cvoid
+        _gemm_cabi!(transa, transb, unsafe_load(m), unsafe_load(n), unsafe_load(k),
+            unsafe_load(alpha), A, unsafe_load(lda), B, unsafe_load(ldb),
+            unsafe_load(beta), C, unsafe_load(ldc))
+        return
+    end
+end
