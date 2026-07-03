@@ -107,6 +107,17 @@ const _CHOL_NC = 4                                # syrk column block
 function _chol_base_f64!(p::Ptr{Float64}, n::Int, ld::Int)
     @inbounds for j in 1:n
         i = j
+        while i + 3_CHOLW - 1 <= n                              # MR=3 row-vectors: 3 independent acc chains
+            b0 = _cvptr(p, i, j, ld); b1 = _cvptr(p, i + _CHOLW, j, ld); b2 = _cvptr(p, i + 2_CHOLW, j, ld)
+            a0 = vload(_CVF, b0); a1 = vload(_CVF, b1); a2 = vload(_CVF, b2)
+            for k in 1:j-1                                      # break the k-reduction latency chain + reuse
+                g = _CVF(-unsafe_load(p, _clidx(j, k, ld)))     # the L[j,k] broadcast across the 3 blocks
+                a0 = muladd(g, vload(_CVF, _cvptr(p, i, k, ld)), a0)
+                a1 = muladd(g, vload(_CVF, _cvptr(p, i + _CHOLW, k, ld)), a1)
+                a2 = muladd(g, vload(_CVF, _cvptr(p, i + 2_CHOLW, k, ld)), a2)
+            end
+            vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); i += 3_CHOLW
+        end
         while i + _CHOLW - 1 <= n
             base = _cvptr(p, i, j, ld); acc = vload(_CVF, base)
             for k in 1:j-1
