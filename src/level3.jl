@@ -648,15 +648,29 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
     iv = view(_l3_tmp(T), 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
     tmp = view(_trsm_tmp(T, nb, n), 1:nb, 1:n)
-    gemm!(tmp, iv, B; alpha = true, beta = false, transA = tr ? 'T' : 'N')
+    # tmp := op(iv)·B. The leaf shape is skewed (nb ≤ _TRSM_BASE tiny, n wide) — the UNPACKED path (no
+    # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
+    # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
+    if tr
+        gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
+    else
+        _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+    end
     copyto!(B, tmp); return B
 end
-# side R base: B := B·op(A)⁻¹ = B·op(inv(A)) (gemm with transB=op into temp, copy back).
+# side R base: B := B·op(A)⁻¹ = B·op(inv(A)). tmp := B·op(iv) via the unpacked path (transB=op is a free
+# Val{TB}; skewed shape m wide, n=k=nb tiny → same unpacked win as invL).
 function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); m = size(B, 1); T = eltype(B)
     iv = view(_l3_tmp(T), 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
     tmp = view(_trsm_tmp(T, m, nb), 1:m, 1:nb)
-    gemm!(tmp, B, iv; alpha = true, beta = false, transB = tr ? 'T' : 'N')
+    # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
+    # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
+    if tr
+        _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+    else
+        _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+    end
     copyto!(B, tmp); return B
 end
 
