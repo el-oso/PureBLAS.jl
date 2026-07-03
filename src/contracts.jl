@@ -119,7 +119,13 @@ function her2k! end  # C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, 
 function trmm! end   # B := α·op(A)·B / α·B·op(A),      A triangular
 function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular (solve)
 
-@contract AbstractBLAS3 begin
+# Level-3 is a strict contract too. `@verify_strict SIMDBackend` (backend.jl) currently enforces the
+# allocation-free guarantee on the four ops that are 0-alloc today — gemm!/symm!/trmm!/trsm!. The
+# rank-k / hemm family (syrk!/herk!/syr2k!/her2k!/hemm!) carries a known ceiling: their divide-and-
+# conquer recursion heap-boxes the sub-block SubArrays it passes to the non-inlined recursive call
+# (O(log n) bytes, no effect on the perf gate). Upgrade path = rewrite those drivers to carry integer
+# offsets into the original arrays instead of fresh views; once 0-alloc they join the @verify_strict list.
+@strict_contract AbstractBLAS3 begin
     gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
     symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
     hemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix

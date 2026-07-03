@@ -22,6 +22,7 @@ include("qr.jl")            # LAPACK: QR (geqrf) — faer panel reduction + gemm
 include("lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm! trailing
 include("svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implicit-QR + back-transform
 include("svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal solver (bdsdc, faer port)
+include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_forward
 
