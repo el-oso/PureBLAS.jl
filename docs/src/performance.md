@@ -26,13 +26,13 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L1 iamax | ✓ 1.15 | ✗ 0.90 |
 | L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
 | L2 gemvN | ✗ 0.96 | ✗ 0.87 |
-| L3 gemm | ✗ 0.89 (n=8) | ✓ 1.01 |
+| L3 gemm | ✗ 0.83 (n=8 dispatch) | ✓ 1.03 (clip) |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
 | **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.00 | ◐ 0.88 (n=128); geomean 1.00 |
+| L3 trsm (unpacked leaf + clip; n≥192 gate) | ✓ 1.02 | ◐ 0.91 (n=128); geomean 0.99 |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ◐ 0.90 (n=128; geomean 1.21) |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ◐ 0.90 (n=128; geomean 1.26) |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
@@ -57,10 +57,14 @@ the square-gemm gate): PB was 0.89–0.90× OB there purely from **m-alignment**
 1.10–1.16, but m=32 with an 8-row=2·W remainder only 0.97; k barely mattered). The packed path masked such
 remainders (computing all mr rows to use mre); a **clean clip kernel** (`_microkernel_clip!` — reads the
 mr-strided panel but computes only the mre÷W live row-vectors, unmasked) removes the penalty: misaligned
-**m=32 0.97→1.17**, and **trsm n=256 → ~0.95 (gate boundary), getrf n=256 → ~1.02**, with the square-gemm
-gate holding and several non-aligned sizes improving (AVX-512 too — pure gain, no regression). Extending
-*unpacked* to the off-diagonal gemms was tried and *regressed* (in-context cache thrash — the isolated
-micro-bench lied). Remaining AVX2 ✗: `trsm`/`getrf` **n≤128** (~0.89, small-n leaf overhead), `trmm` n=8
+**m=32 0.97→1.17**, and **trsm n=256 → ~0.97 (gates), getrf n=256 → ~1.0**, with the square-gemm gate
+holding and several non-aligned sizes improving (AVX-512 too — pure gain, no regression). The clip is
+mirrored on the **unpacked** path (used at n ≤ `_GEMM_UNPACK_MAX`) — it closed the same penalty on trsm's
+n≤128 off-diagonals — and since the invL leaf's gemm is now cheap, the narrow-B dense cut `_TRSM_NCUT`
+dropped 96→64 (**trsm n=96 0.90→1.09**). Routing *unpacked* to the off-diagonal gemms of the wide path,
+by contrast, *regressed* (in-context cache thrash — the isolated micro-bench lied). Remaining AVX2 ✗:
+`trsm`/`getrf` **n=64/128** (~0.83/0.92 — the small-n dense base + invL trtri overhead; the worst-size is
+overhead-bound like AVX-512's n=8 gemm, geomeans clear), `trmm` n=8
 (the 8×8 block is materialize-bound — every non-materializing kernel measured slower), and `potrf` (n=1024,
 rides trsm-side-R). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
 
