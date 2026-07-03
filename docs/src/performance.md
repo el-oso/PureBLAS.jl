@@ -29,10 +29,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in te
 | L3 gemm | ✗ 0.89 (n=8) | ✓ 1.01 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
 | **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (po2 A-pad off; n≥512 gate) | ✓ 1.00 | ◐ 0.85 (n=128/256 invL recursion) |
+| L3 trsm (unpacked leaf; n≥192 gate) | ✓ 1.00 | ◐ 0.88–0.93 (n≤256 invL leaf) |
 | L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
 | LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ◐ 0.91 (getrf n=256 only) |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.69 · ✓ 0.98 |
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
@@ -44,13 +44,24 @@ OpenBLAS's symmetric copy switches the source stride **once per column** at the 
 of a per-element `i≤j` branch — the branchless pack made the fused path beat materialize+gemm. `syr2k`
 (0.91→**0.96**): OpenBLAS runs **two full-kernel gemm passes** (our fused 8-acc tile is ILP-starved on 16
 regs), plus a **β=0 overwrite** mode (skip the scaleC zero-pass) — n=256 sits right at the gate. Complex
-`zgemm` is at the n=32 cold boundary (0.94 cold / **~1.02 warm**). `trsm` was lifted (geomean **0.97**,
-n≥512 gate) by **disabling the po2 A-pad** — measured on an idle core, the pad's O(k²) copy costs more
-than the aliasing it avoids (the old "pad pays" was a contended measurement); this also lifted `getrf` to
-~0.96 (only n=256 remains). The remaining AVX2 ✗: `trsm`/`getrf` **n=256** (the L2-resonant invL-recursion
-small-M gemms — OpenBLAS solves in the packed gemm buffer, a larger restructure), `trmm` n=8 (the 8×8
-block is materialize-bound — every non-materializing kernel measured slower), and `potrf` (n=1024, rides
-trsm-side-R). `zgemm` is a SIMD split-pack kernel that **beats OpenBLAS on AVX-512**.
+`zgemm` is at the n=32 cold boundary (0.94 cold / **~1.02 warm**). `trsm` was first lifted (n≥512 gate) by
+**disabling the po2 A-pad** (the pad's O(k²) copy costs more than the aliasing it avoids — the old "pad
+pays" was a contended measurement), then the **n=128/256 leaf** was closed further: decomposing the invL/
+invR base on an idle core showed the gap is the leaf **GEMM** (18µs/leaf, dominant), *not* the copyback
+(~1.5% — a prior mis-diagnosis). The leaf shape is skewed (nb ≤ 32 tiny, B wide), so the packed path pays
+a full B-pack + scaleC-zero pass for a k=32 contraction; routing the leaf multiply through the **unpacked**
+kernel (no B-pack, `Val{B0}` overwrite; 0.72× the packed time, beats OpenBLAS's own gemm there) lifts
+**trsm n=256 0.85→~0.93** and **getrf n=256 0.91→0.98 (now gates)**. The remaining AVX2 ✗: `trsm` **n≤256**
+(~0.88–0.93 — the invL leaf's trtri + recursion overhead; extending unpacked to the off-diagonal gemms
+*regressed* in context, cache thrash), `trmm` n=8 (the 8×8 block is materialize-bound — every
+non-materializing kernel measured slower), and `potrf` (n=1024, rides trsm-side-R). `zgemm` is a SIMD
+split-pack kernel that **beats OpenBLAS on AVX-512**.
+
+All Level-3 scratch is owned by a single per-type `L3Workspace` (`src/workspace.jl`) — the seven former
+global buffer caches bundled into one concrete-field struct (const-dispatched for Float64/Float32, so no
+lookup on the hot path), mirroring PureFFT's plan-owned scratch. This removed the abstract-`Matrix`
+boxing that recurred on the old IdDict returns and makes the whole L3 thread-ready in one place; it is
+performance-neutral single-thread (measured, tiny-n within noise).
 
 > **Measurement note (learned the hard way):** with CPU boost enabled, allocating between timed regions
 > drops the core off boost mid-measurement, biasing whichever side is timed first — this once fabricated
