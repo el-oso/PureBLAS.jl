@@ -89,6 +89,34 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       (n=128 0.873→0.853, n=256 ~same), so MR=3 register pressure is NOT the potrf limiter; the bottleneck
       is elsewhere in the faer base (`_chol_base_f64!` left-looking panel or `_trsm_right_lower_f64!`, both
       also 3·W-unrolled) — needs per-kernel decomposition, not a blanket tile change.
+    - **UPDATE 2026-07-04 (session 2) — gemvN mid-band FIXED + residual triage (commit 676582e).**
+      Decomposed every remaining AVX2 gate FAIL to per-size on galen (boost off):
+      - **gemvN — FIXED** the mid-band (n=128..768 sat ~0.90-0.94). Root cause: `_GEMV_MR=4`
+        accumulators half-fed Zen3's two FMA units (~5-cyc latency wants ~10 independent chains) while
+        A is still cache/L3-resident → FMA-latency-bound, not bandwidth. Two width-conditional consts
+        (AVX2 only; AVX-512 verified bit-identical, W=8→MR=4/RB=448): `_GEMV_MR 4→8` (8 accs feed both
+        FMA ports, 10/16 ymm, no spill; MR=10/12 spill+regress), `_GEMVN_RB 192→64` (with MR=8 the
+        sequential-streaming panel path beats strided row-block for all n≥96, so route mid-n to it;
+        row-block only wins n≤64 where panel's m<mr all-masked tail dominates). galen real public gemvN
+        median: n=64 1.09→1.44, **128 0.91→0.98, 256 0.91→1.04**, 512 0.92→0.94, 1024 0.98→1.03,
+        2048 1.03→1.07. Correctness nfail=0 over m,n∈{1..513}×{1..512}, s/d, α≠1, β≠0. **ONLY n=512
+        remains** (0.93 median, min 0.91/max 0.97 — L3-bandwidth ceiling, A=2MB; a single-size ceiling
+        like zgemm's registers / potrf's serial dep).
+      - **iamax — NOT a real fail (measurement noise).** Cached plots showed n=3000 0.912; re-measured
+        median 0.994 with ±40% per-round variance (min 0.55/max 1.3) — alignment-sensitive reduction,
+        at parity in expectation. Kernel is fine; the plots.jl median-of-20 fabricates the red.
+      - **DISPROVEN this session (don't re-try):** (a) **symm n=256 (0.944) via smaller kc** — the
+        n=256 all-straddle-pack (kc=256=n → every M-block crosses the diagonal → 100% `_pack_A_sym!`)
+        is NOT the bottleneck; kc-parameterized reimpl showed KC 256/192/128 all ~0.93 at n=256, KC≤96
+        WORSE. Gap is inherent packed-gemm efficiency at that shape, no clean lever. (b) **gemvN n=512
+        via α==1 fast path** (`Val{A1}` skipping the per-column `av*` broadcast-multiply) — built +
+        verified correct, but n=512 unmoved (0.936→0.93; the "0.975" leaner-probe reading was a lucky
+        median). Only helped already-passing n=64. Reverted (dead-purpose complexity). (c) **gemvN n=512
+        via software prefetch** (llvmcall `@llvm.prefetch`) — naive per-inner-iteration placement tanked
+        it to ~0.58; prefetch is non-portable + fiddle-tuned, not worth it for one borderline size.
+      - **trmm n=8 (0.842) — public-wrapper dispatch overhead, not the kernel.** `_trmm_small!` called
+        directly at k=8 = 0.999; the `trmm!`→`_trmm!`→`_trmm_left!` chain adds ~16% on a ~50ns 8×8 op.
+        Tiny corner; not chased (would need a tiny-k fast-path in the public entry).
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
