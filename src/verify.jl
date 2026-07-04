@@ -69,6 +69,7 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             asum(bk, xd)
             iamax(bk, xd)
             axpy!(bk, yz, 2.0 + 1.0im, xz)
+            scal!(bk, 2.0 + 1.0im, xz)         # complex scal: interleaved-SIMD (swap-pairs) path
             dot(bk, xz, yz)
             nrm2(bk, xz)                       # complex nrm2/asum now take the SIMD real-reinterpret path
             asum(bk, xz)

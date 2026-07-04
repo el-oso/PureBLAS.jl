@@ -32,7 +32,8 @@
             PureBLAS.nrm2(bk, xd)
             PureBLAS.asum(bk, xd)
             PureBLAS.iamax(bk, xd)
-            PureBLAS.axpy!(bk, yz, 2.0 + 1.0im, xz)   # generic complex path
+            PureBLAS.axpy!(bk, yz, 2.0 + 1.0im, xz)   # axpy/dot: generic complex path
+            PureBLAS.scal!(bk, 2.0 + 1.0im, xz)       # complex scal: interleaved-SIMD (swap-pairs)
             PureBLAS.dot(bk, xz, yz)
             PureBLAS.nrm2(bk, xz)                      # complex nrm2/asum → SIMD real-reinterpret path
             PureBLAS.asum(bk, xz)
