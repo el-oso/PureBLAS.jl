@@ -381,7 +381,7 @@ function _chol_hyb_f64!(M, n::Int, base::Int)
     return M
 end
 
-function _potrf_f64_lower!(A::StridedMatrix{Float64}, base::Int = _CHOL_FAER_BASE)
+function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
     n = size(A, 1)
     n == 0 && return A
     if _chol_needs_pad(A, n)                      # factor in a non-conflicting (ld = n+8) scratch, copy back
@@ -412,7 +412,7 @@ end
 function potrf!(A::AbstractMatrix; uplo::Char = 'L')
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potrf!: A must be square"))
-    if uplo == 'L' && A isa StridedMatrix{Float64} && stride(A, 1) == 1
+    if uplo == 'L' && _strided1(A) && eltype(A) === Float64
         return _potrf_f64_lower!(A)
     end
     uplo == 'L' ? _potrf_lower!(A, n) : _potrf_upper!(A, n)

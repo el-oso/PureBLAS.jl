@@ -81,7 +81,7 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Ma
     end
     return V, Tm, G, Wb, Yb
 end
-function geqrf!(A::StridedMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
+function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))

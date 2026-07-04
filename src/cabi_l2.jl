@@ -11,10 +11,12 @@
 # real-SIMD fast paths (which gate on `x isa StridedVector`) fall through to the generic scalar loop;
 # that is correct for all s/d/c/z (only the SIMD micro-opt is skipped at this boundary).
 
-# Ptr→matrix bridge: unsafe_wrap the (ld × nc) column-major buffer, view the top-left nr×nc operand
-# (StridedMatrix, stride(1)==1). Non-owning, trim-safe, 0-alloc (the header doesn't escape the kernel).
+# Ptr→matrix bridge: isbits `PtrMatrix` (ptr, nr, nc, ld) — stride(1)==1, stride(2)==ld dense operand.
+# Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). Vector args
+# (x/y) stay raw Ptr, so the real-SIMD L2 paths gate off (StridedVector) and take the generic loop —
+# which indexes PtrMatrix via unsafe_load, still 0-alloc.
 @inline function _cabi_mat(p::Ptr{T}, ld::Int64, nr::Int64, nc::Int64) where {T}
-    return view(unsafe_wrap(Array, p, (Int(ld), Int(nc))), 1:Int(nr), 1:Int(nc))
+    return PtrMatrix(p, Int(nr), Int(nc), Int(ld))
 end
 
 # ── gemv: y := α·op(A)·x + β·y  (1 char: trans) ──────────────────────────────────────────────────

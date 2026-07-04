@@ -5,6 +5,7 @@ module PureBLAS
 # and as a libblastrampoline drop-in (juliac --trim → libpureblas.so). See ROADMAP.md for L2/L3.
 
 include("core.jl")          # type aliases, _ld/_st! accessors, lassq, |·|
+include("ptrmat.jl")        # PtrMatrix/PtrVector: isbits Ptr-backed operands for the C-ABI boundary
 include("cpuinfo.jl")       # SIMD width detection (const-folded, trim-safe)
 include("simd_kernels.jl")  # SIMD.jl fast paths (real, unit-stride, dense)
 include("level1.jl")        # low-level (n,…,inc) kernels — shared by both modes

@@ -25,7 +25,7 @@ for (p, T) in (("s", Float32), ("d", Float64))
             info::Ptr{Int64}, len_uplo::Clong)::Cvoid
         ul = _cabi_char(uplo)
         N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-        Av = view(unsafe_wrap(Array, A, (ld, N)), 1:N, 1:N)
+        Av = PtrMatrix(A, N, N, ld)
         try
             potrf!(Av; uplo = ul)
             unsafe_store!(info, Int64(0))
@@ -43,8 +43,8 @@ end
 Base.@ccallable function dgetrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
         ipiv::Ptr{Int64}, info::Ptr{Int64})::Cvoid
     M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-    Av = view(unsafe_wrap(Array, A, (ld, N)), 1:M, 1:N)
-    ip = unsafe_wrap(Array, ipiv, min(M, N))
+    Av = PtrMatrix(A, M, N, ld)
+    ip = PtrVector(ipiv, min(M, N))
     _, _, inf = getrf!(Av, ip)
     unsafe_store!(info, Int64(inf))
     return
@@ -60,8 +60,8 @@ Base.@ccallable function dgeqrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64
         unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
     end
     M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-    Av = view(unsafe_wrap(Array, A, (ld, N)), 1:M, 1:N)
-    tv = unsafe_wrap(Array, tau, min(M, N))
+    Av = PtrMatrix(A, M, N, ld)
+    tv = PtrVector(tau, min(M, N))
     geqrf!(Av, tv)
     unsafe_store!(info, Int64(0))
     return
@@ -97,28 +97,28 @@ Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{
         unsafe_store!(info, Int64(-1)); return
     end
     ld = Int(unsafe_load(lda))
-    Av = view(unsafe_wrap(Array, A, (ld, N)), 1:M, 1:N)
+    Av = PtrMatrix(A, M, N, ld)
     if ju == 'N' && jvt == 'N'
         Sc = _gesvd_vals!(Av)
-        copyto!(unsafe_wrap(Array, S, mn), Sc)
+        copyto!(PtrVector(S, mn), Sc)
         unsafe_store!(info, Int64(0)); return
     end
     full_u = ju == 'A' && M > N                         # extra m−n complement columns needed
     full_v = jvt == 'A' && N > M                        # extra n−m complement rows needed
     Uc, Sc, Vtc = _gesvd_full!(Av; full_u = full_u, full_v = full_v)  # Uc: M×ncu, Vtc: ncv×N
-    copyto!(unsafe_wrap(Array, S, mn), Sc)
+    copyto!(PtrVector(S, mn), Sc)
     if ju == 'O'                                       # economy U columns overwrite A
         @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Uc[i, j]; end
     elseif ju != 'N'                                   # 'S' → M×mn, 'A' → M×M
         ncu = ju == 'A' ? M : mn
-        Uw = view(unsafe_wrap(Array, U, (Int(unsafe_load(ldu)), ncu)), 1:M, 1:ncu)
+        Uw = PtrMatrix(U, M, ncu, Int(unsafe_load(ldu)))
         copyto!(Uw, Uc)
     end
     if jvt == 'O'                                      # economy Vᵀ rows overwrite A
         @inbounds for j in 1:N, i in 1:mn; Av[i, j] = Vtc[i, j]; end
     elseif jvt != 'N'                                  # 'S' → mn×N, 'A' → N×N
         ncv = jvt == 'A' ? N : mn
-        Vw = view(unsafe_wrap(Array, VT, (Int(unsafe_load(ldvt)), N)), 1:ncv, 1:N)
+        Vw = PtrMatrix(VT, ncv, N, Int(unsafe_load(ldvt)))
         copyto!(Vw, Vtc)
     end
     unsafe_store!(info, Int64(0))
