@@ -81,10 +81,10 @@ end
     return b >= 0x61 ? Char(b - 0x20) : Char(b)
 end
 
-# Pointer→matrix bridge: unsafe_wrap the (ld × stored_cols) column-major buffer (own=false, non-owning
-# header), then view the top-left stored_rows×stored_cols operand. The view is a StridedMatrix with
-# stride(1)==1, stride(2)==ld — exactly what gemm!'s fast path wants. Trim-safe and (measured) 0-alloc:
-# the Array headers + SubArrays don't escape gemm!, so they stack-allocate.
+# Pointer→matrix bridge: wrap each operand as an isbits `PtrMatrix` (ptr, rows, cols, ld) — a
+# stride(1)==1, stride(2)==ld dense-column operand, exactly what gemm!'s `_strided1` fast path wants.
+# Trim-safe and 0-alloc: PtrMatrix is isbits, so it passes BY VALUE into the non-inlined pack/driver
+# kernels with no heap box (the SubArray-of-unsafe_wrap bridge it replaces cost ~384 B/call).
 @inline function _gemm_cabi!(transa::Ptr{UInt8}, transb::Ptr{UInt8}, m::Int64, n::Int64, k::Int64,
         alpha::T, A::Ptr{T}, lda::Int64, B::Ptr{T}, ldb::Int64,
         beta::T, C::Ptr{T}, ldc::Int64) where {T}
@@ -92,9 +92,9 @@ end
     trA = ta != 'N'; trB = tb != 'N'
     Arows = trA ? k : m; Acols = trA ? m : k    # op(A)=Aᵀ ⇒ A stored k×m; op(A)=A ⇒ m×k
     Brows = trB ? n : k; Bcols = trB ? k : n
-    Am = view(unsafe_wrap(Array, A, (Int(lda), Int(Acols))), 1:Int(Arows), 1:Int(Acols))
-    Bm = view(unsafe_wrap(Array, B, (Int(ldb), Int(Bcols))), 1:Int(Brows), 1:Int(Bcols))
-    Cm = view(unsafe_wrap(Array, C, (Int(ldc), Int(n))),     1:Int(m),     1:Int(n))
+    Am = PtrMatrix(A, Int(Arows), Int(Acols), Int(lda))
+    Bm = PtrMatrix(B, Int(Brows), Int(Bcols), Int(ldb))
+    Cm = PtrMatrix(C, Int(m), Int(n), Int(ldc))
     # Call the @inline dispatch core directly (not the public kwarg `gemm!`): the kwarg entry boxes
     # its keyword args (measured +64 B), and the hot L3 D&C path already routes through _gemm_core!.
     _gemm_core!(Cm, Am, Bm, alpha, beta, trA, trB, ta == 'C', tb == 'C')

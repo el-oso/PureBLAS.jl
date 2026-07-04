@@ -235,14 +235,14 @@ function _trmm_right_base!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, 
 end
 # B[:,j] *= s   and   B[:,j] += a·B[:,i]  on contiguous columns (SIMD where eligible).
 @inline function _scal_col!(B, j, s, m)
-    if B isa StridedMatrix && stride(B, 1) == 1 && eltype(B) <: BlasReal
+    if _strided1(B) && eltype(B) <: BlasReal
         GC.@preserve B (_scal_simd_ptr!(pointer(B) + (j - 1) * stride(B, 2) * sizeof(eltype(B)), m, s))
     else
         @inbounds for r in 1:m; B[r, j] *= s; end
     end
 end
 @inline function _axpy_col!(B, j, a, i, m)
-    if B isa StridedMatrix && stride(B, 1) == 1 && eltype(B) <: BlasReal
+    if _strided1(B) && eltype(B) <: BlasReal
         T = eltype(B); sz = sizeof(T); ldb = stride(B, 2)
         GC.@preserve B _axpy_simd!(m, T(a), pointer(B) + (i - 1) * ldb * sz, pointer(B) + (j - 1) * ldb * sz)
     else
@@ -356,7 +356,7 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                                     _trmm_small!(false, up, tr, unit, A, B)
-    elseif B isa StridedMatrix{Float64} && stride(B, 1) == 1 && !cj && k > _TRMM_RPACK
+    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _TRMM_RPACK
         return _trmm_packedR!(up, tr, unit, A, B, Float64)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
@@ -432,8 +432,17 @@ function _trmm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::N
     return B
 end
 @inline function _scal_all!(B, α)
-    if B isa StridedMatrix && stride(B, 1) == 1
-        GC.@preserve B _scal!(length(B), convert(eltype(B), α), pointer(B), 1)
+    if _strided1(B)
+        αT = convert(eltype(B), α); m = size(B, 1); n = size(B, 2); ld = stride(B, 2)
+        GC.@preserve B begin
+            p = pointer(B)
+            if ld == m
+                _scal!(m * n, αT, p, 1)                        # fully contiguous — one shot
+            else                                               # padded ld: scale each column (skip the gap)
+                sz = sizeof(eltype(B))
+                for j in 0:(n - 1); _scal!(m, αT, p + j * ld * sz, 1); end
+            end
+        end
     else
         B .*= α
     end
@@ -444,7 +453,7 @@ end
 # (off-diagonal panels are fully stored → plain _pack_A!, fully-zero panels are skipped by the driver).
 function _pack_A_tri!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bool, unit::Bool,
         packed_upper::Bool, alpha::T, mr::Int) where {T}
-    if !tA && A isa StridedMatrix{T} && stride(A, 1) == 1 && T <: BlasReal
+    if !tA && _strided1(A) && T <: BlasReal
         return _pack_A_tri_simd!(Ap, A, ic, pc, mce, kce, unit, packed_upper, alpha, mr)
     end
     np = cld(mce, mr)
@@ -909,7 +918,7 @@ function trsm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
         return sl ? _trsm_dense_L!(up, tr, unit, A, B) : _trsm_dense_R!(up, tr, unit, A, B)
     end
     if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
-       A isa StridedMatrix && stride(A, 1) == 1 && _badld(stride(A, 2))
+       _strided1(A) && _badld(stride(A, 2))
         Apad = _l3_apad(eltype(B), k); copyto!(Apad, A)
         _trsm!(sl, uplo == 'U', transA != 'N', false, diag == 'U', alpha, Apad, B)
     else

@@ -10,11 +10,11 @@
 # (~384 B/call) that dominates the Mode-1 boundary anyway (per task note). The redundant dimension
 # checks the public ops run are cheap and 0-alloc.
 
-# Pointer→matrix bridge (as in _gemm_cabi!): non-owning column-major wrap of the (ld×nc) buffer,
-# viewed to the top-left nr×nc operand → a stride(1)==1, stride(2)==ld StridedMatrix. Trim-safe,
-# 0-alloc (the headers don't escape the op).
-@inline _l3wrap(p::Ptr{T}, ld, nr, nc) where {T} =
-    view(unsafe_wrap(Array, p, (Int(ld), Int(nc))), 1:Int(nr), 1:Int(nc))
+# Pointer→matrix bridge (as in _gemm_cabi!): isbits `PtrMatrix` (ptr, nr, nc, ld) — a stride(1)==1,
+# stride(2)==ld dense operand. Trim-safe, 0-alloc (isbits ⇒ passes by value with no heap box). Its
+# sub-views (the recursive L3 blocking uses view(A, :, r) etc.) stay PtrMatrix, so the recursion leaves
+# still hit the vectorized gemm/trsm fast paths.
+@inline _l3wrap(p::Ptr{T}, ld, nr, nc) where {T} = PtrMatrix(p, Int(nr), Int(nc), Int(ld))
 
 # ── symm / hemm: (side,uplo, m,n, α, A,lda, B,ldb, β, C,ldc) + 2 trailing Clongs ────────────────
 # C(m×n) := α·A·B + β·C (side L, A m×m) or α·B·A + β·C (side R, A n×n); only `uplo` triangle of A.

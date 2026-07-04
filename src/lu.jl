@@ -162,7 +162,7 @@ const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # which over-decomposes into many small gemm! calls). Factor each nb-panel (getf2), swap the rest of the
 # rows (laswp), solve the row panel (trsm, L11⁻¹·A12), downdate the trailing (gemm, A22 −= L21·U12).
 # The cheap unblocked panel + ONE big rank-nb trailing gemm per step is the win. Returns (A, ipiv, info).
-function getrf!(A::StridedMatrix{Float64}, ipiv::Vector{Int}; nb::Int = _LU_NB)
+function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB)
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))

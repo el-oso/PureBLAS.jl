@@ -22,7 +22,7 @@ end
 @inline function _l2_simd_ok(A, x, y, incx::Integer, incy::Integer)
     T = eltype(A)
     return incx == 1 && incy == 1 && T <: BlasReal && eltype(x) === T && eltype(y) === T &&
-        A isa StridedMatrix && stride(A, 1) == 1 &&
+        _strided1(A) &&
         x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
 end
 
@@ -535,7 +535,7 @@ end
 @inline function _l2v_simd_ok(A, x, incx::Integer)
     T = eltype(A)
     return incx == 1 && T <: BlasReal && eltype(x) === T &&
-        A isa StridedMatrix && stride(A, 1) == 1 && x isa StridedVector && stride(x, 1) == 1
+        _strided1(A) && x isa StridedVector && stride(x, 1) == 1
 end
 
 @inline function _trmv_simd!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)

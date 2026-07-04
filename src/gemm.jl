@@ -172,7 +172,7 @@ end
 # segment of A, so pack = vector load + scale + vector store. The scalar packing was the measured
 # large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). Partial last panel
 # (zero-padded) stays scalar.
-@inline function _pack_A_simd!(Ap::AbstractVector{T}, A::StridedMatrix{T}, ic::Int, pc::Int, mce::Int,
+@inline function _pack_A_simd!(Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int,
         kce::Int, alpha::T, mr::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2)
     np = cld(mce, mr)
@@ -238,7 +238,7 @@ end
 # A[gp,gi] would need A's ROWS (strided) — the old scalar fallback. Instead read W contiguous A-columns
 # (op(A) rows), W contraction-rows at a time, transpose the W×W register block, and store the transposed
 # rows into Ap. Partial panels / contraction tail stay scalar (zero-padded).
-@inline function _pack_A_simd_T!(Ap::Vector{T}, A::StridedMatrix{T}, ic::Int, pc::Int, mce::Int,
+@inline function _pack_A_simd_T!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int,
         kce::Int, alpha::T, mr::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2)
     np = cld(mce, mr); kfull = (kce ÷ W) * W; sub = mr ÷ W
@@ -276,7 +276,7 @@ end
 
 # Transpose A (k×m, the transA='T' operand) into `At` (m×k, column-major) via the W×W SIMD block
 # transpose — so the unpacked microkernel can run it as a plain N·N product (no B-packing). At[i,p]=A[p,i].
-@inline function _transpose_dense!(At::Vector{T}, A::StridedMatrix{T}, m::Int, k::Int) where {T}
+@inline function _transpose_dense!(At::Vector{T}, A, m::Int, k::Int) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); ov = Vec{W, T}(one(T))
     mfull = (m ÷ W) * W; kfull = (k ÷ W) * W
     GC.@preserve A At begin
@@ -304,10 +304,10 @@ end
 
 # Pack a mc_eff×kc_eff block of op(A) into mr-row panels (zero-padded), scaling by alpha.
 function _pack_A!(Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, tA::Bool, alpha::T, mr::Int) where {T}
-    if !tA && A isa StridedMatrix{T} && stride(A, 1) == 1
+    if !tA && _strided1(A)
         return _pack_A_simd!(Ap, A, ic, pc, mce, kce, alpha, mr)
     end
-    if tA && A isa StridedMatrix{T} && stride(A, 1) == 1 && T <: BlasReal && mr % _vwidth(T) == 0
+    if tA && _strided1(A) && T <: BlasReal && mr % _vwidth(T) == 0
         return _pack_A_simd_T!(Ap, A, ic, pc, mce, kce, alpha, mr)
     end
     np = cld(mce, mr)
@@ -785,7 +785,7 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 12 : 
 # so the microkernel indexes both identically). No alpha (folded at store), no conj (kernel sign).
 function _pack_A_cmplx!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
         tA::Bool, mr::Int) where {T}
-    if !tA && A isa StridedMatrix && stride(A, 1) == 1     # contiguous columns → vectorized deinterleave
+    if !tA && _strided1(A)     # contiguous columns → vectorized deinterleave
         return _pack_A_cmplx_simd!(ApR, ApI, A, ic, pc, mce, kce, mr)
     end
     np = cld(mce, mr)
@@ -1031,7 +1031,7 @@ end
 
 # Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
 # column, deinterleave → real panel ApR / imag panel ApI. Partial last panel stays scalar (zero-pad).
-function _pack_A_cmplx_simd!(ApR::Vector{T}, ApI::Vector{T}, A::StridedMatrix, ic::Int, pc::Int,
+function _pack_A_cmplx_simd!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int,
         mce::Int, kce::Int, mr::Int) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); np = cld(mce, mr)
     GC.@preserve A ApR ApI begin
@@ -1216,8 +1216,7 @@ function _gemm_tiny_v!(C, A, B, alpha::T, beta::T, ::Val{TA}, ::Val{TB}, m::Int,
     return C
 end
 @inline function _gemm_tiny!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int) where {T}
-    if !tA && T <: BlasReal && A isa StridedMatrix{T} && B isa StridedMatrix{T} &&
-       stride(A, 1) == 1 && m <= _vwidth(T)
+    if !tA && T <: BlasReal && _strided1(A) && _strided1(B) && m <= _vwidth(T)
         return _gemm_tiny_vec!(C, A, B, alpha, beta, tB, m, n, k)
     end
     if tA
@@ -1231,12 +1230,11 @@ end
 end
 @inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
-    if T <: BlasReal && C isa StridedMatrix && stride(C, 1) == 1
+    if T <: BlasReal && _strided1(C)
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
-        if A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
-                stride(B, 1) == 1 && _use_unpacked(m, n, k)
+        if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
             if !tA
                 _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
                     m, n, k, alpha, A, B, beta, C)
@@ -1250,9 +1248,8 @@ end
         else
             _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
         end
-    elseif T <: BlasComplex && C isa StridedMatrix && stride(C, 1) == 1 && max(m, n, k) > _CGEMM_TINY
-        if !tA && A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 &&
-                stride(B, 1) == 1 && max(m, n, k) <= _CGEMM_UNPACK_MAX
+    elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _CGEMM_TINY
+        if !tA && _strided1(A) && _strided1(B) && max(m, n, k) <= _CGEMM_UNPACK_MAX
             _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, A, B, beta, C)
         else
             _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
