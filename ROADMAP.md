@@ -65,6 +65,23 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       0.68 (small-n n≤256; large-n gates), symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk
       small-n + trsm small-n gate). L2 gemvN / gbmvN **now done** (phase 1, see below). This is the Zen3
       analogue of the wintermute small-n grind — a multi-op campaign.
+    - **UPDATE 2026-07-04 (autonomous) — re-measured galen (AVX2, boost OFF) + syrk/syr2k FIXED.** The
+      2026-07-02 numbers above were partly stale (many lifted by the width-adaptive gemm/L3 landings +
+      the const-dispatch workspace). CURRENT measured small-n gate state (bench/smalln_probe.jl, taskset
+      -c 8): trmm ALL gate (1.06–1.25); getrf ALL gate; syr2k n≤128 gate. **syrk n=64/128/256 (0.83/0.94/
+      0.94) + syr2k n=256 (0.92) were still LOW → NOW FIXED** (commit 947336d): the single-product tri
+      multi-pack `_trgemm_packed!` used the gemm row-tile MR=3 (mr=12); at n not divisible by 12 the last
+      row-panel is zero-padded → wasted flops. Width-adaptive `_tri_mr(T)=W==4 ? 2 : _MR` (mr=8 divides
+      64/96/128/192/256, 8 accs ample ILP) → syrk/syr2k gate the WHOLE AVX2 range (MR2 ≥ MR3 at every
+      n=64..2048, exact correctness, no large-n regression; AVX-512 bit-identical). Knob "syrk_mr".
+      **DISPROVEN this round (don't re-try): power-of-2 leading-dim padding of A/C for small-n syrk — made
+      it WORSE** (the gap was mr-divisibility, not ld-thrash; verified by the n%12==0 sizes 48/96/192
+      already gating). **STILL OPEN on AVX2 (the real remaining grind):** trsm n=32/64 (**0.787** — the
+      `_trsm_dense_L!` per-column rank-1 base: serial dependency + shrinking vector length, hard to beat
+      OB small-n); potrf n=128/256 (**~0.87** — its faer base kernel's fused syrk is a 3×4=12-acc tile
+      sized for AVX-512; the Zen3 analogue of the syrk fix likely applies but the kernel is in lapack.jl
+      and more involved). trsm large-n + potrf n≥512 gate. NEXT: trsm dense-base and/or faer-potrf base
+      register-blocking for W=4.
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
