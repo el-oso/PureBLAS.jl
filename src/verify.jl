@@ -70,7 +70,8 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             iamax(bk, xd)
             axpy!(bk, yz, 2.0 + 1.0im, xz)
             scal!(bk, 2.0 + 1.0im, xz)         # complex scal: interleaved-SIMD (swap-pairs) path
-            dot(bk, xz, yz)
+            dot(bk, xz, yz)                     # complex dot/dotu: split-deinterleave SIMD reduction
+            dotu(bk, xz, yz)
             nrm2(bk, xz)                       # complex nrm2/asum now take the SIMD real-reinterpret path
             asum(bk, xz)
             # ── Level 2 (dense hot paths; real + complex)

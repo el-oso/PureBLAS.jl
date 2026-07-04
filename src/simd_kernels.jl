@@ -25,6 +25,9 @@ using SIMD: Vec, vload, vstore, vifelse, shufflevector
 @inline _cplx_re(@nospecialize(_)) = false
 @inline _reptr(x::Ptr{Complex{T}}) where {T<:BlasReal} = Ptr{T}(x)
 @inline _reptr(x::DenseArray{Complex{T}}) where {T<:BlasReal} = Ptr{T}(pointer(x))
+const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
+@inline _cplx2(::_CplxArg{T}, ::_CplxArg{T}) where {T<:BlasReal} = true      # both complex, same real T
+@inline _cplx2(@nospecialize(_), @nospecialize(_)) = false
 
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)
@@ -118,6 +121,89 @@ end
             end
         end
         return x
+    end
+end
+
+# Complex axpy: y .+= (alr + i·ali)·x. Same swap-pairs complex-multiply of x as scal, then add into y.
+# One shuffle/vector, 4× unrolled (bandwidth-bound: reads x+y, writes y). `n` counts COMPLEX elements.
+@generated function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T<:BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))
+    quote
+        px = _reptr(x); py = _reptr(y); arv = $V2(alr); sv = $sgn; step = 4 * $W
+        GC.@preserve x y begin
+            i = 0
+            while i + step <= n
+                @inbounds for u in 0:3
+                    o = (i + u * $W) * 2 * $sz; xv = vload($V2, px + o)
+                    ax = muladd(shufflevector(xv, Val($swp)), sv, xv * arv)   # a·x
+                    vstore(vload($V2, py + o) + ax, py + o)                    # y += a·x
+                end
+                i += step
+            end
+            while i + $W <= n
+                o = i * 2 * $sz; xv = vload($V2, px + o)
+                ax = muladd(shufflevector(xv, Val($swp)), sv, xv * arv)
+                vstore(vload($V2, py + o) + ax, py + o); i += $W
+            end
+            while i < n
+                j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j)
+                unsafe_store!(py, unsafe_load(py, 2j - 1) + alr * xr - ali * xi, 2j - 1)
+                unsafe_store!(py, unsafe_load(py, 2j) + alr * xi + ali * xr, 2j)
+                i += 1
+            end
+        end
+        return y
+    end
+end
+
+# Complex dot: Σ (CJ ? conj(xᵢ) : xᵢ)·yᵢ. NO per-iteration deinterleave (too many shuffles on AVX2 — cost
+# dotu 0.70 there). Instead accumulate two INTERLEAVED products: p = Σ x·y = [Σxr·yr, Σxi·yi, …] and
+# q = Σ x·swap(y) = [Σxr·yi, Σxi·yr, …] — ONE shuffle (swap y) + 2 FMAs/iter, identical for dotu/dotc.
+# Deinterleave only the 2 accumulators ONCE at the end; CJ flips two combine signs. 4× unrolled for the
+# FMA-reduction latency. Returns Complex{T}. `n` counts COMPLEX elements.
+@generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T<:BlasReal, CJ}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    ps = [Symbol(:p, u) for u in 0:3]; qs = [Symbol(:q, u) for u in 0:3]
+    init = Expr(:block, (:( $(ps[u+1]) = zero($V2); $(qs[u+1]) = zero($V2) ) for u in 0:3)...)
+    body = Expr(:block)
+    for u in 0:3
+        o = :((i + $u * $W) * 2 * $sz)
+        push!(body.args, quote
+            xv = vload($V2, px + $o); yv = vload($V2, py + $o)
+            $(ps[u+1]) = muladd(xv, yv, $(ps[u+1])); $(qs[u+1]) = muladd(xv, shufflevector(yv, Val($swp)), $(qs[u+1]))
+        end)
+    end
+    quote
+        px = _reptr(x); py = _reptr(y); step = 4 * $W
+        $init
+        GC.@preserve x y begin
+            i = 0
+            while i + step <= n
+                @inbounds begin $body end
+                i += step
+            end
+            while i + $W <= n
+                @inbounds begin
+                    xv = vload($V2, px + i * 2 * $sz); yv = vload($V2, py + i * 2 * $sz)
+                    p0 = muladd(xv, yv, p0); q0 = muladd(xv, shufflevector(yv, Val($swp)), q0)
+                end
+                i += $W
+            end
+            pr, pi = _deint_cmplx((p0 + p1) + (p2 + p3))       # pr = Σxr·yr, pi = Σxi·yi
+            qr, qi = _deint_cmplx((q0 + q1) + (q2 + q3))       # qr = Σxr·yi, qi = Σxi·yr
+            # dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr ;  dotc (conj x): signs of the xi terms flip
+            sr = sum(pr) + $(CJ ? :(sum(pi)) : :(-sum(pi)))
+            si = sum(qr) + $(CJ ? :(-sum(qi)) : :(sum(qi)))
+            @inbounds while i < n
+                j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j); yr = unsafe_load(py, 2j - 1); yi = unsafe_load(py, 2j)
+                sr += xr * yr + $(CJ ? :(xi * yi) : :(-xi * yi)); si += xr * yi + $(CJ ? :(-xi * yr) : :(xi * yr))
+                i += 1
+            end
+            return Complex{$T}(sr, si)
+        end
     end
 end
 
