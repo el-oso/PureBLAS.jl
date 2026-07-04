@@ -689,6 +689,26 @@ in-place dependency-ordered), syr2k's transpose identity (one gemm instead of tw
 + per-column pad copies, `@simd ivdep` pack_B (a wide-vload transpose pack DISPROVEN: −25% geqrf via
 store-forwarding stalls), packed single-pass trmm-R (`_trmm_packedR!`).
 
+## Fleet-gate certification — 3 boxes, per-µarch (2026-07-04) ✅
+
+The per-machine gate (Zen4 dev + Zen3 AVX2 + **Zen5 native AVX-512, added 2026-07-04**) is now certified at
+locked freq (boost off). **Finding: the residual profiles are DISJOINT across µarch — tuning does not
+transfer, which is exactly why the gate is per-machine.** Full `plots.jl bench` on each; caches
+`bench/plots_data_<host>.txt`, per-ISA SVGs.
+
+- **wintermute (Zen4 mobile, AVX-512 double-pumped 256-bit):** all-green bar small-n 7640U-noise dips.
+- **galen (Zen3, AVX2):** all-green except documented ceilings — potrf po2-conflict (0.88–0.95; the copy is
+  the gap, `d61b332` lower-triangle pad-copy cleared n=2048 & lifted the rest), trmm n=8 (materialize
+  tiny-kernel wall), zgemm 0.95–0.958 (16-reg tile), gemvN-512 0.94 (L3 bandwidth), iamax addr-noise.
+- **neuromancer (Zen5, native AVX-512):** clears EVERY AVX2 ceiling (potrf 1.40, zgemm 1.14, trmm 1.09,
+  trsm 1.65) but surfaces NEW L2 gaps: **ger n=2048/4096 = 0.71/0.82** (write-bandwidth-bound — likely OB
+  non-temporal stores vs our cached writes; reproduced tight on a quiet box, REAL), gemvN-256 0.87, gemm-32
+  0.91, symm-256 0.94. Correctness bit-exact (gemm 0, potrf 2.8e-14, zgemm 7.6e-16). Detection auto-adapts
+  (W=8, `_INTEL_AVX2=false`). **Next AVX-512-AMD residual pass = ger-first** (its own campaign; the AVX2
+  campaign does not carry over). See memory `fleet-gate-snapshot-locked`.
+
+This satisfies M7's stated prerequisite ("start after the Zen3/Zen5 fleet gate runs").
+
 ## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
 
 Parallelize the gemm jj-loop, threshold-gated (small sizes stay serial). Per-host tuning. This is
