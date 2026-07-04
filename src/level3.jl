@@ -1112,9 +1112,9 @@ end
 # into the packed A by _pack_A!. C's stored triangle must be β-pre-scaled by the caller.
 # General triangular-C gemm: C[uplo-triangle] += α·op(X)·op(Y) (X→A-operand, Y→B-operand), n×n result.
 # The reusable core behind syrk (Y=X) and syr2k (two passes). Real only; α folded into packed X.
-function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
-        ::Val{OV} = Val(false)) where {T<:BlasReal, OV}
-    n = size(C, 1); W = _vwidth(T); mr = _MR * W; nr = _NR
+function _trgemm_packed!(::Val{MR}, ::Val{NR}, up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
+        ::Val{OV} = Val(false)) where {T<:BlasReal, MR, NR, OV}
+    n = size(C, 1); W = _vwidth(T); mr = MR * W; nr = NR
     kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
@@ -1144,14 +1144,14 @@ function _trgemm_packed!(up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
                                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                                 if full && mre == mr && nre == nr
-                                    b0 ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
-                                         _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
+                                    b0 ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(true)) :
+                                         _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(false))
                                 elseif full
-                                    b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
-                                         _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
+                                    b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(true)) :
+                                         _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(false))
                                 else
-                                    b0 ? _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(_MR), Val(_NR), Val(true)) :
-                                         _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(_MR), Val(_NR), Val(false))
+                                    b0 ? _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(MR), Val(NR), Val(true)) :
+                                         _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(MR), Val(NR), Val(false))
                                 end
                             end
                             ir += mr
@@ -1181,10 +1181,17 @@ end
 # single-pack halves that traffic and wins for small n, but is latency-starved (W=4 accs) at larger n
 # (n=128 unified 0.73 vs multi 1.02) — so cap it low. AVX-512 uses unified everywhere (_unified_ok).
 const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) == 4 ? 48 : 0)::Int
+# Single-product triangular multi-pack row-tile MR. On AVX2 (W=4) the 12-acc gemm tile (MR=_MR=3) zero-pads
+# the remainder row-panel at n not divisible by 12 → small/mid-n syrk/syr2k below gate (n=64 0.81, 128 0.94,
+# 256 0.92 measured galen). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
+# single-product tri kernel → gates the whole AVX2 range (MR2 ≥ MR3 at every n=64..2048, exact correctness).
+# Width-conditional: only F64/AVX2 (W=4); F32/AVX2 and all of AVX-512 keep _MR. Knob "syrk_mr".
+const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
+@inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T<:BlasReal} =
     (_unified_ok(T) || size(C, 1) <= _SYRK_UNIFIED_MAX) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
-        _trgemm_packed!(up, α, A, tr, A, !tr, C, k)
+        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
 
 # The fused two-product syr2k driver's four-buffer scratch (two A-packs, two B-packs) is the per-type
 # L3Workspace `s2` field — `_syr2k_scratch(T, lenA, lenB)` grows and returns it (see src/workspace.jl).
@@ -1390,9 +1397,9 @@ const _SYR2K_2PASS = @load_preference("syr2k_2pass", _vwidth(Float64) == 4 ? 128
         β0 || _syrk_scaleC!(C, up, β)      # β≠0: pre-scale; β=0: pass 1 overwrites (Val(true))
         X1, tX1, Y1, tY1, X2, tX2, Y2, tY2 = tr ? (A, true, Bm, false, Bm, true, A, false) :
                                                   (A, false, Bm, true, Bm, false, A, true)
-        β0 ? _trgemm_packed!(up, α, X1, tX1, Y1, tY1, C, k, Val(true)) :
-             _trgemm_packed!(up, α, X1, tX1, Y1, tY1, C, k, Val(false))
-        _trgemm_packed!(up, α, X2, tX2, Y2, tY2, C, k)
+        β0 ? _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(true)) :
+             _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(false))
+        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X2, tX2, Y2, tY2, C, k)
         return C
     end
     β0 = iszero(β)
