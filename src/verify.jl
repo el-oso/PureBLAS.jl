@@ -22,6 +22,9 @@ _strict_potrf_probe(bk, Aw, Apd) = (copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L')
 # dynamically-dispatched call would add. Return nothing so the (A,ipiv,info)/(A,τ) tuple never escapes.
 _strict_getrf_probe(Gw, G0, ipiv) = (copyto!(Gw, G0); getrf!(Gw, ipiv); nothing)
 _strict_geqrf_probe(Gw, G0, tau) = (copyto!(Gw, G0); geqrf!(Gw, tau); nothing)
+# gesvd! is 0-alloc through its IN-PLACE form (caller-provided U/S/Vᵀ + a cached SVDWorkspace for the
+# bidiagonalization scratch); the convenience gesvd!(A; want_vectors) allocates the outputs. Re-seed A.
+_strict_gesvd_probe(Gw, G0, U, S, Vt) = (copyto!(Gw, G0); gesvd!(Gw, U, S, Vt); nothing)
 
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
@@ -36,7 +39,9 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
         # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
         kb = 8, APd = ones(m * (m + 1) ÷ 2), APz = ones(ComplexF64, m * (m + 1) ÷ 2),
-        ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m)
+        ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m),
+        # gesvd in-place output buffers (square m×m: U m×m, S m, Vᵀ m×m).
+        Usv = zeros(m, m), Ssv = zeros(m), Vtsv = zeros(m, m)
         # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
         # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
         # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
@@ -51,6 +56,7 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
         copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L')
         copyto!(Aw, Apd); getrf!(Aw, ipiv); copyto!(Aw, Apd); geqrf!(Aw, tau)
+        copyto!(Aw, Apd); gesvd!(Aw, Usv, Ssv, Vtsv)   # warm the cached SVDWorkspace
         @verify_strict SIMDBackend begin
             # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
             axpy!(bk, yd, 2.0, xd)
@@ -99,12 +105,14 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
-            # their in-place pre-allocated-ipiv/τ forms). Via re-seeding probes so repeated @strict calls
+            # their in-place pre-allocated-output forms). Via re-seeding probes so repeated @strict calls
             # always factor a fresh source (potrf would otherwise throw PosDefException on its L-output).
-            # gesvd! is NOT here — it allocates its U/S/Vᵀ outputs (inherent); it stays interface-@verify'd.
+            # All four LAPACK factorizations are strict now: gesvd! reaches 0-alloc via the in-place
+            # gesvd!(A,U,S,Vᵀ) form + a cached SVDWorkspace for the bidiagonalization scratch.
             _strict_potrf_probe(bk, Aw, Apd)
             _strict_getrf_probe(Aw, Apd, ipiv)
             _strict_geqrf_probe(Aw, Apd, tau)
+            _strict_gesvd_probe(Aw, Apd, Usv, Ssv, Vtsv)
         end
     end
 end
