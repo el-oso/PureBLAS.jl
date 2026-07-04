@@ -117,6 +117,22 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       - **trmm n=8 (0.842) — public-wrapper dispatch overhead, not the kernel.** `_trmm_small!` called
         directly at k=8 = 0.999; the `trmm!`→`_trmm!`→`_trmm_left!` chain adds ~16% on a ~50ns 8×8 op.
         Tiny corner; not chased (would need a tiny-k fast-path in the public entry).
+    - **potrf AVX2 decomposition (2026-07-04, session 2) — already well-tuned; no fruit found; TARGET IS
+      HASWELL not Zen3.** Full sub-kernel decomposition on galen (Zen3): the trailing update `syrk!`
+      **beats** OpenBLAS (128=1.03, 256=1.04), panel `trsm!` fine (0.95), faer base-64 excellent (1.30).
+      The gap is the **faer path at n=128 = 0.87** (potrf n=128 IS that path), which degrades from base-64's
+      1.30 because `_chol_rl(128)` splits into bs=64 blocks adding the fused trsm/syrk. **DISPROVEN levers
+      (don't re-try):** (a) `_CHOL_FAER_BASE` crossover sweep — 128 (current) is optimal; 64/96 make n=256
+      WORSE (0.79). (b) raising `_CHOL_THRESHOLD` so n=128 uses the monolithic `_chol_base_f64!` directly —
+      the base kernel is **L1-bound** (base@64=1.30 fits 32KB L1 exactly; base@128=0.53 thrashes L1), so
+      thresh=64 is already optimal, not arbitrary. Residual ~0.83–0.91 is the intrinsic serial small-n
+      Cholesky vs a strong OpenBLAS-on-Zen3 — no single sub-kernel to fix. **Key caveat:** this is all vs
+      *OpenBLAS-on-Zen3*. The user's deployment target is **Haswell** (also AVX2), where OpenBLAS/MKL kernel
+      quality differs; the faer approach hit ~1.8× on **Zen5-AVX2** (likely OpenBLAS under-tuned there), so
+      the Haswell outcome is genuinely **unmeasurable without a Haswell box** and hinges on OpenBLAS/MKL-
+      Haswell. Side experiment: BlazingPorts `cholesky_llt!` as-is is NOT faster (equal on AVX-512, slower
+      on AVX2 — PureBLAS is its tuned descendant). Bench infra: `plots.jl bench mkl` added for the eventual
+      real-Haswell vs-MKL run; docs `performance.md` has a footnoted **Haswell\*** column (AVX2 proxy).
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
