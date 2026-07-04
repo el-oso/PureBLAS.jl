@@ -21,7 +21,7 @@
         bk = PureBLAS.DEFAULT_BACKEND
         n = 1000
         xd = randn(n); yd = randn(n)                          # SIMD fast path
-        xz = randn(ComplexF64, n); yz = randn(ComplexF64, n)  # generic scalar path
+        xz = randn(ComplexF64, n); yz = randn(ComplexF64, n)  # complex: axpy/dot generic; nrm2/asum SIMD
         @verify_strict PureBLAS.SIMDBackend begin
             PureBLAS.axpy!(bk, yd, 2.0, xd)
             PureBLAS.scal!(bk, 2.0, xd)
@@ -34,7 +34,8 @@
             PureBLAS.iamax(bk, xd)
             PureBLAS.axpy!(bk, yz, 2.0 + 1.0im, xz)   # generic complex path
             PureBLAS.dot(bk, xz, yz)
-            PureBLAS.nrm2(bk, xz)
+            PureBLAS.nrm2(bk, xz)                      # complex nrm2/asum → SIMD real-reinterpret path
+            PureBLAS.asum(bk, xz)
         end
         @test true
     end

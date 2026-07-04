@@ -84,6 +84,11 @@ function _nrm2(n::Integer, x, incx::Integer)
         ss = _sumsq_simd(Int(n), x, _et(x))
         (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
         # ss is Inf (overflow) or 0 (all-zero, or underflow of tiny values) → use safe path
+    elseif incx == 1 && _cplx_re(x)
+        GC.@preserve x begin                               # Σ|xᵢ|² over the interleaved 2n-real buffer
+            ss = _sumsq_simd(2 * Int(n), _reptr(x), R)
+            (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
+        end                                                # non-finite/zero → complex lassq fallback below
     end
     scale = zero(R); ssq = one(R)
     ix = _start(n, incx)
@@ -98,6 +103,8 @@ function _asum(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
     (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
+    (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
+        (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
     s = zero(R); ix = _start(n, incx)
     @inbounds for _ in 1:n
         s += _l1(_ld(x, ix)); ix += incx
