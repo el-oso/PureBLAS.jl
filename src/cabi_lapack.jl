@@ -69,16 +69,16 @@ end
 
 # ── gesvd: SVD ──────────────────────────────────────────────────────────────────────────────────────
 # `dgesvd_64_(jobu, jobvt, m, n, A, lda, S, U, ldu, VT, ldvt, work, lwork, info, len_jobu, len_jobvt)`.
-# PureBLAS's SVD internals return FRESH factors (destroying A, as LAPACK gesvd does): _gesvd_vals! → S
-# (min values); _gesvd_full!(full_u,full_v) → (U, S, Vᵀ) as concrete Matrix/Vector. We COPY them into the
-# caller's S/U/VT (or A for 'O') buffers. Both internals have a single concrete return type, so the whole
-# call graph passes juliac --trim=safe (validated by TrimCheck.@validate in test/trim_tests.jl).
+# The in-place gesvd!(A,U,S,Vᵀ) writes the factors DIRECTLY into the caller's buffers (0-alloc; A destroyed
+# as LAPACK gesvd does). The SVD forms BOTH U and Vᵀ regardless of job, so 'N'/'O' — which supply no output
+# buffer, or overwrite A — get an owned economy scratch (SVDWorkspace.cabi_U/cabi_Vt), copied into A for 'O'.
+# Every operand is a PtrMatrix ⇒ one concrete gesvd! specialization ⇒ juliac --trim=safe (TrimCheck).
 #
 # jobu/jobvt COVERAGE (LAPACK dgesvd semantics):
 #   'N' — vectors not computed (skip).
 #   'S' — economy: U is m×min into the U buffer; Vᵀ is min×n into the VT buffer.
 #   'A' — full square: U is m×m; Vᵀ is n×n. When the full factor exceeds economy (jobu='A' & m>n, or
-#         jobvt='A' & n>m) _gesvd_full! forms the extra orthonormal complement (full_u/full_v).
+#         jobvt='A' & n>m) gesvd!'s full_u/full_v forms the extra orthonormal complement.
 #   'O' — overwrite A: jobu='O' writes U's economy columns into A; jobvt='O' writes Vᵀ's economy rows into
 #         A. (LAPACK forbids jobu=jobvt='O' → info=-1.) A is destroyed by the factorization first, then the
 #         fresh vectors are written into it — no aliasing with the returned Matrices.
@@ -98,28 +98,34 @@ Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{
     end
     ld = Int(unsafe_load(lda))
     Av = PtrMatrix(A, M, N, ld)
-    if ju == 'N' && jvt == 'N'
-        Sc = _gesvd_vals!(Av)
-        copyto!(PtrVector(S, mn), Sc)
+    if ju == 'N' && jvt == 'N'                         # values only → 0-alloc into caller's S
+        gesvd_vals!(Av, PtrVector(S, mn))
         unsafe_store!(info, Int64(0)); return
     end
+    # 0-alloc: gesvd! writes U/S/Vᵀ straight into caller buffers. The SVD forms BOTH factors regardless,
+    # so 'N'/'O' (no caller buffer, or overwrite-A) get an owned economy scratch (ws.cabi_U/cabi_Vt); 'O'
+    # is then copied into A. Everything stays a PtrMatrix ⇒ one concrete gesvd! specialization ⇒ trim-safe.
     full_u = ju == 'A' && M > N                         # extra m−n complement columns needed
     full_v = jvt == 'A' && N > M                        # extra n−m complement rows needed
-    Uc, Sc, Vtc = _gesvd_full!(Av; full_u = full_u, full_v = full_v)  # Uc: M×ncu, Vtc: ncv×N
-    copyto!(PtrVector(S, mn), Sc)
-    if ju == 'O'                                       # economy U columns overwrite A
-        @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Uc[i, j]; end
-    elseif ju != 'N'                                   # 'S' → M×mn, 'A' → M×M
-        ncu = ju == 'A' ? M : mn
-        Uw = PtrMatrix(U, M, ncu, Int(unsafe_load(ldu)))
-        copyto!(Uw, Uc)
-    end
-    if jvt == 'O'                                      # economy Vᵀ rows overwrite A
-        @inbounds for j in 1:N, i in 1:mn; Av[i, j] = Vtc[i, j]; end
-    elseif jvt != 'N'                                  # 'S' → mn×N, 'A' → N×N
-        ncv = jvt == 'A' ? N : mn
-        Vw = PtrMatrix(VT, ncv, N, Int(unsafe_load(ldvt)))
-        copyto!(Vw, Vtc)
+    ncu = ju == 'A' ? M : mn
+    ncv = jvt == 'A' ? N : mn
+    ws = _svdws()
+    uscr = ju == 'N' || ju == 'O'                      # need scratch U (economy M×mn)
+    vscr = jvt == 'N' || jvt == 'O'                    # need scratch Vᵀ (economy mn×N)
+    uscr && (ws.cabi_U = _gm(ws.cabi_U, M, mn))
+    vscr && (ws.cabi_Vt = _gm(ws.cabi_Vt, mn, N))
+    GC.@preserve ws begin
+        Ut  = uscr ? PtrMatrix(pointer(ws.cabi_U), M, mn, size(ws.cabi_U, 1)) :
+                     PtrMatrix(U, M, ncu, Int(unsafe_load(ldu)))
+        Vtt = vscr ? PtrMatrix(pointer(ws.cabi_Vt), mn, N, size(ws.cabi_Vt, 1)) :
+                     PtrMatrix(VT, ncv, N, Int(unsafe_load(ldvt)))
+        gesvd!(Av, Ut, PtrVector(S, mn), Vtt; full_u = full_u, full_v = full_v)
+        if ju == 'O'                                   # economy U columns overwrite A
+            @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Ut[i, j]; end
+        end
+        if jvt == 'O'                                  # economy Vᵀ rows overwrite A
+            @inbounds for j in 1:N, i in 1:mn; Av[i, j] = Vtt[i, j]; end
+        end
     end
     unsafe_store!(info, Int64(0))
     return

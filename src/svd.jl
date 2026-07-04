@@ -184,11 +184,12 @@ mutable struct SVDWorkspace{T}
     Vpad::Matrix{T}; VP::Matrix{T}                                 # V back-transform: padded accumulator + P reflectors
     bt_T::Matrix{T}; bt_G::Matrix{T}; bt_W::Matrix{T}; bt_Yb::Matrix{T}   # compact-WY back-transform blocks
     trbuf::Matrix{T}; Usc::Matrix{T}; Vtsc::Matrix{T}             # m<n transpose staging (Aᵀ, Ū, V̄ᵀ)
+    cabi_U::Matrix{T}; cabi_Vt::Matrix{T}                         # C-ABI dgesvd scratch for jobu/jobvt ∈ {'N','O'}
 end
 function SVDWorkspace{T}() where {T}
     ev() = T[]; em() = Matrix{T}(undef, 0, 0)
     SVDWorkspace{T}(ev(), ev(), ev(), ev(), em(), em(), ev(), ev(), em(), em(),
-        ev(), ev(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em())
+        ev(), ev(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em())
 end
 
 const _SVDWS = SVDWorkspace{Float64}()
@@ -608,29 +609,6 @@ function gesvd_vals!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64})
         return _svals_core!(At, S, ws)
     end
     return _svals_core!(A, S, ws)
-end
-
-# ── concrete-return wrappers (the trim-safe C-ABI path — may allocate their outputs) ────────────────────
-# Singular values only → fresh `Vector{Float64}`.
-function _gesvd_vals!(A::AbstractMatrix{Float64})
-    S = Vector{Float64}(undef, min(size(A, 1), size(A, 2)))
-    gesvd_vals!(A, S)
-    return S
-end
-
-# Full SVD → concrete `Tuple{Matrix,Vector,Matrix}` (U, S, Vᵀ). Allocates ONLY the outputs (the C-ABI copy
-# source); all internal scratch is the cached ws ⇒ no per-call scratch churn. Single concrete return type,
-# so the whole graph passes juliac --trim=safe (TrimCheck.@validate in test/trim_tests.jl).
-function _gesvd_full!(A::AbstractMatrix{Float64}; full_u::Bool = false,
-        full_v::Bool = false)::Tuple{Matrix{Float64}, Vector{Float64}, Matrix{Float64}}
-    m, n = size(A); mn = min(m, n)
-    ncu = (full_u && m > n) ? m : mn
-    ncv = (full_v && n > m) ? n : mn
-    U = Matrix{Float64}(undef, m, ncu)
-    S = Vector{Float64}(undef, mn)
-    Vt = Matrix{Float64}(undef, ncv, n)
-    gesvd!(A, U, S, Vt; full_u = full_u, full_v = full_v)
-    return U, S, Vt
 end
 
 # Full SVD of A (Float64), convenience allocating form. want_vectors=false → (S,); true → (U, S, Vᵀ),

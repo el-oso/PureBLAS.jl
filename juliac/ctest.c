@@ -24,6 +24,10 @@ typedef void (*dgemm_t)(char *, char *, int64_t *, int64_t *, int64_t *, double 
 /* dgemv_64_ (L2): one char arg (trans) + one trailing hidden length. y := alpha*op(A)*x + beta*y. */
 typedef void (*dgemv_t)(char *, int64_t *, int64_t *, double *, double *, int64_t *, double *,
                         int64_t *, double *, double *, int64_t *, long);
+/* dgesvd_64_ (LAPACK): two char args (jobu, jobvt) + info out-arg + two trailing hidden lengths. */
+typedef void (*dgesvd_t)(char *, char *, int64_t *, int64_t *, double *, int64_t *, double *,
+                         double *, int64_t *, double *, int64_t *, double *, int64_t *, int64_t *,
+                         long, long);
 
 int main(void) {
     void *h = dlopen("juliac/build/libpureblas.so", RTLD_NOW | RTLD_GLOBAL);
@@ -58,5 +62,28 @@ int main(void) {
     double one = 1.0, zero = 0.0, xv[2] = {1, 1}, yv[2] = {0, 0};
     dgemv(&N, &m2, &n2, &one, A, &ld, xv, &i1, &zero, yv, &i1, 1);
     printf("dgemv: %.1f %.1f\n", yv[0], yv[1]); /* 4.0 6.0 */
+
+    /* dgesvd (LAPACK, 2-char + info ABI): full SVD of A = [1 3; 2 4] (col-major {1,2,3,4}).
+     *   singular values ~ 5.4650, 0.3660; verify U*diag(S)*VT reconstructs A. jobu=jobvt='A'. */
+    dgesvd_t dgesvd = (dgesvd_t)dlsym(h, "dgesvd_64_");
+    if (!dgesvd) { printf("dlsym dgesvd fail\n"); return 1; }
+    char Aj = 'A';
+    int64_t lwork = -1, info = -99;
+    double As[4] = {1, 2, 3, 4}, S[2], Um[4], VTm[4], work[16];
+    /* workspace query then compute (PureBLAS manages its own workspace, but honor the protocol) */
+    dgesvd(&Aj, &Aj, &m2, &n2, As, &ld, S, Um, &ld, VTm, &ld, work, &lwork, &info, 1, 1);
+    lwork = (int64_t)work[0];
+    dgesvd(&Aj, &Aj, &m2, &n2, As, &ld, S, Um, &ld, VTm, &ld, work, &lwork, &info, 1, 1);
+    printf("dgesvd: info=%lld  S= %.4f %.4f\n", (long long)info, S[0], S[1]); /* 5.4650 0.3660 */
+    /* reconstruct R = U*diag(S)*VT (col-major) and compare to the original {1,2,3,4} */
+    double A0[4] = {1, 2, 3, 4}, rerr = 0.0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            double r = 0.0;
+            for (int k = 0; k < 2; k++) r += Um[i + 2*k] * S[k] * VTm[k + 2*j];
+            double d = r - A0[i + 2*j]; if (d < 0) d = -d;
+            if (d > rerr) rerr = d;
+        }
+    printf("dgesvd recon max|err| = %.2e\n", rerr); /* ~1e-15 */
     return 0;
 }

@@ -31,7 +31,7 @@
             Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Clong, Clong),
         PureBLAS.cgemm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF32},
             Ptr{ComplexF32}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{ComplexF32}, Ptr{Int64}, Clong, Clong),
-        # LAPACK gesvd: concrete-return internals (_gesvd_vals!/_gesvd_full!) + full jobu/jobvt/'O' coverage.
+        # LAPACK gesvd: in-place gesvd!(A,U,S,Vᵀ) into caller PtrMatrix buffers + full jobu/jobvt/'O' coverage.
         # Exercises gebrd + bdsqr + bdsdc divide-and-conquer + the compact-WY back-transform, all trim-clean.
         PureBLAS.dgesvd_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64},
             Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong, Clong),
