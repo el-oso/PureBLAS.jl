@@ -48,6 +48,17 @@ Both modes share ONE set of low-level kernels. Source map:
    return-type annotations so inference matches the contract; eliminated by the trimmer.
 6. **`nrm2` uses LAPACK scaled accumulation (lassq)** — overflow/underflow safe. Correctness
    boundary; never simplify to `sqrt(sum(abs2))`.
+7. **Adapt to the CPU via compile-time detection, NOT manual flags.** The fleet spans different
+   ISAs, cache sizes, and microarchitectures. PureBLAS detects the build machine with
+   **`CpuId` / `HostCPUFeatures` / `CPUSummary`** and bakes the result into **const-folded, trim-safe
+   consts** (`cpuinfo.jl`: `_SIMD_BYTES`/`_vwidth`, `_L1_BYTES`, `_INTEL_AVX2`, …), each **overridable
+   via `Preferences`** (cross-compile / pinning / correcting a heuristic). When a kernel choice or
+   tuning parameter depends on the CPU — ISA width, cache size, **or microarchitecture/vendor** — you
+   MUST key it on one of these detected consts. Do **not** reach for an opt-in flag, and do **not**
+   claim "we can't detect it." Note: width and cache size do **not** distinguish microarchitectures with
+   the same ISA (Haswell vs Zen3 are both AVX2/W=4) — for a µarch-dependent choice use the **vendor +
+   feature bits** (`cpuvendor`/`cpufeature`), as `_INTEL_AVX2` does for the `_CHOL_BASE_SPLIT` latency
+   split. Detection stays at build time (const-folds away → no runtime `CpuId` ccall, per req. 4).
 
 ## ABI conventions (Mode 1)
 
