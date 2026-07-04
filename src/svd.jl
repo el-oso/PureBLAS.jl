@@ -106,10 +106,10 @@ end
 @inline _lg!(yv, Av, xv, α::Float64, β::Float64, tr::Bool) =
     _gemv!(tr, false, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
 
-function _labrd!(As::AbstractMatrix{Float64}, d, e, tauq, taup, X, Y, nb::Int)
+# arow/tmp are caller-provided scratch (from the SVD workspace): arow ≥ nn (active reflector row), tmp ≥ nb.
+function _labrd!(As::AbstractMatrix{Float64}, d, e, tauq, taup, X, Y, nb::Int,
+        arow::AbstractVector{Float64}, tmp::AbstractVector{Float64})
     mm, nn = size(As)
-    arow = Vector{Float64}(undef, nn)      # contiguous copy of the active reflector row (kills strided gemv)
-    tmp = Vector{Float64}(undef, nb)       # contiguous copy of strided row-vectors used as x
     @inbounds for i in 1:nb
         if i > 1
             for t in 1:i-1; tmp[t] = Y[i, t]; end                       # Y[i,1:i-1] strided → contiguous
@@ -166,10 +166,60 @@ const _BT_NB = 32      # back-transform (compact-WY dlarfb) block: larger than g
 const _SVD_DC_CROSS = 128   # vectors: bdsqr (QR) at/below this n, divide-and-conquer above (retuned down from 144 once the CAP=0 secular cut made bdsdc merges cheap enough to win at 136-144).
                             # wins ≤~144 (less D&C fixed overhead at tiny n), D&C wins ≥160 (O(n³) rotations).
 
+# ── SVD scratch: one owned workspace per element type (mirrors L3Workspace/workspace.jl) ────────────
+# Every internal SVD buffer — bidiag arrays, gebrd/labrd panels, bidiagonal singular-vector blocks, the
+# bdsdc D&C staging, the two back-transform accumulators (padded), the compact-WY T/G/W/Y blocks, and the
+# m<n transpose staging — lives here as a concrete field, grown on demand and reused across calls. So a
+# warm `gesvd!` into caller-provided U/S/Vt allocates NOTHING. gesvd is Float64-ONLY (no s/c/z SVD kernel),
+# so unlike L3Workspace there is NO per-type dispatch and NO IdDict fallback: one module-level const,
+# reached by a bare field load (unconditionally trim-safe). Single global ⇒ single-thread only (project's
+# current mode); MT swaps _svdws() for a per-task owner, nothing else.
+mutable struct SVDWorkspace{T}
+    d::Vector{T}; e::Vector{T}; tauq::Vector{T}; taup::Vector{T}   # bidiagonal + reflector scalars
+    gebrd_X::Matrix{T}; gebrd_Y::Matrix{T}                         # dlabrd panels
+    labrd_arow::Vector{T}; labrd_tmp::Vector{T}                    # dlabrd contiguous row/col temps
+    Lvec::Matrix{T}; Rvec::Matrix{T}                               # B's left/right singular vectors (N×N)
+    dc_diag::Vector{T}; dc_subdiag::Vector{T}; dc_U::Matrix{T}     # bdsdc D&C staging (dc_U is (N+1)²)
+    UApad::Matrix{T}; VQ::Matrix{T}                                # U back-transform: padded accumulator + Q reflectors
+    Vpad::Matrix{T}; VP::Matrix{T}                                 # V back-transform: padded accumulator + P reflectors
+    bt_T::Matrix{T}; bt_G::Matrix{T}; bt_W::Matrix{T}; bt_Yb::Matrix{T}   # compact-WY back-transform blocks
+    trbuf::Matrix{T}; Usc::Matrix{T}; Vtsc::Matrix{T}             # m<n transpose staging (Aᵀ, Ū, V̄ᵀ)
+end
+function SVDWorkspace{T}() where {T}
+    ev() = T[]; em() = Matrix{T}(undef, 0, 0)
+    SVDWorkspace{T}(ev(), ev(), ev(), ev(), em(), em(), ev(), ev(), em(), em(),
+        ev(), ev(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em())
+end
+
+const _SVDWS = SVDWorkspace{Float64}()
+@inline _svdws() = _SVDWS
+
+@inline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
+@inline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
+
+# Grow every m≥n-path buffer to fit a reduced M×N problem forming `nu` U-columns. Buffers are pure scratch
+# (fully re-initialized per call), so growth just reallocates when too small — nothing to preserve.
+function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
+    nbb = _BRD_NB; nbt = _BT_NB
+    ldu = M % 256 == 0 ? M + 8 : M
+    ldv = N % 256 == 0 ? N + 8 : N
+    ws.d = _gv(ws.d, N); ws.e = _gv(ws.e, max(N, 1)); ws.tauq = _gv(ws.tauq, N); ws.taup = _gv(ws.taup, N)
+    ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
+    ws.labrd_arow = _gv(ws.labrd_arow, N); ws.labrd_tmp = _gv(ws.labrd_tmp, N)
+    ws.Lvec = _gm(ws.Lvec, N, N); ws.Rvec = _gm(ws.Rvec, N, N)
+    ws.dc_diag = _gv(ws.dc_diag, N); ws.dc_subdiag = _gv(ws.dc_subdiag, N); ws.dc_U = _gm(ws.dc_U, N + 1, N + 1)
+    ws.UApad = _gm(ws.UApad, ldu, nu); ws.VQ = _gm(ws.VQ, M, N)
+    ws.Vpad = _gm(ws.Vpad, ldv, N); ws.VP = _gm(ws.VP, N, max(N - 1, 1))
+    ws.bt_T = _gm(ws.bt_T, nbt, nbt); ws.bt_G = _gm(ws.bt_G, nbt, nbt)
+    ws.bt_W = _gm(ws.bt_W, nbt, nu); ws.bt_Yb = _gm(ws.bt_Yb, nbt, nu)
+    return ws
+end
+
 # Blocked bidiagonalization driver (LAPACK dgebrd): blocked panels via _labrd! + two gemm! trailing
 # updates, finishing the tail with the unblocked gebd2!. Requires m ≥ n.
 function gebrd!(A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
-        tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}; nb::Int = _BRD_NB)
+        tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64};
+        nb::Int = _BRD_NB)
     m, n = size(A)
     m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
     k = n
@@ -177,13 +227,14 @@ function gebrd!(A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::Abstr
     if k <= nx || nb < 2
         return gebd2!(A, d, e, tauq, taup)
     end
-    X = Matrix{Float64}(undef, m, nb); Y = Matrix{Float64}(undef, n, nb)
+    X = ws.gebrd_X; Y = ws.gebrd_Y
     i = 1
     @inbounds while i <= k - nx
         mm = m - i + 1; nn = n - i + 1
         As = view(A, i:m, i:n)
         di = view(d, i:k); ei = view(e, i:k-1); tqi = view(tauq, i:k); tpi = view(taup, i:k)
-        _labrd!(As, di, ei, tqi, tpi, view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb)
+        _labrd!(As, di, ei, tqi, tpi, view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
+            view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:nb))
         # trailing update A[i+nb:m, i+nb:n] −= V·Yₜᵀ + Xₜ·Ar
         if i + nb <= k
             tr = view(A, i+nb:m, i+nb:n)
@@ -408,23 +459,15 @@ end
 # explicit; roff = row offset of reflector i's support below its index) to C from the left, in place:
 # C := Q·C. Blocked compact-WY (dlarft + dlarfb) driven by PureBLAS gemm! — the BLAS-3 back-transform
 # that replaces explicit form-Q/P + combine. Vfull is M×k with the reflector vectors as its columns.
-# Cached T/G/W/Y workspace — fresh zeros(nb,nb)+3 allocs per call cost ~32 KB per gesvd (2 calls),
-# dominating tiny-n SVD. Regrown on nc; T's needed region is re-zeroed per use below.
-const _BT_WS = Ref{NTuple{4, Matrix{Float64}}}((zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0)))
-@inline function _bt_ws(nb::Int, nc::Int)
-    T, G, W, Yb = _BT_WS[]
-    if size(T, 1) < nb || size(W, 2) < nc
-        T = zeros(Float64, nb, nb); G = Matrix{Float64}(undef, nb, nb)
-        W = Matrix{Float64}(undef, nb, nc); Yb = Matrix{Float64}(undef, nb, nc)
-        _BT_WS[] = (T, G, W, Yb)
-    end
-    return T, G, W, Yb
-end
+# Compact-WY T/G/W/Y blocks come from the SVD workspace (ws.bt_*, grown in _svd_grow!) — the former per-call
+# fresh zeros(nb,nb)+3 allocs cost ~32 KB per gesvd (2 calls), dominating tiny-n SVD. T's region is re-zeroed
+# per use below (gemm reads the full Tv, so its strict-lower must be 0).
 function _apply_reflectors_left!(Vfull::AbstractMatrix{Float64}, tau::AbstractVector{Float64},
-        C::AbstractMatrix{Float64}, k::Int, nb::Int, roff::Int)
+        C::AbstractMatrix{Float64}, k::Int, nb::Int, roff::Int, ws::SVDWorkspace{Float64})
     M = size(Vfull, 1); nc = size(C, 2)
     (k == 0 || nc == 0) && return C
-    T, G, W, Yb = _bt_ws(nb, nc)
+    T = view(ws.bt_T, 1:nb, 1:nb); G = view(ws.bt_G, 1:nb, 1:nb)
+    W = view(ws.bt_W, 1:nb, 1:nc); Yb = view(ws.bt_Yb, 1:nb, 1:nc)
     @inbounds for j in 1:nb, i in 1:nb; T[i, j] = 0.0; end   # gemm reads the full Tv (lower must be 0)
     nblk = cld(k, nb)
     @inbounds for b in nblk:-1:1                          # blocks right-to-left (apply H(k)…H(1))
@@ -451,96 +494,157 @@ function _apply_reflectors_left!(Vfull::AbstractMatrix{Float64}, tau::AbstractVe
     return C
 end
 
-# Trim-safe transpose. permutedims's generic machinery is not guaranteed trim-clean, and the C-ABI SVD
-# path must be fully juliac-analyzable, so we use a hand-written loop. Allocates an n×m Matrix; O(mn),
-# negligible vs the O(mn·min) SVD.
-function _svd_transpose(A::AbstractMatrix{Float64})
+# Trim-safe transpose into a caller buffer B (n×m) ← A (m×n). Hand loop (permutedims isn't guaranteed
+# trim-clean and the C-ABI SVD path must be juliac-analyzable). O(mn), negligible vs the O(mn·min) SVD.
+function _svd_transpose!(B::AbstractMatrix{Float64}, A::AbstractMatrix{Float64})
     m, n = size(A)
-    B = Matrix{Float64}(undef, n, m)
     @inbounds for j in 1:n, i in 1:m
         B[j, i] = A[i, j]
     end
     return B
 end
+# Allocating variant (used only by the concrete-return C-ABI wrappers, which may allocate their outputs).
+_svd_transpose(A::AbstractMatrix{Float64}) = _svd_transpose!(Matrix{Float64}(undef, size(A, 2), size(A, 1)), A)
 
-# Singular values only — concrete `Vector{Float64}` return (the trim-safe C-ABI values path).
-function _gesvd_vals!(A::AbstractMatrix{Float64})
+# ── in-place SVD core (m ≥ n) ─────────────────────────────────────────────────────────────────────────
+# Writes into caller U (m×nu), S (length n), Vt (n×n). ALL scratch comes from ws (grown once up front) ⇒
+# 0-alloc steady state. Destroys A. nu = m if full_u&&m>n (form the orthonormal complement of range(A)),
+# else n (=min). full_v is handled one level up (transpose), so here Vt is always n×n.
+function _gesvd_core!(A::AbstractMatrix{Float64}, U::AbstractMatrix{Float64}, S::AbstractVector{Float64},
+        Vt::AbstractMatrix{Float64}, ws::SVDWorkspace{Float64}; full_u::Bool = false)
     m, n = size(A)
-    m < n && return _gesvd_vals!(_svd_transpose(A))   # σ(A) = σ(Aᵀ)
-    k = n
-    d = Vector{Float64}(undef, k)
-    e = Vector{Float64}(undef, max(k - 1, 0))
-    tauq = Vector{Float64}(undef, k); taup = Vector{Float64}(undef, k)
-    gebrd!(A, d, e, tauq, taup)
-    bdsqr!(d, e, nothing, nothing)
-    return d
-end
-
-# Full SVD — concrete `Tuple{Matrix,Vector,Matrix}` return (U, S, Vᵀ), the trim-safe C-ABI vectors path.
-#   full_u=true, m>n: form the FULL m×m U (economy columns + the orthonormal complement of range(A)).
-#   full_v=true, n>m: form the FULL n×n Vᵀ (via the transpose path — full_v on A ≡ full_u on Aᵀ).
-# Otherwise economy: U is m×min, Vᵀ is min×n. All returns are dense Matrix/Vector (no views, no Union),
-# so the C-ABI copyto! sees a concrete source and the whole graph passes juliac --trim=safe.
-function _gesvd_full!(A::AbstractMatrix{Float64}; full_u::Bool = false,
-        full_v::Bool = false)::Tuple{Matrix{Float64}, Vector{Float64}, Matrix{Float64}}
-    m, n = size(A)
-    if m < n                                    # work on Aᵀ: A = Ṽ Σ Ũᵀ (full_u/full_v swap under transpose)
-        Ut, S, Vtt = _gesvd_full!(_svd_transpose(A); full_u = full_v, full_v = full_u)
-        return _svd_transpose(Vtt), S, _svd_transpose(Ut)
-    end
-    k = n
-    d = Vector{Float64}(undef, k)
-    e = Vector{Float64}(undef, max(k - 1, 0))
-    tauq = Vector{Float64}(undef, k); taup = Vector{Float64}(undef, k)
-    gebrd!(A, d, e, tauq, taup)
+    nu = (full_u && m > n) ? m : n
+    _svd_grow!(ws, m, n, nu)
+    d = view(ws.d, 1:n); e = view(ws.e, 1:max(n - 1, 0))
+    tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
+    gebrd!(A, d, e, tauq, taup, ws)
     nb = _BT_NB
     # B's left/right singular vectors (Lvec/Rvec, n×n): bdsqr below the crossover (less D&C overhead at
-    # small n, like LAPACK gesdd's QR-below-SMLSIZ), divide-and-conquer above.
+    # small n, like LAPACK gesdd's QR-below-SMLSIZ), divide-and-conquer above. Both write svals into d.
+    Lvec = view(ws.Lvec, 1:n, 1:n); Rvec = view(ws.Rvec, 1:n, 1:n)
     if n <= _SVD_DC_CROSS
-        Lvec = zeros(Float64, n, n); Rvec = zeros(Float64, n, n)
+        fill!(Lvec, 0.0); fill!(Rvec, 0.0)
         @inbounds for i in 1:n; Lvec[i, i] = 1.0; Rvec[i, i] = 1.0; end
         bdsqr!(d, e, Lvec, Rvec)                 # B = Lvec·diag(d)·Rvecᵀ
-        s = d
     else
-        s, Rvec, Lvec = bdsdc!(d, e)             # bdsdc → (s, Ul, Vl); B left=Vl=Lvec, right=Ul=Rvec
+        bdsdc!(d, e, Lvec, Rvec, ws)             # svals→d; Lvec=Vl (left), Rvec=Ul (right)
     end
-    # U_A = Q·[Lvec 0; 0 I] — apply the left (column) reflectors to the embedded bidiagonal left vectors.
-    # Full-U (m>n): the trailing bidiagonal rows are zero, so Ub_full = [Lvec 0; 0 I_{m−n}]; the extra
-    # unit columns pushed through Q become the orthonormal complement of range(A). The accumulator C in the
-    # back-transform's VᵀC gemm is UA/Vmat here — pad its leading dim (+8) so its column stride isn't a
-    # power-of-2 multiple that thrashes one L1 set in the unpacked transA='T' kernel.
-    nu = (full_u && m > n) ? m : n              # #U columns to form (m for full, else economy min=n)
-    ldu = m % 256 == 0 ? m + 8 : m              # pad only when the po2 leading dim aliases (gcd(m/8,64)≥32)
-    UApad = zeros(Float64, ldu, nu); UA = view(UApad, 1:m, 1:nu)
+    s = d
+    # U_A = Q·[Lvec 0; 0 I]. Full-U (m>n): trailing bidiagonal rows are zero ⇒ Ub_full = [Lvec 0; 0 I_{m−n}];
+    # the extra unit columns pushed through Q become the orthonormal complement of range(A). ws.UApad's row
+    # count is the padded ld (+8 on po2 m) so the transA='T' accumulator's column stride doesn't thrash L1.
+    UA = view(ws.UApad, 1:m, 1:nu)
+    @inbounds for j in 1:nu, i in 1:m; UA[i, j] = 0.0; end
     @inbounds for j in 1:n, i in 1:n; UA[i, j] = Lvec[i, j]; end
     @inbounds for j in n+1:nu; UA[j, j] = 1.0; end   # complement unit columns e_{n+1..m}
-    VQ = zeros(Float64, m, n)
+    VQ = view(ws.VQ, 1:m, 1:n)
+    @inbounds for j in 1:n, i in 1:m; VQ[i, j] = 0.0; end
     @inbounds for j in 1:n
         VQ[j, j] = 1.0
         for i in j+1:m; VQ[i, j] = A[i, j]; end
     end
-    _apply_reflectors_left!(VQ, tauq, UA, n, nb, 0)   # Q applied over all nu columns
+    _apply_reflectors_left!(VQ, tauq, UA, n, nb, 0, ws)   # Q applied over all nu columns
     # V_A = P·Rvec — apply the right (row) reflectors (k=n-1, support offset by 1).
-    ldv = n % 256 == 0 ? n + 8 : n
-    Vpad = zeros(Float64, ldv, n); Vmat = view(Vpad, 1:n, 1:n)
+    Vmat = view(ws.Vpad, 1:n, 1:n)
     @inbounds for j in 1:n, i in 1:n; Vmat[i, j] = Rvec[i, j]; end
     if n > 1
-        VP = zeros(Float64, n, n - 1)
+        VP = view(ws.VP, 1:n, 1:n-1)
+        @inbounds for j in 1:n-1, i in 1:n; VP[i, j] = 0.0; end
         @inbounds for j in 1:n-1
             VP[j+1, j] = 1.0
             for r in j+2:n; VP[r, j] = A[j, r]; end
         end
-        _apply_reflectors_left!(VP, taup, Vmat, n - 1, nb, 1)
+        _apply_reflectors_left!(VP, taup, Vmat, n - 1, nb, 1, ws)
     end
     _svd_sort!(s, UA, Vmat)                     # descending; sorts cols 1:n, complement cols n+1:nu untouched
-    Uout = Matrix{Float64}(undef, m, nu)        # materialize the padded view → concrete Matrix for the C-ABI
-    @inbounds for j in 1:nu, i in 1:m; Uout[i, j] = UA[i, j]; end
-    return Uout, s, _svd_transpose(Vmat)        # Vt = V_Aᵀ
+    @inbounds for i in 1:n; S[i] = s[i]; end
+    @inbounds for j in 1:nu, i in 1:m; U[i, j] = UA[i, j]; end
+    _svd_transpose!(Vt, Vmat)                   # Vt = V_Aᵀ (n×n)
+    return U, S, Vt
 end
 
-# Full SVD of A (Float64). want_vectors=false returns (S,) only (singular values). Thin Mode-2 wrapper:
-# the C-ABI (cabi_lapack.jl) calls _gesvd_vals!/_gesvd_full! directly so no Union crosses the trim boundary.
+# In-place SVD values core (m ≥ n): fill S (length n) with the singular values. 0-alloc steady state.
+function _svals_core!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64}, ws::SVDWorkspace{Float64})
+    m, n = size(A)
+    _svd_grow!(ws, m, n, n)
+    d = view(ws.d, 1:n); e = view(ws.e, 1:max(n - 1, 0))
+    tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
+    gebrd!(A, d, e, tauq, taup, ws)
+    bdsqr!(d, e, nothing, nothing)
+    @inbounds for i in 1:n; S[i] = d[i]; end
+    return S
+end
+
+# ── in-place entries (caller provides the output buffers; 0-alloc steady state) ─────────────────────────
+# Full SVD: writes into U (m×nu / m×m), S (min), Vt (ncv×n / n×n). full_u: U's m×m complement (m>n).
+# full_v: Vt's n×n complement (n>m) — realized via the transpose path (full_v on A ≡ full_u on Aᵀ).
+# m<n: SVD Aᵀ (tall) = Ū·Σ·V̄ᵀ ⟹ A = V̄·Σ·Ūᵀ ⟹ U(A)=V̄=(V̄ᵀ)ᵀ, Vt(A)=Ūᵀ. All staging (Aᵀ, Ū, V̄ᵀ) from ws.
+function gesvd!(A::AbstractMatrix{Float64}, U::AbstractMatrix{Float64}, S::AbstractVector{Float64},
+        Vt::AbstractMatrix{Float64}; full_u::Bool = false, full_v::Bool = false)
+    m, n = size(A)
+    ws = _svdws()
+    if m < n
+        ws.trbuf = _gm(ws.trbuf, n, m)
+        At = view(ws.trbuf, 1:n, 1:m); _svd_transpose!(At, A)
+        nU = (full_v && n > m) ? n : m           # Ū columns (full_v(A) ≡ full_u(Aᵀ)); full_u(A) adds nothing
+        ws.Usc = _gm(ws.Usc, n, nU); ws.Vtsc = _gm(ws.Vtsc, m, m)
+        Usc = view(ws.Usc, 1:n, 1:nU); Vtsc = view(ws.Vtsc, 1:m, 1:m)
+        _gesvd_core!(At, Usc, S, Vtsc, ws; full_u = full_v)
+        _svd_transpose!(U, Vtsc)                 # U(A) = (V̄ᵀ)ᵀ  (m×m)
+        _svd_transpose!(Vt, Usc)                 # Vt(A) = Ūᵀ  (nU×n)
+        return U, S, Vt
+    end
+    _gesvd_core!(A, U, S, Vt, ws; full_u = full_u)
+    return U, S, Vt
+end
+
+# In-place singular values: fill S (length min(m,n)). 0-alloc steady state.
+function gesvd_vals!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64})
+    m, n = size(A)
+    ws = _svdws()
+    if m < n                                      # σ(A) = σ(Aᵀ)
+        ws.trbuf = _gm(ws.trbuf, n, m)
+        At = view(ws.trbuf, 1:n, 1:m); _svd_transpose!(At, A)
+        return _svals_core!(At, S, ws)
+    end
+    return _svals_core!(A, S, ws)
+end
+
+# ── concrete-return wrappers (the trim-safe C-ABI path — may allocate their outputs) ────────────────────
+# Singular values only → fresh `Vector{Float64}`.
+function _gesvd_vals!(A::AbstractMatrix{Float64})
+    S = Vector{Float64}(undef, min(size(A, 1), size(A, 2)))
+    gesvd_vals!(A, S)
+    return S
+end
+
+# Full SVD → concrete `Tuple{Matrix,Vector,Matrix}` (U, S, Vᵀ). Allocates ONLY the outputs (the C-ABI copy
+# source); all internal scratch is the cached ws ⇒ no per-call scratch churn. Single concrete return type,
+# so the whole graph passes juliac --trim=safe (TrimCheck.@validate in test/trim_tests.jl).
+function _gesvd_full!(A::AbstractMatrix{Float64}; full_u::Bool = false,
+        full_v::Bool = false)::Tuple{Matrix{Float64}, Vector{Float64}, Matrix{Float64}}
+    m, n = size(A); mn = min(m, n)
+    ncu = (full_u && m > n) ? m : mn
+    ncv = (full_v && n > m) ? n : mn
+    U = Matrix{Float64}(undef, m, ncu)
+    S = Vector{Float64}(undef, mn)
+    Vt = Matrix{Float64}(undef, ncv, n)
+    gesvd!(A, U, S, Vt; full_u = full_u, full_v = full_v)
+    return U, S, Vt
+end
+
+# Full SVD of A (Float64), convenience allocating form. want_vectors=false → (S,); true → (U, S, Vᵀ),
+# economy (U m×min, Vᵀ min×n). Allocates the outputs, then calls the 0-alloc in-place entry.
 function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
-    want_vectors && return _gesvd_full!(A)
-    return (_gesvd_vals!(A),)
+    m, n = size(A); mn = min(m, n)
+    if !want_vectors
+        S = Vector{Float64}(undef, mn)
+        gesvd_vals!(A, S)
+        return (S,)
+    end
+    U = Matrix{Float64}(undef, m, mn)
+    S = Vector{Float64}(undef, mn)
+    Vt = Matrix{Float64}(undef, mn, n)
+    gesvd!(A, U, S, Vt)
+    return U, S, Vt
 end

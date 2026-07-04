@@ -809,15 +809,21 @@ function _dc!(diag::AbstractVector{Float64}, subdiag::AbstractVector{Float64}, U
     return
 end
 
-# Bidiagonal SVD via D&C. Input: upper-bidiagonal B (d=diagonal, e=superdiagonal). Returns
-# (s, Ul, Vl) with the LOWER bidiagonal L=Bᵀ = Ul·diag(s)·Vlᵀ (Ul=U[1:n,1:n], Vl=V), so B's left
-# vectors = Vl, right vectors = Ul.
-function bdsdc!(d::Vector{Float64}, e::Vector{Float64})
+# Bidiagonal SVD via D&C, writing into caller buffers (0-alloc: all scratch is the cached SVD workspace).
+# Input: upper-bidiagonal B (d=diagonal, e=superdiagonal). The LOWER bidiagonal L=Bᵀ = Ul·diag(s)·Vlᵀ with
+# Ul=U[1:n,1:n], Vl=V, so B's left vectors = Vl, right vectors = Ul. Writes svals into d (in place),
+# Lvec ← Vl (left), Rvec ← Ul (right). dc_diag/dc_subdiag/dc_U staging + _dc!'s own _get_dcwork recursion
+# scratch make this allocation-free.
+function bdsdc!(d::AbstractVector{Float64}, e::AbstractVector{Float64},
+        Lvec::AbstractMatrix{Float64}, Rvec::AbstractMatrix{Float64}, ws::SVDWorkspace{Float64})
     n = length(d)
-    diag = copy(d)
-    subdiag = zeros(n)
+    diag = view(ws.dc_diag, 1:n); subdiag = view(ws.dc_subdiag, 1:n)
+    @inbounds for i in 1:n; diag[i] = d[i]; subdiag[i] = 0.0; end
     @inbounds for i in 1:n-1; subdiag[i] = e[i]; end
-    U = zeros(n+1, n+1); V = zeros(n, n)
-    _dc!(diag, subdiag, U, V, _DC_THRESHOLD, _get_dcwork(n))
-    return diag, U[1:n, 1:n], V
+    U = view(ws.dc_U, 1:n+1, 1:n+1); fill!(U, 0.0)
+    fill!(Lvec, 0.0)
+    _dc!(diag, subdiag, U, Lvec, _DC_THRESHOLD, _get_dcwork(n))
+    @inbounds for i in 1:n; d[i] = diag[i]; end
+    @inbounds for j in 1:n, i in 1:n; Rvec[i, j] = U[i, j]; end
+    return
 end
