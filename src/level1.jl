@@ -31,6 +31,10 @@ end
 function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
     (incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
+    if incx == 1 && _cplx_re(x)
+        ac = convert(_et(x), a)                            # interleaved-complex SIMD scale
+        return _scal_cmplx_simd!(Int(n), real(ac), imag(ac), x)
+    end
     ix = _start(n, incx)
     @inbounds for _ in 1:n
         _st!(x, ix, a * _ld(x, ix)); ix += incx

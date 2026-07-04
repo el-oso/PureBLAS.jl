@@ -87,6 +87,40 @@ end
     return x
 end
 
+# Complex scal: x .*= (alr + i·ali). Bandwidth-bound (read-modify-write), so minimise the shuffle chain:
+# for a SCALAR multiplier, one swap-adjacent-pairs shuffle suffices — result = v·alr + swap(v)·[−ali,+ali…]
+# (= [r·alr − i·ali, i·alr + r·ali, …] on the interleaved [r i r i…] buffer). One shuffle/vector (vs 3 for
+# deinterleave+interleave), 4× unrolled to saturate memory bandwidth. `n` counts COMPLEX elements.
+@generated function _scal_cmplx_simd!(n::Int, alr::T, ali::T, x) where {T<:BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T); Wc = 2 * W          # reals per Vec = 2W; W complex
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)     # swap adjacent (re,im)
+    sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))  # [−ali,ali,…]
+    quote
+        px = _reptr(x); arv = $V2(alr); sv = $sgn; step = 4 * $W          # 4 vectors = 4W complex/step
+        GC.@preserve x begin
+            i = 0
+            while i + step <= n
+                @inbounds for u in 0:3
+                    o = (i + u * $W) * 2 * $sz; v = vload($V2, px + o)
+                    vstore(muladd(shufflevector(v, Val($swp)), sv, v * arv), px + o)
+                end
+                i += step
+            end
+            while i + $W <= n
+                o = i * 2 * $sz; v = vload($V2, px + o)
+                vstore(muladd(shufflevector(v, Val($swp)), sv, v * arv), px + o)
+                i += $W
+            end
+            while i < n
+                j = i + 1; re = unsafe_load(px, 2j - 1); im = unsafe_load(px, 2j)
+                unsafe_store!(px, alr * re - ali * im, 2j - 1); unsafe_store!(px, alr * im + ali * re, 2j)
+                i += 1
+            end
+        end
+        return x
+    end
+end
+
 @inline function _copy_simd!(n::Int, x, y) # T inferred from the pointer/array element type
     T = _et(x); px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
