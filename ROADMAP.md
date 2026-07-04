@@ -81,7 +81,14 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       OB small-n); potrf n=128/256 (**~0.87** — its faer base kernel's fused syrk is a 3×4=12-acc tile
       sized for AVX-512; the Zen3 analogue of the syrk fix likely applies but the kernel is in lapack.jl
       and more involved). trsm large-n + potrf n≥512 gate. NEXT: trsm dense-base and/or faer-potrf base
-      register-blocking for W=4.
+      register-blocking for W=4. **DISPROVEN-by-measurement this session (don't re-try):** (a) routing
+      small-n narrow-B trsm through the invL+gemm base instead of `_trsm_dense_L!` — invL is FAR worse on
+      AVX2 (k=32 nrhs=32: dense 0.855 vs invL 0.495; dense is already the better base — the rank-1 dense
+      solve IS the ceiling, the gap is the serial-dependency/shrinking-vector nature). (b) guarding the
+      faer `_syrk_lower_f64!` MR=3 (12-acc) block to W≥8 so AVX2 starts at MR=2 — did NOT help potrf
+      (n=128 0.873→0.853, n=256 ~same), so MR=3 register pressure is NOT the potrf limiter; the bottleneck
+      is elsewhere in the faer base (`_chol_base_f64!` left-looking panel or `_trsm_right_lower_f64!`, both
+      also 3·W-unrolled) — needs per-kernel decomposition, not a blanket tile change.
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
