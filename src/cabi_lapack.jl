@@ -69,26 +69,20 @@ end
 
 # ── gesvd: SVD ──────────────────────────────────────────────────────────────────────────────────────
 # `dgesvd_64_(jobu, jobvt, m, n, A, lda, S, U, ldu, VT, ldvt, work, lwork, info, len_jobu, len_jobvt)`.
-# PureBLAS's gesvd! returns FRESH ECONOMY factors: U (m × min), S (min), Vᵀ (min × n), destroying A (as
-# LAPACK gesvd does). We COPY them into the caller's S/U/VT buffers.
+# PureBLAS's SVD internals return FRESH factors (destroying A, as LAPACK gesvd does): _gesvd_vals! → S
+# (min values); _gesvd_full!(full_u,full_v) → (U, S, Vᵀ) as concrete Matrix/Vector. We COPY them into the
+# caller's S/U/VT (or A for 'O') buffers. Both internals have a single concrete return type, so the whole
+# call graph passes juliac --trim=safe (validated by TrimCheck.@validate in test/trim_tests.jl).
 #
-# SUPPORTED jobu/jobvt: 'N' (skip) and 'S' (economy — a direct copy). 'A' is supported ONLY when the full
-# factor coincides with the economy one — jobu='A' needs U m×m so requires min==m (m≤n); jobvt='A' needs
-# VT n×n so requires min==n (n≤m). For a square A ('A'=='S') this is the common all-vectors case.
-# UNIMPLEMENTED (info set to -1, buffers untouched): jobu='O'/jobvt='O' (overwrite-A mode), jobu='A' with
-# m>n, jobvt='A' with n>m — PureBLAS computes only the economy (min) vectors, so the extra columns/rows of
-# the FULL square factor are unavailable; shipping a partly-filled buffer would be subtly wrong.
-#
-# TRIM LIMITATION (unlike potrf/getrf/geqrf, this symbol does NOT pass TrimCheck.@validate): gesvd! has a
-# type-UNSTABLE return — U is a SubArray on the m≥n path but a Matrix on the m<n transpose-recursion path,
-# and want_vectors unions a 1-tuple with a 3-tuple — plus internals (permutedims, bdsdc! divide-and-conquer)
-# that aren't trim-clean. That Union flows into the copyto! below as an ::Any source. So dgesvd_64_ is
-# correct (validated by reconstruction) but can't yet be compiled into libpureblas.so via juliac --trim;
-# making it trim-safe needs gesvd! itself refactored to a single concrete return type (a separate pass).
-# GATED OUT of the trimmed .so: defined as a PLAIN function (no `Base.@ccallable`) so --compile-ccallable
-# does not export it and --trim=safe does not choke on it. Re-add `Base.@ccallable` once gesvd! is
-# refactored to a concrete return. The body is unchanged and still callable/validatable in-Julia.
-function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+# jobu/jobvt COVERAGE (LAPACK dgesvd semantics):
+#   'N' — vectors not computed (skip).
+#   'S' — economy: U is m×min into the U buffer; Vᵀ is min×n into the VT buffer.
+#   'A' — full square: U is m×m; Vᵀ is n×n. When the full factor exceeds economy (jobu='A' & m>n, or
+#         jobvt='A' & n>m) _gesvd_full! forms the extra orthonormal complement (full_u/full_v).
+#   'O' — overwrite A: jobu='O' writes U's economy columns into A; jobvt='O' writes Vᵀ's economy rows into
+#         A. (LAPACK forbids jobu=jobvt='O' → info=-1.) A is destroyed by the factorization first, then the
+#         fresh vectors are written into it — no aliasing with the returned Matrices.
+Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
         A::Ptr{Float64}, lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{Float64}, ldu::Ptr{Int64},
         VT::Ptr{Float64}, ldvt::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64},
         len_jobu::Clong, len_jobvt::Clong)::Cvoid
@@ -97,27 +91,35 @@ function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{I
     end
     ju = _cabi_char(jobu); jvt = _cabi_char(jobvt)
     M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); mn = min(M, N)
-    u_ok = ju == 'N' || ju == 'S' || (ju == 'A' && M <= N)
-    v_ok = jvt == 'N' || jvt == 'S' || (jvt == 'A' && N <= M)
-    if !(u_ok && v_ok)                                 # 'O' or an unsupported full 'A' → flag, don't ship
+    u_ok = ju == 'N' || ju == 'S' || ju == 'A' || ju == 'O'
+    v_ok = jvt == 'N' || jvt == 'S' || jvt == 'A' || jvt == 'O'
+    if !(u_ok && v_ok) || (ju == 'O' && jvt == 'O')    # unknown job, or the illegal jobu=jobvt='O'
         unsafe_store!(info, Int64(-1)); return
     end
     ld = Int(unsafe_load(lda))
     Av = view(unsafe_wrap(Array, A, (ld, N)), 1:M, 1:N)
     if ju == 'N' && jvt == 'N'
-        (Sc,) = gesvd!(Av; want_vectors = false)
+        Sc = _gesvd_vals!(Av)
         copyto!(unsafe_wrap(Array, S, mn), Sc)
-    else
-        Uc, Sc, Vtc = gesvd!(Av; want_vectors = true)   # Uc: M×mn, Sc: mn, Vtc: mn×N
-        copyto!(unsafe_wrap(Array, S, mn), Sc)
-        if ju != 'N'
-            Uw = view(unsafe_wrap(Array, U, (Int(unsafe_load(ldu)), mn)), 1:M, 1:mn)
-            copyto!(Uw, Uc)
-        end
-        if jvt != 'N'
-            Vw = view(unsafe_wrap(Array, VT, (Int(unsafe_load(ldvt)), N)), 1:mn, 1:N)
-            copyto!(Vw, Vtc)
-        end
+        unsafe_store!(info, Int64(0)); return
+    end
+    full_u = ju == 'A' && M > N                         # extra m−n complement columns needed
+    full_v = jvt == 'A' && N > M                        # extra n−m complement rows needed
+    Uc, Sc, Vtc = _gesvd_full!(Av; full_u = full_u, full_v = full_v)  # Uc: M×ncu, Vtc: ncv×N
+    copyto!(unsafe_wrap(Array, S, mn), Sc)
+    if ju == 'O'                                       # economy U columns overwrite A
+        @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Uc[i, j]; end
+    elseif ju != 'N'                                   # 'S' → M×mn, 'A' → M×M
+        ncu = ju == 'A' ? M : mn
+        Uw = view(unsafe_wrap(Array, U, (Int(unsafe_load(ldu)), ncu)), 1:M, 1:ncu)
+        copyto!(Uw, Uc)
+    end
+    if jvt == 'O'                                      # economy Vᵀ rows overwrite A
+        @inbounds for j in 1:N, i in 1:mn; Av[i, j] = Vtc[i, j]; end
+    elseif jvt != 'N'                                  # 'S' → mn×N, 'A' → N×N
+        ncv = jvt == 'A' ? N : mn
+        Vw = view(unsafe_wrap(Array, VT, (Int(unsafe_load(ldvt)), N)), 1:ncv, 1:N)
+        copyto!(Vw, Vtc)
     end
     unsafe_store!(info, Int64(0))
     return

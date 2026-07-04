@@ -451,27 +451,48 @@ function _apply_reflectors_left!(Vfull::AbstractMatrix{Float64}, tau::AbstractVe
     return C
 end
 
-# Full SVD of A (Float64). want_vectors=false returns (S,) only (singular values).
-function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
+# Trim-safe transpose. permutedims's generic machinery is not guaranteed trim-clean, and the C-ABI SVD
+# path must be fully juliac-analyzable, so we use a hand-written loop. Allocates an n×m Matrix; O(mn),
+# negligible vs the O(mn·min) SVD.
+function _svd_transpose(A::AbstractMatrix{Float64})
     m, n = size(A)
-    if m < n                                    # work on Aᵀ: A = Ṽ Σ Ũᵀ
-        At = permutedims(A)
-        if want_vectors
-            Ut, S, Vtt = gesvd!(At; want_vectors = true)
-            return permutedims(Vtt), S, permutedims(Ut)
-        else
-            return (gesvd!(At; want_vectors = false)[1],)
-        end
+    B = Matrix{Float64}(undef, n, m)
+    @inbounds for j in 1:n, i in 1:m
+        B[j, i] = A[i, j]
+    end
+    return B
+end
+
+# Singular values only — concrete `Vector{Float64}` return (the trim-safe C-ABI values path).
+function _gesvd_vals!(A::AbstractMatrix{Float64})
+    m, n = size(A)
+    m < n && return _gesvd_vals!(_svd_transpose(A))   # σ(A) = σ(Aᵀ)
+    k = n
+    d = Vector{Float64}(undef, k)
+    e = Vector{Float64}(undef, max(k - 1, 0))
+    tauq = Vector{Float64}(undef, k); taup = Vector{Float64}(undef, k)
+    gebrd!(A, d, e, tauq, taup)
+    bdsqr!(d, e, nothing, nothing)
+    return d
+end
+
+# Full SVD — concrete `Tuple{Matrix,Vector,Matrix}` return (U, S, Vᵀ), the trim-safe C-ABI vectors path.
+#   full_u=true, m>n: form the FULL m×m U (economy columns + the orthonormal complement of range(A)).
+#   full_v=true, n>m: form the FULL n×n Vᵀ (via the transpose path — full_v on A ≡ full_u on Aᵀ).
+# Otherwise economy: U is m×min, Vᵀ is min×n. All returns are dense Matrix/Vector (no views, no Union),
+# so the C-ABI copyto! sees a concrete source and the whole graph passes juliac --trim=safe.
+function _gesvd_full!(A::AbstractMatrix{Float64}; full_u::Bool = false,
+        full_v::Bool = false)::Tuple{Matrix{Float64}, Vector{Float64}, Matrix{Float64}}
+    m, n = size(A)
+    if m < n                                    # work on Aᵀ: A = Ṽ Σ Ũᵀ (full_u/full_v swap under transpose)
+        Ut, S, Vtt = _gesvd_full!(_svd_transpose(A); full_u = full_v, full_v = full_u)
+        return _svd_transpose(Vtt), S, _svd_transpose(Ut)
     end
     k = n
     d = Vector{Float64}(undef, k)
     e = Vector{Float64}(undef, max(k - 1, 0))
     tauq = Vector{Float64}(undef, k); taup = Vector{Float64}(undef, k)
     gebrd!(A, d, e, tauq, taup)
-    if !want_vectors
-        bdsqr!(d, e, nothing, nothing)
-        return (d,)
-    end
     nb = _BT_NB
     # B's left/right singular vectors (Lvec/Rvec, n×n): bdsqr below the crossover (less D&C overhead at
     # small n, like LAPACK gesdd's QR-below-SMLSIZ), divide-and-conquer above.
@@ -483,21 +504,26 @@ function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
     else
         s, Rvec, Lvec = bdsdc!(d, e)             # bdsdc → (s, Ul, Vl); B left=Vl=Lvec, right=Ul=Rvec
     end
-    # U_A = Q·[Lvec;0] — apply the left (column) reflectors to the embedded bidiagonal left vectors. The
-    # accumulator C in the back-transform's VᵀC gemm is UA/Vmat here — pad its leading dim (+8) so its
-    # column stride isn't a power-of-2 multiple that thrashes one L1 set in the unpacked transA='T' kernel.
+    # U_A = Q·[Lvec 0; 0 I] — apply the left (column) reflectors to the embedded bidiagonal left vectors.
+    # Full-U (m>n): the trailing bidiagonal rows are zero, so Ub_full = [Lvec 0; 0 I_{m−n}]; the extra
+    # unit columns pushed through Q become the orthonormal complement of range(A). The accumulator C in the
+    # back-transform's VᵀC gemm is UA/Vmat here — pad its leading dim (+8) so its column stride isn't a
+    # power-of-2 multiple that thrashes one L1 set in the unpacked transA='T' kernel.
+    nu = (full_u && m > n) ? m : n              # #U columns to form (m for full, else economy min=n)
     ldu = m % 256 == 0 ? m + 8 : m              # pad only when the po2 leading dim aliases (gcd(m/8,64)≥32)
-    UApad = zeros(Float64, ldu, n); UA = view(UApad, 1:m, 1:n)
+    UApad = zeros(Float64, ldu, nu); UA = view(UApad, 1:m, 1:nu)
     @inbounds for j in 1:n, i in 1:n; UA[i, j] = Lvec[i, j]; end
+    @inbounds for j in n+1:nu; UA[j, j] = 1.0; end   # complement unit columns e_{n+1..m}
     VQ = zeros(Float64, m, n)
     @inbounds for j in 1:n
         VQ[j, j] = 1.0
         for i in j+1:m; VQ[i, j] = A[i, j]; end
     end
-    _apply_reflectors_left!(VQ, tauq, UA, n, nb, 0)
+    _apply_reflectors_left!(VQ, tauq, UA, n, nb, 0)   # Q applied over all nu columns
     # V_A = P·Rvec — apply the right (row) reflectors (k=n-1, support offset by 1).
     ldv = n % 256 == 0 ? n + 8 : n
-    Vpad = zeros(Float64, ldv, n); Vmat = view(Vpad, 1:n, 1:n); copyto!(Vmat, Rvec)
+    Vpad = zeros(Float64, ldv, n); Vmat = view(Vpad, 1:n, 1:n)
+    @inbounds for j in 1:n, i in 1:n; Vmat[i, j] = Rvec[i, j]; end
     if n > 1
         VP = zeros(Float64, n, n - 1)
         @inbounds for j in 1:n-1
@@ -506,6 +532,15 @@ function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
         end
         _apply_reflectors_left!(VP, taup, Vmat, n - 1, nb, 1)
     end
-    _svd_sort!(s, UA, Vmat)                     # descending (bdsdc order isn't globally sorted)
-    return UA, s, permutedims(Vmat)             # Vt = V_Aᵀ (UA is a view of the padded buffer; no copy)
+    _svd_sort!(s, UA, Vmat)                     # descending; sorts cols 1:n, complement cols n+1:nu untouched
+    Uout = Matrix{Float64}(undef, m, nu)        # materialize the padded view → concrete Matrix for the C-ABI
+    @inbounds for j in 1:nu, i in 1:m; Uout[i, j] = UA[i, j]; end
+    return Uout, s, _svd_transpose(Vmat)        # Vt = V_Aᵀ
+end
+
+# Full SVD of A (Float64). want_vectors=false returns (S,) only (singular values). Thin Mode-2 wrapper:
+# the C-ABI (cabi_lapack.jl) calls _gesvd_vals!/_gesvd_full! directly so no Union crosses the trim boundary.
+function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
+    want_vectors && return _gesvd_full!(A)
+    return (_gesvd_vals!(A),)
 end

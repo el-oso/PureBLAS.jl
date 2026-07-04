@@ -239,6 +239,62 @@ end
 # unchanged (stress: clustered/graded/repeated/tiny-gap spectra all ~1.7e-14). Saves ~4 sec() evals/root, the
 # largest single cut to the small-n bdsdc merge cost (root-finding is ~45% of bdsdc). See kb pureblas-svd.
 const _SEC_BISECT_CAP = 0
+# Secant step of the root finder, HOISTED out of _secular_root to a top-level function: as an inner
+# closure, its local `use_bisection` (a Bool reassigned across the loop/nested blocks) got boxed → Any →
+# not trim-safe. `sec` (the secular-eq evaluator) is passed as a type parameter so it stays specialized.
+# Returns (use_bisection, mu_cur, left_cand, right_cand).
+function _secular_secant(sec::F, sh::Float64, left::Float64, right::Float64,
+        mu_cur::Float64, mu_prev::Float64, f_cur::Float64, f_prev::Float64) where {F}
+    two = 2.0; eight = 8.0; epsilon = eps(Float64)
+    if abs(f_prev) < abs(f_cur)
+        f_prev, f_cur = f_cur, f_prev
+        mu_prev, mu_cur = mu_cur, mu_prev
+    end
+    left_cand = NaN; right_cand = NaN; use_bisection = false
+    sme_sign = (f_prev > 0.0) == (f_cur > 0.0)
+    if !sme_sign
+        mn, mx = mu_cur < mu_prev ? (mu_cur, mu_prev) : (mu_prev, mu_cur)
+        left_cand = mn; right_cand = mx
+    end
+    while f_cur != 0.0 &&
+            abs(mu_cur - mu_prev) > eight * epsilon * max(abs(mu_cur), abs(mu_prev)) &&
+            abs(f_cur - f_prev) > epsilon && !use_bisection
+        a = (f_cur - f_prev) * (mu_prev * mu_cur) / (mu_prev - mu_cur)
+        b = f_cur - a / mu_cur
+        mu_zero = -a / b
+        f_zero = sec(sh, mu_zero)
+        if f_zero < 0.0
+            left_cand = mu_zero
+        else
+            right_cand = mu_zero
+        end
+        mu_prev = mu_cur; f_prev = f_cur
+        mu_cur = mu_zero; f_cur = f_zero
+        if sh == left && (mu_cur < 0.0 || mu_cur > right - left)
+            use_bisection = true
+        end
+        if sh == right && (mu_cur > 0.0 || mu_cur < left - right)
+            use_bisection = true
+        end
+        if abs(f_cur) > abs(f_prev)
+            k = 1.0
+            for _ in 0:3
+                mu_opp = -a / (k * f_zero + b)
+                f_opp = sec(sh, mu_opp)
+                if f_zero < 0.0 && f_opp >= 0.0
+                    right_cand = mu_opp; break
+                end
+                if f_zero > 0.0 && f_opp <= 0.0
+                    left_cand = mu_opp; break
+                end
+                k *= two
+            end
+            use_bisection = true
+        end
+    end
+    return use_bisection, mu_cur, left_cand, right_cand
+end
+
 function _secular_root(col0p::AbstractVector{Float64}, diagp::AbstractVector{Float64}, o::Int,
         left::Float64, right::Float64, last::Bool)
     two = 2.0; eight = 8.0; half = 0.5; epsilon = eps(Float64)
@@ -262,56 +318,6 @@ function _secular_root(col0p::AbstractVector{Float64}, diagp::AbstractVector{Flo
         elseif f_mid_right_shift > 0.0
             shift = left; f_mid = f_mid_left_shift
         end
-    end
-    # secant closure → returns (use_bisection, mu_cur, left_cand, right_cand)
-    secant = function (mu_cur, mu_prev, f_cur, f_prev)
-        if abs(f_prev) < abs(f_cur)
-            f_prev, f_cur = f_cur, f_prev
-            mu_prev, mu_cur = mu_cur, mu_prev
-        end
-        left_cand = NaN; right_cand = NaN; use_bisection = false
-        sme_sign = (f_prev > 0.0) == (f_cur > 0.0)
-        if !sme_sign
-            mn, mx = mu_cur < mu_prev ? (mu_cur, mu_prev) : (mu_prev, mu_cur)
-            left_cand = mn; right_cand = mx
-        end
-        while f_cur != 0.0 &&
-                abs(mu_cur - mu_prev) > eight * epsilon * max(abs(mu_cur), abs(mu_prev)) &&
-                abs(f_cur - f_prev) > epsilon && !use_bisection
-            a = (f_cur - f_prev) * (mu_prev * mu_cur) / (mu_prev - mu_cur)
-            b = f_cur - a / mu_cur
-            mu_zero = -a / b
-            f_zero = sec(shift, mu_zero)
-            if f_zero < 0.0
-                left_cand = mu_zero
-            else
-                right_cand = mu_zero
-            end
-            mu_prev = mu_cur; f_prev = f_cur
-            mu_cur = mu_zero; f_cur = f_zero
-            if shift == left && (mu_cur < 0.0 || mu_cur > right - left)
-                use_bisection = true
-            end
-            if shift == right && (mu_cur > 0.0 || mu_cur < left - right)
-                use_bisection = true
-            end
-            if abs(f_cur) > abs(f_prev)
-                k = 1.0
-                for _ in 0:3
-                    mu_opp = -a / (k * f_zero + b)
-                    f_opp = sec(shift, mu_opp)
-                    if f_zero < 0.0 && f_opp >= 0.0
-                        right_cand = mu_opp; break
-                    end
-                    if f_zero > 0.0 && f_opp <= 0.0
-                        left_cand = mu_opp; break
-                    end
-                    k *= two
-                end
-                use_bisection = true
-            end
-        end
-        return use_bisection, mu_cur, left_cand, right_cand
     end
     if shift == left
         left_shifted = 0.0; f_left = -Inf
@@ -371,7 +377,7 @@ function _secular_root(col0p::AbstractVector{Float64}, diagp::AbstractVector{Flo
     else
         a0, a1, a2, a3 = left_shifted, right_shifted, f_left, f_right
     end
-    use_bisection, mu_cur, lc, rc = secant(a0, a1, a2, a3)
+    use_bisection, mu_cur, lc, rc = _secular_secant(sec, shift, left, right, a0, a1, a2, a3)
     if !isnan(lc) && !isnan(rc) && lc < rc
         lc > left_shifted && (left_shifted = lc)
         rc < right_shifted && (right_shifted = rc)
