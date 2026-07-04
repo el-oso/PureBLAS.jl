@@ -282,6 +282,12 @@ function svg_trend(path, title, data)
     println(io, """<text x="$(ml+4)" y="$(yg-5)" font-size="11" fill="#d33">0.96× gate</text>""")
     for (i, d) in enumerate(data)
         col = pal[mod1(i, length(pal))]
+        # ribbon: 25th–75th-percentile band of the per-size round ratios (run-to-run spread around the
+        # median). Upper edge left→right, then lower edge right→left → a closed filled polygon.
+        rhi = [(xof(s), yof(quantile(v, 0.75))) for (s, v) in d.second]
+        rlo = [(xof(s), yof(quantile(v, 0.25))) for (s, v) in reverse(d.second)]
+        band = vcat(rhi, rlo)
+        println(io, """<polygon points="$(join(("$(round(x,digits=1)),$(round(y,digits=1))" for (x,y) in band), " "))" fill="$col" opacity="0.14" stroke="none"/>""")
         pts = [(xof(s), yof(m)) for (s, m) in sizemeds(d.second)]
         println(io, """<polyline points="$(join(("$(round(x,digits=1)),$(round(y,digits=1))" for (x,y) in pts), " "))" fill="none" stroke="$col" stroke-width="2"/>""")
         for (s, m) in sizemeds(d.second)
