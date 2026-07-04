@@ -355,6 +355,10 @@ end
 end
 
 const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators in the microkernel)
+# symv row-panel height in vectors — its OWN const, NOT _GEMV_MR: symv's off-block fuses NB axpy +
+# NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
+# 16 ymm; the gemv-N MR=8 bump spilled symv (galen 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
+const _SYMV_MR = 4
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
 # accumulating gemv-N into y (yp) and gemv-T into the d_c (one A load feeds both). masked ⇒ guard
@@ -459,9 +463,9 @@ end
         jb = 0
         while jb + NB <= n                                  # full column panels (unified kernel)
             if up
-                _symv_upperpanel!(jb + NB, α, base + jb * lda * sz, lda, xp, yp, Val(_GEMV_MR), Val(NB))
+                _symv_upperpanel!(jb + NB, α, base + jb * lda * sz, lda, xp, yp, Val(_SYMV_MR), Val(NB))
             else
-                _symv_lowerpanel!(n - jb, α, base + (jb + jb * lda) * sz, lda, xp + jb * sz, yp + jb * sz, Val(_GEMV_MR), Val(NB))
+                _symv_lowerpanel!(n - jb, α, base + (jb + jb * lda) * sz, lda, xp + jb * sz, yp + jb * sz, Val(_SYMV_MR), Val(NB))
             end
             jb += NB
         end
