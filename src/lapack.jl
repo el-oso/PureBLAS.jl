@@ -422,12 +422,16 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
         lda = stride(A, 2); ldb = size(b, 1)
         GC.@preserve A b begin
             pa = pointer(A); pb = pointer(b)
+            # Lower triangle only: the faer lower path reads/writes exclusively the lower triangle + diagonal
+            # (base kernel loads rows ≥ j, cols < j), and the scratch upper is never-read workspace. Copying
+            # column j from its diagonal down (n-j elts) halves the copy — the copy is the WHOLE pad overhead
+            # (~16 MB at n=1024), so this lifts the po2-input gate directly (2n²→n² moved).
             @inbounds for j in 0:(n - 1)
-                unsafe_copyto!(pb + j * ldb * 8, pa + j * lda * 8, n)
+                unsafe_copyto!(pb + (j * ldb + j) * 8, pa + (j * lda + j) * 8, n - j)
             end
             _chol_hyb_f64!(Mw, n, base)
             @inbounds for j in 0:(n - 1)
-                unsafe_copyto!(pa + j * lda * 8, pb + j * ldb * 8, n)
+                unsafe_copyto!(pa + (j * lda + j) * 8, pb + (j * ldb + j) * 8, n - j)
             end
         end
     else
