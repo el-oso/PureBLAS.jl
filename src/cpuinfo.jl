@@ -9,7 +9,7 @@
 #   Zen3     (AVX2)     -> 32 bytes -> Vec{4,Float64}, Vec{8,Float32}
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
-using CpuId: simdbytes
+using CpuId: simdbytes, cpuvendor, cpufeature
 using CPUSummary: cache_size
 using Preferences: @load_preference
 
@@ -31,6 +31,18 @@ end
 # SIMD lane count for element type `T` on this build (>=1). `# ponytail: width auto-detected,
 # override via Preferences "simd_bytes"`.
 @inline _vwidth(::Type{T}) where {T} = max(1, _SIMD_BYTES ÷ sizeof(T))
+
+# Intel AVX2-without-AVX-512 (Haswell/Broadwell class). These cores have a narrower out-of-order window
+# than Zen, so a serial FMA-reduction chain that Zen's OOO hides across iterations becomes latency-bound
+# here (confirmed via `llvm-mca -mcpu=haswell`: the Cholesky base k-reduction runs 10 cyc/iter vs a 4-cyc
+# resource bound). Kernels can opt into extra-accumulator splits keyed on this (see `_CHOL_BASE_SPLIT`).
+# Detected at build (const-folds, trim-safe); AMD / AVX-512 / non-x86 → false. Width and cache size can't
+# distinguish this — it's a microarchitecture trait, so it needs the vendor + feature bits.
+const _INTEL_AVX2 = try
+    cpuvendor() === :Intel && cpufeature(:AVX2) && !cpufeature(:AVX512F)
+catch
+    false
+end
 
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the
 # bandwidth-bound Level-1 kernels, but L2/L3 blocking for the M2 dgemm will read these.

@@ -133,6 +133,19 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       Haswell. Side experiment: BlazingPorts `cholesky_llt!` as-is is NOT faster (equal on AVX-512, slower
       on AVX2 — PureBLAS is its tuned descendant). Bench infra: `plots.jl bench mkl` added for the eventual
       real-Haswell vs-MKL run; docs `performance.md` has a footnoted **Haswell\*** column (AVX2 proxy).
+    - **Haswell static tuning via `llvm-mca` (2026-07-04, session 2) — one lever landed, auto-detected.**
+      Workflow (reusable): `julia -C haswell` → `code_native` the kernel → `llvm-mca -mcpu=haswell` (already
+      on galen at `/usr/lib/llvm-20/bin`). Findings on the potrf kernels: **syrk 12-acc tile is throughput-
+      optimal** on Haswell (6 cyc/iter = 12 FMA/2 units); **trsm diagonal** is inherently serial (unfixable);
+      **chol_base k-reduction was latency-bound** (10 vs 4 cyc/iter — only 3 accumulators, each 2 serial FMAs
+      after LLVM's ×2 unroll; Haswell's narrow OOO can't hide the 5-cyc FMA chain). **LANDED:** split each
+      row-block's k-reduction into even/odd partials → 6 independent chains → llvm-mca 10→5 cyc/iter. It only
+      helps Haswell: Zen3/Zen4's wider OOO already hid the chain (measured slight regression), so it's keyed
+      on `_INTEL_AVX2` (cpuinfo.jl: Intel && AVX2 && !AVX512F, const-folded) via `_CHOL_BASE_SPLIT`
+      (@load_preference override `chol_base_split`). Auto-on when built on Haswell, auto-off on Zen/AVX-512
+      (bit-exact faer path preserved there). Reassociates the reduction (loses faer bit-exactness on the split
+      path, stays OpenBLAS-correct ~1e-14). Payoff marginal (base runs only at n≤64) and **static-only —
+      unvalidated on real Haswell**; flip `chol_base_split` off if a real run shows it doesn't help.
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8

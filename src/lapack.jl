@@ -100,6 +100,10 @@ const _CHOL_THRESHOLD = 64                        # faer LdltParams::auto
 const _CHOL_BLOCK = 128
 const _CHOL_NB = 4                                # trsm panel column block
 const _CHOL_NC = 4                                # syrk column block
+# Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
+# latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
+# the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
+const _CHOL_BASE_SPLIT = @load_preference("chol_base_split", _INTEL_AVX2)::Bool
 @inline _clidx(i, k, ld) = (k - 1) * ld + i                              # 1-based linear index
 @inline _cvptr(p, i, k, ld) = p + (((k - 1) * ld + (i - 1)) * sizeof(Float64))   # byte Ptr to [i,k]
 
@@ -107,14 +111,39 @@ const _CHOL_NC = 4                                # syrk column block
 function _chol_base_f64!(p::Ptr{Float64}, n::Int, ld::Int)
     @inbounds for j in 1:n
         i = j
-        while i + 3_CHOLW - 1 <= n                              # MR=3 row-vectors: 3 independent acc chains
+        while i + 3_CHOLW - 1 <= n                              # MR=3 row-vectors
             b0 = _cvptr(p, i, j, ld); b1 = _cvptr(p, i + _CHOLW, j, ld); b2 = _cvptr(p, i + 2_CHOLW, j, ld)
             a0 = vload(_CVF, b0); a1 = vload(_CVF, b1); a2 = vload(_CVF, b2)
-            for k in 1:j-1                                      # break the k-reduction latency chain + reuse
-                g = _CVF(-unsafe_load(p, _clidx(j, k, ld)))     # the L[j,k] broadcast across the 3 blocks
-                a0 = muladd(g, vload(_CVF, _cvptr(p, i, k, ld)), a0)
-                a1 = muladd(g, vload(_CVF, _cvptr(p, i + _CHOLW, k, ld)), a1)
-                a2 = muladd(g, vload(_CVF, _cvptr(p, i + 2_CHOLW, k, ld)), a2)
+            if _CHOL_BASE_SPLIT
+                # Haswell-class: split each row-block's k-reduction into even/odd partials → 6 independent
+                # FMA chains so the 2 units aren't starved by the 5-cyc latency (llvm-mca: 10→5 cyc/iter).
+                # Reassociates the dot product (not bit-identical to faer, still OpenBLAS-correct).
+                d0 = zero(_CVF); d1 = zero(_CVF); d2 = zero(_CVF)
+                kk = 1
+                while kk + 1 <= j - 1
+                    g = _CVF(-unsafe_load(p, _clidx(j, kk, ld))); h = _CVF(-unsafe_load(p, _clidx(j, kk + 1, ld)))
+                    a0 = muladd(g, vload(_CVF, _cvptr(p, i, kk, ld)), a0)
+                    d0 = muladd(h, vload(_CVF, _cvptr(p, i, kk + 1, ld)), d0)
+                    a1 = muladd(g, vload(_CVF, _cvptr(p, i + _CHOLW, kk, ld)), a1)
+                    d1 = muladd(h, vload(_CVF, _cvptr(p, i + _CHOLW, kk + 1, ld)), d1)
+                    a2 = muladd(g, vload(_CVF, _cvptr(p, i + 2_CHOLW, kk, ld)), a2)
+                    d2 = muladd(h, vload(_CVF, _cvptr(p, i + 2_CHOLW, kk + 1, ld)), d2)
+                    kk += 2
+                end
+                if kk <= j - 1                                  # odd tail k
+                    g = _CVF(-unsafe_load(p, _clidx(j, kk, ld)))
+                    a0 = muladd(g, vload(_CVF, _cvptr(p, i, kk, ld)), a0)
+                    a1 = muladd(g, vload(_CVF, _cvptr(p, i + _CHOLW, kk, ld)), a1)
+                    a2 = muladd(g, vload(_CVF, _cvptr(p, i + 2_CHOLW, kk, ld)), a2)
+                end
+                a0 += d0; a1 += d1; a2 += d2
+            else                                               # Zen / AVX-512: OOO hides the chain → keep 3
+                for k in 1:j-1
+                    g = _CVF(-unsafe_load(p, _clidx(j, k, ld)))
+                    a0 = muladd(g, vload(_CVF, _cvptr(p, i, k, ld)), a0)
+                    a1 = muladd(g, vload(_CVF, _cvptr(p, i + _CHOLW, k, ld)), a1)
+                    a2 = muladd(g, vload(_CVF, _cvptr(p, i + 2_CHOLW, k, ld)), a2)
+                end
             end
             vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); i += 3_CHOLW
         end
