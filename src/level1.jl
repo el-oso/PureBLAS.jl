@@ -46,6 +46,10 @@ end
 function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
+    if incx == 1 && incy == 1 && _cplx2(x, y)
+        ac = convert(_et(x), a)                            # interleaved-complex SIMD axpy
+        return _axpy_cmplx_simd!(Int(n), real(ac), imag(ac), x, y)
+    end
     ix = _start(n, incx); iy = _start(n, incy)
     @inbounds for _ in 1:n
         _st!(y, iy, muladd(a, _ld(x, ix), _ld(y, iy))); ix += incx; iy += incy
@@ -69,12 +73,14 @@ end
 # Unconjugated dot (BLAS ?dot / ?dotu).
 function _dotu(n::Integer, x, incx::Integer, y, incy::Integer)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(false))
     return _dot_generic(n, x, incx, y, incy, false)
 end
 
 # Conjugated dot (BLAS ?dotc). For real T this equals `_dotu`.
 function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(true))
     return _dot_generic(n, x, incx, y, incy, true)
 end
 
