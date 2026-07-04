@@ -9,7 +9,16 @@
 #   taskset -c 2 julia --project=bench bench/plots.jl          # use cache if present, else measure + cache
 #   taskset -c 2 julia --project=bench bench/plots.jl bench    # force re-measure (refresh the cache)
 #   julia --project=bench bench/plots.jl plot                  # plot from cache only (never measure)
+#   taskset -c 2 julia --project=bench bench/plots.jl bench mkl # reference = Intel MKL instead of OpenBLAS
+#                                                              # (Haswell target: `]add MKL` first; MKL uses
+#                                                              #  its native Haswell kernels. On AMD MKL
+#                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
+# Reference BLAS: OpenBLAS (default) or Intel MKL (`mkl` arg). MKL.jl LBT-forwards LinearAlgebra to MKL,
+# so `B`/`LAPACK` below transparently measure against whichever is active — one code path, two baselines.
+const REFBK = "mkl" in ARGS ? "mkl" : "openblas"
+REFBK == "mkl" && @eval using MKL
+const REFNAME = REFBK == "mkl" ? "MKL" : "OpenBLAS"
 import LinearAlgebra.BLAS as B
 BLAS.set_num_threads(1)
 const SINK = Ref(0.0); @noinline _run(f) = f()
@@ -178,7 +187,7 @@ end
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
-const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname()).txt")
+const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFBK == "mkl" ? "_mkl" : "").txt")
 function save_cache(path, groups)
     open(path, "w") do io
         for (lvl, d) in groups, (nm, op) in d
@@ -318,8 +327,9 @@ adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
 # (the docs show AVX-512 and AVX2 side by side). AVX-512 W64=8, AVX2 W64=4, NEON W64=2.
 const _W64P = PureBLAS._vwidth(Float64)
 const ISA = _W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
-const SLUG = _W64P == 8 ? "avx512" : _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
-const TITLE = "PureBLAS / OpenBLAS ($ISA, 1 thread, Float64)"
+const _SLUGB = _W64P == 8 ? "avx512" : _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
+const SLUG = REFBK == "mkl" ? "$(_SLUGB)_mkl" : _SLUGB
+const TITLE = "PureBLAS / $REFNAME ($ISA, 1 thread, Float64)"
 svg_violins(joinpath(adir, "perf_l1_$SLUG.svg"), "BLAS-1: $TITLE", g["L1"])
 svg_violins(joinpath(adir, "perf_l2_$SLUG.svg"), "BLAS-2: $TITLE", g["L2"])
 svg_trend(joinpath(adir, "perf_l3_$SLUG.svg"), "BLAS-3: $TITLE", g["L3"])

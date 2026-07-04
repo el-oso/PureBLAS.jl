@@ -16,23 +16,33 @@ ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.j
 ## Per-ISA gate (dev fleet)
 
 The 0.96× gate is **per machine**. The fleet spans double-pumped **AVX-512** (Zen4, the tuning target)
-and native **AVX2** (Zen3). Below is the full-stack `plots.jl bench` at pinned frequency, worst-size
-ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans are given in text.
+and native **AVX2** (Zen3). **Haswell\*** is a deployment target that shares the *identical* AVX2 code
+path (W=4, 16 ymm) — its column mirrors the AVX2 (Zen3) proxy. Below is the full-stack `plots.jl bench`
+at pinned frequency, worst-size ratio (the gate metric) with ✓ ≥ 0.96 / ✗ < 0.96; geomeans in text.
 
-| Op | AVX-512 (Zen4) | AVX2 (Zen3) |
-|----|:---:|:---:|
-| L1 axpy · dot · asum · scal | ✓ 0.99–1.06 | ✓ 0.99–1.33 |
-| L1 nrm2 (scaled-accum beats OpenBLAS) | ✓ 3.6× | ✓ 5.5× |
-| L1 iamax | ✓ 1.15 | ✗ 0.90 |
-| L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 |
-| L2 gemvN | ✗ 0.96 | ✗ 0.87 |
-| L3 gemm | ✗ 0.83 (n=8 dispatch) | ✓ 1.03 (clip) |
-| **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 |
-| **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) |
-| L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | **✓ 0.98** (geomean 1.03) |
-| L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) |
-| LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 |
-| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.79 (n=256) · **✓ 1.03** (geomean 1.34) |
+| Op | AVX-512 (Zen4) | AVX2 (Zen3) | Haswell\* |
+|----|:---:|:---:|:---:|
+| L1 axpy · dot · asum · scal | ✓ 0.99–1.06 | ✓ 0.99–1.33 | ✓ 0.99–1.33 |
+| L1 nrm2 (scaled-accum beats OpenBLAS) | ✓ 3.6× | ✓ 5.5× | ✓ 5.5× |
+| L1 iamax | ✓ 1.15 | ◐ 0.90 (noise) | ◐ 0.90 (noise) |
+| L2 gemvT · ger · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.97–1.64 | ✓ 0.97–1.64 |
+| L2 gemvN | ◐ 0.96 | ✓ 0.97 (8-acc + panel route) | ✓ 0.97 |
+| L3 gemm | ✗ 0.83 (n=8 dispatch) | ✓ 1.03 (clip) | ✓ 1.03 |
+| **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.02 | ✓ 0.96–1.02 |
+| **L3 zgemm (complex)** | **✓ 1.12** | ◐ 0.94 (n=32 cold; ~1.02 warm) | ◐ 0.94 |
+| L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | **✓ 0.98** (geomean 1.03) | ✓ 0.98 |
+| L3 trmm | ✓ 0.95 | ✗ 0.81 (n=8 materialize-bound) | ✗ 0.81 |
+| LAPACK geqrf · gesvd | ✓ 1.03–1.21 | ✓ 1.06–1.08 | ✓ 1.06–1.08 |
+| LAPACK potrf · getrf | ✓ 1.10 · ✓ 0.99 | ✗ 0.83 (n=256) · **✓ 1.03** (geomean 1.34) | ✗ 0.83 · ✓ 1.03 |
+
+> **\* Haswell not tested on Haswell hardware.** Haswell runs the identical AVX2 code path (W=4, 16 ymm,
+> two FMA units), so the AVX2 (Zen3) column is the best available proxy — but Zen3 ≠ Haswell (Haswell has
+> a 256 KB L2 vs Zen3's 512 KB, FMA latency 5 vs 4, and lower memory bandwidth), and the gate is measured
+> **relative to OpenBLAS**, whose per-µarch kernel dispatch differs between the two. Actual Haswell figures
+> — and a **vs-MKL** comparison (MKL uses its native Haswell kernels on Intel) — are pending a run on the
+> target machine: `taskset -c N julia --project=bench bench/plots.jl bench` (vs OpenBLAS) and
+> `] add MKL; taskset -c N julia --project=bench bench/plots.jl bench mkl` (vs MKL). MKL throttles to a
+> generic path on AMD, so the MKL baseline is only meaningful on the Intel Haswell target itself.
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
