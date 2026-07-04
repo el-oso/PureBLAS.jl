@@ -26,10 +26,10 @@ end
         x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
 end
 
-const _GEMV_MR = 4   # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows)
+const _GEMV_MR = _vwidth(Float64) == 4 ? 8 : 4   # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows). AVX2: 8 accs feed both FMA units (~5-cyc latency) — MR=4 half-fills the pipe at cache-resident mid-n; AVX-512 (32 regs, already ≥gate) stays 4.
 
 const _GEMV_NP = 8             # gemv-N column-panel width
-const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 192 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. Cut ≈ where A (n²·8B) exceeds L2 so rowblock's cache-resident-A assumption breaks: Zen4 1MB L2 → 448, Zen3 512KB L2 → 192. (which, with an
+const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
 # gemv-N (column-major A makes it transpose-like — see kb finding): two regimes —
