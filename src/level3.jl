@@ -560,8 +560,11 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             end
         end
         return B
-    elseif k <= _TRMM_BASE
-        return _trmm_right_base!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: SIMD K-TRIM base (mirror side-L /
+        return _strided1(B) ? _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :   # the recursion base @579).
+                              _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)      # WAS mis-routed to the
+    elseif k <= _TRMM_BASE                                                        # scalar column-axpy base
+        return _trmm_right_base!(up, tr, cj, unit, k, A, B)                       # (0.24 vs 0.78; #root cause).
     end
     return _trmm_right_recur!(up, tr, cj, unit, A, B)
 end
