@@ -864,6 +864,11 @@ end
 const _TRI_NB = 64       # triangular block size (diagonal block per-column; off-diagonal via gemv)
 const _TRI_T_UNB = 1024  # trsv-T: unblocked up to here (blocked only helps the huge-n x-restream).
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
+# COMPLEX tri unblocked threshold. The blocked off-diagonal scatter uses the complex gemv, which is
+# shuffle-bound-slow on AVX2 (W=4) — so per-column beats blocking through mid-n there; blocking only
+# wins once the unblocked x-restream serialization dominates (huge n). On AVX-512 (W≥8) the complex
+# gemv is fast, so block from _TRI_NB. Keyed to vector width (the ISA axis that sets shuffle throughput).
+const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ? 1024 : _TRI_NB)::Int
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
 # — each diagonal NB×NB block uses the per-column kernel (cache-resident), and the off-diagonal block
@@ -1055,11 +1060,102 @@ function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
     return x
 end
 
+# Complex off-diagonal scatters for blocked trmv/trsv: y += α·op(Av)·xv (β=1 accumulate), reusing the
+# gating complex gemv kernels. N → gemv-N; T/C → gemv-T/C with cj resolved to a compile-time Val.
+@inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
+    _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
+@inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
+    cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
+         _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))
+
+# Blocked complex trmv/trsv (mirror of the real _trmv_blk!/_trsv_blk!): per-column kernel re-streams x
+# at large n and serializes across columns. Block it — NB×NB diagonal via the per-column complex kernel
+# (cache-resident), off-diagonal via the gating complex gemv (reads A once, no re-stream, not serialized).
+@inline function _trmv_cmplx_blk!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x)
+    NB = _TRI_NB
+    n <= _TRI_C_BLK_MIN && return _trmv_cmplx!(up, tr, cj, unit, n, A, x)
+    T = eltype(A)
+    @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
+        ib = 0
+        while ib < n
+            nb = min(NB, n - ib); J = (ib + 1):(ib + nb)
+            ib > 0 && _tri_scat_cmplx!(view(x, 1:ib), view(A, 1:ib, J), view(x, J), one(T))
+            _trmv_cmplx!(true, false, cj, unit, nb, view(A, J, J), view(x, J))
+            ib += NB
+        end
+    elseif !tr && !up                    # L,N: J descending; tall scatter DOWN then diag
+        ib = (cld(n, NB) - 1) * NB
+        while ib >= 0
+            nb = min(NB, n - ib); J = (ib + 1):(ib + nb); je = ib + nb
+            je < n && _tri_scat_cmplx!(view(x, (je + 1):n), view(A, (je + 1):n, J), view(x, J), one(T))
+            _trmv_cmplx!(false, false, cj, unit, nb, view(A, J, J), view(x, J))
+            ib -= NB
+        end
+    elseif tr && up                      # U,T/C: I descending; diag(op) then gemv-T/C (rows above)
+        ib = (cld(n, NB) - 1) * NB
+        while ib >= 0
+            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
+            _trmv_cmplx!(true, true, cj, unit, nb, view(A, I, I), view(x, I))
+            ib > 0 && _tri_scatT_cmplx!(view(x, I), view(A, 1:ib, I), view(x, 1:ib), one(T), cj)
+            ib -= NB
+        end
+    else                                 # L,T/C: I ascending; diag(op) then gemv-T/C (rows below)
+        ib = 0
+        while ib < n
+            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
+            _trmv_cmplx!(false, true, cj, unit, nb, view(A, I, I), view(x, I))
+            ib + nb < n && _tri_scatT_cmplx!(view(x, I), view(A, (ib + nb + 1):n, I), view(x, (ib + nb + 1):n), one(T), cj)
+            ib += NB
+        end
+    end
+    return x
+end
+
+@inline function _trsv_cmplx_blk!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x)
+    NB = _TRI_NB
+    (n <= _TRI_C_BLK_MIN || (tr && n <= _TRI_T_UNB)) && return _trsv_cmplx!(up, tr, cj, unit, n, A, x)
+    T = eltype(A)
+    @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP (−)
+        ib = (cld(n, NB) - 1) * NB
+        while ib >= 0
+            nb = min(NB, n - ib); J = (ib + 1):(ib + nb)
+            _trsv_cmplx!(true, false, cj, unit, nb, view(A, J, J), view(x, J))
+            ib > 0 && _tri_scat_cmplx!(view(x, 1:ib), view(A, 1:ib, J), view(x, J), -one(T))
+            ib -= NB
+        end
+    elseif !tr && !up                    # L,N fwd: J ascending; solve diag then tall scatter DOWN (−)
+        ib = 0
+        while ib < n
+            nb = min(NB, n - ib); J = (ib + 1):(ib + nb); je = ib + nb
+            _trsv_cmplx!(false, false, cj, unit, nb, view(A, J, J), view(x, J))
+            je < n && _tri_scat_cmplx!(view(x, (je + 1):n), view(A, (je + 1):n, J), view(x, J), -one(T))
+            ib += NB
+        end
+    elseif tr && up                      # U,T/C fwd: I ascending; gemv-T/C(−, above) then solve(op)
+        ib = 0
+        while ib < n
+            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
+            ib > 0 && _tri_scatT_cmplx!(view(x, I), view(A, 1:ib, I), view(x, 1:ib), -one(T), cj)
+            _trsv_cmplx!(true, true, cj, unit, nb, view(A, I, I), view(x, I))
+            ib += NB
+        end
+    else                                 # L,T/C back: I descending; gemv-T/C(−, below) then solve(op)
+        ib = (cld(n, NB) - 1) * NB
+        while ib >= 0
+            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
+            ib + nb < n && _tri_scatT_cmplx!(view(x, I), view(A, (ib + nb + 1):n, I), view(x, (ib + nb + 1):n), -one(T), cj)
+            _trsv_cmplx!(false, true, cj, unit, nb, view(A, I, I), view(x, I))
+            ib -= NB
+        end
+    end
+    return x
+end
+
 function _trmv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx::Integer)
     if _l2v_simd_ok(A, x, incx)
         return _trmv_blk!(up, tr, unit, Int(n), A, x)
     end
-    _l2vc_ok(A, x, incx) && return _trmv_cmplx!(up, tr, cj, unit, Int(n), A, x)
+    _l2vc_ok(A, x, incx) && return _trmv_cmplx_blk!(up, tr, cj, unit, Int(n), A, x)
     n = Int(n); sx = _start(n, incx)
     el = (i, j) -> cj ? conj(A[i, j]) : A[i, j]
     if !tr                                       # x := A·x
@@ -1099,7 +1195,7 @@ function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
     if _l2v_simd_ok(A, x, incx)
         return _trsv_blk!(up, tr, unit, Int(n), A, x)
     end
-    _l2vc_ok(A, x, incx) && return _trsv_cmplx!(up, tr, cj, unit, Int(n), A, x)
+    _l2vc_ok(A, x, incx) && return _trsv_cmplx_blk!(up, tr, cj, unit, Int(n), A, x)
     n = Int(n); sx = _start(n, incx)
     el = (i, j) -> cj ? conj(A[i, j]) : A[i, j]
     if !tr                                       # solve A·x = b
