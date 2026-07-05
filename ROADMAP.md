@@ -744,13 +744,17 @@ deinterleave — it starves Zen3's shuffle ports.
   both (galen 0.86–1.68), trsv gates AVX-512 (0.96–1.03), AVX2 0.84–0.94 (sequential solve + complex divide
   — AVX2 residual, but improves scalar 0.57). **⇒ complex L2 essentially complete** (symv skipped — no
   standard LinearAlgebra complex-symv oracle).
-- **REMAINING L3:** ctrmm 0.84 / ctrsm 0.75 (wintermute). Off-diagonals already route through the gating
-  SIMD complex gemm (`_gemm_acc!`→`_gemm_core!`) and the base is now SIMD trmv-per-column — but still below
-  gate: the base does 128 separate trmv calls per block (per-column overhead) where the REAL trmm base
-  materializes the triangle + one gemm. Likely fix: a complex materialized-triangle base (mirror
-  `_trmm_small!`/`_mat_tri!`). Decompose first.
-- **AVX2 TUNING RESIDUALS:** gemvN (0.5–0.7), trsv (0.84–0.94) — both shuffle/latency-bound on Zen3; fma
-  primitives suffice (not intrinsic-blocked).
+- **L3 ctrmm/ctrsm side-L DONE — materialized-gemm bases** (9a5d3b1, b5ad32c): the complex bases re-read A
+  n times (trmv/trsv-per-column); replaced with the real bases' strategy — ctrmm: materialize op(A) triangle
+  once (`_mat_tri!`+conj) then B:=M·B; ctrsm: invert once via the now-generic `_trtri!` then B:=op(M⁻¹)·B —
+  both via the gating SIMD complex gemm (reads A once). Correct nfail=0 all combos both boxes, 0-alloc warm.
+  ctrmm wintermute n=64 0.26→0.79 … 1024 0.97; ctrsm n=512 0.75→**0.97**, 1024→**1.00** (gate). galen
+  improved but below gate (complex-gemm AVX2 ceiling + trtri/materialize+copyback overhead on small-n).
+  NOT in strict dogfood (complex L3 scratch = keyed workspace fallback, 0-alloc but not const-dispatched).
+- **REMAINING L3:** ctrmm/ctrsm **side-R** (unmeasured; mirror side-L: B:=B·M / B:=B·op(M⁻¹)); csymm/csyrk;
+  ctrmm/ctrsm **small-n** (64–256, trtri/materialize overhead) + **AVX2** (below gate).
+- **AVX2 TUNING RESIDUALS:** gemvN (0.5–0.7), trsv (0.84–0.94), ctrmm/ctrsm — shuffle/latency-bound on Zen3;
+  fma primitives suffice (not intrinsic-blocked).
 
 Runtime multi-ISA dispatch (below) still not started — detection is compile-time per-build today.
 
