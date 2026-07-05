@@ -32,6 +32,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ◐ borderline / ✗ < 0.96; geomean
 | L2 gemvN | ◐ 0.96 | ✗ 0.85 | ✓ 0.97 (8-acc + panel route) | ✓ 0.97 |
 | L3 gemm | ✗ 0.83 (n=8 dispatch) | ◐ 0.93 (n=8; geomean 1.14) | ✓ 1.03 (clip) | ✓ 1.03 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.11 | ✓ 0.96–1.02 | ✓ 0.96–1.02 |
+| **L2 complex** zhemv · zgeru · zdotc · zscal · zaxpy · dzasum | ✓ 0.99–2× | — | ✓ 0.96–2× (n=1000 zdotc/zscal ◐) | ✓ |
+| **L2 complex zgemvC** (column-blocked) | ✓ 0.94–1.34 | — | ◐ 0.80–1.09 (n=64 + mid-n) | ◐ |
+| **L2 complex zgemvN** (ILP-tuned; AVX2 register-bound) | ✓ 0.95–1.29 | — | ✗ 0.73–0.83 (n≤1024) | ✗ |
+| **L2 complex ztrmv · ztrsv** (blocked) | ✓ ≤2048 (ztrsv n≤128 ◐ 0.88) | — | ◐ large-n gates, mid-n 0.85–0.96 | ◐ |
 | **L3 zgemm (complex)** | **✓ 1.12** | **✓ 1.16** | ◐ 0.94 (n=32 cold; ~1.02 warm) | ◐ 0.94 |
 | L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | ✓ 1.15 | **✓ 0.98** (geomean 1.03) | ✓ 0.98 |
 | L3 trmm | ✓ 0.95 | ✓ 1.08 | ✗ 0.81 (n=8 materialize-bound) | ✗ 0.81 |
@@ -226,6 +230,14 @@ exactly to the real kernel over the 2n-real buffer), a **fused axpy+conj-dot** c
 **materialized-triangle / triangular-inverse bases** for `trmm`/`trsm` that read A once via the gating
 complex `gemm`. The generic scalar path is kept as the AD (ForwardDiff/Enzyme) path.
 
+The complex L2 gate campaign added the blocking the real kernels already had: **`zgemvC`/`zgemvT`** now
+**column-block** (NC columns per pass share each x-chunk *and* its swap — one shuffle feeds NC columns, x
+streamed once instead of per column); **`ztrmv`/`ztrsv`** are **blocked** (NB×NB diagonal via the per-column
+kernel, off-diagonal via the gating complex `gemv`, breaking the per-column x-restream + serialization at
+large n); and the `gemv` cache thresholds are **keyed to detected L2** (`_CGEMV_RB = L2÷16`, so Zen3's 512 KB
+doesn't inherit Zen4's 1 MB and thrash mid-n). Complex `zgemvN` is **ILP-tuned** (MR=4 square / MR=3 tall
+scatter).
+
 **Complex BLAS-1 / BLAS-2 (violins) — AVX-512 (Zen4):**
 
 ![Complex BLAS-1, AVX-512](assets/perf_cl1_avx512.svg)
@@ -247,11 +259,21 @@ complex `gemm`. The generic scalar path is kept as the AD (ForwardDiff/Enzyme) p
 ![Complex BLAS-3, AVX2](assets/perf_cl3_avx2.svg)
 ![Complex BLAS-3, Zen5](assets/perf_cl3_zen5.svg)
 
-On **AVX-512** the whole complex surface gates or beats OpenBLAS — `hemv` ≈ **2×**, `dznrm2` **4–6×**
-(OpenBLAS's is the slow always-scaled `dznrm2`), `zgemm`/`zhemm`/`zherk` 1.05–1.4×, complex `trsm` gates at
-large n. The remaining sub-gate cells are AVX2 and small-n complex-triangular ops (`ztrmm`/`ztrsm` carry the
-same materialize/copyback + complex-`gemm` overhead that bounds them there) and `zgemvN` on AVX2 (shuffle-
-throughput-bound on Zen3) — the same small-n/AVX2 hard spots the real ops have.
+On **AVX-512** the whole complex L1/L2 surface gates or beats OpenBLAS — `zhemv` ≈ **2×**, `dznrm2` **4–6×**
+(OpenBLAS's is the slow always-scaled `dznrm2`), `zgeru`/`zdotc`/`zscal`/`zaxpy` clear it, `zgemvC`/`zgemvN`
+gate (a couple of ~0.95 worst-size dips), and blocked `ztrmv`/`ztrsv` gate through n=2048; `zgemm`/`zhemm`/
+`zherk` 1.05–1.4×, complex `trsm` gates at large n. Residuals there are small-n only (`ztrsv` n=64/128 ≈ 0.88,
+the sequential complex-divide substitution).
+
+On **AVX2 (Zen3)** the campaign closed most of the surface: `zhemv`/`zgeru`/`dzasum` beat OpenBLAS, `zgemvC`
+gates almost everywhere (column-blocking; small residuals at n=64 and the mid-n cache transition), and blocked
+`ztrmv`/`ztrsv` gate at large n. Two hard AVX2 residuals remain, both **register-capacity** bound (not shuffle
+throughput, as first suspected — verified by measuring): **`zgemvN`** (0.73–0.83 at n≤1024) and the
+axpy-based **`ztrmv`/`ztrsv` mid-n** (0.85–0.96). Complex accumulators are `Vec{2W}` = 2 ymm each, so AVX2's
+16 ymm fit only ~4 independent chains — half the ~8 needed to hide Zen3's FMA latency; real `gemvN` (1-ymm
+accumulators) gates, and complex `zgemvN` gates on AVX-512's 32 zmm. Closing them on AVX2 needs the forbidden
+`vfmaddsub` intrinsic. Small-n complex-triangular `ztrmm`/`ztrsm` carry the same materialize/copyback +
+complex-`gemm` overhead that bounds their real counterparts.
 
 ## Milestones
 
