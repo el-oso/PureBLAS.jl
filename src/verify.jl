@@ -85,6 +85,8 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             hemv!(bk, wz, Az, uz)
             trmv!(bk, Ad, um)
             trsv!(bk, Ad, um)
+            trmv!(bk, Az, uz)                     # complex trmv/trsv: per-column axpy(N)/dot(T/C) reuse
+            trsv!(bk, Az, uz)
             # ── Level 2 packed storage (symmetric/Hermitian/triangular; rank-1/2 updates)
             spmv!(bk, vm, APd, um; uplo = 'U', alpha = 2.0, beta = 1.0)
             hpmv!(bk, wz, APz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)

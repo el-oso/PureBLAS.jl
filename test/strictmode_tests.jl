@@ -66,6 +66,8 @@ end
             PureBLAS.hemv!(bk, wz, Az, uz)
             PureBLAS.trmv!(bk, Ad, um)
             PureBLAS.trsv!(bk, Ad, um)
+            PureBLAS.trmv!(bk, Az, uz)                    # complex trmv/trsv: per-column axpy(N)/dot(T/C)
+            PureBLAS.trsv!(bk, Az, uz)
         end
         @test true
     end
