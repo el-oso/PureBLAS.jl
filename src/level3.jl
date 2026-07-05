@@ -353,6 +353,63 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     return B
 end
 
+# Packed K-TRIM complex trmm side-R: B := B·op(A). Transposed mirror of _trmm_cmplx_packed_L!: the
+# BIG operand is B itself (the gemm A-slot, m×k), packed ONCE per mc row-panel (its data is copied
+# out → the in-place aliasing dissolves; each output row depends only on its own B row, so B0-overwrite
+# is safe in any order). M = op(A) (off-triangle zeroed) is the small B-slot operand, packed ONCE up
+# front as nr-panels over ALL k rows. The per-output-column-tile K-TRIM is an OFFSET into both packs
+# (packed row-stride is mr resp. nr REALS — re/im split — so start-row plo ⇒ +plo·mr / +plo·nr) plus
+# the trimmed kc. Zeros inside the diagonal tile are real zeros in M (contribute 0, no mask); row/col
+# edges use the masked kernel. α folded outside (A1=true); cj baked into M ⇒ SA=SB=1. Fable-designed
+# 2026-07-05 (mirror of the side-L win; the old "side-R packed regresses" note was a routing artifact).
+function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    Tc = eltype(B); T = real(Tc); m = size(B, 1)
+    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
+    upM = (up != tr)
+    W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
+    mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mc * k, cld(k, nr) * nr * k)
+    ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
+    GC.@preserve M B ApR ApI BpR BpI begin
+        Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
+        BRp = pointer(BpR); BIp = pointer(BpI)
+        _pack_B_cmplx!(BpR, BpI, Mv, 0, 0, k, k, false, nr)  # M as nr-panels, all k rows (zeros incl.)
+        ic = 0
+        while ic < m
+            mce = min(mc, m - ic)
+            _pack_A_cmplx!(ApR, ApI, B, ic, 0, mce, k, false, mr)   # B row-panel, all k cols, pre-store
+            jr = 0
+            while jr < k
+                nre = min(nr, k - jr); ji = div(jr, nr)
+                plo = upM ? 0 : jr                          # K-TRIM: M's nonzero p-range (== small_R)
+                phi = upM ? min(k, jr + nre) : k; kc = phi - plo
+                boff = (ji * nr * k + plo * nr) * sz
+                ir = 0
+                while ir < mce
+                    mre = min(mr, mce - ir)
+                    aoff = (div(ir, mr) * mr * k + plo * mr) * sz
+                    Cblk = Bp0 + (2 * (ic + ir) + 2 * jr * ldb) * sz
+                    AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
+                    BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
+                    if mre == mr && nre == nr
+                        _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                            Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                    else
+                        _microkernel_cmplx_masked!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                            mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                    end
+                    ir += mr
+                end
+                jr += nr
+            end
+            ic += mc
+        end
+    end
+    return B
+end
+
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
@@ -560,11 +617,12 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             end
         end
         return B
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: SIMD K-TRIM base (mirror side-L /
-        return _strided1(B) ? _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :   # the recursion base @579).
-                              _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)      # WAS mis-routed to the
-    elseif k <= _TRMM_BASE                                                        # scalar column-axpy base
-        return _trmm_right_base!(up, tr, cj, unit, k, A, B)                       # (0.24 vs 0.78; #root cause).
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM kernels (mirror side-L).
+        return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :            # strided B → base
+               (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+                             _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)    # AVX-512 / tiny-k → unpacked
+    elseif k <= _TRMM_BASE                                # AD/generic: scalar column-axpy base
+        return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
     return _trmm_right_recur!(up, tr, cj, unit, A, B)
 end
@@ -576,11 +634,11 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                                         _trmm_small!(false, up, tr, unit, A, B)
         elseif eltype(B) <: BlasComplex
-            # side-R stays on the unpacked K-TRIM path: the packed base REGRESSES here (measured galen:
-            # ztrmmR k=128 0.24 vs side-L 0.93). side-L packs the big B operand once per nc-panel and reuses
-            # it; side-R's roles are transposed and the packed base loses badly at k≤128 — see kb strategy.
-            return _strided1(B) ? _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
-                                  _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
+            # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
+            # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
+            return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
+                   (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+                                 _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
         end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
@@ -1008,7 +1066,8 @@ end
 function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
-    return _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)   # side-R packed regresses at k≤128 (see _trmm_right!)
+    return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
+                                                   _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
 end
 
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
