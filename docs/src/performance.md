@@ -226,9 +226,11 @@ The complex surface is now **SIMD across L1/L2/L3** — it used to be scalar exc
 portable (SIMD.jl `Vec`/`fma`, no x86 intrinsics): a **swap-pairs** complex multiply for scalar×vector
 (scal/axpy/ger), an **interleaved-product** reduction for the complex dot (deinterleave only the
 accumulators — cheap on AVX2's shuffle ports), a **real-reinterpret** trick for `nrm2`/`asum` (which reduce
-exactly to the real kernel over the 2n-real buffer), a **fused axpy+conj-dot** column kernel for `hemv`, and
-**materialized-triangle / triangular-inverse bases** for `trmm`/`trsm` that read A once via the gating
-complex `gemm`. The generic scalar path is kept as the AD (ForwardDiff/Enzyme) path.
+exactly to the real kernel over the 2n-real buffer), a **fused axpy+conj-dot** column kernel for `hemv`, and —
+mirroring the real kernels so no half is wasted — a **K-trimmed** `trmm`/`trsm` (each tile contracts only the
+nonzero band; `trsm` inverts small diagonal blocks and re-uses the trim) plus a **triangular-output** `herk`/
+`syrk` (a single-pass packed kernel that computes only the stored triangle, no full `A·Aᴴ`). The generic
+scalar path is kept as the AD (ForwardDiff/Enzyme) path.
 
 The complex L2 gate campaign added the blocking the real kernels already had: **`zgemvC`/`zgemvT`** now
 **column-block** (NC columns per pass share each x-chunk *and* its swap — one shuffle feeds NC columns, x
