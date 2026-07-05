@@ -632,7 +632,69 @@ end
 
 # y := α·A·x + β·y, A Hermitian (`up` ⇒ upper stored; A[j,i]=conj(A[i,j]); diagonal taken real).
 # Complex → generic path (complex SIMD deferred, per project convention); correct for real too.
+# Fused hemv column-segment kernel: over L complex of A-column ap (with x-segment xp, y-segment yp),
+# does y += tmp·a (complex axpy, swap-pairs) AND accumulates s += conj(a)·x (interleaved products),
+# reading a ONCE. Returns (sr, si) = the conj-dot. tmp = α·x[j] (complex scalar).
+@generated function _hemv_col_cmplx!(L::Int, tmpr::T, tmpi::T, ap::Ptr{T}, xp::Ptr{T}, yp::Ptr{T}) where {T<:BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    quote
+        tmprv = $V2(tmpr); tmpsgn = $V2($(Expr(:tuple, (iseven(l) ? :(-tmpi) : :tmpi for l in 0:(2W - 1))...)))
+        pacc = zero($V2); qacc = zero($V2); i = 0
+        while i + $W <= L
+            o = i * 2 * $sz; av = vload($V2, ap + o)
+            yv = vload($V2, yp + o)
+            yv = muladd(av, tmprv, yv); yv = muladd(shufflevector(av, Val($swp)), tmpsgn, yv)
+            vstore(yv, yp + o)
+            xv = vload($V2, xp + o)
+            pacc = muladd(av, xv, pacc); qacc = muladd(av, shufflevector(xv, Val($swp)), qacc)
+            i += $W
+        end
+        pr, pi = _deint_cmplx(pacc); qr, qi = _deint_cmplx(qacc)
+        sr = sum(pr) + sum(pi); si = sum(qr) - sum(qi)          # conj(a)·x = (ar·xr+ai·xi) + i(ar·xi−ai·xr)
+        while i < L
+            j2 = 2i
+            ar = unsafe_load(ap, j2 + 1); ai = unsafe_load(ap, j2 + 2)
+            xr = unsafe_load(xp, j2 + 1); xi = unsafe_load(xp, j2 + 2)
+            unsafe_store!(yp, unsafe_load(yp, j2 + 1) + tmpr * ar - tmpi * ai, j2 + 1)
+            unsafe_store!(yp, unsafe_load(yp, j2 + 2) + tmpr * ai + tmpi * ar, j2 + 2)
+            sr += ar * xr + ai * xi; si += ar * xi - ai * xr
+            i += 1
+        end
+        return (sr, si)
+    end
+end
+
+# Complex hemv (A Hermitian, `up` triangle stored, diagonal real): y := β·y + α·A·x. One fused pass over
+# each stored column (off-diagonal axpy+conj-dot), then the real-diagonal term. Reuses the fused kernel.
+function _hemv_cmplx!(up::Bool, n::Int, α::Complex{T}, A, x, β::Complex{T}, y) where {T<:BlasReal}
+    _scale_y!(n, β, y, 1)                                       # β·y (complex scal via _scal_cmplx_simd!)
+    iszero(α) && return y
+    sz = sizeof(T)
+    GC.@preserve A x y begin
+        Ap = Ptr{T}(pointer(A)); xp = Ptr{T}(pointer(x)); yp = Ptr{T}(pointer(y))
+        Apc = Ptr{Complex{T}}(pointer(A)); xpc = Ptr{Complex{T}}(pointer(x)); ypc = Ptr{Complex{T}}(pointer(y))
+        ldc = stride(A, 2)
+        @inbounds for j in 1:n
+            tmp = α * unsafe_load(xpc, j)
+            L = up ? (j - 1) : (n - j)
+            sr = zero(T); si = zero(T)
+            if L > 0
+                off = up ? (j - 1) * 2 * ldc : ((j - 1) * ldc + j) * 2   # A[1,j] (up) or A[j+1,j] (lo)
+                seg = up ? 0 : j * 2                                     # x/y segment start (reals)
+                sr, si = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + off * sz, xp + seg * sz, yp + seg * sz)
+            end
+            ajj = unsafe_load(Ap, ((j - 1) * ldc + (j - 1)) * 2 + 1)     # real(A[j,j])
+            unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{T}(sr, si), j)
+        end
+    end
+    return y
+end
+
 function _hemv!(up::Bool, n::Integer, α::Number, A, x, incx::Integer, β::Number, y, incy::Integer)
+    if incx == 1 && incy == 1 && _l2c_ok(A, x, y, incx, incy)
+        return _hemv_cmplx!(up, Int(n), convert(eltype(A), α), A, x, convert(eltype(A), β), y)
+    end
     _scale_y!(Int(n), β, y, incy)
     iszero(α) && return y
     sx = _start(Int(n), incx); sy = _start(Int(n), incy)
