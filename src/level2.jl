@@ -264,6 +264,9 @@ end
 # Complex gemv-N row-tile height (in W-complex vectors). Vec{2W} accumulators (AVX2 → 2 regs each), so a
 # smaller MR than the real kernel. Preferences-tunable; swept per fleet box.
 const _CGEMV_MR = @load_preference("cgemv_mr", _vwidth(Float64) == 4 ? 3 : 4)::Int
+# Complex gemv-T/C column-block width (cols/pass). Each col needs 2 Vec{2W} accs (p,q); AVX2's 16 regs
+# → 2, AVX-512 → 4. Sharing xc + its swap across the block is the win (fewer shuffles, x streamed once).
+const _CGEMVT_NC = @load_preference("cgemvt_nc", _vwidth(Float64) == 4 ? 2 : 4)::Int
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
@@ -334,14 +337,68 @@ end
 
 # Complex gemv trans='T'/'C': y[j] := β·y[j] + α·Σ_i (CJ ? conj(A[i,j]) : A[i,j])·x[i]. Each output is
 # one complex dot of A's (contiguous) column j with x — reuses the L1 _dot_cmplx_simd kernel directly.
+# One column-block of gemv-T/C: NC columns share each x W-chunk AND its swap (1 shuffle feeds NC cols),
+# and x is streamed once per block instead of re-read per column. Reduction mirrors _dot_cmplx_simd.
+@generated function _gemv_tc_block_cmplx!(yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int,
+        xp::Ptr{Complex{T}}, m::Int, α::Complex{T}, β::Complex{T}, z::Bool,
+        ::Val{NC}, ::Val{CJ}) where {T, NC, CJ}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    body = quote
+        xr = Ptr{$T}(xp); Ar = Ptr{$T}(Ab)
+    end
+    for c in 1:NC; push!(body.args, :($(Symbol(:p, c)) = zero($V2); $(Symbol(:q, c)) = zero($V2))); end
+    main = quote
+        xc = vload($V2, xr + i * 2 * $sz); xcs = shufflevector(xc, Val($swp))
+    end
+    for c in 1:NC
+        av = Symbol(:av, c)
+        push!(main.args, :($av = vload($V2, Ar + (i + $(c - 1) * lda) * 2 * $sz)))
+        push!(main.args, :($(Symbol(:p, c)) = muladd($av, xc, $(Symbol(:p, c)))))
+        push!(main.args, :($(Symbol(:q, c)) = muladd($av, xcs, $(Symbol(:q, c)))))
+    end
+    push!(body.args, :(nfull = m - rem(m, $W); i = 0; @inbounds while i < nfull; $main; i += $W; end))
+    for c in 1:NC
+        push!(body.args, quote
+            pr, pii = _deint_cmplx($(Symbol(:p, c))); qr, qi = _deint_cmplx($(Symbol(:q, c)))
+            $(Symbol(:sr, c)) = sum(pr) + $(CJ ? :(sum(pii)) : :(-sum(pii)))
+            $(Symbol(:si, c)) = sum(qr) + $(CJ ? :(-sum(qi)) : :(sum(qi)))
+        end)
+    end
+    tail = quote xrr = unsafe_load(xr, 2i + 1); xii = unsafe_load(xr, 2i + 2) end
+    for c in 1:NC
+        push!(tail.args, quote
+            arr = unsafe_load(Ar, 2 * (i + $(c - 1) * lda) + 1); aii = unsafe_load(Ar, 2 * (i + $(c - 1) * lda) + 2)
+            $(Symbol(:sr, c)) += arr * xrr + $(CJ ? :(aii * xii) : :(-aii * xii))
+            $(Symbol(:si, c)) += arr * xii + $(CJ ? :(-aii * xrr) : :(aii * xrr))
+        end)
+    end
+    push!(body.args, :(@inbounds while i < m; $tail; i += 1; end))
+    for c in 1:NC
+        push!(body.args, quote
+            s = Complex($(Symbol(:sr, c)), $(Symbol(:si, c)))
+            yj = unsafe_load(yp, $c)
+            unsafe_store!(yp, z ? α * s : muladd(β, yj, α * s), $c)
+        end)
+    end
+    push!(body.args, :(return nothing))
+    body
+end
+
 function _gemv_tc_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}) where {T<:BlasReal, CJ}
-    z = iszero(β); csz = sizeof(Complex{T})
-    GC.@preserve A x begin
-        Ap = pointer(A); lda = stride(A, 2); xp = pointer(x)
-        @inbounds for j in 1:n
-            colp = Ap + (j - 1) * lda * csz                       # Ptr{Complex{T}} → column j (unit-stride)
+    z = iszero(β); csz = sizeof(Complex{T}); NC = _CGEMVT_NC
+    GC.@preserve A x y begin
+        Ap = pointer(A); lda = stride(A, 2); xp = pointer(x); yp = pointer(y)
+        j = 0
+        while j + NC <= n                                         # NC-column blocks (shared x + swap)
+            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ))
+            j += NC
+        end
+        @inbounds while j < n                                     # remainder columns: per-column dot
+            colp = Ap + j * lda * csz
             s = _dot_cmplx_simd(m, colp, xp, T, Val(CJ))
-            yj = y[j]; y[j] = (z ? zero(yj) : β * yj) + α * s
+            yj = y[j + 1]; y[j + 1] = (z ? zero(yj) : β * yj) + α * s
+            j += 1
         end
     end
     return y
