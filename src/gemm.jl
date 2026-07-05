@@ -1081,7 +1081,8 @@ end
 # n≈16 on AVX2), so the cutoff is small (esp. W=4). tA='N' required (contiguous A columns for the load).
 @generated function _uker_cmplx!(C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T, mre::Int, nre::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB}) where {T, MR, NR, TB, SA, SB}
+        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
+        ::Val{B0} = Val(false), ::Val{A1} = Val(false)) where {T, MR, NR, TB, SA, SB, B0, A1}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     evens = Expr(:tuple, (2 * (i - 1) for i in 1:W)...)
     odds = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
@@ -1116,18 +1117,17 @@ end
         end
     end
     push!(body.args, :(for p in 0:(k - 1); $inner; end))
-    push!(body.args, :(avr = $V(alr); avi = $V(ali)))
+    A1 || push!(body.args, :(avr = $V(alr); avi = $V(ali)))
     for j in 1:NR
         stores = quote end
         for mi in 1:MR
             cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j); mk = Symbol(:m2, mi)
             q = :(C + ((jr + $(j - 1)) * ldc * 2 + 2 * (ir + $((mi - 1) * W))) * $sz)
-            push!(stores.args, quote
-                let qq = $q
-                    resv = shufflevector(avr * $cr - avi * $ci, avr * $ci + avi * $cr, Val($ilv))
-                    vstore(vload(Vec{$(2W), $T}, qq, $mk) + resv, qq, $mk)
-                end
-            end)
+            rv = A1 ? :(resv = shufflevector($cr, $ci, Val($ilv))) :             # A1: skip α-multiply
+                      :(resv = shufflevector(avr * $cr - avi * $ci, avr * $ci + avi * $cr, Val($ilv)))
+            st = B0 ? :(vstore(resv, qq, $mk)) :                                 # B0: overwrite (masked)
+                      :(vstore(vload(Vec{$(2W), $T}, qq, $mk) + resv, qq, $mk))  # else: accumulate
+            push!(stores.args, :(let qq = $q; $rv; $st; end))
         end
         push!(body.args, :(if $(j - 1) < nre; $stores; end))
     end
