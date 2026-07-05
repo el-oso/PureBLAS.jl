@@ -34,7 +34,7 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ◐ borderline / ✗ < 0.96; geomean
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.11 | ✓ 0.96–1.02 | ✓ 0.96–1.02 |
 | **L2 complex** zhemv · zgeru · zdotc · zscal · zaxpy · dzasum | ✓ 0.99–2× | — | ✓ 0.96–2× (n=1000 zdotc/zscal ◐) | ✓ |
 | **L2 complex zgemvC** (column-blocked) | ✓ 0.94–1.34 | — | ◐ 0.80–1.09 (n=64 + mid-n) | ◐ |
-| **L2 complex zgemvN** (ILP-tuned; AVX2 register-bound) | ✓ 0.95–1.29 | — | ✗ 0.73–0.83 (n≤1024) | ✗ |
+| **L2 complex zgemvN** (ILP-tuned; AVX2 kernel-formulation gap) | ✓ 0.95–1.29 | — | ✗ 0.73–0.83 (n≤1024) | ✗ |
 | **L2 complex ztrmv · ztrsv** (blocked) | ✓ ≤2048 (ztrsv n≤128 ◐ 0.88) | — | ◐ large-n gates, mid-n 0.85–0.96 | ◐ |
 | **L3 zgemm (complex)** | **✓ 1.12** | **✓ 1.16** | ◐ 0.94 (n=32 cold; ~1.02 warm) | ◐ 0.94 |
 | L3 trsm (unpacked leaf + clip + blocked trtri) | ✓ 1.02 | ✓ 1.15 | **✓ 0.98** (geomean 1.03) | ✓ 0.98 |
@@ -267,13 +267,18 @@ the sequential complex-divide substitution).
 
 On **AVX2 (Zen3)** the campaign closed most of the surface: `zhemv`/`zgeru`/`dzasum` beat OpenBLAS, `zgemvC`
 gates almost everywhere (column-blocking; small residuals at n=64 and the mid-n cache transition), and blocked
-`ztrmv`/`ztrsv` gate at large n. Two hard AVX2 residuals remain, both **register-capacity** bound (not shuffle
-throughput, as first suspected — verified by measuring): **`zgemvN`** (0.73–0.83 at n≤1024) and the
-axpy-based **`ztrmv`/`ztrsv` mid-n** (0.85–0.96). Complex accumulators are `Vec{2W}` = 2 ymm each, so AVX2's
-16 ymm fit only ~4 independent chains — half the ~8 needed to hide Zen3's FMA latency; real `gemvN` (1-ymm
-accumulators) gates, and complex `zgemvN` gates on AVX-512's 32 zmm. Closing them on AVX2 needs the forbidden
-`vfmaddsub` intrinsic. Small-n complex-triangular `ztrmm`/`ztrsm` carry the same materialize/copyback +
-complex-`gemm` overhead that bounds their real counterparts.
+`ztrmv`/`ztrsv` gate at large n. Two AVX2 residuals remain: **`zgemvN`** (best ~0.73–0.83 at n≤1024, after
+MR=4 ILP tuning) and the axpy-based **`ztrmv`/`ztrsv` mid-n** (0.85–0.96). This is **not** a hardware limit —
+OpenBLAS is faster on the same Zen3 silicon, so the chip can clearly do it — it's a **kernel-formulation** gap.
+The portable complex multiply-accumulate is `swap + 2 FMA` into a `Vec{2W}` accumulator (2 ymm on AVX2); to
+hide Zen3's FMA latency it wants ~8 independent chains but AVX2's 16 ymm fit only ~4, so it caps below OpenBLAS.
+`vfmaddsub`/`vaddsub` **are** reachable portably (the pattern `shufflevector(muladd(a,b,-c), muladd(a,b,c))`
+auto-fuses to `vfmaddsub213pd` on x86, plain shuffle+add/sub on ARM — no intrinsic needed), but they don't help
+the *accumulating* gemv: `vfmaddsub` subtracts the destination on even lanes, so it can't fold a running sum,
+and a single-accumulator variant measured *worse* (extra mul+add per element). Matching OpenBLAS here needs its
+specific register-blocking/scheduling, not a missing instruction — an open item, not a ceiling. On AVX-512 (32
+zmm) the same portable kernel has room for the chains and gates. Small-n complex-triangular `ztrmm`/`ztrsm`
+carry the same materialize/copyback + complex-`gemm` overhead that bounds their real counterparts.
 
 ## Milestones
 
