@@ -933,6 +933,32 @@ end
     _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
 end
 
+# Triangular-store complex tile for the single-pass packed syrk/herk path (parity with the real
+# _microkernel_tri!): the straddling diagonal tile. Combines the interleaved ROW cap (mre complex
+# rows) with a per-column diagonal threshold. Everything (mre, thr, d0, crow) is in COMPLEX-row
+# units; the ×2 for interleaving lives only in the C address (built by the caller). Real lane
+# l∈0:2W-1 of vector-block mi holds complex row r = l÷2 + (mi-1)·W — baked into a compile-time tuple
+# (0,0,1,1,…) so lanes 2r,2r+1 share a mask bit (re/im store or skip together). No scalar loop.
+@generated function _microkernel_cmplx_tri!(C::Ptr{T}, ldc::Int, ApR::Ptr{T}, ApI::Ptr{T},
+        BpR::Ptr{T}, BpI::Ptr{T}, kc::Int, alr::T, ali::T, mre::Int, nre::Int,
+        d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB},
+        ::Val{B0} = Val(false), ::Val{A1} = Val(false)) where {T, MR, NR, SA, SB, B0, A1}
+    W = _vwidth(T)
+    crowtuple = Expr(:tuple, ((l ÷ 2) for l in 0:(2W - 1))...)   # (0,0,1,1,…,W−1,W−1)
+    storefn = (mi, j, q, st) -> quote
+        if $(j - 1) < nre
+            let qq = $q, thr = d0 + $(j - 1),
+                crow = Vec{$(2W), Int}($crowtuple) + $((mi - 1) * W)
+                mk = (crow < mre) & (upper ? (crow <= thr) : (crow >= thr))
+                $st
+                $(B0 ? :(vstore(resv, qq, mk)) :
+                       :(vstore(vload(Vec{$(2W), $T}, qq, mk) + resv, qq, mk)))
+            end
+        end
+    end
+    _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
+end
+
 # Complex split-pack buffers live in the per-type L3Workspace `cg` field (see src/workspace.jl);
 # `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
 

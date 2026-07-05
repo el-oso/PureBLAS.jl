@@ -1328,6 +1328,72 @@ function _trgemm_packed!(::Val{MR}, ::Val{NR}, up::Bool, α::T, X, tXp::Bool, Y,
     return C
 end
 
+# Single-pass packed triangular-output COMPLEX syrk/herk (the complex analogue of _trgemm_packed!):
+# C[uplo] += α·op(X)·op(Y) (X→A-operand split-pack, Y→B-operand), n×n. Classifies each micro-tile vs
+# the diagonal exactly like the real path (skip-below / full / straddle) — the classification is in
+# complex row/col units and the interleaving is invisible to it. α is applied at the store (alr/ali/A1),
+# NOT folded into the pack (syrk reads the same operand twice → folding would give α²; the complex pack
+# has no α slot anyway). Always accumulates (B0=false); the caller β-pre-scales C's stored triangle via
+# _syrk_scaleC! (herk!/syrk! already do). SA/SB are the operand conj signs (herk conjugates one side).
+function _trgemm_cmplx_packed!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, up::Bool,
+        alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, NR, A1, T}
+    n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = NR
+    kc = min(_KC, k)
+    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
+    ldc = stride(C, 2); sz = sizeof(T)                 # ldc in COMPLEX elements (kernel does the ×2)
+    GC.@preserve C ApR ApI BpR BpI begin
+        Cp0 = Ptr{T}(pointer(C)); ARp = pointer(ApR); AIp = pointer(ApI)
+        BRp = pointer(BpR); BIp = pointer(BpI)
+        jc = 0
+        while jc < n
+            nce = min(nc, n - jc); pc = 0
+            while pc < k
+                kce = min(kc, k - pc)
+                _pack_B_cmplx!(BpR, BpI, Y, pc, jc, kce, nce, tYp, nr)
+                ic = 0
+                while ic < n
+                    mce = min(mc, n - ic)
+                    _pack_A_cmplx!(ApR, ApI, X, ic, pc, mce, kce, tXp, mr)
+                    jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+                            if !skip
+                                aoff = div(ir, mr) * mr * kce * sz
+                                boff = div(jr, nr) * nr * kce * sz
+                                AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
+                                BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
+                                Cblk = Cp0 + (2 * r0 + 2 * c0 * ldc) * sz     # interleaved: ×2 HERE only
+                                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
+                                if full && mre == mr && nre == nr
+                                    _microkernel_cmplx!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false), Val(A1))
+                                elseif full
+                                    _microkernel_cmplx_masked!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        mre, nre, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false), Val(A1))
+                                else
+                                    _microkernel_cmplx_tri!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        mre, nre, c0 - r0, up, Val(_CMR), Val(NR), Val(SA), Val(SB), Val(false), Val(A1))
+                                end
+                            end
+                            ir += mr
+                        end
+                        jr += nr
+                    end
+                    ic += mc
+                end
+                pc += kc
+            end
+            jc += nc
+        end
+    end
+    return C
+end
+
 # Add S's `uplo` triangle into C's; herm → force the diagonal real.
 # @inline so the (possibly SubArray) C/S args passed from the D&C recursion don't escape to a
 # non-inlined callee and heap-box — the recursion drivers rely on this to stay allocation-free.
@@ -1352,6 +1418,31 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T<:BlasReal} =
     (_unified_ok(T) || size(C, 1) <= _SYRK_UNIFIED_MAX) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
         _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
+
+# Complex packed syrk/herk dispatch. X=Y=A (both operands the same array). tXp=tr, tYp=!tr (identical to
+# real _syrk_packed!). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc (cc=herm): herk
+# conjugates the operand that is NOT transposed. zsyrk (herm=false) conjugates neither. A1 = (α==1) skips
+# the store-time complex α-multiply. Post-pass forces C's diagonal real for herk (Hermitian: reference
+# zherk zeroes the diagonal imaginary part on exit; β is real by herk!'s signature so β·C keeps it real).
+@inline function _csyrk_packed!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
+    Tc = eltype(C); a = convert(Tc, α); alr = real(a); ali = imag(a); n = size(C, 1)
+    nrv = (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
+    isone(a) ? _csyrk_conj(Val(true), nrv, up, tr, herm, alr, ali, A, C, k) :
+               _csyrk_conj(Val(false), nrv, up, tr, herm, alr, ali, A, C, k)
+    herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end
+    return C
+end
+@inline function _csyrk_conj(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
+        alr::T, ali::T, A, C, k::Int) where {A1, NR, T}
+    if !herm
+        tr ? _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, A, true, A, false, C, k) :
+             _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, A, false, A, true, C, k)
+    elseif tr
+        _trgemm_cmplx_packed!(Val(-1), Val(1), Val(NR), Val(A1), up, alr, ali, A, true, A, false, C, k)
+    else
+        _trgemm_cmplx_packed!(Val(1), Val(-1), Val(NR), Val(A1), up, alr, ali, A, false, A, true, C, k)
+    end
+end
 
 # The fused two-product syr2k driver's four-buffer scratch (two A-packs, two B-packs) is the per-type
 # L3Workspace `s2` field — `_syr2k_scratch(T, lenA, lenB)` grows and returns it (see src/workspace.jl).
@@ -1586,10 +1677,22 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _vwidth(Float64) == 4 ? 23 : _GEMM_UNPACK_MAX)::Int
-# Large real syrk → single-pass packed (gate); small / complex / herk → recursion (gemm-temp base).
+# n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
+# no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):
+# trans='N' recursion base packs A's contiguous columns via the fast SIMD deinterleave → it WINS small-n
+# (n=8 gates 1.2× on AVX-512), packed wins n≥~24. trans='C'/'T' needs a transposed A-pack → recursion is
+# slow at every small n while the packed path amortizes it, so packed wins uniformly (route it from ~n=4).
+# Complex micro-tile is _CMR·W complex rows (AVX2 z: 4, AVX-512 z: 16). Per-machine Preferences knobs.
+const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int        # trans='N': recursion below this
+const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # trans='C'/'T': packed ~always
+# Large real syrk → single-pass packed (gate); complex syrk/herk → complex packed-tri; small → recursion.
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
-    if !herm && eltype(C) <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
-        return _syrk_packed!(up, tr, convert(eltype(C), α), A, C, k)
+    T = eltype(C)
+    if !herm && T <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
+        return _syrk_packed!(up, tr, convert(T, α), A, C, k)
+    elseif T <: Union{ComplexF64, ComplexF32} && k > 0 &&
+           size(C, 1) > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
+        return _csyrk_packed!(up, tr, herm, α, A, C, k)
     end
     _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)), 0, size(C, 1))
 end
