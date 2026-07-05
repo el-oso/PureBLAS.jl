@@ -229,7 +229,7 @@ function run_cmplx_benchmarks()
     end
     cl3 = OpData[]
     let
-        NN = TN; LT = Char(76); UP = U; TC = Char(67)
+        NN = TN; LT = Char(76); RT = Char(82); UP = U; TC = Char(67)
         ctri(s) = (A = randn(T, s, s) ./ (2s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; A)
         cherm(s) = (A = randn(T, s, s); A = A + A'; for i in 1:s; A[i, i] = real(A[i, i]); end; A)
         addh(nm, mk, ob, pb) = push!(cl3, nm => sweep_heavy(mk, ob, pb, L3SZ))
@@ -248,6 +248,12 @@ function run_cmplx_benchmarks()
         addh("ztrsm", s -> (ctri(s), randn(T, s, s)),
             c -> (B.trsm!(LT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
             c -> (PureBLAS.trsm!(c[2], c[1]; side = LT, uplo = UP); real(c[2][1])))
+        addh("ztrmmR", s -> (ctri(s), randn(T, s, s)),     # side-R: plots measured only side-L → the 0.24
+            c -> (B.trmm!(RT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),   # side-R routing bug went unseen
+            c -> (PureBLAS.trmm!(c[2], c[1]; side = RT, uplo = UP); real(c[2][1])))
+        addh("ztrsmR", s -> (ctri(s), randn(T, s, s)),
+            c -> (B.trsm!(RT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
+            c -> (PureBLAS.trsm!(c[2], c[1]; side = RT, uplo = UP); real(c[2][1])))
     end
     return cl1, cl2, cl3
 end
