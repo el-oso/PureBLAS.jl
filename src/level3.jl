@@ -792,14 +792,30 @@ function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
             if tr
                 rows = fwd ? ((i + 1):k) : (1:(i - 1))
                 for c in 1:n; bic = B[i, c]; @simd for r in rows; B[r, c] -= A[i, r] * bic; end; end
-            else
+            elseif T <: BlasReal
                 aptr = pA + ((i - 1) * lda + (rs - 1)) * sz
                 _trsm_col_r1!(T, rlen, Ptr{T}(aptr), pB, i - 1, rs - 1, n, ldb)
+            else                                             # complex/generic column rank-1 (trtri base ≤16)
+                rows = fwd ? ((i + 1):k) : (1:(i - 1))
+                for c in 1:n; bic = B[i, c]; @simd for r in rows; B[r, c] -= A[r, i] * bic; end; end
             end
         end
     end
     return B
 end
+# Complex trsm side-L base: invert op(A)'s k×k triangle ONCE (generic _trtri! → M⁻¹, reads A once) then
+# B := op(M⁻¹)·B via the gating SIMD complex gemm — vs trsv-per-column re-reading A n times. (op(A)⁻¹ =
+# op(A⁻¹): the gemm carries the trans/conj on the inverse.) The complex analog of the real invL leaf.
+function _trsm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); n = size(B, 2)
+    V = _l3_tmp(T); Vv = view(V, 1:k, 1:k)
+    _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
+    Bt = _trsm_tmp(T, k, n); Btv = view(Bt, 1:k, 1:n)
+    _gemm_core!(Btv, Vv, B, one(T), zero(T), tr, false, cj, false)   # Btv = op(A⁻¹)·B
+    copyto!(B, Btv)
+    return B
+end
+
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
@@ -811,7 +827,9 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
-    elseif k <= _TRMM_BASE
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + one SIMD gemm
+        return _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+    elseif k <= _TRMM_BASE                                 # AD/generic: trsv per column
         @inbounds for c in axes(B, 2)
             _trsv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
         end
