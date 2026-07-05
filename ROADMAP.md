@@ -751,8 +751,11 @@ deinterleave — it starves Zen3's shuffle ports.
   ctrmm wintermute n=64 0.26→0.79 … 1024 0.97; ctrsm n=512 0.75→**0.97**, 1024→**1.00** (gate). galen
   improved but below gate (complex-gemm AVX2 ceiling + trtri/materialize+copyback overhead on small-n).
   NOT in strict dogfood (complex L3 scratch = keyed workspace fallback, 0-alloc but not const-dispatched).
-- **REMAINING L3:** ctrmm/ctrsm **side-R** (unmeasured; mirror side-L: B:=B·M / B:=B·op(M⁻¹)); csymm/csyrk;
-  ctrmm/ctrsm **small-n** (64–256, trtri/materialize overhead) + **AVX2** (below gate).
+- **L3 ctrmm/ctrsm side-R DONE** (c7ce41a): materialized bases mirroring side-L (B:=B·M / B:=B·op(M⁻¹)),
+  nfail=0 all combos. **⇒ triangular complex L3 complete, both sides.**
+- **REMAINING L3:** csymm/csyrk/csyr2k (complex SYMMETRIC — non-Hermitian; less common, check routing);
+  ctrmm/ctrsm **small-n** (64–256, trtri/materialize+copyback overhead) + **AVX2** (below gate — complex-gemm
+  ceiling; ctrmm n=512 in-place microkernel would avoid the copyback but is a deeper rewrite).
 - **AVX2 TUNING RESIDUALS:** gemvN (0.5–0.7), trsv (0.84–0.94), ctrmm/ctrsm — shuffle/latency-bound on Zen3;
   fma primitives suffice (not intrinsic-blocked).
 
