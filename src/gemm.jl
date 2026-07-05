@@ -847,6 +847,11 @@ end
 function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1 = false)
     sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    # prefetch the C output tile (parity with the real microkernel) so the cold read-modify-write store
+    # epilogue overlaps the k-loop — C column j base is at 2·(j-1)·ldc reals (interleaved complex).
+    for j in 1:NR
+        push!(body.args, :(_prefetch(C + $((j - 1) * 2) * ldc * $sz)))
+    end
     for mi in 1:MR, j in 1:NR
         push!(body.args, :($(Symbol(:cr, mi, :_, j)) = zero($V)))
         push!(body.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
@@ -872,7 +877,11 @@ function _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1 = false)
             push!(inner.args, :($ci = muladd($aibr, $br, $ci)))
         end
     end
-    push!(body.args, :(for p in 0:(kc - 1); $inner; end))
+    push!(body.args, quote
+        @inbounds @simd ivdep for p in 0:(kc - 1)
+            $inner
+        end
+    end)
     # store: res = alpha·(cr + i·ci); C += res. C is interleaved [r0 i0 r1 i1 …]; a complex add is an
     # elementwise real add of the interleaved reps, so we only interleave `res` once (no deinterleave
     # of old C) and add straight into C. beta already applied to C. ilv: (r0,i0,r1,i1,…) from [resr;resi].
@@ -1023,7 +1032,7 @@ end
 # was tried and LOST (re-reads B per row-tile: ~0.45 on galen). Complex `_scale_C!` is vectorized too.
 
 # Deinterleave a Vec{2W} [r i r i…] into (reals, imags) via one shuffle each (indices fold at compile).
-@generated function _deint_cmplx(av::Vec{N, T}) where {N, T}
+@inline @generated function _deint_cmplx(av::Vec{N, T}) where {N, T}
     W = N ÷ 2
     ev = Expr(:tuple, (2 * (i - 1) for i in 1:W)...); od = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
     :((shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
