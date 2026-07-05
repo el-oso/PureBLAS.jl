@@ -718,11 +718,35 @@ L2-bandwidth-bound, needs threading" — that was wrong; it was scalar packing, 
 **Standing instruction (2026-06-28): defer ALL multithreading requests until later — keep everything
 single-threaded for now.**
 
-## M5 — complex SIMD + multi-ISA dispatch
+## M5 — complex SIMD + multi-ISA dispatch (IN PROGRESS)
 
-Complex-SIMD for complex kernels (currently correct-but-scalar → the biggest beat-OpenBLAS
-opportunity). Runtime AVX-512/AVX2/NEON dispatch in one build (so a single artifact runs optimally
-across the Zen3/Zen4/Zen5/ARM fleet).
+Complex-SIMD for complex kernels (was correct-but-scalar → the biggest beat-OpenBLAS opportunity).
+Runtime AVX-512/AVX2/NEON dispatch in one build (so a single artifact runs optimally across the fleet).
+
+### Progress (2026-07-04/05)
+
+Complex GEMM family was done earlier (gemm/hemm/herk/syr2k/her2k gate). This session extended the SIMD
+complex path across L1 + much of L2. Two portable interleaved-`Vec{2W}` idioms (NO x86 intrinsics — SIMD.jl
+`fma`/`muladd` suffice): **swap-pairs** for scalar×vector (scal/axpy) and **interleaved-product** (`x·y`,
+`x·swap(y)`, deinterleave only the accumulators) for dot. AVX2 lesson (twice): avoid per-iteration
+deinterleave — it starves Zen3's shuffle ports.
+
+- **L1 DONE — all gate both boxes** (commits 5c4e217, c148aa8, 586ced4): nrm2/asum (real-reinterpret,
+  nrm2 4–6×), scal/axpy (swap-pairs), dotu/dotc (interleaved-product). Each in @verify_strict + dogfood.
+- **L2 gemv N/T/C** (b345b5f): T/C = per-column complex dot (reuses L1 dot) → gate AVX-512 (1.11). N =
+  column-panel driver → gates AVX-512 small-mid (0.99–1.02), large-n memory-ceiling (~0.93, mirrors real
+  gemvN). **AVX2 gemvN 0.5–0.7 (below gate): shuffle/throughput-bound TUNING residual** — a split-`Vec{W}`
+  variant measured WORSE; fma primitives suffice (not intrinsic-blocked). TODO: AVX2 gemvN tuning.
+- **L2 geru/gerc DONE — gate both boxes** (3b62394): per-column complex axpy (reuses L1 axpy), contiguous
+  so no strided/reduction penalty — galen 0.97–1.31, wintermute 1.03–1.32.
+- **REMAINING L2:** hemv/symv (need a fused complex axpy+conj-dot column kernel, like real `_symv_col!`),
+  trmv/trsv (blocked recursion — now can use the complex gemv for off-diagonals + a complex base kernel).
+- **REMAINING L3:** ctrmm/ctrsm/csymm/csyrk etc. — recurse on the (gating) complex gemm; check whether they
+  already route through it or need the complex triangular base. **AVX2 gemvN tuning** also outstanding.
+
+Runtime multi-ISA dispatch (below) still not started — detection is compile-time per-build today.
+
+### Original design
 
 **Design ready (OpenBLAS study 2026-07-02, memory `openblas-complex-simd-design`):** pack SPLIT
 (de-interleave `[Ar…][Ai…]` once at pack time, NOT interleaved+shuffle — the x86 `vmovsldup` trick
