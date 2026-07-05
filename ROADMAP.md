@@ -737,12 +737,20 @@ deinterleave — it starves Zen3's shuffle ports.
   column-panel driver → gates AVX-512 small-mid (0.99–1.02), large-n memory-ceiling (~0.93, mirrors real
   gemvN). **AVX2 gemvN 0.5–0.7 (below gate): shuffle/throughput-bound TUNING residual** — a split-`Vec{W}`
   variant measured WORSE; fma primitives suffice (not intrinsic-blocked). TODO: AVX2 gemvN tuning.
-- **L2 geru/gerc DONE — gate both boxes** (3b62394): per-column complex axpy (reuses L1 axpy), contiguous
-  so no strided/reduction penalty — galen 0.97–1.31, wintermute 1.03–1.32.
-- **REMAINING L2:** hemv/symv (need a fused complex axpy+conj-dot column kernel, like real `_symv_col!`),
-  trmv/trsv (blocked recursion — now can use the complex gemv for off-diagonals + a complex base kernel).
-- **REMAINING L3:** ctrmm/ctrsm/csymm/csyrk etc. — recurse on the (gating) complex gemm; check whether they
-  already route through it or need the complex triangular base. **AVX2 gemvN tuning** also outstanding.
+- **L2 geru/gerc DONE — gate both** (3b62394): per-column complex axpy — galen 0.97–1.31, wintermute 1.03–1.32.
+- **L2 hemv DONE — BEATS OB both** (77d8873): fused axpy+conj-dot column kernel (one A-column read). galen
+  1.28–1.87×, wintermute 1.21–2.01×.
+- **L2 trmv/trsv DONE** (e676b3f): per-column axpy(N)/dot(T/C) reuse, all 48 combos correct. trmv gates
+  both (galen 0.86–1.68), trsv gates AVX-512 (0.96–1.03), AVX2 0.84–0.94 (sequential solve + complex divide
+  — AVX2 residual, but improves scalar 0.57). **⇒ complex L2 essentially complete** (symv skipped — no
+  standard LinearAlgebra complex-symv oracle).
+- **REMAINING L3:** ctrmm 0.84 / ctrsm 0.75 (wintermute). Off-diagonals already route through the gating
+  SIMD complex gemm (`_gemm_acc!`→`_gemm_core!`) and the base is now SIMD trmv-per-column — but still below
+  gate: the base does 128 separate trmv calls per block (per-column overhead) where the REAL trmm base
+  materializes the triangle + one gemm. Likely fix: a complex materialized-triangle base (mirror
+  `_trmm_small!`/`_mat_tri!`). Decompose first.
+- **AVX2 TUNING RESIDUALS:** gemvN (0.5–0.7), trsv (0.84–0.94) — both shuffle/latency-bound on Zen3; fma
+  primitives suffice (not intrinsic-blocked).
 
 Runtime multi-ISA dispatch (below) still not started — detection is compile-time per-build today.
 
