@@ -753,9 +753,17 @@ deinterleave — it starves Zen3's shuffle ports.
   NOT in strict dogfood (complex L3 scratch = keyed workspace fallback, 0-alloc but not const-dispatched).
 - **L3 ctrmm/ctrsm side-R DONE** (c7ce41a): materialized bases mirroring side-L (B:=B·M / B:=B·op(M⁻¹)),
   nfail=0 all combos. **⇒ triangular complex L3 complete, both sides.**
-- **REMAINING L3:** csymm/csyrk/csyr2k (complex SYMMETRIC — non-Hermitian; less common, check routing);
-  ctrmm/ctrsm **small-n** (64–256, trtri/materialize+copyback overhead) + **AVX2** (below gate — complex-gemm
-  ceiling; ctrmm n=512 in-place microkernel would avoid the copyback but is a deeper rewrite).
+- **csymm/csyrk/csyr2k ALREADY GATE** (measured csymm 1.08, csyrk 1.05) — they're built on the complex
+  gemm/packed kernels. ⇒ **the entire complex L1/L2/L3 surface is now SIMD.**
+- **REMAINING (residuals only):** ctrmm/ctrsm **small-n** (64–256, trtri/materialize+copyback overhead) and
+  **AVX2** (below gate — complex-gemm ceiling; ctrmm n=512 in-place microkernel would avoid the copyback,
+  a deeper rewrite); gemvN/trsv **AVX2** tuning. These mirror the real ops' small-n/AVX2 hard spots.
+- **NOT STARTED:** runtime multi-ISA dispatch (AVX-512/AVX2/NEON in one artifact) — detection is
+  compile-time per-build today. That's the other half of M5's title; a separate feature.
+
+**M5 core goal ACHIEVED:** the complex surface (was the biggest beat-OpenBLAS opportunity) is SIMD across
+L1/L2/L3 — gates/beats OpenBLAS broadly (esp. AVX-512: hemv 2.0×, nrm2 4–6×, most ops ≥1.0×). Remaining is
+residual tuning + the multi-ISA-dispatch feature.
 - **AVX2 TUNING RESIDUALS:** gemvN (0.5–0.7), trsv (0.84–0.94), ctrmm/ctrsm — shuffle/latency-bound on Zen3;
   fma primitives suffice (not intrinsic-blocked).
 
