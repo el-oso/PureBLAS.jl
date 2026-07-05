@@ -261,9 +261,14 @@ end
         x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
 end
 
-# Complex gemv-N row-tile height (in W-complex vectors). Vec{2W} accumulators (AVX2 → 2 regs each), so a
-# smaller MR than the real kernel. Preferences-tunable; swept per fleet box.
-const _CGEMV_MR = @load_preference("cgemv_mr", _vwidth(Float64) == 4 ? 3 : 4)::Int
+# Complex gemv-N row-tile height (in W-complex vectors). Each y-tile is a Vec{2W} accumulator (AVX2 →
+# 2 ymm each). gemvN is ILP-bound: more independent tiles hide Zen3's fma latency — but 2W-wide accs
+# eat the 16-ymm file fast, so MR=4 (4 chains, ~14 ymm) is the measured AVX2 optimum (MR=5 spills,
+# split-accumulators need MR too small to amortize A). AVX-512's 32 zmm has ample room. Swept per box.
+const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
+# Off-diagonal tri-scatter is a TALL skinny gemv (m≫n=NB); MR=4 that suits square gemvN regresses it
+# (worse panel/cache behavior), so the scatter uses its own smaller MR. Decoupled per shape.
+const _CGEMV_MR_SCAT = @load_preference("cgemv_mr_scat", 3)::Int
 # Complex gemv-T/C column-block width (cols/pass). Each col needs 2 Vec{2W} accs (p,q); AVX2's 16 regs
 # → 2, AVX-512 → 4. Sharing xc + its swap across the block is the win (fewer shuffles, x streamed once).
 const _CGEMVT_NC = @load_preference("cgemvt_nc", _vwidth(Float64) == 4 ? 2 : 4)::Int
@@ -306,8 +311,9 @@ end
 
 # Driver: pre-scale y by β once, then column-panels × row-tiles accumulate (RMW y). W-remainder blocks
 # (Val(1)) + scalar tail per panel handle m not a multiple of MR·W.
-function _gemv_n_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T<:BlasReal, B0}
-    W = _vwidth(T); mr = _CGEMV_MR * W; sz = sizeof(T); αr = real(α); αi = imag(α)
+function _gemv_n_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0},
+        ::Val{MR} = Val(_CGEMV_MR)) where {T<:BlasReal, B0, MR}
+    W = _vwidth(T); mr = MR * W; sz = sizeof(T); αr = real(α); αi = imag(α)
     GC.@preserve A x y begin
         Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(pointer(y)); xp = Ptr{T}(pointer(x)); ldc = stride(A, 2)
         if B0
@@ -321,7 +327,7 @@ function _gemv_n_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T},
             Peff = min(np, n - jc)
             i0 = 0
             while i0 + mr <= m
-                _gemv_n_block_cmplx!(yp + i0 * 2 * sz, Ap + i0 * 2 * sz, ldc, xp, jc, Peff, αr, αi, Val(_CGEMV_MR)); i0 += mr
+                _gemv_n_block_cmplx!(yp + i0 * 2 * sz, Ap + i0 * 2 * sz, ldc, xp, jc, Peff, αr, αi, Val(MR)); i0 += mr
             end
             while i0 + W <= m
                 _gemv_n_block_cmplx!(yp + i0 * 2 * sz, Ap + i0 * 2 * sz, ldc, xp, jc, Peff, αr, αi, Val(1)); i0 += W
@@ -1063,7 +1069,7 @@ end
 # Complex off-diagonal scatters for blocked trmv/trsv: y += α·op(Av)·xv (β=1 accumulate), reusing the
 # gating complex gemv kernels. N → gemv-N; T/C → gemv-T/C with cj resolved to a compile-time Val.
 @inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
-    _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
+    _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false), Val(_CGEMV_MR_SCAT))
 @inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
     cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
          _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))
