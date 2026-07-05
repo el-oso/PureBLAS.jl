@@ -80,6 +80,7 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'N')   # complex gemv SIMD
             gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'C')
             ger!(bk, 1.5, um, vm, Ad)
+            ger!(bk, 1.5 + 0.5im, uz, wz, Az)     # complex geru/gerc: per-column complex axpy
             symv!(bk, vm, Ad, um)
             hemv!(bk, wz, Az, uz)
             trmv!(bk, Ad, um)

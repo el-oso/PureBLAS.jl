@@ -412,11 +412,29 @@ end
     return A
 end
 
+# Complex rank-1: A[:,j] += (α·(cj ? conj(y[j]) : y[j]))·x — one complex axpy of x into each contiguous
+# column, reusing the L1 _axpy_cmplx_simd! kernel (like the real _ger_simd! reuses _axpy_simd!).
+function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T<:BlasReal}
+    csz = sizeof(Complex{T})
+    GC.@preserve A x y begin
+        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2)
+        @inbounds for j in 1:n
+            yj = cj ? conj(unsafe_load(yptr, j)) : unsafe_load(yptr, j)
+            ayj = α * yj
+            iszero(ayj) || _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xptr, Aptr + (j - 1) * lda * csz)
+        end
+    end
+    return A
+end
+
 # A := α·x·yᵀ + A  (geru); cj=true gives α·x·yᴴ (gerc).
 function _ger!(cj::Bool, m::Integer, n::Integer, α::Number, x, incx::Integer, y, incy::Integer, A)
     iszero(α) && return A
     if _l2_simd_ok(A, x, y, incx, incy)
         return _ger_simd!(Int(m), Int(n), convert(eltype(A), α), x, y, A)
+    end
+    if _l2c_ok(A, x, y, incx, incy)
+        return _ger_cmplx!(Int(m), Int(n), convert(eltype(A), α), x, y, A, cj)
     end
     iy = _start(n, incy)
     @inbounds for j in 1:n
