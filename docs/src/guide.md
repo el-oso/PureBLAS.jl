@@ -17,8 +17,9 @@ All operations accept any `AbstractVector{T}` with `T<:Number` — the BLAS type
 | `PureBLAS.asum(x)` | `Σ|xᵢ|` (complex: `Σ|Re|+|Im|`) |
 | `PureBLAS.iamax(x)` | 1-based index of `argmax|xᵢ|` |
 
-Real, unit-stride, dense vectors take the SIMD.jl fast path; complex, strided, and AD element
-types take a generic scalar loop (which is what makes the calls differentiable).
+Real **and complex** unit-stride dense inputs take a SIMD.jl fast path (the complex path uses portable
+interleaved-`Vec` kernels — see the Performance page's Complex section); strided inputs and AD element
+types (e.g. `ForwardDiff.Dual`) take the generic scalar loop, which is what keeps the calls differentiable.
 
 ### Automatic differentiation
 

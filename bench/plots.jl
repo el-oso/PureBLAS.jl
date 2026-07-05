@@ -186,6 +186,72 @@ end
     return l1, l2, l3, lp
 end
 
+# ── Complex (ComplexF64) surface: the M5 complex-SIMD work. Same methodology; separate plot family so the
+# real (Float64) plots stay clean. L1/L2 violins, L3 trend. Oracle = OpenBLAS/MKL complex BLAS. ────────
+function run_cmplx_benchmarks()
+    T = ComplexF64; TC = Char(67)
+    ca = one(T); cb = zero(T)
+    cl1 = OpData[]
+    let
+        for (nm, ob, pb) in (
+            ("zaxpy", (c, m) -> (for _ in 1:m; B.axpy!(1.7 + 0.3im, c[1], c[2]); end; real(c[2][1])),
+                      (c, m) -> (for _ in 1:m; PureBLAS.axpy!(c[2], 1.7 + 0.3im, c[1]); end; real(c[2][1]))),
+            ("zdotc", (c, m) -> (s = zero(T); for _ in 1:m; s += B.dotc(c[1], c[2]); end; real(s)),
+                      (c, m) -> (s = zero(T); for _ in 1:m; s += PureBLAS.dot(c[1], c[2]); end; real(s))),
+            ("zscal", (c, m) -> (for _ in 1:m; B.scal!(1.0000001 + 0im, c[1]); end; real(c[1][1])),
+                      (c, m) -> (for _ in 1:m; PureBLAS.scal!(1.0000001 + 0im, c[1]); end; real(c[1][1]))),
+            ("dznrm2", (c, m) -> (s = 0.0; for _ in 1:m; s += B.nrm2(c[1]); end; s),
+                       (c, m) -> (s = 0.0; for _ in 1:m; s += PureBLAS.nrm2(c[1]); end; s)),
+            ("dzasum", (c, m) -> (s = 0.0; for _ in 1:m; s += B.asum(c[1]); end; s),
+                       (c, m) -> (s = 0.0; for _ in 1:m; s += PureBLAS.asum(c[1]); end; s)),
+        )
+            push!(cl1, nm => sweep(s -> (randn(T, s), randn(T, s)), L1SZ, ob, pb, _L1REP))
+        end
+    end
+    cl2 = OpData[]
+    let
+        sq(s) = (randn(T, s, s), randn(T, s), randn(T, s))
+        herm(s) = (A = randn(T, s, s); A = A + A'; for i in 1:s; A[i, i] = real(A[i, i]); end; (A, randn(T, s), randn(T, s)))
+        tri(s) = (A = randn(T, s, s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; (A, randn(T, s), randn(T, s)))
+        add(nm, mk, ob, pb) = push!(cl2, nm => sweep(mk, L2SZ, ob, pb, _L2REP))
+        add("zgemvN", sq, (c, m) -> (for _ in 1:m; B.gemv!(TN, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = ca, beta = cb); end; real(c[3][1])))
+        add("zgemvC", sq, (c, m) -> (for _ in 1:m; B.gemv!(TC, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = ca, beta = cb, trans = TC); end; real(c[3][1])))
+        add("zgeru", sq, (c, m) -> (for _ in 1:m; B.geru!(ca, c[2], c[3], c[1]); end; real(c[1][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.ger!(ca, c[2], c[3], c[1]); end; real(c[1][1])))
+        add("zhemv", herm, (c, m) -> (for _ in 1:m; B.hemv!(U, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.hemv!(c[3], c[1], c[2]; uplo = U, alpha = ca, beta = cb); end; real(c[3][1])))
+        add("ztrmv", tri, (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); B.trmv!(U, TN, TN, c[1], c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trmv!(c[1], c[3]; uplo = U); end; real(c[3][1])))
+        add("ztrsv", tri, (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); B.trsv!(U, TN, TN, c[1], c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trsv!(c[1], c[3]; uplo = U); end; real(c[3][1])))
+    end
+    cl3 = OpData[]
+    let
+        NN = TN; LT = Char(76); UP = U; TC = Char(67)
+        ctri(s) = (A = randn(T, s, s) ./ (2s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; A)
+        cherm(s) = (A = randn(T, s, s); A = A + A'; for i in 1:s; A[i, i] = real(A[i, i]); end; A)
+        addh(nm, mk, ob, pb) = push!(cl3, nm => sweep_heavy(mk, ob, pb, L3SZ))
+        addh("zgemm", s -> (randn(T, s, s), randn(T, s, s), zeros(T, s, s)),
+            c -> (B.gemm!(NN, NN, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
+            c -> (PureBLAS.gemm!(c[3], c[1], c[2]); real(c[3][1])))
+        addh("zhemm", s -> (cherm(s), randn(T, s, s), zeros(T, s, s)),
+            c -> (B.hemm!(LT, UP, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
+            c -> (PureBLAS.hemm!(c[3], c[1], c[2]; side = LT, uplo = UP, alpha = ca, beta = cb); real(c[3][1])))
+        addh("zherk", s -> (randn(T, s, s), zeros(T, s, s)),
+            c -> (B.herk!(UP, NN, 1.0, c[1], 0.0, c[2]); real(c[2][1])),
+            c -> (PureBLAS.herk!(c[2], c[1]; uplo = UP, trans = NN, alpha = 1.0, beta = 0.0); real(c[2][1])))
+        addh("ztrmm", s -> (ctri(s), randn(T, s, s)),
+            c -> (B.trmm!(LT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
+            c -> (PureBLAS.trmm!(c[2], c[1]; side = LT, uplo = UP); real(c[2][1])))
+        addh("ztrsm", s -> (ctri(s), randn(T, s, s)),
+            c -> (B.trsm!(LT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
+            c -> (PureBLAS.trsm!(c[2], c[1]; side = LT, uplo = UP); real(c[2][1])))
+    end
+    return cl1, cl2, cl3
+end
+
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
 const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFBK == "mkl" ? "_mkl" : "").txt")
 function save_cache(path, groups)
@@ -318,22 +384,34 @@ elseif !("bench" in ARGS) && isfile(CACHE)
     g = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     l1, l2, l3, lp = run_benchmarks()
-    g = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp)
-    save_cache(CACHE, ["L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp])
+    cl1, cl2, cl3 = run_cmplx_benchmarks()
+    g = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3)
+    save_cache(CACHE, ["L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3])
 end
 
 adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
 # ISA label/slug from the detected SIMD width so per-machine plots are self-labelled and don't collide
 # (the docs show AVX-512 and AVX2 side by side). AVX-512 W64=8, AVX2 W64=4, NEON W64=2.
 const _W64P = PureBLAS._vwidth(Float64)
-const ISA = _W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
+# ISA label. Same-ISA machines collide on the auto slug (Zen4 & Zen5 are both AVX-512) → allow `slug=NAME`
+# and `isa=LABEL` overrides (e.g. `plots.jl bench slug=zen5 isa="AVX-512 native (Zen5)"`) so the fleet's
+# per-µarch plots don't overwrite each other.
+const _ISAOVR = (i = findfirst(a -> startswith(a, "isa="), ARGS); i === nothing ? nothing : ARGS[i][5:end])
+const _SLUGOVR = (i = findfirst(a -> startswith(a, "slug="), ARGS); i === nothing ? nothing : ARGS[i][6:end])
+const ISA = _ISAOVR !== nothing ? _ISAOVR :
+    (_W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD")
 const _SLUGB = _W64P == 8 ? "avx512" : _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
-const SLUG = REFBK == "mkl" ? "$(_SLUGB)_mkl" : _SLUGB
+const SLUG = _SLUGOVR !== nothing ? _SLUGOVR : (REFBK == "mkl" ? "$(_SLUGB)_mkl" : _SLUGB)
 const TITLE = "PureBLAS / $REFNAME ($ISA, 1 thread, Float64)"
 svg_violins(joinpath(adir, "perf_l1_$SLUG.svg"), "BLAS-1: $TITLE", g["L1"])
 svg_violins(joinpath(adir, "perf_l2_$SLUG.svg"), "BLAS-2: $TITLE", g["L2"])
 svg_trend(joinpath(adir, "perf_l3_$SLUG.svg"), "BLAS-3: $TITLE", g["L3"])
 svg_trend(joinpath(adir, "perf_lapack_$SLUG.svg"), "LAPACK: $TITLE", g["LP"])
+# Complex (ComplexF64) surface — the M5 SIMD complex path (only when the cache has it).
+const CTITLE = "PureBLAS / $REFNAME ($ISA, 1 thread, ComplexF64)"
+haskey(g, "CL1") && svg_violins(joinpath(adir, "perf_cl1_$SLUG.svg"), "Complex BLAS-1: $CTITLE", g["CL1"])
+haskey(g, "CL2") && svg_violins(joinpath(adir, "perf_cl2_$SLUG.svg"), "Complex BLAS-2: $CTITLE", g["CL2"])
+haskey(g, "CL3") && svg_trend(joinpath(adir, "perf_cl3_$SLUG.svg"), "Complex BLAS-3: $CTITLE", g["CL3"])
 for lvl in ("L1", "L2", "L3", "LP"), (nm, op) in get(g, lvl, OpData[])
     geo, mn = geomin(op)
     @printf("%s %-7s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
