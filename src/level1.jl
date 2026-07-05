@@ -32,8 +32,12 @@ function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
     (incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
     if incx == 1 && _cplx_re(x)
-        ac = convert(_et(x), a)                            # interleaved-complex SIMD scale
-        return _scal_cmplx_simd!(Int(n), real(ac), imag(ac), x)
+        ac = convert(_et(x), a)
+        if iszero(imag(ac))                                # real scalar × complex vec = real scal over 2n
+            GC.@preserve x _scal_simd!(2 * Int(n), real(ac), _reptr(x))   # reals (OB fast-paths this too)
+            return x
+        end
+        return _scal_cmplx_simd!(Int(n), real(ac), imag(ac), x)   # true complex → interleaved swap-multiply
     end
     ix = _start(n, incx)
     @inbounds for _ in 1:n
