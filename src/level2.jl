@@ -270,7 +270,9 @@ const _CGEMVT_NC = @load_preference("cgemvt_nc", _vwidth(Float64) == 4 ? 2 : 4):
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
-const _CGEMV_RB = @load_preference("cgemv_rb", 65536)::Int   # m·n complex threshold for one-panel mode
+# Threshold keyed to detected L2 (A fits when m·n·sizeof(ComplexF64) ≤ L2) — NOT hardcoded, so Zen3's
+# 512 KiB L2 doesn't inherit Zen4's 1 MiB assumption and thrash mid-n (one-panel row-tile re-reads A).
+const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n complex threshold for one-panel mode
 
 # Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
 # into y (y pre-scaled by β by the driver). Interleaved Vec{2W} accumulators; per column cⱼ=α·x[j],
