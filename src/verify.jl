@@ -77,6 +77,8 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             # ── Level 2 (dense hot paths; real + complex)
             gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'N')
             gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'T')
+            gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'N')   # complex gemv SIMD
+            gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'C')
             ger!(bk, 1.5, um, vm, Ad)
             symv!(bk, vm, Ad, um)
             hemv!(bk, wz, Az, uz)
