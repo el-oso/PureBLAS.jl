@@ -386,11 +386,14 @@ const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # has no cache-blocked faer syrk so it fades by n≈256 — drop the base to 128 so large-n rides gating
 # syrk! (measured: n=1024 0.70→0.87, n=2048 0.85→0.91 on Zen3). ponytail: per-ISA knob.
 const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : 128
-# Pad when columns alias L1 sets: Zen4 L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
-# (stride % 512 == 0) maps every column to the same sets. Covers po2 ≥512 AND 1536, 2560, … —
-# faer's plain ispow2 missed the non-po2 multiples. WIDENED to %256 (half-period, 2 sets/column):
-# lda=256 measured a 1.77× penalty in the faer right-looking kernel (287µs → 162µs at ld=264).
-@inline _chol_needs_pad(A, n) = n >= 128 && stride(A, 2) % 256 == 0
+# Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
+# (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =
+# quarter-period (4 cols/set) — both thrash L1. But the pad is an n² copy round-trip, so it only wins
+# when it's cheap vs the aliasing it removes: strong (%256) aliasing always, OR quarter-period (%128)
+# only when the matrix is L2-resident (copy cheap, L1-aliasing-dominated). Measured on Zen3: n=128
+# (128 KB, %128) 0.887→1.018 (pad wins); n=384 (1.1 MB > L2, %128 not %256) 0.918→0.899 (pad LOSES).
+@inline _chol_needs_pad(A, n) = n >= 128 && stride(A, 2) % 128 == 0 &&
+    (stride(A, 2) % 256 == 0 || n * n <= _L2_BYTES ÷ 8)
 
 # Hybrid driver: the faer kernels are fastest at small/medium n but their syrk isn't cache-blocked, so
 # they fade at large n (panel re-streamed). Recurse by halving — the big off-diagonal blocks go through
