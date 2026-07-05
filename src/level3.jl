@@ -181,12 +181,28 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     end
     return B
 end
+# Complex trmm side-L base: materialize op(A)'s k×k triangle ONCE into scratch, then B := M·B via the
+# gating SIMD complex gemm — reads A once, vs trmv-per-column re-reading A's triangle n times (O(k²n)).
+# The complex analog of the real `_trmm_small!` (materialize + microkernel). k ≤ _TRMM_BASE = _L3_NB.
+function _trmm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); n = size(B, 2)
+    M = _l3_tmp(T); Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)               # M = op(A) triangle (generic over T; no conj)
+    cj && @inbounds(Mv .= conj.(Mv))                # 'C' variant: conjugate the materialized op
+    Bt = _trsm_tmp(T, k, n); Btv = view(Bt, 1:k, 1:n)
+    gemm!(Btv, Mv, B)                               # Btv = M·B  (complex SIMD gemm)
+    copyto!(B, Btv)                                 # B := M·B
+    return B
+end
+
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _TRMM_DDIRECT ? _trmm_dense_L!(up, tr, unit, A, B) :
                                     _trmm_small!(true, up, tr, unit, A, B)
-    elseif k <= _TRMM_BASE                          # complex/AD: trmv on each B column (contiguous)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: materialize + one SIMD gemm
+        return _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+    elseif k <= _TRMM_BASE                          # AD/generic: trmv on each B column (contiguous)
         @inbounds for c in axes(B, 2)
             _trmv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
         end
