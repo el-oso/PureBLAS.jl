@@ -49,3 +49,9 @@ end
 const _L1_BYTES = let s = Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
+
+# L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
+# "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
+const _L2_BYTES = let s = Int(cache_size(Val(2)))
+    s > 0 ? s : 512 * 1024
+end
