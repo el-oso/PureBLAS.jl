@@ -146,6 +146,20 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       (bit-exact faer path preserved there). Reassociates the reduction (loses faer bit-exactness on the split
       path, stays OpenBLAS-correct ~1e-14). Payoff marginal (base runs only at n≤64) and **static-only —
       unvalidated on real Haswell**; flip `chol_base_split` off if a real run shows it doesn't help.
+    - **potrf AVX2 po2-stride GATE CLOSED (2026-07-05) — fused `@inline` panel driver, BEATS OpenBLAS.**
+      `_chol_panel_f64!` (lapack.jl) replaces the whole-pad on AVX2 for po2 strides n>128: per NB=128
+      block, factor the diag in a conflict-free D scratch, solve the panel INTO a conflict-free T via a
+      split-ld faer trsm whose FIRST TOUCH reads po2 A21 (copy-in fused away), trailing update reads T
+      (@inline split syrk when T ≤ L2/2, packed syrk! reading T above), single streaming writeback T→A21.
+      **galen (BenchmarkTools, boost off, taskset): PB/OB = 256 1.08 · 512 1.06–1.07 · 1024 1.04–1.05 ·
+      2048 1.03–1.04** (was 0.92/0.95/0.96/0.97 whole-pad; nopad ceiling 0.99–1.01 — the driver beats it
+      because the composition is better, not just the stride fix). Decisive lever (per-stage decomposition):
+      the MR=1×4 trsm gemm-pass was load-port-bound (25% slower than packed trsm!); upgrading it to the
+      **MR=3×NC=4 12-accumulator tile** (7 loads/12 FMAs) made the split trsm FASTER than packed trsm!
+      (318 vs 411 µs @512). AVX-512 + non-po2 + n≤128 untouched. Bit-reproducible, relerr ≤4e-16 at
+      n∈{129,200,256,384,512,1000,1024,2048} po2 parent strides, 0-alloc steady state, suite green both
+      boxes. Fusion verified: `@code_llvm` shows the split kernels fully inlined (387 fmuladd.v4f64 in the
+      driver body; native 558 vfnmadd). kb `pureblas-cholesky.md` has the full stage decomposition.
     - **DISPROVEN (2026-07-02, do NOT re-try): unpacked triangular small-n syrk.** Built
       `_microkernel_unpacked_u!` + `_syrk_unpacked!` (compute the triangle directly from column-major A,
       no packing, no 2× waste) and routed small-n W<8 real trans='N' to it. **Measured WORSE:** n=8
