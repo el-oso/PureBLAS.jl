@@ -195,6 +195,18 @@ function _trmm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A
     return B
 end
 
+# Complex trmm side-R base: B := B·op(A). Materialize op(A) once, then one SIMD complex gemm (B·M).
+function _trmm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); m = size(B, 1)
+    M = _l3_tmp(T); Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)
+    cj && @inbounds(Mv .= conj.(Mv))
+    Bt = _trsm_tmp(T, m, k); Btv = view(Bt, 1:m, 1:k)
+    gemm!(Btv, B, Mv)                               # Btv = B·M
+    copyto!(B, Btv)
+    return B
+end
+
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
@@ -412,6 +424,8 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         if eltype(B) <: BlasReal && !cj
             return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                                         _trmm_small!(false, up, tr, unit, A, B)
+        elseif eltype(B) <: BlasComplex
+            return _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
         end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
@@ -816,6 +830,17 @@ function _trsm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A
     return B
 end
 
+# Complex trsm side-R base: B := B·op(A)⁻¹ = B·op(A⁻¹). Invert once (_trtri!), then one SIMD complex gemm.
+function _trsm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); m = size(B, 1)
+    V = _l3_tmp(T); Vv = view(V, 1:k, 1:k)
+    _trtri!(Vv, A, k, up, unit)
+    Bt = _trsm_tmp(T, m, k); Btv = view(Bt, 1:m, 1:k)
+    _gemm_core!(Btv, B, Vv, one(T), zero(T), false, tr, false, cj)   # Btv = B·op(A⁻¹)
+    copyto!(B, Btv)
+    return B
+end
+
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
@@ -901,6 +926,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invR!(up, tr, unit, A, B)
         end
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + one SIMD gemm
+        return _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
     elseif k <= _TRMM_BASE
         return _trsm_right_base!(up, tr, cj, unit, k, A, B)
     end
