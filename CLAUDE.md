@@ -88,6 +88,17 @@ Zen5 native-AVX512 / future M5 ARM — the 0.96× gate is evaluated per machine)
 
 ## Standing rules
 
+- **A sub-1.0 PB/OB ratio is NEVER a "ceiling" — it is an implementation gap.** OpenBLAS runs on the
+  *same silicon*; if it reaches ≥1.0, the hardware is demonstrably capable, so any `PB/OB < 1.0` is an
+  algorithm/kernel-formulation problem in PureBLAS, full stop. Do **not** write "ceiling," "near-ceiling,"
+  "hardware limit," or "irreducible" for a sub-gate number OB beats. The word "ceiling" is reserved for a
+  limit that binds OB too (a real roofline: bandwidth / instruction throughput / unhideable latency) —
+  and then you must show OB is also stuck there. When tempted to shelve a residual as a ceiling, instead
+  ask **how OpenBLAS achieves it on this machine** and target that mechanism (e.g. OB packs every L3
+  operand → po2-`lda`-immune; a PB kernel that reads the matrix directly is the gap). See memory
+  `no-ceiling-if-openblas-does-it` + `gate-is-non-negotiable`. (Same root error as "assume Rust is
+  faster without measuring.")
+
 - **SIMD microkernel pipelining.** A register-blocked microkernel's k-reduction loop wants (a) a
   **prefetch of the output (C) tile at entry** (overlaps the cold RMW store epilogue), and (b)
   possibly **`@inbounds @simd ivdep`** on the k-loop (register accumulators, no cross-iteration
