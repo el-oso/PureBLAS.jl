@@ -6,12 +6,13 @@ parity; the dashed line is the 0.96× gate**). Each **violin** is the distributi
 size sweep (and rounds); the horizontal line is the median and the dark dot is the *worst* size — a violin
 is green only when **every** size clears the gate.
 
-Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64 (plus ComplexF64 for
-`zgemm`), native PureBLAS API vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS
+Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64 (plus the full **ComplexF64**
+surface — see the Complex section), native PureBLAS API vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS
 then PureBLAS back-to-back so frequency drift cancels), **median** of many rounds, core pinned with
 `taskset`, and — importantly — **CPU boost disabled** (a floating boost clock silently biases small-n
 ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.jl`. Each section shows
-**both** ISAs of the dev fleet — **AVX-512** (Zen4, the primary tuning target) and native **AVX2** (Zen3).
+the dev fleet — double-pumped **AVX-512** (Zen4, the primary tuning target), native **AVX2** (Zen3), and
+native 512-bit **AVX-512** (Zen5, `neuromancer`) — so per-µarch differences are visible side by side.
 
 ## Per-ISA gate (dev fleet)
 
@@ -120,6 +121,10 @@ performance-neutral single-thread (measured, tiny-n within noise).
 
 ![BLAS-1 ratio vs OpenBLAS, AVX2](assets/perf_l1_avx2.svg)
 
+**Zen5 (native AVX-512):**
+
+![BLAS-1 ratio vs OpenBLAS, Zen5](assets/perf_l1_zen5.svg)
+
 Bandwidth-bound; PureBLAS matches or beats OpenBLAS across the board. `nrm2` is markedly faster
 because OpenBLAS's `dnrm2` uses the slow always-scaled LAPACK algorithm, while PureBLAS uses a SIMD
 sum-of-squares with a scaled fallback only on overflow/underflow.
@@ -133,6 +138,10 @@ sum-of-squares with a scaled fallback only on overflow/underflow.
 **AVX2 (Zen3):**
 
 ![BLAS-2 ratio vs OpenBLAS, AVX2](assets/perf_l2_avx2.svg)
+
+**Zen5 (native AVX-512):**
+
+![BLAS-2 ratio vs OpenBLAS, Zen5](assets/perf_l2_zen5.svg)
 
 Matrix-vector and the packed/banded variants. The headline lessons (full detail in the project's
 `kb/` findings):
@@ -155,6 +164,10 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 **AVX2 (Zen3):**
 
 ![BLAS-3 ratio vs OpenBLAS, AVX2](assets/perf_l3_avx2.svg)
+
+**Zen5 (native AVX-512):**
+
+![BLAS-3 ratio vs OpenBLAS, Zen5](assets/perf_l3_zen5.svg)
 
 The compute-bound level — **median ratio vs size** (log-log). On **AVX-512**
 every op's geomean clears the 0.96× gate and small sizes run 1–3× OpenBLAS (the former small-n dips were
@@ -181,6 +194,10 @@ complex split-pack kernel (real+imag panels, 4-real-FMA MAC); the rest are built
 
 ![LAPACK ratio vs OpenBLAS, AVX2](assets/perf_lapack_avx2.svg)
 
+**Zen5 (native AVX-512):**
+
+![LAPACK ratio vs OpenBLAS, Zen5](assets/perf_lapack_zen5.svg)
+
 Factorizations driven by the gated BLAS, again **median ratio vs size** for **Zen4/AVX-512** — gating at
 every size, with tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. (On AVX2, `geqrf`/
 `gesvd`/`getrf` gate every size and tiny-n factors run 1.3–2.5×; the only sub-gate cells are `potrf`
@@ -190,6 +207,43 @@ with PureBLAS `gemm!`/`trsm!`; `getrf` is blocked right-looking with a BLAS-3 bl
 pivoting; `gesvd` is
 gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transform.
 
+## Complex (ComplexF64)
+
+The complex surface is now **SIMD across L1/L2/L3** — it used to be scalar except `zgemm`. The kernels are
+portable (SIMD.jl `Vec`/`fma`, no x86 intrinsics): a **swap-pairs** complex multiply for scalar×vector
+(scal/axpy/ger), an **interleaved-product** reduction for the complex dot (deinterleave only the
+accumulators — cheap on AVX2's shuffle ports), a **real-reinterpret** trick for `nrm2`/`asum` (which reduce
+exactly to the real kernel over the 2n-real buffer), a **fused axpy+conj-dot** column kernel for `hemv`, and
+**materialized-triangle / triangular-inverse bases** for `trmm`/`trsm` that read A once via the gating
+complex `gemm`. The generic scalar path is kept as the AD (ForwardDiff/Enzyme) path.
+
+**Complex BLAS-1 / BLAS-2 (violins) — AVX-512 (Zen4):**
+
+![Complex BLAS-1, AVX-512](assets/perf_cl1_avx512.svg)
+![Complex BLAS-2, AVX-512](assets/perf_cl2_avx512.svg)
+
+**AVX2 (Zen3):**
+
+![Complex BLAS-1, AVX2](assets/perf_cl1_avx2.svg)
+![Complex BLAS-2, AVX2](assets/perf_cl2_avx2.svg)
+
+**Zen5 (native AVX-512):**
+
+![Complex BLAS-1, Zen5](assets/perf_cl1_zen5.svg)
+![Complex BLAS-2, Zen5](assets/perf_cl2_zen5.svg)
+
+**Complex BLAS-3 (trend) — AVX-512 (Zen4), AVX2 (Zen3), Zen5:**
+
+![Complex BLAS-3, AVX-512](assets/perf_cl3_avx512.svg)
+![Complex BLAS-3, AVX2](assets/perf_cl3_avx2.svg)
+![Complex BLAS-3, Zen5](assets/perf_cl3_zen5.svg)
+
+On **AVX-512** the whole complex surface gates or beats OpenBLAS — `hemv` ≈ **2×**, `dznrm2` **4–6×**
+(OpenBLAS's is the slow always-scaled `dznrm2`), `zgemm`/`zhemm`/`zherk` 1.05–1.4×, complex `trsm` gates at
+large n. The remaining sub-gate cells are AVX2 and small-n complex-triangular ops (`ztrmm`/`ztrsm` carry the
+same materialize/copyback + complex-`gemm` overhead that bounds them there) and `zgemvN` on AVX2 (shuffle-
+throughput-bound on Zen3) — the same small-n/AVX2 hard spots the real ops have.
+
 ## Milestones
 
 | Milestone | Scope | Status |
@@ -198,7 +252,7 @@ gebrd → divide-and-conquer bidiagonal SVD → blocked compact-WY back-transfor
 | **M2** | `dgemm` (BLIS 5-loop + SIMD microkernel; unpacked small-matrix path) | ✅ single-thread parity (geomean ≈ 1.0×) |
 | **M3 (core L2)** | gemv, ger, symv, hemv, trmv, trsv + packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv) | ✅ gate met across the surface |
 | **L3** | gemm, symm, syrk, syr2k, trmm, trsm | ✅ AVX-512 gates all n; AVX2 gates gemm + syrk + syr2k + symm + **trsm**; trmm n=8 WIP |
-| **L3 complex** | zgemm (ComplexF64 split-pack SIMD) | ✅ beats OpenBLAS on AVX-512; gates on AVX2 |
+| **M5 complex SIMD** | whole ComplexF64 surface — L1 (nrm2/asum/scal/axpy/dotu/dotc), L2 (gemv/ger/hemv/trmv/trsv), L3 (gemm/hemm/herk/symm/syrk + trmm/trsm both sides) | ✅ AVX-512 gates/beats OpenBLAS (hemv 2×, nrm2 4–6×); AVX2 L1/L2 gate, complex-triangular + small-n residuals |
 | **LAPACK** | potrf (Cholesky), geqrf (QR), getrf (LU), gesvd (SVD) | ✅ AVX-512 gates all n; AVX2 geqrf/gesvd/getrf gate (potrf n≤256 WIP) |
 | **M4** | multithreading | deferred |
 
