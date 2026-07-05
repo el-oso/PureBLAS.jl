@@ -253,6 +253,100 @@ end
 end
 
 # y := β·y + α·op(A)·x. trans: false=N, true=T/C; cj: conjugate (op='C').
+# Complex unit-stride L2 eligibility (mirror _l2_simd_ok for the complex SIMD paths).
+@inline function _l2c_ok(A, x, y, incx::Integer, incy::Integer)
+    T = eltype(A)
+    return incx == 1 && incy == 1 && T <: BlasComplex && eltype(x) === T && eltype(y) === T &&
+        _strided1(A) &&
+        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+end
+
+# Complex gemv-N row-tile height (in W-complex vectors). Vec{2W} accumulators (AVX2 → 2 regs each), so a
+# smaller MR than the real kernel. Preferences-tunable; swept per fleet box.
+const _CGEMV_MR = @load_preference("cgemv_mr", _vwidth(Float64) == 4 ? 3 : 4)::Int
+const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
+# When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
+# panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
+const _CGEMV_RB = @load_preference("cgemv_rb", 65536)::Int   # m·n complex threshold for one-panel mode
+
+# Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
+# into y (y pre-scaled by β by the driver). Interleaved Vec{2W} accumulators; per column cⱼ=α·x[j],
+# c += A·cr + swap(A)·[−ci,ci] (swap-pairs complex multiply). Panel loop reads each A-column sequentially.
+# NOTE (AVX2): Vec{2W} legalizes to 2 regs (MR small); still ~0.5–0.7 on AVX2 — gemvN there is
+# shuffle/throughput-bound, an AVX2 TUNING residual (the fma/muladd primitives suffice; a split-Vec{W}
+# variant measured worse). Gates AVX-512 (Vec{2W}=1 reg). See ROADMAP M5.
+@generated function _gemv_n_block_cmplx!(yb::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, Peff::Int,
+        αr::T, αi::T, ::Val{MR}) where {T, MR}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    body = quote end
+    for v in 1:MR; push!(body.args, :($(Symbol(:c, v)) = vload($V2, yb + $((v - 1) * 2W * sz)))); end
+    inner = quote end
+    push!(inner.args, :(jj = jc + cc))
+    push!(inner.args, :(xr = unsafe_load(xp, 2jj + 1); xi = unsafe_load(xp, 2jj + 2)))
+    push!(inner.args, :(cr = αr * xr - αi * xi; ci = αr * xi + αi * xr))                # cⱼ = α·x[jj]
+    push!(inner.args, :(crv = $V2(cr)))
+    push!(inner.args, :(csgn = $V2($(Expr(:tuple, (iseven(l) ? :(-ci) : :ci for l in 0:(2W - 1))...)))))
+    for v in 1:MR
+        av = Symbol(:av, v)
+        push!(inner.args, :($av = vload($V2, Ab + ($((v - 1) * 2W) + jj * 2 * ldc) * $sz)))
+        push!(inner.args, :($(Symbol(:c, v)) = muladd($av, crv, $(Symbol(:c, v)))))
+        push!(inner.args, :($(Symbol(:c, v)) = muladd(shufflevector($av, Val($swp)), csgn, $(Symbol(:c, v)))))
+    end
+    push!(body.args, :(for cc in 0:(Peff - 1); $inner; end))
+    for v in 1:MR; push!(body.args, :(vstore($(Symbol(:c, v)), yb + $((v - 1) * 2W * sz)))); end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Driver: pre-scale y by β once, then column-panels × row-tiles accumulate (RMW y). W-remainder blocks
+# (Val(1)) + scalar tail per panel handle m not a multiple of MR·W.
+function _gemv_n_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T<:BlasReal, B0}
+    W = _vwidth(T); mr = _CGEMV_MR * W; sz = sizeof(T); αr = real(α); αi = imag(α)
+    GC.@preserve A x y begin
+        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(pointer(y)); xp = Ptr{T}(pointer(x)); ldc = stride(A, 2)
+        if B0
+            @inbounds for i in 1:(2m); unsafe_store!(yp, zero(T), i); end       # y := 0
+        elseif !isone(β)
+            _scal_cmplx_simd!(m, real(β), imag(β), y)                           # y := β·y
+        end
+        np = m * n <= _CGEMV_RB ? n : _CGEMV_NP     # one wide panel if A fits cache, else stream
+        jc = 0
+        while jc < n
+            Peff = min(np, n - jc)
+            i0 = 0
+            while i0 + mr <= m
+                _gemv_n_block_cmplx!(yp + i0 * 2 * sz, Ap + i0 * 2 * sz, ldc, xp, jc, Peff, αr, αi, Val(_CGEMV_MR)); i0 += mr
+            end
+            while i0 + W <= m
+                _gemv_n_block_cmplx!(yp + i0 * 2 * sz, Ap + i0 * 2 * sz, ldc, xp, jc, Peff, αr, αi, Val(1)); i0 += W
+            end
+            @inbounds for i in (i0 + 1):m                                       # scalar tail (< W rows)
+                s = zero(Complex{T})
+                for cc in 0:(Peff - 1); s += A[i, jc + cc + 1] * x[jc + cc + 1]; end
+                y[i] += α * s
+            end
+            jc += Peff
+        end
+    end
+    return y
+end
+
+# Complex gemv trans='T'/'C': y[j] := β·y[j] + α·Σ_i (CJ ? conj(A[i,j]) : A[i,j])·x[i]. Each output is
+# one complex dot of A's (contiguous) column j with x — reuses the L1 _dot_cmplx_simd kernel directly.
+function _gemv_tc_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}) where {T<:BlasReal, CJ}
+    z = iszero(β); csz = sizeof(Complex{T})
+    GC.@preserve A x begin
+        Ap = pointer(A); lda = stride(A, 2); xp = pointer(x)
+        @inbounds for j in 1:n
+            colp = Ap + (j - 1) * lda * csz                       # Ptr{Complex{T}} → column j (unit-stride)
+            s = _dot_cmplx_simd(m, colp, xp, T, Val(CJ))
+            yj = y[j]; y[j] = (z ? zero(yj) : β * yj) + α * s
+        end
+    end
+    return y
+end
+
 function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x, incx::Integer,
         β::Number, y, incy::Integer)
     if !trans
@@ -263,6 +357,11 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
             return iszero(β) ? _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(true)) :
                 _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(false))
+        end
+        if _l2c_ok(A, x, y, incx, incy)       # complex N → row-tiled SIMD (y in registers over columns)
+            αc = convert(eltype(A), α); βc = convert(eltype(A), β)
+            return iszero(β) ? _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
+                _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
         end
         _scale_y!(Int(m), β, y, incy)
         ix = _start(n, incx)
@@ -280,6 +379,11 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
             return iszero(β) ? _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(true)) :
                 _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(false))
+        end
+        if _l2c_ok(A, x, y, incx, incy)                          # complex T/C → per-column SIMD dot
+            αc = convert(eltype(A), α); βc = convert(eltype(A), β)
+            return cj ? _gemv_tc_cmplx!(Int(m), Int(n), αc, A, x, βc, y, Val(true)) :
+                _gemv_tc_cmplx!(Int(m), Int(n), αc, A, x, βc, y, Val(false))
         end
         s0 = zero(_et(A)) * zero(_et(x))
         iy = _start(n, incy)

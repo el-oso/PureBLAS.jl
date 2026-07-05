@@ -58,6 +58,8 @@ end
         @verify_strict PureBLAS.SIMDBackend begin
             PureBLAS.gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'N')
             PureBLAS.gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'T')
+            PureBLAS.gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'N')  # complex gemv
+            PureBLAS.gemv!(bk, wz, Az, uz; alpha = 2.0 + 0im, beta = 1.0 + 0im, trans = 'C')
             PureBLAS.ger!(bk, 1.5, um, vm, Ad)
             PureBLAS.symv!(bk, vm, Ad, um)
             PureBLAS.hemv!(bk, wz, Az, uz)
