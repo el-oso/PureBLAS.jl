@@ -88,6 +88,15 @@ Zen5 native-AVX512 / future M5 ARM — the 0.96× gate is evaluated per machine)
 
 ## Standing rules
 
+- **SIMD microkernel pipelining.** A register-blocked microkernel's k-reduction loop wants (a) a
+  **prefetch of the output (C) tile at entry** (overlaps the cold RMW store epilogue), and (b)
+  possibly **`@inbounds @simd ivdep`** on the k-loop (register accumulators, no cross-iteration
+  memory dep → LLVM software-pipelines). The prefetch is safe everywhere; `@simd ivdep` is
+  **FMA-density-dependent — measure per kernel/µarch**: it *helped* complex gemm (4 FMA/cell,
+  0.93–0.95→gates on AVX2, commit that added it) but *regressed* real gemm (1 FMA/cell — LLVM already
+  optimal, broke n=16 AVX-512). Diagnostic: a *flat* few-% under gate across all sizes ⇒ microkernel
+  gap ⇒ diff vs a sibling that gates. Build the loop with the block `quote…end` form (inline
+  `:(@simd for…;…;end)` is a ParseError). See kb `pureblas-gemm-microkernel-simd-prefetch`.
 - No Python anywhere (global rule). Native lib via `ccall` or CLI subprocess if external is needed.
 - `isnothing(x)` / `!isnothing(x)`, never `=== nothing`.
 - Commit author email: `15278831+el-oso@users.noreply.github.com` (never a real address).
