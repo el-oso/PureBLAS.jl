@@ -207,13 +207,58 @@ function _trmm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A
     return B
 end
 
+# Complex small-k trmm side-L at HALF the flops of the materialize+dense-gemm base: materialize op(A)
+# into the _l3_tmp scratch, then per-row-tile K-TRIMmed _uker_cmplx! calls (contract only op(A)'s
+# nonzero p-range per tile — the 2× dense waste is the whole gap; ztrmm n=128 was 0.515 ≈ dense/2).
+# IN PLACE: B is operand AND target; each _uker_cmplx! call is atomic (all A/B loads precede all stores),
+# and the K-TRIM's p-range is exactly the not-yet-overwritten rows (upM top-down / else bottom-up) → no
+# scratch copy needed. B0=overwrite (masked), A1=α==1 (trmm! folds α outside). Requires _CMR ≤ 2 (one
+# call per row-tile). Fable-designed 2026-07-05.
+function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    Tc = eltype(B); T = real(Tc); n = size(B, 2)
+    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
+    upM = (up != tr)
+    W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
+    ldM = _L3_NB; ldb = stride(B, 2)
+    GC.@preserve M B begin
+        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+        onr = one(T); zr = zero(T)
+        nt = cld(k, mr)
+        for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
+            ir = t * mr; mre = min(mr, k - ir)
+            plo = upM ? ir : 0                              # K-TRIM: op(A)'s nonzero p-range only
+            phi = upM ? k : min(k, ir + mre)
+            kc = phi - plo
+            Ap = Mp + 2 * plo * ldM * sz                   # M cols [plo,phi); kernel adds ir row offset
+            Bs = Bp + 2 * plo * sz                         # B-operand rows [plo,phi); kernel adds jr
+            full = cld(mre, W) >= _CMR
+            jr = 0
+            while jr < n
+                nre = min(nr, n - jr)
+                if full
+                    _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                else
+                    _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                end
+                jr += nr
+            end
+        end
+    end
+    return B
+end
+
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _TRMM_DDIRECT ? _trmm_dense_L!(up, tr, unit, A, B) :
                                     _trmm_small!(true, up, tr, unit, A, B)
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: materialize + one SIMD gemm
-        return _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM small kernel (half flops),
+        return _strided1(B) ? _trmm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :  # dense-gemm base fallback
+                              _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B)     # for strided B (rare)
     elseif k <= _TRMM_BASE                          # AD/generic: trmv on each B column (contiguous)
         @inbounds for c in axes(B, 2)
             _trmv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
