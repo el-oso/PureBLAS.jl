@@ -864,11 +864,11 @@ end
 const _TRI_NB = 64       # triangular block size (diagonal block per-column; off-diagonal via gemv)
 const _TRI_T_UNB = 1024  # trsv-T: unblocked up to here (blocked only helps the huge-n x-restream).
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
-# COMPLEX tri unblocked threshold. The blocked off-diagonal scatter uses the complex gemv, which is
-# shuffle-bound-slow on AVX2 (W=4) — so per-column beats blocking through mid-n there; blocking only
-# wins once the unblocked x-restream serialization dominates (huge n). On AVX-512 (W≥8) the complex
-# gemv is fast, so block from _TRI_NB. Keyed to vector width (the ISA axis that sets shuffle throughput).
-const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ? 1024 : _TRI_NB)::Int
+# COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv,
+# whose per-call/shuffle overhead makes per-column faster through mid-n on BOTH ISAs; blocking only
+# wins once the unblocked x-restream serialization dominates (n > 1024, measured crossover on Zen3
+# AVX2 and Zen4 AVX-512 alike). So stay unblocked ≤1024, block above.
+const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", 1024)::Int
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
 # — each diagonal NB×NB block uses the per-column kernel (cache-resident), and the off-diagonal block
