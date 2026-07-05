@@ -353,15 +353,16 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     return B
 end
 
-# Packed K-TRIM complex trmm side-R: B := B·op(A). Transposed mirror of _trmm_cmplx_packed_L!: the
-# BIG operand is B itself (the gemm A-slot, m×k), packed ONCE per mc row-panel (its data is copied
-# out → the in-place aliasing dissolves; each output row depends only on its own B row, so B0-overwrite
-# is safe in any order). M = op(A) (off-triangle zeroed) is the small B-slot operand, packed ONCE up
-# front as nr-panels over ALL k rows. The per-output-column-tile K-TRIM is an OFFSET into both packs
-# (packed row-stride is mr resp. nr REALS — re/im split — so start-row plo ⇒ +plo·mr / +plo·nr) plus
-# the trimmed kc. Zeros inside the diagonal tile are real zeros in M (contribute 0, no mask); row/col
-# edges use the masked kernel. α folded outside (A1=true); cj baked into M ⇒ SA=SB=1. Fable-designed
-# 2026-07-05 (mirror of the side-L win; the old "side-R packed regresses" note was a routing artifact).
+# Packed K-TRIM complex trmm side-R: B := B·op(A). Transposed mirror of _trmm_cmplx_packed_L!: the BIG
+# operand is B itself (the gemm A-slot, m×k), packed per mc row-panel (its data is copied out → the
+# in-place aliasing dissolves; each output row depends only on its own B row, so B0-overwrite is safe
+# in any order). M = op(A) (off-triangle zeroed) is the small B-slot operand, K-trim-packed ONCE up
+# front: tile ji at fixed stride ji·nr·k but storing only its nonzero [plo,phi) rows from slot-row 0 →
+# TOUCHED footprint ~k²/2 (not the full k² with its zero half, which competed with the A-pack in L2)
+# AND packed once (no per-ic-panel repack — that repack regressed the recursion-fed large-k). boff then
+# needs no plo term (row 0 IS M-row plo); the A-pack keeps the +plo·mr offset (it packs all k B-cols).
+# Zeros inside the diagonal tile are real zeros in M (contribute 0, no mask); row/col edges use the
+# masked kernel. α folded outside (A1=true); cj baked into M ⇒ SA=SB=1. Fable-designed 2026-07-05.
 function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); m = size(B, 1)
     M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
@@ -375,7 +376,16 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     GC.@preserve M B ApR ApI BpR BpI begin
         Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
         BRp = pointer(BpR); BIp = pointer(BpI)
-        _pack_B_cmplx!(BpR, BpI, Mv, 0, 0, k, k, false, nr)  # M as nr-panels, all k rows (zeros incl.)
+        # pre-pack all K-trimmed M column-tiles ONCE: tile ji → base ji·nr·k, only rows [plo,phi) stored.
+        @inbounds for ji in 0:(cld(k, nr) - 1)
+            jr = ji * nr; nre = min(nr, k - jr)
+            plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
+            base = ji * nr * k
+            for p in 0:(kc - 1), c in 0:(nr - 1)
+                v = (c < nre) ? Mv[plo + p + 1, jr + c + 1] : zero(Tc)
+                BpR[base + p * nr + c + 1] = real(v); BpI[base + p * nr + c + 1] = imag(v)
+            end
+        end
         ic = 0
         while ic < m
             mce = min(mc, m - ic)
@@ -385,14 +395,13 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
                 nre = min(nr, k - jr); ji = div(jr, nr)
                 plo = upM ? 0 : jr                          # K-TRIM: M's nonzero p-range (== small_R)
                 phi = upM ? min(k, jr + nre) : k; kc = phi - plo
-                boff = (ji * nr * k + plo * nr) * sz
                 ir = 0
                 while ir < mce
                     mre = min(mr, mce - ir)
                     aoff = (div(ir, mr) * mr * k + plo * mr) * sz
                     Cblk = Bp0 + (2 * (ic + ir) + 2 * jr * ldb) * sz
                     AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
-                    BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
+                    BR = Ptr{T}(BRp + ji * nr * k * sz); BI = Ptr{T}(BIp + ji * nr * k * sz)  # slot ji, row 0 = M-row plo
                     if mre == mr && nre == nr
                         _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
                             Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
