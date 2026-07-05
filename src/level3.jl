@@ -251,6 +251,43 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     return B
 end
 
+# Complex small-k trmm side-R: B(m×k) := B·op(A), half flops via K-TRIM. Row-blocks OUTER (the in-place
+# hazard is row-local), column-tiles INNER in dependency order (upM right-to-left / else left-to-right).
+# A-operand is B itself (cols [plo,phi)), B-operand is M (rows [plo,phi)); atomic kernel + K-TRIM → the
+# read columns are exactly the not-yet-overwritten ones, so no scratch (see _trmm_cmplx_small_L!).
+function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    Tc = eltype(B); T = real(Tc); m = size(B, 1)
+    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)
+    cj && @inbounds(Mv .= conj.(Mv))
+    upM = (up != tr)
+    W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
+    ldM = _L3_NB; ldb = stride(B, 2)
+    GC.@preserve M B begin
+        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+        onr = one(T); zr = zero(T); nt = cld(k, nr)
+        ir = 0
+        while ir < m
+            mre = min(mr, m - ir); full = cld(mre, W) >= _CMR
+            for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
+                jr = t * nr; nre = min(nr, k - jr)
+                plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
+                Aop = Bp + 2 * plo * ldb * sz          # B-operand (A-slot): B cols [plo,phi)
+                Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
+                if full
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                else
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                end
+            end
+            ir += mr
+        end
+    end
+    return B
+end
+
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
@@ -470,7 +507,8 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                                         _trmm_small!(false, up, tr, unit, A, B)
         elseif eltype(B) <: BlasComplex
-            return _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
+            return _strided1(B) ? _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
+                                  _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
         end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
@@ -886,6 +924,20 @@ function _trsm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A
     return B
 end
 
+# Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹) and A⁻¹ is triangular (same 2× dense-gemm waste as trmm). Invert
+# once into the trsm scratch (SEPARATE from the trmm K-TRIM's _l3_tmp M scratch), then reuse the trmm
+# K-TRIM kernel on the inverse — B := op(A⁻¹)·B at half the flops. `unit=false` (A⁻¹ carries the diagonal).
+function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
+    _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
+    return _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
+end
+function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
+    _trtri!(Vv, A, k, up, unit)
+    return _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
+end
+
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
@@ -897,8 +949,9 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + one SIMD gemm
-        return _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + K-TRIM gemm (half flops)
+        return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
+                              _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
     elseif k <= _TRMM_BASE                                 # AD/generic: trsv per column
         @inbounds for c in axes(B, 2)
             _trsv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
@@ -971,8 +1024,9 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invR!(up, tr, unit, A, B)
         end
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + one SIMD gemm
-        return _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + K-TRIM gemm (half flops)
+        return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
+                              _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
     elseif k <= _TRMM_BASE
         return _trsm_right_base!(up, tr, cj, unit, k, A, B)
     end
