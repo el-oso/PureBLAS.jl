@@ -1590,16 +1590,20 @@ end
 end
 # Branch-free symmetric/Hermitian → dense fill: copy the stored triangle (contiguous column segments),
 # then mirror it to the other triangle. No per-element uplo/diagonal branch in the hot path.
+# Fill each column of Ad CONTIGUOUSLY (stored run + mirror run) so the write stream is sequential
+# (was strided mirror writes Ad[j,i]). The stored run is a contiguous column copy (SIMD); the mirror
+# reads the crossing row of A (strided load) but writes contiguously — trades strided writes for
+# strided reads (prefetchable, no write-combining stalls). herm: mirror conjugates, diagonal → real.
 function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     @inbounds if up
         for j in 1:n
-            for i in 1:j; Ad[i, j] = A[i, j]; end                       # stored upper col (contiguous)
-            for i in 1:(j - 1); Ad[j, i] = herm ? conj(A[i, j]) : A[i, j]; end   # mirror to lower
+            @simd for i in 1:j; Ad[i, j] = A[i, j]; end                     # stored (i≤j): contiguous
+            for i in (j + 1):n; Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]; end   # mirror (i>j): col j
         end
     else
         for j in 1:n
-            for i in j:n; Ad[i, j] = A[i, j]; end                       # stored lower col (contiguous)
-            for i in (j + 1):n; Ad[j, i] = herm ? conj(A[i, j]) : A[i, j]; end   # mirror to upper
+            @simd for i in j:n; Ad[i, j] = A[i, j]; end                     # stored (i≥j): contiguous
+            for i in 1:(j - 1); Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]; end   # mirror (i<j): col j
         end
     end
     herm && @inbounds for i in 1:n; Ad[i, i] = real(Ad[i, i]); end
@@ -1770,13 +1774,9 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     end
     Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
-    if eltype(C) <: BlasReal && !herm     # real: straight to the dispatch core (skip the kwarg layer)
-        T = eltype(C)
-        side_left ? _gemm_core!(C, Ad, B, T(α), T(β), false, false, false, false) :
-                    _gemm_core!(C, B, Ad, T(α), T(β), false, false, false, false)
-    else
-        side_left ? gemm!(C, Ad, B; alpha = α, beta = β) : gemm!(C, B, Ad; alpha = α, beta = β)
-    end
+    T = eltype(C); aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
+    side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false) :  # complex — skip the kwarg layer
+                _gemm_core!(C, B, Ad, aT, bT, false, false, false, false)
     return C
 end
 function _symm_check(side_left, A, B, C)
