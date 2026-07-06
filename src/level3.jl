@@ -1573,17 +1573,37 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
     herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end
     return C
 end
-@inline function _csyrk_conj(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
-        alr::T, ali::T, A, C, k::Int) where {A1, NR, T}
+@inline _csyrk_conj(::Val{A1}, nr::Val, up::Bool, tr::Bool, herm::Bool, alr::T, ali::T, A, C, k::Int) where {A1, T} =
+    _ctrgemm_prod!(Val(A1), nr, up, tr, herm, alr, ali, A, A, C, k)   # syrk/herk: X = Y = A
+# ONE triangular-C complex product C[tri] += α·op(X)·op(Y)ᴴ (skip/full/tri tiles). herm conjugates the
+# ᴴ operand (tr='N' → Y via SB=-1; tr='C' → X via SA=-1); syrk conjugates neither. syrk/herk pass X=Y=A;
+# syr2k/her2k call twice (A,B then B,A). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc.
+@inline function _ctrgemm_prod!(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
+        alr::T, ali::T, X, Y, C, k::Int) where {A1, NR, T}
     if !herm
-        tr ? _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, A, true, A, false, C, k) :
-             _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, A, false, A, true, C, k)
+        tr ? _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, X, true, Y, false, C, k) :
+             _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, X, false, Y, true, C, k)
     elseif tr
-        _trgemm_cmplx_packed!(Val(-1), Val(1), Val(NR), Val(A1), up, alr, ali, A, true, A, false, C, k)
+        _trgemm_cmplx_packed!(Val(-1), Val(1), Val(NR), Val(A1), up, alr, ali, X, true, Y, false, C, k)
     else
-        _trgemm_cmplx_packed!(Val(1), Val(-1), Val(NR), Val(A1), up, alr, ali, A, false, A, true, C, k)
+        _trgemm_cmplx_packed!(Val(1), Val(-1), Val(NR), Val(A1), up, alr, ali, X, false, Y, true, C, k)
     end
 end
+# Complex syr2k/her2k via the triangular-output kernel: C[tri] += α·op(A)op(B)ᴴ + α2·op(B)op(A)ᴴ
+# (α2 = ᾱ for her2k, α for syr2k) as TWO tri-output products — only the stored triangle, no dense n×n
+# temp (that was the 2× waste in _syr2k_acc!). β·C applied by the caller (_syrk_scaleC!). her2k forces
+# the diagonal real on exit (both products sum to a real diagonal; this clears FP rounding).
+@inline function _csyr2k_packed!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int)
+    Tc = eltype(C); a = convert(Tc, α); a2 = herm ? conj(a) : a; n = size(C, 1)
+    nrv = (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
+    _csyr2k_prod!(nrv, up, tr, herm, real(a), imag(a), A, B, C, k)     # α·op(A)op(B)ᴴ
+    _csyr2k_prod!(nrv, up, tr, herm, real(a2), imag(a2), B, A, C, k)   # α2·op(B)op(A)ᴴ
+    herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end
+    return C
+end
+@inline _csyr2k_prod!(nr::Val, up::Bool, tr::Bool, herm::Bool, alr::T, ali::T, X, Y, C, k::Int) where {T} =
+    (isone(alr) && iszero(ali)) ? _ctrgemm_prod!(Val(true), nr, up, tr, herm, alr, ali, X, Y, C, k) :
+                                  _ctrgemm_prod!(Val(false), nr, up, tr, herm, alr, ali, X, Y, C, k)
 
 # The fused two-product syr2k driver's four-buffer scratch (two A-packs, two B-packs) is the per-type
 # L3Workspace `s2` field — `_syr2k_scratch(T, lenA, lenB)` grows and returns it (see src/workspace.jl).
@@ -2214,11 +2234,17 @@ end
 # (n=128 0.95→1.01). Cut to 96 there (n≥128 packed, ≤64 recursion). AVX-512 unchanged (already gates).
 # Overridable "syr2k_pack_cut".
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
+# Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
+# recursion (which computes a dense n×n temp per diagonal block — the 2× waste). Tuned per machine.
+const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", _vwidth(Float64) == 4 ? 8 : 8)::Int
 function syr2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false)
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
+    elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
+        _syrk_scaleC!(C, up, beta)
+        _csyr2k_packed!(up, trans != 'N', false, alpha, A, Bm, C, k)
     else
         _syrk_scaleC!(C, up, beta)
         _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n)
@@ -2228,5 +2254,9 @@ end
 function her2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Real = false)
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
-    _syrk_scaleC!(C, up, beta); _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n); C
+    _syrk_scaleC!(C, up, beta)
+    if eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
+        return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
+    end
+    _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n); C
 end
