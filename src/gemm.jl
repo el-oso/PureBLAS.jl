@@ -787,6 +787,8 @@ function _pack_A_cmplx!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce
         tA::Bool, mr::Int) where {T}
     if !tA && _strided1(A)     # contiguous columns → vectorized deinterleave
         return _pack_A_cmplx_simd!(ApR, ApI, A, ic, pc, mce, kce, mr)
+    elseif tA && _strided1(A) && mr % _vwidth(T) == 0   # transposed → W×W register-transpose pack
+        return _pack_A_cmplx_simd_T!(ApR, ApI, A, ic, pc, mce, kce, mr)
     end
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
@@ -1088,6 +1090,90 @@ function _pack_A_cmplx_simd!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int
                     lr = pi * mr + r; idx = base + p * mr + r + 1
                     if lr < mce
                         v = A[ic + lr + 1, pc + p + 1]; ApR[idx] = real(v); ApI[idx] = imag(v)
+                    else
+                        ApR[idx] = zero(T); ApI[idx] = zero(T)
+                    end
+                end
+            end
+        end
+    end
+    return
+end
+
+# One W×W COMPLEX transpose-pack block: load W interleaved Vec{2W} column-chunks of A (column r at
+# +2r·lda reals), _deint_cmplx each → W real + W imag Vec{W}s, run the _tblk! shuffle butterfly on both
+# sets, store transposed row pp at dstR/dstI + pp·mrstride. No α (scaled at store), no conj (kernel SA
+# sign). lda in COMPLEX elements. Fable-designed 2026-07-06 (== scalar ref over 288 shape/offset cases).
+@generated function _tblk_cmplx!(dstR::Ptr{T}, dstI::Ptr{T}, src::Ptr{T}, lda::Int,
+        mrstride::Int, ::Val{W}) where {T, W}
+    sz = sizeof(T); q = Int(round(log2(W)))
+    body = quote end
+    curR = [Symbol(:r_, r) for r in 0:(W - 1)]
+    curI = [Symbol(:i_, r) for r in 0:(W - 1)]
+    for r in 0:(W - 1)
+        push!(body.args, :(($(curR[r + 1]), $(curI[r + 1])) =
+            _deint_cmplx(vload(Vec{$(2W), $T}, src + $(2r) * lda * $sz))))
+    end
+    for stage in 0:(q - 1)
+        s = 1 << stage
+        nxtR = [Symbol(:sr, stage, :_, i) for i in 0:(W - 1)]
+        nxtI = [Symbol(:si, stage, :_, i) for i in 0:(W - 1)]
+        for i in 0:(W - 1)
+            if (i & s) == 0
+                j = i | s
+                lo = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + w : W + blk * 2s + (w - s)), W)
+                hi = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + s + w : W + blk * 2s + s + (w - s)), W)
+                push!(body.args, :($(nxtR[i + 1]) = shufflevector($(curR[i + 1]), $(curR[j + 1]), Val($lo))))
+                push!(body.args, :($(nxtR[j + 1]) = shufflevector($(curR[i + 1]), $(curR[j + 1]), Val($hi))))
+                push!(body.args, :($(nxtI[i + 1]) = shufflevector($(curI[i + 1]), $(curI[j + 1]), Val($lo))))
+                push!(body.args, :($(nxtI[j + 1]) = shufflevector($(curI[i + 1]), $(curI[j + 1]), Val($hi))))
+            end
+        end
+        curR = nxtR; curI = nxtI
+    end
+    for pp in 0:(W - 1)
+        push!(body.args, :(vstore($(curR[pp + 1]), dstR + $pp * mrstride * $sz)))
+        push!(body.args, :(vstore($(curI[pp + 1]), dstI + $pp * mrstride * $sz)))
+    end
+    push!(body.args, :(return nothing))
+    body
+end
+# Vectorized split A-pack for tA (op(A)=Aᵀ/Aᴴ, contiguous columns, mr a multiple of W): op(A)[gi,gp] =
+# A[gp,gi] would read A's rows (strided) — the old scalar fallback. Instead read W contiguous A-columns
+# (op(A) rows), W contraction-rows at a time, deint+transpose the W×W block into ApR/ApI. Partial panels
+# / contraction tail stay scalar (zero-padded). No α, no conj (both applied downstream).
+@inline function _pack_A_cmplx_simd_T!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int,
+        mce::Int, kce::Int, mr::Int) where {T}
+    W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2)
+    np = cld(mce, mr); kfull = (kce ÷ W) * W; sub = mr ÷ W
+    GC.@preserve A ApR ApI begin
+        Aptr = Ptr{T}(pointer(A)); PR = pointer(ApR); PI = pointer(ApI)
+        @inbounds for pi in 0:(np - 1)
+            base = pi * mr * kce
+            if pi * mr + mr <= mce                       # full panel — W×W register transposes
+                for ri in 0:(sub - 1)
+                    r0 = pi * mr + ri * W                # op(A) row offset within the block
+                    p = 0
+                    while p < kfull
+                        src = Aptr + 2 * ((ic + r0) * lda + (pc + p)) * sz   # A[pc+p, ic+r0]
+                        doff = base + p * mr + ri * W
+                        _tblk_cmplx!(PR + doff * sz, PI + doff * sz, src, lda, mr, Val(W))
+                        p += W
+                    end
+                    while p < kce                        # contraction tail — scalar
+                        for r in 0:(W - 1)
+                            v = A[pc + p + 1, ic + r0 + r + 1]
+                            idx = base + p * mr + ri * W + r + 1
+                            ApR[idx] = real(v); ApI[idx] = imag(v)
+                        end
+                        p += 1
+                    end
+                end
+            else                                         # partial panel — scalar, zero-padded
+                for p in 0:(kce - 1), r in 0:(mr - 1)
+                    lr = pi * mr + r; idx = base + p * mr + r + 1
+                    if lr < mce
+                        v = A[pc + p + 1, ic + lr + 1]; ApR[idx] = real(v); ApI[idx] = imag(v)
                     else
                         ApR[idx] = zero(T); ApI[idx] = zero(T)
                     end

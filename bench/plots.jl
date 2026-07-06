@@ -242,6 +242,12 @@ function run_cmplx_benchmarks()
         addh("zherk", s -> (randn(T, s, s), zeros(T, s, s)),
             c -> (B.herk!(UP, NN, 1.0, c[1], 0.0, c[2]); real(c[2][1])),
             c -> (PureBLAS.herk!(c[2], c[1]; uplo = UP, trans = NN, alpha = 1.0, beta = 0.0); real(c[2][1])))
+        addh("zher2k", s -> (randn(T, s, s), randn(T, s, s), zeros(T, s, s)),   # were UNPLOTTED (like side-R)
+            c -> (B.her2k!(UP, NN, ca, c[1], c[2], 0.0, c[3]); real(c[3][1])),
+            c -> (PureBLAS.her2k!(c[3], c[1], c[2]; uplo = UP, trans = NN, alpha = ca, beta = 0.0); real(c[3][1])))
+        addh("zsyr2k", s -> (randn(T, s, s), randn(T, s, s), zeros(T, s, s)),
+            c -> (B.syr2k!(UP, NN, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
+            c -> (PureBLAS.syr2k!(c[3], c[1], c[2]; uplo = UP, trans = NN, alpha = ca, beta = cb); real(c[3][1])))
         addh("ztrmm", s -> (ctri(s), randn(T, s, s)),
             c -> (B.trmm!(LT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
             c -> (PureBLAS.trmm!(c[2], c[1]; side = LT, uplo = UP); real(c[2][1])))
