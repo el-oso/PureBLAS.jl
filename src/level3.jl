@@ -1535,6 +1535,75 @@ function _trgemm_cmplx_packed!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, up::B
     return C
 end
 
+# Unified single-pack complex triangular-output kernel (AVX2 mid-n lever). At the AVX2 tile CMR=1 the
+# A-panel (mr=W rows) and B-panel (nr=W cols) layouts COINCIDE (mr==nr==W), so for herk/zsyrk (X===Y)
+# ONE `_pack_A_cmplx!` of all n rows feeds BOTH operand roles (A read as W-vectors at div(r0,W)·pstr,
+# B read as scalar broadcasts at div(c0,W)·pstr of the same buffer). NR=W=4 (not 6): divides every
+# benched n (no column-remainder waste), and 8 accumulators + ar/ai/br/bi = 12 ymm leave 4 registers
+# of headroom for the tri/masked store epilogue (the NR=6 path is a zero-headroom 16-ymm fit → epilogue
+# spills). Kills the ~12% masked/padded-flop + spill waste that capped NR=6 mid-n at 0.80. Reuses the
+# NR=4 `_microkernel_cmplx!` family verbatim. Fable-designed 2026-07-06 (OB-source-verified analysis).
+# X≠Y (syr2k) packs each operand once into the two buffer pairs (2 packs, not the multi-path's per-role).
+function _trgemm_cmplx_packed_u!(::Val{SA}, ::Val{SB}, ::Val{A1}, up::Bool,
+        alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, A1, T}
+    n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W          # unified requires nr == mr (CMR=1)
+    kc = min(_KC, k)
+    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    plen = cld(n, mr) * mr * kc
+    onepack = X === Y && tXp == !tYp                               # herk/zsyrk: B-pack == A-pack
+    ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, plen, plen)
+    ldc = stride(C, 2); sz = sizeof(T)
+    GC.@preserve C ApR ApI BpR BpI begin
+        Cp0 = Ptr{T}(pointer(C)); ARp = pointer(ApR); AIp = pointer(ApI)
+        BRp = onepack ? ARp : pointer(BpR); BIp = onepack ? AIp : pointer(BpI)
+        jc = 0
+        while jc < n
+            nce = min(nc, n - jc); pc = 0
+            while pc < k
+                kce = min(kc, k - pc); pstr = mr * kce
+                _pack_A_cmplx!(ApR, ApI, X, 0, pc, n, kce, tXp, mr)         # ONE pack, all n rows
+                onepack || _pack_A_cmplx!(BpR, BpI, Y, 0, pc, n, kce, !tYp, mr)
+                ic = 0
+                while ic < n
+                    mce = min(mc, n - ic); jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+                            if !skip
+                                aoff = div(r0, mr) * pstr * sz
+                                boff = div(c0, mr) * pstr * sz             # SAME layout (mr==nr)
+                                AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
+                                BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
+                                Cblk = Cp0 + (2 * r0 + 2 * c0 * ldc) * sz
+                                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
+                                if full && mre == mr && nre == nr
+                                    _microkernel_cmplx!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        Val(_CMR), Val(W), Val(SA), Val(SB), Val(false), Val(A1))
+                                elseif full
+                                    _microkernel_cmplx_masked!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        mre, nre, Val(_CMR), Val(W), Val(SA), Val(SB), Val(false), Val(A1))
+                                else
+                                    _microkernel_cmplx_tri!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                        mre, nre, c0 - r0, up, Val(_CMR), Val(W), Val(SA), Val(SB), Val(false), Val(A1))
+                                end
+                            end
+                            ir += mr
+                        end
+                        jr += nr
+                    end
+                    ic += mc
+                end
+                pc += kc
+            end
+            jc += nc
+        end
+    end
+    return C
+end
+
 # Add S's `uplo` triangle into C's; herm → force the diagonal real.
 # @inline so the (possibly SubArray) C/S args passed from the D&C recursion don't escape to a
 # non-inlined callee and heap-box — the recursion drivers rely on this to stay allocation-free.
@@ -1575,11 +1644,20 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 end
 @inline _csyrk_conj(::Val{A1}, nr::Val, up::Bool, tr::Bool, herm::Bool, alr::T, ali::T, A, C, k::Int) where {A1, T} =
     _ctrgemm_prod!(Val(A1), nr, up, tr, herm, alr, ali, A, A, C, k)   # syrk/herk: X = Y = A
+# n at/below which the unified single-pack tri kernel (NR=W) beats the multi-pack NR=6 path. AVX2 only
+# (the layouts coincide at CMR=1 ⇒ mr==nr==W; AVX-512 already gates 1.02-1.23, leave it). Knob per box.
+# Cap at 512: unified wins n≤512 (128 0.80→0.99), but its full-n pack loses cache reuse vs the mc/nc-
+# blocked multi path at n≥1024 (1024 0.937 vs multi 0.948) — hand large-n back to multi. AVX-512 → 0.
+const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64) == 4 ? 512 : 0)::Int
 # ONE triangular-C complex product C[tri] += α·op(X)·op(Y)ᴴ (skip/full/tri tiles). herm conjugates the
 # ᴴ operand (tr='N' → Y via SB=-1; tr='C' → X via SA=-1); syrk conjugates neither. syrk/herk pass X=Y=A;
 # syr2k/her2k call twice (A,B then B,A). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc.
+# X===Y (herk/zsyrk) on AVX2 mid-n → unified single-pack driver (NR=W, half the pack, no NR=6 spill).
 @inline function _ctrgemm_prod!(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
         alr::T, ali::T, X, Y, C, k::Int) where {A1, NR, T}
+    if X === Y && _vwidth(T) == 4 && size(C, 1) <= _CSYRK_UNIFIED_MAX
+        return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
+    end
     if !herm
         tr ? _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, X, true, Y, false, C, k) :
              _trgemm_cmplx_packed!(Val(1), Val(1), Val(NR), Val(A1), up, alr, ali, X, false, Y, true, C, k)
@@ -1587,6 +1665,17 @@ end
         _trgemm_cmplx_packed!(Val(-1), Val(1), Val(NR), Val(A1), up, alr, ali, X, true, Y, false, C, k)
     else
         _trgemm_cmplx_packed!(Val(1), Val(-1), Val(NR), Val(A1), up, alr, ali, X, false, Y, true, C, k)
+    end
+end
+@inline function _ctrgemm_prod_u!(::Val{A1}, up::Bool, tr::Bool, herm::Bool,
+        alr::T, ali::T, X, Y, C, k::Int) where {A1, T}
+    if !herm
+        tr ? _trgemm_cmplx_packed_u!(Val(1), Val(1), Val(A1), up, alr, ali, X, true, Y, false, C, k) :
+             _trgemm_cmplx_packed_u!(Val(1), Val(1), Val(A1), up, alr, ali, X, false, Y, true, C, k)
+    elseif tr
+        _trgemm_cmplx_packed_u!(Val(-1), Val(1), Val(A1), up, alr, ali, X, true, Y, false, C, k)
+    else
+        _trgemm_cmplx_packed_u!(Val(1), Val(-1), Val(A1), up, alr, ali, X, false, Y, true, C, k)
     end
 end
 # Complex syr2k/her2k via the triangular-output kernel: C[tri] += α·op(A)op(B)ᴴ + α2·op(B)op(A)ᴴ
