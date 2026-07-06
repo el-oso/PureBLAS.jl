@@ -27,11 +27,13 @@ mutable struct L3Workspace{T}
     gpackB::Vector{T}     # _gemm_scratch:      packed B panel
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
+    m3::Vector{Matrix{T}}      # _gemm_3m_scratch:    Karatsuba 3M matrices (Ar/Ai/As, Br/Bi/Bs, P1/P2/P3)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
+    [Matrix{T}(undef, 0, 0) for _ in 1:9],
 )
 
 # Owner accessors. Const-dispatch the gated real types (bare field load, no lookup); a keyed fallback for
@@ -96,5 +98,23 @@ function _syr2k_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
     t = _l3ws(T).s2
     length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[3], lenA))
     length(t[2]) < lenB && (resize!(t[2], lenB); resize!(t[4], lenB))
+    return t
+end
+
+# Karatsuba-3M complex-gemm scratch (REAL buffers): Ar/Ai/As (t1-3, len lenA), Br/Bi/Bs (t4-6, len lenB),
+# P1/P2/P3 (t7-9, len lenC). Keyed on the REAL element type so it lives in the real workspace, disjoint
+# from the sub-gemms' own gpackA/B. Grown on demand.
+# Persistent 3M matrices, GROWN PER-DIM to the max shape seen (never shrink). The caller operates on the
+# top-left (r,c) block via explicit dims + the matrix's own leading dim — so ztrsm's VARYING recursion
+# shapes reuse the same buffers with ZERO per-call allocation (grow only while enlarging to the max).
+function _gemm_3m_scratch(::Type{Tr}, ra::Int, ca::Int, rb::Int, cb::Int, m::Int, n::Int) where {Tr}
+    t = _l3ws(Tr).m3
+    @inline function grow!(i, r, c)
+        M = t[i]
+        (size(M, 1) < r || size(M, 2) < c) && (t[i] = Matrix{Tr}(undef, max(size(M, 1), r), max(size(M, 2), c)))
+    end
+    grow!(1, ra, ca); grow!(2, ra, ca); grow!(3, ra, ca)
+    grow!(4, rb, cb); grow!(5, rb, cb); grow!(6, rb, cb)
+    grow!(7, m, n);   grow!(8, m, n);   grow!(9, m, n)
     return t
 end
