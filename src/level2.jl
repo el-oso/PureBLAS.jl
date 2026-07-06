@@ -278,6 +278,95 @@ const _CGEMV_NP = 8                                 # column-panel width when A 
 # Threshold keyed to detected L2 (A fits when m·n·sizeof(ComplexF64) ≤ L2) — NOT hardcoded, so Zen3's
 # 512 KiB L2 doesn't inherit Zen4's 1 MiB assumption and thrash mid-n (one-panel row-tile re-reads A).
 const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n complex threshold for one-panel mode
+# AVX2 complex gemvN: OpenBLAS-structure kernel (Fable-decomposed 2026-07-06). The mid-n valley (n=1024
+# 0.735) was NOT the shuffle (kb hypothesis, refuted by measurement) nor memory (PB's access streams at
+# the L3 ceiling) — it was the per-(row-tile×column) α·x scalar work stealing FMA-port slots + the two
+# serial muladds/column forming an 8-cyc loop-carried chain. Fix: NC columns OUTER, rows inner, FRESH
+# Pv/Qv accumulators each row-iter (the y-RMW breaks all dep chains), α folded ONCE per column into the
+# hoisted x-broadcast (cr,ci = α·x[jj] — NC mults/panel, amortized over m rows, not per row-tile), and a
+# +192 B prefetch on each A stream. Measured galen: n=1024 0.735→1.03, sweep 1.00–1.24× OB. Only 2
+# shuffles/row-iter (on Q, off the FMA ports). AVX2 only; AVX-512 keeps the row-tile path (already gates).
+const _CGEMVN_NC = @load_preference("cgemvn_nc", 4)::Int             # columns per panel (OB uses 4)
+const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  # A-stream prefetch (AVX2)
+@generated function _gemv_n_ri_panel!(yp::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, m::Int,
+        αr::T, αi::T, ::Val{NC}, ::Val{PF}) where {T, NC, PF}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    sgn = Expr(:tuple, (iseven(l) ? -one(T) : one(T) for l in 0:(2W - 1))...)
+    body = quote sgnv = $V2($sgn) end
+    for c in 1:NC                                   # hoist: α·x[jj] once per column, broadcast re/im
+        push!(body.args, :($(Symbol(:b, c)) = Ab + (jc + $(c - 1)) * 2 * ldc * $sz))
+        push!(body.args, :(xr = unsafe_load(xp, 2 * (jc + $(c - 1)) + 1); xi = unsafe_load(xp, 2 * (jc + $(c - 1)) + 2)))
+        push!(body.args, :($(Symbol(:cr, c)) = $V2(αr * xr - αi * xi)))
+        push!(body.args, :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr)))
+    end
+    inner = quote off = i * 2 * $sz end
+    for c in 1:NC
+        av = Symbol(:av, c)
+        push!(inner.args, :($av = vload($V2, $(Symbol(:b, c)) + off)))
+        PF && push!(inner.args, :(_prefetch($(Symbol(:b, c)) + off + $(3 * 2W * sz))))   # +2W complex (192 B @W=4)
+        if c == 1
+            push!(inner.args, :(Pv = $av * cr1; Qv = $av * ci1))     # FRESH accumulators (break dep chains)
+        else
+            push!(inner.args, :(Pv = muladd($av, $(Symbol(:cr, c)), Pv)))
+            push!(inner.args, :(Qv = muladd($av, $(Symbol(:ci, c)), Qv)))
+        end
+    end
+    push!(inner.args, :(yv = vload($V2, yp + off)))
+    push!(inner.args, :(yv = muladd(shufflevector(Qv, Val($swp)), sgnv, yv + Pv)))
+    push!(inner.args, :(vstore(yv, yp + off)))
+    tail = quote acr = zero($T); aci = zero($T) end                  # scalar row tail (m % W complex rows)
+    for c in 1:NC
+        push!(tail.args, quote
+            arr = unsafe_load($(Symbol(:b, c)), 2i + 1); aii = unsafe_load($(Symbol(:b, c)), 2i + 2)
+            acr += arr * $(Symbol(:cr, c))[1] - aii * $(Symbol(:ci, c))[1]
+            aci += arr * $(Symbol(:ci, c))[1] + aii * $(Symbol(:cr, c))[1]
+        end)
+    end
+    push!(tail.args, quote
+        unsafe_store!(yp, unsafe_load(yp, 2i + 1) + acr, 2i + 1)
+        unsafe_store!(yp, unsafe_load(yp, 2i + 2) + aci, 2i + 2)
+    end)
+    push!(body.args, :(i = 0))
+    push!(body.args, :(while i + $W <= m; $inner; i += $W; end))
+    push!(body.args, :(while i < m; $tail; i += 1; end))
+    push!(body.args, :(return nothing))
+    return body
+end
+# AVX2 complex gemvN driver: β-prescale y, then NC-column panels over full m (no m-blocking — full-m
+# column streams prefetch best; tall y-beyond-L2 shapes stay on the row-tile path via the caller).
+function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T<:BlasReal, B0}
+    NC = _CGEMVN_NC; sz = sizeof(T); αr = real(α); αi = imag(α)
+    # y is restreamed once per NC-column panel (n/NC times) → block m so the y-block fits ~½ L2 for tall
+    # shapes; square mid-n (16m ≤ ½L2) runs one block (NB=m), which measured fastest (prefetch continuity).
+    NB = (2 * m * sz <= _L2_BYTES ÷ 2) ? m : max(NC, (_L2_BYTES ÷ 2) ÷ (2 * sz))
+    GC.@preserve A x y begin
+        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(pointer(y)); xp = Ptr{T}(pointer(x)); ldc = stride(A, 2)
+        if B0
+            @inbounds for i in 1:(2m); unsafe_store!(yp, zero(T), i); end
+        elseif !isone(β)
+            _scal_cmplx_simd!(m, real(β), imag(β), y)
+        end
+        i0 = 0
+        while i0 < m
+            mb = min(NB, m - i0); ypb = yp + i0 * 2 * sz; Apb = Ap + i0 * 2 * sz
+            jc = 0
+            while jc + NC <= n
+                _CGEMVN_PF ? _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(true)) :
+                             _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(false))
+                jc += NC
+            end
+            while jc < n
+                _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(1), Val(false))
+                jc += 1
+            end
+            i0 += mb
+        end
+    end
+    return y
+end
+
+# Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
 
 # Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
 # into y (y pre-scaled by β by the driver). Interleaved Vec{2W} accumulators; per column cⱼ=α·x[j],
@@ -423,9 +512,13 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
             return iszero(β) ? _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(true)) :
                 _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(false))
         end
-        if _l2c_ok(A, x, y, incx, incy)       # complex N → row-tiled SIMD (y in registers over columns)
+        if _l2c_ok(A, x, y, incx, incy)       # complex N
             αc = convert(eltype(A), α); βc = convert(eltype(A), β)
-            return iszero(β) ? _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
+            if _vwidth(real(eltype(A))) == 4  # AVX2 → OB-structure ri kernel (fresh accs, α-in-broadcast)
+                return iszero(β) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
+                    _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
+            end
+            return iszero(β) ? _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :   # AVX-512 row-tile
                 _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
         end
         _scale_y!(Int(m), β, y, incy)
