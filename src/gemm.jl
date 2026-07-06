@@ -1535,14 +1535,19 @@ end
 function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C)
     Tc = eltype(C); Tr = real(Tc)
     ra = size(A, 1); ca = size(A, 2); rb = size(B, 1); cb = size(B, 2)   # stored dims (trans folded by sub-gemm)
-    t = _gemm_3m_scratch(Tr, ra, ca, rb, cb, m, n)   # persistent max-sized matrices; operate on top-left blocks
-    Ar = t[1]; Ai = t[2]; As = t[3]; Br = t[4]; Bi = t[5]; Bs = t[6]; P1 = t[7]; P2 = t[8]; P3 = t[9]
-    _split3!(Ar, Ai, As, A, cA, ra, ca); _split3!(Br, Bi, Bs, B, cB, rb, cb)
-    o = one(Tr); z = zero(Tr)
-    _gemm_real_dims!(tA, tB, m, n, k, o, z, Ar, Br, P1)
-    _gemm_real_dims!(tA, tB, m, n, k, o, z, Ai, Bi, P2)
-    _gemm_real_dims!(tA, tB, m, n, k, o, z, As, Bs, P3)
-    _combine3!(C, P1, P2, P3, convert(Tc, alpha), convert(Tc, beta), m, n)
+    t = _gemm_3m_scratch(Tr, ra * ca, rb * cb, m * n)   # grow-only flat buffers
+    GC.@preserve t begin      # unsafe_wrap the first r·c → CONTIGUOUS r×c matrix (ld=r; no strided top-left)
+        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+        Ar = w(1, ra, ca); Ai = w(2, ra, ca); As = w(3, ra, ca)
+        Br = w(4, rb, cb); Bi = w(5, rb, cb); Bs = w(6, rb, cb)
+        P1 = w(7, m, n); P2 = w(8, m, n); P3 = w(9, m, n)
+        _split3!(Ar, Ai, As, A, cA, ra, ca); _split3!(Br, Bi, Bs, B, cB, rb, cb)
+        o = one(Tr); z = zero(Tr)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ar, Br, P1)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ai, Bi, P2)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, As, Bs, P3)
+        _combine3!(C, P1, P2, P3, convert(Tc, alpha), convert(Tc, beta), m, n)
+    end
     return C
 end
 
