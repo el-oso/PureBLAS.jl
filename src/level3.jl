@@ -1063,10 +1063,42 @@ function _trsm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A
     return B
 end
 
-# Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹) and A⁻¹ is triangular (same 2× dense-gemm waste as trmm). Invert
-# once into the trsm scratch (SEPARATE from the trmm K-TRIM's _l3_tmp M scratch), then reuse the trmm
-# K-TRIM kernel on the inverse — B := op(A⁻¹)·B at half the flops. `unit=false` (A⁻¹ carries the diagonal).
+# DIRECT j-outer trsm-L (op=A, no-trans): process each A COLUMN j once (read A once, not per-RHS like
+# per-column trsv), scaling B's row j by the precomputed diagonal reciprocal, then a CONTIGUOUS column
+# axpy B[·,c] -= x·A[·,j] across every RHS c. Diagonal reciprocals precomputed off the loop (as in trsv).
+# This is OB's structure — no trtri, no extra flops. Replaces trtri+trmm for small/mid-n where the
+# trtri overhead sank ztrsm-L (n=8–128 was 0.55–0.80). k ≤ _TRMM_BASE (128); reuses _TRSV_RCP.
+function _trsm_cmplx_dLN!(up::Bool, unit::Bool, k::Int, A, B)
+    Tc = eltype(B); T = real(Tc); nrhs = size(B, 2); csz = sizeof(Tc)
+    lda = stride(A, 2); ldb = stride(B, 2); rcp = _trsv_rcpbuf(T)
+    GC.@preserve A B begin
+        Ap = Ptr{Tc}(pointer(A)); Bp = Ptr{Tc}(pointer(B))
+        unit || @inbounds for j in 1:k; rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * lda + j)); end
+        @inbounds for j in (up ? (k:-1:1) : (1:k))
+            aj = Ap + (j - 1) * lda * csz                        # &A[1,j] (Julia Ptr+int = BYTES)
+            for c in 0:(nrhs - 1)
+                bc = Bp + c * ldb * csz                          # &B[1,c]
+                xj = unit ? unsafe_load(bc, j) : unsafe_load(bc, j) * rcp[j]
+                unit || unsafe_store!(bc, xj, j)
+                if up
+                    j > 1 && _axpy_cmplx_simd!(j - 1, -real(xj), -imag(xj), aj, bc)      # B[1:j-1,c] -= xj·A[1:j-1,j]
+                else
+                    j < k && _axpy_cmplx_simd!(k - j, -real(xj), -imag(xj), aj + j * csz, bc + j * csz)  # B[j+1:k,c]
+                end
+            end
+        end
+    end
+    return B
+end
+# n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
+# solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
+const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
+# Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹), A⁻¹ triangular → reuse the trmm K-TRIM kernel on the inverse at
+# half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
 function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # direct back-substitution (no trtri)
+        return _trsm_cmplx_dLN!(up, unit, k, A, B)
+    end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
     return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
