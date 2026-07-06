@@ -2223,6 +2223,93 @@ function _pack_A_sym!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, up
     end
     return
 end
+# Complex HERMITIAN A-pack (split re/im) for a diagonal-straddling OR full-mirror panel (hemm side-L):
+# per panel-column the stored run reads A[i,gp] direct; the MIRROR run reads A[gp,i] CONJUGATED
+# (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store). Mirrors _pack_A_sym! + the
+# conj that makes it Hermitian. Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
+function _pack_A_sym_cmplx!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
+        up::Bool, mr::Int) where {T}
+    np = cld(mce, mr)
+    @inbounds for pi in 0:(np - 1)
+        base = pi * mr * kce; pbase = pi * mr; rhi = min(mr, mce - pbase)
+        for p in 0:(kce - 1)
+            gp = pc + p; o = base + p * mr; ls = gp - ic - pbase
+            if up                                          # stored r∈[0,st_end); mirror(conj) r∈[st_end,rhi)
+                st_end = clamp(ls + 1, 0, rhi)
+                for r in 0:(st_end - 1)
+                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
+                end
+                for r in st_end:(rhi - 1)
+                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = -imag(v)
+                end
+            else                                           # mirror(conj) r∈[0,st_start); stored r∈[st_start,rhi)
+                st_start = clamp(ls, 0, rhi)
+                for r in 0:(st_start - 1)
+                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = -imag(v)
+                end
+                for r in st_start:(rhi - 1)
+                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
+                end
+            end
+            for r in rhi:(mr - 1); ApR[o + r + 1] = zero(T); ApI[o + r + 1] = zero(T); end
+        end
+    end
+    return
+end
+# Single-pass packed complex hemm (side-L): C := α·A_herm·B + β·C. Standard packed complex gemm (all C
+# tiles) but each A-panel is packed from the Hermitian TRIANGLE on the fly (stored → SIMD _pack_A_cmplx!;
+# mirror/straddle → _pack_A_sym_cmplx! with conj) — reads the triangle ONCE, no materialize, no 2×
+# A-traffic. α at the microkernel store (A1=false); β·C up front. Reuses _microkernel_cmplx!.
+function _hemm_packed_L!(up::Bool, α, β, A, B, C)
+    Tc = eltype(C); T = real(Tc); n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _CMR * W; nr = _CNR
+    kc = min(_KC, n)
+    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
+    ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
+    _scale_C!(C, n, m, convert(Tc, β)); ldc = stride(C, 2); sz = sizeof(T)
+    alr = real(convert(Tc, α)); ali = imag(convert(Tc, α))
+    GC.@preserve C ApR ApI BpR BpI begin
+        Cp0 = Ptr{T}(pointer(C)); ARp = pointer(ApR); AIp = pointer(ApI); BRp = pointer(BpR); BIp = pointer(BpI)
+        jc = 0
+        while jc < m
+            nce = min(nc, m - jc); pc = 0
+            while pc < n
+                kce = min(kc, n - pc)
+                _pack_B_cmplx!(BpR, BpI, B, pc, jc, kce, nce, false, nr)
+                ic = 0
+                while ic < n
+                    mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
+                    stored = up ? (a_hi <= pc) : (ic >= p_hi)     # read A[i,gp] direct (SIMD)
+                    stored ? _pack_A_cmplx!(ApR, ApI, A, ic, pc, mce, kce, false, mr) :
+                             _pack_A_sym_cmplx!(ApR, ApI, A, ic, pc, mce, kce, up, mr)  # mirror/straddle (conj)
+                    jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir)
+                            AR = Ptr{T}(ARp + div(ir, mr) * mr * kce * sz); AI = Ptr{T}(AIp + div(ir, mr) * mr * kce * sz)
+                            BR = Ptr{T}(BRp + div(jr, nr) * nr * kce * sz); BI = Ptr{T}(BIp + div(jr, nr) * nr * kce * sz)
+                            Cblk = Cp0 + (2 * (ic + ir) + 2 * (jc + jr) * ldc) * sz
+                            if mre == mr && nre == nr
+                                _microkernel_cmplx!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                    Val(_CMR), Val(_CNR), Val(1), Val(1), Val(false), Val(false))
+                            else
+                                _microkernel_cmplx_masked!(Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                                    mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(false), Val(false))
+                            end
+                            ir += mr
+                        end
+                        jr += nr
+                    end
+                    ic += mc
+                end
+                pc += kc
+            end
+            jc += nc
+        end
+    end
+    return C
+end
 # Symmetric B-pack for a diagonal-straddling panel (real symm side R): the symmetric matrix is the
 # gemm's RIGHT operand. Stored side reads A[gp,gj], mirror side A[gj,gp]. Off-diagonal panels use
 # plain _pack_B! (stored: tB=false; mirror: tB=true). No α here — α rides on the left operand's pack.
@@ -2354,17 +2441,19 @@ end
 # On AVX2 the branchless pack makes packed win from n=128 (0.97 vs materialize 0.95); AVX-512 unchanged
 # (materialize ≤ _GEMM_UNPACK_MAX, already gates). Overridable "symm_pack_cut".
 const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
+# n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
+# conj-mirror pack). Small-n stays materialize+gemm (the pack setup doesn't amortize). Per-box knob.
+const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 32 : 32)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT
         return side_left ?
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
+    elseif herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
+           _strided1(B) && _strided1(C)                     # packed Hermitian (no materialize, triangle once)
+        return _hemm_packed_L!(up, α, β, A, B, C)
     end
-    # NOTE: complex hemm still materializes the full Hermitian matrix + one gemm. Per-column hemv (no
-    # materialize) was tried and REGRESSED (n=8 0.56→0.37) — it re-reads the triangle per RHS, n× the
-    # A-traffic (memory-bound). Small-n hemm (0.56–0.92 vs OB) needs a packed hermitian kernel (the complex
-    # analog of _symm_packed_L! + _pack_A_sym!, with conj on the mirror run) — not yet built.
     Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
     T = eltype(C); aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
