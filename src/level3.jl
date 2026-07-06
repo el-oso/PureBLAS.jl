@@ -1604,6 +1604,86 @@ function _trgemm_cmplx_packed_u!(::Val{SA}, ::Val{SB}, ::Val{A1}, up::Bool,
     return C
 end
 
+# Fused two-product unified complex syr2k/her2k driver. C[tri] += α·op(X)op(Y)ᴴ + α₂·op(Y)op(X)ᴴ, each
+# tile visited ONCE with the fused _microkernel2_cmplx! (both products → one register set → one RMW
+# store; the two-CALL version regressed on doubled epilogues). Unified NR=W (CMR=1: mr==nr) so the X/Y
+# packs share one panel format and serve both operand roles. α-FOLD: packA holds s·op(X), s = (SA==-1 ?
+# conj(α) : α); the kernel conj signs then give product-1 coeff σA(s)=α and product-2 σB(s)=ᾱ (her2k)/α
+# (syr2k). β·C by the caller. Fable-designed 2026-07-06.
+function _trgemm_cmplx_packed2_u!(::Val{SA}, ::Val{SB}, up::Bool, alr::T, ali::T,
+        X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, T}
+    n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W
+    kc = min(_KC, k)
+    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    plen = cld(n, mr) * mr * kc
+    ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, plen, plen)
+    sr = alr; si = SA == -1 ? -ali : ali                         # s = SA==-1 ? conj(α) : α (into X-pack)
+    noscale = isone(sr) && iszero(si)
+    ldc = stride(C, 2); sz = sizeof(T)
+    GC.@preserve C ApR ApI BpR BpI begin
+        Cp0 = Ptr{T}(pointer(C)); ARp = pointer(ApR); AIp = pointer(ApI)
+        BRp = pointer(BpR); BIp = pointer(BpI)
+        jc = 0
+        while jc < n
+            nce = min(nc, n - jc); pc = 0
+            while pc < k
+                kce = min(kc, k - pc); pstr = mr * kce
+                _pack_A_cmplx!(ApR, ApI, X, 0, pc, n, kce, tXp, mr)         # op(X) once
+                noscale || _scale_pack_cmplx!(ApR, ApI, cld(n, mr) * pstr, sr, si)
+                _pack_A_cmplx!(BpR, BpI, Y, 0, pc, n, kce, !tYp, mr)        # op(Y) once
+                ic = 0
+                while ic < n
+                    mce = min(mc, n - ic); jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+                            if !skip
+                                aoff = div(r0, mr) * pstr * sz; boff = div(c0, mr) * pstr * sz
+                                P1AR = Ptr{T}(ARp + aoff); P1AI = Ptr{T}(AIp + aoff)   # P1: X rows r0
+                                P1BR = Ptr{T}(BRp + boff); P1BI = Ptr{T}(BIp + boff)   # P1: Y cols c0
+                                P2AR = Ptr{T}(BRp + aoff); P2AI = Ptr{T}(BIp + aoff)   # P2: Y rows r0
+                                P2BR = Ptr{T}(ARp + boff); P2BI = Ptr{T}(AIp + boff)   # P2: X cols c0
+                                Cblk = Cp0 + (2 * r0 + 2 * c0 * ldc) * sz
+                                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
+                                if full && mre == mr && nre == nr
+                                    _microkernel2_cmplx!(Cblk, ldc, P1AR, P1AI, P1BR, P1BI,
+                                        P2AR, P2AI, P2BR, P2BI, kce, Val(_CMR), Val(W), Val(SA), Val(SB))
+                                elseif full
+                                    _microkernel2_cmplx_masked!(Cblk, ldc, P1AR, P1AI, P1BR, P1BI,
+                                        P2AR, P2AI, P2BR, P2BI, kce, mre, nre, Val(_CMR), Val(W), Val(SA), Val(SB))
+                                else
+                                    _microkernel2_cmplx_tri!(Cblk, ldc, P1AR, P1AI, P1BR, P1BI,
+                                        P2AR, P2AI, P2BR, P2BI, kce, mre, nre, c0 - r0, up,
+                                        Val(_CMR), Val(W), Val(SA), Val(SB))
+                                end
+                            end
+                            ir += mr
+                        end
+                        jr += nr
+                    end
+                    ic += mc
+                end
+                pc += kc
+            end
+            jc += nc
+        end
+    end
+    return C
+end
+@inline function _csyr2k_fused!(up::Bool, tr::Bool, herm::Bool, alr::T, ali::T, X, Y, C, k::Int) where {T}
+    if !herm
+        tr ? _trgemm_cmplx_packed2_u!(Val(1), Val(1), up, alr, ali, X, true, Y, false, C, k) :
+             _trgemm_cmplx_packed2_u!(Val(1), Val(1), up, alr, ali, X, false, Y, true, C, k)
+    elseif tr
+        _trgemm_cmplx_packed2_u!(Val(-1), Val(1), up, alr, ali, X, true, Y, false, C, k)
+    else
+        _trgemm_cmplx_packed2_u!(Val(1), Val(-1), up, alr, ali, X, false, Y, true, C, k)
+    end
+end
+
 # Add S's `uplo` triangle into C's; herm → force the diagonal real.
 # @inline so the (possibly SubArray) C/S args passed from the D&C recursion don't escape to a
 # non-inlined callee and heap-box — the recursion drivers rely on this to stay allocation-free.
@@ -1682,15 +1762,21 @@ end
 # (α2 = ᾱ for her2k, α for syr2k) as TWO tri-output products — only the stored triangle, no dense n×n
 # temp (that was the 2× waste in _syr2k_acc!). β·C applied by the caller (_syrk_scaleC!). her2k forces
 # the diagonal real on exit (both products sum to a real diagonal; this clears FP rounding).
+# n at/below which complex syr2k/her2k uses the FUSED two-product unified driver (AVX2). Cap 512 mirrors
+# _CSYRK_UNIFIED_MAX (large-n full-n pack loses cache reuse vs the blocked multi path). Knob per box.
+# Cap 256: fused wins n≤256 (n≤64 beats OB, 128 0.86→0.92); at n≥512 its full-n pack loses cache reuse
+# vs the mc/nc-blocked multi tri path (512 0.92 vs 0.944) — hand large-n back to multi. AVX-512 → 0.
+const _CSYR2K_FUSED_MAX = @load_preference("csyr2k_fused_max", _vwidth(Float64) == 4 ? 256 : 0)::Int
 @inline function _csyr2k_packed!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int)
-    Tc = eltype(C); a = convert(Tc, α); a2 = herm ? conj(a) : a; n = size(C, 1)
-    # NOTE: the fused two-product unified (pack once, two microkernel passes/tile) REGRESSED here — two
-    # separate _microkernel_cmplx! calls double the RMW store epilogue (n=128 0.86 vs multi 0.87). syr2k
-    # mid-n needs a genuine _microkernel2_cmplx! (both products → one register set → one store); until
-    # then the multi-pack tri path is best. (herk's single-pack win doesn't transfer: X≠Y here.)
-    nrv = (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
-    _csyr2k_prod!(nrv, up, tr, herm, real(a), imag(a), A, B, C, k)     # α·op(A)op(B)ᴴ
-    _csyr2k_prod!(nrv, up, tr, herm, real(a2), imag(a2), B, A, C, k)   # α2·op(B)op(A)ᴴ
+    Tc = eltype(C); a = convert(Tc, α); n = size(C, 1)
+    if _vwidth(real(Tc)) == 4 && n <= _CSYR2K_FUSED_MAX && k > 0
+        _csyr2k_fused!(up, tr, herm, real(a), imag(a), A, B, C, k)   # both products, one RMW/tile
+    else
+        a2 = herm ? conj(a) : a
+        nrv = (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
+        _csyr2k_prod!(nrv, up, tr, herm, real(a), imag(a), A, B, C, k)     # α·op(A)op(B)ᴴ
+        _csyr2k_prod!(nrv, up, tr, herm, real(a2), imag(a2), B, A, C, k)   # α2·op(B)op(A)ᴴ
+    end
     herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end
     return C
 end
