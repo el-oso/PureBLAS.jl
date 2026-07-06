@@ -1068,24 +1068,39 @@ end
 # axpy B[·,c] -= x·A[·,j] across every RHS c. Diagonal reciprocals precomputed off the loop (as in trsv).
 # This is OB's structure — no trtri, no extra flops. Replaces trtri+trmm for small/mid-n where the
 # trtri overhead sank ztrsm-L (n=8–128 was 0.55–0.80). k ≤ _TRMM_BASE (128); reuses _TRSV_RCP.
+# One RHS panel (pw columns), j-outer solve, panel kept L1-resident. @inline so A's column pointer and the
+# reciprocal table stay register/L1-resident across the panel — fuses the per-column work (the key to
+# mid-n: the UNBLOCKED solve streamed the whole B out of L1 k times, ~O(k²·nrhs) L2 traffic; blocking the
+# RHS into L1-fitting panels keeps each panel hot so only A is re-read).
+@inline function _dLN_panel!(up::Bool, unit::Bool, k::Int, rcp, Ap::Ptr{Tc}, Bp::Ptr{Tc},
+        pw::Int, lda::Int, ldb::Int, csz::Int) where {Tc}
+    @inbounds for j in (up ? (k:-1:1) : (1:k))
+        aj = Ap + (j - 1) * lda * csz                            # &A[1,j] (Julia Ptr+int = BYTES)
+        for c in 0:(pw - 1)
+            bc = Bp + c * ldb * csz                              # &B[1, panel-col c]
+            xj = unit ? unsafe_load(bc, j) : unsafe_load(bc, j) * rcp[j]
+            unit || unsafe_store!(bc, xj, j)
+            if up
+                j > 1 && _axpy_cmplx_simd!(j - 1, -real(xj), -imag(xj), aj, bc)          # B[1:j-1,c] -= xj·A[1:j-1,j]
+            else
+                j < k && _axpy_cmplx_simd!(k - j, -real(xj), -imag(xj), aj + j * csz, bc + j * csz)  # B[j+1:k,c]
+            end
+        end
+    end
+    return
+end
 function _trsm_cmplx_dLN!(up::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); nrhs = size(B, 2); csz = sizeof(Tc)
     lda = stride(A, 2); ldb = stride(B, 2); rcp = _trsv_rcpbuf(T)
+    nc = clamp((_L1_BYTES ÷ 2) ÷ (k * csz), 1, nrhs)             # RHS panel fitting ~½ L1 (A col shares it)
     GC.@preserve A B begin
         Ap = Ptr{Tc}(pointer(A)); Bp = Ptr{Tc}(pointer(B))
-        unit || @inbounds for j in 1:k; rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * lda + j)); end
-        @inbounds for j in (up ? (k:-1:1) : (1:k))
-            aj = Ap + (j - 1) * lda * csz                        # &A[1,j] (Julia Ptr+int = BYTES)
-            for c in 0:(nrhs - 1)
-                bc = Bp + c * ldb * csz                          # &B[1,c]
-                xj = unit ? unsafe_load(bc, j) : unsafe_load(bc, j) * rcp[j]
-                unit || unsafe_store!(bc, xj, j)
-                if up
-                    j > 1 && _axpy_cmplx_simd!(j - 1, -real(xj), -imag(xj), aj, bc)      # B[1:j-1,c] -= xj·A[1:j-1,j]
-                else
-                    j < k && _axpy_cmplx_simd!(k - j, -real(xj), -imag(xj), aj + j * csz, bc + j * csz)  # B[j+1:k,c]
-                end
-            end
+        unit || @inbounds @simd for j in 1:k; rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * lda + j)); end
+        pc = 0
+        while pc < nrhs
+            pw = min(nc, nrhs - pc)
+            _dLN_panel!(up, unit, k, rcp, Ap, Bp + pc * ldb * csz, pw, lda, ldb, csz)
+            pc += nc
         end
     end
     return B
@@ -2346,6 +2361,10 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
     end
+    # NOTE: complex hemm still materializes the full Hermitian matrix + one gemm. Per-column hemv (no
+    # materialize) was tried and REGRESSED (n=8 0.56→0.37) — it re-reads the triangle per RHS, n× the
+    # A-traffic (memory-bound). Small-n hemm (0.56–0.92 vs OB) needs a packed hermitian kernel (the complex
+    # analog of _symm_packed_L! + _pack_A_sym!, with conj on the mirror run) — not yet built.
     Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
     T = eltype(C); aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
