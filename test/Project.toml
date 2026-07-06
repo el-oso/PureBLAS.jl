@@ -10,9 +10,6 @@ StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 
-[sources]
-StrictMode = {rev = "master", url = "https://github.com/el-oso/StrictMode.jl"}
-
 [preferences.StrictMode]
 analysis = "full"
 checks_enabled = true
