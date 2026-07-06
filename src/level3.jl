@@ -1655,7 +1655,7 @@ const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64
 # X===Y (herk/zsyrk) on AVX2 mid-n → unified single-pack driver (NR=W, half the pack, no NR=6 spill).
 @inline function _ctrgemm_prod!(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
         alr::T, ali::T, X, Y, C, k::Int) where {A1, NR, T}
-    if X === Y && _vwidth(T) == 4 && size(C, 1) <= _CSYRK_UNIFIED_MAX
+    if X === Y && _vwidth(T) == 4 && size(C, 1) <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
         return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
     end
     if !herm
@@ -1684,6 +1684,10 @@ end
 # the diagonal real on exit (both products sum to a real diagonal; this clears FP rounding).
 @inline function _csyr2k_packed!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int)
     Tc = eltype(C); a = convert(Tc, α); a2 = herm ? conj(a) : a; n = size(C, 1)
+    # NOTE: the fused two-product unified (pack once, two microkernel passes/tile) REGRESSED here — two
+    # separate _microkernel_cmplx! calls double the RMW store epilogue (n=128 0.86 vs multi 0.87). syr2k
+    # mid-n needs a genuine _microkernel2_cmplx! (both products → one register set → one store); until
+    # then the multi-pack tri path is best. (herk's single-pack win doesn't transfer: X≠Y here.)
     nrv = (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
     _csyr2k_prod!(nrv, up, tr, herm, real(a), imag(a), A, B, C, k)     # α·op(A)op(B)ᴴ
     _csyr2k_prod!(nrv, up, tr, herm, real(a2), imag(a2), B, A, C, k)   # α2·op(B)op(A)ᴴ
