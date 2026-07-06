@@ -963,11 +963,12 @@ end
 const _TRI_NB = 64       # triangular block size (diagonal block per-column; off-diagonal via gemv)
 const _TRI_T_UNB = 1024  # trsv-T: unblocked up to here (blocked only helps the huge-n x-restream).
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
-# COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv,
-# whose per-call/shuffle overhead makes per-column faster through mid-n on BOTH ISAs; blocking only
-# wins once the unblocked x-restream serialization dominates (n > 1024, measured crossover on Zen3
-# AVX2 and Zen4 AVX-512 alike). So stay unblocked ≤1024, block above.
-const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", 1024)::Int
+# COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
+# AVX-512 its per-call/shuffle overhead made per-column faster ≤1024. On AVX2 the scatter now uses the
+# fast OB-structure ri gemv (see _tri_scat_cmplx!), so blocking wins earlier — the unblocked column-axpy
+# re-streams x and dips at n=1024–2048 (0.83–0.86); route those to blocked+ri. n≤512 stays unblocked
+# (gates 0.96–1.53). Sweep the crossover per box via the knob.
+const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ? 256 : 1024)::Int
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
 # — each diagonal NB×NB block uses the per-column kernel (cache-resident), and the off-diagonal block
@@ -1162,7 +1163,9 @@ end
 # Complex off-diagonal scatters for blocked trmv/trsv: y += α·op(Av)·xv (β=1 accumulate), reusing the
 # gating complex gemv kernels. N → gemv-N; T/C → gemv-T/C with cj resolved to a compile-time Val.
 @inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
-    _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false), Val(_CGEMV_MR_SCAT))
+    _vwidth(real(T)) == 4 ?     # AVX2: the OB-structure ri gemv (α folded, fresh accs, prefetch, m-blocked)
+        _gemv_n_ri_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false)) :
+        _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false), Val(_CGEMV_MR_SCAT))
 @inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
     cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
          _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))
