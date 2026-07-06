@@ -1108,6 +1108,12 @@ end
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
+# Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
+# off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
+# ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).
+# Wide B keeps the trtri-on-inverse base (_TRMM_BASE) — its invert is amortized by the big gemm. Per-box knob.
+const _CTRSM_REC_L = @load_preference("ctrsm_rec_l", 64)::Int
+const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: ≤ → narrow (j-outer recursion)
 # Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹), A⁻¹ triangular → reuse the trmm K-TRIM kernel on the inverse at
 # half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
 function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
@@ -1137,9 +1143,15 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + K-TRIM gemm (half flops)
-        return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
-                              _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex                       # complex base (else fall through → gemm-blocked split)
+        # nrhs is invariant under the row-split → decide the base once. Wide B: trtri-on-inverse base (its
+        # O(k³) invert is amortized by the big off-diagonal gemm). Narrow B (standalone 96/128): trtri
+        # overhead is exposed, so recurse into small j-outer bases + gemm subtract (OB's structure).
+        recbase = size(B, 2) <= _CTRSM_NCUT ? _CTRSM_REC_L : _TRMM_BASE
+        if k <= recbase
+            return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
+                                  _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
+        end
     elseif k <= _TRMM_BASE                                 # AD/generic: trsv per column
         @inbounds for c in axes(B, 2)
             _trsv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
