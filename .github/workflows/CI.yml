@@ -11,13 +11,12 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ github.event_name }}
     runs-on: ubuntu-latest
-    # The suite uses TrimCheck (Julia 1.12 `Compiler` stdlib), JET, StrictMode, ForwardDiff, so it
-    # runs on stable (1.12.x); nightly is allowed to fail (compiler-internals churn).
-    continue-on-error: ${{ matrix.version == 'nightly' }}
+    # The suite uses TrimCheck (Julia 1.12 `Compiler` stdlib), JET, StrictMode, ForwardDiff — pinned to
+    # 1.12 (nightly dropped: compiler-internals churn broke it and it added no signal).
     strategy:
       fail-fast: false
       matrix:
-        version: ['1', 'nightly']
+        version: ['1.12']
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
