@@ -961,6 +961,119 @@ end
     _cmplx_kernel_body(T, W, MR, NR, SA, SB, storefn, A1)
 end
 
+# ── Fused two-product complex microkernel (syr2k/her2k AVX2 mid-n lever) ─────────────────────
+# C[tile] += Σₖ σA(a1)·σB(b1) + σA(a2)·σB(b2) — BOTH rank-k products accumulated into ONE register set
+# with ONE RMW store (two _microkernel_cmplx! calls/tile = two prologues + two RMW epilogues, measured
+# REGRESSION). No α args: the driver folds s = (SA==-1 ? conj(α) : α) into the X-pack, so the conj signs
+# deliver product-1 coefficient σA(s)=α and product-2 σB(s)=ᾱ (her2k)/α (syr2k) — the store is then the
+# cheap A1-style interleave+add. Budget (W=4,MR=1,NR=4): 8 accs + 4 A-vecs + 2 sequenced broadcasts =
+# 14/16 ymm (separate per-product accs would be 16+6 → spill, the NR=6 lesson). Fable-designed 2026-07-06.
+function _cmplx_kernel_body2(T, W, MR, NR, SA, SB, storefn)
+    sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for j in 1:NR
+        push!(body.args, :(_prefetch(C + $((j - 1) * 2) * ldc * $sz)))
+    end
+    for mi in 1:MR, j in 1:NR
+        push!(body.args, :($(Symbol(:cr, mi, :_, j)) = zero($V)))
+        push!(body.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
+    end
+    inner = quote end
+    for mi in 1:MR
+        push!(inner.args, :($(Symbol(:a1r, mi)) = vload($V, A1R + (p * $MR + $(mi - 1)) * $(W * sz))))
+        push!(inner.args, :($(Symbol(:a1i, mi)) = vload($V, A1I + (p * $MR + $(mi - 1)) * $(W * sz))))
+        push!(inner.args, :($(Symbol(:a2r, mi)) = vload($V, A2R + (p * $MR + $(mi - 1)) * $(W * sz))))
+        push!(inner.args, :($(Symbol(:a2i, mi)) = vload($V, A2I + (p * $MR + $(mi - 1)) * $(W * sz))))
+    end
+    for j in 1:NR
+        for (pn, BR, BI) in ((1, :B1R, :B1I), (2, :B2R, :B2I))   # b{pn} pair dies before the next loads
+            br = Symbol(:b, pn, :r, j); bi = Symbol(:b, pn, :i, j)
+            push!(inner.args, :($br = $V(unsafe_load($BR + (p * $NR + $(j - 1)) * $sz))))
+            push!(inner.args, :($bi = $V(unsafe_load($BI + (p * $NR + $(j - 1)) * $sz))))
+            for mi in 1:MR
+                cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+                ar = Symbol(:a, pn, :r, mi); ai = Symbol(:a, pn, :i, mi)
+                push!(inner.args, :($cr = muladd($ar, $br, $cr)))
+                aibi = SA * SB == 1 ? :(-$ai) : :($ai)
+                push!(inner.args, :($cr = muladd($aibi, $bi, $cr)))
+                arbi = SB == 1 ? :($ar) : :(-$ar)
+                push!(inner.args, :($ci = muladd($arbi, $bi, $ci)))
+                aibr = SA == 1 ? :($ai) : :(-$ai)
+                push!(inner.args, :($ci = muladd($aibr, $br, $ci)))
+            end
+        end
+    end
+    push!(body.args, quote
+        @inbounds @simd ivdep for p in 0:(kc - 1)
+            $inner
+        end
+    end)
+    ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
+    for j in 1:NR, mi in 1:MR
+        cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+        q = :(C + ($(j - 1) * ldc * 2 + $((mi - 1) * 2W)) * $sz)
+        st = :(resv = shufflevector($cr, $ci, Val($ilv)))       # α folded into the pack ⇒ no store-α
+        push!(body.args, storefn(mi, j, q, st))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+@generated function _microkernel2_cmplx!(C::Ptr{T}, ldc::Int, A1R::Ptr{T}, A1I::Ptr{T},
+        B1R::Ptr{T}, B1I::Ptr{T}, A2R::Ptr{T}, A2I::Ptr{T}, B2R::Ptr{T}, B2I::Ptr{T},
+        kc::Int, ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB},
+        ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
+    W = _vwidth(T)
+    storefn = (mi, j, q, st) -> B0 ?
+        quote let qq = $q; $st; vstore(resv, qq); end end :
+        quote let qq = $q; $st; vstore(vload(Vec{$(2W), $T}, qq) + resv, qq); end end
+    _cmplx_kernel_body2(T, W, MR, NR, SA, SB, storefn)
+end
+@generated function _microkernel2_cmplx_masked!(C::Ptr{T}, ldc::Int, A1R::Ptr{T}, A1I::Ptr{T},
+        B1R::Ptr{T}, B1I::Ptr{T}, A2R::Ptr{T}, A2I::Ptr{T}, B2R::Ptr{T}, B2I::Ptr{T},
+        kc::Int, mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{SA}, ::Val{SB},
+        ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
+    W = _vwidth(T)
+    lanetuple = Expr(:tuple, (0:(2W - 1))...)
+    storefn = (mi, j, q, st) -> quote
+        if $(j - 1) < nre
+            let qq = $q, msk = (Vec{$(2W), Int}($lanetuple)) < 2 * (mre - $((mi - 1) * W))
+                $st
+                $(B0 ? :(vstore(resv, qq, msk)) : :(vstore(vload(Vec{$(2W), $T}, qq, msk) + resv, qq, msk)))
+            end
+        end
+    end
+    _cmplx_kernel_body2(T, W, MR, NR, SA, SB, storefn)
+end
+@generated function _microkernel2_cmplx_tri!(C::Ptr{T}, ldc::Int, A1R::Ptr{T}, A1I::Ptr{T},
+        B1R::Ptr{T}, B1I::Ptr{T}, A2R::Ptr{T}, A2I::Ptr{T}, B2R::Ptr{T}, B2I::Ptr{T},
+        kc::Int, mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR},
+        ::Val{SA}, ::Val{SB}, ::Val{B0} = Val(false)) where {T, MR, NR, SA, SB, B0}
+    W = _vwidth(T)
+    crowtuple = Expr(:tuple, ((l ÷ 2) for l in 0:(2W - 1))...)
+    storefn = (mi, j, q, st) -> quote
+        if $(j - 1) < nre
+            let qq = $q, thr = d0 + $(j - 1),
+                crow = Vec{$(2W), Int}($crowtuple) + $((mi - 1) * W)
+                mk = (crow < mre) & (upper ? (crow <= thr) : (crow >= thr))
+                $st
+                $(B0 ? :(vstore(resv, qq, mk)) :
+                       :(vstore(vload(Vec{$(2W), $T}, qq, mk) + resv, qq, mk)))
+            end
+        end
+    end
+    _cmplx_kernel_body2(T, W, MR, NR, SA, SB, storefn)
+end
+# Complex-scale a packed split panel in place: (PR,PI) ← s·(PR,PI). Folds α into the fused driver's
+# X-pack (padded zeros scale to zero — the whole packed region is safe). Skipped when α==1.
+function _scale_pack_cmplx!(PR::Vector{T}, PI::Vector{T}, len::Int, sr::T, si::T) where {T}
+    @inbounds @simd ivdep for idx in 1:len
+        r = PR[idx]; im = PI[idx]
+        PR[idx] = muladd(sr, r, -(si * im))
+        PI[idx] = muladd(sr, im, si * r)
+    end
+    return
+end
+
 # Complex split-pack buffers live in the per-type L3Workspace `cg` field (see src/workspace.jl);
 # `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
 
