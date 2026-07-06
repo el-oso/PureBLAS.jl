@@ -1119,24 +1119,46 @@ function _trmv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
     return x
 end
 
+# Reciprocal-of-diagonal scratch for complex trsv (per real type; single-thread — no MT here). The
+# in-loop complex DIVIDE sits on the sequential substitution CRITICAL PATH (each x[j] feeds the next
+# column's axpy/dot) — Julia's Complex `/` (Smith's robust algorithm) latency is fully exposed and
+# dominates small n (ztrsv n≤256 was 0.65–0.96 vs OB; ztrmv, SAME axpy but NO divide, gates). Precompute
+# r[j]=1/diag up front (all independent → pipelined, throughput-bound) with a NAIVE reciprocal (the trsv
+# diagonal is well-conditioned; BLAS doesn't overflow-guard the inner divide), then MULTIPLY in the loop.
+# n ≤ _TRI_C_BLK_MIN (256) unblocked / 64-block ⇒ 512 covers it (else fall back to the divide).
+const _TRSV_RCP64 = Vector{ComplexF64}(undef, 512)
+const _TRSV_RCP32 = Vector{ComplexF32}(undef, 512)
+@inline _trsv_rcpbuf(::Type{Float64}) = _TRSV_RCP64
+@inline _trsv_rcpbuf(::Type{Float32}) = _TRSV_RCP32
+@inline _crecip(d::Complex) = (r = real(d); i = imag(d); s = inv(muladd(r, r, i * i)); Complex(r * s, -i * s))
+
 # Complex trsv (solve op(A)·x = x in place). N forms = column substitution (axpy of −xⱼ into the rest);
-# T/C forms = dot-based row substitution. Same L1-kernel reuse.
+# T/C forms = dot-based row substitution. Diagonal reciprocals precomputed off the critical path.
 function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) where {}
     T = real(eltype(A)); csz = sizeof(Complex{T})
+    userc = !unit && n <= 512                                # precompute reciprocals off the crit path
     GC.@preserve A x begin
         Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(pointer(x)); ldc = stride(A, 2)
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
+        rcp = _trsv_rcpbuf(T)
+        if userc                                             # r[j] = 1/diag (naive, pipelined)
+            if !tr
+                @inbounds for j in 1:n; rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * ldc + j)); end
+            else
+                @inbounds for j in 1:n; rcp[j] = _crecip(djj(j)); end
+            end
+        end
         if !tr                                               # op = A: column-oriented substitution
             if up                                            # back-substitution (j descending)
                 @inbounds for j in n:-1:1
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
+                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
                     xj = unsafe_load(xp, j)
                     j > 1 && _axpy_cmplx_simd!(j - 1, real(-xj), imag(-xj), colp(1, j), xp)
                 end
             else                                             # forward-substitution (j ascending)
                 @inbounds for j in 1:n
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
+                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
                     xj = unsafe_load(xp, j)
                     j < n && _axpy_cmplx_simd!(n - j, real(-xj), imag(-xj), colp(j + 1, j), xp + j * csz)
                 end
@@ -1146,13 +1168,13 @@ function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
                 @inbounds for j in 1:n
                     s = unsafe_load(xp, j)
                     j > 1 && (s -= _dot_cmplx_disp(j - 1, colp(1, j), xp, T, cj))
-                    unsafe_store!(xp, unit ? s : s / djj(j), j)
+                    unsafe_store!(xp, unit ? s : (userc ? s * rcp[j] : s / djj(j)), j)
                 end
             else                                             # backward (j descending)
                 @inbounds for j in n:-1:1
                     s = unsafe_load(xp, j)
                     j < n && (s -= _dot_cmplx_disp(n - j, colp(j + 1, j), xp + j * csz, T, cj))
-                    unsafe_store!(xp, unit ? s : s / djj(j), j)
+                    unsafe_store!(xp, unit ? s : (userc ? s * rcp[j] : s / djj(j)), j)
                 end
             end
         end
