@@ -791,6 +791,21 @@ const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int    # max(m,n,k) 
 const _CGEMM_3M_MAX = @load_preference("cgemm_3m_max", 2048)::Int  # max(m,n,k) ≤ this
 const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) ≥ this (thin gemms: overhead dominates)
 
+# Strassen-Winograd for REAL gemm (see _gemm_strassen!): recursive 2×2 blocking, 7 half-size products
+# instead of 8 (~14% fewer flops/level, compounding), each running the gating classical kernel as base.
+# Beats OB at large n where classical is at the FMA roofline (measured AVX2: 2-level 1.20× at n=2048,
+# 1.26× at 4096). Split while min(m,n,k) ≥ _STRASSEN_MIN (base stays ≥ ~min/2), capped at _MAXDEPTH.
+# NN + real α/β only (trans/complex fall back). Default ON for W=4/8 (real gemm is throughput-bound on
+# both AVX2 and AVX-512 — Strassen's flop cut is ISA-independent); per-box threshold via Preferences.
+const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
+const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
+const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
+@inline function _strassen_depth(m::Int, n::Int, k::Int)
+    d = 0; s = min(m, n, k)
+    while s >= _STRASSEN_MIN && d < _STRASSEN_MAXDEPTH; d += 1; s >>= 1; end
+    return d
+end
+
 # Split-pack op(A) into mr-row panels: real parts → ApR, imag → ApI (same panel layout as _pack_A!,
 # so the microkernel indexes both identically). No alpha (folded at store), no conj (kernel sign).
 function _pack_A_cmplx!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
@@ -1531,6 +1546,56 @@ function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::In
     return C
 end
 
+# ── Strassen-Winograd real GEMM ──────────────────────────────────────────────────────────────
+# C := α·A·B + β·C, recursive 2×2 (Douglas-Heroux-Slishman-Smith form, 15 adds). Sub-products run with
+# α=1,β=0; the top-level combine applies α,β. Buffers come from the per-level workspace pool; quadrants
+# are views (tiny headers, negligible at Strassen's large n). Dims must be divisible by 2^depth (the
+# entry pads odd/awkward sizes). Verified symbolically + numerically (~1e-14 vs the OB oracle).
+function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) where {T}
+    if depth == 0
+        return _gemm_real_dims!(false, false, size(C, 1), size(C, 2), size(A, 2), alpha, beta, A, Bm, C)
+    end
+    m = size(C, 1); n = size(C, 2); k = size(A, 2); mh = m ÷ 2; nh = n ÷ 2; kh = k ÷ 2
+    A11 = @view A[1:mh, 1:kh]; A12 = @view A[1:mh, (kh+1):k]; A21 = @view A[(mh+1):m, 1:kh]; A22 = @view A[(mh+1):m, (kh+1):k]
+    B11 = @view Bm[1:kh, 1:nh]; B12 = @view Bm[1:kh, (nh+1):n]; B21 = @view Bm[(kh+1):k, 1:nh]; B22 = @view Bm[(kh+1):k, (nh+1):n]
+    C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh+1):n]; C21 = @view C[(mh+1):m, 1:nh]; C22 = @view C[(mh+1):m, (nh+1):n]
+    TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
+    o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
+    @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z)   # S1,T1 → P5
+    @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z)   # S2,T2 → P6
+    @. TB = TB - B21;                     _strassen_rec!(P4, A22, TB, dm, lv, o, z)  # T4 → P4
+    @. TA = A12 - TA;                     _strassen_rec!(P3, TA, B22, dm, lv, o, z)  # S4 → P3
+    @. TA = A11 - A21; @. TB = B22 - B12; _strassen_rec!(P7, TA, TB, dm, lv, o, z)   # S3,T3 → P7
+    _strassen_rec!(P1, A11, B11, dm, lv, o, z)
+    _strassen_rec!(P2, A12, B21, dm, lv, o, z)
+    @. U = P1 + P6                                                                   # U1
+    if iszero(beta)
+        @. C11 = alpha * (P1 + P2); @. C12 = alpha * (U + P5 + P3)
+        @. C21 = alpha * (U + P7 - P4); @. C22 = alpha * (U + P7 + P5)
+    else
+        @. C11 = alpha * (P1 + P2) + beta * C11; @. C12 = alpha * (U + P5 + P3) + beta * C12
+        @. C21 = alpha * (U + P7 - P4) + beta * C21; @. C22 = alpha * (U + P7 + P5) + beta * C22
+    end
+    return C
+end
+# Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
+function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
+    T = eltype(C); D = _strassen_depth(m, n, k); p = 1 << D
+    mp = cld(m, p) * p; np = cld(n, p) * p; kp = cld(k, p) * p
+    a = convert(T, alpha); b = convert(T, beta)
+    if mp == m && np == n && kp == k                       # already clean — recurse in place (β applied at top)
+        _strassen_rec!(C, A, B, D, 0, a, b)
+    else                                                   # odd/awkward: pad to even^D with zeros, copy back
+        Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
+        fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= A
+        fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= B
+        _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
+        Cv = @view Cp[1:m, 1:n]
+        iszero(b) ? (@inbounds @. C = a * Cv) : (@inbounds @. C = a * Cv + b * C)
+    end
+    return C
+end
+
 """
     gemm!(C, A, B; alpha=1, beta=0, transA='N', transB='N')
 
@@ -1600,6 +1665,9 @@ end
     if T <: BlasReal && _strided1(C)
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
+        end
+        if _STRASSEN && !tA && !tB && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
+            return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
         end
         if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
             if !tA

@@ -28,12 +28,14 @@ mutable struct L3Workspace{T}
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
     m3::Vector{Matrix{T}}      # _gemm_3m_scratch:    Karatsuba 3M matrices (Ar/Ai/As, Br/Bi/Bs, P1/P2/P3)
+    str::Vector{Matrix{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     [Matrix{T}(undef, 0, 0) for _ in 1:9],
+    Matrix{T}[],
 )
 
 # Owner accessors. Const-dispatch the gated real types (bare field load, no lookup); a keyed fallback for
@@ -117,4 +119,26 @@ function _gemm_3m_scratch(::Type{Tr}, ra::Int, ca::Int, rb::Int, cb::Int, m::Int
     grow!(4, rb, cb); grow!(5, rb, cb); grow!(6, rb, cb)
     grow!(7, m, n);   grow!(8, m, n);   grow!(9, m, n)
     return t
+end
+
+# Strassen scratch pool (real). Slots 1-3: odd-n pad buffers (Ap mp×kp, Bp kp×np, Cp mp×np). Slots
+# 4+: per-recursion-level Winograd buffers, 10 per level (TA mh×kh, TB kh×nh, P1..P7 + U all mh×nh) at
+# base 3+level*10. Exact-sized (realloc on shape mismatch — negligible at the large n Strassen runs at).
+@inline function _str_fit!(pool, i::Int, r::Int, c::Int, ::Type{Tr}) where {Tr}
+    while length(pool) < i; push!(pool, Matrix{Tr}(undef, 0, 0)); end
+    M = pool[i]; (size(M, 1) != r || size(M, 2) != c) && (pool[i] = Matrix{Tr}(undef, r, c))
+    return pool[i]
+end
+function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
+    p = _l3ws(Tr).str
+    return _str_fit!(p, 1, mp, kp, Tr), _str_fit!(p, 2, kp, np, Tr), _str_fit!(p, 3, mp, np, Tr)
+end
+function _strassen_lvl_scratch(::Type{Tr}, level::Int, mh::Int, nh::Int, kh::Int) where {Tr}
+    p = _l3ws(Tr).str; b = 3 + level * 10
+    TA = _str_fit!(p, b + 1, mh, kh, Tr); TB = _str_fit!(p, b + 2, kh, nh, Tr)
+    P1 = _str_fit!(p, b + 3, mh, nh, Tr); P2 = _str_fit!(p, b + 4, mh, nh, Tr)
+    P3 = _str_fit!(p, b + 5, mh, nh, Tr); P4 = _str_fit!(p, b + 6, mh, nh, Tr)
+    P5 = _str_fit!(p, b + 7, mh, nh, Tr); P6 = _str_fit!(p, b + 8, mh, nh, Tr)
+    P7 = _str_fit!(p, b + 9, mh, nh, Tr); U = _str_fit!(p, b + 10, mh, nh, Tr)
+    return TA, TB, P1, P2, P3, P4, P5, P6, P7, U
 end
