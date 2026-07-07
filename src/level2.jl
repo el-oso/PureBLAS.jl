@@ -519,14 +519,12 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
             return iszero(β) ? _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(true)) :
                 _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(false))
         end
-        if _l2c_ok(A, x, y, incx, incy)       # complex N
-            αc = convert(eltype(A), α); βc = convert(eltype(A), β)
-            if _vwidth(real(eltype(A))) == 4  # AVX2 → OB-structure ri kernel (fresh accs, α-in-broadcast)
-                return iszero(β) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
-                    _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
-            end
-            return iszero(β) ? _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :   # AVX-512 row-tile
-                _gemv_n_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
+        if _l2c_ok(A, x, y, incx, incy)       # complex N → OB-structure ri kernel (column-streaming; measured
+            αc = convert(eltype(A), α); βc = convert(eltype(A), β)   # ≥ the row-tile at every n on BOTH AVX2 and
+            # AVX-512 — the row-tile's 8-col-panel restreaming of y is L3-hostile at mid-n, e.g. Zen4 n=1024
+            # 0.77→1.00, n=512 1.11→1.31. (Row-tile _gemv_n_cmplx! is kept: hemv still uses it internally.)
+            return iszero(β) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
+                _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
         end
         _scale_y!(Int(m), β, y, incy)
         ix = _start(n, incx)
