@@ -1500,6 +1500,36 @@ function _split3!(Xr, Xi, Xs, M, conj::Bool, r::Int, c::Int)
     end
     return
 end
+# Hermitian/symmetric split for 3M hemm/symm side-L: split A_herm (stored `up` triangle) into re/im/sum
+# reading the triangle IN PLACE — no materialize, no n² complex scratch. Stored run reads A[i,j] direct
+# (contiguous column, @simd); mirror run reads A[j,i] (row j, strided) with im negated for herm; herm
+# diagonal → real (im=0). The 3M A-split IS the reflection — deletes the materialize pre-pass that
+# dominated small/mid-n hemm/symm. herm=false ⇒ symm (mirror not conjugated).
+function _split3_sym!(Xr, Xi, Xs, A, up::Bool, herm::Bool, n::Int)
+    Tr = eltype(Xr); ms = herm ? -one(Tr) : one(Tr)
+    lda = stride(A, 2); ldx = stride(Xr, 2)
+    GC.@preserve A Xr Xi Xs begin
+        pa = Ptr{Tr}(pointer(A)); pr = pointer(Xr); pii = pointer(Xi); ps = pointer(Xs)
+        @inbounds for j in 1:n
+            xb = (j - 1) * ldx; cj = (j - 1) * lda * 2                 # A column j (real offset)
+            slo, shi = up ? (1, j) : (j, n)                            # stored rows: read A[i,j] direct
+            @simd for i in slo:shi
+                re = unsafe_load(pa, cj + 2i - 1); im = unsafe_load(pa, cj + 2i)
+                unsafe_store!(pr, re, xb + i); unsafe_store!(pii, im, xb + i); unsafe_store!(ps, re + im, xb + i)
+            end
+            if herm                                                   # diagonal is real
+                unsafe_store!(pii, zero(Tr), xb + j); unsafe_store!(ps, unsafe_load(pr, xb + j), xb + j)
+            end
+            mlo, mhi = up ? (j + 1, n) : (1, j - 1)                    # mirror rows: read A[j,i] (row j, strided)
+            for i in mlo:mhi
+                ci = (i - 1) * lda * 2
+                re = unsafe_load(pa, ci + 2j - 1); im = ms * unsafe_load(pa, ci + 2j)
+                unsafe_store!(pr, re, xb + i); unsafe_store!(pii, im, xb + i); unsafe_store!(ps, re + im, xb + i)
+            end
+        end
+    end
+    return
+end
 # C := α·(P1−P2 + i(P3−P1−P2)) + β·C.  β=0 ⇒ skip the C read (overwrite).
 function _combine3!(C, P1, P2, P3, alpha::Tc, beta::Tc, m::Int, n::Int) where {Tc}
     Tr = real(Tc); ar = real(alpha); ai = imag(alpha); br = real(beta); bi = imag(beta); b0 = iszero(beta)
@@ -1552,6 +1582,28 @@ function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::In
         _gemm_real_dims!(tA, tB, m, n, k, o, z, Ai, Bi, P2)
         _gemm_real_dims!(tA, tB, m, n, k, o, z, As, Bs, P3)
         _combine3!(C, P1, P2, P3, convert(Tc, alpha), convert(Tc, beta), m, n)
+    end
+    return C
+end
+# Karatsuba-3M complex hemm/symm side-L: C := α·A_herm·B + β·C, with A split from its stored triangle by
+# _split3_sym! (no materialize, no n² complex scratch). Mirror of _gemm_3m! (tA=tB='N', k=n=size(A,1)).
+# herm=false ⇒ symm. `_combine3!` applies α and β (β=0 overwrites), so no separate scaleC. This deletes
+# the materialize pre-pass for complex hemm/symm in the 3M window — the 3M split already reads all of A.
+function _hemm_3m_L!(up::Bool, herm::Bool, α, β, A, B, C)
+    Tc = eltype(C); Tr = real(Tc); n = size(A, 1); m = size(B, 2)
+    t = _gemm_3m_scratch(Tr, n * n, size(B, 1) * m, n * m)
+    GC.@preserve t begin
+        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+        Ar = w(1, n, n); Ai = w(2, n, n); As = w(3, n, n)
+        Br = w(4, n, m); Bi = w(5, n, m); Bs = w(6, n, m)
+        P1 = w(7, n, m); P2 = w(8, n, m); P3 = w(9, n, m)
+        _split3_sym!(Ar, Ai, As, A, up, herm, n)
+        _split3!(Br, Bi, Bs, B, false, n, m)
+        o = one(Tr); z = zero(Tr)
+        _gemm_real_dims!(false, false, n, m, n, o, z, Ar, Br, P1)
+        _gemm_real_dims!(false, false, n, m, n, o, z, Ai, Bi, P2)
+        _gemm_real_dims!(false, false, n, m, n, o, z, As, Bs, P3)
+        _combine3!(C, P1, P2, P3, convert(Tc, α), convert(Tc, β), n, m)
     end
     return C
 end
