@@ -276,9 +276,17 @@ const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
 # Off-diagonal tri-scatter is a TALL skinny gemv (m≫n=NB); MR=4 that suits square gemvN regresses it
 # (worse panel/cache behavior), so the scatter uses its own smaller MR. Decoupled per shape.
 const _CGEMV_MR_SCAT = @load_preference("cgemv_mr_scat", 3)::Int
-# Complex gemv-T/C column-block width (cols/pass). Each col needs 2 Vec{2W} accs (p,q); AVX2's 16 regs
-# → 2, AVX-512 → 4. Sharing xc + its swap across the block is the win (fewer shuffles, x streamed once).
-const _CGEMVT_NC = @load_preference("cgemvt_nc", _vwidth(Float64) == 4 ? 2 : 4)::Int
+# Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
+# _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
+# (1 shuffle feeds NC cols, x streamed once per block).
+const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int
+# AVX2: accumulate gemvT/C in native ymm (Vec{W}) so NC=4 columns fit → 4 concurrent load streams (see
+# _gemv_tc_block_cmplx!). AVX-512 keeps full-width Vec{2W} (32 zmm has room, already gates).
+const _CGEMVT_HALF = @load_preference("cgemvt_half", _vwidth(Float64) == 4)::Bool
+# Once A spills L2 (n≳768), gemvT/C is bandwidth-bound, not FMA-latency-bound (measured galen: n≥1024
+# both PB & OB run at L3/DRAM bandwidth, PB only ~92-94% of OB's). Same +192B A-stream prefetch that
+# fixed the gemvN ri valley saturates it here. AVX2-gated (AVX-512 gemvT already gates); Preferences knob.
+const _CGEMVT_PF = @load_preference("cgemvt_pf", _vwidth(Float64) == 4)::Bool
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
@@ -443,11 +451,15 @@ end
 # one complex dot of A's (contiguous) column j with x — reuses the L1 _dot_cmplx_simd kernel directly.
 # One column-block of gemv-T/C: NC columns share each x W-chunk AND its swap (1 shuffle feeds NC cols),
 # and x is streamed once per block instead of re-read per column. Reduction mirrors _dot_cmplx_simd.
+# HALF: accumulate in the native-ymm Vec{W} (1 reg) rather than Vec{2W} (2 regs). Large-n gemvT/C is
+# bandwidth/MLP-bound (measured galen: n≥1024 both PB & OB run at L3/DRAM bw); Vec{2W} at NC=2 already
+# eats all 16 ymm, capping concurrent column streams at 2. Vec{W} at NC=4 → 4 independent streams (OB's
+# AVX2 blocking) → more memory-level parallelism → saturates bw. Full-width kept for AVX-512 (32 regs).
 @inline @generated function _gemv_tc_block_cmplx!(yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int,
         xp::Ptr{Complex{T}}, m::Int, α::Complex{T}, β::Complex{T}, z::Bool,
-        ::Val{NC}, ::Val{CJ}) where {T, NC, CJ}
-    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+        ::Val{NC}, ::Val{CJ}, ::Val{HALF} = Val(false)) where {T, NC, CJ, HALF}
+    W = _vwidth(T); lanes = HALF ? W : 2W; cstep = lanes ÷ 2; V2 = Vec{lanes, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(lanes - 1))...)
     body = quote
         xr = Ptr{$T}(xp); Ar = Ptr{$T}(Ab)
     end
@@ -458,10 +470,11 @@ end
     for c in 1:NC
         av = Symbol(:av, c)
         push!(main.args, :($av = vload($V2, Ar + (i + $(c - 1) * lda) * 2 * $sz)))
+        _CGEMVT_PF && push!(main.args, :(_prefetch(Ar + (i + $(c - 1) * lda) * 2 * $sz + $(3 * lanes * sz))))
         push!(main.args, :($(Symbol(:p, c)) = muladd($av, xc, $(Symbol(:p, c)))))
         push!(main.args, :($(Symbol(:q, c)) = muladd($av, xcs, $(Symbol(:q, c)))))
     end
-    push!(body.args, :(nfull = m - rem(m, $W); i = 0; @inbounds while i < nfull; $main; i += $W; end))
+    push!(body.args, :(nfull = m - rem(m, $cstep); i = 0; @inbounds while i < nfull; $main; i += $cstep; end))
     for c in 1:NC
         push!(body.args, quote
             pr, pii = _deint_cmplx($(Symbol(:p, c))); qr, qi = _deint_cmplx($(Symbol(:q, c)))
@@ -495,7 +508,7 @@ function _gemv_tc_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y
         Ap = pointer(A); lda = stride(A, 2); xp = pointer(x); yp = pointer(y)
         j = 0
         while j + NC <= n                                         # NC-column blocks (shared x + swap)
-            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ))
+            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(_CGEMVT_HALF))
             j += NC
         end
         @inbounds while j < n                                     # remainder columns: per-column dot
