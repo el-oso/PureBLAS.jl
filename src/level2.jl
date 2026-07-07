@@ -443,7 +443,7 @@ end
 # one complex dot of A's (contiguous) column j with x — reuses the L1 _dot_cmplx_simd kernel directly.
 # One column-block of gemv-T/C: NC columns share each x W-chunk AND its swap (1 shuffle feeds NC cols),
 # and x is streamed once per block instead of re-read per column. Reduction mirrors _dot_cmplx_simd.
-@generated function _gemv_tc_block_cmplx!(yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int,
+@inline @generated function _gemv_tc_block_cmplx!(yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int,
         xp::Ptr{Complex{T}}, m::Int, α::Complex{T}, β::Complex{T}, z::Bool,
         ::Val{NC}, ::Val{CJ}) where {T, NC, CJ}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
