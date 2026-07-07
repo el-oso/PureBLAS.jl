@@ -9,7 +9,7 @@
 #   Zen3     (AVX2)     -> 32 bytes -> Vec{4,Float64}, Vec{8,Float32}
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
-using CpuId: simdbytes, cpuvendor, cpufeature
+using CpuId: simdbytes, cpuvendor, cpufeature, cpumodel
 using CPUSummary: cache_size
 using Preferences: @load_preference
 
@@ -42,6 +42,22 @@ const _INTEL_AVX2 = try
     cpuvendor() === :Intel && cpufeature(:AVX2) && !cpufeature(:AVX512F)
 catch
     false
+end
+
+# Zen4's AVX-512 is DOUBLE-PUMPED (256-bit physical datapath), so the packed complex trmm-on-inverse base
+# out-throughputs the direct-recurse side-R solve for WIDE B at n≥256 (measured 1.7× vs 1.3×) — unlike
+# Zen5's native-512 datapath or AVX2, which prefer the recurse. `_trsm_right!` keeps the trtri base for
+# wide B only on Zen4. Width can't distinguish it (Zen4/Zen5 both W=8), so key on vendor + AVX-512 +
+# effective family: AMD family 0x19 (Zen3/Zen4) WITH AVX-512 ⇒ Zen4 (Zen3 shares 0x19 but lacks AVX-512;
+# Zen5 is 0x1A). CpuId's :Family byte is the raw base|extended nibbles → effective = base + extended.
+# Detected at build (const-folds, trim-safe), overridable via Preferences. AMD-only; else false.
+const _ZEN4_AVX512 = let p = @load_preference("zen4_avx512", nothing)
+    p isa Bool ? p : try
+        cpuvendor() === :AMD && cpufeature(:AVX512F) &&
+            (r = Int(cpumodel()[:Family]); (r & 0x0f) + (r >> 4) == 0x19)
+    catch
+        false
+    end
 end
 
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the

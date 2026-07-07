@@ -1248,12 +1248,13 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             return _trsm_base_invR!(up, tr, unit, A, B)
         end
     elseif eltype(B) <: BlasComplex
-        # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse),
-        # and 64<k recurses all the way down to it + gated _gemm_subR!. Measured (consistent harness, all
-        # three µarchs) uniformly ≥ the invert+K-TRIM base for side-R — the trtri never amortizes here
-        # (its O(k³/6) invert is 40–66% exposed even at k=256, where two 128-trtri bases capped 0.95 on AVX2
-        # and direct-recurse beats the wide-B trtri path on AVX-512/Zen5 too). Trans keeps the ≤128 base.
-        recbase = !tr ? _CTRSM_REC_L : _TRMM_BASE
+        # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse).
+        # Above that, recurse down to it + gated _gemm_subR! — measured best for side-R on AVX2 and Zen5
+        # (native-512), where the trtri never amortizes (O(k³/6) invert stays exposed even at k=256). The
+        # ONE exception is Zen4: its double-pumped 256-bit AVX-512 datapath makes the packed trmm-on-inverse
+        # win for WIDE B at k≥256 (1.7× vs 1.3× recursed) — so there, keep the ≤128 trtri base for wide B
+        # (narrow B still recurses; small k still direct). Trans keeps the ≤128 base. (See _ZEN4_AVX512.)
+        recbase = !tr ? ((_ZEN4_AVX512 && size(B, 1) > _CTRSM_NCUT) ? _TRMM_BASE : _CTRSM_REC_L) : _TRMM_BASE
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
                                   _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
