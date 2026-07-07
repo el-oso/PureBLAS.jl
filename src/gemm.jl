@@ -1248,6 +1248,44 @@ function _pack_A_cmplx_simd!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int
     end
     return
 end
+# _pack_A_cmplx_simd! with a complex scale s=(sr,si) FOLDED into the store (PR=ar·sr−ai·si, PI=ar·si+ai·sr)
+# — one pass replaces pack + a separate _scale_pack_cmplx! pass for the fused two-product driver's α≠1
+# (contiguous X only; the fused kernel bakes α into the X-pack since its 2-product microkernel can't apply
+# it at the store). Saves a full re-read+re-write of the pack per kc-block. Deinterleave = _pack_A_cmplx_simd!.
+function _pack_A_cmplx_simd_scaled!(ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int,
+        mce::Int, kce::Int, mr::Int, sr::T, si::T) where {T}
+    W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); np = cld(mce, mr)
+    svr = Vec{W, T}(sr); svi = Vec{W, T}(si)
+    GC.@preserve A ApR ApI begin
+        Aptr = Ptr{T}(pointer(A)); PR = pointer(ApR); PI = pointer(ApI)
+        @inbounds for pi in 0:(np - 1)
+            base = pi * mr * kce; r0 = ic + pi * mr
+            if pi * mr + mr <= mce
+                for p in 0:(kce - 1)
+                    col = 2 * (r0 + (pc + p) * lda); dst = base + p * mr
+                    o = 0
+                    while o < mr
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, Aptr + (col + 2 * o) * sz))
+                        nar = muladd(svr, ar, -(svi * ai)); nai = muladd(svr, ai, svi * ar)
+                        vstore(nar, PR + (dst + o) * sz); vstore(nai, PI + (dst + o) * sz)
+                        o += W
+                    end
+                end
+            else
+                for p in 0:(kce - 1), r in 0:(mr - 1)
+                    lr = pi * mr + r; idx = base + p * mr + r + 1
+                    if lr < mce
+                        v = A[ic + lr + 1, pc + p + 1]; re = real(v); im = imag(v)
+                        ApR[idx] = sr * re - si * im; ApI[idx] = sr * im + si * re
+                    else
+                        ApR[idx] = zero(T); ApI[idx] = zero(T)
+                    end
+                end
+            end
+        end
+    end
+    return
+end
 
 # One W×W COMPLEX transpose-pack block: load W interleaved Vec{2W} column-chunks of A (column r at
 # +2r·lda reals), _deint_cmplx each → W real + W imag Vec{W}s, run the _tblk! shuffle butterfly on both

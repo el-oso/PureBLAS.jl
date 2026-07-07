@@ -1719,8 +1719,14 @@ function _trgemm_cmplx_packed2_u!(::Val{SA}, ::Val{SB}, up::Bool, alr::T, ali::T
             nce = min(nc, n - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
-                _pack_A_cmplx!(ApR, ApI, X, 0, pc, n, kce, tXp, mr)         # op(X) once
-                noscale || _scale_pack_cmplx!(ApR, ApI, cld(n, mr) * pstr, sr, si)
+                if noscale                                                 # op(X) once (α folded below)
+                    _pack_A_cmplx!(ApR, ApI, X, 0, pc, n, kce, tXp, mr)
+                elseif !tXp && _strided1(X)                                # contiguous: fold α into the pack write
+                    _pack_A_cmplx_simd_scaled!(ApR, ApI, X, 0, pc, n, kce, mr, sr, si)
+                else                                                       # transposed/strided: two-pass
+                    _pack_A_cmplx!(ApR, ApI, X, 0, pc, n, kce, tXp, mr)
+                    _scale_pack_cmplx!(ApR, ApI, cld(n, mr) * pstr, sr, si)
+                end
                 _pack_A_cmplx!(BpR, BpI, Y, 0, pc, n, kce, !tYp, mr)        # op(Y) once
                 ic = 0
                 while ic < n
