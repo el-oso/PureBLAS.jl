@@ -14,6 +14,7 @@
 #                                                              #  its native Haswell kernels. On AMD MKL
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
+using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
 # Reference BLAS: OpenBLAS (default) or Intel MKL (`mkl` arg). MKL.jl LBT-forwards LinearAlgebra to MKL,
 # so `B`/`LAPACK` below transparently measure against whichever is active — one code path, two baselines.
 const REFBK = "mkl" in ARGS ? "mkl" : "openblas"
@@ -29,51 +30,43 @@ sizemeds(op) = [(s, median(v)) for (s, v) in op]                    # per-size m
 pooled(op) = reduce(vcat, (v for (_, v) in op); init = Float64[])   # all samples (for violins)
 geomin(op) = (m = [median(v) for (_, v) in op]; (exp(sum(log, m) / length(m)), minimum(m)))
 
-# L1/L2 sweep: each round is one fresh context (address/alignment varies — essential for iamax, whose
-# OpenBLAS idamax swings ~60% by address), interleaved OpenBLAS-then-PureBLAS timing (drift cancels).
-function sweep(mk, sizes, work_ob, work_pb, repfn; rounds = 20)
+# Every Chairmarks sample time (seconds) — it reports min but stores all timings; we use the full set.
+_times(b) = Float64[smp.time for smp in b.samples]
+# Quantile-paired ratio distribution: q-th quantile of OB time ÷ q-th quantile of PB time. q=0.5 IS the
+# median ratio (the gate number); the spread across q gives the violin body. Robust to unequal counts.
+_qratios(bo, bp) = (to = _times(bo); tp = _times(bp); qs = range(0.03, 0.97; length = 48);
+    [quantile(to, q) / quantile(tp, q) for q in qs])
+
+# L1/L2 sweep: one interleaved OB/PB `@be` per size. `evals=1` reruns the setup `mk(s)` per sample so
+# address/alignment varies (essential for iamax — OpenBLAS idamax swings ~60% by address) and the mk
+# allocation is EXCLUDED from the timed core; `reps` amortizes the timer for tiny ops. All sample timings
+# feed the ratio distribution.
+function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.5)
     out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
-        reps = repfn(s); rs = Float64[]
-        for _ in 1:rounds
-            ctx = mk(s)
-            _run(() -> work_ob(ctx, 1)); _run(() -> work_pb(ctx, 1))    # warm this buffer
-            t0 = time_ns(); v1 = _run(() -> work_ob(ctx, reps)); t1 = time_ns()
-            v2 = _run(() -> work_pb(ctx, reps)); t2 = time_ns()
-            SINK[] += v1 + v2; push!(rs, (t1 - t0) / (t2 - t1))
-        end
-        push!(out, (s, rs))
+        reps = repfn(s)
+        bo = @be mk(s) (c -> work_ob(c, reps)) evals=1 samples=samples seconds=seconds
+        bp = @be mk(s) (c -> work_pb(c, reps)) evals=1 samples=samples seconds=seconds
+        push!(out, (s, _qratios(bo, bp)))
     end
     return out
 end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 
-# Heavy O(n³) sweep for L3 / LAPACK, destructive-safe: per round, PRE-GENERATE `reps` fresh contexts
-# (outside timing) and time the loop over them — a single ~100 ns call at n=8 is pure timer quantization
-# (it fabricated a gemm 0.90 "fail" the high-reps harness measured at 1.2×). reps→1 at large n.
-# ⚠ REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`, performance
-# governor). The per-round `mk(s)` alloc between timed regions is memory-bound and drops the core off
-# boost, so with boost ON the side timed first runs at a lower clock → biased ratio + big small-n noise
-# (fabricated a fake complex-gemm "n=32 0.90 floor"; clean locked-freq = 1.03 hot). See memory dev-fleet.
-function sweep_heavy(mk, ob1, pb1, sizes; rounds = 8)
+# Heavy O(n³) sweep for L3 / LAPACK. `@be` with `evals=1` runs a FRESH `mk(s)` per sample (the destructive
+# op mutates its input → one op per context) and EXCLUDES the mk allocation from the timed core — which
+# removes the old hazard where the per-round alloc dropped the core off-clock and biased whichever side was
+# timed first. Warmup + sample sizing are Chairmarks'. Small n is measured cleanly (no timer-quantization
+# reps hack needed — Chairmarks amortizes internally).
+# ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
+# performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
+function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0)
     out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
-        _run(() -> ob1(mk(s))); _run(() -> pb1(mk(s)))     # compile warm
-        t0w = time_ns(); while time_ns() - t0w < 50_000_000; end   # freq warm: an idle-parked core
-        reps = clamp(20_000_000 ÷ (s * s * s), 1, 512)             # (0.4 GHz) ramps THROUGH the first
-        # rounds otherwise, biasing whichever side is timed first.
-        rs = Float64[]
-        for _ in 1:rounds
-            cos = [mk(s) for _ in 1:reps]; cps = [mk(s) for _ in 1:reps]
-            t0 = time_ns()
-            for c in cos; SINK[] += ob1(c); end
-            t1 = time_ns()
-            for c in cps; SINK[] += pb1(c); end
-            t2 = time_ns()
-            push!(rs, (t1 - t0) / (t2 - t1))
-        end
-        push!(out, (s, rs))
+        bo = @be mk(s) ob1 evals=1 samples=samples seconds=seconds
+        bp = @be mk(s) pb1 evals=1 samples=samples seconds=seconds
+        push!(out, (s, _qratios(bo, bp)))
     end
     return out
 end
@@ -204,6 +197,10 @@ function run_cmplx_benchmarks()
                        (c, m) -> (s = 0.0; for _ in 1:m; s += PureBLAS.nrm2(c[1]); end; s)),
             ("dzasum", (c, m) -> (s = 0.0; for _ in 1:m; s += B.asum(c[1]); end; s),
                        (c, m) -> (s = 0.0; for _ in 1:m; s += PureBLAS.asum(c[1]); end; s)),
+            ("zdotu", (c, m) -> (s = zero(T); for _ in 1:m; s += B.dotu(c[1], c[2]); end; real(s)),
+                      (c, m) -> (s = zero(T); for _ in 1:m; s += PureBLAS.dotu(c[1], c[2]); end; real(s))),
+            ("izamax", (c, m) -> (s = 0; for _ in 1:m; s += B.iamax(c[1]); end; s),
+                       (c, m) -> (s = 0; for _ in 1:m; s += PureBLAS.iamax(c[1]); end; s)),
         )
             push!(cl1, nm => sweep(s -> (randn(T, s), randn(T, s)), L1SZ, ob, pb, _L1REP))
         end
@@ -213,9 +210,14 @@ function run_cmplx_benchmarks()
         sq(s) = (randn(T, s, s), randn(T, s), randn(T, s))
         herm(s) = (A = randn(T, s, s); A = A + A'; for i in 1:s; A[i, i] = real(A[i, i]); end; (A, randn(T, s), randn(T, s)))
         tri(s) = (A = randn(T, s, s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; (A, randn(T, s), randn(T, s)))
+        cpk(s) = (randn(T, (s * (s + 1)) ÷ 2), randn(T, s), randn(T, s))          # Hermitian packed (hpmv)
+        cbd(s) = (k = 16; (randn(T, 2k + 1, s), randn(T, s), randn(T, s), k))      # general banded (gbmv)
+        csbd(s) = (k = 16; (randn(T, k + 1, s), randn(T, s), randn(T, s), k))      # Hermitian banded (hbmv)
         add(nm, mk, ob, pb) = push!(cl2, nm => sweep(mk, L2SZ, ob, pb, _L2REP))
         add("zgemvN", sq, (c, m) -> (for _ in 1:m; B.gemv!(TN, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
             (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = ca, beta = cb); end; real(c[3][1])))
+        add("zgemvT", sq, (c, m) -> (for _ in 1:m; B.gemv!(TT, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = ca, beta = cb, trans = TT); end; real(c[3][1])))
         add("zgemvC", sq, (c, m) -> (for _ in 1:m; B.gemv!(TC, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
             (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = ca, beta = cb, trans = TC); end; real(c[3][1])))
         add("zgeru", sq, (c, m) -> (for _ in 1:m; B.geru!(ca, c[2], c[3], c[1]); end; real(c[1][1])),
@@ -226,6 +228,12 @@ function run_cmplx_benchmarks()
             (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trmv!(c[1], c[3]; uplo = U); end; real(c[3][1])))
         add("ztrsv", tri, (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); B.trsv!(U, TN, TN, c[1], c[3]); end; real(c[3][1])),
             (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trsv!(c[1], c[3]; uplo = U); end; real(c[3][1])))
+        add("zhpmv", cpk, (c, m) -> (for _ in 1:m; B.hpmv!(U, ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.hpmv!(c[3], c[1], c[2]; uplo = U, alpha = ca, beta = cb); end; real(c[3][1])))
+        add("zgbmvN", cbd, (c, m) -> (for _ in 1:m; B.gbmv!(TN, length(c[2]), c[4], c[4], ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (n = length(c[2]); for _ in 1:m; PureBLAS.gbmv!(c[3], c[1], c[2], n, c[4], c[4]; trans = TN, alpha = ca, beta = cb); end; real(c[3][1])))
+        add("zhbmv", csbd, (c, m) -> (for _ in 1:m; B.hbmv!(U, c[4], ca, c[1], c[2], cb, c[3]); end; real(c[3][1])),
+            (c, m) -> (for _ in 1:m; PureBLAS.hbmv!(c[3], c[1], c[2]; uplo = U, alpha = ca, beta = cb); end; real(c[3][1])))
     end
     cl3 = OpData[]
     let
@@ -239,6 +247,12 @@ function run_cmplx_benchmarks()
         addh("zhemm", s -> (cherm(s), randn(T, s, s), zeros(T, s, s)),
             c -> (B.hemm!(LT, UP, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
             c -> (PureBLAS.hemm!(c[3], c[1], c[2]; side = LT, uplo = UP, alpha = ca, beta = cb); real(c[3][1])))
+        addh("zsymm", s -> (randn(T, s, s), randn(T, s, s), zeros(T, s, s)),
+            c -> (B.symm!(LT, UP, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
+            c -> (PureBLAS.symm!(c[3], c[1], c[2]; side = LT, uplo = UP, alpha = ca, beta = cb); real(c[3][1])))
+        addh("zsyrk", s -> (randn(T, s, s), zeros(T, s, s)),
+            c -> (B.syrk!(UP, NN, ca, c[1], cb, c[2]); real(c[2][1])),
+            c -> (PureBLAS.syrk!(c[2], c[1]; uplo = UP, trans = NN, alpha = ca, beta = cb); real(c[2][1])))
         addh("zherk", s -> (randn(T, s, s), zeros(T, s, s)),
             c -> (B.herk!(UP, NN, 1.0, c[1], 0.0, c[2]); real(c[2][1])),
             c -> (PureBLAS.herk!(c[2], c[1]; uplo = UP, trans = NN, alpha = 1.0, beta = 0.0); real(c[2][1])))
@@ -424,7 +438,7 @@ const CTITLE = "PureBLAS / $REFNAME ($ISA, 1 thread, ComplexF64)"
 haskey(g, "CL1") && svg_violins(joinpath(adir, "perf_cl1_$SLUG.svg"), "Complex BLAS-1: $CTITLE", g["CL1"])
 haskey(g, "CL2") && svg_violins(joinpath(adir, "perf_cl2_$SLUG.svg"), "Complex BLAS-2: $CTITLE", g["CL2"])
 haskey(g, "CL3") && svg_trend(joinpath(adir, "perf_cl3_$SLUG.svg"), "Complex BLAS-3: $CTITLE", g["CL3"])
-for lvl in ("L1", "L2", "L3", "LP"), (nm, op) in get(g, lvl, OpData[])
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3"), (nm, op) in get(g, lvl, OpData[])
     geo, mn = geomin(op)
-    @printf("%s %-7s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
+    @printf("%-3s %-8s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
 end
