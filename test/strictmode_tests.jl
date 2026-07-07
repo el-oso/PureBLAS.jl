@@ -110,6 +110,15 @@ end
         @assert_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
         @assert_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
         @assert_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
+        # OWNED-SCRATCH (GKH) guard — @assert_owned (StrictMode ≥0.3.5) fails on a runtime AbstractDict
+        # lookup reached on the hot path. This is the check that WAS MISSING when the complex `_symm_scr`
+        # scratch accessor shipped with const-dispatched owned Refs only for Float64/Float32: ComplexF64/F32
+        # fell through to the generic `get(::IdDict, T, …)` (~130 ns/call, ~26% of a tiny-n op). That's
+        # type-stable + alloc-free (warm hit) + trim-safe, so it passed all three OTHER asserts — only a
+        # benchmark caught it. Now every eltype has an owned Ref, and this guard goes red if that regresses.
+        Az = randn(ComplexF64, 64, 64); Hz = Az + Az'; Bz = randn(ComplexF64, 64, 64)
+        @assert_owned P.hemm!(zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
+        @assert_owned P.symm!(zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
         @test true
     end
 end
