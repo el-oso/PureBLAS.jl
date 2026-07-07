@@ -695,8 +695,13 @@ end
 function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
     n = size(A, 1)
     n == 0 && return A
-    if _chol_needs_pad(A, n) && _CHOLW == 4 && n > _CHOL_BLOCK
-        return _chol_panel_f64!(A, n)             # AVX2 po2 stride: fused panel driver (no n² pad)
+    if _CHOLW == 4 && n > _CHOL_BLOCK
+        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured galen/Zen3,
+        # 200–4000: transition dips 384/448/640 0.91-0.94→1.01-1.03, non-po2 large 0.98→1.00-1.03). It was
+        # originally gated to po2-aliased strides only (its raison d'être was dodging the po2 pad round-trip),
+        # but it's a better-composed blocked driver everywhere — the hybrid's generic trsm!(side=R,transA=T)
+        # is the side-R-T laggard the panel driver's fused split-ld trsm avoids. (AVX-512 W=8 stays below.)
+        return _chol_panel_f64!(A, n)
     end
     if _chol_needs_pad(A, n)                      # factor in a non-conflicting (ld = n+8) scratch, copy back
         R = n + 8
