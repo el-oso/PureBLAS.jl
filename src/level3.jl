@@ -1125,7 +1125,30 @@ function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
                                                    _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
 end
+# Direct complex side-R column-substitution base (no trtri): X·op(A)=B in place, !tr (⟹ !cj), unit or
+# non-unit, A k×k upper/lower. Ascending columns when up (up≠tr, tr=false). The side-R mirror of
+# _trsm_cmplx_dLN! and the complex sibling of _trsm_dense_R! (same loop, complex SIMD kernels). Beats OB
+# for k≤64 (trtri-free) where the invert+trmm base's trtri is 40–66% exposed overhead (measured, galen).
+function _trsm_cmplx_dRN!(up::Bool, unit::Bool, k::Int, A, B)
+    m = size(B, 1); T = eltype(B); csz = sizeof(T); ldb = stride(B, 2); lda = stride(A, 2)
+    GC.@preserve A B begin
+        pB = pointer(B); pA = Ptr{T}(pointer(A))
+        @inbounds for j in (up ? (1:k) : (k:-1:1))
+            pj = pB + (j - 1) * ldb * csz
+            for i in (up ? (1:(j - 1)) : ((j + 1):k))
+                c = unsafe_load(pA, (j - 1) * lda + i)                                     # A[i,j]
+                (real(c) == 0 && imag(c) == 0) ||
+                    _axpy_cmplx_simd!(m, -real(c), -imag(c), pB + (i - 1) * ldb * csz, pj)  # X[:,j] -= A[i,j]·X[:,i]
+            end
+            unit || (r = _crecip(unsafe_load(pA, (j - 1) * lda + j)); _scal_cmplx_simd!(m, real(r), imag(r), pj))
+        end
+    end
+    return B
+end
 function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # direct column-substitution (no trtri)
+        return _trsm_cmplx_dRN!(up, unit, k, A, B)
+    end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
     return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
@@ -1224,9 +1247,17 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invR!(up, tr, unit, A, B)
         end
-    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: invert + K-TRIM gemm (half flops)
-        return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
-                              _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
+    elseif eltype(B) <: BlasComplex
+        # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse),
+        # and 64<k recurses all the way down to it + gated _gemm_subR!. Measured (consistent harness, all
+        # three µarchs) uniformly ≥ the invert+K-TRIM base for side-R — the trtri never amortizes here
+        # (its O(k³/6) invert is 40–66% exposed even at k=256, where two 128-trtri bases capped 0.95 on AVX2
+        # and direct-recurse beats the wide-B trtri path on AVX-512/Zen5 too). Trans keeps the ≤128 base.
+        recbase = !tr ? _CTRSM_REC_L : _TRMM_BASE
+        if k <= recbase
+            return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
+                                  _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
+        end
     elseif k <= _TRMM_BASE
         return _trsm_right_base!(up, tr, cj, unit, k, A, B)
     end
