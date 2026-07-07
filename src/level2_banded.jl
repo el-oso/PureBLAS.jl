@@ -60,6 +60,24 @@ end
     end
     return y
 end
+# Complex gbmv-N: each column is a complex axpy of α·x[j] into the band segment of y (mirrors the real
+# kernel with `_axpy_cmplx_simd!`). y pre-scaled by β outside; kernel accumulates. `sz` is the COMPLEX
+# element size (band segments are contiguous complex runs); pointers reinterpreted to the real type.
+@inline function _gbmv_n_cmplx_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T<:BlasComplex}
+    GC.@preserve AB x y begin
+        Ap = pointer(AB); xp = pointer(x); yp = pointer(y)   # Ptr{Complex} (kernel reinterprets via _reptr)
+        ldb = stride(AB, 2); sz = sizeof(T)                  # complex element size (bytes)
+        @inbounds for j in 1:n
+            ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
+            len <= 0 && continue
+            c = α * unsafe_load(xp, j)                        # complex scalar α·x[j]
+            (real(c) == 0 && imag(c) == 0) && continue
+            segp = Ap + ((ku + ilo - j) + (j - 1) * ldb) * sz
+            _axpy_cmplx_simd!(len, real(c), imag(c), segp, yp + (ilo - 1) * sz)
+        end
+    end
+    return y
+end
 
 # One gbmv-T column dot (band of column j against x). Plain function (not a closure) so the 4-column
 # unroll below stays allocation-free.
@@ -151,6 +169,10 @@ function _gbmv!(tr::Bool, cj::Bool, m::Integer, n::Integer, kl::Integer, ku::Int
             _scale_y!(ylen, βT, y, 1); iszero(α) && return y
             return _gbmv_n_simd!(m, n, kl, ku, αT, AB, x, y)            # y pre-scaled, kernel accumulates
         end
+    elseif !tr && !cj && _l2c_simd_ok(AB, x, y, incx, incy)              # complex non-trans → complex axpy band
+        αT = convert(eltype(AB), α); βT = convert(eltype(AB), β)
+        _scale_y!(ylen, βT, y, 1); iszero(α) && return y
+        return _gbmv_n_cmplx_simd!(m, n, kl, ku, αT, AB, x, y)
     end
     _scale_y!(ylen, β, y, incy)
     iszero(α) && return y
@@ -198,6 +220,38 @@ end
     return y
 end
 
+# Complex Hermitian banded mv: the banded analog of _hemv_cmplx! — per column, run the fused two-sided
+# _hemv_col_cmplx! over the (contiguous) band segment, then add the real-diagonal + conj-dot term. β·y
+# pre-scaled by the driver. `up`: band above diag stored AB[k+1+i-j,j], diag AB[k+1,j]; `lo`: mirror.
+@inline function _hbmv_cmplx_simd!(up::Bool, n::Int, k::Int, α::T, AB, x, y) where {T<:BlasComplex}
+    Tr = real(T)
+    GC.@preserve AB x y begin
+        Ap = Ptr{Tr}(pointer(AB)); xp = Ptr{Tr}(pointer(x)); yp = Ptr{Tr}(pointer(y))
+        Apc = pointer(AB); xpc = pointer(x); ypc = pointer(y)     # Ptr{Complex}
+        ldb = stride(AB, 2); szr = sizeof(Tr)
+        @inbounds for j in 1:n
+            tmp = α * unsafe_load(xpc, j); sr = zero(Tr); si = zero(Tr)
+            if up
+                ilo = max(1, j - k); L = j - ilo
+                if L > 0
+                    off = (k + ilo - j + (j - 1) * ldb) * 2; seg = (ilo - 1) * 2        # AB[k+1+ilo-j,j]; x/y[ilo]
+                    sr, si = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + off * szr, xp + seg * szr, yp + seg * szr)
+                end
+                ajj = unsafe_load(Ap, (k + (j - 1) * ldb) * 2 + 1)                       # real(AB[k+1,j])
+            else
+                ihi = min(n, j + k); L = ihi - j
+                if L > 0
+                    off = (1 + (j - 1) * ldb) * 2; seg = j * 2                           # AB[2,j]; x/y[j+1]
+                    sr, si = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + off * szr, xp + seg * szr, yp + seg * szr)
+                end
+                ajj = unsafe_load(Ap, ((j - 1) * ldb) * 2 + 1)                           # real(AB[1,j])
+            end
+            unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si), j)
+        end
+    end
+    return y
+end
+
 # Generic symmetric/Hermitian banded (herm=true ⇒ conj + real diagonal). Covers sbmv complex & hbmv.
 function _sbmv_generic!(up::Bool, herm::Bool, n::Int, k::Int, α::Number, AB, x, incx::Integer, β::Number, y, incy::Integer)
     _scale_y!(n, β, y, incy)
@@ -226,7 +280,13 @@ function _sbmv!(up::Bool, n::Integer, k::Integer, α::Number, AB, x, incx::Integ
     end
     return _sbmv_generic!(up, false, n, k, α, AB, x, incx, β, y, incy)
 end
-_hbmv!(up, n, k, α, AB, x, incx, β, y, incy) = _sbmv_generic!(up, true, Int(n), Int(k), α, AB, x, incx, β, y, incy)
+function _hbmv!(up, n, k, α, AB, x, incx, β, y, incy)
+    if _l2c_simd_ok(AB, x, y, incx, incy)                        # complex contiguous → fused hemv-col band kernel
+        _scale_y!(Int(n), convert(eltype(AB), β), y, 1); iszero(α) && return y
+        return _hbmv_cmplx_simd!(up, Int(n), Int(k), convert(eltype(AB), α), AB, x, y)
+    end
+    return _sbmv_generic!(up, true, Int(n), Int(k), α, AB, x, incx, β, y, incy)
+end
 
 # ── tbmv / tbsv: x := op(A)·x  /  op(A)⁻¹·x, A triangular banded ────────────────────────────────
 # Band-segment helpers per column j (returns 0-based AB-row offset of the segment start + length of
