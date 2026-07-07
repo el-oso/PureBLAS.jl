@@ -1819,13 +1819,76 @@ end
 # Cap at 512: unified wins n≤512 (128 0.80→0.99), but its full-n pack loses cache reuse vs the mc/nc-
 # blocked multi path at n≥1024 (1024 0.937 vs multi 0.948) — hand large-n back to multi. AVX-512 → 0.
 const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64) == 4 ? 512 : 0)::Int
+# n at/above which the complex rank-k product uses Karatsuba-3M (3 REAL tri-output products on split re/im).
+# Both complex tri kernels (unified NR=4, multi NR=6) plateau at 0.88-0.96 for n≥256 on AVX2 — the 4-FMA
+# complex microkernel's per-flop ceiling, the SAME one zgemm sidesteps with 3M (which gates 1.1-1.2 at
+# these sizes). 3M runs the gating real _trgemm_packed! at 25% fewer flops. AVX2-only (`_CGEMM_3M`);
+# windowed to [_CSYRK_3M_MIN, _CGEMM_3M_MAX] with k ≥ _CGEMM_3M_KMIN. Knob per box; retune the unified cap
+# to meet this after measuring. AVX-512 keeps the multi path (already gates 1.02-1.23).
+const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 256)::Int
+
+# C[tri] += α·(P1−P2 + i·(P3−P1−P2)) — triangular RMW combine of the 3 real Karatsuba products (caller
+# pre-scaled β·C). Mirror of _combine3! (gemm.jl) restricted to the stored triangle (loop bounds only;
+# Karatsuba is pointwise in C so the triangle restriction is exact). P's are real n×n top-left blocks.
+function _combine3_tri!(C, P1, P2, P3, alpha::Tc, up::Bool, n::Int) where {Tc}
+    Tr = real(Tc); ar = real(alpha); ai = imag(alpha)
+    ldc = stride(C, 2); ldp = stride(P1, 2)
+    GC.@preserve C P1 P2 P3 begin
+        pc = Ptr{Tr}(pointer(C)); p1 = pointer(P1); p2 = pointer(P2); p3 = pointer(P3)
+        @inbounds for j in 1:n
+            cb = (j - 1) * ldc * 2; pb = (j - 1) * ldp
+            lo = up ? 1 : j; hi = up ? j : n
+            @simd for i in lo:hi
+                a = unsafe_load(p1, pb + i); b = unsafe_load(p2, pb + i)
+                zr = a - b; zi = unsafe_load(p3, pb + i) - a - b
+                or = unsafe_load(pc, cb + 2i - 1); oi = unsafe_load(pc, cb + 2i)
+                unsafe_store!(pc, or + ar * zr - ai * zi, cb + 2i - 1)
+                unsafe_store!(pc, oi + ar * zi + ai * zr, cb + 2i)
+            end
+        end
+    end
+    return
+end
+# Karatsuba-3M triangular-output rank-k: C[tri] += α·op(X)·op(Y)ᴴ via 3 real tri-output products
+# (P1=op(Xr)op(Yr), P2=op(Xi)op(Yi), P3=op(Xs)op(Ys)) through the gating real `_trgemm_packed!` (OV=true
+# overwrite → no P pre-zero; off-triangle garbage is never read by the combine). conjX/conjY (herk's ᴴ)
+# fold into the split's imag sign. tXp=tr, tYp=!tr ride the sub-products. α applied at the combine (subs
+# run α=1). Reuses the 9-buffer 3M scratch + `_split3!`. Buffers are grow-only (n×k splits + 3 n×n P's).
+function _ctrgemm_3m!(up::Bool, conjX::Bool, conjY::Bool, tXp::Bool, tYp::Bool, α::Tc, X, Y, C, k::Int) where {Tc}
+    Tr = real(Tc); n = size(C, 1)
+    rx = size(X, 1); cx = size(X, 2); ry = size(Y, 1); cy = size(Y, 2)
+    t = _gemm_3m_scratch(Tr, rx * cx, ry * cy, n * n)
+    GC.@preserve t begin
+        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+        Xr = w(1, rx, cx); Xi = w(2, rx, cx); Xs = w(3, rx, cx)
+        _split3!(Xr, Xi, Xs, X, conjX, rx, cx)
+        if X === Y && conjX == conjY                       # syrk/zsyrk: X,Y split identically — split once
+            Yr, Yi, Ys = Xr, Xi, Xs
+        else
+            Yr = w(4, ry, cy); Yi = w(5, ry, cy); Ys = w(6, ry, cy)
+            _split3!(Yr, Yi, Ys, Y, conjY, ry, cy)
+        end
+        P1 = w(7, n, n); P2 = w(8, n, n); P3 = w(9, n, n); o = one(Tr)
+        _trgemm_packed!(Val(_tri_mr(Tr)), Val(_NR), up, o, Xr, tXp, Yr, tYp, P1, k, Val(true))
+        _trgemm_packed!(Val(_tri_mr(Tr)), Val(_NR), up, o, Xi, tXp, Yi, tYp, P2, k, Val(true))
+        _trgemm_packed!(Val(_tri_mr(Tr)), Val(_NR), up, o, Xs, tXp, Ys, tYp, P3, k, Val(true))
+        _combine3_tri!(C, P1, P2, P3, α, up, n)
+    end
+    return C
+end
 # ONE triangular-C complex product C[tri] += α·op(X)·op(Y)ᴴ (skip/full/tri tiles). herm conjugates the
 # ᴴ operand (tr='N' → Y via SB=-1; tr='C' → X via SA=-1); syrk conjugates neither. syrk/herk pass X=Y=A;
 # syr2k/her2k call twice (A,B then B,A). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc.
 # X===Y (herk/zsyrk) on AVX2 mid-n → unified single-pack driver (NR=W, half the pack, no NR=6 spill).
 @inline function _ctrgemm_prod!(::Val{A1}, ::Val{NR}, up::Bool, tr::Bool, herm::Bool,
         alr::T, ali::T, X, Y, C, k::Int) where {A1, NR, T}
-    if X === Y && _vwidth(T) == 4 && size(C, 1) <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
+    n = size(C, 1)
+    if _CGEMM_3M && _vwidth(T) == 4 && _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
+        # large-n: Karatsuba-3M (the complex tri kernels plateau ~0.92 here). herk conjugates op(X) at
+        # tr='C' (SA=-1) / op(Y) at tr='N' (SB=-1); syrk conjugates neither. tXp=tr, tYp=!tr.
+        return _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
+    end
+    if X === Y && _vwidth(T) == 4 && n <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
         return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
     end
     if !herm
@@ -1856,7 +1919,9 @@ end
 # _CSYRK_UNIFIED_MAX (large-n full-n pack loses cache reuse vs the blocked multi path). Knob per box.
 # Cap 256: fused wins n≤256 (n≤64 beats OB, 128 0.86→0.92); at n≥512 its full-n pack loses cache reuse
 # vs the mc/nc-blocked multi tri path (512 0.92 vs 0.944) — hand large-n back to multi. AVX-512 → 0.
-const _CSYR2K_FUSED_MAX = @load_preference("csyr2k_fused_max", _vwidth(Float64) == 4 ? 256 : 0)::Int
+# Fused cap lowered 256→192 on AVX2 so n≥256 syr2k/her2k reach the 3M branch in _ctrgemm_prod! (measured:
+# n=256 3M = 1.04-1.06 vs fused 0.93-0.94). n≤128 stays fused (3M's two-pass overhead loses there: 0.89).
+const _CSYR2K_FUSED_MAX = @load_preference("csyr2k_fused_max", _vwidth(Float64) == 4 ? 192 : 0)::Int
 @inline function _csyr2k_packed!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int)
     Tc = eltype(C); a = convert(Tc, α); n = size(C, 1)
     if _vwidth(real(Tc)) == 4 && n <= _CSYR2K_FUSED_MAX && k > 0
