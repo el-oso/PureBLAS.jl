@@ -2571,6 +2571,15 @@ const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _vwidth(Float64) == 4 ?
 const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 4096 : 32)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
+    # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
+    # complex scratch). Deletes the materialize tax that dominated small/mid-n hemm/symm. Concrete-complex
+    # only (generic T<:Number / AD path falls through to materialize+_gemm_core!); AVX2-gated via _CGEMM_3M.
+    if side_left && eltype(C) <: BlasComplex && _CGEMM_3M && _strided1(A) && _strided1(B) && _strided1(C)
+        m2 = size(B, 2)
+        if _CGEMM_3M_MIN <= max(n, m2) <= _CGEMM_3M_MAX && min(n, m2) >= _CGEMM_3M_KMIN
+            return _hemm_3m_L!(up, herm, α, β, A, B, C)
+        end
+    end
     if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT
         return side_left ?
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
