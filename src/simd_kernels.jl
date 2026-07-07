@@ -400,3 +400,54 @@ end
     end
     return bi
 end
+
+# Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
+# argmax machinery as the real kernel, but each Vec{2W} load is W complex elements — deinterleave → re/im,
+# magnitude = |re|+|im| → Vec{W}. `n` counts COMPLEX elements; xp points at the interleaved [r i r i…]
+# buffer (Ptr{T}, T the real type). Was a scalar loop (~0.6× OB); this vectorizes the magnitude + argmax.
+# |re|+|im| in the INTERLEAVED domain: abs, then add each real to its swapped partner (within-128-bit-lane
+# shuffle — far cheaper than the cross-lane deinterleave). Result Vec{2W} has magnitude mₖ=|rₖ|+|iₖ|
+# DUPLICATED in each (re,im) lane-pair: [m0,m0,m1,m1,…]. Argmax then runs over 2W lanes with the complex
+# index duplicated per pair, so no deinterleave/extract shuffle at all — memory-bandwidth-bound like OB.
+@inline @generated function _cmag2(v::Vec{N, T}) where {N, T}
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)   # swap adjacent re↔im
+    :((av = abs(v); av + shufflevector(av, Val($swp))))
+end
+@inline function _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
+    W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 4W
+    clane = Vec(ntuple(i -> (i + 1) ÷ 2, Val(2W)))        # 1,1,2,2,…,W,W (complex index per real lane)
+    magc(c) = _cmag2(vload(V, xp + 2c * sz))              # Vec{2W}, mₖ duplicated per pair
+    m0 = magc(0); m1 = magc(W); m2 = magc(2W); m3 = magc(3W)
+    i0 = clane; i1 = clane + W; i2 = clane + 2W; i3 = clane + 3W
+    c = step
+    @inbounds while c + step <= n                         # 4 independent chains (loop-carried max latency)
+        (m0, i0) = _amax_up(m0, i0, magc(c), clane + c)
+        (m1, i1) = _amax_up(m1, i1, magc(c + W), clane + (c + W))
+        (m2, i2) = _amax_up(m2, i2, magc(c + 2W), clane + (c + 2W))
+        (m3, i3) = _amax_up(m3, i3, magc(c + 3W), clane + (c + 3W))
+        c += step
+    end
+    (m0, i0) = _amax_merge(m0, i0, m1, i1); (m2, i2) = _amax_merge(m2, i2, m3, i3)
+    (m0, i0) = _amax_merge(m0, i0, m2, i2)                # fold 4 chains → 1
+    @inbounds while c + W <= n                             # leftover full blocks (W complex each)
+        (m0, i0) = _amax_up(m0, i0, magc(c), clane + c); c += W
+    end
+    if c < n                                               # masked remainder (no OOB read)
+        rem = n - c
+        rmsk = Vec(ntuple(i -> i, Val(2W))) <= 2 * rem     # real-lane mask (2 reals / complex)
+        av = abs(vload(V, xp + 2c * sz, rmsk)); mag = _cmag2_masked(av)
+        cmsk = clane <= rem; take = (mag > m0) & cmsk
+        m0 = vifelse(take, mag, m0); i0 = vifelse(take, clane + c, i0)
+    end
+    mx = m0[1]; bi = i0[1]
+    @inbounds for l in 2:2W                                # reduce 2W lanes; strict > keeps first occurrence
+        ml = m0[l]
+        (ml > mx || (ml == mx && i0[l] < bi)) && (mx = ml; bi = i0[l])
+    end
+    return bi
+end
+# masked remainder magnitude: masked-out reals load as 0, so |·| pairs sum correctly (0 lanes stay 0).
+@inline @generated function _cmag2_masked(av::Vec{N, T}) where {N, T}
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)
+    :(av + shufflevector(av, Val($swp)))
+end

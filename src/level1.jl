@@ -127,13 +127,18 @@ function _asum(n::Integer, x, incx::Integer)
 end
 
 # 1-based index of the first element maximising |xᵢ| (complex: |Re|+|Im|). 0 if n ≤ 0.
-# Real unit-stride → SIMD argmax; everything else (complex, strided, short, other T) → scalar below.
+# Real unit-stride → SIMD argmax; complex unit-stride → complex SIMD argmax; else (strided, short, other
+# T) → scalar below.
 @inline _iamax_simd_try(n::Integer, x) = 0
 @inline _iamax_simd_try(n::Integer, x::Ptr{T}) where {T<:BlasReal} =
     n < 4 * _vwidth(T) ? 0 : _iamax_simd!(Int(n), x)
 @inline function _iamax_simd_try(n::Integer, x::StridedVector{T}) where {T<:BlasReal}
     (stride(x, 1) == 1 && n >= 4 * _vwidth(T)) || return 0
     GC.@preserve x return _iamax_simd!(Int(n), pointer(x))
+end
+@inline function _iamax_simd_try(n::Integer, x::StridedVector{Complex{T}}) where {T<:BlasReal}
+    (stride(x, 1) == 1 && n >= 4 * _vwidth(T)) || return 0
+    GC.@preserve x return _iamax_cmplx_simd!(Int(n), Ptr{T}(pointer(x)))
 end
 
 function _iamax(n::Integer, x, incx::Integer)
