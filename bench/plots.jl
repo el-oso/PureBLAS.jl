@@ -64,8 +64,12 @@ const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0)
     out = Tuple{Int,Vector{Float64}}[]
     for s in sizes
-        bo = @be mk(s) ob1 evals=1 samples=samples seconds=seconds
-        bp = @be mk(s) pb1 evals=1 samples=samples seconds=seconds
+        # reps fresh contexts per sample: setup (EXCLUDED from timing) pre-generates them, the core runs the
+        # destructive op on each. reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a
+        # single sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
+        reps = clamp(20_000_000 ÷ (s * s * s), 1, 512)
+        bo = @be [mk(s) for _ in 1:reps] (cs -> (v = 0.0; for c in cs; v += ob1(c); end; v)) evals=1 samples=samples seconds=seconds
+        bp = @be [mk(s) for _ in 1:reps] (cs -> (v = 0.0; for c in cs; v += pb1(c); end; v)) evals=1 samples=samples seconds=seconds
         push!(out, (s, _qratios(bo, bp)))
     end
     return out
