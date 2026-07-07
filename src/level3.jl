@@ -2549,32 +2549,23 @@ function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr, o
     T = eltype(C); a = convert(T, α); a2 = herm ? conj(a) : a; cc = herm
     if n <= _SYRK_DBASE
         r = (off + 1):(off + n); tmp = view(scr, 1:n, 1:n)
-        if !herm && T <: BlasReal
-            # Real: the second product IS the transpose of the first (B·Aᵀ = (A·Bᵀ)ᵀ, Bᵀ·A = (Aᵀ·B)ᵀ),
-            # so ONE gemm + a symmetrized triangle-add — halves the base's gemm work.
-            if tr
-                Ab = view(A, :, r); Bb = view(B, :, r)
-                _gemm_core!(tmp, Ab, Bb, a, zero(T), true, false, false, false)
-            else
-                Ab = view(A, r, :); Bb = view(B, r, :)
-                _gemm_core!(tmp, Ab, Bb, a, zero(T), false, true, false, false)
-            end
-            Cd = view(C, r, r)
-            @inbounds for j in 1:n, i in (up ? (1:j) : (j:n))
-                Cd[i, j] += tmp[i, j] + tmp[j, i]
-            end
-            return C
-        end
-        if tr                                     # α·op(A)op(B)ᴴ + α2·op(B)op(A)ᴴ into tmp
-            Ab = view(A, :, r); Bb = view(B, :, r)
-            _syrk_gemm!(tmp, Ab, Bb, a, zero(T), true, cc)
-            _syrk_gemm!(tmp, Bb, Ab, a2, one(T), true, cc)
+        # ONE product M = α·op(A)·op(B)ᴴ (her2k conjugates via cc; syr2k/real = plain transpose), then a
+        # symmetrized triangle-add for the 2nd product op(B)op(A)ᴴ = Mᴴ (Mᵀ for syr2k/real): since
+        # conj(M[j,i]) = ᾱ·(op(B)op(A)ᴴ)[i,j], the add is C += M[i,j] + conj(M[j,i]) (her2k) / M[j,i]
+        # (syr2k). Halves the base gemm work vs the old two-`_syrk_gemm!` path — now the complex base
+        # too, not just real (was the tiny-n zsyr2k/zher2k red). her2k diagonal → real (M + conj(M)).
+        if tr
+            Ab = view(A, :, r); Bb = view(B, :, r); _syrk_gemm!(tmp, Ab, Bb, a, zero(T), true, cc)
         else
-            Ab = view(A, r, :); Bb = view(B, r, :)
-            _syrk_gemm!(tmp, Ab, Bb, a, zero(T), false, cc)
-            _syrk_gemm!(tmp, Bb, Ab, a2, one(T), false, cc)
+            Ab = view(A, r, :); Bb = view(B, r, :); _syrk_gemm!(tmp, Ab, Bb, a, zero(T), false, cc)
         end
-        _add_tri!(view(C, r, r), tmp, up, herm, n)
+        Cd = view(C, r, r)
+        if herm
+            @inbounds for j in 1:n, i in (up ? (1:j) : (j:n)); Cd[i, j] += tmp[i, j] + conj(tmp[j, i]); end
+            @inbounds for i in 1:n; Cd[i, i] = real(Cd[i, i]); end   # clear rounding imag on the diagonal
+        else
+            @inbounds for j in 1:n, i in (up ? (1:j) : (j:n)); Cd[i, j] += tmp[i, j] + tmp[j, i]; end
+        end
         return C           # NOT `return _add_tri!(...)`: that returns the SubArray, making the
     end                    # recursion's return type Union{Matrix,SubArray} — boxes at every level
     h = _trsplit(n)
