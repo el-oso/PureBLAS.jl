@@ -25,6 +25,13 @@ end
         _strided1(A) &&
         x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
 end
+# Complex analog: unit-stride, contiguous, matching complex eltypes → the complex-SIMD L2 kernels apply.
+@inline function _l2c_simd_ok(A, x, y, incx::Integer, incy::Integer)
+    T = eltype(A)
+    return incx == 1 && incy == 1 && T <: BlasComplex && eltype(x) === T && eltype(y) === T &&
+        _strided1(A) &&
+        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+end
 
 const _GEMV_MR = _vwidth(Float64) == 4 ? 8 : 4   # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows). AVX2: 8 accs feed both FMA units (~5-cyc latency) — MR=4 half-fills the pipe at cache-resident mid-n; AVX-512 (32 regs, already ≥gate) stays 4.
 

@@ -69,7 +69,36 @@ function _spmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Numb
 end
 
 # ── hpmv: y := α·A·x + β·y, A Hermitian packed (complex; generic path, real diagonal) ───────────
+# Complex Hermitian packed mv: packed analog of _hemv_cmplx! — the off-diagonal of column j is a CONTIGUOUS
+# packed run, so run the fused two-sided _hemv_col_cmplx! over it + real-diagonal term. β·y pre-scaled.
+@inline function _hpmv_cmplx_simd!(up::Bool, n::Int, α::T, AP, x, y) where {T<:BlasComplex}
+    Tr = real(T)
+    GC.@preserve AP x y begin
+        Ap = Ptr{Tr}(pointer(AP)); xp = Ptr{Tr}(pointer(x)); yp = Ptr{Tr}(pointer(y))
+        xpc = pointer(x); ypc = pointer(y); szr = sizeof(Tr)
+        @inbounds for j in 1:n
+            tmp = α * unsafe_load(xpc, j); sr = zero(Tr); si = zero(Tr)
+            base = up ? _pkU(j) : _pkL(j, n)                      # 0-based complex index before column j
+            if up
+                L = j - 1
+                L > 0 && ((sr, si) = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + (base * 2) * szr, xp, yp))
+                ajj = unsafe_load(Ap, (base + j - 1) * 2 + 1)     # real(A[j,j]) = AP[base+j]
+            else
+                L = n - j
+                L > 0 && ((sr, si) = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + (base * 2 + 2) * szr, xp + (j * 2) * szr, yp + (j * 2) * szr))
+                ajj = unsafe_load(Ap, base * 2 + 1)               # real(A[j,j]) = AP[base+1]
+            end
+            unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si), j)
+        end
+    end
+    return y
+end
 function _hpmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Number, y, incy::Integer)
+    if incx == 1 && incy == 1 && eltype(AP) <: BlasComplex && eltype(x) === eltype(AP) && eltype(y) === eltype(AP) &&
+            AP isa StridedVector && x isa StridedVector && y isa StridedVector
+        _scale_y!(Int(n), convert(eltype(AP), β), y, 1); iszero(α) && return y
+        return _hpmv_cmplx_simd!(up, Int(n), convert(eltype(AP), α), AP, x, y)
+    end
     _scale_y!(Int(n), β, y, incy)
     iszero(α) && return y
     n = Int(n); sx = _start(n, incx); sy = _start(n, incy); s0 = zero(_et(AP)) * zero(_et(x))
