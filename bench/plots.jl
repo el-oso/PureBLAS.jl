@@ -162,7 +162,7 @@ end
 lp = OpData[]
 let
     LP = Char(76)
-    addh(nm, mk, ob, pb) = push!(lp, nm => sweep_heavy(mk, ob, pb, LPSZ; rounds = 6))
+    addh(nm, mk, ob, pb) = push!(lp, nm => sweep_heavy(mk, ob, pb, LPSZ; samples = 40))
     addh("potrf", s -> (A = randn(s, s); A * A' + s * I + zeros(s, s)),
         c -> (LinearAlgebra.LAPACK.potrf!(LP, c); c[1, 1]),
         c -> (PureBLAS.potrf!(c; uplo = LP); c[1, 1]))
