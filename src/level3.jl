@@ -2572,8 +2572,10 @@ const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
-    # complex scratch). Deletes the materialize tax that dominated small/mid-n hemm/symm. Concrete-complex
-    # only (generic T<:Number / AD path falls through to materialize+_gemm_core!); AVX2-gated via _CGEMM_3M.
+    # complex scratch). Deletes the materialize tax that dominated mid-n hemm/symm. Concrete-complex only
+    # (generic T<:Number / AD path falls through to materialize+_gemm_core!); AVX2-gated via _CGEMM_3M.
+    # (n≤40 tried a direct triangle sweep — measured SLOWER than materialize: its many small _uker calls +
+    # branchy panel fill cost more than one gemm at tiny n. Reverted; tiny-n stays on materialize.)
     if side_left && eltype(C) <: BlasComplex && _CGEMM_3M && _strided1(A) && _strided1(B) && _strided1(C)
         m2 = size(B, 2)
         if _CGEMM_3M_MIN <= max(n, m2) <= _CGEMM_3M_MAX && min(n, m2) >= _CGEMM_3M_KMIN
