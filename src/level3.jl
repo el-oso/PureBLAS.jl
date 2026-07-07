@@ -2207,9 +2207,13 @@ function _symm_scr(::Type{T}, n::Int) where {T}
     if isnothing(m) || size(m, 1) < n; m = Matrix{T}(undef, n, n); _SYMM_SCR[T] = m; end
     return m::Matrix{T}   # the IdDict values are abstract `Matrix` — assert or the view boxes (hemm 160 B)
 end
-# Const-dispatch the gated types (the IdDict get costs ~130 ns — dominates tiny symm).
+# Const-dispatch the gated types (the IdDict get costs ~130 ns — dominates tiny symm/hemm). Complex too:
+# ComplexF64/F32 are the exact types hitting the tiny-n symm/hemm reds, and they were falling through to
+# the generic IdDict method above (~130 ns/call). Owned Refs kill that (GKH ownership, no runtime lookup).
 const _SYMM_SCR_F64 = Ref(Matrix{Float64}(undef, 0, 0))
 const _SYMM_SCR_F32 = Ref(Matrix{Float32}(undef, 0, 0))
+const _SYMM_SCR_C64 = Ref(Matrix{ComplexF64}(undef, 0, 0))
+const _SYMM_SCR_C32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
 @inline function _symm_scr(::Type{Float64}, n::Int)
     m = _SYMM_SCR_F64[]
     size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); _SYMM_SCR_F64[] = m)
@@ -2218,6 +2222,16 @@ end
 @inline function _symm_scr(::Type{Float32}, n::Int)
     m = _SYMM_SCR_F32[]
     size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); _SYMM_SCR_F32[] = m)
+    return m
+end
+@inline function _symm_scr(::Type{ComplexF64}, n::Int)
+    m = _SYMM_SCR_C64[]
+    size(m, 1) < n && (m = Matrix{ComplexF64}(undef, n, n); _SYMM_SCR_C64[] = m)
+    return m
+end
+@inline function _symm_scr(::Type{ComplexF32}, n::Int)
+    m = _SYMM_SCR_C32[]
+    size(m, 1) < n && (m = Matrix{ComplexF32}(undef, n, n); _SYMM_SCR_C32[] = m)
     return m
 end
 # Branch-free symmetric/Hermitian → dense fill: copy the stored triangle (contiguous column segments),
@@ -2485,8 +2499,11 @@ end
 # (materialize ≤ _GEMM_UNPACK_MAX, already gates). Overridable "symm_pack_cut".
 const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
-# conj-mirror pack). Small-n stays materialize+gemm (the pack setup doesn't amortize). Per-box knob.
-const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 32 : 32)::Int
+# conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
+# the materialize path routes to _gemm_core!'s Karatsuba-3M at mid-n — the SAME path complex symm already
+# gates on (zsymm n=128 = 1.06). So on AVX2 raise the cut past the whole gate range: hemm rides
+# materialize+3M like symm. (AVX-512 keeps 32 — 3M path is AVX2-only; leave the gating classic path.)
+const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 4096 : 32)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT

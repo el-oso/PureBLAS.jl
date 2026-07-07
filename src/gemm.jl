@@ -779,7 +779,12 @@ const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
 # free MR) beats blocked broadly on Zen4/32-reg → 192. W=4/AVX2: unpacked's per-panel re-deinterleave
 # loses to the vectorized-pack blocked path by n≈16, and the CNR=6 tile + deinterleave temp spill, so
 # only the tiniest n win → 12. Above this, blocked (with vectorized packs). galen-swept 2026-07-02.
-const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 12 : 192)::Int
+# AVX2: the unpacked direct-read complex kernel BEATS the blocked path through n≈40 (measured galen:
+# n=16 1.20 vs 1.00, n=24 1.06 vs 0.94, n=32 0.99 vs 0.94, n=40 0.99 vs 0.97) — no pack/scratch overhead
+# while A·B still fit L1. It collapses at n=48 (0.68, no cache blocking), but 3M (_CGEMM_3M_MIN=48) owns
+# n≥48, so 40 is a clean handoff (41-47 → blocked ~0.97, ungated). Was 12 (far too conservative). This
+# also lifts the small-n rank/hemm/symm ops that route through _gemm_core!. AVX-512 unchanged.
+const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 192)::Int
 
 # Karatsuba 3M route for complex GEMM (see _gemm_3m!): 3 real gemms on split re/im, 25% fewer flops on
 # the gating real kernel. BEATS OB at mid-n on AVX2 where the 4-FMA complex kernel is latency-bound
