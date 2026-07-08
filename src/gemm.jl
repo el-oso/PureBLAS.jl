@@ -1214,6 +1214,11 @@ end
     ev = Expr(:tuple, (2 * (i - 1) for i in 1:W)...); od = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
     :((shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
 end
+# Inverse of _deint_cmplx: interleave separate re/im W-vectors back to a Vec{2W} (re,im,re,im,…).
+@inline @generated function _intlv_cmplx(vr::Vec{W, T}, vi::Vec{W, T}) where {W, T}
+    ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
+    :(shufflevector(vr, vi, Val($ilv)))
+end
 
 # Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
 # column, deinterleave → real panel ApR / imag panel ApI. Partial last panel stays scalar (zero-pad).

@@ -11,9 +11,11 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
-const _CPOTRF_BASE = @load_preference("cpotrf_base", 32)::Int
-# Measured sweet spot on Zen4: smaller bases pay more small-k trsm/syrk overhead, larger pay a
-# memory-bound unblocked panel. ponytail: hand-set; revisit when tuning Cholesky to the gate.
+const _CPOTRF_BASE = @load_preference("cpotrf_base", 64)::Int
+# With the vectorized `_cpotf2_lower!` base (Zen4): n≤base factored by the fast SIMD panel; base=64 is the
+# sweet spot (n=32 0.48→1.25, n=48 0.66→1.22, n=64 0.70→1.08 — all gate/beat). Larger bases go memory-bound
+# unblocked (base=128 → n=128 0.72), smaller pay recursion/small-k overhead — mirrors the real path's
+# _CHOL_THRESHOLD=64. ponytail: flat 64 like the real threshold; galen(AVX2)/zen5 calibration via the knob.
 
 # Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
 # columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
@@ -54,11 +56,65 @@ function _potf2_upper!(A, n::Int)
     return A
 end
 
+# Vectorized complex Hermitian Cholesky base (lower, A = L·Lᴴ). Complex analogue of `_chol_base_f64!`:
+# left-looking, SIMD over i (W complex per step, deinterleaved re/im FMA chains), scalar tail. Column j:
+# A[i,j] -= Σ_{k<j} L[i,k]·conj(L[j,k]) (i=j..n), then real diagonal d=A[j,j], scale below-diag by 1/√d.
+# Reads only the lower triangle. Throws PosDefException at the first non-positive pivot (LAPACK zpotf2).
+# The scalar `_potf2_lower!` above stays for Float32/Dual/other T (this method is BlasComplex-only).
+function _cpotf2_lower!(A::AbstractMatrix{Tc}, n::Int) where {Tc <: BlasComplex}
+    Tr = real(Tc); W = _vwidth(Tr); V = Vec{W, Tr}; V2 = Vec{2W, Tr}; sz = sizeof(Tr); ld = stride(A, 2)
+    GC.@preserve A begin
+        p = Ptr{Tr}(pointer(A))
+        cx(i, k) = p + ((k - 1) * ld + (i - 1)) * 2 * sz                 # byte Ptr to the re-part of A[i,k]
+        @inbounds for j in 1:n
+            i = j
+            while i + W - 1 <= n                                         # SIMD: W complex rows / step
+                base = cx(i, j); (ar, ai) = _deint_cmplx(vload(V2, base))
+                for k in 1:j-1
+                    l = cx(j, k); sr = V(unsafe_load(l)); si = V(unsafe_load(l + sz))   # L[j,k]
+                    (vr, vi) = _deint_cmplx(vload(V2, cx(i, k)))         # -v·conj(L[j,k])
+                    ar = muladd(vr, -sr, ar); ar = muladd(vi, -si, ar)
+                    ai = muladd(vi, -sr, ai); ai = muladd(vr, si, ai)
+                end
+                vstore(_intlv_cmplx(ar, ai), base); i += W
+            end
+            while i <= n                                                # scalar tail
+                sr = unsafe_load(cx(i, j)); si = unsafe_load(cx(i, j) + sz)
+                for k in 1:j-1
+                    l = cx(j, k); jr = unsafe_load(l); ji = unsafe_load(l + sz)
+                    vr = unsafe_load(cx(i, k)); vi = unsafe_load(cx(i, k) + sz)
+                    sr -= vr * jr + vi * ji; si -= vi * jr - vr * ji
+                end
+                unsafe_store!(cx(i, j), sr); unsafe_store!(cx(i, j) + sz, si); i += 1
+            end
+            d = unsafe_load(cx(j, j))                                    # diagonal is real (Hermitian)
+            d > 0 || throw(PosDefException(j))
+            ajj = sqrt(d); invd = inv(ajj)
+            unsafe_store!(cx(j, j), ajj); unsafe_store!(cx(j, j) + sz, zero(Tr))
+            i = j + 1                                                   # scale below-diag by 1/√d (real)
+            while i + W - 1 <= n
+                base = cx(i, j); vstore(vload(V2, base) * V2(invd), base); i += W
+            end
+            while i <= n
+                unsafe_store!(cx(i, j), unsafe_load(cx(i, j)) * invd)
+                unsafe_store!(cx(i, j) + sz, unsafe_load(cx(i, j) + sz) * invd); i += 1
+            end
+        end
+    end
+    return A
+end
+
 # Recursive (cache-oblivious) Cholesky. Lower: split 2×2 — factor A11, solve the off-diagonal panel
 # A21·L11⁻ᵀ (trsm), downdate A22 -= A21·A21ᵀ (syrk), recurse A22. The top-level trsm/syrk are large-k
 # (half-matrix → the gated packed L3 paths); only the ≤_POTRF_BASE diagonal base is scalar potf2.
 # Factor a base block, via a contiguous buffer when A is a strided sub-block (better locality).
 @inline function _potf2b_lower!(A, n::Int)
+    if eltype(A) <: BlasComplex                                         # SIMD Hermitian base (via contig buf if strided)
+        if A isa SubArray && stride(A, 2) > n && n >= 8
+            buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _cpotf2_lower!(buf, n); copyto!(A, buf); return A
+        end
+        return _cpotf2_lower!(A, n)
+    end
     if n >= 128 && A isa SubArray && stride(A, 2) > n
         buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _potf2_lower!(buf, n); copyto!(A, buf); return A
     end
