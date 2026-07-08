@@ -261,6 +261,15 @@ scatter).
 ![Complex BLAS-3, AVX2](assets/perf_cl3_avx2.svg)
 ![Complex BLAS-3, Zen5](assets/perf_cl3_zen5.svg)
 
+**Complex LAPACK (trend) — AVX-512 (Zen4), AVX2 (Zen3), Zen5:**
+
+`zpotrf`/`zgetrf`/`zgeqrf` factor on the gated complex L3 kernels; `zgesvd` is **singular values only**
+(complex singular vectors are a follow-up), so it is benched values-vs-values against OpenBLAS `zgesdd('N')`.
+
+![Complex LAPACK, AVX-512](assets/perf_clapack_avx512.svg)
+![Complex LAPACK, AVX2](assets/perf_clapack_avx2.svg)
+![Complex LAPACK, Zen5](assets/perf_clapack_zen5.svg)
+
 On **AVX-512** the whole complex L1/L2 surface gates or beats OpenBLAS — `zhemv` ≈ **2×**, `dznrm2` **4–6×**
 (OpenBLAS's is the slow always-scaled `dznrm2`), `zgeru`/`zdotc`/`zscal`/`zaxpy` clear it, `zgemvC`/`zgemvN`
 gate (a couple of ~0.95 worst-size dips), and blocked `ztrmv`/`ztrsv` gate through n=2048; `zgemm`/`zhemm`/

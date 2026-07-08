@@ -279,7 +279,28 @@ function run_cmplx_benchmarks()
             c -> (B.trsm!(RT, UP, NN, NN, ca, c[1], c[2]); real(c[2][1])),
             c -> (PureBLAS.trsm!(c[2], c[1]; side = RT, uplo = UP); real(c[2][1])))
     end
-    return cl1, cl2, cl3
+    # ── Complex LAPACK (zpotrf/zgetrf/zgeqrf/zgesvd; destructive → fresh input per round). Mirrors the real
+    # `lp` group. zgesvd compares VALUES-ONLY (gesdd 'N' vs PB want_vectors=false) — complex singular VECTORS
+    # aren't implemented yet, so this is the honest fair fight for what ships. ─────────────────────────────
+    clp = OpData[]
+    let
+        LP = Char(76)  # 'L'
+        hpd(s) = (A = randn(T, s, s); A * A' + s * I + zeros(T, s, s))  # Hermitian positive-definite
+        addh(nm, mk, ob, pb) = push!(clp, nm => sweep_heavy(mk, ob, pb, LPSZ; samples = 40))
+        addh("zpotrf", s -> hpd(s),
+            c -> (LinearAlgebra.LAPACK.potrf!(LP, c); real(c[1, 1])),
+            c -> (PureBLAS.potrf!(c; uplo = LP); real(c[1, 1])))
+        addh("zgeqrf", s -> randn(T, s, s),
+            c -> (LinearAlgebra.LAPACK.geqrf!(c); real(c[1, 1])),
+            c -> (PureBLAS.geqrf!(c); real(c[1, 1])))
+        addh("zgetrf", s -> randn(T, s, s),
+            c -> (LinearAlgebra.LAPACK.getrf!(c); real(c[1, 1])),
+            c -> (PureBLAS.getrf!(c); real(c[1, 1])))
+        addh("zgesvd", s -> randn(T, s, s),
+            c -> (LinearAlgebra.LAPACK.gesdd!(Char(78), c); real(c[1, 1])),   # 'N' — singular values only
+            c -> (PureBLAS.gesvd!(c; want_vectors = false); 0.0))
+    end
+    return cl1, cl2, cl3, clp
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
@@ -414,9 +435,9 @@ elseif !("bench" in ARGS) && isfile(CACHE)
     g = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     l1, l2, l3, lp = run_benchmarks()
-    cl1, cl2, cl3 = run_cmplx_benchmarks()
-    g = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3)
-    save_cache(CACHE, ["L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3])
+    cl1, cl2, cl3, clp = run_cmplx_benchmarks()
+    g = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp)
+    save_cache(CACHE, ["L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp])
 end
 
 adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
@@ -442,7 +463,8 @@ const CTITLE = "PureBLAS / $REFNAME ($ISA, 1 thread, ComplexF64)"
 haskey(g, "CL1") && svg_violins(joinpath(adir, "perf_cl1_$SLUG.svg"), "Complex BLAS-1: $CTITLE", g["CL1"])
 haskey(g, "CL2") && svg_violins(joinpath(adir, "perf_cl2_$SLUG.svg"), "Complex BLAS-2: $CTITLE", g["CL2"])
 haskey(g, "CL3") && svg_trend(joinpath(adir, "perf_cl3_$SLUG.svg"), "Complex BLAS-3: $CTITLE", g["CL3"])
-for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3"), (nm, op) in get(g, lvl, OpData[])
+haskey(g, "CLP") && svg_trend(joinpath(adir, "perf_clapack_$SLUG.svg"), "Complex LAPACK: $CTITLE", g["CLP"])
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, op) in get(g, lvl, OpData[])
     geo, mn = geomin(op)
     @printf("%-3s %-8s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
 end
