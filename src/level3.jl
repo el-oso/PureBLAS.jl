@@ -302,6 +302,33 @@ const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # land ≥64 → packed; only tiny single-base trmm stays unpacked. Preferences knob "ctrmm_pack_min".
 const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
 
+# Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
+# non-multiple-of-nr panel is partial (width nre∈1:_CNR-1); running it through the nr-wide masked kernel
+# computes (nr-nre) PAD columns — and for upper-N that tile sits at MAX K-trim depth (kc=k), so the pad
+# is charged at full depth (measured galen ztrmmR spike). Dispatch the runtime nre to a compile-time
+# Val{NR}=nre masked kernel so the pad columns are NEVER computed. REQUIRES the slot packed at row-stride
+# nre (see packed_R pack loop). B0=A1=true (overwrite; α folded outside). AVX2-only (packed path gated by
+# _CTRMM_PACK=W==4); the 5-way branch is compile cost there, never instantiated on AVX-512.
+@inline function _trmm_rem_cmplx!(C::Ptr{T}, ldc::Int, AR::Ptr{T}, AI::Ptr{T}, BR::Ptr{T}, BI::Ptr{T},
+        kc::Int, alr::T, ali::T, mre::Int, nre::Int, ::Val{MR}, ::Val{SA}, ::Val{SB}) where {T, MR, SA, SB}
+    if nre == 1
+        _microkernel_cmplx_masked!(C, ldc, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+            Val(MR), Val(1), Val(SA), Val(SB), Val(true), Val(true))
+    elseif nre == 2
+        _microkernel_cmplx_masked!(C, ldc, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+            Val(MR), Val(2), Val(SA), Val(SB), Val(true), Val(true))
+    elseif nre == 3
+        _microkernel_cmplx_masked!(C, ldc, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+            Val(MR), Val(3), Val(SA), Val(SB), Val(true), Val(true))
+    elseif nre == 4
+        _microkernel_cmplx_masked!(C, ldc, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+            Val(MR), Val(4), Val(SA), Val(SB), Val(true), Val(true))
+    else                                                     # nre == 5
+        _microkernel_cmplx_masked!(C, ldc, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+            Val(MR), Val(5), Val(SA), Val(SB), Val(true), Val(true))
+    end
+end
+
 # Packed K-TRIM complex trmm side-L: B := op(A)·B. Materialize op(A)→M (off-triangle zeroed), then PACK B
 # ONCE per nc-panel (its data is copied out → the in-place aliasing constraint vanishes, so tiles store
 # B0-overwrite in ANY order — no atomic/dependency-order dance) and per output row-tile pack M's K-TRIMmed
@@ -386,10 +413,10 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
         @inbounds for ji in 0:(cld(k, nr) - 1)
             jr = ji * nr; nre = min(nr, k - jr)
             plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
-            base = ji * nr * k
-            for p in 0:(kc - 1), c in 0:(nr - 1)
-                v = (c < nre) ? Mv[plo + p + 1, jr + c + 1] : zero(Tc)
-                BpR[base + p * nr + c + 1] = real(v); BpI[base + p * nr + c + 1] = imag(v)
+            base = ji * nr * k                          # slot over-allocated at nr·k; the REMAINDER slot is
+            for p in 0:(kc - 1), c in 0:(nre - 1)       # packed at row-stride nre so the NR=nre kernel reads
+                v = Mv[plo + p + 1, jr + c + 1]          # it with ZERO pad columns computed (upper-N spike fix).
+                BpR[base + p * nre + c + 1] = real(v); BpI[base + p * nre + c + 1] = imag(v)
             end
         end
         ic = 0
@@ -408,12 +435,17 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
                     Cblk = Bp0 + (2 * (ic + ir) + 2 * jr * ldb) * sz
                     AR = Ptr{T}(ARp + aoff); AI = Ptr{T}(AIp + aoff)
                     BR = Ptr{T}(BRp + ji * nr * k * sz); BI = Ptr{T}(BIp + ji * nr * k * sz)  # slot ji, row 0 = M-row plo
-                    if mre == mr && nre == nr
-                        _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                            Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
-                    else
-                        _microkernel_cmplx_masked!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                            mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                    if nre == nr
+                        if mre == mr
+                            _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                        else
+                            _microkernel_cmplx_masked!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                        end
+                    else                                     # partial column-tile (last, nre∈1:_CNR-1): NR=nre
+                        _trmm_rem_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali, mre, nre,
+                            Val(_CMR), Val(1), Val(1))       # kernel → no pad cols computed (upper-N deep-rem)
                     end
                     ir += mr
                 end
