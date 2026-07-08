@@ -11,9 +11,11 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
-const _CPOTRF_BASE = @load_preference("cpotrf_base", 64)::Int
-# With the vectorized `_cpotf2_lower!` base (Zen4): n≤base factored by the fast SIMD panel; base=64 is the
-# sweet spot (n=32 0.48→1.25, n=48 0.66→1.22, n=64 0.70→1.08 — all gate/beat). Larger bases go memory-bound
+const _CPOTRF_BASE = @load_preference("cpotrf_base", _vwidth(Float64) == 4 ? 48 : 64)::Int
+# n≤base ⇒ ONE vectorized `_cpotf2_lower!` call; n>base ⇒ right-looking blocked (see _cpotrf_rl_lower!).
+# Base sweet spot is where the unblocked SIMD base still gates: AVX-512 (W=8) rides it to 64 (n=64 gates
+# 1.09), but on AVX2 (W=4) the narrower datapath makes the n=64 base memory-bound (0.76), so cap it at 32
+# (n≤32 gates, n>32 → rl). Keyed on _vwidth like the sibling cuts. Larger bases go memory-bound unblocked
 # unblocked (base=128 → n=128 0.72), smaller pay recursion/small-k overhead — mirrors the real path's
 # _CHOL_THRESHOLD=64. ponytail: flat 64 like the real threshold; galen(AVX2)/zen5 calibration via the knob.
 
@@ -803,15 +805,44 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
     return A
 end
 
+# Right-looking blocked complex Hermitian Cholesky (lower). The cache-oblivious n/2 recursion
+# (`_potrf_lower!`) capped 0.90–0.93 (Zen4/Zen5) / 0.76–0.88 (AVX2) across n≈80–128: splitting n in half
+# makes each trailing trsm/herk too small to amortize the recursion + base-copy overhead — even though the
+# base, ztrsmR-C, and zherk all gate at those block sizes. A SMALL fixed-nb right-looking sweep instead does
+# BIG early trailing herks (n−nb, n−2nb, …) that amortize well. Per nb-panel: factor the diagonal block
+# (vectorized `_cpotf2_lower!` via the contiguous-buffer `_potf2b_lower!`), solve the sub-panel (trsm
+# side-R 'C'), rank-nb downdate the trailing (herk 'N') — all gating L3. Measured (Zen4, nb=32): n=128
+# 0.90→1.11, whole n≥96 band ≥1.03. nb keyed for per-µarch tuning; BlasComplex only (Dual → recursion).
+const _CPOTRF_NB = @load_preference("cpotrf_nb", 32)::Int
+function _cpotrf_rl_lower!(A, n::Int, nb::Int)
+    j = 1
+    @inbounds while j <= n
+        jb = min(nb, n - j + 1)
+        _potf2b_lower!(view(A, j:(j + jb - 1), j:(j + jb - 1)), jb)      # factor nb diagonal block
+        if j + jb <= n
+            db = view(A, j:(j + jb - 1), j:(j + jb - 1)); pan = view(A, (j + jb):n, j:(j + jb - 1))
+            trsm!(pan, db; side = 'R', uplo = 'L', transA = 'C', diag = 'N', alpha = true)  # L21 = A21·L11⁻ᴴ
+            herk!(view(A, (j + jb):n, (j + jb):n), pan; uplo = 'L', trans = 'N', alpha = -1.0, beta = 1.0)  # A22 -= L21·L21ᴴ
+        end
+        j += jb
+    end
+    return A
+end
+
 # Public: Cholesky factor A in place into its `uplo` triangle. Returns A. Throws PosDefException if A is
-# not positive definite. Float64 lower → faer fast path; else the generic AD-traceable recursion.
+# not positive definite. Float64 lower → faer fast path; complex lower → right-looking blocked; else the
+# generic AD-traceable recursion.
 function potrf!(A::AbstractMatrix; uplo::Char = 'L')
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potrf!: A must be square"))
-    if uplo == 'L' && _strided1(A) && eltype(A) === Float64
-        return _potrf_f64_lower!(A)
+    if uplo == 'L' && _strided1(A)
+        eltype(A) === Float64 && return _potrf_f64_lower!(A)
+        # n≤base: one vectorized base call (fast ≤64, single contiguous factor). n>base: right-looking
+        # blocked (small-nb panels → big amortizing trailing herks). Splitting n≤64 into panels regressed it.
+        eltype(A) <: BlasComplex &&
+            return (n <= _CPOTRF_BASE ? _potf2b_lower!(A, n) : _cpotrf_rl_lower!(A, n, _CPOTRF_NB); A)
     end
-    base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex: small base → fast ztrsm!/zherk! recursion
+    base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex upper / Dual: small base → fast recursion
     uplo == 'L' ? _potrf_lower!(A, n, base) : _potrf_upper!(A, n, base)
     return A
 end
