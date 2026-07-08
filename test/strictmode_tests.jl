@@ -119,6 +119,19 @@ end
         Az = randn(ComplexF64, 64, 64); Hz = Az + Az'; Bz = randn(ComplexF64, 64, 64)
         @assert_owned P.hemm!(zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
         @assert_owned P.symm!(zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
+        # UNPACKED-TRI complex rank-k (small-n trans='N', `_ctri_unpacked!` → `_uker_cmplx!` TRI-store): the
+        # path that fixed the zsyrk/zherk n≈24–48 valley. Direct-read A, no pack, masks the diagonal tile —
+        # must stay typestable + alloc-free (the tri sweep resolves sb/a1/ar/nr to concrete Vals). trim-side
+        # is covered ccallable-rooted in trim_tests.jl; here the type/alloc contract on the hot driver.
+        Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
+        @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
+        @assert_noalloc P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40) static = false
+        @assert_noalloc P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, zeros(ComplexF64, 48, 48), 40) static = false
+        @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
+        # rank-2k (two products through the shared _ctri_core!)
+        @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
+        @assert_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
+        @assert_noalloc P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
         @test true
     end
 end

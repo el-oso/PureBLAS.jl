@@ -2186,14 +2186,103 @@ const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _vwidth(Float64) == 4 ?
 # Complex micro-tile is _CMR·W complex rows (AVX2 z: 4, AVX-512 z: 16). Per-machine Preferences knobs.
 const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int        # trans='N': recursion below this
 const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # trans='C'/'T': packed ~always
-# Large real syrk → single-pass packed (gate); complex syrk/herk → complex packed-tri; small → recursion.
+# trans='N' complex n≤this ⇒ unpacked triangular kernel (`_ctri_unpacked!`): the packed path's operand-pack
+# + NR-remainder overhead and the recursion base's 2×-flop waste BOTH miss the gate at n≈24–48, while the
+# unpacked complex microkernel (what zgemm rides) gates ~1.4 there. Keyed on `_vwidth` like every sibling
+# cut; AVX2 (W=4) defaults OFF pending galen calibration (its small-n takes the unified path). Per-box knob.
+const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 0 : 96)::Int
+
+# ── Unpacked triangular-output complex rank-k/rank-2k (small-n, trans='N'). Routes herk/syrk (and, via two
+# products, her2k/syr2k) through the SAME direct-read `_uker_cmplx!` as zgemm (no operand pack) but stores
+# only the `up` triangle: off-diagonal tiles store full, the diagonal-straddling tile stores masked (TRI
+# mode), below-triangle tiles are skipped (recovering the flops the recursion base wastes). trans='N' only
+# (each product is X·Yᴴ: SA=1, TB=true, SB=herm?-1:1); β pre-applied by caller ⇒ accumulate (B0=false).
+# Vals resolved to concrete via the sb/a1/ar/nr chain (type-stable + trim-safe).
+@inline function _ctri_unpacked!(up::Bool, herm::Bool, α, A, C, k::Int)
+    Tc = eltype(C); a = convert(Tc, α); n = size(C, 1)
+    k == 0 && return C
+    _ctri_sb!(up, herm, real(a), imag(a), A, A, C, k, n)               # rank-k: X = Y = A
+    herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end        # Hermitian diagonal is real
+    return C
+end
+# rank-2k: C[tri] += α·A·Bᴴ + α₂·B·Aᴴ (α₂ = conj(α) her2k, α syr2k). Two unpacked-tri products, one each.
+@inline function _ctri2_unpacked!(up::Bool, herm::Bool, α, A, B, C, k::Int)
+    Tc = eltype(C); a = convert(Tc, α); a2 = herm ? conj(a) : a; n = size(C, 1)
+    k == 0 && return C
+    _ctri_sb!(up, herm, real(a), imag(a), A, B, C, k, n)              # α·A·Bᴴ
+    _ctri_sb!(up, herm, real(a2), imag(a2), B, A, C, k, n)            # α₂·B·Aᴴ
+    herm && @inbounds for i in 1:n; C[i, i] = real(C[i, i]); end
+    return C
+end
+@inline _ctri_sb!(up, herm, alr::T, ali::T, X, Y, C, k, n) where {T} = herm ?
+    _ctri_a1!(up, Val(-1), alr, ali, X, Y, C, k, n) : _ctri_a1!(up, Val(1), alr, ali, X, Y, C, k, n)
+@inline _ctri_a1!(up, sb::Val, alr::T, ali::T, X, Y, C, k, n) where {T} = (isone(alr) && iszero(ali)) ?
+    _ctri_ar!(up, sb, Val(true), alr, ali, X, Y, C, k, n) : _ctri_ar!(up, sb, Val(false), alr, ali, X, Y, C, k, n)
+@inline _ctri_ar!(up, sb::Val, a1::Val, alr::T, ali::T, X, Y, C, k, n) where {T} = iszero(ali) ?
+    _ctri_nr!(up, sb, a1, Val(true), alr, ali, X, Y, C, k, n) : _ctri_nr!(up, sb, a1, Val(false), alr, ali, X, Y, C, k, n)
+@inline _ctri_nr!(up, sb::Val, a1::Val, ar::Val, alr::T, ali::T, X, Y, C, k, n) where {T} =
+    (_CNR_SMALL != _CNR && max(n, k) <= _CGEMM_NRSMALL_MAX) ?
+        _ctri_core!(Val(_CNR_SMALL), up, sb, a1, ar, alr, ali, X, Y, C, k, n) :
+        _ctri_core!(Val(_CNR), up, sb, a1, ar, alr, ali, X, Y, C, k, n)
+# One product's triangular tile sweep: C[tri] += α·X·Yᴴ. NR-col panels × mr-row tiles; classify each tile
+# vs the stored (`up`) diagonal — skip (outside) / full (interior) / tri (straddling). Mirrors `_uker_sweep!`'s
+# MR + edge choice + advance. X===Y for rank-k; distinct for each rank-2k product.
+function _ctri_core!(::Val{NR}, up::Bool, ::Val{SB}, ::Val{A1}, ::Val{AR},
+        alr::T, ali::T, X, Y, C, k::Int, n::Int) where {NR, SB, A1, AR, T}
+    W = _vwidth(T); mr = _CMR * W
+    ldx = stride(X, 2); ldy = stride(Y, 2); ldc = stride(C, 2)
+    parX = parent(X); parY = parent(Y); parC = parent(C)
+    GC.@preserve parX parY parC begin
+        Xp = Ptr{T}(pointer(X)); Yp = Ptr{T}(pointer(Y)); Cp = Ptr{T}(pointer(C))
+        jr = 0
+        while jr < n
+            nre = min(NR, n - jr)
+            ir = 0
+            while ir < n
+                mre = min(mr, n - ir); nrv = cld(mre, W)
+                below = up ? (ir >= jr + nre) : (ir + mre <= jr)         # tile entirely off the stored triangle
+                full  = up ? (ir + mre - 1 <= jr) : (ir >= jr + nre - 1) # tile entirely inside it
+                if below
+                    # skip: nothing stored
+                elseif full && mre == mr
+                    _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(true))
+                elseif full && nrv >= _CMR
+                    _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false))
+                elseif full
+                    _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
+                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false))
+                elseif nrv >= _CMR                                       # diagonal-straddling ⇒ TRI masked store
+                    _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR),
+                        Val(false), Val(true), jr - ir, up)
+                else
+                    _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
+                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR),
+                        Val(false), Val(true), jr - ir, up)
+                end
+                ir += nrv >= _CMR ? mr : W
+            end
+            jr += NR
+        end
+    end
+    return C
+end
+
+# Large real syrk → single-pass packed (gate); complex syrk/herk → unpacked-tri (small trans='N') or
+# packed-tri; small → recursion.
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
     T = eltype(C)
     if !herm && T <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
         return _syrk_packed!(up, tr, convert(T, α), A, C, k)
-    elseif T <: Union{ComplexF64, ComplexF32} && k > 0 &&
-           size(C, 1) > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
-        return _csyrk_packed!(up, tr, herm, α, A, C, k)
+    elseif T <: Union{ComplexF64, ComplexF32} && k > 0
+        n = size(C, 1)
+        if !tr && n <= _CSYRK_UNPACK_MAX
+            return _ctri_unpacked!(up, herm, α, A, C, k)
+        elseif n > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
+            return _csyrk_packed!(up, tr, herm, α, A, C, k)
+        end
     end
     _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)), 0, size(C, 1))
 end
@@ -2694,6 +2783,9 @@ function syr2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
+    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0
+        _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
+        _ctri2_unpacked!(up, false, alpha, A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
         _syrk_scaleC!(C, up, beta)
         _csyr2k_packed!(up, trans != 'N', false, alpha, A, Bm, C, k)
@@ -2707,7 +2799,9 @@ function her2k!(C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::
         trans::Char = 'N', alpha::Number = true, beta::Real = false)
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
-    if eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
+    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0
+        return (_ctri2_unpacked!(up, true, alpha, A, Bm, C, k); C)     # small-n trans='N': unpacked-tri (2 products)
+    elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
     end
     _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n); C

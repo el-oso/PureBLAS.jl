@@ -1382,7 +1382,8 @@ end
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T, mre::Int, nre::Int,
         ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
         ::Val{B0} = Val(false), ::Val{A1} = Val(false),
-        ::Val{AR} = Val(false), ::Val{FULL} = Val(false)) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL}
+        ::Val{AR} = Val(false), ::Val{FULL} = Val(false),
+        ::Val{TRI} = Val(false), d0::Int = 0, upper::Bool = true) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}; V2W = Vec{2W, T}
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
     swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)                       # (1,0,3,2,…): swap re/im pairs
@@ -1428,8 +1429,10 @@ end
     AR || push!(body.args, :(aialt = $V2W(ali) * $V2W($signt)))         # (−α_im,α_im,…): complex-α cross term
     for j in 1:NR
         stores = quote end
+        TRI && push!(stores.args, :(thr = d0 + $(j - 1)))               # tri-store threshold for this column
         for mi in 1:MR
-            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j); mk = Symbol(:m2, mi)
+            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+            mk = TRI ? :mkl : Symbol(:m2, mi)                           # TRI ⇒ per-tile edge∧triangle mask (mkl)
             q = :(C + ((jr + $(j - 1)) * ldc * 2 + 2 * (ir + $((mi - 1) * W))) * $sz)
             vst(v) = FULL ? :(vstore($v, qq)) : :(vstore($v, qq, $mk))   # FULL ⇒ unmasked store/C-load
             cvl = FULL ? :(vload($V2W, qq)) : :(vload($V2W, qq, $mk))
@@ -1444,7 +1447,13 @@ end
                           :(let ziv = shufflevector($cr, $ci, Val($ilv))
                                 $(vst(:(muladd(ziv, avr, muladd(shufflevector(ziv, Val($swp)), aialt, $cvl))))) end)
             end
-            push!(stores.args, :(let qq = $q; $st; end))
+            if TRI                                                       # edge mask ∧ triangle: upper keep row≤thr, lower row≥thr
+                trik = :($(Symbol(:m2, mi)) & (upper ? (lanes2 < 2 * (thr - $((mi - 1) * W) + 1)) :
+                                                       (lanes2 >= 2 * (thr - $((mi - 1) * W)))))
+                push!(stores.args, :(let qq = $q, mkl = $trik; $st; end))
+            else
+                push!(stores.args, :(let qq = $q; $st; end))
+            end
         end
         push!(body.args, :(if $(j - 1) < nre; $stores; end))
     end
