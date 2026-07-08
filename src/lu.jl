@@ -58,6 +58,9 @@ function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     if A isa StridedMatrix{Float64} && stride(A, 1) == 1
         return GC.@preserve A _getf2_simd!(pointer(A), stride(A, 2), mp, pb, roff, ipiv, ioff)
     end
+    if A isa StridedMatrix && stride(A, 1) == 1 && eltype(A) <: BlasComplex
+        return GC.@preserve A _cgetf2_simd!(pointer(A), stride(A, 2), mp, pb, roff, ipiv, ioff)
+    end
     info = 0
     @inbounds for jl in 1:pb
         piv = jl; pmax = abs(A[jl, jl])                  # partial pivot: max |·| in column jl, rows jl:mp
@@ -119,6 +122,43 @@ function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipi
                 vstore(muladd(vajc, vload(_CVF, _cvptr(p, i, jl, ld)), vload(_CVF, bj)), bj); i += _CHOLW
             end
             while i <= mp; unsafe_store!(p, muladd(ajc, unsafe_load(p, _clidx(i, jl, ld)), unsafe_load(p, _clidx(i, jc, ld))), _clidx(i, jc, ld)); i += 1; end
+        end
+    end
+    return info
+end
+
+# Complex SIMD panel (zgetf2): same math as the scalar fallback, vectorized over rows via the L1 complex
+# kernels (`_scal_cmplx_simd!` column scale, `_axpy_cmplx_simd!` rank-1 trailing update). Scalar argmax +
+# row swap (data-dependent). Contiguous-column complex panel, p = &panel[1,1]. Pivoting is a correctness
+# boundary — do not simplify.
+function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
+    R = real(Tc); csz = sizeof(Tc); info = 0
+    lidx(i, k) = (k - 1) * ld + i                                   # 1-based linear (complex) index
+    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz                # &A[i,k] (complex Ptr)
+    @inbounds for jl in 1:pb
+        piv = jl; pmax = abs(unsafe_load(p, lidx(jl, jl)))         # argmax |·| in column jl, rows jl:mp
+        for il in (jl + 1):mp
+            a = abs(unsafe_load(p, lidx(il, jl))); a > pmax && (pmax = a; piv = il)
+        end
+        ipiv[ioff + jl] = roff + piv
+        if unsafe_load(p, lidx(piv, jl)) != zero(Tc)
+            if piv != jl                                            # swap rows jl ↔ piv across the panel
+                for jc in 1:pb
+                    a = unsafe_load(p, lidx(jl, jc))
+                    unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc))
+                    unsafe_store!(p, a, lidx(piv, jc))
+                end
+            end
+            mt = mp - jl
+            r = _crecip(unsafe_load(p, lidx(jl, jl)))               # scale column below diagonal by 1/pivot
+            mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
+        elseif info == 0
+            info = roff + jl
+        end
+        mt = mp - jl
+        for jc in (jl + 1):pb                                       # rank-1 update: A[jl+1:,jc] -= A[jl,jc]·A[jl+1:,jl]
+            ajc = unsafe_load(p, lidx(jl, jc))
+            mt > 0 && _axpy_cmplx_simd!(mt, -real(ajc), -imag(ajc), cptr(jl + 1, jl), cptr(jl + 1, jc))
         end
     end
     return info

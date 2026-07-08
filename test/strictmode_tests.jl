@@ -217,6 +217,16 @@ end
             @assert_typestable P._cpotf2_lower!(copy(A), 48)
             @assert_noalloc P._cpotf2_lower!(copy(A), 48)
             @assert_typestable P.potrf!(copy(A); uplo = 'L')
+            # complex getf2 panel (`_cgetf2_simd!`, zgetrf base) + QR panel (`qr_unblocked!`, zgeqrf) —
+            # both vectorize via the L1 complex kernels; typestable + alloc-free on the native hot path.
+            G = randn(TC, 48, 48) + 48I; ip = zeros(Int, 48); pG = pointer(G); ldG = stride(G, 2)
+            GC.@preserve G begin
+                @assert_typestable P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
+                @assert_noalloc P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
+            end
+            Q = randn(TC, 48, 48); tau = similar(Q, 48)
+            @assert_typestable P.qr_unblocked!(copy(Q), tau)
+            @assert_noalloc P.qr_unblocked!(copy(Q), tau)
         end
         @test true
     end
