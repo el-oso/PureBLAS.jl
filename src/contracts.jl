@@ -121,7 +121,14 @@ function trmm! end   # B := α·op(A)·B / α·B·op(A),      A triangular
 function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular (solve)
 
 # Level-3 is a strict contract: every matrix-matrix op is type-stable and allocation-free, verified by
-# `@verify_strict SIMDBackend` (verify.jl). The rank-k/hemm family's divide-and-conquer drivers were
+# `@verify_strict SIMDBackend` (verify.jl). It ALSO carries a TRIM-COMPATIBILITY guarantee — the C-ABI
+# entry points that export these ops (cabi.jl: s/d/c/z `gemm_64_` …) must compile under juliac --trim for
+# the Mode-1 LBT `.so`, a hard requirement. The trim-critical path is the complex unpacked gemm kernel
+# (`_gemm_cmplx_unpacked!`): it is asserted `@assert_trim_compatible` in the strict-verify pass — heuristic
+# in :fast (dev, verify.jl) and juliac's authoritative verify_typeinf_trim in :full (tests, the strictmode
+# dogfood, TrimCheck loaded). trim_tests.jl keeps the exhaustive ccallable-rooted belt (strict isn't perfect
+# yet; the fast/full heuristic-vs-authoritative gap is reported upstream to improve StrictMode).
+# The rank-k/hemm family's divide-and-conquer drivers were
 # refactored to carry integer offsets into the original arrays (not fresh sub-block SubArrays, which
 # are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are
 # also built per concrete type, never as a Union, so they stay stack-allocated). All nine now gate 0-alloc.

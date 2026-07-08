@@ -124,7 +124,8 @@ end
 end
 
 @testitem "StrictMode dogfood: GEMM hot paths" begin
-    using StrictMode, AllocCheck, JET
+    using StrictMode, AllocCheck, JET, TrimCheck  # TrimCheck → @assert_trim_compatible runs the
+    # authoritative juliac verify_typeinf_trim here (test project is analysis="full"), not the heuristic.
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping GEMM dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -137,14 +138,14 @@ end
             # register-blocked microkernel: the hot path — must be tight
             @assert_typestable P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
             @assert_noalloc P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @assert_trim_safe P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @assert_trim_compatible P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
             @assert_noalloc P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
-            @assert_trim_safe P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @assert_trim_compatible P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             # clip kernel: W-aligned partial row-tile (reads _MR-strided panel, computes 1 live vector)
             @assert_typestable P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
             @assert_noalloc P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
-            @assert_trim_safe P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @assert_trim_compatible P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
         end
         # unpacked microkernel (small-matrix path): A is mr×k, B is k×nr, column-major
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
@@ -154,25 +155,29 @@ end
                 Val(P._MR), Val(P._NR), Val(false), Val(true))
             @assert_noalloc P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 2.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(false))
-            @assert_trim_safe P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
+            @assert_trim_compatible P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(true))
             # masked-row kernel (partial rows): mre=12 → second row-vector partially masked
             @assert_typestable P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true))
             @assert_noalloc P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false))
-            @assert_trim_safe P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
+            @assert_trim_compatible P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true))
         end
         # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed
         # zgemm_64_/cgemm_64_ trim-safety (four runtime `bool ? Val(true):Val(false)` flags → a Union{Val,Val}
-        # split that exceeds juliac's reachability limit). Asserting it HERE catches it in the fast strict-verify
-        # loop at dev-time, not only at the ccallable in trim_tests.jl on CI (too late). :full mode → the
-        # authoritative verify_typeinf_trim verifier (same one juliac/TrimCheck runs), so it recurses the graph.
+        # split that exceeds juliac's reachability limit). `@assert_trim_compatible` in the test project's
+        # :full mode (TrimCheck loaded) runs juliac's AUTHORITATIVE verify_typeinf_trim over this exact kernel
+        # graph — VERIFIED to reproduce the pre-fix failure (4 verifier errors) when rooted here, so the class
+        # is caught in the strict-verify pass at dev-time, not only at the ccallable in trim_tests.jl on CI.
+        # NB the sibling `@assert_trim_safe` (heuristic TypeContracts scan) does NOT catch this reachability-
+        # limit split — it's the known fast/full discrepancy: dev runs :fast (heuristic), tests run :full
+        # (authoritative). trim_tests.jl stays as the ccallable-rooted belt (strict verify isn't perfect yet).
         for TC in (ComplexF64, ComplexF32)
             Az = randn(TC, 8, 8); Bz = randn(TC, 8, 8); Cz = zeros(TC, 8, 8)
-            @assert_trim_safe P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
-            @assert_trim_safe P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
+            @assert_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
+            @assert_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
         end
         # packing + generic path allocate nothing
         A = randn(8, 5); Bm = randn(5, 6); Cg = zeros(8, 6)
