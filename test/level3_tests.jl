@@ -4,7 +4,9 @@
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 50
     @testset "$T s=$side u=$ul t=$ta d=$dg ($m×$n)" for T in (Float32, Float64, ComplexF64),
         side in ('L', 'R'), ul in ('U', 'L'), ta in ('N', 'T', 'C'), dg in ('N', 'U'),
-        (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96))
+        # last 3 sizes exercise the packed complex-trmm remainder column-tile (k%_CNR ∈ {2,4}) at
+        # both uplo (upper-N deep-remainder / lower-N shallow) with a non-mr-multiple m (bottom-row mask).
+        (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96), (50, 56), (66, 112), (128, 64))
 
         (T <: Real && ta == 'C') && continue
         k = side == 'L' ? m : n
