@@ -164,6 +164,16 @@ end
             @assert_trim_safe P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true))
         end
+        # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed
+        # zgemm_64_/cgemm_64_ trim-safety (four runtime `bool ? Val(true):Val(false)` flags → a Union{Val,Val}
+        # split that exceeds juliac's reachability limit). Asserting it HERE catches it in the fast strict-verify
+        # loop at dev-time, not only at the ccallable in trim_tests.jl on CI (too late). :full mode → the
+        # authoritative verify_typeinf_trim verifier (same one juliac/TrimCheck runs), so it recurses the graph.
+        for TC in (ComplexF64, ComplexF32)
+            Az = randn(TC, 8, 8); Bz = randn(TC, 8, 8); Cz = zeros(TC, 8, 8)
+            @assert_trim_safe P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
+            @assert_trim_safe P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
+        end
         # packing + generic path allocate nothing
         A = randn(8, 5); Bm = randn(5, 6); Cg = zeros(8, 6)
         @assert_typestable P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
