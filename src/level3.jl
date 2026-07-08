@@ -300,6 +300,11 @@ const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # Below this k the packed base's pack overhead loses to the unpacked K-TRIM (measured galen: k=8 0.46 vs
 # unpacked ~1.0, k=32 0.75 vs 0.85; crossover ≈48, k=64 packed 0.91 wins). Recursion bases (k>128 split)
 # land ≥64 → packed; only tiny single-base trmm stays unpacked. Preferences knob "ctrmm_pack_min".
+# pack-vs-unpacked crossover: below this k the unpacked small kernel's lower setup beats the packed path's
+# O(k²) M-materialize. Empirically side-DEPENDENT (packed_R amortizes ~4·_CNR, packed_L not until ~8·_CNR
+# — the B-vs-M packing asymmetry) and small-n stays sub-gate either way, so a single derived crossover
+# doesn't pay; kept at the measured conservative value. Preferences-pinnable. (req#8: acknowledged debt —
+# the pack-amortization threshold resists a clean cache/ISA formula; revisit with an OB-style fused pack.)
 const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
 
 # Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
@@ -353,6 +358,14 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
         while jc < n
             nce = min(nc, n - jc)
             _pack_B_cmplx!(BpR, BpI, B, 0, jc, k, nce, false, nr)   # B[:, jc-panel], all k rows
+            rem = nce - (nce ÷ nr) * nr                    # partial column-tile width (0 if divisible)
+            if rem != 0                                    # repack the last slot at row-stride rem (pad-free,
+                jip = nce ÷ nr; basep = jip * nr * k       # so the NR=rem kernel computes no pad columns)
+                @inbounds for p in 0:(k - 1), c in 0:(rem - 1)
+                    v = B[p + 1, jc + jip * nr + c + 1]
+                    BpR[basep + p * rem + c + 1] = real(v); BpI[basep + p * rem + c + 1] = imag(v)
+                end
+            end
             ir = 0
             while ir < k
                 mre = min(mr, k - ir)
@@ -366,12 +379,18 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
                     Cblk = Bp0 + (2 * ir + 2 * (jc + jr) * ldb) * sz
                     AR = Ptr{T}(ARp); AI = Ptr{T}(AIp)
                     BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
-                    if mre == mr && nre == nr
-                        _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                            Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
-                    else
-                        _microkernel_cmplx_masked!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                            mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                    if nre == nr
+                        if mre == mr
+                            _microkernel_cmplx!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                        else
+                            _microkernel_cmplx_masked!(Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true))
+                        end
+                    else                                     # partial column-tile: stride-rem slot ⇒ plo*rem
+                        boffr = (ji * nr * k + plo * rem) * sz
+                        _trmm_rem_cmplx!(Cblk, ldb, AR, AI, Ptr{T}(BRp + boffr), Ptr{T}(BIp + boffr),
+                            kc, alr, ali, mre, nre, Val(_CMR), Val(1), Val(1))
                     end
                     jr += nr
                 end
