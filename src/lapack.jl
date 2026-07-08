@@ -805,20 +805,22 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
     return A
 end
 
-# Right-looking blocked complex Hermitian Cholesky (lower). The cache-oblivious n/2 recursion
-# (`_potrf_lower!`) capped 0.90–0.93 (Zen4/Zen5) / 0.76–0.88 (AVX2) across n≈80–128: splitting n in half
-# makes each trailing trsm/herk too small to amortize the recursion + base-copy overhead — even though the
-# base, ztrsmR-C, and zherk all gate at those block sizes. A SMALL fixed-nb right-looking sweep instead does
-# BIG early trailing herks (n−nb, n−2nb, …) that amortize well. Per nb-panel: factor the diagonal block
-# (vectorized `_cpotf2_lower!` via the contiguous-buffer `_potf2b_lower!`), solve the sub-panel (trsm
-# side-R 'C'), rank-nb downdate the trailing (herk 'N') — all gating L3. Measured (Zen4, nb=32): n=128
-# 0.90→1.11, whole n≥96 band ≥1.03. nb keyed for per-µarch tuning; BlasComplex only (Dual → recursion).
-const _CPOTRF_NB = @load_preference("cpotrf_nb", 32)::Int
-function _cpotrf_rl_lower!(A, n::Int, nb::Int)
+# Recursive right-looking blocked complex Hermitian Cholesky (lower). Panel width nb ∝ n/4 (OpenBLAS's own
+# policy — see potrf_L_single.c: nb = min(n/4, GEMM_Q)), capped at `_CPOTRF_NBMAX`. This keeps the panel
+# COUNT ~constant (≈4) and block shapes SCALING CONTINUOUSLY with n — the two things that make the curve
+# smooth. A fixed nb=32 instead made panel count jump 2→4→8→16 (large-n falloff: AVX2 0.82 at n≥1024) and
+# a big base cutoff added a discrete base→blocked step; nb=n/4 removes both. Per panel: factor the diagonal
+# jb-block RECURSIVELY (jb>base ⇒ blocks again; jb≤base ⇒ the vectorized unblocked base), trsm side-R 'C'
+# panel solve, herk 'N' rank-jb trailing downdate — all gating L3. BlasComplex only (Dual/upper → generic).
+const _CPOTRF_NBMAX = @load_preference("cpotrf_nbmax", _vwidth(Float64) == 4 ? 128 : 192)::Int
+@inline _chol_nb(n::Int) = clamp((n >> 2) & ~15, 32, _CPOTRF_NBMAX)     # ~n/4, rounded to a multiple of 16
+function _cpotrf_lower!(A, n::Int)
+    n <= _CPOTRF_BASE && return _potf2b_lower!(A, n)                    # unblocked vectorized base
+    nb = _chol_nb(n)
     j = 1
     @inbounds while j <= n
         jb = min(nb, n - j + 1)
-        _potf2b_lower!(view(A, j:(j + jb - 1), j:(j + jb - 1)), jb)      # factor nb diagonal block
+        _cpotrf_lower!(view(A, j:(j + jb - 1), j:(j + jb - 1)), jb)     # factor diagonal jb-block (recurse)
         if j + jb <= n
             db = view(A, j:(j + jb - 1), j:(j + jb - 1)); pan = view(A, (j + jb):n, j:(j + jb - 1))
             trsm!(pan, db; side = 'R', uplo = 'L', transA = 'C', diag = 'N', alpha = true)  # L21 = A21·L11⁻ᴴ
@@ -839,8 +841,7 @@ function potrf!(A::AbstractMatrix; uplo::Char = 'L')
         eltype(A) === Float64 && return _potrf_f64_lower!(A)
         # n≤base: one vectorized base call (fast ≤64, single contiguous factor). n>base: right-looking
         # blocked (small-nb panels → big amortizing trailing herks). Splitting n≤64 into panels regressed it.
-        eltype(A) <: BlasComplex &&
-            return (n <= _CPOTRF_BASE ? _potf2b_lower!(A, n) : _cpotrf_rl_lower!(A, n, _CPOTRF_NB); A)
+        eltype(A) <: BlasComplex && return (_cpotrf_lower!(A, n); A)   # recursive nb=n/4 (base handled inside)
     end
     base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex upper / Dual: small base → fast recursion
     uplo == 'L' ? _potrf_lower!(A, n, base) : _potrf_upper!(A, n, base)
