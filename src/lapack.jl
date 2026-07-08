@@ -8,6 +8,10 @@ using LinearAlgebra: PosDefException
 # traceable); BlasReal hits the SIMD trsm/syrk. ponytail: NB hand-set for Zen4; lift to a knob if tuning.
 
 const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf2, vectorized inner loop).
+# Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
+# (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
+# complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
+const _CPOTRF_BASE = @load_preference("cpotrf_base", 32)::Int
 # Measured sweet spot on Zen4: smaller bases pay more small-k trsm/syrk overhead, larger pay a
 # memory-bound unblocked panel. ponytail: hand-set; revisit when tuning Cholesky to the gate.
 
@@ -19,29 +23,32 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 
 # Unblocked right-looking Cholesky of an n×n block, lower triangle. Throws PosDefException at the first
 # non-positive pivot (LAPACK's info>0). Reads/writes only the lower triangle.
+# Hermitian-aware: `real(A[j,j])` (the diagonal is real for A=LLᴴ) and `conj` on the downdate operand.
+# On T<:Real both are identities (compile away) → the real/ForwardDiff path is byte-identical; on
+# T<:Complex this is the Hermitian Cholesky (zpotrf), matching LAPACK zpotf2.
 function _potf2_lower!(A, n::Int)
     @inbounds for j in 1:n
-        d = A[j, j]
+        d = real(A[j, j])
         d > 0 || throw(PosDefException(j))
         ajj = sqrt(d); A[j, j] = ajj; invd = inv(ajj)
         for i in (j + 1):n; A[i, j] *= invd; end                 # scale column j below the diagonal
         for k in (j + 1):n                                        # rank-1 update of the lower trailing
-            akj = A[k, j]
+            akj = conj(A[k, j])                                   # Hermitian: L[i,j]·conj(L[k,j])
             for i in k:n; A[i, k] -= A[i, j] * akj; end
         end
     end
     return A
 end
-# Unblocked, upper triangle: A = Uᵀ·U.
+# Unblocked, upper triangle: A = Uᴴ·U (Hermitian). conj on the mirror operand A[j,i].
 function _potf2_upper!(A, n::Int)
     @inbounds for j in 1:n
-        d = A[j, j]
+        d = real(A[j, j])
         d > 0 || throw(PosDefException(j))
         ajj = sqrt(d); A[j, j] = ajj; invd = inv(ajj)
         for i in (j + 1):n; A[j, i] *= invd; end                 # scale row j right of the diagonal
         for k in (j + 1):n                                        # rank-1 update of the upper trailing
             ajk = A[j, k]
-            for i in (j + 1):k; A[i, k] -= A[j, i] * ajk; end
+            for i in (j + 1):k; A[i, k] -= conj(A[j, i]) * ajk; end   # Hermitian: conj(U[j,i])·U[j,k]
         end
     end
     return A
@@ -69,20 +76,30 @@ function _potrf_lower!(A, n::Int, base::Int = _POTRF_BASE)
     h = n ÷ 2
     _potrf_lower!(view(A, 1:h, 1:h), h, base)
     A21 = view(A, (h + 1):n, 1:h)
-    trsm!(A21, view(A, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = true)
-    syrk!(view(A, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1, beta = 1)
+    if eltype(A) <: Complex                                    # Hermitian: A21·L11⁻ᴴ + A22 -= A21·A21ᴴ
+        trsm!(A21, view(A, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'C', diag = 'N', alpha = true)
+        herk!(view(A, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1.0, beta = 1.0)
+    else
+        trsm!(A21, view(A, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = true)
+        syrk!(view(A, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1, beta = 1)
+    end
     _potrf_lower!(view(A, (h + 1):n, (h + 1):n), n - h, base)
     return A
 end
 # Upper: A = Uᵀ·U. Off-diagonal panel A12 = U11⁻ᵀ·A12 (trsm side-L), downdate A22 -= A12ᵀ·A12 (syrk).
-function _potrf_upper!(A, n::Int)
-    n <= _POTRF_BASE && return _potf2b_upper!(A, n)
+function _potrf_upper!(A, n::Int, base::Int = _POTRF_BASE)
+    n <= base && return _potf2b_upper!(A, n)
     h = n ÷ 2
     _potrf_upper!(view(A, 1:h, 1:h), h)
     A12 = view(A, 1:h, (h + 1):n)
-    trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
-    syrk!(view(A, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'T', alpha = -1, beta = 1)
-    _potrf_upper!(view(A, (h + 1):n, (h + 1):n), n - h)
+    if eltype(A) <: Complex                                    # Hermitian: U11⁻ᴴ·A12 + A22 -= A12ᴴ·A12
+        trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'C', diag = 'N', alpha = true)
+        herk!(view(A, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'C', alpha = -1.0, beta = 1.0)
+    else
+        trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
+        syrk!(view(A, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'T', alpha = -1, beta = 1)
+    end
+    _potrf_upper!(view(A, (h + 1):n, (h + 1):n), n - h, base)
     return A
 end
 
@@ -738,6 +755,7 @@ function potrf!(A::AbstractMatrix; uplo::Char = 'L')
     if uplo == 'L' && _strided1(A) && eltype(A) === Float64
         return _potrf_f64_lower!(A)
     end
-    uplo == 'L' ? _potrf_lower!(A, n) : _potrf_upper!(A, n)
+    base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex: small base → fast ztrsm!/zherk! recursion
+    uplo == 'L' ? _potrf_lower!(A, n, base) : _potrf_upper!(A, n, base)
     return A
 end

@@ -51,7 +51,8 @@ end
 # column scale + rank-1 update over contiguous rows; scalar argmax); else the generic fallback.
 # Pivoting is a correctness boundary — do not simplify.
 function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    if pb > _GETF2_BASE && A isa StridedMatrix{Float64} && stride(A, 1) == 1   # wide → BLAS-3 split
+    if pb > _GETF2_BASE && A isa StridedMatrix && stride(A, 1) == 1 &&        # wide → BLAS-3 split (generic:
+            (eltype(A) === Float64 || eltype(A) <: BlasComplex)               # rides trsm!/gemm!, incl. complex)
         return _getf2_blocked!(A, mp, pb, roff, ipiv, ioff)
     end
     if A isa StridedMatrix{Float64} && stride(A, 1) == 1
@@ -220,8 +221,23 @@ function _getrf_core!(A, ipiv, nb::Int)
     return A, ipiv, info
 end
 
+# Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s generic panel pivots on
+# |·| and divides by the complex pivot correctly; `_getrf_core!` rides complex trsm!/gemm! (the 3M path)
+# for the trailing update. The Float64 pad-scratch optimization (`_LU_PAD`) is real-only, so complex routes
+# straight to the core. (Partial-pivot metric is |·| like LAPACK's cabs2, not cabs1 — both valid; oracle
+# tests must compare the PA=LU residual, not entries.)
+function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB) where {T<:BlasComplex}
+    m, n = size(A); k = min(m, n)
+    k == 0 && return A, ipiv, 0
+    length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
+    return _getrf_core!(A, ipiv, nb)
+end
 # Convenience: allocate ipiv, return (A overwritten with L\U, ipiv, info).
 function getrf!(A::StridedMatrix{Float64})
+    ipiv = Vector{Int}(undef, min(size(A)...))
+    return getrf!(A, ipiv)
+end
+function getrf!(A::StridedMatrix{T}) where {T<:BlasComplex}
     ipiv = Vector{Int}(undef, min(size(A)...))
     return getrf!(A, ipiv)
 end
