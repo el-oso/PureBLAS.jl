@@ -8,7 +8,7 @@
     hw(simd, l1, l2, l3, vendor, family, nvreg) =
         (simd = simd, l1 = l1, l2 = l2, l3 = l3, vendor = vendor, family = family, nvreg = nvreg)
     #                     simd        l1        l2         l3       vendor  fam   nvreg
-    galen       = hw(32, 32 * 1024, 1024^2, 32 * 1024^2, :AMD, 0x19, 16)   # Zen3, AVX2 (L3: 1 CCD)
+    galen       = hw(32, 32 * 1024, 512 * 1024, 32 * 1024^2, :AMD, 0x19, 16)  # Zen3, AVX2 (L2 512K, L3 1 CCD)
     wintermute  = hw(64, 32 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x19, 32)   # Zen4, double-pumped 512
     neuromancer = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32)   # Zen5, native 512
     tigerlake   = hw(64, 48 * 1024, 1280 * 1024, 12 * 1024^2, :Intel, 0x06, 32)  # never benchmarked — prediction
@@ -32,6 +32,14 @@
     @test (P._at_gemm_mr(wintermute), P._at_gemm_nr(wintermute)) == (2, 8)
     @test (P._at_gemm_mr(galen), P._at_gemm_nr(galen)) == (3, 4)
     @test (P._at_gemm_mr(neuromancer), P._at_gemm_nr(neuromancer)) == (2, 8)
+
+    # ── Complex mc (all L3 sites derive via _at_mc_kc with the COMPLEX element, 16 B/elt) ─────────────
+    # Joint residency mc·kc·sizeof ≤ 30%·L2. Complex (16 B) halves the real mc; galen's 512K L2 halves
+    # it again — the adaptation the Zen4-tuned _MC=144 literal could not do. Fleet-A/B validated 2026-07-08.
+    @test P._at_mc_kc(wintermute, ComplexF64, 256, 16, 4096) == 64   # 30%·1M /(256·16)=76 → mr-round 64
+    @test P._at_mc_kc(neuromancer, ComplexF64, 256, 16, 4096) == 64
+    @test P._at_mc_kc(galen, ComplexF64, 256, 16, 4096) == 32        # 512K L2 → half of Zen4/Zen5
+    @test P._at_mc_kc(wintermute, Float64, 256, 16, 4096) == 144     # real path unchanged (8 B/elt)
 
     # ── Out-of-fleet auto-sizing (no crash, sane values) — the whole point of the mandate ─────────────
     @test P._at_cpotf2_mr(tigerlake) == 1    # Intel native-512

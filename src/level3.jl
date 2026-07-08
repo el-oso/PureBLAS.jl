@@ -7,7 +7,10 @@
 
 const _TRMM_BASE = 128        # ≤ this → _trmm_small! directly (capped by _L3_NB=128 M scratch)
 const _TRMM_RPANEL = 512
-const _TRMM_RKC = 384
+# side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
+# residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
+# (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
+const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 const _TRMM_RPACK = 448        # > this → packed single-pass side-R (mirrors the L cut at _GEMM_UNPACK_MAX)       # side-R flat-loop panel width (fat off-diag gemms; diagonal recurses)
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
@@ -370,7 +373,10 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    # B row-panel is materialized with ALL k cols at once (not a kc-blocked loop), so mc is the
+    # CANONICAL 30%·L2 A-block (`_at_gemm_mc`), NOT the per-kc `_at_mc_kc` — keying it on the full k
+    # makes mc a moving target that over-blocks small-L2 boxes at small n (galen ztrmmR regression). req#8.
+    mc = min(max(mr, (_at_gemm_mc(_HW) ÷ mr) * mr), cld(m, mr) * mr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mc * k, cld(k, nr) * nr * k)
     ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
     GC.@preserve M B ApR ApI BpR BpI begin
@@ -1593,7 +1599,7 @@ function _trgemm_cmplx_packed!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, up::B
         alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, NR, A1, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = NR
     kc = min(_CKC, k)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)                 # ldc in COMPLEX elements (kernel does the ×2)
@@ -1661,7 +1667,7 @@ function _trgemm_cmplx_packed_u!(::Val{SA}, ::Val{SB}, ::Val{A1}, up::Bool,
         alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, A1, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W          # unified requires nr == mr (CMR=1)
     kc = min(_CKC, k)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
     onepack = X === Y && tXp == !tYp                               # herk/zsyrk: B-pack == A-pack
@@ -1727,7 +1733,7 @@ function _trgemm_cmplx_packed2_u!(::Val{SA}, ::Val{SB}, up::Bool, alr::T, ali::T
         X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W
     kc = min(_CKC, k)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, plen, plen)
@@ -2503,7 +2509,7 @@ end
 function _hemm_packed_L!(up::Bool, α, β, A, B, C)
     Tc = eltype(C); T = real(Tc); n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _CMR * W; nr = _CNR
     kc = min(_CKC, n)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     _scale_C!(C, n, m, convert(Tc, β)); ldc = stride(C, 2); sz = sizeof(T)

@@ -115,10 +115,11 @@ end
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-
 # independent overhead floor + per-lane slope): base 32+4W (48/64), nbmax 64+16W (128/192).
-# A-row block for the ACTUAL local kc (joint residency mc·kc·sizeof ≤ 30%·L2). The standalone `_MC` bakes
-# kc=canonical, so callers with a small local kc (e.g. potrf's trailing gemm at kc=nb) get a stale-small mc;
-# this recomputes from the local kc. Returns the mc capped at `cap` (=cld(dim,mr)*mr), rounded to the local
-# mr — so real (mr=_MR·W) and complex (mr=_CMR·W) sites each round correctly. req#8.
+# A-row block for the ACTUAL local kc + element type (joint residency mc·kc·sizeof ≤ 30%·L2). The single
+# authority for mc across ALL gemm/L3 sites (real & complex) — a standalone `_MC` const would bake the
+# canonical kc + Float64, so it under-blocks small-kc callers (potrf's trailing gemm at kc=nb) AND mis-sizes
+# complex (16 B/elt vs 8). Recomputes from the local kc/T; capped at `cap` (=cld(dim,mr)*mr), rounded to the
+# local mr — so real (mr=_MR·W) and complex (mr=_CMR·W) sites each round correctly. req#8.
 @inline _at_mc_kc(hw, ::Type{T}, kc::Int, mr::Int, cap::Int) where {T} =
     min(max(mr, (((((hw.l2 * 3) ÷ 10) ÷ (kc * sizeof(T))) ÷ mr) * mr)), cap)
 @inline _at_cpotf2_mr(hw) = max(1, 64 ÷ _datapath_bytes(hw))
