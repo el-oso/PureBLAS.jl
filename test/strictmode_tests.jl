@@ -199,3 +199,21 @@ end
         @test true
     end
 end
+
+@testitem "StrictMode dogfood: complex Cholesky base (zpotf2)" begin
+    using StrictMode, AllocCheck, JET, LinearAlgebra
+    if !StrictMode.checks_enabled()
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        # Vectorized Hermitian Cholesky base `_cpotf2_lower!` (the zpotrf n≤64 fix): the `cx` pointer-arith
+        # closure + deinterleaved SIMD FMA must stay typestable + alloc-free on the Mode-2 native hot path.
+        for TC in (ComplexF64, ComplexF32)
+            A = randn(TC, 48, 48); A = A * A' + 48I + zeros(TC, 48, 48)
+            @assert_typestable P._cpotf2_lower!(copy(A), 48)
+            @assert_noalloc P._cpotf2_lower!(copy(A), 48)
+            @assert_typestable P.potrf!(copy(A); uplo = 'L')
+        end
+        @test true
+    end
+end
