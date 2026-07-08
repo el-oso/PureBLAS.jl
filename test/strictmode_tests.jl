@@ -216,7 +216,10 @@ end
             A = randn(TC, 48, 48); A = A * A' + 48I + zeros(TC, 48, 48)
             @assert_typestable P._cpotf2_lower!(copy(A), 48)
             @assert_noalloc P._cpotf2_lower!(copy(A), 48)
-            @assert_typestable P.potrf!(copy(A); uplo = 'L')
+            @assert_typestable P.potrf!(copy(A); uplo = 'L')          # n≤base → single base
+            A2 = randn(TC, 128, 128); A2 = A2 * A2' + 128I + zeros(TC, 128, 128)
+            @assert_typestable P.potrf!(copy(A2); uplo = 'L')         # n>base → right-looking blocked
+            @assert_typestable P._cpotrf_rl_lower!(copy(A2), 128, 32)
             # complex getf2 panel (`_cgetf2_simd!`, zgetrf base) + QR panel (`qr_unblocked!`, zgeqrf) —
             # both vectorize via the L1 complex kernels; typestable + alloc-free on the native hot path.
             G = randn(TC, 48, 48) + 48I; ip = zeros(Int, 48); pG = pointer(G); ldG = stride(G, 2)
