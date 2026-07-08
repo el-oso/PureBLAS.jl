@@ -1456,8 +1456,12 @@ end
 # (zero slack). NR=6 → 12 chains (fits 16 ymm: 12 accs + ar/ai + br/bi) hides the FMA latency. Tiny-n
 # keeps NR=4 (NR=6's column remainder wastes more than the extra chains buy). Cutoff is per-box.
 const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typemax(Int))::Int
+# TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
+# methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s ::Val{TB} through an untyped
+# arg is an "unresolved call" for --trim (the zgemm_64_/cgemm_64_ trim failure). Mirrors the real path.
 @inline function _uker_sweep!(::Val{NR}, Cp, ldc, Ap, lda, Bp, ldb, m::Int, n::Int, k::Int,
-        alr, ali, W::Int, mr::Int, tb, ::Val{SA}, ::Val{SB}, ov, a1v, arv) where {NR, SA, SB}
+        alr, ali, W::Int, mr::Int, ::Val{TB}, ::Val{SA}, ::Val{SB},
+        ::Val{OV}, ::Val{A1}, ::Val{AR}) where {NR, TB, SA, SB, OV, A1, AR}
     jr = 0
     while jr < n
         nre = min(NR, n - jr)
@@ -1468,14 +1472,14 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
             if nrv >= _CMR
                 if mre == mr                                         # full-row interior tile → unmasked
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), tb, Val(SA), Val(SB), ov, a1v, arv, Val(true))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true))
                 else
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), tb, Val(SA), Val(SB), ov, a1v, arv, Val(false))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false))
                 end
             else
                 _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                    Val(1), Val(NR), tb, Val(SA), Val(SB), ov, a1v, arv, Val(false))
+                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false))
             end
             ir += nrv >= _CMR ? mr : W
         end
@@ -1483,6 +1487,23 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
     end
     return
 end
+# Trim-safe flag resolution: the juliac/TrimCheck trimmer cannot union-split FOUR simultaneous
+# Union{Val{true},Val{false}} args to _uker_sweep! (> the split limit — the real gemm gets away with 2).
+# So resolve tB/b0/a1/ar to CONCRETE Vals through a chain of 2-way branches; each leaf call to _uker_sweep!
+# has fully-concrete Val args → resolved for --trim. REQUIRED for zgemm_64_/cgemm_64_ (LBT). ­­args passed
+# positionally to keep the chain terse.
+@inline _res_tb!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB::Bool, sa, sb, b0, a1, ar) =
+    tB ? _res_ov!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, Val(true), sa, sb, b0, a1, ar) :
+         _res_ov!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, Val(false), sa, sb, b0, a1, ar)
+@inline _res_ov!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, b0::Bool, a1, ar) =
+    b0 ? _res_a1!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, Val(true), a1, ar) :
+         _res_a1!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, Val(false), a1, ar)
+@inline _res_a1!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, a1::Bool, ar) =
+    a1 ? _res_ar!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, Val(true), ar) :
+         _res_ar!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, Val(false), ar)
+@inline _res_ar!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, a1v, ar::Bool) =
+    ar ? _uker_sweep!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, a1v, Val(true)) :
+         _uker_sweep!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, a1v, Val(false))
 function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k::Int,
         alpha, A, B, beta, C) where {SA, SB}
     Tc = eltype(C); T = real(Tc)
@@ -1499,12 +1520,10 @@ function _gemm_cmplx_unpacked!(::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k
     parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
     GC.@preserve parA parB parC begin
         Ap = Ptr{T}(pointer(A)); Bp = Ptr{T}(pointer(B)); Cp = Ptr{T}(pointer(C))
-        tb = tB ? Val(true) : Val(false); ov = b0 ? Val(true) : Val(false)
-        a1v = a1 ? Val(true) : Val(false); arv = ar ? Val(true) : Val(false)
         if max(m, n, k) >= _CUKER_NR6_MIN         # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
-            _uker_sweep!(Val(_CNR), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, Val(SA), Val(SB), ov, a1v, arv)
+            _res_tb!(Val(_CNR), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         else
-            _uker_sweep!(Val(_CNR_SMALL), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, Val(SA), Val(SB), ov, a1v, arv)
+            _res_tb!(Val(_CNR_SMALL), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         end
     end
     return C
