@@ -97,6 +97,67 @@ function gebd2!(A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::Abstr
     return A
 end
 
+# ── Complex bidiagonalization (LAPACK zgebd2): real d,e — τ complex, β real. Left applies conj(τq); the
+# right reflector operates on the zlacgv-CONJUGATED row (the phase dance that keeps e real). WIP-debug.
+@inline function _larfg!(x::AbstractVector{T}) where {T<:Complex}
+    R = real(T); n = length(x)
+    @inbounds begin
+        α = x[1]
+        ss = zero(R); for i in 2:n; ss += abs2(x[i]); end
+        xnorm = sqrt(ss)
+        # n==1 (empty tail) with imag(α)≠0 still needs the phase rotation (τ≠0, β real) — do NOT early-return
+        # on n==1; only the genuinely-trivial α (xnorm=0 AND real α) is τ=0.
+        (xnorm == 0 && imag(α) == 0) && return real(α), zero(T)
+        β = -copysign(hypot(abs(α), xnorm), real(α))
+        τ = T((β - real(α)) / β, -imag(α) / β)
+        s = one(T) / (α - β)
+        for i in 2:n; x[i] *= s; end
+    end
+    return β, τ
+end
+@inline function _house_left!(C::AbstractMatrix{T}, v::AbstractVector{T}, τ::T) where {T<:Complex}
+    iszero(τ) && return C
+    len, nc = size(C)
+    @inbounds for j in 1:nc
+        w = C[1, j]; for i in 2:len; w += conj(v[i]) * C[i, j]; end
+        w *= τ; C[1, j] -= w
+        for i in 2:len; C[i, j] -= v[i] * w; end
+    end
+    return C
+end
+@inline function _house_right!(C::AbstractMatrix{T}, v::AbstractVector{T}, τ::T) where {T<:Complex}
+    iszero(τ) && return C
+    nr, len = size(C)
+    @inbounds for i in 1:nr
+        w = C[i, 1]; for j in 2:len; w += C[i, j] * v[j]; end
+        w *= τ; C[i, 1] -= w
+        for j in 2:len; C[i, j] -= w * conj(v[j]); end
+    end
+    return C
+end
+function gebd2!(A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R},
+        tauq::AbstractVector{T}, taup::AbstractVector{T}) where {T<:Complex, R<:Real}
+    m, n = size(A)
+    m >= n || throw(ArgumentError("gebd2!: requires m ≥ n (got $m×$n)"))
+    @inbounds for i in 1:n
+        β, τq = _larfg!(view(A, i:m, i))
+        d[i] = β; tauq[i] = τq
+        i < n && _house_left!(view(A, i:m, i+1:n), view(A, i:m, i), conj(τq))
+        A[i, i] = β
+        if i < n
+            xp = view(A, i, i+1:n)
+            for j in eachindex(xp); xp[j] = conj(xp[j]); end
+            β2, τp = _larfg!(xp); e[i] = β2; taup[i] = τp
+            i < m && _house_right!(view(A, i+1:m, i+1:n), xp, τp)
+            for j in eachindex(xp); xp[j] = conj(xp[j]); end
+            A[i, i+1] = β2
+        else
+            taup[i] = zero(T)
+        end
+    end
+    return A
+end
+
 # --- Stage 1b: BLOCKED bidiagonalization (LAPACK dlabrd panel + gemm trailing update), m ≥ n -----
 # Reduce the first nb rows/cols of the (mm×nn) submatrix As to bidiagonal form, accumulating the
 # matrices X (mm×nb) and Y (nn×nb) that drive the rank-2nb trailing update. Faithful dlabrd port;
@@ -625,4 +686,27 @@ function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
     Vt = Matrix{Float64}(undef, mn, n)
     gesvd!(A, U, S, Vt)
     return U, S, Vt
+end
+
+# Complex SVD singular VALUES (zgesvd, want_vectors=false): complex bidiagonalization (gebd2!, real d,e) →
+# the REUSED real-bidiagonal stage 2 (bdsqr! on real d,e). σ(A)=σ(Aᵀ), so m<n transposes to tall. Vectors
+# (the complex back-transform of Q,P onto the real bidiagonal vectors) are the follow-up. ponytail: local
+# d,e,τ scratch (values path only); the SVDWorkspace real/complex split lands with the vectors path.
+function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T<:BlasComplex}
+    m, n = size(A)
+    m >= n || return gesvd_vals!(permutedims(A), S)          # tall via transpose (σ preserved)
+    R = real(T)
+    d = zeros(R, n); e = zeros(R, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
+    gebd2!(A, d, e, tauq, taup)
+    bdsqr!(d, e, nothing, nothing)
+    @inbounds for i in 1:n; S[i] = d[i]; end
+    return S
+end
+function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T<:BlasComplex}
+    m, n = size(A); mn = min(m, n)
+    want_vectors && throw(ArgumentError("complex gesvd! with singular vectors not yet implemented — " *
+        "use want_vectors=false for singular values (the vectors' back-transform is the follow-up)"))
+    S = Vector{real(T)}(undef, mn)
+    gesvd_vals!(copy(A), S)                                   # gebd2! is destructive
+    return (S,)
 end
