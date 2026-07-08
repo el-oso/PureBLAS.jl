@@ -3,20 +3,16 @@
 <text x="450.0" y="28" text-anchor="middle" font-size="18" font-weight="bold">LAPACK: PureBLAS / OpenBLAS (AVX-512, 1 thread, Float64)</text>
 <line x1="62" y1="400.0" x2="768" y2="400.0" stroke="#eee"/>
 <text x="54" y="404.0" text-anchor="end" font-size="11" fill="#666">0.5×</text>
-<line x1="62" y1="350.551619559772" x2="768" y2="350.551619559772" stroke="#eee"/>
-<text x="54" y="354.551619559772" text-anchor="end" font-size="11" fill="#666">0.7×</text>
-<line x1="62" y1="298.1342240014144" x2="768" y2="298.1342240014144" stroke="#eee"/>
-<text x="54" y="302.1342240014144" text-anchor="end" font-size="11" fill="#666">1.0×</text>
-<line x1="62" y1="238.54656493538056" x2="768" y2="238.54656493538056" stroke="#eee"/>
-<text x="54" y="242.54656493538056" text-anchor="end" font-size="11" fill="#666">1.5×</text>
-<line x1="62" y1="196.26844800282873" x2="768" y2="196.26844800282873" stroke="#eee"/>
-<text x="54" y="200.26844800282873" text-anchor="end" font-size="11" fill="#666">2.0×</text>
-<line x1="62" y1="136.6807889367949" x2="768" y2="136.6807889367949" stroke="#eee"/>
-<text x="54" y="140.6807889367949" text-anchor="end" font-size="11" fill="#666">3.0×</text>
-<line x1="62" y1="94.40267200424307" x2="768" y2="94.40267200424307" stroke="#eee"/>
-<text x="54" y="98.40267200424307" text-anchor="end" font-size="11" fill="#666">4.0×</text>
-<line x1="62" y1="61.60921680279559" x2="768" y2="61.60921680279559" stroke="#eee"/>
-<text x="54" y="65.6092168027956" text-anchor="end" font-size="11" fill="#666">5.0×</text>
+<line x1="62" y1="338.20399094844413" x2="768" y2="338.20399094844413" stroke="#eee"/>
+<text x="54" y="342.20399094844413" text-anchor="end" font-size="11" fill="#666">0.7×</text>
+<line x1="62" y1="272.69758160711683" x2="768" y2="272.69758160711683" stroke="#eee"/>
+<text x="54" y="276.69758160711683" text-anchor="end" font-size="11" fill="#666">1.0×</text>
+<line x1="62" y1="198.2304405961651" x2="768" y2="198.2304405961651" stroke="#eee"/>
+<text x="54" y="202.2304405961651" text-anchor="end" font-size="11" fill="#666">1.5×</text>
+<line x1="62" y1="145.39516321423375" x2="768" y2="145.39516321423375" stroke="#eee"/>
+<text x="54" y="149.39516321423375" text-anchor="end" font-size="11" fill="#666">2.0×</text>
+<line x1="62" y1="70.92802220328196" x2="768" y2="70.92802220328196" stroke="#eee"/>
+<text x="54" y="74.92802220328196" text-anchor="end" font-size="11" fill="#666">3.0×</text>
 <line x1="62.0" y1="50" x2="62.0" y2="400" stroke="#f4f4f4"/>
 <text x="62.0" y="418" text-anchor="middle" font-size="11" fill="#444">8</text>
 <line x1="238.5" y1="50" x2="238.5" y2="400" stroke="#f4f4f4"/>
@@ -31,51 +27,51 @@
 <text x="679.75" y="418" text-anchor="middle" font-size="11" fill="#444">1024</text>
 <line x1="768.0" y1="50" x2="768.0" y2="400" stroke="#f4f4f4"/>
 <text x="768.0" y="418" text-anchor="middle" font-size="11" fill="#444">2048</text>
-<line x1="62" y1="298.1342240014144" x2="768" y2="298.1342240014144" stroke="#888"/>
-<line x1="62" y1="304.1334753382755" x2="768" y2="304.1334753382755" stroke="#d33" stroke-width="1.5" stroke-dasharray="6 4"/>
-<text x="66" y="299.1334753382755" font-size="11" fill="#d33">0.96× gate</text>
-<polygon points="62.0,236.7 238.5,238.9 415.0,237.5 503.2,243.3 591.5,252.6 679.8,270.2 768.0,285.5 768.0,286.1 679.8,274.0 591.5,260.8 503.2,249.3 415.0,240.0 238.5,240.4 62.0,243.0" fill="#1f77b4" opacity="0.14" stroke="none"/>
-<polyline points="62.0,237.9 238.5,239.4 415.0,238.0 503.2,246.4 591.5,255.2 679.8,271.3 768.0,285.9" fill="none" stroke="#1f77b4" stroke-width="2"/>
-<circle cx="62.0" cy="237.9" r="3" fill="#1f77b4"/>
-<circle cx="238.5" cy="239.4" r="3" fill="#1f77b4"/>
-<circle cx="415.0" cy="238.0" r="3" fill="#1f77b4"/>
-<circle cx="503.2" cy="246.4" r="3" fill="#1f77b4"/>
-<circle cx="591.5" cy="255.2" r="3" fill="#1f77b4"/>
-<circle cx="679.8" cy="271.3" r="3" fill="#1f77b4"/>
-<circle cx="768.0" cy="285.9" r="3" fill="#1f77b4"/>
+<line x1="62" y1="272.69758160711683" x2="768" y2="272.69758160711683" stroke="#888"/>
+<line x1="62" y1="280.1948906517146" x2="768" y2="280.1948906517146" stroke="#d33" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="66" y="275.1948906517146" font-size="11" fill="#d33">0.96× gate</text>
+<polygon points="62.0,211.8 238.5,208.2 415.0,193.5 503.2,204.6 591.5,224.2 679.8,237.2 768.0,251.0 768.0,251.2 679.8,238.2 591.5,233.8 503.2,217.8 415.0,196.8 238.5,213.6 62.0,217.2" fill="#1f77b4" opacity="0.14" stroke="none"/>
+<polyline points="62.0,214.3 238.5,210.6 415.0,195.9 503.2,208.0 591.5,227.6 679.8,237.6 768.0,251.2" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<circle cx="62.0" cy="214.3" r="3" fill="#1f77b4"/>
+<circle cx="238.5" cy="210.6" r="3" fill="#1f77b4"/>
+<circle cx="415.0" cy="195.9" r="3" fill="#1f77b4"/>
+<circle cx="503.2" cy="208.0" r="3" fill="#1f77b4"/>
+<circle cx="591.5" cy="227.6" r="3" fill="#1f77b4"/>
+<circle cx="679.8" cy="237.6" r="3" fill="#1f77b4"/>
+<circle cx="768.0" cy="251.2" r="3" fill="#1f77b4"/>
 <line x1="782" y1="56" x2="802" y2="56" stroke="#1f77b4" stroke-width="3"/>
 <text x="806" y="60" font-size="12">potrf</text>
-<polygon points="62.0,68.9 238.5,215.2 415.0,243.5 503.2,257.9 591.5,229.4 679.8,256.4 768.0,275.4 768.0,276.5 679.8,256.7 591.5,230.4 503.2,260.3 415.0,245.0 238.5,242.3 62.0,75.7" fill="#d62728" opacity="0.14" stroke="none"/>
-<polyline points="62.0,70.5 238.5,241.5 415.0,244.1 503.2,259.0 591.5,230.1 679.8,256.6 768.0,275.8" fill="none" stroke="#d62728" stroke-width="2"/>
-<circle cx="62.0" cy="70.5" r="3" fill="#d62728"/>
-<circle cx="238.5" cy="241.5" r="3" fill="#d62728"/>
-<circle cx="415.0" cy="244.1" r="3" fill="#d62728"/>
-<circle cx="503.2" cy="259.0" r="3" fill="#d62728"/>
-<circle cx="591.5" cy="230.1" r="3" fill="#d62728"/>
-<circle cx="679.8" cy="256.6" r="3" fill="#d62728"/>
-<circle cx="768.0" cy="275.8" r="3" fill="#d62728"/>
+<polygon points="62.0,73.4 238.5,200.0 415.0,205.4 503.2,219.8 591.5,186.9 679.8,219.7 768.0,244.6 768.0,245.9 679.8,221.0 591.5,187.2 503.2,224.0 415.0,207.4 238.5,207.8 62.0,89.8" fill="#d62728" opacity="0.14" stroke="none"/>
+<polyline points="62.0,75.7 238.5,206.2 415.0,206.8 503.2,221.4 591.5,187.0 679.8,220.8 768.0,245.2" fill="none" stroke="#d62728" stroke-width="2"/>
+<circle cx="62.0" cy="75.7" r="3" fill="#d62728"/>
+<circle cx="238.5" cy="206.2" r="3" fill="#d62728"/>
+<circle cx="415.0" cy="206.8" r="3" fill="#d62728"/>
+<circle cx="503.2" cy="221.4" r="3" fill="#d62728"/>
+<circle cx="591.5" cy="187.0" r="3" fill="#d62728"/>
+<circle cx="679.8" cy="220.8" r="3" fill="#d62728"/>
+<circle cx="768.0" cy="245.2" r="3" fill="#d62728"/>
 <line x1="782" y1="74" x2="802" y2="74" stroke="#d62728" stroke-width="3"/>
 <text x="806" y="78" font-size="12">geqrf</text>
-<polygon points="62.0,208.4 238.5,222.4 415.0,257.3 503.2,275.8 591.5,278.5 679.8,280.2 768.0,293.6 768.0,293.8 679.8,281.0 591.5,279.7 503.2,285.2 415.0,262.3 238.5,226.5 62.0,219.9" fill="#2ca02c" opacity="0.14" stroke="none"/>
-<polyline points="62.0,211.6 238.5,224.5 415.0,261.8 503.2,281.6 591.5,279.3 679.8,280.4 768.0,293.7" fill="none" stroke="#2ca02c" stroke-width="2"/>
-<circle cx="62.0" cy="211.6" r="3" fill="#2ca02c"/>
-<circle cx="238.5" cy="224.5" r="3" fill="#2ca02c"/>
-<circle cx="415.0" cy="261.8" r="3" fill="#2ca02c"/>
-<circle cx="503.2" cy="281.6" r="3" fill="#2ca02c"/>
-<circle cx="591.5" cy="279.3" r="3" fill="#2ca02c"/>
-<circle cx="679.8" cy="280.4" r="3" fill="#2ca02c"/>
-<circle cx="768.0" cy="293.7" r="3" fill="#2ca02c"/>
+<polygon points="62.0,157.0 238.5,177.7 415.0,223.2 503.2,238.0 591.5,247.9 679.8,250.2 768.0,267.1 768.0,267.6 679.8,251.4 591.5,251.5 503.2,250.8 415.0,227.1 238.5,179.7 62.0,162.9" fill="#2ca02c" opacity="0.14" stroke="none"/>
+<polyline points="62.0,157.5 238.5,178.8 415.0,226.1 503.2,242.2 591.5,249.6 679.8,250.9 768.0,267.1" fill="none" stroke="#2ca02c" stroke-width="2"/>
+<circle cx="62.0" cy="157.5" r="3" fill="#2ca02c"/>
+<circle cx="238.5" cy="178.8" r="3" fill="#2ca02c"/>
+<circle cx="415.0" cy="226.1" r="3" fill="#2ca02c"/>
+<circle cx="503.2" cy="242.2" r="3" fill="#2ca02c"/>
+<circle cx="591.5" cy="249.6" r="3" fill="#2ca02c"/>
+<circle cx="679.8" cy="250.9" r="3" fill="#2ca02c"/>
+<circle cx="768.0" cy="267.1" r="3" fill="#2ca02c"/>
 <line x1="782" y1="92" x2="802" y2="92" stroke="#2ca02c" stroke-width="3"/>
 <text x="806" y="96" font-size="12">getrf</text>
-<polygon points="62.0,226.4 238.5,250.9 415.0,291.8 503.2,257.7 591.5,253.1 679.8,263.9 768.0,278.8 768.0,283.6 679.8,265.8 591.5,254.1 503.2,258.6 415.0,292.2 238.5,259.2 62.0,227.8" fill="#9467bd" opacity="0.14" stroke="none"/>
-<polyline points="62.0,227.1 238.5,259.0 415.0,292.0 503.2,258.4 591.5,253.2 679.8,265.0 768.0,281.2" fill="none" stroke="#9467bd" stroke-width="2"/>
-<circle cx="62.0" cy="227.1" r="3" fill="#9467bd"/>
-<circle cx="238.5" cy="259.0" r="3" fill="#9467bd"/>
-<circle cx="415.0" cy="292.0" r="3" fill="#9467bd"/>
-<circle cx="503.2" cy="258.4" r="3" fill="#9467bd"/>
-<circle cx="591.5" cy="253.2" r="3" fill="#9467bd"/>
-<circle cx="679.8" cy="265.0" r="3" fill="#9467bd"/>
-<circle cx="768.0" cy="281.2" r="3" fill="#9467bd"/>
+<polygon points="62.0,183.8 238.5,213.9 415.0,266.3 503.2,222.8 591.5,217.9 679.8,230.3 768.0,250.2 768.0,250.2 679.8,232.3 591.5,218.8 503.2,223.8 415.0,266.7 238.5,225.7 62.0,185.2" fill="#9467bd" opacity="0.14" stroke="none"/>
+<polyline points="62.0,184.7 238.5,225.6 415.0,266.6 503.2,223.5 591.5,218.3 679.8,232.1 768.0,250.2" fill="none" stroke="#9467bd" stroke-width="2"/>
+<circle cx="62.0" cy="184.7" r="3" fill="#9467bd"/>
+<circle cx="238.5" cy="225.6" r="3" fill="#9467bd"/>
+<circle cx="415.0" cy="266.6" r="3" fill="#9467bd"/>
+<circle cx="503.2" cy="223.5" r="3" fill="#9467bd"/>
+<circle cx="591.5" cy="218.3" r="3" fill="#9467bd"/>
+<circle cx="679.8" cy="232.1" r="3" fill="#9467bd"/>
+<circle cx="768.0" cy="250.2" r="3" fill="#9467bd"/>
 <line x1="782" y1="110" x2="802" y2="110" stroke="#9467bd" stroke-width="3"/>
 <text x="806" y="114" font-size="12">gesvd</text>
 <text x="415.0" y="450" text-anchor="middle" font-size="11" fill="#666">matrix size n (log) · y = median ratio (log) · dashed = the 0.96× gate</text>
