@@ -132,6 +132,10 @@ end
         @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
         @assert_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
         @assert_noalloc P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
+        # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
+        Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48; Atr[d, d] = 1 + abs(Atr[d, d]); end
+        @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
+        @assert_noalloc P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48)) static = false
         @test true
     end
 end
