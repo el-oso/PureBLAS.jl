@@ -395,7 +395,7 @@ function _gemm_blocked!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
     W = _vwidth(T); mr = _MR * W; nr = _NR
     # Cap block sizes by the actual problem so small GEMMs don't allocate/pack huge panels.
     kc = min(_KC, k)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)
