@@ -528,7 +528,7 @@ end
 function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {T<:BlasReal}
     m, k = size(B); W = _vwidth(T); mr = _MR * W; nr = _NR
     upM = (up != tr)
-    kc = min(_TRMM_RKC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    kc = min(_TRMM_RKC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     _, Bp = _gemm_scratch(T, 0, cld(k, nr) * nr * kc)
     # Pre-pack ALL of B (the gemm A-operand) up front, before any C write — B IS C here, so packing it
     # once both captures the input (no separate copy pass; ~2% of runtime at 1024) and feeds the whole
@@ -781,7 +781,7 @@ end
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T<:BlasReal, MRV}
     m = size(B, 1); n = size(B, 2); W = _vwidth(T); mr = MRV * W; nr = _NR
     packed_upper = (up != tr)
-    kc = min(_KC, m); mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    kc = min(_KC, m); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     nblk = cld(m, kc); bpf_blk = cld(nc, nr) * nr * kc          # one packed pc-block slot (padded to kc)
     Ap, _ = _gemm_scratch(T, cld(mc, mr) * mr * kc, 1)
@@ -1529,7 +1529,7 @@ end
 function _trgemm_packed!(::Val{MR}, ::Val{NR}, up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
         ::Val{OV} = Val(false)) where {T<:BlasReal, MR, NR, OV}
     n = size(C, 1); W = _vwidth(T); mr = MR * W; nr = NR
-    kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)
@@ -1980,7 +1980,7 @@ function _trgemm_packed2!(up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
         X2, tX2::Bool, Y2, tY2::Bool, C, k::Int, ::Val{MRV} = Val(_MR),
         ::Val{NRV} = Val(_NR), ::Val{OV} = Val(false)) where {T<:BlasReal, MRV, NRV, OV}
     n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = NRV
-    kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap1, Bp1, Ap2, Bp2 = _syr2k_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)
@@ -2047,7 +2047,7 @@ end
 # layouts coincide; α applied at the store (shared buffer ⇒ can't fold α into the pack).
 function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T<:BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
-    kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
     pk = _syr2k_scratch(T, plen, plen); packA = pk[1]
@@ -2098,7 +2098,7 @@ end
 # swapped roles (A·Bᵀ: packA-rows·packB-cols; B·Aᵀ: packB-rows·packA-cols). 2 packs, not 4.
 function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::Int) where {T<:BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
-    kc = min(_KC, k); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
     pk = _syr2k_scratch(T, plen, plen); packA = pk[1]; packB = pk[2]
@@ -2579,7 +2579,7 @@ end
 # panels directly (no n² materialize). M=n, N=m, K=n; classify each A-panel: stored / mirror / straddle.
 function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T<:BlasReal}
     n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
+    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     _scale_C!(C, n, m, β); ldc = stride(C, 2); sz = sizeof(T)
@@ -2630,7 +2630,7 @@ end
 # M=size(C,1), N=K=n; classify each A_sym panel (pc..K, jc..N): stored / mirror / straddle.
 function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T<:BlasReal}
     M = size(C, 1); n = size(A, 1); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = min(max(mr, (_MC ÷ mr) * mr), cld(M, mr) * mr)
+    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(M, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     _scale_C!(C, M, n, β); ldc = stride(C, 2); sz = sizeof(T)

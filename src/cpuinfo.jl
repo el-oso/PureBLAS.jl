@@ -115,6 +115,12 @@ end
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-
 # independent overhead floor + per-lane slope): base 32+4W (48/64), nbmax 64+16W (128/192).
+# A-row block for the ACTUAL local kc (joint residency mc·kc·sizeof ≤ 30%·L2). The standalone `_MC` bakes
+# kc=canonical, so callers with a small local kc (e.g. potrf's trailing gemm at kc=nb) get a stale-small mc;
+# this recomputes from the local kc. Returns the mc capped at `cap` (=cld(dim,mr)*mr), rounded to the local
+# mr — so real (mr=_MR·W) and complex (mr=_CMR·W) sites each round correctly. req#8.
+@inline _at_mc_kc(hw, ::Type{T}, kc::Int, mr::Int, cap::Int) where {T} =
+    min(max(mr, (((((hw.l2 * 3) ÷ 10) ÷ (kc * sizeof(T))) ÷ mr) * mr)), cap)
 @inline _at_cpotf2_mr(hw) = max(1, 64 ÷ _datapath_bytes(hw))
 @inline _at_cpotrf_base(hw) = 32 + 4 * _lanes(hw, Float64)
 @inline _at_cpotrf_nbmax(hw) = 64 + 16 * _lanes(hw, Float64)
