@@ -10,7 +10,11 @@
 # OWN precompile. The guard skips the whole block under full-mode environments (e.g. the test project)
 # where @strict demands the AllocCheck/JET backend not loaded during PureBLAS's own precompile — there
 # the test suite's strictmode dogfood runs the interface + deep static proof at test runtime with the
-# backend present. (Trim-safety of the C-ABI entries is covered exhaustively by TrimCheck.@validate.)
+# backend present. TRIM-COMPATIBILITY is a strict-contract guarantee too (contracts.jl): the complex-gemm
+# kernel is asserted `@assert_trim_compatible` HERE (fast/dev → heuristic scan, cheap early net) and in the
+# full-mode dogfood (test → juliac's authoritative verify_typeinf_trim). The heuristic misses reachability-
+# limit union-splits the authoritative pass catches — the known fast/full discrepancy (report to StrictMode).
+# trim_tests.jl keeps the exhaustive ccallable-rooted TrimCheck.@validate belt (strict verify isn't perfect).
 # Values live in a `let` — only their types matter, so `ones` (no Random dep).
 # potrf! overwrites its argument and throws PosDefException if re-factored — but @strict calls its
 # target repeatedly. This probe re-seeds the SPD source (in-place copyto!, no allocation) before each
@@ -122,5 +126,10 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_geqrf_probe(Aw, Apd, tau)
             _strict_gesvd_probe(Aw, Apd, Usv, Ssv, Vtsv)
         end
+        # Trim-compatibility guarantee (contracts.jl): the complex unpacked gemm kernel is the trim-critical
+        # path (its runtime bool→Val flags were the union-split that regressed zgemm_64_/cgemm_64_). Fast/dev
+        # here → heuristic; the full-mode dogfood roots the same call under juliac's authoritative verifier.
+        @assert_trim_compatible _gemm_cmplx_unpacked!(Val(1), Val(1), false, m, m, m,
+            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3)
     end
 end
