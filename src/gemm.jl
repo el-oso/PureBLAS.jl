@@ -25,7 +25,9 @@ const _W64 = _vwidth(Float64)
 # ½ L1 (the "AVX-512-tile-on-AVX2" residency miss). Real-path (Float64/_NR); complex gemm uses `_CKC`.
 const _MR = @load_preference("gemm_mr", _at_gemm_mr(_HW))::Int
 const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
-const _MC = @load_preference("gemm_mc", _at_gemm_mc(_HW))::Int   # A row block ≤ 30%·L2
+# mc is derived per-CALLER from the LOCAL kc + element type via `_at_mc_kc` (joint residency
+# mc·kc·sizeof ≤ 30%·L2), not a single const — a standalone `_MC` bakes the canonical kc and
+# under-blocks small-kc callers (potrf's trailing gemm) / mis-sizes complex (16 B/elt). req#8.
 const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
 
@@ -1130,7 +1132,7 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, ::Val{AR}
     end
     W = _vwidth(T); mr = _CMR * W; nr = NR
     kc = min(_CKC, k)
-    mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
+    mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     a = convert(Tc, alpha); alr = real(a); ali = imag(a)
