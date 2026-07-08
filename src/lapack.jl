@@ -58,6 +58,13 @@ function _potf2_upper!(A, n::Int)
     return A
 end
 
+# Base-update row-unroll (MR). MR=2 (two W-blocks/step, 1 L[j,k] load / 2 blocks → more ILP) LIFTS the
+# memory-bound base on DOUBLE-PUMPED AVX-512 (Zen4) + AVX2 (Zen3) — n=48 0.97→1.18, n=64 1.11→1.17 — but
+# REGRESSES native-512 (Zen5) where MR=1 already saturates. The discriminator is L1D size: 32K on the
+# double-pump/AVX2 boxes, 48K on Zen5 (and Intel Tiger/Ice Lake+) native-512 — so key MR on `_L1_BYTES`
+# (Zen4 fam 25 / Zen5 fam 26 also differ, but L1D is the causal-adjacent cache signal + already a const).
+const _CPOTF2_MR = @load_preference("cpotf2_mr", _L1_BYTES < 49152 ? 2 : 1)::Int
+
 # Vectorized complex Hermitian Cholesky base (lower, A = L·Lᴴ). Complex analogue of `_chol_base_f64!`:
 # left-looking, SIMD over i (W complex per step, deinterleaved re/im FMA chains), scalar tail. Column j:
 # A[i,j] -= Σ_{k<j} L[i,k]·conj(L[j,k]) (i=j..n), then real diagonal d=A[j,j], scale below-diag by 1/√d.
@@ -70,6 +77,19 @@ function _cpotf2_lower!(A::AbstractMatrix{Tc}, n::Int) where {Tc <: BlasComplex}
         cx(i, k) = p + ((k - 1) * ld + (i - 1)) * 2 * sz                 # byte Ptr to the re-part of A[i,k]
         @inbounds for j in 1:n
             i = j
+            if _CPOTF2_MR >= 2                                           # MR=2 (double-pump/AVX2): 2 W-blocks / step
+                while i + 2W - 1 <= n
+                    b0 = cx(i, j); b1 = cx(i + W, j)
+                    (ar0, ai0) = _deint_cmplx(vload(V2, b0)); (ar1, ai1) = _deint_cmplx(vload(V2, b1))
+                    for k in 1:j-1
+                        l = cx(j, k); sr = V(unsafe_load(l)); si = V(unsafe_load(l + sz))   # L[j,k], 1 load / 2 blocks
+                        (vr0, vi0) = _deint_cmplx(vload(V2, cx(i, k))); (vr1, vi1) = _deint_cmplx(vload(V2, cx(i + W, k)))
+                        ar0 = muladd(vr0, -sr, ar0); ar0 = muladd(vi0, -si, ar0); ai0 = muladd(vi0, -sr, ai0); ai0 = muladd(vr0, si, ai0)
+                        ar1 = muladd(vr1, -sr, ar1); ar1 = muladd(vi1, -si, ar1); ai1 = muladd(vi1, -sr, ai1); ai1 = muladd(vr1, si, ai1)
+                    end
+                    vstore(_intlv_cmplx(ar0, ai0), b0); vstore(_intlv_cmplx(ar1, ai1), b1); i += 2W
+                end
+            end
             while i + W - 1 <= n                                         # SIMD: W complex rows / step
                 base = cx(i, j); (ar, ai) = _deint_cmplx(vload(V2, base))
                 for k in 1:j-1
