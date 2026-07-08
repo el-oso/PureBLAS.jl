@@ -68,32 +68,42 @@ end
 # CONJ(τ) (the zgeqr2 convention — the τ-vs-conj(τ) placement is the bug magnet). Scalar; the blocked
 # driver rides complex gemm ('C') for the O(n³) trailing update. Matches LinearAlgebra.qr reconstruction.
 function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:BlasComplex}
-    m, n = size(A); R = real(T)
-    @inbounds for col in 1:min(m, n)
-        row = col
-        xnorm = zero(R)                                          # ‖tail‖ (rows row+1:m)
-        for i in (row + 1):m; xnorm = hypot(xnorm, abs(A[i, col])); end
-        alpha = A[row, col]
-        if xnorm == 0 && imag(alpha) == 0
-            tau[col] = zero(T); continue                         # trivial reflector
-        end
-        beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))  # β = −sign(re α)·‖[α;x]‖ (real)
-        tau[col] = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
-        sc = one(T) / (alpha - beta)                             # v_essential = tail / (α − β)
-        for i in (row + 1):m; A[i, col] *= sc; end
-        A[row, col] = complex(beta, zero(R))                     # R diagonal = β
-        tc = conj(tau[col])
-        for j in (col + 1):n                                     # C := (I − conj(τ)·v·vᴴ)·C
-            w = A[row, j]                                        # w = vᴴ·C[:,j] (v[row]=1)
-            for i in (row + 1):m; w += conj(A[i, col]) * A[i, j]; end
-            twc = tc * w
-            A[row, j] -= twc
-            for i in (row + 1):m; A[i, j] -= twc * A[i, col]; end
+    m, n = size(A); R = real(T); ld = stride(A, 2); csz = sizeof(T)
+    GC.@preserve A begin
+        p = pointer(A)                                          # Ptr{Complex{R}}; SIMD helpers take complex Ptr
+        @inbounds for col in 1:min(m, n)
+            row = col
+            xnorm = zero(R)                                      # ‖tail‖ (rows row+1:m)
+            for i in (row + 1):m; xnorm = hypot(xnorm, abs(A[i, col])); end
+            alpha = A[row, col]
+            if xnorm == 0 && imag(alpha) == 0
+                tau[col] = zero(T); continue                     # trivial reflector
+            end
+            beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))  # β = −sign(re α)·‖[α;x]‖ (real)
+            tau[col] = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
+            sc = one(T) / (alpha - beta)                         # v_essential = tail / (α − β)
+            mt = m - row                                        # tail length (rows row+1:m)
+            vp = p + ((col - 1) * ld + row) * csz               # &A[row+1, col]
+            mt > 0 && _scal_cmplx_simd!(mt, real(sc), imag(sc), vp)   # SIMD: scale essential v
+            A[row, col] = complex(beta, zero(R))                 # R diagonal = β
+            tc = conj(tau[col])
+            for j in (col + 1):n                                 # C := (I − conj(τ)·v·vᴴ)·C
+                cjp = p + ((j - 1) * ld + row) * csz            # &A[row+1, j]
+                w = A[row, j]                                    # w = vᴴ·C[:,j] (v[row]=1)
+                mt > 0 && (w += _dot_cmplx_simd(mt, vp, cjp, R, Val(true)))   # SIMD dotc: Σ conj(v)·C[:,j]
+                twc = tc * w
+                A[row, j] -= twc
+                mt > 0 && _axpy_cmplx_simd!(mt, -real(twc), -imag(twc), vp, cjp)  # SIMD: C[:,j] -= twc·v
+            end
         end
     end
     return true
 end
 const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune if needed
+# Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
+# call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
+# Keyed via Preferences per box (Zen4 sweet spot measured).
+const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
@@ -108,7 +118,7 @@ end
 # Complex blocked QR (zgeqrf): per nb-panel qr_unblocked! (complex zlarfg), build V + the LAPACK compact-WY
 # T (zlarft: T[c,c]=τ, T[1:c-1,c] = T[1:c-1,1:c-1]·(−τ·G[1:c-1,c]), G=VᴴV), then apply the block Qᴴ to the
 # trailing: C −= V·(Tᴴ·(Vᴴ·C)) — the two big products via complex gemm ('C' = compile-time conj signs).
-function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB) where {T<:BlasComplex}
+function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C) where {T<:BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
