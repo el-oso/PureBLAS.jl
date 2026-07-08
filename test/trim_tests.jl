@@ -49,6 +49,12 @@
             Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Clong, Clong),
         PureBLAS.zher2k_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64},
             Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Float64}, Ptr{ComplexF64}, Ptr{Int64}, Clong, Clong),
+        # Complex trsm (all sides/trans): side='R' transA='C' now has a direct SIMD base `_trsm_cmplx_dRC!`
+        # (the zpotrf-lower recursion path). Validate the ccallable roots the whole trsm dispatch tree.
+        PureBLAS.ztrsm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64},
+            Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Clong, Clong, Clong, Clong),
+        PureBLAS.ctrsm_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64},
+            Ptr{ComplexF32}, Ptr{ComplexF32}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{Int64}, Clong, Clong, Clong, Clong),
         # LAPACK gesvd: in-place gesvd!(A,U,S,Vᵀ) into caller PtrMatrix buffers + full jobu/jobvt/'O' coverage.
         # Exercises gebrd + bdsqr + bdsdc divide-and-conquer + the compact-WY back-transform, all trim-clean.
         PureBLAS.dgesvd_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64},

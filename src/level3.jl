@@ -1145,9 +1145,32 @@ function _trsm_cmplx_dRN!(up::Bool, unit::Bool, k::Int, A, B)
     end
     return B
 end
+# Direct complex side-R column-substitution base for transA='C' (no trtri): X·Aᴴ = B in place. Conjugate-
+# transpose sibling of _trsm_cmplx_dRN!: coef(i,j)=conj(A[j,i]) (row j of A, conjugated), diagonal
+# 1/conj(A[j,j]); order is up≠tr with tr=true ⇒ up ? descending : ascending (mirror of _trsm_right_base!).
+# Fixes the ztrsmR-C collapse (0.53–0.88 at all n) that the trtri+K-TRIM base caused — the exact path
+# zpotrf lower recurses through (side='R', transA='C'), so it was dragging zpotrf n≥128.
+function _trsm_cmplx_dRC!(up::Bool, unit::Bool, k::Int, A, B)
+    m = size(B, 1); T = eltype(B); csz = sizeof(T); ldb = stride(B, 2); lda = stride(A, 2)
+    GC.@preserve A B begin
+        pB = pointer(B); pA = Ptr{T}(pointer(A))
+        @inbounds for j in (up ? (k:-1:1) : (1:k))
+            pj = pB + (j - 1) * ldb * csz
+            for i in (up ? ((j + 1):k) : (1:(j - 1)))
+                c = conj(unsafe_load(pA, (i - 1) * lda + j))                                # conj(A[j,i])
+                (real(c) == 0 && imag(c) == 0) ||
+                    _axpy_cmplx_simd!(m, -real(c), -imag(c), pB + (i - 1) * ldb * csz, pj)   # X[:,j] -= conj(A[j,i])·X[:,i]
+            end
+            unit || (r = _crecip(conj(unsafe_load(pA, (j - 1) * lda + j))); _scal_cmplx_simd!(m, real(r), imag(r), pj))
+        end
+    end
+    return B
+end
 function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
-    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # direct column-substitution (no trtri)
+    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # transA='N' direct column-substitution
         return _trsm_cmplx_dRN!(up, unit, k, A, B)
+    elseif tr && cj && k <= _CTRSM_DIRECT_MAX && _strided1(B)        # transA='C' direct (no trtri)
+        return _trsm_cmplx_dRC!(up, unit, k, A, B)
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
@@ -1253,7 +1276,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # three µarchs) uniformly ≥ the invert+K-TRIM base for side-R — the trtri never amortizes here
         # (its O(k³/6) invert is 40–66% exposed even at k=256, where two 128-trtri bases capped 0.95 on AVX2
         # and direct-recurse beats the wide-B trtri path on AVX-512/Zen5 too). Trans keeps the ≤128 base.
-        recbase = !tr ? _CTRSM_REC_L : _TRMM_BASE
+        recbase = (!tr || cj) ? _CTRSM_REC_L : _TRMM_BASE   # transA='N'/'C' → direct-base recursion; 'T' → trtri base
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
                                   _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
