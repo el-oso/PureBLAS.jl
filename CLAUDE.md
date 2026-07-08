@@ -60,6 +60,28 @@ Both modes share ONE set of low-level kernels. Source map:
    feature bits** (`cpuvendor`/`cpufeature`), as `_INTEL_AVX2` does for the `_CHOL_BASE_SPLIT` latency
    split. Detection stays at build time (const-folds away → no runtime `CpuId` ccall, per req. 4).
 
+8. **DERIVE tuning from detected hardware — do NOT hardcode per-µarch literals. (Julia's advantage; USE IT.)**
+   Every machine-dependent tuning parameter — block sizes (`mc`/`nc`/`kc`), base-case cutoffs, panel
+   widths, unroll factors (`MR`), packing/algorithm-switch thresholds — MUST have a **default that is a
+   FORMULA over the detected consts** (`_L1_BYTES`/`_L2_BYTES`/`_L3_BYTES`, `_vwidth`/`_SIMD_BYTES`,
+   `cpuvendor`/`cpufeature`/family + `sizeof(elt)`), keyed on a **physical criterion** — cache RESIDENCY
+   for block sizes (e.g. `kc·nr·sizeof(elt) ≲ ½·L1`), datapath LATENCY for unroll, ISA for width
+   granularity. **Cache size and ISA come hand-in-hand — take BOTH into account** (a block size depends on
+   how much fits in cache AND the vector width). A bare literal like `_vwidth==4 ? 48 : 64`, `const _KC =
+   256`, or any hand-fit magic block size is a **VIOLATION** — the tell is a number you can't trace to a
+   detected const via a residency/latency formula. **Why this is mandatory, not optional:** Julia JITs to
+   the host at load time, so PureBLAS can *compute* the right sizes for the ACTUAL machine — including CPUs
+   never benchmarked (a new laptop, a cloud box). Static C/Rust BLAS (OpenBLAS/BLIS) can't — they ship
+   hand-tuned per-µarch tables baked at their compile time; hardcoded literals here throw away Julia's one
+   real structural advantage and silently mis-size on any box off the test fleet. Rules: (a) Preferences
+   override stays (pinning/calibration/correcting a heuristic), but the **default must autotune**. (b) A
+   derived formula must **reproduce the measured-optimal values on the known fleet** (Zen4/Zen3/Zen5) before
+   it's trusted to extrapolate — derive → validate on the fleet → ship. (c) Every tuning const cites which
+   detected consts it derives from and the residency/latency criterion. (d) When tempted to write a magic
+   block-size number: STOP and derive it. Applies to **all of BLAS-1/2/3 + LAPACK**, not just new code —
+   existing literals (`_KC`, `_MC`, `_NC`, `_CPOTRF_BASE`, `_CPOTRF_NBMAX`, the `_vwidth==4 ? …` cuts) are
+   tech debt to migrate to derived formulas.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
