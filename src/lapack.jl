@@ -11,7 +11,7 @@ const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
-const _CPOTRF_BASE = @load_preference("cpotrf_base", _vwidth(Float64) == 4 ? 48 : 64)::Int
+const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int   # req#8: derived 32+4·W (48/64)
 # n≤base ⇒ ONE vectorized `_cpotf2_lower!` call; n>base ⇒ right-looking blocked (see _cpotrf_rl_lower!).
 # Base sweet spot is where the unblocked SIMD base still gates: AVX-512 (W=8) rides it to 64 (n=64 gates
 # 1.09), but on AVX2 (W=4) the narrower datapath makes the n=64 base memory-bound (0.76), so cap it at 32
@@ -63,7 +63,7 @@ end
 # REGRESSES native-512 (Zen5) where MR=1 already saturates. The discriminator is L1D size: 32K on the
 # double-pump/AVX2 boxes, 48K on Zen5 (and Intel Tiger/Ice Lake+) native-512 — so key MR on `_L1_BYTES`
 # (Zen4 fam 25 / Zen5 fam 26 also differ, but L1D is the causal-adjacent cache signal + already a const).
-const _CPOTF2_MR = @load_preference("cpotf2_mr", _L1_BYTES < 49152 ? 2 : 1)::Int
+const _CPOTF2_MR = @load_preference("cpotf2_mr", _at_cpotf2_mr(_HW))::Int   # req#8: derived 64÷datapath_bytes (2 double-pump/AVX2, 1 native-512)
 
 # Vectorized complex Hermitian Cholesky base (lower, A = L·Lᴴ). Complex analogue of `_chol_base_f64!`:
 # left-looking, SIMD over i (W complex per step, deinterleaved re/im FMA chains), scalar tail. Column j:
@@ -832,7 +832,7 @@ end
 # a big base cutoff added a discrete base→blocked step; nb=n/4 removes both. Per panel: factor the diagonal
 # jb-block RECURSIVELY (jb>base ⇒ blocks again; jb≤base ⇒ the vectorized unblocked base), trsm side-R 'C'
 # panel solve, herk 'N' rank-jb trailing downdate — all gating L3. BlasComplex only (Dual/upper → generic).
-const _CPOTRF_NBMAX = @load_preference("cpotrf_nbmax", _vwidth(Float64) == 4 ? 128 : 192)::Int
+const _CPOTRF_NBMAX = @load_preference("cpotrf_nbmax", _at_cpotrf_nbmax(_HW))::Int   # req#8: derived 64+16·W (128/192)
 @inline _chol_nb(n::Int) = clamp((n >> 2) & ~15, 32, _CPOTRF_NBMAX)     # ~n/4, rounded to a multiple of 16
 function _cpotrf_lower!(A, n::Int)
     n <= _CPOTRF_BASE && return _potf2b_lower!(A, n)                    # unblocked vectorized base
