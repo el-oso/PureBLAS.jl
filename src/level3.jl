@@ -1592,7 +1592,7 @@ end
 function _trgemm_cmplx_packed!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, up::Bool,
         alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, NR, A1, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = NR
-    kc = min(_KC, k)
+    kc = min(_CKC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
@@ -1660,7 +1660,7 @@ end
 function _trgemm_cmplx_packed_u!(::Val{SA}, ::Val{SB}, ::Val{A1}, up::Bool,
         alr::T, ali::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, A1, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W          # unified requires nr == mr (CMR=1)
-    kc = min(_KC, k)
+    kc = min(_CKC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
@@ -1726,7 +1726,7 @@ end
 function _trgemm_cmplx_packed2_u!(::Val{SA}, ::Val{SB}, up::Bool, alr::T, ali::T,
         X, tXp::Bool, Y, tYp::Bool, C, k::Int) where {SA, SB, T}
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W
-    kc = min(_KC, k)
+    kc = min(_CKC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     plen = cld(n, mr) * mr * kc
@@ -2502,7 +2502,7 @@ end
 # A-traffic. α at the microkernel store (A1=false); β·C up front. Reuses _microkernel_cmplx!.
 function _hemm_packed_L!(up::Bool, α, β, A, B, C)
     Tc = eltype(C); T = real(Tc); n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _CMR * W; nr = _CNR
-    kc = min(_KC, n)
+    kc = min(_CKC, n)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)

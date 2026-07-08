@@ -19,12 +19,15 @@
 #   W64=2  NEON,     32 regs: 2×8            (placeholder; tune on M5 later)
 # ponytail: per-width defaults below; override via Preferences "gemm_mr"/"gemm_nr" to sweep.
 const _W64 = _vwidth(Float64)
-const _MR = @load_preference("gemm_mr", _W64 == 4 ? 3 : 2)::Int
-const _NR = @load_preference("gemm_nr", _W64 == 8 ? 8 : _W64 == 4 ? 4 : 8)::Int
-const _MC = 144   # A row block (L2); rounded down to a multiple of mr at runtime
-const _NC = 2040  # B col block (L3); rounded down to a multiple of nr
-const _KC = 256   # contraction block — sized so the B micropanel (kc·nr·8) ≈ ½ L1, per BLIS
-#                   (kc=512 filled all of L1 and starved A streaming → slower large-n)
+# req#8: derived from detected hardware (cpuinfo.jl `_at_gemm_*`). Reproduce the fleet's tuned literals —
+# MR/NR: galen 3/4, Zen4/Zen5 2/8 (behavior-preserving, was `_W64==4 ? …`). KC/MC/NC: Zen4 256/144/2040
+# (bit-identical), galen 512/72/2044, Zen5 384/96/1360 — the KC=512 raises galen's B-micropanel from ¼ to
+# ½ L1 (the "AVX-512-tile-on-AVX2" residency miss). Real-path (Float64/_NR); complex gemm uses `_CKC`.
+const _MR = @load_preference("gemm_mr", _at_gemm_mr(_HW))::Int
+const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
+const _MC = @load_preference("gemm_mc", _at_gemm_mc(_HW))::Int   # A row block ≤ 30%·L2
+const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
+const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
 
 # Software prefetch hint (read, high locality, data cache) via the LLVM intrinsic. Used to pull the
 # C output tile toward cache at microkernel entry so the read-modify-write at the end (cold C from
@@ -772,6 +775,11 @@ const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
 # == _CNR makes the size branch a no-op. Crossover ≈ n=64.
 const _CNR_SMALL = @load_preference("cgemm_nr_small", _W64 == 4 ? 4 : _CNR)::Int
 const _CGEMM_NRSMALL_MAX = @load_preference("cgemm_nrsmall_max", _W64 == 4 ? 64 : 0)::Int
+# req#8: complex contraction block — the SPLIT of real _KC (BLIS stores kc per datatype). Complex B
+# micropanel is kc·nr·sizeof(ComplexF64) ≤ ½·L1; key on max(_CNR,_CNR_SMALL) so the small-nr branch
+# under-fills L1 (never overflows). Reproduces Zen4 256 (old _KC, complex path bit-identical); galen 168,
+# Zen5 384. Used at the complex-packed sites (_gemm_cmplx_impl!, _trgemm_cmplx_packed*, _hemm_packed_L!).
+const _CKC = @load_preference("cgemm_kc", _l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL)))::Int
 # Small-n cutoff: below this the blocked machinery (pack + interleave-store) loses to the plain scalar
 # triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
 const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
@@ -1121,7 +1129,7 @@ function _gemm_cmplx_impl!(::Val{SA}, ::Val{SB}, ::Val{NR}, ::Val{A1}, ::Val{AR}
         return C
     end
     W = _vwidth(T); mr = _CMR * W; nr = NR
-    kc = min(_KC, k)
+    kc = min(_CKC, k)
     mc = min(max(mr, (_MC ÷ mr) * mr), cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
