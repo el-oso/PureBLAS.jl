@@ -337,10 +337,12 @@ end
 # Packed K-TRIM complex trmm side-L: B := op(A)·B. Materialize op(A)→M (off-triangle zeroed), then PACK B
 # ONCE per nc-panel (its data is copied out → the in-place aliasing constraint vanishes, so tiles store
 # B0-overwrite in ANY order — no atomic/dependency-order dance) and per output row-tile pack M's K-TRIMmed
-# trapezoid M[ir:ir+mre, plo:phi] as the A-operand, running the near-peak PACKED complex microkernel. The
-# diagonal block's below-diagonal zeros are real zeros in M (contribute 0, no mask needed); bottom/edge
-# tiles use the masked kernel. α folded outside (trmm! scales) → A1=true. Reuses _pack_A/B_cmplx! +
-# _microkernel_cmplx!. See kb pureblas-zen3-gate-strategy.
+# trapezoid M[ir:ir+mre, plo:phi] as the A-operand via _pack_A_cmplx!'s SIMD deinterleave, running the
+# near-peak PACKED complex microkernel. (A fused straight-from-A pack was tried 2026-07-09 and REGRESSED
+# side-L — it loses _pack_A_cmplx!'s vectorized deinterleave for scalar select-heavy stores; the one-time
+# materialize is cheaper than that per-row-tile loss here. Side-R, whose prepack was already scalar, DID
+# win from fusing — see _trmm_cmplx_packed_R!.) The diagonal block's below-diagonal zeros are real zeros
+# in M (no mask); edge tiles use the masked kernel. α folded outside → A1=true. See kb pureblas-zen3-gate-strategy.
 function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); n = size(B, 2)
     M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
@@ -371,7 +373,7 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
                 mre = min(mr, k - ir)
                 plo = upM ? ir : 0                          # K-TRIM: op(A)'s nonzero p-range
                 phi = upM ? k : min(k, ir + mre); kc = phi - plo
-                _pack_A_cmplx!(ApR, ApI, Mv, ir, plo, mre, kc, false, mr)
+                _pack_A_cmplx!(ApR, ApI, Mv, ir, plo, mre, kc, false, mr)   # SIMD deinterleave from dense M
                 jr = 0
                 while jr < nce
                     nre = min(nr, nce - jr); ji = div(jr, nr)
@@ -405,18 +407,15 @@ end
 # Packed K-TRIM complex trmm side-R: B := B·op(A). Transposed mirror of _trmm_cmplx_packed_L!: the BIG
 # operand is B itself (the gemm A-slot, m×k), packed per mc row-panel (its data is copied out → the
 # in-place aliasing dissolves; each output row depends only on its own B row, so B0-overwrite is safe
-# in any order). M = op(A) (off-triangle zeroed) is the small B-slot operand, K-trim-packed ONCE up
-# front: tile ji at fixed stride ji·nr·k but storing only its nonzero [plo,phi) rows from slot-row 0 →
-# TOUCHED footprint ~k²/2 (not the full k² with its zero half, which competed with the A-pack in L2)
-# AND packed once (no per-ic-panel repack — that repack regressed the recursion-fed large-k). boff then
-# needs no plo term (row 0 IS M-row plo); the A-pack keeps the +plo·mr offset (it packs all k B-cols).
-# Zeros inside the diagonal tile are real zeros in M (contribute 0, no mask); row/col edges use the
-# masked kernel. α folded outside (A1=true); cj baked into M ⇒ SA=SB=1. Fable-designed 2026-07-05.
+# in any order). op(A) is the small B-slot operand, FUSED-packed ONCE up front straight from A (uplo/trans/
+# conj/unit + off-triangle zeros inline — no dense _mat_tri! materialize, no conj pass, no po2 _l3_tmp
+# stride): tile ji at fixed stride ji·nr·k storing only its [plo,phi) rows from slot-row 0 → TOUCHED
+# footprint ~k²/2, packed once (no per-ic-panel repack — that regressed the recursion-fed large-k). boff
+# needs no plo term (row 0 IS op(A)-row plo); the A-pack keeps the +plo·mr offset (it packs all k B-cols).
+# Off-triangle zeros are real zeros in the packed panel (contribute 0, no mask); row/col edges use the
+# masked kernel. α folded outside (A1=true); cj baked into the pack ⇒ SA=SB=1. Fable-designed 2026-07-05/09.
 function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); m = size(B, 1)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
-    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
     # B row-panel is materialized with ALL k cols at once (not a kc-blocked loop), so mc is the
@@ -425,17 +424,28 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     mc = min(max(mr, (_at_gemm_mc(_HW) ÷ mr) * mr), cld(m, mr) * mr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mc * k, cld(k, nr) * nr * k)
     ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
-    GC.@preserve M B ApR ApI BpR BpI begin
+    GC.@preserve B ApR ApI BpR BpI begin
         Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
         BRp = pointer(BpR); BIp = pointer(BpI)
-        # pre-pack all K-trimmed M column-tiles ONCE: tile ji → base ji·nr·k, only rows [plo,phi) stored.
+        # FUSED triangle pack: op(A)'s K-trimmed column-tiles read STRAIGHT from A — uplo/trans/conj/unit
+        # and the off-triangle zeros applied inline. No _mat_tri! dense materialize, no conj pass, no po2
+        # _l3_tmp stride. Tile ji → base ji·nr·k, rows [plo,phi), row-stride nre (=nr on full tiles; the
+        # Route-A remainder slot keeps its pad-free nre). All A reads in-bounds ∀c (gj=jr+c<k, gp<phi≤k) →
+        # unconditional load, triangle/diag by select; @simd ivdep on the contiguous BpR/BpI store.
         @inbounds for ji in 0:(cld(k, nr) - 1)
             jr = ji * nr; nre = min(nr, k - jr)
             plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
-            base = ji * nr * k                          # slot over-allocated at nr·k; the REMAINDER slot is
-            for p in 0:(kc - 1), c in 0:(nre - 1)       # packed at row-stride nre so the NR=nre kernel reads
-                v = Mv[plo + p + 1, jr + c + 1]          # it with ZERO pad columns computed (upper-N spike fix).
-                BpR[base + p * nre + c + 1] = real(v); BpI[base + p * nre + c + 1] = imag(v)
+            base = ji * nr * k
+            for p in 0:(kc - 1)
+                gp = plo + p; off = base + p * nre
+                @simd ivdep for c in 0:(nre - 1)
+                    gj = jr + c
+                    a = tr ? A[gj + 1, gp + 1] : A[gp + 1, gj + 1]   # op(A)[gp,gj]
+                    intri = upM ? (gp <= gj) : (gp >= gj)
+                    dg = unit & (gp == gj)
+                    BpR[off + c + 1] = intri ? (dg ? one(T) : real(a)) : zero(T)
+                    BpI[off + c + 1] = (intri & !dg) ? (cj ? -imag(a) : imag(a)) : zero(T)
+                end
             end
         end
         ic = 0
