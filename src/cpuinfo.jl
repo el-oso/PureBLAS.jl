@@ -100,6 +100,11 @@ const _ILP_TARGET = 16
 @inline function _at_gemm_mr(hw, ::Type{T} = Float64) where {T}                               # MR (row W-blocks)
     nr = _at_gemm_nr(hw, T); min(cld(_ILP_TARGET, nr), (hw.nvreg - 1) ÷ (nr + 1))              # capped by reg budget
 end
+# Below max(m,n,k) ≤ this, the single-row unpacked tile beats the full _MR·W-row tile (can't fill one full
+# tile of rows, so its 16-acc setup doesn't amortize). Criterion: the full tile's row height _MR·W. req#8
+# (was a bare 40). W=8 → 2·8=16 (routes n=32 to the full tile). NOTE: W=4 → 3·4=12, but galen measured
+# gating at 40 — sweep/pin before trusting W=4 (see gemm.jl _GEMM_MR1_MAX).
+@inline _at_gemm_mr1_max(hw, ::Type{T} = Float64) where {T} = _at_gemm_mr(hw, T) * _lanes(hw, T)
 # (a) L1-resident block: a `unit`-element micro-operand per k-step stays in (num/den)·L1 across the sweep.
 @inline _l1_block(hw, ::Type{T}, unit::Int; num::Int = 1, den::Int = 2, mult::Int = 8) where {T} =
     _round_dn(((hw.l1 * num) ÷ den) ÷ (unit * sizeof(T)), mult)

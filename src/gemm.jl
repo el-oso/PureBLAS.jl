@@ -610,10 +610,11 @@ end
 
 # Unpacked driver (tA='N'). TB and B0 (beta==0) are Vals so the microkernel specializes; resolved
 # once at the boundary. beta is folded into the microkernel — no separate scale-C pass.
-# Small-n unpacked driver with SINGLE-vector (W-row) tiles: at max dim ≲ 40 the 16-acc tile's setup
-# (prefetches, acc init, load/store fan-out) doesn't amortize over the short k — 8×8 tiles took the
-# n=32 dip from 0.95 to 1.01. Same masked/edge kernels, Val(1) rows.
-const _GEMM_MR1_MAX = 40
+# Small-n unpacked driver with SINGLE-vector (W-row) tiles: below the full tile's row height (_MR·W) the
+# matrix can't fill one full tile of rows, so its 16-acc setup doesn't amortize over short k. Same masked/
+# edge kernels, Val(1) rows. DERIVED (req#8, was a bare 40): _at_gemm_mr·W → W=8=16 (measured: full tile now
+# beats mr1 at n=32, 0.833→0.860). W=4→12: sweep-validate galen (measured 40) or pin "gemm_mr1_max"=40 there.
+const _GEMM_MR1_MAX = @load_preference("gemm_mr1_max", _at_gemm_mr1_max(_HW))::Int
 function _gemm_unpacked_mr1!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
     W = _vwidth(T); nr = _NR
