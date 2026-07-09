@@ -116,6 +116,25 @@ end
 @inline function _at_gemm_nc(hw, ::Type{T} = Float64) where {T}
     nr = _at_gemm_nr(hw, T); _avoid_po2(_round_dn((hw.l3 ÷ 4) ÷ (_at_gemm_kc(hw, T) * sizeof(T)), nr), nr)
 end
+# (e) Short-k split-reduction tile (small-n, wide-AVX-512 only). The wide steady-state tile (_MR×_NR)
+# UNDER-FILLS at short k: each C-cell's reduction chain is only k deep, so during the fill few independent
+# FMAs are in flight and the pipeline stalls (measured n=32: PB 0.85× OB — chains ready, but not enough of
+# them early). A TALL tile with an S-way k-split keeps _ILP_TARGET partial chains live from iter 0 (every
+# cell splits into S independent accumulators summed at store), covering latency during the fill. SAME
+# _ILP_TARGET register budget as the wide tile, just redistributed. Gate to wide-reg AVX-512 (nvreg≥32):
+# on AVX2 (16 regs) the _ILP_TARGET accumulators + load temps spill, AND small-n gemm there is already ≥1.0
+# via _GEMM_MR1_MAX — so it const-folds off on Zen3. Derived: S=2 (double ILP for the fill), cells=_ILP_TARGET÷S
+# arranged TALL (NR=2 → a B-reuse column pair; MR=cells÷NR), giving 4×2 on W=8. Validated n=32 0.85→1.07× OB
+# (wintermute Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
+const _GEMM_SPLIT_S = 2
+@inline _at_gemm_split_ok(hw) = hw.nvreg >= 32 && hw.simd >= 64
+@inline _at_gemm_split_nr(hw) = 2
+@inline _at_gemm_split_mr(hw) = (_ILP_TARGET ÷ _GEMM_SPLIT_S) ÷ _at_gemm_split_nr(hw)
+# Upper size: split helps until the wide tile self-fills. One tall split tile (_split_mr·W rows) plus one
+# wide row-block (_MR·W) ≈ where the crossover sits (W=8: 32+16=48 — covers the measured wins 32/48, drops
+# 64 to the wide path). Preferences-overridable ("gemm_split_max"); fleet-validate before trusting.
+@inline _at_gemm_split_max(hw, ::Type{T} = Float64) where {T} =
+    (_at_gemm_split_mr(hw) + _at_gemm_mr(hw, T)) * _lanes(hw, T)
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-

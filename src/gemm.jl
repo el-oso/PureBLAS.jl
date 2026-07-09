@@ -30,6 +30,13 @@ const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
 # under-blocks small-kc callers (potrf's trailing gemm) / mis-sizes complex (16 B/elt). req#8.
 const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
+# Short-k split-reduction tile (cpuinfo.jl `_at_gemm_split_*`): tall _SMR·W×_SNR tile, S-way k-split, for the
+# small-n window where the wide tile under-fills. _SPLIT_OK const-folds the whole path off on AVX2 (already ≥1.0
+# there via _GEMM_MR1_MAX; would spill). req#8; measured n=32 0.85→1.07× OB (wintermute).
+const _SPLIT_OK  = _at_gemm_split_ok(_HW)
+const _SMR = _at_gemm_split_mr(_HW)
+const _SNR = _at_gemm_split_nr(_HW)
+const _GEMM_SPLIT_MAX = @load_preference("gemm_split_max", _at_gemm_split_max(_HW))::Int
 
 # Software prefetch hint (read, high locality, data cache) via the LLVM intrinsic. Used to pull the
 # C output tile toward cache at microkernel entry so the read-modify-write at the end (cold C from
@@ -647,6 +654,101 @@ function _gemm_unpacked_mr1!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
     end
     return C
 end
+# Tall split-reduction microkernel: MR row-blocks × NR cols, S independent partial accumulators per cell,
+# summed at store — keeps MR·NR·S (=_ILP_TARGET) chains live from k=0 to cover the short-k fill the wide
+# tile leaves exposed. Full tile only (mr rows × NR cols, all in bounds); partials delegate to the wide
+# masked/edge kernels. Same store/beta folding as _microkernel_unpacked!. req#8; wintermute n=32 0.85→1.07×.
+@generated function _microkernel_unpacked_split!(C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
+        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T,
+        ::Val{MR}, ::Val{NR}, ::Val{S}, ::Val{TB}, ::Val{B0}) where {T, MR, NR, S, TB, B0}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for mi in 1:MR, j in 1:NR, s in 0:(S - 1)
+        push!(body.args, :($(Symbol(:c, mi, :_, j, :_, s)) = zero($V)))
+    end
+    step = (pex, s) -> begin
+        q = quote end
+        for mi in 1:MR
+            push!(q.args, :($(Symbol(:a, mi)) = vload($V, A + ((ir + $((mi - 1) * W)) + $pex * lda) * $sz)))
+        end
+        for j in 1:NR
+            baddr = TB ? :(B + ((jr + $(j - 1)) + $pex * ldb) * $sz) : :(B + ($pex + (jr + $(j - 1)) * ldb) * $sz)
+            push!(q.args, :($(Symbol(:b, j)) = $V(unsafe_load($baddr))))
+            for mi in 1:MR
+                cs = Symbol(:c, mi, :_, j, :_, s)
+                push!(q.args, :($cs = muladd($(Symbol(:a, mi)), $(Symbol(:b, j)), $cs)))
+            end
+        end
+        q
+    end
+    steps = [step(:(p + $s), s) for s in 0:(S - 1)]
+    push!(body.args, quote
+        p = 0
+        while p + $S <= k; $(steps...); p += $S; end   # S independent chains per cell
+        while p < k; $(step(:p, 0)); p += 1; end       # k-remainder into chain 0
+    end)
+    push!(body.args, :(av = $V(alpha)))
+    B0 || push!(body.args, :(bv = $V(beta)))
+    for j in 1:NR
+        push!(body.args, :(colp = C + (ir + (jr + $(j - 1)) * ldc) * $sz))
+        for mi in 1:MR
+            red = Symbol(:c, mi, :_, j, :_, 0)
+            for s in 1:(S - 1); red = :($red + $(Symbol(:c, mi, :_, j, :_, s))); end
+            st = B0 ? :(vstore(av * $red, q)) : :(vstore(muladd(bv, vload($V, q), av * $red), q))
+            push!(body.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). Full _SMR·W×_SNR tiles via the split
+# kernel; row remainder → wide masked-row kernel, col remainder → edge strip (reuse; remainders are small).
+function _gemm_unpacked_split!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
+        alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
+    W = _vwidth(T); mr = _SMR * W; nr = _SNR
+    lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
+    parA = parent(A); parB = parent(B); parC = parent(C)
+    GC.@preserve parA parB parC begin
+        Ap = pointer(A); Bp = pointer(B); Cp = pointer(C)
+        jr = 0
+        while jr < n
+            nre = min(nr, n - jr)
+            ir = 0
+            while ir < m
+                mre = min(mr, m - ir)
+                if nre == nr && rem(mre, W) == 0
+                    # full OR W-aligned partial rows: split kernel at vr = mre/W row-blocks (keeps the
+                    # split's B-reuse for the row remainder — mrows(NR=_SNR) would lose it). _SMR=4 → vr∈1:4.
+                    vr = div(mre, W)
+                    if vr == _SMR
+                        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            Val(_SMR), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0))
+                    elseif vr == 1
+                        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            Val(1), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0))
+                    elseif vr == 2
+                        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            Val(2), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0))
+                    else
+                        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0))
+                    end
+                elseif nre == nr
+                    _microkernel_unpacked_mrows!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0))
+                else
+                    _microkernel_unpacked_edge!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, nre, TB, B0)
+                end
+                ir += mr
+            end
+            jr += nr
+        end
+    end
+    return C
+end
+
 function _gemm_unpacked!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal, TB, B0}
     if iszero(alpha) || k == 0
@@ -655,6 +757,11 @@ function _gemm_unpacked!(::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
     end
     if max(m, n, k) <= _GEMM_MR1_MAX
         return _gemm_unpacked_mr1!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
+    end
+    # Short-k split path: small-n window where the wide tile under-fills (needs ≥1 full tall row-tile so the
+    # split kernel actually fires; else the NR=2 remainder loses B-reuse to the wide NR). Const-folds off on AVX2.
+    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, n, k) <= _GEMM_SPLIT_MAX
+        return _gemm_unpacked_split!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
     lda = stride(A, 2); ldb = stride(B, 2); ldc = stride(C, 2)
