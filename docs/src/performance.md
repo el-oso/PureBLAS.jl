@@ -7,12 +7,18 @@ size sweep (and rounds); the horizontal line is the median and the dark dot is t
 is green only when **every** size clears the gate.
 
 Methodology (see `bench/`): single-thread (`BLAS.set_num_threads(1)`), Float64 (plus the full **ComplexF64**
-surface — see the Complex section), native PureBLAS API vs `LinearAlgebra.BLAS`, **interleaved** timing (each round times OpenBLAS
-then PureBLAS back-to-back so frequency drift cancels), **median** of many rounds, core pinned with
-`taskset`, and — importantly — **CPU boost disabled** (a floating boost clock silently biases small-n
-ratios; see below). Reproduce: `taskset -c 2 julia --project=bench bench/plots.jl`. Each section shows
-the dev fleet — double-pumped **AVX-512** (Zen4, the primary tuning target), native **AVX2** (Zen3), and
-native 512-bit **AVX-512** (Zen5, `neuromancer`) — so per-µarch differences are visible side by side.
+surface — see the Complex section), native PureBLAS API vs `LinearAlgebra.BLAS`. Each (op, size) is measured
+over **repeated rounds** — per round OpenBLAS and PureBLAS are timed in consecutive **ABBA-alternated**
+windows and reconciled into a quantile-paired ratio; the per-round **ratios are pooled** and the **median**
+is the gate number. Repetition rejects the one-unlucky-window failure a single measurement is prone to
+(the band on each curve is the q10–q90 spread of the pooled ratios). Core pinned with `taskset`, **CPU boost
+disabled / clock pinned** (a floating boost clock silently biases small-n ratios). Reproduce:
+`taskset -c 2 julia --project=bench bench/plots.jl` (or `bench lite` for a fast smoke, `bench op=<name>` to
+re-measure one op). Each plot overlays the dev fleet — double-pumped **AVX-512** (Zen4, `wintermute`, the
+primary tuning target), native **AVX2** (Zen3, `galen`), and native 512-bit **AVX-512** (Zen5, `neuromancer`)
+— one panel per op, three µarchs superimposed. Per-run provenance (CPU model, code commit, timestamp) is in
+[`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md), regenerated with
+the plots.
 
 ## Per-ISA gate (dev fleet)
 
@@ -126,17 +132,11 @@ performance-neutral single-thread (measured, tiny-n within noise).
 
 ## BLAS-1
 
-**AVX-512 (Zen4):**
+One panel per op; each overlays the three µarchs — **Zen4 (blue)**, **Zen3 (red)**, **Zen5 (green)** —
+as PureBLAS/OpenBLAS **ratio vs size**, with the 0.96× gate (red dashed) and 1.0 parity (grey). The band
+is the q10–q90 spread of the pooled per-round ratios.
 
-![BLAS-1 ratio vs OpenBLAS, AVX-512](assets/perf_l1_avx512.svg)
-
-**AVX2 (Zen3):**
-
-![BLAS-1 ratio vs OpenBLAS, AVX2](assets/perf_l1_avx2.svg)
-
-**Zen5 (native AVX-512):**
-
-![BLAS-1 ratio vs OpenBLAS, Zen5](assets/perf_l1_zen5.svg)
+![BLAS-1 — PureBLAS/OpenBLAS per op, three µarchs overlaid](assets/perf_l1.svg)
 
 Bandwidth-bound; PureBLAS matches or beats OpenBLAS across the board. `nrm2` is markedly faster
 because OpenBLAS's `dnrm2` uses the slow always-scaled LAPACK algorithm, while PureBLAS uses a SIMD
@@ -144,17 +144,7 @@ sum-of-squares with a scaled fallback only on overflow/underflow.
 
 ## BLAS-2
 
-**AVX-512 (Zen4):**
-
-![BLAS-2 ratio vs OpenBLAS, AVX-512](assets/perf_l2_avx512.svg)
-
-**AVX2 (Zen3):**
-
-![BLAS-2 ratio vs OpenBLAS, AVX2](assets/perf_l2_avx2.svg)
-
-**Zen5 (native AVX-512):**
-
-![BLAS-2 ratio vs OpenBLAS, Zen5](assets/perf_l2_zen5.svg)
+![BLAS-2 — PureBLAS/OpenBLAS per op, three µarchs overlaid](assets/perf_l2.svg)
 
 Matrix-vector and the packed/banded variants. The headline lessons (full detail in the project's
 `kb/` findings):
@@ -170,17 +160,7 @@ Matrix-vector and the packed/banded variants. The headline lessons (full detail 
 
 ## BLAS-3
 
-**AVX-512 (Zen4):**
-
-![BLAS-3 ratio vs OpenBLAS, AVX-512](assets/perf_l3_avx512.svg)
-
-**AVX2 (Zen3):**
-
-![BLAS-3 ratio vs OpenBLAS, AVX2](assets/perf_l3_avx2.svg)
-
-**Zen5 (native AVX-512):**
-
-![BLAS-3 ratio vs OpenBLAS, Zen5](assets/perf_l3_zen5.svg)
+![BLAS-3 — PureBLAS/OpenBLAS per op, three µarchs overlaid](assets/perf_l3.svg)
 
 The compute-bound level — **median ratio vs size** (log-log). On **AVX-512**
 every op's geomean clears the 0.96× gate and small sizes run 1–3× OpenBLAS (the former small-n dips were
@@ -199,17 +179,7 @@ complex split-pack kernel (real+imag panels, 4-real-FMA MAC); the rest are built
 
 ## LAPACK
 
-**AVX-512 (Zen4):**
-
-![LAPACK ratio vs OpenBLAS, AVX-512](assets/perf_lapack_avx512.svg)
-
-**AVX2 (Zen3):**
-
-![LAPACK ratio vs OpenBLAS, AVX2](assets/perf_lapack_avx2.svg)
-
-**Zen5 (native AVX-512):**
-
-![LAPACK ratio vs OpenBLAS, Zen5](assets/perf_lapack_zen5.svg)
+![LAPACK — PureBLAS/OpenBLAS per op, three µarchs overlaid](assets/perf_lapack.svg)
 
 Factorizations driven by the gated BLAS, again **median ratio vs size** for **Zen4/AVX-512** — gating at
 every size, with tiny-n factors 1.5–4× OpenBLAS after the workspace-caching fixes. (On AVX2, `geqrf`/
@@ -240,35 +210,24 @@ large n); and the `gemv` cache thresholds are **keyed to detected L2** (`_CGEMV_
 doesn't inherit Zen4's 1 MB and thrash mid-n). Complex `zgemvN` is **ILP-tuned** (MR=4 square / MR=3 tall
 scatter).
 
-**Complex BLAS-1 / BLAS-2 (violins) — AVX-512 (Zen4):**
+**Complex BLAS-1 / BLAS-2:**
 
-![Complex BLAS-1, AVX-512](assets/perf_cl1_avx512.svg)
-![Complex BLAS-2, AVX-512](assets/perf_cl2_avx512.svg)
+![Complex BLAS-1 — three µarchs overlaid](assets/perf_cl1.svg)
 
-**AVX2 (Zen3):**
+![Complex BLAS-2 — three µarchs overlaid](assets/perf_cl2.svg)
 
-![Complex BLAS-1, AVX2](assets/perf_cl1_avx2.svg)
-![Complex BLAS-2, AVX2](assets/perf_cl2_avx2.svg)
+**Complex BLAS-3:**
 
-**Zen5 (native AVX-512):**
+![Complex BLAS-3 — three µarchs overlaid](assets/perf_cl3.svg)
 
-![Complex BLAS-1, Zen5](assets/perf_cl1_zen5.svg)
-![Complex BLAS-2, Zen5](assets/perf_cl2_zen5.svg)
-
-**Complex BLAS-3 (trend) — AVX-512 (Zen4), AVX2 (Zen3), Zen5:**
-
-![Complex BLAS-3, AVX-512](assets/perf_cl3_avx512.svg)
-![Complex BLAS-3, AVX2](assets/perf_cl3_avx2.svg)
-![Complex BLAS-3, Zen5](assets/perf_cl3_zen5.svg)
-
-**Complex LAPACK (trend) — AVX-512 (Zen4), AVX2 (Zen3), Zen5:**
+**Complex LAPACK:**
 
 `zpotrf`/`zgetrf`/`zgeqrf` factor on the gated complex L3 kernels; `zgesvd` is **singular values only**
 (complex singular vectors are a follow-up), so it is benched values-vs-values against OpenBLAS `zgesdd('N')`.
+Its complex bidiagonalization is still unblocked (BLAS-2), so it collapses at large n — the panel is **capped
+at n=1024** pending the blocked-bidiag port; the rest of complex LAPACK runs to 4096.
 
-![Complex LAPACK, AVX-512](assets/perf_clapack_avx512.svg)
-![Complex LAPACK, AVX2](assets/perf_clapack_avx2.svg)
-![Complex LAPACK, Zen5](assets/perf_clapack_zen5.svg)
+![Complex LAPACK — three µarchs overlaid](assets/perf_clapack.svg)
 
 On **AVX-512** the whole complex L1/L2 surface gates or beats OpenBLAS — `zhemv` ≈ **2×**, `dznrm2` **4–6×**
 (OpenBLAS's is the slow always-scaled `dznrm2`), `zgeru`/`zdotc`/`zscal`/`zaxpy` clear it, `zgemvC`/`zgemvN`
