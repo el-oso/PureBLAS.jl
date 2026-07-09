@@ -740,7 +740,7 @@ const _CHOL_T = Ref(Matrix{Float64}(undef, 0, 0))                     # panel wo
 # trsm row chunk: the mc×NB T slab the k-repasses re-read stays L2-resident (slab ≤ L2/2).
 const _CHOL_MC = max(_CHOLW, (_L2_BYTES ÷ 2) ÷ (_CHOL_BLOCK * 8))
 
-function _chol_panel_f64!(A, n::Int)
+function _chol_panel_f64!(A, n::Int, blk::Int = _CHOL_BLOCK)
     lda = stride(A, 2)
     Tb = _CHOL_T[]
     if size(Tb, 1) < n + 8
@@ -752,7 +752,7 @@ function _chol_panel_f64!(A, n::Int)
         pa = pointer(A); pT = pointer(Tb); pD = pointer(D)
         j = 0
         @inbounds while j < n
-            bs = min(_CHOL_BLOCK, n - j)
+            bs = min(blk, n - j)
             pjj = _cvptr(pa, j + 1, j + 1, lda)
             for c in 0:bs-1                                   # diag block lower triangle → D (L1/L2)
                 unsafe_copyto!(pD + (c * ldD + c) * 8, pjj + (c * lda + c) * 8, bs - c)
@@ -797,6 +797,16 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
         # but it's a better-composed blocked driver everywhere — the hybrid's generic trsm!(side=R,transA=T)
         # is the side-R-T laggard the panel driver's fused split-ld trsm avoids. (AVX-512 W=8 stays below.)
         return _chol_panel_f64!(A, n)
+    end
+    if _CHOLW == 4 && n == _CHOL_BLOCK && _chol_needs_pad(A, n)
+        # po2 n=128 (n == _CHOL_BLOCK ⇒ single block, m=0, no trailing to fuse into): route through the
+        # fused panel driver at HALF blocks (blk = _CHOL_THRESHOLD = 64) instead of the whole-matrix pad
+        # round-trip. Only the two 64×64 diagonal blocks round-trip through the alias-free _CHOL_D; the A21
+        # panel read is fused into the split-trsm first touch (free), the trailing syrk reads L2-hot _CHOL_T.
+        # ~½ the copy traffic AND the heavy-reuse trsm/syrk k-loops hit conflict-free scratch, not po2 A.
+        # (Copy can't be fully eliminated — factoring a po2-strided diag block in place thrashes L1; the
+        # alias-free scratch IS the cure. This shrinks it to the diagonal + makes reused reads cache-hot.)
+        return _chol_panel_f64!(A, n, _CHOL_THRESHOLD)
     end
     if _chol_needs_pad(A, n)                      # factor in a non-conflicting (ld = n+8) scratch, copy back
         R = n + 8
