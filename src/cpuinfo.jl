@@ -9,7 +9,7 @@
 #   Zen3     (AVX2)     -> 32 bytes -> Vec{4,Float64}, Vec{8,Float32}
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
-using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize
+using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize, cpuid
 using CPUSummary: cache_size
 using Preferences: @load_preference
 
@@ -53,6 +53,22 @@ end
 # Cache-line size in bytes (folded to a const; 64 on all current x86/ARM). Governs software-prefetch
 # density — one prefetch per line (the ger column-RMW prefetch) — and the prefetch-distance unit.
 const _CACHELINE = let s = try Int(cachelinesize()) catch; 0 end; s > 0 ? s : 64 end
+
+# L1d associativity (ways), CPUID leaf 4 (Intel) / 0x8000001D (AMD) subleaf 0, ebx[22:31]+1 — the same
+# leaf CpuId's `cachesize` parses for sizes. The derived way size (_L1_WAY_BYTES) is the address stride
+# at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
+# index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
+# Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
+const _L1D_ASSOC = @load_preference("l1d_assoc",
+    let w = try
+            leaf = cpuvendor() === :AMD ? 0x8000_001d : 0x0000_0004
+            eax, ebx, _, _ = cpuid(leaf, 0x0000_0000)
+            # subleaf 0 must be a level-1 data/unified cache (eax[0:4] type≠0, eax[5:7] level==1)
+            (eax & 0x1f) != 0 && ((eax >> 5) & 0x7) == 1 ? Int(1 + (ebx >> 22) & 0x03ff) : 0
+        catch; 0 end
+        w > 0 ? w : 8
+    end)::Int
+const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
