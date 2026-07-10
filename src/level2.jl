@@ -773,7 +773,7 @@ end
     # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
     # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
     # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
-    m * n * sizeof(T) > _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())
+    m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
