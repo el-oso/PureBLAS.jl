@@ -33,7 +33,11 @@ end
         x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
 end
 
-const _GEMV_MR = _vwidth(Float64) == 4 ? 8 : 4   # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows). AVX2: 8 accs feed both FMA units (~5-cyc latency) — MR=4 half-fills the pipe at cache-resident mid-n; AVX-512 (32 regs, already ≥gate) stays 4.
+# gemv-N row-block height in vectors (mr = _GEMV_MR·W rows). MR=8 keeps 8 accumulators feeding both FMA
+# units to cover the ~5-cyc latency; MR=4 half-fills the pipe at cache-resident mid-n. Double-pumped Zen4
+# occupies each 512-bit pipe TWICE, self-hiding the latency → MR=4 suffices. AVX2 (Zen3) and NATIVE-512
+# (Zen5) re-expose it → MR=8 (Zen5 gemvN@256 was 0.86 at MR=4). Keyed on _double_pumped (silicon fact).
+const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
 const _GEMV_NP = 8             # gemv-N column-panel width
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
