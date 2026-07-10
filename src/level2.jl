@@ -670,8 +670,39 @@ end
 # DRAM sizes): Zen5→1, Zen3→4, Zen4→8. Every external cause was eliminated (memory subsystem scales fine on
 # both; DIMMs rank-matched; OS/clock cancel in the PB/OB ratio; 4K-aliasing padded out; LLVM znver4≡znver5
 # codegen on the same silicon) — so this is a genuine tuning knob, not a µarch hack. Default 4 (a safe middle).
-const _GER_PANEL_NP = @load_preference("ger_panel_np", 4)::Int
 const _GER_PANEL_U  = 4                                          # x-vector unroll (ILP)
+# NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
+# else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
+# trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
+# trim/.so build MUST set it), the auto path is NEVER DEFINED → trivially trim-clean.
+const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
+@static if isnothing(_GER_NP_PREF)
+    # Base-only, TOTAL (OncePerProcess poisons the whole process if the initializer throws) → catch → 4.
+    function _measure_ger_np()::Int
+        Base.generating_output() && return 4                     # don't burn a measure during precompilation
+        try
+            n = 64                                               # columns (multiple of max NP=8)
+            m = cld(2 * _L3_BYTES, n * sizeof(Float64))          # ~2×L3 rows ⇒ genuinely DRAM-bound
+            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(1.0, n)   # pre-touch pages (no first-touch bias)
+            best = 4; bt = typemax(UInt64)
+            for np in (1, 2, 4, 8)
+                _ger_paneldrv_np(m, n, 1.0, x, y, A, np)         # untimed warmup (absorbs this Val's JIT)
+                t = typemax(UInt64)
+                for _ in 1:4
+                    s = time_ns(); _ger_paneldrv_np(m, n, 1.0, x, y, A, np); t = min(t, time_ns() - s)
+                end
+                t < bt && (bt = t; best = np)
+            end
+            return best
+        catch
+            return 4
+        end
+    end
+    const _GER_NP_ONCE = Base.OncePerProcess{Int}(_measure_ger_np)
+    @inline _ger_np() = _GER_NP_ONCE()
+else
+    @inline _ger_np() = _GER_NP_PREF::Int
+end
 
 @generated function _ger_panel!(Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},
         jc::Int, m::Int, α::T, pf::Int, ::Val{NP}, ::Val{U}) where {T, NP, U}
@@ -707,31 +738,39 @@ const _GER_PANEL_U  = 4                                          # x-vector unro
     return body
 end
 
-@inline function _ger_panel_driver!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
-    pf = 0   # NP (calibrated per box) is THE lever; software prefetch is a wash/slight-hurt for the panel
+@inline function _ger_panel_driver!(m::Int, n::Int, α::T, x, y, A, ::Val{NP}) where {T<:BlasReal, NP}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         jc = 0
-        while jc + _GER_PANEL_NP <= n
-            _ger_panel!(Aptr, lda, xptr, yptr, jc, m, α, pf, Val(_GER_PANEL_NP), Val(_GER_PANEL_U))
-            jc += _GER_PANEL_NP
+        while jc + NP <= n
+            _ger_panel!(Aptr, lda, xptr, yptr, jc, m, α, 0, Val(NP), Val(_GER_PANEL_U))   # pf=0: NP is the lever
+            jc += NP
         end
         @inbounds while jc < n                                                            # remainder columns (< NP)
             ayj = α * unsafe_load(yptr, jc + 1)
-            iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + jc * lda * sz, pf)
+            iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + jc * lda * sz, 0)
             jc += 1
         end
     end
     return A
 end
 
+# Static Val ladder: runtime NP (from _ger_np()) → a compile-time Val{NP} driver call. One branch, each arm
+# statically dispatched (no dynamic Val(NP) in the hot loop → zero-alloc, StrictMode-clean).
+@inline function _ger_paneldrv_np(m::Int, n::Int, α::T, x, y, A, np::Int) where {T<:BlasReal}
+    np == 1 ? _ger_panel_driver!(m, n, α, x, y, A, Val(1)) :
+    np == 2 ? _ger_panel_driver!(m, n, α, x, y, A, Val(2)) :
+    np == 4 ? _ger_panel_driver!(m, n, α, x, y, A, Val(4)) :
+              _ger_panel_driver!(m, n, α, x, y, A, Val(8))
+end
+
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
-    # DRAM-bound (A > L3) → m-inner panel with a CALIBRATED stream count `_GER_PANEL_NP`. The optimal number
+    # DRAM-bound (A > L3) → m-inner panel with a per-box stream count (`_ger_np()`: Preference or auto-measured). The optimal number
     # of concurrent wide-SIMD write-streams is an intrinsic per-core property with NO derivable formula and
     # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
     # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
     # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
-    m * n * sizeof(T) > _L3_BYTES && return _ger_panel_driver!(m, n, α, x, y, A)
+    m * n * sizeof(T) > _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
