@@ -40,6 +40,11 @@ end
 const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
 const _GEMV_NP = 8             # gemv-N column-panel width
+# A-stream prefetch for the real gemvN panel path (_gemv_n_panel_full!): the panel reads A as _GEMV_NP
+# strided column streams; on high-latency memory (LPDDR5x) the HW prefetcher under-fetches them. Mirrors
+# _CGEMVN_PF. Default OFF pending fleet A/B — net-negative on double-pumped Zen4 (self-hides latency), the
+# candidate is Zen5 native-512 @DRAM (gemvN@2048=0.91). Set default to the validated µarch+residency gate.
+const _GEMVN_PF = @load_preference("gemvn_pf", false)::Bool
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
@@ -150,7 +155,7 @@ end
 # panel path is competitive at mid n (e.g. n=512), where the masked version's per-block overhead cost
 # ~12% vs per-column.
 @generated function _gemv_n_panel_full!(yb::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T}, jc::Int,
-        Peff::Int, α::T, ::Val{MR}) where {T, MR}
+        Peff::Int, α::T, ::Val{MR}, ::Val{PF} = Val(false)) where {T, MR, PF}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     body = quote end
     push!(body.args, :(av = $V(α)))
@@ -160,6 +165,9 @@ end
     for v in 1:MR
         push!(inner.args, :($(Symbol(:c, v)) = muladd(vload($V, Ab + ($((v - 1) * W) + (jc + cc) * lda) * $sz), xj, $(Symbol(:c, v)))))
     end
+    # A-stream prefetch: once per column, +192 B down that column (the row-blocks the driver visits next),
+    # saturating the panel's Peff strided streams the HW prefetcher under-fetches. Gated (see _GEMVN_PF).
+    PF && push!(inner.args, :(_prefetch(Ab + (jc + cc) * lda * $sz + $(3 * _CACHELINE))))
     push!(body.args, :(for cc in 0:(Peff - 1); $inner; end))
     for v in 1:MR; push!(body.args, :(vstore($(Symbol(:c, v)), yb + $((v - 1) * W * sz)))); end
     push!(body.args, :(return nothing))
@@ -180,7 +188,7 @@ end
             Peff = min(_GEMV_NP, n - jc)
             i0 = 0
             while i0 + mr <= m   # full row-blocks: unmasked (no per-block mask overhead)
-                _gemv_n_panel_full!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, jc, Peff, α, Val(_GEMV_MR))
+                _gemv_n_panel_full!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, jc, Peff, α, Val(_GEMV_MR), Val(_GEMVN_PF))
                 i0 += mr
             end
             mre = m - i0          # masked remainder
