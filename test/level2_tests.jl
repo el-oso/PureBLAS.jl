@@ -184,3 +184,19 @@ end
     @test_throws DimensionMismatch PureBLAS.trmv!(zeros(3, 4), zeros(3))
     @test_throws DimensionMismatch PureBLAS.trsv!(zeros(3, 3), zeros(4))
 end
+
+# The DRAM ger panel driver only fires at A ≥ L3 (level2.jl:776), so the public ger test (small n) never
+# reaches it. Call it directly at every NP with awkward m (masked W-tail) and n (< NP column remainder).
+@testitem "ger panel driver (_ger_paneldrv_np) direct: all NP, m-tails + column remainders" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    tol(::Type{T}) where {T} = T <: Float32 ? 1.0f-4 : 1.0e-11
+    @testset "T=$T np=$np m=$m n=$n" for T in (Float32, Float64), np in (1, 2, 4, 8),
+        m in (1, 7, 16, 31), n in (1, 3, 8, 13)
+
+        α = T(0.7); x = randn(T, m); y = randn(T, n); A0 = randn(T, m, n)
+        Ap = copy(A0); PureBLAS._ger_paneldrv_np(m, n, α, x, y, Ap, np)   # A += α·x·yᵀ
+        Ar = copy(A0); B.ger!(α, x, y, Ar)                               # OpenBLAS geru oracle
+        @test norm(Ap .- Ar) / max(norm(Ar), eps(Float64)) < tol(T)
+    end
+end
