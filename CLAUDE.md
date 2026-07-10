@@ -108,6 +108,17 @@ closures) · repeated in-place reps · **median** times (not min) · `taskset -c
 low noise · results→JSON, plot from JSON · **per-host JSON filenames** (fleet: Zen4 dev / Zen3 AVX2 /
 Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
+- **FREQUENCY METHODOLOGY — one command, never re-decided: `sudo bench/fleet_freqlock.sh lock`** (that
+  script is the single source of truth; read its header). It sets `amd_pstate=passive` + **boost OFF** +
+  all cores pinned to **base clock** (min=max) + **verifies the achieved freq under load**. This is the
+  ONLY valid state for a gate/plot measurement, on every box. Rules: (a) a run whose `verify` is not ✅
+  (boost floating, `boost=1`) is **INVALID — discard it, don't rationalize it**; a floating boost clock
+  drifts between the OB and PB windows → wide, meaningless ratios. (b) **There is no stable high pin** —
+  a clock above base (e.g. 4000 on a ~2 GHz-base chip) lives in the boost range and floats above
+  `scaling_max_freq`; `pin >base` is refused by design. Base clock is the ceiling for a LOCKED run.
+  (c) Absolute clock is irrelevant (the gate is a PB/OB *ratio*, both at one clock) → higher clock buys
+  nothing and costs drift. Do **not** reopen this per session — measure on `lock`, full stop.
+
 ## Standing rules
 
 - **A sub-1.0 PB/OB ratio is NEVER a "ceiling" — it is an implementation gap.** OpenBLAS runs on the
