@@ -194,3 +194,20 @@ end
         @test ForwardDiff.derivative(f, 1.0) ≈ 4.0
     end
 end
+
+# The spmv panel driver only fires when 2·n·sizeof ≥ _SPMV_PANEL_MINXY (level2_packed.jl:185), so the
+# public spmv test's small n mostly takes the per-column path. Call it directly across U/L and n that
+# leave an NB remainder + a partial last panel. Driver does y += α·A·x (no β) ⇒ oracle β=1.
+@testitem "spmv panel driver (_spmv_panel_driver!) direct: U/L, NB remainders + partial panel" setup = [PackBand] begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    @testset "spmv-panel $T up=$up n=$n" for T in (Float32, Float64), up in (true, false),
+        n in (1, 3, 5, 9, 17, 33, 48)
+
+        ul = up ? 'U' : 'L'
+        AP = randn(T, (n * (n + 1)) ÷ 2); x = randn(T, n); y0 = randn(T, n); α = T(0.7)
+        yp = copy(y0); PureBLAS._spmv_panel_driver!(up, n, α, AP, x, yp)   # y += α·A·x (symmetric)
+        yr = copy(y0); B.spmv!(ul, α, AP, x, one(T), yr)                  # β=1 accumulate oracle
+        @test l2err(yp, yr) < l2tol(T)
+    end
+end
