@@ -9,7 +9,7 @@
 #   Zen3     (AVX2)     -> 32 bytes -> Vec{4,Float64}, Vec{8,Float32}
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
-using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel
+using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize
 using CPUSummary: cache_size
 using Preferences: @load_preference
 
@@ -49,6 +49,10 @@ end
 const _L1_BYTES = let s = Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
+
+# Cache-line size in bytes (folded to a const; 64 on all current x86/ARM). Governs software-prefetch
+# density — one prefetch per line (the ger column-RMW prefetch) — and the prefetch-distance unit.
+const _CACHELINE = let s = try Int(cachelinesize()) catch; 0 end; s > 0 ? s : 64 end
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).

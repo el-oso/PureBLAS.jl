@@ -34,7 +34,7 @@ Both modes share ONE set of low-level kernels. Source map:
 
 ## Hard requirements (MUST follow)
 
-1. **Performance gate: ≥ 0.96× OpenBLAS, non-negotiable.** Per-machine (the gate is measured on
+1. **Performance gate: ≥ 1.0× OpenBLAS (parity or better), non-negotiable.** Per-machine (the gate is measured on
    the dev box). Beat it where possible. BLAS-1 is bandwidth-bound (easy parity); the real fight is
    M2 `dgemm`.
 2. **SIMD.jl for kernels** (`Vec`, `vload`/`vstore`, `muladd`). Real unit-stride dense → SIMD fast
@@ -106,7 +106,7 @@ Both modes share ONE set of low-level kernels. Source map:
 `BLAS.set_num_threads(1)` for fair single-thread comparison · `@noinline` concrete wrappers (not
 closures) · repeated in-place reps · **median** times (not min) · `taskset -c N` + cpufreq pin for
 low noise · results→JSON, plot from JSON · **per-host JSON filenames** (fleet: Zen4 dev / Zen3 AVX2 /
-Zen5 native-AVX512 / future M5 ARM — the 0.96× gate is evaluated per machine).
+Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
