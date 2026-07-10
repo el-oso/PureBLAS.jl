@@ -151,12 +151,13 @@ end
         base = pointer(AP); xp = pointer(x); yp = pointer(y); sz = sizeof(T)
         jb = 0
         while jb + NB <= n
+            jbl = jb                                                                # fresh, un-reassigned ⇒ the `bc` closures don't box jb (Core.Box → per-panel heap alloc)
             if up
-                bc = ntuple(c -> base + _pkU(jb + c) * sz, Val(NB))                 # A[i,jb+c] (1-based i≤jb+c) = base+(_pkU(jb+c)+i-1); 0-based row → +i
-                _spmv_upanel!(jb + NB, α, bc, xp, yp, Val(_SYMV_MR), Val(NB))
+                bc = ntuple(c -> base + _pkU(jbl + c) * sz, Val(NB))                # A[i,jb+c] (1-based i≤jb+c) = base+(_pkU(jb+c)+i-1); 0-based row → +i
+                _spmv_upanel!(jbl + NB, α, bc, xp, yp, Val(_SYMV_MR), Val(NB))
             else
-                bc = ntuple(c -> base + (_pkL(jb + c, n) + 1 - c) * sz, Val(NB))     # A[jb+i+1,jb+c] = base+(_pkL(jb+c,n)+1-c)+i
-                _spmv_lpanel!(n - jb, α, bc, xp + jb * sz, yp + jb * sz, Val(_SYMV_MR), Val(NB))
+                bc = ntuple(c -> base + (_pkL(jbl + c, n) + 1 - c) * sz, Val(NB))    # A[jb+i+1,jb+c] = base+(_pkL(jb+c,n)+1-c)+i
+                _spmv_lpanel!(n - jbl, α, bc, xp + jbl * sz, yp + jbl * sz, Val(_SYMV_MR), Val(NB))
             end
             jb += NB
         end
