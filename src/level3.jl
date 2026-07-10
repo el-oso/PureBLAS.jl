@@ -919,10 +919,21 @@ function trmm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trmm!: A must be $k×$k"))
+    # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
+    # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
+    # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
+    if eltype(B) <: BlasReal && transA != 'C' && k <= _TRMM_BASE
+        up_ = uplo == 'U'; tr_ = transA != 'N'; unit_ = diag == 'U'
+        if sl
+            k <= _TRMM_DDIRECT ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
+        else
+            k <= _TRMM_DDIRECT ? _trmm_right_base!(up_, tr_, false, unit_, k, A, B) : _trmm_small!(false, up_, tr_, unit_, A, B)
+        end
+        isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
     # side-L real large → K-range-trimmed single-pass packed (the straddling tile contracts only its
     # nonzero p-band, not the full kc zero-band — that band was the ~kc/k waste that capped the naive
     # packed trmm). Else (side R, complex/AD, small) → recursion-over-gemm! (no regression).
-    if sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX
+    elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
         # but regressed k=768 and the public po2 A-pad path — non-robust, not worth the split.)
