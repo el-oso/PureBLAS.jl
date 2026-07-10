@@ -53,6 +53,8 @@ const _COMMIT = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch
 #   bench op=gemm    → measure ONLY that op, full methodology, MERGE into the (v2) cache
 #   bench group=L3   → measure ONLY that level, merge
 const _LITE = "lite" in ARGS
+const _NODRAW = "nodraw" in ARGS   # fleet boxes: measure + cache only, skip SVG/table render (so their
+                                    # working tree stays clean → `git pull` never blocks). Render centrally.
 const _SELOP  = (i = findfirst(a -> startswith(a, "op="), ARGS);    isnothing(i) ? nothing : ARGS[i][4:end])
 const _SELGRP = (i = findfirst(a -> startswith(a, "group="), ARGS); isnothing(i) ? nothing : ARGS[i][7:end])
 _want(lvl, nm) = (isnothing(_SELOP) && isnothing(_SELGRP)) || _SELOP == nm || _SELGRP == lvl
@@ -67,7 +69,7 @@ _sizes(szs) = _LITE && length(szs) > 3 ? szs[1:(length(szs)-3)] : szs
 # there is exactly the unlucky-window regime — repeat 8×. Only n≥2048 fills a 2 s seconds-bound window;
 # still keep 2 rounds there so ABBA order-balance applies (windows are hottest/most order-biased there).
 _rounds_light(_sz) = _LITE ? 2 : 8
-_rounds_heavy(sz) = _LITE ? 1 : (sz <= 1024 ? 8 : 2)
+_rounds_heavy(sz) = _LITE ? 1 : (sz <= 1024 ? 8 : 4)   # n≥2048 was 2 → under-replicated (noise at 4096); 4
 
 # Measure one op ROBUSTLY: skip if filtered out; a per-op try/catch means one op's failure logs and the
 # sweep CONTINUES (never all-or-nothing); flush so a run is live-monitorable despite Julia's block-buffered
@@ -578,8 +580,8 @@ end
 
 adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
 # Draw the whole FLEET (every host cache on disk) as cross-µarch panel grids: 8 SVGs, NO per-host suffix
-# (a 3-line panel IS the per-host view). One SVG per group.
-fleet = load_fleet()
+# (a 3-line panel IS the per-host view). One SVG per group. `nodraw` skips this (fleet boxes measure only).
+fleet = _NODRAW ? [] : load_fleet()
 if isempty(fleet)
     println("no fleet caches on disk to plot")
 else
