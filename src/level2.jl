@@ -46,6 +46,10 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # (dips at first L3-resident size: galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that
 # the y-block stays L1-resident, NP=4 columns per panel, inner loop streams m DOWN each column (tight,
 # continuous per-column streams the L2 prefetcher locks onto), x broadcasts hoisted, y RMW'd from L1.
+# Default OFF: the minner path is a locked-fleet win on AVX2 (galen 512 0.91→1.01) but MIXED on AVX-512
+# (helps some sizes, regresses others), and gating it by µarch would be a post-hoc hack with no measured
+# mechanism. Held until the mechanism is understood (why minner helps narrow but not wide SIMD) — do NOT
+# ship a width-gated two-path without a derived criterion. Preference lets a box opt in for A/B.
 const _GEMVN_MINNER = @load_preference("gemvn_minner", false)::Bool
 const _GEMVN_MINNER_NP = @load_preference("gemvn_minner_np", 8)::Int  # columns/panel. y is re-streamed n/NP times, and at large-n DRAM the A-stream evicts the y-block → small NP doubles y traffic (NP=4 regressed n=4096 26% on Zen4). NP=8 matches the old path's y traffic; sweep on the fleet.
 const _GEMVN_MINNER_U  = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
@@ -660,20 +664,13 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
     return y
 end
 
-# Software-prefetch distance for the ger column RMW: 16 cache lines ahead of the output A-column, ÷sizeof(T)
-# → elements (F64→128, F32→256). This targets the L2→L1 latency × consume-rate (~15–20 ns × ~50 B/ns ≈ ~1 KB)
-# that the HW prefetcher misses on high-latency memory (LPDDR5x); it is CALIBRATED on the fleet, not derived
-# from first principles (a raw DRAM-latency formula gives ~6 KB and mismatches) — same footing as the
-# _double_pumped "measured fact" exception to req#8. The response is NON-MONOTONIC (a mid distance can
-# de-train the region prefetcher — pf≈64 elems regressed), so it's fleet-swept, not free to retune blindly.
-# Preferences-overridable; expressed as 16·cacheline so it tracks the line size.
-const _GER_PF_BYTES = @load_preference("ger_prefetch_bytes", 16 * _CACHELINE)::Int
-# ── ger NP-column m-inner panel (BLASFEO dger shape). The per-column path (`_axpy_simd!` per column below)
-# re-reads x every column AND runs ONE serial A-column RMW stream; the panel loads x ONCE per NP columns and
-# runs NP concurrent RMW streams → more DRAM-level parallelism (the Zen5 short-column starvation) + x-traffic
-# amortized. Keeps the calibrated per-column prefetch (BLASFEO has none — it's our DRAM-regime advantage).
-const _GER_PANEL = @load_preference("ger_panel", false)::Bool   # default OFF pending fleet A/B
-const _GER_PANEL_NP = @load_preference("ger_panel_np", 4)::Int  # concurrent A-column RMW streams
+# ── ger DRAM path: NP-column m-inner panel (BLASFEO dger shape), NP = concurrent wide-SIMD A-column RMW
+# streams. NP is CALIBRATED per box (bench/calibrate.jl) because the optimal stream count is an intrinsic
+# per-core property with NO derivable formula and opposite sign across µarchs — MEASURED (prefetch off, both
+# DRAM sizes): Zen5→1, Zen3→4, Zen4→8. Every external cause was eliminated (memory subsystem scales fine on
+# both; DIMMs rank-matched; OS/clock cancel in the PB/OB ratio; 4K-aliasing padded out; LLVM znver4≡znver5
+# codegen on the same silicon) — so this is a genuine tuning knob, not a µarch hack. Default 4 (a safe middle).
+const _GER_PANEL_NP = @load_preference("ger_panel_np", 4)::Int
 const _GER_PANEL_U  = 4                                          # x-vector unroll (ILP)
 
 @generated function _ger_panel!(Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},
@@ -711,8 +708,7 @@ const _GER_PANEL_U  = 4                                          # x-vector unro
 end
 
 @inline function _ger_panel_driver!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
-    pfd = _GER_PF_BYTES ÷ sizeof(T)
-    pf = (m >= 4pfd && m * n * sizeof(T) > _L3_BYTES) ? pfd : 0
+    pf = 0   # NP (calibrated per box) is THE lever; software prefetch is a wash/slight-hurt for the panel
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         jc = 0
@@ -730,14 +726,13 @@ end
 end
 
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
-    # Panel only when A is DRAM-bound (>L3): PB-self Zen4 showed +18% @4096 but −24% @1024 (cache-resident,
-    # where the tight per-column axpy wins). Neutral @2048 on Zen4 — but that's the WORST ger gap on Zen5
-    # (0.79); whether the panel's NP parallel streams or the prefetch-DISTANCE closes it is the locked-Zen5 A/B.
-    _GER_PANEL && m * n * sizeof(T) > _L3_BYTES && return _ger_panel_driver!(m, n, α, x, y, A)  # default OFF
-    pfd = _GER_PF_BYTES ÷ sizeof(T)
-    # Prefetch ONLY when A exceeds L3 (genuinely DRAM-bound) AND columns are long enough to amortize. On a
-    # cache-resident A the prefetch just pollutes cache + wastes issue slots (regressed Zen4 n=512: 1.09→0.96).
-    pf = (m >= 4pfd && m * n * sizeof(T) > _L3_BYTES) ? pfd : 0
+    # DRAM-bound (A > L3) → m-inner panel with a CALIBRATED stream count `_GER_PANEL_NP`. The optimal number
+    # of concurrent wide-SIMD write-streams is an intrinsic per-core property with NO derivable formula and
+    # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
+    # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
+    # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
+    m * n * sizeof(T) > _L3_BYTES && return _ger_panel_driver!(m, n, α, x, y, A)
+    pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         @inbounds for j in 1:n
