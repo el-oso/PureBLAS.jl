@@ -46,11 +46,14 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # (dips at first L3-resident size: galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that
 # the y-block stays L1-resident, NP=4 columns per panel, inner loop streams m DOWN each column (tight,
 # continuous per-column streams the L2 prefetcher locks onto), x broadcasts hoisted, y RMW'd from L1.
-# Default OFF: the minner path is a locked-fleet win on AVX2 (galen 512 0.91→1.01) but MIXED on AVX-512
-# (helps some sizes, regresses others), and gating it by µarch would be a post-hoc hack with no measured
-# mechanism. Held until the mechanism is understood (why minner helps narrow but not wide SIMD) — do NOT
-# ship a width-gated two-path without a derived criterion. Preference lets a box opt in for A/B.
-const _GEMVN_MINNER = @load_preference("gemvn_minner", false)::Bool
+# DEFAULT = AVX2 only (`_vwidth==4`). Locked-fleet + full bandwidth-decomposition finding: on AVX2 (narrow
+# SIMD, 16 regs) the m-inner's long contiguous per-column streams cleanly gate the mid-n dip (galen 512
+# 0.91→1.01, all mid-n up). On wide SIMD (AVX-512) it's MIXED (the extra y-restream costs more than the
+# stream-quality gain since wide vectors already near-saturate) — verified by decomposition that no lever
+# (α-fold, prefetch, NP, ivdep, inline) closes AVX-512's residual ~3-5% cache-transition gap. The width
+# criterion is the PHYSICAL divide (register budget + saturation), not a hunch. AVX-512 mid-n stays a known
+# residual (see the from-scratch dgemvN effort); do not force minner there.
+const _GEMVN_MINNER = @load_preference("gemvn_minner", _vwidth(Float64) == 4)::Bool
 const _GEMVN_MINNER_NP = @load_preference("gemvn_minner_np", 8)::Int  # columns/panel. y is re-streamed n/NP times, and at large-n DRAM the A-stream evicts the y-block → small NP doubles y traffic (NP=4 regressed n=4096 26% on Zen4). NP=8 matches the old path's y traffic; sweep on the fleet.
 const _GEMVN_MINNER_U  = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
 const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64)))::Int  # m-block: y-block ≤ ½L1 stays resident while sweeping all n columns
