@@ -13,52 +13,47 @@
 # The parameters are swept as RUNTIME kernel args (no recompile per candidate) — that's why this is fast.
 
 using PureBLAS, LinearAlgebra, Printf, Chairmarks, TOML
-import PureBLAS: _axpy_simd!, _vwidth, _L3_BYTES
+import PureBLAS: _ger_panel!, _vwidth, _L3_BYTES
 BLAS.set_num_threads(1)
 const DRYRUN = "dryrun" in ARGS
 
-# ── ger with an EXPLICIT runtime prefetch distance `pf` (elements) — the thing we're tuning. Mirrors
-# `_ger_simd!`'s per-column axpy but with pf passed in instead of read from the (const) preference.
-@noinline function _ger_pf!(A::Matrix{T}, x, y, pf::Int) where {T}
-    m, n = size(A); sz = sizeof(T)
+# ── ger DRAM path with an EXPLICIT stream count NP (the thing we're tuning): the m-inner panel over NP
+# concurrent wide-SIMD A-column RMW streams, prefetch off. The optimal NP is an intrinsic per-core property
+# (measured opposite-sign across µarchs — Zen5→1, Zen3→4, Zen4→8), so it must be measured, not derived.
+@noinline function _ger_np!(A::Matrix{T}, x, y, ::Val{NP}) where {T, NP}
+    m, n = size(A)
     GC.@preserve A x y begin
-        Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2)
-        @inbounds for j in 1:n
-            ayj = unsafe_load(yp, j)
-            _axpy_simd!(m, ayj, xp, Ap + (j - 1) * lda * sz, pf)
-        end
+        Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); jc = 0
+        while jc + NP <= n; _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(NP), Val(4)); jc += NP; end
+        while jc < n; _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(1), Val(4)); jc += 1; end
     end
     return A
 end
+runnp(A, x, y, NP::Int) = NP == 1 ? _ger_np!(A, x, y, Val(1)) : NP == 2 ? _ger_np!(A, x, y, Val(2)) :
+    NP == 4 ? _ger_np!(A, x, y, Val(4)) : _ger_np!(A, x, y, Val(8))
 
-# Winner = the distance that MINIMIZES PB time (OB is fixed, so min PB-time ⇒ max PB/OB gate ratio). Only
-# DRAM-bound sizes (A > L3) are swept — that's the only regime the prefetch fires in (`_ger_simd!` gates it
-# on m·n·sizeof > L3), so cache-resident sizes are unaffected by the distance and must not vote.
-function calibrate_ger_prefetch(::Type{T} = Float64) where {T}
-    W = _vwidth(T)
-    # candidate distances in BYTES (0 = prefetch OFF, e.g. what low-latency DDR5 wants). Spans DDR4/DDR5/
-    # LPDDR5x optima (~1 page … ~2 pages) plus off.
-    cand = [0, 512, 1024, 2048, 4096, 8192, 16384]
-    # smallest square n with A = n²·sizeof > L3, then one larger — the two DRAM points prefetch acts on.
+# Winner = the NP that MINIMIZES PB time (OB fixed ⇒ min PB-time = max PB/OB gate ratio). Swept only at the
+# DRAM sizes (A > L3) — the regime the panel serves; cache-resident ger stays on the per-column path.
+function calibrate_ger_np(::Type{T} = Float64) where {T}
+    W = _vwidth(T); cand = [1, 2, 4, 8]
     n0 = ceil(Int, sqrt(_L3_BYTES / sizeof(T))); sizes = (max(2048, n0 + (W - n0 % W) % W), 4096)
     probs = [(randn(T, n, n), randn(T, n), randn(T, n), n) for n in sizes]
-    @printf("calibrate ger prefetch (%s, sizes %s, DRAM > %.0f MB):\n", T, sizes, _L3_BYTES / 2^20)
+    @printf("calibrate ger stream-count NP (%s, sizes %s, DRAM > %.0f MB):\n", T, sizes, _L3_BYTES / 2^20)
     scores = zeros(length(cand))
-    for (ci, cb) in pairs(cand)
-        pf = cb ÷ sizeof(T)
+    for (ci, NP) in pairs(cand)
         for (A, x, y, n) in probs
-            scores[ci] += minimum(@be _ger_pf!(A, x, y, pf) seconds = 0.4).time / n^2   # per-element time
+            scores[ci] += minimum(@be runnp(A, x, y, NP) seconds = 0.4).time / n^2
         end
-        @printf("  pf = %6d B  →  %.3e\n", cb, scores[ci])
+        @printf("  NP = %d  →  %.3e\n", NP, scores[ci])
     end
     best = cand[argmin(scores)]
-    @printf("  ⇒ BEST ger_prefetch_bytes = %d B\n", best)
+    @printf("  ⇒ BEST ger_panel_np = %d\n", best)
     return best
 end
 
 # ── run every calibration, collect (key => value), write once ──────────────────────────────────────────
 prefs = Pair{String,Any}[]
-push!(prefs, "ger_prefetch_bytes" => calibrate_ger_prefetch())
+push!(prefs, "ger_panel_np" => calibrate_ger_np())
 # (add further runtime-swept params here as they arrive — same pattern)
 
 const LP = joinpath(dirname(Base.active_project()), "LocalPreferences.toml")   # active project (bench/) is where @load_preference reads
