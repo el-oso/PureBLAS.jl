@@ -51,7 +51,7 @@ end
 # prefix EVERY column (n·n/2 extra traffic → the large-n decline). BLASFEO's dsymv is this same fused
 # panel. `bc` = NB per-column base Ptrs with bc[c] + (panel-local row i)·sz = A[row, col_c]; that identity
 # is what makes packed's variable column spacing address-uniform in the row (mirrors `_symv_*panel!`).
-const _SPMV_PANEL = @load_preference("spmv_panel", false)::Bool   # default OFF pending fleet A/B
+const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the large-n decline on all 3 µarchs (galen 2048 0.99→1.51, Zen4 4096 1.09→1.81, Zen5 4096 1.23→1.72)
 # The panel wins only once x+y spill L1 (the re-stream then hits L2/L3 — measured Zen4 PB-self: n=2048
 # +21%, n=4096 +42%, but n=512 −18% where the single-column path's lower setup wins with x/y L1-resident).
 # So size-gate: panel above, per-column below. Crossover ≈ x+y = L1; tune on the locked fleet.
