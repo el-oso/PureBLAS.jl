@@ -46,11 +46,144 @@ end
     return y
 end
 
+# ── Packed symv PANEL kernels (dense-symv fused n+t panel ported to packed via per-column base pointers).
+# Amortizes the x/y re-stream over NB columns — the dense `_symv_col!` per-column path re-reads the x/y
+# prefix EVERY column (n·n/2 extra traffic → the large-n decline). BLASFEO's dsymv is this same fused
+# panel. `bc` = NB per-column base Ptrs with bc[c] + (panel-local row i)·sz = A[row, col_c]; that identity
+# is what makes packed's variable column spacing address-uniform in the row (mirrors `_symv_*panel!`).
+const _SPMV_PANEL = @load_preference("spmv_panel", false)::Bool   # default OFF pending fleet A/B
+# The panel wins only once x+y spill L1 (the re-stream then hits L2/L3 — measured Zen4 PB-self: n=2048
+# +21%, n=4096 +42%, but n=512 −18% where the single-column path's lower setup wins with x/y L1-resident).
+# So size-gate: panel above, per-column below. Crossover ≈ x+y = L1; tune on the locked fleet.
+const _SPMV_PANEL_MINXY = @load_preference("spmv_panel_minxy", _L1_BYTES)::Int  # min x+y bytes (2·n·sizeof) for the panel
+
+function _spmv_offblk_packed_expr(W, V, sz, NB, K, masked)
+    q = Expr(:block)
+    masked && for v in 1:K
+        push!(q.args, :($(Symbol(:k, v)) = (lanes + $((v - 1) * W)) < rmn))
+    end
+    ld = (p, v) -> masked ? :(vload($V, $p + (i + $((v - 1) * W)) * $sz, $(Symbol(:k, v)))) :
+        :(vload($V, $p + (i + $((v - 1) * W)) * $sz))
+    for v in 1:K; push!(q.args, :($(Symbol(:yy, v)) = $(ld(:yp, v)))); end
+    for v in 1:K; push!(q.args, :($(Symbol(:xx, v)) = $(ld(:xp, v)))); end
+    for c in 1:NB
+        for v in 1:K
+            ap = masked ? :(vload($V, bc[$c] + (i + $((v - 1) * W)) * $sz, $(Symbol(:k, v)))) :
+                :(vload($V, bc[$c] + (i + $((v - 1) * W)) * $sz))
+            push!(q.args, :($(Symbol(:aa, v)) = $ap))
+        end
+        for v in 1:K
+            push!(q.args, :($(Symbol(:yy, v)) = muladd($(Symbol(:aa, v)), $(Symbol(:xj, c)), $(Symbol(:yy, v)))))
+            push!(q.args, :($(Symbol(:d, c)) = muladd($(Symbol(:aa, v)), $(Symbol(:xx, v)), $(Symbol(:d, c)))))
+        end
+    end
+    for v in 1:K
+        push!(q.args, masked ? :(vstore($(Symbol(:yy, v)), yp + (i + $((v - 1) * W)) * $sz, $(Symbol(:k, v)))) :
+            :(vstore($(Symbol(:yy, v)), yp + (i + $((v - 1) * W)) * $sz)))
+    end
+    return q
+end
+
+# LOWER panel: NB×NB masked diagonal block (rows 0:NB-1) then off-block below (rows NB:M-1).
+@generated function _spmv_lpanel!(M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T},
+        ::Val{MR}, ::Val{NB}) where {T, MR, NB}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); mr = MR * W
+    body = quote end
+    push!(body.args, :(lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...)))))
+    push!(body.args, :(zv = zero($V)))
+    for c in 1:NB
+        push!(body.args, :($(Symbol(:xj, c)) = $V(α * unsafe_load(xp, $c))))
+        push!(body.args, :($(Symbol(:d, c)) = zero($V)))
+    end
+    push!(body.args, :(mblk = lanes < $NB))
+    push!(body.args, :(yblk = vload($V, yp, mblk)))
+    push!(body.args, :(xblk = vload($V, xp, mblk)))
+    for c in 1:NB
+        push!(body.args, :(acd = vload($V, bc[$c], mblk)))
+        push!(body.args, :(yblk = vifelse(lanes >= $(c - 1), muladd($(Symbol(:xj, c)), acd, yblk), yblk)))
+        push!(body.args, :($(Symbol(:d, c)) = muladd(vifelse(lanes > $(c - 1), acd, zv), xblk, $(Symbol(:d, c)))))
+    end
+    push!(body.args, :(vstore(yblk, yp, mblk)))
+    push!(body.args, :(i = $NB; nfull = M - rem(M - $NB, $mr); while i < nfull; $(_spmv_offblk_packed_expr(W, V, sz, NB, MR, false)); i += $mr; end))
+    branches = _spmv_offblk_packed_expr(W, V, sz, NB, 1, true)
+    for k in 2:MR; branches = Expr(:if, :(rmn > $((k - 1) * W)), _spmv_offblk_packed_expr(W, V, sz, NB, k, true), branches); end
+    push!(body.args, :(if i < M; rmn = M - i; $branches; end))
+    for c in 1:NB; push!(body.args, :(unsafe_store!(yp, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, $c)), $c))); end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# UPPER panel: off-block rows 0:dboff-1 (dboff=M-NB) then NB×NB masked diagonal block at rows dboff:M-1.
+@generated function _spmv_upanel!(M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T},
+        ::Val{MR}, ::Val{NB}) where {T, MR, NB}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); mr = MR * W
+    body = quote end
+    push!(body.args, :(lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...)))))
+    push!(body.args, :(zv = zero($V)))
+    push!(body.args, :(dboff = M - $NB))
+    for c in 1:NB
+        push!(body.args, :($(Symbol(:xj, c)) = $V(α * unsafe_load(xp, dboff + $c))))
+        push!(body.args, :($(Symbol(:d, c)) = zero($V)))
+    end
+    push!(body.args, :(i = 0; nfull = dboff - rem(dboff, $mr); while i < nfull; $(_spmv_offblk_packed_expr(W, V, sz, NB, MR, false)); i += $mr; end))
+    branches = _spmv_offblk_packed_expr(W, V, sz, NB, 1, true)
+    for k in 2:MR; branches = Expr(:if, :(rmn > $((k - 1) * W)), _spmv_offblk_packed_expr(W, V, sz, NB, k, true), branches); end
+    push!(body.args, :(if i < dboff; rmn = dboff - i; $branches; end))
+    push!(body.args, :(mblk = lanes < $NB))
+    push!(body.args, :(yblk = vload($V, yp + dboff * $sz, mblk)))
+    push!(body.args, :(xblk = vload($V, xp + dboff * $sz, mblk)))
+    for c in 1:NB
+        push!(body.args, :(acd = vload($V, bc[$c] + dboff * $sz, mblk)))
+        push!(body.args, :(yblk = vifelse(lanes <= $(c - 1), muladd($(Symbol(:xj, c)), acd, yblk), yblk)))
+        push!(body.args, :($(Symbol(:d, c)) = muladd(vifelse(lanes < $(c - 1), acd, zv), xblk, $(Symbol(:d, c)))))
+    end
+    push!(body.args, :(vstore(yblk, yp + dboff * $sz, mblk)))
+    for c in 1:NB; push!(body.args, :(unsafe_store!(yp, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, dboff + $c)), dboff + $c))); end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Panel driver: full NB-column panels via the fused kernels, per-column bases from _pkU/_pkL; partial last
+# panel falls back to the per-column path (same as _spmv_simd!). bc[c] + row·sz = A[row, panel-col c].
+@inline function _spmv_panel_driver!(up::Bool, n::Int, α::T, AP, x, y) where {T<:BlasReal}
+    NB = min(_SYMV_NB, _vwidth(T))
+    GC.@preserve AP x y begin
+        base = pointer(AP); xp = pointer(x); yp = pointer(y); sz = sizeof(T)
+        jb = 0
+        while jb + NB <= n
+            if up
+                bc = ntuple(c -> base + _pkU(jb + c) * sz, Val(NB))                 # A[i,jb+c] (1-based i≤jb+c) = base+(_pkU(jb+c)+i-1); 0-based row → +i
+                _spmv_upanel!(jb + NB, α, bc, xp, yp, Val(_SYMV_MR), Val(NB))
+            else
+                bc = ntuple(c -> base + (_pkL(jb + c, n) + 1 - c) * sz, Val(NB))     # A[jb+i+1,jb+c] = base+(_pkL(jb+c,n)+1-c)+i
+                _spmv_lpanel!(n - jb, α, bc, xp + jb * sz, yp + jb * sz, Val(_SYMV_MR), Val(NB))
+            end
+            jb += NB
+        end
+        @inbounds while jb < n                                                       # partial last panel (per-column)
+            axj = α * unsafe_load(xp, jb + 1)
+            if up
+                cp = base + _pkU(jb + 1) * sz; ajj = unsafe_load(cp + jb * sz)
+                s = _symv_col!(jb, axj, cp, xp, yp)
+            else
+                cp = base + _pkL(jb + 1, n) * sz; ajj = unsafe_load(cp)
+                s = _symv_col!(n - 1 - jb, axj, cp + sz, xp + (jb + 1) * sz, yp + (jb + 1) * sz)
+            end
+            unsafe_store!(yp, unsafe_load(yp, jb + 1) + axj * ajj + α * s, jb + 1)
+            jb += 1
+        end
+    end
+    return y
+end
+
 function _spmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Number, y, incy::Integer)
     _scale_y!(Int(n), β, y, incy)
     iszero(α) && return y
     if _pk2_simd_ok(AP, x, y, incx, incy)
-        return _spmv_simd!(up, Int(n), convert(eltype(AP), α), AP, x, y)
+        T = eltype(AP)                                        # panel only where x+y spill L1 (large-n flatten); else per-column
+        return (_SPMV_PANEL && 2 * Int(n) * sizeof(T) >= _SPMV_PANEL_MINXY) ?
+            _spmv_panel_driver!(up, Int(n), convert(T, α), AP, x, y) :
+            _spmv_simd!(up, Int(n), convert(T, α), AP, x, y)
     end
     n = Int(n); sx = _start(n, incx); sy = _start(n, incy); s0 = zero(_et(AP)) * zero(_et(x))
     @inbounds for j in 1:n
