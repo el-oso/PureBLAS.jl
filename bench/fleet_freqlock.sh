@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
-# Frequency-lock a fleet box to its BASE clock for drift-free OB-vs-PB benchmarking — robust against the
-# amd_pstate ACTIVE (epp) trap.
+# ============================================================================================
+# THE FLEET FREQUENCY METHODOLOGY — SINGLE SOURCE OF TRUTH. DO NOT RE-DECIDE THIS PER SESSION.
+# ============================================================================================
+# THE canonical command for every gate / plot measurement, on every box:
+#
+#       sudo bench/fleet_freqlock.sh lock
+#
+# It puts the box in the ONE reproducible state: amd_pstate=passive + BOOST OFF + all cores pinned to
+# BASE clock (min=max) + the achieved frequency VERIFIED under load. Run it once per box before a sweep;
+# run `verify` (no sudo) any time to confirm the box is still locked. `restore` undoes it.
+#
+# STRICT RULES (agents + humans — non-negotiable, this ends the recurring flip-flop):
+#   1. NEVER benchmark for the gate unless this script's `verify` reports ✅ (locked at base, boost off).
+#      A boosting/floating clock (boost=1) gives wide, irreproducible OB/PB ratios — any number measured
+#      there is INVALID and must be discarded, not "explained".
+#   2. There is NO stable high pin. base < requested → impossible. Concretely: you CANNOT lock 4000 MHz on
+#      a chip whose base is ~2 GHz — 4000 lives in the boost range, and boost frequencies float ABOVE
+#      scaling_max_freq and cannot be held at a fixed value. `pin <MHz>` with MHz > base will FAIL verify
+#      BY DESIGN (see below). If you want "a higher clock", the answer is: base clock is the ceiling for a
+#      LOCKED run. Do not chase a fixed boost frequency; it does not exist as a stable state.
+#   3. Absolute clock is IRRELEVANT to the gate — it is a PB/OB ratio, both sides run at the same clock.
+#      So there is no benefit to a higher clock and a real cost (drift). Base-clock-locked is the answer,
+#      permanently. If a future session is tempted to re-open this: don't. Measure on `lock`, full stop.
 #
 # Why base clock (boost off): the plotted number is a RATIO to OpenBLAS, so absolute speed is irrelevant;
 # what matters is that the clock does not DRIFT between the OB window and the PB window. The base clock is
 # the only thermally-sustainable one, so it stays flat across a multi-minute sweep. Boost floats with
-# thermals → wide, unreproducible ratios. (This box's base is ~2.0 GHz; everything above is CPB/boost.)
+# thermals → wide, unreproducible ratios. (Neuromancer/Zen5 base ~2.0 GHz, boost to 4.9; the 4000 "pin"
+# tried earlier was in the boost range → it floated to ~4844 and was never actually locked.)
 #
 # The trap this fixes: with the amd-pstate-epp driver in `active` mode, the kernel manages frequency via EPP
 # hints and SILENTLY REVERTS manual `scaling_max_freq` clamps and ignores the `boost` node — so the obvious
@@ -18,11 +40,12 @@
 # the benchmark core under actual load (perf `cycles`, or scaling_cur_freq sampled under load as fallback).
 #
 # Usage (run on the target box):
-#   sudo bench/fleet_freqlock.sh lock      # passive + base clock, boost off  ← what the gate/plots want
-#   sudo bench/fleet_freqlock.sh pin 2000  # passive + hard-pin all cores to 2000 MHz (min=max)
-#   sudo bench/fleet_freqlock.sh restore   # back to active/epp, boost on, full range
+#   sudo bench/fleet_freqlock.sh lock      # ← THE canonical gate state: passive + boost OFF + base clock + verify
+#   sudo bench/fleet_freqlock.sh pin 1800  # passive + hard-pin ≤ base (boost off, verified); >base is REFUSED
+#   sudo bench/fleet_freqlock.sh restore   # back to active/epp, boost on, full range (daily-use state)
 #        bench/fleet_freqlock.sh verify     # (no sudo) measure achieved freq of the bench core under load
 # Env: CORE=<n> selects the core to verify (default 8, neuromancer's `taskset -c 8` bench core).
+#      (wintermute bench core = 2, galen = 6, neuromancer = 8 — pass CORE=<n> to match the box.)
 
 set -euo pipefail
 STATUS=/sys/devices/system/cpu/amd_pstate/status
@@ -114,8 +137,16 @@ case "${1:-verify}" in
     fi ;;
   pin)
     need_root pin
-    mhz="${2:?usage: sudo $0 pin <MHz>}"
+    mhz="${2:?usage: sudo $0 pin <MHz>  (MHz must be ≤ base clock; use 'lock' for the canonical base-clock state)}"
     ensure_passive || { echo "  passive needed for a hard pin; persisting boot param:"; persist_grub; echo ">>> reboot, reconnect, re-run."; exit 3; }
+    echo 0 > "$BOOST" 2>/dev/null || true                     # a hard pin MUST kill boost, else it floats above the pin
+    base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))   # boost-off cpuinfo_max = base
+    if [ "$mhz" -gt "$base" ]; then
+        echo "❌ requested ${mhz} MHz > base ${base} MHz. Boost frequencies do NOT lock (they float above"
+        echo "   scaling_max_freq with thermals). There is no stable pin above base — use 'sudo $0 lock'"
+        echo "   for the canonical base-clock state. Refusing to ship an unlockable target."
+        exit 2
+    fi
     pin_khz $(( mhz * 1000 ))
     verify_or_die "$mhz" ;;
   restore)
