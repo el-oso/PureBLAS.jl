@@ -40,19 +40,39 @@ end
 const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
 const _GEMV_NP = 8             # gemv-N column-panel width
-# ── gemvN m-inner panel (OpenBLAS dgemv_n shape). Default OFF pending fleet A/B (see _gemv_n_paneldrv_minner!).
-# The current panel path holds a full row-block's y in registers and sweeps columns inner, so each of NP=8
-# A-columns is read in mr-row bursts with big gaps → the HW prefetcher can't sustain 8 strided streams
-# (dips at first L3-resident size: galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that
-# the y-block stays L1-resident, NP=4 columns per panel, inner loop streams m DOWN each column (tight,
-# continuous per-column streams the L2 prefetcher locks onto), x broadcasts hoisted, y RMW'd from L1.
-# Default OFF: the minner path is a locked-fleet win on AVX2 (galen 512 0.91→1.01) but MIXED on AVX-512
-# (helps some sizes, regresses others), and gating it by µarch would be a post-hoc hack with no measured
-# mechanism. Held until the mechanism is understood (why minner helps narrow but not wide SIMD) — do NOT
-# ship a width-gated two-path without a derived criterion. Preference lets a box opt in for A/B.
-const _GEMVN_MINNER = @load_preference("gemvn_minner", false)::Bool
-const _GEMVN_MINNER_NP = @load_preference("gemvn_minner_np", 8)::Int  # columns/panel. y is re-streamed n/NP times, and at large-n DRAM the A-stream evicts the y-block → small NP doubles y traffic (NP=4 regressed n=4096 26% on Zen4). NP=8 matches the old path's y traffic; sweep on the fleet.
+# ── gemvN m-inner panel (OpenBLAS dgemv_n shape; see _gemv_n_paneldrv_minner!). The old panel path holds
+# a full row-block's y in registers and sweeps columns inner, so each of NP=8 A-columns is read in mr-row
+# bursts with big gaps → the HW prefetcher can't sustain 8 strided streams (dips at first L3-resident size:
+# galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that the y-block stays L1-resident,
+# columns grouped per panel, inner loop streams m DOWN each column (tight, continuous per-column streams
+# the prefetchers lock onto), x broadcasts hoisted, y RMW'd from L1. Default ON since the AVX-512 mid-n
+# mechanism was decomposed (wintermute, gate methodology): the residual 3-5% vs OB was NOT codegen (asm is
+# spill-free, loads folded into FMAs) and NOT SW prefetch (token & full-rate, t0/t1/nta, 256-4096B all
+# neutral-to-harmful) — it is PANEL WIDTH, three measured regimes (see _gemvn_minner_np). AVX2's verified
+# config (NP=8) is reproduced exactly by the same formula (16-reg cap → wide=assoc=8).
+const _GEMVN_MINNER = @load_preference("gemvn_minner", true)::Bool
 const _GEMVN_MINNER_U  = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
+# Panel width (columns/panel = concurrent A-read streams; y re-streamed n/NP times) — three regimes:
+#  narrow  A ≤ 2·L2 (partially L2-resident band, e.g. f64 n=512 = 2 MB): few streams win. NP8 = 0.95 vs OB,
+#          NP5/6 ≈ 1.00 (16-round gate check; 5 vs 6 within noise). Mechanism: with A partly L2-resident the
+#          L2→L1 feed, not MLP, limits — more concurrent streams only thrash the DL1/its prefetcher.
+#          Empirical width: assoc−2 (streams + y + slack fit the 8-way L1); Preferences-overridable.
+#  aliased lda·sizeof ≡ 0 mod L1-way (po2 lda: 1024/1536/2048 f64): ALL NP streams index the SAME L1 set,
+#          so NP is capped at the associativity (8-way: NP12 1.027/1.264 vs NP8 1.067/1.283 @1024/2048).
+#          Proof it's aliasing, not size: de-aliased via lda+8 pad @1024, NP12 1.107 > NP8 1.079 flips back.
+#  wide    otherwise: NP12 — fewer y-RMW re-streams; the extra streams cost nothing (streams spread over
+#          ≥2 sets: worst case s=way/2 → 12/2+1 = 7 ≤ 8 ways). n=768: NP8 0.978 → NP12 1.019 (A-only read
+#          runs 69-71 GB/s vs OB's 67 total, so the y-restream tax was the whole gap). Register-capped:
+#          NP+U+1 live vectors = 17 ≤ 32 on AVX-512; on 16-reg ISAs 12+4+1 spills → cap at assoc (=8, the
+#          fleet-verified AVX2 config).
+const _GEMVN_NP_NARROW = @load_preference("gemvn_np_narrow", max(2, _L1D_ASSOC - 2))::Int
+const _GEMVN_NP_WIDE   = @load_preference("gemvn_np_wide",
+    _NVREG >= 32 ? min(12, _NVREG - _GEMVN_MINNER_U - 1) : _L1D_ASSOC)::Int
+@inline function _gemvn_minner_np(m::Int, n::Int, lda::Int, ::Type{T}) where {T}
+    m * n * sizeof(T) <= 2 * _L2_BYTES && return _GEMVN_NP_NARROW
+    (lda * sizeof(T)) % _L1_WAY_BYTES == 0 && return min(_L1D_ASSOC, _GEMVN_NP_WIDE)
+    return _GEMVN_NP_WIDE
+end
 const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64)))::Int  # m-block: y-block ≤ ½L1 stays resident while sweeping all n columns
 # minner helps the mid-n/L3 regime (measured Zen4 PB-self: n=512-2048 ~8-10% faster) but the y-restream
 # regresses deep-DRAM n (4096 ~16% slower, where the old NP=8 path already gates 1.31×). So cap minner to
@@ -256,9 +276,25 @@ end
 # m-BLOCKED driver: each m-block's y stays ≤½L1 resident while all n columns stream through it once,
 # NP columns per panel, m streamed inner (tight per-column streams). β pre-applied per y-block, then
 # panels pure-accumulate. This is OpenBLAS's dgemv_n structure (NBMAX m-block × 4-col groups).
+# One m-block × all its column panels at compile-time width NP (Val-dispatched by the driver below).
+@inline function _gemv_n_mblock_minner!(yb::Ptr{T}, Ab0::Ptr{T}, lda::Int, xptr::Ptr{T}, n::Int,
+        mb::Int, α::T, ::Val{NP}) where {T, NP}
+    jc = 0
+    while jc + NP <= n
+        _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(NP), Val(_GEMVN_MINNER_U))
+        jc += NP
+    end
+    while jc < n                                 # column remainder (< NP): 1-column panels
+        _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(1), Val(_GEMVN_MINNER_U))
+        jc += 1
+    end
+    return
+end
+
 @inline function _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T<:BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = pointer(y); xptr = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        np = _gemvn_minner_np(m, n, lda, T)      # regime-selected panel width (consts → Val below is static)
         i0 = 0
         while i0 < m
             mb = min(_GEMVN_MB, m - i0)
@@ -268,14 +304,12 @@ end
             elseif β != one(T)
                 @inbounds for i in 1:mb; unsafe_store!(yb, β * unsafe_load(yb, i), i); end
             end
-            jc = 0
-            while jc + _GEMVN_MINNER_NP <= n
-                _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(_GEMVN_MINNER_NP), Val(_GEMVN_MINNER_U))
-                jc += _GEMVN_MINNER_NP
-            end
-            while jc < n                                 # column remainder (< NP): 1-column panels
-                _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(1), Val(_GEMVN_MINNER_U))
-                jc += 1
+            if np == _GEMVN_NP_WIDE
+                _gemv_n_mblock_minner!(yb, Ab0, lda, xptr, n, mb, α, Val(_GEMVN_NP_WIDE))
+            elseif np == _GEMVN_NP_NARROW
+                _gemv_n_mblock_minner!(yb, Ab0, lda, xptr, n, mb, α, Val(_GEMVN_NP_NARROW))
+            else                                         # aliased-lda cap (≤ L1 associativity)
+                _gemv_n_mblock_minner!(yb, Ab0, lda, xptr, n, mb, α, Val(min(_L1D_ASSOC, _GEMVN_NP_WIDE)))
             end
             i0 += mb
         end
