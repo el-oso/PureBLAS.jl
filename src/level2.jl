@@ -587,7 +587,9 @@ end
 const _GER_PF_BYTES = @load_preference("ger_prefetch_bytes", 16 * _CACHELINE)::Int
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
     pfd = _GER_PF_BYTES ÷ sizeof(T)
-    pf = m >= 4pfd ? pfd : 0                    # only prefetch long (DRAM-bound) columns; short cols → 0
+    # Prefetch ONLY when A exceeds L3 (genuinely DRAM-bound) AND columns are long enough to amortize. On a
+    # cache-resident A the prefetch just pollutes cache + wastes issue slots (regressed Zen4 n=512: 1.09→0.96).
+    pf = (m >= 4pfd && m * n * sizeof(T) > _L3_BYTES) ? pfd : 0
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         @inbounds for j in 1:n
