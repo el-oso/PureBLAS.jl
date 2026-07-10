@@ -520,8 +520,12 @@ function svg_panels(path, title, fleet, gk)
             for (s, v) in ps; println(io, """<circle cx="$(round(xof(s),digits=1))" cy="$(round(yof(median(v)),digits=1))" r="2" fill="$col"/>"""); end
         end
         println(io, """<text x="$(px+pw/2)" y="$(py-5)" text-anchor="middle" font-size="12" font-weight="bold">$op</text>""")
-        println(io, """<text x="$px" y="$(py+ph+12)" font-size="9" fill="#999">n=$(minimum(allsz))</text>""")
-        println(io, """<text x="$(px+pw)" y="$(py+ph+12)" text-anchor="end" font-size="9" fill="#999">$(maximum(allsz))</text>""")
+        # x-axis: a tick + label at every measured size (≥1024 abbreviated as k so they fit the narrow panel)
+        for s in allsz
+            x = round(xof(s), digits = 1); lbl = s >= 1024 ? "$(s ÷ 1024)k" : "$s"
+            println(io, """<line x1="$x" y1="$py" x2="$x" y2="$(py+ph)" stroke="#f4f4f4"/>""")
+            println(io, """<text x="$x" y="$(py+ph+11)" text-anchor="middle" font-size="8" fill="#999">$lbl</text>""")
+        end
     end
     println(io, "</svg>"); write(path, String(take!(io))); println("wrote $path")
 end

@@ -41,8 +41,20 @@
 <circle cx="221.0" cy="87.3" r="2" fill="#1f77b4"/>
 <circle cx="256.0" cy="82.0" r="2" fill="#1f77b4"/>
 <text x="151.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">zgemvN</text>
-<text x="46" y="210" font-size="9" fill="#999">n=64</text>
-<text x="256" y="210" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="46.0" y1="60" x2="46.0" y2="198" stroke="#f4f4f4"/>
+<text x="46.0" y="209" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="81.0" y1="60" x2="81.0" y2="198" stroke="#f4f4f4"/>
+<text x="81.0" y="209" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="116.0" y1="60" x2="116.0" y2="198" stroke="#f4f4f4"/>
+<text x="116.0" y="209" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="151.0" y1="60" x2="151.0" y2="198" stroke="#f4f4f4"/>
+<text x="151.0" y="209" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="186.0" y1="60" x2="186.0" y2="198" stroke="#f4f4f4"/>
+<text x="186.0" y="209" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="221.0" y1="60" x2="221.0" y2="198" stroke="#f4f4f4"/>
+<text x="221.0" y="209" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="256.0" y1="60" x2="256.0" y2="198" stroke="#f4f4f4"/>
+<text x="256.0" y="209" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="276" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="276" y1="115.76276119065531" x2="486" y2="115.76276119065531" stroke="#bbb"/>
 <line x1="276" y1="120.6060155617169" x2="486" y2="120.6060155617169" stroke="#d33" stroke-dasharray="4 3"/>
@@ -77,8 +89,20 @@
 <circle cx="451.0" cy="92.6" r="2" fill="#1f77b4"/>
 <circle cx="486.0" cy="84.0" r="2" fill="#1f77b4"/>
 <text x="381.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">zgemvT</text>
-<text x="276" y="210" font-size="9" fill="#999">n=64</text>
-<text x="486" y="210" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="276.0" y1="60" x2="276.0" y2="198" stroke="#f4f4f4"/>
+<text x="276.0" y="209" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="311.0" y1="60" x2="311.0" y2="198" stroke="#f4f4f4"/>
+<text x="311.0" y="209" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="346.0" y1="60" x2="346.0" y2="198" stroke="#f4f4f4"/>
+<text x="346.0" y="209" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="381.0" y1="60" x2="381.0" y2="198" stroke="#f4f4f4"/>
+<text x="381.0" y="209" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="416.0" y1="60" x2="416.0" y2="198" stroke="#f4f4f4"/>
+<text x="416.0" y="209" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="451.0" y1="60" x2="451.0" y2="198" stroke="#f4f4f4"/>
+<text x="451.0" y="209" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="486.0" y1="60" x2="486.0" y2="198" stroke="#f4f4f4"/>
+<text x="486.0" y="209" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="506" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="506" y1="115.76276119065531" x2="716" y2="115.76276119065531" stroke="#bbb"/>
 <line x1="506" y1="120.6060155617169" x2="716" y2="120.6060155617169" stroke="#d33" stroke-dasharray="4 3"/>
@@ -113,8 +137,20 @@
 <circle cx="681.0" cy="91.9" r="2" fill="#1f77b4"/>
 <circle cx="716.0" cy="83.6" r="2" fill="#1f77b4"/>
 <text x="611.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">zgemvC</text>
-<text x="506" y="210" font-size="9" fill="#999">n=64</text>
-<text x="716" y="210" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="506.0" y1="60" x2="506.0" y2="198" stroke="#f4f4f4"/>
+<text x="506.0" y="209" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="541.0" y1="60" x2="541.0" y2="198" stroke="#f4f4f4"/>
+<text x="541.0" y="209" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="576.0" y1="60" x2="576.0" y2="198" stroke="#f4f4f4"/>
+<text x="576.0" y="209" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="611.0" y1="60" x2="611.0" y2="198" stroke="#f4f4f4"/>
+<text x="611.0" y="209" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="646.0" y1="60" x2="646.0" y2="198" stroke="#f4f4f4"/>
+<text x="646.0" y="209" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="681.0" y1="60" x2="681.0" y2="198" stroke="#f4f4f4"/>
+<text x="681.0" y="209" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="716.0" y1="60" x2="716.0" y2="198" stroke="#f4f4f4"/>
+<text x="716.0" y="209" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="736" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="736" y1="115.76276119065531" x2="946" y2="115.76276119065531" stroke="#bbb"/>
 <line x1="736" y1="120.6060155617169" x2="946" y2="120.6060155617169" stroke="#d33" stroke-dasharray="4 3"/>
@@ -149,8 +185,20 @@
 <circle cx="911.0" cy="97.4" r="2" fill="#1f77b4"/>
 <circle cx="946.0" cy="102.9" r="2" fill="#1f77b4"/>
 <text x="841.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">zgeru</text>
-<text x="736" y="210" font-size="9" fill="#999">n=64</text>
-<text x="946" y="210" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="736.0" y1="60" x2="736.0" y2="198" stroke="#f4f4f4"/>
+<text x="736.0" y="209" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="771.0" y1="60" x2="771.0" y2="198" stroke="#f4f4f4"/>
+<text x="771.0" y="209" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="806.0" y1="60" x2="806.0" y2="198" stroke="#f4f4f4"/>
+<text x="806.0" y="209" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="841.0" y1="60" x2="841.0" y2="198" stroke="#f4f4f4"/>
+<text x="841.0" y="209" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="876.0" y1="60" x2="876.0" y2="198" stroke="#f4f4f4"/>
+<text x="876.0" y="209" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="911.0" y1="60" x2="911.0" y2="198" stroke="#f4f4f4"/>
+<text x="911.0" y="209" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="946.0" y1="60" x2="946.0" y2="198" stroke="#f4f4f4"/>
+<text x="946.0" y="209" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="46" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="46" y1="313.8659996602214" x2="256" y2="313.8659996602214" stroke="#bbb"/>
 <line x1="46" y1="317.17193802156527" x2="256" y2="317.17193802156527" stroke="#d33" stroke-dasharray="4 3"/>
@@ -184,8 +232,20 @@
 <circle cx="221.0" cy="313.5" r="2" fill="#1f77b4"/>
 <circle cx="256.0" cy="316.3" r="2" fill="#1f77b4"/>
 <text x="151.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">zhemv</text>
-<text x="46" y="382" font-size="9" fill="#999">n=64</text>
-<text x="256" y="382" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="46.0" y1="232" x2="46.0" y2="370" stroke="#f4f4f4"/>
+<text x="46.0" y="381" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="81.0" y1="232" x2="81.0" y2="370" stroke="#f4f4f4"/>
+<text x="81.0" y="381" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="116.0" y1="232" x2="116.0" y2="370" stroke="#f4f4f4"/>
+<text x="116.0" y="381" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="151.0" y1="232" x2="151.0" y2="370" stroke="#f4f4f4"/>
+<text x="151.0" y="381" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="186.0" y1="232" x2="186.0" y2="370" stroke="#f4f4f4"/>
+<text x="186.0" y="381" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="221.0" y1="232" x2="221.0" y2="370" stroke="#f4f4f4"/>
+<text x="221.0" y="381" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="256.0" y1="232" x2="256.0" y2="370" stroke="#f4f4f4"/>
+<text x="256.0" y="381" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="276" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="276" y1="299.91455671346336" x2="486" y2="299.91455671346336" stroke="#bbb"/>
 <line x1="276" y1="304.0421470175621" x2="486" y2="304.0421470175621" stroke="#d33" stroke-dasharray="4 3"/>
@@ -219,8 +279,20 @@
 <circle cx="451.0" cy="305.5" r="2" fill="#1f77b4"/>
 <circle cx="486.0" cy="283.8" r="2" fill="#1f77b4"/>
 <text x="381.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">ztrmv</text>
-<text x="276" y="382" font-size="9" fill="#999">n=64</text>
-<text x="486" y="382" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="276.0" y1="232" x2="276.0" y2="370" stroke="#f4f4f4"/>
+<text x="276.0" y="381" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="311.0" y1="232" x2="311.0" y2="370" stroke="#f4f4f4"/>
+<text x="311.0" y="381" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="346.0" y1="232" x2="346.0" y2="370" stroke="#f4f4f4"/>
+<text x="346.0" y="381" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="381.0" y1="232" x2="381.0" y2="370" stroke="#f4f4f4"/>
+<text x="381.0" y="381" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="416.0" y1="232" x2="416.0" y2="370" stroke="#f4f4f4"/>
+<text x="416.0" y="381" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="451.0" y1="232" x2="451.0" y2="370" stroke="#f4f4f4"/>
+<text x="451.0" y="381" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="486.0" y1="232" x2="486.0" y2="370" stroke="#f4f4f4"/>
+<text x="486.0" y="381" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="506" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="506" y1="290.7188042790842" x2="716" y2="290.7188042790842" stroke="#bbb"/>
 <line x1="506" y1="295.387966367667" x2="716" y2="295.387966367667" stroke="#d33" stroke-dasharray="4 3"/>
@@ -255,8 +327,20 @@
 <circle cx="681.0" cy="294.8" r="2" fill="#1f77b4"/>
 <circle cx="716.0" cy="270.3" r="2" fill="#1f77b4"/>
 <text x="611.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">ztrsv</text>
-<text x="506" y="382" font-size="9" fill="#999">n=64</text>
-<text x="716" y="382" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="506.0" y1="232" x2="506.0" y2="370" stroke="#f4f4f4"/>
+<text x="506.0" y="381" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="541.0" y1="232" x2="541.0" y2="370" stroke="#f4f4f4"/>
+<text x="541.0" y="381" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="576.0" y1="232" x2="576.0" y2="370" stroke="#f4f4f4"/>
+<text x="576.0" y="381" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="611.0" y1="232" x2="611.0" y2="370" stroke="#f4f4f4"/>
+<text x="611.0" y="381" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="646.0" y1="232" x2="646.0" y2="370" stroke="#f4f4f4"/>
+<text x="646.0" y="381" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="681.0" y1="232" x2="681.0" y2="370" stroke="#f4f4f4"/>
+<text x="681.0" y="381" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="716.0" y1="232" x2="716.0" y2="370" stroke="#f4f4f4"/>
+<text x="716.0" y="381" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="736" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="736" y1="301.0660303149421" x2="946" y2="301.0660303149421" stroke="#bbb"/>
 <line x1="736" y1="305.12580609080203" x2="946" y2="305.12580609080203" stroke="#d33" stroke-dasharray="4 3"/>
@@ -291,8 +375,20 @@
 <circle cx="911.0" cy="289.6" r="2" fill="#1f77b4"/>
 <circle cx="946.0" cy="289.2" r="2" fill="#1f77b4"/>
 <text x="841.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">zhpmv</text>
-<text x="736" y="382" font-size="9" fill="#999">n=64</text>
-<text x="946" y="382" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="736.0" y1="232" x2="736.0" y2="370" stroke="#f4f4f4"/>
+<text x="736.0" y="381" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="771.0" y1="232" x2="771.0" y2="370" stroke="#f4f4f4"/>
+<text x="771.0" y="381" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="806.0" y1="232" x2="806.0" y2="370" stroke="#f4f4f4"/>
+<text x="806.0" y="381" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="841.0" y1="232" x2="841.0" y2="370" stroke="#f4f4f4"/>
+<text x="841.0" y="381" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="876.0" y1="232" x2="876.0" y2="370" stroke="#f4f4f4"/>
+<text x="876.0" y="381" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="911.0" y1="232" x2="911.0" y2="370" stroke="#f4f4f4"/>
+<text x="911.0" y="381" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="946.0" y1="232" x2="946.0" y2="370" stroke="#f4f4f4"/>
+<text x="946.0" y="381" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="46" y="404" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="46" y1="467.8340185956113" x2="256" y2="467.8340185956113" stroke="#bbb"/>
 <line x1="46" y1="472.20192684279414" x2="256" y2="472.20192684279414" stroke="#d33" stroke-dasharray="4 3"/>
@@ -326,8 +422,20 @@
 <circle cx="221.0" cy="445.1" r="2" fill="#1f77b4"/>
 <circle cx="256.0" cy="443.4" r="2" fill="#1f77b4"/>
 <text x="151.0" y="399" text-anchor="middle" font-size="12" font-weight="bold">zgbmvN</text>
-<text x="46" y="554" font-size="9" fill="#999">n=64</text>
-<text x="256" y="554" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="46.0" y1="404" x2="46.0" y2="542" stroke="#f4f4f4"/>
+<text x="46.0" y="553" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="81.0" y1="404" x2="81.0" y2="542" stroke="#f4f4f4"/>
+<text x="81.0" y="553" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="116.0" y1="404" x2="116.0" y2="542" stroke="#f4f4f4"/>
+<text x="116.0" y="553" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="151.0" y1="404" x2="151.0" y2="542" stroke="#f4f4f4"/>
+<text x="151.0" y="553" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="186.0" y1="404" x2="186.0" y2="542" stroke="#f4f4f4"/>
+<text x="186.0" y="553" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="221.0" y1="404" x2="221.0" y2="542" stroke="#f4f4f4"/>
+<text x="221.0" y="553" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="256.0" y1="404" x2="256.0" y2="542" stroke="#f4f4f4"/>
+<text x="256.0" y="553" text-anchor="middle" font-size="8" fill="#999">4k</text>
 <rect x="276" y="404" width="210" height="138" fill="none" stroke="#e2e2e2"/>
 <line x1="276" y1="459.7627611906553" x2="486" y2="459.7627611906553" stroke="#bbb"/>
 <line x1="276" y1="464.6060155617169" x2="486" y2="464.6060155617169" stroke="#d33" stroke-dasharray="4 3"/>
@@ -362,6 +470,18 @@
 <circle cx="451.0" cy="451.4" r="2" fill="#1f77b4"/>
 <circle cx="486.0" cy="452.8" r="2" fill="#1f77b4"/>
 <text x="381.0" y="399" text-anchor="middle" font-size="12" font-weight="bold">zhbmv</text>
-<text x="276" y="554" font-size="9" fill="#999">n=64</text>
-<text x="486" y="554" text-anchor="end" font-size="9" fill="#999">4096</text>
+<line x1="276.0" y1="404" x2="276.0" y2="542" stroke="#f4f4f4"/>
+<text x="276.0" y="553" text-anchor="middle" font-size="8" fill="#999">64</text>
+<line x1="311.0" y1="404" x2="311.0" y2="542" stroke="#f4f4f4"/>
+<text x="311.0" y="553" text-anchor="middle" font-size="8" fill="#999">128</text>
+<line x1="346.0" y1="404" x2="346.0" y2="542" stroke="#f4f4f4"/>
+<text x="346.0" y="553" text-anchor="middle" font-size="8" fill="#999">256</text>
+<line x1="381.0" y1="404" x2="381.0" y2="542" stroke="#f4f4f4"/>
+<text x="381.0" y="553" text-anchor="middle" font-size="8" fill="#999">512</text>
+<line x1="416.0" y1="404" x2="416.0" y2="542" stroke="#f4f4f4"/>
+<text x="416.0" y="553" text-anchor="middle" font-size="8" fill="#999">1k</text>
+<line x1="451.0" y1="404" x2="451.0" y2="542" stroke="#f4f4f4"/>
+<text x="451.0" y="553" text-anchor="middle" font-size="8" fill="#999">2k</text>
+<line x1="486.0" y1="404" x2="486.0" y2="542" stroke="#f4f4f4"/>
+<text x="486.0" y="553" text-anchor="middle" font-size="8" fill="#999">4k</text>
 </svg>
