@@ -40,6 +40,20 @@ end
 const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
 const _GEMV_NP = 8             # gemv-N column-panel width
+# ── gemvN m-inner panel (OpenBLAS dgemv_n shape). Default OFF pending fleet A/B (see _gemv_n_paneldrv_minner!).
+# The current panel path holds a full row-block's y in registers and sweeps columns inner, so each of NP=8
+# A-columns is read in mr-row bursts with big gaps → the HW prefetcher can't sustain 8 strided streams
+# (dips at first L3-resident size: galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that
+# the y-block stays L1-resident, NP=4 columns per panel, inner loop streams m DOWN each column (tight,
+# continuous per-column streams the L2 prefetcher locks onto), x broadcasts hoisted, y RMW'd from L1.
+const _GEMVN_MINNER = @load_preference("gemvn_minner", false)::Bool
+const _GEMVN_MINNER_NP = @load_preference("gemvn_minner_np", 8)::Int  # columns/panel. y is re-streamed n/NP times, and at large-n DRAM the A-stream evicts the y-block → small NP doubles y traffic (NP=4 regressed n=4096 26% on Zen4). NP=8 matches the old path's y traffic; sweep on the fleet.
+const _GEMVN_MINNER_U  = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
+const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64)))::Int  # m-block: y-block ≤ ½L1 stays resident while sweeping all n columns
+# minner helps the mid-n/L3 regime (measured Zen4 PB-self: n=512-2048 ~8-10% faster) but the y-restream
+# regresses deep-DRAM n (4096 ~16% slower, where the old NP=8 path already gates 1.31×). So cap minner to
+# A ≲ a few × L3 and fall back to the old panel path beyond. Crossover is unmeasured on locked HW → tune.
+const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES)::Int  # max A bytes (m·n·sizeof) for minner
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
@@ -202,9 +216,74 @@ end
     return y
 end
 
+# m-inner panel (OB dgemv_n shape): yb[0:mb) += Σ_{c=0}^{NP-1} (α·x[jc+c])·A[:,jc+c], streaming m DOWN
+# each column. NP x-broadcasts hoisted; U row-vectors held in registers per step for ILP; masked W-tail.
+@generated function _gemv_n_panel_minner!(yb::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T},
+        jc::Int, mb::Int, α::T, ::Val{NP}, ::Val{U}) where {T, NP, U}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    lanetuple = Expr(:tuple, (0:(W - 1))...)
+    body = quote
+        av = $V(α)
+        lanes = Vec{$W, Int}($lanetuple)
+    end
+    for c in 1:NP; push!(body.args, :($(Symbol(:xb, c)) = av * $V(unsafe_load(xp, jc + $c)))); end   # α·x[jc+c-1]
+    main = quote end
+    for u in 1:U; push!(main.args, :($(Symbol(:y, u)) = vload($V, yb + (i + $((u - 1) * W)) * $sz))); end
+    for c in 1:NP, u in 1:U
+        push!(main.args, :($(Symbol(:y, u)) = muladd(
+            vload($V, Ab + (i + $((u - 1) * W) + (jc + $(c - 1)) * lda) * $sz), $(Symbol(:xb, c)), $(Symbol(:y, u)))))
+    end
+    for u in 1:U; push!(main.args, :(vstore($(Symbol(:y, u)), yb + (i + $((u - 1) * W)) * $sz))); end
+    push!(body.args, :(i = 0))
+    push!(body.args, :(while i + $(U * W) <= mb; $main; i += $(U * W); end))
+    tail = quote
+        msk = lanes < (mb - i)
+        yt = vload($V, yb + i * $sz, msk)
+    end
+    for c in 1:NP
+        push!(tail.args, :(yt = muladd(vload($V, Ab + (i + (jc + $(c - 1)) * lda) * $sz, msk), $(Symbol(:xb, c)), yt)))
+    end
+    push!(tail.args, :(vstore(yt, yb + i * $sz, msk)))
+    push!(body.args, :(while i < mb; $tail; i += $W; end))
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# m-BLOCKED driver: each m-block's y stays ≤½L1 resident while all n columns stream through it once,
+# NP columns per panel, m streamed inner (tight per-column streams). β pre-applied per y-block, then
+# panels pure-accumulate. This is OpenBLAS's dgemv_n structure (NBMAX m-block × 4-col groups).
+@inline function _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T<:BlasReal, B0}
+    GC.@preserve A x y begin
+        Aptr = pointer(A); yptr = pointer(y); xptr = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        i0 = 0
+        while i0 < m
+            mb = min(_GEMVN_MB, m - i0)
+            yb = yptr + i0 * sz; Ab0 = Aptr + i0 * sz
+            if B0                                        # β pre-scale this y-block once; panels then accumulate
+                @inbounds for i in 1:mb; unsafe_store!(yb, zero(T), i); end
+            elseif β != one(T)
+                @inbounds for i in 1:mb; unsafe_store!(yb, β * unsafe_load(yb, i), i); end
+            end
+            jc = 0
+            while jc + _GEMVN_MINNER_NP <= n
+                _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(_GEMVN_MINNER_NP), Val(_GEMVN_MINNER_U))
+                jc += _GEMVN_MINNER_NP
+            end
+            while jc < n                                 # column remainder (< NP): 1-column panels
+                _gemv_n_panel_minner!(yb, Ab0, lda, xptr, jc, mb, α, Val(1), Val(_GEMVN_MINNER_U))
+                jc += 1
+            end
+            i0 += mb
+        end
+    end
+    return y
+end
+
 @inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T<:BlasReal, B0}
     if n <= _GEMVN_RB
         _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0))
+    elseif _GEMVN_MINNER && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
+        _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
     else
         _gemv_n_paneldrv!(m, n, α, A, x, y, β, Val(B0))
     end
