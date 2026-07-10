@@ -668,7 +668,72 @@ end
 # de-train the region prefetcher — pf≈64 elems regressed), so it's fleet-swept, not free to retune blindly.
 # Preferences-overridable; expressed as 16·cacheline so it tracks the line size.
 const _GER_PF_BYTES = @load_preference("ger_prefetch_bytes", 16 * _CACHELINE)::Int
+# ── ger NP-column m-inner panel (BLASFEO dger shape). The per-column path (`_axpy_simd!` per column below)
+# re-reads x every column AND runs ONE serial A-column RMW stream; the panel loads x ONCE per NP columns and
+# runs NP concurrent RMW streams → more DRAM-level parallelism (the Zen5 short-column starvation) + x-traffic
+# amortized. Keeps the calibrated per-column prefetch (BLASFEO has none — it's our DRAM-regime advantage).
+const _GER_PANEL = @load_preference("ger_panel", false)::Bool   # default OFF pending fleet A/B
+const _GER_PANEL_NP = @load_preference("ger_panel_np", 4)::Int  # concurrent A-column RMW streams
+const _GER_PANEL_U  = 4                                          # x-vector unroll (ILP)
+
+@generated function _ger_panel!(Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},
+        jc::Int, m::Int, α::T, pf::Int, ::Val{NP}, ::Val{U}) where {T, NP, U}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = U * W
+    body = quote lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...))) end
+    for c in 1:NP
+        push!(body.args, :($(Symbol(:ay, c)) = $V(α * unsafe_load(yp, jc + $c))))       # α·y[jc+c-1]
+        push!(body.args, :($(Symbol(:ac, c)) = Aptr + (jc + $(c - 1)) * lda * $sz))      # column base
+    end
+    main = quote end
+    for u in 1:U; push!(main.args, :($(Symbol(:xv, u)) = vload($V, xp + (i + $((u - 1) * W)) * $sz))); end
+    for c in 1:NP
+        push!(main.args, quote
+            if pf > 0                                                                    # dense prefetch of this A-column pf ahead
+                pb = $(Symbol(:ac, c)) + (i + pf) * $sz
+                for cl in 0:$_CACHELINE:$(step * sz - 1); _prefetch(pb + cl); end
+            end
+        end)
+        for u in 1:U
+            push!(main.args, :(p = $(Symbol(:ac, c)) + (i + $((u - 1) * W)) * $sz))
+            push!(main.args, :(vstore(muladd($(Symbol(:ay, c)), $(Symbol(:xv, u)), vload($V, p)), p)))
+        end
+    end
+    push!(body.args, :(i = 0))
+    push!(body.args, :(while i + $step <= m; $main; i += $step; end))
+    tail = quote msk = lanes < (m - i); xt = vload($V, xp + i * $sz, msk) end
+    for c in 1:NP
+        push!(tail.args, :(pt = $(Symbol(:ac, c)) + i * $sz))
+        push!(tail.args, :(vstore(muladd($(Symbol(:ay, c)), xt, vload($V, pt, msk)), pt, msk)))
+    end
+    push!(body.args, :(while i < m; $tail; i += $W; end))
+    push!(body.args, :(return nothing))
+    return body
+end
+
+@inline function _ger_panel_driver!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
+    pfd = _GER_PF_BYTES ÷ sizeof(T)
+    pf = (m >= 4pfd && m * n * sizeof(T) > _L3_BYTES) ? pfd : 0
+    GC.@preserve A x y begin
+        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        jc = 0
+        while jc + _GER_PANEL_NP <= n
+            _ger_panel!(Aptr, lda, xptr, yptr, jc, m, α, pf, Val(_GER_PANEL_NP), Val(_GER_PANEL_U))
+            jc += _GER_PANEL_NP
+        end
+        @inbounds while jc < n                                                            # remainder columns (< NP)
+            ayj = α * unsafe_load(yptr, jc + 1)
+            iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + jc * lda * sz, pf)
+            jc += 1
+        end
+    end
+    return A
+end
+
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
+    # Panel only when A is DRAM-bound (>L3): PB-self Zen4 showed +18% @4096 but −24% @1024 (cache-resident,
+    # where the tight per-column axpy wins). Neutral @2048 on Zen4 — but that's the WORST ger gap on Zen5
+    # (0.79); whether the panel's NP parallel streams or the prefetch-DISTANCE closes it is the locked-Zen5 A/B.
+    _GER_PANEL && m * n * sizeof(T) > _L3_BYTES && return _ger_panel_driver!(m, n, α, x, y, A)  # default OFF
     pfd = _GER_PF_BYTES ÷ sizeof(T)
     # Prefetch ONLY when A exceeds L3 (genuinely DRAM-bound) AND columns are long enough to amortize. On a
     # cache-resident A the prefetch just pollutes cache + wastes issue slots (regressed Zen4 n=512: 1.09→0.96).
