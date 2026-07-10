@@ -866,3 +866,18 @@ no-multithreading standing rule (that covers CPU threads).
 
 ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). LAPACK surface. SparseArrays
 interop; CHOLMOD / sparse Cholesky.
+
+### Wishlist
+
+- **Pure-Julia reimplementation of BLASFEO kernel ideas.** BLASFEO (github.com/giaf/blasfeo, BSD-2)
+  hand-tunes small/medium-n dense kernels in asm and reaches MKL-level GFlops — *but* its headline speed
+  comes from **panel-major storage** (pre-packed, no runtime packing), which PureBLAS's column-major
+  drop-in contract can't adopt. What transfers is the **kernel STRUCTURE** (register-block shapes, loop
+  order, accumulator counts, prefetch placement, small-n no-pack microkernels, its strong `dtrsv`/`dgemv`
+  level-2 kernels) reimplemented in SIMD.jl/LLVM — our small/mid-n overhead regime is exactly its domain.
+  License is a non-issue: BSD-2 permits derivative work with attribution, and reimplementing the
+  *algorithm* isn't even a copyright question (ideas aren't copyrightable) — **attribution to BLASFEO is
+  the right thing to do regardless, and the user has OK'd giving it.** Pull relevant pieces into PureBLAS
+  *now* wherever a Fable-mapped technique measurably closes a gate on locked HW; the broader systematic
+  port (or a dedicated panel-major sibling package for the embedded-optimization use case) is a future
+  project. Reference-only — never a C/asm dependency (pure-Julia). See the Fable BLASFEO technique-map.
