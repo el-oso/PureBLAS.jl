@@ -83,7 +83,13 @@ function _mat_tri!(M, A, k::Int, up::Bool, tr::Bool, unit::Bool)
     end
     return M
 end
-const _TRMM_DDIRECT = 4      # ≤ this → dense substitution kernel (beats everything at tiny k)
+# ≤ this → scratch-free dense substitution (per-row SIMD axpy/dot, no materialize/scratch setup).
+# Above it → materialize+microkernel (_trmm_small!). MEASURED crossover is k=4 on WIDE SIMD: at k=8 the
+# direct path's per-row axpys are length ~k/2=4, only a quarter of an AVX-512 register, so it loses hard
+# (Zen4 n=8 dropped 1.20→0.57 when widened to 8) while _trmm_small!'s 8×8 tile is one efficient op.
+# Widening only plausibly helps narrow SIMD (Zen3 W=4: len-4 axpy = a full register) — under A/B; keep 4
+# as the wide-SIMD-safe default. Preference lets a box override without a code push.
+const _TRMM_DDIRECT = @load_preference("trmm_ddirect", 4)
 # Small-k trmm at HALF flops and gemm throughput: materialize op(A) into a dense scratch (zeros in the
 # unstored half make every read safe), copy B to scratch (in-place source), then run the UNPACKED gemm
 # micro-kernels with a per-tile K-TRIM — each C-tile contracts only the p-range where M's triangle is
