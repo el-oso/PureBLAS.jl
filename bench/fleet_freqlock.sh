@@ -6,8 +6,11 @@
 #
 #       sudo bench/fleet_freqlock.sh lock
 #
-# It puts the box in the ONE reproducible state: amd_pstate=passive + BOOST OFF + all cores pinned to
-# BASE clock (min=max) + the achieved frequency VERIFIED under load. Run it once per box before a sweep;
+# It puts the box in the ONE reproducible state: amd_pstate=passive + BOOST OFF + all cores pinned
+# (min=max) to the HIGHEST CLOCK THE BOX SUSTAINS UNDER LOAD + the achieved frequency VERIFIED. That is
+# base clock on a desktop (galen 5900X holds it), or the thermal/power ceiling on a power-limited laptop
+# (the 7640U / AI-5-340 can't hold base — a 3501 pin measured only 2367 achieved — so `lock` auto-steps
+# down to 90% of the sustained measurement, the highest FLAT clock). Run it once per box before a sweep;
 # run `verify` (no sudo) any time to confirm the box is still locked. `restore` undoes it.
 #
 # STRICT RULES (agents + humans — non-negotiable, this ends the recurring flip-flop):
@@ -121,12 +124,23 @@ verify_or_die() {
 case "${1:-verify}" in
   lock)
     need_root lock
-    echo "Locking $(hostname) to base clock (boost off)…"
+    echo "Locking $(hostname) to its highest VERIFIED-SUSTAINABLE clock (boost off)…"
     if ensure_passive; then
         echo 0 > "$BOOST" 2>/dev/null || true                 # passive honors this → cpuinfo_max drops to base
-        base=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)
-        pin_khz "$base"
-        verify_or_die $(( base / 1000 ))
+        base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))
+        pin_khz $(( base * 1000 ))
+        got=$(achieved_mhz "$CORE")                           # does the box actually HOLD base under load?
+        if [ "$got" -ge $(( base * 90 / 100 )) ]; then
+            verify_or_die "$base"                             # yes (desktop, e.g. galen) — locked at base
+        else
+            # Power/thermally limited (mobile, e.g. the 7640U/AI-5-340 laptops): base does NOT hold under
+            # sustained load (measured 3501-pin → 2367 achieved). Re-pin to 90% of the sustained measurement
+            # — the highest clock that stays FLAT across a multi-minute sweep (10% margin for thermal creep).
+            stable=$(( got * 90 / 100 ))
+            echo "  ⚠ base ${base} MHz not sustained (load=${got} MHz) — power-limited box; re-pinning ${stable} MHz…"
+            pin_khz $(( stable * 1000 ))
+            verify_or_die "$stable"
+        fi
     else
         echo "  runtime active→passive REJECTED by kernel — persisting the boot param instead:"
         persist_grub
