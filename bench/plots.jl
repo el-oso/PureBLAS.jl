@@ -502,7 +502,7 @@ function svg_panels(path, title, fleet, gk)
         xof(s) = px + pw * (log2(s) - xlo) / xsp
         yof(r) = py + ph * (1 - (L(clamp(r, ylo, yhi)) - L(ylo)) / (L(yhi) - L(ylo)))
         println(io, """<rect x="$px" y="$py" width="$pw" height="$ph" fill="none" stroke="#e2e2e2"/>""")
-        for (rr, cc, da) in ((1.0, "#bbb", ""), (0.96, "#d33", """ stroke-dasharray="4 3\""""))
+        for (rr, cc, da) in ((1.0, "#d33", """ stroke-dasharray="4 3\""""),)   # gate = parity = 1.0×
             (rr < ylo || rr > yhi) && continue
             println(io, """<line x1="$px" y1="$(yof(rr))" x2="$(px+pw)" y2="$(yof(rr))" stroke="$cc"$da/>""")
         end
@@ -603,6 +603,6 @@ end
 # gate summary for THIS host's just-measured/loaded data
 for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, op) in get(g, lvl, OpData[])
     geo, mn = geomin(op)
-    @printf("%-3s %-8s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 0.96 ? "PASS" : "FAIL")
+    @printf("%-3s %-8s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 1.0 ? "PASS" : "FAIL")
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"

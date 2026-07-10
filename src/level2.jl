@@ -577,12 +577,22 @@ function _gemv!(trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x,
     return y
 end
 
+# Software-prefetch distance for the ger column RMW: 16 cache lines ahead of the output A-column, ÷sizeof(T)
+# → elements (F64→128, F32→256). This targets the L2→L1 latency × consume-rate (~15–20 ns × ~50 B/ns ≈ ~1 KB)
+# that the HW prefetcher misses on high-latency memory (LPDDR5x); it is CALIBRATED on the fleet, not derived
+# from first principles (a raw DRAM-latency formula gives ~6 KB and mismatches) — same footing as the
+# _double_pumped "measured fact" exception to req#8. The response is NON-MONOTONIC (a mid distance can
+# de-train the region prefetcher — pf≈64 elems regressed), so it's fleet-swept, not free to retune blindly.
+# Preferences-overridable; expressed as 16·cacheline so it tracks the line size.
+const _GER_PF_BYTES = @load_preference("ger_prefetch_bytes", 16 * _CACHELINE)::Int
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T<:BlasReal}
+    pfd = _GER_PF_BYTES ÷ sizeof(T)
+    pf = m >= 4pfd ? pfd : 0                    # only prefetch long (DRAM-bound) columns; short cols → 0
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         @inbounds for j in 1:n
             ayj = α * unsafe_load(yptr, j)
-            iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + (j - 1) * lda * sz)  # A[:,j] += ayj·x
+            iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + (j - 1) * lda * sz, pf)  # A[:,j] += ayj·x
         end
     end
     return A

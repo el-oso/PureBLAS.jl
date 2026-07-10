@@ -36,13 +36,24 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 # give the prefetcher a longer stride — a single vector/iteration is throughput-starved in the
 # L2-resident regime. `_UNROLL` is defined with the reductions below. Pattern: unrolled body, then
 # a W-at-a-time pass, then a scalar tail.
-@inline function _axpy_simd!(n::Int, a::T, x, y) where {T<:BlasReal}
+# `pf` = software-prefetch distance (elements ahead) for the OUTPUT stream `y`. Default 0 → the whole
+# prefetch block const-folds away, so the L1 `axpy` path (and every other 4-arg caller) is byte-identical.
+# `ger` passes `pf>0`: its `y` is a full A column, so at large m the sequential read-modify-write is
+# memory-latency-bound on high-latency memory (e.g. LPDDR5x) — one prefetch PER CACHE LINE across the
+# unrolled step (the HW prefetcher can't be relied on there) hides it (measured: neuromancer ger n=4096
+# 0.88→~1.0). The prefetch may reach up to `pf` elements past the column end; `llvm.prefetch` lowers to a
+# non-faulting `prefetcht0`, so that's safe. Distance `pf` is a derived const (see `_GER_PF_BYTES`).
+@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T<:BlasReal}
     px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
         va = V(a)
         i = 0
         while i + step <= n
             o = i * sz
+            if pf > 0                                 # const-folds OFF when pf==0 (default / axpy)
+                pb = py + (i + pf) * sz
+                for c in 0:_CACHELINE:(step * sz - 1); _prefetch(pb + c); end   # one prefetch per line
+            end
             vstore(muladd(va, vload(V, px + o), vload(V, py + o)), py + o)
             vstore(muladd(va, vload(V, px + o + W * sz), vload(V, py + o + W * sz)), py + o + W * sz)
             vstore(muladd(va, vload(V, px + o + 2W * sz), vload(V, py + o + 2W * sz)), py + o + 2W * sz)
