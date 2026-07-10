@@ -930,6 +930,18 @@ function trmm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
             k <= _TRMM_DDIRECT ? _trmm_right_base!(up_, tr_, false, unit_, k, A, B) : _trmm_small!(false, up_, tr_, unit_, A, B)
         end
         isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE   # tiny complex: same skip (mirrors _trmm_left!/_right! complex base)
+        up_ = uplo == 'U'; tr_ = transA != 'N'; cj_ = transA == 'C'; unit_ = diag == 'U'
+        if sl
+            !_strided1(B) ? _trmm_cmplx_base_L!(up_, tr_, cj_, unit_, k, A, B) :
+            (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up_, tr_, cj_, unit_, k, A, B) :
+            _trmm_cmplx_small_L!(up_, tr_, cj_, unit_, k, A, B)
+        else
+            !_strided1(B) ? _trmm_cmplx_base_R!(up_, tr_, cj_, unit_, k, A, B) :
+            (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up_, tr_, cj_, unit_, k, A, B) :
+            _trmm_cmplx_small_R!(up_, tr_, cj_, unit_, k, A, B)
+        end
+        isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
     # side-L real large → K-range-trimmed single-pass packed (the straddling tile contracts only its
     # nonzero p-band, not the full kc zero-band — that band was the ~kc/k waste that capped the naive
     # packed trmm). Else (side R, complex/AD, small) → recursion-over-gemm! (no regression).
