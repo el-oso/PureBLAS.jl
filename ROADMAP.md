@@ -2,6 +2,38 @@
 
 Canonical status + next steps for this multi-session project. Update this file as milestones land.
 
+## Tuning methodology — analytical vs empirical (project vocabulary)
+
+Every machine-dependent parameter (block size, cutoff, panel width, stream count, prefetch distance) is
+tuned to the host by one of **two distinct mechanisms**. Use these terms precisely — "auto-tune" alone is
+ambiguous:
+
+- **Analytical tuning** (a.k.a. *model-based*). **Compute** the parameter from a hardware *model* via a
+  formula — cache sizes, vector width, register count, cache-line size, `_double_pumped`. Deterministic, no
+  measurement. This is CLAUDE.md req-8 ("derive from detected hardware"); canonical prior art = **BLIS**
+  (analytic gemm block sizes). PureBLAS: nearly all block sizes / cutoffs, derived from
+  `_L1/_L2/_L3_BYTES` + `_vwidth`. Const-folded at build → **trim-safe**.
+- **Empirical tuning** (a.k.a. *calibration*; "auto-tuning" in the strict historical sense). **Measure**
+  actual runtime behavior with micro-benchmarks and pick the best — needed when no datasheet number
+  captures the effect (memory-access scheduling, store-port concurrency, prefetcher depth). Canonical prior
+  art = **ATLAS** (measures at install) and **FFTW** ("wisdom": measure a plan, cache it). PureBLAS:
+  **ger's `_GER_PANEL_NP`** (concurrent wide-store streams, opposite-signed per µarch, no formula) via
+  `bench/calibrate.jl` (offline → Preference → frozen per-µarch `.so`) or `OncePerProcess` (lazy first-use
+  auto-measure for end users, cached per process).
+
+**The discriminator:** *does a datasheet number suffice?* Cache size is on the datasheet → analytical.
+"How many concurrent 512-bit store streams this core sustains" is not → empirical. Prefer analytical when a
+real formula exists (reproduce the measured-optimal on the fleet, then it extrapolates); fall to empirical
+only when the effect is a *behavior*, not a *parameter*.
+
+**Orthogonal axis — *when* / *where-stored*:** build-time→`const` (analytical, trim-safe) · offline→
+Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · install-time (ATLAS-style, N/A here).
+
+**Anti-pattern — the *analytical heuristic*:** a binary decision from ONE detected parameter (e.g. gemvN's
+`_vwidth==4 ? minner : old`). It generalizes by mechanism but is coarse — neither a real formula nor a
+measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
+analytical formula, an empirical calibration, or a kernel that needs neither.
+
 ## M1 — BLAS Level 1 vertical slice (IN PROGRESS)
 
 Goal: prove the whole pipeline cheaply on bandwidth-bound BLAS-1 (no GEMM perf risk, no Fortran
