@@ -50,9 +50,10 @@ triangular/symmetric ops gate on AVX-512; on AVX2 the worst sizes of `trmm` (0.8
 ![LAPACK — PureBLAS/OpenBLAS ratio per op, three µarchs](assets/perf_lapack.svg)
 
 `potrf`/`geqrf`/`getrf`/`gesvd` gate on all three boxes (geomeans 1.25–1.52). The small-n `potrf`
-campaign — block-small Cholesky plus a **fused** 12-accumulator `trsm`-R panel (downdate + triangular
-solve in one register pass) — brings AVX2 `potrf` to **BLASFEO parity** (the MKL proxy) at n≤224:
-0.91–1.04× its column-major `dpotrf`, and 1.5–2.2× vs OpenBLAS fleet-wide.
+campaign — block-small Cholesky plus a **fused** 12-accumulator `trsm`-R (downdate + triangular solve in
+one register pass, in both the small-n and NB=128 panel drivers) — brings AVX2 `potrf` to **BLASFEO
+parity** (the MKL proxy): 0.91–1.04× its column-major `dpotrf` at n≤224 and 0.87–0.91× at n≥256, and
+1.5–2.2× vs OpenBLAS fleet-wide.
 
 ## Complex (ComplexF64): CL1 / CL2 / CL3 / complex LAPACK
 
