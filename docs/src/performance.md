@@ -49,9 +49,10 @@ triangular/symmetric ops gate on AVX-512; on AVX2 the worst sizes of `trmm` (0.8
 
 ![LAPACK — PureBLAS/OpenBLAS ratio per op, three µarchs](assets/perf_lapack.svg)
 
-`potrf`/`geqrf`/`getrf`/`gesvd` gate on all three boxes (geomeans 1.17–1.49). The banked small-n
-`potrf` campaign — block-small Cholesky plus a 12-accumulator `trsm`-R panel, benchmarked against
-BLASFEO as the MKL proxy — lifts AVX2 small/mid-n to 1.4–1.7×; large-n sits at parity.
+`potrf`/`geqrf`/`getrf`/`gesvd` gate on all three boxes (geomeans 1.25–1.52). The small-n `potrf`
+campaign — block-small Cholesky plus a **fused** 12-accumulator `trsm`-R panel (downdate + triangular
+solve in one register pass) — brings AVX2 `potrf` to **BLASFEO parity** (the MKL proxy) at n≤224:
+0.91–1.04× its column-major `dpotrf`, and 1.5–2.2× vs OpenBLAS fleet-wide.
 
 ## Complex (ComplexF64): CL1 / CL2 / CL3 / complex LAPACK
 
@@ -105,8 +106,8 @@ n=4096.
 
 **Zen3 (AVX2).** The hardest target: 16 ymm registers vs AVX-512's 32 zmm. Real surface gates
 except `trmm`/`trsm` worst sizes; complex carries the widest residual set (`zdot`, `ztrmm`
-both sides, `ztrsm`, `zgetrf`). The banked `potrf` small-n campaign (block-small Cholesky +
-12-accumulator `trsm`-R, vs BLASFEO) lifts AVX2 small/mid-n to 1.4–1.7×; large-n at parity.
+both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Cholesky + a fused
+12-accumulator `trsm`-R) reaches **BLASFEO column-major parity at n≤224** (0.91–1.04×), 1.5–2.2× vs OB.
 
 **Known open items** (tracked in [`ROADMAP.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/ROADMAP.md)):
 
