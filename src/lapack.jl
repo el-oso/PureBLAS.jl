@@ -277,25 +277,6 @@ function _chol_base_f64!(p::Ptr{Float64}, n::Int, ld::Int)
     return true
 end
 
-# panel solve column cc: A10[:,cc] -= Σ_{k<c0} L00[cc,k]·A10[:,k]  (remainder / non-full-NB path).
-@inline function _trsm_gemm_col_f64!(p00, p10, cc::Int, c0::Int, m::Int, ld::Int)
-    i = 1
-    @inbounds while i + _CHOLW - 1 <= m
-        o = _cvptr(p10, i, cc, ld); a = vload(_CVF, o)
-        for k in 1:c0-1
-            a = muladd(_CVF(-unsafe_load(p00, _clidx(cc, k, ld))), vload(_CVF, _cvptr(p10, i, k, ld)), a)
-        end
-        vstore(a, o); i += _CHOLW
-    end
-    @inbounds while i <= m
-        s = unsafe_load(p10, _clidx(i, cc, ld))
-        for k in 1:c0-1
-            s = muladd(-unsafe_load(p00, _clidx(cc, k, ld)), unsafe_load(p10, _clidx(i, k, ld)), s)
-        end
-        unsafe_store!(p10, s, _clidx(i, cc, ld)); i += 1
-    end
-end
-
 # panel solve: L10 (m×bs) from L10·L00ᵀ = A10, in place on A10. FUSED — each NB=4 column panel downdates
 # against all prior columns AND does the within-panel triangular solve in ONE register pass (no store/re-load
 # round-trip between them), MR=3/2/1 tiers like _syrk_lower + a scalar tail. Measured galen: 80–92% of FMA
