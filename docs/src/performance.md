@@ -33,9 +33,10 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ◐ borderline / ✗ < 0.96; geomean
 | L1 axpy · dot · asum · scal | ✓ 0.99–1.06 | ✓ 0.98–1.07 | ✓ 0.99–1.33 | ✓ 0.99–1.33 |
 | L1 nrm2 (scaled-accum beats OpenBLAS) | ✓ 3.6× | ✓ 6.2× | ✓ 5.5× | ✓ 5.5× |
 | L1 iamax | ✓ 1.15 | ✓ 1.32 | ◐ 0.90 (noise) | ◐ 0.90 (noise) |
-| L2 gemvT · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.99–1.23 | ✓ 0.97–1.64 | ✓ 0.97–1.64 |
+| L2 gemvT · symv · trmv · trsv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.99–1.23 | ✓ 0.97–1.64 | ✓ 0.97–1.64 |
+| L2 spmv (AP-residency packed panel) | ✓ 1.79 | ✓ 1.35 | ✓ 1.92 | ✓ 1.92 |
 | L2 ger | ✓ 1.09 | ✓ 1.00 (calibrated write-stream NP) | ✓ 1.00 | ✓ 1.00 |
-| L2 gemvN | ✓ 0.99 | ✗ 0.85 (mid-n, native-512) | ✓ 1.02 (regime-derived panel width) | ✓ 1.02 |
+| L2 gemvN | ✓ 1.00 | ✗ 0.90 (mid-n native-512 residual) | ✓ 1.00 (regime-derived panel width) | ✓ 1.00 |
 | L3 gemm | ✗ 0.83 (n=8 dispatch) | ◐ 0.93 (n=8; geomean 1.14) | ✓ 1.03 (clip) | ✓ 1.03 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.11 | ✓ 0.96–1.02 | ✓ 0.96–1.02 |
 | **L2 complex** zhemv · zgeru · zdotc · zscal · zaxpy · dzasum | ✓ 0.99–2× | — | ✓ 0.96–2× (n=1000 zdotc/zscal ◐) | ✓ |
