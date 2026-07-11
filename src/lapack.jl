@@ -811,16 +811,6 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
         # is the side-R-T laggard the panel driver's fused split-ld trsm avoids. (AVX-512 W=8 stays below.)
         return _chol_panel_f64!(A, n)
     end
-    if _CHOLW == 4 && n == _CHOL_BLOCK && _chol_needs_pad(A, n)
-        # po2 n=128 (n == _CHOL_BLOCK ⇒ single block, m=0, no trailing to fuse into): route through the
-        # fused panel driver at HALF blocks (blk = _CHOL_THRESHOLD = 64) instead of the whole-matrix pad
-        # round-trip. Only the two 64×64 diagonal blocks round-trip through the alias-free _CHOL_D; the A21
-        # panel read is fused into the split-trsm first touch (free), the trailing syrk reads L2-hot _CHOL_T.
-        # ~½ the copy traffic AND the heavy-reuse trsm/syrk k-loops hit conflict-free scratch, not po2 A.
-        # (Copy can't be fully eliminated — factoring a po2-strided diag block in place thrashes L1; the
-        # alias-free scratch IS the cure. This shrinks it to the diagonal + makes reused reads cache-hot.)
-        return _chol_panel_f64!(A, n, _CHOL_THRESHOLD)
-    end
     if _chol_needs_pad(A, n)                      # factor in a non-conflicting (ld = n+8) scratch, copy back
         R = n + 8
         b = _CHOL_PAD[]
