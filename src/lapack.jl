@@ -193,6 +193,14 @@ const _CVF = Vec{_vwidth(Float64), Float64}     # vector type at host width (con
 const _CHOLW = _vwidth(Float64)
 const _CHOL_THRESHOLD = 64                        # faer LdltParams::auto
 const _CHOL_BLOCK = 128
+# Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
+# (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
+# the bulk through the FMA-efficient rank-k trailing (_trsm_right/_syrk) and confines the slow base to
+# ≤16-col diagonal blocks. Measured galen/Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
+# (n=64 14.5→19.9, gate 1.12→1.54×). th ≈ (MR+1)·W = one full 3×W row-block + tail; bs = 2·th keeps the
+# trailing panel L1-resident. ponytail: measured literals, req#8 derive-from-cache debt like _CHOL_BLOCK.
+const _CHOL_STH = 16
+const _CHOL_SB = 32
 const _CHOL_NB = 4                                # trsm panel column block
 const _CHOL_NC = 4                                # syrk column block
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
@@ -495,7 +503,7 @@ const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : 128
 # PureBLAS's cache-blocked trsm!/syrk! (which gate at large k) — and bottom out in the faer kernels.
 function _chol_hyb_f64!(M, n::Int, base::Int)
     if n <= base
-        ok = GC.@preserve M _chol_rl_f64!(pointer(M), n, stride(M, 2), _CHOL_BLOCK, _CHOL_THRESHOLD)
+        ok = GC.@preserve M _chol_rl_f64!(pointer(M), n, stride(M, 2), _CHOL_SB, _CHOL_STH)
         ok || throw(PosDefException(1))   # ponytail: faer returns Bool; exact pivot column not threaded
         return M
     end
