@@ -2,6 +2,36 @@
 
 Canonical status + next steps for this multi-session project. Update this file as milestones land.
 
+## CURRENT FOCUS (2026-07-11) — BLAS-2 banked → potrf campaign
+
+**BLAS-2 is BANKED.** Fleet republished at commit `de5c107` (all 3 boxes locked, complex sweeps capped
+at 2048, ger calibration frozen per box). Closing results:
+- **spmv**: mid-n dip removed — re-keyed the packed panel on **AP residency** not x+y (`_SPMV_PANEL_MINAP`);
+  flat ~1.9–2.2 fleet-wide (was declining to ~1.0 @1024). GB/s decomp: per-column was 40% of L3 roofline.
+- **gemvN**: Zen3/Zen4 gate; the m-inner panel is gated OFF on native-512 (Zen5) — it regressed there
+  (0.85); Zen5 recovered to ~0.90 (the pre-existing native-512 residual).
+- **ger**: gates fleet-wide with the frozen calibrated NP (the OncePerProcess auto-cal is UNRELIABLE —
+  misfired on Zen5; freeze `ger_panel_np` per box: Zen5→1, Zen3→4, Zen4→8).
+- **trmv/trsv**: near-roofline (85–95%); the decline/dip is OB catching up, NOT a lever. gate except Zen5@4096.
+
+**NEW CAMPAIGN — VASTLY improve potrf (Cholesky), AVX2-first**, via **potf2, trsm, syrk, syr2k** (all must
+gate). Design agreed with Fable — see `kb/findings/pureblas-potrf-campaign.md`. KEY LEVER: Strassen (PB's
+only >1.2× engine) routes only `!tA && !tB`, but every triangular op feeds transB → teach `_gemm_strassen!`
+to accept transB, then D&C-route syrk/syr2k/trsm-R. Plus: promote the fused trsm-R panel to a general
+driver; NB(n) policy vs fixed 128. **USER PRIORITY: mid-n AVX2 256–1024 must NOT be neglected** — Fable
+projects ~1.05–1.10 ("no flop trick") but it's UNMEASURED; FIRST step = the GB/s/GFlops-vs-roofline probe
+(`kb/findings/pureblas-roofline-decomposition-method.md`) on mid-n syrk/trsm-R before accepting that.
+
+### Open items (per-µarch gate residuals + debt)
+- **gemvN Zen5 mid-n** (~0.90 @2048, native-512): deeper gap, no config fix — needs a native-512 lever.
+- **trmv/trsv Zen5@4096** (0.96): DRAM regime, PB < OB on Zen5; + galen L2→L3 edge (NB=64 not optimal @512).
+- **Zen4 gemm blocked kernel** @512 = 1.01 vs Zen5 1.14: possible headroom OR OB-weak-on-znver5 — cheap
+  GFlops-vs-FMA-peak check before any grind (likely a mirage).
+- **hpmv** is per-column only (no panel) — port the spmv AP-residency packed panel to complex.
+- **Add a real `trsmR` gate op to plots.jl** — trsm side-R is never benched (the 0.87–0.93 was never gated).
+- **req#8 literal debt**: `_TRI_NB=64`, `_TRI_T_UNB=1024`, `_CHOL_BLOCK=128`, `_POTRF_BASE=512`,
+  `_STRASSEN_MIN=1024`, `_GEMM_UNPACK_MAX=448/128` — bare literals, re-key on cache/register formulas.
+
 ## Tuning methodology — analytical vs empirical (project vocabulary)
 
 Every machine-dependent parameter (block size, cutoff, panel width, stream count, prefetch distance) is
