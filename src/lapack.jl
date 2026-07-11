@@ -544,7 +544,7 @@ end
                 a21 = vload(_CVF, _cvptr(psrc, r2, c0 + 1, lds))
                 a22 = vload(_CVF, _cvptr(psrc, r2, c0 + 2, lds))
                 a23 = vload(_CVF, _cvptr(psrc, r2, c0 + 3, lds))
-                for k in 1:c0-1                                   # solved columns: conflict-free T
+                @simd ivdep for k in 1:c0-1                       # solved columns: conflict-free T (12 FMA/iter → SW-pipeline; A/B'd)
                     v0 = vload(_CVF, _cvptr(pT, i, k, ldt)); v1 = vload(_CVF, _cvptr(pT, r1, k, ldt)); v2 = vload(_CVF, _cvptr(pT, r2, k, ldt))
                     g = _CVF(-unsafe_load(p00, _clidx(c0, k, ld0)));     a00 = muladd(g, v0, a00); a10 = muladd(g, v1, a10); a20 = muladd(g, v2, a20)
                     g = _CVF(-unsafe_load(p00, _clidx(c0 + 1, k, ld0))); a01 = muladd(g, v0, a01); a11 = muladd(g, v1, a11); a21 = muladd(g, v2, a21)
