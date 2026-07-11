@@ -488,7 +488,12 @@ const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # gating syrk!/trsm!. AVX-512 (32 regs) runs the faer syrk to 1024 where it still wins; AVX2 (16 regs)
 # has no cache-blocked faer syrk so it fades by n≈256 — drop the base to 128 so large-n rides gating
 # syrk! (measured: n=1024 0.70→0.87, n=2048 0.85→0.91 on Zen3). ponytail: per-ISA knob.
-const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : 128
+# AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
+# until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
+# (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
+# 7⁄8 of that ≈ 224. ponytail: measured literal, req#8 derive √(_L2_BYTES/8)·7⁄8 once fleet-validated.
+const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : 224
+const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : _CHOL_RL_MAX
 # Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =
 # quarter-period (4 cols/set) — both thrash L1. But the pad is an n² copy round-trip, so it only wins
@@ -798,7 +803,7 @@ end
 function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
     n = size(A, 1)
     n == 0 && return A
-    if _CHOLW == 4 && n > _CHOL_BLOCK
+    if _CHOLW == 4 && n > _CHOL_RL_MAX
         # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured galen/Zen3,
         # 200–4000: transition dips 384/448/640 0.91-0.94→1.01-1.03, non-po2 large 0.98→1.00-1.03). It was
         # originally gated to po2-aliased strides only (its raison d'être was dodging the po2 pad round-trip),
