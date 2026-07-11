@@ -16,8 +16,8 @@ const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int 
 # Base sweet spot is where the unblocked SIMD base still gates: AVX-512 (W=8) rides it to 64 (n=64 gates
 # 1.09), but on AVX2 (W=4) the narrower datapath makes the n=64 base memory-bound (0.76), so cap it at 32
 # (n≤32 gates, n>32 → rl). Keyed on _vwidth like the sibling cuts. Larger bases go memory-bound unblocked
-# unblocked (base=128 → n=128 0.72), smaller pay recursion/small-k overhead — mirrors the real path's
-# _CHOL_THRESHOLD=64. ponytail: flat 64 like the real threshold; galen(AVX2)/zen5 calibration via the knob.
+# unblocked (base=128 → n=128 0.72), smaller pay recursion/small-k overhead — like the real f64 path's
+# base-case threshold _CHOL_STH. ponytail: flat literal; galen(AVX2)/zen5 calibration via the knob.
 
 # Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
 # columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
@@ -191,7 +191,6 @@ end
 # non-positive pivot. SIMD via PureBLAS's SIMD.jl layer at the detected width.
 const _CVF = Vec{_vwidth(Float64), Float64}     # vector type at host width (concrete const)
 const _CHOLW = _vwidth(Float64)
-const _CHOL_THRESHOLD = 64                        # faer LdltParams::auto
 const _CHOL_BLOCK = 128
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
@@ -531,10 +530,10 @@ end
 # ~1.3–1.5× slower at n≥512). When A's stride is a po2, factor in a padded (ld+8) scratch and copy
 # back — bit-identical, ld is pure addressing. Reusable buffer (single-thread; project defers MT).
 const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
-# ≤ this → faer kernels; above → halve, routing the O(n³) trailing update through the cache-blocked
-# gating syrk!/trsm!. AVX-512 (32 regs) runs the faer syrk to 1024 where it still wins; AVX2 (16 regs)
-# has no cache-blocked faer syrk so it fades by n≈256 — drop the base to 128 so large-n rides gating
-# syrk! (measured: n=1024 0.70→0.87, n=2048 0.85→0.91 on Zen3). ponytail: per-ISA knob.
+# _CHOL_FAER_BASE: ≤ this → faer rl kernels; above → hybrid halving routing the O(n³) trailing through the
+# cache-blocked gating syrk!/trsm!. AVX-512 (32 regs) rides the faer syrk to 1024 (n=1024 0.70→0.87,
+# n=2048 0.85→0.91 on the hybrid; W=8 stays off the AVX2 panel driver). AVX2 (16 regs) never halves — its
+# large-n path is the fused panel driver (n>_CHOL_RL_MAX), so its base = _CHOL_RL_MAX (all n≤224 → rl32).
 # AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
 # until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
