@@ -51,11 +51,16 @@ end
 # prefix EVERY column (n·n/2 extra traffic → the large-n decline). BLASFEO's dsymv is this same fused
 # panel. `bc` = NB per-column base Ptrs with bc[c] + (panel-local row i)·sz = A[row, col_c]; that identity
 # is what makes packed's variable column spacing address-uniform in the row (mirrors `_symv_*panel!`).
-const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the large-n decline on all 3 µarchs (galen 2048 0.99→1.51, Zen4 4096 1.09→1.81, Zen5 4096 1.23→1.72)
-# The panel wins only once x+y spill L1 (the re-stream then hits L2/L3 — measured Zen4 PB-self: n=2048
-# +21%, n=4096 +42%, but n=512 −18% where the single-column path's lower setup wins with x/y L1-resident).
-# So size-gate: panel above, per-column below. Crossover ≈ x+y = L1; tune on the locked fleet.
-const _SPMV_PANEL_MINXY = @load_preference("spmv_panel_minxy", _L1_BYTES)::Int  # min x+y bytes (2·n·sizeof) for the panel
+const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the decline on all 3 µarchs
+# The fused NB-column panel beats per-column at EVERY size where AP is streaming-bound — its real win is AP
+# STREAM PREFETCHABILITY (NB contiguous per-column bases → the HW prefetcher locks onto long sequential runs),
+# NOT x/y amortization. Measured galen/AVX2 (locked, direct A/B): the per-column path caps at ~33 GB/s (40%
+# of the ~80 GB/s single-core L3 roofline) once AP spills L2, while the panel holds ~64–70 GB/s (1.7–2.1× at
+# n=256..2048). Gate-validated dip removal: spmv n=1024 1.00→1.98, whole curve flat ~2.0, no regression.
+# (The old "n=512 −18%" note was the PRE-de-box panel paying a per-panel `Core.Box` heap alloc; that setup
+# cost is gone since the `jbl` fresh-local fix, so the panel now wins small-n too.) So gate on AP RESIDENCY,
+# not x+y: run the panel once the packed triangle itself spills L1 (below that, tiny-n setup isn't amortized).
+const _SPMV_PANEL_MINAP = @load_preference("spmv_panel_minap", _L1_BYTES)::Int  # min AP bytes (n(n+1)/2·sizeof) to panel — fires ≈ n≥128 on 32KB L1
 
 function _spmv_offblk_packed_expr(W, V, sz, NB, K, masked)
     q = Expr(:block)
@@ -181,8 +186,8 @@ function _spmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Numb
     _scale_y!(Int(n), β, y, incy)
     iszero(α) && return y
     if _pk2_simd_ok(AP, x, y, incx, incy)
-        T = eltype(AP)                                        # panel only where x+y spill L1 (large-n flatten); else per-column
-        return (_SPMV_PANEL && 2 * Int(n) * sizeof(T) >= _SPMV_PANEL_MINXY) ?
+        T = eltype(AP)                                        # panel once AP is streaming-bound (AP ≥ L1); tiny n stays per-column
+        return (_SPMV_PANEL && Int(n) * (Int(n) + 1) ÷ 2 * sizeof(T) >= _SPMV_PANEL_MINAP) ?
             _spmv_panel_driver!(up, Int(n), convert(T, α), AP, x, y) :
             _spmv_simd!(up, Int(n), convert(T, α), AP, x, y)
     end
