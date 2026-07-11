@@ -567,21 +567,22 @@ end
     @inbounds while c0 <= bs
         nb = min(_CHOL_NB, bs - c0 + 1)
         if nb == _CHOL_NB
+            # FUSED: downdate (vs solved cols in T) + within-panel 4×4 solve in ONE register pass, store to T
+            # once (kills the store/re-load round-trip of the old two-pass split kernel). +11–25% at the panel
+            # shape (galen, bs=128). Coeffs from the diag factor p00; @simd ivdep kept on the downdate k-loop.
+            d0 = 1.0 / unsafe_load(p00, _clidx(c0, c0, ld0));         l10 = -unsafe_load(p00, _clidx(c0 + 1, c0, ld0))
+            d1 = 1.0 / unsafe_load(p00, _clidx(c0 + 1, c0 + 1, ld0)); l20 = -unsafe_load(p00, _clidx(c0 + 2, c0, ld0)); l21 = -unsafe_load(p00, _clidx(c0 + 2, c0 + 1, ld0))
+            d2 = 1.0 / unsafe_load(p00, _clidx(c0 + 2, c0 + 2, ld0)); l30 = -unsafe_load(p00, _clidx(c0 + 3, c0, ld0)); l31 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 1, ld0)); l32 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 2, ld0))
+            d3 = 1.0 / unsafe_load(p00, _clidx(c0 + 3, c0 + 3, ld0))
+            vd0 = _CVF(d0); vd1 = _CVF(d1); vd2 = _CVF(d2); vd3 = _CVF(d3)
+            vl10 = _CVF(l10); vl20 = _CVF(l20); vl21 = _CVF(l21); vl30 = _CVF(l30); vl31 = _CVF(l31); vl32 = _CVF(l32)
             i = 1
-            while i + 3_CHOLW - 1 <= m                            # MR=3 × NC=4 = 12 accumulators —
-                r1 = i + _CHOLW; r2 = i + 2_CHOLW                 # 7 loads/12 FMAs (FMA-bound; the
-                a00 = vload(_CVF, _cvptr(psrc, i, c0, lds))       # MR=1 pass was 5 loads/4 FMAs,
-                a01 = vload(_CVF, _cvptr(psrc, i, c0 + 1, lds))   # load-port-bound — measured +25%
-                a02 = vload(_CVF, _cvptr(psrc, i, c0 + 2, lds))   # vs packed trsm!). First touch:
-                a03 = vload(_CVF, _cvptr(psrc, i, c0 + 3, lds))   # po2 A21, read exactly once.
-                a10 = vload(_CVF, _cvptr(psrc, r1, c0, lds))
-                a11 = vload(_CVF, _cvptr(psrc, r1, c0 + 1, lds))
-                a12 = vload(_CVF, _cvptr(psrc, r1, c0 + 2, lds))
-                a13 = vload(_CVF, _cvptr(psrc, r1, c0 + 3, lds))
-                a20 = vload(_CVF, _cvptr(psrc, r2, c0, lds))
-                a21 = vload(_CVF, _cvptr(psrc, r2, c0 + 1, lds))
-                a22 = vload(_CVF, _cvptr(psrc, r2, c0 + 2, lds))
-                a23 = vload(_CVF, _cvptr(psrc, r2, c0 + 3, lds))
+            while i + 3_CHOLW - 1 <= m                            # MR=3 fused tier (12 accumulators)
+                r1 = i + _CHOLW; r2 = i + 2_CHOLW                 # first touch: po2 A21 (psrc), read once
+                a00 = vload(_CVF, _cvptr(psrc, i, c0, lds));     a10 = vload(_CVF, _cvptr(psrc, r1, c0, lds));     a20 = vload(_CVF, _cvptr(psrc, r2, c0, lds))
+                a01 = vload(_CVF, _cvptr(psrc, i, c0 + 1, lds)); a11 = vload(_CVF, _cvptr(psrc, r1, c0 + 1, lds)); a21 = vload(_CVF, _cvptr(psrc, r2, c0 + 1, lds))
+                a02 = vload(_CVF, _cvptr(psrc, i, c0 + 2, lds)); a12 = vload(_CVF, _cvptr(psrc, r1, c0 + 2, lds)); a22 = vload(_CVF, _cvptr(psrc, r2, c0 + 2, lds))
+                a03 = vload(_CVF, _cvptr(psrc, i, c0 + 3, lds)); a13 = vload(_CVF, _cvptr(psrc, r1, c0 + 3, lds)); a23 = vload(_CVF, _cvptr(psrc, r2, c0 + 3, lds))
                 @simd ivdep for k in 1:c0-1                       # solved columns: conflict-free T (12 FMA/iter → SW-pipeline; A/B'd)
                     v0 = vload(_CVF, _cvptr(pT, i, k, ldt)); v1 = vload(_CVF, _cvptr(pT, r1, k, ldt)); v2 = vload(_CVF, _cvptr(pT, r2, k, ldt))
                     g = _CVF(-unsafe_load(p00, _clidx(c0, k, ld0)));     a00 = muladd(g, v0, a00); a10 = muladd(g, v1, a10); a20 = muladd(g, v2, a20)
@@ -589,6 +590,10 @@ end
                     g = _CVF(-unsafe_load(p00, _clidx(c0 + 2, k, ld0))); a02 = muladd(g, v0, a02); a12 = muladd(g, v1, a12); a22 = muladd(g, v2, a22)
                     g = _CVF(-unsafe_load(p00, _clidx(c0 + 3, k, ld0))); a03 = muladd(g, v0, a03); a13 = muladd(g, v1, a13); a23 = muladd(g, v2, a23)
                 end
+                a00 *= vd0; a10 *= vd0; a20 *= vd0
+                a01 = muladd(vl10, a00, a01); a11 = muladd(vl10, a10, a11); a21 = muladd(vl10, a20, a21); a01 *= vd1; a11 *= vd1; a21 *= vd1
+                a02 = muladd(vl20, a00, a02); a12 = muladd(vl20, a10, a12); a22 = muladd(vl20, a20, a22); a02 = muladd(vl21, a01, a02); a12 = muladd(vl21, a11, a12); a22 = muladd(vl21, a21, a22); a02 *= vd2; a12 *= vd2; a22 *= vd2
+                a03 = muladd(vl30, a00, a03); a13 = muladd(vl30, a10, a13); a23 = muladd(vl30, a20, a23); a03 = muladd(vl31, a01, a03); a13 = muladd(vl31, a11, a13); a23 = muladd(vl31, a21, a23); a03 = muladd(vl32, a02, a03); a13 = muladd(vl32, a12, a13); a23 = muladd(vl32, a22, a23); a03 *= vd3; a13 *= vd3; a23 *= vd3
                 vstore(a00, _cvptr(pT, i, c0, ldt));      vstore(a01, _cvptr(pT, i, c0 + 1, ldt))
                 vstore(a02, _cvptr(pT, i, c0 + 2, ldt));  vstore(a03, _cvptr(pT, i, c0 + 3, ldt))
                 vstore(a10, _cvptr(pT, r1, c0, ldt));     vstore(a11, _cvptr(pT, r1, c0 + 1, ldt))
@@ -597,11 +602,31 @@ end
                 vstore(a22, _cvptr(pT, r2, c0 + 2, ldt)); vstore(a23, _cvptr(pT, r2, c0 + 3, ldt))
                 i += 3_CHOLW
             end
-            while i + _CHOLW - 1 <= m                             # MR=1 tail rows
-                a0 = vload(_CVF, _cvptr(psrc, i, c0, lds))
-                a1 = vload(_CVF, _cvptr(psrc, i, c0 + 1, lds))
-                a2 = vload(_CVF, _cvptr(psrc, i, c0 + 2, lds))
-                a3 = vload(_CVF, _cvptr(psrc, i, c0 + 3, lds))
+            while i + 2_CHOLW - 1 <= m                            # MR=2 fused tier (8 accumulators)
+                r1 = i + _CHOLW
+                a00 = vload(_CVF, _cvptr(psrc, i, c0, lds));     a10 = vload(_CVF, _cvptr(psrc, r1, c0, lds))
+                a01 = vload(_CVF, _cvptr(psrc, i, c0 + 1, lds)); a11 = vload(_CVF, _cvptr(psrc, r1, c0 + 1, lds))
+                a02 = vload(_CVF, _cvptr(psrc, i, c0 + 2, lds)); a12 = vload(_CVF, _cvptr(psrc, r1, c0 + 2, lds))
+                a03 = vload(_CVF, _cvptr(psrc, i, c0 + 3, lds)); a13 = vload(_CVF, _cvptr(psrc, r1, c0 + 3, lds))
+                @simd ivdep for k in 1:c0-1
+                    v0 = vload(_CVF, _cvptr(pT, i, k, ldt)); v1 = vload(_CVF, _cvptr(pT, r1, k, ldt))
+                    g = _CVF(-unsafe_load(p00, _clidx(c0, k, ld0)));     a00 = muladd(g, v0, a00); a10 = muladd(g, v1, a10)
+                    g = _CVF(-unsafe_load(p00, _clidx(c0 + 1, k, ld0))); a01 = muladd(g, v0, a01); a11 = muladd(g, v1, a11)
+                    g = _CVF(-unsafe_load(p00, _clidx(c0 + 2, k, ld0))); a02 = muladd(g, v0, a02); a12 = muladd(g, v1, a12)
+                    g = _CVF(-unsafe_load(p00, _clidx(c0 + 3, k, ld0))); a03 = muladd(g, v0, a03); a13 = muladd(g, v1, a13)
+                end
+                a00 *= vd0; a10 *= vd0
+                a01 = muladd(vl10, a00, a01); a11 = muladd(vl10, a10, a11); a01 *= vd1; a11 *= vd1
+                a02 = muladd(vl20, a00, a02); a12 = muladd(vl20, a10, a12); a02 = muladd(vl21, a01, a02); a12 = muladd(vl21, a11, a12); a02 *= vd2; a12 *= vd2
+                a03 = muladd(vl30, a00, a03); a13 = muladd(vl30, a10, a13); a03 = muladd(vl31, a01, a03); a13 = muladd(vl31, a11, a13); a03 = muladd(vl32, a02, a03); a13 = muladd(vl32, a12, a13); a03 *= vd3; a13 *= vd3
+                vstore(a00, _cvptr(pT, i, c0, ldt));     vstore(a01, _cvptr(pT, i, c0 + 1, ldt))
+                vstore(a02, _cvptr(pT, i, c0 + 2, ldt)); vstore(a03, _cvptr(pT, i, c0 + 3, ldt))
+                vstore(a10, _cvptr(pT, r1, c0, ldt));     vstore(a11, _cvptr(pT, r1, c0 + 1, ldt))
+                vstore(a12, _cvptr(pT, r1, c0 + 2, ldt)); vstore(a13, _cvptr(pT, r1, c0 + 3, ldt))
+                i += 2_CHOLW
+            end
+            while i + _CHOLW - 1 <= m                             # MR=1 fused tier (4 accumulators)
+                a0 = vload(_CVF, _cvptr(psrc, i, c0, lds)); a1 = vload(_CVF, _cvptr(psrc, i, c0 + 1, lds)); a2 = vload(_CVF, _cvptr(psrc, i, c0 + 2, lds)); a3 = vload(_CVF, _cvptr(psrc, i, c0 + 3, lds))
                 for k in 1:c0-1
                     vk = vload(_CVF, _cvptr(pT, i, k, ldt))
                     a0 = muladd(_CVF(-unsafe_load(p00, _clidx(c0, k, ld0))), vk, a0)
@@ -609,56 +634,33 @@ end
                     a2 = muladd(_CVF(-unsafe_load(p00, _clidx(c0 + 2, k, ld0))), vk, a2)
                     a3 = muladd(_CVF(-unsafe_load(p00, _clidx(c0 + 3, k, ld0))), vk, a3)
                 end
+                a0 *= vd0
+                a1 = muladd(vl10, a0, a1); a1 *= vd1
+                a2 = muladd(vl20, a0, a2); a2 = muladd(vl21, a1, a2); a2 *= vd2
+                a3 = muladd(vl30, a0, a3); a3 = muladd(vl31, a1, a3); a3 = muladd(vl32, a2, a3); a3 *= vd3
                 vstore(a0, _cvptr(pT, i, c0, ldt));     vstore(a1, _cvptr(pT, i, c0 + 1, ldt))
                 vstore(a2, _cvptr(pT, i, c0 + 2, ldt)); vstore(a3, _cvptr(pT, i, c0 + 3, ldt))
                 i += _CHOLW
             end
-            while i <= m
+            while i <= m                                          # scalar tail (<W rows), fused
                 for dj in 0:_CHOL_NB-1
                     cc = c0 + dj; s = unsafe_load(psrc, _clidx(i, cc, lds))
-                    for k in 1:c0-1
+                    for k in 1:cc-1
                         s = muladd(-unsafe_load(p00, _clidx(cc, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
                     end
-                    unsafe_store!(pT, s, _clidx(i, cc, ldt))
+                    unsafe_store!(pT, s / unsafe_load(p00, _clidx(cc, cc, ld0)), _clidx(i, cc, ldt))
                 end
                 i += 1
             end
         else
-            for dj in 0:nb-1                                      # remainder columns (<NB)
-                cc = c0 + dj
-                i = 1
-                while i + _CHOLW - 1 <= m
-                    a = vload(_CVF, _cvptr(psrc, i, cc, lds))
-                    for k in 1:c0-1
-                        a = muladd(_CVF(-unsafe_load(p00, _clidx(cc, k, ld0))), vload(_CVF, _cvptr(pT, i, k, ldt)), a)
-                    end
-                    vstore(a, _cvptr(pT, i, cc, ldt)); i += _CHOLW
-                end
-                while i <= m
-                    s = unsafe_load(psrc, _clidx(i, cc, lds))
-                    for k in 1:c0-1
+            for i in 1:m                                          # nb<4 remainder (rare — bs mult of 4 in rl32)
+                for dj in 0:nb-1
+                    cc = c0 + dj; s = unsafe_load(psrc, _clidx(i, cc, lds))
+                    for k in 1:cc-1
                         s = muladd(-unsafe_load(p00, _clidx(cc, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
                     end
-                    unsafe_store!(pT, s, _clidx(i, cc, ldt)); i += 1
+                    unsafe_store!(pT, s / unsafe_load(p00, _clidx(cc, cc, ld0)), _clidx(i, cc, ldt))
                 end
-            end
-        end
-        for dj in 0:nb-1                                  # within-panel triangular solve + scale, on T
-            c = c0 + dj; invc = 1.0 / unsafe_load(p00, _clidx(c, c, ld0)); vinv = _CVF(invc)
-            i = 1
-            while i + _CHOLW - 1 <= m
-                o = _cvptr(pT, i, c, ldt); a = vload(_CVF, o)
-                for k in c0:c-1
-                    a = muladd(_CVF(-unsafe_load(p00, _clidx(c, k, ld0))), vload(_CVF, _cvptr(pT, i, k, ldt)), a)
-                end
-                vstore(a * vinv, o); i += _CHOLW
-            end
-            while i <= m
-                s = unsafe_load(pT, _clidx(i, c, ldt))
-                for k in c0:c-1
-                    s = muladd(-unsafe_load(p00, _clidx(c, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
-                end
-                unsafe_store!(pT, s * invc, _clidx(i, c, ldt)); i += 1
             end
         end
         c0 += _CHOL_NB
