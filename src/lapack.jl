@@ -858,7 +858,10 @@ function _potrf_f64_lower!(A, base::Int = _CHOL_FAER_BASE)
         # is the side-R-T laggard the panel driver's fused split-ld trsm avoids. (AVX-512 W=8 stays below.)
         return _chol_panel_f64!(A, n)
     end
-    if _chol_needs_pad(A, n)                      # factor in a non-conflicting (ld = n+8) scratch, copy back
+    # AVX2 reaches here only for n ≤ _CHOL_RL_MAX (rl32 regime): rl32's small 32-blocks are alias-tolerant
+    # (measured galen: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8% at po2-128) so the pad
+    # is dead weight — skip it. W=8 still pads (its larger rl blocks' po2-tolerance is unmeasured).
+    if _CHOLW != 4 && _chol_needs_pad(A, n)       # factor in a non-conflicting (ld = n+8) scratch, copy back
         R = n + 8
         b = _CHOL_PAD[]
         (size(b, 1) < R || size(b, 2) < n) && (b = _CHOL_PAD[] = Matrix{Float64}(undef, R, n))
