@@ -9,6 +9,8 @@
 # Block sizes are a first cut for Zen4 (AVX-512, 8 Float64/vec) — tune via the calibration knobs.
 # ponytail: blocks hand-set for Zen4; lift into Preferences when tuning the fleet.
 
+using LinearAlgebra: transpose!   # transB Strassen route: materialize Bᵀ into the cached scratch
+
 # Register-blocked microkernel tile: _MR vector-rows × _NR columns = _MR*_NR vector accumulators.
 # The k-loop holds _MR*_NR accumulators + _MR A-vectors + 1 B-broadcast live at once, so the tile
 # must satisfy  _MR*_NR + _MR + 1 ≲ (vector registers).  Register count differs by ISA, so the tile
@@ -918,11 +920,17 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 # instead of 8 (~14% fewer flops/level, compounding), each running the gating classical kernel as base.
 # Beats OB at large n where classical is at the FMA roofline (measured AVX2: 2-level 1.20× at n=2048,
 # 1.26× at 4096). Split while min(m,n,k) ≥ _STRASSEN_MIN (base stays ≥ ~min/2), capped at _MAXDEPTH.
-# NN + real α/β only (trans/complex fall back). Default ON for W=4/8 (real gemm is throughput-bound on
-# both AVX2 and AVX-512 — Strassen's flop cut is ISA-independent); per-box threshold via Preferences.
+# NN + NT (Bᵀ materialized) + real α/β only (tA/complex fall back). Default ON for W=4/8 (real gemm is
+# throughput-bound on both AVX2 and AVX-512 — Strassen's flop cut is ISA-independent); per-box threshold
+# via Preferences.
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
+# transB-route Bᵀ scratch (GKH-owned, grown on demand; Float64 = the routed MVP case). Exact-shape refit
+# à la _str_fit! — keeps ld == k contiguous (no strided-top-left cache hazard) and transpose! needs an
+# exact-shape dest; realloc churn is negligible at Strassen's ≥_STRASSEN_MIN sizes. Single-thread (MT
+# deferred project-wide). Disjoint from gpackA/B and the str pool the nested Strassen/base kernels use.
+const _STRASSEN_BT = Ref(Matrix{Float64}(undef, 0, 0))
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
     while s >= _STRASSEN_MIN && d < _STRASSEN_MAXDEPTH; d += 1; s >>= 1; end
@@ -1917,8 +1925,20 @@ end
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
-        if _STRASSEN && !tA && !tB && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
-            return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
+        if _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
+            if !tB
+                return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
+            elseif T === Float64
+                # transB (syrk/trsm-R feed this): materialize Bᵀ, ride the same NN Strassen recursion.
+                # Measured GO (galen/AVX2): 1.18-1.33× vs OB at n=2048/4096 — 59.6/67.4 GFlops vs
+                # packed-transB 54.3/54.9, OB 50.6/50.7; the win survives the transpose (~4% off NN).
+                Bt = _STRASSEN_BT[]
+                if size(Bt, 1) != k || size(Bt, 2) != n
+                    Bt = Matrix{Float64}(undef, k, n); _STRASSEN_BT[] = Bt
+                end
+                transpose!(Bt, B)   # real: 'C' ≡ 'T', conj is a no-op (as the NN real path ignores cA/cB)
+                return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
+            end
         end
         if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
             if !tA
