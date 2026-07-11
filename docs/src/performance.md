@@ -34,8 +34,8 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ◐ borderline / ✗ < 0.96; geomean
 | L1 nrm2 (scaled-accum beats OpenBLAS) | ✓ 3.6× | ✓ 6.2× | ✓ 5.5× | ✓ 5.5× |
 | L1 iamax | ✓ 1.15 | ✓ 1.32 | ◐ 0.90 (noise) | ◐ 0.90 (noise) |
 | L2 gemvT · symv · trmv · trsv · spmv · gbmv · sbmv | ✓ 1.0–1.6 | ✓ 0.99–1.23 | ✓ 0.97–1.64 | ✓ 0.97–1.64 |
-| L2 ger | ✓ 1.01 | ✗ 0.69 (LPDDR5x DRAM-bandwidth ceiling) | ✓ 0.99 | ✓ 0.99 |
-| L2 gemvN | ◐ 0.96 | ✗ 0.85 | ✓ 0.97 (8-acc + panel route) | ✓ 0.97 |
+| L2 ger | ✓ 1.09 | ✓ 1.00 (calibrated write-stream NP) | ✓ 1.00 | ✓ 1.00 |
+| L2 gemvN | ✓ 0.99 | ✗ 0.85 (mid-n, native-512) | ✓ 1.02 (regime-derived panel width) | ✓ 1.02 |
 | L3 gemm | ✗ 0.83 (n=8 dispatch) | ◐ 0.93 (n=8; geomean 1.14) | ✓ 1.03 (clip) | ✓ 1.03 |
 | **L3 syrk · syr2k · symm** (decomposed to the gate) | ✓ 0.97–1.02 | ✓ 0.96–1.11 | ✓ 0.96–1.02 | ✓ 0.96–1.02 |
 | **L2 complex** zhemv · zgeru · zdotc · zscal · zaxpy · dzasum | ✓ 0.99–2× | — | ✓ 0.96–2× (n=1000 zdotc/zscal ◐) | ✓ |
@@ -59,10 +59,11 @@ ratio (the gate metric) with ✓ ≥ 0.96 / ◐ borderline / ✗ < 0.96; geomean
 
 **Zen5 (native AVX-512)** shows a *disjoint* residual profile from Zen3/Zen4 — the key reason the gate is
 per-machine. Its native 512-bit ports clear every AVX2 pain point (`trmm` 0.81→**1.08**, `zgemm` 0.94→**1.16**,
-`potrf` 0.83→**1.22**, `trsm` **1.15**), but its LPDDR5x memory subsystem surfaces new ones: **`ger` 0.69**
-(a rank-1 update is pure write-bandwidth at large n; OpenBLAS extracts ~1.3× more DRAM bandwidth there —
-non-temporal stores and multi-column blocking were both measured and don't recover it) and small-n `gemvN`/
-`gemm`. Tuning for one µarch does not transfer, so each box is gated on its own hardware.
+`potrf` 0.83→**1.22**, `trsm` **1.15**). `ger`, once a Zen5 outlier, now gates at **1.00** via a calibrated
+per-µarch write-stream count (the optimum is opposite-signed across the fleet — Zen5→1, Zen3→4, Zen4→8 — so
+it is measured, not derived; the box runs DDR5-5600 SODIMM, the same as Zen4, *not* LPDDR5x). The remaining
+Zen5 residual is mid-n **`gemvN`** (0.85 at n=1024 — the m-inner panel narrows but does not close the
+native-512 gap) and small-n `gemm`. Tuning for one µarch does not transfer, so each box is gated on its own hardware.
 
 On **AVX-512** every op's **geomean** clears the gate (1.0–1.5×); the ✗ cells are small-n **worst-size**
 dips only (n=8 dispatch / cold-cache — `gemm` geomean is still 1.03). On **AVX2**, BLAS-1/2, real `gemm`,
