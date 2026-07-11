@@ -335,7 +335,7 @@ function run_cmplx_benchmarks()
         NN = TN; LT = Char(76); RT = Char(82); UP = U; TC = Char(67)
         ctri(s) = (A = randn(T, s, s) ./ (2s); for i in 1:s; A[i, i] = 1 + abs(A[i, i]); end; A)
         cherm(s) = (A = randn(T, s, s); A = A + A'; for i in 1:s; A[i, i] = real(A[i, i]); end; A)
-        addh(nm, mk, ob, pb) = _meas!(cl3, "CL3", nm, () -> sweep_heavy(mk, ob, pb, _sizes(L3SZ)))
+        addh(nm, mk, ob, pb) = _meas!(cl3, "CL3", nm, () -> sweep_heavy(mk, ob, pb, _sizes(_cap(L3SZ, 2048))))  # complex 4096 is a ~10min sink for little signal → cap at 2048 (real L3 keeps 4096)
         addh("zgemm", s -> (randn(T, s, s), randn(T, s, s), zeros(T, s, s)),
             c -> (B.gemm!(NN, NN, ca, c[1], c[2], cb, c[3]); real(c[3][1])),
             c -> (PureBLAS.gemm!(c[3], c[1], c[2]); real(c[3][1])))
@@ -376,7 +376,7 @@ function run_cmplx_benchmarks()
     clp = OpData[]
     let
         LP = Char(76)  # 'L'
-        addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(clp, "CLP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(sizes); samples = 40))
+        addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(clp, "CLP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(_cap(sizes, 2048)); samples = 40))  # cap complex LAPACK at 2048 (zgesvd's 1024 cap survives via nested _cap)
         addh("zpotrf", s -> _hpd(T, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); real(c[1, 1])),
             c -> (PureBLAS.potrf!(c; uplo = LP); real(c[1, 1])))
