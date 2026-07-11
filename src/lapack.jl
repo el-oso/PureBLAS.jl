@@ -817,7 +817,7 @@ function _chol_panel_f64!(A, n::Int, blk::Int = _CHOL_BLOCK)
             for c in 0:bs-1                                   # diag block lower triangle → D (L1/L2)
                 unsafe_copyto!(pD + (c * ldD + c) * 8, pjj + (c * lda + c) * 8, bs - c)
             end
-            _chol_rl_f64!(pD, bs, ldD, _CHOL_BLOCK, _CHOL_THRESHOLD) || throw(PosDefException(j + 1))
+            _chol_rl_f64!(pD, bs, ldD, _CHOL_SB, _CHOL_STH) || throw(PosDefException(j + 1))
             for c in 0:bs-1                                   # factored diag back (tiny)
                 unsafe_copyto!(pjj + (c * lda + c) * 8, pD + (c * ldD + c) * 8, bs - c)
             end
