@@ -45,12 +45,14 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # bursts with big gaps → the HW prefetcher can't sustain 8 strided streams (dips at first L3-resident size:
 # galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that the y-block stays L1-resident,
 # columns grouped per panel, inner loop streams m DOWN each column (tight, continuous per-column streams
-# the prefetchers lock onto), x broadcasts hoisted, y RMW'd from L1. Default ON since the AVX-512 mid-n
-# mechanism was decomposed (wintermute, gate methodology): the residual 3-5% vs OB was NOT codegen (asm is
-# spill-free, loads folded into FMAs) and NOT SW prefetch (token & full-rate, t0/t1/nta, 256-4096B all
-# neutral-to-harmful) — it is PANEL WIDTH, three measured regimes (see _gemvn_minner_np). AVX2's verified
-# config (NP=8) is reproduced exactly by the same formula (16-reg cap → wide=assoc=8).
-const _GEMVN_MINNER = @load_preference("gemvn_minner", true)::Bool
+# the prefetchers lock onto), x broadcasts hoisted, y RMW'd from L1. HELPS on AVX2 (narrow → the extra
+# per-column streams win) and on double-pumped-512 Zen4 (each 512-bit pipe is occupied twice, hiding the
+# y-restream cost); REGRESSES on NATIVE-512 Zen5 (single-pumped ports already saturate, so the y-restream
+# is pure overhead — full-sweep worst n=1024 0.91→0.85, both geomean AND worst below the old NP=8 path).
+# So gate on the DATAPATH, not a flat default: minner ON iff the vector unit is AVX2 (W<8) OR double-pumped,
+# OFF on native-512 (physical criterion over detected consts — CLAUDE.md req#7/#8; validated full-sweep on
+# the fleet: Zen3/Zen4 keep the gains, Zen5 reverts to the old path). Panel-width regimes below apply where on.
+const _GEMVN_MINNER = @load_preference("gemvn_minner", _vwidth(Float64) < 8 || _double_pumped(_HW))::Bool
 const _GEMVN_MINNER_U  = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
 # Panel width (columns/panel = concurrent A-read streams; y re-streamed n/NP times) — three regimes:
 #  narrow  A ≤ 2·L2 (partially L2-resident band, e.g. f64 n=512 = 2 MB): few streams win. NP8 = 0.95 vs OB,
