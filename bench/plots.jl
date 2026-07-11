@@ -249,6 +249,9 @@ let
     addh("trsm", s -> (tri(s), randn(s, s)),
         c -> (B.trsm!(LT, UP, NN, NN, 1.0, c[1], c[2]); c[2][1]),
         c -> (PureBLAS.trsm!(c[2], c[1]; side = LT, uplo = UP); c[2][1]))
+    addh("trsmR", s -> (tri(s), randn(s, s)),   # side-R lower-T (the potrf/getrf panel-solve shape) — the lever
+        c -> (B.trsm!('R', 'L', 'T', 'N', 1.0, c[1], c[2]); c[2][1]),
+        c -> (PureBLAS.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'T'); c[2][1]))
 end
 
 # ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────
