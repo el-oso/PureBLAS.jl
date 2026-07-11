@@ -305,7 +305,54 @@ function _trsm_right_lower_f64!(p00::Ptr{Float64}, p10::Ptr{Float64}, bs::Int, m
         if c0 > 1
             if nb == _CHOL_NB
                 i = 1
-                while i + _CHOLW - 1 <= m
+                while i + 3_CHOLW - 1 <= m                  # MR=3 × NB=4 = 12 accumulators (mirror _syrk_lower)
+                    r1 = i + _CHOLW; r2 = i + 2_CHOLW
+                    o00 = _cvptr(p10, i, c0, ld);     A00 = vload(_CVF, o00)
+                    o10 = _cvptr(p10, r1, c0, ld);    B00 = vload(_CVF, o10)
+                    o20 = _cvptr(p10, r2, c0, ld);    C00 = vload(_CVF, o20)
+                    o01 = _cvptr(p10, i, c0 + 1, ld); A01 = vload(_CVF, o01)
+                    o11 = _cvptr(p10, r1, c0 + 1, ld); B01 = vload(_CVF, o11)
+                    o21 = _cvptr(p10, r2, c0 + 1, ld); C01 = vload(_CVF, o21)
+                    o02 = _cvptr(p10, i, c0 + 2, ld); A02 = vload(_CVF, o02)
+                    o12 = _cvptr(p10, r1, c0 + 2, ld); B02 = vload(_CVF, o12)
+                    o22 = _cvptr(p10, r2, c0 + 2, ld); C02 = vload(_CVF, o22)
+                    o03 = _cvptr(p10, i, c0 + 3, ld); A03 = vload(_CVF, o03)
+                    o13 = _cvptr(p10, r1, c0 + 3, ld); B03 = vload(_CVF, o13)
+                    o23 = _cvptr(p10, r2, c0 + 3, ld); C03 = vload(_CVF, o23)
+                    for k in 1:c0-1
+                        v0 = vload(_CVF, _cvptr(p10, i, k, ld)); v1 = vload(_CVF, _cvptr(p10, r1, k, ld)); v2 = vload(_CVF, _cvptr(p10, r2, k, ld))
+                        g0 = _CVF(-unsafe_load(p00, _clidx(c0, k, ld)));     A00 = muladd(g0, v0, A00); B00 = muladd(g0, v1, B00); C00 = muladd(g0, v2, C00)
+                        g1 = _CVF(-unsafe_load(p00, _clidx(c0 + 1, k, ld))); A01 = muladd(g1, v0, A01); B01 = muladd(g1, v1, B01); C01 = muladd(g1, v2, C01)
+                        g2 = _CVF(-unsafe_load(p00, _clidx(c0 + 2, k, ld))); A02 = muladd(g2, v0, A02); B02 = muladd(g2, v1, B02); C02 = muladd(g2, v2, C02)
+                        g3 = _CVF(-unsafe_load(p00, _clidx(c0 + 3, k, ld))); A03 = muladd(g3, v0, A03); B03 = muladd(g3, v1, B03); C03 = muladd(g3, v2, C03)
+                    end
+                    vstore(A00, o00); vstore(A01, o01); vstore(A02, o02); vstore(A03, o03)
+                    vstore(B00, o10); vstore(B01, o11); vstore(B02, o12); vstore(B03, o13)
+                    vstore(C00, o20); vstore(C01, o21); vstore(C02, o22); vstore(C03, o23)
+                    i += 3_CHOLW
+                end
+                while i + 2_CHOLW - 1 <= m                  # MR=2 × NB=4 = 8 accumulators
+                    r1 = i + _CHOLW
+                    o00 = _cvptr(p10, i, c0, ld);     A00 = vload(_CVF, o00)
+                    o10 = _cvptr(p10, r1, c0, ld);    B00 = vload(_CVF, o10)
+                    o01 = _cvptr(p10, i, c0 + 1, ld); A01 = vload(_CVF, o01)
+                    o11 = _cvptr(p10, r1, c0 + 1, ld); B01 = vload(_CVF, o11)
+                    o02 = _cvptr(p10, i, c0 + 2, ld); A02 = vload(_CVF, o02)
+                    o12 = _cvptr(p10, r1, c0 + 2, ld); B02 = vload(_CVF, o12)
+                    o03 = _cvptr(p10, i, c0 + 3, ld); A03 = vload(_CVF, o03)
+                    o13 = _cvptr(p10, r1, c0 + 3, ld); B03 = vload(_CVF, o13)
+                    for k in 1:c0-1
+                        v0 = vload(_CVF, _cvptr(p10, i, k, ld)); v1 = vload(_CVF, _cvptr(p10, r1, k, ld))
+                        g0 = _CVF(-unsafe_load(p00, _clidx(c0, k, ld)));     A00 = muladd(g0, v0, A00); B00 = muladd(g0, v1, B00)
+                        g1 = _CVF(-unsafe_load(p00, _clidx(c0 + 1, k, ld))); A01 = muladd(g1, v0, A01); B01 = muladd(g1, v1, B01)
+                        g2 = _CVF(-unsafe_load(p00, _clidx(c0 + 2, k, ld))); A02 = muladd(g2, v0, A02); B02 = muladd(g2, v1, B02)
+                        g3 = _CVF(-unsafe_load(p00, _clidx(c0 + 3, k, ld))); A03 = muladd(g3, v0, A03); B03 = muladd(g3, v1, B03)
+                    end
+                    vstore(A00, o00); vstore(A01, o01); vstore(A02, o02); vstore(A03, o03)
+                    vstore(B00, o10); vstore(B01, o11); vstore(B02, o12); vstore(B03, o13)
+                    i += 2_CHOLW
+                end
+                while i + _CHOLW - 1 <= m                   # MR=1 × NB=4 = 4 accumulators
                     o0 = _cvptr(p10, i, c0, ld);     a0 = vload(_CVF, o0)
                     o1 = _cvptr(p10, i, c0 + 1, ld); a1 = vload(_CVF, o1)
                     o2 = _cvptr(p10, i, c0 + 2, ld); a2 = vload(_CVF, o2)
