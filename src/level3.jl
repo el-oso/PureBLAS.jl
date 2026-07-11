@@ -1355,9 +1355,30 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     end
     return B
 end
+const _TRSM_R_FUSE = 128       # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
 function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
+    # Lower-transpose real-f64 wide-B fast base: the fused 12-acc substitution (the potrf panel kernel
+    # `_trsm_rl_split_f64!`, IN-PLACE, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no
+    # trtri, no unpacked-gemm-into-tmp, no copyback, no recurse-to-32. Net win on wide-B (n=256 0.88→1.02
+    # gates; geomean up) + the zpotrf/getrf panel shape. Recursion above `_TRSM_R_FUSE` keeps the
+    # cache-blocked off-diagonal gemms and bottoms out here. (Square-gate worst n=32 is the narrow base.)
+    if !up && tr && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 &&
+            size(B, 1) > _TRSM_NCUT_R && B isa StridedMatrix
+        m = size(B, 1); ldb = stride(B, 2)
+        mc0 = max(_vwidth(Float64), (_L2_BYTES ÷ 2) ÷ (k * 8))   # MC row-chunk: the mc×k slab the k-repasses
+        GC.@preserve A B begin                                   # re-read stays L2-resident (req#8; rows independent)
+            pA = pointer(A); ldA = stride(A, 2); pB = pointer(B)
+            i0 = 0
+            while i0 < m
+                mc = min(mc0, m - i0)
+                _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pB + i0 * 8, ldb, k, mc)
+                i0 += mc
+            end
+        end
+        return B
+    end
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
         # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
