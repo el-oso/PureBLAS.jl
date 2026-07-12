@@ -95,6 +95,11 @@ end
         # get!/IdDict lazy alloc. StrictMode macros reject kwargs, so we assert on the POSITIONAL
         # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
         # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
+        # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
+        # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
+        # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
+        P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
+        P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
         @assert_noalloc P._trsm_base_invL!(false, false, false, Atri, randn(32, 256)) static = false
         @assert_noalloc P._trsm_base_invR!(false, false, false, Atri, randn(256, 32)) static = false
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
