@@ -3,8 +3,12 @@
 # gated trsm!/gemm! for the trailing. A = P·L·U (L unit-lower, U upper; ipiv[i] = global row swapped to
 # position i, LAPACK convention). Float64. ponytail: generic/AD LU deferred (pivoting is data-dependent).
 
-const _LU_NB = 48       # blocked panel width (measured optimum on Zen4: small nb trims panel/trsm
-# overhead but shrinks the rank-nb trailing gemm — balance ~48). ponytail: revisit with the large-n gap.
+const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trsm BLAS-2 cost; large nb fattens
+# the rank-nb trailing gemm toward peak). At small n the panel factor dominates → nb=48; at large n the gemm
+# dominates → grow nb so k=nb isn't a skinny gemm. Measured (galen/fleet): nb=48 to n≈384, 64@512, 128@≥1024
+# gives +4–5% large-n (getrf 2048 45.7→47.8 = BLASFEO parity, OB gate 1.01→1.06). ponytail/req#8: the /8 +
+# clamp bounds are measured literals to re-derive from the gemm k-block (L1) / trailing residency (L2).
+_lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
@@ -203,7 +207,7 @@ const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # which over-decomposes into many small gemm! calls). Factor each nb-panel (getf2), swap the rest of the
 # rows (laswp), solve the row panel (trsm, L11⁻¹·A12), downdate the trailing (gemm, A22 −= L21·U12).
 # The cheap unblocked panel + ONE big rank-nb trailing gemm per step is the win. Returns (A, ipiv, info).
-function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB)
+function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...)))
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
