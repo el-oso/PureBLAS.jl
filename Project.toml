@@ -25,4 +25,19 @@ TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 [preferences.StrictMode]
 analysis = "fast"
 checks_enabled = true
-fail_mode = "error"
+# WARN (not error) for the main package's own :fast precompile dogfood (src/verify.jl). StrictMode 0.3.6+
+# tightened the :fast static noalloc scan to flag OncePerProcess auto-calibration allocs (gemv/trmv/trsv
+# panel measurement — a ONE-TIME cold init, not a hot-path alloc; :full/AllocCheck clears them warm, so the
+# authoritative test-suite dogfood at fail_mode="error"/analysis="full" still enforces and passes). Erroring
+# the precompile on those :fast-static-only findings blocks `using PureBLAS`; warn keeps the early-net signal
+# without the false block. (ger below is a GENUINELY-real alloc frozen out; the rest are the :fast/:full gap.)
+fail_mode = "warn"
+
+# Freeze ger's panel stream-count so the :fast load-time dogfood (src/verify.jl) exercises the alloc-free
+# SHIPPING path — same as test/Project.toml and what the .so/trim build MUST set. Without it, ger!'s
+# OncePerProcess auto-calibration branch compiles in and statically allocates its one-time calibration
+# buffer (a REAL alloc — both :fast and :full AllocCheck flag it), reddening the noalloc proof. 0.3.5's
+# :fast heuristic missed this; 0.3.6+ correctly catches it. Value arbitrary (1/2/4/8); benchmarks use the
+# separate bench project (auto-cal, best perf) so dev/bench perf is unaffected.
+[preferences.PureBLAS]
+ger_panel_np = 4
