@@ -3,13 +3,17 @@
 # gated trsm!/gemm! for the trailing. A = P·L·U (L unit-lower, U upper; ipiv[i] = global row swapped to
 # position i, LAPACK convention). Float64. ponytail: generic/AD LU deferred (pivoting is data-dependent).
 
-const _LU_NB = 48       # blocked panel width (measured optimum on Zen4: small nb trims panel/trsm
-# overhead but shrinks the rank-nb trailing gemm — balance ~48). ponytail: revisit with the large-n gap.
+const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trsm BLAS-2 cost; large nb fattens
+# the rank-nb trailing gemm toward peak). At small n the panel factor dominates → nb=48; at large n the gemm
+# dominates → grow nb so k=nb isn't a skinny gemm. Measured (galen/fleet): nb=48 to n≈384, 64@512, 128@≥1024
+# gives +4–5% large-n (getrf 2048 45.7→47.8 = BLASFEO parity, OB gate 1.01→1.06). ponytail/req#8: the /8 +
+# clamp bounds are measured literals to re-derive from the gemm k-block (L1) / trailing residency (L2).
+_lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
 # single split does the cross-half update ONCE via BLAS-3 gemm, halving that store traffic.
-const _GETF2_BASE = 24
+const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split. 24→16: +2-4.5% at n=64-384 (less store-bound rank-1 in the cliff zone). req#8: derive from store-BW/L1.
 
 # Apply the sequential row interchanges recorded in ipiv[ip0+1 : ip0+np] to columns j1:j2 of panel view V,
 # LOCAL to V (ipiv holds GLOBAL rows = roff + local). Pivot t swaps V-row (rowbase+t) ↔ V-row (ipiv[ip0+t]
@@ -87,42 +91,69 @@ function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     return info
 end
 
-# SIMD panel (Float64, ld-strided columns, p = &panel[1,1]). Same math as above, vectorized over rows.
+const _LU_IOFF = Vec{_CHOLW, Int}(ntuple(k -> k - 1, _CHOLW))    # lane row offsets for the SIMD idamax
+
+# SIMD partial-pivot argmax: index of max |·| over rows jl:mp of column jl (LAPACK: first max on ties).
+@inline function _idamax_col(p::Ptr{Float64}, ld::Int, mp::Int, jl::Int)
+    vm = _CVF(-1.0); vi = Vec{_CHOLW, Int}(jl); i = jl
+    @inbounds while i + _CHOLW - 1 <= mp
+        v = abs(vload(_CVF, _cvptr(p, i, jl, ld))); idx = _LU_IOFF + Vec{_CHOLW, Int}(i)
+        gt = v > vm; vm = vifelse(gt, v, vm); vi = vifelse(gt, idx, vi); i += _CHOLW
+    end
+    m = -1.0; piv = jl
+    @inbounds for l in 1:_CHOLW; (vm[l] > m) && (m = vm[l]; piv = vi[l]); end   # lane reduce (first max)
+    @inbounds while i <= mp; a = abs(unsafe_load(p, _clidx(i, jl, ld))); a > m && (m = a; piv = i); i += 1; end
+    return piv
+end
+
+# factor column jl: SIMD argmax + swap rows jl↔piv across the whole panel + scale below diagonal. Returns
+# true on a zero pivot. Pivoting is a correctness boundary — do not simplify.
+@inline function _lu_fact1!(p::Ptr{Float64}, ld::Int, mp::Int, jl::Int, pb::Int, roff::Int, ipiv, ioff::Int)
+    piv = _idamax_col(p, ld, mp, jl); ipiv[ioff + jl] = roff + piv
+    zero_piv = unsafe_load(p, _clidx(piv, jl, ld)) == 0.0
+    @inbounds if piv != jl
+        for c in 1:pb
+            a = unsafe_load(p, _clidx(jl, c, ld))
+            unsafe_store!(p, unsafe_load(p, _clidx(piv, c, ld)), _clidx(jl, c, ld)); unsafe_store!(p, a, _clidx(piv, c, ld))
+        end
+    end
+    @inbounds if !zero_piv
+        invd = 1.0 / unsafe_load(p, _clidx(jl, jl, ld)); vinv = _CVF(invd); i = jl + 1
+        while i + _CHOLW - 1 <= mp; b = _cvptr(p, i, jl, ld); vstore(vload(_CVF, b) * vinv, b); i += _CHOLW; end
+        while i <= mp; unsafe_store!(p, unsafe_load(p, _clidx(i, jl, ld)) * invd, _clidx(i, jl, ld)); i += 1; end
+    end
+    return zero_piv
+end
+
+# SIMD panel (Float64) — RANK-2 blocked with SIMD idamax. Bit-identical pivots/result to the flat rank-1
+# sweep, but the trailing update touches each element ONCE per 2 columns (the rank-1 sweep is store-bound
+# BLAS-2, ~40% of getrf(256)) and the pivot argmax is vectorized (was ~30% scalar). Measured +48–82% on the
+# base (galen). Columns processed in pairs: factor jl, update col jl+1 by jl, factor jl+1, then one fused
+# rank-2 update of the trailing (with the U[jl+1,·] row correction). Pivoting is a correctness boundary.
 function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    info = 0
-    @inbounds for jl in 1:pb
-        piv = jl; pmax = abs(unsafe_load(p, _clidx(jl, jl, ld)))      # argmax |·| in column jl, rows jl:mp
-        for il in (jl + 1):mp
-            a = abs(unsafe_load(p, _clidx(il, jl, ld))); a > pmax && (pmax = a; piv = il)
+    info = 0; jl = 1
+    @inbounds while jl <= pb
+        if jl == pb
+            _lu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl); break
         end
-        ipiv[ioff + jl] = roff + piv
-        d = unsafe_load(p, _clidx(piv, jl, ld))
-        if d != 0.0
-            if piv != jl                                              # swap rows jl ↔ piv across the panel
-                for jc in 1:pb
-                    a = unsafe_load(p, _clidx(jl, jc, ld))
-                    unsafe_store!(p, unsafe_load(p, _clidx(piv, jc, ld)), _clidx(jl, jc, ld))
-                    unsafe_store!(p, a, _clidx(piv, jc, ld))
-                end
-            end
-            invd = 1.0 / unsafe_load(p, _clidx(jl, jl, ld)); vinv = _CVF(invd)
-            i = jl + 1                                                # scale column below the diagonal
+        _lu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl)
+        u = -unsafe_load(p, _clidx(jl, jl + 1, ld)); vu = _CVF(u); i = jl + 1     # update col jl+1 by jl
+        while i + _CHOLW - 1 <= mp; bj = _cvptr(p, i, jl + 1, ld); vstore(muladd(vu, vload(_CVF, _cvptr(p, i, jl, ld)), vload(_CVF, bj)), bj); i += _CHOLW; end
+        while i <= mp; unsafe_store!(p, muladd(u, unsafe_load(p, _clidx(i, jl, ld)), unsafe_load(p, _clidx(i, jl + 1, ld))), _clidx(i, jl + 1, ld)); i += 1; end
+        _lu_fact1!(p, ld, mp, jl + 1, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl + 1)
+        for jc in (jl + 2):pb                                                    # fused rank-2 trailing update
+            u0 = -unsafe_load(p, _clidx(jl, jc, ld))
+            u1c = unsafe_load(p, _clidx(jl + 1, jc, ld)) + u0 * unsafe_load(p, _clidx(jl + 1, jl, ld))  # U[jl+1,jc]
+            unsafe_store!(p, u1c, _clidx(jl + 1, jc, ld)); u1 = -u1c
+            vu0 = _CVF(u0); vu1 = _CVF(u1); i = jl + 2
             while i + _CHOLW - 1 <= mp
-                b = _cvptr(p, i, jl, ld); vstore(vload(_CVF, b) * vinv, b); i += _CHOLW
+                bj = _cvptr(p, i, jc, ld); acc = vload(_CVF, bj)
+                acc = muladd(vu0, vload(_CVF, _cvptr(p, i, jl, ld)), acc); acc = muladd(vu1, vload(_CVF, _cvptr(p, i, jl + 1, ld)), acc)
+                vstore(acc, bj); i += _CHOLW
             end
-            while i <= mp; unsafe_store!(p, unsafe_load(p, _clidx(i, jl, ld)) * invd, _clidx(i, jl, ld)); i += 1; end
-        elseif info == 0
-            info = roff + jl
+            while i <= mp; s = unsafe_load(p, _clidx(i, jc, ld)); s = muladd(u0, unsafe_load(p, _clidx(i, jl, ld)), s); s = muladd(u1, unsafe_load(p, _clidx(i, jl + 1, ld)), s); unsafe_store!(p, s, _clidx(i, jc, ld)); i += 1; end
         end
-        for jc in (jl + 1):pb                                         # rank-1 update of the panel trailing
-            ajc = -unsafe_load(p, _clidx(jl, jc, ld)); vajc = _CVF(ajc)
-            i = jl + 1
-            while i + _CHOLW - 1 <= mp
-                bj = _cvptr(p, i, jc, ld)
-                vstore(muladd(vajc, vload(_CVF, _cvptr(p, i, jl, ld)), vload(_CVF, bj)), bj); i += _CHOLW
-            end
-            while i <= mp; unsafe_store!(p, muladd(ajc, unsafe_load(p, _clidx(i, jl, ld)), unsafe_load(p, _clidx(i, jc, ld))), _clidx(i, jc, ld)); i += 1; end
-        end
+        jl += 2
     end
     return info
 end
@@ -203,7 +234,7 @@ const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # which over-decomposes into many small gemm! calls). Factor each nb-panel (getf2), swap the rest of the
 # rows (laswp), solve the row panel (trsm, L11⁻¹·A12), downdate the trailing (gemm, A22 −= L21·U12).
 # The cheap unblocked panel + ONE big rank-nb trailing gemm per step is the win. Returns (A, ipiv, info).
-function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB)
+function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...)))
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
