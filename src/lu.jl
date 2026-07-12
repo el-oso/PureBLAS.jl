@@ -13,7 +13,7 @@ _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
 # single split does the cross-half update ONCE via BLAS-3 gemm, halving that store traffic.
-const _GETF2_BASE = Ref(24)   # A/B knob: recursion base (≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split)
+const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split. 24→16: +2-4.5% at n=64-384 (less store-bound rank-1 in the cliff zone). req#8: derive from store-BW/L1.
 
 # Apply the sequential row interchanges recorded in ipiv[ip0+1 : ip0+np] to columns j1:j2 of panel view V,
 # LOCAL to V (ipiv holds GLOBAL rows = roff + local). Pivot t swaps V-row (rowbase+t) ↔ V-row (ipiv[ip0+t]
@@ -35,7 +35,7 @@ end
 # half. Net result is bit-identical to the flat sweep; only the store traffic is halved. Pivoting is a
 # correctness boundary — the two _laswp_local! calls carry the interchanges the flat sweep applied inline.
 function _getf2_blocked!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    pb <= _GETF2_BASE[] && return _getf2!(A, mp, pb, roff, ipiv, ioff)   # base: flat rank-1 sweep
+    pb <= _GETF2_BASE && return _getf2!(A, mp, pb, roff, ipiv, ioff)   # base: flat rank-1 sweep
     pb1 = pb ÷ 2; pb2 = pb - pb1
     info = _getf2_blocked!(view(A, :, 1:pb1), mp, pb1, roff, ipiv, ioff)     # factor left half
     _laswp_local!(A, ipiv, ioff, pb1, 0, pb1 + 1, pb, roff)                  # left pivots → right cols
@@ -55,7 +55,7 @@ end
 # column scale + rank-1 update over contiguous rows; scalar argmax); else the generic fallback.
 # Pivoting is a correctness boundary — do not simplify.
 function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    if pb > _GETF2_BASE[] && A isa StridedMatrix && stride(A, 1) == 1 &&        # wide → BLAS-3 split (generic:
+    if pb > _GETF2_BASE && A isa StridedMatrix && stride(A, 1) == 1 &&        # wide → BLAS-3 split (generic:
             (eltype(A) === Float64 || eltype(A) <: BlasComplex)               # rides trsm!/gemm!, incl. complex)
         return _getf2_blocked!(A, mp, pb, roff, ipiv, ioff)
     end
