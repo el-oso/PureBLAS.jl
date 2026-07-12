@@ -199,13 +199,13 @@ end
 const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0),
     Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0)))
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
-    V, Tm, G, Wb, Yb = _QR_WS[]
-    if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
-        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
-        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Yb = Matrix{Float64}(undef, nb, n)
-        _QR_WS[] = (V, Tm, G, Wb, Yb)
+    V, Tm, G, Wb, Vt = _QR_WS[]                                   # 5th slot repurposed Yb→Vt (nb×m): the
+    if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n || size(Vt, 2) < m
+        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)   # transposed V for the skinny
+        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Vt = Matrix{Float64}(undef, nb, m)
+        _QR_WS[] = (V, Tm, G, Wb, Vt)                             # W=Vᵀ·C as an unpacked no-trans gemm
     end
-    return V, Tm, G, Wb, Yb
+    return V, Tm, G, Wb, Vt
 end
 function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
     m, n = size(A); k = min(m, n)
@@ -216,7 +216,7 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
         return A
     end
-    V, Tm, G, Wb, Yb = _qr_ws(m, n, nb)
+    V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
     pc = 1
     @inbounds while pc <= k
         pb = min(nb, k - pc + 1)
@@ -224,9 +224,10 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
         jt0 = pc + pb
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
-            Vv = view(V, 1:mp, 1:pb)
-            for c in 1:pb, i in 1:mp                            # dense unit-lower-trapezoid V
-                Vv[i, c] = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
+            Vv = view(V, 1:mp, 1:pb); Vtv = view(Vt, 1:pb, 1:mp)   # V (mp×pb) AND its transpose Vᵀ (pb×mp),
+            for c in 1:pb, i in 1:mp                               # both from A in ONE pass (transpose is free)
+                val = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
+                Vv[i, c] = val; Vtv[c, i] = val
             end
             Gv = view(G, 1:pb, 1:pb)
             syrk!(Gv, Vv; uplo = 'U', trans = 'T', alpha = true, beta = false)  # G = Vᵀ V (upper only — dlarft
@@ -242,7 +243,10 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
                 end
             end
             C = view(A, pc:m, jt0:n)
-            Wv = view(Wb, 1:pb, 1:nt); gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)  # W = Vᵀ C
+            Wv = view(Wb, 1:pb, 1:nt)                                     # W = Vᵀ·C: skinny m=pb; the UNPACKED
+            _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, 1.0, Vtv, C, 0.0, Wv)   # no-trans path (Vᵀ pre-
+            #  built) beats the packed transA gemm +7-15% here — at m=pb the B-pack overhead exceeds the in-
+            #  place-stream cost (galen; measured). _gemm_unpacked! reads Vtv/C in place with their strides.
             trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'T')            # W := Tᵀ W (was a scalar latency-bound
                                                                           # triple loop — SIMD trmm instead)
             gemm!(C, Vv, Wv; alpha = -1, beta = true)                     # C −= V·(Tᵀ W)
