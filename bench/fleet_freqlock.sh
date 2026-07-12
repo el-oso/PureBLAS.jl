@@ -72,6 +72,21 @@ achieved_mhz() {
     echo $(( s / n / 1000 ))
 }
 
+# power-profiles-daemon (and tuned) actively manage scaling_max_freq. In `performance` mode PPD drives it
+# back up to the boost range, and on an INTERACTIVE box (open desktop sessions) it re-asserts on every
+# AC/session/activity event — silently REVERTING the pin mid-sweep (the recurring neuromancer flip-flop;
+# headless galen/wintermute never trigger the re-apply so their pin held). Stop them for the locked run;
+# `restore` brings them back. ponytail: `stop` not `mask` — if socket-activation resurrects PPD mid-sweep,
+# escalate to `mask` here (verify_or_die will catch a reverted pin regardless).
+quiesce_ppd() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    for svc in power-profiles-daemon tuned; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null && echo "  stopped $svc (was re-asserting scaling_max_freq)" || true
+        fi
+    done
+}
+
 # Ensure passive mode. 0=passive now; 1=runtime switch rejected (needs reboot); 3=not an amd_pstate box.
 ensure_passive() {
     [ -e "$STATUS" ] || { echo "  (no amd_pstate — plain cpufreq box; boost node should work directly)"; return 3; }
@@ -125,6 +140,7 @@ case "${1:-verify}" in
   lock)
     need_root lock
     echo "Locking $(hostname) to its highest VERIFIED-SUSTAINABLE clock (boost off)…"
+    quiesce_ppd                                               # stop PPD/tuned so they can't revert the pin
     if ensure_passive; then
         echo 0 > "$BOOST" 2>/dev/null || true                 # passive honors this → cpuinfo_max drops to base
         base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))
@@ -152,6 +168,7 @@ case "${1:-verify}" in
   pin)
     need_root pin
     mhz="${2:?usage: sudo $0 pin <MHz>  (MHz must be ≤ base clock; use 'lock' for the canonical base-clock state)}"
+    quiesce_ppd                                               # stop PPD/tuned so they can't revert the pin
     ensure_passive || { echo "  passive needed for a hard pin; persisting boot param:"; persist_grub; echo ">>> reboot, reconnect, re-run."; exit 3; }
     echo 0 > "$BOOST" 2>/dev/null || true                     # a hard pin MUST kill boost, else it floats above the pin
     base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))   # boost-off cpuinfo_max = base
@@ -167,6 +184,9 @@ case "${1:-verify}" in
     need_root restore
     echo active > "$STATUS" 2>/dev/null || true
     echo 1 > "$BOOST" 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then             # bring PPD/tuned back (undo quiesce_ppd)
+        for svc in power-profiles-daemon tuned; do systemctl start "$svc" 2>/dev/null || true; done
+    fi
     for f in $(cpus); do
         echo "$(cat "$f/cpuinfo_max_freq")" > "$f/scaling_max_freq" 2>/dev/null || true
         echo "$(cat "$f/cpuinfo_min_freq")" > "$f/scaling_min_freq" 2>/dev/null || true
