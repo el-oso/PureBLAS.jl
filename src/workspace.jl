@@ -22,6 +22,7 @@ mutable struct L3Workspace{T}
     trtri::Matrix{T}      # _trtri_tmp:   blocked-trtri off-block gemm scratch (≤ _TRSM_BASE/2 square)
     trsm_tmp::Matrix{T}   # _trsm_tmp:    trsm invL/invR copyback temp (grows m×n)
     apad::Matrix{T}       # _l3_apad:     trsm po2-ld A-pad, ld=k+8 (grows)
+    rpack::Matrix{T}      # _trsm_rpack:  side-R fused-leaf pT scratch, ODD ld (conflict-free re-reads; grows)
     potf2::Matrix{T}      # _potf2_buf:   potrf diagonal-base contiguous buffer (grows n×n)
     gpackA::Vector{T}     # _gemm_scratch:      packed A panel
     gpackB::Vector{T}     # _gemm_scratch:      packed B panel
@@ -32,7 +33,7 @@ mutable struct L3Workspace{T}
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
@@ -72,6 +73,18 @@ function _l3_apad(::Type{T}, k::Int) where {T}   # ld = k+8 (non-po2) to dodge c
         b = Matrix{T}(undef, k + 8, k); ws.apad = b
     end
     return view(b, 1:k, 1:k)
+end
+
+# Side-R fused-leaf pT scratch with an ODD leading dim: an odd ld can never be a multiple of the (power-of-2)
+# L1 way stride, so the leaf's solved-column re-reads are conflict-free — vs an in-place po2/way-stride ldb
+# where they collide in one set. Grown odd-and-only (never shrinks) so the ld stays odd across reuse.
+function _trsm_rpack(::Type{T}, rows::Int, cols::Int) where {T}
+    ws = _l3ws(T); b = ws.rpack
+    need = rows + 8; iseven(need) && (need += 1)      # odd ld ⇒ never a way-stride multiple
+    if size(b, 1) < need || size(b, 2) < cols
+        b = Matrix{T}(undef, need, cols); ws.rpack = b
+    end
+    return b
 end
 
 function _potf2_buf(::Type{T}, n::Int) where {T}
