@@ -1156,7 +1156,7 @@ end
             rb += 1
         end
     end
-    return B
+    return nothing
 end
 
 function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
@@ -1164,7 +1164,8 @@ function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
     lda = stride(A, 2); ldb = stride(B, 2); fwd = (up == tr)
     if !up && !tr && unit && T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
             stride(A, 1) == 1 && stride(B, 1) == 1 && k >= _CHOLW      # getrf's side-L lower-unit shape → tile
-        return GC.@preserve A B _trsm_tile_lu_f64!(pointer(A), lda, pointer(B), ldb, k, n)
+        GC.@preserve A B _trsm_tile_lu_f64!(pointer(A), lda, pointer(B), ldb, k, n)
+        return B
     end
     GC.@preserve A B begin
         pA = pointer(A); pB = pointer(B)
