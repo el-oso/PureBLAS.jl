@@ -224,10 +224,21 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
         jt0 = pc + pb
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
-            Vv = view(V, 1:mp, 1:pb); Vtv = view(Vt, 1:pb, 1:mp)   # V (mp×pb) AND its transpose Vᵀ (pb×mp),
-            for c in 1:pb, i in 1:mp                               # both from A in ONE pass (transpose is free)
-                val = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
-                Vv[i, c] = val; Vtv[c, i] = val
+            Vv = view(V, 1:mp, 1:pb); Vtv = view(Vt, 1:pb, 1:mp)
+            # Skinny W=Vᵀ·C via the unpacked path wins ONLY while Vᵀ (pb·mp·8 B) stays L2-resident across the
+            # n-tiles; above ~½L2 the unpacked path re-fetches it from DRAM per n-tile and the packed kc-blocked
+            # transA gemm wins (measured galen: +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536). Derived gate
+            # from detected L2 (req#8): Vᵀ ≤ ½L2 ⇔ 16·pb·mp ≤ _L2_BYTES. Build Vᵀ (free in the V loop) only then.
+            useskinny = 16 * pb * mp <= _L2_BYTES
+            if useskinny
+                for c in 1:pb, i in 1:mp                           # V and its transpose Vᵀ from A in ONE pass
+                    val = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
+                    Vv[i, c] = val; Vtv[c, i] = val
+                end
+            else
+                for c in 1:pb, i in 1:mp
+                    Vv[i, c] = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
+                end
             end
             Gv = view(G, 1:pb, 1:pb)
             syrk!(Gv, Vv; uplo = 'U', trans = 'T', alpha = true, beta = false)  # G = Vᵀ V (upper only — dlarft
@@ -243,10 +254,12 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
                 end
             end
             C = view(A, pc:m, jt0:n)
-            Wv = view(Wb, 1:pb, 1:nt)                                     # W = Vᵀ·C: skinny m=pb; the UNPACKED
-            _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, 1.0, Vtv, C, 0.0, Wv)   # no-trans path (Vᵀ pre-
-            #  built) beats the packed transA gemm +7-15% here — at m=pb the B-pack overhead exceeds the in-
-            #  place-stream cost (galen; measured). _gemm_unpacked! reads Vtv/C in place with their strides.
+            Wv = view(Wb, 1:pb, 1:nt)                                     # W = Vᵀ·C: skinny m=pb. When Vᵀ is
+            if useskinny                                                  # L2-resident, the UNPACKED no-trans path
+                _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, 1.0, Vtv, C, 0.0, Wv)  # (Vᵀ prebuilt, streams C
+            else                                                          # in place) beats the packed transA gemm
+                gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)   # +8-17%; else packed kc-blocked wins.
+            end
             trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'T')            # W := Tᵀ W (was a scalar latency-bound
                                                                           # triple loop — SIMD trmm instead)
             gemm!(C, Vv, Wv; alpha = -1, beta = true)                     # C −= V·(Tᵀ W)
