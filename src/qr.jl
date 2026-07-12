@@ -207,7 +207,8 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
                 Vv[i, c] = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
             end
             Gv = view(G, 1:pb, 1:pb)
-            gemm!(Gv, Vv, Vv; transA = 'T', alpha = true, beta = false)     # G = Vᵀ V
+            syrk!(Gv, Vv; uplo = 'U', trans = 'T', alpha = true, beta = false)  # G = Vᵀ V (upper only — dlarft
+                                                                               # reads Gv[kk,c], kk<c; half the flops)
             Tv = view(Tm, 1:pb, 1:pb)                                       # compact-WY T (dlarft), λ=1/τ
             for c in 1:pb
                 tc = tau[pc+c-1]; λ = isfinite(tc) ? 1.0 / tc : 0.0
@@ -220,13 +221,9 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
             end
             C = view(A, pc:m, jt0:n)
             Wv = view(Wb, 1:pb, 1:nt); gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)  # W = Vᵀ C
-            Yv = view(Yb, 1:pb, 1:nt)
-            for j in 1:nt, c in 1:pb                            # Y = Tᵀ W (Tᵀ lower-tri; pb small → scalar)
-                s = 0.0
-                for r in 1:c; s = muladd(Tv[r, c], Wv[r, j], s); end
-                Yv[c, j] = s
-            end
-            gemm!(C, Vv, Yv; alpha = -1, beta = true)                       # C −= V Y
+            trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'T')            # W := Tᵀ W (was a scalar latency-bound
+                                                                          # triple loop — SIMD trmm instead)
+            gemm!(C, Vv, Wv; alpha = -1, beta = true)                     # C −= V·(Tᵀ W)
         end
         pc += pb
     end
