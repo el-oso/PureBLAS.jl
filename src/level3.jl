@@ -1524,8 +1524,14 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
                     while i0 < m
                         mc = min(mc0, m - i0)
                         _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
-                        @inbounds for c in 1:k
-                            unsafe_copyto!(pB + (i0 + (c - 1) * ldb) * 8, pS + (c - 1) * lds * 8, mc)
+                        @inbounds for c in 1:k                     # copy S[1:mc,c] → B[i0+1:i0+mc,c] (SIMD, trim-safe)
+                            r = 1
+                            while r + _CHOLW - 1 <= mc
+                                vstore(vload(_CVF, _cvptr(pS, r, c, lds)), _cvptr(pB, i0 + r, c, ldb)); r += _CHOLW
+                            end
+                            while r <= mc
+                                unsafe_store!(pB, unsafe_load(pS, _clidx(r, c, lds)), _clidx(i0 + r, c, ldb)); r += 1
+                            end
                         end
                         i0 += mc
                     end
