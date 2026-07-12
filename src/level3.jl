@@ -1513,11 +1513,30 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         mc0 = max(_vwidth(Float64), (_L2_BYTES ÷ 2) ÷ (k * 8))   # MC row-chunk: the mc×k slab the k-repasses
         GC.@preserve A B begin                                   # re-read stays L2-resident (req#8; rows independent)
             pA = pointer(A); ldA = stride(A, 2); pB = pointer(B)
-            i0 = 0
-            while i0 < m
-                mc = min(mc0, m - i0)
-                _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pB + i0 * 8, ldb, k, mc)
-                i0 += mc
+            if _alias_ld(ldb)
+                # Aliasing ldb (way-stride multiple): the leaf's solved-column re-reads collide in one L1 set.
+                # Solve each chunk into an ODD-ld scratch (conflict-free re-reads); psrc=B is read-once
+                # (streaming, no conflict amplification), then copy back. Measured galen +41–49% at 512/1024/
+                # 1536; the single copy-back pass nets positive. Bit-identical. (Kernel unchanged — pT re-target.)
+                S = _trsm_rpack(Float64, mc0, k); lds = stride(S, 2)
+                GC.@preserve S begin
+                    pS = pointer(S); i0 = 0
+                    while i0 < m
+                        mc = min(mc0, m - i0)
+                        _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
+                        @inbounds for c in 1:k
+                            unsafe_copyto!(pB + (i0 + (c - 1) * ldb) * 8, pS + (c - 1) * lds * 8, mc)
+                        end
+                        i0 += mc
+                    end
+                end
+            else
+                i0 = 0
+                while i0 < m
+                    mc = min(mc0, m - i0)
+                    _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pB + i0 * 8, ldb, k, mc)
+                    i0 += mc
+                end
             end
         end
         return B
@@ -1577,6 +1596,12 @@ end
 # catastrophic 0.78→1.12, the copy pays" was a pre-clean (contended / pre-trtri-fix) measurement. Kept
 # for AVX-512/other (untested there; trsm already gates), disabled on AVX2.
 @inline _badld(ld::Int) = _vwidth(Float64) != 4 && ld >= 512 && (ld & (ld - 1)) == 0
+# Aliasing leading dim: a multiple of the L1 WAY STRIDE (L1_BYTES ÷ assoc ÷ 8 doubles; x86 L1 ≈ 8-way) maps
+# every matrix column to the same L1 set → conflict misses on repeated column re-reads. Generalizes _badld
+# (po2-only): 1536 = 3·512 also aliases on a 32KB/8-way L1. Derived from detected L1 (req#8). Independent of
+# vector width (cache geometry, not ISA) — used by the side-R fused leaf's pT-scratch pack.
+const _L1_WAY_D = max(64, _L1_BYTES ÷ 64)      # doubles per L1 way (÷8-way ÷8-byte/double)
+@inline _alias_ld(ld::Int) = ld >= _L1_WAY_D && ld % _L1_WAY_D == 0
 # _l3_apad (po2-ld A-pad, ld=k+8) lives in the per-type L3Workspace (see src/workspace.jl).
 
 # Public: B := α·op(A)⁻¹·B (side 'L') or α·B·op(A)⁻¹ (side 'R'); A k×k triangular (uplo/transA/diag).
