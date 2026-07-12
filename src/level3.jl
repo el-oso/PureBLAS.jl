@@ -1110,51 +1110,65 @@ const _TRSM_DBASE = 32
     end
     return
 end
-# Register-tiled trsm-L base for the LOWER-UNIT no-trans f64 case (getrf's U-solve shape): 4-row blocks —
-# downdate each block against solved rows (vectorized, NC=4-column tiling reusing the L column-vector) then a
-# scalar 4×4 diagonal pass. Touches each B element ~once vs the dense base's k passes (store-bound BLAS-2).
-# Measured galen +119–151% (dense 12–20% → tile 29–44%). Bit-identical. Contiguous columns; pL/pB = &·[1,1].
-@inline function _trsm_tile_lu_f64!(pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int)
-    @inbounds begin
-        rb = 1
-        while rb + _CHOLW - 1 <= k
-            c = 1
-            while c + 3 <= n
-                a0 = vload(_CVF, _cvptr(pB, rb, c, ldb));     a1 = vload(_CVF, _cvptr(pB, rb, c + 1, ldb))
-                a2 = vload(_CVF, _cvptr(pB, rb, c + 2, ldb)); a3 = vload(_CVF, _cvptr(pB, rb, c + 3, ldb))
-                for j in 1:rb-1
-                    Lv = vload(_CVF, _cvptr(pL, rb, j, ld0))
-                    a0 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))),     Lv, a0)
-                    a1 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 1, ldb))), Lv, a1)
-                    a2 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 2, ldb))), Lv, a2)
-                    a3 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 3, ldb))), Lv, a3)
-                end
-                vstore(a0, _cvptr(pB, rb, c, ldb));     vstore(a1, _cvptr(pB, rb, c + 1, ldb))
-                vstore(a2, _cvptr(pB, rb, c + 2, ldb)); vstore(a3, _cvptr(pB, rb, c + 3, ldb))
-                c += 4
+# Register-tiled trsm-L base for the no-trans f64 case (op(A)=A), GENERAL up/unit: solve A·X=B, A k×k lower
+# (fwd) or upper (bwd), unit or non-unit diagonal. W-row blocks — downdate each block against the ALREADY-
+# SOLVED rows (vectorized; the 4-B-column unroll reuses the A row-block vector), then a scalar W×W diagonal
+# solve. Touches each B element ~once vs the dense base's ~k passes (store-bound BLAS-2). Bit-identical.
+# Measured galen: lower-unit (getrf) +119–151%; upper-non-unit (trsm gate) +44–47%. pL/pB = &·[1,1], ld col.
+@inline function _trsm_tile_L_f64!(up::Bool, unit::Bool, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int)
+    W = _CHOLW; nb = k ÷ W
+    @inline function doblock(rb)
+        solved = up ? ((rb + W):k) : (1:(rb - 1))            # already-solved rows: below (upper) / above (lower)
+        c = 1
+        @inbounds while c + 3 <= n
+            a0 = vload(_CVF, _cvptr(pB, rb, c, ldb));     a1 = vload(_CVF, _cvptr(pB, rb, c + 1, ldb))
+            a2 = vload(_CVF, _cvptr(pB, rb, c + 2, ldb)); a3 = vload(_CVF, _cvptr(pB, rb, c + 3, ldb))
+            for j in solved
+                Lv = vload(_CVF, _cvptr(pL, rb, j, ld0))
+                a0 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))),     Lv, a0)
+                a1 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 1, ldb))), Lv, a1)
+                a2 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 2, ldb))), Lv, a2)
+                a3 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 3, ldb))), Lv, a3)
             end
-            while c <= n
-                a = vload(_CVF, _cvptr(pB, rb, c, ldb))
-                for j in 1:rb-1; a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), vload(_CVF, _cvptr(pL, rb, j, ld0)), a); end
-                vstore(a, _cvptr(pB, rb, c, ldb)); c += 1
-            end
-            for cc in 1:n                                   # scalar 4×4 (unit-lower) diagonal solve
-                for ii in 1:_CHOLW-1
-                    s = unsafe_load(pB, _clidx(rb + ii, cc, ldb))
-                    for jj in 0:ii-1; s = muladd(-unsafe_load(pL, _clidx(rb + ii, rb + jj, ld0)), unsafe_load(pB, _clidx(rb + jj, cc, ldb)), s); end
-                    unsafe_store!(pB, s, _clidx(rb + ii, cc, ldb))
-                end
-            end
-            rb += _CHOLW
+            vstore(a0, _cvptr(pB, rb, c, ldb));     vstore(a1, _cvptr(pB, rb, c + 1, ldb))
+            vstore(a2, _cvptr(pB, rb, c + 2, ldb)); vstore(a3, _cvptr(pB, rb, c + 3, ldb))
+            c += 4
         end
-        while rb <= k                                       # tail rows (k not a multiple of W)
-            for cc in 1:n
-                s = unsafe_load(pB, _clidx(rb, cc, ldb))
-                for j in 1:rb-1; s = muladd(-unsafe_load(pL, _clidx(rb, j, ld0)), unsafe_load(pB, _clidx(j, cc, ldb)), s); end
-                unsafe_store!(pB, s, _clidx(rb, cc, ldb))
-            end
-            rb += 1
+        @inbounds while c <= n
+            a = vload(_CVF, _cvptr(pB, rb, c, ldb))
+            for j in solved; a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), vload(_CVF, _cvptr(pL, rb, j, ld0)), a); end
+            vstore(a, _cvptr(pB, rb, c, ldb)); c += 1
         end
+        # W diagonal reciprocals ONCE per block (not per column — the redundant per-cc inv() was a division
+        # chain that sank non-unit on wide vectors). Val(W) ⇒ const-length tuple that const-folds.
+        recips = unit ? ntuple(_ -> 1.0, Val(W)) :
+                 ntuple(q -> @inbounds(inv(unsafe_load(pL, _clidx(rb + q - 1, rb + q - 1, ld0)))), Val(W))
+        @inbounds for cc in 1:n                             # scalar W×W in-block diagonal solve
+            for ii in (up ? (W-1:-1:0) : (0:W-1))
+                s = unsafe_load(pB, _clidx(rb + ii, cc, ldb))
+                for jj in (up ? (ii+1:W-1) : (0:ii-1)); s = muladd(-unsafe_load(pL, _clidx(rb + ii, rb + jj, ld0)), unsafe_load(pB, _clidx(rb + jj, cc, ldb)), s); end
+                unit || (s *= recips[ii + 1])
+                unsafe_store!(pB, s, _clidx(rb + ii, cc, ldb))
+            end
+        end
+    end
+    @inline function dorow(i)                               # one tail row (k not a multiple of W)
+        rng = up ? (i+1:k) : (1:i-1)
+        @inbounds for cc in 1:n
+            s = unsafe_load(pB, _clidx(i, cc, ldb))
+            for j in rng; s = muladd(-unsafe_load(pL, _clidx(i, j, ld0)), unsafe_load(pB, _clidx(j, cc, ldb)), s); end
+            unit || (s *= inv(unsafe_load(pL, _clidx(i, i, ld0))))
+            unsafe_store!(pB, s, _clidx(i, cc, ldb))
+        end
+    end
+    # ORDER: solve in the substitution direction. Upper=backward ⇒ tail rows (bottom) FIRST, then blocks
+    # bottom-up (they downdate against the tail as "solved"). Lower=forward ⇒ blocks top-down, then tail.
+    if up
+        for i in (nb*W == k ? (0:-1) : (k:-1:nb*W+1)); dorow(i); end
+        for bi in nb:-1:1; doblock((bi - 1) * W + 1); end
+    else
+        for bi in 1:nb; doblock((bi - 1) * W + 1); end
+        for i in (nb*W+1):k; dorow(i); end
     end
     return nothing
 end
@@ -1162,9 +1176,13 @@ end
 function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
     k = size(A, 1); n = size(B, 2); T = eltype(B); sz = sizeof(T)
     lda = stride(A, 2); ldb = stride(B, 2); fwd = (up == tr)
-    if !up && !tr && unit && T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
-            stride(A, 1) == 1 && stride(B, 1) == 1 && k >= _CHOLW      # getrf's side-L lower-unit shape → tile
-        GC.@preserve A B _trsm_tile_lu_f64!(pointer(A), lda, pointer(B), ldb, k, n)
+    # Tile crossover (DERIVED, req#8): tile trades dense's ~k store-passes (∝ k²·n/W) for a per-block scalar
+    # W×W triangular diagonal solve (∝ k·W·n, depth-W latency chain). Net win ⇒ k·W < k²/W ⇒ k > W². Fleet-
+    # validated: galen(W=4,W²=16) wins from k=32, wintermute(W=8,W²=64) from k=96. (Side-R tiles unconditionally
+    # — it vectorizes its in-block solve over m, no W² term.) `_CHOLW*_CHOLW` const-folds at compile time.
+    if !tr && T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
+            stride(A, 1) == 1 && stride(B, 1) == 1 && k > _CHOLW * _CHOLW   # no-trans strided f64 → tile
+        GC.@preserve A B _trsm_tile_L_f64!(up, unit, pointer(A), lda, pointer(B), ldb, k, n)
         return B
     end
     GC.@preserve A B begin
@@ -1390,12 +1408,83 @@ function _trsm_right_base!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, 
     return B
 end
 
-# Dense side-R base: solve X·op(A)=B column by column. Eliminate a solved column via _axpy_simd! over the
-# contiguous B columns (closure-free, unlike _trsm_right_base!); divide by the diagonal via _scal. Real
-# non-conj; ascending columns when up≠tr. Used only for narrow B (few rows) — few axpy calls.
+# Register-tiled trsm-R base (f64, GENERAL up/tr/unit): solve X·op(A)=B, X/B m×k, vectorized over m (B rows,
+# contiguous). Mirror of the side-L tile with rows↔solve-columns swapped: block NC=4 SOLVE-COLUMNS, downdate
+# the block against the ALREADY-SOLVED columns in one W-wide sweep (reuse each solved column's m-vector across
+# the 4 block-cols), then a scalar in-block NC×NC coupling solve. coef(j,l)=A[j,l] (tr) or A[l,j]. Each B
+# element written ~once vs the dense base's ~k passes. Measured galen (trsmR gate, lower-T): +64–113%. Bit-id.
+@inline function _trsm_tile_R_f64!(up::Bool, tr::Bool, unit::Bool, pA::Ptr{Float64}, lda::Int, pB::Ptr{Float64}, ldb::Int, m::Int, k::Int)
+    W = _CHOLW; NC = 4; nb = k ÷ NC; asc = (up != tr)
+    @inline cf(j, l) = tr ? unsafe_load(pA, _clidx(j, l, lda)) : unsafe_load(pA, _clidx(l, j, lda))
+    @inline function doblock(j0)                             # block solve-cols j0..j0+3
+        solved = asc ? (1:(j0 - 1)) : ((j0 + NC):k)
+        i = 1
+        @inbounds while i + W - 1 <= m                       # vectorized downdate of the 4 block-cols over m
+            a0 = vload(_CVF, _cvptr(pB, i, j0, ldb));     a1 = vload(_CVF, _cvptr(pB, i, j0 + 1, ldb))
+            a2 = vload(_CVF, _cvptr(pB, i, j0 + 2, ldb)); a3 = vload(_CVF, _cvptr(pB, i, j0 + 3, ldb))
+            for l in solved
+                xv = vload(_CVF, _cvptr(pB, i, l, ldb))
+                a0 = muladd(_CVF(-cf(j0, l)),     xv, a0); a1 = muladd(_CVF(-cf(j0 + 1, l)), xv, a1)
+                a2 = muladd(_CVF(-cf(j0 + 2, l)), xv, a2); a3 = muladd(_CVF(-cf(j0 + 3, l)), xv, a3)
+            end
+            vstore(a0, _cvptr(pB, i, j0, ldb));     vstore(a1, _cvptr(pB, i, j0 + 1, ldb))
+            vstore(a2, _cvptr(pB, i, j0 + 2, ldb)); vstore(a3, _cvptr(pB, i, j0 + 3, ldb)); i += W
+        end
+        @inbounds while i <= m                               # m tail
+            for t in 0:NC-1
+                s = unsafe_load(pB, _clidx(i, j0 + t, ldb))
+                for l in solved; s = muladd(-cf(j0 + t, l), unsafe_load(pB, _clidx(i, l, ldb)), s); end
+                unsafe_store!(pB, s, _clidx(i, j0 + t, ldb))
+            end
+            i += 1
+        end
+        @inbounds for t in (asc ? (0:NC-1) : (NC-1:-1:0))    # in-block 4×4 coupling solve, vectorized over m
+            jj = j0 + t; d = unit ? 1.0 : inv(cf(jj, jj)); rng = asc ? (0:t-1) : (t+1:NC-1); i = 1
+            while i + W - 1 <= m
+                x = vload(_CVF, _cvptr(pB, i, jj, ldb))
+                for u in rng; x = muladd(_CVF(-cf(jj, j0 + u)), vload(_CVF, _cvptr(pB, i, j0 + u, ldb)), x); end
+                unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, jj, ldb)); i += W
+            end
+            while i <= m
+                s = unsafe_load(pB, _clidx(i, jj, ldb))
+                for u in rng; s = muladd(-cf(jj, j0 + u), unsafe_load(pB, _clidx(i, j0 + u, ldb)), s); end
+                unit || (s *= d); unsafe_store!(pB, s, _clidx(i, jj, ldb)); i += 1
+            end
+        end
+    end
+    @inline function docol(j)                                # one tail solve-col (k not a multiple of NC)
+        solved = asc ? (1:j-1) : (j+1:k); d = unit ? 1.0 : inv(cf(j, j)); i = 1
+        @inbounds while i + W - 1 <= m
+            x = vload(_CVF, _cvptr(pB, i, j, ldb))
+            for l in solved; x = muladd(_CVF(-cf(j, l)), vload(_CVF, _cvptr(pB, i, l, ldb)), x); end
+            unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, j, ldb)); i += W
+        end
+        @inbounds while i <= m
+            s = unsafe_load(pB, _clidx(i, j, ldb))
+            for l in solved; s = muladd(-cf(j, l), unsafe_load(pB, _clidx(i, l, ldb)), s); end
+            unit || (s *= d); unsafe_store!(pB, s, _clidx(i, j, ldb)); i += 1
+        end
+    end
+    # ORDER (as side-L): ascending ⇒ blocks low→high then tail cols; descending ⇒ tail cols (high) FIRST,
+    # then blocks high→low (blocks downdate against the tail as "solved").
+    if asc
+        for bi in 1:nb; doblock((bi - 1) * NC + 1); end
+        for j in (nb*NC+1):k; docol(j); end
+    else
+        for j in (nb*NC == k ? (0:-1) : (k:-1:nb*NC+1)); docol(j); end
+        for bi in nb:-1:1; doblock((bi - 1) * NC + 1); end
+    end
+    return nothing
+end
+
 function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     m = size(B, 1); k = size(A, 2); T = eltype(B); sz = sizeof(T); ldb = stride(B, 2)
     asc = (up != tr)
+    if T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
+            stride(A, 1) == 1 && stride(B, 1) == 1 && k >= 4 && m >= _CHOLW    # strided f64 (trsmR gate) → tile
+        GC.@preserve A B _trsm_tile_R_f64!(up, tr, unit, pointer(A), stride(A, 2), pointer(B), ldb, m, k)
+        return B
+    end
     GC.@preserve A B begin
         pB = pointer(B)
         @inbounds for j in (asc ? (1:k) : (k:-1:1))
