@@ -845,7 +845,20 @@ end
 # IN-PLACE (no full B-copy): trmm-L columns are independent, so per jc column-panel we pack ALL of its
 # pc-blocks into Bpf (capturing the input) BEFORE zeroing that panel of B — the pack itself is the copy,
 # so the separate Bc scratch is gone. (Bpf holds the whole panel: nblk pc-blocks × one packed block.)
+# GKH ownership: const-dispatch the gated real types (_trmm_packed! is BlasReal-only, so Float64/Float32
+# are the only hot callers) → bare field load, no runtime `get!` (~130 ns) and no box signal. IdDict stays
+# as the open-ended fallback only.
 const _TRMM_BPF = IdDict{DataType, Vector}()
+const _TRMM_BPF_F64 = Float64[]
+const _TRMM_BPF_F32 = Float32[]
+@inline function _trmm_bpf(::Type{Float64}, len::Int)
+    length(_TRMM_BPF_F64) < len && resize!(_TRMM_BPF_F64, len)
+    return _TRMM_BPF_F64
+end
+@inline function _trmm_bpf(::Type{Float32}, len::Int)
+    length(_TRMM_BPF_F32) < len && resize!(_TRMM_BPF_F32, len)
+    return _TRMM_BPF_F32
+end
 function _trmm_bpf(::Type{T}, len::Int) where {T}
     v = get!(() -> T[], _TRMM_BPF, T)::Vector{T}
     length(v) < len && resize!(v, len)
