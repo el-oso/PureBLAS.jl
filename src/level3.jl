@@ -2501,10 +2501,15 @@ const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _vwidth(Float64) == 4 ?
 const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int        # trans='N': recursion below this
 const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # trans='C'/'T': packed ~always
 # trans='N' complex n≤this ⇒ unpacked triangular kernel (`_ctri_unpacked!`): the packed path's operand-pack
-# + NR-remainder overhead and the recursion base's 2×-flop waste BOTH miss the gate at n≈24–48, while the
-# unpacked complex microkernel (what zgemm rides) gates ~1.4 there. Keyed on `_vwidth` like every sibling
-# cut; AVX2 (W=4) defaults OFF pending galen calibration (its small-n takes the unified path). Per-box knob.
-const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 0 : 96)::Int
+# + NR-remainder overhead and the recursion base's 2×-flop waste BOTH miss the gate at small n, while the
+# unpacked complex microkernel (what zgemm rides) gates there. The cutoff is where the packed path's NR-tile
+# amortization overtakes unpacked — a microkernel-ramp crossover, µarch-specific (NOT a cache formula), so
+# it is `_vwidth`-keyed & Preferences-overridable. Measured boost-locked (bench/csyrk_avx2_calib.jl):
+#  • AVX2 (W=4, galen): the recursion base (n≤_CSYRK_PACK_CUT=16) 2×-wastes → zherk/zsyrk n=16 DIP to 0.87-
+#    0.91 (sub-gate). Unpacked-tri gates all 4 ops at n≤16 (herk 1.49/her2k 1.21) and beats the dip; packed
+#    overtakes by n=24, so cutoff=16.  • AVX-512 (W=8): packed's edge overhead is larger → unpacked wins to
+#    n≈192; 96 is the shipped conservative value. (Deriving one formula for both remains req#8 debt.)
+const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 16 : 96)::Int
 
 # ── Unpacked triangular-output complex rank-k/rank-2k (small-n, trans='N'). Routes herk/syrk (and, via two
 # products, her2k/syr2k) through the SAME direct-read `_uker_cmplx!` as zgemm (no operand pack) but stores
