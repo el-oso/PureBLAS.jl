@@ -1,7 +1,12 @@
-# Deep trim-safety check on the @ccallable C-ABI entry points — these are exactly what
+# FAST first-net trim-safety check on the @ccallable C-ABI entry points — these are exactly what
 # juliac --trim compiles into libpureblas.so, so they must contain no dynamic dispatch / runtime
-# reflection. TrimCheck @validate runs the same reachability analysis as juliac. Mirrors PureFFT's
-# "TrimCheck trim-safety" testitem (signatures given by argument TYPES, not values).
+# reflection. Signatures given by argument TYPES, not values. Mirrors PureFFT's testitem.
+#
+# ⚠ NOT AUTHORITATIVE: @validate infers each signature IN ISOLATION (where hot kernels inline and
+# default-arg trampolines resolve), so it is MORE OPTIMISTIC than juliac's whole-program compile — it
+# once PASSED here while the real .so build failed with 36 `unresolved invoke ::Any` errors (a
+# @generated kernel with default args → trampoline methods juliac verifies but @validate does not). The
+# authoritative check is the actual build in juliac_build_test.jl (gated). Keep this as the quick net.
 
 @testitem "TrimCheck trim-safety (C-ABI entry points)" begin
     using TrimCheck
