@@ -2507,9 +2507,12 @@ const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # tra
 # it is `_vwidth`-keyed & Preferences-overridable. Measured boost-locked (bench/csyrk_avx2_calib.jl):
 #  • AVX2 (W=4, galen): the recursion base (n≤_CSYRK_PACK_CUT=16) 2×-wastes → zherk/zsyrk n=16 DIP to 0.87-
 #    0.91 (sub-gate). Unpacked-tri gates all 4 ops at n≤16 (herk 1.49/her2k 1.21) and beats the dip; packed
-#    overtakes by n=24, so cutoff=16.  • AVX-512 (W=8): packed's edge overhead is larger → unpacked wins to
-#    n≈192; 96 is the shipped conservative value. (Deriving one formula for both remains req#8 debt.)
-const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 16 : 96)::Int
+#    overtakes by n=24, so cutoff=16.  • AVX-512 (W=8): packed's edge overhead is larger → unpacked wins
+#    broadly. Measured both boxes boost-locked: Zen4 (wm) unpacked ≥ packed to n=192 (packed reclaims n=256);
+#    Zen5 (neuro) unpacked ≥ packed at EVERY n≤256. Cutoff 192 is safe on both (avoids Zen4's n=256 packed
+#    preference) and lifts the n=128/192 complex rank-k the factorizations recurse through. (One formula for
+#    both µarchs remains req#8 debt.)
+const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 16 : 192)::Int
 
 # ── Unpacked triangular-output complex rank-k/rank-2k (small-n, trans='N'). Routes herk/syrk (and, via two
 # products, her2k/syr2k) through the SAME direct-read `_uker_cmplx!` as zgemm (no operand pack) but stores
