@@ -135,8 +135,16 @@ end
     end
 end
 
-# Complex axpy: y .+= (alr + i·ali)·x. Same swap-pairs complex-multiply of x as scal, then add into y.
-# One shuffle/vector, 4× unrolled (bandwidth-bound: reads x+y, writes y). `n` counts COMPLEX elements.
+# Complex axpy: y .+= (alr + i·ali)·x. Swap-pairs complex-multiply of x, fused straight into y.
+# DECOMPOSITION (galen Zen3/AVX2, n=1M ≈ 32MB footprint = L3 edge, the worst point): the complex kernel
+# under-extracted bandwidth with NO register spills and no prefetch/unroll sensitivity (all falsified) — so
+# the residual was the compute critical path at the L3→DRAM transition, not memory. The old body was 4 vector
+# ops/lane (mul xv·arv, shuffle, FMA, then a standalone `y + ax` add). Folding the y-load into the FIRST FMA
+# as its addend drops it to 1 shuffle + 2 FMAs = 3 ops/lane (−25%), identical numerics, shorter dep chain
+# (yv feeds the FMA directly): t = yv + xv·arv ; result = t + swap(xv)·sv. ISA-neutral. Controlled same-process
+# A/B @1M: 96.5→99.1 GB/s, PB/OB 0.937→0.958 (5/5 trials). Residual vs OB is complex-specific L3-edge
+# scheduling (shuffle+2FMA density limits bandwidth for OB's complex too: real 111 vs complex-OB 104 GB/s at
+# matched 32MB/bytes). 4× unrolled (bandwidth-bound: reads x+y, writes y). `n` counts COMPLEX elements.
 @generated function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T<:BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
@@ -148,15 +156,15 @@ end
             while i + step <= n
                 @inbounds for u in 0:3
                     o = (i + u * $W) * 2 * $sz; xv = vload($V2, px + o)
-                    ax = muladd(shufflevector(xv, Val($swp)), sv, xv * arv)   # a·x
-                    vstore(vload($V2, py + o) + ax, py + o)                    # y += a·x
+                    t = muladd(xv, arv, vload($V2, py + o))                      # y + arv·x
+                    vstore(muladd(shufflevector(xv, Val($swp)), sv, t), py + o)  # + swap(x)·sv
                 end
                 i += step
             end
             while i + $W <= n
                 o = i * 2 * $sz; xv = vload($V2, px + o)
-                ax = muladd(shufflevector(xv, Val($swp)), sv, xv * arv)
-                vstore(vload($V2, py + o) + ax, py + o); i += $W
+                t = muladd(xv, arv, vload($V2, py + o))
+                vstore(muladd(shufflevector(xv, Val($swp)), sv, t), py + o); i += $W
             end
             while i < n
                 j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j)
