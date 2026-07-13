@@ -225,11 +225,13 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
             Vv = view(V, 1:mp, 1:pb); Vtv = view(Vt, 1:pb, 1:mp)
-            # Skinny W=Vᵀ·C via the unpacked path wins ONLY while Vᵀ (pb·mp·8 B) stays L2-resident across the
-            # n-tiles; above ~½L2 the unpacked path re-fetches it from DRAM per n-tile and the packed kc-blocked
-            # transA gemm wins (measured galen: +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536). Derived gate
-            # from detected L2 (req#8): Vᵀ ≤ ½L2 ⇔ 16·pb·mp ≤ _L2_BYTES. Build Vᵀ (free in the V loop) only then.
-            useskinny = 16 * pb * mp <= _L2_BYTES
+            # Skinny W=Vᵀ·C via the unpacked path — the crossover is a µARCH SPLIT (req#8; measured fleet):
+            #  • AVX2 (W=4): the packed transA skinny gemm is STABLE at large mp, so unpacked wins only while Vᵀ
+            #    (pb·mp·8 B) stays L2-resident (else it re-fetches Vᵀ per n-tile). Gate: Vᵀ≤½L2 ⇔ 16·pb·mp≤L2
+            #    (galen: unpacked +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536).
+            #  • AVX-512 (W=8): the packed transA skinny gemm COLLAPSES at large mp (neuro/wm: packed 16-28 vs
+            #    unpacked ~30-42 GF for mp≥512), so unpacked wins for all non-tiny mp. Gate: mp>_GEMM_UNPACK_MAX.
+            useskinny = _CHOLW == 4 ? (16 * pb * mp <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX)
             if useskinny
                 for c in 1:pb, i in 1:mp                           # V and its transpose Vᵀ from A in ONE pass
                     val = i == c ? 1.0 : (i > c ? A[pc+i-1, pc+c-1] : 0.0)
