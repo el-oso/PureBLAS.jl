@@ -225,14 +225,14 @@ end
 # call per row-tile). Fable-designed 2026-07-05.
 function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); n = size(B, 2)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+    Mv = _l3_apad(Tc, k); M = parent(Mv)                    # non-po2 ld=k+8 scratch: dodges the L1 set
+    _mat_tri!(Mv, A, k, up, tr, unit)                       # aliasing the po2 _l3_tmp(128) suffered at small k
     cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
-    ldM = _L3_NB; ldb = stride(B, 2)
+    ldM = stride(Mv, 2); ldb = stride(B, 2)
     GC.@preserve M B begin
-        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+        Mp = Ptr{T}(pointer(Mv)); Bp = Ptr{T}(pointer(B))
         onr = one(T); zr = zero(T)
         nt = cld(k, mr)
         for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
@@ -266,14 +266,14 @@ end
 # read columns are exactly the not-yet-overwritten ones, so no scratch (see _trmm_cmplx_small_L!).
 function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); m = size(B, 1)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
+    Mv = _l3_apad(Tc, k); M = parent(Mv)                    # non-po2 ld=k+8 scratch (see _trmm_cmplx_small_L!)
     _mat_tri!(Mv, A, k, up, tr, unit)
     cj && @inbounds(Mv .= conj.(Mv))
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
-    ldM = _L3_NB; ldb = stride(B, 2)
+    ldM = stride(Mv, 2); ldb = stride(B, 2)
     GC.@preserve M B begin
-        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+        Mp = Ptr{T}(pointer(Mv)); Bp = Ptr{T}(pointer(B))
         onr = one(T); zr = zero(T); nt = cld(k, nr)
         ir = 0
         while ir < m
