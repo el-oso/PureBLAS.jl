@@ -176,11 +176,17 @@ end
 # FMA-reduction latency. Returns Complex{T}. `n` counts COMPLEX elements.
 @generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T<:BlasReal, CJ}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    # Unroll from the REGISTER BUDGET (req#8), not a literal: the 2·UNR `Vec{2W}` accumulators each take 2
+    # physical vector registers, so keep 4·UNR ≲ Nregs−6 (leave ~6 for the x/y/swap loads). AVX2 has 16
+    # vector regs, AVX-512 has 32 — the old hardcoded 4× put all 16 YMM into accumulators on AVX2 → spill
+    # (dotc/dotu small-n 0.75×); this gives 2× on AVX2 / 4× on AVX-512, register-resident on both.
+    UNR = clamp(((_SIMD_BYTES == 64 ? 32 : 16) - 6) ÷ 4, 1, 4)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
-    ps = [Symbol(:p, u) for u in 0:3]; qs = [Symbol(:q, u) for u in 0:3]
-    init = Expr(:block, (:( $(ps[u+1]) = zero($V2); $(qs[u+1]) = zero($V2) ) for u in 0:3)...)
+    ps = [Symbol(:p, u) for u in 0:(UNR - 1)]; qs = [Symbol(:q, u) for u in 0:(UNR - 1)]
+    init = Expr(:block, (:( $(ps[u+1]) = zero($V2); $(qs[u+1]) = zero($V2) ) for u in 0:(UNR - 1))...)
+    psum = foldl((a, b) -> :($a + $b), ps); qsum = foldl((a, b) -> :($a + $b), qs)
     body = Expr(:block)
-    for u in 0:3
+    for u in 0:(UNR - 1)
         o = :((i + $u * $W) * 2 * $sz)
         push!(body.args, quote
             xv = vload($V2, px + $o); yv = vload($V2, py + $o)
@@ -188,7 +194,7 @@ end
         end)
     end
     quote
-        px = _reptr(x); py = _reptr(y); step = 4 * $W
+        px = _reptr(x); py = _reptr(y); step = $UNR * $W
         $init
         GC.@preserve x y begin
             i = 0
@@ -203,8 +209,8 @@ end
                 end
                 i += $W
             end
-            pr, pi = _deint_cmplx((p0 + p1) + (p2 + p3))       # pr = Σxr·yr, pi = Σxi·yi
-            qr, qi = _deint_cmplx((q0 + q1) + (q2 + q3))       # qr = Σxr·yi, qi = Σxi·yr
+            pr, pi = _deint_cmplx($psum)       # pr = Σxr·yr, pi = Σxi·yi
+            qr, qi = _deint_cmplx($qsum)       # qr = Σxr·yi, qi = Σxi·yr
             # dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr ;  dotc (conj x): signs of the xi terms flip
             sr = sum(pr) + $(CJ ? :(sum(pi)) : :(-sum(pi)))
             si = sum(qr) + $(CJ ? :(-sum(qi)) : :(sum(qi)))
