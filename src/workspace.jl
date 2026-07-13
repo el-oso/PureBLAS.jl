@@ -39,13 +39,20 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}[],
 )
 
-# Owner accessors. Const-dispatch the gated real types (bare field load, no lookup); a keyed fallback for
-# everything else (complex/Dual/…), same cost as the old per-role Dicts.
+# Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
+# four BLAS element types s/d/c/z. The IdDict fallback is ONLY for the open-ended non-gated set
+# (ForwardDiff.Dual & co. on the generic AD path), which can't have a compile-time owner and isn't a hot
+# path. Complex was on the fallback before — that cost the complex L3 hot path a ~130 ns `get!` per call
+# (and read as a runtime box to static alloc checks); const owners fix both.
 const _L3WS_F64 = L3Workspace{Float64}()
 const _L3WS_F32 = L3Workspace{Float32}()
+const _L3WS_C64 = L3Workspace{ComplexF64}()
+const _L3WS_C32 = L3Workspace{ComplexF32}()
 const _L3WS_OTHER = IdDict{DataType, L3Workspace}()
 @inline _l3ws(::Type{Float64}) = _L3WS_F64
 @inline _l3ws(::Type{Float32}) = _L3WS_F32
+@inline _l3ws(::Type{ComplexF64}) = _L3WS_C64
+@inline _l3ws(::Type{ComplexF32}) = _L3WS_C32
 _l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER, T)::L3Workspace{T}
 
 # Per-role accessors (unchanged signatures — call sites are untouched). Each returns/grows one owned field.
