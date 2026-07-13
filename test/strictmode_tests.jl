@@ -9,7 +9,10 @@
 # separately with runtime @allocated in gemm_tests.jl, where static AllocCheck would false-positive.
 
 @testitem "StrictMode dogfood: BLAS-1 strict contract" begin
-    using StrictMode, AllocCheck, JET
+    # StrictMode.TypeContracts: TypeContracts 0.14.0's @verify emits a `_seal_verified!(@__MODULE__,…)`
+    # that resolves `TypeContracts` in THIS module (@verify_strict esc's the forwarded @verify call), so
+    # the name must be in scope here. Reach it through StrictMode (already a dep) — no new test dep.
+    using StrictMode, StrictMode.TypeContracts, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping dogfood (enable in test/Project.toml to run)"
         @test_skip StrictMode.checks_enabled()
@@ -44,7 +47,9 @@
 end
 
 @testitem "StrictMode dogfood: BLAS-2 strict contract" begin
-    using StrictMode, AllocCheck, JET
+    # StrictMode.TypeContracts: see the BLAS-1 item — @verify_strict's forwarded @verify (TypeContracts
+    # 0.14.0) seals into this module, so `TypeContracts` must resolve here.
+    using StrictMode, StrictMode.TypeContracts, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L2 dogfood"
         @test_skip StrictMode.checks_enabled()
