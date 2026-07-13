@@ -1504,9 +1504,12 @@ end
 @generated function _uker_cmplx!(C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T, mre::Int, nre::Int,
         ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
-        ::Val{B0} = Val(false), ::Val{A1} = Val(false),
-        ::Val{AR} = Val(false), ::Val{FULL} = Val(false),
-        ::Val{TRI} = Val(false), d0::Int = 0, upper::Bool = true) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI}
+        ::Val{B0}, ::Val{A1},
+        ::Val{AR}, ::Val{FULL},
+        ::Val{TRI}, d0::Int, upper::Bool) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI}
+    # NOTE: no default args — they generate default-arg TRAMPOLINE methods that juliac's --trim verifier
+    # cannot resolve through this @generated function (unresolved invoke ::Any → .so build fails). Every
+    # call site MUST pass all 10 Vals + d0 + upper explicitly. (Regression guard: bench/juliac build.)
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}; V2W = Vec{2W, T}
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
     swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)                       # (1,0,3,2,…): swap re/im pairs
@@ -1604,14 +1607,14 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
             if nrv >= _CMR
                 if mre == mr                                         # full-row interior tile → unmasked
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true), Val(false), 0, true)
                 else
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true)
                 end
             else
                 _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false))
+                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true)
             end
             ir += nrv >= _CMR ? mr : W
         end

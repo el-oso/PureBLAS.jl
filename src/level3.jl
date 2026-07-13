@@ -248,10 +248,10 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 nre = min(nr, n - jr)
                 if full
                     _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
                 else
                     _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
                 end
                 jr += nr
             end
@@ -285,10 +285,10 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
                 if full
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
                 else
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true))
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
                 end
             end
             ir += mr
@@ -2568,13 +2568,13 @@ function _ctri_core!(::Val{NR}, up::Bool, ::Val{SB}, ::Val{A1}, ::Val{AR},
                     # skip: nothing stored
                 elseif full && mre == mr
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(true))
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(true), Val(false), 0, true)
                 elseif full && nrv >= _CMR
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false))
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true)
                 elseif full
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false))
+                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true)
                 elseif nrv >= _CMR                                       # diagonal-straddling ⇒ TRI masked store
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
                         Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR),
