@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <dlfcn.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
 
 typedef void (*daxpy_t)(int64_t *, double *, double *, int64_t *, double *, int64_t *);
 typedef double (*dnrm2_t)(int64_t *, double *, int64_t *);
@@ -85,5 +87,42 @@ int main(void) {
             if (d > rerr) rerr = d;
         }
     printf("dgesvd recon max|err| = %.2e\n", rerr); /* ~1e-15 */
+
+    /* larger SVD (n=160) — exercises the divide-and-conquer singular-VECTOR path (n > _SVD_DC_CROSS=96,
+     * the crossover just retuned). Deterministic diagonally-dominant matrix; verify full reconstruction
+     * U*diag(S)*VT ≈ A and orthonormality of U (max|UᵀU − I|). This is the real drop-in SVD path. */
+    {
+        int64_t Ng = 160, ldn = 160;
+        double *Ag = malloc(Ng*Ng*sizeof(double)), *A0g = malloc(Ng*Ng*sizeof(double));
+        double *Ug = malloc(Ng*Ng*sizeof(double)), *VTg = malloc(Ng*Ng*sizeof(double));
+        double *Sg = malloc(Ng*sizeof(double)), wq[1];
+        for (int64_t j = 0; j < Ng; j++)
+            for (int64_t i = 0; i < Ng; i++) {
+                double v = (double)(((i*131 + j*17 + 1) % 101)) / 50.0 - 1.0;
+                if (i == j) v += (double)Ng;                 /* diagonal dominance → well-conditioned */
+                Ag[i + Ng*j] = v; A0g[i + Ng*j] = v;
+            }
+        int64_t lw = -1, inf = -99;
+        dgesvd(&Aj, &Aj, &Ng, &Ng, Ag, &ldn, Sg, Ug, &ldn, VTg, &ldn, wq, &lw, &inf, 1, 1);
+        lw = (int64_t)wq[0]; if (lw < 8*Ng) lw = 8*Ng;
+        double *wk = malloc(lw*sizeof(double));
+        dgesvd(&Aj, &Aj, &Ng, &Ng, Ag, &ldn, Sg, Ug, &ldn, VTg, &ldn, wk, &lw, &inf, 1, 1);
+        double rerr2 = 0.0, oerr = 0.0;
+        for (int64_t j = 0; j < Ng; j++)
+            for (int64_t i = 0; i < Ng; i++) {
+                double r = 0.0;
+                for (int64_t k = 0; k < Ng; k++) r += Ug[i + Ng*k] * Sg[k] * VTg[k + Ng*j];
+                double d = fabs(r - A0g[i + Ng*j]); if (d > rerr2) rerr2 = d;
+            }
+        for (int64_t a = 0; a < Ng; a++)
+            for (int64_t b = 0; b < Ng; b++) {
+                double s = 0.0;
+                for (int64_t i = 0; i < Ng; i++) s += Ug[i + Ng*a] * Ug[i + Ng*b];
+                double d = fabs(s - (a == b ? 1.0 : 0.0)); if (d > oerr) oerr = d;
+            }
+        printf("dgesvd n=160: info=%lld  S[0]=%.3f S[159]=%.3f  recon|err|=%.2e  ortho|err|=%.2e\n",
+               (long long)inf, Sg[0], Sg[Ng-1], rerr2, oerr);   /* info=0, err ~1e-12 */
+        free(Ag); free(A0g); free(Ug); free(VTg); free(Sg); free(wk);
+    }
     return 0;
 }
