@@ -17,11 +17,26 @@
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
-# Reference BLAS: OpenBLAS (default) or Intel MKL (`mkl` arg). MKL.jl LBT-forwards LinearAlgebra to MKL,
-# so `B`/`LAPACK` below transparently measure against whichever is active — one code path, two baselines.
-const REFBK = "mkl" in ARGS ? "mkl" : "openblas"
+# Reference BLAS: OpenBLAS (default), Intel MKL (`mkl` arg), or AMD AOCL (`aocl` arg). Each package
+# LBT-forwards LinearAlgebra's BLAS+LAPACK to itself on load, so `B`/`LAPACK` below transparently measure
+# against whichever is active — one code path, three baselines. AOCL (AMD-tuned BLIS + libFLAME) is a
+# SEPARATE baseline from OpenBLAS: its caches/SVGs carry an `_aocl` suffix and never mix with OpenBLAS's.
+const REFBK = "aocl" in ARGS ? "aocl" : "mkl" in ARGS ? "mkl" : "openblas"
 REFBK == "mkl" && @eval using MKL
-const REFNAME = REFBK == "mkl" ? "MKL" : "OpenBLAS"
+# AOCL = AMD's Zen-tuned AOCL-BLIS + AOCL-libFLAME, shipped as the `AOCL_jll` artifact (AMD's own release,
+# NOT generic blis_jll/libflame_jll). We LBT-forward its artifact .so paths directly (BLAS→libblis-mt,
+# LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
+# reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
+# single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
+if REFBK == "aocl"
+    ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
+    @eval using AOCL_jll
+    LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # ILP64 BLAS  → libblis-mt.so
+    LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # ILP64 LAPACK → libflame.so
+end
+const REFNAME = REFBK == "mkl" ? "MKL" : REFBK == "aocl" ? "AOCL" : "OpenBLAS"
+# cache/SVG filename suffix: "" for OpenBLAS (the default baseline — its artefacts are UNTOUCHED), "_mkl"/"_aocl" otherwise
+const REFSUF = REFBK == "openblas" ? "" : "_$REFBK"
 import LinearAlgebra.BLAS as B
 BLAS.set_num_threads(1)
 
@@ -43,7 +58,7 @@ const _AUTOISA = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "AVX-512" : "Zen5
                  _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
 const ISA = isnothing(_ISAOVR) ? _AUTOISA : _ISAOVR
 const _SLUGB = isnothing(_SLUGOVR) ? _AUTOSLUG : _SLUGOVR
-const SLUG = REFBK == "mkl" ? "$(_SLUGB)_mkl" : _SLUGB
+const SLUG = "$(_SLUGB)$(REFSUF)"
 # Provenance stamped into every cache header (self-describing: which CPU, what code, when measured).
 const _CPUNAME = replace(strip(Sys.cpu_info()[1].model), r"[\t\r\n]" => " ")   # e.g. "AMD Ryzen 9 7950X …"
 const _COMMIT = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "unknown" end
@@ -59,9 +74,9 @@ const _SELOP  = (i = findfirst(a -> startswith(a, "op="), ARGS);    isnothing(i)
 const _SELGRP = (i = findfirst(a -> startswith(a, "group="), ARGS); isnothing(i) ? nothing : ARGS[i][7:end])
 _want(lvl, nm) = (isnothing(_SELOP) && isnothing(_SELGRP)) || _SELOP == nm || _SELGRP == lvl
 _cap(szs, maxn) = Tuple(s for s in szs if s <= maxn)   # per-op size cap (e.g. skip 4096 for slow ops)
-# lite drops the 3 LARGEST (expensive) sizes of each vector — relative, so it works for L1 (sizes in the
-# thousands) as well as L3/LAPACK (8…4096). Guarded so a short/empty cap never yields an empty tuple.
-_sizes(szs) = _LITE && length(szs) > 3 ? szs[1:(length(szs)-3)] : szs
+# lite caps sizes at 1024 (drops the expensive 2048/4096 tail) — keeps the meaningful mid-n range while
+# skipping the O(n³) large-n sink that dominates wall time. Guarded so a cap never yields an empty tuple.
+_sizes(szs) = _LITE ? (t = Tuple(s for s in szs if s <= 1024); isempty(t) ? szs[1:1] : t) : szs
 
 # Repeated rounds reject the one-unlucky-window failure (gemm n=32 read 0.83 in a single window vs 1.01
 # true). Keyed on SIZE, deterministic (never on measured duration → identical protocol on every host).
@@ -399,7 +414,7 @@ function run_cmplx_benchmarks()
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
-const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFBK == "mkl" ? "_mkl" : "")$(_LITE ? "_lite" : "").txt")
+const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFSUF)$(_LITE ? "_lite" : "").txt")
 function save_cache(path, groups)
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
@@ -455,7 +470,7 @@ function load_fleet()
     fleet = Tuple{NamedTuple,Dict{String,Vector{OpData}}}[]
     for f in sort(readdir(@__DIR__))
         (startswith(f, "plots_data_") && endswith(f, ".txt")) || continue
-        occursin("_mkl", f) == (REFBK == "mkl") || continue   # mkl-mode ↔ *_mkl caches; else OpenBLAS caches
+        (occursin("_aocl", f) ? "aocl" : occursin("_mkl", f) ? "mkl" : "openblas") == REFBK || continue  # baseline ↔ its own caches; never mix
         occursin("_lite", f) == _LITE || continue
         try                                                    # a stale/foreign/half-written cache must NOT
             g, meta = load_cache(joinpath(@__DIR__, f))        # abort the whole fleet render — skip it loudly
@@ -593,9 +608,9 @@ else
                             ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
                             ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
                             ("CLP", "clapack", "Complex LAPACK"))
-        svg_panels(joinpath(adir, "perf_$(base)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk)
+        svg_panels(joinpath(adir, "perf_$(base)$(REFSUF)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk)
     end
-    open(joinpath(@__DIR__, "gen_table$L.md"), "w") do io   # drift-proof numeric table: geomean (worst) per op/µarch
+    open(joinpath(@__DIR__, "gen_table$(REFSUF)$L.md"), "w") do io   # drift-proof numeric table: geomean (worst) per op/µarch
         println(io, "_Measured (provenance):_\n")
         for (m, _) in fleet   # self-describing: CPU, code commit, measure time per µarch
             println(io, "- **$(_ulabel(m))** (`$(m.host)`) — $(m.cpu), commit `$(m.commit)`, $(m.time)")
