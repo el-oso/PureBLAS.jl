@@ -10,10 +10,25 @@ const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trs
 # clamp bounds are measured literals to re-derive from the gemm k-block (L1) / trailing residency (L2).
 _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
+# Complex getrf panel width. Grows with n so the trailing rank-nb zgemm is compute-bound — measured
+# (galen): a rank-k zgemm gates only at k≳96 on AVX2 (k=48 → 0.85), so the complex panel must grow faster
+# than the real one (÷5 vs ÷8) — and is CAPPED at the complex-gemm kc micropanel `_clu_cap` (== `_CKC` for
+# ComplexF64: L1-residency `kc·nr·sizeof(T) ≤ ½L1`, per-T via `_l1_block`), beyond which the trailing zgemm
+# re-blocks k internally anyway. Floor keeps the panel lean at small n (the rank-2 panel factor dominates
+# there). Reproduces the rank-2-panel nb-sweep optima (galen Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
+@inline _clu_cap(::Type{T}) where {T<:BlasComplex} = _l1_block(_HW, T, max(_CNR, _CNR_SMALL))
+@inline _clu_nb(n::Int, ::Type{T}) where {T<:BlasComplex} = clamp((n ÷ 5) & ~15, 32, _clu_cap(T))
+
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
 # single split does the cross-half update ONCE via BLAS-3 gemm, halving that store traffic.
 const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split. 24→16: +2-4.5% at n=64-384 (less store-bound rank-1 in the cliff zone). req#8: derive from store-BW/L1.
+# Complex base is WIDER than the real one, by the complex/real element-size ratio (=2): the complex base
+# is a rank-2 SIMD sweep (already halves the store traffic the recursion's cross-half gemm targets), so the
+# BLAS-3 split's benefit shrinks while its cost (skinny-k zgemm/ztrsm cross-updates on a TALL panel) grows,
+# pushing the flat/recurse crossover ~2× wider. Measured (galen): 32 beats both 16 and 64 for zgetrf 256/
+# 1024 (panel 0.91→0.96 at m=1024). Derived from sizeof so cgetf2 (ComplexF32) tracks the same criterion.
+const _CGETF2_BASE = _GETF2_BASE * (sizeof(ComplexF64) ÷ sizeof(Float64))   # = 32
 
 # Apply the sequential row interchanges recorded in ipiv[ip0+1 : ip0+np] to columns j1:j2 of panel view V,
 # LOCAL to V (ipiv holds GLOBAL rows = roff + local). Pivot t swaps V-row (rowbase+t) ↔ V-row (ipiv[ip0+t]
@@ -35,7 +50,8 @@ end
 # half. Net result is bit-identical to the flat sweep; only the store traffic is halved. Pivoting is a
 # correctness boundary — the two _laswp_local! calls carry the interchanges the flat sweep applied inline.
 function _getf2_blocked!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    pb <= _GETF2_BASE && return _getf2!(A, mp, pb, roff, ipiv, ioff)   # base: flat rank-1 sweep
+    _base = eltype(A) <: BlasComplex ? _CGETF2_BASE : _GETF2_BASE      # complex base is wider (flat rank-2)
+    pb <= _base && return _getf2!(A, mp, pb, roff, ipiv, ioff)         # base: flat rank-1/rank-2 sweep
     pb1 = pb ÷ 2; pb2 = pb - pb1
     info = _getf2_blocked!(view(A, :, 1:pb1), mp, pb1, roff, ipiv, ioff)     # factor left half
     _laswp_local!(A, ipiv, ioff, pb1, 0, pb1 + 1, pb, roff)                  # left pivots → right cols
@@ -55,7 +71,8 @@ end
 # column scale + rank-1 update over contiguous rows; scalar argmax); else the generic fallback.
 # Pivoting is a correctness boundary — do not simplify.
 function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
-    if pb > _GETF2_BASE && A isa StridedMatrix && stride(A, 1) == 1 &&        # wide → BLAS-3 split (generic:
+    _base = eltype(A) <: BlasComplex ? _CGETF2_BASE : _GETF2_BASE            # complex base is wider (rank-2)
+    if pb > _base && A isa StridedMatrix && stride(A, 1) == 1 &&              # wide → BLAS-3 split (generic:
             (eltype(A) === Float64 || eltype(A) <: BlasComplex)               # rides trsm!/gemm!, incl. complex)
         return _getf2_blocked!(A, mp, pb, roff, ipiv, ioff)
     end
@@ -158,39 +175,68 @@ function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipi
     return info
 end
 
-# Complex SIMD panel (zgetf2): same math as the scalar fallback, vectorized over rows via the L1 complex
-# kernels (`_scal_cmplx_simd!` column scale, `_axpy_cmplx_simd!` rank-1 trailing update). Scalar argmax +
-# row swap (data-dependent). Contiguous-column complex panel, p = &panel[1,1]. Pivoting is a correctness
-# boundary — do not simplify.
-function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
-    R = real(Tc); csz = sizeof(Tc); info = 0
-    lidx(i, k) = (k - 1) * ld + i                                   # 1-based linear (complex) index
-    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz                # &A[i,k] (complex Ptr)
-    @inbounds for jl in 1:pb
-        piv = jl; pmax = abs(unsafe_load(p, lidx(jl, jl)))         # argmax |·| in column jl, rows jl:mp
-        for il in (jl + 1):mp
-            a = abs(unsafe_load(p, lidx(il, jl))); a > pmax && (pmax = a; piv = il)
+# factor complex column jl: SIMD izamax (cabs1, LAPACK's izamax metric) + swap rows jl↔piv across the whole
+# panel + scale below diagonal by 1/pivot. Returns true on a zero pivot. Pivoting is a correctness boundary.
+@inline function _clu_fact1!(p::Ptr{Tc}, ld::Int, mp::Int, jl::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
+    R = real(Tc); csz = sizeof(Tc)
+    lidx(i, k) = (k - 1) * ld + i
+    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz
+    nrows = mp - jl + 1
+    rel = if nrows >= 4 * _vwidth(R)                                # SIMD izamax needs n ≥ 4W (else OOB lanes)
+        _iamax_cmplx_simd!(nrows, Ptr{R}(cptr(jl, jl)))
+    else
+        b = 1; m = -one(R)                                          # scalar cabs1 argmax (LAPACK izamax metric)
+        for t in 1:nrows
+            v = unsafe_load(p, lidx(jl - 1 + t, jl)); a = abs(real(v)) + abs(imag(v))
+            a > m && (m = a; b = t)
         end
-        ipiv[ioff + jl] = roff + piv
-        if unsafe_load(p, lidx(piv, jl)) != zero(Tc)
-            if piv != jl                                            # swap rows jl ↔ piv across the panel
-                for jc in 1:pb
-                    a = unsafe_load(p, lidx(jl, jc))
-                    unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc))
-                    unsafe_store!(p, a, lidx(piv, jc))
-                end
-            end
-            mt = mp - jl
-            r = _crecip(unsafe_load(p, lidx(jl, jl)))               # scale column below diagonal by 1/pivot
-            mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
-        elseif info == 0
-            info = roff + jl
+        b
+    end
+    piv = jl - 1 + rel
+    ipiv[ioff + jl] = roff + piv
+    zero_piv = unsafe_load(p, lidx(piv, jl)) == zero(Tc)
+    @inbounds if piv != jl                                          # swap rows jl ↔ piv across the panel
+        for jc in 1:pb
+            a = unsafe_load(p, lidx(jl, jc))
+            unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc)); unsafe_store!(p, a, lidx(piv, jc))
         end
+    end
+    @inbounds if !zero_piv
         mt = mp - jl
-        for jc in (jl + 1):pb                                       # rank-1 update: A[jl+1:,jc] -= A[jl,jc]·A[jl+1:,jl]
-            ajc = unsafe_load(p, lidx(jl, jc))
-            mt > 0 && _axpy_cmplx_simd!(mt, -real(ajc), -imag(ajc), cptr(jl + 1, jl), cptr(jl + 1, jc))
+        r = _crecip(unsafe_load(p, lidx(jl, jl)))                   # 1/pivot; scale column below the diagonal
+        mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
+    end
+    return zero_piv
+end
+
+# Complex SIMD panel (zgetf2) — RANK-2 blocked (mirror of the real _getf2_simd!): SIMD izamax argmax
+# (`_iamax_cmplx_simd!`), and the trailing update touches each element ONCE per 2 columns via the fused
+# 2-source complex axpy (`_qr_axpy2_cmplx!`) instead of two rank-1 passes — halving the store traffic that
+# dominates the store-bound BLAS-2 panel. Columns in pairs: factor jl, update col jl+1 by jl, factor jl+1,
+# then one fused rank-2 update of the trailing (with the U[jl+1,·] row correction). Bit-equivalent pivots/
+# result to the flat rank-1 sweep. Pivoting is a correctness boundary — do not simplify.
+function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
+    csz = sizeof(Tc); info = 0
+    lidx(i, k) = (k - 1) * ld + i
+    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz
+    jl = 1
+    @inbounds while jl <= pb
+        if jl == pb                                                # odd tail: single column
+            _clu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl); break
         end
+        _clu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl)
+        u = unsafe_load(p, lidx(jl, jl + 1)); mt = mp - jl          # update col jl+1 by jl (rank-1 axpy)
+        mt > 0 && _axpy_cmplx_simd!(mt, -real(u), -imag(u), cptr(jl + 1, jl), cptr(jl + 1, jl + 1))
+        _clu_fact1!(p, ld, mp, jl + 1, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl + 1)
+        mt2 = mp - jl - 1
+        for jc in (jl + 2):pb                                      # fused rank-2 trailing update
+            a0 = unsafe_load(p, lidx(jl, jc)); u0 = -a0
+            uc = unsafe_load(p, lidx(jl + 1, jc)) - a0 * unsafe_load(p, lidx(jl + 1, jl))  # U[jl+1,jc]
+            unsafe_store!(p, uc, lidx(jl + 1, jc)); u1 = -uc
+            mt2 > 0 && _qr_axpy2_cmplx!(mt2, real(u0), imag(u0), real(u1), imag(u1),
+                                        cptr(jl + 2, jl), cptr(jl + 2, jl + 1), cptr(jl + 2, jc))
+        end
+        jl += 2
     end
     return info
 end
@@ -292,15 +338,45 @@ function _getrf_core!(A, ipiv, nb::Int)
     return A, ipiv, info
 end
 
-# Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s generic panel pivots on
-# |·| and divides by the complex pivot correctly; `_getrf_core!` rides complex trsm!/gemm! (the 3M path)
-# for the trailing update. The Float64 pad-scratch optimization (`_LU_PAD`) is real-only, so complex routes
-# straight to the core. (Partial-pivot metric is |·| like LAPACK's cabs2, not cabs1 — both valid; oracle
-# tests must compare the PA=LU residual, not entries.)
-function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB) where {T<:BlasComplex}
+# Complex padded scratch (mirror of the real `_LU_PAD`): a po2 leading dim aliases cache sets — the L1 page
+# is 4096 B, so `stride·sizeof(T) % 4096 == 0` maps every column onto the same set, thrashing the per-pivot
+# row-swaps + trsm/gemm view reads. MEASURED (galen): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
+# n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
+# ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
+const _CLU_PAD64 = Ref(Matrix{ComplexF64}(undef, 0, 0))
+const _CLU_PAD32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
+@inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64
+@inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32
+@inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
+    m >= 256 && A isa StridedMatrix && stride(A, 1) == 1 && (stride(A, 2) * sizeof(T)) % 4096 == 0
+
+# Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s rank-2 SIMD panel pivots
+# on |·| (cabs1 = LAPACK izamax) and divides by the complex pivot correctly; `_getrf_core!` rides complex
+# trsm!/gemm! (the 3M path) for the trailing update. Pad-scratch dodges po2 lda aliasing (see `_clu_pad`).
+# (Oracle tests compare the PA=LU residual, not entries.)
+function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _clu_nb(min(size(A)...), T)) where {T<:BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
+    if _clu_needs_pad(A, m, T)                            # factor in a non-conflicting scratch
+        R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
+        pref = _clu_pad(T); b = pref[]
+        (size(b, 1) < R || size(b, 2) < n) && (b = pref[] = Matrix{T}(undef, R, n))
+        Mw = view(b, 1:m, 1:n)
+        ld = stride(A, 2); sz = sizeof(T)
+        info = GC.@preserve A b begin
+            pA = pointer(A); pB = pointer(b)
+            @inbounds for j in 0:n-1                       # contiguous per-column copy in (A → scratch)
+                unsafe_copyto!(pB + j * R * sz, pA + j * ld * sz, m)
+            end
+            (_, _, i3) = _getrf_core!(Mw, ipiv, nb)
+            @inbounds for j in 0:n-1                       # and back
+                unsafe_copyto!(pA + j * ld * sz, pB + j * R * sz, m)
+            end
+            i3
+        end
+        return A, ipiv, info
+    end
     return _getrf_core!(A, ipiv, nb)
 end
 # Convenience: allocate ipiv, return (A overwritten with L\U, ipiv, info).
