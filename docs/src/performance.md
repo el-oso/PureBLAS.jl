@@ -62,20 +62,26 @@ the generic scalar path remains for AD.
 
 ![Complex BLAS-1 — three µarchs](assets/perf_cl1.svg)
 
-At parity or better fleet-wide, except worst-size dips in `zdotc`/`zdotu` on AVX2 (0.79) and
-`zaxpy` (0.94–0.96). `dznrm2` is 7–9× (same scaled-accumulation story as real `nrm2`);
-`izamax` 1.2–1.8×.
+At parity or better fleet-wide. `dznrm2` is 7–9× (same scaled-accumulation story as real `nrm2`);
+`izamax` 1.2–1.8×. The former AVX2 `zdotc`/`zdotu` small-n dip is closed by a parity-preserving fold
+epilogue (shared with complex gemv-T/C). Residuals: `zaxpy` at the L3 edge (0.94–0.96) and `zdotc`/
+`zdotu` on Zen5 at DRAM sizes (0.89–0.94, bandwidth).
 
 ![Complex BLAS-2 — three µarchs](assets/perf_cl2.svg)
 
-Gates broadly on all three boxes; the residuals are worst-size dips in the 0.87–0.95 range
-(`zgemvT`/`zgemvC` on AVX-512, `ztrmv` Zen4, `zhpmv` Zen5 — `zhpmv` has no packed panel yet).
+Gates broadly on all three boxes. The complex gemv-T/C small-n dip on AVX-512 (was 0.68–0.74 at
+n=32) is closed by a parity-preserving fold epilogue (Vec{2W} deinterleave + two horizontal sums →
+one halving fold to [Σeven,Σodd]); `zgemvN` on Zen5 (was ~0.91 across small/mid n) by sign-folding
+the `ci` broadcast so the per-row epilogue drops an FMA-port op. Remaining worst-size dips are shallow
+(0.93–0.97): `ztrmv`/`ztrsv` large-n (Zen4/Zen5), `zgeru` mid-n, `zhemv` large-n, `zgemvN` Zen5 at n=512.
 
 ![Complex BLAS-3 — three µarchs](assets/perf_cl3.svg)
 
 `zgemm` beats OpenBLAS fleet-wide (geomean 1.26–1.40; Karatsuba 3M at mid/large n). The
-rank-k ops gate within a few percent; the open items are AVX2 worst sizes: `ztrmm` 0.78,
-`ztrmmR` 0.75, `ztrsm` 0.89, and a `zhemm`/`zsymm` small-n dip (0.91–0.94).
+rank-k ops gate within a few percent; the open items are AVX2 (Zen3) small sizes: `ztrmm` 0.84,
+`ztrmmR` 0.77 (n=32), `ztrsm` 0.89 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97).
+These are materialize+microkernel overhead on the complex small-n L3 path (a non-po2-scratch attempt
+was measured neutral under the pooled gate and reverted — the fix is an OB-style fused triangle pack).
 
 ![Complex LAPACK — three µarchs](assets/perf_clapack.svg)
 
