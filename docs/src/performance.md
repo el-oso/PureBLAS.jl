@@ -78,17 +78,26 @@ the `ci` broadcast so the per-row epilogue drops an FMA-port op. Remaining worst
 ![Complex BLAS-3 — three µarchs](assets/perf_cl3.svg)
 
 `zgemm` beats OpenBLAS fleet-wide (geomean 1.26–1.40; Karatsuba 3M at mid/large n). The
-rank-k ops gate within a few percent; the open items are AVX2 (Zen3) small sizes: `ztrmm` 0.84,
-`ztrmmR` 0.77 (n=32), `ztrsm` 0.89 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97).
-These are materialize+microkernel overhead on the complex small-n L3 path (a non-po2-scratch attempt
-was measured neutral under the pooled gate and reverted — the fix is an OB-style fused triangle pack).
+rank-k ops gate within a few percent. A direct-read fused-triangle base (reads op(A) straight from
+memory, no `_mat_tri!` materialize) plus a FULL-row-tile fix (drops the per-tile masked store on AVX2)
+lifted the deepest AVX2 (Zen3) small-n dips: `ztrmmR` 0.77→0.89 and `ztrmm` 0.84→0.93 at n=32 (side-R
+now gates n≥64), and `@simd ivdep` on the complex k-loop helped fleet-wide. Remaining open AVX2 small
+sizes: side-L n=32 (still materializes — needs the `Val{TRIA}` A-slot lane-mask), `ztrsm` 0.89 (n=128),
+and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97). (A non-po2-scratch attempt measured neutral under
+the pooled gate and was reverted.)
 
 ![Complex LAPACK — three µarchs](assets/perf_clapack.svg)
 
-The weak group. `zpotrf` gates fleet-wide and `zgetrf` is close (Zen3 worst 0.80), but
-`zgeqrf` is well under gate (geomean 0.76–0.85), and `zgesvd` — singular values only, benched
-against `zgesdd('N')` — collapses at large n because its bidiagonalization is still unblocked
-BLAS-2 (panel capped at n=1024). Both are open work, not measurement artifacts.
+`zpotrf` gates fleet-wide and `zgetrf` is close (Zen3 worst 0.80). `zgeqrf` **now gates at every
+size fleet-wide** (1.07–1.83; was geomean 0.76–0.85): the complex trailing update was rebuilt to mirror
+the real path (`herk` for VᴴV at half the flops + `trmm` for TᴴW), the reflector norm moved from
+per-element `hypot` to SIMD `_nrm2`, the unblocked rank-2 panel now runs while the matrix is L3-resident,
+and the AVX2 trailing update is chunked to bound the Karatsuba-3M scratch below ½L3. `zgesvd` — singular
+values only, vs `zgesdd('N')` — **no longer collapses**: the complex bidiagonalization is now blocked
+(zlabrd/zgebrd port), so n≥128 gates fleet-wide (1.07–1.74) where it was 0.05–0.23, and ComplexF32
+singular values work for the first time. n=32 sits at 0.94–1.0, a shared small-n BLAS-2 bidiag floor
+(the real values path dips identically). `zgeqrf` was validated on square inputs; tall/skinny QR is a
+separate benchmark shape.
 
 ## Numeric summary
 
