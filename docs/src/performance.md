@@ -145,3 +145,46 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
 
 Both consumption modes share one kernel set: the **native API** (`PureBLAS.gemm!(…)`,
 AD-traceable) and the **LBT drop-in** `.so` (`@ccallable` ILP64 symbols via `juliac --trim`).
+
+## vs AOCL — AMD's own Zen-tuned library (AOCL-BLIS + libFLAME)
+
+OpenBLAS is the default oracle above; this section adds a **second, tougher baseline: AOCL**, AMD's
+own optimizing library (AOCL-BLIS for BLAS, AOCL-libFLAME for LAPACK), hand-tuned for these exact Zen
+chips. Everything here is **single-threaded** (BLIS pinned to one thread — verified: `dgemm` runs at
+one-core throughput), boost-locked, same methodology; caches/SVGs carry an `_aocl` suffix and never mix
+with the OpenBLAS artifacts. The plots below are **lite** (sizes capped at n=1024) — a fast pass that
+covers the meaningful range; the summary numbers are from a size-controlled probe.
+
+The AOCL binary is a genuinely optimized build, not a reference fallback: measured directly against
+OpenBLAS, AOCL-BLIS `dgemm` matches it and AOCL-libFLAME `potrf`/`geqrf` **meet or beat** it (e.g.
+geqrf 40 vs 30 GFlops) — a reference build would be slower, not faster.
+
+Verified PB/AOCL at mid/large n (>1 = PureBLAS faster; wintermute Zen4, single-thread), alongside
+PB/OpenBLAS for context:
+
+| op | PB / OpenBLAS | PB / AOCL |
+|---|---|---|
+| gemm    | 1.05–1.11 | 1.08–1.24 |
+| potrf   | 1.16–1.28 | 1.12–1.20 |
+| geqrf   | 1.63–1.80 | 1.53–1.70 |
+| getrf   | 1.14–2.24 | 1.59–1.78 |
+| **trsm**| ~1.0      | **0.71–0.93** |
+
+**PureBLAS matches-or-beats AMD's own library on gemm and every LAPACK factorization — real and
+complex — by 5–80%.** The single op AOCL wins is real `trsm` (BLIS's hand-tuned triangular solve),
+which is the one concrete kernel to chase. Note `PB/AOCL < PB/OpenBLAS` on getrf/geqrf: AOCL is faster
+than OpenBLAS there, so our margin over it is smaller — the signature of a legit competitor.
+
+![BLAS-1 vs AOCL](assets/perf_l1_aocl_lite.svg)
+![BLAS-2 vs AOCL](assets/perf_l2_aocl_lite.svg)
+![BLAS-3 vs AOCL](assets/perf_l3_aocl_lite.svg)
+![LAPACK vs AOCL](assets/perf_lapack_aocl_lite.svg)
+![Complex BLAS-1 vs AOCL](assets/perf_cl1_aocl_lite.svg)
+![Complex BLAS-2 vs AOCL](assets/perf_cl2_aocl_lite.svg)
+![Complex BLAS-3 vs AOCL](assets/perf_cl3_aocl_lite.svg)
+![Complex LAPACK vs AOCL](assets/perf_clapack_aocl_lite.svg)
+
+**Caveat on the small-n LAPACK ratios in the plots.** AOCL-libFLAME has heavy *per-call overhead* at
+tiny n (e.g. `potrf`/`getrf` show 4–160× at n≤32), which flatters PureBLAS there — that is dispatch
+overhead, not an algorithmic gap. The mid/large-n figures in the table are the honest signal. The
+per-op numbers are generated to [`bench/gen_table_aocl_lite.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table_aocl_lite.md).

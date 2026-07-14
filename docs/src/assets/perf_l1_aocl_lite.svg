@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="962" height="420" font-family="sans-serif">
+<rect width="962" height="420" fill="white"/>
+<text x="481.0" y="26" text-anchor="middle" font-size="17" font-weight="bold">BLAS-1 — PureBLAS / AOCL (PB/AOCL ratio)</text>
+<line x1="46" y1="42" x2="68" y2="42" stroke="#888888" stroke-width="3"/>
+<text x="73" y="46" font-size="12">AVX2</text>
+<line x1="127" y1="42" x2="149" y2="42" stroke="#888888" stroke-width="3"/>
+<text x="154" y="46" font-size="12">Zen5</text>
+<line x1="208" y1="42" x2="230" y2="42" stroke="#888888" stroke-width="3"/>
+<text x="235" y="46" font-size="12">AVX-512</text>
+<rect x="46" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="46" y1="123.64624309154783" x2="256" y2="123.64624309154783" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="42" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="42" y="126.64624309154783" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<text x="42" y="63.000193221733504" text-anchor="end" font-size="9" fill="#999">1.81×</text>
+<polygon points="46.0,68.3 46.0,68.7" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,68.5" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="68.5" r="2" fill="#888888"/>
+<polygon points="46.0,118.7 46.0,119.8" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,119.4" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="119.4" r="2" fill="#888888"/>
+<polygon points="46.0,113.9 46.0,115.5" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,114.0" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="114.0" r="2" fill="#888888"/>
+<text x="151.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">axpy</text>
+<line x1="46.0" y1="60" x2="46.0" y2="198" stroke="#f4f4f4"/>
+<text x="46.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
+<rect x="276" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="276" y1="115.76276119065531" x2="486" y2="115.76276119065531" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="272" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="272" y="118.76276119065531" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<text x="272" y="63.0" text-anchor="end" font-size="9" fill="#999">1.6×</text>
+<polygon points="276.0,102.5 276.0,103.4" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,103.0" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="103.0" r="2" fill="#888888"/>
+<polygon points="276.0,112.2 276.0,112.9" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,112.7" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="112.7" r="2" fill="#888888"/>
+<polygon points="276.0,106.8 276.0,109.8" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,109.4" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="109.4" r="2" fill="#888888"/>
+<text x="381.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">dot</text>
+<line x1="276.0" y1="60" x2="276.0" y2="198" stroke="#f4f4f4"/>
+<text x="276.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
+<rect x="506" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="506" y1="157.6647199257308" x2="716" y2="157.6647199257308" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="502" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="502" y="160.6647199257308" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="506.0,90.6 506.0,91.3" fill="#888888" opacity="0.11"/>
+<polyline points="506.0,90.9" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="506.0" cy="90.9" r="2" fill="#888888"/>
+<polygon points="506.0,64.5 506.0,65.0" fill="#888888" opacity="0.11"/>
+<polyline points="506.0,64.8" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="506.0" cy="64.8" r="2" fill="#888888"/>
+<polygon points="506.0,65.7 506.0,68.4" fill="#888888" opacity="0.11"/>
+<polyline points="506.0,67.0" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="506.0" cy="67.0" r="2" fill="#888888"/>
+<text x="611.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">nrm2</text>
+<line x1="506.0" y1="60" x2="506.0" y2="198" stroke="#f4f4f4"/>
+<text x="506.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
+<rect x="736" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="736" y1="173.29045410554016" x2="946" y2="173.29045410554016" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="732" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="732" y="176.29045410554016" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="736.0,77.1 736.0,77.4" fill="#888888" opacity="0.11"/>
+<polyline points="736.0,77.2" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="736.0" cy="77.2" r="2" fill="#888888"/>
+<polygon points="736.0,62.7 736.0,63.8" fill="#888888" opacity="0.11"/>
+<polyline points="736.0,63.6" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="736.0" cy="63.6" r="2" fill="#888888"/>
+<polygon points="736.0,68.2 736.0,69.1" fill="#888888" opacity="0.11"/>
+<polyline points="736.0,68.5" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="736.0" cy="68.5" r="2" fill="#888888"/>
+<text x="841.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">asum</text>
+<line x1="736.0" y1="60" x2="736.0" y2="198" stroke="#f4f4f4"/>
+<text x="736.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
+<rect x="46" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="46" y1="304.40148569770344" x2="256" y2="304.40148569770344" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="42" y="373.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="42" y="307.40148569770344" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="46.0,239.3 46.0,239.8" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,239.5" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="239.5" r="2" fill="#888888"/>
+<polygon points="46.0,301.2 46.0,303.1" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,302.2" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="302.2" r="2" fill="#888888"/>
+<polygon points="46.0,299.0 46.0,302.2" fill="#888888" opacity="0.11"/>
+<polyline points="46.0,302.0" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="46.0" cy="302.0" r="2" fill="#888888"/>
+<text x="151.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">scal</text>
+<line x1="46.0" y1="232" x2="46.0" y2="370" stroke="#f4f4f4"/>
+<text x="46.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
+<rect x="276" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
+<line x1="276" y1="284.4120516598968" x2="486" y2="284.4120516598968" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="272" y="287.4120516598968" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<text x="272" y="235.0" text-anchor="end" font-size="9" fill="#999">1.6×</text>
+<polygon points="276.0,342.6 276.0,361.9" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,350.7" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="350.7" r="2" fill="#888888"/>
+<polygon points="276.0,299.1 276.0,333.4" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,319.2" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="319.2" r="2" fill="#888888"/>
+<polygon points="276.0,312.9 276.0,331.7" fill="#888888" opacity="0.11"/>
+<polyline points="276.0,321.8" fill="none" stroke="#888888" stroke-width="1.6"/>
+<circle cx="276.0" cy="321.8" r="2" fill="#888888"/>
+<text x="381.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">iamax</text>
+<line x1="276.0" y1="232" x2="276.0" y2="370" stroke="#f4f4f4"/>
+<text x="276.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
+</svg>
