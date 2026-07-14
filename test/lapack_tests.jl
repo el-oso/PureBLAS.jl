@@ -47,6 +47,113 @@ end
     @test_throws DimensionMismatch PureBLAS.geqrf!(randn(5, 5), zeros(2))
 end
 
+@testsetup module WYHelpers
+using PureBLAS, LinearAlgebra
+export explicit_v_panel, lapack_tau, wy_qtc!, wy_qc!
+
+# Build the EXPLICIT unit-diagonal panel wy_t!/wy_apply! require (see src/wy.jl's header:
+# `Apanel` must NOT be a raw post-factorization view — its diagonal/above-diagonal entries
+# hold R values, not the implicit 0/1 structure VᵀV needs).
+function explicit_v_panel(Af::AbstractMatrix{Float64}, k::Int)
+    m = size(Af, 1)
+    V = zeros(m, k)
+    for c in 1:k, i in 1:m
+        V[i, c] = i == c ? 1.0 : (i > c ? Af[i, c] : 0.0)
+    end
+    return V
+end
+
+# qr_unblocked! stores tau in the inverted "faer" convention (H = I - vvᵀ/tau); wy_t!/wy_apply!
+# take standard LAPACK convention (H = I - tau·vvᵀ) — the one-documented-convention P1 requirement.
+lapack_tau(tau_stored) = [isfinite(t) ? 1.0 / t : 0.0 for t in tau_stored]
+
+# Multi-block Qᵀ·C / Q·C sweeps — caller-side looping is wy_apply!'s documented contract
+# (single-block kernel; forward order for 'T', reverse for 'N').
+function wy_qtc!(C::AbstractMatrix{Float64}, V::AbstractMatrix{Float64}, tau::AbstractVector{Float64}, nb::Int)
+    m, k = size(V)
+    nblk = cld(k, nb)
+    for b in 1:nblk
+        pc = (b - 1) * nb + 1
+        pb = min(nb, k - pc + 1)
+        Vv = view(V, pc:m, pc:pc+pb-1)
+        Tv = zeros(pb, pb); G = zeros(pb, pb)
+        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:pc+pb-1), G)
+        Cb = view(C, pc:m, :)
+        ws = PureBLAS.WYApplyWorkspace{Float64}(size(Cb, 1), pb, size(Cb, 2))
+        PureBLAS.wy_apply!('T', Cb, Vv, Tv, ws)
+    end
+    return C
+end
+
+function wy_qc!(C::AbstractMatrix{Float64}, V::AbstractMatrix{Float64}, tau::AbstractVector{Float64}, nb::Int)
+    m, k = size(V)
+    nblk = cld(k, nb)
+    for b in nblk:-1:1
+        pc = (b - 1) * nb + 1
+        pb = min(nb, k - pc + 1)
+        Vv = view(V, pc:m, pc:pc+pb-1)
+        Tv = zeros(pb, pb); G = zeros(pb, pb)
+        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:pc+pb-1), G)
+        Cb = view(C, pc:m, :)
+        ws = PureBLAS.WYApplyWorkspace{Float64}(size(Cb, 1), pb, size(Cb, 2))
+        PureBLAS.wy_apply!('N', Cb, Vv, Tv, ws)
+    end
+    return C
+end
+end
+
+@testitem "wy_t!/wy_apply! — Qᵀ·A reconstructs R, Q·(Qᵀ·A) reconstructs A, single+multi block" setup = [WYHelpers] begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(303)
+    maxe(A, B) = maximum(abs.(A .- B))
+    @testset "$m×$n, nb=$nb" for (m, n) in ((1, 1), (8, 8), (30, 12), (64, 64), (96, 40), (200, 150)),
+            nb in (min(m, n), 5, 16)
+        A0 = randn(m, n)
+        k = min(m, n)
+        Af = copy(A0); tau_stored = zeros(k)
+        PureBLAS.qr_unblocked!(Af, tau_stored)
+        V = explicit_v_panel(Af, k)
+        tau = lapack_tau(tau_stored)
+
+        C = copy(A0)
+        wy_qtc!(C, V, tau, nb)
+        @test maxe(triu(C), triu(Af)) < 1e-10          # Qᵀ·A upper part == R
+
+        C2 = copy(C)
+        wy_qc!(C2, V, tau, nb)
+        @test maxe(C2, A0) < 1e-10                      # Q·(Qᵀ·A) == A
+    end
+end
+
+@testitem "wy_apply!: trans argument validation" begin
+    using PureBLAS, LinearAlgebra
+    V = Matrix{Float64}(I, 4, 2)
+    Tm = zeros(2, 2)
+    C = zeros(4, 3)
+    ws = PureBLAS.WYApplyWorkspace{Float64}(4, 2, 3)
+    @test_throws ArgumentError PureBLAS.wy_apply!('X', C, V, Tm, ws)
+end
+
+@testitem "wy_t!/wy_apply!: zero-allocation after warmup" setup = [WYHelpers] begin
+    using PureBLAS, Random
+    Random.seed!(404)
+    m, n = 64, 20
+    A0 = randn(m, n)
+    Af = copy(A0); tau_stored = zeros(n)
+    PureBLAS.qr_unblocked!(Af, tau_stored)
+    V = explicit_v_panel(Af, n)
+    tau = lapack_tau(tau_stored)
+    Tm = zeros(n, n); G = zeros(n, n)
+    C = copy(A0)
+    ws = PureBLAS.WYApplyWorkspace{Float64}(m, n, n)
+
+    PureBLAS.wy_t!(Tm, V, tau, G)                    # warm up
+    PureBLAS.wy_apply!('T', C, V, Tm, ws)
+    @test (@allocated PureBLAS.wy_t!(Tm, V, tau, G)) == 0
+    @test (@allocated PureBLAS.wy_apply!('T', C, V, Tm, ws)) == 0
+    @test (@allocated PureBLAS.wy_apply!('N', C, V, Tm, ws)) == 0
+end
+
 @testitem "getrf (LU) vs LAPACK — square/tall/wide, factor + ipiv + P·A=L·U" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
