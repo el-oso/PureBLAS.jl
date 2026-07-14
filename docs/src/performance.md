@@ -172,8 +172,11 @@ PB/OpenBLAS for context:
 
 **PureBLAS matches-or-beats AMD's own library on gemm and every LAPACK factorization — real and
 complex — by 5–80%.** The single op AOCL wins is real `trsm` (BLIS's hand-tuned triangular solve),
-which is the one concrete kernel to chase. Note `PB/AOCL < PB/OpenBLAS` on getrf/geqrf: AOCL is faster
-than OpenBLAS there, so our margin over it is smaller — the signature of a legit competitor.
+which is the one concrete kernel to chase. AOCL is a *mixed* competitor vs OpenBLAS, not uniformly
+tougher: its `geqrf` beats OpenBLAS (so `PB/AOCL < PB/OpenBLAS` there — a smaller margin, the
+legit-competitor signature), `gemm`/`potrf` are ≈ parity, but `getrf` trails OpenBLAS. This is a
+single-thread comparison; AOCL is tuned first for multi-threaded EPYC, so on these single-thread mobile
+Zen parts it's a fair-but-not-dominant baseline.
 
 ![BLAS-1 vs AOCL](assets/perf_l1_aocl_lite.svg)
 ![BLAS-2 vs AOCL](assets/perf_l2_aocl_lite.svg)
