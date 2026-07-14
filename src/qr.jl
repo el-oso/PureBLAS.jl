@@ -89,15 +89,17 @@ end
 # β REAL on the diagonal = −sign(re α)·‖col‖, vⱼ[col]=1 implicit + scaled essential below). Returns τ
 # (zero(T) ⇒ trivial reflector, H=I). `p` = Ptr{Complex{R}} to A[1,1] of the view; `ld` = col stride.
 @inline function _zqr_reflect!(p::Ptr{Complex{R}}, m::Int, col::Int, ld::Int, csz::Int) where {R}
-    xnorm = zero(R)
-    @inbounds for i in (col + 1):m; xnorm = hypot(xnorm, abs(unsafe_load(p, _clidx(i, col, ld)))); end
+    mt0 = m - col                                                  # tail length (rows col+1:m)
+    # ‖tail‖ via _nrm2 (SIMD sum-of-squares fast path + lassq fallback — robust AND fast; req#6). The old
+    # per-element hypot(xnorm, abs(xᵢ)) did TWO transcendentals/element (abs is itself a hypot).
+    xnorm = mt0 > 0 ? _nrm2(mt0, p + ((col - 1) * ld + col) * csz, 1) : zero(R)
     @inbounds alpha = unsafe_load(p, _clidx(col, col, ld))
     (xnorm == 0 && imag(alpha) == 0) && return zero(Complex{R})    # trivial reflector
     beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))
     tau = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
     sc = one(Complex{R}) / (alpha - beta)                          # v_essential = tail / (α − β)
-    mt = m - col; vp = p + ((col - 1) * ld + col) * csz            # &A[col+1, col]
-    mt > 0 && _scal_cmplx_simd!(mt, real(sc), imag(sc), vp)
+    vp = p + ((col - 1) * ld + col) * csz                          # &A[col+1, col]
+    mt0 > 0 && _scal_cmplx_simd!(mt0, real(sc), imag(sc), vp)
     @inbounds unsafe_store!(p, complex(beta, zero(R)), _clidx(col, col, ld))
     return tau
 end
