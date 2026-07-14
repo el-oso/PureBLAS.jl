@@ -85,37 +85,75 @@ function qr_unblocked!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64})
     return true
 end
 
-# Complex unblocked QR panel — LAPACK zgeqr2 + zlarfg. Hⱼ = I − τⱼ·vⱼ·vⱼᴴ with τ COMPLEX, β REAL on the
-# diagonal (β = −sign(re α)·‖col‖), vⱼ[j]=1 implicit + essential below. Apply to the trailing columns with
-# CONJ(τ) (the zgeqr2 convention — the τ-vs-conj(τ) placement is the bug magnet). Scalar; the blocked
-# driver rides complex gemm ('C') for the O(n³) trailing update. Matches LinearAlgebra.qr reconstruction.
+# Complex Householder reflector of column `col` (LAPACK zlarfg convention: Hⱼ = I − τⱼ·vⱼ·vⱼᴴ, τ COMPLEX,
+# β REAL on the diagonal = −sign(re α)·‖col‖, vⱼ[col]=1 implicit + scaled essential below). Returns τ
+# (zero(T) ⇒ trivial reflector, H=I). `p` = Ptr{Complex{R}} to A[1,1] of the view; `ld` = col stride.
+@inline function _zqr_reflect!(p::Ptr{Complex{R}}, m::Int, col::Int, ld::Int, csz::Int) where {R}
+    xnorm = zero(R)
+    @inbounds for i in (col + 1):m; xnorm = hypot(xnorm, abs(unsafe_load(p, _clidx(i, col, ld)))); end
+    @inbounds alpha = unsafe_load(p, _clidx(col, col, ld))
+    (xnorm == 0 && imag(alpha) == 0) && return zero(Complex{R})    # trivial reflector
+    beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))
+    tau = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
+    sc = one(Complex{R}) / (alpha - beta)                          # v_essential = tail / (α − β)
+    mt = m - col; vp = p + ((col - 1) * ld + col) * csz            # &A[col+1, col]
+    mt > 0 && _scal_cmplx_simd!(mt, real(sc), imag(sc), vp)
+    @inbounds unsafe_store!(p, complex(beta, zero(R)), _clidx(col, col, ld))
+    return tau
+end
+# Apply a single reflector H_col (v[col]=1 + essential below) to trailing column j with coefficient
+# tc = conj(τ): C[:,j] := C[:,j] − tc·(vᴴ·C[:,j])·v. SIMD dotc + axpy over the tail rows col+1:m.
+@inline function _zqr_apply1!(p::Ptr{Complex{R}}, m::Int, col::Int, j::Int, ld::Int, csz::Int, tc::Complex{R}) where {R}
+    mt = m - col; vp = p + ((col - 1) * ld + col) * csz; cjp = p + ((j - 1) * ld + col) * csz
+    @inbounds w = unsafe_load(p, _clidx(col, j, ld))               # w = vᴴ·C[:,j] (v[col]=1)
+    mt > 0 && (w += _dot_cmplx_simd(mt, vp, cjp, R, Val(true)))    # + Σ conj(v)·C[:,j]
+    twc = tc * w
+    @inbounds unsafe_store!(p, unsafe_load(p, _clidx(col, j, ld)) - twc, _clidx(col, j, ld))
+    mt > 0 && _axpy_cmplx_simd!(mt, -real(twc), -imag(twc), vp, cjp)
+end
+# Complex unblocked QR panel — LAPACK zgeqr2 + zlarfg. RANK-2 (mirror of the real path): factor columns in
+# PAIRS. The two reflectors + the H0→col+1 cross-apply are rank-1; the BULK trailing columns (j≥col+2) get a
+# FUSED rank-2 apply (one c-read pass for both dotc's + one read/write pass for the rank-2 axpy) instead of
+# two rank-1 sweeps — halving the level-2 trailing traffic. g = v1ᴴ·v0 (once/pair) decouples the 2nd dot.
+# Apply uses CONJ(τ) (the zgeqr2 convention — the τ-vs-conj(τ) placement is the bug magnet). Odd tail column /
+# trivial reflectors fall back to rank-1. Matches LinearAlgebra.qr reconstruction.
 function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:BlasComplex}
-    m, n = size(A); R = real(T); ld = stride(A, 2); csz = sizeof(T)
+    m, n = size(A); R = real(T); ld = stride(A, 2); csz = sizeof(T); k = min(m, n)
     GC.@preserve A begin
-        p = pointer(A)                                          # Ptr{Complex{R}}; SIMD helpers take complex Ptr
-        @inbounds for col in 1:min(m, n)
-            row = col
-            xnorm = zero(R)                                      # ‖tail‖ (rows row+1:m)
-            for i in (row + 1):m; xnorm = hypot(xnorm, abs(A[i, col])); end
-            alpha = A[row, col]
-            if xnorm == 0 && imag(alpha) == 0
-                tau[col] = zero(T); continue                     # trivial reflector
-            end
-            beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))  # β = −sign(re α)·‖[α;x]‖ (real)
-            tau[col] = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
-            sc = one(T) / (alpha - beta)                         # v_essential = tail / (α − β)
-            mt = m - row                                        # tail length (rows row+1:m)
-            vp = p + ((col - 1) * ld + row) * csz               # &A[row+1, col]
-            mt > 0 && _scal_cmplx_simd!(mt, real(sc), imag(sc), vp)   # SIMD: scale essential v
-            A[row, col] = complex(beta, zero(R))                 # R diagonal = β
-            tc = conj(tau[col])
-            for j in (col + 1):n                                 # C := (I − conj(τ)·v·vᴴ)·C
-                cjp = p + ((j - 1) * ld + row) * csz            # &A[row+1, j]
-                w = A[row, j]                                    # w = vᴴ·C[:,j] (v[row]=1)
-                mt > 0 && (w += _dot_cmplx_simd(mt, vp, cjp, R, Val(true)))   # SIMD dotc: Σ conj(v)·C[:,j]
-                twc = tc * w
-                A[row, j] -= twc
-                mt > 0 && _axpy_cmplx_simd!(mt, -real(twc), -imag(twc), vp, cjp)  # SIMD: C[:,j] -= twc·v
+        p = pointer(A); col = 1                                   # Ptr{Complex{R}}; SIMD helpers take complex Ptr
+        @inbounds while col <= k
+            t0 = _zqr_reflect!(p, m, col, ld, csz); tau[col] = t0
+            if col + 1 <= k && t0 != zero(T)
+                _zqr_apply1!(p, m, col, col + 1, ld, csz, conj(t0))    # H0 → col+1
+                t1 = _zqr_reflect!(p, m, col + 1, ld, csz); tau[col + 1] = t1
+                if t1 == zero(T)
+                    for j in col+2:n; _zqr_apply1!(p, m, col, j, ld, csz, conj(t0)); end
+                else
+                    tc0 = conj(t0); tc1 = conj(t1)
+                    w10 = unsafe_load(p, _clidx(col + 1, col, ld))     # v0[col+1] essential
+                    mt2 = m - (col + 1)                               # rows col+2:m
+                    v0p = p + ((col - 1) * ld + (col + 1)) * csz      # &A[col+2, col]
+                    v1p = p + (col * ld + (col + 1)) * csz            # &A[col+2, col+1]
+                    g = w10                                          # g = v1ᴴ·v0 = w10 + Σ conj(v1)·v0
+                    mt2 > 0 && (g += _dot_cmplx_simd(mt2, v1p, v0p, R, Val(true)))
+                    for j in col+2:n                                  # FUSED rank-2 apply
+                        cp = p + ((j - 1) * ld + (col + 1)) * csz     # &A[col+2, j]
+                        a0 = unsafe_load(p, _clidx(col, j, ld)); a1 = unsafe_load(p, _clidx(col + 1, j, ld))
+                        d0 = a0 + conj(w10) * a1; d1 = a1                # heads: d0 += conj(v0[col+1])·C[col+1,j]
+                        if mt2 > 0
+                            e0, e1 = _qr_dot2c_cmplx(mt2, v0p, v1p, cp, R)
+                            d0 += e0; d1 += e1
+                        end
+                        k0 = -tc0 * d0; k1 = -tc1 * (d1 + k0 * g)
+                        unsafe_store!(p, a0 + k0, _clidx(col, j, ld))
+                        unsafe_store!(p, muladd(k0, w10, a1) + k1, _clidx(col + 1, j, ld))
+                        mt2 > 0 && _qr_axpy2_cmplx!(mt2, real(k0), imag(k0), real(k1), imag(k1), v0p, v1p, cp)
+                    end
+                end
+                col += 2
+            else
+                for j in col+1:n; t0 == zero(T) || _zqr_apply1!(p, m, col, j, ld, csz, conj(t0)); end
+                col += 1
             end
         end
     end
@@ -161,7 +199,8 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C
                 Vv[i, c] = i == c ? one(T) : (i > c ? A[pc+i-1, pc+c-1] : zero(T))
             end
             Gv = view(G, 1:pb, 1:pb)
-            gemm!(Gv, Vv, Vv; transA = 'C', alpha = true, beta = false)     # G = Vᴴ V
+            herk!(Gv, Vv; uplo = 'U', trans = 'C', alpha = true, beta = false)  # G = Vᴴ V (upper only —
+                                                                               # dlarft reads Gv[kk,c], kk<c; half flops)
             Tv = view(Tm, 1:pb, 1:pb)                                       # LAPACK zlarft T
             for c in 1:pb
                 τc = tau[pc+c-1]; Tv[c, c] = τc
@@ -173,13 +212,9 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C
             end
             C = view(A, pc:m, jt0:n)
             Wv = view(Wb, 1:pb, 1:nt); gemm!(Wv, Vv, C; transA = 'C', alpha = true, beta = false)  # W = Vᴴ C
-            Yv = view(Yb, 1:pb, 1:nt)
-            for j in 1:nt, c in 1:pb                                        # Y = Tᴴ W (Tᴴ lower: r≤c → conj)
-                s = zero(T)
-                for r in 1:c; s = muladd(conj(Tv[r, c]), Wv[r, j], s); end
-                Yv[c, j] = s
-            end
-            gemm!(C, Vv, Yv; alpha = -1, beta = true)                       # C −= V Y
+            trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'C')            # W := Tᴴ W (was a scalar
+                                                                          # latency-bound triple loop — SIMD trmm)
+            gemm!(C, Vv, Wv; alpha = -1, beta = true)                       # C −= V·(Tᴴ W)
         end
         pc += pb
     end
