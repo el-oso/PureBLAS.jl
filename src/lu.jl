@@ -10,6 +10,15 @@ const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trs
 # clamp bounds are measured literals to re-derive from the gemm k-block (L1) / trailing residency (L2).
 _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
+# Complex getrf panel width. Grows with n so the trailing rank-nb zgemm is compute-bound — measured
+# (galen): a rank-k zgemm gates only at k≳96 on AVX2 (k=48 → 0.85), so the complex panel must grow faster
+# than the real one (÷5 vs ÷8) — and is CAPPED at the complex-gemm kc micropanel `_clu_cap` (== `_CKC` for
+# ComplexF64: L1-residency `kc·nr·sizeof(T) ≤ ½L1`, per-T via `_l1_block`), beyond which the trailing zgemm
+# re-blocks k internally anyway. Floor keeps the panel lean at small n (the rank-2 panel factor dominates
+# there). Reproduces the rank-2-panel nb-sweep optima (galen Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
+@inline _clu_cap(::Type{T}) where {T<:BlasComplex} = _l1_block(_HW, T, max(_CNR, _CNR_SMALL))
+@inline _clu_nb(n::Int, ::Type{T}) where {T<:BlasComplex} = clamp((n ÷ 5) & ~15, 32, _clu_cap(T))
+
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
 # single split does the cross-half update ONCE via BLAS-3 gemm, halving that store traffic.
@@ -326,7 +335,7 @@ end
 # for the trailing update. The Float64 pad-scratch optimization (`_LU_PAD`) is real-only, so complex routes
 # straight to the core. (Partial-pivot metric is |·| like LAPACK's cabs2, not cabs1 — both valid; oracle
 # tests must compare the PA=LU residual, not entries.)
-function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _LU_NB) where {T<:BlasComplex}
+function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _clu_nb(min(size(A)...), T)) where {T<:BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
