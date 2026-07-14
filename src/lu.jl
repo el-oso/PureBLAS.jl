@@ -338,15 +338,45 @@ function _getrf_core!(A, ipiv, nb::Int)
     return A, ipiv, info
 end
 
-# Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s generic panel pivots on
-# |·| and divides by the complex pivot correctly; `_getrf_core!` rides complex trsm!/gemm! (the 3M path)
-# for the trailing update. The Float64 pad-scratch optimization (`_LU_PAD`) is real-only, so complex routes
-# straight to the core. (Partial-pivot metric is |·| like LAPACK's cabs2, not cabs1 — both valid; oracle
-# tests must compare the PA=LU residual, not entries.)
+# Complex padded scratch (mirror of the real `_LU_PAD`): a po2 leading dim aliases cache sets — the L1 page
+# is 4096 B, so `stride·sizeof(T) % 4096 == 0` maps every column onto the same set, thrashing the per-pivot
+# row-swaps + trsm/gemm view reads. MEASURED (galen): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
+# n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
+# ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
+const _CLU_PAD64 = Ref(Matrix{ComplexF64}(undef, 0, 0))
+const _CLU_PAD32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
+@inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64
+@inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32
+@inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
+    m >= 256 && A isa StridedMatrix && stride(A, 1) == 1 && (stride(A, 2) * sizeof(T)) % 4096 == 0
+
+# Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s rank-2 SIMD panel pivots
+# on |·| (cabs1 = LAPACK izamax) and divides by the complex pivot correctly; `_getrf_core!` rides complex
+# trsm!/gemm! (the 3M path) for the trailing update. Pad-scratch dodges po2 lda aliasing (see `_clu_pad`).
+# (Oracle tests compare the PA=LU residual, not entries.)
 function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _clu_nb(min(size(A)...), T)) where {T<:BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
+    if _clu_needs_pad(A, m, T)                            # factor in a non-conflicting scratch
+        R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
+        pref = _clu_pad(T); b = pref[]
+        (size(b, 1) < R || size(b, 2) < n) && (b = pref[] = Matrix{T}(undef, R, n))
+        Mw = view(b, 1:m, 1:n)
+        ld = stride(A, 2); sz = sizeof(T)
+        info = GC.@preserve A b begin
+            pA = pointer(A); pB = pointer(b)
+            @inbounds for j in 0:n-1                       # contiguous per-column copy in (A → scratch)
+                unsafe_copyto!(pB + j * R * sz, pA + j * ld * sz, m)
+            end
+            (_, _, i3) = _getrf_core!(Mw, ipiv, nb)
+            @inbounds for j in 0:n-1                       # and back
+                unsafe_copyto!(pA + j * ld * sz, pB + j * R * sz, m)
+            end
+            i3
+        end
+        return A, ipiv, info
+    end
     return _getrf_core!(A, ipiv, nb)
 end
 # Convenience: allocate ipiv, return (A overwritten with L\U, ipiv, info).
