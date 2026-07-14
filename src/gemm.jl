@@ -1523,8 +1523,7 @@ end
         ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
         ::Val{B0}, ::Val{A1},
         ::Val{AR}, ::Val{FULL},
-        ::Val{TRI}, d0::Int, upper::Bool,
-        ::Val{TRIB}, ::Val{UNIT}, ::Val{PART}) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI, TRIB, UNIT, PART}
+        ::Val{TRI}, d0::Int, upper::Bool) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI}
     # NOTE: no default args — they generate default-arg TRAMPOLINE methods that juliac's --trim verifier
     # cannot resolve through this @generated function (unresolved invoke ::Any → .so build fails). Every
     # call site MUST pass all 10 Vals + d0 + upper explicitly. (Regression guard: bench/juliac build.)
@@ -1543,120 +1542,32 @@ end
         push!(body.args, :($(Symbol(:cr, mi, :_, j)) = zero($V)))
         push!(body.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
     end
-    (TRI && TRIB) && error("_uker_cmplx!: TRI and TRIB both consume d0/upper — mutually exclusive")
-    if !TRIB
-        inner = quote end
-        for mi in 1:MR
-            aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
-            aload = FULL ? :(vload($V2W, A + $aoff)) : :(vload($V2W, A + $aoff, $(Symbol(:m2, mi))))
-            push!(inner.args, :($(Symbol(:av, mi)) = $aload))
-            push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
-        end
-        for j in 1:NR
-            boff = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
-            push!(inner.args, :($(Symbol(:bp, j)) = B + $boff))
-            push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
-            push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
-            for mi in 1:MR
-                cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
-                ar = Symbol(:ar, mi); ai = Symbol(:ai, mi); br = Symbol(:br, j); bi = Symbol(:bi, j)
-                push!(inner.args, :($cr = muladd($ar, $br, $cr)))
-                push!(inner.args, :($cr = muladd($(SA * SB == 1 ? :(-$ai) : ai), $bi, $cr)))
-                push!(inner.args, :($ci = muladd($(SB == 1 ? ar : :(-$ar)), $bi, $ci)))
-                push!(inner.args, :($ci = muladd($(SA == 1 ? ai : :(-$ai)), $br, $ci)))
-            end
-        end
-        push!(body.args, quote                            # k-reduction: 4 FMA/cell (complex) → @simd ivdep
-            @inbounds @simd ivdep for p in 0:(k - 1)      # lets LLVM software-pipeline (register accs, no
-                $inner                                    # in-loop memory dep; stores are in the epilogue).
-            end                                           # FMA-density win — helps complex, would regress
-        end)                                              # the 1-FMA/cell real _microkernel_unpacked! (kb).
-    else
-        # TRIB: the B-slot operand is a triangular op(A) read STRAIGHT from A (ldb=lda; op-variant via
-        # TB/SB, no materialize). K-loop is SPLIT into a branch-free strict interior (fast unconditional
-        # load) + a ≤NR-deep diagonal straddle where a branchless `ifelse` select applies the triangle:
-        # off-tri→0 (via select, NOT ×0 — the dead triangle can hold NaN/Inf), unit-diag→1. Per-column
-        # diagonal threshold thrb{j}=d0+(j-1); intri = upper ? p≤thrb : p≥thrb. PART=true guards the LOAD
-        # itself (a partial column-tile's masked columns index A OOB) — never on gate sizes (÷NR).
-        aloads = quote end
-        for mi in 1:MR
-            aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
-            aload = FULL ? :(vload($V2W, A + $aoff)) : :(vload($V2W, A + $aoff, $(Symbol(:m2, mi))))
-            push!(aloads.args, :($(Symbol(:av, mi)) = $aload))
-            push!(aloads.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
-        end
-        fma_j = map(1:NR) do j
-            f = quote end
-            for mi in 1:MR
-                cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
-                ar = Symbol(:ar, mi); ai = Symbol(:ai, mi); br = Symbol(:br, j); bi = Symbol(:bi, j)
-                push!(f.args, :($cr = muladd($ar, $br, $cr)))
-                push!(f.args, :($cr = muladd($(SA * SB == 1 ? :(-$ai) : ai), $bi, $cr)))
-                push!(f.args, :($ci = muladd($(SB == 1 ? ar : :(-$ar)), $bi, $ci)))
-                push!(f.args, :($ci = muladd($(SA == 1 ? ai : :(-$ai)), $br, $ci)))
-            end
-            f
-        end
-        boff_j(j) = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
-        bfast_j(j) = quote
-            $(Symbol(:bp, j)) = B + $(boff_j(j))
-            $(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))
-            $(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))
-        end
-        function bsel_j(j, up::Bool)
-            bpj = Symbol(:bp, j); sre = Symbol(:bsr, j); sim = Symbol(:bsi, j); thrj = Symbol(:thrb, j)
-            intri = up ? :(p <= $thrj) : :(p >= $thrj)
-            re = UNIT ? :(ifelse(p == $thrj, one($T), $sre)) : sre
-            im = UNIT ? :(ifelse(p == $thrj, zero($T), $sim)) : sim
-            quote
-                $bpj = B + $(boff_j(j))
-                $sre = unsafe_load($bpj); $sim = unsafe_load($bpj + $sz)   # off-tri read is in-allocation; select discards
-                $(Symbol(:br, j)) = $V(ifelse($intri, $re, zero($T)))
-                $(Symbol(:bi, j)) = $V(ifelse($intri, $im, zero($T)))
-            end
-        end
-        guard_j(j, blk) = !PART ? blk : quote            # skip the LOAD (OOB), zero the result (store-masked)
-            if $(j - 1) < nre
-                $blk
-            else
-                $(Symbol(:br, j)) = zero($V); $(Symbol(:bi, j)) = zero($V)
-            end
-        end
-        mkinner(bld) = begin
-            q = quote end
-            append!(q.args, aloads.args)
-            for j in 1:NR
-                push!(q.args, guard_j(j, bld(j)))
-                push!(q.args, fma_j[j])
-            end
-            q
-        end
-        for j in 1:NR
-            push!(body.args, :($(Symbol(:thrb, j)) = d0 + $(j - 1)))   # hoist per-column thresholds
-        end
-        inner_fast = mkinner(bfast_j)
-        inner_su = mkinner(j -> bsel_j(j, true))
-        inner_sl = mkinner(j -> bsel_j(j, false))
-        push!(body.args, quote
-            if upper                                     # strict [0,d0) ∥ straddle [d0,k)
-                pud = min(d0, k)
-                @inbounds @simd ivdep for p in 0:(pud - 1)
-                    $inner_fast
-                end
-                @inbounds for p in pud:(k - 1)
-                    $inner_su
-                end
-            else                                         # straddle [0,d0+NR) ∥ strict [d0+NR,k)
-                pld = min(d0 + $NR, k)
-                @inbounds for p in 0:(pld - 1)
-                    $inner_sl
-                end
-                @inbounds @simd ivdep for p in pld:(k - 1)
-                    $inner_fast
-                end
-            end
-        end)
+    inner = quote end
+    for mi in 1:MR
+        aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
+        aload = FULL ? :(vload($V2W, A + $aoff)) : :(vload($V2W, A + $aoff, $(Symbol(:m2, mi))))
+        push!(inner.args, :($(Symbol(:av, mi)) = $aload))
+        push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
     end
+    for j in 1:NR
+        boff = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
+        push!(inner.args, :($(Symbol(:bp, j)) = B + $boff))
+        push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
+        push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
+        for mi in 1:MR
+            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+            ar = Symbol(:ar, mi); ai = Symbol(:ai, mi); br = Symbol(:br, j); bi = Symbol(:bi, j)
+            push!(inner.args, :($cr = muladd($ar, $br, $cr)))
+            push!(inner.args, :($cr = muladd($(SA * SB == 1 ? :(-$ai) : ai), $bi, $cr)))
+            push!(inner.args, :($ci = muladd($(SB == 1 ? ar : :(-$ar)), $bi, $ci)))
+            push!(inner.args, :($ci = muladd($(SA == 1 ? ai : :(-$ai)), $br, $ci)))
+        end
+    end
+    push!(body.args, quote                                # k-reduction: 4 FMA/cell (complex) → @simd ivdep
+        @inbounds @simd ivdep for p in 0:(k - 1)          # lets LLVM software-pipeline (register accs, no
+            $inner                                        # in-loop memory dep; stores are in the epilogue).
+        end                                               # FMA-density win — helps complex, would regress
+    end)                                                  # the 1-FMA/cell real _microkernel_unpacked! (kb).
     # Store epilogue (OB's structure): interleave the split acc → zi=[zr,zi,…], then fold α (and, when
     # accumulating, C) into an FMA chain in the INTERLEAVED domain. REAL α ⇒ one FMA `zi·αr (+C)` (no
     # swap); complex α ⇒ add the cross term via a swapped-lane FMA with alternating-sign αi. The C load is
@@ -1717,14 +1628,14 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
             if nrv >= _CMR
                 if mre == mr                                         # full-row interior tile → unmasked
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true), Val(false), 0, true, Val(false), Val(false), Val(false))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true), Val(false), 0, true)
                 else
                     _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
+                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true)
                 end
             else
                 _uker_cmplx!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
+                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true)
             end
             ir += nrv >= _CMR ? mr : W
         end
