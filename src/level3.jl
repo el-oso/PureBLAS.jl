@@ -248,10 +248,10 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 nre = min(nr, n - jr)
                 if full
                     _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 else
                     _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 end
                 jr += nr
             end
@@ -266,10 +266,23 @@ end
 # read columns are exactly the not-yet-overwritten ones, so no scratch (see _trmm_cmplx_small_L!).
 function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); m = size(B, 1)
+    upM = (up != tr)
+    if _CTRMM_DIRECT                                        # DIRECT-READ: op(A) straight from A, no materialize
+        ldb = stride(B, 2); lda = stride(A, 2)
+        GC.@preserve A B begin
+            Ap0 = Ptr{T}(pointer(A)); Bp = Ptr{T}(pointer(B))
+            # Resolve tr/cj/unit → Val type-params ONCE (fixed per trmm! call) so the trimmer union-splits
+            # the helper into concrete methods (mirrors _uker_sweep!; a bare `tr ? Val(true):Val(false)`
+            # reaching _uker_cmplx!'s ::Val{TB} is an unresolved --trim call). Per-tile full/part stay runtime.
+            vtb = tr ? Val(true) : Val(false); vsb = cj ? Val(-1) : Val(1); vun = unit ? Val(true) : Val(false)
+            _trmm_smallR_direct!(vtb, vsb, vun, upM, k, m, Ap0, lda, Bp, ldb)
+        end
+        return B
+    end
+    # Fallback (AVX-512 / _CTRMM_DIRECT off): materialize op(A)→M once, then K-TRIM unpacked kernels.
     M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
     _mat_tri!(Mv, A, k, up, tr, unit)
     cj && @inbounds(Mv .= conj.(Mv))
-    upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
     ldM = _L3_NB; ldb = stride(B, 2)
     GC.@preserve M B begin
@@ -285,16 +298,55 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
                 if full
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 else
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true)
+                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 end
             end
             ir += mr
         end
     end
     return B
+end
+# Direct-read side-R inner: TB/SB/UNIT are type-params (trimmer union-splits). B-slot reads op(A) from A
+# (Bop points at A; ldb=lda; TB carries transpose, SB carries conj); the kernel's Val{TRIB} triangle
+# select zeroes off-tri + sets the unit diagonal inline — no _mat_tri! materialize. Iteration order/K-TRIM
+# identical to the materialize path (the in-place hazard is A-slot=B, unchanged). d0=jr-plo, upper=upM.
+@inline function _trmm_smallR_direct!(::Val{TB}, ::Val{SB}, ::Val{UNIT}, upM::Bool, k::Int, m::Int,
+        Ap0::Ptr{T}, lda::Int, Bp::Ptr{T}, ldb::Int) where {T, TB, SB, UNIT}
+    W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
+    onr = one(T); zr = zero(T); nt = cld(k, nr)
+    ir = 0
+    while ir < m
+        mre = min(mr, m - ir); full = cld(mre, W) >= _CMR
+        for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
+            jr = t * nr; nre = min(nr, k - jr)
+            plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
+            Aop = Bp + 2 * plo * ldb * sz                          # A-slot: B cols [plo,phi) (unchanged)
+            Bop = TB ? Ap0 + 2 * plo * lda * sz : Ap0 + 2 * plo * sz   # B-slot: op(A) rows [plo,phi) direct
+            d0 = upM ? jr : 0; part = nre < nr
+            if full
+                if part
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(true))
+                else
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(false))
+                end
+            else
+                if part
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(1), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(true))
+                else
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(1), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(false))
+                end
+            end
+        end
+        ir += mr
+    end
+    return
 end
 
 # The packed K-TRIM complex trmm base (near-peak PACKED microkernel) vs the weak unpacked _uker_cmplx!.
@@ -312,6 +364,11 @@ const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # doesn't pay; kept at the measured conservative value. Preferences-pinnable. (req#8: acknowledged debt —
 # the pack-amortization threshold resists a clean cache/ISA formula; revisit with an OB-style fused pack.)
 const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
+# Direct-read fused-triangle unpacked base (side-R/L): read op(A) STRAIGHT from A in the _uker_cmplx!
+# B-slot (Val{TRIB}) — no _mat_tri! materialize, no conj pass. AVX2-only (W=4): the unpacked path is the
+# small-k trmm base only there (AVX-512 has ILP headroom via the same path but never instantiates the
+# TRIB kernels, so its gate is untouched). ISA predicate, Preferences-pinnable. Fable-designed 2026-07-14.
+const _CTRMM_DIRECT = @load_preference("ctrmm_direct", _vwidth(Float64) == 4)::Bool
 
 # Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
 # non-multiple-of-nr panel is partial (width nre∈1:_CNR-1); running it through the nr-wide masked kernel
@@ -2581,21 +2638,21 @@ function _ctri_core!(::Val{NR}, up::Bool, ::Val{SB}, ::Val{A1}, ::Val{AR},
                     # skip: nothing stored
                 elseif full && mre == mr
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(true), Val(false), 0, true)
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(true), Val(false), 0, true, Val(false), Val(false), Val(false))
                 elseif full && nrv >= _CMR
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true)
+                        Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 elseif full
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
-                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true)
+                        Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
                 elseif nrv >= _CMR                                       # diagonal-straddling ⇒ TRI masked store
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
                         Val(_CMR), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR),
-                        Val(false), Val(true), jr - ir, up)
+                        Val(false), Val(true), jr - ir, up, Val(false), Val(false), Val(false))
                 else
                     _uker_cmplx!(Cp, ldc, Xp, ldx, ir, Yp, ldy, jr, k, alr, ali, mre, nre,
                         Val(1), Val(NR), Val(true), Val(1), Val(SB), Val(false), Val(A1), Val(AR),
-                        Val(false), Val(true), jr - ir, up)
+                        Val(false), Val(true), jr - ir, up, Val(false), Val(false), Val(false))
                 end
                 ir += nrv >= _CMR ? mr : W
             end
