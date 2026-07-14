@@ -233,6 +233,77 @@ end
     end
 end
 
+# Fused rank-2 complex conj-dot for the QR panel: returns (Σ conj(v0)·c, Σ conj(v1)·c) in ONE pass over
+# c — the two reflectors share the c-load (halves the panel's level-2 read traffic vs two _dot_cmplx_simd
+# calls). Same interleaved swap-adjacent idiom as _dot_cmplx_simd (CJ=true). `n` counts COMPLEX elements.
+@generated function _qr_dot2c_cmplx(n::Int, v0, v1, c, ::Type{T}) where {T<:BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    quote
+        pv0 = _reptr(v0); pv1 = _reptr(v1); pc = _reptr(c)
+        p0 = zero($V2); q0 = zero($V2); p1 = zero($V2); q1 = zero($V2); i = 0
+        GC.@preserve v0 v1 c begin
+            while i + $W <= n
+                @inbounds begin
+                    o = i * 2 * $sz
+                    cv = vload($V2, pc + o); cs = shufflevector(cv, Val($swp))
+                    a0 = vload($V2, pv0 + o); a1 = vload($V2, pv1 + o)
+                    p0 = muladd(a0, cv, p0); q0 = muladd(a0, cs, q0)
+                    p1 = muladd(a1, cv, p1); q1 = muladd(a1, cs, q1)
+                end
+                i += $W
+            end
+            pf0 = _fold2_cmplx(p0); qf0 = _fold2_cmplx(q0); pf1 = _fold2_cmplx(p1); qf1 = _fold2_cmplx(q1)
+            d0r = pf0[1] + pf0[2]; d0i = qf0[1] - qf0[2]; d1r = pf1[1] + pf1[2]; d1i = qf1[1] - qf1[2]
+            @inbounds while i < n
+                j = i + 1
+                v0r = unsafe_load(pv0, 2j-1); v0i = unsafe_load(pv0, 2j)
+                v1r = unsafe_load(pv1, 2j-1); v1i = unsafe_load(pv1, 2j)
+                cr = unsafe_load(pc, 2j-1); ci = unsafe_load(pc, 2j)
+                d0r += v0r*cr + v0i*ci; d0i += v0r*ci - v0i*cr
+                d1r += v1r*cr + v1i*ci; d1i += v1r*ci - v1i*cr
+                i += 1
+            end
+            return (Complex{$T}(d0r, d0i), Complex{$T}(d1r, d1i))
+        end
+    end
+end
+
+# Fused rank-2 complex axpy for the QR panel: c .+= k0·v0 + k1·v1 in ONE pass over c (shares the c
+# read/write across both reflectors). Swap-pairs complex-multiply, same idiom as _axpy_cmplx_simd.
+@generated function _qr_axpy2_cmplx!(n::Int, k0r::T, k0i::T, k1r::T, k1i::T, v0, v1, c) where {T<:BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    sgn0 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k0i) : :k0i for l in 0:(2W - 1))...))))
+    sgn1 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k1i) : :k1i for l in 0:(2W - 1))...))))
+    quote
+        pv0 = _reptr(v0); pv1 = _reptr(v1); pc = _reptr(c)
+        ar0 = $V2(k0r); ar1 = $V2(k1r); s0 = $sgn0; s1 = $sgn1; i = 0
+        GC.@preserve v0 v1 c begin
+            while i + $W <= n
+                @inbounds begin
+                    o = i * 2 * $sz
+                    a0 = vload($V2, pv0 + o); a1 = vload($V2, pv1 + o); t = vload($V2, pc + o)
+                    t = muladd(a0, ar0, t); t = muladd(shufflevector(a0, Val($swp)), s0, t)
+                    t = muladd(a1, ar1, t); t = muladd(shufflevector(a1, Val($swp)), s1, t)
+                    vstore(t, pc + o)
+                end
+                i += $W
+            end
+            @inbounds while i < n
+                j = i + 1
+                v0r = unsafe_load(pv0, 2j-1); v0i = unsafe_load(pv0, 2j)
+                v1r = unsafe_load(pv1, 2j-1); v1i = unsafe_load(pv1, 2j)
+                cr = unsafe_load(pc, 2j-1); ci = unsafe_load(pc, 2j)
+                unsafe_store!(pc, cr + k0r*v0r - k0i*v0i + k1r*v1r - k1i*v1i, 2j-1)
+                unsafe_store!(pc, ci + k0r*v0i + k0i*v0r + k1r*v1i + k1i*v1r, 2j)
+                i += 1
+            end
+        end
+        return c
+    end
+end
+
 @inline function _copy_simd!(n::Int, x, y) # T inferred from the pointer/array element type
     T = _et(x); px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
