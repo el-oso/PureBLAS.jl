@@ -430,13 +430,17 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
         αr::T, αi::T, ::Val{NC}, ::Val{PF}) where {T, NC, PF}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
-    sgn = Expr(:tuple, (iseven(l) ? -one(T) : one(T) for l in 0:(2W - 1))...)
-    body = quote sgnv = $V2($sgn) end
+    # Sign-fold: pre-multiply the ci broadcast by [+1,-1,+1,-1,…] (hoisted, once/column) so the per-row
+    # epilogue becomes a plain FADD `(y+Pv)+shuffle(Qv)` instead of `muladd(shuffle(Qv), sgnv, y+Pv)` —
+    # drops one FMA-port op per row-iter (the inner loop is FMA-bound). altv[swp[k]]·shuffle folds the
+    # sgnv=[-1,+1,…] pattern into Qv; scalar-tail uses lane[1] (=+ci, unaffected). Fable-P2 2026-07-14.
+    altv = Expr(:tuple, (iseven(l) ? one(T) : -one(T) for l in 0:(2W - 1))...)
+    body = quote altv = $V2($altv) end
     for c in 1:NC                                   # hoist: α·x[jj] once per column, broadcast re/im
         push!(body.args, :($(Symbol(:b, c)) = Ab + (jc + $(c - 1)) * 2 * ldc * $sz))
         push!(body.args, :(xr = unsafe_load(xp, 2 * (jc + $(c - 1)) + 1); xi = unsafe_load(xp, 2 * (jc + $(c - 1)) + 2)))
         push!(body.args, :($(Symbol(:cr, c)) = $V2(αr * xr - αi * xi)))
-        push!(body.args, :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr)))
+        push!(body.args, :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr) * altv))   # sign-folded ci broadcast
     end
     inner = quote off = i * 2 * $sz end
     for c in 1:NC
@@ -451,7 +455,7 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
         end
     end
     push!(inner.args, :(yv = vload($V2, yp + off)))
-    push!(inner.args, :(yv = muladd(shufflevector(Qv, Val($swp)), sgnv, yv + Pv)))
+    push!(inner.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($swp))))   # sign pre-folded into Qv
     push!(inner.args, :(vstore(yv, yp + off)))
     tail = quote acr = zero($T); aci = zero($T) end                  # scalar row tail (m % W complex rows)
     for c in 1:NC
