@@ -396,9 +396,6 @@ end
 # eat the 16-ymm file fast, so MR=4 (4 chains, ~14 ymm) is the measured AVX2 optimum (MR=5 spills,
 # split-accumulators need MR too small to amortize A). AVX-512's 32 zmm has ample room. Swept per box.
 const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
-# Off-diagonal tri-scatter is a TALL skinny gemv (m≫n=NB); MR=4 that suits square gemvN regresses it
-# (worse panel/cache behavior), so the scatter uses its own smaller MR. Decoupled per shape.
-const _CGEMV_MR_SCAT = @load_preference("cgemv_mr_scat", 3)::Int
 # Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
 # _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
 # (1 shuffle feeds NC cols, x streamed once per block).
@@ -1438,10 +1435,11 @@ end
 
 # Complex off-diagonal scatters for blocked trmv/trsv: y += α·op(Av)·xv (β=1 accumulate), reusing the
 # gating complex gemv kernels. N → gemv-N; T/C → gemv-T/C with cj resolved to a compile-time Val.
+# The OB-structure ri gemv (α folded, fresh accs, prefetch, m-blocked) beats the row-tile scatter on
+# BOTH ISAs for the tall off-diagonal shape (m≫k=NB, β=1) — measured 0.71–0.96× row-tile across m on
+# AVX-512, and it's the same kernel zgemvN already rides. (Was AVX-512→row-tile; that predated the ri tune.)
 @inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
-    _vwidth(real(T)) == 4 ?     # AVX2: the OB-structure ri gemv (α folded, fresh accs, prefetch, m-blocked)
-        _gemv_n_ri_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false)) :
-        _gemv_n_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false), Val(_CGEMV_MR_SCAT))
+    _gemv_n_ri_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
 @inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
     cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
          _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))
