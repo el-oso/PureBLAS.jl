@@ -158,39 +158,68 @@ function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipi
     return info
 end
 
-# Complex SIMD panel (zgetf2): same math as the scalar fallback, vectorized over rows via the L1 complex
-# kernels (`_scal_cmplx_simd!` column scale, `_axpy_cmplx_simd!` rank-1 trailing update). Scalar argmax +
-# row swap (data-dependent). Contiguous-column complex panel, p = &panel[1,1]. Pivoting is a correctness
-# boundary — do not simplify.
-function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
-    R = real(Tc); csz = sizeof(Tc); info = 0
-    lidx(i, k) = (k - 1) * ld + i                                   # 1-based linear (complex) index
-    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz                # &A[i,k] (complex Ptr)
-    @inbounds for jl in 1:pb
-        piv = jl; pmax = abs(unsafe_load(p, lidx(jl, jl)))         # argmax |·| in column jl, rows jl:mp
-        for il in (jl + 1):mp
-            a = abs(unsafe_load(p, lidx(il, jl))); a > pmax && (pmax = a; piv = il)
+# factor complex column jl: SIMD izamax (cabs1, LAPACK's izamax metric) + swap rows jl↔piv across the whole
+# panel + scale below diagonal by 1/pivot. Returns true on a zero pivot. Pivoting is a correctness boundary.
+@inline function _clu_fact1!(p::Ptr{Tc}, ld::Int, mp::Int, jl::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
+    R = real(Tc); csz = sizeof(Tc)
+    lidx(i, k) = (k - 1) * ld + i
+    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz
+    nrows = mp - jl + 1
+    rel = if nrows >= 4 * _vwidth(R)                                # SIMD izamax needs n ≥ 4W (else OOB lanes)
+        _iamax_cmplx_simd!(nrows, Ptr{R}(cptr(jl, jl)))
+    else
+        b = 1; m = -one(R)                                          # scalar cabs1 argmax (LAPACK izamax metric)
+        for t in 1:nrows
+            v = unsafe_load(p, lidx(jl - 1 + t, jl)); a = abs(real(v)) + abs(imag(v))
+            a > m && (m = a; b = t)
         end
-        ipiv[ioff + jl] = roff + piv
-        if unsafe_load(p, lidx(piv, jl)) != zero(Tc)
-            if piv != jl                                            # swap rows jl ↔ piv across the panel
-                for jc in 1:pb
-                    a = unsafe_load(p, lidx(jl, jc))
-                    unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc))
-                    unsafe_store!(p, a, lidx(piv, jc))
-                end
-            end
-            mt = mp - jl
-            r = _crecip(unsafe_load(p, lidx(jl, jl)))               # scale column below diagonal by 1/pivot
-            mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
-        elseif info == 0
-            info = roff + jl
+        b
+    end
+    piv = jl - 1 + rel
+    ipiv[ioff + jl] = roff + piv
+    zero_piv = unsafe_load(p, lidx(piv, jl)) == zero(Tc)
+    @inbounds if piv != jl                                          # swap rows jl ↔ piv across the panel
+        for jc in 1:pb
+            a = unsafe_load(p, lidx(jl, jc))
+            unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc)); unsafe_store!(p, a, lidx(piv, jc))
         end
+    end
+    @inbounds if !zero_piv
         mt = mp - jl
-        for jc in (jl + 1):pb                                       # rank-1 update: A[jl+1:,jc] -= A[jl,jc]·A[jl+1:,jl]
-            ajc = unsafe_load(p, lidx(jl, jc))
-            mt > 0 && _axpy_cmplx_simd!(mt, -real(ajc), -imag(ajc), cptr(jl + 1, jl), cptr(jl + 1, jc))
+        r = _crecip(unsafe_load(p, lidx(jl, jl)))                   # 1/pivot; scale column below the diagonal
+        mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
+    end
+    return zero_piv
+end
+
+# Complex SIMD panel (zgetf2) — RANK-2 blocked (mirror of the real _getf2_simd!): SIMD izamax argmax
+# (`_iamax_cmplx_simd!`), and the trailing update touches each element ONCE per 2 columns via the fused
+# 2-source complex axpy (`_qr_axpy2_cmplx!`) instead of two rank-1 passes — halving the store traffic that
+# dominates the store-bound BLAS-2 panel. Columns in pairs: factor jl, update col jl+1 by jl, factor jl+1,
+# then one fused rank-2 update of the trailing (with the U[jl+1,·] row correction). Bit-equivalent pivots/
+# result to the flat rank-1 sweep. Pivoting is a correctness boundary — do not simplify.
+function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int) where {Tc <: BlasComplex}
+    csz = sizeof(Tc); info = 0
+    lidx(i, k) = (k - 1) * ld + i
+    cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz
+    jl = 1
+    @inbounds while jl <= pb
+        if jl == pb                                                # odd tail: single column
+            _clu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl); break
         end
+        _clu_fact1!(p, ld, mp, jl, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl)
+        u = unsafe_load(p, lidx(jl, jl + 1)); mt = mp - jl          # update col jl+1 by jl (rank-1 axpy)
+        mt > 0 && _axpy_cmplx_simd!(mt, -real(u), -imag(u), cptr(jl + 1, jl), cptr(jl + 1, jl + 1))
+        _clu_fact1!(p, ld, mp, jl + 1, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl + 1)
+        mt2 = mp - jl - 1
+        for jc in (jl + 2):pb                                      # fused rank-2 trailing update
+            a0 = unsafe_load(p, lidx(jl, jc)); u0 = -a0
+            uc = unsafe_load(p, lidx(jl + 1, jc)) - a0 * unsafe_load(p, lidx(jl + 1, jl))  # U[jl+1,jc]
+            unsafe_store!(p, uc, lidx(jl + 1, jc)); u1 = -uc
+            mt2 > 0 && _qr_axpy2_cmplx!(mt2, real(u0), imag(u0), real(u1), imag(u1),
+                                        cptr(jl + 2, jl), cptr(jl + 2, jl + 1), cptr(jl + 2, jc))
+        end
+        jl += 2
     end
     return info
 end
