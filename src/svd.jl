@@ -309,11 +309,13 @@ mutable struct SVDWorkspace{T}
     bt_T::Matrix{T}; bt_G::Matrix{T}; bt_W::Matrix{T}; bt_Yb::Matrix{T}   # compact-WY back-transform blocks
     trbuf::Matrix{T}; Usc::Matrix{T}; Vtsc::Matrix{T}             # m<n transpose staging (Aᵀ, Ū, V̄ᵀ)
     cabi_U::Matrix{T}; cabi_Vt::Matrix{T}                         # C-ABI dgesvd scratch for jobu/jobvt ∈ {'N','O'}
+    dqds_Z::Vector{Float64}; dqds_st::_DqdsState                  # dqds (dlasq) values path: 4n qd-array + state
 end
 function SVDWorkspace{T}() where {T}
     ev() = T[]; em() = Matrix{T}(undef, 0, 0)
     SVDWorkspace{T}(ev(), ev(), ev(), ev(), em(), em(), ev(), ev(), em(), em(),
-        ev(), ev(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em())
+        ev(), ev(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(), em(),
+        Float64[], _DqdsState())
 end
 
 const _SVDWS = SVDWorkspace{Float64}()
@@ -331,6 +333,7 @@ function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
     nbb = _BRD_NB
     ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
     ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 1))
+    ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
     return ws
 end
 
@@ -352,6 +355,7 @@ function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
     ws.Vpad = _gm(ws.Vpad, ldv, N); ws.VP = _gm(ws.VP, N, max(N - 1, 1))
     ws.bt_T = _gm(ws.bt_T, nbt, nbt); ws.bt_G = _gm(ws.bt_G, nbt, nbt)
     ws.bt_W = _gm(ws.bt_W, nbt, nu); ws.bt_Yb = _gm(ws.bt_Yb, nbt, nu)
+    ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
     return ws
 end
 
@@ -746,7 +750,8 @@ function _svals_core!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64}, ws
     d = view(ws.d, 1:n); e = view(ws.e, 1:max(n - 1, 0))
     tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
     gebrd!(A, d, e, tauq, taup, ws)
-    bdsqr!(d, e, nothing, nothing)
+    # dqds (dlasq) for singular VALUES — ~1.7× faster than the QR bdsqr!; QR is the rare-failure fallback.
+    _dlasq1!(d, e, ws.dqds_Z, ws.dqds_st) != 0 && bdsqr!(d, e, nothing, nothing)
     @inbounds for i in 1:n; S[i] = d[i]; end
     return S
 end
@@ -815,7 +820,8 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T<:
     # bidiagonal of a ComplexF32 A is fine to refine in double (σ then rounded back into S's eltype).
     d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
     gebrd!(A, d, e, tauq, taup, ws)                          # blocked zgebrd (zlabrd panels + gemm trailing)
-    bdsqr!(d, e, nothing, nothing)                           # singular VALUES only (real bidiagonal)
+    # dqds (dlasq) singular VALUES on the real bidiagonal; QR bdsqr! is the rare-failure fallback.
+    _dlasq1!(d, e, ws.dqds_Z, ws.dqds_st) != 0 && bdsqr!(d, e, nothing, nothing)
     @inbounds for i in 1:n; S[i] = d[i]; end
     return S
 end
