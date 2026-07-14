@@ -166,6 +166,12 @@ const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune i
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
+# Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
+# strong — it BEATS the blocked WY path while the matrix stays L3-resident (its O(n³) re-streams hit cache,
+# not DRAM). Measured neuromancer Zen5 (L3=16MB): single wins to n≈700 (matrix ≈ ½L3), collapses at n≥1536
+# (matrix ≫ L3, 0.86/0.79×); blocked wins beyond. req#8: derive from residency, not a size literal — stay
+# unblocked while m·n·sizeof(T) ≤ L3/frac. Overridable "qr_unblk_l3frac".
+const _QR_UNBLK_L3FRAC = @load_preference("qr_unblk_l3frac", 2)::Int
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
@@ -185,7 +191,9 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
     nb = clamp(nb, 1, k)
-    if k <= nb && n <= nb
+    # Single unblocked panel while the matrix is L3-resident (BLAS-2 rank-2 panel beats the blocked WY path
+    # there); blocked only once re-streaming would spill to DRAM. Subsumes the tiny k≤nb case (no workspace).
+    if m * n * sizeof(T) <= _L3_BYTES ÷ _QR_UNBLK_L3FRAC
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k)); return A
     end
     V, Tm, G, Wb, Yb = _qr_ws_c(T, m, n, nb)
