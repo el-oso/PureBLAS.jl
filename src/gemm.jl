@@ -1563,7 +1563,11 @@ end
             push!(inner.args, :($ci = muladd($(SA == 1 ? ai : :(-$ai)), $br, $ci)))
         end
     end
-    push!(body.args, :(for p in 0:(k - 1); $inner; end))
+    push!(body.args, quote                                # k-reduction: 4 FMA/cell (complex) → @simd ivdep
+        @inbounds @simd ivdep for p in 0:(k - 1)          # lets LLVM software-pipeline (register accs, no
+            $inner                                        # in-loop memory dep; stores are in the epilogue).
+        end                                               # FMA-density win — helps complex, would regress
+    end)                                                  # the 1-FMA/cell real _microkernel_unpacked! (kb).
     # Store epilogue (OB's structure): interleave the split acc → zi=[zr,zi,…], then fold α (and, when
     # accumulating, C) into an FMA chain in the INTERLEAVED domain. REAL α ⇒ one FMA `zi·αr (+C)` (no
     # swap); complex α ⇒ add the cross term via a swapped-lane FMA with alternating-sign αi. The C load is
