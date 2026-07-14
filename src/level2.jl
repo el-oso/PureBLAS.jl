@@ -599,10 +599,12 @@ end
     end
     push!(body.args, :(nfull = m - rem(m, $cstep); i = 0; @inbounds while i < nfull; $main; i += $cstep; end))
     for c in 1:NC
+        pf = Symbol(:pf, c); qf = Symbol(:qf, c)   # unique names — must NOT collide with accumulators p$c/q$c
         push!(body.args, quote
-            pr, pii = _deint_cmplx($(Symbol(:p, c))); qr, qi = _deint_cmplx($(Symbol(:q, c)))
-            $(Symbol(:sr, c)) = sum(pr) + $(CJ ? :(sum(pii)) : :(-sum(pii)))
-            $(Symbol(:si, c)) = sum(qr) + $(CJ ? :(-sum(qi)) : :(sum(qi)))
+            $pf = _fold2_cmplx($(Symbol(:p, c)))   # [Σ ar·xr, Σ ai·xi]  (parity-preserving fold; see gemm.jl)
+            $qf = _fold2_cmplx($(Symbol(:q, c)))   # [Σ ar·xi, Σ ai·xr]
+            $(Symbol(:sr, c)) = $pf[1] + $(CJ ? :($pf[2]) : :(-$pf[2]))
+            $(Symbol(:si, c)) = $qf[1] + $(CJ ? :(-$qf[2]) : :($qf[2]))
         end)
     end
     tail = quote xrr = unsafe_load(xr, 2i + 1); xii = unsafe_load(xr, 2i + 2) end
