@@ -824,6 +824,6 @@ function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T<:BlasC
     want_vectors && throw(ArgumentError("complex gesvd! with singular vectors not yet implemented — " *
         "use want_vectors=false for singular values (the vectors' back-transform is the follow-up)"))
     S = Vector{real(T)}(undef, mn)
-    gesvd_vals!(copy(A), S)                                   # gebd2! is destructive
+    gesvd_vals!(A, S)                                         # destructive (mirrors the real want_vectors=false path)
     return (S,)
 end
