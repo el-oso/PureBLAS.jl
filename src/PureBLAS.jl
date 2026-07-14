@@ -20,6 +20,8 @@ include("gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; gene
 include("level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
 include("lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
 include("qr.jl")            # LAPACK: QR (geqrf) — faer panel reduction + gemm! dlarfb
+include("wy.jl")            # compact-WY block-reflector kernels (dlarft/dlarfb roles), caller-
+                             # owned workspace — PureSparse.jl M5b multifrontal QR's P1a/P1b
 include("lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm! trailing
 include("svd_dqds.jl")      # LAPACK: dqds (dlasq1-6) — fast bidiagonal singular VALUES (values-only path)
 include("svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implicit-QR + back-transform
