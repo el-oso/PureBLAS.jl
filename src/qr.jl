@@ -167,11 +167,19 @@ const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune i
 # Keyed via Preferences per box (Zen4 sweet spot measured).
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
-# strong — it BEATS the blocked WY path while the matrix stays L3-resident (its O(n³) re-streams hit cache,
-# not DRAM). Measured neuromancer Zen5 (L3=16MB): single wins to n≈700 (matrix ≈ ½L3), collapses at n≥1536
-# (matrix ≫ L3, 0.86/0.79×); blocked wins beyond. req#8: derive from residency, not a size literal — stay
-# unblocked while m·n·sizeof(T) ≤ L3/frac. Overridable "qr_unblk_l3frac".
-const _QR_UNBLK_L3FRAC = @load_preference("qr_unblk_l3frac", 2)::Int
+# strong — it BEATS the blocked WY path while the matrix stays cache-resident (its O(n³) re-streams hit cache,
+# not DRAM). req#8: derive from residency, not a size literal. On the wide-SIMD box (AVX-512, _CGEMM_3M off)
+# unblocked wins to matrix ≈ ½L3 (neuromancer Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
+# box (_CGEMM_3M) the BLAS-2 panel is bandwidth-bound AND the chunked blocked path is efficient from small n,
+# so unblocked only wins while the matrix is ~L2-resident (≤2·L2 ⇒ galen n≤256; n≥320 must reach blocked).
+@inline _zqr_unblk_max(::Type{T}) where {T} = _CGEMM_3M ? 2 * _L2_BYTES : _L3_BYTES ÷ 2
+# Blocked panel width (COMPLEX), derived: the trailing gemm C−=V·W contracts over pb=nb, and once the matrix
+# spills cache each panel re-streams the trailing matrix from DRAM (total sweep traffic ∝ k/nb). Grow nb with
+# how many times the matrix exceeds ¼L3 so DRAM-sweep bytes stay bounded, capped at 4× where the BLAS-2 panel
+# share (≈0.75·nb/n) starts to bite. Measured galen: 32 (n≤512) → 64 (768) → 96 (1024) → 128 (≥1280), gating
+# the whole range (nb=32 dips at n≥896, nb=64 dips at n≈320). Overridable base "qr_nb_c".
+@inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
+    clamp(_QR_NB_C * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB_C, 4 * _QR_NB_C)
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
@@ -186,16 +194,16 @@ end
 # Complex blocked QR (zgeqrf): per nb-panel qr_unblocked! (complex zlarfg), build V + the LAPACK compact-WY
 # T (zlarft: T[c,c]=τ, T[1:c-1,c] = T[1:c-1,1:c-1]·(−τ·G[1:c-1,c]), G=VᴴV), then apply the block Qᴴ to the
 # trailing: C −= V·(Tᴴ·(Vᴴ·C)) — the two big products via complex gemm ('C' = compile-time conj signs).
-function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C) where {T<:BlasComplex}
+function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T<:BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
-    nb = clamp(nb, 1, k)
-    # Single unblocked panel while the matrix is L3-resident (BLAS-2 rank-2 panel beats the blocked WY path
+    # Single unblocked panel while the matrix is cache-resident (BLAS-2 rank-2 panel beats the blocked WY path
     # there); blocked only once re-streaming would spill to DRAM. Subsumes the tiny k≤nb case (no workspace).
-    if m * n * sizeof(T) <= _L3_BYTES ÷ _QR_UNBLK_L3FRAC
+    if m * n * sizeof(T) <= _zqr_unblk_max(T)
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k)); return A
     end
+    nb = clamp(nb > 0 ? nb : _zqr_nb(T, m, n), 1, k)
     V, Tm, G, Wb, Yb = _qr_ws_c(T, m, n, nb)
     pc = 1
     @inbounds while pc <= k
@@ -220,11 +228,23 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = _QR_NB_C
                     Tv[r, c] = s
                 end
             end
-            C = view(A, pc:m, jt0:n)
-            Wv = view(Wb, 1:pb, 1:nt); gemm!(Wv, Vv, C; transA = 'C', alpha = true, beta = false)  # W = Vᴴ C
-            trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'C')            # W := Tᴴ W (was a scalar
-                                                                          # latency-bound triple loop — SIMD trmm)
-            gemm!(C, Vv, Wv; alpha = -1, beta = true)                       # C −= V·(Tᴴ W)
+            # nc-CHUNK the trailing update over columns. On the AVX2-complex path (_CGEMM_3M) the two trailing
+            # gemms route through Karatsuba-3M, which materializes O(mp·nt) real split/product scratch (~3× the
+            # trailing matrix) — for nt≈mp≈n that spills L3 exactly when the matrix ITSELF fits L3 (the galen
+            # n≈768–1100 dip band). Chunking columns bounds that scratch to ≤½L3 AND fuses each Cj's V·W downdate
+            # while its Vᴴ·C is still L3-hot (read+write once vs ~5–6 matrix passes). ncb = nt (single chunk,
+            # bit-identical) when 3M is off (neuromancer). req#8: ncb from the 3M live-set residency ≤ ½·L3,
+            # live set ≈ (sizeof(T) + 3·sizeof(real(T)))·mp·ncb (C chunk + its real split/product buffers).
+            ncb = _CGEMM_3M ? clamp(((_L3_BYTES ÷ 2) ÷ ((sizeof(T) + 3 * sizeof(real(T))) * mp)) & ~7, min(4 * _CNR, nt), nt) : nt
+            jj = jt0
+            while jj <= n
+                cw = min(ncb, n - jj + 1)
+                Cj = view(A, pc:m, jj:jj+cw-1)
+                Wv = view(Wb, 1:pb, 1:cw); gemm!(Wv, Vv, Cj; transA = 'C', alpha = true, beta = false)  # W = Vᴴ Cj
+                trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'C')        # W := Tᴴ W (SIMD trmm)
+                gemm!(Cj, Vv, Wv; alpha = -1, beta = true)                 # Cj −= V·(Tᴴ W)
+                jj += cw
+            end
         end
         pc += pb
     end
