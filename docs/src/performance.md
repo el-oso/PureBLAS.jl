@@ -78,13 +78,13 @@ the `ci` broadcast so the per-row epilogue drops an FMA-port op. Remaining worst
 ![Complex BLAS-3 — three µarchs](assets/perf_cl3.svg)
 
 `zgemm` beats OpenBLAS fleet-wide (geomean 1.26–1.40; Karatsuba 3M at mid/large n). The
-rank-k ops gate within a few percent. A direct-read fused-triangle base (reads op(A) straight from
-memory, no `_mat_tri!` materialize) plus a FULL-row-tile fix (drops the per-tile masked store on AVX2)
-lifted the deepest AVX2 (Zen3) small-n dips: `ztrmmR` 0.77→0.89 and `ztrmm` 0.84→0.93 at n=32 (side-R
-now gates n≥64), and `@simd ivdep` on the complex k-loop helped fleet-wide. Remaining open AVX2 small
-sizes: side-L n=32 (still materializes — needs the `Val{TRIA}` A-slot lane-mask), `ztrsm` 0.89 (n=128),
-and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97). (A non-po2-scratch attempt measured neutral under
-the pooled gate and was reverted.)
+rank-k ops gate within a few percent. `@simd ivdep` on the complex microkernel's k-loop (4 FMA/cell)
+helped the small-n complex trmm. The deepest AVX2 (Zen3) small-n dips remain open: `ztrmm`/`ztrmmR`
+n=32 (~0.8), `ztrsm` 0.89 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+
+microkernel overhead on the small-n complex-L3 path. A direct-read fused-triangle base closed the trmm
+dips in development but its runtime `Val` args broke trim-safety and it was reverted; the trim-safe
+refix (compile-time `Val` dispatch) is a follow-up. (A non-po2-scratch attempt was also measured neutral
+and reverted.)
 
 ![Complex LAPACK — three µarchs](assets/perf_clapack.svg)
 
