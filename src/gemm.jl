@@ -612,7 +612,10 @@ end
 # unpacked — refine to an A-fits-L2 test if skewed shapes matter.
 # Width-adaptive + Preferences-overridable (the unpacked path fits A in L2; the L2/register
 # tradeoff differs by ISA — Zen4 flips at n≈448, Zen3/AVX2 loses earlier). Override "gemm_unpack_max".
-const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _W64 == 8 ? 448 : _W64 == 4 ? 128 : 192)::Int
+# AVX2 re-swept 128→80 after the direct-B blocked path (no B-pack) became faster: the unpacked path now
+# only wins n≤~64 (measured galen: n=64 unpk 1.05 vs blk 1.00; n=96 unpk 1.00 vs blk 1.04; n=128 unpk
+# 0.89 vs blk 1.01 vs AOCL) — so n=96–128 now route to blocked-direct-B. AVX-512 unmeasured here (left 448).
+const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _W64 == 8 ? 448 : _W64 == 4 ? 80 : 192)::Int
 @inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX
 
 # Unpacked microkernel: full mr×nr tile, reading A (tA='N') and op(B) directly. alpha applied at
