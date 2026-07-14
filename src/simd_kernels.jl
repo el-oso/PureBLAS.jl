@@ -217,11 +217,12 @@ end
                 end
                 i += $W
             end
-            pr, pi = _deint_cmplx($psum)       # pr = Σxr·yr, pi = Σxi·yi
-            qr, qi = _deint_cmplx($qsum)       # qr = Σxr·yi, qi = Σxi·yr
-            # dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr ;  dotc (conj x): signs of the xi terms flip
-            sr = sum(pr) + $(CJ ? :(sum(pi)) : :(-sum(pi)))
-            si = sum(qr) + $(CJ ? :(-sum(qi)) : :(sum(qi)))
+            # dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr ;  dotc (conj x): signs of the xi terms flip.
+            # Parity-preserving fold → [Σeven, Σodd] instead of deint + two full horizontal sums (see gemm.jl).
+            pfld = _fold2_cmplx($psum)         # [Σxr·yr, Σxi·yi]  (unique names: $psum reads p0..p_{UNR-1})
+            qfld = _fold2_cmplx($qsum)         # [Σxr·yi, Σxi·yr]
+            sr = pfld[1] + $(CJ ? :(pfld[2]) : :(-pfld[2]))
+            si = qfld[1] + $(CJ ? :(-qfld[2]) : :(qfld[2]))
             @inbounds while i < n
                 j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j); yr = unsafe_load(py, 2j - 1); yi = unsafe_load(py, 2j)
                 sr += xr * yr + $(CJ ? :(xi * yi) : :(-xi * yi)); si += xr * yi + $(CJ ? :(-xi * yr) : :(xi * yr))

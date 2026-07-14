@@ -1332,6 +1332,23 @@ end
     ev = Expr(:tuple, (2 * (i - 1) for i in 1:W)...); od = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
     :((shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
 end
+
+# Parity-preserving halving reduce: an interleaved [even,odd,even,odd,…] partial-product Vec{N}
+# (N a power of 2 ≥ 2) → Vec{2} = [Σ even-lanes, Σ odd-lanes]. Each level halves-and-adds; every half
+# has even length down to width 2, so even/odd lane parity is preserved at every step. Replaces
+# `_deint_cmplx` + two full-width horizontal `sum`s in the complex dot / gemv-T epilogue: strictly
+# fewer shuffles (the first fold of a multi-register Vec, e.g. Vec{16,F64}=2 zmm, is a bare add), and
+# it dominates the reduction cost that swamps the tiny main loop at small m. Fable-designed 2026-07-14.
+@inline @generated function _fold2_cmplx(v::Vec{N, T}) where {N, T}
+    body = :v; n = N
+    while n > 2
+        h = n ÷ 2
+        lo = Expr(:tuple, (0:(h - 1))...); hi = Expr(:tuple, (h:(n - 1))...)
+        body = :(shufflevector($body, Val($lo)) + shufflevector($body, Val($hi)))
+        n = h
+    end
+    body
+end
 # Inverse of _deint_cmplx: interleave separate re/im W-vectors back to a Vec{2W} (re,im,re,im,…).
 @inline @generated function _intlv_cmplx(vr::Vec{W, T}, vi::Vec{W, T}) where {W, T}
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
