@@ -220,6 +220,62 @@ function _labrd!(As::AbstractMatrix{Float64}, d, e, tauq, taup, X, Y, nb::Int,
     return As
 end
 
+# Complex blocked panel (LAPACK zlabrd): faithful port of the real _labrd! with zlabrd's conjugation
+# dance — d,e stay REAL; τ complex; left ops use vᴴ (gemv 'C' where the real path uses 'T'); the active
+# row is reduced in the CONJUGATED domain (arow ≡ conj(row)), so the P reflector is built there and the
+# essential v is stored back conjugated (matching zgebrd's 'N','C' trailing gemm). mode 0=N,1=T,2=C.
+@inline _lgc!(yv, Av, xv, α::T, β::T, mode::Int) where {T<:Complex} =
+    _gemv!(mode != 0, mode == 2, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
+
+function _labrd!(As::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq, taup, X, Y,
+        nb::Int, arow::AbstractVector{T}, tmp::AbstractVector{T}) where {T<:Complex, R<:Real}
+    mm, nn = size(As)
+    o = one(T); z = zero(T)
+    @inbounds for i in 1:nb
+        if i > 1
+            for t in 1:i-1; tmp[t] = conj(Y[i, t]); end                 # zlacgv Y(i,1:i-1)
+            _lgc!(view(As, i:mm, i), view(As, i:mm, 1:i-1), view(tmp, 1:i-1), -o, o, 0)
+            _lgc!(view(As, i:mm, i), view(X, i:mm, 1:i-1), view(As, 1:i-1, i), -o, o, 0)
+        end
+        β, τq = _larfg!(view(As, i:mm, i))
+        d[i] = β; tauq[i] = τq; As[i, i] = o
+        if i < nn
+            L = nn - i
+            _lgc!(view(Y, i+1:nn, i), view(As, i:mm, i+1:nn), view(As, i:mm, i), o, z, 2)   # Aᴴ·v
+            if i > 1
+                _lgc!(view(Y, 1:i-1, i), view(As, i:mm, 1:i-1), view(As, i:mm, i), o, z, 2)
+                _lgc!(view(Y, i+1:nn, i), view(Y, i+1:nn, 1:i-1), view(Y, 1:i-1, i), -o, o, 0)
+                _lgc!(view(Y, 1:i-1, i), view(X, i:mm, 1:i-1), view(As, i:mm, i), o, z, 2)
+                _lgc!(view(Y, i+1:nn, i), view(As, 1:i-1, i+1:nn), view(Y, 1:i-1, i), -o, o, 2)
+            end
+            for r in i+1:nn; Y[r, i] *= τq; end
+            # Update the active row in the CONJUGATED domain: arow ← conj(A(i,i+1:nn)).
+            for t in 1:L; arow[t] = conj(As[i, i+t]); end
+            for t in 1:i; tmp[t] = conj(As[i, t]); end                  # zlacgv A(i,1:i)
+            _lgc!(view(arow, 1:L), view(Y, i+1:nn, 1:i), view(tmp, 1:i), -o, o, 0)
+            if i > 1
+                for t in 1:i-1; tmp[t] = conj(X[i, t]); end             # zlacgv X(i,1:i-1)
+                _lgc!(view(arow, 1:L), view(As, 1:i-1, i+1:nn), view(tmp, 1:i-1), -o, o, 2)
+            end
+            β2, τp = _larfg!(view(arow, 1:L))
+            e[i] = β2; taup[i] = τp; arow[1] = o                        # arow = conj-domain reflector v (v[1]=1)
+            As[i, i+1] = o
+            for t in 2:L; As[i, i+t] = conj(arow[t]); end               # store the un-conjugated essential v
+            _lgc!(view(X, i+1:mm, i), view(As, i+1:mm, i+1:nn), view(arow, 1:L), o, z, 0)
+            _lgc!(view(X, 1:i, i), view(Y, i+1:nn, 1:i), view(arow, 1:L), o, z, 2)
+            _lgc!(view(X, i+1:mm, i), view(As, i+1:mm, 1:i), view(X, 1:i, i), -o, o, 0)
+            if i > 1
+                _lgc!(view(X, 1:i-1, i), view(As, 1:i-1, i+1:nn), view(arow, 1:L), o, z, 0)
+                _lgc!(view(X, i+1:mm, i), view(X, i+1:mm, 1:i-1), view(X, 1:i-1, i), -o, o, 0)
+            end
+            for r in i+1:mm; X[r, i] *= τp; end
+        else
+            taup[i] = z
+        end
+    end
+    return As
+end
+
 const _BRD_NB = 16     # bidiagonalization panel width; measured optimal across n=256–2048 (narrow panel ⇒
                        # less BLAS-2 work/panel; the rank-16 trailing gemm stays efficient). ponytail: Zen4.
 const _BT_NB = 32      # back-transform (compact-WY dlarfb) block: larger than gebrd's — its gemms want
@@ -262,6 +318,21 @@ end
 
 const _SVDWS = SVDWorkspace{Float64}()
 @inline _svdws() = _SVDWS
+# Complex SVD values path: a separate owned workspace. Only the blocked-bidiag panels (gebrd_X/Y,
+# labrd_arow/tmp) are ever grown/used here — the singular-VECTOR buffers stay empty (vectors are the
+# follow-up). d,e stay real (local to the values entry), so they don't live in this complex workspace.
+const _SVDWS_C = SVDWorkspace{ComplexF64}()
+const _SVDWS_C32 = SVDWorkspace{ComplexF32}()
+@inline _svdws(::Type{ComplexF64}) = _SVDWS_C
+@inline _svdws(::Type{ComplexF32}) = _SVDWS_C32
+
+# Grow only the blocked-bidiag panels (complex values path; vectors buffers untouched).
+function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
+    nbb = _BRD_NB
+    ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
+    ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 1))
+    return ws
+end
 
 @inline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
 @inline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
@@ -317,6 +388,42 @@ function gebrd!(A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::Abstr
         i += nb
     end
     if i <= k                                  # unblocked tail
+        gebd2!(view(A, i:m, i:n), view(d, i:k), view(e, i:k-1), view(tauq, i:k), view(taup, i:k))
+    end
+    return A
+end
+
+# Complex blocked bidiagonalization driver (LAPACK zgebrd): zlabrd panels + two gemm trailing updates
+# (the first with transB='C' — the block update is A −= V·Yᴴ − X·Uᴴ), unblocked zgebd2! tail. m ≥ n.
+function gebrd!(A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq::AbstractVector{T},
+        taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _BRD_NB) where {T<:Complex, R<:Real}
+    m, n = size(A)
+    m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
+    k = n; nx = nb
+    if k <= nx || nb < 2
+        return gebd2!(A, d, e, tauq, taup)
+    end
+    X = ws.gebrd_X; Y = ws.gebrd_Y
+    o = one(T)
+    i = 1
+    @inbounds while i <= k - nx
+        mm = m - i + 1; nn = n - i + 1
+        As = view(A, i:m, i:n)
+        _labrd!(As, view(d, i:k), view(e, i:k-1), view(tauq, i:k), view(taup, i:k),
+            view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
+            view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:nb))
+        if i + nb <= k
+            tr = view(A, i+nb:m, i+nb:n)
+            gemm!(tr, view(A, i+nb:m, i:i+nb-1), view(Y, nb+1:nn, 1:nb); transB = 'C', alpha = -o, beta = o)
+            gemm!(tr, view(X, nb+1:mm, 1:nb), view(A, i:i+nb-1, i+nb:n); alpha = -o, beta = o)
+        end
+        for j in i:i+nb-1
+            A[j, j] = d[j]
+            A[j, j+1] = e[j]
+        end
+        i += nb
+    end
+    if i <= k
         gebd2!(view(A, i:m, i:n), view(d, i:k), view(e, i:k-1), view(tauq, i:k), view(taup, i:k))
     end
     return A
@@ -702,10 +809,13 @@ end
 function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T<:BlasComplex}
     m, n = size(A)
     m >= n || return gesvd_vals!(permutedims(A), S)          # tall via transpose (σ preserved)
-    R = real(T)
-    d = zeros(R, n); e = zeros(R, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
-    gebd2!(A, d, e, tauq, taup)
-    bdsqr!(d, e, nothing, nothing)
+    ws = _svdws(T)
+    _svd_grow_bidiag!(ws, m, n)
+    # Bidiagonal d,e in Float64 unconditionally: bdsqr! is the Float64 implicit-QR core, and the real
+    # bidiagonal of a ComplexF32 A is fine to refine in double (σ then rounded back into S's eltype).
+    d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
+    gebrd!(A, d, e, tauq, taup, ws)                          # blocked zgebrd (zlabrd panels + gemm trailing)
+    bdsqr!(d, e, nothing, nothing)                           # singular VALUES only (real bidiagonal)
     @inbounds for i in 1:n; S[i] = d[i]; end
     return S
 end

@@ -389,11 +389,11 @@ function run_cmplx_benchmarks()
         addh("zgetrf", s -> randn(T, s, s),
             c -> (LinearAlgebra.LAPACK.getrf!(c); real(c[1, 1])),
             c -> (PureBLAS.getrf!(c); real(c[1, 1])))
-        # zgesvd capped at 1024 (INTERIM): the complex bidiag is unblocked (BLAS-2) → ~0.05× and tens of
-        # minutes at 4096 for no new signal. Uncap once the complex gebrd port lands (roadmap #1).
+        # zgesvd now on the BLOCKED complex bidiag (zlabrd panels + gemm trailing) → gates; capped at 2048
+        # (the group cap) like the other complex LAPACK ops.
         addh("zgesvd", s -> randn(T, s, s),
             c -> (LinearAlgebra.LAPACK.gesdd!(Char(78), c); real(c[1, 1])),   # 'N' — singular values only
-            c -> (PureBLAS.gesvd!(c; want_vectors = false); 0.0); sizes = _cap(LPSZ, 1024))
+            c -> (PureBLAS.gesvd!(c; want_vectors = false); 0.0))
     end
     return cl1, cl2, cl3, clp
 end
