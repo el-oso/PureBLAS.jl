@@ -242,13 +242,20 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
             kc = phi - plo
             Ap = Mp + 2 * plo * ldM * sz                   # M cols [plo,phi); kernel adds ir row offset
             Bs = Bp + 2 * plo * sz                         # B-operand rows [plo,phi); kernel adds jr
-            full = cld(mre, W) >= _CMR
+            # FULL=(mre==mr): full-row tiles store UNMASKED (drop the vmaskmov). Validated on AVX2 (galen);
+            # gated to AVX2 so AVX-512 small_L stays byte-identical (no-regression mandate, unmeasured there).
+            full = cld(mre, W) >= _CMR; mfull = (mre == mr) && _CTRMM_DIRECT
             jr = 0
             while jr < n
                 nre = min(nr, n - jr)
                 if full
-                    _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
+                    if mfull
+                        _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true, Val(false), Val(false), Val(false))
+                    else
+                        _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
+                    end
                 else
                     _uker_cmplx!(Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
                         Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true, Val(false), Val(false), Val(false))
@@ -326,21 +333,25 @@ end
             Aop = Bp + 2 * plo * ldb * sz                          # A-slot: B cols [plo,phi) (unchanged)
             Bop = TB ? Ap0 + 2 * plo * lda * sz : Ap0 + 2 * plo * sz   # B-slot: op(A) rows [plo,phi) direct
             d0 = upM ? jr : 0; part = nre < nr
-            if full
+            # MR=_CMR always (on AVX2 _CMR=1 ⇒ cld(mre,W)≥_CMR ∀mre). FULL=(mre==mr) ⇒ full-row interior
+            # tiles store UNMASKED (drop the vmaskmov + m2 compute on every tile — the dominant per-tile
+            # cost at tiny n; masked only on the m-remainder). part guards the OOB B-load on the last col-tile.
+            mfull = mre == mr
+            if mfull
+                if part
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(true), Val(false), d0, upM, Val(true), Val(UNIT), Val(true))
+                else
+                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(true), Val(false), d0, upM, Val(true), Val(UNIT), Val(false))
+                end
+            else
                 if part
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(true))
                 else
                     _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(false))
-                end
-            else
-                if part
-                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(true))
-                else
-                    _uker_cmplx!(Bp, ldb, Aop, ldb, ir, Bop, lda, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(TB), Val(1), Val(SB), Val(true), Val(true), Val(false), Val(false), Val(false), d0, upM, Val(true), Val(UNIT), Val(false))
                 end
             end
         end
