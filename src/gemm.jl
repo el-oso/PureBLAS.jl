@@ -347,20 +347,25 @@ function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * nr * kce
-        if ji * nr + nr <= nce                       # full panel: branch-free, `@simd ivdep` vectorizes the
-            j0 = jc + ji * nr                        # contiguous stores (reads stay elementwise — a wide
-            if tB                                    # vload here stalls on freshly-written C operands, e.g.
-                for p in 0:(kce - 1)                 # geqrf's trailing update: measured −25% with _tblk!).
+        if ji * nr + nr <= nce                       # full panel. Reads stay elementwise (a wide vload
+            j0 = jc + ji * nr                        # stalls on freshly-written C operands — geqrf's
+            if tB                                    # trailing update: measured −25% with _tblk!).
+                # op(B)=Bᵀ: B[j0+c, gp] — for fixed gp the c-run is down a B column (contiguous), so the
+                # p-outer/c-inner order already streams the reads; keep it (contiguous vector stores too).
+                for p in 0:(kce - 1)
                     gp = pc + p
                     @simd ivdep for c in 0:(nr - 1)
                         Bp[base + p * nr + c + 1] = B[j0 + c + 1, gp + 1]
                     end
                 end
             else
-                for p in 0:(kce - 1)
-                    gp = pc + p
-                    @simd ivdep for c in 0:(nr - 1)
-                        Bp[base + p * nr + c + 1] = B[gp + 1, j0 + c + 1]
+                # op(B)=B: B[gp, j0+c] — the contiguous B direction is down a column (p), so loop c-outer/
+                # p-inner: each read-stream is one sequential B column (1 stream vs nr strided), stores
+                # scatter into the hot Bp panel. Measured 1.3–1.35× faster pack than p-outer (galen).
+                for c in 0:(nr - 1)
+                    j = j0 + c
+                    @simd ivdep for p in 0:(kce - 1)
+                        Bp[base + p * nr + c + 1] = B[pc + p + 1, j + 1]
                     end
                 end
             end
@@ -396,64 +401,196 @@ end
 # Reusable GEMM packing buffers now live in the per-type L3Workspace (see src/workspace.jl):
 # `_gemm_scratch(T, lenA, lenB)` returns its `gpackA`/`gpackB` fields, grown on demand.
 
+# ── Direct-B microkernels (op(B)=B, no B-pack) ───────────────────────────────────────────────
+# A comes from the packed panel (contiguous, PMR vectors/k-step, VR live rows), but B is read STRAIGHT
+# from the user array: B[pc+p, jc+jr+j] = Bc + p + j·ldb — contiguous in the k-index p (col-major B), so
+# op(B)=B needs NO pack. Eliminates the entire B-pack pass (measured: n=192 0.93→0.98 vs AOCL on galen).
+# alpha is folded in the A-pack (as for _microkernel!), so no alpha here. VR<PMR ⇒ clip (no mask).
+@generated function _microkernel_db!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bc::Ptr{T}, ldb::Int, kc::Int,
+        ::Val{PMR}, ::Val{VR}, ::Val{NR}, ::Val{B0}) where {T, PMR, VR, NR, B0}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for j in 1:NR; push!(body.args, :(_prefetch(C + $(j - 1) * ldc * $sz))); end
+    for mi in 1:VR, j in 1:NR; push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V))); end
+    inner = quote end
+    for mi in 1:VR
+        push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $PMR + $(mi - 1)) * $(W * sz))))
+    end
+    for j in 1:NR
+        push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bc + (p + $(j - 1) * ldb) * $sz))))
+        for mi in 1:VR
+            cs = Symbol(:c, mi, :_, j)
+            push!(inner.args, :($cs = muladd($(Symbol(:a, mi)), $(Symbol(:b, j)), $cs)))
+        end
+    end
+    push!(body.args, :(for p in 0:(kc - 1); $inner; end))
+    for j in 1:NR
+        push!(body.args, :(colp = C + $(j - 1) * ldc * $sz))
+        for mi in 1:VR
+            cs = Symbol(:c, mi, :_, j)
+            st = B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q))
+            push!(body.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Direct-B masked tile: partial rows (mre) via a SIMD mask, partial columns (nre) via a guard. Same
+# packed-A / direct-B split as _microkernel_db!; mirrors _microkernel_masked!'s store masking.
+@generated function _microkernel_db_masked!(C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bc::Ptr{T}, ldb::Int,
+        kc::Int, mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{B0}) where {T, MR, NR, B0}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    lanetuple = Expr(:tuple, (0:(W - 1))...)
+    push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
+    for mi in 1:MR
+        push!(body.args, :($(Symbol(:msk, mi)) = (lanes + $((mi - 1) * W)) < mre))
+    end
+    for mi in 1:MR, j in 1:NR; push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V))); end
+    inner = quote end
+    for mi in 1:MR
+        push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $MR + $(mi - 1)) * $(W * sz))))
+    end
+    for j in 1:NR
+        push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bc + (p + $(j - 1) * ldb) * $sz))))
+        for mi in 1:MR
+            cs = Symbol(:c, mi, :_, j)
+            push!(inner.args, :($cs = muladd($(Symbol(:a, mi)), $(Symbol(:b, j)), $cs)))
+        end
+    end
+    push!(body.args, :(for p in 0:(kc - 1); $inner; end))
+    for j in 1:NR
+        stores = quote end
+        push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz))
+        for mi in 1:MR
+            cs = Symbol(:c, mi, :_, j); mk = Symbol(:msk, mi)
+            st = B0 ? :(vstore($cs, q, $mk)) : :(vstore(vload($V, q, $mk) + $cs, q, $mk))
+            push!(stores.args, :(let q = colp + $((mi - 1) * W * sz); $st; end))
+        end
+        push!(body.args, :(if $(j - 1) < nre; $stores; end))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# One (jc,pc) sweep over the ic panels: pack A, run the microkernels over the nce×mce C-block.
+# ::Val{B0} folds beta==0 on the FIRST kc-block (pc==0) into an OVERWRITE store — skips both the
+# up-front _scale_C! zeroing AND the microkernel's C read-modify-write (~2× C traffic at small n,
+# where k≤kc ⇒ a single kc-block; the measured small-n AOCL gap). Parity with the unpacked path.
+# ::Val{DB} (op(B)=B and B unit row-stride): read B direct (Bp0/ldb), no B-pack — the compile-time
+# branch const-folds; the packed side (DB=false) keeps Bpp for tB / strided-B.
+function _blocked_pc_sweep!(::Val{B0}, ::Val{DB}, Cp0::Ptr{T}, App::Ptr{T}, Bpp::Ptr{T}, Bp0::Ptr{T},
+        Ap, A, jc::Int, pc::Int, m::Int, nce::Int, kce::Int, mc::Int, mr::Int, nr::Int, W::Int,
+        ldc::Int, ldb::Int, sz::Int, tA::Bool, alpha::T) where {T, B0, DB}
+    ic = 0
+    while ic < m
+        mce = min(mc, m - ic)
+        _pack_A!(Ap, A, ic, pc, mce, kce, tA, alpha, mr)
+        jr = 0
+        while jr < nce
+            nre = min(nr, nce - jr)
+            ir = 0
+            while ir < mce
+                mre = min(mr, mce - ir)
+                Apanel = App + (div(ir, mr) * mr * kce) * sz
+                Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
+                if DB
+                    Bc = Bp0 + (pc + (jc + jr) * ldb) * sz   # B[pc, jc+jr]
+                    if mre == mr && nre == nr
+                        _microkernel_db!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb,
+                            kce, Val(_MR), Val(_MR), Val(_NR), Val(B0))
+                    elseif nre == nr && rem(mre, W) == 0
+                        vr = div(mre, W)
+                        if vr == 1
+                            _microkernel_db!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb,
+                                kce, Val(_MR), Val(1), Val(_NR), Val(B0))
+                        elseif vr == 2
+                            _microkernel_db!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb,
+                                kce, Val(_MR), Val(2), Val(_NR), Val(B0))
+                        else
+                            _microkernel_db_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb,
+                                kce, mre, nre, Val(_MR), Val(_NR), Val(B0))
+                        end
+                    else
+                        _microkernel_db_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb,
+                            kce, mre, nre, Val(_MR), Val(_NR), Val(B0))
+                    end
+                else
+                    Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
+                    if mre == mr && nre == nr
+                        _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                            kce, Val(_MR), Val(_NR), Val(B0))
+                    elseif nre == nr && rem(mre, W) == 0   # W-aligned partial rows → clean clip (no mask)
+                        vr = div(mre, W)
+                        if vr == 1
+                            _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                kce, Val(_MR), Val(1), Val(_NR), Val(B0))
+                        elseif vr == 2
+                            _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                kce, Val(_MR), Val(2), Val(_NR), Val(B0))
+                        else
+                            _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                                kce, mre, nre, Val(_MR), Val(_NR), Val(B0))
+                        end
+                    else
+                        _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                            kce, mre, nre, Val(_MR), Val(_NR), Val(B0))
+                    end
+                end
+                ir += mr
+            end
+            jr += nr
+        end
+        ic += mc
+    end
+    return nothing
+end
+
 # Blocked real GEMM (the optimized path). C must have unit column stride (pointer + vstore).
 function _gemm_blocked!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal}
-    _scale_C!(C, m, n, beta)
-    (iszero(alpha) || k == 0) && return C
+    if iszero(alpha) || k == 0
+        _scale_C!(C, m, n, beta)   # nothing to accumulate ⇒ C := βC (or 0)
+        return C
+    end
+    b0first = iszero(beta)             # β=0 ⇒ overwrite on the first kc-block; no zeroing, no RMW read
+    b0first || _scale_C!(C, m, n, beta)
+    # op(B)=B with unit row-stride ⇒ read B direct in the microkernel (no B-pack, B is contiguous in k).
+    db = !tB && _strided1(B)
     W = _vwidth(T); mr = _MR * W; nr = _NR
     # Cap block sizes by the actual problem so small GEMMs don't allocate/pack huge panels.
     kc = min(_KC, k)
     mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
+    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, db ? 0 : cld(nc, nr) * nr * kc)
+    ldc = stride(C, 2); ldb = stride(B, 2); sz = sizeof(T)
+    GC.@preserve C Ap Bp B begin
+        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp); Bp0 = db ? pointer(B) : Bpp
         jc = 0
         while jc < n
             nce = min(nc, n - jc)
             pc = 0
             while pc < k
                 kce = min(kc, k - pc)
-                _pack_B!(Bp, B, pc, jc, kce, nce, tB, nr)
-                ic = 0
-                while ic < m
-                    mce = min(mc, m - ic)
-                    _pack_A!(Ap, A, ic, pc, mce, kce, tA, alpha, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr)
-                        ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                            Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            if mre == mr && nre == nr
-                                _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                                    kce, Val(_MR), Val(_NR))
-                            elseif nre == nr && rem(mre, W) == 0   # W-aligned partial rows → clean clip (no mask)
-                                vr = div(mre, W)
-                                if vr == 1
-                                    _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                                        kce, Val(_MR), Val(1), Val(_NR))
-                                elseif vr == 2
-                                    _microkernel_clip!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                                        kce, Val(_MR), Val(2), Val(_NR))
-                                else
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                                        kce, mre, nre, Val(_MR), Val(_NR))
-                                end
-                            else
-                                _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                                    kce, mre, nre, Val(_MR), Val(_NR))
-                            end
-                            ir += mr
-                        end
-                        jr += nr
+                db || _pack_B!(Bp, B, pc, jc, kce, nce, tB, nr)
+                b0 = b0first && pc == 0     # concrete-Val dispatch (trim-safe: no Union{Val}→Any)
+                if db
+                    if b0
+                        _blocked_pc_sweep!(Val(true), Val(true), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha)
+                    else
+                        _blocked_pc_sweep!(Val(false), Val(true), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha)
                     end
-                    ic += mc
+                else
+                    if b0
+                        _blocked_pc_sweep!(Val(true), Val(false), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha)
+                    else
+                        _blocked_pc_sweep!(Val(false), Val(false), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha)
+                    end
                 end
                 pc += kc
             end
