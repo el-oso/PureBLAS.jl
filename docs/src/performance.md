@@ -72,8 +72,11 @@ epilogue (shared with complex gemv-T/C). Residuals: `zaxpy` at the L3 edge (0.94
 Gates broadly on all three boxes. The complex gemv-T/C small-n dip on AVX-512 (was 0.68–0.74 at
 n=32) is closed by a parity-preserving fold epilogue (Vec{2W} deinterleave + two horizontal sums →
 one halving fold to [Σeven,Σodd]); `zgemvN` on Zen5 (was ~0.91 across small/mid n) by sign-folding
-the `ci` broadcast so the per-row epilogue drops an FMA-port op. Remaining worst-size dips are shallow
-(0.93–0.97): `ztrmv`/`ztrsv` large-n (Zen4/Zen5), `zgeru` mid-n, `zhemv` large-n, `zgemvN` Zen5 at n=512.
+the `ci` broadcast so the per-row epilogue drops an FMA-port op. `ztrsv`/`ztrmv` large-n on AVX-512
+were closed (2048: 0.97→1.22) by routing the triangular off-diagonal scatter through the tuned `ri`
+gemv — a stale branch had used the older row-tile kernel. Remaining shallow residuals: `ztrsv` n=1024
+(~0.91, a coupled upper/lower-triangular tradeoff), `zgeru` mid-n and `zhemv` large-n (~0.97, near the
+DRAM roofline), and `zgemvN` Zen5 at n=512.
 
 ![Complex BLAS-3 — three µarchs](assets/perf_cl3.svg)
 
@@ -88,16 +91,20 @@ and reverted.)
 
 ![Complex LAPACK — three µarchs](assets/perf_clapack.svg)
 
-`zpotrf` gates fleet-wide and `zgetrf` is close (Zen3 worst 0.80). `zgeqrf` **now gates at every
-size fleet-wide** (1.07–1.83; was geomean 0.76–0.85): the complex trailing update was rebuilt to mirror
-the real path (`herk` for VᴴV at half the flops + `trmm` for TᴴW), the reflector norm moved from
-per-element `hypot` to SIMD `_nrm2`, the unblocked rank-2 panel now runs while the matrix is L3-resident,
-and the AVX2 trailing update is chunked to bound the Karatsuba-3M scratch below ½L3. `zgesvd` — singular
-values only, vs `zgesdd('N')` — **no longer collapses**: the complex bidiagonalization is now blocked
-(zlabrd/zgebrd port), so n≥128 gates fleet-wide (1.07–1.74) where it was 0.05–0.23, and ComplexF32
-singular values work for the first time. n=32 sits at 0.94–1.0, a shared small-n BLAS-2 bidiag floor
-(the real values path dips identically). `zgeqrf` was validated on square inputs; tall/skinny QR is a
-separate benchmark shape.
+`zpotrf` gates fleet-wide. `zgetrf` **now gates fleet-wide** (was Zen3 worst 0.80): a rank-2
+SIMD-`izamax` `getf2` panel, a derived complex block width, a base-32 crossover, and a po2-aliasing-dodge
+scratch. The only residual is galen n=256 (0.94), localized to PB's complex gemm at the trailing
+208×208×48 shape (a gemm-kernel gap, not a getrf-structure one). `zgeqrf` **gates at every size
+fleet-wide** (1.07–1.83; was geomean 0.76–0.85): the complex trailing update was rebuilt to mirror the
+real path (`herk` for VᴴV at half the flops + `trmm` for TᴴW), the reflector norm moved from per-element
+`hypot` to SIMD `_nrm2`, the unblocked rank-2 panel runs while the matrix is L3-resident, and the AVX2
+trailing update is chunked to bound the Karatsuba-3M scratch below ½L3. `zgesvd` — singular values only,
+vs `zgesdd('N')` — **gates at every size** (real + ComplexF64): the large-n collapse was fixed by a
+blocked complex bidiagonalization (zlabrd/zgebrd port), and the small-n floor by switching the values
+path to **dqds** (`dlasq1–6`) — OpenBLAS's `gesdd('N')` uses the sqrt-free dqds recurrence, not
+Golub–Kahan QR; matching it lifted n=32 from ~0.86 to ~1.07 (real *and* complex, since the bidiagonal is
+real). ComplexF32 small-n (n=32/48 ≈ 0.9) is the remaining sub-gate, a `cgebrd` limit. `zgeqrf` was
+validated on square inputs; tall/skinny QR is a separate benchmark shape.
 
 ## Numeric summary
 
