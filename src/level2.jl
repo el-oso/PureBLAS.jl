@@ -1074,17 +1074,121 @@ end
     end
 end
 
-# Complex hemv (A Hermitian, `up` triangle stored, diagonal real): y := β·y + α·A·x. One fused pass over
-# each stored column (off-diagonal axpy+conj-dot), then the real-diagonal term. Reuses the fused kernel.
+# Blocked off-diagonal rectangle for complex hemv: NB stored columns processed TOGETHER so each x/y
+# row-tile is read ONCE across all NB columns (the per-column kernel above re-reads x/y once PER column
+# — fine while x,y fit L1, but it collapses when they spill, e.g. n≥1024: measured PB 33→23 GB/s vs
+# AOCL's ~38 as n grows). Each A element is still read once, feeding BOTH its column axpy (y += tmp_c·a)
+# and its conj-dot (s_c += conj(a)·x_row) — same swap-adjacent idiom as `_hemv_col_cmplx!`. `arp` → the
+# rectangle's top-left A element (reals); M rows; `ldc` = A complex column stride; `xrp`/`yrp` → the
+# x/y row-segment; `xcp` → x at the NB panel columns. Returns ((sr₁,si₁),…) partial conj-dots per col.
+# A-stream software prefetch in the blocked rect kernel — AVX2 only (matches `_CGEMVN_PF`: the narrow
+# machine's HW prefetcher can't sustain the NB concurrent A column streams; +192 B prefetch hides the
+# DRAM latency that leaves PB below AOCL at n≥2048. AVX-512 boxes don't need it — override via Preference.
+const _ZHEMV_PF = @load_preference("zhemv_pf", _vwidth(Float64) == 4)::Bool
+# Prefetch distance in row-tiles (1 tile = W complex = one 64 B line @ W=4). The large-n A read sits
+# deep in DRAM (n≥2048 ⇒ A ≫ L3), so hemv wants a longer look-ahead than gemvN's 3 lines to cover the
+# ~hundreds-of-cycles DRAM latency; empirical (a latency behaviour, not a datasheet number) — Preference.
+const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
+
+@generated function _hemv_rect_cmplx!(M::Int, arp::Ptr{T}, ldc::Int, xrp::Ptr{T}, yrp::Ptr{T},
+        xcp::Ptr{T}, αr::T, αi::T, ::Val{NB}) where {T<:BlasReal, NB}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    body = quote end
+    for c in 1:NB                                              # tmp_c = α·x[col_c]; conj-dot accumulators
+        push!(body.args, quote
+            xcr = unsafe_load(xcp, $(2c - 1)); xci = unsafe_load(xcp, $(2c))
+            $(Symbol(:cr, c)) = αr * xcr - αi * xci; $(Symbol(:ci, c)) = αr * xci + αi * xcr
+            $(Symbol(:crv, c)) = $V2($(Symbol(:cr, c)))
+            $(Symbol(:csgn, c)) = $V2($(Expr(:tuple, (iseven(l) ? :(-$(Symbol(:ci, c))) : Symbol(:ci, c) for l in 0:(2W - 1))...)))
+            $(Symbol(:pac, c)) = zero($V2); $(Symbol(:qac, c)) = zero($V2)
+        end)
+    end
+    loop = quote                                              # one W-complex row-tile, all NB columns
+        o = i * 2 * $sz
+        yv = vload($V2, yrp + o); xv = vload($V2, xrp + o); xsw = shufflevector(xv, Val($swp))
+    end
+    for c in 1:NB
+        push!(loop.args, quote
+            av = vload($V2, arp + o + $((c - 1)) * ldc * 2 * $sz)
+            yv = muladd(av, $(Symbol(:crv, c)), yv); yv = muladd(shufflevector(av, Val($swp)), $(Symbol(:csgn, c)), yv)
+            $(Symbol(:pac, c)) = muladd(av, xv, $(Symbol(:pac, c))); $(Symbol(:qac, c)) = muladd(av, xsw, $(Symbol(:qac, c)))
+        end)
+        # A-stream prefetch, +3 complex-tiles (192 B @ W=4) ahead per column, like the gemvN panel's
+        # _CGEMVN_PF: hides the DRAM latency of the large-n A read (the residual vs AOCL at n≥2048).
+        _ZHEMV_PF && push!(loop.args, :(_prefetch(arp + o + $((c - 1)) * ldc * 2 * $sz + $(_ZHEMV_PF_TILES * 2W * sz))))
+    end
+    push!(loop.args, :(vstore(yv, yrp + o)))
+    push!(body.args, :(i = 0; while i + $W <= M; $loop; i += $W; end))
+    for c in 1:NB                                              # reduce: conj(a)·x = (ar·xr+ai·xi)+i(ar·xi−ai·xr)
+        push!(body.args, quote
+            (prc, pic) = _deint_cmplx($(Symbol(:pac, c))); (qrc, qic) = _deint_cmplx($(Symbol(:qac, c)))
+            $(Symbol(:sr, c)) = sum(prc) + sum(pic); $(Symbol(:si, c)) = sum(qrc) - sum(qic)
+        end)
+    end
+    rem = quote                                               # scalar row remainder (< W rows), all NB cols
+        j2 = 2i; xrr = unsafe_load(xrp, j2 + 1); xri = unsafe_load(xrp, j2 + 2)
+    end
+    for c in 1:NB
+        push!(rem.args, quote
+            ar = unsafe_load(arp, j2 + 1 + $((c - 1)) * ldc * 2); ai = unsafe_load(arp, j2 + 2 + $((c - 1)) * ldc * 2)
+            unsafe_store!(yrp, unsafe_load(yrp, j2 + 1) + $(Symbol(:cr, c)) * ar - $(Symbol(:ci, c)) * ai, j2 + 1)
+            unsafe_store!(yrp, unsafe_load(yrp, j2 + 2) + $(Symbol(:cr, c)) * ai + $(Symbol(:ci, c)) * ar, j2 + 2)
+            $(Symbol(:sr, c)) += ar * xrr + ai * xri; $(Symbol(:si, c)) += ar * xri - ai * xrr
+        end)
+    end
+    push!(body.args, :(@inbounds while i < M; $rem; i += 1; end))
+    push!(body.args, Expr(:return, Expr(:tuple, (Expr(:tuple, Symbol(:sr, c), Symbol(:si, c)) for c in 1:NB)...)))
+    return body
+end
+
+# Complex hemv panel width: 2 conj-dot Vec{2W} accumulators per column ⇒ 4 physical vector regs/column
+# (a Vec{2W} legalizes to 2 regs on both AVX2 and AVX-512). Reserve half the architectural vector regs
+# (_NVREG: 16 AVX2 / 32 AVX-512) for accumulators, rest for the x/y/A working set ⇒ AVX2→2, AVX-512→4.
+const _ZHEMV_NB = clamp((_NVREG ÷ 2) ÷ 4, 1, 4)
+
+# Complex hemv (A Hermitian, `up` triangle stored, diagonal real): y := β·y + α·A·x. Off-diagonal work
+# is done in NB-column panels (`_hemv_rect_cmplx!`, blocked → x/y-traffic-efficient at large n); the tiny
+# NB×NB diagonal triangle + real-diagonal term are finished per column (mirrors the reference recurrence).
 function _hemv_cmplx!(up::Bool, n::Int, α::Complex{T}, A, x, β::Complex{T}, y) where {T<:BlasReal}
     _scale_y!(n, β, y, 1)                                       # β·y (complex scal via _scal_cmplx_simd!)
     iszero(α) && return y
-    sz = sizeof(T)
+    NB = _ZHEMV_NB; sz = sizeof(T); αr = real(α); αi = imag(α)
     GC.@preserve A x y begin
         Ap = Ptr{T}(pointer(A)); xp = Ptr{T}(pointer(x)); yp = Ptr{T}(pointer(y))
         Apc = Ptr{Complex{T}}(pointer(A)); xpc = Ptr{Complex{T}}(pointer(x)); ypc = Ptr{Complex{T}}(pointer(y))
         ldc = stride(A, 2)
-        @inbounds for j in 1:n
+        jb = 0
+        @inbounds while jb + NB <= n                           # full NB-column panels
+            if up                                              # rectangle = rows 0:jb-1 (above the block)
+                s = _hemv_rect_cmplx!(jb, Ap + jb * 2 * ldc * sz, ldc, xp, yp, xp + jb * 2 * sz, αr, αi, Val(NB))
+            else                                               # rectangle = rows jb+NB:n-1 (below the block)
+                r0 = jb + NB
+                s = _hemv_rect_cmplx!(n - r0, Ap + (r0 + jb * ldc) * 2 * sz, ldc, xp + r0 * 2 * sz, yp + r0 * 2 * sz,
+                                      xp + jb * 2 * sz, αr, αi, Val(NB))
+            end
+            for c in 1:NB                                      # NB×NB diagonal triangle + real diagonal, per col
+                j = jb + c                                     # 1-based column index
+                tmp = α * unsafe_load(xpc, j)
+                sc = Complex{T}(s[c][1], s[c][2])
+                if up
+                    for i in (jb + 1):(j - 1)                  # intra-block strictly-upper rows
+                        aij = unsafe_load(Apc, (j - 1) * ldc + i)
+                        unsafe_store!(ypc, unsafe_load(ypc, i) + tmp * aij, i); sc += conj(aij) * unsafe_load(xpc, i)
+                    end
+                else
+                    for i in (j + 1):(jb + NB)                 # intra-block strictly-lower rows
+                        aij = unsafe_load(Apc, (j - 1) * ldc + i)
+                        unsafe_store!(ypc, unsafe_load(ypc, i) + tmp * aij, i); sc += conj(aij) * unsafe_load(xpc, i)
+                    end
+                end
+                ajj = unsafe_load(Ap, ((j - 1) * ldc + (j - 1)) * 2 + 1)     # real(A[j,j])
+                unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * sc, j)
+            end
+            jb += NB
+        end
+        @inbounds while jb < n                                 # tail columns (< NB): per-column kernel
+            j = jb + 1
             tmp = α * unsafe_load(xpc, j)
             L = up ? (j - 1) : (n - j)
             sr = zero(T); si = zero(T)
@@ -1095,6 +1199,7 @@ function _hemv_cmplx!(up::Bool, n::Int, α::Complex{T}, A, x, β::Complex{T}, y)
             end
             ajj = unsafe_load(Ap, ((j - 1) * ldc + (j - 1)) * 2 + 1)     # real(A[j,j])
             unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{T}(sr, si), j)
+            jb += 1
         end
     end
     return y
