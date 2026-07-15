@@ -161,7 +161,23 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:B
     end
     return true
 end
-const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune if needed
+# Blocked-QR panel width (real), DERIVED (req#8; was a flat literal 32). The unblocked rank-1/2 panel is
+# BLAS-2 (cost ∝ m·nb² per panel); the blocked trailing update is gemm (efficient once nb ≳ the register
+# tile ≈ _vwidth). So the panel wants the SMALLEST nb that keeps the trailing gemm efficient (= _vwidth),
+# growing only when the matrix spills L2 and the trailing re-streams from DRAM (sweep traffic ∝ k/nb) —
+# one _vwidth per L2-overflow, capped at 4·_vwidth where the BLAS-2 panel share (≈0.75·nb/n) starts to
+# bite. MEASURED Zen4 (vw=8, L2=1MB): 8 (n≤256) → 16 (384–512) → 32 (≥768), each within ~2% of the
+# nb-sweep optimum, vs the old flat nb=32 which lost 20–50% at n=48–256 (and caused the n=48 AOCL gate
+# miss). Tall (large m·n) caps at 32 = the old value (no regression — [[pureblas-getrf-campaign]] found
+# growth ABOVE 32 hurts tall). Keyed _vwidth + _L2_BYTES. NEEDS Zen3/Zen5 fleet validation (req#8b).
+@inline _qr_nb(m::Int, n::Int) = clamp(_vwidth(Float64) * cld(m * n * sizeof(Float64), _L2_BYTES),
+    _vwidth(Float64), 4 * _vwidth(Float64))
+# Unblocked→blocked crossover (real): the SIMD rank-2 unblocked panel beats the blocked WY path only while
+# the matrix is TINY (n≤32 on Zen4) — real blocked-nb=_vwidth is efficient enough to win from n≈48 up.
+# (Contrast the complex path at qr.jl:_zqr_unblk_max, whose stronger BLAS-2 panel stays ahead to ~½L3.)
+# Pinned at 4·_vwidth = the old flat _QR_NB (=32 Zen4), preserving the measured n≤32 unblocked win,
+# decoupled from the now-variable nb. Dim-wise (not m·n) so a tall-skinny front stays unblocked.
+const _QR_UNBLK_MAX = 4 * _vwidth(Float64)
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
@@ -272,15 +288,16 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Ma
     end
     return V, Tm, G, Wb, Vt
 end
-function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
+function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = 0)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
-    nb = clamp(nb, 1, k)
-    if k <= nb && n <= nb                     # single panel, no trailing update — no workspace needed
+    # Tiny matrix → single unblocked panel (BLAS-2 rank-2 beats the blocked WY path there; no workspace).
+    if k <= _QR_UNBLK_MAX && n <= _QR_UNBLK_MAX
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
         return A
     end
+    nb = clamp(nb > 0 ? nb : _qr_nb(m, n), 1, k)    # nb>0 = caller override (tuning); else derive
     V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
     pc = 1
     @inbounds while pc <= k
