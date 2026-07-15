@@ -161,7 +161,27 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:B
     end
     return true
 end
-const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune if needed
+# Blocked-QR panel width (real), DERIVED (req#8; was a flat literal 32). The unblocked panel is BLAS-2
+# (cost ∝ m·nb²/panel); the blocked trailing update is gemm. The panel wants the SMALLEST nb that keeps
+# the trailing gemm efficient, growing as the matrix spills L2 and re-streams from DRAM (sweep ∝ k/nb).
+# CRITICAL — the floor keys on REGISTER COUNT, not vector width, because the µarch relationship INVERTS:
+# fewer vector registers (AVX2's 16 vs AVX-512's 32) ⇒ a smaller gemm microkernel tile ⇒ the trailing
+# update needs a DEEPER panel to amortize it, so nb_floor ∝ 1/_NVREG. Fleet-calibrated scale 256 (=
+# measured Zen4 floor 8 · _NVREG 32): Zen4/Zen5 (32 regs) → floor 8, Zen3 (16 regs) → floor 16. Grow one
+# floor per L2-overflow of the matrix; cap 32 (µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs — the
+# BLAS-2 panel share ≈0.75·nb/n bites there; also = old flat value, so tall/large-m·n caps at 32 = no
+# regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 galen (16→24→32),
+# formula reproduces both within ~5% (req#8b). Zen5 predicted = Zen4 (same NVREG/vw/L2) — needs confirm.
+@inline _qr_nb(m::Int, n::Int) = (fl = 256 ÷ _NVREG;
+    clamp(fl * cld(m * n * sizeof(Float64), _L2_BYTES), fl, 32))
+# Unblocked→blocked crossover (real): the SIMD rank-2 unblocked panel beats the blocked WY path only while
+# the matrix is TINY (measured n≤32 on Zen4) — blocked-nb is efficient enough to win from n≈48 up. Pinned
+# at 32 = the old flat _QR_NB, PRESERVING master's n≤32 unblocked crossover on every µarch (decoupled from
+# the now-variable nb). Dim-wise (not m·n) so a tall-skinny front stays unblocked. Kept fixed rather than
+# vwidth-scaled: the per-µarch unblocked crossover is unmeasured off Zen4 (a separate minor lever), and a
+# vw-scaled 16 would shrink Zen3's proven master range n≤32→16 with no data. ponytail: derive when fleet
+# unblocked-crossover data exists; preserving validated behavior beats an unvalidated formula here (req#8b).
+const _QR_UNBLK_MAX = 32
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
@@ -272,15 +292,16 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Ma
     end
     return V, Tm, G, Wb, Vt
 end
-function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
+function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = 0)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
-    nb = clamp(nb, 1, k)
-    if k <= nb && n <= nb                     # single panel, no trailing update — no workspace needed
+    # Tiny matrix → single unblocked panel (BLAS-2 rank-2 beats the blocked WY path there; no workspace).
+    if k <= _QR_UNBLK_MAX && n <= _QR_UNBLK_MAX
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
         return A
     end
+    nb = clamp(nb > 0 ? nb : _qr_nb(m, n), 1, k)    # nb>0 = caller override (tuning); else derive
     V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
     pc = 1
     @inbounds while pc <= k
