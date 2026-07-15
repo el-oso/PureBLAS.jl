@@ -2031,14 +2031,13 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
                 _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
             # Whole-k packed sweep (shared solved-X panel, no recursion / re-pack). AVX-512-f64, large-k only.
             return _trsm_fused_full_L!(unit, A, B)
-        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B) &&
-                (_GT_TRANSPOSE || size(B, 2) <= _TRSM_FUSED_BASE)
-            # Fused gemmtrsm leaf (1× flop). AVX-512 (transpose pack): fires at EVERY k ≤ base diagonal block,
-            # including the ones the n≥256 recursion descends into (B width unbounded — the leaf stripes over
-            # B's columns). The recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block
-            # is fused (1× flop) vs invL's 2×-flop bases → beats invL fleet-wide on this box (n=256 0.85→0.93
-            # vs AOCL). Non-AVX-512: restricted to the single-leaf regime (size(B,2) ≤ base) — the scalar-pack
-            # leaf's wide-B behaviour isn't fleet-validated from here, so keep the shipped-safe gating.
+        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
+            # Fused gemmtrsm leaf (1× flop). Fires at EVERY k ≤ base diagonal block, INCLUDING the ones the
+            # n≥256 recursion descends into (B width unbounded — the leaf stripes over B's columns). The
+            # recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block is fused (1× flop)
+            # vs invL's 2×-flop k=32 leaves. The old `size(B,2) ≤ base` restriction (AVX2 only) sent wide-B
+            # n≥256 to those k=32 invL leaves instead — the whole AVX2 n≥256 gap (Fable-diagnosed 2026-07-15;
+            # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
