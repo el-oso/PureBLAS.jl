@@ -1581,6 +1581,54 @@ end
      shufflevector(u0, u4, Val((4,5,6,7,12,13,14,15))), shufflevector(u1, u5, Val((4,5,6,7,12,13,14,15))),
      shufflevector(u2, u6, Val((4,5,6,7,12,13,14,15))), shufflevector(u3, u7, Val((4,5,6,7,12,13,14,15))))
 end
+# 4×4 register transpose (AVX2, Vec{4,Float64}) — the W==4 mirror of _tr8x8 (8 shufflevectors). Turns 4
+# B-columns (loaded as 4 Vec{4} rows) into 4 transposed rows for the row-major P pack (Fable lever 2).
+@inline function _tr4x4(r0::V, r1::V, r2::V, r3::V) where {V}
+    t0 = shufflevector(r0, r1, Val((0,4,2,6))); t1 = shufflevector(r0, r1, Val((1,5,3,7)))
+    t2 = shufflevector(r2, r3, Val((0,4,2,6))); t3 = shufflevector(r2, r3, Val((1,5,3,7)))
+    (shufflevector(t0, t2, Val((0,1,4,5))), shufflevector(t1, t3, Val((0,1,4,5))),
+     shufflevector(t0, t2, Val((2,3,6,7))), shufflevector(t1, t3, Val((2,3,6,7))))
+end
+# AVX2 vectorized transpose pack (W==4): B[:,jc:jc+wid) → P row-major via 4×4 transpose for full 4-row×4-col
+# blocks, scalar tails/zero-pad. Replaces the scalar rowouter/column-outer pack (Fable: ~20-25% of the AVX2
+# leaf's cycles). Same row-major P layout the slab reads — no microkernel change.
+@inline function _fused_packP_tr4!(Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
+        KC::Int, NR::Int, sz::Int)
+    V = Vec{4, Float64}; ng = (KC >> 2) << 2; ncg = (wid >> 2) << 2
+    @inbounds for i0 in 0:4:ng-1, vb in 0:4:ncg-1
+        b = pB + (i0 + (jc + vb) * ldb) * sz
+        x0 = vload(V, b); x1 = vload(V, b + ldb*sz); x2 = vload(V, b + 2ldb*sz); x3 = vload(V, b + 3ldb*sz)
+        y0,y1,y2,y3 = _tr4x4(x0,x1,x2,x3)
+        p = Pp + (i0 * NR + vb) * sz
+        vstore(y0, p); vstore(y1, p + NR*sz); vstore(y2, p + 2NR*sz); vstore(y3, p + 3NR*sz)
+    end
+    @inbounds for v in ncg:wid-1                          # tail columns (contiguous B reads down the column)
+        scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
+        for i in 0:KC-1; unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + i * sz)); end
+    end
+    @inbounds for i in ng:KC-1                            # tail rows (only full-col groups left)
+        for v in 0:ncg-1; unsafe_store!(Pp + (i*NR + v)*sz, unsafe_load(pB + (i + (jc+v)*ldb)*sz)); end
+    end
+    @inbounds for v in wid:NR-1, i in 0:KC-1; unsafe_store!(Pp + (i*NR + v)*sz, zero(Float64)); end
+end
+@inline function _fused_unpackP_tr4!(Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
+        KC::Int, NR::Int, sz::Int)
+    V = Vec{4, Float64}; ng = (KC >> 2) << 2; ncg = (wid >> 2) << 2
+    @inbounds for i0 in 0:4:ng-1, vb in 0:4:ncg-1
+        p = Pp + (i0 * NR + vb) * sz
+        y0 = vload(V, p); y1 = vload(V, p + NR*sz); y2 = vload(V, p + 2NR*sz); y3 = vload(V, p + 3NR*sz)
+        x0,x1,x2,x3 = _tr4x4(y0,y1,y2,y3)
+        b = pB + (i0 + (jc + vb) * ldb) * sz
+        vstore(x0, b); vstore(x1, b + ldb*sz); vstore(x2, b + 2ldb*sz); vstore(x3, b + 3ldb*sz)
+    end
+    @inbounds for v in ncg:wid-1
+        scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
+        for i in 0:KC-1; unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NR * sz)); end
+    end
+    @inbounds for i in ng:KC-1
+        for v in 0:ncg-1; unsafe_store!(pB + (i + (jc+v)*ldb)*sz, unsafe_load(Pp + (i*NR + v)*sz)); end
+    end
+end
 # Pack B[:,jc:jc+wid) → P row-major (row i at Pp+i·NR) via 8×8 transpose for full 8-row × 8-col blocks;
 # scalar column-outer for the ragged row/col tails and the wid:NR zero-pad. Contiguous B reads throughout.
 @inline function _fused_packP_tr!(Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
@@ -1686,6 +1734,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # column-lane back-sub needs the transpose. The fusedT slab (below) removes the P round-trip but not
         # the aliasing. Escaping it needs the row-lane microkernel family (Fable: net-negative — deferred).
         useT = _GT_TRANSPOSE
+        useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
         jc = 0
@@ -1707,6 +1756,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
             end
             if useT
                 _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+            elseif useT4                                  # AVX2 vectorized 4×4 transpose pack (lever 2)
+                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NR, sz)
             elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
                 @inbounds for i in 0:KC-1
                     srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NR * sz
@@ -1728,6 +1779,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
             end
             if useT
                 _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+            elseif useT4
+                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NR, sz)
             elseif rowouter
                 @inbounds for i in 0:KC-1                 # unpack P → B row-outer (contiguous P reads)
                     srow = Pp + i * NR * sz; drow = pB + (i + jc * ldb) * sz
@@ -2031,14 +2084,13 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
                 _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
             # Whole-k packed sweep (shared solved-X panel, no recursion / re-pack). AVX-512-f64, large-k only.
             return _trsm_fused_full_L!(unit, A, B)
-        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B) &&
-                (_GT_TRANSPOSE || size(B, 2) <= _TRSM_FUSED_BASE)
-            # Fused gemmtrsm leaf (1× flop). AVX-512 (transpose pack): fires at EVERY k ≤ base diagonal block,
-            # including the ones the n≥256 recursion descends into (B width unbounded — the leaf stripes over
-            # B's columns). The recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block
-            # is fused (1× flop) vs invL's 2×-flop bases → beats invL fleet-wide on this box (n=256 0.85→0.93
-            # vs AOCL). Non-AVX-512: restricted to the single-leaf regime (size(B,2) ≤ base) — the scalar-pack
-            # leaf's wide-B behaviour isn't fleet-validated from here, so keep the shipped-safe gating.
+        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
+            # Fused gemmtrsm leaf (1× flop). Fires at EVERY k ≤ base diagonal block, INCLUDING the ones the
+            # n≥256 recursion descends into (B width unbounded — the leaf stripes over B's columns). The
+            # recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block is fused (1× flop)
+            # vs invL's 2×-flop k=32 leaves. The old `size(B,2) ≤ base` restriction (AVX2 only) sent wide-B
+            # n≥256 to those k=32 invL leaves instead — the whole AVX2 n≥256 gap (Fable-diagnosed 2026-07-15;
+            # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
