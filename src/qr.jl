@@ -161,7 +161,7 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:B
     end
     return true
 end
-const _QR_NB = 32     # blocked panel width; ponytail: hand-set for Zen4, tune if needed
+const _QR_NB = @load_preference("qr_nb", 32)::Int   # blocked panel width BASE; grown per m·n vs cache by _qr_nb (req#8). Overridable "qr_nb".
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
@@ -180,6 +180,14 @@ const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # the whole range (nb=32 dips at n≥896, nb=64 dips at n≈320). Overridable base "qr_nb_c".
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
     clamp(_QR_NB_C * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB_C, 4 * _QR_NB_C)
+# Blocked panel width (REAL), derived — mirrors _zqr_nb's structure: grow nb with how many times the matrix
+# exceeds ¼L3 so the trailing-gemm DRAM-sweep traffic (∝ k/nb) stays bounded, capped at 4× where the BLAS-2
+# panel share (≈0.75·nb/n) begins to bite. Replaces the flat _QR_NB literal (was a req#8 violation; qr_block_size
+# and geqrf!'s default route through this). CAVEAT (req#8b): the ¼L3 divisor + 4× cap are INHERITED from the
+# fleet-validated complex path pending REAL-path validation — real gemm's higher throughput may shift the
+# cache-spill crossovers, so this must be re-measured n≥2048 on Zen4/Zen3/Zen5 before it's trusted to extrapolate.
+@inline _qr_nb(::Type{T}, m::Int, n::Int) where {T} =
+    clamp(_QR_NB * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB, 4 * _QR_NB)
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
@@ -272,7 +280,7 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}((Matrix{Float64}(undef, 0, 0), Ma
     end
     return V, Tm, G, Wb, Vt
 end
-function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _QR_NB)
+function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = _qr_nb(Float64, size(A, 1), size(A, 2)))
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))

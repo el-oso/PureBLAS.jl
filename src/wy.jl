@@ -107,7 +107,7 @@ end
 Query PureBLAS's own derived QR panel width for an m×n problem (the `geqrf!`/`_QR_NB` sizing
 logic, made queryable — design_qr_m5b.md §A7.1: PureSparse's frontal block width must be
 PureBLAS-derived, never a PureSparse literal, mirroring `faer`'s own `recommended_block_size`
-query as precedent, not spec). Float64 only (the tuned path); mirrors `_QR_NB`'s current
-hand-set-but-overridable-via-Preferences status (`qr.jl`).
+query as precedent, not spec). Float64 only (the tuned path); grows with the m×n cache footprint
+via `_qr_nb` (`qr.jl`), base overridable via the `qr_nb` Preference.
 """
-qr_block_size(m::Int, n::Int) = _QR_NB
+qr_block_size(m::Int, n::Int) = _qr_nb(Float64, m, n)
