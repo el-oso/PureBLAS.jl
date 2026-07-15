@@ -448,12 +448,19 @@ end
         push!(body.args, :($(Symbol(:msk, mi)) = (lanes + $((mi - 1) * W)) < mre))
     end
     for mi in 1:MR, j in 1:NR; push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V))); end
+    # DIRECT B has no column padding (unlike the packed panel), so a partial-column tile (nre < NR) must
+    # NOT read columns j-1 ≥ nre — that walks off B's last column → OOB (flaky segfault when B's tail is
+    # near an unmapped page). Clamp each column's read to the last valid column (nre-1); the c_mi_j for
+    # j-1 ≥ nre is then garbage but is never stored (the store below guards `if (j-1) < nre`). nre ≥ 1.
+    for j in 1:NR
+        push!(body.args, :($(Symbol(:bcol, j)) = min($(j - 1), nre - 1)))
+    end
     inner = quote end
     for mi in 1:MR
         push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $MR + $(mi - 1)) * $(W * sz))))
     end
     for j in 1:NR
-        push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bc + (p + $(j - 1) * ldb) * $sz))))
+        push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bc + (p + $(Symbol(:bcol, j)) * ldb) * $sz))))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
             push!(inner.args, :($cs = muladd($(Symbol(:a, mi)), $(Symbol(:b, j)), $cs)))
