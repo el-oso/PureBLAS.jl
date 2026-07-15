@@ -1374,9 +1374,19 @@ end
 const _GT_NREG = _SIMD_BYTES >= 64 ? 32 : 16
 const _GT_NRV = @load_preference("gemmtrsm_nrv", _GT_NREG >= 32 ? 3 : 2)::Int
 const _GT_MR  = @load_preference("gemmtrsm_mr",  min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV))::Int
-# Fused-leaf block size: bigger KC ⇒ smaller solve fraction, bounded by KC×KC U ⊆ L2. ponytail: 128
-# (= _L3_NB, the block-scratch analog) is safe/measured; knob to sweep 256. Recursion above feeds it.
-const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base", 128)::Int
+const _GT_W   = _vwidth(Float64)                  # fused leaf is f64-only; SIMD lanes over RHS columns
+const _GT_NR  = _GT_NRV * _GT_W                   # columns per stripe (SIMD-lane block width)
+# The vectorized 8×8-transpose pack (contiguous B reads, po2-immune, ~5% stripe vs the scalar 15%) is
+# AVX-512-f64-specific (needs W==8 lanes). On W≠8 the leaf uses the scalar pack + the orientation predicate.
+const _GT_TRANSPOSE = (_GT_W == 8)
+# Fused-leaf k-cutoff. The recursion feeds the largest ½-split ≤ base; a bigger leaf runs MORE of its internal
+# off-diagonal at the ~35-GF leaf rate instead of the recursion's ~43-GF peak, so keep it modest. AVX-512:
+# DERIVE from the P-stripe ½-L1 residency — the KC×NR row-major P stripe is packed+solved per stripe, cap it
+# at KC·NR·sizeof ≤ ½·L1 ⇒ 85 on Zen4 (feeds 64-row leaves, the measured Zen4/AVX-512 optimum). Non-AVX-512:
+# keep the shipped 128 single-leaf cutoff — the scalar-pack leaf's optimum can't be fleet-validated from this
+# AVX-512 dev box, so it stays as committed (req#8 Preferences-override still applies for calibration).
+const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base",
+    _GT_TRANSPOSE ? max(_GT_MR, (_L1_BYTES ÷ 2) ÷ (_GT_NR * sizeof(Float64))) : 128)::Int
 # Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
 # the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
 const _TRSM_FUSED_ON = Ref(true)
@@ -1457,39 +1467,140 @@ end
 # leaf even at n=128 (measured −18% if fused) — f32 stays on invL. The kernel itself is T-generic.
 @inline _trsm_fusable(A, B) = eltype(B) === Float64 &&
     A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 && stride(B, 1) == 1
+# Transpose-packing B (col-major, stride ldb) → P (row-major, stride NR) has one unavoidable strided side.
+# Row-outer keeps P writes contiguous but reads B at stride ldb·sz: for a leading dim whose byte stride
+# shares a big power-of-2 factor with the L1 way size, the NR reads collapse onto few sets (n=256→2 sets,
+# n=512→1) and overflow associativity → conflict-miss cliff. sets = way/gcd(way, ldb·sz); row-outer is
+# safe while sets·assoc ≥ NR, else flip to column-outer (contiguous B reads, strided writes into the tiny
+# L1-resident P). Derived from _L1_WAY_BYTES/_L1D_ASSOC (req#8), not a po2 test — n=128 (4 sets) stays
+# row-outer (measured faster), only the truly-aliased strides pay the transpose the other way.
+@inline function _fused_pack_rowouter(ldb::Int, NR::Int, sz::Int)
+    stride_b = ldb * sz
+    sets = _L1_WAY_BYTES ÷ gcd(_L1_WAY_BYTES, stride_b)
+    return sets * _L1D_ASSOC >= NR
+end
+
+# In-register 8×8 Float64 transpose (AVX-512): 24 shuffles, unpacklo/hi → 128b → 256b lane stages. Used to
+# pack/unpack the B↔P transpose contiguously (reads B DOWN columns = unit stride = po2-immune) AND fast
+# (the scalar transpose pack is ~15% of stripe cycles / 33 GF; this drops it to ~5% / 38 GF — Fable-measured
+# decomposition, the residual to the 43-GF dgemm peak). Only the W==8 f64 path; AVX2/edges keep the scalar
+# column-outer/row-outer pack (already po2-immune via contiguous reads there).
+@inline function _tr8x8(r0::V, r1::V, r2::V, r3::V, r4::V, r5::V, r6::V, r7::V) where {V}
+    t0 = shufflevector(r0, r1, Val((0,8,2,10,4,12,6,14))); t1 = shufflevector(r0, r1, Val((1,9,3,11,5,13,7,15)))
+    t2 = shufflevector(r2, r3, Val((0,8,2,10,4,12,6,14))); t3 = shufflevector(r2, r3, Val((1,9,3,11,5,13,7,15)))
+    t4 = shufflevector(r4, r5, Val((0,8,2,10,4,12,6,14))); t5 = shufflevector(r4, r5, Val((1,9,3,11,5,13,7,15)))
+    t6 = shufflevector(r6, r7, Val((0,8,2,10,4,12,6,14))); t7 = shufflevector(r6, r7, Val((1,9,3,11,5,13,7,15)))
+    u0 = shufflevector(t0, t2, Val((0,1,8,9,4,5,12,13))); u1 = shufflevector(t1, t3, Val((0,1,8,9,4,5,12,13)))
+    u2 = shufflevector(t0, t2, Val((2,3,10,11,6,7,14,15))); u3 = shufflevector(t1, t3, Val((2,3,10,11,6,7,14,15)))
+    u4 = shufflevector(t4, t6, Val((0,1,8,9,4,5,12,13))); u5 = shufflevector(t5, t7, Val((0,1,8,9,4,5,12,13)))
+    u6 = shufflevector(t4, t6, Val((2,3,10,11,6,7,14,15))); u7 = shufflevector(t5, t7, Val((2,3,10,11,6,7,14,15)))
+    (shufflevector(u0, u4, Val((0,1,2,3,8,9,10,11))), shufflevector(u1, u5, Val((0,1,2,3,8,9,10,11))),
+     shufflevector(u2, u6, Val((0,1,2,3,8,9,10,11))), shufflevector(u3, u7, Val((0,1,2,3,8,9,10,11))),
+     shufflevector(u0, u4, Val((4,5,6,7,12,13,14,15))), shufflevector(u1, u5, Val((4,5,6,7,12,13,14,15))),
+     shufflevector(u2, u6, Val((4,5,6,7,12,13,14,15))), shufflevector(u3, u7, Val((4,5,6,7,12,13,14,15))))
+end
+# Pack B[:,jc:jc+wid) → P row-major (row i at Pp+i·NR) via 8×8 transpose for full 8-row × 8-col blocks;
+# scalar column-outer for the ragged row/col tails and the wid:NR zero-pad. Contiguous B reads throughout.
+@inline function _fused_packP_tr!(Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
+        KC::Int, NR::Int, sz::Int)
+    V = Vec{8, Float64}; ng = (KC >> 3) << 3; ncg = (wid >> 3) << 3
+    @inbounds for i0 in 0:8:ng-1, vb in 0:8:ncg-1
+        b = pB + (i0 + (jc + vb) * ldb) * sz
+        x0 = vload(V, b);           x1 = vload(V, b + ldb*sz);   x2 = vload(V, b + 2ldb*sz); x3 = vload(V, b + 3ldb*sz)
+        x4 = vload(V, b + 4ldb*sz); x5 = vload(V, b + 5ldb*sz);  x6 = vload(V, b + 6ldb*sz); x7 = vload(V, b + 7ldb*sz)
+        y0,y1,y2,y3,y4,y5,y6,y7 = _tr8x8(x0,x1,x2,x3,x4,x5,x6,x7)
+        p = Pp + (i0 * NR + vb) * sz
+        vstore(y0, p);          vstore(y1, p + NR*sz);   vstore(y2, p + 2NR*sz); vstore(y3, p + 3NR*sz)
+        vstore(y4, p + 4NR*sz); vstore(y5, p + 5NR*sz);  vstore(y6, p + 6NR*sz); vstore(y7, p + 7NR*sz)
+    end
+    @inbounds for v in ncg:wid-1                          # tail columns (contiguous B reads down the column)
+        scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
+        for i in 0:KC-1; unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + i * sz)); end
+    end
+    @inbounds for i in ng:KC-1                            # tail rows (only full-col groups left to do)
+        for v in 0:ncg-1; unsafe_store!(Pp + (i*NR + v)*sz, unsafe_load(pB + (i + (jc+v)*ldb)*sz)); end
+    end
+    @inbounds for v in wid:NR-1, i in 0:KC-1; unsafe_store!(Pp + (i*NR + v)*sz, zero(Float64)); end
+end
+@inline function _fused_unpackP_tr!(Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
+        KC::Int, NR::Int, sz::Int)
+    V = Vec{8, Float64}; ng = (KC >> 3) << 3; ncg = (wid >> 3) << 3
+    @inbounds for i0 in 0:8:ng-1, vb in 0:8:ncg-1
+        p = Pp + (i0 * NR + vb) * sz
+        y0 = vload(V, p);          y1 = vload(V, p + NR*sz);   y2 = vload(V, p + 2NR*sz); y3 = vload(V, p + 3NR*sz)
+        y4 = vload(V, p + 4NR*sz); y5 = vload(V, p + 5NR*sz);  y6 = vload(V, p + 6NR*sz); y7 = vload(V, p + 7NR*sz)
+        x0,x1,x2,x3,x4,x5,x6,x7 = _tr8x8(y0,y1,y2,y3,y4,y5,y6,y7)
+        b = pB + (i0 + (jc + vb) * ldb) * sz
+        vstore(x0, b);           vstore(x1, b + ldb*sz);   vstore(x2, b + 2ldb*sz); vstore(x3, b + 3ldb*sz)
+        vstore(x4, b + 4ldb*sz); vstore(x5, b + 5ldb*sz);  vstore(x6, b + 6ldb*sz); vstore(x7, b + 7ldb*sz)
+    end
+    @inbounds for v in ncg:wid-1                          # tail columns (contiguous B writes down the column)
+        scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
+        for i in 0:KC-1; unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NR * sz)); end
+    end
+    @inbounds for i in ng:KC-1                            # tail rows
+        for v in 0:ncg-1; unsafe_store!(pB + (i + (jc+v)*ldb)*sz, unsafe_load(Pp + (i*NR + v)*sz)); end
+    end
+end
 function _trsm_fused_L!(unit::Bool, A, B)
     T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
     W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
     lda = stride(A, 2); ldb = stride(B, 2)
     nfull = KC ÷ MR; rem = KC - nfull * MR
-    # Buffer = P (KC×NR row-major, L1) ‖ compact U (KC×KC col-major, ldu=KC) ‖ recip (KC). Packing U once
-    # per leaf (into a contiguous KC² buffer, ldu=KC) fixes the parent-matrix large-`lda` scatter + keeps
-    # the per-stripe U re-reads on a compact L2-resident panel (else the off-diagonal gemm evicts it → DRAM).
-    buf = _trsm_fused_buf(T, KC * NR + KC * KC + KC)
+    # Buffer = P (KC×NR row-major, L1) ‖ compact U (KC×ldu col-major) ‖ recip (KC). Packing U once per leaf
+    # fixes the parent-matrix large-`lda` scatter + keeps the per-stripe U re-reads on a compact L2-resident
+    # panel (else the off-diagonal gemm evicts it → DRAM). ldu is forced ODD (KC|1): the slab reads U down a
+    # column at stride ldu·sz, and a po2 ldu (KC=128) collapses those onto few L1 sets — an odd ld can never
+    # be a way-stride multiple, so the re-reads stay conflict-free (mirrors _trsm_rpack's odd-ld trick).
+    ldu = KC | 1
+    buf = _trsm_fused_buf(T, KC * NR + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
-        pU = Pp + KC * NR * sz; rp = pU + KC * KC * sz
-        @inbounds for c in 0:KC-1                         # pack A's upper triangle → compact U (ldu=KC)
-            for r in 0:c; unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * KC + 1); end
+        pU = Pp + KC * NR * sz; rp = pU + KC * ldu * sz
+        @inbounds for c in 0:KC-1                         # pack A's upper triangle → compact U (odd ldu)
+            for r in 0:c; unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1); end
         end
         @inbounds for i in 0:KC-1
             unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, i + i * lda + 1)), i + 1)
         end
+        useT = _GT_TRANSPOSE                              # AVX-512 f64: vectorized 8×8-transpose pack (const-folds)
+        rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         jc = 0
         while jc < n
             wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
-            @inbounds for i in 0:KC-1                     # pack B[:,jc:jc+wid) → P row-major, zero-pad tail
-                srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NR * sz
-                for v in 0:wid-1; unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1); end
-                for v in wid:NR-1; unsafe_store!(drow, zero(T), v + 1); end
+            if useT
+                _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+            elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
+                @inbounds for i in 0:KC-1
+                    srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NR * sz
+                    for v in 0:wid-1; unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1); end
+                    for v in wid:NR-1; unsafe_store!(drow, zero(T), v + 1); end
+                end
+            else                                          # contiguous B reads; strided P writes (po2-immune)
+                @inbounds for v in 0:wid-1
+                    scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
+                    for i in 0:KC-1; unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + i * sz)); end
+                end
+                @inbounds for v in wid:NR-1, i in 0:KC-1
+                    unsafe_store!(Pp + (i * NR + v) * sz, zero(T))
+                end
             end
-            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pU, KC, rp, nfull * MR, KC, Val(NRV))
+            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pU, ldu, rp, nfull * MR, KC, Val(NRV))
             for si in (nfull - 1):-1:0
-                _gemmtrsm_u_slab!(Pp, NR, pU, KC, rp, si * MR, KC, Val(MR), Val(NRV))
+                _gemmtrsm_u_slab!(Pp, NR, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRV))
             end
-            @inbounds for i in 0:KC-1                     # unpack P → B[:,jc:jc+wid)
-                srow = Pp + i * NR * sz; drow = pB + (i + jc * ldb) * sz
-                for v in 0:wid-1; unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1)); end
+            if useT
+                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+            elseif rowouter
+                @inbounds for i in 0:KC-1                 # unpack P → B row-outer (contiguous P reads)
+                    srow = Pp + i * NR * sz; drow = pB + (i + jc * ldb) * sz
+                    for v in 0:wid-1; unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1)); end
+                end
+            else
+                @inbounds for v in 0:wid-1               # unpack column-outer (contiguous B writes)
+                    scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
+                    for i in 0:KC-1; unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NR * sz)); end
+                end
             end
             jc += NR
         end
@@ -1505,11 +1616,14 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # the side-L row split, so the choice is consistent through the recursion.
         if size(B, 2) <= _TRSM_NCUT
             k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
-        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE &&
-                size(B, 2) <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
-            # Fused gemmtrsm leaf (1× flop, ~30 GF). Gated to the SINGLE-LEAF regime (B width ≤ base):
-            # there it beats invL (n=128 worst-AOCL point). For wider B the recursion's deep off-diagonal
-            # gemms run near peak (~38 GF) and BEAT the 30-GF fused leaf, so keep invL/recursion there.
+        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B) &&
+                (_GT_TRANSPOSE || size(B, 2) <= _TRSM_FUSED_BASE)
+            # Fused gemmtrsm leaf (1× flop). AVX-512 (transpose pack): fires at EVERY k ≤ base diagonal block,
+            # including the ones the n≥256 recursion descends into (B width unbounded — the leaf stripes over
+            # B's columns). The recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block
+            # is fused (1× flop) vs invL's 2×-flop bases → beats invL fleet-wide on this box (n=256 0.85→0.93
+            # vs AOCL). Non-AVX-512: restricted to the single-leaf regime (size(B,2) ≤ base) — the scalar-pack
+            # leaf's wide-B behaviour isn't fleet-validated from here, so keep the shipped-safe gating.
             return _trsm_fused_L!(unit, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
