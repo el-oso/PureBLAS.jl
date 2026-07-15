@@ -1457,7 +1457,11 @@ end
 @inline @generated function _gemmtrsm_u_slab_upk_fusedT!(Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
         jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
-    @assert W == 8 && MR == 8 "fusedT slab requires W==MR==8 (AVX-512 f64)"
+    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
+    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
+    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
+    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
+    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
     body = quote end
     for r in 0:MR-1, v in 0:NRV-1
         push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
@@ -1785,7 +1789,11 @@ end
 @inline @generated function _gemmtrsm_u_slab_fusedT!(Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int, jc::Int,
         MPp::Ptr{T}, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
-    @assert W == 8 && MR == 8 "fusedT slab requires W==MR==8 (AVX-512 f64)"
+    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
+    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
+    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
+    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
+    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
     body = quote end
     for r in 0:MR-1, v in 0:NRV-1
         push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
