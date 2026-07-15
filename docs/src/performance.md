@@ -137,9 +137,12 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
 - `gemvN` Zen5 mid-n (~0.90): needs a native-512 lever; no config fix found.
 - `trmv`/`trsv` Zen5 n=4096 just under parity, and the Zen3 L2→L3 blocking edge at n=512.
 - `hpmv` still per-column — port the spmv AP-residency panel to complex.
-- `trsm` side-R is not yet a gated op in `plots.jl` (its numbers were never gate-measured).
-- Complex LAPACK: `zgeqrf` under gate fleet-wide; `zgesvd` blocked-bidiagonalization port
-  pending (values-only, capped at n=1024).
+- `trsm`/`ztrsm` side-L remain the flagship AOCL gaps (4K power-of-two aliasing in the
+  column-lane back-substitution); side-R (`trsmR`/`ztrsmR`) is now gate-measured and mostly clears.
+- Real `geqrf` panel width is now hardware-derived (register-count floor `256/NVREG`, grown with
+  the matrix vs L2) — it gates AOCL fleet-wide (worst ≥ 0.96), closing the former n=48 dip.
+- Complex LAPACK: `zgeqrf` worst-size still just under gate on Zen5; `zgesvd` blocked-bidiagonalization
+  port pending (values-only, capped at n=1024).
 - Tuning-constant debt: several block-size literals remain to be re-derived as formulas over
   detected cache/register parameters.
 
