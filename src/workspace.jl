@@ -23,6 +23,7 @@ mutable struct L3Workspace{T}
     trsm_tmp::Matrix{T}   # _trsm_tmp:    trsm invL/invR copyback temp (grows m×n)
     apad::Matrix{T}       # _l3_apad:     trsm po2-ld A-pad, ld=k+8 (grows)
     rpack::Matrix{T}      # _trsm_rpack:  side-R fused-leaf pT scratch, ODD ld (conflict-free re-reads; grows)
+    ftrsm::Vector{T}      # _trsm_fused_buf: side-L gemmtrsm leaf packed row-major stripe P + recip (grows)
     potf2::Matrix{T}      # _potf2_buf:   potrf diagonal-base contiguous buffer (grows n×n)
     gpackA::Vector{T}     # _gemm_scratch:      packed A panel
     gpackB::Vector{T}     # _gemm_scratch:      packed B panel
@@ -33,7 +34,7 @@ mutable struct L3Workspace{T}
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[], Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
@@ -91,6 +92,12 @@ function _trsm_rpack(::Type{T}, rows::Int, cols::Int) where {T}
     if size(b, 1) < need || size(b, 2) < cols
         b = Matrix{T}(undef, need, cols); ws.rpack = b
     end
+    return b
+end
+
+function _trsm_fused_buf(::Type{T}, len::Int) where {T}   # side-L gemmtrsm leaf: P stripe + recip (flat)
+    ws = _l3ws(T); b = ws.ftrsm
+    length(b) < len && (b = Vector{T}(undef, len); ws.ftrsm = b)
     return b
 end
 
