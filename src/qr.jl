@@ -161,7 +161,11 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:B
     end
     return true
 end
-const _QR_NB = @load_preference("qr_nb", 32)::Int   # blocked panel width BASE; grown per m·n vs cache by _qr_nb (req#8). Overridable "qr_nb".
+# Real blocked-QR panel width BASE, DERIVED (req#8): four SIMD vector widths in Float64 elements. The gemm
+# microkernel's C-tile load/store overhead per flop scales as _vwidth/nb (wider SIMD chews the k-loop faster,
+# so it needs deeper k to hide the same tile traffic); pinning that share at a few % ⇒ nb ≈ 4·_vwidth. Gives
+# 32 on AVX-512 (Zen4/Zen5), 16 on AVX2 (Zen3). Overridable "qr_nb" (sets the Float64 width directly).
+const _QR_NB = @load_preference("qr_nb", 4 * _vwidth(Float64))::Int
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
@@ -180,14 +184,20 @@ const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # the whole range (nb=32 dips at n≥896, nb=64 dips at n≈320). Overridable base "qr_nb_c".
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
     clamp(_QR_NB_C * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB_C, 4 * _QR_NB_C)
-# Blocked panel width (REAL), derived — mirrors _zqr_nb's structure: grow nb with how many times the matrix
-# exceeds ¼L3 so the trailing-gemm DRAM-sweep traffic (∝ k/nb) stays bounded, capped at 4× where the BLAS-2
-# panel share (≈0.75·nb/n) begins to bite. Replaces the flat _QR_NB literal (was a req#8 violation; qr_block_size
-# and geqrf!'s default route through this). CAVEAT (req#8b): the ¼L3 divisor + 4× cap are INHERITED from the
-# fleet-validated complex path pending REAL-path validation — real gemm's higher throughput may shift the
-# cache-spill crossovers, so this must be re-measured n≥2048 on Zen4/Zen3/Zen5 before it's trusted to extrapolate.
+# Blocked panel width (REAL), derived — FLAT in (m,n): the real trailing larfb is plain packed gemm (full
+# internal L1/L2-blocked reuse, NO materialized scratch), so each panel step does ~4·nb flops per trailing
+# element vs O(1) streamed bytes — the DRAM sweep is amortized once nb > β·c·sizeof/4 ≈ 5 (machine balance),
+# i.e. already BELOW the base at every size. Above that, larger nb only inflates the unblocked BLAS-2 panel
+# share (≈0.75·nb/n at gemv rate), so the smallest (base) nb wins. The old ¼L3 growth term was a COMPLEX-path
+# artifact: its Karatsuba-3M trailing gemm materializes ~3× scratch (per-step traffic ∝ trailing size), the
+# DRAM pressure that growing nb relieved (∝ k/nb) — real has no such term, so L3 does NOT enter. Growth
+# returns only under shared-BW multithreading (β·nthreads pushes nb* past base) — deferred. Measured Zen5
+# (AVX-512, boost-locked): nb=32 is GFlops-optimal at every n∈[256,4096] incl. tall, monotone-decreasing in
+# nb (bench/qr_nb_sweep.jl). req#8b: reproduces the Zen5 optimum; AVX2 (Zen3/half-β) predicts 16 and needs
+# same-machine A/B on galen(Zen3)+wintermute(Zen4) before merge. _vwidth(T)/_vwidth(Float64) scales the base
+# to the eltype width (identity for Float64) while keeping the "qr_nb" Preference the single knob.
 @inline _qr_nb(::Type{T}, m::Int, n::Int) where {T} =
-    clamp(_QR_NB * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB, 4 * _QR_NB)
+    (_QR_NB * _vwidth(T)) ÷ _vwidth(Float64)
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
