@@ -1662,10 +1662,19 @@ function _trsm_fused_L!(unit::Bool, A, B)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
         pU = Pp + KC * NR * sz; rp = pU + KC * ldu * sz
-        @inbounds for c in 0:KC-1                         # pack A's upper triangle → compact U (odd ldu)
-            for r in 0:c; unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1); end
+        # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
+        # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
+        # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
+        # negligible in L1). Fixes the small-k setup floor (s=24/32, the only genuinely setup-bound points).
+        directA = KC * KC * sz <= _L1_BYTES
+        pUsrc = pA; lduse = lda
+        if !directA
+            @inbounds for c in 0:KC-1                     # pack A's upper triangle → compact U (odd ldu)
+                for r in 0:c; unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1); end
+            end
+            pUsrc = pU; lduse = ldu
         end
-        @inbounds for i in 0:KC-1
+        @inbounds for i in 0:KC-1                          # recips always packed (contiguous rp panel)
             unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, i + i * lda + 1)), i + 1)
         end
         # AVX-512 f64: vectorized 8×8-transpose pack (const-folds). NOTE: the transpose reads 8 B-columns at
@@ -1687,13 +1696,13 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
             if fusedT && wid == NR
-                _fusedT_stripe!(Val(NRV), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += NR; continue
             elseif fusedT && NRV >= 3 && wid == 2 * W
-                _fusedT_stripe!(Val(2), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += 2 * W; continue
             elseif fusedT && wid == W
-                _fusedT_stripe!(Val(1), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += W; continue
             end
             if useT
@@ -1713,9 +1722,9 @@ function _trsm_fused_L!(unit::Bool, A, B)
                     unsafe_store!(Pp + (i * NR + v) * sz, zero(T))
                 end
             end
-            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pU, ldu, rp, nfull * MR, KC, Val(NRV))
+            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pUsrc, lduse, rp, nfull * MR, KC, Val(NRV))
             for si in (nfull - 1):-1:0
-                _gemmtrsm_u_slab!(Pp, NR, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRV))
+                _gemmtrsm_u_slab!(Pp, NR, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(NRV))
             end
             if useT
                 _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
