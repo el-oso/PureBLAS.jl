@@ -2750,11 +2750,95 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     herm && @inbounds for i in 1:n; Ad[i, i] = real(Ad[i, i]); end
     return Ad
 end
+# SIMD symmetric A-pack (real, dense): tile each FULL row-panel into W×W blocks and classify by the
+# diagonal — fully-STORED tiles (all gi≤gp for up) read A directly as vectorized column copies
+# (_pack_A_simd! idiom), fully-MIRROR tiles (all gi>gp) read the stored transpose A[gp,i] via the W×W
+# register transpose block (_tblk!, the _pack_A_simd_T! idiom), and the lone diagonal tile per W-row-block
+# (d=0 when mc/kc are W-aligned, ~1.5% of elements) stays scalar. Block starts (ic,pc mult of W) put every
+# crossing tile at d=0; the scalar branch is correct for any d, so misalignment only widens the thin band.
+# Kills the 2.7–2.9× scalar-pack tax that sank symm below AOCL (each stored element read ONCE, no materialize).
+@inline function _pack_A_sym_simd!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
+        up::Bool, alpha::T, mr::Int, W::Int) where {T<:BlasReal}
+    V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2); sub = mr ÷ W; np = cld(mce, mr)
+    GC.@preserve A Ap begin
+        Aptr = pointer(A); App = pointer(Ap); av = V(alpha)
+        @inbounds for pi in 0:(np - 1)
+            base = pi * mr * kce; pbase = pi * mr
+            if pbase + mr <= mce                              # full row-panel: wings full-mr, band per-tile
+                gtop = ic + pbase; p = 0
+                while p + W <= kce
+                    gc0 = pc + p; dst0 = App + (base + p * mr) * sz
+                    fullstored = up ? (gc0 >= gtop + mr - 1) : (gc0 + W - 1 <= gtop)   # whole mr panel stored
+                    fullmirror = up ? (gc0 + W - 1 < gtop)   : (gc0 >= gtop + mr)      # whole mr panel mirror
+                    if fullstored                               # A[gi,gp] direct: full-mr column copy
+                        for j in 0:(W - 1)
+                            src = Aptr + (gtop + (gc0 + j) * lda) * sz; dj = dst0 + j * mr * sz; o = 0
+                            while o < mr; vstore(av * vload(V, src + o * sz), dj + o * sz); o += W; end
+                        end
+                    elseif fullmirror                           # A[gp,gi] transpose: W×W blocks over sub rows
+                        for ri in 0:(sub - 1)
+                            _tblk!(Ptr{T}(dst0 + ri * W * sz), Ptr{T}(Aptr + ((gtop + ri * W) * lda + gc0) * sz),
+                                   lda, mr, av, Val(W))
+                        end
+                    else                                        # diagonal band (~mr+W wide): per-tile
+                        for ri in 0:(sub - 1)
+                            rowoff = ri * W; gr0 = gtop + rowoff; dstk = dst0 + rowoff * sz
+                            if up ? (gr0 + W - 1 <= gc0) : (gr0 >= gc0 + W - 1)          # stored tile
+                                for j in 0:(W - 1)
+                                    vstore(av * vload(V, Aptr + (gr0 + (gc0 + j) * lda) * sz), dstk + j * mr * sz)
+                                end
+                            elseif up ? (gr0 >= gc0 + W) : (gr0 + W <= gc0)              # mirror tile
+                                _tblk!(Ptr{T}(dstk), Ptr{T}(Aptr + (gr0 * lda + gc0) * sz), lda, mr, av, Val(W))
+                            else                                                         # diagonal tile: scalar
+                                for j in 0:(W - 1), l in 0:(W - 1)
+                                    gi = gr0 + l; gp = gc0 + j
+                                    v = (up ? (gi <= gp) : (gi >= gp)) ? A[gi + 1, gp + 1] : A[gp + 1, gi + 1]
+                                    Ap[base + (p + j) * mr + rowoff + l + 1] = alpha * v
+                                end
+                            end
+                        end
+                    end
+                    p += W
+                end
+                while p < kce                                    # k tail (kce not mult of W): scalar
+                    gp = pc + p
+                    for r in 0:(mr - 1)
+                        gi = gtop + r
+                        v = (up ? (gi <= gp) : (gi >= gp)) ? A[gi + 1, gp + 1] : A[gp + 1, gi + 1]
+                        Ap[base + p * mr + r + 1] = alpha * v
+                    end
+                    p += 1
+                end
+            else                                                 # partial row-panel → scalar (branchless)
+                rhi = min(mr, mce - pbase)
+                for p in 0:(kce - 1)
+                    gp = pc + p; o = base + p * mr; ls = gp - ic - pbase
+                    if up
+                        st_end = clamp(ls + 1, 0, rhi)
+                        for r in 0:(st_end - 1); Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]; end
+                        for r in st_end:(rhi - 1); Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]; end
+                    else
+                        st_start = clamp(ls, 0, rhi)
+                        for r in 0:(st_start - 1); Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]; end
+                        for r in st_start:(rhi - 1); Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]; end
+                    end
+                    for r in rhi:(mr - 1); Ap[o + r + 1] = zero(T); end
+                end
+            end
+        end
+    end
+    return
+end
 # Symmetric A-pack for a diagonal-straddling panel (real symm). BRANCHLESS (OpenBLAS-style): per column
 # the stored/mirror split is a single crossing, so each column packs a contiguous STORED run (reads A's
 # column gp, stride 1) then a MIRROR run (reads A's row gp, stride lda) — no per-element `i≤j` branch in
 # the hot loop. Off-diagonal panels use plain _pack_A! (stored: tA=false SIMD; mirror: tA=true).
+# Dense real unit-stride with mr a multiple of W → the SIMD tiled pack above (each element read once, SIMD).
 function _pack_A_sym!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, up::Bool, alpha::T, mr::Int) where {T}
+    W = _vwidth(T)
+    if T <: BlasReal && _strided1(A) && mr % W == 0
+        return _pack_A_sym_simd!(Ap, A, ic, pc, mce, kce, up, alpha, mr, W)
+    end
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
         base = pi * mr * kce; pbase = pi * mr
@@ -2862,10 +2946,93 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C)
     end
     return C
 end
+# SIMD symmetric B-pack (real, dense, side R): tile each FULL col-panel into W×W blocks. Roles SWAP vs
+# side L — the STORED read A[gp,gj] is row-strided (a row of A) → W×W register transpose block (_tblk!,
+# stride nr); the MIRROR read A[gj,gp] is a contiguous column of A → per-k column copy. Diagonal tile
+# (d=0 when kc/nc are W-aligned) scalar. Each stored element read once (no α — α rides the left operand).
+@inline function _pack_B_sym_simd!(Bp::Vector{T}, A, pc::Int, jc::Int, kce::Int, nce::Int,
+        up::Bool, nr::Int, W::Int) where {T<:BlasReal}
+    V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2); cn = nr ÷ W; np = cld(nce, nr)
+    GC.@preserve A Bp begin
+        Aptr = pointer(A); Bpp = pointer(Bp); ov = V(one(T))
+        @inbounds for ji in 0:(np - 1)
+            base = ji * nr * kce; cbase = ji * nr
+            if cbase + nr <= nce                              # full col-panel: wings full-nr, band per-tile
+                gjtop = jc + cbase; p = 0
+                while p + W <= kce
+                    gp0 = pc + p; blk = base + p * nr
+                    fullstored = up ? (gp0 + W - 1 <= gjtop) : (gp0 >= gjtop + nr - 1)  # whole nr panel stored
+                    fullmirror = up ? (gp0 >= gjtop + nr)    : (gp0 + W - 1 < gjtop)     # whole nr panel mirror
+                    if fullstored                               # A[gp,gj] row-strided: transpose blocks
+                        for ci in 0:(cn - 1)
+                            _tblk!(Ptr{T}(Bpp + (blk + ci * W) * sz),
+                                   Ptr{T}(Aptr + (gp0 + (gjtop + ci * W) * lda) * sz), lda, nr, ov, Val(W))
+                        end
+                    elseif fullmirror                           # A[gj,gp] column: per-k column copy
+                        for kk in 0:(W - 1), ci in 0:(cn - 1)
+                            vstore(vload(V, Aptr + (gjtop + ci * W + (gp0 + kk) * lda) * sz),
+                                   Bpp + (blk + kk * nr + ci * W) * sz)
+                        end
+                    else                                        # diagonal band: per-tile
+                        for ci in 0:(cn - 1)
+                            coff = ci * W; gj0 = gjtop + coff
+                            if up ? (gp0 + W - 1 <= gj0) : (gp0 >= gj0 + W - 1)           # stored tile
+                                _tblk!(Ptr{T}(Bpp + (blk + coff) * sz),
+                                       Ptr{T}(Aptr + (gp0 + gj0 * lda) * sz), lda, nr, ov, Val(W))
+                            elseif up ? (gp0 >= gj0 + W) : (gp0 + W <= gj0)               # mirror tile
+                                for kk in 0:(W - 1)
+                                    vstore(vload(V, Aptr + (gj0 + (gp0 + kk) * lda) * sz),
+                                           Bpp + (blk + kk * nr + coff) * sz)
+                                end
+                            else                                                          # diagonal tile: scalar
+                                for kk in 0:(W - 1), cc in 0:(W - 1)
+                                    gp = gp0 + kk; gj = gj0 + cc
+                                    v = (up ? (gp <= gj) : (gp >= gj)) ? A[gp + 1, gj + 1] : A[gj + 1, gp + 1]
+                                    Bp[blk + kk * nr + coff + cc + 1] = v
+                                end
+                            end
+                        end
+                    end
+                    p += W
+                end
+                while p < kce                                    # k tail (kce not mult of W): scalar
+                    gp = pc + p
+                    for c in 0:(nr - 1)
+                        gj = gjtop + c
+                        v = (up ? (gp <= gj) : (gp >= gj)) ? A[gp + 1, gj + 1] : A[gj + 1, gp + 1]
+                        Bp[base + p * nr + c + 1] = v
+                    end
+                    p += 1
+                end
+            else                                                 # partial col-panel → scalar (branchless)
+                chi = min(nr, nce - cbase)
+                for p in 0:(kce - 1)
+                    gp = pc + p; o = base + p * nr; ls = gp - jc - cbase
+                    if up
+                        st = clamp(ls, 0, chi)
+                        for c in 0:(st - 1); Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]; end
+                        for c in st:(chi - 1); Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]; end
+                    else
+                        st = clamp(ls + 1, 0, chi)
+                        for c in 0:(st - 1); Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]; end
+                        for c in st:(chi - 1); Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]; end
+                    end
+                    for c in chi:(nr - 1); Bp[o + c + 1] = zero(T); end
+                end
+            end
+        end
+    end
+    return
+end
 # Symmetric B-pack for a diagonal-straddling panel (real symm side R): the symmetric matrix is the
 # gemm's RIGHT operand. Stored side reads A[gp,gj], mirror side A[gj,gp]. Off-diagonal panels use
 # plain _pack_B! (stored: tB=false; mirror: tB=true). No α here — α rides on the left operand's pack.
+# Dense real unit-stride with nr a multiple of W → the SIMD tiled pack above (each element read once).
 function _pack_B_sym!(Bp::Vector{T}, A, pc::Int, jc::Int, kce::Int, nce::Int, up::Bool, nr::Int) where {T}
+    W = _vwidth(T)
+    if T <: BlasReal && _strided1(A) && nr % W == 0
+        return _pack_B_sym_simd!(Bp, A, pc, jc, kce, nce, up, nr, W)
+    end
     np = cld(nce, nr)                              # branchless (OpenBLAS-style): stored/mirror = one crossing
     @inbounds for ji in 0:(np - 1)
         base = ji * nr * kce; cbase = ji * nr
@@ -2893,16 +3060,18 @@ function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T<:BlasReal}
     n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _MR * W; nr = _NR
     kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(C, n, m, β); ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
+    db = _strided1(B)                                    # op(B)=B unit row-stride ⇒ read B direct (no B-pack)
+    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, db ? 0 : cld(nc, nr) * nr * kc)
+    b0 = iszero(β); b0 || _scale_C!(C, n, m, β)   # β=0 ⇒ first kc-block overwrites (skip scale + C RMW)
+    ldc = stride(C, 2); ldb = db ? stride(B, 2) : 0; sz = sizeof(T)
+    GC.@preserve C Ap Bp B begin
+        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp); Bp0 = db ? pointer(B) : Bpp
         jc = 0
         while jc < m
             nce = min(nc, m - jc); pc = 0
             while pc < n
-                kce = min(kc, n - pc)
-                _pack_B!(Bp, B, pc, jc, kce, nce, false, nr)
+                kce = min(kc, n - pc); ow = b0 && pc == 0
+                db || _pack_B!(Bp, B, pc, jc, kce, nce, false, nr)
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
@@ -2917,12 +3086,19 @@ function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T<:BlasReal}
                         while ir < mce
                             mre = min(mr, mce - ir)
                             Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
                             Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            if mre == mr && nre == nr
-                                _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR))
+                            if db
+                                Bc = Bp0 + (pc + (jc + jr) * ldb) * sz
+                                _db_tile!(ow, Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bc), ldb, kce, mre, nre, Val(_MR), Val(_NR), Val(W))
                             else
-                                _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR))
+                                Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
+                                if mre == mr && nre == nr
+                                    ow ? _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
+                                         _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
+                                else
+                                    ow ? _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                         _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
+                                end
                             end
                             ir += mr
                         end
@@ -2945,14 +3121,15 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T<:BlasReal}
     kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(M, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(C, M, n, β); ldc = stride(C, 2); sz = sizeof(T)
+    b0 = iszero(β); b0 || _scale_C!(C, M, n, β)   # β=0 ⇒ first kc-block overwrites (skip scale + C RMW)
+    ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
         jc = 0
         while jc < n
             nce = min(nc, n - jc); j_hi = jc + nce - 1; pc = 0
             while pc < n
-                kce = min(kc, n - pc); p_hi = pc + kce - 1
+                kce = min(kc, n - pc); p_hi = pc + kce - 1; ow = b0 && pc == 0
                 stored = up ? (p_hi <= jc) : (pc >= j_hi)
                 mirror = up ? (pc > j_hi) : (p_hi < jc)
                 stored ? _pack_B!(Bp, A, pc, jc, kce, nce, false, nr) :
@@ -2971,9 +3148,11 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T<:BlasReal}
                             Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
                             Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
                             if mre == mr && nre == nr
-                                _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR))
+                                ow ? _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
+                                     _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
                             else
-                                _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR))
+                                ow ? _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                     _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
                             end
                             ir += mr
                         end
@@ -3012,7 +3191,13 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             return _hemm_3m_L!(up, herm, α, β, A, B, C)
         end
     end
-    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT
+    # Real, above the pack cut: packed single-pass kernel (each stored A element read once, SIMD pack) —
+    # UNLESS the resulting gemm is in the Strassen regime. There materialize+_gemm_core! captures the
+    # 7-mult recursion whose flop saving beats the O(n²) copy tax (measured n=2048: packed 0.99× vs
+    # materialize+Strassen 1.10× AOCL; n=1024 ~parity). Below Strassen_min, packed wins (no copy tax).
+    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT &&
+            !(_STRASSEN && (side_left ? _strassen_depth(n, size(B, 2), n) :
+                                        _strassen_depth(size(B, 1), n, n)) > 0)
         return side_left ?
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)

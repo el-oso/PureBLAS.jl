@@ -547,6 +547,33 @@ function _blocked_pc_sweep!(::Val{B0}, ::Val{DB}, Cp0::Ptr{T}, App::Ptr{T}, Bpp:
     return nothing
 end
 
+# Direct-B tile dispatch (op(B)=B, unit row-stride: read B WITHOUT packing) — the _blocked_pc_sweep!
+# DB ladder as a reusable @inline so symm side-L gets the same no-B-pack kernels (the dgemm small-n AOCL
+# lever). `ow` ⇒ β=0 first-block overwrite. mre/nre are the live tile extents.
+@inline function _db_tile!(ow::Bool, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bc::Ptr{T}, ldb::Int,
+        kce::Int, mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{W}) where {T, MR, NR, W}
+    mr = MR * W
+    if mre == mr && nre == NR
+        ow ? _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(MR), Val(NR), Val(true)) :
+             _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(MR), Val(NR), Val(false))
+    elseif nre == NR && rem(mre, W) == 0
+        vr = div(mre, W)
+        if vr == 1
+            ow ? _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(1), Val(NR), Val(true)) :
+                 _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(1), Val(NR), Val(false))
+        elseif vr == 2
+            ow ? _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(2), Val(NR), Val(true)) :
+                 _microkernel_db!(Cblk, ldc, Apanel, Bc, ldb, kce, Val(MR), Val(2), Val(NR), Val(false))
+        else
+            ow ? _microkernel_db_masked!(Cblk, ldc, Apanel, Bc, ldb, kce, mre, nre, Val(MR), Val(NR), Val(true)) :
+                 _microkernel_db_masked!(Cblk, ldc, Apanel, Bc, ldb, kce, mre, nre, Val(MR), Val(NR), Val(false))
+        end
+    else
+        ow ? _microkernel_db_masked!(Cblk, ldc, Apanel, Bc, ldb, kce, mre, nre, Val(MR), Val(NR), Val(true)) :
+             _microkernel_db_masked!(Cblk, ldc, Apanel, Bc, ldb, kce, mre, nre, Val(MR), Val(NR), Val(false))
+    end
+end
+
 # Blocked real GEMM (the optimized path). C must have unit column stride (pointer + vstore).
 function _gemm_blocked!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C) where {T<:BlasReal}
