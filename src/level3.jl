@@ -1752,9 +1752,18 @@ end
 # only reaches AOCL PARITY (~0.97 large-n, ~0.87 small-n) — NOT the ≥1.0 mandate. The re-pack was NOT the
 # binding lever: the fused-slab microkernel intrinsically runs ~40.6 GF vs PB's own dgemm 43 / AOCL trsm 42,
 # worst at small n (PB 31 vs AOCL 37 @128). It also shows a noise-level regression at po2 n=512, which the
-# no-regression contract forbids. Kept behind this toggle as the validated re-pack-free substrate for the
-# real next lever (inverted-diagonal epilogue + C-tile prefetch on the packed slab — target the microkernel
-# rate + small-n back-sub latency, not the driver). Flip to true for the same-process A/B that measured this.
+# no-regression contract forbids. Kept behind this toggle as the validated re-pack-free substrate.
+# FALSIFIED levers (measured wintermute Zen4, boost-locked, in-process A/B — do NOT re-try; bench/
+# trsm_fullpack_gf.jl reproduces): (1) INVERTED-DIAGONAL epilogue (precompute inv of the MR×MR diagonal
+# block at pack time, replace the serial back-sub with X=Vss·acc) — REGRESSED small-k (k=128 30.2 vs
+# back-sub 31.5 GF), converged at large-k. The back-sub is NOT latency-bound: its MR×NRV=24 v-lanes across
+# the MR rows already saturate ILP, so removing the serial chain buys nothing while the diag inversion adds
+# pack-time cost. (2) C-TILE PREFETCH of the MR own-rows [s,s+MR) of P at slab entry — MEASURED NO-OP at
+# every size (P is L2-resident straight from _fused_packP_tr!, so the "cold subtract-read" it targeted was
+# never cold). The residual is the slab MICROKERNEL RATE (large-k plateau 40.6 vs dgemm 43 / AOCL 42) plus
+# the O(k·n) transpose-pack + O(k²) U-pack OVERHEAD that dominates small-k (k=128 31 GF, amortizes to 40.6
+# by k≥384) — NOT the back-sub, NOT prefetch. Next lever = the slab gemm tile geometry (8×3=24 acc, near
+# the 32-zmm limit) and/or skipping the P round-trip at small-k, not the epilogue. Flip to true for the A/B.
 const _TRSM_FULLPACK_ON = Ref(false)
 # Whole-k cutoff: packed-U micropanels hold the upper triangle ≈ k²/2 elements; bound to ½·L3 residency
 # (req#8): (k²/2)·sizeof(T) ≤ _L3_BYTES/2 ⟹ k ≤ isqrt(_L3_BYTES ÷ sizeof(T)). Above → recursion bottoms here.
