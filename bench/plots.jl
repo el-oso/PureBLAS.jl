@@ -461,8 +461,11 @@ end
 # the old 11-line/8-colour collision is gone. Fixed colour per µarch, keyed on the cache's stamped slug. ──
 const _UARCH = Dict("avx512" => ("#1f77b4", "Zen4 · AVX-512"), "zen5" => ("#2ca02c", "Zen5 · AVX-512"),
                     "avx2" => ("#d62728", "Zen3 · AVX2"))
-_ucolor(slug) = get(_UARCH, slug, ("#888888", slug))[1]
-_ulabel(meta) = get(_UARCH, meta.slug, ("#888888", meta.isa))[2]
+# AOCL/MKL caches stamp slug=<µarch>_<refbk> (e.g. avx512_aocl); _UARCH is keyed on the BARE µarch slug,
+# so strip the refbk suffix before the color/label lookup — else every AOCL series fell to the grey fallback.
+_baseslug(slug) = replace(slug, r"_(aocl|mkl)$" => "")
+_ucolor(slug) = get(_UARCH, _baseslug(slug), ("#888888", slug))[1]
+_ulabel(meta) = get(_UARCH, _baseslug(meta.slug), ("#888888", meta.isa))[2]
 
 # Load every fleet cache (plots_data_<host>.txt) → [(meta, groups), …]. In lite mode loads only *_lite; in
 # full mode only full caches. Skips MKL. Refuses stale-version caches via load_cache.
