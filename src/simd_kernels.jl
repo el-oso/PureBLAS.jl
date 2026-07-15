@@ -453,16 +453,17 @@ end
 # assumes n ≥ 4W (caller routes shorter / strided / complex to the scalar loop). Two implementations,
 # selected by ISA at build time (`_SIMD_BYTES` const-folds → trim-safe, no runtime branch):
 #
-#  • AVX-512 (`_iamax_thresh4!`): DEPENDENCY-FREE THRESHOLD SCAN. The hot loop keeps a broadcast running
-#    max `thr` (invariant except on the rare advance) and does 4 INDEPENDENT `|xⱼ| > thr` compares per
-#    iter, OR-ing the masks into ONE `any` branch — no loop-carried accumulator, so it out-throughputs
-#    even a bare vmaxpd reduction. The predicted-not-taken cold path (max advances ~O(log n) for random
-#    data) scalar-scans the 4 blocks for the new max + its first lane. This tracks NO index in the hot
-#    path, unlike the chain kernel below. Beats AOCL-BLIS's `bli_damaxv` at n≥1e4 and hits the shared
-#    single-thread DRAM roofline (~48 GB/s, PB=AOCL) at n≥1e6 on Zen5; small-n (n≲3000) is per-call
-#    overhead where the hand-asm still leads (even the bare-reduction floor is ~0.65× there).
-#  • AVX2 / narrower (`_iamax_chain4!`): the original 4-chain lane-parallel running max + parallel index
-#    vector (loop-carried, latency-bound → 4 chains). Kept as-is; validated ≥1.06× OpenBLAS.
+#  • AVX2 + AVX-512 (`_iamax_thresh4!`): DEPENDENCY-FREE THRESHOLD SCAN. The hot loop keeps a broadcast
+#    running max `thr` (invariant except on the rare advance) and does `_IAMAX_NB` INDEPENDENT `|xⱼ| > thr`
+#    compares per iter, OR-ing the masks into ONE `any` branch — no loop-carried accumulator, so it
+#    out-throughputs even a bare vmaxpd reduction. The predicted-not-taken cold path (max advances
+#    ~O(log n) for random data) scalar-scans the blocks for the new max + its first lane. Tracks NO index
+#    in the hot path, unlike the chain kernel below. WIDTH-GENERAL (W=4 f64 / W=8 f32). Gates AOCL-BLIS's
+#    `bli_[d/s]amaxv` at EVERY size on Zen3(AVX2)/Zen4/Zen5 (f64 ≥1.00×, f32 ≥1.20×) and beats OpenBLAS
+#    1.2–2.3×; at n≥1e6 both PB and AOCL sit on the shared single-thread DRAM roofline. (Old AVX2 chain
+#    was the worst AOCL miss: f64 0.55×, f32 0.32× — see bench/iamax_nb.jl, git log.)
+#  • SSE / NEON (narrower than 32 B, unvalidated) (`_iamax_chain4!`): the original 4-chain lane-parallel
+#    running max + parallel index vector (loop-carried, latency-bound → 4 chains). Kept as the fallback.
 #
 # Tie rule everywhere: equal value → keep the SMALLER index ⇒ BLAS first-occurrence semantics (strict `>`).
 # NB: OB/AOCL idamax are alignment-volatile (time swings ~60% with the array's address) while these are
@@ -474,10 +475,13 @@ end
     (vifelse(take, m1, m0), vifelse(take, i1, i0))
 end
 
-# _IAMAX_NB: blocks per hot-loop iteration for the threshold scan = ILP unroll that feeds enough
-# independent compares to cover the vcmppd→k latency at ~2/cyc throughput. 4 measured optimal on Zen5
-# (2 starves ILP, 8 grows prologue/cold-path → both regress small-n); mirrors the chain kernel's 4.
-const _IAMAX_NB = 4
+# _IAMAX_NB: independent |xⱼ|>thr compare-chains issued per hot-loop iteration — the ILP unroll that
+# covers the vcmp→mask latency (~4 cyc) so the predicted-not-taken branch never stalls the load stream.
+# Criterion: datapath-latency ILP, capped by the vector-register budget (NB loaded blocks + 1 broadcast
+# `thr` ≤ _NVREG). 4 covers the latency and const-folds to 4 on both AVX2 (16 reg) and AVX-512 (32 reg) —
+# measured (co-)optimal on Zen3/Zen5: NB=2 starves ILP; NB≥6 only ties NB=4 mid-n and regresses the
+# overhead-critical small-n (see bench/iamax_nb.jl). Derived from _NVREG → trim-safe (req#8).
+const _IAMAX_NB = min(4, _NVREG - 1)
 
 @inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
     W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = _IAMAX_NB * W
@@ -542,9 +546,10 @@ end
 end
 
 # ISA-selected at build time: the `_SIMD_BYTES` compare const-folds, so the dead arm is eliminated
-# (trim-safe, no runtime dispatch). AVX-512 → threshold scan; AVX2/narrower → 4-chain.
+# (trim-safe, no runtime dispatch). AVX2 + AVX-512 (≥32 B) → threshold scan (gates AOCL/OB at every size
+# on Zen3/Zen4/Zen5, see bench/iamax_nb.jl); narrower unvalidated ISAs (SSE/NEON) keep the 4-chain.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal} =
-    _SIMD_BYTES >= 64 ? _iamax_thresh4!(n, xp) : _iamax_chain4!(n, xp)
+    _SIMD_BYTES >= 32 ? _iamax_thresh4!(n, xp) : _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
 # argmax machinery as the real kernel, but each Vec{2W} load is W complex elements — deinterleave → re/im,
