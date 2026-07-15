@@ -10,8 +10,11 @@
 # implicit + essential below, R diagonal = β on output). Returns tinv (=τ), or Inf for a trivial reflector.
 @inline function _qr_reflect_f64!(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
     tn = 0.0; i = col + 1
-    @inbounds while i + _CHOLW - 1 <= m; x = vload(_CVF, _cvptr(p, i, col, ld)); tn += sum(x * x); i += _CHOLW; end
-    @inbounds while i <= m; x = unsafe_load(p, _clidx(i, col, ld)); tn = muladd(x, x, tn); i += 1; end
+    acc = _CVF(0.0)                                                # vector accumulator: one horizontal reduction
+    @inbounds while i + _CHOLW - 1 <= m; x = vload(_CVF, _cvptr(p, i, col, ld)); acc = muladd(x, x, acc); i += _CHOLW; end
+    tn = sum(acc)                                                  # (was `tn += sum(x*x)` PER iter — a serial
+    @inbounds while i <= m; x = unsafe_load(p, _clidx(i, col, ld)); tn = muladd(x, x, tn); i += 1; end  # shuffle/add
+    # on the reflector dependency chain at every column; Fable 2026-07-15)
     tail = sqrt(tn); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
     tail < floatmin(Float64) && return Inf
     nrm = hypot(abs(head), tail); sn = head >= 0.0 ? nrm : -nrm; hwb = head + sn; hi = 1.0 / hwb; vi = _CVF(hi)
@@ -33,6 +36,48 @@ end
         while i <= m; unsafe_store!(p, muladd(kk, unsafe_load(p, _clidx(i, col, ld)), unsafe_load(p, _clidx(i, j, ld))), _clidx(i, j, ld)); i += 1; end
     end
 end
+# Pass-fusion helpers (Fable 2026-07-15): split reflect into norm-head (no scale) + a fused scale-and-dot,
+# so the reflector's SCALE pass and the H0-apply's DOT pass become ONE tail pass over col+1:m (was two).
+# Numerically equivalent to reflect+apply1 but not bit-identical (dot now sums the just-scaled v0). Used only
+# in the PAIR path; singles keep _qr_reflect_f64! (which scales). Returns (hi, tinv); tinv=Inf ⇒ trivial (NO
+# scale done — column untouched, caller must treat as a trivial reflector, exactly as _qr_reflect_f64! does).
+@inline function _qr_norm_head_f64!(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
+    i = col + 1; acc = _CVF(0.0)
+    @inbounds while i + _CHOLW - 1 <= m; x = vload(_CVF, _cvptr(p, i, col, ld)); acc = muladd(x, x, acc); i += _CHOLW; end
+    tn = sum(acc)
+    @inbounds while i <= m; x = unsafe_load(p, _clidx(i, col, ld)); tn = muladd(x, x, tn); i += 1; end
+    tail = sqrt(tn); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
+    tail < floatmin(Float64) && return (0.0, Inf)
+    nrm = hypot(abs(head), tail); sn = head >= 0.0 ? nrm : -nrm; hi = 1.0 / (head + sn)
+    @inbounds unsafe_store!(p, -sn, _clidx(col, col, ld))
+    return (hi, 1.0 / (0.5 * (1.0 + (tail * abs(hi))^2)))
+end
+# Fused SCALE(col by hi) + DOT(v0ᵀ·A[:,j]): one pass over col+1:m — scale each v0_i = A[i,col]·hi (store) AND
+# accumulate v0_i·A[i,j]. dot includes the head A[col,j] (v0[col]=1 implicit). Returns v0ᵀ·A[:,j].
+@inline function _qr_scale_dot_f64!(p::Ptr{Float64}, m::Int, col::Int, j::Int, ld::Int, hi::Float64)
+    @inbounds begin
+        vi = _CVF(hi); dacc = _CVF(0.0); dot = unsafe_load(p, _clidx(col, j, ld)); i = col + 1
+        while i + _CHOLW - 1 <= m
+            b = _cvptr(p, i, col, ld); v = vload(_CVF, b) * vi; vstore(v, b)
+            dacc = muladd(v, vload(_CVF, _cvptr(p, i, j, ld)), dacc); i += _CHOLW
+        end
+        dot += sum(dacc)
+        while i <= m
+            v = unsafe_load(p, _clidx(i, col, ld)) * hi; unsafe_store!(p, v, _clidx(i, col, ld))
+            dot = muladd(v, unsafe_load(p, _clidx(i, j, ld)), dot); i += 1
+        end
+        return dot
+    end
+end
+# axpy tail of H_col applied to column j: A[:,j] += kk·v_col (head A[col,j] += kk since v[col]=1).
+@inline function _qr_axpy1_f64!(p::Ptr{Float64}, m::Int, col::Int, j::Int, ld::Int, kk::Float64)
+    @inbounds begin
+        unsafe_store!(p, unsafe_load(p, _clidx(col, j, ld)) + kk, _clidx(col, j, ld))
+        vk = _CVF(kk); i = col + 1
+        while i + _CHOLW - 1 <= m; bj = _cvptr(p, i, j, ld); vstore(muladd(vk, vload(_CVF, _cvptr(p, i, col, ld)), vload(_CVF, bj)), bj); i += _CHOLW; end
+        while i <= m; unsafe_store!(p, muladd(kk, unsafe_load(p, _clidx(i, col, ld)), unsafe_load(p, _clidx(i, j, ld))), _clidx(i, j, ld)); i += 1; end
+    end
+end
 # Unblocked panel reduction (faer port). RANK-2: factor columns in PAIRS — the two reflectors + the H0→col+1
 # cross-apply are the rank-1 path, but the BULK trailing columns (j≥col+2) get a FUSED rank-2 apply (one read
 # pass for both dots + one read/write pass for the rank-2 axpy) instead of two rank-1 sweeps, halving the
@@ -43,9 +88,17 @@ function qr_unblocked!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64})
     GC.@preserve A begin
         p = pointer(A); col = 1
         @inbounds while col <= k
-            t0 = _qr_reflect_f64!(p, m, col, ld); tau[col] = isinf(t0) ? Inf : 1.0 / t0
-            if col + 1 <= k && !isinf(t0)
-                _qr_apply1_f64!(p, m, col, col + 1, ld, t0)         # H0 → col+1
+            if col + 1 > k                                          # last single column → full reflect (scales)
+                t0 = _qr_reflect_f64!(p, m, col, ld); tau[col] = isinf(t0) ? Inf : 1.0 / t0
+                col += 1; continue
+            end
+            hi0, t0 = _qr_norm_head_f64!(p, m, col, ld); tau[col] = isinf(t0) ? Inf : 1.0 / t0
+            if isinf(t0)                                            # trivial H0: column untouched, nothing to apply
+                col += 1; continue
+            end
+            begin
+                dot0 = _qr_scale_dot_f64!(p, m, col, col + 1, ld, hi0)  # FUSED reflect0-scale + apply1-dot (1 pass)
+                _qr_axpy1_f64!(p, m, col, col + 1, ld, -dot0 * t0)      # H0 → col+1 (axpy)
                 t1 = _qr_reflect_f64!(p, m, col + 1, ld); tau[col + 1] = isinf(t1) ? Inf : 1.0 / t1
                 if isinf(t1)
                     for j in col+2:n; _qr_apply1_f64!(p, m, col, j, ld, t0); end
@@ -76,9 +129,6 @@ function qr_unblocked!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64})
                     end
                 end
                 col += 2
-            else
-                for j in col+1:n; isinf(t0) || _qr_apply1_f64!(p, m, col, j, ld, t0); end
-                col += 1
             end
         end
     end
