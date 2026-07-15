@@ -1608,6 +1608,166 @@ function _trsm_fused_L!(unit::Bool, A, B)
     return B
 end
 
+# ===== Whole-k packed fused gemmtrsm (side-L, upper, no-trans) — the shared-panel design =====
+# The single-leaf `_trsm_fused_L!` is fed KC≤_TRSM_FUSED_BASE (≈64) blocks by the recursion, then the
+# off-diagonal coupling is a SEPARATE peak-dgemm `_gemm_sub!` that writes B UNPACKED — so every leaf
+# boundary re-reads/re-packs B (measured 14–20% of the leaf) AND the small-KC leaves pay a large 1/k
+# tax (back-sub latency ≈ MR/k, transpose-pack ≈ 1/k → ~40% overhead at KC=64). BLIS/AOCL avoid BOTH:
+# one gemmtrsm sweep per stripe whose gemm portion accumulates against the WHOLE packed solved-X tail
+# (no separate off-diagonal gemm, no re-pack), at whole-k so the 1/k tax vanishes. This is that sweep.
+#
+# U is packed ONCE per call into MR-row micropanels (unit-stride gemm reads, mirroring BLIS packed-A).
+# MEASURED CAVEAT: packing did NOT lift the slab gemm — the whole-k sweep runs ~40.6 GF packed OR
+# unpacked (the ~35 GF figure was the SMALL-KC recursion leaf, back-sub-latency-bound, not U-stride-
+# bound). Kept as the structurally-correct BLIS shared-panel layout (substrate for the next lever); the
+# residual to AOCL's 42 GF is the microkernel rate, not the re-pack (see the _TRSM_FULLPACK_ON note).
+# Micro-panel si (rows [s,s+MR), s=si·MR) is MR×(k−s) column-major: MP_si[c·MR+r] = U[s+r, s+c], c∈[0,k−s).
+# gemm reads U[s+r,kk] = MP_si[(kk−s)·MR+r] (kk≥s+MR); back-sub reads U[s+j,s+i] = MP_si[i·MR+j] (j<i).
+# Below-diagonal diag-block entries (r>c) are stored but never read (upper-tri). Offset closed-form
+# (no per-slab table): _mp_off(si) = MR·si·k − MR²·si·(si−1)/2. AVX-512-f64 only (needs the 8×8 pack).
+@inline _mp_off(si::Int, k::Int, MR::Int) = MR * si * k - (MR * MR * si * (si - 1)) ÷ 2
+
+# One MR-row slab × one NR-column stripe, reading U from its packed micropanel MPp (unit stride). Same
+# structure as `_gemmtrsm_u_slab!` but the gemm kk-loop spans the FULL tail [s+MR,KC) (the whole solved-X
+# panel, = the recursion's off-diagonal fused in) and U reads are unit-stride within the micropanel.
+@inline @generated function _gemmtrsm_u_slab_packed!(Pp::Ptr{T}, ldp::Int, MPp::Ptr{T}, rp::Ptr{T},
+        s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    end
+    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    push!(inner.args, :(ub = MPp + (kk - s) * $(MR * sz)))  # &MP_si[(kk−s)·MR] = U[s:,kk] column (MR contig)
+    for v in 0:NRV-1
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+    end
+    for r in 0:MR-1
+        push!(inner.args, :(u = $V(unsafe_load(ub + $(r * sz)))))
+        for v in 0:NRV-1
+            cs = Symbol(:c, r, :_, v)
+            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+        end
+    end
+    push!(body.args, :(for kk in UnitRange(s + $MR, KC - 1); $inner; end))
+    for r in 0:MR-1, v in 0:NRV-1                          # subtract: acc = B[s+r] − acc
+        cs = Symbol(:c, r, :_, v)
+        push!(body.args, :($cs = vload($V, Pp + ((s + $r) * ldp + $(v * W)) * $sz) - $cs))
+    end
+    for i in MR-1:-1:0                                     # back-substitution, critical-path-first
+        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        for v in 0:NRV-1
+            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+        end
+        for j in (i-1):-1:0
+            push!(body.args, :(u = $V(unsafe_load(MPp + $((i * MR + j) * sz)))))
+            for v in 0:NRV-1
+                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
+                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+            end
+        end
+    end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Ragged bottom tail (rem<MR rows, no rows below → pure back-sub), reading the rem×rem packed micropanel
+# MPt (col-major, ld=rem): U[base+jr,base+ir] = MPt[ir·rem+jr]. Rare (k not a multiple of MR).
+@inline function _gemmtrsm_u_tail_packed!(Pp::Ptr{T}, ldp::Int, MPt::Ptr{T}, rp::Ptr{T},
+        base::Int, KC::Int, rem::Int, ::Val{NRV}) where {T, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    @inbounds for i in (KC - 1):-1:base
+        ir = i - base; d = V(unsafe_load(rp + i * sz))
+        for v in 0:NRV-1
+            q = Pp + (i * ldp + v * W) * sz
+            ci = vload(V, q) * d; vstore(ci, q)
+            for j in (i - 1):-1:base
+                u = V(unsafe_load(MPt + (ir * rem + (j - base)) * sz))
+                qj = Pp + (j * ldp + v * W) * sz
+                vstore(muladd(-u, ci, vload(V, qj)), qj)
+            end
+        end
+    end
+    return nothing
+end
+
+# Pack A's upper triangle → MR-row micropanels (MP) + reciprocal diagonal (rp). One pass per trsm call.
+function _pack_U_micro!(MP::Ptr{T}, rp::Ptr{T}, pA::Ptr{T}, lda::Int, k::Int, unit::Bool,
+        MR::Int, nfull::Int, rem::Int) where {T}
+    sz = sizeof(T)
+    @inbounds for si in 0:nfull-1
+        s = si * MR; moff = _mp_off(si, k, MR)
+        for c in 0:(k - s - 1)
+            dst = MP + (moff + c * MR) * sz
+            src = pA + (s + (s + c) * lda) * sz            # &A[s, s+c]
+            for r in 0:MR-1; unsafe_store!(dst + r * sz, unsafe_load(src + r * sz)); end
+        end
+    end
+    if rem > 0
+        s = nfull * MR; moff = _mp_off(nfull, k, MR)
+        @inbounds for c in 0:rem-1, r in 0:rem-1
+            unsafe_store!(MP + (moff + c * rem + r) * sz, unsafe_load(pA + ((s + r) + (s + c) * lda) * sz))
+        end
+    end
+    @inbounds for i in 0:k-1
+        unsafe_store!(rp + i * sz, unit ? one(T) : inv(unsafe_load(pA + (i + i * lda) * sz)))
+    end
+    return nothing
+end
+
+# Whole-k driver: solve U·X=B in place, U upper k×k, B k×n wide — ONE packed sweep, NO recursion. P is
+# k×NR row-major (per NR-column stripe, reused; L2-resident at gate k). U packed once (½L3-bounded, see
+# _TRSM_FULLPACK_MAX). Column stripes OUTER / slabs INNER — P stays hot across a stripe's whole solve.
+function _trsm_fused_full_L!(unit::Bool, A, B)
+    T = eltype(B); k = size(A, 1); n = size(B, 2); sz = sizeof(T)
+    W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
+    lda = stride(A, 2); ldb = stride(B, 2)
+    nfull = k ÷ MR; rem = k - nfull * MR
+    packUlen = _mp_off(nfull, k, MR) + (rem > 0 ? rem * rem : 0)
+    buf = _trsm_fused_buf(T, k * NR + packUlen + k)
+    GC.@preserve A B buf begin
+        pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
+        MP = Pp + k * NR * sz; rp = MP + packUlen * sz
+        _pack_U_micro!(MP, rp, pA, lda, k, unit, MR, nfull, rem)
+        MPt = MP + _mp_off(nfull, k, MR) * sz
+        jc = 0
+        while jc < n
+            wid = min(NR, n - jc)
+            _fused_packP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
+            rem > 0 && _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, nfull * MR, k, rem, Val(NRV))
+            for si in (nfull - 1):-1:0
+                _gemmtrsm_u_slab_packed!(Pp, NR, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
+            end
+            _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
+            jc += NR
+        end
+    end
+    return B
+end
+# Same-process A/B switch for the whole-k packed sweep vs the recursion+single-leaf path.
+# DEFAULT OFF: the shared-panel restructure eliminates the re-pack round-trip and is correct, but measured
+# only reaches AOCL PARITY (~0.97 large-n, ~0.87 small-n) — NOT the ≥1.0 mandate. The re-pack was NOT the
+# binding lever: the fused-slab microkernel intrinsically runs ~40.6 GF vs PB's own dgemm 43 / AOCL trsm 42,
+# worst at small n (PB 31 vs AOCL 37 @128). It also shows a noise-level regression at po2 n=512, which the
+# no-regression contract forbids. Kept behind this toggle as the validated re-pack-free substrate for the
+# real next lever (inverted-diagonal epilogue + C-tile prefetch on the packed slab — target the microkernel
+# rate + small-n back-sub latency, not the driver). Flip to true for the same-process A/B that measured this.
+const _TRSM_FULLPACK_ON = Ref(false)
+# Whole-k cutoff: packed-U micropanels hold the upper triangle ≈ k²/2 elements; bound to ½·L3 residency
+# (req#8): (k²/2)·sizeof(T) ≤ _L3_BYTES/2 ⟹ k ≤ isqrt(_L3_BYTES ÷ sizeof(T)). Above → recursion bottoms here.
+const _TRSM_FULLPACK_MAX = isqrt(_L3_BYTES ÷ sizeof(Float64))
+# Lower crossover: the whole-k sweep's flat overheads (transpose-pack O(k·NR), back-sub O(MR)/slab) amortize
+# only for large k; below it the ½-split recursion — which runs its off-diagonal at TRUE dgemm peak (43 GF)
+# vs the fused slab's ~40.6 — wins. Crossover ≈ where the k×NR P-stripe exceeds ~2·L1 (whole-k must stream
+# P from L2, erasing the recursion's small-leaf L1 locality edge, so its lower overhead takes over): k ≥
+# 2·L1/(NR·sizeof). Measured Zen4 crossover is 256<k≤384; the formula gives ≈342. EMPIRICAL crossover —
+# req#8 debt (derive+fleet-validate), Preferences-overridable. Measured net: 512 0.889→0.90, 1024 0.94→0.97.
+const _TRSM_FULLPACK_MIN = @load_preference("trsm_fullpack_min",
+    cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64)))::Int
+
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
@@ -1616,6 +1776,10 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # the side-L row split, so the choice is consistent through the recursion.
         if size(B, 2) <= _TRSM_NCUT
             k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
+        elseif up && !tr && _GT_TRANSPOSE && _TRSM_FULLPACK_ON[] &&
+                _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
+            # Whole-k packed sweep (shared solved-X panel, no recursion / re-pack). AVX-512-f64, large-k only.
+            return _trsm_fused_full_L!(unit, A, B)
         elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B) &&
                 (_GT_TRANSPOSE || size(B, 2) <= _TRSM_FUSED_BASE)
             # Fused gemmtrsm leaf (1× flop). AVX-512 (transpose pack): fires at EVERY k ≤ base diagonal block,

@@ -113,6 +113,12 @@ end
         P._trsm_fused_L!(false, Aup, randn(128, 256))                     # warm the ftrsm buffer
         @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
         @assert_noalloc P._trsm_fused_L!(false, Aup, randn(128, 256)) static = false
+        # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
+        # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer.
+        Auf = (M = triu(randn(512, 512)); for i in 1:512; M[i, i] += 512.0; end; M)
+        P._trsm_fused_full_L!(false, Auf, randn(512, 256))               # warm the ftrsm buffer
+        @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
+        @assert_noalloc P._trsm_fused_full_L!(false, Auf, randn(512, 256)) static = false
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
         @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512) static = false
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
