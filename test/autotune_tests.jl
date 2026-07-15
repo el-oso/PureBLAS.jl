@@ -41,6 +41,23 @@
     @test P._at_mc_kc(galen, ComplexF64, 256, 16, 4096) == 32        # 512K L2 → half of Zen4/Zen5
     @test P._at_mc_kc(wintermute, Float64, 256, 16, 4096) == 144     # real path unchanged (8 B/elt)
 
+    # ── Pack crossovers (req#8): register-capacity cut for gemm/rank-k, L2-copy-residency for symm ─────
+    @test P._at_gemm_unpack_max(galen) == 96          # 2·(16−4)·4 ; measured unpk/blk tie-band 80–112
+    @test P._at_gemm_unpack_max(wintermute) == 448    # 2·(32−4)·8 ; EXACT match to the validated Zen4 literal
+    @test P._at_gemm_unpack_max(neuromancer) == 448
+    @test P._at_rank_k_pack_cut(galen) == 84          # (7·48)/4 ; routes n=80→recursion, 96→packed (syrk/syr2k)
+    @test P._at_rank_k_pack_cut(wintermute) == 392    # predicted (was a 448 placeholder) — validate on AVX-512
+    @test P._at_rank_k_pack_cut(neuromancer) == 392
+    @test P._at_symm_mat_max(galen) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
+    @test P._at_symm_mat_max(wintermute) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
+    @test P._at_symm_mat_max(neuromancer) == 362
+    @test P._at_symm_mat_max(tigerlake) == 404        # isqrt(1280K/8) — out-of-fleet auto-size, no crash
+    # live wired consts equal the formula applied to the detected _HW
+    @test P._GEMM_UNPACK_MAX == P._at_gemm_unpack_max(P._HW)
+    @test P._SYRK_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
+    @test P._SYR2K_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
+    @test P._SYMM_PACK_CUT == P._at_symm_mat_max(P._HW)
+
     # ── Out-of-fleet auto-sizing (no crash, sane values) — the whole point of the mandate ─────────────
     @test P._at_cpotf2_mr(tigerlake) == 1    # Intel native-512
     @test P._at_cpotrf_base(tigerlake) == 64
