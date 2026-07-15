@@ -2498,13 +2498,16 @@ end
 # Recursion base for the diagonal (gemm→temp + triangle-add wastes 2× flops on b×b; smaller base =
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
-# n above which the single-pass packed syrk beats the gemm→temp recursion. On W=8 = _GEMM_UNPACK_MAX
-# (unchanged: recursion up to the gemm unpack size, packed above). On AVX2 the recursion base's 2×-flop
-# waste bites earlier and the packed path (per-microtile diagonal, no waste) wins from n≈24 — but the
-# tiny-n gemm base still wins below that (packing overhead dominates on n≤20). Overridable per machine.
+# n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
+# diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) from the
+# register file via `_at_rank_k_pack_cut` = (7·(nvreg−4)·W)/4 — same REGISTER-capacity criterion as gemm's
+# unpack cut, ×7/4 (vs gemm ×2) for the recursion's extra flop/split cost (see cpuinfo.jl). Reproduces galen
+# 84 (measured: recursion wins n≈40–80, packed decisive n≥96 — routes n=80→recursion, 96→packed; the old
+# literal 23 mis-routed n=48/80 to the slower packed path, causing the galen AOCL misses there). Predicts
+# Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX=448 placeholder — A/B on the AVX-512 boxes). Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
-const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _vwidth(Float64) == 4 ? 23 : _GEMM_UNPACK_MAX)::Int
+const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
 # no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):
 # trans='N' recursion base packs A's contiguous columns via the fast SIMD deinterleave → it WINS small-n
@@ -2989,10 +2992,16 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T<:BlasReal}
     return C
 end
 
-# n above which symm uses the single-pass packed kernel (branchless symmetric pack) vs materialize+gemm.
-# On AVX2 the branchless pack makes packed win from n=128 (0.97 vs materialize 0.95); AVX-512 unchanged
-# (materialize ≤ _GEMM_UNPACK_MAX, already gates). Overridable "symm_pack_cut".
-const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
+# n above which symm uses the single-pass packed kernel vs materialize (O(n²) dense copy of the triangle) +
+# the flagship gemm. DERIVED (req#8) via `_at_symm_mat_max` = √(L2/sizeof): a DIFFERENT criterion from the
+# rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured galen n (packed
+# is dead weight on AVX2), and the only thing that unseats it is the O(n²) copy evicting the gemm's resident
+# L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Galen measured a mat≈pack
+# tie at EXACTLY n=256=√(512K/8) (they converge for all n≥256), pinning the fraction at 1. This lifts the cut
+# off the mistuned 96 (which routed n=112–192 to the slower packed path → the galen AOCL misses) to 256.
+# Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
+# Overridable "symm_pack_cut".
+const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW))::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
 # conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
 # the materialize path routes to _gemm_core!'s Karatsuba-3M at mid-n — the SAME path complex symm already
@@ -3105,11 +3114,12 @@ function _syr2k_dims(C, A, B, trans)
     (trans == 'N' ? size(A, 1) : size(A, 2)) == n || throw(DimensionMismatch("syr2k!: op(A) rows ≠ n"))
     (n, k)
 end
-# n above which syr2k uses the single-pass fused packed kernel (else the gemm-temp recursion). On AVX2
-# _GEMM_UNPACK_MAX (128) was too high — n=128 fell to recursion (gate 0.95) while the packed kernel gates
-# (n=128 0.95→1.01). Cut to 96 there (n≥128 packed, ≤64 recursion). AVX-512 unchanged (already gates).
+# n above which syr2k uses the single-pass fused packed kernel (else the gemm-temp recursion). Same
+# REGISTER-capacity criterion as syrk → shares `_at_rank_k_pack_cut` = (7·(nvreg−4)·W)/4 (see cpuinfo.jl).
+# Reproduces galen 84 (measured: recursion wins n≤80, packed wins n≥96 — the old literal 96 routed n=96 to
+# the slower recursion; 84 routes it to packed). Predicts Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX placeholder).
 # Overridable "syr2k_pack_cut".
-const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _vwidth(Float64) == 4 ? 96 : _GEMM_UNPACK_MAX)::Int
+const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
 # recursion (which computes a dense n×n temp per diagonal block — the 2× waste). Tuned per machine.
 const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", _vwidth(Float64) == 4 ? 8 : 8)::Int

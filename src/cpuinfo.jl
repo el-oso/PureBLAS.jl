@@ -169,3 +169,31 @@ const _GEMM_SPLIT_S = 2
 @inline _at_cpotf2_mr(hw) = max(1, 64 ÷ _datapath_bytes(hw))
 @inline _at_cpotrf_base(hw) = 32 + 4 * _lanes(hw, Float64)
 @inline _at_cpotrf_nbmax(hw) = 64 + 16 * _lanes(hw, Float64)
+
+# (f) Pack crossovers for gemm/syrk/syr2k (req#8). Above `n`, a single-pass PACKED kernel is used; at/below,
+# the cheaper "re-stream the operand directly from cache" path (unpacked microkernel for gemm, recursion for
+# rank-k). Criterion: REGISTER CAPACITY, not cache residency. The fleet's measured Zen4 crossover (448) puts
+# one square operand at 448²·8 = 1.6 MB ≫ 1 MB L2 — the re-stream path demonstrably wins while only L3-
+# resident, which FALSIFIES an L2-residency law (a `sqrt(L2)·W²` fit only appeared to work because on this
+# fleet the small-L2 box is also the narrow-W box: L2 and W are collinear). The re-stream path wins while the
+# microkernel's accumulator working set stays register-bound; it loses once the packed kernel's contiguous
+# reuse amortizes. Base quantity = the FP register file's accumulator capacity in elements:
+#   _acc_cap = (nvreg − 4)·W,  where 4 = the k-step's operand registers (MR A-loads + 1 B-broadcast; the same
+#   budget `_at_gemm_mr` reserves — galen's 3×4 tile uses all 16 regs: 12 acc + 3 A + 1 B). Op multiples are
+#   machine-INDEPENDENT op-shape calibration (like `_l1_block`'s ½, `_at_gemm_mc`'s 3/10): gemm pays 2 passes
+#   (read+write) to pack → ×2; rank-k's re-stream alternative is recursion (2×-flop diagonal + split overhead)
+#   so it packs slightly earlier → ×7/4. Reproduces galen (nvreg16,W4): gemm 96 (measured tie-band 80–112),
+#   rank-k 84 (routes n=80→recursion, 96→packed). Predicts Zen4/Zen5 (nvreg32,W8): gemm 448 (EXACT match to the
+#   validated literal), rank-k 392 (was a 448 placeholder — A/B on wintermute/neuromancer before trusting). req#8.
+@inline _acc_cap(hw, ::Type{T} = Float64) where {T} = (hw.nvreg - 4) * _lanes(hw, T)
+@inline _at_gemm_unpack_max(hw, ::Type{T} = Float64) where {T} = 2 * _acc_cap(hw, T)
+@inline _at_rank_k_pack_cut(hw, ::Type{T} = Float64) where {T} = (7 * _acc_cap(hw, T)) >> 2
+# symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
+# copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
+# packed symmetric kernel at EVERY measured galen n (the packed path is dead weight on AVX2), and the only
+# thing that can kill it is the O(n²) copy evicting the gemm's resident A-block from L2 — i.e. when the
+# materialized n×n copy no longer fits L2. Threshold = side of a square that fills L2: n = √(L2/sizeof). Galen
+# measured a mat≈pack TIE at exactly n=256 = √(512K/8), pinning the fraction at 1. This lifts the cut off the
+# mistuned 96 (which routed n=112–192 to the slower packed path, the AOCL misses) up to 256, routing the whole
+# gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on wintermute). req#8.
+@inline _at_symm_mat_max(hw, ::Type{T} = Float64) where {T} = Base.isqrt(hw.l2 ÷ sizeof(T))

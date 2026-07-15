@@ -606,16 +606,15 @@ end
 # B is strided scalar broadcasts. Requires tA='N' (transposed A would need strided loads). Reference:
 # BLASFEO switches algorithms by matrix size (Frison et al., arXiv:1902.08115). See kb finding
 # pureblas-gemm-performance.
-# Use the unpacked path when max(m,n,k) ≤ this. Tuned on Zen4: unpacked (no packing, re-streams A
-# from L2/L3) beats the blocked path until A no longer fits ~L2 (square n≈448; n=512 flips to
-# blocked). ponytail: crude max() heuristic; a rectangular A (m·k fits but n huge) would also prefer
-# unpacked — refine to an A-fits-L2 test if skewed shapes matter.
-# Width-adaptive + Preferences-overridable (the unpacked path fits A in L2; the L2/register
-# tradeoff differs by ISA — Zen4 flips at n≈448, Zen3/AVX2 loses earlier). Override "gemm_unpack_max".
-# AVX2 re-swept 128→80 after the direct-B blocked path (no B-pack) became faster: the unpacked path now
-# only wins n≤~64 (measured galen: n=64 unpk 1.05 vs blk 1.00; n=96 unpk 1.00 vs blk 1.04; n=128 unpk
-# 0.89 vs blk 1.01 vs AOCL) — so n=96–128 now route to blocked-direct-B. AVX-512 unmeasured here (left 448).
-const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _W64 == 8 ? 448 : _W64 == 4 ? 80 : 192)::Int
+# Use the unpacked path when max(m,n,k) ≤ this. The unpacked microkernel re-streams A directly from cache;
+# it wins while the accumulator working set stays register-bound and loses once the blocked-direct-B path's
+# contiguous reuse amortizes. DERIVED (req#8) from the register file via `_at_gemm_unpack_max` = 2·(nvreg−4)·W
+# — a REGISTER-capacity criterion, not L2 residency (Zen4's crossover puts one operand at 1.6 MB ≫ L2, so
+# L2-residency is falsified; see cpuinfo.jl). Reproduces galen 96 (measured unpk/blk tie-band 80–112) and
+# Zen4/Zen5 448 (the validated literal, EXACT); overridable "gemm_unpack_max". ponytail: crude max() heuristic;
+# a rectangular A (m·k fits but n huge) would also prefer unpacked — refine to an A-fits-registers test if
+# skewed shapes matter. (n=128+ route to blocked-direct-B; measured galen best=blk from ~128.)
+const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max(_HW))::Int
 @inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX
 
 # Unpacked microkernel: full mr×nr tile, reading A (tA='N') and op(B) directly. alpha applied at
