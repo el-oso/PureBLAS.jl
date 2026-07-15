@@ -1359,6 +1359,144 @@ function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                                                    _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
 end
 
+# ===== Fused gemmtrsm (side-L, upper, no-trans) — BLIS/AOCL-style diagonal-block leaf =====
+# Replaces the invL 2×-flop leaf for the trsm gate shape (solve U·X=B, U upper k×k, B k×n wide).
+# Design (Fable + BLIS bli_dgemmtrsm_u): RHS columns → SIMD lanes; per MR-row slab, accumulate the
+# trailing gemm (rows below, already solved) over ALL rows below, then an in-register MR×MR back-
+# substitution with pre-inverted diagonal. Beats invL (1× flop vs 2×) and the old serial epilogue
+# (MR-granular chain of NR-wide vector steps + full-k amortization hides the substitution latency).
+# The KC×NR column-stripe of B is packed ROW-MAJOR into P (row i at Pp+i·NR, NR contiguous = NRV
+# vectors); U is read column-major directly (scalar broadcasts; KC×KC block is L2-resident).
+#
+# Tile geometry DERIVED from the register file (req#8): NRV column-vectors/row + MR rows so that
+# MR·NRV accumulators + NRV RHS-slice + 2 broadcast/slack ≤ nreg. nreg=32(AVX-512)→8×24 f64 /8×48 f32;
+# nreg=16(AVX2)→6×8. Reproduces BLIS zen4 8×24 / haswell 6×8. Preferences-overridable (fleet calib).
+const _GT_NREG = _SIMD_BYTES >= 64 ? 32 : 16
+const _GT_NRV = @load_preference("gemmtrsm_nrv", _GT_NREG >= 32 ? 3 : 2)::Int
+const _GT_MR  = @load_preference("gemmtrsm_mr",  min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV))::Int
+# Fused-leaf block size: bigger KC ⇒ smaller solve fraction, bounded by KC×KC U ⊆ L2. ponytail: 128
+# (= _L3_NB, the block-scratch analog) is safe/measured; knob to sweep 256. Recursion above feeds it.
+const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base", 128)::Int
+# Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
+# the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
+const _TRSM_FUSED_ON = Ref(true)
+
+# One MR-row slab, one NR-column stripe: acc = B[slab] − U12·X21 (gemm, kk over solved rows below),
+# then in-register MR×MR back-substitution (bottom-up, critical-path-first), stored back into P.
+# Pp: &P at (row 0, this stripe's column) — P is the WHOLE KC×ncol row-major stripe buffer, row stride
+# ldp (elements). Up: &U[0,0], ldu. rp: &recip[0]. s: slab top row. Slabs OUTER / stripes INNER in the
+# driver ⇒ for a fixed slab the U reads hit the same addresses across stripes → U read L2→L1 ONCE, reused.
+@inline @generated function _gemmtrsm_u_slab!(Pp::Ptr{T}, ldp::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T},
+        s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    body = quote end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    end
+    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    for v in 0:NRV-1
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+    end
+    for r in 0:MR-1
+        push!(inner.args, :(u = $V(unsafe_load(Up + ((s + $r) + kk * ldu) * $sz))))
+        for v in 0:NRV-1
+            cs = Symbol(:c, r, :_, v)
+            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+        end
+    end
+    push!(body.args, :(for kk in UnitRange(s + $MR, KC - 1); $inner; end))
+    for r in 0:MR-1, v in 0:NRV-1                          # subtract: acc = B[s+r] − acc
+        cs = Symbol(:c, r, :_, v)
+        push!(body.args, :($cs = vload($V, Pp + ((s + $r) * ldp + $(v * W)) * $sz) - $cs))
+    end
+    for i in MR-1:-1:0                                     # back-substitution, critical-path-first
+        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        for v in 0:NRV-1
+            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+        end
+        for j in (i-1):-1:0
+            push!(body.args, :(u = $V(unsafe_load(Up + ((s + $j) + (s + $i) * ldu) * $sz))))
+            for v in 0:NRV-1
+                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
+                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+            end
+        end
+    end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Ragged bottom slab (rem<MR rows, [base,KC) → no rows below, pure solve), one NR stripe. Rare (KC not a
+# multiple of MR = non-power-of-2 leaves). NRV column-vectors, runtime row count. P row stride ldp.
+@inline function _gemmtrsm_u_tail!(Pp::Ptr{T}, ldp::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, base::Int,
+        KC::Int, ::Val{NRV}) where {T, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    @inbounds for i in (KC - 1):-1:base
+        d = V(unsafe_load(rp + i * sz))
+        for v in 0:NRV-1
+            q = Pp + (i * ldp + v * W) * sz
+            ci = vload(V, q) * d; vstore(ci, q)
+            for j in (i - 1):-1:base
+                u = V(unsafe_load(Up + (j + i * ldu) * sz))
+                qj = Pp + (j * ldp + v * W) * sz
+                vstore(muladd(-u, ci, vload(V, qj)), qj)
+            end
+        end
+    end
+    return nothing
+end
+
+# Driver: solve U·X = B in place, U upper KC×KC (view of A), B KC×n wide. up=true, no-trans, non-conj.
+# Column stripes OUTER (NR at a time) / slabs INNER: each stripe's P (KC×NR ≈ L1) is packed, fully solved
+# (all slabs), unpacked — P stays L1-hot for the whole stripe solve. U (KC×KC in L2) is re-read per stripe
+# (cheap; L2-resident). Whole-B packing (P=KC×n) was measured WORSE (P spills L1) — keep P per-stripe.
+# Float64 only: for Float32 the invL leaf (2×-flop at ~2×-higher f32 gemm peak) already beats the fused
+# leaf even at n=128 (measured −18% if fused) — f32 stays on invL. The kernel itself is T-generic.
+@inline _trsm_fusable(A, B) = eltype(B) === Float64 &&
+    A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 && stride(B, 1) == 1
+function _trsm_fused_L!(unit::Bool, A, B)
+    T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
+    W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
+    lda = stride(A, 2); ldb = stride(B, 2)
+    nfull = KC ÷ MR; rem = KC - nfull * MR
+    # Buffer = P (KC×NR row-major, L1) ‖ compact U (KC×KC col-major, ldu=KC) ‖ recip (KC). Packing U once
+    # per leaf (into a contiguous KC² buffer, ldu=KC) fixes the parent-matrix large-`lda` scatter + keeps
+    # the per-stripe U re-reads on a compact L2-resident panel (else the off-diagonal gemm evicts it → DRAM).
+    buf = _trsm_fused_buf(T, KC * NR + KC * KC + KC)
+    GC.@preserve A B buf begin
+        pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
+        pU = Pp + KC * NR * sz; rp = pU + KC * KC * sz
+        @inbounds for c in 0:KC-1                         # pack A's upper triangle → compact U (ldu=KC)
+            for r in 0:c; unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * KC + 1); end
+        end
+        @inbounds for i in 0:KC-1
+            unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, i + i * lda + 1)), i + 1)
+        end
+        jc = 0
+        while jc < n
+            wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
+            @inbounds for i in 0:KC-1                     # pack B[:,jc:jc+wid) → P row-major, zero-pad tail
+                srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NR * sz
+                for v in 0:wid-1; unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1); end
+                for v in wid:NR-1; unsafe_store!(drow, zero(T), v + 1); end
+            end
+            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pU, KC, rp, nfull * MR, KC, Val(NRV))
+            for si in (nfull - 1):-1:0
+                _gemmtrsm_u_slab!(Pp, NR, pU, KC, rp, si * MR, KC, Val(MR), Val(NRV))
+            end
+            @inbounds for i in 0:KC-1                     # unpack P → B[:,jc:jc+wid)
+                srow = Pp + i * NR * sz; drow = pB + (i + jc * ldb) * sz
+                for v in 0:wid-1; unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1)); end
+            end
+            jc += NR
+        end
+    end
+    return B
+end
+
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
 function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
@@ -1367,6 +1505,12 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # the side-L row split, so the choice is consistent through the recursion.
         if size(B, 2) <= _TRSM_NCUT
             k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
+        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE &&
+                size(B, 2) <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
+            # Fused gemmtrsm leaf (1× flop, ~30 GF). Gated to the SINGLE-LEAF regime (B width ≤ base):
+            # there it beats invL (n=128 worst-AOCL point). For wider B the recursion's deep off-diagonal
+            # gemms run near peak (~38 GF) and BEAT the 30-GF fused leaf, so keep invL/recursion there.
+            return _trsm_fused_L!(unit, A, B)
         elseif k <= _TRSM_BASE
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
