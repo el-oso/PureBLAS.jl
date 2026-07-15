@@ -1390,6 +1390,17 @@ const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base",
 # Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
 # the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
 const _TRSM_FUSED_ON = Ref(true)
+# When true, the AVX-512 transpose pack falls back to the alias-free column-outer scalar pack on a 4K-aliased
+# ldb (see the useT note). ponytail: A/B toggle now; promote to always-on (derive from the aliasing predicate,
+# no Ref) once measured to gate. Default matches shipped behaviour until validated.
+# Lever 1 (default ON): the AVX-512 fused-leaf + fullpack sweeps use the fused first/last-touch-transpose
+# slabs (`_gemmtrsm_u_slab_upk_fusedT!` / `_gemmtrsm_u_slab_fusedT!`) for full stripes — read own rows
+# straight from B (in-register 8×8 transpose), gemm-reuse from row-major P, store to P + transposed to B —
+# eliminating the standalone _fused_packP_tr!/_fused_unpackP_tr! passes (the 9.4%-of-stripe pack round-trip
+# at k=128). Bit-identical to the pack path; measured strict no-regression win fleet-dev (Zen5): n=512
+# 0.930→0.960, 1024 0.970→0.989, 513 0.998→1.058 vs AOCL. AVX-512-f64 (W==MR==8) only; no-op elsewhere.
+# ponytail: kept as a Ref for controlled A/B (mirrors _TRSM_FUSED_ON); the read is trivial vs the O(n²) solve.
+const _TRSM_FUSEDT_ON = Ref(true)
 
 # One MR-row slab, one NR-column stripe: acc = B[slab] − U12·X21 (gemm, kk over solved rows below),
 # then in-register MR×MR back-substitution (bottom-up, critical-path-first), stored back into P.
@@ -1434,6 +1445,68 @@ const _TRSM_FUSED_ON = Ref(true)
     end
     for r in 0:MR-1, v in 0:NRV-1
         push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Compact-U fused first/last-touch-transpose slab (Lever 1 for the SHIPPED recursion leaf). Same as
+# `_gemmtrsm_u_slab!` (reads U from the compact odd-ldu panel, col-major) but reads its own MR rows
+# STRAIGHT from B (in-register 8×8 transpose) for the subtract and writes solved rows to P (reuse) AND
+# transposed to B (final) — no standalone pack/unpack. REQUIRES W==MR==8 (AVX-512 f64), FULL stripe.
+@inline @generated function _gemmtrsm_u_slab_upk_fusedT!(Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
+        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    @assert W == 8 && MR == 8 "fusedT slab requires W==MR==8 (AVX-512 f64)"
+    body = quote end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    end
+    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    for v in 0:NRV-1
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+    end
+    for r in 0:MR-1
+        push!(inner.args, :(u = $V(unsafe_load(Up + ((s + $r) + kk * ldu) * $sz))))
+        for v in 0:NRV-1
+            cs = Symbol(:c, r, :_, v)
+            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+        end
+    end
+    push!(body.args, :(for kk in UnitRange(s + $MR, KC - 1); $inner; end))
+    for v in 0:NRV-1                                       # subtract: own rows read direct from B + transpose
+        for l in 0:W-1
+            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+        end
+        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:W-1)...)
+        push!(body.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:W-1)...)))))
+        for r in 0:MR-1
+            cs = Symbol(:c, r, :_, v)
+            push!(body.args, :($cs = $(Symbol(:br, r)) - $cs))
+        end
+    end
+    for i in MR-1:-1:0                                     # back-substitution, critical-path-first
+        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        for v in 0:NRV-1
+            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+        end
+        for j in (i-1):-1:0
+            push!(body.args, :(u = $V(unsafe_load(Up + ((s + $j) + (s + $i) * ldu) * $sz))))
+            for v in 0:NRV-1
+                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
+                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+            end
+        end
+    end
+    for v in 0:NRV-1                                       # store: → P row-major (reuse) AND transposed → B
+        for r in 0:MR-1
+            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+        end
+        ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:W-1)...)
+        push!(body.args, Expr(:(=), ccs, :(_tr8x8($((Symbol(:c, r, :_, v) for r in 0:MR-1)...)))))
+        for l in 0:W-1
+            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+        end
     end
     push!(body.args, :(return nothing))
     return body
@@ -1563,11 +1636,37 @@ function _trsm_fused_L!(unit::Bool, A, B)
         @inbounds for i in 0:KC-1
             unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, i + i * lda + 1)), i + 1)
         end
-        useT = _GT_TRANSPOSE                              # AVX-512 f64: vectorized 8×8-transpose pack (const-folds)
+        # AVX-512 f64: vectorized 8×8-transpose pack (const-folds). NOTE: the transpose reads 8 B-columns at
+        # stride ldb·sz simultaneously for the in-register 8×8 block — when ldb·sz is a big power-of-2 multiple
+        # (po2 n) those 8 accesses share low-12 bits → 4K-aliasing stall (measured +3.5%@512 / +1.7%@1024 from
+        # padding B). FALSIFIED fix: routing the aliased stride to the alias-free column-outer scalar pack
+        # regressed −0.9% (the scalar per-element cost outweighs the aliasing) — do NOT retry. The residual is
+        # structural: AOCL reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose); PB's
+        # column-lane back-sub needs the transpose. The fusedT slab (below) removes the P round-trip but not
+        # the aliasing. Escaping it needs the row-lane microkernel family (Fable: net-negative — deferred).
+        useT = _GT_TRANSPOSE
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
+        fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
         jc = 0
         while jc < n
             wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
+            if fusedT && wid == NR
+                if rem > 0                                # mini-pack/unpack the ragged tail rows around the tail solve
+                    b0 = nfull * MR
+                    @inbounds for v in 0:NR-1, i in 0:rem-1
+                        unsafe_store!(Pp + ((b0 + i) * NR + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
+                    end
+                    _gemmtrsm_u_tail!(Pp, NR, pU, ldu, rp, b0, KC, Val(NRV))
+                    @inbounds for v in 0:NR-1, i in 0:rem-1
+                        unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * NR + v) * sz))
+                    end
+                end
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab_upk_fusedT!(Pp, NR, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRV))
+                end
+                jc += NR
+                continue
+            end
             if useT
                 _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
             elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
@@ -1674,6 +1773,79 @@ end
     return body
 end
 
+# ── Fused first/last-touch-transpose slab (Lever 1: skip the P transpose round-trip) ──────────────
+# Same math as `_gemmtrsm_u_slab_packed!` but reads its OWN MR rows STRAIGHT from B (in-register 8×8
+# transpose) for the subtract, and writes the solved rows BOTH to P (row-major, so upper slabs' gemm
+# reuses them) AND transposed back to B (col-major, final). Eliminates the standalone _fused_packP_tr!
+# and _fused_unpackP_tr! passes (the pack round-trip = 9.4% of the stripe at k=128, decomposed). The
+# gemm phase is UNCHANGED (contiguous vloads from row-major P, written once by the solving slab; no
+# re-transpose on reuse — the P memoization Fable's design keeps). REQUIRES W==MR==8 (AVX-512 f64) and
+# a FULL stripe (all NRV column-blocks real, no zero-pad) — the driver routes the ragged last stripe to
+# the old pack path. jc = this stripe's first B-column; s = slab top row. Design: Fable consult 2026-07.
+@inline @generated function _gemmtrsm_u_slab_fusedT!(Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int, jc::Int,
+        MPp::Ptr{T}, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}) where {T, MR, NRV}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    @assert W == 8 && MR == 8 "fusedT slab requires W==MR==8 (AVX-512 f64)"
+    body = quote end
+    for r in 0:MR-1, v in 0:NRV-1
+        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    end
+    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    push!(inner.args, :(ub = MPp + (kk - s) * $(MR * sz)))
+    for v in 0:NRV-1
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+    end
+    for r in 0:MR-1
+        push!(inner.args, :(u = $V(unsafe_load(ub + $(r * sz)))))
+        for v in 0:NRV-1
+            cs = Symbol(:c, r, :_, v)
+            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+        end
+    end
+    push!(body.args, :(for kk in UnitRange(s + $MR, KC - 1); $inner; end))
+    # subtract: read own MR rows of B directly (block v = 8 cols [jc+v·8, jc+v·8+8), 8-row vloads down
+    # cols = contiguous), transpose in-register → row-vectors, acc = B[s+r] − acc. bc_l/br_r reused per v.
+    for v in 0:NRV-1
+        for l in 0:W-1
+            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+        end
+        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:W-1)...)
+        bcs = (Symbol(:bc, l) for l in 0:W-1)
+        push!(body.args, Expr(:(=), brs, :(_tr8x8($(bcs...)))))
+        for r in 0:MR-1
+            cs = Symbol(:c, r, :_, v)
+            push!(body.args, :($cs = $(Symbol(:br, r)) - $cs))
+        end
+    end
+    for i in MR-1:-1:0                                     # back-substitution, critical-path-first
+        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        for v in 0:NRV-1
+            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+        end
+        for j in (i-1):-1:0
+            push!(body.args, :(u = $V(unsafe_load(MPp + $((i * MR + j) * sz)))))
+            for v in 0:NRV-1
+                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
+                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+            end
+        end
+    end
+    # store: solved rows → P row-major (for upper slabs' gemm reuse) AND transposed → B col-major (final).
+    for v in 0:NRV-1
+        for r in 0:MR-1
+            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+        end
+        ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:W-1)...)
+        cvs = (Symbol(:c, r, :_, v) for r in 0:MR-1)
+        push!(body.args, Expr(:(=), ccs, :(_tr8x8($(cvs...)))))
+        for l in 0:W-1
+            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
 # Ragged bottom tail (rem<MR rows, no rows below → pure back-sub), reading the rem×rem packed micropanel
 # MPt (col-major, ld=rem): U[base+jr,base+ir] = MPt[ir·rem+jr]. Rare (k not a multiple of MR).
 @inline function _gemmtrsm_u_tail_packed!(Pp::Ptr{T}, ldp::Int, MPt::Ptr{T}, rp::Ptr{T},
@@ -1736,12 +1908,31 @@ function _trsm_fused_full_L!(unit::Bool, A, B)
         jc = 0
         while jc < n
             wid = min(NR, n - jc)
-            _fused_packP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
-            rem > 0 && _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, nfull * MR, k, rem, Val(NRV))
-            for si in (nfull - 1):-1:0
-                _gemmtrsm_u_slab_packed!(Pp, NR, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
+            if _TRSM_FUSEDT_ON[] && wid == NR
+                # Fused first/last-touch transpose (Lever 1): no standalone pack/unpack. The ragged tail
+                # rows (rem<MR) still need to live in P for the full slabs' gemm reuse, so mini-pack them
+                # (rem×NR, tiny), solve, and unpack at stripe end; the full slabs read/write B directly.
+                if rem > 0
+                    b0 = nfull * MR
+                    @inbounds for v in 0:NR-1, i in 0:rem-1                # pack tail rows B→P (contiguous cols)
+                        unsafe_store!(Pp + ((b0 + i) * NR + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
+                    end
+                    _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, b0, k, rem, Val(NRV))
+                    @inbounds for v in 0:NR-1, i in 0:rem-1                # unpack tail rows P→B
+                        unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * NR + v) * sz))
+                    end
+                end
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab_fusedT!(Pp, NR, pB, ldb, jc, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
+                end
+            else
+                _fused_packP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
+                rem > 0 && _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, nfull * MR, k, rem, Val(NRV))
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab_packed!(Pp, NR, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
+                end
+                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
             end
-            _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
             jc += NR
         end
     end
