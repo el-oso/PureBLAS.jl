@@ -450,23 +450,66 @@ end
 end
 
 # SIMD argmax for BLAS iamax: 1-based index of the first element with maximal |x|. Real unit-stride;
-# assumes n ≥ W (caller routes shorter / strided / complex to the scalar loop). Lane-parallel running
-# max + parallel index vector; strict `>` updates keep the earliest index per lane. The running max is
-# a loop-carried dependency (latency-bound), so it runs 4 independent chains (else ~0.3–0.8× at L1/RAM
-# sizes). Tie rule everywhere: equal value → keep the smaller index ⇒ BLAS first-occurrence semantics.
-# Gate: median ≥1.06× OpenBLAS at every size (n=64…1e6). NB: OB's idamax is alignment-volatile (its
-# time swings ~60% with the array's address) while this kernel is stable — so single-allocation ratios
-# are noisy; sample many fresh allocations and take the median. A two-pass (max-only + locate) variant
-# was tried and is slower (locate's extra array read costs more than the in-loop index selects save).
-# Inner update: new block's indices are always larger than the chain's, so strict `>` keeps the
-# earliest index on ties — no index compare needed (cheap, 1 cmp + 2 selects).
+# assumes n ≥ 4W (caller routes shorter / strided / complex to the scalar loop). Two implementations,
+# selected by ISA at build time (`_SIMD_BYTES` const-folds → trim-safe, no runtime branch):
+#
+#  • AVX-512 (`_iamax_thresh4!`): DEPENDENCY-FREE THRESHOLD SCAN. The hot loop keeps a broadcast running
+#    max `thr` (invariant except on the rare advance) and does 4 INDEPENDENT `|xⱼ| > thr` compares per
+#    iter, OR-ing the masks into ONE `any` branch — no loop-carried accumulator, so it out-throughputs
+#    even a bare vmaxpd reduction. The predicted-not-taken cold path (max advances ~O(log n) for random
+#    data) scalar-scans the 4 blocks for the new max + its first lane. This tracks NO index in the hot
+#    path, unlike the chain kernel below. Beats AOCL-BLIS's `bli_damaxv` at n≥1e4 and hits the shared
+#    single-thread DRAM roofline (~48 GB/s, PB=AOCL) at n≥1e6 on Zen5; small-n (n≲3000) is per-call
+#    overhead where the hand-asm still leads (even the bare-reduction floor is ~0.65× there).
+#  • AVX2 / narrower (`_iamax_chain4!`): the original 4-chain lane-parallel running max + parallel index
+#    vector (loop-carried, latency-bound → 4 chains). Kept as-is; validated ≥1.06× OpenBLAS.
+#
+# Tie rule everywhere: equal value → keep the SMALLER index ⇒ BLAS first-occurrence semantics (strict `>`).
+# NB: OB/AOCL idamax are alignment-volatile (time swings ~60% with the array's address) while these are
+# stable — sample many fresh allocations and take the median (see bench/plots.jl iamax entry).
 @inline _amax_up(m, i, nv, ni) = (t = nv > m; (vifelse(t, nv, m), vifelse(t, ni, i)))
 # Fold across chains: indices interleave, so the tie must pick the smaller index explicitly.
 @inline _amax_merge(m0, i0, m1, i1) = begin
     take = (m1 > m0) | ((m1 == m0) & (i1 < i0))
     (vifelse(take, m1, m0), vifelse(take, i1, i0))
 end
-@inline function _iamax_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
+
+# _IAMAX_NB: blocks per hot-loop iteration for the threshold scan = ILP unroll that feeds enough
+# independent compares to cover the vcmppd→k latency at ~2/cyc throughput. 4 measured optimal on Zen5
+# (2 starves ILP, 8 grows prologue/cold-path → both regress small-n); mirrors the chain kernel's 4.
+const _IAMAX_NB = 4
+
+@inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
+    W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = _IAMAX_NB * W
+    ld(o) = abs(vload(V, xp + o * sz))
+    gmax = typemin(T); bi = 1; thr = V(gmax); o = 0
+    @inbounds while o + step <= n                     # dependency-free: 4 independent compares vs `thr`
+        v0 = ld(o); v1 = ld(o + W); v2 = ld(o + 2W); v3 = ld(o + 3W)
+        if any(((v0 > thr) | (v1 > thr)) | ((v2 > thr) | (v3 > thr)))    # rare (running max advances)
+            for (j, v) in ((0, v0), (W, v1), (2W, v2), (3W, v3))         # cold path: locate new max + lane
+                bm = v[1]; bl = 1
+                for l in 2:W; v[l] > bm && (bm = v[l]; bl = l); end      # strict > ⇒ first lane on ties
+                bm > gmax && (gmax = bm; bi = o + j + bl; thr = V(gmax))
+            end
+        end
+        o += step
+    end
+    @inbounds while o + W <= n                         # leftover full blocks
+        v0 = ld(o)
+        if any(v0 > thr)
+            bm = v0[1]; bl = 1
+            for l in 2:W; v0[l] > bm && (bm = v0[l]; bl = l); end
+            bm > gmax && (gmax = bm; bi = o + bl; thr = V(gmax))
+        end
+        o += W
+    end
+    @inbounds for k in (o + 1):n                       # scalar remainder (no OOB / masked read needed)
+        a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
+    end
+    return bi
+end
+
+@inline function _iamax_chain4!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
     W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = 4W
     lane = Vec(ntuple(i -> i, Val(W)))               # 1,2,…,W
     ld(o) = abs(vload(V, xp + o * sz))
@@ -497,6 +540,11 @@ end
     end
     return bi
 end
+
+# ISA-selected at build time: the `_SIMD_BYTES` compare const-folds, so the dead arm is eliminated
+# (trim-safe, no runtime dispatch). AVX-512 → threshold scan; AVX2/narrower → 4-chain.
+@inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal} =
+    _SIMD_BYTES >= 64 ? _iamax_thresh4!(n, xp) : _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
 # argmax machinery as the real kernel, but each Vec{2W} load is W complex elements — deinterleave → re/im,
