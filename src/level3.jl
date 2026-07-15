@@ -1387,6 +1387,11 @@ const _GT_TRANSPOSE = (_GT_W == 8)
 # AVX-512 dev box, so it stays as committed (req#8 Preferences-override still applies for calibration).
 const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base",
     _GT_TRANSPOSE ? max(_GT_MR, (_L1_BYTES ÷ 2) ÷ (_GT_NR * sizeof(Float64))) : 128)::Int
+# Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
+# scalar dense base wins on the sub-µs tiny solve. MEASURED Zen4 crossover k≈16 = 2·_GT_W (fused beats dense
+# from k=16: e.g. k=24 15.9 vs 9.3 GF); below it dense wins (k=8 2.2 vs 1.7). Keyed on the SIMD width (the
+# setup is _GT_W-lane transposes). NEEDS Zen3/Zen5 validation (req#8b).
+const _TRSM_FUSED_MIN = 2 * _GT_W
 # Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
 # the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
 const _TRSM_FUSED_ON = Ref(true)
@@ -1619,6 +1624,29 @@ end
         for v in 0:ncg-1; unsafe_store!(pB + (i + (jc+v)*ldb)*sz, unsafe_load(Pp + (i*NR + v)*sz)); end
     end
 end
+# One fusedT stripe of TRUE width NRVe·W (no pad, no pack round-trip): mini-pack the ragged tail rows
+# (rem<MR) for the full slabs' P-reuse, solve them, then run the fusedT slabs (read B direct, write B
+# transposed). Val{NRVe} lets a RAGGED column stripe (wid = W or 2W, produced by n mod NR) run at its
+# real width instead of the driver padding it to NR — that n-mod-NR padding was the ENTIRE small-n AOCL
+# gap (s=32: 24-wide work for an 8-col tail ⇒ 1.5× flops ⇒ 0.67× ceiling; Fable-decomposed 2026-07-15).
+@inline function _fusedT_stripe!(::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int, pU::Ptr{T},
+        ldu::Int, rp::Ptr{T}, KC::Int, nfull::Int, rem::Int, MR::Int, sz::Int) where {T, NRVe}
+    Ppw = NRVe * _vwidth(T)                               # P row stride = this stripe's real width
+    if rem > 0
+        b0 = nfull * MR
+        @inbounds for v in 0:Ppw-1, i in 0:rem-1
+            unsafe_store!(Pp + ((b0 + i) * Ppw + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
+        end
+        _gemmtrsm_u_tail!(Pp, Ppw, pU, ldu, rp, b0, KC, Val(NRVe))
+        @inbounds for v in 0:Ppw-1, i in 0:rem-1
+            unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * Ppw + v) * sz))
+        end
+    end
+    for si in (nfull - 1):-1:0
+        _gemmtrsm_u_slab_upk_fusedT!(Pp, Ppw, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe))
+    end
+    return
+end
 function _trsm_fused_L!(unit::Bool, A, B)
     T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
     W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
@@ -1654,22 +1682,19 @@ function _trsm_fused_L!(unit::Bool, A, B)
         jc = 0
         while jc < n
             wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
+            # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
+            # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
+            # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
+            # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
             if fusedT && wid == NR
-                if rem > 0                                # mini-pack/unpack the ragged tail rows around the tail solve
-                    b0 = nfull * MR
-                    @inbounds for v in 0:NR-1, i in 0:rem-1
-                        unsafe_store!(Pp + ((b0 + i) * NR + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
-                    end
-                    _gemmtrsm_u_tail!(Pp, NR, pU, ldu, rp, b0, KC, Val(NRV))
-                    @inbounds for v in 0:NR-1, i in 0:rem-1
-                        unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * NR + v) * sz))
-                    end
-                end
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab_upk_fusedT!(Pp, NR, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRV))
-                end
-                jc += NR
-                continue
+                _fusedT_stripe!(Val(NRV), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                jc += NR; continue
+            elseif fusedT && NRV >= 3 && wid == 2 * W
+                _fusedT_stripe!(Val(2), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                jc += 2 * W; continue
+            elseif fusedT && wid == W
+                _fusedT_stripe!(Val(1), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz)
+                jc += W; continue
             end
             if useT
                 _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
@@ -1983,6 +2008,15 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # narrow B → dense base (few axpy calls); wide B → invL base (gemm-efficient). n is invariant under
         # the side-L row split, so the choice is consistent through the recursion.
         if size(B, 2) <= _TRSM_NCUT
+            # Narrow B. Prefer the fused gemmtrsm leaf for eligible mid-k (_TRSM_FUSED_MIN ≤ k ≤ _TRSM_FUSED_BASE):
+            # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
+            # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
+            # the scalar dense base (~15 GF) vs the fused leaf's ~26 GF. Measured Zen4 vs AOCL: k=48 0.53→0.94,
+            # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans / non-AVX-512 keep the dense base.
+            if up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE &&
+                    _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
+                return _trsm_fused_L!(unit, A, B)
+            end
             k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
         elseif up && !tr && _GT_TRANSPOSE && _TRSM_FULLPACK_ON[] &&
                 _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
@@ -2260,9 +2294,15 @@ function trsm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trsm!: A must be $k×$k"))
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
-    # which dominates when the solve itself is only ~100ns) and go straight to the dense base kernel.
+    # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
     if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha)
         up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
+        # k in [_TRSM_FUSED_MIN, _TRSM_DBASE]: the fused gemmtrsm leaf beats the scalar dense base even here
+        # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans AVX-512, fusable),
+        # keeping the low-overhead tiny entry. Below _TRSM_FUSED_MIN the dense base wins (setup unamortized).
+        if sl && up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
+            return _trsm_fused_L!(unit, A, B)
+        end
         return sl ? _trsm_dense_L!(up, tr, unit, A, B) : _trsm_dense_R!(up, tr, unit, A, B)
     end
     if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
