@@ -10,7 +10,7 @@ end
 BLAS.set_num_threads(1)
 const ELT = "f32" in ARGS ? Float32 : Float64
 import PureBLAS
-const SIZES = (32, 64, 128, 256, 512, 1024)
+const SIZES = (128, 224, 256, 257, 384, 512, 1024)   # po2 (aliasing-prone) AND non-po2 — cover BOTH regimes
 tri(::Type{T}, s) where {T} = (A = triu(randn(T, s, s)); @inbounds for i in 1:s; A[i,i] += T(s); end; A)
 mk(s) = (tri(ELT, s), randn(ELT, s, s))
 @noinline ob1(c) = (BLAS.trsm!('L','U','N','N', one(ELT), c[1], c[2]); c[2][1])
