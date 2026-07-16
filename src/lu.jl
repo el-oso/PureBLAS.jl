@@ -30,7 +30,7 @@ _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 # Panels wider than this recurse (see _getf2_blocked!). The flat rank-1 sweep below rewrites the trailing
 # panel once per pivot column → O(pb²·mp) stores (store-bound BLAS-2, ~40% of getrf(256) on AVX2). A
 # single split does the cross-half update ONCE via BLAS-3 gemm, halving that store traffic.
-const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split. 24→16: +2-4.5% at n=64-384 (less store-bound rank-1 in the cliff zone). req#8: derive from store-BW/L1.
+const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS-3 split. 24→16: +2-4.5% at n=64-384 (less store-bound rank-1 in the cliff zone). req#8: INVARIANT — a store-traffic algorithm-switch crossover (not a cache-residency block), validated-by-gate (getrf gates vs OB+AOCL); the complex sibling `_CGETF2_BASE` is sizeof-derived. Literal retained (a residency formula would add spurious variation; cf. falsified _LU_NB/_TRMM_RPACK derivations).
 # Complex base is WIDER than the real one, by the complex/real element-size ratio (=2): the complex base
 # is a rank-2 SIMD sweep (already halves the store traffic the recursion's cross-half gemm targets), so the
 # BLAS-3 split's benefit shrinks while its cost (skinny-k zgemm/ztrsm cross-updates on a TALL panel) grows,
