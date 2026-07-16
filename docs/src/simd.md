@@ -127,9 +127,25 @@ matter of library maturity and tuning, not of language: Julia's LLVM backend gen
 competitive with Rust's, and JIT-to-host is the more flexible substrate for hardware adaptation, not
 a handicap.
 
-A note on scope: faer additionally *guarantees* bit-reproducible results across alignment offsets on
-a machine (by rotating reduction accumulators). PureBLAS does not currently make that guarantee. Its
-own numerical-robustness emphasis is elsewhere — overflow/underflow-safe accumulation, e.g. `nrm2` via
-LAPACK `lassq` (`√(Σxᵢ²)` computed with running rescaling so it neither overflows nor underflows for
-any representable input). The two are independent properties, not a trade-off against each other; each
-is a separate choice about which numerical risk to spend effort on.
+## Reproducibility and BLAS compatibility
+
+Two numerical properties are worth separating, because the reference BLAS spec treats them very
+differently:
+
+- **Overflow/underflow safety is mandated.** The spec *defines* `nrm2` to return `√(Σxᵢ²)` without
+  spurious overflow or underflow, so a faithful drop-in **must** use scaled accumulation (LAPACK
+  `lassq`, which carries a running rescale). It is not optional, and it does cost some speed in that
+  one kernel versus a naive square-and-sum.
+- **Bit-reproducibility is not in the spec.** faer *elects* to guarantee it — identical results
+  across alignment offsets on a machine — by rotating reduction accumulators (needed because faer
+  aligns its loads, which would otherwise make the summation order alignment-dependent).
+
+PureBLAS is not *required* to be reproducible, but it turns out to be — **by construction rather than
+by contract**. Its kernels load from the base pointer with a fixed lane grouping (no alignment
+peeling) and run single-threaded, so the reduction order cannot depend on alignment or scheduling.
+Measured on one machine, `nrm2` / `dot` / `asum` / `iamax` / `gemv` are bit-identical across eight
+distinct memory alignments, and `gemm` is bit-identical run-to-run. The difference from faer is one of
+*promise*, not behavior: faer tests and guarantees this as an invariant; PureBLAS has it de facto but
+does not yet lock it with regression tests. Neither guarantees cross-*machine* reproducibility (a
+different vector width builds a different reduction tree), and adding multithreading would require a
+fixed reduction tree to preserve it.
