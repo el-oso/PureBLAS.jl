@@ -54,8 +54,10 @@ const _SLUGOVR = (i = findfirst(a -> startswith(a, "slug="), ARGS); isnothing(i)
 const _HWB = PureBLAS._HW
 const _AUTOSLUG = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "avx512" : "zen5") :   # Zen4 dp-512 vs Zen5 native
                   _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
-const _AUTOISA = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "AVX-512" : "Zen5") :
-                 _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
+# ISA is the instruction set (AVX-512 for BOTH Zen4 double-pumped and Zen5 native — the native-vs-pumped
+# distinction is a µarch trait, carried by `uarch=` now, not the ISA). Keeping them both AVX-512 avoids the
+# redundant "Zen5 · Zen5" legend the old (µarch-in-ISA) value produced.
+const _AUTOISA = _W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
 const ISA = isnothing(_ISAOVR) ? _AUTOISA : _ISAOVR
 const _SLUGB = isnothing(_SLUGOVR) ? _AUTOSLUG : _SLUGOVR
 const SLUG = "$(_SLUGB)$(REFSUF)"
