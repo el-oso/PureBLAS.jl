@@ -60,14 +60,21 @@ there) — the wrong, ungated shape. → SCALES-vs-INVARIANT deferred to Phase B
 | const | file:line | value | hypothesis | Tier-2 plan |
 |-------|-----------|-------|-----------|-------------|
 | ✅`_TRMM_RPACK` | level3.jl:14 | `448`→`_GEMM_UNPACK_MAX` | **SCALES — DERIVED** (register-capacity, = gemm unpack cut) | no-op Zen4/Zen5 (both 448); Zen3 448→96; correct 5.5e-16 |
-| `_TRMM_RPANEL` | level3.jl:9 | `512` | SCALES (pack panel) | pair with RPACK |
-| ✅`_CHOL_RL_MAX` | lapack.jl:524 | `128:224` | **PARTIAL DERIVE** — AVX2 `√(_L2_BYTES/8)·7/8` (=224 galen); W=8 `128` is the halving base (distinct 32-reg criterion) → kept flat, µarch-invariant | no-op all 3 boxes (galen 224, Zen4/Zen5 128) |
+| ✅`_CHOL_RL_MAX` | lapack.jl:524 | `128:224` | **PARTIAL DERIVE** — AVX2 `√(_L2_BYTES/8)·7/8` (=224 galen); W=8 `128` halving base kept flat (µarch-invariant) | no-op all 3 boxes |
 | ~~`_TRMM_RPANEL`~~ | level3.jl:9 | `512` | **soft width** ("keep off-diag gemm fat") — no clean cache/reg formula; ungated | keep + document; revisit only on side-R gap |
-| `_CHOL_BLOCK` | lapack.jl:194 | `128` | SCALES (L2) — feeds already-derived `_CHOL_MC` | A/B potrf; may share NB with `_L3_NB` |
-| `_L3_NB` | workspace.jl:18 | `128` | SCALES (L2/L3) — feeds `_TRMM_BASE` + scratch | shared-NB A/B with `_CHOL_BLOCK` |
-| `_TRMM_BASE` | level3.jl:8 | `128` | SCALES (follows `_L3_NB`) | trmm A/B |
-| `_LU_NB` | lu.jl:6 | `48` | SCALES **or** MISTUNED (self-flagged; getrf wanted nb(n) growth) | getrf nb sweep 3 boxes |
-| `_BRD_NB` / `_BT_NB` | svd.jl | (lit) | SCALES (bidiag L2 block) | gebrd A/B (low priority — SVD) |
+
+**Phase B remainder = a GATED NB-sweep campaign (B2).** The clean no-op refactors are done. What's left are
+**gated block sizes** that would change fleet gate numbers if re-derived → each needs a real multi-box NB
+sweep (getrf/geqrf-style), NOT a guessed formula. These are the genuine "derive→fleet-validate" targets and
+the measurement-heavy part:
+| const | file:line | value | note |
+|-------|-----------|-------|------|
+| `_CHOL_BLOCK` | lapack.jl:194 | `128` | outer potrf panel NB; feeds derived `_CHOL_MC`. Shared-NB candidate with `_L3_NB`. GATED. |
+| `_L3_NB` | workspace.jl:18 | `128` | NB×NB trmm/syrk scratch + `_TRMM_BASE`. Shared-NB candidate. |
+| `_TRMM_BASE` | level3.jl:8 | `128` | = `_L3_NB` cap; follows the shared NB. |
+| `_LU_NB` | lu.jl:6 | `48` | self-flagged; getrf campaign found nb GROWS w/ size, µarch-keys on _NVREG. GATED. |
+| `_GETF2_BASE` | lu.jl:25 | `16` | self-flagged "derive from store-BW/L1"; `_CGETF2_BASE` scales it by sizeof. |
+| `_BRD_NB`/`_BT_NB` | svd.jl | (lit) | bidiag block; low priority (SVD). |
 
 ### Phase C — INVARIANT (document + done; confirming A/B only if flatness unproven)
 | const | file:line | value | hypothesis | note |
