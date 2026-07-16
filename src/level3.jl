@@ -11,10 +11,18 @@ const _TRMM_RPANEL = 512
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
 const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
-# side-R packed cut: k > this → packed single-pass side-R. Same register-capacity criterion as gemm's
-# unpack cut (identical microkernel), so DERIVE it from _GEMM_UNPACK_MAX (=2·_acc_cap) rather than the
-# hand-fit 448 (a req#8 violation; 448 = the Zen4/Zen5 value → no-op there, but AVX2 wants 2·(16-4)·4=96).
-const _TRMM_RPACK = @load_preference("trmm_rpack", _GEMM_UNPACK_MAX)::Int
+# side-R packed cut: n > this → packed single-pass side-R, else direct/unpacked. NOT
+# register-capacity-governed: the plausible "= gemm's _GEMM_UNPACK_MAX (=2·_acc_cap)" derivation was
+# FLEET-FALSIFIED. Measured direct-vs-packed (boost-locked, both boxes): the crossover is µarch-dependent
+# and SOFT — packed decisively wins only at large n (Zen3 n≥512 up to 17%; Zen4 n≥1536 ~3-6%), with a
+# wide tied band below and DIRECT winning the small/mid band on both (Zen4 n=256/384 direct gates 0.93/0.96
+# while packed MISSES at 1.00/1.01). So the AVX2 value 96 regresses BOTH boxes (it packs the direct-favoring
+# small/mid band) and gains nothing large-n (both pack there). 448 keeps small/mid on the winning direct
+# path and packs the large-n region → fleet-best of the tested values. (The crossover appears to scale UP
+# with cache — Zen3 L2=512K→~500, Zen4 L2=1M→~1200 — a candidate future SCALES derivation, but too soft/noisy
+# to pin without a dedicated 2-box crossover campaign; a guessed formula would be worse than this literal.)
+# Preferences "trmm_rpack" pins it if a future box measures otherwise.
+const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
