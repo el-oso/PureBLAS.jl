@@ -59,6 +59,12 @@ const _AUTOISA = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "AVX-512" : "Zen5
 const ISA = isnothing(_ISAOVR) ? _AUTOISA : _ISAOVR
 const _SLUGB = isnothing(_SLUGOVR) ? _AUTOSLUG : _SLUGOVR
 const SLUG = "$(_SLUGB)$(REFSUF)"
+# AUTHORITATIVE µarch name, resolved on the MEASURING machine (from its own CpuId-derived slug) and stamped
+# into the cache header. The multi-host plot then READS this — it must NOT re-derive µarch at plot time from
+# the plotting box's local vector width (that was the mislabel bug: three caches all relabelled as whatever
+# CPU rendered them, so Zen3/Zen4/Zen5 lines got swapped). Self-documenting + can't be swapped downstream.
+const _MYUARCH = get(Dict("avx512" => "Zen4", "zen5" => "Zen5", "avx2" => "Zen3", "neon" => "ARM"),
+                     _SLUGB, uppercasefirst(_SLUGB))
 # Provenance stamped into every cache header (self-describing: which CPU, what code, when measured).
 const _CPUNAME = replace(strip(Sys.cpu_info()[1].model), r"[\t\r\n]" => " ")   # e.g. "AMD Ryzen 9 7950X …"
 const _COMMIT = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "unknown" end
@@ -420,8 +426,8 @@ function save_cache(path, groups)
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
         # (slug/isa) for the multi-host plot, and full provenance: CPU model, code commit, measure time.
         ts = Libc.strftime("%Y-%m-%dT%H:%M", time())
-        println(io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tisa=$ISA\thost=$(gethostname())",
-            "\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts")
+        println(io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
+            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts")
         for (lvl, d) in groups, (nm, op) in d
             println(io, lvl, "\t", nm, "\t", join(("$(s)=$(join(v, ","))" for (s, v) in op), ";"))
         end
@@ -432,14 +438,14 @@ end
 # for the multi-host overlay). Refuses a cache from an older methodology version (forces re-measure).
 function load_cache(path)
     g = Dict{String,Vector{OpData}}()
-    meta = (version = 1, slug = "?", isa = "?", host = "?", cpu = "?", commit = "?", time = "?")   # legacy ⇒ v1
+    meta = (version = 1, slug = "?", uarch = "?", isa = "?", host = "?", cpu = "?", commit = "?", time = "?")  # legacy ⇒ v1
     for ln in eachline(path)
         isempty(strip(ln)) && continue
         if startswith(ln, "#pbbench")
             kv = Dict(String(p[1]) => String(p[2]) for p in (split(x, "=") for x in split(ln, "\t")[2:end]) if length(p) == 2)
             meta = (version = parse(Int, get(kv, "version", "1")), slug = get(kv, "slug", "?"),
-                    isa = get(kv, "isa", "?"), host = get(kv, "host", "?"), cpu = get(kv, "cpu", "?"),
-                    commit = get(kv, "commit", "?"), time = get(kv, "time", "?"))
+                    uarch = get(kv, "uarch", "?"), isa = get(kv, "isa", "?"), host = get(kv, "host", "?"),
+                    cpu = get(kv, "cpu", "?"), commit = get(kv, "commit", "?"), time = get(kv, "time", "?"))
             continue
         end
         lvl, nm, blocks = split(ln, "\t")
@@ -465,7 +471,10 @@ const _UARCH = Dict("avx512" => ("#1f77b4", "Zen4 · AVX-512"), "zen5" => ("#2ca
 # so strip the refbk suffix before the color/label lookup — else every AOCL series fell to the grey fallback.
 _baseslug(slug) = replace(slug, r"_(aocl|mkl)$" => "")
 _ucolor(slug) = get(_UARCH, _baseslug(slug), ("#888888", slug))[1]
-_ulabel(meta) = get(_UARCH, _baseslug(meta.slug), ("#888888", meta.isa))[2]
+# Label from the AUTHORITATIVE stamped µarch (measuring machine's own CpuId), not re-derived here. Old caches
+# (no uarch= field, meta.uarch=="?") fall back to the slug→label map so pre-fix caches still render.
+_ulabel(meta) = meta.uarch != "?" ? "$(meta.uarch) · $(meta.isa)" :
+                get(_UARCH, _baseslug(meta.slug), ("#888888", meta.isa))[2]
 
 # Load every fleet cache (plots_data_<host>.txt) → [(meta, groups), …]. In lite mode loads only *_lite; in
 # full mode only full caches. Skips MKL. Refuses stale-version caches via load_cache.
