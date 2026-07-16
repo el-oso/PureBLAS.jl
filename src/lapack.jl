@@ -5,7 +5,8 @@ using LinearAlgebra: PosDefException
 # the `uplo` triangle. Right-looking BLOCKED algorithm: each NB diagonal block is factored by the
 # unblocked `_potf2` base, then the gated trsm (panel solve) + syrk (trailing rank-NB update) carry the
 # bulk. Generic over T<:Real (the unblocked base + the generic trsm/syrk path make it ForwardDiff-
-# traceable); BlasReal hits the SIMD trsm/syrk. ponytail: NB hand-set for Zen4; lift to a knob if tuning.
+# traceable); BlasReal hits the SIMD trsm/syrk. NB = `_CHOL_BLOCK` (req#8: validated NB-insensitive — potrf
+# n=1024…4096 within 0.5% over 96/128/192/256; see bench/req8_classification.md); `_CHOL_MC` derived from L2.
 
 const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf2, vectorized inner loop).
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar

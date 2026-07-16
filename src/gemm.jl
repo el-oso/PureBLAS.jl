@@ -6,8 +6,8 @@
 # beta is applied once up front. Real (Float32/Float64) take the blocked path; complex / Dual / any
 # other T<:Number, and non-contiguous C, take the generic triple-loop (correct + AD-traceable).
 #
-# Block sizes are a first cut for Zen4 (AVX-512, 8 Float64/vec) — tune via the calibration knobs.
-# ponytail: blocks hand-set for Zen4; lift into Preferences when tuning the fleet.
+# Block sizes are DERIVED from detected cache+ISA (`_at_gemm_*(_HW)`, cpuinfo.jl) per req#8 — _MR/_NR/_NC/_KC
+# each = a residency/latency formula over _L1/_L2/_L3/_vwidth, Preferences-overridable for pinning/calibration.
 
 # Register-blocked microkernel tile: _MR vector-rows × _NR columns = _MR*_NR vector accumulators.
 # The k-loop holds _MR*_NR accumulators + _MR A-vectors + 1 B-broadcast live at once, so the tile
