@@ -1381,12 +1381,14 @@ const _GT_NR  = _GT_NRV * _GT_W                   # columns per stripe (SIMD-lan
 const _GT_TRANSPOSE = (_GT_W == 8)
 # Fused-leaf k-cutoff. The recursion feeds the largest ½-split ≤ base; a bigger leaf runs MORE of its internal
 # off-diagonal at the ~35-GF leaf rate instead of the recursion's ~43-GF peak, so keep it modest. AVX-512:
-# DERIVE from the P-stripe ½-L1 residency — the KC×NR row-major P stripe is packed+solved per stripe, cap it
-# at KC·NR·sizeof ≤ ½·L1 ⇒ 85 on Zen4 (feeds 64-row leaves, the measured Zen4/AVX-512 optimum). Non-AVX-512:
-# keep the shipped 128 single-leaf cutoff — the scalar-pack leaf's optimum can't be fleet-validated from this
-# AVX-512 dev box, so it stays as committed (req#8 Preferences-override still applies for calibration).
+# DERIVE from the P-stripe FULL-L1 residency — the KC×NR row-major P stripe is the ONLY hot streamed operand
+# (the compact U is L2-resident, recips tiny), so size KC so the stripe fills L1: KC·NR·sizeof ≤ L1 ⇒ 170 on
+# Zen4 (L1=32K), 256 on Zen5 (L1=48K). FLEET-VALIDATED boost-locked 2026-07-16: the old ½-L1 (⇒85) was a
+# warm-micro MIS-TUNE — full-L1 nets +1.5–5.8pt on Zen4 (n=32 0.918→0.976, n≥512 +1.5–3.6pt), Zen5 INSENSITIVE
+# (safe). Non-AVX-512: keep the 128 literal — Zen3/AVX2 optimum (measured; a bigger base REGRESSES it, n=256
+# 0.996→0.85). req#8 Preferences-override "trsm_fused_base" still applies for calibration.
 const _TRSM_FUSED_BASE = @load_preference("trsm_fused_base",
-    _GT_TRANSPOSE ? max(_GT_MR, (_L1_BYTES ÷ 2) ÷ (_GT_NR * sizeof(Float64))) : 128)::Int
+    _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128)::Int
 # Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
 # scalar dense base wins on the sub-µs tiny solve. MEASURED Zen4 crossover k≈16 = 2·_GT_W (fused beats dense
 # from k=16: e.g. k=24 15.9 vs 9.3 GF); below it dense wins (k=8 2.2 vs 1.7). Keyed on the SIMD width (the
