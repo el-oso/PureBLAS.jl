@@ -5,9 +5,17 @@
 
 const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trsm BLAS-2 cost; large nb fattens
 # the rank-nb trailing gemm toward peak). At small n the panel factor dominates → nb=48; at large n the gemm
-# dominates → grow nb so k=nb isn't a skinny gemm. Measured (galen/fleet): nb=48 to n≈384, 64@512, 128@≥1024
-# gives +4–5% large-n (getrf 2048 45.7→47.8 = BLASFEO parity, OB gate 1.01→1.06). ponytail/req#8: the /8 +
-# clamp bounds are measured literals to re-derive from the gemm k-block (L1) / trailing residency (L2).
+# dominates → grow nb so k=nb isn't a skinny gemm. req#8 (2026-07-16): fleet nb-sweep (Zen4+Zen3, full nb×n
+# grid) shows this is a FLAT, roughly µarch-INVARIANT optimum — NOT a clean cache-residency scale:
+#   • FLOOR 48 — VALIDATED: n=256 wants exactly 48 on BOTH boxes (a real dip, nb64 is +2.4% Zen4 / +4.4% Zen3).
+#   • SLOPE ÷8 / CAP 128 — VALIDATED: for n≥384 nb∈[96,192] are all within ~1% (flat band); 128 sits in it on
+#     both boxes. The curve is parity-BUMPY (multiples of 64 win; e.g. 128,192 beat 168), so it does NOT track
+#     a residency formula: the derived `_l1_block(F64,_MR·W)` (=128 Zen4 / 168 Zen3, the A-micropanel ½·L1
+#     bound) was FLEET-FALSIFIED — 168 is a trough on Zen3 (+0.4–2.6% vs 128), worse than the literal. The true
+#     large-n optimum is 64-aligned + per-µarch (Zen4 256, Zen3 192) — no clean formula hits it, and it's only
+#     ~0.5% (Zen4) / ~1.5% (Zen3, n≥1536) above 128. A formula here would add spurious variation (req#8(b)).
+# So: measured-validated literals kept. (The old "+4–5% large-n → BLASFEO parity" note stands as the win vs a
+# flat nb=48; this sweep confirms 128 is near the flat optimum, not that a bigger derived cap would help.)
 _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
 # Complex getrf panel width. Grows with n so the trailing rank-nb zgemm is compute-bound — measured
