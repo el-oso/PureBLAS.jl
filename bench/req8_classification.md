@@ -59,7 +59,7 @@ there) — the wrong, ungated shape. → SCALES-vs-INVARIANT deferred to Phase B
 ### Phase B — SCALES / refactor-to-reproduce (formula often already in-comment)
 | const | file:line | value | hypothesis | Tier-2 plan |
 |-------|-----------|-------|-----------|-------------|
-| ✅`_TRMM_RPACK` | level3.jl:14 | `448`→`_GEMM_UNPACK_MAX` | **SCALES — DERIVED** (register-capacity, = gemm unpack cut) | no-op Zen4/Zen5 (both 448); Zen3 448→96; correct 5.5e-16 |
+| ⛔`_TRMM_RPACK` | level3.jl:14 | `448` (kept) | **DERIVATION FALSIFIED** — the "= gemm `_GEMM_UNPACK_MAX`" hypothesis regressed Zen3 (see below); reverted to literal 448 | galen A/B: 96 slower 3–18% |
 | ✅`_CHOL_RL_MAX` | lapack.jl:524 | `128:224` | **PARTIAL DERIVE** — AVX2 `√(_L2_BYTES/8)·7/8` (=224 galen); W=8 `128` halving base kept flat (µarch-invariant) | no-op all 3 boxes |
 | ~~`_TRMM_RPANEL`~~ | level3.jl:9 | `512` | **soft width** ("keep off-diag gemm fat") — no clean cache/reg formula; ungated | keep + document; revisit only on side-R gap |
 
@@ -89,11 +89,23 @@ the measurement-heavy part:
 | `_GEMM_TINY` | (cold) | `6` | INVARIANT (flop crossover) | document |
 | `_SVD_DC_CROSS`/`_DC_THRESHOLD` | svd.jl | (lit) | INVARIANT (algorithm crossover; 96 was measured — [[gesvd-dc-crossover-and-lbt]]) | document |
 
-**`_TRMM_RPACK` status (2026-07-16):** derived to `_GEMM_UNPACK_MAX` (=2·_acc_cap, same register-capacity
-crossover — identical microkernel). Zen4/Zen5 unchanged (both 448 → pure req#8 cleanup, byte-identical);
-Zen3 448→96 (the principled AVX2 value). Correctness verified on Zen4 with the pref forced to 96 (5.5e-16,
-all side/uplo/trans/diag). **Side-R trmm is UNGATED** (plots.jl gates only side-L), so the bar is "no Zen3
-regression," not a gate win. PENDING: galen (Zen3) side-R perf spot-check before master-merge (branch-safe now).
+**`_TRMM_RPACK` status (2026-07-16) — DERIVATION FALSIFIED, reverted to literal 448:** the hypothesis was
+`_TRMM_RPACK = _GEMM_UNPACK_MAX` (=2·_acc_cap, "same register-capacity crossover as gemm — identical
+microkernel"). Byte-identical on Zen4/Zen5 (both 448) but changed Zen3 448→96. Two-box direct-vs-packed
+crossover sweep (boost-locked, pure rpack=100000 vs 1) REFUTED it and mapped the real behavior:
+- `_TRMM_RPACK` is a pure path selector (n≤thr → direct/unpacked, n>thr → packed); nothing else reads it → clean A/B.
+- The crossover is **µarch-dependent and SOFT**: packed decisively wins only at large n (Zen3 n≥512, up to
+  17% @512; Zen4 n≥1536, ~3-6%), with a wide tied band below and DIRECT winning the small/mid band on BOTH
+  boxes. On Zen4, direct GATES at n=256/384 (0.93/0.96 PB/OB) where packed MISSES (1.00/1.01).
+- ∴ 96 regresses BOTH boxes (packs the direct-favoring small/mid band; Zen4 256/384 ~5-7% + below gate,
+  Zen3 128-448 wash-to-worse) and gains nothing large-n (both pack there). 448 keeps small/mid on the
+  winning direct path AND packs the large-n win region → **fleet-best of the tested values**.
+Per req#8(b) (a formula must reproduce the fleet optimum before it ships) the register-cap derivation is
+rejected; literal 448 kept + documented in-code. NOTE: the crossover appears to scale UP with cache (Zen3
+L2=512K→~500, Zen4 L2=1M→~1200) — a candidate FUTURE SCALES derivation, but too soft/noisy to pin without a
+dedicated 2-box crossover campaign; a guessed formula would be worse than 448. **The method worked: a
+plausible mechanism ("identical microkernel") was a HYPOTHESIS, measurement killed it — and the measurement
+also corrected an early single-shot artifact (a spurious "n=160 +18%" that a wider ABBA sweep showed was noise).**
 
 ## Ship discipline
 Per-const small commits on this branch. Update this table's hypothesis→verdict as each clears. Do NOT
