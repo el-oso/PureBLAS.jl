@@ -17,6 +17,7 @@ makedocs(;
         "Home" => "index.md",
         "Guide" => "guide.md",
         "Design" => "design.md",
+        "SIMD & Hardware Adaptation" => "simd.md",
         "Performance" => "performance.md",
     ],
 )
