@@ -11,7 +11,10 @@ const _TRMM_RPANEL = 512
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
 const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
-const _TRMM_RPACK = 448        # > this → packed single-pass side-R (mirrors the L cut at _GEMM_UNPACK_MAX)       # side-R flat-loop panel width (fat off-diag gemms; diagonal recurses)
+# side-R packed cut: k > this → packed single-pass side-R. Same register-capacity criterion as gemm's
+# unpack cut (identical microkernel), so DERIVE it from _GEMM_UNPACK_MAX (=2·_acc_cap) rather than the
+# hand-fit 448 (a req#8 violation; 448 = the Zen4/Zen5 value → no-op there, but AVX2 wants 2·(16-4)·4=96).
+const _TRMM_RPACK = @load_preference("trmm_rpack", _GEMM_UNPACK_MAX)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
