@@ -525,7 +525,10 @@ const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
 # until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
-# 7⁄8 of that ≈ 224 → DERIVED √(_L2_BYTES/8)·7⁄8 (galen 512 KB L2 → 224 EXACT; scales to other AVX2 L2).
+# 7⁄8 of that ≈ 224 → √(_L2_BYTES/8)·7⁄8 (galen 512 KB L2 → 224 EXACT). NB: the 7⁄8 is a ONE-POINT FIT to
+# galen's 224/256 bracket — the √-L2 form is physical but the coefficient is unvalidated off 512K; the only
+# extrapolation point in the fleet (Zen4 1 MB) is EXEMPTED below (W=8 branch). Validate on the next AVX2 box
+# with ≠512K L2 before trusting the scaling (a bare literal 224 has the same epistemic content today).
 # W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
 # give ~317). 128 is µarch-invariant across the AVX-512 fleet (Zen4+Zen5 both gate potrf with it) → kept flat.
 const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : round(Int, sqrt(_L2_BYTES / 8) * (7 / 8))

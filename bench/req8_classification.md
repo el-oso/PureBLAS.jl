@@ -86,15 +86,17 @@ formula would add spurious variation — as the `_TRMM_RPACK` and `_LU_NB` deriv
 FALSIFIED). Literals retained + documented; no fleet re-measure needed.
 | const | file:line | value | verdict |
 |-------|-----------|-------|---------|
+**⚠️ FABLE REVIEW (2026-07-16) corrected 4 over-claims below — "validated-by-gate" was stamped without
+checking, per const, that the GATED path executes the const. Corrections applied; owed A/Bs pending (B3).**
 | `_CHOL_STH`/`_CHOL_SB` | lapack.jl:201-2 | `16`/`32` | ✅ INVARIANT (f622318; Zen4 A/B 16 beats 32) |
-| `_CHOL_FAER_BASE` | level3.jl:521 | (lit) | ✅ INVARIANT (recursion base; gates via cpotrf) |
-| `_SYRK_BASE` | level3.jl:2406 | `48` | ✅ INVARIANT (diagonal scalar-base vs gemm-recurse crossover; syrk gates) |
-| `_GETF2_BASE` | lu.jl:33 | `16` | ✅ INVARIANT (store-traffic rank-1↔BLAS-3-split crossover; 24→16 measured; `_CGETF2_BASE`=sizeof-derived; getrf gates) |
-| `_TRI_NB` | level2.jl:1319 | `64` | ✅ INVARIANT (tri diagonal-block↔gemv split; BLAS-2 bandwidth-bound; trsv/trmv gate) |
-| `_TRI_T_UNB` | level2.jl:1320 | `1024` | ✅ INVARIANT (unblocked-max; blocked only helps huge-n restream) |
-| `_POTRF_BASE` | lapack.jl:10 | `512` | ✅ INVARIANT (potf2-SIMD-base↔recurse crossover; validated by the potrf BLASFEO-parity campaign) |
-| `_GEMM_TINY` | gemm.jl:2034 | `6` | ✅ INVARIANT (naive-loop↔masked-µkernel flop crossover; mild ≈W dependence but max-dim≤6 gemm ~never exercised) |
-| `_L3_NB`/`_TRMM_BASE` | workspace.jl:18 / level3.jl:8 | `128` | ✅ INVARIANT (NB×NB scratch cap; same class as measured-flat `_CHOL_BLOCK`; trmm side-L gates) |
+| `_CHOL_FAER_BASE` | **lapack.jl:532** | `_CHOLW==8?1024:_CHOL_RL_MAX` | ✅ INVARIANT — real f64 potrf faer base (NOT level3/cpotrf; my earlier row was wrong on file+mechanism). W=8 side = bare `1024` literal, executed by `_potrf_f64_lower!` (gated) → validated-by-gate; AVX2 side rides `_CHOL_RL_MAX`. |
+| `_SYRK_BASE` | level3.jl:2406 | `48` | ✅ INVARIANT (diagonal scalar-base vs gemm-recurse crossover; real gate coverage n=8/32 + every recursion diagonal) |
+| `_GETF2_BASE` | lu.jl:33 | `16` | ✅ INVARIANT (store-traffic rank-1↔BLAS-3-split crossover; executed at all gated getrf sizes; 24→16 measured; `_CGETF2_BASE`=sizeof-derived) |
+| ⚠️`_TRI_NB` | level2.jl:1319 | `64` | **NEEDS A/B (B3)** — `64²·8 = 32K = fleet L1d exactly`; a homogeneous-L1 fleet CANNOT falsify an L1-residency scale, and the code (level2.jl:1330) calls the diagonal block "cache-resident". Owed: trmv/trsv NB∈{32,64,128} 3-box; if flat, ship a no-op L1-residency clamp (protects small-L1 boxes). |
+| ⚠️`_TRI_T_UNB` | level2.jl:1320 | `1024` | **UNGATED** — only trans='T'; gate benches trans='N'. "blocked only helps huge-n restream" is asserted, unmeasured. Owed: trsv-T n=1024–4096 unblocked-vs-blocked. |
+| ⚠️`_POTRF_BASE` | lapack.jl:11 | `512` | **FALSE PROVENANCE (corrected)** — the gated potrf (f64-lower, `_potrf_f64_lower!`) NEVER reads it; `_POTRF_BASE` governs only UNGATED F32/Dual/complex-upper/non-strided (lapack.jl:920). NOT validated by the BLASFEO campaign (that was f64-lower = `_CHOL_BLOCK`). base=512 ⇒ a 2MB unblocked potf2 block on untimed paths. → INVARIANT-for-correctness (AD/F32 fallback), but unvalidated for speed. |
+| ⚠️`_GEMM_TINY` | gemm.jl:2034 | `6` | **UNGATED + immaterial** (fires only max-dim≤6; smallest gated size n=8). Honest label = "unvalidated + immaterial", not "validated-by-gate". Dispatch safe (`m≤_vwidth` guard). Mild ≈W dependence. |
+| ⚠️`_L3_NB`/`_TRMM_BASE` | workspace.jl:18 / level3.jl:8 | `128` | **NEEDS A/B (B3) — owed confirm skipped.** `_trmm_small!` materializes a 128×128 (128KB) scratch re-read across B cols = a genuine L2-residency TILE, not a scratch cap. ¼ galen-L2 / ⅛ Zen4-L2 → gate proves "≤bound on THIS fleet", not invariance; a ≤256K-L2 box thrashes. Closing it via `_CHOL_BLOCK` (potrf, Zen4-only) was a different-op substitution (contract violation). Owed: trmm side-L NB∈{96,128,192} 3-box; if flat, ship a no-op L2 clamp. |
 | `_BRD_NB`/`_BT_NB` | svd.jl:279/281 | `16`/`32` | ✅ INVARIANT (bidiag/back-transform panel; measured optimal n=256–2048) |
 | `_SVD_DC_CROSS`/`_DC_THRESHOLD` | svd.jl:283 / svd_dc.jl:711 | `96`/`64` | ✅ INVARIANT (algorithm/recursion crossover; 96 measured boost-locked — [[gesvd-dc-crossover-and-lbt]]) |
 
