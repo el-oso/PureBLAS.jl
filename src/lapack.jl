@@ -520,8 +520,10 @@ const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
 # until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
-# 7⁄8 of that ≈ 224. ponytail: measured literal, req#8 derive √(_L2_BYTES/8)·7⁄8 once fleet-validated.
-const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : 224
+# 7⁄8 of that ≈ 224 → DERIVED √(_L2_BYTES/8)·7⁄8 (galen 512 KB L2 → 224 EXACT; scales to other AVX2 L2).
+# W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
+# give ~317). 128 is µarch-invariant across the AVX-512 fleet (Zen4+Zen5 both gate potrf with it) → kept flat.
+const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : round(Int, sqrt(_L2_BYTES / 8) * (7 / 8))
 const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : _CHOL_RL_MAX
 # Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =

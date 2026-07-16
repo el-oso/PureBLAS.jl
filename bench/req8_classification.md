@@ -61,7 +61,8 @@ there) — the wrong, ungated shape. → SCALES-vs-INVARIANT deferred to Phase B
 |-------|-----------|-------|-----------|-------------|
 | ✅`_TRMM_RPACK` | level3.jl:14 | `448`→`_GEMM_UNPACK_MAX` | **SCALES — DERIVED** (register-capacity, = gemm unpack cut) | no-op Zen4/Zen5 (both 448); Zen3 448→96; correct 5.5e-16 |
 | `_TRMM_RPANEL` | level3.jl:9 | `512` | SCALES (pack panel) | pair with RPACK |
-| `_CHOL_RL_MAX` | level3.jl:520 | (lit) | SCALES — formula in-comment `√(_L2/8)·7/8` | apply + validate potrf |
+| ✅`_CHOL_RL_MAX` | lapack.jl:524 | `128:224` | **PARTIAL DERIVE** — AVX2 `√(_L2_BYTES/8)·7/8` (=224 galen); W=8 `128` is the halving base (distinct 32-reg criterion) → kept flat, µarch-invariant | no-op all 3 boxes (galen 224, Zen4/Zen5 128) |
+| ~~`_TRMM_RPANEL`~~ | level3.jl:9 | `512` | **soft width** ("keep off-diag gemm fat") — no clean cache/reg formula; ungated | keep + document; revisit only on side-R gap |
 | `_CHOL_BLOCK` | lapack.jl:194 | `128` | SCALES (L2) — feeds already-derived `_CHOL_MC` | A/B potrf; may share NB with `_L3_NB` |
 | `_L3_NB` | workspace.jl:18 | `128` | SCALES (L2/L3) — feeds `_TRMM_BASE` + scratch | shared-NB A/B with `_CHOL_BLOCK` |
 | `_TRMM_BASE` | level3.jl:8 | `128` | SCALES (follows `_L3_NB`) | trmm A/B |
