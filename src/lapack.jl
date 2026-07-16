@@ -196,8 +196,12 @@ const _CHOL_BLOCK = 128
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
 # the bulk through the FMA-efficient rank-k trailing (_trsm_right/_syrk) and confines the slow base to
 # ≤16-col diagonal blocks. Measured galen/Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
-# (n=64 14.5→19.9, gate 1.12→1.54×). th ≈ (MR+1)·W = one full 3×W row-block + tail; bs = 2·th keeps the
-# trailing panel L1-resident. ponytail: measured literals, req#8 derive-from-cache debt like _CHOL_BLOCK.
+# (n=64 14.5→19.9, gate 1.12→1.54×). bs = 2·th keeps the trailing panel L1-resident.
+# req#8 NOTE (validated 2026-07-16): th is a µarch-INVARIANT 16, NOT the width-scaled (MR+1)·W the earlier
+# comment guessed. Zen4 A/B (same harness, potrf PB/AOCL small-n): th=16 vs th=32(=4·_CHOLW) → th=16 WINS
+# n=32 3.46 vs 2.67 (−23%), 64 2.57v2.34, 128 1.75v1.66; ties n≥256. The slow left-looking base wants a SMALL
+# fixed diagonal block (confine it, let the fast rank-k trailing do the bulk) — bigger-on-wide-SIMD regresses.
+# So 16 is a measured µarch-invariant base cap (a crossover, not a cache/width size), correctly flat. Knob-able.
 const _CHOL_STH = 16
 const _CHOL_SB = 32
 const _CHOL_NB = 4                                # trsm panel column block
