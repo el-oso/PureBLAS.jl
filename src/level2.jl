@@ -1323,7 +1323,15 @@ end
 # so the block is capped at √(L1/8) and shrunk further on a smaller L1. Fleet L1 = 32 KB → √4096 = 64 EXACT
 # (no-op vs the old literal); a ≤16 KB-L1 box gets a smaller, still-resident block. `tri_nb` pref pins it.
 const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int
-const _TRI_T_UNB = 1024  # trsv-T: unblocked up to here (blocked only helps the huge-n x-restream).
+# trsv-T: unblocked (scalar back/forward-substitution dots) up to here, blocked above. req#8: the blocked
+# path offloads the bulk O(n²) off-diagonal work to the vectorized gemv-T kernel and only substitutes the
+# NB×NB diagonal per-column, so it wins once n is large enough to amortize the gemv-T calls. FLEET A/B
+# (Zen4 W=8 + Zen3 W=4, boost-locked, same-process interleaved): crossover is n≈512–768 on BOTH boxes —
+# unblocked wins ≤3% at n≤512, blocked wins 6–40% at n≥768. Nearly FLAT across ISA width (512 vs ~640,
+# within a size-step) ⇒ INVARIANT algorithmic crossover, literal not formula. The old 1024 was MISTUNED:
+# it forced the slower unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both boxes
+# (Zen4 1.03×, Zen3 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
+const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
 # AVX-512 its per-call/shuffle overhead made per-column faster ≤1024. On AVX2 the scatter now uses the
@@ -1387,8 +1395,8 @@ end
 
 @inline function _trsv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
-    # trsv-T (forward/back substitution by dots): unblocked is faster at mid n (x cached), blocking
-    # only pays off for the huge-n x-restream. (trmv-T differs — it blocks at NB; see _TRI_T_UNB.)
+    # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
+    # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
     (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP
