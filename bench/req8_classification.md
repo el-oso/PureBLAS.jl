@@ -69,9 +69,9 @@ sweep (getrf/geqrf-style), NOT a guessed formula. These are the genuine "derive�
 the measurement-heavy part:
 | const | file:line | value | note |
 |-------|-----------|-------|------|
-| `_CHOL_BLOCK` | lapack.jl:194 | `128` | outer potrf panel NB; feeds derived `_CHOL_MC`. Shared-NB candidate with `_L3_NB`. GATED. |
-| `_L3_NB` | workspace.jl:18 | `128` | NB×NB trmm/syrk scratch + `_TRMM_BASE`. Shared-NB candidate. |
-| `_TRMM_BASE` | level3.jl:8 | `128` | = `_L3_NB` cap; follows the shared NB. |
+| ✅`_CHOL_BLOCK` | lapack.jl:194 | `128` | **INVARIANT — measured NB-insensitive** (Zen4 sweep 96/128/192/256 → potrf n=1024…4096 within 0.5%). Large-n residual is structural panel-major, not NB. Kept flat + documented. |
+| `_L3_NB` | workspace.jl:18 | `128` | NB×NB trmm/syrk scratch. Same 128 class as `_CHOL_BLOCK`; insensitivity inferred but `_TRMM_BASE` gates side-L → light confirm before closing. |
+| `_TRMM_BASE` | level3.jl:8 | `128` | = `_L3_NB` cap; side-L trmm base (GATED). Confirm with a small NB check. |
 | `_LU_NB` | lu.jl:6 | `48` | self-flagged; getrf campaign found nb GROWS w/ size, µarch-keys on _NVREG. GATED. |
 | `_GETF2_BASE` | lu.jl:25 | `16` | self-flagged "derive from store-BW/L1"; `_CGETF2_BASE` scales it by sizeof. |
 | `_BRD_NB`/`_BT_NB` | svd.jl | (lit) | bidiag block; low priority (SVD). |
