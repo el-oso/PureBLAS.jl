@@ -8,7 +8,18 @@ using LinearAlgebra: PosDefException
 # traceable); BlasReal hits the SIMD trsm/syrk. NB = `_CHOL_BLOCK` (req#8: validated NB-insensitive — potrf
 # n=1024…4096 within 0.5% over 96/128/192/256; see bench/req8_classification.md); `_CHOL_MC` derived from L2.
 
-const _POTRF_BASE = 512    # recurse above this; below, the unblocked base (potf2, vectorized inner loop).
+# Recursion base for the AD-traceable/fallback potrf (F32, Dual, F64-upper, F64-lower-non-strided). Below
+# this, one unblocked potf2 (vectorized inner loop); above, right-looking blocked recurse (fast trsm/syrk).
+# NOTE: the GATED F64-lower-strided path uses `_potrf_f64_lower!` (faer) and NEVER reads this — so the base
+# is untouched by the potrf gate. req#8: the old 512 was a badly MISTUNED untested assumption (that potf2
+# stays competitive to 512): fleet A/B (Zen4+Zen3, boost-locked) shows base=512 runs the unblocked potf2 on
+# an L2-sized block and is 2.3–5.2× slower (F32) / up to 43.9× (Zen3 F64-upper) than OB. The unblocked base
+# is uncompetitive past n≈64, so the base must be SMALL: base=32 wins hugely on both boxes (Zen4 F32
+# 0.80–1.07, Zen3 F32 n=512 43.9→1.75 F64U). Optimum is small + µarch-flat (16–32 both boxes), NOT
+# L1-residency (√(L1/8)=64 is WORSE than 32) — it is a recursion-overhead floor, matching `_CHOL_SB`=32.
+# INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
+# Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
+const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
