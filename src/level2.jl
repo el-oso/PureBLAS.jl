@@ -1323,14 +1323,17 @@ end
 # so the block is capped at √(L1/8) and shrunk further on a smaller L1. Fleet L1 = 32 KB → √4096 = 64 EXACT
 # (no-op vs the old literal); a ≤16 KB-L1 box gets a smaller, still-resident block. `tri_nb` pref pins it.
 const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int
-# trsv-T: unblocked (scalar back/forward-substitution dots) up to here, blocked above. req#8: the blocked
-# path offloads the bulk O(n²) off-diagonal work to the vectorized gemv-T kernel and only substitutes the
-# NB×NB diagonal per-column, so it wins once n is large enough to amortize the gemv-T calls. FLEET A/B
-# (Zen4 W=8 + Zen3 W=4, boost-locked, same-process interleaved): crossover is n≈512–768 on BOTH boxes —
-# unblocked wins ≤3% at n≤512, blocked wins 6–40% at n≥768. Nearly FLAT across ISA width (512 vs ~640,
-# within a size-step) ⇒ INVARIANT algorithmic crossover, literal not formula. The old 1024 was MISTUNED:
-# it forced the slower unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both boxes
-# (Zen4 1.03×, Zen3 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
+# REAL trsv-T only (complex has its own `_TRI_C_T_UNB` below): unblocked (scalar back/forward-substitution
+# dots) up to here, blocked above. req#8: the blocked path offloads the bulk O(n²) off-diagonal work to the
+# vectorized gemv-T kernel and only substitutes the NB×NB diagonal per-column, so it wins once n is large
+# enough to amortize the gemv-T calls. FLEET A/B (boost-locked, same-process interleaved): the crossover
+# MOVES with ISA — AVX2 Zen4 ties at ~512 / Zen3 at ~640 (unblocked wins ≤3% at n≤512, blocked wins 6–40%
+# at n≥768), and AVX-512 Zen5 blocks even at n=128 (blk wins 1–6% ≤512). 512 = the fleet MAX crossover:
+# it keeps the AVX2 boxes' small-n unblocked optimum (where they'd lose ~3% blocked) while Zen5 still gates
+# unblocked ≤512 (no miss, ~1–6% left on the table). Spread is within a size-step ⇒ literal, not a W-formula
+# (a formula would inject unmeasured µarch variation). The old 1024 was MISTUNED: it forced the slower
+# unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both AVX2 boxes (Zen4 1.03×, Zen3
+# 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
@@ -1339,6 +1342,11 @@ const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 # re-streams x and dips at n=1024–2048 (0.83–0.86); route those to blocked+ri. n≤512 stays unblocked
 # (gates 0.96–1.53). Sweep the crossover per box via the knob.
 const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ? 256 : 1024)::Int
+# COMPLEX trsv-T unblocked threshold — SEPARATE from real `_TRI_T_UNB` (which the real-only fleet A/B retuned
+# to 512). Kept at 1024 (the pre-retune value) so the complex path is byte-unchanged: complex ztrsv-T stays
+# unblocked ≤1024 as before. A complex-specific crossover sweep (the AVX2 n=1024–2048 dip noted above) is
+# DEFERRED to the parked complex batch; decoupling avoids silently retuning a gated complex op off a real A/B.
+const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
 # — each diagonal NB×NB block uses the per-column kernel (cache-resident), and the off-diagonal block
@@ -1608,7 +1616,7 @@ end
 
 @inline function _trsv_cmplx_blk!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
-    (n <= _TRI_C_BLK_MIN || (tr && n <= _TRI_T_UNB)) && return _trsv_cmplx!(up, tr, cj, unit, n, A, x)
+    (n <= _TRI_C_BLK_MIN || (tr && n <= _TRI_C_T_UNB)) && return _trsv_cmplx!(up, tr, cj, unit, n, A, x)
     T = eltype(A)
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP (−)
         ib = (cld(n, NB) - 1) * NB
