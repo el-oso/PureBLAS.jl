@@ -5,7 +5,7 @@
 # decomposition: gemm carries the flops, the small triangular base carries the structure. α is applied
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
-const _TRMM_BASE = 128        # ≤ this → _trmm_small! directly (capped by _L3_NB=128 M scratch)
+const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
 const _TRMM_RPANEL = 512
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
