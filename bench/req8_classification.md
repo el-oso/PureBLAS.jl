@@ -72,7 +72,7 @@ the measurement-heavy part:
 | ✅`_CHOL_BLOCK` | lapack.jl:194 | `128` | **INVARIANT — measured NB-insensitive** (Zen4 sweep 96/128/192/256 → potrf n=1024…4096 within 0.5%). Large-n residual is structural panel-major, not NB. Kept flat + documented. |
 | `_L3_NB` | workspace.jl:18 | `128` | NB×NB trmm/syrk scratch. Same 128 class as `_CHOL_BLOCK`; insensitivity inferred but `_TRMM_BASE` gates side-L → light confirm before closing. |
 | `_TRMM_BASE` | level3.jl:8 | `128` | = `_L3_NB` cap; side-L trmm base (GATED). Confirm with a small NB check. |
-| `_LU_NB` | lu.jl:6 | `48` | self-flagged; getrf campaign found nb GROWS w/ size, µarch-keys on _NVREG. GATED. |
+| ✅`_LU_NB` | lu.jl:6 | `48`/÷8/`128` | **INVARIANT — fleet nb-sweep (2026-07-16), derivation FALSIFIED.** Full nb×n grid Zen4+Zen3: FLAT band (n≥384 nb∈[96,192] within ~1%); FLOOR 48 sharply validated (n=256 wants 48 both boxes, nb64 +2.4/+4.4%); CAP/slope in-band. Curve is parity-BUMPY (mult-64 win), so the derived `_l1_block(F64,_MR·W)` (128 Zen4/168 Zen3) is a Zen3 TROUGH — 168 WORSE than 128 (+0.4–2.6%). True large-n opt is 64-aligned + per-µarch (Zen4 256/Zen3 192), no clean formula, only ~0.5–1.5% over 128. Literals kept + documented. |
 | `_GETF2_BASE` | lu.jl:25 | `16` | self-flagged "derive from store-BW/L1"; `_CGETF2_BASE` scales it by sizeof. |
 | `_BRD_NB`/`_BT_NB` | svd.jl | (lit) | bidiag block; low priority (SVD). |
 
