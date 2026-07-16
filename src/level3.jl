@@ -2239,16 +2239,25 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     return B
 end
 const _TRSM_R_FUSE = 128       # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
+# BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
+# amortizes over O(m·k) solve work — tax = k/m — so it needs a FEW register-tiles of m, NOT the k-CEILING.
+# The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
+# n≤128 (m=n≤128) missed its own best kernel → the Zen3 n=128 side-R dip (0.74 vs AOCL; the fused panel does
+# 0.87). Derived: max(_CHOLW SIMD row-tile, k>>2 setup-amortization) ⇒ 32 at k=128, admits the square-128 gate.
+# _CHOLW is µarch-derived (req#8). Fleet-safe: measured galen(Zen3) n=128 0.74→0.87 AND wintermute(Zen4)
+# 0.945→1.04 (both beat AOCL at n=64), 2026-07-16 — the fused panel is no-op-or-better at narrow m on both.
+_trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
 function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    # Lower-transpose real-f64 wide-B fast base: the fused 12-acc substitution (the potrf panel kernel
+    # Lower-transpose real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
     # `_trsm_rl_split_f64!`, IN-PLACE, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no
-    # trtri, no unpacked-gemm-into-tmp, no copyback, no recurse-to-32. Net win on wide-B (n=256 0.88→1.02
-    # gates; geomean up) + the zpotrf/getrf panel shape. Recursion above `_TRSM_R_FUSE` keeps the
-    # cache-blocked off-diagonal gemms and bottoms out here. (Square-gate worst n=32 is the narrow base.)
-    if !up && tr && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 &&
-            size(B, 1) > _TRSM_NCUT_R && B isa StridedMatrix
+    # trtri, no unpacked-gemm-into-tmp, no copyback, no recurse-to-32. Fires on wide B (m > _TRSM_NCUT_R,
+    # ALL k≤fuse — unchanged) AND on narrow-but-square-ish B (k∈(_TRSM_DBASE,fuse], m ≥ the derived batch
+    # floor) — the latter is the ADDED path that closes the n=128 side-R dip (was falling to the recursion +
+    # k=32 scalar bases). k≤_TRSM_DBASE narrow keeps the dense base (n=32 unchanged). Recursion above fuse.
+    if !up && tr && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 && B isa StridedMatrix &&
+            (size(B, 1) > _TRSM_NCUT_R || (k > _TRSM_DBASE && size(B, 1) >= _trsm_r_mfloor(k)))
         m = size(B, 1); ldb = stride(B, 2)
         mc0 = max(_vwidth(Float64), (_L2_BYTES ÷ 2) ÷ (k * 8))   # MC row-chunk: the mc×k slab the k-repasses
         GC.@preserve A B begin                                   # re-read stays L2-resident (req#8; rows independent)
