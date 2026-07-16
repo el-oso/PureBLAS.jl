@@ -1316,7 +1316,13 @@ end
     return x
 end
 
-const _TRI_NB = 64       # triangular block size (diagonal block per-column; off-diagonal via gemv)
+# triangular block size for blocked trmv/trsv: the NB×NB diagonal block is walked per-column while the
+# off-diagonal goes through gemv, so the diagonal block must stay L1-resident (NB²·8 ≤ L1 ⇒ NB ≤ √(L1/8)).
+# req#8: DERIVED as an L1-residency CLAMP. NOT a flat crossover — the fleet A/B (trmv/trsv N+T, boost-locked)
+# shows NB=128 REGRESSES mid-n 3–8% on Zen4 (128²·8 = 128 KB SPILLS the 32 KB L1) while NB=32/64 tie ≤2%;
+# so the block is capped at √(L1/8) and shrunk further on a smaller L1. Fleet L1 = 32 KB → √4096 = 64 EXACT
+# (no-op vs the old literal); a ≤16 KB-L1 box gets a smaller, still-resident block. `tri_nb` pref pins it.
+const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int
 const _TRI_T_UNB = 1024  # trsv-T: unblocked up to here (blocked only helps the huge-n x-restream).
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
