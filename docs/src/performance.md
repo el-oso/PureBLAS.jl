@@ -184,16 +184,21 @@ PB/OpenBLAS` there — a smaller margin, the legit-competitor signature) while `
 a single-thread comparison; AOCL is tuned first for multi-threaded EPYC, so on these single-thread Zen
 parts it's a fair-but-not-dominant baseline.
 
-![BLAS-1 vs AOCL](assets/perf_l1_aocl_lite.svg)
-![BLAS-2 vs AOCL](assets/perf_l2_aocl_lite.svg)
-![BLAS-3 vs AOCL](assets/perf_l3_aocl_lite.svg)
-![LAPACK vs AOCL](assets/perf_lapack_aocl_lite.svg)
-![Complex BLAS-1 vs AOCL](assets/perf_cl1_aocl_lite.svg)
-![Complex BLAS-2 vs AOCL](assets/perf_cl2_aocl_lite.svg)
-![Complex BLAS-3 vs AOCL](assets/perf_cl3_aocl_lite.svg)
-![Complex LAPACK vs AOCL](assets/perf_clapack_aocl_lite.svg)
+![BLAS-1 vs AOCL](assets/perf_l1_aocl.svg)
+![BLAS-2 vs AOCL](assets/perf_l2_aocl.svg)
+![BLAS-3 vs AOCL](assets/perf_l3_aocl.svg)
+![LAPACK vs AOCL](assets/perf_lapack_aocl.svg)
+![Complex BLAS-1 vs AOCL](assets/perf_cl1_aocl.svg)
+![Complex BLAS-2 vs AOCL](assets/perf_cl2_aocl.svg)
+![Complex BLAS-3 vs AOCL](assets/perf_cl3_aocl.svg)
+![Complex LAPACK vs AOCL](assets/perf_clapack_aocl.svg)
 
 **Caveat on the small-n LAPACK ratios in the plots.** AOCL-libFLAME has heavy *per-call overhead* at
 tiny n (e.g. `potrf`/`getrf` show 4–160× at n≤32), which flatters PureBLAS there — that is dispatch
 overhead, not an algorithmic gap. The mid/large-n figures in the table are the honest signal. The
-per-op numbers are generated to [`bench/gen_table_aocl_lite.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table_aocl_lite.md).
+per-op numbers are generated to [`bench/gen_table_aocl.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table_aocl.md).
+
+> **Freshness note (interim).** These AOCL plots use *freshly remeasured* Zen3 (galen) and Zen4
+> (wintermute) caches (boost-locked); the Zen5 (neuromancer) line is from an earlier same-session run.
+> The µarch labels are now stamped authoritatively into each cache header (`uarch=`), fixing a prior
+> plot-labeling swap. A full same-commit fleet re-measure will follow.
