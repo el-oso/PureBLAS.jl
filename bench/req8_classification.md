@@ -40,14 +40,26 @@ Sequenced **payoff-first**: MISTUNED (gate wins) → SCALES-refactor (correctnes
 ### Phase A — MISTUNED candidates (far-apart µarch ternaries; highest payoff)
 | const | file:line | value | hypothesis | Tier-2 plan |
 |-------|-----------|-------|-----------|-------------|
-| `_GEMVN_RB` | level2.jl:83 | `64 : 448` | MISTUNED? (comment says L2-derived but AVX2 64 is a measured crossover) | gemv-N sweep, both RB values, 3 boxes |
-| `_TRI_C_BLK_MIN` | level2.jl:1327 | `256 : 1024` | MISTUNED? | trtri/tri-solve sweep |
-| `_GBMV_CONV_MAX` | level2_banded.jl:17 | `20 : 48` | MISTUNED? | gbmv sweep at the crossover |
+| ~~`_GEMVN_RB`~~ | level2.jl:83 | `64 : 448` | **NOT a Zen4 gate bug** — see verdict below | Zen3/Zen5 confirm → Phase B |
+| ~~`_TRI_C_BLK_MIN`~~ | level2.jl:1327 | `256 : 1024` | **OUT OF SCOPE — complex** (tri unblocked threshold) | defer to complex batch |
+| ~~`_GBMV_CONV_MAX`~~ | level2_banded.jl:17 | `20 : 48` | **INVARIANT-per-ISA** — measured datapath crossover (conv re-reads AB ~band/W×; comment: stable n=256…4096). Formula `band*≈f(W)` under-determined (2 pts), low payoff. | keep+document; revisit if a W-formula batch covers it |
+
+**Phase A conclusion (2026-07-16): NO gate wins.** The only suspicious real ternary, `_GEMVN_RB`, is
+correctly tuned on Zen4; the near-miss was a wrong-shape (tall M) artifact I caught. `_GBMV_CONV_MAX` is a
+characterized per-ISA crossover; `_TRI_C_BLK_MIN` is complex. → Confirms campaign value is **Phase B**
+(correct block-sizing on unbenchmarked HW), not gate wins.
+
+**`_GEMVN_RB` Zen4 verdict (2026-07-16):** row-block/panel A/B at the **gated square shape** (forced each
+path via `gemvn_rb` pref): row-block wins n≤64 (+20-33%), **flat tie 96→448**, panel wins ≥512 (row-block
+collapses at the po2-512 aliasing cliff, 0.41× at n=2048). Literal `448` sits at the knee → correct on
+Zen4. Value is **insensitive in [64,511]** (flat band) → 64 and 448 tie on Zen4-square. NOT mistuned; no
+Zen4 gate win. TRAP: a tall M=2048 test said "panel always wins" (row-block's y can't be register-resident
+there) — the wrong, ungated shape. → SCALES-vs-INVARIANT deferred to Phase B fleet batch (needs Zen3/Zen5).
 
 ### Phase B — SCALES / refactor-to-reproduce (formula often already in-comment)
 | const | file:line | value | hypothesis | Tier-2 plan |
 |-------|-----------|-------|-----------|-------------|
-| `_TRMM_RPACK` | level3.jl:14 | `448` | SCALES — **= `_at_gemm_unpack_max` (register-capacity, G1 lesson)** | reuse derived `_acc_cap`; A/B trmm-R |
+| ✅`_TRMM_RPACK` | level3.jl:14 | `448`→`_GEMM_UNPACK_MAX` | **SCALES — DERIVED** (register-capacity, = gemm unpack cut) | no-op Zen4/Zen5 (both 448); Zen3 448→96; correct 5.5e-16 |
 | `_TRMM_RPANEL` | level3.jl:9 | `512` | SCALES (pack panel) | pair with RPACK |
 | `_CHOL_RL_MAX` | level3.jl:520 | (lit) | SCALES — formula in-comment `√(_L2/8)·7/8` | apply + validate potrf |
 | `_CHOL_BLOCK` | lapack.jl:194 | `128` | SCALES (L2) — feeds already-derived `_CHOL_MC` | A/B potrf; may share NB with `_L3_NB` |
@@ -68,6 +80,12 @@ Sequenced **payoff-first**: MISTUNED (gate wins) → SCALES-refactor (correctnes
 | `_POTRF_BASE` | (cold) | `512` | INVARIANT (recursion base) | document |
 | `_GEMM_TINY` | (cold) | `6` | INVARIANT (flop crossover) | document |
 | `_SVD_DC_CROSS`/`_DC_THRESHOLD` | svd.jl | (lit) | INVARIANT (algorithm crossover; 96 was measured — [[gesvd-dc-crossover-and-lbt]]) | document |
+
+**`_TRMM_RPACK` status (2026-07-16):** derived to `_GEMM_UNPACK_MAX` (=2·_acc_cap, same register-capacity
+crossover — identical microkernel). Zen4/Zen5 unchanged (both 448 → pure req#8 cleanup, byte-identical);
+Zen3 448→96 (the principled AVX2 value). Correctness verified on Zen4 with the pref forced to 96 (5.5e-16,
+all side/uplo/trans/diag). **Side-R trmm is UNGATED** (plots.jl gates only side-L), so the bar is "no Zen3
+regression," not a gate win. PENDING: Zen3 (Zen3) side-R perf spot-check before master-merge (branch-safe now).
 
 ## Ship discipline
 Per-const small commits on this branch. Update this table's hypothesis→verdict as each clears. Do NOT
