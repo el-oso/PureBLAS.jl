@@ -191,6 +191,10 @@ end
 # non-positive pivot. SIMD via PureBLAS's SIMD.jl layer at the detected width.
 const _CVF = Vec{_vwidth(Float64), Float64}     # vector type at host width (concrete const)
 const _CHOLW = _vwidth(Float64)
+# req#8 (validated 2026-07-16, Zen4): potrf large-n time is NB-INSENSITIVE — sweeping this 96/128/192/256
+# moves n=1024…4096 potrf by <0.5% (noise; _CHOL_MC follows via the derived formula below). The large-n
+# residual is the structural panel-major streaming gap ([[pureblas-potrf-campaign]]), not the block size,
+# so 128 is a correct µarch-invariant (a formula would add spurious variation for zero gain). Knob-able.
 const _CHOL_BLOCK = 128
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
@@ -520,8 +524,10 @@ const _CHOL_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
 # until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
-# 7⁄8 of that ≈ 224. ponytail: measured literal, req#8 derive √(_L2_BYTES/8)·7⁄8 once fleet-validated.
-const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : 224
+# 7⁄8 of that ≈ 224 → DERIVED √(_L2_BYTES/8)·7⁄8 (galen 512 KB L2 → 224 EXACT; scales to other AVX2 L2).
+# W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
+# give ~317). 128 is µarch-invariant across the AVX-512 fleet (Zen4+Zen5 both gate potrf with it) → kept flat.
+const _CHOL_RL_MAX = _CHOLW == 8 ? 128 : round(Int, sqrt(_L2_BYTES / 8) * (7 / 8))
 const _CHOL_FAER_BASE = _CHOLW == 8 ? 1024 : _CHOL_RL_MAX
 # Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =
