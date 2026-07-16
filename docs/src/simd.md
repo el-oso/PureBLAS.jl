@@ -140,12 +140,15 @@ differently:
   across alignment offsets on a machine — by rotating reduction accumulators (needed because faer
   aligns its loads, which would otherwise make the summation order alignment-dependent).
 
-PureBLAS is not *required* to be reproducible, but it turns out to be — **by construction rather than
-by contract**. Its kernels load from the base pointer with a fixed lane grouping (no alignment
-peeling) and run single-threaded, so the reduction order cannot depend on alignment or scheduling.
-Measured on one machine, `nrm2` / `dot` / `asum` / `iamax` / `gemv` are bit-identical across eight
-distinct memory alignments, and `gemm` is bit-identical run-to-run. The difference from faer is one of
-*promise*, not behavior: faer tests and guarantees this as an invariant; PureBLAS has it de facto but
-does not yet lock it with regression tests. Neither guarantees cross-*machine* reproducibility (a
-different vector width builds a different reduction tree), and adding multithreading would require a
-fixed reduction tree to preserve it.
+PureBLAS is not *required* to be reproducible, but it is — **by construction, and now locked by
+regression tests** (`test/reproducibility_tests.jl`). Its kernels load from the base pointer with a
+fixed lane grouping (no alignment peeling) and run single-threaded, so two properties hold and are
+asserted: every operation is bit-identical **run-to-run** (same input, repeated call), and a reduction
+is bit-identical across memory alignments **within a code path**.
+
+What is *not* guaranteed — for PureBLAS, and typically not for any BLAS — is that the SIMD fast path
+and the generic scalar fallback agree to the last bit: they sum in a different order, so `nrm2` of a
+plain `Vector` (SIMD path) can differ by a ULP or two from `nrm2` of an offset view (scalar path).
+That is the normal fast-path/fallback split, not a reproducibility bug. Cross-*machine* reproducibility
+is likewise not guaranteed (a different vector width builds a different reduction tree), and adding
+multithreading would require a fixed reduction tree to preserve run-to-run identity.

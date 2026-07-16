@@ -4,4 +4,10 @@
 using ReTestItems
 using PureBLAS
 
-runtests(PureBLAS)
+# Optional name filter via test args, e.g. `Pkg.test(PureBLAS; test_args=["Reproducibility"])` runs
+# only matching `@testitem`s. No args → the full suite.
+if isempty(ARGS)
+    runtests(PureBLAS)
+else
+    runtests(PureBLAS; name = Regex(join(ARGS, "|")))
+end
