@@ -128,5 +128,8 @@ competitive with Rust's, and JIT-to-host is the more flexible substrate for hard
 a handicap.
 
 A note on scope: faer additionally *guarantees* bit-reproducible results across alignment offsets on
-a machine (by rotating reduction accumulators). PureBLAS does not currently make that guarantee; its
-numerical-correctness budget goes to overflow-safe accumulation (`nrm2` via LAPACK `lassq`) instead.
+a machine (by rotating reduction accumulators). PureBLAS does not currently make that guarantee. Its
+own numerical-robustness emphasis is elsewhere — overflow/underflow-safe accumulation, e.g. `nrm2` via
+LAPACK `lassq` (`√(Σxᵢ²)` computed with running rescaling so it neither overflows nor underflows for
+any representable input). The two are independent properties, not a trade-off against each other; each
+is a separate choice about which numerical risk to spend effort on.
