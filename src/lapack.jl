@@ -180,7 +180,7 @@ end
 function _potrf_upper!(A, n::Int, base::Int = _POTRF_BASE)
     n <= base && return _potf2b_upper!(A, n)
     h = n ÷ 2
-    _potrf_upper!(view(A, 1:h, 1:h), h)
+    _potrf_upper!(view(A, 1:h, 1:h), h, base)
     A12 = view(A, 1:h, (h + 1):n)
     if eltype(A) <: Complex                                    # Hermitian: U11⁻ᴴ·A12 + A22 -= A12ᴴ·A12
         trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'C', diag = 'N', alpha = true)

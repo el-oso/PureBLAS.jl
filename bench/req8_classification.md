@@ -148,13 +148,31 @@ cache-block literal remains on the real path.**
 - **trsm consts** (`_TRSM_BASE`/`_TRTRI_BASE`/`_TRSM_NCUT`/`_TRSM_NCUT_R`/`_TRSM_DBASE`/`_TRSM_R_FUSE`, `_TRMM_RPANEL`) — "trsm consts parked" (scope line); measured in the trsm/AOCL campaigns (tasks #66/#73).
 - **complex** (`_QR_NB_C` pref, zgeqrf gates 1.24×; `_CGEMV_NP`) — complex G1c/G2 batch deferred.
 
-**Ledger conclusion:** every hardcoded numeric const in `src/` is now one of — (a) a derived cache-block
-SCALES already shipped (gemm tiles via `_at_gemm_*`, `_CHOL_MC`, `_L3_NB`, `_TRI_NB`, `_CHOL_RL_MAX`),
-(b) a MISTUNED literal corrected this session (`_TRI_T_UNB` 1024→512, `_POTRF_BASE` 512→32), (c) a
-req#8-compliant derivation INPUT/primitive, (d) an INVARIANT structural/algorithmic/datapath constant
-(documented + evidence), or (e) a parked/deferred batch (trsm/complex, tracked). **The req#8 real-path
-audit (task #69) is COMPLETE.** Residual perf gaps that are NOT req#8 const issues are tracked separately
-(F64-upper po2 aliasing + Zen3 F32 recursion, task #77; trsm-vs-AOCL, task #73).
+**GREP-FLAW CORRECTION (2026-07-17, Opus adversarial review):** the first Phase-D grep
+(`^const _…= [0-9]+` minus `@load_preference`) had TWO blind spots — it excluded (i) `@load_preference`-
+wrapped consts whose DEFAULT is a µarch ternary or literal, and (ii) double-space `_X  = n` defs. A
+corrected exhaustive sweep surfaced these additional real-path tuning consts, now classified:
+
+| const | file:line | value | class + evidence |
+|-------|-----------|-------|------------------|
+| `_SYRK_UNIFIED_MAX` | level3.jl:2875 | `W4? 48 : 0` | **INVARIANT-per-ISA (validated-by-gate).** µarch selector for the unified syrk path (AVX2 uses it ≤48; AVX-512 disables, `0`). Each side runs on its own µarch and **syrk gates ≥1.40× OB at every size on all 3 boxes** (wintermute 1.40 / galen 1.40 / neuromancer 1.61 worst-median) → both sides gate-validated. Same class as `_GBMV_CONV_MAX`. Flipping the disabled AVX-512 side is a speculative "could-be-faster", not a fix (op already gates hard). |
+| `_SYR2K_2PASS` | level3.jl:3219 | `W4? 128 : typemax` | **INVARIANT-per-ISA (validated-by-gate).** 2-pass syr2k above n=128 on AVX2, never on AVX-512. syr2k gates ≥1.45× OB all boxes (1.45/1.65/1.56 worst-median) → both sides validated. |
+| `_SYRK_DBASE`/`_SYRK_MR` | level3.jl:3253/2881 | `32`/`2` | INVARIANT — syrk diagonal recursion base + microkernel rows (algorithmic/register-structural, sibling of `_SYRK_BASE`=48). syrk gates. |
+| `_STRASSEN_MIN`/`_STRASSEN_MAXDEPTH` | gemm.jl:1070-1 | `1024`/`3` | INVARIANT algorithmic — Strassen-Winograd recursion cutoff + depth cap; gemm gates + BEATS OB ([[strassen-3m-gemm]]). Cut is a flop-reduction-vs-overhead crossover, not a cache block. |
+| `_GEMVN_MINNER_U`/`_GER_PANEL_U` | level2.jl:56/712 | `4`/`4` | INVARIANT datapath — ILP unroll (independent y/x accumulators to cover FMA latency), same class as `_UNROLL`=4/`_SYMV_MR`=4; hand-unrolled, ~µarch-robust. |
+
+**Ledger conclusion (corrected):** after the flaw fix, every hardcoded numeric const in `src/` is one of —
+(a) a derived cache-block SCALES already shipped (gemm tiles via `_at_gemm_*`, `_CHOL_MC`, `_L3_NB`,
+`_TRI_NB`, `_CHOL_RL_MAX`), (b) a MISTUNED literal corrected this session (`_TRI_T_UNB` 1024→512,
+`_POTRF_BASE` 512→32), (c) a req#8-compliant derivation INPUT/primitive (`_ILP_TARGET`, `_GEMM_SPLIT_S`),
+(d) an INVARIANT structural/algorithmic/datapath/per-ISA constant (documented + gate/structural evidence,
+incl. the two syrk/syr2k µarch ternaries above), or (e) a parked/deferred batch (trsm/complex, tracked).
+The req#8 real-path SCALES + MISTUNED audit (task #69) is complete **to the corrected exhaustive grep**;
+the residual "could-the-disabled-side-be-faster" question on the two per-ISA syrk/syr2k ternaries is a
+speculative optimization (both sides already gate ≥1.4× OB), not an open req#8 violation. Perf gaps that
+are NOT req#8 const issues are tracked separately (F64-upper po2 aliasing + Zen3 F32 recursion, task #77;
+trsm-vs-AOCL, task #73). LESSON (Opus review): a "completeness" grep must catch `@load_preference`
+ternary DEFAULTS + whitespace variants, else it silently skips the exact µarch-ternary class the audit targets.
 
 ## Ship discipline
 Per-const small commits on this branch. Update this table's hypothesis→verdict as each clears. Do NOT
