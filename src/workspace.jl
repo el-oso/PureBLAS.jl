@@ -15,7 +15,13 @@
 # Single global instance per hot type ⇒ single-thread only (the project's current mode; multithreading is
 # deferred). M4 threading swaps _l3ws for a per-task/per-thread owner — the ~4 lines below, nothing else.
 
-const _L3_NB = 128   # NB×NB diagonal-block scratch side (was in level3.jl); caps trmm/syrk materialize.
+# NB×NB diagonal-block scratch side; caps trmm/syrk materialize (the _trmm_small! `_mat_tri!` M tile is
+# re-read across all B columns → it must stay L2-resident: NB²·8 ≲ ¼·L2 ⇒ NB ≤ √(L2/32)). req#8: DERIVED as
+# an L2-residency CLAMP — capped at 128 (the measured flat on-fleet optimum; trmm side-L NB∈{96,128,192} tie
+# within noise on Zen4+Zen3, PB≥OB throughout — the base is an algorithm crossover that does NOT grow with L2),
+# shrunk only when L2 can't hold the 128² F64 tile at ¼ occupancy. No-op on the fleet (galen 512K→√16384=128
+# EXACT; Zen4/Zen5 1M→181→cap 128); a ≤256K-L2 box gets a smaller, still-fitting tile. `l3_nb` pref pins it.
+const _L3_NB = @load_preference("l3_nb", clamp(_round_dn(isqrt(_L2_BYTES ÷ 32), 16), 16, 128))::Int
 
 mutable struct L3Workspace{T}
     diag::Matrix{T}       # _l3_tmp:      fixed _L3_NB×_L3_NB diagonal-block scratch
