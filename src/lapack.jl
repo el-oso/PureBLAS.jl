@@ -191,6 +191,10 @@ end
 # non-positive pivot. SIMD via PureBLAS's SIMD.jl layer at the detected width.
 const _CVF = Vec{_vwidth(Float64), Float64}     # vector type at host width (concrete const)
 const _CHOLW = _vwidth(Float64)
+# req#8 (validated 2026-07-16, Zen4): potrf large-n time is NB-INSENSITIVE — sweeping this 96/128/192/256
+# moves n=1024…4096 potrf by <0.5% (noise; _CHOL_MC follows via the derived formula below). The large-n
+# residual is the structural panel-major streaming gap ([[pureblas-potrf-campaign]]), not the block size,
+# so 128 is a correct µarch-invariant (a formula would add spurious variation for zero gain). Knob-able.
 const _CHOL_BLOCK = 128
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
