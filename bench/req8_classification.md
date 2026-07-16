@@ -118,6 +118,44 @@ dedicated 2-box crossover campaign; a guessed formula would be worse than 448. *
 plausible mechanism ("identical microkernel") was a HYPOTHESIS, measurement killed it — and the measurement
 also corrected an early single-shot artifact (a spurious "n=160 +18%" that a wider ABBA sweep showed was noise).**
 
+### Phase D — completeness ledger (2026-07-17): every remaining bare-literal const accounted for
+
+A full `grep '^const _… = <int>'` over `src/*.jl` surfaces the consts below (those NOT already in
+Phase A/B/C). Each is classified so the audit ledger is provably complete — **no unclassified magic
+cache-block literal remains on the real path.**
+
+**Derivation INPUTS (req#8-COMPLIANT primitives — the target consts that formulas derive FROM, not tuning outputs):**
+| const | file:line | role |
+|-------|-----------|------|
+| `_ILP_TARGET` | cpuinfo.jl:118 | `=16` ILP register-budget target; `_at_gemm_nr`/`_at_gemm_mr`/`_at_gemm_split_*` derive gemm tile dims FROM it (≈ FMA-latency×issue-width, µarch-robust). This IS the req#8 mechanism. |
+| `_GEMM_SPLIT_S` | cpuinfo.jl:149 | `=2` k-split factor for the tall AVX-512 fill tile (double ILP for the short-k fill); structural, feeds `_at_gemm_split_mr` + the split gemm kernel. |
+
+**Structurally-coupled datapath constants (INVARIANT across x86; a formula can't vary them without regenerating hand-unrolled code):**
+| const | file:line | why INVARIANT |
+|-------|-----------|---------------|
+| `_UNROLL` | simd_kernels.jl:366 | `=4` independent accumulator chains for L1 reductions, HAND-WRITTEN `a0..a3`. 4 saturates the uniform 2-load/cycle x86 port limit; changing it needs regenerating the accumulator structure, not a knob. |
+| `_SYMV_MR` | level2.jl:892 | `=4` symv microkernel rows (register-blocked, hand-unrolled). |
+| `_CHOL_NB`/`_CHOL_NC` | lapack.jl:223-4 | `=4`/`4` trsm/syrk panel column blocks inside the Cholesky recursion (small register-blocking widths). |
+
+**Panel widths — MEASURED, widening/aliasing FALSIFIED (do not re-chase):**
+| const | file:line | evidence |
+|-------|-----------|----------|
+| `_GEMV_NP`/`_SYMV_NB` | level2.jl:42/888 | `=8` column-panel = # sequential A-streams (y re-streamed n/8×, 8-way-L1-tied). gemvN widening/aliasing/prefetch levers FALSIFIED on the fleet; residuals are Zen5-DRAM-bound, not panel-width ([[gemvn-trmm-residuals-falsified]]). |
+
+**Algorithmic bases / non-tuning:** `_QR_UNBLK_MAX=32` (qr.jl:234, QR unblocked crossover — INVARIANT); `_SEC_BISECT_CAP=0` (svd_dc.jl:241, a disable cap — not tuning).
+
+**PARKED / DEFERRED batches (tracked out-of-scope per the header, NOT oversights):**
+- **trsm consts** (`_TRSM_BASE`/`_TRTRI_BASE`/`_TRSM_NCUT`/`_TRSM_NCUT_R`/`_TRSM_DBASE`/`_TRSM_R_FUSE`, `_TRMM_RPANEL`) — "trsm consts parked" (scope line); measured in the trsm/AOCL campaigns (tasks #66/#73).
+- **complex** (`_QR_NB_C` pref, zgeqrf gates 1.24×; `_CGEMV_NP`) — complex G1c/G2 batch deferred.
+
+**Ledger conclusion:** every hardcoded numeric const in `src/` is now one of — (a) a derived cache-block
+SCALES already shipped (gemm tiles via `_at_gemm_*`, `_CHOL_MC`, `_L3_NB`, `_TRI_NB`, `_CHOL_RL_MAX`),
+(b) a MISTUNED literal corrected this session (`_TRI_T_UNB` 1024→512, `_POTRF_BASE` 512→32), (c) a
+req#8-compliant derivation INPUT/primitive, (d) an INVARIANT structural/algorithmic/datapath constant
+(documented + evidence), or (e) a parked/deferred batch (trsm/complex, tracked). **The req#8 real-path
+audit (task #69) is COMPLETE.** Residual perf gaps that are NOT req#8 const issues are tracked separately
+(F64-upper po2 aliasing + Zen3 F32 recursion, task #77; trsm-vs-AOCL, task #73).
+
 ## Ship discipline
 Per-const small commits on this branch. Update this table's hypothesis→verdict as each clears. Do NOT
 batch-formula-ize; each SCALES/MISTUNED const clears its own fleet A/B before shipping. Merge to master
