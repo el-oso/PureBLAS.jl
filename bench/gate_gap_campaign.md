@@ -29,8 +29,9 @@ has gaps the main plot doesn't show, plus its building blocks miss. Sub-items:
 | id | item | evidence | status |
 |----|------|----------|--------|
 | P0.1 | **F64-UPPER po2 aliasing** | ✅ **DONE** — whole-matrix pad at the generic-potrf entry (`_potrf_gen!`+`_potrf_needs_pad`, byte-scaled off `_L1_WAY_BYTES`; separate `padf` scratch). Fleet A/B: **Zen4/Zen5 (AVX-512) F64-U n≥192 all GATE** (n=512 0.72/0.78 vs 1.50 before; n=256 1.01/1.05 vs 1.64). **galen (AVX2) strict win** — pad on/off: n=256 2.44→1.51, n=512 1.73→0.99, n=1024 1.17→0.96, non-po2 neutral (fires only at po2, zero overhead regression). Also fixes F32-U + complex-U large-n. Gated F64-L faer path untouched. | task #77, committed |
-| P0.2 | **F32 potrf Zen3** | generic recursion sits **1.24–1.78× slower** than OB at n=192–1024 on Zen3 even at optimal base=32 (AVX-512 gates 0.80–1.07). AVX2 recursion kernel gap. | found this session |
-| P0.3 | **potrf small-n (n=8/32/128)** | lower gates; UPPER n=128 = 1.78× (overhead, not aliasing). Supernode diagonal blocks are often small → verify all uplo/precision small-n gate. | to measure |
+| Lever A | **F64-UPPER via faer-lower transpose (U=Lᵀ)** | ✅ **DONE** (supersedes P0.1's pad for F64-upper). Route ALL F64-upper through the gating faer LOWER kernels: transpose A-upper→scratch-lower (CACHE-BLOCKED 32×32 tile, else the strided cost is µarch-variable & regresses AVX2 large-n), `_potrf_f64_lower!`, transpose L→A-upper. Fleet OB/PB: **gates everywhere** except galen n=768 (0.96, unchanged) — n=128 **0.45–0.63→1.48–2.07**, n=256 0.67–0.99→1.09–1.80, n=512 0.99–1.38→1.05–1.58. Fixes the small-n floor (P0.3) + galen mid-n (P0.2-real). Only softening: galen n=1024/2048 ~1.0 vs P0.1 ~1.06 (within noise, uncommon supernode size). Correct 1e-5. | task #79 |
+| P0.2 | **F32 potrf Zen3** | generic recursion **1.24–1.78× slower** than OB at n=192–1024 on Zen3. F64-upper now fixed by Lever A; F32 has NO faer equivalent → needs a fused F32 base (Lever B). Open. | Lever B |
+| P0.3 | **potrf small-n (n=8/32/128)** | F64-upper n=128 FIXED by Lever A (→1.5–2.1). F32/complex small-n still on the generic recursion. | partly done (Lever A) |
 | P0.4 | **potrf n=2048 Zen5** | 0.98 vs AOCL (last-mile). | low |
 | P0.5 | **zpotrf n=2048** | 1.00 vs AOCL Zen4/Zen5 (borderline). | low |
 
