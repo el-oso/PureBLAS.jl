@@ -13,7 +13,8 @@
 # backend present. TRIM-COMPATIBILITY is a strict-contract guarantee too (contracts.jl): the complex-gemm
 # kernel is asserted `@assert_trim_compatible` HERE (fast/dev → heuristic scan, cheap early net) and in the
 # full-mode dogfood (test → juliac's authoritative verify_typeinf_trim). The heuristic misses reachability-
-# limit union-splits the authoritative pass catches — the known fast/full discrepancy (report to StrictMode).
+# limit union-splits the authoritative pass catches — StrictMode 0.3.9 now logs a one-time caveat on that
+# heuristic-path trim PASS (issue #13); trim_tests.jl keeps the authoritative ccallable-rooted belt.
 # trim_tests.jl keeps the exhaustive ccallable-rooted TrimCheck.@validate belt (strict verify isn't perfect).
 # Values live in a `let` — only their types matter, so `ones` (no Random dep).
 # potrf! overwrites its argument and throws PosDefException if re-factored — but @strict calls its
