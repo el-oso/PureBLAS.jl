@@ -208,8 +208,57 @@ end
     end
 
 const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
+
+# Transposed-triangle copies for the F64-UPPER → faer-LOWER reuse (Lever A). CACHE-BLOCKED: a naive strided
+# transpose thrashes L1 at large n (its strided side sweeps the whole matrix, so the cost tracks memory
+# bandwidth and varies wildly by µarch); tiling confines each strided sweep to a `_TR_TB`² block that stays
+# L1-resident, so the O(n²) transpose cost shrinks uniformly and Lever A ≈ faer-lower on every box. TB=32 is
+# µarch-invariant (two 32² F64 tiles = 16 KB ≤ any real L1). Contiguous stores; tile-confined strided loads.
+const _TR_TB = 32
+@inline function _tri_upper_to_lowerT!(pm::Ptr{Float64}, ldM::Int, pa::Ptr{Float64}, lda::Int, n::Int)
+    @inbounds for jb in 0:_TR_TB:(n - 1)            # M_lower[i,j] = A_upper[j,i], i≥j
+        je = min(jb + _TR_TB, n)
+        for ib in jb:_TR_TB:(n - 1)
+            ie = min(ib + _TR_TB, n)
+            for j in jb:(je - 1)
+                mo = j * ldM
+                for i in max(ib, j):(ie - 1)        # M col j contiguous ← A row j, tile-confined strided
+                    unsafe_store!(pm + (mo + i) * 8, unsafe_load(pa + (i * lda + j) * 8))
+                end
+            end
+        end
+    end
+    return nothing
+end
+@inline function _tri_lowerT_to_upper!(pa::Ptr{Float64}, lda::Int, pm::Ptr{Float64}, ldM::Int, n::Int)
+    @inbounds for ib in 0:_TR_TB:(n - 1)            # A_upper[j,i] = M_lower[i,j], j≤i
+        ie = min(ib + _TR_TB, n)
+        for jb in 0:_TR_TB:ib
+            je = min(jb + _TR_TB, n)
+            for i in ib:(ie - 1)
+                ao = i * lda
+                for j in jb:min(je - 1, i)          # A col i contiguous ← M row i, tile-confined strided
+                    unsafe_store!(pa + (ao + j) * 8, unsafe_load(pm + (j * ldM + i) * 8))
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     T = eltype(A)
+    # Lever A: F64 UPPER factored via the gating faer LOWER kernels. U = Lᵀ exactly (UᵀU = LLᵀ = A). faer
+    # gates at ALL sizes (incl. small-n, where the generic recursion's trsm!/syrk! overhead loses) and self-
+    # pads po2 strides — so this closes F64-upper's small-n + AVX2 mid-n gaps by reuse, portably. Transpose
+    # A's upper into the (alias-free) scratch's lower, factor, transpose L back into A's upper.
+    if _POTRF_PAD && up && T === Float64 && _strided1(A)
+        M = _potrf_pad(Float64, n); ldM = size(M, 1); lda = stride(A, 2)
+        GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
+        _potrf_f64_lower!(view(M, 1:n, 1:n))        # M lower ← L (throws PosDefException ⇒ A upper unchanged)
+        GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n)
+        return A
+    end
     if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
         b = _potrf_pad(T, n); lda = stride(A, 2); ldb = size(b, 1); sz = sizeof(T)
         GC.@preserve A b begin
