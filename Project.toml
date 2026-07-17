@@ -18,26 +18,29 @@ CpuId = "0.3"
 LinearAlgebra = "1.12.0"
 Preferences = "1.5.2"
 SIMD = "3.7.2"
-StrictMode = "0.3.7"
+StrictMode = "0.3.9"
 TypeContracts = "0.13.1, 0.14"
 julia = "1.12"
 
 # Freeze ger's panel stream-count so the :fast load-time dogfood (src/verify.jl) exercises the alloc-free
 # SHIPPING path — same as test/Project.toml and what the .so/trim build MUST set. Without it, ger!'s
 # OncePerProcess auto-calibration branch compiles in and statically allocates its one-time calibration
-# buffer (a REAL alloc — both :fast and :full AllocCheck flag it), reddening the noalloc proof. 0.3.5's
-# :fast heuristic missed this; 0.3.6+ correctly catches it. Value arbitrary (1/2/4/8); benchmarks use the
-# separate bench project (auto-cal, best perf) so dev/bench perf is unaffected.
+# buffer; 0.3.9's one-time-init barrier exemption now clears that (issue #14), but we keep ger frozen so the
+# dogfood exercises the true shipping path. Value arbitrary (1/2/4/8); benchmarks use the separate bench
+# project (auto-cal, best perf) so dev/bench perf is unaffected.
 [preferences.PureBLAS]
 ger_panel_np = 4
 
 [preferences.StrictMode]
 analysis = "fast"
 checks_enabled = true
-# WARN (not error) for the main package's own :fast precompile dogfood (src/verify.jl). StrictMode 0.3.6+
-# tightened the :fast static noalloc scan to flag OncePerProcess auto-calibration allocs (gemv/trmv/trsv
-# panel measurement — a ONE-TIME cold init, not a hot-path alloc; :full/AllocCheck clears them warm, so the
-# authoritative test-suite dogfood at fail_mode="error"/analysis="full" still enforces and passes). Erroring
-# the precompile on those :fast-static-only findings blocks `using PureBLAS`; warn keeps the early-net signal
-# without the false block. (ger above is a GENUINELY-real alloc frozen out; the rest are the :fast/:full gap.)
+# WARN (not error) for the main package's own :fast precompile dogfood (src/verify.jl). StrictMode 0.3.9's
+# :fast is a VALUE-FREE IR heuristic (F38 — a signature-level `_alloc_signals` verdict, more conservative
+# than 0.3.8's warm `@allocated`); it flags a boxing/alloc SIGNAL in some hot kernels (e.g. trmv!/gemv!)
+# that the AUTHORITATIVE :full/AllocCheck all-paths proof clears warm — the inherent :fast↔:full heuristic
+# gap, which a heuristic can't close without false-positiving. Erroring the precompile on those blocks
+# `using PureBLAS`; warn keeps the early-net signal. The strict GUARANTEE lives in the test-suite dogfood
+# (analysis="full", AllocCheck loaded), which enforces at fail_mode default and passes. (0.3.9's one-time-init
+# barrier exemption — issue #14 — is honored in BOTH :full and this :fast heuristic, so ger's OncePerProcess
+# auto-cal would be exempted; it's frozen via `ger_panel_np` regardless so the dogfood tests the shipping path.)
 fail_mode = "warn"
