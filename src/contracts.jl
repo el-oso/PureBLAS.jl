@@ -127,7 +127,7 @@ function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular
 # (`_gemm_cmplx_unpacked!`): it is asserted `@assert_trim_compatible` in the strict-verify pass — heuristic
 # in :fast (dev, verify.jl) and juliac's authoritative verify_typeinf_trim in :full (tests, the strictmode
 # dogfood, TrimCheck loaded). trim_tests.jl keeps the exhaustive ccallable-rooted belt (strict isn't perfect
-# yet; the fast/full heuristic-vs-authoritative gap is reported upstream to improve StrictMode).
+# yet; StrictMode 0.3.9 logs a one-time caveat on the fast/full heuristic-vs-authoritative trim gap, issue #13).
 # The rank-k/hemm family's divide-and-conquer drivers were
 # refactored to carry integer offsets into the original arrays (not fresh sub-block SubArrays, which
 # are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are
