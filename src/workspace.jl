@@ -31,6 +31,7 @@ mutable struct L3Workspace{T}
     rpack::Matrix{T}      # _trsm_rpack:  side-R fused-leaf pT scratch, ODD ld (conflict-free re-reads; grows)
     ftrsm::Vector{T}      # _trsm_fused_buf: side-L gemmtrsm leaf packed row-major stripe P + recip (grows)
     potf2::Matrix{T}      # _potf2_buf:   potrf diagonal-base contiguous buffer (grows n×n)
+    padf::Matrix{T}       # _potrf_pad:   potrf po2-ld whole-matrix pad, alias-free ld (grows (n+8|+16)×n)
     gpackA::Vector{T}     # _gemm_scratch:      packed A panel
     gpackB::Vector{T}     # _gemm_scratch:      packed B panel
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
@@ -40,7 +41,7 @@ mutable struct L3Workspace{T}
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[], Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
@@ -113,6 +114,18 @@ function _potf2_buf(::Type{T}, n::Int) where {T}
         b = Matrix{T}(undef, n, n); ws.potf2 = b
     end
     return view(b, 1:n, 1:n)
+end
+
+# potrf whole-matrix pad: an alias-free leading dim (n+8, bumped +8 more if that ld would ITSELF land on the
+# L1 quarter-way stride) so the generic potrf recursion's trailing trsm!/syrk! read the copy conflict-free.
+function _potrf_pad(::Type{T}, n::Int) where {T}
+    ws = _l3ws(T); b = ws.padf
+    need = n + 8
+    (need * sizeof(T)) % (_L1_WAY_BYTES >> 2) == 0 && (need += 8)   # keep the scratch's own ld off the way-stride
+    if size(b, 1) < need || size(b, 2) < n
+        b = Matrix{T}(undef, need, n); ws.padf = b
+    end
+    return b
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}

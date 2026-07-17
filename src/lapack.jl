@@ -193,6 +193,42 @@ function _potrf_upper!(A, n::Int, base::Int = _POTRF_BASE)
     return A
 end
 
+# Power-of-2 lda cache-set aliasing: the generic potrf recursion's trailing trsm!/syrk! read A sub-views at
+# a power-of-2 column stride → columns collapse onto a few L1 sets → conflict misses (measured Zen4 F64-upper
+# n=512 1.50× slower vs OB; padding the working ld → 0.74×, PB beats OB). Fix = mirror the gated lower path's
+# whole-matrix pad (`_potrf_f64_lower!`): factor in an alias-free (ld=n+8) scratch, copy the `uplo` triangle
+# back. Covers the UNGATED generic recursion — F64-upper, F32 (both uplo), complex-upper, F64/complex-lower-
+# non-strided; the gated F64/complex-LOWER-STRIDED paths have their own kernels and never reach here.
+# req#8: the pad predicate is byte-scaled off _L1_WAY_BYTES (reproduces `_chol_needs_pad`'s F64 128-elt period
+# on the fleet, and classifies F32/complex by their own stride bytes). Pad ONLY when aliased (a pad above L2
+# loses — measured on the lower path). Dual (non-BlasFloat) skips → byte-identical to the old generic path.
+@inline _potrf_needs_pad(A, n) = _strided1(A) && n >= 128 &&
+    let sb = stride(A, 2) * sizeof(eltype(A)), q = _L1_WAY_BYTES >> 2
+        sb % q == 0 && (sb % (q << 1) == 0 || n * n * sizeof(eltype(A)) <= _L2_BYTES)
+    end
+
+const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
+function _potrf_gen!(A, n::Int, base::Int, up::Bool)
+    T = eltype(A)
+    if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
+        b = _potrf_pad(T, n); lda = stride(A, 2); ldb = size(b, 1); sz = sizeof(T)
+        GC.@preserve A b begin
+            pa = pointer(A); pb = pointer(b)
+            @inbounds for j in 0:(n - 1)          # copy only the `uplo` triangle: upper=col prefix (j+1), lower=col suffix (n-j)
+                up ? unsafe_copyto!(pb + (j * ldb) * sz,     pa + (j * lda) * sz,     j + 1) :
+                     unsafe_copyto!(pb + (j * ldb + j) * sz, pa + (j * lda + j) * sz, n - j)
+            end
+            up ? _potrf_upper!(view(b, 1:n, 1:n), n, base) : _potrf_lower!(view(b, 1:n, 1:n), n, base)
+            @inbounds for j in 0:(n - 1)          # factored triangle back; the opposite triangle of A is untouched (throws skip copy-back)
+                up ? unsafe_copyto!(pa + (j * lda) * sz,     pb + (j * ldb) * sz,     j + 1) :
+                     unsafe_copyto!(pa + (j * lda + j) * sz, pb + (j * ldb + j) * sz, n - j)
+            end
+        end
+        return A
+    end
+    return up ? _potrf_upper!(A, n, base) : _potrf_lower!(A, n, base)
+end
+
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 # Float64 LOWER fast path — faithful port of faer 0.24.1 `cholesky_recursion_right_looking`
 # (github.com/el-oso/BlazingPorts.jl, src/Factorizations.jl). Custom register-blocked SIMD kernels
@@ -932,6 +968,6 @@ function potrf!(A::AbstractMatrix; uplo::Char = 'L')
         eltype(A) <: BlasComplex && return (_cpotrf_lower!(A, n); A)   # recursive nb=n/4 (base handled inside)
     end
     base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex upper / Dual: small base → fast recursion
-    uplo == 'L' ? _potrf_lower!(A, n, base) : _potrf_upper!(A, n, base)
+    _potrf_gen!(A, n, base, uplo != 'L')                       # pads po2-aliased strides (see _potrf_needs_pad)
     return A
 end
