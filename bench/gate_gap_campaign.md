@@ -28,7 +28,7 @@ has gaps the main plot doesn't show, plus its building blocks miss. Sub-items:
 
 | id | item | evidence | status |
 |----|------|----------|--------|
-| P0.1 | **F64-UPPER po2 aliasing** | `_potrf_upper!` trailing syrk/trsm read power-of-2 lda → cache-set conflict misses. Zen4 n=256 **1.64×**, n=512 **1.50×** slower vs OB; padding lda +8 → 1.06 / **0.74** (PB beats OB unaliased). Fleet-confirmed pattern. | task #77, diagnosed |
+| P0.1 | **F64-UPPER po2 aliasing** | ✅ **DONE** — whole-matrix pad at the generic-potrf entry (`_potrf_gen!`+`_potrf_needs_pad`, byte-scaled off `_L1_WAY_BYTES`; separate `padf` scratch). Fleet A/B: **Zen4/Zen5 (AVX-512) F64-U n≥192 all GATE** (n=512 0.72/0.78 vs 1.50 before; n=256 1.01/1.05 vs 1.64). **galen (AVX2) strict win** — pad on/off: n=256 2.44→1.51, n=512 1.73→0.99, n=1024 1.17→0.96, non-po2 neutral (fires only at po2, zero overhead regression). Also fixes F32-U + complex-U large-n. Gated F64-L faer path untouched. | task #77, committed |
 | P0.2 | **F32 potrf Zen3** | generic recursion sits **1.24–1.78× slower** than OB at n=192–1024 on Zen3 even at optimal base=32 (AVX-512 gates 0.80–1.07). AVX2 recursion kernel gap. | found this session |
 | P0.3 | **potrf small-n (n=8/32/128)** | lower gates; UPPER n=128 = 1.78× (overhead, not aliasing). Supernode diagonal blocks are often small → verify all uplo/precision small-n gate. | to measure |
 | P0.4 | **potrf n=2048 Zen5** | 0.98 vs AOCL (last-mile). | low |
