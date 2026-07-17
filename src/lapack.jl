@@ -20,6 +20,18 @@ using LinearAlgebra: PosDefException
 # INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
 # Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
 const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
+# Lever B (F32): the generic recursion's base crossover is TYPE-dependent. Float32 packs 2× per SIMD lane, so
+# the scalar left-looking `_potf2` base is ~2× costlier per element while the SIMD trsm!/syrk! recursion is
+# relatively cheaper → the crossover where blocking beats the base HALVES. Measured Zen4 (spotrf-L OB-ratio,
+# base32→base16): n=32 0.33→0.62, n=64 0.76→0.96, n=128 0.97→1.14 — closes n≥64. (n=32 stays ~0.62: the
+# scalar base still runs the whole 32² factorization; fully closing it needs a fast fused F32 base — the
+# F64 faer base ported to Float32 — deferred, lower priority than F64 supernodes.) F64/Dual keep _POTRF_BASE.
+# Derived (÷2 off the F64 anchor), µarch-invariant crossover like _CHOL_STH; knob "potrf_base_f32"; fleet-validate.
+# MUST be a top-level const (like every other tuning const here): @load_preference inside a function body is a
+# per-CALL runtime preferences lookup — it dominated microsecond small-n F32 factorizations (galen spotrf 0.02).
+const _POTRF_BASE_F32 = @load_preference("potrf_base_f32", _POTRF_BASE >> 1)::Int
+@inline _potrf_base(::Type{Float32}) = _POTRF_BASE_F32
+@inline _potrf_base(::Type{T}) where {T} = _POTRF_BASE
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
@@ -209,36 +221,44 @@ end
 
 const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
 
-# Transposed-triangle copies for the F64-UPPER → faer-LOWER reuse (Lever A). CACHE-BLOCKED: a naive strided
-# transpose thrashes L1 at large n (its strided side sweeps the whole matrix, so the cost tracks memory
-# bandwidth and varies wildly by µarch); tiling confines each strided sweep to a `_TR_TB`² block that stays
-# L1-resident, so the O(n²) transpose cost shrinks uniformly and Lever A ≈ faer-lower on every box. TB=32 is
-# µarch-invariant (two 32² F64 tiles = 16 KB ≤ any real L1). Contiguous stores; tile-confined strided loads.
+# Transposed-triangle copies for the UPPER → gating-LOWER reuse: Lever A (F64, U=Lᵀ) and Lever C (complex
+# Hermitian, U=Lᴴ, so `CJ=true` conjugates). Generic over T; the `CJ` flag is a type param so the conj
+# const-folds away (real path is byte-identical to the old F64 code). CACHE-BLOCKED: a naive strided transpose
+# thrashes L1 at large n (its strided side sweeps the whole matrix, so the cost tracks memory bandwidth and
+# varies wildly by µarch); tiling confines each strided sweep to a `_TR_TB`² block that stays L1-resident, so
+# the O(n²) transpose cost shrinks uniformly and the lever ≈ the lower kernel on every box. TB=32 is
+# µarch-invariant (two 32² F64 tiles = 16 KB ≤ any real L1; complex 32² = 32 KB still fits typical L1).
 const _TR_TB = 32
-@inline function _tri_upper_to_lowerT!(pm::Ptr{Float64}, ldM::Int, pa::Ptr{Float64}, lda::Int, n::Int)
-    @inbounds for jb in 0:_TR_TB:(n - 1)            # M_lower[i,j] = A_upper[j,i], i≥j
+@inline function _tri_upper_to_lowerT!(pm::Ptr{T}, ldM::Int, pa::Ptr{T}, lda::Int, n::Int,
+        ::Val{CJ} = Val(false)) where {T, CJ}
+    sz = sizeof(T)
+    @inbounds for jb in 0:_TR_TB:(n - 1)            # M_lower[i,j] = (CJ ? conj : id)(A_upper[j,i]), i≥j
         je = min(jb + _TR_TB, n)
         for ib in jb:_TR_TB:(n - 1)
             ie = min(ib + _TR_TB, n)
             for j in jb:(je - 1)
                 mo = j * ldM
                 for i in max(ib, j):(ie - 1)        # M col j contiguous ← A row j, tile-confined strided
-                    unsafe_store!(pm + (mo + i) * 8, unsafe_load(pa + (i * lda + j) * 8))
+                    v = unsafe_load(pa + (i * lda + j) * sz)
+                    unsafe_store!(pm + (mo + i) * sz, CJ ? conj(v) : v)
                 end
             end
         end
     end
     return nothing
 end
-@inline function _tri_lowerT_to_upper!(pa::Ptr{Float64}, lda::Int, pm::Ptr{Float64}, ldM::Int, n::Int)
-    @inbounds for ib in 0:_TR_TB:(n - 1)            # A_upper[j,i] = M_lower[i,j], j≤i
+@inline function _tri_lowerT_to_upper!(pa::Ptr{T}, lda::Int, pm::Ptr{T}, ldM::Int, n::Int,
+        ::Val{CJ} = Val(false)) where {T, CJ}
+    sz = sizeof(T)
+    @inbounds for ib in 0:_TR_TB:(n - 1)            # A_upper[j,i] = (CJ ? conj : id)(M_lower[i,j]), j≤i
         ie = min(ib + _TR_TB, n)
         for jb in 0:_TR_TB:ib
             je = min(jb + _TR_TB, n)
             for i in ib:(ie - 1)
                 ao = i * lda
                 for j in jb:min(je - 1, i)          # A col i contiguous ← M row i, tile-confined strided
-                    unsafe_store!(pa + (ao + j) * 8, unsafe_load(pm + (j * ldM + i) * 8))
+                    v = unsafe_load(pm + (j * ldM + i) * sz)
+                    unsafe_store!(pa + (ao + j) * sz, CJ ? conj(v) : v)
                 end
             end
         end
@@ -257,6 +277,17 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
         _potrf_f64_lower!(view(M, 1:n, 1:n))        # M lower ← L (throws PosDefException ⇒ A upper unchanged)
         GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n)
+        return A
+    end
+    # Lever C: complex Hermitian UPPER via the gating _cpotrf_lower!. U = Lᴴ exactly (UᴴU = LLᴴ = A), so the
+    # transpose CONJUGATES (Val(true)). Mirrors Lever A — closes zpotrf-upper's small/mid-n gap (the generic
+    # _potrf_upper! recursion's trsm!/herk! overhead loses there; _cpotrf_lower! gates). Conj-transpose A's
+    # upper into the scratch lower, factor, conj-transpose Lᴴ back into A's upper.
+    if _POTRF_PAD && up && T <: BlasComplex && _strided1(A)
+        M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
+        GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
+        _cpotrf_lower!(view(M, 1:n, 1:n), n)        # M lower ← L (throws PosDefException ⇒ A upper unchanged)
+        GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
         return A
     end
     if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
@@ -1016,7 +1047,7 @@ function potrf!(A::AbstractMatrix; uplo::Char = 'L')
         # blocked (small-nb panels → big amortizing trailing herks). Splitting n≤64 into panels regressed it.
         eltype(A) <: BlasComplex && return (_cpotrf_lower!(A, n); A)   # recursive nb=n/4 (base handled inside)
     end
-    base = eltype(A) <: Complex ? _CPOTRF_BASE : _POTRF_BASE   # complex upper / Dual: small base → fast recursion
+    base = eltype(A) <: Complex ? _CPOTRF_BASE : _potrf_base(eltype(A))   # complex→_CPOTRF_BASE; F32→halved (Lever B); F64/Dual→_POTRF_BASE
     _potrf_gen!(A, n, base, uplo != 'L')                       # pads po2-aliased strides (see _potrf_needs_pad)
     return A
 end
