@@ -943,6 +943,33 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
     return B
 end
 
+# Strassen split driver for large side-L real trmm. Blocks the triangular dim k and routes the OFF-DIAGONAL
+# update through gemm! — which fires Strassen (≥ _STRASSEN_MIN) for the flop cut that lets PB beat AOCL and
+# that the single-pass _trmm_packed! cannot use. Diagonal halves recurse, bottoming out in _trmm_packed!
+# below 2·_STRASSEN_MIN (where the off-diagonal gemm's min-dim falls under the Strassen threshold, so the
+# split stops paying off). In-place safe: the half whose update READS the other half runs LAST — top-first
+# for upper-N / lower-T, bottom-first for lower-N / upper-T. UNSCALED (trmm! applies α once at the top).
+# req#8: keyed on _STRASSEN_MIN (no literal). Measured Zen4 vs AOCL: n=2048 0.925→0.963, n=4096 0.929→1.001
+# (the strassen-3m-gemm lesson — a flop reduction on the gating base kernel).
+function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
+    k = size(B, 1); T = eltype(B)
+    k < 2 * _STRASSEN_MIN && return _trmm_packed!(up, tr, unit, one(T), A, B, mrv)
+    h = k ÷ 2
+    A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):k, (h + 1):k)
+    off = up ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)     # upper→A12, lower→A21
+    Bt = view(B, 1:h, :); Bb = view(B, (h + 1):k, :); ta = tr ? 'T' : 'N'
+    if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
+        _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
+        gemm!(Bt, off, Bb; transA = ta, alpha = true, beta = true)   # Bt += op(off)·Bb  (Strassen)
+        _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
+    else                                        # bottom block carries the update
+        _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
+        gemm!(Bb, off, Bt; transA = ta, alpha = true, beta = true)   # Bb += op(off)·Bt  (Strassen)
+        _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
+    end
+    return B
+end
+
 # Public: B := α·op(A)·B (side 'L') or α·B·op(A) (side 'R'); A k×k triangular (uplo/transA/diag).
 function trmm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
         transA::Char = 'N', diag::Char = 'N', alpha::Number = true)
@@ -983,7 +1010,10 @@ function trmm!(B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Cha
         # NOTE: no A-pad here (unlike trsm). trmm's po2-ld conflict is mild (~2%); the O(k²) A-copy to
         # pad it costs about the same, so padding is net-negative for trmm — measured. (trsm's conflict
         # was catastrophic 0.78→1.12, there the copy pays.)
-        _trmm_packed!(uplo == 'U', transA != 'N', diag == 'U', convert(eltype(B), alpha), A, B, mrv)
+        # Split driver: recurses to the packed base, but routes the off-diagonal update through gemm! so
+        # Strassen fires at k ≥ 2·_STRASSEN_MIN (closes large-n vs AOCL). UNSCALED → scale B by α once here.
+        _trmm_split_L!(uplo == 'U', transA != 'N', diag == 'U', A, B, mrv)
+        isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
     else
         _trmm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, B)
     end
