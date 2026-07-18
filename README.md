@@ -6,8 +6,9 @@ replaces OpenBLAS/MKL, and it is usable two ways:
 
 1. **Native Julia API** — call it directly. Because it's plain Julia source, it is **differentiable**
    (ForwardDiff/Enzyme/ChainRules), which opaque `ccall`s into OpenBLAS never allowed.
-2. **libblastrampoline drop-in** — compiled to `libpureblas.so` via `juliac --trim`, providing the
-   reference-BLAS (ILP64) symbols for **non-Julia hosts** (C/C++/Rust).
+2. **Whole-ecosystem reroute** — `PureBLAS.activate()` reroutes all of LinearAlgebra's BLAS/LAPACK to
+   PureBLAS in the running process (MKL.jl-style), so existing `A*B`/`cholesky`/`qr`/… code uses it with
+   no changes. The same symbols also compile to `libpureblas.so` (`juliac --trim`) for **non-Julia hosts**.
 
 **Status:** feature-complete BLAS Levels 1–3 (real + complex, `s`/`d`/`c`/`z`) plus core LAPACK
 factorizations — Cholesky (`potrf`), LU (`getrf`), QR (`geqrf`), SVD (`gesvd`) — real and complex.
@@ -43,7 +44,25 @@ PureBLAS.getrf!(copy(A))                                # LU (returns A, ipiv, i
 Works for `Float32/Float64/ComplexF32/ComplexF64` — and any other `T<:Number`, including
 `ForwardDiff.Dual`, so you can differentiate through these calls.
 
-## LBT drop-in (Mode 1) — for non-Julia hosts
+## Whole-ecosystem reroute (Mode 1, in-process)
+
+Reroute everything LinearAlgebra dispatches through BLAS/LAPACK to PureBLAS — no code changes, just one call:
+
+```julia
+using PureBLAS, LinearAlgebra
+PureBLAS.activate()          # A*B, mul!, cholesky, qr, svd, LinearAlgebra.BLAS.* now use PureBLAS
+A = randn(512, 512)
+C = A * A'                   # gemm → PureBLAS
+cholesky(C)                  # potrf → PureBLAS
+PureBLAS.deactivate()        # restore OpenBLAS
+```
+
+This registers in-process `@cfunction` pointers to PureBLAS's native kernels via libblastrampoline
+(`lbt_set_forward`) — it runs in the live process, so there is no separate library to build or load.
+Note: this C-ABI path is **not** differentiable (no compiled BLAS is) — for AD, call the native `PureBLAS.*`
+API directly.
+
+## `libpureblas.so` — for non-Julia hosts
 
 ```bash
 julia juliac/build.jl        # build libpureblas.so (Julia 1.12, experimental juliac --trim)
@@ -52,15 +71,16 @@ julia juliac/build.jl        # build libpureblas.so (Julia 1.12, experimental ju
 The resulting `libpureblas.so` exports the reference-BLAS ILP64 symbols and self-initializes its embedded
 runtime, so a **C/C++/Rust** host can link it as its BLAS backend (see [`juliac/ctest.c`](juliac/ctest.c)).
 
-> **Known limitation:** forwarding this `.so` back into a *running* Julia process
-> (`BLAS.lbt_forward(libpureblas.so)`) currently **aborts** (`signal 6`) — juliac libraries embed the Julia
-> runtime and double-initialize the shared `libjulia` on LBT's autodetect probe. So **inside Julia, use the
-> native API (Mode 2)**; the `.so` is for non-Julia hosts. This is revisitable once juliac gains a
-> host-runtime-init mode. See [`ROADMAP.md`](ROADMAP.md) → "Key finding".
+> Note: the `.so` is for **non-Julia hosts**. Do *not* `BLAS.lbt_forward(libpureblas.so)` from inside a
+> running Julia process — a juliac library embeds its own `libjulia` and double-inits it on LBT's probe
+> (`signal 6`). Inside Julia use `PureBLAS.activate()` (above), which forwards `@cfunction` pointers to the
+> in-process kernels and needs no `.so`. See [`ROADMAP.md`](ROADMAP.md) → "In-process LBT forwarding".
 
 ## Known limitations
 
-- **LBT live-forward from a running Julia process is blocked** (juliac limitation, above).
+- **Forwarding the `.so` into a live Julia process is blocked** (juliac double-init); this is *not* a
+  limitation on rerouting to PureBLAS in Julia — use `PureBLAS.activate()` (in-process `@cfunction`
+  forwarding, above), which needs no `.so`.
 - **Complex-dot ABI symbols deferred** — the four `c/zdotu`, `c/zdotc` `@ccallable` symbols have an
   unresolved complex-return ABI; the native API covers complex dot.
 - **Single-threaded** — multithreading is deferred by design.

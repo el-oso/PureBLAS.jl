@@ -20,8 +20,12 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
   - *Native API (Mode 2)* — `PureBLAS.axpy!`, `.dot`, `.gemm!`, … Direct Julia calls, no `ccall`
     boundary, so they are **AD-traceable** (ForwardDiff/Enzyme/ChainRules) — something opaque OpenBLAS
     `ccall`s never permitted.
-  - *LBT drop-in (Mode 1)* — `@ccallable` reference-BLAS (ILP64) symbols built to `libpureblas.so` via
-    `juliac --trim`. The `.so` self-inits its embedded runtime and works from non-Julia hosts (C/C++/Rust).
+  - *Whole-ecosystem reroute (Mode 1)* — `PureBLAS.activate()` reroutes all of LinearAlgebra's
+    BLAS/LAPACK to PureBLAS in the running process (MKL.jl-style), by registering in-process `@cfunction`
+    pointers to the native kernels via libblastrampoline (`lbt_set_forward`). After it, `A*B`, `mul!`,
+    `cholesky`, `qr`, `svd`, and `LinearAlgebra.BLAS.*` use PureBLAS with no code change; `deactivate()`
+    restores OpenBLAS. The same `@ccallable` reference-BLAS (ILP64) symbols also build to `libpureblas.so`
+    via `juliac --trim` (self-inits its embedded runtime) for **non-Julia hosts** (C/C++/Rust).
 - **Hardware-adaptive tuning.** Block sizes, base-case cutoffs, panel widths, and unroll/stream counts are
   **derived at load time** from the detected CPU (cache sizes, vector width, register count, µarch/vendor
   via `CpuId`/`HostCPUFeatures`/`CPUSummary`), const-folded and trim-safe — so PureBLAS sizes itself to the
@@ -37,11 +41,12 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
 
 ### Known limitations
 
-- **LBT live-forward is blocked** (a juliac limitation, not a PureBLAS bug): `BLAS.lbt_forward(libpureblas.so)`
-  from inside a *running* Julia process aborts (`signal 6`) — juliac libraries embed the Julia runtime and
-  double-initialize the shared `libjulia` on the LBT autodetect probe. The in-Julia path is therefore the
-  native API (Mode 2); the `.so` (Mode 1) is for **non-Julia hosts**. Revisit when juliac gains host-runtime
-  init. See `ROADMAP.md` → "Key finding".
+- **Forwarding the `.so` into a live Julia process is blocked** (a juliac limitation, not a PureBLAS bug):
+  `BLAS.lbt_forward(libpureblas.so)` from inside a *running* Julia process aborts (`signal 6`) — a juliac
+  library embeds its own `libjulia` and double-inits it on LBT's autodetect probe. This is *not* a limit on
+  using PureBLAS as the in-Julia backend: `PureBLAS.activate()` reroutes the whole ecosystem via in-process
+  `@cfunction` forwarding (no `.so`). The `.so` is for **non-Julia hosts**. See `ROADMAP.md` → "In-process
+  LBT forwarding".
 - **Complex-dot ABI symbols deferred** — the four `c/zdotu`, `c/zdotc` `@ccallable` symbols have an
   unresolved complex-return ABI (LBT NORMAL vs ARGUMENT retstyle); the native API covers complex dot.
 - **Single-threaded** — multithreading is deferred by design; all kernels are single-thread today.

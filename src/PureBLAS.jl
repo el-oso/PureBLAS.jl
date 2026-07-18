@@ -31,6 +31,7 @@ include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + 
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
 include("cabi_l3.jl")       # Mode 1: BLAS-3 rest (symm/syrk/trmm/trsm/…)
 include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
-include("lbt.jl")           # activate/deactivate via BLAS.lbt_forward
+include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
+include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
 end # module
