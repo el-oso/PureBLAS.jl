@@ -354,6 +354,23 @@ THIS process's runtime → no second init. The `.so` remains the artifact for **
   change). Not auto-forwarded at load (the suite needs OpenBLAS as its correctness oracle).
 - The `.so` is still the artifact for **non-Julia consumers** (C/C++/Rust calling BLAS).
 
+**NORTH STAR — completely remove the OpenBLAS fallback** (user directive 2026-07-18): every symbol
+LinearAlgebra can call should route to PureBLAS. Prioritize *replacing* methods over leaving them on
+OpenBLAS. **Policy:** forward a symbol only when it is **self-consistent under a mixed backend** (correct
+even if its companions stay on OpenBLAS) — else you ship the NaN-Q class of bug (geqrf's faer-τ vs
+OpenBLAS orgqr, retracted 4b5454c). Coverage today: all BLAS 1–3; LAPACK getrf/potrf(real)/gesvd. Worklist:
+
+- **Tier 1 (kernel exists → just C-ABI wrapper + forward):** complex LAPACK `zpotrf/zgetrf/zgeqrf/zgesvd`
+  (kernels done; `cabi_lapack.jl` wraps only real + `spotrf`); `gesdd` divide-conquer SVD (have
+  `svd_dc.jl`; Julia's `svd`/`svdvals` default to gesdd, not gesvd, so `svd()` doesn't route today);
+  solve/inverse companions `getrs/potrs/trtrs` (built on `trsm`) and `getri/potri` (`trtri`+`trsm`).
+- **Tier 2 (convention/moderate work):** QR routing — τ-consistent `geqrt`+`orgqr`+`ormqr` (emit LAPACK-τ
+  or implement PureBLAS orgqr/ormqr consuming faer-τ); Float32 `sgetrf/sgeqrf/sgesvd`.
+- **Tier 3 (new implementation):** eigensolvers `syev/heev/geev/gees` (none yet — see "unbuilt surface");
+  least squares `gels/gelsd`, pivoted QR `geqp3`, Bunch-Kaufman `sytrf`, banded/packed LAPACK.
+- **Coverage audit:** enumerate every LinearAlgebra-reachable symbol, diff vs `_LBT_REGISTRARS`, track the
+  shrinking OpenBLAS-fallthrough set as a gate toward zero.
+
 Open risks: complex-dot return ABI (deferred to M2); AVX-512 on Zen4 is double-pumped (tune via
 Preferences knob).
 
