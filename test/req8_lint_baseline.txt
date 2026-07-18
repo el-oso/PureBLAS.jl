@@ -1,0 +1,74 @@
+# req#8 lint baseline — known tuning literals pending derivation or `# req8-ok:` annotation.
+# The lint fails on any flag NOT listed here. Whittle this down; do not add to it without cause.
+cpuinfo.jl  const _ILP_TARGET = 16
+cpuinfo.jl  const _GEMM_SPLIT_S = 2
+cpuinfo.jl  Val(2)
+gemm.jl  const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
+gemm.jl  const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int
+gemm.jl  const _CGEMM_3M_MAX = @load_preference("cgemm_3m_max", 2048)::Int
+gemm.jl  const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int
+gemm.jl  const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int
+gemm.jl  const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
+gemm.jl  const _GEMM_TINY = 6
+gemm.jl  Val(2)
+gemm.jl  Val(2)
+gemm.jl  Val(2)
+gemm.jl  Val(3)
+gemm.jl  Val(2)
+lapack.jl  const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
+lapack.jl  const _TR_TB = 32
+lapack.jl  const _CHOL_NB = 4
+lapack.jl  const _CHOL_NC = 4
+level2.jl  const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
+level2.jl  const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
+level2.jl  const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
+level2.jl  Val(2)
+level2.jl  Val(3)
+level2.jl  Val(2)
+level2.jl  Val(3)
+level2.jl  Val(4)
+level2.jl  const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
+level2.jl  const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int
+level2.jl  const _CGEMV_NP = 8
+level2.jl  const _GEMV_NP = 8
+level2.jl  const _CGEMVN_NC = @load_preference("cgemvn_nc", 4)::Int
+level2.jl  const _GEMVN_MINNER_U = 4
+level2.jl  const _GER_PANEL_U = 4
+level2.jl  Val(2)
+level2.jl  Val(4)
+level2.jl  Val(8)
+level2.jl  const _SYMV_NB = 8
+level2.jl  const _SYMV_MR = 4
+level3.jl  const _TRSM_BASE = 32
+level3.jl  const _TRTRI_BASE = 16
+level3.jl  const _TRMM_DDIRECT = @load_preference("trmm_ddirect", 4)
+level3.jl  const _TRSM_NCUT = 64
+level3.jl  const _TRSM_NCUT_R = 128
+level3.jl  const _TRSM_DBASE = 32
+level3.jl  const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
+level3.jl  const _CTRSM_REC_L = @load_preference("ctrsm_rec_l", 64)::Int
+level3.jl  const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int
+level3.jl  Val(2)
+level3.jl  const _TRSM_R_FUSE = 128
+level3.jl  const _SYRK_BASE = 48
+level3.jl  const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
+level3.jl  const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
+level3.jl  const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 256)::Int
+level3.jl  const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
+level3.jl  const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
+level3.jl  const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int
+level3.jl  const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int
+level3.jl  Val(2)
+level3.jl  Val(3)
+level3.jl  Val(4)
+level3.jl  Val(5)
+level3.jl  const _TRMM_RPANEL = 512
+lu.jl  const _GETF2_BASE = 16
+lu.jl  const _LU_NB = 48
+qr.jl  const _QR_UNBLK_MAX = 32
+qr.jl  const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
+simd_kernels.jl  const _UNROLL = 4
+svd.jl  const _BRD_NB = 16
+svd.jl  const _BT_NB = 32
+svd.jl  const _SVD_DC_CROSS = 96
+svd_dc.jl  const _DC_THRESHOLD = 64
