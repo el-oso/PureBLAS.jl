@@ -3,6 +3,10 @@ Manifest.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
+# Machine-local Preferences: the trim build writes ger_panel_np here transiently (juliac/build.jl);
+# never ship it — the package's clean default is the runtime auto-calibration.
+LocalPreferences.toml
+**/LocalPreferences.toml
 
 # Compiled artifacts (juliac --trim output)
 *.so
