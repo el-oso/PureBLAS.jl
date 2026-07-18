@@ -1,0 +1,337 @@
+=== GATE MISSES (median PB/baseline < 1.0); 'ob'/'ao' = which baseline PB loses to ===
+
+## trsmR  (7 miss-cells)
+L3   trsmR    n=32     Zen3·A2:/ao0.97
+L3   trsmR    n=128    Zen3·A2:/ao0.84
+L3   trsmR    n=256    Zen4·512:/ao0.99  Zen3·A2:/ao0.93
+L3   trsmR    n=512    Zen3·A2:ob0.93  Zen5·512:/ao0.93
+L3   trsmR    n=1024   Zen3·A2:ob0.97  Zen5·512:/ao0.96
+L3   trsmR    n=2048   Zen4·512:/ao0.96  Zen3·A2:/ao0.93  Zen5·512:/ao0.98
+L3   trsmR    n=4096   Zen4·512:/ao0.96  Zen3·A2:/ao0.96  Zen5·512:/ao0.99
+
+## zhemm  (6 miss-cells)
+CL3  zhemm    n=32     Zen3·A2:ob0.95
+CL3  zhemm    n=128    Zen4·512:/ao0.98  Zen5·512:/ao0.98
+CL3  zhemm    n=256    Zen4·512:/ao1.00
+CL3  zhemm    n=512    Zen4·512:/ao1.00  Zen5·512:/ao0.99
+CL3  zhemm    n=1024   Zen4·512:/ao0.99
+CL3  zhemm    n=2048   Zen4·512:/ao0.99
+
+## ztrmm  (6 miss-cells)
+CL3  ztrmm    n=32     Zen3·A2:ob0.83  Zen5·512:ob0.96
+CL3  ztrmm    n=128    Zen4·512:/ao0.96  Zen3·A2:ob0.92/ao0.93  Zen5·512:/ao0.97
+CL3  ztrmm    n=256    Zen4·512:/ao0.94  Zen3·A2:/ao0.99  Zen5·512:/ao0.96
+CL3  ztrmm    n=512    Zen4·512:/ao0.96  Zen5·512:/ao0.97
+CL3  ztrmm    n=1024   Zen4·512:/ao0.97  Zen5·512:/ao0.97
+CL3  ztrmm    n=2048   Zen4·512:/ao0.98  Zen5·512:/ao0.99
+
+## trmv  (6 miss-cells)
+L2   trmv     n=128    Zen5·512:/ao0.86
+L2   trmv     n=256    Zen4·512:/ao0.95  Zen5·512:/ao1.00
+L2   trmv     n=512    Zen4·512:/ao0.96  Zen3·A2:/ao0.95  Zen5·512:/ao0.98
+L2   trmv     n=1024   Zen4·512:/ao0.95  Zen3·A2:/ao0.96
+L2   trmv     n=2048   Zen3·A2:/ao0.99
+L2   trmv     n=4096   Zen3·A2:/ao0.91
+
+## zsymm  (6 miss-cells)
+CL3  zsymm    n=32     Zen3·A2:ob0.93
+CL3  zsymm    n=128    Zen4·512:/ao0.97  Zen5·512:/ao0.98
+CL3  zsymm    n=256    Zen4·512:/ao0.95  Zen5·512:/ao0.98
+CL3  zsymm    n=512    Zen4·512:/ao0.95  Zen5·512:/ao0.95
+CL3  zsymm    n=1024   Zen4·512:/ao0.97  Zen5·512:/ao0.98
+CL3  zsymm    n=2048   Zen4·512:/ao0.98
+
+## gemvT  (6 miss-cells)
+L2   gemvT    n=64     Zen5·512:/ao0.98
+L2   gemvT    n=128    Zen5·512:/ao0.86
+L2   gemvT    n=256    Zen4·512:ob0.97/ao0.98  Zen5·512:/ao0.72
+L2   gemvT    n=512    Zen5·512:/ao1.00
+L2   gemvT    n=1024   Zen4·512:/ao0.95  Zen3·A2:/ao0.97
+L2   gemvT    n=2048   Zen4·512:/ao0.96  Zen3·A2:/ao0.95  Zen5·512:/ao0.95
+
+## ztrsm  (6 miss-cells)
+CL3  ztrsm    n=8      Zen4·512:/ao0.91
+CL3  ztrsm    n=32     Zen4·512:/ao0.64  Zen3·A2:/ao0.72  Zen5·512:/ao0.63
+CL3  ztrsm    n=128    Zen4·512:/ao0.66  Zen3·A2:ob0.90/ao0.65  Zen5·512:/ao0.80
+CL3  ztrsm    n=256    Zen3·A2:/ao0.87  Zen5·512:/ao0.86
+CL3  ztrsm    n=512    Zen4·512:/ao0.97  Zen5·512:/ao0.95
+CL3  ztrsm    n=1024   Zen5·512:/ao1.00
+
+## ztrsmR  (6 miss-cells)
+CL3  ztrsmR   n=32     Zen4·512:/ao0.95
+CL3  ztrsmR   n=128    Zen4·512:/ao0.95  Zen3·A2:/ao0.92  Zen5·512:/ao0.99
+CL3  ztrsmR   n=256    Zen5·512:/ao1.00
+CL3  ztrsmR   n=512    Zen4·512:/ao0.98
+CL3  ztrsmR   n=1024   Zen4·512:/ao0.96  Zen5·512:/ao1.00
+CL3  ztrsmR   n=2048   Zen4·512:/ao0.97  Zen5·512:/ao0.97
+
+## ztrmmR  (6 miss-cells)
+CL3  ztrmmR   n=32     Zen3·A2:ob0.78
+CL3  ztrmmR   n=128    Zen3·A2:/ao0.99
+CL3  ztrmmR   n=256    Zen4·512:/ao0.98
+CL3  ztrmmR   n=512    Zen4·512:/ao0.98  Zen5·512:/ao0.99
+CL3  ztrmmR   n=1024   Zen4·512:/ao0.99  Zen5·512:/ao0.98
+CL3  ztrmmR   n=2048   Zen4·512:/ao0.99  Zen5·512:/ao0.99
+
+## syrk  (6 miss-cells)
+L3   syrk     n=128    Zen4·512:/ao0.91  Zen3·A2:/ao0.99  Zen5·512:/ao0.88
+L3   syrk     n=256    Zen3·A2:/ao0.96
+L3   syrk     n=512    Zen3·A2:/ao0.98
+L3   syrk     n=1024   Zen3·A2:/ao0.97
+L3   syrk     n=2048   Zen4·512:ob0.97/ao0.96  Zen3·A2:/ao0.95  Zen5·512:/ao0.98
+L3   syrk     n=4096   Zen4·512:ob0.94/ao0.94  Zen3·A2:/ao0.96  Zen5·512:/ao0.95
+
+## zsyrk  (6 miss-cells)
+CL3  zsyrk    n=32     Zen5·512:/ao1.00
+CL3  zsyrk    n=128    Zen5·512:/ao0.99
+CL3  zsyrk    n=256    Zen4·512:/ao0.96  Zen5·512:/ao0.97
+CL3  zsyrk    n=512    Zen4·512:/ao0.96  Zen5·512:/ao0.97
+CL3  zsyrk    n=1024   Zen4·512:/ao0.98  Zen5·512:/ao1.00
+CL3  zsyrk    n=2048   Zen4·512:/ao0.98
+
+## trmm  (6 miss-cells)
+L3   trmm     n=8      Zen3·A2:ob0.86
+L3   trmm     n=256    Zen3·A2:/ao0.94
+L3   trmm     n=512    Zen4·512:ob1.00/ao0.95  Zen3·A2:/ao0.96  Zen5·512:/ao0.97
+L3   trmm     n=1024   Zen4·512:ob0.97/ao0.95  Zen3·A2:/ao0.96  Zen5·512:/ao0.96
+L3   trmm     n=2048   Zen4·512:ob0.96/ao0.93  Zen3·A2:/ao0.96  Zen5·512:/ao0.95
+L3   trmm     n=4096   Zen4·512:ob0.96/ao0.94  Zen3·A2:/ao0.98  Zen5·512:/ao0.97
+
+## trsv  (5 miss-cells)
+L2   trsv     n=256    Zen4·512:/ao0.88
+L2   trsv     n=512    Zen4·512:ob1.00/ao0.93  Zen3·A2:/ao0.95  Zen5·512:/ao0.93
+L2   trsv     n=1024   Zen4·512:/ao0.93  Zen3·A2:/ao0.96
+L2   trsv     n=2048   Zen4·512:/ao0.91  Zen3·A2:/ao0.98
+L2   trsv     n=4096   Zen4·512:/ao0.94  Zen3·A2:/ao0.94
+
+## syr2k  (5 miss-cells)
+L3   syr2k    n=128    Zen3·A2:ob0.95
+L3   syr2k    n=256    Zen3·A2:ob0.97/ao0.98
+L3   syr2k    n=1024   Zen4·512:ob0.99  Zen3·A2:/ao0.98
+L3   syr2k    n=2048   Zen4·512:ob0.97/ao0.97  Zen3·A2:/ao0.95  Zen5·512:/ao0.97
+L3   syr2k    n=4096   Zen4·512:ob0.96/ao0.96  Zen3·A2:/ao0.97  Zen5·512:/ao0.95
+
+## zsyr2k  (5 miss-cells)
+CL3  zsyr2k   n=128    Zen3·A2:ob0.95
+CL3  zsyr2k   n=256    Zen4·512:/ao0.97  Zen5·512:/ao0.97
+CL3  zsyr2k   n=512    Zen4·512:/ao0.97  Zen5·512:/ao0.97
+CL3  zsyr2k   n=1024   Zen4·512:/ao0.99  Zen5·512:/ao1.00
+CL3  zsyr2k   n=2048   Zen4·512:/ao0.99
+
+## zaxpy  (5 miss-cells)
+CL1  zaxpy    n=3000   Zen5·512:ob0.88/ao1.00
+CL1  zaxpy    n=10000  Zen3·A2:ob1.00  Zen5·512:ob0.87/ao0.98
+CL1  zaxpy    n=100000  Zen4·512:ob0.93/ao0.98  Zen5·512:ob0.99
+CL1  zaxpy    n=300000  Zen4·512:ob0.94/ao0.99  Zen3·A2:ob0.99  Zen5·512:ob0.99/ao0.98
+CL1  zaxpy    n=1000000  Zen4·512:ob1.00  Zen3·A2:ob0.98  Zen5·512:/ao0.98
+
+## axpy  (5 miss-cells)
+L1   axpy     n=10000  Zen5·512:ob0.99
+L1   axpy     n=30000  Zen5·512:ob0.99/ao0.99
+L1   axpy     n=100000  Zen5·512:/ao1.00
+L1   axpy     n=300000  Zen3·A2:ob1.00  Zen5·512:/ao0.97
+L1   axpy     n=1000000  Zen4·512:ob0.98/ao1.00  Zen3·A2:ob0.99  Zen5·512:ob0.97/ao0.99
+
+## dot  (5 miss-cells)
+L1   dot      n=10000  Zen5·512:ob1.00
+L1   dot      n=30000  Zen3·A2:ob1.00  Zen5·512:ob0.97
+L1   dot      n=100000  Zen4·512:ob1.00  Zen3·A2:ob1.00  Zen5·512:ob1.00
+L1   dot      n=300000  Zen4·512:ob1.00  Zen3·A2:ob1.00  Zen5·512:/ao0.98
+L1   dot      n=1000000  Zen4·512:ob1.00/ao1.00  Zen3·A2:ob0.99/ao1.00
+
+## trsm  (5 miss-cells)
+L3   trsm     n=32     Zen4·512:/ao0.93  Zen3·A2:/ao0.96  Zen5·512:/ao0.94
+L3   trsm     n=128    Zen4·512:/ao0.93  Zen3·A2:/ao0.97
+L3   trsm     n=256    Zen4·512:/ao0.95  Zen3·A2:/ao0.99
+L3   trsm     n=512    Zen4·512:/ao0.93  Zen5·512:/ao0.97
+L3   trsm     n=1024   Zen4·512:/ao0.95  Zen5·512:/ao1.00
+
+## asum  (5 miss-cells)
+L1   asum     n=10000  Zen5·512:ob0.98
+L1   asum     n=30000  Zen5·512:ob1.00
+L1   asum     n=100000  Zen4·512:ob1.00  Zen5·512:ob0.99
+L1   asum     n=300000  Zen4·512:ob1.00  Zen5·512:ob0.99
+L1   asum     n=1000000  Zen4·512:ob0.99  Zen5·512:ob1.00
+
+## zgemvT  (5 miss-cells)
+CL2  zgemvT   n=64     Zen5·512:/ao0.98
+CL2  zgemvT   n=128    Zen5·512:/ao0.99
+CL2  zgemvT   n=512    Zen4·512:/ao0.97  Zen3·A2:/ao0.99
+CL2  zgemvT   n=1024   Zen4·512:/ao0.93  Zen3·A2:/ao0.95
+CL2  zgemvT   n=2048   Zen4·512:/ao0.99  Zen3·A2:/ao0.95
+
+## zscal  (5 miss-cells)
+CL1  zscal    n=3000   Zen3·A2:ob0.99
+CL1  zscal    n=10000  Zen3·A2:ob1.00
+CL1  zscal    n=100000  Zen4·512:ob0.99/ao0.96  Zen3·A2:ob0.99
+CL1  zscal    n=300000  Zen4·512:ob0.99/ao0.96  Zen3·A2:ob0.99
+CL1  zscal    n=1000000  Zen4·512:/ao0.98  Zen3·A2:ob0.99  Zen5·512:ob0.99/ao0.98
+
+## iamax  (5 miss-cells)
+L1   iamax    n=1000   Zen4·512:/ao0.84  Zen5·512:/ao0.83
+L1   iamax    n=3000   Zen4·512:/ao0.94  Zen5·512:/ao0.97
+L1   iamax    n=10000  Zen4·512:/ao0.93
+L1   iamax    n=30000  Zen4·512:/ao0.96
+L1   iamax    n=100000  Zen4·512:/ao0.93
+
+## symm  (5 miss-cells)
+L3   symm     n=256    Zen4·512:ob1.00/ao0.97  Zen3·A2:ob0.99/ao0.93
+L3   symm     n=512    Zen4·512:/ao0.97  Zen3·A2:/ao0.97
+L3   symm     n=1024   Zen4·512:/ao0.97  Zen3·A2:/ao0.98  Zen5·512:/ao0.98
+L3   symm     n=2048   Zen4·512:ob0.99/ao0.96  Zen3·A2:/ao0.99  Zen5·512:/ao0.98
+L3   symm     n=4096   Zen4·512:ob0.98/ao0.96  Zen5·512:/ao0.99
+
+## scal  (5 miss-cells)
+L1   scal     n=10000  Zen4·512:ob1.00
+L1   scal     n=30000  Zen4·512:ob0.99
+L1   scal     n=100000  Zen3·A2:ob1.00
+L1   scal     n=300000  Zen4·512:ob1.00  Zen3·A2:ob0.99
+L1   scal     n=1000000  Zen4·512:ob0.97/ao0.91  Zen3·A2:ob1.00  Zen5·512:/ao0.99
+
+## zgeru  (4 miss-cells)
+CL2  zgeru    n=512    Zen3·A2:ob0.98
+CL2  zgeru    n=1024   Zen4·512:/ao0.91  Zen3·A2:ob0.96  Zen5·512:/ao0.97
+CL2  zgeru    n=2048   Zen4·512:/ao0.98  Zen5·512:/ao0.94
+CL2  zgeru    n=4096   Zen4·512:/ao0.98  Zen3·A2:ob0.99  Zen5·512:/ao0.95
+
+## gemvN  (4 miss-cells)
+L2   gemvN    n=256    Zen4·512:ob0.99
+L2   gemvN    n=1024   Zen5·512:/ao0.92
+L2   gemvN    n=2048   Zen5·512:/ao0.94
+L2   gemvN    n=4096   Zen3·A2:/ao0.96
+
+## zgemm  (4 miss-cells)
+CL3  zgemm    n=32     Zen4·512:/ao0.98  Zen3·A2:/ao0.83
+CL3  zgemm    n=128    Zen4·512:/ao0.97  Zen5·512:/ao0.96
+CL3  zgemm    n=512    Zen5·512:/ao1.00
+CL3  zgemm    n=2048   Zen4·512:/ao1.00
+
+## zher2k  (4 miss-cells)
+CL3  zher2k   n=32     Zen3·A2:ob0.99
+CL3  zher2k   n=128    Zen3·A2:ob0.95
+CL3  zher2k   n=1024   Zen4·512:/ao0.99
+CL3  zher2k   n=2048   Zen4·512:/ao0.99
+
+## zgemvN  (3 miss-cells)
+CL2  zgemvN   n=512    Zen4·512:/ao0.95
+CL2  zgemvN   n=1024   Zen4·512:/ao0.88  Zen5·512:/ao0.99
+CL2  zgemvN   n=2048   Zen4·512:/ao0.97
+
+## gemm  (3 miss-cells)
+L3   gemm     n=128    Zen4·512:/ao0.97  Zen3·A2:/ao0.99  Zen5·512:/ao1.00
+L3   gemm     n=256    Zen4·512:/ao0.99  Zen5·512:/ao0.99
+L3   gemm     n=512    Zen5·512:/ao1.00
+
+## zdotc  (3 miss-cells)
+CL1  zdotc    n=1000   Zen3·A2:ob0.95
+CL1  zdotc    n=100000  Zen3·A2:/ao1.00  Zen5·512:ob0.98
+CL1  zdotc    n=300000  Zen5·512:ob0.97/ao0.97
+
+## zdotu  (3 miss-cells)
+CL1  zdotu    n=1000   Zen3·A2:ob0.96
+CL1  zdotu    n=100000  Zen3·A2:/ao0.99  Zen5·512:ob0.98/ao1.00
+CL1  zdotu    n=300000  Zen3·A2:/ao0.99  Zen5·512:ob0.98
+
+## zgemvC  (3 miss-cells)
+CL2  zgemvC   n=512    Zen4·512:/ao0.98
+CL2  zgemvC   n=1024   Zen4·512:/ao0.89  Zen3·A2:/ao0.97
+CL2  zgemvC   n=2048   Zen4·512:/ao0.99  Zen3·A2:/ao0.96
+
+## ger  (3 miss-cells)
+L2   ger      n=1024   Zen4·512:/ao0.97
+L2   ger      n=2048   Zen4·512:/ao0.90  Zen3·A2:ob0.99  Zen5·512:/ao0.98
+L2   ger      n=4096   Zen4·512:ob0.99/ao0.97  Zen3·A2:ob1.00  Zen5·512:/ao0.99
+
+## zgetrf  (2 miss-cells)
+CLP  zgetrf   n=32     Zen4·512:/ao0.97  Zen5·512:/ao0.96
+CLP  zgetrf   n=256    Zen3·A2:ob0.99
+
+## zherk  (2 miss-cells)
+CL3  zherk    n=1024   Zen4·512:/ao0.99
+CL3  zherk    n=2048   Zen4·512:/ao0.99
+
+## zgeqrf  (2 miss-cells)
+CLP  zgeqrf   n=1024   Zen5·512:/ao0.95
+CLP  zgeqrf   n=2048   Zen5·512:/ao0.99
+
+## zhemv  (2 miss-cells)
+CL2  zhemv    n=2048   Zen3·A2:/ao0.96
+CL2  zhemv    n=4096   Zen3·A2:/ao0.94
+
+## symv  (2 miss-cells)
+L2   symv     n=2048   Zen4·512:/ao0.99  Zen3·A2:/ao0.98
+L2   symv     n=4096   Zen4·512:/ao0.96  Zen3·A2:/ao0.97
+
+## ztrsv  (1 miss-cells)
+CL2  ztrsv    n=1024   Zen4·512:ob0.99
+
+## potrf  (1 miss-cells)
+LP   potrf    n=2048   Zen5·512:/ao0.98
+
+## zpotrf  (1 miss-cells)
+CLP  zpotrf   n=2048   Zen4·512:/ao1.00
+
+## getrf  (1 miss-cells)
+LP   getrf    n=32     Zen4·512:/ao0.99  Zen3·A2:/ao0.97  Zen5·512:/ao0.99
+
+## dzasum  (1 miss-cells)
+CL1  dzasum   n=1000   Zen4·512:ob0.96
+
+## geqrf  (1 miss-cells)
+LP   geqrf    n=32     Zen4·512:/ao0.95  Zen5·512:/ao0.99
+
+## zgesvd  (1 miss-cells)
+CLP  zgesvd   n=128    Zen4·512:/ao0.98  Zen5·512:/ao0.97
+
+
+=== SUMMARY (real ops first) ===
+op       miss worst  vsOB# boxes-hit
+zaxpy    5    0.87   10    Zen3,Zen4,Zen5 [CL1]
+zscal    5    0.96   8     Zen3,Zen4,Zen5 [CL1]
+zdotc    3    0.95   3     Zen3,Zen5 [CL1]
+zdotu    3    0.96   3     Zen3,Zen5 [CL1]
+dzasum   1    0.96   1     Zen4 [CL1]
+zgemvT   5    0.93   0     Zen3,Zen4,Zen5 [CL2]
+zgeru    4    0.91   3     Zen3,Zen4,Zen5 [CL2]
+zgemvN   3    0.88   0     Zen4,Zen5 [CL2]
+zgemvC   3    0.89   0     Zen3,Zen4 [CL2]
+zhemv    2    0.94   0     Zen3 [CL2]
+ztrsv    1    0.99   1     Zen4 [CL2]
+ztrsm    6    0.63   1     Zen3,Zen4,Zen5 [CL3]
+ztrmmR   6    0.78   1     Zen3,Zen4,Zen5 [CL3]
+ztrmm    6    0.83   3     Zen3,Zen4,Zen5 [CL3]
+ztrsmR   6    0.92   0     Zen3,Zen4,Zen5 [CL3]
+zsymm    6    0.93   1     Zen3,Zen4,Zen5 [CL3]
+zhemm    6    0.95   1     Zen3,Zen4,Zen5 [CL3]
+zsyrk    6    0.96   0     Zen4,Zen5 [CL3]
+zsyr2k   5    0.95   1     Zen3,Zen4,Zen5 [CL3]
+zgemm    4    0.83   0     Zen3,Zen4,Zen5 [CL3]
+zher2k   4    0.95   2     Zen3,Zen4 [CL3]
+zherk    2    0.99   0     Zen4 [CL3]
+zgeqrf   2    0.95   0     Zen5 [CLP]
+zgetrf   2    0.96   1     Zen3,Zen4,Zen5 [CLP]
+zgesvd   1    0.97   0     Zen4,Zen5 [CLP]
+zpotrf   1    1.00   0     Zen4 [CLP]
+iamax    5    0.83   0     Zen4,Zen5 [L1]
+scal     5    0.91   7     Zen3,Zen4,Zen5 [L1]
+axpy     5    0.97   6     Zen3,Zen4,Zen5 [L1]
+dot      5    0.97   10    Zen3,Zen4,Zen5 [L1]
+asum     5    0.98   8     Zen4,Zen5 [L1]
+gemvT    6    0.72   1     Zen3,Zen4,Zen5 [L2]
+trmv     6    0.86   0     Zen3,Zen4,Zen5 [L2]
+trsv     5    0.88   1     Zen3,Zen4,Zen5 [L2]
+gemvN    4    0.92   1     Zen3,Zen4,Zen5 [L2]
+ger      3    0.90   3     Zen3,Zen4,Zen5 [L2]
+symv     2    0.96   0     Zen3,Zen4 [L2]
+trsmR    7    0.84   2     Zen3,Zen4,Zen5 [L3]
+trmm     6    0.86   5     Zen3,Zen4,Zen5 [L3]
+syrk     6    0.88   2     Zen3,Zen4,Zen5 [L3]
+trsm     5    0.93   0     Zen3,Zen4,Zen5 [L3]
+symm     5    0.93   4     Zen3,Zen4,Zen5 [L3]
+syr2k    5    0.95   5     Zen3,Zen4,Zen5 [L3]
+gemm     3    0.97   0     Zen3,Zen4,Zen5 [L3]
+geqrf    1    0.95   0     Zen4,Zen5 [LP]
+getrf    1    0.97   0     Zen3,Zen4,Zen5 [LP]
+potrf    1    0.98   0     Zen5 [LP]
+
+TOTAL miss-cells across fleet: 189 ; real-only: 92
