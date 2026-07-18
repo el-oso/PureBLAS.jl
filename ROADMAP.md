@@ -32,6 +32,27 @@ Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated
   `test/req8_lint_baseline.txt` (documented invariants + algorithmic tiers) to whittle down.
 - **`hpmv`** per-column only (no packed panel). **Complex-dot ABI** symbols deferred (see "Key finding").
 
+## Release 0.1.0 — checklist (release-ready; tag/register on HOLD per user)
+
+**Done:** Aqua quality gate, CHANGELOG, accurate README/ROADMAP, clean Project.toml ([deps]/[compat]
+only — prefs pinned via the Preferences API in `juliac/build.jl`, not shipped), suite green
+(7943 pass / 1 gated-skip / 7944), `libpureblas.so` builds under `juliac --trim` and is verified through
+the C-ABI (`ctest.c`, incl. dgesvd). CI pinned to Julia 1.12 (trim is 1.12-specific).
+
+**Remaining (user-triggered):**
+- [ ] **Registry decision** — General vs the private "Pure" registry. All deps (incl. el-oso's own
+      StrictMode 0.3.9 / TypeContracts 0.14) resolve from **General**, so General registration is *not*
+      dep-blocked — it's a free policy call. General makes it public + pulls the two dev-tooling runtime
+      deps into every installer; the Pure registry keeps it self-contained alongside PureFFT.
+- [ ] **Tag `0.1.0`** + GitHub release (notes from CHANGELOG).
+- [ ] **Register** — Registrator/JuliaHub PR (General) or the Pure-registry flow.
+
+**CI gap (not release-blocking, but close before tagging):** the authoritative trim-build test
+(`test/juliac_build_test.jl`) is `@test_skip`ped in normal `Pkg.test()` and **CI never sets
+`PUREBLAS_JULIAC_BUILD=1`** → the `.so` build is not exercised in CI (a trim break shipped undetected once;
+see kb `trim-generated-default-args`). Fix: add a dedicated CI job (tag-push + `workflow_dispatch`) running
+`Pkg.test(PureBLAS; test_args=["juliac"])` with the env var set, or keep running it manually before each tag.
+
 ## Tuning methodology — analytical vs empirical (project vocabulary)
 
 Every machine-dependent parameter (block size, cutoff, panel width, stream count, prefetch distance) is
@@ -64,7 +85,7 @@ Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · 
 measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
 analytical formula, an empirical calibration, or a kernel that needs neither.
 
-## M1 — BLAS Level 1 vertical slice (IN PROGRESS)
+## M1 — BLAS Level 1 vertical slice (✅ COMPLETE — history below)
 
 Goal: prove the whole pipeline cheaply on bandwidth-bound BLAS-1 (no GEMM perf risk, no Fortran
 char/string ABI). All four element types via generic `T<:Number` kernels.
@@ -94,7 +115,9 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       scal/copy/asum ≥ parity; axpy/dot at parity. Implementation: reductions use 4 accumulators
       (latency-bound otherwise); elementwise kernels 4-way unrolled; nrm2 = SIMD sum-of-squares with
       scaled-lassq fallback on overflow/underflow.
-- [~] Re-run the gate per-machine on the rest of the fleet (Zen3 AVX2, Zen5 native-AVX512, M5 ARM).
+- [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 galen, Zen4/
+      AVX-512 wintermute, Zen5/native-AVX-512 neuromancer); boost-locked certification in "Fleet-gate
+      certification" below. (Future M5 ARM box not yet acquired.)
   - **Zen3 (galen, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
     suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
     symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
@@ -329,7 +352,7 @@ Consequences / decisions:
 Open risks: complex-dot return ABI (deferred to M2); AVX-512 on Zen4 is double-pumped (tune via
 Preferences knob).
 
-## M2 — flagship `dgemm` (IN PROGRESS)
+## M2 — flagship `dgemm` (✅ COMPLETE — history below; C-ABI char-arg symbols still open, see "Remaining / next")
 
 BLIS 5-loop (mc/nc/kc/mr/nr blocking + packing), register-blocked AVX-512 micro-kernel via SIMD.jl,
 ≥0.96× OpenBLAS.
@@ -399,7 +422,7 @@ Remaining / next:
       complex-gemm-implemented. **Benchmarking now requires boost OFF ([[dev-fleet]]).** Complex GEMM DONE.
 - [ ] **complex-return ABI** for the deferred c/zdotu,c/zdotc symbols (LBT NORMAL vs ARGUMENT retstyle).
 
-## M3 — Level 2 (CORE COMPLETE ✅) + rest of Level 3 (IN PROGRESS)
+## M3 — Level 2 (CORE COMPLETE ✅) + rest of Level 3 (✅ COMPLETE — history below)
 
 **Milestone — core BLAS-2 complete & at the gate (2026-06-29):** gemv, ger, symv, hemv, trmv, trsv,
 plus packed (spmv/hpmv/tpmv/tpsv) and banded (gbmv/sbmv/hbmv/tbmv/tbsv). Full suite 5854/5854; every
@@ -926,8 +949,18 @@ no-multithreading standing rule (that covers CPU threads).
 
 ## Later
 
-ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). LAPACK surface. SparseArrays
-interop; CHOLMOD / sparse Cholesky.
+ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). SparseArrays interop; CHOLMOD /
+sparse Cholesky.
+
+**Unbuilt surface (not yet milestoned):**
+- **Eigensolvers** — `syev`/`heev` (symmetric/Hermitian), `geev` (general), `gees` (Schur). The largest
+  missing LAPACK chunk; no milestone yet.
+- **C-ABI completions** — L3 `dgemm_64_`/`sgemm_64_` char args + hidden Fortran string-length args
+  (the L3 ABI M1 deferred), and the 4 complex-dot symbols (`c/zdotu`, `c/zdotc`; NORMAL vs ARGUMENT
+  retstyle). Native API already covers both meanwhile.
+- **Generic/AD paths** for QR (`geqrf`) and SVD (`gesvd`) — currently Float64-vector-specific; the
+  differentiable generic-`T` path is deferred.
+- **`hpmv` packed panel** and **`hpr`/`hpr2` complex SIMD** — currently per-column / generic.
 
 ### Wishlist
 
