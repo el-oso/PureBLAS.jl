@@ -19,7 +19,7 @@ LinearAlgebra = "1.12.0"
 Preferences = "1.5.2"
 SIMD = "3.7.2"
 StrictMode = "0.3.9"
-TypeContracts = "0.13.1, 0.14"
+TypeContracts = "0.14"
 julia = "1.12"
 
 # Freeze ger's panel stream-count so the :fast load-time dogfood (src/verify.jl) exercises the alloc-free
