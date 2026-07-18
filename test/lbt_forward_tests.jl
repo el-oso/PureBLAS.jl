@@ -13,16 +13,19 @@
     n = 96
     A = randn(n, n); Bm = randn(n, n); x = randn(n); y = randn(n); b = randn(n)
     SPD = A * A' + n * I
+    Az = randn(ComplexF64, n, n); zb = randn(ComplexF64, n); HPD = Az * Az' + n * I
 
     # OpenBLAS oracles, captured BEFORE activate (independent reference).
     ref = (mul = A * Bm, gemv = A * x, gemvt = transpose(A) * x, dot = dot(x, y), nrm2 = norm(x),
            symm = Symmetric(A) * Bm, trsm = UpperTriangular(A) \ Bm,
            chol = Matrix(cholesky(copy(SPD)).U), lusol = lu(copy(A)) \ b, chsol = cholesky(copy(SPD)) \ b,
-           svals = svdvals!(copy(A)))   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
+           svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
+           zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb)
 
     @test length(PureBLAS._LBT_REGISTRARS) > 100
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
     gemm_before = fwd("dgemm_"); geqrf_before = fwd("dgeqrf_")
+    zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -44,6 +47,15 @@
         # gesvd routes (direct LAPACK call; svd()/svdvals default to gesdd, which stays on OpenBLAS).
         S = LA.gesvd!('N', 'N', copy(A))[2]
         @test maximum(abs, S .- ref.svals) < 1e-9
+
+        # Complex LAPACK — potrf/getrf route (self-consistent: standard-convention factors).
+        @test fwd("zpotrf_") != zpotrf_before
+        @test fwd("zgetrf_") != zgetrf_before
+        Cz = cholesky(Hermitian(copy(HPD)))
+        @test maximum(abs, Matrix(Cz.U) .- ref.zchol) < 1e-8               # zpotrf
+        Fz = lu(copy(Az))
+        @test maximum(abs, (Fz.L * Fz.U) .- Az[Fz.p, :]) < 1e-9            # zgetrf (valid factorization)
+        @test maximum(abs, (lu(copy(Az)) \ zb) .- ref.zlusol) < 1e-8       # zgetrf(PB) + zgetrs(OpenBLAS)
 
         # HAZARD GUARD: geqrf must NOT be forwarded (faer-τ would break OpenBLAS orgqr → NaN Q). With it
         # unforwarded, geqrf!+orgqr! are both OpenBLAS and produce a valid orthonormal Q.

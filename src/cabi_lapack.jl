@@ -14,12 +14,13 @@
 # potrf! has a generic T<:Real path (Float32-capable), but getrf!/geqrf!/gesvd! are Float64-only kernels,
 # so sgetrf/sgeqrf/sgesvd are intentionally NOT provided (no Float32 factorization path to forward to).
 
-# ── potrf: Cholesky ─────────────────────────────────────────────────────────────────────────────────
-# `{d,s}potrf_64_(uplo, n, A, lda, info, len_uplo)` — 1 char. potrf! throws PosDefException on a non-SPD
-# input; CATCH it at the boundary and report the failing minor via info>0 (LAPACK convention) rather than
-# letting a Julia exception unwind through the C-ABI. (Note: the Float64 lower faer fast path reports its
-# non-SPD as PosDefException(1) — info=1, not the exact minor; correctness-wise info>0 is all LAPACK asks.)
-for (p, T) in (("s", Float32), ("d", Float64))
+# ── potrf: Cholesky (real SPD; complex Hermitian PD) ─────────────────────────────────────────────────
+# `{s,d,c,z}potrf_64_(uplo, n, A, lda, info, len_uplo)` — 1 char. potrf! throws PosDefException on a
+# non-(S/H)PD input; CATCH it at the boundary and report the failing minor via info>0 (LAPACK convention)
+# rather than letting a Julia exception unwind through the C-ABI. (Note: the Float64 lower faer fast path
+# reports its non-SPD as PosDefException(1) — info=1, not the exact minor; correctness-wise info>0 is all
+# LAPACK asks.) potrf! is generic over the element type, so the complex (Hermitian) path is the same code.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "potrf_64_"))(
             uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
             info::Ptr{Int64}, len_uplo::Clong)::Cvoid
@@ -37,17 +38,21 @@ for (p, T) in (("s", Float32), ("d", Float64))
     end
 end
 
-# ── getrf: LU with partial pivoting ─────────────────────────────────────────────────────────────────
-# `dgetrf_64_(m, n, A, lda, ipiv, info)` — 0 chars, no hidden lengths. ipiv is `Ptr{Int64}` OUTPUT
+# ── getrf: LU with partial pivoting (real + complex) ─────────────────────────────────────────────────
+# `{d,c,z}getrf_64_(m, n, A, lda, ipiv, info)` — 0 chars, no hidden lengths. ipiv is `Ptr{Int64}` OUTPUT
 # (length min(m,n)); bridge as a Vector{Int64} (== Vector{Int} on 64-bit) — LAPACK 1-based pivot rows.
-Base.@ccallable function dgetrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
-        ipiv::Ptr{Int64}, info::Ptr{Int64})::Cvoid
-    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-    Av = PtrMatrix(A, M, N, ld)
-    ip = PtrVector(ipiv, min(M, N))
-    _, _, inf = getrf!(Av, ip)
-    unsafe_store!(info, Int64(inf))
-    return
+# getrf!(A, ipiv) has both a Float64 and a `T<:BlasComplex` method, so the complex path is the same wrapper.
+# (No `s` — the Float32 getrf! kernel isn't implemented yet; sgetrf stays on the fallback backend.)
+for (p, T) in (("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "getrf_64_"))(m::Ptr{Int64}, n::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, ipiv::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Av = PtrMatrix(A, M, N, ld)
+        ip = PtrVector(ipiv, min(M, N))
+        _, _, inf = getrf!(Av, ip)
+        unsafe_store!(info, Int64(inf))
+        return
+    end
 end
 
 # ── geqrf: QR (Householder, no pivoting) ────────────────────────────────────────────────────────────
