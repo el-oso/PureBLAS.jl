@@ -122,13 +122,20 @@ for op in ("trmm", "trsm"), (p, T) in (("s", Float32), ("d", Float64), ("c", Com
 end
 
 # ─────────────────────────────── LAPACK (cabi_lapack.jl) ─────────────────────────────────────────
+# ONLY forward LAPACK symbols that are SELF-CONSISTENT under a mixed backend — i.e. correct even when
+# their solve/inverse companions stay on OpenBLAS. potrf/getrf qualify: they produce standard-convention
+# factors (Cholesky factor; LU L/U + LAPACK-1-based ipiv — verified identical to OpenBLAS), so OpenBLAS's
+# potrs/getrs/getri/potri operate on them correctly. gesvd is self-contained (returns U/S/Vᵀ, no companion).
+#
+# geqrf is DELIBERATELY NOT forwarded: PureBLAS returns the faer reflector convention (τ = 1/τ_LAPACK,
+# with differently-scaled v), so a forwarded geqrf feeding OpenBLAS's orgqr/ormqr produces a BROKEN Q
+# (‖QᵀQ−I‖ = NaN). Julia's high-level `qr()` uses geqrt (not geqrf) anyway, so this costs no routing. To
+# forward QR properly we'd need τ-compatible geqrf/geqrt wrappers + orgqr/ormqr — a follow-up.
 for (p, T) in (("s", Float32), ("d", Float64))
     @eval _reg!($(p * "potrf_"), () -> @cfunction($(Symbol(p, "potrf_64_")), Cvoid,
         (_CU, _CI, Ptr{$T}, _CI, _CI, Clong)))
 end
 _reg!("dgetrf_", () -> @cfunction(dgetrf_64_, Cvoid, (_CI, _CI, Ptr{Float64}, _CI, _CI, _CI)))
-_reg!("dgeqrf_", () -> @cfunction(dgeqrf_64_, Cvoid,
-    (_CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI)))
 _reg!("dgesvd_", () -> @cfunction(dgesvd_64_, Cvoid,
     (_CU, _CU, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Ptr{Float64}, _CI, _CI, Clong, Clong)))
