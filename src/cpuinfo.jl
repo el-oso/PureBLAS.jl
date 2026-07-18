@@ -183,11 +183,19 @@ const _GEMM_SPLIT_S = 2
 #   machine-INDEPENDENT op-shape calibration (like `_l1_block`'s ½, `_at_gemm_mc`'s 3/10): gemm pays 2 passes
 #   (read+write) to pack → ×2; rank-k's re-stream alternative is recursion (2×-flop diagonal + split overhead)
 #   so it packs slightly earlier → ×7/4. Reproduces galen (nvreg16,W4): gemm 96 (measured tie-band 80–112),
-#   rank-k 84 (routes n=80→recursion, 96→packed). Predicts Zen4/Zen5 (nvreg32,W8): gemm 448 (EXACT match to the
-#   validated literal), rank-k 392 (was a 448 placeholder — A/B on wintermute/neuromancer before trusting). req#8.
+#   rank-k 84 (routes n=80→recursion, 96→packed). req#8.
+# PATH-DEPENDENT crossover (the ×7/4·acc_cap form was calibrated for the AVX2 MULTI-pack `_trgemm_packed!`,
+# whose double-A-pack keeps the recursion competitive to ~84). AVX-512 uses the UNIFIED single-pack
+# `_trgemm_packed_u!` (half the pack traffic, 8 well-fed accumulators, mirror `_unified_ok`: W≥8 && W==NR),
+# whose real crossover is ≈W — the recursion's 2×-flop diagonal waste + per-call overhead loses from ≈W up.
+# The 392 the old formula gave on AVX-512 (mis)routed all n≤256 to the recursion → the syrk n=128 gate miss
+# (Zen5 0.88 / Zen4 0.91); packed is +14% there (→~1.04). Fleet-validated: AVX-512 → W, galen AVX2 → 84.
 @inline _acc_cap(hw, ::Type{T} = Float64) where {T} = (hw.nvreg - 4) * _lanes(hw, T)
 @inline _at_gemm_unpack_max(hw, ::Type{T} = Float64) where {T} = 2 * _acc_cap(hw, T)
-@inline _at_rank_k_pack_cut(hw, ::Type{T} = Float64) where {T} = (7 * _acc_cap(hw, T)) >> 2
+@inline function _at_rank_k_pack_cut(hw, ::Type{T} = Float64) where {T}
+    W = _lanes(hw, T)
+    (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : (7 * _acc_cap(hw, T)) >> 2   # unified single-pack vs AVX2 multi-pack
+end
 # symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
 # copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
 # packed symmetric kernel at EVERY measured galen n (the packed path is dead weight on AVX2), and the only

@@ -45,9 +45,9 @@
     @test P._at_gemm_unpack_max(galen) == 96          # 2·(16−4)·4 ; measured unpk/blk tie-band 80–112
     @test P._at_gemm_unpack_max(wintermute) == 448    # 2·(32−4)·8 ; EXACT match to the validated Zen4 literal
     @test P._at_gemm_unpack_max(neuromancer) == 448
-    @test P._at_rank_k_pack_cut(galen) == 84          # (7·48)/4 ; routes n=80→recursion, 96→packed (syrk/syr2k)
-    @test P._at_rank_k_pack_cut(wintermute) == 392    # predicted (was a 448 placeholder) — validate on AVX-512
-    @test P._at_rank_k_pack_cut(neuromancer) == 392
+    @test P._at_rank_k_pack_cut(galen) == 84          # AVX2 MULTI-pack path: (7·48)/4 ; n=80→recursion, 96→packed
+    @test P._at_rank_k_pack_cut(wintermute) == 8      # AVX-512 UNIFIED single-pack: crossover ≈ W (the 392 the old
+    @test P._at_rank_k_pack_cut(neuromancer) == 8     # formula gave mis-routed n≤256 → recursion → syrk n=128 miss)
     @test P._at_symm_mat_max(galen) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
     @test P._at_symm_mat_max(wintermute) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
     @test P._at_symm_mat_max(neuromancer) == 362
