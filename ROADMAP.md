@@ -332,22 +332,27 @@ Done & verified (426/426 tests passing as of 2026-06-28):
   `bench/`: bench_gemm/bench_level1/l3bench (manual L1/L3 gate sweeps). Correctness is guarded by the
   7130-item suite + StrictMode. `benchmark/base.json` is a machine-specific local baseline (wintermute).
 
-### ⚠️ Key finding — LBT live-forward is blocked (juliac limitation, not a PureBLAS bug)
+### ✅ In-process LBT forwarding — SOLVED (2026-07-18): `PureBLAS.activate()` reroutes the whole ecosystem
 
-`BLAS.lbt_forward(libpureblas.so)` from inside a running Julia process **aborts**: LBT's interface
-autodetection calls a probe symbol (`isamax_64_`), whose juliac wrapper runs
-`ijl_autoinit_and_adopt_thread` and **double-initializes the shared libjulia** → `signal 6`.
-A juliac-trimmed library embeds the Julia runtime and is meant to be loaded by a *non-Julia* host
-(which it self-inits — see ctest.c), so it cannot currently be forwarded into a live Julia session.
+`PureBLAS.activate()` reroutes **all** of LinearAlgebra's BLAS/LAPACK to PureBLAS inside a LIVE Julia
+process — same call sites (`A*B`, `mul!`, `cholesky`, `qr`, `svd`, `LinearAlgebra.BLAS.*`), MKL.jl-style.
+It registers in-process `@cfunction` pointers to the native `@ccallable` kernels via `lbt_set_forward`
+(see `src/cabi_forward.jl`, 123 symbols: BLAS 1–3 + potrf/getrf/geqrf/gesvd). `deactivate()` restores
+OpenBLAS. Verified end-to-end (`test/lbt_forward_tests.jl`): gemm/gemv/dot/nrm2/symm/cholesky/lu/qr/svd
+route to PureBLAS with correct results, no abort.
 
-Consequences / decisions:
-- **In-Julia replacement = Mode 2 (native API / pkgimage)**, which is also the AD-enabling path —
-  this is the primary way to use PureBLAS inside Julia. Trim-compatibility (the other reason for the
-  .so) is independently proven by the successful build + symbol export + C-host run.
-- The .so is the artifact for **non-Julia consumers** (C/C++/Rust calling BLAS).
-- To make LBT forwarding work later: needs a juliac mode that initializes against the host runtime
-  instead of embedding/auto-initing its own (upstream Julia work), OR a runtime-free codegen path.
-  Track upstream; revisit in M5 (multi-ISA dispatch) / when juliac matures.
+**Earlier misdiagnosis (retracted):** we thought "LBT live-forward is blocked." That is true ONLY for
+`BLAS.lbt_forward(libpureblas.so)` — dlopening the *juliac .so* double-inits the embedded libjulia
+(the probe symbol runs `ijl_autoinit_and_adopt_thread`) → `signal 6`. The fix was never the `.so` in
+process: `lbt_set_forward` registers raw `@cfunction` pointers to our native kernels, which run against
+THIS process's runtime → no second init. The `.so` remains the artifact for **non-Julia hosts**
+(C/C++/Rust); the in-Julia reroute needs no `.so` at all.
+
+- **Two in-Julia paths now:** (a) native `PureBLAS.*` API — AD-traceable (ForwardDiff/Enzyme), the
+  differentiable path; (b) `PureBLAS.activate()` — transparent whole-ecosystem reroute (not AD-traceable,
+  as no compiled BLAS is, but it makes every existing `A*B`/`cholesky`/… call use PureBLAS with no code
+  change). Not auto-forwarded at load (the suite needs OpenBLAS as its correctness oracle).
+- The `.so` is still the artifact for **non-Julia consumers** (C/C++/Rust calling BLAS).
 
 Open risks: complex-dot return ABI (deferred to M2); AVX-512 on Zen4 is double-pumped (tune via
 Preferences knob).

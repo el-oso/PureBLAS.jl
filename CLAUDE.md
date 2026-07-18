@@ -15,13 +15,17 @@ Pure-Julia BLAS plugged into Julia **two ways**, both first-class:
 1. **Native API (Mode 2)** — `PureBLAS.axpy!(y,a,x)`, `PureBLAS.dot(x,y)`, … Direct Julia calls,
    no `ccall` boundary, so they are **AD-traceable** (ForwardDiff/Enzyme/ChainRules). This is the
    higher-value mode — opaque OpenBLAS `ccall`s never allowed differentiation through BLAS.
-2. **LBT drop-in (Mode 1)** — `@ccallable` Fortran-ABI symbols → `juliac --trim` → `libpureblas.so`.
-   The .so works from **non-Julia hosts** (C/C++/Rust; it self-inits its embedded runtime — see
-   `juliac/ctest.c`) and proves trim-compatibility. **KNOWN LIMITATION (don't re-chase):**
-   `BLAS.lbt_forward` of this .so from inside a *live Julia* process aborts (signal 6) — juliac libs
-   embed the Julia runtime and double-init the shared libjulia on the autodetect probe. So the
-   in-Julia path is Mode 2; revisit LBT forwarding only when juliac gains host-runtime init. See
-   `ROADMAP.md` "Key finding".
+2. **LBT drop-in (Mode 1)** — reroute LinearAlgebra's BLAS/LAPACK to PureBLAS with ONE call,
+   MKL.jl-style. **`PureBLAS.activate()`** registers in-process `@cfunction` pointers to the native
+   `@ccallable` kernels via `lbt_set_forward` (`cabi_forward.jl`, 123 symbols); after it, `A*B`,
+   `mul!`, `cholesky`, `qr`, `svd`, `LinearAlgebra.BLAS.*` all dispatch to PureBLAS. `deactivate()`
+   restores OpenBLAS. This runs in the LIVE process against its own runtime — no `.so`, no double-init.
+   The SAME `@ccallable` symbols also `juliac --trim` → `libpureblas.so` for **non-Julia hosts**
+   (C/C++/Rust; self-inits its embedded runtime — see `juliac/ctest.c`) and prove trim-compatibility.
+   **DON'T re-chase:** `BLAS.lbt_forward(libpureblas.so)` from *inside* live Julia still aborts (signal
+   6 — the juliac lib double-inits the embedded libjulia); that path is only for non-Julia hosts. In
+   Julia, use `activate()` (@cfunction registration), NOT `.so` forwarding. See `ROADMAP.md` "In-process
+   LBT forwarding".
 
 Both modes share ONE set of low-level kernels. Source map:
 `core.jl` (accessors `_ld`/`_st!` over Ptr AND AbstractVector, lassq, |·|) · `cpuinfo.jl`
@@ -29,7 +33,8 @@ Both modes share ONE set of low-level kernels. Source map:
 (low-level `(n,…,inc)` kernels) · `level2.jl` (gemv/ger/symv/hemv/trmv/trsv) · `level2_packed.jl`
 (spmv/hpmv/tpmv/tpsv) · `level2_banded.jl` (gbmv/sbmv/hbmv/tbmv/tbsv) · `gemm.jl` (L3) ·
 `contracts.jl` (TypeContracts `AbstractBLAS1`/`AbstractBLAS2`) · `backend.jl`
-(`SIMDBackend`, Mode 2) · `native.jl` (bare API) · `cabi.jl` (`@ccallable` ABI) · `lbt.jl`
+(`SIMDBackend`, Mode 2) · `native.jl` (bare API) · `cabi.jl`/`cabi_l2.jl`/`cabi_l3.jl`/`cabi_lapack.jl`
+(`@ccallable` ABI) · `cabi_forward.jl` (in-process LBT `@cfunction` forward registry) · `lbt.jl`
 (`activate`/`deactivate`).
 
 ## Hard requirements (MUST follow)
