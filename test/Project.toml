@@ -1,5 +1,6 @@
 [deps]
 AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"

@@ -2,35 +2,35 @@
 
 Canonical status + next steps for this multi-session project. Update this file as milestones land.
 
-## CURRENT FOCUS (2026-07-11) — BLAS-2 banked → potrf campaign
+## STATUS (2026-07-18) — feature-complete, release-prep
 
-**BLAS-2 is BANKED.** Fleet republished at commit `de5c107` (all 3 boxes locked, complex sweeps capped
-at 2048, ger calibration frozen per box). Closing results:
-- **spmv**: mid-n dip removed — re-keyed the packed panel on **AP residency** not x+y (`_SPMV_PANEL_MINAP`);
-  flat ~1.9–2.2 fleet-wide (was declining to ~1.0 @1024). GB/s decomp: per-column was 40% of L3 roofline.
-- **gemvN**: Zen3/Zen4 gate; the m-inner panel is gated OFF on native-512 (Zen5) — it regressed there
-  (0.85); Zen5 recovered to ~0.90 (the pre-existing native-512 residual).
-- **ger**: gates fleet-wide with the frozen calibrated NP (the OncePerProcess auto-cal is UNRELIABLE —
-  misfired on Zen5; freeze `ger_panel_np` per box: Zen5→1, Zen3→4, Zen4→8).
-- **trmv/trsv**: near-roofline (85–95%); the decline/dip is OB catching up, NOT a lever. gate except Zen5@4096.
+**Functionally complete: BLAS Levels 1–3 (real + complex, s/d/c/z) + core LAPACK (potrf/getrf/geqrf/gesvd,
+real + complex).** Two integration modes (native AD-traceable API; `libpureblas.so` via `juliac --trim` for
+non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 
-**NEW CAMPAIGN — VASTLY improve potrf (Cholesky), AVX2-first**, via **potf2, trsm, syrk, syr2k** (all must
-gate). Design agreed with Fable — see `kb/findings/pureblas-potrf-campaign.md`. KEY LEVER: Strassen (PB's
-only >1.2× engine) routes only `!tA && !tB`, but every triangular op feeds transB → teach `_gemm_strassen!`
-to accept transB, then D&C-route syrk/syr2k/trsm-R. Plus: promote the fused trsm-R panel to a general
-driver; NB(n) policy vs fixed 128. **USER PRIORITY: mid-n AVX2 256–1024 must NOT be neglected** — Fable
-projects ~1.05–1.10 ("no flop trick") but it's UNMEASURED; FIRST step = the GB/s/GFlops-vs-roofline probe
-(`kb/findings/pureblas-roofline-decomposition-method.md`) on mid-n syrk/trsm-R before accepting that.
+**The performance gate is now `PB ≥ max(OpenBLAS, AOCL-BLIS)`** (upgraded 2026-07-15 from ≥ OpenBLAS) — a
+sub-1.0 ratio vs *either* AMD-tuned baseline is a miss, never a "ceiling." Certified boost-locked on the AMD
+fleet (Zen3/AVX2 `galen`, Zen4/AVX-512 `wintermute`, Zen5/native-AVX-512 `neuromancer`) via
+`bench/fleet_freqlock.sh lock`; audit in `bench/gate_audit_2026-07-18.txt`, plots published to the docs.
 
-### Open items (per-µarch gate residuals + debt)
-- **gemvN Zen5 mid-n** (~0.90 @2048, native-512): deeper gap, no config fix — needs a native-512 lever.
-- **trmv/trsv Zen5@4096** (0.96): DRAM regime, PB < OB on Zen5; + galen L2→L3 edge (NB=64 not optimal @512).
-- **Zen4 gemm blocked kernel** @512 = 1.01 vs Zen5 1.14: possible headroom OR OB-weak-on-znver5 — cheap
-  GFlops-vs-FMA-peak check before any grind (likely a mirage).
-- **hpmv** is per-column only (no panel) — port the spmv AP-residency packed panel to complex.
-- **Add a real `trsmR` gate op to plots.jl** — trsm side-R is never benched (the 0.87–0.93 was never gated).
-- **req#8 literal debt**: `_TRI_NB=64`, `_TRI_T_UNB=1024`, `_CHOL_BLOCK=128`, `_POTRF_BASE=512`,
-  `_STRASSEN_MIN=1024`, `_GEMM_UNPACK_MAX=448/128` — bare literals, re-key on cache/register formulas.
+Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated):
+- **potrf** near-BLASFEO parity + **F32 fully gated** by generalizing the faer Cholesky stack to
+  `T<:BlasReal`; F64/complex upper via transpose-to-gating-lower.
+- **getrf** (1.40× geomean, rank-2 `getf2` + register-tiled trsm) and **geqrf** (blocked-QR trailing-update
+  overhead fix) campaigns; **complex LAPACK** (zpotrf/zgetrf/zgeqrf/zgesvd) correct + committed.
+- **gate-gap campaign vs AOCL**: `trmm` Strassen-split (large-n) and `syrk`/`syr2k` AVX-512 pack-cut fix
+  (small-n) shipped; `gemvT` NC-widen and the `gemmtrsm` macrokernel measured-and-**falsified** (documented).
+- **Tooling**: `req#8` lint (CI gate vs hardcoded tuning literals), Aqua, StrictMode 0.3.9
+  (`@assert_no_spill`/`@assert_memsafe` dogfood), `f32_aocl`/gate-miss bench harnesses.
+
+### Open residuals (characterized; not release-blocking)
+- **Large-n `trmm`/`syrk`/`trsm` vs AOCL** ~0.93–0.98 at n≥2048 — the LLVM-vs-hand-asm classical-microkernel
+  floor (recursion/Strassen/wide-NR/KC levers falsified for syrk; trmm Lever-2 direct-B for n256–1024 is the
+  one un-built portable lever). Closing it fully would need x86 inline-asm (crosses the portability line).
+- **`ger`/`gemvN`/`gemvT` per-µarch** small residuals (some memory-bandwidth-bound; NC-widen falsified for
+  gemvT Zen5). `req#8` literal debt: mostly derived/classified; the remaining 72 are baselined in
+  `test/req8_lint_baseline.txt` (documented invariants + algorithmic tiers) to whittle down.
+- **`hpmv`** per-column only (no packed panel). **Complex-dot ABI** symbols deferred (see "Key finding").
 
 ## Tuning methodology — analytical vs empirical (project vocabulary)
 
