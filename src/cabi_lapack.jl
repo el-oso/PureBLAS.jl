@@ -474,3 +474,128 @@ Base.@ccallable function zgemqrt_64_(side::Ptr{UInt8}, trans::Ptr{UInt8}, m::Ptr
     end
     unsafe_store!(info, Int64(0)); return
 end
+
+# ── Float32 LAPACK via MIXED PRECISION (promote→Float64 kernel→demote) ────────────────────────────────
+# PureBLAS has no native Float32 getrf/geqrf/gesvd kernels (only potrf). To route sgetrf/sgeqrt/sgemqrt/
+# sgesdd/sgesvd to PureBLAS anyway, we compute in Float64 and round back to Float32 — correct to F32
+# precision (actually a touch more accurate), reusing the tuned F64 kernels. Native F32 SIMD kernels (~2×)
+# are a perf follow-up. `spotrf`/`strtrs`/`spotrs`/`sgetrs`/`s{tri}` already route via the generic F32 paths.
+@inline function _f32_to_f64!(dst::Matrix{Float64}, src::PtrMatrix{Float32}, M::Int, N::Int)
+    @inbounds for j in 1:N, i in 1:M; dst[i, j] = Float64(src[i, j]); end
+end
+@inline function _f64_to_f32!(dst::PtrMatrix{Float32}, src::Matrix{Float64}, M::Int, N::Int)
+    @inbounds for j in 1:N, i in 1:M; dst[i, j] = Float32(src[i, j]); end
+end
+
+Base.@ccallable function sgetrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float32}, lda::Ptr{Int64},
+        ipiv::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); Am = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
+    Af = Matrix{Float64}(undef, M, N); _f32_to_f64!(Af, Am, M, N)
+    ip = PtrVector(ipiv, min(M, N))
+    GC.@preserve Af begin
+        _, _, inf = getrf!(PtrMatrix(pointer(Af), M, N, M), ip)
+        _f64_to_f32!(Am, Af, M, N); unsafe_store!(info, Int64(inf))
+    end
+    return
+end
+
+Base.@ccallable function sgeqrt_64_(m::Ptr{Int64}, n::Ptr{Int64}, nb::Ptr{Int64}, A::Ptr{Float32},
+        lda::Ptr{Int64}, T::Ptr{Float32}, ldt::Ptr{Int64}, work::Ptr{Float32}, info::Ptr{Int64})::Cvoid
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); NB = Int(unsafe_load(nb)); k = min(M, N)
+    Am = PtrMatrix(A, M, N, Int(unsafe_load(lda))); Tm = PtrMatrix(T, NB, k, Int(unsafe_load(ldt)))
+    Af = Matrix{Float64}(undef, M, N); _f32_to_f64!(Af, Am, M, N)
+    Tf = Matrix{Float64}(undef, NB, k)
+    GC.@preserve Af Tf begin
+        Avf = PtrMatrix(pointer(Af), M, N, M); τ = Vector{Float64}(undef, k)
+        GC.@preserve τ begin
+            geqrf!(Avf, PtrVector(pointer(τ), k))
+            @inbounds for i in 1:k; t = τ[i]; τ[i] = (isfinite(t) && t != 0.0) ? 1.0 / t : 0.0; end
+            ws = WYApplyWorkspace{Float64}(M, NB, N)
+            Tvf = PtrMatrix(pointer(Tf), NB, k, NB)
+            for i in 1:NB:k
+                ib = min(NB, k - i + 1); mp = M - i + 1
+                Vp = view(ws.V, 1:mp, 1:ib); _qr_vpanel!(Vp, Avf, i, ib, mp)
+                wy_t!(view(Tvf, 1:ib, i:(i + ib - 1)), Vp, view(τ, i:(i + ib - 1)), view(ws.G, 1:ib, 1:ib))
+            end
+        end
+        _f64_to_f32!(Am, Af, M, N); _f64_to_f32!(Tm, Tf, NB, k)
+    end
+    unsafe_store!(info, Int64(0)); return
+end
+
+Base.@ccallable function sgemqrt_64_(side::Ptr{UInt8}, trans::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        k::Ptr{Int64}, nb::Ptr{Int64}, V::Ptr{Float32}, ldv::Ptr{Int64}, T::Ptr{Float32}, ldt::Ptr{Int64},
+        C::Ptr{Float32}, ldc::Ptr{Int64}, work::Ptr{Float32}, info::Ptr{Int64},
+        len_s::Clong, len_t::Clong)::Cvoid
+    sd = _cabi_char(side); tr = _cabi_char(trans)
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); K = Int(unsafe_load(k)); NB = Int(unsafe_load(nb))
+    vrows = sd == 'L' ? M : N
+    Vm = PtrMatrix(V, vrows, K, Int(unsafe_load(ldv))); Tm = PtrMatrix(T, NB, K, Int(unsafe_load(ldt)))
+    Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
+    Vf = Matrix{Float64}(undef, vrows, K); _f32_to_f64!(Vf, Vm, vrows, K)
+    Tf = Matrix{Float64}(undef, NB, K); _f32_to_f64!(Tf, Tm, NB, K)
+    Cf = Matrix{Float64}(undef, M, N); _f32_to_f64!(Cf, Cm, M, N)
+    GC.@preserve Vf Tf Cf begin
+        Vmf = PtrMatrix(pointer(Vf), vrows, K, vrows); Tmf = PtrMatrix(pointer(Tf), NB, K, NB)
+        Cmf = PtrMatrix(pointer(Cf), M, N, M)
+        forward = (sd == 'L' && tr != 'N') || (sd == 'R' && tr == 'N')
+        starts = collect(1:NB:K); forward || reverse!(starts)
+        ws = WYApplyWorkspace{Float64}(vrows, NB, max(M, N))
+        for i in starts
+            ib = min(NB, K - i + 1); mp = vrows - i + 1
+            Vp = view(ws.V, 1:mp, 1:ib); _qr_vpanel!(Vp, Vmf, i, ib, mp)
+            Tblk = view(Tmf, 1:ib, i:(i + ib - 1))
+            sd == 'L' ? wy_apply!(tr, view(Cmf, i:M, 1:N), Vp, Tblk, ws) :
+                        _qr_apply_right!(tr, view(Cmf, 1:M, i:N), Vp, Tblk)
+        end
+        _f64_to_f32!(Cm, Cf, M, N)
+    end
+    unsafe_store!(info, Int64(0)); return
+end
+
+# F32 SVD via mixed precision: promote A→F64, run the F64 gesvd! driver into F64 scratch, demote outputs.
+@inline function _svd_cabi_f32!(ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{Float32}, ld::Int,
+        S::Ptr{Float32}, U::Ptr{Float32}, ldu::Int, VT::Ptr{Float32}, ldvt::Int, info::Ptr{Int64})
+    mn = min(M, N)
+    Af = Matrix{Float64}(undef, M, N); _f32_to_f64!(Af, PtrMatrix(A, M, N, ld), M, N)
+    Sf = Vector{Float64}(undef, mn)
+    needU = ju != 'N'; needV = jvt != 'N'
+    ncu = ju == 'A' ? M : mn; ncv = jvt == 'A' ? N : mn
+    Uf = Matrix{Float64}(undef, M, needU ? ncu : 1)
+    Vf = Matrix{Float64}(undef, needV ? ncv : 1, N)
+    GC.@preserve Af Sf Uf Vf begin
+        _svd_cabi!(ju, jvt, M, N, pointer(Af), M, pointer(Sf), pointer(Uf), M,
+            pointer(Vf), needV ? ncv : 1, info)
+        unsafe_load(info) == 0 || return
+        Sm = PtrVector(S, mn); @inbounds for i in 1:mn; Sm[i] = Float32(Sf[i]); end
+        needU && _f64_to_f32!(PtrMatrix(U, M, ncu, ldu), Uf, M, ncu)
+        needV && _f64_to_f32!(PtrMatrix(VT, ncv, N, ldvt), Vf, ncv, N)
+    end
+    return
+end
+
+Base.@ccallable function sgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        A::Ptr{Float32}, lda::Ptr{Int64}, S::Ptr{Float32}, U::Ptr{Float32}, ldu::Ptr{Int64},
+        VT::Ptr{Float32}, ldvt::Ptr{Int64}, work::Ptr{Float32}, lwork::Ptr{Int64}, info::Ptr{Int64},
+        len_ju::Clong, len_jvt::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, 1.0f0); unsafe_store!(info, Int64(0)); return
+    end
+    _svd_cabi_f32!(_cabi_char(jobu), _cabi_char(jobvt), Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
+Base.@ccallable function sgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float32},
+        lda::Ptr{Int64}, S::Ptr{Float32}, U::Ptr{Float32}, ldu::Ptr{Int64}, VT::Ptr{Float32},
+        ldvt::Ptr{Int64}, work::Ptr{Float32}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, info::Ptr{Int64},
+        len_jobz::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, 1.0f0); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz)
+    if jz == 'O'; unsafe_store!(info, Int64(-1)); return; end
+    _svd_cabi_f32!(jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end

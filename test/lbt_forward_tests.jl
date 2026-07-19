@@ -35,6 +35,8 @@
     getri_before = fwd("dgetri_"); potri_before = fwd("dpotri_"); trtri_before = fwd("dtrtri_")
     geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
     zgeqrt_before = fwd("zgeqrt_"); zgemqrt_before = fwd("zgemqrt_")
+    sgetrf_before = fwd("sgetrf_"); sgeqrt_before = fwd("sgeqrt_"); sgesdd_before = fwd("sgesdd_")
+    Af = randn(Float32, n, n); f32svals = svdvals(copy(Af))
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -83,6 +85,14 @@
         @test maximum(abs, Matrix(Qz.Q)' * Matrix(Qz.Q) - I) < 1e-9        # zgemqrt: Q unitary
         @test maximum(abs, Matrix(Qz.Q) * Qz.R - Az) < 1e-9                # zgeqrt+zgemqrt: Q·R = Az
         @test maximum(abs, (qr(copy(Az)) \ zb) .- ref.zqrsol) < 1e-8       # complex qr()\b
+
+        # Float32 LAPACK via mixed precision (compute F64, store F32) — lu/qr/svd route, correct to F32.
+        @test fwd("sgetrf_") != sgetrf_before && fwd("sgeqrt_") != sgeqrt_before && fwd("sgesdd_") != sgesdd_before
+        Ff = lu(copy(Af)); @test maximum(abs, (Ff.L * Ff.U) .- Af[Ff.p, :]) < 1f-4   # sgetrf
+        Qf = qr(copy(Af))
+        @test maximum(abs, Matrix(Qf.Q)' * Matrix(Qf.Q) - I) < 1f-4          # sgeqrt+sgemqrt
+        @test maximum(abs, Matrix(Qf.Q) * Qf.R - Af) < 1f-4
+        @test maximum(abs, svdvals(copy(Af)) .- f32svals) < 1f-3             # sgesdd (loose F32 tol)
 
         # QR routes to PureBLAS via geqrt+gemqrt (Julia's qr() is QRCompactWY). geqrf is now forwarded too
         # (its wrapper converts faer τ → LAPACK, so geqrf!+OpenBLAS-orgqr is correct — no more NaN-Q hazard).
