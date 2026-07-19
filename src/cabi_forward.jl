@@ -305,3 +305,38 @@ for (nm, T) in (("sorghr", Float32), ("dorghr", Float64), ("cunghr", ComplexF32)
     @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
         (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
 end
+
+# ─────────── General nonsymmetric eigensolver: geev / geevx / gees — routes eigen/eigvals/schur ───────
+# eigen(A)/eigvals(A) call LAPACK.geevx! (sense='N'); schur(A) calls gees!('V',A). geev is registered too
+# (plain driver + non-Julia hosts). @cfunction sigs match the @ccallable defs in cabi_lapack.jl exactly:
+# real geev has separate wr/wi outputs; complex geev has one w + a REAL rwork block. geevx adds balanc/
+# sense chars (4 char args → 4 lens) + ilo/ihi/scale/abnrm/rconde/rcondv. gees carries select/bwork
+# function-pointer args (Ptr{Cvoid}, ignored) + sdim.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        _reg!($(p * "geev_"), () -> @cfunction($(Symbol(p, "geev_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI,
+             Ptr{$T}, _CI, _CI, Clong, Clong)))
+        _reg!($(p * "geevx_"), () -> @cfunction($(Symbol(p, "geevx_64_")), Cvoid,
+            (_CU, _CU, _CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI,
+             _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI, _CI,
+             Clong, Clong, Clong, Clong)))
+        _reg!($(p * "gees_"), () -> @cfunction($(Symbol(p, "gees_64_")), Cvoid,
+            (_CU, _CU, Ptr{Cvoid}, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI,
+             Ptr{$T}, _CI, Ptr{Cvoid}, _CI, Clong, Clong)))
+    end
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval begin
+        _reg!($(p * "geev_"), () -> @cfunction($(Symbol(p, "geev_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI,
+             Ptr{$T}, _CI, Ptr{$R}, _CI, Clong, Clong)))
+        _reg!($(p * "geevx_"), () -> @cfunction($(Symbol(p, "geevx_64_")), Cvoid,
+            (_CU, _CU, _CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI,
+             _CI, _CI, Ptr{$R}, Ptr{$R}, Ptr{$R}, Ptr{$R}, Ptr{$T}, _CI, Ptr{$R}, _CI,
+             Clong, Clong, Clong, Clong)))
+        _reg!($(p * "gees_"), () -> @cfunction($(Symbol(p, "gees_64_")), Cvoid,
+            (_CU, _CU, Ptr{Cvoid}, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, Ptr{$T}, _CI,
+             Ptr{$T}, _CI, Ptr{$R}, Ptr{Cvoid}, _CI, Clong, Clong)))
+    end
+end
