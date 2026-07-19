@@ -160,6 +160,19 @@ _reg!("zgeqrt_", () -> @cfunction(zgeqrt_64_, Cvoid,
 _reg!("zgemqrt_", () -> @cfunction(zgemqrt_64_, Cvoid,
     (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI,
      Ptr{ComplexF64}, _CI, Clong, Clong)))
+# Float32 LAPACK via mixed precision (compute F64, store F32): routes lu/qr/svd for Matrix{Float32}.
+_reg!("sgetrf_", () -> @cfunction(sgetrf_64_, Cvoid, (_CI, _CI, Ptr{Float32}, _CI, _CI, _CI)))
+_reg!("sgeqrt_", () -> @cfunction(sgeqrt_64_, Cvoid,
+    (_CI, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, _CI, Ptr{Float32}, _CI)))
+_reg!("sgemqrt_", () -> @cfunction(sgemqrt_64_, Cvoid,
+    (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, _CI, Ptr{Float32}, _CI,
+     Ptr{Float32}, _CI, Clong, Clong)))
+_reg!("sgesvd_", () -> @cfunction(sgesvd_64_, Cvoid,
+    (_CU, _CU, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, Ptr{Float32}, _CI,
+     Ptr{Float32}, _CI, Ptr{Float32}, _CI, _CI, Clong, Clong)))
+_reg!("sgesdd_", () -> @cfunction(sgesdd_64_, Cvoid,
+    (_CU, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, Ptr{Float32}, _CI,
+     Ptr{Float32}, _CI, Ptr{Float32}, _CI, _CI, _CI, Clong)))
 # Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval begin
