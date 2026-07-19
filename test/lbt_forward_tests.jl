@@ -35,6 +35,7 @@
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
     gemm_before = fwd("dgemm_"); geqrf_before = fwd("dgeqrf_")
     zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_"); gesdd_before = fwd("dgesdd_")
+    zgesdd_before = fwd("zgesdd_")
     getrs_before = fwd("dgetrs_"); potrs_before = fwd("dpotrs_"); trtrs_before = fwd("dtrtrs_")
     getri_before = fwd("dgetri_"); potri_before = fwd("dpotri_"); trtri_before = fwd("dtrtri_")
     geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
@@ -91,6 +92,14 @@
         @test maximum(abs, Matrix(Qz.Q) * Qz.R - Az) < 1e-9                # zgeqrt+zgemqrt: Q·R = Az
         @test maximum(abs, (qr(copy(Az)) \ zb) .- ref.zqrsol) < 1e-8       # complex qr()\b
 
+        # Complex SVD routes → svd()/svdvals(::Matrix{ComplexF64}) now use PureBLAS (zgesdd).
+        @test fwd("zgesdd_") != zgesdd_before
+        @test maximum(abs, svdvals(copy(Az)) .- svdvals(Az)) < 1e-9         # zgesdd values
+        Fz = svd(copy(Az))                                                  # zgesdd U/S/Vᴴ
+        @test maximum(abs, Fz.U * Diagonal(Fz.S) * Fz.Vt .- Az) < 1e-9      # reconstruction
+        @test maximum(abs, Fz.U' * Fz.U - I) < 1e-9                         # U unitary columns
+        @test maximum(abs, Fz.Vt * Fz.Vt' - I) < 1e-9                       # Vᴴ unitary rows
+
         # Float32 LAPACK via mixed precision (compute F64, store F32) — lu/qr/svd route, correct to F32.
         @test fwd("sgetrf_") != sgetrf_before && fwd("sgeqrt_") != sgeqrt_before && fwd("sgesdd_") != sgesdd_before
         Ff = lu(copy(Af)); @test maximum(abs, (Ff.L * Ff.U) .- Af[Ff.p, :]) < 1f-4   # sgetrf
@@ -131,4 +140,47 @@
         PureBLAS.deactivate()   # ALWAYS restore OpenBLAS so later testitems keep their oracle
     end
     @test A * Bm == ref.mul     # after deactivate the OpenBLAS oracle is back (bit-identical)
+end
+
+@testitem "LBT in-process forward: batch-6 LAPACK (lq/bunchkaufman/qr-pivot/cond/hessenberg)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xF00D)
+    n = 64
+    A = randn(n, n); Az = randn(ComplexF64, n, n)
+    SI = A + transpose(A); HI = Az + Az'          # symmetric / Hermitian indefinite
+    U = triu(A) + n * I                            # well-conditioned upper-triangular
+    tall = randn(90, n); b = randn(90)
+
+    # OpenBLAS oracles captured BEFORE activate.
+    ref = (lqrec = (F = lq(copy(A)); Matrix(F.L) * Matrix(F.Q)),
+           bksol = bunchkaufman(Symmetric(copy(SI))) \ ones(n),
+           zbksol = bunchkaufman(Hermitian(copy(HI))) \ ones(ComplexF64, n),
+           qpp = (Q = qr(copy(A), ColumnNorm()); Matrix(Q.Q) * Matrix(Q.R) - A[:, Q.p]),
+           tallsol = tall \ b,
+           trcond = cond(UpperTriangular(copy(U)), 1),
+           hess = (H = hessenberg(copy(A)); Matrix(H.Q) * Matrix(H.H) * Matrix(H.Q)' - A))
+
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    gelqf_b = fwd("dgelqf_"); orglq_b = fwd("dorglq_"); sytrf_b = fwd("dsytrf_")
+    zhetrf_b = fwd("zhetrf_"); geqp3_b = fwd("dgeqp3_"); trcon_b = fwd("dtrcon_"); gehrd_b = fwd("dgehrd_")
+    PureBLAS.activate()
+    try
+        # Pointers actually changed (forwarded to PureBLAS).
+        @test fwd("dgelqf_") != gelqf_b && fwd("dorglq_") != orglq_b
+        @test fwd("dsytrf_") != sytrf_b && fwd("zhetrf_") != zhetrf_b
+        @test fwd("dgeqp3_") != geqp3_b && fwd("dtrcon_") != trcon_b && fwd("dgehrd_") != gehrd_b
+        # Correct under the mixed backend.
+        F = lq(copy(A)); @test maximum(abs, (Matrix(F.L) * Matrix(F.Q)) .- ref.lqrec) < 1e-9
+        @test maximum(abs, (bunchkaufman(Symmetric(copy(SI))) \ ones(n)) .- ref.bksol) < 1e-8
+        @test maximum(abs, (bunchkaufman(Hermitian(copy(HI))) \ ones(ComplexF64, n)) .- ref.zbksol) < 1e-8
+        Q = qr(copy(A), ColumnNorm()); @test maximum(abs, (Matrix(Q.Q) * Matrix(Q.R) - A[:, Q.p]) .- ref.qpp) < 1e-9
+        @test maximum(abs, (tall \ b) .- ref.tallsol) < 1e-8       # non-square \ (geqp3 path)
+        @test isapprox(cond(UpperTriangular(copy(U)), 1), ref.trcond; rtol = 1e-6)   # trcon
+        Hh = hessenberg(copy(A))
+        @test maximum(abs, (Matrix(Hh.Q) * Matrix(Hh.H) * Matrix(Hh.Q)' - A) .- ref.hess) < 1e-8
+    finally
+        PureBLAS.deactivate()
+    end
 end

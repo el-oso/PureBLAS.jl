@@ -617,7 +617,7 @@ function _svd_sort!(d::AbstractVector{Float64}, U, V)
     return d
 end
 
-@inline function _swap_cols!(M::AbstractMatrix{T}, j1::Int, j2::Int) where {T<:Real}
+@inline function _swap_cols!(M::AbstractMatrix{T}, j1::Int, j2::Int) where {T<:Number}
     @inbounds for i in 1:size(M, 1)
         M[i, j1], M[i, j2] = M[i, j2], M[i, j1]
     end
@@ -718,6 +718,16 @@ function _svd_transpose!(B::AbstractMatrix{Float64}, A::AbstractMatrix{Float64})
 end
 # Allocating variant (used only by the concrete-return C-ABI wrappers, which may allocate their outputs).
 _svd_transpose(A::AbstractMatrix{Float64}) = _svd_transpose!(Matrix{Float64}(undef, size(A, 2), size(A, 1)), A)
+
+# Trim-safe CONJUGATE transpose B (n×m) ← Aᴴ (from A m×n). The complex SVD's Vᴴ (and the m<n transpose
+# path) need conjugate-transpose, not plain transpose. Real T is a plain transpose (conj is a no-op).
+function _svd_ctranspose!(B::AbstractMatrix{T}, A::AbstractMatrix{T}) where {T<:Number}
+    m, n = size(A)
+    @inbounds for j in 1:n, i in 1:m
+        B[j, i] = conj(A[i, j])
+    end
+    return B
+end
 
 # ── in-place SVD core (m ≥ n) ─────────────────────────────────────────────────────────────────────────
 # Writes into caller U (m×nu), S (length n), Vt (n×n). ALL scratch comes from ws (grown once up front) ⇒
@@ -858,11 +868,120 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T<:
     @inbounds for i in 1:n; S[i] = d[i]; end
     return S
 end
+# ── Complex singular-VECTOR back-transform (unblocked, mirrors _unmtr! in eigen.jl) ─────────────────────
+# Q = H_1·H_2·⋯·H_n from the LEFT (tauq) reflectors: apply C := Q·C. H_i = I − τq_i·v_i·v_iᴴ acts on rows
+# i:m, v_i[1]≡1 (at row i), v_i[2:] = A[i+1:m, i] (stored un-conjugated — the LEFT reflectors get no zlacgv
+# dance). ALL n reflectors applied (i=n has a length-1 v with a nonzero phase τ — no real-code τ=0 shortcut,
+# per the eigen lesson). trans='N' (form Q, not Qᴴ) ⇒ τ un-conjugated.
+function _zapply_Q_left!(A::AbstractMatrix{T}, tauq::AbstractVector{T}, C::AbstractMatrix{T},
+        m::Int, n::Int) where {T<:Complex}
+    v = Vector{T}(undef, m)
+    @inbounds for i in n:-1:1
+        len = m - i + 1
+        v[1] = one(T)
+        for r in 2:len; v[r] = A[i+r-1, i]; end
+        _house_left!(view(C, i:m, :), view(v, 1:len), tauq[i])
+    end
+    return C
+end
+
+# P = R_1·R_2·⋯·R_{n-1} from the LEFT (taup) reflectors: apply C := P·C. From A = Q·B·Pᴴ, P = R_1…R_{n-1}
+# with R_i = I − τp_i·w_i·w_iᴴ acting on the col-index space i+1:n (rows i+1:n of C), w_i[1]≡1 (col i+1),
+# w_i[2:] = conj(A[i, i+2:n]). The CONJUGATION on w (vs the real _form_P!, which uses A[i,i+t] directly) is
+# the P-side subtlety: zgebd2 reduces the CONJUGATED row (zlacgv), so the reflector applied from the right
+# during factorization is w_i = conj(stored essential); forming P from the left re-uses that same w_i. τ is
+# un-conjugated (form P, not Pᴴ). Derivation cross-checked against the known-correct Q side + verified
+# numerically (reconstruction ‖A−UΣVᴴ‖ at machine eps across scaled/rank-deficient cases). i=n−1 has a
+# length-1 w (phase-only) — applied, no τ=0 shortcut.
+function _zapply_P_left!(A::AbstractMatrix{T}, taup::AbstractVector{T}, C::AbstractMatrix{T},
+        n::Int) where {T<:Complex}
+    n <= 1 && return C
+    v = Vector{T}(undef, n)
+    @inbounds for i in (n-1):-1:1
+        len = n - i
+        v[1] = one(T)
+        for t in 2:len; v[t] = conj(A[i, i+t]); end
+        _house_left!(view(C, i+1:n, :), view(v, 1:len), taup[i])
+    end
+    return C
+end
+
+# ── Complex in-place SVD core (m ≥ n), mirrors _gesvd_core! (the _heev! pattern for SVD) ────────────────
+# gebrd! (complex; real d,e + complex tauq/taup) → REAL bidiagonal SVD (bdsqr!/bdsdc! into real Lvec/Rvec)
+# → realify into complex U/V staging → apply complex Q (tauq) / P (taup) back-transforms → Vᴴ = conjugate
+# transpose. B is REAL, so its singular-vector blocks are REAL scratch (allocated here — perf/0-alloc is the
+# follow-up). nu = m when full_u&&m>n (orthonormal complement of range(A)), else n.
+function _zgesvd_core!(A::AbstractMatrix{T}, U::AbstractMatrix{T}, S::AbstractVector{R},
+        Vt::AbstractMatrix{T}, ws::SVDWorkspace{T}; full_u::Bool = false) where {T<:Complex, R<:Real}
+    m, n = size(A)
+    nu = (full_u && m > n) ? m : n
+    _svd_grow_bidiag!(ws, m, n)
+    d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0))
+    tauq = Vector{T}(undef, n); taup = Vector{T}(undef, n)
+    gebrd!(A, d, e, tauq, taup, ws)                     # complex bidiagonalization (real d,e; complex τ)
+    # REAL bidiagonal SVD: B = Lvec·diag(d)·Rvecᵀ (bdsqr below the crossover, D&C above — mirror the real
+    # core). Lvec/Rvec are REAL (B is real bidiagonal); the D&C reuses the Float64 global workspace.
+    Lvec = Matrix{Float64}(undef, n, n); Rvec = Matrix{Float64}(undef, n, n)
+    if n <= _SVD_DC_CROSS
+        fill!(Lvec, 0.0); fill!(Rvec, 0.0)
+        @inbounds for i in 1:n; Lvec[i, i] = 1.0; Rvec[i, i] = 1.0; end
+        bdsqr!(d, e, Lvec, Rvec)
+    else
+        rws = _svdws()                                  # grow the Float64 D&C staging on the real workspace
+        rws.dc_diag = _gv(rws.dc_diag, n); rws.dc_subdiag = _gv(rws.dc_subdiag, n)
+        rws.dc_U = _gm(rws.dc_U, n + 1, n + 1)
+        bdsdc!(d, e, Lvec, Rvec, rws)
+    end
+    s = d
+    # U_A = Q·[Lvec 0; 0 I]: realify Lvec into the complex staging, push the n+1:nu unit columns through Q
+    # (they become the orthonormal complement of range(A) when full_u & m>n).
+    UA = Matrix{T}(undef, m, nu)
+    fill!(UA, zero(T))
+    @inbounds for j in 1:n, i in 1:n; UA[i, j] = T(Lvec[i, j]); end
+    @inbounds for j in n+1:nu; UA[j, j] = one(T); end
+    _zapply_Q_left!(A, tauq, UA, m, n)
+    # V_A = P·Rvec (realify Rvec, apply the right reflectors).
+    VA = Matrix{T}(undef, n, n)
+    @inbounds for j in 1:n, i in 1:n; VA[i, j] = T(Rvec[i, j]); end
+    _zapply_P_left!(A, taup, VA, n)
+    _svd_sort!(s, UA, VA)                                # descending; complement cols n+1:nu untouched
+    @inbounds for i in 1:n; S[i] = R(s[i]); end
+    @inbounds for j in 1:nu, i in 1:m; U[i, j] = UA[i, j]; end
+    _svd_ctranspose!(Vt, VA)                             # Vt = V_Aᴴ (CONJUGATE transpose — n×n)
+    return U, S, Vt
+end
+
+# Complex full SVD (in-place; caller provides U/S/Vt). m<n via the CONJUGATE transpose: SVD(Aᴴ)=Ū·Σ·V̄ᴴ ⟹
+# A=V̄·Σ·Ūᴴ ⟹ U(A)=V̄=(V̄ᴴ)ᴴ, Vᴴ(A)=Ūᴴ (σ preserved). full_u/full_v mirror the real path (full_v(A)≡full_u(Aᴴ)).
+function gesvd!(A::AbstractMatrix{T}, U::AbstractMatrix{T}, S::AbstractVector{<:Real},
+        Vt::AbstractMatrix{T}; full_u::Bool = false, full_v::Bool = false) where {T<:Complex}
+    m, n = size(A)
+    ws = _svdws(T)
+    if m < n
+        At = Matrix{T}(undef, n, m); _svd_ctranspose!(At, A)     # At = Aᴴ (tall, n>m)
+        nU = (full_v && n > m) ? n : m
+        Usc = Matrix{T}(undef, n, nU); Vtsc = Matrix{T}(undef, m, m)
+        _zgesvd_core!(At, Usc, S, Vtsc, ws; full_u = full_v)
+        _svd_ctranspose!(U, Vtsc)                                # U(A) = V̄ = (V̄ᴴ)ᴴ  (m×m)
+        _svd_ctranspose!(Vt, Usc)                                # Vt(A) = Ūᴴ  (nU×n)
+        return U, S, Vt
+    end
+    _zgesvd_core!(A, U, S, Vt, ws; full_u = full_u)
+    return U, S, Vt
+end
+
+# Complex full SVD (zgesvd), convenience allocating form. want_vectors=false → (S,); true → (U, S, Vᴴ),
+# economy (U m×min, Vᴴ min×n). Mirrors the Float64 convenience entry.
 function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T<:BlasComplex}
     m, n = size(A); mn = min(m, n)
-    want_vectors && throw(ArgumentError("complex gesvd! with singular vectors not yet implemented — " *
-        "use want_vectors=false for singular values (the vectors' back-transform is the follow-up)"))
+    if !want_vectors
+        S = Vector{real(T)}(undef, mn)
+        gesvd_vals!(A, S)                                        # destructive (mirrors the real path)
+        return (S,)
+    end
+    U = Matrix{T}(undef, m, mn)
     S = Vector{real(T)}(undef, mn)
-    gesvd_vals!(A, S)                                         # destructive (mirrors the real want_vectors=false path)
-    return (S,)
+    Vt = Matrix{T}(undef, mn, n)
+    gesvd!(A, U, S, Vt)
+    return U, S, Vt
 end

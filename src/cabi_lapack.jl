@@ -244,6 +244,138 @@ Base.@ccallable function dgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int6
     return
 end
 
+# ── COMPLEX gesvd/gesdd (ComplexF64 native + ComplexF32 mixed-precision) ───────────────────────────────
+# Same job semantics as the real _svd_cabi! (N/S/A/O), but S/rwork are REAL ($Tr) while A/U/VT/work are
+# COMPLEX; the LAPACK complex gesvd/gesdd ABI inserts an rwork block (real scratch) the real drivers lack —
+# ignored here (PureBLAS owns its scratch). gesvd! forms BOTH factors regardless, so 'N'/'O' get an owned
+# economy scratch (ws.cabi_U/cabi_Vt), 'O' then copied into A. One concrete gesvd! specialization ⇒ trim-safe.
+@inline function _zsvd_cabi!(ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{ComplexF64}, ld::Int,
+        S::Ptr{Float64}, U::Ptr{ComplexF64}, ldu::Int, VT::Ptr{ComplexF64}, ldvt::Int, info::Ptr{Int64})
+    mn = min(M, N)
+    u_ok = ju == 'N' || ju == 'S' || ju == 'A' || ju == 'O'
+    v_ok = jvt == 'N' || jvt == 'S' || jvt == 'A' || jvt == 'O'
+    if !(u_ok && v_ok) || (ju == 'O' && jvt == 'O')
+        unsafe_store!(info, Int64(-1)); return
+    end
+    Av = PtrMatrix(A, M, N, ld)
+    if ju == 'N' && jvt == 'N'                         # values only → 0-alloc into caller's S
+        gesvd_vals!(Av, PtrVector(S, mn))
+        unsafe_store!(info, Int64(0)); return
+    end
+    full_u = ju == 'A' && M > N
+    full_v = jvt == 'A' && N > M
+    ncu = ju == 'A' ? M : mn
+    ncv = jvt == 'A' ? N : mn
+    ws = _svdws(ComplexF64)
+    uscr = ju == 'N' || ju == 'O'
+    vscr = jvt == 'N' || jvt == 'O'
+    uscr && (ws.cabi_U = _gm(ws.cabi_U, M, mn))
+    vscr && (ws.cabi_Vt = _gm(ws.cabi_Vt, mn, N))
+    GC.@preserve ws begin
+        Ut  = uscr ? PtrMatrix(pointer(ws.cabi_U), M, mn, size(ws.cabi_U, 1)) :
+                     PtrMatrix(U, M, ncu, ldu)
+        Vtt = vscr ? PtrMatrix(pointer(ws.cabi_Vt), mn, N, size(ws.cabi_Vt, 1)) :
+                     PtrMatrix(VT, ncv, N, ldvt)
+        gesvd!(Av, Ut, PtrVector(S, mn), Vtt; full_u = full_u, full_v = full_v)
+        if ju == 'O'
+            @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Ut[i, j]; end
+        end
+        if jvt == 'O'
+            @inbounds for j in 1:N, i in 1:mn; Av[i, j] = Vtt[i, j]; end
+        end
+    end
+    unsafe_store!(info, Int64(0))
+    return
+end
+
+# zgesvd_(jobu, jobvt, m, n, A, lda, S, U, ldu, VT, ldvt, work, lwork, rwork, info, len_jobu, len_jobvt).
+Base.@ccallable function zgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        A::Ptr{ComplexF64}, lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{ComplexF64}, ldu::Ptr{Int64},
+        VT::Ptr{ComplexF64}, ldvt::Ptr{Int64}, work::Ptr{ComplexF64}, lwork::Ptr{Int64},
+        rwork::Ptr{Float64}, info::Ptr{Int64}, len_jobu::Clong, len_jobvt::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, ComplexF64(1)); unsafe_store!(info, Int64(0)); return
+    end
+    _zsvd_cabi!(_cabi_char(jobu), _cabi_char(jobvt), Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
+# zgesdd_(jobz, m, n, A, lda, S, U, ldu, VT, ldvt, work, lwork, rwork, iwork, info, len_jobz) — Julia's
+# svd()/svdvals(::Matrix{ComplexF64}) route here (D&C). rwork/iwork ignored. jobz='O' unsupported (info=-1).
+Base.@ccallable function zgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{ComplexF64},
+        lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{ComplexF64}, ldu::Ptr{Int64}, VT::Ptr{ComplexF64},
+        ldvt::Ptr{Int64}, work::Ptr{ComplexF64}, lwork::Ptr{Int64}, rwork::Ptr{Float64},
+        iwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, ComplexF64(1)); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz)
+    if jz == 'O'
+        unsafe_store!(info, Int64(-1)); return
+    end
+    _zsvd_cabi!(jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
+# ComplexF32 SVD via mixed precision: promote A→ComplexF64, run the ComplexF64 driver into F64 scratch,
+# demote outputs (S→Float32, U/VT→ComplexF32). Mirrors _svd_cabi_f32! (the real F32 path).
+@inline function _csvd_cabi_f32!(ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{ComplexF32}, ld::Int,
+        S::Ptr{Float32}, U::Ptr{ComplexF32}, ldu::Int, VT::Ptr{ComplexF32}, ldvt::Int, info::Ptr{Int64})
+    mn = min(M, N)
+    Af = Matrix{ComplexF64}(undef, M, N); Am = PtrMatrix(A, M, N, ld)
+    @inbounds for j in 1:N, i in 1:M; Af[i, j] = ComplexF64(Am[i, j]); end
+    Sf = Vector{Float64}(undef, mn)
+    needU = ju != 'N'; needV = jvt != 'N'
+    ncu = ju == 'A' ? M : mn; ncv = jvt == 'A' ? N : mn
+    Uf = Matrix{ComplexF64}(undef, M, needU ? ncu : 1)
+    Vf = Matrix{ComplexF64}(undef, needV ? ncv : 1, N)
+    GC.@preserve Af Sf Uf Vf begin
+        _zsvd_cabi!(ju, jvt, M, N, pointer(Af), M, pointer(Sf), pointer(Uf), M,
+            pointer(Vf), needV ? ncv : 1, info)
+        unsafe_load(info) == 0 || return
+        Sm = PtrVector(S, mn); @inbounds for i in 1:mn; Sm[i] = Float32(Sf[i]); end
+        if needU
+            Um = PtrMatrix(U, M, ncu, ldu)
+            @inbounds for j in 1:ncu, i in 1:M; Um[i, j] = ComplexF32(Uf[i, j]); end
+        end
+        if needV
+            Vm = PtrMatrix(VT, ncv, N, ldvt)
+            @inbounds for j in 1:N, i in 1:ncv; Vm[i, j] = ComplexF32(Vf[i, j]); end
+        end
+    end
+    return
+end
+
+Base.@ccallable function cgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        A::Ptr{ComplexF32}, lda::Ptr{Int64}, S::Ptr{Float32}, U::Ptr{ComplexF32}, ldu::Ptr{Int64},
+        VT::Ptr{ComplexF32}, ldvt::Ptr{Int64}, work::Ptr{ComplexF32}, lwork::Ptr{Int64},
+        rwork::Ptr{Float32}, info::Ptr{Int64}, len_jobu::Clong, len_jobvt::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, ComplexF32(1)); unsafe_store!(info, Int64(0)); return
+    end
+    _csvd_cabi_f32!(_cabi_char(jobu), _cabi_char(jobvt), Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
+Base.@ccallable function cgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{ComplexF32},
+        lda::Ptr{Int64}, S::Ptr{Float32}, U::Ptr{ComplexF32}, ldu::Ptr{Int64}, VT::Ptr{ComplexF32},
+        ldvt::Ptr{Int64}, work::Ptr{ComplexF32}, lwork::Ptr{Int64}, rwork::Ptr{Float32},
+        iwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, ComplexF32(1)); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz)
+    if jz == 'O'
+        unsafe_store!(info, Int64(-1)); return
+    end
+    _csvd_cabi_f32!(jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
 # ── syev / syevd / syevr: symmetric eigensolver (real Float64, M-E1) ──────────────────────────────────
 # All three LAPACK drivers share ONE engine (_syev! = sytrd → steqr → ormtr): the driver contract is
 # identical (eigenpairs to O(eps·‖A‖), orthonormal vectors, ascending). Julia's DEFAULT eigen(Symmetric)/
@@ -822,4 +954,251 @@ Base.@ccallable function sgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int6
     _svd_cabi_f32!(jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
         A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
     return
+end
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# Batch 6: LQ / Bunch-Kaufman / pivoted-QR / least-squares / condition / Hessenberg reduction.
+# All six kernels are GENERIC over s/d/c/z (native — NOT mixed precision), so every wrapper forwards
+# straight to the generic kernel per element type. Char args → Ptr{UInt8} first (deref via _cabi_char),
+# trailing Fortran string-length Clong(s) last (one per char). Routines with lwork honor the -1 query
+# (report work[1]=1, info=0). Cross-checked vs LinearAlgebra/lapack.jl ccalls for arg order + hidden lens.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+# ── LQ: gelqf / orglq·unglq / ormlq·unmlq — routes lq(A), Matrix(lq(A).Q), lq(A).Q ops ────────────────
+# {s,d,c,z}gelqf_64_(m, n, A, lda, tau, work, lwork, info) — 0 chars.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "gelqf_64_"))(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); k = min(M, N)
+        gelqf!(PtrMatrix(A, M, N, Int(unsafe_load(lda))), PtrVector(tau, k))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# orglq (real) / unglq (complex): (m, n, k, A, lda, tau, work, lwork, info) — 0 chars. Reference name
+# differs by type (dorglq vs zunglq) but the kernel is one generic orglq!.
+for (nm, T) in (("sorglq", Float32), ("dorglq", Float64), ("cunglq", ComplexF32), ("zunglq", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(nm, "_64_"))(m::Ptr{Int64}, n::Ptr{Int64}, k::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64},
+            info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); K = Int(unsafe_load(k))
+        orglq!(PtrMatrix(A, M, N, Int(unsafe_load(lda))), PtrVector(tau, K))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ormlq (real) / unmlq (complex): (side, trans, m, n, k, A, lda, tau, C, ldc, work, lwork, info) — 2 chars.
+# A is the gelqf reflector panel: K rows × nq cols (nq = m if side='L' else n).
+for (nm, T) in (("sormlq", Float32), ("dormlq", Float64), ("cunmlq", ComplexF32), ("zunmlq", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(nm, "_64_"))(side::Ptr{UInt8}, trans::Ptr{UInt8},
+            m::Ptr{Int64}, n::Ptr{Int64}, k::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, tau::Ptr{$T},
+            C::Ptr{$T}, ldc::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64},
+            len_s::Clong, len_t::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        sd = _cabi_char(side); tr = _cabi_char(trans)
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); K = Int(unsafe_load(k))
+        nq = sd == 'L' ? M : N
+        Am = PtrMatrix(A, K, nq, Int(unsafe_load(lda)))
+        Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
+        ormlq!(sd, tr, Am, PtrVector(tau, K), Cm)
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── Bunch-Kaufman: sytrf/hetrf + sytrs/hetrs — routes bunchkaufman(Symmetric/Hermitian) + its solve ───
+# {s,d,c,z}sytrf_64_(uplo, n, A, lda, ipiv, work, lwork, info, len_uplo) — 1 char. ipiv OUT (LAPACK enc).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "sytrf_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, ipiv::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64},
+            lu::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        N = Int(unsafe_load(n))
+        inf = sytrf!(PtrMatrix(A, N, N, Int(unsafe_load(lda))), PtrVector(ipiv, N); uplo = _cabi_char(uplo))
+        unsafe_store!(info, Int64(inf)); return
+    end
+end
+# {c,z}hetrf_64_ — Hermitian variant (complex only; real Hermitian bunchkaufman routes to sytrf).
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "hetrf_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, ipiv::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64},
+            lu::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        N = Int(unsafe_load(n))
+        inf = hetrf!(PtrMatrix(A, N, N, Int(unsafe_load(lda))), PtrVector(ipiv, N); uplo = _cabi_char(uplo))
+        unsafe_store!(info, Int64(inf)); return
+    end
+end
+# {s,d,c,z}sytrs_64_(uplo, n, nrhs, A, lda, ipiv, B, ldb, info, len_uplo) — 1 char.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "sytrs_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64},
+            nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, ipiv::Ptr{Int64}, B::Ptr{$T},
+            ldb::Ptr{Int64}, info::Ptr{Int64}, lu::Clong)::Cvoid
+        N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        sytrs!(PtrMatrix(A, N, N, Int(unsafe_load(lda))), PtrVector(ipiv, N),
+            PtrMatrix(B, N, R, Int(unsafe_load(ldb))); uplo = _cabi_char(uplo))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "hetrs_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64},
+            nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, ipiv::Ptr{Int64}, B::Ptr{$T},
+            ldb::Ptr{Int64}, info::Ptr{Int64}, lu::Clong)::Cvoid
+        N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        hetrs!(PtrMatrix(A, N, N, Int(unsafe_load(lda))), PtrVector(ipiv, N),
+            PtrMatrix(B, N, R, Int(unsafe_load(ldb))); uplo = _cabi_char(uplo))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── geqp3: pivoted QR — routes qr(A, ColumnNorm()) and non-square A\b ─────────────────────────────────
+# real {s,d}geqp3_64_(m, n, A, lda, jpvt, tau, work, lwork, info) — 0 chars.
+# complex {c,z}geqp3_64_(m, n, A, lda, jpvt, tau, work, lwork, rwork, info) — extra REAL rwork block.
+# jpvt is Ptr{Int64} (1-based, both IN as the free-column mask AND OUT as the permutation). The kernel
+# initializes jpvt itself (writes 1:n then permutes), matching LAPACK's behavior for the all-free case
+# that qr(::Matrix, ColumnNorm()) uses (Julia passes jpvt = zeros).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval Base.@ccallable function $(Symbol(p, "geqp3_64_"))(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, jpvt::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64},
+            info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); k = min(M, N)
+        geqp3!(PtrMatrix(A, M, N, Int(unsafe_load(lda))), PtrVector(jpvt, N), PtrVector(tau, k))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    Tr = T == ComplexF32 ? Float32 : Float64
+    @eval Base.@ccallable function $(Symbol(p, "geqp3_64_"))(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, jpvt::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64},
+            rwork::Ptr{$Tr}, info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); k = min(M, N)
+        geqp3!(PtrMatrix(A, M, N, Int(unsafe_load(lda))), PtrVector(jpvt, N), PtrVector(tau, k))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── gels: least-squares / min-norm — {s,d,c,z}gels_64_(trans, m, n, nrhs, A, lda, B, ldb, work, lwork,
+# info, len_trans) — 1 char. The SOLUTION is written into B (LAPACK ldb layout: B is max(m,n)×nrhs, first
+# `cols(op A)` rows hold x, the tail rows hold Qᴴ·b's residual block). NOTE: the PureBLAS gels! kernel
+# does NOT overwrite A with the QR/LQ factors (LAPACK does) — see the assembly report. For routing `\` and
+# for the solution vector this is immaterial (Julia's non-square `\` goes through geqp3, not gels; the
+# solution in B is the load-bearing output). A direct LAPACK.gels! call gets a correct B + residuals.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "gels_64_"))(trans::Ptr{UInt8}, m::Ptr{Int64},
+            n::Ptr{Int64}, nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64},
+            work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64}, lt::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        Am = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
+        Bm = PtrMatrix(B, max(M, N), R, Int(unsafe_load(ldb)))
+        gels!(_cabi_char(trans), Am, Bm)
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── Condition estimation: gecon / trcon / pocon. rcond is a by-ref REAL OUTPUT scalar. anorm a by-ref
+# REAL input. Complex drivers carry a REAL rwork block where the real ones carry an integer iwork — both
+# ignored (PureBLAS owns its scratch), but the ABI slot type differs so the wrappers are split by type.
+# gecon: (normtype, n, A, lda, anorm, rcond, work, iwork|rwork, info, len_norm) — 1 char. The LAPACK ABI
+# passes NO ipiv (the 1-norm/∞-norm estimate is invariant under the LU row permutation P — permuting the
+# operator's rows/cols leaves the max column-sum unchanged), so we feed the kernel an identity ipiv.
+for (p, T, Tr, IW) in (("s", Float32, Float32, Int64), ("d", Float64, Float64, Int64),
+                       ("c", ComplexF32, Float32, Float32), ("z", ComplexF64, Float64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "gecon_64_"))(normtype::Ptr{UInt8}, n::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, anorm::Ptr{$Tr}, rcond::Ptr{$Tr}, work::Ptr{$T},
+            iwork::Ptr{$IW}, info::Ptr{Int64}, ln::Clong)::Cvoid
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        idp = Vector{Int64}(undef, N)
+        @inbounds for i in 1:N; idp[i] = i; end
+        rc = gecon!($Tr(unsafe_load(anorm)), Am, idp; norm = _cabi_char(normtype))
+        unsafe_store!(rcond, $Tr(rc)); unsafe_store!(info, Int64(0)); return
+    end
+end
+# trcon: (norm, uplo, diag, n, A, lda, rcond, work, iwork|rwork, info, len_norm, len_uplo, len_diag) — 3 chars.
+for (p, T, Tr, IW) in (("s", Float32, Float32, Int64), ("d", Float64, Float64, Int64),
+                       ("c", ComplexF32, Float32, Float32), ("z", ComplexF64, Float64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "trcon_64_"))(norm::Ptr{UInt8}, uplo::Ptr{UInt8},
+            diag::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, rcond::Ptr{$Tr}, work::Ptr{$T},
+            iwork::Ptr{$IW}, info::Ptr{Int64}, ln::Clong, lu::Clong, ld::Clong)::Cvoid
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        rc = trcon!(Am; uplo = _cabi_char(uplo), diag = _cabi_char(diag), norm = _cabi_char(norm))
+        unsafe_store!(rcond, $Tr(rc)); unsafe_store!(info, Int64(0)); return
+    end
+end
+# pocon: (uplo, n, A, lda, anorm, rcond, work, iwork|rwork, info, len_uplo) — 1 char.
+for (p, T, Tr, IW) in (("s", Float32, Float32, Int64), ("d", Float64, Float64, Int64),
+                       ("c", ComplexF32, Float32, Float32), ("z", ComplexF64, Float64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "pocon_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, anorm::Ptr{$Tr}, rcond::Ptr{$Tr}, work::Ptr{$T}, iwork::Ptr{$IW},
+            info::Ptr{Int64}, lu::Clong)::Cvoid
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        rc = pocon!($Tr(unsafe_load(anorm)), Am; uplo = _cabi_char(uplo))
+        unsafe_store!(rcond, $Tr(rc)); unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── Hessenberg reduction: gebal / gehrd / orghr·unghr — routes hessenberg(A) (gehrd) + reductions ─────
+# gebal: (job, n, A, lda, ilo, ihi, scale, info, len_job) — 1 char. ilo/ihi Ptr{Int64} OUT, scale Ptr{real} OUT.
+for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
+                   ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "gebal_64_"))(job::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, ilo::Ptr{Int64}, ihi::Ptr{Int64}, scale::Ptr{$Tr}, info::Ptr{Int64},
+            lj::Clong)::Cvoid
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        k, l, scl = gebal!(Am; job = _cabi_char(job))
+        sm = PtrVector(scale, N)
+        @inbounds for i in 1:N; sm[i] = scl[i]; end
+        unsafe_store!(ilo, Int64(k)); unsafe_store!(ihi, Int64(l)); unsafe_store!(info, Int64(0)); return
+    end
+end
+# gehrd: (n, ilo, ihi, A, lda, tau, work, lwork, info) — 0 chars. tau length max(n-1,0).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "gehrd_64_"))(n::Ptr{Int64}, ilo::Ptr{Int64},
+            ihi::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T},
+            lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        gehrd!(Am, Int(unsafe_load(ilo)), Int(unsafe_load(ihi)), PtrVector(tau, max(N - 1, 0)))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+# orghr (real) / unghr (complex): (n, ilo, ihi, A, lda, tau, work, lwork, info) — 0 chars. Overwrites A with Q.
+for (nm, T) in (("sorghr", Float32), ("dorghr", Float64), ("cunghr", ComplexF32), ("zunghr", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(nm, "_64_"))(n::Ptr{Int64}, ilo::Ptr{Int64}, ihi::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64},
+            info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        N = Int(unsafe_load(n))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        orghr!(Am, Int(unsafe_load(ilo)), Int(unsafe_load(ihi)), PtrVector(tau, max(N - 1, 0)))
+        unsafe_store!(info, Int64(0)); return
+    end
 end

@@ -64,5 +64,25 @@
         # Exercises gebrd + bdsqr + bdsdc divide-and-conquer + the compact-WY back-transform, all trim-clean.
         PureBLAS.dgesvd_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64},
             Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong, Clong),
+        # Batch-6 LAPACK: LQ / Bunch-Kaufman / geqp3 / gels / gecon·trcon·pocon / hessenberg. One
+        # representative per family (+ the 2-char ormlq, the complex-rwork geqp3, and a complex herm solve)
+        # to exercise the trim-critical shapes (workspace-query branch, char derefs, rwork ABI slot).
+        PureBLAS.dgelqf_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
+        PureBLAS.dorglq_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
+        PureBLAS.dormlq_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64},
+            Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong, Clong),
+        PureBLAS.dsytrf_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.zhetrf_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.zhetrs_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.dgeqp3_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
+        PureBLAS.zgeqp3_64_(Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}),
+        PureBLAS.dgels_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.dgecon_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.zgecon_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{ComplexF64}, Ptr{Float64}, Ptr{Int64}, Clong),
+        PureBLAS.dtrcon_64_(Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong, Clong, Clong),
+        PureBLAS.dpocon_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        PureBLAS.dgebal_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Clong),
+        PureBLAS.dgehrd_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
+        PureBLAS.dorghr_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
     )
 end

@@ -213,6 +213,54 @@ end
     end
 end
 
+@testitem "zgesvd (complex SVD) vs LAPACK — U/S/Vᴴ residual + orthonormality, scaled + rank-deficient" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(202)
+    # residual ‖A−U·Σ·Vᴴ‖/(‖A‖·max(m,n)·eps), orthonormality ‖UᴴU−I‖, ‖VᴴV−I‖ (all ≲ O(1)·eps units).
+    function chk(A)
+        m, n = size(A); mn = min(m, n); T = eltype(A); R = real(T)
+        U, S, Vt = PureBLAS.gesvd!(copy(A))
+        sref = svdvals(A)
+        sc = max(opnorm(A), floatmin(R)) * max(m, n) * eps(R)
+        resid = opnorm(U * Diagonal(S) * Vt - A) / sc
+        orthU = opnorm(U' * U - I) / (mn * eps(R))
+        orthV = opnorm(Vt * Vt' - I) / (mn * eps(R))
+        verr  = maximum(abs, S .- sref) / max(maximum(sref), floatmin(R))
+        return resid, orthU, orthV, verr
+    end
+    @testset "$T $m×$n" for T in (ComplexF64, ComplexF32),
+            (m, n) in ((2, 2), (4, 4), (8, 8), (32, 32), (64, 64), (128, 128),
+                       (8, 4), (4, 8), (64, 40), (40, 64), (129, 96), (96, 129))
+        tol = T === ComplexF64 ? 64.0 : 512.0
+        resid, orthU, orthV, verr = chk(randn(T, m, n))
+        @test resid < tol
+        @test orthU < tol
+        @test orthV < tol
+        @test verr < tol * eps(real(T))
+    end
+    @testset "$T scaled ‖A‖=$s" for T in (ComplexF64, ComplexF32), s in (1e-10, 1e-14, 1e8)
+        resid, orthU, orthV, verr = chk(randn(T, 48, 48) .* T(s))
+        @test resid < 128 && orthU < 128 && orthV < 128
+    end
+    @testset "$T rank-deficient / large-imag" for T in (ComplexF64, ComplexF32)
+        A = randn(T, 32, 20); A[:, 12:20] .= 0                       # exact zero singular values
+        r = chk(A); @test r[1] < 128 && r[2] < 128 && r[3] < 128
+        # Repeated/exact-clustered σ: routed through the D&C path (n>_SVD_DC_CROSS). The simplified
+        # forward-only bdsqr! (n≤96) does NOT converge on tightly-clustered σ — a PRE-EXISTING limitation
+        # shared by the real Float64 gesvd path (bdsqr! is uarch-shared); D&C (bdsdc!) handles them.
+        Q1 = Matrix(qr(randn(T, 128, 128)).Q); Q2 = Matrix(qr(randn(T, 128, 128)).Q)
+        Arep = Q1 * Diagonal(T[fill(3.0, 40); fill(1.0, 48); fill(0.05, 40)]) * Q2'   # repeated σ
+        r = chk(Arep); @test r[1] < 256 && r[2] < 256 && r[3] < 256
+        Abig = randn(T, 32, 32) .+ T(0, 100) .* randn(T, 32, 32)      # large imaginary parts
+        r = chk(Abig); @test r[1] < 128 && r[2] < 128 && r[3] < 128
+    end
+    @testset "values-only path matches" begin
+        A = randn(ComplexF64, 50, 30)
+        Sv = PureBLAS.gesvd!(copy(A); want_vectors = false)[1]
+        @test maximum(abs, Sv .- svdvals(A)) / maximum(svdvals(A)) < 1e-11
+    end
+end
+
 @testitem "syev (symmetric eigen) vs LAPACK — eigenvalues + residual + orthonormality, both uplo + stress" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(21)
@@ -346,5 +394,139 @@ end
         wref = eigvals(Symmetric(Float64.(A)))
         tol = T === Float64 ? 1e-11 : 1e-4
         @test maximum(abs, Float64.(d) .- wref) / max(1.0, maximum(abs, wref)) < tol
+    end
+end
+
+@testitem "lq (LQ) vs LAPACK — gelqf L·Q reconstruct, orglq orthonormal rows, ormlq apply" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.LAPACK
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
+        (m, n) in ((1, 1), (8, 8), (25, 40), (64, 64), (96, 129), (60, 60))
+
+        A0 = randn(T, m, n)
+        F = copy(A0); tau = zeros(T, min(m, n)); PureBLAS.gelqf!(F, tau)
+        # LAPACK reference: gelqf produces the SAME τ convention → compare L directly (lower trapezoid).
+        Fl = copy(A0); tl = LAPACK.gelqf!(Fl)[2]
+        k = min(m, n)
+        @test maxe(abs.(tril(F)[:, 1:k]), abs.(tril(Fl)[:, 1:k])) < 100 * eps(real(T))
+        # Reconstruct A = L·Q by forming Q (orglq) on the min(m,n)×n reflector rows.
+        mq = k
+        Qrows = copy(F)[1:mq, :]                        # first mq rows hold reflectors + tau[1:mq]
+        Q = PureBLAS.orglq!(Qrows, tau[1:mq])
+        @test maxe(Q * Q', Matrix{T}(I, mq, mq)) < 200 * eps(real(T))   # orthonormal rows
+        L = tril(F)[:, 1:k]
+        @test maxe(L * Q, A0) < 200 * eps(real(T))                      # L·Q = A
+        # ormlq: apply Qᴴ then Q to a matrix, round-trips. side='L' applies the ORDER-n Q (of which orglq's
+        # thin mq×n is the leading rows), so C is n×7 and Q·Qᴴ·C = C (full n×n orthogonal round-trip).
+        C = randn(T, n, 7)
+        trN = 'N'; trC = T <: Complex ? 'C' : 'T'
+        C1 = PureBLAS.ormlq!('L', trC, copy(F)[1:mq, :], tau[1:mq], copy(C))
+        C2 = PureBLAS.ormlq!('L', trN, copy(F)[1:mq, :], tau[1:mq], copy(C1))
+        @test maxe(C2, C) < 200 * eps(real(T))
+    end
+end
+
+@testitem "bunchkaufman (sytrf/hetrf + solve) vs LAPACK — factor solve residual, both uplo" begin
+    using PureBLAS, LinearAlgebra
+    tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 100
+    @testset "$T n=$n uplo=$uplo herm=$herm" for T in (Float32, Float64, ComplexF32, ComplexF64),
+        n in (1, 2, 5, 17, 64), uplo in ('L', 'U'), herm in (false, true)
+
+        (herm && !(T <: Complex)) && continue           # herm==sym for real; skip dup
+        M = randn(T, n, n)
+        A = herm ? (M + M') : (M + transpose(M))        # Hermitian / symmetric indefinite
+        ipiv = zeros(Int, n)
+        LD = copy(A)
+        herm ? PureBLAS.hetrf!(LD, ipiv; uplo = uplo) : PureBLAS.sytrf!(LD, ipiv; uplo = uplo)
+        B = randn(T, n, 3); X = copy(B)
+        herm ? PureBLAS.hetrs!(LD, ipiv, X; uplo = uplo) : PureBLAS.sytrs!(LD, ipiv, X; uplo = uplo)
+        @test norm(A * X - B) <= tol(T) * (norm(A) * norm(X) + norm(B))
+    end
+end
+
+@testitem "geqp3 (pivoted QR) vs LAPACK — A·P = Q·R reconstruct, |R| non-increasing" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.LAPACK
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
+        (m, n) in ((6, 6), (40, 25), (25, 40), (64, 64))
+
+        A0 = randn(T, m, n)
+        F = copy(A0); jpvt = zeros(Int, n); tau = zeros(T, min(m, n))
+        PureBLAS.geqp3!(F, jpvt, tau)
+        k = min(m, n)
+        # Rebuild Q from the reflectors (standard τ: H_i = I − τ v vᴴ) and check A[:,jpvt] = Q·R.
+        R = [i <= j ? F[i, j] : zero(T) for i in 1:m, j in 1:n]
+        Q = Matrix{T}(I, m, m)
+        for i in 1:k                                    # Q = H_1·H_2···H_k (right-multiply from I, in order)
+            v = zeros(T, m); v[i] = one(T); v[i+1:m] = F[i+1:m, i]
+            Q = Q - (tau[i] * Q * v) * v'
+        end
+        @test maxe(Q * R, A0[:, jpvt]) < 300 * eps(real(T))
+        rdiag = [abs(R[i, i]) for i in 1:k]
+        @test issorted(rdiag; rev = true) || maximum(diff(rdiag)) < 1e-6 * rdiag[1]  # non-increasing
+    end
+end
+
+@testitem "gels (least-squares / min-norm) vs LAPACK — overdetermined + underdetermined residual" begin
+    using PureBLAS, LinearAlgebra
+    tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 100
+    @testset "$T $m×$n trans=$trans" for T in (Float32, Float64, ComplexF32, ComplexF64),
+        (m, n) in ((40, 20), (20, 40), (30, 30)), trans in ('N',)
+
+        A = randn(T, m, n)
+        p, q = size(A)                                  # op = A (trans N): p×q
+        nrhs = 2
+        B = zeros(T, max(p, q), nrhs); b0 = randn(T, p, nrhs); B[1:p, :] = b0
+        PureBLAS.gels!(trans, copy(A), B)
+        X = B[1:q, :]
+        if p >= q                                       # overdetermined → normal equations Aᴴ(Ax−b)=0
+            @test norm(A' * (A * X - b0)) <= tol(T) * (norm(A)^2 * norm(X) + norm(A) * norm(b0))
+        else                                            # underdetermined → A·x = b exactly, min-norm
+            @test norm(A * X - b0) <= tol(T) * (norm(A) * norm(X) + norm(b0))
+        end
+    end
+end
+
+@testitem "gecon/trcon/pocon (condition estimate) vs LAPACK" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.LAPACK
+    @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (5, 20, 50)
+        A = randn(T, n, n) + n * I
+        # gecon: estimate from LU vs LAPACK.gecon! on the same factors.
+        for nrm in ('1', 'I')
+            an = opnorm(A, nrm == '1' ? 1 : Inf)
+            LU = lu(copy(A))
+            LUf = Matrix(LU.factors)
+            rc = PureBLAS.gecon!(an, LUf, LU.ipiv; norm = nrm)
+            rc_ref = LAPACK.gecon!(nrm, copy(LUf), real(T)(an))   # Julia's LAPACK wrapper wants '1'/'I' (not 'O')
+            @test isapprox(rc, rc_ref; rtol = 1e-3)
+        end
+        # trcon: triangular condition vs LAPACK.trcon!.
+        U = triu(A)
+        rct = PureBLAS.trcon!(copy(U); uplo = 'U', diag = 'N', norm = '1')
+        rct_ref = LAPACK.trcon!('1', 'U', 'N', copy(U))   # Julia's LAPACK wrapper wants '1'/'I' (not 'O')
+        @test isapprox(rct, rct_ref; rtol = 1e-3)
+        # pocon: SPD Cholesky condition; compare to reciprocal true condition (loose).
+        SPD = A * A' + n * I
+        Cf = PureBLAS.potrf!(copy(SPD); uplo = 'L')
+        an = opnorm(SPD, 1)
+        rcp = PureBLAS.pocon!(an, Cf; uplo = 'L')
+        @test 0 < rcp <= 1
+        @test isapprox(rcp, 1 / cond(SPD, 1); rtol = 0.5)   # estimator within ~2× of true rcond
+    end
+end
+
+@testitem "gehrd (Hessenberg reduction) vs LAPACK — H = Qᴴ·A·Q reconstruct, orghr Q unitary" begin
+    using PureBLAS, LinearAlgebra
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (1, 2, 5, 20, 64)
+        A0 = randn(T, n, n)
+        H = copy(A0); tau = zeros(T, max(n - 1, 0)); PureBLAS.gehrd!(H, 1, n, tau)
+        Q = PureBLAS.orghr!(copy(H), 1, n, tau)
+        @test maxe(Q' * Q, Matrix{T}(I, n, n)) < 500 * eps(real(T))         # Q unitary
+        Hu = triu(H, -1)                                                     # upper Hessenberg part
+        @test maxe(Q * Hu * Q', A0) < 500 * eps(real(T))                    # Q·H·Qᴴ = A
     end
 end
