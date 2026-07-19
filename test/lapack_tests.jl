@@ -212,3 +212,65 @@ end
         @test maxe(Sv, sref) / maximum(sref) < 1e-11
     end
 end
+
+@testitem "syev (symmetric eigen) vs LAPACK — eigenvalues + residual + orthonormality, both uplo + stress" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(21)
+    # ‖A·V − V·Diag(w)‖ / (‖A‖·n·eps) and ‖V'V − I‖ / (n·eps): sidesteps eigenvector non-uniqueness.
+    function checkpair(Afull, w, Z)
+        n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, 1.0) * n * eps()
+        resid = opnorm(Afull * Z - Z * Diagonal(w)) / sc
+        orth  = opnorm(Z' * Z - I) / (n * eps())
+        return resid, orth
+    end
+    @testset "$(uplo) n=$n" for n in (4, 16, 64, 128), uplo in ('L', 'U')
+        A0 = randn(n, n); A0 = A0 + A0'
+        S = Symmetric(A0, Symbol(uplo))
+        Afull = Matrix(S)
+        wref = eigvals(S)
+        # jobz='V' — eigenvalues + vectors
+        w, Z, info = PureBLAS._syev!('V', uplo, copy(Afull))
+        @test info == 0
+        @test maximum(abs, w .- wref) / max(1.0, maximum(abs, wref)) < 1e-12   # eigenvalues match LAPACK
+        @test issorted(w)                                                       # ascending
+        resid, orth = checkpair(Afull, w, Z)
+        @test resid < 32                                                        # residual ≲ 32·n·eps·‖A‖
+        @test orth < 32                                                         # orthonormality ≲ 32·n·eps
+        # jobz='N' — eigenvalues only (same values)
+        wN, _, iN = PureBLAS._syev!('N', uplo, copy(Afull))
+        @test iN == 0
+        @test maximum(abs, wN .- wref) / max(1.0, maximum(abs, wref)) < 1e-12
+    end
+    @testset "stress: eps-clustered spectrum" begin
+        n = 60
+        Q = Matrix(qr(randn(n, n)).Q)                         # random orthogonal
+        dvals = [1.0 + (k - 1) * eps() for k in 1:n]          # spacings = eps (deflation-tolerance stress)
+        A = Symmetric(Q * Diagonal(dvals) * Q')
+        Afull = Matrix(A)
+        w, Z, info = PureBLAS._syev!('V', 'L', copy(Afull))
+        @test info == 0
+        @test maximum(abs, w .- eigvals(A)) < 1e-12
+        resid, orth = checkpair(Afull, w, Z)
+        @test resid < 64 && orth < 64
+    end
+    @testset "stress: glued Wilkinson W21+" begin
+        # Two glued Wilkinson W21+ blocks: many pathologically-close eigenvalue pairs.
+        m = 21
+        wdiag = Float64[abs(k - (m + 1) ÷ 2) for k in 1:m]    # [10,9,…,1,0,1,…,9,10]
+        n = 2m
+        d = vcat(wdiag, wdiag)
+        A = zeros(n, n)
+        for i in 1:n; A[i, i] = d[i]; end
+        for i in 1:n-1
+            i == m && continue                                # weak glue link between the two blocks
+            A[i+1, i] = 1.0; A[i, i+1] = 1.0
+        end
+        A[m+1, m] = 1e-3; A[m, m+1] = 1e-3                    # faint coupling
+        S = Symmetric(A, :L); Afull = Matrix(S)
+        w, Z, info = PureBLAS._syev!('V', 'L', copy(Afull))
+        @test info == 0
+        @test maximum(abs, w .- eigvals(S)) < 1e-10
+        resid, orth = checkpair(Afull, w, Z)
+        @test resid < 128 && orth < 128
+    end
+end

@@ -244,6 +244,100 @@ Base.@ccallable function dgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int6
     return
 end
 
+# ── syev / syevd / syevr: symmetric eigensolver (real Float64, M-E1) ──────────────────────────────────
+# All three LAPACK drivers share ONE engine (_syev! = sytrd → steqr → ormtr): the driver contract is
+# identical (eigenpairs to O(eps·‖A‖), orthonormal vectors, ascending). Julia's DEFAULT eigen(Symmetric)/
+# eigvals(Symmetric) routes through dsyevr_ (RobustRepresentations); DivideAndConquer→dsyevd_, QRIteration→
+# dsyev_. We compute the FULL spectrum and (for jobz='V') vectors from a COPY of the caller's A (cheap O(n²)
+# vs the O(n³) solve; sidesteps PtrMatrix-view aliasing), then write back per each driver's ABI.
+@inline function _syev_compute(jobz::Char, uplo::Char, N::Int, A::Ptr{Float64}, ld::Int)
+    Aw = Matrix{Float64}(undef, N, N)
+    Am = PtrMatrix(A, N, N, ld)
+    @inbounds for j in 1:N, i in 1:N; Aw[i, j] = Am[i, j]; end   # unused triangle is garbage but unread
+    return _syev!(jobz, uplo, Aw)                                # (w::Vector, Z::Matrix, info::Int)
+end
+
+# dsyev_64_(jobz, uplo, n, A, lda, w, work, lwork, info, len_jobz, len_uplo) — vectors OVERWRITE A.
+Base.@ccallable function dsyev_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{Float64},
+        lda::Ptr{Int64}, w::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64},
+        len_jobz::Clong, len_uplo::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)                 # workspace query
+        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
+    wm = PtrVector(w, N)
+    @inbounds for i in 1:N; wm[i] = wv[i]; end
+    if jz == 'V'
+        Am = PtrMatrix(A, N, N, ld)
+        @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
+    end
+    unsafe_store!(info, Int64(inf)); return
+end
+
+# dsyevd_64_(jobz, uplo, n, A, lda, w, work, lwork, iwork, liwork, info, len_jobz, len_uplo) — vectors
+# OVERWRITE A (same as dsyev); extra Int64 iwork/liwork workspace query args (ignored; PureBLAS owns scratch).
+Base.@ccallable function dsyevd_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{Float64},
+        lda::Ptr{Int64}, w::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64},
+        liwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong, len_uplo::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)                 # workspace query (report both work + iwork sizes)
+        unsafe_store!(work, 1.0); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
+    wm = PtrVector(w, N)
+    @inbounds for i in 1:N; wm[i] = wv[i]; end
+    if jz == 'V'
+        Am = PtrMatrix(A, N, N, ld)
+        @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
+    end
+    unsafe_store!(info, Int64(inf)); return
+end
+
+# dsyevr_64_(jobz, range, uplo, n, A, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work, lwork,
+#            iwork, liwork, info, +3 hidden lens) — vectors into the SEPARATE z buffer. range:
+#   'A' → all (m=N); 'I' → compute all, slice il:iu (m=iu-il+1); 'V' → count in HALF-OPEN (vl,vu] (m=count).
+# isuppz[2i-1]=1, isuppz[2i]=N (dense support). abstol ignored (full accuracy always).
+Base.@ccallable function dsyevr_64_(jobz::Ptr{UInt8}, range::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
+        A::Ptr{Float64}, lda::Ptr{Int64}, vl::Ptr{Float64}, vu::Ptr{Float64}, il::Ptr{Int64},
+        iu::Ptr{Int64}, abstol::Ptr{Float64}, m::Ptr{Int64}, w::Ptr{Float64}, z::Ptr{Float64},
+        ldz::Ptr{Int64}, isuppz::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64},
+        liwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong, len_range::Clong, len_uplo::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)                 # workspace query
+        unsafe_store!(work, 1.0); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
+    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
+    wantz = jz == 'V'
+    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)       # full spectrum (ascending) + vectors if wantz
+    # pick the selected index range (compute-all-then-slice)
+    lo = 1; hi = N
+    if rg == 'I'
+        lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+    elseif rg == 'V'
+        vlo = unsafe_load(vl); vhi = unsafe_load(vu)
+        lo = N + 1; hi = 0                             # empty until we find the half-open (vlo,vhi] band
+        @inbounds for i in 1:N
+            if vlo < wv[i] <= vhi
+                lo = min(lo, i); hi = max(hi, i)
+            end
+        end
+    end
+    M = max(hi - lo + 1, 0)
+    unsafe_store!(m, Int64(M))
+    wm = PtrVector(w, max(M, 0))
+    @inbounds for k in 1:M; wm[k] = wv[lo + k - 1]; end
+    if wantz && M > 0
+        Zm = PtrMatrix(z, N, M, ldzz)
+        @inbounds for k in 1:M, i in 1:N; Zm[i, k] = Z[i, lo + k - 1]; end
+    end
+    ipz = PtrVector(isuppz, 2 * max(M, 0))
+    @inbounds for k in 1:M; ipz[2k - 1] = Int64(1); ipz[2k] = Int64(N); end
+    unsafe_store!(info, Int64(inf)); return
+end
+
 # ── SOLVES on caller-provided factors: trtrs / potrs / getrs (compose trsm! + _laswp!) ────────────────
 # Self-consistent under a mixed backend: they operate on the factors passed in (standard-convention L/U/
 # Cholesky + LAPACK 1-based ipiv), so forwarding them is correct even if the factorization ran on OpenBLAS.

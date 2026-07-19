@@ -26,6 +26,7 @@ include("lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm!
 include("svd_dqds.jl")      # LAPACK: dqds (dlasq1-6) — fast bidiagonal singular VALUES (values-only path)
 include("svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implicit-QR + back-transform
 include("svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal solver (bdsdc, faer port)
+include("eigen.jl")         # LAPACK: symmetric eigensolver (syev) — sytrd + steqr + ormtr (M-E1, real F64)
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
