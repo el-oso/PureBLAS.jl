@@ -301,15 +301,21 @@ const _BRD_NB = 16     # bidiagonalization panel width; measured optimal across 
                        # less BLAS-2 work/panel; the rank-16 trailing gemm stays efficient). ponytail: Zen4.
 const _BT_NB = 32      # back-transform (compact-WY dlarfb) block: larger than gebrd's — its gemms want
                        # bigger T blocks (nb=16 there regressed large-n vectors). Decoupled from _BRD_NB.
-const _SVD_DC_CROSS = 96    # vectors: bdsqr (QR) at/below this n, divide-and-conquer above. Measured boost-
-                            # locked (bench/gesvd_cross.jl, PB/OB, want_vectors): within the bdsqr regime the
-                            # ratio DEGRADES as n grows (n=48 1.42 → n=128 1.04 vs OB's gesdd) — bdsqr's QR-
-                            # iteration loses ground to OB's D&C. bdsqr still wins n≤96 (1.13-1.42 > D&C's
-                            # 1.10-1.22), but D&C wins n≥112 (1.09-1.15 > bdsqr's 1.04). The old 128 kept
-                            # n=112/128 on the degrading bdsqr tail → a visible KINK at n=128 (all 3 boxes
-                            # ~1.0-1.11). Crossing at 96 puts n≥112 on D&C: n=128 1.035→1.146, curve smooth.
-                            # (Algorithm-intrinsic QR-vs-D&C crossover, like LAPACK gesdd's SMLSIZ — not a
-                            # cache-derived block size; fleet-validated single value.)
+const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
+                            # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
+                            # FAILS on near-degenerate singular-value clusters (two σ agreeing to relative spread
+                            # in ~(3e-15,1e-7)) — it either exhausts maxit ("failed to converge", a hard crash on
+                            # any clustered/rank-deficient input — reachable via gelsd/ggsvd, whose inputs have
+                            # clustered/zero σ BY DEFINITION) or, worse, SILENTLY drops the largest σ on graded
+                            # bidiagonals (recon error ~1). The D&C solver (_dc_qr! base) has correct
+                            # Demmel–Kahan-style deflation and is machine-eps on all these inputs (verified n=2..50,
+                            # clustered+graded), so route ALL with-vectors SVD through it. bdsqr! is a simplified
+                            # port; fixing its convergence (proper relative-accuracy tests + direction-dependent
+                            # shift, per reference dbdsqr) restores the perf crossover below — until then, D&C.
+                            # PERF NOTE (pre-fix, boost-locked bench/gesvd_cross.jl): bdsqr won n≤96 (1.13-1.42 vs
+                            # OB gesdd) but that path was numerically UNSOUND; the small-n perf regression from
+                            # using D&C is the correctness-first tradeoff. (Algorithm-intrinsic crossover like
+                            # LAPACK gesdd's SMLSIZ — not a cache-derived block size.)
 
 # ── SVD scratch: one owned workspace per element type (mirrors L3Workspace/workspace.jl) ────────────
 # Every internal SVD buffer — bidiag arrays, gebrd/labrd panels, bidiagonal singular-vector blocks, the
