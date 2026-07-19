@@ -173,16 +173,32 @@ _reg!("sgesvd_", () -> @cfunction(sgesvd_64_, Cvoid,
 _reg!("sgesdd_", () -> @cfunction(sgesdd_64_, Cvoid,
     (_CU, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, Ptr{Float32}, _CI,
      Ptr{Float32}, _CI, Ptr{Float32}, _CI, _CI, _CI, Clong)))
-# Symmetric eigensolver (real Float64, M-E1) — routes eigen(Symmetric)/eigvals(Symmetric). The DEFAULT
-# path is dsyevr_ (RobustRepresentations); DivideAndConquer→dsyevd_, QRIteration→dsyev_. Sigs must match
-# the @ccallable defs in cabi_lapack.jl exactly (2 chars→2 hidden lens for syev/syevd, 3→3 for syevr).
-_reg!("dsyev_", () -> @cfunction(dsyev_64_, Cvoid,
-    (_CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, Clong, Clong)))
-_reg!("dsyevd_", () -> @cfunction(dsyevd_64_, Cvoid,
-    (_CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, _CI, _CI, Clong, Clong)))
-_reg!("dsyevr_", () -> @cfunction(dsyevr_64_, Cvoid,
-    (_CU, _CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, Ptr{Float64}, _CI,
-     Ptr{Float64}, Ptr{Float64}, _CI, _CI, Ptr{Float64}, _CI, _CI, _CI, _CI, Clong, Clong, Clong)))
+# Symmetric/Hermitian eigensolver — routes eigen(Symmetric/Hermitian)/eigvals(...). The DEFAULT path is
+# syevr_/heevr_ (RobustRepresentations); DivideAndConquer→syevd_/heevd_, QRIteration→syev_/heev_. Sigs
+# must match the @ccallable defs in cabi_lapack.jl exactly (real: 2→2 lens syev/syevd, 3→3 syevr; complex
+# adds the rwork block — heev/heevd 2 lens, heevr 3 lens). Float32 real is NATIVE; ComplexF32 (c) is mixed.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        _reg!($(p * "syev_"), () -> @cfunction($(Symbol(p, "syev_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong, Clong)))
+        _reg!($(p * "syevd_"), () -> @cfunction($(Symbol(p, "syevd_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, _CI, _CI, Clong, Clong)))
+        _reg!($(p * "syevr_"), () -> @cfunction($(Symbol(p, "syevr_64_")), Cvoid,
+            (_CU, _CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI,
+             Ptr{$T}, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI, _CI, _CI, Clong, Clong, Clong)))
+    end
+end
+for (p, Tc, Tr) in (("z", ComplexF64, Float64), ("c", ComplexF32, Float32))
+    @eval begin
+        _reg!($(p * "heev_"), () -> @cfunction($(Symbol(p, "heev_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$Tc}, _CI, Ptr{$Tr}, Ptr{$Tc}, _CI, Ptr{$Tr}, _CI, Clong, Clong)))
+        _reg!($(p * "heevd_"), () -> @cfunction($(Symbol(p, "heevd_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$Tc}, _CI, Ptr{$Tr}, Ptr{$Tc}, _CI, Ptr{$Tr}, _CI, _CI, _CI, _CI, Clong, Clong)))
+        _reg!($(p * "heevr_"), () -> @cfunction($(Symbol(p, "heevr_64_")), Cvoid,
+            (_CU, _CU, _CU, _CI, Ptr{$Tc}, _CI, Ptr{$Tr}, Ptr{$Tr}, _CI, _CI, Ptr{$Tr}, _CI,
+             Ptr{$Tr}, Ptr{$Tc}, _CI, _CI, Ptr{$Tc}, _CI, Ptr{$Tr}, _CI, _CI, _CI, _CI, Clong, Clong, Clong)))
+    end
+end
 # Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval begin

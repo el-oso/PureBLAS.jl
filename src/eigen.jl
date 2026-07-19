@@ -10,23 +10,23 @@
 # One Householder reflector per column; essential vᵢ stored in A[i+2:n, i] (vᵢ[1]≡1 implicit at row i+1),
 # tau[i] the standard LAPACK τ. The trailing symmetric matvec is PureBLAS symv! (the memory-bound half of
 # the 4/3·n³ flops). Copies dsytd2's τ/2 half-correction verbatim (w += (−τ/2·(wᵀv))·v).
-function _sytd2_lower!(A::AbstractMatrix{Float64}, d::AbstractVector{Float64},
-        e::AbstractVector{Float64}, tau::AbstractVector{Float64})
+function _sytd2_lower!(A::AbstractMatrix{T}, d::AbstractVector{T},
+        e::AbstractVector{T}, tau::AbstractVector{T}) where {T<:Real}
     n = size(A, 1)
     n == 0 && return
-    v = Vector{Float64}(undef, n)
-    w = Vector{Float64}(undef, n)
+    v = Vector{T}(undef, n)
+    w = Vector{T}(undef, n)
     @inbounds for i in 1:n-1
         m = n - i
         col = view(A, i+1:n, i)
         β, τ = _larfg!(col)                       # essential v now in A[i+2:n,i]; col[1]=A[i+1,i] left as-is
         e[i] = β; tau[i] = τ; d[i] = A[i, i]
-        if τ != 0.0 && m > 1
-            v[1] = 1.0
+        if τ != zero(T) && m > 1
+            v[1] = one(T)
             for r in 2:m; v[r] = A[i+r, i]; end
             Atr = view(A, i+1:n, i+1:n); vv = view(v, 1:m); ww = view(w, 1:m)
-            symv!(ww, Atr, vv; uplo = 'L', alpha = τ, beta = 0.0)   # w = τ·A_trailing·v (lower symmetric)
-            s = 0.0
+            symv!(ww, Atr, vv; uplo = 'L', alpha = τ, beta = zero(T))   # w = τ·A_trailing·v (lower symmetric)
+            s = zero(T)
             for r in 1:m; s = muladd(ww[r], vv[r], s); end
             c = -(τ / 2) * s                       # dsytd2 half-correction
             for r in 1:m; ww[r] = muladd(c, vv[r], ww[r]); end
@@ -315,18 +315,18 @@ end
 # (v_i[1]≡1 at row i+1); tau[i] standard LAPACK τ. side='L' real Float64 (steqr back-transform is L/N).
 #   trans='N':  C := Q·C  = H_1·(⋯·(H_{n-2}·C))   → apply i = n-2 … 1  (decreasing)
 #   trans='T':  C := Qᵀ·C = H_{n-2}·(⋯·(H_1·C))   → apply i = 1 … n-2  (increasing)
-function _ormtr!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64},
-        C::AbstractMatrix{Float64}; side::Char = 'L', trans::Char = 'N')
+function _ormtr!(A::AbstractMatrix{T}, tau::AbstractVector{T},
+        C::AbstractMatrix{T}; side::Char = 'L', trans::Char = 'N') where {T<:Real}
     side === 'L' || throw(ArgumentError("_ormtr!: only side='L' implemented"))
     trans === 'N' || trans === 'T' || throw(ArgumentError("_ormtr!: trans must be 'N' or 'T'"))
     n = size(A, 1)
     n <= 2 && return C                       # no reflectors (H_1..H_{n-2})
-    v = Vector{Float64}(undef, n)
+    v = Vector{T}(undef, n)
     order = trans === 'N' ? ((n-2):-1:1) : (1:(n-2))
     @inbounds for i in order
         m = n - i                            # length of v_i (rows i+1:n)
         τ = tau[i]
-        v[1] = 1.0
+        v[1] = one(T)
         for r in 2:m
             v[r] = A[i+r, i]                 # essential part = A[i+2:n, i]
         end
@@ -335,14 +335,286 @@ function _ormtr!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64},
     return C
 end
 
+# ── Complex Hermitian tridiagonalization (LAPACK zhetd2, LOWER) — Hermitian analogue of _sytd2_lower! ─
+# Reduces the lower triangle of Hermitian A to real tridiagonal T = QᴴAQ: d=diagonal (real), e=subdiag
+# (real — β from complex _larfg! is real by the zlarfg phase convention), tau=complex reflectors.
+# Essential v_i in A[i+2:n,i] (v_i[1]≡1 implicit); trailing matvec is hemv! (Hermitian). Half-correction
+# uses the CONJUGATE dot wᴴv. Trailing downdate A -= v·wᴴ + w·vᴴ (her2), diagonal re-realified.
+# The m==1 (last column) trailing downdate is an EXACT no-op (|τ|²=2Re(τ) by unitarity) — skipped like
+# the real code; tau[n-1] itself is NOT dropped (it is generically nonzero and used by _unmtr!).
+function _hetrd!(A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R},
+        tau::AbstractVector{T}) where {T<:Complex, R<:Real}
+    n = size(A, 1)
+    n == 0 && return
+    v = Vector{T}(undef, n)
+    w = Vector{T}(undef, n)
+    @inbounds for i in 1:n-1
+        m = n - i
+        col = view(A, i+1:n, i)
+        β, τ = _larfg!(col)                       # β real (zlarfg phase convention), τ complex
+        e[i] = β; tau[i] = τ; d[i] = real(A[i, i])
+        if τ != zero(T) && m > 1
+            v[1] = one(T)
+            for r in 2:m; v[r] = A[i+r, i]; end
+            Atr = view(A, i+1:n, i+1:n); vv = view(v, 1:m); ww = view(w, 1:m)
+            hemv!(ww, Atr, vv; uplo = 'L', alpha = τ, beta = zero(T))   # w = τ·Atr·v (Hermitian)
+            s = zero(T)
+            for r in 1:m; s += conj(ww[r]) * vv[r]; end                # wᴴv
+            α = -(τ / 2) * s
+            for r in 1:m; ww[r] = muladd(α, vv[r], ww[r]); end
+            for jc in 1:m, ir in jc:m                                  # Hermitian rank-2 downdate (lower)
+                upd = vv[ir] * conj(ww[jc]) + ww[ir] * conj(vv[jc])
+                if ir == jc
+                    Atr[ir, jc] = Complex(real(Atr[ir, jc] - upd), zero(R))  # re-realify diagonal
+                else
+                    Atr[ir, jc] -= upd
+                end
+            end
+        end
+    end
+    d[n] = real(A[n, n])
+    return
+end
+
+# ── Apply Q from _hetrd! (LAPACK zunmtr, side='L', LOWER) to C ────────────────────────────────────────
+# Q = H_1·H_2·⋯·H_{n-1}, H_i = I − τ_i·v_i·v_iᴴ acts on rows i+1:n.  *** Uses ALL n-1 reflectors ***
+# — unlike REAL _ormtr! (which safely skips i=n-1 because real _larfg! HARDCODES τ=0 for a length-1
+# vector). Complex _larfg! has no such hardcode: tau[n-1] is GENERICALLY nonzero for Hermitian data and
+# its reflector is NOT a no-op on other columns of C. Dropping it gives O(1) reconstruction error.
+#   trans='N':  C := Q·C  = H_1·(⋯·(H_{n-1}·C))    → apply i = n-1 … 1  (decreasing)
+#   trans='C':  C := Qᴴ·C = H_{n-1}ᴴ·(⋯·(H_1ᴴ·C))  → apply i = 1 … n-1  (increasing), τ → conj(τ)
+function _unmtr!(A::AbstractMatrix{T}, tau::AbstractVector{T},
+        C::AbstractMatrix{T}; side::Char = 'L', trans::Char = 'N') where {T<:Complex}
+    side === 'L' || throw(ArgumentError("_unmtr!: only side='L' implemented"))
+    trans === 'N' || trans === 'C' || throw(ArgumentError("_unmtr!: trans must be 'N' or 'C'"))
+    n = size(A, 1)
+    n <= 1 && return C                        # no reflectors (H_1..H_{n-1} needs n≥2)
+    v = Vector{T}(undef, n)
+    order = trans === 'N' ? ((n-1):-1:1) : (1:(n-1))
+    @inbounds for i in order
+        m = n - i                             # length of v_i (rows i+1:n)
+        τ = trans === 'N' ? tau[i] : conj(tau[i])
+        v[1] = one(T)
+        for r in 2:m
+            v[r] = A[i+r, i]                  # essential part = A[i+2:n, i]
+        end
+        _house_left!(view(C, (i+1):n, :), view(v, 1:m), τ)
+    end
+    return C
+end
+
+# ── Values-only tridiagonal eigensolver (LAPACK dsterf) — O(n²) root-free PWK QL/QR, no vectors ───────
+# jobz='N' fast path for _syev!/_heev!. d (diag) → eigenvalues ascending in place; e (subdiag) destroyed.
+# Returns info (0 = converged; >0 = # off-diagonals that failed to deflate within 30n iterations).
+@inline function _sterf_lae2(a::T, b::T, c::T) where {T<:Real}
+    sm = a + c; df = a - c; adf = abs(df); tb = b + b; ab = abs(tb)
+    acmx = abs(a) > abs(c) ? a : c; acmn = abs(a) > abs(c) ? c : a
+    rt = if adf > ab
+        adf * sqrt(one(T) + (ab / adf)^2)
+    elseif adf < ab
+        ab * sqrt(one(T) + (adf / ab)^2)
+    else
+        ab * sqrt(T(2))
+    end
+    if sm < zero(T)
+        rt1 = (sm - rt) / 2
+        rt2 = (acmx / rt1) * acmn - (b / rt1) * b
+    elseif sm > zero(T)
+        rt1 = (sm + rt) / 2
+        rt2 = (acmx / rt1) * acmn - (b / rt1) * b
+    else
+        rt1 = rt / 2; rt2 = -rt / 2
+    end
+    return rt1, rt2
+end
+
+function _sterf!(d::AbstractVector{T}, e::AbstractVector{T}) where {T<:Real}
+    n = length(d)
+    n <= 1 && return 0
+    @assert length(e) >= n - 1 "_sterf!: e must have length >= n-1"
+
+    eps_  = eps(T) / 2                     # dlamch('E'): unit roundoff (½ ulp)
+    eps2  = eps_ * eps_
+    safmin = floatmin(T)
+    safmax = one(T) / safmin
+    ssfmax = sqrt(safmax) / 3
+    ssfmin = sqrt(safmin) / eps2
+    MAXIT = 30
+    nmaxit = n * MAXIT
+    jtot = 0
+    nm1 = n - 1
+
+    l1 = 1
+    @inbounds while true
+        l1 > n && break
+        l1 > 1 && (e[l1 - 1] = zero(T))
+
+        # ------ find the next unreduced block [l:lend] via the split criterion --------------
+        m = n
+        if l1 <= nm1
+            for mm in l1:nm1
+                if abs(e[mm]) <= sqrt(abs(d[mm])) * sqrt(abs(d[mm + 1])) * eps_
+                    e[mm] = zero(T); m = mm; break
+                end
+            end
+        end
+        l = l1; lsv = l; lend = m; lendsv = lend; l1 = m + 1
+        lend == l && continue                          # 1x1 block: already an eigenvalue
+
+        # ------ scale the block into [ssfmin, ssfmax] ---------------------------------------
+        anorm = abs(d[lend])
+        for i in l:lend-1
+            anorm = max(anorm, abs(d[i]), abs(e[i]))
+        end
+        anorm == zero(T) && continue
+        iscale = 0
+        if anorm > ssfmax
+            iscale = 1; f = ssfmax / anorm
+            for i in l:lend; d[i] *= f; end
+            for i in l:lend-1; e[i] *= f; end
+        elseif anorm < ssfmin
+            iscale = 2; f = ssfmin / anorm
+            for i in l:lend; d[i] *= f; end
+            for i in l:lend-1; e[i] *= f; end
+        end
+        for i in l:lend-1; e[i] = e[i] * e[i]; end     # work in squared off-diagonals (root-free)
+
+        # ------ pick QL (bottom-up) or QR (top-down): iterate toward the smaller-|d| end ----
+        if abs(d[lend]) < abs(d[l])
+            lend = lsv; l = lendsv
+        end
+
+        converged = true
+        if lend >= l
+            # =================== QL iteration (root-free PWK recurrence) ====================
+            while true
+                m = lend
+                if l != lend
+                    for mm in l:lend-1
+                        if abs(e[mm]) <= eps2 * abs(d[mm] * d[mm + 1])
+                            m = mm; break
+                        end
+                    end
+                end
+                m < lend && (e[m] = zero(T))
+                p = d[l]
+                if m == l
+                    d[l] = p; l += 1
+                    (l <= lend) ? continue : break
+                end
+                if m == l + 1
+                    rte = sqrt(e[l])
+                    rt1, rt2 = _sterf_lae2(d[l], rte, d[l + 1])
+                    d[l] = rt1; d[l + 1] = rt2; e[l] = zero(T)
+                    l += 2
+                    (l <= lend) ? continue : break
+                end
+                if jtot == nmaxit
+                    converged = false; break
+                end
+                jtot += 1
+                rte = sqrt(e[l])
+                sigma = (d[l + 1] - p) / (2 * rte)
+                r = hypot(sigma, one(T))
+                sigma = p - rte / (sigma + copysign(r, sigma))
+                c = one(T); s = zero(T)
+                gamma = d[m] - sigma
+                pp = gamma * gamma
+                for i in (m - 1):-1:l
+                    bb = e[i]
+                    rr = pp + bb
+                    i != m - 1 && (e[i + 1] = s * rr)
+                    oldc = c
+                    c = pp / rr; s = bb / rr
+                    oldgam = gamma
+                    alpha = d[i]
+                    gamma = c * (alpha - sigma) - s * oldgam
+                    d[i + 1] = oldgam + (alpha - gamma)
+                    pp = c != zero(T) ? (gamma * gamma) / c : oldc * bb
+                end
+                e[l] = s * pp
+                d[l] = sigma + gamma
+            end
+        else
+            # =================== QR iteration (root-free PWK recurrence) ====================
+            while true
+                m = lend
+                for mm in l:-1:lend+1
+                    if abs(e[mm - 1]) <= eps2 * abs(d[mm] * d[mm - 1])
+                        m = mm; break
+                    end
+                end
+                m > lend && (e[m - 1] = zero(T))
+                p = d[l]
+                if m == l
+                    d[l] = p; l -= 1
+                    (l >= lend) ? continue : break
+                end
+                if m == l - 1
+                    rte = sqrt(e[l - 1])
+                    rt1, rt2 = _sterf_lae2(d[l], rte, d[l - 1])
+                    d[l] = rt1; d[l - 1] = rt2; e[l - 1] = zero(T)
+                    l -= 2
+                    (l >= lend) ? continue : break
+                end
+                if jtot == nmaxit
+                    converged = false; break
+                end
+                jtot += 1
+                rte = sqrt(e[l - 1])
+                sigma = (d[l - 1] - p) / (2 * rte)
+                r = hypot(sigma, one(T))
+                sigma = p - rte / (sigma + copysign(r, sigma))
+                c = one(T); s = zero(T)
+                gamma = d[m] - sigma
+                pp = gamma * gamma
+                for i in m:(l - 1)
+                    bb = e[i]
+                    rr = pp + bb
+                    i != m && (e[i - 1] = s * rr)
+                    oldc = c
+                    c = pp / rr; s = bb / rr
+                    oldgam = gamma
+                    alpha = d[i + 1]
+                    gamma = c * (alpha - sigma) - s * oldgam
+                    d[i] = oldgam + (alpha - gamma)
+                    pp = c != zero(T) ? (gamma * gamma) / c : oldc * bb
+                end
+                e[l - 1] = s * pp
+                d[l] = sigma + gamma
+            end
+        end
+
+        # ------ undo scaling for this block --------------------------------------------------
+        if iscale == 1
+            f = anorm / ssfmax
+            for i in lsv:lendsv; d[i] *= f; end
+        elseif iscale == 2
+            f = anorm / ssfmin
+            for i in lsv:lendsv; d[i] *= f; end
+        end
+
+        if !converged
+            info = 0
+            for i in 1:nm1
+                e[i] != zero(T) && (info += 1)
+            end
+            return info
+        end
+    end
+
+    sort!(view(d, 1:n))
+    return 0
+end
+
 # ── Engine: _syev!(jobz, uplo, A) → (w, Z, info). REAL Float64 symmetric eigensolver. ──────────────
 # jobz='V' returns eigenvectors in Z (columns, ascending eigenvalue order); 'N' returns empty Z.
 # A is destroyed (reduction workspace). uplo='U' is handled by mirroring the upper triangle into the
 # lower and running the LOWER path (A symmetric ⇒ A_L[i,j]=A[j,i], i>j). anrm pre-scaling per dsyev.
-function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{Float64})
+function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T<:Real}
     n = size(A, 1)
     if n == 0
-        return Float64[], Matrix{Float64}(undef, 0, 0), 0
+        return T[], Matrix{T}(undef, 0, 0), 0
     end
     wantz = jobz == 'V'
     if uplo == 'U'                                    # mirror upper → lower, then run the LOWER path
@@ -352,40 +624,99 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{Float64})
     end
 
     # anrm pre-scaling (dsyev): pull |A| into [rmin, rmax] for denormal/huge-norm safety; unscale w after.
-    anrm = 0.0
+    anrm = zero(T)
     @inbounds for j in 1:n, i in j:n
         anrm = max(anrm, abs(A[i, j]))                # max abs of the lower triangle
     end
-    rmin = sqrt(floatmin(Float64)) / eps(Float64)     # algorithm constants (req8-ok: LAPACK dsyev scaling band)
-    rmax = 1.0 / rmin
-    sigma = 1.0
-    if anrm > 0.0 && anrm < rmin
+    rmin = sqrt(floatmin(T)) / eps(T)                 # algorithm constants (req8-ok: LAPACK dsyev scaling band)
+    rmax = one(T) / rmin
+    sigma = one(T)
+    if anrm > zero(T) && anrm < rmin
         sigma = rmin / anrm
     elseif anrm > rmax
         sigma = rmax / anrm
     end
-    if sigma != 1.0
+    if sigma != one(T)
         @inbounds for j in 1:n, i in j:n; A[i, j] *= sigma; end
     end
 
-    d = Vector{Float64}(undef, n)
-    e = Vector{Float64}(undef, max(n - 1, 1))
-    tau = Vector{Float64}(undef, max(n - 1, 1))
+    d = Vector{T}(undef, n)
+    e = Vector{T}(undef, max(n - 1, 1))
+    tau = Vector{T}(undef, max(n - 1, 1))
     _sytd2_lower!(A, d, e, tau)
 
+    info = 0
     if wantz
-        Z = zeros(Float64, n, n)                      # identity start (steqr compz='I' also fills it, but n==1 skips)
-        @inbounds for i in 1:n; Z[i, i] = 1.0; end
-        _steqr!('I', d, e, Z)                         # eigenvectors of T (ascending), Z columns permuted
-        _ormtr!(A, tau, Z; side = 'L', trans = 'N')   # V = Q·Z_T = eigenvectors of A (already ordered)
+        Z = zeros(T, n, n)                            # identity start (stedc base fills it too, but n==1 skips)
+        @inbounds for i in 1:n; Z[i, i] = one(T); end
+        _stedc!(d, e, Z)                              # divide-and-conquer eigenvectors of T (ascending)
+        _ormtr!(A, tau, Z; side = 'L', trans = 'N')  # V = Q·Z_T = eigenvectors of A (already ordered)
     else
-        Z = Matrix{Float64}(undef, 0, 0)
-        _steqr!('N', d, e, nothing)
+        Z = Matrix{T}(undef, 0, 0)
+        info = _sterf!(d, e)                          # O(n²) values-only (dsterf); info>0 = non-convergence
     end
 
-    if sigma != 1.0                                   # unscale eigenvalues
-        invσ = 1.0 / sigma
+    if sigma != one(T)                                # unscale eigenvalues
+        invσ = one(T) / sigma
         @inbounds for i in 1:n; d[i] *= invσ; end
     end
-    return d, Z, 0
+    return d, Z, info
+end
+
+# ── Engine: _heev!(jobz, uplo, A) → (w, Z, info). COMPLEX Hermitian eigensolver (native). ──────────────
+# Mirrors _syev! but Hermitian: _hetrd! (real d,e; complex tau) → REAL _stedc!/_sterf! on the tridiagonal
+# → back-transform. Eigenvectors: real Z from _stedc! is embedded into a complex matrix, then rotated by
+# Q via _unmtr! (ALL n-1 reflectors). anrm pre-scaling on the complex magnitudes (unscale w after).
+function _heev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T<:Complex}
+    R = real(T)
+    n = size(A, 1)
+    if n == 0
+        return R[], Matrix{T}(undef, 0, 0), 0
+    end
+    wantz = jobz == 'V'
+    if uplo == 'U'                                    # mirror upper → lower (Hermitian: A_L[i,j]=conj(A[j,i]))
+        @inbounds for j in 1:n, i in j+1:n
+            A[i, j] = conj(A[j, i])
+        end
+    end
+
+    anrm = zero(R)
+    @inbounds for j in 1:n, i in j:n
+        anrm = max(anrm, abs(A[i, j]))                # max magnitude of the lower triangle
+    end
+    rmin = sqrt(floatmin(R)) / eps(R)
+    rmax = one(R) / rmin
+    sigma = one(R)
+    if anrm > zero(R) && anrm < rmin
+        sigma = rmin / anrm
+    elseif anrm > rmax
+        sigma = rmax / anrm
+    end
+    if sigma != one(R)
+        @inbounds for j in 1:n, i in j:n; A[i, j] *= sigma; end
+    end
+
+    d = Vector{R}(undef, n)
+    e = Vector{R}(undef, max(n - 1, 1))
+    tau = Vector{T}(undef, max(n - 1, 1))
+    _hetrd!(A, d, e, tau)
+
+    info = 0
+    if wantz
+        Zr = zeros(R, n, n)                           # real eigenvectors of the tridiagonal T
+        @inbounds for i in 1:n; Zr[i, i] = one(R); end
+        _stedc!(d, e, Zr)
+        Z = Matrix{T}(undef, n, n)
+        @inbounds for j in 1:n, i in 1:n; Z[i, j] = T(Zr[i, j]); end
+        _unmtr!(A, tau, Z; side = 'L', trans = 'N')  # V = Q·Z_T = eigenvectors of A (already ordered)
+    else
+        Z = Matrix{T}(undef, 0, 0)
+        info = _sterf!(d, e)                          # info>0 = non-convergence
+    end
+
+    if sigma != one(R)                                # unscale eigenvalues
+        invσ = one(R) / sigma
+        @inbounds for i in 1:n; d[i] *= invσ; end
+    end
+    return d, Z, info
 end

@@ -274,3 +274,77 @@ end
         @test resid < 128 && orth < 128
     end
 end
+
+@testitem "syev Float32 (native) vs LAPACK — eigenvalues + residual + orthonormality, both uplo" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(31)
+    function checkpair(Afull, w, Z, R)
+        n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, one(R)) * n * eps(R)
+        resid = opnorm(Afull * Z - Z * Diagonal(w)) / sc
+        orth  = opnorm(Z' * Z - I) / (n * eps(R))
+        return resid, orth
+    end
+    @testset "$(uplo) n=$n" for n in (4, 17, 64, 128), uplo in ('L', 'U')
+        A0 = randn(Float32, n, n); A0 = A0 + A0'
+        S = Symmetric(A0, Symbol(uplo)); Afull = Matrix(S)
+        wref = eigvals(Symmetric(Float64.(Afull)))                     # F64 LAPACK reference
+        w, Z, info = PureBLAS._syev!('V', uplo, copy(Afull))
+        @test info == 0
+        @test eltype(w) === Float32 && eltype(Z) === Float32
+        @test issorted(w)
+        @test maximum(abs, Float64.(w) .- wref) / max(1.0, maximum(abs, wref)) < 1e-4
+        resid, orth = checkpair(Afull, w, Z, Float32)
+        @test resid < 64 && orth < 64
+        wN, _, iN = PureBLAS._syev!('N', uplo, copy(Afull))            # values-only (sterf)
+        @test iN == 0
+        @test maximum(abs, Float64.(wN) .- wref) / max(1.0, maximum(abs, wref)) < 1e-4
+    end
+end
+
+@testitem "heev (Hermitian eigen) vs LAPACK — ComplexF64/F32, residual + orthonormality, both uplo" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(32)
+    # _heev! is generic: on ComplexF32 it computes natively (Float32 eigenvalues, ComplexF32 vectors) —
+    # the mixed-precision promotion is only in the C-ABI cheev shim, not the engine. Check at native eps(R).
+    function checkpair(Afull, w, Z, R)
+        n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, one(R)) * n * eps(R)
+        resid = opnorm(Afull * Z - Z * Diagonal(complex(w))) / sc
+        orth  = opnorm(Z' * Z - I) / (n * eps(R))
+        return resid, orth
+    end
+    @testset "$T $(uplo) n=$n" for T in (ComplexF64, ComplexF32),
+        n in (2, 4, 16, 64, 128), uplo in ('L', 'U')
+
+        B0 = randn(T, n, n); A0 = B0 + B0'
+        S = Hermitian(A0, Symbol(uplo)); Afull = Matrix(S)
+        R = real(T)
+        wref = eigvals(Hermitian(ComplexF64.(Afull)))                 # F64 LAPACK reference
+        w, Z, info = PureBLAS._heev!('V', uplo, copy(Afull))
+        @test info == 0
+        @test eltype(w) === R && eltype(Z) === T                       # native element type
+        @test issorted(w)
+        vtol = R === Float64 ? 1e-11 : 1e-4
+        @test maximum(abs, Float64.(w) .- wref) / max(1.0, maximum(abs, wref)) < vtol
+        resid, orth = checkpair(Afull, w, Z, R)
+        @test resid < 64 && orth < 64
+        wN, _, iN = PureBLAS._heev!('N', uplo, copy(Afull))           # values-only (sterf)
+        @test iN == 0
+        @test maximum(abs, Float64.(wN) .- wref) / max(1.0, maximum(abs, wref)) < vtol
+    end
+end
+
+@testitem "sterf (tridiagonal eigenvalues, values-only) vs LAPACK" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(33)
+    @testset "$T n=$n" for T in (Float64, Float32), n in (1, 2, 10, 31, 128, 257)
+        A = randn(T, n, n); A = A + A'
+        d = Vector{T}(undef, n); e = Vector{T}(undef, max(n - 1, 1)); tau = Vector{T}(undef, max(n - 1, 1))
+        PureBLAS._sytd2_lower!(copy(Symmetric(A, :L) |> Matrix), d, e, tau)   # tridiagonalize
+        info = PureBLAS._sterf!(d, e)
+        @test info == 0
+        @test issorted(d)
+        wref = eigvals(Symmetric(Float64.(A)))
+        tol = T === Float64 ? 1e-11 : 1e-4
+        @test maximum(abs, Float64.(d) .- wref) / max(1.0, maximum(abs, wref)) < tol
+    end
+end
