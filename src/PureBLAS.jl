@@ -36,4 +36,38 @@ include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
 include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
+# ── Precompile workload ────────────────────────────────────────────────────────────────────────────
+# Run the hot native kernels once at precompile time so their inferred+native code is cached in the .ji
+# — cuts first-call JIT latency for both direct callers and the test suite (StrictMode/correctness items
+# were ~95% compile). Precompile-time only (guarded by jl_generating_output); NOT reachable from the
+# @ccallable roots, so juliac --trim excludes it (verified: the .so still builds). Small n keeps the
+# workload cheap; covers L1/L2/L3 + Cholesky/LU/QR + symmetric/Hermitian eigen across d/f/z.
+using PrecompileTools: @setup_workload, @compile_workload
+@setup_workload begin
+    n = 8
+    @compile_workload begin
+        for T in (Float64, Float32, ComplexF64)
+            x = ones(T, n); y = fill(T(2), n)
+            axpy!(copy(y), one(T), x); dot(x, y); dotu(x, y); nrm2(x)
+            A = reshape(collect(T, 1:n * n), n, n) ./ T(n)
+            gemv(A, x); gemv(A, x; trans = 'T')
+            C = zeros(T, n, n)
+            gemm!(C, A, A; alpha = one(T), beta = zero(T))
+            gemm!(copy(C), A, A; alpha = one(T), beta = one(T), transA = 'T', transB = 'N')
+        end
+        for T in (Float64, ComplexF64)
+            A = reshape(collect(T, 1:n * n), n, n) ./ T(n)
+            S = A * A'; @inbounds for i in 1:n; S[i, i] += T(n); end   # Hermitian PD
+            potrf!(copy(S); uplo = 'L')
+            G = copy(A); @inbounds for i in 1:n; G[i, i] += T(n); end  # nonsingular
+            getrf!(G)
+            tau = zeros(T, n); geqrf!(copy(A), tau)
+        end
+        As = reshape(collect(Float64, 1:n * n), n, n); As = As .+ As'
+        _syev!('V', 'L', copy(As))
+        Ah = reshape(collect(ComplexF64, 1:n * n), n, n); Ah = Ah .+ Ah'
+        _heev!('V', 'L', copy(Ah))
+    end
+end
+
 end # module

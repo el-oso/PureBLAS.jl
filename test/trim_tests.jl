@@ -8,7 +8,7 @@
 # @generated kernel with default args → trampoline methods juliac verifies but @validate does not). The
 # authoritative check is the actual build in juliac_build_test.jl (gated). Keep this as the quick net.
 
-@testitem "TrimCheck trim-safety (C-ABI entry points)" begin
+@testitem "TrimCheck trim-safety (C-ABI entry points)" tags = [:checks] begin
     using TrimCheck
     @validate(
         init = begin
