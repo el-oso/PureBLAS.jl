@@ -57,19 +57,97 @@ end
 
 # ── geqrf: QR (Householder, no pivoting) ────────────────────────────────────────────────────────────
 # `dgeqrf_64_(m, n, A, lda, tau, work, lwork, info)` — 0 chars. Honors the lwork==-1 query.
-# IMPORTANT: PureBLAS's τ uses the faer convention H = I − v·vᵀ/τ (τ = 1/τ_LAPACK); this native convention
-# is what the symbol returns, so a caller using PureBLAS-as-LAPACK gets PureBLAS's τ (NOT reference τ).
+# PureBLAS's geqrf! stores the SAME reflector vectors v as reference LAPACK, but τ in the faer convention
+# (τ_stored = 1/τ_LAPACK). We CONVERT τ back to the LAPACK convention at the C-ABI boundary so this symbol
+# is a true drop-in (faer never crosses the ABI): a caller feeding this τ to reference/OpenBLAS orgqr/ormqr
+# now gets a correct Q. (Complex zgeqrf! already returns LAPACK-convention τ — no conversion there.)
 Base.@ccallable function dgeqrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
         tau::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
     if unsafe_load(lwork) == Int64(-1)                 # workspace query: report size 1, do nothing else
         unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
     end
-    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); k = min(M, N)
     Av = PtrMatrix(A, M, N, ld)
-    tv = PtrVector(tau, min(M, N))
+    tv = PtrVector(tau, k)
     geqrf!(Av, tv)
+    @inbounds for i in 1:k                             # faer τ_stored=1/τ_LAPACK → LAPACK (trivial: Inf→0)
+        t = tv[i]; tv[i] = (isfinite(t) && t != 0.0) ? 1.0 / t : 0.0
+    end
     unsafe_store!(info, Int64(0))
     return
+end
+
+# ── geqrt / gemqrt: compact-WY QR — routes LinearAlgebra.qr() (QRCompactWY) to PureBLAS ────────────────
+# Julia's qr(A) calls geqrt!; Q ops (Matrix(Q), Q*B, Q'*B, A*Q, qr(A)\b's Qᵀb) all go through gemqrt!.
+# We compose PureBLAS's geqrf! (V + faer τ) + τ→LAPACK inversion + wy_t! (dlarft) for geqrt, and wy_apply!
+# / a right-side mirror (dlarfb) for gemqrt. The T factor is built on the CALLER's nb grid in LAPACK-exact
+# layout (T[1:ib, i:i+ib-1] per block) — det(Q::QRCompactWYQ) reads T's block-diagonal. Real Float64 only:
+# no Float32 QR kernel, and complex needs a VᴴV (not VᵀV) T-build — a separate wrapper.
+
+# Build the explicit unit-lower-trapezoidal reflector panel for block [i, i+ib) into dest[1:mp,1:ib].
+@inline function _qr_vpanel!(dest::AbstractMatrix{Float64}, Vsrc::AbstractMatrix{Float64}, i::Int, ib::Int, mp::Int)
+    @inbounds for c in 1:ib, r in 1:mp
+        dest[r, c] = r == c ? 1.0 : (r > c ? Vsrc[i + r - 1, i + c - 1] : 0.0)
+    end
+end
+# Right-side block apply: C := C·Q (trans 'N') or C·Qᵀ ('T'), Q = I − V·Tblk·Vᵀ (V = mp×ib explicit unit).
+@inline function _qr_apply_right!(trans::Char, C::AbstractMatrix{Float64}, Vp::AbstractMatrix{Float64},
+        Tblk::AbstractMatrix{Float64})
+    nr = size(C, 1); ib = size(Vp, 2)
+    (nr == 0 || ib == 0) && return C
+    W = Matrix{Float64}(undef, nr, ib)
+    gemm!(W, C, Vp; alpha = true, beta = false)                       # W = C·V
+    trmm!(W, Tblk; side = 'R', uplo = 'U', transA = trans)            # W := W·(T or Tᵀ)
+    gemm!(C, W, Vp; transB = 'T', alpha = -1.0, beta = 1.0)           # C -= W·Vᵀ
+    return C
+end
+
+Base.@ccallable function dgeqrt_64_(m::Ptr{Int64}, n::Ptr{Int64}, nb::Ptr{Int64}, A::Ptr{Float64},
+        lda::Ptr{Int64}, T::Ptr{Float64}, ldt::Ptr{Int64}, work::Ptr{Float64}, info::Ptr{Int64})::Cvoid
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); NB = Int(unsafe_load(nb)); k = min(M, N)
+    Av = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
+    Tm = PtrMatrix(T, NB, k, Int(unsafe_load(ldt)))
+    τ = Vector{Float64}(undef, k)
+    GC.@preserve τ begin
+        geqrf!(Av, PtrVector(pointer(τ), k))
+        @inbounds for i in 1:k; t = τ[i]; τ[i] = (isfinite(t) && t != 0.0) ? 1.0 / t : 0.0; end
+        ws = WYApplyWorkspace{Float64}(M, NB, N)
+        for i in 1:NB:k
+            ib = min(NB, k - i + 1); mp = M - i + 1
+            Vp = view(ws.V, 1:mp, 1:ib)
+            _qr_vpanel!(Vp, Av, i, ib, mp)
+            wy_t!(view(Tm, 1:ib, i:(i + ib - 1)), Vp, view(τ, i:(i + ib - 1)), view(ws.G, 1:ib, 1:ib))
+        end
+    end
+    unsafe_store!(info, Int64(0)); return
+end
+
+Base.@ccallable function dgemqrt_64_(side::Ptr{UInt8}, trans::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        k::Ptr{Int64}, nb::Ptr{Int64}, V::Ptr{Float64}, ldv::Ptr{Int64}, T::Ptr{Float64}, ldt::Ptr{Int64},
+        C::Ptr{Float64}, ldc::Ptr{Int64}, work::Ptr{Float64}, info::Ptr{Int64},
+        len_s::Clong, len_t::Clong)::Cvoid
+    sd = _cabi_char(side); tr = _cabi_char(trans)
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); K = Int(unsafe_load(k)); NB = Int(unsafe_load(nb))
+    vrows = sd == 'L' ? M : N
+    Vm = PtrMatrix(V, vrows, K, Int(unsafe_load(ldv)))
+    Tm = PtrMatrix(T, NB, K, Int(unsafe_load(ldt)))
+    Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
+    # Block sweep order (LAPACK dgemqrt): L+T / R+N forward; L+N / R+T reverse.
+    forward = (sd == 'L' && tr != 'N') || (sd == 'R' && tr == 'N')
+    starts = collect(1:NB:K); forward || reverse!(starts)
+    ws = WYApplyWorkspace{Float64}(vrows, NB, max(M, N))
+    for i in starts
+        ib = min(NB, K - i + 1); mp = vrows - i + 1
+        Vp = view(ws.V, 1:mp, 1:ib)
+        _qr_vpanel!(Vp, Vm, i, ib, mp)
+        Tblk = view(Tm, 1:ib, i:(i + ib - 1))
+        if sd == 'L'
+            wy_apply!(tr, view(Cm, i:M, 1:N), Vp, Tblk, ws)      # C[i:M, :]
+        else
+            _qr_apply_right!(tr, view(Cm, 1:M, i:N), Vp, Tblk)   # C[:, i:N]
+        end
+    end
+    unsafe_store!(info, Int64(0)); return
 end
 
 # ── gesvd: SVD ──────────────────────────────────────────────────────────────────────────────────────
