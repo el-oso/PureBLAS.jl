@@ -26,8 +26,10 @@
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
            zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb,
            zqrsol = qr(copy(Az)) \ zb,
-           evals = eigvals(Symmetric(A + A')))         # symmetric eigen values (uplo='U' default)
+           evals = eigvals(Symmetric(A + A')),         # symmetric eigen values (uplo='U' default)
+           zevals = eigvals(Hermitian(Az + Az')))      # Hermitian complex eigen values (uplo='U' default)
     Asym = Symmetric(A + A'); Asymf = Matrix(Asym)     # dense symmetric for the eigen residual check
+    Aherm = Hermitian(Az + Az'); Ahermf = Matrix(Aherm)  # dense Hermitian for the complex eigen residual check
 
     @test length(PureBLAS._LBT_REGISTRARS) > 100
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
@@ -38,7 +40,7 @@
     geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
     zgeqrt_before = fwd("zgeqrt_"); zgemqrt_before = fwd("zgemqrt_")
     sgetrf_before = fwd("sgetrf_"); sgeqrt_before = fwd("sgeqrt_"); sgesdd_before = fwd("sgesdd_")
-    syevr_before = fwd("dsyevr_")
+    syevr_before = fwd("dsyevr_"); zheevr_before = fwd("zheevr_")
     Af = randn(Float32, n, n); f32svals = svdvals(copy(Af))
     PureBLAS.activate()
     try
@@ -117,6 +119,14 @@
         @test opnorm(Asymf * Fe.vectors - Fe.vectors * Diagonal(Fe.values)) < 1e-8 * opnorm(Asymf)
         @test opnorm(Fe.vectors' * Fe.vectors - I) < 1e-9                 # orthonormal vectors
         @test maximum(abs, eigvals(Asym) .- ref.evals) < 1e-9            # eigvals(Symmetric) routes too
+
+        # Hermitian complex eigensolver routes: eigen(Hermitian)/eigvals(Hermitian) → zheevr_ (default).
+        @test fwd("zheevr_") != zheevr_before                             # actually forwarded
+        Fze = eigen(Aherm)                                               # zheevr_ jobz='V' range='A'
+        @test maximum(abs, Fze.values .- ref.zevals) < 1e-9              # eigenvalues match OpenBLAS
+        @test opnorm(Ahermf * Fze.vectors - Fze.vectors * Diagonal(Fze.values)) < 1e-8 * opnorm(Ahermf)
+        @test opnorm(Fze.vectors' * Fze.vectors - I) < 1e-9             # orthonormal (unitary) vectors
+        @test maximum(abs, eigvals(Aherm) .- ref.zevals) < 1e-9        # eigvals(Hermitian) routes too
     finally
         PureBLAS.deactivate()   # ALWAYS restore OpenBLAS so later testitems keep their oracle
     end

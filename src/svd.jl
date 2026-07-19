@@ -8,30 +8,30 @@
 # --- Householder generator (LAPACK dlarfg) on a strided segment ---------------------------------
 # x = [α; tail]. Returns (β, τ): the reflector H = I − τ·v·vᵀ with v = [1; x[2:]/(α−β)] zeros the
 # tail, leaving β at x[1]. On return x[2:] holds the essential v; x[1] is left to the caller.
-@inline function _larfg!(x::AbstractVector{Float64})
+@inline function _larfg!(x::AbstractVector{T}) where {T<:Real}
     n = length(x)
     @inbounds begin
         α = x[1]
-        n == 1 && return α, 0.0
-        ss = 0.0                                     # SIMD sum-of-squares (avoids O(n²) Base.hypot in gebrd);
+        n == 1 && return α, zero(T)
+        ss = zero(T)                                 # SIMD sum-of-squares (avoids O(n²) Base.hypot in gebrd);
         @simd for i in 2:n; ss = muladd(x[i], x[i], ss); end   # fast path — exact for the common regime.
         xnorm = sqrt(ss)
         # Scaled recompute when the fast ss over/underflowed. The underflow case matters: when x is NORMAL
-        # but its squares are DENORMAL (|x| ≲ √floatmin ≈ 1.5e-154), ss < floatmin loses mantissa bits and
-        # the reflector loses orthogonality (dlarfg guards this; same principle as req#6 nrm2/lassq). The
+        # but its squares are DENORMAL (|x| ≲ √floatmin), ss < floatmin loses mantissa bits and the
+        # reflector loses orthogonality (dlarfg guards this; same principle as req#6 nrm2/lassq). The
         # common path (ss finite, ≥ floatmin) is UNCHANGED — this only reroutes the extreme-scale tails.
-        if !isfinite(xnorm) || ss < floatmin(Float64)
-            scale = 0.0
+        if !isfinite(xnorm) || ss < floatmin(T)
+            scale = zero(T)
             for i in 2:n; scale = max(scale, abs(x[i])); end
-            scale == 0.0 && return α, 0.0
-            ssum = 0.0
+            scale == zero(T) && return α, zero(T)
+            ssum = zero(T)
             for i in 2:n; t = x[i] / scale; ssum = muladd(t, t, ssum); end
             xnorm = scale * sqrt(ssum)
         end
-        xnorm == 0.0 && return α, 0.0
+        xnorm == zero(T) && return α, zero(T)
         β = -copysign(hypot(α, xnorm), α)
         τ = (β - α) / β
-        s = 1.0 / (α - β)
+        s = one(T) / (α - β)
         for i in 2:n
             x[i] *= s
         end
@@ -40,8 +40,8 @@
 end
 
 # Apply H = I − τ·v·vᵀ (v[1]≡1, v[2:]=v[2:]) to C (size len×nc) from the LEFT:  C := H·C.
-@inline function _house_left!(C::AbstractMatrix{Float64}, v::AbstractVector{Float64}, τ::Float64)
-    τ == 0.0 && return C
+@inline function _house_left!(C::AbstractMatrix{T}, v::AbstractVector{T}, τ::T) where {T<:Real}
+    τ == zero(T) && return C
     len, nc = size(C)
     @inbounds for j in 1:nc
         w = C[1, j]
@@ -113,6 +113,19 @@ end
         α = x[1]
         ss = zero(R); for i in 2:n; ss += abs2(x[i]); end
         xnorm = sqrt(ss)
+        # Scaled recompute when the naive Σ|xᵢ|² over/underflowed. The underflow case is real: when x is
+        # NORMAL but its squares are DENORMAL (|x| ≲ √floatmin), ss < floatmin loses mantissa bits and the
+        # reflector goes non-unitary — mirrors the real _larfg! guard (req#6-analogous). This method is shared
+        # by the complex SVD path (zgebd2/zgesvd), so the fix reaches there too. Common path UNCHANGED.
+        if !isfinite(xnorm) || (ss < floatmin(R) && n > 1)
+            scale = zero(R)
+            for i in 2:n; scale = max(scale, abs(x[i])); end
+            if scale != zero(R)
+                ssum = zero(R)
+                for i in 2:n; t = abs(x[i]) / scale; ssum = muladd(t, t, ssum); end
+                xnorm = scale * sqrt(ssum)
+            end
+        end
         # n==1 (empty tail) with imag(α)≠0 still needs the phase rotation (τ≠0, β real) — do NOT early-return
         # on n==1; only the genuinely-trivial α (xnorm=0 AND real α) is τ=0.
         (xnorm == 0 && imag(α) == 0) && return real(α), zero(T)
@@ -456,9 +469,10 @@ end
 end
 
 # Givens: (c,s,r) with c·f + s·g = r, −s·f + c·g = 0. r ≥ 0 (sign absorbed by later normalization).
-@inline function _givens(f::Float64, g::Float64)
+# Generic over T<:Real (Float64 codegen unchanged); the T-generic form also drives Float32 _steqr!/_stedc!.
+@inline function _givens(f::T, g::T) where {T<:Real}
     r = sqrt(f * f + g * g)          # bdsqr! scales the bidiagonal to O(1) ⇒ no overflow; skip Base.hypot
-    r == 0.0 && return 1.0, 0.0, 0.0
+    r == zero(T) && return one(T), zero(T), zero(T)
     return f / r, g / r, r
 end
 
@@ -486,6 +500,17 @@ end
             a = M[i, j1]; b = M[i, j2]
             M[i, j1] = c * a + s * b; M[i, j2] = c * b - s * a
         end
+    end
+    return M
+end
+
+# Generic (non-Float64) scalar column rotation — the Float32 _steqr!/_stedc! eigen path (no SIMD
+# fast-path). Float64 dispatches to the more-specific SIMD method above; Float32 lands here.
+@inline function _rot_cols!(M::AbstractMatrix{T}, j1::Int, j2::Int, c::T, s::T) where {T<:Real}
+    s == zero(T) && return M
+    @inbounds for i in 1:size(M, 1)
+        a = M[i, j1]; b = M[i, j2]
+        M[i, j1] = c * a + s * b; M[i, j2] = c * b - s * a
     end
     return M
 end
@@ -592,7 +617,7 @@ function _svd_sort!(d::AbstractVector{Float64}, U, V)
     return d
 end
 
-@inline function _swap_cols!(M::AbstractMatrix{Float64}, j1::Int, j2::Int)
+@inline function _swap_cols!(M::AbstractMatrix{T}, j1::Int, j2::Int) where {T<:Real}
     @inbounds for i in 1:size(M, 1)
         M[i, j1], M[i, j2] = M[i, j2], M[i, j1]
     end

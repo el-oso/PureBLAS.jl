@@ -250,105 +250,222 @@ end
 # eigvals(Symmetric) routes through dsyevr_ (RobustRepresentations); DivideAndConquer→dsyevd_, QRIteration→
 # dsyev_. We compute the FULL spectrum and (for jobz='V') vectors from a COPY of the caller's A (cheap O(n²)
 # vs the O(n³) solve; sidesteps PtrMatrix-view aliasing), then write back per each driver's ABI.
-@inline function _syev_compute(jobz::Char, uplo::Char, N::Int, A::Ptr{Float64}, ld::Int)
-    Aw = Matrix{Float64}(undef, N, N)
+# Dispatch the right native engine by element type (const-folds per instantiation — trim-safe).
+_ev_engine!(jobz::Char, uplo::Char, A::AbstractMatrix{<:Real})    = _syev!(jobz, uplo, A)
+_ev_engine!(jobz::Char, uplo::Char, A::AbstractMatrix{<:Complex}) = _heev!(jobz, uplo, A)
+
+# Copy the caller's A into a fresh Matrix{T} (unused triangle is garbage but unread) and solve. For the
+# real drivers T is the ABI type; for the complex drivers _heev_solve promotes to ComplexF64 (native for
+# z, MIXED precision for c — mirrors sgetrf/sgesvd). Returns (w::Vector, Z::Matrix, info::Int).
+@inline function _syev_compute(jobz::Char, uplo::Char, N::Int, A::Ptr{T}, ld::Int) where {T}
+    Aw = Matrix{T}(undef, N, N)
     Am = PtrMatrix(A, N, N, ld)
-    @inbounds for j in 1:N, i in 1:N; Aw[i, j] = Am[i, j]; end   # unused triangle is garbage but unread
-    return _syev!(jobz, uplo, Aw)                                # (w::Vector, Z::Matrix, info::Int)
+    @inbounds for j in 1:N, i in 1:N; Aw[i, j] = Am[i, j]; end
+    return _ev_engine!(jobz, uplo, Aw)
+end
+@inline function _heev_solve(jobz::Char, uplo::Char, N::Int, A::Ptr{Tc}, ld::Int) where {Tc<:Complex}
+    Aw = Matrix{ComplexF64}(undef, N, N)             # compute in ComplexF64 (z native, c mixed-precision)
+    Am = PtrMatrix(A, N, N, ld)
+    @inbounds for j in 1:N, i in 1:N; Aw[i, j] = ComplexF64(Am[i, j]); end
+    return _heev!(jobz, uplo, Aw)                    # (w::Vector{Float64}, Z::Matrix{ComplexF64}, info)
 end
 
-# dsyev_64_(jobz, uplo, n, A, lda, w, work, lwork, info, len_jobz, len_uplo) — vectors OVERWRITE A.
-Base.@ccallable function dsyev_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{Float64},
-        lda::Ptr{Int64}, w::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64},
-        len_jobz::Clong, len_uplo::Clong)::Cvoid
-    if unsafe_load(lwork) == Int64(-1)                 # workspace query
-        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
-    end
-    jz = _cabi_char(jobz); ul = _cabi_char(uplo)
-    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-    bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
-    !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)   # LAPACK arg validation (bad .so-caller args)
-    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
-    wm = PtrVector(w, N)
-    @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
-    if jz == 'V'
-        Am = PtrMatrix(A, N, N, ld)
-        @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
-    end
-    unsafe_store!(info, Int64(inf)); return
-end
-
-# dsyevd_64_(jobz, uplo, n, A, lda, w, work, lwork, iwork, liwork, info, len_jobz, len_uplo) — vectors
-# OVERWRITE A (same as dsyev); extra Int64 iwork/liwork workspace query args (ignored; PureBLAS owns scratch).
-Base.@ccallable function dsyevd_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{Float64},
-        lda::Ptr{Int64}, w::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64},
-        liwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong, len_uplo::Clong)::Cvoid
-    if unsafe_load(lwork) == Int64(-1)                 # workspace query (report both work + iwork sizes)
-        unsafe_store!(work, 1.0); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
-    end
-    jz = _cabi_char(jobz); ul = _cabi_char(uplo)
-    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
-    bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
-    !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)   # LAPACK arg validation (bad .so-caller args)
-    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
-    wm = PtrVector(w, N)
-    @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
-    if jz == 'V'
-        Am = PtrMatrix(A, N, N, ld)
-        @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
-    end
-    unsafe_store!(info, Int64(inf)); return
-end
-
-# dsyevr_64_(jobz, range, uplo, n, A, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work, lwork,
-#            iwork, liwork, info, +3 hidden lens) — vectors into the SEPARATE z buffer. range:
-#   'A' → all (m=N); 'I' → compute all, slice il:iu (m=iu-il+1); 'V' → count in HALF-OPEN (vl,vu] (m=count).
-# isuppz[2i-1]=1, isuppz[2i]=N (dense support). abstol ignored (full accuracy always).
-Base.@ccallable function dsyevr_64_(jobz::Ptr{UInt8}, range::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
-        A::Ptr{Float64}, lda::Ptr{Int64}, vl::Ptr{Float64}, vu::Ptr{Float64}, il::Ptr{Int64},
-        iu::Ptr{Int64}, abstol::Ptr{Float64}, m::Ptr{Int64}, w::Ptr{Float64}, z::Ptr{Float64},
-        ldz::Ptr{Int64}, isuppz::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64},
-        liwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong, len_range::Clong, len_uplo::Clong)::Cvoid
-    if unsafe_load(lwork) == Int64(-1)                 # workspace query
-        unsafe_store!(work, 1.0); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
-    end
-    jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
-    N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
-    wantz = jz == 'V'
-    # LAPACK argument validation — a non-Julia .so caller may pass bad args (the in-Julia LinearAlgebra
-    # path is pre-validated). Return info<0 (xerbla convention) instead of an @inbounds OOB read.
-    bad = (jz != 'N' && jz != 'V') ? -1 :
-          (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
-          (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
-          (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -8 : 0
-    if !iszero(bad)
-        unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
-    end
-    wv, Z, inf = _syev_compute(jz, ul, N, A, ld)       # full spectrum (ascending) + vectors if wantz
-    # pick the selected index range (compute-all-then-slice)
-    lo = 1; hi = N
-    if rg == 'I'
-        lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
-    elseif rg == 'V'
-        vlo = unsafe_load(vl); vhi = unsafe_load(vu)
-        lo = N + 1; hi = 0                             # empty until we find the half-open (vlo,vhi] band
-        @inbounds for i in 1:N
-            if vlo < wv[i] <= vhi
-                lo = min(lo, i); hi = max(hi, i)
+# ── REAL syev/syevd/syevr (Float32 native + Float64) ──────────────────────────────────────────────────
+# All three drivers share the _syev! engine (sytrd → stedc/sterf → ormtr): identical contract (eigenpairs
+# to O(eps·‖A‖), orthonormal vectors, ascending). Julia's DEFAULT eigen(Symmetric)/eigvals(Symmetric) →
+# dsyevr_ (RobustRepresentations); DivideAndConquer→dsyevd_, QRIteration→dsyev_. Float32 is NATIVE (the
+# genericized kernels), not mixed precision. Vectors OVERWRITE A (syev/syevd) or go to the z buffer (syevr).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        # $(p)syev_(jobz, uplo, n, A, lda, w, work, lwork, info, len_jobz, len_uplo)
+        Base.@ccallable function $(Symbol(p, "syev_64_"))(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
+                A::Ptr{$T}, lda::Ptr{Int64}, w::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64},
+                len_jobz::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query
+                unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
             end
+            jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+            bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+            !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)
+            wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
+            wm = PtrVector(w, N)
+            @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
+            if jz == 'V'
+                Am = PtrMatrix(A, N, N, ld)
+                @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
+            end
+            unsafe_store!(info, Int64(inf)); return
+        end
+
+        # $(p)syevd_(jobz, uplo, n, A, lda, w, work, lwork, iwork, liwork, info, len_jobz, len_uplo)
+        Base.@ccallable function $(Symbol(p, "syevd_64_"))(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
+                A::Ptr{$T}, lda::Ptr{Int64}, w::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64},
+                liwork::Ptr{Int64}, info::Ptr{Int64}, len_jobz::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query (report work + iwork sizes)
+                unsafe_store!(work, one($T)); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+            end
+            jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+            bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+            !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)
+            wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
+            wm = PtrVector(w, N)
+            @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
+            if jz == 'V'
+                Am = PtrMatrix(A, N, N, ld)
+                @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
+            end
+            unsafe_store!(info, Int64(inf)); return
+        end
+
+        # $(p)syevr_(jobz, range, uplo, n, A, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,
+        #            lwork, iwork, liwork, info, +3 lens) — vectors into the SEPARATE z buffer. range:
+        #   'A'→all (m=N); 'I'→slice il:iu; 'V'→HALF-OPEN (vl,vu] band. isuppz[2i-1]=1,isuppz[2i]=N. abstol ignored.
+        Base.@ccallable function $(Symbol(p, "syevr_64_"))(jobz::Ptr{UInt8}, range::Ptr{UInt8}, uplo::Ptr{UInt8},
+                n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, vl::Ptr{$T}, vu::Ptr{$T}, il::Ptr{Int64},
+                iu::Ptr{Int64}, abstol::Ptr{$T}, m::Ptr{Int64}, w::Ptr{$T}, z::Ptr{$T}, ldz::Ptr{Int64},
+                isuppz::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, liwork::Ptr{Int64},
+                info::Ptr{Int64}, len_jobz::Clong, len_range::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query
+                unsafe_store!(work, one($T)); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+            end
+            jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
+            wantz = jz == 'V'
+            bad = (jz != 'N' && jz != 'V') ? -1 :
+                  (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
+                  (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
+                  (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -8 : 0
+            if !iszero(bad)
+                unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
+            end
+            wv, Z, inf = _syev_compute(jz, ul, N, A, ld)       # full spectrum (ascending) + vectors if wantz
+            lo = 1; hi = N
+            if rg == 'I'
+                lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+            elseif rg == 'V'
+                vlo = unsafe_load(vl); vhi = unsafe_load(vu)
+                lo = N + 1; hi = 0
+                @inbounds for i in 1:N
+                    if vlo < wv[i] <= vhi
+                        lo = min(lo, i); hi = max(hi, i)
+                    end
+                end
+            end
+            M = max(hi - lo + 1, 0)
+            unsafe_store!(m, Int64(M))
+            wm = PtrVector(w, max(M, 0))
+            @inbounds for k in 1:M; wm[k] = wv[lo + k - 1]; end
+            if wantz && M > 0
+                Zm = PtrMatrix(z, N, M, ldzz)
+                @inbounds for k in 1:M, i in 1:N; Zm[i, k] = Z[i, lo + k - 1]; end
+            end
+            ipz = PtrVector(isuppz, 2 * max(M, 0))
+            @inbounds for k in 1:M; ipz[2k - 1] = Int64(1); ipz[2k] = Int64(N); end
+            unsafe_store!(info, Int64(inf)); return
         end
     end
-    M = max(hi - lo + 1, 0)
-    unsafe_store!(m, Int64(M))
-    wm = PtrVector(w, max(M, 0))
-    @inbounds for k in 1:M; wm[k] = wv[lo + k - 1]; end
-    if wantz && M > 0
-        Zm = PtrMatrix(z, N, M, ldzz)
-        @inbounds for k in 1:M, i in 1:N; Zm[i, k] = Z[i, lo + k - 1]; end
+end
+
+# ── COMPLEX heev/heevd/heevr (ComplexF64 native + ComplexF32 mixed-precision) ─────────────────────────
+# Hermitian eigensolver via _heev! (hetrd → stedc/sterf → unmtr). ABI adds the LAPACK complex rwork block
+# (and lrwork/iwork/liwork for heevd/heevr): w/rwork/vl/vu/abstol are REAL ($Tr); A/z/work are COMPLEX
+# ($Tc). Julia's eigen(Hermitian) default → zheevr_/cheevr_. c-prefix promotes ComplexF32→ComplexF64.
+for (p, Tc, Tr) in (("z", ComplexF64, Float64), ("c", ComplexF32, Float32))
+    @eval begin
+        # $(p)heev_(jobz, uplo, n, A, lda, w, work, lwork, rwork, info, len_jobz, len_uplo)
+        Base.@ccallable function $(Symbol(p, "heev_64_"))(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
+                A::Ptr{$Tc}, lda::Ptr{Int64}, w::Ptr{$Tr}, work::Ptr{$Tc}, lwork::Ptr{Int64},
+                rwork::Ptr{$Tr}, info::Ptr{Int64}, len_jobz::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query (only work[1] per zheev)
+                unsafe_store!(work, one($Tc)); unsafe_store!(info, Int64(0)); return
+            end
+            jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+            bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+            !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)
+            wv, Z, inf = _heev_solve(jz, ul, N, A, ld)
+            wm = PtrVector(w, N)
+            @inbounds for i in eachindex(wm); wm[i] = $Tr(wv[i]); end
+            if jz == 'V'
+                Am = PtrMatrix(A, N, N, ld)
+                @inbounds for j in 1:N, i in 1:N; Am[i, j] = $Tc(Z[i, j]); end
+            end
+            unsafe_store!(info, Int64(inf)); return
+        end
+
+        # $(p)heevd_(jobz, uplo, n, A, lda, w, work, lwork, rwork, lrwork, iwork, liwork, info, 2 lens)
+        Base.@ccallable function $(Symbol(p, "heevd_64_"))(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{Int64},
+                A::Ptr{$Tc}, lda::Ptr{Int64}, w::Ptr{$Tr}, work::Ptr{$Tc}, lwork::Ptr{Int64},
+                rwork::Ptr{$Tr}, lrwork::Ptr{Int64}, iwork::Ptr{Int64}, liwork::Ptr{Int64},
+                info::Ptr{Int64}, len_jobz::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query (work + rwork + iwork sizes)
+                unsafe_store!(work, one($Tc)); unsafe_store!(rwork, one($Tr))
+                unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+            end
+            jz = _cabi_char(jobz); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+            bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+            !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)
+            wv, Z, inf = _heev_solve(jz, ul, N, A, ld)
+            wm = PtrVector(w, N)
+            @inbounds for i in eachindex(wm); wm[i] = $Tr(wv[i]); end
+            if jz == 'V'
+                Am = PtrMatrix(A, N, N, ld)
+                @inbounds for j in 1:N, i in 1:N; Am[i, j] = $Tc(Z[i, j]); end
+            end
+            unsafe_store!(info, Int64(inf)); return
+        end
+
+        # $(p)heevr_(jobz, range, uplo, n, A, lda, vl, vu, il, iu, abstol, m, w, z, ldz, isuppz, work,
+        #            lwork, rwork, lrwork, iwork, liwork, info, +3 lens) — vectors into the z buffer.
+        Base.@ccallable function $(Symbol(p, "heevr_64_"))(jobz::Ptr{UInt8}, range::Ptr{UInt8}, uplo::Ptr{UInt8},
+                n::Ptr{Int64}, A::Ptr{$Tc}, lda::Ptr{Int64}, vl::Ptr{$Tr}, vu::Ptr{$Tr}, il::Ptr{Int64},
+                iu::Ptr{Int64}, abstol::Ptr{$Tr}, m::Ptr{Int64}, w::Ptr{$Tr}, z::Ptr{$Tc}, ldz::Ptr{Int64},
+                isuppz::Ptr{Int64}, work::Ptr{$Tc}, lwork::Ptr{Int64}, rwork::Ptr{$Tr}, lrwork::Ptr{Int64},
+                iwork::Ptr{Int64}, liwork::Ptr{Int64}, info::Ptr{Int64},
+                len_jobz::Clong, len_range::Clong, len_uplo::Clong)::Cvoid
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query (work + rwork + iwork sizes)
+                unsafe_store!(work, one($Tc)); unsafe_store!(rwork, one($Tr))
+                unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
+            end
+            jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
+            wantz = jz == 'V'
+            bad = (jz != 'N' && jz != 'V') ? -1 :
+                  (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
+                  (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
+                  (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -10 : 0
+            if !iszero(bad)
+                unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
+            end
+            wv, Z, inf = _heev_solve(jz, ul, N, A, ld)         # full spectrum (ascending) + vectors if wantz
+            lo = 1; hi = N
+            if rg == 'I'
+                lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+            elseif rg == 'V'
+                vlo = unsafe_load(vl); vhi = unsafe_load(vu)
+                lo = N + 1; hi = 0
+                @inbounds for i in 1:N
+                    if vlo < wv[i] <= vhi
+                        lo = min(lo, i); hi = max(hi, i)
+                    end
+                end
+            end
+            M = max(hi - lo + 1, 0)
+            unsafe_store!(m, Int64(M))
+            wm = PtrVector(w, max(M, 0))
+            @inbounds for k in 1:M; wm[k] = $Tr(wv[lo + k - 1]); end
+            if wantz && M > 0
+                Zm = PtrMatrix(z, N, M, ldzz)
+                @inbounds for k in 1:M, i in 1:N; Zm[i, k] = $Tc(Z[i, lo + k - 1]); end
+            end
+            ipz = PtrVector(isuppz, 2 * max(M, 0))
+            @inbounds for k in 1:M; ipz[2k - 1] = Int64(1); ipz[2k] = Int64(N); end
+            unsafe_store!(info, Int64(inf)); return
+        end
     end
-    ipz = PtrVector(isuppz, 2 * max(M, 0))
-    @inbounds for k in 1:M; ipz[2k - 1] = Int64(1); ipz[2k] = Int64(N); end
-    unsafe_store!(info, Int64(inf)); return
 end
 
 # ── SOLVES on caller-provided factors: trtrs / potrs / getrs (compose trsm! + _laswp!) ────────────────
