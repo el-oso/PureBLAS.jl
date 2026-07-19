@@ -127,10 +127,10 @@ end
 # factors (Cholesky factor; LU L/U + LAPACK-1-based ipiv — verified identical to OpenBLAS), so OpenBLAS's
 # potrs/getrs/getri/potri operate on them correctly. gesvd is self-contained (returns U/S/Vᵀ, no companion).
 #
-# geqrf is DELIBERATELY NOT forwarded: PureBLAS returns the faer reflector convention (τ = 1/τ_LAPACK,
-# with differently-scaled v), so a forwarded geqrf feeding OpenBLAS's orgqr/ormqr produces a BROKEN Q
-# (‖QᵀQ−I‖ = NaN). Julia's high-level `qr()` uses geqrt (not geqrf) anyway, so this costs no routing. To
-# forward QR properly we'd need τ-compatible geqrf/geqrt wrappers + orgqr/ormqr — a follow-up.
+# geqrf is now SAFE to forward: the dgeqrf_64_ wrapper converts PureBLAS's faer τ (=1/τ_LAPACK) back to
+# LAPACK convention (v is already standard), so geqrf+OpenBLAS-orgqr gives a correct Q. QR routing for
+# Julia's `qr()` (QRCompactWY) goes through geqrt+gemqrt — forwarded below (Float64; complex is TODO — its
+# T-build needs VᴴV not VᵀV; no Float32 QR kernel exists).
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))   # potrf: real + complex
     @eval _reg!($(p * "potrf_"), () -> @cfunction($(Symbol(p, "potrf_64_")), Cvoid,
         (_CU, _CI, Ptr{$T}, _CI, _CI, Clong)))
@@ -146,6 +146,14 @@ _reg!("dgesvd_", () -> @cfunction(dgesvd_64_, Cvoid,
 _reg!("dgesdd_", () -> @cfunction(dgesdd_64_, Cvoid,
     (_CU, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Ptr{Float64}, _CI, _CI, _CI, Clong)))
+# QR: geqrf (τ now LAPACK-converted) + geqrt/gemqrt (Float64) — routes LinearAlgebra.qr() to PureBLAS.
+_reg!("dgeqrf_", () -> @cfunction(dgeqrf_64_, Cvoid,
+    (_CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI)))
+_reg!("dgeqrt_", () -> @cfunction(dgeqrt_64_, Cvoid,
+    (_CI, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI)))
+_reg!("dgemqrt_", () -> @cfunction(dgemqrt_64_, Cvoid,
+    (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, _CI, Clong, Clong)))
 # Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval begin

@@ -22,6 +22,7 @@
            chol = Matrix(cholesky(copy(SPD)).U), lusol = lu(copy(A)) \ b, chsol = cholesky(copy(SPD)) \ b,
            atsol = transpose(A) \ b, trsol = UpperTriangular(At) \ b,
            ichol = inv(cholesky(copy(SPD))), itri = inv(UpperTriangular(At)),
+           qrsol = qr(copy(A)) \ b, qrdet = det(qr(copy(A)).Q),
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
            zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb)
 
@@ -31,6 +32,7 @@
     zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_"); gesdd_before = fwd("dgesdd_")
     getrs_before = fwd("dgetrs_"); potrs_before = fwd("dpotrs_"); trtrs_before = fwd("dtrtrs_")
     getri_before = fwd("dgetri_"); potri_before = fwd("dpotri_"); trtri_before = fwd("dtrtri_")
+    geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -75,11 +77,17 @@
         @test maximum(abs, (Fz.L * Fz.U) .- Az[Fz.p, :]) < 1e-9            # zgetrf (valid factorization)
         @test maximum(abs, (lu(copy(Az)) \ zb) .- ref.zlusol) < 1e-8       # zgetrf + zgetrs, both PureBLAS
 
-        # HAZARD GUARD: geqrf must NOT be forwarded (faer-τ would break OpenBLAS orgqr → NaN Q). With it
-        # unforwarded, geqrf!+orgqr! are both OpenBLAS and produce a valid orthonormal Q.
-        @test fwd("dgeqrf_") == geqrf_before                       # dgeqrf_ NOT redirected (stays OpenBLAS)
-        A2 = copy(A); _, tau = LA.geqrf!(A2); Q = LA.orgqr!(copy(A2), tau)
-        @test maximum(abs, Q'Q - I) < 1e-9
+        # QR routes to PureBLAS via geqrt+gemqrt (Julia's qr() is QRCompactWY). geqrf is now forwarded too
+        # (its wrapper converts faer τ → LAPACK, so geqrf!+OpenBLAS-orgqr is correct — no more NaN-Q hazard).
+        @test fwd("dgeqrt_") != geqrt_before && fwd("dgemqrt_") != gemqrt_before && fwd("dgeqrf_") != geqrf_before
+        Q = qr(copy(A))
+        @test maximum(abs, Matrix(Q.Q)' * Matrix(Q.Q) - I) < 1e-9   # gemqrt: Q orthonormal
+        @test maximum(abs, Matrix(Q.Q) * Q.R - A) < 1e-9            # geqrt+gemqrt: Q·R = A
+        @test maximum(abs, (qr(copy(A)) \ b) .- ref.qrsol) < 1e-8   # geqrt+gemqrt+trtrs
+        @test abs(det(qr(copy(A)).Q) - ref.qrdet) < 1e-9            # det(Q) reads T's diagonal (LAPACK-exact T)
+        # geqrf τ-conversion: geqrf!+OpenBLAS orgqr now gives a valid Q (faer never crosses the ABI).
+        A2 = copy(A); _, tau = LA.geqrf!(A2); Qo = LA.orgqr!(copy(A2), tau)
+        @test maximum(abs, Qo'Qo - I) < 1e-9
     finally
         PureBLAS.deactivate()   # ALWAYS restore OpenBLAS so later testitems keep their oracle
     end
