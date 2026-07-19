@@ -28,6 +28,12 @@ include("svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implici
 include("svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal solver (bdsdc, faer port)
 include("eigen.jl")         # LAPACK: symmetric/Hermitian eigensolver (syev/heev) — sytrd/hetrd + steqr + ormtr/unmtr
 include("eigen_dc.jl")      # LAPACK: symmetric tridiagonal divide-and-conquer (stedc, Cuppen) — jobz='V' path
+include("lq.jl")            # LAPACK: LQ (gelqf/orglq/ormlq) — row-wise dual of QR, generic s/d/c/z
+include("bunchkaufman.jl")  # LAPACK: Bunch-Kaufman (sytrf/hetrf + sytrs/hetrs) symmetric-indefinite/Hermitian
+include("geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-revealing, generic s/d/c/z
+include("gels.jl")          # LAPACK: least-squares / min-norm solve (gels) over QR/LQ
+include("gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
+include("hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) — nonsymmetric-eigen front half
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
