@@ -30,9 +30,15 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             (_CI, Ptr{$T}, _CI, Ptr{$T}, _CI)))
     end
 end
-for (p, T) in (("s", Float32), ("d", Float64))     # real dot only (complex dot ABI deferred)
+for (p, T) in (("s", Float32), ("d", Float64))     # real dot
     @eval _reg!($(p * "dot_"), () -> @cfunction($(Symbol(p, "dot_64_")), $T,
         (_CI, Ptr{$T}, _CI, Ptr{$T}, _CI)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))   # complex dot (cabi_cdot.jl) — by-value complex return
+    @eval begin
+        _reg!($(p * "dotu_"), () -> @cfunction($(Symbol(p, "dotu_64_")), $T, (_CI, Ptr{$T}, _CI, Ptr{$T}, _CI)))
+        _reg!($(p * "dotc_"), () -> @cfunction($(Symbol(p, "dotc_64_")), $T, (_CI, Ptr{$T}, _CI, Ptr{$T}, _CI)))
+    end
 end
 for (nm, T, R) in (("snrm2", Float32, Float32), ("dnrm2", Float64, Float64),
                    ("scnrm2", ComplexF32, Float32), ("dznrm2", ComplexF64, Float64))
@@ -165,12 +171,13 @@ _reg!("dgeqrt_", () -> @cfunction(dgeqrt_64_, Cvoid,
 _reg!("dgemqrt_", () -> @cfunction(dgemqrt_64_, Cvoid,
     (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Clong, Clong)))
-# Complex QR (ComplexF64): zgeqrt/zgemqrt route qr(::Matrix{ComplexF64}).
-_reg!("zgeqrt_", () -> @cfunction(zgeqrt_64_, Cvoid,
-    (_CI, _CI, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI)))
-_reg!("zgemqrt_", () -> @cfunction(zgemqrt_64_, Cvoid,
-    (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI,
-     Ptr{ComplexF64}, _CI, Clong, Clong)))
+# Complex QR: zgeqrt/zgemqrt (ComplexF64) + cgeqrt/cgemqrt (ComplexF32, native) route qr(::Matrix{Complex*}).
+for (p, T) in (("z", ComplexF64), ("c", ComplexF32))
+    @eval _reg!($(p * "geqrt_"), () -> @cfunction($(Symbol(p, "geqrt_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI)))
+    @eval _reg!($(p * "gemqrt_"), () -> @cfunction($(Symbol(p, "gemqrt_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Clong, Clong)))
+end
 # Float32 LAPACK via mixed precision (compute F64, store F32): routes lu/qr/svd for Matrix{Float32}.
 _reg!("sgetrf_", () -> @cfunction(sgetrf_64_, Cvoid, (_CI, _CI, Ptr{Float32}, _CI, _CI, _CI)))
 _reg!("sgeqrt_", () -> @cfunction(sgeqrt_64_, Cvoid,
@@ -225,7 +232,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             (_CU, _CU, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
     end
 end
-for (p, T) in (("d", Float64), ("c", ComplexF32), ("z", ComplexF64))   # getri: matches getrf coverage (no s)
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))   # getri (s native via generic trsm!)
     @eval _reg!($(p * "getri_"), () -> @cfunction($(Symbol(p, "getri_64_")), Cvoid,
         (_CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI)))
 end
@@ -340,3 +347,238 @@ for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
              Ptr{$T}, _CI, Ptr{$R}, Ptr{Cvoid}, _CI, Clong, Clong)))
     end
 end
+
+# ─────────── Assembly batch: generalized eigen + tridiagonal + band/packed Cholesky ───────────────
+# Routes: eigen(Sym,Sym)→sygvd/hegvd; eigen(A,B)/eigvals(A,B)→ggev3; schur(A,B)→gges3; eigen/eigvals(
+# SymTridiagonal)→stegr/stev. gtsv/gttrf/gttrs + pbtrf/pbtrs + pptrf/pptrs serve DIRECT LAPACK callers
+# and external packages (base LA's Tridiagonal\b is native-Julia, not gtsv). @cfunction sigs match the
+# @ccallable defs in cabi_lapack.jl byte-for-byte (arg tuple + trailing Clong per char arg).
+# sygvd/hegvd — eigen(Symmetric,Symmetric)/eigvals(Symmetric,Symmetric). Complex ref name is hegvd.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "sygvd_"), () -> @cfunction($(Symbol(p, "sygvd_64_")), Cvoid,
+        (_CI, _CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, _CI, _CI, Clong, Clong)))
+end
+for (p, Tc, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "hegvd_"), () -> @cfunction($(Symbol(p, "hegvd_64_")), Cvoid,
+        (_CI, _CU, _CU, _CI, Ptr{$Tc}, _CI, Ptr{$Tc}, _CI, Ptr{$Tr}, Ptr{$Tc}, _CI, Ptr{$Tr}, _CI, _CI, _CI, _CI, Clong, Clong)))
+end
+# gtsv / gttrf / gttrs — tridiagonal solve/factor (direct LAPACK callers).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "gtsv_"), () -> @cfunction($(Symbol(p, "gtsv_64_")), Cvoid,
+            (_CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+        _reg!($(p * "gttrf_"), () -> @cfunction($(Symbol(p, "gttrf_64_")), Cvoid,
+            (_CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+        _reg!($(p * "gttrs_"), () -> @cfunction($(Symbol(p, "gttrs_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+    end
+end
+# stev / stegr — SymTridiagonal eigensolver (real only). eigvals→stev('N'); eigen→stegr('V','A').
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        _reg!($(p * "stev_"), () -> @cfunction($(Symbol(p, "stev_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, Clong)))
+        _reg!($(p * "stegr_"), () -> @cfunction($(Symbol(p, "stegr_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T},
+             _CI, _CI, Ptr{$T}, _CI, _CI, _CI, _CI, Clong, Clong)))
+    end
+end
+# pbtrf / pbtrs (band) + pptrf / pptrs (packed) — direct/external callers (BandedMatrices, packed storage).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "pbtrf_"), () -> @cfunction($(Symbol(p, "pbtrf_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "pbtrs_"), () -> @cfunction($(Symbol(p, "pbtrs_64_")), Cvoid,
+            (_CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "pptrf_"), () -> @cfunction($(Symbol(p, "pptrf_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, _CI, Clong)))
+        _reg!($(p * "pptrs_"), () -> @cfunction($(Symbol(p, "pptrs_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+    end
+end
+# ggev / ggev3 — eigen(A,B)/eigvals(A,B) (Julia≥3.6 calls ggev3; register both). REAL alphar/alphai/beta;
+# COMPLEX one alpha + a REAL rwork block.
+for (p, T) in (("s", Float32), ("d", Float64)), nm in ("ggev", "ggev3")
+    @eval _reg!($(p * nm * "_"), () -> @cfunction($(Symbol(p, nm, "_64_")), Cvoid,
+        (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI,
+         Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64)), nm in ("ggev", "ggev3")
+    @eval _reg!($(p * nm * "_"), () -> @cfunction($(Symbol(p, nm, "_64_")), Cvoid,
+        (_CU, _CU, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T},
+         _CI, Ptr{$R}, _CI, Clong, Clong)))
+end
+# gges / gges3 — schur(A,B) (Julia≥3.6 calls gges3; register both). select/bwork are Ptr{Cvoid}. REAL
+# alphar/alphai; COMPLEX one alpha + a REAL rwork block. 3 char args → 3 trailing Clongs.
+for (p, T) in (("s", Float32), ("d", Float64)), nm in ("gges", "gges3")
+    @eval _reg!($(p * nm * "_"), () -> @cfunction($(Symbol(p, nm, "_64_")), Cvoid,
+        (_CU, _CU, _CU, Ptr{Cvoid}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T},
+         Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{Cvoid}, _CI, Clong, Clong, Clong)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64)), nm in ("gges", "gges3")
+    @eval _reg!($(p * nm * "_"), () -> @cfunction($(Symbol(p, nm, "_64_")), Cvoid,
+        (_CU, _CU, _CU, Ptr{Cvoid}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T},
+         _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$R}, Ptr{Cvoid}, _CI, Clong, Clong, Clong)))
+end
+
+# ─────────── Assembly batch 2: banded LU, SPD tridiagonal, sym-tridiag bisection/inverse-iteration,
+# pivoted Cholesky, QL/RQ, RZ least-squares, SVD least-squares, symmetric-indefinite solve/inverse,
+# Sylvester, Schur reorder, equality-constrained LS, generalized SVD (Float64). Sigs match the
+# @ccallable defs in cabi_lapack.jl byte-for-byte (arg tuple + trailing Clong count per char arg).
+# gbtrf / gbtrs — general banded LU (direct/external callers; not reached via a high-level Julia call).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "gbtrf_"), () -> @cfunction($(Symbol(p, "gbtrf_64_")), Cvoid,
+            (_CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{Int64}, _CI)))
+        _reg!($(p * "gbtrs_"), () -> @cfunction($(Symbol(p, "gbtrs_64_")), Cvoid,
+            (_CU, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, _CI, _CI, Clong)))
+    end
+end
+# ptsv / pttrf / pttrs — SPD/Hermitian-PD tridiagonal (direct/external callers).
+for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
+                   ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval begin
+        _reg!($(p * "ptsv_"), () -> @cfunction($(Symbol(p, "ptsv_64_")), Cvoid,
+            (_CI, _CI, Ptr{$Tr}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+        _reg!($(p * "pttrf_"), () -> @cfunction($(Symbol(p, "pttrf_64_")), Cvoid,
+            (_CI, Ptr{$Tr}, Ptr{$T}, _CI)))
+    end
+end
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "pttrs_"), () -> @cfunction($(Symbol(p, "pttrs_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "pttrs_"), () -> @cfunction($(Symbol(p, "pttrs_64_")), Cvoid,
+        (_CU, _CI, _CI, Ptr{$Tr}, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+end
+# stebz / stein — real-symmetric-tridiag eigenvalues/eigenvectors (direct/external callers).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        _reg!($(p * "stebz_"), () -> @cfunction($(Symbol(p, "stebz_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI,
+             Ptr{$T}, Ptr{Int64}, Ptr{Int64}, Ptr{$T}, Ptr{Int64}, _CI, Clong, Clong)))
+        _reg!($(p * "stein_"), () -> @cfunction($(Symbol(p, "stein_64_")), Cvoid,
+            (_CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, Ptr{Int64}, Ptr{Int64}, Ptr{$T}, _CI,
+             Ptr{$T}, Ptr{Int64}, Ptr{Int64}, _CI)))
+    end
+end
+# pstrf — pivoted (rank-revealing) Cholesky (direct/external callers; backs cholesky(A, RowMaximum())).
+for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
+                   ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "pstrf_"), () -> @cfunction($(Symbol(p, "pstrf_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{$Tr}, Ptr{$Tr}, _CI, Clong)))
+end
+# QL / RQ — routes ql(A)/rq(A)-style direct callers (no high-level LinearAlgebra wrapper for QL/RQ).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "geqlf_"), () -> @cfunction($(Symbol(p, "geqlf_64_")), Cvoid,
+            (_CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+        _reg!($(p * "gerqf_"), () -> @cfunction($(Symbol(p, "gerqf_64_")), Cvoid,
+            (_CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+    end
+end
+for (nm, T) in (("sorgql", Float32), ("dorgql", Float64), ("cungql", ComplexF32), ("zungql", ComplexF64))
+    @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (nm, T) in (("sorgrq", Float32), ("dorgrq", Float64), ("cungrq", ComplexF32), ("zungrq", ComplexF64))
+    @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (nm, T) in (("sormql", Float32), ("dormql", Float64), ("cunmql", ComplexF32), ("zunmql", ComplexF64))
+    @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+for (nm, T) in (("sormrq", Float32), ("dormrq", Float64), ("cunmrq", ComplexF32), ("zunmrq", ComplexF64))
+    @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+# tzrzf / ormrz(unmrz) — the "complete orthogonal" half of gelsy (direct/external callers).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "tzrzf_"), () -> @cfunction($(Symbol(p, "tzrzf_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (nm, T) in (("sormrz", Float32), ("dormrz", Float64), ("cunmrz", ComplexF32), ("zunmrz", ComplexF64))
+    @eval _reg!($(nm * "_"), () -> @cfunction($(Symbol(nm, "_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong)))
+end
+# gelsy — routes non-square `\` least-squares (rank-deficient path, RZ factorization).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "gelsy_"), () -> @cfunction($(Symbol(p, "gelsy_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, Ptr{Int64}, Ptr{$T}, _CI, _CI)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "gelsy_"), () -> @cfunction($(Symbol(p, "gelsy_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$R}, Ptr{Int64}, Ptr{$T}, _CI,
+         Ptr{$R}, _CI)))
+end
+# gelsd — rank-deficient least squares via SVD (direct LAPACK.gelsd! callers).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "gelsd_"), () -> @cfunction($(Symbol(p, "gelsd_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{Int64}, Ptr{$T}, _CI,
+         Ptr{Int64}, _CI)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "gelsd_"), () -> @cfunction($(Symbol(p, "gelsd_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$R}, Ptr{$R}, Ptr{Int64}, Ptr{$T}, _CI,
+         Ptr{$R}, Ptr{Int64}, _CI)))
+end
+# sysv / hesv — one-shot symmetric-indefinite / Hermitian solve (backs `\` on Symmetric/Hermitian, and
+# direct callers). sytri / hetri — matrix inverse from the Bunch-Kaufman factors (direct callers).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "sysv_"), () -> @cfunction($(Symbol(p, "sysv_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "sytri_"), () -> @cfunction($(Symbol(p, "sytri_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, _CI, Clong)))
+    end
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "hesv_"), () -> @cfunction($(Symbol(p, "hesv_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "hetri_"), () -> @cfunction($(Symbol(p, "hetri_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, _CI, Ptr{Int64}, Ptr{$T}, _CI, Clong)))
+    end
+end
+# trsyl — triangular Sylvester solve (backs sylvester/lyap; direct callers).
+for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
+                   ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "trsyl_"), () -> @cfunction($(Symbol(p, "trsyl_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$Tr}, _CI, Clong, Clong)))
+end
+# trexc / trsen — Schur reordering (backs ordschur; direct callers).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval begin
+        _reg!($(p * "trexc_"), () -> @cfunction($(Symbol(p, "trexc_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CI, Ptr{$T}, _CI, Clong)))
+        _reg!($(p * "trsen_"), () -> @cfunction($(Symbol(p, "trsen_64_")), Cvoid,
+            (_CU, _CU, Ptr{Int64}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T},
+             Ptr{$T}, Ptr{$T}, _CI, Ptr{Int64}, _CI, _CI, Clong, Clong)))
+    end
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "trexc_"), () -> @cfunction($(Symbol(p, "trexc_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CI, _CI, Clong)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "trsen_"), () -> @cfunction($(Symbol(p, "trsen_64_")), Cvoid,
+        (_CU, _CU, Ptr{Int64}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$R}, Ptr{$R},
+         Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+# gglse — equality-constrained least squares (direct LAPACK.gglse! callers).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "gglse_"), () -> @cfunction($(Symbol(p, "gglse_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+# ggsvd / ggsvd3 — generalized SVD, Float64 full-rank ONLY (direct LAPACK.ggsvd!/ggsvd3! callers).
+_reg!("dggsvd_", () -> @cfunction(dggsvd_64_, Cvoid,
+    (_CU, _CU, _CU, _CI, _CI, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, Ptr{Int64}, _CI, Clong, Clong, Clong)))
+_reg!("dggsvd3_", () -> @cfunction(dggsvd3_64_, Cvoid,
+    (_CU, _CU, _CU, _CI, _CI, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, _CI, Ptr{Int64}, _CI, Clong, Clong, Clong)))

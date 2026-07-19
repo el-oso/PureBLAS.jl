@@ -37,8 +37,28 @@ include("hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) �
 include("hseqr.jl")         # LAPACK: Schur decomposition of upper-Hessenberg (hseqr, Francis double-shift QR)
 include("trevc.jl")         # LAPACK: right eigenvectors of Schur form (trevc, back-substitution)
 include("geev.jl")          # LAPACK: general eigensolver drivers (geev/gees + gebak) — eigen/eigvals/schur
+include("sygvd.jl")         # LAPACK: generalized sym/Herm-definite eigensolver (sygvd/hegvd) — eigen(Sym,Sym)
+include("tridiag.jl")       # LAPACK: tridiagonal solvers (gtsv/gttrf/gttrs) + _gt_asmat helper
+include("banded_chol.jl")   # LAPACK: band Cholesky (pbtrf/pbtrs)
+include("packed_chol.jl")   # LAPACK: packed Cholesky (pptrf/pptrs)
+include("qz.jl")            # LAPACK: generalized-eigen QZ kernels (gghrd/hgeqz + auxiliaries)
+include("tgevc_gen.jl")     # LAPACK: generalized right eigenvectors (tgevc) — needs qz.jl first
+include("ggev.jl")          # LAPACK: generalized eigensolver drivers (ggev/gges) — eigen(A,B)/eigvals/schur(A,B)
+include("sysv.jl")          # LAPACK: symmetric-indefinite/Hermitian solve+inverse (sysv/hesv/sytri/hetri)
+include("gbtrf.jl")         # LAPACK: general banded LU (gbtrf/gbtrs)
+include("pttrf.jl")         # LAPACK: SPD tridiagonal LDLᴴ (pttrf/pttrs/ptsv)
+include("stebz.jl")         # LAPACK: sym-tridiag eigvals by bisection (stebz) / eigvecs by inverse iteration (stein)
+include("pstrf.jl")         # LAPACK: pivoted/semidefinite Cholesky (pstrf)
+include("qlrq.jl")          # LAPACK: QL/RQ factorizations (geqlf/gerqf/orgql/orgrq/ormql/ormrq + complex duals)
+include("gelsy.jl")         # LAPACK: rank-deficient LS via RZ (gelsy/tzrzf/ormrz) — needs geqp3.jl + gels.jl
+include("gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — needs svd.jl
+include("trsyl.jl")         # LAPACK: Sylvester solve (trsyl) — standalone
+include("trsen.jl")         # LAPACK: Schur reorder (trexc/trsen) — needs trsyl.jl
+include("gglse.jl")         # LAPACK: equality-constrained LS (gglse)
+include("ggsvd.jl")         # LAPACK: generalized SVD, Float64 full-rank (ggsvd) — needs gglse.jl's _ggl_* helpers
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
+include("cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
 include("cabi_l3.jl")       # Mode 1: BLAS-3 rest (symm/syrk/trmm/trsm/…)
 include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
