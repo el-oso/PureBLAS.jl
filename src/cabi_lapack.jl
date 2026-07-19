@@ -1202,3 +1202,178 @@ for (nm, T) in (("sorghr", Float32), ("dorghr", Float64), ("cunghr", ComplexF32)
         unsafe_store!(info, Int64(0)); return
     end
 end
+
+# ── geev / geevx: general eigensolver (eigenvalues + right eigenvectors) ───────────────────────────────
+# Routes eigen(A)/eigvals(A) (Julia's default is geevx! with sense='N', balanc='B'/'N'; geev is the plain
+# driver + non-Julia hosts). jobvl='V' (left vectors) is unsupported by our trevc — reported via info<0.
+# _geev_run! composes gebal→gehrd→orghr→hseqr→trevc→gebak→normalize and mutates A (→ Schur form) in place,
+# returning freshly-allocated VR (real-packed for real A) copied into the caller's buffer; wr/wi (real) or
+# w (complex) into their buffers. Honors the lwork==-1 query. Everything is a PtrMatrix ⇒ trim-safe.
+
+# REAL {s,d}geev_(jobvl, jobvr, n, A, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info, +2 lens).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval Base.@ccallable function $(Symbol(p, "geev_64_"))(jobvl::Ptr{UInt8}, jobvr::Ptr{UInt8},
+            n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, wr::Ptr{$T}, wi::Ptr{$T}, vl::Ptr{$T},
+            ldvl::Ptr{Int64}, vr::Ptr{$T}, ldvr::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64},
+            info::Ptr{Int64}, ljl::Clong, ljr::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        jl = _cabi_char(jobvl); jr = _cabi_char(jobvr)
+        if jl != 'N'                                       # left eigenvectors not implemented
+            unsafe_store!(info, Int64(-1)); return
+        end
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wra, wia, _, VRm = _geev_run!('B', jl, jr, Am)
+        wrp = PtrVector(wr, N); wip = PtrVector(wi, N)
+        @inbounds for i in 1:N; wrp[i] = wra[i]; wip[i] = wia[i]; end
+        if jr == 'V'
+            VRp = PtrMatrix(vr, N, N, Int(unsafe_load(ldvr)))
+            @inbounds for j in 1:N, i in 1:N; VRp[i, j] = VRm[i, j]; end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# COMPLEX {c,z}geev_(jobvl, jobvr, n, A, lda, w, vl, ldvl, vr, ldvr, work, lwork, rwork, info, +2 lens).
+# The complex ABI has ONE w output (vs real's wr/wi) and inserts a REAL rwork block the real driver lacks.
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "geev_64_"))(jobvl::Ptr{UInt8}, jobvr::Ptr{UInt8},
+            n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, w::Ptr{$T}, vl::Ptr{$T}, ldvl::Ptr{Int64},
+            vr::Ptr{$T}, ldvr::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, rwork::Ptr{$R},
+            info::Ptr{Int64}, ljl::Clong, ljr::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        jl = _cabi_char(jobvl); jr = _cabi_char(jobvr)
+        if jl != 'N'
+            unsafe_store!(info, Int64(-1)); return
+        end
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wa, _, VRm = _geev_run!('B', jl, jr, Am)
+        wp = PtrVector(w, N)
+        @inbounds for i in 1:N; wp[i] = wa[i]; end
+        if jr == 'V'
+            VRp = PtrMatrix(vr, N, N, Int(unsafe_load(ldvr)))
+            @inbounds for j in 1:N, i in 1:N; VRp[i, j] = VRm[i, j]; end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# REAL {s,d}geevx_ — expert driver Julia's eigen!/eigvals! actually call (sense='N'). Adds balanc/sense
+# chars + ilo/ihi/scale/abnrm outputs; rconde/rcondv (condition numbers) are only computed for sense∈
+# {E,V,B} which Julia never requests — left untouched here. Same _geev_run! core, balanc passed through.
+# (balanc, jobvl, jobvr, sense, n, A, lda, wr, wi, vl, ldvl, vr, ldvr, ilo, ihi, scale, abnrm, rconde,
+#  rcondv, work, lwork, iwork, info, +4 lens)
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval Base.@ccallable function $(Symbol(p, "geevx_64_"))(balanc::Ptr{UInt8}, jobvl::Ptr{UInt8},
+            jobvr::Ptr{UInt8}, sense::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
+            wr::Ptr{$T}, wi::Ptr{$T}, vl::Ptr{$T}, ldvl::Ptr{Int64}, vr::Ptr{$T}, ldvr::Ptr{Int64},
+            ilo::Ptr{Int64}, ihi::Ptr{Int64}, scale::Ptr{$T}, abnrm::Ptr{$T}, rconde::Ptr{$T},
+            rcondv::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, info::Ptr{Int64},
+            lb::Clong, ljl::Clong, ljr::Clong, ls::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        bl = _cabi_char(balanc); jl = _cabi_char(jobvl); jr = _cabi_char(jobvr)
+        if jl != 'N'
+            unsafe_store!(info, Int64(-2)); return
+        end
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wra, wia, _, VRm, il, ih, scl, anr = _geev_run!(bl, jl, jr, Am)
+        wrp = PtrVector(wr, N); wip = PtrVector(wi, N)
+        @inbounds for i in 1:N; wrp[i] = wra[i]; wip[i] = wia[i]; end
+        if jr == 'V'
+            VRp = PtrMatrix(vr, N, N, Int(unsafe_load(ldvr)))
+            @inbounds for j in 1:N, i in 1:N; VRp[i, j] = VRm[i, j]; end
+        end
+        unsafe_store!(ilo, Int64(il)); unsafe_store!(ihi, Int64(ih))
+        scp = PtrVector(scale, N); @inbounds for i in 1:N; scp[i] = scl[i]; end
+        unsafe_store!(abnrm, $T(anr)); unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# COMPLEX {c,z}geevx_ — scale/abnrm/rconde/rcondv are REAL ($R); one w output; a REAL rwork block replaces
+# real's integer iwork. (balanc, jobvl, jobvr, sense, n, A, lda, w, vl, ldvl, vr, ldvr, ilo, ihi, scale,
+#  abnrm, rconde, rcondv, work, lwork, rwork, info, +4 lens)
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "geevx_64_"))(balanc::Ptr{UInt8}, jobvl::Ptr{UInt8},
+            jobvr::Ptr{UInt8}, sense::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
+            w::Ptr{$T}, vl::Ptr{$T}, ldvl::Ptr{Int64}, vr::Ptr{$T}, ldvr::Ptr{Int64}, ilo::Ptr{Int64},
+            ihi::Ptr{Int64}, scale::Ptr{$R}, abnrm::Ptr{$R}, rconde::Ptr{$R}, rcondv::Ptr{$R},
+            work::Ptr{$T}, lwork::Ptr{Int64}, rwork::Ptr{$R}, info::Ptr{Int64},
+            lb::Clong, ljl::Clong, ljr::Clong, ls::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        bl = _cabi_char(balanc); jl = _cabi_char(jobvl); jr = _cabi_char(jobvr)
+        if jl != 'N'
+            unsafe_store!(info, Int64(-2)); return
+        end
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wa, _, VRm, il, ih, scl, anr = _geev_run!(bl, jl, jr, Am)
+        wp = PtrVector(w, N); @inbounds for i in 1:N; wp[i] = wa[i]; end
+        if jr == 'V'
+            VRp = PtrMatrix(vr, N, N, Int(unsafe_load(ldvr)))
+            @inbounds for j in 1:N, i in 1:N; VRp[i, j] = VRm[i, j]; end
+        end
+        unsafe_store!(ilo, Int64(il)); unsafe_store!(ihi, Int64(ih))
+        scp = PtrVector(scale, N); @inbounds for i in 1:N; scp[i] = scl[i]; end
+        unsafe_store!(abnrm, $R(anr)); unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# ── gees: Schur decomposition (Schur form + Schur vectors). Routes schur(A) (Julia calls gees!('V',A)). ──
+# `sort`/`select`/`bwork` (eigenvalue sorting) are not supported — sort is always 'N' from Julia, so
+# select/bwork are ignored (Ptr{Cvoid}) and sdim=0. _gees_run! uses permute-only balance so Z stays
+# orthogonal. REAL {s,d}gees_(jobvs, sort, select, n, A, lda, sdim, wr, wi, vs, ldvs, work, lwork, bwork,
+# info, +2 lens).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval Base.@ccallable function $(Symbol(p, "gees_64_"))(jobvs::Ptr{UInt8}, sort::Ptr{UInt8},
+            select::Ptr{Cvoid}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, sdim::Ptr{Int64},
+            wr::Ptr{$T}, wi::Ptr{$T}, vs::Ptr{$T}, ldvs::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64},
+            bwork::Ptr{Cvoid}, info::Ptr{Int64}, ljvs::Clong, ls::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        jvs = _cabi_char(jobvs)
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wra, wia, VSm = _gees_run!(jvs, Am)
+        wrp = PtrVector(wr, N); wip = PtrVector(wi, N)
+        @inbounds for i in 1:N; wrp[i] = wra[i]; wip[i] = wia[i]; end
+        if jvs == 'V'
+            VSp = PtrMatrix(vs, N, N, Int(unsafe_load(ldvs)))
+            @inbounds for j in 1:N, i in 1:N; VSp[i, j] = VSm[i, j]; end
+        end
+        unsafe_store!(sdim, Int64(0)); unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# COMPLEX {c,z}gees_(jobvs, sort, select, n, A, lda, sdim, w, vs, ldvs, work, lwork, rwork, bwork, info,
+# +2 lens). One w output + a REAL rwork block (vs real's wr/wi).
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "gees_64_"))(jobvs::Ptr{UInt8}, sort::Ptr{UInt8},
+            select::Ptr{Cvoid}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, sdim::Ptr{Int64},
+            w::Ptr{$T}, vs::Ptr{$T}, ldvs::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64},
+            rwork::Ptr{$R}, bwork::Ptr{Cvoid}, info::Ptr{Int64}, ljvs::Clong, ls::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        jvs = _cabi_char(jobvs)
+        N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        Am = PtrMatrix(A, N, N, ld)
+        wa, VSm = _gees_run!(jvs, Am)
+        wp = PtrVector(w, N); @inbounds for i in 1:N; wp[i] = wa[i]; end
+        if jvs == 'V'
+            VSp = PtrMatrix(vs, N, N, Int(unsafe_load(ldvs)))
+            @inbounds for j in 1:N, i in 1:N; VSp[i, j] = VSm[i, j]; end
+        end
+        unsafe_store!(sdim, Int64(0)); unsafe_store!(info, Int64(0)); return
+    end
+end

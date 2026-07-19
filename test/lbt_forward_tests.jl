@@ -184,3 +184,51 @@ end
         PureBLAS.deactivate()
     end
 end
+
+@testitem "LBT in-process forward: general eigensolver (eigen/eigvals/schur → geev/geevx/gees)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    Random.seed!(0xBEEF)
+    n = 48
+    A = randn(n, n); Az = randn(ComplexF64, n, n)     # general NON-symmetric / non-Hermitian
+    # A matrix guaranteed to have complex-conjugate eigenvalue pairs (real-packed VR path).
+    Bp = zeros(n, n); i = 1
+    while i + 1 <= n
+        Bp[i, i] = randn(); Bp[i+1, i+1] = Bp[i, i]; Bp[i, i+1] = randn(); Bp[i+1, i] = -Bp[i, i+1]; i += 2
+    end
+    Qr, _ = qr(randn(n, n)); Acp = Matrix(Qr) * Bp * Matrix(Qr)'
+
+    evsort(v) = sort(v; by = x -> (real(x), imag(x)))
+    # OpenBLAS oracles captured BEFORE activate.
+    ref = (ev = evsort(eigvals(copy(A))), zev = evsort(eigvals(copy(Az))),
+           cpev = evsort(eigvals(copy(Acp))),
+           eF = eigen(copy(A)), zeF = eigen(copy(Az)),
+           sch = (F = schur(copy(A)); Matrix(F.Z) * Matrix(F.T) * Matrix(F.Z)' - A))
+
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    geev_b = fwd("dgeev_"); geevx_b = fwd("dgeevx_"); zgeev_b = fwd("zgeev_")
+    zgeevx_b = fwd("zgeevx_"); gees_b = fwd("dgees_"); zgees_b = fwd("zgees_")
+    PureBLAS.activate()
+    try
+        # Pointers actually changed (forwarded to PureBLAS). eigen/eigvals route via geevx; schur via gees.
+        @test fwd("dgeev_") != geev_b && fwd("dgeevx_") != geevx_b
+        @test fwd("zgeev_") != zgeev_b && fwd("zgeevx_") != zgeevx_b
+        @test fwd("dgees_") != gees_b && fwd("zgees_") != zgees_b
+        # eigvals / eigen correct under PureBLAS.
+        @test maximum(abs, evsort(eigvals(copy(A))) .- ref.ev) < 1e-9          # real eigvals (geevx)
+        @test maximum(abs, evsort(eigvals(copy(Az))) .- ref.zev) < 1e-9        # complex eigvals
+        @test maximum(abs, evsort(eigvals(copy(Acp))) .- ref.cpev) < 1e-9      # conj-pair spectrum
+        Fe = eigen(copy(A))                                                    # real eigen (geevx jobvr='V')
+        @test maximum(abs, evsort(Fe.values) .- ref.ev) < 1e-9
+        @test maximum(abs, A * Fe.vectors - Fe.vectors * Diagonal(Fe.values)) / (opnorm(A, 1) * n * eps()) < 200
+        Fcp = eigen(copy(Acp))                                                 # conj-pair eigen residual
+        @test maximum(abs, Acp * Fcp.vectors - Fcp.vectors * Diagonal(Fcp.values)) / (opnorm(Acp, 1) * n * eps()) < 200
+        Fze = eigen(copy(Az))                                                  # complex eigen
+        @test maximum(abs, Az * Fze.vectors - Fze.vectors * Diagonal(Fze.values)) / (opnorm(Az, 1) * n * eps()) < 200
+        Fs = schur(copy(A))                                                    # schur (gees)
+        @test maximum(abs, (Matrix(Fs.Z) * Matrix(Fs.T) * Matrix(Fs.Z)' - A) .- ref.sch) < 1e-8
+        @test maximum(abs, Matrix(Fs.Z)' * Matrix(Fs.Z) - I) < 1e-10
+    finally
+        PureBLAS.deactivate()
+    end
+end

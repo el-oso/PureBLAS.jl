@@ -34,6 +34,9 @@ include("geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-reveali
 include("gels.jl")          # LAPACK: least-squares / min-norm solve (gels) over QR/LQ
 include("gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
 include("hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) — nonsymmetric-eigen front half
+include("hseqr.jl")         # LAPACK: Schur decomposition of upper-Hessenberg (hseqr, Francis double-shift QR)
+include("trevc.jl")         # LAPACK: right eigenvectors of Schur form (trevc, back-substitution)
+include("geev.jl")          # LAPACK: general eigensolver drivers (geev/gees + gebak) — eigen/eigvals/schur
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)

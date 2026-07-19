@@ -530,3 +530,92 @@ end
         @test maxe(Q * Hu * Q', A0) < 500 * eps(real(T))                    # Q·H·Qᴴ = A
     end
 end
+
+@testitem "geev (general eigen) vs LAPACK — eigenvalues + A·V=V·Λ residual, real+complex, conj-pairs" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(0xEE)
+    evmatch(a, b) = (a = sort(collect(a); by = x -> (real(x), imag(x)));
+                     b = sort(collect(b); by = x -> (real(x), imag(x)));
+                     maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1))
+    # reconstruct the complex eigenvector matrix from real-packed VR (LAPACK conj-pair convention)
+    function evecs_real(wr, wi, VR)
+        n = length(wr); E = zeros(ComplexF64, n, n); j = 1
+        while j <= n
+            if wi[j] == 0
+                E[:, j] = VR[:, j]
+            else
+                for i in 1:n
+                    E[i, j] = VR[i, j] + im * VR[i, j+1]; E[i, j+1] = VR[i, j] - im * VR[i, j+1]
+                end
+                j += 1
+            end
+            j += 1
+        end
+        E
+    end
+    @testset "real n=$n" for n in (2, 4, 8, 16, 32, 64)
+        A = randn(n, n)
+        wr, wi, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
+        λ = complex.(wr, wi); E = evecs_real(wr, wi, VR)
+        @test maximum(abs.(A * E - E * Diagonal(λ))) / (opnorm(A, 1) * n * eps()) < 100
+        @test evmatch(λ, eigvals(copy(A))) < 1e-8            # vs LinearAlgebra (OpenBLAS)
+        wr2, wi2 = PureBLAS.geev!('N', 'N', copy(A))         # values-only path
+        @test evmatch(complex.(wr2, wi2), λ) < 1e-10
+    end
+    @testset "conj-pair real n=$n" for n in (4, 8, 16)       # block rotations → guaranteed complex pairs
+        B = zeros(n, n); i = 1
+        while i + 1 <= n
+            θ = randn(); a = randn()
+            B[i, i] = a; B[i+1, i+1] = a; B[i, i+1] = θ; B[i+1, i] = -θ; i += 2
+        end
+        Q, _ = qr(randn(n, n)); A = Matrix(Q) * B * Matrix(Q)'
+        wr, wi, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
+        @test count(!iszero, wi) > 0                          # actually has conjugate pairs
+        E = evecs_real(wr, wi, VR)
+        @test maximum(abs.(A * E - E * Diagonal(complex.(wr, wi)))) / (opnorm(A, 1) * n * eps()) < 100
+        @test evmatch(complex.(wr, wi), eigvals(copy(A))) < 1e-8
+    end
+    @testset "complex n=$n" for n in (2, 4, 8, 16, 32)
+        A = randn(ComplexF64, n, n)
+        w, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
+        @test maximum(abs.(A * VR - VR * Diagonal(w))) / (opnorm(A, 1) * n * eps()) < 100
+        @test evmatch(w, eigvals(copy(A))) < 1e-8
+        w2, = PureBLAS.geev!('N', 'N', copy(A))
+        @test evmatch(w2, w) < 1e-10
+    end
+    @test_throws ArgumentError PureBLAS.geev!('V', 'N', randn(4, 4))   # left vectors not implemented
+end
+
+@testitem "gees (Schur) vs LAPACK — Z·T·Zᴴ=A reconstruction, Z orthonormal, real+complex" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(0x5C)
+    evmatch(a, b) = (a = sort(collect(a); by = x -> (real(x), imag(x)));
+                     b = sort(collect(b); by = x -> (real(x), imag(x)));
+                     maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1))
+    @testset "real n=$n" for n in (2, 4, 8, 16, 32)
+        A = randn(n, n)
+        T, Z, w = PureBLAS.gees!('V', copy(A))
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11    # A = Z·T·Zᵀ
+        @test maximum(abs.(Z' * Z - I)) < 1e-12                                # Z orthonormal
+        @test evmatch(w, eigvals(copy(A))) < 1e-8
+        @test all(iszero, [T[i, j] for j in 1:n for i in j+2:n])              # quasi-upper-triangular
+    end
+    @testset "conj-pair real n=$n" for n in (4, 8, 16)
+        B = zeros(n, n); i = 1
+        while i + 1 <= n
+            θ = randn(); a = randn(); B[i, i] = a; B[i+1, i+1] = a; B[i, i+1] = θ; B[i+1, i] = -θ; i += 2
+        end
+        Q, _ = qr(randn(n, n)); A = Matrix(Q) * B * Matrix(Q)'
+        T, Z, w = PureBLAS.gees!('V', copy(A))
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11
+        @test maximum(abs.(Z' * Z - I)) < 1e-12
+    end
+    @testset "complex n=$n" for n in (2, 4, 8, 16, 32)
+        A = randn(ComplexF64, n, n)
+        T, Z, w = PureBLAS.gees!('V', copy(A))
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11
+        @test maximum(abs.(Z' * Z - I)) < 1e-12
+        @test evmatch(w, eigvals(copy(A))) < 1e-8
+        @test all(iszero, [T[i, j] for j in 1:n for i in j+1:n])              # upper-triangular (complex)
+    end
+end
