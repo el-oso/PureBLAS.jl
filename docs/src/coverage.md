@@ -1,7 +1,7 @@
 # LAPACK / BLAS coverage
 
 This page tracks which `LinearAlgebra` operations route to PureBLAS after
-[`PureBLAS.activate()`](@ref), and their optimization status.
+`PureBLAS.activate()`, and their optimization status.
 
 **Legend**
 
