@@ -87,21 +87,17 @@ end
 #   'O' — overwrite A: jobu='O' writes U's economy columns into A; jobvt='O' writes Vᵀ's economy rows into
 #         A. (LAPACK forbids jobu=jobvt='O' → info=-1.) A is destroyed by the factorization first, then the
 #         fresh vectors are written into it — no aliasing with the returned Matrices.
-Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
-        A::Ptr{Float64}, lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{Float64}, ldu::Ptr{Int64},
-        VT::Ptr{Float64}, ldvt::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64},
-        len_jobu::Clong, len_jobvt::Clong)::Cvoid
-    if unsafe_load(lwork) == Int64(-1)                 # workspace query
-        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
-    end
-    ju = _cabi_char(jobu); jvt = _cabi_char(jobvt)
-    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); mn = min(M, N)
+# Shared SVD C-ABI core: given the already-deref'd job chars + raw pointers/dims, compute the SVD via
+# PureBLAS's gesvd! driver (which picks bdsqr vs bdsdc divide-and-conquer by size) and write into the
+# caller's buffers. Used by BOTH dgesvd_64_ (jobu,jobvt) and dgesdd_64_ (jobz → same (ju,jvt)).
+@inline function _svd_cabi!(ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{Float64}, ld::Int,
+        S::Ptr{Float64}, U::Ptr{Float64}, ldu::Int, VT::Ptr{Float64}, ldvt::Int, info::Ptr{Int64})
+    mn = min(M, N)
     u_ok = ju == 'N' || ju == 'S' || ju == 'A' || ju == 'O'
     v_ok = jvt == 'N' || jvt == 'S' || jvt == 'A' || jvt == 'O'
     if !(u_ok && v_ok) || (ju == 'O' && jvt == 'O')    # unknown job, or the illegal jobu=jobvt='O'
         unsafe_store!(info, Int64(-1)); return
     end
-    ld = Int(unsafe_load(lda))
     Av = PtrMatrix(A, M, N, ld)
     if ju == 'N' && jvt == 'N'                         # values only → 0-alloc into caller's S
         gesvd_vals!(Av, PtrVector(S, mn))
@@ -121,9 +117,9 @@ Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{
     vscr && (ws.cabi_Vt = _gm(ws.cabi_Vt, mn, N))
     GC.@preserve ws begin
         Ut  = uscr ? PtrMatrix(pointer(ws.cabi_U), M, mn, size(ws.cabi_U, 1)) :
-                     PtrMatrix(U, M, ncu, Int(unsafe_load(ldu)))
+                     PtrMatrix(U, M, ncu, ldu)
         Vtt = vscr ? PtrMatrix(pointer(ws.cabi_Vt), mn, N, size(ws.cabi_Vt, 1)) :
-                     PtrMatrix(VT, ncv, N, Int(unsafe_load(ldvt)))
+                     PtrMatrix(VT, ncv, N, ldvt)
         gesvd!(Av, Ut, PtrVector(S, mn), Vtt; full_u = full_u, full_v = full_v)
         if ju == 'O'                                   # economy U columns overwrite A
             @inbounds for j in 1:mn, i in 1:M; Av[i, j] = Ut[i, j]; end
@@ -133,5 +129,39 @@ Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{
         end
     end
     unsafe_store!(info, Int64(0))
+    return
+end
+
+Base.@ccallable function dgesvd_64_(jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        A::Ptr{Float64}, lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{Float64}, ldu::Ptr{Int64},
+        VT::Ptr{Float64}, ldvt::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64},
+        len_jobu::Clong, len_jobvt::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)                 # workspace query
+        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
+    end
+    _svd_cabi!(_cabi_char(jobu), _cabi_char(jobvt), Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
+    return
+end
+
+# ── gesdd: divide-and-conquer SVD ─────────────────────────────────────────────────────────────────────
+# `dgesdd_64_(jobz, m, n, A, lda, S, U, ldu, VT, ldvt, work, lwork, iwork, info, len_jobz)` — 1 char + an
+# extra Int64 `iwork` workspace arg (ignored; PureBLAS owns its scratch). Julia's `svd()`/`svdvals` route
+# through gesdd (NOT gesvd), so this is what makes them use PureBLAS. gesdd's single `jobz` maps to gesvd's
+# (jobu,jobvt) = (jobz,jobz) for N/S/A, dispatched to the same gesvd! driver (which does D&C above
+# _SVD_DC_CROSS). jobz='O' (overwrite A) is NOT supported (info=-1) — Julia only ever uses N/S/A.
+Base.@ccallable function dgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64},
+        lda::Ptr{Int64}, S::Ptr{Float64}, U::Ptr{Float64}, ldu::Ptr{Int64}, VT::Ptr{Float64},
+        ldvt::Ptr{Int64}, work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, info::Ptr{Int64},
+        len_jobz::Clong)::Cvoid
+    if unsafe_load(lwork) == Int64(-1)                 # workspace query
+        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
+    end
+    jz = _cabi_char(jobz)
+    if jz == 'O'                                       # gesdd overwrite-A mode not supported
+        unsafe_store!(info, Int64(-1)); return
+    end
+    _svd_cabi!(jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
+        A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
     return
 end
