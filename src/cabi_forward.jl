@@ -155,5 +155,13 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
         _reg!($(p * "getrs_"), () -> @cfunction($(Symbol(p, "getrs_64_")), Cvoid,
             (_CU, _CI, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "potri_"), () -> @cfunction($(Symbol(p, "potri_64_")), Cvoid,
+            (_CU, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "trtri_"), () -> @cfunction($(Symbol(p, "trtri_64_")), Cvoid,
+            (_CU, _CU, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
     end
+end
+for (p, T) in (("d", Float64), ("c", ComplexF32), ("z", ComplexF64))   # getri: matches getrf coverage (no s)
+    @eval _reg!($(p * "getri_"), () -> @cfunction($(Symbol(p, "getri_64_")), Cvoid,
+        (_CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI)))
 end

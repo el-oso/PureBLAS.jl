@@ -21,6 +21,7 @@
            symm = Symmetric(A) * Bm, trsm = UpperTriangular(At) \ Bm,
            chol = Matrix(cholesky(copy(SPD)).U), lusol = lu(copy(A)) \ b, chsol = cholesky(copy(SPD)) \ b,
            atsol = transpose(A) \ b, trsol = UpperTriangular(At) \ b,
+           ichol = inv(cholesky(copy(SPD))), itri = inv(UpperTriangular(At)),
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
            zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb)
 
@@ -29,6 +30,7 @@
     gemm_before = fwd("dgemm_"); geqrf_before = fwd("dgeqrf_")
     zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_"); gesdd_before = fwd("dgesdd_")
     getrs_before = fwd("dgetrs_"); potrs_before = fwd("dpotrs_"); trtrs_before = fwd("dtrtrs_")
+    getri_before = fwd("dgetri_"); potri_before = fwd("dpotri_"); trtri_before = fwd("dtrtri_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -51,6 +53,11 @@
         @test maximum(abs, (transpose(A) \ b) .- ref.atsol) < 1e-9         # getrs trans='T' (reverse pivots)
         @test maximum(abs, (cholesky(copy(SPD)) \ b) .- ref.chsol) < 1e-9  # potrf + potrs
         @test maximum(abs, (UpperTriangular(At) \ b) .- ref.trsol) < 1e-9   # trtrs
+        # Inverses now route (getri/potri/trtri) — inv() uses PureBLAS.
+        @test fwd("dgetri_") != getri_before && fwd("dpotri_") != potri_before && fwd("dtrtri_") != trtri_before
+        @test maximum(abs, inv(copy(A)) * A - I) < 1e-8                     # getri
+        @test maximum(abs, inv(cholesky(copy(SPD))) - ref.ichol) < 1e-9    # potri
+        @test maximum(abs, inv(UpperTriangular(At)) - ref.itri) < 1e-9     # trtri
         # gesvd routes (direct LAPACK call).
         S = LA.gesvd!('N', 'N', copy(A))[2]
         @test maximum(abs, S .- ref.svals) < 1e-9
