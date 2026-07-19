@@ -235,3 +235,75 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         unsafe_store!(info, Int64(0)); return
     end
 end
+
+# ── INVERSES: getri / potri / trtri (solve A·X = I on the factors, then copy back) ────────────────────
+# Correctness-first: compute the inverse by solving A·X = I with the same trsm!/_laswp! machinery as the
+# solves (self-consistent on any-backend factors). O(n³) scratch solve — fine (inverses aren't hot; prefer
+# `\`). getri needs the LU + ipiv from getrf; potri/trtri need only the (Cholesky / triangular) factor.
+
+# getri: A⁻¹ from the LU factors in A (+ ipiv). Solve A·X=I ⇒ laswp(I) then L\ then U\; copy X→A.
+for (p, T) in (("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "getri_64_"))(n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
+            ipiv::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        N = Int(unsafe_load(n)); Am = PtrMatrix(A, N, N, Int(unsafe_load(lda))); ip = PtrVector(ipiv, N)
+        X = zeros($T, N, N)
+        @inbounds for i in 1:N; X[i, i] = one($T); end
+        GC.@preserve X begin
+            Xm = PtrMatrix(pointer(X), N, N, N)
+            _laswp!(Xm, ip, 1, N, 1, N)
+            trsm!(Xm, Am; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one($T))
+            trsm!(Xm, Am; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one($T))
+            @inbounds for j in 1:N, i in 1:N; Am[i, j] = Xm[i, j]; end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# potri: A⁻¹ from the Cholesky factor in A (uplo). Solve A·X=I via the two triangular solves; copy the
+# uplo triangle of X (A⁻¹ is Hermitian) back to A — LAPACK dpotri returns only the uplo triangle.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "potri_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, info::Ptr{Int64}, lu::Clong)::Cvoid
+        N = Int(unsafe_load(n)); ul = _cabi_char(uplo); Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        ct = $(T <: Complex ? 'C' : 'T')
+        X = zeros($T, N, N)
+        @inbounds for i in 1:N; X[i, i] = one($T); end
+        GC.@preserve X begin
+            Xm = PtrMatrix(pointer(X), N, N, N)
+            if ul == 'L'
+                trsm!(Xm, Am; side = 'L', uplo = 'L', transA = 'N', alpha = one($T))
+                trsm!(Xm, Am; side = 'L', uplo = 'L', transA = ct, alpha = one($T))
+                @inbounds for j in 1:N, i in j:N; Am[i, j] = Xm[i, j]; end     # lower triangle
+            else
+                trsm!(Xm, Am; side = 'L', uplo = 'U', transA = ct, alpha = one($T))
+                trsm!(Xm, Am; side = 'L', uplo = 'U', transA = 'N', alpha = one($T))
+                @inbounds for j in 1:N, i in 1:j; Am[i, j] = Xm[i, j]; end     # upper triangle
+            end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# trtri: inverse of a triangular A (in place). Solve op(A)·X = I (one trsm), copy the uplo triangle back.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "trtri_64_"))(uplo::Ptr{UInt8}, diag::Ptr{UInt8},
+            n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, info::Ptr{Int64}, lu::Clong, ld::Clong)::Cvoid
+        N = Int(unsafe_load(n)); ul = _cabi_char(uplo); dg = _cabi_char(diag)
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        X = zeros($T, N, N)
+        @inbounds for i in 1:N; X[i, i] = one($T); end
+        GC.@preserve X begin
+            Xm = PtrMatrix(pointer(X), N, N, N)
+            trsm!(Xm, Am; side = 'L', uplo = ul, transA = 'N', diag = dg, alpha = one($T))
+            if ul == 'L'
+                @inbounds for j in 1:N, i in j:N; Am[i, j] = Xm[i, j]; end
+            else
+                @inbounds for j in 1:N, i in 1:j; Am[i, j] = Xm[i, j]; end
+            end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
