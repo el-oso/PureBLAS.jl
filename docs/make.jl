@@ -19,6 +19,7 @@ makedocs(;
         "Design" => "design.md",
         "SIMD & Hardware Adaptation" => "simd.md",
         "Performance" => "performance.md",
+        "LAPACK/BLAS Coverage" => "coverage.md",
     ],
 )
 
