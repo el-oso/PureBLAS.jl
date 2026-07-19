@@ -232,3 +232,194 @@ end
         PureBLAS.deactivate()
     end
 end
+
+@testitem "LBT in-process forward: generalized/tridiagonal eigen (eigen(A,B)/eigen(Sym,Sym)/SymTridiagonal/gtsv)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xC0DE)
+    n = 40
+    A = randn(n, n); Az = randn(ComplexF64, n, n)
+    Ms = randn(n, n); As = Ms + Ms'                        # symmetric
+    Ns = randn(n, n); Bs = Ns * Ns' + n * I                # symmetric positive definite
+    Bw = (M = randn(n, n); M'M + n * I)                    # well-conditioned general B (all finite eigs)
+    Bwz = (M = randn(ComplexF64, n, n); M'M + n * I)
+    dv = randn(n); ev = randn(n - 1); ST = SymTridiagonal(dv, ev)
+    # tridiagonal system for a direct LAPACK.gtsv! routing check (Tridiagonal\b is native Julia, not gtsv)
+    dl = randn(n - 1); dd = randn(n) .+ 4; du = randn(n - 1)
+    Td = diagm(-1 => dl, 0 => dd, 1 => du); rhs = randn(n)
+
+    # OpenBLAS oracles captured BEFORE activate.
+    evsort(v) = sort(v; by = x -> (real(x), imag(x)))
+    # Set-match (nearest neighbour): robust to eigenvalue ORDER (sorting complex-conjugate pairs by
+    # (re,im) is unstable across backends when real parts coincide — an absolute sorted diff spuriously
+    # blows up though the spectra are identical). Correctness of magnitudes is what this asserts.
+    setmatch(p, q) = maximum(i -> minimum(j -> abs(p[i] - q[j]), eachindex(q)), eachindex(p))
+    ref = (gab = eigvals(copy(A), copy(Bw)), gabz = eigvals(copy(Az), copy(Bwz)),
+           gsym = eigvals(Symmetric(copy(As)), Symmetric(copy(Bs))),
+           stev = eigvals(ST), gtsv = LA.gtsv!(copy(dl), copy(dd), copy(du), copy(rhs)))
+    Fst_ref = eigen(ST)
+
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    ggev3_b = fwd("dggev3_"); zggev3_b = fwd("zggev3_"); gges3_b = fwd("dgges3_")
+    sygvd_b = fwd("dsygvd_"); stev_b = fwd("dstev_"); stegr_b = fwd("dstegr_"); gtsv_b = fwd("dgtsv_")
+    PureBLAS.activate()
+    try
+        @test fwd("dggev3_") != ggev3_b && fwd("zggev3_") != zggev3_b && fwd("dgges3_") != gges3_b
+        @test fwd("dsygvd_") != sygvd_b && fwd("dstev_") != stev_b && fwd("dstegr_") != stegr_b
+        @test fwd("dgtsv_") != gtsv_b
+        # eigen(A,B) / eigvals(A,B) → ggev3 (set-match: robust to conjugate-pair ordering)
+        @test setmatch(eigvals(copy(A), copy(Bw)), ref.gab) < 1e-8
+        @test setmatch(eigvals(copy(Az), copy(Bwz)), ref.gabz) < 1e-8
+        Fg = eigen(copy(A), copy(Bw))                       # generalized eigen residual (finite eigs)
+        @test maximum(abs, A * Fg.vectors - Bw * Fg.vectors * Diagonal(Fg.values)) /
+              ((opnorm(A, 1) + opnorm(Bw, 1)) * n) < 1e-10
+        # eigen(Symmetric,Symmetric) → sygvd
+        @test maximum(abs, eigvals(Symmetric(copy(As)), Symmetric(copy(Bs))) .- ref.gsym) < 1e-8
+        Fgs = eigen(Symmetric(copy(As)), Symmetric(copy(Bs)))
+        @test maximum(abs, As * Fgs.vectors - Bs * Fgs.vectors * Diagonal(Fgs.values)) /
+              (opnorm(As, 1) * opnorm(Bs, 1) * n) < 1e-10
+        # schur(A,B) → gges3
+        Fsc = schur(copy(A), copy(Bw))
+        @test maximum(abs, Fsc.Q * Fsc.S * Fsc.Z' - A) < 1e-9 * (opnorm(A, 1) + 1)
+        @test maximum(abs, Fsc.Q * Fsc.T * Fsc.Z' - Bw) < 1e-9 * (opnorm(Bw, 1) + 1)
+        # eigen(SymTridiagonal) → stegr; eigvals(SymTridiagonal) → stev
+        @test maximum(abs, eigvals(ST) .- ref.stev) < 1e-9
+        Fst = eigen(ST)
+        @test maximum(abs, sort(Fst.values) .- sort(Fst_ref.values)) < 1e-9
+        @test maximum(abs, Matrix(ST) * Fst.vectors - Fst.vectors * Diagonal(Fst.values)) < 1e-8 * (norm(dv) + norm(ev))
+        # direct LAPACK.gtsv! routes (Tridiagonal\b itself is native-Julia, not a BLAS/LAPACK call)
+        x = LA.gtsv!(copy(dl), copy(dd), copy(du), copy(rhs))
+        @test maximum(abs, Td * x - rhs) < 1e-9
+        @test maximum(abs, x .- ref.gtsv) < 1e-9
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
+@testitem "LBT in-process forward: batch-7 assembly (sysv/hesv/sytri/hetri, gbtrf/gbtrs, pttrf/pttrs/ptsv, stebz/stein, pstrf, QL/RQ, gelsy/tzrzf/ormrz, gelsd, trsyl, trexc/trsen, gglse, ggsvd)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xA55E)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+
+    # None of this batch's routines are reached through Julia's high-level `\`/factorize/eigen/svd
+    # dispatch (verified by grep over LinearAlgebra/src: sysv!/hesv!/gelsd!/gelsy! are never called
+    # outside lapack.jl; bunchkaufman routes through sytrf!/sytrs! instead; qr.jl's non-square `\`
+    # implements its own gelsy-like algorithm natively rather than calling LAPACK.gelsy!/gelsd!). So
+    # every check here is a DIRECT `LinearAlgebra.LAPACK.<name>!` call (mirrors the gtsv routing test).
+    before = Dict(s => fwd(s) for s in (
+        "dsysv_", "zhesv_", "dsytri_", "zhetri_", "dgbtrf_", "dgbtrs_", "dpttrf_", "dpttrs_", "dptsv_",
+        "dstebz_", "dstein_", "dpstrf_", "dgeqlf_", "dgerqf_", "dorgql_", "dorgrq_", "dormql_", "dormrq_",
+        "dgelsy_", "dtzrzf_", "dormrz_", "dgelsd_", "dtrsyl_", "dtrexc_", "dtrsen_", "dgglse_", "dggsvd3_",
+    ))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))    # every symbol actually rerouted
+
+        n = 20
+        # sysv / hesv / sytri / hetri
+        M = randn(n, n); A = M + M' + n * I; Bv = randn(n, 3)
+        Xr, _, _ = LA.sysv!('L', copy(A), copy(Bv))
+        @test norm(A * Xr - Bv) < 1e-8 * (norm(A) * norm(Xr) + norm(Bv))
+        Mz = randn(ComplexF64, n, n); Az = Mz + Mz' + n * I; Bz = randn(ComplexF64, n, 3)
+        Xz, _, _ = LA.hesv!('L', copy(Az), copy(Bz))
+        @test norm(Az * Xz - Bz) < 1e-8 * (norm(Az) * norm(Xz) + norm(Bz))
+        LD, ipiv, _ = LA.sytrf!('L', copy(A))
+        Ainv = LA.sytri!('L', copy(LD), ipiv)
+        @test norm(A * Symmetric(Ainv, :L) - I) < 1e-6 * n
+
+        # gbtrf / gbtrs (banded LU)
+        kl, ku = 2, 1
+        Ab = zeros(n, n)
+        for j in 1:n, i in max(1, j - ku):min(n, j + kl); Ab[i, j] = randn(); end
+        Ab += n * I
+        ldab = 2kl + ku + 1
+        AB = zeros(ldab, n)
+        for j in 1:n, i in max(1, j - ku):min(n, j + kl); AB[kl + ku + 1 + i - j, j] = Ab[i, j]; end
+        ABf, ipivb = LA.gbtrf!(kl, ku, n, copy(AB))
+        bb = randn(n)
+        xb = LA.gbtrs!('N', kl, ku, n, ABf, ipivb, copy(bb))
+        @test norm(Ab * xb - bb) < 1e-8 * (norm(Ab) + 1)
+
+        # pttrf / pttrs / ptsv (SPD tridiagonal)
+        dv = rand(n) .+ (n + 2); ev = randn(n - 1) .* 0.3
+        At = SymTridiagonal(dv, ev)
+        d1, e1 = LA.pttrf!(copy(dv), copy(ev))
+        bt = randn(n, 2)
+        xt = LA.pttrs!(d1, e1, copy(bt))
+        @test norm(Matrix(At) * xt - bt) < 1e-7 * (norm(Matrix(At)) + 1)
+        xt2 = LA.ptsv!(copy(dv), copy(ev), copy(bt))
+        @test norm(Matrix(At) * xt2 - bt) < 1e-7 * (norm(Matrix(At)) + 1)
+
+        # stebz / stein (SymTridiagonal eigen, expert path)
+        wb, ibb, isb = LA.stebz!('A', 'E', 0.0, 0.0, 0, 0, -1.0, copy(dv), copy(ev))
+        @test maximum(abs, sort(wb) .- sort(eigvals(At))) < 1e-8 * (norm(dv) + norm(ev) + 1)
+        Zb = LA.stein!(dv, ev, wb, ibb, isb)
+        @test maximum(abs, Matrix(At) * Zb - Zb * Diagonal(wb)) < 1e-6 * (norm(dv) + norm(ev) + 1)
+
+        # pstrf (pivoted Cholesky)
+        Mp = randn(n, n); Ap = Mp * Mp' + n * I
+        Fp, pv, rk, infop = LA.pstrf!('L', copy(Ap), -1.0)
+        @test infop == 0 && rk == n
+        @test maximum(abs, tril(Fp) * tril(Fp)' .- Ap[pv, pv]) < 1e-6 * maximum(abs, Ap)
+
+        # QL / RQ
+        Aql = randn(n + 4, n)               # QL needs rows ≥ cols
+        Fql, tql = LA.geqlf!(copy(Aql))
+        Qql = LA.orgql!(copy(Fql), tql)
+        @test maximum(abs, Qql' * Qql - I) < 1e-8
+        Arq = randn(n, n + 4)               # RQ needs rows ≤ cols
+        Frq, trq = LA.gerqf!(copy(Arq))
+        Qrq = LA.orgrq!(copy(Frq), trq)
+        @test maximum(abs, Qrq * Qrq' - I) < 1e-8
+        Cql = randn(n + 4, 3)
+        Cql1 = LA.ormql!('L', 'T', copy(Fql), tql, copy(Cql))
+        Cql2 = LA.ormql!('L', 'N', copy(Fql), tql, copy(Cql1))
+        @test maximum(abs, Cql2 .- Cql) < 1e-6
+
+        # gelsy / tzrzf / ormrz (rank-deficient LS via RZ) and gelsd (via SVD)
+        m2, n2 = 25, 15
+        A2 = randn(m2, n2); b2 = randn(m2)
+        B2 = zeros(max(m2, n2), 1); B2[1:m2, 1] = b2
+        Xy, rky = LA.gelsy!(copy(A2), copy(B2))
+        @test rky == n2
+        @test norm(A2' * (A2 * Xy[1:n2, :] - b2)) < 1e-6 * (norm(A2)^2 * norm(Xy) + 1)
+        B2d = zeros(max(m2, n2), 1); B2d[1:m2, 1] = b2
+        Xd, rkd = LA.gelsd!(copy(A2), copy(B2d))
+        @test rkd == n2
+        @test norm(Xd[1:n2, :] .- Xy[1:n2, :]) < 1e-5 * (norm(Xy) + 1)
+
+        # trsyl (triangular Sylvester)
+        Atri = triu(randn(n, n)) + n * I
+        Btri = triu(randn(6, 6)) .* 0.3 + 3n * I
+        Ctri = randn(n, 6)
+        Xtri, sctri = LA.trsyl!('N', 'N', copy(Atri), copy(Btri), copy(Ctri))
+        @test norm(Atri * Xtri + Xtri * Btri - sctri * Ctri) < 1e-6 * (norm(Atri) * norm(Btri) * norm(Xtri) + norm(Ctri))
+
+        # trexc / trsen (Schur reorder)
+        Ssch = schur(randn(n, n))
+        Torig = Matrix(Ssch.T); Q0 = Matrix(Ssch.Z)
+        Aorig = Q0 * Torig * Q0'
+        Te, Qe = LA.trexc!('V', 1, min(3, n), copy(Torig), copy(Q0))
+        @test maximum(abs, Qe * Te * Qe' - Aorig) < 1e-7 * (opnorm(Aorig, 1) + 1)
+        sel = zeros(Int, n); sel[1] = 1
+        Ts, Qs, ws, ss, seps = LA.trsen!('N', 'V', sel, copy(Torig), copy(Q0))
+        @test maximum(abs, Qs * Ts * Qs' - Aorig) < 1e-7 * (opnorm(Aorig, 1) + 1)
+
+        # gglse (equality-constrained LS)
+        Ag = randn(10, 6); cg = randn(10); Bg = randn(3, 6); dg = Bg * randn(6)
+        xg, resg = LA.gglse!(copy(Ag), copy(cg), copy(Bg), copy(dg))
+        @test norm(Bg * xg - dg) < 1e-6 * (norm(Bg) * norm(xg) + norm(dg) + 1)
+
+        # ggsvd3 (generalized SVD, Float64 full-rank)
+        Ag2 = randn(10, 6); Bg2 = randn(8, 6)
+        Ug, Vg, Qg, alphag, betag, kg, lg, Rg = LA.ggsvd3!('U', 'V', 'Q', copy(Ag2), copy(Bg2))
+        @test maximum(abs, Ug' * Ug - I) < 1e-8
+        @test maximum(abs, Vg' * Vg - I) < 1e-8
+        @test length(alphag) == 6 && length(betag) == 6
+    finally
+        PureBLAS.deactivate()
+    end
+end
