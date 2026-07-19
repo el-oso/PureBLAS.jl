@@ -24,7 +24,8 @@
            ichol = inv(cholesky(copy(SPD))), itri = inv(UpperTriangular(At)),
            qrsol = qr(copy(A)) \ b, qrdet = det(qr(copy(A)).Q),
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
-           zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb)
+           zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb,
+           zqrsol = qr(copy(Az)) \ zb)
 
     @test length(PureBLAS._LBT_REGISTRARS) > 100
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
@@ -33,6 +34,7 @@
     getrs_before = fwd("dgetrs_"); potrs_before = fwd("dpotrs_"); trtrs_before = fwd("dtrtrs_")
     getri_before = fwd("dgetri_"); potri_before = fwd("dpotri_"); trtri_before = fwd("dtrtri_")
     geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
+    zgeqrt_before = fwd("zgeqrt_"); zgemqrt_before = fwd("zgemqrt_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -76,6 +78,11 @@
         Fz = lu(copy(Az))
         @test maximum(abs, (Fz.L * Fz.U) .- Az[Fz.p, :]) < 1e-9            # zgetrf (valid factorization)
         @test maximum(abs, (lu(copy(Az)) \ zb) .- ref.zlusol) < 1e-8       # zgetrf + zgetrs, both PureBLAS
+        @test fwd("zgeqrt_") != zgeqrt_before && fwd("zgemqrt_") != zgemqrt_before   # complex QR routes
+        Qz = qr(copy(Az))
+        @test maximum(abs, Matrix(Qz.Q)' * Matrix(Qz.Q) - I) < 1e-9        # zgemqrt: Q unitary
+        @test maximum(abs, Matrix(Qz.Q) * Qz.R - Az) < 1e-9                # zgeqrt+zgemqrt: Q·R = Az
+        @test maximum(abs, (qr(copy(Az)) \ zb) .- ref.zqrsol) < 1e-8       # complex qr()\b
 
         # QR routes to PureBLAS via geqrt+gemqrt (Julia's qr() is QRCompactWY). geqrf is now forwarded too
         # (its wrapper converts faer τ → LAPACK, so geqrf!+OpenBLAS-orgqr is correct — no more NaN-Q hazard).

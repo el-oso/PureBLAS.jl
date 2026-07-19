@@ -85,9 +85,9 @@ end
 # no Float32 QR kernel, and complex needs a VᴴV (not VᵀV) T-build — a separate wrapper.
 
 # Build the explicit unit-lower-trapezoidal reflector panel for block [i, i+ib) into dest[1:mp,1:ib].
-@inline function _qr_vpanel!(dest::AbstractMatrix{Float64}, Vsrc::AbstractMatrix{Float64}, i::Int, ib::Int, mp::Int)
+@inline function _qr_vpanel!(dest::AbstractMatrix{T}, Vsrc::AbstractMatrix{T}, i::Int, ib::Int, mp::Int) where {T}
     @inbounds for c in 1:ib, r in 1:mp
-        dest[r, c] = r == c ? 1.0 : (r > c ? Vsrc[i + r - 1, i + c - 1] : 0.0)
+        dest[r, c] = r == c ? one(T) : (r > c ? Vsrc[i + r - 1, i + c - 1] : zero(T))
     end
 end
 # Right-side block apply: C := C·Q (trans 'N') or C·Qᵀ ('T'), Q = I − V·Tblk·Vᵀ (V = mp×ib explicit unit).
@@ -384,4 +384,93 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         end
         unsafe_store!(info, Int64(0)); return
     end
+end
+
+# ── Complex QR (zgeqrt / zgemqrt): same structure as real, but the compact-WY T uses VᴴV (herk) not VᵀV,
+# τ is ALREADY LAPACK-convention (no inversion), and the block reflector is Q = I − V·T·Vᴴ (conjugate).
+# Mirrors complex geqrf!'s proven zlarft + trailing-update pattern (qr.jl). ComplexF64 only for now.
+@inline function _qr_t_cmplx!(Tm::AbstractMatrix{T}, Vp::AbstractMatrix{T}, tau::AbstractVector{T},
+        G::AbstractMatrix{T}) where {T<:Complex}
+    bs = length(tau); bs == 0 && return Tm
+    m = size(Vp, 1)
+    Vv = view(Vp, 1:m, 1:bs); Gv = view(G, 1:bs, 1:bs)
+    herk!(Gv, Vv; uplo = 'U', trans = 'C', alpha = true, beta = false)   # G = VᴴV (upper)
+    @inbounds for c in 1:bs
+        τc = tau[c]; Tm[c, c] = τc
+        for r in 1:(c - 1)
+            s = zero(T)
+            for kk in r:(c - 1); s = muladd(Tm[r, kk], -τc * Gv[kk, c], s); end
+            Tm[r, c] = s
+        end
+        for r in (c + 1):bs; Tm[r, c] = zero(T); end
+    end
+    return Tm
+end
+# Left apply: C := op(Q)·C, op(Q)= Q (trans 'N') or Qᴴ (trans 'C'), Q = I − V·T·Vᴴ.
+@inline function _qr_apply_left_cmplx!(trans::Char, C::AbstractMatrix{T}, Vp::AbstractMatrix{T},
+        Tblk::AbstractMatrix{T}) where {T<:Complex}
+    mp = size(C, 1); ib = size(Vp, 2); nc = size(C, 2)
+    (ib == 0 || nc == 0 || mp == 0) && return C
+    W = Matrix{T}(undef, ib, nc)
+    gemm!(W, Vp, C; transA = 'C', alpha = true, beta = false)            # W = Vᴴ·C
+    trmm!(W, Tblk; side = 'L', uplo = 'U', transA = trans)               # W := op(T)·W  (trans 'N'/'C')
+    gemm!(C, Vp, W; alpha = -one(T), beta = one(T))                      # C -= V·W
+    return C
+end
+# Right apply: C := C·op(Q).
+@inline function _qr_apply_right_cmplx!(trans::Char, C::AbstractMatrix{T}, Vp::AbstractMatrix{T},
+        Tblk::AbstractMatrix{T}) where {T<:Complex}
+    nr = size(C, 1); ib = size(Vp, 2)
+    (nr == 0 || ib == 0) && return C
+    W = Matrix{T}(undef, nr, ib)
+    gemm!(W, C, Vp; alpha = true, beta = false)                         # W = C·V
+    trmm!(W, Tblk; side = 'R', uplo = 'U', transA = trans)              # W := W·op(T)
+    gemm!(C, W, Vp; transB = 'C', alpha = -one(T), beta = one(T))       # C -= W·Vᴴ
+    return C
+end
+
+Base.@ccallable function zgeqrt_64_(m::Ptr{Int64}, n::Ptr{Int64}, nb::Ptr{Int64}, A::Ptr{ComplexF64},
+        lda::Ptr{Int64}, T::Ptr{ComplexF64}, ldt::Ptr{Int64}, work::Ptr{ComplexF64}, info::Ptr{Int64})::Cvoid
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); NB = Int(unsafe_load(nb)); k = min(M, N)
+    Av = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
+    Tm = PtrMatrix(T, NB, k, Int(unsafe_load(ldt)))
+    τ = Vector{ComplexF64}(undef, k)
+    GC.@preserve τ begin
+        geqrf!(Av, PtrVector(pointer(τ), k))                # complex τ already LAPACK-convention
+        Vpan = Matrix{ComplexF64}(undef, M, NB); Gs = Matrix{ComplexF64}(undef, NB, NB)
+        for i in 1:NB:k
+            ib = min(NB, k - i + 1); mp = M - i + 1
+            Vp = view(Vpan, 1:mp, 1:ib)
+            _qr_vpanel!(Vp, Av, i, ib, mp)
+            _qr_t_cmplx!(view(Tm, 1:ib, i:(i + ib - 1)), Vp, view(τ, i:(i + ib - 1)), Gs)
+        end
+    end
+    unsafe_store!(info, Int64(0)); return
+end
+
+Base.@ccallable function zgemqrt_64_(side::Ptr{UInt8}, trans::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
+        k::Ptr{Int64}, nb::Ptr{Int64}, V::Ptr{ComplexF64}, ldv::Ptr{Int64}, T::Ptr{ComplexF64},
+        ldt::Ptr{Int64}, C::Ptr{ComplexF64}, ldc::Ptr{Int64}, work::Ptr{ComplexF64}, info::Ptr{Int64},
+        len_s::Clong, len_t::Clong)::Cvoid
+    sd = _cabi_char(side); tr = _cabi_char(trans)
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); K = Int(unsafe_load(k)); NB = Int(unsafe_load(nb))
+    vrows = sd == 'L' ? M : N
+    Vm = PtrMatrix(V, vrows, K, Int(unsafe_load(ldv)))
+    Tm = PtrMatrix(T, NB, K, Int(unsafe_load(ldt)))
+    Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
+    forward = (sd == 'L' && tr != 'N') || (sd == 'R' && tr == 'N')     # L+C/R+N forward; L+N/R+C reverse
+    starts = collect(1:NB:K); forward || reverse!(starts)
+    Vpan = Matrix{ComplexF64}(undef, vrows, NB)
+    for i in starts
+        ib = min(NB, K - i + 1); mp = vrows - i + 1
+        Vp = view(Vpan, 1:mp, 1:ib)
+        _qr_vpanel!(Vp, Vm, i, ib, mp)
+        Tblk = view(Tm, 1:ib, i:(i + ib - 1))
+        if sd == 'L'
+            _qr_apply_left_cmplx!(tr, view(Cm, i:M, 1:N), Vp, Tblk)
+        else
+            _qr_apply_right_cmplx!(tr, view(Cm, 1:M, i:N), Vp, Tblk)
+        end
+    end
+    unsafe_store!(info, Int64(0)); return
 end
