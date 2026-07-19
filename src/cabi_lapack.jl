@@ -165,3 +165,73 @@ Base.@ccallable function dgesdd_64_(jobz::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int6
         A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info)
     return
 end
+
+# ── SOLVES on caller-provided factors: trtrs / potrs / getrs (compose trsm! + _laswp!) ────────────────
+# Self-consistent under a mixed backend: they operate on the factors passed in (standard-convention L/U/
+# Cholesky + LAPACK 1-based ipiv), so forwarding them is correct even if the factorization ran on OpenBLAS.
+# This is what makes `A\b` / `ldiv!` route to PureBLAS after activate() (getrs is the solve step of `\`).
+
+# trtrs: op(A)·X = B, A triangular n×n — a single trsm.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "trtrs_64_"))(uplo::Ptr{UInt8}, trans::Ptr{UInt8},
+            diag::Ptr{UInt8}, n::Ptr{Int64}, nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
+            B::Ptr{$T}, ldb::Ptr{Int64}, info::Ptr{Int64}, lu::Clong, lt::Clong, ld::Clong)::Cvoid
+        N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
+        trsm!(Bm, Am; side = 'L', uplo = _cabi_char(uplo), transA = _cabi_char(trans),
+            diag = _cabi_char(diag), alpha = one($T))
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# potrs: A·X = B with A = Cholesky factor (L·Lᴴ if uplo='L', Uᴴ·U if 'U') — two trsm (conj-transpose for
+# the complex Hermitian second solve).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "potrs_64_"))(uplo::Ptr{UInt8}, n::Ptr{Int64},
+            nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64},
+            info::Ptr{Int64}, lu::Clong)::Cvoid
+        N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
+        ct = $(T <: Complex ? 'C' : 'T')
+        if _cabi_char(uplo) == 'L'
+            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = 'N', alpha = one($T))    # L·Y = B
+            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = ct, alpha = one($T))     # Lᴴ·X = Y
+        else
+            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = ct, alpha = one($T))     # Uᴴ·Y = B
+            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = 'N', alpha = one($T))    # U·X = Y
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+
+# getrs: A·X = B with PA = LU (from getrf). trans='N': P·B then L\ then U\. trans='T'/'C': Uᵀ\, Lᵀ\, then
+# the row interchanges in REVERSE (LAPACK dgetrs). ipiv is LAPACK 1-based.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "getrs_64_"))(trans::Ptr{UInt8}, n::Ptr{Int64},
+            nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, ipiv::Ptr{Int64}, B::Ptr{$T},
+            ldb::Ptr{Int64}, info::Ptr{Int64}, lt::Clong)::Cvoid
+        N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs)); tr = _cabi_char(trans)
+        Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
+        ip = PtrVector(ipiv, N)
+        if tr == 'N'
+            _laswp!(Bm, ip, 1, N, 1, R)                                              # P·B (forward)
+            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one($T))  # L·Y = PB
+            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one($T))  # U·X = Y
+        else
+            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = tr, diag = 'N', alpha = one($T))   # Uᵀ·Y = B
+            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = tr, diag = 'U', alpha = one($T))   # Lᵀ·Z = Y
+            @inbounds for i in N:-1:1                                                 # reverse interchanges
+                q = Int(ip[i])
+                if q != i
+                    for j in 1:R
+                        Bm[i, j], Bm[q, j] = Bm[q, j], Bm[i, j]
+                    end
+                end
+            end
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end

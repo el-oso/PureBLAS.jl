@@ -146,3 +146,14 @@ _reg!("dgesvd_", () -> @cfunction(dgesvd_64_, Cvoid,
 _reg!("dgesdd_", () -> @cfunction(dgesdd_64_, Cvoid,
     (_CU, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Ptr{Float64}, _CI, _CI, _CI, Clong)))
+# Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval begin
+        _reg!($(p * "trtrs_"), () -> @cfunction($(Symbol(p, "trtrs_64_")), Cvoid,
+            (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong, Clong)))
+        _reg!($(p * "potrs_"), () -> @cfunction($(Symbol(p, "potrs_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+        _reg!($(p * "getrs_"), () -> @cfunction($(Symbol(p, "getrs_64_")), Cvoid,
+            (_CU, _CI, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI, Clong)))
+    end
+end
