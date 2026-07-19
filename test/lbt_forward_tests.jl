@@ -13,12 +13,14 @@
     n = 96
     A = randn(n, n); Bm = randn(n, n); x = randn(n); y = randn(n); b = randn(n)
     SPD = A * A' + n * I
+    At = A + n * I                # well-conditioned source for triangular solves (UpperTriangular(A) is near-singular)
     Az = randn(ComplexF64, n, n); zb = randn(ComplexF64, n); HPD = Az * Az' + n * I
 
     # OpenBLAS oracles, captured BEFORE activate (independent reference).
     ref = (mul = A * Bm, gemv = A * x, gemvt = transpose(A) * x, dot = dot(x, y), nrm2 = norm(x),
-           symm = Symmetric(A) * Bm, trsm = UpperTriangular(A) \ Bm,
+           symm = Symmetric(A) * Bm, trsm = UpperTriangular(At) \ Bm,
            chol = Matrix(cholesky(copy(SPD)).U), lusol = lu(copy(A)) \ b, chsol = cholesky(copy(SPD)) \ b,
+           atsol = transpose(A) \ b, trsol = UpperTriangular(At) \ b,
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
            zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb)
 
@@ -26,6 +28,7 @@
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
     gemm_before = fwd("dgemm_"); geqrf_before = fwd("dgeqrf_")
     zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_"); gesdd_before = fwd("dgesdd_")
+    getrs_before = fwd("dgetrs_"); potrs_before = fwd("dpotrs_"); trtrs_before = fwd("dtrtrs_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -36,14 +39,18 @@
         @test abs(dot(x, y) - ref.dot) < 1e-11                     # dot
         @test abs(norm(x) - ref.nrm2) < 1e-12                      # nrm2
         @test maximum(abs, (Symmetric(A) * Bm) .- ref.symm) < 1e-9 # symm
-        @test maximum(abs, (UpperTriangular(A) \ Bm) .- ref.trsm) < 1e-9  # trsm
+        @test maximum(abs, (UpperTriangular(At) \ Bm) .- ref.trsm) < 1e-9  # trsm
 
         # LAPACK that routes to PureBLAS (self-consistent under a mixed backend).
         C = cholesky(copy(SPD)); @test maximum(abs, Matrix(C.U) .- ref.chol) < 1e-8   # potrf
         F = lu(copy(A))                                            # getrf (LAPACK-convention ipiv/factors)
         @test maximum(abs, (F.L * F.U) .- A[F.p, :]) < 1e-9
-        @test maximum(abs, (lu(copy(A)) \ b) .- ref.lusol) < 1e-9  # getrf(PB) + getrs(OpenBLAS) consistent
-        @test maximum(abs, (cholesky(copy(SPD)) \ b) .- ref.chsol) < 1e-9  # potrf(PB) + potrs(OpenBLAS)
+        # Solves now route to PureBLAS too (getrs/potrs/trtrs) — the solve step of `\`.
+        @test fwd("dgetrs_") != getrs_before && fwd("dpotrs_") != potrs_before && fwd("dtrtrs_") != trtrs_before
+        @test maximum(abs, (lu(copy(A)) \ b) .- ref.lusol) < 1e-9          # getrf + getrs, both PureBLAS
+        @test maximum(abs, (transpose(A) \ b) .- ref.atsol) < 1e-9         # getrs trans='T' (reverse pivots)
+        @test maximum(abs, (cholesky(copy(SPD)) \ b) .- ref.chsol) < 1e-9  # potrf + potrs
+        @test maximum(abs, (UpperTriangular(At) \ b) .- ref.trsol) < 1e-9   # trtrs
         # gesvd routes (direct LAPACK call).
         S = LA.gesvd!('N', 'N', copy(A))[2]
         @test maximum(abs, S .- ref.svals) < 1e-9
@@ -59,7 +66,7 @@
         @test maximum(abs, Matrix(Cz.U) .- ref.zchol) < 1e-8               # zpotrf
         Fz = lu(copy(Az))
         @test maximum(abs, (Fz.L * Fz.U) .- Az[Fz.p, :]) < 1e-9            # zgetrf (valid factorization)
-        @test maximum(abs, (lu(copy(Az)) \ zb) .- ref.zlusol) < 1e-8       # zgetrf(PB) + zgetrs(OpenBLAS)
+        @test maximum(abs, (lu(copy(Az)) \ zb) .- ref.zlusol) < 1e-8       # zgetrf + zgetrs, both PureBLAS
 
         # HAZARD GUARD: geqrf must NOT be forwarded (faer-τ would break OpenBLAS orgqr → NaN Q). With it
         # unforwarded, geqrf!+orgqr! are both OpenBLAS and produce a valid orthonormal Q.
