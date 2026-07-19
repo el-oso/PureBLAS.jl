@@ -37,11 +37,14 @@ include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointe
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
 # ── Precompile workload ────────────────────────────────────────────────────────────────────────────
-# Run the hot native kernels once at precompile time so their inferred+native code is cached in the .ji
-# — cuts first-call JIT latency for both direct callers and the test suite (StrictMode/correctness items
-# were ~95% compile). Precompile-time only (guarded by jl_generating_output); NOT reachable from the
-# @ccallable roots, so juliac --trim excludes it (verified: the .so still builds). Small n keeps the
-# workload cheap; covers L1/L2/L3 + Cholesky/LU/QR + symmetric/Hermitian eigen across d/f/z.
+# Run the hot native kernels once at precompile time so their native code is cached in the .ji — first-call
+# gemm!/potrf!/eigen drops from ~3.5ms (base inference only) to ~0.06ms. Precompile-time only (the macros
+# guard on jl_generating_output); NOT reachable from the @ccallable roots, so juliac --trim excludes it
+# (verified: the .so still builds). Small n keeps the cost low (~18s of the ~140s module precompile — the
+# base kernel surface dominates, not this). ALWAYS ON: an env/@static gate on the workload is cache-UNSAFE
+# (ENV is not part of the .ji key → a .ji built once with the workload skipped is silently reused later),
+# and the CI saving was only ~18s, so it isn't worth gating. Covers L1/L2/L3 + Cholesky/LU/QR + sym/Herm
+# eigen across Float64/Float32/ComplexF64.
 using PrecompileTools: @setup_workload, @compile_workload
 @setup_workload begin
     n = 8
