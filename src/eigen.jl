@@ -42,6 +42,7 @@ end
 # ── Stage 2: 2×2 symmetric eigensolvers (LAPACK dlae2 values / dlaev2 values+vector) ───────────────
 @inline function _dlae2(a::T, b::T, c::T) where {T<:Real}
     sm = a + c; df = a - c; adf = abs(df); tb = b + b; ab = abs(tb)
+    acmx = abs(a) > abs(c) ? a : c; acmn = abs(a) > abs(c) ? c : a   # dlaev2 ACMX/ACMN by magnitude
     if adf > ab
         rt = adf * sqrt(one(T) + (ab / adf)^2)
     elseif adf < ab
@@ -51,10 +52,10 @@ end
     end
     if sm < zero(T)
         rt1 = (sm - rt) / 2
-        rt2 = ((max(a, c) / rt1) * min(a, c)) - (b / rt1) * b
+        rt2 = ((acmx / rt1) * acmn) - (b / rt1) * b
     elseif sm > zero(T)
         rt1 = (sm + rt) / 2
-        rt2 = ((max(a, c) / rt1) * min(a, c)) - (b / rt1) * b
+        rt2 = ((acmx / rt1) * acmn) - (b / rt1) * b
     else
         rt1 = rt / 2; rt2 = -rt / 2
     end
@@ -63,6 +64,7 @@ end
 
 @inline function _dlaev2(a::T, b::T, c::T) where {T<:Real}
     sm = a + c; df = a - c; adf = abs(df); tb = b + b; ab = abs(tb)
+    acmx = abs(a) > abs(c) ? a : c; acmn = abs(a) > abs(c) ? c : a   # dlaev2 ACMX/ACMN by magnitude
     if adf > ab
         rt = adf * sqrt(one(T) + (ab / adf)^2)
     elseif adf < ab
@@ -73,10 +75,10 @@ end
     local rt1, rt2, sgn1
     if sm < zero(T)
         rt1 = (sm - rt) / 2; sgn1 = -1
-        rt2 = ((max(a, c) / rt1) * min(a, c)) - (b / rt1) * b
+        rt2 = ((acmx / rt1) * acmn) - (b / rt1) * b
     elseif sm > zero(T)
         rt1 = (sm + rt) / 2; sgn1 = 1
-        rt2 = ((max(a, c) / rt1) * min(a, c)) - (b / rt1) * b
+        rt2 = ((acmx / rt1) * acmn) - (b / rt1) * b
     else
         rt1 = rt / 2; rt2 = -rt / 2; sgn1 = 1
     end

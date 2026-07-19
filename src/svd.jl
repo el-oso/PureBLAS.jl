@@ -14,11 +14,19 @@
         α = x[1]
         n == 1 && return α, 0.0
         ss = 0.0                                     # SIMD sum-of-squares (avoids O(n²) Base.hypot in gebrd);
-        @simd for i in 2:n; ss = muladd(x[i], x[i], ss); end   # fall back to scaled hypot on overflow only
+        @simd for i in 2:n; ss = muladd(x[i], x[i], ss); end   # fast path — exact for the common regime.
         xnorm = sqrt(ss)
-        if !isfinite(xnorm)
-            xnorm = 0.0
-            for i in 2:n; xnorm = hypot(xnorm, x[i]); end
+        # Scaled recompute when the fast ss over/underflowed. The underflow case matters: when x is NORMAL
+        # but its squares are DENORMAL (|x| ≲ √floatmin ≈ 1.5e-154), ss < floatmin loses mantissa bits and
+        # the reflector loses orthogonality (dlarfg guards this; same principle as req#6 nrm2/lassq). The
+        # common path (ss finite, ≥ floatmin) is UNCHANGED — this only reroutes the extreme-scale tails.
+        if !isfinite(xnorm) || ss < floatmin(Float64)
+            scale = 0.0
+            for i in 2:n; scale = max(scale, abs(x[i])); end
+            scale == 0.0 && return α, 0.0
+            ssum = 0.0
+            for i in 2:n; t = x[i] / scale; ssum = muladd(t, t, ssum); end
+            xnorm = scale * sqrt(ssum)
         end
         xnorm == 0.0 && return α, 0.0
         β = -copysign(hypot(α, xnorm), α)
