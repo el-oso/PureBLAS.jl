@@ -25,7 +25,7 @@
     @test length(PureBLAS._LBT_REGISTRARS) > 100
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
     gemm_before = fwd("dgemm_"); geqrf_before = fwd("dgeqrf_")
-    zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_")
+    zpotrf_before = fwd("zpotrf_"); zgetrf_before = fwd("zgetrf_"); gesdd_before = fwd("dgesdd_")
     PureBLAS.activate()
     try
         # BLAS — all route to PureBLAS.
@@ -44,9 +44,13 @@
         @test maximum(abs, (F.L * F.U) .- A[F.p, :]) < 1e-9
         @test maximum(abs, (lu(copy(A)) \ b) .- ref.lusol) < 1e-9  # getrf(PB) + getrs(OpenBLAS) consistent
         @test maximum(abs, (cholesky(copy(SPD)) \ b) .- ref.chsol) < 1e-9  # potrf(PB) + potrs(OpenBLAS)
-        # gesvd routes (direct LAPACK call; svd()/svdvals default to gesdd, which stays on OpenBLAS).
+        # gesvd routes (direct LAPACK call).
         S = LA.gesvd!('N', 'N', copy(A))[2]
         @test maximum(abs, S .- ref.svals) < 1e-9
+        # gesdd routes → svd()/svdvals (Julia's default SVD path) now use PureBLAS.
+        @test fwd("dgesdd_") != gesdd_before
+        @test maximum(abs, svdvals(copy(A)) .- ref.svals) < 1e-9
+        Fs = svd(copy(A)); @test maximum(abs, Fs.U * Diagonal(Fs.S) * Fs.Vt .- A) < 1e-9
 
         # Complex LAPACK — potrf/getrf route (self-consistent: standard-convention factors).
         @test fwd("zpotrf_") != zpotrf_before

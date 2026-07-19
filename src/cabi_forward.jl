@@ -142,3 +142,7 @@ end
 _reg!("dgesvd_", () -> @cfunction(dgesvd_64_, Cvoid,
     (_CU, _CU, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Ptr{Float64}, _CI, _CI, Clong, Clong)))
+# gesdd: Julia's svd()/svdvals route here (D&C), not gesvd — this is what makes them use PureBLAS.
+_reg!("dgesdd_", () -> @cfunction(dgesdd_64_, Cvoid,
+    (_CU, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI,
+     Ptr{Float64}, _CI, Ptr{Float64}, _CI, _CI, _CI, Clong)))
