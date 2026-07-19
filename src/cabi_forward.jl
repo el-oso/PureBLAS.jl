@@ -173,6 +173,16 @@ _reg!("sgesvd_", () -> @cfunction(sgesvd_64_, Cvoid,
 _reg!("sgesdd_", () -> @cfunction(sgesdd_64_, Cvoid,
     (_CU, _CI, _CI, Ptr{Float32}, _CI, Ptr{Float32}, Ptr{Float32}, _CI,
      Ptr{Float32}, _CI, Ptr{Float32}, _CI, _CI, _CI, Clong)))
+# Symmetric eigensolver (real Float64, M-E1) — routes eigen(Symmetric)/eigvals(Symmetric). The DEFAULT
+# path is dsyevr_ (RobustRepresentations); DivideAndConquer→dsyevd_, QRIteration→dsyev_. Sigs must match
+# the @ccallable defs in cabi_lapack.jl exactly (2 chars→2 hidden lens for syev/syevd, 3→3 for syevr).
+_reg!("dsyev_", () -> @cfunction(dsyev_64_, Cvoid,
+    (_CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, Clong, Clong)))
+_reg!("dsyevd_", () -> @cfunction(dsyevd_64_, Cvoid,
+    (_CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, _CI, _CI, Clong, Clong)))
+_reg!("dsyevr_", () -> @cfunction(dsyevr_64_, Cvoid,
+    (_CU, _CU, _CU, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI, Ptr{Float64}, _CI,
+     Ptr{Float64}, Ptr{Float64}, _CI, _CI, Ptr{Float64}, _CI, _CI, _CI, _CI, Clong, Clong, Clong)))
 # Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval begin

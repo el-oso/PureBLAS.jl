@@ -25,7 +25,9 @@
            qrsol = qr(copy(A)) \ b, qrdet = det(qr(copy(A)).Q),
            svals = svdvals!(copy(A)),   # svdvals! → gesdd (stays OpenBLAS); here just a numeric oracle
            zchol = Matrix(cholesky(Hermitian(copy(HPD))).U), zlusol = lu(copy(Az)) \ zb,
-           zqrsol = qr(copy(Az)) \ zb)
+           zqrsol = qr(copy(Az)) \ zb,
+           evals = eigvals(Symmetric(A + A')))         # symmetric eigen values (uplo='U' default)
+    Asym = Symmetric(A + A'); Asymf = Matrix(Asym)     # dense symmetric for the eigen residual check
 
     @test length(PureBLAS._LBT_REGISTRARS) > 100
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
@@ -36,6 +38,7 @@
     geqrt_before = fwd("dgeqrt_"); gemqrt_before = fwd("dgemqrt_")
     zgeqrt_before = fwd("zgeqrt_"); zgemqrt_before = fwd("zgemqrt_")
     sgetrf_before = fwd("sgetrf_"); sgeqrt_before = fwd("sgeqrt_"); sgesdd_before = fwd("sgesdd_")
+    syevr_before = fwd("dsyevr_")
     Af = randn(Float32, n, n); f32svals = svdvals(copy(Af))
     PureBLAS.activate()
     try
@@ -105,6 +108,15 @@
         # geqrf τ-conversion: geqrf!+OpenBLAS orgqr now gives a valid Q (faer never crosses the ABI).
         A2 = copy(A); _, tau = LA.geqrf!(A2); Qo = LA.orgqr!(copy(A2), tau)
         @test maximum(abs, Qo'Qo - I) < 1e-9
+
+        # Symmetric eigensolver routes: eigen(Symmetric)/eigvals(Symmetric) → dsyevr_ (Julia's default).
+        @test fwd("dsyevr_") != syevr_before                              # actually forwarded
+        Fe = eigen(Asym)                                                  # dsyevr_ jobz='V' range='A'
+        n_ = size(Asymf, 1)
+        @test maximum(abs, Fe.values .- ref.evals) < 1e-9                 # eigenvalues match OpenBLAS
+        @test opnorm(Asymf * Fe.vectors - Fe.vectors * Diagonal(Fe.values)) < 1e-8 * opnorm(Asymf)
+        @test opnorm(Fe.vectors' * Fe.vectors - I) < 1e-9                 # orthonormal vectors
+        @test maximum(abs, eigvals(Asym) .- ref.evals) < 1e-9            # eigvals(Symmetric) routes too
     finally
         PureBLAS.deactivate()   # ALWAYS restore OpenBLAS so later testitems keep their oracle
     end
