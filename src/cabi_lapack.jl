@@ -266,9 +266,11 @@ Base.@ccallable function dsyev_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{In
     end
     jz = _cabi_char(jobz); ul = _cabi_char(uplo)
     N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+    bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+    !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)   # LAPACK arg validation (bad .so-caller args)
     wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
     wm = PtrVector(w, N)
-    @inbounds for i in 1:N; wm[i] = wv[i]; end
+    @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
     if jz == 'V'
         Am = PtrMatrix(A, N, N, ld)
         @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
@@ -286,9 +288,11 @@ Base.@ccallable function dsyevd_64_(jobz::Ptr{UInt8}, uplo::Ptr{UInt8}, n::Ptr{I
     end
     jz = _cabi_char(jobz); ul = _cabi_char(uplo)
     N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+    bad = (jz != 'N' && jz != 'V') ? -1 : (ul != 'U' && ul != 'L') ? -2 : (N < 0) ? -3 : 0
+    !iszero(bad) && (unsafe_store!(info, Int64(bad)); return)   # LAPACK arg validation (bad .so-caller args)
     wv, Z, inf = _syev_compute(jz, ul, N, A, ld)
     wm = PtrVector(w, N)
-    @inbounds for i in 1:N; wm[i] = wv[i]; end
+    @inbounds for i in eachindex(wm); wm[i] = wv[i]; end
     if jz == 'V'
         Am = PtrMatrix(A, N, N, ld)
         @inbounds for j in 1:N, i in 1:N; Am[i, j] = Z[i, j]; end
@@ -311,6 +315,15 @@ Base.@ccallable function dsyevr_64_(jobz::Ptr{UInt8}, range::Ptr{UInt8}, uplo::P
     jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
     N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
     wantz = jz == 'V'
+    # LAPACK argument validation — a non-Julia .so caller may pass bad args (the in-Julia LinearAlgebra
+    # path is pre-validated). Return info<0 (xerbla convention) instead of an @inbounds OOB read.
+    bad = (jz != 'N' && jz != 'V') ? -1 :
+          (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
+          (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
+          (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -8 : 0
+    if !iszero(bad)
+        unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
+    end
     wv, Z, inf = _syev_compute(jz, ul, N, A, ld)       # full spectrum (ascending) + vectors if wantz
     # pick the selected index range (compute-all-then-slice)
     lo = 1; hi = N
