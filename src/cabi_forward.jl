@@ -154,6 +154,12 @@ _reg!("dgeqrt_", () -> @cfunction(dgeqrt_64_, Cvoid,
 _reg!("dgemqrt_", () -> @cfunction(dgemqrt_64_, Cvoid,
     (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Clong, Clong)))
+# Complex QR (ComplexF64): zgeqrt/zgemqrt route qr(::Matrix{ComplexF64}).
+_reg!("zgeqrt_", () -> @cfunction(zgeqrt_64_, Cvoid,
+    (_CI, _CI, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI)))
+_reg!("zgemqrt_", () -> @cfunction(zgemqrt_64_, Cvoid,
+    (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI, Ptr{ComplexF64}, _CI,
+     Ptr{ComplexF64}, _CI, Clong, Clong)))
 # Solves on caller-provided factors — trtrs/potrs/getrs (real + complex). getrs is the solve step of `\`.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval begin
