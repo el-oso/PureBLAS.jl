@@ -166,6 +166,10 @@ end
 # QR: geqrf (τ now LAPACK-converted) + geqrt/gemqrt (Float64) — routes LinearAlgebra.qr() to PureBLAS.
 _reg!("dgeqrf_", () -> @cfunction(dgeqrf_64_, Cvoid,
     (_CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, Ptr{Float64}, _CI, _CI)))
+for (p, T) in (("c", ComplexF32), ("s", Float32), ("z", ComplexF64))
+    @eval _reg!($(p * "geqrf_"), () -> @cfunction($(Symbol(p, "geqrf_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
 _reg!("dgeqrt_", () -> @cfunction(dgeqrt_64_, Cvoid,
     (_CI, _CI, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI)))
 _reg!("dgemqrt_", () -> @cfunction(dgemqrt_64_, Cvoid,
