@@ -77,6 +77,41 @@ Base.@ccallable function dgeqrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64
     return
 end
 
+# cgeqrf/zgeqrf: native complex geqrf! (BlasComplex). Same faer-τ→LAPACK convert as dgeqrf (v is standard).
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "geqrf_64_"))(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T},
+            lda::Ptr{Int64}, tau::Ptr{$T}, work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, $T(1)); unsafe_store!(info, Int64(0)); return
+        end
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); k = min(M, N)
+        geqrf!(PtrMatrix(A, M, N, ld), PtrVector(tau, k))
+        tv = PtrVector(tau, k)
+        @inbounds for i in 1:k
+            t = tv[i]; tv[i] = (isfinite(t) && t != zero($T)) ? one($T) / t : zero($T)
+        end
+        unsafe_store!(info, Int64(0)); return
+    end
+end
+# sgeqrf: no native Float32 geqrf! kernel — mixed-precision (promote→F64 geqrf!→demote), like sgeqrt_64_.
+Base.@ccallable function sgeqrf_64_(m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float32}, lda::Ptr{Int64},
+        tau::Ptr{Float32}, work::Ptr{Float32}, lwork::Ptr{Int64}, info::Ptr{Int64})::Cvoid
+    if unsafe_load(lwork) == Int64(-1)
+        unsafe_store!(work, 1.0f0); unsafe_store!(info, Int64(0)); return
+    end
+    M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); k = min(M, N)
+    Am = PtrMatrix(A, M, N, ld)
+    Af = Matrix{Float64}(undef, M, N); _f32_to_f64!(Af, Am, M, N)
+    tf = Vector{Float64}(undef, k)
+    geqrf!(Af, tf)
+    _f64_to_f32!(Am, Af, M, N)
+    tv = PtrVector(tau, k)
+    @inbounds for i in 1:k
+        t = tf[i]; tv[i] = Float32((isfinite(t) && t != 0.0) ? 1.0 / t : 0.0)
+    end
+    unsafe_store!(info, Int64(0)); return
+end
+
 # ── geqrt / gemqrt: compact-WY QR — routes LinearAlgebra.qr() (QRCompactWY) to PureBLAS ────────────────
 # Julia's qr(A) calls geqrt!; Q ops (Matrix(Q), Q*B, Q'*B, A*Q, qr(A)\b's Qᵀb) all go through gemqrt!.
 # We compose PureBLAS's geqrf! (V + faer τ) + τ→LAPACK inversion + wy_t! (dlarft) for geqrt, and wy_apply!

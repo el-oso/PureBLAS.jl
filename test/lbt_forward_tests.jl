@@ -433,7 +433,7 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 90   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    _FALLTHROUGH_MAX = 87   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
     lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
     syms = Set{String}()
     for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end
