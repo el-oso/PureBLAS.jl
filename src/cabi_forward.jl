@@ -631,6 +631,12 @@ for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))  # co
         (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI,
          Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, Ptr{$Tr}, _CI, Clong, Clong, Clong)))
 end
+# tgsen (COMPLEX only — cabi_lapack3.jl). Integer ijob/wantq/wantz (no chars → no Clong); pl/pr/dif Ptr{Cvoid}.
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "tgsen_"), () -> @cfunction($(Symbol(p, "tgsen_64_")), Cvoid,
+        (_CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI,
+         Ptr{$T}, _CI, _CI, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{$T}, _CI, _CI, _CI, _CI)))
+end
 # gebak — undo gebal's balancing on eigen/Schur vectors.
 for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
                    ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))

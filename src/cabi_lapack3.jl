@@ -52,3 +52,37 @@ for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
         unsafe_store!(info, Int64(0)); return
     end
 end
+
+# ── tgsen (COMPLEX ONLY): reorder a generalized Schur pair so selected eigenvalues lead. ijob/wantq/wantz
+# are INTEGER args (no chars → no Clong). Julia calls twice (lwork=-1 query then real); our kernel self-
+# allocates so the query reports minimal sizes. Complex ztgsen/ctgsen is COMPLETE (no 2×2 blocks) — the
+# real dtgsen/stgsen path is NOT forwarded (2×2 conjugate-pair swap unbuilt; would throw). pl/pr/dif are
+# ijob=0-unused (Ptr{Cvoid}). `_ztgsen!` mutates A/B/Q/Z in place → PtrMatrix writes reach the caller.
+# `ztgsen_64_(ijob,wantq,wantz,select,n,A,lda,B,ldb,alpha,beta,Q,ldq,Z,ldz,m,pl,pr,dif,work,lwork,iwork,liwork,info)`.
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval Base.@ccallable function $(Symbol(p, "tgsen_64_"))(ijob::Ptr{Int64}, wantq::Ptr{Int64},
+            wantz::Ptr{Int64}, select::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64},
+            B::Ptr{$T}, ldb::Ptr{Int64}, alpha::Ptr{$T}, beta::Ptr{$T}, Q::Ptr{$T}, ldq::Ptr{Int64},
+            Z::Ptr{$T}, ldz::Ptr{Int64}, m::Ptr{Int64}, pl::Ptr{Cvoid}, pr::Ptr{Cvoid}, dif::Ptr{Cvoid},
+            work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, liwork::Ptr{Int64},
+            info::Ptr{Int64})::Cvoid
+        N = Int(unsafe_load(n))
+        if Int(unsafe_load(lwork)) < 0                       # workspace query — kernel self-allocates
+            unsafe_store!(work, $T(1)); unsafe_store!(iwork, Int64(1))
+            unsafe_store!(info, Int64(0)); return
+        end
+        S = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
+        Tm = PtrMatrix(B, N, N, Int(unsafe_load(ldb)))
+        Qm = PtrMatrix(Q, N, N, Int(unsafe_load(ldq)))
+        Zm = PtrMatrix(Z, N, N, Int(unsafe_load(ldz)))
+        sel = PtrVector(select, N)
+        _, _, al, be, _, _ = tgsen!(sel, S, Tm, Qm, Zm)
+        av = PtrVector(alpha, N); bv = PtrVector(beta, N)
+        cnt = 0
+        @inbounds for i in 1:N
+            av[i] = al[i]; bv[i] = be[i]
+            (sel[i] != 0) && (cnt += 1)
+        end
+        unsafe_store!(m, Int64(cnt)); unsafe_store!(info, Int64(0)); return
+    end
+end
