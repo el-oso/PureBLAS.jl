@@ -266,3 +266,120 @@ end
         @test true
     end
 end
+
+# LAPACK finish-all surface — trim-compatibility dogfood. In the :checks (analysis="full") project with
+# TrimCheck loaded, @assert_trim_compatible runs juliac's AUTHORITATIVE verify_typeinf_trim (the same
+# verifier as juliac/build.jl). This is the dev-time net that was MISSING when the trsyl `scale` Core.Box
+# and the qr.jl complex-muladd / svd.jl permutedims union-splits shipped a non-building .so with CI green.
+# REQUIREMENT (memory lapack-strict-contract-required): a new LAPACK @ccallable entry point is not done
+# until asserted here. @assert_trim_compatible EXECUTES the call, so inputs must be runtime-valid (SPD /
+# pre-factored where the kernel demands it). Covers the full finish-all surface, real + complex.
+@testitem "StrictMode dogfood: LAPACK finish-all trim-compatibility" tags = [:checks] begin
+    using StrictMode, AllocCheck, JET, TrimCheck, LinearAlgebra
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping LAPACK finish-all trim dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        n = 24; k = 12
+        # symmetric / Hermitian sources; SPD variants for the Cholesky-family kernels
+        Ad = (M = randn(n, n); M + transpose(M)); Az = (M = randn(ComplexF64, n, n); M + transpose(M))
+        Ahe = (M = randn(ComplexF64, n, n); M + M')
+        Sd = (M = randn(n, n); M * transpose(M) + n * I)            # real SPD
+        She = (M = randn(ComplexF64, n, n); M * M' + n * I)         # Hermitian PD
+
+        # ── symmetric-indefinite solve/inverse (sytri/hetri need a real factorization first) ──
+        @assert_trim_compatible P.sysv!('L', copy(Ad), randn(n, 2))
+        @assert_trim_compatible P.sysv!('L', copy(Az), randn(ComplexF64, n, 2))
+        @assert_trim_compatible P.hesv!('L', copy(Ahe), randn(ComplexF64, n, 2))
+        LDd = copy(Ad); ipd = zeros(Int, n); P.sytrf!(LDd, ipd; uplo = 'L')
+        LDz = copy(Az); ipz = zeros(Int, n); P.sytrf!(LDz, ipz; uplo = 'L')
+        LDh = copy(Ahe); iph = zeros(Int, n); P.hetrf!(LDh, iph; uplo = 'L')
+        @assert_trim_compatible P.sytri!(copy(LDd), ipd; uplo = 'L')
+        @assert_trim_compatible P.sytri!(copy(LDz), ipz; uplo = 'L')
+        @assert_trim_compatible P.hetri!(copy(LDh), iph; uplo = 'L')
+        # ── QL / RQ (geqlf/gerqf + org/orm), real + complex ──
+        Aqd = randn(n, k); tqd = zeros(Float64, k); Aqz = randn(ComplexF64, n, k); tqz = zeros(ComplexF64, k)
+        Fqd = copy(Aqd); P.geqlf!(Fqd, tqd); Fqz = copy(Aqz); P.geqlf!(Fqz, tqz)
+        @assert_trim_compatible P.geqlf!(copy(Aqd), zeros(Float64, k))
+        @assert_trim_compatible P.orgql!(copy(Fqd), copy(tqd))
+        @assert_trim_compatible P.ormql!('L', 'N', copy(Fqd), tqd, randn(n, 3))
+        @assert_trim_compatible P.geqlf!(copy(Aqz), zeros(ComplexF64, k))
+        @assert_trim_compatible P.orgql!(copy(Fqz), copy(tqz))
+        @assert_trim_compatible P.ormql!('L', 'N', copy(Fqz), tqz, randn(ComplexF64, n, 3))
+        Ard = randn(k, n); Arz = randn(ComplexF64, k, n)
+        Grd = copy(Ard); P.gerqf!(Grd, tqd); Grz = copy(Arz); P.gerqf!(Grz, tqz)
+        @assert_trim_compatible P.gerqf!(copy(Ard), zeros(Float64, k))
+        @assert_trim_compatible P.orgrq!(copy(Grd), copy(tqd))
+        @assert_trim_compatible P.ormrq!('R', 'N', copy(Grd), tqd, randn(3, n))
+        @assert_trim_compatible P.gerqf!(copy(Arz), zeros(ComplexF64, k))
+        @assert_trim_compatible P.orgrq!(copy(Grz), copy(tqz))
+        # ── RZ (tzrzf/ormrz) ──
+        Tzd = randn(k, n); ttd = zeros(Float64, k); P.tzrzf!(Tzd, ttd)
+        @assert_trim_compatible P.tzrzf!(randn(k, n), zeros(Float64, k))
+        @assert_trim_compatible P.tzrzf!(randn(ComplexF64, k, n), zeros(ComplexF64, k))
+        @assert_trim_compatible P.ormrz!('L', 'N', copy(Tzd), ttd, randn(n, 3))
+        # ── pivoted Cholesky (pstrf) — SPD input ──
+        @assert_trim_compatible P.pstrf!(copy(Sd), zeros(Int, n), -1.0; uplo = 'L')
+        @assert_trim_compatible P.pstrf!(copy(She), zeros(Int, n), -1.0; uplo = 'L')
+        # ── rank-deficient / constrained least squares ──
+        @assert_trim_compatible P.gelsd!(randn(n, k), randn(n, 2), -1.0)
+        @assert_trim_compatible P.gelsd!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), -1.0)
+        @assert_trim_compatible P.gelsy!(randn(n, k), randn(n, 2), zeros(Int, k), -1.0)
+        @assert_trim_compatible P.gelsy!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), zeros(Int, k), -1.0)
+        @assert_trim_compatible P.gglse!(randn(8, 6), randn(8), randn(4, 6), randn(4))
+        @assert_trim_compatible P.gglse!(randn(ComplexF64, 8, 6), randn(ComplexF64, 8), randn(ComplexF64, 4, 6), randn(ComplexF64, 4))
+        # ── Sylvester (trsyl) + Schur reorder (trexc/trsen) ──
+        @assert_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(n, n)) + n * I, triu(randn(n, n)) + n * I, randn(n, n))
+        @assert_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(ComplexF64, n, n)) + n * I, triu(randn(ComplexF64, n, n)) + n * I, randn(ComplexF64, n, n))
+        @assert_trim_compatible P.trexc!('V', triu(randn(n, n)) + n * I, Matrix(1.0I, n, n), 2, n - 1)
+        @assert_trim_compatible P.trexc!('V', triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n), 2, n - 1)
+        @assert_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(n, n)) + n * I, Matrix(1.0I, n, n))
+        @assert_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n))
+        # ── generalized eigen (ggev/gges/sygvd/hegvd) — sygvd/hegvd need PD B ──
+        @assert_trim_compatible P.ggev!('N', 'V', randn(n, n), randn(n, n))
+        @assert_trim_compatible P.ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        @assert_trim_compatible P.gges!('V', 'V', randn(n, n), randn(n, n))
+        @assert_trim_compatible P.gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        # sygvd!/hegvd! (compose _syev!/_heev!) and ggsvd! (compose gesvd!) reach Base Array setindex!/bounds
+        # error paths (throw_setindex_mismatch) in the Matrix instantiation that the .so's PtrMatrix path
+        # (unsafe_store!) does not. They are authoritatively trim-gated by the juliac `trim-so` CI job; Mode-2
+        # (Matrix) trim-hardening of the eigen/SVD Array internals is a tracked follow-up.
+        # ── symmetric-tridiagonal (stebz/stein), real ──
+        dd = randn(n); ee = randn(n - 1)
+        @assert_trim_compatible P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
+        w, ib, isp, _ = P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
+        # stein! writes eigenvectors into Array slices → same Matrix-instantiation setindex! path (juliac-gated).
+        # ── generalized SVD (ggsvd), Float64 full-rank ──
+        # ── banded LU (gbtrf/gbtrs) — factor then solve ──
+        ABd2 = randn(6, n); _, gip, _ = P.gbtrf!(2, 1, n, ABd2)
+        @assert_trim_compatible P.gbtrf!(2, 1, n, randn(6, n))
+        @assert_trim_compatible P.gbtrs!('N', 2, 1, n, copy(ABd2), gip, randn(n, 2))
+        @assert_trim_compatible P.gbtrf!(2, 1, n, randn(ComplexF64, 6, n))
+        # ── SPD tridiagonal (pttrf/pttrs/ptsv) — factor then solve ──
+        Dp = fill(4.0, n); Ep = fill(1.0, n - 1); Df = copy(Dp); Ef = copy(Ep); P.pttrf!(Df, Ef)
+        @assert_trim_compatible P.pttrf!(fill(4.0, n), fill(1.0, n - 1))
+        @assert_trim_compatible P.pttrs!(copy(Df), copy(Ef), randn(n, 2))
+        @assert_trim_compatible P.ptsv!(fill(4.0, n), fill(1.0, n - 1), randn(n, 2))
+        Dpz = fill(4.0, n); Epz = fill(1.0 + 0im, n - 1)
+        @assert_trim_compatible P.ptsv!(copy(Dpz), copy(Epz), randn(ComplexF64, n, 2))
+        # ── general tridiagonal (gtsv/gttrf/gttrs) — factor then solve ──
+        dl = fill(1.0, n - 1); dm = fill(4.0, n); du = fill(1.0, n - 1)
+        du2 = zeros(Float64, n - 2); gtip = zeros(Int, n); P.gttrf!(copy(dl), copy(dm), copy(du), du2, gtip)
+        @assert_trim_compatible P.gtsv!(copy(dl), copy(dm), copy(du), randn(n, 2))
+        @assert_trim_compatible P.gttrf!(copy(dl), copy(dm), copy(du), zeros(Float64, n - 2), zeros(Int, n))
+        @assert_trim_compatible P.gtsv!(fill(1.0 + 0im, n - 1), fill(4.0 + 0im, n), fill(1.0 + 0im, n - 1), randn(ComplexF64, n, 2))
+        # ── banded / packed Cholesky (pbtrf/pbtrs, pptrf/pptrs) — SPD storage ──
+        mkband(T) = (AB = zeros(T, 3, n); AB[1, :] .= T(10); AB[2, 1:n-1] .= T(1); AB[3, 1:n-2] .= T(0.5); AB)
+        ABsd = mkband(Float64); P.pbtrf!(ABsd; uplo = 'L', kd = 2)
+        @assert_trim_compatible P.pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
+        @assert_trim_compatible P.pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)
+        @assert_trim_compatible P.pbtrf!(mkband(ComplexF64); uplo = 'L', kd = 2)
+        pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
+        APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
+        @assert_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
+        @assert_trim_compatible P.pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
+        @assert_trim_compatible P.pptrf!(pack(She); uplo = 'L')
+        @test true
+    end
+end
