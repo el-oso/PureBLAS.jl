@@ -707,7 +707,7 @@ end
     end
 end
 
-@testitem "LBT in-process forward: batch-12 (tgsen — complex generalized Schur reorder)" tags = [:lbt] begin
+@testitem "LBT in-process forward: batch-12 (tgsen — generalized Schur reorder, real + complex)" tags = [:lbt] begin
     using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.BLAS as B
     import LinearAlgebra.LAPACK as LA
@@ -715,9 +715,9 @@ end
     fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
     n = 10
 
-    # COMPLEX tgsen only (real dtgsen/stgsen not forwarded — 2×2 conjugate-pair swap unbuilt). Direct
-    # LAPACK.tgsen! call, OpenBLAS oracle pre-activate. select is BlasInt (Julia's wrapper constrains it).
-    cases = map((ComplexF64, ComplexF32)) do T
+    # ALL FOUR types: real dtgsen/stgsen now handle 2×2 conjugate-pair blocks (dtgex2), complex ctgsen/
+    # ztgsen have none. Direct LAPACK.tgsen! call, OpenBLAS oracle pre-activate; select is BlasInt.
+    cases = map((Float64, Float32, ComplexF64, ComplexF32)) do T
         A = randn(T, n, n); Bm = randn(T, n, n)
         F = schur(A, Bm)                                   # generalized: A = Q·S·Z', B = Q·T·Z'
         (T = T, S0 = F.S, T0 = F.T, Q0 = F.Q, Z0 = F.Z, sel = Int64[i > n ÷ 2 for i in 1:n])
@@ -727,16 +727,84 @@ end
         (ev = sort(al ./ be, by = x -> (real(x), imag(x))), rec = Q * S * Z')
     end
 
-    before = Dict(s => fwd(s) for s in ("ctgsen_", "ztgsen_"))
+    before = Dict(s => fwd(s) for s in ("dtgsen_", "stgsen_", "ctgsen_", "ztgsen_"))
     PureBLAS.activate()
     try
         @test all(s -> fwd(s) != before[s], keys(before))
         for (i, c) in enumerate(cases)
             S, Tt, al, be, Q, Z = LA.tgsen!(c.sel, copy(c.S0), copy(c.T0), copy(c.Q0), copy(c.Z0))
             ev = sort(al ./ be, by = x -> (real(x), imag(x)))
-            tol = c.T == ComplexF32 ? 1.0f-3 : 1e-9
+            tol = real(c.T) == Float32 ? 1.0f-3 : 1e-9
             @test maximum(abs, ev .- oracle[i].ev) < tol * (norm(oracle[i].ev) + 1)   # same eigenvalues
             @test maximum(abs, Q * S * Z' .- oracle[i].rec) < tol * (norm(oracle[i].rec) + 1)  # pair invariant
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
+@testitem "LBT in-process forward: batch-13 (gesvx — expert general solve)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB13)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 14
+    data = map((Float64, Float32, ComplexF64, ComplexF32)) do T
+        (T = T, A = randn(T, n, n) + n * I, Bm = randn(T, n, 3))
+    end
+    ref = map(d -> LA.gesvx!(copy(d.A), copy(d.Bm))[1], data)   # OpenBLAS X (fact='N')
+
+    before = Dict(s => fwd(s) for s in ("sgesvx_", "dgesvx_", "cgesvx_", "zgesvx_"))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+        for (i, d) in enumerate(data)
+            X, rc, fe, be, rp = LA.gesvx!(copy(d.A), copy(d.Bm))
+            tol = real(d.T) == Float32 ? 1.0f-3 : 1e-8
+            @test maximum(abs, X .- ref[i]) < tol * (norm(ref[i]) + 1)                # matches OpenBLAS X
+            @test maximum(abs, d.A * X - d.Bm) < tol * (norm(d.A) * norm(X) + norm(d.Bm))  # residual
+            @test maximum(be) < tol                                                   # backward error tiny
+            @test 0 < rc <= 1                                                          # sane rcond
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
+@testitem "LBT in-process forward: batch-14 (bdsqr — complex bidiagonal SVD)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB14)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    # real bidiagonals (clustered / graded / random), complex Vt/U/C accumulators.
+    mk(T, m, kind) = (Tr = real(T); kind == :clustered ?
+            (Tr[1 + 1e-10 * randn() for _ in 1:m], Tr[1e-8 * randn() for _ in 1:m-1]) :
+            kind == :graded ? (Tr[Tr(10)^(i - m ÷ 2) for i in 1:m], Tr[Tr(10)^(i - m ÷ 2) / 3 for i in 1:m-1]) :
+            (randn(Tr, m), randn(Tr, m - 1)))
+    cases = [(T, m, k) for T in (ComplexF64, ComplexF32) for m in (6, 25) for k in (:clustered, :graded, :random)]
+    ref = map(cases) do (T, m, k)
+        d, e = mk(T, m, k)
+        Id = Matrix{T}(I, m, m)
+        (d0 = d, e0 = e, sv = sort(LA.bdsqr!('U', copy(d), copy(e), copy(Id), copy(Id), copy(Id))[1], rev = true))
+    end
+
+    before = Dict(s => fwd(s) for s in ("cbdsqr_", "zbdsqr_"))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+        for (i, (T, m, k)) in enumerate(cases)
+            Tr = real(T)
+            d = copy(ref[i].d0); e = copy(ref[i].e0)
+            Vt = Matrix{T}(I, m, m); U = Matrix{T}(I, m, m); C = Matrix{T}(I, m, m)
+            d2, Vt2, U2, C2 = LA.bdsqr!('U', d, e, Vt, U, C)
+            sv = sort(d2, rev = true)
+            @test maximum(abs, sv .- ref[i].sv) < 1e-6 * (sv[1] + 1)                  # σ match OpenBLAS
+            Bre = zeros(T, m, m)
+            for j in 1:m; Bre[j, j] = ref[i].d0[j]; end
+            for j in 1:m-1; Bre[j, j+1] = ref[i].e0[j]; end
+            @test maximum(abs, U2 * Diagonal(d2) * Vt2 .- Bre) < 1e-5 * (maximum(abs, Bre) + 1)  # recon
         end
     finally
         PureBLAS.deactivate()
@@ -752,16 +820,13 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 11   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
-    # 2026-07-20: 87 → 23 → 15 → 13 → 11. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·
-    # hetrd/orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
-    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open), syconv
-    # (s/d/c/z) + trrfs (s/d/c/z), ctgsen_/ztgsen_ (COMPLEX tgsen — cabi_lapack3.jl, batch-12), and the
-    # cstev_/zstev_ PHANTOM allowlist below. The residual 11 = the honest floor, all needing NEW kernels:
-    #   gesvx s/d/c/z (4) — expert driver; needs an iterative-refinement gerfs kernel for ferr/berr.
-    #   dtgsen_/stgsen_ (2) — real tgsen; the 2×2 conjugate-pair swap is unbuilt (would throw).
-    #   cggsvd_/sggsvd_/zggsvd_ (3) — complex/F32 GSVD kernel is full-rank-only (would throw rank-deficient).
-    #   cbdsqr_/zbdsqr_ (2) — complex bdsqr; needs a complex-accumulator Givens apply not yet in svd.jl.
+    _FALLTHROUGH_MAX = 3    # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    # 2026-07-20: 87 → 23 → 15 → 13 → 11 → 3. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc,
+    # sytrd·hetrd/orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/
+    # bdsdc, syconv + trrfs (s/d/c/z), tgsen (COMPLEX + now REAL via the dtgex2 2×2 swap — batch-12),
+    # gesvx s/d/c/z (expert driver: geequ + getrf + getrs + gecon + gerfs — batch-13), c/z bdsqr (robust
+    # complex Demmel–Kahan sweep — batch-14), and the cstev_/zstev_ PHANTOM allowlist below. The residual
+    # 3 = cggsvd_/sggsvd_/zggsvd_ (complex/F32 rank-deficient GSVD — kernel built, wiring is the last batch).
     # PHANTOM allowlist: cstev_/zstev_ appear ONLY in COMMENTED-OUT lines of stdlib lapack.jl (the s/d/c/z
     # macro loop explicitly drops the complex STEV — "Need to rewrite for ZHEEV"); `nm -D libopenblas`
     # confirms NO c/zstev_ export exists. They are regex-scan artifacts with no caller, not real gaps, so
