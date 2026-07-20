@@ -752,19 +752,25 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 13   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
-    # 2026-07-20: 87 → 23 → 15 → 13. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
-    # orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
+    _FALLTHROUGH_MAX = 11   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    # 2026-07-20: 87 → 23 → 15 → 13 → 11. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·
+    # hetrd/orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
     # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open), syconv
-    # (s/d/c/z) + trrfs (s/d/c/z), and now ctgsen_/ztgsen_ (COMPLEX tgsen — cabi_lapack3.jl, batch-12).
-    # The residual 13 = the honest floor: gesvx s/d/c/z (expert driver — needs iterative-refinement gerfs),
-    # dtgsen_/stgsen_ (real tgsen — 2×2 conjugate-pair swap unbuilt; would throw), cggsvd_/sggsvd_/zggsvd_
-    # (complex GSVD kernel is full-rank-only → would throw on rank-deficient pairs OpenBLAS handles),
-    # cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-accumulator Givens apply not yet in svd.jl), and
-    # cstev_/zstev_ (NOT real LAPACK symbols — stev is s/d only; no caller, an artifact of the regex scan).
+    # (s/d/c/z) + trrfs (s/d/c/z), ctgsen_/ztgsen_ (COMPLEX tgsen — cabi_lapack3.jl, batch-12), and the
+    # cstev_/zstev_ PHANTOM allowlist below. The residual 11 = the honest floor, all needing NEW kernels:
+    #   gesvx s/d/c/z (4) — expert driver; needs an iterative-refinement gerfs kernel for ferr/berr.
+    #   dtgsen_/stgsen_ (2) — real tgsen; the 2×2 conjugate-pair swap is unbuilt (would throw).
+    #   cggsvd_/sggsvd_/zggsvd_ (3) — complex/F32 GSVD kernel is full-rank-only (would throw rank-deficient).
+    #   cbdsqr_/zbdsqr_ (2) — complex bdsqr; needs a complex-accumulator Givens apply not yet in svd.jl.
+    # PHANTOM allowlist: cstev_/zstev_ appear ONLY in COMMENTED-OUT lines of stdlib lapack.jl (the s/d/c/z
+    # macro loop explicitly drops the complex STEV — "Need to rewrite for ZHEEV"); `nm -D libopenblas`
+    # confirms NO c/zstev_ export exists. They are regex-scan artifacts with no caller, not real gaps, so
+    # they are excluded from the denominator — otherwise north-star == 0 would be unreachable by construction.
+    _PHANTOM = Set(["cstev_", "zstev_"])
     lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
     syms = Set{String}()
     for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end
+    setdiff!(syms, _PHANTOM)
     gf(s) = B.lbt_get_forward(s, B.LBT_INTERFACE_ILP64, B.LBT_F2C_PLAIN)
     pre = Dict(s => gf(s) for s in syms)
     PureBLAS.activate()
