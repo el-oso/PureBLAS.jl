@@ -38,6 +38,43 @@ julia juliac/build.jl     # -> juliac/build/libpureblas.so, exports daxpy_64_, d
 Use it from a non-Julia host (see `juliac/ctest.c`). Forwarding the library into a *live Julia*
 process via `BLAS.lbt_forward` is not currently possible — see [Design](design.md).
 
+## In-process drop-in (`activate`)
+
+To reroute `LinearAlgebra`'s BLAS/LAPACK to PureBLAS **inside a live Julia process** (MKL.jl-style), call
+`PureBLAS.activate()`. After it, `A*B`, `mul!`, `\`, `cholesky`, `qr`, `svd`, `eigen`, and
+`LinearAlgebra.BLAS.*` dispatch to PureBLAS. `PureBLAS.deactivate()` restores the original backend.
+
+```julia
+using LinearAlgebra, PureBLAS
+PureBLAS.activate()
+PureBLAS.is_active()          # true
+PureBLAS.status()             # how many symbols route to PureBLAS + notes
+A = randn(1000, 1000); A = A'A + 1000I
+cholesky!(copy(A))            # → PureBLAS potrf
+PureBLAS.deactivate()
+```
+
+**`get_config()` still lists `libopenblas` — that is expected.** `activate()` overlays per-symbol
+`@cfunction` forwards on top of the loaded OpenBLAS (it does not swap the *loaded library*), so
+`LinearAlgebra.BLAS.get_config()` — which reports loaded libraries — cannot show PureBLAS. Use
+`PureBLAS.is_active()` / `PureBLAS.status()` to confirm routing, or compare
+`BLAS.lbt_get_forward(sym, …)` before/after `activate()` (a changed pointer = handled by PureBLAS).
+
+### Performance note: the Cholesky/`potrf` triangle
+
+`potrf!` (Cholesky) has a specialized fast base for the **lower** triangle; the **upper** triangle
+currently goes through the generic path and is meaningfully slower (roughly ~2× at moderate `n`).
+`LinearAlgebra.cholesky!(A::Matrix)` defaults to the **upper** factorization, so it hits the slower
+path. For the fast base today, factor the **lower** triangle:
+
+```julia
+cholesky!(Hermitian(A, :L))         # routes to potrf!('L') — the fast base
+PureBLAS.potrf!(A; uplo = 'L')      # native (Mode 2), same fast base
+```
+
+A fast upper path (transpose → fast-lower base → transpose back) is a scheduled fix; once it lands the
+default `cholesky!` gets the fast base with no change on your side.
+
 ## Testing
 
 ```bash
