@@ -56,7 +56,7 @@ function _gvd_impl!(itype::Integer, jobz::Char, uplo::Char,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T<:Number}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gvd!: A must be square"))
-    (size(B, 1) == size(B, 2) == n) || throw(DimensionMismatch("gvd!: B must be $n×$n"))
+    (size(B, 1) == size(B, 2) == n) || throw(DimensionMismatch("gvd!: B must be square, same size as A"))
     (itype == 1 || itype == 2 || itype == 3) || throw(ArgumentError("gvd!: itype must be 1, 2 or 3"))
     (jobz == 'N' || jobz == 'V') || throw(ArgumentError("gvd!: jobz must be 'N' or 'V'"))
     (uplo == 'U' || uplo == 'L') || throw(ArgumentError("gvd!: uplo must be 'U' or 'L'"))
