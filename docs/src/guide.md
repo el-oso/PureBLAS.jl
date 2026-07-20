@@ -44,6 +44,10 @@ To reroute `LinearAlgebra`'s BLAS/LAPACK to PureBLAS **inside a live Julia proce
 `PureBLAS.activate()`. After it, `A*B`, `mul!`, `\`, `cholesky`, `qr`, `svd`, `eigen`, and
 `LinearAlgebra.BLAS.*` dispatch to PureBLAS. `PureBLAS.deactivate()` restores the original backend.
 
+Coverage is **complete**: every LAPACK symbol `LinearAlgebra` can `ccall` forwards to PureBLAS
+after `activate()` — the OpenBLAS fallback is fully removed (see [Coverage](coverage.md), enforced
+by a ratchet test that asserts zero fallthrough).
+
 ```julia
 using LinearAlgebra, PureBLAS
 PureBLAS.activate()
