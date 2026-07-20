@@ -403,6 +403,37 @@ function _unmtr!(A::AbstractMatrix{T}, tau::AbstractVector{T},
     return C
 end
 
+# ── orgtr / ungtr — form Q from sytrd/hetrd reflectors (LOWER only) ────────────────────────────────────
+# LAPACK dorgtr/zungtr forms the SAME Q that `_ormtr!`/`_unmtr!` (side='L', trans='N') apply as the
+# eigenvector back-transform — so Q = _ormtr!(A, tau, I) reuses that already-validated kernel verbatim
+# (no new reflector-forming code): starting C from the identity and running the proven trans='N' sweep
+# builds exactly Q = H_1·H_2·⋯. Only uplo='L' is implemented (mirrors `_sytd2_lower!`/`_hetrd!`'s own
+# restriction) — uplo='U' is a documented follow-up (a genuinely different reflector layout, not a
+# transpose of this one); callers get a clean ArgumentError rather than a silently-wrong Q.
+"""
+    orgtr!(uplo, A, tau) -> Q    (real)
+    ungtr!(uplo, A, tau) -> Q    (complex)
+
+Form the orthogonal/unitary `Q` from [`_sytd2_lower!`](@ref)/[`_hetrd!`](@ref)'s reflectors (LAPACK
+dorgtr/zungtr). Only `uplo='L'` is implemented. Returns a fresh `n×n` `Q` (does not overwrite `A`).
+"""
+function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:Real}
+    uplo === 'L' || throw(ArgumentError("orgtr!: only uplo='L' is implemented"))
+    n = size(A, 1)
+    Q = zeros(T, n, n)
+    @inbounds for i in 1:n; Q[i, i] = one(T); end
+    _ormtr!(A, tau, Q; side = 'L', trans = 'N')
+    return Q
+end
+function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T<:Complex}
+    uplo === 'L' || throw(ArgumentError("ungtr!: only uplo='L' is implemented"))
+    n = size(A, 1)
+    Q = zeros(T, n, n)
+    @inbounds for i in 1:n; Q[i, i] = one(T); end
+    _unmtr!(A, tau, Q; side = 'L', trans = 'N')
+    return Q
+end
+
 # ── Values-only tridiagonal eigensolver (LAPACK dsterf) — O(n²) root-free PWK QL/QR, no vectors ───────
 # jobz='N' fast path for _syev!/_heev!. d (diag) → eigenvalues ascending in place; e (subdiag) destroyed.
 # Returns info (0 = converged; >0 = # off-diagonals that failed to deflate within 30n iterations).

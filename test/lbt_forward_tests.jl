@@ -424,6 +424,245 @@ end
     end
 end
 
+@testitem "LBT in-process forward: batch-8 (gesv/posv/lacpy/larfg/larf)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB8)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 12
+
+    # None of this batch's routines are reached through Julia's high-level `\`/factorize dispatch (gesv/
+    # posv are one-shot combined factor+solve LAPACK drivers; Julia's own `\` composes getrf!+getrs! /
+    # potrf!+potrs! separately) — every check is a DIRECT `LinearAlgebra.LAPACK.<name>!` call, oracle
+    # captured BEFORE activate() (mirrors the batch-7/gtsv style).
+    A = randn(n, n) + n * I; Bv = randn(n, 3)
+    Az = randn(ComplexF64, n, n) + n * I; Bz = randn(ComplexF64, n, 2)
+    Af = randn(Float32, n, n) + Float32(n) * I; Bf = randn(Float32, n, 2)
+    M = randn(n, n); SPD = M * M' + n * I; Bp = randn(n, 2)
+    Mz = randn(ComplexF64, n, n); SPDz = Mz * Mz' + n * I; Bpz = randn(ComplexF64, n, 2)
+    Ac = randn(n, n)
+    x = randn(n); xz = randn(ComplexF64, n)
+
+    ref = (gesv = LA.gesv!(copy(A), copy(Bv))[1], zgesv = LA.gesv!(copy(Az), copy(Bz))[1],
+           sgesv = LA.gesv!(copy(Af), copy(Bf))[1],
+           posv = LA.posv!('L', copy(SPD), copy(Bp))[2], zposv = LA.posv!('L', copy(SPDz), copy(Bpz))[2],
+           lacpyU = triu(Ac), lacpyL = tril(Ac))
+
+    # larfg!/larf! oracles (OpenBLAS, pre-activate). larfg! mutates x → x[1]=1, x[2:]=essential v.
+    # larf!('L') applies H (=I−τ·v·vᴴ, the LAPACK zlarf op) to C. Note LAPACK zlarfg makes Hᴴ (not H)
+    # zero the tail, so the convention-agnostic correctness test is "identical to OpenBLAS", not "zeros".
+    xr_o = copy(x); taur_o = LA.larfg!(xr_o)
+    Cr0 = randn(n, 3); Cr_o = copy(Cr0); LA.larf!('L', xr_o, taur_o, Cr_o)
+    xz_o = copy(xz); tauz_o = LA.larfg!(xz_o)
+    Cz0 = randn(ComplexF64, n, 3); Cz_o = copy(Cz0); LA.larf!('L', xz_o, tauz_o, Cz_o)
+
+    before = Dict(s => fwd(s) for s in (
+        "sgesv_", "dgesv_", "cgesv_", "zgesv_", "sposv_", "dposv_", "cposv_", "zposv_",
+        "slacpy_", "dlacpy_", "clacpy_", "zlacpy_", "slarfg_", "dlarfg_", "clarfg_", "zlarfg_",
+        "slarf_", "dlarf_", "clarf_", "zlarf_",
+    ))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+
+        Xpb, _, _ = LA.gesv!(copy(A), copy(Bv))
+        @test maximum(abs, Xpb .- ref.gesv) < 1e-8 * (norm(ref.gesv) + 1)
+        @test maximum(abs, A * Xpb - Bv) < 1e-8 * (norm(A) * norm(Xpb) + norm(Bv))          # residual too
+        Xzpb, _, _ = LA.gesv!(copy(Az), copy(Bz))
+        @test maximum(abs, Xzpb .- ref.zgesv) < 1e-8 * (norm(ref.zgesv) + 1)
+        Xfpb, _, _ = LA.gesv!(copy(Af), copy(Bf))
+        @test maximum(abs, Xfpb .- ref.sgesv) < 1f-3 * (norm(ref.sgesv) + 1)                # F32 mixed-prec
+
+        _, Xppb = LA.posv!('L', copy(SPD), copy(Bp))     # posv! returns (A_factor, X) — X is [2]
+        @test maximum(abs, Xppb .- ref.posv) < 1e-8 * (norm(ref.posv) + 1)
+        @test maximum(abs, SPD * Xppb - Bp) < 1e-8 * (norm(SPD) * norm(Xppb) + norm(Bp))
+        _, Xpzpb = LA.posv!('L', copy(SPDz), copy(Bpz))
+        @test maximum(abs, Xpzpb .- ref.zposv) < 1e-8 * (norm(ref.zposv) + 1)
+
+        Bu = zeros(n, n); LA.lacpy!(Bu, Ac, 'U'); @test Bu ≈ ref.lacpyU
+        Bl = zeros(n, n); LA.lacpy!(Bl, Ac, 'L'); @test Bl ≈ ref.lacpyL
+        Bfull = zeros(n, n); LA.lacpy!(Bfull, Ac, 'A'); @test Bfull ≈ Ac
+
+        # larfg!/larf! must reproduce OpenBLAS exactly (tau + essential v + the applied C).
+        xr_p = copy(x); taur_p = LA.larfg!(xr_p)
+        @test abs(taur_p - taur_o) < 1e-10 && maximum(abs, xr_p .- xr_o) < 1e-10
+        Cr_p = copy(Cr0); LA.larf!('L', xr_p, taur_p, Cr_p)
+        @test maximum(abs, Cr_p .- Cr_o) < 1e-9 * (norm(Cr_o) + 1)
+        xz_p = copy(xz); tauz_p = LA.larfg!(xz_p)
+        @test abs(tauz_p - tauz_o) < 1e-10 && maximum(abs, xz_p .- xz_o) < 1e-10
+        Cz_p = copy(Cz0); LA.larf!('L', xz_p, tauz_p, Cz_p)
+        @test maximum(abs, Cz_p .- Cz_o) < 1e-9 * (norm(Cz_o) + 1)
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
+@testitem "LBT in-process forward: batch-9 (gebak/hseqr/trevc, sytrd·hetrd/orgtr·ungtr/ormtr·unmtr)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB9)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 10
+
+    # None reached via Julia's high-level dispatch for a PLAIN Matrix (eigen/schur route through the
+    # geevx_/gees_ ABI symbols, whose _geev_run!/_gees_run! composition calls hseqr!/trevc!/gebak! as
+    # Julia FUNCTIONS, not through these ABI POINTERS) — direct `LinearAlgebra.LAPACK.<name>!` calls,
+    # oracle captured BEFORE activate().
+    A = randn(n, n)
+    ilo, ihi, scale = LA.gebal!('B', copy(A))
+    V = randn(n, n)
+    Href = copy(A); tauref = LA.gehrd!(Href)[2]; Qref = LA.orghr!(1, n, copy(Href), tauref)
+    for i in 1:n-1, r in (i+2):n; Href[r, i] = 0.0; end        # clean Hessenberg
+    Hs, Zs, ws = LA.hseqr!('S', 'V', 1, n, copy(Href), copy(Qref))   # Schur form for the trevc oracle
+    selref = zeros(Int, n)
+
+    Msy = randn(n, n); Asy = Msy + Msy'
+    Mhe = randn(ComplexF64, n, n); Ahe = Mhe + Mhe'
+
+    ref = (gebak = LA.gebak!('B', 'R', ilo, ihi, copy(scale), copy(V)),
+           hseqr_w = sort(ws; by = x -> (real(x), imag(x))),
+           trevcA = LA.trevc!('R', 'A', selref, copy(Hs))[1],
+           trevcB = LA.trevc!('R', 'B', selref, copy(Hs), similar(Hs), copy(Zs)),
+           sytrd = LA.hetrd!('L', copy(Asy)), hetrd = LA.hetrd!('L', copy(Ahe)))
+    Qsy = LA.orgtr!('L', copy(ref.sytrd[1]), ref.sytrd[2])
+    Qhe = LA.orgtr!('L', copy(ref.hetrd[1]), ref.hetrd[2])
+    Csy = randn(n, 3); Cherm = randn(ComplexF64, n, 3)
+    ormtrref = LA.ormtr!('L', 'L', 'N', copy(ref.sytrd[1]), ref.sytrd[2], copy(Csy))
+    unmtrref = LA.ormtr!('L', 'L', 'N', copy(ref.hetrd[1]), ref.hetrd[2], copy(Cherm))
+
+    before = Dict(s => fwd(s) for s in (
+        "sgebak_", "dgebak_", "cgebak_", "zgebak_", "shseqr_", "dhseqr_", "chseqr_", "zhseqr_",
+        "strevc_", "dtrevc_", "ctrevc_", "ztrevc_", "ssytrd_", "dsytrd_", "chetrd_", "zhetrd_",
+        "sorgtr_", "dorgtr_", "cungtr_", "zungtr_", "sormtr_", "dormtr_", "cunmtr_", "zunmtr_",
+    ))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+
+        Vpb = copy(V); LA.gebak!('B', 'R', ilo, ihi, copy(scale), Vpb)
+        @test maximum(abs, Vpb .- ref.gebak) < 1e-9 * (norm(ref.gebak) + 1)
+
+        Hpb, Zpb, wpb = LA.hseqr!('S', 'V', 1, n, copy(Href), copy(Qref))
+        @test maximum(abs, sort(wpb; by = x -> (real(x), imag(x))) .- ref.hseqr_w) < 1e-8
+        @test maximum(abs, Zpb * Hpb * Zpb' - A) < 1e-8 * (norm(A) + 1)        # Schur reconstruction
+        @test maximum(abs, Zpb' * Zpb - I) < 1e-9
+
+        VAp = LA.trevc!('R', 'A', selref, copy(Hs))[1]
+        @test maximum(abs, VAp .- ref.trevcA) < 1e-8 * (norm(ref.trevcA) + 1)
+        VBp = LA.trevc!('R', 'B', selref, copy(Hs), similar(Hs), copy(Zs))
+        @test maximum(abs, VBp .- ref.trevcB) < 1e-8 * (norm(ref.trevcB) + 1)
+
+        Asyf, tausy = LA.hetrd!('L', copy(Asy))
+        @test maximum(abs, Asyf[1, 1] - ref.sytrd[1][1, 1]) < 1e-9    # sanity: same diagonal reduction
+        Qsypb = LA.orgtr!('L', copy(Asyf), tausy)
+        @test maximum(abs, Qsypb' * Qsypb - I) < 1e-9
+        @test maximum(abs, Qsypb .- Qsy) < 1e-8 * (norm(Qsy) + 1)
+
+        Ahef2, tauhe = LA.hetrd!('L', copy(Ahe))
+        Qhepb = LA.orgtr!('L', copy(Ahef2), tauhe)
+        @test maximum(abs, Qhepb' * Qhepb - I) < 1e-9
+        @test maximum(abs, Qhepb .- Qhe) < 1e-8 * (norm(Qhe) + 1)
+
+        Csypb = LA.ormtr!('L', 'L', 'N', copy(Asyf), tausy, copy(Csy))
+        @test maximum(abs, Csypb .- ormtrref) < 1e-8 * (norm(ormtrref) + 1)
+        Chepb = LA.ormtr!('L', 'L', 'N', copy(Ahef2), tauhe, copy(Cherm))
+        @test maximum(abs, Chepb .- unmtrref) < 1e-8 * (norm(unmtrref) + 1)
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
+@testitem "LBT in-process forward: batch-10 (orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB10)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 10
+
+    # orgqr/ormqr are reached via a DIRECT LAPACK.orgqr!/ormqr! call (Julia's qr() uses geqrt+gemqrt, the
+    # QRCompactWY path — already covered by the main forward testitem). gebrd/bdsqr/bdsdc/ormhr are also
+    # direct-caller-only. Oracle captured BEFORE activate().
+    A = randn(n, n - 3)
+    Aref = copy(A); tauref = LA.geqrf!(Aref)[2]
+    Qref = LA.orgqr!(copy(Aref), tauref)
+    C = randn(n, 4)
+    ormqrref = LA.ormqr!('L', 'N', copy(Aref), tauref, copy(C))
+
+    Ah = randn(n, n)
+    Href = copy(Ah); tauh = LA.gehrd!(Href)[2]
+    Ch = randn(n, 3)
+    ormhrref = LA.ormhr!('L', 'N', 1, n, copy(Href), tauh, copy(Ch))
+
+    m2 = 14
+    Ab = randn(m2, n)
+    gebrdref = LA.gebrd!(copy(Ab))     # (A, d, e, tauq, taup)
+    svref = svdvals(Ab)
+
+    dbd = rand(8) .+ 0.5; ebd = randn(7) .* 0.6
+    Uid = Matrix{Float64}(I, 8, 8); Vtid = Matrix{Float64}(I, 8, 8); Cempty = zeros(8, 0)
+    bdsqrref = LA.bdsqr!('U', copy(dbd), copy(ebd), copy(Vtid), copy(Uid), copy(Cempty))
+    bdsdcref = LA.bdsdc!('U', 'I', copy(dbd), copy(ebd))
+
+    before = Dict(s => fwd(s) for s in (
+        "sorgqr_", "dorgqr_", "cungqr_", "zungqr_", "sormqr_", "dormqr_", "cunmqr_", "zunmqr_",
+        "sormhr_", "dormhr_", "cunmhr_", "zunmhr_", "sgebrd_", "dgebrd_", "cgebrd_", "zgebrd_",
+        "sbdsqr_", "dbdsqr_", "sbdsdc_", "dbdsdc_",
+    ))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+
+        Apb = copy(A); taupb = LA.geqrf!(Apb)[2]
+        Qpb = LA.orgqr!(copy(Apb), taupb)
+        @test maximum(abs, Qpb' * Qpb - I) < 1e-9
+        @test maximum(abs, Qpb .- Qref) < 1e-8 * (norm(Qref) + 1)
+        Cpb = LA.ormqr!('L', 'N', copy(Apb), taupb, copy(C))
+        @test maximum(abs, Cpb .- ormqrref) < 1e-8 * (norm(ormqrref) + 1)
+
+        Hpb = copy(Ah); tauhpb = LA.gehrd!(Hpb)[2]
+        Chpb = LA.ormhr!('L', 'N', 1, n, copy(Hpb), tauhpb, copy(Ch))
+        @test maximum(abs, Chpb .- ormhrref) < 1e-8 * (norm(ormhrref) + 1)
+
+        gpb = LA.gebrd!(copy(Ab))
+        @test maximum(abs, gpb[2] .- gebrdref[2]) < 1e-8 * (norm(gebrdref[2]) + 1)   # d
+        @test maximum(abs, sort(abs.(gpb[3])) .- sort(abs.(gebrdref[3]))) < 1e-6 * (norm(gebrdref[3]) + 1)  # e magnitude
+        # independent oracle: the bidiagonal's own singular values must match svdvals(Ab) regardless of
+        # sign/algorithm details in the reduction above.
+        dchk = copy(gpb[2]); echk = copy(gpb[3])[1:n-1]   # gebrd e is length k; bdsqr wants n-1 off-diags
+        Uidm = Matrix{Float64}(I, m2, m2)[:, 1:n]; Vtidm = Matrix{Float64}(I, n, n)
+        LA.bdsqr!('U', dchk, echk, Vtidm, Uidm, zeros(n, 0))
+        @test maximum(abs, sort(dchk) .- sort(svref)) < 1e-7 * (norm(svref) + 1)
+
+        dqpb = copy(dbd); eqpb = copy(ebd)
+        bdsqrpb = LA.bdsqr!('U', dqpb, eqpb, copy(Vtid), copy(Uid), copy(Cempty))
+        @test maximum(abs, sort(bdsqrpb[1]) .- sort(bdsqrref[1])) < 1e-8
+        Bmat = diagm(0 => dbd, 1 => ebd)
+        Upb2 = bdsqrpb[3]; Vtpb2 = bdsqrpb[2]; Spb2 = bdsqrpb[1]
+        @test maximum(abs, Upb2 * Diagonal(Spb2) * Vtpb2 - Bmat) < 1e-7 * (norm(Bmat) + 1)
+
+        dcpb = copy(dbd); ecpb = copy(ebd)
+        bdsdcpb = LA.bdsdc!('U', 'I', dcpb, ecpb)
+        @test maximum(abs, sort(bdsdcpb[1]) .- sort(bdsdcref[1])) < 1e-8
+        Ubd = bdsdcpb[3]; Vtbd = bdsdcpb[4]
+        @test maximum(abs, Ubd * Diagonal(bdsdcpb[1]) * Vtbd - Bmat) < 1e-7 * (norm(Bmat) + 1)
+
+        # uplo='L' path (the Bᵀ swap-trick): reconstruct against a LOWER-bidiagonal B.
+        dl = rand(8) .+ 0.5; el = randn(7) .* 0.6
+        dlpb = copy(dl); elpb = copy(el)
+        Ulpb = Matrix{Float64}(I, 8, 8); Vtlpb = Matrix{Float64}(I, 8, 8)
+        bdlref = LA.bdsqr!('L', copy(dl), copy(el), copy(Vtlpb), copy(Ulpb), copy(Cempty))
+        bdlpb = LA.bdsqr!('L', dlpb, elpb, Vtlpb, Ulpb, copy(Cempty))
+        @test maximum(abs, sort(bdlpb[1]) .- sort(bdlref[1])) < 1e-8
+        Bl_ = diagm(0 => dl, -1 => el)
+        @test maximum(abs, Ulpb * Diagonal(bdlpb[1]) * Vtlpb - Bl_) < 1e-7 * (norm(Bl_) + 1)
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
 # ── OpenBLAS-removal GATE (the contract) ──────────────────────────────────────────────────────────────
 # Enumerates EVERY LAPACK symbol LinearAlgebra can ccall (parsed from stdlib lapack.jl) and asserts how
 # many still fall through to OpenBLAS after activate() (pointer unchanged vs pre-activate). This is the
@@ -433,7 +672,15 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 87   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    _FALLTHROUGH_MAX = 23   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    # 2026-07-20: 87 → 23. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
+    # orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
+    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open). The
+    # residual 23 = the explicitly out-of-scope set: gesvx/posvx-class expert drivers (gesvx), tgsen
+    # (generalized Schur reorder — not built), trrfs (not built), syconv (Bunch-Kaufman aa-convert — not
+    # built), complex/F32 ggsvd (needs complex GSVD), cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-
+    # accumulator Givens apply not yet in svd.jl), and cstev_/zstev_ (NOT real LAPACK symbols — stev is
+    # s/d only; they have no caller, an artifact of the regex scan).
     lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
     syms = Set{String}()
     for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end

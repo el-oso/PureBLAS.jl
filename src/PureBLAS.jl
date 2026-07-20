@@ -62,6 +62,9 @@ include("cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — 
 include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
 include("cabi_l3.jl")       # Mode 1: BLAS-3 rest (symm/syrk/trmm/trsm/…)
 include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
+include("cabi_lapack2.jl")  # Mode 1: LAPACK batch 2 (gesv/posv/lacpy/larfg/larf/gebak/hseqr/trevc/
+                             # sytrd·hetrd/orgtr·ungtr/ormtr·unmtr/orgqr·ungqr/ormqr·unmqr/ormhr·unmhr/
+                             # gebrd/bdsqr/bdsdc) — OpenBLAS-removal ratchet follow-up
 include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
