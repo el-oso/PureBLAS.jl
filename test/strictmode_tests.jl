@@ -341,7 +341,8 @@ end
         @assert_trim_compatible P.ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
         @assert_trim_compatible P.gges!('V', 'V', randn(n, n), randn(n, n))
         @assert_trim_compatible P.gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
-        @assert_trim_compatible P.ggsvd!(randn(8, 6), randn(6, 6))
+        @assert_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(8, 6), randn(6, 6))
+        @assert_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(ComplexF64, 8, 6), randn(ComplexF64, 6, 6))
         @assert_trim_compatible P.sygvd!(1, 'V', 'U', copy(Ad), copy(Sd))
         @assert_trim_compatible P.hegvd!(1, 'V', 'U', copy(Ahe), copy(She))
         # ── symmetric-tridiagonal (stebz/stein), real ──

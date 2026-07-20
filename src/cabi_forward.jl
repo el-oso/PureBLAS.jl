@@ -577,15 +577,24 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
     @eval _reg!($(p * "gglse_"), () -> @cfunction($(Symbol(p, "gglse_64_")), Cvoid,
         (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
 end
-# ggsvd / ggsvd3 — generalized SVD, Float64 full-rank ONLY (direct LAPACK.ggsvd!/ggsvd3! callers).
-_reg!("dggsvd_", () -> @cfunction(dggsvd_64_, Cvoid,
-    (_CU, _CU, _CU, _CI, _CI, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
-     Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
-     Ptr{Float64}, Ptr{Int64}, _CI, Clong, Clong, Clong)))
-_reg!("dggsvd3_", () -> @cfunction(dggsvd3_64_, Cvoid,
-    (_CU, _CU, _CU, _CI, _CI, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
-     Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
-     Ptr{Float64}, _CI, Ptr{Int64}, _CI, Clong, Clong, Clong)))
+# ggsvd / ggsvd3 — generalized SVD, RANK-DEFICIENT-capable, ALL FOUR types (direct LAPACK.ggsvd!/ggsvd3!
+# callers + svd(A,B) via ggsvd3!). REAL: work real, iwork; COMPLEX: alpha/beta real + extra rwork.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "ggsvd_"), () -> @cfunction($(Symbol(p, "ggsvd_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T},
+         Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong, Clong)))
+    @eval _reg!($(p * "ggsvd3_"), () -> @cfunction($(Symbol(p, "ggsvd3_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T},
+         Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CI, Clong, Clong, Clong)))
+end
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "ggsvd_"), () -> @cfunction($(Symbol(p, "ggsvd_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$Tr}, Ptr{$Tr},
+         Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$Tr}, _CI, _CI, Clong, Clong, Clong)))
+    @eval _reg!($(p * "ggsvd3_"), () -> @cfunction($(Symbol(p, "ggsvd3_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$Tr}, Ptr{$Tr},
+         Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$Tr}, _CI, _CI, Clong, Clong, Clong)))
+end
 
 # ═══════════ Batch 2 (cabi_lapack2.jl): gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
 # orgtr·ungtr/ormtr·unmtr, orgqr·ungqr/ormqr·unmqr, ormhr·unmhr, gebrd/bdsqr/bdsdc — the OpenBLAS-removal

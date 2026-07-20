@@ -811,6 +811,38 @@ end
     end
 end
 
+@testitem "LBT in-process forward: batch-15 (ggsvd — rank-deficient generalized SVD, s/d/c/z)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB15)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    m, n, p = 8, 6, 7
+    # full-rank AND rank-deficient (low-rank A) pairs. Direct LAPACK.ggsvd!, OpenBLAS oracle pre-activate.
+    data = [(T, rd) for T in (Float64, Float32, ComplexF64, ComplexF32) for rd in (false, true)]
+    mats = map(d -> (A = d[2] ? randn(d[1], m, 2) * randn(d[1], 2, n) : randn(d[1], m, n), Bm = randn(d[1], p, n)), data)
+    oracle = map(mats) do mm
+        _, _, _, a, b, k, l, _ = LA.ggsvd!('U', 'V', 'Q', copy(mm.A), copy(mm.Bm))
+        (a = sort(a), b = sort(b), k = k, l = l)
+    end
+    before = Dict(s => fwd(s) for s in ("sggsvd_", "dggsvd_", "cggsvd_", "zggsvd_"))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+        for (i, mm) in enumerate(mats)
+            T = data[i][1]
+            U, V, Q, a, b, k, l, R = LA.ggsvd!('U', 'V', 'Q', copy(mm.A), copy(mm.Bm))
+            tol = real(T) == Float32 ? 1.0f-3 : 1e-8
+            @test k == oracle[i].k && l == oracle[i].l                         # ranks exact vs OpenBLAS
+            @test maximum(abs, sort(a) .- oracle[i].a) < tol                   # generalized singular values
+            @test maximum(abs, sort(b) .- oracle[i].b) < tol
+            @test opnorm(U'U - I) < tol && opnorm(V'V - I) < tol && opnorm(Q'Q - I) < tol  # unitary
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
 # ── OpenBLAS-removal GATE (the contract) ──────────────────────────────────────────────────────────────
 # Enumerates EVERY LAPACK symbol LinearAlgebra can ccall (parsed from stdlib lapack.jl) and asserts how
 # many still fall through to OpenBLAS after activate() (pointer unchanged vs pre-activate). This is the
@@ -820,13 +852,13 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 3    # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
-    # 2026-07-20: 87 → 23 → 15 → 13 → 11 → 3. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc,
-    # sytrd·hetrd/orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/
-    # bdsdc, syconv + trrfs (s/d/c/z), tgsen (COMPLEX + now REAL via the dtgex2 2×2 swap — batch-12),
-    # gesvx s/d/c/z (expert driver: geequ + getrf + getrs + gecon + gerfs — batch-13), c/z bdsqr (robust
-    # complex Demmel–Kahan sweep — batch-14), and the cstev_/zstev_ PHANTOM allowlist below. The residual
-    # 3 = cggsvd_/sggsvd_/zggsvd_ (complex/F32 rank-deficient GSVD — kernel built, wiring is the last batch).
+    _FALLTHROUGH_MAX = 0    # ★ NORTH STAR REACHED ★ Every LinearAlgebra-reachable LAPACK symbol forwards
+    # to PureBLAS after activate(). Do not raise. 2026-07-20: 87 → 23 → 15 → 13 → 11 → 3 → 0. The final
+    # wave forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/orgtr·ungtr/ormtr·unmtr,
+    # orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc, syconv + trrfs (s/d/c/z), tgsen (complex +
+    # real dtgex2 2×2 swap), gesvx s/d/c/z (geequ+getrf+getrs+gecon+gerfs), c/z bdsqr (robust Demmel–Kahan),
+    # and c/s/z ggsvd (rank-deficient GSVD via dggsvp + dtgsja). The cstev_/zstev_ PHANTOM allowlist below
+    # is the ONLY exclusion — they are not real LAPACK symbols (see the note). OpenBLAS fallback: REMOVED.
     # PHANTOM allowlist: cstev_/zstev_ appear ONLY in COMMENTED-OUT lines of stdlib lapack.jl (the s/d/c/z
     # macro loop explicitly drops the complex STEV — "Need to rewrite for ZHEEV"); `nm -D libopenblas`
     # confirms NO c/zstev_ export exists. They are regex-scan artifacts with no caller, not real gaps, so
