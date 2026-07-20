@@ -286,7 +286,7 @@ function stein!(d::AbstractVector{T}, e::AbstractVector{T}, w::AbstractVector{T}
     d2 = Vector{T}(undef, n); inn = Vector{Int}(undef, n); rhs = Vector{T}(undef, n)
 
     j1 = 1
-    nblkmax = maximum(iblock)
+    nblkmax = 0; @inbounds for x in iblock; nblkmax = max(nblkmax, Int(x)); end   # not maximum(): abstract-elt MappingRF is --trim-unsafe
     @inbounds for nblk in 1:nblkmax
         b1 = nblk == 1 ? 1 : Int(isplit[nblk-1]) + 1
         bn = Int(isplit[nblk])
