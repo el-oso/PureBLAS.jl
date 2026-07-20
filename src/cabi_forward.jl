@@ -615,6 +615,22 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
     @eval _reg!($(p * "larf_"), () -> @cfunction($(Symbol(p, "larf_64_")), Cvoid,
         (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, Clong)))
 end
+# syconv — Bunch-Kaufman factorization convert (cabi_lapack3.jl). 2 chars (uplo, way).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "syconv_"), () -> @cfunction($(Symbol(p, "syconv_64_")), Cvoid,
+        (_CU, _CU, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, Clong, Clong)))
+end
+# trrfs — triangular-solve error bounds (cabi_lapack3.jl). 3 chars (uplo, trans, diag).
+for (p, T) in (("s", Float32), ("d", Float64))     # real: Ferr/Berr/work real, iwork Int
+    @eval _reg!($(p * "trrfs_"), () -> @cfunction($(Symbol(p, "trrfs_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI,
+         Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong, Clong, Clong)))
+end
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))  # complex: Ferr/Berr/rwork real
+    @eval _reg!($(p * "trrfs_"), () -> @cfunction($(Symbol(p, "trrfs_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI,
+         Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, Ptr{$Tr}, _CI, Clong, Clong, Clong)))
+end
 # gebak — undo gebal's balancing on eigen/Schur vectors.
 for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
                    ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
