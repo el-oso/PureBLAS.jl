@@ -29,7 +29,7 @@ println(read("judge.md", String))
 
 regs = [join(k, "/") for (k, tj) in leaves(benchmarkgroup(j)) if time(tj) == :regression]
 if !isempty(regs)
-    println("\n❌ PERFORMANCE REGRESSION (>$(round(Int, TOL*100))% slower vs $baseref):")
+    println("\n❌ PERFORMANCE REGRESSION (>$(round(Int, TOL * 100))% slower vs $baseref):")
     foreach(r -> println("   - ", r), regs)
     exit(1)
 end

@@ -85,7 +85,11 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        tri(s) = (M = tril(randn(s, s)); for i in 1:s; M[i, i] += s; end; M)
+        tri(s) = (
+            M = tril(randn(s, s)); for i in 1:s
+                M[i, i] += s
+            end; M
+        )
         # ROOT-CAUSE guard, on the CONSUMER (not the accessor — passing `Float64` as a value infers over
         # DataType, where T is unresolvable, a test artifact). Here T = eltype(B) is a concrete compile-
         # time parameter, so :full-mode JET report_opt sees the real specialization: the invL/invR base
@@ -109,7 +113,11 @@ end
         @assert_noalloc P._trsm_base_invR!(false, false, false, Atri, randn(256, 32)) static = false
         # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
         # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
-        Aup = (M = triu(randn(128, 128)); for i in 1:128; M[i, i] += 128.0; end; M)
+        Aup = (
+            M = triu(randn(128, 128)); for i in 1:128
+                M[i, i] += 128.0
+            end; M
+        )
         P._trsm_fused_L!(false, Aup, randn(128, 256))                     # warm the ftrsm buffer
         @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
         @assert_noalloc P._trsm_fused_L!(false, Aup, randn(128, 256)) static = false
@@ -119,7 +127,11 @@ end
         # no non-transpose fallback (its slab kernels require W==MR==8), so a DIRECT call on AVX2 throws by
         # design — gate the dogfood on the same predicate the dispatcher uses.
         if PureBLAS._GT_TRANSPOSE
-            Auf = (M = triu(randn(512, 512)); for i in 1:512; M[i, i] += 512.0; end; M)
+            Auf = (
+                M = triu(randn(512, 512)); for i in 1:512
+                    M[i, i] += 512.0
+                end; M
+            )
             P._trsm_fused_full_L!(false, Auf, randn(512, 256))               # warm the ftrsm buffer
             @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
             @assert_noalloc P._trsm_fused_full_L!(false, Auf, randn(512, 256)) static = false
@@ -160,7 +172,9 @@ end
         @assert_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
         @assert_noalloc P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
         # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
-        Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48; Atr[d, d] = 1 + abs(Atr[d, d]); end
+        Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
+            Atr[d, d] = 1 + abs(Atr[d, d])
+        end
         @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
         @assert_noalloc P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48)) static = false
         @test true
@@ -200,19 +214,31 @@ end
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
         GC.@preserve Au Bu Cu begin
             aup = pointer(Au); bup = pointer(Bu); cup = pointer(Cu)
-            @assert_typestable P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
-                Val(P._MR), Val(P._NR), Val(false), Val(true))
-            @assert_noalloc P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 2.0,
-                Val(P._MR), Val(P._NR), Val(false), Val(false))
-            @assert_trim_compatible P._microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
-                Val(P._MR), Val(P._NR), Val(false), Val(true))
+            @assert_typestable P._microkernel_unpacked!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
+                Val(P._MR), Val(P._NR), Val(false), Val(true)
+            )
+            @assert_noalloc P._microkernel_unpacked!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 2.0,
+                Val(P._MR), Val(P._NR), Val(false), Val(false)
+            )
+            @assert_trim_compatible P._microkernel_unpacked!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
+                Val(P._MR), Val(P._NR), Val(false), Val(true)
+            )
             # masked-row kernel (partial rows): mre=12 → second row-vector partially masked
-            @assert_typestable P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true))
-            @assert_noalloc P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false))
-            @assert_trim_compatible P._microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true))
+            @assert_typestable P._microkernel_unpacked_mrows!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true)
+            )
+            @assert_noalloc P._microkernel_unpacked_mrows!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false)
+            )
+            @assert_trim_compatible P._microkernel_unpacked_mrows!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true)
+            )
         end
         # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed
         # zgemm_64_/cgemm_64_ trim-safety (four runtime `bool ? Val(true):Val(false)` flags → a Union{Val,Val}
@@ -370,7 +396,7 @@ end
         @assert_trim_compatible P.gttrf!(copy(dl), copy(dm), copy(du), zeros(Float64, n - 2), zeros(Int, n))
         @assert_trim_compatible P.gtsv!(fill(1.0 + 0im, n - 1), fill(4.0 + 0im, n), fill(1.0 + 0im, n - 1), randn(ComplexF64, n, 2))
         # ── banded / packed Cholesky (pbtrf/pbtrs, pptrf/pptrs) — SPD storage ──
-        mkband(T) = (AB = zeros(T, 3, n); AB[1, :] .= T(10); AB[2, 1:n-1] .= T(1); AB[3, 1:n-2] .= T(0.5); AB)
+        mkband(T) = (AB = zeros(T, 3, n); AB[1, :] .= T(10); AB[2, 1:(n - 1)] .= T(1); AB[3, 1:(n - 2)] .= T(0.5); AB)
         ABsd = mkband(Float64); P.pbtrf!(ABsd; uplo = 'L', kd = 2)
         @assert_trim_compatible P.pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
         @assert_trim_compatible P.pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)

@@ -1,16 +1,16 @@
 @testsetup module GemmOracle
-    using LinearAlgebra
-    export gerr, gtol
-    gerr(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
-    gtol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-11
+using LinearAlgebra
+export gerr, gtol
+gerr(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
+gtol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-11
 end
 
 @testitem "GEMM real (blocked) vs OpenBLAS" setup = [GemmOracle] begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
     @testset "$T $tA$tB m=$m n=$n k=$k" for T in (Float32, Float64),
-        (tA, tB) in (('N', 'N'), ('T', 'N'), ('N', 'T'), ('T', 'T')),
-        m in (1, 16, 17, 40), n in (1, 6, 7, 31), k in (1, 16, 33)
+            (tA, tB) in (('N', 'N'), ('T', 'N'), ('N', 'T'), ('T', 'T')),
+            m in (1, 16, 17, 40), n in (1, 6, 7, 31), k in (1, 16, 33)
 
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         Bm = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
@@ -28,8 +28,8 @@ end
     import LinearAlgebra.BLAS as B
     # Sizes above the unpacked threshold (96) exercise the blocked path incl. its masked edge.
     @testset "$T $tA$tB m=$m n=$n k=$k" for T in (Float32, Float64),
-        (tA, tB) in (('N', 'N'), ('T', 'N'), ('N', 'T')),
-        (m, n, k) in ((100, 100, 100), (130, 97, 113), (160, 200, 128), (97, 150, 99))
+            (tA, tB) in (('N', 'N'), ('T', 'N'), ('N', 'T')),
+            (m, n, k) in ((100, 100, 100), (130, 97, 113), (160, 200, 128), (97, 150, 99))
 
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         Bm = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
@@ -56,8 +56,8 @@ end
     # sizes span the routing: tiny→generic (5), unpacked small-n (23,40 — >nr cols & >mr rows to
     # exercise the jr/ir tiling), and >_CGEMM_UNPACK_MAX→blocked (100). n>nr with jr>0 was a real bug.
     @testset "$T $tA$tB $m×$n×$k" for T in (ComplexF32, ComplexF64),
-        (tA, tB) in (('N', 'N'), ('C', 'N'), ('N', 'C'), ('T', 'T'), ('C', 'C')),
-        (m, n, k) in ((23, 17, 19), (5, 5, 5), (40, 48, 33), (100, 96, 77))
+            (tA, tB) in (('N', 'N'), ('C', 'N'), ('N', 'C'), ('T', 'T'), ('C', 'C')),
+            (m, n, k) in ((23, 17, 19), (5, 5, 5), (40, 48, 33), (100, 96, 77))
 
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         Bm = tB == 'N' ? randn(T, k, n) : randn(T, n, k)

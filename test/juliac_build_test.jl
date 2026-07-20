@@ -9,7 +9,7 @@
 # against a trimmed base image). Run it in a dedicated CI job / before a release, not on every Pkg.test().
 #   PUREBLAS_JULIAC_BUILD=1 julia --project=test -e 'using ReTestItems, PureBLAS; runtests(PureBLAS; name="juliac")'
 
-@testitem "juliac --trim build + C-host LBT (authoritative; gated PUREBLAS_JULIAC_BUILD=1)" tags=[:juliac] begin
+@testitem "juliac --trim build + C-host LBT (authoritative; gated PUREBLAS_JULIAC_BUILD=1)" tags = [:juliac] begin
     using PureBLAS
     root = pkgdir(PureBLAS)
     juliac = normpath(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl"))
@@ -28,8 +28,10 @@
         # subprocess sees the DEFAULT path (incl. @stdlib → LazyArtifacts): a ReTestItems worker restricts
         # it, which would otherwise fail the build with "LazyArtifacts not found" before it even verifies.
         buildjl = joinpath(root, "juliac", "build.jl")
-        cmd = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$root $buildjl`,
-                     "JULIA_LOAD_PATH" => nothing, "JULIA_PROJECT" => nothing)
+        cmd = addenv(
+            `$(Base.julia_cmd()) --startup-file=no --project=$root $buildjl`,
+            "JULIA_LOAD_PATH" => nothing, "JULIA_PROJECT" => nothing
+        )
         proc = run(pipeline(cmd; stdout = stderr, stderr = stderr); wait = false)
         wait(proc)
         @test success(proc)
@@ -52,8 +54,8 @@
             # both SVD reconstructions must hit machine precision through the C-ABI
             m = match(r"dgesvd n=160:.*recon\|err\|=([0-9.eE+-]+)\s+ortho\|err\|=([0-9.eE+-]+)", out)
             @test !isnothing(m)
-            @test parse(Float64, m.captures[1]) < 1e-9
-            @test parse(Float64, m.captures[2]) < 1e-9
+            @test parse(Float64, m.captures[1]) < 1.0e-9
+            @test parse(Float64, m.captures[2]) < 1.0e-9
         end
     end
 end

@@ -14,7 +14,7 @@
 # algorithmic `4` from a tuning `4`; it flags candidates and forces an explicit, reviewer-signed justification.
 
 const _SRCDIR = joinpath(@__DIR__, "..", "src")
-const _ANNOT  = r"#\s*req8-ok:"i
+const _ANNOT = r"#\s*req8-ok:"i
 const _VAL_LIT = r"\bVal\(\s*(\d+)\s*\)"
 const _CONST_DEF = r"^\s*const\s+(_[A-Z][A-Z0-9_]*)\s*=\s*(.*)$"
 
@@ -31,11 +31,11 @@ end
 
 function req8_scan()
     viols = String[]
-    for f in sort(readdir(_SRCDIR; join=true))
+    for f in sort(readdir(_SRCDIR; join = true))
         endswith(f, ".jl") || continue
         lines = readlines(f)
         for (i, ln) in enumerate(lines)
-            (i > 1 && occursin(_ANNOT, lines[i-1])) && continue
+            (i > 1 && occursin(_ANNOT, lines[i - 1])) && continue
             occursin(_ANNOT, ln) && continue
             code = split(ln, '#')[1]
             for m in eachmatch(_VAL_LIT, code)
@@ -44,7 +44,7 @@ function req8_scan()
             end
             cm = match(_CONST_DEF, code)
             if cm !== nothing && _bare_int_rhs(cm.captures[2])
-                push!(viols, "$(basename(f)):$i  const $(cm.captures[1]) = $(strip(split(cm.captures[2],'#')[1]))")
+                push!(viols, "$(basename(f)):$i  const $(cm.captures[1]) = $(strip(split(cm.captures[2], '#')[1]))")
             end
         end
     end
@@ -71,7 +71,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
         open(_BASELINE, "w") do io
             println(io, "# req#8 lint baseline — known tuning literals pending derivation or `# req8-ok:` annotation.")
             println(io, "# The lint fails on any flag NOT listed here. Whittle this down; do not add to it without cause.")
-            for v in sort(req8_scan()); println(io, _stripline(v)); end
+            for v in sort(req8_scan())
+                println(io, _stripline(v))
+            end
         end
         println("wrote baseline: $(length(req8_scan())) entries")
     else
@@ -80,7 +82,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
             println("req8 lint: PASS (no NEW unjustified tuning literals beyond the baseline)")
         else
             println("req8 lint: FAIL — $(length(nv)) NEW tuning literal(s) not derived/annotated/baselined:")
-            for x in nv; println("  ", x); end
+            for x in nv
+                println("  ", x)
+            end
             exit(1)
         end
     end

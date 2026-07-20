@@ -33,7 +33,7 @@ const BlasFloat = Union{Float32, Float64, ComplexF32, ComplexF64}
 
 # One step of the LAPACK `lassq` scaled sum-of-squares (overflow/underflow safe) — the
 # correctness boundary for nrm2. Returns the updated (scale, ssq).
-@inline function _lassq(scale::R, ssq::R, a::R) where {R<:Real}
+@inline function _lassq(scale::R, ssq::R, a::R) where {R <: Real}
     if !iszero(a)
         absa = abs(a)
         if scale < absa

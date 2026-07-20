@@ -37,6 +37,6 @@ function main()
         end
     end
     fails == 0 || error("memsafe_verify: $fails direct-read gemm OOB violation(s) — a partial-tile read walked off bounds")
-    println("memsafe_verify: all direct-read gemm shapes clean.")
+    return println("memsafe_verify: all direct-read gemm shapes clean.")
 end
 main()

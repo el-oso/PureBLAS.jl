@@ -14,16 +14,22 @@ iamax(x::AbstractVector) = iamax(DEFAULT_BACKEND, x)
 
 # Level 2. @inline + explicit kwarg forwarding (no `kw...` splat) so the keyword-argument overhead
 # is elided at the call site — it otherwise dominates tiny-matrix gemv (~200 ns vs a ~33 ns kernel).
-@inline gemv!(y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
-    alpha = one(eltype(A)), beta = zero(eltype(A)), trans::Char = 'N') =
+@inline gemv!(
+    y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
+    alpha = one(eltype(A)), beta = zero(eltype(A)), trans::Char = 'N'
+) =
     gemv!(DEFAULT_BACKEND, y, A, x; alpha, beta, trans)
 @inline ger!(alpha::Number, x::AbstractVector, y::AbstractVector, A::AbstractMatrix; conj::Bool = false) =
     ger!(DEFAULT_BACKEND, alpha, x, y, A; conj)
-@inline symv!(y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
-    uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))) =
+@inline symv!(
+    y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
+    uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))
+) =
     symv!(DEFAULT_BACKEND, y, A, x; uplo, alpha, beta)
-@inline hemv!(y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
-    uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))) =
+@inline hemv!(
+    y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
+    uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))
+) =
     hemv!(DEFAULT_BACKEND, y, A, x; uplo, alpha, beta)
 @inline trmv!(A::AbstractMatrix, x::AbstractVector; uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N') =
     trmv!(DEFAULT_BACKEND, A, x; uplo, trans, diag)
@@ -59,8 +65,10 @@ end
 @inline tpsv!(AP::AbstractVector, x::AbstractVector; uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N') =
     tpsv!(DEFAULT_BACKEND, AP, x; uplo, trans, diag)
 # Level 2 banded
-@inline gbmv!(y::AbstractVector, AB::AbstractMatrix, x::AbstractVector, m::Integer, kl::Integer, ku::Integer;
-    trans::Char = 'N', alpha = one(eltype(AB)), beta = zero(eltype(AB))) =
+@inline gbmv!(
+    y::AbstractVector, AB::AbstractMatrix, x::AbstractVector, m::Integer, kl::Integer, ku::Integer;
+    trans::Char = 'N', alpha = one(eltype(AB)), beta = zero(eltype(AB))
+) =
     gbmv!(DEFAULT_BACKEND, y, AB, x, m, kl, ku; trans, alpha, beta)
 @inline sbmv!(y::AbstractVector, AB::AbstractMatrix, x::AbstractVector; uplo::Char = 'U', alpha = one(eltype(AB)), beta = zero(eltype(AB))) =
     sbmv!(DEFAULT_BACKEND, y, AB, x; uplo, alpha, beta)

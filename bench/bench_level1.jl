@@ -35,7 +35,7 @@ end
 function report(op, n, ob, pb, acc)
     r = ob / pb
     push!(acc, r)
-    @printf("%-7s %9d %13.1f %13.1f %8.2fx   %s\n", op, n, ob, pb, r, r >= 0.96 ? "PASS" : "FAIL")
+    return @printf("%-7s %9d %13.1f %13.1f %8.2fx   %s\n", op, n, ob, pb, r, r >= 0.96 ? "PASS" : "FAIL")
 end
 
 function run_table()
@@ -43,28 +43,96 @@ function run_table()
     @printf("%-7s %9s %13s %13s %9s   %s\n", "op", "n", "OpenBLAS(ns)", "PureBLAS(ns)", "ratio", "gate")
     for n in SIZES
         x = randn(n); y = randn(n); a = 1.0000001; m = m_for(n); R = 151
-        report("axpy", n, paired(
-            () -> begin for _ in 1:m; B.axpy!(a, x, y); end; y[1] end,
-            () -> begin for _ in 1:m; PureBLAS.axpy!(y, a, x); end; y[1] end; m, rounds=R)..., acc)
-        report("scal", n, paired(
-            () -> begin for _ in 1:m; B.scal!(a, x); end; x[1] end,
-            () -> begin for _ in 1:m; PureBLAS.scal!(a, x); end; x[1] end; m, rounds=R)..., acc)
-        report("copy", n, paired(
-            () -> begin for _ in 1:m; B.blascopy!(n, x, 1, y, 1); end; y[1] end,
-            () -> begin for _ in 1:m; PureBLAS.blascopy!(y, x); end; y[1] end; m, rounds=R)..., acc)
-        report("dot", n, paired(
-            () -> begin s = 0.0; for _ in 1:m; s += dot(x, y); end; s end,
-            () -> begin s = 0.0; for _ in 1:m; s += PureBLAS.dot(x, y); end; s end; m, rounds=R)..., acc)
-        report("nrm2", n, paired(
-            () -> begin s = 0.0; for _ in 1:m; s += B.nrm2(x); end; s end,
-            () -> begin s = 0.0; for _ in 1:m; s += PureBLAS.nrm2(x); end; s end; m, rounds=R)..., acc)
-        report("asum", n, paired(
-            () -> begin s = 0.0; for _ in 1:m; s += B.asum(x); end; s end,
-            () -> begin s = 0.0; for _ in 1:m; s += PureBLAS.asum(x); end; s end; m, rounds=R)..., acc)
+        report(
+            "axpy", n, paired(
+                () -> begin
+                    for _ in 1:m
+                        B.axpy!(a, x, y)
+                    end; y[1]
+                end,
+                () -> begin
+                    for _ in 1:m
+                        PureBLAS.axpy!(y, a, x)
+                    end; y[1]
+                end; m, rounds = R
+            )..., acc
+        )
+        report(
+            "scal", n, paired(
+                () -> begin
+                    for _ in 1:m
+                        B.scal!(a, x)
+                    end; x[1]
+                end,
+                () -> begin
+                    for _ in 1:m
+                        PureBLAS.scal!(a, x)
+                    end; x[1]
+                end; m, rounds = R
+            )..., acc
+        )
+        report(
+            "copy", n, paired(
+                () -> begin
+                    for _ in 1:m
+                        B.blascopy!(n, x, 1, y, 1)
+                    end; y[1]
+                end,
+                () -> begin
+                    for _ in 1:m
+                        PureBLAS.blascopy!(y, x)
+                    end; y[1]
+                end; m, rounds = R
+            )..., acc
+        )
+        report(
+            "dot", n, paired(
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += dot(x, y)
+                    end; s
+                end,
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += PureBLAS.dot(x, y)
+                    end; s
+                end; m, rounds = R
+            )..., acc
+        )
+        report(
+            "nrm2", n, paired(
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += B.nrm2(x)
+                    end; s
+                end,
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += PureBLAS.nrm2(x)
+                    end; s
+                end; m, rounds = R
+            )..., acc
+        )
+        report(
+            "asum", n, paired(
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += B.asum(x)
+                    end; s
+                end,
+                () -> begin
+                    s = 0.0; for _ in 1:m
+                        s += PureBLAS.asum(x)
+                    end; s
+                end; m, rounds = R
+            )..., acc
+        )
     end
     geo = exp(mean(log.(acc)))
-    @printf("\n geomean ratio = %.3fx   min = %.3fx   ops below 0.96 = %d/%d\n",
-        geo, minimum(acc), count(<(0.96), acc), length(acc))
+    return @printf(
+        "\n geomean ratio = %.3fx   min = %.3fx   ops below 0.96 = %d/%d\n",
+        geo, minimum(acc), count(<(0.96), acc), length(acc)
+    )
 end
 
 for pass in 1:2

@@ -13,17 +13,19 @@
 # equality is not asserted either.
 
 @testsetup module ReproHelp
-    export shifted, biteq, biteqv
-    # same values placed contiguously at byte-offset `off` in a fresh buffer → different alignment,
-    # returned as a unit-stride view (so every offset, incl. 0, takes the SAME code path).
-    shifted(v, off) = (buf = Vector{eltype(v)}(undef, length(v) + off);
-                       buf[off+1:off+length(v)] .= v; view(buf, off+1:off+length(v)))
-    biteq(a, b) = reinterpret(UInt64, Float64(a)) == reinterpret(UInt64, Float64(b))
-    biteqv(A, B) = length(A) == length(B) &&
-                   all(reinterpret(UInt64, vec(collect(A))) .== reinterpret(UInt64, vec(collect(B))))
+export shifted, biteq, biteqv
+# same values placed contiguously at byte-offset `off` in a fresh buffer → different alignment,
+# returned as a unit-stride view (so every offset, incl. 0, takes the SAME code path).
+shifted(v, off) = (
+    buf = Vector{eltype(v)}(undef, length(v) + off);
+    buf[(off + 1):(off + length(v))] .= v; view(buf, (off + 1):(off + length(v)))
+)
+biteq(a, b) = reinterpret(UInt64, Float64(a)) == reinterpret(UInt64, Float64(b))
+biteqv(A, B) = length(A) == length(B) &&
+    all(reinterpret(UInt64, vec(collect(A))) .== reinterpret(UInt64, vec(collect(B))))
 end
 
-@testitem "Reproducibility: BLAS-1 run-to-run bit-identity" setup=[ReproHelp] begin
+@testitem "Reproducibility: BLAS-1 run-to-run bit-identity" setup = [ReproHelp] begin
     using PureBLAS
     for n in (1000, 4096, 10007)
         x = randn(n); y = randn(n)
@@ -34,7 +36,7 @@ end
     end
 end
 
-@testitem "Reproducibility: BLAS-1 alignment invariant within a code path" setup=[ReproHelp] begin
+@testitem "Reproducibility: BLAS-1 alignment invariant within a code path" setup = [ReproHelp] begin
     using PureBLAS
     for n in (1000, 4096, 10007)
         x = randn(n); y = randn(n)
@@ -50,7 +52,7 @@ end
     end
 end
 
-@testitem "Reproducibility: gemv/gemm run-to-run + gemv alignment invariant" setup=[ReproHelp] begin
+@testitem "Reproducibility: gemv/gemm run-to-run + gemv alignment invariant" setup = [ReproHelp] begin
     using PureBLAS
     m, k, nrhs = 257, 384, 200
     A = randn(m, k); x = randn(k)

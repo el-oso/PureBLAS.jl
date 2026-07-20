@@ -7,25 +7,41 @@
 using LinearAlgebra, Chairmarks, Statistics, Printf; import PureBLAS
 const P = PureBLAS
 BLAS.set_num_threads(1)
-tri(s) = (A = triu(randn(Float64, s, s)); @inbounds for i in 1:s; A[i,i] += Float64(s); end; A)
+tri(s) = (
+    A = triu(randn(Float64, s, s)); @inbounds for i in 1:s
+        A[i, i] += Float64(s)
+    end; A
+)
 
 function fp_gf(k, n)
     A = tri(k); Bs = [randn(Float64, k, n) for _ in 1:8]
     f(B) = (P._trsm_fused_full_L!(false, A, B); B[1])
-    b = @be Bs (x -> (v=0.0; for B in x; v += f(B); end; v)) evals=1 samples=200 seconds=2.0
+    b = @be Bs (
+        x -> (
+            v = 0.0; for B in x
+                v += f(B)
+            end; v
+        )
+    ) evals = 1 samples = 200 seconds = 2.0
     t = median(getproperty.(b.samples, :time)) / length(Bs)
-    (n * k^2 / t / 1e9)
+    return (n * k^2 / t / 1.0e9)
 end
 function gemm_gf(k, n)
-    A = randn(Float64,k,k); Bs=[randn(Float64,k,n) for _ in 1:8]; C=randn(Float64,k,n)
-    g(B) = (P.gemm!(C, A, B; alpha=true, beta=false); C[1])
-    b = @be Bs (x -> (v=0.0; for B in x; v += g(B); end; v)) evals=1 samples=200 seconds=2.0
+    A = randn(Float64, k, k); Bs = [randn(Float64, k, n) for _ in 1:8]; C = randn(Float64, k, n)
+    g(B) = (P.gemm!(C, A, B; alpha = true, beta = false); C[1])
+    b = @be Bs (
+        x -> (
+            v = 0.0; for B in x
+                v += g(B)
+            end; v
+        )
+    ) evals = 1 samples = 200 seconds = 2.0
     t = median(getproperty.(b.samples, :time)) / length(Bs)
-    (2 * k^2 * n / t / 1e9)
+    return (2 * k^2 * n / t / 1.0e9)
 end
 
 @printf("%-6s %-6s | fullpack GF | dgemm GF (2x peak) | ratio\n", "k", "n")
-for (k, n) in ((128,128),(128,256),(256,256),(384,384),(512,512),(512,256),(768,768),(1024,1024))
-    fp = fp_gf(k,n); gg = gemm_gf(k,n)
-    @printf("%-6d %-6d | %9.1f   | %14.1f     | %.3f\n", k, n, fp, gg, fp/gg)
+for (k, n) in ((128, 128), (128, 256), (256, 256), (384, 384), (512, 512), (512, 256), (768, 768), (1024, 1024))
+    fp = fp_gf(k, n); gg = gemm_gf(k, n)
+    @printf("%-6d %-6d | %9.1f   | %14.1f     | %.3f\n", k, n, fp, gg, fp / gg)
 end

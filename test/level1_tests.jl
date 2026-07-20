@@ -1,11 +1,11 @@
 @testsetup module Oracle
-    using LinearAlgebra
-    import LinearAlgebra.BLAS as B
-    export relerr, tol, B, TYPES, SIZES
-    relerr(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
-    tol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-10
-    const TYPES = (Float32, Float64, ComplexF32, ComplexF64)
-    const SIZES = (1, 2, 7, 8, 9, 16, 31, 1000)
+using LinearAlgebra
+import LinearAlgebra.BLAS as B
+export relerr, tol, B, TYPES, SIZES
+relerr(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
+tol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-10
+const TYPES = (Float32, Float64, ComplexF32, ComplexF64)
+const SIZES = (1, 2, 7, 8, 9, 16, 31, 1000)
 end
 
 @testitem "Level-1 contiguous vs OpenBLAS" setup = [Oracle] begin
@@ -70,7 +70,7 @@ end
     import LinearAlgebra.BLAS as B
     P = PureBLAS
     @testset "$T inc=($ix,$iy)" for T in TYPES,
-        (ix, iy) in ((2, 1), (1, 3), (2, 3), (-1, 1), (-2, -3))
+            (ix, iy) in ((2, 1), (1, 3), (2, 3), (-1, 1), (-2, -3))
 
         n = 50
         lenx = 1 + (n - 1) * abs(ix); leny = 1 + (n - 1) * abs(iy)

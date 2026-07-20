@@ -13,34 +13,36 @@ import LinearAlgebra.LAPACK, LinearAlgebra.BLAS
 BLAS.set_num_threads(1)
 mt(b) = minimum(x.time for x in b.samples)
 hpd(T, s) = (A = randn(T, s, s); Matrix(A * A' + s * I))
-const CASES = [(Float32,'L',"spotrf-L"), (Float32,'U',"spotrf-U"),
-               (ComplexF64,'U',"zpotrf-U"), (Float64,'L',"dpotrf-L")]
+const CASES = [
+    (Float32, 'L', "spotrf-L"), (Float32, 'U', "spotrf-U"),
+    (ComplexF64, 'U', "zpotrf-U"), (Float64, 'L', "dpotrf-L"),
+]
 const SZ = (32, 64, 128, 256, 512, 1024, 2048)
 
 # phase 1: PB + OB (default OpenBLAS backend)
 pb = Dict(); ob = Dict()
-for (T,u,tag) in CASES, s in SZ
-    A0 = hpd(T,s)
-    pb[(tag,s)] = mt(@be copy(A0) PureBLAS.potrf!(_; uplo=u) evals=1 seconds=0.4)
-    ob[(tag,s)] = mt(@be copy(A0) LAPACK.potrf!(u, _) evals=1 seconds=0.4)
+for (T, u, tag) in CASES, s in SZ
+    A0 = hpd(T, s)
+    pb[(tag, s)] = mt(@be copy(A0) PureBLAS.potrf!(_; uplo = u) evals = 1 seconds = 0.4)
+    ob[(tag, s)] = mt(@be copy(A0) LAPACK.potrf!(u, _) evals = 1 seconds = 0.4)
 end
 # phase 2: forward LAPACK to AOCL, measure the same shapes
 import AOCL_jll
-BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear=true)
+BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)
 BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)
 BLAS.set_num_threads(1)   # re-enforce single-thread on the freshly-forwarded AOCL lib
 ao = Dict()
-for (T,u,tag) in CASES, s in SZ
-    A0 = hpd(T,s)
-    ao[(tag,s)] = mt(@be copy(A0) LAPACK.potrf!(u, _) evals=1 seconds=0.4)
+for (T, u, tag) in CASES, s in SZ
+    A0 = hpd(T, s)
+    ao[(tag, s)] = mt(@be copy(A0) LAPACK.potrf!(u, _) evals = 1 seconds = 0.4)
 end
 # report: OB/PB, AOCL/PB, GATE=min(OB,AOCL)/PB
-for (T,u,tag) in CASES
-    println(rpad(tag,10), "  [comp_t/PB_t; * = below gate min(OB,AOCL)/PB]")
+for (T, u, tag) in CASES
+    println(rpad(tag, 10), "  [comp_t/PB_t; * = below gate min(OB,AOCL)/PB]")
     for s in SZ
-        rob = ob[(tag,s)]/pb[(tag,s)]; rao = ao[(tag,s)]/pb[(tag,s)]
+        rob = ob[(tag, s)] / pb[(tag, s)]; rao = ao[(tag, s)] / pb[(tag, s)]
         gate = min(rob, rao)   # against the faster competitor
         flag = gate < 1.0 ? "*" : " "
-        println("   n=$(rpad(s,5)) OB=$(round(rob,digits=2)) AOCL=$(round(rao,digits=2))  GATE=$(round(gate,digits=2))$flag")
+        println("   n=$(rpad(s, 5)) OB=$(round(rob, digits = 2)) AOCL=$(round(rao, digits = 2))  GATE=$(round(gate, digits = 2))$flag")
     end
 end

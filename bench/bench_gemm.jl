@@ -27,9 +27,14 @@ for n in (64, 128, 256, 512, 1024, 2048)
     A = randn(n, n); Bm = randn(n, n); C = zeros(n, n)
     rounds = n <= 256 ? 31 : (n <= 1024 ? 11 : 5)
     mo, mp = paired(
-        () -> begin B.gemm!('N', 'N', 1.0, A, Bm, 0.0, C); C[1] end,
-        () -> begin PureBLAS.gemm!(C, A, Bm; alpha = 1.0, beta = 0.0); C[1] end;
-        rounds)
+        () -> begin
+            B.gemm!('N', 'N', 1.0, A, Bm, 0.0, C); C[1]
+        end,
+        () -> begin
+            PureBLAS.gemm!(C, A, Bm; alpha = 1.0, beta = 0.0); C[1]
+        end;
+        rounds
+    )
     gf = 2.0 * n^3
     r = mo / mp
     push!(ratios, r)

@@ -3,7 +3,7 @@
     spd(T, n) = (M = randn(T, n, n); M * M' + n * I)
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 50
     @testset "$T n=$n" for T in (Float32, Float64),
-        n in (1, 2, 5, 31, 96, 256, 512, 513, 700, 1025, 1536, 2049)
+            n in (1, 2, 5, 31, 96, 256, 512, 513, 700, 1025, 1536, 2049)
 
         A = Matrix{T}(spd(T, n)); F = cholesky(A)              # LAPACK reference
         L = PureBLAS.potrf!(copy(A); uplo = 'L')
@@ -24,14 +24,14 @@ end
 @testitem "geqrf (QR) vs LAPACK — square/tall/wide, R + reconstruction" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     # reconstruct A = Q*R from faer-convention factored output (H_k = I − v vᵀ/τ, τ=Inf ⇒ identity)
     function recon(F, tau)
         m, n = size(F); k = min(m, n)
         R = [i <= j ? F[i, j] : 0.0 for i in 1:m, j in 1:n]
         for kk in k:-1:1
             isfinite(tau[kk]) || continue
-            v = zeros(m); v[kk] = 1.0; v[kk+1:m] = F[kk+1:m, kk]
+            v = zeros(m); v[kk] = 1.0; v[(kk + 1):m] = F[(kk + 1):m, kk]
             R .-= (v * (v' * R)) ./ tau[kk]
         end
         R
@@ -41,8 +41,8 @@ end
         F = copy(A0); tau = zeros(min(m, n)); PureBLAS.geqrf!(F, tau)
         Fl = copy(A0); LAPACK.geqrf!(Fl)                                   # LAPACK reference
         k = min(m, n)
-        @test maxe(abs.(triu(F)[1:k, :]), abs.(triu(Fl)[1:k, :])) < 1e-11   # |R| matches up to sign
-        @test maxe(recon(F, tau), A0) < 1e-11                              # Q·R ≈ A
+        @test maxe(abs.(triu(F)[1:k, :]), abs.(triu(Fl)[1:k, :])) < 1.0e-11   # |R| matches up to sign
+        @test maxe(recon(F, tau), A0) < 1.0e-11                              # Q·R ≈ A
     end
     @test_throws DimensionMismatch PureBLAS.geqrf!(randn(5, 5), zeros(2))
 end
@@ -75,9 +75,9 @@ function wy_qtc!(C::AbstractMatrix{Float64}, V::AbstractMatrix{Float64}, tau::Ab
     for b in 1:nblk
         pc = (b - 1) * nb + 1
         pb = min(nb, k - pc + 1)
-        Vv = view(V, pc:m, pc:pc+pb-1)
+        Vv = view(V, pc:m, pc:(pc + pb - 1))
         Tv = zeros(pb, pb); G = zeros(pb, pb)
-        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:pc+pb-1), G)
+        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:(pc + pb - 1)), G)
         Cb = view(C, pc:m, :)
         ws = PureBLAS.WYApplyWorkspace{Float64}(size(Cb, 1), pb, size(Cb, 2))
         PureBLAS.wy_apply!('T', Cb, Vv, Tv, ws)
@@ -91,9 +91,9 @@ function wy_qc!(C::AbstractMatrix{Float64}, V::AbstractMatrix{Float64}, tau::Abs
     for b in nblk:-1:1
         pc = (b - 1) * nb + 1
         pb = min(nb, k - pc + 1)
-        Vv = view(V, pc:m, pc:pc+pb-1)
+        Vv = view(V, pc:m, pc:(pc + pb - 1))
         Tv = zeros(pb, pb); G = zeros(pb, pb)
-        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:pc+pb-1), G)
+        PureBLAS.wy_t!(Tv, Vv, view(tau, pc:(pc + pb - 1)), G)
         Cb = view(C, pc:m, :)
         ws = PureBLAS.WYApplyWorkspace{Float64}(size(Cb, 1), pb, size(Cb, 2))
         PureBLAS.wy_apply!('N', Cb, Vv, Tv, ws)
@@ -117,11 +117,11 @@ end
 
         C = copy(A0)
         wy_qtc!(C, V, tau, nb)
-        @test maxe(triu(C), triu(Af)) < 1e-10          # Qᵀ·A upper part == R
+        @test maxe(triu(C), triu(Af)) < 1.0e-10          # Qᵀ·A upper part == R
 
         C2 = copy(C)
         wy_qc!(C2, V, tau, nb)
-        @test maxe(C2, A0) < 1e-10                      # Q·(Qᵀ·A) == A
+        @test maxe(C2, A0) < 1.0e-10                      # Q·(Qᵀ·A) == A
     end
 end
 
@@ -157,7 +157,7 @@ end
 @testitem "getrf (LU) vs LAPACK — square/tall/wide, factor + ipiv + P·A=L·U" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     function recon(A0, F, ipiv)                       # P·A ≈ L·U
         m, n = size(F); k = min(m, n)
         L = [i > j ? F[i, j] : (i == j ? 1.0 : 0.0) for i in 1:m, j in 1:k]
@@ -175,9 +175,9 @@ end
         A0 = randn(m, n)
         F = copy(A0); ip = zeros(Int, min(m, n)); PureBLAS.getrf!(F, ip)
         Fl = copy(A0); _, ipl, _ = LAPACK.getrf!(Fl)                  # LAPACK reference
-        @test maxe(F, Fl) < 1e-11                                    # same factorization
+        @test maxe(F, Fl) < 1.0e-11                                    # same factorization
         @test ip == ipl                                             # same pivot sequence
-        @test recon(A0, F, ip) < 1e-11                              # P·A = L·U
+        @test recon(A0, F, ip) < 1.0e-11                              # P·A = L·U
     end
     @test_throws DimensionMismatch PureBLAS.getrf!(randn(5, 5), zeros(Int, 2))
 end
@@ -186,9 +186,9 @@ end
     using PureBLAS, LinearAlgebra, ForwardDiff
     # L[1,1] of [[x+4, 1],[1, 3]] = sqrt(x+4); d/dx = 1/(2 sqrt(x+4))
     f(x) = (A = [x + 4.0 1.0; 1.0 3.0]; PureBLAS.potrf!(A; uplo = 'L')[1, 1])
-    @test ForwardDiff.derivative(f, 1.0) ≈ 0.5 / sqrt(5.0) rtol = 1e-10
+    @test ForwardDiff.derivative(f, 1.0) ≈ 0.5 / sqrt(5.0) rtol = 1.0e-10
     # gradient of logdet via Cholesky: logdet(A) = 2 Σ log(L[i,i])
-    g(v) = (A = [v[1]+5.0 1.0; 1.0 v[2]+5.0]; L = PureBLAS.potrf!(A; uplo = 'L'); 2*(log(L[1,1]) + log(L[2,2])))
+    g(v) = (A = [v[1] + 5.0 1.0; 1.0 v[2] + 5.0]; L = PureBLAS.potrf!(A; uplo = 'L'); 2 * (log(L[1, 1]) + log(L[2, 2])))
     gr = ForwardDiff.gradient(g, [1.0, 2.0])
     @test all(isfinite, gr)
 end
@@ -197,19 +197,21 @@ end
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(20)
     maxe(A, B) = maximum(abs.(A .- B))
-    @testset "$m×$n" for (m, n) in ((1, 1), (2, 2), (8, 8), (40, 25), (64, 64),
-            (129, 96), (200, 200), (96, 160), (300, 257))
+    @testset "$m×$n" for (m, n) in (
+            (1, 1), (2, 2), (8, 8), (40, 25), (64, 64),
+            (129, 96), (200, 200), (96, 160), (300, 257),
+        )
         A0 = randn(m, n)
         sref = svdvals(A0)
         # full factorization
         U, S, Vt = PureBLAS.gesvd!(copy(A0))
-        @test maxe(S, sref) / maximum(sref) < 1e-11                  # singular values match LAPACK
-        @test maxe(U * Diagonal(S) * Vt, A0) < 1e-10                 # A = U Σ Vᵀ
-        @test maxe(U' * U, Matrix(I, size(U, 2), size(U, 2))) < 1e-10   # U orthonormal columns
-        @test maxe(Vt * Vt', Matrix(I, size(Vt, 1), size(Vt, 1))) < 1e-10  # Vᵀ orthonormal rows
+        @test maxe(S, sref) / maximum(sref) < 1.0e-11                  # singular values match LAPACK
+        @test maxe(U * Diagonal(S) * Vt, A0) < 1.0e-10                 # A = U Σ Vᵀ
+        @test maxe(U' * U, Matrix(I, size(U, 2), size(U, 2))) < 1.0e-10   # U orthonormal columns
+        @test maxe(Vt * Vt', Matrix(I, size(Vt, 1), size(Vt, 1))) < 1.0e-10  # Vᵀ orthonormal rows
         # values-only path
         Sv = PureBLAS.gesvd!(copy(A0); want_vectors = false)[1]
-        @test maxe(Sv, sref) / maximum(sref) < 1e-11
+        @test maxe(Sv, sref) / maximum(sref) < 1.0e-11
     end
 end
 
@@ -225,12 +227,14 @@ end
         resid = opnorm(U * Diagonal(S) * Vt - A) / sc
         orthU = opnorm(U' * U - I) / (mn * eps(R))
         orthV = opnorm(Vt * Vt' - I) / (mn * eps(R))
-        verr  = maximum(abs, S .- sref) / max(maximum(sref), floatmin(R))
+        verr = maximum(abs, S .- sref) / max(maximum(sref), floatmin(R))
         return resid, orthU, orthV, verr
     end
     @testset "$T $m×$n" for T in (ComplexF64, ComplexF32),
-            (m, n) in ((2, 2), (4, 4), (8, 8), (32, 32), (64, 64), (128, 128),
-                       (8, 4), (4, 8), (64, 40), (40, 64), (129, 96), (96, 129))
+            (m, n) in (
+                (2, 2), (4, 4), (8, 8), (32, 32), (64, 64), (128, 128),
+                (8, 4), (4, 8), (64, 40), (40, 64), (129, 96), (96, 129),
+            )
         tol = T === ComplexF64 ? 64.0 : 512.0
         resid, orthU, orthV, verr = chk(randn(T, m, n))
         @test resid < tol
@@ -238,7 +242,7 @@ end
         @test orthV < tol
         @test verr < tol * eps(real(T))
     end
-    @testset "$T scaled ‖A‖=$s" for T in (ComplexF64, ComplexF32), s in (1e-10, 1e-14, 1e8)
+    @testset "$T scaled ‖A‖=$s" for T in (ComplexF64, ComplexF32), s in (1.0e-10, 1.0e-14, 1.0e8)
         resid, orthU, orthV, verr = chk(randn(T, 48, 48) .* T(s))
         @test resid < 128 && orthU < 128 && orthV < 128
     end
@@ -257,7 +261,7 @@ end
     @testset "values-only path matches" begin
         A = randn(ComplexF64, 50, 30)
         Sv = PureBLAS.gesvd!(copy(A); want_vectors = false)[1]
-        @test maximum(abs, Sv .- svdvals(A)) / maximum(svdvals(A)) < 1e-11
+        @test maximum(abs, Sv .- svdvals(A)) / maximum(svdvals(A)) < 1.0e-11
     end
 end
 
@@ -268,7 +272,7 @@ end
     function checkpair(Afull, w, Z)
         n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, 1.0) * n * eps()
         resid = opnorm(Afull * Z - Z * Diagonal(w)) / sc
-        orth  = opnorm(Z' * Z - I) / (n * eps())
+        orth = opnorm(Z' * Z - I) / (n * eps())
         return resid, orth
     end
     @testset "$(uplo) n=$n" for n in (4, 16, 64, 128), uplo in ('L', 'U')
@@ -279,7 +283,7 @@ end
         # jobz='V' — eigenvalues + vectors
         w, Z, info = PureBLAS._syev!('V', uplo, copy(Afull))
         @test info == 0
-        @test maximum(abs, w .- wref) / max(1.0, maximum(abs, wref)) < 1e-12   # eigenvalues match LAPACK
+        @test maximum(abs, w .- wref) / max(1.0, maximum(abs, wref)) < 1.0e-12   # eigenvalues match LAPACK
         @test issorted(w)                                                       # ascending
         resid, orth = checkpair(Afull, w, Z)
         @test resid < 32                                                        # residual ≲ 32·n·eps·‖A‖
@@ -287,7 +291,7 @@ end
         # jobz='N' — eigenvalues only (same values)
         wN, _, iN = PureBLAS._syev!('N', uplo, copy(Afull))
         @test iN == 0
-        @test maximum(abs, wN .- wref) / max(1.0, maximum(abs, wref)) < 1e-12
+        @test maximum(abs, wN .- wref) / max(1.0, maximum(abs, wref)) < 1.0e-12
     end
     @testset "stress: eps-clustered spectrum" begin
         n = 60
@@ -297,7 +301,7 @@ end
         Afull = Matrix(A)
         w, Z, info = PureBLAS._syev!('V', 'L', copy(Afull))
         @test info == 0
-        @test maximum(abs, w .- eigvals(A)) < 1e-12
+        @test maximum(abs, w .- eigvals(A)) < 1.0e-12
         resid, orth = checkpair(Afull, w, Z)
         @test resid < 64 && orth < 64
     end
@@ -308,16 +312,18 @@ end
         n = 2m
         d = vcat(wdiag, wdiag)
         A = zeros(n, n)
-        for i in 1:n; A[i, i] = d[i]; end
-        for i in 1:n-1
-            i == m && continue                                # weak glue link between the two blocks
-            A[i+1, i] = 1.0; A[i, i+1] = 1.0
+        for i in 1:n
+            A[i, i] = d[i]
         end
-        A[m+1, m] = 1e-3; A[m, m+1] = 1e-3                    # faint coupling
+        for i in 1:(n - 1)
+            i == m && continue                                # weak glue link between the two blocks
+            A[i + 1, i] = 1.0; A[i, i + 1] = 1.0
+        end
+        A[m + 1, m] = 1.0e-3; A[m, m + 1] = 1.0e-3                    # faint coupling
         S = Symmetric(A, :L); Afull = Matrix(S)
         w, Z, info = PureBLAS._syev!('V', 'L', copy(Afull))
         @test info == 0
-        @test maximum(abs, w .- eigvals(S)) < 1e-10
+        @test maximum(abs, w .- eigvals(S)) < 1.0e-10
         resid, orth = checkpair(Afull, w, Z)
         @test resid < 128 && orth < 128
     end
@@ -329,7 +335,7 @@ end
     function checkpair(Afull, w, Z, R)
         n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, one(R)) * n * eps(R)
         resid = opnorm(Afull * Z - Z * Diagonal(w)) / sc
-        orth  = opnorm(Z' * Z - I) / (n * eps(R))
+        orth = opnorm(Z' * Z - I) / (n * eps(R))
         return resid, orth
     end
     @testset "$(uplo) n=$n" for n in (4, 17, 64, 128), uplo in ('L', 'U')
@@ -340,12 +346,12 @@ end
         @test info == 0
         @test eltype(w) === Float32 && eltype(Z) === Float32
         @test issorted(w)
-        @test maximum(abs, Float64.(w) .- wref) / max(1.0, maximum(abs, wref)) < 1e-4
+        @test maximum(abs, Float64.(w) .- wref) / max(1.0, maximum(abs, wref)) < 1.0e-4
         resid, orth = checkpair(Afull, w, Z, Float32)
         @test resid < 64 && orth < 64
         wN, _, iN = PureBLAS._syev!('N', uplo, copy(Afull))            # values-only (sterf)
         @test iN == 0
-        @test maximum(abs, Float64.(wN) .- wref) / max(1.0, maximum(abs, wref)) < 1e-4
+        @test maximum(abs, Float64.(wN) .- wref) / max(1.0, maximum(abs, wref)) < 1.0e-4
     end
 end
 
@@ -357,11 +363,11 @@ end
     function checkpair(Afull, w, Z, R)
         n = size(Afull, 1); nA = opnorm(Afull); sc = max(nA, one(R)) * n * eps(R)
         resid = opnorm(Afull * Z - Z * Diagonal(complex(w))) / sc
-        orth  = opnorm(Z' * Z - I) / (n * eps(R))
+        orth = opnorm(Z' * Z - I) / (n * eps(R))
         return resid, orth
     end
     @testset "$T $(uplo) n=$n" for T in (ComplexF64, ComplexF32),
-        n in (2, 4, 16, 64, 128), uplo in ('L', 'U')
+            n in (2, 4, 16, 64, 128), uplo in ('L', 'U')
 
         B0 = randn(T, n, n); A0 = B0 + B0'
         S = Hermitian(A0, Symbol(uplo)); Afull = Matrix(S)
@@ -371,7 +377,7 @@ end
         @test info == 0
         @test eltype(w) === R && eltype(Z) === T                       # native element type
         @test issorted(w)
-        vtol = R === Float64 ? 1e-11 : 1e-4
+        vtol = R === Float64 ? 1.0e-11 : 1.0e-4
         @test maximum(abs, Float64.(w) .- wref) / max(1.0, maximum(abs, wref)) < vtol
         resid, orth = checkpair(Afull, w, Z, R)
         @test resid < 64 && orth < 64
@@ -392,7 +398,7 @@ end
         @test info == 0
         @test issorted(d)
         wref = eigvals(Symmetric(Float64.(A)))
-        tol = T === Float64 ? 1e-11 : 1e-4
+        tol = T === Float64 ? 1.0e-11 : 1.0e-4
         @test maximum(abs, Float64.(d) .- wref) / max(1.0, maximum(abs, wref)) < tol
     end
 end
@@ -400,9 +406,9 @@ end
 @testitem "lq (LQ) vs LAPACK — gelqf L·Q reconstruct, orglq orthonormal rows, ormlq apply" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((1, 1), (8, 8), (25, 40), (64, 64), (96, 129), (60, 60))
+            (m, n) in ((1, 1), (8, 8), (25, 40), (64, 64), (96, 129), (60, 60))
 
         A0 = randn(T, m, n)
         F = copy(A0); tau = zeros(T, min(m, n)); PureBLAS.gelqf!(F, tau)
@@ -431,7 +437,7 @@ end
     using PureBLAS, LinearAlgebra
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 100
     @testset "$T n=$n uplo=$uplo herm=$herm" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        n in (1, 2, 5, 17, 64), uplo in ('L', 'U'), herm in (false, true)
+            n in (1, 2, 5, 17, 64), uplo in ('L', 'U'), herm in (false, true)
 
         (herm && !(T <: Complex)) && continue           # herm==sym for real; skip dup
         M = randn(T, n, n)
@@ -448,9 +454,9 @@ end
 @testitem "geqp3 (pivoted QR) vs LAPACK — A·P = Q·R reconstruct, |R| non-increasing" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((6, 6), (40, 25), (25, 40), (64, 64))
+            (m, n) in ((6, 6), (40, 25), (25, 40), (64, 64))
 
         A0 = randn(T, m, n)
         F = copy(A0); jpvt = zeros(Int, n); tau = zeros(T, min(m, n))
@@ -460,12 +466,12 @@ end
         R = [i <= j ? F[i, j] : zero(T) for i in 1:m, j in 1:n]
         Q = Matrix{T}(I, m, m)
         for i in 1:k                                    # Q = H_1·H_2···H_k (right-multiply from I, in order)
-            v = zeros(T, m); v[i] = one(T); v[i+1:m] = F[i+1:m, i]
+            v = zeros(T, m); v[i] = one(T); v[(i + 1):m] = F[(i + 1):m, i]
             Q = Q - (tau[i] * Q * v) * v'
         end
         @test maxe(Q * R, A0[:, jpvt]) < 300 * eps(real(T))
         rdiag = [abs(R[i, i]) for i in 1:k]
-        @test issorted(rdiag; rev = true) || maximum(diff(rdiag)) < 1e-6 * rdiag[1]  # non-increasing
+        @test issorted(rdiag; rev = true) || maximum(diff(rdiag)) < 1.0e-6 * rdiag[1]  # non-increasing
     end
 end
 
@@ -473,7 +479,7 @@ end
     using PureBLAS, LinearAlgebra
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 100
     @testset "$T $m×$n trans=$trans" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((40, 20), (20, 40), (30, 30)), trans in ('N',)
+            (m, n) in ((40, 20), (20, 40), (30, 30)), trans in ('N',)
 
         A = randn(T, m, n)
         p, q = size(A)                                  # op = A (trans N): p×q
@@ -501,13 +507,13 @@ end
             LUf = Matrix(LU.factors)
             rc = PureBLAS.gecon!(an, LUf, LU.ipiv; norm = nrm)
             rc_ref = LAPACK.gecon!(nrm, copy(LUf), real(T)(an))   # Julia's LAPACK wrapper wants '1'/'I' (not 'O')
-            @test isapprox(rc, rc_ref; rtol = 1e-3)
+            @test isapprox(rc, rc_ref; rtol = 1.0e-3)
         end
         # trcon: triangular condition vs LAPACK.trcon!.
         U = triu(A)
         rct = PureBLAS.trcon!(copy(U); uplo = 'U', diag = 'N', norm = '1')
         rct_ref = LAPACK.trcon!('1', 'U', 'N', copy(U))   # Julia's LAPACK wrapper wants '1'/'I' (not 'O')
-        @test isapprox(rct, rct_ref; rtol = 1e-3)
+        @test isapprox(rct, rct_ref; rtol = 1.0e-3)
         # pocon: SPD Cholesky condition; compare to reciprocal true condition (loose).
         SPD = A * A' + n * I
         Cf = PureBLAS.potrf!(copy(SPD); uplo = 'L')
@@ -520,7 +526,7 @@ end
 
 @testitem "gehrd (Hessenberg reduction) vs LAPACK — H = Qᴴ·A·Q reconstruct, orghr Q unitary" begin
     using PureBLAS, LinearAlgebra
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (1, 2, 5, 20, 64)
         A0 = randn(T, n, n)
         H = copy(A0); tau = zeros(T, max(n - 1, 0)); PureBLAS.gehrd!(H, 1, n, tau)
@@ -534,9 +540,11 @@ end
 @testitem "geev (general eigen) vs LAPACK — eigenvalues + A·V=V·Λ residual, real+complex, conj-pairs" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(0xEE)
-    evmatch(a, b) = (a = sort(collect(a); by = x -> (real(x), imag(x)));
-                     b = sort(collect(b); by = x -> (real(x), imag(x)));
-                     maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1))
+    evmatch(a, b) = (
+        a = sort(collect(a); by = x -> (real(x), imag(x)));
+        b = sort(collect(b); by = x -> (real(x), imag(x)));
+        maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1)
+    )
     # reconstruct the complex eigenvector matrix from real-packed VR (LAPACK conj-pair convention)
     function evecs_real(wr, wi, VR)
         n = length(wr); E = zeros(ComplexF64, n, n); j = 1
@@ -545,7 +553,7 @@ end
                 E[:, j] = VR[:, j]
             else
                 for i in 1:n
-                    E[i, j] = VR[i, j] + im * VR[i, j+1]; E[i, j+1] = VR[i, j] - im * VR[i, j+1]
+                    E[i, j] = VR[i, j] + im * VR[i, j + 1]; E[i, j + 1] = VR[i, j] - im * VR[i, j + 1]
                 end
                 j += 1
             end
@@ -558,30 +566,30 @@ end
         wr, wi, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
         λ = complex.(wr, wi); E = evecs_real(wr, wi, VR)
         @test maximum(abs.(A * E - E * Diagonal(λ))) / (opnorm(A, 1) * n * eps()) < 100
-        @test evmatch(λ, eigvals(copy(A))) < 1e-8            # vs LinearAlgebra (OpenBLAS)
+        @test evmatch(λ, eigvals(copy(A))) < 1.0e-8            # vs LinearAlgebra (OpenBLAS)
         wr2, wi2 = PureBLAS.geev!('N', 'N', copy(A))         # values-only path
-        @test evmatch(complex.(wr2, wi2), λ) < 1e-10
+        @test evmatch(complex.(wr2, wi2), λ) < 1.0e-10
     end
     @testset "conj-pair real n=$n" for n in (4, 8, 16)       # block rotations → guaranteed complex pairs
         B = zeros(n, n); i = 1
         while i + 1 <= n
             θ = randn(); a = randn()
-            B[i, i] = a; B[i+1, i+1] = a; B[i, i+1] = θ; B[i+1, i] = -θ; i += 2
+            B[i, i] = a; B[i + 1, i + 1] = a; B[i, i + 1] = θ; B[i + 1, i] = -θ; i += 2
         end
         Q, _ = qr(randn(n, n)); A = Matrix(Q) * B * Matrix(Q)'
         wr, wi, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
         @test count(!iszero, wi) > 0                          # actually has conjugate pairs
         E = evecs_real(wr, wi, VR)
         @test maximum(abs.(A * E - E * Diagonal(complex.(wr, wi)))) / (opnorm(A, 1) * n * eps()) < 100
-        @test evmatch(complex.(wr, wi), eigvals(copy(A))) < 1e-8
+        @test evmatch(complex.(wr, wi), eigvals(copy(A))) < 1.0e-8
     end
     @testset "complex n=$n" for n in (2, 4, 8, 16, 32)
         A = randn(ComplexF64, n, n)
         w, VL, VR = PureBLAS.geev!('N', 'V', copy(A))
         @test maximum(abs.(A * VR - VR * Diagonal(w))) / (opnorm(A, 1) * n * eps()) < 100
-        @test evmatch(w, eigvals(copy(A))) < 1e-8
+        @test evmatch(w, eigvals(copy(A))) < 1.0e-8
         w2, = PureBLAS.geev!('N', 'N', copy(A))
-        @test evmatch(w2, w) < 1e-10
+        @test evmatch(w2, w) < 1.0e-10
     end
     @test_throws ArgumentError PureBLAS.geev!('V', 'N', randn(4, 4))   # left vectors not implemented
 end
@@ -589,34 +597,36 @@ end
 @testitem "gees (Schur) vs LAPACK — Z·T·Zᴴ=A reconstruction, Z orthonormal, real+complex" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(0x5C)
-    evmatch(a, b) = (a = sort(collect(a); by = x -> (real(x), imag(x)));
-                     b = sort(collect(b); by = x -> (real(x), imag(x)));
-                     maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1))
+    evmatch(a, b) = (
+        a = sort(collect(a); by = x -> (real(x), imag(x)));
+        b = sort(collect(b); by = x -> (real(x), imag(x)));
+        maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1)
+    )
     @testset "real n=$n" for n in (2, 4, 8, 16, 32)
         A = randn(n, n)
         T, Z, w = PureBLAS.gees!('V', copy(A))
-        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11    # A = Z·T·Zᵀ
-        @test maximum(abs.(Z' * Z - I)) < 1e-12                                # Z orthonormal
-        @test evmatch(w, eigvals(copy(A))) < 1e-8
-        @test all(iszero, [T[i, j] for j in 1:n for i in j+2:n])              # quasi-upper-triangular
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1.0e-11    # A = Z·T·Zᵀ
+        @test maximum(abs.(Z' * Z - I)) < 1.0e-12                                # Z orthonormal
+        @test evmatch(w, eigvals(copy(A))) < 1.0e-8
+        @test all(iszero, [T[i, j] for j in 1:n for i in (j + 2):n])              # quasi-upper-triangular
     end
     @testset "conj-pair real n=$n" for n in (4, 8, 16)
         B = zeros(n, n); i = 1
         while i + 1 <= n
-            θ = randn(); a = randn(); B[i, i] = a; B[i+1, i+1] = a; B[i, i+1] = θ; B[i+1, i] = -θ; i += 2
+            θ = randn(); a = randn(); B[i, i] = a; B[i + 1, i + 1] = a; B[i, i + 1] = θ; B[i + 1, i] = -θ; i += 2
         end
         Q, _ = qr(randn(n, n)); A = Matrix(Q) * B * Matrix(Q)'
         T, Z, w = PureBLAS.gees!('V', copy(A))
-        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11
-        @test maximum(abs.(Z' * Z - I)) < 1e-12
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1.0e-11
+        @test maximum(abs.(Z' * Z - I)) < 1.0e-12
     end
     @testset "complex n=$n" for n in (2, 4, 8, 16, 32)
         A = randn(ComplexF64, n, n)
         T, Z, w = PureBLAS.gees!('V', copy(A))
-        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1e-11
-        @test maximum(abs.(Z' * Z - I)) < 1e-12
-        @test evmatch(w, eigvals(copy(A))) < 1e-8
-        @test all(iszero, [T[i, j] for j in 1:n for i in j+1:n])              # upper-triangular (complex)
+        @test maximum(abs.(Z * T * Z' - A)) / max(opnorm(A, 1), 1) < 1.0e-11
+        @test maximum(abs.(Z' * Z - I)) < 1.0e-12
+        @test evmatch(w, eigvals(copy(A))) < 1.0e-8
+        @test all(iszero, [T[i, j] for j in 1:n for i in (j + 1):n])              # upper-triangular (complex)
     end
 end
 
@@ -638,11 +648,16 @@ end
         end
         w
     end
-    packR(vr, ai) = (n = size(vr, 1); VC = zeros(ComplexF64, n, n); j = 1;
+    packR(vr, ai) = (
+        n = size(vr, 1); VC = zeros(ComplexF64, n, n); j = 1;
         while j <= n
-            if iszero(ai[j]); VC[:, j] = vr[:, j]; j += 1
-            else VC[:, j] = vr[:, j] .+ im .* vr[:, j+1]; VC[:, j+1] = vr[:, j] .- im .* vr[:, j+1]; j += 2 end
-        end; VC)
+            if iszero(ai[j])
+                VC[:, j] = vr[:, j]; j += 1
+            else
+                VC[:, j] = vr[:, j] .+ im .* vr[:, j + 1]; VC[:, j + 1] = vr[:, j] .- im .* vr[:, j + 1]; j += 2
+            end
+        end; VC
+    )
     function resid(A, B, al, be, VC)
         n = size(A, 1); w = 0.0
         for j in 1:n
@@ -659,42 +674,42 @@ end
         ar, ai, be, vl, vr = PureBLAS.ggev!('N', 'V', copy(A), copy(B))
         @test size(vl, 2) == 0
         VC = packR(vr, ai)
-        @test resid(A, B, complex.(ar, ai), be, VC) < 1e-11
+        @test resid(A, B, complex.(ar, ai), be, VC) < 1.0e-11
         ar2, ai2, be2, _, _ = LA.ggev3!('N', 'V', copy(A), copy(B))
-        @test evmatch(complex.(ar, ai), complex.(be), complex.(ar2, ai2), complex.(be2)) < 1e-10
+        @test evmatch(complex.(ar, ai), complex.(be), complex.(ar2, ai2), complex.(be2)) < 1.0e-10
     end
     @testset "real guaranteed conj-pairs n=$n" for n in (8, 20)
         Bp = zeros(n, n); i = 1
         while i + 1 <= n
-            Bp[i, i] = randn(); Bp[i+1, i+1] = Bp[i, i]; Bp[i, i+1] = randn(); Bp[i+1, i] = -Bp[i, i+1]; i += 2
+            Bp[i, i] = randn(); Bp[i + 1, i + 1] = Bp[i, i]; Bp[i, i + 1] = randn(); Bp[i + 1, i] = -Bp[i, i + 1]; i += 2
         end
         Qr, _ = qr(randn(n, n)); A = Matrix(Qr) * Bp * Matrix(Qr)'
         M = randn(n, n); B = M'M + I                        # SPD, well conditioned
         ar, ai, be, _, vr = PureBLAS.ggev!('N', 'V', copy(A), copy(B))
         @test count(!iszero, ai) > 0                        # actually produced conjugate pairs
-        @test resid(A, B, complex.(ar, ai), be, packR(vr, ai)) < 1e-11
+        @test resid(A, B, complex.(ar, ai), be, packR(vr, ai)) < 1.0e-11
     end
     @testset "real infinite eigenvalue (singular B)" begin
         n = 12
         A = randn(n, n); B = randn(n, n); B[:, n] .= 0; B[n, :] .= 0    # rank-deficient B → infinite eig
         ar, ai, be, _, vr = PureBLAS.ggev!('N', 'V', copy(A), copy(B))
-        @test count(x -> abs(x) < 1e-10, be) >= 1           # at least one infinite eigenvalue (β≈0)
-        @test resid(A, B, complex.(ar, ai), be, packR(vr, ai)) < 1e-9
+        @test count(x -> abs(x) < 1.0e-10, be) >= 1           # at least one infinite eigenvalue (β≈0)
+        @test resid(A, B, complex.(ar, ai), be, packR(vr, ai)) < 1.0e-9
     end
     @testset "complex n=$n" for n in (6, 20, 40)
         A = randn(ComplexF64, n, n); B = randn(ComplexF64, n, n)
         al, be, vl, vr = PureBLAS.ggev!('N', 'V', copy(A), copy(B))
         @test size(vl, 2) == 0
-        @test resid(A, B, al, be, vr) < 1e-11
+        @test resid(A, B, al, be, vr) < 1.0e-11
         al2, be2, _, _ = LA.ggev3!('N', 'V', copy(A), copy(B))
-        @test evmatch(al, be, al2, be2) < 1e-10
+        @test evmatch(al, be, al2, be2) < 1.0e-10
     end
     @testset "eigenvalues-only path (jobvr='N') n=$n" for n in (10, 24)
         A = randn(n, n); B = randn(n, n)
         ar, ai, be, _, vr = PureBLAS.ggev!('N', 'N', copy(A), copy(B))
         @test size(vr, 2) == 0
         ar2, ai2, be2, _, _ = LA.ggev3!('N', 'N', copy(A), copy(B))
-        @test evmatch(complex.(ar, ai), complex.(be), complex.(ar2, ai2), complex.(be2)) < 1e-10
+        @test evmatch(complex.(ar, ai), complex.(be), complex.(ar2, ai2), complex.(be2)) < 1.0e-10
     end
     @test_throws ArgumentError PureBLAS.ggev!('V', 'V', randn(4, 4), randn(4, 4))   # left vectors unsupported
 end
@@ -705,18 +720,18 @@ end
     @testset "$T n=$n" for T in (Float64, ComplexF64), n in (5, 16, 33)
         A = randn(T, n, n); B = randn(T, n, n)
         S, P, al, be, Q, Z = PureBLAS.gges!('V', 'V', copy(A), copy(B))
-        tol = 1e-11 * (opnorm(A, 1) + opnorm(B, 1) + 1)
+        tol = 1.0e-11 * (opnorm(A, 1) + opnorm(B, 1) + 1)
         @test maximum(abs, Q * S * Z' - A) < tol
         @test maximum(abs, Q * P * Z' - B) < tol
-        @test maximum(abs, Q' * Q - I) < 1e-12
-        @test maximum(abs, Z' * Z - I) < 1e-12
+        @test maximum(abs, Q' * Q - I) < 1.0e-12
+        @test maximum(abs, Z' * Z - I) < 1.0e-12
         @test length(al) == n && length(be) == n
     end
     @testset "singular B (infinite eig) n=12" begin
         n = 12; A = randn(n, n); B = randn(n, n); B[:, n] .= 0; B[n, :] .= 0
         S, P, al, be, Q, Z = PureBLAS.gges!('V', 'V', copy(A), copy(B))
-        @test maximum(abs, Q * S * Z' - A) < 1e-10 * (opnorm(A, 1) + 1)
-        @test maximum(abs, Q * P * Z' - B) < 1e-12
+        @test maximum(abs, Q * S * Z' - A) < 1.0e-10 * (opnorm(A, 1) + 1)
+        @test maximum(abs, Q * P * Z' - B) < 1.0e-12
     end
 end
 
@@ -725,14 +740,14 @@ end
     import LinearAlgebra.LAPACK as LA
     Random.seed!(0x5aa5)
     @testset "$T itype=$it uplo=$ul n=$n" for T in (Float64, ComplexF64), it in (1, 2, 3),
-        ul in ('L', 'U'), n in (4, 13, 40)
+            ul in ('L', 'U'), n in (4, 13, 40)
 
         M = randn(T, n, n); A = M + M'                     # Hermitian
         N = randn(T, n, n); B = N * N' + n * I             # Hermitian positive definite
         gvd! = T <: Complex ? PureBLAS.hegvd! : PureBLAS.sygvd!
         w, Z = gvd!(it, 'V', ul, copy(A), copy(B))
         wref = LA.sygvd!(it, 'V', ul, copy(A), copy(B))[1]
-        @test maximum(abs, w .- wref) < 1e-9 * (norm(w) + 1)
+        @test maximum(abs, w .- wref) < 1.0e-9 * (norm(w) + 1)
         # verify the defining relation per itype
         if it == 1                                         # A z = λ B z
             R = A * Z - B * Z * Diagonal(w)
@@ -741,9 +756,9 @@ end
         else                                               # itype 3: B A z = λ z
             R = B * (A * Z) - Z * Diagonal(w)
         end
-        @test maximum(abs, R) < 1e-8 * (opnorm(A, 1) * opnorm(B, 1) + 1)
+        @test maximum(abs, R) < 1.0e-8 * (opnorm(A, 1) * opnorm(B, 1) + 1)
         wN = gvd!(it, 'N', ul, copy(A), copy(B))[1]        # values-only path
-        @test maximum(abs, wN .- wref) < 1e-9 * (norm(w) + 1)
+        @test maximum(abs, wN .- wref) < 1.0e-9 * (norm(w) + 1)
     end
     @test_throws PosDefException PureBLAS.sygvd!(1, 'V', 'L', [2.0 0; 0 2], [1.0 0; 0 -1.0])  # B not PD
 end
@@ -761,8 +776,10 @@ end
             @test maximum(abs, A * X - B) < sqrt(eps(real(T))) * 50 * (norm(A) + 1)
         end
         # factor once, solve with trans variants
-        dl2, d2, du2, du22, ipiv = PureBLAS.gttrf!(copy(dl), copy(d), copy(du), Vector{T}(undef, max(n - 2, 0)),
-            Vector{Int}(undef, n))
+        dl2, d2, du2, du22, ipiv = PureBLAS.gttrf!(
+            copy(dl), copy(d), copy(du), Vector{T}(undef, max(n - 2, 0)),
+            Vector{Int}(undef, n)
+        )
         for (tr, Aop) in (('N', A), ('T', transpose(A)), ('C', A'))
             B = randn(T, n, 2)
             X = PureBLAS.gttrs!(tr, dl2, d2, du2, du22, ipiv, copy(B))
@@ -795,7 +812,7 @@ end
     using PureBLAS, LinearAlgebra
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 200
     @testset "$T n=$n uplo=$uplo herm=$herm" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        n in (1, 2, 5, 17, 40), uplo in ('L', 'U'), herm in (false, true)
+            n in (1, 2, 5, 17, 40), uplo in ('L', 'U'), herm in (false, true)
 
         (herm && !(T <: Complex)) && continue
         M = randn(T, n, n)
@@ -813,7 +830,7 @@ end
         Ainv = copy(LD)
         herm ? PureBLAS.hetri!(Ainv, ipiv; uplo = uplo) : PureBLAS.sytri!(Ainv, ipiv; uplo = uplo)
         Afull = uplo == 'L' ? (herm ? Hermitian(Ainv, :L) : Symmetric(Ainv, :L)) :
-                               (herm ? Hermitian(Ainv, :U) : Symmetric(Ainv, :U))
+            (herm ? Hermitian(Ainv, :U) : Symmetric(Ainv, :U))
         @test norm(A * Matrix(Afull) - I) <= tol(T) * n
     end
 end
@@ -822,7 +839,7 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK as LA
     @testset "$T n=$n kl=$kl ku=$ku" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (n, kl, ku) in ((8, 1, 1), (20, 2, 3), (35, 3, 1))
+            (n, kl, ku) in ((8, 1, 1), (20, 2, 3), (35, 3, 1))
 
         A = zeros(T, n, n)
         for j in 1:n, i in max(1, j - ku):min(n, j + kl)
@@ -858,8 +875,12 @@ end
         d = rand(R, n) .+ R(n + 2)                              # diagonally dominant → SPD/HPD
         e = randn(T, max(n - 1, 0)) .* R(0.3)
         A = zeros(T, n, n)
-        for i in 1:n; A[i, i] = d[i]; end
-        for i in 1:n-1; A[i + 1, i] = e[i]; A[i, i + 1] = conj(e[i]); end
+        for i in 1:n
+            A[i, i] = d[i]
+        end
+        for i in 1:(n - 1)
+            A[i + 1, i] = e[i]; A[i, i + 1] = conj(e[i])
+        end
         d1 = copy(d); e1 = copy(e)
         _, _, info = PureBLAS.pttrf!(d1, e1)
         @test info == 0
@@ -902,7 +923,7 @@ end
     using PureBLAS, LinearAlgebra
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 200
     @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((30, 15), (15, 30), (20, 20))
+            (m, n) in ((30, 15), (15, 30), (20, 20))
 
         A = randn(T, m, n)
         nrhs = 2
@@ -911,7 +932,7 @@ end
         @test rk == min(m, n)
         X = Bsol[1:n, :]
         sref = svdvals(A)
-        @test maximum(abs, s .- sref) / maximum(sref) < 1e-3
+        @test maximum(abs, s .- sref) / maximum(sref) < 1.0e-3
         if m >= n
             @test norm(A' * (A * X - b0)) <= tol(T) * (norm(A)^2 * norm(X) + norm(A) * norm(b0))
         else
@@ -924,7 +945,7 @@ end
         s = Float64[5, 4, 3, 0, 0, 0, 0, 0, 0, 0]
         A = U[:, 1:n] * Diagonal(T.(s)) * V'
         Bv = zeros(T, m, 1); Bv[:, 1] = randn(T, m)
-        _, rk, _ = PureBLAS.gelsd!(copy(A), copy(Bv), 1e-8)
+        _, rk, _ = PureBLAS.gelsd!(copy(A), copy(Bv), 1.0e-8)
         @test rk == 3
     end
 end
@@ -933,7 +954,7 @@ end
     using PureBLAS, LinearAlgebra
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 200
     @testset "$T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((30, 15), (15, 30), (20, 20))
+            (m, n) in ((30, 15), (15, 30), (20, 20))
 
         A = randn(T, m, n)
         nrhs = 2
@@ -988,23 +1009,23 @@ end
         @test rk == k
         Aperm = A[pv, pv]
         Lr = tril(F)[:, 1:rk]
-        @test maximum(abs, Lr * Lr' .- Aperm) < 1e-6 * maximum(abs, A)
+        @test maximum(abs, Lr * Lr' .- Aperm) < 1.0e-6 * maximum(abs, A)
     end
 end
 
 @testitem "QL/RQ (geqlf/gerqf/orgql/orgrq/ormql/ormrq) vs LAPACK — reconstruction + orthonormal Q + apply" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK as LA
-    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1e-300)
+    maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
     @testset "QL $T $m×$n" for T in (Float32, Float64, ComplexF32, ComplexF64), (m, n) in ((8, 5), (8, 8), (30, 18))
         A0 = randn(T, m, n); k = min(m, n)
         F = copy(A0); tau = zeros(T, k); PureBLAS.geqlf!(F, tau)
         Fl = copy(A0); taul = zeros(T, k); LA.geqlf!(Fl, taul)     # LAPACK reference, SAME τ convention
-        @test maxe(tril(F[m-k+1:m, n-k+1:n]), tril(Fl[m-k+1:m, n-k+1:n])) < 400 * eps(real(T))
+        @test maxe(tril(F[(m - k + 1):m, (n - k + 1):n]), tril(Fl[(m - k + 1):m, (n - k + 1):n])) < 400 * eps(real(T))
         @test maxe(tau, taul) < 400 * eps(real(T))
         Q = PureBLAS.orgql!(copy(F), copy(tau))
         @test maxe(Q' * Q, Matrix{T}(I, n, n)) < 800 * eps(real(T))
-        Lql = tril(F[m-n+1:m, :])          # economy L: n×n lower-tri bottom block, A = Q(m×n)·L(n×n)
+        Lql = tril(F[(m - n + 1):m, :])          # economy L: n×n lower-tri bottom block, A = Q(m×n)·L(n×n)
         @test maxe(Q * Lql, A0) < 800 * eps(real(T))
         C = randn(T, m, 6); trH = T <: Complex ? 'C' : 'T'
         C1 = PureBLAS.ormql!('L', trH, copy(F), tau, copy(C))
@@ -1015,11 +1036,11 @@ end
         A0 = randn(T, m, n); k = min(m, n)
         F = copy(A0); tau = zeros(T, k); PureBLAS.gerqf!(F, tau)
         Fl = copy(A0); taul = zeros(T, k); LA.gerqf!(Fl, taul)
-        @test maxe(triu(F[:, n-m+1:n]), triu(Fl[:, n-m+1:n])) < 400 * eps(real(T))
+        @test maxe(triu(F[:, (n - m + 1):n]), triu(Fl[:, (n - m + 1):n])) < 400 * eps(real(T))
         @test maxe(tau, taul) < 400 * eps(real(T))
         Q = PureBLAS.orgrq!(copy(F), copy(tau))
         @test maxe(Q * Q', Matrix{T}(I, m, m)) < 800 * eps(real(T))
-        Rrq = triu(F[:, n-m+1:n])          # economy R: m×m upper-tri right block, A = R(m×m)·Q(m×n)
+        Rrq = triu(F[:, (n - m + 1):n])          # economy R: m×m upper-tri right block, A = R(m×m)·Q(m×n)
         @test maxe(Rrq * Q, A0) < 800 * eps(real(T))
         C = randn(T, 6, n); trH = T <: Complex ? 'C' : 'T'
         C1 = PureBLAS.ormrq!('R', 'N', copy(F), tau, copy(C))
@@ -1032,8 +1053,8 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK as LA
     @testset "$T m=$m n=$n ta=$ta tb=$tb isgn=$isgn" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n) in ((5, 5), (8, 6)), ta in (T <: Complex ? ('N', 'C') : ('N', 'T')),
-        tb in (T <: Complex ? ('N', 'C') : ('N', 'T')), isgn in (1, -1)
+            (m, n) in ((5, 5), (8, 6)), ta in (T <: Complex ? ('N', 'C') : ('N', 'T')),
+            tb in (T <: Complex ? ('N', 'C') : ('N', 'T')), isgn in (1, -1)
 
         A0 = triu(randn(T, m, m)) + m * I           # well-separated diagonal (avoid a near-singular Sylvester op)
         B0 = triu(randn(T, n, n)) .* T(0.3) + 3m * I
@@ -1059,8 +1080,8 @@ end
         Tm = copy(Torig); Qm = copy(Q0)
         ifst, ilst = 1, min(3, n)
         PureBLAS.trexc!('V', Tm, Qm, ifst, ilst)
-        @test maximum(abs, Qm * Tm * Qm' - A0) < 1e-9 * (opnorm(A0, 1) + 1)
-        @test maximum(abs, Qm' * Qm - I) < 1e-9
+        @test maximum(abs, Qm * Tm * Qm' - A0) < 1.0e-9 * (opnorm(A0, 1) + 1)
+        @test maximum(abs, Qm' * Qm - I) < 1.0e-9
     end
     @testset "trsen $T n=$n" for T in (Float64, ComplexF64), n in (6, 14)
         A0 = randn(T, n, n)
@@ -1069,9 +1090,9 @@ end
         Tm = copy(Torig); Qm = copy(Q0)
         sel = falses(n); sel[1] = true               # select the leading eigenvalue('s conjugate-pair block)
         Tr, Qr, w, s, sep = PureBLAS.trsen!('B', 'V', sel, Tm, Qm)
-        @test maximum(abs, Qr * Tr * Qr' - A0) < 1e-8 * (opnorm(A0, 1) + 1)
-        @test maximum(abs, Qr' * Qr - I) < 1e-8
-        @test 0 < s <= 1 + 1e-8
+        @test maximum(abs, Qr * Tr * Qr' - A0) < 1.0e-8 * (opnorm(A0, 1) + 1)
+        @test maximum(abs, Qr' * Qr - I) < 1.0e-8
+        @test 0 < s <= 1 + 1.0e-8
         @test sep >= 0
     end
 end
@@ -1080,7 +1101,7 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK as LA
     @testset "$T m=$m n=$n p=$p" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        (m, n, p) in ((10, 6, 3), (8, 8, 4), (12, 7, 7))
+            (m, n, p) in ((10, 6, 3), (8, 8, 4), (12, 7, 7))
 
         A = randn(T, m, n); c = randn(T, m)
         B = randn(T, p, n); d = B * randn(T, n)     # ensure B·x=d is consistent
@@ -1099,18 +1120,28 @@ end
     function d1d2(::Type{T}, m, p, k, l, alpha, beta) where {T}
         kl = k + l
         D1 = zeros(T, m, kl); D2 = zeros(T, p, kl)
-        for i in 1:k; D1[i, i] = 1; end
+        for i in 1:k
+            D1[i, i] = 1
+        end
         if m - kl >= 0
-            for i in 1:l; D1[k + i, k + i] = alpha[k + i]; D2[i, k + i] = beta[k + i]; end
+            for i in 1:l
+                D1[k + i, k + i] = alpha[k + i]; D2[i, k + i] = beta[k + i]
+            end
         else
-            for i in (k + 1):m; D1[i, i] = alpha[i]; end
-            for i in 1:(m - k); D2[i, k + i] = beta[k + i]; end
-            for i in (m - k + 1):l; D2[i, k + i] = 1; end
+            for i in (k + 1):m
+                D1[i, i] = alpha[i]
+            end
+            for i in 1:(m - k)
+                D2[i, k + i] = beta[k + i]
+            end
+            for i in (m - k + 1):l
+                D2[i, k + i] = 1
+            end
         end
         return D1, D2
     end
     @testset "T=$T m=$m p=$p n=$n rA=$rA rB=$rB" for T in (Float64, Float32, ComplexF64, ComplexF32),
-        (m, p, n) in ((10, 8, 6), (6, 10, 6), (4, 5, 9)), (rA, rB) in ((99, 99), (2, 2))
+            (m, p, n) in ((10, 8, 6), (6, 10, 6), (4, 5, 9)), (rA, rB) in ((99, 99), (2, 2))
 
         RT = real(T)
         A = rA >= min(m, n) ? randn(T, m, n) : randn(T, m, rA) * randn(T, rA, n)
@@ -1118,8 +1149,8 @@ end
         U, V, Q, al, be, k, l, R = PureBLAS.ggsvd!('U', 'V', 'Q', copy(A), copy(B))
         _, _, _, alo, beo, ko, lo, _ = LA.ggsvd3!('U', 'V', 'Q', copy(A), copy(B))
         @test (k, l) == (ko, lo)                       # rank parameters match LAPACK exactly
-        @test sort(al) ≈ sort(alo) atol = (RT === Float64 ? 1e-9 : 1e-4)
-        @test sort(be) ≈ sort(beo) atol = (RT === Float64 ? 1e-9 : 1e-4)
+        @test sort(al) ≈ sort(alo) atol = (RT === Float64 ? 1.0e-9 : 1.0e-4)
+        @test sort(be) ≈ sort(beo) atol = (RT === Float64 ? 1.0e-9 : 1.0e-4)
         otol = 100 * max(m, p, n) * eps(RT)
         @test opnorm(U'U - I) < otol
         @test opnorm(V'V - I) < otol

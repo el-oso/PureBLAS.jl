@@ -14,18 +14,18 @@ function core_timed(A, ipiv, nb)
     tp = tl = tt = tg = 0.0; pc = 1
     while pc <= k
         pb = min(nb, k - pc + 1); mp = m - pc + 1
-        t = time_ns(); _getf2!(view(A, pc:m, pc:pc+pb-1), mp, pb, pc-1, ipiv, pc-1); tp += time_ns()-t
+        t = time_ns(); _getf2!(view(A, pc:m, pc:(pc + pb - 1)), mp, pb, pc - 1, ipiv, pc - 1); tp += time_ns() - t
         jt0 = pc + pb
         if jt0 <= n
-            t = time_ns(); _laswp!(A, ipiv, pc, pc+pb-1, jt0, n); tl += time_ns()-t
-            t = time_ns(); P.trsm!(view(A, pc:pc+pb-1, jt0:n), view(A, pc:pc+pb-1, pc:pc+pb-1); side='L', uplo='L', transA='N', diag='U', alpha=true); tt += time_ns()-t
-            if pc+pb <= m
-                t = time_ns(); P.gemm!(view(A, pc+pb:m, jt0:n), view(A, pc+pb:m, pc:pc+pb-1), view(A, pc:pc+pb-1, jt0:n); alpha=-1, beta=true); tg += time_ns()-t
+            t = time_ns(); _laswp!(A, ipiv, pc, pc + pb - 1, jt0, n); tl += time_ns() - t
+            t = time_ns(); P.trsm!(view(A, pc:(pc + pb - 1), jt0:n), view(A, pc:(pc + pb - 1), pc:(pc + pb - 1)); side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = true); tt += time_ns() - t
+            if pc + pb <= m
+                t = time_ns(); P.gemm!(view(A, (pc + pb):m, jt0:n), view(A, (pc + pb):m, pc:(pc + pb - 1)), view(A, pc:(pc + pb - 1), jt0:n); alpha = -1, beta = true); tg += time_ns() - t
             end
         end
         pc += pb
     end
-    (tp, tl, tt, tg)
+    return (tp, tl, tt, tg)
 end
 
 for n in (128, 256, 512, 1024, 2048)
@@ -37,6 +37,8 @@ for n in (128, 256, 512, 1024, 2048)
         acc .+= collect(core_timed(A, ipiv, nb))
     end
     acc ./= reps; tot = sum(acc)
-    @printf("n=%-5d nb=%-3d tot=%7.1fus  panel=%5.1f%% laswp=%5.1f%% trsm=%5.1f%% gemm=%5.1f%%\n",
-        n, nb, tot/1000, 100acc[1]/tot, 100acc[2]/tot, 100acc[3]/tot, 100acc[4]/tot)
+    @printf(
+        "n=%-5d nb=%-3d tot=%7.1fus  panel=%5.1f%% laswp=%5.1f%% trsm=%5.1f%% gemm=%5.1f%%\n",
+        n, nb, tot / 1000, 100acc[1] / tot, 100acc[2] / tot, 100acc[3] / tot, 100acc[4] / tot
+    )
 end
