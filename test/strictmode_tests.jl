@@ -341,15 +341,14 @@ end
         @assert_trim_compatible P.ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
         @assert_trim_compatible P.gges!('V', 'V', randn(n, n), randn(n, n))
         @assert_trim_compatible P.gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
-        # sygvd!/hegvd! (compose _syev!/_heev!) and ggsvd! (compose gesvd!) reach Base Array setindex!/bounds
-        # error paths (throw_setindex_mismatch) in the Matrix instantiation that the .so's PtrMatrix path
-        # (unsafe_store!) does not. They are authoritatively trim-gated by the juliac `trim-so` CI job; Mode-2
-        # (Matrix) trim-hardening of the eigen/SVD Array internals is a tracked follow-up.
+        @assert_trim_compatible P.ggsvd!(randn(8, 6), randn(6, 6))
+        @assert_trim_compatible P.sygvd!(1, 'V', 'U', copy(Ad), copy(Sd))
+        @assert_trim_compatible P.hegvd!(1, 'V', 'U', copy(Ahe), copy(She))
         # ── symmetric-tridiagonal (stebz/stein), real ──
         dd = randn(n); ee = randn(n - 1)
         @assert_trim_compatible P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
         w, ib, isp, _ = P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
-        # stein! writes eigenvectors into Array slices → same Matrix-instantiation setindex! path (juliac-gated).
+        @assert_trim_compatible P.stein!(copy(dd), copy(ee), w, ib, isp)
         # ── generalized SVD (ggsvd), Float64 full-rank ──
         # ── banded LU (gbtrf/gbtrs) — factor then solve ──
         ABd2 = randn(6, n); _, gip, _ = P.gbtrf!(2, 1, n, ABd2)

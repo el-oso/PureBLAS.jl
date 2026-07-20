@@ -349,8 +349,8 @@ function _dc_eigen!(d::AbstractVector{T}, e::AbstractVector{T}, Z::AbstractMatri
     # final ascending re-sort merging deflated + secular eigenvalues, so the invariant ("d ascending
     # on return") holds for the parent's z-extraction (last row of Q1 / first row of Q2).
     ord2 = sortperm(Dout)
-    d .= Dout[ord2]
-    Z .= Qout[:, ord2]
+    copyto!(d, Dout[ord2])                 # copyto!(view/dest, X), not .= / slice-assign: those carry Base
+    copyto!(Z, Qout[:, ord2])              # setindex_shape_check / DimensionMismatch error paths (--trim-unsafe)
     return
 end
 
@@ -404,8 +404,8 @@ function _stedc!(d::AbstractVector{T}, e::AbstractVector{T}, Z::AbstractMatrix{T
     # global ascending sort of eigenvalues + eigenvector columns (blocks are each ascending but interleaved).
     if !issorted(view(d, 1:n))
         ord = sortperm(view(d, 1:n))
-        d[1:n] = d[ord]
-        Z[:, 1:n] = Z[:, ord]
+        copyto!(view(d, 1:n), d[ord])       # copyto!(view, X), not slice-assign (setindex_shape_check --trim-unsafe)
+        copyto!(view(Z, :, 1:n), Z[:, ord])
     end
     return d, Z
 end
