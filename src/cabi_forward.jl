@@ -586,3 +586,139 @@ _reg!("dggsvd3_", () -> @cfunction(dggsvd3_64_, Cvoid,
     (_CU, _CU, _CU, _CI, _CI, _CI, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
      Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, _CI, Ptr{Float64}, _CI, Ptr{Float64}, _CI,
      Ptr{Float64}, _CI, Ptr{Int64}, _CI, Clong, Clong, Clong)))
+
+# ═══════════ Batch 2 (cabi_lapack2.jl): gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
+# orgtr·ungtr/ormtr·unmtr, orgqr·ungqr/ormqr·unmqr, ormhr·unmhr, gebrd/bdsqr/bdsdc — the OpenBLAS-removal
+# ratchet follow-up. @cfunction sigs match the @ccallable defs in cabi_lapack2.jl byte-for-byte.
+# gesv — composes getrf!+getrs (routes any DIRECT LAPACK.gesv! caller; s is mixed-precision).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "gesv_"), () -> @cfunction($(Symbol(p, "gesv_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, _CI, _CI, Ptr{$T}, _CI, _CI)))
+end
+# posv — composes potrf!+potrs (native for all 4 types).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "posv_"), () -> @cfunction($(Symbol(p, "posv_64_")), Cvoid,
+        (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong)))
+end
+# lacpy — triangle/full copy. No `info` arg (matches the real Fortran ABI).
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "lacpy_"), () -> @cfunction($(Symbol(p, "lacpy_64_")), Cvoid,
+        (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Clong)))
+end
+# larfg — Householder reflector generator. 0 chars; alpha is a SEPARATE by-ref scalar from x.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "larfg_"), () -> @cfunction($(Symbol(p, "larfg_64_")), Cvoid,
+        (_CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T})))
+end
+# larf — apply a Householder reflector.
+for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "larf_"), () -> @cfunction($(Symbol(p, "larf_64_")), Cvoid,
+        (_CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, Clong)))
+end
+# gebak — undo gebal's balancing on eigen/Schur vectors.
+for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),
+                   ("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "gebak_"), () -> @cfunction($(Symbol(p, "gebak_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$Tr}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+# hseqr — Schur factorization of upper-Hessenberg H. REAL has separate wr/wi; COMPLEX one w + no rwork.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "hseqr_"), () -> @cfunction($(Symbol(p, "hseqr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "hseqr_"), () -> @cfunction($(Symbol(p, "hseqr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+# trevc — right eigenvectors of a Schur form by back-substitution (side='R' only; select is Ptr{Int64}).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "trevc_"), () -> @cfunction($(Symbol(p, "trevc_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CI, Ptr{$T}, _CI,
+         Clong, Clong)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "trevc_"), () -> @cfunction($(Symbol(p, "trevc_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CI, Ptr{$T}, Ptr{$R}, _CI,
+         Clong, Clong)))
+end
+# sytrd (real) / hetrd (complex) — tridiagonalize symmetric/Hermitian A. uplo='L' only (kernel scope).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "sytrd_"), () -> @cfunction($(Symbol(p, "sytrd_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "hetrd_"), () -> @cfunction($(Symbol(p, "hetrd_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{$R}, Ptr{$R}, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+end
+# orgtr (real) / ungtr (complex) — form Q from sytrd/hetrd reflectors. uplo='L' only.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "orgtr_"), () -> @cfunction($(Symbol(p, "orgtr_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "ungtr_"), () -> @cfunction($(Symbol(p, "ungtr_64_")), Cvoid,
+        (_CU, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong)))
+end
+# ormtr (real) / unmtr (complex) — apply Q from sytrd/hetrd reflectors. side='L' + uplo='L' only.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "ormtr_"), () -> @cfunction($(Symbol(p, "ormtr_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong, Clong)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "unmtr_"), () -> @cfunction($(Symbol(p, "unmtr_64_")), Cvoid,
+        (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong, Clong)))
+end
+# orgqr (real) / ungqr (complex) — form Q from geqrf reflectors. 0 chars.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "orgqr_"), () -> @cfunction($(Symbol(p, "orgqr_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "ungqr_"), () -> @cfunction($(Symbol(p, "ungqr_64_")), Cvoid,
+        (_CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+# ormqr (real) / unmqr (complex) — apply Q from geqrf reflectors.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "ormqr_"), () -> @cfunction($(Symbol(p, "ormqr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "unmqr_"), () -> @cfunction($(Symbol(p, "unmqr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, Clong, Clong)))
+end
+# ormhr (real) / unmhr (complex) — apply Q from gehrd reflectors.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "ormhr_"), () -> @cfunction($(Symbol(p, "ormhr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong)))
+end
+for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
+    @eval _reg!($(p * "unmhr_"), () -> @cfunction($(Symbol(p, "unmhr_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong)))
+end
+# gebrd — bidiagonalize A (Golub-Kahan reduction). m≥n only (kernel scope). 0 chars.
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "gebrd_"), () -> @cfunction($(Symbol(p, "gebrd_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+for (p, T, R) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "gebrd_"), () -> @cfunction($(Symbol(p, "gebrd_64_")), Cvoid,
+        (_CI, _CI, Ptr{$T}, _CI, Ptr{$R}, Ptr{$R}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI)))
+end
+# bdsqr — bidiagonal SVD (implicit-shift QR). REAL only (s,d); ncc≠0 unsupported (checked at the ABI).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "bdsqr_"), () -> @cfunction($(Symbol(p, "bdsqr_64_")), Cvoid,
+        (_CU, _CI, _CI, _CI, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T},
+         _CI, Clong)))
+end
+# bdsdc — bidiagonal SVD (divide-and-conquer). REAL only (no complex variant in reference LAPACK);
+# compq∈{'N','I'} only (checked at the ABI).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval _reg!($(p * "bdsdc_"), () -> @cfunction($(Symbol(p, "bdsdc_64_")), Cvoid,
+        (_CU, _CU, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI,
+         Clong, Clong)))
+end

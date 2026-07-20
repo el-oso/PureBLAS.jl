@@ -416,3 +416,73 @@ function geqrf!(A::StridedMatrix{Float64})
     geqrf!(A, tau)
     return A, tau
 end
+
+# ── orgqr / ungqr — form Q from geqrf reflectors (LAPACK dorg2r/zung2r, unblocked) ─────────────────────
+# A (m×n, m≥n on entry) holds the geqrf reflectors (standard LAPACK τ — the C-ABI dgeqrf_64_ shim already
+# converts faer's stored 1/τ back to this convention). `k` reflectors H(1)…H(k) are used (k≤n≤m); on exit
+# the first n columns of A hold Q's first n columns (orthonormal). Reuses `_house_left!`/`_larfg!`'s
+# convention exactly as geqp3.jl does (v = view(A,i:m,i); v[1] ignored/implicit-1 by `_house_left!`).
+"""
+    orgqr!(A, tau, k=length(tau)) -> A    (real)
+    ungqr!(A, tau, k=length(tau)) -> A    (complex)
+
+Form `Q` (LAPACK dorgqr/zungqr, unblocked dorg2r/zung2r) from the `k` geqrf reflectors stored in `A`
+(standard LAPACK τ convention). Overwrites `A`'s leading `n` columns with `Q`'s leading `n` columns.
+"""
+function orgqr!(A::AbstractMatrix{T}, tau::AbstractVector{T}, k::Int = length(tau)) where {T}
+    m, n = size(A)
+    (0 <= k <= n <= m) || throw(DimensionMismatch("orgqr!: requires k ≤ n ≤ m"))
+    @inbounds begin
+        for j in k+1:n
+            for l in 1:m; A[l, j] = zero(T); end
+            A[j, j] = one(T)
+        end
+        for i in k:-1:1
+            τ = tau[i]
+            i < n && _house_left!(view(A, i:m, i+1:n), view(A, i:m, i), τ)
+            for l in i+1:m; A[l, i] *= -τ; end
+            A[i, i] = one(T) - τ
+            for l in 1:i-1; A[l, i] = zero(T); end
+        end
+    end
+    return A
+end
+const ungqr! = orgqr!
+
+# ── ormqr / unmqr — apply Q (or Qᴴ) from geqrf reflectors (LAPACK dorm2r/zunm2r, unblocked) ────────────
+# Q's order (nq) is ALWAYS A's row count (mA), for both side='L' and side='R' (matches LinearAlgebra's own
+# ormqr! dimension check: `side=='L' ? m==mA : n==mA`). Reflector i has essential v=A[i:mA,i] (length
+# mA-i+1), applied via `_house_left!` (side='L') / `_larf_right!` (side='R', generic T<:Number — the
+# hessenberg.jl mirror of svd.jl's Float64-only `_house_right!`).
+"""
+    ormqr!(side, trans, A, tau, C) -> C    (real: trans ∈ {'N','T'})
+    unmqr!(side, trans, A, tau, C) -> C    (complex: trans ∈ {'N','C'})
+
+Apply `Q` (geqrf reflectors in `A`, standard τ) to `C`: side='L' → `C := op(Q)·C`, side='R' → `C :=
+C·op(Q)`. `op` = `Q` (trans='N') or `Qᴴ`/`Qᵀ` (trans='C'/'T'). LAPACK dorm2r/zunm2r.
+"""
+function ormqr!(side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
+        C::AbstractMatrix{T}) where {T}
+    mA = size(A, 1); k = length(tau)
+    left = side == 'L'; notran = trans == 'N'
+    if (left && !notran) || (!left && notran)
+        i1, i2, i3 = 1, k, 1
+    else
+        i1, i2, i3 = k, 1, -1
+    end
+    @inbounds begin
+        i = i1
+        while i3 > 0 ? i <= i2 : i >= i2
+            τ = notran ? tau[i] : conj(tau[i])          # conj is a no-op for T<:Real
+            v = view(A, i:mA, i)
+            if left
+                _house_left!(view(C, i:mA, :), v, τ)
+            else
+                _larf_right!(view(C, :, i:mA), v, τ)
+            end
+            i += i3
+        end
+    end
+    return C
+end
+const unmqr! = ormqr!

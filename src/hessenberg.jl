@@ -298,3 +298,37 @@ end
 
 unghr!(A::AbstractMatrix{T}, ilo::Integer, ihi::Integer, tau::AbstractVector{T}) where {T<:Number} =
     orghr!(A, ilo, ihi, tau)
+
+# ── ormhr / unmhr — apply Q from gehrd reflectors to a general matrix C ────────────────────────────────
+# LAPACK dormhr/zunmhr applies Q (or Qᴴ) WITHOUT first forming it (a dedicated reflector sweep). Correct-
+# ness-first / ponytail: `orghr!` already forms Q correctly and cheaply enough for this batch's scope (a
+# direct-LAPACK-caller symbol, not on any PureBLAS-internal hot path) — form Q on a COPY of A (orghr!
+# overwrites its input, but C-ABI dormhr/zunmhr must leave A unchanged) then apply via PureBLAS's own
+# `gemm!` (trim-safe; avoids routing through `Base.:*`'s generic BLAS dispatch).
+"""
+    ormhr!(side, trans, ilo, ihi, A, tau, C) -> C    (real: trans ∈ {'N','T'})
+    unmhr!(side, trans, ilo, ihi, A, tau, C) -> C    (complex: trans ∈ {'N','C'})
+
+Apply `Q` (LAPACK dormhr/zunmhr — the `gehrd!`/`orghr!` reflectors) to `C`: side='L' → `C := op(Q)·C`,
+side='R' → `C := C·op(Q)`. `A`/`tau` are left unchanged (read-only, as in reference LAPACK).
+"""
+function ormhr!(side::Char, trans::Char, ilo::Integer, ihi::Integer, A::AbstractMatrix{T},
+        tau::AbstractVector{T}, C::AbstractMatrix{T}) where {T<:Number}
+    n = size(A, 1)
+    Q = orghr!(copy(A), ilo, ihi, tau)
+    ct = T <: Complex ? 'C' : 'T'
+    top = trans == 'N' ? 'N' : ct
+    if side == 'L'
+        m, ncol = size(C)
+        tmp = Matrix{T}(undef, m, ncol)
+        gemm!(tmp, Q, C; transA = top, alpha = one(T), beta = zero(T))
+        copyto!(C, tmp)
+    else
+        mrow, m = size(C)
+        tmp = Matrix{T}(undef, mrow, m)
+        gemm!(tmp, C, Q; transB = top, alpha = one(T), beta = zero(T))
+        copyto!(C, tmp)
+    end
+    return C
+end
+const unmhr! = ormhr!
