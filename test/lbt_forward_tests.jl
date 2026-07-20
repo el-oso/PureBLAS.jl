@@ -707,6 +707,42 @@ end
     end
 end
 
+@testitem "LBT in-process forward: batch-12 (tgsen — complex generalized Schur reorder)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB12)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 10
+
+    # COMPLEX tgsen only (real dtgsen/stgsen not forwarded — 2×2 conjugate-pair swap unbuilt). Direct
+    # LAPACK.tgsen! call, OpenBLAS oracle pre-activate. select is BlasInt (Julia's wrapper constrains it).
+    cases = map((ComplexF64, ComplexF32)) do T
+        A = randn(T, n, n); Bm = randn(T, n, n)
+        F = schur(A, Bm)                                   # generalized: A = Q·S·Z', B = Q·T·Z'
+        (T = T, S0 = F.S, T0 = F.T, Q0 = F.Q, Z0 = F.Z, sel = Int64[i > n ÷ 2 for i in 1:n])
+    end
+    oracle = map(cases) do c
+        S, Tt, al, be, Q, Z = LA.tgsen!(c.sel, copy(c.S0), copy(c.T0), copy(c.Q0), copy(c.Z0))
+        (ev = sort(al ./ be, by = x -> (real(x), imag(x))), rec = Q * S * Z')
+    end
+
+    before = Dict(s => fwd(s) for s in ("ctgsen_", "ztgsen_"))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+        for (i, c) in enumerate(cases)
+            S, Tt, al, be, Q, Z = LA.tgsen!(c.sel, copy(c.S0), copy(c.T0), copy(c.Q0), copy(c.Z0))
+            ev = sort(al ./ be, by = x -> (real(x), imag(x)))
+            tol = c.T == ComplexF32 ? 1.0f-3 : 1e-9
+            @test maximum(abs, ev .- oracle[i].ev) < tol * (norm(oracle[i].ev) + 1)   # same eigenvalues
+            @test maximum(abs, Q * S * Z' .- oracle[i].rec) < tol * (norm(oracle[i].rec) + 1)  # pair invariant
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
 # ── OpenBLAS-removal GATE (the contract) ──────────────────────────────────────────────────────────────
 # Enumerates EVERY LAPACK symbol LinearAlgebra can ccall (parsed from stdlib lapack.jl) and asserts how
 # many still fall through to OpenBLAS after activate() (pointer unchanged vs pre-activate). This is the
@@ -716,16 +752,16 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 15   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
-    # 2026-07-20: 87 → 23 → 15. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
+    _FALLTHROUGH_MAX = 13   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    # 2026-07-20: 87 → 23 → 15 → 13. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
     # orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
-    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open), and
-    # now syconv (s/d/c/z) + trrfs (s/d/c/z) — cabi_lapack3.jl (batch-11 test below). The residual 15 =
-    # the explicitly out-of-scope set: gesvx/posvx-class expert drivers (gesvx), tgsen (generalized Schur
-    # reorder — real 2×2 conjugate-pair swap unbuilt; must NOT ship a throwing forward), complex/F32 ggsvd
-    # (needs complex GSVD), cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-accumulator Givens apply not
-    # yet in svd.jl), and cstev_/zstev_ (NOT real LAPACK symbols — stev is s/d only; they have no caller,
-    # an artifact of the regex scan).
+    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open), syconv
+    # (s/d/c/z) + trrfs (s/d/c/z), and now ctgsen_/ztgsen_ (COMPLEX tgsen — cabi_lapack3.jl, batch-12).
+    # The residual 13 = the honest floor: gesvx s/d/c/z (expert driver — needs iterative-refinement gerfs),
+    # dtgsen_/stgsen_ (real tgsen — 2×2 conjugate-pair swap unbuilt; would throw), cggsvd_/sggsvd_/zggsvd_
+    # (complex GSVD kernel is full-rank-only → would throw on rank-deficient pairs OpenBLAS handles),
+    # cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-accumulator Givens apply not yet in svd.jl), and
+    # cstev_/zstev_ (NOT real LAPACK symbols — stev is s/d only; no caller, an artifact of the regex scan).
     lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
     syms = Set{String}()
     for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end

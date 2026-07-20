@@ -58,6 +58,7 @@ include("gglse.jl")         # LAPACK: equality-constrained LS (gglse)
 include("ggsvd.jl")         # LAPACK: generalized SVD, Float64 full-rank + complex (ggsvd) — needs gglse.jl's _ggl_* helpers
 include("syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert (syconv)
 include("trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
+include("tgsen.jl")         # LAPACK: generalized Schur reorder (tgsen) — complex complete; real all-real-λ only
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
