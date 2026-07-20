@@ -5,6 +5,40 @@
 # LAPACK symbols forwarded" invariant (a forwarded factorization whose companion stays on OpenBLAS must
 # still be correct — e.g. geqrf is deliberately NOT forwarded: its faer-τ breaks OpenBLAS orgqr).
 
+@testitem "LBT: high-level cholesky!/cholesky reaches PureBLAS potrf (all paths, s/d/c/z)" tags = [:lbt] begin
+    # PROOF (not just correctness) that LinearAlgebra.cholesky!/cholesky routes to PureBLAS's potrf
+    # kernel after activate(): overlay a recording thunk on {d,s,z,c}potrf_ that still delegates to the
+    # real PureBLAS kernel, then assert every cholesky call form fires it. Guards the wiring permanently.
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    const hits = Ref(0)   # module-global (const) so the recorders reference it, not capture it → @cfunction → raw Ptr
+    _d(u, n, A::Ptr{Float64}, lda, i, l)::Cvoid = (hits[] += 1; PureBLAS.dpotrf_64_(u, n, A, lda, i, l); nothing)
+    _s(u, n, A::Ptr{Float32}, lda, i, l)::Cvoid = (hits[] += 1; PureBLAS.spotrf_64_(u, n, A, lda, i, l); nothing)
+    _z(u, n, A::Ptr{ComplexF64}, lda, i, l)::Cvoid = (hits[] += 1; PureBLAS.zpotrf_64_(u, n, A, lda, i, l); nothing)
+    _c(u, n, A::Ptr{ComplexF32}, lda, i, l)::Cvoid = (hits[] += 1; PureBLAS.cpotrf_64_(u, n, A, lda, i, l); nothing)
+    setf(s, th) = B.lbt_set_forward(s, th, B.LBT_INTERFACE_ILP64, B.LBT_COMPLEX_RETSTYLE_NORMAL, B.LBT_F2C_PLAIN)
+    PureBLAS.activate()
+    try
+        setf("dpotrf_", @cfunction(_d, Cvoid, (Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong)))
+        setf("spotrf_", @cfunction(_s, Cvoid, (Ptr{UInt8}, Ptr{Int64}, Ptr{Float32}, Ptr{Int64}, Ptr{Int64}, Clong)))
+        setf("zpotrf_", @cfunction(_z, Cvoid, (Ptr{UInt8}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Clong)))
+        setf("cpotrf_", @cfunction(_c, Cvoid, (Ptr{UInt8}, Ptr{Int64}, Ptr{ComplexF32}, Ptr{Int64}, Ptr{Int64}, Clong)))
+        mkspd(T, n) = (M = randn(T, n, n); M'M + n * I)
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
+            atol = real(T) == Float32 ? 1.0f-3 : 1e-9
+            for call in (A -> cholesky!(copy(A)), A -> cholesky(A),
+                         A -> cholesky!(Hermitian(copy(A), :L)), A -> cholesky!(Hermitian(copy(A), :U)))
+                A = mkspd(T, 96); c0 = hits[]
+                F = call(A)
+                @test hits[] > c0                                      # the call reached PureBLAS potrf
+                @test norm(Matrix(F) - A) / norm(A) < atol             # …and factored correctly
+            end
+        end
+    finally
+        PureBLAS.deactivate()   # restores the real forwards (and OpenBLAS after)
+    end
+end
+
 @testitem "LBT in-process forward: activate reroutes BLAS/LAPACK to PureBLAS" tags = [:lbt] begin
     using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.BLAS as B
