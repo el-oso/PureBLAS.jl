@@ -173,7 +173,9 @@ end
 # 4+: per-recursion-level Winograd buffers, 10 per level (TA mh×kh, TB kh×nh, P1..P7 + U all mh×nh) at
 # base 3+level*10. Exact-sized (realloc on shape mismatch — negligible at the large n Strassen runs at).
 @inline function _str_fit!(pool, i::Int, r::Int, c::Int, ::Type{Tr}) where {Tr}
-    while length(pool) < i; push!(pool, Matrix{Tr}(undef, 0, 0)); end
+    while length(pool) < i
+        push!(pool, Matrix{Tr}(undef, 0, 0))
+    end
     M = pool[i]; (size(M, 1) != r || size(M, 2) != c) && (pool[i] = Matrix{Tr}(undef, r, c))
     return pool[i]
 end

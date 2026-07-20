@@ -1,15 +1,15 @@
 @testsetup module L2Oracle
-    using LinearAlgebra
-    export l2err, l2tol
-    l2err(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
-    l2tol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-10
+using LinearAlgebra
+export l2err, l2tol
+l2err(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
+l2tol(::Type{T}) where {T} = T <: Union{Float32, ComplexF32} ? 1.0e-3 : 1.0e-10
 end
 
 @testitem "gemv vs OpenBLAS" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
     @testset "$T $tr m=$m n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        tr in ('N', 'T', 'C'), m in (1, 5, 16, 17, 40), n in (1, 7, 16, 33)
+            tr in ('N', 'T', 'C'), m in (1, 5, 16, 17, 40), n in (1, 7, 16, 33)
 
         A = randn(T, m, n)
         xlen = tr == 'N' ? n : m; ylen = tr == 'N' ? m : n
@@ -27,7 +27,7 @@ end
     # Oracle is the explicit rank-1 update (LinearAlgebra.BLAS has geru! but not gerc!):
     #   geru: A += α·x·yᵀ (transpose) ;  gerc: A += α·x·yᴴ (adjoint, conjugates y).
     @testset "$T m=$m n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        m in (1, 16, 17, 40), n in (1, 7, 16, 33)
+            m in (1, 16, 17, 40), n in (1, 7, 16, 33)
 
         x = randn(T, m); y = randn(T, n); A0 = randn(T, m, n); al = randn(T)
         Ap = copy(A0); PureBLAS.ger!(al, x, y, Ap)                 # geru
@@ -75,7 +75,7 @@ end
 @testitem "symv vs Symmetric·x" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
     @testset "$T uplo=$ul n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        ul in ('U', 'L'), n in (1, 5, 16, 17, 40)
+            ul in ('U', 'L'), n in (1, 5, 16, 17, 40)
 
         A = randn(T, n, n); x = randn(T, n); y0 = randn(T, n)
         S = Symmetric(A, ul == 'U' ? :U : :L)   # oracle reads the same triangle PureBLAS does
@@ -89,7 +89,7 @@ end
 @testitem "hemv vs Hermitian·x" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
     @testset "$T uplo=$ul n=$n" for T in (ComplexF32, ComplexF64, Float64),
-        ul in ('U', 'L'), n in (1, 5, 16, 17, 40)
+            ul in ('U', 'L'), n in (1, 5, 16, 17, 40)
 
         A = randn(T, n, n); x = randn(T, n); y0 = randn(T, n)
         H = Hermitian(A, ul == 'U' ? :U : :L)   # Hermitian forces real diagonal — hemv matches
@@ -110,7 +110,7 @@ end
     @test l2err(ys, 2.0 .* (Symmetric(A, :L) * collect(xs))) < l2tol(Float64)
     dx = randn(40)                              # ForwardDiff through symv (generic scalar path)
     @test ForwardDiff.derivative(t -> sum(PureBLAS.symv!(zeros(eltype(t), 40), A, x .+ t .* dx; uplo = 'U')), 0.0) ≈
-          sum(Symmetric(A, :U) * dx)
+        sum(Symmetric(A, :U) * dx)
 end
 
 @testitem "symv/hemv dimension mismatch is caught" begin
@@ -123,7 +123,7 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
     @testset "$T $ul$tr$dg n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (1, 5, 16, 17, 40)
+            ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (1, 5, 16, 17, 40)
 
         A = randn(T, n, n); x0 = randn(T, n)
         xr = copy(x0); B.trmv!(ul, tr, dg, A, xr)
@@ -136,10 +136,12 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
     @testset "$T $ul$tr$dg n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (1, 5, 16, 17, 40)
+            ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (1, 5, 16, 17, 40)
 
         A = randn(T, n, n) ./ T(2n)                       # well-conditioned: near-identity triangle
-        for i in 1:n; A[i, i] = one(T) + abs(real(A[i, i])); end
+        for i in 1:n
+            A[i, i] = one(T) + abs(real(A[i, i]))
+        end
         b = randn(T, n)
         xr = copy(b); B.trsv!(ul, tr, dg, A, xr)
         xp = copy(b); PureBLAS.trsv!(A, xp; uplo = ul, trans = tr, diag = dg)
@@ -151,13 +153,15 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B   # n > _TRI_NB(=64) exercises the blocked diagonal+gemv path
     @testset "$T $ul$tr$dg n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-        ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (65, 100, 129, 257)
+            ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'), n in (65, 100, 129, 257)
 
         A = randn(T, n, n); x0 = randn(T, n)
         xr = copy(x0); B.trmv!(ul, tr, dg, A, xr)
         xp = copy(x0); PureBLAS.trmv!(A, xp; uplo = ul, trans = tr, diag = dg)
         @test l2err(xp, xr) < l2tol(T)
-        As = randn(T, n, n) ./ T(2n); for i in 1:n; As[i, i] = one(T) + abs(real(As[i, i])); end
+        As = randn(T, n, n) ./ T(2n); for i in 1:n
+            As[i, i] = one(T) + abs(real(As[i, i]))
+        end
         b = randn(T, n)
         br = copy(b); B.trsv!(ul, tr, dg, As, br)
         bp = copy(b); PureBLAS.trsv!(As, bp; uplo = ul, trans = tr, diag = dg)
@@ -173,7 +177,9 @@ end
     PureBLAS.trmv!(A, xs; uplo = 'U')
     @test l2err(collect(xs), xr) < l2tol(Float64)
     # round-trip: trsv ∘ trmv == identity
-    L = randn(15, 15); for i in 1:15; L[i, i] += 15; end
+    L = randn(15, 15); for i in 1:15
+        L[i, i] += 15
+    end
     xt = randn(15); y = copy(xt)
     PureBLAS.trmv!(L, y; uplo = 'L'); PureBLAS.trsv!(L, y; uplo = 'L')
     @test l2err(y, xt) < 1.0e-9
@@ -192,7 +198,7 @@ end
     import LinearAlgebra.BLAS as B
     tol(::Type{T}) where {T} = T <: Float32 ? 1.0f-4 : 1.0e-11
     @testset "T=$T np=$np m=$m n=$n" for T in (Float32, Float64), np in (1, 2, 4, 8),
-        m in (1, 7, 16, 31), n in (1, 3, 8, 13)
+            m in (1, 7, 16, 31), n in (1, 3, 8, 13)
 
         α = T(0.7); x = randn(T, m); y = randn(T, n); A0 = randn(T, m, n)
         Ap = copy(A0); PureBLAS._ger_paneldrv_np(m, n, α, x, y, Ap, np)   # A += α·x·yᵀ

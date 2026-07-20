@@ -24,8 +24,12 @@ const DRYRUN = "dryrun" in ARGS
     m, n = size(A)
     GC.@preserve A x y begin
         Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); jc = 0
-        while jc + NP <= n; _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(NP), Val(4)); jc += NP; end
-        while jc < n; _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(1), Val(4)); jc += 1; end
+        while jc + NP <= n
+            _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(NP), Val(4)); jc += NP
+        end
+        while jc < n
+            _ger_panel!(Ap, lda, xp, yp, jc, m, one(T), 0, Val(1), Val(4)); jc += 1
+        end
     end
     return A
 end
@@ -52,7 +56,7 @@ function calibrate_ger_np(::Type{T} = Float64) where {T}
 end
 
 # ── run every calibration, collect (key => value), write once ──────────────────────────────────────────
-prefs = Pair{String,Any}[]
+prefs = Pair{String, Any}[]
 push!(prefs, "ger_panel_np" => calibrate_ger_np())
 # (add further runtime-swept params here as they arrive — same pattern)
 
@@ -61,9 +65,11 @@ if DRYRUN
     println("\n[dryrun] would write to $LP under [PureBLAS]:")
     foreach(p -> println("  $(p.first) = $(p.second)"), prefs)
 else
-    d = isfile(LP) ? TOML.parsefile(LP) : Dict{String,Any}()      # merge — preserve other packages' + other PureBLAS prefs
-    sect = get!(d, "PureBLAS", Dict{String,Any}())
-    for p in prefs; sect[p.first] = p.second; end
+    d = isfile(LP) ? TOML.parsefile(LP) : Dict{String, Any}()      # merge — preserve other packages' + other PureBLAS prefs
+    sect = get!(d, "PureBLAS", Dict{String, Any}())
+    for p in prefs
+        sect[p.first] = p.second
+    end
     open(io -> TOML.print(io, d), LP, "w")
     println("\nwrote $(length(prefs)) preference(s) → $LP  [PureBLAS]")
     println("(reload PureBLAS to bake them; a per-µarch frozen .so carries them forward)")

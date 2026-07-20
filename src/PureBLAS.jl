@@ -8,69 +8,69 @@ include("core.jl")          # type aliases, _ld/_st! accessors, lassq, |·|
 include("ptrmat.jl")        # PtrMatrix/PtrVector: isbits Ptr-backed operands for the C-ABI boundary
 include("cpuinfo.jl")       # SIMD width detection (const-folded, trim-safe)
 include("simd_kernels.jl")  # SIMD.jl fast paths (real, unit-stride, dense)
-include("level1.jl")        # low-level (n,…,inc) kernels — shared by both modes
-include("level2.jl")        # Level-2 gemv/ger/symv/hemv/trmv/trsv kernels (on the L1 column kernels)
-include("level2_packed.jl") # Level-2 packed storage: spmv/hpmv/tpmv/tpsv
-include("level2_banded.jl") # Level-2 band storage: gbmv/sbmv/hbmv/tbmv/tbsv
+include("blas1/level1.jl")        # low-level (n,…,inc) kernels — shared by both modes
+include("blas2/level2.jl")        # Level-2 gemv/ger/symv/hemv/trmv/trsv kernels (on the L1 column kernels)
+include("blas2/level2_packed.jl") # Level-2 packed storage: spmv/hpmv/tpmv/tpsv
+include("blas2/level2_banded.jl") # Level-2 band storage: gbmv/sbmv/hbmv/tbmv/tbsv
 include("contracts.jl")     # TypeContracts AbstractBLAS1 / AbstractBLAS2 interfaces
 include("backend.jl")       # SIMDBackend: high-level AbstractVector ops (Mode 2)
 include("native.jl")        # bare native API → default backend
 include("workspace.jl")     # L3Workspace: owned per-type Level-3/LAPACK scratch (replaces global caches)
-include("gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
-include("level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
-include("lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
-include("qr.jl")            # LAPACK: QR (geqrf) — faer panel reduction + gemm! dlarfb
-include("wy.jl")            # compact-WY block-reflector kernels (dlarft/dlarfb roles), caller-
-                             # owned workspace — PureSparse.jl M5b multifrontal QR's P1a/P1b
-include("lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm! trailing
-include("svd_dqds.jl")      # LAPACK: dqds (dlasq1-6) — fast bidiagonal singular VALUES (values-only path)
-include("svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implicit-QR + back-transform
-include("svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal solver (bdsdc, faer port)
-include("eigen.jl")         # LAPACK: symmetric/Hermitian eigensolver (syev/heev) — sytrd/hetrd + steqr + ormtr/unmtr
-include("eigen_dc.jl")      # LAPACK: symmetric tridiagonal divide-and-conquer (stedc, Cuppen) — jobz='V' path
-include("lq.jl")            # LAPACK: LQ (gelqf/orglq/ormlq) — row-wise dual of QR, generic s/d/c/z
-include("bunchkaufman.jl")  # LAPACK: Bunch-Kaufman (sytrf/hetrf + sytrs/hetrs) symmetric-indefinite/Hermitian
-include("geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-revealing, generic s/d/c/z
-include("gels.jl")          # LAPACK: least-squares / min-norm solve (gels) over QR/LQ
-include("gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
-include("hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) — nonsymmetric-eigen front half
-include("hseqr.jl")         # LAPACK: Schur decomposition of upper-Hessenberg (hseqr, Francis double-shift QR)
-include("trevc.jl")         # LAPACK: right eigenvectors of Schur form (trevc, back-substitution)
-include("geev.jl")          # LAPACK: general eigensolver drivers (geev/gees + gebak) — eigen/eigvals/schur
-include("sygvd.jl")         # LAPACK: generalized sym/Herm-definite eigensolver (sygvd/hegvd) — eigen(Sym,Sym)
-include("tridiag.jl")       # LAPACK: tridiagonal solvers (gtsv/gttrf/gttrs) + _gt_asmat helper
-include("banded_chol.jl")   # LAPACK: band Cholesky (pbtrf/pbtrs)
-include("packed_chol.jl")   # LAPACK: packed Cholesky (pptrf/pptrs)
-include("qz.jl")            # LAPACK: generalized-eigen QZ kernels (gghrd/hgeqz + auxiliaries)
-include("tgevc_gen.jl")     # LAPACK: generalized right eigenvectors (tgevc) — needs qz.jl first
-include("ggev.jl")          # LAPACK: generalized eigensolver drivers (ggev/gges) — eigen(A,B)/eigvals/schur(A,B)
-include("sysv.jl")          # LAPACK: symmetric-indefinite/Hermitian solve+inverse (sysv/hesv/sytri/hetri)
-include("gbtrf.jl")         # LAPACK: general banded LU (gbtrf/gbtrs)
-include("pttrf.jl")         # LAPACK: SPD tridiagonal LDLᴴ (pttrf/pttrs/ptsv)
-include("stebz.jl")         # LAPACK: sym-tridiag eigvals by bisection (stebz) / eigvecs by inverse iteration (stein)
-include("pstrf.jl")         # LAPACK: pivoted/semidefinite Cholesky (pstrf)
-include("qlrq.jl")          # LAPACK: QL/RQ factorizations (geqlf/gerqf/orgql/orgrq/ormql/ormrq + complex duals)
-include("gelsy.jl")         # LAPACK: rank-deficient LS via RZ (gelsy/tzrzf/ormrz) — needs geqp3.jl + gels.jl
-include("gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — needs svd.jl
-include("trsyl.jl")         # LAPACK: Sylvester solve (trsyl) — standalone
-include("trsen.jl")         # LAPACK: Schur reorder (trexc/trsen) — needs trsyl.jl
-include("gglse.jl")         # LAPACK: equality-constrained LS (gglse)
-include("ggsvd.jl")         # LAPACK: generalized SVD (ggsvd) — rank-deficient-capable, all s/d/c/z (dggsvp + dtgsja)
-include("syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert (syconv)
-include("trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
-include("tgsen.jl")         # LAPACK: generalized Schur reorder (tgsen) — complex complete; real all-real-λ only
-include("gesvx.jl")         # LAPACK: expert general solve (gesvx) — equilibrate + LU + refine + error bounds
+include("blas3/gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
+include("blas3/level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
+include("lapack/lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
+include("lapack/qr.jl")            # LAPACK: QR (geqrf) — faer panel reduction + gemm! dlarfb
+include("lapack/wy.jl")            # compact-WY block-reflector kernels (dlarft/dlarfb roles), caller-
+# owned workspace — PureSparse.jl M5b multifrontal QR's P1a/P1b
+include("lapack/lu.jl")            # LAPACK: LU (getrf) — pivoted panel + gemm!/trsm! trailing
+include("lapack/svd_dqds.jl")      # LAPACK: dqds (dlasq1-6) — fast bidiagonal singular VALUES (values-only path)
+include("lapack/svd.jl")           # LAPACK: SVD (gesvd) — gebrd + bidiagonal implicit-QR + back-transform
+include("lapack/svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal solver (bdsdc, faer port)
+include("lapack/eigen.jl")         # LAPACK: symmetric/Hermitian eigensolver (syev/heev) — sytrd/hetrd + steqr + ormtr/unmtr
+include("lapack/eigen_dc.jl")      # LAPACK: symmetric tridiagonal divide-and-conquer (stedc, Cuppen) — jobz='V' path
+include("lapack/lq.jl")            # LAPACK: LQ (gelqf/orglq/ormlq) — row-wise dual of QR, generic s/d/c/z
+include("lapack/bunchkaufman.jl")  # LAPACK: Bunch-Kaufman (sytrf/hetrf + sytrs/hetrs) symmetric-indefinite/Hermitian
+include("lapack/geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-revealing, generic s/d/c/z
+include("lapack/gels.jl")          # LAPACK: least-squares / min-norm solve (gels) over QR/LQ
+include("lapack/gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
+include("lapack/hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) — nonsymmetric-eigen front half
+include("lapack/hseqr.jl")         # LAPACK: Schur decomposition of upper-Hessenberg (hseqr, Francis double-shift QR)
+include("lapack/trevc.jl")         # LAPACK: right eigenvectors of Schur form (trevc, back-substitution)
+include("lapack/geev.jl")          # LAPACK: general eigensolver drivers (geev/gees + gebak) — eigen/eigvals/schur
+include("lapack/sygvd.jl")         # LAPACK: generalized sym/Herm-definite eigensolver (sygvd/hegvd) — eigen(Sym,Sym)
+include("lapack/tridiag.jl")       # LAPACK: tridiagonal solvers (gtsv/gttrf/gttrs) + _gt_asmat helper
+include("lapack/banded_chol.jl")   # LAPACK: band Cholesky (pbtrf/pbtrs)
+include("lapack/packed_chol.jl")   # LAPACK: packed Cholesky (pptrf/pptrs)
+include("lapack/qz.jl")            # LAPACK: generalized-eigen QZ kernels (gghrd/hgeqz + auxiliaries)
+include("lapack/tgevc_gen.jl")     # LAPACK: generalized right eigenvectors (tgevc) — needs qz.jl first
+include("lapack/ggev.jl")          # LAPACK: generalized eigensolver drivers (ggev/gges) — eigen(A,B)/eigvals/schur(A,B)
+include("lapack/sysv.jl")          # LAPACK: symmetric-indefinite/Hermitian solve+inverse (sysv/hesv/sytri/hetri)
+include("lapack/gbtrf.jl")         # LAPACK: general banded LU (gbtrf/gbtrs)
+include("lapack/pttrf.jl")         # LAPACK: SPD tridiagonal LDLᴴ (pttrf/pttrs/ptsv)
+include("lapack/stebz.jl")         # LAPACK: sym-tridiag eigvals by bisection (stebz) / eigvecs by inverse iteration (stein)
+include("lapack/pstrf.jl")         # LAPACK: pivoted/semidefinite Cholesky (pstrf)
+include("lapack/qlrq.jl")          # LAPACK: QL/RQ factorizations (geqlf/gerqf/orgql/orgrq/ormql/ormrq + complex duals)
+include("lapack/gelsy.jl")         # LAPACK: rank-deficient LS via RZ (gelsy/tzrzf/ormrz) — needs geqp3.jl + gels.jl
+include("lapack/gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — needs svd.jl
+include("lapack/trsyl.jl")         # LAPACK: Sylvester solve (trsyl) — standalone
+include("lapack/trsen.jl")         # LAPACK: Schur reorder (trexc/trsen) — needs trsyl.jl
+include("lapack/gglse.jl")         # LAPACK: equality-constrained LS (gglse)
+include("lapack/ggsvd.jl")         # LAPACK: generalized SVD (ggsvd) — rank-deficient-capable, all s/d/c/z (dggsvp + dtgsja)
+include("lapack/syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert (syconv)
+include("lapack/trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
+include("lapack/tgsen.jl")         # LAPACK: generalized Schur reorder (tgsen) — complex complete; real all-real-λ only
+include("lapack/gesvx.jl")         # LAPACK: expert general solve (gesvx) — equilibrate + LU + refine + error bounds
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
-include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
-include("cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
-include("cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
-include("cabi_l3.jl")       # Mode 1: BLAS-3 rest (symm/syrk/trmm/trsm/…)
-include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
-include("cabi_lapack2.jl")  # Mode 1: LAPACK batch 2 (gesv/posv/lacpy/larfg/larf/gebak/hseqr/trevc/
-                             # sytrd·hetrd/orgtr·ungtr/ormtr·unmtr/orgqr·ungqr/ormqr·unmqr/ormhr·unmhr/
-                             # gebrd/bdsqr/bdsdc) — OpenBLAS-removal ratchet follow-up
-include("cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/ggsvd-complex to follow)
-include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
+include("cabi/cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
+include("cabi/cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
+include("cabi/cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
+include("cabi/cabi_l3.jl")       # Mode 1: BLAS-3 rest (symm/syrk/trmm/trsm/…)
+include("cabi/cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
+include("cabi/cabi_lapack2.jl")  # Mode 1: LAPACK batch 2 (gesv/posv/lacpy/larfg/larf/gebak/hseqr/trevc/
+# sytrd·hetrd/orgtr·ungtr/ormtr·unmtr/orgqr·ungqr/ormqr·unmqr/ormhr·unmhr/
+# gebrd/bdsqr/bdsdc) — OpenBLAS-removal ratchet follow-up
+include("cabi/cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/ggsvd-complex to follow)
+include("cabi/cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
 # ── Precompile workload ────────────────────────────────────────────────────────────────────────────
@@ -89,23 +89,27 @@ using PrecompileTools: @setup_workload, @compile_workload
         for T in (Float64, Float32, ComplexF64)
             x = ones(T, n); y = fill(T(2), n)
             axpy!(copy(y), one(T), x); dot(x, y); dotu(x, y); nrm2(x)
-            A = reshape(collect(T, 1:n * n), n, n) ./ T(n)
+            A = reshape(collect(T, 1:(n * n)), n, n) ./ T(n)
             gemv(A, x); gemv(A, x; trans = 'T')
             C = zeros(T, n, n)
             gemm!(C, A, A; alpha = one(T), beta = zero(T))
             gemm!(copy(C), A, A; alpha = one(T), beta = one(T), transA = 'T', transB = 'N')
         end
         for T in (Float64, ComplexF64)
-            A = reshape(collect(T, 1:n * n), n, n) ./ T(n)
-            S = A * A'; @inbounds for i in 1:n; S[i, i] += T(n); end   # Hermitian PD
+            A = reshape(collect(T, 1:(n * n)), n, n) ./ T(n)
+            S = A * A'; @inbounds for i in 1:n
+                S[i, i] += T(n)
+            end   # Hermitian PD
             potrf!(copy(S); uplo = 'L')
-            G = copy(A); @inbounds for i in 1:n; G[i, i] += T(n); end  # nonsingular
+            G = copy(A); @inbounds for i in 1:n
+                G[i, i] += T(n)
+            end  # nonsingular
             getrf!(G)
             tau = zeros(T, n); geqrf!(copy(A), tau)
         end
-        As = reshape(collect(Float64, 1:n * n), n, n); As = As .+ As'
+        As = reshape(collect(Float64, 1:(n * n)), n, n); As = As .+ As'
         _syev!('V', 'L', copy(As))
-        Ah = reshape(collect(ComplexF64, 1:n * n), n, n); Ah = Ah .+ Ah'
+        Ah = reshape(collect(ComplexF64, 1:(n * n)), n, n); Ah = Ah .+ Ah'
         _heev!('V', 'L', copy(Ah))
     end
 end

@@ -56,8 +56,10 @@ function activate()
     empty!(_OUR_PTRS)
     for (name, thunk) in _LBT_REGISTRARS
         p = thunk()
-        r = lbt_set_forward(name, p, LBT_INTERFACE_ILP64,
-            LBT_COMPLEX_RETSTYLE_NORMAL, LBT_F2C_PLAIN)
+        r = lbt_set_forward(
+            name, p, LBT_INTERFACE_ILP64,
+            LBT_COMPLEX_RETSTYLE_NORMAL, LBT_F2C_PLAIN
+        )
         r == 0 ? (_OUR_PTRS[name] = Base.unsafe_convert(Ptr{Cvoid}, p)) : push!(failed, name)
     end
     isempty(failed) ||

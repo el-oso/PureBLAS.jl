@@ -3,10 +3,10 @@
     import LinearAlgebra.BLAS as B
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 50
     @testset "$T s=$side u=$ul t=$ta d=$dg ($m×$n)" for T in (Float32, Float64, ComplexF64),
-        side in ('L', 'R'), ul in ('U', 'L'), ta in ('N', 'T', 'C'), dg in ('N', 'U'),
-        # last 3 sizes exercise the packed complex-trmm remainder column-tile (k%_CNR ∈ {2,4}) at
-        # both uplo (upper-N deep-remainder / lower-N shallow) with a non-mr-multiple m (bottom-row mask).
-        (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96), (50, 56), (66, 112), (128, 64))
+            side in ('L', 'R'), ul in ('U', 'L'), ta in ('N', 'T', 'C'), dg in ('N', 'U'),
+            # last 3 sizes exercise the packed complex-trmm remainder column-tile (k%_CNR ∈ {2,4}) at
+            # both uplo (upper-N deep-remainder / lower-N shallow) with a non-mr-multiple m (bottom-row mask).
+            (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96), (50, 56), (66, 112), (128, 64))
 
         (T <: Real && ta == 'C') && continue
         k = side == 'L' ? m : n
@@ -24,13 +24,15 @@ end
     import LinearAlgebra.BLAS as B
     tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 200   # solves amplify; looser than trmm
     @testset "$T s=$side u=$ul t=$ta d=$dg ($m×$n)" for T in (Float32, Float64, ComplexF64),
-        side in ('L', 'R'), ul in ('U', 'L'), ta in ('N', 'T', 'C'), dg in ('N', 'U'),
-        (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96))
+            side in ('L', 'R'), ul in ('U', 'L'), ta in ('N', 'T', 'C'), dg in ('N', 'U'),
+            (m, n) in ((4, 3), (33, 33), (80, 50), (130, 96))
 
         (T <: Real && ta == 'C') && continue
         k = side == 'L' ? m : n
         A = randn(T, k, k)                                # diagonally dominant ⇒ well-conditioned
-        for i in 1:k; A[i, i] += (3 + k) * sign(real(A[i, i]) + 0.1); end
+        for i in 1:k
+            A[i, i] += (3 + k) * sign(real(A[i, i]) + 0.1)
+        end
         X = randn(T, m, n)
         for al in (one(T), T(0.8))
             Br = copy(X); B.trsm!(side, ul, ta, dg, al, A, Br)
@@ -58,7 +60,7 @@ end
     import LinearAlgebra.BLAS as B
     tri(M, up) = up ? triu(M) : tril(M)
     @testset "syrk $T $ul $tr ($n,$k)" for T in (Float32, Float64, ComplexF64),
-        ul in ('U', 'L'), tr in ('N', 'T'), (n, k) in ((5, 7), (60, 40), (100, 100), (130, 70))
+            ul in ('U', 'L'), tr in ('N', 'T'), (n, k) in ((5, 7), (60, 40), (100, 100), (130, 70))
         A = tr == 'N' ? randn(T, n, k) : randn(T, k, n)
         C0 = randn(T, n, n); C0 = C0 + transpose(C0); al = T(0.7); be = T(0.3)
         Cr = copy(C0); B.syrk!(ul, tr, al, A, be, Cr)
@@ -66,12 +68,12 @@ end
         @test norm(tri(Cr - Cp, ul == 'U')) <= sqrt(eps(real(T))) * 100 * (norm(Cr) + 1)
     end
     @testset "herk $ul $tr ($n,$k)" for ul in ('U', 'L'), tr in ('N', 'C'),
-        (n, k) in ((5, 7), (80, 50), (120, 120))
+            (n, k) in ((5, 7), (80, 50), (120, 120))
         A = tr == 'N' ? randn(ComplexF64, n, k) : randn(ComplexF64, k, n)
         C0 = randn(ComplexF64, n, n); C0 = C0 + adjoint(C0); al = 0.7; be = 0.4
         Cr = copy(C0); B.herk!(ul, tr, al, A, be, Cr)
         Cp = copy(C0); PureBLAS.herk!(Cp, A; uplo = ul, trans = tr, alpha = al, beta = be)
-        @test norm(tri(Cr - Cp, ul == 'U')) <= 1e-9 * (norm(Cr) + 1)
+        @test norm(tri(Cr - Cp, ul == 'U')) <= 1.0e-9 * (norm(Cr) + 1)
     end
 end
 
@@ -79,7 +81,7 @@ end
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
     @testset "symm $T $side $ul ($n,$m)" for T in (Float32, Float64, ComplexF64),
-        side in ('L', 'R'), ul in ('U', 'L'), (n, m) in ((5, 4), (60, 40), (100, 100), (130, 70))
+            side in ('L', 'R'), ul in ('U', 'L'), (n, m) in ((5, 4), (60, 40), (100, 100), (130, 70))
         k = side == 'L' ? n : m
         A = randn(T, k, k); A = A + transpose(A)
         Bm = randn(T, n, m); C0 = randn(T, n, m); al = T(0.7); be = T(0.3)
@@ -88,13 +90,13 @@ end
         @test norm(Cr - Cp) <= sqrt(eps(real(T))) * 100 * (norm(Cr) + 1)
     end
     @testset "hemm $side $ul ($n,$m)" for side in ('L', 'R'), ul in ('U', 'L'),
-        (n, m) in ((5, 4), (80, 50), (120, 120))
+            (n, m) in ((5, 4), (80, 50), (120, 120))
         k = side == 'L' ? n : m
         A = randn(ComplexF64, k, k); A = A + adjoint(A)
         Bm = randn(ComplexF64, n, m); C0 = randn(ComplexF64, n, m); al = 0.7 + 0.2im; be = 0.3 - 0.1im
         Cr = copy(C0); B.hemm!(side, ul, al, A, Bm, be, Cr)
         Cp = copy(C0); PureBLAS.hemm!(Cp, A, Bm; side, uplo = ul, alpha = al, beta = be)
-        @test norm(Cr - Cp) <= 1e-9 * (norm(Cr) + 1)
+        @test norm(Cr - Cp) <= 1.0e-9 * (norm(Cr) + 1)
     end
 end
 
@@ -103,7 +105,7 @@ end
     import LinearAlgebra.BLAS as B
     tri(M, up) = up ? triu(M) : tril(M)
     @testset "syr2k $T $ul $tr ($n,$k)" for T in (Float32, Float64, ComplexF64),
-        ul in ('U', 'L'), tr in ('N', 'T'), (n, k) in ((5, 7), (60, 40), (100, 100), (130, 70))
+            ul in ('U', 'L'), tr in ('N', 'T'), (n, k) in ((5, 7), (60, 40), (100, 100), (130, 70))
         A = tr == 'N' ? randn(T, n, k) : randn(T, k, n); Bm = tr == 'N' ? randn(T, n, k) : randn(T, k, n)
         C0 = randn(T, n, n); C0 = C0 + transpose(C0); al = T(0.7); be = T(0.3)
         Cr = copy(C0); B.syr2k!(ul, tr, al, A, Bm, be, Cr)
@@ -111,13 +113,13 @@ end
         @test norm(tri(Cr - Cp, ul == 'U')) <= sqrt(eps(real(T))) * 100 * (norm(Cr) + 1)
     end
     @testset "her2k $ul $tr ($n,$k)" for ul in ('U', 'L'), tr in ('N', 'C'),
-        (n, k) in ((5, 7), (80, 50), (120, 120))
+            (n, k) in ((5, 7), (80, 50), (120, 120))
         A = tr == 'N' ? randn(ComplexF64, n, k) : randn(ComplexF64, k, n)
         Bm = tr == 'N' ? randn(ComplexF64, n, k) : randn(ComplexF64, k, n)
         C0 = randn(ComplexF64, n, n); C0 = C0 + adjoint(C0); al = 0.7 + 0.2im; be = 0.4
         Cr = copy(C0); B.her2k!(ul, tr, al, A, Bm, be, Cr)
         Cp = copy(C0); PureBLAS.her2k!(Cp, A, Bm; uplo = ul, trans = tr, alpha = al, beta = be)
-        @test norm(tri(Cr - Cp, ul == 'U')) <= 1e-9 * (norm(Cr) + 1)
+        @test norm(tri(Cr - Cp, ul == 'U')) <= 1.0e-9 * (norm(Cr) + 1)
     end
 end
 
@@ -126,18 +128,18 @@ end
     import LinearAlgebra.BLAS as B
     tri(M, up) = up ? triu(M) : tril(M)
     @testset "$op $ul $tr ($n,$k)" for op in (:syrk, :syr2k), ul in ('U', 'L'), tr in ('N', 'T'),
-        (n, k) in ((500, 300), (512, 512), (700, 128), (513, 600))
+            (n, k) in ((500, 300), (512, 512), (700, 128), (513, 600))
         A = tr == 'N' ? randn(n, k) : randn(k, n)
         C0 = randn(n, n); C0 = C0 + transpose(C0); al = 0.8; be = 0.3
         if op === :syrk
             Cr = copy(C0); B.syrk!(ul, tr, al, A, be, Cr)
             Cp = copy(C0); PureBLAS.syrk!(Cp, A; uplo = ul, trans = tr, alpha = al, beta = be)
-            @test norm(tri(Cr - Cp, ul == 'U')) <= 1e-8 * (norm(Cr) + 1)
+            @test norm(tri(Cr - Cp, ul == 'U')) <= 1.0e-8 * (norm(Cr) + 1)
         else
             Bm = tr == 'N' ? randn(n, k) : randn(k, n)
             Cr = copy(C0); B.syr2k!(ul, tr, al, A, Bm, be, Cr)
             Cp = copy(C0); PureBLAS.syr2k!(Cp, A, Bm; uplo = ul, trans = tr, alpha = al, beta = be)
-            @test norm(tri(Cr - Cp, ul == 'U')) <= 1e-8 * (norm(Cr) + 1)
+            @test norm(tri(Cr - Cp, ul == 'U')) <= 1.0e-8 * (norm(Cr) + 1)
         end
     end
 end

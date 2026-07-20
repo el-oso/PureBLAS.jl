@@ -18,9 +18,11 @@ const _SHARD = parse(Int, get(ENV, "PUREBLAS_SHARD", "1"))
 # The few expensive items (LAPACK factorizations, SVD/eigen, the OpenBLAS L3 sweeps) dominate wall-clock —
 # round-robin them across shards by list position so no single shard collects them all (a pure name hash
 # clustered them). Light items fall to a stable codeunit-sum split; their individual cost is negligible.
-const _HEAVY = ("gesvd", "syev (symmetric", "heev (Hermitian", "getrf (LU", "geqrf (QR", "potrf (Cholesky",
+const _HEAVY = (
+    "gesvd", "syev (symmetric", "heev (Hermitian", "getrf (LU", "geqrf (QR", "potrf (Cholesky",
     "GEMM real (blocked", "GEMM blocked", "GEMM complex", "trsm vs OpenBLAS", "trmm vs OpenBLAS",
-    "syrk/herk", "syrk/syr2k", "symm/hemm", "trmv/trsv blocked")
+    "syrk/herk", "syrk/syr2k", "symm/hemm", "trmv/trsv blocked",
+)
 function _shard_of(nm::AbstractString)
     for (k, h) in enumerate(_HEAVY)
         occursin(h, nm) && return mod(k, _NSHARDS) + 1
@@ -30,8 +32,8 @@ end
 _in_shard(ti) = _NSHARDS <= 1 || _shard_of(ti.name) == _SHARD
 _group_filter =
     _GROUP == "checks" ? (ti -> :checks in ti.tags) :
-    _GROUP == "main"   ? (ti -> !(:checks in ti.tags) && _in_shard(ti)) :
-                         (ti -> true)
+    _GROUP == "main" ? (ti -> !(:checks in ti.tags) && _in_shard(ti)) :
+    (ti -> true)
 
 # Optional name filter via test args, e.g. `Pkg.test(PureBLAS; test_args=["Reproducibility"])` runs
 # only matching `@testitem`s (ANDed with the group filter). No args → the whole selected group.

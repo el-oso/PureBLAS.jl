@@ -9,24 +9,24 @@ using SIMD: Vec, vload, vstore, vifelse, shufflevector
 
 # Eligibility: unit-stride + dense + real. `Ptr` inputs come from the C ABI (already raw); dense
 # arrays expose a pointer. Complex deliberately excluded (interleaved re/im SIMD is M2 work).
-@inline _simd1(::Ptr{T}) where {T<:BlasReal} = true
-@inline _simd1(::DenseArray{T}) where {T<:BlasReal} = true
+@inline _simd1(::Ptr{T}) where {T <: BlasReal} = true
+@inline _simd1(::DenseArray{T}) where {T <: BlasReal} = true
 @inline _simd1(@nospecialize(_)) = false
-@inline _simd2(::Ptr{T}, ::Ptr{T}) where {T<:BlasReal} = true
-@inline _simd2(::DenseArray{T}, ::DenseArray{T}) where {T<:BlasReal} = true
+@inline _simd2(::Ptr{T}, ::Ptr{T}) where {T <: BlasReal} = true
+@inline _simd2(::DenseArray{T}, ::DenseArray{T}) where {T <: BlasReal} = true
 @inline _simd2(@nospecialize(_), @nospecialize(_)) = false
 
 # Complex unit-stride dense/Ptr → the underlying interleaved [re im re im …] buffer IS a contiguous
 # 2n-real array. For the two reductions that are grouping-invariant — nrm2 (Σ|xᵢ|² = Σ over 2n reals r² )
 # and asum (dzasum = Σ|Re|+|Im| = Σ over 2n reals |r|) — a complex op reduces EXACTLY to the real SIMD
 # kernel over that reinterpreted buffer. `_reptr` gives the real Ptr (caller GC.@preserves the array).
-@inline _cplx_re(::Ptr{Complex{T}}) where {T<:BlasReal} = true
-@inline _cplx_re(::DenseArray{Complex{T}}) where {T<:BlasReal} = true
+@inline _cplx_re(::Ptr{Complex{T}}) where {T <: BlasReal} = true
+@inline _cplx_re(::DenseArray{Complex{T}}) where {T <: BlasReal} = true
 @inline _cplx_re(@nospecialize(_)) = false
-@inline _reptr(x::Ptr{Complex{T}}) where {T<:BlasReal} = Ptr{T}(x)
-@inline _reptr(x::DenseArray{Complex{T}}) where {T<:BlasReal} = Ptr{T}(pointer(x))
+@inline _reptr(x::Ptr{Complex{T}}) where {T <: BlasReal} = Ptr{T}(x)
+@inline _reptr(x::DenseArray{Complex{T}}) where {T <: BlasReal} = Ptr{T}(pointer(x))
 const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
-@inline _cplx2(::_CplxArg{T}, ::_CplxArg{T}) where {T<:BlasReal} = true      # both complex, same real T
+@inline _cplx2(::_CplxArg{T}, ::_CplxArg{T}) where {T <: BlasReal} = true      # both complex, same real T
 @inline _cplx2(@nospecialize(_), @nospecialize(_)) = false
 
 @inline _ptr(p::Ptr) = p
@@ -43,7 +43,7 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 # unrolled step (the HW prefetcher can't be relied on there) hides it (measured: neuromancer ger n=4096
 # 0.88→~1.0). The prefetch may reach up to `pf` elements past the column end; `llvm.prefetch` lowers to a
 # non-faulting `prefetcht0`, so that's safe. Distance `pf` is a derived const (see `_GER_PF_BYTES`).
-@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T<:BlasReal}
+@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T <: BlasReal}
     px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
         va = V(a)
@@ -52,7 +52,9 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
             o = i * sz
             if pf > 0                                 # const-folds OFF when pf==0 (default / axpy)
                 pb = py + (i + pf) * sz
-                for c in 0:_CACHELINE:(step * sz - 1); _prefetch(pb + c); end   # one prefetch per line
+                for c in 0:_CACHELINE:(step * sz - 1)
+                    _prefetch(pb + c)
+                end   # one prefetch per line
             end
             vstore(muladd(va, vload(V, px + o), vload(V, py + o)), py + o)
             vstore(muladd(va, vload(V, px + o + W * sz), vload(V, py + o + W * sz)), py + o + W * sz)
@@ -74,7 +76,7 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
     return y
 end
 
-@inline function _scal_simd!(n::Int, a::T, x) where {T<:BlasReal}
+@inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x begin
         va = V(a)
@@ -105,11 +107,11 @@ end
 # for a SCALAR multiplier, one swap-adjacent-pairs shuffle suffices — result = v·alr + swap(v)·[−ali,+ali…]
 # (= [r·alr − i·ali, i·alr + r·ali, …] on the interleaved [r i r i…] buffer). One shuffle/vector (vs 3 for
 # deinterleave+interleave), 4× unrolled to saturate memory bandwidth. `n` counts COMPLEX elements.
-@generated function _scal_cmplx_simd!(n::Int, alr::T, ali::T, x) where {T<:BlasReal}
+@generated function _scal_cmplx_simd!(n::Int, alr::T, ali::T, x) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T); Wc = 2 * W          # reals per Vec = 2W; W complex
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)     # swap adjacent (re,im)
     sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))  # [−ali,ali,…]
-    quote
+    return quote
         px = _reptr(x); arv = $V2(alr); sv = $sgn; step = 4 * $W          # 4 vectors = 4W complex/step
         GC.@preserve x begin
             i = 0
@@ -145,11 +147,11 @@ end
 # A/B @1M: 96.5→99.1 GB/s, PB/OB 0.937→0.958 (5/5 trials). Residual vs OB is complex-specific L3-edge
 # scheduling (shuffle+2FMA density limits bandwidth for OB's complex too: real 111 vs complex-OB 104 GB/s at
 # matched 32MB/bytes). 4× unrolled (bandwidth-bound: reads x+y, writes y). `n` counts COMPLEX elements.
-@generated function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T<:BlasReal}
+@generated function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))
-    quote
+    return quote
         px = _reptr(x); py = _reptr(y); arv = $V2(alr); sv = $sgn; step = 4 * $W
         GC.@preserve x y begin
             i = 0
@@ -182,7 +184,7 @@ end
 # q = Σ x·swap(y) = [Σxr·yi, Σxi·yr, …] — ONE shuffle (swap y) + 2 FMAs/iter, identical for dotu/dotc.
 # Deinterleave only the 2 accumulators ONCE at the end; CJ flips two combine signs. 4× unrolled for the
 # FMA-reduction latency. Returns Complex{T}. `n` counts COMPLEX elements.
-@generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T<:BlasReal, CJ}
+@generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T <: BlasReal, CJ}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     # Unroll from the REGISTER BUDGET (req#8), not a literal: the 2·UNR `Vec{2W}` accumulators each take 2
     # physical vector registers, so keep 4·UNR ≲ Nregs−6 (leave ~6 for the x/y/swap loads). AVX2 has 16
@@ -191,23 +193,27 @@ end
     UNR = clamp(((_SIMD_BYTES == 64 ? 32 : 16) - 6) ÷ 4, 1, 4)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     ps = [Symbol(:p, u) for u in 0:(UNR - 1)]; qs = [Symbol(:q, u) for u in 0:(UNR - 1)]
-    init = Expr(:block, (:( $(ps[u+1]) = zero($V2); $(qs[u+1]) = zero($V2) ) for u in 0:(UNR - 1))...)
+    init = Expr(:block, (:($(ps[u + 1]) = zero($V2); $(qs[u + 1]) = zero($V2)) for u in 0:(UNR - 1))...)
     psum = foldl((a, b) -> :($a + $b), ps); qsum = foldl((a, b) -> :($a + $b), qs)
     body = Expr(:block)
     for u in 0:(UNR - 1)
         o = :((i + $u * $W) * 2 * $sz)
-        push!(body.args, quote
-            xv = vload($V2, px + $o); yv = vload($V2, py + $o)
-            $(ps[u+1]) = muladd(xv, yv, $(ps[u+1])); $(qs[u+1]) = muladd(xv, shufflevector(yv, Val($swp)), $(qs[u+1]))
-        end)
+        push!(
+            body.args, quote
+                xv = vload($V2, px + $o); yv = vload($V2, py + $o)
+                $(ps[u + 1]) = muladd(xv, yv, $(ps[u + 1])); $(qs[u + 1]) = muladd(xv, shufflevector(yv, Val($swp)), $(qs[u + 1]))
+            end
+        )
     end
-    quote
+    return quote
         px = _reptr(x); py = _reptr(y); step = $UNR * $W
         $init
         GC.@preserve x y begin
             i = 0
             while i + step <= n
-                @inbounds begin $body end
+                @inbounds begin
+                    $body
+                end
                 i += step
             end
             while i + $W <= n
@@ -236,10 +242,10 @@ end
 # Fused rank-2 complex conj-dot for the QR panel: returns (Σ conj(v0)·c, Σ conj(v1)·c) in ONE pass over
 # c — the two reflectors share the c-load (halves the panel's level-2 read traffic vs two _dot_cmplx_simd
 # calls). Same interleaved swap-adjacent idiom as _dot_cmplx_simd (CJ=true). `n` counts COMPLEX elements.
-@generated function _qr_dot2c_cmplx(n::Int, v0, v1, c, ::Type{T}) where {T<:BlasReal}
+@generated function _qr_dot2c_cmplx(n::Int, v0, v1, c, ::Type{T}) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
-    quote
+    return quote
         pv0 = _reptr(v0); pv1 = _reptr(v1); pc = _reptr(c)
         p0 = zero($V2); q0 = zero($V2); p1 = zero($V2); q1 = zero($V2); i = 0
         GC.@preserve v0 v1 c begin
@@ -257,11 +263,11 @@ end
             d0r = pf0[1] + pf0[2]; d0i = qf0[1] - qf0[2]; d1r = pf1[1] + pf1[2]; d1i = qf1[1] - qf1[2]
             @inbounds while i < n
                 j = i + 1
-                v0r = unsafe_load(pv0, 2j-1); v0i = unsafe_load(pv0, 2j)
-                v1r = unsafe_load(pv1, 2j-1); v1i = unsafe_load(pv1, 2j)
-                cr = unsafe_load(pc, 2j-1); ci = unsafe_load(pc, 2j)
-                d0r += v0r*cr + v0i*ci; d0i += v0r*ci - v0i*cr
-                d1r += v1r*cr + v1i*ci; d1i += v1r*ci - v1i*cr
+                v0r = unsafe_load(pv0, 2j - 1); v0i = unsafe_load(pv0, 2j)
+                v1r = unsafe_load(pv1, 2j - 1); v1i = unsafe_load(pv1, 2j)
+                cr = unsafe_load(pc, 2j - 1); ci = unsafe_load(pc, 2j)
+                d0r += v0r * cr + v0i * ci; d0i += v0r * ci - v0i * cr
+                d1r += v1r * cr + v1i * ci; d1i += v1r * ci - v1i * cr
                 i += 1
             end
             return (Complex{$T}(d0r, d0i), Complex{$T}(d1r, d1i))
@@ -271,12 +277,12 @@ end
 
 # Fused rank-2 complex axpy for the QR panel: c .+= k0·v0 + k1·v1 in ONE pass over c (shares the c
 # read/write across both reflectors). Swap-pairs complex-multiply, same idiom as _axpy_cmplx_simd.
-@generated function _qr_axpy2_cmplx!(n::Int, k0r::T, k0i::T, k1r::T, k1i::T, v0, v1, c) where {T<:BlasReal}
+@generated function _qr_axpy2_cmplx!(n::Int, k0r::T, k0i::T, k1r::T, k1i::T, v0, v1, c) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     sgn0 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k0i) : :k0i for l in 0:(2W - 1))...))))
     sgn1 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k1i) : :k1i for l in 0:(2W - 1))...))))
-    quote
+    return quote
         pv0 = _reptr(v0); pv1 = _reptr(v1); pc = _reptr(c)
         ar0 = $V2(k0r); ar1 = $V2(k1r); s0 = $sgn0; s1 = $sgn1; i = 0
         GC.@preserve v0 v1 c begin
@@ -292,11 +298,11 @@ end
             end
             @inbounds while i < n
                 j = i + 1
-                v0r = unsafe_load(pv0, 2j-1); v0i = unsafe_load(pv0, 2j)
-                v1r = unsafe_load(pv1, 2j-1); v1i = unsafe_load(pv1, 2j)
-                cr = unsafe_load(pc, 2j-1); ci = unsafe_load(pc, 2j)
-                unsafe_store!(pc, cr + k0r*v0r - k0i*v0i + k1r*v1r - k1i*v1i, 2j-1)
-                unsafe_store!(pc, ci + k0r*v0i + k0i*v0r + k1r*v1i + k1i*v1r, 2j)
+                v0r = unsafe_load(pv0, 2j - 1); v0i = unsafe_load(pv0, 2j)
+                v1r = unsafe_load(pv1, 2j - 1); v1i = unsafe_load(pv1, 2j)
+                cr = unsafe_load(pc, 2j - 1); ci = unsafe_load(pc, 2j)
+                unsafe_store!(pc, cr + k0r * v0r - k0i * v0i + k1r * v1r - k1i * v1i, 2j - 1)
+                unsafe_store!(pc, ci + k0r * v0i + k0i * v0r + k1r * v1i + k1i * v1r, 2j)
                 i += 1
             end
         end
@@ -365,7 +371,7 @@ end
 # sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then a scalar tail.
 const _UNROLL = 4
 
-@inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T<:BlasReal}
+@inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
     px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
@@ -394,7 +400,7 @@ const _UNROLL = 4
     return s
 end
 
-@inline function _asum_simd(n::Int, x, ::Type{T}) where {T<:BlasReal}
+@inline function _asum_simd(n::Int, x, ::Type{T}) where {T <: BlasReal}
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x begin
         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
@@ -424,7 +430,7 @@ end
 
 # Sum of squares, SIMD, 4 accumulators. Fast path for nrm2 — may overflow to Inf or underflow to 0
 # on extreme inputs; the caller (_nrm2) detects that and falls back to scaled lassq.
-@inline function _sumsq_simd(n::Int, x, ::Type{T}) where {T<:BlasReal}
+@inline function _sumsq_simd(n::Int, x, ::Type{T}) where {T <: BlasReal}
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x begin
         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
@@ -483,8 +489,8 @@ end
 # overhead-critical small-n (see bench/iamax_nb.jl). Derived from _NVREG → trim-safe (req#8).
 const _IAMAX_NB = min(4, _NVREG - 1)
 
-@inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
-    W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = _IAMAX_NB * W
+@inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = _IAMAX_NB * W
     ld(o) = abs(vload(V, xp + o * sz))
     gmax = typemin(T); bi = 1; thr = V(gmax); o = 0
     @inbounds while o + step <= n                     # dependency-free: 4 independent compares vs `thr`
@@ -492,7 +498,9 @@ const _IAMAX_NB = min(4, _NVREG - 1)
         if any(((v0 > thr) | (v1 > thr)) | ((v2 > thr) | (v3 > thr)))    # rare (running max advances)
             for (j, v) in ((0, v0), (W, v1), (2W, v2), (3W, v3))         # cold path: locate new max + lane
                 bm = v[1]; bl = 1
-                for l in 2:W; v[l] > bm && (bm = v[l]; bl = l); end      # strict > ⇒ first lane on ties
+                for l in 2:W
+                    v[l] > bm && (bm = v[l]; bl = l)
+                end      # strict > ⇒ first lane on ties
                 bm > gmax && (gmax = bm; bi = o + j + bl; thr = V(gmax))
             end
         end
@@ -502,7 +510,9 @@ const _IAMAX_NB = min(4, _NVREG - 1)
         v0 = ld(o)
         if any(v0 > thr)
             bm = v0[1]; bl = 1
-            for l in 2:W; v0[l] > bm && (bm = v0[l]; bl = l); end
+            for l in 2:W
+                v0[l] > bm && (bm = v0[l]; bl = l)
+            end
             bm > gmax && (gmax = bm; bi = o + bl; thr = V(gmax))
         end
         o += W
@@ -513,8 +523,8 @@ const _IAMAX_NB = min(4, _NVREG - 1)
     return bi
 end
 
-@inline function _iamax_chain4!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
-    W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = 4W
+@inline function _iamax_chain4!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = 4W
     lane = Vec(ntuple(i -> i, Val(W)))               # 1,2,…,W
     ld(o) = abs(vload(V, xp + o * sz))
     m0 = ld(0); m1 = ld(W); m2 = ld(2W); m3 = ld(3W)
@@ -548,7 +558,7 @@ end
 # ISA-selected at build time: the `_SIMD_BYTES` compare const-folds, so the dead arm is eliminated
 # (trim-safe, no runtime dispatch). AVX2 + AVX-512 (≥32 B) → threshold scan (gates AOCL/OB at every size
 # on Zen3/Zen4/Zen5, see bench/iamax_nb.jl); narrower unvalidated ISAs (SSE/NEON) keep the 4-chain.
-@inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal} =
+@inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ? _iamax_thresh4!(n, xp) : _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
@@ -561,9 +571,9 @@ end
 # index duplicated per pair, so no deinterleave/extract shuffle at all — memory-bandwidth-bound like OB.
 @inline @generated function _cmag2(v::Vec{N, T}) where {N, T}
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)   # swap adjacent re↔im
-    :((av = abs(v); av + shufflevector(av, Val($swp))))
+    return :((av = abs(v); av + shufflevector(av, Val($swp))))
 end
-@inline function _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T<:BlasReal}
+@inline function _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 4W
     clane = Vec(ntuple(i -> (i + 1) ÷ 2, Val(2W)))        # 1,1,2,2,…,W,W (complex index per real lane)
     magc(c) = _cmag2(vload(V, xp + 2c * sz))              # Vec{2W}, mₖ duplicated per pair
@@ -599,5 +609,5 @@ end
 # masked remainder magnitude: masked-out reals load as 0, so |·| pairs sum correctly (0 lanes stay 0).
 @inline @generated function _cmag2_masked(av::Vec{N, T}) where {N, T}
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)
-    :(av + shufflevector(av, Val($swp)))
+    return :(av + shufflevector(av, Val($swp)))
 end

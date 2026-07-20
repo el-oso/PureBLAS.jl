@@ -2,7 +2,7 @@
 using Statistics, Printf
 host = length(ARGS) >= 1 ? ARGS[1] : "galen"
 f = "bench/plots_data_$(host).txt"
-below = Tuple{String,String,Int,Float64}[]
+below = Tuple{String, String, Int, Float64}[]
 for ln in eachline(f)
     parts = split(ln, '\t')
     length(parts) < 3 && continue

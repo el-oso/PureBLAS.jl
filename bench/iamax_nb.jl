@@ -18,17 +18,21 @@ const REFNAME = REF == "aocl" ? "AOCL" : "OpenBLAS"
 # Generate an explicitly-unrolled threshold-scan kernel for a given NB (blocks per hot iter).
 for NB in (2, 4, 6, 8)
     fname = Symbol("thresh_", NB, "!")
-    loads = [:($(Symbol(:v, j)) = abs(vload(V, xp + (o + $j * W) * sz))) for j in 0:NB-1]
-    orexpr = foldl((a, b) -> :($a | $b), [:($(Symbol(:v, j)) > thr) for j in 0:NB-1])
-    cold = [quote
-        let v = $(Symbol(:v, j))
-            bm = v[1]; bl = 1
-            for l in 2:W; v[l] > bm && (bm = v[l]; bl = l); end
-            bm > gmax && (gmax = bm; bi = o + $j * W + bl; thr = V(gmax))
-        end
-    end for j in 0:NB-1]
+    loads = [:($(Symbol(:v, j)) = abs(vload(V, xp + (o + $j * W) * sz))) for j in 0:(NB - 1)]
+    orexpr = foldl((a, b) -> :($a | $b), [:($(Symbol(:v, j)) > thr) for j in 0:(NB - 1)])
+    cold = [
+        quote
+                let v = $(Symbol(:v, j))
+                    bm = v[1]; bl = 1
+                    for l in 2:W
+                        v[l] > bm && (bm = v[l]; bl = l)
+                end
+                    bm > gmax && (gmax = bm; bi = o + $j * W + bl; thr = V(gmax))
+            end
+            end for j in 0:(NB - 1)
+    ]
     @eval @inline function $fname(n::Int, xp::Ptr{T}) where {T}
-        W = _vwidth(T); V = Vec{W,T}; sz = sizeof(T); step = $NB * W
+        W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = $NB * W
         gmax = typemin(T); bi = 1; thr = V(gmax); o = 0
         @inbounds while o + step <= n
             $(loads...)
@@ -41,7 +45,9 @@ for NB in (2, 4, 6, 8)
             v0 = abs(vload(V, xp + o * sz))
             if any(v0 > thr)
                 bm = v0[1]; bl = 1
-                for l in 2:W; v0[l] > bm && (bm = v0[l]; bl = l); end
+                for l in 2:W
+                    v0[l] > bm && (bm = v0[l]; bl = l)
+                end
                 bm > gmax && (gmax = bm; bi = o + bl; thr = V(gmax))
             end
             o += W
@@ -68,9 +74,10 @@ function check(T)
         pb6(x) == ref || error("NB6 T=$T n=$n"); pb8(x) == ref || error("NB8 T=$T n=$n")
         n >= 4 * _vwidth(T) && (pbc(x) == ref || error("chain T=$T n=$n"))
     end
+    return
 end
 
-med(f, mk; s = 0.15) = median(Float64[smp.time for smp in (@be mk() f evals=1 samples=400 seconds=s).samples])
+med(f, mk; s = 0.15) = median(Float64[smp.time for smp in (@be mk() f evals = 1 samples = 400 seconds = s).samples])
 
 function sweep(T)
     W = _vwidth(T)
@@ -79,16 +86,33 @@ function sweep(T)
     for n in (1000, 3000, 10000, 30000, 100000, 300000, 1000000)
         reps = clamp(8_000_000 ÷ n, 30, 20000)
         mk = () -> randn(T, n)
-        tref = med(x -> (s = 0; for _ in 1:reps; s += B.iamax(x); end; s), mk)
+        tref = med(
+            x -> (
+                s = 0; for _ in 1:reps
+                    s += B.iamax(x)
+                end; s
+            ), mk
+        )
         rs = Float64[]
         for (_, f) in VARS
-            t = med(x -> (s = 0; for _ in 1:reps; s += f(x); end; s), mk)
+            t = med(
+                x -> (
+                    s = 0; for _ in 1:reps
+                        s += f(x)
+                    end; s
+                ), mk
+            )
             push!(rs, tref / t)
         end
         @printf("%-9d %8.3f %8.3f %8.3f %8.3f %8.3f | %10.2e\n", n, rs..., tref / reps)
     end
+    return
 end
 
-for T in (Float64, Float32); check(T); end
+for T in (Float64, Float32)
+    check(T)
+end
 println("correctness OK")
-for T in (Float64, Float32); sweep(T); end
+for T in (Float64, Float32)
+    sweep(T)
+end

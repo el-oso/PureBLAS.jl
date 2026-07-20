@@ -66,8 +66,10 @@ end
 # a contiguous PtrVector. Column-major: sub-block (1,1) sits at ptr + (i0 + j0·ld); ld is unchanged.
 @inline _vspan(::Colon, n::Int) = (0, n)
 @inline _vspan(r::AbstractUnitRange{<:Integer}, ::Int) = (Int(first(r)) - 1, length(r))
-@inline function Base.view(A::PtrMatrix{T}, I::Union{Colon, AbstractUnitRange{<:Integer}},
-        J::Union{Colon, AbstractUnitRange{<:Integer}}) where {T}
+@inline function Base.view(
+        A::PtrMatrix{T}, I::Union{Colon, AbstractUnitRange{<:Integer}},
+        J::Union{Colon, AbstractUnitRange{<:Integer}}
+    ) where {T}
     i0, ni = _vspan(I, A.m)
     j0, nj = _vspan(J, A.n)
     return PtrMatrix(A.ptr + (i0 + j0 * A.ld) * sizeof(T), ni, nj, A.ld)

@@ -29,12 +29,13 @@ function _stable(ref, our, reset; rounds = 11, tol = 0.02, cap = 41)
         m = median(rs)
         ((quantile(rs, 0.75) - quantile(rs, 0.25)) / m < tol || length(rs) >= cap) && return m
     end
+    return
 end
 
 # Each routine: n → (ref, our, reset) sharing a work buffer, plus a correctness (relerr) probe.
 function _case(name, n)
     Random.seed!(1234 + n)
-    if name == "potrf"
+    return if name == "potrf"
         M = randn(n, n); A0 = M'M + n * I; Aw = Matrix{Float64}(undef, n, n); reset = () -> copyto!(Aw, A0)
         (() -> LAPACK.potrf!('L', Aw), () -> PureBLAS.potrf!(Aw; uplo = 'L'), reset)
     elseif name == "geqrf"
@@ -71,9 +72,13 @@ function _parseargs(args)
     routines = String[]; sizes = Int[]; save = false; i = 1
     while i <= length(args)
         a = args[i]
-        if a == "save"; save = true
-        elseif a == "--sizes"; sizes = parse.(Int, split(args[i+1], ",")); i += 1
-        else push!(routines, a); end
+        if a == "save"
+            save = true
+        elseif a == "--sizes"
+            sizes = parse.(Int, split(args[i + 1], ",")); i += 1
+        else
+            push!(routines, a)
+        end
         i += 1
     end
     isempty(routines) && (routines = ["potrf", "geqrf", "getrf", "gesvd"])
@@ -94,19 +99,21 @@ results = Dict{String, Float64}(); NF = Ref(0)
 @printf("%-7s %-6s %-9s %-8s %s\n", "routine", "n", "relerr", "our/OB", "flags")
 for name in routines, n in sizes
     er = _relerr(name, n)
-    er > 1e-9 && (NF[] += 1)
+    er > 1.0e-9 && (NF[] += 1)
     ref, our, reset = _case(name, n)
     r = _stable(ref, our, reset); key = "$(name)_$n"; results[key] = r
     b = get(base, key, NaN)
     flags = r >= GATE ? "GATE" : ""
     (!isnan(b) && r < b * (1 - REGR_TOL)) && (NF[] += 1; flags *= @sprintf(" REGRESSION vs %.3f", b))
-    er > 1e-9 && (flags *= @sprintf(" ✗CORRECTNESS(%.1e)", er))
+    er > 1.0e-9 && (flags *= @sprintf(" ✗CORRECTNESS(%.1e)", er))
     @printf("%-7s %-6d %.2e  %.3f    %s\n", name, n, er, r, flags)
 end
 if save
     open(_bpath(), "w") do io
         println(io, "# PureBLAS LAPACK gate baseline — $(_host()) — our/OpenBLAS interleaved-median ratios")
-        for k in sort(collect(keys(results))); println(io, "$k = $(round(results[k], digits = 4))"); end
+        for k in sort(collect(keys(results)))
+            println(io, "$k = $(round(results[k], digits = 4))")
+        end
     end
     println("\nbaseline written: $(_bpath())")
 end

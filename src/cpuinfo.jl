@@ -52,22 +52,32 @@ end
 
 # Cache-line size in bytes (folded to a const; 64 on all current x86/ARM). Governs software-prefetch
 # density — one prefetch per line (the ger column-RMW prefetch) — and the prefetch-distance unit.
-const _CACHELINE = let s = try Int(cachelinesize()) catch; 0 end; s > 0 ? s : 64 end
+const _CACHELINE = let s = try
+        Int(cachelinesize())
+    catch
+        0
+    end
+    s > 0 ? s : 64
+end
 
 # L1d associativity (ways), CPUID leaf 4 (Intel) / 0x8000001D (AMD) subleaf 0, ebx[22:31]+1 — the same
 # leaf CpuId's `cachesize` parses for sizes. The derived way size (_L1_WAY_BYTES) is the address stride
 # at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
 # index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
 # Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
-const _L1D_ASSOC = @load_preference("l1d_assoc",
+const _L1D_ASSOC = @load_preference(
+    "l1d_assoc",
     let w = try
             leaf = cpuvendor() === :AMD ? 0x8000_001d : 0x0000_0004
             eax, ebx, _, _ = cpuid(leaf, 0x0000_0000)
             # subleaf 0 must be a level-1 data/unified cache (eax[0:4] type≠0, eax[5:7] level==1)
-            (eax & 0x1f) != 0 && ((eax >> 5) & 0x7) == 1 ? Int(1 + (ebx >> 22) & 0x03ff) : 0
-        catch; 0 end
+            (eax & 0x1f) != 0 && ((eax >> 5) & 0x07) == 1 ? Int(1 + (ebx >> 22) & 0x03ff) : 0
+        catch
+            0
+        end
         w > 0 ? w : 8
-    end)::Int
+    end
+)::Int
 const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
@@ -78,20 +88,38 @@ end
 
 # L3 TOTAL size in bytes. NOTE: CPUSummary.cache_size(Val(3)) returns a PER-CORE SHARE (wintermute: 2.67M),
 # but L3 is shared — nc blocking wants the TOTAL. CpuId.cachesize()[3] gives the total (16M). Fallback 8M.
-const _L3_BYTES = @load_preference("l3_bytes",
-    let s = try Int(cachesize()[3]) catch; 0 end; s > 0 ? s : 8 * 1024 * 1024 end)::Int
+const _L3_BYTES = @load_preference(
+    "l3_bytes",
+    let s = try
+            Int(cachesize()[3])
+        catch
+            0
+        end
+        s > 0 ? s : 8 * 1024 * 1024
+    end
+)::Int
 
 # ── AutoTune (req#8): derive machine-dependent tuning from detected cache + ISA + µarch, NOT hardcoded
 # per-µarch literals. Julia JITs to the host, so we COMPUTE block sizes for the ACTUAL machine (incl. CPUs
 # never benchmarked) — the structural advantage over static C/Rust BLAS. Every formula is a pure function
 # of these load-time consts, so it const-folds (no runtime CpuId); every consumer keeps its Preferences
 # override. Validated to reproduce the fleet's measured optima (see test/autotune_tests.jl). ─────────────
-const _CPU_VENDOR = try cpuvendor() catch; :Unknown end
+const _CPU_VENDOR = try
+    cpuvendor()
+catch
+    :Unknown
+end
 # CpuId.cpumodel()[:Family] is raw-packed (ext<<4 | base); display family adds ext only when base==0xF
 # (wintermute: raw 0xaf → 0xF + 0xA = 0x19 = Zen4; Zen5 = 0x1A). Baked to a const, Preferences-overridable.
-_display_family(raw::Integer) = (raw & 0xF) == 0xF ? Int(raw & 0xF) + Int(raw >> 4) : Int(raw & 0xF)
-const _CPU_FAMILY = @load_preference("cpu_family",
-    try _display_family(cpumodel()[:Family]) catch; 0 end)::Int
+_display_family(raw::Integer) = (raw & 0x0F) == 0x0F ? Int(raw & 0x0F) + Int(raw >> 4) : Int(raw & 0x0F)
+const _CPU_FAMILY = @load_preference(
+    "cpu_family",
+    try
+        _display_family(cpumodel()[:Family])
+    catch
+        0
+    end
+)::Int
 # Architectural vector registers: 32 (AVX-512, AArch64 NEON) vs 16 (AVX2/SSE) — the register budget cap.
 const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 
@@ -99,8 +127,10 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # the derivation functions below const-fold when called with `_HW`). The functions take a `hw` arg (not the
 # globals) so they are PURE and the fleet table is an offline unit test (test/autotune_tests.jl feeds
 # galen/Zen4/Zen5/TigerLake descriptors and asserts the measured optima). req#8.
-const _HW = (simd = _SIMD_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
-             vendor = _CPU_VENDOR, family = _CPU_FAMILY, nvreg = _NVREG)
+const _HW = (
+    simd = _SIMD_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
+    vendor = _CPU_VENDOR, family = _CPU_FAMILY, nvreg = _NVREG,
+)
 
 @inline _lanes(hw, ::Type{T}) where {T} = max(1, hw.simd ÷ sizeof(T))
 # Double-pumped SIMD: full-width registers but HALF-width FP datapath (a 512-bit op occupies the 256-bit
@@ -118,7 +148,8 @@ const _HW = (simd = _SIMD_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
 const _ILP_TARGET = 16
 @inline _at_gemm_nr(hw, ::Type{T} = Float64) where {T} = max(_lanes(hw, T), _ILP_TARGET ÷ _lanes(hw, T))
 @inline function _at_gemm_mr(hw, ::Type{T} = Float64) where {T}                               # MR (row W-blocks)
-    nr = _at_gemm_nr(hw, T); min(cld(_ILP_TARGET, nr), (hw.nvreg - 1) ÷ (nr + 1))              # capped by reg budget
+    nr = _at_gemm_nr(hw, T)
+    return min(cld(_ILP_TARGET, nr), (hw.nvreg - 1) ÷ (nr + 1))              # capped by reg budget
 end
 # Below max(m,n,k) ≤ this, the single-row unpacked tile beats the full _MR·W-row tile (can't fill one full
 # tile of rows, so its 16-acc setup doesn't amortize). Criterion: the full tile's row height _MR·W. req#8
@@ -131,10 +162,12 @@ end
 @inline _at_gemm_kc(hw, ::Type{T} = Float64) where {T} = _l1_block(hw, T, _at_gemm_nr(hw, T))  # B micropanel ≤ ½·L1
 # (b) L2/L3 blocks — A block ≤ ~30% L2 (rest streams B/C/prefetch); B block ≤ ¼ shared L3, po2-dodged.
 @inline function _at_gemm_mc(hw, ::Type{T} = Float64) where {T}
-    kc = _at_gemm_kc(hw, T); _round_dn(((hw.l2 * 3) ÷ 10) ÷ (kc * sizeof(T)), _at_gemm_mr(hw, T) * _lanes(hw, T))
+    kc = _at_gemm_kc(hw, T)
+    return _round_dn(((hw.l2 * 3) ÷ 10) ÷ (kc * sizeof(T)), _at_gemm_mr(hw, T) * _lanes(hw, T))
 end
 @inline function _at_gemm_nc(hw, ::Type{T} = Float64) where {T}
-    nr = _at_gemm_nr(hw, T); _avoid_po2(_round_dn((hw.l3 ÷ 4) ÷ (_at_gemm_kc(hw, T) * sizeof(T)), nr), nr)
+    nr = _at_gemm_nr(hw, T)
+    return _avoid_po2(_round_dn((hw.l3 ÷ 4) ÷ (_at_gemm_kc(hw, T) * sizeof(T)), nr), nr)
 end
 # (e) Short-k split-reduction tile (small-n, wide-AVX-512 only). The wide steady-state tile (_MR×_NR)
 # UNDER-FILLS at short k: each C-cell's reduction chain is only k deep, so during the fill few independent
@@ -194,7 +227,7 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gemm_unpack_max(hw, ::Type{T} = Float64) where {T} = 2 * _acc_cap(hw, T)
 @inline function _at_rank_k_pack_cut(hw, ::Type{T} = Float64) where {T}
     W = _lanes(hw, T)
-    (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : (7 * _acc_cap(hw, T)) >> 2   # unified single-pack vs AVX2 multi-pack
+    return (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : (7 * _acc_cap(hw, T)) >> 2   # unified single-pack vs AVX2 multi-pack
 end
 # symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
 # copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the

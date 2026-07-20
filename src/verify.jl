@@ -33,20 +33,20 @@ _strict_gesvd_probe(Gw, G0, U, S, Vt) = (copyto!(Gw, G0); gesvd!(Gw, U, S, Vt); 
 
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
-        xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
-        Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
-        uz = ones(ComplexF64, m), wz = ones(ComplexF64, m),
-        C3 = ones(m, m), A3 = ones(m, m), B3 = ones(m, m), Bt = ones(m, m), At = ones(m, m),
-        Cz3 = ones(ComplexF64, m, m), Az3 = ones(ComplexF64, m, m), Bz3 = ones(ComplexF64, m, m),
-        # SPD/non-singular source (diagonally dominant: diag m+1, off-diag 1) + a working copy the
-        # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
-        Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
-        ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
-        # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
-        kb = 8, APd = ones(m * (m + 1) ÷ 2), APz = ones(ComplexF64, m * (m + 1) ÷ 2),
-        ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m),
-        # gesvd in-place output buffers (square m×m: U m×m, S m, Vᵀ m×m).
-        Usv = zeros(m, m), Ssv = zeros(m), Vtsv = zeros(m, m)
+            xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
+            Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
+            uz = ones(ComplexF64, m), wz = ones(ComplexF64, m),
+            C3 = ones(m, m), A3 = ones(m, m), B3 = ones(m, m), Bt = ones(m, m), At = ones(m, m),
+            Cz3 = ones(ComplexF64, m, m), Az3 = ones(ComplexF64, m, m), Bz3 = ones(ComplexF64, m, m),
+            # SPD/non-singular source (diagonally dominant: diag m+1, off-diag 1) + a working copy the
+            # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
+            Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
+            ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
+            # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
+            kb = 8, APd = ones(m * (m + 1) ÷ 2), APz = ones(ComplexF64, m * (m + 1) ÷ 2),
+            ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m),
+            # gesvd in-place output buffers (square m×m: U m×m, S m, Vᵀ m×m).
+            Usv = zeros(m, m), Ssv = zeros(m), Vtsv = zeros(m, m)
         # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
         # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
         # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
@@ -130,7 +130,9 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         # Trim-compatibility guarantee (contracts.jl): the complex unpacked gemm kernel is the trim-critical
         # path (its runtime bool→Val flags were the union-split that regressed zgemm_64_/cgemm_64_). Fast/dev
         # here → heuristic; the full-mode dogfood roots the same call under juliac's authoritative verifier.
-        @assert_trim_compatible _gemm_cmplx_unpacked!(Val(1), Val(1), false, m, m, m,
-            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3)
+        @assert_trim_compatible _gemm_cmplx_unpacked!(
+            Val(1), Val(1), false, m, m, m,
+            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3
+        )
     end
 end
