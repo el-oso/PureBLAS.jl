@@ -423,3 +423,28 @@ end
         PureBLAS.deactivate()
     end
 end
+
+# ── OpenBLAS-removal GATE (the contract) ──────────────────────────────────────────────────────────────
+# Enumerates EVERY LAPACK symbol LinearAlgebra can ccall (parsed from stdlib lapack.jl) and asserts how
+# many still fall through to OpenBLAS after activate() (pointer unchanged vs pre-activate). This is the
+# machine-checkable definition of "removed OpenBLAS": the RATCHET only decreases. Tighten _FALLTHROUGH_MAX
+# toward 0 as symbols are forwarded; a NEW fallthrough (regression) or exceeding the baseline fails CI.
+# North-star: _FALLTHROUGH_MAX == 0 (nothing reaches OpenBLAS). Current baseline is the honest count.
+@testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
+    using LinearAlgebra, PureBLAS
+    const B = LinearAlgebra.BLAS
+    _FALLTHROUGH_MAX = 90   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
+    syms = Set{String}()
+    for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end
+    gf(s) = B.lbt_get_forward(s, B.LBT_INTERFACE_ILP64, B.LBT_F2C_PLAIN)
+    pre = Dict(s => gf(s) for s in syms)
+    PureBLAS.activate()
+    try
+        resid = sort([s for s in syms if gf(s) == pre[s]])
+        @info "OpenBLAS fallthrough" total = length(syms) forwarded = length(syms) - length(resid) still_openblas = length(resid) residual = join(resid, " ")
+        @test length(resid) <= _FALLTHROUGH_MAX
+    finally
+        PureBLAS.deactivate()
+    end
+end
