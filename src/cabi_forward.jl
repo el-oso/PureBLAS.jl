@@ -631,11 +631,35 @@ for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))  # co
         (_CU, _CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI,
          Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, Ptr{$Tr}, _CI, Clong, Clong, Clong)))
 end
-# tgsen (COMPLEX only — cabi_lapack3.jl). Integer ijob/wantq/wantz (no chars → no Clong); pl/pr/dif Ptr{Cvoid}.
+# tgsen (cabi_lapack3.jl). Integer ijob/wantq/wantz (no chars → no Clong); pl/pr/dif Ptr{Cvoid}. COMPLEX
+# has alpha/beta (2 vecs); REAL has alphar/alphai/beta (3 vecs).
 for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
     @eval _reg!($(p * "tgsen_"), () -> @cfunction($(Symbol(p, "tgsen_64_")), Cvoid,
         (_CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI,
          Ptr{$T}, _CI, _CI, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{$T}, _CI, _CI, _CI, _CI)))
+end
+for (p, T) in (("s", Float32), ("d", Float64))   # real: alphar, alphai, beta (3× Ptr{T})
+    @eval _reg!($(p * "tgsen_"), () -> @cfunction($(Symbol(p, "tgsen_64_")), Cvoid,
+        (_CI, _CI, _CI, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI,
+         Ptr{$T}, _CI, _CI, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{$T}, _CI, _CI, _CI, _CI)))
+end
+# gesvx (cabi_lapack3.jl). 3 chars (fact/trans/equed → 3 Clong). REAL: R/C/rcond/ferr/berr/work all real,
+# trailing iwork. COMPLEX: those five REAL (Ptr{Tr}), trailing rwork (Ptr{Tr}); work is complex (Ptr{T}).
+for (p, T) in (("s", Float32), ("d", Float64))   # real: Tr = T; slot before info is iwork (_CI)
+    @eval _reg!($(p * "gesvx_"), () -> @cfunction($(Symbol(p, "gesvx_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CU, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI,
+         Ptr{$T}, _CI, Ptr{$T}, Ptr{$T}, Ptr{$T}, Ptr{$T}, _CI, _CI, Clong, Clong, Clong)))
+end
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))  # complex: real R/C/rcond/ferr/berr + rwork
+    @eval _reg!($(p * "gesvx_"), () -> @cfunction($(Symbol(p, "gesvx_64_")), Cvoid,
+        (_CU, _CU, _CI, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI, _CI, _CU, Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, _CI,
+         Ptr{$T}, _CI, Ptr{$Tr}, Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, Ptr{$Tr}, _CI, Clong, Clong, Clong)))
+end
+# bdsqr (COMPLEX — cabi_lapack3.jl). d/e/rwork REAL; Vt/U/C complex. 1 char (uplo → 1 Clong).
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval _reg!($(p * "bdsqr_"), () -> @cfunction($(Symbol(p, "bdsqr_64_")), Cvoid,
+        (_CU, _CI, _CI, _CI, _CI, Ptr{$Tr}, Ptr{$Tr}, Ptr{$T}, _CI, Ptr{$T}, _CI, Ptr{$T}, _CI,
+         Ptr{$Tr}, _CI, Clong)))
 end
 # gebak — undo gebal's balancing on eigen/Schur vectors.
 for (p, T, Tr) in (("s", Float32, Float32), ("d", Float64, Float64),

@@ -599,6 +599,285 @@ function bdsqr!(d::AbstractVector{Float64}, e::AbstractVector{Float64}, U, V)
     return d
 end
 
+# ── Complex bidiagonal SVD: LAPACK {c,z}bdsqr (Demmel–Kahan implicit-zero-shift QR). The bidiagonal B
+# is REAL (diag d, off-diag e); the Givens rotations are REAL but accumulate into COMPLEX Vt (right
+# rotations on ROWS), U (left rotations on COLUMNS), C (left rotations on ROWS). This is the ROBUST
+# sweep (correct on clustered/graded σ) — NOT the simplified real bdsqr! above. Control flow mirrors
+# Reference-LAPACK dbdsqr.f (tol>0 relative-accuracy path); reuses _lartg/_lasv2/_qz_safmin (qz.jl) +
+# _swap_cols! (above). Validated bit-identical σ to OpenBLAS {c,z}bdsqr across clustered/graded/scaled.
+
+# DLAS2: singular values of the 2×2 upper-triangular [f g; 0 h] (overflow/underflow-safe), for the shift.
+@inline function _las2(f::R, g::R, h::R) where {R<:Real}
+    fa = abs(f); ga = abs(g); ha = abs(h)
+    fhmn = min(fa, ha); fhmx = max(fa, ha)
+    if fhmn == zero(R)
+        ssmin = zero(R)
+        if fhmx == zero(R)
+            ssmax = ga
+        else
+            mn = min(fhmx, ga); mx = max(fhmx, ga)
+            ssmax = mx * sqrt(one(R) + (mn / mx)^2)
+        end
+        return ssmin, ssmax
+    end
+    if ga < fhmx
+        as = one(R) + fhmn / fhmx
+        at = (fhmx - fhmn) / fhmx
+        au = (ga / fhmx)^2
+        c = R(2) / (sqrt(as * as + au) + sqrt(at * at + au))
+        return fhmn * c, fhmx / c
+    end
+    au = fhmx / ga
+    if au == zero(R)
+        return (fhmn * fhmx) / ga, ga
+    end
+    as = one(R) + fhmn / fhmx
+    at = (fhmx - fhmn) / fhmx
+    c = one(R) / (sqrt(one(R) + (as * au)^2) + sqrt(one(R) + (at * au)^2))
+    ssmin = (fhmn * c) * au
+    return ssmin + ssmin, ga / (c + c)
+end
+
+# Real Givens on complex ROWS (i1,i2): [c s; −s c] convention (matches _lartg), dlasr 'L'.
+@inline function _rot_rows_cx!(M::AbstractMatrix, i1::Int, i2::Int, c::R, s::R) where {R<:Real}
+    @inbounds for j in 1:size(M, 2)
+        a = M[i1, j]; b = M[i2, j]
+        M[i1, j] = c * a + s * b
+        M[i2, j] = c * b - s * a
+    end
+    return M
+end
+# Real Givens on complex COLUMNS (j1,j2) — dlasr 'R'.
+@inline function _rot_cols_cx!(M::AbstractMatrix, j1::Int, j2::Int, c::R, s::R) where {R<:Real}
+    @inbounds for i in 1:size(M, 1)
+        a = M[i, j1]; b = M[i, j2]
+        M[i, j1] = c * a + s * b
+        M[i, j2] = c * b - s * a
+    end
+    return M
+end
+@inline function _negate_row_cx!(M::AbstractMatrix, i::Int)
+    @inbounds for j in 1:size(M, 2); M[i, j] = -M[i, j]; end
+    return M
+end
+@inline function _swap_rows_cx!(M::AbstractMatrix, i1::Int, i2::Int)
+    @inbounds for j in 1:size(M, 2); M[i1, j], M[i2, j] = M[i2, j], M[i1, j]; end
+    return M
+end
+
+# bdsqr!(uplo, d, e, Vt, U, C) — the {c,z}bdsqr_64_ entry. d,e REAL; Vt (n×ncvt), U (nru×n), C (n×ncc)
+# COMPLEX, any may be empty (rotations no-op). On exit d holds σ (≥0, DESCENDING), e destroyed; with
+# Vt=U=C=I on entry, B₀ = U·Diagonal(d)·Vt. Returns (d, Vt, U, C).
+function bdsqr!(uplo::AbstractChar, d::AbstractVector{R}, e::AbstractVector{R},
+        Vt::AbstractMatrix{Complex{R}}, U::AbstractMatrix{Complex{R}},
+        C::AbstractMatrix{Complex{R}}) where {R<:AbstractFloat}
+    n = length(d)
+    (uplo == 'U' || uplo == 'L') || throw(ArgumentError("bdsqr!: uplo must be 'U' or 'L'"))
+    length(e) >= n - 1 || throw(DimensionMismatch("bdsqr!: e must have length >= n-1"))
+    !isempty(Vt) && size(Vt, 1) != n && throw(DimensionMismatch("bdsqr!: size(Vt,1) != n"))
+    !isempty(U) && size(U, 2) != n && throw(DimensionMismatch("bdsqr!: size(U,2) != n"))
+    !isempty(C) && size(C, 1) != n && throw(DimensionMismatch("bdsqr!: size(C,1) != n"))
+    n == 0 && return d, Vt, U, C
+    if n == 1
+        @inbounds if d[1] < zero(R)
+            d[1] = -d[1]; _negate_row_cx!(Vt, 1)
+        end
+        return d, Vt, U, C
+    end
+    epsv = eps(R) / 2
+    unfl = _qz_safmin(R)
+    if uplo == 'L'
+        @inbounds for i in 1:n-1
+            cs, sn, r = _lartg(d[i], e[i])
+            d[i] = r; e[i] = sn * d[i+1]; d[i+1] = cs * d[i+1]
+            _rot_cols_cx!(U, i, i + 1, cs, sn)
+            _rot_rows_cx!(C, i, i + 1, cs, sn)
+        end
+    end
+    tolmul = max(R(10), min(R(100), epsv^(-R(1) / 8)))
+    tol = tolmul * epsv
+    smax = zero(R)
+    @inbounds for i in 1:n; smax = max(smax, abs(d[i])); end
+    @inbounds for i in 1:n-1; smax = max(smax, abs(e[i])); end
+    smax == zero(R) && return d, Vt, U, C
+    sminoa = abs(@inbounds d[1])
+    if sminoa != zero(R)
+        mu = sminoa
+        @inbounds for i in 2:n
+            mu = abs(d[i]) * (mu / (mu + abs(e[i-1])))
+            sminoa = min(sminoa, mu)
+            sminoa == zero(R) && break
+        end
+    end
+    sminoa /= sqrt(R(n))
+    maxitr = 6
+    thresh = max(tol * sminoa, R(maxitr * n) * (R(n) * unfl))
+    maxit = maxitr * n * n
+    iter = 0
+    oldll = -1; oldm = -1; idir = 0
+    m = n
+    while m > 1
+        iter > maxit && error("bdsqr!: the QR iteration failed to converge")
+        smax_b = abs(@inbounds d[m]); ll = 0; split = false
+        @inbounds for lll in 1:m-1
+            llc = m - lll; abse = abs(e[llc])
+            if abse <= thresh
+                ll = llc; split = true; break
+            end
+            smax_b = max(smax_b, abs(d[llc]), abse)
+        end
+        if split
+            @inbounds e[ll] = zero(R)
+            if ll == m - 1
+                m -= 1; continue
+            end
+        end
+        ll += 1
+        if ll == m - 1
+            @inbounds begin
+                sigmn, sigmx, sinr, cosr, sinl, cosl = _lasv2(d[m-1], e[m-1], d[m])
+                d[m-1] = sigmx; e[m-1] = zero(R); d[m] = sigmn
+            end
+            _rot_rows_cx!(Vt, m - 1, m, cosr, sinr)
+            _rot_cols_cx!(U, m - 1, m, cosl, sinl)
+            _rot_rows_cx!(C, m - 1, m, cosl, sinl)
+            m -= 2; continue
+        end
+        if ll > oldm || m < oldll
+            idir = abs(@inbounds d[ll]) >= abs(@inbounds d[m]) ? 1 : 2
+        end
+        converged = false; sminl = zero(R)
+        if idir == 1
+            @inbounds if abs(e[m-1]) <= tol * abs(d[m])
+                e[m-1] = zero(R); converged = true
+            else
+                mu = abs(d[ll]); sminl = mu
+                for lll in ll:m-1
+                    if abs(e[lll]) <= tol * mu
+                        e[lll] = zero(R); converged = true; break
+                    end
+                    mu = abs(d[lll+1]) * (mu / (mu + abs(e[lll]))); sminl = min(sminl, mu)
+                end
+            end
+        else
+            @inbounds if abs(e[ll]) <= tol * abs(d[ll])
+                e[ll] = zero(R); converged = true
+            else
+                mu = abs(d[m]); sminl = mu
+                for lll in m-1:-1:ll
+                    if abs(e[lll]) <= tol * mu
+                        e[lll] = zero(R); converged = true; break
+                    end
+                    mu = abs(d[lll]) * (mu / (mu + abs(e[lll]))); sminl = min(sminl, mu)
+                end
+            end
+        end
+        converged && continue
+        oldll = ll; oldm = m
+        shift = zero(R)
+        if !(R(n) * tol * (sminl / smax_b) <= max(epsv, R(1) / 100 * tol))
+            @inbounds if idir == 1
+                sll = abs(d[ll]); shift, _ = _las2(d[m-1], e[m-1], d[m])
+            else
+                sll = abs(d[m]); shift, _ = _las2(d[ll], e[ll], d[ll+1])
+            end
+            sll > zero(R) && (shift / sll)^2 < epsv && (shift = zero(R))
+        end
+        iter += m - ll
+        if shift == zero(R)
+            if idir == 1
+                cs = one(R); oldcs = one(R); sn = zero(R); oldsn = zero(R)
+                @inbounds for i in ll:m-1
+                    cs, sn, r = _lartg(d[i] * cs, e[i])
+                    i > ll && (e[i-1] = oldsn * r)
+                    oldcs, oldsn, dnew = _lartg(oldcs * r, d[i+1] * sn)
+                    d[i] = dnew
+                    _rot_rows_cx!(Vt, i, i + 1, cs, sn)
+                    _rot_cols_cx!(U, i, i + 1, oldcs, oldsn)
+                    _rot_rows_cx!(C, i, i + 1, oldcs, oldsn)
+                end
+                @inbounds begin
+                    h = d[m] * cs; d[m] = h * oldcs; e[m-1] = h * oldsn
+                    abs(e[m-1]) <= thresh && (e[m-1] = zero(R))
+                end
+            else
+                cs = one(R); oldcs = one(R); sn = zero(R); oldsn = zero(R)
+                @inbounds for i in m:-1:ll+1
+                    cs, sn, r = _lartg(d[i] * cs, e[i-1])
+                    i < m && (e[i] = oldsn * r)
+                    oldcs, oldsn, dnew = _lartg(oldcs * r, d[i-1] * sn)
+                    d[i] = dnew
+                    _rot_rows_cx!(Vt, i - 1, i, oldcs, -oldsn)
+                    _rot_cols_cx!(U, i - 1, i, cs, -sn)
+                    _rot_rows_cx!(C, i - 1, i, cs, -sn)
+                end
+                @inbounds begin
+                    h = d[ll] * cs; d[ll] = h * oldcs; e[ll] = h * oldsn
+                    abs(e[ll]) <= thresh && (e[ll] = zero(R))
+                end
+            end
+        else
+            if idir == 1
+                @inbounds begin
+                    f = (abs(d[ll]) - shift) * (copysign(one(R), d[ll]) + shift / d[ll]); g = e[ll]
+                end
+                @inbounds for i in ll:m-1
+                    cosr, sinr, r = _lartg(f, g)
+                    i > ll && (e[i-1] = r)
+                    f = cosr * d[i] + sinr * e[i]; e[i] = cosr * e[i] - sinr * d[i]
+                    g = sinr * d[i+1]; d[i+1] = cosr * d[i+1]
+                    cosl, sinl, r = _lartg(f, g)
+                    d[i] = r; f = cosl * e[i] + sinl * d[i+1]; d[i+1] = cosl * d[i+1] - sinl * e[i]
+                    if i < m - 1
+                        g = sinl * e[i+1]; e[i+1] = cosl * e[i+1]
+                    end
+                    _rot_rows_cx!(Vt, i, i + 1, cosr, sinr)
+                    _rot_cols_cx!(U, i, i + 1, cosl, sinl)
+                    _rot_rows_cx!(C, i, i + 1, cosl, sinl)
+                end
+                @inbounds begin
+                    e[m-1] = f; abs(e[m-1]) <= thresh && (e[m-1] = zero(R))
+                end
+            else
+                @inbounds begin
+                    f = (abs(d[m]) - shift) * (copysign(one(R), d[m]) + shift / d[m]); g = e[m-1]
+                end
+                @inbounds for i in m:-1:ll+1
+                    cosr, sinr, r = _lartg(f, g)
+                    i < m && (e[i] = r)
+                    f = cosr * d[i] + sinr * e[i-1]; e[i-1] = cosr * e[i-1] - sinr * d[i]
+                    g = sinr * d[i-1]; d[i-1] = cosr * d[i-1]
+                    cosl, sinl, r = _lartg(f, g)
+                    d[i] = r; f = cosl * e[i-1] + sinl * d[i-1]; d[i-1] = cosl * d[i-1] - sinl * e[i-1]
+                    if i > ll + 1
+                        g = sinl * e[i-2]; e[i-2] = cosl * e[i-2]
+                    end
+                    _rot_rows_cx!(Vt, i - 1, i, cosl, -sinl)
+                    _rot_cols_cx!(U, i - 1, i, cosr, -sinr)
+                    _rot_rows_cx!(C, i - 1, i, cosr, -sinr)
+                end
+                @inbounds begin
+                    e[ll] = f; abs(e[ll]) <= thresh && (e[ll] = zero(R))
+                end
+            end
+        end
+    end
+    @inbounds for i in 1:n
+        if d[i] < zero(R)
+            d[i] = -d[i]; _negate_row_cx!(Vt, i)
+        end
+    end
+    @inbounds for i in 1:n-1
+        k = i
+        for j in i+1:n; d[j] > d[k] && (k = j); end
+        if k != i
+            d[i], d[k] = d[k], d[i]
+            _swap_rows_cx!(Vt, i, k); _swap_cols!(U, i, k); _swap_rows_cx!(C, i, k)
+        end
+    end
+    return d, Vt, U, C
+end
+
 @inline function _rot_cols_negate!(M::AbstractMatrix{Float64}, j::Int)
     @inbounds for i in 1:size(M, 1)
         M[i, j] = -M[i, j]
