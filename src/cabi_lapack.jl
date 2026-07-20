@@ -2284,66 +2284,87 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
     end
 end
 
-# ── ggsvd / ggsvd3: generalized SVD of the pair (A,B) — FLOAT64 FULL-RANK ONLY. The kernel (ggsvd.jl)
-# has no complex or rank-deficient path (needs complex SVD-with-vectors / dggsvp3 zero-block pivoting,
-# neither implemented) — c/z are intentionally NOT registered here (honest coverage gap, see report).
-# The kernel always computes U/V/Q/alpha/beta/R regardless of job; 'N' jobs just skip writing that
-# (zero-sized, per the LAPACK-side wrapper) output buffer. R is additionally written back into A's
-# leading n×n block when m≥n (approximates the LAPACK on-exit "R lives in A" convention for that shape;
-# the m<n split-across-A-and-B case is left as-is — a further honest limitation).
-@inline function _ggsvd_cabi!(ju::Char, jv::Char, jq::Char, M::Int, N::Int, P::Int,
-        A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int, alpha::Ptr{Float64}, beta::Ptr{Float64},
-        U::Ptr{Float64}, ldu::Int, V::Ptr{Float64}, ldv::Int, Q::Ptr{Float64}, ldq::Int,
-        k::Ptr{Int64}, l::Ptr{Int64}, info::Ptr{Int64})
+# ── ggsvd / ggsvd3: generalized SVD of the pair (A,B) — RANK-DEFICIENT-capable, ALL FOUR types (the
+# ggsvd.jl kernel now does dggsvp rank-revealing preprocessing + dtgsja/ztgsja). The kernel mutates A/B
+# IN PLACE to the LAPACK on-exit layout (R lives in A, or A+B for m<n) — the C caller reads R from there
+# — so this helper only copies U/V/Q/alpha/beta/k/l out. alpha/beta are REAL. 'N' jobs skip that output.
+@inline function _ggsvd_cabi!(::Type{T}, ::Type{Tr}, ju::Char, jv::Char, jq::Char, M::Int, N::Int, P::Int,
+        A::Ptr{T}, lda::Int, B::Ptr{T}, ldb::Int, alpha::Ptr{Tr}, beta::Ptr{Tr},
+        U::Ptr{T}, ldu::Int, V::Ptr{T}, ldv::Int, Q::Ptr{T}, ldq::Int,
+        k::Ptr{Int64}, l::Ptr{Int64}, info::Ptr{Int64}) where {T,Tr}
     Am = PtrMatrix(A, M, N, lda); Bm = PtrMatrix(B, P, N, ldb)
-    res = ggsvd!(Am, Bm)
+    Uo, Vo, Qo, ao, bo, ko, lo, _ = ggsvd!(ju, jv, jq, Am, Bm)   # mutates Am/Bm in place → R lands in A/B
     ap = PtrVector(alpha, N); bp = PtrVector(beta, N)
-    @inbounds for i in 1:N; ap[i] = res.alpha[i]; bp[i] = res.beta[i]; end
+    @inbounds for i in 1:N; ap[i] = ao[i]; bp[i] = bo[i]; end
     if ju == 'U'
-        Um = PtrMatrix(U, M, M, ldu)
-        @inbounds for j in 1:M, i in 1:M; Um[i, j] = res.U[i, j]; end
+        Um = PtrMatrix(U, M, M, ldu); @inbounds for j in 1:M, i in 1:M; Um[i, j] = Uo[i, j]; end
     end
     if jv == 'V'
-        Vm = PtrMatrix(V, P, P, ldv)
-        @inbounds for j in 1:P, i in 1:P; Vm[i, j] = res.V[i, j]; end
+        Vm = PtrMatrix(V, P, P, ldv); @inbounds for j in 1:P, i in 1:P; Vm[i, j] = Vo[i, j]; end
     end
     if jq == 'Q'
-        Qm = PtrMatrix(Q, N, N, ldq)
-        @inbounds for j in 1:N, i in 1:N; Qm[i, j] = res.Q[i, j]; end
+        Qm = PtrMatrix(Q, N, N, ldq); @inbounds for j in 1:N, i in 1:N; Qm[i, j] = Qo[i, j]; end
     end
-    if M >= N                                          # write R back into A (LAPACK on-exit convention)
-        @inbounds for j in 1:N, i in 1:min(j, N); Am[i, j] = res.R[i, j]; end
-    end
-    unsafe_store!(k, Int64(res.k)); unsafe_store!(l, Int64(res.l)); unsafe_store!(info, Int64(0))
+    unsafe_store!(k, Int64(ko)); unsafe_store!(l, Int64(lo)); unsafe_store!(info, Int64(0))
     return
 end
-# dggsvd_64_(jobu,jobv,jobq,m,n,p,k,l,A,lda,B,ldb,alpha,beta,U,ldu,V,ldv,Q,ldq,work,iwork,info,+3 lens)
-# — 3 chars, NO lwork query (fixed LAPACK work array; PureBLAS owns its own scratch).
-Base.@ccallable function dggsvd_64_(jobu::Ptr{UInt8}, jobv::Ptr{UInt8}, jobq::Ptr{UInt8}, m::Ptr{Int64},
-        n::Ptr{Int64}, p::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
-        B::Ptr{Float64}, ldb::Ptr{Int64}, alpha::Ptr{Float64}, beta::Ptr{Float64}, U::Ptr{Float64},
-        ldu::Ptr{Int64}, V::Ptr{Float64}, ldv::Ptr{Int64}, Q::Ptr{Float64}, ldq::Ptr{Int64},
-        work::Ptr{Float64}, iwork::Ptr{Int64}, info::Ptr{Int64},
-        lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
-    _ggsvd_cabi!(_cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
-        Int(unsafe_load(n)), Int(unsafe_load(p)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
-        alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
-        k, l, info)
-    return
-end
-# dggsvd3_64_ — same shape + lwork query (LAPACK≥3.6 blocked driver; Julia≥1.9's ggsvd3! calls this).
-Base.@ccallable function dggsvd3_64_(jobu::Ptr{UInt8}, jobv::Ptr{UInt8}, jobq::Ptr{UInt8}, m::Ptr{Int64},
-        n::Ptr{Int64}, p::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
-        B::Ptr{Float64}, ldb::Ptr{Int64}, alpha::Ptr{Float64}, beta::Ptr{Float64}, U::Ptr{Float64},
-        ldu::Ptr{Int64}, V::Ptr{Float64}, ldv::Ptr{Int64}, Q::Ptr{Float64}, ldq::Ptr{Int64},
-        work::Ptr{Float64}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, info::Ptr{Int64},
-        lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
-    if unsafe_load(lwork) == Int64(-1)
-        unsafe_store!(work, 1.0); unsafe_store!(info, Int64(0)); return
+# {s,d}ggsvd_64_(jobu,jobv,jobq,m,n,p,k,l,A,lda,B,ldb,alpha,beta,U,ldu,V,ldv,Q,ldq,work,iwork,info,+3 lens)
+# REAL: work real, trailing iwork. — 3 chars, NO lwork query (PureBLAS owns its own scratch).
+for (p, T) in (("s", Float32), ("d", Float64))
+    @eval Base.@ccallable function $(Symbol(p, "ggsvd_64_"))(jobu::Ptr{UInt8}, jobv::Ptr{UInt8},
+            jobq::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, pp::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64}, alpha::Ptr{$T}, beta::Ptr{$T},
+            U::Ptr{$T}, ldu::Ptr{Int64}, V::Ptr{$T}, ldv::Ptr{Int64}, Q::Ptr{$T}, ldq::Ptr{Int64},
+            work::Ptr{$T}, iwork::Ptr{Int64}, info::Ptr{Int64}, lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
+        _ggsvd_cabi!($T, $T, _cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
+            Int(unsafe_load(n)), Int(unsafe_load(pp)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
+            alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
+            k, l, info)
+        return
     end
-    _ggsvd_cabi!(_cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
-        Int(unsafe_load(n)), Int(unsafe_load(p)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
-        alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
-        k, l, info)
-    return
+    @eval Base.@ccallable function $(Symbol(p, "ggsvd3_64_"))(jobu::Ptr{UInt8}, jobv::Ptr{UInt8},
+            jobq::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, pp::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64}, alpha::Ptr{$T}, beta::Ptr{$T},
+            U::Ptr{$T}, ldu::Ptr{Int64}, V::Ptr{$T}, ldv::Ptr{Int64}, Q::Ptr{$T}, ldq::Ptr{Int64},
+            work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, info::Ptr{Int64},
+            lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        _ggsvd_cabi!($T, $T, _cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
+            Int(unsafe_load(n)), Int(unsafe_load(pp)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
+            alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
+            k, l, info)
+        return
+    end
+end
+# COMPLEX: alpha/beta REAL; extra `rwork` (real) before iwork.
+for (p, T, Tr) in (("c", ComplexF32, Float32), ("z", ComplexF64, Float64))
+    @eval Base.@ccallable function $(Symbol(p, "ggsvd_64_"))(jobu::Ptr{UInt8}, jobv::Ptr{UInt8},
+            jobq::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, pp::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64}, alpha::Ptr{$Tr}, beta::Ptr{$Tr},
+            U::Ptr{$T}, ldu::Ptr{Int64}, V::Ptr{$T}, ldv::Ptr{Int64}, Q::Ptr{$T}, ldq::Ptr{Int64},
+            work::Ptr{$T}, rwork::Ptr{$Tr}, iwork::Ptr{Int64}, info::Ptr{Int64},
+            lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
+        _ggsvd_cabi!($T, $Tr, _cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
+            Int(unsafe_load(n)), Int(unsafe_load(pp)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
+            alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
+            k, l, info)
+        return
+    end
+    @eval Base.@ccallable function $(Symbol(p, "ggsvd3_64_"))(jobu::Ptr{UInt8}, jobv::Ptr{UInt8},
+            jobq::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64}, pp::Ptr{Int64}, k::Ptr{Int64}, l::Ptr{Int64},
+            A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64}, alpha::Ptr{$Tr}, beta::Ptr{$Tr},
+            U::Ptr{$T}, ldu::Ptr{Int64}, V::Ptr{$T}, ldv::Ptr{Int64}, Q::Ptr{$T}, ldq::Ptr{Int64},
+            work::Ptr{$T}, lwork::Ptr{Int64}, rwork::Ptr{$Tr}, iwork::Ptr{Int64},
+            info::Ptr{Int64}, lju::Clong, ljv::Clong, ljq::Clong)::Cvoid
+        if unsafe_load(lwork) == Int64(-1)
+            unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
+        end
+        _ggsvd_cabi!($T, $Tr, _cabi_char(jobu), _cabi_char(jobv), _cabi_char(jobq), Int(unsafe_load(m)),
+            Int(unsafe_load(n)), Int(unsafe_load(pp)), A, Int(unsafe_load(lda)), B, Int(unsafe_load(ldb)),
+            alpha, beta, U, Int(unsafe_load(ldu)), V, Int(unsafe_load(ldv)), Q, Int(unsafe_load(ldq)),
+            k, l, info)
+        return
+    end
 end

@@ -1092,21 +1092,46 @@ end
     end
 end
 
-@testitem "ggsvd (generalized SVD, Float64 full-rank) vs LAPACK routing — UᵀAQ=Σ₁R, VᵀBQ=Σ₂R" begin
+@testitem "ggsvd (generalized SVD, rank-deficient-capable, s/d/c/z) vs LAPACK — UᴴAQ=D1·[0 R], VᴴBQ=D2·[0 R]" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK as LA
-    @testset "m=$m p=$p n=$n" for (m, p, n) in ((10, 8, 6), (6, 10, 6), (12, 12, 8))
-        A = randn(m, n); B = randn(p, n)
-        res = PureBLAS.ggsvd!(A, B)
-        @test size(res.U) == (m, m) && size(res.V) == (p, p) && size(res.Q) == (n, n)
-        @test maximum(abs, res.U' * res.U - I) < 1e-9
-        @test maximum(abs, res.V' * res.V - I) < 1e-9
-        @test maximum(abs, res.Q' * res.Q - I) < 1e-9
-        @test maximum(abs, res.U' * A * res.Q - res.Sigma1 * res.R) < 1e-8 * (opnorm(A) + 1)
-        @test maximum(abs, res.V' * B * res.Q - res.Sigma2 * res.R) < 1e-8 * (opnorm(B) + 1)
-        @test all(x -> x >= -1e-10, res.alpha) && all(x -> x >= -1e-10, res.beta)
-        @test maximum(abs, res.alpha .^ 2 .+ res.beta .^ 2 .- 1) < 1e-9
-        U, V, Q, alpha, beta, k, l, R = LA.ggsvd3!('U', 'V', 'Q', copy(A), copy(B))
-        @test length(alpha) == n && length(beta) == n
+    # D1/D2 block forms from the LAPACK dggsvd doc
+    function d1d2(::Type{T}, m, p, k, l, alpha, beta) where {T}
+        kl = k + l
+        D1 = zeros(T, m, kl); D2 = zeros(T, p, kl)
+        for i in 1:k; D1[i, i] = 1; end
+        if m - kl >= 0
+            for i in 1:l; D1[k + i, k + i] = alpha[k + i]; D2[i, k + i] = beta[k + i]; end
+        else
+            for i in (k + 1):m; D1[i, i] = alpha[i]; end
+            for i in 1:(m - k); D2[i, k + i] = beta[k + i]; end
+            for i in (m - k + 1):l; D2[i, k + i] = 1; end
+        end
+        return D1, D2
+    end
+    @testset "T=$T m=$m p=$p n=$n rA=$rA rB=$rB" for T in (Float64, Float32, ComplexF64, ComplexF32),
+        (m, p, n) in ((10, 8, 6), (6, 10, 6), (4, 5, 9)), (rA, rB) in ((99, 99), (2, 2))
+
+        RT = real(T)
+        A = rA >= min(m, n) ? randn(T, m, n) : randn(T, m, rA) * randn(T, rA, n)
+        B = rB >= min(p, n) ? randn(T, p, n) : randn(T, p, rB) * randn(T, rB, n)
+        U, V, Q, al, be, k, l, R = PureBLAS.ggsvd!('U', 'V', 'Q', copy(A), copy(B))
+        _, _, _, alo, beo, ko, lo, _ = LA.ggsvd3!('U', 'V', 'Q', copy(A), copy(B))
+        @test (k, l) == (ko, lo)                       # rank parameters match LAPACK exactly
+        @test sort(al) ≈ sort(alo) atol = (RT === Float64 ? 1e-9 : 1e-4)
+        @test sort(be) ≈ sort(beo) atol = (RT === Float64 ? 1e-9 : 1e-4)
+        otol = 100 * max(m, p, n) * eps(RT)
+        @test opnorm(U'U - I) < otol
+        @test opnorm(V'V - I) < otol
+        @test opnorm(Q'Q - I) < otol
+        D1, D2 = d1d2(T, m, p, k, l, al, be)
+        ZR = [zeros(T, k + l, n - k - l) R]
+        rtol = 500 * max(m, p, n) * eps(RT)
+        @test opnorm(U' * A * Q - D1 * ZR) < rtol * (opnorm(A) + 1)
+        @test opnorm(V' * B * Q - D2 * ZR) < rtol * (opnorm(B) + 1)
+        @test maximum(abs, al .^ 2 .+ be .^ 2 .- vcat(ones(RT, k + l), zeros(RT, n - k - l))) < otol
+        # job='N' variants reproduce the same k, l, alpha, beta, R
+        _, _, _, a2, b2, k2, l2, R2 = PureBLAS.ggsvd!('N', 'N', 'N', copy(A), copy(B))
+        @test (k2, l2) == (k, l) && a2 == al && b2 == be && R2 == R
     end
 end

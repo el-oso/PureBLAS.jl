@@ -55,7 +55,7 @@ include("gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — need
 include("trsyl.jl")         # LAPACK: Sylvester solve (trsyl) — standalone
 include("trsen.jl")         # LAPACK: Schur reorder (trexc/trsen) — needs trsyl.jl
 include("gglse.jl")         # LAPACK: equality-constrained LS (gglse)
-include("ggsvd.jl")         # LAPACK: generalized SVD, Float64 full-rank + complex (ggsvd) — needs gglse.jl's _ggl_* helpers
+include("ggsvd.jl")         # LAPACK: generalized SVD (ggsvd) — rank-deficient-capable, all s/d/c/z (dggsvp + dtgsja)
 include("syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert (syconv)
 include("trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
 include("tgsen.jl")         # LAPACK: generalized Schur reorder (tgsen) — complex complete; real all-real-λ only
