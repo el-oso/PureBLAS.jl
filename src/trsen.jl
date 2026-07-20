@@ -485,7 +485,7 @@ function _dtrsen!(job::AbstractChar, wantq::Bool, select::AbstractVector{Bool},
             # S = scale / ( sqrt(scale²/rnorm + rnorm)·sqrt(rnorm) ),  rnorm = ‖X‖_F of the coupling solve
             Rm = copy(T[1:n1, n1+1:n])                 # off-diagonal coupling block T₁₂
             _, scale, _ = _dtrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, n1+1:n, n1+1:n), Rm)
-            rnorm = sqrt(sum(abs2, Rm))
+            rnorm = (rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm; rn2 += abs2(x); end; sqrt(rn2))
             s = rnorm == ZERO ? ONE : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
         end
     end
@@ -519,7 +519,7 @@ function _ztrsen!(job::AbstractChar, wantq::Bool, select::AbstractVector{Bool},
     wants = job === 'E' || job === 'B'
     wantsp = job === 'V' || job === 'B'
     sel = collect(Bool, select)
-    m = count(sel)
+    m = 0; @inbounds for i in eachindex(sel); sel[i] && (m += 1); end   # not count(): mapreduce MappingRF is --trim-unsafe
     n1 = m; n2 = n - m
     s = one(R); sep = zero(R); info = 0
     if !(m == n || m == 0)
@@ -537,7 +537,7 @@ function _ztrsen!(job::AbstractChar, wantq::Bool, select::AbstractVector{Bool},
         else
             Rm = C.(T[1:n1, n1+1:n])
             _, scale, _ = _ztrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, n1+1:n, n1+1:n), Rm)
-            rnorm = sqrt(sum(abs2, Rm))
+            rnorm = (rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm; rn2 += abs2(x); end; sqrt(rn2))
             s = rnorm == zero(R) ? one(R) : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
         end
     end
@@ -577,7 +577,14 @@ function _diag_eigs(T::AbstractMatrix{R}) where {R<:Real}
 end
 _diag_eigs(T::AbstractMatrix{C}) where {C<:Complex} = [T[k, k] for k in 1:size(T, 1)]
 
-_one_norm(T) = maximum(sum(abs, T; dims = 1))
+function _one_norm(T)                                    # explicit (not sum(;dims)+maximum: MappingRF --trim-unsafe)
+    mx = zero(real(eltype(T)))
+    @inbounds for j in 1:size(T, 2)
+        c = zero(real(eltype(T))); for i in 1:size(T, 1); c += abs(T[i, j]); end
+        c > mx && (mx = c)
+    end
+    return mx
+end
 
 """
     trsen!(job, compq, select, T, Q) -> (T, Q, w, s, sep)
