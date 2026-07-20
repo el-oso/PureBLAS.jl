@@ -78,6 +78,24 @@ jobs:
         env:
           PUREBLAS_TEST_GROUP: checks
 
+  # AUTHORITATIVE trim gate: actually build libpureblas.so via juliac --trim=safe. The `checks` job's
+  # StrictMode @assert_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
+  # reachability-limit union-splits juliac catches (a green suite once shipped a non-building .so — the
+  # complex-F32 LAPACK variants union-split geqrf!'s muladd). This is the only check that proves the .so
+  # links for non-Julia hosts (req #4). Runs on 1.12 (juliac --trim is a 1.12 Compiler-stdlib feature).
+  trim-so:
+    name: Julia 1.12 - juliac --trim .so build (authoritative)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
+        run: julia --project=. juliac/build.jl
+
   perf:
     name: Perf regression (PkgBenchmark judge)
     if: github.event_name == 'pull_request'
