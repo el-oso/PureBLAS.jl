@@ -262,9 +262,9 @@ function _dtrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
     ZERO = zero(R); ONE = one(R)
     m = size(A, 1); n = size(B, 1)
     notrna = trana === 'N'; notrnb = tranb === 'N'
-    scale = ONE
+    scale = Ref(ONE)   # Ref{R}, concrete: closure-mutated locals must not be plain captured-and-reassigned (Core.Box, trim-unsafe)
     info = 0
-    (m == 0 || n == 0) && return C, scale, info
+    (m == 0 || n == 0) && return C, scale[], info
     eps_p = eps(R)
     smlnum = _syl_safmin(R)
     bignum = ONE / smlnum
@@ -284,7 +284,7 @@ function _dtrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
     @inline function scaleC!(sc)
         if sc != ONE
             @inbounds for jj in 1:n, ii in 1:m; C[ii, jj] *= sc; end
-            scale *= sc
+            scale[] *= sc
         end
     end
     # small quasi-tri block views
@@ -493,7 +493,7 @@ function _dtrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
             L = l1 - 1
         end
     end
-    return C, scale, info
+    return C, scale[], info
 end
 
 # ── ZTRSYL (Reference-LAPACK verbatim), COMPLEX triangular A (m×m), B (n×n) ────────────────────────────
@@ -504,8 +504,8 @@ function _ztrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
     m = size(A, 1); n = size(B, 1)
     notrna = trana === 'N'; notrnb = tranb === 'N'
     cabs1(z) = abs(real(z)) + abs(imag(z))
-    scale = ONE; info = 0
-    (m == 0 || n == 0) && return C, scale, info
+    scale = Ref(ONE); info = 0   # Ref{R}, concrete: closure-mutated capture must not be a plain reassigned local (Core.Box)
+    (m == 0 || n == 0) && return C, scale[], info
     eps_p = eps(R)
     smlnum = _syl_safmin(R)
     bignum = ONE / smlnum
@@ -524,7 +524,7 @@ function _ztrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
     @inline function scaleC!(sc)
         if sc != ONE
             @inbounds for jj in 1:n, ii in 1:m; C[ii, jj] *= sc; end
-            scale *= sc
+            scale[] *= sc
         end
     end
 
@@ -569,7 +569,7 @@ function _ztrsyl!(trana::AbstractChar, tranb::AbstractChar, isgn::Int,
             x = (vec * scaloc) / a11; scaleC!(scaloc); C[k, l] = x
         end
     end
-    return C, scale, info
+    return C, scale[], info
 end
 
 """

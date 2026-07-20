@@ -862,7 +862,11 @@ end
 # d,e,τ scratch (values path only); the SVDWorkspace real/complex split lands with the vectors path.
 function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T<:BlasComplex}
     m, n = size(A)
-    m >= n || return gesvd_vals!(permutedims(A), S)          # tall via transpose (σ preserved)
+    if m < n                                                  # tall via transpose (σ preserved). Explicit copy
+        At = Matrix{T}(undef, n, m)                            # into a concrete Matrix — permutedims on a PtrMatrix
+        @inbounds for j in 1:n, i in 1:m; At[j, i] = A[i, j]; end   # yields a non-trim-safe PermutedDimsArray path.
+        return gesvd_vals!(At, S)
+    end
     ws = _svdws(T)
     _svd_grow_bidiag!(ws, m, n)
     # Bidiagonal d,e in Float64 unconditionally: bdsqr! is the Float64 implicit-QR core, and the real

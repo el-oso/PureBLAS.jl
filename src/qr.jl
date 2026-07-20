@@ -294,7 +294,10 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
                 τc = tau[pc+c-1]; Tv[c, c] = τc
                 for r in 1:c-1                                              # T[r,c] = Σ_{kk≥r} T[r,kk]·(−τc·G[kk,c])
                     s = zero(T)
-                    for kk in r:c-1; s = muladd(Tv[r, kk], -τc * Gv[kk, c], s); end
+                    # `s += a*b`, NOT muladd(a,b,s): the explicit complex Base.muladd(::Complex,::Complex,::Complex)
+                    # is un-devirtualizable by juliac's --trim verifier when the c/z (ComplexF32/F64) instances
+                    # union-merge (reachability-limit union-split via cgeqrt/cgels/cggev). mul+add avoids it.
+                    for kk in r:c-1; s += Tv[r, kk] * (-τc * Gv[kk, c]); end
                     Tv[r, c] = s
                 end
             end
