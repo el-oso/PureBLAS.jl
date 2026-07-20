@@ -46,7 +46,7 @@ size crossover — **beats** OpenBLAS at large `n`.
 |---|---|---|---|---|
 | SVD (values+vectors) | gesvd, gesdd, gebrd, bdsqr, bdsdc | s/d | ✅ | ✅ |
 | SVD complex | gesvd, gesdd (z/c) | c/z | ✅ | ⏳ |
-| Generalized SVD | ggsvd | d | ✅ (Float64 full-rank) | ⏳ |
+| Generalized SVD | ggsvd, ggsvd3 | s/d/c/z | ✅ (rank-deficient) | ⏳ |
 
 ## LAPACK — eigensolvers
 
@@ -77,34 +77,31 @@ size crossover — **beats** OpenBLAS at large `n`.
 `rank`, `cond`, `factorize` — computed in Julia on top of the routed
 `eigen`/`schur`/`svd`/`\` kernels; no separate LAPACK wrapper needed.
 
-## Known fallthroughs (still served by OpenBLAS)
+## OpenBLAS fallthrough: ZERO
 
-The registry-vs-reachable audit (401 forwarded symbols vs the LAPACK surface
-`LinearAlgebra` wraps) leaves only these, none of which a user hits through a
-high-level call (`\`, `lu`, `cholesky`, `qr`, `svd`, `eigen`, `schur`, `eigen(A,B)`,
-`svd(A,B)`, least-squares, indefinite solve — all routed):
+**Every LAPACK symbol `LinearAlgebra` can `ccall` now forwards to PureBLAS after
+`activate()`** — including the auxiliaries (`larf`/`larfg`/`lacpy`), the driver internals
+(`gebrd`/`bdsqr`/`bdsdc`/`hseqr`/`trevc`/`gebak`/`sytrd`/`hetrd`/`orgtr`/`ormtr`), the
+combined and expert drivers (`gesv`, `posv`, **`gesvx`** with equilibration + iterative
+refinement + condition/error bounds), the reordering routines (`trexc`/`trsen`/**`tgsen`**,
+real *and* complex — the real path does the 2×2 conjugate-pair swap), **`trrfs`**,
+**`syconv`**, complex **`bdsqr`**, and the **rank-deficient generalized SVD** (`ggsvd`,
+all s/d/c/z). This is enforced by a machine-checkable ratchet test (`test/lbt_forward_tests.jl`)
+that enumerates every symbol the stdlib wraps and asserts the fallthrough count is **0**.
 
-- **Auxiliaries** (`larf`, `larfg`, `lacpy`) — PureBLAS uses its own in-house kernels;
-  only a direct `LAPACK.larfg!` etc. call falls through.
-- **Driver internals** (`gebrd`, `bdsqr`, `bdsdc`, `hseqr`, `trevc`, `gebak`, `sytrd`,
-  `hetrd`, `orgtr`/`ormtr`) — the enclosing driver (`gesvd`/`gesdd`/`geev`/`syev`…) is
-  routed; only the piecewise direct call falls through.
-- **Combined drivers** (`gesv`, `posv`, `gesvx`) — the high-level path composes the
-  routed pieces (`getrf`+`getrs`, `potrf`+`potrs`).
-- **Niche / not-yet-built**: `tgsen` (generalized Schur reorder), `trrfs` (iterative
-  refinement), `syconv` (Bunch–Kaufman aa-variant), generalized SVD for complex +
-  rank-deficient (`ggsvd` is Float64 full-rank only).
+The only two names excluded from the count are `cstev_`/`zstev_`, which are **not real LAPACK
+symbols** — they appear only in commented-out lines of the stdlib and have no OpenBLAS export.
 
 ## Summary
 
 - **BLAS 1/2/3 and the core dense factorizations (Cholesky, LU, QR, SVD real+complex+F32)
   are routed AND perf-gated `≥ OpenBLAS`.**
-- **All eigensolvers (symmetric, Hermitian, nonsymmetric, generalized, Schur), the
-  Sylvester/Schur-reordering routines, and the remaining factorizations (indefinite,
-  QL/RQ, RZ, pivoted Cholesky, banded/tridiagonal/packed, rank-deficient LS) are routed
-  and numerically LAPACK-accurate, but correctness-first** — the `≥ OpenBLAS` performance
-  gate for these (blocked `dlaqr0` multishift+AED, blocked `dlahr2`, SIMD Bunch-Kaufman/QZ,
-  blocked complex `zunmbr`, …) is a scheduled follow-up campaign.
-- The coverage audit (registry-vs-reachable diff) confirms **zero high-level fallthrough**:
-  every op reachable through the `LinearAlgebra` API routes to PureBLAS; the residual
-  fallthroughs above are auxiliaries, driver-internals, and niche/expert routines.
+- **Everything else routable through the `LinearAlgebra` API** — all eigensolvers (symmetric,
+  Hermitian, nonsymmetric, generalized, Schur), Sylvester/Schur-reordering, the expert general
+  solver (`gesvx`), generalized SVD, and the remaining factorizations (indefinite, QL/RQ, RZ,
+  pivoted Cholesky, banded/tridiagonal/packed, rank-deficient LS) — **is routed and numerically
+  LAPACK-accurate, correctness-first**. The `≥ OpenBLAS` performance gate for this second tier
+  (blocked `dlaqr0` multishift+AED, blocked `dlahr2`, SIMD Bunch-Kaufman/QZ, blocked complex
+  `zunmbr`, a convergent perf `dbdsqr`, …) is a scheduled follow-up campaign.
+- The coverage audit (the ratchet gate) confirms **zero OpenBLAS fallthrough**: after
+  `activate()`, the OpenBLAS fallback is fully removed.
