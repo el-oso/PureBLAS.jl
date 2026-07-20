@@ -663,6 +663,50 @@ end
     end
 end
 
+@testitem "LBT in-process forward: batch-11 (syconv, trrfs)" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.BLAS as B
+    import LinearAlgebra.LAPACK as LA
+    Random.seed!(0xB11)
+    fwd(s) = B.lbt_get_forward(s, Int32(B.LBT_INTERFACE_ILP64), Int32(B.LBT_F2C_PLAIN))
+    n = 16
+
+    # Neither routine is on a high-level dispatch path — both checked via DIRECT LinearAlgebra.LAPACK.<name>!
+    # calls, OpenBLAS oracle captured BEFORE activate(). syconv converts a Bunch-Kaufman (sytrf) factor's
+    # 2×2 off-diagonals into `work`; factor ONCE with OpenBLAS so both syconv calls see identical input.
+    facs = map((Float64, Float32, ComplexF64, ComplexF32)) do T
+        M = randn(T, n, n); A = M + transpose(M)          # symmetric (sytrf, not hetrf) for all 4 types
+        LD, ip, _ = LA.sytrf!('L', copy(A)); (LD = LD, ip = ip)
+    end
+    sycref = map(f -> LA.syconv!('L', copy(f.LD), copy(f.ip))[2], facs)   # OpenBLAS `work` per type
+
+    # trrfs error bounds for a well-conditioned triangular solve — Berr must stay ~eps.
+    tris = map((Float64, Float32, ComplexF64, ComplexF32)) do T
+        A = triu(randn(T, n, n)) + n * I; Bm = randn(T, n, 3); X = A \ Bm
+        (A = A, B = Bm, X = X)
+    end
+    trref = map(t -> LA.trrfs!('U', 'N', 'N', t.A, t.B, t.X), tris)       # OpenBLAS (Ferr, Berr) per type
+
+    before = Dict(s => fwd(s) for s in (
+        "ssyconv_", "dsyconv_", "csyconv_", "zsyconv_",
+        "strrfs_", "dtrrfs_", "ctrrfs_", "ztrrfs_"))
+    PureBLAS.activate()
+    try
+        @test all(s -> fwd(s) != before[s], keys(before))
+        for (i, f) in enumerate(facs)
+            wpb = LA.syconv!('L', copy(f.LD), copy(f.ip))[2]
+            @test maximum(abs, wpb .- sycref[i]) < 1e-6 * (norm(sycref[i]) + 1)   # F32-tol covers all 4
+        end
+        for (i, t) in enumerate(tris)
+            Fe, Be = LA.trrfs!('U', 'N', 'N', t.A, t.B, t.X)
+            @test maximum(Be) < 1e-5                                             # well-conditioned → tiny Berr
+            @test maximum(Fe) < 1.0                                              # sane forward bound
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+end
+
 # ── OpenBLAS-removal GATE (the contract) ──────────────────────────────────────────────────────────────
 # Enumerates EVERY LAPACK symbol LinearAlgebra can ccall (parsed from stdlib lapack.jl) and asserts how
 # many still fall through to OpenBLAS after activate() (pointer unchanged vs pre-activate). This is the
@@ -672,15 +716,16 @@ end
 @testitem "LBT: OpenBLAS-removal ratchet (fallthrough count)" tags = [:forward] begin
     using LinearAlgebra, PureBLAS
     const B = LinearAlgebra.BLAS
-    _FALLTHROUGH_MAX = 23   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
-    # 2026-07-20: 87 → 23. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
+    _FALLTHROUGH_MAX = 15   # RATCHET → 0. Do not raise. Lower it every time a symbol is forwarded.
+    # 2026-07-20: 87 → 23 → 15. Forwarded gesv/posv/lacpy/larfg/larf, gebak/hseqr/trevc, sytrd·hetrd/
     # orgtr·ungtr/ormtr·unmtr (uplo='L' only), orgqr·ungqr/ormqr·unmqr/ormhr·unmhr, gebrd/bdsqr/bdsdc
-    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open). The
-    # residual 23 = the explicitly out-of-scope set: gesvx/posvx-class expert drivers (gesvx), tgsen
-    # (generalized Schur reorder — not built), trrfs (not built), syconv (Bunch-Kaufman aa-convert — not
-    # built), complex/F32 ggsvd (needs complex GSVD), cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-
-    # accumulator Givens apply not yet in svd.jl), and cstev_/zstev_ (NOT real LAPACK symbols — stev is
-    # s/d only; they have no caller, an artifact of the regex scan).
+    # (dbdsqr_/sbdsqr_ only — see cabi_lapack2.jl header for why cbdsqr_/zbdsqr_ are still open), and
+    # now syconv (s/d/c/z) + trrfs (s/d/c/z) — cabi_lapack3.jl (batch-11 test below). The residual 15 =
+    # the explicitly out-of-scope set: gesvx/posvx-class expert drivers (gesvx), tgsen (generalized Schur
+    # reorder — real 2×2 conjugate-pair swap unbuilt; must NOT ship a throwing forward), complex/F32 ggsvd
+    # (needs complex GSVD), cbdsqr_/zbdsqr_ (complex bdsqr — needs a complex-accumulator Givens apply not
+    # yet in svd.jl), and cstev_/zstev_ (NOT real LAPACK symbols — stev is s/d only; they have no caller,
+    # an artifact of the regex scan).
     lp = joinpath(Sys.STDLIB, "LinearAlgebra", "src", "lapack.jl")
     syms = Set{String}()
     for m in eachmatch(r":([a-z]{4,7}_),", read(lp, String)); push!(syms, m.captures[1]); end

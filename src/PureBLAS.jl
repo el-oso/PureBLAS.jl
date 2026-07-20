@@ -55,7 +55,9 @@ include("gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — need
 include("trsyl.jl")         # LAPACK: Sylvester solve (trsyl) — standalone
 include("trsen.jl")         # LAPACK: Schur reorder (trexc/trsen) — needs trsyl.jl
 include("gglse.jl")         # LAPACK: equality-constrained LS (gglse)
-include("ggsvd.jl")         # LAPACK: generalized SVD, Float64 full-rank (ggsvd) — needs gglse.jl's _ggl_* helpers
+include("ggsvd.jl")         # LAPACK: generalized SVD, Float64 full-rank + complex (ggsvd) — needs gglse.jl's _ggl_* helpers
+include("syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert (syconv)
+include("trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
 include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
@@ -65,6 +67,7 @@ include("cabi_lapack.jl")   # Mode 1: LAPACK (potrf/getrf/geqrf/gesvd)
 include("cabi_lapack2.jl")  # Mode 1: LAPACK batch 2 (gesv/posv/lacpy/larfg/larf/gebak/hseqr/trevc/
                              # sytrd·hetrd/orgtr·ungtr/ormtr·unmtr/orgqr·ungqr/ormqr·unmqr/ormhr·unmhr/
                              # gebrd/bdsqr/bdsdc) — OpenBLAS-removal ratchet follow-up
+include("cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/ggsvd-complex to follow)
 include("cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 
