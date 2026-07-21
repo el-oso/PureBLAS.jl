@@ -38,4 +38,17 @@ finally
         set_preferences!(PUREBLAS_UUID, "ger_panel_np" => _prev_ger; force = true)
     end
 end
+# Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
+# is `.debug_*` sections, dead weight in a distributed drop-in. `--strip-debug` keeps the full symbol
+# table AND all 492 dynamic `_64_` exports (verified present after strip), so the library is functionally
+# identical; only the debug sections go (154 MB → ~48 MB). Best-effort: skip silently if `strip` is absent.
+if isfile(OUT) && Sys.which("strip") !== nothing
+    presz = filesize(OUT)
+    try
+        run(`strip --strip-debug $OUT`)
+        @info "PureBLAS: stripped debug info" before_MB = round(presz / 2^20; digits = 1) after_MB = round(filesize(OUT) / 2^20; digits = 1)
+    catch e
+        @warn "PureBLAS: strip failed (keeping debug info)" exception = e
+    end
+end
 @info "PureBLAS: built" OUT filesize_bytes = (isfile(OUT) ? filesize(OUT) : 0)
