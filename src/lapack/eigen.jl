@@ -47,6 +47,109 @@ function _sytd2_lower!(
     return
 end
 
+# ── Stage 1b: BLOCKED tridiagonalization (LAPACK dlatrd panel + dsyr2k trailing update), LOWER ──────
+# The unblocked `_sytd2_lower!` above does ONE memory-bound `symv!` on the shrinking trailing submatrix
+# PER column (n Level-2 sweeps, no cache blocking) — it was ~90% of a `jobz='N'` solve and dragged PB to
+# 0.63× OB at n=2048. dlatrd reduces `nb` columns of the trailing submatrix at a time, accumulating W so
+# HALF the flops move into ONE rank-2·nb `syr2k!` (Level-3, cache-blocked) — the structural OB match.
+# Direct-gemv helper `_eg!` skips the kwarg wrapper's dispatch/char-parse (mirrors svd.jl's `_lg!` in the
+# analogous blocked bidiagonalization `_labrd!`). Generic over T so complex `_hetrd!` can share the shape.
+@inline _eg!(yv, Av, xv, α::T, β::T, tr::Bool) where {T} =
+    _gemv!(tr, false, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
+# Conj-aware variant for the complex (zlatrd) panel: op(A) = Aᴴ needs (tr=true, cj=true).
+@inline _egc!(yv, Av, xv, α::T, β::T, tr::Bool, cj::Bool) where {T} =
+    _gemv!(tr, cj, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
+
+# Reduce the first `nb` columns of the ns×ns trailing submatrix `As` to tridiagonal form, filling
+# d[1:nb], e[1:nb], tau[1:nb] and the panel W[:,1:nb] that drives the caller's syr2k. Faithful dlatrd
+# (lower): symv unscaled, the τ scaling + half-correction applied last (so the cross-term gemvs see the
+# raw A·v). `tmp` (≥ nb) contiguous-izes the strided W[i,·]/A[i,·] rows for the SIMD gemv fast path.
+function _latrd_lower!(
+        As::AbstractMatrix{T}, W::AbstractMatrix{T}, d::AbstractVector{T},
+        e::AbstractVector{T}, tau::AbstractVector{T}, nb::Int, tmp::AbstractVector{T}
+    ) where {T <: Real}
+    ns = size(As, 1)
+    @inbounds for i in 1:nb
+        if i > 1
+            # A(i:ns,i) -= A(i:ns,1:i-1)·W(i,1:i-1)ᵀ − W(i:ns,1:i-1)·A(i,1:i-1)ᵀ  (two rank-(i−1) gemv N)
+            for t in 1:(i - 1)
+                tmp[t] = W[i, t]
+            end
+            _eg!(view(As, i:ns, i), view(As, i:ns, 1:(i - 1)), view(tmp, 1:(i - 1)), -one(T), one(T), false)
+            for t in 1:(i - 1)
+                tmp[t] = As[i, t]
+            end
+            _eg!(view(As, i:ns, i), view(W, i:ns, 1:(i - 1)), view(tmp, 1:(i - 1)), -one(T), one(T), false)
+        end
+        d[i] = As[i, i]
+        if i < ns
+            m = ns - i
+            col = view(As, (i + 1):ns, i)
+            β, τ = _larfg!(col)
+            e[i] = β; tau[i] = τ; As[i + 1, i] = one(T)   # explicit unit (symv v[1] AND the trailing syr2k V2)
+            v = view(As, (i + 1):ns, i)
+            wc = view(W, (i + 1):ns, i)
+            symv!(wc, view(As, (i + 1):ns, (i + 1):ns), v; uplo = 'L', alpha = one(T), beta = zero(T))  # wc = A·v
+            if i > 1
+                wtop = view(W, 1:(i - 1), i)
+                _eg!(wtop, view(W, (i + 1):ns, 1:(i - 1)), v, one(T), zero(T), true)     # wtop = W2ᵀ·v
+                _eg!(wc, view(As, (i + 1):ns, 1:(i - 1)), wtop, -one(T), one(T), false)  # wc −= A21·wtop
+                _eg!(wtop, view(As, (i + 1):ns, 1:(i - 1)), v, one(T), zero(T), true)    # wtop = A21ᵀ·v
+                _eg!(wc, view(W, (i + 1):ns, 1:(i - 1)), wtop, -one(T), one(T), false)   # wc −= W2·wtop
+            end
+            for r in 1:m
+                wc[r] *= τ
+            end
+            s = zero(T)
+            for r in 1:m
+                s = muladd(wc[r], v[r], s)
+            end
+            c = -(τ / 2) * s                                # dlatrd half-correction
+            for r in 1:m
+                wc[r] = muladd(c, v[r], wc[r])
+            end
+        end
+    end
+    return
+end
+
+# Blocked driver (LAPACK dsytrd, lower): panel-reduce nb columns (dlatrd), rank-2·nb syr2k the trailing
+# block, repeat; finish the small tail unblocked. `nb`/`nx` derived (req#8): panel width reuses the QR
+# cache-residency width (same rank-nb-trailing-gemm criterion); the unblocked-tail crossover `nx` is a
+# multiple of nb (keep blocking while the trailing syr2k spans ≥2 panels — else it is too small to amortize
+# the panel's BLAS-2 W-accumulation). Reuses `_sytd2_lower!` as the tail kernel — no separate base case.
+_sytrd_nb(n::Int) = _qr_nb(n, n)
+function _sytrd_lower!(
+        A::AbstractMatrix{T}, d::AbstractVector{T},
+        e::AbstractVector{T}, tau::AbstractVector{T}
+    ) where {T <: Real}
+    n = size(A, 1)
+    n == 0 && return
+    nb = _sytrd_nb(n)
+    nx = 2 * nb                                       # unblocked-tail crossover (≥2 panels ⇒ blocking pays)
+    if n <= nx || nb <= 1
+        _sytd2_lower!(A, d, e, tau)
+        return
+    end
+    W = Matrix{T}(undef, n, nb)
+    tmp = Vector{T}(undef, nb)
+    kk = 1
+    @inbounds while n - kk + 1 > nx
+        pb = min(nb, n - kk)                          # ≤ ns−1 (each panel column needs a trailing row)
+        ns = n - kk + 1
+        As = view(A, kk:n, kk:n)
+        Wp = view(W, 1:ns, 1:pb)
+        _latrd_lower!(As, Wp, view(d, kk:(kk + pb - 1)), view(e, kk:(kk + pb - 1)), view(tau, kk:(kk + pb - 1)), pb, tmp)
+        rs = kk + pb                                  # trailing block A(rs:n, rs:n) -= V2·W2ᵀ + W2·V2ᵀ
+        V2 = view(A, rs:n, kk:(kk + pb - 1))
+        W2 = view(W, (pb + 1):ns, 1:pb)
+        syr2k!(view(A, rs:n, rs:n), V2, W2; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
+        kk += pb
+    end
+    _sytd2_lower!(view(A, kk:n, kk:n), view(d, kk:n), view(e, kk:(n - 1)), view(tau, kk:(n - 1)))  # tail
+    return
+end
+
 # ── Stage 2: 2×2 symmetric eigensolvers (LAPACK dlae2 values / dlaev2 values+vector) ───────────────
 @inline function _dlae2(a::T, b::T, c::T) where {T <: Real}
     sm = a + c; df = a - c; adf = abs(df); tb = b + b; ab = abs(tb)
@@ -347,36 +450,60 @@ end
 # (v_i[1]≡1 at row i+1); tau[i] standard LAPACK τ. side='L' real Float64 (steqr back-transform is L/N).
 #   trans='N':  C := Q·C  = H_1·(⋯·(H_{n-2}·C))   → apply i = n-2 … 1  (decreasing)
 #   trans='T':  C := Qᵀ·C = H_{n-2}·(⋯·(H_1·C))   → apply i = 1 … n-2  (increasing)
+#
+# BLOCKED (LAPACK dlarfb / dormtr): the per-reflector `_house_left!` above is Level-2 (a rank-1 apply
+# per reflector) — it was ~80% of a `jobz='V'` eigensolve at n≥512 (unblocked). Group the reflectors
+# into nb-wide panels and apply each as ONE compact-WY block reflector Q_b = I − V·T·Vᵀ (`wy_t!` builds
+# T, `wy_apply!` does the triple-gemm) → Level-3, matching OB's dormtr. The nb reflectors for columns
+# [pc:pc+pb-1] occupy rows [pc+1:n] as a unit-lower-trapezoid (reflector at col g has its implicit 1 at
+# row g+1, essential A[g+2:n,g]) — exactly the `Apanel` shape wy_t! wants. Block order: reverse for
+# Q·C (rightmost block H_pc..·C applied first), forward for Qᵀ·C — the block mirror of the scalar loops.
 function _ormtr!(
         A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}; side::Char = 'L', trans::Char = 'N'
     ) where {T <: Real}
     side === 'L' || throw(ArgumentError("_ormtr!: only side='L' implemented"))
     trans === 'N' || trans === 'T' || throw(ArgumentError("_ormtr!: trans must be 'N' or 'T'"))
-    n = size(A, 1)
-    n <= 2 && return C                       # no reflectors (H_1..H_{n-2})
-    v = Vector{T}(undef, n)
-    order = trans === 'N' ? ((n - 2):-1:1) : (1:(n - 2))
-    @inbounds for i in order
-        m = n - i                            # length of v_i (rows i+1:n)
-        τ = tau[i]
-        v[1] = one(T)
-        for r in 2:m
-            v[r] = A[i + r, i]                 # essential part = A[i+2:n, i]
+    n = size(A, 1); nc = size(C, 2)
+    (n <= 2 || nc == 0) && return C          # no reflectors (H_1..H_{n-2})
+    k = n - 2                                 # reflector count
+    nb = clamp(_qr_nb(n, nc), 1, k)           # derived panel width (cache-residency; shared with QR)
+    ws = WYApplyWorkspace{T}(n, nb, nc)
+    Tm = Matrix{T}(undef, nb, nb)
+    nblk = cld(k, nb)
+    order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
+    @inbounds for b in order
+        pc = (b - 1) * nb + 1
+        pb = min(nb, k - pc + 1)
+        rs = pc + 1                           # first row H_pc acts on (v_pc[1] at row pc+1)
+        m = n - rs + 1                        # panel rows (pc+1 : n)
+        Vp = view(ws.V, 1:m, 1:pb)            # build explicit unit-lower-trapezoid panel
+        for c in 1:pb
+            g = pc + c - 1                    # global reflector column
+            for r in 1:(c - 1)
+                Vp[r, c] = zero(T)
+            end
+            Vp[c, c] = one(T)
+            for r in (c + 1):m
+                Vp[r, c] = A[rs + r - 1, g]   # essential v_g = A[g+2:n, g]
+            end
         end
-        _house_left!(view(C, (i + 1):n, :), view(v, 1:m), τ)
+        Tv = view(Tm, 1:pb, 1:pb)
+        wy_t!(Tv, Vp, view(tau, pc:(pc + pb - 1)), ws.G)
+        wy_apply!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
     end
     return C
 end
 
-# ── Complex Hermitian tridiagonalization (LAPACK zhetd2, LOWER) — Hermitian analogue of _sytd2_lower! ─
-# Reduces the lower triangle of Hermitian A to real tridiagonal T = QᴴAQ: d=diagonal (real), e=subdiag
-# (real — β from complex _larfg! is real by the zlarfg phase convention), tau=complex reflectors.
-# Essential v_i in A[i+2:n,i] (v_i[1]≡1 implicit); trailing matvec is hemv! (Hermitian). Half-correction
-# uses the CONJUGATE dot wᴴv. Trailing downdate A -= v·wᴴ + w·vᴴ (her2), diagonal re-realified.
-# The m==1 (last column) trailing downdate is an EXACT no-op (|τ|²=2Re(τ) by unitarity) — skipped like
-# the real code; tau[n-1] itself is NOT dropped (it is generically nonzero and used by _unmtr!).
-function _hetrd!(
+# ── Complex Hermitian tridiagonalization TAIL/base (LAPACK zhetd2, LOWER) — Hermitian analogue of
+# _sytd2_lower!; the unblocked base case the blocked `_hetrd!` driver below finishes with (and the whole
+# reduction for n below the blocking crossover). Reduces the lower triangle of Hermitian A to real
+# tridiagonal T = QᴴAQ: d=diagonal (real), e=subdiag (real — β from complex _larfg! is real by the zlarfg
+# phase convention), tau=complex reflectors. Essential v_i in A[i+2:n,i] (v_i[1]≡1 implicit); trailing
+# matvec is hemv! (Hermitian). Half-correction uses the CONJUGATE dot wᴴv. Trailing downdate A -= v·wᴴ +
+# w·vᴴ (her2), diagonal re-realified. The m==1 (last column) trailing downdate is an EXACT no-op
+# (|τ|²=2Re(τ) by unitarity) — skipped; tau[n-1] itself is NOT dropped (it is used by _unmtr!).
+function _hetd2_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R},
         tau::AbstractVector{T}
     ) where {T <: Complex, R <: Real}
@@ -418,6 +545,94 @@ function _hetrd!(
     return
 end
 
+# ── Complex BLOCKED tridiagonalization (LAPACK zlatrd panel + zher2k trailing), LOWER ───────────────────
+# Hermitian analogue of `_latrd_lower!`: hemv (not symv), Aᴴ cross-terms (gemv 'C'), conjugated column-
+# update multipliers, dotc half-correction, diagonal re-realified each step. Fills real d/e, complex tau,
+# and W (ns×nb) for the caller's her2k trailing update. τ scaling + half-correction applied last (raw A·v
+# feeds the cross-term gemvs), mirroring zlatrd exactly.
+function _latrd_lower!(
+        As::AbstractMatrix{T}, W::AbstractMatrix{T}, d::AbstractVector{R},
+        e::AbstractVector{R}, tau::AbstractVector{T}, nb::Int, tmp::AbstractVector{T}
+    ) where {T <: Complex, R <: Real}
+    ns = size(As, 1)
+    @inbounds for i in 1:nb
+        if i > 1
+            As[i, i] = Complex(real(As[i, i]), zero(R))                    # realify diagonal (zlatrd)
+            for t in 1:(i - 1)
+                tmp[t] = conj(W[i, t])
+            end
+            _egc!(view(As, i:ns, i), view(As, i:ns, 1:(i - 1)), view(tmp, 1:(i - 1)), -one(T), one(T), false, false)
+            for t in 1:(i - 1)
+                tmp[t] = conj(As[i, t])
+            end
+            _egc!(view(As, i:ns, i), view(W, i:ns, 1:(i - 1)), view(tmp, 1:(i - 1)), -one(T), one(T), false, false)
+            As[i, i] = Complex(real(As[i, i]), zero(R))
+        end
+        d[i] = real(As[i, i])
+        if i < ns
+            m = ns - i
+            col = view(As, (i + 1):ns, i)
+            β, τ = _larfg!(col)
+            e[i] = β; tau[i] = τ; As[i + 1, i] = one(T)
+            v = view(As, (i + 1):ns, i)
+            wc = view(W, (i + 1):ns, i)
+            hemv!(wc, view(As, (i + 1):ns, (i + 1):ns), v; uplo = 'L', alpha = one(T), beta = zero(T))  # wc = A·v
+            if i > 1
+                wtop = view(W, 1:(i - 1), i)
+                _egc!(wtop, view(W, (i + 1):ns, 1:(i - 1)), v, one(T), zero(T), true, true)     # wtop = W2ᴴ·v
+                _egc!(wc, view(As, (i + 1):ns, 1:(i - 1)), wtop, -one(T), one(T), false, false) # wc −= A21·wtop
+                _egc!(wtop, view(As, (i + 1):ns, 1:(i - 1)), v, one(T), zero(T), true, true)    # wtop = A21ᴴ·v
+                _egc!(wc, view(W, (i + 1):ns, 1:(i - 1)), wtop, -one(T), one(T), false, false)  # wc −= W2·wtop
+            end
+            for r in 1:m
+                wc[r] *= τ
+            end
+            s = zero(T)
+            for r in 1:m
+                s += conj(wc[r]) * v[r]                                    # wᴴ·v (dotc)
+            end
+            c = -(τ / 2) * s
+            for r in 1:m
+                wc[r] = muladd(c, v[r], wc[r])
+            end
+        end
+    end
+    return
+end
+
+# Blocked driver (LAPACK zhetrd, lower): zlatrd panel + rank-2·nb her2k, unblocked `_hetd2_lower!` tail.
+# nb/nx derived exactly like the real `_sytrd_lower!`.
+function _hetrd!(
+        A::AbstractMatrix{T}, d::AbstractVector{R},
+        e::AbstractVector{R}, tau::AbstractVector{T}
+    ) where {T <: Complex, R <: Real}
+    n = size(A, 1)
+    n == 0 && return
+    nb = _sytrd_nb(n)
+    nx = 2 * nb
+    if n <= nx || nb <= 1
+        _hetd2_lower!(A, d, e, tau)
+        return
+    end
+    W = Matrix{T}(undef, n, nb)
+    tmp = Vector{T}(undef, nb)
+    kk = 1
+    @inbounds while n - kk + 1 > nx
+        pb = min(nb, n - kk)
+        ns = n - kk + 1
+        As = view(A, kk:n, kk:n)
+        Wp = view(W, 1:ns, 1:pb)
+        _latrd_lower!(As, Wp, view(d, kk:(kk + pb - 1)), view(e, kk:(kk + pb - 1)), view(tau, kk:(kk + pb - 1)), pb, tmp)
+        rs = kk + pb
+        V2 = view(A, rs:n, kk:(kk + pb - 1))
+        W2 = view(W, (pb + 1):ns, 1:pb)
+        her2k!(view(A, rs:n, rs:n), V2, W2; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(R))
+        kk += pb
+    end
+    _hetd2_lower!(view(A, kk:n, kk:n), view(d, kk:n), view(e, kk:(n - 1)), view(tau, kk:(n - 1)))
+    return
+end
+
 # ── Apply Q from _hetrd! (LAPACK zunmtr, side='L', LOWER) to C ────────────────────────────────────────
 # Q = H_1·H_2·⋯·H_{n-1}, H_i = I − τ_i·v_i·v_iᴴ acts on rows i+1:n.  *** Uses ALL n-1 reflectors ***
 # — unlike REAL _ormtr! (which safely skips i=n-1 because real _larfg! HARDCODES τ=0 for a length-1
@@ -425,24 +640,88 @@ end
 # its reflector is NOT a no-op on other columns of C. Dropping it gives O(1) reconstruction error.
 #   trans='N':  C := Q·C  = H_1·(⋯·(H_{n-1}·C))    → apply i = n-1 … 1  (decreasing)
 #   trans='C':  C := Qᴴ·C = H_{n-1}ᴴ·(⋯·(H_1ᴴ·C))  → apply i = 1 … n-1  (increasing), τ → conj(τ)
+# Q = H_1·H_2·⋯·H_{n-1}, H_i = I − τ_i·v_i·v_iᴴ acts on rows i+1:n.  *** Uses ALL n-1 reflectors ***
+# — unlike REAL _ormtr! (which safely skips i=n-1 because real _larfg! HARDCODES τ=0 for a length-1
+# vector). Complex _larfg! has no such hardcode: tau[n-1] is GENERICALLY nonzero for Hermitian data and
+# its reflector is NOT a no-op on other columns of C. Dropping it gives O(1) reconstruction error.
+#   trans='N':  C := Q·C  = H_1·(⋯·(H_{n-1}·C))    → apply i = n-1 … 1  (decreasing)
+#   trans='C':  C := Qᴴ·C = H_{n-1}ᴴ·(⋯·(H_1ᴴ·C))  → apply i = 1 … n-1  (increasing), τ → conj(τ)
+# Complex compact-WY T factor (zlarft forward): Q = I − V·T·Vᴴ. G = Vᴴ·V via herk (upper), then the
+# same triangular recurrence as `wy_t!` but over the Hermitian Gram. `Tm` written full (lower zeroed).
+function _wy_t_cplx!(
+        Tm::AbstractMatrix{T}, Vp::AbstractMatrix{T}, tau::AbstractVector{T}, G::AbstractMatrix{T}
+    ) where {T <: Complex}
+    bs = length(tau)
+    bs == 0 && return Tm
+    m = size(Vp, 1)
+    Gv = view(G, 1:bs, 1:bs)
+    herk!(Gv, view(Vp, 1:m, 1:bs); uplo = 'U', trans = 'C', alpha = true, beta = false)  # G = VᴴV, upper
+    @inbounds for c in 1:bs
+        tc = tau[c]
+        Tm[c, c] = tc
+        for r in 1:(c - 1)
+            s = zero(T)
+            for kk in r:(c - 1)
+                s = muladd(Tm[r, kk], Gv[kk, c], s)
+            end
+            Tm[r, c] = -tc * s
+        end
+        for r in (c + 1):bs
+            Tm[r, c] = zero(T)
+        end
+    end
+    return Tm
+end
+# Complex block-reflector apply (zlarfb): C := Q·C (trans='N') or Qᴴ·C (trans='C'), Q = I − V·Tm·Vᴴ.
+@inline function _wy_apply_cplx!(
+        trans::Char, C::AbstractMatrix{T}, Vp::AbstractMatrix{T},
+        Tm::AbstractMatrix{T}, ws::WYApplyWorkspace{T}
+    ) where {T <: Complex}
+    m = size(Vp, 1); bs = size(Vp, 2); nc = size(C, 2)
+    (bs == 0 || nc == 0 || m == 0) && return C
+    Wv = view(ws.W, 1:bs, 1:nc)
+    gemm!(Wv, Vp, C; transA = 'C', alpha = true, beta = false)                # W = Vᴴ·C
+    trmm!(Wv, view(Tm, 1:bs, 1:bs); side = 'L', uplo = 'U', transA = trans)   # W := (T or Tᴴ)·W
+    gemm!(C, Vp, Wv; alpha = -one(T), beta = one(T))                          # C −= V·W
+    return C
+end
+
+# BLOCKED zunmtr (side='L', lower): reflectors H_1..H_{n-1} in nb-wide compact-WY blocks (`_wy_t_cplx!`/
+# `_wy_apply_cplx!`) → Level-3, mirroring the real `_ormtr!`. Panel for columns [pc:pc+pb-1] occupies rows
+# [pc+1:n] as a unit-lower-trapezoid. Reverse block order for Q·C, forward for Qᴴ·C.
 function _unmtr!(
         A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}; side::Char = 'L', trans::Char = 'N'
     ) where {T <: Complex}
     side === 'L' || throw(ArgumentError("_unmtr!: only side='L' implemented"))
     trans === 'N' || trans === 'C' || throw(ArgumentError("_unmtr!: trans must be 'N' or 'C'"))
-    n = size(A, 1)
-    n <= 1 && return C                        # no reflectors (H_1..H_{n-1} needs n≥2)
-    v = Vector{T}(undef, n)
-    order = trans === 'N' ? ((n - 1):-1:1) : (1:(n - 1))
-    @inbounds for i in order
-        m = n - i                             # length of v_i (rows i+1:n)
-        τ = trans === 'N' ? tau[i] : conj(tau[i])
-        v[1] = one(T)
-        for r in 2:m
-            v[r] = A[i + r, i]                  # essential part = A[i+2:n, i]
+    n = size(A, 1); nc = size(C, 2)
+    (n <= 1 || nc == 0) && return C           # no reflectors (H_1..H_{n-1} needs n≥2)
+    k = n - 1                                  # reflector count (complex: incl. the nontrivial H_{n-1})
+    nb = clamp(_qr_nb(n, nc), 1, k)
+    ws = WYApplyWorkspace{T}(n, nb, nc)
+    Tm = Matrix{T}(undef, nb, nb); G = Matrix{T}(undef, nb, nb)
+    nblk = cld(k, nb)
+    order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
+    @inbounds for b in order
+        pc = (b - 1) * nb + 1
+        pb = min(nb, k - pc + 1)
+        rs = pc + 1
+        m = n - rs + 1
+        Vp = view(ws.V, 1:m, 1:pb)
+        for c in 1:pb
+            g = pc + c - 1
+            for r in 1:(c - 1)
+                Vp[r, c] = zero(T)
+            end
+            Vp[c, c] = one(T)
+            for r in (c + 1):m
+                Vp[r, c] = A[rs + r - 1, g]
+            end
         end
-        _house_left!(view(C, (i + 1):n, :), view(v, 1:m), τ)
+        Tv = view(Tm, 1:pb, 1:pb)
+        _wy_t_cplx!(Tv, Vp, view(tau, pc:(pc + pb - 1)), G)
+        _wy_apply_cplx!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
     end
     return C
 end
@@ -738,7 +1017,7 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
     d = Vector{T}(undef, n)
     e = Vector{T}(undef, max(n - 1, 1))
     tau = Vector{T}(undef, max(n - 1, 1))
-    _sytd2_lower!(A, d, e, tau)
+    _sytrd_lower!(A, d, e, tau)                       # blocked tridiagonalization (dlatrd + syr2k)
 
     info = 0
     if wantz

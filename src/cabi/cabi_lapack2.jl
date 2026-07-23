@@ -315,7 +315,7 @@ for (p, T) in (("s", Float32), ("d", Float64))
         N = Int(unsafe_load(n))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         dm = PtrVector(d, N); em = PtrVector(e, max(N - 1, 0)); tm = PtrVector(tau, max(N - 1, 0))
-        _sytd2_lower!(Am, dm, em, tm)
+        _sytrd_lower!(Am, dm, em, tm)   # blocked (dlatrd + syr2k)
         unsafe_store!(info, Int64(0)); return
     end
 end
