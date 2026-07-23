@@ -508,6 +508,21 @@ function run_benchmarks()
             c -> (LinearAlgebra.LAPACK.gesdd!(Char(65), c); c[1, 1]),
             c -> (PureBLAS.gesvd!(c; want_vectors = true); 0.0); sizes = _cap(LPSZ, 2048)
         )
+        # Symmetric eigensolver, blocked sytrd + D&C stedc + blocked ormtr. Baseline = OB `dsyevd` (D&C — the
+        # faster of Julia's two default drivers; syevr is ~15% slower), the conservative gate target. Two rows:
+        # 'V' (eigenpairs, Julia's default `eigen(Symmetric)`) and 'N' (eigenvalues, `eigvals`). Capped at 2048
+        # like gesvd (a single 4096 'V' solve isn't seconds-bounded at 40 samples). Fresh symmetric input/sample.
+        _sym(s) = (A = randn(s, s); A .+ A')
+        addh(
+            "syev", _sym,
+            c -> (LinearAlgebra.LAPACK.syevd!(Char(86), LP, c); c[1, 1]),   # 'V','L'
+            c -> (PureBLAS._syev!('V', 'L', c); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        addh(
+            "syevN", _sym,
+            c -> (LinearAlgebra.LAPACK.syevd!(Char(78), LP, c); c[1, 1]),   # 'N','L'
+            c -> (PureBLAS._syev!('N', 'L', c); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
     end
     return l1, l2, l3, lp
 end
