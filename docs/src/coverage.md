@@ -6,7 +6,7 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
 **Legend**
 
 - **Routes** — the routine forwards to PureBLAS via LBT after `activate()` (or is composed from routines that do).
-- **Optimized** — ✅ perf-gated `≥ OpenBLAS` on the dev fleet (Zen3/4/5); ⏳ correctness-first (numerically LAPACK-accurate, blocked/SIMD perf tuning is a documented follow-up); — n/a.
+- **Optimized** — ✅ perf-gated `≥ OpenBLAS` on the dev fleet (Zen3/4/5); 🔷 partially optimized (gates on a large sub-surface; a specific residual is a documented follow-up — see the note); ⏳ correctness-first (numerically LAPACK-accurate, blocked/SIMD perf tuning is a documented follow-up); — n/a.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
@@ -52,7 +52,7 @@ size crossover — **beats** OpenBLAS at large `n`.
 
 | Op | Routines | Types | Routes | Optimized |
 |---|---|---|---|---|
-| Symmetric / Hermitian | syev, syevd, syevr, heev*, sytrd, hetrd, stedc, steqr, sterf, ormtr | s/d/c/z | ✅ | ⏳ |
+| Symmetric / Hermitian | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, sterf, ormtr | s/d/c/z | ✅ | 🔷 |
 | Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | ⏳ |
 | Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | ⏳ |
 | Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | ⏳ |
@@ -60,6 +60,13 @@ size crossover — **beats** OpenBLAS at large `n`.
 | Generalized nonsym (QZ) | ggev, gges, gghrd, hgeqz, tgevc | s/d/c/z | ✅ | ⏳ |
 | Schur reordering | trexc, trsen | s/d/c/z | ✅ | ⏳ |
 | Sylvester / Lyapunov | trsyl | s/d/c/z | ✅ | ⏳ |
+
+🔷 **Symmetric / Hermitian eigensolver.** The two-sided reduction (`sytrd`/`hetrd`) and the
+eigenvector back-transform (`ormtr`/`unmtr`) are blocked (compact-WY / `dlatrd`+`syr2k`), Level-3
+and cache-blocked like OpenBLAS. As a result **complex Hermitian `heev` (all jobz) and real
+eigenvalues (`syev` jobz=`'N'`) gate `≥ OpenBLAS` fleet-wide** (Zen3/4/5). The one open residual is
+**real `syev` with eigenvectors (jobz=`'V'`) at large `n`**, bounded by the tridiagonal
+divide-and-conquer solver (`stedc`); closing it is a documented follow-up (the `stedc` D&C campaign).
 
 ## LAPACK — banded / tridiagonal / packed
 
