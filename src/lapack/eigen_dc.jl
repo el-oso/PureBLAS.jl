@@ -315,7 +315,14 @@ function _dc_eigen!(
     survivor_idx = findall(!, deflated)
     K = length(survivor_idx)
 
-    Dout = copy(dsort); Qout = copy(Zsort)   # deflated entries are already final at this point
+    # Eigenvalues in sorted-column order: deflated slots keep dsort; survivor slots overwritten by the
+    # secular roots below. `srcmap[i]` routes sorted-column i to its final eigenvector source in the
+    # single assembly pass at the end: j>0 ⇒ R[:,j] (secular combine), 0 ⇒ Zsort[:,i] (deflated column).
+    # This replaces the old `Qout = copy(Zsort)` + per-survivor scatter + `Qout[:,ord2]` resort — THREE
+    # O(n²) Q-copies/allocs per merge — with ONE write pass into Z (LAPACK dlaed2/dlaed3 assemble-once).
+    Dout = copy(dsort)
+    srcmap = zeros(Int, n)
+    R = Matrix{T}(undef, n, max(K, 0))     # survivor eigenvectors B·V (0 cols if none)
 
     if K > 0
         dlambda = dsort[survivor_idx]; w = zsort[survivor_idx]
@@ -359,22 +366,32 @@ function _dc_eigen!(
             end
         end
         B = Zsort[:, survivor_idx]           # gather the surviving basis columns (n×K)
-        R = Matrix{T}(undef, n, K)
         gemm!(R, B, V)                       # final eigenvectors for the survivor slots = B·V
         @inbounds for j in 1:K
             pos = survivor_idx[j]
-            Dout[pos] = lam[j]
-            for i in 1:n
-                Qout[i, pos] = R[i, j]
-            end
+            Dout[pos] = lam[j]; srcmap[pos] = j
         end
     end
 
     # final ascending re-sort merging deflated + secular eigenvalues, so the invariant ("d ascending
-    # on return") holds for the parent's z-extraction (last row of Q1 / first row of Q2).
+    # on return") holds for the parent's z-extraction (last row of Q1 / first row of Q2). Assemble Z's
+    # columns in the ascending order directly from R (survivors) / Zsort (deflated) — one O(n²) pass.
     ord2 = sortperm(Dout)
-    copyto!(d, Dout[ord2])                 # copyto!(view/dest, X), not .= / slice-assign: those carry Base
-    copyto!(Z, Qout[:, ord2])              # setindex_shape_check / DimensionMismatch error paths (--trim-unsafe)
+    @inbounds for p in 1:n
+        d[p] = Dout[ord2[p]]
+    end
+    @inbounds for p in 1:n
+        i = ord2[p]; j = srcmap[i]
+        if j > 0
+            for r in 1:n
+                Z[r, p] = R[r, j]
+            end
+        else
+            for r in 1:n
+                Z[r, p] = Zsort[r, i]
+            end
+        end
+    end
     return
 end
 
