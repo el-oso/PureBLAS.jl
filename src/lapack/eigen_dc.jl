@@ -275,6 +275,12 @@ function _dc_eigen!(
     # --- dlaed2: physically sort (d,z,Q-columns) into global ascending d order.
     ord = sortperm(d)
     dsort = d[ord]; zsort = z[ord]; Zsort = Z[:, ord]
+    # dlaed2 COLTYP: sorted column i originates from Q1 (rows 1:k → type 1) or Q2 (rows k+1:n → type 3);
+    # a cross-block Givens (rule b) turns the survivor DENSE (type 2). Drives the dlaed3 two-gemm split.
+    coltyp = Vector{Int}(undef, n)
+    @inbounds for i in 1:n
+        coltyp[i] = ord[i] <= k ? 1 : 3
+    end
 
     # deflation tolerance: LAPACK dlaed2 TOL = 64·DLAMCH('E')·max(...), DLAMCH('E')=eps(T)/2 → 32·eps·max.
     dmax = maximum(abs, dsort); zmax = maximum(abs, zsort)
@@ -302,6 +308,9 @@ function _dc_eigen!(
                 # rule (b): near-equal poles ⇒ Givens-zero pj's z, chain nj forward carrying τ
                 zsort[nj] = tau; zsort[pj] = zero(T)
                 _drot_cols!(Zsort, pj, nj, cc, ss)
+                if coltyp[pj] != coltyp[nj]
+                    coltyp[nj] = 2       # cross-block mix ⇒ survivor nj now dense (dlaed2 type 2)
+                end
                 newpj = dsort[pj] * cc * cc + dsort[nj] * ss * ss
                 newnj = dsort[pj] * ss * ss + dsort[nj] * cc * cc
                 dsort[pj] = newpj; dsort[nj] = newnj
@@ -365,8 +374,45 @@ function _dc_eigen!(
                 V[i, j] *= ninv
             end
         end
-        B = Zsort[:, survivor_idx]           # gather the surviving basis columns (n×K)
-        gemm!(R, B, V)                       # final eigenvectors for the survivor slots = B·V
+        # dlaed3 TWO-GEMM combine: survivors grouped by COLTYP as [type1|type2|type3]. Type-1 basis columns
+        # are zero in rows k+1:n, type-3 zero in rows 1:k, so the top row-block (1:k) needs only type-1∪2
+        # columns and the bottom (k+1:n) only type-2∪3 → TWO half-height gemms instead of one n×K×K, ~halving
+        # the dominant combine flops. B is gathered and V's rows permuted into grouped order (gperm); V's
+        # COLUMNS (output eigenvectors, j) stay ascending, so the assembly below is unchanged. (De-risked:
+        # full-length B gather retained — half-length packing of the zero halves is a follow-up.)
+        gperm = Vector{Int}(undef, K)        # secular index (1:K) reordered to [type1;type2;type3]
+        c1 = 0; c2 = 0; c3 = 0
+        @inbounds for tp in 1:3, i in 1:K
+            if coltyp[survivor_idx[i]] == tp
+                gperm[c1 + c2 + c3 + 1] = i
+                tp == 1 ? (c1 += 1) : tp == 2 ? (c2 += 1) : (c3 += 1)
+            end
+        end
+        N12 = c1 + c2; N23 = c2 + c3
+        B = Matrix{T}(undef, n, K); Vg = Matrix{T}(undef, K, K)
+        @inbounds for gp in 1:K
+            sc = survivor_idx[gperm[gp]]
+            for r in 1:n
+                B[r, gp] = Zsort[r, sc]
+            end
+            for jj in 1:K
+                Vg[gp, jj] = V[gperm[gp], jj]
+            end
+        end
+        if N12 > 0                           # top block R[1:k,:] ← type-1∪2 columns
+            gemm!(view(R, 1:k, 1:K), view(B, 1:k, 1:N12), view(Vg, 1:N12, 1:K))
+        else
+            @inbounds for j in 1:K, r in 1:k
+                R[r, j] = zero(T)
+            end
+        end
+        if N23 > 0                           # bottom block R[k+1:n,:] ← type-2∪3 columns
+            gemm!(view(R, (k + 1):n, 1:K), view(B, (k + 1):n, (c1 + 1):K), view(Vg, (c1 + 1):K, 1:K))
+        else
+            @inbounds for j in 1:K, r in (k + 1):n
+                R[r, j] = zero(T)
+            end
+        end
         @inbounds for j in 1:K
             pos = survivor_idx[j]
             Dout[pos] = lam[j]; srcmap[pos] = j
