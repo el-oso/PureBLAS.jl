@@ -860,6 +860,19 @@ function run_cmplx_benchmarks()
             c -> (LinearAlgebra.LAPACK.gesdd!(Char(78), c); real(c[1, 1])),   # 'N' — singular values only
             c -> (PureBLAS.gesvd!(c; want_vectors = false); 0.0)
         )
+        # Hermitian eigensolver (zheevd): blocked hetrd + D&C stedc + blocked unmtr. 'V' eigenpairs (Julia's
+        # default eigen(Hermitian)) and 'N' eigenvalues. syevd! on a complex matrix dispatches to zheevd.
+        _herm(s) = (A = randn(T, s, s); A .+ A')
+        addh(
+            "zheev", _herm,
+            c -> (LinearAlgebra.LAPACK.syevd!(Char(86), LP, c); real(c[1, 1])),   # 'V','L'
+            c -> (PureBLAS._heev!('V', 'L', c); real(c[1, 1]))
+        )
+        addh(
+            "zheevN", _herm,
+            c -> (LinearAlgebra.LAPACK.syevd!(Char(78), LP, c); real(c[1, 1])),   # 'N','L'
+            c -> (PureBLAS._heev!('N', 'L', c); real(c[1, 1]))
+        )
     end
     return cl1, cl2, cl3, clp
 end
