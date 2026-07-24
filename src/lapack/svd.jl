@@ -1090,6 +1090,52 @@ function _apply_reflectors_left!(
     return C
 end
 
+# COMPLEX blocked back-transform (zunmbr role): C := Q·C, Q = H_k·⋯·H_1 (trans='N'), applied in nb-wide
+# compact-WY blocks — the complex mirror of `_apply_reflectors_left!`, replacing the unblocked per-reflector
+# `_zapply_Q_left!`/`_zapply_P_left!` (BLAS-2 → BLAS-3 on ~half the with-vectors flops). `Vfull` is the
+# explicit unit-lower-trapezoid reflector panel (built by the caller with roff row-offset; the P-side stores
+# CONJUGATED essentials). Block reflector Q_b = I − V·T·Vᴴ: G = VᴴV (herk), zlarft T (upper), apply via
+# W = VᴴC (gemm 'C'), W := T·W (trmm), C −= V·W. Blocks run reverse (rightmost first ⇒ Q·C). Uses the
+# ws.bt_T/G/W buffers (grown for the complex workspace by the caller).
+function _zapply_reflectors_left!(
+        Vfull::AbstractMatrix{T}, tau::AbstractVector{T},
+        C::AbstractMatrix{T}, k::Int, nb::Int, roff::Int, ws::SVDWorkspace{T}
+    ) where {T <: Complex}
+    M = size(Vfull, 1); nc = size(C, 2)
+    (k == 0 || nc == 0) && return C
+    Tm = view(ws.bt_T, 1:nb, 1:nb); G = view(ws.bt_G, 1:nb, 1:nb); W = view(ws.bt_W, 1:nb, 1:nc)
+    nblk = cld(k, nb)
+    @inbounds for b in nblk:-1:1                          # reverse blocks ⇒ apply H(k)…H(1) = Q
+        pc = (b - 1) * nb + 1
+        pb = min(nb, k - pc + 1)
+        rs = pc + roff
+        Vp = view(Vfull, rs:M, pc:(pc + pb - 1))
+        Cb = view(C, rs:M, 1:nc)
+        Gv = view(G, 1:pb, 1:pb)
+        herk!(Gv, Vp; uplo = 'U', trans = 'C', alpha = true, beta = false)   # G = VᴴV, upper
+        Tv = view(Tm, 1:pb, 1:pb)                          # zlarft (forward): Q_b = I − V·T·Vᴴ, T upper
+        for c in 1:pb
+            tc = tau[pc + c - 1]
+            Tv[c, c] = tc
+            for ii in 1:(c - 1)
+                s = zero(T)
+                for kk in ii:(c - 1)
+                    s = muladd(Tv[ii, kk], Gv[kk, c], s)
+                end
+                Tv[ii, c] = -tc * s
+            end
+            for r in (c + 1):pb
+                Tv[r, c] = zero(T)
+            end
+        end
+        Wv = view(W, 1:pb, 1:nc)
+        gemm!(Wv, Vp, Cb; transA = 'C', alpha = true, beta = false)          # W = VᴴC
+        trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'N')                  # W := T·W
+        gemm!(Cb, Vp, Wv; alpha = -one(T), beta = one(T))                    # C −= V·W
+    end
+    return C
+end
+
 # Trim-safe transpose into a caller buffer B (n×m) ← A (m×n). Hand loop (permutedims isn't guaranteed
 # trim-clean and the C-ABI SVD path must be juliac-analyzable). O(mn), negligible vs the O(mn·min) SVD.
 function _svd_transpose!(B::AbstractMatrix{Float64}, A::AbstractMatrix{Float64})
@@ -1364,8 +1410,10 @@ function _zgesvd_core!(
         bdsdc!(d, e, Lvec, Rvec, rws)
     end
     s = d
+    nb = _BT_NB                                          # grow the compact-WY back-transform buffers (complex ws)
+    ws.bt_T = _gm(ws.bt_T, nb, nb); ws.bt_G = _gm(ws.bt_G, nb, nb); ws.bt_W = _gm(ws.bt_W, nb, max(nu, n))
     # U_A = Q·[Lvec 0; 0 I]: realify Lvec into the complex staging, push the n+1:nu unit columns through Q
-    # (they become the orthonormal complement of range(A) when full_u & m>n).
+    # (they become the orthonormal complement of range(A) when full_u & m>n). Q applied BLOCKED (zunmbr).
     UA = Matrix{T}(undef, m, nu)
     fill!(UA, zero(T))
     @inbounds for j in 1:n, i in 1:n
@@ -1374,13 +1422,31 @@ function _zgesvd_core!(
     @inbounds for j in (n + 1):nu
         UA[j, j] = one(T)
     end
-    _zapply_Q_left!(A, tauq, UA, m, n)
-    # V_A = P·Rvec (realify Rvec, apply the right reflectors).
+    VQ = Matrix{T}(undef, m, n)                          # explicit unit-trapezoid Q panel (un-conjugated essentials)
+    fill!(VQ, zero(T))
+    @inbounds for j in 1:n
+        VQ[j, j] = one(T)
+        for i in (j + 1):m
+            VQ[i, j] = A[i, j]
+        end
+    end
+    _zapply_reflectors_left!(VQ, tauq, UA, n, nb, 0, ws)
+    # V_A = P·Rvec (realify Rvec, apply the right reflectors BLOCKED; P essentials are CONJUGATED).
     VA = Matrix{T}(undef, n, n)
     @inbounds for j in 1:n, i in 1:n
         VA[i, j] = T(Rvec[i, j])
     end
-    _zapply_P_left!(A, taup, VA, n)
+    if n > 1
+        VP = Matrix{T}(undef, n, n - 1)
+        fill!(VP, zero(T))
+        @inbounds for j in 1:(n - 1)
+            VP[j + 1, j] = one(T)
+            for r in (j + 2):n
+                VP[r, j] = conj(A[j, r])
+            end
+        end
+        _zapply_reflectors_left!(VP, taup, VA, n - 1, nb, 1, ws)
+    end
     _svd_sort!(s, UA, VA)                                # descending; complement cols n+1:nu untouched
     @inbounds for i in 1:n
         S[i] = R(s[i])
