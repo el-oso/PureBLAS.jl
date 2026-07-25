@@ -315,10 +315,13 @@ end
 # COMPLEX; the LAPACK complex gesvd/gesdd ABI inserts an rwork block (real scratch) the real drivers lack —
 # ignored here (PureBLAS owns its scratch). gesvd! forms BOTH factors regardless, so 'N'/'O' get an owned
 # economy scratch (ws.cabi_U/cabi_Vt), 'O' then copied into A. One concrete gesvd! specialization ⇒ trim-safe.
+# Generic over T<:Complex (ComplexF64 AND ComplexF32): the complex SVD core (`_zgesvd_core!`/`gesvd_vals!`)
+# is already T-generic and the bidiagonal D&C refines in Float64 regardless, so ComplexF32 runs NATIVELY
+# here — no promote-demote to ComplexF64 (was ~2× flops + memory in the old `_csvd_cabi_f32!`).
 @inline function _zsvd_cabi!(
-        ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{ComplexF64}, ld::Int,
-        S::Ptr{Float64}, U::Ptr{ComplexF64}, ldu::Int, VT::Ptr{ComplexF64}, ldvt::Int, info::Ptr{Int64}
-    )
+        ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{T}, ld::Int,
+        S::Ptr{R}, U::Ptr{T}, ldu::Int, VT::Ptr{T}, ldvt::Int, info::Ptr{Int64}
+    ) where {T <: Complex, R <: Real}
     mn = min(M, N)
     u_ok = ju == 'N' || ju == 'S' || ju == 'A' || ju == 'O'
     v_ok = jvt == 'N' || jvt == 'S' || jvt == 'A' || jvt == 'O'
@@ -334,7 +337,7 @@ end
     full_v = jvt == 'A' && N > M
     ncu = ju == 'A' ? M : mn
     ncv = jvt == 'A' ? N : mn
-    ws = _svdws(ComplexF64)
+    ws = _svdws(T)
     uscr = ju == 'N' || ju == 'O'
     vscr = jvt == 'N' || jvt == 'O'
     uscr && (ws.cabi_U = _gm(ws.cabi_U, M, mn))
@@ -399,47 +402,6 @@ Base.@ccallable function zgesdd_64_(
     return
 end
 
-# ComplexF32 SVD via mixed precision: promote A→ComplexF64, run the ComplexF64 driver into F64 scratch,
-# demote outputs (S→Float32, U/VT→ComplexF32). Mirrors _svd_cabi_f32! (the real F32 path).
-@inline function _csvd_cabi_f32!(
-        ju::Char, jvt::Char, M::Int, N::Int, A::Ptr{ComplexF32}, ld::Int,
-        S::Ptr{Float32}, U::Ptr{ComplexF32}, ldu::Int, VT::Ptr{ComplexF32}, ldvt::Int, info::Ptr{Int64}
-    )
-    mn = min(M, N)
-    Af = Matrix{ComplexF64}(undef, M, N); Am = PtrMatrix(A, M, N, ld)
-    @inbounds for j in 1:N, i in 1:M
-        Af[i, j] = ComplexF64(Am[i, j])
-    end
-    Sf = Vector{Float64}(undef, mn)
-    needU = ju != 'N'; needV = jvt != 'N'
-    ncu = ju == 'A' ? M : mn; ncv = jvt == 'A' ? N : mn
-    Uf = Matrix{ComplexF64}(undef, M, needU ? ncu : 1)
-    Vf = Matrix{ComplexF64}(undef, needV ? ncv : 1, N)
-    GC.@preserve Af Sf Uf Vf begin
-        _zsvd_cabi!(
-            ju, jvt, M, N, pointer(Af), M, pointer(Sf), pointer(Uf), M,
-            pointer(Vf), needV ? ncv : 1, info
-        )
-        unsafe_load(info) == 0 || return
-        Sm = PtrVector(S, mn); @inbounds for i in 1:mn
-            Sm[i] = Float32(Sf[i])
-        end
-        if needU
-            Um = PtrMatrix(U, M, ncu, ldu)
-            @inbounds for j in 1:ncu, i in 1:M
-                Um[i, j] = ComplexF32(Uf[i, j])
-            end
-        end
-        if needV
-            Vm = PtrMatrix(VT, ncv, N, ldvt)
-            @inbounds for j in 1:N, i in 1:ncv
-                Vm[i, j] = ComplexF32(Vf[i, j])
-            end
-        end
-    end
-    return
-end
-
 Base.@ccallable function cgesvd_64_(
         jobu::Ptr{UInt8}, jobvt::Ptr{UInt8}, m::Ptr{Int64}, n::Ptr{Int64},
         A::Ptr{ComplexF32}, lda::Ptr{Int64}, S::Ptr{Float32}, U::Ptr{ComplexF32}, ldu::Ptr{Int64},
@@ -449,7 +411,7 @@ Base.@ccallable function cgesvd_64_(
     if unsafe_load(lwork) == Int64(-1)
         unsafe_store!(work, ComplexF32(1)); unsafe_store!(info, Int64(0)); return
     end
-    _csvd_cabi_f32!(
+    _zsvd_cabi!(                                            # native ComplexF32 (generic; no promote-demote)
         _cabi_char(jobu), _cabi_char(jobvt), Int(unsafe_load(m)), Int(unsafe_load(n)),
         A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info
     )
@@ -469,7 +431,7 @@ Base.@ccallable function cgesdd_64_(
     if jz == 'O'
         unsafe_store!(info, Int64(-1)); return
     end
-    _csvd_cabi_f32!(
+    _zsvd_cabi!(                                            # native ComplexF32 (generic; no promote-demote)
         jz, jz, Int(unsafe_load(m)), Int(unsafe_load(n)),
         A, Int(unsafe_load(lda)), S, U, Int(unsafe_load(ldu)), VT, Int(unsafe_load(ldvt)), info
     )
