@@ -87,6 +87,34 @@ Both modes share ONE set of low-level kernels. Source map:
    existing literals (`_KC`, `_MC`, `_NC`, `_CPOTRF_BASE`, `_CPOTRF_NBMAX`, the `_vwidth==4 ? …` cuts) are
    tech debt to migrate to derived formulas.
 
+8b. **THE "PDM LADDER" (Pin → Derive → Measure) — the NAMED, MANDATORY mechanism for req#7/#8. Every
+   machine-dependent constant is a "self-tuning constant"; a bare OR validated-literal default is a
+   VIOLATION ("No Fixed Tuning").** This is the rule I keep forgetting — enforce it explicitly. Refer to
+   the mechanism as **"the PDM ladder"**; a knob obeying it is a **"self-tuning constant."** EVERY tuning
+   knob (block size, cutoff, panel width, unroll, fuse factor, stream count, algorithm-switch threshold)
+   resolves in exactly this order:
+   - **P — Pin:** `@load_preference("name", <default>)`. A set Preference always wins (calibration,
+     cross-compile, and the trim/.so build — which MUST pin any Measure-tier knob, since a runtime
+     benchmark is not trim-safe).
+   - **D — Derive:** if the optimum is **physically predictable from a detected const** (cache RESIDENCY,
+     SIMD width, register count), the default is a **FORMULA** over `_L1/L2/L3_BYTES`, `_vwidth`, `_NVREG`,
+     … — zero runtime cost, const-folds (trim-safe), adapts to unseen machines. E.g. `_GEMVN_RB_MAXA =
+     _L3_BYTES ÷ 4`, `_qr_nb`.
+   - **M — Measure:** if the optimum is **NOT predictable from detected consts** — it depends on port
+     balance / prefetcher / write-stream count and can INVERT sign across µarchs (the TELL: our own model
+     mispredicts a box we HAVE) — the default is an **on-host auto-tune**: `Base.OncePerProcess` measuring
+     a **formula-bounded candidate set**, `@static if isnothing(pref)`-gated so a pinned build never
+     benchmarks. Mirror `_ger_np` / `_gemvt_nc`. The candidate set is itself **Derived** (e.g. NC bounded
+     by `_NVREG`) — so BOTH the bounds and the selection adapt to unseen hardware.
+
+   **The decision D-vs-M IS the rule:** for every machine-dependent number, ask *"is this physically
+   predictable from a detected const?"* — **Yes ⇒ Derive, No ⇒ Measure. There is NO third option.** A
+   fixed literal, or a datapath-gated literal like `_double_pumped(_HW) ? 8 : 4`, is NOT a valid answer —
+   it is a Measure-tier knob that hasn't been converted yet (correct only for the µarchs we've
+   benchmarked; wrong on unseen ones). When you write ANY tuning number, STATE its tier in the code
+   comment; if you can neither give a Derive formula nor a Measure harness+candidate-set, STOP — it's a
+   violation.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
