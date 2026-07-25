@@ -479,25 +479,40 @@ end
 
 # gemv-T: column-block (4 cols/pass sharing each x W-chunk) for all n. Sharing x cuts both the small-n
 # per-column overhead AND the huge-n x-restream (x exceeds L1 at n≈4096; per-column re-read it n times).
-# gemv-T column-block width (cols/pass). `_gemv_t_block!` issues 1 shared-x load + NC A-loads + NC FMAs
-# per iteration ⇒ on a datapath that sustains ~1 SIMD-load/cycle it is LOAD-slot bound and the x-load is
-# 1/(NC+1) of the slots. Zen4 double-pumped 512 (2×256 load pipes) is exactly that regime: NC=4 → the x-load
-# wastes 20% of load bandwidth; NC=8 (= BLIS dotxf's fuse factor) cuts it to 11% → ~10% throughput, closing
-# the measured PB/AOCL 0.89–0.94 tall-skinny gap (Fable-diagnosed; port arithmetic predicts 0.90). AVX2 (W<8,
-# 16 ymm) is also load-bound and fits 8 accs + x ⇒ NC=8. NATIVE-512 (Zen5, 2×512 load ports) is NOT load-
-# bound ⇒ NC=8 falsified there ⇒ keep 4. Derived from the datapath, req#8-clean; Preferences-overridable.
-const _GEMVT_NC = @load_preference("gemvt_nc", (_double_pumped(_HW) || _vwidth(Float64) < 8) ? 8 : 4)::Int
-@inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
+# gemv-T column-block width NC (cols/pass). `_gemv_t_block!` issues 1 shared-x load + NC A-loads + NC FMAs
+# per iteration, so on a LOAD-slot-bound datapath the x-load wastes 1/(NC+1) of the load bandwidth — deeper
+# NC amortizes it (Zen4 double-pumped: NC=4 wastes 20%, NC=8 wastes 11%, closing the AOCL/BLIS tall-skinny
+# gap). But whether the datapath IS load-bound — and how deep NC pays before the prefetcher/scheduler stops
+# caring — is a per-µarch property with NO derivable formula and OPPOSITE sign across boxes (measured: Zen4
+# wants 8, native-512 Zen5 wants 4 — the naive load-port model MISpredicts Zen5). Exactly like `_ger_np`, so
+# resolve it the same way: AUTO-TUNE per host. The register file bounds the CANDIDATE set (NC accumulators +
+# x + a temp ≤ _NVREG, derived → adapts to unseen register widths); the SELECTION is measured on the actual
+# silicon (adapts to unseen µarch, which a formula cannot). A `gemvt_nc` Preference PINS it (the trim/.so
+# build MUST set it — the runtime measure is not trim-safe); else it's measured ONCE per process on first use
+# via OncePerProcess (no __init__ ⇒ a pinned .so never benchmarks at load).
+const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
+
+# Runtime-NC → Val dispatch (the candidate widths get their own @generated `_gemv_t_block!` specializations).
+@inline function _gemv_t_blk!(yp::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T}, m::Int, α::T, β::T, nc::Int, ::Val{B0}) where {T, B0}
+    if nc >= 16
+        _gemv_t_block!(yp, Ab, lda, xp, m, α, β, Val(16), Val(B0))
+    elseif nc >= 8
+        _gemv_t_block!(yp, Ab, lda, xp, m, α, β, Val(8), Val(B0))
+    else
+        _gemv_t_block!(yp, Ab, lda, xp, m, α, β, Val(4), Val(B0))
+    end
+    return nothing
+end
+# Full column-sweep at a given block width `nc`: nc-blocks, then a 4-wide mid-remainder, then per-column dots.
+@inline function _gemv_t_sweep!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         j = 0
-        while j + _GEMVT_NC <= n
-            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(_GEMVT_NC), Val(B0))
-            j += _GEMVT_NC
+        while j + nc <= n
+            _gemv_t_blk!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, nc, Val(B0)); j += nc
         end
-        while j + 4 <= n                # mid-remainder (only when _GEMVT_NC>4): one NC=4 block
-            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))
-            j += 4
+        while j + 4 <= n                # mid-remainder (only when nc>4): one NC=4 block
+            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0)); j += 4
         end
         @inbounds while j < n           # remainder columns: per-column dot
             s = _dot_simd(m, Aptr + j * lda * sz, xptr, T)
@@ -508,6 +523,35 @@ const _GEMVT_NC = @load_preference("gemvt_nc", (_double_pumped(_HW) || _vwidth(F
     end
     return y
 end
+const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
+@static if isnothing(_GEMVT_NC_PREF)
+    function _measure_gemvt_nc()::Int
+        Base.generating_output() && return 4                    # never benchmark during precompilation
+        try
+            n = 64
+            m = max(1024, _L2_BYTES ÷ (n * sizeof(Float64)))    # A ≈ L2 → the LOAD-bound regime where NC matters
+            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(1.0, n)   # pre-touch pages
+            best = 4; bt = typemax(UInt64)
+            for nc in _GEMVT_NC_CANDIDATES
+                _gemv_t_sweep!(m, n, 1.0, A, x, 0.0, y, nc, Val(true))          # untimed warmup (absorbs JIT)
+                t = typemax(UInt64)
+                for _ in 1:5
+                    s = time_ns(); _gemv_t_sweep!(m, n, 1.0, A, x, 0.0, y, nc, Val(true)); t = min(t, time_ns() - s)
+                end
+                t < bt && (bt = t; best = nc)
+            end
+            return best
+        catch
+            return 4
+        end
+    end
+    const _GEMVT_NC_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_nc)
+    @inline _gemvt_nc() = _GEMVT_NC_ONCE()
+else
+    @inline _gemvt_nc() = _GEMVT_NC_PREF::Int
+end
+@inline _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, b0::Val) where {T <: BlasReal} =
+    _gemv_t_sweep!(m, n, α, A, x, β, y, _gemvt_nc(), b0)
 
 # y := β·y + α·op(A)·x. trans: false=N, true=T/C; cj: conjugate (op='C').
 # Complex unit-stride L2 eligibility (mirror _l2_simd_ok for the complex SIMD paths).

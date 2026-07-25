@@ -22,11 +22,17 @@ cmd = `$(Base.julia_cmd()) --startup-file=no --project=$ROOT $JULIAC
 # shipped Project.toml deliberately omits this pref so Mode-2 (in-Julia) users auto-calibrate per µarch — so
 # we set it here via Preferences (writing ROOT's gitignored LocalPreferences.toml), scoped to the build, then
 # restore the prior state. Value is arbitrary among 1/2/4/8; the .so uses a fixed stream count regardless.
+# Pin `gemvt_nc` too, for the same reason: gemv-T's OncePerProcess NC auto-tune is a runtime benchmark
+# (not trim-safe); the pref compiles the `@static if` measure branch out. The .so can't auto-tune per host,
+# so it takes a fixed NC — 8 (the double-pumped-512 / AVX2 win; a native-512 host loses ~a few % but Mode-2
+# there auto-tunes to 4). Shipped Project.toml omits it so Mode-2 measures per box.
 Base.set_active_project(joinpath(ROOT, "Project.toml"))   # so set_preferences! targets ROOT's LocalPreferences
 using Preferences
 const PUREBLAS_UUID = Base.UUID("cc9e14db-574f-4602-bf53-1167cc4b26d2")
 const _prev_ger = load_preference(PUREBLAS_UUID, "ger_panel_np")
+const _prev_gemvt = load_preference(PUREBLAS_UUID, "gemvt_nc")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
+set_preferences!(PUREBLAS_UUID, "gemvt_nc" => 8; force = true)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -36,6 +42,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "ger_panel_np"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "ger_panel_np" => _prev_ger; force = true)
+    end
+    if _prev_gemvt === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_nc"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_nc" => _prev_gemvt; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
