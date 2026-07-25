@@ -571,7 +571,7 @@ end
 # index duplicated per pair, so no deinterleave/extract shuffle at all — memory-bandwidth-bound like OB.
 @inline @generated function _cmag2(v::Vec{N, T}) where {N, T}
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)   # swap adjacent re↔im
-    return :((av = abs(v); av + shufflevector(av, Val($swp))))
+    return :($(Expr(:meta, :inline)); (av = abs(v); av + shufflevector(av, Val($swp))))
 end
 @inline function _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 4W
@@ -609,5 +609,5 @@ end
 # masked remainder magnitude: masked-out reals load as 0, so |·| pairs sum correctly (0 lanes stay 0).
 @inline @generated function _cmag2_masked(av::Vec{N, T}) where {N, T}
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)
-    return :(av + shufflevector(av, Val($swp)))
+    return :($(Expr(:meta, :inline)); av + shufflevector(av, Val($swp)))
 end
