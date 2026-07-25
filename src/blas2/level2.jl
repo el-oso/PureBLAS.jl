@@ -412,8 +412,14 @@ end
     return y
 end
 
+# Row-block wins only while A is CACHE-RESIDENT: it reads A in mr-row × 8B chunks jumping lda·8 between
+# columns (n strided streams) — prefetcher-hostile once A leaves cache. The `n ≤ _GEMVN_RB` cut bounds n but
+# NOT the footprint, so large-m mid-n (e.g. m=5600·n=320 = 14 MB) wrongly took it (measured 0.82–0.86 vs
+# AOCL). Cap the row-block on A bytes too (≈¼L3 fits the measured crossover: 3.6 MB fine, 7 MB borderline,
+# 14 MB broken) → beyond it, minner streams A contiguously with an L1-resident y-block (DRAM-friendly).
+const _GEMVN_RB_MAXA = @load_preference("gemvn_rb_maxa", _L3_BYTES ÷ 4)::Int
 @inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
-    if n <= _GEMVN_RB
+    if n <= _GEMVN_RB && m * n * sizeof(T) <= _GEMVN_RB_MAXA
         _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0))
     elseif _GEMVN_MINNER && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
         _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
@@ -473,11 +479,23 @@ end
 
 # gemv-T: column-block (4 cols/pass sharing each x W-chunk) for all n. Sharing x cuts both the small-n
 # per-column overhead AND the huge-n x-restream (x exceeds L1 at n≈4096; per-column re-read it n times).
+# gemv-T column-block width (cols/pass). `_gemv_t_block!` issues 1 shared-x load + NC A-loads + NC FMAs
+# per iteration ⇒ on a datapath that sustains ~1 SIMD-load/cycle it is LOAD-slot bound and the x-load is
+# 1/(NC+1) of the slots. Zen4 double-pumped 512 (2×256 load pipes) is exactly that regime: NC=4 → the x-load
+# wastes 20% of load bandwidth; NC=8 (= BLIS dotxf's fuse factor) cuts it to 11% → ~10% throughput, closing
+# the measured PB/AOCL 0.89–0.94 tall-skinny gap (Fable-diagnosed; port arithmetic predicts 0.90). AVX2 (W<8,
+# 16 ymm) is also load-bound and fits 8 accs + x ⇒ NC=8. NATIVE-512 (Zen5, 2×512 load ports) is NOT load-
+# bound ⇒ NC=8 falsified there ⇒ keep 4. Derived from the datapath, req#8-clean; Preferences-overridable.
+const _GEMVT_NC = @load_preference("gemvt_nc", (_double_pumped(_HW) || _vwidth(Float64) < 8) ? 8 : 4)::Int
 @inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         j = 0
-        while j + 4 <= n
+        while j + _GEMVT_NC <= n
+            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(_GEMVT_NC), Val(B0))
+            j += _GEMVT_NC
+        end
+        while j + 4 <= n                # mid-remainder (only when _GEMVT_NC>4): one NC=4 block
             _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))
             j += 4
         end
