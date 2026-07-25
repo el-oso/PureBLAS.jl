@@ -1999,9 +1999,21 @@ end
         push!(inner.args, :($(Symbol(:av, mi)) = $aload))
         push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
     end
+    # OOB FIX (direct-read B has NO padding, unlike a packed panel): the k-loop must not read columns
+    # past the last valid one on a PARTIAL tile (nre < NR). The store epilogue already masks `j-1 ≥ nre`,
+    # so clamping the READ column is sufficient — those lanes are computed and then discarded. Without the
+    # clamp this walks off the caller's array: harmless when it lands in mapped memory, a SEGFAULT when it
+    # crosses an unmapped page (flaky; reproduced via complex gebrd's trailing gemm). Same bug class as the
+    # real path's direct-read fix — see kb `directb-masked-oob-guardpage`. The clamped column base is
+    # loop-invariant, so hoist it out of the k-loop and add only the k-step inside.
     for j in 1:NR
-        boff = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
-        push!(inner.args, :($(Symbol(:bp, j)) = B + $boff))
+        push!(body.args, :($(Symbol(:jc, j)) = jr + min($(j - 1), nre - 1)))
+        bbase = TB ? :(B + 2 * $(Symbol(:jc, j)) * $sz) : :(B + 2 * $(Symbol(:jc, j)) * ldb * $sz)
+        push!(body.args, :($(Symbol(:bb, j)) = $bbase))
+    end
+    for j in 1:NR
+        bstep = TB ? :(2 * p * ldb * $sz) : :(2 * p * $sz)
+        push!(inner.args, :($(Symbol(:bp, j)) = $(Symbol(:bb, j)) + $bstep))
         push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
         push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
         for mi in 1:MR
