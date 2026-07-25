@@ -477,8 +477,61 @@ function _labrd!(
     return As
 end
 
-const _BRD_NB = 16     # bidiagonalization panel width; measured optimal across n=256–2048 (narrow panel ⇒
-# less BLAS-2 work/panel; the rank-16 trailing gemm stays efficient). ponytail: Zen4.
+# Bidiagonalization panel width — PDM **MEASURE** tier (req#8b). It was a literal 16 ("measured optimal
+# across n=256–2048"), and that value went STALE for a reason that is itself the argument for Measure:
+# fixing an unrelated inlining bug (84ffacf) made the panel's gemv ~3× faster, which shifted the
+# panel-vs-trailing balance and made nb=8 beat 16 by 7–13% at EVERY size — including inside the range the
+# old literal claimed to own. An optimum that moves when a DIFFERENT kernel gets faster is by definition
+# not predictable from detected hardware consts, so Derive is the wrong tier: it must be measured on the
+# host. Pin → Derive(candidates+buffer bound) → Measure(selection), mirroring `_ger_np`.
+#
+# `_BRD_NB_MAX` bounds the CANDIDATES and sizes the GKH-owned workspace buffers, so every candidate fits
+# the owner's allocation — the auto-tune can never pick an nb the buffers can't hold. (Do NOT reach into
+# the workspace to widen it: that is an ownership violation, and the direct-read gemm then reads off the
+# end — how the pre-existing OOB in `_uker_cmplx!` was surfaced.)
+const _BRD_NB_MAX = max(16, 2 * _vwidth(Float64))
+const _BRD_NB_CANDS = Tuple(sort!(collect(unique(
+    clamp.((_vwidth(Float64) ÷ 2, _vwidth(Float64), 2 * _vwidth(Float64), _BRD_NB_MAX), 2, _BRD_NB_MAX)
+))))::Tuple{Vararg{Int}}
+const _BRD_NB = _BRD_NB_MAX          # legacy name: buffer-sizing bound (NOT the chosen panel width)
+const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
+@static if isnothing(_BRD_NB_PREF)
+    # Measured ONCE per process on first bidiagonalization (no __init__, so a pinned/trimmed .so never
+    # benchmarks at load). TOTAL try/catch: OncePerProcess poisons the whole process if the initializer
+    # throws. n=256 is the probe size — big enough that the panel/trailing balance is the thing being
+    # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
+    function _measure_brd_nb()::Int
+        Base.generating_output() && return 16          # never benchmark during precompilation
+        try
+            n = 256
+            A0 = Matrix{ComplexF64}(undef, n, n)
+            @inbounds for j in 1:n, i in 1:n
+                A0[i, j] = ComplexF64(sinpi((i + 2j) / n), cospi((3i - j) / n))   # deterministic, no RNG dep
+            end
+            ws = _svdws(ComplexF64); _svd_grow_bidiag!(ws, n, n)
+            d = zeros(Float64, n); e = zeros(Float64, n - 1)
+            tq = Vector{ComplexF64}(undef, n); tp = Vector{ComplexF64}(undef, n)
+            A = similar(A0)
+            best = 16; bt = typemax(UInt64)
+            for nb in _BRD_NB_CANDS
+                copyto!(A, A0); gebrd!(A, d, e, tq, tp, ws; nb = nb)             # untimed warmup (JIT)
+                t = typemax(UInt64)
+                for _ in 1:3
+                    copyto!(A, A0)
+                    s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); t = min(t, time_ns() - s)
+                end
+                t < bt && (bt = t; best = nb)
+            end
+            return best
+        catch
+            return 16
+        end
+    end
+    const _BRD_NB_ONCE = Base.OncePerProcess{Int}(_measure_brd_nb)
+    @inline _brd_nb() = _BRD_NB_ONCE()
+else
+    @inline _brd_nb() = _BRD_NB_PREF::Int
+end
 # Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
 # register-invariant compact-WY panel cap — the SAME value `_qr_nb` caps at (its comment: cap 32,
 # "µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs"). The panel is deep enough to amortize the rank-nb
@@ -579,7 +632,7 @@ end
 function gebrd!(
         A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
         tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64};
-        nb::Int = _BRD_NB
+        nb::Int = _brd_nb()
     )
     m, n = size(A)
     m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
@@ -620,7 +673,7 @@ end
 # (the first with transB='C' — the block update is A −= V·Yᴴ − X·Uᴴ), unblocked zgebd2! tail. m ≥ n.
 function gebrd!(
         A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq::AbstractVector{T},
-        taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _BRD_NB
+        taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _brd_nb()
     ) where {T <: Complex, R <: Real}
     m, n = size(A)
     m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))

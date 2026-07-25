@@ -26,7 +26,12 @@ Base.set_active_project(joinpath(ROOT, "Project.toml"))   # so set_preferences! 
 using Preferences
 const PUREBLAS_UUID = Base.UUID("cc9e14db-574f-4602-bf53-1167cc4b26d2")
 const _prev_ger = load_preference(PUREBLAS_UUID, "ger_panel_np")
+# Pin `brd_nb` too: gebrd's OncePerProcess panel-width auto-tune is a runtime benchmark (not trim-safe);
+# the pref compiles the `@static if` measure branch out. The .so can't auto-tune per host, so it takes the
+# measured Zen4 optimum; Mode-2 (in-Julia) users still measure per box because Project.toml omits it.
+const _prev_brd = load_preference(PUREBLAS_UUID, "brd_nb")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
+set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -36,6 +41,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "ger_panel_np"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "ger_panel_np" => _prev_ger; force = true)
+    end
+    if _prev_brd === nothing
+        delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "brd_nb" => _prev_brd; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
