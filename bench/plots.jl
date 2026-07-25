@@ -501,6 +501,13 @@ function run_benchmarks()
             c -> (LinearAlgebra.LAPACK.getrf!(c); c[1, 1]),
             c -> (PureBLAS.getrf!(c); c[1, 1])
         )
+        # Pivoted (semidefinite) Cholesky — blocked dpstrf: BLAS-2 pivoted panel + rank-jb syrk trailing,
+        # with the leading row swaps batched per panel (they are stride-lda and were ~47% of the runtime).
+        addh(
+            "pstrf", s -> _hpd(Float64, s),
+            c -> (LinearAlgebra.LAPACK.pstrf!(LP, c, -1.0); c[1, 1]),
+            c -> (PureBLAS.pstrf!(c, -1.0; uplo = LP); c[1, 1])
+        )
         # real gesvd capped at 2048: OB gesdd is divide-and-conquer, PB is QR-iteration — at 4096 with vectors
         # that algorithm mismatch dominates (no actionable signal) and a single sample isn't seconds-bounded.
         addh(
