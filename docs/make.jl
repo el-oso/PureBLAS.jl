@@ -18,6 +18,7 @@ makedocs(;
         "Guide" => "guide.md",
         "Design" => "design.md",
         "SIMD & Hardware Adaptation" => "simd.md",
+        "Tuning Constants" => "tuning.md",
         "Performance" => "performance.md",
         "LAPACK/BLAS Coverage" => "coverage.md",
     ],

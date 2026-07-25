@@ -357,8 +357,14 @@ end
 
 const _BRD_NB = 16     # bidiagonalization panel width; measured optimal across n=256–2048 (narrow panel ⇒
 # less BLAS-2 work/panel; the rank-16 trailing gemm stays efficient). ponytail: Zen4.
-const _BT_NB = 32      # back-transform (compact-WY dlarfb) block: larger than gebrd's — its gemms want
-# bigger T blocks (nb=16 there regressed large-n vectors). Decoupled from _BRD_NB.
+# Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
+# register-invariant compact-WY panel cap — the SAME value `_qr_nb` caps at (its comment: cap 32,
+# "µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs"). The panel is deep enough to amortize the rank-nb
+# trailing gemm while the T-factor (nb²) stays L1-resident; that balance is 32 on AVX2 (16 regs) and AVX-512
+# (32) alike — deriving off _NVREG would evaluate to 32 on every real machine, so a formula adds nothing
+# (cf. `_TR_TB`). Bigger than the bidiag panel `_BRD_NB` (nb=16 here regressed large-n vectors). Pinned
+# (P-tier) for calibration/override; fleet-confirm the invariance if a very-wide-register box ever appears.
+const _BT_NB = @load_preference("bt_nb", 32)::Int
 const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
 # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
 # FAILS on near-degenerate singular-value clusters (two σ agreeing to relative spread

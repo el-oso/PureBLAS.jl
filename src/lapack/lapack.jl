@@ -351,8 +351,13 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # So 16 is a measured µarch-invariant base cap (a crossover, not a cache/width size), correctly flat. Knob-able.
 @inline _chol_sth(::Type{T}) where {T} = 16      # base-case element crossover (µarch-invariant; fleet-tuned later)
 @inline _chol_sb(::Type{T}) where {T} = 32       # small-n rl block size (= 2·_chol_sth)
-const _CHOL_NB = 4                                # trsm panel column block
-const _CHOL_NC = 4                                # syrk column block
+# trsm/syrk column block = the register-TILE WIDTH of the fused Cholesky base kernel (columns unrolled with
+# register rank-update accumulators). PDM: proven-invariant Exempt, NOT a cache/width size — 4 columns ×
+# their accumulators fit the register file on every ISA, and the small Cholesky base does not benefit from a
+# wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
+# across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
+const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
+const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
