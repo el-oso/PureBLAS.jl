@@ -225,6 +225,9 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 const L2SZ = (64, 128, 256, 512, 1024, 2048, 4096)
 const L3SZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
 const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations, to 4096
+# Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
+# the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
+const TDSZ = (256, 1024, 4096, 16384, 65536, 262144)
 const TN = Char(78); const TT = Char(84); const U = Char(85)
 
 # Run the full benchmark sweep; returns (l1, l2, l3, lp) as vectors of OpData.
@@ -529,6 +532,51 @@ function run_benchmarks()
             "syevN", _sym,
             c -> (LinearAlgebra.LAPACK.syevd!(Char(78), LP, c); c[1, 1]),   # 'N','L'
             c -> (PureBLAS._syev!('N', 'L', c); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        # ── Tridiagonal (O(n), so swept over TDSZ's much larger n, not LPSZ) ───────────────────────────
+        # These are serial 3-term recurrences: the gate here is a divide→multiply→subtract latency chain,
+        # not flops, and the levers are store streams and register-carried recurrences (see tridiag.jl).
+        # gttrs/pttrs consume a factorization, so `mk` builds and factors the context (mk is excluded from
+        # the timed core). gttrf allocates du2/ipiv on BOTH sides — Julia's LAPACK.gttrf! wrapper allocates
+        # them internally, so PureBLAS must pay the same to keep the comparison honest.
+        _gtd(s) = (randn(s - 1), [4.0 + abs(randn()) for _ in 1:s], randn(s - 1), randn(s))
+        _ptd(s) = ([2.0 + abs(randn()) for _ in 1:s], randn(s - 1) ./ 4, randn(s))
+        addh(
+            "gtsv", _gtd,
+            c -> (LinearAlgebra.LAPACK.gtsv!(c[1], c[2], c[3], c[4]); c[4][1]),
+            c -> (PureBLAS.gtsv!(c[1], c[2], c[3], c[4]); c[4][1]); sizes = TDSZ
+        )
+        addh(
+            "gttrf", _gtd,
+            c -> (LinearAlgebra.LAPACK.gttrf!(c[1], c[2], c[3]); c[2][1]),
+            c -> (
+                PureBLAS.gttrf!(
+                    c[1], c[2], c[3], Vector{Float64}(undef, length(c[2]) - 2),
+                    Vector{Int}(undef, length(c[2]))
+                ); c[2][1]
+            ); sizes = TDSZ
+        )
+        _gtf(s) = (c = _gtd(s); (LinearAlgebra.LAPACK.gttrf!(c[1], c[2], c[3])..., c[4]))
+        addh(
+            "gttrs", _gtf,
+            c -> (LinearAlgebra.LAPACK.gttrs!(TN, c[1], c[2], c[3], c[4], c[5], c[6]); c[6][1]),
+            c -> (PureBLAS.gttrs!(TN, c[1], c[2], c[3], c[4], c[5], c[6]); c[6][1]); sizes = TDSZ
+        )
+        addh(
+            "pttrf", _ptd,
+            c -> (LinearAlgebra.LAPACK.pttrf!(c[1], c[2]); c[1][1]),
+            c -> (PureBLAS.pttrf!(c[1], c[2]); c[1][1]); sizes = TDSZ
+        )
+        _ptf(s) = (c = _ptd(s); (LinearAlgebra.LAPACK.pttrf!(c[1], c[2])..., c[3]))
+        addh(
+            "pttrs", _ptf,
+            c -> (LinearAlgebra.LAPACK.pttrs!(c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.pttrs!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
+        )
+        addh(
+            "ptsv", _ptd,
+            c -> (LinearAlgebra.LAPACK.ptsv!(c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.ptsv!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
         )
     end
     return l1, l2, l3, lp
