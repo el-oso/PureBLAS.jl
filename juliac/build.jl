@@ -30,8 +30,10 @@ const _prev_ger = load_preference(PUREBLAS_UUID, "ger_panel_np")
 # the pref compiles the `@static if` measure branch out. The .so can't auto-tune per host, so it takes the
 # measured Zen4 optimum; Mode-2 (in-Julia) users still measure per box because Project.toml omits it.
 const _prev_brd = load_preference(PUREBLAS_UUID, "brd_nb")
+const _prev_pbt = load_preference(PUREBLAS_UUID, "pbtrf_cross_kd")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
+set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -46,6 +48,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "brd_nb" => _prev_brd; force = true)
+    end
+    if _prev_pbt === nothing
+        delete_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => _prev_pbt; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
