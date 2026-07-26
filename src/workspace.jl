@@ -29,6 +29,7 @@ mutable struct L3Workspace{T}
     trsm_tmp::Matrix{T}   # _trsm_tmp:    trsm invL/invR copyback temp (grows m×n)
     apad::Matrix{T}       # _l3_apad:     trsm po2-ld A-pad, ld=k+8 (grows)
     rpack::Matrix{T}      # _trsm_rpack:  side-R fused-leaf pT scratch, ODD ld (conflict-free re-reads; grows)
+    rrefl::Matrix{T}      # _trsm_rrefl:  side-R NOTRANS reflected coefficients Ã=J·Aᵀ·J (lower), ODD ld (grows)
     ftrsm::Vector{T}      # _trsm_fused_buf: side-L gemmtrsm leaf packed row-major stripe P + recip (grows)
     potf2::Matrix{T}      # _potf2_buf:   potrf diagonal-base contiguous buffer (grows n×n)
     padf::Matrix{T}       # _potrf_pad:   potrf po2-ld whole-matrix pad, alias-free ld (grows (n+8|+16)×n)
@@ -44,7 +45,8 @@ mutable struct L3Workspace{T}
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
@@ -102,6 +104,21 @@ function _trsm_rpack(::Type{T}, rows::Int, cols::Int) where {T}
     need = rows + 8; iseven(need) && (need += 1)      # odd ld ⇒ never a way-stride multiple
     if size(b, 1) < need || size(b, 2) < cols
         b = Matrix{T}(undef, need, cols); ws.rpack = b
+    end
+    return b
+end
+
+# Side-R NOTRANS reflected-coefficient scratch. X·A=B (A lower, no transpose) is the column-reversal
+# conjugate of the lower-TRANSPOSE recurrence the fused leaf already implements, so we hand the leaf
+# Ã = J·Aᵀ·J (J = reversal; Ã is still lower) instead of a second hand-unrolled kernel. Cost is one
+# O(k²/2) triangle copy, negligible against the O(m·k²) solve. ODD ld (as _trsm_rpack) so the leaf's
+# coefficient-column walks stay conflict-free whatever A's own lda is. Dedicated field — must NOT share
+# `apad` (trsm! can hold that across the recursion reaching this branch) or `rpack` (the dealias arm).
+function _trsm_rrefl(::Type{T}, k::Int) where {T}
+    ws = _l3ws(T); b = ws.rrefl
+    need = k + 8; iseven(need) && (need += 1)
+    if size(b, 1) < need || size(b, 2) < k
+        b = Matrix{T}(undef, need, k); ws.rrefl = b
     end
     return b
 end
