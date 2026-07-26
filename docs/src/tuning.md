@@ -285,6 +285,49 @@ One more trap, learned the hard way (`_POTRF_BASE_F32`): `@load_preference` **mu
 a top-level `const`**, never inside a function body — in a function it becomes a per-call
 runtime Preferences lookup, which dominated microsecond-scale small-n factorizations.
 
+### 5.1 Measure a *crossover*, not a flag: `_trsm_r_scratch_kmin`
+
+`_ger_np` picks a count. The cautionary example is `_trsm_r_scratch_kmin`
+(`src/blas3/level3.jl`, pref `"trsm_r_alias_scratch_kmin"`): when side-R `trsm`'s `ldb` is
+an L1 way-stride multiple (`_alias_ld`), the solved-column re-reads all collide in one L1
+set. Two cures — solve each row-chunk into the odd-`ld` `rpack` scratch and copy back, or
+solve in place and eat the conflicts.
+
+It was first written as a **`Bool`**, probed at `k = _TRSM_DBASE`. That was wrong twice
+over, and only the fleet run caught it:
+
+1. **The winner depends on `k`, and `k` was the dimension nobody was looking at.** Fleet A/B
+   on galen/Zen3 at an aliasing `ldb`: scratch/in-place = 1.18 at k=16 (in-place wins),
+   **1.00–1.02 at k=32**, 0.68–0.79 at k≥48 (scratch wins by 20–32%). That is physics, not
+   noise — the copy-back costs O(m·k) against an O(m·k²) solve, so its relative price falls
+   as 1/k and scratch can only pay above some k. A single Bool cannot represent a crossover.
+   Worth recording *why* this was missed: the original code comment asserted a **µarch**
+   inversion ("Zen3 scratch +41–49%, Zen4 a net loss"), so the knob was modelled as a
+   per-box flag. Measured properly, both boxes cross over at the same k (64) — the
+   µarch-inversion framing was an artifact, and it hid the real variable.
+2. **The probe sat exactly on the tie.** `k = _TRSM_DBASE` = 32 is the crossover itself, so
+   the measurement was a coin flip: two galen processes in one run returned different
+   answers, costing `'T'` 1024×16 = 0.763 (chose scratch) and `'N'` 1024×48 = 0.718 (chose
+   in-place) — wrong in *both* directions on the same box.
+
+The fix is to measure the **crossover k** itself: walk a Derived candidate set (powers of
+two from `_vwidth` up to `_TRSM_R_FUSE`) at an aliasing probe shape and return the first k
+where scratch wins, or `typemax(Int)` for "never". Lessons that generalize:
+
+- **Probe where the decision is decisive, never where it is marginal.** If your probe shape
+  happens to be the tie point, the knob returns noise and looks like a flaky benchmark.
+- **Before choosing Bool, ask what the answer depends on.** If it varies along a dimension
+  the caller already knows (here `k`), measure the threshold along that dimension.
+- **The `catch` returns the conservative strategy**, not the fast one. An infallible
+  initializer is mandatory (a throwing `OncePerProcess` poisons the process), and the safe
+  fallback is the one with no extra buffer traffic.
+- **Don't reach for Measure when Derive fits.** The sibling question in the same routine —
+  should side-R `op='N'` pay an O(k²) reflect copy to reach the fused leaf? — *is*
+  predictable: the copy's per-element cost is governed by whether A's k×k footprint stays
+  L1-resident, so the gate is the formula `k·k·sizeof(T) ≤ _L1_BYTES` (Derive), not a
+  measured crossover. Measuring what a residency formula already predicts is its own kind
+  of debt.
+
 ## 6. How to add or change a tuning constant (checklist)
 
 1. **Confirm it's actually a tuning constant.** Machine-dependent block size, cutoff,

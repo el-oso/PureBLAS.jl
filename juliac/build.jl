@@ -54,6 +54,9 @@ finally
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => _prev_pbt; force = true)
     end
+    if _prev_trs === nothing
+    else
+    end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
 # is `.debug_*` sections, dead weight in a distributed drop-in. `--strip-debug` keeps the full symbol
