@@ -96,8 +96,72 @@ end
 # `IF( NB.LE.1 .OR. NB.GT.KD ) THEN → DPBTF2`): a panel wider than the band would make A21 vanish
 # and push ALL trailing work through the slow corner path. Reference-LAPACK's own choice is ILAENV
 # nb=32 capped at NBMAX=32 — _potrf_base(F64) defaults to the same 32.
-@inline _pbtrf_nb(::Type{T}, kd::Int) where {T} =
-    min(T <: Complex ? _CPOTRF_BASE : _potrf_base(T), kd)
+#
+# ⚠ The "ride _potrf_base" anchoring above was FALSIFIED by measurement and is retained only as history.
+# _potrf_base(Float64) = 32, and 32 turns out to be a sharp LOCAL MINIMUM for the BAND factor — worse than
+# both 24 and 40 at every bandwidth (Zen4, uplo='L', n=4096, ratio vs AOCL, two independent runs agreeing):
+#     kd     nb=24   nb=32   nb=40   nb=48   nb=64
+#     96     1.043   0.907   1.417   1.283   1.194
+#     128    1.046   0.932   1.291   1.238   1.130
+#     160    1.177   0.947   1.250   1.195   1.103
+#     256    1.156   1.119   1.177   1.154   1.095
+# nb=32 was the ONLY reason pbtrf missed the gate for mid bands (kd = 96/128/160 sat at 0.90-0.95 in BOTH
+# triangles). The dense-potrf panel width is simply not the band factor's optimum, so nb gets its own knob.
+#
+# req#8 tier: MEASURE, same ladder and the same harness shape as `_pbtrf_cross` below — the optimum is a
+# panel/port-balance tradeoff, not a residency one (a residency model predicts nb ≤ 32 for kd=128 on a
+# 32 KiB L1, i.e. exactly the value measured to be WORST).
+# The candidate bracket is DERIVED around the dense potrf panel width `_potrf_base(T)` / `_CPOTRF_BASE`:
+# the band panel faces the same trsm-vs-syrk tradeoff, so that IS the physically analogous knob — the part
+# this falsifies is only the assumption that the band optimum EQUALS it. So keep the anchor, measure around
+# it: {1/2, 3/4, 1, 5/4, 3/2, 2}·nb0, which for nb0 = 32 spans 16…64 and contains the Zen4 optimum (40).
+# NOT scaled by _vwidth: an earlier version bracketed on multiples of W and that was wrong — a W=4 box
+# (Zen3/AVX2) could then only reach 32, and measured 0.74-1.01 across kd = 96…256 because the optimum was
+# outside its own candidate set. The panel width is a blocking/overhead parameter, not a vector-width one.
+const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
+@static if isnothing(_PBTRF_NB_PREF)
+    @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
+    function _measure_pbtrf_nb(::Type{T})::Int where {T}
+        nb0 = _pbtrf_nb_anchor(T)
+        Base.generating_output() && return nb0        # don't burn a measure during precompilation
+        try
+            kd = max(4 * nb0, 1)                      # representative mid band (nb0=32 → 128, the worst cell)
+            nloc = 16 * kd                            # ≥16 panel rounds; run stays well under ~100 ms
+            ABm = Matrix{T}(undef, kd + 1, nloc)
+            refill! = () -> begin                     # diagonally-dominant SPD band, uplo='L'
+                fill!(ABm, one(T))
+                @inbounds for j in 1:nloc
+                    ABm[1, j] = T(2 * kd + 2)
+                end
+            end
+            best = nb0; tbest = typemax(UInt64)
+            for c in (nb0 >> 1, (3 * nb0) >> 2, nb0, (5 * nb0) >> 2, (3 * nb0) >> 1, 2 * nb0)
+                nb = min(c, kd)
+                refill!(); _pbtrf_blocked!(ABm, nloc, kd, nb)      # untimed warmup (absorb JIT)
+                t = typemax(UInt64)
+                for _ in 1:3
+                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); t = min(t, time_ns() - s)
+                end
+                t < tbest && (tbest = t; best = c)
+            end
+            return best
+        catch
+            return nb0                                # fall back to the dense potrf anchor
+        end
+    end
+    const _PBTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(Float32))
+    const _PBTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(Float64))
+    const _PBTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF32))
+    const _PBTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF64))
+    @inline _pbtrf_nb_tuned(::Type{Float32}) = _PBTRF_NB_F32()
+    @inline _pbtrf_nb_tuned(::Type{Float64}) = _PBTRF_NB_F64()
+    @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = _PBTRF_NB_C32()
+    @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = _PBTRF_NB_C64()
+    @inline _pbtrf_nb_tuned(::Type{T}) where {T} = _pbtrf_nb_anchor(T)   # generic/AD eltypes never block
+else
+    @inline _pbtrf_nb_tuned(::Type{<:Any}) = _PBTRF_NB_PREF::Int      # pinned (trim builds land here)
+end
+@inline _pbtrf_nb(::Type{T}, kd::Int) where {T} = min(_pbtrf_nb_tuned(T), kd)
 
 # ── crossover kd — MEASURE tier (see the tier discussion at pbtrf! above) ─────────────────────────
 const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
@@ -207,8 +271,7 @@ end
 #   A22 (i2×i2), A32 (i3×i2), A33 (i3×i3) — trailing blocks receiving syrk/gemm/syrk, ld-1 views.
 # LDWORK = nb+1, mirroring reference LDWORK = NBMAX+1 (odd leading dim ⇒ no po2 column-stride cache
 # aliasing — same lore as _alias_ld; not a tuning knob).
-function _pbtrf_blocked!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
-    nb = _pbtrf_nb(T, kd)
+function _pbtrf_blocked!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pbtrf_nb(T, kd)) where {T}
     ldabs = stride(AB, 2)
     ld2 = ldabs - 1                                    # the LDAB-1 of every BLAS call in dpbtrf.f
     tc = T <: Complex ? 'C' : 'T'                      # dpbtrf 'Transpose' / zpbtrf 'Conjugate transpose'

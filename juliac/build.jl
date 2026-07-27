@@ -31,9 +31,14 @@ const _prev_ger = load_preference(PUREBLAS_UUID, "ger_panel_np")
 # measured Zen4 optimum; Mode-2 (in-Julia) users still measure per box because Project.toml omits it.
 const _prev_brd = load_preference(PUREBLAS_UUID, "brd_nb")
 const _prev_pbt = load_preference(PUREBLAS_UUID, "pbtrf_cross_kd")
+# Pin `pbtrf_nb` for the same reason: the band factor's panel width is a Measure-tier OncePerProcess
+# auto-tune, and a runtime benchmark is not trim-safe. 40 is the Zen4 F64 optimum (= 5·W, the derived
+# bracket centre); Mode-2 users still measure per box because Project.toml omits the pref.
+const _prev_pbnb = load_preference(PUREBLAS_UUID, "pbtrf_nb")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
+set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -53,6 +58,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => _prev_pbt; force = true)
+    end
+    if _prev_pbnb === nothing
+        delete_preferences!(PUREBLAS_UUID, "pbtrf_nb"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => _prev_pbnb; force = true)
     end
     if _prev_trs === nothing
     else
