@@ -212,17 +212,18 @@ PB/OpenBLAS for context:
 | pttrf   | 1.11–1.13 | 1.11–1.12 |
 | ptsv    | 1.31–1.33 | 1.04–1.05 |
 | **pttrs** | 1.67–1.73 | **0.99** (shared chain bound) |
-| **trsm** (side-L)  | ~1.0    | **0.92–1.07** |
-| **trsmR** (side-R) | 1.1–1.8 | 0.85–1.5      |
+| **trsm** (side-L)  | 1.13–2.73 | **0.93–1.07** |
+| **trsmR** (side-R) | 1.03–2.29 | 0.97–1.73     |
 
 **PureBLAS matches-or-beats AMD's own library on gemm and every LAPACK factorization — real and
 complex — by 5–80%.** The one residual vs AOCL is real **side-L `trsm` at mid-n** (worst-size
 0.92–0.97): a codegen-scheduling gap on the fused-leaf kernel — the fused-back-substitution's
 latency chain runs at ~2 IPC where BLIS's hand-scheduled assembly hides it — not a structural lever
 (building AOCL's own packed-triangle structure in portable SIMD.jl lands at the same ~0.95). Side-R
-`trsmR` (the potrf/getrf panel shape) PB *leads* overall (geomean 1.15–1.30); a former AVX2 `n=128`
-dispatch dip (a batch-floor literal wrongly excluding square n≤128 from the fused panel, 0.74) is
-fixed to 0.85. The former **small-n `gemm` dip** (~0.92× AOCL at
+`trsmR` (the potrf/getrf panel shape) PB *leads* overall (geomean 1.28–1.30 vs AOCL): both `transA`
+now route through the fused leaf via the reflection identity Ã = J·Aᵀ·J, which closed side-R `'T'`
+outright on Zen4 and left the worst size at 0.97 (n≥2048) — the former mid-n dip is gone.
+The former **small-n `gemm` dip** (~0.92× AOCL at
 n≤256, where BLIS's lower packing overhead won) is now **closed** by a *direct-B microkernel* that skips
 the B-pack entirely when B is contiguous in the k-index (col-major, no transpose) — dgemm now gates
 **≥0.98× AOCL fleet-wide from n=128 up** (Zen3/Zen4/Zen5), with no large-n or OpenBLAS regression. AOCL
