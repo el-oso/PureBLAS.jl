@@ -52,8 +52,15 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
   costs one cache line per element, and that copy grows superlinearly in `kd`. A native port of the
   reference's `UPLO='U'` branch now takes over above a measured bandwidth crossover
   (`_pbtrf_ucross`), while the re-pack — which is *faster* for narrow bands — keeps everything
-  below it. `uplo='U'` now gates at 1.02–3.29× AOCL and 1.49–2.00× OpenBLAS across
-  `kd = 64…384`.
+  below it. Two further defects surfaced once the whole bandwidth range was swept: the
+  blocked-vs-unblocked crossover harness returned **different answers in different processes**
+  (32 or 64), and because its candidate ladder doubled, one flipped comparison left every
+  `kd ∈ 32…63` on a kernel that is ~2× slower there; and the panel width `min(nb_tuned, kd)`
+  collapsed onto `kd` whenever the clamp bound, killing the in-band panel and landing `nb` on a
+  value this code already documents as a local minimum (0.99× at `kd=32`, where a narrower panel
+  gives 1.63×). The crossover ladder now steps by `W` with a measured-asymmetry tie-break, and the
+  narrow-band regime has its own measured width. `pbtrf` now gates at **1.02–3.28× AOCL** across
+  `kd = 32…384` in both triangles.
 - **`juliac/build.jl` restored a preference that was never captured.** The `finally` block tested
   an undefined `_prev_trs`, so every trim build would have thrown `UndefVarError` while unwinding —
   masking whatever the real build outcome was.

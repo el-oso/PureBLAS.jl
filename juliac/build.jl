@@ -40,11 +40,16 @@ const _prev_pbnb = load_preference(PUREBLAS_UUID, "pbtrf_nb")
 # again not trim-safe. 256 is the Zen4 F64 measurement (repack 1.10 at kd=192, 0.845 at 256; native
 # 1.055 there); Mode-2 users still measure per box because Project.toml omits the pref.
 const _prev_pbu = load_preference(PUREBLAS_UUID, "pbtrf_u_native_kd")
+# And `pbtrf_nb_small`: the band panel width has two measured regimes (wide-band `pbtrf_nb`, and this
+# one for kd below it, where clamping to kd would collapse the in-band panel). Both are runtime
+# benchmarks. 8 is the Zen4 F64 optimum (= W).
+const _prev_pbns = load_preference(PUREBLAS_UUID, "pbtrf_nb_small")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
+set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -74,6 +79,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => _prev_pbu; force = true)
+    end
+    if _prev_pbns === nothing
+        delete_preferences!(PUREBLAS_UUID, "pbtrf_nb_small"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => _prev_pbns; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB

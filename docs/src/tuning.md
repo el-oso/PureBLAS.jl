@@ -365,6 +365,52 @@ beyond 5.1's:
   crossover, where it gates at 1.02–3.26×. Deleting it to keep one code path would have
   cost more than the rewrite gained.
 
+### 5.3 A Measure knob must be *reproducible*, not just correct on average
+
+`_pbtrf_cross` (blocked-vs-unblocked band Cholesky) was written exactly to the §5.1 recipe — measure
+the crossover, walk a Derived candidate set, `typemax` for never — and still shipped a 2× regression,
+because the harness answered **32 in some processes and 64 in others**. Two independent flaws, both
+of which apply to any threshold-finding harness:
+
+**The comparison at the crossover is a coin flip, by construction.** At the crossover the two kernels
+are equal — that is the definition — so whichever is timed as faster is decided by noise. §5.1's fix
+("probe where the decision is decisive") does not help here: the harness *searches* for the crossover,
+so it must evaluate the tie. What it can control is the **cost of getting the tie wrong**, and that
+is set by the candidate spacing. The old ladder doubled (`{2,4,8,16}·W`), so one flipped comparison
+skipped an entire octave. Measured cost on Zen4 (F64, `uplo='L'`, n=4096): at `kd=40` blocked runs
+815 µs against unblocked's 1644 µs, at `kd=48` 1132 vs 2138. A harness that answered 64 instead of 32
+left every `kd` in 32…63 running ~2× slow — and *both* answers occurred across runs on one box.
+Stepping by `W` instead bounds the damage of a flip to one `W`-wide band.
+
+**When the two mistakes cost different amounts, the tie-break must say so.** Switching one candidate
+too early costs +9% here (`kd=24`: blocked 227 µs vs unblocked 208). Switching one too late costs
++103% (`kd=40`, above). That is a 20 : 1 asymmetry, so a bare `tb < tu` — which treats the two
+directions as equally bad — is the wrong test. The harness now accepts blocked when it is within 5%
+(`20·tb < 21·tu`); the band is the measured gap at the true crossover, and at `kd=24` blocked is 9.3%
+behind, safely outside it, so the bias does not drag the answer down an extra step.
+
+The general rule: **after writing a Measure harness, run it in several fresh processes and check it
+returns the same value.** A knob that varies run to run is not merely imprecise — it makes every gate
+number irreproducible, and it will silently pick the slow kernel on a user's machine. Verified for
+these two: `_pbtrf_cross` and `_pbtrf_ucross` now return 32 and 256 in 6/6 Float64 runs; the complex
+knobs still move by exactly one ladder step (20↔24, 192↔208), which is the bounded outcome the finer
+ladder is there to guarantee.
+
+A related failure in the same routine: `_pbtrf_nb` was one measurement (`min(nb_tuned, kd)`) serving
+two regimes. `nb_tuned` is probed at a mid band, where it is right; but for `kd < nb_tuned` the clamp
+collapses `nb` onto `kd` itself, which both kills the in-band panel (`i2 = kd − ib = 0`) and lands
+`nb` on whatever `kd` happens to be — on Zen4, 32, which this very file documents as "a sharp local
+minimum for the band factor". That turned a 1.6× win into the routine's only gate miss:
+
+| kd=32, vs AOCL | nb=8 | nb=16 | nb=24 | nb=kd=32 |
+|---|---|---|---|---|
+| n=1024 | **1.63** | 1.36 | 1.05 | 0.99 |
+| n=4096 | **1.64** | 1.33 | 1.04 | 0.96 |
+
+The fix is a second Measure knob (`_pbtrf_nb_small`, candidates `{1,2,3,4}·W` probed at `kd = 4W`)
+used when the clamp binds. **If one measured constant has to serve two regimes with different optima
+— here 40 and 8, a 5× spread — it is two knobs, not one.**
+
 ## 6. How to add or change a tuning constant (checklist)
 
 1. **Confirm it's actually a tuning constant.** Machine-dependent block size, cutoff,
