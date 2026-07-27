@@ -688,7 +688,14 @@ end
 
         gpb = LA.gebrd!(copy(Ab))
         @test maximum(abs, gpb[2] .- gebrdref[2]) < 1.0e-8 * (norm(gebrdref[2]) + 1)   # d
-        @test maximum(abs, sort(abs.(gpb[3])) .- sort(abs.(gebrdref[3]))) < 1.0e-6 * (norm(gebrdref[3]) + 1)  # e magnitude
+        # e magnitude — compare ONLY the entries LAPACK defines. Julia's LAPACK.gebrd! allocates
+        # `e = similar(A, relty, k)` with k = min(m,n), but dgebrd writes just k-1 off-diagonals when
+        # m >= n, so e[k] is UNINITIALIZED memory for OpenBLAS and PureBLAS alike. Comparing the full
+        # vector read that slot and failed ~10% of runs with `NaN < NaN` (or `NaN < <finite>`, when only
+        # one side's garbage happened to be NaN) — reproduced 2/12 fresh processes before this fix.
+        ke = min(m2, n) - 1
+        @test maximum(abs, sort(abs.(gpb[3][1:ke])) .- sort(abs.(gebrdref[3][1:ke]))) <
+            1.0e-6 * (norm(gebrdref[3][1:ke]) + 1)
         # independent oracle: the bidiagonal's own singular values must match svdvals(Ab) regardless of
         # sign/algorithm details in the reduction above.
         dchk = copy(gpb[2]); echk = copy(gpb[3])[1:(n - 1)]   # gebrd e is length k; bdsqr wants n-1 off-diags
