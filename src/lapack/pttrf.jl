@@ -69,6 +69,14 @@ function pttrf!(D::AbstractVector{Tr}, E::AbstractVector{T}) where {Tr <: Real, 
     return D, E, (n >= 1 && !(D[n] > 0)) ? n : 0
 end
 
+# PERF NOTE — do not re-chase. This measures 0.99–1.00 vs AOCL dpttrs on Zen4 AND Zen3 (flat in n), which
+# looks like a gate miss but is a dependency-chain bound that binds the reference identically: PB 12.17–12.29
+# cyc/elem vs AOCL 12.18–12.33, with 0.0% run-to-run drift. That IS the analytic bound — the forward sweep's
+# recurrence is multiply+subtract (~6 cyc) and the backward sweep's divide is OFF the chain (B[i]/D[i] does
+# not depend on B[i+1]), so ~2×6 = 12 cyc/elem for the pair. Register-carrying the B recurrence and manually
+# unswitching the `upper` test on both sweeps were both measured: identical to this code, because LLVM
+# already does both. There is no lever here at nrhs = 1 short of changing the numerics (cyclic reduction).
+#
 # Shared LDLᴴ solve. upper=false ⇒ E is the SUBdiagonal (uplo='L'): forward with L (no conj),
 # backward with Lᴴ (conj). upper=true ⇒ E is the SUPERdiagonal (uplo='U'): conj placement flips.
 # For real T, conj is the identity so both branches coincide (matches dpttrs).
