@@ -328,6 +328,43 @@ where scratch wins, or `typemax(Int)` for "never". Lessons that generalize:
   measured crossover. Measuring what a residency formula already predicts is its own kind
   of debt.
 
+### 5.2 The overhead you set out to delete can be the fast path: `_pbtrf_ucross`
+
+Banded Cholesky's `uplo='U'` had one kernel: conj-transpose the band into lower storage,
+run the (much faster) lower kernel, transpose the factor back. Profiling at `kd=256`
+indicted the copy — 43% of the whole factorization, and the op sat at **0.845 vs AOCL**, a
+gate miss. Tuning the copy was a dead end (the best tiling recovered 1149 µs of 2749 µs →
+0.917, still a miss, and it *helped* `kd=128/256` while *hurting* `kd=160/192/384`), so the
+copy was replaced outright with a native port of the reference's own `UPLO='U'` branch.
+
+The native kernel fixed `kd ≥ 256` — and lost badly below it. Same-process ABBA, Zen4 F64,
+ratio vs AOCL:
+
+| kd | 48 | 64 | 96 | 128 | 160 | 192 | 256 | 384 |
+|---|---|---|---|---|---|---|---|---|
+| re-pack | 2.41 | 3.26 | 1.20 | 1.02 | 1.11 | 1.10 | **0.845** | 1.01 |
+| native | 1.36 | 1.71 | 0.63 | 0.83 | 0.87 | 0.92 | **1.055** | 1.08 |
+
+Both are needed; the switch point is `_pbtrf_ucross` (Measure, pref
+`"pbtrf_u_native_kd"`, harness returns 256 for F64 on Zen4 — matching the table). Lessons
+beyond 5.1's:
+
+- **A profiler naming a component as "43% of runtime" does not make removing it a win.**
+  The copy was genuinely 43% *at that one bandwidth*; at `kd=96` it was ~27% and the kernel
+  it bought access to was worth far more than it cost. "Dominant cost" and "wrong design"
+  are different claims, and only the second justifies a rewrite.
+- **Measure the replacement against the incumbent across the whole parameter range, not at
+  the size that motivated the work.** The rewrite was validated at `kd=256`, where it wins;
+  had it shipped as a straight replacement it would have taken `kd=96` from 1.20 to 0.63.
+- **A superlinear overhead crosses over.** The re-pack walks the band down a *diagonal*, so
+  it touches `kd` distinct columns per pass — one cache line, and eventually one page, per
+  8-byte element. Its cost grows faster than `kd` while the factor grows as `kd²`, so it is
+  cheap-then-catastrophic rather than uniformly bad. Any overhead with that shape has a
+  crossover in it, and the fix is a threshold, not a deletion.
+- **Keep the loser.** The re-pack is still the shipping kernel for every `kd` below the
+  crossover, where it gates at 1.02–3.26×. Deleting it to keep one code path would have
+  cost more than the rewrite gained.
+
 ## 6. How to add or change a tuning constant (checklist)
 
 1. **Confirm it's actually a tuning constant.** Machine-dependent block size, cutoff,

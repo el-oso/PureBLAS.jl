@@ -75,8 +75,15 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 | General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | ⏳ |
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | ✅ |
 | SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | ✅ [^tri] |
-| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ |
+| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ [^pb] |
 | Packed Cholesky | pptrf, pptrs | s/d/c/z | ✅ | ⏳ |
+
+[^pb]: `pbtrf` gates on **Zen4 for Float64** across `kd = 64…384` at n=4096 — 1.02–3.29× AOCL and
+    1.49–2.00× OpenBLAS in both triangles — but that is one box and one type, so the row stays ⏳
+    until the fleet run confirms Zen3/Zen5. `uplo='U'` dispatches between two kernels at a measured
+    bandwidth crossover: a conj-transpose re-pack onto the (much faster) lower kernel for narrow
+    bands, and a native upper-storage port once the re-pack's diagonal walk starts to dominate.
+    See §5.2 of [Tuning](tuning.md).
 
 [^tri]: All six tridiagonal routines gate `≥ max(OpenBLAS, AOCL)` on Zen3/4/5 with one exception:
     `pttrs` measures 0.99 against AOCL (1.67–1.73 vs OpenBLAS). That is a *shared* dependency-chain

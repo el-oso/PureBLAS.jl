@@ -64,6 +64,23 @@ end
         B = randn(T, n, 2)
         X = PureBLAS.pbtrs!(F, copy(B); uplo = uplo, kd = kd)
         @test maximum(abs, Afull * X - B) < sqrt(eps(R)) * 200 * (norm(Afull) + 1)
+
+        # uplo='U' has TWO blocked kernels and pbtrf! picks between them at a MEASURED bandwidth
+        # crossover (_pbtrf_ucross), so which one the loop above exercised depends on the host —
+        # on this box it is 256 for Float64 and typemax for Float32, i.e. the native kernel would
+        # never be reached by any kd this test can afford. Call both directly so each is covered
+        # on every machine regardless of what the harness measured.
+        # NOT guarded on _pbtrf_cross(T): that is a per-process measurement, so gating on it made
+        # the number of assertions vary between runs (336 one run, 332 the next). kd ≥ 4 is the
+        # blocked kernels' own documented precondition (reference dpbtrf takes the blocked branch
+        # only for 1 < NB ≤ KD, and nb = min(nb_tuned, kd) here).
+        if uplo == 'U' && T <: PureBLAS.BlasFloat && kd >= 4
+            for k! in (PureBLAS._pbtrf_repack_U!, PureBLAS._pbtrf_blocked_U!)
+                Fk = k!(copy(AB), n, kd)
+                Fkd = dense_from_band(Fk, n, kd, 'U')
+                @test maximum(abs, Fkd' * Fkd - Afull) < sqrt(eps(R)) * 50 * (norm(Afull) + 1)
+            end
+        end
     end
 end
 
