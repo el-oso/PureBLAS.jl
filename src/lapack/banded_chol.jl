@@ -321,7 +321,7 @@ end
 # column needs no translation: leading minors of A are uplo-independent, and _pbtrf_blocked! already
 # reports dpotf2-ordered global columns.
 function _pbtrf_blocked_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
-    ABL = Matrix{T}(undef, kd + 1, n)
+    ABL = _pbtrf_band(T, kd, n)                        # owned scratch — see _pbtrf_band for why not `undef`
     @inbounds for j in 1:n                             # pack: ABU → conj-transposed lower band
         for d in 0:min(kd, n - j)
             ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])

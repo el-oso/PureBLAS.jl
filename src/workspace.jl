@@ -42,6 +42,7 @@ mutable struct L3Workspace{T}
     cholpad::Matrix{T}    # _chol_pad:    faer potrf po2-ld whole-matrix pad, ld=n+8 (grows R×n)
     chold::Matrix{T}      # _chol_d:      faer potrf diag-block scratch, (_chol_block+8)×_chol_block
     cholt::Matrix{T}      # _chol_t:      faer potrf panel workspace, grows R×_chol_block
+    bandl::Matrix{T}      # _pbtrf_band:  pbtrf uplo='U' conj-transposed band re-pack, grows (kd+1)×n
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -51,6 +52,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0),
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -147,6 +149,21 @@ function _potrf_pad(::Type{T}, n::Int) where {T}
         b = Matrix{T}(undef, need, n); ws.padf = b
     end
     return b
+end
+
+# pbtrf uplo='U' band re-pack target. OWNED rather than freshly allocated: at kd=256, n=4096 this buffer
+# is 8.4 MB, and allocating it per call made PureBLAS's own runtime vary 22.8% run-to-run for identical
+# input inside one process (the reference varied 1.3%) — GC noise larger than the gap being tuned, which
+# made the cell unmeasurable before it made it slow.
+# NOTE the row test is `!=`, not `<`: the re-pack's leading dimension IS kd+1, so a buffer kept from a
+# WIDER band must not be reused by viewing a sub-block of it — that would hand the blocked kernel an ld
+# from the previous call. Measured: reusing a kd=256 buffer for kd=64 dropped that cell from 2.10 to 1.81.
+function _pbtrf_band(::Type{T}, kd::Int, n::Int) where {T}
+    ws = _l3ws(T); b = ws.bandl
+    if size(b, 1) != kd + 1 || size(b, 2) < n
+        b = Matrix{T}(undef, kd + 1, n); ws.bandl = b
+    end
+    return view(b, :, 1:n)                             # ld == kd+1 by construction
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
