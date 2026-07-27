@@ -21,6 +21,38 @@ end
     @test_throws DimensionMismatch PureBLAS.potrf!(randn(3, 4))
 end
 
+@testitem "potrf — PosDefException reports the FIRST failing column (LAPACK info)" begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.LAPACK as LA
+    # LAPACK's dpotrf sets info = the first column whose pivot is non-positive; `cholesky(A; check=true)`
+    # surfaces it, so a wrong value is user-visible through the C-ABI. The blocked/hybrid drivers factor
+    # sub-blocks of VIEWS, so the base kernel's column index has to be lifted back through every recursion
+    # level — this pins that. (Previously every failure reported column 1 regardless.)
+    function pb_info(A, uplo)
+        B = copy(A)
+        try
+            PureBLAS.potrf!(B; uplo = uplo); return 0
+        catch e
+            e isa PosDefException && return e.info
+            rethrow()
+        end
+    end
+    ref_info(A, uplo) = LA.potrf!(uplo, copy(A))[2]        # LAPACK.potrf! RETURNS (A, info); it does not throw
+    @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32), uplo in ('L', 'U'),
+            n in (8, 17, 33, 64, 129, 257)
+
+        Random.seed!(hash((T, n)))
+        X = randn(T, n, n)
+        A0 = Matrix(Symmetric(X'X + T(n) * I, :L))
+        @test pb_info(A0, uplo) == 0                                  # SPD ⇒ no throw
+        for col in unique(clamp.([1, 2, n ÷ 2, n - 1, n], 1, n))
+            A = copy(A0)
+            A[col, col] = -abs(A[col, col]) * T(1.0e-3)                # poison one pivot
+            @test pb_info(A, uplo) == ref_info(A, uplo)
+        end
+    end
+end
+
 @testitem "geqrf (QR) vs LAPACK — square/tall/wide, R + reconstruction" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
