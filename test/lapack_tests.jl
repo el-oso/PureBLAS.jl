@@ -38,12 +38,12 @@ end
         end
     end
     ref_info(A, uplo) = LA.potrf!(uplo, copy(A))[2]        # LAPACK.potrf! RETURNS (A, info); it does not throw
-    @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32), uplo in ('L', 'U'),
-            n in (8, 17, 33, 64, 129, 257)
+    @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            uplo in ('L', 'U'), n in (8, 17, 33, 64, 129, 257)
 
         Random.seed!(hash((T, n)))
         X = randn(T, n, n)
-        A0 = Matrix(Symmetric(X'X + T(n) * I, :L))
+        A0 = Matrix(T <: Complex ? Hermitian(X'X + real(T)(n) * I, :L) : Symmetric(X'X + T(n) * I, :L))
         @test pb_info(A0, uplo) == 0                                  # SPD ⇒ no throw
         for col in unique(clamp.([1, 2, n ÷ 2, n - 1, n], 1, n))
             A = copy(A0)
