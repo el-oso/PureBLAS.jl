@@ -830,16 +830,36 @@ transfer, which is exactly why the gate is per-machine.** Full `plots.jl bench` 
 
 This satisfies M7's stated prerequisite ("start after the Zen3/Zen5 fleet gate runs").
 
-## LAPACK — tridiagonal (gtsv/gttrf/gttrs/pttrf/pttrs/ptsv) — ✅ GATED Zen4 + Zen3 (2026-07-27)
+## LAPACK — tridiagonal (gtsv/gttrf/gttrs/pttrf/pttrs/ptsv) — ✅ GATED WHOLE FLEET (2026-07-27)
 
-All six real tridiagonal ops now gate vs **both** OpenBLAS and AOCL, bit-exact everywhere. Authoritative
-numbers (`plots.jl group=LP aocl`, geomean/worst over the new `TDSZ` sweep, n = 256…262144 — these ops are
+All six real tridiagonal ops now gate across Zen4 + Zen3 + Zen5, bit-exact everywhere. Authoritative
+numbers (`plots.jl group=LP`, geomean/worst over the new `TDSZ` sweep, n = 256…262144 — these ops are
 O(n), so `LPSZ` sizes are timer noise for them):
+
+**vs AOCL** (the binding reference for pttrf/gttrf/gtsv):
 
 | | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
 |---|---|---|---|---|---|---|
 | **wintermute (Zen4)** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
 | **galen (Zen3)** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
+| **neuromancer (Zen5)** | 1.28/1.22 | 1.62/1.54 | 1.06/1.05 | 1.12/1.12 | 1.00/**0.99** | 1.06/1.04 |
+
+**vs OpenBLAS** (the binding reference for gttrs), same column order:
+
+| | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
+|---|---|---|---|---|---|---|
+| **wintermute (Zen4)** | 1.50/1.43 | 1.62/1.54 | 1.00/1.00 | 1.13/1.13 | 1.73/1.68 | 1.36/1.33 |
+| **galen (Zen3)** | 1.49/1.41 | 1.64/1.53 | 1.00/1.00 | 1.11/1.11 | 1.72/1.68 | 1.34/1.31 |
+| **neuromancer (Zen5)** | 1.51/1.43 | 1.64/1.57 | 1.00/1.00 | 1.12/1.12 | 1.72/1.67 | 1.35/1.32 |
+
+`pttrs` is 1.67–1.73 vs OB, so **AOCL is its only binding reference**; `gttrs` is 1.03–1.06 vs AOCL and
+sits at parity with OB (medians 0.9999–1.004, per-sample spread at n=4096 of 0.897–1.107 — where the
+harness flags it, that is a 1e-4 rounding, not a gap).
+
+**Notable: these fixes TRANSFER across all three µarchs** — 1.20–1.22 / 1.51–1.54 / 1.11–1.13 are
+near-identical on Zen3, Zen4 and Zen5. That is the opposite of the usual finding recorded above
+("residual profiles are DISJOINT across µarch — tuning does not transfer"), and the reason is that these
+are dependency-chain and store-stream properties of the generated code, not cache/ISA tuning.
 
 Before: pttrf 0.64–0.69, gttrf 0.95–0.99, gtsv 0.99 vs AOCL. **The bound here is a divide→multiply→subtract
 latency chain (~19.5 cyc/elem on Zen4), not flops** — so every lever was about how data moves AROUND the
@@ -859,7 +879,9 @@ input near-ties chose a different (valid) pivot and the factors/`ipiv` disagreed
 until interchange coverage was added — the old test was diagonally dominant only (+272 assertions).
 
 ⚠ Gate numbers for these ops MUST come from `bench/plots.jl`; the scratchpad sweep-all-ops-per-process
-harness inflates SMALL-n cells (memory `adhoc-tridiag-harness-inflates-small-n`). Zen5 leg pending.
+harness inflates SMALL-n cells — it measured the reference at 3.71 µs for pttrf n=256 where a clean
+process measures 2.00 µs, because it times six ops sequentially per size (memory
+`adhoc-tridiag-harness-inflates-small-n`). Its large-n cells agree with plots.jl to ~0.5%.
 
 ## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
 
