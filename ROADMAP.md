@@ -830,6 +830,37 @@ transfer, which is exactly why the gate is per-machine.** Full `plots.jl bench` 
 
 This satisfies M7's stated prerequisite ("start after the Zen3/Zen5 fleet gate runs").
 
+## LAPACK — tridiagonal (gtsv/gttrf/gttrs/pttrf/pttrs/ptsv) — ✅ GATED Zen4 + Zen3 (2026-07-27)
+
+All six real tridiagonal ops now gate vs **both** OpenBLAS and AOCL, bit-exact everywhere. Authoritative
+numbers (`plots.jl group=LP aocl`, geomean/worst over the new `TDSZ` sweep, n = 256…262144 — these ops are
+O(n), so `LPSZ` sizes are timer noise for them):
+
+| | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
+|---|---|---|---|---|---|---|
+| **wintermute (Zen4)** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
+| **galen (Zen3)** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
+
+Before: pttrf 0.64–0.69, gttrf 0.95–0.99, gtsv 0.99 vs AOCL. **The bound here is a divide→multiply→subtract
+latency chain (~19.5 cyc/elem on Zen4), not flops** — so every lever was about how data moves AROUND the
+chain, and none changed the arithmetic. See memory `generic-kernel-codegen-hazards`; the three hazards each
+cost ~10 cyc/elem and are generic to the "one scalar loop covers s/d/c/z" style:
+a live `fadd x, 0.0` on the real path of a complex-shaped expression (LLVM will not fold it without `nsz`);
+a per-element inner loop with a RUNTIME trip count; and re-reading a recurrence variable the previous
+iteration just stored. Plus an extra store stream (10.1 cyc/elem — hoisted to a bulk pass at 0.3).
+
+**`pttrs` 0.99 is NOT a gap** and must not be re-chased: PB 12.17–12.29 cyc/elem vs AOCL 12.18–12.33, at
+the analytic 2×(mul+sub) = 12 bound (the backward sweep's divide is off the chain). Register-carry and
+`upper`-unswitch were both measured and are neutral — LLVM already does them. Memory `pttrs-is-at-chain-bound`.
+
+Correctness: the pre-existing pivot test used `abs` where LAPACK uses **CABS1** (|Re|+|Im|), so for complex
+input near-ties chose a different (valid) pivot and the factors/`ipiv` disagreed with `z/cgttrf`. Fixed to
+`_l1`; also cheaper (no hypot). Complex path now 1.79–2.06× vs AOCL with `ipiv` matching. This was invisible
+until interchange coverage was added — the old test was diagonally dominant only (+272 assertions).
+
+⚠ Gate numbers for these ops MUST come from `bench/plots.jl`; the scratchpad sweep-all-ops-per-process
+harness inflates SMALL-n cells (memory `adhoc-tridiag-harness-inflates-small-n`). Zen5 leg pending.
+
 ## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
 
 Parallelize the gemm jj-loop, threshold-gated (small sizes stay serial). Per-host tuning. This is
