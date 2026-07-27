@@ -55,6 +55,42 @@ one register pass, in both the small-n and NB=128 panel drivers) — brings AVX2
 parity** (the MKL proxy): 0.91–1.04× its column-major `dpotrf` at n≤224 and 0.87–0.91× at n≥256, and
 1.5–2.2× vs OpenBLAS fleet-wide.
 
+`potrf` is gated for **both triangles**. That is worth stating because it was not always true: the
+benchmark harness passed `uplo='L'` to the `potrf`/`zpotrf` rows, so the upper path — a different route
+(transpose into a padded scratch, factor with the gating lower kernels, transpose back) rather than a
+mirror image — went unmeasured. Adding `potrfU`/`zpotrfU` rows surfaced a real miss at large `n`, whose
+cause was the same power-of-two-`lda` cache-set aliasing that the factorizations already defend against,
+this time inside the *copy*: the transpose read `A` strided across a row at its raw `lda`, and at
+`lda·sizeof(T) % 4096 == 0` — precisely the benchmarked sizes — every column maps into one L1 set group.
+Reordering the loops so the contiguous side is the read and the strided side is the (non-power-of-two)
+scratch is bit-identical and worth 2.1–3.8× on the copy, taking real `potrfU` from 0.96 to 1.03 vs AOCL
+on Zen4 and 0.98 → 1.04 on Zen3. Complex `zpotrfU` still sits at 0.95 for `n ≥ 1024` on Zen4 (it gates on
+Zen3): the two transposes are the entire remaining gap — remove them and PureBLAS would be 3.4% *ahead*
+of AOCL — but they cannot simply be deleted, since factoring the upper triangle natively measures slower
+than the transpose route at every size and type.
+
+### Tridiagonal
+
+`gtsv`, `gttrf`, `gttrs`, `pttrf`, `pttrs`, `ptsv` gate `≥ max(OpenBLAS, AOCL)` on **all three µarchs**,
+every result bit-identical to the reference. Worst-case vs AOCL: `gtsv` 1.20–1.22, `gttrf` 1.51–1.54,
+`gttrs` 1.03–1.06, `pttrf` 1.11–1.12, `ptsv` 1.04–1.05; vs OpenBLAS the same ops run 1.31–1.57 and
+`pttrs` 1.67–1.73.
+
+These are `O(n)` serial three-term recurrences, so the limit is a divide→multiply→subtract **latency
+chain** (~19.5 cyc/elem on Zen4), not flops — and every lever was about how data moves *around* that
+chain rather than about the arithmetic. Three cost roughly 10 cyc/elem each: a live `fadd x, 0.0` left on
+the real path of a complex-shaped expression (LLVM may only fold it under `nsz`, since `x + 0.0` is not
+an identity for `x = -0.0`); re-reading a recurrence variable the previous iteration just stored; and a
+per-element inner loop with a *runtime* trip count. A fourth, an extra store stream, cost 10.1 and was
+hoisted into a bulk pass priced at 0.3. Unusually for this project these fixes **transfer across
+µarchs** — they are properties of the generated code, not cache- or ISA-dependent tuning.
+
+`pttrs` is the one cell at parity rather than above it (0.99 vs AOCL). Both libraries run at
+~12.2 cyc/elem, which is exactly the analytic bound: the forward sweep's recurrence is
+multiply+subtract (~6 cyc) and the backward sweep's divide sits *off* the chain, since `B[i]/D[i]` does
+not depend on `B[i+1]`. Register-carrying the recurrence and hoisting the `uplo` test out of both loops
+were each measured and are neutral — LLVM already does both.
+
 ## Complex (ComplexF64): CL1 / CL2 / CL3 / complex LAPACK
 
 The complex surface is SIMD across all levels, in portable SIMD.jl kernels (no x86 intrinsics);
@@ -171,6 +207,11 @@ PB/OpenBLAS for context:
 | potrf   | 1.16–1.28 | 1.12–1.20 |
 | geqrf   | 1.63–1.80 | 1.53–1.70 |
 | getrf   | 1.14–2.24 | 1.59–1.78 |
+| gtsv    | 1.41–1.43 | 1.20–1.22 |
+| gttrf   | 1.53–1.57 | 1.51–1.54 |
+| pttrf   | 1.11–1.13 | 1.11–1.12 |
+| ptsv    | 1.31–1.33 | 1.04–1.05 |
+| **pttrs** | 1.67–1.73 | **0.99** (shared chain bound) |
 | **trsm** (side-L)  | ~1.0    | **0.92–1.07** |
 | **trsmR** (side-R) | 1.1–1.8 | 0.85–1.5      |
 

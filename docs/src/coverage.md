@@ -73,10 +73,16 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 | Op | Routines | Types | Routes | Optimized |
 |---|---|---|---|---|
 | General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | ⏳ |
-| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | ⏳ |
-| SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | ⏳ |
+| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | ✅ |
+| SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | ✅ [^tri] |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ |
 | Packed Cholesky | pptrf, pptrs | s/d/c/z | ✅ | ⏳ |
+
+[^tri]: All six tridiagonal routines gate `≥ max(OpenBLAS, AOCL)` on Zen3/4/5 with one exception:
+    `pttrs` measures 0.99 against AOCL (1.67–1.73 vs OpenBLAS). That is a *shared* dependency-chain
+    bound, not a gap — both libraries run at ~12.2 cyc/elem, which is the analytic 2×(multiply+subtract)
+    limit for the pair of triangular sweeps, with 0.0% run-to-run drift. See "Tridiagonal" in
+    [Performance](performance.md).
 
 ## Free via composition
 

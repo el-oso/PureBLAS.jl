@@ -39,6 +39,20 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
   TypeContracts interface contracts, juliac `--trim` build verification, and an OpenBLAS oracle test suite
   over s/d/c/z with many sizes, strides, and edge cases.
 
+### Fixed
+
+- **`potrf`/`cholesky` now report the true failing column.** `PosDefException` carried column `1`
+  regardless of where the factorization actually failed, so `cholesky(A; check=true)` named the wrong
+  column and the `dpotrf_64_`/`zpotrf_64_` C-ABI symbols returned the wrong `info` to LBT callers. The
+  blocked and hybrid drivers factor sub-blocks of *views*, so the base kernel's column index is now
+  lifted back through every recursion level, matching LAPACK's `info` exactly for `s`/`d`/`c`/`z` and
+  both triangles (validated against the LAPACK oracle across poisoned columns at `n = 8…257`).
+- **`gtsv`/`gttrf` pivot selection for complex input.** These compared pivots with `abs` where LAPACK
+  uses `CABS1` (`|Re| + |Im|`), which selects a *different* pivot on near-ties. The factorization stayed
+  valid, but the overwritten factor arrays and `ipiv` disagreed with `cgttrf`/`zgttrf`. Now matches
+  LAPACK, and is also cheaper (no `hypot` on the complex path). This was invisible until row-interchange
+  test coverage was added — the previous tests were diagonally dominant and never took a pivot.
+
 ### Known limitations
 
 - **Forwarding the `.so` into a live Julia process is blocked** (a juliac limitation, not a PureBLAS bug):
@@ -51,4 +65,9 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
   unresolved complex-return ABI (LBT NORMAL vs ARGUMENT retstyle); the native API covers complex dot.
 - **Single-threaded** — multithreading is deferred by design; all kernels are single-thread today.
 - **Large-n `trmm`/`syrk` vs AOCL** sit at ~0.95–0.98 (n≥2048) — an LLVM-vs-hand-asm classical-microkernel
-  gap; everything else meets the `max(OB, AOCL)` gate.
+  gap.
+- **Complex `zpotrf` with `uplo='U'`** sits at ~0.95 vs AOCL for `n ≥ 1024` on Zen4 (it gates on Zen3).
+  The upper path transposes into a padded scratch and back; those two copies are the entire gap.
+- **`pttrs` measures 0.99 vs AOCL** (1.67–1.73 vs OpenBLAS). This one is *not* an implementation gap:
+  both libraries sit on the same ~12.2 cyc/elem dependency-chain bound for the pair of triangular
+  sweeps, with 0.0% run-to-run drift.
