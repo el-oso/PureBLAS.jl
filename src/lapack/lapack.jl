@@ -421,7 +421,7 @@ function _chol_base_f64!(p::Ptr{T}, n::Int, ld::Int) where {T}
             unsafe_store!(p, s, _clidx(i, j, ld)); i += 1
         end
         d = unsafe_load(p, _clidx(j, j, ld))
-        (d > 0) || return false
+        (d > 0) || return j                                # failing column (1-based, local); 0 ⇒ success
         invd = inv(sqrt(d)); vinv = V(invd)
         i = j
         while i + W - 1 <= n
@@ -431,7 +431,7 @@ function _chol_base_f64!(p::Ptr{T}, n::Int, ld::Int) where {T}
             unsafe_store!(p, unsafe_load(p, _clidx(i, j, ld)) * invd, _clidx(i, j, ld)); i += 1
         end
     end
-    return true
+    return 0
 end
 
 # panel solve: L10 (m×bs) from L10·L00ᵀ = A10, in place on A10. FUSED — each NB=4 column panel downdates
@@ -654,7 +654,8 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
     j = 0
     while j < n
         bs = min(bs_outer, n - j)
-        _chol_rl_f64!(_cvptr(p, j + 1, j + 1, ld), bs, ld, block_size, threshold) || return false
+        f = _chol_rl_f64!(_cvptr(p, j + 1, j + 1, ld), bs, ld, block_size, threshold)
+        f == 0 || return j + f                             # lift the sub-block's column into this frame
         m = n - j - bs
         if m > 0
             p10 = _cvptr(p, j + bs + 1, j + 1, ld); p11 = _cvptr(p, j + bs + 1, j + bs + 1, ld)
@@ -663,7 +664,7 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
         end
         j += bs
     end
-    return true
+    return 0
 end
 
 # A power-of-two leading dimension aliases columns into the same cache sets (the LDA=2^k conflict,
@@ -698,19 +699,26 @@ end
 # Hybrid driver: the faer kernels are fastest at small/medium n but their syrk isn't cache-blocked, so
 # they fade at large n (panel re-streamed). Recurse by halving — the big off-diagonal blocks go through
 # PureBLAS's cache-blocked trsm!/syrk! (which gate at large k) — and bottom out in the faer kernels.
+# Returns the FIRST non-positive-pivot column (1-based, relative to this call's frame), 0 on success —
+# it does not throw, so the offsets can be lifted through the halving recursion and the caller reports the
+# true global column. LAPACK dpotrf sets info to exactly this; before, every failure reported column 1
+# regardless, which reached LBT callers through `dpotrf_64_` (`cholesky(A; check=true)` named the wrong
+# column). Success is the hot path and returns a plain 0, same register traffic as the old Bool.
 function _chol_hyb_f64!(M, n::Int, base::Int)
     if n <= base
-        ok = GC.@preserve M _chol_rl_f64!(pointer(M), n, stride(M, 2), _chol_sb(eltype(M)), _chol_sth(eltype(M)))
-        ok || throw(PosDefException(1))   # ponytail: faer returns Bool; exact pivot column not threaded
-        return M
+        return GC.@preserve M _chol_rl_f64!(
+            pointer(M), n, stride(M, 2), _chol_sb(eltype(M)), _chol_sth(eltype(M))
+        )
     end
     h = n ÷ 2
-    _chol_hyb_f64!(view(M, 1:h, 1:h), h, base)
+    f = _chol_hyb_f64!(view(M, 1:h, 1:h), h, base)
+    f == 0 || return f
     A21 = view(M, (h + 1):n, 1:h)
     trsm!(A21, view(M, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = true)
     syrk!(view(M, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1, beta = 1)
-    _chol_hyb_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
-    return M
+    f = _chol_hyb_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
+    f == 0 || return h + f                                 # trailing block starts at column h+1
+    return 0
 end
 
 # ── Fused panel driver: po2-strided AVX2 potrf without the whole-matrix pad round-trip ──────────────
@@ -990,7 +998,9 @@ function _chol_panel_f64!(A, n::Int, blk::Int = _chol_block(eltype(A)))
             for c in 0:(bs - 1)                                   # diag block lower triangle → D (L1/L2)
                 unsafe_copyto!(pD + (c * ldD + c) * sizeof(T), pjj + (c * lda + c) * sizeof(T), bs - c)
             end
-            _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T)) || throw(PosDefException(j + 1))
+            let f = _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T))
+                f == 0 || throw(PosDefException(j + f))    # j = 0-based block offset, f = column within it
+            end
             for c in 0:(bs - 1)                                   # factored diag back (tiny)
                 unsafe_copyto!(pjj + (c * lda + c) * sizeof(T), pD + (c * ldD + c) * sizeof(T), bs - c)
             end
@@ -1052,13 +1062,15 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
             @inbounds for j in 0:(n - 1)
                 unsafe_copyto!(pb + (j * ldb + j) * sizeof(T), pa + (j * lda + j) * sizeof(T), n - j)
             end
-            _chol_hyb_f64!(Mw, n, base)
+            f = _chol_hyb_f64!(Mw, n, base)
+            f == 0 || throw(PosDefException(f))            # throw BEFORE copy-back: A stays untouched
             @inbounds for j in 0:(n - 1)
                 unsafe_copyto!(pa + (j * lda + j) * sizeof(T), pb + (j * ldb + j) * sizeof(T), n - j)
             end
         end
     else
-        _chol_hyb_f64!(A, n, base)
+        f = _chol_hyb_f64!(A, n, base)
+        f == 0 || throw(PosDefException(f))
     end
     return A
 end
