@@ -21,6 +21,52 @@ end
     @test_throws DimensionMismatch PureBLAS.potrf!(randn(3, 4))
 end
 
+@testitem "pbtrf/pbtrs (banded Cholesky) — both triangles, kd across the blocked crossover" begin
+    using PureBLAS, LinearAlgebra, Random
+    # pbtrf had NO correctness coverage — only a StrictMode trim check at uplo='L', kd=2. Everything at
+    # kd >= _pbtrf_cross (the BLOCKED kernel, both triangles, the panel/corner blocks and the work-array
+    # copy-back) was untested, so a broken blocked kernel passed the whole suite. Julia's stdlib has no
+    # pbtrf wrapper, so the oracle here is self-contained: factor the band, reconstruct UᴴU / LLᴴ, and
+    # compare against the dense matrix it came from. kd is chosen to straddle the crossover (32 on Zen4)
+    # and to include a power-of-two and the nb boundary.
+    function dense_from_band(AB, n, kd, uplo)
+        A = zeros(eltype(AB), n, n)
+        if uplo == 'L'
+            for j in 1:n, i in j:min(n, j + kd); A[i, j] = AB[1 + i - j, j]; end
+        else
+            for j in 1:n, i in max(1, j - kd):j; A[i, j] = AB[kd + 1 + i - j, j]; end
+        end
+        A
+    end
+    @testset "$T uplo=$uplo kd=$kd n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            uplo in ('L', 'U'), kd in (1, 2, 8, 31, 32, 33, 40, 64), n in (65, 300)
+
+        kd >= n && continue
+        R = real(T)
+        Random.seed!(hash((T, uplo, kd, n)))
+        AB = zeros(T, kd + 1, n)                       # diagonally dominant ⇒ SPD/HPD
+        for j in 1:n
+            if uplo == 'L'
+                AB[1, j] = T(2kd + 4) + abs(randn(R))
+                for i in 1:min(kd, n - j); AB[1 + i, j] = randn(T) * R(0.3); end
+            else
+                AB[kd + 1, j] = T(2kd + 4) + abs(randn(R))
+                for i in 1:min(kd, j - 1); AB[kd + 1 - i, j] = randn(T) * R(0.3); end
+            end
+        end
+        Aband = dense_from_band(AB, n, kd, uplo)
+        Afull = uplo == 'L' ? Matrix(Hermitian(Aband, :L)) : Matrix(Hermitian(Aband, :U))
+        F = PureBLAS.pbtrf!(copy(AB); uplo = uplo, kd = kd)
+        Fd = dense_from_band(F, n, kd, uplo)
+        rec = uplo == 'L' ? Fd * Fd' : Fd' * Fd        # A = L·Lᴴ  /  A = Uᴴ·U
+        @test maximum(abs, rec - Afull) < sqrt(eps(R)) * 50 * (norm(Afull) + 1)
+        # and the solve round-trips
+        B = randn(T, n, 2)
+        X = PureBLAS.pbtrs!(F, copy(B); uplo = uplo, kd = kd)
+        @test maximum(abs, Afull * X - B) < sqrt(eps(R)) * 200 * (norm(Afull) + 1)
+    end
+end
+
 @testitem "potrf — PosDefException reports the FIRST failing column (LAPACK info)" begin
     using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.LAPACK as LA
