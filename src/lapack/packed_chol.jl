@@ -59,17 +59,36 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
             AP[jc + j] = sqrt(ajj)
         end
     elseif uplo == 'L'
+        # Right-looking, as dpptrf.f does it: scale the column, then ONE packed rank-1 downdate of the
+        # trailing triangle (dspr/zhpr). In lower-packed storage columns j+1..n follow column j directly,
+        # so the trailing triangle of order n-j is exactly the contiguous tail AP[_pp_l(j+1,j+1,n):end]
+        # and the multiplier column is the contiguous run AP[_pp_l(j+1,j,n) .. _pp_l(n,j,n)] — spr!/hpr!
+        # can take both as views with no packing or copy.
+        cplx = eltype(AP) <: Complex
         @inbounds for j in 1:n
             ajj = real(AP[_pp_l(j, j, n)])
             ajj > 0 || throw(PosDefException(j))
             ajj = sqrt(ajj); AP[_pp_l(j, j, n)] = ajj; invd = inv(ajj)
+            m = n - j
+            m == 0 && continue
             for i in (j + 1):n                              # scale L[j+1:n, j]
                 AP[_pp_l(i, j, n)] *= invd
             end
-            for q in (j + 1):n                              # rank-1 downdate of the trailing triangle
-                lqj = conj(AP[_pp_l(q, j, n)])            # conj(L[q,j])
-                for p in q:n                              # p ≥ q (lower)
-                    AP[_pp_l(p, q, n)] -= AP[_pp_l(p, j, n)] * lqj
+            if m > _PPTRF_TPSV_MIN
+                xs = _pp_l(j + 1, j, n)
+                x = view(AP, xs:(xs + m - 1))
+                A22 = view(AP, _pp_l(j + 1, j + 1, n):length(AP))
+                if cplx
+                    hpr!(-one(real(eltype(AP))), x, A22; uplo = 'L')
+                else
+                    spr!(-one(eltype(AP)), x, A22; uplo = 'L')
+                end
+            else
+                for q in (j + 1):n                          # short trailing block: inline downdate
+                    lqj = conj(AP[_pp_l(q, j, n)])        # conj(L[q,j])
+                    for p in q:n                          # p ≥ q (lower)
+                        AP[_pp_l(p, q, n)] -= AP[_pp_l(p, j, n)] * lqj
+                    end
                 end
             end
         end
