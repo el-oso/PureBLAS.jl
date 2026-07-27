@@ -2,3 +2,10 @@
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
 PureBLAS = "cc9e14db-574f-4602-bf53-1167cc4b26d2"
+
+# PureBLAS is not in the General registry yet, so `Pkg.instantiate()` cannot resolve it by name.
+# Declaring the path here (Julia ≥1.11) makes `julia --project=docs -e 'using Pkg; Pkg.instantiate()'`
+# work on its own; without it every caller has to remember a separate
+# `Pkg.develop(PackageSpec(path=pwd()))` first. Drop this section once the package is registered.
+[sources]
+PureBLAS = {path = ".."}
