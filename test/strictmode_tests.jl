@@ -401,6 +401,32 @@ end
         @assert_trim_compatible P.pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
         @assert_trim_compatible P.pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)
         @assert_trim_compatible P.pbtrf!(mkband(ComplexF64); uplo = 'L', kd = 2)
+        # kd=2 only reaches the UNBLOCKED kernel. The blocked kernels — the lower one, and the two
+        # the 'U' path dispatches between — carry all the PtrMatrix/ld-1 band views and the tuned L3
+        # calls, i.e. everything trim actually has to chew on, and none of it was covered here.
+        # Both upper kernels are invoked DIRECTLY: which one pbtrf! selects depends on a per-host
+        # measurement (_pbtrf_ucross), so going through the public entry would leave one of them
+        # untested on any given box.
+        wideband(T, kd) = (
+            AB = zeros(T, kd + 1, n); AB[1, :] .= T(4 * kd);
+            for d in 1:kd
+                AB[1 + d, 1:(n - d)] .= T(0.5)
+            end; AB
+        )
+        wideU(T, kd) = (
+            AB = zeros(T, kd + 1, n); AB[kd + 1, :] .= T(4 * kd);
+            for d in 1:kd
+                AB[kd + 1 - d, (1 + d):n] .= T(0.5)
+            end; AB
+        )
+        @assert_trim_compatible P.pbtrf!(wideband(Float64, 64); uplo = 'L', kd = 64)
+        @assert_trim_compatible P.pbtrf!(wideU(Float64, 64); uplo = 'U', kd = 64)
+        @assert_trim_compatible P._pbtrf_blocked!(wideband(Float64, 64), n, 64)
+        @assert_trim_compatible P._pbtrf_repack_U!(wideU(Float64, 64), n, 64)
+        @assert_trim_compatible P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
+        @assert_trim_compatible P._pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
+        @assert_trim_compatible P._pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
+        @assert_trim_compatible P._pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
         @assert_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')

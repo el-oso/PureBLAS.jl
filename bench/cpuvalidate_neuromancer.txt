@@ -1,0 +1,10 @@
+#cpuvalidate	version=1	host=neuromancer	cpu=AMD Ryzen AI 5 340 w/ Radeon 840M	vendor=AMD	isa=512-bit	wF64=8	date=2026-07-13T21:38
+#detect	vendor=AMD	simd_B=64	L1_B=49152	L2_B=1048576	L3_B=16777216	line_B=64	intelAVX2=false
+#derived	gemm_MR=2	gemm_NR=8	gemm_NC=1360	gemm_KC=384	unpack_max=448	potrf_base=512	trsm_base=32	chol_split=false	syrk_cut=448	csyrk_unpk=192
+op     n=256   n=512   n=1024  n=2048  worst  PB_GFlops(maxn)
+gemm   1.22    1.15    1.20    1.24    1.15   33.2
+syrk   1.52    1.38    1.17    1.12    1.12   28.9
+trsm   1.86    1.39    1.29    1.18    1.18   27.5
+trmm   1.20    1.12    1.06    1.09    1.06   28.6
+potrf  1.68    1.59    1.43    1.26    1.26   27.6
+SUMMARY  worst=1.06  geomean=1.29  GATE(>=0.96)=PASS

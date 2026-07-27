@@ -35,10 +35,16 @@ const _prev_pbt = load_preference(PUREBLAS_UUID, "pbtrf_cross_kd")
 # auto-tune, and a runtime benchmark is not trim-safe. 40 is the Zen4 F64 optimum (= 5·W, the derived
 # bracket centre); Mode-2 users still measure per box because Project.toml omits the pref.
 const _prev_pbnb = load_preference(PUREBLAS_UUID, "pbtrf_nb")
+# And `pbtrf_u_native_kd`: uplo='U' has two blocked kernels (re-pack-onto-L vs native upper) whose
+# winner inverts with the bandwidth, and the switch point is a Measure-tier OncePerProcess race —
+# again not trim-safe. 256 is the Zen4 F64 measurement (repack 1.10 at kd=192, 0.845 at 256; native
+# 1.055 there); Mode-2 users still measure per box because Project.toml omits the pref.
+const _prev_pbu = load_preference(PUREBLAS_UUID, "pbtrf_u_native_kd")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
+set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -64,8 +70,10 @@ finally
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => _prev_pbnb; force = true)
     end
-    if _prev_trs === nothing
+    if _prev_pbu === nothing
+        delete_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd"; force = true)
     else
+        set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => _prev_pbu; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB

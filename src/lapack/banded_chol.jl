@@ -43,7 +43,10 @@ function pbtrf!(AB::AbstractMatrix; uplo::AbstractChar = 'L', kd::Integer = size
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("pbtrf!: uplo must be 'L' or 'U'"))
     T = eltype(AB)
     if T <: BlasFloat && _strided1(AB) && n > 1 && Int(kd) >= _pbtrf_cross(T)
-        return uplo == 'U' ? _pbtrf_blocked_U!(AB, n, Int(kd)) : _pbtrf_blocked!(AB, n, Int(kd))
+        uplo == 'L' && return _pbtrf_blocked!(AB, n, Int(kd))
+        # Two upper kernels; the winner inverts with kd (see _pbtrf_ucross).
+        return Int(kd) >= _pbtrf_ucross(T) ? _pbtrf_blocked_U!(AB, n, Int(kd)) :
+            _pbtrf_repack_U!(AB, n, Int(kd))
     end
     return uplo == 'L' ? _pbtf2_L!(AB, n, Int(kd)) : _pbtf2_U!(AB, n, Int(kd))
 end
@@ -212,6 +215,71 @@ else
     @inline _pbtrf_cross(::Type{<:BlasFloat}) = _PBTRF_CROSS_PREF::Int   # pinned (trim builds land here)
 end
 
+# ── uplo='U' kernel crossover: re-pack-onto-L below, native-upper at and above ────────────────────
+# Which of the two upper kernels wins inverts with kd (table in the _pbtrf_repack_U! header:
+# repack 2.41→1.10 over kd=48…192 then falls off a cliff to 0.845 at kd=256; native climbs
+# 0.63→0.92 then takes over at 1.055/1.078). This knob is the switch point.
+#
+# req#8 tier: MEASURE. Not Derive — the crossover balances the re-pack's diagonal-walk bandwidth
+# against the RATIO of PB's upper/transposed L3 rate to its lower/normal one. That ratio is a
+# property of our own kernels' port balance, not of any detected const, and it MOVES whenever the
+# upper trsm/syrk paths improve — exactly the "our model mispredicts a box we have" tell that
+# separates M from D (same reasoning as _pbtrf_cross and _ger_np).
+# Candidate bounds ARE Derived, as one octave above _pbtrf_cross's {2,4,8,16}·W ladder, refined to
+# 4W granularity because the cliff is sharp (repack is 1.10 at 24W and 0.845 at 32W on Zen4, so a
+# pure doubling ladder would strand kd ∈ (24W, 32W) on the losing kernel):
+#   lower 8W — below it the walk spans < 8W columns and the copy is measured-trivial (repack wins
+#              by 2.3–3.3× at 6W/8W on Zen4); there is nothing for the native kernel to win back.
+#   upper 64W — a full band block already exceeds every fleet L2 by then; if native has not won by
+#              64W it never will, and the harness returns typemax (never go native).
+const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
+@static if isnothing(_PBTRF_UCROSS_PREF)
+    function _measure_pbtrf_ucross(::Type{T})::Int where {T}
+        vw = _vwidth(T)
+        Base.generating_output() && return typemax(Int)   # never measure during precompilation
+        try
+            for c in (8 * vw):(4 * vw):(64 * vw)
+                nloc = 8 * c        # harness shape, not a tuning knob: ≥8 panel rounds of steady
+                #                     state, and bounded work at the top of the ladder (the scan
+                #                     stops at the crossover, so the tail is usually never run).
+                ABm = Matrix{T}(undef, c + 1, nloc)
+                refill! = () -> begin                     # diagonally-dominant HPD band, uplo='U'
+                    fill!(ABm, one(T))
+                    @inbounds for j in 1:nloc
+                        ABm[c + 1, j] = T(2 * c + 2)      # diag > Σ|offdiag| ≤ 2c ⇒ HPD
+                    end
+                end
+                # NOTE the two kernels are called DIRECTLY, never through pbtrf! — pbtrf! consults
+                # _pbtrf_ucross, so routing the harness through it would re-enter this very
+                # OncePerProcess initializer and deadlock. (Their default nb argument reaches
+                # _pbtrf_nb, a *different* OncePerProcess whose own harness passes nb explicitly,
+                # so that nesting terminates.)
+                refill!(); _pbtrf_repack_U!(ABm, nloc, c)          # untimed warmups (absorb JIT)
+                refill!(); _pbtrf_blocked_U!(ABm, nloc, c)
+                tr = typemax(UInt64); tn = typemax(UInt64)
+                for _ in 1:3                                       # interleaved (crude ABBA), min-of-3
+                    refill!(); s = time_ns(); _pbtrf_repack_U!(ABm, nloc, c);  tr = min(tr, time_ns() - s)
+                    refill!(); s = time_ns(); _pbtrf_blocked_U!(ABm, nloc, c); tn = min(tn, time_ns() - s)
+                end
+                tn < tr && return c    # smallest candidate where native wins; all kd ≥ c go native
+            end
+            return typemax(Int)        # native never won inside the derived bracket ⇒ always re-pack
+        catch
+            return typemax(Int)        # on any failure keep the older, more broadly-tested path
+        end
+    end
+    const _PBTRF_UCROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(Float32))
+    const _PBTRF_UCROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(Float64))
+    const _PBTRF_UCROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF32))
+    const _PBTRF_UCROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF64))
+    @inline _pbtrf_ucross(::Type{Float32}) = _PBTRF_UCROSS_F32()
+    @inline _pbtrf_ucross(::Type{Float64}) = _PBTRF_UCROSS_F64()
+    @inline _pbtrf_ucross(::Type{ComplexF32}) = _PBTRF_UCROSS_C32()
+    @inline _pbtrf_ucross(::Type{ComplexF64}) = _PBTRF_UCROSS_C64()
+else
+    @inline _pbtrf_ucross(::Type{<:BlasFloat}) = _PBTRF_UCROSS_PREF::Int   # pinned (trim builds land here)
+end
+
 # ── band-block view: the LAPACK ld-1 trick ────────────────────────────────────────────────────────
 # In band storage AB[1+(i-j), j] (uplo='L'), a block of A whose row-col offset r-c is constant
 # along each block diagonal becomes a PLAIN column-major matrix when re-read with leading dimension
@@ -248,6 +316,26 @@ function _potf2L_col!(S::Matrix{T}, m::Int) where {T}
     return 0
 end
 
+# Scalar dense UPPER potf2 (mirror of _potf2L_col!): factors S[1:m,1:m] in place from its upper
+# triangle, returns 0 or the first failing column. Failure path of _pbtrf_blocked_U! only.
+function _potf2U_col!(S::Matrix{T}, m::Int) where {T}
+    @inbounds for j in 1:m
+        ajj = real(S[j, j])
+        ajj > 0 || return j
+        rj = sqrt(ajj); S[j, j] = rj; iv = inv(rj)
+        for q in (j + 1):m
+            S[j, q] *= iv
+        end
+        for q in (j + 1):m
+            ujq = conj(S[j, q])
+            for p in (j + 1):q
+                S[p, q] -= ujq * S[j, p]
+            end
+        end
+    end
+    return 0
+end
+
 # ── blocked kernel, uplo='L' (dpbtrf.f DO 140 / zpbtrf.f) ─────────────────────────────────────────
 # Partition at outer column i (Fortran names; ib = min(nb, n-i+1)):
 #   A11 (ib×ib)  diagonal block — factored in a DENSE nb×nb scratch, not in the band view, because:
@@ -276,8 +364,8 @@ function _pbtrf_blocked!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pbtr
     ld2 = ldabs - 1                                    # the LDAB-1 of every BLAS call in dpbtrf.f
     tc = T <: Complex ? 'C' : 'T'                      # dpbtrf 'Transpose' / zpbtrf 'Conjugate transpose'
     rone = one(real(T))
-    W = zeros(T, nb + 1, nb)                           # corner work array, zeroed ONCE (see above)
-    S = Matrix{T}(undef, nb, nb)                       # dense diagonal-block scratch (see (a)/(b))
+    W, S = _pbtrf_work(T, nb)                          # GKH-owned; W arrives zeroed ONCE (see above),
+    #                                                    S is the dense diagonal-block scratch ((a)/(b))
     p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
     GC.@preserve AB W S begin
         for i in 1:nb:n
@@ -372,18 +460,35 @@ function _pbtrf_blocked!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pbtr
     return AB
 end
 
-# ── blocked kernel, uplo='U': ride the L kernel through a conjugate-transpose band repack ─────────
-# A = Uᴴ·U with U upper-banded ⟺ A = L·Lᴴ with L = Uᴴ lower-banded: the SAME matrix in lower band
-# storage is ABL[1+d, j] = A[j+d, j] = conj(A[j, j+d]) = conj(ABU[kd+1-d, j+d]), and the factor maps
-# back as U[j-d, j] = conj(L[j, j-d]) ⇒ ABU[kd+1-d, j] = conj(ABL[1+d, j-d]).
-# Why not a direct U port (dpbtrf.f DO 70 — potrf 'U' + trsm 'L','U','T' + syrk 'U','T')? Built and
-# validated it first: correct, but 0.90×OB @kd=64 and 0.40×OB / 0.28×AOCL @kd=256 on Zen4 — PB's
-# upper/transposed L3 band paths are far off the lower ones. The repack costs two O(kd·n) band
-# passes vs the O(n·kd²) factor — ≤ ~3% at kd ≥ 32 (crossover guarantees kd ≥ 2W) — and puts 'U' on
-# the exact proven-fastest path (anchor-fastest-path / wire-the-fastest-path rules). The failing
-# column needs no translation: leading minors of A are uplo-independent, and _pbtrf_blocked! already
-# reports dpotf2-ordered global columns.
-function _pbtrf_blocked_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
+# ── uplo='U': TWO kernels, split at a measured bandwidth crossover ────────────────────────────────
+# Neither upper kernel dominates — the choice inverts with kd, so both ship (see _pbtrf_ucross).
+#
+#   _pbtrf_repack_U!  — conj-transpose re-pack onto the LOWER kernel. A = Uᴴ·U with U upper-banded ⟺
+#     A = L·Lᴴ with L = Uᴴ lower-banded: the same matrix in lower band storage is
+#     ABL[1+d, j] = A[j+d, j] = conj(ABU[kd+1-d, j+d]), and the factor maps back as
+#     ABU[kd+1-d, j] = conj(ABL[1+d, j-d]). Costs two O(kd·n) band passes but runs the whole
+#     factorization on the proven-fastest path (the L kernel gates at 1.16–2.33× AOCL).
+#   _pbtrf_blocked_U! — NATIVE port of the reference's own UPLO='U' branch (dpbtrf.f DO 50 /
+#     zpbtrf.f), operating directly on upper band storage. No copy, but every L3 call is an
+#     upper/transposed one (trsm 'L','U','T'; syrk 'U','T'), which PB does not do as well as the
+#     lower/normal ones the repack path reaches.
+#
+# Measured, Zen4 F64, n ∈ {1024, 4096}, same-process ABBA, ratio vs AOCL (`nat/AOCL` vs `rep/AOCL`):
+#     kd      48     64     96    128    160    192  |   256    384
+#     repack 2.41   3.26   1.20   1.02   1.11   1.10  |  0.845  1.012
+#     native 1.36   1.71   0.63   0.83   0.87   0.92  |  1.055  1.078
+# The repack's cost is superlinear in kd — it walks A down a DIAGONAL, so it touches kd distinct
+# columns per pass, one cache line (and, past a point, one page) per 8-byte element. At kd=96 that
+# copy is ~0.7 ms of a 2.6 ms factorization; by kd=256 it is ~6.2 ms of 14.5 ms and drags the whole
+# op to 0.845 — a gate MISS that tuning could not reach (the best tiling recovered 1149 µs of
+# 2749 µs → 0.917, and helped kd=128/256 while HURTING kd=160/192/384). Below the crossover the
+# copy is cheap and the L kernel's advantage is decisive; above it the copy dominates and the
+# native kernel's weaker L3 calls are the lesser evil. Both are needed to gate everywhere.
+#
+# Failing-column reporting is uplo-independent for the repack path (leading minors of A do not
+# depend on which triangle is stored, and _pbtrf_blocked! already reports dpotf2-ordered global
+# columns), so it needs no translation.
+function _pbtrf_repack_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
     ABL = _pbtrf_band(T, kd, n)                        # owned scratch — see _pbtrf_band for why not `undef`
     @inbounds for j in 1:n                             # pack: ABU → conj-transposed lower band
         for d in 0:min(kd, n - j)
@@ -394,6 +499,101 @@ function _pbtrf_blocked_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
     @inbounds for j in 1:n                             # unpack: L factor → ABU (U = Lᴴ)
         for d in 0:min(kd, j - 1)
             AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+        end
+    end
+    return AB
+end
+
+# Same `_pb_blk` ld-1 trick as the lower kernel: in uplo='U' storage AB[kd+1+(i-j), j] = A[i,j], so a
+# block anchored at storage (r0, c0) re-read with ld = LDAB-1 is a plain column-major matrix.
+function _pbtrf_blocked_U!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pbtrf_nb(T, kd)) where {T}
+    ldabs = stride(AB, 2)
+    ld2 = ldabs - 1                                    # the LDAB-1 of every BLAS call in dpbtrf.f
+    tc = T <: Complex ? 'C' : 'T'
+    rone = one(real(T))
+    W, S = _pbtrf_work(T, nb)                          # GKH-owned; W arrives zeroed ONCE per call
+    p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
+    GC.@preserve AB W S begin
+        for i in 1:nb:n
+            ib = min(nb, n - i + 1)
+            # dpbtrf: CALL DPOTF2('U', IB, AB(KD+1,I), LDAB-1, II) — via the dense scratch (zero the
+            # unused lower half so the factor kernel sees fully-defined data).
+            @inbounds for q in 1:ib
+                for p in 1:q; S[p, q] = AB[kd + 1 + p - q, i + q - 1]; end
+                for p in (q + 1):ib; S[p, q] = zero(T); end
+            end
+            Sv = PtrMatrix(ps, ib, ib, nb)
+            ok = true
+            try
+                potrf!(Sv; uplo = 'U')
+            catch e
+                e isa PosDefException || rethrow()
+                ok = false
+            end
+            if !ok
+                # Band data is still pristine — recover the exact failing column with the scalar
+                # potf2-ordered factor (the reference's pivot sequence). If it succeeds (a blocked-vs-
+                # scalar roundoff tie on a borderline pivot) keep ITS factor and continue.
+                @inbounds for q in 1:ib
+                    for p in 1:q; S[p, q] = AB[kd + 1 + p - q, i + q - 1]; end
+                    for p in (q + 1):ib; S[p, q] = zero(T); end
+                end
+                col = _potf2U_col!(S, ib)
+                col != 0 && throw(PosDefException(i - 1 + col))
+            end
+            @inbounds for q in 1:ib, p in 1:q           # factor back into the band
+                AB[kd + 1 + p - q, i + q - 1] = S[p, q]
+            end
+            if i + ib <= n
+                i2 = min(kd - ib, n - i - ib + 1)      # dpbtrf: I2 — in-band panel cols
+                i3 = min(ib, n - i - kd + 1)           # dpbtrf: I3 — corner cols (≤0 ⇒ no corner)
+                if i2 > 0
+                    # dpbtrf: DTRSM('Left','Upper','T','N', IB, I2, 1, AB(KD+1,I), LDAB-1,
+                    #               AB(KD+1-IB,I+IB), LDAB-1)      — A12 := U11⁻ᴴ·A12
+                    A12 = _pb_blk(p0, ld2, ldabs, kd + 1 - ib, i + ib, ib, i2)
+                    trsm!(A12, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
+                    # dpbtrf: DSYRK('Upper','T', I2, IB, -1, A12, LDAB-1, 1, AB(KD+1,I+IB), LDAB-1)
+                    #                                              — A22 -= A12ᴴ·A12
+                    A22 = _pb_blk(p0, ld2, ldabs, kd + 1, i + ib, i2, i2)
+                    if T <: Complex
+                        herk!(A22, A12; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
+                    else
+                        syrk!(A22, A12; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
+                    end
+                end
+                if i3 > 0
+                    # dpbtrf DO 20/10: WORK(II,JJ) = AB(II-JJ+1, JJ+I+KD-1), JJ=1:I3, II=JJ:IB — the
+                    # LOWER triangle of A13. W is IB×I3 here, the mirror of the lower branch's I3×IB,
+                    # and its strictly-upper part stays 0 for the life of the call (W is zeroed once,
+                    # and copy-in/copy-back both touch only ii ≥ jj). The bound is NOT the lower
+                    # branch's `min(jj, i3)` mirrored: `ii in (i3-jj+1):ib` sends the band row index
+                    # ii-jj+1 to 2-i3 ≤ 0 at jj=i3, ii=1.
+                    @inbounds for jj in 1:i3, ii in jj:ib
+                        W[ii, jj] = AB[ii - jj + 1, jj + i + kd - 1]
+                    end
+                    Wv = PtrMatrix(pw, ib, i3, nb + 1)
+                    # dpbtrf: DTRSM('Left','Upper','T','N', IB, I3, 1, A11, LDAB-1, WORK, LDWORK)
+                    trsm!(Wv, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
+                    if i2 > 0
+                        # dpbtrf: DGEMM('T','N', I2, I3, IB, -1, AB(KD+1-IB,I+IB), LDAB-1, WORK,
+                        #               LDWORK, 1, AB(1+IB,I+KD), LDAB-1)   — A23 -= A12ᴴ·A13
+                        A12 = _pb_blk(p0, ld2, ldabs, kd + 1 - ib, i + ib, ib, i2)
+                        A23 = _pb_blk(p0, ld2, ldabs, 1 + ib, i + kd, i2, i3)
+                        _gemm_core!(A23, A12, Wv, -one(T), one(T), true, false, T <: Complex, false)
+                    end
+                    # dpbtrf: DSYRK('Upper','T', I3, IB, -1, WORK, LDWORK, 1, AB(KD+1,I+KD), LDAB-1)
+                    A33 = _pb_blk(p0, ld2, ldabs, kd + 1, i + kd, i3, i3)
+                    if T <: Complex
+                        herk!(A33, Wv; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
+                    else
+                        syrk!(A33, Wv; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
+                    end
+                    # dpbtrf DO 40/30: copy the lower triangle of A13 back into place
+                    @inbounds for jj in 1:i3, ii in jj:ib
+                        AB[ii - jj + 1, jj + i + kd - 1] = W[ii, jj]
+                    end
+                end
+            end
         end
     end
     return AB

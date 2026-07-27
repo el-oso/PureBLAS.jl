@@ -43,6 +43,8 @@ mutable struct L3Workspace{T}
     chold::Matrix{T}      # _chol_d:      faer potrf diag-block scratch, (_chol_block+8)×_chol_block
     cholt::Matrix{T}      # _chol_t:      faer potrf panel workspace, grows R×_chol_block
     bandl::Matrix{T}      # _pbtrf_band:  pbtrf uplo='U' conj-transposed band re-pack, grows (kd+1)×n
+    bandw::Matrix{T}      # _pbtrf_work:  pbtrf corner work array W, exactly (nb+1)×nb (ld is load-bearing)
+    bands::Matrix{T}      # _pbtrf_work:  pbtrf dense diagonal-block scratch, exactly nb×nb (ld load-bearing)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -52,7 +54,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -164,6 +166,31 @@ function _pbtrf_band(::Type{T}, kd::Int, n::Int) where {T}
         b = Matrix{T}(undef, kd + 1, n); ws.bandl = b
     end
     return view(b, :, 1:n)                             # ld == kd+1 by construction
+end
+
+# Both blocked band-Cholesky kernels need two dense scratches per call: the corner work array W
+# ((nb+1)×nb — LDWORK = nb+1 mirrors the reference's NBMAX+1, an odd leading dim so the column
+# stride can't po2-alias) and the diagonal-block factor scratch S (nb×nb). GKH-owned rather than
+# per-call `Matrix` allocations: at kd≈nb the whole factorization of a narrow band is microseconds,
+# so two allocations per call are pure overhead, and both leading dimensions are load-bearing — the
+# kernels build `PtrMatrix(…, nb+1)` / `PtrMatrix(…, nb)` views over them.
+# The size tests are `!=`, NOT `>=`: a *larger* stale buffer has the WRONG ld, and handing the
+# kernel a view whose ld disagrees with its PtrMatrix stride silently reads the wrong elements
+# (this exact bug — a `<` row test leaking an old ld — cost pbtrf kd=64 a 2.10→1.81 regression).
+# W is re-zeroed every call: the kernels write only the in-band triangle and rely on the rest being
+# zero, and which part is "the rest" moves with ib/i3, so a reused buffer must not carry stale values.
+function _pbtrf_work(::Type{T}, nb::Int) where {T}
+    ws = _l3ws(T)
+    w = ws.bandw
+    if size(w, 1) != nb + 1 || size(w, 2) != nb
+        w = Matrix{T}(undef, nb + 1, nb); ws.bandw = w
+    end
+    fill!(w, zero(T))
+    s = ws.bands
+    if size(s, 1) != nb || size(s, 2) != nb
+        s = Matrix{T}(undef, nb, nb); ws.bands = s
+    end
+    return w, s
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}

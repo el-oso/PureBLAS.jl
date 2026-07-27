@@ -164,6 +164,8 @@ end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 
+_reps_cubic(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)
+
 # Heavy O(n³) sweep for L3 / LAPACK. `@be` with `evals=1` runs a FRESH `mk(s)` per sample (the destructive
 # op mutates its input → one op per context) and EXCLUDES the mk allocation from the timed core — which
 # removes the old hazard where the per-round alloc dropped the core off-clock and biased whichever side was
@@ -171,13 +173,16 @@ const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 # reps hack needed — Chairmarks amortizes internally).
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
-function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0)
+function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic)
     out = Tuple{Int, Vector{Float64}}[]
     for s in sizes
         # reps fresh contexts per sample: setup (EXCLUDED from timing) pre-generates them, the core runs the
         # destructive op on each. reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a
         # single sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
-        reps = clamp(20_000_000 ÷ (s * s * s), 1, 512)
+        # `repsof` is overridable because the default assumes the swept size IS the problem dimension and
+        # the op is O(s³); rows that sweep some other axis (pbtrf sweeps the BANDWIDTH at fixed n, cost
+        # O(n·kd²)) would otherwise be handed hundreds of full-size contexts to allocate.
+        reps = repsof(s)
         rounds = _rounds_heavy(s)
         secs = s >= 1024 ? 2.0 : seconds   # large-n windows are seconds-bound; 2.0 is plenty and ~halves cost
         acc = Float64[]; rmeds = Float64[]
@@ -228,6 +233,11 @@ const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations,
 # Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
 # the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
 const TDSZ = (256, 1024, 4096, 16384, 65536, 262144)
+# Banded Cholesky sweeps the BANDWIDTH kd (see the pbtrf rows); n is fixed at BANDN. The points
+# straddle the two kd crossovers the kernel selection turns on: blocked-vs-unblocked (~4·W) and,
+# for uplo='U', re-pack-vs-native (~256 on Zen4).
+const BANDSZ = (16, 32, 64, 96, 128, 192, 256, 384)
+const BANDN = 4096
 const TN = Char(78); const TT = Char(84); const U = Char(85)
 
 # Run the full benchmark sweep; returns (l1, l2, l3, lp) as vectors of OpData.
@@ -488,7 +498,8 @@ function run_benchmarks()
     lp = OpData[]
     let
         LP = Char(76); UP = Char(85)
-        addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(lp, "LP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(sizes); samples = 40))
+        addh(nm, mk, ob, pb; sizes = LPSZ, repsof = _reps_cubic) =
+            _meas!(lp, "LP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(sizes); samples = 40, repsof = repsof))
         addh(
             "potrf", s -> _hpd(Float64, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); c[1, 1]),
@@ -585,6 +596,41 @@ function run_benchmarks()
             c -> (LinearAlgebra.LAPACK.ptsv!(c[1], c[2], c[3]); c[3][1]),
             c -> (PureBLAS.ptsv!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
         )
+        # ── Banded Cholesky (swept over BANDWIDTH kd at fixed n, not over n) ───────────────────────────
+        # pbtrf's cost is O(n·kd²) and every interesting effect — the blocked/unblocked crossover, the
+        # panel width, and (uplo='U') the re-pack-vs-native kernel crossover — is a function of kd, so kd
+        # is the swept axis and n is held at BANDN. Both triangles are gated: they run entirely different
+        # kernels, and 'U' is the one with two of them.
+        # Julia's stdlib has NO pbtrf! wrapper, so the reference is a direct ILP64 ccall through LBT
+        # (which is what `ref=aocl` re-points, so this row honours the AOCL comparison like every other).
+        _pbref!(uplo::Char, n::Int, kd::Int, AB::Matrix{Float64}) =
+            (
+                i = Ref{Int64}(0); ccall(
+                    (:dpbtrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                    (Ref{UInt8}, Ref{Int64}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Ref{Int64}, Clong),
+                    UInt8(uplo), Int64(n), Int64(kd), AB, Int64(size(AB, 1)), i, 1
+                ); i[]
+            )
+        # Diagonally dominant ⇒ HPD for any kd, so no size in the sweep can fail to factor.
+        function _pbd(kd, uplo)
+            AB = zeros(Float64, kd + 1, BANDN)
+            dr = uplo == 'L' ? 1 : kd + 1
+            for j in 1:BANDN
+                AB[dr, j] = 2kd + 4 + abs(randn())
+                for i in 1:min(kd, uplo == 'L' ? BANDN - j : j - 1)
+                    AB[uplo == 'L' ? 1 + i : kd + 1 - i, j] = randn() * 0.3
+                end
+            end
+            AB
+        end
+        for uplo in ('L', 'U')
+            addh(
+                "pbtrf$uplo", s -> _pbd(s, uplo),
+                c -> (_pbref!(uplo, BANDN, size(c, 1) - 1, c); c[1, 1]),
+                c -> (PureBLAS.pbtrf!(c; uplo = uplo, kd = size(c, 1) - 1); c[1, 1]);
+                sizes = BANDSZ, repsof = _ -> 1   # one (kd+1)×BANDN context per sample: ≥80 µs even at kd=16
+            )
+        end
     end
     return l1, l2, l3, lp
 end

@@ -41,6 +41,22 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
 
 ### Fixed
 
+- **Banded Cholesky `pbtrf` had no correctness coverage, and wide upper bands missed the gate.**
+  The only test was a trim-compatibility check at `uplo='L', kd=2`, so the entire blocked kernel —
+  both triangles, the panel and corner blocks, the work-array copy-back — was untested; a
+  deliberately rewritten `uplo='U'` kernel passed the full suite and then failed on its first real
+  matrix. There is now a reconstruction-oracle testitem over `s`/`d`/`c`/`z` × both triangles ×
+  `kd ∈ {1,2,8,31,32,33,40,64}` × `n ∈ {65,300}`, which also exercises both upper kernels directly
+  (which one `pbtrf!` selects is host-dependent). Separately, `uplo='U'` at `kd ≥ 256` ran at
+  0.845× AOCL: it reached the upper triangle through a conj-transpose re-pack whose diagonal walk
+  costs one cache line per element, and that copy grows superlinearly in `kd`. A native port of the
+  reference's `UPLO='U'` branch now takes over above a measured bandwidth crossover
+  (`_pbtrf_ucross`), while the re-pack — which is *faster* for narrow bands — keeps everything
+  below it. `uplo='U'` now gates at 1.02–3.29× AOCL and 1.49–2.00× OpenBLAS across
+  `kd = 64…384`.
+- **`juliac/build.jl` restored a preference that was never captured.** The `finally` block tested
+  an undefined `_prev_trs`, so every trim build would have thrown `UndefVarError` while unwinding —
+  masking whatever the real build outcome was.
 - **`potrf`/`cholesky` now report the true failing column.** `PosDefException` carried column `1`
   regardless of where the factorization actually failed, so `cholesky(A; check=true)` named the wrong
   column and the `dpotrf_64_`/`zpotrf_64_` C-ABI symbols returned the wrong `info` to LBT callers. The
