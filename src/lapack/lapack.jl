@@ -255,15 +255,28 @@ const _TR_TB = 32
         ::Val{CJ} = Val(false)
     ) where {T, CJ}
     sz = sizeof(T)
+    # Inner loops ordered so the CONTIGUOUS side is the READ of A and the strided side is the write into
+    # the scratch M. The obvious other order (contiguous write down M's column, strided read across A's
+    # row) is 2.1–3.8× SLOWER whenever A's lda is a power of two — which is exactly the gated sizes.
+    # Measured on Zen4, transposing the upper triangle, bit-identical either way:
+    #     F64  n=1024 lda=1024   strided-read 2056 µs (4.1 GB/s) → this order 543 µs (15.5)   3.79×
+    #     F64  n=2048 lda=2048   strided-read 9459 µs (3.6)      → this order 4560 µs (7.4)   2.07×
+    #     zF64 n=1024 lda=1024   strided-read 2516 µs (6.7)      → this order 1205 µs (13.9)  2.09×
+    # It is po2 SET ALIASING on the strided side, not page span or bandwidth: at lda·8 % 4096 == 0 every
+    # column lands in the same L1 set group. Padding the source lda by 8 recovers the same speed
+    # (n=1024: 2095 → 435 µs; n=2048: 9433 → 3438), while lda = 4096 and 8192 are no worse than 2048 —
+    # so span is irrelevant and the tile size is not the lever (see _TR_TB). The strided side here is M,
+    # whose ldM comes from _potrf_pad and is deliberately NOT a power of two, so it cannot alias.
+    # `_tri_lowerT_to_upper!` below keeps the mirrored order for the same reason and measures flat in lda.
     @inbounds for jb in 0:_TR_TB:(n - 1)            # M_lower[i,j] = (CJ ? conj : id)(A_upper[j,i]), i≥j
         je = min(jb + _TR_TB, n)
         for ib in jb:_TR_TB:(n - 1)
             ie = min(ib + _TR_TB, n)
-            for j in jb:(je - 1)
-                mo = j * ldM
-                for i in max(ib, j):(ie - 1)        # M col j contiguous ← A row j, tile-confined strided
-                    v = unsafe_load(pa + (i * lda + j) * sz)
-                    unsafe_store!(pm + (mo + i) * sz, CJ ? conj(v) : v)
+            for i in ib:(ie - 1)
+                ao = i * lda                        # A col i contiguous → M row i, tile-confined strided
+                for j in jb:min(je - 1, i)          # keep i ≥ j (A's upper triangle)
+                    v = unsafe_load(pa + (ao + j) * sz)
+                    unsafe_store!(pm + (j * ldM + i) * sz, CJ ? conj(v) : v)
                 end
             end
         end
