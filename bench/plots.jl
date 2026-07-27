@@ -487,12 +487,19 @@ function run_benchmarks()
     # ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────
     lp = OpData[]
     let
-        LP = Char(76)
+        LP = Char(76); UP = Char(85)
         addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(lp, "LP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(sizes); samples = 40))
         addh(
             "potrf", s -> _hpd(Float64, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); c[1, 1]),
             c -> (PureBLAS.potrf!(c; uplo = LP); c[1, 1])
+        )
+        # Upper takes its own route (Lever A: transpose into scratch → faer lower kernels → transpose back),
+        # so gating only 'L' leaves half of potrf unmeasured. See the zpotrfU note in the CLP group.
+        addh(
+            "potrfU", s -> _hpd(Float64, s),
+            c -> (LinearAlgebra.LAPACK.potrf!(UP, c); c[1, 1]),
+            c -> (PureBLAS.potrf!(c; uplo = UP); c[1, 1])
         )
         addh(
             "geqrf", s -> randn(s, s),
@@ -891,12 +898,21 @@ function run_cmplx_benchmarks()
     # aren't implemented yet, so this is the honest fair fight for what ships. ─────────────────────────────
     clp = OpData[]
     let
-        LP = Char(76)  # 'L'
+        LP = Char(76); UP = Char(85)  # 'L' / 'U'
         addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(clp, "CLP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(_cap(sizes, 2048)); samples = 40))  # cap complex LAPACK at 2048 (zgesvd's 1024 cap survives via nested _cap)
         addh(
             "zpotrf", s -> _hpd(T, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); real(c[1, 1])),
             c -> (PureBLAS.potrf!(c; uplo = LP); real(c[1, 1]))
+        )
+        # UPPER is a genuinely different code path (Lever C: conj-transpose → _cpotrf_lower! →
+        # conj-transpose back), not a mirror of lower — and it was UNGATED until now, which is exactly how
+        # it came to sit at 0.92–0.94 vs AOCL at n=512/1024 unnoticed. "zpotrf PASSES" previously meant
+        # only that the lower path passed.
+        addh(
+            "zpotrfU", s -> _hpd(T, s),
+            c -> (LinearAlgebra.LAPACK.potrf!(UP, c); real(c[1, 1])),
+            c -> (PureBLAS.potrf!(c; uplo = UP); real(c[1, 1]))
         )
         addh(
             "zgeqrf", s -> randn(T, s, s),
