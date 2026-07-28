@@ -2719,6 +2719,16 @@ function trsm!(
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
     if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha)
         up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
+        # SINGLE column, side-L: one trsv beats the dense base even down here. This path returns
+        # before the narrow-B branch below, so without this the sweep never fires for k ≤ _TRSM_DBASE
+        # — exactly the sizes most dominated by per-call overhead. Measured Zen4 (ns, dense base vs
+        # trsv): k=8 151→121, k=16 251→211, k=24 361→311, k=32 481→421, i.e. 12–20% faster.
+        # nrhs=1 ONLY: at nrhs=2 and 4 in this range the dense base wins (k=32: 711 vs 802, 751 vs
+        # 1573), because it amortises across columns while the sweep re-walks A each time.
+        if sl && size(B, 2) == 1 && _strided1(B)
+            trsv!(A, view(B, :, 1); uplo = uplo, trans = transA, diag = diag)
+            return B
+        end
         # k in [_TRSM_FUSED_MIN, _TRSM_DBASE]: the fused gemmtrsm leaf beats the scalar dense base even here
         # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans AVX-512, fusable),
         # keeping the low-overhead tiny entry. Below _TRSM_FUSED_MIN the dense base wins (setup unamortized).
