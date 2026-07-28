@@ -113,9 +113,11 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     timing the *same reference routine* under each library, AOCL's `dpptrf` `uplo='U'` is
     **6.0× slower than OpenBLAS's** at n=1024 (175 281 µs vs 29 297 µs) — near-stock netlib — while
     on `dpotrf` the two sit within 20% of each other. AOCL optimizes dense Cholesky and does not
-    optimize the packed variant, so **OpenBLAS is the meaningful bar here** and the eight missing
-    cells are the real result. A cell far above one reference *and* below the other is the tell that
-    one of them is not a reference; measuring against AOCL alone would have shipped this as a win.
+    optimize the packed variant. The gate is unchanged by this — it is `max(OpenBLAS, AOCL)`, so a
+    slow AOCL never *lowers* the bar, it merely means `max()` here **equals OpenBLAS**; both
+    references are still measured, and both sets of misses above still count. What the asymmetry does
+    change is how much a large ratio is worth as *evidence*: a cell far above one reference and below
+    the other is the tell that the high ratio is measuring the reference's absence, not our speed.
     The lower path improved this session (worst cell 0.738 → 0.949) once its gap was decomposed: the
     `spr!` *kernel* already ties or beats AOCL at every order, and the whole deficit was per-call
     overhead — the public entry plus a `SubArray` built per column — compounded by the lower path
