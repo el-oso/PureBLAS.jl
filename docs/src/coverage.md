@@ -94,14 +94,16 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
     routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 
-[^ps]: `pstrf`'s blocked pivoted factorization gates broadly — Zen4 Float64 vs OpenBLAS, `uplo='L'`
-    1.13–1.76 at every size and `uplo='U'` 1.01–1.99 — with **two remaining cells**: `uplo='U'` at
-    n=48 (**0.943**) and n=64 (**0.921**). Those two were known but had never been *gated*: the
-    benchmark harness measured only `uplo='L'`, and 'U' is a separate code path (both the pivoted
-    panel and the trailing update mirror). A `pstrfU` row now tracks them. The large-n wins come from
-    batching the pivot row swaps per panel — they are stride-`lda` and were ~47% of the runtime, i.e.
-    the swap, not the BLAS-3 update, was the bottleneck.
-    ⚠ Zen4 Float64 only; not yet fleet-validated.
+[^ps]: `pstrf`'s blocked pivoted factorization clears **AOCL completely on both Zen4 and Zen5**, both
+    triangles, every size (Zen5: `uplo='L'` 1.07–1.75, `uplo='U'` 1.06–1.75). Against **OpenBLAS** it
+    clears everywhere except a narrow `uplo='U'` window that is consistent across µarchs and mild:
+    Zen4 n=48 **0.943** and n=64 **0.921**; Zen5 n=64 **0.978** only. Everything else runs 1.01–1.99.
+    Those cells were known but had never been *gated* — the harness passed `uplo='L'` for both sides,
+    so the separate 'U' code path (the pivoted panel and the trailing update both mirror) was never
+    measured. A `pstrfU` row now tracks it. The large-n wins come from batching the pivot row swaps
+    per panel: they are stride-`lda` and were ~47% of the runtime, so the swap — not the BLAS-3
+    update — was the bottleneck.
+    ⚠ Float64; Zen3 not yet measured for this routine.
 
 [^pp]: `pptrf` does **not** yet gate, and the two triangles fail against *different* references —
     which is why it needs both. Zen4, Float64, n = 8…2048:
