@@ -41,6 +41,20 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
 
 ### Fixed
 
+- **Packed Cholesky `pptrf` (lower) was paying per-call overhead, not doing slow arithmetic.**
+  Its worst cell ran 0.738× AOCL at n=32. Decomposing it: PureBLAS's `spr!` *kernel* already ties or
+  beats AOCL's `dspr` at every trailing order (70 vs 70 ns at m=8, 591 vs 641 at m=64), but the
+  factorization reached it through the public entry (~11 ns of validation) and built two `SubArray`s
+  per column (a further 9–50 ns) — at n=32 that per-call tax was the entire gap. Compounding it, the
+  lower path gated on the *upper* path's cutoff constant, whose measurement table is upper-path only;
+  at 32 that meant `m = n−j` was below the cutoff for **every** column at n=32, so `spr!` was never
+  called and the whole factorization ran the scalar fallback. Split into its own Measure-tier knob
+  (`_pptrf_spr_min`) and given a pointer-direct kernel entry (`_spr_simd_lower_ptr!`). Both were
+  needed — lowering the cutoff alone only reached 0.846. `uplo='L'` vs AOCL: n=32 0.738 → **0.949**,
+  n=48 0.880 → 0.980, n=64 0.922 → 1.009, n=96 0.980 → 1.050, n=128 1.002 → 1.069; vs OpenBLAS it now
+  clears every size (1.05–1.37). Still open: `uplo='L'` n=32/48 vs AOCL, and `uplo='U'` n=48…2048 vs
+  OpenBLAS (0.918–0.990) — the latter a systematic miss that measuring against AOCL alone concealed,
+  since PureBLAS beats AOCL's packed upper by up to 6.3×.
 - **Banded Cholesky `pbtrf` had no correctness coverage, and wide upper bands missed the gate.**
   The only test was a trim-compatibility check at `uplo='L', kd=2`, so the entire blocked kernel —
   both triangles, the panel and corner blocks, the work-array copy-back — was untested; a
