@@ -109,8 +109,13 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     which is why it needs both. Zen4, Float64, n = 8…2048:
     `uplo='L'` clears OpenBLAS at every size (1.05–1.37) and clears AOCL except n=32 (**0.949**) and
     n=48 (**0.980**). `uplo='U'` beats AOCL by a wide margin (1.17–**6.27**, growing with n) but
-    loses to OpenBLAS at n=48…2048 (**0.918–0.990**) — OpenBLAS's packed upper is far stronger than
-    AOCL's, so measuring against AOCL alone would have shown a 6× win and hidden eight missing cells.
+    loses to OpenBLAS at n=48…2048 (**0.918–0.990**). That 6.27× is **not** evidence of quality:
+    timing the *same reference routine* under each library, AOCL's `dpptrf` `uplo='U'` is
+    **6.0× slower than OpenBLAS's** at n=1024 (175 281 µs vs 29 297 µs) — near-stock netlib — while
+    on `dpotrf` the two sit within 20% of each other. AOCL optimizes dense Cholesky and does not
+    optimize the packed variant, so **OpenBLAS is the meaningful bar here** and the eight missing
+    cells are the real result. A cell far above one reference *and* below the other is the tell that
+    one of them is not a reference; measuring against AOCL alone would have shipped this as a win.
     The lower path improved this session (worst cell 0.738 → 0.949) once its gap was decomposed: the
     `spr!` *kernel* already ties or beats AOCL at every order, and the whole deficit was per-call
     overhead — the public entry plus a `SubArray` built per column — compounded by the lower path
