@@ -44,12 +44,16 @@ const _prev_pbu = load_preference(PUREBLAS_UUID, "pbtrf_u_native_kd")
 # one for kd below it, where clamping to kd would collapse the in-band panel). Both are runtime
 # benchmarks. 8 is the Zen4 F64 optimum (= W).
 const _prev_pbns = load_preference(PUREBLAS_UUID, "pbtrf_nb_small")
+# And `pptrf_spr_min`: the packed lower path's spr!-vs-inline cutoff is a Measure-tier
+# OncePerProcess race. 8 is the Zen4 F64 optimum (= W).
+const _prev_ppsm = load_preference(PUREBLAS_UUID, "pptrf_spr_min")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
+set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => 8; force = true)       # packed lower spr-vs-inline cutoff (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -84,6 +88,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "pbtrf_nb_small"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => _prev_pbns; force = true)
+    end
+    if _prev_ppsm === nothing
+        delete_preferences!(PUREBLAS_UUID, "pptrf_spr_min"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => _prev_ppsm; force = true)
     end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
