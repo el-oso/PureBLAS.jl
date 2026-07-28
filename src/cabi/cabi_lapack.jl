@@ -721,10 +721,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
-        trsm!(
-            Bm, Am; side = 'L', uplo = _cabi_char(uplo), transA = _cabi_char(trans),
-            diag = _cabi_char(diag), alpha = one($T)
-        )
+        trtrs!(Am, Bm; uplo = _cabi_char(uplo), trans = _cabi_char(trans), diag = _cabi_char(diag))
         unsafe_store!(info, Int64(0)); return
     end
 end
@@ -740,14 +737,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
-        ct = $(T <: Complex ? 'C' : 'T')
-        if _cabi_char(uplo) == 'L'
-            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = 'N', alpha = one($T))    # L·Y = B
-            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = ct, alpha = one($T))     # Lᴴ·X = Y
-        else
-            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = ct, alpha = one($T))     # Uᴴ·Y = B
-            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = 'N', alpha = one($T))    # U·X = Y
-        end
+        potrs!(Am, Bm; uplo = _cabi_char(uplo))
         unsafe_store!(info, Int64(0)); return
     end
 end
@@ -764,22 +754,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
         ip = PtrVector(ipiv, N)
-        if tr == 'N'
-            _laswp!(Bm, ip, 1, N, 1, R)                                              # P·B (forward)
-            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one($T))  # L·Y = PB
-            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one($T))  # U·X = Y
-        else
-            trsm!(Bm, Am; side = 'L', uplo = 'U', transA = tr, diag = 'N', alpha = one($T))   # Uᵀ·Y = B
-            trsm!(Bm, Am; side = 'L', uplo = 'L', transA = tr, diag = 'U', alpha = one($T))   # Lᵀ·Z = Y
-            @inbounds for i in N:-1:1                                                 # reverse interchanges
-                q = Int(ip[i])
-                if q != i
-                    for j in 1:R
-                        Bm[i, j], Bm[q, j] = Bm[q, j], Bm[i, j]
-                    end
-                end
-            end
-        end
+        getrs!(Am, ip, Bm; trans = tr)
         unsafe_store!(info, Int64(0)); return
     end
 end

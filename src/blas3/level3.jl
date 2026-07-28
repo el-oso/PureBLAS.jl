@@ -1204,6 +1204,10 @@ const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is strong
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
 const _TRSM_DBASE = 32
+# Narrow-B divisor: side-L trsm sweeps trsv per column when nrhs ≤ k ÷ this (see the branch in trsm!).
+# Derive over _TRSM_DBASE — the blocked setup inverts diagonal blocks of that width, so the nrhs at
+# which the setup is repaid scales as k/(4·base). Set to 1 to disable the sweep entirely.
+const _TRSM_NARROW_DIV = @load_preference("trsm_narrow_max", 4 * _TRSM_DBASE)::Int
 # Column-blocked rank-1 update for the dense trsm base (non-transpose): B[brow0.., c] -= B[irow0, c]·acol
 # over all n columns. Holds the A-column vector across a block of 4 B-columns (reuse) and does the short
 # rlen-remainder mask ONCE per row-block instead of once per column — the per-column `_axpy_simd!` (though
@@ -2718,6 +2722,34 @@ function trsm!(
             return _trsm_right!(up, tr, false, unit, A, B)
         end
         return _trsm_dense_R!(up, tr, unit, A, B)
+    end
+    # ── NARROW B (side='L'): sweep trsv per column instead of the blocked solve ────────────────────
+    # The blocked path pays an O(k·nb²) setup — the triangular inverse of the diagonal blocks — that is
+    # amortised over B's columns. With few columns it is never repaid, and the cost is near-constant in
+    # nrhs: measured Zen4 k=1024, PB trsm took 1123 µs at nrhs=1 and 1197 µs at nrhs=8, i.e. eight
+    # solves for the price of one. Against OpenBLAS that was 0.21 at nrhs=1 — while PB's own trsv beat
+    # OB's trsm by 2.87× on the same shape. This was invisible because the trsm gate row uses SQUARE
+    # operands, so the narrow-B regime had never been measured; it is also the whole reason getrs/potrs
+    # measured 0.07–0.27 vs OpenBLAS (`A \ b` with one RHS is exactly nrhs=1).
+    # Ratio trsm/per-column-trsv, Zen4 (>1 ⇒ sweep wins):
+    #     k\nrhs      1      2      4      8     16     32
+    #     256      2.18   1.75   1.55   0.48   0.48   0.84
+    #     512      9.70   5.30   3.08   1.53   1.46   1.47
+    #     1024    13.98   7.21   3.83   1.87   1.44   1.23
+    #     2048    12.49   6.31   3.28   1.58   1.03   0.76
+    # PDM Derive: the crossover scales with k because the setup does — nrhs* ≈ k/(4·_TRSM_DBASE),
+    # _TRSM_DBASE being the already-derived dense-base width whose diagonal blocks are what gets
+    # inverted. On Zen4 (base 32) that is k÷128, which is at or inside the measured crossover at every
+    # k above — conservative by construction, and it captures the large wins (all of nrhs=1, out to
+    # nrhs=16 at k=2048). Overridable via "trsm_narrow_max".
+    # Only side='L': side='R' is narrow in its ROWS, a different kernel question, not measured here.
+    if sl && !isone(_TRSM_NARROW_DIV) && size(B, 2) <= max(1, k ÷ _TRSM_NARROW_DIV) &&
+            _strided1(B) && size(B, 1) == k
+        isone(alpha) || (B .*= alpha)          # trsv has no α; A⁻¹(αB) = α·A⁻¹B, so prescaling is exact
+        @inbounds for j in 1:size(B, 2)
+            trsv!(A, view(B, :, j); uplo = uplo, trans = transA, diag = diag)
+        end
+        return B
     end
     if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
             _strided1(A) && _badld(stride(A, 2))

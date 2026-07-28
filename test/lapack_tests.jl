@@ -84,6 +84,44 @@ end
     end
 end
 
+@testitem "getrs/potrs/trtrs (solves on given factors) vs LAPACK" begin
+    using PureBLAS, LinearAlgebra, Random
+    # These back `lu(A) \ b`, `cholesky(A) \ b` and triangular `\`. Until now they existed ONLY as
+    # C-ABI shims, so there was no native entry point to test or to gate — and gating them turned up
+    # getrs at 0.07-0.27 vs OpenBLAS for a single RHS. nrhs=1 is covered explicitly because that is
+    # the `\` case and the one that was broken.
+    @testset "$T n=$n nrhs=$nrhs" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            n in (1, 7, 64, 129), nrhs in (1, 3)
+
+        R = real(T); tol = sqrt(eps(R)) * 100
+        Random.seed!(hash((T, n, nrhs)))
+        A = randn(T, n, n) + n * I
+        B = randn(T, n, nrhs)
+        # Factors come from LAPACK on purpose: these solves are specified to operate on
+        # standard-convention factors from ANY backend (that is what makes forwarding them correct
+        # under a mixed backend), so testing against reference-produced factors is the faithful check.
+        F, ipiv, _ = LinearAlgebra.LAPACK.getrf!(copy(A))
+        for tr in ('N', 'T', 'C')
+            x1 = PureBLAS.getrs!(copy(F), ipiv, copy(B); trans = tr)
+            x2 = LinearAlgebra.LAPACK.getrs!(tr, copy(F), ipiv, copy(B))
+            @test maximum(abs, x1 - x2) < tol * (norm(x2) + 1)
+        end
+        S = A * A' + n * I                                  # HPD for the Cholesky solve
+        for u in ('L', 'U')
+            C = copy(S); PureBLAS.potrf!(C; uplo = u)
+            y1 = PureBLAS.potrs!(copy(C), copy(B); uplo = u)
+            y2 = LinearAlgebra.LAPACK.potrs!(u, copy(C), copy(B))
+            @test maximum(abs, y1 - y2) < tol * (norm(y2) + 1)
+        end
+        for u in ('L', 'U'), tr in ('N', 'T', 'C'), dg in ('N', 'U')
+            Tm = u == 'L' ? tril(A) : triu(A)
+            z1 = PureBLAS.trtrs!(copy(Tm), copy(B); uplo = u, trans = tr, diag = dg)
+            z2 = LinearAlgebra.LAPACK.trtrs!(u, tr, dg, copy(Tm), copy(B))
+            @test maximum(abs, z1 - z2) < tol * (norm(z2) + 1)
+        end
+    end
+end
+
 @testitem "pptrf/pptrs (packed Cholesky) — both triangles, s/d/c/z" begin
     using PureBLAS, LinearAlgebra, Random
     # Same coverage hole pbtrf had: pptrf's only test was a StrictMode trim check at uplo='L', so
