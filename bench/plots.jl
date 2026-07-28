@@ -529,6 +529,14 @@ function run_benchmarks()
             c -> (LinearAlgebra.LAPACK.pstrf!(LP, c, -1.0); c[1, 1]),
             c -> (PureBLAS.pstrf!(c, -1.0; uplo = LP); c[1, 1])
         )
+        # uplo='U' is a SEPARATE code path (pivoted panel and trailing update both mirror), and gating
+        # only 'L' left the one cell with a known residual — n=48/64 upper vs OpenBLAS — unmeasured.
+        # Same omission that hid potrf's, pbtrf's and pptrf's upper paths.
+        addh(
+            "pstrfU", s -> _hpd(Float64, s),
+            c -> (LinearAlgebra.LAPACK.pstrf!(UP, c, -1.0); c[1, 1]),
+            c -> (PureBLAS.pstrf!(c, -1.0; uplo = UP); c[1, 1])
+        )
         # real gesvd capped at 2048: OB gesdd is divide-and-conquer, PB is QR-iteration — at 4096 with vectors
         # that algorithm mismatch dominates (no actionable signal) and a single sample isn't seconds-bounded.
         addh(
