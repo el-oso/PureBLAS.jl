@@ -1204,10 +1204,25 @@ const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is strong
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
 const _TRSM_DBASE = 32
-# Narrow-B divisor: side-L trsm sweeps trsv per column when nrhs ≤ k ÷ this (see the branch in trsm!).
-# Derive over _TRSM_DBASE — the blocked setup inverts diagonal blocks of that width, so the nrhs at
-# which the setup is repaid scales as k/(4·base). Set to 1 to disable the sweep entirely.
-const _TRSM_NARROW_DIV = @load_preference("trsm_narrow_max", 4 * _TRSM_DBASE)::Int
+# Narrow-B cutoff: side-L trsm sweeps trsv per column when nrhs ≤ this. Set to 0 to disable.
+#
+# The crossover is CONSTANT in k, not proportional to it. Blocked costs `setup + nrhs·b`, the sweep
+# costs `nrhs·v`, so the sweep wins while `nrhs < setup/(v − b)`; setup and the per-column terms all
+# scale as k², so the ratio — and therefore the crossover — is k-INVARIANT. Measured that way on
+# Zen4 (µs, per-column sweep vs blocked, after the A-pad removal above):
+#     k     nrhs=1        nrhs=4          nrhs=8         nrhs=16
+#     512   22 vs 94      93 vs 372       186 vs 91      370 vs 315
+#     1024  82 vs 429     337 vs 998      657 vs 378     1320 vs 1002
+#     2048  452 vs 2475   1817 vs 3955    3611 vs 2297   7141 vs 4105
+# The sweep wins at 1 and 4 and loses at 8 and 16, at EVERY k — one crossover, no k dependence.
+# An earlier version of this knob used k ÷ (4·_TRSM_DBASE), reasoning that the setup amortises over
+# more columns as k grows. That was the wrong SHAPE: it admitted nrhs ≤ 8 at k=1024 and ≤ 16 at
+# k=2048, i.e. exactly where the sweep loses, and it was the cause of the getrs/potrs nrhs=8 misses.
+# req#8 tier: validated literal. The k-invariance IS derived (above); the value 4 is the measured
+# crossover and is not predictable from a detected const — it is a ratio of two kernels' constants.
+# ⚠ Zen4-measured; needs fleet confirmation (the Zen3 crossover looked the same, 2–4, but was taken
+# before the A-pad removal).
+const _TRSM_NARROW_MAX = @load_preference("trsm_narrow_max", 4)::Int
 # Column-blocked rank-1 update for the dense trsm base (non-transpose): B[brow0.., c] -= B[irow0, c]·acol
 # over all n columns. Holds the A-column vector across a block of 4 B-columns (reuse) and does the short
 # rlen-remainder mask ONCE per row-block instead of once per column — the per-column `_axpy_simd!` (though
@@ -2743,7 +2758,7 @@ function trsm!(
     # k above — conservative by construction, and it captures the large wins (all of nrhs=1, out to
     # nrhs=16 at k=2048). Overridable via "trsm_narrow_max".
     # Only side='L': side='R' is narrow in its ROWS, a different kernel question, not measured here.
-    if sl && !isone(_TRSM_NARROW_DIV) && size(B, 2) <= max(1, k ÷ _TRSM_NARROW_DIV) &&
+    if sl && _TRSM_NARROW_MAX > 0 && size(B, 2) <= _TRSM_NARROW_MAX &&
             _strided1(B) && size(B, 1) == k
         isone(alpha) || (B .*= alpha)          # trsv has no α; A⁻¹(αB) = α·A⁻¹B, so prescaling is exact
         @inbounds for j in 1:size(B, 2)
@@ -2751,13 +2766,19 @@ function trsm!(
         end
         return B
     end
-    if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
-            _strided1(A) && _badld(stride(A, 2))
-        Apad = _l3_apad(eltype(B), k); copyto!(Apad, A)
-        _trsm!(sl, uplo == 'U', transA != 'N', false, diag == 'U', alpha, Apad, B)
-    else
-        _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, B)
-    end
+    # NOTE: a po2-`lda` A-pad used to sit here — when stride(A,2) was a bad (power-of-two) stride, A
+    # was copied into an odd-ld scratch (`_l3_apad`, ld = k+8) before the solve, to dodge cache-set
+    # aliasing. It was REMOVED after measuring it: the copy is O(k²) and never repaid. Zen4, k=1024,
+    # nopad vs pad, all sixteen combinations of side × uplo × transA × B-width:
+    #     side-L narrow B  +198% / +71% / +229% / +69%      side-L wide B  +4% / +15% / +3% / +12%
+    #     side-R narrow B  +346% / +103% / +357% / +101%    side-R wide B  +7% / +6% / +11% / tie
+    # It is a loss everywhere — worst for narrow B, where an O(k²) copy is paid for an O(k·nrhs)
+    # solve, but still a loss at nrhs = k. Removing it also slightly IMPROVES the square-B gate shape
+    # (OB/PB at k=1024, nrhs=1024: 1.355 with the pad → 1.388 without).
+    # Whatever aliasing motivated it is evidently already handled inside `_trsm!`'s own blocking; the
+    # pad was paying a second time for it. `_l3_apad`/`L3Workspace.apad` are now unused by trsm and
+    # kept only so the buffer and its rationale survive in one place if a future shape needs them.
+    _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, B)
     return B
 end
 
