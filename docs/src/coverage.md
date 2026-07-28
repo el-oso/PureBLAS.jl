@@ -78,14 +78,21 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ [^pb] |
 | Packed Cholesky | pptrf, pptrs | s/d/c/z | ✅ | ⏳ |
 
-[^pb]: `pbtrf` gates on **Zen4 for Float64** at every bandwidth measured — `kd = 32…384`, n ∈
-    {1024, 4096}, both triangles, 1.02–3.28× AOCL — but that is one box and one type, so the row
-    stays ⏳ until the fleet run confirms Zen3/Zen5. `uplo='U'` dispatches between two kernels at a
-    measured bandwidth crossover: a conj-transpose re-pack onto the (much faster) lower kernel for
-    narrow bands, and a native upper-storage port once the re-pack's diagonal walk starts to
-    dominate. The panel width likewise has two measured regimes — clamping the wide-band width to
-    `kd` collapses the in-band panel and was the routine's only gate miss. See §5.2 and §5.3 of
-    [Tuning](tuning.md).
+[^pb]: `pbtrf` gates fully on **Zen4** (Float64, `kd = 32…384`, n ∈ {1024, 4096}, both triangles:
+    1.02–3.28× AOCL, 1.49–2.00× OpenBLAS) and beats **OpenBLAS on all three µarchs**, but it does
+    **not** yet clear AOCL fleet-wide — which is why this row is ⏳. Residuals are all `uplo='U'`
+    at mid bandwidth: Zen5 `kd=128/192/256/384` at 0.954–0.991, Zen3 `kd=128/160/192` at
+    0.881–0.984 (plus `uplo='L'` `kd=160/192` at 0.959–0.995). Zen3 is the worst box and also the
+    one whose `_pbtrf_ucross` bracket is derived from a narrower `_vwidth` (W=4 → the switch lands
+    on 192, itself a 0.90 cell), so the leading hypothesis is a candidate bracket putting the
+    optimum at an edge — the failure this file's own history records for the wide-band panel
+    bracket. Not yet confirmed by measurement. Correctness is clean on all three boxes
+    (11368/11369, identical).
+    `uplo='U'` dispatches between two kernels at a measured bandwidth crossover: a conj-transpose
+    re-pack onto the (much faster) lower kernel for narrow bands, and a native upper-storage port
+    once the re-pack's diagonal walk starts to dominate. The panel width likewise has two measured
+    regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
+    routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 
 [^tri]: All six tridiagonal routines gate `≥ max(OpenBLAS, AOCL)` on Zen3/4/5 with one exception:
     `pttrs` measures 0.99 against AOCL (1.67–1.73 vs OpenBLAS). That is a *shared* dependency-chain
