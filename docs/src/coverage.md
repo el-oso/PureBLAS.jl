@@ -26,7 +26,7 @@ size crossover — **beats** OpenBLAS at large `n`.
 | Op | Routines | Types | Routes | Optimized |
 |---|---|---|---|---|
 | Cholesky | potrf, potrs, potri | s/d/c/z | ✅ | ✅ |
-| Pivoted Cholesky | pstrf | s/d/c/z | ✅ | ⏳ |
+| Pivoted Cholesky | pstrf | s/d/c/z | ✅ | ⏳ [^ps] |
 | LU | getrf, getrs, getri, gesv | s/d/c/z | ✅ | ✅ |
 | QR | geqrf, geqrt, gemqrt, orgqr, ormqr | s/d/c/z | ✅ | ✅ |
 | LQ | gelqf, orglq, ormlq | s/d/c/z | ✅ | ⏳ |
@@ -93,6 +93,15 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     once the re-pack's diagonal walk starts to dominate. The panel width likewise has two measured
     regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
     routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
+
+[^ps]: `pstrf`'s blocked pivoted factorization gates broadly — Zen4 Float64 vs OpenBLAS, `uplo='L'`
+    1.13–1.76 at every size and `uplo='U'` 1.01–1.99 — with **two remaining cells**: `uplo='U'` at
+    n=48 (**0.943**) and n=64 (**0.921**). Those two were known but had never been *gated*: the
+    benchmark harness measured only `uplo='L'`, and 'U' is a separate code path (both the pivoted
+    panel and the trailing update mirror). A `pstrfU` row now tracks them. The large-n wins come from
+    batching the pivot row swaps per panel — they are stride-`lda` and were ~47% of the runtime, i.e.
+    the swap, not the BLAS-3 update, was the bottleneck.
+    ⚠ Zen4 Float64 only; not yet fleet-validated.
 
 [^pp]: `pptrf` does **not** yet gate, and the two triangles fail against *different* references —
     which is why it needs both. Zen4, Float64, n = 8…2048:
