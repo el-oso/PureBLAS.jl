@@ -76,7 +76,7 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | ✅ |
 | SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | ✅ [^tri] |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ [^pb] |
-| Packed Cholesky | pptrf, pptrs | s/d/c/z | ✅ | ⏳ |
+| Packed Cholesky | pptrf, pptrs | s/d/c/z | ✅ | ⏳ [^pp] |
 
 [^pb]: `pbtrf` gates fully on **Zen4** (Float64, `kd = 32…384`, n ∈ {1024, 4096}, both triangles:
     1.02–3.28× AOCL, 1.49–2.00× OpenBLAS) and beats **OpenBLAS on all three µarchs**, but it does
@@ -93,6 +93,19 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     once the re-pack's diagonal walk starts to dominate. The panel width likewise has two measured
     regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
     routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
+
+[^pp]: `pptrf` does **not** yet gate, and the two triangles fail against *different* references —
+    which is why it needs both. Zen4, Float64, n = 8…2048:
+    `uplo='L'` clears OpenBLAS at every size (1.05–1.37) and clears AOCL except n=32 (**0.949**) and
+    n=48 (**0.980**). `uplo='U'` beats AOCL by a wide margin (1.17–**6.27**, growing with n) but
+    loses to OpenBLAS at n=48…2048 (**0.918–0.990**) — OpenBLAS's packed upper is far stronger than
+    AOCL's, so measuring against AOCL alone would have shown a 6× win and hidden eight missing cells.
+    The lower path improved this session (worst cell 0.738 → 0.949) once its gap was decomposed: the
+    `spr!` *kernel* already ties or beats AOCL at every order, and the whole deficit was per-call
+    overhead — the public entry plus a `SubArray` built per column — compounded by the lower path
+    reusing the *upper* path's cutoff constant, which meant `spr!` was never called at all at n=32.
+    See §5.3 of [Tuning](tuning.md). The remaining cells are gaps, not ceilings.
+    ⚠ Zen4 only; not yet fleet-validated. The committed plot SVGs/tables predate the lower-path fix.
 
 [^tri]: All six tridiagonal routines gate `≥ max(OpenBLAS, AOCL)` on Zen3/4/5 with one exception:
     `pttrs` measures 0.99 against AOCL (1.67–1.73 vs OpenBLAS). That is a *shared* dependency-chain
