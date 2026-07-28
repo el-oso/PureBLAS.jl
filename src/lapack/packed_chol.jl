@@ -22,6 +22,62 @@
 # validation before it is trusted to extrapolate (req#8: derive → validate on the fleet → ship).
 const _PPTRF_TPSV_MIN = 32
 
+# ── lower path: trailing-order below which the rank-1 downdate inlines instead of calling spr! ─────
+# SEPARATE KNOB from _PPTRF_TPSV_MIN above. The lower path reused that constant, but its table was
+# measured entirely on the UPPER path (tpsv-vs-inline); the lower path's question is spr!-vs-inline,
+# a different crossover, and 32 was simply wrong for it. Because `m = n-j < 32` for EVERY column when
+# n=32, the whole factorization ran the scalar inline loop and never called spr! at all — measured
+# 0.738 vs AOCL, the worst cell in packed Cholesky. Sweeping the cutoff (Zen4, ratio AOCL/PB):
+#     n=16  cut8 0.881  cut16 0.976*  cut32 0.976        n=64   cut8 0.921  cut16 0.927*  cut32 0.891
+#     n=32  cut8 0.825  cut16 0.846*  cut32 0.733        n=128  cut8 1.012  cut16 1.015*  cut32 1.003
+#     n=48  cut8 0.875  cut16 0.886*  cut32 0.822        n=512  cut8 1.261  cut16 1.262   cut32 1.265*
+# 16 = 2W is best or tied at every order ≤ 128. (Lowering the cutoff alone did NOT close the gate —
+# it took the pointer-direct spr path too; see _spr_simd_lower_ptr!.)
+# req#8 tier: MEASURE — a call-overhead-vs-vectorised-work crossover, the same class as _GETF2_BASE
+# and _pbtrf_cross, not a residency bound. Candidates are DERIVED as {1,2,3,4}·W: the crossover is
+# where one SIMD store's worth of work starts to amortise a call, so the vector width is the unit.
+const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
+@static if isnothing(_PPTRF_SPR_MIN_PREF)
+    function _measure_pptrf_spr_min(::Type{T})::Int where {T}
+        vw = _vwidth(T)
+        Base.generating_output() && return 2 * vw     # don't burn a measure during precompilation
+        try
+            n = 4 * vw                                # the order where the cutoff bites hardest
+            len = (n * (n + 1)) >> 1
+            AP = Vector{T}(undef, len)
+            refill! = () -> begin                     # diagonally dominant ⇒ HPD in packed lower form
+                fill!(AP, one(T))
+                @inbounds for j in 1:n
+                    AP[_pp_l(j, j, n)] = T(2 * n + 2)
+                end
+            end
+            best = 2 * vw; tbest = typemax(UInt64)
+            for c in (vw, 2 * vw, 3 * vw, 4 * vw)
+                refill!(); _pptrf_lower!(AP, n, c)                 # untimed warmup (absorb JIT)
+                t = typemax(UInt64)
+                for _ in 1:5
+                    refill!(); s = time_ns(); _pptrf_lower!(AP, n, c); t = min(t, time_ns() - s)
+                end
+                t < tbest && (tbest = t; best = c)
+            end
+            return best
+        catch
+            return 2 * vw
+        end
+    end
+    const _PPTRF_SPR_F32 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(Float32))
+    const _PPTRF_SPR_F64 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(Float64))
+    const _PPTRF_SPR_C32 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(ComplexF32))
+    const _PPTRF_SPR_C64 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(ComplexF64))
+    @inline _pptrf_spr_min(::Type{Float32}) = _PPTRF_SPR_F32()
+    @inline _pptrf_spr_min(::Type{Float64}) = _PPTRF_SPR_F64()
+    @inline _pptrf_spr_min(::Type{ComplexF32}) = _PPTRF_SPR_C32()
+    @inline _pptrf_spr_min(::Type{ComplexF64}) = _PPTRF_SPR_C64()
+    @inline _pptrf_spr_min(::Type{T}) where {T} = 2 * _vwidth(T)   # generic/AD eltypes
+else
+    @inline _pptrf_spr_min(::Type{<:Any}) = _PPTRF_SPR_MIN_PREF::Int   # pinned (trim builds land here)
+end
+
 # ── pptrf!: packed Cholesky factorization (dpptrf.f) ──────────────────────────────────────────────
 # uplo='U': A = Uᴴ·U (left-looking — solve Uᴴu = col then the diagonal). uplo='L': A = L·Lᴴ
 # (right-looking — scale column, rank-1 downdate). Overwrites AP. Throws PosDefException.
@@ -64,18 +120,44 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         # so the trailing triangle of order n-j is exactly the contiguous tail AP[_pp_l(j+1,j+1,n):end]
         # and the multiplier column is the contiguous run AP[_pp_l(j+1,j,n) .. _pp_l(n,j,n)] — spr!/hpr!
         # can take both as views with no packing or copy.
-        cplx = eltype(AP) <: Complex
-        @inbounds for j in 1:n
-            ajj = real(AP[_pp_l(j, j, n)])
-            ajj > 0 || throw(PosDefException(j))
-            ajj = sqrt(ajj); AP[_pp_l(j, j, n)] = ajj; invd = inv(ajj)
-            m = n - j
-            m == 0 && continue
-            for i in (j + 1):n                              # scale L[j+1:n, j]
-                AP[_pp_l(i, j, n)] *= invd
-            end
-            if m > _PPTRF_TPSV_MIN
-                xs = _pp_l(j + 1, j, n)
+        _pptrf_lower!(AP, n, _pptrf_spr_min(eltype(AP)))
+    else
+        throw(ArgumentError("pptrf!: uplo must be 'L' or 'U'"))
+    end
+    return AP
+end
+
+# Lower packed Cholesky, right-looking (dpptrf.f): scale the column, then ONE packed rank-1 downdate
+# of the trailing triangle. In lower-packed storage columns j+1..n follow column j directly, so the
+# trailing triangle of order n-j is exactly the contiguous tail AP[_pp_l(j+1,j+1,n):end] and the
+# multiplier column is the contiguous run AP[_pp_l(j+1,j,n) .. _pp_l(n,j,n)] — no packing or copy.
+# `cut` is a parameter (not read from the knob) so the Measure harness can race candidate values.
+function _pptrf_lower!(AP::AbstractVector, n::Int, cut::Int)
+    cplx = eltype(AP) <: Complex
+    @inbounds for j in 1:n
+        ajj = real(AP[_pp_l(j, j, n)])
+        ajj > 0 || throw(PosDefException(j))
+        ajj = sqrt(ajj); AP[_pp_l(j, j, n)] = ajj; invd = inv(ajj)
+        m = n - j
+        m == 0 && continue
+        for i in (j + 1):n                              # scale L[j+1:n, j]
+            AP[_pp_l(i, j, n)] *= invd
+        end
+        if m > cut
+            xs = _pp_l(j + 1, j, n)
+            if !cplx && eltype(AP) <: BlasReal && AP isa StridedVector && stride(AP, 1) == 1
+                # Straight to the kernel: no SubArrays, no public entry. See _spr_simd_lower_ptr!
+                # for the per-call measurement that motivated this.
+                T = eltype(AP)
+                GC.@preserve AP begin
+                    p = pointer(AP)
+                    _spr_simd_lower_ptr!(
+                        m, -one(T),
+                        p + (_pp_l(j + 1, j + 1, n) - 1) * sizeof(T),
+                        p + (xs - 1) * sizeof(T)
+                    )
+                end
+            else                                        # complex, AD eltypes, non-unit stride
                 x = view(AP, xs:(xs + m - 1))
                 A22 = view(AP, _pp_l(j + 1, j + 1, n):length(AP))
                 if cplx
@@ -83,17 +165,15 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
                 else
                     spr!(-one(eltype(AP)), x, A22; uplo = 'L')
                 end
-            else
-                for q in (j + 1):n                          # short trailing block: inline downdate
-                    lqj = conj(AP[_pp_l(q, j, n)])        # conj(L[q,j])
-                    for p in q:n                          # p ≥ q (lower)
-                        AP[_pp_l(p, q, n)] -= AP[_pp_l(p, j, n)] * lqj
-                    end
+            end
+        else
+            for q in (j + 1):n                          # short trailing block: inline downdate
+                lqj = conj(AP[_pp_l(q, j, n)])          # conj(L[q,j])
+                for p in q:n                            # p ≥ q (lower)
+                    AP[_pp_l(p, q, n)] -= AP[_pp_l(p, j, n)] * lqj
                 end
             end
         end
-    else
-        throw(ArgumentError("pptrf!: uplo must be 'L' or 'U'"))
     end
     return AP
 end

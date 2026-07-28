@@ -480,6 +480,28 @@ end
 # the diagonal real. Convention matches the packed mat-vecs: A[i,j] at `_pkU(j)+i` (up) / `_pkL(j,n)+(i-j)+1`.
 
 # spr:  A := α·x·xᵀ + A
+# Lower-triangle rank-1 packed downdate straight off base pointers — the SAME loop as the `up=false`
+# branch of `_spr_simd!`, with no array arguments to unwrap.
+# Why it exists: pptrf!'s lower path calls spr! once per column with two `view`s into AP. Measured on
+# Zen4 (F64, ns per call, vs AOCL's dspr): the KERNEL already ties or beats AOCL at every order —
+#   m         8     16     24     32     48     64
+#   AOCL     70    101    160    221    401    641
+#   kernel   70    110    160    220    380    591
+# — but the public `spr!` entry adds ~11 ns (dim checks + `_pk_simd_ok`) and passing SubArrays adds a
+# further 9–50 ns on top, growing with m. At n=32 that per-call tax is ~17% of the whole
+# factorization, which was the entire pptrfL gate miss (0.738 vs AOCL). Both operands are contiguous
+# runs of one Vector, so the caller can hand over pointers and skip all of it (wire-the-fastest-path).
+# Caller owns the GC.@preserve and guarantees: unit stride, m ≤ the packed order, no overlap between
+# the x run and the triangle.
+@inline function _spr_simd_lower_ptr!(m::Int, α::T, Ap::Ptr{T}, xp::Ptr{T}) where {T <: BlasReal}
+    sz = sizeof(T)
+    @inbounds for j in 1:m
+        xj = unsafe_load(xp, j)
+        iszero(xj) || _axpy_simd!(m - j + 1, α * xj, xp + (j - 1) * sz, Ap + _pkL(j, m) * sz)
+    end
+    return nothing
+end
+
 @inline function _spr_simd!(up::Bool, n::Int, α::T, AP, x) where {T <: BlasReal}
     sz = sizeof(T)
     GC.@preserve AP x begin
