@@ -84,6 +84,41 @@ end
     end
 end
 
+@testitem "pptrf/pptrs (packed Cholesky) — both triangles, s/d/c/z" begin
+    using PureBLAS, LinearAlgebra, Random
+    # Same coverage hole pbtrf had: pptrf's only test was a StrictMode trim check at uplo='L', so
+    # neither triangle was ever checked for correctness. Julia's stdlib has no pptrf! wrapper either,
+    # so the oracle is again self-contained — factor, reconstruct, compare to the dense original.
+    packL(M, n) = [M[i, j] for j in 1:n for i in j:n]     # column-packed lower
+    packU(M, n) = [M[i, j] for j in 1:n for i in 1:j]     # column-packed upper
+    function unpack(AP, n, uplo)
+        M = zeros(eltype(AP), n, n); k = 1
+        if uplo == 'L'
+            for j in 1:n, i in j:n; M[i, j] = AP[k]; k += 1; end
+        else
+            for j in 1:n, i in 1:j; M[i, j] = AP[k]; k += 1; end
+        end
+        M
+    end
+    @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            uplo in ('L', 'U'), n in (1, 2, 7, 32, 33, 64, 129)
+
+        R = real(T)
+        Random.seed!(hash((T, uplo, n)))
+        B = randn(T, n, n); A = B * B' + n * I           # HPD
+        A = (A + A') / 2
+        Af = Matrix{T}(A)
+        AP = uplo == 'L' ? packL(Af, n) : packU(Af, n)
+        F = PureBLAS.pptrf!(copy(AP); uplo = uplo)
+        Fd = unpack(F, n, uplo)
+        rec = uplo == 'L' ? Fd * Fd' : Fd' * Fd
+        @test maximum(abs, rec - Af) < sqrt(eps(R)) * 50 * (norm(Af) + 1)
+        b = randn(T, n, 2)
+        x = PureBLAS.pptrs!(copy(F), copy(b); uplo = uplo)
+        @test maximum(abs, Af * x - b) < sqrt(eps(R)) * 500 * (norm(Af) + 1)
+    end
+end
+
 @testitem "potrf — PosDefException reports the FIRST failing column (LAPACK info)" begin
     using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.LAPACK as LA
