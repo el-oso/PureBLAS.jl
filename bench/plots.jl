@@ -631,6 +631,30 @@ function run_benchmarks()
                 sizes = BANDSZ, repsof = _ -> 1   # one (kd+1)×BANDN context per sample: ≥80 µs even at kd=16
             )
         end
+        # ── Packed Cholesky (pptrf) — sweeps n like the dense factorizations ───────────────────────────
+        # Also no stdlib wrapper, so the reference is a direct ILP64 ccall (honours ref=aocl). Both
+        # triangles: packed 'U' and 'L' are different loops, and 'U' is the one that needed the tpsv
+        # rewrite. Cost is O(n³/6) but on packed storage, so the cubic reps heuristic applies as-is.
+        _ppref!(uplo::Char, n::Int, AP::Vector{Float64}) =
+            (
+                i = Ref{Int64}(0); ccall(
+                    (:dpptrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                    (Ref{UInt8}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Clong),
+                    UInt8(uplo), Int64(n), AP, i, 1
+                ); i[]
+            )
+        function _ppd(n, uplo)
+            A = _hpd(Float64, n)
+            uplo == 'L' ? [A[i, j] for j in 1:n for i in j:n] : [A[i, j] for j in 1:n for i in 1:j]
+        end
+        _ppn(c) = (isqrt(8 * length(c) + 1) - 1) ÷ 2      # recover n from the packed length n(n+1)/2
+        for uplo in ('L', 'U')
+            addh(
+                "pptrf$uplo", s -> _ppd(s, uplo),
+                c -> (_ppref!(uplo, _ppn(c), c); c[1]),
+                c -> (PureBLAS.pptrf!(c; uplo = uplo); c[1]); sizes = _cap(LPSZ, 2048)
+            )
+        end
     end
     return l1, l2, l3, lp
 end

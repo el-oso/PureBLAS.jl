@@ -427,6 +427,15 @@ end
         @assert_trim_compatible P._pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
         @assert_trim_compatible P._pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
         @assert_trim_compatible P._pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
+        # The corner work array W and the diagonal-block scratch S used to be allocated per CALL;
+        # they are now GKH-owned (L3Workspace, via _pbtrf_work). Assert the steady state is actually
+        # allocation-free — that IS the point of the ownership, and a per-call `Matrix` would sail
+        # through every correctness test. `static = false` because the FIRST call legitimately sizes
+        # the owned buffers; these calls run after the warm-ups above, so the buffers already exist.
+        P._pbtrf_blocked!(wideband(Float64, 64), n, 64)          # size the owned scratch for nb(64)
+        @assert_noalloc P._pbtrf_blocked!(wideband(Float64, 64), n, 64) static = false
+        P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
+        @assert_noalloc P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64) static = false
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
         @assert_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
