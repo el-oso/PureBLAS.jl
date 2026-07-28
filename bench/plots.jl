@@ -522,6 +522,32 @@ function run_benchmarks()
             c -> (LinearAlgebra.LAPACK.getrf!(c); c[1, 1]),
             c -> (PureBLAS.getrf!(c); c[1, 1])
         )
+        # ── SOLVES on given factors: getrs / potrs / trtrs ────────────────────────────────────────────
+        # These back `lu(A) \ b`, `cholesky(A) \ b` and triangular `\` — among the most-executed LAPACK
+        # in practice — and had NEVER been gated: they existed only as C-ABI shims, and the harness
+        # compares PureBLAS.foo! against LAPACK.foo!, so with no native entry point there was nothing to
+        # measure. nrhs is fixed at 1 (the `\` case; a vector RHS is the common one and the one where
+        # per-call overhead shows). `mk` returns the FACTORS, so the timed core is the solve alone.
+        _lufac(s) = (F = _hpd(Float64, s); ip = Vector{Int}(undef, s); PureBLAS.getrf!(F, ip); (F, ip, randn(s)))
+        addh(
+            "getrs", _lufac,
+            c -> (LinearAlgebra.LAPACK.getrs!(TN, c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.getrs!(c[1], c[2], c[3]; trans = TN); c[3][1]); sizes = _cap(LPSZ, 2048)
+        )
+        _chfac(s, uplo) = (C = _hpd(Float64, s); PureBLAS.potrf!(C; uplo = uplo); (C, randn(s)))
+        for uplo in ('L', 'U')
+            addh(
+                "potrs$uplo", s -> _chfac(s, uplo),
+                c -> (LinearAlgebra.LAPACK.potrs!(uplo, c[1], c[2]); c[2][1]),
+                c -> (PureBLAS.potrs!(c[1], c[2]; uplo = uplo); c[2][1]); sizes = _cap(LPSZ, 2048)
+            )
+        end
+        addh(
+            "trtrs", s -> (triu(_hpd(Float64, s)), randn(s)),
+            c -> (LinearAlgebra.LAPACK.trtrs!(UP, TN, Char(78), c[1], c[2]); c[2][1]),
+            c -> (PureBLAS.trtrs!(c[1], c[2]; uplo = UP, trans = TN, diag = Char(78)); c[2][1]);
+            sizes = _cap(LPSZ, 2048)
+        )
         # Pivoted (semidefinite) Cholesky — blocked dpstrf: BLAS-2 pivoted panel + rank-jb syrk trailing,
         # with the leading row swaps batched per panel (they are stride-lda and were ~47% of the runtime).
         addh(
