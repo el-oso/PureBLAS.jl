@@ -2776,6 +2776,34 @@ function trsm!(
         end
         return B
     end
+    # ── RAGGED COLUMN TAIL: widen B to a full SIMD lane before solving ────────────────────────────
+    # The blocked kernel processes B's columns in W-wide lanes and a partial lane costs a FULL lane —
+    # so a B narrower than W pays per column what W columns would cost together. Measured Zen4
+    # (W=8, k=512, µs): nrhs=1..7 cost 96/180/278/381/464/543/675 — i.e. ~95 µs PER COLUMN — while
+    # nrhs=8 costs 94 in total. Eight columns for the price of one.
+    # Widening the ragged B into scratch, solving once, and copying back collapses that:
+    #     k=512   nrhs=3  278 → 97   nrhs=5  464 → 98   nrhs=7  675 → 100    (2.9–6.8× faster)
+    #     k=1024  nrhs=3  945 → 407  nrhs=5 1407 → 405  nrhs=7 1712 → 401    (2.3–4.3×)
+    # vs OpenBLAS those cells go 0.35/0.26/0.21 → 0.99/1.21/1.41.
+    # This is the SAME defect the upper fused leaf had (fixed earlier by a per-stripe NRV downshift,
+    # see the trsm-smalln-ragged-stripe note) — it survived here in the lower/notrans blocked path,
+    # which is exactly the one getrs/potrs use, hence `A \ b` being the worst case of all.
+    # ONLY nrhs < W, where the whole of B is one ragged lane. Above W the trade is not one-signed —
+    # measured nrhs=9 padding to 16 is 0.57× (a 1-column tail becomes 7 fake columns) while nrhs=15
+    # is 2.42× — so a general rule needs the per-lane cost model, not a rounding. Left alone.
+    # The extra columns are ZEROED, not garbage: a triangular solve on a zero column yields zero and
+    # cannot trap, whereas `undef` scratch could hold NaN/Inf and raise spurious FP exceptions.
+    if sl && _strided1(B) && size(B, 1) == k && 1 < size(B, 2) < _vwidth(eltype(B)) &&
+            eltype(B) <: BlasFloat
+        nr = size(B, 2); w = _vwidth(eltype(B))
+        Bw = _trsm_tmp(eltype(B), k, w)                      # GKH-owned (L3Workspace), grows
+        Bv = view(Bw, 1:k, 1:w)
+        @inbounds copyto!(view(Bv, :, 1:nr), B)
+        @inbounds fill!(view(Bv, :, (nr + 1):w), zero(eltype(B)))
+        _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, Bv)
+        @inbounds copyto!(B, view(Bv, :, 1:nr))
+        return B
+    end
     # NOTE: a po2-`lda` A-pad used to sit here — when stride(A,2) was a bad (power-of-two) stride, A
     # was copied into an odd-ld scratch (`_l3_apad`, ld = k+8) before the solve, to dodge cache-set
     # aliasing. It was REMOVED after measuring it: the copy is O(k²) and never repaid. Zen4, k=1024,
