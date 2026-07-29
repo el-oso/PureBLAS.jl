@@ -548,6 +548,41 @@ function run_benchmarks()
             c -> (PureBLAS.trtrs!(c[1], c[2]; uplo = UP, trans = TN, diag = Char(78)); c[2][1]);
             sizes = _cap(LPSZ, 2048)
         )
+        # ── Symmetric-indefinite (Bunch-Kaufman), banded LU, pivoted QR, least squares ────────────────
+        # A whole factorization+solve pair (sytrf/sytrs) plus four more real factorizations that had
+        # correctness tests but had NEVER been measured. Adding the rows is step 1 of the ALL-LAPACK
+        # audit: a routine that is routed and tested still reads as covered while measuring nothing.
+        _symm_hpd(s) = (A = _hpd(Float64, s); (A + transpose(A)) ./ 2)
+        addh(
+            "sytrf", _symm_hpd,
+            c -> (LinearAlgebra.LAPACK.sytrf!(LP, c); c[1, 1]),
+            c -> (PureBLAS.sytrf!(c, Vector{Int}(undef, size(c, 1)); uplo = LP); c[1, 1])
+        )
+        _sytrfac(s) = (A = _symm_hpd(s); ip = Vector{Int}(undef, s); PureBLAS.sytrf!(A, ip; uplo = LP); (A, ip, randn(s)))
+        addh(
+            "sytrs", _sytrfac,
+            c -> (LinearAlgebra.LAPACK.sytrs!(LP, c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.sytrs!(c[1], c[2], c[3]; uplo = LP); c[3][1]); sizes = _cap(LPSZ, 2048)
+        )
+        # Banded LU: kd scales with n (a fixed narrow band makes this O(n) and hides the kernel).
+        _gbd(s) = (kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
+            for j in 1:s, i in 1:(2kl + ku + 1); AB[i, j] = randn(); end;
+            for j in 1:s; AB[kl + ku + 1, j] = 4 * (kl + ku); end; (kl, ku, AB))
+        addh(
+            "gbtrf", _gbd,
+            c -> (LinearAlgebra.LAPACK.gbtrf!(c[1], c[2], size(c[3], 2), c[3]); c[3][1]),
+            c -> (PureBLAS.gbtrf!(c[1], c[2], size(c[3], 2), c[3]); c[3][1]); sizes = _cap(LPSZ, 2048)
+        )
+        addh(
+            "geqp3", s -> randn(s, s),
+            c -> (LinearAlgebra.LAPACK.geqp3!(c); c[1, 1]),
+            c -> (PureBLAS.geqp3!(c); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        addh(
+            "gels", s -> (randn(s, s), randn(s, 1)),
+            c -> (LinearAlgebra.LAPACK.gels!(TN, copy(c[1]), copy(c[2])); c[2][1]),
+            c -> (PureBLAS.gels!(TN, copy(c[1]), copy(c[2])); c[2][1]); sizes = _cap(LPSZ, 1024)
+        )
         # Pivoted (semidefinite) Cholesky — blocked dpstrf: BLAS-2 pivoted panel + rank-jb syrk trailing,
         # with the leading row swaps batched per panel (they are stride-lda and were ~47% of the runtime).
         addh(
