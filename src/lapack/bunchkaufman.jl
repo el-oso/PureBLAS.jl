@@ -540,6 +540,186 @@ end
     return C
 end
 
+# ═══ Hermitian blocked panel (zlahef) ═════════════════════════════════════════════════════════════
+# A SEPARATE kernel, not a Val{HERM} thread through `_lasyf_*`: zlahef realifies the diagonal at
+# points with no symmetric counterpart, conjugates the crossing strip, scales by a REAL reciprocal,
+# and its 2×2 inverse is asymmetric in the conjugates.
+#
+# ONE DELIBERATE DEVIATION from the reference, and it simplifies rather than complicates. zlahef
+# stores conj(W) below the diagonal (ZLACGV after every store) purely so its trailing update can be a
+# plain 'T' gemm — "note that conjg(W) is actually stored". PureBLAS's `_gemm_core!` takes a `cB` flag
+# and `her2k!` wants W UNCONJUGATED, so storing conj(W) would mean conjugating it back. Keeping W as
+# the true L21·D moves the conjugation to exactly two places:
+#   (1) the panel gemv's x vector, which is a ROW of W from previous columns — conjugated during the
+#       gather that `_l2_simd_ok` needs anyway, so it is free;
+#   (2) the trailing update, cB = true (Wᴴ) instead of 'T'.
+# Everything else — the 2×2 inverse, the 1×1 store, the pivot tests — reads W_true in the reference
+# too, because its ZLACGV happens AFTER those reads. So no other site changes.
+# Correctness of (2): A22 -= L21·D·L21ᴴ = L21·(L21·D)ᴴ = L21·Wᴴ, using D = Dᴴ.
+function _lahef_lower!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
+        W::AbstractMatrix{T}, xs::AbstractVector{T}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    Tr = real(T)
+    alpha = Tr(_BK_ALPHA)
+    info = 0
+    k = 1
+    @inbounds while !(k >= nb && nb < n) && k <= n
+        W[k, k] = real(A[k, k])                            # D's diagonal is real by definition
+        for i in (k + 1):n
+            W[i, k] = A[i, k]
+        end
+        if k > 1
+            for t in 1:(k - 1)
+                xs[t] = conj(W[k, t])                      # see deviation (1)
+            end
+            _gemv!(false, false, n - k + 1, k - 1, -one(T),
+                view(A, k:n, 1:(k - 1)), xs, 1, one(T), view(W, k:n, k), 1)
+        end
+        W[k, k] = real(W[k, k])
+
+        kstep = 1
+        absakk = abs(real(W[k, k]))
+        if k < n
+            imax, colmax = _bk_colmax(W, (k + 1):n, k)
+        else
+            imax = k; colmax = zero(Tr)
+        end
+
+        if max(absakk, colmax) == zero(Tr)
+            info == 0 && (info = k)
+            kp = k
+            A[k, k] = real(A[k, k])
+        else
+            if absakk >= alpha * colmax
+                kp = k
+            else
+                for i in k:(imax - 1)
+                    W[i, k + 1] = conj(A[imax, i])         # transposed strip, CONJUGATED
+                end
+                W[imax, k + 1] = real(A[imax, imax])
+                for i in (imax + 1):n
+                    W[i, k + 1] = A[i, imax]
+                end
+                if k > 1
+                    for t in 1:(k - 1)
+                        xs[t] = conj(W[imax, t])
+                    end
+                    _gemv!(false, false, n - k + 1, k - 1, -one(T),
+                        view(A, k:n, 1:(k - 1)), xs, 1, one(T), view(W, k:n, k + 1), 1)
+                end
+                W[imax, k + 1] = real(W[imax, k + 1])
+                _, rowmax = _bk_colmax(W, k:(imax - 1), k + 1)
+                if imax < n
+                    _, r2 = _bk_colmax(W, (imax + 1):n, k + 1)
+                    rowmax = max(rowmax, r2)
+                end
+                if absakk >= alpha * colmax * (colmax / rowmax)
+                    kp = k
+                elseif abs(real(W[imax, k + 1])) >= alpha * rowmax
+                    kp = imax
+                    for i in k:n
+                        W[i, k] = W[i, k + 1]
+                    end
+                else
+                    kp = imax; kstep = 2
+                end
+            end
+
+            kk = k + kstep - 1
+            if kp != kk
+                A[kp, kp] = real(A[kk, kk])
+                for j in (kk + 1):(kp - 1)
+                    A[kp, j] = conj(A[j, kk])              # crossing strip, CONJUGATED
+                end
+                for i in (kp + 1):n
+                    A[i, kp] = A[i, kk]
+                end
+                if k > 1
+                    for j in 1:(k - 1)
+                        t = A[kk, j]; A[kk, j] = A[kp, j]; A[kp, j] = t
+                    end
+                end
+                for j in 1:kk
+                    t = W[kk, j]; W[kk, j] = W[kp, j]; W[kp, j] = t
+                end
+            end
+
+            if kstep == 1
+                for i in k:n
+                    A[i, k] = W[i, k]
+                end
+                if k < n
+                    r1 = one(Tr) / real(A[k, k])           # REAL reciprocal (zdscal)
+                    for i in (k + 1):n
+                        A[i, k] *= r1
+                    end
+                end
+            else
+                if k < n - 1
+                    d21 = W[k + 1, k]
+                    d11 = W[k + 1, k + 1] / d21
+                    d22 = W[k, k] / conj(d21)              # asymmetric in the conjugates
+                    tt = one(Tr) / (real(d11 * d22) - one(Tr))
+                    d21 = tt / d21
+                    cd21 = conj(d21)
+                    for j in (k + 2):n
+                        A[j, k] = cd21 * (d11 * W[j, k] - W[j, k + 1])
+                        A[j, k + 1] = d21 * (d22 * W[j, k + 1] - W[j, k])
+                    end
+                end
+                A[k, k] = W[k, k]
+                A[k + 1, k] = W[k + 1, k]
+                A[k + 1, k + 1] = W[k + 1, k + 1]
+            end
+        end
+
+        if kstep == 1
+            ipiv[k] = kp
+        else
+            ipiv[k] = -kp; ipiv[k + 1] = -kp
+        end
+        k += kstep
+    end
+
+    kb = k - 1
+    if kb > 0
+        j = k
+        while j <= n
+            jb = min(nb, n - j + 1)
+            # her2k additionally zeroes the imaginary diagonal for free, which is what zlahef's
+            # A(JJ,JJ) = DBLE(...) bracketing exists to do.
+            her2k!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
+                view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb);
+                uplo = 'L', trans = 'N', alpha = -one(T) / 2, beta = one(Tr))
+            if j + jb <= n
+                _gemm_core!(view(A, (j + jb):n, j:(j + jb - 1)),
+                    view(A, (j + jb):n, 1:kb), view(W, j:(j + jb - 1), 1:kb),
+                    -one(T), one(T), false, true, false, true)      # cB=true ⇒ Wᴴ
+            end
+            j += jb
+        end
+
+        j = kb
+        while j >= 1
+            jj = j
+            jp = ipiv[j]
+            if jp < 0
+                jp = -jp; j -= 1
+            end
+            j -= 1
+            if jp != jj && j >= 1
+                for c in 1:j
+                    t = A[jp, c]; A[jp, c] = A[jj, c]; A[jj, c] = t
+                end
+            end
+            j <= 1 && break
+        end
+    end
+    return kb, info
+end
+
 # uplo='U' panel. NOT a mirror of the lower code shape: it works BACKWARDS from column n and indexes
 # W by `kw = nb + k - n`, so the panel occupies W[:, kw..nb] and the first column written is W[:,nb].
 # The second search column goes LEFTWARD into W[:,kw-1]. Everything else — the α test, the directed
@@ -718,7 +898,7 @@ end
 # `_sytf2_lower!` remains the tail (k > n-nb), the whole path for non-BlasFloat T, and the small-n
 # path — the last falls out structurally from nb >= n with no extra threshold.
 function _sytrf_blocked_lower!(
-        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int, herm::Bool = false
     ) where {T}
     n = size(A, 1)
     W, xs = _sytrf_work(T, n, nb)
@@ -726,9 +906,10 @@ function _sytrf_blocked_lower!(
     k = 1
     @inbounds while k <= n
         if k <= n - nb
-            kb, iinfo = _lasyf_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb)
+            kb, iinfo = herm ? _lahef_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb) :
+                _lasyf_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb)
         else
-            iinfo = _sytf2_lower!(view(A, k:n, k:n), view(ipiv, k:n), false)
+            iinfo = _sytf2_lower!(view(A, k:n, k:n), view(ipiv, k:n), herm)
             kb = n - k + 1
         end
         info == 0 && iinfo > 0 && (info = iinfo + k - 1)
@@ -740,12 +921,186 @@ function _sytrf_blocked_lower!(
     return info
 end
 
+# Hermitian uplo='U' panel (zlahef upper). Same W convention as `_lahef_lower!` (unconjugated; see its
+# header). CAREFUL: the 2×2 inverse's conjugates are SWAPPED relative to the lower panel —
+# d11 = W[k,kw]/conj(d21) and d22 = W[k-1,kw-1]/d21 here, against d11 = W[k+1,k+1]/d21 and
+# d22 = W[k,k]/conj(d21) there; and A[j,k-1] takes d21 while A[j,k] takes conj(d21), also the reverse
+# of the lower panel. That is the reference's own asymmetry, not a transcription slip.
+function _lahef_upper!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
+        W::AbstractMatrix{T}, xs::AbstractVector{T}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    Tr = real(T)
+    alpha = Tr(_BK_ALPHA)
+    info = 0
+    k = n
+    @inbounds while true
+        kw = nb + k - n
+        ((k <= n - nb + 1 && nb < n) || k < 1) && break
+
+        for i in 1:(k - 1)
+            W[i, kw] = A[i, k]
+        end
+        W[k, kw] = real(A[k, k])
+        if k < n
+            for t in 1:(n - k)
+                xs[t] = conj(W[k, kw + t])
+            end
+            _gemv!(false, false, k, n - k, -one(T),
+                view(A, 1:k, (k + 1):n), xs, 1, one(T), view(W, 1:k, kw), 1)
+            W[k, kw] = real(W[k, kw])
+        end
+
+        kstep = 1
+        absakk = abs(real(W[k, kw]))
+        if k > 1
+            imax, colmax = _bk_colmax(W, 1:(k - 1), kw)
+        else
+            imax = k; colmax = zero(Tr)
+        end
+
+        if max(absakk, colmax) == zero(Tr)
+            info == 0 && (info = k)
+            kp = k
+            A[k, k] = real(A[k, k])
+        else
+            if absakk >= alpha * colmax
+                kp = k
+            else
+                for i in 1:(imax - 1)
+                    W[i, kw - 1] = A[i, imax]
+                end
+                W[imax, kw - 1] = real(A[imax, imax])
+                for i in (imax + 1):k
+                    W[i, kw - 1] = conj(A[imax, i])        # transposed strip, CONJUGATED
+                end
+                if k < n
+                    for t in 1:(n - k)
+                        xs[t] = conj(W[imax, kw + t])
+                    end
+                    _gemv!(false, false, k, n - k, -one(T),
+                        view(A, 1:k, (k + 1):n), xs, 1, one(T), view(W, 1:k, kw - 1), 1)
+                    W[imax, kw - 1] = real(W[imax, kw - 1])
+                end
+                _, rowmax = _bk_colmax(W, (imax + 1):k, kw - 1)
+                if imax > 1
+                    _, r2 = _bk_colmax(W, 1:(imax - 1), kw - 1)
+                    rowmax = max(rowmax, r2)
+                end
+                if absakk >= alpha * colmax * (colmax / rowmax)
+                    kp = k
+                elseif abs(real(W[imax, kw - 1])) >= alpha * rowmax
+                    kp = imax
+                    for i in 1:k
+                        W[i, kw] = W[i, kw - 1]
+                    end
+                else
+                    kp = imax; kstep = 2
+                end
+            end
+
+            kk = k - kstep + 1
+            kkw = nb + kk - n
+            if kp != kk
+                A[kp, kp] = real(A[kk, kk])
+                for j in (kp + 1):(kk - 1)
+                    A[kp, j] = conj(A[j, kk])              # crossing strip, CONJUGATED
+                end
+                for i in 1:(kp - 1)
+                    A[i, kp] = A[i, kk]
+                end
+                if k < n
+                    for j in (k + 1):n
+                        t = A[kk, j]; A[kk, j] = A[kp, j]; A[kp, j] = t
+                    end
+                end
+                for j in kkw:nb
+                    t = W[kk, j]; W[kk, j] = W[kp, j]; W[kp, j] = t
+                end
+            end
+
+            if kstep == 1
+                for i in 1:k
+                    A[i, k] = W[i, kw]
+                end
+                r1 = one(Tr) / real(A[k, k])               # REAL reciprocal (zdscal)
+                for i in 1:(k - 1)
+                    A[i, k] *= r1
+                end
+            else
+                if k > 2
+                    d21 = W[k - 1, kw]
+                    d11 = W[k, kw] / conj(d21)             # SWAPPED vs the lower panel
+                    d22 = W[k - 1, kw - 1] / d21
+                    tt = one(Tr) / (real(d11 * d22) - one(Tr))
+                    d21 = tt / d21
+                    cd21 = conj(d21)
+                    for j in 1:(k - 2)
+                        A[j, k - 1] = d21 * (d11 * W[j, kw - 1] - W[j, kw])
+                        A[j, k] = cd21 * (d22 * W[j, kw] - W[j, kw - 1])
+                    end
+                end
+                A[k - 1, k - 1] = W[k - 1, kw - 1]
+                A[k - 1, k] = W[k - 1, kw]
+                A[k, k] = W[k, kw]
+            end
+        end
+
+        if kstep == 1
+            ipiv[k] = kp
+        else
+            ipiv[k] = -kp; ipiv[k - 1] = -kp
+        end
+        k -= kstep
+    end
+
+    kb = n - k
+    if kb > 0
+        kw = nb + k - n
+        j = ((k - 1) ÷ nb) * nb + 1
+        while j >= 1
+            jb = min(nb, k - j + 1)
+            if jb > 0
+                her2k!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
+                    view(A, j:(j + jb - 1), (k + 1):n),
+                    view(W, j:(j + jb - 1), (kw + 1):nb);
+                    uplo = 'U', trans = 'N', alpha = -one(T) / 2, beta = one(Tr))
+                if j > 1
+                    _gemm_core!(view(A, 1:(j - 1), j:(j + jb - 1)),
+                        view(A, 1:(j - 1), (k + 1):n),
+                        view(W, j:(j + jb - 1), (kw + 1):nb),
+                        -one(T), one(T), false, true, false, true)   # cB=true ⇒ Wᴴ
+                end
+            end
+            j -= nb
+        end
+
+        j = k + 1
+        while true
+            jj = j
+            jp = ipiv[j]
+            if jp < 0
+                jp = -jp; j += 1
+            end
+            j += 1
+            if jp != jj && j <= n
+                for c in j:n
+                    t = A[jp, c]; A[jp, c] = A[jj, c]; A[jj, c] = t
+                end
+            end
+            j >= n && break
+        end
+    end
+    return kb, info
+end
+
 # Blocked driver (dsytrf, upper). DELIBERATELY asymmetric with the lower driver, and the asymmetry is
 # the copy-paste hazard: the upper sub-problem is the LEADING block A[1:k,1:k], so its indices are
 # already GLOBAL — there is no ipiv remap and no info offset here. Getting that wrong yields a factor
 # that is self-consistent under PureBLAS's own solve but wrong against LAPACK.
 function _sytrf_blocked_upper!(
-        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int, herm::Bool = false
     ) where {T}
     n = size(A, 1)
     W, xs = _sytrf_work(T, n, nb)
@@ -753,9 +1108,10 @@ function _sytrf_blocked_upper!(
     k = n
     @inbounds while k >= 1
         if k > nb
-            kb, iinfo = _lasyf_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb)
+            kb, iinfo = herm ? _lahef_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb) :
+                _lasyf_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb)
         else
-            iinfo = _sytf2_upper!(view(A, 1:k, 1:k), ipiv, false)
+            iinfo = _sytf2_upper!(view(A, 1:k, 1:k), ipiv, herm)
             kb = k
         end
         info == 0 && iinfo > 0 && (info = iinfo)          # NO offset (leading sub-problem)
@@ -801,11 +1157,11 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
             for c in (nb0 ÷ 6, nb0 ÷ 4, nb0 ÷ 3, nb0 >> 1, (3 * nb0) >> 2, nb0)
                 nb = c
                 (nb < 1 || nb >= nloc) && continue
-                refill!(); _sytrf_blocked_lower!(Am, ipv, nb)        # untimed warmup
+                refill!(); _sytrf_blocked_lower!(Am, ipv, nb, false)  # untimed warmup
                 t = typemax(UInt64)
                 for _ in 1:3
                     refill!(); s = time_ns()
-                    _sytrf_blocked_lower!(Am, ipv, nb)
+                    _sytrf_blocked_lower!(Am, ipv, nb, false)
                     t = min(t, time_ns() - s)
                 end
                 t < tbest && (tbest = t; best = nb)
@@ -817,8 +1173,12 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
     end
     const _SYTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float64))
     const _SYTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float32))
+    const _SYTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(ComplexF64))
+    const _SYTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(ComplexF32))
     @inline _sytrf_nb(::Type{Float64}) = _SYTRF_NB_F64()
     @inline _sytrf_nb(::Type{Float32}) = _SYTRF_NB_F32()
+    @inline _sytrf_nb(::Type{ComplexF64}) = _SYTRF_NB_C64()
+    @inline _sytrf_nb(::Type{ComplexF32}) = _SYTRF_NB_C32()
     @inline _sytrf_nb(::Type{T}) where {T} = _LU_NB
 else
     @inline _sytrf_nb(::Type{T}) where {T} = _SYTRF_NB_PREF::Int
@@ -836,10 +1196,11 @@ end
 # the same care, so it stays on the validated unblocked path until measured.
 @inline function _bk_factor!(A::AbstractMatrix{T}, ipiv, lower::Bool, herm::Bool) where {T}
     n = size(A, 1)
-    if T <: BlasReal && !herm && _strided1(A)
+    if T <: BlasFloat && _strided1(A)
         nb = _sytrf_nb(T)
         if nb > 1 && nb < n
-            return lower ? _sytrf_blocked_lower!(A, ipiv, nb) : _sytrf_blocked_upper!(A, ipiv, nb)
+            return lower ? _sytrf_blocked_lower!(A, ipiv, nb, herm) :
+                _sytrf_blocked_upper!(A, ipiv, nb, herm)
         end
     end
     return lower ? _sytf2_lower!(A, ipiv, herm) : _sytf2_upper!(A, ipiv, herm)

@@ -731,24 +731,34 @@ end
     # "2×2 deferred to the next panel" case both occur many times with no per-cell reasoning. The
     # hollow class matters most here: a zero diagonal forces every pivot to 2×2 with a search that
     # reaches an arbitrary row, which is exactly what a panel boundary can get wrong.
-    @testset "blocked $T n=$n nb=$nb cls=$cls uplo=$uplo" for T in (Float64, Float32),
+    @testset "blocked $T n=$n nb=$nb cls=$cls uplo=$uplo herm=$hm" for
+            T in (Float64, Float32, ComplexF64, ComplexF32),
             n in (7, 13, 40, 100, 129), nb in 2:12, cls in (:generic, :hollow, :rankdef),
-            uplo in ('L', 'U')
+            uplo in ('L', 'U'), hm in (false, true)
 
         nb >= n && continue
-        Random.seed!(hash((T, n, nb, cls)))
-        M = randn(T, n, n); A = M + transpose(M)
+        (hm && !(T <: Complex)) && continue      # herm == sym for real; skip the duplicate
+        Random.seed!(hash((T, n, nb, cls, hm)))
+        M = randn(T, n, n); A = hm ? (M + M') : (M + transpose(M))
         cls === :hollow && (A[diagind(A)] .= zero(T))
-        cls === :rankdef && (B0 = randn(T, n, max(1, n - 3)); A = B0 * transpose(B0))
+        if cls === :rankdef
+            B0 = randn(T, n, max(1, n - 3))
+            A = hm ? (B0 * B0') : (B0 * transpose(B0))
+        end
 
         ip = zeros(Int, n); LD = copy(A)
-        info = uplo == 'L' ? PureBLAS._sytrf_blocked_lower!(LD, ip, nb) :
-                             PureBLAS._sytrf_blocked_upper!(LD, ip, nb)
+        info = uplo == 'L' ? PureBLAS._sytrf_blocked_lower!(LD, ip, nb, hm) :
+                             PureBLAS._sytrf_blocked_upper!(LD, ip, nb, hm)
         @test ipiv_wellformed(ip, uplo, n)
         @test all(isfinite, LD)
+        # zhetrf's D must be EXACTLY real. Measured 0.0 against LAPACK on every cell, so no
+        # tolerance — this is the assertion that catches a missing real() site, and it is the same
+        # class of bug the unblocked kernel was carrying (see the header of this testitem).
+        hm && @test all(isreal, diag(LD))
         if info == 0
             Bv = randn(T, n, 3); X = copy(Bv)
-            LAPACK.sytrs!(uplo, LD, ip, X)       # independent P·L·D·Lᵀ·Pᵀ reconstruction
+            # independent P·L·D·Lᴴ·Pᵀ reconstruction, performed by LAPACK
+            hm ? LAPACK.hetrs!(uplo, LD, ip, X) : LAPACK.sytrs!(uplo, LD, ip, X)
             @test norm(A * X - Bv) <= tol(T, n) * (norm(A) * norm(X) + norm(Bv))
         end
     end
