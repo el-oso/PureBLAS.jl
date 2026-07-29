@@ -2717,7 +2717,21 @@ function trsm!(
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trsm!: A must be $k×$k"))
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
-    if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha)
+    # The bypass criterion is n-DEPENDENT for side-L, exactly as the side-R note below says of m.
+    # Skipping ~60ns of dispatch only pays while the whole solve is itself O(100ns); with WIDE B the
+    # solve is tens of µs and the bypass instead pins k ≤ _TRSM_DBASE to the SCALAR dense base, which
+    # reads and writes B directly at its ld. Two costs, both measured on Zen4 F64 at k=32, n=256:
+    #   • even at a friendly ld the dense base is 33.3 µs against the invL leaf's 18.4 µs (1.8× worse);
+    #   • the direct B access is exposed to column-stride cache-set aliasing, so it degrades to 61.8 µs
+    #     at ldb=256, 223.4 at 512, 73.1 at 768, 219.9 at 1024 — a 6.7× cliff. The blocked path is flat
+    #     across that whole ld sweep, and k=40 (just above the bypass) shows no ld sensitivity at all,
+    #     which is the control.
+    # This was the entire nb=32→40 discontinuity in blocked gbtrf (0.91→1.20 vs OpenBLAS at kl≥256):
+    # its panel trsm is exactly k=nb, n=ku, with ldb = 2kl+ku. Wide side-L now falls through to the
+    # normal routing, which still reaches the fused leaf via _trsm_left! when it applies. Gated on the
+    # same _TRSM_NCUT the narrow/wide split already uses, so no new tuning constant is introduced.
+    if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha) &&
+            !(side == 'L' && size(B, 2) > _TRSM_NCUT)
         up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
         # SINGLE column, side-L: one trsv beats the dense base even down here. This path returns
         # before the narrow-B branch below, so without this the sweep never fires for k ≤ _TRSM_DBASE
@@ -2735,6 +2749,18 @@ function trsm!(
         if sl && up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
             return _trsm_fused_L!(unit, A, B)
         end
+        # Side-L: the dispatch-skip criterion is n-DEPENDENT, exactly as the side-R note below says of
+        # m. Skipping ~60ns of dispatch only pays while the whole solve is itself O(100ns); with wide B
+        # the solve is tens of µs and the bypass instead pins k≤32 to the SCALAR dense base, which
+        # reads and writes B directly at its ld. Two costs, both measured on Zen4 F64 at k=32, n=256:
+        #   • even at a friendly ld the dense base is 33.3 µs vs the invL leaf's 18.4 µs (1.8× worse);
+        #   • the direct B access is exposed to column-stride cache-set aliasing, so it degrades to
+        #     61.8 µs at ldb=256, 223.4 at 512, 73.1 at 768, 219.9 at 1024 — a 6.7× cliff. The blocked
+        #     path is flat across the same ld sweep, and k=40 (just above this bypass) shows no ld
+        #     sensitivity at all, which is the control.
+        # This was the whole nb=32→40 discontinuity in blocked gbtrf (0.91→1.20 vs OpenBLAS at kl≥256):
+        # its panel trsm is exactly k=nb, n=ku, with ldb = 2kl+ku. Gate on the same _TRSM_NCUT the
+        # narrow/wide split already uses below, so no new tuning constant appears.
         sl && return _trsm_dense_L!(up, tr, unit, A, B)
         # Side-R: the dispatch-skip criterion above is m-DEPENDENT — skipping ~60ns of dispatch only pays
         # while the whole solve is itself O(100ns). For m > _TRSM_NCUT_R the fused f64 leaf (reachable ONLY
