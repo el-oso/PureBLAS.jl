@@ -424,11 +424,11 @@ function _sytrs_lower!(A, ipiv, B, herm::Bool)
                 for j in 1:nrhs
                     s = zero(eltype(B))
                     if herm
-                        for i in (k + 1):n
+                        @simd for i in (k + 1):n
                             s += conj(A[i, k]) * B[i, j]
                         end
                     else
-                        for i in (k + 1):n
+                        @simd for i in (k + 1):n
                             s += A[i, k] * B[i, j]
                         end
                     end
@@ -441,12 +441,12 @@ function _sytrs_lower!(A, ipiv, B, herm::Bool)
                 for j in 1:nrhs
                     s1 = zero(eltype(B)); s2 = zero(eltype(B))
                     if herm
-                        for i in (k + 1):n
+                        @simd for i in (k + 1):n
                             s1 += conj(A[i, k]) * B[i, j]
                             s2 += conj(A[i, k - 1]) * B[i, j]
                         end
                     else
-                        for i in (k + 1):n
+                        @simd for i in (k + 1):n
                             s1 += A[i, k] * B[i, j]
                             s2 += A[i, k - 1] * B[i, j]
                         end
@@ -471,8 +471,11 @@ function _sytrs_upper!(A, ipiv, B, herm::Bool)
             if ipiv[k] > 0                               # 1×1
                 kp = ipiv[k]
                 kp != k && _bk_swap_rows!(B, k, kp)
-                for j in 1:nrhs, i in 1:(k - 1)
-                    B[i, j] -= A[i, k] * B[k, j]
+                for j in 1:nrhs                        # bkj hoisted: see the lower path's note
+                    bkj = B[k, j]
+                    for i in 1:(k - 1)
+                        B[i, j] -= A[i, k] * bkj
+                    end
                 end
                 dk = herm ? real(A[k, k]) : A[k, k]
                 for j in 1:nrhs
@@ -482,8 +485,11 @@ function _sytrs_upper!(A, ipiv, B, herm::Bool)
             else                                         # 2×2, rows (k-1,k)
                 kp = -ipiv[k]
                 kp != k - 1 && _bk_swap_rows!(B, k - 1, kp)
-                for j in 1:nrhs, i in 1:(k - 2)
-                    B[i, j] -= A[i, k] * B[k, j] + A[i, k - 1] * B[k - 1, j]
+                for j in 1:nrhs
+                    bkj = B[k, j]; bkm1j = B[k - 1, j]
+                    for i in 1:(k - 2)
+                        B[i, j] -= A[i, k] * bkj + A[i, k - 1] * bkm1j
+                    end
                 end
                 akm1k = A[k - 1, k]
                 akm1 = A[k - 1, k - 1] / akm1k
@@ -504,8 +510,14 @@ function _sytrs_upper!(A, ipiv, B, herm::Bool)
             if ipiv[k] > 0                               # 1×1
                 for j in 1:nrhs
                     s = zero(eltype(B))
-                    for i in 1:(k - 1)
-                        s += (herm ? conj(A[i, k]) : A[i, k]) * B[i, j]
+                    if herm
+                        @simd for i in 1:(k - 1)
+                            s += conj(A[i, k]) * B[i, j]
+                        end
+                    else
+                        @simd for i in 1:(k - 1)
+                            s += A[i, k] * B[i, j]
+                        end
                     end
                     B[k, j] -= s
                 end
@@ -515,9 +527,16 @@ function _sytrs_upper!(A, ipiv, B, herm::Bool)
             else                                         # 2×2, rows (k,k+1)
                 for j in 1:nrhs
                     s1 = zero(eltype(B)); s2 = zero(eltype(B))
-                    for i in 1:(k - 1)
-                        s1 += (herm ? conj(A[i, k]) : A[i, k]) * B[i, j]
-                        s2 += (herm ? conj(A[i, k + 1]) : A[i, k + 1]) * B[i, j]
+                    if herm
+                        @simd for i in 1:(k - 1)
+                            s1 += conj(A[i, k]) * B[i, j]
+                            s2 += conj(A[i, k + 1]) * B[i, j]
+                        end
+                    else
+                        @simd for i in 1:(k - 1)
+                            s1 += A[i, k] * B[i, j]
+                            s2 += A[i, k + 1] * B[i, j]
+                        end
                     end
                     B[k, j] -= s1; B[k + 1, j] -= s2
                 end
