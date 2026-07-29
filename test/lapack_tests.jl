@@ -731,8 +731,9 @@ end
     # "2×2 deferred to the next panel" case both occur many times with no per-cell reasoning. The
     # hollow class matters most here: a zero diagonal forces every pivot to 2×2 with a search that
     # reaches an arbitrary row, which is exactly what a panel boundary can get wrong.
-    @testset "blocked-lower $T n=$n nb=$nb cls=$cls" for T in (Float64, Float32),
-            n in (7, 13, 40, 100, 129), nb in 2:12, cls in (:generic, :hollow, :rankdef)
+    @testset "blocked $T n=$n nb=$nb cls=$cls uplo=$uplo" for T in (Float64, Float32),
+            n in (7, 13, 40, 100, 129), nb in 2:12, cls in (:generic, :hollow, :rankdef),
+            uplo in ('L', 'U')
 
         nb >= n && continue
         Random.seed!(hash((T, n, nb, cls)))
@@ -741,12 +742,13 @@ end
         cls === :rankdef && (B0 = randn(T, n, max(1, n - 3)); A = B0 * transpose(B0))
 
         ip = zeros(Int, n); LD = copy(A)
-        info = PureBLAS._sytrf_blocked_lower!(LD, ip, nb)
-        @test ipiv_wellformed(ip, 'L', n)
+        info = uplo == 'L' ? PureBLAS._sytrf_blocked_lower!(LD, ip, nb) :
+                             PureBLAS._sytrf_blocked_upper!(LD, ip, nb)
+        @test ipiv_wellformed(ip, uplo, n)
         @test all(isfinite, LD)
         if info == 0
             Bv = randn(T, n, 3); X = copy(Bv)
-            LAPACK.sytrs!('L', LD, ip, X)        # independent P·L·D·Lᵀ·Pᵀ reconstruction
+            LAPACK.sytrs!(uplo, LD, ip, X)       # independent P·L·D·Lᵀ·Pᵀ reconstruction
             @test norm(A * X - Bv) <= tol(T, n) * (norm(A) * norm(X) + norm(Bv))
         end
     end

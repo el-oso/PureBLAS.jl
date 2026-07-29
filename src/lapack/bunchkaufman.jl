@@ -494,7 +494,7 @@ function _lasyf_lower!(
         while j <= n
             jb = min(nb, n - j + 1)
             _lasyf_diag!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
-                view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb), false)
+                view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb), false)  # up=false
             if j + jb <= n
                 # `_gemm_core!`, not the kwarg `gemm!`: the latter gates on `C isa StridedMatrix`,
                 # which PtrMatrix is NOT, so a Mode-1 / .so caller would silently take the generic
@@ -534,10 +534,178 @@ end
 # diagonal blocks only. Val-dispatched so the symmetric/Hermitian split is a compile-time choice
 # (the pstrf.jl:74-79 pattern); `her2k!` additionally zeroes the imaginary diagonal for free, which
 # is what zlahef's A(JJ,JJ)=DBLE(...) bracketing exists to do.
-@inline function _lasyf_diag!(C, L, Wv, herm::Bool)
+@inline function _lasyf_diag!(C, L, Wv, up::Bool)
     T = eltype(C)
-    syr2k!(C, L, Wv; uplo = 'L', trans = 'N', alpha = -one(T) / 2, beta = one(T))
+    syr2k!(C, L, Wv; uplo = up ? 'U' : 'L', trans = 'N', alpha = -one(T) / 2, beta = one(T))
     return C
+end
+
+# uplo='U' panel. NOT a mirror of the lower code shape: it works BACKWARDS from column n and indexes
+# W by `kw = nb + k - n`, so the panel occupies W[:, kw..nb] and the first column written is W[:,nb].
+# The second search column goes LEFTWARD into W[:,kw-1]. Everything else — the α test, the directed
+# copy on interchange, the two-W-column budget that bounds kb — is the same argument as the lower
+# panel (see its header).
+function _lasyf_upper!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
+        W::AbstractMatrix{T}, xs::AbstractVector{T}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    Tr = real(T)
+    alpha = Tr(_BK_ALPHA)
+    info = 0
+    k = n
+    @inbounds while true
+        kw = nb + k - n
+        ((k <= n - nb + 1 && nb < n) || k < 1) && break
+
+        for i in 1:k
+            W[i, kw] = A[i, k]
+        end
+        if k < n
+            for t in 1:(n - k)
+                xs[t] = W[k, kw + t]
+            end
+            _gemv!(false, false, k, n - k, -one(T),
+                view(A, 1:k, (k + 1):n), xs, 1, one(T), view(W, 1:k, kw), 1)
+        end
+
+        kstep = 1
+        absakk = _bk_cabs1(W[k, kw])
+        if k > 1
+            imax, colmax = _bk_colmax(W, 1:(k - 1), kw)
+        else
+            imax = k; colmax = zero(Tr)
+        end
+
+        if max(absakk, colmax) == zero(Tr)
+            info == 0 && (info = k)
+            kp = k
+        else
+            if absakk >= alpha * colmax
+                kp = k
+            else
+                for i in 1:imax
+                    W[i, kw - 1] = A[i, imax]
+                end
+                for i in (imax + 1):k
+                    W[i, kw - 1] = A[imax, i]              # transposed strip (symmetric)
+                end
+                if k < n
+                    for t in 1:(n - k)
+                        xs[t] = W[imax, kw + t]
+                    end
+                    _gemv!(false, false, k, n - k, -one(T),
+                        view(A, 1:k, (k + 1):n), xs, 1, one(T), view(W, 1:k, kw - 1), 1)
+                end
+                _, rowmax = _bk_colmax(W, (imax + 1):k, kw - 1)
+                if imax > 1
+                    _, r2 = _bk_colmax(W, 1:(imax - 1), kw - 1)
+                    rowmax = max(rowmax, r2)
+                end
+                if absakk >= alpha * colmax * (colmax / rowmax)
+                    kp = k
+                elseif _bk_cabs1(W[imax, kw - 1]) >= alpha * rowmax
+                    kp = imax
+                    for i in 1:k
+                        W[i, kw] = W[i, kw - 1]
+                    end
+                else
+                    kp = imax; kstep = 2
+                end
+            end
+
+            kk = k - kstep + 1
+            kkw = nb + kk - n
+            if kp != kk
+                A[kp, kp] = A[kk, kk]
+                for j in (kp + 1):(kk - 1)
+                    A[kp, j] = A[j, kk]                   # crossing strip, transposed
+                end
+                for i in 1:(kp - 1)
+                    A[i, kp] = A[i, kk]
+                end
+                if k < n
+                    for j in (k + 1):n
+                        t = A[kk, j]; A[kk, j] = A[kp, j]; A[kp, j] = t
+                    end
+                end
+                for j in kkw:nb
+                    t = W[kk, j]; W[kk, j] = W[kp, j]; W[kp, j] = t
+                end
+            end
+
+            if kstep == 1
+                for i in 1:k
+                    A[i, k] = W[i, kw]
+                end
+                r1 = one(T) / A[k, k]
+                for i in 1:(k - 1)
+                    A[i, k] *= r1
+                end
+            else
+                if k > 2
+                    d21 = W[k - 1, kw]
+                    d11 = W[k, kw] / d21
+                    d22 = W[k - 1, kw - 1] / d21
+                    tt = one(T) / (d11 * d22 - one(T))
+                    d21 = tt / d21
+                    for j in 1:(k - 2)
+                        A[j, k - 1] = d21 * (d11 * W[j, kw - 1] - W[j, kw])
+                        A[j, k] = d21 * (d22 * W[j, kw] - W[j, kw - 1])
+                    end
+                end
+                A[k - 1, k - 1] = W[k - 1, kw - 1]
+                A[k - 1, k] = W[k - 1, kw]
+                A[k, k] = W[k, kw]
+            end
+        end
+
+        if kstep == 1
+            ipiv[k] = kp
+        else
+            ipiv[k] = -kp; ipiv[k - 1] = -kp
+        end
+        k -= kstep
+    end
+
+    kb = n - k
+    if kb > 0
+        kw = nb + k - n
+        j = ((k - 1) ÷ nb) * nb + 1                        # block columns BACKWARDS
+        while j >= 1
+            jb = min(nb, k - j + 1)
+            if jb > 0
+                _lasyf_diag!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
+                    view(A, j:(j + jb - 1), (k + 1):n),
+                    view(W, j:(j + jb - 1), (kw + 1):nb), true)
+                if j > 1
+                    _gemm_core!(view(A, 1:(j - 1), j:(j + jb - 1)),
+                        view(A, 1:(j - 1), (k + 1):n),
+                        view(W, j:(j + jb - 1), (kw + 1):nb),
+                        -one(T), one(T), false, true, false, false)
+                end
+            end
+            j -= nb
+        end
+
+        # Undo the panel interchanges in columns k+1:n, walking UPWARD (the lower path walks down).
+        j = k + 1
+        while true
+            jj = j
+            jp = ipiv[j]
+            if jp < 0
+                jp = -jp; j += 1
+            end
+            j += 1
+            if jp != jj && j <= n
+                for c in j:n
+                    t = A[jp, c]; A[jp, c] = A[jj, c]; A[jj, c] = t
+                end
+            end
+            j >= n && break
+        end
+    end
+    return kb, info
 end
 
 # Blocked driver (dsytrf, lower). THREE things bite here, all of which produce a factor that looks
@@ -568,6 +736,30 @@ function _sytrf_blocked_lower!(
             ipiv[j] = ipiv[j] > 0 ? ipiv[j] + k - 1 : ipiv[j] - k + 1
         end
         k += kb
+    end
+    return info
+end
+
+# Blocked driver (dsytrf, upper). DELIBERATELY asymmetric with the lower driver, and the asymmetry is
+# the copy-paste hazard: the upper sub-problem is the LEADING block A[1:k,1:k], so its indices are
+# already GLOBAL — there is no ipiv remap and no info offset here. Getting that wrong yields a factor
+# that is self-consistent under PureBLAS's own solve but wrong against LAPACK.
+function _sytrf_blocked_upper!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    W, xs = _sytrf_work(T, n, nb)
+    info = 0
+    k = n
+    @inbounds while k >= 1
+        if k > nb
+            kb, iinfo = _lasyf_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb)
+        else
+            iinfo = _sytf2_upper!(view(A, 1:k, 1:k), ipiv, false)
+            kb = k
+        end
+        info == 0 && iinfo > 0 && (info = iinfo)          # NO offset (leading sub-problem)
+        k -= kb
     end
     return info
 end
@@ -634,15 +826,23 @@ end
 
 # Dispatch. Gated on `_strided1`, NOT `A isa StridedMatrix`: cabi_lapack.jl calls sytrf!/hetrf! with
 # a PtrMatrix, so a StridedMatrix gate would leave Mode 1 and the .so on the unblocked kernel — the
-# port would be invisible exactly where LBT users live. Only the REAL LOWER path is blocked so far;
-# upper and Hermitian keep `_sytf2_*` until their panels are ported and validated the same way.
-@inline function _bk_factor_lower(A::AbstractMatrix{T}, ipiv, herm::Bool) where {T}
+# port would be invisible exactly where LBT users live.
+# REAL (symmetric) is blocked in BOTH triangles. Complex is NOT: `zlahef` is not `dlasyf` plus a few
+# conjugations — it stores conj(W) so the trailing update can stay a plain transpose ("note that
+# conjg(W) is actually stored"), and it realifies the diagonal and conjugates the crossing strip at
+# points that have no symmetric counterpart. That is a separate kernel and gets its own port, not a
+# Val{HERM} thread through this one. Complex-symmetric (herm=false, T<:Complex) is also excluded: the
+# real panel's `_bk_cabs1`/α logic carries over but the syr2k-based trailing update does not without
+# the same care, so it stays on the validated unblocked path until measured.
+@inline function _bk_factor!(A::AbstractMatrix{T}, ipiv, lower::Bool, herm::Bool) where {T}
     n = size(A, 1)
     if T <: BlasReal && !herm && _strided1(A)
         nb = _sytrf_nb(T)
-        nb > 1 && nb < n && return _sytrf_blocked_lower!(A, ipiv, nb)
+        if nb > 1 && nb < n
+            return lower ? _sytrf_blocked_lower!(A, ipiv, nb) : _sytrf_blocked_upper!(A, ipiv, nb)
+        end
     end
-    return _sytf2_lower!(A, ipiv, herm)
+    return lower ? _sytf2_lower!(A, ipiv, herm) : _sytf2_upper!(A, ipiv, herm)
 end
 
 """
@@ -657,7 +857,7 @@ function sytrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("sytrf!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytrf!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytrf!: uplo must be 'L' or 'U'"))
-    return uplo == 'L' ? _bk_factor_lower(A, ipiv, false) : _sytf2_upper!(A, ipiv, false)
+    return _bk_factor!(A, ipiv, uplo == 'L', false)
 end
 
 """
@@ -673,7 +873,7 @@ function hetrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     length(ipiv) == n || throw(DimensionMismatch("hetrf!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetrf!: uplo must be 'L' or 'U'"))
     herm = eltype(A) <: Complex
-    return uplo == 'L' ? _bk_factor_lower(A, ipiv, herm) : _sytf2_upper!(A, ipiv, herm)
+    return _bk_factor!(A, ipiv, uplo == 'L', herm)
 end
 
 # ---------------------------------------------------------------------------------------------------
