@@ -601,21 +601,149 @@ end
     end
 end
 
-@testitem "bunchkaufman (sytrf/hetrf + solve) vs LAPACK — factor solve residual, both uplo" begin
-    using PureBLAS, LinearAlgebra
-    tol(::Type{T}) where {T} = sqrt(eps(real(T))) * 100
-    @testset "$T n=$n uplo=$uplo herm=$herm" for T in (Float32, Float64, ComplexF32, ComplexF64),
-            n in (1, 2, 5, 17, 64), uplo in ('L', 'U'), herm in (false, true)
+# Bunch-Kaufman is a PIVOTED factorization, so the test has to constrain the PIVOTS, and until this
+# item was rewritten nothing did. The old version factored with PureBLAS and solved with PureBLAS,
+# then checked ‖A·X−B‖ — a closed loop that ANY self-consistent pivot sequence passes, including a
+# numerically terrible one. It also used only well-conditioned randoms, so the 2×2-pivot branches of
+# both `_sytf2_*` and `_sytrs_*` were barely reached. Three additions fix that, and they are what a
+# blocked `dlasyf` port has to be built against:
+#
+#   1. CROSS-SOLVE, both directions. PureBLAS factor → `LAPACK.sytrs!`, and `LAPACK.sytrf!` →
+#      PureBLAS solve. This IS a P·L·D·Lᵀ·Pᵀ reconstruction, performed by an independent
+#      implementation, so it pins the `ipiv` encoding in BOTH the writing and the reading direction
+#      without a hand-written extractor that would just reimplement the convention under test.
+#   2. MULTIPLIER + BACKWARD-ERROR BOUNDS, both calibrated against LAPACK on the same input.
+#      Cross-solve alone still admits a *valid but poor* pivot — one that stays self-consistent but
+#      divides by a near-zero and blows up ‖L‖. NOTE the bound here is comparative, not the textbook
+#      |l_ij| ≤ 1/(1−α) ≈ 2.781: that is the Bunch-PARLETT (complete-pivoting) bound. Bunch-KAUFMAN
+#      *partial* pivoting bounds the growth factor but leaves ‖L‖ genuinely unbounded — which is the
+#      entire reason `sytrf_rook` exists. Asserting 2.781 fails on ordinary random input (measured
+#      2.87–4.94 against the known-good unblocked kernel). What IS true, measured over every cell
+#      below: PureBLAS's max|L| equals LAPACK's to a ratio of 1.00, and the solve backward error is
+#      0.05·n·eps. The asserted slack (4× and 100·n·eps) is ~1000× looser than observed, so it can't
+#      flake, while a mis-selected pivot moves both by orders of magnitude. The D entries of a 2×2
+#      block are not multipliers, so they're skipped via `ipiv`.
+#   3. HARD MATRIX CLASSES. `hollow` (zero diagonal) forces EVERY pivot to 2×2 with a search that
+#      reaches an arbitrary row — the decisive class for a blocked kernel's panel boundary. `rankdef`
+#      reaches the `max(absakk,colmax)==0 ⇒ info=k` branch, which no test touched before.
+#
+# Bit-exact `ipiv` vs LAPACK is deliberately NOT asserted: a blocked path re-associates the column
+# update (one length-(k−1) gemv reduction vs k−1 successive axpys), so near-ties can rank
+# differently, and PureBLAS's nb differs from OpenBLAS's ILAENV value regardless. It would be a flaky
+# test on the one routine whose entire point is pivot selection.
+@testitem "bunchkaufman (sytrf/hetrf) — cross-solve vs LAPACK, growth bound, hollow + rank-deficient" begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.LAPACK
+    # Backward-error tolerance, NOT the usual sqrt(eps)*100. Measured worst over every cell here is
+    # 0.05·n·eps, so 100·n·eps keeps ~2000× headroom while being ~5 orders of magnitude tighter than
+    # sqrt(eps)*100 — tight enough that a factorization with real growth cannot slip through.
+    tol(::Type{T}, n) where {T} = 100 * max(n, 4) * eps(real(T))
+
+    # Largest |L| entry, skipping the D entries of every 2×2 block (read off ipiv, both uplo).
+    function maxmult(LD, ipiv, uplo, n)
+        m = 0.0
+        if uplo == 'L'
+            k = 1
+            while k <= n
+                if ipiv[k] > 0                          # 1×1: column k below the diagonal is all L
+                    for i in (k + 1):n; m = max(m, abs(LD[i, k])); end
+                    k += 1
+                else                                    # 2×2 at (k,k+1): LD[k+1,k] is D, not L
+                    for i in (k + 2):n; m = max(m, abs(LD[i, k]), abs(LD[i, k + 1])); end
+                    k += 2
+                end
+            end
+        else
+            k = n
+            while k >= 1
+                if ipiv[k] > 0
+                    for i in 1:(k - 1); m = max(m, abs(LD[i, k])); end
+                    k -= 1
+                else                                    # 2×2 at (k-1,k): LD[k-1,k] is D, not L
+                    for i in 1:(k - 2); m = max(m, abs(LD[i, k - 1]), abs(LD[i, k])); end
+                    k -= 2
+                end
+            end
+        end
+        return m
+    end
+
+    # Every negative ipiv entry must come as an adjacent equal pair, oriented by uplo.
+    function ipiv_wellformed(ipiv, uplo, n)
+        k = uplo == 'L' ? 1 : n
+        while uplo == 'L' ? k <= n : k >= 1
+            p = ipiv[k]
+            (1 <= abs(p) <= n) || return false
+            if p > 0
+                k += uplo == 'L' ? 1 : -1
+            else
+                j = uplo == 'L' ? k + 1 : k - 1
+                (1 <= j <= n && ipiv[j] == p) || return false
+                k += uplo == 'L' ? 2 : -2
+            end
+        end
+        return true
+    end
+
+    @testset "$T n=$n uplo=$uplo herm=$herm cls=$cls" for T in (Float32, Float64, ComplexF32, ComplexF64),
+            n in (1, 2, 5, 17, 49, 64, 100, 129, 200), uplo in ('L', 'U'),
+            herm in (false, true), cls in (:generic, :hollow)
 
         (herm && !(T <: Complex)) && continue           # herm==sym for real; skip dup
+        Random.seed!(hash((T, n, uplo, herm, cls)))
         M = randn(T, n, n)
         A = herm ? (M + M') : (M + transpose(M))        # Hermitian / symmetric indefinite
-        ipiv = zeros(Int, n)
-        LD = copy(A)
-        herm ? PureBLAS.hetrf!(LD, ipiv; uplo = uplo) : PureBLAS.sytrf!(LD, ipiv; uplo = uplo)
-        B = randn(T, n, 3); X = copy(B)
-        herm ? PureBLAS.hetrs!(LD, ipiv, X; uplo = uplo) : PureBLAS.sytrs!(LD, ipiv, X; uplo = uplo)
-        @test norm(A * X - B) <= tol(T) * (norm(A) * norm(X) + norm(B))
+        # hollow: a zero diagonal makes absakk==0 at every step, so the 1×1 tests can never fire and
+        # EVERY pivot is 2×2 with imax an arbitrary row — the panel-boundary stress case.
+        cls === :hollow && (A[diagind(A)] .= zero(T))
+
+        ipiv = zeros(Int, n); LD = copy(A)
+        info = herm ? PureBLAS.hetrf!(LD, ipiv; uplo = uplo) :
+                      PureBLAS.sytrf!(LD, ipiv; uplo = uplo)
+        LDr = copy(A); ipr = zeros(Int, n)               # LAPACK's factor of the SAME matrix
+        herm ? LAPACK.hetrf!(uplo, LDr, ipr) : LAPACK.sytrf!(uplo, LDr, ipr)
+
+        @test ipiv_wellformed(ipiv, uplo, n)
+        # Multiplier bound, calibrated against LAPACK's own pivot sequence on this exact input
+        # (measured ratio 1.00 everywhere; 4× is slack, not a fitted threshold).
+        @test maxmult(LD, ipiv, uplo, n) <=
+              4 * maxmult(LDr, ipr, uplo, n) + sqrt(eps(real(T)))
+        # zhetrf's D must stay real; a missing real() site shows up here exactly, no tolerance.
+        herm && @test all(isreal, diag(LD))
+
+        if info == 0
+            B = randn(T, n, 3)
+            # (1) PureBLAS factor → LAPACK solve. Independent reconstruction of P·L·D·Lᵀ·Pᵀ.
+            Xl = copy(B)
+            herm ? LAPACK.hetrs!(uplo, LD, ipiv, Xl) : LAPACK.sytrs!(uplo, LD, ipiv, Xl)
+            @test norm(A * Xl - B) <= tol(T, n) * (norm(A) * norm(Xl) + norm(B))
+            # (2) LAPACK factor → PureBLAS solve. Pins the READING side of the ipiv convention.
+            Xr = copy(B)
+            herm ? PureBLAS.hetrs!(LDr, ipr, Xr; uplo = uplo) :
+                   PureBLAS.sytrs!(LDr, ipr, Xr; uplo = uplo)
+            @test norm(A * Xr - B) <= tol(T, n) * (norm(A) * norm(Xr) + norm(B))
+        end
+    end
+
+    # Rank-deficient / exactly-singular: reaches the `max(absakk,colmax)==0 ⇒ info=k` branch, which
+    # nothing else in the suite touches (every other item adds n*I to stay well away from it).
+    @testset "singular $T n=$n uplo=$uplo" for T in (Float32, Float64, ComplexF64),
+            n in (8, 60), uplo in ('L', 'U')
+
+        Random.seed!(hash((T, n, uplo, :sing)))
+        B = randn(T, n, n - 3); A = B * transpose(B)     # rank n-3, symmetric
+        LD = copy(A); ipiv = zeros(Int, n)
+        info = PureBLAS.sytrf!(LD, ipiv; uplo = uplo)
+        @test all(isfinite, LD)                          # must not NaN/Inf out
+        @test ipiv_wellformed(ipiv, uplo, n)
+
+        c = n ÷ 2                                        # exactly-zero row/column ⇒ info names it
+        A2 = randn(T, n, n); A2 = A2 + transpose(A2)
+        A2[:, c] .= zero(T); A2[c, :] .= zero(T)
+        LD2 = copy(A2); ip2 = zeros(Int, n)
+        info2 = PureBLAS.sytrf!(LD2, ip2; uplo = uplo)
+        @test info2 > 0
+        @test all(isfinite, LD2)
     end
 end
 
@@ -1039,35 +1167,164 @@ end
     end
 end
 
-@testitem "gbtrf/gbtrs (general banded LU) vs LAPACK — band storage, all four types, trans variants" begin
-    using PureBLAS, LinearAlgebra
+# `gbtrf` is a PIVOTED factorization, and until this item was widened its inputs could not pivot: it
+# built the band then did `A += n*I`, so every column's argmax was the diagonal and `ipiv[j] == j`
+# throughout. The bit-exact `ipiv == ipivl` assertion was therefore true but vacuous — it never once
+# compared a nontrivial pivot. Three generators fix that, and the third is the one that matters:
+#
+#   :dominant — the old behaviour. `ju` never runs ahead, so the fill-in/deep-swap machinery is idle.
+#   :pivot    — random band with a shrunk diagonal. Most columns now pivot; the `nontrivial > half`
+#               assertion below FAILS LOUDLY if a future change makes the generator stop pivoting.
+#   :deep     — forces the argmax onto the LAST subdiagonal of every column, so `jp == km+1`, `ju`
+#               runs maximally ahead, and the swap reaches its furthest column. This is the only
+#               generator that exercises the deep-pivot path at all.
+#
+# Bit-exact `ipiv` IS a sound oracle here (unlike Bunch-Kaufman): partial pivoting is a single
+# well-defined argmax per column with no re-association. If a blocked port ever makes a cell flake on
+# a near-tie, the fix is a different seed, not a weaker assertion.
+@testitem "gbtrf/gbtrs (general banded LU) vs LAPACK — pivoting, deep pivots, rectangular, padded ldab" begin
+    using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.LAPACK as LA
-    @testset "$T n=$n kl=$kl ku=$ku" for T in (Float32, Float64, ComplexF32, ComplexF64),
-            (n, kl, ku) in ((8, 1, 1), (20, 2, 3), (35, 3, 1))
 
-        A = zeros(T, n, n)
-        for j in 1:n, i in max(1, j - ku):min(n, j + kl)
+    # Dense band -> LAPACK GB storage with a caller-chosen ldab (>= 2kl+ku+1).
+    function tob(A, m, n, kl, ku, ldab)
+        AB = zeros(eltype(A), ldab, n)
+        for j in 1:n, i in max(1, j - ku):min(m, j + kl)
+            AB[kl + ku + 1 + i - j, j] = A[i, j]
+        end
+        return AB
+    end
+
+    @testset "$T $m×$n kl=$kl ku=$ku gen=$gen pad=$pad" for T in (Float32, Float64, ComplexF32, ComplexF64),
+            (m, n, kl, ku) in ((8, 8, 1, 1), (20, 20, 2, 3), (35, 35, 3, 1),
+                               (48, 48, 12, 6), (50, 32, 10, 6), (32, 50, 10, 6)),
+            gen in (:dominant, :pivot, :deep), pad in (0, 3)
+
+        Random.seed!(hash((T, m, n, kl, ku, gen, pad)))
+        A = zeros(T, m, n)
+        for j in 1:n, i in max(1, j - ku):min(m, j + kl)
             A[i, j] = randn(T)
         end
-        A += n * I     # diagonally dominant-ish, keep nonsingular
-        ldab = 2kl + ku + 1
-        AB = zeros(T, ldab, n)
+        # :pivot is just the plain random band — with no diagonal boost the argmax lands off the
+        # diagonal most of the time. :deep RAISES the last subdiagonal rather than shrinking the
+        # diagonal: shrinking it (tried first) forces the pivots but also drives cond(A) through the
+        # roof, and the solve residuals then blow past any backward-error bound for reasons that have
+        # nothing to do with gbtrf. Raising the subdiagonal forces jp = km+1 while the matrix stays
+        # generically conditioned.
+        if gen === :dominant
+            for j in 1:min(m, n); A[j, j] += T(4 * (kl + ku + 1)); end
+        elseif gen === :deep && kl > 0
+            for j in 1:n
+                i = min(m, j + kl)
+                i > j && (A[i, j] = T(100))                      # argmax onto the LAST subdiagonal
+            end
+        end
+
+        ldab = 2kl + ku + 1 + pad                                # pad ⇒ the port must use stride(AB,2)
+        ABp = tob(A, m, n, kl, ku, ldab)
+        # Sentinel below the band: dgbtrf never touches storage rows kv+kl+2..ldab. An ld-1 view whose
+        # declared rectangle overruns writes here, and nothing else in the suite would notice.
+        pad > 0 && (ABp[(kl + ku + kl + 2):ldab, :] .= T(-12345))
+        ABl = copy(ABp)
+
+        _, ipiv, info = PureBLAS.gbtrf!(kl, ku, m, ABp)
+        @test info == 0
+        _, ipivl = LA.gbtrf!(kl, ku, m, ABl)
+        @test ipiv == ipivl                                      # bit-exact pivot sequence
+        @test maximum(abs, ABp .- ABl) < 200 * eps(real(T)) * maximum(abs, ABl)
+        pad > 0 && @test all(==(T(-12345)), ABp[(kl + ku + kl + 2):ldab, :])
+
+        mn = min(m, n)
+        # Fails loudly if a future change makes the generator stop pivoting — the exact hole that let
+        # the old `A += n*I` version assert `ipiv == ipivl` while every pivot was trivially j. The
+        # threshold is a third, not a half: with kl subdiagonals a column pivots with probability
+        # ≈ kl/(kl+1), so kl=1 sits right ON one half and would flake.
+        if gen !== :dominant && kl > 0
+            @test count(!=(0), ipiv .- (1:mn)) >= mn ÷ 3
+        end
+
+        if m == n
+            for tr in ('N', 'T', 'C')
+                Bv = randn(T, n, 2); Bp = copy(Bv)
+                PureBLAS.gbtrs!(tr, kl, ku, n, ABp, ipiv, Bp)
+                Aop = tr == 'N' ? A : (tr == 'T' ? transpose(A) : A')
+                # Backward-error form: the ‖A‖·‖X‖ term is what makes this conditioning-independent.
+                # Without it (the old bound) an ill-conditioned cell fails for reasons unrelated to
+                # gbtrf, because the residual scales with ‖X‖ but the bound did not.
+                @test norm(Aop * Bp - Bv) <=
+                      200 * n * eps(real(T)) * (norm(A) * norm(Bp) + norm(Bv))
+            end
+        end
+    end
+
+    # BLOCKED kernel, called BY NAME with an explicit nb. Going through `gbtrf!` would not do: its
+    # gate is kl ≥ 2·nb with nb = 48, so reaching the blocked path through the front door needs
+    # kl ≥ 96 and n in the thousands — far too slow for a correctness item, and the coverage would
+    # silently depend on the host's measured nb. This is the `pbtrf` precedent (see :24-31), whose
+    # header is a post-mortem of a blocked kernel that shipped with no test reaching it.
+    #
+    # ORACLE is `_gbtf2!` on the same input, which is sharper than comparing against stdlib: a wrong
+    # undo loop or a mis-offset ipiv produces a STRUCTURALLY different factor, not a roundoff-level
+    # one. Measured separation is ~13 orders of magnitude (valid cells 1e-13, nb>kl cells 1e0-1e4).
+    # `ipiv` is asserted bit-exact — partial pivoting is one argmax per column, no re-association.
+    # The FACTOR tolerance is loose (1e4·eps) on purpose: blocked and unblocked reassociate the
+    # arithmetic (rank-1 sweep vs rank-nb gemm), so they legitimately differ by roundoff × growth.
+    @testset "blocked $T $m×$n kl=$kl ku=$ku nb=$nb gen=$gen pad=$pad" for
+            T in (Float32, Float64, ComplexF32, ComplexF64),
+            (m, n, kl, ku) in ((24, 24, 8, 4), (64, 64, 16, 16), (40, 40, 8, 8),
+                               (40, 40, 12, 0), (50, 32, 10, 6), (32, 50, 10, 6)),
+            nb in (1, 2, 3, 5, 8), gen in (:dominant, :pivot, :deep), pad in (0, 3)
+
+        nb > kl && continue                                  # structural precondition of dgbtrf
+        Random.seed!(hash((T, m, n, kl, ku, gen, pad)))
+        A = zeros(T, m, n)
+        for j in 1:n, i in max(1, j - ku):min(m, j + kl); A[i, j] = randn(T); end
+        if gen === :dominant
+            for j in 1:min(m, n); A[j, j] += T(4 * (kl + ku + 1)); end
+        elseif gen === :deep && kl > 0
+            for j in 1:n; i = min(m, j + kl); i > j && (A[i, j] = T(100)); end
+        end
+
+        ldab = 2kl + ku + 1 + pad
+        ABb = tob(A, m, n, kl, ku, ldab); ABu = copy(ABb)
+        if pad > 0                                           # out-of-band canary on BOTH copies
+            ABb[(kl + ku + kl + 2):ldab, :] .= T(-12345)
+            ABu[(kl + ku + kl + 2):ldab, :] .= T(-12345)
+        end
+        ipb = zeros(Int, min(m, n)); ipu = zeros(Int, min(m, n))
+        infb = PureBLAS._gbtrf_blocked!(kl, ku, m, ABb, ipb, nb)
+        infu = PureBLAS._gbtf2!(kl, ku, m, ABu, ipu)
+
+        @test ipb == ipu
+        @test infb == infu
+        @test maximum(abs, ABb .- ABu) <=
+              1.0e4 * eps(real(T)) * max(maximum(abs, ABu), one(real(T)))
+        pad > 0 && @test all(==(T(-12345)), ABb[(kl + ku + kl + 2):ldab, :])
+    end
+
+    # nb > kl is outside the algorithm's domain (i2 = kl-jb goes negative) — must throw, not
+    # silently return a wrong factor. Verified: those cells diverge from _gbtf2! by O(1).
+    @test_throws ArgumentError PureBLAS._gbtrf_blocked!(4, 2, 20, zeros(Float64, 11, 20),
+        zeros(Int, 20), 8)
+
+    # Singular: an exactly-zero band column ⇒ info names it. Note LA.gbtrf! runs chklapackerror and
+    # THROWS on info>0, so it cannot be used as an oracle here — assert against PureBLAS directly.
+    @testset "singular $T n=$n kl=$kl ku=$ku" for T in (Float64, ComplexF64),
+            (n, kl, ku) in ((20, 2, 3), (48, 12, 6))
+
+        Random.seed!(hash((T, n, kl, ku, :sing)))
+        A = zeros(T, n, n)
+        for j in 1:n, i in max(1, j - ku):min(n, j + kl); A[i, j] = randn(T); end
+        for j in 1:n; A[j, j] += T(4 * (kl + ku + 1)); end
+        c = n ÷ 2
+        for i in max(1, c - ku):min(n, c + kl); A[i, c] = zero(T); end
+        AB = zeros(T, 2kl + ku + 1, n)
         for j in 1:n, i in max(1, j - ku):min(n, j + kl)
             AB[kl + ku + 1 + i - j, j] = A[i, j]
         end
-        ABp = copy(AB)
-        _, ipiv, info = PureBLAS.gbtrf!(kl, ku, n, ABp)
-        @test info == 0
-        ABl = copy(AB); _, ipivl = LA.gbtrf!(kl, ku, n, ABl)
-        @test ipiv == ipivl
-        @test maximum(abs, ABp .- ABl) < 200 * eps(real(T)) * maximum(abs, ABl)
-        for tr in ('N', 'T', 'C')
-            Bv = randn(T, n, 2)
-            Bp = copy(Bv)
-            PureBLAS.gbtrs!(tr, kl, ku, n, ABp, ipiv, Bp)
-            Aop = tr == 'N' ? A : (tr == 'T' ? transpose(A) : A')
-            @test norm(Aop * Bp - Bv) < sqrt(eps(real(T))) * 200 * (norm(A) + 1)
-        end
+        _, _, info = PureBLAS.gbtrf!(kl, ku, n, AB)
+        @test info == c
+        @test all(isfinite, AB)
     end
 end
 
