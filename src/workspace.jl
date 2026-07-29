@@ -48,6 +48,7 @@ mutable struct L3Workspace{T}
     gbw13::Matrix{T}      # _gbtrf_work:  gbtrf upper-corner WORK13, exactly (nb+1)×nb (ld load-bearing)
     gbw31::Matrix{T}      # _gbtrf_work:  gbtrf lower-corner WORK31, exactly (nb+1)×nb (ld load-bearing)
     gbs::Matrix{T}        # _gbtrf_work:  gbtrf dense L11 staging scratch, exactly nb×nb (ld load-bearing)
+    sylw::Matrix{T}       # _sytrf_work:  dlasyf panel W (n×nb) + gather col; exact rows, grow-only cols
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -59,6 +60,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0),
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -230,6 +232,27 @@ function _gbtrf_work(::Type{T}, nb::Int) where {T}
         s = Matrix{T}(undef, nb, nb); ws.gbs = s
     end
     return w13, w31, s
+end
+
+# dlasyf's panel W (n×nb, accumulating L21·D) plus one extra column used as the contiguous gather
+# buffer for the panel gemv's strided W row (`_l2_simd_ok` needs incx==1).
+# EXACT on rows, grow-only on columns. The stated rule permits grow-only throughout here — every
+# consumer is a `view` carrying its own stride and no correctness depends on ldw — but there is a
+# second, PERF reason to pin the rows: `_gemm_3m_scratch` (:220-224) records a grow-only buffer that
+# retained a large leading dimension tanking zgemm/ztrsm at n=128 from 1.16 to 0.57, because the
+# small-n view then walks a huge stride. W's columns are the trailing gemm's B operand and the panel
+# gemv's y, both stride-sensitive, so the rows get the exact test. nb is bounded and monotone in n,
+# so the column test rarely fires. No `fill!`: every element read is written by the copy-then-gemv in
+# the same step. The W view is handed out at exactly nb columns so a panel-boundary bug trips
+# @boundscheck in a debug build rather than silently reading the gather column.
+function _sytrf_work(::Type{T}, n::Int, nb::Int) where {T}
+    ws = _l3ws(T); b = ws.sylw
+    ld = n + 8                                          # off the way stride (same lore as _l3_apad)
+    (ld * sizeof(T)) % (_L1_WAY_BYTES >> 2) == 0 && (ld += 8)
+    if size(b, 1) != ld || size(b, 2) < nb + 1
+        b = Matrix{T}(undef, ld, nb + 1); ws.sylw = b
+    end
+    return view(b, 1:n, 1:nb), view(b, 1:nb, nb + 1)
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}

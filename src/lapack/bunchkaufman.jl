@@ -336,6 +336,315 @@ function _sytf2_upper!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
     return info
 end
 
+# ═══ blocked Bunch-Kaufman (dlasyf) ═══════════════════════════════════════════════════════════════
+# `_sytf2_*` updates the whole trailing submatrix after EVERY pivot — a rank-1/rank-2 BLAS-2 sweep.
+# `dlasyf` updates only the current column, into a panel W that accumulates L21·D, and defers the
+# trailing update to one rank-kb BLAS-3 pass. That is the entire difference, and it is why the
+# unblocked kernel measures ~0.5 vs OpenBLAS and degrades monotonically with n.
+#
+# THE PANEL BOUND. `dlasyf` factors kb ≤ nb columns, not exactly nb, and the bound is on W's COLUMN
+# budget, not on rows: the pivot search may and routinely does reach outside the panel, because every
+# W column is full height and every interchange swaps full rows of A(:,1:kk) and W. One step consumes
+# at most two W columns — k, and k+1 in BOTH the 2×2 case and the 1×1-with-interchange case (which
+# materialises column imax into W[:,k+1] and then copies it back). Guarding `k ≤ nb-1` bounds the
+# highest column touched at exactly nb, so kb ∈ {nb-1, nb}. A 2×2 that would START at k = nb is never
+# attempted — the guard fires and the next panel takes it. That is precisely "a 2×2 pivot cannot
+# straddle the panel boundary".
+#
+# TRAILING UPDATE. Reference master uses one DGEMMTR (gemm into a triangle); PureBLAS has no gemmt,
+# so this uses the OLDER dlasyf structure, which is equivalent and maps onto kernels that exist: per
+# nb-wide block column, `syr2k!` for the jb×jb diagonal triangle and `gemm!` for the rectangle below.
+# A22 -= L21·D·L21ᵀ = L21·Wᵀ, and L21·Wᵀ is symmetric, so ½(L21·Wᵀ + W·L21ᵀ) = L21·Wᵀ exactly — that
+# is the syr2k. It costs 2× flops, but ONLY on the diagonal blocks (≈ nb/m of the work, ~3% at
+# n=4096), versus running that fraction at BLAS-2 speed; the rectangle stays 1×-flop peak gemm.
+# Isolated in `_lasyf_diag!` so reverting to LAPACK's per-column gemv loop is one method body.
+function _lasyf_lower!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
+        W::AbstractMatrix{T}, xs::AbstractVector{T}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    Tr = real(T)
+    alpha = Tr(_BK_ALPHA)
+    info = 0
+    k = 1
+    @inbounds while !(k >= nb && nb < n) && k <= n
+        # W[k:n,k] = A[k:n,k] - A[k:n,1:k-1]·W[k,1:k-1]ᵀ. The W row is strided by ldw, and
+        # `_l2_simd_ok` needs incx==1, so gather it contiguously first (the pstrf.jl:276-282 idiom).
+        for i in k:n
+            W[i, k] = A[i, k]
+        end
+        if k > 1
+            for t in 1:(k - 1)
+                xs[t] = W[k, t]
+            end
+            _gemv!(false, false, n - k + 1, k - 1, -one(T),
+                view(A, k:n, 1:(k - 1)), xs, 1, one(T), view(W, k:n, k), 1)
+        end
+
+        kstep = 1
+        absakk = _bk_cabs1(W[k, k])
+        if k < n
+            imax, colmax = _bk_colmax(W, (k + 1):n, k)
+        else
+            imax = k; colmax = zero(Tr)
+        end
+
+        if max(absakk, colmax) == zero(Tr)
+            info == 0 && (info = k)
+            kp = k
+        else
+            if absakk >= alpha * colmax
+                kp = k
+            else
+                # Materialise column imax into W[:,k+1]; the ROWMAX search then runs against a COLUMN
+                # of W rather than a row of A — which is why `_bk_rowmax`'s strided row walk vanishes
+                # from the blocked path entirely.
+                for i in k:(imax - 1)
+                    W[i, k + 1] = A[imax, i]              # transposed strip (symmetric)
+                end
+                for i in imax:n
+                    W[i, k + 1] = A[i, imax]
+                end
+                if k > 1
+                    for t in 1:(k - 1)
+                        xs[t] = W[imax, t]
+                    end
+                    _gemv!(false, false, n - k + 1, k - 1, -one(T),
+                        view(A, k:n, 1:(k - 1)), xs, 1, one(T), view(W, k:n, k + 1), 1)
+                end
+                _, rowmax = _bk_colmax(W, k:(imax - 1), k + 1)
+                if imax < n
+                    _, r2 = _bk_colmax(W, (imax + 1):n, k + 1)
+                    rowmax = max(rowmax, r2)
+                end
+                if absakk >= alpha * colmax * (colmax / rowmax)
+                    kp = k
+                elseif _bk_cabs1(W[imax, k + 1]) >= alpha * rowmax
+                    kp = imax
+                    for i in k:n                          # updated imax column becomes the pivot col
+                        W[i, k] = W[i, k + 1]
+                    end
+                else
+                    kp = imax; kstep = 2
+                end
+            end
+
+            kk = k + kstep - 1
+            if kp != kk
+                # A directed COPY, not a swap: kk is LEAVING the trailing set this step, so the only
+                # surviving effect is "row/col kp now holds what kk held". This is where _sytf2_lower!
+                # and dlasyf structurally diverge.
+                A[kp, kp] = A[kk, kk]
+                for j in (kk + 1):(kp - 1)
+                    A[kp, j] = A[j, kk]                   # crossing strip, transposed
+                end
+                for i in (kp + 1):n
+                    A[i, kp] = A[i, kk]
+                end
+                if k > 1                                  # swap rows kk/kp over A's first k-1 columns
+                    for j in 1:(k - 1)
+                        t = A[kk, j]; A[kk, j] = A[kp, j]; A[kp, j] = t
+                    end
+                end
+                for j in 1:kk                             # and over W's first kk columns
+                    t = W[kk, j]; W[kk, j] = W[kp, j]; W[kp, j] = t
+                end
+            end
+
+            if kstep == 1
+                for i in k:n
+                    A[i, k] = W[i, k]
+                end
+                if k < n
+                    r1 = one(T) / A[k, k]
+                    for i in (k + 1):n
+                        A[i, k] *= r1
+                    end
+                end
+            else
+                if k < n - 1
+                    d21 = W[k + 1, k]
+                    d11 = W[k + 1, k + 1] / d21
+                    d22 = W[k, k] / d21
+                    tt = one(T) / (d11 * d22 - one(T))
+                    d21 = tt / d21
+                    for j in (k + 2):n
+                        A[j, k] = d21 * (d11 * W[j, k] - W[j, k + 1])
+                        A[j, k + 1] = d21 * (d22 * W[j, k + 1] - W[j, k])
+                    end
+                end
+                A[k, k] = W[k, k]
+                A[k + 1, k] = W[k + 1, k]
+                A[k + 1, k + 1] = W[k + 1, k + 1]
+            end
+        end
+
+        if kstep == 1
+            ipiv[k] = kp
+        else
+            ipiv[k] = -kp; ipiv[k + 1] = -kp
+        end
+        k += kstep
+    end
+
+    kb = k - 1
+    if kb > 0
+        # Trailing update over nb-wide block columns (see the header on why not gemmt).
+        j = k
+        while j <= n
+            jb = min(nb, n - j + 1)
+            _lasyf_diag!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
+                view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb), false)
+            if j + jb <= n
+                # `_gemm_core!`, not the kwarg `gemm!`: the latter gates on `C isa StridedMatrix`,
+                # which PtrMatrix is NOT, so a Mode-1 / .so caller would silently take the generic
+                # kernel (banded_chol.jl:517-521 documents the same trap).
+                _gemm_core!(view(A, (j + jb):n, j:(j + jb - 1)),
+                    view(A, (j + jb):n, 1:kb), view(W, j:(j + jb - 1), 1:kb),
+                    -one(T), one(T), false, true, false, false)
+            end
+            j += jb
+        end
+
+        # Put L21 in standard form: partially undo the row interchanges in columns 1:k-1, backwards.
+        # The panel swapped FULL rows so the trailing BLAS-3 sees a consistent block; `_sytrs_*`
+        # expects dsytf2's convention, where column p carries no permutation from steps after p.
+        # Skip this and the factor is internally consistent but wrong against LAPACK.
+        j = kb
+        while j >= 1
+            jj = j
+            jp = ipiv[j]
+            if jp < 0
+                jp = -jp; j -= 1
+            end
+            j -= 1
+            if jp != jj && j >= 1
+                for c in 1:j
+                    t = A[jp, c]; A[jp, c] = A[jj, c]; A[jj, c] = t
+                end
+            end
+            j <= 1 && break
+        end
+    end
+    return kb, info
+end
+
+# A22 -= L·Wᵀ on the `uplo` triangle only. L·Wᵀ = L·D·Lᵀ is symmetric, so ½(L·Wᵀ + W·Lᵀ) is exactly
+# it — one existing BLAS-3 call in place of LAPACK's jb per-column gemv loop, at 2× flops on the
+# diagonal blocks only. Val-dispatched so the symmetric/Hermitian split is a compile-time choice
+# (the pstrf.jl:74-79 pattern); `her2k!` additionally zeroes the imaginary diagonal for free, which
+# is what zlahef's A(JJ,JJ)=DBLE(...) bracketing exists to do.
+@inline function _lasyf_diag!(C, L, Wv, herm::Bool)
+    T = eltype(C)
+    syr2k!(C, L, Wv; uplo = 'L', trans = 'N', alpha = -one(T) / 2, beta = one(T))
+    return C
+end
+
+# Blocked driver (dsytrf, lower). THREE things bite here, all of which produce a factor that looks
+# plausible and passes a closed-loop residual test:
+#  (1) `kb`, NOT `nb`, advances k — the panel stops short whenever a 2×2 would straddle the boundary.
+#  (2) The ipiv LOCAL→GLOBAL remap is SIGN-AWARE: positives get +k-1, negatives -k+1. A naive
+#      `+= k-1` corrupts every 2×2 block outside the first panel.
+#  (3) info is offset by k-1 (the sub-problem is the TRAILING block here; the upper driver's is the
+#      LEADING one and needs neither remap nor offset).
+# `_sytf2_lower!` remains the tail (k > n-nb), the whole path for non-BlasFloat T, and the small-n
+# path — the last falls out structurally from nb >= n with no extra threshold.
+function _sytrf_blocked_lower!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int
+    ) where {T}
+    n = size(A, 1)
+    W, xs = _sytrf_work(T, n, nb)
+    info = 0
+    k = 1
+    @inbounds while k <= n
+        if k <= n - nb
+            kb, iinfo = _lasyf_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb)
+        else
+            iinfo = _sytf2_lower!(view(A, k:n, k:n), view(ipiv, k:n), false)
+            kb = n - k + 1
+        end
+        info == 0 && iinfo > 0 && (info = iinfo + k - 1)
+        for j in k:(k + kb - 1)
+            ipiv[j] = ipiv[j] > 0 ? ipiv[j] + k - 1 : ipiv[j] - k + 1
+        end
+        k += kb
+    end
+    return info
+end
+
+# PDM tier: MEASURE. Panel/port-balance crossover, same class as `_pbtrf_nb` and `_gbtrf_nb`; anchor
+# is `_LU_NB` for the reason `_pstrf_nb` also reuses it (a pivoted BLAS-2 panel amortized against a
+# rank-nb BLAS-3 trailing update is the physically identical shape), bracket widened downward because
+# dlasyf's panel does up to TWICE getrf's BLAS-2 work per column — the ROWMAX branch fires a second
+# full-height gemv — so its optimum sits below the dense anchor. Measured Zen4 F64 PB/OB, indefinite:
+#     n     nb=8   16    24    32    48    64    96
+#     128   1.29  1.58  1.62  1.46  1.26  1.28  1.05
+#     256   1.32  1.67  1.55  1.47  1.34  1.18  0.97
+#     512   1.10  1.46  1.54  1.41  1.28  1.13  0.94
+#     1024  0.83  1.13  1.21  1.23  1.17  1.09  0.95
+#     2048  0.68  0.90  1.01  1.08  1.09  1.06  0.99
+# The optimum DRIFTS with n (≈√n: 16/24/32/48 at n=256/512/1024/2048), so a single constant cannot be
+# optimal everywhere. It is measured at a LARGE probe size on purpose: the ratio is tightest at the
+# big end (1.08-1.09 at n=2048 vs 1.5-1.7 at mid n), so a knob tuned there gates everywhere, while
+# one tuned at mid n would land on 24 and leave n=2048 at 1.01. Promoting to an n-scaled formula is
+# the identified refinement; the data above is the record to derive it from.
+const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
+@static if isnothing(_SYTRF_NB_PREF)
+    function _measure_sytrf_nb(::Type{T})::Int where {T}
+        nb0 = _LU_NB
+        Base.generating_output() && return nb0
+        try
+            nloc = 16 * nb0                                # 768: large enough that the big-n regime
+            Am = Matrix{T}(undef, nloc, nloc)               # governs, small enough to stay ~100 ms
+            ipv = Vector{Int}(undef, nloc)
+            refill! = () -> begin                           # indefinite symmetric, deterministic
+                @inbounds for j in 1:nloc, i in 1:nloc
+                    Am[i, j] = T(((i * 7 + j * 13) % 101) - 50) / T(50)
+                end
+                @inbounds for j in 1:nloc, i in (j + 1):nloc
+                    Am[i, j] = Am[j, i]
+                end
+            end
+            best = nb0; tbest = typemax(UInt64)
+            for c in (nb0 ÷ 6, nb0 ÷ 4, nb0 ÷ 3, nb0 >> 1, (3 * nb0) >> 2, nb0)
+                nb = c
+                (nb < 1 || nb >= nloc) && continue
+                refill!(); _sytrf_blocked_lower!(Am, ipv, nb)        # untimed warmup
+                t = typemax(UInt64)
+                for _ in 1:3
+                    refill!(); s = time_ns()
+                    _sytrf_blocked_lower!(Am, ipv, nb)
+                    t = min(t, time_ns() - s)
+                end
+                t < tbest && (tbest = t; best = nb)
+            end
+            return best
+        catch
+            return nb0
+        end
+    end
+    const _SYTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float64))
+    const _SYTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float32))
+    @inline _sytrf_nb(::Type{Float64}) = _SYTRF_NB_F64()
+    @inline _sytrf_nb(::Type{Float32}) = _SYTRF_NB_F32()
+    @inline _sytrf_nb(::Type{T}) where {T} = _LU_NB
+else
+    @inline _sytrf_nb(::Type{T}) where {T} = _SYTRF_NB_PREF::Int
+end
+
+# Dispatch. Gated on `_strided1`, NOT `A isa StridedMatrix`: cabi_lapack.jl calls sytrf!/hetrf! with
+# a PtrMatrix, so a StridedMatrix gate would leave Mode 1 and the .so on the unblocked kernel — the
+# port would be invisible exactly where LBT users live. Only the REAL LOWER path is blocked so far;
+# upper and Hermitian keep `_sytf2_*` until their panels are ported and validated the same way.
+@inline function _bk_factor_lower(A::AbstractMatrix{T}, ipiv, herm::Bool) where {T}
+    n = size(A, 1)
+    if T <: BlasReal && !herm && _strided1(A)
+        nb = _sytrf_nb(T)
+        nb > 1 && nb < n && return _sytrf_blocked_lower!(A, ipiv, nb)
+    end
+    return _sytf2_lower!(A, ipiv, herm)
+end
+
 """
     sytrf!(A, ipiv; uplo='L') -> info
 
@@ -348,7 +657,7 @@ function sytrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("sytrf!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytrf!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytrf!: uplo must be 'L' or 'U'"))
-    return uplo == 'L' ? _sytf2_lower!(A, ipiv, false) : _sytf2_upper!(A, ipiv, false)
+    return uplo == 'L' ? _bk_factor_lower(A, ipiv, false) : _sytf2_upper!(A, ipiv, false)
 end
 
 """
@@ -364,7 +673,7 @@ function hetrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     length(ipiv) == n || throw(DimensionMismatch("hetrf!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetrf!: uplo must be 'L' or 'U'"))
     herm = eltype(A) <: Complex
-    return uplo == 'L' ? _sytf2_lower!(A, ipiv, herm) : _sytf2_upper!(A, ipiv, herm)
+    return uplo == 'L' ? _bk_factor_lower(A, ipiv, herm) : _sytf2_upper!(A, ipiv, herm)
 end
 
 # ---------------------------------------------------------------------------------------------------

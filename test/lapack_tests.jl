@@ -725,6 +725,32 @@ end
         end
     end
 
+    # BLOCKED panel, called BY NAME with an explicit nb. Going through `sytrf!` would tie coverage to
+    # the host's measured nb and to n crossing it; this sweeps `nb in 2:12`, which hits EVERY panel-
+    # boundary parity — so the k=nb-1/kstep=2 case (the one that touches W's last column) and the
+    # "2×2 deferred to the next panel" case both occur many times with no per-cell reasoning. The
+    # hollow class matters most here: a zero diagonal forces every pivot to 2×2 with a search that
+    # reaches an arbitrary row, which is exactly what a panel boundary can get wrong.
+    @testset "blocked-lower $T n=$n nb=$nb cls=$cls" for T in (Float64, Float32),
+            n in (7, 13, 40, 100, 129), nb in 2:12, cls in (:generic, :hollow, :rankdef)
+
+        nb >= n && continue
+        Random.seed!(hash((T, n, nb, cls)))
+        M = randn(T, n, n); A = M + transpose(M)
+        cls === :hollow && (A[diagind(A)] .= zero(T))
+        cls === :rankdef && (B0 = randn(T, n, max(1, n - 3)); A = B0 * transpose(B0))
+
+        ip = zeros(Int, n); LD = copy(A)
+        info = PureBLAS._sytrf_blocked_lower!(LD, ip, nb)
+        @test ipiv_wellformed(ip, 'L', n)
+        @test all(isfinite, LD)
+        if info == 0
+            Bv = randn(T, n, 3); X = copy(Bv)
+            LAPACK.sytrs!('L', LD, ip, X)        # independent P·L·D·Lᵀ·Pᵀ reconstruction
+            @test norm(A * X - Bv) <= tol(T, n) * (norm(A) * norm(X) + norm(Bv))
+        end
+    end
+
     # Rank-deficient / exactly-singular: reaches the `max(absakk,colmax)==0 ⇒ info=k` branch, which
     # nothing else in the suite touches (every other item adds n*I to stay well away from it).
     @testset "singular $T n=$n uplo=$uplo" for T in (Float32, Float64, ComplexF64),
