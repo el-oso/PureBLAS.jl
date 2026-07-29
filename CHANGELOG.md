@@ -41,6 +41,28 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
 
 ### Fixed
 
+- **`A \ b` with one right-hand side ran 14× slower than OpenBLAS, and nothing was measuring it.**
+  `getrs`/`potrs`/`trtrs` existed only as C-ABI shims, so the benchmark harness — which compares
+  `PureBLAS.foo!` against `LAPACK.foo!` — had nothing to call. Native entry points now exist (Mode-2,
+  AD-traceable, with the shims calling them so there is one implementation), and gating them exposed
+  three defects, all in `trsm`: the blocked path's `O(k·nb²)` setup is never repaid when B has few
+  columns (at k=1024 it cost 1123 µs for one column and 1197 µs for eight); a power-of-two-`lda`
+  A-pad copied all of A into scratch on every call, costing **+3% to +357%** across all sixteen
+  side × uplo × transA × B-width combinations and paying nowhere, including at square B; and a
+  **ragged SIMD lane was charged as a full lane**, so `nrhs`=1…7 each cost what eight columns cost
+  together. Narrow B now sweeps `trsv` per column, the pad is deleted, and a ragged B is widened into
+  GKH-owned scratch before the solve. `getrs` at `nrhs=1` went from 0.072–0.817 to **0.98–1.16×**
+  OpenBLAS across n = 8…2048; `potrs` reaches **4.9×** at n=1024. `trsm` itself now gates at
+  worst 1.18× (was 1.04). Residual at `nrhs = 8`, which falls between the two mechanisms.
+- **`sytrs` had two codegen hazards** on the hot path of every LDLᵀ solve: an unforwarded
+  store-to-load (`B[i,j] -= A[i,k]*B[k,j]` forces a reload of `B[k,j]` because alias analysis cannot
+  see that `i > k`), and a per-element `herm ? conj(x) : x` runtime branch blocking vectorisation.
+  Both fixed; +11–18% (n=1024, `nrhs=1`: 0.435 → 0.514 vs OpenBLAS). Still short — the rest is
+  structural, `sytrf` being unblocked.
+- **Five real factorizations had never been benchmarked once**: `sytrf`, `sytrs`, `gbtrf`, `geqp3`,
+  `gels`. They routed and passed correctness, which reads as coverage while measuring nothing. Gate
+  rows added. Only `gels` passes (1.87–2.82×); `geqp3` is the worst routine in the real surface at
+  **0.181×** OpenBLAS, and both it and `sytrf` are confirmed-unblocked BLAS-2 implementations.
 - **Packed Cholesky `pptrf` (lower) was paying per-call overhead, not doing slow arithmetic.**
   Its worst cell ran 0.738× AOCL at n=32. Decomposing it: PureBLAS's `spr!` *kernel* already ties or
   beats AOCL's `dspr` at every trailing order (70 vs 70 ns at m=8, 591 vs 641 at m=64), but the

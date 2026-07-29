@@ -6,7 +6,11 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
 **Legend**
 
 - **Routes** — the routine forwards to PureBLAS via LBT after `activate()` (or is composed from routines that do).
-- **Optimized** — ✅ perf-gated `≥ OpenBLAS` on the dev fleet (Zen3/4/5); ⏳ correctness-first (numerically LAPACK-accurate, blocked/SIMD perf tuning is a documented follow-up); — n/a.
+- **Optimized** — ✅ perf-gated `≥ max(OpenBLAS, AOCL)` on the dev fleet (Zen3/4/5); ⏳ correctness-first (numerically LAPACK-accurate, blocked/SIMD perf tuning is a documented follow-up); — n/a.
+  Both references are always measured: a routine can beat one by a wide margin and lose to the other,
+  and a large win over a library that did not implement a routine is not evidence of speed (AOCL's
+  packed Cholesky is ~6× slower than OpenBLAS's — near-reference code — so beating it there means
+  little). Where a footnote gives numbers, it names the reference.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
@@ -25,19 +29,19 @@ size crossover — **beats** OpenBLAS at large `n`.
 
 | Op | Routines | Types | Routes | Optimized |
 |---|---|---|---|---|
-| Cholesky | potrf, potrs, potri | s/d/c/z | ✅ | ✅ |
+| Cholesky | potrf, potrs, potri | s/d/c/z | ✅ | ✅ [^solv] |
 | Pivoted Cholesky | pstrf | s/d/c/z | ✅ | ⏳ [^ps] |
-| LU | getrf, getrs, getri, gesv | s/d/c/z | ✅ | ✅ |
+| LU | getrf, getrs, getri, gesv | s/d/c/z | ✅ | ✅ [^solv] |
 | QR | geqrf, geqrt, gemqrt, orgqr, ormqr | s/d/c/z | ✅ | ✅ |
 | LQ | gelqf, orglq, ormlq | s/d/c/z | ✅ | ⏳ |
 | QL / RQ | geqlf, gerqf, org/orm ql/rq | s/d/c/z | ✅ | ⏳ |
-| Pivoted QR | geqp3 | s/d/c/z | ✅ | ⏳ |
+| Pivoted QR | geqp3 | s/d/c/z | ✅ | ⏳ [^unblk] |
 | RZ (for gelsy) | tzrzf, ormrz | s/d/c/z | ✅ | ⏳ |
-| Bunch–Kaufman | sytrf, hetrf, sytrs, hetrs | s/d/c/z | ✅ | ⏳ |
+| Bunch–Kaufman | sytrf, hetrf, sytrs, hetrs | s/d/c/z | ✅ | ⏳ [^unblk] |
 | Indefinite solve/inv | sysv, hesv, sytri, hetri | s/d/c/z | ✅ | ⏳ |
 | Triangular | trtrs, trtri, trcon | s/d/c/z | ✅ | ✅ |
 | Condition est. | gecon, pocon, trcon | s/d/c/z | ✅ | ⏳ |
-| Least-squares | gels | s/d/c/z | ✅ | ⏳ |
+| Least-squares | gels | s/d/c/z | ✅ | ✅ [^gels] |
 | Rank-deficient LS | gelsd, gelsy | s/d/c/z | ✅ | ⏳ |
 
 ## LAPACK — SVD
@@ -72,7 +76,7 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 
 | Op | Routines | Types | Routes | Optimized |
 |---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | ⏳ |
+| General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | ⏳ [^gb] |
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | ✅ |
 | SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | ✅ [^tri] |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | ⏳ [^pb] |
@@ -94,6 +98,49 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
     routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 
+[^unblk]: **Measured as unblocked.** `geqp3` and `sytrf`/`sytrs` are BLAS-2 implementations racing
+    blocked BLAS-3 ones, and their ratios degrade monotonically with `n` — the signature. Zen4 gate
+    sweep (geomean / worst, n = 8…4096): `geqp3` **0.34 / 0.18** vs OpenBLAS and **0.31 / 0.17** vs
+    AOCL — the worst routine in the real LAPACK surface; `sytrf` **0.56 / 0.15** and 0.59 / 0.15;
+    `sytrs` 0.86 / 0.52 and 1.10 / 0.47. Both are confirmed from source, not inferred:
+    `geqp3.jl`'s header states it is the unblocked core, and `sytrf!` calls `_sytf2_*` directly with
+    no blocked driver at all. These had **never been benchmarked** before 2026-07-29 — they routed
+    and passed correctness, which reads as coverage while measuring nothing.
+    A blocked `dlaqps` port for `geqp3` was written and **verified correct** (pivots and R identical
+    to LAPACK, reconstruction to 1e-13, over full-rank/rank-deficient/graded input) but was **not
+    faster**, and larger panels were *worse* — the diagnostic that the cost is the panel's own
+    per-column BLAS-2 calls, not the trailing gemm. It is reverted, not shipped. The retry must reach
+    the kernels pointer-direct; see §5 of [Tuning](tuning.md) and the note on `sytrs`, where two
+    codegen hazards (an unforwarded store-to-load and a per-element `herm ?` branch) were worth
+    +11–18%.
+
+[^gels]: `gels` clears **both** references on the Zen4 gate sweep — geomean 2.42 / worst 1.93 vs
+    OpenBLAS, 1.88 / 1.28 vs AOCL. Worth noting as a control alongside the ⏳ rows above: it composes
+    `geqrf` + `trsm`, both already tuned, which is consistent with the others' problem being their own
+    kernels rather than anything shared. It was also never benchmarked before 2026-07-29 — this row
+    changed from ⏳ to ✅ on measurement, not on work.
+
+[^gb]: `gbtrf` has no clean shape — Zen4 vs OpenBLAS 1.44 / 1.30 / 0.79 / 1.11 / 1.08 / 0.66 at
+    n = 32…1024, and vs AOCL 1.06 / 0.89 / 0.60 / 1.25 / 1.12 / 0.44 (gate sweep: 0.96 / 0.48 and
+    0.78 / 0.34). The dips at n=128 and n=1024 are undiagnosed and should not be assumed to share a
+    cause with the unblocked routines above.
+
+[^solv]: The ✅ on these rows is for the **factorizations**; their **solves are not yet gated**, and
+    the distinction is worth stating because the solves were invisible for a long time.
+    `getrs`/`potrs`/`trtrs` had no native entry point until 2026-07-29, so they could not be measured
+    at all — the harness compares `PureBLAS.foo!` against `LAPACK.foo!` and there was nothing to call.
+    Adding one exposed `A \ b` with a single right-hand side running **14× slower than OpenBLAS**,
+    traced to three defects in `trsm`: a blocked setup never repaid for narrow B, a power-of-two-`lda`
+    A-pad that cost +3–357% across all sixteen operand combinations and paid nowhere, and a **ragged
+    SIMD lane charged as a full lane** (`nrhs`=1…7 each cost what eight columns cost together).
+    After those, Zen4 gate sweep: vs **OpenBLAS** `getrs` geomean 1.05 / worst 0.99, `potrsL`
+    2.20 / 0.93, `potrsU` 2.74 / 1.07 ✓, `trtrs` 1.11 / 1.02 ✓ — `potrs` reaching **4.9×** at n=1024.
+    vs **AOCL** they still miss: `getrs` 0.93 / 0.85, `potrsL` 0.94 / 0.78, `potrsU` 1.13 / 0.91,
+    `trtrs` 1.07 / 0.88. So under `max(OB, AOCL)` the solves remain open, and `trsm` itself passes
+    OpenBLAS (worst 1.18, up from 1.04) while still missing AOCL (worst 0.90).
+    A residual sits at `nrhs = 8`, between the two mechanisms — too wide for the per-column sweep,
+    and on Zen3 (`W=4`) already two full lanes, so the ragged-tail fix does not reach it.
+
 [^ps]: `pstrf`'s blocked pivoted factorization clears **AOCL completely on both Zen4 and Zen5**, both
     triangles, every size (Zen5: `uplo='L'` 1.07–1.75, `uplo='U'` 1.06–1.75). Against **OpenBLAS** it
     clears everywhere except a narrow `uplo='U'` window that is consistent across µarchs and mild:
@@ -104,8 +151,17 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
     per panel: they are stride-`lda` and were ~47% of the runtime, so the swap — not the BLAS-3
     update — was the bottleneck.
     ⚠ Float64; Zen3 not yet measured for this routine.
+    One caveat on reading the published table: the Zen4 gate sweep reports `pstrf` worst = 0.85 vs
+    OpenBLAS, which is **not** one of the cells above — it is n=8, where the per-round ratios come out
+    bimodal (1.03 / 1.00 / 0.79 / 1.01 / 1.01 / 0.79 / 0.80 / 1.03). Rounds alternating like that at
+    sub-microsecond scale is the ABBA ordering effect, not a stable regression; the sweep's size grid
+    (8, 32, 128, …) skips 48 and 64 entirely, so it never samples the real residual.
 
-[^pp]: `pptrf` does **not** yet gate, and the two triangles fail against *different* references —
+[^pp]: **`uplo='L'` now clears OpenBLAS** on the Zen4 gate sweep (geomean 1.11, worst 1.04) after the
+    per-call overhead fix described below — but it still misses **AOCL** (1.17 / 0.93), so the row
+    stays ⏳. `uplo='U'` is the mirror image: 3.30 / 1.43 vs AOCL ✓ but 1.07 / **0.92** vs OpenBLAS.
+    Neither triangle clears both references, and they fail against *different* ones.
+    Historical detail, kept because the diagnosis generalises —
     which is why it needs both. Zen4, Float64, n = 8…2048:
     `uplo='L'` clears OpenBLAS at every size (1.05–1.37) and clears AOCL except n=32 (**0.949**) and
     n=48 (**0.980**). `uplo='U'` beats AOCL by a wide margin (1.17–**6.27**, growing with n) but
