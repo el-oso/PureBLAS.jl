@@ -1,7 +1,8 @@
 # LAPACK general-banded LU with partial pivoting — faithful port of Reference-LAPACK
 # dgbtf2 (unblocked banded LU) + dgbtrs (banded LU solve), generic over s/d/c/z (and any
-# T<:Number, so Mode 2 / ForwardDiff-traceable). STANDALONE: depends only on Base — not yet
-# wired into the module includes.
+# T<:Number, so Mode 2 / ForwardDiff-traceable). `_gbtf2!` depends only on Base, which is what
+# keeps the generic-T / ForwardDiff path alive: a `Dual` fails the `T<:BlasFloat` gate in
+# `gbtrf!` and lands here unchanged.
 #
 # ── LAPACK band storage (GB) ────────────────────────────────────────────────────────────────
 # An n×n matrix with `kl` subdiagonals and `ku` superdiagonals is held in an `ldab × n` array
@@ -21,16 +22,50 @@
 @inline _gb_cabs1(x::Real) = abs(x)
 @inline _gb_cabs1(z::Complex) = abs(real(z)) + abs(imag(z))
 
+# PDM tier: MEASURE — PROVISIONAL, currently pinned to the _LU_NB anchor pending the auto-tune.
+# Not Derive: this is a panel-vs-rank-nb-gemm crossover, not a cache-residency block, and the tell
+# for Measure is on record — `_pbtrf_nb` (banded_chol.jl:110-125) found 32 to be a SHARP local
+# minimum, worse than both 24 and 40, i.e. a residency model mispredicts a box we own.
+# The anchor is `_LU_NB` because dense right-looking LU faces the identical tradeoff (a pivoted
+# BLAS-2 panel amortized against a rank-nb BLAS-3 trailing update); `_pstrf_nb` reuses it for the
+# same reason. See the campaign plan: the Measure ladder lands in the next step with the candidate
+# bracket {½,¾,1,5⁄4,3⁄2,2}·_LU_NB.
+@inline _gbtrf_nb(::Type{T}) where {T} = _LU_NB
+
 # gbtrf!(kl, ku, m, AB) → (AB, ipiv, info).  AB overwritten with L\U in band storage; ipiv the
-# min(m,n) pivot rows; info = index of the first exactly-zero pivot (0 if none). Mirrors dgbtf2.
+# min(m,n) pivot rows; info = index of the first exactly-zero pivot (0 if none). Allocates ipiv and
+# dispatches; the arity and the 3-tuple are load-bearing (the C-ABI wrapper destructures them).
 function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) where {T}
+    _, n = size(AB)
+    ipiv = Vector{Int}(undef, min(Int(m), n))
+    nb = _gbtrf_nb(T)
+    # Blocking only pays when the in-band trailing block A22 is at least as tall as the panel is
+    # wide (i2 = kl-nb ≥ nb). Reference dgbtrf's structural condition is the weaker nb ≤ kl, but at
+    # nb ≈ kl every trailing flop funnels through the dense corners instead of the band — the same
+    # collapse `_pbtrf_nb` documents (banded_chol.jl:173-186), where clamping the width to kd turned
+    # a 1.6× win into the routine's only gate miss. Narrow bands stay on the unblocked kernel, where
+    # PureBLAS already gates.
+    if T <: BlasFloat && _strided1(AB) && Int(kl) >= 2 * nb && min(Int(m), n) > nb
+        info = _gbtrf_blocked!(kl, ku, m, AB, ipiv, nb)
+    else
+        info = _gbtf2!(kl, ku, m, AB, ipiv)
+    end
+    return AB, ipiv, info
+end
+
+# _gbtf2!(kl, ku, m, AB, ipiv) → info.  Reference dgbtf2: UNBLOCKED banded LU, one rank-1 downdate
+# per column, no BLAS calls. Base-only, so it serves every non-BlasFloat eltype as well as being the
+# narrow-band path (blocking cannot pay when the panel does not fit inside kl).
+function _gbtf2!(
+        kl::Integer, ku::Integer, m::Integer,
+        AB::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}
+    ) where {T}
     ldab, n = size(AB)
     kl >= 0 || throw(ArgumentError("gbtrf!: kl < 0"))
     ku >= 0 || throw(ArgumentError("gbtrf!: ku < 0"))
     ldab >= 2 * kl + ku + 1 || throw(DimensionMismatch("gbtrf!: ldab must be ≥ 2kl+ku+1"))
     kv = ku + kl
     mn = min(Int(m), n)
-    ipiv = Vector{Int}(undef, mn)
     info = 0
     z = zero(T)
     # Zero the fill-in triangle in the leading columns (ku+2 .. min(kv,n)).
@@ -84,7 +119,264 @@ function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) whe
             info = j
         end
     end
-    return AB, ipiv, info
+    return info
+end
+
+# ── blocked kernel (dgbtrf.f DO 180) ──────────────────────────────────────────────────────────────
+# Partition at outer column j (reference names; jb = min(nb, min(m,n)-j+1)):
+#
+#     A11(jb×jb)  A12(jb×j2)  A13(jb×j3)      i2 = min(kl-jb, m-j-jb+1)
+#     A21(i2×jb)  A22(i2×j2)  A23(i2×j3)      i3 = min(jb, m-j-kl+1)
+#     A31(i3×jb)  A32(i3×j2)  A33(i3×j3)      j2, j3 computed AFTER ju is updated
+#
+# A13's superdiagonal part and A31's subdiagonal part lie OUTSIDE the stored band: A31[ii,jj] sits at
+# storage row kv+kl+1+ii-jj, which is ≤ ldab only for ii ≤ jj, and A13[ii,jj] at row ii-jj+1, ≥ 1
+# only for ii ≥ jj. Both fill in completely during the panel — A31 through the pivot swaps, A13
+# through the trsm — so each is staged in a dense work array, exactly as the reference does.
+# Unlike pbtrf, where the corner only appears past kd, here i3 = jb for essentially the whole sweep
+# whenever kl is wide, so the corner path is the COMMON case, not an edge case.
+#
+# Every band block is read through the ld-1 trick (`_pb_blk`, banded_chol.jl:376): a block whose
+# row-col offset is constant along each block diagonal is a plain column-major matrix with leading
+# dimension ldab-1. That is the `AB(r,c), LDAB-1` idiom of every BLAS call in dgbtrf.f.
+#
+# TWO deviations from the reference, both deliberate:
+#  (1) L11 is staged into a dense jb×jb scratch instead of being passed as an ld-1 view. The
+#      strictly-upper triangle of a view anchored at AB(kv+1,j) IS U11 — live matrix data — and
+#      handing that to a triangular kernel is the aliasing class banded_chol.jl:420-428 records
+#      costing a 4e-4 factor error. trsm contractually ignores it, but jb²/2 copies per panel is
+#      O(n·nb/2) total (noise) and buys certainty.
+#  (2) `gemm!` is NOT used: it gates on `C isa StridedMatrix`, which `PtrMatrix` is not, so it would
+#      silently fall through to the generic kernel. `_gemm_core!` is the entry that takes PtrMatrix.
+#      `trsm!` needs no such care — it gates on `_strided1`, which PtrMatrix satisfies.
+#
+# The undo loop at the end is easy to mistake for redundant and is not: dgbtf2 stores L UNPERMUTED
+# (its swap runs only over columns to the right, and `gbtrs!` compensates by interleaving a row swap
+# with each column of multipliers). The blocked panel swaps the full panel width so the trsm/gemm see
+# a consistent block, so the left columns must be un-swapped to restore that storage convention.
+# Skip it and `gbtrs!` silently solves the wrong system while the factor still looks plausible.
+function _gbtrf_blocked!(
+        kl::Integer, ku::Integer, m::Integer,
+        AB::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int
+    ) where {T}
+    ldab, n = size(AB)
+    kl >= 0 || throw(ArgumentError("gbtrf!: kl < 0"))
+    ku >= 0 || throw(ArgumentError("gbtrf!: ku < 0"))
+    ldab >= 2 * kl + ku + 1 || throw(DimensionMismatch("gbtrf!: ldab must be ≥ 2kl+ku+1"))
+    M = Int(m); KL = Int(kl); KU = Int(ku)
+    # PRECONDITION, structural and not a tuning choice: the panel must fit inside the subdiagonal
+    # band. Above it i2 = kl-jb goes negative and the A11/A21/A31 partition stops describing the
+    # storage, so the factor is silently wrong rather than merely slow (verified: every nb > kl cell
+    # diverges from _gbtf2!, every nb ≤ kl cell matches bit-exactly). `gbtrf!` gates on the stricter
+    # kl ≥ 2·nb for performance reasons; this guard protects direct callers, including the tests.
+    nb <= KL || throw(ArgumentError("_gbtrf_blocked!: needs nb ≤ kl (got nb=$nb, kl=$KL)"))
+    kv = KU + KL
+    mn = min(M, n)
+    info = 0
+    z = zero(T)
+    ldabs = stride(AB, 2)                              # NOT 2kl+ku+1: callers may pad
+    ld2 = ldabs - 1
+    ldw = nb + 1
+    W13, W31, S = _gbtrf_work(T, nb)                   # GKH-owned; W13/W31 arrive zeroed
+    p0 = pointer(AB); p13 = pointer(W13); p31 = pointer(W31); ps = pointer(S)
+
+    # Fill-in zeroing of the leading columns (dgbtrf DO 60), identical to the unblocked kernel.
+    @inbounds for j in (KU + 2):min(kv, n)
+        for i in (kv - j + 2):KL
+            AB[i, j] = z
+        end
+    end
+
+    ju = 1                                             # ONE variable across ALL panels (see DO 180)
+    GC.@preserve AB W13 W31 S begin
+        @inbounds for j in 1:nb:mn
+            jb = min(nb, mn - j + 1)
+            i2 = min(KL - jb, M - j - jb + 1)
+            i3 = min(jb, M - j - KL + 1)
+
+            # ── panel: unblocked factorization of the jb columns (DO 80) ──────────────────────────
+            for jj in j:(j + jb - 1)
+                if jj + kv <= n                        # zero the incoming column's fill-in
+                    for i in 1:KL
+                        AB[i, jj + kv] = z
+                    end
+                end
+                km = min(KL, M - jj)
+                jp = 1; pmax = _gb_cabs1(AB[kv + 1, jj])
+                for i in 2:(km + 1)
+                    a = _gb_cabs1(AB[kv + i, jj]); a > pmax && (pmax = a; jp = i)
+                end
+                ipiv[jj] = jp + jj - j                 # PANEL-LOCAL; +j-1 is applied below
+                if AB[kv + jp, jj] != z
+                    ju = max(ju, min(jj + KU + jp - 1, n))
+                    if jp != 1
+                        if jp + jj - 1 < j + KL
+                            # swap over the whole panel width; stride ldab-1 walks one column right
+                            # and one storage row up, i.e. along a row of A.
+                            for t in 0:(jb - 1)
+                                r1 = kv + 1 + jj - j - t; r2 = kv + jp + jj - j - t
+                                c = j + t
+                                AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                            end
+                        else
+                            # the pivot row reaches A31, whose columns j..jj-1 live in W31
+                            for t in 0:(jj - j - 1)
+                                r1 = kv + 1 + jj - j - t
+                                w = jp + jj - j - KL
+                                AB[r1, j + t], W31[w, 1 + t] = W31[w, 1 + t], AB[r1, j + t]
+                            end
+                            for t in 0:(j + jb - jj - 1)
+                                r1 = kv + 1 - t; r2 = kv + jp - t
+                                c = jj + t
+                                AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                            end
+                        end
+                    end
+                    if km > 0
+                        d = one(T) / AB[kv + 1, jj]
+                        for i in 1:km
+                            AB[kv + 1 + i, jj] *= d
+                        end
+                        # rank-1 update confined to the PANEL (jm), not to ju: everything right of
+                        # the panel is deferred to the trsm/gemm below.
+                        jm = min(ju, j + jb - 1)
+                        for c in 1:(jm - jj)
+                            ujj = AB[kv + 1 - c, jj + c]
+                            if ujj != z
+                                @simd ivdep for i in 1:km
+                                    AB[kv + 1 + i - c, jj + c] -= AB[kv + 1 + i, jj] * ujj
+                                end
+                            end
+                        end
+                    end
+                elseif info == 0
+                    info = jj
+                end
+                nw = min(jj - j + 1, i3)               # stash this column of A31 into W31
+                for t in 1:nw
+                    W31[t, jj - j + 1] = AB[kv + KL + t - jj + j, jj]
+                end
+            end
+
+            if j + jb <= n
+                j2 = min(ju - j + 1, kv) - jb
+                j3 = max(0, ju - j - kv + 1)
+
+                # row interchanges on A12/A22/A32 (DLASWP over the ld-1 view at AB(kv+1-jb, j+jb)),
+                # applied with the still-LOCAL ipiv values and composed in sequence.
+                for t in 1:jb
+                    ip = ipiv[j + t - 1]
+                    if ip != t
+                        for q in 0:(j2 - 1)
+                            r1 = kv + 1 - jb + t - 1 - q
+                            r2 = kv + 1 - jb + ip - 1 - q
+                            c = j + jb + q
+                            AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                        end
+                    end
+                end
+                for i in j:(j + jb - 1)                # LOCAL → GLOBAL, after the laswp
+                    ipiv[i] = ipiv[i] + j - 1
+                end
+
+                # A13/A23/A33 columnwise (DO 110): these columns are past the band window, so the
+                # swap is written out rather than expressed as a view.
+                k2 = j - 1 + jb + j2
+                for i in 1:j3
+                    jj = k2 + i
+                    for ii in (j + i - 1):(j + jb - 1)
+                        ip = ipiv[ii]                  # GLOBAL here
+                        if ip != ii
+                            r1 = kv + 1 + ii - jj; r2 = kv + 1 + ip - jj
+                            AB[r1, jj], AB[r2, jj] = AB[r2, jj], AB[r1, jj]
+                        end
+                    end
+                end
+
+                # L11 → dense scratch (deviation (1)): unit lower, strictly-upper zeroed so the
+                # kernel never reads live U11 through the aliasing triangle.
+                for q in 1:jb
+                    for p in 1:(q - 1); S[p, q] = z; end
+                    S[q, q] = one(T)
+                    for p in (q + 1):jb; S[p, q] = AB[kv + 1 + p - q, j + q - 1]; end
+                end
+                Lv = PtrMatrix(ps, jb, jb, nb)
+                A21v = _pb_blk(p0, ld2, ldabs, kv + 1 + jb, j, i2, jb)
+
+                if j2 > 0
+                    A12v = _pb_blk(p0, ld2, ldabs, kv + 1 - jb, j + jb, jb, j2)
+                    trsm!(A12v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
+                        alpha = one(T))
+                    if i2 > 0
+                        A22v = _pb_blk(p0, ld2, ldabs, kv + 1, j + jb, i2, j2)
+                        _gemm_core!(A22v, A21v, A12v, -one(T), one(T), false, false, false, false)
+                    end
+                    if i3 > 0
+                        A32v = _pb_blk(p0, ld2, ldabs, kv + KL + 1 - jb, j + jb, i3, j2)
+                        W31v = PtrMatrix(p31, i3, jb, ldw)
+                        _gemm_core!(A32v, W31v, A12v, -one(T), one(T), false, false, false, false)
+                    end
+                end
+
+                if j3 > 0
+                    for jj in 1:j3                     # lower triangle of A13 → W13
+                        for ii in jj:jb
+                            W13[ii, jj] = AB[ii - jj + 1, jj + j + kv - 1]
+                        end
+                    end
+                    W13v = PtrMatrix(p13, jb, j3, ldw)
+                    trsm!(W13v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
+                        alpha = one(T))
+                    if i2 > 0
+                        A23v = _pb_blk(p0, ld2, ldabs, 1 + jb, j + kv, i2, j3)
+                        _gemm_core!(A23v, A21v, W13v, -one(T), one(T), false, false, false, false)
+                    end
+                    if i3 > 0
+                        A33v = _pb_blk(p0, ld2, ldabs, 1 + KL, j + kv, i3, j3)
+                        W31v = PtrMatrix(p31, i3, jb, ldw)
+                        _gemm_core!(A33v, W31v, W13v, -one(T), one(T), false, false, false, false)
+                    end
+                    for jj in 1:j3                     # and back into the band
+                        for ii in jj:jb
+                            AB[ii - jj + 1, jj + j + kv - 1] = W13[ii, jj]
+                        end
+                    end
+                end
+            else
+                for i in j:(j + jb - 1)                # the reference adjusts in BOTH branches
+                    ipiv[i] = ipiv[i] + j - 1
+                end
+            end
+
+            # ── undo the panel interchanges on the LEFT columns (DO 170) ──────────────────────────
+            # Restores dgbtf2's unpermuted-L convention (see the header) and, as a side effect,
+            # restores A31 to upper-triangular so its triangle fits back inside the band. Strictly
+            # DECREASING jj: the swaps are involutions, so reversed order is the exact inverse.
+            for jj in (j + jb - 1):-1:j
+                jp = ipiv[jj] - jj + 1
+                if jp != 1
+                    if jp + jj - 1 < j + KL
+                        for t in 0:(jj - j - 1)
+                            r1 = kv + 1 + jj - j - t; r2 = kv + jp + jj - j - t
+                            c = j + t
+                            AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                        end
+                    else
+                        for t in 0:(jj - j - 1)
+                            r1 = kv + 1 + jj - j - t
+                            w = jp + jj - j - KL
+                            AB[r1, j + t], W31[w, 1 + t] = W31[w, 1 + t], AB[r1, j + t]
+                        end
+                    end
+                end
+                nw = min(i3, jj - j + 1)
+                for t in 1:nw
+                    AB[kv + KL + t - jj + j, jj] = W31[t, jj - j + 1]
+                end
+            end
+        end
+    end
+    return info
 end
 
 # gbtrs!(trans, kl, ku, m, AB, ipiv, B) → B.  Solve op(A)·X = B in place from gbtrf!'s factors.

@@ -116,7 +116,14 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                 if kstep == 2
                     t = A[k + 1, k]; A[k + 1, k] = A[kp, k]; A[kp, k] = t
                 end
-            elseif herm
+            end
+            if herm
+                # D is Hermitian, so its diagonal is real BY DEFINITION — any imaginary part is pure
+                # roundoff carried in by the trailing updates. This used to be an `elseif` on the
+                # no-interchange path only, and the interchange path realifies A[kk,kk]/A[kp,kp],
+                # which for a 2×2 pivot is A[k+1,k+1] and NEVER A[k,k] (kk = k+kstep-1). So a 2×2
+                # pivot *with* an interchange left A[k,k] complex: measured ~5e-8 relative residue
+                # against LAPACK's exact zero. Unconditional covers all four combinations.
                 A[k, k] = real(A[k, k])
                 kstep == 2 && (A[k + 1, k + 1] = real(A[k + 1, k + 1]))
             end
@@ -250,8 +257,9 @@ function _sytf2_upper!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                 if kstep == 2
                     t = A[k - 1, k]; A[k - 1, k] = A[kp, k]; A[kp, k] = t
                 end
-            elseif herm
-                A[k, k] = real(A[k, k])
+            end
+            if herm                                       # see _sytf2_lower!: kk = k-kstep+1 here,
+                A[k, k] = real(A[k, k])                   # so a 2×2 interchange missed A[k,k] too
                 kstep == 2 && (A[k - 1, k - 1] = real(A[k - 1, k - 1]))
             end
 

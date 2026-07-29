@@ -45,6 +45,9 @@ mutable struct L3Workspace{T}
     bandl::Matrix{T}      # _pbtrf_band:  pbtrf uplo='U' conj-transposed band re-pack, grows (kd+1)×n
     bandw::Matrix{T}      # _pbtrf_work:  pbtrf corner work array W, exactly (nb+1)×nb (ld is load-bearing)
     bands::Matrix{T}      # _pbtrf_work:  pbtrf dense diagonal-block scratch, exactly nb×nb (ld load-bearing)
+    gbw13::Matrix{T}      # _gbtrf_work:  gbtrf upper-corner WORK13, exactly (nb+1)×nb (ld load-bearing)
+    gbw31::Matrix{T}      # _gbtrf_work:  gbtrf lower-corner WORK31, exactly (nb+1)×nb (ld load-bearing)
+    gbs::Matrix{T}        # _gbtrf_work:  gbtrf dense L11 staging scratch, exactly nb×nb (ld load-bearing)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -53,6 +56,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
     Matrix{T}[],
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
 )
@@ -191,6 +195,41 @@ function _pbtrf_work(::Type{T}, nb::Int) where {T}
         s = Matrix{T}(undef, nb, nb); ws.bands = s
     end
     return w, s
+end
+
+# Blocked dgbtrf needs three dense scratches per call. Two are the reference's WORK13/WORK31: the
+# band's two CORNER blocks A13 and A31 fall outside the stored ldab window — A31[ii,jj] sits at
+# storage row kv+kl+1+ii-jj, which is ≤ ldab only for ii ≤ jj, and A13 symmetrically only for
+# ii ≥ jj — yet both fill in completely during the panel (A31 through the pivot swaps, A13 through
+# the trsm). So each is staged dense, exactly as dgbtrf does. The third, S, stages the unit-lower
+# L11 block: the strictly-upper triangle of an ld-1 band view anchored at AB(kv+1,j) IS U11, live
+# matrix data, and handing that to a triangular kernel is the aliasing bug banded_chol.jl:420-428
+# records costing a 4e-4 factor error. jb²/2 copies per panel is O(n·nb/2) total — noise.
+#
+# Shapes mirror the reference (LDWORK = NBMAX+1): W13/W31 are (nb+1)×nb, S is nb×nb. Size tests are
+# `!=`, NOT `>=`, for the same reason as `_pbtrf_work`: the kernels build `PtrMatrix(…, nb+1)` views
+# over these, so a *larger* stale buffer carries the WRONG ld and silently reads wrong elements.
+# W13/W31 are re-zeroed each call — their off-triangles must stay zero across panels, and which part
+# is "the off-triangle" moves with i3/j3.
+# Deliberately NOT sharing pbtrf's bandw/bands: the two routines tune to different nb, so alternating
+# them would reallocate on every call under the exact-size test.
+function _gbtrf_work(::Type{T}, nb::Int) where {T}
+    ws = _l3ws(T)
+    w13 = ws.gbw13
+    if size(w13, 1) != nb + 1 || size(w13, 2) != nb
+        w13 = Matrix{T}(undef, nb + 1, nb); ws.gbw13 = w13
+    end
+    fill!(w13, zero(T))
+    w31 = ws.gbw31
+    if size(w31, 1) != nb + 1 || size(w31, 2) != nb
+        w31 = Matrix{T}(undef, nb + 1, nb); ws.gbw31 = w31
+    end
+    fill!(w31, zero(T))
+    s = ws.gbs
+    if size(s, 1) != nb || size(s, 2) != nb
+        s = Matrix{T}(undef, nb, nb); ws.gbs = s
+    end
+    return w13, w31, s
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
