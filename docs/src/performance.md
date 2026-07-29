@@ -91,6 +91,48 @@ multiply+subtract (~6 cyc) and the backward sweep's divide sits *off* the chain,
 not depend on `B[i+1]`. Register-carrying the recurrence and hoisting the `uplo` test out of both loops
 were each measured and are neutral — LLVM already does both.
 
+### Triangular solves and the narrow-B `trsm`
+
+`A \ b` with a **single** right-hand side — the most common solve there is — ran **14× slower than
+OpenBLAS** until 2026-07-29. It had never been measured: `getrs`/`potrs`/`trtrs` existed only as
+C-ABI shims, and the benchmark harness compares `PureBLAS.foo!` against `LAPACK.foo!`, so with no
+native entry point there was nothing to call. Adding one turned up three separate defects, all in
+`trsm` rather than the solves:
+
+1. **The blocked setup is never repaid for narrow B.** It costs `O(k·nb²)` — a triangular inverse of
+   the diagonal blocks — amortised over B's columns. Measured at k=1024: 1123 µs at `nrhs=1` and
+   1197 µs at `nrhs=8`, i.e. eight solves for the price of one. Narrow B now sweeps `trsv`
+   per column, which beat OpenBLAS's own `trsm` by 2.9× on that shape.
+2. **A po2-`lda` A-pad that never paid.** When `stride(A,2)` was a power of two, all of A was copied
+   into an odd-`ld` scratch to dodge cache-set aliasing — `O(k²)` work, charged even to a
+   single-column B. Measured across **all sixteen** combinations of side × uplo × transA × B-width:
+   it cost between **+3% and +357%** and won nowhere, including at square B, where removing it
+   slightly *improved* the gate cell. Deleted.
+3. **A ragged SIMD lane costs a full lane.** The kernel processes B's columns in `W`-wide lanes, so
+   a partial lane is charged as a whole one. At k=512: `nrhs` = 1…7 cost 96/180/278/381/464/543/675 µs
+   — about 95 µs *per column* — while `nrhs=8` cost 94 µs in total. Widening a ragged B into scratch
+   before the solve collapses that (2.9–6.8× at k=512). This is the same defect the *upper* fused
+   leaf had, fixed there in an earlier campaign; it survived in the lower/notrans path, which is
+   exactly the one `getrs`/`potrs` use — hence `nrhs=1` being the worst case of all.
+
+Result, Zen4 vs OpenBLAS, `nrhs=1`, n = 8…2048:
+
+| | 8 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|---|---|---|
+| `getrs` before | 0.817 | 0.479 | 0.389 | 0.276 | 0.268 | 0.092 | **0.072** | 0.113 |
+| `getrs` after | 1.142 | 1.013 | 1.084 | 1.095 | 1.036 | 0.994 | 0.984 | 1.162 |
+| `potrs` after | 1.157 | 0.980 | 1.196 | 1.667 | 2.470 | **4.550** | **4.913** | 4.120 |
+
+A residual remains at `nrhs = 8`, which falls between the two mechanisms — too wide for the
+per-column sweep, and on Zen3 (`W=4`) already two full lanes, so the ragged-tail fix does not reach
+it either.
+
+The threshold guarding the sweep is worth recording as a tuning lesson: it was first written as
+`nrhs ≤ k/(4·_TRSM_DBASE)`, on the reasoning that a larger `k` amortises the setup over more columns.
+That was the wrong **shape** — blocked costs `setup + nrhs·b`, the sweep costs `nrhs·v`, and all three
+terms scale as `k²`, so the crossover is **`k`-invariant**. The growing rule selected the sweep
+exactly where it loses, and was itself the cause of the `nrhs=8` misses it was meant to fix.
+
 ## Complex (ComplexF64): CL1 / CL2 / CL3 / complex LAPACK
 
 The complex surface is SIMD across all levels, in portable SIMD.jl kernels (no x86 intrinsics);
