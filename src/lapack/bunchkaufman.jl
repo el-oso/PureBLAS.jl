@@ -127,7 +127,7 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         r1 = one(Tr) / real(A[k, k])
                         for j in (k + 1):n               # rank-1 downdate of lower A(k+1:n,k+1:n)
                             wj = r1 * conj(A[j, k])
-                            for i in j:n
+                            @simd ivdep for i in j:n
                                 A[i, j] -= A[i, k] * wj
                             end
                             A[j, k] *= r1                # scale column below diagonal
@@ -137,7 +137,7 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         d11 = one(T) / A[k, k]
                         for j in (k + 1):n
                             wj = d11 * A[j, k]
-                            for i in j:n
+                            @simd ivdep for i in j:n
                                 A[i, j] -= A[i, k] * wj
                             end
                             A[j, k] *= d11
@@ -156,7 +156,7 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         for j in (k + 2):n
                             wk = dm * (d11 * A[j, k] - d21 * A[j, k + 1])
                             wkp1 = dm * (d22 * A[j, k + 1] - conj(d21) * A[j, k])
-                            for i in j:n
+                            @simd ivdep for i in j:n
                                 A[i, j] -= A[i, k] * conj(wk) + A[i, k + 1] * conj(wkp1)
                             end
                             A[j, k] = wk; A[j, k + 1] = wkp1
@@ -171,7 +171,7 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         for j in (k + 2):n
                             wk = d21 * (d11 * A[j, k] - A[j, k + 1])
                             wkp1 = d21 * (d22 * A[j, k + 1] - A[j, k])
-                            for i in j:n
+                            @simd ivdep for i in j:n
                                 A[i, j] -= A[i, k] * wk + A[i, k + 1] * wkp1
                             end
                             A[j, k] = wk; A[j, k + 1] = wkp1
@@ -261,7 +261,7 @@ function _sytf2_upper!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         r1 = one(Tr) / real(A[k, k])
                         for j in 1:(k - 1)                # rank-1 downdate on ORIGINAL column k
                             wj = r1 * conj(A[j, k])
-                            for i in 1:j
+                            @simd ivdep for i in 1:j
                                 A[i, j] -= A[i, k] * wj
                             end
                         end
@@ -273,7 +273,7 @@ function _sytf2_upper!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
                         d11 = one(T) / A[k, k]
                         for j in 1:(k - 1)
                             wj = d11 * A[j, k]
-                            for i in 1:j
+                            @simd ivdep for i in 1:j
                                 A[i, j] -= A[i, k] * wj
                             end
                         end

@@ -69,7 +69,12 @@ function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) whe
                 for jj in (j + 1):ju                       # rank-1 trailing update within the band
                     ujj = AB[kv + 1 + j - jj, jj]          # U(j,jj)
                     if ujj != z
-                        for i in 1:km
+                        # `ivdep`: the loop STORES into column jj and LOADS from column j, and
+                        # jj > j always (jj runs j+1:ju), so they are distinct columns of AB and
+                        # cannot alias — but alias analysis cannot see that and otherwise has to
+                        # assume a store→load dependency. Measured 1.03–1.19× on the isolated
+                        # downdate, which is 87–97% of the whole routine.
+                        @simd ivdep for i in 1:km
                             AB[kv + 1 + i + j - jj, jj] -= AB[kv + 1 + i, j] * ujj  # A(j+i,jj) -= L(j+i,j)·U(j,jj)
                         end
                     end
