@@ -382,6 +382,16 @@ end
         @assert_trim_compatible P.gbtrf!(2, 1, n, randn(6, n))
         @assert_trim_compatible P.gbtrs!('N', 2, 1, n, copy(ABd2), gip, randn(n, 2))
         @assert_trim_compatible P.gbtrf!(2, 1, n, randn(ComplexF64, 6, n))
+        # BLOCKED path. The cells above are kl=2, so they can only ever reach `_gbtf2!` — a Base-only
+        # scalar kernel — and the blocked port would ship trim-unvalidated, which is exactly the
+        # failure the pbtrf item at test/lapack_tests.jl:24 is a post-mortem of. kl ≥ 2·nb is the
+        # dispatch gate; kl=32 clears it for every measured nb. This puts trsm!, _gemm_core!,
+        # PtrMatrix and the L3Workspace scratch inside gbtrf's trim call graph for the first time.
+        ldgb = 2 * 32 + 8 + 1
+        P.gbtrf!(32, 8, 64, randn(ldgb, 64))                 # warm the owned workspace first
+        P.gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
+        @assert_trim_compatible P.gbtrf!(32, 8, 64, randn(ldgb, 64))
+        @assert_trim_compatible P.gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
         # ── SPD tridiagonal (pttrf/pttrs/ptsv) — factor then solve ──
         Dp = fill(4.0, n); Ep = fill(1.0, n - 1); Df = copy(Dp); Ef = copy(Ep); P.pttrf!(Df, Ef)
         @assert_trim_compatible P.pttrf!(fill(4.0, n), fill(1.0, n - 1))

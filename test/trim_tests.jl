@@ -102,6 +102,10 @@
         PureBLAS.dsytrf_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
         PureBLAS.zhetrf_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Clong),
         PureBLAS.zhetrs_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Clong),
+        # gbtrf was absent here while it was pure Base scalar code — defensible then, not once the
+        # blocked path pulled trsm!/_gemm_core!/PtrMatrix/L3Workspace into its call graph. 0 chars.
+        PureBLAS.dgbtrf_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}),
+        PureBLAS.zgbtrf_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}),
         PureBLAS.dgeqp3_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
         PureBLAS.zgeqp3_64_(Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Int64}, Ptr{ComplexF64}, Ptr{ComplexF64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}),
         PureBLAS.dgels_64_(Ptr{UInt8}, Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}, Clong),
