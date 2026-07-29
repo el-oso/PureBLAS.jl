@@ -47,6 +47,9 @@ const _prev_pbns = load_preference(PUREBLAS_UUID, "pbtrf_nb_small")
 # And `pptrf_spr_min`: the packed lower path's spr!-vs-inline cutoff is a Measure-tier
 # OncePerProcess race. 8 is the Zen4 F64 optimum (= W).
 const _prev_ppsm = load_preference(PUREBLAS_UUID, "pptrf_spr_min")
+# And `gbtrf_nb`: the banded-LU panel width is a Measure-tier OncePerProcess race, and a runtime
+# benchmark is not trim-safe. 16 is the Zen4/Zen3 F64 optimum (both boxes agree in absolute terms).
+const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
@@ -54,6 +57,7 @@ set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band p
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => 8; force = true)       # packed lower spr-vs-inline cutoff (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => 16; force = true)           # banded-LU panel width (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -89,7 +93,12 @@ finally
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => _prev_pbns; force = true)
     end
-    if _prev_ppsm === nothing
+    if _prev_gbnb === nothing
+    delete_preferences!(PUREBLAS_UUID, "gbtrf_nb"; force = true)
+else
+    set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => _prev_gbnb; force = true)
+end
+if _prev_ppsm === nothing
         delete_preferences!(PUREBLAS_UUID, "pptrf_spr_min"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => _prev_ppsm; force = true)

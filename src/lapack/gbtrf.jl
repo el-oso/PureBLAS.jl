@@ -22,15 +22,77 @@
 @inline _gb_cabs1(x::Real) = abs(x)
 @inline _gb_cabs1(z::Complex) = abs(real(z)) + abs(imag(z))
 
-# PDM tier: MEASURE — PROVISIONAL, currently pinned to the _LU_NB anchor pending the auto-tune.
-# Not Derive: this is a panel-vs-rank-nb-gemm crossover, not a cache-residency block, and the tell
-# for Measure is on record — `_pbtrf_nb` (banded_chol.jl:110-125) found 32 to be a SHARP local
-# minimum, worse than both 24 and 40, i.e. a residency model mispredicts a box we own.
-# The anchor is `_LU_NB` because dense right-looking LU faces the identical tradeoff (a pivoted
-# BLAS-2 panel amortized against a rank-nb BLAS-3 trailing update); `_pstrf_nb` reuses it for the
-# same reason. See the campaign plan: the Measure ladder lands in the next step with the candidate
-# bracket {½,¾,1,5⁄4,3⁄2,2}·_LU_NB.
-@inline _gbtrf_nb(::Type{T}) where {T} = _LU_NB
+# PDM tier: MEASURE. Not Derive — a cache-residency model is FALSIFIED here on boxes we own. The
+# panel is (kl+1)×nb, so "panel fits L1" gives nb ≤ L1/((kl+1)·sizeof(T)): 32 at kl=128, 16 at
+# kl=256, 8 at kl=512 (Zen4 F64). Measured optima are 16, 16-24 and 24-32 — the model is wrong at
+# both ends and in opposite directions. What remains is a panel/port-balance crossover, exactly the
+# case `_pbtrf_nb` (banded_chol.jl:110-125) documents.
+#
+# The anchor is `_LU_NB`: dense right-looking LU faces the physically identical tradeoff (a pivoted
+# BLAS-2 panel amortized against a rank-nb BLAS-3 trailing update), which is also why `_pstrf_nb`
+# reuses it. The bracket is widened DOWNWARD rather than centred on the anchor as pbtrf's is, and
+# that asymmetry is reasoned, not fitted: gbtrf's trailing update is bounded by the BAND (kl, ku),
+# not by n, so each panel amortizes over a far smaller trailing region than dense LU and the optimum
+# necessarily sits below the dense anchor. Measurement agrees — 16-24 against _LU_NB's 48.
+# NOT scaled by _vwidth: `_pbtrf_nb` records that bracketing on multiples of W was wrong (a W=4 box
+# could then only reach 32 and measured 0.74-1.01), and here the two µarchs' optima coincide in
+# ABSOLUTE terms (Zen4 W=8 and Zen3 W=4 both land on 16-24), which W-scaling would break.
+#
+# Measured PB/OB after the trsm tiny-k bypass fix (freq-locked, kl = ku = n/8):
+#           Zen4                              Zen3
+#   kl   16    24    32    48    64      16    24    32    48    64
+#   64  1.80  1.62  1.44  1.29  1.07    1.62  1.50  1.35  1.20  0.99
+#   128 1.54  1.46  1.35  1.21  1.06    1.32  1.30  1.17  1.07  0.89
+#   256 1.33  1.33  1.27  1.20  1.09    1.21  1.21  1.14  1.09  0.98
+#   512 1.17  1.19  1.20  1.17  1.13    1.36  1.42  1.38  1.36  1.26
+const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
+@static if isnothing(_GBTRF_NB_PREF)
+    function _measure_gbtrf_nb(::Type{T})::Int where {T}
+        nb0 = _LU_NB
+        Base.generating_output() && return nb0        # don't burn a measure during precompilation
+        try
+            kl = 4 * nb0                              # representative wide band (nb0=48 → 192)
+            ku = kl
+            nloc = 8 * kl                             # ≥8 panel rounds at the largest candidate
+            ldab = 2 * kl + ku + 1
+            ABm = Matrix{T}(undef, ldab, nloc)
+            ipv = Vector{Int}(undef, nloc)
+            refill! = () -> begin                     # diagonally-dominant band (mirrors bench `_gbd`)
+                fill!(ABm, one(T))
+                @inbounds for j in 1:nloc
+                    ABm[kl + ku + 1, j] = T(4 * (kl + ku))
+                end
+            end
+            best = nb0; tbest = typemax(UInt64)
+            for c in (nb0 ÷ 6, nb0 ÷ 4, nb0 ÷ 3, nb0 >> 1, (3 * nb0) >> 2, nb0)
+                nb = min(c, kl)
+                nb < 1 && continue
+                refill!(); _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)     # untimed warmup (absorb JIT)
+                t = typemax(UInt64)
+                for _ in 1:3
+                    refill!(); s = time_ns()
+                    _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)
+                    t = min(t, time_ns() - s)
+                end
+                t < tbest && (tbest = t; best = nb)
+            end
+            return best
+        catch
+            return nb0                                # any failure ⇒ the anchor, never a bad nb
+        end
+    end
+    const _GBTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(Float64))
+    const _GBTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(Float32))
+    const _GBTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(ComplexF64))
+    const _GBTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(ComplexF32))
+    @inline _gbtrf_nb(::Type{Float64}) = _GBTRF_NB_F64()
+    @inline _gbtrf_nb(::Type{Float32}) = _GBTRF_NB_F32()
+    @inline _gbtrf_nb(::Type{ComplexF64}) = _GBTRF_NB_C64()
+    @inline _gbtrf_nb(::Type{ComplexF32}) = _GBTRF_NB_C32()
+    @inline _gbtrf_nb(::Type{T}) where {T} = _LU_NB      # generic/AD never blocks; never consulted
+else
+    @inline _gbtrf_nb(::Type{T}) where {T} = _GBTRF_NB_PREF::Int   # pinned (trim builds land here)
+end
 
 # gbtrf!(kl, ku, m, AB) → (AB, ipiv, info).  AB overwritten with L\U in band storage; ipiv the
 # min(m,n) pivot rows; info = index of the first exactly-zero pivot (0 if none). Allocates ipiv and
