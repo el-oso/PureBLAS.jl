@@ -1120,68 +1120,100 @@ function _sytrf_blocked_upper!(
     return info
 end
 
-# PDM tier: MEASURE. Panel/port-balance crossover, same class as `_pbtrf_nb` and `_gbtrf_nb`; anchor
-# is `_LU_NB` for the reason `_pstrf_nb` also reuses it (a pivoted BLAS-2 panel amortized against a
-# rank-nb BLAS-3 trailing update is the physically identical shape), bracket widened downward because
-# dlasyf's panel does up to TWICE getrf's BLAS-2 work per column — the ROWMAX branch fires a second
-# full-height gemv — so its optimum sits below the dense anchor. Measured Zen4 F64 PB/OB, indefinite:
-#     n     nb=8   16    24    32    48    64    96
-#     128   1.29  1.58  1.62  1.46  1.26  1.28  1.05
-#     256   1.32  1.67  1.55  1.47  1.34  1.18  0.97
-#     512   1.10  1.46  1.54  1.41  1.28  1.13  0.94
-#     1024  0.83  1.13  1.21  1.23  1.17  1.09  0.95
-#     2048  0.68  0.90  1.01  1.08  1.09  1.06  0.99
-# The optimum DRIFTS with n (≈√n: 16/24/32/48 at n=256/512/1024/2048), so a single constant cannot be
-# optimal everywhere. It is measured at a LARGE probe size on purpose: the ratio is tightest at the
-# big end (1.08-1.09 at n=2048 vs 1.5-1.7 at mid n), so a knob tuned there gates everywhere, while
-# one tuned at mid n would land on 24 and leave n=2048 at 1.01. Promoting to an n-scaled formula is
-# the identified refinement; the data above is the record to derive it from.
+# PDM tier: DERIVE — and unusually for this file, the formula is over a PROBLEM parameter (n) with NO
+# machine-dependent constant in it, which is why it needs no Pin and no OncePerProcess (so it is also
+# trim-safe, with nothing to pin in juliac/build.jl).
+#
+# The shape nb ~ sqrt(n) is EMPIRICAL, established on the fleet rather than derived from a residency
+# argument — the same status, and the same precedent, as `_lu_nb` (lu.jl:6-19), whose n-formula and
+# clamp bounds are likewise measured-validated literals explicitly documented as NOT derived. A
+# residency model is falsified here: panel-fits-L1 gives a bound that DECREASES with n, while the
+# measured optimum RISES with n.
+#
+# Prediction vs per-cell argmax, Zen4 freq-locked, PB/OB (pred = 8*ceil(isqrt(n)/8), clamp [16,96]):
+#   sytrf F64   n=128 pred16 1.61 (best 24: 1.65)   n=256 pred16 1.73*   n=512 pred24 1.53*
+#               n=1024 pred32 1.28*                 n=2048 pred48 1.11*
+#   hetrf C64   n=128 pred16 1.17*   n=256 pred16 1.35*   n=512 pred24 1.22 (best 32: 1.23)
+#               n=1024 pred32 1.16*                 n=2048 pred48 1.14 (best 64: 1.16)
+# 7 of 10 cells hit the argmax exactly; the worst miss costs 2.4%. It beats a single measured constant
+# where the gate is tightest: F64 n=2048 reaches 1.11 against 1.02 for the nb=24 the measure ladder
+# selected, and for C64 the formula wins at EVERY size against that ladder's nb=48.
+#
+# The clamp bounds are measured, not guessed: nb=8 loses at every size on both types (0.70-1.38 — the
+# panel gemv stops amortizing), and nb=96 never wins (<= 1.12 everywhere — the trailing gemms rank too
+# high for what the panel buys). 8 is a rounding quantum rather than a tuning value; the response is
+# flat enough between adjacent multiples (<3%) that it does not matter.
+#
+# A Preference still overrides, for calibration or to A/B the formula on an unseen box.
+#
+# THE FLEET SPLIT — this is the D-vs-M decision made by measurement, not by preference. Running the
+# same sweep on Zen3 (galen, W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
+#
+#   sytrf F64, Zen3 PB/OB at the predicted nb:  1.44  1.47  1.37  1.24  1.17   (n=128…2048)
+#     gates at every size; argmax differs at n=128 (24: 1.58) and n=2048 (96: 1.19), worst loss 9%.
+#   hetrf C64, Zen3 PB/OB at the predicted nb:  1.02  0.97  0.95  0.96  1.03
+#     THREE GATE MISSES. Zen3 argmax is 32/48/48/96/96 against Zen4 s 16/16/32/32/64 — roughly a
+#     factor of two, i.e. the complex optimum is MICROARCHITECTURE-dependent while the real one is not.
+#
+# So: real is DERIVE (the formula, fleet-validated on two µarchs), and complex is MEASURE over a
+# multiplier of that same shape — which is what the PDM ladder prescribes for a knob whose optimum our
+# own model mispredicts on a box we own. The candidate set is derived (small integer multiples of the
+# validated real shape), so both the bounds and the selection adapt to unseen hardware. Checked: on
+# Zen3 multiplier 2 gives 1.19/1.15/1.09/1.07/1.12 — every cell gates; on Zen4 multiplier 1 gives
+# 1.17/1.35/1.22/1.16/1.14. The likely mechanism is that a complex rank-k gemm needs a larger k to
+# reach peak on AVX2 than on AVX-512 (cf. `_clu_nb`, lu.jl:24-29, which grows faster than `_lu_nb`
+# for exactly that reason) — plausible but NOT verified, so the knob is measured rather than modelled.
 const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
+@inline _sytrf_nb_shape(n::Int) = 8 * cld(isqrt(n), 8)
 @static if isnothing(_SYTRF_NB_PREF)
-    function _measure_sytrf_nb(::Type{T})::Int where {T}
-        nb0 = _LU_NB
-        Base.generating_output() && return nb0
+    @inline _sytrf_nb(::Type{T}, n::Int) where {T <: BlasReal} =
+        clamp(_sytrf_nb_shape(n), 16, 96)
+    # Measure the multiplier once per process, on a Hermitian probe at a representative size.
+    function _measure_sytrf_cmult(::Type{T})::Int where {T}
+        Base.generating_output() && return 1
         try
-            nloc = 16 * nb0                                # 768: large enough that the big-n regime
-            Am = Matrix{T}(undef, nloc, nloc)               # governs, small enough to stay ~100 ms
+            nloc = 384
+            Am = Matrix{T}(undef, nloc, nloc)
             ipv = Vector{Int}(undef, nloc)
-            refill! = () -> begin                           # indefinite symmetric, deterministic
+            refill! = () -> begin                       # deterministic Hermitian indefinite
+                R = real(T)
                 @inbounds for j in 1:nloc, i in 1:nloc
-                    Am[i, j] = T(((i * 7 + j * 13) % 101) - 50) / T(50)
+                    re = R(((i * 7 + j * 13) % 101) - 50) / R(50)
+                    ip = R(((i * 11 + j * 5) % 97) - 48) / R(48)
+                    Am[i, j] = T(re, ip)
                 end
-                @inbounds for j in 1:nloc, i in (j + 1):nloc
-                    Am[i, j] = Am[j, i]
+                @inbounds for j in 1:nloc
+                    for i in (j + 1):nloc; Am[i, j] = conj(Am[j, i]); end
+                    Am[j, j] = real(Am[j, j])
                 end
             end
-            best = nb0; tbest = typemax(UInt64)
-            for c in (nb0 ÷ 6, nb0 ÷ 4, nb0 ÷ 3, nb0 >> 1, (3 * nb0) >> 2, nb0)
-                nb = c
-                (nb < 1 || nb >= nloc) && continue
-                refill!(); _sytrf_blocked_lower!(Am, ipv, nb, false)  # untimed warmup
+            best = 1; tbest = typemax(UInt64)
+            for m in (1, 2, 3, 4)
+                nb = clamp(m * _sytrf_nb_shape(nloc), 16, 96)
+                nb >= nloc && continue
+                refill!(); _sytrf_blocked_lower!(Am, ipv, nb, true)      # untimed warmup
                 t = typemax(UInt64)
                 for _ in 1:3
                     refill!(); s = time_ns()
-                    _sytrf_blocked_lower!(Am, ipv, nb, false)
+                    _sytrf_blocked_lower!(Am, ipv, nb, true)
                     t = min(t, time_ns() - s)
                 end
-                t < tbest && (tbest = t; best = nb)
+                t < tbest && (tbest = t; best = m)
             end
             return best
         catch
-            return nb0
+            return 2                                    # the safer default: 1 MISSES on Zen3
         end
     end
-    const _SYTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float64))
-    const _SYTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(Float32))
-    const _SYTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(ComplexF64))
-    const _SYTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_nb(ComplexF32))
-    @inline _sytrf_nb(::Type{Float64}) = _SYTRF_NB_F64()
-    @inline _sytrf_nb(::Type{Float32}) = _SYTRF_NB_F32()
-    @inline _sytrf_nb(::Type{ComplexF64}) = _SYTRF_NB_C64()
-    @inline _sytrf_nb(::Type{ComplexF32}) = _SYTRF_NB_C32()
-    @inline _sytrf_nb(::Type{T}) where {T} = _LU_NB
+    const _SYTRF_CMULT_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF64))
+    const _SYTRF_CMULT_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF32))
+    @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
+        clamp(_SYTRF_CMULT_C64() * _sytrf_nb_shape(n), 16, 96)
+    @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
+        clamp(_SYTRF_CMULT_C32() * _sytrf_nb_shape(n), 16, 96)
+    @inline _sytrf_nb(::Type{T}, n::Int) where {T} = clamp(_sytrf_nb_shape(n), 16, 96)
 else
-    @inline _sytrf_nb(::Type{T}) where {T} = _SYTRF_NB_PREF::Int
+    @inline _sytrf_nb(::Type{T}, n::Int) where {T} = _SYTRF_NB_PREF::Int   # pinned (trim lands here)
 end
 
 # Dispatch. Gated on `_strided1`, NOT `A isa StridedMatrix`: cabi_lapack.jl calls sytrf!/hetrf! with
@@ -1197,7 +1229,7 @@ end
 @inline function _bk_factor!(A::AbstractMatrix{T}, ipiv, lower::Bool, herm::Bool) where {T}
     n = size(A, 1)
     if T <: BlasFloat && _strided1(A)
-        nb = _sytrf_nb(T)
+        nb = _sytrf_nb(T, n)
         if nb > 1 && nb < n
             return lower ? _sytrf_blocked_lower!(A, ipiv, nb, herm) :
                 _sytrf_blocked_upper!(A, ipiv, nb, herm)
