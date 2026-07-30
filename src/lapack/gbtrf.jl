@@ -22,76 +22,37 @@
 @inline _gb_cabs1(x::Real) = abs(x)
 @inline _gb_cabs1(z::Complex) = abs(real(z)) + abs(imag(z))
 
-# PDM tier: MEASURE. Not Derive — a cache-residency model is FALSIFIED here on boxes we own. The
-# panel is (kl+1)×nb, so "panel fits L1" gives nb ≤ L1/((kl+1)·sizeof(T)): 32 at kl=128, 16 at
-# kl=256, 8 at kl=512 (Zen4 F64). Measured optima are 16, 16-24 and 24-32 — the model is wrong at
-# both ends and in opposite directions. What remains is a panel/port-balance crossover, exactly the
-# case `_pbtrf_nb` (banded_chol.jl:110-125) documents.
+# PDM tier: DERIVE, as a formula over the BAND WIDTH kl — a problem parameter, not a machine one, so
+# it const-folds, is trim-safe, and needs nothing pinned in juliac/build.jl.
 #
-# The anchor is `_LU_NB`: dense right-looking LU faces the physically identical tradeoff (a pivoted
-# BLAS-2 panel amortized against a rank-nb BLAS-3 trailing update), which is also why `_pstrf_nb`
-# reuses it. The bracket is widened DOWNWARD rather than centred on the anchor as pbtrf's is, and
-# that asymmetry is reasoned, not fitted: gbtrf's trailing update is bounded by the BAND (kl, ku),
-# not by n, so each panel amortizes over a far smaller trailing region than dense LU and the optimum
-# necessarily sits below the dense anchor. Measurement agrees — 16-24 against _LU_NB's 48.
-# NOT scaled by _vwidth: `_pbtrf_nb` records that bracketing on multiples of W was wrong (a W=4 box
-# could then only reach 32 and measured 0.74-1.01), and here the two µarchs' optima coincide in
-# ABSOLUTE terms (Zen4 W=8 and Zen3 W=4 both land on 16-24), which W-scaling would break.
+# This replaced a Measure-tier OncePerProcess that selected a single constant, and measurement forced
+# the replacement: that ladder probed at kl=192 and picked nb=16, but sweeping kl end to end shows the
+# optimum MOVES with kl, so no constant can be right. Zen4 F64, freq-locked, PB/OB, winner starred
+# (kl = ku = n/8, the bench shape):
+#   kl    16    20    24    32    40    48    64    80    96   128   192   256   384   512
+#   nb=8 0.97* 1.00* 1.20* 1.42* 1.73* 1.51* 1.93* 1.72* 1.68* 1.47  1.34  1.16  1.08  0.90
+#   nb=16                  1.25              1.81             1.53* 1.42* 1.31  1.21  1.15
+#   nb=24                  1.10              1.63             1.45  1.37  1.31* 1.22* 1.18*
+# 8 for kl <= 96, 16 for kl in 128..192, 24 from 256 — one step per 128 of band width, which
+# `8 * (1 + kl ÷ 128)` reproduces at EVERY measured point. The response is flat within 1-3% either side
+# of the winner, so the step positions are not delicate.
 #
-# Measured PB/OB after the trsm tiny-k bypass fix (freq-locked, kl = ku = n/8):
-#           Zen4                              Zen3
-#   kl   16    24    32    48    64      16    24    32    48    64
-#   64  1.80  1.62  1.44  1.29  1.07    1.62  1.50  1.35  1.20  0.99
-#   128 1.54  1.46  1.35  1.21  1.06    1.32  1.30  1.17  1.07  0.89
-#   256 1.33  1.33  1.27  1.20  1.09    1.21  1.21  1.14  1.09  0.98
-#   512 1.17  1.19  1.20  1.17  1.13    1.36  1.42  1.38  1.36  1.26
+# The blocking gate `kl >= 2*nb` then admits kl >= 16 (nb=8), which is right: at kl=8 and 12 the
+# UNBLOCKED kernel wins outright (1.31 and 1.13, against 0.86/0.95 blocked), so the gate declines
+# exactly where it should. i2 = kl-nb >= nb still holds by construction.
+#
+# RESIDUAL, diagnosed rather than left open: kl=16 reaches only 0.97. The unblocked kernel is 0.796
+# there and no nb rescues it past 0.97 — and the reason is that OpenBLAS is ALSO unblocked at that
+# width (its ILAENV nb=64 exceeds kl, so dgbtrf takes the dgbtf2 branch). We are losing to OpenBLAS's
+# *unblocked* band downdate, not to its blocking, so the remaining lever is the quality of `_gbtf2!`'s
+# rank-1 band update against dger — NOT the panel width. Worth stating because the obvious next move,
+# routing that loop through `_ger!`, is the shape that has failed three times already on BLAS-2 entry
+# overhead; it needs measuring, not assuming.
 const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
 @static if isnothing(_GBTRF_NB_PREF)
-    function _measure_gbtrf_nb(::Type{T})::Int where {T}
-        nb0 = _LU_NB
-        Base.generating_output() && return nb0        # don't burn a measure during precompilation
-        try
-            kl = 4 * nb0                              # representative wide band (nb0=48 → 192)
-            ku = kl
-            nloc = 8 * kl                             # ≥8 panel rounds at the largest candidate
-            ldab = 2 * kl + ku + 1
-            ABm = Matrix{T}(undef, ldab, nloc)
-            ipv = Vector{Int}(undef, nloc)
-            refill! = () -> begin                     # diagonally-dominant band (mirrors bench `_gbd`)
-                fill!(ABm, one(T))
-                @inbounds for j in 1:nloc
-                    ABm[kl + ku + 1, j] = T(4 * (kl + ku))
-                end
-            end
-            best = nb0; tbest = typemax(UInt64)
-            for c in (nb0 ÷ 6, nb0 ÷ 4, nb0 ÷ 3, nb0 >> 1, (3 * nb0) >> 2, nb0)
-                nb = min(c, kl)
-                nb < 1 && continue
-                refill!(); _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)     # untimed warmup (absorb JIT)
-                t = typemax(UInt64)
-                for _ in 1:3
-                    refill!(); s = time_ns()
-                    _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)
-                    t = min(t, time_ns() - s)
-                end
-                t < tbest && (tbest = t; best = nb)
-            end
-            return best
-        catch
-            return nb0                                # any failure ⇒ the anchor, never a bad nb
-        end
-    end
-    const _GBTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(Float64))
-    const _GBTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(Float32))
-    const _GBTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(ComplexF64))
-    const _GBTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_nb(ComplexF32))
-    @inline _gbtrf_nb(::Type{Float64}) = _GBTRF_NB_F64()
-    @inline _gbtrf_nb(::Type{Float32}) = _GBTRF_NB_F32()
-    @inline _gbtrf_nb(::Type{ComplexF64}) = _GBTRF_NB_C64()
-    @inline _gbtrf_nb(::Type{ComplexF32}) = _GBTRF_NB_C32()
-    @inline _gbtrf_nb(::Type{T}) where {T} = _LU_NB      # generic/AD never blocks; never consulted
+    @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = clamp(8 * (1 + kl ÷ 128), 8, 48)
 else
-    @inline _gbtrf_nb(::Type{T}) where {T} = _GBTRF_NB_PREF::Int   # pinned (trim builds land here)
+    @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = _GBTRF_NB_PREF::Int
 end
 
 # gbtrf!(kl, ku, m, AB) → (AB, ipiv, info).  AB overwritten with L\U in band storage; ipiv the
@@ -100,7 +61,7 @@ end
 function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) where {T}
     _, n = size(AB)
     ipiv = Vector{Int}(undef, min(Int(m), n))
-    nb = _gbtrf_nb(T)
+    nb = _gbtrf_nb(T, Int(kl))
     # Blocking only pays when the in-band trailing block A22 is at least as tall as the panel is
     # wide (i2 = kl-nb ≥ nb). Reference dgbtrf's structural condition is the weaker nb ≤ kl, but at
     # nb ≈ kl every trailing flop funnels through the dense corners instead of the band — the same
