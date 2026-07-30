@@ -81,6 +81,16 @@ end
     GC.@preserve x begin
         va = V(a)
         i = 0
+        # FALSIFIED 2026-07-30 (wintermute, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
+        # n=1e6 (8 MB against a 16 MB L3, doubled by RMW read + dirty-writeback) and gates everywhere
+        # smaller. Deepening the unroll to 8 for that regime — i.e. 8 cache lines in flight instead of
+        # 4 — moved it 0.91 → 0.92, noise. So lines-in-flight is NOT the mechanism; do not re-try depth.
+        # Also do not re-try NON-TEMPORAL stores: this is a load+store to the SAME address (an RMW), the
+        # line is already resident from the load so there is no RFO to skip, and NT on the identical
+        # structure was measured at ger n=1024 0.99 → 0.45 (see kb pureblas-zen5-ger).
+        # Note `_UNROLL = 4`'s upstream justification ("reductions use 4 independent accumulators so the
+        # FMA/add latency is hidden") does NOT apply here — `_scal_simd!` has no accumulator — but the
+        # measurement above says the value is not what is costing us, so it stays.
         while i + step <= n
             o = i * sz
             vstore(va * vload(V, px + o), px + o)
