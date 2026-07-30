@@ -44,9 +44,9 @@ size crossover — **beats** OpenBLAS at large `n`.
 | LU | getrf, gesv | s/d/c/z | ✅ | 🐢 | 1.37 / 1.03 | 1.76 / 0.98 |
 | LU solve | getrs [^solv] | s/d/c/z | ✅ | 🐢 | 1.05 / 0.99 | 0.93 / 0.85 |
 | QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | 🐢 | 1.94 / 1.65 | 1.54 / 0.93 |
-| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 🐢 | 0.34 / 0.18 | 0.31 / 0.17 |
-| Bunch–Kaufman | sytrf, hetrf [^unblk] | s/d/c/z | ✅ | 🐢 | 0.56 / 0.15 | 0.59 / 0.15 |
-| Bunch–Kaufman solve | sytrs, hetrs [^unblk] | s/d/c/z | ✅ | 🐢 | 0.86 / 0.52 | 1.1 / 0.47 |
+| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 🐢 | 0.34 / 0.18 | 0.34 / 0.19 |
+| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 🐢 | 1.39 / 1.04 | 1.40 / 0.99 |
+| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 🐰 | 1.68 / 1.43 | 2.16 / 1.34 |
 | Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | 🐢 | 1.11 / 1.02 | 1.07 / 0.88 |
 | Least-squares | gels | s/d/c/z | ✅ | 🐰 | 2.42 / 1.93 | 1.88 / 1.28 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 🐰 | 1.23 / 1.12 | 1.17 / 1.05 |
@@ -91,7 +91,7 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | 🐢 | 0.96 / 0.48 | 0.78 / 0.34 |
+| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | 🐢 | 1.49 / 0.93 | 1.19 / 0.72 |
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 🐰 | 1.0 / 1.0 | 1.03 / 1.03 |
 | SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | 🐢 | 1.13 / 1.13 | 1.0 / 0.99 |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 🐰 | 1.52 / 1.12 | 1.41 / 1.03 |
@@ -119,27 +119,64 @@ once the re-pack's diagonal walk starts to dominate. The panel width likewise ha
 regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
 routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 
-[^unblk]: **Measured as unblocked.** `geqp3` and `sytrf`/`sytrs` are BLAS-2 implementations racing
-    blocked BLAS-3 ones, and their ratios degrade monotonically with `n` — the signature. Zen4 gate
-    sweep (geomean / worst, n = 8…4096): `geqp3` **0.34 / 0.18** vs OpenBLAS and **0.31 / 0.17** vs
-    AOCL — the worst routine in the real LAPACK surface; `sytrf` **0.56 / 0.15** and 0.59 / 0.15;
-    `sytrs` 0.86 / 0.52 and 1.10 / 0.47. Both are confirmed from source, not inferred:
-    `geqp3.jl`'s header states it is the unblocked core, and `sytrf!` calls `_sytf2_*` directly with
-    no blocked driver at all. These had **never been benchmarked** before 2026-07-29 — they routed
-    and passed correctness, which reads as coverage while measuring nothing.
+[^unblk]: **Measured as unblocked.** `geqp3` is a BLAS-2 implementation racing a blocked BLAS-3 one,
+    and its ratio degrades monotonically with `n` — the signature. Zen4 gate sweep (geomean / worst,
+    n = 8…4096): **0.34 / 0.18** vs OpenBLAS and **0.34 / 0.19** vs AOCL — the worst routine in the
+    real LAPACK surface. Confirmed from source, not inferred: `geqp3.jl`'s header states it is the
+    unblocked core. It had **never been benchmarked** before 2026-07-29 — it routed and passed
+    correctness, which reads as coverage while measuring nothing.
+    `sytrf`/`sytrs` were in exactly the same state and no longer are; see [^bk].
     A blocked `dlaqps` port for `geqp3` was written and **verified correct** (pivots and R identical
     to LAPACK, reconstruction to 1e-13, over full-rank/rank-deficient/graded input) but was **not
     faster**, and larger panels were *worse* — the diagnostic that the cost is the panel's own
     per-column BLAS-2 calls, not the trailing gemm. It is reverted, not shipped. The retry must reach
-    the kernels pointer-direct; see §5 of [Tuning](tuning.md) and the note on `sytrs`, where two
-    codegen hazards (an unforwarded store-to-load and a per-element `herm ?` branch) were worth
-    +11–18%.
+    the kernels pointer-direct; see §5 of [Tuning](tuning.md).
 
+[^bk]: **Blocked since 2026-07-30.** `sytrf`/`hetrf` dispatched straight to the unblocked `_sytf2_*`
+    (rank-1/rank-2 BLAS-2 column downdates) against OpenBLAS's blocked `dlasyf` — hence the old
+    0.56 / 0.15 and 0.59 / 0.15, and `hetrf` measuring **0.116** vs OpenBLAS at n=1024. All four
+    variants are now blocked: real-symmetric and complex-symmetric through a `dlasyf` port, Hermitian
+    through a separate `zlahef` port, both `uplo`. `zlahef` is deliberately NOT `dlasyf` plus a few
+    conjugations — it realifies the diagonal at points that have no symmetric counterpart, and its
+    2×2 inverse is asymmetric in the conjugates with the asymmetry FLIPPING between triangles.
+    Speedup over the kernel replaced: 1.5–2.9× real, 9.8× Hermitian, 11.3× complex-symmetric at
+    n = 1024–2048. Dispatch-path PB/OB, freq-locked, `uplo='L'`, n = 64…2048:
 
-[^gb]: `gbtrf` has no clean shape — Zen4 vs OpenBLAS 1.44 / 1.30 / 0.79 / 1.11 / 1.08 / 0.66 at
-    n = 32…1024, and vs AOCL 1.06 / 0.89 / 0.60 / 1.25 / 1.12 / 0.44 (gate sweep: 0.96 / 0.48 and
-    0.78 / 0.34). The dips at n=128 and n=1024 are undiagnosed and should not be assumed to share a
-    cause with the unblocked routines above.
+    | | Zen4 | Zen3 |
+    |---|---|---|
+    | `sytrf` F64 | 1.26 / 1.60 / 1.69 / 1.50 / 1.24 / 1.10 | 1.28 / 1.42 / 1.46 / 1.38 / 1.22 / 1.15 |
+    | `hetrf` C64 | 1.37 / 1.16 / 1.33 / 1.20 / 1.16 / 1.13 | 1.37 / 1.16 / 1.17 / 1.06 / 1.07 / 1.12 |
+    | `zsytrf` C64 | 1.27 / 1.10 / 1.16 / 1.08 / 1.08 / 1.08 | 1.33 / 1.03 / 1.05 / 1.00 / 1.01 / 1.08 |
+
+    The row is 🐢 rather than 🐰 on ONE cell: vs AOCL on Zen4 the gate sweep reads 1.40 / **0.99**,
+    from n=2048 measuring 0.98–1.02 across rounds — parity within noise rather than a structural gap.
+    Every other size clears, and on **Zen3 both references clear outright** (1.34 / 1.04 vs OpenBLAS,
+    1.49 / 1.17 vs AOCL). The panel width is `8·⌈√n/8⌉` clamped to [16,96] for real — a formula over
+    the problem size, validated on two microarchitectures — times a **measured** multiplier for
+    complex, because the complex optimum is microarchitecture-dependent (Zen4 selects 1, Zen3 selects
+    3) while the real one is not. That split was made by measurement: the real formula gates on both
+    boxes, but applied to complex on Zen3 it produced three gate misses (0.95–0.97).
+
+[^gb]: **Blocked since 2026-07-30**, and the one residual has a known cause. `gbtrf` was a faithful
+    port of reference `dgbtf2` — the UNBLOCKED banded LU — racing OpenBLAS's blocked `dgbtrf`, which
+    is where 0.96 / 0.48 (OB) and 0.78 / 0.34 (AOCL) came from. It is now a port of blocked `dgbtrf`,
+    with the two corner blocks (A13/A31, whose parts fall outside the stored `ldab` window) staged
+    dense as the reference does. Zen4 vs OpenBLAS at `kl = ku = n/8`:
+    1.90 / 1.67 / **0.93** / 1.36 / 1.87 / 1.55 / 1.35 for n = 8…2048 (**1.49 / 0.93**); vs AOCL
+    **1.19 / 0.72**. **Zen3 clears OpenBLAS outright: 1.41 / 1.16.**
+    The single miss is n=128, i.e. `kl`=16, and it is **not** a blocking question: OpenBLAS is *also*
+    unblocked at that width (its ILAENV `nb`=64 exceeds `kl`, so `dgbtrf` takes the `dgbtf2` branch),
+    so we are losing to its **unblocked** band downdate. The remaining lever is the quality of
+    `_gbtf2!`'s rank-1 band update against `dger`, not the panel width — no `nb` rescues that cell
+    past ~0.93, measured across `nb` = 2…16.
+Two knobs, and the second exists because of a mistake worth recording. The panel width is a
+formula over `kl` (`8·(1 + kl÷128)`), fitted to the measured optimum at fourteen band widths on
+Zen4. Shipping only that **regressed Zen3** from PASS to FAIL (1.43 / 1.18 → 1.32 / 0.91): at
+`kl`=16 blocking wins on Zen4 (0.93 against 0.796 unblocked) but *loses* on Zen3 (0.91 against
+~1.18), because at that width OpenBLAS is unblocked too, so the cell is a scalar-downdate race
+rather than a blocking race. The blocked-vs-unblocked floor is therefore a **measured** knob —
+Zen4 selects 16, Zen3 selects 24 — which restored Zen3 to 1.41 / 1.16 with Zen4 unchanged. That
+is req#8(b)'s "derive → validate on the **fleet** → ship" catching a one-box derivation.
 
 [^solv]: The 🐰 on these rows is for the **factorizations**; their **solves are not yet gated**, and
     the distinction is worth stating because the solves were invisible for a long time.
