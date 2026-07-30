@@ -770,6 +770,22 @@ end
 # pT at ldt, and the po2 source psrc at lds read exactly once (each column's initial load, before its
 # first update). Same math/order as _trsm_right_lower_f64! — the c0==1 register pass degenerates to
 # the first-touch copy (empty k-loop), fusing the copy-in.
+# THIS KERNEL SPILLS ON AVX2 — AND THAT IS NOT THE BOTTLENECK. DO NOT "FIX" IT BY SHRINKING MR.
+# Measured 2026-07-30 (`code_native` + bench/plots.jl op=trsmR, galen Zen3 freq-locked). The MR=3 tier
+# holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
+# `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
+#     wintermute Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
+#     galen      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
+# That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
+# invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
+#     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
+#     MR=2   9/ 9 spills → trsmR 0.87/0.39 vs AOCL, 0.84/0.55 vs OB
+#     MR=1   3/ 2 spills → trsmR 0.87/0.40 vs AOCL, 0.88/0.56 vs OB
+# Removing the spill almost entirely makes the routine ~2× WORSE: the 12-accumulator ILP dominates the
+# spill traffic by a wide margin, and the spilled values are the loop-invariant broadcasts, which stay
+# L1-hot and reload cheaply. So MR=3 is correct on both µarchs and the trsmR n=128 gap (0.81 vs AOCL)
+# is STILL UNEXPLAINED — both the L1-aliasing predicate (see level3.jl `_alias_ld`) and the register
+# spill are now measured dead ends. Next hypotheses should be tested somewhere other than this tier.
 @inline function _trsm_rl_split_f64!(
         p00::Ptr{T}, ld0::Int, psrc::Ptr{T}, lds::Int,
         pT::Ptr{T}, ldt::Int, bs::Int, m::Int

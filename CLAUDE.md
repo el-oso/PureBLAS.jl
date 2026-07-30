@@ -154,6 +154,19 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
+- **READ `../kb/findings/` BEFORE any perf diagnosis or gate campaign — before measuring, not after.**
+  The sibling `kb/` is the cross-session knowledge hub: 25 digests of diagnostics, decisions, measured
+  results, and **disproven hypotheses so nobody re-chases a dead end**. Start at
+  `../kb/wiki/index.md`, then grep by routine (`grep -rli syrk ../kb/findings/`).
+  This rule exists because it was violated: on 2026-07-30 a session re-measured all of BLAS 1–3 and
+  reported the po2-ld L3 cells (syrk 0.95, syr2k 0.96, trmm 0.97) as new findings, then started
+  diagnosing syrk from scratch — all of it already root-caused in
+  `kb/findings/pureblas-l3-syrk-syr2k-symm.md`, **with the A-pad remedy already measured and
+  deliberately rejected for trmm**. Two methodology rules were re-derived from scratch as well
+  (`kb/findings/pureblas-avx2-l3-gate-campaign.md` items #1–#2). Hours lost.
+  **Write back too** (`kb/CLAUDE.md` rule #2): a diagnosis, decision, or disproven idea belongs in a
+  `findings/` file plus a `wiki/index.md` refresh. A commit message is not the kb — the kb sat dormant
+  2026-07-12 → 2026-07-30 while five campaigns shipped.
 - **A sub-1.0 PB/OB ratio is NEVER a "ceiling" — it is an implementation gap.** OpenBLAS runs on the
   *same silicon*; if it reaches ≥1.0, the hardware is demonstrably capable, so any `PB/OB < 1.0` is an
   algorithm/kernel-formulation problem in PureBLAS, full stop. Do **not** write "ceiling," "near-ceiling,"
