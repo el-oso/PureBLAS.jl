@@ -77,6 +77,16 @@ catch
     "unknown"
 end
 
+# Resolved Measure-tier tuning state, stamped into the cache header (see the `tune=` note at the write
+# site). These are the knobs whose value can differ per box AND be silently overridden by an untracked
+# LocalPreferences.toml — so a cache file must carry them to be reproducible from its own header.
+# Add a knob here whenever a new Measure-tier constant starts influencing a benched routine.
+_tunestamp() = try
+    join(("ger_np=$(PureBLAS._ger_np())",), ",")
+catch e
+    "unavailable($(typeof(e)))"
+end
+
 # Iteration / robustness modes (for a fast dev loop — full `bench` remains the trustworthy artifact):
 #   bench lite       → few rounds + small sizes, ~1–2 min smoke (NOT gate numbers; cache is *_lite.txt)
 #   bench op=gemm    → measure ONLY that op, full methodology, MERGE into the (v2) cache
@@ -1096,11 +1106,20 @@ const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFSUF)$(_LITE ? 
 function save_cache(path, groups)
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
-        # (slug/isa) for the multi-host plot, and full provenance: CPU model, code commit, measure time.
+        # (slug/isa) for the multi-host plot, and full provenance: CPU model, code commit, measure time,
+        # and the RESOLVED Measure-tier tuning state (`tune=`).
+        # `tune=` exists because on 2026-07-30 an UNTRACKED `bench/LocalPreferences.toml` pinning
+        # `ger_panel_np = 1` was found on BOTH fleet boxes. It overrode a correctly-working auto-measure
+        # (wintermute wants 8, galen wants 4; 1 is the Zen5 value) and silently sandbagged every ger number
+        # ever committed: removing it took wintermute n=2048 from 0.914 to 1.244 and n=4096 from 0.974 to
+        # 1.408, and flipped galen's ger from FAIL to PASS vs OpenBLAS. A pin does not appear in
+        # `git status`, so nothing in the cache file revealed that the run was measuring the pin rather
+        # than the kernel. Stamping the resolved values makes a cache reproducible from its own header —
+        # if two runs disagree, diff `tune=` first.
         ts = Libc.strftime("%Y-%m-%dT%H:%M", time())
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
-            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts"
+            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())"
         )
         for (lvl, d) in groups, (nm, op) in d
             println(io, lvl, "\t", nm, "\t", join(("$(s)=$(join(v, ","))" for (s, v) in op), ";"))
