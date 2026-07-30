@@ -55,6 +55,74 @@ else
     @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = _GBTRF_NB_PREF::Int
 end
 
+# Minimum band width at which BLOCKING beats the unblocked kernel. PDM tier: MEASURE, and the
+# falsification that forced it is worth recording because it was mine.
+#
+# The nb formula above was validated on Zen4 only, and shipping it there REGRESSED Zen3: at kl=16 the
+# blocked path (nb=8) measures 0.93 on Zen4 where unblocked is 0.796 — blocking wins — but on Zen3 the
+# same cell is 0.91 blocked against ~1.18 unblocked, so blocking LOSES. bench/plots.jl's gbtrf row went
+# from PASS (1.43 / 1.18) to FAIL (1.32 / 0.91) on Zen3 as a direct result. The crossover is therefore
+# microarchitecture-dependent, which is the definition of a Measure-tier knob, and this is exactly the
+# "derive -> validate on the FLEET -> ship" step of req#8(b) catching a one-box derivation.
+#
+# Mechanism (consistent with both boxes): at kl=16 OpenBLAS is ALSO unblocked (its ILAENV nb=64 exceeds
+# kl, so dgbtrf takes the dgbtf2 branch), so this cell is a scalar-band-downdate race, not a blocking
+# race — and which side wins depends on how well each box runs that scalar loop versus a rank-8 gemm on
+# a very thin trailing block. Not something a residency model predicts.
+#
+# Candidate set is derived: multiples of the nb quantum (8). The probe times blocked against unblocked
+# at each candidate width and returns the smallest at which blocking actually wins, so the ladder
+# adapts to a box we have never measured.
+const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
+@static if isnothing(_GBTRF_CROSS_PREF)
+    function _measure_gbtrf_cross(::Type{T})::Int where {T}
+        Base.generating_output() && return 32          # conservative: unblocked wins on Zen3 at 16
+        try
+            for kl in (8, 16, 24, 32, 48)
+                ku = kl
+                nloc = 16 * kl
+                nb = _gbtrf_nb(T, kl)
+                nb > kl && continue
+                ldab = 2 * kl + ku + 1
+                ABm = Matrix{T}(undef, ldab, nloc)
+                ipv = Vector{Int}(undef, nloc)
+                refill! = () -> begin
+                    fill!(ABm, one(T))
+                    @inbounds for j in 1:nloc
+                        ABm[kl + ku + 1, j] = T(4 * (kl + ku))
+                    end
+                end
+                refill!(); _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)   # warmups
+                refill!(); _gbtf2!(kl, ku, nloc, ABm, ipv)
+                tb = typemax(UInt64); tu = typemax(UInt64)
+                for _ in 1:3
+                    refill!(); s = time_ns()
+                    _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)
+                    tb = min(tb, time_ns() - s)
+                    refill!(); s = time_ns()
+                    _gbtf2!(kl, ku, nloc, ABm, ipv)
+                    tu = min(tu, time_ns() - s)
+                end
+                tb < tu && return kl                    # smallest width where blocking wins
+            end
+            return 64                                   # blocking never won on the narrow candidates
+        catch
+            return 32
+        end
+    end
+    const _GBTRF_CROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(Float64))
+    const _GBTRF_CROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(Float32))
+    const _GBTRF_CROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(ComplexF64))
+    const _GBTRF_CROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(ComplexF32))
+    @inline _gbtrf_cross(::Type{Float64}) = _GBTRF_CROSS_F64()
+    @inline _gbtrf_cross(::Type{Float32}) = _GBTRF_CROSS_F32()
+    @inline _gbtrf_cross(::Type{ComplexF64}) = _GBTRF_CROSS_C64()
+    @inline _gbtrf_cross(::Type{ComplexF32}) = _GBTRF_CROSS_C32()
+    @inline _gbtrf_cross(::Type{T}) where {T} = 32
+else
+    @inline _gbtrf_cross(::Type{T}) where {T} = _GBTRF_CROSS_PREF::Int   # pinned (trim lands here)
+end
+
 # gbtrf!(kl, ku, m, AB) → (AB, ipiv, info).  AB overwritten with L\U in band storage; ipiv the
 # min(m,n) pivot rows; info = index of the first exactly-zero pivot (0 if none). Allocates ipiv and
 # dispatches; the arity and the 3-tuple are load-bearing (the C-ABI wrapper destructures them).
@@ -68,7 +136,8 @@ function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) whe
     # collapse `_pbtrf_nb` documents (banded_chol.jl:173-186), where clamping the width to kd turned
     # a 1.6× win into the routine's only gate miss. Narrow bands stay on the unblocked kernel, where
     # PureBLAS already gates.
-    if T <: BlasFloat && _strided1(AB) && Int(kl) >= 2 * nb && min(Int(m), n) > nb
+    if T <: BlasFloat && _strided1(AB) && Int(kl) >= max(2 * nb, _gbtrf_cross(T)) &&
+min(Int(m), n) > nb
         info = _gbtrf_blocked!(kl, ku, m, AB, ipiv, nb)
     else
         info = _gbtf2!(kl, ku, m, AB, ipiv)

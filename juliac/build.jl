@@ -47,6 +47,10 @@ const _prev_pbns = load_preference(PUREBLAS_UUID, "pbtrf_nb_small")
 # And `pptrf_spr_min`: the packed lower path's spr!-vs-inline cutoff is a Measure-tier
 # OncePerProcess race. 8 is the Zen4 F64 optimum (= W).
 const _prev_ppsm = load_preference(PUREBLAS_UUID, "pptrf_spr_min")
+# And `gbtrf_cross`: the blocked-vs-unblocked band crossover is a Measure-tier OncePerProcess race and
+# a runtime benchmark is not trim-safe. 16 is the Zen4 value; Zen3 measures higher (blocking loses at
+# kl=16 there), so a trim build for AVX2 should re-pin this.
+const _prev_gbcr = load_preference(PUREBLAS_UUID, "gbtrf_cross")
 # And `gbtrf_nb`: the banded-LU panel width is a Measure-tier OncePerProcess race, and a runtime
 # benchmark is not trim-safe. 16 is the Zen4/Zen3 F64 optimum (both boxes agree in absolute terms).
 const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
@@ -57,6 +61,7 @@ set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band p
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => 8; force = true)       # packed lower spr-vs-inline cutoff (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gbtrf_cross" => 16; force = true)         # banded-LU blocking floor (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -92,7 +97,12 @@ finally
     else
         set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => _prev_pbns; force = true)
     end
-    if _prev_gbnb === nothing
+    if _prev_gbcr === nothing
+    delete_preferences!(PUREBLAS_UUID, "gbtrf_cross"; force = true)
+else
+    set_preferences!(PUREBLAS_UUID, "gbtrf_cross" => _prev_gbcr; force = true)
+end
+if _prev_gbnb === nothing
     delete_preferences!(PUREBLAS_UUID, "gbtrf_nb"; force = true)
 else
     set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => _prev_gbnb; force = true)
