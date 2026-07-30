@@ -321,7 +321,24 @@ end
         LDd = copy(Ad); ipd = zeros(Int, n); P.sytrf!(LDd, ipd; uplo = 'L')
         LDz = copy(Az); ipz = zeros(Int, n); P.sytrf!(LDz, ipz; uplo = 'L')
         LDh = copy(Ahe); iph = zeros(Int, n); P.hetrf!(LDh, iph; uplo = 'L')
-        @assert_trim_compatible P.sytri!(copy(LDd), ipd; uplo = 'L')
+        # sytrf!/hetrf! were only ever covered TRANSITIVELY (through sysv!, and above only as input
+# setup). Assert them directly, and at a size that reaches the BLOCKED panel — nb is
+# 8*ceil(isqrt(n)/8) clamped [16,96], so any n > 16 does, but 96 exercises several panels
+# plus the unblocked tail. Both uplo, and all three of symmetric / complex-symmetric /
+# Hermitian, since each takes a different kernel (_lasyf_* vs _lahef_*).
+nbig = 96
+Abd = (M = randn(nbig, nbig); M + transpose(M))
+Abz = (M = randn(ComplexF64, nbig, nbig); M + transpose(M))
+Abh = (M = randn(ComplexF64, nbig, nbig); M + M')
+ipb = zeros(Int, nbig)
+P.sytrf!(copy(Abd), ipb; uplo = 'L')                    # warm the owned W workspace first
+P.hetrf!(copy(Abh), ipb; uplo = 'L')
+for ul in ('L', 'U')
+    @assert_trim_compatible P.sytrf!(copy(Abd), zeros(Int, nbig); uplo = ul)
+    @assert_trim_compatible P.sytrf!(copy(Abz), zeros(Int, nbig); uplo = ul)
+    @assert_trim_compatible P.hetrf!(copy(Abh), zeros(Int, nbig); uplo = ul)
+end
+@assert_trim_compatible P.sytri!(copy(LDd), ipd; uplo = 'L')
         @assert_trim_compatible P.sytri!(copy(LDz), ipz; uplo = 'L')
         @assert_trim_compatible P.hetri!(copy(LDh), iph; uplo = 'L')
         # ── QL / RQ (geqlf/gerqf + org/orm), real + complex ──
