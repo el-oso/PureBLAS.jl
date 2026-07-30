@@ -81,6 +81,25 @@ end
     GC.@preserve x begin
         va = V(a)
         i = 0
+        # Beyond L1, HAND-UNROLLING LOSES TO `@simd ivdep`. Measured 2026-07-30, wintermute freq-locked,
+        # one process, back-to-back, plots.jl's own L1 regime (`_L1REP` reps on the same vector) — GB/s of
+        # this kernel vs the identical pointer loop written as `@simd ivdep for i in 1:n`:
+        #     n=1e3  0.99   n=3e3  0.98   n=1e4  1.01   n=3e4  1.00
+        #     n=1e5  1.04   n=3e5  1.03   n=1e6  1.08
+        # The crossover is L1 residency: 3e3·8 = 24 KB fits a 32 KB L1 (manual unroll wins), 1e4·8 = 80 KB
+        # does not (ivdep wins). So keep the explicit 4× unroll while resident — it pipelines a short loop
+        # better — and hand the rest to LLVM, which picks its own unroll/addressing and does better.
+        # This is also the ACTUAL scal gate gap, and it is NOT a memory-parallelism story: at n=1e6 (8 MB
+        # in a 16 MB L3) a plain Julia `x[i] *= a` loop reaches 152.8 GB/s where this kernel reached 141.6
+        # — PB/raw = 0.927 against the gate's PB/AOCL = 0.923, i.e. AOCL is simply achieving what the naive
+        # loop achieves. The genuine DRAM regime (n=4e6, 32 MB) sits at 76-79 GB/s with PB/raw = 0.973.
+        # PDM: DERIVE tier (L1 residency over a detected const), no new knob.
+        if n * sizeof(T) > _L1_BYTES
+            @inbounds @simd ivdep for j in 1:n
+                unsafe_store!(px, a * unsafe_load(px, j), j)
+            end
+            return x
+        end
         # FALSIFIED 2026-07-30 (wintermute, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
         # n=1e6 (8 MB against a 16 MB L3, doubled by RMW read + dirty-writeback) and gates everywhere
         # smaller. Deepening the unroll to 8 for that regime — i.e. 8 cache lines in flight instead of
