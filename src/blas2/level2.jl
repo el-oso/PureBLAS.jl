@@ -1548,19 +1548,32 @@ end
 
 @inline function _trsv_simd!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A)
+    rcp = _trsv_rrcpbuf(T)
+    # Take the divide OFF the sequential substitution critical path (see _TRSV_RRCP64 above). `userc` is
+    # loop-invariant, so the in-loop ternary predicts perfectly / unswitches — same shape the complex
+    # `_trsv_cmplx!` already uses, which is why this needs no duplicate branch bodies.
+    userc = !unit && n <= length(rcp)
     GC.@preserve A x begin
         Ap = pointer(A); xp = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        dp(j) = Ap + ((j - 1) * lda + (j - 1)) * sz          # &A[j,j]
+        if userc                                 # r[j] = 1/A[j,j]: all independent ⇒ pipelined
+            @inbounds @simd ivdep for j in 1:n
+                rcp[j] = inv(unsafe_load(dp(j)))
+            end
+        end
         if !tr                                   # solve A·x = b  (column axpy, subtract)
             if up                                # U,N: back-substitution, j descending
                 @inbounds for j in n:-1:1
                     cp = Ap + (j - 1) * lda * sz
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
+                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] :
+                                              unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
                     _axpy_simd!(j - 1, -unsafe_load(xp, j), cp, xp)
                 end
             else                                 # L,N: forward, j ascending
                 @inbounds for j in 1:n
                     cp = Ap + (j - 1) * lda * sz
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
+                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] :
+                                              unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
                     _axpy_simd!(n - j, -unsafe_load(xp, j), cp + j * sz, xp + j * sz)
                 end
             end
@@ -1569,14 +1582,14 @@ end
                 @inbounds for j in 1:n
                     cp = Ap + (j - 1) * lda * sz
                     t = unsafe_load(xp, j) - _dot_simd(j - 1, cp, xp, T)
-                    unit || (t /= unsafe_load(cp + (j - 1) * sz))
+                    unit || (t = userc ? t * rcp[j] : t / unsafe_load(cp + (j - 1) * sz))
                     unsafe_store!(xp, t, j)
                 end
             else                                 # L,T: back, j descending
                 @inbounds for j in n:-1:1
                     cp = Ap + (j - 1) * lda * sz
                     t = unsafe_load(xp, j) - _dot_simd(n - j, cp + j * sz, xp + j * sz, T)
-                    unit || (t /= unsafe_load(cp + (j - 1) * sz))
+                    unit || (t = userc ? t * rcp[j] : t / unsafe_load(cp + (j - 1) * sz))
                     unsafe_store!(xp, t, j)
                 end
             end
@@ -1605,6 +1618,24 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
+
+# Reciprocal-of-diagonal scratch for REAL trsv (per type; single-thread — no MT here). Same mechanism the
+# complex path already ships (see _TRSV_RCP64 / _crecip below): the in-loop scalar DIVIDE sits on the
+# sequential substitution CRITICAL PATH — x[j] feeds the next column's axpy/dot — so its ~13.5-cyc Zen4
+# latency is fully exposed, ×n columns, while a multiply is ~4. Precompute r[j]=1/diag up front (all
+# independent ⇒ pipelined, throughput-bound), then MULTIPLY in the loop. The complex finding that motivates
+# this reads: "ztrsv n≤256 was 0.65-0.96 vs OB; ztrmv, SAME axpy but NO divide, gates" — and the real
+# Zen4/AOCL split has the same shape (trmv 0.95 worst, trsv 0.88, identical blocking and identical axpy).
+# Naive reciprocal, no overflow guard: reference `dtrsm` itself does `temp = one/a(k,k)` then multiplies, so
+# the one extra rounding is BLAS-conformant practice, not a liberty.
+# Size DERIVED, not a literal: `_trsv_blk!` hands the per-column kernel at most max(_TRI_NB, _TRI_T_UNB)
+# columns (unblocked dispatch at :1695, diagonal blocks ≤ _TRI_NB elsewhere), and it is the only caller.
+# The `n <= length` guard below keeps a pinned-larger `tri_t_unb` correct rather than out-of-bounds.
+const _TRSV_RRCP_N = max(_TRI_NB, _TRI_T_UNB)
+const _TRSV_RRCP64 = Vector{Float64}(undef, _TRSV_RRCP_N)
+const _TRSV_RRCP32 = Vector{Float32}(undef, _TRSV_RRCP_N)
+@inline _trsv_rrcpbuf(::Type{Float64}) = _TRSV_RRCP64
+@inline _trsv_rrcpbuf(::Type{Float32}) = _TRSV_RRCP32
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
 # AVX-512 its per-call/shuffle overhead made per-column faster ≤1024. On AVX2 the scatter now uses the
 # fast OB-structure ri gemv (see _tri_scat_cmplx!), so blocking wins earlier — the unblocked column-axpy
@@ -1624,8 +1655,26 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # views (unit-stride → SIMD gemv via the relaxed _l2_simd_ok).
 # Force the column-panel gemv-N (β=1 accumulate) for the tall off-diagonal scatter `y += α·Av·xv`.
 # Going through the dispatcher would pick the row-block path (n=NB cols → NB strided streams), which
-# thrashes because a sub-block's columns are a full parent-lda apart; the panel uses _GEMV_NP streams.
-@inline _tri_scat!(yv, Av, xv, α) = _gemv_n_paneldrv!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(α), Val(false))
+# thrashes because a sub-block's columns are a full parent-lda apart; so we keep calling a panel
+# driver DIRECTLY (also dodging the ~200 ns/call kwarg layer).
+# But pick the SAME panel driver the dispatcher would (`_gemv_n_simd!`, minus the row-block branch we
+# must avoid): `_gemv_n_paneldrv_minner!` in the mid-n/L3 regime, the old NP=8 panel beyond it. Two
+# reasons, and the second is the one that matters here:
+#   (a) minner measured ~8–10% faster PB-self at n=512–2048 on Zen4;
+#   (b) `_gemvn_minner_np` is **lda-aliasing-aware** — at a way-stride lda it drops the stream count to
+#       `min(_L1D_ASSOC, _GEMVN_NP_WIDE)`, whereas the old path's bare `_GEMV_NP = 8` is not. The
+#       scatter's A-view inherits the PARENT's lda, and every size in the trmv/trsv gate rows is a
+#       power of two, so the aliasing branch is exactly the live case.
+# This is why `gemvN` gates while `trmv`/`trsv` missed at the SAME sizes: gemvN got minner, this
+# scatter never did. No new tuning constant — `_GEMVN_MINNER` (Derive: datapath-gated, OFF on
+# native-512 Zen5) and `_GEMVN_MINNER_MAXA` are reused verbatim from the dispatcher.
+@inline function _tri_scat!(yv, Av, xv, α)
+    m = size(Av, 1); n = size(Av, 2)
+    if _GEMVN_MINNER && m * n * sizeof(eltype(Av)) <= _GEMVN_MINNER_MAXA
+        return _gemv_n_paneldrv_minner!(m, n, α, Av, xv, yv, one(α), Val(false))
+    end
+    return _gemv_n_paneldrv!(m, n, α, Av, xv, yv, one(α), Val(false))
+end
 # T-form off-diagonal: gemv-T kernel directly (no backend kwarg layer — ~200 ns/call dominated the
 # few off-diagonal calls at mid n). y_I += α·Avᵀ·xv  (β=1 accumulate).
 @inline _tri_scatT!(yv, Av, xv, α) = _gemv_t_simd!(size(Av, 1), size(Av, 2), α, Av, xv, one(α), yv, Val(false))

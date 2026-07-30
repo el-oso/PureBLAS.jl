@@ -146,6 +146,29 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                             Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
                             one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
                         )
+                    elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
+                        # W-aligned partial rows → UNMASKED clipped kernel, the ladder gemm already
+                        # ships (gemm.jl:1167-1196: "a smaller Val(vr) reads exactly the mre live rows
+                        # — no mask, no wasted vector"). The old binary `cld(mre,W)==1 ? Val(1) :
+                        # Val(_MR)` only had an exact answer for one row-vector: on AVX2 (_MR=3, W=4) a
+                        # k=8 trmm has mre=8 ⇒ masked Val(3), i.e. 12 rows computed for 8 live ones —
+                        # 50% wasted FMAs, and at n=8 that is 100% of the operation (Zen3 trmm n=8 was
+                        # 0.88 vs OB while Zen4, where _MR=2/W=8 lands on the exact Val(1), got 1.32).
+                        # mre ≤ mr = _MR·W and mre == mr is handled above, so vr < _MR here ⇒ vr ∈ {1,2}
+                        # for every current µarch; a wider _MR falls through to the masked path unharmed.
+                        # Aliasing-safe by this function's own rule (:140-143): full-strip kernels hold
+                        # the tile in registers between read and store; only `_edge!` is row-serial.
+                        if div(mre, W) == 1
+                            _microkernel_unpacked!(
+                                Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                            )
+                        else
+                            _microkernel_unpacked!(
+                                Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
+                            )
+                        end
                     elseif nre == nr
                         _microkernel_unpacked_mrows!(
                             Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
@@ -196,6 +219,20 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                             Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
                             one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
                         )
+                    elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
+                        # W-aligned partial rows → unmasked clipped kernel (same ladder and same reasoning
+                        # as the side-L site above; vr ∈ {1,2} since mre < mr here).
+                        if div(mre, W) == 1
+                            _microkernel_unpacked!(
+                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                            )
+                        else
+                            _microkernel_unpacked!(
+                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
+                            )
+                        end
                     elseif nre == nr
                         _microkernel_unpacked_mrows!(
                             Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
@@ -2692,6 +2729,15 @@ end
 # vector width (cache geometry, not ISA) — used by the side-R fused leaf's pT-scratch pack.
 const _L1_WAY_D = max(64, _L1_BYTES ÷ 64)      # doubles per L1 way (÷8-way ÷8-byte/double)
 @inline _alias_ld(ld::Int) = ld >= _L1_WAY_D && ld % _L1_WAY_D == 0
+# FALSIFIED 2026-07-30 (galen, freq-locked, plots.jl): extending this to the QUARTER way period
+# (`ld % (_L1_WAY_D>>2) == 0` gated on B being L2-resident, mirroring `_chol_needs_pad`'s fleet-measured
+# criterion at lapack.jl:722-731) does NOT move trsmR — worst 0.82 → 0.81 vs AOCL, i.e. noise.
+# The motivating correlation is real but NOT causal: the two sub-gate cells (ldb=128, 256) are exactly
+# the two where `_alias_ld` is false, while ldb=512/1024 get the dealias arm and beat AOCL 1.27-1.66×.
+# Whatever makes 512/1024 fast, it is not this predicate. Do not re-derive the quarter-period widening.
+# Next suspect for trsmR n=128 is the fused leaf's hardcoded MR=3 × NC=_CHOL_NB=4 = 12-accumulator top
+# tier (lapack.jl:792-816): on AVX2's 16 ymm that is 12 accs + 3 T-vectors + 1 broadcast = exactly 16,
+# with 10 loop-invariant broadcasts that must spill (UNVERIFIED — check with @assert_no_spill first).
 
 # ── Alias-strategy self-tuning constant (PDM ladder, MEASURE tier — req#8b) ────────────────────────────
 # On an L1-way-stride ldb the side-R leaf's solved-column re-reads collide in one set. Two cures exist:
