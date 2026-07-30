@@ -552,7 +552,11 @@ function run_benchmarks()
         # A whole factorization+solve pair (sytrf/sytrs) plus four more real factorizations that had
         # correctness tests but had NEVER been measured. Adding the rows is step 1 of the ALL-LAPACK
         # audit: a routine that is routed and tested still reads as covered while measuring nothing.
-        _symm_hpd(s) = (A = _hpd(Float64, s); (A + transpose(A)) ./ 2)
+        # INDEFINITE, not positive definite. The original maker was (hpd + hpd')/2, which is PD, so
+# every Bunch-Kaufman pivot was 1x1 and the 2x2 branches of BOTH sytrf and sytrs were never
+# measured — the row reported a number for a code path real symmetric-indefinite input does
+# not take. A plain M + M' is the actual workload.
+_symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         addh(
             "sytrf", _symm_hpd,
             c -> (LinearAlgebra.LAPACK.sytrf!(LP, c); c[1, 1]),
