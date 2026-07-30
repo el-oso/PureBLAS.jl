@@ -57,7 +57,6 @@ set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band p
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => 8; force = true)       # packed lower spr-vs-inline cutoff (Measure tier)
-set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => 16; force = true)           # banded-LU panel width (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
 try
