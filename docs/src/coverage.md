@@ -278,9 +278,11 @@ symbols** — they appear only in commented-out lines of the stdlib and have no 
   sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 7 of 33 measured
   rows clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly
   (0.9–0.99 at one or two sizes — often the smallest, where per-call overhead dominates and the
-  measurement is least stable). Four are genuinely behind and are the active work: pivoted QR
-  (`geqp3`, 0.18), Bunch–Kaufman (`sytrf` 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — the
-  first two confirmed as unblocked BLAS-2 implementations racing blocked ones.
+  measurement is least stable). **One row is now genuinely behind**: pivoted QR (`geqp3`, 0.18), an unblocked
+  BLAS-2 implementation racing a blocked one. The other three that used to sit here —
+  Bunch–Kaufman (`sytrf` was 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — shared that
+  diagnosis and were blocked on 2026-07-30: `sytrf` 1.39 / 1.04, `sytrs` 1.68 / 1.43 🐰,
+  `gbtrf` 1.49 / 0.93. This paragraph previously contradicted its own footnotes.
   An earlier version of this summary said BLAS 1/2/3 and the core factorizations were "perf-gated
   `≥ OpenBLAS`". That was written against an OpenBLAS-only, geomean-flavoured reading; under the
   project's actual rule — `max(OpenBLAS, AOCL)` at every size — it does not hold, and the tables
