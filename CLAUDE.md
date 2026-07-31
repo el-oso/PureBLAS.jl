@@ -154,6 +154,20 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
+- **SYNC THE FLEET WITH GIT, NEVER rsync — use `bench/fleet_sync.sh <box|all> [ref]`.**
+  Commit and push first; the script fetches and hard-resets the box to a pushed ref, then re-verifies
+  source parity by md5. Do not `rsync src/` to a fleet box, and do not hand-roll an `ssh … git reset`.
+  **Why:** rsync copies the code but not its identity. `bench/plots.jl` stamps `commit=` into every
+  cache header from `git rev-parse`, so an rsync'd box benchmarks new code while claiming its old
+  HEAD. On 2026-07-31 galen emitted a full gate sweep stamped `commit=ac96c00` while actually running
+  the tree from `78eafc7` — 13 commits and two perf fixes later. The numbers were fine, but the
+  provenance in the published coverage table was false and **nothing in the artifact revealed it**;
+  it was caught only by manually md5-ing both trees. A benchmark cache is evidence, and evidence needs
+  a truthful provenance line. rsync of a subdirectory is also silently partial — new `src/` with stale
+  `test/` or `juliac/` and no indication. Bench caches are gitignored, so the hard reset preserves them
+  and `op=`/merge runs keep working. The script refuses if local HEAD is not an ancestor of the target
+  ref (catches "I synced my uncommitted tree" before a 3-hour sweep, not after).
+
 - **READ `../kb/findings/` BEFORE any perf diagnosis or gate campaign — before measuring, not after.**
   The sibling `kb/` is the cross-session knowledge hub: 25 digests of diagnostics, decisions, measured
   results, and **disproven hypotheses so nobody re-chases a dead end**. Start at
