@@ -540,13 +540,40 @@ const _IAMAX_NB = min(4, _NVREG - 1)
         # defeats whatever keeps this loop in registers (capture/boxing), and the cost dwarfs the entire
         # scan it was meant to save. Correctness tests all passed, so ONLY the gate caught it.
         # If retried, it must be written without a closure — straight-line, no tuple return.
-        if any(((v0 > thr) | (v1 > thr)) | ((v2 > thr) | (v3 > thr)))    # rare (running max advances)
-            for (j, v) in ((0, v0), (W, v1), (2W, v2), (3W, v3))         # cold path: locate new max + lane
-                bm = v[1]; bl = 1
+        c0 = v0 > thr; c1 = v1 > thr; c2 = v2 > thr; c3 = v3 > thr
+        if any((c0 | c1) | (c2 | c3))                                    # rare (running max advances)
+            # Rescan ONLY the blocks with a lane above `thr`, fully unrolled and straight-line. Skipping
+            # an empty-mask block is exact: all its lanes are ≤ thr == the running gmax when the mask was
+            # taken, and gmax only rises. A block scanned after gmax rises is still fine — `bm > gmax`
+            # re-checks. The serial `>` walk (not a max-tree, not `maximum(::Vec)`) is what keeps the NaN
+            # contract netlib defines and the NaN testitem pins.
+            if any(c0)
+                bm = v0[1]; bl = 1
                 for l in 2:W
-                    v[l] > bm && (bm = v[l]; bl = l)
+                    v0[l] > bm && (bm = v0[l]; bl = l)
                 end      # strict > ⇒ first lane on ties
-                bm > gmax && (gmax = bm; bi = o + j + bl; thr = V(gmax))
+                bm > gmax && (gmax = bm; bi = o + bl; thr = V(gmax))
+            end
+            if any(c1)
+                bm = v1[1]; bl = 1
+                for l in 2:W
+                    v1[l] > bm && (bm = v1[l]; bl = l)
+                end
+                bm > gmax && (gmax = bm; bi = o + W + bl; thr = V(gmax))
+            end
+            if any(c2)
+                bm = v2[1]; bl = 1
+                for l in 2:W
+                    v2[l] > bm && (bm = v2[l]; bl = l)
+                end
+                bm > gmax && (gmax = bm; bi = o + 2W + bl; thr = V(gmax))
+            end
+            if any(c3)
+                bm = v3[1]; bl = 1
+                for l in 2:W
+                    v3[l] > bm && (bm = v3[l]; bl = l)
+                end
+                bm > gmax && (gmax = bm; bi = o + 3W + bl; thr = V(gmax))
             end
         end
         o += step
