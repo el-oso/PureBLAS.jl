@@ -21,3 +21,9 @@ fail_mode = "error"
 # proof. Value is arbitrary here (any of 1/2/4/8) — the dogfood checks alloc-freeness, not perf.
 [preferences.PureBLAS]
 ger_panel_np = 4
+# Same reason for gemv-T's column-route decision: its OncePerProcess probe allocates a calibration
+# buffer, so leaving it unpinned reddens the same all-paths noalloc proof (trmv! reaches gemv-T).
+# `false` = the always-blocked shipping arm. Value is arbitrary for this job -- the dogfood checks
+# alloc-freeness, not perf -- and pinning is legitimate here precisely because the CI runner is known
+# hardware; real users on unknown hardware still auto-measure.
+gemvt_perscan = false
