@@ -476,6 +476,20 @@ end
 @inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # NC=4 columns (⇒ 4 dot accumulators) per block. MEASURED-AND-KEPT, not an unexamined literal:
+        # the standing hypothesis was that 4 chains half-fill Zen4's 2 FMA/cyc × ~4-cyc-latency pipe and
+        # that ≥8 would close the mid-n gemvT miss. FALSIFIED 2026-07-31 (wintermute, freq-locked, GF/s,
+        # same-process A/B over the @generated Val{NC}):
+        #     n=  256   512  1024  2048  4096
+        #  NC=2  20.59 15.88 14.27  7.28  7.13
+        #  NC=4  20.71 16.61 14.04  8.43  8.06   ← ships
+        #  NC=8  21.07 15.66 14.84  8.36  6.89
+        #  NC=16 18.92 11.58 10.87  7.23  7.24
+        # NC=8 wins only at 256 (+1.7%) and 1024 (+5.7%) and LOSES at 512 (−5.7%), 2048 and 4096 (−14.5%);
+        # NC=16 is uniformly worse. So this is not ILP-starved, and a size-switched NC would buy the
+        # n=1024 cell (0.948 vs AOCL) by giving back others — a new tuning knob for a net wash. Left at 4.
+        # NOTE this also retires the `_gemvt_nc` Measure-tier constant referenced in comments elsewhere
+        # (e.g. banded_chol.jl): it was never implemented, and the measurement above says it should not be.
         j = 0
         while j + 4 <= n
             _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))

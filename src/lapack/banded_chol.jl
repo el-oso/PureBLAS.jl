@@ -34,7 +34,8 @@
 #       per-block dispatch/packing overhead — a port-balance/overhead crossover, not a residency
 #       one. The residency model was FALSIFIED on a box we have (Zen4: kd=64 triangle = 16 KB,
 #       L1-resident, yet blocked already wins) — the PDM tell for Measure tier, mirroring
-#       _ger_np/_gemvt_nc. Candidate bounds ARE Derived: below 2W a trsm/syrk panel column can't
+#       _ger_np (`_gemvt_nc` was only ever aspirational — never implemented, and MEASURED to be a
+#       net wash on 2026-07-31; see the NC table at level2.jl `_gemv_t_simd!`). Candidate bounds ARE Derived: below 2W a trsm/syrk panel column can't
 #       fill two SIMD registers, so BLAS-3 can't pay (measured: kd=16=2W unblocked wins on Zen4);
 #       by 16W the unblocked working set (16W)²·sizeof ≥ L1 on every fleet µarch, so the scalar
 #       rank-1 streams with zero reuse while blocked is compute-bound — if blocked hasn't won by
