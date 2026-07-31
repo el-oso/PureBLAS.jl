@@ -1808,7 +1808,19 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
-    n <= NB && return _trmv_simd!(up, tr, unit, n, A, x)
+    # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
+    # re-streaming x from memory; while A is L2-resident that re-stream is served from L2 and costs
+    # little, so the blocking overhead (a gemv call and its bookkeeping per block) is not repaid.
+    # Measured (wintermute, freq-locked, GB/s, unblocked ÷ blocked):
+    #     n=       128    192    256    384    512    768   1024
+    #   trmv      1.086  1.087  1.056  0.936  0.942  0.824  0.729
+    # Crossover sits exactly at L2: n=256 ⇒ A = 0.52 MB fits the 1 MB L2 and unblocked wins; n=384 ⇒
+    # 1.18 MB does not and blocking wins. DERIVE tier — cache residency over a detected const.
+    # NOT shared with trsv, deliberately: the same sweep gives trsv 1.009 / 0.986 / 0.960 / 0.967, i.e.
+    # blocking pays from n≈192 there, because trsv's per-column path carries the serial substitution
+    # dependency and is latency-bound, so offloading the off-diagonal to gemv repays much earlier.
+    # Two routines, one shape, different crossovers — do not unify them.
+    (n <= NB || n * n * sizeof(eltype(A)) <= _L2_BYTES) && return _trmv_simd!(up, tr, unit, n, A, x)
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
         ib = 0
