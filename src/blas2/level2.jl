@@ -1811,16 +1811,24 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
     # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
     # re-streaming x from memory; while A is L2-resident that re-stream is served from L2 and costs
     # little, so the blocking overhead (a gemv call and its bookkeeping per block) is not repaid.
-    # Measured (wintermute, freq-locked, GB/s, unblocked ÷ blocked):
-    #     n=       128    192    256    384    512    768   1024
-    #   trmv      1.086  1.087  1.056  0.936  0.942  0.824  0.729
-    # Crossover sits exactly at L2: n=256 ⇒ A = 0.52 MB fits the 1 MB L2 and unblocked wins; n=384 ⇒
-    # 1.18 MB does not and blocking wins. DERIVE tier — cache residency over a detected const.
+    # The triangle must fit L2 with HEADROOM (hence 2·A <= L2, not A <= L2): x, the output and the
+    # streaming share that cache, so a triangle that exactly fills L2 already thrashes it.
+    # `A <= L2` alone was fitted on Zen4 and REGRESSED Zen3, where n=256 gives a triangle of exactly
+    # 512 KB = its entire L2. Interleaved A/B, 5 fresh processes per arm, alternating arms, separate
+    # precompile, variant verified present/absent every round. Ratio vs AOCL (min..max over 5):
+    #             ORIGINAL          HALF-L2           verdict
+    #   Zen4 128  1.010..1.017      1.169..1.176      BETTER, disjoint
+    #   Zen4 256  0.950..0.958      1.021..1.034      BETTER, disjoint   <- was the failing cell
+    #   Zen3 128  1.080..1.091      1.115..1.120      BETTER, disjoint
+    #   Zen3 256  1.003..1.051      1.011..1.037      overlap  (A <= L2 made this WORSE, disjoint)
+    #   both 512..4096                                overlap  (criterion cannot reach them)
+    # Sizes the criterion cannot touch overlap on both boxes - the controls are part of the result.
+    # DERIVE tier: cache residency over a detected const, validated on both microarchitectures (req#8b).
     # NOT shared with trsv, deliberately: the same sweep gives trsv 1.009 / 0.986 / 0.960 / 0.967, i.e.
     # blocking pays from n≈192 there, because trsv's per-column path carries the serial substitution
     # dependency and is latency-bound, so offloading the off-diagonal to gemv repays much earlier.
     # Two routines, one shape, different crossovers — do not unify them.
-    (n <= NB || n * n * sizeof(eltype(A)) <= _L2_BYTES) && return _trmv_simd!(up, tr, unit, n, A, x)
+    (n <= NB || 2 * n * n * sizeof(eltype(A)) <= _L2_BYTES) && return _trmv_simd!(up, tr, unit, n, A, x)
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
         ib = 0
