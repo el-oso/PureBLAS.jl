@@ -495,39 +495,32 @@ end
 # Shipping the Derive-only version regressed Zen3 gemvT from 1.04/0.94 to **1.00/0.69** vs AOCL. Same
 # class as `_ger_np` ("intrinsic per-core property, NO derivable formula, OPPOSITE sign across µarchs"),
 # so it gets the same treatment: Preference-pinnable, else auto-measured once per process.
-const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
-@static if isnothing(_GEMVT_PERSCAN_PREF)
-    function _measure_gemvt_perscan()::Bool
-        Base.generating_output() && return false     # never burn a measure during precompile; default
-        try                                          # to today's shipped behaviour (always blocked)
-            # Probe INSIDE the window, derived: A ≈ 4×L2 (clearly past L2) with m capped so x ≤ L1/2.
-            m = min(isqrt(4 * _L2_BYTES ÷ sizeof(Float64)), _L1_BYTES ÷ 2 ÷ sizeof(Float64))
-            m -= m % 4; m < 64 && return false
-            n = m
-            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(0.0, n)
-            GC.@preserve A x y begin
-                pA = pointer(A); px = pointer(x); py = pointer(y); ld = stride(A, 2); sz = sizeof(Float64)
-                blocked() = (j = 0; while j + 4 <= n
-                    _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true)); j += 4 end)
-                percol() = (@inbounds for j in 0:(n - 1)
-                    unsafe_store!(py, _dot_simd(m, pA + j * ld * sz, px, Float64), j + 1) end)
-                blocked(); percol()                  # untimed warmup: absorb JIT for both arms
-                tb = typemax(UInt64); tp = typemax(UInt64)
-                for _ in 1:3                         # interleaved ABBA so drift hits both arms
-                    s = time_ns(); blocked(); tb = min(tb, time_ns() - s)
-                    s = time_ns(); percol();  tp = min(tp, time_ns() - s)
-                end
-                return tp < tb
-            end
-        catch
-            return false
-        end
-    end
-    const _GEMVT_PERSCAN_ONCE = Base.OncePerProcess{Bool}(_measure_gemvt_perscan)
-    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_ONCE()
-else
-    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_PREF::Bool
-end
+# PIN over DERIVE, resolved at COMPILE TIME — deliberately NOT a `OncePerProcess` auto-measure.
+# Two independent CI gates rejected the runtime-probe version and both are worth recording:
+#   1. TRIM. Writing the probe's two arms as closures boxed a mutated capture, and the Box leaked into
+#      the trim call graph of every @ccallable that can reach gemv-T — dgbtrf/dgels/dgecon/dtrcon/
+#      dpocon all failed with "unresolved call … Core.getfield(%new()::Box, :contents)". Rewriting the
+#      probe straight-line fixed that. Note the juliac pin does NOT save you here: CI validates trim
+#      WITHOUT the preference set, so the `@static if` compiles the measure branch in.
+#   2. @noalloc. `trmv!` carries a `@strict_contract` AllocCheck all-paths proof, and OncePerProcess's
+#      one-time-init path provably allocates (`jl_set_precompile_field_replace`, lock.jl:725). Any
+#      lazily-measured knob reachable from a noalloc-contracted L2 entry point hits this, whatever the
+#      probe looks like — the measurement itself must not be on that call graph.
+# So the value is a compile-time const: overridable per box by Preference, defaulting to a DERIVED
+# datapath property. `_double_pumped(_HW)` is the same discriminator `_GEMVN_MINNER` already uses for
+# the neighbouring gemv-N routing decision, and it separates the two boxes measured: on a double-pumped
+# 512-bit datapath (Zen4) each op occupies the pipe twice, and the blocked kernel's extra concurrent
+# A-column streams stop paying inside the window; on a native-width datapath with more bandwidth
+# headroom (Zen3 AVX2) blocking always wins.
+#   Zen4 double-pumped ⇒ true  — per-column wins in-window, up to 1.35× (gemvT 0.939 → 0.99 vs AOCL)
+#   Zen3 native AVX2   ⇒ false — per-column NEVER wins at any size (0.74–0.97); the Derive-only
+#                                version of this route regressed galen gemvT to 0.69 vs AOCL
+# HONEST LIMIT: this is a 2-point fit on a physically-motivated property, not a law. Zen5 (native 512,
+# not double-pumped) therefore takes the conservative `false` arm and is UNVALIDATED — if it turns out
+# to want the per-column route, pin `gemvt_perscan = true` there rather than widening the formula on
+# one more data point.
+const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", _double_pumped(_HW))::Bool
+@inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_PREF
 @inline _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T} =
     m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2 && _gemvt_perscan_ok()
 
