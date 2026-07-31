@@ -54,7 +54,14 @@ const _prev_gbcr = load_preference(PUREBLAS_UUID, "gbtrf_cross")
 # And `gbtrf_nb`: the banded-LU panel width is a Measure-tier OncePerProcess race, and a runtime
 # benchmark is not trim-safe. 16 is the Zen4/Zen3 F64 optimum (both boxes agree in absolute terms).
 const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
+# And `gemvt_perscan`: gemv-T routes its columns per-column instead of NC-blocked inside a derived
+# cache window, but ONLY on boxes where that wins — the sign is µarch-dependent (Zen4 up to 1.35x,
+# Zen3 never; the Derive-only version regressed Zen3 gemvT to 0.69 vs AOCL). The decision is a
+# OncePerProcess runtime benchmark, so it is not trim-safe; pin it to compile the measure branch out.
+# `false` = always blocked = the conservative arm that is correct on every box measured so far.
+const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
+set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
@@ -71,6 +78,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "ger_panel_np"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "ger_panel_np" => _prev_ger; force = true)
+    end
+    if _prev_gvtp === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_perscan"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => _prev_gvtp; force = true)
     end
     if _prev_brd === nothing
         delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)

@@ -473,17 +473,63 @@ end
 
 # gemv-T: column-block (4 cols/pass sharing each x W-chunk) for all n. Sharing x cuts both the small-n
 # per-column overhead AND the huge-n x-restream (x exceeds L1 at n≈4096; per-column re-read it n times).
-# Route gemv-T to the per-column dot instead of the NC-blocked kernel. See the regime table at the call
-# site. Both arms are DERIVED from detected cache geometry (req#8 Derive tier — no literal, no knob):
-#   `m*n*sizeof(T) > _L2_BYTES`  — past L2 the op stops being compute-bound, so the blocked kernel's
-#                                  NC independent accumulators no longer buy anything.
-#   `m*sizeof(T) <= _L1_BYTES÷2` — x (length m for the T form) still fits comfortably in L1 beside the
-#                                  streaming A column, so re-reading it per column is free. The ÷2
-#                                  leaves room for the A stream itself; at exactly L1 the A traffic
-#                                  evicts x and blocking wins again (measured: 2048 = L1/2 per-column,
-#                                  3072 = 0.75·L1 blocked).
+# Route gemv-T to the per-column dot instead of the NC-blocked kernel, inside a cache-geometry WINDOW,
+# and only on boxes where that actually wins. PDM: the window is DERIVE, the decision to use it is
+# MEASURE — because the sign is µarch-dependent and no formula over detected consts predicts it.
+#
+# WINDOW (Derive, no literal). Blocking amortises the x RE-READ across NC columns; it can only matter
+# when x is not already free to re-read and the op is not compute-bound:
+#   `m*n*sizeof(T) > _L2_BYTES`  — past L2 the NC independent accumulators stop being the binding
+#                                  resource (below it the op is compute-bound and blocking's ILP wins).
+#   `m*sizeof(T) <= _L1_BYTES÷2` — x (length m for the T form) still fits L1 beside the streaming A
+#                                  column, so per-column re-reads are free. The ÷2 leaves room for the
+#                                  A stream; once x approaches L1 the A traffic evicts it and
+#                                  amortising x is the whole game again.
+#
+# DECISION (Measure, req#8b — a one-box derivation was caught here). Inside that window, per-column
+# beats blocked NC=4 by up to 1.35× on wintermute (Zen4, 16 MB L3, mobile) and NEVER wins on galen
+# (Zen3, 32 MB L3/CCX, desktop) — measured per-column ÷ blocked, GB/s:
+#     n=      128   256   512   768  1024  1536  2048  3072  4096
+#   Zen4     0.83  0.90  1.10  1.09  1.22  1.30  1.13  0.80  0.71   ⇒ window real
+#   Zen3     0.81  0.86  0.92  0.90  0.97  0.84  0.74  0.74  0.80   ⇒ never
+# Shipping the Derive-only version regressed Zen3 gemvT from 1.04/0.94 to **1.00/0.69** vs AOCL. Same
+# class as `_ger_np` ("intrinsic per-core property, NO derivable formula, OPPOSITE sign across µarchs"),
+# so it gets the same treatment: Preference-pinnable, else auto-measured once per process.
+const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
+@static if isnothing(_GEMVT_PERSCAN_PREF)
+    function _measure_gemvt_perscan()::Bool
+        Base.generating_output() && return false     # never burn a measure during precompile; default
+        try                                          # to today's shipped behaviour (always blocked)
+            # Probe INSIDE the window, derived: A ≈ 4×L2 (clearly past L2) with m capped so x ≤ L1/2.
+            m = min(isqrt(4 * _L2_BYTES ÷ sizeof(Float64)), _L1_BYTES ÷ 2 ÷ sizeof(Float64))
+            m -= m % 4; m < 64 && return false
+            n = m
+            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(0.0, n)
+            GC.@preserve A x y begin
+                pA = pointer(A); px = pointer(x); py = pointer(y); ld = stride(A, 2); sz = sizeof(Float64)
+                blocked() = (j = 0; while j + 4 <= n
+                    _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true)); j += 4 end)
+                percol() = (@inbounds for j in 0:(n - 1)
+                    unsafe_store!(py, _dot_simd(m, pA + j * ld * sz, px, Float64), j + 1) end)
+                blocked(); percol()                  # untimed warmup: absorb JIT for both arms
+                tb = typemax(UInt64); tp = typemax(UInt64)
+                for _ in 1:3                         # interleaved ABBA so drift hits both arms
+                    s = time_ns(); blocked(); tb = min(tb, time_ns() - s)
+                    s = time_ns(); percol();  tp = min(tp, time_ns() - s)
+                end
+                return tp < tb
+            end
+        catch
+            return false
+        end
+    end
+    const _GEMVT_PERSCAN_ONCE = Base.OncePerProcess{Bool}(_measure_gemvt_perscan)
+    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_ONCE()
+else
+    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_PREF::Bool
+end
 @inline _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T} =
-    m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2
+    m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2 && _gemvt_perscan_ok()
 
 @inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
