@@ -1788,13 +1788,20 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # This is why `gemvN` gates while `trmv`/`trsv` missed at the SAME sizes: gemvN got minner, this
 # scatter never did. No new tuning constant — `_GEMVN_MINNER` (Derive: datapath-gated, OFF on
 # native-512 Zen5) and `_GEMVN_MINNER_MAXA` are reused verbatim from the dispatcher.
-@inline function _tri_scat!(yv, Av, xv, α)
-    m = size(Av, 1); n = size(Av, 2)
-    if _GEMVN_MINNER && m * n * sizeof(eltype(Av)) <= _GEMVN_MINNER_MAXA
-        return _gemv_n_paneldrv_minner!(m, n, α, Av, xv, yv, one(α), Val(false))
-    end
-    return _gemv_n_paneldrv!(m, n, α, Av, xv, yv, one(α), Val(false))
-end
+# Always the plain NP=8 panel driver — NOT the dispatcher, and NOT minner.
+#   • not the dispatcher: at n = NB = 64 columns it would take the row-block path, measured 49.8 GB/s
+#     at m=4096 against the panel's 63.5 (−22%), because a sub-block's columns are a full parent-lda
+#     apart. That is the original reason this call is direct.
+#   • not minner: minner wins on SQUARE mid-n (which is why the dispatcher prefers it there), but the
+#     scatter is TALL-SKINNY and it loses at that shape. Measured GB/s, n=64 cols, β=1 accumulate:
+#         m=       1024   2048   4096   8192
+#       paneldrv  77.58  69.92  63.49  63.29   ← ships
+#       minner    74.87  67.78  60.95  62.95
+#     Consistent 3–4% for paneldrv at every height. Routing this call through minner (briefly done on
+#     a "small PB-self gain" reading of a whole-op sweep) is therefore a small REGRESSION here, and the
+#     scatter is 56–58% of blocked trsv's runtime, so it is not free. Shape matters more than the
+#     residency window: measure the kernel at the shape the CALLER issues, not at a square one.
+@inline _tri_scat!(yv, Av, xv, α) = _gemv_n_paneldrv!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(α), Val(false))
 # T-form off-diagonal: gemv-T kernel directly (no backend kwarg layer — ~200 ns/call dominated the
 # few off-diagonal calls at mid n). y_I += α·Avᵀ·xv  (β=1 accumulate).
 @inline _tri_scatT!(yv, Av, xv, α) = _gemv_t_simd!(size(Av, 1), size(Av, 2), α, Av, xv, one(α), yv, Val(false))
