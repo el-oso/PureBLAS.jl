@@ -473,9 +473,37 @@ end
 
 # gemv-T: column-block (4 cols/pass sharing each x W-chunk) for all n. Sharing x cuts both the small-n
 # per-column overhead AND the huge-n x-restream (x exceeds L1 at n≈4096; per-column re-read it n times).
+# Route gemv-T to the per-column dot instead of the NC-blocked kernel. See the regime table at the call
+# site. Both arms are DERIVED from detected cache geometry (req#8 Derive tier — no literal, no knob):
+#   `m*n*sizeof(T) > _L2_BYTES`  — past L2 the op stops being compute-bound, so the blocked kernel's
+#                                  NC independent accumulators no longer buy anything.
+#   `m*sizeof(T) <= _L1_BYTES÷2` — x (length m for the T form) still fits comfortably in L1 beside the
+#                                  streaming A column, so re-reading it per column is free. The ÷2
+#                                  leaves room for the A stream itself; at exactly L1 the A traffic
+#                                  evicts x and blocking wins again (measured: 2048 = L1/2 per-column,
+#                                  3072 = 0.75·L1 blocked).
+@inline _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T} =
+    m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2
+
 @inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # Column blocking exists to amortise the x RE-READ across NC columns. It only pays in two
+        # regimes, and LOSES between them — route on the physics rather than blocking unconditionally.
+        #   • A ≤ L2: compute-bound, and the NC independent dot accumulators supply the ILP. Blocked.
+        #   • x no longer L1-resident against the A stream: per-column would re-stream x from L2/DRAM
+        #     n times (x traffic ≈ A traffic at n=4096!), so amortising it is the whole game. Blocked.
+        #   • in between — A past L2 but x still comfortably L1-hot — re-reading x is free, and the
+        #     blocked kernel's extra concurrent A-column streams only cost prefetch/TLB. Per-column.
+        # Measured (wintermute, freq-locked, GB/s; per-column ÷ blocked NC=4):
+        #     n=      128    256    512    768   1024   1536   2048   3072   4096
+        #   ratio    0.83   0.90   1.10   1.09   1.22   1.30   1.13   0.80   0.71
+        # `_gemvt_perscan` below reproduces every one of those crossovers on this box: blocked at
+        # 128/256 (A ≤ L2) and at 3072/4096 (x > L1/2), per-column at 512…2048. DERIVE tier — pure
+        # cache geometry over detected consts, no new knob. The per-column arm reuses this function's
+        # OWN remainder path (`_dot_simd` per column), so it is a routing change, not a new kernel:
+        # isolating it showed per-column `_dot_simd` already recovers 1.08-1.21x of the 1.09-1.35x, i.e.
+        # the deficit is the BLOCKING, not the kernel.
         # NC=4 columns (⇒ 4 dot accumulators) per block. MEASURED-AND-KEPT, not an unexamined literal:
         # the standing hypothesis was that 4 chains half-fill Zen4's 2 FMA/cyc × ~4-cyc-latency pipe and
         # that ≥8 would close the mid-n gemvT miss. FALSIFIED 2026-07-31 (wintermute, freq-locked, GF/s,
@@ -491,7 +519,8 @@ end
         # NOTE this also retires the `_gemvt_nc` Measure-tier constant referenced in comments elsewhere
         # (e.g. banded_chol.jl): it was never implemented, and the measurement above says it should not be.
         j = 0
-        while j + 4 <= n
+        blk = !_gemvt_perscan(m, n, T)
+        while blk && j + 4 <= n
             _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))
             j += 4
         end
