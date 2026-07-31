@@ -25,7 +25,7 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
 
 | Level | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.64 / 0.99 | 1.90 / 0.85 |
+| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.65 / 0.99 | 1.91 / 0.94 |
 | BLAS-2 dense | gemv, ger, symv, trmv, trsv | s/d/c/z | ✅ | 🐢 | 1.18 / 0.98 | 1.13 / 0.89 |
 | BLAS-2 banded/packed | gbmv, sbmv, spmv | s/d/c/z | ✅ | 🐰 | 1.56 / 1.06 | 2.02 / 1.11 |
 | BLAS-3 | gemm, symm, syrk, syr2k, trmm, trsm | s/d/c/z | ✅ | 🐢 | 1.20 / 0.93 | 1.41 / 0.81 |
