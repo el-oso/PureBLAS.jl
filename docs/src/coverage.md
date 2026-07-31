@@ -25,13 +25,22 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
 
 | Level | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.0 / 0.97 | 0.95 / 0.84 |
-| BLAS-2 dense | gemv, ger, symv, trmv, trsv | s/d/c/z | ✅ | 🐢 | 1.08 / 0.98 | 0.97 / 0.87 |
-| BLAS-2 banded/packed | gbmv, sbmv, spmv | s/d/c/z | ✅ | 🐰 | 1.14 / 1.1 | 1.12 / 1.11 |
-| BLAS-3 | gemm, symm, syrk, syr2k, trmm, trsm | s/d/c/z | ✅ | 🐢 | 1.08 / 0.95 | 1.02 / 0.9 |
+| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.64 / 0.99 | 1.90 / 0.85 |
+| BLAS-2 dense | gemv, ger, symv, trmv, trsv | s/d/c/z | ✅ | 🐢 | 1.18 / 0.98 | 1.13 / 0.89 |
+| BLAS-2 banded/packed | gbmv, sbmv, spmv | s/d/c/z | ✅ | 🐰 | 1.56 / 1.06 | 2.02 / 1.11 |
+| BLAS-3 | gemm, symm, syrk, syr2k, trmm, trsm | s/d/c/z | ✅ | 🐢 | 1.20 / 0.93 | 1.41 / 0.81 |
 
 GEMM additionally uses Strassen–Winograd (real) and Karatsuba 3M (complex) above a
 size crossover — **beats** OpenBLAS at large `n`.
+
+!!! note "Provenance — BLAS numbers re-measured 2026-07-31"
+    Geomean/worst are over every op and size in the group, pooled across the freq-locked fleet
+    (wintermute Zen4/AVX-512, galen Zen3/AVX2; Zen5 offline for this run), `bench/plots.jl`.
+    **These supersede earlier `ger` figures**, which were measured through a stale local
+    `bench/LocalPreferences.toml` pinning `ger_panel_np = 1` on both boxes — it overrode a
+    correctly-working auto-tune (Zen4 wants 8, Zen3 wants 4) and understated ger by up to 36%
+    at n=2048. The pin is removed and the cache header now records the resolved tuning state
+    (`tune=`) so a run is reproducible from its own provenance.
 
 ## LAPACK — factorizations & solves
 
