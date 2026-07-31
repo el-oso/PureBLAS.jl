@@ -103,3 +103,62 @@ end
         @test relerr(xp, xb) < tol(T)
     end
 end
+
+# iamax with NaN/Inf had NO coverage before 2026-07-31, which is why two proposed optimisations of
+# `_iamax_thresh4!` had to be rejected on review rather than caught by a test: a value max-tree in the
+# hot path lets a NaN lane HIDE a real maximum in the same lane of another block, and the cold path's
+# `maximum(::Vec)` resolves to `fmax` or `fmaximum` depending on SIMD.jl's SUPPORTS_FMAXIMUM_FMINIMUM,
+# so its NaN semantics are not even stable across dependency versions.
+#
+# The oracle is reference netlib `idamax` transcribed directly (init to |x[1]|, sequential strict `>`),
+# NOT `BLAS.iamax`: OpenBLAS's vectorised kernel DISAGREES with netlib on NaN — for [1.0, NaN, 2.0] it
+# returns 2 (picks the NaN) where netlib and PureBLAS return 3 (NaN fails `>`, so it is skipped).
+# Pinning against OpenBLAS here would therefore encode a bug and forbid the correct behaviour.
+# Note the asymmetry this exposes and deliberately preserves: a NaN at position 1 poisons the whole
+# scan (result 1, because DMAX starts as NaN and nothing compares greater), while a NaN anywhere else
+# is simply skipped. That is reference behaviour, not an accident.
+@testitem "iamax NaN/Inf semantics (netlib reference oracle)" begin
+    using PureBLAS
+
+    function ref_iamax(x)                      # netlib idamax, verbatim
+        n = length(x)
+        n < 1 && return 0
+        n == 1 && return 1
+        dmax = abs(x[1]); ix = 1
+        for k in 2:n
+            if abs(x[k]) > dmax
+                dmax = abs(x[k]); ix = k
+            end
+        end
+        ix
+    end
+
+    for T in (Float32, Float64)
+        nan, inf = T(NaN), T(Inf)
+        cases = Vector{T}[
+            T[nan, 1, 2], T[1, nan, 2], T[1, 2, nan], T[nan, nan, nan],
+            T[nan, 1, 9, 3], T[1, inf, 2], T[1, -inf, 2], T[inf, nan, 1],
+            T[nan, inf, 1], T[3, -3, 3],
+            # NaN placed in each SIMD lane/block position, with the true max after it
+            vcat(fill(T(1), 8), T[nan], fill(T(2), 8), T[9]),
+            vcat(fill(T(1), 31), T[nan], fill(T(2), 31), T[9]),
+            vcat(fill(T(1), 64), T[nan], fill(T(2), 64), T[9]),
+            vcat(T[nan], fill(T(1), 128), T[9]),               # NaN first, long ⇒ SIMD path
+            vcat(fill(T(1), 100), T[inf], fill(T(2), 100)),
+            vcat(fill(T(1), 100), T[nan], fill(T(2), 100), T[inf]),
+        ]
+        for x in cases
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
+        # every single-NaN position in a vector long enough to exercise all three kernel tiers
+        for pos in (1, 2, 8, 9, 17, 33, 64, 65, 100, 127, 128)
+            x = collect(T, 1:128); x[pos] = nan
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
+        # NaN AND the true max in the same lane of different blocks — the case a max-tree would break
+        for W in (4, 8), blk in (1, 2, 3)
+            x = fill(T(1), 4W); x[W ÷ 2] = nan; x[blk * W + W ÷ 2] = T(99)
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
+    end
+end
