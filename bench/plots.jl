@@ -82,7 +82,10 @@ end
 # LocalPreferences.toml — so a cache file must carry them to be reproducible from its own header.
 # Add a knob here whenever a new Measure-tier constant starts influencing a benched routine.
 _tunestamp() = try
-    join(("ger_np=$(PureBLAS._ger_np())",), ",")
+    join((
+        "ger_np=$(PureBLAS._ger_np())",
+        "gemvt_perscan=$(PureBLAS._gemvt_perscan_ok())",
+    ), ",")
 catch e
     "unavailable($(typeof(e)))"
 end
