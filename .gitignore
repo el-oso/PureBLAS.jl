@@ -29,3 +29,6 @@ bench/plots_data_*.txt
 
 # Claude Code agent worktrees (embedded git repos — never part of the project)
 .claude/worktrees/
+
+# lite-mode plot output: smoke-test artifacts, explicitly NOT gate numbers (see bench/plots.jl)
+docs/src/assets/*_lite.svg
