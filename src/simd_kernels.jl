@@ -521,9 +521,25 @@ const _IAMAX_NB = min(4, _NVREG - 1)
 @inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = _IAMAX_NB * W
     ld(o) = abs(vload(V, xp + o * sz))
-    gmax = typemin(T); bi = 1; thr = V(gmax); o = 0
+    # Seed from |x[1]|, NOT typemin — reference netlib `idamax` starts `DMAX = DABS(DX(1))`, and seeding
+    # lower silently changed the NaN contract WITH VECTOR LENGTH: `[NaN, 1.0]` returned 1 on the scalar
+    # path (n < 4W) but the index of the true max on this one, because a NaN never beats typemin and so
+    # got skipped, whereas seeding from x[1] makes every later compare-with-NaN false and pins the answer
+    # at 1. Same routine, two different semantics either side of an internal threshold (found 2026-07-31
+    # by the new netlib-oracle NaN testitem). For finite data this is identical — element 1 is simply
+    # accounted for up front instead of via the first compare — and it can only REDUCE cold-path entries,
+    # since the starting threshold is now a real element rather than typemin.
+    # `_iamax_simd_try` gates on n >= 4W, so x[1] always exists here.
+    gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = V(gmax); o = 0
     @inbounds while o + step <= n                     # dependency-free: 4 independent compares vs `thr`
         v0 = ld(o); v1 = ld(o + W); v2 = ld(o + 2W); v3 = ld(o + 3W)
+        # FALSIFIED 2026-07-31: rescanning ONLY the blocks whose mask is non-empty (keeping per-block
+        # `c0..c3 = vN > thr` and guarding each serial walk with `any(cN)`, via a small closure returning
+        # the updated `(gmax, bi, thr)`) is semantically exact and looks like a 4× cut of cold-path work —
+        # but it measured **0.006 vs AOCL, ~160× SLOWER**, at every size. The closure in the loop body
+        # defeats whatever keeps this loop in registers (capture/boxing), and the cost dwarfs the entire
+        # scan it was meant to save. Correctness tests all passed, so ONLY the gate caught it.
+        # If retried, it must be written without a closure — straight-line, no tuple return.
         if any(((v0 > thr) | (v1 > thr)) | ((v2 > thr) | (v3 > thr)))    # rare (running max advances)
             for (j, v) in ((0, v0), (W, v1), (2W, v2), (3W, v3))         # cold path: locate new max + lane
                 bm = v[1]; bl = 1
