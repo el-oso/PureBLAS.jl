@@ -23,16 +23,92 @@ using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); 
 # SEPARATE baseline from OpenBLAS: its caches/SVGs carry an `_aocl` suffix and never mix with OpenBLAS's.
 const REFBK = "aocl" in ARGS ? "aocl" : "mkl" in ARGS ? "mkl" : "openblas"
 REFBK == "mkl" && @eval using MKL
+
+# ══ v3 ARMS ═══════════════════════════════════════════════════════════════════════════════════════
+# EVERY reference is measured in ONE run, interleaved with PureBLAS per round, and the cache stores
+# TIMES — never ratios. Two reasons, and the first is correctness, not convenience:
+#
+#  1. THE GATE IS max(OpenBLAS, AOCL). Until v3 the two references lived in separate cache files from
+#     separate runs, so that max combined numbers that never saw the same machine state — different
+#     frequency history, different page/TLB state, different array addresses. Interleaving all arms
+#     inside one round makes the gate exact instead of approximately-comparable.
+#  2. Ratios are lossy. Stored times give absolute GB/s and GFlop/s for roofline work, let the ratio
+#     definition change without re-measuring, and expose run-to-run drift (an `op=` re-measure and a
+#     `group=` sweep read the SAME trmv@512 cell as 1.001 and 0.959 on 2026-08-01 — a 4% spread that
+#     was invisible while only the quotient was kept).
+#
+# Switching backend is an LBT re-forward BETWEEN timed windows: the `ref` arm closure of every op calls
+# `B.*`, which routes to whatever is currently forwarded, so one closure serves every backend and no
+# per-backend benchmark code exists.
+using OpenBLAS_jll
+const _ARM_PB = "pb"
+# `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
+# iteration path; it is also the one that can silently go stale, which is why every arm carries its own
+# timestamp+commit and the table reports reference age rather than hiding it.
+const _ARMS_SEL = (i = findfirst(a -> startswith(a, "arms="), ARGS);
+                   isnothing(i) ? nothing : split(ARGS[i][6:end], ","))
+# One cell, not a whole op: `op=trmv size=512`. Sizes are matched exactly against the op's own list.
+const _SELSIZE = (i = findfirst(a -> startswith(a, "size="), ARGS);
+                  isnothing(i) ? nothing : parse(Int, ARGS[i][6:end]))
 # AOCL = AMD's Zen-tuned AOCL-BLIS + AOCL-libFLAME, shipped as the `AOCL_jll` artifact (AMD's own release,
 # NOT generic blis_jll/libflame_jll). We LBT-forward its artifact .so paths directly (BLAS→libblis-mt,
 # LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
 # reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
 # single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
-if REFBK == "aocl"
-    ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
-    @eval using AOCL_jll
-    LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # ILP64 BLAS  → libblis-mt.so
-    LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # ILP64 LAPACK → libflame.so
+ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these at init, before any forward
+@eval using AOCL_jll
+
+# Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
+# forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
+# state — the failure mode where you measure AOCL's BLAS against OpenBLAS's LAPACK and never notice.
+function _use_ref!(name::AbstractString)
+    if name == "aocl"
+        LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # BLAS   → libblis-mt.so
+        LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # LAPACK → libflame.so
+    elseif name == "openblas"
+        LinearAlgebra.BLAS.lbt_forward(OpenBLAS_jll.libopenblas_path; clear = true)
+    else
+        error("unknown reference backend $name")
+    end
+    BLAS.set_num_threads(1)      # re-assert through the NEW forward; a fresh backend does not inherit it
+    return name
+end
+
+# Reference arms available this run. `_REF_ARMS` is what gets measured; PureBLAS is always measured
+# unless the cache already holds it and only references were asked for.
+const _REF_ALL = REFBK == "mkl" ? ["mkl"] : ["openblas", "aocl"]
+const _REF_ARMS = isnothing(_ARMS_SEL) ? _REF_ALL : [a for a in _REF_ALL if a in _ARMS_SEL]
+const _DO_PB = isnothing(_ARMS_SEL) || (_ARM_PB in _ARMS_SEL)
+const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _REF_ARMS)
+isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$(join(_REF_ALL, ","))")
+
+# One measured arm of one cell, with ITS OWN provenance. Per-arm (not per-cell) timestamps are the whole
+# point: `arms=pb` rewrites only the pb record, so the reference records keep the date and commit at
+# which they were actually measured and the table can report their age instead of implying freshness.
+struct ArmRec
+    time::String
+    commit::String
+    q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
+end
+const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
+const CellData = Dict{String, ArmRec}           # cached:  arm => record
+
+# Rotate arm order by round. With 2 arms this is exactly the old ABBA alternation; with k arms it keeps
+# each arm in the cold first slot equally often, which is the property ABBA was buying.
+_round_arms(r::Int) = circshift(_ACTIVE_ARMS, r - 1)
+# Stamp each freshly measured arm with the time and commit it was measured at. Done HERE, at the point of
+# measurement, rather than at save time: a run that measures L1 at 14:00 and CL3 at 17:00 must not write
+# 17:00 against the L1 cells, which is exactly the imprecision the v2 single header commit had.
+_stamp(acc::ArmData) = CellData(
+    a => ArmRec(Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, q) for (a, q) in acc
+)
+# Progress line only: median ratio of the first available reference against pb this round.
+function _round_med(qs::ArmData)
+    haskey(qs, _ARM_PB) || return NaN
+    for a in _REF_ARMS
+        haskey(qs, a) && return median(_ratio(qs[a], qs[_ARM_PB]))
+    end
+    return NaN
 end
 const REFNAME = REFBK == "mkl" ? "MKL" : REFBK == "aocl" ? "AOCL" : "OpenBLAS"
 # cache/SVG filename suffix: "" for OpenBLAS (the default baseline — its artefacts are UNTOUCHED), "_mkl"/"_aocl" otherwise
@@ -44,7 +120,7 @@ BLAS.set_num_threads(1)
 # later multi-host plot loads several `plots_data_<host>.txt` and must tell Zen4/Zen3/Zen5 apart — the
 # filenames are bare hostnames and the SIMD width alone can't (Zen4 & Zen5 are both AVX-512). Same-ISA
 # boxes disambiguate via `slug=`/`isa=` CLI overrides (e.g. neuromancer runs `slug=zen5 isa=Zen5`). ─────
-const _BENCH_VERSION = 2   # v2 = pooled per-round ratios; v1 = single-window. Bump ⇒ old caches refused.
+const _BENCH_VERSION = 3   # v3 = per-arm TIMES + per-arm provenance; v2 = pooled ratios (unconvertible). Bump ⇒ old caches refused.
 const _W64P = PureBLAS._vwidth(Float64)
 # µarch slug DERIVED from CPU detection (CLAUDE.md req#7 — not a manual flag), so Zen4 vs Zen5 (both
 # AVX-512) disambiguate on their own: Zen4 is double-pumped 512, Zen5 is native. Override stays as an
@@ -60,7 +136,7 @@ const _AUTOSLUG = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "avx512" : "zen5
 const _AUTOISA = _W64P == 8 ? "AVX-512" : _W64P == 4 ? "AVX2" : _W64P == 2 ? "NEON" : "SIMD"
 const ISA = isnothing(_ISAOVR) ? _AUTOISA : _ISAOVR
 const _SLUGB = isnothing(_SLUGOVR) ? _AUTOSLUG : _SLUGOVR
-const SLUG = "$(_SLUGB)$(REFSUF)"
+const SLUG = _SLUGB   # v3: identifies the MACHINE, not the reference — one cache serves all arms
 # AUTHORITATIVE µarch name, resolved on the MEASURING machine (from its own CpuId-derived slug) and stamped
 # into the cache header. The multi-host plot then READS this — it must NOT re-derive µarch at plot time from
 # the plotting box's local vector width (that was the mislabel bug: three caches all relabelled as whatever
@@ -130,7 +206,7 @@ function _meas!(vec, lvl, nm, sweeper)
 end
 
 # name => per-size samples: [(size, [ratio,ratio,…]), …]. The single data model the renderer consumes.
-const OpData = Pair{String, Vector{Tuple{Int, Vector{Float64}}}}
+const OpData = Pair{String, Vector{Tuple{Int, CellData}}}
 geomin(op) = (m = [median(v) for (s, v) in op]; (exp(sum(log, m) / length(m)), minimum(m)))  # geomean, worst
 # Hermitian-positive-definite operand for (z)potrf, memoized per (T,size): the O(n³) `A*A'` is built ONCE;
 # each sample gets a fresh O(n²) copy (potrf is destructive). Avoids an OpenBLAS gemm + 2 big allocs PER
@@ -140,12 +216,14 @@ _hpd(T, s) = copy(get!(() -> (A = randn(T, s, s); A * A' + s * I), _HPD, (T, s))
 
 # Every Chairmarks sample time (seconds) — it reports min but stores all timings; we use the full set.
 _times(b) = Float64[smp.time for smp in b.samples]
-# Quantile-paired ratio distribution: q-th quantile of OB time ÷ q-th quantile of PB time. q=0.5 IS the
-# median ratio (the gate number); the spread across q gives the violin body. Robust to unequal counts.
-_qratios(bo, bp) = (
-    to = _times(bo); tp = _times(bp); qs = range(0.03, 0.97; length = 48);
-    [quantile(to, q) / quantile(tp, q) for q in qs]
-)
+# v3: store the QUANTILE VECTOR of each arm, not the quotient. `_qvec` reduces a window's samples to the
+# same 48 quantiles the ratio used to be formed from, so `ref_q ./ pb_q` reproduces the old `_qratios`
+# EXACTLY — the pairing is preserved, nothing is approximated, and the absolute times survive.
+const _QS = range(0.03, 0.97; length = 48)
+_qvec(b) = (t = _times(b); [quantile(t, q) for q in _QS])
+# Ratio of two stored quantile vectors. q=0.5 is the median ratio (the gate number); the spread across q
+# is the violin body. Defined once here so tables and plots cannot drift apart in how they derive it.
+_ratio(qref::Vector{Float64}, qpb::Vector{Float64}) = qref ./ qpb
 
 # L1/L2 sweep: `_rounds_light(s)` rounds of consecutive ABBA-ordered OB/PB `@be` windows per size, pooling
 # the per-round `_qratios`. `evals=1` reruns the setup `mk(s)` per sample so
@@ -153,24 +231,31 @@ _qratios(bo, bp) = (
 # allocation is EXCLUDED from the timed core; `reps` amortizes the timer for tiny ops. All sample timings
 # feed the ratio distribution.
 function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15)
-    out = Tuple{Int, Vector{Float64}}[]
+    out = Tuple{Int, CellData}[]
     for s in sizes
+        !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
         reps = repfn(s)
-        rounds = _rounds_light(s); acc = Float64[]; rmeds = Float64[]
+        rounds = _rounds_light(s); rmeds = Float64[]
+        # Accumulate per arm. Every arm is measured inside the SAME round, so the quantile vectors that
+        # later divide into a ratio saw one machine state — that is what makes max(OB,AOCL) legitimate.
+        acc = Dict{String, Vector{Float64}}()
         for r in 1:rounds
-            # ABBA: alternate which side runs first each round → cancels the "2nd window runs warmer" bias.
-            # `_qratios` per round keeps each OB/PB pairing temporally tight; POOL the ratios (never times).
-            if isodd(r)
-                bo = @be mk(s) (c -> work_ob(c, reps)) evals = 1 samples = samples seconds = seconds
-                bp = @be mk(s) (c -> work_pb(c, reps)) evals = 1 samples = samples seconds = seconds
-            else
-                bp = @be mk(s) (c -> work_pb(c, reps)) evals = 1 samples = samples seconds = seconds
-                bo = @be mk(s) (c -> work_ob(c, reps)) evals = 1 samples = samples seconds = seconds
+            # Rotate arm order every round (the ABBA generalisation): with k arms, rotating by r keeps
+            # every arm equally often in the cold first slot, which is what the old A/B alternation did.
+            arms = _round_arms(r)
+            qs = Dict{String, Vector{Float64}}()
+            for a in arms
+                w = a == _ARM_PB ? work_pb : (_use_ref!(a); work_ob)
+                b = @be mk(s) (c -> w(c, reps)) evals = 1 samples = samples seconds = seconds
+                qs[a] = _qvec(b)
             end
-            qr = _qratios(bo, bp); append!(acc, qr); push!(rmeds, median(qr))
+            for (a, q) in qs
+                append!(get!(acc, a, Float64[]), q)
+            end
+            push!(rmeds, _round_med(qs))
         end
         rounds > 1 && (println(stderr, "    n=$s rounds: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
-        push!(out, (s, acc))
+        push!(out, (s, _stamp(acc)))
     end
     return out
 end
@@ -187,8 +272,9 @@ _reps_cubic(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic)
-    out = Tuple{Int, Vector{Float64}}[]
+    out = Tuple{Int, CellData}[]
     for s in sizes
+        !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
         # reps fresh contexts per sample: setup (EXCLUDED from timing) pre-generates them, the core runs the
         # destructive op on each. reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a
         # single sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
@@ -198,43 +284,27 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
         reps = repsof(s)
         rounds = _rounds_heavy(s)
         secs = s >= 1024 ? 2.0 : seconds   # large-n windows are seconds-bound; 2.0 is plenty and ~halves cost
-        acc = Float64[]; rmeds = Float64[]
+        acc = ArmData(); rmeds = Float64[]
         for r in 1:rounds
-            if isodd(r)   # ABBA order alternation (fires only where rounds>1; n≥512 uses 1 round)
-                bo = @be [mk(s) for _ in 1:reps] (
+            qs = ArmData()
+            for a in _round_arms(r)      # rotated (generalised ABBA); reference switch is outside the window
+                f = a == _ARM_PB ? pb1 : (_use_ref!(a); ob1)
+                b = @be [mk(s) for _ in 1:reps] (
                     cs -> (
                         v = 0.0; for c in cs
-                            v += ob1(c)
+                            v += f(c)
                         end; v
                     )
                 ) evals = 1 samples = samples seconds = secs
-                bp = @be [mk(s) for _ in 1:reps] (
-                    cs -> (
-                        v = 0.0; for c in cs
-                            v += pb1(c)
-                        end; v
-                    )
-                ) evals = 1 samples = samples seconds = secs
-            else
-                bp = @be [mk(s) for _ in 1:reps] (
-                    cs -> (
-                        v = 0.0; for c in cs
-                            v += pb1(c)
-                        end; v
-                    )
-                ) evals = 1 samples = samples seconds = secs
-                bo = @be [mk(s) for _ in 1:reps] (
-                    cs -> (
-                        v = 0.0; for c in cs
-                            v += ob1(c)
-                        end; v
-                    )
-                ) evals = 1 samples = samples seconds = secs
+                qs[a] = _qvec(b)
             end
-            qr = _qratios(bo, bp); append!(acc, qr); push!(rmeds, median(qr))
+            for (a, q) in qs
+                append!(get!(acc, a, Float64[]), q)
+            end
+            push!(rmeds, _round_med(qs))
         end
         rounds > 1 && (println(stderr, "    n=$s rounds: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
-        push!(out, (s, acc))
+        push!(out, (s, _stamp(acc)))
     end
     return out
 end
@@ -1105,7 +1175,7 @@ function run_cmplx_benchmarks()
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
-const CACHE = joinpath(@__DIR__, "plots_data_$(gethostname())$(REFSUF)$(_LITE ? "_lite" : "").txt")
+const CACHE = joinpath(@__DIR__, "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")   # v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to the rendered views
 function save_cache(path, groups)
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
@@ -1124,11 +1194,21 @@ function save_cache(path, groups)
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
             "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())"
         )
-        for (lvl, d) in groups, (nm, op) in d
-            println(io, lvl, "\t", nm, "\t", join(("$(s)=$(join(v, ","))" for (s, v) in op), ";"))
+        # v3 record: ONE LINE PER CELL, one field per measured arm, each carrying its own timestamp and
+        # commit. Per-arm provenance is what makes `arms=pb` safe to use: it rewrites only the pb field,
+        # so the reference fields still say when they were actually measured and the table reports their
+        # age rather than implying they are as fresh as the run that produced the page.
+        #   <lvl> <op> <size> pb|<iso>|<commit>|t1,..,t48  openblas|<iso>|<commit>|t1,..  aocl|...
+        # Times are SECONDS (the quantiles of that arm's sample times). Ratios are derived, never stored.
+        for (lvl, d) in groups, (nm, op) in d, (s, cell) in op
+            fields = [
+                "$(a)|$(rec.time)|$(rec.commit)|$(join(rec.q, ","))"
+                    for (a, rec) in sort!(collect(cell); by = first)
+            ]
+            println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
         end
     end
-    return println("cached ratio data → $path")
+    return println("cached arm times → $path")
 end
 # Returns (groups, meta::NamedTuple). meta carries version/slug/isa/host from the header (µarch identity
 # for the multi-host overlay). Refuses a cache from an older methodology version (forces re-measure).
@@ -1146,16 +1226,22 @@ function load_cache(path)
             )
             continue
         end
-        lvl, nm, blocks = split(ln, "\t")
-        op = Tuple{Int, Vector{Float64}}[]
-        for blk in split(blocks, ";")
-            sp = split(blk, "="); push!(op, (parse(Int, sp[1]), parse.(Float64, split(sp[2], ","))))
+        parts = split(ln, "\t")
+        length(parts) >= 4 || continue                       # v2 line shape ⇒ let the version check below speak
+        lvl, nm, ssz = String(parts[1]), String(parts[2]), parse(Int, parts[3])
+        cell = CellData()
+        for f in parts[4:end]
+            a, tstamp, cmt, csv = split(f, "|"; limit = 4)
+            cell[String(a)] = ArmRec(String(tstamp), String(cmt), parse.(Float64, split(csv, ",")))
         end
-        push!(get!(g, String(lvl), OpData[]), String(nm) => op)
+        ops = get!(g, lvl, OpData[])
+        i = findfirst(p -> p.first == nm, ops)
+        isnothing(i) ? push!(ops, nm => [(ssz, cell)]) : push!(ops[i].second, (ssz, cell))
     end
     meta.version == _BENCH_VERSION || error(
-        "cache $path is methodology v$(meta.version); this is " *
-            "v$(_BENCH_VERSION) (pooled per-round ratios) — re-measure with `bench` (old numbers aren't comparable)"
+        "cache $path is methodology v$(meta.version); this is v$(_BENCH_VERSION) (per-arm TIMES with " *
+            "per-arm provenance). v2 stored only the quotient, so it cannot be converted — the arm times " *
+            "were never written. Re-measure with `bench`."
     )
     return g, meta
 end
@@ -1184,7 +1270,10 @@ function load_fleet()
     fleet = Tuple{NamedTuple, Dict{String, Vector{OpData}}}[]
     for f in sort(readdir(@__DIR__))
         (startswith(f, "plots_data_") && endswith(f, ".txt")) || continue
-        (occursin("_aocl", f) ? "aocl" : occursin("_mkl", f) ? "mkl" : "openblas") == REFBK || continue  # baseline ↔ its own caches; never mix
+        # v3: no reference filter. One cache per host carries every arm, and `_series` picks the arm for
+        # the view being rendered — so the "never mix baselines" rule is now enforced by construction
+        # (each ratio divides two arms measured in the SAME round) rather than by filename discipline.
+        (occursin("_aocl", f) || occursin("_mkl", f)) && continue   # skip leftover v2 split caches
         occursin("_lite", f) == _LITE || continue
         try                                                    # a stale/foreign/half-written cache must NOT
             g, meta = load_cache(joinpath(@__DIR__, f))        # abort the whole fleet render — skip it loudly
@@ -1205,7 +1294,33 @@ _opsin(fleet, gk) = (
         (nm in ops) || push!(ops, nm)
     end; ops
 )
-_series(g, gk, op) = (i = findfirst(p -> p.first == op, get(g, gk, OpData[])); isnothing(i) ? nothing : get(g, gk, OpData[])[i].second)
+# THE one place a ratio is formed for output. Everything downstream (gen_table, svg_panels, geomin)
+# consumes `[(size, ratios)]` exactly as it did under v2, so deriving here — rather than at each call
+# site — is what keeps tables and plots from drifting apart in how they define the number.
+# Cells missing either arm are dropped: `arms=pb` on a fresh cache legitimately has no reference yet,
+# and a half-populated series must not be silently plotted as if it were complete.
+function _series(g, gk, op, ref::AbstractString = REFBK)
+    ops = get(g, gk, OpData[])
+    i = findfirst(p -> p.first == op, ops)
+    isnothing(i) && return nothing
+    out = Tuple{Int, Vector{Float64}}[]
+    for (s, cell) in ops[i].second
+        (haskey(cell, ref) && haskey(cell, _ARM_PB)) || continue
+        push!(out, (s, _ratio(cell[ref].q, cell[_ARM_PB].q)))
+    end
+    return out
+end
+
+# Age of the reference arms behind a rendered view, so a page can say how old its baseline is instead of
+# implying it matches the run that produced it. Returns (oldest, newest) ISO stamps over the cells used.
+function _ref_age(g, ref::AbstractString = REFBK)
+    ts = String[]
+    for (_, ops) in g, (_, sizes) in ops, (_, cell) in sizes
+        haskey(cell, ref) && push!(ts, cell[ref].time)
+    end
+    isempty(ts) && return ("–", "–")
+    return (minimum(ts), maximum(ts))
+end
 
 function svg_panels(path, title, fleet, gk)
     ops = _opsin(fleet, gk); isempty(ops) && return
@@ -1311,10 +1426,28 @@ else
         isfile(CACHE) || error("subset re-measure (op=/group=) needs an existing full cache at $CACHE — run a full `bench` first")
         g, meta = load_cache(CACHE)   # load_cache refuses a non-v2 cache
         meta.slug == SLUG || error("subset slug ($SLUG) ≠ cache slug ($(meta.slug)) — merging would relabel the µarch; re-run full `bench`")
-        for (lvl, ops) in measured, (nm, r) in ops
-            gl = get!(g, lvl, OpData[]); filter!(p -> p.first != nm, gl); push!(gl, nm => r)
+        # PER-ARM, PER-CELL merge. v2 replaced a whole op, which was fine when a run always measured both
+        # sides. In v3 `arms=pb` measures only PureBLAS, so replacing the op would DELETE the reference
+        # arms and silently turn the next table into "no reference data". Merge arm-by-arm instead: a cell
+        # keeps every arm it had, each with the provenance of whenever that arm was last measured.
+        # counted up front: `nc += 1` inside a top-level `for` would create a soft-scope local
+        nc = sum((length(cells) for (_, ops) in measured for (_, cells) in ops); init = 0)
+        for (lvl, ops) in measured, (nm, cells) in ops, (s, fresh) in cells
+            gl = get!(g, lvl, OpData[])
+            i = findfirst(p -> p.first == nm, gl)
+            isnothing(i) && (push!(gl, nm => Tuple{Int, CellData}[]); i = length(gl))
+            sizes = gl[i].second
+            j = findfirst(t -> t[1] == s, sizes)
+            if isnothing(j)
+                push!(sizes, (s, copy(fresh)))
+            else
+                merge!(sizes[j][2], fresh)      # fresh arms win; untouched arms keep their own stamps
+            end
         end
-        println("merged $(sum(length(ops) for ops in values(measured))) re-measured op(s) into $CACHE")
+        for ops in values(g), (_, sizes) in ops
+            sort!(sizes; by = first)          # a newly inserted `size=` cell must not land out of order
+        end
+        println("merged $nc re-measured cell(s) [arms: $(join(_ACTIVE_ARMS, ","))] into $CACHE")
     else
         g = measured
     end
@@ -1347,9 +1480,26 @@ else
     end
     println("wrote gen_table$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
 end
-# gate summary for THIS host's just-measured/loaded data
-for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, op) in get(g, lvl, OpData[])
-    geo, mn = geomin(op)
-    @printf("%-3s %-8s geomean=%.2f  worst=%.2f  %s\n", lvl, nm, geo, mn, mn >= 1.0 ? "PASS" : "FAIL")
+# Gate summary for THIS host. v3 holds every arm in one cache, so this is the FIRST version that can
+# state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of
+# eyeballing two separately-measured tables. `gate` is the worst over cells of min over references,
+# i.e. the margin against whichever reference is faster at each individual size.
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in get(g, lvl, OpData[])
+    per = Dict{String, Tuple{Float64, Float64}}()
+    for r in _REF_ALL
+        ps = _series(g, lvl, nm, r)
+        (isnothing(ps) || isempty(ps)) && continue
+        per[r] = geomin(ps)
+    end
+    isempty(per) && continue
+    # worst cell against the FASTER reference at that cell = the gate margin
+    gate = Inf
+    for (_, cell) in cells
+        haskey(cell, _ARM_PB) || continue
+        rs = [median(_ratio(cell[r].q, cell[_ARM_PB].q)) for r in _REF_ALL if haskey(cell, r)]
+        isempty(rs) || (gate = min(gate, minimum(rs)))
+    end
+    txt = join((@sprintf("%s %.2f/%.2f", r, per[r][1], per[r][2]) for r in _REF_ALL if haskey(per, r)), "  ")
+    @printf("%-3s %-8s %s   gate=%.3f %s\n", lvl, nm, txt, gate, gate >= 1.0 ? "PASS" : "FAIL")
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"
