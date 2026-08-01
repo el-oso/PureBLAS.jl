@@ -186,6 +186,11 @@ function _gbmv!(tr::Bool, cj::Bool, m::Integer, n::Integer, kl::Integer, ku::Int
     if !cj && _l2_simd_ok(AB, x, y, incx, incy)
         αT = convert(eltype(AB), α); βT = convert(eltype(AB), β)
         if tr
+            # α==0 ⇒ y := βy, AB and x unreferenced. The T kernel fuses β, so it is entered before any
+            # α check — unlike the N arm below and the generic arm at the bottom, which both guard.
+            if iszero(α)
+                _scale_y!(ylen, βT, y, 1); return y
+            end
             return _gbmv_t_simd!(m, n, kl, ku, αT, AB, x, βT, y)         # β fused (no pre-scale pass)
         else
             _scale_y!(ylen, βT, y, 1); iszero(α) && return y

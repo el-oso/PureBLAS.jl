@@ -275,8 +275,13 @@ end
     return y
 end
 function _hpmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Number, y, incy::Integer)
+    # `incx == 1` is the BLAS increment, NOT the Julia stride: a `view(v, 1:2:7)` passed with incx=1 is a
+    # StridedVector with stride 2, and the pointer kernel below would read it contiguously — wrong y, or
+    # an OOB read for a reverse view. The real analogue `_pk2_simd_ok` checks all three strides; this gate
+    # did not. Found 2026-08-01 by adversarial review.
     if incx == 1 && incy == 1 && eltype(AP) <: BlasComplex && eltype(x) === eltype(AP) && eltype(y) === eltype(AP) &&
-            AP isa StridedVector && x isa StridedVector && y isa StridedVector
+            AP isa StridedVector && stride(AP, 1) == 1 &&
+            x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
         _scale_y!(Int(n), convert(eltype(AP), β), y, 1); iszero(α) && return y
         return _hpmv_cmplx_simd!(up, Int(n), convert(eltype(AP), α), AP, x, y)
     end
@@ -575,6 +580,10 @@ end
 
 # hpr:  A := α·x·xᴴ + A  (α real, A Hermitian; diagonal forced real)
 function _hpr!(up::Bool, n::Integer, α::Number, x, incx::Integer, AP)
+    # α==0 ⇒ AP untouched (reference zhpr returns immediately), which its siblings `_spr!`/`_spr2!`/
+    # `_hpr2!` all do. Without it the diagonal store below still runs and strips the imaginary part of
+    # every AP diagonal entry, and any Inf/NaN in x yields `x[i]*tmp = Inf*0 = NaN` in the off-diagonals.
+    iszero(α) && return AP
     n = Int(n); sx = _start(n, incx); a = real(α)
     @inbounds for j in 1:n
         xj = _ld(x, sx + (j - 1) * incx)

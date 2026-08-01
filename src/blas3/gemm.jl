@@ -2439,6 +2439,19 @@ end
 end
 @inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
+    # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
+    # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
+    # quick-return already; the tiny, Strassen and 3M routes did NOT, and would compute the product
+    # first and scale by zero, turning Inf·0 into NaN in C. Hoisting it here covers every route at
+    # once and also skips a full O(n³) Strassen recursion for what is only a scale of C.
+    # Restricted to BlasReal/BlasComplex ON PURPOSE: for a ForwardDiff `Dual` α with zero value but a
+    # nonzero partial, `iszero` is true while the derivative is not, so quick-returning would silently
+    # drop it. The AD path keeps computing the product. Every pre-existing α==0 guard here is likewise
+    # inside a `T <: BlasReal` method — widening this to all T would have been the regression.
+    if T <: Union{BlasReal, BlasComplex} && (iszero(alpha) || k == 0)
+        _scale_C!(C, m, n, beta)
+        return C
+    end
     if T <: BlasReal && _strided1(C)
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
@@ -2465,7 +2478,14 @@ end
             _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
         end
     elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _CGEMM_TINY
-        if _CGEMM_3M && _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX && min(m, n, k) >= _CGEMM_3M_KMIN
+        # `_strided1(A)/(B)` is REQUIRED, not defensive: `_split3!` honours an arbitrary COLUMN stride via
+        # `ldm` but hardcodes ROW stride 1 (`unsafe_load(pm, (j-1)*ldm*2 + 2i - 1)`). Its docstring says
+        # "any column stride", which is exactly true and exactly why the row assumption reads as covered.
+        # Without this, `@view P[1:2:end, :]` silently reads the wrong rows — plausible magnitudes, no
+        # error. Both sibling branches (real Strassen, complex unpacked) and the 3M hemm caller already
+        # guard; this one did not. Found 2026-08-01 by adversarial review.
+        if _CGEMM_3M && _strided1(A) && _strided1(B) &&
+           _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX && min(m, n, k) >= _CGEMM_3M_KMIN
             _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)   # Karatsuba 3M: beats OB at mid-n
         elseif !tA && _strided1(A) && _strided1(B) && max(m, n, k) <= _CGEMM_UNPACK_MAX
             _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, A, B, beta, C)

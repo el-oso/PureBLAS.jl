@@ -160,5 +160,15 @@ end
             x = fill(T(1), 4W); x[W ÷ 2] = nan; x[blk * W + W ÷ 2] = T(99)
             @test PureBLAS.iamax(x) == ref_iamax(x)
         end
+        # NaN immediately followed by the UNIQUE global max, at every alignment. This is the case that
+        # discriminates a block-local rescan seed from netlib's running-max walk: if the rescan seeds its
+        # block max from lane 1 and that lane is the NaN, the block is silently dropped and the true max
+        # is never seen. The `collect(1:128)` sweep above cannot catch it — there a LATER block always
+        # holds a bigger element, so the answer comes out right despite the dropped block. Sweeping every
+        # p covers lane 1 of every block for every vector width. Regression for the 2026-08-01 fix.
+        for p in 1:127
+            x = fill(T(1), 128); x[p] = nan; x[p + 1] = T(99)
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
     end
 end
