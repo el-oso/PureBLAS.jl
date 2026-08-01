@@ -25,22 +25,53 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
 
 | Level | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.65 / 0.99 | 1.91 / 0.94 |
-| BLAS-2 dense | gemv, ger, symv, trmv, trsv | s/d/c/z | ✅ | 🐢 | 1.18 / 0.98 | 1.13 / 0.89 |
-| BLAS-2 banded/packed | gbmv, sbmv, spmv | s/d/c/z | ✅ | 🐰 | 1.56 / 1.06 | 2.02 / 1.11 |
-| BLAS-3 | gemm, symm, syrk, syr2k, trmm, trsm | s/d/c/z | ✅ | 🐢 | 1.20 / 0.93 | 1.41 / 0.81 |
+| BLAS-1 | axpy, scal, dot, nrm2, asum, iamax | s/d/c/z | ✅ | 🐢 | 1.54 / 0.95 | 2.08 / 0.94 |
+| BLAS-2 dense | gemv, ger, symv, trmv, trsv | s/d/c/z | ✅ | 🐢 | 1.22 / 0.98 | 1.18 / 0.91 |
+| BLAS-2 banded/packed | gbmv, sbmv, spmv | s/d/c/z | ✅ | 🐰 | 1.44 / 1.06 | 2.52 / 1.10 |
+| BLAS-3 | gemm, symm, syrk, syr2k, trmm, trsm | s/d/c/z | ✅ | 🐢 | 1.17 / 0.78 | 1.45 / 0.63 |
+
+Cells below 1.0, out of every (op, size, box) in the group — this is what 🐢 vs 🐰 means, and it is
+counted, not judged:
+
+| Level | cells | below 1.0 vs OB | below 1.0 vs AOCL | worst cell |
+|---|---|---|---|---|
+| BLAS-1 | 182 | 34 | 12 | `iamax@100000` 0.94 (AOCL) |
+| BLAS-2 dense | 182 | 6 | 36 | `zgemvN@1024` 0.91 (AOCL) |
+| BLAS-2 banded/packed | 84 | **0** | **0** | `sbmv@4096` 1.10 — **gates outright** |
+| BLAS-3 | 266 | 30 | 103 | `ztrsm@32` 0.63 (AOCL) |
+
+The two references disagree about where the work is: BLAS-2 dense is nearly clean against OpenBLAS
+(6 cells) and not against AOCL (36) — almost all of the latter are **complex** gemv/geru/hemv, which
+is the open `zgemv` lever. BLAS-3's AOCL column is dominated by small-`n` complex triangular
+(`ztrsm@32` 0.63, `@128` 0.65). Real BLAS-2 dense is now within 2% everywhere.
 
 GEMM additionally uses Strassen–Winograd (real) and Karatsuba 3M (complex) above a
 size crossover — **beats** OpenBLAS at large `n`.
 
-!!! note "Provenance — BLAS numbers re-measured 2026-07-31"
+!!! note "Provenance — BLAS re-measured in full 2026-08-01"
     Geomean/worst are over every op and size in the group, pooled across the freq-locked fleet
     (wintermute Zen4/AVX-512, galen Zen3/AVX2; Zen5 offline for this run), `bench/plots.jl`.
+    Every BLAS-1/2/3 group was re-swept against **both** references on **both** boxes at this
+    commit — not a subset merge — so no cell in the four rows above predates the sweep. Rows are
+    derived from the caches by `bench/coverage_rows.awk` rather than transcribed by eye.
+
+    **The header `commit=` is the LATEST measurement's commit, not necessarily every row's.**
+    Here the sweeps ran at `9c8cb66` and `iamax` was re-measured after at `79180a0`; the only
+    source difference between them is `iamax` itself, so every number stands — but the stamp is
+    imprecise by construction. A subset merge (`op=`/`group=`) leaves older rows carrying the newer
+    header, which is how a galen `trsv` row was once read as fresh when it was a day old. The v3
+    cache format fixes this properly by timestamping each cell.
+
     **These supersede earlier `ger` figures**, which were measured through a stale local
     `bench/LocalPreferences.toml` pinning `ger_panel_np = 1` on both boxes — it overrode a
     correctly-working auto-tune (Zen4 wants 8, Zen3 wants 4) and understated ger by up to 36%
     at n=2048. The pin is removed and the cache header now records the resolved tuning state
     (`tune=`) so a run is reproducible from its own provenance.
+
+!!! warning "The LAPACK tables below were NOT part of this sweep"
+    Only BLAS-1/2/3 was re-measured on 2026-08-01. The LAPACK rows carry their own earlier dates;
+    do not read the BLAS provenance above as covering them. `geqp3` in particular is mid-campaign
+    (blocked `dlaqps` port outstanding) and its figure moves between refreshes.
 
 ## LAPACK — factorizations & solves
 
@@ -278,8 +309,11 @@ symbols** — they appear only in commented-out lines of the stdlib and have no 
   sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 7 of 33 measured
   rows clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly
   (0.9–0.99 at one or two sizes — often the smallest, where per-call overhead dominates and the
-  measurement is least stable). **One row is now genuinely behind**: pivoted QR (`geqp3`, 0.18), an unblocked
-  BLAS-2 implementation racing a blocked one. The other three that used to sit here —
+  measurement is least stable). **One row is still behind**: pivoted QR (`geqp3`, 0.84 geo / 0.51
+  worst), an unblocked BLAS-2 implementation racing a blocked one. It was 0.34 / 0.18; making
+  `_house_left!` reach the SIMD dot/axpy pointer-direct (rather than through the scalar Householder
+  body) recovered ~2.5×, but the blocked `dlaqps` port is still outstanding and is what closes it.
+  The other three that used to sit here —
   Bunch–Kaufman (`sytrf` was 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — shared that
   diagnosis and were blocked on 2026-07-30: `sytrf` 1.39 / 1.04, `sytrs` 1.68 / 1.43 🐰,
   `gbtrf` 1.49 / 0.93. This paragraph previously contradicted its own footnotes.
