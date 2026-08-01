@@ -102,13 +102,17 @@ _round_arms(r::Int) = circshift(_ACTIVE_ARMS, r - 1)
 _stamp(acc::ArmData) = CellData(
     a => ArmRec(Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, q) for (a, q) in acc
 )
-# Progress line only: median ratio of the first available reference against pb this round.
+# Progress line only: median ratio of the first available reference against pb this round. Under
+# `arms=pb` there IS no reference in this round (that is the point of the mode), so fall back to pb's
+# median time in µs — a bare NaN told you nothing, and the per-round time is exactly what you want to
+# eyeball for stability when iterating on the kernel. `_ROUNDLBL` says which you are looking at.
+const _ROUNDLBL = isempty(_REF_ARMS) ? "rounds (pb µs)" : "rounds"
 function _round_med(qs::ArmData)
     haskey(qs, _ARM_PB) || return NaN
     for a in _REF_ARMS
         haskey(qs, a) && return median(_ratio(qs[a], qs[_ARM_PB]))
     end
-    return NaN
+    return median(qs[_ARM_PB]) * 1e6
 end
 const REFNAME = REFBK == "mkl" ? "MKL" : REFBK == "aocl" ? "AOCL" : "OpenBLAS"
 # cache/SVG filename suffix: "" for OpenBLAS (the default baseline — its artefacts are UNTOUCHED), "_mkl"/"_aocl" otherwise
@@ -254,7 +258,7 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
             end
             push!(rmeds, _round_med(qs))
         end
-        rounds > 1 && (println(stderr, "    n=$s rounds: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
+        rounds > 1 && (println(stderr, "    n=$s $_ROUNDLBL: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
         push!(out, (s, _stamp(acc)))
     end
     return out
@@ -303,7 +307,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
             end
             push!(rmeds, _round_med(qs))
         end
-        rounds > 1 && (println(stderr, "    n=$s rounds: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
+        rounds > 1 && (println(stderr, "    n=$s $_ROUNDLBL: ", join((@sprintf("%.3f", m) for m in rmeds), " ")); flush(stderr))
         push!(out, (s, _stamp(acc)))
     end
     return out
