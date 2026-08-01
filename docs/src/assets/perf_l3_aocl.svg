@@ -31,16 +31,16 @@
 <circle cx="209.3" cy="121.9" r="2" fill="#2ca02c"/>
 <circle cx="232.7" cy="112.1" r="2" fill="#2ca02c"/>
 <circle cx="256.0" cy="100.0" r="2" fill="#2ca02c"/>
-<polygon points="46.0,80.6 92.7,105.1 139.3,129.3 162.7,127.9 186.0,116.6 209.3,112.8 232.7,92.9 256.0,103.4 256.0,104.2 232.7,102.6 209.3,115.6 186.0,120.7 162.7,130.3 139.3,130.4 92.7,112.6 46.0,82.9" fill="#1f77b4" opacity="0.11"/>
-<polyline points="46.0,81.7 92.7,110.3 139.3,130.0 162.7,128.2 186.0,119.8 209.3,114.4 232.7,96.7 256.0,103.6" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="46.0" cy="81.7" r="2" fill="#1f77b4"/>
-<circle cx="92.7" cy="110.3" r="2" fill="#1f77b4"/>
-<circle cx="139.3" cy="130.0" r="2" fill="#1f77b4"/>
-<circle cx="162.7" cy="128.2" r="2" fill="#1f77b4"/>
-<circle cx="186.0" cy="119.8" r="2" fill="#1f77b4"/>
-<circle cx="209.3" cy="114.4" r="2" fill="#1f77b4"/>
-<circle cx="232.7" cy="96.7" r="2" fill="#1f77b4"/>
-<circle cx="256.0" cy="103.6" r="2" fill="#1f77b4"/>
+<polygon points="46.0,81.7 92.7,106.5 139.3,128.8 162.7,127.2 186.0,117.0 209.3,112.7 232.7,99.2 256.0,103.5 256.0,103.9 232.7,103.3 209.3,114.9 186.0,121.0 162.7,129.3 139.3,130.5 92.7,112.7 46.0,92.3" fill="#1f77b4" opacity="0.11"/>
+<polyline points="46.0,82.5 92.7,110.9 139.3,129.8 162.7,127.9 186.0,120.0 209.3,113.8 232.7,101.5 256.0,103.7" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="46.0" cy="82.5" r="2" fill="#1f77b4"/>
+<circle cx="92.7" cy="110.9" r="2" fill="#1f77b4"/>
+<circle cx="139.3" cy="129.8" r="2" fill="#1f77b4"/>
+<circle cx="162.7" cy="127.9" r="2" fill="#1f77b4"/>
+<circle cx="186.0" cy="120.0" r="2" fill="#1f77b4"/>
+<circle cx="209.3" cy="113.8" r="2" fill="#1f77b4"/>
+<circle cx="232.7" cy="101.5" r="2" fill="#1f77b4"/>
+<circle cx="256.0" cy="103.7" r="2" fill="#1f77b4"/>
 <text x="151.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">gemm</text>
 <line x1="46.0" y1="60" x2="46.0" y2="198" stroke="#f4f4f4"/>
 <text x="46.0" y="209" text-anchor="middle" font-size="8" fill="#999">8</text>
