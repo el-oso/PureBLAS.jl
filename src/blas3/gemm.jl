@@ -2437,6 +2437,20 @@ end
     end
     return C
 end
+# Cold α==0 / k==0 exit, kept OUT of `_gemm_core!`'s inlined body. `_gemm_core!` is `@inline` and sits
+# on every gemm call site in the library, so a `_scale_C!` loop nest inlined here grows the body and can
+# shift callers' inlining decisions.
+# HONEST MEASUREMENT STATUS (Zen4, freq-locked, gemm row vs AOCL): pre-guard 1.18 geomean (1 sample),
+# guard inlined 1.16 (2 samples, identical), guard @noinline 1.17 (1 sample). The published geomean is
+# rounded to 2 dp, so a ~1% effect is AT the resolution limit — this is suggestive, NOT established, and
+# it is not the controlled interleaved A/B the methodology requires. `worst` is 0.97 in all three, i.e.
+# gating is unaffected either way. Kept @noinline because it is the right shape for a cold path in an
+# @inline function and is not worse; do NOT cite these numbers as proof the placement bought anything.
+@noinline function _gemm_scale_only!(C, m::Int, n::Int, beta)
+    _scale_C!(C, m, n, beta)
+    return C
+end
+
 @inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
@@ -2449,8 +2463,7 @@ end
     # drop it. The AD path keeps computing the product. Every pre-existing α==0 guard here is likewise
     # inside a `T <: BlasReal` method — widening this to all T would have been the regression.
     if T <: Union{BlasReal, BlasComplex} && (iszero(alpha) || k == 0)
-        _scale_C!(C, m, n, beta)
-        return C
+        return _gemm_scale_only!(C, m, n, beta)   # @noinline: keep `_gemm_core!`'s inlined body small
     end
     if T <: BlasReal && _strided1(C)
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
