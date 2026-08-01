@@ -1866,11 +1866,150 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
     return x
 end
 
+# FUSED f-column trsv for the N forms (BLIS `trsv_unf_var2` shape), F fixed at 8.
+#
+# Per panel of F columns: (1) an F×F scalar triangle — dependent chain only F long, not n; (2) ONE
+# fused pass over the remaining rows doing F fmas per vector chunk, with the F solved values HOISTED
+# into F broadcast registers before the loop. Zero kernel calls in the whole routine.
+#
+# WHY THIS AND NOT THE BLOCKED PATH. Decomposing blocked trsv showed the off-diagonal scatter is
+# 75% (n=512) to 93% (n=4096) of runtime — but a vendor head-to-head at the scatter's own shape has
+# our gemv-N BEATING both AOCL and OpenBLAS (77.9/72.5/69.0 GB/s at m=1024). Working the arithmetic
+# back through the split: at n=512 our scatter ALONE costs 0.773× AOCL's entire trsv. The deficit was
+# never the scatter — it was the 64-long dependent chain in the diagonal solve, which this removes.
+# AOCL is BLIS, and BLIS never cache-blocks level-2: its exported symbols are `bli_dtrsv_unf_var1/2`
+# over fused `axpyf`/`dotxf`, with no blocked variant at all. This is that structure.
+#
+# Measured vs the blocked path it replaces (Zen4, freq-locked, upper/N/non-unit F64):
+#     n=      256    512   1024   2048   4096
+#   ratio    1.01   1.06   1.14   1.07   1.00
+#
+# THREE EARLIER ATTEMPTS AT THIS REGION FAILED, and the reasons are the design constraints here:
+#   • sub-blocking with hand-written update loops — 0.47-0.53×
+#   • sub-blocking calling `_axpy_simd!` per column — 0.59-0.66×
+#     Both issued ~2n kernel calls where the shipped sweep issues n; entry cost ate the shorter chain.
+#     THE FUSED FORM ISSUES ZERO CALLS — that is the whole point, not an optimisation detail.
+#   • the same fused loop with the F broadcasts left INSIDE the chunk loop — 0.54-0.62×. Hoisting
+#     them into registers took it to 0.71/0.84/1.06 at n=64/128/256. Runtime-bounded inner loops do
+#     not get unrolled, so the broadcasts must be written out explicitly.
+# Numerics: reassociated vs the per-column sweep; residual-checked, not bitwise.
+@inline function _trsv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
+    T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    GC.@preserve A x begin
+        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+        if up                                     # U,N: panels backward from column n
+            hi = n
+            @inbounds while hi > 0
+                lo = max(1, hi - 7)
+                for j in hi:-1:lo                 # F×F triangle: chain is F, not n
+                    cp = Ap + (j - 1) * lda * sz
+                    xj = unit ? unsafe_load(xp, j) :
+                         unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
+                    unsafe_store!(xp, xj, j)
+                    for i in lo:(j - 1)
+                        unsafe_store!(xp, unsafe_load(xp, i) - xj * unsafe_load(cp, i), i)
+                    end
+                end
+                top = lo - 1
+                if top > 0
+                    if hi - lo + 1 == 8           # full panel: fused, broadcasts hoisted
+                        c0 = Ap + (lo - 1) * lda * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                        c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                        c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                        b0 = V(-unsafe_load(xp, lo));     b1 = V(-unsafe_load(xp, lo + 1))
+                        b2 = V(-unsafe_load(xp, lo + 2)); b3 = V(-unsafe_load(xp, lo + 3))
+                        b4 = V(-unsafe_load(xp, lo + 4)); b5 = V(-unsafe_load(xp, lo + 5))
+                        b6 = V(-unsafe_load(xp, lo + 6)); b7 = V(-unsafe_load(xp, lo + 7))
+                        i = 0
+                        while i + W <= top
+                            o = i * sz; acc = vload(V, xp + o)
+                            acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                            acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                            acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                            acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                            vstore(acc, xp + o); i += W
+                        end
+                        @inbounds while i < top
+                            s = unsafe_load(xp, i + 1)
+                            for k in lo:hi
+                                s -= unsafe_load(Ap + ((k - 1) * lda + i) * sz) * unsafe_load(xp, k)
+                            end
+                            unsafe_store!(xp, s, i + 1); i += 1
+                        end
+                    else                          # ragged final panel
+                        @inbounds for k in lo:hi
+                            _axpy_simd!(top, -unsafe_load(xp, k), Ap + (k - 1) * lda * sz, xp)
+                        end
+                    end
+                end
+                hi = lo - 1
+            end
+        else                                      # L,N: panels forward from column 1
+            lo = 1
+            @inbounds while lo <= n
+                hi = min(n, lo + 7)
+                for j in lo:hi
+                    cp = Ap + (j - 1) * lda * sz
+                    xj = unit ? unsafe_load(xp, j) :
+                         unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
+                    unsafe_store!(xp, xj, j)
+                    for i in (j + 1):hi
+                        unsafe_store!(xp, unsafe_load(xp, i) - xj * unsafe_load(cp, i), i)
+                    end
+                end
+                rest = n - hi
+                if rest > 0
+                    if hi - lo + 1 == 8
+                        c0 = Ap + ((lo - 1) * lda + hi) * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                        c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                        c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                        b0 = V(-unsafe_load(xp, lo));     b1 = V(-unsafe_load(xp, lo + 1))
+                        b2 = V(-unsafe_load(xp, lo + 2)); b3 = V(-unsafe_load(xp, lo + 3))
+                        b4 = V(-unsafe_load(xp, lo + 4)); b5 = V(-unsafe_load(xp, lo + 5))
+                        b6 = V(-unsafe_load(xp, lo + 6)); b7 = V(-unsafe_load(xp, lo + 7))
+                        yp = xp + hi * sz
+                        i = 0
+                        while i + W <= rest
+                            o = i * sz; acc = vload(V, yp + o)
+                            acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                            acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                            acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                            acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                            vstore(acc, yp + o); i += W
+                        end
+                        @inbounds while i < rest
+                            s = unsafe_load(yp, i + 1)
+                            for k in lo:hi
+                                s -= unsafe_load(Ap + ((k - 1) * lda + hi + i) * sz) * unsafe_load(xp, k)
+                            end
+                            unsafe_store!(yp, s, i + 1); i += 1
+                        end
+                    else
+                        @inbounds for k in lo:hi
+                            _axpy_simd!(rest, -unsafe_load(xp, k),
+                                        Ap + ((k - 1) * lda + hi) * sz, xp + hi * sz)
+                        end
+                    end
+                end
+                lo = hi + 1
+            end
+        end
+    end
+    return x
+end
+
 @inline function _trsv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
     (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
+    # N forms: the fused F=8 panel sweep (see `_trsv_fused8!`) replaces the blocked
+    # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
+    # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
+    # Requires unit-stride columns for the vector loads; anything else keeps the blocked path below.
+    if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+        return _trsv_fused8!(up, unit, n, A, x)
+    end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP
         ib = (cld(n, NB) - 1) * NB
