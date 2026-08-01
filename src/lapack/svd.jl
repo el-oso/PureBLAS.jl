@@ -46,9 +46,33 @@
 end
 
 # Apply H = I − τ·v·vᵀ (v[1]≡1, v[2:]=v[2:]) to C (size len×nc) from the LEFT:  C := H·C.
+# Per column this is exactly a DOT then an AXPY against v, so when C's columns are contiguous we hand
+# both to the tuned SIMD kernels instead of walking scalar. The scalar body below is kept verbatim as
+# the fallback for non-strided C, non-BlasReal T (Dual/AD, req: the scalar path stays differentiable),
+# and any element type `_dot_simd`/`_axpy_simd!` do not cover.
+# WHY THIS MATTERS: `geqp3` applies one reflector per column across the whole trailing matrix, so this
+# is its O(m·n²) inner loop — running it scalar is the routine's dominant cost, not its unblocked
+# structure. Also on the hot path of gels, gebrd/unmbr (svd.jl) and hessenberg.
+# Numerics: the dot is reassociated by the SIMD reduction, so results differ from the scalar order at
+# the last ulp — same class of change as any blocked-vs-unblocked reformulation, and the QR/SVD tests
+# check residuals, not bitwise equality.
 @inline function _house_left!(C::AbstractMatrix{T}, v::AbstractVector{T}, τ::T) where {T <: Real}
     τ == zero(T) && return C
     len, nc = size(C)
+    if T <: BlasReal && len > 1 && _strided1(C) && v isa StridedVector && stride(v, 1) == 1
+        sz = sizeof(T)
+        GC.@preserve C v begin
+            pc = pointer(C); pv = pointer(v); ld = stride(C, 2)
+            @inbounds for j in 1:nc
+                cp = pc + (j - 1) * ld * sz
+                c1 = unsafe_load(cp, 1)
+                w = τ * (c1 + _dot_simd(len - 1, cp + sz, pv + sz, T))   # v[1] ≡ 1
+                unsafe_store!(cp, c1 - w, 1)
+                _axpy_simd!(len - 1, -w, pv + sz, cp + sz)
+            end
+        end
+        return C
+    end
     @inbounds for j in 1:nc
         w = C[1, j]
         for i in 2:len
