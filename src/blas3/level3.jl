@@ -1476,21 +1476,94 @@ end
 # reciprocal table stay register/L1-resident across the panel — fuses the per-column work (the key to
 # mid-n: the UNBLOCKED solve streamed the whole B out of L1 k times, ~O(k²·nrhs) L2 traffic; blocking the
 # RHS into L1-fitting panels keeps each panel hot so only A is re-read).
+# FUSED 4-RHS inner update for `_dLN_panel!`: B[1:len, c0..c0+3] -= x_c · A[1:len, j], for FOUR RHS
+# columns in ONE pass. `_dLN_panel!` used to call `_axpy_cmplx_simd!` once per (j, RHS column) — k·pw
+# invocations, 1024 of them at k=32/nrhs=32, each ~16 complex elements, which is far too short to
+# amortise the per-call entry cost. It also re-streamed A[1:len,j] once per RHS column although that
+# column is loop-invariant in c.
+#
+# Here A's chunk is loaded ONCE and its swap computed ONCE, then reused for all four columns: 4× less A
+# traffic, one shuffle instead of four, and zero calls in the loop. Same transformation as
+# `_trsv_fused8!`/`_trmv_fused8!`, transposed — there F A-columns were fused against one x; here one
+# A-column is fused against F B-columns.
+#
+# @generated for the swap mask and the per-lane sign tuple. MUST emit Expr(:meta, :inline) explicitly:
+# on Julia 1.12 `@inline` does NOT propagate into a @generated body, and without it the Vec arguments
+# pass BY POINTER and the caller's accumulators get stack-demoted (the zgemvC 0.58→1.20 lesson).
+@generated function _dLN_fuse4!(
+        len::Int, a0r::T, a0i::T, a1r::T, a1i::T, a2r::T, a2i::T, a3r::T, a3i::T,
+        pa::Ptr{T}, pb0::Ptr{T}, pb1::Ptr{T}, pb2::Ptr{T}, pb3::Ptr{T}
+    ) where {T <: BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    sgn(ai) = :($V2($(Expr(:tuple, (iseven(l) ? :(-$ai) : ai for l in 0:(2W - 1))...))))
+    return quote
+        $(Expr(:meta, :inline))
+        r0 = $V2(a0r); s0 = $(sgn(:a0i)); r1 = $V2(a1r); s1 = $(sgn(:a1i))
+        r2 = $V2(a2r); s2 = $(sgn(:a2i)); r3 = $V2(a3r); s3 = $(sgn(:a3i))
+        i = 0
+        @inbounds while i + $W <= len
+            o = i * 2 * $sz
+            av = vload($V2, pa + o); aw = shufflevector(av, Val($swp))   # A chunk + its swap: ONCE for all 4
+            vstore(muladd(aw, s0, muladd(av, r0, vload($V2, pb0 + o))), pb0 + o)
+            vstore(muladd(aw, s1, muladd(av, r1, vload($V2, pb1 + o))), pb1 + o)
+            vstore(muladd(aw, s2, muladd(av, r2, vload($V2, pb2 + o))), pb2 + o)
+            vstore(muladd(aw, s3, muladd(av, r3, vload($V2, pb3 + o))), pb3 + o)
+            i += $W
+        end
+        @inbounds while i < len                                          # scalar tail
+            j2 = 2 * (i + 1); ar = unsafe_load(pa, j2 - 1); ai = unsafe_load(pa, j2)
+            unsafe_store!(pb0, unsafe_load(pb0, j2 - 1) + a0r * ar - a0i * ai, j2 - 1)
+            unsafe_store!(pb0, unsafe_load(pb0, j2) + a0r * ai + a0i * ar, j2)
+            unsafe_store!(pb1, unsafe_load(pb1, j2 - 1) + a1r * ar - a1i * ai, j2 - 1)
+            unsafe_store!(pb1, unsafe_load(pb1, j2) + a1r * ai + a1i * ar, j2)
+            unsafe_store!(pb2, unsafe_load(pb2, j2 - 1) + a2r * ar - a2i * ai, j2 - 1)
+            unsafe_store!(pb2, unsafe_load(pb2, j2) + a2r * ai + a2i * ar, j2)
+            unsafe_store!(pb3, unsafe_load(pb3, j2 - 1) + a3r * ar - a3i * ai, j2 - 1)
+            unsafe_store!(pb3, unsafe_load(pb3, j2) + a3r * ai + a3i * ar, j2)
+            i += 1
+        end
+        return nothing
+    end
+end
+
 @inline function _dLN_panel!(
         up::Bool, unit::Bool, k::Int, rcp, Ap::Ptr{Tc}, Bp::Ptr{Tc},
         pw::Int, lda::Int, ldb::Int, csz::Int
     ) where {Tc}
+    T = real(Tc)
     @inbounds for j in (up ? (k:-1:1) : (1:k))
         aj = Ap + (j - 1) * lda * csz                            # &A[1,j] (Julia Ptr+int = BYTES)
-        for c in 0:(pw - 1)
+        len = up ? j - 1 : k - j                                 # rows updated by this j
+        off = up ? 0 : j                                         # row offset of that run
+        c = 0
+        while c + 4 <= pw                                        # FUSED: 4 RHS columns share one A pass
+            b0 = Bp + c * ldb * csz; b1 = b0 + ldb * csz
+            b2 = b1 + ldb * csz;     b3 = b2 + ldb * csz
+            x0 = unit ? unsafe_load(b0, j) : unsafe_load(b0, j) * rcp[j]
+            x1 = unit ? unsafe_load(b1, j) : unsafe_load(b1, j) * rcp[j]
+            x2 = unit ? unsafe_load(b2, j) : unsafe_load(b2, j) * rcp[j]
+            x3 = unit ? unsafe_load(b3, j) : unsafe_load(b3, j) * rcp[j]
+            if !unit
+                unsafe_store!(b0, x0, j); unsafe_store!(b1, x1, j)
+                unsafe_store!(b2, x2, j); unsafe_store!(b3, x3, j)
+            end
+            if len > 0
+                ao = Ptr{T}(aj + off * csz); do_ = off * csz
+                _dLN_fuse4!(
+                    len, -real(x0), -imag(x0), -real(x1), -imag(x1),
+                    -real(x2), -imag(x2), -real(x3), -imag(x3), ao,
+                    Ptr{T}(b0 + do_), Ptr{T}(b1 + do_), Ptr{T}(b2 + do_), Ptr{T}(b3 + do_)
+                )
+            end
+            c += 4
+        end
+        while c < pw                                             # ragged tail: the original per-column path
             bc = Bp + c * ldb * csz                              # &B[1, panel-col c]
             xj = unit ? unsafe_load(bc, j) : unsafe_load(bc, j) * rcp[j]
             unit || unsafe_store!(bc, xj, j)
-            if up
-                j > 1 && _axpy_cmplx_simd!(j - 1, -real(xj), -imag(xj), aj, bc)          # B[1:j-1,c] -= xj·A[1:j-1,j]
-            else
-                j < k && _axpy_cmplx_simd!(k - j, -real(xj), -imag(xj), aj + j * csz, bc + j * csz)  # B[j+1:k,c]
-            end
+            len > 0 && _axpy_cmplx_simd!(len, -real(xj), -imag(xj), aj + off * csz, bc + off * csz)
+            c += 1
         end
     end
     return
