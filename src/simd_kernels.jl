@@ -548,7 +548,16 @@ const _IAMAX_NB = min(4, _NVREG - 1)
             # compares against the current gmax. The serial `>` walk (not a max-tree, not
             # `maximum(::Vec)`) is what keeps the NaN contract netlib defines and the NaN testitem pins.
             #
-            # EACH LANE IS COMPARED AGAINST THE RUNNING `gmax`, NEVER AGAINST A BLOCK-LOCAL MAX. An
+            # THE BLOCK WALK SEEDS `bm` FROM `gmax`, NEVER FROM A LANE. Seeding from gmax is exactly
+            # netlib's running-max comparison (bm starts at the running max and only rises), and it is
+            # NaN-safe for free: `NaN > bm` is false, so a NaN can never become bm and can never poison
+            # the block. `bl == 0` means no lane beat the running max, so gmax/bi/thr are left alone —
+            # which is what keeps this cheap. A first version compared each lane against `gmax` directly
+            # and re-broadcast `thr` on EVERY non-empty block; correct, but it made the compare chain
+            # dependent and cost iamax 0.94 -> 0.825 vs AOCL at n=1000 on Zen4. Correctness did not
+            # require that: this form is equally exact and folds once per block.
+            #
+            # THE ORIGINAL BUG, for the avoidance of a repeat: the seed used to be `bm = v0[1]`. An
             # earlier version seeded `bm = vN[1]` and walked lanes 2:W against it, then folded `bm` into
             # gmax. That is NOT netlib's loop and it is wrong under NaN: `bm` seeded to NaN makes every
             # `vN[l] > bm` false, so the block keeps bm = NaN, `bm > gmax` is false, and a genuine new
@@ -556,28 +565,32 @@ const _IAMAX_NB = min(4, _NVREG - 1)
             # 1 where netlib returns 6 — a wrong idamax pivot on NaN data. Found 2026-08-01 by adversarial
             # review, NOT by the NaN testitem, which only covers NaN in lane 1 of the FIRST block.
             if any(c0)
-                for l in 1:W                        # strict > vs the RUNNING max ⇒ first lane on ties
-                    v0[l] > gmax && (gmax = v0[l]; bi = o + l)
+                bm = gmax; bl = 0                   # SEED FROM gmax, never from a lane (see note above)
+                for l in 1:W
+                    v0[l] > bm && (bm = v0[l]; bl = l)   # strict > ⇒ first lane on ties
                 end
-                thr = V(gmax)
+                bl != 0 && (gmax = bm; bi = o + bl; thr = V(gmax))
             end
             if any(c1)
+                bm = gmax; bl = 0
                 for l in 1:W
-                    v1[l] > gmax && (gmax = v1[l]; bi = o + W + l)
+                    v1[l] > bm && (bm = v1[l]; bl = l)
                 end
-                thr = V(gmax)
+                bl != 0 && (gmax = bm; bi = o + W + bl; thr = V(gmax))
             end
             if any(c2)
+                bm = gmax; bl = 0
                 for l in 1:W
-                    v2[l] > gmax && (gmax = v2[l]; bi = o + 2W + l)
+                    v2[l] > bm && (bm = v2[l]; bl = l)
                 end
-                thr = V(gmax)
+                bl != 0 && (gmax = bm; bi = o + 2W + bl; thr = V(gmax))
             end
             if any(c3)
+                bm = gmax; bl = 0
                 for l in 1:W
-                    v3[l] > gmax && (gmax = v3[l]; bi = o + 3W + l)
+                    v3[l] > bm && (bm = v3[l]; bl = l)
                 end
-                thr = V(gmax)
+                bl != 0 && (gmax = bm; bi = o + 3W + bl; thr = V(gmax))
             end
         end
         o += step
@@ -585,10 +598,11 @@ const _IAMAX_NB = min(4, _NVREG - 1)
     @inbounds while o + W <= n                         # leftover full blocks
         v0 = ld(o)
         if any(v0 > thr)
+            bm = gmax; bl = 0
             for l in 1:W
-                v0[l] > gmax && (gmax = v0[l]; bi = o + l)
+                v0[l] > bm && (bm = v0[l]; bl = l)
             end
-            thr = V(gmax)
+            bl != 0 && (gmax = bm; bi = o + bl; thr = V(gmax))
         end
         o += W
     end
