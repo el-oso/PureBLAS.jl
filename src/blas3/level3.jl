@@ -872,6 +872,13 @@ end
 
 # x := op(A)·x / op(A)⁻¹·x entry: B := α·op(A)·B (side L) or α·B·op(A) (side R), A triangular.
 function _trmm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::Number, A, B)
+    # α==0 ⇒ B := 0 with A not referenced (reference ?trmm). α is applied AFTER the product below, so
+    # without this an Inf/NaN anywhere in A or in the unset B becomes NaN·0 = NaN rather than 0.
+    # Not applied to AD types — see the matching note in `_gemm_core!` on `iszero(::Dual)`.
+    if eltype(B) <: Union{BlasReal, BlasComplex} && iszero(α)
+        fill!(B, zero(eltype(B)))
+        return B
+    end
     if side_left
         _trmm_left!(up, tr, cj, unit, A, B)
     else
@@ -1097,6 +1104,13 @@ function trmm!(
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trmm!: A must be $k×$k"))
+    # α==0 ⇒ B := 0, A not referenced (reference ?trmm). Placed HERE, above the dispatch, because all
+    # four branches below apply α only after forming the product — the tiny real/complex bypasses and
+    # the split-L path each route around `_trmm!` and would need the same guard individually.
+    if eltype(B) <: Union{BlasReal, BlasComplex} && iszero(alpha)
+        fill!(B, zero(eltype(B)))
+        return B
+    end
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
     # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
@@ -2708,6 +2722,15 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
 end
 
 function _trsm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::Number, A, B)
+    # α==0 ⇒ B := 0, and reference ?trsm guarantees "A is not referenced and B need not be set". Both
+    # halves matter: `_scal_all!` MULTIPLIES (dscal semantics), so an unset B holding Inf/NaN gives
+    # 0·Inf = NaN instead of 0; and a caller is entitled to pass a singular A (say A[1,1]=0), whose
+    # reciprocal in the solve below would then contaminate the zeros. Explicit zero-fill, no solve.
+    # Not applied to AD types — see the matching note in `_gemm_core!` on `iszero(::Dual)`.
+    if eltype(B) <: Union{BlasReal, BlasComplex} && iszero(α)
+        fill!(B, zero(eltype(B)))
+        return B
+    end
     isone(α) || _scal_all!(B, α)
     side_left ? _trsm_left!(up, tr, cj, unit, A, B) : _trsm_right!(up, tr, cj, unit, A, B)
     return B

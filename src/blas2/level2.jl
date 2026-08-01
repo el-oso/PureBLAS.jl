@@ -976,6 +976,12 @@ function _gemv!(
             end
         end
     else
+        # α==0 ⇒ y := βy with A and x NOT referenced (reference ?gemv). The !trans branch above has had
+        # this since forever; the trans branch did not, so `gemv 'T'` with α=0 over an A holding Inf/NaN
+        # produced NaN in y. Note the output length here is n, not m. Found 2026-08-01 by review.
+        if iszero(α)
+            _scale_y!(Int(n), β, y, incy); return y
+        end
         if _l2_simd_ok(A, x, y, incx, incy)
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
             return iszero(β) ? _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(true)) :
@@ -1829,6 +1835,11 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
     # dependency and is latency-bound, so offloading the off-diagonal to gemv repays much earlier.
     # Two routines, one shape, different crossovers — do not unify them.
     (n <= NB || 2 * n * n * sizeof(eltype(A)) <= _L2_BYTES) && return _trmv_simd!(up, tr, unit, n, A, x)
+    # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
+    # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
+    if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+        return _trmv_fused8!(up, unit, n, A, x)
+    end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
         ib = 0
@@ -1861,6 +1872,111 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
             _trmv_simd!(false, true, unit, nb, view(A, I, I), view(x, I))
             ib + nb < n && _tri_scatT!(view(x, I), view(A, (ib + nb + 1):n, I), view(x, (ib + nb + 1):n), one(eltype(A)))
             ib += NB
+        end
+    end
+    return x
+end
+
+# FUSED f-column trmv for the N forms (BLIS `trmv_unf_var2` / `axpyf` shape), F fixed at 8.
+#
+# Same panel structure as `_trsv_fused8!` below, minus the divide: per panel of F columns, the F
+# ORIGINAL x values are read into scalars first (the triangle overwrites them), then ONE fused pass
+# over the off-panel rows does F fmas per vector chunk, then the F×F triangle runs in registers.
+#
+# WHY: the per-column sweep this replaces re-reads AND re-writes the whole x prefix once per column
+# — n²/2 loads + n²/2 stores of x against n²/2 loads of A, i.e. 3 streams per A element. F=8 cuts
+# the x traffic 8×, to 1.25 streams. That is precisely the fusing factor BLIS's `axpyf` exists for.
+# Ordering note: for U,N the triangle must run j ASCENDING with its `x[j] = t·A[j,j]` store in the
+# loop, so later columns of the same panel accumulate onto it; L,N mirrors with j descending.
+#
+# PANEL ALIGNMENT IS THE MIRROR OF trsv's, AND GETTING IT BACKWARDS COSTS THE WHOLE WIN. trmv's
+# off-panel update GROWS with panel index (U,N updates rows 1:lo-1), where trsv's SHRINKS. Putting
+# the ragged n-mod-8 panel last — the natural loop shape, and what trsv does — would drop the single
+# LARGEST update onto a per-column fallback. Anchoring the remainder in the FIRST panel instead puts
+# it exactly where the off-panel work is zero, so every panel that does off-panel work is full and
+# the ragged fallback disappears entirely (hence no `_axpy_simd!` branch here, unlike `_trsv_fused8!`).
+@inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
+    T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    GC.@preserve A x begin
+        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+        r = n & 7; r = r == 0 ? 8 : r             # remainder goes in the FIRST panel — see note above
+        if up                                     # U,N: panels forward from column 1
+            lo = 1
+            @inbounds while lo <= n
+                hi = lo == 1 ? r : lo + 7; top = lo - 1
+                if top > 0                        # fused pass over rows 1:lo-1, originals hoisted
+                    c0 = Ap + (lo - 1) * lda * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                    c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                    c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                    b0 = V(unsafe_load(xp, lo));     b1 = V(unsafe_load(xp, lo + 1))
+                    b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
+                    b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
+                    b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
+                    i = 0
+                    while i + W <= top
+                        o = i * sz; acc = vload(V, xp + o)
+                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                        vstore(acc, xp + o); i += W
+                    end
+                    while i < top
+                        s = unsafe_load(xp, i + 1)
+                        for k in lo:hi
+                            s += unsafe_load(Ap + ((k - 1) * lda + i) * sz) * unsafe_load(xp, k)
+                        end
+                        unsafe_store!(xp, s, i + 1); i += 1
+                    end
+                end
+                for j in lo:hi                    # F×F triangle, in registers
+                    cp = Ap + (j - 1) * lda * sz; t = unsafe_load(xp, j)
+                    for i in lo:(j - 1)
+                        unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
+                    end
+                    unit || unsafe_store!(xp, t * unsafe_load(cp + (j - 1) * sz), j)
+                end
+                lo = hi + 1
+            end
+        else                                      # L,N: panels backward from column n
+            hi = n
+            @inbounds while hi > 0
+                lo = hi == n ? n - r + 1 : hi - 7; rest = n - hi
+                if rest > 0
+                    c0 = Ap + ((lo - 1) * lda + hi) * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                    c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                    c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                    b0 = V(unsafe_load(xp, lo));     b1 = V(unsafe_load(xp, lo + 1))
+                    b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
+                    b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
+                    b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
+                    yp = xp + hi * sz
+                    i = 0
+                    while i + W <= rest
+                        o = i * sz; acc = vload(V, yp + o)
+                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                        vstore(acc, yp + o); i += W
+                    end
+                    while i < rest
+                        s = unsafe_load(yp, i + 1)
+                        for k in lo:hi
+                            s += unsafe_load(Ap + ((k - 1) * lda + hi + i) * sz) * unsafe_load(xp, k)
+                        end
+                        unsafe_store!(yp, s, i + 1); i += 1
+                    end
+                end
+                for j in hi:-1:lo
+                    cp = Ap + (j - 1) * lda * sz; t = unsafe_load(xp, j)
+                    for i in (j + 1):hi
+                        unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
+                    end
+                    unit || unsafe_store!(xp, t * unsafe_load(cp + (j - 1) * sz), j)
+                end
+                hi = lo - 1
+            end
         end
     end
     return x
