@@ -1586,6 +1586,208 @@ function _trsm_cmplx_dLN!(up::Bool, unit::Bool, k::Int, A, B)
     end
     return B
 end
+
+# ===== Complex gemmtrsm leaf (side-L, upper, no-trans) — SIMD lanes are RHS COLUMNS =====
+#
+# WHY THIS EXISTS. `_trsm_cmplx_dLN!` above re-reads and re-writes all of B once per A-column: k passes
+# with ~2 muladds per load+store, i.e. a BLAS-2 traffic pattern wearing a BLAS-3 name. The roofline
+# decomposition that found it (Zen4, freq-locked, 2026-08-02) is the clean statement of the gap: PB's
+# OWN zgemm matched the best reference at every size (0.97–1.02), while PB's ztrsm reached only 0.41 /
+# 0.53 / 0.63 of that same zgemm at k=32/64/128 where AOCL reached 0.54 / 0.73 / 0.83 of its own. The
+# arithmetic was never the problem; converting gemm rate into trsm rate was.
+#
+# TWO SHAPES WERE MEASURED AND REJECTED FIRST — both die on the register/lane budget, and both are
+# worth recording so they are not re-attempted:
+#   * F A-columns × C B-columns fused (the `_trsv_fused8!` trick crossed with `_dLN_fuse4!`). The F·C
+#     scalar pairs are LOOP-INVARIANT, so LLVM hoists 2·F·C broadcast vectors: 44 zmm needed at F=C=4
+#     against 32 available. Measured 6× SLOWER. `_dLN_fuse4!` (F=1, C=4) already sits at 28 zmm — that
+#     loop shape has no headroom left, which is why entry-overhead work on it kept returning ~nothing.
+#   * A W-row × C-column register tile with lanes = ROWS. Correct, but when lanes are rows the W×W
+#     diagonal triangle cannot vectorize at all; at k=32 that is 22% of the flops at scalar rate, and
+#     the whole leaf measured 8 GF against dLN's 17.
+# With lanes = COLUMNS the triangle vectorizes too — all NR columns are substituted simultaneously and
+# only the row dependency runs serially through registers. That is the same reason the real
+# `_trsm_fused_L!` packs, and it is what makes the transpose pack unavoidable rather than incidental.
+#
+# Measured Zen4 vs AOCL (GFlop/s, k = nrhs): k=16 16.4/13.3, k=32 29.0/22.5, k=48 33.5/27.3,
+# k=64 36.4/29.8, k=96 39.0/33.8, k=128 40.4/35.5 — i.e. 1.14–1.29×, where dLN was 0.64–0.74×.
+# The vectorized transpose pack is NOT a refinement: with the scalar pack the same geometry measured
+# 20.8/22.6 at k=32 (0.92, still under gate). Pack cost was 25–45% of a k=32 stripe.
+const _ZGT_W = _vwidth(Float64)                  # lanes = RHS columns, so the stripe width is one vector
+const _ZGT_NR = _ZGT_W
+# MR (rows per slab) — Derive. The register bound is 2·MR accumulators + 2 packed-row vectors ≤ nreg,
+# i.e. MR ≤ 14 on AVX-512 / 6 on AVX2, and is NOT binding: total accumulate flops are MR-INDEPENDENT
+# (2·KC² either way), so MR only trades triangle flops (∝ MR) against packed-row loads (∝ 1/MR). The
+# derivation that fixes it is structural rather than arithmetic — MR = W makes a slab exactly one W×W
+# transpose block, so slabs and pack blocks share ONE ragged region instead of each growing their own.
+# Confirmed on Zen4: MR ∈ {8,10,12} at NRV=1 measured 40.4 / 34.7 / 34.6 at k=128, W=8 winning.
+const _ZGT_MR = @load_preference("ztrsm_gt_mr", _ZGT_W)::Int
+# The leaf needs an in-register W×W transpose (`_tr8x8` / `_tr4x4`); other widths keep the dLN base.
+const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
+# k ceiling — Derive from L1 RESIDENCY of the packed stripe, the only hot streamed operand: the two
+# KC×NR Float64 planes must fit, so KC ≤ L1 ÷ (2·NR·8). Zen4 (32K L1, NR=8) ⇒ 256; AVX2 (NR=4) ⇒ 512.
+const _ZGT_BASE = @load_preference(
+    "ztrsm_gt_base", _L1_BYTES ÷ (2 * _ZGT_NR * sizeof(Float64))
+)::Int
+# Deinterleave/interleave lane masks for the complex plane split (const-folded).
+const _ZGT_DERE = Val(ntuple(l -> 2 * (l - 1), Val(_ZGT_W)))
+const _ZGT_DEIM = Val(ntuple(l -> 2 * (l - 1) + 1, Val(_ZGT_W)))
+const _ZGT_ILV = Val(ntuple(l -> isodd(l) ? (l - 1) >> 1 : _ZGT_W + ((l - 1) >> 1), Val(2 * _ZGT_W)))
+
+@inline _zgt_tr(x::NTuple{8, Vec{8, Float64}}) = _tr8x8(x...)
+@inline _zgt_tr(x::NTuple{4, Vec{4, Float64}}) = _tr4x4(x...)
+
+# W rows × W columns of B → the row-major re/im planes: one contiguous Vec{2W} load per column (B is
+# column-major, so this is unit-stride and po2-immune), deinterleave, then the existing W×W transpose.
+@inline function _zgt_pack!(pr::Ptr{Float64}, pim::Ptr{Float64}, pB0::Ptr{Float64}, cs::Int, i0::Int)
+    sz = sizeof(Float64); o = i0 * 2 * sz
+    c = ntuple(v -> vload(Vec{2 * _ZGT_W, Float64}, pB0 + (v - 1) * cs + o), Val(_ZGT_W))
+    yr = _zgt_tr(ntuple(v -> shufflevector(c[v], _ZGT_DERE), Val(_ZGT_W)))
+    yi = _zgt_tr(ntuple(v -> shufflevector(c[v], _ZGT_DEIM), Val(_ZGT_W)))
+    @inbounds for r in 1:_ZGT_W
+        vstore(yr[r], pr + (i0 + r - 1) * _ZGT_NR * sz)
+        vstore(yi[r], pim + (i0 + r - 1) * _ZGT_NR * sz)
+    end
+    return
+end
+@inline function _zgt_unpack!(pr::Ptr{Float64}, pim::Ptr{Float64}, pB0::Ptr{Float64}, cs::Int, i0::Int)
+    sz = sizeof(Float64); o = i0 * 2 * sz
+    xr = _zgt_tr(ntuple(r -> vload(Vec{_ZGT_W, Float64}, pr + (i0 + r - 1) * _ZGT_NR * sz), Val(_ZGT_W)))
+    xi = _zgt_tr(ntuple(r -> vload(Vec{_ZGT_W, Float64}, pim + (i0 + r - 1) * _ZGT_NR * sz), Val(_ZGT_W)))
+    @inbounds for v in 1:_ZGT_W
+        vstore(shufflevector(xr[v], xi[v], _ZGT_ILV), pB0 + (v - 1) * cs + o)
+    end
+    return
+end
+
+# One slab: rows r0..r0+MR-1 of the packed stripe. Accumulate the trailing update against EVERY already-
+# solved row t (one pass, accumulators never leaving registers — this is what replaces dLN's k passes
+# over B), then substitute the MR×MR diagonal triangle in register. `rc` holds the split reciprocals.
+# @generated for the unrolled row set; MUST emit Expr(:meta,:inline) — on Julia 1.12 `@inline` does not
+# propagate into a @generated body and the Vec accumulators would be stack-demoted (the zgemvC lesson).
+@generated function _zgt_slab!(
+        ::Val{MR}, pr::Ptr{Float64}, pim::Ptr{Float64}, pA::Ptr{Float64}, lda::Int,
+        rc::Ptr{Float64}, r0::Int, kc::Int
+    ) where {MR}
+    sz = sizeof(Float64); NR = _ZGT_NR; V = Vec{_ZGT_W, Float64}
+    ar(i) = Symbol(:ar, i); ai(i) = Symbol(:ai, i)
+    ld = [
+        quote
+            $(ar(i)) = vload($V, pr + ($i + r0) * $NR * $sz)
+            $(ai(i)) = vload($V, pim + ($i + r0) * $NR * $sz)
+        end for i in 0:(MR - 1)
+    ]
+    # row i -= U[r0+i, t] · P[t, :]  (complex, split planes)
+    acc = [
+        quote
+            ur = unsafe_load(pAt, 2 * (r0 + $i) + 1); ui = unsafe_load(pAt, 2 * (r0 + $i) + 2)
+            $(ar(i)) = muladd($V(ui), pm, muladd($V(-ur), pv, $(ar(i))))
+            $(ai(i)) = muladd($V(-ui), pv, muladd($V(-ur), pm, $(ai(i))))
+        end for i in 0:(MR - 1)
+    ]
+    tri = map((MR - 1):-1:0) do j
+        upd = [
+            quote
+                ur = unsafe_load(pAj, 2 * (r0 + $i) + 1); ui = unsafe_load(pAj, 2 * (r0 + $i) + 2)
+                $(ar(i)) = muladd($V(ui), $(ai(j)), muladd($V(-ur), $(ar(j)), $(ar(i))))
+                $(ai(i)) = muladd($V(-ui), $(ar(j)), muladd($V(-ur), $(ai(j)), $(ai(i))))
+            end for i in 0:(j - 1)
+        ]
+        return quote
+            rr = unsafe_load(rc, 2 * (r0 + $j) + 1); ri = unsafe_load(rc, 2 * (r0 + $j) + 2)
+            nr = $(ar(j)) * $V(rr) - $(ai(j)) * $V(ri)
+            ni = $(ar(j)) * $V(ri) + $(ai(j)) * $V(rr)
+            $(ar(j)) = nr; $(ai(j)) = ni
+            pAj = pA + (r0 + $j) * lda * 2 * $sz
+            $(upd...)
+        end
+    end
+    st = [
+        quote
+            vstore($(ar(i)), pr + ($i + r0) * $NR * $sz)
+            vstore($(ai(i)), pim + ($i + r0) * $NR * $sz)
+        end for i in 0:(MR - 1)
+    ]
+    return quote
+        $(Expr(:meta, :inline))
+        @inbounds begin
+            $(ld...)
+            for t in (r0 + $MR):(kc - 1)
+                pv = vload($V, pr + t * $NR * $sz); pm = vload($V, pim + t * $NR * $sz)
+                pAt = pA + t * lda * 2 * $sz
+                $(acc...)
+            end
+            $(tri...)
+            $(st...)
+        end
+        return nothing
+    end
+end
+
+# Driver: one NR-wide column stripe at a time; pack → slabs bottom-up → unpack.
+function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
+    nrhs = size(B, 2); csz = sizeof(ComplexF64); sz = sizeof(Float64)
+    NR = _ZGT_NR; MR = _ZGT_MR
+    lda = stride(A, 2); ldb = stride(B, 2)
+    buf = _trsm_fused_buf(Float64, 2 * k * NR + 2 * k)
+    GC.@preserve A B buf begin
+        pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B))
+        pr = pointer(buf); pim = pr + k * NR * sz; rc = pim + k * NR * sz
+        @inbounds for j in 0:(k - 1)
+            z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
+            unsafe_store!(rc, real(z), 2j + 1); unsafe_store!(rc, imag(z), 2j + 2)
+        end
+        # Ragged rows go at the TOP for both the pack blocks and the slabs: the slab loop walks up from
+        # row k-MR, so k mod W is left over at row 0 either way. Anchoring the transpose blocks to the
+        # same end keeps ONE ragged region instead of one at each end.
+        rlo = k % _ZGT_W
+        jc = 0
+        while jc < nrhs
+            wid = min(NR, nrhs - jc)
+            pB0 = pB + jc * ldb * csz
+            lo = wid == NR ? rlo : k                     # ragged column stripe → scalar pack (no full block)
+            @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                _zgt_pack!(pr, pim, pB0, ldb * csz, i0)
+            end
+            @inbounds for v in 0:(wid - 1)               # scalar pack for the ragged rows / ragged stripe
+                sc = pB0 + v * ldb * csz
+                for i in 0:(lo - 1)
+                    unsafe_store!(pr + (i * NR + v) * sz, unsafe_load(sc, 2i + 1))
+                    unsafe_store!(pim + (i * NR + v) * sz, unsafe_load(sc, 2i + 2))
+                end
+            end
+            @inbounds for v in wid:(NR - 1), i in 0:(k - 1)   # zero-pad the unused lanes of a short stripe
+                unsafe_store!(pr + (i * NR + v) * sz, 0.0)
+                unsafe_store!(pim + (i * NR + v) * sz, 0.0)
+            end
+            r0 = k - MR
+            while r0 >= 0
+                _zgt_slab!(Val(_ZGT_MR), pr, pim, pA, lda, rc, r0, k)
+                r0 -= MR
+            end
+            @inbounds for r in (r0 + MR - 1):-1:0        # ragged top rows, one at a time (Val(1) is literal)
+                _zgt_slab!(Val(1), pr, pim, pA, lda, rc, r, k)
+            end
+            @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                _zgt_unpack!(pr, pim, pB0, ldb * csz, i0)
+            end
+            @inbounds for v in 0:(wid - 1)
+                dc = pB0 + v * ldb * csz
+                for i in 0:(lo - 1)
+                    unsafe_store!(dc, unsafe_load(pr + (i * NR + v) * sz), 2i + 1)
+                    unsafe_store!(dc, unsafe_load(pim + (i * NR + v) * sz), 2i + 2)
+                end
+            end
+            jc += NR
+        end
+    end
+    return B
+end
+# Eligibility: ComplexF64 only (the plane split rides the f64 W×W transpose), unit-stride A and B,
+# upper + no-trans (the substitution direction the slab hardcodes), and k within the L1 stripe bound.
+@inline _cgt_ok(A, B) = _ZGT_ON && eltype(B) === ComplexF64 &&
+    _strided1(A) && _strided1(B) && stride(A, 2) >= size(A, 1)
+
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
@@ -1598,6 +1800,9 @@ const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: �
 # Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹), A⁻¹ triangular → reuse the trmm K-TRIM kernel on the inverse at
 # half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
 function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)                  # register-tiled gemmtrsm leaf
+        return _trsm_cgt_L!(unit, k, A, B)
+    end
     if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # direct back-substitution (no trtri)
         return _trsm_cmplx_dLN!(up, unit, k, A, B)
     end
@@ -2491,6 +2696,12 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # nrhs is invariant under the row-split → decide the base once. Wide B: trtri-on-inverse base (its
         # O(k³) invert is amortized by the big off-diagonal gemm). Narrow B (standalone 96/128): trtri
         # overhead is exposed, so recurse into small j-outer bases + gemm subtract (OB's structure).
+        # The gemmtrsm leaf beats BOTH bases (and the recursion into them) for every k it covers, so it
+        # is taken before the narrow/wide split rather than from inside it — at k=128 one leaf measured
+        # 40.4 GF against 35.7 for the two-64-leaves-plus-gemm recursion this recbase would pick.
+        if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
+            return _trsm_cgt_L!(unit, k, A, B)
+        end
         recbase = size(B, 2) <= _CTRSM_NCUT ? _CTRSM_REC_L : _TRMM_BASE
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
