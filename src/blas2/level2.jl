@@ -562,7 +562,18 @@ end
 @inline _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T} =
     m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2 && _gemvt_perscan_ok()
 
-@inline function _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}) where {T <: BlasReal, B0}
+@inline _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}) where {T <: BlasReal, B0} =
+    _gemv_t_simd!(m, n, α, A, x, β, y, b0, !_gemvt_perscan(m, n, T))
+
+# `blk`-explicit entry: `true` forces the NC=4 blocked kernel regardless of `_gemvt_perscan`.
+# Exists for callers whose regime the perscan probe does NOT represent — the probe measures a CLEAN
+# standalone sweep, but `_laqps!`'s F-build re-sweeps the SAME trailing block once per panel column;
+# in that repeated-sweep regime blocked won on Zen4 at EVERY size measured (in-context replay
+# 38 vs 30 GB/s at the n=2048 trailing shape; live geqp3 1.03-1.34x at n=256..2048) even though the
+# clean standalone probe ranks per-column ahead there (probe-regime-must-match-live).
+@inline function _gemv_t_simd!(
+        m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
+    ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
         # Column blocking exists to amortise the x RE-READ across NC columns. It only pays in two
@@ -596,7 +607,6 @@ end
         # NOTE this also retires the `_gemvt_nc` Measure-tier constant referenced in comments elsewhere
         # (e.g. banded_chol.jl): it was never implemented, and the measurement above says it should not be.
         j = 0
-        blk = !_gemvt_perscan(m, n, T)
         while blk && j + 4 <= n
             _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))
             j += 4

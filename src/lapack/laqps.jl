@@ -22,13 +22,16 @@
 # A/B vs AOCL libflame dgeqp3 (LBT-forwarded, 1 thread): 1.16/1.07/1.09/0.98/0.75 at n=128..2048
 # (NOT gate numbers — bench/plots.jl is authoritative).
 #
-# REMAINING GAP (n=2048 only) — measured, not guessed: the F-build gemv-T (step 4a) is 79.8% of
-# panel time at 6.1 GFlop/s there, while the SAME kernel on the same shape standalone reaches
-# 10.8 GF/s (43 GB/s — ABOVE OpenBLAS 9.2 and equal to AOCL BLIS 10.3-10.8, po2-lda effect: none).
-# The live loss decomposes into measured context effects: submatrix streaming (-11%), re-reading the
-# block the trailing gemm just DIRTIED (writeback shares DRAM, -22%), and repeated panel streaming
-# (-20%). nb sweep at 2048: 32 (derived) beats 64/128 — deeper panels falsified. Next lever is the
-# gemv-T kernel's streaming/prefetch behaviour in the dirty-DRAM regime, not this file's structure.
+# n=2048 GAP — RESOLVED (2026-08-02): the F-build gemv-T was 79.8% of panel time at 6.1 GF/s while
+# the same kernel/shape reached 10.8 standalone. Root cause was NOT dirty-DRAM writeback contention
+# (in-context replay: dirtying the block before the sweeps changes NOTHING, 7.42 vs 7.54 GF/s —
+# writebacks are ~3% of a panel's sweep traffic) and NOT L3 capacity per se. It was gemv-T ROUTING:
+# on Zen4 `_gemvt_perscan`'s clean standalone probe picks the per-column dot inside its window, but
+# the F-build re-sweeps the SAME trailing block once per panel column, and in that repeated-sweep
+# regime the NC=4 blocked kernel wins at EVERY size (38 vs 30 GB/s at the 2048 trailing shape;
+# live geqp3 1.03/1.08/1.11/1.34x at n=256/512/1024/2048). Fix: `_qp_gemv_t!` forces the blocked
+# kernel (see its header). Zen3 was never affected — its probe already picks blocked, which is why
+# the miss was Zen4-only. nb sweep at 2048: 32 (derived) beats 64/128 — deeper panels falsified.
 #
 # Other fixes vs the first (NaN-producing) port, verified against reference dlaqps:
 #   1. UNIT HEAD: dlaqps sets A(RK,K)=ONE after dlarfg and restores AKK only after the F gemvs AND
@@ -78,13 +81,26 @@
 end
 
 # y[1:nc] = α · A[ar:ar+nr-1, ac:ac+nc-1]ᵀ · X[xr:xr+nr-1, xc]      (β = 0: overwrite)
+# FORCED-BLOCKED gemv-T (measured 2026-08-02, Zen4 freq-locked): the F-build re-sweeps the SAME
+# trailing block once per panel column, and in that repeated-sweep regime the NC=4 blocked kernel
+# beats the per-column dot at EVERY size — in-context replay 38 vs 30 GB/s at the n=2048 trailing
+# shape (dirty-vs-clean A/B: NO difference, the writeback-contention hypothesis is falsified — the
+# regime itself is the effect), live geqp3 1.03/1.08/1.11/1.34x at n=256/512/1024/2048, the 2048
+# cell 0.75→1.01 vs AOCL. `_gemvt_perscan`'s clean standalone probe ranks per-column ahead inside
+# its window on Zen4 and routed the live path there — probe-regime-must-match-live. Zen3 (probe
+# false, blocked everywhere) is bit-identical under the force. No tuning constant: this deletes a
+# mis-applied Measure knob from a regime it never measured, rather than adding a knob.
 @inline function _qp_gemv_t!(A, ar::Int, ac::Int, nr::Int, nc::Int, X, xr::Int, xc::Int, α, y)
     (nr <= 0 || nc <= 0) && return
     T = eltype(A)
-    _gemv!(
-        true, false, nr, nc, T(α), view(A, ar:(ar + nr - 1), ac:(ac + nc - 1)),
-        _qp_colv(X, xr, xr + nr - 1, xc), 1, zero(T), view(y, 1:nc), 1
-    )
+    Av = view(A, ar:(ar + nr - 1), ac:(ac + nc - 1))
+    xv = _qp_colv(X, xr, xr + nr - 1, xc)
+    yv = view(y, 1:nc)
+    if T <: BlasReal && _l2_simd_ok(Av, xv, yv, 1, 1)
+        _gemv_t_simd!(nr, nc, T(α), Av, xv, zero(T), yv, Val(true), true)
+    else
+        _gemv!(true, false, nr, nc, T(α), Av, xv, 1, zero(T), yv, 1)
+    end
     return
 end
 
