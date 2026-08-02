@@ -87,3 +87,32 @@ end
 # PtrMatrix is not in the closed StridedMatrix Union, so it gets an explicit `true` method.
 @inline _strided1(A) = A isa StridedMatrix && stride(A, 1) == 1
 @inline _strided1(::PtrMatrix) = true
+
+# ===== Container-type normalization for the gemm kernels =====
+#
+# The microkernels only ever consume `pointer`, `stride(·,2)` and the dims, but they were specialized on
+# whatever container reached them. Twelve distinct types did — 6 shapes × 2 element types:
+#   Matrix{T}; PtrMatrix{T}; SubArray{T,2,Matrix{T},(Slice,UnitRange),true};
+#   SubArray{T,2,Matrix{T},(UnitRange,Slice),false}; SubArray{T,2,Matrix{T},(UnitRange,UnitRange),false};
+#   ReshapedArray{T,2,SubArray{T,1,Vector{T},(UnitRange,),true},()}
+# all of them strided column-major and semantically identical to the kernels. That fan-out — not the
+# Val-parameterized tile geometry, whose every axis is only 2 wide — is what put 280 specializations on
+# each of `_gemm_unpacked!`/`_split`/`_mr1` and 432 on `_gemm_cmplx_impl!`, and it drives BOTH `.text`
+# and `.ldata` (the serialized MethodInstance/CodeInstance graph) in the pkgimage.
+#
+# `_pm` collapses them to one type per element type. Mode 1 already feeds PtrMatrix into these exact
+# kernels, so after normalization Mode 1 and Mode 2 SHARE instances instead of duplicating the gemm
+# universe per container.
+@inline _pm(A::PtrMatrix) = A
+@inline _pm(A::AbstractMatrix{T}) where {T} =
+    PtrMatrix{T}(pointer(A), size(A, 1), size(A, 2), Int(stride(A, 2)))
+
+# `_root` is the load-bearing half. The drivers root their operands with `parA = parent(A); GC.@preserve
+# parA …`, but `parent(::PtrMatrix)` returns the struct ITSELF (isbits), so once a PtrMatrix is passed
+# down those preserves become SILENT NO-OPS and nothing keeps the buffer alive. The preserve therefore
+# has to move to the conversion site and root the real owner, which is what this peels to: an `Array`
+# for Julia-owned memory, or the PtrMatrix itself when the buffer is caller/C-owned (preserving an
+# isbits value is a legitimate no-op there — the C caller owns it across the call).
+@inline _root(A::Array) = A
+@inline _root(A::PtrMatrix) = A
+@inline _root(A) = _root(parent(A))
