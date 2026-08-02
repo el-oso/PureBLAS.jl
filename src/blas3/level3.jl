@@ -1624,10 +1624,23 @@ const _ZGT_NR = _ZGT_W
 const _ZGT_MR = @load_preference("ztrsm_gt_mr", _ZGT_W)::Int
 # The leaf needs an in-register W×W transpose (`_tr8x8` / `_tr4x4`); other widths keep the dLN base.
 const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
-# k ceiling — Derive from L1 RESIDENCY of the packed stripe, the only hot streamed operand: the two
-# KC×NR Float64 planes must fit, so KC ≤ L1 ÷ (2·NR·8). Zen4 (32K L1, NR=8) ⇒ 256; AVX2 (NR=4) ⇒ 512.
+# k ceiling — Derive from L2 RESIDENCY OF A'S TRIANGULAR PANEL. A is re-read once per NR-wide column
+# stripe (n/NR times), so the binding constraint is that the KC×KC panel stay in L2:
+#   KC²·sizeof(ComplexF64) ≤ L2  ⇒  KC ≤ √(L2 ÷ 16).
+# Zen4 (1 MB L2) ⇒ 256; Zen3 (512 KB L2) ⇒ 181. FLEET-VALIDATED, both boxes, and the second box is what
+# corrected it: the first derivation bounded the PACKED STRIPE by L1 (KC ≤ L1 ÷ (2·NR·8)), which gives
+# the same 256 on Zen4 but 512 on AVX2 because NR=W=4 halves the stripe — and at that base galen
+# measured leaf/AOCL 1.005 at k=192 but 0.820 at k=256 and 0.818 at 512, regressing ztrsm@256 from
+# 0.851 to 0.787. The L1-stripe bound is not binding (KC=256/NR=8 fills L1 exactly on Zen4 and gates
+# fine); A's panel is, and NR=4 doubles the number of A re-reads on AVX2. `min` with the stripe bound
+# keeps a hypothetical huge-L2 box from blowing L1. The real path learned the same lesson the same way
+# (_TRSM_FUSED_BASE keeps a literal 128 on non-AVX-512 because a bigger base REGRESSES n=256).
 const _ZGT_BASE = @load_preference(
-    "ztrsm_gt_base", _L1_BYTES ÷ (2 * _ZGT_NR * sizeof(Float64))
+    "ztrsm_gt_base",
+    min(
+        isqrt(_L2_BYTES ÷ sizeof(ComplexF64)),
+        _L1_BYTES ÷ (2 * _ZGT_NR * sizeof(Float64))
+    )
 )::Int
 # Deinterleave/interleave lane masks for the complex plane split (const-folded).
 const _ZGT_DERE = Val(ntuple(l -> 2 * (l - 1), Val(_ZGT_W)))
@@ -1785,7 +1798,13 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
 end
 # Eligibility: ComplexF64 only (the plane split rides the f64 W×W transpose), unit-stride A and B,
 # upper + no-trans (the substitution direction the slab hardcodes), and k within the L1 stripe bound.
-@inline _cgt_ok(A, B) = _ZGT_ON && eltype(B) === ComplexF64 &&
+# BOTH eltypes are checked. Gating on `eltype(B)` alone is a memory-safety hole, not a typo: the leaf
+# does `Ptr{Float64}(pointer(A))` and strides A by 16 bytes/element, so a Float64 (or ComplexF32) A with
+# a ComplexF64 B reads ~2× past A's allocation and returns NaN. Reachable only from the native Mode-2
+# API — LBT callers always match eltypes — which is exactly why no test caught it (found by adversarial
+# review, 2026-08-02, with a verified reproducer). The sibling direct paths had the same hole; see the
+# matching guards on _trsm_cmplx_dLN!/_dRN!/_dRC!.
+@inline _cgt_ok(A, B) = _ZGT_ON && eltype(B) === ComplexF64 && eltype(A) === ComplexF64 &&
     _strided1(A) && _strided1(B) && stride(A, 2) >= size(A, 1)
 
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
@@ -1803,8 +1822,8 @@ function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)                  # register-tiled gemmtrsm leaf
         return _trsm_cgt_L!(unit, k, A, B)
     end
-    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # direct back-substitution (no trtri)
-        return _trsm_cmplx_dLN!(up, unit, k, A, B)
+    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)   # direct back-substitution
+        return _trsm_cmplx_dLN!(up, unit, k, A, B)                                # (no trtri)
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
@@ -1853,10 +1872,13 @@ function _trsm_cmplx_dRC!(up::Bool, unit::Bool, k::Int, A, B)
     return B
 end
 function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
-    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B)                 # transA='N' direct column-substitution
-        return _trsm_cmplx_dRN!(up, unit, k, A, B)
-    elseif tr && cj && k <= _CTRSM_DIRECT_MAX && _strided1(B)        # transA='C' direct (no trtri)
-        return _trsm_cmplx_dRC!(up, unit, k, A, B)
+    # `eltype(A) === eltype(B)` guards the same memory-safety hole documented on `_cgt_ok`: these bases
+    # do `Ptr{eltype(B)}(pointer(A))`, so a mismatched A is read at the wrong element width and runs off
+    # its allocation. Mismatched eltypes fall through to the generic path, which handles them correctly.
+    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)   # transA='N' direct
+        return _trsm_cmplx_dRN!(up, unit, k, A, B)                               # column-substitution
+    elseif tr && cj && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)  # transA='C'
+        return _trsm_cmplx_dRC!(up, unit, k, A, B)                                        # direct, no trtri
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
@@ -3061,6 +3083,34 @@ const _L1_WAY_D = max(64, _L1_BYTES ÷ 64)      # doubles per L1 way (÷8-way ÷
 # _l3_apad (po2-ld A-pad, ld=k+8) lives in the per-type L3Workspace (see src/workspace.jl).
 
 # Public: B := α·op(A)⁻¹·B (side 'L') or α·B·op(A)⁻¹ (side 'R'); A k×k triangular (uplo/transA/diag).
+# A and B MUST agree in eltype before any BlasFloat fast path runs. Every such path — real and complex,
+# both sides — reinterprets A through `pointer(A)` at B's element width, so a mismatched A is read at the
+# wrong stride: measured Float32-A/Float64-B rel error 1.5e7, ComplexF32-A/ComplexF64-B either NaN or a
+# silently wrong finite answer, and a Float64 A under a ComplexF64 B runs ~2× off its own allocation.
+# Found by adversarial review 2026-08-02; the reference BLAS never has to consider it (one type per
+# symbol), and Mode 1/LBT callers always match, which is why nothing caught it.
+#
+# Promote rather than throw where the result is representable — `promote_type(TA,TB) === TB` means B can
+# hold the answer, so a one-off O(k²) copy of A gives the mathematically correct result on a path that
+# is never hot (internal and LBT callers always match, so this is a no-op for them). Where B cannot hold
+# the answer (ComplexF64 A into a Float64 B, or a Dual A under a Float64 B) it is a genuine user error
+# and must be loud, never a silent narrowing.
+#
+# NOT applied when B's eltype is outside BlasFloat: that is the generic/AD path (e.g. Float64 A with
+# ForwardDiff.Dual B), which is type-generic scalar code, handles the mixture correctly today, and would
+# be broken by forcing a convert.
+@inline function _trsm_matchel(A::AbstractMatrix, B::AbstractMatrix)
+    TA, TB = eltype(A), eltype(B)
+    (TA === TB || !(TB <: BlasFloat)) && return A
+    promote_type(TA, TB) === TB || throw(
+        ArgumentError(
+            "trsm!: eltype(A)=$TA cannot be represented in eltype(B)=$TB; " *
+                "convert the operands explicitly"
+        )
+    )
+    return convert(AbstractMatrix{TB}, A)
+end
+
 function trsm!(
         B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
         transA::Char = 'N', diag::Char = 'N', alpha::Number = true
@@ -3068,6 +3118,7 @@ function trsm!(
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trsm!: A must be $k×$k"))
+    A = _trsm_matchel(A, B)
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
     # The bypass criterion is n-DEPENDENT for side-L, exactly as the side-R note below says of m.

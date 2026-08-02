@@ -143,3 +143,28 @@ end
         end
     end
 end
+
+# Regression: the complex trsm pointer bases (`_trsm_cgt_L!`, `_trsm_cmplx_dLN!`, `_dRN!`, `_dRC!`) used
+# to be gated on `eltype(B)` ALONE. They reinterpret A as `Ptr{eltype(B)}`, so a Float64 or ComplexF32 A
+# paired with a ComplexF64 B was read at the wrong element width and ran ~2x off A's allocation, quietly
+# returning NaN. LBT/Mode-1 callers always match eltypes, so nothing in the suite exercised it — it was
+# found by adversarial review (2026-08-02). Mismatched eltypes must fall through to the generic path and
+# still produce the promoted answer.
+@testitem "trsm mixed-eltype A/B does not take the complex pointer bases" begin
+    using LinearAlgebra, PureBLAS
+    T = ComplexF64
+    for (ul, sd, ta) in (
+            ('U', 'L', 'N'), ('L', 'L', 'N'), ('U', 'R', 'N'),
+            ('L', 'R', 'N'), ('U', 'R', 'C'), ('L', 'R', 'C'),
+        ), At in (Float64, ComplexF32)
+        k, n = 64, 8                                    # k > _ZGT_W and > any direct-base cutoff
+        A = At <: Real ? triu(rand(At, k, k) .+ At(4)) : (rand(At, k, k) + At(4) * I)
+        B = sd == 'L' ? rand(T, k, n) : rand(T, n, k)
+        X = copy(B)
+        PureBLAS.trsm!(X, A; side = sd, uplo = ul, transA = ta)
+        @test all(isfinite, X)
+        R = copy(B)
+        LinearAlgebra.BLAS.trsm!(sd, ul, ta, 'N', one(T), Matrix{T}(A), R)
+        @test norm(X - R) <= 1.0e-10 * (norm(R) + 1)
+    end
+end
