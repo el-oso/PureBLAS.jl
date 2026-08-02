@@ -2274,8 +2274,26 @@ function _combine3!(C, P1, P2, P3, alpha::Tc, beta::Tc, m::Int, n::Int) where {T
 end
 # Real gemm on the top-left (m×n) block of persistent max-sized buffers: explicit logical (m,n,k) + the
 # matrix's own leading dim, so no per-call wrapping/allocation. Mirrors _gemm_core!'s real dispatch.
+# Normalizes too, and must: Strassen and 3M RE-ENTER the drivers from inside with freshly-built
+# containers (`_strassen_lvl_scratch`/`_strassen_pad_scratch` hand back `Matrix{Tr}` from the pool, and
+# `_gemm_3m!` builds `unsafe_wrap` Arrays), so converting only at `_gemm_core!` would leave
+# Matrix×PtrMatrix combinations alive and collect roughly half the specialization collapse.
+# `_strassen_rec!`'s broadcast combines (`@. TA = A21 + A22`) keep operating on plain `Matrix` — this
+# converts only at the driver call, so that codegen and its large-n gate behaviour are untouched.
 @inline function _gemm_real_dims!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::T, beta::T, A, B, C) where {T}
-    if !tA && _use_unpacked(m, n, k)
+    if _strided1(A) && _strided1(B) && _strided1(C)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC begin
+            if !tA && _use_unpacked(m, n, k)
+                _gemm_unpacked!(
+                    tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C)
+                )
+            else
+                _gemm_blocked!(tA, tB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+            end
+        end
+    elseif !tA && _use_unpacked(m, n, k)
         _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C)
     else
         _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)   # blocked also covers the transpose case
@@ -2473,19 +2491,33 @@ end
             return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
         end
         if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
-            if !tA
-                _gemm_unpacked!(
-                    tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, alpha, A, B, beta, C
-                )
-            else
-                At, _ = _gemm_scratch(T, m * k, 0)
-                _transpose_dense!(At, A, m, k)
-                Am = reshape(view(At, 1:(m * k)), m, k)
-                _gemm_unpacked!(
-                    tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, alpha, Am, B, beta, C
-                )
+            # NORMALIZE the container types here (see `_pm`/`_root` in ptrmat.jl). Every operand is
+            # already known `_strided1` on this branch, so the conversion is information-preserving —
+            # `_strided1(::PtrMatrix)` is `true` and nothing downstream consumes anything but
+            # pointer/stride/dims. The preserve MUST root the real owners and MUST enclose the whole
+            # call: the drivers' own `GC.@preserve parent(A)` becomes a no-op once they see a PtrMatrix.
+            # `_gemm_core!` is `@inline`, so this lands in the caller's frame and covers the kernel's
+            # entire lifetime.
+            rA = _root(A); rB = _root(B); rC = _root(C)
+            GC.@preserve rA rB rC begin
+                if !tA
+                    _gemm_unpacked!(
+                        tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C)
+                    )
+                else
+                    At, _ = _gemm_scratch(T, m * k, 0)
+                    _transpose_dense!(At, A, m, k)
+                    # was `reshape(view(At, 1:(m*k)), m, k)` — that ReshapedArray-of-SubArray IS one of
+                    # the twelve container types the census found reaching the microkernels.
+                    GC.@preserve At begin
+                        Am = PtrMatrix{T}(pointer(At), m, k, m)
+                        _gemm_unpacked!(
+                            tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+                            m, n, k, alpha, Am, _pm(B), beta, _pm(C)
+                        )
+                    end
+                end
             end
         else
             _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
@@ -2497,11 +2529,22 @@ end
         # Without this, `@view P[1:2:end, :]` silently reads the wrong rows — plausible magnitudes, no
         # error. Both sibling branches (real Strassen, complex unpacked) and the 3M hemm caller already
         # guard; this one did not. Found 2026-08-01 by adversarial review.
-        if _CGEMM_3M && _strided1(A) && _strided1(B) &&
-           _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX && min(m, n, k) >= _CGEMM_3M_KMIN
-            _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)   # Karatsuba 3M: beats OB at mid-n
-        elseif !tA && _strided1(A) && _strided1(B) && max(m, n, k) <= _CGEMM_UNPACK_MAX
-            _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, A, B, beta, C)
+        # Same container-type normalization as the real branch above, and the bigger half of the win:
+        # `_gemm_cmplx_impl!` alone carried 432 specializations — the largest single offender in the
+        # census — with `_uker_cmplx!` (224, already pointer-based: its count is the 2^8 Val-flag axis,
+        # NOT container types), `_cmplx_blk_conj` (108) and `_gemm_cmplx_unpacked!` (72) behind it.
+        if _strided1(A) && _strided1(B)
+            rA = _root(A); rB = _root(B); rC = _root(C)
+            GC.@preserve rA rB rC begin
+                if _CGEMM_3M && _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX &&
+                        min(m, n, k) >= _CGEMM_3M_KMIN
+                    _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                elseif !tA && max(m, n, k) <= _CGEMM_UNPACK_MAX
+                    _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                else
+                    _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                end
+            end
         else
             _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
         end
