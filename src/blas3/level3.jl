@@ -1871,7 +1871,125 @@ function _trsm_cmplx_dRC!(up::Bool, unit::Bool, k::Int, A, B)
     end
     return B
 end
+# ===== Complex trsm side-R register tile (X·U = B, upper, no-trans) — lanes are ROWS OF B =====
+#
+# The side-R twin of the `_trsm_cgt_L!` problem, with a strictly easier answer. `_trsm_cmplx_dRN!` issues
+# one full-length `_axpy_cmplx_simd!` per (i,j) pair, so B's columns are re-read k times with no row
+# blocking — BLAS-2 traffic again.
+#
+# Side-R's independent problems are the ROWS of B, and rows are CONTIGUOUS within a column, so putting
+# them in SIMD lanes needs NO transpose pack (the side-L leaf pays for one only because its independent
+# axis is the columns). A W-row × NC-column tile of B sits in registers; the already-solved columns of
+# that same tile are the operands of the in-register triangle, so the diagonal block costs zero memory
+# traffic. Registers: 2·NC accumulators + 2 (xv, xw), all Vec{2W}.
+#
+# Measured Zen4 vs AOCL (GFlop/s, m=k, freq-locked): k=16 19.9/14.5, k=32 28.1/24.0, k=48 31.4/29.0,
+# k=64 31.8/31.9, k=96 32.4/35.4 — beats dRN (16.4 / 21.6 / 25.4 / 29.0 / 30.0) at every size and AOCL
+# through k=48. It is deliberately a BASE, not the whole solve: run monolithically it plateaus at ~32 GF
+# for every k (measured flat 32.1–32.3 from n=256 to n=1024 against AOCL's 42) because the i-loop
+# re-reads solved columns at ldb stride and the panel leaves cache. The existing `_trsm_right!`
+# recursion + `_gemm_subR!` already solves that; this only replaces the leaf it bottoms out in.
+#
+# NC — Derive. Per row-block the trailing muladds are NC-INDEPENDENT (≈k²), while the panel re-reads fall
+# as k²/(2·NC) loads and the in-register triangle grows as k·(NC-1) fmas. Balancing the two marginal
+# costs gives NC ≈ √(KC·F/2L) ≈ √(KC/2) for a machine issuing ~2 fma and ~2–3 loads per cycle — which
+# predicts 4 at k=32 and ~8 at k=128, matching where each measured best. Evaluated at the base size and
+# bounded by the register file (2·NC + 2 vectors must fit).
+# NC must also DIVIDE the base, or every base invocation leaves a ragged column tail that costs an extra
+# `_gemm_core!` plus a `dRN` call. Rounding √(KC/2) down to a power of two does both jobs at once, since
+# the recursion halves and the base is a power of two: √(64/2)=5.66 → 4, which divides 32/64/128 exactly.
+# Measured: the un-rounded 5 left a 4-column tail per call and regressed ztrsmR@512 0.979→0.965 (spread
+# 0.001, so 14× the noise) while helping the sizes whose base call happened to divide evenly.
+# (the register count is spelled out rather than reusing `_GT_NREG`, which this file defines further down)
+const _ZRT_NC = @load_preference(
+    "ztrsm_zrt_nc",
+    clamp(prevpow(2, max(2, isqrt(_CTRSM_REC_L ÷ 2))), 2, ((_SIMD_BYTES >= 64 ? 32 : 16) - 4) ÷ 2)
+)::Int
+const _ZRT_SWP = Val(ntuple(l -> (l - 1) ⊻ 1, Val(2 * _ZGT_W)))
+const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val(2 * _ZGT_W)))
+@inline _zrt_nswap(v) = shufflevector(v, _ZRT_SWP) * _ZRT_NEG      # [-im, re, -im, re, …]
+
+# Rows r0..r0+W-1 of the NC-column block at jb: fold in every solved column i<jb (one B load shared by
+# all NC columns), then substitute the NC×NC triangle entirely in register.
+@generated function _zrt_tile!(
+        ::Val{NC}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
+        rc::Ptr{Float64}, r0::Int, jb::Int
+    ) where {NC}
+    sz = sizeof(Float64); V2 = Vec{2 * _ZGT_W, Float64}
+    a(t) = Symbol(:acc, t)
+    ld = [:($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    upd = [
+        quote
+            cr = unsafe_load(pAi, 2 * (jb + $t) * lda + 1); ci = unsafe_load(pAi, 2 * (jb + $t) * lda + 2)
+            $(a(t)) = muladd($V2(-cr), xv, muladd($V2(-ci), xw, $(a(t))))
+        end for t in 0:(NC - 1)
+    ]
+    tri = map(0:(NC - 1)) do t
+        feed = [
+            quote
+                cr = unsafe_load(pAt, 2 * (jb + $u) * lda + 1); ci = unsafe_load(pAt, 2 * (jb + $u) * lda + 2)
+                $(a(u)) = muladd($V2(-cr), $(a(t)), muladd($V2(-ci), sw, $(a(u))))
+            end for u in (t + 1):(NC - 1)
+        ]
+        return quote
+            rr = unsafe_load(rc, 2 * (jb + $t) + 1); ri = unsafe_load(rc, 2 * (jb + $t) + 2)
+            $(a(t)) = $V2(rr) * $(a(t)) + $V2(ri) * _zrt_nswap($(a(t)))
+            sw = _zrt_nswap($(a(t)))
+            pAt = pA + (jb + $t) * 2 * $sz                       # &A[jb+t+1, 1]; walk columns by lda
+            $(feed...)
+        end
+    end
+    st = [:(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    return quote
+        $(Expr(:meta, :inline))
+        @inbounds begin
+            $(ld...)
+            for i in 0:(jb - 1)
+                xv = vload($V2, pB + (i * ldb + r0) * 2 * $sz)
+                xw = _zrt_nswap(xv)
+                pAi = pA + i * 2 * $sz                           # &A[i+1, 1]
+                $(upd...)
+            end
+            $(tri...)
+            $(st...)
+        end
+        return nothing
+    end
+end
+
+function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
+    m = size(B, 1); W = _ZGT_W; NC = _ZRT_NC
+    lda = stride(A, 2); ldb = stride(B, 2)
+    nb = (k ÷ NC) * NC                       # columns covered by full tiles
+    mb = (m ÷ W) * W                         # rows covered by full vector blocks
+    rc = _trsm_fused_buf(Float64, 2 * k)
+    GC.@preserve A B rc begin
+        pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B)); prc = pointer(rc)
+        @inbounds for j in 0:(k - 1)
+            z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
+            unsafe_store!(prc, real(z), 2j + 1); unsafe_store!(prc, imag(z), 2j + 2)
+        end
+        for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
+            _zrt_tile!(Val(_ZRT_NC), pB, ldb, pA, lda, prc, r0, jb)
+        end
+    end
+    # ragged rows must finish BEFORE the column tail: that gemm reads every row of the solved block
+    mb < m && nb > 0 &&
+        _trsm_cmplx_dRN!(true, unit, nb, view(A, 1:nb, 1:nb), view(B, (mb + 1):m, 1:nb))
+    if nb < k
+        nb > 0 && _gemm_core!(
+            view(B, :, (nb + 1):k), view(B, :, 1:nb), view(A, 1:nb, (nb + 1):k),
+            -one(ComplexF64), one(ComplexF64), false, false, false, false
+        )
+        _trsm_cmplx_dRN!(true, unit, k - nb, view(A, (nb + 1):k, (nb + 1):k), view(B, :, (nb + 1):k))
+    end
+    return B
+end
+
 function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
+    if up && !tr && _cgt_ok(A, B) && size(B, 1) >= _ZGT_W          # register tile (lanes = rows of B)
+        return _trsm_zrt_R!(unit, k, A, B)
+    end
     # `eltype(A) === eltype(B)` guards the same memory-safety hole documented on `_cgt_ok`: these bases
     # do `Ptr{eltype(B)}(pointer(A))`, so a mismatched A is read at the wrong element width and runs off
     # its allocation. Mismatched eltypes fall through to the generic path, which handles them correctly.
