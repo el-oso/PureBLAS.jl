@@ -15,6 +15,123 @@
 @inline _geqp3_tau_Qh(τ::T) where {T <: BlasReal} = τ
 @inline _geqp3_tau_Qh(τ::T) where {T <: BlasComplex} = conj(τ)
 
+# ── real-strided fast path for the unblocked loop ────────────────────────────────────────────────
+# Phase decomposition of the n=32 call (Zen4 freq-locked, in-situ time_ns accumulators, 2026-08-02)
+# put the reflector apply at ~41% (6.6 GF/s) and the norm DOWNDATE at ~25% — the downdate is two
+# scalar divides + a sqrt per trailing column (≈20 cyc latency each visit), pure scalar throughput
+# next to zero flops. The fix below: the apply pass collects each updated head A[i,j] into a
+# contiguous buffer, and the downdate becomes ONE SIMD pass (vdivpd/vsqrtpd are full-width) with a
+# scalar fixup chunk only where the tol3z recompute test fires (rare). IEEE div/sqrt vectorize
+# exactly, so results are BITWISE identical to the scalar order. Measured (same harness): n=32
+# 13.8→11.2 µs (1.23×), n=8 1.07× — the shipped path LOST the n=32 gate cell to AOCL at 0.848.
+
+# Scalar downdate of one column: the LAPACK dlaqp2/dlaqps formula, verbatim (recompute via lassq-safe
+# _nrm2, req#6). `h` is the just-updated head A[i,jj].
+@inline function _geqp3_dd1!(A, i::Int, m::Int, jj::Int, h::T, vn1, vn2, tol3z::T) where {T <: BlasReal}
+    @inbounds if !iszero(vn1[jj])
+        temp = one(T) - (abs(h) / vn1[jj])^2
+        temp = max(temp, zero(T))
+        temp2 = temp * (vn1[jj] / vn2[jj])^2
+        if temp2 <= tol3z
+            if i < m
+                nrm = _nrm2(m - i, view(A, (i + 1):m, jj), 1); vn1[jj] = nrm; vn2[jj] = nrm
+            else
+                vn1[jj] = zero(T); vn2[jj] = zero(T)
+            end
+        else
+            vn1[jj] = vn1[jj] * sqrt(temp)
+        end
+    end
+    return
+end
+
+# One reflector step of the unblocked loop: apply H = I − τ·v·vᵀ (v = A[i:m,i], head ≡ 1, holds β —
+# never read) to the trailing columns AND downdate vn1/vn2. Per column the apply is the same
+# _dot_simd/_axpy_simd! pair `_house_left!`'s SIMD branch issues (bitwise-identical results); the
+# downdate runs as the SIMD pass described above. Below 2·_vwidth trailing columns there is at most
+# one full vector + tail, so the two-pass structure has nothing to amortize — the downdate stays
+# fused scalar per column instead (derived cutoff: pure ISA width, no tuning literal; this is also
+# what keeps n=8 ahead of the old code, measured 0.91×→1.07×).
+function _geqp3_house_dd!(
+        A::AbstractMatrix{T}, i::Int, m::Int, n::Int, τ::T,
+        hbuf::Vector{T}, vn1::Vector{T}, vn2::Vector{T}, tol3z::T
+    ) where {T <: BlasReal}
+    len = m - i + 1; nc = n - i
+    W = _vwidth(T)
+    sz = sizeof(T)
+    GC.@preserve A hbuf begin
+        pa = pointer(A); ld = stride(A, 2)
+        pv = pa + ((i - 1) * ld + (i - 1)) * sz          # column i, row i: the reflector v
+        if nc < 2 * W
+            @inbounds for j in (i + 1):n
+                cp = pa + ((j - 1) * ld + (i - 1)) * sz
+                c1 = unsafe_load(cp, 1)
+                w = iszero(τ) ? zero(T) : τ * (c1 + _dot_simd(len - 1, cp + sz, pv + sz, T))
+                c1new = c1 - w
+                unsafe_store!(cp, c1new, 1)
+                iszero(w) || _axpy_simd!(len - 1, -w, pv + sz, cp + sz)
+                _geqp3_dd1!(A, i, m, j, c1new, vn1, vn2, tol3z)
+            end
+            return
+        end
+        @inbounds for j in (i + 1):n
+            cp = pa + ((j - 1) * ld + (i - 1)) * sz
+            c1 = unsafe_load(cp, 1)
+            w = iszero(τ) ? zero(T) : τ * (c1 + _dot_simd(len - 1, cp + sz, pv + sz, T))
+            c1new = c1 - w
+            unsafe_store!(cp, c1new, 1)
+            hbuf[j - i] = c1new                          # contiguous heads for the SIMD downdate
+            iszero(w) || _axpy_simd!(len - 1, -w, pv + sz, cp + sz)
+        end
+    end
+    V = Vec{W, T}
+    j = 1
+    @inbounds begin
+        while j + W - 1 <= nc
+            v1 = vload(V, vn1, i + j); v2 = vload(V, vn2, i + j)
+            h = vload(V, hbuf, j)
+            q = abs(h) / v1
+            temp = max(one(T) - q * q, zero(T))
+            r = v1 / v2
+            t2 = temp * (r * r)
+            zero1 = v1 == zero(T)                        # vn1==0 lanes: q=Inf ⇒ temp=0 ⇒ t2=0 would
+            flag = (t2 <= tol3z) & !zero1                # false-flag; mask them (they stay 0)
+            if any(flag)
+                for l in 0:(W - 1)                       # exact LAPACK path for the whole chunk
+                    _geqp3_dd1!(A, i, m, i + j + l, hbuf[j + l], vn1, vn2, tol3z)
+                end
+            else
+                vstore(vifelse(zero1, v1, v1 * sqrt(temp)), vn1, i + j)
+            end
+            j += W
+        end
+        while j <= nc
+            _geqp3_dd1!(A, i, m, i + j, hbuf[j], vn1, vn2, tol3z)
+            j += 1
+        end
+    end
+    return
+end
+
+# Initial column norms, real-strided fast path: one plain-SIMD sum-of-squares pass per (contiguous)
+# column with the lassq-safe _nrm2 as the over/underflow fallback — the SAME guard pattern _larfg!'s
+# fast path uses (reroute when ss is non-finite or below floatmin; req#6 honoured via the fallback).
+# 32 separate _nrm2 entries were ~14% of the n=32 call (measured); this pass is ~4×.
+function _geqp3_norms!(A::AbstractMatrix{T}, m::Int, n::Int, vn1, vn2) where {T <: BlasReal}
+    @inbounds for j in 1:n
+        ss = zero(T)
+        @simd for r in 1:m
+            ss = muladd(A[r, j], A[r, j], ss)
+        end
+        nrm = sqrt(ss)
+        if !isfinite(nrm) || ss < floatmin(T)
+            nrm = _nrm2(m, view(A, :, j), 1)
+        end
+        vn1[j] = nrm; vn2[j] = nrm
+    end
+    return
+end
+
 function geqp3!(
         A::AbstractMatrix{T}, jpvt::AbstractVector{<:Integer},
         tau::AbstractVector{T}
@@ -29,11 +146,15 @@ function geqp3!(
     tol3z = sqrt(eps(R))                                   # dlaqps recompute threshold (√ machine-eps)
     vn1 = Vector{R}(undef, n)                              # current (downdated) partial column 2-norms
     vn2 = Vector{R}(undef, n)                              # reference norm at last exact recompute
-    @inbounds for j in 1:n
-        nrm = _nrm2(m, view(A, :, j), 1); vn1[j] = nrm; vn2[j] = nrm
+    if T <: BlasReal && R === T && _strided1(A)
+        _geqp3_norms!(A, m, n, vn1, vn2)                   # fused fast pass, _nrm2 fallback guard
+    else
+        @inbounds for j in 1:n
+            nrm = _nrm2(m, view(A, :, j), 1); vn1[j] = nrm; vn2[j] = nrm
+        end
     end
     # blocked dlaqps panels (laqps.jl) — real strided above the unblocked crossover; unblocked loop
-    # below factors the tail and remains the fallback (also the complex / AD / non-strided path).
+    # below factors the tail and remains the fallback (also the complex / non-strided path).
     j0 = 1
     if T <: BlasReal && R === T && _strided1(A) && k > _QR_UNBLK_MAX
         nb = clamp(_qr_nb(m, n), 1, k)
@@ -52,6 +173,34 @@ function geqp3!(
                 j0 += fjb
             end
         end
+    end
+    if T <: BlasReal && R === T && _strided1(A)
+        # fast unblocked loop: same pivot/swap/larfg, apply+downdate via _geqp3_house_dd! (SIMD
+        # downdate, bitwise-identical results — see the kernel header for the measurements).
+        # NOTE (measured 2026-08-02, Zen4): with this loop the UNBLOCKED path also beats the blocked
+        # path at n=48/64/96 (1.33×/1.24×/1.05×), crossing only at n=128 (0.96×). _QR_UNBLK_MAX
+        # stays 32 — no gate cell sits in 48..96 and the crossover is unmeasured off Zen4; a
+        # geqp3-specific derived crossover is a follow-up lever, not assumed here.
+        hbuf = Vector{R}(undef, n)                         # contiguous heads for the SIMD downdate
+        @inbounds for i in j0:k
+            pvt = i; maxn = vn1[i]
+            for j in (i + 1):n
+                if vn1[j] > maxn
+                    maxn = vn1[j]; pvt = j
+                end
+            end
+            if pvt != i
+                for r in 1:m
+                    t = A[r, i]; A[r, i] = A[r, pvt]; A[r, pvt] = t
+                end
+                jpvt[i], jpvt[pvt] = jpvt[pvt], jpvt[i]
+                vn1[pvt] = vn1[i]; vn2[pvt] = vn2[i]
+            end
+            β, τ = _larfg!(view(A, i:m, i)); tau[i] = τ
+            A[i, i] = β                                    # _larfg! leaves x[1]=α; place R's diagonal
+            i < n && _geqp3_house_dd!(A, i, m, n, τ, hbuf, vn1, vn2, tol3z)
+        end
+        return A, jpvt, tau
     end
     @inbounds for i in j0:k
         # ---- pivot: column of maximal partial norm over i:n → swap to position i ----
