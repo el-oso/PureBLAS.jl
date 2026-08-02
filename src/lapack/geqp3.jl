@@ -32,7 +32,28 @@ function geqp3!(
     @inbounds for j in 1:n
         nrm = _nrm2(m, view(A, :, j), 1); vn1[j] = nrm; vn2[j] = nrm
     end
-    @inbounds for i in 1:k
+    # blocked dlaqps panels (laqps.jl) — real strided above the unblocked crossover; unblocked loop
+    # below factors the tail and remains the fallback (also the complex / AD / non-strided path).
+    j0 = 1
+    if T <: BlasReal && R === T && _strided1(A) && k > _QR_UNBLK_MAX
+        nb = clamp(_qr_nb(m, n), 1, k)
+        if nb > 1
+            F = Matrix{T}(undef, n, nb)
+            auxv = Vector{T}(undef, nb)
+            wrow = Vector{T}(undef, n)                 # pivot-row delta buffer (see laqps.jl step 5)
+            while k - j0 + 1 > nb
+                jb = min(nb, k - j0 + 1)
+                fjb = _laqps!(
+                    m, n - j0 + 1, j0 - 1, jb, view(A, 1:m, j0:n),
+                    view(jpvt, j0:n), view(tau, j0:k),
+                    view(vn1, j0:n), view(vn2, j0:n), auxv, view(F, 1:(n - j0 + 1), 1:jb), wrow
+                )
+                fjb <= 0 && break
+                j0 += fjb
+            end
+        end
+    end
+    @inbounds for i in j0:k
         # ---- pivot: column of maximal partial norm over i:n → swap to position i ----
         pvt = i; maxn = vn1[i]
         for j in (i + 1):n

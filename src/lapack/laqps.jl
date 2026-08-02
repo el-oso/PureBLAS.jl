@@ -1,31 +1,38 @@
-# ⚠ CORRECT BUT ~2-3x SLOWER THAN THE UNBLOCKED PATH. NOT INCLUDED, NOT CALLED. Do not wire this in
-# without first fixing the cause below — it was wired, measured, and reverted on 2026-08-02.
+# Blocked pivoted-QR panel — LAPACK `dlaqps`, real types. Called by `geqp3!` (geqp3.jl) for
+# `T <: BlasReal && _strided1(A)` above `_QR_UNBLK_MAX`; the unblocked loop remains the fallback
+# (complex, generic/AD, non-strided) and factors the tail after the last full panel.
 #
-# This is a VERIFIED-CORRECT port of LAPACK `dlaqps` (blocked pivoted-QR panel). Correctness is not the
-# problem and is no longer a confound:
-#   Q·R reconstruction vs A0[:,jpvt] — 11 shapes incl. rank-deficient, tall-skinny, short-fat, both real
-#   types: relerr 6.5e-16 .. 1.8e-15 (F64), 3.4e-07 .. 1.3e-06 (F32); |diag R| non-increasing;
-#   sort(jpvt)==1:n; C-ABI/LBT path jpvt IDENTICAL to OpenBLAS; existing suite 164/164.
+# VERIFIED CORRECT: Q·R reconstruction vs A0[:,jpvt] — 11 shapes incl. rank-deficient, tall-skinny,
+# short-fat, both real types: relerr ≤1.8e-15 (F64) / ≤1.3e-06 (F32); |diag R| non-increasing;
+# sort(jpvt)==1:n; jpvt IDENTICAL to OpenBLAS on the LBT path; suite 164/164.
 #
-# MEASURED GATE, Zen4 freq-locked, PB/AOCL (v3 `op=geqp3 arms=pb`, references from the same cache):
-#     n=        32      128      256      512     1024     2048
-#   unblocked  0.856    0.917    0.756    0.832    0.722    0.561
-#   BLOCKED    0.846    0.785    0.456    0.282    0.247    0.417
-# Every cell REGRESSED, worst ~3x at n=512-1024. The unblocked path was reinstated.
+# PERF HISTORY — the first wiring of this port was CORRECT BUT 2.7-3.1x SLOWER and was reverted
+# (2026-08-02). The culprit was found by PHASE DECOMPOSITION (timed copy of this function, Zen4
+# freq-locked), NOT by shape/code reading — a prior static review concluded the inner ops were fine
+# and was falsified:
+#   the OLD step-5 pivot-row update walked the lda-strided row A[rk,k+1:n] once per rank-1 term
+#   (k ≤ nb passes/column). At power-of-2 lda (8·lda = 4 KiB at n=512) every row element maps to the
+#   SAME L1 set, so all passes thrash to L2/L3: measured 0.05 GFlop/s, 65-77% of panel time — the
+#   entire regression. Every gemv/gemm was already on its SIMD kernel (predicates measured true; live
+#   shapes within 0.75-1.0x of plain-Matrix probes). NOT the kb entry-overhead failure mode.
+# THE FIX (current step 5): gather A[rk,1:k] into auxv, ONE contiguous SIMD gemv for the row delta
+# into `wrow`, then a SINGLE strided pass applying the delta with the step-6 downdate folded in.
+# Measured after fix (same harness, min-of-samples): blocked/unblocked runtime 0.82/0.70/0.74/0.73/
+# 0.74x at n=128/256/512/1024/2048 — blocked wins everywhere it engages. Indicative same-process
+# A/B vs AOCL libflame dgeqp3 (LBT-forwarded, 1 thread): 1.16/1.07/1.09/0.98/0.75 at n=128..2048
+# (NOT gate numbers — bench/plots.jl is authoritative).
 #
-# THIS IS THE SECOND TIME A BLOCKED geqp3 HAS BEEN CORRECT BUT SLOWER HERE. The first attempt is
-# recorded in kb `pureblas-blas2-entry-overhead-blocks-blocked-lapack.md`. That the ALGORITHM is right
-# (it is LAPACK's own, and it is what AOCL runs to beat us) while this implementation of it is 2-3x
-# slower isolates the cause to the inner operations, not the blocking:
-#   * the F-build gemv-T is (m-rk)x(n-k) and carries ~half the panel flops — if it is not hitting the
-#     SIMD gemv-T kernel, the whole port is BLAS-2 with extra bookkeeping;
-#   * a static review (Fable, 2026-08-02) concluded the gemvs were "structurally fine at gate size".
-#     THE MEASUREMENT FALSIFIED THAT. Do not re-run that analysis and believe it — profile instead.
+# REMAINING GAP (n=2048 only) — measured, not guessed: the F-build gemv-T (step 4a) is 79.8% of
+# panel time at 6.1 GFlop/s there, while the SAME kernel on the same shape standalone reaches
+# 10.8 GF/s (43 GB/s — ABOVE OpenBLAS 9.2 and equal to AOCL BLIS 10.3-10.8, po2-lda effect: none).
+# The live loss decomposes into measured context effects: submatrix streaming (-11%), re-reading the
+# block the trailing gemm just DIRTIED (writeback shares DRAM, -22%), and repeated panel streaming
+# (-20%). nb sweep at 2048: 32 (derived) beats 64/128 — deeper panels falsified. Next lever is the
+# gemv-T kernel's streaming/prefetch behaviour in the dirty-DRAM regime, not this file's structure.
 #
-# NEXT STEP IS A DECOMPOSITION, NOT A REWRITE: time the four inner ops separately (step-2 gemv, F-build
-# gemv-T, F acc gemv, trailing `_gemm_core!`) against their own roofline at n=512/1024, and find which
-# one is not reaching its kernel. Only then decide whether to fix the call or abandon the approach.
-# Suspect #1 is that these views do not satisfy `_l2_simd_ok`, silently taking the generic scalar loop.
+# Other fixes vs the first (NaN-producing) port, verified against reference dlaqps:
+#   1. UNIT HEAD: dlaqps sets A(RK,K)=ONE after dlarfg and restores AKK only after the F gemvs AND
+#      the pivot-row update — the reflector multiplies as [1; v]. The old port left β at the head.
 #   2. The norm downdate ran unguarded; dlaqps guards it with `RK < LASTRK` (skip on the last row —
 #      the trailing vectors below rk are empty and the downdate is meaningless there).
 #   3. The LSTICC recompute used a raw sum of squares; req#6 demands lassq-safe `_nrm2`.
@@ -45,6 +52,9 @@
 #
 # Returns `kb`, the number of columns actually factored: the norm-recompute branch (LSTICC) can stop
 # a panel early, and the caller MUST honour the returned value rather than assuming `nb`.
+
+# A/B switch for measurement: lets one process time blocked vs unblocked geqp3! back-to-back
+# (controlled A/B, not cross-run). true = geqp3! may take the blocked path.
 
 # ── panel helpers ────────────────────────────────────────────────────────────────────────────────
 # All take explicit (row, col, extent) rather than pre-built SubArrays so each view is built exactly
@@ -112,7 +122,7 @@ function _laqps!(
         m::Int, n::Int, offset::Int, nb::Int, A::AbstractMatrix{T},
         jpvt::AbstractVector{<:Integer}, tau::AbstractVector{T},
         vn1::AbstractVector{T}, vn2::AbstractVector{T}, auxv::AbstractVector{T},
-        F::AbstractMatrix{T}
+        F::AbstractMatrix{T}, wrow::AbstractVector{T}
     ) where {T <: BlasReal}
     tol3z = sqrt(eps(T))
     lastrk = min(m, offset + n)
@@ -184,23 +194,30 @@ function _laqps!(
                 F[r, k] = zero(T)
             end
 
-            # ── 5. update the PIVOT ROW only: A[rk,k+1:n] -= A[rk,1:k]·F[k+1:n,1:k]ᵀ ──────────────
-            #      (r=k term uses the unit head A[rk,k]=1.) r outer so each F column streams
-            #      contiguously; the strided A-row writes revisit the same cache lines k≤nb times.
+            # ── 5.+6. pivot row update + norm downdate, ONE strided pass ─────────────────────────
+            # A[rk,k+1:n] -= A[rk,1:k]·F[k+1:n,1:k]ᵀ (r=k term uses the unit head A[rk,k]=1).
+            # MEASURED HAZARD (this was the whole regression): walking the lda-strided pivot row
+            # per rank-1 term is catastrophic at power-of-2 lda — every element maps to the same
+            # L1 set (lda·8 = 4 KiB at n=512/1024), so k read-modify-write passes all thrash to
+            # L2/L3: 0.05 GFlop/s, 65-77% of panel time, the 2.7-3.1x end-to-end loss. Instead:
+            # gather A[rk,1:k] (k≤nb elements), ONE contiguous SIMD gemv for the delta into wrow,
+            # then a SINGLE strided pass that applies the delta and folds in the downdate (which
+            # previously re-read the same pathological row a second time).
             @inbounds for r in 1:k
-                arkr = A[rk, r]
-                iszero(arkr) && continue
-                @simd for j in (k + 1):n
-                    A[rk, j] = muladd(-arkr, F[j, r], A[rk, j])
-                end
+                auxv[r] = A[rk, r]
             end
-
-            # ── 6. downdate the partial norms (dlaqps guards this with RK < LASTRK: on the last
-            #      row the trailing vectors below rk are empty and the downdate is meaningless) ────
+            _gemv!(
+                false, false, n - k, k, -one(T), view(F, (k + 1):n, 1:k),
+                view(auxv, 1:k), 1, zero(T), view(wrow, 1:(n - k)), 1
+            )
             if rk < lastrk
+                # dlaqps guards the downdate with RK < LASTRK: on the last row the trailing
+                # vectors below rk are empty and the downdate is meaningless.
                 @inbounds for j in (k + 1):n
+                    aj = A[rk, j] + wrow[j - k]
+                    A[rk, j] = aj
                     if !iszero(vn1[j])
-                        temp = one(T) - (abs(A[rk, j]) / vn1[j])^2
+                        temp = one(T) - (abs(aj) / vn1[j])^2
                         temp = max(temp, zero(T))
                         temp2 = temp * (vn1[j] / vn2[j])^2
                         if temp2 <= tol3z
@@ -210,6 +227,10 @@ function _laqps!(
                             vn1[j] *= sqrt(temp)
                         end
                     end
+                end
+            else
+                @inbounds for j in (k + 1):n
+                    A[rk, j] += wrow[j - k]
                 end
             end
         end

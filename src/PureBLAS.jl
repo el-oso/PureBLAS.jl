@@ -30,6 +30,7 @@ include("lapack/eigen.jl")         # LAPACK: symmetric/Hermitian eigensolver (sy
 include("lapack/eigen_dc.jl")      # LAPACK: symmetric tridiagonal divide-and-conquer (stedc, Cuppen) — jobz='V' path
 include("lapack/lq.jl")            # LAPACK: LQ (gelqf/orglq/ormlq) — row-wise dual of QR, generic s/d/c/z
 include("lapack/bunchkaufman.jl")  # LAPACK: Bunch-Kaufman (sytrf/hetrf + sytrs/hetrs) symmetric-indefinite/Hermitian
+include("lapack/laqps.jl")         # LAPACK: blocked pivoted-QR panel (dlaqps) — BLAS-3 path for geqp3
 include("lapack/geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-revealing, generic s/d/c/z
 include("lapack/gels.jl")          # LAPACK: least-squares / min-norm solve (gels) over QR/LQ
 include("lapack/gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
