@@ -172,3 +172,130 @@ end
         end
     end
 end
+
+# FIRST-OCCURRENCE (tie) semantics — the companion hazard to the NaN item above, and the one a
+# BLIS-style restructure would break. `bli_damaxv_zen_int_avx512` finds the maximum VALUE with a
+# vmaxpd merge tree, records only which BLOCK won, and recovers the index at the end by a scalar
+# equality-rescan of that block. If the same magnitude also occurs in an EARLIER block, that shape
+# returns the later index; netlib idamax returns the FIRST (its update is a strict `>`, so an equal
+# element never displaces the incumbent). The existing cases above are almost all UNIQUE-max vectors,
+# so they cannot see this: `T[3, -3, 3]` is the only tie, and it is 3 elements long — below every
+# SIMD tier. These sweep ties across lanes, across blocks, and at every alignment.
+#
+# Also pinned here: |−0.0| == |0.0| is a tie (must give index 1, not 2), and ±x are a tie under abs.
+@testitem "iamax first-occurrence on ties (netlib reference oracle)" begin
+    using PureBLAS
+
+    function ref_iamax(x)                      # netlib idamax, verbatim — strict `>`, so ties keep first
+        n = length(x)
+        n < 1 && return 0
+        n == 1 && return 1
+        dmax = abs(x[1]); ix = 1
+        for k in 2:n
+            if abs(x[k]) > dmax
+                dmax = abs(x[k]); ix = k
+            end
+        end
+        ix
+    end
+
+    for T in (Float32, Float64)
+        nan = T(NaN)
+        cases = Vector{T}[
+            T[0, -0.0], T[-0.0, 0], T[5, -5], T[-5, 5],          # sign/zero ties
+            fill(T(7), 3), fill(T(7), 8), fill(T(7), 64), fill(T(7), 300),   # all-equal, every tier
+        ]
+        for x in cases
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
+        # the SAME maximum magnitude in two different blocks: the first must win. Sweep both positions
+        # across lane and block boundaries for both vector widths.
+        for n in (64, 128, 300), p in (1, 2, 4, 8, 9, 16, 17, 32, 33, 63, 64)
+            p < n || continue
+            for q in (p + 1, p + 8, p + 16, p + 63)
+                q <= n || continue
+                x = fill(T(1), n); x[p] = T(99); x[q] = T(99)     # exact tie, p < q ⇒ answer is p
+                @test PureBLAS.iamax(x) == ref_iamax(x) == p
+                x2 = fill(T(1), n); x2[p] = T(99); x2[q] = T(-99) # tie under abs
+                @test PureBLAS.iamax(x2) == ref_iamax(x2) == p
+            end
+        end
+        # a tie whose duplicate sits in a LATER block than a NaN — combines both hazards
+        for p in (2, 9, 17, 65)
+            x = fill(T(1), 128); x[p] = nan; x[p + 1] = T(50); x[p + 40] = T(50)
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+        end
+    end
+end
+
+# SAME-LANE, CROSS-BLOCK NaN/max pairs — the input class that breaks a max-TREE detect, which is what
+# `_iamax_thresh4!` uses below L2. The tree computes m = vmax(vmax(v0,v1), vmax(v2,v3)) over the four
+# blocks of one iteration and then asks whether any lane of m exceeds the running threshold. vmaxpd
+# PROPAGATES a NaN over a real maximum in the same lane of another block, so an ORDERED compare
+# (`any(m > thr)`) would swallow the real max and skip the whole iteration. The shipped detect uses the
+# UNORDERED form (`any(!(m <= thr))`), under which a NaN lane conservatively fires the cold path and the
+# byte-for-byte-unchanged gmax-seeded walk then resolves the true answer.
+#
+# These pin that. Every pair is placed at the SAME lane of two different blocks within ONE 4W iteration,
+# in both orders and at all three tree levels (blocks 0-1, 0-2, 0-3), for both vector widths. Also the
+# leftover-W and scalar-tail regions, the n = 4W routing threshold, and ties across blocks.
+@testitem "iamax max-tree detect: same-lane cross-block NaN/max (netlib reference oracle)" begin
+    using PureBLAS
+
+    function ref_iamax(x)
+        n = length(x)
+        n < 1 && return 0
+        n == 1 && return 1
+        dmax = abs(x[1]); ix = 1
+        for k in 2:n
+            if abs(x[k]) > dmax
+                dmax = abs(x[k]); ix = k
+            end
+        end
+        ix
+    end
+
+    for T in (Float32, Float64)
+        nan, inf = T(NaN), T(Inf)
+        for W in (4, 8, 16)                       # cover both real widths and F32's W=16
+            n = 8W
+            for l in 1:W, d in (W, 2W, 3W)        # same lane l, blocks 1 apart / 2 apart / 3 apart
+                l + d <= n || continue
+                x = ones(T, n); x[l] = nan; x[l + d] = T(99)       # NaN before the max
+                @test PureBLAS.iamax(x) == ref_iamax(x)
+                y = ones(T, n); y[l] = T(99); y[l + d] = nan       # max before the NaN
+                @test PureBLAS.iamax(y) == ref_iamax(y)
+            end
+            # the true max in a DIFFERENT block of a NaN-poisoned iteration
+            for l in (1, W ÷ 2, W)
+                x = ones(T, n); x[l] = nan; x[l + W + 1] = T(55)
+                @test PureBLAS.iamax(x) == ref_iamax(x)
+            end
+        end
+        # NaN at position 1 on both sides of the n = 4W routing threshold, all-NaN, and the tail regions
+        for n in (15, 16, 17, 31, 32, 33, 63, 64, 65, 100)
+            x = collect(T, 1:n); x[1] = nan
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+            y = fill(nan, n)
+            @test PureBLAS.iamax(y) == ref_iamax(y)
+            z = collect(T, 1:n); z[n] = nan                        # NaN in the scalar tail
+            @test PureBLAS.iamax(z) == ref_iamax(z)
+        end
+        # NaN in the leftover-W region specifically (n just past a 4W multiple), and +-Inf with NaN
+        for n in (36, 68, 132)
+            x = ones(T, n); x[n - 2] = nan; x[n - 1] = T(9)
+            @test PureBLAS.iamax(x) == ref_iamax(x)
+            y = ones(T, n); y[3] = inf; y[n - 3] = nan; y[n - 1] = -inf
+            @test PureBLAS.iamax(y) == ref_iamax(y)
+        end
+        # ties across blocks WITHIN one iteration, and across iterations — first must win either way
+        let x = ones(T, 128)
+            x[33] = T(7); x[41] = T(7)
+            @test PureBLAS.iamax(x) == ref_iamax(x) == 33
+        end
+        let x = ones(T, 512)
+            x[5] = T(7); x[300] = T(7)
+            @test PureBLAS.iamax(x) == ref_iamax(x) == 5
+        end
+    end
+end
