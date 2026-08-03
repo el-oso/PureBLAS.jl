@@ -59,9 +59,14 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # Zen3 never; the Derive-only version regressed Zen3 gemvT to 0.69 vs AOCL). The decision is a
 # OncePerProcess runtime benchmark, so it is not trim-safe; pin it to compile the measure branch out.
 # `false` = always blocked = the conservative arm that is correct on every box measured so far.
+# And `zaxpy_narrow`: the complex-axpy width decision is a Measure-tier OncePerProcess benchmark, so it
+# allocates a probe buffer and is not trim-safe. `true` = the narrow arm, measured best on Zen4 and the
+# arm that closes the zaxpy gate cells; a trim build for a true-512-bit datapath should re-pin it.
+const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
+set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
@@ -83,6 +88,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "gemvt_perscan"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => _prev_gvtp; force = true)
+    end
+    if _prev_zaxn === nothing
+        delete_preferences!(PUREBLAS_UUID, "zaxpy_narrow"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => _prev_zaxn; force = true)
     end
     if _prev_brd === nothing
         delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)

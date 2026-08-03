@@ -176,7 +176,106 @@ end
 # A/B @1M: 96.5→99.1 GB/s, PB/OB 0.937→0.958 (5/5 trials). Residual vs OB is complex-specific L3-edge
 # scheduling (shuffle+2FMA density limits bandwidth for OB's complex too: real 111 vs complex-OB 104 GB/s at
 # matched 32MB/bytes). 4× unrolled (bandwidth-bound: reads x+y, writes y). `n` counts COMPLEX elements.
-@generated function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+# PAST-L2 VARIANT: 256-bit vectors, and the iteration PHASE-SEPARATED (all x loads, all y loads, all
+# compute, all stores) — the shape OpenBLAS's zaxpy_kernel_4 uses (verified by disassembly: it is a ymm
+# kernel even under the Cooperlake dispatch, with all loads issued up front and the stores batched).
+#
+# BOTH halves are required, and only past L2. Measured Zen4, freq-locked (GB/s, shipped / narrow+phase /
+# native+phase / OpenBLAS):
+#   n=1e3   129.7 /  78.6 /  77.3 / 119.7      n=1e5  108.0 / 111.9 / 106.7 / 112.5
+#   n=4096  130.0 / 113.4 / 112.8 / 129.2      n=3e5  105.0 / 110.5 / 103.2 / 109.9
+#   n=1e4   128.8 / 117.4 / 118.6 / 126.4      n=1e6   69.5 /  69.9 /  69.2 /  70.7
+#   n=3e4   114.2 / 106.9 / 107.8 / 111.8
+# The phase shape is CATASTROPHIC while resident (78.6 vs 129.7 at n=1e3) and the narrow width only pays
+# once a stream leaves L2 — applying it globally cost zaxpy 0.952→0.877 and, because complex `ger` calls
+# this per COLUMN at exactly those short lengths, zgeru 0.909→0.754. Do not hoist the switch.
+@generated function _axpy_cmplx_phase!(::Val{LANES}, n::Int, alr::T, ali::T, x, y) where {LANES, T <: BlasReal}
+    V = Vec{LANES, T}; sz = sizeof(T); cpx = LANES ÷ 2; U = 4
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(LANES - 1))...)
+    sgn = :($V($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(LANES - 1))...))))
+    lx = [:($(Symbol(:xv, u)) = vload($V, px + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
+    ly = [:($(Symbol(:yv, u)) = vload($V, py + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
+    cp = [
+        :(
+            $(Symbol(:rv, u)) = muladd(
+                shufflevector($(Symbol(:xv, u)), Val($swp)), sv,
+                muladd($(Symbol(:xv, u)), arv, $(Symbol(:yv, u)))
+            )
+        ) for u in 0:(U - 1)
+    ]
+    st = [:(vstore($(Symbol(:rv, u)), py + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
+    return quote
+        $(Expr(:meta, :inline))
+        px = _reptr(x); py = _reptr(y); arv = $V(alr); sv = $sgn; step = $U * $cpx
+        GC.@preserve x y begin
+            i = 0
+            @inbounds while i + step <= n
+                $(lx...)                       # phase 1: x stream
+                $(ly...)                       # phase 2: y stream
+                $(cp...)                       # phase 3: compute
+                $(st...)                       # phase 4: stores batched
+                i += step
+            end
+            @inbounds while i + $cpx <= n
+                o = i * 2 * $sz; xv = vload($V, px + o)
+                t = muladd(xv, arv, vload($V, py + o))
+                vstore(muladd(shufflevector(xv, Val($swp)), sv, t), py + o); i += $cpx
+            end
+            @inbounds while i < n
+                j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j)
+                unsafe_store!(py, unsafe_load(py, 2j - 1) + alr * xr - ali * xi, 2j - 1)
+                unsafe_store!(py, unsafe_load(py, 2j) + alr * xi + ali * xr, 2j)
+                i += 1
+            end
+        end
+        return y
+    end
+end
+
+# Is the past-L2 variant actually faster HERE? PDM **Measure** tier: it is a datapath property (Zen4
+# double-pumps 512-bit ops over a 256-bit path, so the wide vector buys no bandwidth on a memory-bound
+# kernel; a true 512-bit datapath can flip the sign), which no formula over the detected consts predicts
+# — the req#8b tell. The WINDOW, by contrast, is Derived: one stream leaving L2.
+@inline _zaxpy_narrow_lanes(::Type{T}) where {T} = 32 ÷ sizeof(T)      # 256 bits
+const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
+@static if isnothing(_ZAXPY_NARROW_PREF)
+    function _measure_zaxpy_narrow()::Bool                 # straight-line, no closures, TOTAL
+        Base.generating_output() && return false           # never burn a measure during precompile
+        try
+            nn = _zaxpy_narrow_lanes(Float64); nw = 2 * _vwidth(Float64)
+            nn == nw && return false
+            n = max(4096, 3 * _L2_BYTES ÷ sizeof(ComplexF64))   # inside the window: stream > L2
+            x = fill(ComplexF64(1.0, 0.5), n); y = fill(ComplexF64(0.25, -0.75), n)
+            tn = typemax(UInt64); tw = typemax(UInt64)
+            for r in 0:3                                   # r=0 untimed warmup; ABBA after
+                s = time_ns()
+                _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(Float64)), n, 1.0e-9, 0.0, x, y)
+                e = time_ns() - s; r > 0 && (tn = min(tn, e))
+                s = time_ns()
+                _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y)
+                e = time_ns() - s; r > 0 && (tw = min(tw, e))
+            end
+            return tn < tw
+        catch
+            return false
+        end
+    end
+    const _ZAXPY_NARROW_ONCE = Base.OncePerProcess{Bool}(_measure_zaxpy_narrow)
+    @inline _zaxpy_narrow() = _ZAXPY_NARROW_ONCE()
+else
+    @inline _zaxpy_narrow() = _ZAXPY_NARROW_PREF::Bool
+end
+
+# The size test comes FIRST so short calls (complex `ger`, per column) never even reach the
+# OncePerProcess lookup and run byte-identical code to before.
+@inline function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+    if n * 2 * sizeof(T) > _L2_BYTES && _zaxpy_narrow()
+        return _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y)
+    end
+    return _axpy_cmplx_wide!(n, alr, ali, x, y)
+end
+
+@generated function _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))
