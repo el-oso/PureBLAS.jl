@@ -587,15 +587,37 @@ end
 # assumes n ≥ 4W (caller routes shorter / strided / complex to the scalar loop). Two implementations,
 # selected by ISA at build time (`_SIMD_BYTES` const-folds → trim-safe, no runtime branch):
 #
-#  • AVX2 + AVX-512 (`_iamax_thresh4!`): DEPENDENCY-FREE THRESHOLD SCAN. The hot loop keeps a broadcast
-#    running max `thr` (invariant except on the rare advance) and does `_IAMAX_NB` INDEPENDENT `|xⱼ| > thr`
+#  • AVX2 + AVX-512 (`_iamax_thresh!`): DEPENDENCY-FREE THRESHOLD SCAN. The hot loop keeps a broadcast
+#    running max `thr` (invariant except on the rare advance) and does FOUR INDEPENDENT `|xⱼ| > thr`
 #    compares per iter, OR-ing the masks into ONE `any` branch — no loop-carried accumulator, so it
 #    out-throughputs even a bare vmaxpd reduction. The predicted-not-taken cold path (max advances
 #    ~O(log n) for random data) scalar-scans the blocks for the new max + its first lane. Tracks NO index
-#    in the hot path, unlike the chain kernel below. WIDTH-GENERAL (W=4 f64 / W=8 f32). Gates AOCL-BLIS's
-#    `bli_[d/s]amaxv` at EVERY size on Zen3(AVX2)/Zen4/Zen5 (f64 ≥1.00×, f32 ≥1.20×) and beats OpenBLAS
-#    1.2–2.3×; at n≥1e6 both PB and AOCL sit on the shared single-thread DRAM roofline. (Old AVX2 chain
-#    was the worst AOCL miss: f64 0.55×, f32 0.32× — see bench/iamax_nb.jl, git log.)
+#    in the hot path, unlike the chain kernel below. WIDTH-GENERAL (W=4 f64 / W=8 f32). Beats OpenBLAS
+#    1.6–2.1× on Zen4. (Old AVX2 chain was the worst AOCL miss: f64 0.55×, f32 0.32× — git log.)
+#
+#    It does NOT gate AOCL-BLIS. Measured 2026-08-03, wintermute, freq-locked, bench/plots.jl arms=pb,
+#    pb/AOCL by size: n=1e3 0.967 | 3e3 1.039 | 1e4 0.957 | 3e4 0.974 | 1e5 0.937 | 3e5 1.03 | 1e6 1.016
+#    ⇒ gate 0.937. Two claims that used to stand here are FALSE and were removed: "gates AOCL at EVERY
+#    size" (unreproducible — it came from bench/iamax_nb.jl, which the kb already flags for stale seeding),
+#    and "at n≥1e6 both sit on the shared DRAM roofline" (the harness runs `_L1REP(1e6)=30` reps over one
+#    8 MB buffer, so it is L3-resident; 73–77 GB/s is far above Zen4 single-thread DRAM. n=1e6 is an
+#    L3-bandwidth cell at the half-L3 edge, not a roofline).
+#
+#    THE GAP vs AOCL, read from `bli_damaxv_zen_int_avx512`'s disassembly: it issues TWO ops per vector —
+#    `vandnpd (mem),zmm_sign,zmmX` (abs FUSED into the load) then `vmaxpd` into 4 accumulators — and finds
+#    only the max VALUE, taking a SECOND PASS for the index. This scan issues three (vload, vandpd,
+#    vcmppd). A ceiling probe deleting the abs measured +21% at n=1e3, +2% at n=1e5, ~0 at n=1e6, so the
+#    third op costs real time only where the loop is issue-bound. AOCL can afford its second pass because
+#    inside the gate's size range the re-read is L3-resident; it would lose in a true DRAM regime, which
+#    the gate does not currently measure at all.
+#    FALSIFIED 2026-08-03 (do not rebuild): porting that as a CHUNKED single-pass max-accumulate —
+#    accumulate 2 ops/vector over an L1-resident chunk, re-walk only a chunk whose max beats `gmax` —
+#    was correct (netlib NaN/tie intact: `max(::Vec,::Vec)` is llvm.maxnum and drops NaN, while
+#    `maximum(::Vec)` and scalar `max` propagate, so the fold and tail used the strict `>` walk) and MUCH
+#    slower: pb/AOCL 0.435/0.486/0.599/0.697/0.827/0.897/0.921 across n=1e3…1e6. Reason is RE-WALK
+#    GRANULARITY: this scan detects per BLOCK and rescans ~NB·W elements, a chunk is 64× coarser, and at
+#    small n the chunk IS the array so it degenerates to a literal two-pass. Any revival must detect at
+#    block granularity — which is what this kernel already does.
 #  • SSE / NEON (narrower than 32 B, unvalidated) (`_iamax_chain4!`): the original 4-chain lane-parallel
 #    running max + parallel index vector (loop-carried, latency-bound → 4 chains). Kept as the fallback.
 #
@@ -609,17 +631,76 @@ end
     (vifelse(take, m1, m0), vifelse(take, i1, i0))
 end
 
-# _IAMAX_NB: independent |xⱼ|>thr compare-chains issued per hot-loop iteration — the ILP unroll that
-# covers the vcmp→mask latency (~4 cyc) so the predicted-not-taken branch never stalls the load stream.
-# Criterion: datapath-latency ILP, capped by the vector-register budget (NB loaded blocks + 1 broadcast
-# `thr` ≤ _NVREG). 4 covers the latency and const-folds to 4 on both AVX2 (16 reg) and AVX-512 (32 reg) —
-# measured (co-)optimal on Zen3/Zen5: NB=2 starves ILP; NB≥6 only ties NB=4 mid-n and regresses the
-# overhead-critical small-n (see bench/iamax_nb.jl). Derived from _NVREG → trim-safe (req#8).
-const _IAMAX_NB = min(4, _NVREG - 1)
+# NB = independent |xⱼ|>thr compare-chains per hot-loop iteration. It is a REAL parameter (`Val{NB}`,
+# body generated from it). It used to be `const _IAMAX_NB = min(4, _NVREG - 1)`, advertised as the
+# tunable unroll but INERT and a trap: it fed only `step` while the body loaded four blocks
+# unconditionally, so setting it to 2 made the loop re-read every element AND read up to 2W past the
+# guard, and 8 made it SKIP half the data and return wrong answers. (The NB numbers in the old comment
+# did not come from turning it — bench/iamax_nb.jl @evals its own unrolled kernels; those are suspect
+# for a different reason, the kb records that file as carrying stale seeding.)
+#
+# NB IS CHOSEN BY L2 RESIDENCY — PDM **Derive** tier, no knob, no preference, no runtime measurement.
+# Criterion: while the stream fits L2, load latency is low and two lines in flight cover it, so the
+# shorter loop (less per-iteration overhead, fewer live registers) wins; once the stream leaves L2 the
+# misses must be hidden by more outstanding lines, and 4 beats 2. Measured on wintermute (Zen4, L2 = 1 MB,
+# freq-locked, plots.jl's own fresh-allocation regime, 90 samples, GB/s median) — NB=2 over NB=4:
+#     7 KB +12.7% | 23 KB +8.8% | 78 KB +5.1% | 234 KB +4.2% | 781 KB +4.2% | 1024 KB (=L2) +1.5%
+#     1562 KB −5.5% | 2343 KB −0.4% | 4.6 MB −7.6% | 7.6 MB −11.1% | 15 MB −9.5% | 30 MB −9.9%
+# The sign flips exactly at L2, which is why the criterion is `n*sizeof(T) <= _L2_BYTES` and not a fitted
+# constant. NOTE THE STATISTIC: at n≥600 KB the NB=2 loss is a TAIL, not a slower best case (n=1e6:
+# identical min, ~15% worse median, p90/min 1.20 vs 1.06) — consistent with fewer outstanding lines
+# absorbing an L3 miss worse. A 24-sample A/B could not see it and ranked NB=2 ahead at every size; it
+# took ~90 samples. Do not re-rank this knob from a small sample.
+# RESIDENT unroll — **Derive**: hold TWO CACHE LINES in flight per iteration. While the stream fits L2 the
+# load latency is low, so extra chains buy nothing and the shorter loop's lower per-iteration overhead
+# wins; two lines is what keeps the load stream fed without lengthening the body. The ISA sets how many
+# blocks that is, which is the whole point of deriving it — AVX-512 (_SIMD_BYTES=64) → 2, AVX2 (32) → 4.
+# BOTH are the measured optimum on their box, and they are DIFFERENT NUMBERS: shipping the Zen4 value (2)
+# as a literal regressed galen's iamax from gate 1.022 (PASS) to 0.934 (FAIL), −18/−19% at n=1e3/3e3.
+# That is the req#8 lesson in one line: the constant that looked µarch-specific was a fixed byte budget.
+const _IAMAX_NB_RESIDENT = max(1, 2 * _CACHELINE ÷ _SIMD_BYTES)
+# STREAMING unroll — past L2 the criterion changes from bytes to ILP: independent compare chains to cover
+# the miss latency. Four is ISA-invariant here and is also the incumbent value, now validated BOTH ways —
+# Zen4 4 blocks = 4 lines (n=1e6: 72.3 vs 64.3 GB/s for 2), Zen3 4 blocks = 2 lines (78.5, beating both 2
+# at 75.0 and 8 at 77.4). Deriving this as a line budget like the resident arm gives 8 on AVX2, which
+# MEASURED WORSE on galen at every size — so it is a chain count, not a byte budget.
+# req8-ok: ILP chain count, ISA-invariant, incumbent value measured optimal on Zen3 and Zen4 (see above)
+const _IAMAX_NB_STREAM = 4
 
-@inline function _iamax_thresh4!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
-    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = _IAMAX_NB * W
-    ld(o) = abs(vload(V, xp + o * sz))
+@generated function _iamax_thresh!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    vs = [Symbol(:v, j) for j in 0:(NB - 1)]
+    cs = [Symbol(:c, j) for j in 0:(NB - 1)]
+    loads = [:($(vs[j + 1]) = abs(vload($V, xp + (o + $(j * W)) * $sz))) for j in 0:(NB - 1)]
+    cmps = [:($(cs[j + 1]) = $(vs[j + 1]) > thr) for j in 0:(NB - 1)]
+    ortree = reduce((a, b) -> :($a | $b), cs)
+    walks = [quote
+            if any($(cs[j + 1]))
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    $(vs[j + 1])[l] > bm && (bm = $(vs[j + 1])[l]; bl = l)   # strict > ⇒ first lane on ties
+                end
+                bl != 0 && (gmax = bm; bi = o + $(j * W) + bl; thr = $V(gmax))
+            end
+        end for j in 0:(NB - 1)]
+    # Straight-line only: no ntuple, no closure, no tuple return. A closure in this loop body measured
+    # 160× slower on 2026-07-31 and 300× on 2026-08-03. `Expr(:meta, :inline)` is emitted because
+    # `@inline` does NOT propagate into @generated CodeInfo on 1.12.
+    #
+    # FALSIFIED 2026-08-03, do NOT rebuild — CHUNKED MAX-ACCUMULATE. AOCL's `bli_damaxv_zen_int_avx512`
+    # issues 2 ops/vector (`vandnpd (mem),zmm_sign,zmmX` — abs fused into the load — then `vmaxpd` into 4
+    # accumulators, no index in the hot loop, index on a SECOND pass) where this scan issues 3 (vload,
+    # vandpd, vcmppd). Porting it single-pass — accumulate over an L1-resident chunk, re-walk only a chunk
+    # whose max beats `gmax` — was CORRECT (netlib NaN/tie intact: `max(::Vec,::Vec)` is llvm.maxnum and
+    # drops NaN, while `maximum(::Vec)` and scalar `max` propagate, so the fold and tail used the strict
+    # `>` walk) and MUCH slower: pb/AOCL 0.435/0.486/0.599/0.697/0.827/0.897/0.921 at n=1e3…1e6. Reason is
+    # RE-WALK GRANULARITY — this scan detects per BLOCK and rescans ~NB·W elements, a chunk is 64× coarser,
+    # and at small n the chunk IS the array so it degenerates into a literal two-pass. Any revival must
+    # detect at block granularity, which is what this already does. AOCL can afford its second pass only
+    # because inside the gate's size range the re-read is L3-resident.
+    return quote
+        $(Expr(:meta, :inline))
+        step = $(NB * W)
     # Seed from |x[1]|, NOT typemin — reference netlib `idamax` starts `DMAX = DABS(DX(1))`, and seeding
     # lower silently changed the NaN contract WITH VECTOR LENGTH: `[NaN, 1.0]` returned 1 on the scalar
     # path (n < 4W) but the index of the true max on this one, because a NaN never beats typemin and so
@@ -629,86 +710,36 @@ const _IAMAX_NB = min(4, _NVREG - 1)
     # accounted for up front instead of via the first compare — and it can only REDUCE cold-path entries,
     # since the starting threshold is now a real element rather than typemin.
     # `_iamax_simd_try` gates on n >= 4W, so x[1] always exists here.
-    gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = V(gmax); o = 0
-    @inbounds while o + step <= n                     # dependency-free: 4 independent compares vs `thr`
-        v0 = ld(o); v1 = ld(o + W); v2 = ld(o + 2W); v3 = ld(o + 3W)
-        # FALSIFIED 2026-07-31: rescanning ONLY the blocks whose mask is non-empty (keeping per-block
-        # `c0..c3 = vN > thr` and guarding each serial walk with `any(cN)`, via a small closure returning
-        # the updated `(gmax, bi, thr)`) is semantically exact and looks like a 4× cut of cold-path work —
-        # but it measured **0.006 vs AOCL, ~160× SLOWER**, at every size. The closure in the loop body
-        # defeats whatever keeps this loop in registers (capture/boxing), and the cost dwarfs the entire
-        # scan it was meant to save. Correctness tests all passed, so ONLY the gate caught it.
-        # If retried, it must be written without a closure — straight-line, no tuple return.
-        c0 = v0 > thr; c1 = v1 > thr; c2 = v2 > thr; c3 = v3 > thr
-        if any((c0 | c1) | (c2 | c3))                                    # rare (running max advances)
-            # Rescan ONLY the blocks with a lane above `thr`, fully unrolled and straight-line. Skipping
-            # an empty-mask block is exact: all its lanes are ≤ thr == the running gmax when the mask was
-            # taken, and gmax only rises. A block scanned after gmax rises is still fine — the walk
-            # compares against the current gmax. The serial `>` walk (not a max-tree, not
-            # `maximum(::Vec)`) is what keeps the NaN contract netlib defines and the NaN testitem pins.
-            #
-            # THE BLOCK WALK SEEDS `bm` FROM `gmax`, NEVER FROM A LANE. Seeding from gmax is exactly
-            # netlib's running-max comparison (bm starts at the running max and only rises), and it is
-            # NaN-safe for free: `NaN > bm` is false, so a NaN can never become bm and can never poison
-            # the block. `bl == 0` means no lane beat the running max, so gmax/bi/thr are left alone —
-            # which is what keeps this cheap. A first version compared each lane against `gmax` directly
-            # and re-broadcast `thr` on EVERY non-empty block; correct, but it made the compare chain
-            # dependent and cost iamax 0.94 -> 0.825 vs AOCL at n=1000 on Zen4. Correctness did not
-            # require that: this form is equally exact and folds once per block.
-            #
-            # THE ORIGINAL BUG, for the avoidance of a repeat: the seed used to be `bm = v0[1]`. An
-            # earlier version seeded `bm = vN[1]` and walked lanes 2:W against it, then folded `bm` into
-            # gmax. That is NOT netlib's loop and it is wrong under NaN: `bm` seeded to NaN makes every
-            # `vN[l] > bm` false, so the block keeps bm = NaN, `bm > gmax` is false, and a genuine new
-            # maximum living in that block is silently dropped. n=16, x=[1,1,1,1, NaN,9,1,1, 1…] returned
-            # 1 where netlib returns 6 — a wrong idamax pivot on NaN data. Found 2026-08-01 by adversarial
-            # review, NOT by the NaN testitem, which only covers NaN in lane 1 of the FIRST block.
-            if any(c0)
-                bm = gmax; bl = 0                   # SEED FROM gmax, never from a lane (see note above)
-                for l in 1:W
-                    v0[l] > bm && (bm = v0[l]; bl = l)   # strict > ⇒ first lane on ties
-                end
-                bl != 0 && (gmax = bm; bi = o + bl; thr = V(gmax))
+        gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = $V(gmax); o = 0
+        @inbounds while o + step <= n                 # dependency-free: NB independent compares vs `thr`
+            $(loads...)
+            # FALSIFIED 2026-07-31: rescanning ONLY the blocks whose mask is non-empty via a small closure
+            # returning the updated `(gmax, bi, thr)` is semantically exact and looks like an NB× cut of
+            # cold-path work — but it measured 0.006 vs AOCL, ~160× SLOWER, at every size. The closure
+            # defeats whatever keeps this loop in registers. That is why the walks below are generated
+            # straight-line instead.
+            $(cmps...)
+            if any($ortree)                                              # rare (running max advances)
+                $(walks...)
             end
-            if any(c1)
-                bm = gmax; bl = 0
-                for l in 1:W
-                    v1[l] > bm && (bm = v1[l]; bl = l)
-                end
-                bl != 0 && (gmax = bm; bi = o + W + bl; thr = V(gmax))
-            end
-            if any(c2)
-                bm = gmax; bl = 0
-                for l in 1:W
-                    v2[l] > bm && (bm = v2[l]; bl = l)
-                end
-                bl != 0 && (gmax = bm; bi = o + 2W + bl; thr = V(gmax))
-            end
-            if any(c3)
-                bm = gmax; bl = 0
-                for l in 1:W
-                    v3[l] > bm && (bm = v3[l]; bl = l)
-                end
-                bl != 0 && (gmax = bm; bi = o + 3W + bl; thr = V(gmax))
-            end
+            o += step
         end
-        o += step
-    end
-    @inbounds while o + W <= n                         # leftover full blocks
-        v0 = ld(o)
-        if any(v0 > thr)
-            bm = gmax; bl = 0
-            for l in 1:W
-                v0[l] > bm && (bm = v0[l]; bl = l)
+        @inbounds while o + $W <= n                    # leftover full blocks
+            u0 = abs(vload($V, xp + o * $sz))
+            if any(u0 > thr)
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    u0[l] > bm && (bm = u0[l]; bl = l)
+                end
+                bl != 0 && (gmax = bm; bi = o + bl; thr = $V(gmax))
             end
-            bl != 0 && (gmax = bm; bi = o + bl; thr = V(gmax))
+            o += $W
         end
-        o += W
+        @inbounds for k in (o + 1):n                   # scalar remainder (no OOB / masked read needed)
+            a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
+        end
+        return bi
     end
-    @inbounds for k in (o + 1):n                       # scalar remainder (no OOB / masked read needed)
-        a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
-    end
-    return bi
 end
 
 @inline function _iamax_chain4!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
@@ -744,10 +775,17 @@ end
 end
 
 # ISA-selected at build time: the `_SIMD_BYTES` compare const-folds, so the dead arm is eliminated
-# (trim-safe, no runtime dispatch). AVX2 + AVX-512 (≥32 B) → threshold scan (gates AOCL/OB at every size
-# on Zen3/Zen4/Zen5, see bench/iamax_nb.jl); narrower unvalidated ISAs (SSE/NEON) keep the 4-chain.
+# (trim-safe, no runtime dispatch). AVX2 + AVX-512 (≥32 B) → threshold scan; narrower unvalidated ISAs
+# (SSE/NEON) keep the 4-chain.
+#
+# The unroll is picked by L2 RESIDENCY — PDM Derive tier, see `_iamax_thresh!`. Both `Val`s are LITERAL,
+# so this stays trim-safe (no runtime→Val) and both specializations are statically reachable; the test is
+# a single compare against a const-folded `_L2_BYTES`.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
-    _SIMD_BYTES >= 32 ? _iamax_thresh4!(n, xp) : _iamax_chain4!(n, xp)
+    _SIMD_BYTES >= 32 ?
+    (n * sizeof(T) <= _L2_BYTES ?
+     _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, xp) : _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)) :
+    _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
 # argmax machinery as the real kernel, but each Vec{2W} load is W complex elements — deinterleave → re/im,
