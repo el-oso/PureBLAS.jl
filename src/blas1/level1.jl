@@ -132,6 +132,12 @@ end
 @inline _iamax_simd_try(n::Integer, x) = 0
 @inline _iamax_simd_try(n::Integer, x::Ptr{T}) where {T <: BlasReal} =
     n < 4 * _vwidth(T) ? 0 : _iamax_simd!(Int(n), x)
+# Ptr{Complex} — the Mode-1 C-ABI shape. Without this method `icamax_64_`/`izamax_64_` fell through to
+# the generic `= 0` above and ran the SCALAR loop, while the identical call on a `StridedVector{Complex}`
+# (Mode 2, and everything bench/plots.jl measures) took the SIMD path. A wire-the-fastest-path miss that
+# no gate row could see. Same n ≥ 4W guard as the sibling methods.
+@inline _iamax_simd_try(n::Integer, x::Ptr{Complex{T}}) where {T <: BlasReal} =
+    n < 4 * _vwidth(T) ? 0 : _iamax_cmplx_simd!(Int(n), Ptr{T}(x))
 @inline function _iamax_simd_try(n::Integer, x::StridedVector{T}) where {T <: BlasReal}
     (stride(x, 1) == 1 && n >= 4 * _vwidth(T)) || return 0
     GC.@preserve x return _iamax_simd!(Int(n), pointer(x))
