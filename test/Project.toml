@@ -27,3 +27,7 @@ ger_panel_np = 4
 # alloc-freeness, not perf -- and pinning is legitimate here precisely because the CI runner is known
 # hardware; real users on unknown hardware still auto-measure.
 gemvt_perscan = false
+# Same again for the complex-axpy width decision: its OncePerProcess probe allocates a calibration
+# buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
+# the shipping path here); the dogfood checks alloc-freeness, not perf.
+zaxpy_narrow = true
