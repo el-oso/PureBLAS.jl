@@ -1323,7 +1323,10 @@ function _ref_age(g, ref::AbstractString = REFBK)
         haskey(cell, ref) && push!(ts, cell[ref].time)
     end
     isempty(ts) && return ("–", "–")
-    return (minimum(ts), maximum(ts))
+    # estimator-ok: `ts` here is a vector of ISO DATE STRINGS, not timings — this is the oldest/newest
+    # reference-arm stamp for the provenance line. Flagged only because the name matches the lint's
+    # timing-variable heuristic.
+    return (minimum(ts), maximum(ts))   # estimator-ok: ts is ISO date strings, not timings
 end
 
 function svg_panels(path, title, fleet, gk)

@@ -141,6 +141,19 @@ closures) · repeated in-place reps · **median** times (not min) · `taskset -c
 low noise · results→JSON, plot from JSON · **per-host JSON filenames** (fleet: Zen4 dev / Zen3 AVX2 /
 Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
+- **ESTIMATOR — MEDIAN, and it is ENFORCED, not remembered.** Every timing that informs a gate decision
+  reduces through `Measure.tstat` (`bench/measure.jl`) = `median`. **Never `minimum`, never `mean`** —
+  `min` is optimistic AND tail-blind, `mean` over-weights the tail; the median is chosen precisely to be
+  insensitive to window tails. Report numbers WITH their estimator and sample count (`Measure.report` →
+  "0.946 (median of 8 rounds)"); a bare figure hides which statistic produced it.
+  **Throwaway probes go in `bench/probes/`, never a /tmp scratch dir** — contents are gitignored but the
+  directory IS scanned by `test/estimator_lint.jl`, which fails the suite on an unapproved reduction
+  (escape hatch `# estimator-ok: <reason>` for deliberate non-gate uses like `cpuvalidate.jl`'s
+  cliff-finding). Why this is a rule and not advice: on 2026-08-03/04 the shipped kernels obeyed the
+  median rule while the PROBES used `minimum(@elapsed …)`, which ranked an `iamax` unroll NB=2 *above*
+  NB=4 at n=1e6 where the gate's median ranked it 15% *worse*. A day went into explaining that
+  contradiction with tail hypotheses and a kernel port; the estimator swap was the whole of it. Sample
+  count is not a fix — with `min`, more samples drifts further from the median.
 - **FREQUENCY METHODOLOGY — one command, never re-decided: `sudo bench/fleet_freqlock.sh lock`** (that
   script is the single source of truth; read its header). It sets `amd_pstate=passive` + **boost OFF** +
   all cores pinned to **base clock** (min=max) + **verifies the achieved freq under load**. This is the
