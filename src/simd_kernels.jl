@@ -677,6 +677,20 @@ const _IAMAX_NB_RESIDENT = max(1, 2 * _CACHELINE ÷ _SIMD_BYTES)
 # MEASURED WORSE on galen at every size — so it is a chain count, not a byte budget.
 # req8-ok: ILP chain count, ISA-invariant, incumbent value measured optimal on Zen3 and Zen4 (see above)
 const _IAMAX_NB_STREAM = 4
+# WIDTH IS NOT THE REMAINING GAP — measured 2026-08-04, wintermute, freq-locked, plots.jl op=iamax.
+# AOCL's `bli_damaxv_zen_int_avx512` (the reference that binds here; OpenBLAS is at 2.04, we beat it 2x)
+# streams 512 B/iteration = 8 zmm, against our 128 B at NB=2, so NB=8 looked like the obvious lever.
+# It is decisively WORSE at every resident size — gate ratios NB=2 -> NB=8:
+#     n=1e3 1.058 -> 0.822 | 3e3 1.112 -> 0.944 | 1e4 0.964 -> 0.882 | 3e4 0.976 -> 0.899 | 1e5 0.942 -> 0.890
+# with NB=4 already recorded 4-5% worse in the same band. Widening OUR structure costs more than it buys:
+# each extra block adds a live vector AND a live mask plus its index-walk arm, so register pressure and
+# loop size grow faster than the memory-level parallelism helps.
+# What is NOT yet falsified is AOCL's STRUCTURE at width: it has no per-block threshold compare and no
+# mask OR-tree — it computes |x| with `vandnpd` straight off memory (we already fuse that, via `vandpd`),
+# then a log-depth `vmaxpd` REDUCTION TREE, reduces to one scalar per iteration, and branches into the
+# index search only when that scalar beats the running max. That keeps 8 blocks in flight with 8 vector
+# registers and ONE mask-free compare, which is exactly what our width-8 attempt could not do. If iamax
+# n=1e4..1e5 is attacked again, that is the design to port — not another NB value.
 
 @generated function _iamax_thresh!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
