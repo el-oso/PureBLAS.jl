@@ -315,10 +315,21 @@ end
 @generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T <: BlasReal, CJ}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     # Unroll from the REGISTER BUDGET (req#8), not a literal: the 2·UNR `Vec{2W}` accumulators each take 2
-    # physical vector registers, so keep 4·UNR ≲ Nregs−6 (leave ~6 for the x/y/swap loads). AVX2 has 16
-    # vector regs, AVX-512 has 32 — the old hardcoded 4× put all 16 YMM into accumulators on AVX2 → spill
-    # (dotc/dotu small-n 0.75×); this gives 2× on AVX2 / 4× on AVX-512, register-resident on both.
-    UNR = clamp(((_SIMD_BYTES == 64 ? 32 : 16) - 6) ÷ 4, 1, 4)
+    # physical vector registers, so keep 4·UNR ≤ Nregs−RESERVE, where RESERVE covers the live x/y/swap
+    # values. AVX2 has 16 vector regs, AVX-512 has 32 — a hardcoded 4× put all 16 YMM into accumulators on
+    # AVX2 and spilled (dotc/dotu small-n 0.75×).
+    #
+    # RESERVE IS 4, MEASURED — it was 6, which is one register-pair too conservative on AVX2. galen (Zen3,
+    # AVX2), plots.jl's L1-sweep regime, 40 samples, GB/s median, standalone kernels differing only in UNR:
+    #     n=1000   UNR 1/2/3/4 = 117.7 / 158.5 / 169.9 / 129.4     (shipped UNR=2 measured 155.5)
+    #     n=3000               = 116.4 / 116.7 / 116.7 / 116.3
+    #     n=10000              = 114.3 / 114.4 / 114.9 / 113.6
+    # UNR=3 is +9.3% at n=1000 — two 16 KB vectors exactly fill the 32 KB L1, the one size where the
+    # accumulator chain is not hidden behind memory — and is neutral above it. UNR=4 collapsing to 129.4 is
+    # the spill the old comment describes, so the ceiling is real; the reserve was simply set one pair high.
+    # AVX-512 clamps to 4 under BOTH forms ((32−6)÷4 = 6 and (32−4)÷4 = 7 both clamp), so Zen4/Zen5 are
+    # unchanged by construction and this is an AVX2-only correction.
+    UNR = clamp(((_SIMD_BYTES == 64 ? 32 : 16) - 4) ÷ 4, 1, 4)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     ps = [Symbol(:p, u) for u in 0:(UNR - 1)]; qs = [Symbol(:q, u) for u in 0:(UNR - 1)]
     init = Expr(:block, (:($(ps[u + 1]) = zero($V2); $(qs[u + 1]) = zero($V2)) for u in 0:(UNR - 1))...)
