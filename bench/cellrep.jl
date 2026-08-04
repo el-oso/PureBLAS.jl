@@ -88,6 +88,36 @@ const OPS = Dict(
                 (c, m) -> (s = 0; for _ in 1:m
                      s += B.iamax(c[1])
                  end; s)),
+    # Complex CL1 — call forms copied from plots.jl's cl1 block so the regime matches exactly
+    # (PureBLAS.dot is the conjugating one, matching BLAS.dotc).
+    "zaxpy" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+                (c, m) -> (for _ in 1:m
+                     P.axpy!(c[2], 1.7 + 0.3im, c[1])
+                 end),
+                (c, m) -> (for _ in 1:m
+                     B.axpy!(1.7 + 0.3im, c[1], c[2])
+                 end)),
+    "zscal" => (() -> (randn(ComplexF64, N),),
+                (c, m) -> (for _ in 1:m
+                     P.scal!(c[1], 1.0000001 + 0im)
+                 end),
+                (c, m) -> (for _ in 1:m
+                     B.scal!(1.0000001 + 0im, c[1])
+                 end)),
+    "zdotc" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
+                     s += P.dot(c[1], c[2])
+                 end; real(s)),
+                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
+                     s += B.dotc(c[1], c[2])
+                 end; real(s))),
+    "dzasum" => (() -> (randn(ComplexF64, N),),
+                 (c, m) -> (s = 0.0; for _ in 1:m
+                      s += P.asum(c[1])
+                  end; s),
+                 (c, m) -> (s = 0.0; for _ in 1:m
+                      s += B.asum(c[1])
+                  end; s)),
 )
 haskey(OPS, OP) || error("cellrep: unknown op $OP (have: $(join(sort(collect(keys(OPS))), ", ")))")
 mk, pbw, refw = OPS[OP]
