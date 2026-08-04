@@ -14,6 +14,9 @@
 # Run standalone: julia test/estimator_lint.jl
 const _BENCHDIRS = [joinpath(@__DIR__, "..", "bench"), joinpath(@__DIR__, "..", "bench", "probes")]
 const _EANNOT = r"#\s*estimator-ok:"i
+# Raw timing primitives, banned OUTRIGHT inside bench/probes/ — see the check in estimator_scan.
+const _RAWTIME = r"@elapsed|\btime_ns\s*\(|@btime|@benchmark|\bChairmarks\b|@be\b"
+const _PROBEDIR = "probes"
 # min/minimum/mean over an @elapsed comprehension, or over a timing-ish name.
 const _BAD = [
     r"\b(minimum|mean)\s*\(\s*@elapsed"i,
@@ -34,6 +37,16 @@ function estimator_scan()
             (i > 1 && occursin(_EANNOT, lines[i - 1])) && continue
             occursin(_EANNOT, ln) && continue
             code = split(ln, '#')[1]
+            # In a PROBE, the raw timing primitive itself is banned — not just the bad reduction. A
+            # hand-rolled loop re-opens five decisions at once (estimator, rounds, warm-up, arm order,
+            # fresh-vs-warm inputs), and on 2026-08-03/04 every one of them was got wrong in a bespoke
+            # probe. `Measure.ab` makes those decisions once. Removing the opportunity beats detecting
+            # the mistake.
+            if occursin(_PROBEDIR, dir) && occursin(_RAWTIME, code)
+                push!(viols, string(basename(f), ":", i,
+                                    "  raw timing primitive in a probe — use Measure.ab: ", strip(code)))
+                continue
+            end
             for re in _BAD
                 if occursin(re, code)
                     push!(viols, "$(basename(f)):$i  $(strip(code))")
