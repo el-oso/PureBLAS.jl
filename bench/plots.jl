@@ -225,6 +225,9 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 const L2SZ = (64, 128, 256, 512, 1024, 2048, 4096)
 const L3SZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
 const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations, to 4096
+# Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
+# the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
+const TDSZ = (256, 1024, 4096, 16384, 65536, 262144)
 const TN = Char(78); const TT = Char(84); const U = Char(85)
 
 # Run the full benchmark sweep; returns (l1, l2, l3, lp) as vectors of OpData.
@@ -484,12 +487,19 @@ function run_benchmarks()
     # ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────
     lp = OpData[]
     let
-        LP = Char(76)
+        LP = Char(76); UP = Char(85)
         addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(lp, "LP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(sizes); samples = 40))
         addh(
             "potrf", s -> _hpd(Float64, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); c[1, 1]),
             c -> (PureBLAS.potrf!(c; uplo = LP); c[1, 1])
+        )
+        # Upper takes its own route (Lever A: transpose into scratch → faer lower kernels → transpose back),
+        # so gating only 'L' leaves half of potrf unmeasured. See the zpotrfU note in the CLP group.
+        addh(
+            "potrfU", s -> _hpd(Float64, s),
+            c -> (LinearAlgebra.LAPACK.potrf!(UP, c); c[1, 1]),
+            c -> (PureBLAS.potrf!(c; uplo = UP); c[1, 1])
         )
         addh(
             "geqrf", s -> randn(s, s),
@@ -500,6 +510,13 @@ function run_benchmarks()
             "getrf", s -> randn(s, s),
             c -> (LinearAlgebra.LAPACK.getrf!(c); c[1, 1]),
             c -> (PureBLAS.getrf!(c); c[1, 1])
+        )
+        # Pivoted (semidefinite) Cholesky — blocked dpstrf: BLAS-2 pivoted panel + rank-jb syrk trailing,
+        # with the leading row swaps batched per panel (they are stride-lda and were ~47% of the runtime).
+        addh(
+            "pstrf", s -> _hpd(Float64, s),
+            c -> (LinearAlgebra.LAPACK.pstrf!(LP, c, -1.0); c[1, 1]),
+            c -> (PureBLAS.pstrf!(c, -1.0; uplo = LP); c[1, 1])
         )
         # real gesvd capped at 2048: OB gesdd is divide-and-conquer, PB is QR-iteration — at 4096 with vectors
         # that algorithm mismatch dominates (no actionable signal) and a single sample isn't seconds-bounded.
@@ -522,6 +539,51 @@ function run_benchmarks()
             "syevN", _sym,
             c -> (LinearAlgebra.LAPACK.syevd!(Char(78), LP, c); c[1, 1]),   # 'N','L'
             c -> (PureBLAS._syev!('N', 'L', c); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        # ── Tridiagonal (O(n), so swept over TDSZ's much larger n, not LPSZ) ───────────────────────────
+        # These are serial 3-term recurrences: the gate here is a divide→multiply→subtract latency chain,
+        # not flops, and the levers are store streams and register-carried recurrences (see tridiag.jl).
+        # gttrs/pttrs consume a factorization, so `mk` builds and factors the context (mk is excluded from
+        # the timed core). gttrf allocates du2/ipiv on BOTH sides — Julia's LAPACK.gttrf! wrapper allocates
+        # them internally, so PureBLAS must pay the same to keep the comparison honest.
+        _gtd(s) = (randn(s - 1), [4.0 + abs(randn()) for _ in 1:s], randn(s - 1), randn(s))
+        _ptd(s) = ([2.0 + abs(randn()) for _ in 1:s], randn(s - 1) ./ 4, randn(s))
+        addh(
+            "gtsv", _gtd,
+            c -> (LinearAlgebra.LAPACK.gtsv!(c[1], c[2], c[3], c[4]); c[4][1]),
+            c -> (PureBLAS.gtsv!(c[1], c[2], c[3], c[4]); c[4][1]); sizes = TDSZ
+        )
+        addh(
+            "gttrf", _gtd,
+            c -> (LinearAlgebra.LAPACK.gttrf!(c[1], c[2], c[3]); c[2][1]),
+            c -> (
+                PureBLAS.gttrf!(
+                    c[1], c[2], c[3], Vector{Float64}(undef, length(c[2]) - 2),
+                    Vector{Int}(undef, length(c[2]))
+                ); c[2][1]
+            ); sizes = TDSZ
+        )
+        _gtf(s) = (c = _gtd(s); (LinearAlgebra.LAPACK.gttrf!(c[1], c[2], c[3])..., c[4]))
+        addh(
+            "gttrs", _gtf,
+            c -> (LinearAlgebra.LAPACK.gttrs!(TN, c[1], c[2], c[3], c[4], c[5], c[6]); c[6][1]),
+            c -> (PureBLAS.gttrs!(TN, c[1], c[2], c[3], c[4], c[5], c[6]); c[6][1]); sizes = TDSZ
+        )
+        addh(
+            "pttrf", _ptd,
+            c -> (LinearAlgebra.LAPACK.pttrf!(c[1], c[2]); c[1][1]),
+            c -> (PureBLAS.pttrf!(c[1], c[2]); c[1][1]); sizes = TDSZ
+        )
+        _ptf(s) = (c = _ptd(s); (LinearAlgebra.LAPACK.pttrf!(c[1], c[2])..., c[3]))
+        addh(
+            "pttrs", _ptf,
+            c -> (LinearAlgebra.LAPACK.pttrs!(c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.pttrs!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
+        )
+        addh(
+            "ptsv", _ptd,
+            c -> (LinearAlgebra.LAPACK.ptsv!(c[1], c[2], c[3]); c[3][1]),
+            c -> (PureBLAS.ptsv!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
         )
     end
     return l1, l2, l3, lp
@@ -836,12 +898,21 @@ function run_cmplx_benchmarks()
     # aren't implemented yet, so this is the honest fair fight for what ships. ─────────────────────────────
     clp = OpData[]
     let
-        LP = Char(76)  # 'L'
+        LP = Char(76); UP = Char(85)  # 'L' / 'U'
         addh(nm, mk, ob, pb; sizes = LPSZ) = _meas!(clp, "CLP", nm, () -> sweep_heavy(mk, ob, pb, _sizes(_cap(sizes, 2048)); samples = 40))  # cap complex LAPACK at 2048 (zgesvd's 1024 cap survives via nested _cap)
         addh(
             "zpotrf", s -> _hpd(T, s),
             c -> (LinearAlgebra.LAPACK.potrf!(LP, c); real(c[1, 1])),
             c -> (PureBLAS.potrf!(c; uplo = LP); real(c[1, 1]))
+        )
+        # UPPER is a genuinely different code path (Lever C: conj-transpose → _cpotrf_lower! →
+        # conj-transpose back), not a mirror of lower — and it was UNGATED until now, which is exactly how
+        # it came to sit at 0.92–0.94 vs AOCL at n=512/1024 unnoticed. "zpotrf PASSES" previously meant
+        # only that the lower path passed.
+        addh(
+            "zpotrfU", s -> _hpd(T, s),
+            c -> (LinearAlgebra.LAPACK.potrf!(UP, c); real(c[1, 1])),
+            c -> (PureBLAS.potrf!(c; uplo = UP); real(c[1, 1]))
         )
         addh(
             "zgeqrf", s -> randn(T, s, s),

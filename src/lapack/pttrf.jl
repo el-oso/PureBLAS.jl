@@ -13,27 +13,70 @@
 # Recurrence:  D[i+1] -= |E_orig[i]|² / D[i];   E[i] ← E_orig[i] / D[i].
 # info = index of the first non-positive pivot (0 if the matrix is SPD), = LAPACK's info>0.
 
+# |E_orig[i]|²/D[i], written as real(conj(e)·t) — two multiplies instead of a full complex product.
+# The `ej*t` specialization for real T is NOT cosmetic: `real(ej)*real(t) + imag(ej)*imag(t)` leaves a
+# live `fadd x, 0.0` on the real path, and LLVM may only fold that under `nsz` (x + 0.0 ≠ x for x = -0.0),
+# so the extra add sits on the strictly serial divide→multiply→subtract recurrence. Measured 3.4 cyc/elem
+# — 0.937 → 1.098 vs Reference-LAPACK dpttrf, n = 262144, Zen4. The 3-arg fallback keeps any other
+# T <: Number (AD duals reach the ::Real method) on the generic formula.
+@inline _pt_absq(ej::Real, t::Real) = ej * t
+@inline _pt_absq(ej, t) = real(ej) * real(t) + imag(ej) * imag(t)
+
+# Pivot-check block length. Derived, not tuned: the only cost the block trades against is the worst-case
+# re-scan, which re-reads one block of D, so the block is sized so its D+E footprint is what L1 just held
+# — the re-scan is then an L1 hit and never a second trip to memory. Measured flat over blk = 256…8192
+# (1.129–1.131 vs dpttrf), i.e. the derived value (2048 for d, 1365 for z, 4096 for s on a 32 KiB L1)
+# lands inside the plateau rather than on a cliff.
+@inline _pt_blk(::Type{Tr}, ::Type{T}) where {Tr, T} = max(_L1_BYTES ÷ (sizeof(Tr) + sizeof(T)), 1)
+
 # pttrf!(D, E) → (D, E, info). In-place LDLᴴ factorization. Mirrors dpttrf/zpttrf.
+#
+# Reference-LAPACK tests the pivot on EVERY iteration; that branch is correctly predicted but its compare
+# still lands in the dependency chain of a recurrence with no independent work to hide it. Here the check
+# is hoisted out of the inner loop: a block runs unconditionally while OR-ing a branchless `bad` flag, and
+# only a block that actually saw a non-positive (or NaN) pivot is re-scanned to recover the exact index.
+# The flag is free — it measures identical to the same loop with the check deleted entirely.
+#
+# Deviation on the failure path: LAPACK returns the moment it sees a bad pivot, leaving D[info+1:n] and
+# E[info:n-1] at their input values, whereas this writes to the end of the failing block before returning.
+# `info` itself is identical (including which index is reported when several are bad). LAPACK's contract
+# for info > 0 is "the factorization could not be completed" and promises nothing about the contents, and
+# ptsv! below skips the solve, so nothing downstream reads them.
 function pttrf!(D::AbstractVector{Tr}, E::AbstractVector{T}) where {Tr <: Real, T <: Number}
     n = length(D)
     length(E) >= max(n - 1, 0) || throw(DimensionMismatch("pttrf!: length(E) < n-1"))
-    info = 0
-    @inbounds for i in 1:(n - 1)
-        if !(D[i] > 0)
-            return D, E, i
+    blk = _pt_blk(Tr, T)
+    i = 1
+    @inbounds while i <= n - 1
+        hi = min(i + blk - 1, n - 1)
+        (D[i] > 0) || return D, E, i
+        bad = false
+        for j in i:hi
+            ej = E[j]
+            t = ej / D[j]                                # L[j+1,j] (complex/real ÷ real pivot)
+            E[j] = t
+            dn = D[j + 1] - _pt_absq(ej, t)              # stays real
+            D[j + 1] = dn
+            bad |= !(dn > 0)                             # `!(x > 0)` also catches NaN
         end
-        ei = E[i]
-        f = real(ei) / D[i]                              # real & imag parts of the multiplier
-        g = imag(ei) / D[i]
-        E[i] = ei / D[i]                                 # L[i+1,i] (complex/real ÷ real pivot)
-        D[i + 1] = D[i + 1] - (f * real(ei) + g * imag(ei))   # -= |E_orig[i]|² / D[i]  (stays real)
+        if bad
+            for j in i:hi
+                (D[j] > 0) || return D, E, j
+            end
+        end
+        i = hi + 1
     end
-    if n >= 1 && !(D[n] > 0)
-        info = n
-    end
-    return D, E, info
+    return D, E, (n >= 1 && !(D[n] > 0)) ? n : 0
 end
 
+# PERF NOTE — do not re-chase. This measures 0.99–1.00 vs AOCL dpttrs on Zen4 AND Zen3 (flat in n), which
+# looks like a gate miss but is a dependency-chain bound that binds the reference identically: PB 12.17–12.29
+# cyc/elem vs AOCL 12.18–12.33, with 0.0% run-to-run drift. That IS the analytic bound — the forward sweep's
+# recurrence is multiply+subtract (~6 cyc) and the backward sweep's divide is OFF the chain (B[i]/D[i] does
+# not depend on B[i+1]), so ~2×6 = 12 cyc/elem for the pair. Register-carrying the B recurrence and manually
+# unswitching the `upper` test on both sweeps were both measured: identical to this code, because LLVM
+# already does both. There is no lever here at nrhs = 1 short of changing the numerics (cyclic reduction).
+#
 # Shared LDLᴴ solve. upper=false ⇒ E is the SUBdiagonal (uplo='L'): forward with L (no conj),
 # backward with Lᴴ (conj). upper=true ⇒ E is the SUPERdiagonal (uplo='U'): conj placement flips.
 # For real T, conj is the identity so both branches coincide (matches dpttrs).

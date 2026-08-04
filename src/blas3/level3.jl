@@ -2516,54 +2516,101 @@ const _TRSM_R_FUSE = 128       # ponytail: lower-T real-f64 side-R fused-panel b
 # _CHOLW is µarch-derived (req#8). Fleet-safe: measured galen(Zen3) n=128 0.74→0.87 AND wintermute(Zen4)
 # 0.945→1.04 (both beat AOCL at n=64), 2026-07-16 — the fused panel is no-op-or-better at narrow m on both.
 _trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
-# side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
-function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
-    k = size(A, 1)
-    # Lower-transpose real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
-    # `_trsm_rl_split_f64!`, IN-PLACE, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no
-    # trtri, no unpacked-gemm-into-tmp, no copyback, no recurse-to-32. Fires on wide B (m > _TRSM_NCUT_R,
-    # ALL k≤fuse — unchanged) AND on narrow-but-square-ish B (k∈(_TRSM_DBASE,fuse], m ≥ the derived batch
-    # floor) — the latter is the ADDED path that closes the n=128 side-R dip (was falling to the recursion +
-    # k=32 scalar bases). k≤_TRSM_DBASE narrow keeps the dense base (n=32 unchanged). Recursion above fuse.
-    if !up && tr && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 && B isa StridedMatrix &&
-            (size(B, 1) > _TRSM_NCUT_R || (k > _TRSM_DBASE && size(B, 1) >= _trsm_r_mfloor(k)))
-        m = size(B, 1); ldb = stride(B, 2)
-        mc0 = max(_vwidth(Float64), (_L2_BYTES ÷ 2) ÷ (k * 8))   # MC row-chunk: the mc×k slab the k-repasses
-        GC.@preserve A B begin                                   # re-read stays L2-resident (req#8; rows independent)
-            pA = pointer(A); ldA = stride(A, 2); pB = pointer(B)
-            if _alias_ld(ldb)
-                # Aliasing ldb (way-stride multiple): the leaf's solved-column re-reads collide in one L1 set.
-                # Solve each chunk into an ODD-ld scratch (conflict-free re-reads); psrc=B is read-once
-                # (streaming, no conflict amplification), then copy back. Measured galen +41–49% at 512/1024/
-                # 1536; the single copy-back pass nets positive. Bit-identical. (Kernel unchanged — pT re-target.)
-                S = _trsm_rpack(Float64, mc0, k); lds = stride(S, 2)
-                GC.@preserve S begin
-                    pS = pointer(S); i0 = 0
-                    while i0 < m
-                        mc = min(mc0, m - i0)
-                        _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
-                        @inbounds for c in 1:k                     # copy S[1:mc,c] → B[i0+1:i0+mc,c] (SIMD, trim-safe)
-                            r = 1
-                            while r + _CHOLW - 1 <= mc
-                                vstore(vload(_CVF, _cvptr(pS, r, c, lds)), _cvptr(pB, i0 + r, c, ldb)); r += _CHOLW
-                            end
-                            while r <= mc
-                                unsafe_store!(pB, unsafe_load(pS, _clidx(r, c, lds)), _clidx(i0 + r, c, ldb)); r += 1
-                            end
-                        end
-                        i0 += mc
-                    end
-                end
-            else
-                i0 = 0
+# Fused side-R lower driver: X·op(A)⁻¹ via the potrf panel leaf `_trsm_rl_split_f64!`, MC row-chunked.
+# `Ar` (k×k used, may be a larger grown workspace ⇒ k passed explicitly) holds LOWER-TRANSPOSE-layout
+# coefficients: A itself for op='T'; the reflected Ã=J·Aᵀ·J for op='N' (see `_trsm_rrefl`), in which case
+# `revB=true` hands the leaf a column-REVERSED view of B — base pointer at column k with a NEGATIVE column
+# stride. `_cvptr`/`_clidx` are plain affine Ptr arithmetic, so a negative ld is legal and copies nothing.
+# `scratch=true` solves each chunk into the odd-ld rpack (conflict-free solved-column re-reads) then copies
+# back; `false` solves in place. Chosen by `k > _TRSM_DBASE` — DERIVE tier, and deliberately NOT a Measure
+# knob. Fleet A/B at aliasing ldb (2026-07-26) shows both boxes agree in-place clearly wins at k≤32
+# (Zen4 scratch/in-place 1.27–1.52, galen 1.18: the O(m·k) copy-back can't amortize against an O(m·k²)
+# solve that small) and scratch is a win-or-wash at k≥48 (galen 0.68–0.79, Zen4 0.84 at k=48, ~1.0 at 128).
+# A Measure-tier crossover was tried and REMOVED: Zen4 is NOT monotone in k (0.84 at k=48 but 1.13 at
+# k=64), so "first k where scratch wins" has no stable answer — it returned different values in different
+# processes on the same box, cost galen 'T' 1024×48 0.688, and no margin (5/10/15%) fixed it. Don't
+# re-Measure this without first re-checking monotonicity.
+function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
+    m = size(B, 1); ldb0 = stride(B, 2)
+    mc0 = max(_vwidth(Float64), (_L2_BYTES ÷ 2) ÷ (k * 8))   # MC row-chunk: the mc×k slab the k-repasses
+    GC.@preserve Ar B begin                                  # re-read stays L2-resident (req#8; rows independent)
+        pA = pointer(Ar); ldA = stride(Ar, 2)
+        pB = pointer(B); ldb = ldb0
+        if revB
+            pB += (k - 1) * ldb0 * 8; ldb = -ldb0
+        end
+        if scratch
+            S = _trsm_rpack(Float64, mc0, k); lds = stride(S, 2)
+            GC.@preserve S begin
+                pS = pointer(S); i0 = 0
                 while i0 < m
                     mc = min(mc0, m - i0)
-                    _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pB + i0 * 8, ldb, k, mc)
+                    _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
+                    @inbounds for c in 1:k                     # copy S[1:mc,c] → B[i0+1:i0+mc,c] (SIMD, trim-safe)
+                        r = 1
+                        while r + _CHOLW - 1 <= mc
+                            vstore(vload(_CVF, _cvptr(pS, r, c, lds)), _cvptr(pB, i0 + r, c, ldb)); r += _CHOLW
+                        end
+                        while r <= mc
+                            unsafe_store!(pB, unsafe_load(pS, _clidx(r, c, lds)), _clidx(i0 + r, c, ldb)); r += 1
+                        end
+                    end
                     i0 += mc
                 end
             end
+        else
+            i0 = 0
+            while i0 < m
+                mc = min(mc0, m - i0)
+                _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pB + i0 * 8, ldb, k, mc)
+                i0 += mc
+            end
         end
-        return B
+    end
+    return B
+end
+
+# side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
+function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+    k = size(A, 1)
+    # Lower real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
+    # `_trsm_rl_split_f64!`, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no trtri, no
+    # unpacked-gemm-into-tmp, no recurse-to-32. Fires on wide B (m > _TRSM_NCUT_R, ALL k≤fuse) AND on
+    # narrow-but-square-ish B (k∈(_TRSM_DBASE,fuse], m ≥ the derived batch floor) — the latter closes the
+    # n=128 side-R dip (was falling to the recursion + k=32 scalar bases). Recursion above fuse.
+    # BOTH op='T' and op='N' now ride this leaf: X·A=B (lower, NO transpose) is the column-reversal
+    # conjugate of the lower-transpose recurrence. With J the k×k reversal and cc = k+1−j,
+    #   X[:,j] = (B[:,j] − Σ_{i>j} A[i,j]·X[:,i]) / A[j,j]              (descending j)
+    # becomes, on Ã = J·Aᵀ·J (still lower: Ã[cc,κ] = A[k+1−κ, k+1−cc], κ<cc ⇒ row>col) and B·J,
+    #   T[:,cc] = (src[:,cc] − Σ_{κ<cc} Ã[cc,κ]·T[:,κ]) / Ã[cc,cc]      (ascending cc, i = k+1−κ)
+    # i.e. literally the leaf's own pass. B·J costs zero (negative column stride); Ã costs one O(k²/2)
+    # triangle copy, ≪ the O(m·k²) solve. A pure pointer trick can NOT do it: `_clidx(cc,k,ld0)` hard-codes
+    # cc's stride at 1, so no base/ld choice swaps which index carries the parameter. Verified relerr
+    # ≤1.2e-15 incl. chunked, k%4≠0 (nb<4 remainder) and scalar tails, 2026-07-26.
+    # op='N' additionally needs its O(k²) reflect copy to amortize. Measured decomposition (Zen4,
+    # 2026-07-26): the reflected solve is exactly as fast as native 'T' (12.50 vs 12.65 µs at m=32,k=128;
+    # 98.16 vs 98.64 at m=256) — the identity is FREE — so 100% of any op='N' deficit is that copy, which
+    # costs 44%/21%/9% of the call at m=32/96/256 (k=128). Its per-element cost is governed by whether A's
+    # k×k footprint stays L1-resident: at k≤64 (≤32 KB) the copy is cheap enough to pay at ANY m, above
+    # that it needs the wide-B predicate to amortize. DERIVE tier (residency over `_L1_BYTES`, req#8) —
+    # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
+    # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
+    if !up && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 && _strided1(B) &&
+            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _TRSM_NCUT_R) &&
+            (size(B, 1) > _TRSM_NCUT_R || (k > _TRSM_DBASE && size(B, 1) >= _trsm_r_mfloor(k)))
+        Ar = A
+        if !tr
+            Ar = _trsm_rrefl(Float64, k)
+            # Contiguous-WRITE order: the inner r-loop stores Ar[:,c] unit-stride and reads A with a
+            # constant lda stride the prefetcher follows. Cache-BLOCKING this (8×8 tiles = one A line per
+            # tile row) was tried and measured uniformly WORSE — 32×48 0.85→0.69, 256×48 1.01→0.97 vs AOCL
+            # (Zen4, 2026-07-26): the tiles' computed triangular bounds cost more than the traffic they
+            # save. Do not re-try tiling here without measuring.
+            @inbounds for c in 1:k, r in c:k
+                Ar[r, c] = A[k + 1 - c, k + 1 - r]
+            end
+        end
+        return _trsm_rl_fused_drv!(Ar, B, k, !tr, _alias_ld(stride(B, 2)) && k > _TRSM_DBASE)
     end
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
@@ -2626,6 +2673,19 @@ end
 # vector width (cache geometry, not ISA) — used by the side-R fused leaf's pT-scratch pack.
 const _L1_WAY_D = max(64, _L1_BYTES ÷ 64)      # doubles per L1 way (÷8-way ÷8-byte/double)
 @inline _alias_ld(ld::Int) = ld >= _L1_WAY_D && ld % _L1_WAY_D == 0
+
+# ── Alias-strategy self-tuning constant (PDM ladder, MEASURE tier — req#8b) ────────────────────────────
+# On an L1-way-stride ldb the side-R leaf's solved-column re-reads collide in one set. Two cures exist:
+# solve into the ODD-ld rpack scratch and copy back, or just solve in place and eat the conflicts. Which
+# wins is NOT derivable from any detected const — it is the copy-back round-trip (m·k·8 B each way,
+# chunk-size-independent) traded against the conflict rate, and it INVERTS SIGN across µarchs we own:
+# galen/Zen3 measured scratch +41–49% at m=512/1024/1536, while wintermute/Zen4 measures the same scratch
+# arm a 15–45% net LOSS (in-place 33.9/37.3/37.3 vs arm 23.4/29.1/33.9 GF at k=16/32/64, m=ldb=1024,
+# 2026-07-26). Sign inversion on benchmarked boxes is the ladder's explicit Measure tell — a literal or a
+# µarch-gated literal would be wrong on any unseen machine. Candidate set is the 2 strategies; the probe
+# shape is DERIVED (k = _TRSM_DBASE, m = ldb = 2·_L1_WAY_D ⇒ aliasing by construction, inside the fused
+# range where the misses live). Pin `trsm_r_alias_scratch` — the trim/.so build MUST set it (a runtime
+# benchmark is not trim-safe); `@static if` then compiles the measure branch out entirely.
 # _l3_apad (po2-ld A-pad, ld=k+8) lives in the per-type L3Workspace (see src/workspace.jl).
 
 # Public: B := α·op(A)⁻¹·B (side 'L') or α·B·op(A)⁻¹ (side 'R'); A k×k triangular (uplo/transA/diag).
@@ -2646,7 +2706,18 @@ function trsm!(
         if sl && up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
             return _trsm_fused_L!(unit, A, B)
         end
-        return sl ? _trsm_dense_L!(up, tr, unit, A, B) : _trsm_dense_R!(up, tr, unit, A, B)
+        sl && return _trsm_dense_L!(up, tr, unit, A, B)
+        # Side-R: the dispatch-skip criterion above is m-DEPENDENT — skipping ~60ns of dispatch only pays
+        # while the whole solve is itself O(100ns). For m > _TRSM_NCUT_R the fused f64 leaf (reachable ONLY
+        # through _trsm_right!) beats the dense base 1.29–1.62× at k=16/32 (Zen4, 2026-07-26), and this
+        # bypass was the ENTIRE side-R transA='T' gap vs AOCL: n≤32 measured 0.61–0.96 while every n≥48
+        # cell — which already reached the leaf — wins (1.03–1.57). Falling through also picks up the
+        # `_alias_ld` handling the bypass skipped. Reuses the existing _TRSM_NCUT_R routing predicate, so
+        # no new tuning constant is introduced (that const's own PDM debt is noted at its definition).
+        if !up && !unit && eltype(B) === Float64 && _strided1(B) && size(B, 1) > _TRSM_NCUT_R
+            return _trsm_right!(up, tr, false, unit, A, B)
+        end
+        return _trsm_dense_R!(up, tr, unit, A, B)
     end
     if eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX &&
             _strided1(A) && _badld(stride(A, 2))

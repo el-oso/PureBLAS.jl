@@ -1759,7 +1759,7 @@ end
 @inline @generated function _deint_cmplx(av::Vec{N, T}) where {N, T}
     W = N ÷ 2
     ev = Expr(:tuple, (2 * (i - 1) for i in 1:W)...); od = Expr(:tuple, (2 * (i - 1) + 1 for i in 1:W)...)
-    return :((shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
+    return :($(Expr(:meta, :inline)); (shufflevector(av, Val($ev)), shufflevector(av, Val($od))))
 end
 
 # Parity-preserving halving reduce: an interleaved [even,odd,even,odd,…] partial-product Vec{N}
@@ -1768,6 +1768,13 @@ end
 # `_deint_cmplx` + two full-width horizontal `sum`s in the complex dot / gemv-T epilogue: strictly
 # fewer shuffles (the first fold of a multi-register Vec, e.g. Vec{16,F64}=2 zmm, is a bare add), and
 # it dominates the reduction cost that swamps the tiny main loop at small m. Fable-designed 2026-07-14.
+# CRITICAL — the `Expr(:meta, :inline)` in the RETURNED BODY is load-bearing, not decoration: on Julia
+# 1.12 the surface `@inline` does NOT propagate into a @generated function's CodeInfo, so without it every
+# call site emits a real out-of-line call that passes the `Vec` argument BY POINTER. That forces the
+# caller's SIMD accumulators into stack slots, and LLVM hoists the slot stores into the LOOP HEADER — the
+# complex gemv-T/C loop opened with ~1 KiB of `vmovupd [rsp+…], zmm` per iteration and ran at a flat
+# ~17 GB/s (vs 55-63 GB/s cache-resident for OpenBLAS) at EVERY size. Adding the meta: 0.26-0.64 → 1.06-1.37
+# vs OB. Any @generated helper taking/returning a Vec MUST carry it (Fable-diagnosed 2026-07-25).
 @inline @generated function _fold2_cmplx(v::Vec{N, T}) where {N, T}
     body = :v; n = N
     while n > 2
@@ -1776,12 +1783,12 @@ end
         body = :(shufflevector($body, Val($lo)) + shufflevector($body, Val($hi)))
         n = h
     end
-    return body
+    return :($(Expr(:meta, :inline)); $body)
 end
 # Inverse of _deint_cmplx: interleave separate re/im W-vectors back to a Vec{2W} (re,im,re,im,…).
 @inline @generated function _intlv_cmplx(vr::Vec{W, T}, vi::Vec{W, T}) where {W, T}
     ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
-    return :(shufflevector(vr, vi, Val($ilv)))
+    return :($(Expr(:meta, :inline)); shufflevector(vr, vi, Val($ilv)))
 end
 
 # Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
@@ -1992,9 +1999,21 @@ end
         push!(inner.args, :($(Symbol(:av, mi)) = $aload))
         push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
     end
+    # OOB FIX (direct-read B has NO padding, unlike a packed panel): the k-loop must not read columns
+    # past the last valid one on a PARTIAL tile (nre < NR). The store epilogue already masks `j-1 ≥ nre`,
+    # so clamping the READ column is sufficient — those lanes are computed and then discarded. Without the
+    # clamp this walks off the caller's array: harmless when it lands in mapped memory, a SEGFAULT when it
+    # crosses an unmapped page (flaky; reproduced via complex gebrd's trailing gemm). Same bug class as the
+    # real path's direct-read fix — see kb `directb-masked-oob-guardpage`. The clamped column base is
+    # loop-invariant, so hoist it out of the k-loop and add only the k-step inside.
     for j in 1:NR
-        boff = TB ? :((2 * ((jr + $(j - 1)) + p * ldb)) * $sz) : :((2 * (p + (jr + $(j - 1)) * ldb)) * $sz)
-        push!(inner.args, :($(Symbol(:bp, j)) = B + $boff))
+        push!(body.args, :($(Symbol(:jc, j)) = jr + min($(j - 1), nre - 1)))
+        bbase = TB ? :(B + 2 * $(Symbol(:jc, j)) * $sz) : :(B + 2 * $(Symbol(:jc, j)) * ldb * $sz)
+        push!(body.args, :($(Symbol(:bb, j)) = $bbase))
+    end
+    for j in 1:NR
+        bstep = TB ? :(2 * p * ldb * $sz) : :(2 * p * $sz)
+        push!(inner.args, :($(Symbol(:bp, j)) = $(Symbol(:bb, j)) + $bstep))
         push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
         push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
         for mi in 1:MR

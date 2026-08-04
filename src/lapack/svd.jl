@@ -290,7 +290,9 @@ end
 @inline _lgc!(yv, Av, xv, α::T, β::T, mode::Int) where {T <: Complex} =
     _gemv!(mode != 0, mode == 2, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
 
-function _labrd!(
+# Sequential reference (the fused `_labrd!` below falls back here for legacy nb-sized tmp, and it is
+# the entrywise A/B oracle). Body is the faithful zlabrd port; only the name differs from the fused method.
+function _labrd_seq!(
         As::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq, taup, X, Y,
         nb::Int, arow::AbstractVector{T}, tmp::AbstractVector{T}
     ) where {T <: Complex, R <: Real}
@@ -355,10 +357,189 @@ function _labrd!(
     return As
 end
 
-const _BRD_NB = 16     # bidiagonalization panel width; measured optimal across n=256–2048 (narrow panel ⇒
-# less BLAS-2 work/panel; the rank-16 trailing gemm stays efficient). ponytail: Zen4.
-const _BT_NB = 32      # back-transform (compact-WY dlarfb) block: larger than gebrd's — its gemms want
-# bigger T blocks (nb=16 there regressed large-n vectors). Decoupled from _BRD_NB.
+# Fused complex zlabrd panel (BLAS-2.5 / Howell-2008): ONE group-blocked sweep of the trailing block per
+# column replaces the reference's TWO streams (Y-pass `_labrd_seq!` ref-311 gemv-'C' + X-pass ref-341
+# gemv-'N'), halving big-pass DRAM traffic where the trailing block exceeds the LLC (~1.18× the panel,
+# ~1.15–1.2× gebrd at large n; the compute-bound conj-dot pass caps it below 2×). Fusion is legal because
+# per trailing column c, the final τq-scaled Y[c,i] — and hence the UNSCALED reflector entry â_j — is
+# computable on the spot (its correction ingredients w1/w2/τq are pre-sweep constants); the Householder
+# scaling is DEFERRED to an epilogue: `_larfg!(arow)` as-is (inherits phase/underflow bit-identically), then
+# X_big = s·x̂ + (1−s·â₁)·col₁ with s=1/(α−β). A scale-guard recomputes X via the ref gemv for extreme-
+# magnitude columns (unscaled col·â ~‖A‖² can denormal/overflow). All ≤nb-wide skinny corrections verbatim.
+# EXACT signature of `_labrd_seq!` (gebrd! calls it unchanged; needs a 4·nb `tmp` else falls back).
+# Group width `nc_g` is req#8 D-tier derived (slab L2-residency). Type-generic (heavy ops via `_lgc!`).
+function _labrd!(
+        As::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq, taup, X, Y,
+        nb::Int, arow::AbstractVector{T}, tmp::AbstractVector{T}
+    ) where {T <: Complex, R <: Real}
+    length(tmp) >= 4 * nb || return _labrd_seq!(As, d, e, tauq, taup, X, Y, nb, arow, tmp)
+    mm, nn = size(As)
+    o = one(T); z = zero(T)
+    # tmp carve — four disjoint nb-slots held simultaneously per column (the ref serializes w1/w2 through
+    # Y[1:i-1,i]): tmpc=conj(As[i,1:i]) [ref 325–327], w1=As[i:mm,1:i-1]ᴴ·v [ref 313], w2=X[i:mm,1:i-1]ᴴ·v
+    # [ref 315], xr=conj(X[i,1:i-1]) [ref 330–332].
+    w1o = nb; w2o = 2 * nb; xro = 3 * nb
+    @inbounds for i in 1:nb
+        if i > 1                                                                   # q-reflector [ref 300–308]
+            for t in 1:(i - 1)
+                tmp[t] = conj(Y[i, t])
+            end
+            _lgc!(view(As, i:mm, i), view(As, i:mm, 1:(i - 1)), view(tmp, 1:(i - 1)), -o, o, 0)
+            _lgc!(view(As, i:mm, i), view(X, i:mm, 1:(i - 1)), view(As, 1:(i - 1), i), -o, o, 0)
+        end
+        β, τq = _larfg!(view(As, i:mm, i))
+        d[i] = β; tauq[i] = τq; As[i, i] = o
+        if i < nn
+            L = nn - i
+            if i > 1                                                               # per-i skinny vectors
+                _lgc!(view(tmp, (w1o + 1):(w1o + i - 1)), view(As, i:mm, 1:(i - 1)), view(As, i:mm, i), o, z, 2)  # w1 [ref 313]
+                _lgc!(view(tmp, (w2o + 1):(w2o + i - 1)), view(X, i:mm, 1:(i - 1)), view(As, i:mm, i), o, z, 2)   # w2 [ref 315]
+                for t in 1:(i - 1)
+                    Y[t, i] = tmp[w2o + t]                                          # ref's final Y[1:i-1,i] state
+                end
+                for t in 1:(i - 1)
+                    tmp[xro + t] = conj(X[i, t])                                    # xr [ref 330–332]
+                end
+            end
+            for t in 1:i
+                tmp[t] = conj(As[i, t])                                             # tmpc [ref 325–327]; tmp[i]=1 exactly
+            end
+            for r in (i + 1):mm
+                X[r, i] = z                                                         # zero x̂ (accumulator)
+            end
+            # nc_g — req#8 D-tier: the slab the dot pass (1) streamed must stay L2-resident when accumulate
+            # pass (3) re-reads it (slab ≤ ½·L2; other half = x̂ col + v + Y rows + tmp). Grouping also
+            # amortizes the x̂ RMW over nc_g columns (the ungrouped v1 form throttled DRAM to ~17 GB/s).
+            mmi = mm - i
+            nc_g = max(1, (_L2_BYTES ÷ 2) ÷ (max(mmi, 1) * sizeof(T)))
+            jg = 1
+            while jg <= L
+                ncg = min(nc_g, L - jg + 1)
+                cg = (i + jg):(i + jg + ncg - 1)
+                _lgc!(view(Y, cg, i), view(As, i:mm, cg), view(As, i:mm, i), o, z, 2)   # (1) batched gemv-'C' dot [ref 311]
+                for j in jg:(jg + ncg - 1)                                          # (2) per-column skinny algebra
+                    c = i + j
+                    hy = z; ha = z; sY = z; sA = z
+                    for t in 1:(i - 1)
+                        act = conj(As[t, c])
+                        hy += act * tmp[w2o + t]                                    # [ref 316]
+                        ha += act * tmp[xro + t]                                    # [ref 333]
+                    end
+                    for t in 1:(i - 1)
+                        yct = Y[c, t]
+                        sY += yct * tmp[w1o + t]                                    # [ref 314]
+                        sA += yct * tmp[t]                                          # [ref 328]
+                    end
+                    yci = τq * (Y[c, i] - sY - hy)                                  # [ref 311..320]; τq BEFORE arow use
+                    Y[c, i] = yci
+                    arow[j] = conj(As[i, c]) - sA - yci - ha                        # raw â_j [ref 322–333]
+                end
+                _lgc!(view(X, (i + 1):mm, i), view(As, (i + 1):mm, cg), view(arow, jg:(jg + ncg - 1)), o, o, 0)  # (3) batched gemv-'N' accumulate [ref 341, unscaled]
+                jg += ncg
+            end
+            # epilogue: deferred Householder + x̂→X recovery + verbatim skinny X fixes
+            β2, τp = _larfg!(view(arow, 1:L))                                       # [ref 335]; inherits phase/underflow
+            e[i] = β2; taup[i] = τp
+            α_raw = arow[1]
+            arow[1] = o                                                            # [ref 336]
+            As[i, i + 1] = o                                                       # [ref 337]
+            for t in 2:L
+                As[i, i + t] = conj(arow[t])                                       # un-conjugated essential v [ref 338–340]
+            end
+            if iszero(τp)
+                for r in (i + 1):mm
+                    X[r, i] = z
+                end
+            else
+                pm = abs(β2) * abs(d[i])                                            # scale-guard magnitude proxy
+                if floatmin(R) / eps(R) < pm < floatmax(R) * eps(R)
+                    s = o / (α_raw - β2); k1 = o - s * α_raw                        # X_big = s·x̂ + (1−s·â₁)·col₁
+                    for r in (i + 1):mm
+                        X[r, i] = s * X[r, i] + k1 * As[r, i + 1]
+                    end
+                else                                                               # extreme scale: exact ref recompute
+                    _lgc!(view(X, (i + 1):mm, i), view(As, (i + 1):mm, (i + 1):nn), view(arow, 1:L), o, z, 0)
+                end
+                _lgc!(view(X, 1:i, i), view(Y, (i + 1):nn, 1:i), view(arow, 1:L), o, z, 2)          # [ref 342]
+                _lgc!(view(X, (i + 1):mm, i), view(As, (i + 1):mm, 1:i), view(X, 1:i, i), -o, o, 0) # [ref 343]
+                if i > 1
+                    _lgc!(view(X, 1:(i - 1), i), view(As, 1:(i - 1), (i + 1):nn), view(arow, 1:L), o, z, 0)        # [ref 345]
+                    _lgc!(view(X, (i + 1):mm, i), view(X, (i + 1):mm, 1:(i - 1)), view(X, 1:(i - 1), i), -o, o, 0) # [ref 346]
+                end
+                for r in (i + 1):mm
+                    X[r, i] *= τp                                                   # [ref 348–350]
+                end
+            end
+        else
+            taup[i] = z
+        end
+    end
+    return As
+end
+
+# Bidiagonalization panel width — PDM **MEASURE** tier (req#8b). It was a literal 16 ("measured optimal
+# across n=256–2048"), and that value went STALE for a reason that is itself the argument for Measure:
+# fixing an unrelated inlining bug (84ffacf) made the panel's gemv ~3× faster, which shifted the
+# panel-vs-trailing balance and made nb=8 beat 16 by 7–13% at EVERY size — including inside the range the
+# old literal claimed to own. An optimum that moves when a DIFFERENT kernel gets faster is by definition
+# not predictable from detected hardware consts, so Derive is the wrong tier: it must be measured on the
+# host. Pin → Derive(candidates+buffer bound) → Measure(selection), mirroring `_ger_np`.
+#
+# `_BRD_NB_MAX` bounds the CANDIDATES and sizes the GKH-owned workspace buffers, so every candidate fits
+# the owner's allocation — the auto-tune can never pick an nb the buffers can't hold. (Do NOT reach into
+# the workspace to widen it: that is an ownership violation, and the direct-read gemm then reads off the
+# end — how the pre-existing OOB in `_uker_cmplx!` was surfaced.)
+const _BRD_NB_MAX = max(16, 2 * _vwidth(Float64))
+const _BRD_NB_CANDS = Tuple(sort!(collect(unique(
+    clamp.((_vwidth(Float64) ÷ 2, _vwidth(Float64), 2 * _vwidth(Float64), _BRD_NB_MAX), 2, _BRD_NB_MAX)
+))))::Tuple{Vararg{Int}}
+const _BRD_NB = _BRD_NB_MAX          # legacy name: buffer-sizing bound (NOT the chosen panel width)
+const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
+@static if isnothing(_BRD_NB_PREF)
+    # Measured ONCE per process on first bidiagonalization (no __init__, so a pinned/trimmed .so never
+    # benchmarks at load). TOTAL try/catch: OncePerProcess poisons the whole process if the initializer
+    # throws. n=256 is the probe size — big enough that the panel/trailing balance is the thing being
+    # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
+    function _measure_brd_nb()::Int
+        Base.generating_output() && return 16          # never benchmark during precompilation
+        try
+            n = 256
+            A0 = Matrix{ComplexF64}(undef, n, n)
+            @inbounds for j in 1:n, i in 1:n
+                A0[i, j] = ComplexF64(sinpi((i + 2j) / n), cospi((3i - j) / n))   # deterministic, no RNG dep
+            end
+            ws = _svdws(ComplexF64); _svd_grow_bidiag!(ws, n, n)
+            d = zeros(Float64, n); e = zeros(Float64, n - 1)
+            tq = Vector{ComplexF64}(undef, n); tp = Vector{ComplexF64}(undef, n)
+            A = similar(A0)
+            best = 16; bt = typemax(UInt64)
+            for nb in _BRD_NB_CANDS
+                copyto!(A, A0); gebrd!(A, d, e, tq, tp, ws; nb = nb)             # untimed warmup (JIT)
+                t = typemax(UInt64)
+                for _ in 1:3
+                    copyto!(A, A0)
+                    s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); t = min(t, time_ns() - s)
+                end
+                t < bt && (bt = t; best = nb)
+            end
+            return best
+        catch
+            return 16
+        end
+    end
+    const _BRD_NB_ONCE = Base.OncePerProcess{Int}(_measure_brd_nb)
+    @inline _brd_nb() = _BRD_NB_ONCE()
+else
+    @inline _brd_nb() = _BRD_NB_PREF::Int
+end
+# Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
+# register-invariant compact-WY panel cap — the SAME value `_qr_nb` caps at (its comment: cap 32,
+# "µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs"). The panel is deep enough to amortize the rank-nb
+# trailing gemm while the T-factor (nb²) stays L1-resident; that balance is 32 on AVX2 (16 regs) and AVX-512
+# (32) alike — deriving off _NVREG would evaluate to 32 on every real machine, so a formula adds nothing
+# (cf. `_TR_TB`). Bigger than the bidiag panel `_BRD_NB` (nb=16 here regressed large-n vectors). Pinned
+# (P-tier) for calibration/override; fleet-confirm the invariance if a very-wide-register box ever appears.
+const _BT_NB = @load_preference("bt_nb", 32)::Int
 const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
 # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
 # FAILS on near-degenerate singular-value clusters (two σ agreeing to relative spread
@@ -419,7 +600,7 @@ const _SVDWS_C32 = SVDWorkspace{ComplexF32}()
 function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
     nbb = _BRD_NB
     ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
-    ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 1))
+    ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 4 * nbb))  # 4·nb: fused _labrd!
     ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
     return ws
 end
@@ -435,7 +616,7 @@ function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
     ldv = N % 256 == 0 ? N + 8 : N
     ws.d = _gv(ws.d, N); ws.e = _gv(ws.e, max(N, 1)); ws.tauq = _gv(ws.tauq, N); ws.taup = _gv(ws.taup, N)
     ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
-    ws.labrd_arow = _gv(ws.labrd_arow, N); ws.labrd_tmp = _gv(ws.labrd_tmp, N)
+    ws.labrd_arow = _gv(ws.labrd_arow, N); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 4 * nbb))  # 4·nb: fused complex _labrd!
     ws.Lvec = _gm(ws.Lvec, N, N); ws.Rvec = _gm(ws.Rvec, N, N)
     ws.dc_diag = _gv(ws.dc_diag, N); ws.dc_subdiag = _gv(ws.dc_subdiag, N); ws.dc_U = _gm(ws.dc_U, N + 1, N + 1)
     ws.UApad = _gm(ws.UApad, ldu, nu); ws.VQ = _gm(ws.VQ, M, N)
@@ -451,7 +632,7 @@ end
 function gebrd!(
         A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
         tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64};
-        nb::Int = _BRD_NB
+        nb::Int = _brd_nb()
     )
     m, n = size(A)
     m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
@@ -492,7 +673,7 @@ end
 # (the first with transB='C' — the block update is A −= V·Yᴴ − X·Uᴴ), unblocked zgebd2! tail. m ≥ n.
 function gebrd!(
         A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq::AbstractVector{T},
-        taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _BRD_NB
+        taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _brd_nb()
     ) where {T <: Complex, R <: Real}
     m, n = size(A)
     m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
@@ -509,7 +690,7 @@ function gebrd!(
         _labrd!(
             As, view(d, i:k), view(e, i:(k - 1)), view(tauq, i:k), view(taup, i:k),
             view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
-            view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:nb)
+            view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:(4 * nb))   # fused _labrd! needs 4·nb tmp
         )
         if i + nb <= k
             tr = view(A, (i + nb):m, (i + nb):n)

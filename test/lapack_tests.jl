@@ -21,6 +21,38 @@ end
     @test_throws DimensionMismatch PureBLAS.potrf!(randn(3, 4))
 end
 
+@testitem "potrf — PosDefException reports the FIRST failing column (LAPACK info)" begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.LAPACK as LA
+    # LAPACK's dpotrf sets info = the first column whose pivot is non-positive; `cholesky(A; check=true)`
+    # surfaces it, so a wrong value is user-visible through the C-ABI. The blocked/hybrid drivers factor
+    # sub-blocks of VIEWS, so the base kernel's column index has to be lifted back through every recursion
+    # level — this pins that. (Previously every failure reported column 1 regardless.)
+    function pb_info(A, uplo)
+        B = copy(A)
+        try
+            PureBLAS.potrf!(B; uplo = uplo); return 0
+        catch e
+            e isa PosDefException && return e.info
+            rethrow()
+        end
+    end
+    ref_info(A, uplo) = LA.potrf!(uplo, copy(A))[2]        # LAPACK.potrf! RETURNS (A, info); it does not throw
+    @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            uplo in ('L', 'U'), n in (8, 17, 33, 64, 129, 257)
+
+        Random.seed!(hash((T, n)))
+        X = randn(T, n, n)
+        A0 = Matrix(T <: Complex ? Hermitian(X'X + real(T)(n) * I, :L) : Symmetric(X'X + T(n) * I, :L))
+        @test pb_info(A0, uplo) == 0                                  # SPD ⇒ no throw
+        for col in unique(clamp.([1, 2, n ÷ 2, n - 1, n], 1, n))
+            A = copy(A0)
+            A[col, col] = -abs(A[col, col]) * T(1.0e-3)                # poison one pivot
+            @test pb_info(A, uplo) == ref_info(A, uplo)
+        end
+    end
+end
+
 @testitem "geqrf (QR) vs LAPACK — square/tall/wide, R + reconstruction" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK
@@ -787,6 +819,42 @@ end
         end
     end
     @test_throws LinearAlgebra.SingularException PureBLAS.gtsv!([0.0], [0.0, 0.0], [1.0], [1.0, 1.0])  # [[0 1];[0 0]] singular
+
+    # Row-interchange coverage. Everything above is diagonally dominant, so it only ever takes the
+    # no-interchange branch — which leaves gtsv!'s fast loop → general loop transition, its deferred
+    # dl prefix fill, and its 2-term/3-term back-solve selection untested. "pivot" makes |d| ≪ |dl| so
+    # nearly every step swaps; "mixed" is dominant for the first half and swap-heavy for the second,
+    # which is the case that actually crosses between the two loops mid-factorization.
+    @testset "interchange $T n=$n $tag" for T in (Float32, Float64, ComplexF32, ComplexF64),
+            n in (2, 7, 40, 129), tag in ("pivot", "mixed")
+
+        Random.seed!(hash((T, n, tag)))
+        dl = randn(T, n - 1); du = randn(T, n - 1)
+        d = tag == "pivot" ? randn(T, n) .* real(T)(1.0e-3) :
+            [i <= n ÷ 2 ? randn(T) + T(4) : randn(T) * real(T)(1.0e-3) for i in 1:n]
+        A = diagm(-1 => dl, 0 => d, 1 => du)
+        B = randn(T, n, 2)
+        # solution AND the overwritten factor arrays must both match LAPACK (dl is a documented gtsv
+        # output — the deferred fill must reproduce it exactly, not just leave B correct)
+        pdl, pd, pdu, pB = copy(dl), copy(d), copy(du), copy(B)
+        rdl, rd, rdu, rB = copy(dl), copy(d), copy(du), copy(B)
+        PureBLAS.gtsv!(pdl, pd, pdu, pB)
+        LA.gtsv!(rdl, rd, rdu, rB)
+        tol = sqrt(eps(real(T))) * 100 * (norm(A) + 1)
+        @test maximum(abs, A * pB - B) < tol
+        @test maximum(abs, pB - rB) < tol
+        @test maximum(abs, pd - rd) < tol
+        n > 1 && @test maximum(abs, pdu - rdu) < tol
+        n > 2 && @test maximum(abs, pdl[1:(n - 2)] - rdl[1:(n - 2)]) < tol
+        # gttrf's pivot bookkeeping (ipiv/du2 defaults now written inside the branches, not prologues)
+        pf = PureBLAS.gttrf!(copy(dl), copy(d), copy(du), Vector{T}(undef, max(n - 2, 0)), Vector{Int}(undef, n))
+        rf = LA.gttrf!(copy(dl), copy(d), copy(du))
+        @test pf[5] == rf[5]                                       # ipiv identical
+        @test maximum(abs, pf[2] - rf[2]) < tol                    # U diagonal
+        n > 2 && @test maximum(abs, pf[4] - rf[4]) < tol           # du2 second superdiagonal
+        Xg = PureBLAS.gttrs!('N', pf[1], pf[2], pf[3], pf[4], pf[5], copy(B))
+        @test maximum(abs, A * Xg - B) < tol
+    end
 end
 
 @testitem "stev engine (_sterf!/_steqr!) vs LAPACK — SymTridiagonal values + vectors (stev C-ABI core)" begin

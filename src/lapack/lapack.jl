@@ -57,7 +57,7 @@ const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int 
 function _potf2_lower!(A, n::Int)
     @inbounds for j in 1:n
         d = real(A[j, j])
-        d > 0 || throw(PosDefException(j))
+        d > 0 || return j                       # failing column, LOCAL to this block; 0 = success
         ajj = sqrt(d); A[j, j] = ajj; invd = inv(ajj)
         for i in (j + 1):n
             A[i, j] *= invd
@@ -69,13 +69,13 @@ function _potf2_lower!(A, n::Int)
             end
         end
     end
-    return A
+    return 0
 end
 # Unblocked, upper triangle: A = Uᴴ·U (Hermitian). conj on the mirror operand A[j,i].
 function _potf2_upper!(A, n::Int)
     @inbounds for j in 1:n
         d = real(A[j, j])
-        d > 0 || throw(PosDefException(j))
+        d > 0 || return j                       # failing column, LOCAL to this block; 0 = success
         ajj = sqrt(d); A[j, j] = ajj; invd = inv(ajj)
         for i in (j + 1):n
             A[j, i] *= invd
@@ -87,7 +87,7 @@ function _potf2_upper!(A, n::Int)
             end   # Hermitian: conj(U[j,i])·U[j,k]
         end
     end
-    return A
+    return 0
 end
 
 # Base-update row-unroll (MR). MR=2 (two W-blocks/step, 1 L[j,k] load / 2 blocks → more ILP) LIFTS the
@@ -142,7 +142,7 @@ function _cpotf2_lower!(A::AbstractMatrix{Tc}, n::Int) where {Tc <: BlasComplex}
                 unsafe_store!(cx(i, j), sr); unsafe_store!(cx(i, j) + sz, si); i += 1
             end
             d = unsafe_load(cx(j, j))                                    # diagonal is real (Hermitian)
-            d > 0 || throw(PosDefException(j))
+            d > 0 || return j                       # failing column, LOCAL to this block; 0 = success
             ajj = sqrt(d); invd = inv(ajj)
             unsafe_store!(cx(j, j), ajj); unsafe_store!(cx(j, j) + sz, zero(Tr))
             i = j + 1                                                   # scale below-diag by 1/√d (real)
@@ -155,28 +155,37 @@ function _cpotf2_lower!(A::AbstractMatrix{Tc}, n::Int) where {Tc <: BlasComplex}
             end
         end
     end
-    return A
+    return 0
 end
 
 # Recursive (cache-oblivious) Cholesky. Lower: split 2×2 — factor A11, solve the off-diagonal panel
 # A21·L11⁻ᵀ (trsm), downdate A22 -= A21·A21ᵀ (syrk), recurse A22. The top-level trsm/syrk are large-k
 # (half-matrix → the gated packed L3 paths); only the ≤_POTRF_BASE diagonal base is scalar potf2.
 # Factor a base block, via a contiguous buffer when A is a strided sub-block (better locality).
+# These now return the failing column (local, 1-based) or 0 — see `_chol_hyb_f64!`. On failure the buffered
+# variants return WITHOUT copying back, so A keeps its input contents exactly as before (the old code threw
+# from inside the base, which skipped the copy-back the same way).
 @inline function _potf2b_lower!(A, n::Int)
     if eltype(A) <: BlasComplex                                         # SIMD Hermitian base (via contig buf if strided)
         if A isa SubArray && stride(A, 2) > n && n >= 8
-            buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _cpotf2_lower!(buf, n); copyto!(A, buf); return A
+            buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
+            f = _cpotf2_lower!(buf, n); f == 0 || return f
+            copyto!(A, buf); return 0
         end
         return _cpotf2_lower!(A, n)
     end
     if n >= 128 && A isa SubArray && stride(A, 2) > n
-        buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _potf2_lower!(buf, n); copyto!(A, buf); return A
+        buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
+        f = _potf2_lower!(buf, n); f == 0 || return f
+        copyto!(A, buf); return 0
     end
     return _potf2_lower!(A, n)
 end
 @inline function _potf2b_upper!(A, n::Int)
     if n >= 128 && A isa SubArray && stride(A, 2) > n
-        buf = _potf2_buf(eltype(A), n); copyto!(buf, A); _potf2_upper!(buf, n); copyto!(A, buf); return A
+        buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
+        f = _potf2_upper!(buf, n); f == 0 || return f
+        copyto!(A, buf); return 0
     end
     return _potf2_upper!(A, n)
 end
@@ -184,7 +193,8 @@ end
 function _potrf_lower!(A, n::Int, base::Int = _POTRF_BASE)
     n <= base && return _potf2b_lower!(A, n)
     h = n ÷ 2
-    _potrf_lower!(view(A, 1:h, 1:h), h, base)
+    f = _potrf_lower!(view(A, 1:h, 1:h), h, base)
+    f == 0 || return f
     A21 = view(A, (h + 1):n, 1:h)
     if eltype(A) <: Complex                                    # Hermitian: A21·L11⁻ᴴ + A22 -= A21·A21ᴴ
         trsm!(A21, view(A, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'C', diag = 'N', alpha = true)
@@ -193,14 +203,16 @@ function _potrf_lower!(A, n::Int, base::Int = _POTRF_BASE)
         trsm!(A21, view(A, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = true)
         syrk!(view(A, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1, beta = 1)
     end
-    _potrf_lower!(view(A, (h + 1):n, (h + 1):n), n - h, base)
-    return A
+    f = _potrf_lower!(view(A, (h + 1):n, (h + 1):n), n - h, base)
+    f == 0 || return h + f                                     # trailing block starts at column h+1
+    return 0
 end
 # Upper: A = Uᵀ·U. Off-diagonal panel A12 = U11⁻ᵀ·A12 (trsm side-L), downdate A22 -= A12ᵀ·A12 (syrk).
 function _potrf_upper!(A, n::Int, base::Int = _POTRF_BASE)
     n <= base && return _potf2b_upper!(A, n)
     h = n ÷ 2
-    _potrf_upper!(view(A, 1:h, 1:h), h, base)
+    f = _potrf_upper!(view(A, 1:h, 1:h), h, base)
+    f == 0 || return f
     A12 = view(A, 1:h, (h + 1):n)
     if eltype(A) <: Complex                                    # Hermitian: U11⁻ᴴ·A12 + A22 -= A12ᴴ·A12
         trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'C', diag = 'N', alpha = true)
@@ -209,8 +221,9 @@ function _potrf_upper!(A, n::Int, base::Int = _POTRF_BASE)
         trsm!(A12, view(A, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
         syrk!(view(A, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'T', alpha = -1, beta = 1)
     end
-    _potrf_upper!(view(A, (h + 1):n, (h + 1):n), n - h, base)
-    return A
+    f = _potrf_upper!(view(A, (h + 1):n, (h + 1):n), n - h, base)
+    f == 0 || return h + f                                     # trailing block starts at column h+1
+    return 0
 end
 
 # Power-of-2 lda cache-set aliasing: the generic potrf recursion's trailing trsm!/syrk! read A sub-views at
@@ -299,7 +312,10 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     if _POTRF_PAD && up && T <: BlasComplex && _strided1(A)
         M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
         GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
-        _cpotrf_lower!(view(M, 1:n, 1:n), n)        # M lower ← L (throws PosDefException ⇒ A upper unchanged)
+        # U = Lᴴ, so column j of U is column j of L — the index carries across the transpose unchanged.
+        let f = _cpotrf_lower!(view(M, 1:n, 1:n), n)
+            f == 0 || throw(PosDefException(f))     # throw before transposing back ⇒ A upper unchanged
+        end
         GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
         return A
     end
@@ -311,7 +327,9 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
                 up ? unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, j + 1) :
                     unsafe_copyto!(pb + (j * ldb + j) * sz, pa + (j * lda + j) * sz, n - j)
             end
-            up ? _potrf_upper!(view(b, 1:n, 1:n), n, base) : _potrf_lower!(view(b, 1:n, 1:n), n, base)
+            let f = up ? _potrf_upper!(view(b, 1:n, 1:n), n, base) : _potrf_lower!(view(b, 1:n, 1:n), n, base)
+                f == 0 || throw(PosDefException(f))    # throw before copy-back ⇒ A unchanged
+            end
             @inbounds for j in 0:(n - 1)          # factored triangle back; the opposite triangle of A is untouched (throws skip copy-back)
                 up ? unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, j + 1) :
                     unsafe_copyto!(pa + (j * lda + j) * sz, pb + (j * ldb + j) * sz, n - j)
@@ -319,7 +337,10 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         end
         return A
     end
-    return up ? _potrf_upper!(A, n, base) : _potrf_lower!(A, n, base)
+    let f = up ? _potrf_upper!(A, n, base) : _potrf_lower!(A, n, base)
+        f == 0 || throw(PosDefException(f))
+    end
+    return A
 end
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -351,8 +372,13 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # So 16 is a measured µarch-invariant base cap (a crossover, not a cache/width size), correctly flat. Knob-able.
 @inline _chol_sth(::Type{T}) where {T} = 16      # base-case element crossover (µarch-invariant; fleet-tuned later)
 @inline _chol_sb(::Type{T}) where {T} = 32       # small-n rl block size (= 2·_chol_sth)
-const _CHOL_NB = 4                                # trsm panel column block
-const _CHOL_NC = 4                                # syrk column block
+# trsm/syrk column block = the register-TILE WIDTH of the fused Cholesky base kernel (columns unrolled with
+# register rank-update accumulators). PDM: proven-invariant Exempt, NOT a cache/width size — 4 columns ×
+# their accumulators fit the register file on every ISA, and the small Cholesky base does not benefit from a
+# wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
+# across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
+const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
+const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
@@ -416,7 +442,7 @@ function _chol_base_f64!(p::Ptr{T}, n::Int, ld::Int) where {T}
             unsafe_store!(p, s, _clidx(i, j, ld)); i += 1
         end
         d = unsafe_load(p, _clidx(j, j, ld))
-        (d > 0) || return false
+        (d > 0) || return j                                # failing column (1-based, local); 0 ⇒ success
         invd = inv(sqrt(d)); vinv = V(invd)
         i = j
         while i + W - 1 <= n
@@ -426,7 +452,7 @@ function _chol_base_f64!(p::Ptr{T}, n::Int, ld::Int) where {T}
             unsafe_store!(p, unsafe_load(p, _clidx(i, j, ld)) * invd, _clidx(i, j, ld)); i += 1
         end
     end
-    return true
+    return 0
 end
 
 # panel solve: L10 (m×bs) from L10·L00ᵀ = A10, in place on A10. FUSED — each NB=4 column panel downdates
@@ -649,7 +675,8 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
     j = 0
     while j < n
         bs = min(bs_outer, n - j)
-        _chol_rl_f64!(_cvptr(p, j + 1, j + 1, ld), bs, ld, block_size, threshold) || return false
+        f = _chol_rl_f64!(_cvptr(p, j + 1, j + 1, ld), bs, ld, block_size, threshold)
+        f == 0 || return j + f                             # lift the sub-block's column into this frame
         m = n - j - bs
         if m > 0
             p10 = _cvptr(p, j + bs + 1, j + 1, ld); p11 = _cvptr(p, j + bs + 1, j + bs + 1, ld)
@@ -658,7 +685,7 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
         end
         j += bs
     end
-    return true
+    return 0
 end
 
 # A power-of-two leading dimension aliases columns into the same cache sets (the LDA=2^k conflict,
@@ -693,19 +720,26 @@ end
 # Hybrid driver: the faer kernels are fastest at small/medium n but their syrk isn't cache-blocked, so
 # they fade at large n (panel re-streamed). Recurse by halving — the big off-diagonal blocks go through
 # PureBLAS's cache-blocked trsm!/syrk! (which gate at large k) — and bottom out in the faer kernels.
+# Returns the FIRST non-positive-pivot column (1-based, relative to this call's frame), 0 on success —
+# it does not throw, so the offsets can be lifted through the halving recursion and the caller reports the
+# true global column. LAPACK dpotrf sets info to exactly this; before, every failure reported column 1
+# regardless, which reached LBT callers through `dpotrf_64_` (`cholesky(A; check=true)` named the wrong
+# column). Success is the hot path and returns a plain 0, same register traffic as the old Bool.
 function _chol_hyb_f64!(M, n::Int, base::Int)
     if n <= base
-        ok = GC.@preserve M _chol_rl_f64!(pointer(M), n, stride(M, 2), _chol_sb(eltype(M)), _chol_sth(eltype(M)))
-        ok || throw(PosDefException(1))   # ponytail: faer returns Bool; exact pivot column not threaded
-        return M
+        return GC.@preserve M _chol_rl_f64!(
+            pointer(M), n, stride(M, 2), _chol_sb(eltype(M)), _chol_sth(eltype(M))
+        )
     end
     h = n ÷ 2
-    _chol_hyb_f64!(view(M, 1:h, 1:h), h, base)
+    f = _chol_hyb_f64!(view(M, 1:h, 1:h), h, base)
+    f == 0 || return f
     A21 = view(M, (h + 1):n, 1:h)
     trsm!(A21, view(M, 1:h, 1:h); side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = true)
     syrk!(view(M, (h + 1):n, (h + 1):n), A21; uplo = 'L', trans = 'N', alpha = -1, beta = 1)
-    _chol_hyb_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
-    return M
+    f = _chol_hyb_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
+    f == 0 || return h + f                                 # trailing block starts at column h+1
+    return 0
 end
 
 # ── Fused panel driver: po2-strided AVX2 potrf without the whole-matrix pad round-trip ──────────────
@@ -985,7 +1019,9 @@ function _chol_panel_f64!(A, n::Int, blk::Int = _chol_block(eltype(A)))
             for c in 0:(bs - 1)                                   # diag block lower triangle → D (L1/L2)
                 unsafe_copyto!(pD + (c * ldD + c) * sizeof(T), pjj + (c * lda + c) * sizeof(T), bs - c)
             end
-            _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T)) || throw(PosDefException(j + 1))
+            let f = _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T))
+                f == 0 || throw(PosDefException(j + f))    # j = 0-based block offset, f = column within it
+            end
             for c in 0:(bs - 1)                                   # factored diag back (tiny)
                 unsafe_copyto!(pjj + (c * lda + c) * sizeof(T), pD + (c * ldD + c) * sizeof(T), bs - c)
             end
@@ -1047,13 +1083,15 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
             @inbounds for j in 0:(n - 1)
                 unsafe_copyto!(pb + (j * ldb + j) * sizeof(T), pa + (j * lda + j) * sizeof(T), n - j)
             end
-            _chol_hyb_f64!(Mw, n, base)
+            f = _chol_hyb_f64!(Mw, n, base)
+            f == 0 || throw(PosDefException(f))            # throw BEFORE copy-back: A stays untouched
             @inbounds for j in 0:(n - 1)
                 unsafe_copyto!(pa + (j * lda + j) * sizeof(T), pb + (j * ldb + j) * sizeof(T), n - j)
             end
         end
     else
-        _chol_hyb_f64!(A, n, base)
+        f = _chol_hyb_f64!(A, n, base)
+        f == 0 || throw(PosDefException(f))
     end
     return A
 end
@@ -1073,7 +1111,8 @@ function _cpotrf_lower!(A, n::Int)
     j = 1
     @inbounds while j <= n
         jb = min(nb, n - j + 1)
-        _cpotrf_lower!(view(A, j:(j + jb - 1), j:(j + jb - 1)), jb)     # factor diagonal jb-block (recurse)
+        f = _cpotrf_lower!(view(A, j:(j + jb - 1), j:(j + jb - 1)), jb) # factor diagonal jb-block (recurse)
+        f == 0 || return j - 1 + f                                      # lift: block starts at column j
         if j + jb <= n
             db = view(A, j:(j + jb - 1), j:(j + jb - 1)); pan = view(A, (j + jb):n, j:(j + jb - 1))
             trsm!(pan, db; side = 'R', uplo = 'L', transA = 'C', diag = 'N', alpha = true)  # L21 = A21·L11⁻ᴴ
@@ -1081,7 +1120,7 @@ function _cpotrf_lower!(A, n::Int)
         end
         j += jb
     end
-    return A
+    return 0
 end
 
 # Public: Cholesky factor A in place into its `uplo` triangle. Returns A. Throws PosDefException if A is
@@ -1094,7 +1133,11 @@ function potrf!(A::AbstractMatrix; uplo::Char = 'L')
         (eltype(A) === Float64 || eltype(A) === Float32) && return _potrf_f64_lower!(A)
         # n≤base: one vectorized base call (fast ≤64, single contiguous factor). n>base: right-looking
         # blocked (small-nb panels → big amortizing trailing herks). Splitting n≤64 into panels regressed it.
-        eltype(A) <: BlasComplex && return (_cpotrf_lower!(A, n); A)   # recursive nb=n/4 (base handled inside)
+        if eltype(A) <: BlasComplex                                    # recursive nb=n/4 (base handled inside)
+            f = _cpotrf_lower!(A, n)
+            f == 0 || throw(PosDefException(f))
+            return A
+        end
     end
     base = eltype(A) <: Complex ? _CPOTRF_BASE : _potrf_base(eltype(A))   # complex→_CPOTRF_BASE; F32→halved (Lever B); F64/Dual→_POTRF_BASE
     _potrf_gen!(A, n, base, uplo != 'L')                       # pads po2-aliased strides (see _potrf_needs_pad)
