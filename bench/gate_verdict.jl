@@ -79,7 +79,8 @@ const _ICON = Dict(:FAIL => "🐢", :INDET => "❓", :PASS => "🐰")
 
 sel = something(findfirst(a -> startswith(a, "group="), ARGS), 0)
 want = sel == 0 ? nothing : ARGS[sel][7:end]
-paths = [a for a in ARGS if !startswith(a, "group=")]
+const NODRIFT = "nodrift" in ARGS
+paths = [a for a in ARGS if !startswith(a, "group=") && a != "nodrift"]
 
 cells = Dict{Tuple{String, String}, Vector{NamedTuple}}()
 for path in paths, ln in eachline(path)
@@ -97,8 +98,13 @@ for path in paths, ln in eachline(path)
         haskey(d, r) || continue
         # Mixed provenance: pb and ref from different runs. σdrift from the 2026-08-04 observation
         # (identical code, cached vs same-round reference differing by up to 3%).
+        # `nodrift`: pass when POOLING REPEATS of the same mode (e.g. 3 cached-ref runs). The between-run
+        # variance is then already inside the pooled rounds, so adding σdrift on top double-counts it.
+        # Measured 2026-08-04: three back-to-back cached-ref runs of identical code gave 0.954/0.963/0.963
+        # — 0.9% spread — versus 0.4-0.75% for full-arm. Cached mode is usable for effects above ~2%; the
+        # repeats are what turn it into an interval instead of a point.
         mixed = stamp[r] != stamp["pb"]
-        v = cellverdict(roundratios(d[r], d["pb"]); σdrift = mixed ? 0.010 : 0.0)
+        v = cellverdict(roundratios(d[r], d["pb"]); σdrift = (mixed && !NODRIFT) ? 0.010 : 0.0)
         push!(get!(cells, (op, lvl), NamedTuple[]), merge(v, (size = sz, ref = r, mixed = mixed)))
     end
 end

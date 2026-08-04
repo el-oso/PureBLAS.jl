@@ -141,6 +141,15 @@ closures) · repeated in-place reps · **median** times (not min) · `taskset -c
 low noise · results→JSON, plot from JSON · **per-host JSON filenames** (fleet: Zen4 dev / Zen3 AVX2 /
 Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
+- **CHAIRMARKS ONLY — DO NOT AUTHOR TIMING FUNCTIONS.** Benchmarks and timing use Chairmarks (`@be`),
+  as `bench/plots.jl` does. Writing a timing/benchmark function, or any wrapper around Chairmarks,
+  requires EXPLICIT APPROVAL FIRST — it is not a judgement call. If a measurement appears to need
+  something Chairmarks does not provide, stop and ask. Enforced by `test/estimator_lint.jl`: only
+  `plots.jl` and `measure.jl` may drive a benchmark, raw clocks (`@elapsed`/`time_ns`/`@btime`) are
+  banned across `bench/`, and `test/harness_baseline.txt` carries the pre-existing debt so new
+  violations fail immediately. Why it is a hard rule: a hand-rolled loop took ONE timing per window
+  where `@be` takes hundreds, and at `axpy` n=1e6 that flipped the sign of the result — hand loop
+  0.991 [0.941, 1.076] ("falsified") vs Chairmarks 1.022 [1.005, 1.030] (2.2% faster, decisive).
 - **ESTIMATOR — MEDIAN, and it is ENFORCED, not remembered.** Every timing that informs a gate decision
   reduces through `Measure.tstat` (`bench/measure.jl`) = `median`. **Never `minimum`, never `mean`** —
   `min` is optimistic AND tail-blind, `mean` over-weights the tail; the median is chosen precisely to be

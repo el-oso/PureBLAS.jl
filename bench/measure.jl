@@ -18,6 +18,7 @@
 module Measure
 
 using Statistics, Random
+using Chairmarks: @be
 
 export tstat, ESTIMATOR
 
@@ -69,26 +70,26 @@ Choosing badly is only possible if choosing is possible, so this makes those fiv
 `arms` is a vector of `name => f` where `f(ctx)` does the work; `ctx` is whatever `setup()` returned.
 """
 function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> nothing,
-            nboot::Int = 4000, seed::Int = 20260804)
+            samples::Int = 48, seconds::Float64 = 0.5, nboot::Int = 4000, seed::Int = 20260804)
     n = length(arms)
-    ts = [Float64[] for _ in 1:n]
-    ctx0 = setup()                                        # warm code paths, not data
-    for (_, f) in arms, _ in 1:2
-        f(ctx0)
-    end
+    ts = [Float64[] for _ in 1:n]                          # per-round MEDIAN of that window's samples
     for r in 1:rounds
-        ctx = setup()
-        order = isodd(r) ? (1:n) : reverse(1:n)           # ABBA: alternate arm order each round
+        order = isodd(r) ? (1:n) : reverse(1:n)            # ABBA: alternate arm order each round
         for i in order
             f = arms[i][2]
-            t0 = time_ns()                                 # estimator-ok: raw clock read; the REDUCTION
-            for _ in 1:reps                                # below is the median, which is the rule
-                f(ctx)
-            end
-            push!(ts[i], (time_ns() - t0) * 1.0e-9)
+            # CHAIRMARKS, exactly as plots.jl uses it — `evals=1` re-runs `setup` per SAMPLE, so inputs
+            # are fresh and the regime matches the gate. Hand-rolling this was a mistake twice over: it
+            # is the documented "ad-hoc harness" trap (gate numbers must come from the approved path),
+            # and a hand loop yields ONE timing per window where @be yields hundreds — which is why the
+            # hand-rolled intervals were needlessly wide.
+            b = @be setup() (c -> begin
+                for _ in 1:reps
+                    f(c)
+                end
+            end) evals = 1 samples = samples seconds = seconds
+            push!(ts[i], tstat(Float64[s.time for s in b.samples]))
         end
     end
-    base = tstat(ts[1])
     out = NamedTuple[]
     rng = Random.MersenneTwister(seed)
     for i in 1:n
