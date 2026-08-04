@@ -186,7 +186,7 @@ validated on square inputs; tall/skinny QR is a separate benchmark shape.
 
 ## Numeric summary
 
-The per-op numbers — **geomean (worst-size) ratio per op per µarch** — live in
+The per-op numbers — **median (worst-cell) ratio per op per µarch** — live in
 [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md).
 That file is auto-generated from the fleet result caches by the same run that produces the
 plots, with a provenance header (CPU model, code commit, timestamp per box), so it cannot

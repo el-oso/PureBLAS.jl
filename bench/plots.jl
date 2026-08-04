@@ -211,7 +211,13 @@ end
 
 # name => per-size samples: [(size, [ratio,ratio,…]), …]. The single data model the renderer consumes.
 const OpData = Pair{String, Vector{Tuple{Int, CellData}}}
-geomin(op) = (m = [median(v) for (s, v) in op]; (exp(sum(log, m) / length(m)), minimum(m)))  # geomean, worst
+# Per-op summary = (MEDIAN across cells, worst cell). The across-cell reduction was a GEOMEAN
+# (`exp(sum(log,m)/length(m))`) until 2026-08-04. A geomean is a mean; the project's estimator is the
+# median at EVERY level, and the reason is the same here as inside a cell — one soft size drags a mean
+# and hides the shape. It also read as authoritative in gen_table.md and the published docs, so the
+# banned statistic was the headline number. The worst cell stays: the gate is "every cell >= 1.0", so
+# the failing cell IS the decision, not an estimate of one.
+gatestat(op) = (m = [median(v) for (s, v) in op]; (median(m), minimum(m)))
 # Hermitian-positive-definite operand for (z)potrf, memoized per (T,size): the O(n³) `A*A'` is built ONCE;
 # each sample gets a fresh O(n²) copy (potrf is destructive). Avoids an OpenBLAS gemm + 2 big allocs PER
 # sample (seconds of wasted setup at n=4096). No `+zeros` — `A*A'+sI` is already dense HPD.
@@ -1298,7 +1304,7 @@ _opsin(fleet, gk) = (
         (nm in ops) || push!(ops, nm)
     end; ops
 )
-# THE one place a ratio is formed for output. Everything downstream (gen_table, svg_panels, geomin)
+# THE one place a ratio is formed for output. Everything downstream (gen_table, svg_panels, gatestat)
 # consumes `[(size, ratios)]` exactly as it did under v2, so deriving here — rather than at each call
 # site — is what keeps tables and plots from drifting apart in how they define the number.
 # Cells missing either arm are dropped: `arms=pb` on a fresh cache legitimately has no reference yet,
@@ -1397,7 +1403,7 @@ function svg_panels(path, title, fleet, gk)
     return println("wrote $path")
 end
 
-# Drift-proof numeric companion to the hand-annotated narrative table: geomean (worst) per op per µarch.
+# Drift-proof numeric companion to the hand-annotated narrative table: median (worst-cell) per op per µarch.
 function gen_table(fleet, gkeys)
     io = IOBuffer()
     println(io, "| op | ", join((_ulabel(m) for (m, _) in fleet), " | "), " |")
@@ -1409,7 +1415,7 @@ function gen_table(fleet, gkeys)
             if isnothing(ps) || isempty(ps)
                 push!(cells, "–")
             else
-                geo, mn = geomin(ps); push!(cells, @sprintf("%.2f (%.2f)", geo, mn))
+                med, mn = gatestat(ps); push!(cells, @sprintf("%.2f (%.2f)", med, mn))
             end
         end
         println(io, "| `$op` | ", join(cells, " | "), " |")
@@ -1477,7 +1483,7 @@ else
         )
         svg_panels(joinpath(adir, "perf_$(base)$(REFSUF)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk)
     end
-    open(joinpath(@__DIR__, "gen_table$(REFSUF)$L.md"), "w") do io   # drift-proof numeric table: geomean (worst) per op/µarch
+    open(joinpath(@__DIR__, "gen_table$(REFSUF)$L.md"), "w") do io   # drift-proof numeric table: median (worst-cell) per op/µarch
         println(io, "_Measured (provenance):_\n")
         for (m, _) in fleet   # self-describing: CPU, code commit, measure time per µarch
             println(io, "- **$(_ulabel(m))** (`$(m.host)`) — $(m.cpu), commit `$(m.commit)`, $(m.time)")
@@ -1496,7 +1502,7 @@ for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in 
     for r in _REF_ALL
         ps = _series(g, lvl, nm, r)
         (isnothing(ps) || isempty(ps)) && continue
-        per[r] = geomin(ps)
+        per[r] = gatestat(ps)
     end
     isempty(per) && continue
     # worst cell against the FASTER reference at that cell = the gate margin

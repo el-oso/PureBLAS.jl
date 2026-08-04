@@ -44,14 +44,19 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
     ops = sort([k[2] for k in keys(cells) if k[1] == section])
     isempty(ops) && continue
     println("\n#### $section\n")
-    println("| routine | gate | worst cell | geomean | sizes |")
+    println("| routine | gate | worst cell | median | sizes |")
     println("|---|---|---|---|---|")
     for op in ops
         cs = sort(cells[(section, op)]; by = first)
         gs = [c[2] for c in cs]
         gate = minimum(gs)
         wi = argmin(gs)
-        geo = exp(sum(log, gs) / length(gs))
+        # MEDIAN across cells, not a geomean. A geomean is a mean: in log space a 2x win and a 2x loss
+        # cancel exactly, so a strong large-n cell offsets a collapsed small-n one and the row reads
+        # healthy — the opposite of "PB >= max(OB, AOCL) at EVERY size". `gate`/`worst cell` below are
+        # the decision; this column only describes the row's typical cell. (Was `exp(sum(log,gs)/n)`
+        # until 2026-08-04; same fix as bench/plots.jl `gatestat`.)
+        geo = med(gs)
         icon = gate >= 1.0 ? "🐰" : "🐢"
         println("| `$op` | $icon $(round(gate; digits=2)) | n=$(cs[wi][1]) | $(round(geo; digits=2)) | $(length(cs)) |")
     end
