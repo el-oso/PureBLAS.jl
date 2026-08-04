@@ -1,0 +1,40 @@
+# Harness baseline — pre-existing bench scripts that drive Chairmarks directly, or form ratios from
+# raw clocks, instead of going through Measure.ab. DEBT, not permission: a NEW violation fails the
+# lint immediately. Remove a line once that probe is ported. NOTE zgeqrf_gate.jl forms a GATE ratio
+# from raw clocks — port it before trusting its numbers again.
+ab_mc_trmm.jl
+bench_gemm.jl
+bench_level1.jl
+calibrate.jl
+cgemvc.jl
+chol_lazy2.jl
+cl2gate.jl
+cmplx_survey.jl
+csyrk_avx2_calib.jl
+csyrk_cutoff.jl
+csyrk_gate.jl
+f32_aocl.jl
+f32_decomp.jl
+f32base_probe.jl
+gesvd_cross.jl
+iamax_ab.jl
+iamax_nb.jl
+l1gate.jl
+l3bench.jl
+lapackbench.jl
+lever_probe.jl
+ptrmm_gate.jl
+trsm_ab2.jl
+trsm_ab3.jl
+trsm_alias_ab.jl
+trsm_fp_ab.jl
+trsm_fp_decomp.jl
+trsm_fullpack_gf.jl
+trsm_fusedt_ship.jl
+trsm_fusedt_test.jl
+trsm_gfprofile.jl
+trsm_pad_ab.jl
+zen3_decomp.jl
+zen3_gemvn_roofline.jl
+zgemm_3m_ab.jl
+zgeqrf_gate.jl

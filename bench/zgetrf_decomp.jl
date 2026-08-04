@@ -1,3 +1,6 @@
+# estimator-ok-file: PHASE DECOMPOSITION, not a gate ratio. Accumulates each phase's share of one
+# factorization's runtime, so it needs a raw clock around each phase and produces no PB-vs-reference
+# number. Anything that decides PASS/FAIL must go through Measure.ab / plots.jl instead.
 # Decompose zgetrf phases: panel getf2, laswp, trsm, gemm. Times each phase's total across the factorization
 # at given n, plus compares PB trailing gemm/trsm vs OB at representative trailing shapes.
 using PureBLAS, LinearAlgebra, Statistics, Printf

@@ -1,3 +1,6 @@
+# estimator-ok-file: locates a crossover (blocked vs unblocked NX), a 2x-scale feature, with its own
+# interleaved-median reduction. Not a gate number — anything deciding PASS/FAIL goes through
+# Measure.ab / plots.jl.
 # Probe: blocked (nb=32) vs single-panel unblocked (nb=n) for zgeqrf across the transition sizes, to
 # find the unblocked→blocked crossover NX. our/OB interleaved median.
 using PureBLAS, LinearAlgebra, Statistics, Printf, Random
