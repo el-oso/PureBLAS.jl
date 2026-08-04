@@ -1318,15 +1318,15 @@ end
 # Age of the reference arms behind a rendered view, so a page can say how old its baseline is instead of
 # implying it matches the run that produced it. Returns (oldest, newest) ISO stamps over the cells used.
 function _ref_age(g, ref::AbstractString = REFBK)
-    ts = String[]
+    stamps = String[]
     for (_, ops) in g, (_, sizes) in ops, (_, cell) in sizes
-        haskey(cell, ref) && push!(ts, cell[ref].time)
+        haskey(cell, ref) && push!(stamps, cell[ref].time)
     end
-    isempty(ts) && return ("–", "–")
-    # estimator-ok: `ts` here is a vector of ISO DATE STRINGS, not timings — this is the oldest/newest
-    # reference-arm stamp for the provenance line. Flagged only because the name matches the lint's
-    # timing-variable heuristic.
-    return (minimum(ts), maximum(ts))   # estimator-ok: ts is ISO date strings, not timings
+    isempty(stamps) && return ("–", "–")
+    # `stamps` holds ISO DATE STRINGS, not timings — oldest/newest reference-arm stamp for the
+    # provenance line. Renamed from `ts` so it cannot read as a timing vector to either a human or the
+    # lint; the lint has no exemption mechanism, so ambiguous names have to be fixed, not annotated.
+    return (minimum(stamps), maximum(stamps))
 end
 
 function svg_panels(path, title, fleet, gk)
