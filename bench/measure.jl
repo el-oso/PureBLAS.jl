@@ -157,6 +157,12 @@ end
 # it to a ceiling waits until that ceiling is built properly. See bench/zen3_gemvn_roofline.jl for the
 # prior art this needs to absorb.
 
+# Phase decomposition (which phase of a blocked factorization owns the time): absolute scale from @be
+# (median, as everywhere), attribution from stdlib Profile IP sampling IN SITU. See decompose.jl's
+# header for why phase RECONSTRUCTION (isolate each phase, @be it, sum) was rejected — this repo's own
+# pstrf rowcache history is the measured counterexample.
+include("decompose.jl")
+
 """Print an `ab` result so every number carries its estimator, sample count and interval."""
 function abshow(res; label = "")
     isempty(label) || println(label)
