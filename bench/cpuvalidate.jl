@@ -14,6 +14,8 @@
 # Output: printed table + a self-describing  bench/cpuvalidate_<host>.txt  to send back for analysis.
 
 using PureBLAS, LinearAlgebra, Printf, Dates
+using Chairmarks: @be
+include(joinpath(@__DIR__, "measure.jl"))
 const B = LinearAlgebra.BLAS
 B.set_num_threads(1)                                   # PureBLAS is single-threaded — fair baseline
 const P = PureBLAS
@@ -36,17 +38,20 @@ const DERIVED = [
 wF64 = P._vwidth(Float64)
 isa_lbl = _c(:_SIMD_BYTES) == "64" ? "512-bit" : _c(:_SIMD_BYTES) == "32" ? "256-bit/AVX2" : "128-bit"
 
-# ---- measurement: min-of-reps @elapsed ratio OB/PB (coarse is fine for a cliff) ---------------------
+# ---- measurement: Chairmarks, median-of-samples, ratio OB/PB ----------------------------------------
 reps(n) = n <= 256 ? 30 : n <= 512 ? 12 : n <= 1024 ? 5 : 2
 function ratio(pb, ob, n)
     pb(); ob(); pb(); ob()                             # warm (JIT + first-touch workspace grow)
     r = reps(n)
-    # estimator-ok: DELIBERATE min, and these numbers are NOT gate numbers. This file locates a
-    # crossover CLIFF (a 2x-scale feature), where min-of-reps is adequate and cheap. Anything that
-    # decides PASS/FAIL must use bench/measure.jl's `tstat` (median) — see that file for what a silent
-    # min/median swap cost on 2026-08-03/04.
-    tp = minimum(@elapsed(pb()) for _ in 1:r)   # estimator-ok: cliff-finding only, NOT a gate number
-    to = minimum(@elapsed(ob()) for _ in 1:r)   # estimator-ok: cliff-finding only, NOT a gate number
+    # CHAIRMARKS ONLY, and the MEDIAN — no exemption, even though this file only locates a crossover
+    # cliff. It previously used `minimum(@elapsed …)` behind an "it's only a cliff" annotation; that is
+    # exactly the reasoning that let `min` into the iamax probes and inverted an unroll ranking. This
+    # file is also the FIRST thing run on an unknown CPU, so its numbers must mean what every other
+    # number here means.
+    bp = @be pb() evals = 1 samples = r seconds = 1.0
+    bo = @be ob() evals = 1 samples = r seconds = 1.0
+    tp = Measure.tstat(Float64[s.time for s in bp.samples])
+    to = Measure.tstat(Float64[s.time for s in bo.samples])
     return (to / tp, tp)
 end
 mkspd(n) = (M = randn(n, n); M = M * M' + n * I; Matrix(M))
