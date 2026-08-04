@@ -33,3 +33,6 @@ bench/plots_data_*.txt
 # lite-mode plot output: smoke-test artifacts, explicitly NOT gate numbers (see bench/plots.jl)
 docs/src/assets/*_lite.svg
 bench/archive_v2/
+
+# probe scripts: disposable, but linted (see bench/probes/README.md)
+bench/probes/*.jl

@@ -41,8 +41,12 @@ reps(n) = n <= 256 ? 30 : n <= 512 ? 12 : n <= 1024 ? 5 : 2
 function ratio(pb, ob, n)
     pb(); ob(); pb(); ob()                             # warm (JIT + first-touch workspace grow)
     r = reps(n)
-    tp = minimum(@elapsed(pb()) for _ in 1:r)
-    to = minimum(@elapsed(ob()) for _ in 1:r)
+    # estimator-ok: DELIBERATE min, and these numbers are NOT gate numbers. This file locates a
+    # crossover CLIFF (a 2x-scale feature), where min-of-reps is adequate and cheap. Anything that
+    # decides PASS/FAIL must use bench/measure.jl's `tstat` (median) — see that file for what a silent
+    # min/median swap cost on 2026-08-03/04.
+    tp = minimum(@elapsed(pb()) for _ in 1:r)   # estimator-ok: cliff-finding only, NOT a gate number
+    to = minimum(@elapsed(ob()) for _ in 1:r)   # estimator-ok: cliff-finding only, NOT a gate number
     return (to / tp, tp)
 end
 mkspd(n) = (M = randn(n, n); M = M * M' + n * I; Matrix(M))

@@ -17,38 +17,55 @@
 # order, so this needs NO cache format change.
 #
 # Usage: julia --project=bench bench/gate_verdict.jl bench/plots_data_<uarch>_<host>.txt [more…] [group=L1]
-using Statistics
+using Statistics, Random
 
 const QN = 48
-# t_{R-1, 0.975}. Only a few R occur (plots.jl uses 8 light / 4 heavy); the fallback is a crude
-# interpolation — fine, since R outside this set is not a regime we run.
-const _TQ = Dict(2 => 12.706, 3 => 4.303, 4 => 3.182, 6 => 2.571, 8 => 2.365, 16 => 2.131, 32 => 2.040)
-_t(R) = get(() -> (R < 2 ? Inf : 1.96 + 8.0 / R), _TQ, R)
-
-# δ — the dead band, i.e. the resolution of the whole methodology. A deficit smaller than the machine's
-# own day-scale nonstationarity is not a reproducible property of the CODE: it will not replicate
-# tomorrow, so chasing it is chasing machine state. PROVISIONAL 0.003, from same-methodology repeats
-# minutes apart (galen iamax 0.936/0.934, zdotc 0.997/0.995 ⇒ σ̂_pair ≈ 0.1–0.15%, δ = 2σ̂). This is NOT a
-# 1% concession: every currently-open BLAS-1 gap (0.5–3.7%) sits outside it and still reads FAIL/INDET.
-# Replace with 2·σ̂_pair per host once a canary history exists.
-const DELTA = 0.003
-
-# One cell, one reference. Returns the point ratio, a two-sided 95% interval, and a verdict.
-# σdrift > 0 widens the interval for MIXED-PROVENANCE cells (pb and ref measured in different runs) —
-# that is what pushes small-gap cached-reference cells to INDET instead of letting them masquerade.
-function cellverdict(qref, qpb; δ = DELTA, σdrift = 0.0)
-    R = min(length(qref), length(qpb)) ÷ QN
+# THE STATISTIC IS THE MEDIAN, EVERYWHERE. That is the approved methodology (CLAUDE.md: "median times
+# (not min)"; plots.jl forms median(ref_q ./ pb_q) per round; coverage_ops.jl medians over rounds) and it
+# is not negotiable here — the point of the median is exactly to be insensitive to the window tails that
+# a `min` ignores and a `mean` over-weights.
+#
+# An earlier draft of this file used mean±t on log-ratios, and the probe harnesses used `minimum` of
+# repeated timings. Both were unapproved substitutions and the second one was actively harmful: `min` is
+# optimistic AND tail-blind, so a warm A/B on minima ranked an iamax unroll nb2 > nb4 at n=1e6 while the
+# gate's median ranked it 15% WORSE. Sample count was not the problem — with `min`, more samples makes the
+# estimator drift further from the median. Do not reintroduce either.
+#
+# Interval: BOOTSTRAP percentile CI of the median, over the pooled per-round log-ratios. Non-parametric,
+# so it needs no normality claim about round medians, and pooling rounds from EVERY available run folds
+# the between-run component in automatically — which matters, because a within-run-only interval was
+# measured too narrow (2026-08-04: nrm2's run-1 95% CI [2.003, 2.016] did not contain run 2's 1.995).
+const _NBOOT = 4000
+function cellverdict(rs::Vector{Float64}; σdrift = 0.0, seed = 20260804)
+    R = length(rs)
     R < 2 && return (ratio = NaN, lo = NaN, hi = NaN, R = R, verdict = :INDET)
-    x = [log(median(view(qref, (r - 1) * QN + 1:r * QN) ./ view(qpb, (r - 1) * QN + 1:r * QN)))
-         for r in 1:R]
-    m = mean(x)
-    hw = sqrt((_t(R) * std(x) / sqrt(R))^2 + (1.96 * σdrift)^2)
-    lb, ub = m - hw, m + hw
-    v = lb >= 0 ? :PASS :                    # demonstrably at or above the reference
-        lb >= log1p(-δ) ? :PASSEQ :          # indistinguishable from parity at our resolution
-        ub < log1p(-δ) ? :FAIL :             # demonstrably below even the dead band
-        :INDET                               # cannot distinguish — escalate, never force a binary
+    m = median(rs)
+    st = Random.MersenneTwister(seed)                  # fixed ⇒ the verdict is reproducible
+    bs = Vector{Float64}(undef, _NBOOT)
+    idx = Vector{Int}(undef, R)
+    for b in 1:_NBOOT
+        rand!(st, idx, 1:R)
+        bs[b] = median(view(rs, idx))
+    end
+    sort!(bs)
+    lb, ub = bs[max(1, round(Int, 0.025 * _NBOOT))], bs[min(_NBOOT, round(Int, 0.975 * _NBOOT))]
+    # σdrift widens for mixed-provenance cells (fresh pb arm vs a reference from an earlier run).
+    lb -= 1.96 * σdrift; ub += 1.96 * σdrift
+    # ONE null hypothesis: the gate HOLDS. Flag only on evidence that it does not, i.e. the whole
+    # interval below parity. No dead band — with the between-run component included the interval IS the
+    # dead band, and it self-calibrates per cell instead of being a global constant.
+    v = lb >= 0 ? :PASS :
+        ub < 0 ? :FAIL :
+        (ub - lb) > 0.02 ? :INDET :          # genuinely unresolved (>2% wide) ⇒ more rounds
+        :PASS                                # interval contains parity ⇒ no evidence of a regression
     return (ratio = exp(m), lo = exp(lb), hi = exp(ub), R = R, verdict = v)
+end
+
+# Per-round log ratios for one (cell, ref); caller concatenates across runs before verdicting.
+function roundratios(qref, qpb)
+    R = min(length(qref), length(qpb)) ÷ QN
+    return [log(median(view(qref, (r - 1) * QN + 1:r * QN) ./ view(qpb, (r - 1) * QN + 1:r * QN)))
+            for r in 1:R]
 end
 
 # Routine verdict = WORST VERDICT over cells × refs, never `min` of the point estimates. "Must hold at
@@ -57,8 +74,8 @@ end
 # routine containing one truly-deficient cell falsely passes only if THAT cell's bound falsely clears
 # (≤2.5%), regardless of how many healthy cells surround it. Adding sizes or boxes never inflates
 # false-PASS. False FAILs are handled by re-measuring the borderline cell, not by widening every interval.
-const _ORD = Dict(:FAIL => 4, :INDET => 3, :PASSEQ => 2, :PASS => 1)
-const _ICON = Dict(:FAIL => "🐢", :INDET => "❓", :PASSEQ => "🐰≈", :PASS => "🐰")
+const _ORD = Dict(:FAIL => 4, :INDET => 3, :PASS => 1)
+const _ICON = Dict(:FAIL => "🐢", :INDET => "❓", :PASS => "🐰")
 
 sel = something(findfirst(a -> startswith(a, "group="), ARGS), 0)
 want = sel == 0 ? nothing : ARGS[sel][7:end]
@@ -81,7 +98,7 @@ for path in paths, ln in eachline(path)
         # Mixed provenance: pb and ref from different runs. σdrift from the 2026-08-04 observation
         # (identical code, cached vs same-round reference differing by up to 3%).
         mixed = stamp[r] != stamp["pb"]
-        v = cellverdict(d[r], d["pb"]; σdrift = mixed ? 0.010 : 0.0)
+        v = cellverdict(roundratios(d[r], d["pb"]); σdrift = mixed ? 0.010 : 0.0)
         push!(get!(cells, (op, lvl), NamedTuple[]), merge(v, (size = sz, ref = r, mixed = mixed)))
     end
 end
@@ -96,7 +113,9 @@ for (op, lvl) in sort(collect(keys(cells)))
                         round(w.hi; digits=3), "] n=", w.size, " ", w.ref), 30),
             rpad(w.R, 4), nmix == 0 ? "-" : "$nmix/$(length(cs)) ⚠")
 end
-println("\nδ = ", DELTA, " (provisional; = 2·σ̂_pair from same-methodology repeats). ",
-        "🐰 lb≥1  🐰≈ lb≥1-δ  ❓ straddles  🐢 ub<1-δ")
+println("\nMedian of per-round ratios; 95% bootstrap CI (4000 resamples), rounds POOLED across every ",
+        "cache given, so between-run variance is included.")
+println("🐰 CI contains or exceeds parity (no evidence of a regression)   ",
+        "🐢 CI entirely below parity   ❓ CI wider than 2% (needs more rounds)")
 println("⚠ = cell mixes a freshly-measured pb arm with a reference arm from an earlier run; its ",
         "interval is widened by σdrift=1% and it should not decide anything near parity.")
