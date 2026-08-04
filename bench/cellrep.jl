@@ -69,7 +69,7 @@ const OPS = Dict(
                end; s)),
     "scal" => (() -> (randn(N),),
                (c, m) -> (for _ in 1:m
-                    P.scal!(c[1], 1.0000001)
+                    P.scal!(1.0000001, c[1])
                 end),
                (c, m) -> (for _ in 1:m
                     B.scal!(1.0000001, c[1])
@@ -99,7 +99,7 @@ const OPS = Dict(
                  end)),
     "zscal" => (() -> (randn(ComplexF64, N),),
                 (c, m) -> (for _ in 1:m
-                     P.scal!(c[1], 1.0000001 + 0im)
+                     P.scal!(1.0000001 + 0im, c[1])
                  end),
                 (c, m) -> (for _ in 1:m
                      B.scal!(1.0000001 + 0im, c[1])
