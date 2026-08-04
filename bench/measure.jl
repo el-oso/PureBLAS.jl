@@ -72,8 +72,21 @@ Choosing badly is only possible if choosing is possible, so this makes those fiv
 """
 function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> nothing,
             samples::Int = 48, seconds::Float64 = 0.5, nboot::Int = 4000, seed::Int = 20260804,
-            alternate::Bool = false)   # measured unnecessary — see the null test cited below
+            alternate::Bool = false,   # measured unnecessary — see the null test cited below
+            check = nothing)           # ctx -> Bool, run once per arm BEFORE timing
     n = length(arms)
+    # CORRECTNESS BEFORE SPEED. `check` receives the ctx AFTER an arm has run and must return true.
+    # A fast arm computing the wrong thing is not a datapoint, and an arm whose ROUTING silently fell
+    # back to a generic path is the classic version of that — it looks like a modest regression rather
+    # than a bug. `ptrmm_gate.jl` called this "routed correctness"; keeping it here means a probe cannot
+    # report a number for a kernel it never actually exercised.
+    if check !== nothing
+        for (nm, f) in arms
+            c = setup()
+            f(c)
+            check(c) || error("Measure.ab: arm \"$nm\" failed its correctness check — refusing to time it")
+        end
+    end
     ts = [Float64[] for _ in 1:n]                          # per-round MEDIAN of that window's samples
     for r in 1:rounds
         # NO ORDER ALTERNATION — measured unnecessary, not assumed. bench/probes/abba_nulltest.jl runs two
@@ -113,6 +126,36 @@ function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> 
     end
     return out
 end
+
+"""
+    roofline(res; bytes=0, flops=0) -> Vector{NamedTuple}
+
+Attach achieved bandwidth / throughput to an `ab` result. `bytes` and `flops` are per CALL of the arm
+function (not per rep); pass whichever the kernel is bound by.
+
+Preserves the capability that lived in `zen3_decomp.jl` and `zen3_gemvn_roofline.jl`: those asked
+"is this loss the kernel or the bandwidth?", which a PB/reference RATIO cannot answer — a ratio tells you
+who is faster, never whether either is near the machine's ceiling. Compare the reported GB/s against
+`achievable_bandwidth()` below.
+"""
+function roofline(res; bytes::Real = 0, flops::Real = 0, reps::Int = 1)
+    return [merge(r, (gbs = bytes > 0 ? bytes * reps / r.secs / 1e9 : NaN,
+                      gflops = flops > 0 ? flops * reps / r.secs / 1e9 : NaN)) for r in res]
+end
+
+# NO `achievable_bandwidth` YET — DELIBERATELY. Two attempts were both wrong and would have produced
+# confident nonsense:
+#   1. A fixed 32 MB `sum` probe: gave 31 GB/s (DRAM) as the denominator for an axpy running 105 GB/s out
+#      of L2/L3. Bandwidth is not one number; the ceiling must be measured at the kernel's OWN
+#      working-set size.
+#   2. Size-matched `sum`: still gave 59.3 GB/s against axpy's 105.7. `sum` is a REDUCTION with a
+#      dependency chain, not a bandwidth-saturating stream, and it made one cold pass where the kernel
+#      under test made ten warm reps. It underestimates the ceiling, so kernels "exceed" it.
+# A trustworthy roofline denominator needs a saturating streaming kernel (STREAM-triad shaped), matched
+# in working-set size AND rep structure to the arm being measured, and validated against a known figure
+# before use. `roofline()` above reports ACHIEVED GB/s, which is correct and useful on its own; comparing
+# it to a ceiling waits until that ceiling is built properly. See bench/zen3_gemvn_roofline.jl for the
+# prior art this needs to absorb.
 
 """Print an `ab` result so every number carries its estimator, sample count and interval."""
 function abshow(res; label = "")
