@@ -59,8 +59,9 @@ five — estimator, round count, warm-up, arm ordering, and whether inputs are f
 2026-08-03/04 I got every one of them wrong at some point in bespoke probes, each failure costing hours.
 Choosing badly is only possible if choosing is possible, so this makes those five decisions once:
 
-  * ROUND-ALTERNATED (ABBA) — arms are interleaved within each round, so machine drift is common-mode
-    and cancels in the ratio. Cross-run comparison was measured at up to 3% of pure methodology.
+  * ARMS BACK-TO-BACK WITHIN A ROUND — seconds apart, so drift is common-mode and cancels. Order
+    alternation was MEASURED UNNECESSARY (see abba_nulltest.jl); the adjacency is what matters, not the
+    flipping. Cross-RUN comparison, by contrast, was measured at up to 3% of pure methodology.
   * FRESH SETUP PER ROUND — `setup()` is re-run each round, matching plots.jl's `@be … evals=1`. A warm
     single buffer ranked an unroll the wrong way once already.
   * MEDIAN, per round and across rounds. Never min, never mean.
@@ -70,11 +71,20 @@ Choosing badly is only possible if choosing is possible, so this makes those fiv
 `arms` is a vector of `name => f` where `f(ctx)` does the work; `ctx` is whatever `setup()` returned.
 """
 function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> nothing,
-            samples::Int = 48, seconds::Float64 = 0.5, nboot::Int = 4000, seed::Int = 20260804)
+            samples::Int = 48, seconds::Float64 = 0.5, nboot::Int = 4000, seed::Int = 20260804,
+            alternate::Bool = false)   # measured unnecessary — see the null test cited below
     n = length(arms)
     ts = [Float64[] for _ in 1:n]                          # per-round MEDIAN of that window's samples
     for r in 1:rounds
-        order = isodd(r) ? (1:n) : reverse(1:n)            # ABBA: alternate arm order each round
+        # NO ORDER ALTERNATION — measured unnecessary, not assumed. bench/probes/abba_nulltest.jl runs two
+        # IDENTICAL arms; an unbiased harness must read 1.000. Fixed order does:
+        #     n=1e3  1.0002 [0.9999, 1.0008]     n=1e5  0.9998 [0.9989, 1.0011]
+        # and alternating does not improve it (at n=1e5 it is marginally worse: 1.0005 [0.9982, 1.0033]).
+        # Arms run back-to-back within a round — seconds apart — so there is no drift for an order flip to
+        # cancel. Alternation would only matter if arms were separated by minutes, which is the
+        # CACHED-REFERENCE case, where the separation is days and no ordering fixes it.
+        # `alternate=true` is kept solely so the null test can re-check this claim on new hardware.
+        order = (alternate && iseven(r)) ? reverse(1:n) : (1:n)
         for i in order
             f = arms[i][2]
             # CHAIRMARKS, exactly as plots.jl uses it — `evals=1` re-runs `setup` per SAMPLE, so inputs
