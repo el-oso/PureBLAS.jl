@@ -144,10 +144,12 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
             for c in (nb0 >> 1, (3 * nb0) >> 2, nb0, (5 * nb0) >> 2, (3 * nb0) >> 1, 2 * nb0)
                 nb = min(c, kd)
                 refill!(); _pbtrf_blocked!(ABm, nloc, kd, nb)      # untimed warmup (absorb JIT)
-                t = typemax(UInt64)
-                for _ in 1:3
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); t = min(t, time_ns() - s)
+                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`).
+                ts = Vector{UInt64}(undef, 5)
+                for r in 1:5
+                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
                 end
+                sort!(ts); t = ts[3]
                 t < tbest && (tbest = t; best = c)
             end
             return best
@@ -204,10 +206,12 @@ const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
             for c in (vw, 2 * vw, 3 * vw, 4 * vw)
                 nb = min(c, kd)
                 refill!(); _pbtrf_blocked!(ABm, nloc, kd, nb)       # untimed warmup (absorb JIT)
-                t = typemax(UInt64)
-                for _ in 1:5
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); t = min(t, time_ns() - s)
+                # MEDIAN of 5, not min-of-5 (see cpuinfo.jl `_tune_one`).
+                ts = Vector{UInt64}(undef, 5)
+                for r in 1:5
+                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
                 end
+                sort!(ts); t = ts[3]
                 t < tbest && (tbest = t; best = c)
             end
             return best
@@ -262,11 +266,12 @@ const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
                 end
                 refill!(); _pbtf2_L!(ABm, nloc, c)                 # untimed warmups (absorb JIT)
                 refill!(); _pbtrf_blocked!(ABm, nloc, c)
-                tu = typemax(UInt64); tb = typemax(UInt64)
-                for _ in 1:5                                       # interleaved (crude ABBA), min-of-5
-                    refill!(); s = time_ns(); _pbtf2_L!(ABm, nloc, c);         tu = min(tu, time_ns() - s)
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, c);   tb = min(tb, time_ns() - s)
+                tus = Vector{UInt64}(undef, 5); tbs = Vector{UInt64}(undef, 5)
+                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
+                    refill!(); s = time_ns(); _pbtf2_L!(ABm, nloc, c);         tus[r] = time_ns() - s
+                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, c);   tbs[r] = time_ns() - s
                 end
+                sort!(tus); sort!(tbs); tu = tus[3]; tb = tbs[3]
                 # Ties go to BLOCKED, because the two mistakes are not equally expensive. Measured
                 # on Zen4: switching one candidate too EARLY costs +9% (kd=24: blocked 227 vs
                 # unblocked 208), switching one too LATE costs +103% (kd=40, above). 20 : 1. The
@@ -334,11 +339,12 @@ const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
                 # so that nesting terminates.)
                 refill!(); _pbtrf_repack_U!(ABm, nloc, c)          # untimed warmups (absorb JIT)
                 refill!(); _pbtrf_blocked_U!(ABm, nloc, c)
-                tr = typemax(UInt64); tn = typemax(UInt64)
-                for _ in 1:5                                       # interleaved (crude ABBA), min-of-5
-                    refill!(); s = time_ns(); _pbtrf_repack_U!(ABm, nloc, c);  tr = min(tr, time_ns() - s)
-                    refill!(); s = time_ns(); _pbtrf_blocked_U!(ABm, nloc, c); tn = min(tn, time_ns() - s)
+                trs = Vector{UInt64}(undef, 5); tns = Vector{UInt64}(undef, 5)
+                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
+                    refill!(); s = time_ns(); _pbtrf_repack_U!(ABm, nloc, c);  trs[r] = time_ns() - s
+                    refill!(); s = time_ns(); _pbtrf_blocked_U!(ABm, nloc, c); tns[r] = time_ns() - s
                 end
+                sort!(trs); sort!(tns); tr = trs[3]; tn = tns[3]
                 # No tie-break bias here, unlike _pbtrf_cross: the two mistakes cost about the same
                 # (at kd=192 going native early costs 1.10→0.92, at kd=256 staying on the re-pack
                 # costs 1.055→0.845 — both ~20%), so the plain comparison is the right one.

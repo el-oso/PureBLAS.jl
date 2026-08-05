@@ -54,10 +54,13 @@ const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
             best = 2 * vw; tbest = typemax(UInt64)
             for c in (vw, 2 * vw, 3 * vw, 4 * vw)
                 refill!(); _pptrf_lower!(AP, n, c)                 # untimed warmup (absorb JIT)
-                t = typemax(UInt64)
-                for _ in 1:5
-                    refill!(); s = time_ns(); _pptrf_lower!(AP, n, c); t = min(t, time_ns() - s)
+                # MEDIAN of 5, not min — `refill!` is outside the timed region, so each round is a fresh
+                # destructive factorization and the estimator decides which cut SHIPS.
+                ts = Vector{UInt64}(undef, 5)
+                for r in 1:5
+                    refill!(); s = time_ns(); _pptrf_lower!(AP, n, c); ts[r] = time_ns() - s
                 end
+                sort!(ts); t = ts[3]
                 t < tbest && (tbest = t; best = c)
             end
             return best

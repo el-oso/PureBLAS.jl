@@ -94,15 +94,16 @@ const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
                 end
                 refill!(); _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)   # warmups
                 refill!(); _gbtf2!(kl, ku, nloc, ABm, ipv)
-                tb = typemax(UInt64); tu = typemax(UInt64)
-                for _ in 1:3
+                tbs = Vector{UInt64}(undef, 5); tus = Vector{UInt64}(undef, 5)
+                for r in 1:5                            # interleaved, MEDIAN-of-5 (was min-of-3)
                     refill!(); s = time_ns()
                     _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)
-                    tb = min(tb, time_ns() - s)
+                    tbs[r] = time_ns() - s
                     refill!(); s = time_ns()
                     _gbtf2!(kl, ku, nloc, ABm, ipv)
-                    tu = min(tu, time_ns() - s)
+                    tus[r] = time_ns() - s
                 end
+                sort!(tbs); sort!(tus); tb = tbs[3]; tu = tus[3]
                 tb < tu && return kl                    # smallest width where blocking wins
             end
             return 64                                   # blocking never won on the narrow candidates

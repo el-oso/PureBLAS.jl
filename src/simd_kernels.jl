@@ -246,15 +246,12 @@ const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
             nn == nw && return false
             n = max(4096, 3 * _L2_BYTES ÷ sizeof(ComplexF64))   # inside the window: stream > L2
             x = fill(ComplexF64(1.0, 0.5), n); y = fill(ComplexF64(0.25, -0.75), n)
-            tn = typemax(UInt64); tw = typemax(UInt64)
-            for r in 0:3                                   # r=0 untimed warmup; ABBA after
-                s = time_ns()
-                _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(Float64)), n, 1.0e-9, 0.0, x, y)
-                e = time_ns() - s; r > 0 && (tn = min(tn, e))
-                s = time_ns()
-                _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y)
-                e = time_ns() - s; r > 0 && (tw = min(tw, e))
-            end
+            # MEDIAN of interleaved rounds (`_tune_ab`, cpuinfo.jl) — was min-of-3, which is optimistic
+            # and tail-blind and is the estimator that ranked an iamax unroll backwards.
+            tn, tw = _tune_ab(
+                () -> _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(Float64)), n, 1.0e-9, 0.0, x, y),
+                () -> _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y)
+            )
             return tn < tw
         catch
             return false

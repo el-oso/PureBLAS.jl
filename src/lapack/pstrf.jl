@@ -153,11 +153,12 @@ const _PSTRF_ROWCACHE_PREF = @load_preference("pstrf_rowcache_min", 128)
                     _pstrf_blocked!(A, piv, work, scr, R(-1), 1, real(A0[1, 1]), nb, Val(false), ub)
                 end
                 run(true); run(false)                              # untimed warmups (absorb JIT)
-                tb = typemax(UInt64); tn = typemax(UInt64)
-                for _ in 1:5                                       # interleaved (crude ABBA), min-of-5
-                    s = time_ns(); run(false); tn = min(tn, time_ns() - s)
-                    s = time_ns(); run(true); tb = min(tb, time_ns() - s)
+                tbs = Vector{UInt64}(undef, 5); tns = Vector{UInt64}(undef, 5)
+                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
+                    s = time_ns(); run(false); tns[r] = time_ns() - s
+                    s = time_ns(); run(true); tbs[r] = time_ns() - s
                 end
+                sort!(tbs); sort!(tns); tb = tbs[3]; tn = tns[3]
                 wins[ci] = tb < tn
             end
             # The benefit is NOT monotone in n — measured on Zen4 it wins at tiny orders, LOSES at

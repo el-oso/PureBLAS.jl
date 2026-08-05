@@ -539,11 +539,13 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
             best = 16; bt = typemax(UInt64)
             for nb in _BRD_NB_CANDS
                 copyto!(A, A0); gebrd!(A, d, e, tq, tp, ws; nb = nb)             # untimed warmup (JIT)
-                t = typemax(UInt64)
-                for _ in 1:3
+                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`).
+                ts = Vector{UInt64}(undef, 5)
+                for r in 1:5
                     copyto!(A, A0)
-                    s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); t = min(t, time_ns() - s)
+                    s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); ts[r] = time_ns() - s
                 end
+                sort!(ts); t = ts[3]
                 t < bt && (bt = t; best = nb)
             end
             return best
