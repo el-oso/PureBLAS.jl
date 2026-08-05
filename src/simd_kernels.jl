@@ -312,6 +312,21 @@ end
         # — PB/raw = 0.927 against the gate's PB/AOCL = 0.923, i.e. AOCL is simply achieving what the naive
         # loop achieves. The genuine DRAM regime (n=4e6, 32 MB) sits at 76-79 GB/s with PB/raw = 0.973.
         # PDM: DERIVE tier (L1 residency over a detected const), no new knob.
+        # OPEN CELL (2026-08-06, wintermute/Zen4 freq-locked): this branch reads ~0.993 vs OpenBLAS in
+        # the L2 band — gate scal n=30000 0.992-0.993 over two independent runs. It is a FLAT ~0.6%
+        # bandwidth difference, not a per-call cost: PB 174.2-174.9 GB/s vs OB 175.3-176.1 GB/s across
+        # n=2e4/3e4/4e4, where every cell moves the same total bytes (plots.jl's reps ∝ 1/n). Zen3 does
+        # NOT show it (1.006 at the same sizes), and n≤1e4 and n≥1e5 gate on both boxes.
+        # FALSIFIED for this cell — do not re-chase (all measured, bench/probes/scal_live.jl in the live
+        # rep-loop regime unless noted):
+        #   · the public entry frame — fixed in 989ade4, and the BARE ivdep loop still reads 0.9951 here;
+        #   · loop shape — ivdep 0.9956, 2× 0.9959, 4× 0.9919, and OpenBLAS's OWN flat-1× shape is the
+        #     WORST of the four at 0.9814 (dscal_k_COOPERLAKE is a 4-instruction 1× zmm loop);
+        #   · the `_axpy_band`/`_axpy_dram` knob lookup (+0.6 ns) and the `::AbstractVector` return
+        #     annotation on the backend entry (0.27%, identical with/without/`::typeof(x)`);
+        #   · the harness's unused SECOND array (plots.jl's L1 maker is `(randn(s), randn(s))` but scal
+        #     touches only c[1]) — dropping it moves neither arm (ob1 1.002, pb1 0.9946);
+        #   · unroll DEPTH and NON-TEMPORAL stores — falsified earlier, see the note below.
         if n * sizeof(T) > _L1_BYTES
             @inbounds @simd ivdep for j in 1:n
                 unsafe_store!(px, a * unsafe_load(px, j), j)
