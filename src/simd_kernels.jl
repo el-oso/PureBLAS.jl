@@ -186,13 +186,24 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
         end
     end
     const _AXPY_UNROLL_ONCE = Base.OncePerProcess{Int}(_measure_axpy_unroll)
-    @inline _axpy_shape_cache() = _AXPY_UNROLL_ONCE()
+    @inline _axpy_band() = _AXPY_UNROLL_ONCE()
+else
+    @inline _axpy_band() = _AXPY_UNROLL_PREF::Int
+end
 
-    # SECOND KNOB, DRAM REGIME. One knob cannot serve both bands: probed at 4xL1 the winner was the
-    # narrow phase body, and shipping it everywhere past L1 REGRESSED the L2/L3 cells on Zen4
-    # (n=1e5 1.018 -> 0.986, n=3e5 1.020 -> 0.981) while helping only past L3. Same lesson as the first
-    # split — a Measure knob governs the regime it was probed in, and nothing else. Probe at 2xL3, which
-    # is unambiguously DRAM-resident on every fleet box.
+# SECOND KNOB, DRAM REGIME — ITS OWN PREFERENCE AND ITS OWN GATE. It previously lived inside the
+# `axpy_unroll` block and fell back to `_AXPY_UNROLL_PREF`, which (a) silently collapsed two
+# independently-measured knobs onto one value as soon as either was pinned, and (b) left NO
+# `axpy_dram` preference to set, so the trim/.so build could not pin it — and req#8b requires every
+# Measure-tier knob to be pinned there, since a runtime benchmark is not trim-safe. That is exactly
+# what made `daxpy_64_` fail trim checking.
+const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
+# One knob cannot serve both bands: probed at 4xL1 the winner was the
+# narrow phase body, and shipping it everywhere past L1 REGRESSED the L2/L3 cells on Zen4
+# (n=1e5 1.018 -> 0.986, n=3e5 1.020 -> 0.981) while helping only past L3. Same lesson as the first
+# split — a Measure knob governs the regime it was probed in, and nothing else. Probe at 2xL3, which
+# is unambiguously DRAM-resident on every fleet box.
+@static if isnothing(_AXPY_DRAM_PREF)
     function _measure_axpy_dram()::Int
         Base.generating_output() && return _UNROLL
         try
@@ -219,11 +230,9 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
         end
     end
     const _AXPY_DRAM_ONCE = Base.OncePerProcess{Int}(_measure_axpy_dram)
-    @inline _axpy_band() = _AXPY_UNROLL_ONCE()
     @inline _axpy_dram() = _AXPY_DRAM_ONCE()
 else
-    @inline _axpy_band() = _AXPY_UNROLL_PREF::Int
-    @inline _axpy_dram() = _AXPY_UNROLL_PREF::Int
+    @inline _axpy_dram() = _AXPY_DRAM_PREF::Int
 end
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
