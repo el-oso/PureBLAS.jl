@@ -68,6 +68,16 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # separate regimes and must be pinned separately; collapsing them onto one value is what the
 # `_axpy_dram` fallback used to do. Codes: u = interleaved(u); 100+u = phase(u, full width);
 # 200+u = phase(u, narrow/256-bit). 4 = interleaved-4, the arm that is correct on every box measured.
+# And `sytrf_cmult`: the complex Bunch-Kaufman block multiplier is a Measure-tier OncePerProcess
+# benchmark that allocates a 1024x1024 probe matrix. `sytrf_64_` is @ccallable, so leaving it unpinned
+# shipped that benchmark into the .so — and unlike the axpy knobs it was never caught by trim, because
+# its candidate loop is over plain integers (1,2,3,4) with no `Val`, so it is type-stable and trim has
+# no complaint. Nothing announced the gap; test/pin_lint.jl now does.
+# Value 2, not the 1 measured on Zen4: the measure's OWN failure path returns 2 with the comment
+# "the safer default: 1 MISSES on Zen3", and a trimmed .so is one binary that must be safe on any host.
+# NOTE this pins the MULTIPLIER, not `sytrf_nb` — pinning the latter takes a branch whose value is flat
+# and would discard the derived `_sytrf_nb_shape(n)` scaling entirely.
+const _prev_sycm = load_preference(PUREBLAS_UUID, "sytrf_cmult")
 const _prev_axu = load_preference(PUREBLAS_UUID, "axpy_unroll")
 const _prev_axd = load_preference(PUREBLAS_UUID, "axpy_dram")
 const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
@@ -75,6 +85,7 @@ const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
 set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
+set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
 set_preferences!(PUREBLAS_UUID, "axpy_unroll" => 4; force = true)        # real-axpy band shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "axpy_dram" => 4; force = true)          # real-axpy DRAM shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
@@ -103,6 +114,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "zaxpy_narrow"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => _prev_zaxn; force = true)
+    end
+    if _prev_sycm === nothing
+        delete_preferences!(PUREBLAS_UUID, "sytrf_cmult"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => _prev_sycm; force = true)
     end
     if _prev_axu === nothing
         delete_preferences!(PUREBLAS_UUID, "axpy_unroll"; force = true)

@@ -1163,7 +1163,11 @@ end
 # 1.17/1.35/1.22/1.16/1.14. The likely mechanism is that a complex rank-k gemm needs a larger k to
 # reach peak on AVX2 than on AVX-512 (cf. `_clu_nb`, lu.jl:24-29, which grows faster than `_lu_nb`
 # for exactly that reason) — plausible but NOT verified, so the knob is measured rather than modelled.
-const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
+# `sytrf_nb` is a Pin-tier USER override (force a flat nb); its default is the derived
+# `_sytrf_nb_shape(n)` and no benchmark sits behind it, so the trim build has nothing to compile out.
+# The Measure-tier knob in this file is `sytrf_cmult` below, which IS pinned in juliac/build.jl.
+const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)   # pin-ok: user override, no benchmark behind it
+const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
 @inline _sytrf_nb_shape(n::Int) = 8 * cld(isqrt(n), 8)
 @static if isnothing(_SYTRF_NB_PREF)
     @inline _sytrf_nb(::Type{T}, n::Int) where {T <: BlasReal} =
@@ -1212,12 +1216,27 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
             return 2                                    # the safer default: 1 MISSES on Zen3
         end
     end
-    const _SYTRF_CMULT_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF64))
-    const _SYTRF_CMULT_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF32))
-    @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
-        clamp(_SYTRF_CMULT_C64() * _sytrf_nb_shape(n), 16, 96)
-    @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
-        clamp(_SYTRF_CMULT_C32() * _sytrf_nb_shape(n), 16, 96)
+    # THE MEASURE-TIER QUANTITY IS THE MULTIPLIER, NOT `nb` — so `sytrf_cmult` is what gets pinned.
+    # Pinning `sytrf_nb` instead would take the `else` branch below, whose value is FLAT: it discards
+    # `_sytrf_nb_shape(n)` entirely, so the trimmed .so would use one blocking factor at every n while
+    # the Julia path scales it with isqrt(n). Pinning the multiplier keeps the derived size shape and
+    # only fixes the measured part. Without this the knob had no pinnable name at all: `sytrf_64_` is
+    # @ccallable (cabi_lapack.jl), so the .so shipped a first-call benchmark that allocates a 1024×1024
+    # matrix, and the comment below claiming "pinned (trim lands here)" was simply false.
+    # Enforced by test/pin_lint.jl.
+    @static if isnothing(_SYTRF_CMULT_PREF)
+        const _SYTRF_CMULT_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF64))
+        const _SYTRF_CMULT_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF32))
+        @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
+            clamp(_SYTRF_CMULT_C64() * _sytrf_nb_shape(n), 16, 96)
+        @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
+            clamp(_SYTRF_CMULT_C32() * _sytrf_nb_shape(n), 16, 96)
+    else
+        @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
+            clamp((_SYTRF_CMULT_PREF::Int) * _sytrf_nb_shape(n), 16, 96)
+        @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
+            clamp((_SYTRF_CMULT_PREF::Int) * _sytrf_nb_shape(n), 16, 96)
+    end
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = clamp(_sytrf_nb_shape(n), 16, 96)
 else
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = _SYTRF_NB_PREF::Int   # pinned (trim lands here)
