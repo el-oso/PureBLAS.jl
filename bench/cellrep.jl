@@ -111,6 +111,13 @@ const OPS = Dict(
                 (c, m) -> (s = zero(ComplexF64); for _ in 1:m
                      s += B.dotc(c[1], c[2])
                  end; real(s))),
+    "zdotu" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
+                     s += P.dotu(c[1], c[2])
+                 end; real(s)),
+                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
+                     s += B.dotu(c[1], c[2])
+                 end; real(s))),
     "dzasum" => (() -> (randn(ComplexF64, N),),
                  (c, m) -> (s = 0.0; for _ in 1:m
                       s += P.asum(c[1])
