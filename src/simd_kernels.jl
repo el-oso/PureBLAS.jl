@@ -708,6 +708,79 @@ const _IAMAX_NB_STREAM = 4
 # registers and ONE mask-free compare, which is exactly what our width-8 attempt could not do. If iamax
 # n=1e4..1e5 is attacked again, that is the design to port — not another NB value.
 
+# MAX-REDUCTION-TREE scan — the structural port of AOCL's `bli_damaxv_zen_int_avx512`, which is the
+# reference that binds `iamax` in the L2-resident band on Zen4 (OpenBLAS is at ~2x, we beat it).
+#
+# THE DIFFERENCE FROM `_iamax_thresh!` IS NOT WIDTH, IT IS WHAT THE HOT LOOP HOLDS. The threshold form
+# compares every block against `thr` and ORs the masks, so each extra block costs a live VECTOR *and* a
+# live MASK plus its own index-walk arm — which is why widening it collapsed (NB=8 measured 0.822 at
+# n=1e3). This form folds the blocks into one vector with a log-depth `vifelse`-max tree and issues ONE
+# compare for the whole iteration, so NB blocks cost NB vectors and a single mask. That is how AOCL keeps
+# 8 blocks in flight, and it is the only structurally distinct design left after width was falsified at
+# NB=4 and NB=8 under the mask form.
+#
+# LOWERINGS (verified on this box, Julia 1.12.6 / SIMD.jl, strict mode, no fast-math):
+#   * `vifelse(a > b, a, b)` -> ONE `vmaxpd` (memory operand folds). Plain `max(::Vec,::Vec)` is
+#     llvm.maxnum and lowers to `vmaxpd + vcmpunordpd + masked mov` = 3 ops, which would lose on paper.
+#   * `any(!(m <= thr))`     -> ONE `vcmpnlepd` + `kortestb`, i.e. the unordered predicate in one insn.
+#
+# SEMANTICS — the netlib contract is preserved exactly, and every hazard is already test-pinned by the
+# "iamax NaN/Inf semantics", "first-occurrence on ties" and "max-tree detect" testitems:
+#   * seed `gmax = |x[1]|` (NOT typemin) — same as the threshold form; the reason is recorded there.
+#   * DETECT is conservative under NaN: `vmaxpd` propagates its second operand, so a NaN anywhere in the
+#     iteration reaches the tree root, and the unordered `!(m <= thr)` fires on it. It can fire when no
+#     real max advanced (extra cold-path entries), never miss one.
+#   * WALK is unchanged: per block, guarded by its own recomputed unordered test, then a strict `>` scan
+#     lane 1..W in block order 0..NB-1, so first-occurrence on ties holds and NaN is skipped by `>`.
+#     Recomputing the guard against an ALREADY-UPDATED `thr` mid-walk can only skip more blocks.
+@generated function _iamax_tree!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    vs = [Symbol(:v, j) for j in 0:(NB - 1)]
+    loads = [:($(vs[j + 1]) = abs(vload($V, xp + (o + $(j * W)) * $sz))) for j in 0:(NB - 1)]
+    # BALANCED pairwise fold => depth log2(NB), not a left-fold chain of length NB.
+    bal(items) = length(items) == 1 ? items[1] :
+        (m = length(items) ÷ 2; a = bal(items[1:m]); b = bal(items[(m + 1):end]);
+         :(vifelse($a > $b, $a, $b)))
+    tree = bal(Any[vs...])
+    walks = [quote
+            if any(!($(vs[j + 1]) <= thr))            # per-block unordered guard, cold path only
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    $(vs[j + 1])[l] > bm && (bm = $(vs[j + 1])[l]; bl = l)   # strict > ⇒ first on ties
+                end
+                bl != 0 && (gmax = bm; bi = o + $(j * W) + bl; thr = $V(gmax))
+            end
+        end for j in 0:(NB - 1)]
+    return quote
+        $(Expr(:meta, :inline))
+        step = $(NB * W)
+        gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = $V(gmax); o = 0
+        @inbounds while o + step <= n
+            $(loads...)
+            m = $tree                                  # log-depth vmaxpd fold, NO masks
+            if any(!(m <= thr))                        # ONE vcmpnlepd + kortestb for the whole iteration
+                $(walks...)
+            end
+            o += step
+        end
+        @inbounds while o + $W <= n                    # leftover full blocks — identical to _iamax_thresh!
+            u0 = abs(vload($V, xp + o * $sz))
+            if any(u0 > thr)
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    u0[l] > bm && (bm = u0[l]; bl = l)
+                end
+                bl != 0 && (gmax = bm; bi = o + bl; thr = $V(gmax))
+            end
+            o += $W
+        end
+        @inbounds for k in (o + 1):n                   # scalar remainder
+            a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
+        end
+        return bi
+    end
+end
+
 @generated function _iamax_thresh!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     vs = [Symbol(:v, j) for j in 0:(NB - 1)]
@@ -822,10 +895,24 @@ end
 # The unroll is picked by L2 RESIDENCY — PDM Derive tier, see `_iamax_thresh!`. Both `Val`s are LITERAL,
 # so this stays trim-safe (no runtime→Val) and both specializations are statically reachable; the test is
 # a single compare against a const-folded `_L2_BYTES`.
+# TREE width — **Derive**: eight cache lines in flight, bounded by the register file. The tree holds NB
+# live vectors plus a root and `thr`, so NB must leave headroom in `_NVREG` (32 on AVX-512, 16 on AVX2);
+# the line budget gives 8 on AVX-512 and 16 on AVX2, and the clamp keeps the latter buildable.
+# Unlike the threshold form, an extra block here costs ONE vector and no mask — which is the whole
+# reason widening is available to this structure and was not available to that one.
+const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
+
+# THREE-WAY ROUTING, all Derive-tier over detected cache sizes:
+#   L1-resident   -> threshold form, NB=2. It GATES here (n=1e3 1.058, n=3e3 1.112) and the tree's
+#                    all-blocks-eligible cold path is worse at tiny n; do not disturb what passes.
+#   L2-resident   -> TREE. This is the failing band (n=1e4/3e4/1e5 = 0.964/0.976/0.942 vs AOCL) and the
+#                    only band where AOCL's structure beats ours.
+#   beyond L2     -> threshold form, NB=4 (the stream arm). It GATES (n=3e5 1.029, n=1e6 1.022).
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
-    (n * sizeof(T) <= _L2_BYTES ?
-     _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, xp) : _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)) :
+    (n * sizeof(T) <= _L1_BYTES ? _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, xp) :
+     n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
+     _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)) :
     _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
