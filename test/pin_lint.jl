@@ -1,14 +1,21 @@
 # PIN-COVERAGE lint — every Measure-tier knob MUST be pinned in juliac/build.jl.
 #
-# WHY THIS IS A GATE AND NOT A HABIT (CLAUDE.md req#8b): a Measure-tier knob defaults to an on-host
-# `Base.OncePerProcess` benchmark. That benchmark is not trim-safe, so the trim/.so build pins the
-# preference, which makes `@static if isnothing(pref)` delete the measure — and the OncePerProcess with
-# it — at expansion time. If the pin is MISSING, nothing announces it: the knob is caught only by
-# ACCIDENT, when its measure body happens to contain something trim rejects. On 2026-08-05 the axpy
-# knobs were caught exactly that way (a non-concrete `Val(u)` → 10 failing C-ABI symbols), while
-# `sytrf_nb` — whose measure body is plausibly type-stable — sat unpinned and would have shipped a
-# first-call benchmark (allocating a 1024×1024 matrix) into libpureblas.so via the @ccallable
-# `sytrf_64_`. Its own source comment claimed "pinned (trim lands here)", which was false.
+# WHAT THIS ACTUALLY PROTECTS: **determinism of the shipped .so**, not merely trim hygiene. Pinning is
+# the user's knob for building libpureblas.so against a SPECIFIED microarchitecture; the @noalloc
+# contract exists so that resulting artifact is deterministic. The two constraints complement each
+# other — pinning is what makes the no-allocation proof achievable, and the proof verifies the pin did
+# its job. A Measure-tier knob left unpinned puts an on-host `Base.OncePerProcess` benchmark inside the
+# library: the first call through an @ccallable symbol behaves differently from every later one, and
+# what it decides depends on machine state at that instant. The allocation AllocCheck reports is the
+# symptom; the nondeterminism is the defect.
+#
+# WHY A GATE AND NOT A HABIT (CLAUDE.md req#8b): a missing pin announces itself to NOBODY. It is caught
+# only by ACCIDENT, when the measure body happens to contain something trim rejects. On 2026-08-05 the
+# axpy knobs were caught exactly that way (a non-concrete `Val(u)` → 10 failing C-ABI symbols), while
+# `sytrf_nb` sat unpinned and silently reachable: a C/Rust caller's FIRST `sytrf_64_` would have run a
+# benchmark allocating a 1024×1024 matrix and picked its blocking factor from momentary machine state.
+# Trim never objected — that candidate loop is over plain ints, hence type-stable and trim-clean. Its
+# own source comment claimed "pinned (trim lands here)", which was false.
 #
 # HEURISTIC (deliberately boring, per Fable's review): a `const X = @load_preference("name", nothing)`
 # is Measure-tier if the SAME FILE also mentions `Base.OncePerProcess`. Per-file co-occurrence is
