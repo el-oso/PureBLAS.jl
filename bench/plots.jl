@@ -1186,6 +1186,42 @@ end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
 const CACHE = joinpath(@__DIR__, "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")   # v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to the rendered views
+# ── MACHINE-STATE PROVENANCE: `anchor=` and `freq=` ────────────────────────────────────────────────
+# WHY. A cached reference is compared against a PB arm measured in a DIFFERENT process, possibly days
+# later. Same-run ratios cancel machine state — thermal drift, clock, page placement — because both arms
+# run seconds apart; a CACHED ratio cancels nothing. That is the mechanism behind cross-run drift, which
+# read axpy n=1e6 at 0.960 cached against 0.983 same-run on identical code, and heat is one of its
+# inputs: a hot afternoon makes PB look slower against a reference measured on a cool morning, and
+# nothing in the comparison can distinguish that from a regression.
+#
+# So every run stamps two machine-state fields, and neither changes the record format:
+#   * `anchor=` — the median time of a FIXED, CODE-INVARIANT workload (Base `sum(abs2, ·)` over a
+#     constant L2-resident array). It does not touch PureBLAS, so it moves only with the machine, not
+#     with the kernel under test. A later PB-only run can scale a cached reference by the ratio of
+#     anchors to remove the machine-state difference — and can at minimum REFUSE to compare when the
+#     anchors disagree by more than the effect being chased.
+#   * `freq=` — the achieved clock under load (max over cores; the pinned core is the busy one). The
+#     frequency methodology requires base-clock-locked runs, and until now a throttled run was
+#     indistinguishable from a clean one after the fact.
+# Chairmarks + median, like every other timing here (this file is scanned by test/estimator_lint.jl).
+const _ANCHOR_N = 1 << 17                       # 128K Float64 = 1 MB: L2-resident on every fleet box
+function _anchor_secs()
+    a = fill(1.0000001, _ANCHOR_N)
+    b = @be sum(abs2, a) evals = 1 samples = 64 seconds = 0.5
+    return median(Float64[s.time for s in b.samples])
+end
+"Achieved kHz under load: max over cores, sampled right after the anchor while the core is still hot."
+function _achieved_khz()
+    best = 0
+    for d in readdir("/sys/devices/system/cpu"; join = true)
+        f = joinpath(d, "cpufreq", "scaling_cur_freq")
+        isfile(f) || continue
+        v = tryparse(Int, strip(read(f, String)))
+        isnothing(v) || (best = max(best, v))
+    end
+    return best
+end
+
 function save_cache(path, groups)
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
@@ -1200,9 +1236,20 @@ function save_cache(path, groups)
         # than the kernel. Stamping the resolved values makes a cache reproducible from its own header —
         # if two runs disagree, diff `tune=` first.
         ts = Libc.strftime("%Y-%m-%dT%H:%M", time())
+        anc = try
+            _anchor_secs()
+        catch
+            NaN
+        end
+        khz = try
+            _achieved_khz()
+        catch
+            0
+        end
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
-            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())"
+            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())",
+            "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz"
         )
         # v3 record: ONE LINE PER CELL, one field per measured arm, each carrying its own timestamp and
         # commit. Per-arm provenance is what makes `arms=pb` safe to use: it rewrites only the pb field,
