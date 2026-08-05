@@ -1172,7 +1172,10 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
     function _measure_sytrf_cmult(::Type{T})::Int where {T}
         Base.generating_output() && return 1
         try
-            nloc = 384
+            nloc = 1024          # PROBE REGIME: sytrf gates comfortably at n<=1024 (1.10-3.81) and is
+            # decided ONLY at n=2048/4096 (0.988 both). Probing at 384 chose a multiplier that suits a
+            # size the gate never fails at — measured 2026-08-05: with the median estimator that pick
+            # cost the row 1.073 -> 0.989 (5 runs, stable). Probe where the ratio is tight.
             Am = Matrix{T}(undef, nloc, nloc)
             ipv = Vector{Int}(undef, nloc)
             refill! = () -> begin                       # deterministic Hermitian indefinite
