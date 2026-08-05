@@ -1050,7 +1050,7 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             best = 4; bt = typemax(UInt64)
             for np in (1, 2, 4, 8)
                 t = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, np); reps = 5)
-                t < bt && (bt = t; best = np)
+                _tune_better(t, bt) && (bt = t; best = np)
             end
             return best
         catch

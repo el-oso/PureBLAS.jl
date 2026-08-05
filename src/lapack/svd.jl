@@ -546,7 +546,7 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
                     s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); ts[r] = time_ns() - s
                 end
                 sort!(ts); t = ts[3]
-                t < bt && (bt = t; best = nb)
+                _tune_better(t, bt) && (bt = t; best = nb)
             end
             return best
         catch
