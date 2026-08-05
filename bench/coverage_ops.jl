@@ -43,12 +43,18 @@ for path in ARGS
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         haskey(d, "pb") || continue
+        # THE RATIO IS FORMED EXACTLY AS plots.jl DOES IT: elementwise over the sorted sample vectors
+        # (`_ratio` = qref ./ qpb), then ONE median over all of them. This used to take the median of
+        # per-round medians instead, which is a different statistic and DISAGREES AT MARGINAL CELLS —
+        # measured 2026-08-05: galen iamax n=1e6 read 1.0077 vs the gate's 1.0085, and Zen5 iamax
+        # n=1e3 flipped verdict outright (round-pooled <1.0, gate 1.007). A published coverage table
+        # that can say 🐢 where the gate says PASS is worse than no table.
         rs = Float64[]
         for r in ("openblas", "aocl")
             haskey(d, r) || continue
-            n = min(length(d[r]), length(d["pb"])) ÷ QN
-            n == 0 && continue
-            push!(rs, med([med([d[r][(i - 1) * QN + q] / d["pb"][(i - 1) * QN + q] for q in 1:QN]) for i in 1:n]))
+            m = min(length(d[r]), length(d["pb"]))
+            m == 0 && continue
+            push!(rs, med([d[r][i] / d["pb"][i] for i in 1:m]))
         end
         isempty(rs) && continue
         push!(get!(cells, (lvlof(lvl), op, ua), Tuple{Int, Float64}[]), (sz, minimum(rs)))  # vs the FASTER ref
