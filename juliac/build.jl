@@ -62,11 +62,21 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # And `zaxpy_narrow`: the complex-axpy width decision is a Measure-tier OncePerProcess benchmark, so it
 # allocates a probe buffer and is not trim-safe. `true` = the narrow arm, measured best on Zen4 and the
 # arm that closes the zaxpy gate cells; a trim build for a true-512-bit datapath should re-pin it.
+# And the two REAL-axpy shape knobs, `axpy_unroll` (L1..L3 band) and `axpy_dram` (past L3). Both are
+# Measure-tier OncePerProcess benchmarks that allocate a probe buffer, so both must be pinned or
+# `daxpy_64_` fails trim checking — which is exactly what it did. They are SEPARATE knobs measured in
+# separate regimes and must be pinned separately; collapsing them onto one value is what the
+# `_axpy_dram` fallback used to do. Codes: u = interleaved(u); 100+u = phase(u, full width);
+# 200+u = phase(u, narrow/256-bit). 4 = interleaved-4, the arm that is correct on every box measured.
+const _prev_axu = load_preference(PUREBLAS_UUID, "axpy_unroll")
+const _prev_axd = load_preference(PUREBLAS_UUID, "axpy_dram")
 const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
 set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
+set_preferences!(PUREBLAS_UUID, "axpy_unroll" => 4; force = true)        # real-axpy band shape (Measure tier)
+set_preferences!(PUREBLAS_UUID, "axpy_dram" => 4; force = true)          # real-axpy DRAM shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
@@ -93,6 +103,16 @@ finally
         delete_preferences!(PUREBLAS_UUID, "zaxpy_narrow"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => _prev_zaxn; force = true)
+    end
+    if _prev_axu === nothing
+        delete_preferences!(PUREBLAS_UUID, "axpy_unroll"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "axpy_unroll" => _prev_axu; force = true)
+    end
+    if _prev_axd === nothing
+        delete_preferences!(PUREBLAS_UUID, "axpy_dram"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "axpy_dram" => _prev_axd; force = true)
     end
     if _prev_brd === nothing
         delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)
