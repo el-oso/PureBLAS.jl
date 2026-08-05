@@ -43,37 +43,108 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 # unrolled step (the HW prefetcher can't be relied on there) hides it (measured: neuromancer ger n=4096
 # 0.88→~1.0). The prefetch may reach up to `pf` elements past the column end; `llvm.prefetch` lowers to a
 # non-faulting `prefetcht0`, so that's safe. Distance `pf` is a derived const (see `_GER_PF_BYTES`).
-@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T <: BlasReal}
-    px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
-    GC.@preserve x y begin
-        va = V(a)
-        i = 0
-        while i + step <= n
-            o = i * sz
-            if pf > 0                                 # const-folds OFF when pf==0 (default / axpy)
-                pb = py + (i + pf) * sz
-                for c in 0:_CACHELINE:(step * sz - 1)
-                    _prefetch(pb + c)
-                end   # one prefetch per line
+# The unrolled body, U vectors per iteration. `U` is a `Val` so each arm is its own straight-line code.
+@generated function _axpy_unrolled!(::Val{U}, n::Int, a::T, x, y, pf::Int) where {U, T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    body = [:(vstore(muladd(va, vload($V, px + o + $(j * W * sz)), vload($V, py + o + $(j * W * sz))),
+                     py + o + $(j * W * sz))) for j in 0:(U - 1)]
+    return quote
+        $(Expr(:meta, :inline))
+        px = _ptr(x); py = _ptr(y); sz = $sz; step = $(U * W)
+        GC.@preserve x y begin
+            va = $V(a)
+            i = 0
+            while i + step <= n
+                o = i * sz
+                if pf > 0                             # const-folds OFF when pf==0 (default / axpy)
+                    pb = py + (i + pf) * sz
+                    for c in 0:_CACHELINE:(step * sz - 1)
+                        _prefetch(pb + c)
+                    end
+                end
+                $(body...)
+                i += step
             end
-            vstore(muladd(va, vload(V, px + o), vload(V, py + o)), py + o)
-            vstore(muladd(va, vload(V, px + o + W * sz), vload(V, py + o + W * sz)), py + o + W * sz)
-            vstore(muladd(va, vload(V, px + o + 2W * sz), vload(V, py + o + 2W * sz)), py + o + 2W * sz)
-            vstore(muladd(va, vload(V, px + o + 3W * sz), vload(V, py + o + 3W * sz)), py + o + 3W * sz)
-            i += step
+            while i + $W <= n
+                o = i * sz
+                vstore(muladd(va, vload($V, px + o), vload($V, py + o)), py + o)
+                i += $W
+            end
+            while i < n
+                j = i + 1
+                unsafe_store!(py, muladd(a, unsafe_load(px, j), unsafe_load(py, j)), j)
+                i += 1
+            end
         end
-        while i + W <= n
-            o = i * sz
-            vstore(muladd(va, vload(V, px + o), vload(V, py + o)), py + o)
-            i += W
-        end
-        while i < n
-            j = i + 1
-            unsafe_store!(py, muladd(a, unsafe_load(px, j), unsafe_load(py, j)), j)
-            i += 1
+        return y
+    end
+end
+
+# AXPY UNROLL — PDM **Measure** tier, and the fleet is what proves it cannot be Derived.
+#
+# The optimum number of vectors in flight for a streaming read-modify-write is a property of the memory
+# path, and on THIS fleet the analogous knob inverts end to end: `ger_np`, the concurrent write-stream
+# count measured per host, resolves to 8 on Zen4, 4 on Zen3 and 1 on Zen5. Same physical question, three
+# different answers — the req#8b tell that no formula over the detected consts predicts it.
+#
+# The fleet also says the shipped literal 4 is wrong somewhere. Per-size gate ratios (2026-08-05):
+#     Zen3  1.049 1.013 1.002 1.000 0.995 0.988 1.005   isolated dip at 1e5-3e5
+#     Zen4  1.095 1.025 1.007 1.002 1.009 1.007 0.986   fine until 1e6
+#     Zen5  1.040 1.057 0.997 0.992 0.991 0.979 0.979   MONOTONE decline from the first size past L1
+# Zen5 degrades from n=1e4 onward — its L1d is 48 KiB/core, so 1e4 (160 KB working set) is the first
+# size that leaves L1 — and it is also the box that wants ONE write stream. A fixed 4-wide unroll is the
+# widest streaming shape we ship, on the box that measurably prefers the narrowest.
+#
+# CANDIDATE SET is Derived: {2, 4, 8} vectors, bounded by the register file (`_NVREG`), spanning the
+# range the fleet demonstrates is needed — `asum` wanted WIDER (4->8 closed dzasum on Zen4), Zen5's axpy
+# slope points NARROWER. PROBE REGIME is Derived from where the misses actually start: just past L1,
+# which is the first failing size on the worst box (the sytrf lesson — probe where the gate is decided,
+# not at a convenient size).
+const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
+@static if isnothing(_AXPY_UNROLL_PREF)
+    function _measure_axpy_unroll()::Int
+        Base.generating_output() && return _UNROLL          # never burn a measure during precompile
+        try
+            n = max(4096, 4 * _L1_BYTES ÷ sizeof(Float64))  # past L1 — where the fleet's misses begin
+            x = fill(1.0, n); y = fill(0.5, n)
+            best = _UNROLL; bt = typemax(UInt64)
+            GC.@preserve x y begin
+                px = pointer(x); py = pointer(y)
+                for u in (2, 4, 8)
+                    u * _vwidth(Float64) <= _NVREG || continue
+                    t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
+                    t < bt && (bt = t; best = u)
+                end
+            end
+            return best
+        catch
+            return _UNROLL
         end
     end
-    return y
+    const _AXPY_UNROLL_ONCE = Base.OncePerProcess{Int}(_measure_axpy_unroll)
+    @inline _axpy_unroll() = _AXPY_UNROLL_ONCE()
+else
+    @inline _axpy_unroll() = _AXPY_UNROLL_PREF::Int
+end
+
+# Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
+# dynamic `Val(u)` in the hot path, so this stays allocation-free and StrictMode-clean).
+@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T <: BlasReal}
+    # THE KNOB ONLY GOVERNS WHERE IT WAS MEASURED. `_measure_axpy_unroll` probes past L1, so its answer
+    # applies past L1 and nowhere else — the probe-regime rule, and here it is not academic. Measured on
+    # Zen4 (freq-locked, plots.jl) with the tuned value applied at EVERY size, against the fixed 4:
+    #     1k 1.095->1.046 | 3k 1.025->1.012 | 10k 1.007->0.997 | 30k 1.002->1.000
+    #     100k 1.009->1.015 | 300k 1.007->1.018 | 1e6 0.986->0.993
+    # Narrow wins past L2 and LOSES inside it: applying one value everywhere traded the n=1e6 miss for a
+    # new n=1e4 miss. The optimum is size-dependent as well as machine-dependent, so the residency split
+    # is part of the knob, not a detail.
+    # Short calls (complex `ger` per column, tails) also skip the OncePerProcess lookup entirely.
+    (n < 4 * _UNROLL * _vwidth(T) || n * sizeof(T) <= _L1_BYTES) &&
+        return _axpy_unrolled!(Val(_UNROLL), n, a, x, y, pf)
+    u = _axpy_unroll()
+    return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, pf) :
+        u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, pf) :
+        _axpy_unrolled!(Val(4), n, a, x, y, pf)
 end
 
 @inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
