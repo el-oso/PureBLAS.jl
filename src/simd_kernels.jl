@@ -536,10 +536,25 @@ const _UNROLL = 4
     return s
 end
 
+# EIGHT accumulators, not four — **Derive**: cover the FP-add LATENCY across the add pipes. Each vector
+# costs one load, one `abs` (a `vandpd`) and one `vaddpd` into an accumulator, so the loop's floor is set
+# by how many INDEPENDENT add chains are in flight: chains >= add_latency x add_pipes. On Zen4 that is
+# ~4 cycles x 2 pipes = 8; four chains leaves the pipes idle half the time.
+# MEASURED, and this is why it matters (wintermute, freq-locked, `bench/cellrep.jl`): at 16 KB of
+# L1-resident data our 4-chain kernel ran 2000 doubles in ~316 cycles = 1.26 cycles/vector where L1 can
+# sustain ~1.0. OpenBLAS ships TWO kernels for this and we tie the slower one:
+#     dasum_k_COOPERLAKE   4x zmm, 256 B/iter, serial fold   -> we WIN 1.227 (asum n=2000)
+#     zasum_k_COOPERLAKE   8x zmm, 512 B/iter, pipelined     -> we LOSE 0.960 (dzasum n=1000)
+# Same 16 KB, same PB time either way (112.4 vs 112.6 ns) — the complex reinterpret costs nothing, the
+# gap is purely that our shared kernel is 4-wide against their 8-wide. `dzasum`/`asum` bind against
+# OpenBLAS at EVERY size on this fleet (AOCL runs 7.6-19.5x slower — it never implemented these), so
+# the 8-wide kernel is the target to match.
+# Registers are not a constraint: 8 of 32 zmm on AVX-512, 8 of 16 ymm on AVX2.
 @inline function _asum_simd(n::Int, x, ::Type{T}) where {T <: BlasReal}
-    px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
+    px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = 8 * W
     GC.@preserve x begin
         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+        a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
         i = 0
         while i + step <= n
             o = i * sz
@@ -547,9 +562,13 @@ end
             a1 += abs(vload(V, px + o + W * sz))
             a2 += abs(vload(V, px + o + 2W * sz))
             a3 += abs(vload(V, px + o + 3W * sz))
+            a4 += abs(vload(V, px + o + 4W * sz))
+            a5 += abs(vload(V, px + o + 5W * sz))
+            a6 += abs(vload(V, px + o + 6W * sz))
+            a7 += abs(vload(V, px + o + 7W * sz))
             i += step
         end
-        acc = (a0 + a1) + (a2 + a3)
+        acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))   # balanced fold, log depth
         while i + W <= n
             acc += abs(vload(V, px + i * sz))
             i += W
