@@ -446,63 +446,50 @@ end
 
 # The size test comes FIRST so short calls (complex `ger`, per column) never even reach the
 # OncePerProcess lookup and run byte-identical code to before.
-# L1..L2 BAND KNOB — the hole this kernel had. The phase body already existed but was reachable ONLY
-# past L2, and Zen5's failing cell is n=1e4 = 160 KB per array, comfortably INSIDE its 1 MB L2, so it
-# never saw the structure that helps it (replicated K=10: 0.8846, 10/10 below 1.0). Exactly the gap that
-# cost real `axpy` four iterations: a band with no knob, and a probe measured outside the band it governs.
+# THE L1..L2 BAND — PDM **Derive** tier, criterion = WORKING-SET RESIDENCY IN L1.
 #
-# PROBE AT THE GEOMETRIC MIDDLE of (L1, L2]. Cache-transition effects scale with log(size), so the
-# midpoint that represents a band is sqrt(L1*L2) — on Zen5 that is ~221 KB against a failing cell at
-# 160 KB, i.e. in-band and near it. Probing at an endpoint is what picked wrong for real axpy twice.
-# Candidates: 0 = wide interleaved (incumbent), 4 = phase at narrow lanes, 8 = phase at full width. The
-# SET is derived from the ISA (narrow = 256-bit, full = `_vwidth`); the CHOICE is measured, with
-# `_tune_better`'s 5% margin so an indistinguishable pair resolves to the incumbent every load.
-const _ZAXPY_BAND_PREF = @load_preference("zaxpy_band", nothing)
-@static if isnothing(_ZAXPY_BAND_PREF)
-    function _measure_zaxpy_band()::Int
-        Base.generating_output() && return 0
-        try
-            bytes = Base.isqrt(_L1_BYTES * _L2_BYTES)          # geometric middle of the band
-            n = max(1024, bytes ÷ (2 * sizeof(Float64)))
-            x = fill(ComplexF64(1.0, 0.5), n); y = fill(ComplexF64(0.25, -0.75), n)
-            # `LANES` counts REAL lanes (`cpx = LANES÷2`), so the arm that matches `_axpy_cmplx_wide!`'s
-            # `Vec{2W,T}` is 2*_vwidth — same vector, same shuffle, ONLY the phase separation differs.
-            # That makes arm 3 a pure structure-vs-width A/B, which is the whole lesson from real axpy.
-            W = 2 * _vwidth(Float64); nl = _zaxpy_narrow_lanes(Float64)
-            best = 0
-            bt = _tune_one(() -> _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y); reps = 9)
-            t = _tune_one(() -> _axpy_cmplx_phase!(Val(nl), n, 1.0e-9, 0.0, x, y); reps = 9)
-            _tune_better(t, bt) && (bt = t; best = 1)
-            if W != nl
-                t = _tune_one(() -> _axpy_cmplx_phase!(Val(W), n, 1.0e-9, 0.0, x, y); reps = 9)
-                _tune_better(t, bt) && (bt = t; best = 2)
-            end
-            return best
-        catch
-            return 0
-        end
-    end
-    const _ZAXPY_BAND_ONCE = Base.OncePerProcess{Int}(_measure_zaxpy_band)
-    @inline _zaxpy_band() = _ZAXPY_BAND_ONCE()
-else
-    @inline _zaxpy_band() = _ZAXPY_BAND_PREF::Int
-end
-
+# `bytes` counts ONE complex array, but axpy touches TWO streams (x read, y read-modify-write), so the
+# footprint is `2*bytes`. The measured crossover is exactly where that footprint stops fitting in L1:
+# while both streams are L1-resident the interleaved body's shorter dependency chain wins; once they are
+# not, the phase-separated body's batched loads (more outstanding misses) win. Hence `2*bytes <= _L1`.
+#
+# Measured, all three µarchs, freq-locked, Chairmarks median, vs the live OpenBLAS (bench/probes/
+# zaxpy_arms.jl). "wide" = interleaved incumbent, "ph" = 256-bit phase; ratios are PB/OB:
+#            Zen5 (L1 48K)          Zen4 (L1 32K)          Zen3 (L1 32K)
+#   n=1000   1.386 / 1.222  wide    1.094 / 1.092  tie     (L1-resident, wide kept)
+#   n=2000   0.905 / 1.024  PH      1.014 / 1.011  tie
+#   n=3000   0.919 / 1.037  PH      1.002 / 1.009  PH
+#   n=6000   0.891 / 1.025  PH      0.875 / 0.998  PH
+#   n=1e4    0.871 / 1.011  PH      0.999 / 1.003  PH      0.999 / 1.011  PH
+#   n=2e4    1.005 / 1.004  tie     0.988 / 1.004  PH
+#   n=6e4    0.996 / 0.988  tie     0.955 / 1.014  PH
+# The rule predicts every point: Zen5 n=1000 is 32K ≤ 48K L1 ⇒ wide (1.386, and phase would cost 12pp);
+# Zen5 n=2000 is 64K > 48K ⇒ phase (0.905 → 1.024). It also repairs Zen4 cells this campaign was not
+# even chasing (n=6000 0.875 → 0.998, n=6e4 0.955 → 1.014).
+#
+# WHY DERIVE AND NOT MEASURE: an on-host `OncePerProcess` A/B here read 2,2,0,0,2,2,1,2 across eight
+# fresh processes on ONE box — the arm times differ by less than the run-to-run noise of a ~5 µs call, so
+# the knob selected on noise and landed on the WRONG arm (code 2, ~0.89) while the true winner was +15%.
+# A residency criterion is const-folded, trim-safe, and identical every load. This is the req#8b "Yes ⇒
+# Derive" branch: the optimum IS predictable from a detected const.
+#
+# The old "phase is CATASTROPHIC while resident (78.6 vs 129.7 at n=1e3)" note is NOT reproducible and is
+# retired: that measurement predates the `@generated`/`@inline` meta fix, which is exactly the bug that
+# made `Vec` args pass BY POINTER and demoted the caller's accumulators. At n=1000 the two now tie on
+# Zen4 (184.6 vs 184.9). Zen5 still prefers wide deep in L1, which the residency cut already honours.
 @inline function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
-    bytes = n * 2 * sizeof(T)
-    if bytes > _L2_BYTES && _zaxpy_narrow()
-        return _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y)
-    end
-    # L1-resident stays on the incumbent: those sizes gate today and the band probe never saw them.
-    if bytes > _L1_BYTES && bytes <= _L2_BYTES
-        # The knob is a CODE (0/1/2), not a lane count: it is probed once on Float64 but consumed for every
-        # T, and a lane count would match no arm at all for Float32 (narrow 8, full 32 vs a Float64 answer
-        # of 4) — caxpy would silently keep the incumbent while zaxpy moved. Codes map per-T.
-        b = _zaxpy_band()
-        b == 1 && return _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y)
-        b == 2 && return _axpy_cmplx_phase!(Val(2 * _vwidth(T)), n, alr, ali, x, y)
-    end
-    return _axpy_cmplx_wide!(n, alr, ali, x, y)
+    bytes = n * 2 * sizeof(T)                       # ONE array; the footprint is 2*bytes
+    # Past L2 keeps its own **Measure** knob untouched — it is a datapath question (see `_zaxpy_narrow`),
+    # it was measured in its own regime, and those sizes gate today.
+    bytes > _L2_BYTES && return _zaxpy_narrow() ?
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_wide!(n, alr, ali, x, y)
+    # Derived band rule. Narrow lanes (256-bit) — NOT full width: at n=1e4 on Zen5 the full-width phase
+    # arm measured 0.890 against the narrow arm's 1.011, so the win is the SCHEDULING STRUCTURE, not the
+    # vector width. Same conclusion as real axpy, reached independently here.
+    return 2 * bytes > _L1_BYTES ?
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
 
 @generated function _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
