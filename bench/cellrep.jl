@@ -131,6 +131,11 @@ end
 
 # Arms back-to-back in ONE process so the ratio cancels this process's common-mode state; the ACROSS
 # process variation is what the K replications sample.
+# BLIS reads these at init (BEFORE the dlopen `using AOCL_jll` triggers), exactly as plots.jl:58 does.
+# Without them the AOCL arm silently auto-threads past its small-n threshold whenever the CALLING SHELL
+# doesn't export them (measured 2026-08-05, neuromancer bare ssh env: daxpy n=3e5 AOCL arm 0.69 ms vs
+# 2.9 ms single-threaded — a 4x phantom "win" that would poison every large-n screen).
+ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
 using AOCL_jll
 out = Dict{String, Float64}()
 for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
