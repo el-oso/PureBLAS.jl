@@ -2,15 +2,28 @@
 # backend. These are what direct Julia callers (and AD) use — e.g. `PureBLAS.dot(x, y)`,
 # `PureBLAS.axpy!(y, a, x)`. AD-traceable because the whole call tree is plain Julia source.
 
-axpy!(y::AbstractVector, a::Number, x::AbstractVector) = axpy!(DEFAULT_BACKEND, y, a, x)
-scal!(a::Number, x::AbstractVector) = scal!(DEFAULT_BACKEND, a, x)
-blascopy!(y::AbstractVector, x::AbstractVector) = blascopy!(DEFAULT_BACKEND, y, x)
-swap!(x::AbstractVector, y::AbstractVector) = swap!(DEFAULT_BACKEND, x, y)
-dot(x::AbstractVector, y::AbstractVector) = dot(DEFAULT_BACKEND, x, y)
-dotu(x::AbstractVector, y::AbstractVector) = dotu(DEFAULT_BACKEND, x, y)
-nrm2(x::AbstractVector) = nrm2(DEFAULT_BACKEND, x)
-asum(x::AbstractVector) = asum(DEFAULT_BACKEND, x)
-iamax(x::AbstractVector) = iamax(DEFAULT_BACKEND, x)
+# `@inline` for the same reason the Level-2 entries below carry it, and it is a MEASURED gate lever.
+# b129a3c inlined the backend layer (backend.jl) and the level1.jl kernels, which closed axpy/asum/
+# zdotc/zscal on Zen4 — but it stopped one frame short: these nine forwards stayed out-of-line, so
+# every public BLAS-1 call still paid one un-inlined frame. `scal` was the op where that residue was
+# visible, and it did not move at all in b129a3c, which is what pointed here.
+# Measured on wintermute (freq-locked, bench/probes/scal_live.jl, which reproduces plots.jl's regime —
+# fresh arrays per sample, `reps` dependent passes per sample) at the n=10000 gate cell:
+#     PureBLAS.scal!  0.9855-0.9935  |  _scal!(length(x),…) direct  1.0007-1.0026  |  bare loop  1.0058
+# i.e. the kernel already BEATS OpenBLAS and this frame gave the win back — the same shape as the
+# `_axpy!` finding (level1.jl:51), one layer up.
+# NOTE the regime matters: a probe timing ONE call per sample (bench/probes/scal_entry.jl) reports this
+# frame at +0.1 ns, because out-of-line call overhead is amortised differently when it is not inside a
+# tight rep loop. The gate measures the rep loop; measure the frame there too.
+@inline axpy!(y::AbstractVector, a::Number, x::AbstractVector) = axpy!(DEFAULT_BACKEND, y, a, x)
+@inline scal!(a::Number, x::AbstractVector) = scal!(DEFAULT_BACKEND, a, x)
+@inline blascopy!(y::AbstractVector, x::AbstractVector) = blascopy!(DEFAULT_BACKEND, y, x)
+@inline swap!(x::AbstractVector, y::AbstractVector) = swap!(DEFAULT_BACKEND, x, y)
+@inline dot(x::AbstractVector, y::AbstractVector) = dot(DEFAULT_BACKEND, x, y)
+@inline dotu(x::AbstractVector, y::AbstractVector) = dotu(DEFAULT_BACKEND, x, y)
+@inline nrm2(x::AbstractVector) = nrm2(DEFAULT_BACKEND, x)
+@inline asum(x::AbstractVector) = asum(DEFAULT_BACKEND, x)
+@inline iamax(x::AbstractVector) = iamax(DEFAULT_BACKEND, x)
 
 # Level 2. @inline + explicit kwarg forwarding (no `kw...` splat) so the keyword-argument overhead
 # is elided at the call site — it otherwise dominates tiny-matrix gemv (~200 ns vs a ~33 ns kernel).
