@@ -80,6 +80,52 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
     end
 end
 
+# PHASE-SEPARATED body: all U loads+FMAs issued, THEN all U stores. `L` is the lane count, so `L = W`
+# is full width and `L = W÷2` is the narrow (256-bit) variant.
+#
+# THIS IS THE SHAPE OF THE BINDING KERNEL. AOCL's `bli_daxpyv_zen_int_avx512` (objdump, libblis-mt.so
+# +0xac030) runs 8 zmm per iteration as a rolling two-half-block pipeline: x-loads issued ahead, y folded
+# into the FMA memory operands, and the STORES BATCHED AT THE BLOCK TAIL. Our shipped body interleaves
+# load/FMA/store per vector, which caps how far ahead the load stream can run. Batching the stores raises
+# outstanding-load MLP WITHOUT adding write streams — which is exactly the trade Zen5 wants (it is the
+# one box whose measured `ger_np` is 1, i.e. fewest write streams) and it explains why every WIDTH change
+# there did nothing while this structural one does. Same lesson as the iamax max-tree: on this fleet Zen5
+# responds to scheduling structure, not to how many vectors are in flight.
+@generated function _axpy_phase!(::Val{U}, ::Val{L}, n::Int, a::T, x, y) where {U, L, T <: BlasReal}
+    W = _vwidth(T); V = Vec{W, T}; VL = Vec{L, T}; sz = sizeof(T)
+    xs = [Symbol(:xv, j) for j in 0:(U - 1)]
+    ys = [Symbol(:yv, j) for j in 0:(U - 1)]
+    lds = [:($(xs[j + 1]) = vload($VL, px + o + $(j * L * sz))) for j in 0:(U - 1)]
+    fms = [:($(ys[j + 1]) = muladd(va, $(xs[j + 1]), vload($VL, py + o + $(j * L * sz)))) for j in 0:(U - 1)]
+    sts = [:(vstore($(ys[j + 1]), py + o + $(j * L * sz))) for j in 0:(U - 1)]
+    return quote
+        $(Expr(:meta, :inline))
+        px = _ptr(x); py = _ptr(y)
+        GC.@preserve x y begin
+            va = $VL(a); vaw = $V(a)
+            i = 0; step = $(U * L)
+            while i + step <= n
+                o = i * $sz
+                $(lds...)                             # all loads + FMAs first
+                $(fms...)
+                $(sts...)                             # then all stores, batched at the block tail
+                i += step
+            end
+            while i + $W <= n
+                o = i * $sz
+                vstore(muladd(vaw, vload($V, px + o), vload($V, py + o)), py + o)
+                i += $W
+            end
+            while i < n
+                j = i + 1
+                unsafe_store!(py, muladd(a, unsafe_load(px, j), unsafe_load(py, j)), j)
+                i += 1
+            end
+        end
+        return y
+    end
+end
+
 # AXPY UNROLL — PDM **Measure** tier, and the fleet is what proves it cannot be Derived.
 #
 # The optimum number of vectors in flight for a streaming read-modify-write is a property of the memory
@@ -105,15 +151,33 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
     function _measure_axpy_unroll()::Int
         Base.generating_output() && return _UNROLL          # never burn a measure during precompile
         try
-            n = max(4096, 4 * _L1_BYTES ÷ sizeof(Float64))  # past L1 — where the fleet's misses begin
+            # PROBE IN THE MIDDLE OF THE BAND IT GOVERNS. This knob covers L1 < bytes <= L3, and probing
+# at 4xL1 picked a shape that wins at 128 KB and LOSES at 800 KB / 2.4 MB — the sizes that
+# actually fail on Zen4 (1e5, 3e5). 2xL2 sits above L2 and inside L3 on every fleet box.
+n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
             x = fill(1.0, n); y = fill(0.5, n)
+            W = _vwidth(Float64)
             best = _UNROLL; bt = typemax(UInt64)
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
+                # SHAPE x DEPTH, not depth alone. Codes: u -> interleaved(u); 100+u -> phase(u, full
+                # width); 200+u -> phase(u, narrow/256-bit). Measured in situ (Fable's A/B, three fresh
+                # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
+                # by ~2.6pp, while the interleaved-8 control reproduces the earlier width falsification
+                # (0.99). Zen4/Zen3 keep an interleaved arm. Depth alone could never express this.
                 for u in (2, 4, 8)
-                    u * _vwidth(Float64) <= _NVREG || continue
+                    u * W <= _NVREG || continue
                     t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
                     t < bt && (bt = t; best = u)
+                end
+                for u in (4, 8)
+                    u * W <= _NVREG || continue
+                    t = _tune_one(() -> _axpy_phase!(Val(u), Val(W), n, 1.0e-9, px, py); reps = 5)
+                    t < bt && (bt = t; best = 100 + u)
+                end
+                if W >= 8                                    # a narrow arm only exists at 512-bit
+                    t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
+                    t < bt && (bt = t; best = 208)
                 end
             end
             return best
@@ -122,9 +186,44 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
         end
     end
     const _AXPY_UNROLL_ONCE = Base.OncePerProcess{Int}(_measure_axpy_unroll)
-    @inline _axpy_unroll() = _AXPY_UNROLL_ONCE()
+    @inline _axpy_shape_cache() = _AXPY_UNROLL_ONCE()
+
+    # SECOND KNOB, DRAM REGIME. One knob cannot serve both bands: probed at 4xL1 the winner was the
+    # narrow phase body, and shipping it everywhere past L1 REGRESSED the L2/L3 cells on Zen4
+    # (n=1e5 1.018 -> 0.986, n=3e5 1.020 -> 0.981) while helping only past L3. Same lesson as the first
+    # split — a Measure knob governs the regime it was probed in, and nothing else. Probe at 2xL3, which
+    # is unambiguously DRAM-resident on every fleet box.
+    function _measure_axpy_dram()::Int
+        Base.generating_output() && return _UNROLL
+        try
+            n = max(4096, 2 * _L3_BYTES ÷ sizeof(Float64))
+            x = fill(1.0, n); y = fill(0.5, n)
+            W = _vwidth(Float64)
+            best = _UNROLL; bt = typemax(UInt64)
+            GC.@preserve x y begin
+                px = pointer(x); py = pointer(y)
+                for u in (2, 4)
+                    t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
+                    t < bt && (bt = t; best = u)
+                end
+                if W >= 8
+                    t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
+                    t < bt && (bt = t; best = 208)
+                end
+                t8 = _tune_one(() -> _axpy_phase!(Val(8), Val(W), n, 1.0e-9, px, py); reps = 5)
+                t8 < bt && (bt = t8; best = 108)
+            end
+            return best
+        catch
+            return _UNROLL
+        end
+    end
+    const _AXPY_DRAM_ONCE = Base.OncePerProcess{Int}(_measure_axpy_dram)
+    @inline _axpy_band() = _AXPY_UNROLL_ONCE()
+    @inline _axpy_dram() = _AXPY_DRAM_ONCE()
 else
-    @inline _axpy_unroll() = _AXPY_UNROLL_PREF::Int
+    @inline _axpy_band() = _AXPY_UNROLL_PREF::Int
+    @inline _axpy_dram() = _AXPY_UNROLL_PREF::Int
 end
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
@@ -141,10 +240,21 @@ end
     # Short calls (complex `ger` per column, tails) also skip the OncePerProcess lookup entirely.
     (n < 4 * _UNROLL * _vwidth(T) || n * sizeof(T) <= _L1_BYTES) &&
         return _axpy_unrolled!(Val(_UNROLL), n, a, x, y, pf)
-    u = _axpy_unroll()
-    return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, pf) :
-        u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, pf) :
-        _axpy_unrolled!(Val(4), n, a, x, y, pf)
+    # `pf > 0` (ger's prefetching caller) stays on the interleaved body: its prefetch distance is tuned
+    # against that step, and the phase bodies do not carry the prefetch block.
+    pf > 0 && return _axpy_unrolled!(Val(_UNROLL), n, a, x, y, pf)
+    # THREE REGIMES, each governed by a probe measured IN that regime. Applying one knob across the whole
+    # range above L1 regressed Zen4 twice: first the tuned DEPTH broke n=1e4, then the tuned SHAPE broke
+    # n=1e5/3e5 (1.018 -> 0.986 and 1.020 -> 0.981) while helping only past L3. Cache-resident streaming
+    # and DRAM streaming are different problems and get different knobs.
+    u = n * sizeof(T) > _L3_BYTES ? _axpy_dram() : _axpy_band()
+    W = _vwidth(T)
+    return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :
+        u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :
+        u == 104 ? _axpy_phase!(Val(4), Val(W), n, a, x, y) :
+        u == 108 ? _axpy_phase!(Val(8), Val(W), n, a, x, y) :
+        u == 208 ? _axpy_phase!(Val(8), Val(W ÷ 2), n, a, x, y) :
+        _axpy_unrolled!(Val(4), n, a, x, y, 0)
 end
 
 @inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
