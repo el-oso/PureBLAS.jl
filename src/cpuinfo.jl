@@ -274,12 +274,12 @@ function _tune_ab(fa::FA, fb::FB; reps::Int = 5) where {FA, FB}
 end
 
 """
-    _tune_one(f; reps=5) -> t
+    _tune_one(f; reps=9) -> t
 
 Median elapsed ns for a single candidate (for sweeps over a candidate SET, where each candidate is timed
 in its own call). Same estimator rule as `_tune_ab`.
 """
-function _tune_one(f::F; reps::Int = 5) where {F}
+function _tune_one(f::F; reps::Int = 9) where {F}
     ts = Vector{UInt64}(undef, reps)
     f()                                            # warmup, untimed
     for r in 1:reps
@@ -288,3 +288,19 @@ function _tune_one(f::F; reps::Int = 5) where {F}
     sort!(ts)
     return ts[(reps + 1) ÷ 2]
 end
+
+"""
+    _tune_better(t, best) -> Bool
+
+Should a candidate at time `t` displace the incumbent at `best`? Only if it wins by a MARGIN.
+
+WHY A MARGIN AND NOT `<`. A plain `t < best` switches on noise: when two candidates are within the
+probe's resolution the winner is whichever got the luckier window, so the pick changes from process to
+process — and since these knobs select a SHIPPED kernel, the emitted code then varies run to run.
+MEASURED on neuromancer (Zen5), 2026-08-05: two fresh processes of the SAME binary resolved the axpy
+DRAM knob to 208 and to 4. That is not a tuning result, it is a coin flip that changes what executes, and
+it feeds straight back into the run-to-run variance that makes that box hard to measure at all.
+5% is above the probes' resolution on every fleet box and far below the gaps worth switching for (the
+phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which is the derived default.
+"""
+@inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95

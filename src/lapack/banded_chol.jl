@@ -150,7 +150,7 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
                     refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
                 end
                 sort!(ts); t = ts[3]
-                t < tbest && (tbest = t; best = c)
+                _tune_better(t, tbest) && (tbest = t; best = c)
             end
             return best
         catch
@@ -212,7 +212,7 @@ const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
                     refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
                 end
                 sort!(ts); t = ts[3]
-                t < tbest && (tbest = t; best = c)
+                _tune_better(t, tbest) && (tbest = t; best = c)
             end
             return best
         catch

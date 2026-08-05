@@ -168,16 +168,16 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
                 for u in (2, 4, 8)
                     u * W <= _NVREG || continue
                     t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
-                    t < bt && (bt = t; best = u)
+                    _tune_better(t, bt) && (bt = t; best = u)
                 end
                 for u in (4, 8)
                     u * W <= _NVREG || continue
                     t = _tune_one(() -> _axpy_phase!(Val(u), Val(W), n, 1.0e-9, px, py); reps = 5)
-                    t < bt && (bt = t; best = 100 + u)
+                    _tune_better(t, bt) && (bt = t; best = 100 + u)
                 end
                 if W >= 8                                    # a narrow arm only exists at 512-bit
                     t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
-                    t < bt && (bt = t; best = 208)
+                    _tune_better(t, bt) && (bt = t; best = 208)
                 end
             end
             return best
@@ -204,14 +204,14 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
                 px = pointer(x); py = pointer(y)
                 for u in (2, 4)
                     t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
-                    t < bt && (bt = t; best = u)
+                    _tune_better(t, bt) && (bt = t; best = u)
                 end
                 if W >= 8
                     t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
-                    t < bt && (bt = t; best = 208)
+                    _tune_better(t, bt) && (bt = t; best = 208)
                 end
                 t8 = _tune_one(() -> _axpy_phase!(Val(8), Val(W), n, 1.0e-9, px, py); reps = 5)
-                t8 < bt && (bt = t8; best = 108)
+                _tune_better(t8, bt) && (bt = t8; best = 108)
             end
             return best
         catch

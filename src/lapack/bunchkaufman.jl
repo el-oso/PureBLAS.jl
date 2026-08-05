@@ -1205,7 +1205,7 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
                     ts[r] = time_ns() - s
                 end
                 sort!(ts); t = ts[3]
-                t < tbest && (tbest = t; best = m)
+                _tune_better(t, tbest) && (tbest = t; best = m)
             end
             return best
         catch

@@ -61,7 +61,7 @@ const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
                     refill!(); s = time_ns(); _pptrf_lower!(AP, n, c); ts[r] = time_ns() - s
                 end
                 sort!(ts); t = ts[3]
-                t < tbest && (tbest = t; best = c)
+                _tune_better(t, tbest) && (tbest = t; best = c)
             end
             return best
         catch
