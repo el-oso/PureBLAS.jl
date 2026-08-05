@@ -446,9 +446,61 @@ end
 
 # The size test comes FIRST so short calls (complex `ger`, per column) never even reach the
 # OncePerProcess lookup and run byte-identical code to before.
+# L1..L2 BAND KNOB — the hole this kernel had. The phase body already existed but was reachable ONLY
+# past L2, and Zen5's failing cell is n=1e4 = 160 KB per array, comfortably INSIDE its 1 MB L2, so it
+# never saw the structure that helps it (replicated K=10: 0.8846, 10/10 below 1.0). Exactly the gap that
+# cost real `axpy` four iterations: a band with no knob, and a probe measured outside the band it governs.
+#
+# PROBE AT THE GEOMETRIC MIDDLE of (L1, L2]. Cache-transition effects scale with log(size), so the
+# midpoint that represents a band is sqrt(L1*L2) — on Zen5 that is ~221 KB against a failing cell at
+# 160 KB, i.e. in-band and near it. Probing at an endpoint is what picked wrong for real axpy twice.
+# Candidates: 0 = wide interleaved (incumbent), 4 = phase at narrow lanes, 8 = phase at full width. The
+# SET is derived from the ISA (narrow = 256-bit, full = `_vwidth`); the CHOICE is measured, with
+# `_tune_better`'s 5% margin so an indistinguishable pair resolves to the incumbent every load.
+const _ZAXPY_BAND_PREF = @load_preference("zaxpy_band", nothing)
+@static if isnothing(_ZAXPY_BAND_PREF)
+    function _measure_zaxpy_band()::Int
+        Base.generating_output() && return 0
+        try
+            bytes = Base.isqrt(_L1_BYTES * _L2_BYTES)          # geometric middle of the band
+            n = max(1024, bytes ÷ (2 * sizeof(Float64)))
+            x = fill(ComplexF64(1.0, 0.5), n); y = fill(ComplexF64(0.25, -0.75), n)
+            # `LANES` counts REAL lanes (`cpx = LANES÷2`), so the arm that matches `_axpy_cmplx_wide!`'s
+            # `Vec{2W,T}` is 2*_vwidth — same vector, same shuffle, ONLY the phase separation differs.
+            # That makes arm 3 a pure structure-vs-width A/B, which is the whole lesson from real axpy.
+            W = 2 * _vwidth(Float64); nl = _zaxpy_narrow_lanes(Float64)
+            best = 0
+            bt = _tune_one(() -> _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y); reps = 9)
+            t = _tune_one(() -> _axpy_cmplx_phase!(Val(nl), n, 1.0e-9, 0.0, x, y); reps = 9)
+            _tune_better(t, bt) && (bt = t; best = 1)
+            if W != nl
+                t = _tune_one(() -> _axpy_cmplx_phase!(Val(W), n, 1.0e-9, 0.0, x, y); reps = 9)
+                _tune_better(t, bt) && (bt = t; best = 2)
+            end
+            return best
+        catch
+            return 0
+        end
+    end
+    const _ZAXPY_BAND_ONCE = Base.OncePerProcess{Int}(_measure_zaxpy_band)
+    @inline _zaxpy_band() = _ZAXPY_BAND_ONCE()
+else
+    @inline _zaxpy_band() = _ZAXPY_BAND_PREF::Int
+end
+
 @inline function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
-    if n * 2 * sizeof(T) > _L2_BYTES && _zaxpy_narrow()
+    bytes = n * 2 * sizeof(T)
+    if bytes > _L2_BYTES && _zaxpy_narrow()
         return _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y)
+    end
+    # L1-resident stays on the incumbent: those sizes gate today and the band probe never saw them.
+    if bytes > _L1_BYTES && bytes <= _L2_BYTES
+        # The knob is a CODE (0/1/2), not a lane count: it is probed once on Float64 but consumed for every
+        # T, and a lane count would match no arm at all for Float32 (narrow 8, full 32 vs a Float64 answer
+        # of 4) — caxpy would silently keep the incumbent while zaxpy moved. Codes map per-T.
+        b = _zaxpy_band()
+        b == 1 && return _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y)
+        b == 2 && return _axpy_cmplx_phase!(Val(2 * _vwidth(T)), n, alr, ali, x, y)
     end
     return _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
