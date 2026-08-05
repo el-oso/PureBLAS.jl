@@ -31,3 +31,12 @@ gemvt_perscan = false
 # buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
 # the shipping path here); the dogfood checks alloc-freeness, not perf.
 zaxpy_narrow = true
+# And the two REAL-axpy shape knobs, for the identical reason: each is a Measure-tier OncePerProcess
+# whose one-time init provably allocates (jl_set_precompile_field_replace, lock.jl:725), and `trmv!`
+# reaches `_axpy_simd!` per column (level2.jl:1661), so leaving them unpinned reddens the BLAS-2
+# all-paths noalloc proof — which is exactly how this surfaced. Values mirror juliac/build.jl so the
+# dogfood proves the same shipping path the .so ships; the dogfood checks alloc-freeness, not perf, and
+# bench/gate runs use the main (unpinned) env, so the Measure tier still auto-measures for real users.
+# Arm CORRECTNESS is covered directly by the "axpy shape arms" testitem, not by whatever these pin to.
+axpy_unroll = 4
+axpy_dram = 4
