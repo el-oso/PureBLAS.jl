@@ -533,22 +533,28 @@ const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
             A = fill(1.0, m, n); x = fill(1.0, m); y = fill(0.0, n)
             GC.@preserve A x y begin
                 pA = pointer(A); px = pointer(x); py = pointer(y); ld = stride(A, 2); sz = sizeof(Float64)
-                tb = typemax(UInt64); tp = typemax(UInt64)   # straight-line, no closures (constraint 1)
-                for r in 0:3                                 # r=0 untimed warmup; ABBA-interleaved after
+                # MEDIAN, not min. Kept straight-line (constraint 1: no closures here), so the samples go
+                # into vectors rather than through `_tune_ab`. min-of-3 was the shipped estimator until
+                # 2026-08-05; it is optimistic and tail-blind, and it selects which gemv-T path SHIPS.
+                nrep = 5
+                tbs = Vector{UInt64}(undef, nrep); tps = Vector{UInt64}(undef, nrep)
+                for r in 0:nrep                              # r=0 untimed warmup; interleaved after
                     s = time_ns()
                     j = 0
                     while j + 4 <= n
                         _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true))
                         j += 4
                     end
-                    e = time_ns() - s; r > 0 && (tb = min(tb, e))
+                    e = time_ns() - s; r > 0 && (tbs[r] = e)
                     s = time_ns()
                     @inbounds for jj in 0:(n - 1)
                         unsafe_store!(py, _dot_simd(m, pA + jj * ld * sz, px, Float64), jj + 1)
                     end
-                    e = time_ns() - s; r > 0 && (tp = min(tp, e))
+                    e = time_ns() - s; r > 0 && (tps[r] = e)
                 end
-                return tp < tb
+                sort!(tbs); sort!(tps)
+                mid = (nrep + 1) ÷ 2
+                return tps[mid] < tbs[mid]
             end
         catch
             return false
@@ -1038,13 +1044,12 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             n = 64                                               # columns (multiple of max NP=8)
             m = cld(2 * _L3_BYTES, n * sizeof(Float64))          # ~2×L3 rows ⇒ genuinely DRAM-bound
             A = fill(1.0, m, n); x = fill(1.0, m); y = fill(1.0, n)   # pre-touch pages (no first-touch bias)
+            # MEDIAN per candidate, not min (see cpuinfo.jl `_tune_one`). This knob has OPPOSITE SIGN
+            # across µarchs (Zen5→1, Zen3→4, Zen4→8), so it is exactly the case where the luckiest
+            # window of one candidate must not decide what ships.
             best = 4; bt = typemax(UInt64)
             for np in (1, 2, 4, 8)
-                _ger_paneldrv_np(m, n, 1.0, x, y, A, np)         # untimed warmup (absorbs this Val's JIT)
-                t = typemax(UInt64)
-                for _ in 1:4
-                    s = time_ns(); _ger_paneldrv_np(m, n, 1.0, x, y, A, np); t = min(t, time_ns() - s)
-                end
+                t = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, np); reps = 5)
                 t < bt && (bt = t; best = np)
             end
             return best

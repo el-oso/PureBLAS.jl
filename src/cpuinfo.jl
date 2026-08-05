@@ -238,3 +238,53 @@ end
 # mistuned 96 (which routed n=112–192 to the slower packed path, the AOCL misses) up to 256, routing the whole
 # gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on wintermute). req#8.
 @inline _at_symm_mat_max(hw, ::Type{T} = Float64) where {T} = Base.isqrt(hw.l2 ÷ sizeof(T))
+
+# ── PDM "Measure" tier: the estimator ───────────────────────────────────────────────────────────────
+# Measure-tier knobs run a real timing loop ON THE HOST, once per process, to pick a kernel variant or a
+# block size (zaxpy narrow-vs-wide, ger stream count, pstrf batched swap, gebrd nb, …). Those harnesses
+# cannot use Chairmarks — PureBLAS must not depend on it and must stay trim-safe — so `time_ns` is
+# unavoidable here, and this is the ONLY place in the package permitted to touch a clock.
+#
+# THE ESTIMATOR IS STILL THE MEDIAN. Until 2026-08-05 every one of these harnesses reduced with
+# `min(t, time_ns() - s)` over 3-5 samples. `min` is optimistic AND tail-blind: it reports the luckiest
+# window and is blind to exactly the tail behaviour that separates two kernels on real data. That is the
+# same estimator that ranked an iamax unroll backwards and cost a day — except a probe only misleads the
+# person reading it, whereas THIS selects the code that ships, on every machine PureBLAS runs on, and
+# `test/estimator_lint.jl` could not see it (it scanned bench/ only; it now scans src/ too).
+#
+# A/B INTERLEAVED, so drift between the two candidates is common-mode rather than assigned to whichever
+# ran second, and the first (cold) round is discarded.
+"""
+    _tune_ab(fa, fb; reps=5) -> (ta, tb)
+
+Median elapsed ns for two candidate implementations, measured alternately. Returns medians, never minima.
+`reps` is the number of TIMED rounds; one untimed warmup round runs first.
+"""
+function _tune_ab(fa::FA, fb::FB; reps::Int = 5) where {FA, FB}
+    ta = Vector{UInt64}(undef, reps)
+    tb = Vector{UInt64}(undef, reps)
+    fa(); fb()                                     # warmup, untimed (first touch + any JIT)
+    for r in 1:reps
+        s = time_ns(); fa(); ta[r] = time_ns() - s
+        s = time_ns(); fb(); tb[r] = time_ns() - s
+    end
+    sort!(ta); sort!(tb)
+    m = (reps + 1) ÷ 2
+    return (ta[m], tb[m])
+end
+
+"""
+    _tune_one(f; reps=5) -> t
+
+Median elapsed ns for a single candidate (for sweeps over a candidate SET, where each candidate is timed
+in its own call). Same estimator rule as `_tune_ab`.
+"""
+function _tune_one(f::F; reps::Int = 5) where {F}
+    ts = Vector{UInt64}(undef, reps)
+    f()                                            # warmup, untimed
+    for r in 1:reps
+        s = time_ns(); f(); ts[r] = time_ns() - s
+    end
+    sort!(ts)
+    return ts[(reps + 1) ÷ 2]
+end

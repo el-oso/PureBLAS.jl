@@ -1192,12 +1192,16 @@ const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)
                 nb = clamp(m * _sytrf_nb_shape(nloc), 16, 96)
                 nb >= nloc && continue
                 refill!(); _sytrf_blocked_lower!(Am, ipv, nb, true)      # untimed warmup
-                t = typemax(UInt64)
-                for _ in 1:3
+                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`). Bunch-Kaufman is data-dependent
+                # — the pivot sequence varies per refill — so the luckiest window is the worst possible
+                # summary of a block size.
+                ts = Vector{UInt64}(undef, 5)
+                for r in 1:5
                     refill!(); s = time_ns()
                     _sytrf_blocked_lower!(Am, ipv, nb, true)
-                    t = min(t, time_ns() - s)
+                    ts[r] = time_ns() - s
                 end
+                sort!(ts); t = ts[3]
                 t < tbest && (tbest = t; best = m)
             end
             return best
