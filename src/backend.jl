@@ -15,46 +15,46 @@ const DEFAULT_BACKEND = SIMDBackend()
     return length(x)
 end
 
-function axpy!(::SIMDBackend, y::AbstractVector, a::Number, x::AbstractVector)::AbstractVector
+@inline function axpy!(::SIMDBackend, y::AbstractVector, a::Number, x::AbstractVector)::AbstractVector
     _axpy!(_eqlen(x, y), a, x, 1, y, 1)
     return y
 end
 
-function scal!(::SIMDBackend, a::Number, x::AbstractVector)::AbstractVector
+@inline function scal!(::SIMDBackend, a::Number, x::AbstractVector)::AbstractVector
     _scal!(length(x), a, x, 1)
     return x
 end
 
 # Copy src `x` into dest `y` (`y .= x`).
-function blascopy!(::SIMDBackend, y::AbstractVector, x::AbstractVector)::AbstractVector
+@inline function blascopy!(::SIMDBackend, y::AbstractVector, x::AbstractVector)::AbstractVector
     _copy!(_eqlen(x, y), x, 1, y, 1)
     return y
 end
 
-function swap!(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Nothing
+@inline function swap!(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Nothing
     _swap!(_eqlen(x, y), x, 1, y, 1)
     return nothing
 end
 
 # Conjugated inner product conj(x)·y (matches LinearAlgebra.dot for complex).
-function dot(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
+@inline function dot(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
     return _dotc(_eqlen(x, y), x, 1, y, 1)
 end
 
 # Unconjugated inner product x·y (BLAS ?dotu).
-function dotu(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
+@inline function dotu(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
     return _dotu(_eqlen(x, y), x, 1, y, 1)
 end
 
-function nrm2(::SIMDBackend, x::AbstractVector)::Real
+@inline function nrm2(::SIMDBackend, x::AbstractVector)::Real
     return _nrm2(length(x), x, 1)
 end
 
-function asum(::SIMDBackend, x::AbstractVector)::Real
+@inline function asum(::SIMDBackend, x::AbstractVector)::Real
     return _asum(length(x), x, 1)
 end
 
-function iamax(::SIMDBackend, x::AbstractVector)::Integer
+@inline function iamax(::SIMDBackend, x::AbstractVector)::Integer
     return _iamax(length(x), x, 1)
 end
 

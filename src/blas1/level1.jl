@@ -5,7 +5,7 @@
 # scalar loop, which is exactly what makes Mode 2 differentiable.
 
 # y .= x
-function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
+@inline function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _copy_simd!(Int(n), x, y)
     ix = _start(n, incx); iy = _start(n, incy)
@@ -16,7 +16,7 @@ function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
 end
 
 # x ⇄ y
-function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
+@inline function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return nothing
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _swap_simd!(Int(n), x, y)
     ix = _start(n, incx); iy = _start(n, incy)
@@ -28,7 +28,7 @@ function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
 end
 
 # x .*= a
-function _scal!(n::Integer, a::Number, x, incx::Integer)
+@inline function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
     (incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
     if incx == 1 && _cplx_re(x)
@@ -47,7 +47,18 @@ function _scal!(n::Integer, a::Number, x, incx::Integer)
 end
 
 # y .+= a .* x
-function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
+#
+# `@inline` is a MEASURED gate lever, not a style choice. The Zen4 BLAS-1 gate had six ops sitting a
+# hair under 1.0 (axpy 0.999, dot 0.992, asum 0.990, scal 0.992, zaxpy 0.981, zdotc 0.973) — six
+# independent kernel deficits of identical tiny size is implausible; one shared per-call cost is not.
+# Decomposing the ladder (bench/probes/axpy_entry.jl, Chairmarks median) named it at n=1e4 on Zen4:
+#   ob 1816.5 ns | raw kernel 1801.6 (1.0083 vs OB) | +knob 0.6 | +shape ladder 6.9 | +ENTRY 28.7
+# i.e. the kernel already BEATS OpenBLAS and the public wrapper gives the win back. The knob lookup
+# was the obvious suspect and is falsified at +0.6 ns. Out-of-line, this call cannot see that its
+# arguments are a concrete `Vector{Float64}` with unit strides, so the whole branch chain below
+# (`_simd2`/`_cplx2`/stride tests) stays live and the `convert` is a real call; inlined into a
+# concrete call site every one of those tests const-folds to the single surviving branch.
+@inline function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
     if incx == 1 && incy == 1 && _cplx2(x, y)
@@ -62,7 +73,7 @@ function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
 end
 
 # Σ (conjx ? conj(xᵢ) : xᵢ) · yᵢ
-function _dot_generic(n::Integer, x, incx::Integer, y, incy::Integer, conjx::Bool)
+@inline function _dot_generic(n::Integer, x, incx::Integer, y, incy::Integer, conjx::Bool)
     s = zero(_et(x)) * zero(_et(y))
     n <= 0 && return s
     ix = _start(n, incx); iy = _start(n, incy)
@@ -75,14 +86,14 @@ function _dot_generic(n::Integer, x, incx::Integer, y, incy::Integer, conjx::Boo
 end
 
 # Unconjugated dot (BLAS ?dot / ?dotu).
-function _dotu(n::Integer, x, incx::Integer, y, incy::Integer)
+@inline function _dotu(n::Integer, x, incx::Integer, y, incy::Integer)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(false))
     return _dot_generic(n, x, incx, y, incy, false)
 end
 
 # Conjugated dot (BLAS ?dotc). For real T this equals `_dotu`.
-function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
+@inline function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(true))
     return _dot_generic(n, x, incx, y, incy, true)
@@ -91,7 +102,7 @@ end
 # Euclidean norm. Fast path: SIMD sum-of-squares (real, unit-stride dense). If that overflows to
 # Inf or underflows to 0 with a nonzero input, fall back to the overflow/underflow-safe scaled
 # accumulation (LAPACK lassq) — the correctness boundary. Returns a real scalar.
-function _nrm2(n::Integer, x, incx::Integer)
+@inline function _nrm2(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
     if incx == 1 && _simd1(x)
@@ -113,7 +124,7 @@ function _nrm2(n::Integer, x, incx::Integer)
 end
 
 # Σ |xᵢ|  (complex: Σ |Re|+|Im|). Returns a real scalar.
-function _asum(n::Integer, x, incx::Integer)
+@inline function _asum(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
     (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
@@ -147,7 +158,7 @@ end
     GC.@preserve x return _iamax_cmplx_simd!(Int(n), Ptr{T}(pointer(x)))
 end
 
-function _iamax(n::Integer, x, incx::Integer)
+@inline function _iamax(n::Integer, x, incx::Integer)
     n <= 0 && return 0
     if incx == 1
         v = _iamax_simd_try(n, x)
