@@ -146,6 +146,17 @@ end
 # slope points NARROWER. PROBE REGIME is Derived from where the misses actually start: just past L1,
 # which is the first failing size on the worst box (the sytrf lesson — probe where the gate is decided,
 # not at a convenient size).
+# PRE-BUILT `Val` SINGLETONS for the measure closures. `Val(W)` / `Val(W ÷ 2)` with `W` a LOCAL does not
+# const-fold once it is captured by a `_tune_one` closure: trim reported
+#   unresolved call ... _axpy_phase!(Val{8}(), %new()::Val{_A} where _A, ...)  (simd_kernels.jl:194)
+# i.e. the second Val was still being CONSTRUCTED at run time, which is an unresolved call under
+# `juliac --trim` and took 10 C-ABI symbols with it (daxpy/dgesvd/dgbtrf/dgeqp3/dgels/dgehrd/dgecon/
+# dorghr/dpocon/dtrcon — everything reaching `_axpy_simd!`). A module-level const IS its concrete type,
+# so passing it introduces no construction at all. This is the boring fix; it needs no new dependency
+# and no type-level machinery beyond what is already here.
+const _AXPY_VW_F64 = Val(_vwidth(Float64))          # full width, F64 probe
+const _AXPY_VHW_F64 = Val(_vwidth(Float64) ÷ 2)     # narrow (half) width, F64 probe
+
 const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
 @static if isnothing(_AXPY_UNROLL_PREF)
     function _measure_axpy_unroll()::Int
@@ -165,18 +176,33 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
                 # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
                 # by ~2.6pp, while the interleaved-8 control reproduces the earlier width falsification
                 # (0.99). Zen4/Zen3 keep an interleaved arm. Depth alone could never express this.
-                for u in (2, 4, 8)
-                    u * W <= _NVREG || continue
-                    t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
-                    _tune_better(t, bt) && (bt = t; best = u)
+                # CANDIDATES ARE WRITTEN OUT, one literal `Val` each — NOT a loop over `Val(u)`. A loop
+                # variable makes `Val(u)` non-concrete, and the resulting `runtime dispatch detected:
+                # _axpy_unrolled!(%3::Val, …)` propagates out of the measure, through `_axpy_dram()`, and
+                # breaks the @typestable contract on the PUBLIC `axpy!` path (strictmode_tests.jl:11).
+                # The guards const-fold: `W` and `_NVREG` are compile-time consts.
+                if 2 * W <= _NVREG
+                    t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)
+                    _tune_better(t, bt) && (bt = t; best = 2)
                 end
-                for u in (4, 8)
-                    u * W <= _NVREG || continue
-                    t = _tune_one(() -> _axpy_phase!(Val(u), Val(W), n, 1.0e-9, px, py); reps = 5)
-                    _tune_better(t, bt) && (bt = t; best = 100 + u)
+                if 4 * W <= _NVREG
+                    t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)
+                    _tune_better(t, bt) && (bt = t; best = 4)
+                end
+                if 8 * W <= _NVREG
+                    t = _tune_one(() -> _axpy_unrolled!(Val(8), n, 1.0e-9, px, py, 0); reps = 5)
+                    _tune_better(t, bt) && (bt = t; best = 8)
+                end
+                if 4 * W <= _NVREG
+                    t = _tune_one(() -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
+                    _tune_better(t, bt) && (bt = t; best = 104)
+                end
+                if 8 * W <= _NVREG
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
+                    _tune_better(t, bt) && (bt = t; best = 108)
                 end
                 if W >= 8                                    # a narrow arm only exists at 512-bit
-                    t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)
                     _tune_better(t, bt) && (bt = t; best = 208)
                 end
             end
@@ -213,15 +239,17 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             best = _UNROLL; bt = typemax(UInt64)
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
-                for u in (2, 4)
-                    t = _tune_one(() -> _axpy_unrolled!(Val(u), n, 1.0e-9, px, py, 0); reps = 5)
-                    _tune_better(t, bt) && (bt = t; best = u)
-                end
+                # Literal `Val`s, same reason as the band knob above: a loop variable here produced the
+                # runtime dispatch that failed the @typestable contract on the public axpy! path.
+                t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)
+                _tune_better(t, bt) && (bt = t; best = 2)
+                t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)
+                _tune_better(t, bt) && (bt = t; best = 4)
                 if W >= 8
-                    t = _tune_one(() -> _axpy_phase!(Val(8), Val(W ÷ 2), n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)
                     _tune_better(t, bt) && (bt = t; best = 208)
                 end
-                t8 = _tune_one(() -> _axpy_phase!(Val(8), Val(W), n, 1.0e-9, px, py); reps = 5)
+                t8 = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
                 _tune_better(t8, bt) && (bt = t8; best = 108)
             end
             return best
