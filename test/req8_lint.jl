@@ -16,6 +16,19 @@
 const _SRCDIR = joinpath(@__DIR__, "..", "src")
 const _ANNOT = r"#\s*req8-ok:"i
 const _VAL_LIT = r"\bVal\(\s*(\d+)\s*\)"
+# 3. `Val(<lowercase variable>)` — a RUNTIME value lifted into the type domain. Note the deliberate
+#    asymmetry with pattern 1: that one flags a literal as a HARDCODE suspect, this one flags a variable
+#    as a DISPATCH suspect. `Val(u)` with `u` a loop variable is not concrete, so the callee cannot
+#    specialize and the call becomes a runtime dispatch. Two separate failures came from exactly this
+#    shape on 2026-08-05: `for u in (2,4,8) … Val(u)` broke the BLAS-1 @typestable contract, and a
+#    `Val(W)` captured by a `_tune_one` closure broke TEN C-ABI trim symbols (daxpy, dgesvd, dgbtrf,
+#    dgeqp3, dgels, dgehrd, dgecon, dorghr, dpocon, dtrcon) — trim reported it as
+#    `unresolved call … _axpy_phase!(Val{8}(), %new()::Val{_A} where _A, …)`. Both cost a 40-minute
+#    suite run to find; this pattern costs milliseconds. Fix is a literal or a module-level const `Val`
+#    singleton. `Val(true)`/`Val(false)` are excluded (concrete by construction). A genuinely
+#    const-propagated variable gets `# req8-ok:`.
+const _VAL_VAR = r"\bVal\(\s*([a-z][a-zA-Z0-9_]*)\s*\)"
+const _VAL_VAR_OK = ("true", "false")
 const _CONST_DEF = r"^\s*const\s+(_[A-Z][A-Z0-9_]*)\s*=\s*(.*)$"
 
 # A const RHS is "bare" (unjustified) if it's a plain integer, OR an @load_preference whose default is a plain
@@ -41,6 +54,11 @@ function req8_scan()
             for m in eachmatch(_VAL_LIT, code)
                 v = parse(Int, m.captures[1])
                 v >= 2 && push!(viols, "$(basename(f)):$i  Val($v)")
+            end
+            for m in eachmatch(_VAL_VAR, code)
+                v = m.captures[1]
+                v in _VAL_VAR_OK && continue
+                push!(viols, "$(basename(f)):$i  Val($v)  [runtime dispatch]")
             end
             cm = match(_CONST_DEF, code)
             if cm !== nothing && _bare_int_rhs(cm.captures[2])

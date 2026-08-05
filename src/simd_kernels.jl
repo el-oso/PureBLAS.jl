@@ -182,27 +182,27 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
                 # breaks the @typestable contract on the PUBLIC `axpy!` path (strictmode_tests.jl:11).
                 # The guards const-fold: `W` and `_NVREG` are compile-time consts.
                 if 2 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)
+                    t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 2)
                 end
                 if 4 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)
+                    t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 4)
                 end
                 if 8 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(8), n, 1.0e-9, px, py, 0); reps = 5)
+                    t = _tune_one(() -> _axpy_unrolled!(Val(8), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 8)
                 end
                 if 4 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 104)
                 end
                 if 8 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 108)
                 end
                 if W >= 8                                    # a narrow arm only exists at 512-bit
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 208)
                 end
             end
@@ -241,15 +241,15 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
                 px = pointer(x); py = pointer(y)
                 # Literal `Val`s, same reason as the band knob above: a loop variable here produced the
                 # runtime dispatch that failed the @typestable contract on the public axpy! path.
-                t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)
+                t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                 _tune_better(t, bt) && (bt = t; best = 2)
-                t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)
+                t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                 _tune_better(t, bt) && (bt = t; best = 4)
                 if W >= 8
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)
+                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                     _tune_better(t, bt) && (bt = t; best = 208)
                 end
-                t8 = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)
+                t8 = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
                 _tune_better(t8, bt) && (bt = t8; best = 108)
             end
             return best
@@ -286,12 +286,12 @@ end
     # and DRAM streaming are different problems and get different knobs.
     u = n * sizeof(T) > _L3_BYTES ? _axpy_dram() : _axpy_band()
     W = _vwidth(T)
-    return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :
-        u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :
-        u == 104 ? _axpy_phase!(Val(4), Val(W), n, a, x, y) :
-        u == 108 ? _axpy_phase!(Val(8), Val(W), n, a, x, y) :
-        u == 208 ? _axpy_phase!(Val(8), Val(W ÷ 2), n, a, x, y) :
-        _axpy_unrolled!(Val(4), n, a, x, y, 0)
+    return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
+        u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
+        u == 104 ? _axpy_phase!(Val(4), Val(W), n, a, x, y) :  # req8-ok: candidate arm, literal required for specialization
+        u == 108 ? _axpy_phase!(Val(8), Val(W), n, a, x, y) :  # req8-ok: candidate arm, literal required for specialization
+        u == 208 ? _axpy_phase!(Val(8), Val(W ÷ 2), n, a, x, y) :  # req8-ok: candidate arm, literal required for specialization
+        _axpy_unrolled!(Val(4), n, a, x, y, 0)  # req8-ok: candidate arm, literal required for specialization
 end
 
 @inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
