@@ -1,0 +1,14 @@
+# probe-regime lint baseline — probes written before the lint existed (2026-08-06).
+# The lint fails on any probe NOT listed here. Do not add to it: a NEW probe declares its regime.
+# Retiring an entry means either annotating the file with `# REGIME:` or deleting the probe.
+axpy_1e6_decide.jl
+axpy_alloc.jl
+axpy_arms.jl
+axpy_entry.jl
+cell_hypothesis.jl
+decomp_delaycal.jl
+inproc_replication.jl
+pagebacking.jl
+phase_decomp.jl
+zaxpy_arms.jl
+zdot_arms.jl

@@ -19,18 +19,47 @@
 const QN = 48
 
 function cells(path)
-    out = []                                   # (lvl, op, size, Dict(arm => Vector{Float64}))
+    out = []                                   # (lvl, op, size, Dict(arm => times), Dict(arm => commit))
     for ln in eachline(path)
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
         p = split(ln, "\t"); length(p) >= 4 || continue
         d = Dict{String, Vector{Float64}}()
+        c = Dict{String, String}()
         for f in p[4:end]
-            a, _, _, csv = split(f, "|"; limit = 4)
+            a, _, com, csv = split(f, "|"; limit = 4)
             d[String(a)] = parse.(Float64, split(csv, ","))
+            c[String(a)] = String(com)
         end
-        push!(out, (String(p[1]), String(p[2]), parse(Int, p[3]), d))
+        push!(out, (String(p[1]), String(p[2]), parse(Int, p[3]), d, c))
     end
     return out
+end
+
+# PROVENANCE. Every arm carries the commit it was measured at, and a cell whose `pb` arm predates HEAD
+# is evidence about code that no longer exists. Twice on 2026-08-06 a cell was read as a verdict on a
+# change that the cached arm was measured BEFORE — once quoting pre-tiling numbers as post-tiling. The
+# cache said so both times, in a field nothing displayed. `stale` marks it in the row itself; the check
+# is per-ARM because `arms=pb` deliberately leaves the reference arms old, and that is not staleness.
+#
+# STALE MEANS "src/ MOVED", NOT "the hash differs". A hash test flags every row in the file the moment
+# you commit anything — 133 of 133 on the first run of this — and a flag that is always on is a flag
+# nobody reads. `git diff --quiet <c>..HEAD -- src/` asks the question that actually matters: is the
+# measured code still the shipping code? A cell measured five doc commits ago is not stale.
+const HEAD = try
+    readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`)
+catch
+    "unknown"
+end
+const _SRCMOVED = Dict{String, Bool}()
+function srcmoved(c)
+    c in ("?", "unknown", HEAD) && return false
+    return get!(_SRCMOVED, c) do
+        try
+            !success(`git -C $(@__DIR__) diff --quiet $c..HEAD -- ../src`)
+        catch
+            false                              # commit not in this clone (fleet cache) — can't say, don't cry wolf
+        end
+    end
 end
 
 med(v) = sort(v)[max(1, cld(length(v), 2))]
@@ -41,29 +70,47 @@ function roundratios(qref, qpb)
 end
 
 rows = []
-for path in ARGS, (lvl, op, sz, d) in cells(path)
+for path in ARGS, (lvl, op, sz, d, com) in cells(path)
     haskey(d, "pb") || continue
     refs = [r for r in ("openblas", "aocl") if haskey(d, r)]
     isempty(refs) && continue
     best = ""; worst = Inf; spread = 0.0
+    per = Dict{String, Float64}()              # EVERY reference, not just the binding one — see below
     for r in refs                              # the gate is vs the FASTER reference at THIS cell
         rr = roundratios(d[r], d["pb"]); isempty(rr) && continue
-        m = med(rr)
+        m = med(rr); per[r] = m
         m < worst && (worst = m; best = r; spread = (maximum(rr) - minimum(rr)) / m)
     end
-    isfinite(worst) && push!(rows, (worst, spread, lvl, op, sz, best, basename(path)))
+    pbc = get(com, "pb", "?")
+    isfinite(worst) && push!(rows, (worst, spread, lvl, op, sz, best, basename(path), per, pbc))
 end
 
 sort!(rows; by = first)
 fails = [r for r in rows if r[1] < 1.0]
 println("cells=", length(rows), "  below 1.0=", length(fails))
-println("\n  gap    ratio  spread  cell                          vs         cache")
-for (ratio, spread, lvl, op, sz, ref, f) in fails
+# BOTH REFERENCES ARE PRINTED, not just the binding one. The `ratio`/`vs` columns are the gate (worst
+# against the faster reference) — but reporting only that HIDES WHICH LIBRARY BINDS, and that is the
+# fact which tells you whether a caller inherits its callee's gap. Measured 2026-08-06, Zen3 n=32:
+#     zgemm    OB 0.995  AOCL 0.807   <- AOCL binds
+#     ztrmmR   OB 0.779  AOCL 1.377   <- OpenBLAS binds, and we beat AOCL by 38%
+#     ztrmm    OB 0.824  AOCL 1.453   <- OpenBLAS binds
+# If the triangular ops merely inherited zgemm's deficit they would lose to the SAME reference. They do
+# not, so that is OB's better small-n triangular handling — a separate mechanism, not a gemm problem.
+# Reading only the worst-of column, I twice assumed inheritance that was not there. A one-sided gap
+# (we crush one reference, lose to the other) also usually means the loser implemented something the
+# winner did not, which changes what "close this cell" even means.
+println("HEAD=$HEAD   (a STALE row's pb arm predates a change to src/ — re-measure that cell before \
+reading it as a verdict on today's code)")
+println("\n  gap    ratio  spread  cell                          vs        vs_OB   vs_AOCL  cache")
+for (ratio, spread, lvl, op, sz, ref, f, per, pbc) in fails
     # a miss smaller than the cell's own round-to-round spread is not distinguishable from noise
     tag = (1.0 - ratio) <= spread ? "  <- within spread" : ""
+    srcmoved(pbc) && (tag *= "  <- STALE: src/ changed since $pbc")
+    fmt(r) = haskey(per, r) ? rpad(round(per[r]; digits = 3), 8) : rpad("—", 8)
     println(rpad(string(round(100 * (1 - ratio); digits = 1), "%"), 7),
         rpad(round(ratio; digits = 3), 7), rpad(round(spread; digits = 3), 8),
-        rpad("$lvl $op@$sz", 30), rpad(ref, 11), replace(f, "plots_data_" => "", ".txt" => ""), tag)
+        rpad("$lvl $op@$sz", 30), rpad(ref, 10), fmt("openblas"), fmt("aocl"),
+        replace(f, "plots_data_" => "", ".txt" => ""), tag)
 end
 nnoise = count(r -> (1.0 - r[1]) <= r[2], fails)
 println("\n$(length(fails) - nnoise) of $(length(fails)) misses exceed their own round spread; ",

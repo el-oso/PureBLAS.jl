@@ -18,6 +18,37 @@ resolving the deferred complex-dot ABI, which would change exported signatures),
 every microarchitecture in the fleet. Not a date, not a feature count — the project's actual thesis,
 demonstrated.
 
+## [0.1.1] — "Instrument" — 2026-08-06
+
+No `src/` change: this release is entirely measurement infrastructure. Each of the four items exists
+because its absence cost real time in the preceding session, and each converts a rule that had to be
+remembered into one that is checked.
+
+### Added
+
+- **`bench/gate_gaps.jl` reports both references, not just the binding one.** New `vs_OB` / `vs_AOCL`
+  columns beside the gate ratio. Reporting only the worst-of hides *which* library binds, which is the
+  fact that says whether a caller inherits its callee's gap. It immediately separated three Zen3
+  complex cells that had been read as one problem: `zgemm@32` loses to AOCL (0.807) while `ztrmm@32`
+  and `ztrmmR@32` lose to OpenBLAS (0.824 / 0.779) and *beat* AOCL by ~40% — so the triangular gap is
+  OpenBLAS's small-n handling, not inherited from `gemm`.
+- **Provenance check on every reported cell.** Each cached arm already stored the commit it was
+  measured at; nothing displayed it, and twice in one day a cell was quoted as a verdict on a change
+  it predated. A row is now marked `STALE` when `src/` has changed between the `pb` arm's commit and
+  `HEAD` — deliberately *not* when the hash merely differs, which flagged 133 of 133 rows on the first
+  run and would have been a warning nobody reads.
+- **Probe-regime lint** (`test/probe_regime_lint.jl`, wired into the suite). Every `bench/probes/*.jl`
+  must declare the regime it measured — **residency** *and* **call structure** — or carry
+  `# regime-ok:`. A probe's verdict is valid only in its own regime, and consulting one from another
+  regime is silent: the code is right, the measurement is honest, the answer is wrong. This had
+  recurred five times; the fifth was a `scal` ladder timing one call per sample, which reported the
+  public entry frame at +0.1 ns while the gate — a rep loop — read the same cell 1.5% low.
+  `test/probe_regime_baseline.txt` carries the eleven pre-lint probes so a new one fails immediately.
+- **Contention guard before any gate sweep** (`bench/plots.jl`). Refuses to start when a foreign
+  process holds ≥ 25% CPU, listing the offenders; `force-busy` overrides. A stray job found mid-sweep
+  cost a three-hour run that had to be discarded. It matches on `ps -eo` %CPU rather than counting
+  `pgrep julia`, which self-matches this process and any wrapper whose cmdline contains "julia".
+
 ## [0.1.0] — 2026-08-06
 
 First release: a pure-Julia BLAS/LAPACK implementation — a drop-in, AD-traceable replacement for the
