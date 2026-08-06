@@ -866,12 +866,11 @@ const _CGEMVN_NCBIG_PREF = @load_preference("cgemvn_nc_big", nothing)
             bt0 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false)); reps = 5)
             tw = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)); reps = 5)
             t32 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)); reps = 5)
-            qw = _tune_better(tw, bt0)                    # W beats shipping by the margin?
-            q32 = _tune_better(t32, bt0)                  # 3W/2 beats shipping by the margin?
-            q32 && qw && return _tune_better(t32, tw) ? 3W ÷ 2 : W
-            q32 && return 3W ÷ 2
-            qw && return W
-            return _CGEMVN_NC
+            # Selection goes through the PURE `_tune_pick` (cpuinfo.jl) rather than an open-coded loop,
+            # so the rule is unit-tested (test/tuner_tests.jl) instead of only exercisable by running a
+            # benchmark. Candidates smallest-first, so a tie between qualifiers keeps the cheaper panel.
+            i = _tune_pick(bt0, (tw, t32))
+            return i == 2 ? 3W ÷ 2 : i == 1 ? W : _CGEMVN_NC
         catch
             return _CGEMVN_NC
         end

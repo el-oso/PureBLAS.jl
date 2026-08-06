@@ -305,6 +305,39 @@ phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which
 """
 @inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95
 
+"""
+    _tune_pick(t_inc, ts::NTuple{N,UInt64}) -> Int
+
+Which candidate displaces the incumbent? `0` keeps it; otherwise the index into `ts`. Pure — no clock,
+no allocation — so the SELECTION RULE is unit-testable independently of any measurement
+(`test/tuner_tests.jl`). Every Measure-tier sweep should route its decision through this rather than
+open-coding a loop, which is how the two properties below came to differ per site.
+
+TWO RULES, and the first is the one that is easy to get wrong:
+
+  * QUALIFY AGAINST THE INCUMBENT, never against a running best. The open-coded form
+    `_tune_better(t, bt) && (bt = t; best = c)` re-bases the comparison after each win, so what a
+    later candidate must beat depends on what happened to win earlier. Here `t_inc` is fixed.
+  * Among QUALIFIERS the margin applies again, ties going to the EARLIER candidate. Callers order
+    candidates smallest-first, so a tie keeps the cheaper one (fewer live registers, less scratch).
+
+⚠ HONEST NOTE ON WHAT THIS CHANGED: for a MONOTONE ladder (each candidate faster than the last) this
+is behaviourally IDENTICAL to the chained form — if `b` cannot beat `a` by the margin, both rules
+return `a`. The difference appears only when a later candidate qualifies against the incumbent while an
+earlier one that beat it did not, which cannot happen when times are ordered. So the rewrite buys
+testability and a stated invariant, NOT a different answer on the case that motivated it; the measured
+outcome was unchanged, and the unit tests below pin that down rather than letting the claim drift.
+"""
+@inline function _tune_pick(t_inc::UInt64, ts::NTuple{N, UInt64}) where {N}
+    best = 0
+    bt = t_inc
+    for i in 1:N
+        _tune_better(ts[i], t_inc) || continue        # qualify vs the INCUMBENT, fixed
+        (best == 0 || _tune_better(ts[i], bt)) && (best = i; bt = ts[i])
+    end
+    return best
+end
+
 # A PAIRED ABBA SIGN TEST WAS PROPOSED TO REPLACE THE MARGIN, BUILT, AND MEASURED. It does not work
 # here, and the reason is worth more than the rule was.
 #
