@@ -1509,6 +1509,23 @@ else
         end
         println("merged $nc re-measured cell(s) [arms: $(join(_ACTIVE_ARMS, ","))] into $CACHE")
     else
+        # FULL run: the cache is REPLACED wholesale. That is correct only when this run measured every
+        # arm — with a restricted `arms=`, saving here DELETES the reference arms for every cell in the
+        # cache. The per-arm merge above protects the subset path; nothing protected this one, and on
+        # 2026-08-06 a full `bench nodraw arms=pb` on neuromancer destroyed the Zen5 v3 reference arms
+        # (10.9 MB -> 3.65 MB, ~2h45m of OpenBLAS+AOCL measurement) — the run looked like it succeeded
+        # and the loss only surfaced when gate_gaps reported `cells=0`.
+        # `arms=` is for SUBSET re-measures (op=/group=), where merging keeps the references. A full run
+        # must either measure everything or be told explicitly that a pb-only cache is what you want.
+        if !isnothing(_ARMS_SEL) && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
+            error("""
+                REFUSING to overwrite $CACHE with a partial arm set.
+                  full run + arms=$(join(_ACTIVE_ARMS, ",")) would DROP: $(join(setdiff(_REF_ALL, _ACTIVE_ARMS), ", "))
+                A full `bench` REPLACES the cache; only op=/group= merges per arm. Either
+                  • add op=<op> or group=<LVL>  (merges, keeps the reference arms), or
+                  • drop `arms=` to measure every arm (~3x longer), or
+                  • pass `force-arms` if a pb-only cache really is intended.""")
+        end
         g = measured
     end
     save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP")])
