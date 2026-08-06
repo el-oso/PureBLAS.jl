@@ -599,11 +599,23 @@ end
 #     kd=127  stride 1016 B — not line-aligned                     ⇒ not aliased  (measured fine)
 #     kd=128  stride 1024 B,16 lines, gcd16 → 4 sets ·8 = 32 < 128 ⇒ ALIASED      (3x spike)
 #     kd=129  stride 1032 B — not line-aligned                     ⇒ not aliased  (measured fine)
+# SEVERITY, not a binary test: tile only when LESS THAN HALF the walk stays resident in the sets it
+# touches. A bare `capacity < kd` fires on mild aliasing where the tile nest costs more than it saves —
+# measured, and it is exactly the regression the note above predicted:
+#     controlled A/B on galen, same box back-to-back, total µs for _pbtrf_repack_U! at n=4096
+#       kd= 96  2212.8 -> 2194.5   untiled both (capacity 128 >= 96, fully resident)     unchanged
+#       kd=128  3991.9 -> 3496.9   32 of 128 lines resident (25%)                        -12.4%  WIN
+#       kd=160  4740.5 -> 4940.1   128 of 160 lines resident (80%)                       +4.2%   LOSS
+# 25% resident wins big, 80% resident loses; the ½ threshold sits between with margin on both sides.
+# That factor is MEASURED (the two points above bracket it), not derived — stated as such per the PDM
+# ladder. Everything else here is derived: set count, associativity and stride all come from detected
+# consts.
 @inline function _pbtrf_rp_aliased(ld::Int, kd::Int, ::Type{T}) where {T}
     sb = (ld - 1) * sizeof(T)
     (sb > 0 && sb % _CACHELINE == 0) || return false    # sub-line stride ⇒ the walk spreads naturally
     nsets = max(1, _L1_BYTES ÷ (_CACHELINE * _L1D_ASSOC))
-    return (nsets ÷ gcd(sb ÷ _CACHELINE, nsets)) * _L1D_ASSOC < kd
+    capacity = (nsets ÷ gcd(sb ÷ _CACHELINE, nsets)) * _L1D_ASSOC
+    return 2 * capacity < kd
 end
 
 function _pbtrf_repack_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
