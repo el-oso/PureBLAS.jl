@@ -741,10 +741,47 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     push!(body.args, :(return nothing))
     return body
 end
-# AVX2 complex gemvN driver: β-prescale y, then NC-column panels over full m (no m-blocking — full-m
-# column streams prefetch best; tall y-beyond-L2 shapes stay on the row-tile path via the caller).
-function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
-    NC = _CGEMVN_NC; sz = sizeof(T); αr = real(α); αi = imag(α)
+# NC IS A MEMORY-LEVEL-PARALLELISM KNOB, and it was a bare literal (`4`, justified by "OB uses 4" —
+# OpenBLAS's choice for OpenBLAS's kernel is not a derivation for ours). NC is how many A-column streams
+# run concurrently: while A is cache-resident there is no fill latency to hide and a wide panel only
+# costs register pressure and y-restreaming, but once A outgrows the caches more concurrent streams keep
+# more misses outstanding. So the optimum RISES with A's residency, and one constant is wrong at one end.
+#
+# Measured 2026-08-06, both boxes freq-locked, in plots.jl's own `_L2REP` regime, 3 rotated rounds with
+# the anchor arm duplicated as the run's noise floor (0.05-1.4%). Ratios vs the shipping NC=4:
+#   Zen4 (W=8, L2=1 MB, L3=16 MB)          Zen3 (W=4, L2=512 KB)
+#    n     A     A/L2   4     8    12   16      n     A    A/L2   2     4     6     8
+#   256  1.0MB    1   1.000 0.924 0.743 0.576  256  1.0MB   2  0.852 1.000 0.995 0.946
+#   512  4.2MB    4   0.999 1.076 0.972 0.845  512  4.2MB   8  0.870 0.993 1.029 0.878
+#  1024 16.8MB   16   0.980 1.090 1.132 1.080 1024 16.8MB  32  0.827 0.980 1.032 0.880
+#  2048 67.1MB   64   0.996 1.034 1.058 0.930 2048 67.1MB 128  0.787 0.988 1.036 0.930
+#
+# WHY MEASURE AND NOT DERIVE. The tier SHAPE is shared — NC rises with A/L2 and saturates at 3W/2, and
+# 2W is worse than the shipping value on both boxes, which is what bounds the candidate set above. But
+# the values are NOT: at A ≈ L2 Zen4 wants W/2 while the same rule gives Zen3 W/2 = 2, which measures
+# 0.852 there — a 15% regression. A residency formula fitted to Zen4 mispredicts a box we own, which is
+# precisely req#8b's tell for Measure tier. Only the LARGE-A tier is common ground: both boxes put the
+# optimum at 3W/2 once A > L3/2, and both put it above the shipping value.
+#
+# SO ONLY THAT TIER MOVES. Below L3/2 the shipping `_CGEMVN_NC` is kept byte-for-byte — no size on
+# either box regresses (Zen4 n=256/512 measure 1.000/0.999 at NC=4). Above it, the value is measured
+# on-host over the DERIVED candidate set {W, 3W/2}. The boundary (L3 residency) is Derive tier; the
+# value inside it is Measure tier. The A ≤ L3/2 tiers are left as a known-unclaimed +7.6% on Zen4 at
+# n=512 rather than shipping a rule that regresses Zen3 — widening the harness to three measured tiers
+# is the follow-up, and it needs its own fleet validation.
+@inline function _cgemvn_abytes(::Type{T}, m::Int, n::Int) where {T}
+    return 2 * m * n * sizeof(T)                    # A is complex: two reals per element
+end
+
+# Complex gemvN driver with NC fixed at COMPILE time: β-prescale y, then NC-column panels over full m
+# (no m-blocking — full-m column streams prefetch best; tall y-beyond-L2 shapes stay on the row-tile
+# path via the caller). NC is a `Val` rather than an Int so the @generated panel specializes per
+# candidate; a runtime `Val(nc)` would dispatch dynamically on every panel, and the tuner below needs to
+# call this at each candidate anyway.
+function _gemv_n_ri_run!(
+        m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}, ::Val{NC}, ::Val{PF}
+    ) where {T <: BlasReal, B0, NC, PF}
+    sz = sizeof(T); αr = real(α); αi = imag(α)
     # y is restreamed once per NC-column panel (n/NC times) → block m so the y-block fits ~½ L2 for tall
     # shapes; square mid-n (16m ≤ ½L2) runs one block (NB=m), which measured fastest (prefetch continuity).
     NB = (2 * m * sz <= _L2_BYTES ÷ 2) ? m : max(NC, (_L2_BYTES ÷ 2) ÷ (2 * sz))
@@ -762,8 +799,7 @@ function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{
             mb = min(NB, m - i0); ypb = yp + i0 * 2 * sz; Apb = Ap + i0 * 2 * sz
             jc = 0
             while jc + NC <= n
-                _CGEMVN_PF ? _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(true)) :
-                    _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(false))
+                _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(NC), Val(PF))
                 jc += NC
             end
             while jc < n
@@ -774,6 +810,76 @@ function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{
         end
     end
     return y
+end
+
+# MEASURE tier for the large-A NC. Pinned via Preferences (every trim/.so build MUST set it — a runtime
+# benchmark is not trim-safe); `@static if` so the auto path is NOT DEFINED when pinned, rather than
+# relying on DCE. Mirrors `_measure_ger_np` above, including the median-not-min reduction: this knob has
+# different winners on Zen3 and Zen4, so the luckiest window of one candidate must not decide what ships.
+const _CGEMVN_NCBIG_PREF = @load_preference("cgemvn_nc_big", nothing)
+@static if isnothing(_CGEMVN_NCBIG_PREF)
+    # Base-only and TOTAL — OncePerProcess poisons the whole process if its initializer throws, so every
+    # path returns a usable NC. The fallback is the shipping value, i.e. "no worse than before".
+    # PROBE SHAPE IS A ≈ L3 AND SQUARE. Both halves were mistakes I made and measured:
+    #
+    #   SIZE — `_tune_better`'s 5% margin exists because a plain `<` coin-flips which kernel ships (see
+    #   its docstring) and it sits above the in-process tuner's resolution, so a candidate must be
+    #   measured where its effect is LARGEST or a real win is discarded as a tie. On Zen4 the
+    #   shipping→3W/2 gain is 13.2% at A ≈ L3 but only 5.8% at A ≈ 4×L3 — straddling the margin.
+    #
+    #   ASPECT — the first version used n = 4W columns and derived m from the byte target, giving a
+    #   32768×32 TALL-SKINNY matrix. It returned the incumbent: with 32 columns there are two panels and
+    #   a tail, y is half of L2, and none of the column-stream parallelism this knob controls is in
+    #   play. The gate measures SQUARE (plots.jl's `sq` maker), and a knob tuned in one regime and
+    #   consulted from another is the probe-regime error again — the sixth instance. Solve m = n from
+    #   the byte target instead, which lands on 1024×1024 here: the binding gate cell exactly.
+    function _measure_cgemvn_nc_big()::Int
+        W = _vwidth(Float64)
+        Base.generating_output() && return _CGEMVN_NC   # don't burn a measure during precompilation
+        try
+            # A bytes = 2·m·n·sizeof(T); square ⇒ m = n = √(L3 / (2·sizeof(ComplexF64)/2)) = √(L3/16)
+            n = max(4 * W, isqrt(_L3_BYTES ÷ (2 * 2 * sizeof(Float64))))
+            m = n                                    # A ≈ L3, square — the gate's own shape
+            A = fill(ComplexF64(1.0, 0.5), m, n)     # pre-touched (no first-touch bias in the measurement)
+            x = fill(ComplexF64(1.0, 0.0), n); y = fill(ComplexF64(0.0, 0.0), m)
+            α = ComplexF64(1.0, 0.0); β = ComplexF64(1.0, 0.0)
+            # INCUMBENT FIRST so a sub-margin difference keeps today's behaviour. That is what makes this
+            # no-regression by construction: Zen3's best (3W/2) wins by only ~3.5%, under the margin, so
+            # galen keeps `_CGEMVN_NC` and loses nothing; Zen4's 3W/2 wins by 13.2% and is taken.
+            best = _CGEMVN_NC
+            bt = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false)); reps = 5)
+            tw = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)); reps = 5)
+            _tune_better(tw, bt) && (bt = tw; best = W)
+            t32 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)); reps = 5)
+            _tune_better(t32, bt) && (bt = t32; best = 3W ÷ 2)
+            return best
+        catch
+            return _CGEMVN_NC
+        end
+    end
+    const _CGEMVN_NCBIG_ONCE = Base.OncePerProcess{Int}(_measure_cgemvn_nc_big)
+    @inline _cgemvn_nc_big() = _CGEMVN_NCBIG_ONCE()
+else
+    @inline _cgemvn_nc_big() = _CGEMVN_NCBIG_PREF::Int
+end
+
+function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+    # Below L3/2 keep the shipping panel byte-for-byte (no size on either box regresses there); above it,
+    # take the measured value. The BOUNDARY is Derive tier (L3 residency), the VALUE inside it is Measure.
+    if _cgemvn_abytes(T, m, n) > _L3_BYTES ÷ 2
+        nc = _cgemvn_nc_big()
+        # `nc` is one of three compile-time-known values, so branch to a specialization rather than
+        # building `Val(nc)` — and note the branch must be exhaustive over what the tuner can return,
+        # since falling through silently applies `_CGEMVN_NC` instead (correct, just not what was tuned).
+        if nc == 3 * _vwidth(T) ÷ 2
+            return _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(3 * _vwidth(T) ÷ 2), Val(false))
+        elseif nc == _vwidth(T)
+            return _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_vwidth(T)), Val(false))
+        end
+    end
+    return _CGEMVN_PF ?
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(true)) :
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(false))
 end
 
 # Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
