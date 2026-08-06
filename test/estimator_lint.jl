@@ -42,6 +42,13 @@ const _BADRED = [
     r"\b(minimum|mean)\s*\([^)]*\.samples"i,
     r"\b(minimum|mean)\s*\([^)]*s\.time"i,
     r"\b(minimum|mean)\s*\(\s*(ts|times|timings)\s*\)"i,
+    # BLIND SPOT, closed 2026-08-06: `minimum(@be …).time` reduces a Chairmarks BENCHMARK OBJECT and
+    # then takes `.time` off the winning sample, so the banned reduction never touches `.samples`,
+    # `s.time`, or a vector named ts/times/timings — none of the patterns above could see it. It sat in
+    # bench/calibrate.jl, the file that WRITES the Preferences pins, so the mis-ranking would have
+    # shipped rather than merely misled a reader. Anchor on the `@be` itself, which is the thing being
+    # reduced, not on how the result is spelled afterwards.
+    r"\b(minimum|mean)\s*\(\s*@be\b"i,
 ]
 const _BENCHPRIM = r"@be\b|Chairmarks"
 

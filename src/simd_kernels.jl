@@ -242,23 +242,28 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             n = max(4096, 2 * _L3_BYTES ÷ sizeof(Float64))
             x = fill(1.0, n); y = fill(0.5, n)
             W = _vwidth(Float64)
-            # Same typemax-seed defect as the band knob above — see the note there.
-            best = _UNROLL; bt = typemax(UInt64)          # replaced immediately below, once px/py exist
+            # ⚠ DUELS, not a margin — this knob is THE reason the rule changed. Measured 2026-08-06,
+            # wintermute, freq-locked and quiet, five fresh processes of the same binary under the old
+            # margin rule: 208, 4, 2, 208, 4. THREE different kernels shipping from one binary, which is
+            # the Zen5 failure this file's own comments already record, reproduced on Zen4. The margin
+            # cannot separate these candidates because their differences sit inside its threshold, so
+            # noise picked the winner every time.
+            # `_tune_duel` runs each candidate against the INCUMBENT (_UNROLL) over rotated rounds whose
+            # per-round statistic is a median, and `_tune_wins_it` needs a supermajority — no noise floor
+            # is estimated, and a candidate that is merely lucky once cannot win. Candidates are still
+            # written out with literal `Val`s (a loop variable makes `Val(u)` non-concrete and produced
+            # the runtime dispatch that failed the @typestable contract on the public axpy! path).
+            best = _UNROLL
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
-                bt = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: the incumbent _UNROLL=4, timed first
-                # Literal `Val`s, same reason as the band knob above: a loop variable here produced the
-                # runtime dispatch that failed the @typestable contract on the public axpy! path.
-                t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                _tune_better(t, bt) && (bt = t; best = 2)
-                t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                _tune_better(t, bt) && (bt = t; best = 4)
+                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0)   # req8-ok: the incumbent _UNROLL=4
+                # Ordered widest-effect first; the first candidate to earn a supermajority wins, so a
+                # later one cannot displace on a difference the rule has already judged unresolvable.
                 if W >= 8
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 208)
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py))) && return 208  # req8-ok: candidate arm
                 end
-                t8 = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                _tune_better(t8, bt) && (bt = t8; best = 108)
+                _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py))) && return 108  # req8-ok: candidate arm
+                _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0))) && return 2  # req8-ok: candidate arm
             end
             return best
         catch
