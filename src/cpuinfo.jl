@@ -304,3 +304,33 @@ it feeds straight back into the run-to-run variance that makes that box hard to 
 phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which is the derived default.
 """
 @inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95
+
+# A PAIRED ABBA SIGN TEST WAS PROPOSED TO REPLACE THE MARGIN, BUILT, AND MEASURED. It does not work
+# here, and the reason is worth more than the rule was.
+#
+# The proposal (Fable, 2026-08-06): instead of comparing two block-timed medians against a fixed 5%,
+# run k adjacent pairs with the order alternated (ABBA), record only WHICH arm won each pair, and
+# displace on a supermajority. Attractive because it is distribution-free, needs no noise-floor
+# estimate, and self-scales — a noisy shape demands a bigger true gap, a quiet one accepts a small
+# reproducible win. The motivating case was the complex gemvN NC knob, where the 5% margin discards a
+# measured 3.9% (W vs 3W/2 at A≈L3 on Zen4).
+#
+# MEASURED on wintermute, freq-locked, quiet box, at the knob's own probe shape (1024², A≈L3), sweeping
+# k ∈ {9,15,21} and legs of r ∈ {1,5,15} calls — null (an arm against ITSELF), power (3W/2 over W) and
+# reverse (W over 3W/2), all in one run:
+#     r=1    null up to 6/15, power 4/15   → null and power OVERLAP at every k
+#     r=5    null up to 7/15, power 6/15
+#     r=15   null up to 7/9,  power 0/9
+# No (k, threshold) separates them. And the diagnosis is NOT that the test is weak: as the legs get
+# heavier the effect DISAPPEARS — at r=15 the plain median ratio is W/3W2 = 0.997, i.e. the two panel
+# widths are EQUAL in this regime. The 3.9% is real, but it lives in the GATE regime (fresh arrays per
+# sample, `_L1REP` dependent passes) and does not exist in the TUNER's regime (one pre-touched buffer,
+# back-to-back calls on hot data).
+#
+# SO THE PREMISE WAS WRONG: the margin is not discarding a real win. There is no win here to discard,
+# and no decision rule can select for an effect its own measurement regime does not reproduce. Which
+# makes this a probe-regime finding about the TUNERS themselves — they measure in a regime that differs
+# from the one the gate scores, so they can pick the wrong candidate however good the statistics are.
+# That is the open problem (see the task tracker); the threshold is not.
+# Do not re-propose the sign test without first showing the effect survives in the tuner's own regime.
+# Harness kept: bench/probes/tune_signtest_validate.jl (null + power + reverse + cross-process modes).
