@@ -61,27 +61,96 @@ for path in ARGS
     end
 end
 
+# RENDERING: colour bands, not 🐰/🐢. A binary glyph makes `trsm` 0.999 and `zpotrfU` 0.61 look
+# identical, which is exactly backwards — the whole point of a per-routine table is to show WHERE the
+# work is. Banding the shortfall (≥1.0 / ≥0.99 / ≥0.95 / ≥0.85 / below) sorts the page by severity at
+# a glance. The ratio stays in the cell and is the authoritative signal: colour is a redundant
+# encoding, never the only one, so the table still reads correctly in monochrome or to a colourblind
+# reader. Emitted as `@raw html` because Documenter markdown tables cannot carry per-cell classes.
+band(g) = g >= 1.0 ? "ok" : g >= 0.99 ? "b1" : g >= 0.95 ? "b2" : g >= 0.85 ? "b3" : "b4"
+
+# A FAILING gate is printed at 3 digits and FLOORED; a passing one at 2, rounded. Two reasons, both
+# about not lying with a rounded number:
+#   * flooring can never round a miss up to "1.0" (0.9996 prints 0.999, not 1.0), so a cell that reads
+#     like parity always IS parity;
+#   * 3 digits keeps the printed value inside its own colour band, so two cells showing the same
+#     number always get the same colour — at 2 digits, 0.9887 and 0.9938 both printed "0.99" and were
+#     banded differently, which looks like a rendering bug.
+# The band is then computed from the DISPLAYED value, so colour and number cannot disagree.
+function gatestr(g)
+    s = g >= 1.0 ? string(round(g; digits = 2)) : string(floor(g * 1000) / 1000)
+    return s, band(parse(Float64, s))
+end
+
+# One stylesheet for every table below. Vitepress toggles `.dark` on <html>, so that is the hook;
+# `prefers-color-scheme` is kept as a fallback for a bare Documenter build.
+println("""
+```@raw html
+<style>
+.pbg{--l:#e3e6ee;--m:#5d6675;--ok:#1f8a5b;--b1:#7a8496;--b2:#c07d12;--b3:#cf5a35;--b4:#b3243a;
+ --okbg:#e9f6ef;--b1bg:#f1f3f7;--b2bg:#fdf3e2;--b3bg:#fceee9;--b4bg:#fbe9ed;
+ border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;display:table}
+html.dark .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;--b2:#e0a63c;--b3:#f08055;--b4:#ff5f7a;
+ --okbg:#12271d;--b1bg:#1a2130;--b2bg:#2a2113;--b3bg:#2c1a15;--b4bg:#2c1420}
+@media (prefers-color-scheme:dark){html:not(.light) .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;
+ --b2:#e0a63c;--b3:#f08055;--b4:#ff5f7a;--okbg:#12271d;--b1bg:#1a2130;--b2bg:#2a2113;--b3bg:#2c1a15;--b4bg:#2c1420}}
+.pbg th,.pbg td{border-bottom:1px solid var(--l);padding:7px 12px;text-align:left}
+.pbg thead th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--m);white-space:nowrap}
+.pbg tbody th{font-weight:400}
+.pbg td{border-left:1px solid var(--l);white-space:nowrap}
+.pbg .v{font-weight:600}
+.pbg .n{font-size:.82em;color:var(--m);margin-left:7px}
+.pbg td.ok{background:var(--okbg)} .pbg td.ok .v{color:var(--ok)}
+.pbg td.b1{background:var(--b1bg)} .pbg td.b1 .v{color:var(--b1)}
+.pbg td.b2{background:var(--b2bg)} .pbg td.b2 .v{color:var(--b2)}
+.pbg td.b3{background:var(--b3bg)} .pbg td.b3 .v{color:var(--b3)}
+.pbg td.b4{background:var(--b4bg)} .pbg td.b4 .v{color:var(--b4)}
+.pbg-key{display:flex;flex-wrap:wrap;gap:14px;margin:10px 0 0;font-size:12px;color:#5d6675}
+html.dark .pbg-key{color:#98a1b3}
+.pbg-key i{font-style:normal;display:inline-block;width:11px;height:11px;border-radius:2px;
+ margin-right:5px;vertical-align:-1px}
+</style>
+```
+""")
+
 for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
     ops = sort(unique(k[2] for k in keys(cells) if k[1] == section))
     isempty(ops) && continue
     println("\n#### $section\n")
-    println("| routine | ", join(UARCH, " | "), " |")
-    println("|---", "|---"^length(UARCH), "|")
+    println("```@raw html")
+    println("<table class=\"pbg\"><thead><tr><th>routine</th>",
+            join(("<th>$ua</th>" for ua in UARCH)), "</tr></thead><tbody>")
     for op in ops
-        cols = String[]
+        print("<tr><th><code>$op</code></th>")
         for ua in UARCH
             cs = sort(get(cells, (section, op, ua), Tuple{Int, Float64}[]); by = first)
             if isempty(cs)
-                push!(cols, "—")                       # not measured on this box
+                print("<td><span class=\"n\">—</span></td>")   # not measured on this box
                 continue
             end
             gs = [c[2] for c in cs]
             gate = minimum(gs)                          # the gate IS the worst cell, per box
             # A passing row needs no size — it gates everywhere. A failing one names the cell to fix,
             # which is the actionable unit; the ratio alone would say nothing about where to look.
-            push!(cols, gate >= 1.0 ? "🐰 $(round(gate; digits = 2))" :
-                        "🐢 $(round(gate; digits = 2)) n=$(cs[argmin(gs)][1])")
+            sz = gate >= 1.0 ? "" : "<span class=\"n\">n=$(cs[argmin(gs)][1])</span>"
+            gstr, cls = gatestr(gate)
+            print("<td class=\"$cls\"><span class=\"v\">$gstr</span>$sz</td>")
         end
-        println("| `$op` | ", join(cols, " | "), " |")
+        println("</tr>")
     end
+    println("</tbody></table>")
+    println("```")
 end
+
+println("""
+```@raw html
+<p class="pbg-key">
+ <span><i style="background:#1f8a5b"></i>gates (≥ 1.0)</span>
+ <span><i style="background:#7a8496"></i>≥ 0.99</span>
+ <span><i style="background:#c07d12"></i>≥ 0.95</span>
+ <span><i style="background:#cf5a35"></i>≥ 0.85</span>
+ <span><i style="background:#b3243a"></i>below 0.85</span>
+ <span>the number is the gate; colour only bands it</span>
+</p>
+```
+""")
