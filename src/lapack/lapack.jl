@@ -20,11 +20,9 @@ using LinearAlgebra: PosDefException
 # INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
 # Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
 const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
-# Largest UPPER n factored in place by the scalar base instead of transposing to the vectorized lower
-# kernel. MEASURE tier, pinned conservatively below the measured crossover (≈14-16 real, ≈22 complex)
-# — see the cost model and the full table at the head of `_potrf_gen!`. It is NOT `_POTRF_BASE`:
-# shipping that cutoff fixed n=8 and regressed n=32 (zpotrfU 0.692 -> 0.516).
-const _POTRF_UPPER_DIRECT_MAX = @load_preference("potrf_upper_direct_max", 12)::Int
+# (The tiny-UPPER cutoff is `_potrf_udirect(T)` — a real MEASURE-tier auto-tune defined next to the
+# lever bodies below, near `_potrf_gen!`. It was briefly a literal 12 here, which req#8b classifies as
+# a violation; see the note there for the cost model and why Derive is not available.)
 # Lever B (F32): the generic recursion's base crossover is TYPE-dependent. Float32 packs 2× per SIMD lane, so
 # the scalar left-looking `_potf2` base is ~2× costlier per element while the SIMD trsm!/syrk! recursion is
 # relatively cheaper → the crossover where blocking beats the base HALVES. Measured Zen4 (spotrf-L OB-ratio,
@@ -309,6 +307,117 @@ end
     return nothing
 end
 
+# ── the Lever A/C bodies, factored out ────────────────────────────────────────────────────────────
+# Extracted so the Measure harness below races EXACTLY the code the dispatch runs. Replicating a
+# kernel inside its own tuner lets the two drift silently — that is what made a probe report the
+# library as unchanged after the library had changed (bench/probes/pbtrf_tile_size.jl, 2026-08-06).
+# Lever A (real): U = Lᵀ exactly (UᵀU = LLᵀ = A). `_potrf_f64_lower!` THROWS on a non-positive pivot,
+# which is why this returns nothing — the throw happens before the transpose back, so A is unchanged.
+@inline function _potrf_upper_lever_real!(A::AbstractMatrix{T}, n::Int) where {T}
+    M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
+    GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
+    _potrf_f64_lower!(view(M, 1:n, 1:n))            # M lower ← L (throws ⇒ A upper unchanged)
+    GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n)
+    return nothing
+end
+# Lever C (complex Hermitian): U = Lᴴ, so the transpose CONJUGATES (Val(true)) and column j of U is
+# column j of L — the index carries across unchanged. RETURNS the failing column (0 = success); the
+# caller throws, so that the transpose-back is skipped and A's upper triangle is left untouched.
+@inline function _potrf_upper_lever_cmplx!(A::AbstractMatrix{T}, n::Int) where {T}
+    M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
+    GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
+    f = _cpotrf_lower!(view(M, 1:n, 1:n), n)
+    f == 0 || return f
+    GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
+    return 0
+end
+
+# ── tiny-UPPER cutoff: the largest n still factored in place ──────────────────────────────────────
+# PDM **MEASURE** tier, and it has to be. The choice is direct-scalar-base (c_s·n³/3) against
+# transpose-plus-vectorised-lower (c_t·2n² + c_v·n³/3, c_v ≪ c_s), so the crossover is
+# n* = 6·c_t/(c_s − c_v) — a ratio of our OWN kernels' rates. Nothing in the cache hierarchy or the
+# ISA predicts it, it MOVES whenever either kernel improves, and it is TYPE-dependent: measured on
+# wintermute (bench/probes/potrf_upper_cross.jl, direct/transpose, <1 = direct wins)
+#     n            8      12      16      20      24      32
+#     Float64    0.767   0.815   1.026   0.829   1.415   1.825      ⇒ crossover ≈ 14-16
+#     ComplexF64 0.573   0.693   0.867   0.991   1.06    1.342      ⇒ crossover ≈ 22
+# A single shipped literal cannot express a per-type crossover, and req#8b names a validated literal
+# as a VIOLATION regardless. (I shipped `12` first and labelled it "MEASURE tier, pinned
+# conservatively"; "pinned" is the P rung for a SET preference, not for a hardcoded default.)
+#
+# CANDIDATES ARE DERIVED at both ends, and the STEP matters as much as the ends:
+#   start — the transpose moves 2n² elements against n³/3 flops, so it cannot amortise below n ≈ 6;
+#           round that cost-model point up to a ladder point. (Starting at the element width instead
+#           meant Float32, whose width is 16, never tested below 16 at all.)
+#   step  — HALF the element width. The lower kernel is vectorised but the direct base is SCALAR, so
+#           the balance shifts at sub-vector granularity; both cost curves are smooth in n, so the
+#           step directly bounds the quantisation error in the answer.
+#   stop  — `_POTRF_BASE`, above which the direct path is no longer a single base call at all.
+# Stepping by the FULL element width was measured wrong on this box: for Float64 on AVX-512 that is 8,
+# giving candidates {8,16,24,32}, so the harness returned 8 where direct still wins well past it — a
+# quantisation error that sent n=9..15 to the lever needlessly. Half-width gives {8,12,16,20,...}.
+#
+# THE CROSSOVER IS A SHALLOW, NON-MONOTONIC BAND, not a point — do not read the returned value as
+# precise. Probe on wintermute (direct/transpose, <1 = direct wins):
+#     n=8 0.767   12 0.815   16 1.026   20 0.829   24 1.415   32 1.825
+# direct loses at 16 and wins again at 20, i.e. ~16-20 is within a few percent either way, and the
+# decisive loss only arrives at 24 (+41%). The harness scans ascending and returns the last n before
+# the FIRST loss, so on this box it lands on 20; a different box (or a rebuilt kernel) may legitimately
+# land anywhere in that band. That is fine — the cost of being wrong inside the band is a few percent
+# at sizes the gate does not sample, while being wrong at 24+ is 40%+, and the scan cannot overshoot
+# there. It is also exactly why this is Measure tier and not a literal: no reasoning picks a point out
+# of a noisy band, only measurement on the host does.
+const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
+@static if isnothing(_POTRF_UDIRECT_PREF)
+    # elements per SIMD vector for this element type (complex packs two reals per element)
+    @inline _potrf_udirect_ew(::Type{T}) where {T} =
+        max(1, _vwidth(real(T)) ÷ (T <: Complex ? 2 : 1))
+    function _measure_potrf_udirect(::Type{T})::Int where {T}
+        Base.generating_output() && return 0          # never measure during precompilation
+        step = max(1, _potrf_udirect_ew(T) ÷ 2)       # sub-vector granularity — see the note above
+        first = cld(6, step) * step                   # cost-model floor n ≈ 6, on a ladder point
+        try
+            prev = 0
+            for n in first:step:_POTRF_BASE
+                A0 = Matrix{T}(undef, n, n)
+                refill! = () -> begin                 # diagonally-dominant HPD, upper triangle read
+                    fill!(A0, T(0.25))
+                    @inbounds for j in 1:n
+                        A0[j, j] = T(2 * n + 2)       # diag > Σ|offdiag| ⇒ HPD, no pivot failure
+                    end
+                end
+                # Called DIRECTLY, never through `_potrf_gen!` — that consults this very
+                # OncePerProcess and would re-enter its own initializer.
+                lever! = T <: BlasComplex ? _potrf_upper_lever_cmplx! : _potrf_upper_lever_real!
+                refill!(); _potrf_upper!(A0, n, _POTRF_BASE)        # untimed warmups (absorb JIT)
+                refill!(); lever!(A0, n)
+                td = Vector{UInt64}(undef, 5); tl = Vector{UInt64}(undef, 5)
+                for r in 1:5                          # interleaved (crude ABBA), MEDIAN-of-5
+                    refill!(); s = time_ns(); _potrf_upper!(A0, n, _POTRF_BASE); td[r] = time_ns() - s
+                    refill!(); s = time_ns(); lever!(A0, n);                     tl[r] = time_ns() - s
+                end
+                sort!(td); sort!(tl)
+                td[3] < tl[3] || return prev          # first n where the lever wins ⇒ cutoff is the
+                prev = n                              # last n where direct still won
+            end
+            return prev                               # direct won across the whole bracket
+        catch
+            return 0                                  # on any failure keep the lever (broader coverage)
+        end
+    end
+    const _POTRF_UDIRECT_F32 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(Float32))
+    const _POTRF_UDIRECT_F64 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(Float64))
+    const _POTRF_UDIRECT_C32 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(ComplexF32))
+    const _POTRF_UDIRECT_C64 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(ComplexF64))
+    @inline _potrf_udirect(::Type{Float32}) = _POTRF_UDIRECT_F32()
+    @inline _potrf_udirect(::Type{Float64}) = _POTRF_UDIRECT_F64()
+    @inline _potrf_udirect(::Type{ComplexF32}) = _POTRF_UDIRECT_C32()
+    @inline _potrf_udirect(::Type{ComplexF64}) = _POTRF_UDIRECT_C64()
+    @inline _potrf_udirect(::Type{<:Any}) = 0         # generic/AD eltypes never take the lever anyway
+else
+    @inline _potrf_udirect(::Type{<:Any}) = _POTRF_UDIRECT_PREF::Int   # pinned (trim builds land here)
+end
+
 function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     T = eltype(A)
     # TINY UPPER GOES STRAIGHT TO THE BASE — no transpose, no scratch.
@@ -343,7 +452,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # NOTE `_potrf_upper!` RETURNS the failing column; every caller of `_potrf_gen!` ignores its return
     # value and relies on a thrown PosDefException, so the throw has to happen here or a non-positive-
     # definite matrix would report success.
-    if up && n <= _POTRF_UPPER_DIRECT_MAX
+    if up && n <= _potrf_udirect(T)
         f = _potrf_upper!(A, n, base)
         f == 0 || throw(PosDefException(f))
         return A
@@ -354,10 +463,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # upper into the (alias-free) scratch's lower, factor, transpose L back. F32 rides the same faer path (now
     # generic over T<:BlasReal) — closing F32-upper once F32-lower gates.
     if _POTRF_PAD && up && (T === Float64 || T === Float32) && _strided1(A)
-        M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
-        GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
-        _potrf_f64_lower!(view(M, 1:n, 1:n))        # M lower ← L (throws PosDefException ⇒ A upper unchanged)
-        GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n)
+        _potrf_upper_lever_real!(A, n)
         return A
     end
     # Lever C: complex Hermitian UPPER via the gating _cpotrf_lower!. U = Lᴴ exactly (UᴴU = LLᴴ = A), so the
@@ -365,13 +471,9 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # _potrf_upper! recursion's trsm!/herk! overhead loses there; _cpotrf_lower! gates). Conj-transpose A's
     # upper into the scratch lower, factor, conj-transpose Lᴴ back into A's upper.
     if _POTRF_PAD && up && T <: BlasComplex && _strided1(A)
-        M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
-        GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
-        # U = Lᴴ, so column j of U is column j of L — the index carries across the transpose unchanged.
-        let f = _cpotrf_lower!(view(M, 1:n, 1:n), n)
+        let f = _potrf_upper_lever_cmplx!(A, n)
             f == 0 || throw(PosDefException(f))     # throw before transposing back ⇒ A upper unchanged
         end
-        GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
         return A
     end
     if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)

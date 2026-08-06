@@ -77,6 +77,14 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # "the safer default: 1 MISSES on Zen3", and a trimmed .so is one binary that must be safe on any host.
 # NOTE this pins the MULTIPLIER, not `sytrf_nb` — pinning the latter takes a branch whose value is flat
 # and would discard the derived `_sytrf_nb_shape(n)` scaling entirely.
+# And `potrf_upper_direct_max`: the tiny-UPPER cutoff (factor in place vs transpose onto the
+# vectorised lower kernel) is a Measure-tier OncePerProcess per eltype. `potrf_64_` is @ccallable, so
+# unpinned it would ship an on-host benchmark into the .so — the first call would time two Cholesky
+# variants and pick from momentary machine state. Value 12: measured crossover is ≈14-16 real and ≈22
+# complex (bench/probes/potrf_upper_cross.jl), and a trimmed .so is ONE binary that must be safe on any
+# host, so pin below the smallest measured crossover — a box whose vector kernel is relatively faster
+# moves the crossover DOWN, and being early costs only the tiny-n win, while being late regresses n=16+.
+const _prev_pud = load_preference(PUREBLAS_UUID, "potrf_upper_direct_max")
 const _prev_sycm = load_preference(PUREBLAS_UUID, "sytrf_cmult")
 const _prev_axu = load_preference(PUREBLAS_UUID, "axpy_unroll")
 const _prev_axd = load_preference(PUREBLAS_UUID, "axpy_dram")
@@ -86,6 +94,7 @@ set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
 set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
+set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => 12; force = true)  # tiny-upper potrf cutoff (Measure tier)
 set_preferences!(PUREBLAS_UUID, "axpy_unroll" => 4; force = true)        # real-axpy band shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "axpy_dram" => 4; force = true)          # real-axpy DRAM shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
@@ -119,6 +128,11 @@ finally
         delete_preferences!(PUREBLAS_UUID, "sytrf_cmult"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => _prev_sycm; force = true)
+    end
+    if _prev_pud === nothing
+        delete_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => _prev_pud; force = true)
     end
     if _prev_axu === nothing
         delete_preferences!(PUREBLAS_UUID, "axpy_unroll"; force = true)
