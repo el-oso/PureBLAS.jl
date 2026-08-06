@@ -260,6 +260,23 @@ end
 # BLAS-2 panel share ≈0.75·nb/n bites there; also = old flat value, so tall/large-m·n caps at 32 = no
 # regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 galen (16→24→32),
 # formula reproduces both within ~5% (req#8b). Zen5 predicted = Zen4 (same NVREG/vw/L2) — needs confirm.
+#
+# FLAT nb = 4·_vwidth IS FALSIFIED ON BOTH BOXES — do not re-propose it. Branch `geqrf-nb-derived`
+# argued this growth term was a complex-path artifact (the complex trailing larfb rides Karatsuba-3M
+# gemm materializing ~3× scratch, relieved ∝ k/nb; the REAL trailing larfb is plain packed gemm with no
+# scratch, so L3 should not enter) and proposed a flat 4·_vwidth. Measured 2026-08-06, both boxes
+# freq-locked, in plots.jl's `sweep_heavy` regime, 3 rotated rounds with the incumbent duplicated as the
+# noise floor (0.0-0.7%). flat/growth, >1 meaning flat is faster:
+#     Zen4 (flat=32)   256 0.920 | 512 0.982 | ≥768 formulas COINCIDE (growth caps at 32 = 4·W)
+#     Zen3 (flat=16)   256 COINCIDE | 512 1.009 | 768 0.977 | 1024 0.969 | 1536 0.844 | 2048 0.803
+#                     4096 0.792 | tall 4096×512 0.935
+# So the ramp is worth 8% at Zen4's small end and up to 21% at Zen3's large end; flat's only win is
+# Zen3 n=512 at +0.9%. The reason the branch saw the opposite is chronology, not measurement: its tip is
+# 2026-07-15 10:33 and it was arguing against the ¼L3-divisor/4×-cap form that picked nb=64/128, which
+# `bcd04fd` (15:48) and `a71e9eb` (16:04) replaced the SAME DAY with the L2-divisor/32-cap form above.
+# The complex-path root cause it identified is still sound — it is simply already fixed by the cap.
+# What remains genuinely unconfirmed is only the SMALL-n end on Zen5 (whether the 8→16 ramp beats a flat
+# 32 there, as it does on Zen4), NOT the large-n growth the branch measured.
 @inline _qr_nb(m::Int, n::Int) = (
     fl = 256 ÷ _NVREG;
     clamp(fl * cld(m * n * sizeof(Float64), _L2_BYTES), fl, 32)
