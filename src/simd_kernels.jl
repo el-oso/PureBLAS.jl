@@ -330,9 +330,23 @@ end
         #   · INLINING into the caller's loop (the last structural difference from OpenBLAS, which
         #     enters via an opaque ccall per call): forcing it back out of line reads 0.9912 against
         #     0.9924 inlined — no change.
+        #   · the LOAD/STORE GROUPING. Disassembled 2026-08-06: LLVM's 4× unroll of the ivdep branch
+        #     below issues ALL FOUR loads and only then all four stores (`vector.body40`: 4×vmulpd into
+        #     zmm2-5, then 4×vmovupd), where OB alternates 1:1 and bumps a pointer against a precomputed
+        #     end. Grouping four loads ahead of four stores is the textbook anti-pattern for a
+        #     store-bound stream, so an arm was written with our depth, OB's interleave AND OB's
+        #     pointer-bump addressing (the one combination `v1`/`v4` did not cover). It is not faster:
+        #     0.996 at n=3e4, 0.990 at n=1e5, 0.954 at n=3e5. The grouping is not the mechanism.
         # What is left is the generated loop vs OpenBLAS's asm in this band on THIS µarch. Next probe
         # if it is picked up: alignment sensitivity (offset the base pointer and see whether PB's
         # deficit moves while OB's does not).
+        #
+        # ⚠ RESOLUTION BOUND, measure it before believing any number above. The same arm benched TWICE
+        # in one run (identical code, adjacent windows, freq-locked, quiet box) differs by:
+        #     n=3e4  0.02%      n=1e5  0.7%      n=3e5  6.5%
+        # So the n=3e4 entries here are solid and the large-n ones are at or under the floor — at n=3e5
+        # nothing below ~7% is a measurement at all. Any future scal probe must carry a duplicated arm
+        # as its own control; without one, a 1% "win" at n≥1e5 is indistinguishable from nothing.
         if n * sizeof(T) > _L1_BYTES
             @inbounds @simd ivdep for j in 1:n
                 unsafe_store!(px, a * unsafe_load(px, j), j)
