@@ -843,16 +843,35 @@ const _CGEMVN_NCBIG_PREF = @load_preference("cgemvn_nc_big", nothing)
             A = fill(ComplexF64(1.0, 0.5), m, n)     # pre-touched (no first-touch bias in the measurement)
             x = fill(ComplexF64(1.0, 0.0), n); y = fill(ComplexF64(0.0, 0.0), m)
             α = ComplexF64(1.0, 0.0); β = ComplexF64(1.0, 0.0)
-            # INCUMBENT FIRST so a sub-margin difference keeps today's behaviour. That is what makes this
-            # no-regression by construction: Zen3's best (3W/2) wins by only ~3.5%, under the margin, so
-            # galen keeps `_CGEMVN_NC` and loses nothing; Zen4's 3W/2 wins by 13.2% and is taken.
-            best = _CGEMVN_NC
-            bt = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false)); reps = 5)
+            # ⚠ EVERY CANDIDATE IS COMPARED AGAINST THE INCUMBENT, NEVER AGAINST A RUNNING BEST.
+            # The obvious sweep — `_tune_better(t, bt) && (bt = t; best = c)` — RE-BASES the margin after
+            # each win, so a monotone ladder of sub-margin gains never displaces anything even when the
+            # top candidate beats the ORIGINAL default by far more than the margin. That is not
+            # hypothetical: this knob's measured Zen4 ladder is 1.000 → 1.090 (W) → 1.132 (3W/2) vs the
+            # shipping NC, so chained, 3W/2 is judged against W's already-improved time (3.9%) instead of
+            # against shipping (13.2%). `_ger_np` and `_axpy_unroll` share the chained shape and should
+            # be revisited (task filed) — do not copy it here.
+            # Qualification is by margin against the incumbent, so ties still keep today's behaviour.
+            # Between two QUALIFIERS the margin is applied again, ties going to the SMALLER panel: both
+            # are already ≥ margin better than shipping, so the residual choice is worth at most the
+            # margin, and the smaller panel holds fewer live broadcasts.
+            # ⚠ WHAT THIS ACTUALLY SHIPS ON Zen4 TODAY: W, not 3W/2 — both qualify, and the tie-break
+            # margin swallows the 3.9% between them. So ~3.6% of the n=1024 cell is still on the table
+            # (0.849 → ~0.925 taken, ~0.961 available), left there by the DECISION RULE's resolution and
+            # not by the kernel. Fixing that needs `_tune_better` replaced by a paired sign test — a
+            # cross-cutting change to every Measure knob, filed separately rather than special-cased
+            # here. Do not "fix" it locally by dropping the tie-break to a plain `<`: that is the
+            # comparison which made two fresh processes of one binary resolve the axpy knob to 208 and
+            # to 4, and the tuner-regime noise floor that would justify it has never been measured.
+            bt0 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false)); reps = 5)
             tw = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)); reps = 5)
-            _tune_better(tw, bt) && (bt = tw; best = W)
             t32 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)); reps = 5)
-            _tune_better(t32, bt) && (bt = t32; best = 3W ÷ 2)
-            return best
+            qw = _tune_better(tw, bt0)                    # W beats shipping by the margin?
+            q32 = _tune_better(t32, bt0)                  # 3W/2 beats shipping by the margin?
+            q32 && qw && return _tune_better(t32, tw) ? 3W ÷ 2 : W
+            q32 && return 3W ÷ 2
+            qw && return W
+            return _CGEMVN_NC
         catch
             return _CGEMVN_NC
         end
@@ -863,6 +882,23 @@ else
     @inline _cgemvn_nc_big() = _CGEMVN_NCBIG_PREF::Int
 end
 
+# The shipping panel, with NO reference to the measured knob. Internal BLAS-2 callers use THIS, not the
+# tier-selecting entry below — see the @noalloc note there.
+@inline function _gemv_n_ri_ship!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+    return _CGEMVN_PF ?
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(true)) :
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(false))
+end
+
+# ⚠ THE MEASURED KNOB LIVES HERE AND NOWHERE UPSTREAM OF A @noalloc CONTRACT. `Base.OncePerProcess`'s
+# first-call init allocates (`jl_set_precompile_field_replace`), and `@assert_noalloc` is an ALL-PATHS
+# static proof — it does not care that a branch is dynamically unreachable. `trmv!`/`trsv!` carry that
+# contract and reach the complex gemvN kernel through `_tri_scat_cmplx!`, so routing them through this
+# function put 72 allocation sites into their proof and failed StrictMode. Same class as the axpy
+# OncePerProcess that had to leave the BLAS-2 path.
+# It is also the right split on the merits, not just to satisfy the checker: the triangular scatter's
+# operand is m×NB — a tall-skinny panel — never the large SQUARE regime this knob was measured in, so
+# consulting it there would be a probe-regime error even if it were free.
 function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
     # Below L3/2 keep the shipping panel byte-for-byte (no size on either box regresses there); above it,
     # take the measured value. The BOUNDARY is Derive tier (L3 residency), the VALUE inside it is Measure.
@@ -877,9 +913,7 @@ function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{
             return _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_vwidth(T)), Val(false))
         end
     end
-    return _CGEMVN_PF ?
-        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(true)) :
-        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(false))
+    return _gemv_n_ri_ship!(m, n, α, A, x, y, β, Val(B0))
 end
 
 # Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
@@ -2410,8 +2444,11 @@ end
 # The OB-structure ri gemv (α folded, fresh accs, prefetch, m-blocked) beats the row-tile scatter on
 # BOTH ISAs for the tall off-diagonal shape (m≫k=NB, β=1) — measured 0.71–0.96× row-tile across m on
 # AVX-512, and it's the same kernel zgemvN already rides. (Was AVX-512→row-tile; that predated the ri tune.)
+# `_gemv_n_ri_ship!`, NOT `_gemv_n_ri_cmplx!`: trmv!/trsv! carry a @noalloc contract and the latter
+# consults a OncePerProcess whose init allocates — an all-paths proof fails on it even though this
+# operand (m×NB, tall-skinny) can never reach the large-square tier that knob selects for.
 @inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
-    _gemv_n_ri_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
+    _gemv_n_ri_ship!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
 @inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
     cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
     _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))
