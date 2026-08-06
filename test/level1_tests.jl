@@ -299,3 +299,85 @@ end
         end
     end
 end
+
+# Every iamax kernel, called BY NAME — because dispatch decides which one a size reaches, and that is
+# how a real bug shipped.
+#
+# The testitem above is named "max-tree detect" and builds exactly the same-lane cross-block NaN/max
+# shape the tree kernel is vulnerable to — but it calls the PUBLIC `PureBLAS.iamax`, and all of its
+# sizes (n = 8W <= 128 elements, <= 1 KB) are L1-resident, so `_iamax_simd!` routed every one of its
+# assertions to `_iamax_thresh!`. It never once executed `_iamax_tree!`. Meanwhile the tree WAS live for
+# `_L1_BYTES < n*sizeof(T) <= _L2_BYTES`, where its fold `vifelse(a > b, a, b)` let a NaN swallow a
+# larger value and then be dropped itself one node up — so `PureBLAS.iamax` returned its seed index 1
+# where netlib and OpenBLAS return 2 (n=4161, x[2]=99, x[10]=NaN). Found only by widening the dispatch
+# during an unrelated perf experiment; nothing in the suite pointed at it.
+#
+# So: exercise each kernel directly, at sizes INSIDE and OUTSIDE its dispatched band. A residency
+# threshold must never again be able to silently redirect a kernel's assertions elsewhere.
+@testitem "iamax kernels by name: NaN/tie contract per kernel, independent of dispatch" begin
+    using PureBLAS
+    using PureBLAS: _iamax_tree!, _iamax_thresh!, _iamax_chain4!,
+                    _IAMAX_NB_TREE, _IAMAX_NB_RESIDENT, _IAMAX_NB_STREAM, _vwidth
+
+    function ref_iamax(x)                                  # netlib idamax: strict >, so NaN never wins
+        n = length(x)
+        n < 1 && return 0
+        dmax = abs(x[1]); ix = 1
+        for k in 2:n
+            abs(x[k]) > dmax && (dmax = abs(x[k]); ix = k)
+        end
+        return ix
+    end
+
+    for T in (Float32, Float64)
+        W = _vwidth(T)
+        nan, inf = T(NaN), T(Inf)
+        kernels = (("tree", (n, p) -> _iamax_tree!(Val(_IAMAX_NB_TREE), n, p)),
+                   ("thresh_resident", (n, p) -> _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, p)),
+                   ("thresh_stream", (n, p) -> _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, p)),
+                   ("chain4", (n, p) -> _iamax_chain4!(n, p)))
+        run(k, x) = GC.@preserve x k(length(x), pointer(x))
+
+        for (_, k) in kernels
+            # PRECONDITION: every one of these kernels requires n >= 4W and is called only under that
+            # guard in production (`_iamax_simd_try` returns 0 below it so the scalar loop takes over).
+            # `_iamax_chain4!` preloads four blocks unconditionally, so a smaller n reads past the end —
+            # calling it below its contract tests nothing real. Sizes below start at 4W deliberately.
+            # They span: exactly the 4W floor, one full unrolled step, several steps, and non-multiples
+            # that land in the leftover-W loop and the scalar remainder.
+            for n in (4W, 8W, 16W, 64W, 64W + W + 3, 513W ÷ 2)
+                n >= 4W || continue
+                # same-lane cross-block: the max at l, a NaN d lanes later with d a multiple of W.
+                # BOTH directions — only max-then-NaN exposed the fold bug.
+                for l in (1, 2, W ÷ 2, W), d in (W, 2W, 3W)
+                    l + d <= n || continue
+                    y = ones(T, n); y[l] = T(99); y[l + d] = nan
+                    @test run(k, y) == ref_iamax(y)
+                    x = ones(T, n); x[l] = nan; x[l + d] = T(99)
+                    @test run(k, x) == ref_iamax(x)
+                end
+                # NaN-only, NaN at the seed, Inf mixed with NaN, and the scalar tail
+                let a = fill(nan, n)
+                    @test run(k, a) == ref_iamax(a)
+                end
+                let a = collect(T, 1:n)
+                    a[1] = nan
+                    @test run(k, a) == ref_iamax(a)
+                end
+                let a = ones(T, n)
+                    a[max(1, n - 1)] = nan; a[n] = T(5)
+                    @test run(k, a) == ref_iamax(a)
+                end
+                let a = ones(T, n)
+                    a[2] = inf; a[min(n, 3)] = nan; a[n] = -inf
+                    @test run(k, a) == ref_iamax(a)
+                end
+                # first-occurrence on ties, within and across unrolled steps
+                let a = ones(T, n)
+                    a[1 + (n ÷ 4)] = T(7); a[1 + (3n ÷ 4)] = T(7)
+                    @test run(k, a) == ref_iamax(a)
+                end
+            end
+        end
+    end
+end
