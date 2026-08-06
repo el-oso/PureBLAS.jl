@@ -20,6 +20,11 @@ using LinearAlgebra: PosDefException
 # INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
 # Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
 const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
+# Largest UPPER n factored in place by the scalar base instead of transposing to the vectorized lower
+# kernel. MEASURE tier, pinned conservatively below the measured crossover (≈14-16 real, ≈22 complex)
+# — see the cost model and the full table at the head of `_potrf_gen!`. It is NOT `_POTRF_BASE`:
+# shipping that cutoff fixed n=8 and regressed n=32 (zpotrfU 0.692 -> 0.516).
+const _POTRF_UPPER_DIRECT_MAX = @load_preference("potrf_upper_direct_max", 12)::Int
 # Lever B (F32): the generic recursion's base crossover is TYPE-dependent. Float32 packs 2× per SIMD lane, so
 # the scalar left-looking `_potf2` base is ~2× costlier per element while the SIMD trsm!/syrk! recursion is
 # relatively cheaper → the crossover where blocking beats the base HALVES. Measured Zen4 (spotrf-L OB-ratio,
@@ -306,6 +311,43 @@ end
 
 function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     T = eltype(A)
+    # TINY UPPER GOES STRAIGHT TO THE BASE — no transpose, no scratch.
+    #
+    # Levers A and C below factor an UPPER matrix by conj/transposing it into a scratch, running the
+    # gating LOWER kernel, and transposing back. At n=8 that is 2·n² element copies plus scratch
+    # handling to support ~n³/3 ≈ 170 flops, and it was the DEEPEST gap on the fleet — same number on
+    # both µarchs, with a spread that leaves no doubt:
+    #     zpotrfU@8  0.608 (Zen3 spread 0.012, Zen4 0.002)      potrfU@8  0.825 / 0.830
+    #
+    # THE CUTOFF IS MEASURED, AND `_POTRF_BASE` IS THE WRONG ANSWER — I shipped that first and it
+    # regressed exactly what it should have: n=8 fixed, but zpotrfU@32 0.692 -> 0.516 and potrfU@32
+    # -> 0.592. The reasoning error is worth keeping: below the base `_potrf_upper!` really does skip
+    # the recursion and issue no BLAS-3, but the alternative is not free — `_potf2b_upper!` is SCALAR
+    # while the lower kernel it replaces is VECTORIZED. The trade is c_s·n³/3 against c_t·2n² + c_v·n³/3
+    # with c_v << c_s, so direct wins only while n < 6·c_t/(c_s − c_v): a ratio of IMPLEMENTATION
+    # constants, not a structural boundary and not derivable from cache size or SIMD width.
+    #
+    # Measured (wintermute/Zen4, freq-locked, bench/probes/potrf_upper_cross.jl, direct/transpose — <1
+    # means direct wins):
+    #     n            8      12      16      20      24      32      48      64
+    #     Float64    0.767   0.815   1.026   0.829   1.415   1.825   2.721   3.24
+    #     ComplexF64 0.573   0.693   0.867   0.991   1.06    1.342   1.282   1.207
+    # Crossover ≈ 14-16 real, ≈ 22 complex (complex runs later: its conjugating transpose costs more
+    # relative to its base). 12 sits below BOTH with margin — 0.815 real, 0.693 complex — so it is
+    # robust to a box whose vector kernel is relatively faster, which moves the crossover DOWN. It
+    # deliberately leaves the n=16/20 complex wins on the table rather than ride close to a crossover
+    # the gate does not sample (LAPACK sizes are 8, 32, 128, …).
+    # PDM: MEASURE tier, pinned conservatively. Not derived — see the cost model above for why it
+    # cannot be. Re-measure with that probe before tightening it.
+    #
+    # NOTE `_potrf_upper!` RETURNS the failing column; every caller of `_potrf_gen!` ignores its return
+    # value and relies on a thrown PosDefException, so the throw has to happen here or a non-positive-
+    # definite matrix would report success.
+    if up && n <= _POTRF_UPPER_DIRECT_MAX
+        f = _potrf_upper!(A, n, base)
+        f == 0 || throw(PosDefException(f))
+        return A
+    end
     # Lever A: real (F64/F32) UPPER factored via the gating faer LOWER kernels. U = Lᵀ exactly (UᵀU = LLᵀ = A).
     # faer gates at ALL sizes (incl. small-n, where the generic recursion's trsm!/syrk! overhead loses) and self-
     # pads po2 strides — so this closes real-upper's small-n + AVX2 mid-n gaps by reuse, portably. Transpose A's
