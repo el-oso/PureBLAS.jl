@@ -320,8 +320,11 @@ end
         # FALSIFIED for this cell — do not re-chase (all measured, bench/probes/scal_live.jl in the live
         # rep-loop regime unless noted):
         #   · the public entry frame — fixed in 989ade4, and the BARE ivdep loop still reads 0.9951 here;
-        #   · loop shape — ivdep 0.9956, 2× 0.9959, 4× 0.9919, and OpenBLAS's OWN flat-1× shape is the
-        #     WORST of the four at 0.9814 (dscal_k_COOPERLAKE is a 4-instruction 1× zmm loop);
+        #   · loop shape — ivdep 0.9956, 2× 0.9959, 4× 0.9919, and a flat-1× shape is the WORST of the
+        #     four at 0.9814. ⚠ That 1× arm is INDEX-SCALED (`px + i*sz`), so it is not OpenBLAS's loop:
+        #     `dscal_k_COOPERLAKE` is pointer-bumped against a precomputed end. Nobody disassembled what
+        #     LLVM emitted for the arm either, and LLVM rewrites addressing and may re-unroll. Read this
+        #     line as "a 1× source shape loses", NOT as "OB's loop transcribed loses";
         #   · the `_axpy_band`/`_axpy_dram` knob lookup (+0.6 ns) and the `::AbstractVector` return
         #     annotation on the backend entry (0.27%, identical with/without/`::typeof(x)`);
         #   · the harness's unused SECOND array (plots.jl's L1 maker is `(randn(s), randn(s))` but scal
@@ -337,16 +340,36 @@ end
         #     store-bound stream, so an arm was written with our depth, OB's interleave AND OB's
         #     pointer-bump addressing (the one combination `v1`/`v4` did not cover). It is not faster:
         #     0.996 at n=3e4, 0.990 at n=1e5, 0.954 at n=3e5. The grouping is not the mechanism.
-        # What is left is the generated loop vs OpenBLAS's asm in this band on THIS µarch. Next probe
-        # if it is picked up: alignment sensitivity (offset the base pointer and see whether PB's
-        # deficit moves while OB's does not).
+        # THE SHAPE OF THE CELL, which is the best clue it has: the miss is a NOTCH. n=1e4 (80 KB) and
+        # n≥1e5 (800 KB) both GATE, and both run the IDENTICAL ivdep branch below — only 160-320 KB
+        # misses. Identical code either side means the mechanism is working-set-dependent µarch behaviour
+        # (L2 prefetch pacing / replacement / store-drain), not instruction selection. That n=1e4 gates
+        # is also the real argument that the deficit is per-BYTE not per-CALL, and it is much stronger
+        # than the "flat across 2e4/3e4/4e4" line above: n=1e4 runs 3× the reps, so any per-rep cost
+        # would miss 3× harder there. It does not.
+        # Note the opaque-ccall asymmetry runs the OTHER way — OB pays ~266 LBT trampoline entries per
+        # sample INSIDE its timed window and PB pays none, so OB's raw kernel beats our best loop by
+        # somewhat MORE than the ratio says.
         #
-        # ⚠ RESOLUTION BOUND, measure it before believing any number above. The same arm benched TWICE
-        # in one run (identical code, adjacent windows, freq-locked, quiet box) differs by:
-        #     n=3e4  0.02%      n=1e5  0.7%      n=3e5  6.5%
-        # So the n=3e4 entries here are solid and the large-n ones are at or under the floor — at n=3e5
-        # nothing below ~7% is a measurement at all. Any future scal probe must carry a duplicated arm
-        # as its own control; without one, a 1% "win" at n≥1e5 is indistinguishable from nothing.
+        # ALIGNMENT IS DEAD — do not write the offset-pointer probe this comment used to recommend.
+        # Measured 2026-08-06 over 400 fresh pairs from the gate's own maker: every array is 64-byte
+        # aligned, for both arms, always. An offset sweep would probe a regime the gate never generates.
+        # What is left is counters: `perf stat` on L2 fill/prefetch and store-queue events, comparing
+        # n=1e4 (gates) against n=3e4 (misses) — the difference of differences is the signal. That
+        # separates "PB induces more L2 traffic" from "same traffic, worse occupancy"; nothing readable
+        # in the source can.
+        #
+        # ⚠ RESOLUTION IS CONFIGURATION-BOUND, and the earlier note here overstated it. Duplicating an
+        # arm in one run gave 0.02% / 0.7% / 6.5% at n=3e4/1e5/3e5 — but `samples=400 seconds=0.15`
+        # does NOT deliver 400 samples: the `seconds` budget includes the maker, and two `randn(n)`
+        # calls dominate it at large n. Measured actual counts: 80 / 80 / 41. So the 6.5% is mostly
+        # low-N sampling error in a starved window, NOT a property of the machine — raising `seconds`
+        # shrinks it roughly as 1/√N. The n=3e4 floor (0.02%, and there the window is not starved) is
+        # what makes the falsifications above trustworthy; the n≥1e5 entries are the weak ones.
+        # Two rules for any future scal probe: carry a duplicated arm as its own control, and put the
+        # duplicate of the FIRST arm in the LAST slot — adjacent duplicates cannot see run-position
+        # drift (allocator arena growth, page-cache state), which is exactly why the gate rotates arm
+        # order per round (plots.jl:252-255) and why 0.02% is a LOWER bound on this probe's floor.
         if n * sizeof(T) > _L1_BYTES
             @inbounds @simd ivdep for j in 1:n
                 unsafe_store!(px, a * unsafe_load(px, j), j)
