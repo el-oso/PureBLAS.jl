@@ -32,7 +32,7 @@ PureBLAS.dot(x, y)               # conjugated inner product
 ```
 
 **2. LBT drop-in.** `PureBLAS.activate()` registers in-process `@cfunction` pointers to the native
-`@ccallable` kernels (123 symbols), after which `A*B`, `mul!`, `cholesky`, `qr`, `svd`, `eigen` and
+`@ccallable` kernels (492 symbols), after which `A*B`, `mul!`, `cholesky`, `qr`, `svd`, `eigen` and
 `LinearAlgebra.BLAS.*` all dispatch to PureBLAS. `deactivate()` restores OpenBLAS.
 
 ```julia

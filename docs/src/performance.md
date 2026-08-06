@@ -151,10 +151,14 @@ Gates broadly on all three boxes. The complex gemv-T/C small-n dip on AVX-512 (w
 n=32) is closed by a parity-preserving fold epilogue (Vec{2W} deinterleave + two horizontal sums →
 one halving fold to [Σeven,Σodd]); `zgemvN` on Zen5 (was ~0.91 across small/mid n) by sign-folding
 the `ci` broadcast so the per-row epilogue drops an FMA-port op. `ztrsv`/`ztrmv` large-n on AVX-512
-were closed (2048: 0.97→1.22) by routing the triangular off-diagonal scatter through the tuned `ri`
-gemv — a stale branch had used the older row-tile kernel. Remaining shallow residuals: `ztrsv` n=1024
-(~0.91, a coupled upper/lower-triangular tradeoff), `zgeru` mid-n and `zhemv` large-n (~0.97, near the
-DRAM roofline), and `zgemvN` Zen5 at n=512.
+were largely closed (n=2048: `ztrmv` 1.13 Zen4 / 1.17 Zen5, `ztrsv` 1.12 Zen5 and 0.99 Zen4) by
+routing the triangular off-diagonal scatter through the tuned `ri`
+gemv — a stale branch had used the older row-tile kernel. Remaining residuals cluster at **n=1024** on
+the AVX-512 boxes: `ztrsv` (0.948 Zen4, 0.937 Zen5) and `ztrmv` (0.949 Zen4) — a coupled upper/lower-
+triangular tradeoff — alongside the complex gemv trio `zgemvN`/`zgemvT`/`zgemvC` (0.85–0.88 Zen4,
+0.94–0.95 Zen5). `zgeru` dips mid/large-n (0.818 Zen4 at n=1024, 0.857 Zen5 at n=4096), and `zhemv`
+misses only on Zen3 at large n (0.920 at n=2048, near the DRAM roofline) while gating 1.9–2.5× on both
+AVX-512 boxes.
 
 ![Complex BLAS-3 — three µarchs](assets/perf_cl3.svg)
 
@@ -197,8 +201,9 @@ duplicated here.
 
 **Zen4 (AVX-512, double-pumped).** The tuning target; gates essentially everywhere. Real
 residuals are worst-size only (`syrk` 0.94, `syr2k` 0.97, `trmm` 0.97 — geomeans all ≥ 1.07).
-Complex residuals are the shared LAPACK gaps plus small `zgemvT`/`zgemvC`/`ztrmv` worst-size
-dips.
+Complex residuals are the shared LAPACK gaps plus an n=1024 complex BLAS-2 cluster —
+`zgeru` 0.818, `zgemvN` 0.849, `zgemvT` 0.856, `zgemvC` 0.877, and shallower `ztrmv`/`ztrsv`
+dips (~0.95).
 
 **Zen5 (AVX-512, native 512-bit).** Clears every AVX2 ceiling but shows a disjoint residual
 profile — the reason the gate is per-machine. Open: `gemvN` mid-n (~0.90; the m-inner panel
