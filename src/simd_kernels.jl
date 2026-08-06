@@ -351,13 +351,46 @@ end
         # sample INSIDE its timed window and PB pays none, so OB's raw kernel beats our best loop by
         # somewhat MORE than the ratio says.
         #
-        # ALIGNMENT IS DEAD — do not write the offset-pointer probe this comment used to recommend.
-        # Measured 2026-08-06 over 400 fresh pairs from the gate's own maker: every array is 64-byte
-        # aligned, for both arms, always. An offset sweep would probe a regime the gate never generates.
-        # What is left is counters: `perf stat` on L2 fill/prefetch and store-queue events, comparing
-        # n=1e4 (gates) against n=3e4 (misses) — the difference of differences is the signal. That
-        # separates "PB induces more L2 traffic" from "same traffic, worse occupancy"; nothing readable
-        # in the source can.
+        # ALIGNMENT IS DEAD FOR THE GATE REGIME — do not write the offset-pointer probe this comment
+        # used to recommend. Measured 2026-08-06: the harness's arrays are unconditionally 64-byte
+        # aligned, 1600/1600 across n=1e4..3e5 (allocator property of Julia's large-Memory path, not a
+        # call-context one). An offset sweep would probe a regime the gate never generates. This is
+        # scoped to the harness: a user-supplied misaligned view in production is a separate question.
+        #
+        # THE NEXT INSTRUMENT IS `perf stat`, and the plan is written out here because building it is
+        # ~40 min and picking it up cold is where this cell keeps stalling. Native CLI, so rule-safe.
+        #   · ISOLATE BY SUBTRACTION, not by delay flags. The maker (`randn(n)`×2 per sample) writes the
+        #     whole working set and is 60-85% of wall time — its L2 traffic would swamp a 0.7% signal.
+        #     Add a `count` mode to the probe: `scal_live.jl count <pb|ob|setup> <n> <S>` doing S
+        #     iterations of "fresh pair + the live rep loop", where `setup` omits only the rep loop (but
+        #     still calls its arm ONCE, so compilation is equalized). Subtract the setup run.
+        #     The `ob` arm is a JUSTIFIED exception to never-re-measure-references: the v3 cache holds
+        #     OpenBLAS's TIMES, not its COUNTERS. Keep its numbers out of every timing table.
+        #   · S=20000 at n=3e4, S=40000 at n=1e4 (~30 s each); 3 repeats. Counters are exact, so the
+        #     3× spread of the differences IS the error bar.
+        #   · Two groups of 6 (Zen4 has 6 general counters — more would multiplex):
+        #     traffic:  ls_dmnd_fills_from_sys.local_l2, ls_hw_pf_dc_fills.local_l2,
+        #               l2_request_g1.rd_blk_l, l2_request_g1.l2_hw_pf, l2_pf_hit_l2.all,
+        #               l2_pf_miss_l2_hit_l3.all
+        #     occupancy: instructions, cycles, ls_dispatch.store_dispatch, ls_dispatch.ld_dispatch,
+        #               de_no_dispatch_per_slot.backend_stalls, ls_stlf
+        #   · NORMALIZE PER LINE PER PASS (lines L=n/8, passes P=S·_L1REP(n)); per-byte and per-rep both
+        #     hide the ~1-fill-per-line-per-pass structure. Signal is the difference of differences:
+        #         G = [r_pb(3e4) − r_ob(3e4)] − [r_pb(1e4) − r_ob(1e4)]
+        #     i.e. the miss minus the cell that gates on the SAME code path.
+        #   · SANITY-CHECK BEFORE READING ANYTHING: (1) demand+prefetch fills ≈ 1.0 line/line/pass for
+        #     both arms at both n (both working sets exceed L1, so every line refetches each pass) — if
+        #     not, the subtraction is broken; (2) cycles_pb/cycles_ob at 3e4 must reproduce ~1.007 — if
+        #     the counted workload does not reproduce the gate gap it is not in the gate regime and
+        #     nothing else in the run is admissible.
+        #   · DECIDE: traffic G ≳ 0.007 lines/line/pass (the size of the bandwidth gap), spread under
+        #     half that ⇒ PB induces more L2 traffic; then re-run with the `l2_pf_hit_l2.*` sub-masks to
+        #     name the prefetcher. Traffic G ≲ 0.002 while cycles G ≈ +0.7% ⇒ same bytes, worse
+        #     occupancy ⇒ read `backend_stalls`/`store_dispatch`. G ≈ 0 at BOTH n contradicts the notch
+        #     and reopens the "n=1e4 gates" premise — stop rather than force an interpretation.
+        #   · ONLY IF the verdict is "same traffic, worse occupancy" is an exact-asm arm worth writing,
+        #     and it then needs `llvmcall`/inline asm — you cannot make LLVM emit OB's five-instruction
+        #     loop from Julia source, and trying reproduces the source-vs-emitted mismatch struck above.
         #
         # ⚠ RESOLUTION IS CONFIGURATION-BOUND, and the earlier note here overstated it. Duplicating an
         # arm in one run gave 0.02% / 0.7% / 6.5% at n=3e4/1e5/3e5 — but `samples=400 seconds=0.15`
@@ -366,10 +399,23 @@ end
         # low-N sampling error in a starved window, NOT a property of the machine — raising `seconds`
         # shrinks it roughly as 1/√N. The n=3e4 floor (0.02%, and there the window is not starved) is
         # what makes the falsifications above trustworthy; the n≥1e5 entries are the weak ones.
-        # Two rules for any future scal probe: carry a duplicated arm as its own control, and put the
-        # duplicate of the FIRST arm in the LAST slot — adjacent duplicates cannot see run-position
-        # drift (allocator arena growth, page-cache state), which is exactly why the gate rotates arm
-        # order per round (plots.jl:252-255) and why 0.02% is a LOWER bound on this probe's floor.
+        # And the 6.5% is NOT ordinary sampling error either: within-window spread at n=3e5 is ~5%
+        # p10-p90, so a median over 41 samples has SE ≈ 0.4% and two duplicates should differ by ~0.55%
+        # RMS. Seeing 6.5% — an order of magnitude more — means the per-sample distribution is SHIFTING
+        # or BIMODAL between windows (page-placement/allocator modes on fresh 2.4 MB mmaps) and the
+        # median hops modes. So raising `seconds` alone will NOT reliably get under 1%; the arms have to
+        # be POOLED OVER ROTATED ROUNDS so each samples the same mode mixture. Do not extrapolate a
+        # floor from √N — measure it with the duplicate, every time.
+        # Prescription for a probe at these sizes: `seconds` 0.7 / 1.0 / 2.0 at n=3e4 / 1e5 / 3e5, with
+        # 2 / 2 / 4 rounds; keep `evals=1` (the gate uses it, and >1 would average away exactly the
+        # per-context variance being characterised); keep `reps` at `_L1REP` — raising it amortises
+        # setup but changes the warmup-vs-steady-state split INSIDE the timed region, which is a
+        # probe-regime violation with extra steps. Print the per-round medians (as plots.jl:267 does):
+        # monotone across rounds = drift, jumping = the mode-hopping above.
+        # Two rules for any future scal probe: duplicate the ANCHOR arm (`pb`, the one every ratio is
+        # formed against), and ROTATE arm order per round like the gate does (plots.jl:252-255) rather
+        # than merely putting the duplicate last. First-in-last-slot bounds only maximal-separation
+        # drift — conservative, and its failure mode is calling a resolvable cell unresolvable.
         if n * sizeof(T) > _L1_BYTES
             @inbounds @simd ivdep for j in 1:n
                 unsafe_store!(px, a * unsafe_load(px, j), j)
