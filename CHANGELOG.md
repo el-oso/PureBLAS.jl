@@ -4,7 +4,19 @@ All notable changes to PureBLAS.jl are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.1.0
+## Versioning
+
+Pre-1.0, following Julia's convention that **`0.x` → `0.(x+1)` is breaking**. Kernel and blocking
+changes reorder floating-point summation, so results change bit-for-bit even when the API does not —
+in a numerics library that is a breaking change, and it is why each performance phase takes a minor
+bump rather than a patch. Patch releases are reserved for work that provably cannot move a result
+(tooling, benchmarks, documentation).
+
+**`1.0.0` means the gate is met**: every routine ≥ `max(OpenBLAS, AOCL)` at every measured size on
+every microarchitecture in the fleet. Not a date, not a feature count — the project's actual thesis,
+demonstrated.
+
+## [0.1.0] — 2026-08-06
 
 First release: a pure-Julia BLAS/LAPACK implementation — a drop-in, AD-traceable replacement for the
 OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (sibling of PureFFT.jl).
@@ -41,6 +53,21 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
 
 ### Fixed
 
+- **`iamax`/`izamax` returned the WRONG INDEX when a NaN followed the maximum in the same SIMD lane.**
+  A silent wrong answer from a shipped BLAS routine, on ordinary input, in three kernels from one
+  root cause: every comparison against NaN is false, so a max-reduction written as *"take the new
+  value if it compares greater, else keep the old"* silently keeps whatever occupies the fallback
+  slot. `_iamax_tree!` (live for `_L1_BYTES < n·sizeof(T) ≤ _L2_BYTES`, ≈4097–131072 `Float64` on
+  Zen4) let a NaN swallow a larger value at one fold node and then be discarded itself at the next,
+  erasing the true maximum — `PureBLAS.iamax` returned its seed index 1 where netlib and OpenBLAS
+  return 2. `_iamax_cmplx_simd!` (**live on every box**, so `izamax`/`icamax` were affected) and
+  `_iamax_chain4!` (SSE/NEON only) seeded their running maximum from the first blocks' own values,
+  so a NaN there poisoned that lane permanently. netlib's contract is that a NaN *mid-vector* is
+  skipped and `dmax` can only be NaN if element 1 is; `_iamax_thresh!` was correct throughout
+  precisely because it broadcasts its threshold from `|x[1]|`, and the fixes make the others match.
+  The testitem named for this exact shape had never executed the kernel it was named after — its
+  sizes are L1-resident, so dispatch routed every assertion to the one correct kernel. Kernels are
+  now also tested **by name**, independently of dispatch.
 - **`A \ b` with one right-hand side ran 14× slower than OpenBLAS, and nothing was measuring it.**
   `getrs`/`potrs`/`trtrs` existed only as C-ABI shims, so the benchmark harness — which compares
   `PureBLAS.foo!` against `LAPACK.foo!` — had nothing to call. Native entry points now exist (Mode-2,
@@ -111,6 +138,28 @@ OpenBLAS/MKL that Julia ships by default. Part of the **Pure Julia Ecosystem** (
   valid, but the overwritten factor arrays and `ipiv` disagreed with `cgttrf`/`zgttrf`. Now matches
   LAPACK, and is also cheaper (no `hypot` on the complex path). This was invisible until row-interchange
   test coverage was added — the previous tests were diagonally dominant and never took a pivot.
+
+### Falsified
+
+Measured dead ends, recorded so they are not re-attempted. In a project whose rule is "measure, don't
+guess", a disproven hypothesis is worth as much as a win.
+
+- **`pbtrf` uplo='U' band re-pack tiling — REVERTED.** The diagnosis holds: the re-pack is 31.6% of
+  the call at kd=128 and shows a **power-of-two stride aliasing spike**, 3× its immediate neighbours
+  (pack/unpack µs at n=4096: kd=127 215/324, **128 616/640**, 129 204/340), because both passes walk
+  diagonals stepping `ld-1` elements = exactly 1024 B. Tiling the walk fixed it on Zen3 (−14.6%) and
+  **made it worse on Zen4** (+8.8% at kd=128, +18.6% at kd=192, taking a gating cell to 0.995). Both
+  boxes have identical L1 geometry (32 KB, 8-way, 64 sets), so a set-capacity model computes the same
+  value on each and cannot explain opposite signs — the mechanism is not set capacity. Any revival
+  must be a Measure-tier auto-tune, not another predicate.
+- **Narrow-B (`nrhs=1`) `trsm` is not a routing problem.** Routing single-column solves to `trsv`
+  above `_TRSM_DBASE` was the obvious fix; measured, PureBLAS's `trsm!` already matches or beats its
+  own `trsv!` on the configurations `potrs` issues. At k=2048 the solve moves 16.8 MB of triangle in
+  449 µs ≈ 37 GB/s against AOCL's ≈40 — a streaming-efficiency question, not blocking or dispatch.
+- **`getrs@8` is not wrapper overhead.** The entire wrapper (`getrs!` + `laswp` + two public `trsm!`
+  entries) costs ~30 ns of 191 ns; AOCL completes the whole solve in ~154 ns, less than our two
+  kernel calls alone. The cost is the tiny-`n` triangular kernel. Related coverage hole: `trsv` is
+  benchmarked only from n=128 up, so the n ≤ 32 solve path has no gate cell of its own.
 
 ### Known limitations
 
