@@ -812,82 +812,40 @@ function _gemv_n_ri_run!(
     return y
 end
 
-# MEASURE tier for the large-A NC. Pinned via Preferences (every trim/.so build MUST set it — a runtime
-# benchmark is not trim-safe); `@static if` so the auto path is NOT DEFINED when pinned, rather than
-# relying on DCE. Mirrors `_measure_ger_np` above, including the median-not-min reduction: this knob has
-# different winners on Zen3 and Zen4, so the luckiest window of one candidate must not decide what ships.
-const _CGEMVN_NCBIG_PREF = @load_preference("cgemvn_nc_big", nothing)
-@static if isnothing(_CGEMVN_NCBIG_PREF)
-    # Base-only and TOTAL — OncePerProcess poisons the whole process if its initializer throws, so every
-    # path returns a usable NC. The fallback is the shipping value, i.e. "no worse than before".
-    # PROBE SHAPE IS A ≈ L3 AND SQUARE. Both halves were mistakes I made and measured:
-    #
-    #   SIZE — `_tune_better`'s 5% margin exists because a plain `<` coin-flips which kernel ships (see
-    #   its docstring) and it sits above the in-process tuner's resolution, so a candidate must be
-    #   measured where its effect is LARGEST or a real win is discarded as a tie. On Zen4 the
-    #   shipping→3W/2 gain is 13.2% at A ≈ L3 but only 5.8% at A ≈ 4×L3 — straddling the margin.
-    #
-    #   ASPECT — the first version used n = 4W columns and derived m from the byte target, giving a
-    #   32768×32 TALL-SKINNY matrix. It returned the incumbent: with 32 columns there are two panels and
-    #   a tail, y is half of L2, and none of the column-stream parallelism this knob controls is in
-    #   play. The gate measures SQUARE (plots.jl's `sq` maker), and a knob tuned in one regime and
-    #   consulted from another is the probe-regime error again — the sixth instance. Solve m = n from
-    #   the byte target instead, which lands on 1024×1024 here: the binding gate cell exactly.
-    function _measure_cgemvn_nc_big()::Int
-        W = _vwidth(Float64)
-        Base.generating_output() && return _CGEMVN_NC   # don't burn a measure during precompilation
-        try
-            # A bytes = 2·m·n·sizeof(T); square ⇒ m = n = √(L3 / (2·sizeof(ComplexF64)/2)) = √(L3/16)
-            n = max(4 * W, isqrt(_L3_BYTES ÷ (2 * 2 * sizeof(Float64))))
-            m = n                                    # A ≈ L3, square — the gate's own shape
-            A = fill(ComplexF64(1.0, 0.5), m, n)     # pre-touched (no first-touch bias in the measurement)
-            x = fill(ComplexF64(1.0, 0.0), n); y = fill(ComplexF64(0.0, 0.0), m)
-            α = ComplexF64(1.0, 0.0); β = ComplexF64(1.0, 0.0)
-            # ⚠ EVERY CANDIDATE IS COMPARED AGAINST THE INCUMBENT, NEVER AGAINST A RUNNING BEST.
-            # The obvious sweep — `_tune_better(t, bt) && (bt = t; best = c)` — RE-BASES the margin after
-            # each win, so a monotone ladder of sub-margin gains never displaces anything even when the
-            # top candidate beats the ORIGINAL default by far more than the margin. That is not
-            # hypothetical: this knob's measured Zen4 ladder is 1.000 → 1.090 (W) → 1.132 (3W/2) vs the
-            # shipping NC, so chained, 3W/2 is judged against W's already-improved time (3.9%) instead of
-            # against shipping (13.2%). `_ger_np` and `_axpy_unroll` share the chained shape and should
-            # be revisited (task filed) — do not copy it here.
-            # Qualification is by margin against the incumbent, so ties still keep today's behaviour.
-            # Between two QUALIFIERS the margin is applied again, ties going to the SMALLER panel: both
-            # are already ≥ margin better than shipping, so the residual choice is worth at most the
-            # margin, and the smaller panel holds fewer live broadcasts.
-            # ⚠ WHAT THIS ACTUALLY SHIPS ON Zen4 TODAY: W, not 3W/2 — both qualify, and the tie-break
-            # margin swallows the 3.9% between them. So ~3.6% of the n=1024 cell is still on the table
-            # (0.849 → ~0.925 taken, ~0.961 available), left there by the DECISION RULE's resolution and
-            # not by the kernel. Fixing that needs `_tune_better` replaced by a paired sign test — a
-            # cross-cutting change to every Measure knob, filed separately rather than special-cased
-            # here. Do not "fix" it locally by dropping the tie-break to a plain `<`: that is the
-            # comparison which made two fresh processes of one binary resolve the axpy knob to 208 and
-            # to 4, and the tuner-regime noise floor that would justify it has never been measured.
-            # DUELS, not a margin on medians. Each candidate is run against the INCUMBENT over rotated
-            # rounds whose per-round statistic is itself a median; the winner needs a supermajority of
-            # rounds. That is what makes this knob resolvable at all — the pair differs by a stable
-            # ~3-4%, which sat just under the old 5% threshold, so noise decided whether it cleared and
-            # four fresh processes resolved 8, 12, 8, 8. See `_tune_duel` for the measured separation
-            # (null 2/5 against power 5/5 in this very regime) and for why aggregating BEFORE counting
-            # signs is the part that makes it work.
-            inc() = _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false))
-            wW = _tune_duel(inc, () -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)))
-            w32 = _tune_duel(inc, () -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)))
-            # Both are measured against the SAME incumbent, never against a running best, so the verdict
-            # cannot depend on which candidate happened to be tried first. Widest wins ties: if both earn
-            # a supermajority they are each clearly better than shipping, and the gate prefers 3W/2 here.
-            _tune_wins_it(w32) && return 3W ÷ 2
-            _tune_wins_it(wW) && return W
-            return _CGEMVN_NC
-        catch
-            return _CGEMVN_NC
-        end
-    end
-    const _CGEMVN_NCBIG_ONCE = Base.OncePerProcess{Int}(_measure_cgemvn_nc_big)
-    @inline _cgemvn_nc_big() = _CGEMVN_NCBIG_ONCE()
-else
-    @inline _cgemvn_nc_big() = _CGEMVN_NCBIG_PREF::Int
-end
+# NC FOR THE LARGE-A TIER: **DERIVE**, not Measure. This was a Measure-tier OncePerProcess until
+# 2026-08-07, and the demotion is the point — the knob never earned that tier, it inherited it by
+# analogy to `_ger_np` ("same class"), and its own data says otherwise.
+#
+# THE LITMUS TEST for Derive-vs-Measure: does the measured optimum SCALE WITH A DETECTED CONST across
+# boxes, or does it move while every detected const stays fixed? Scaling means the binding resource is
+# core structure, which the ISA/cache consts describe. Moving at fixed consts means the resource is
+# outside the detected set (memory latency, prefetcher depth, store-buffer drain) and no formula over
+# that set can reproduce it without a family branch — a per-µarch literal in disguise, which req#8b
+# bans. Measured winners for this knob, in the regime it governs (A > L3/2), square operands:
+#     Zen4 (W=8):  12   = 3W/2      [n=1024 1.132 and n=2048 1.058 vs shipping; gate 0.849 -> 0.989]
+#     Zen3 (W=4):   6   = 3W/2      [n=1024 1.032, n=2048 1.036 vs shipping]
+# The SAME formula on both, and the value tracks W — the signature of a core-structure bound. Note it
+# is specifically NOT the memory-level-parallelism story I first assumed: MAB/LFB counts do not double
+# when AVX-512 is enabled, so an MLP-bound optimum would not track W at all.
+#
+# WHY 3W/2 AND NOT 2W: 2W was measured WORSE than the shipping value on both boxes (Zen4 0.930 at
+# n=2048, Zen3 0.930 at n=2048) — each column holds a cr/ci broadcast pair alongside the Pv/Qv
+# accumulators, so past 3W/2 the panel spills. That is the register-file bound, and it is why the
+# candidate set was derived from W in the first place.
+#
+# WHAT THIS DELETES, all of it pure benefit: the OncePerProcess (so no first-call benchmark inside a
+# library, no @noalloc hazard on the paths that reach this, no pin required for the trim build), the
+# duel, and the nondeterminism that had it resolving 8/12/8/8 across fresh processes before the duel
+# and 12 after. A derived const is deterministic by construction and const-folds.
+#
+# ⚠ ZEN5 IS PREDICTED, NOT MEASURED (W=8 ⇒ 12). req#8b(b) requires a derived formula to reproduce the
+# fleet's measured optima before it is trusted to extrapolate, and neuromancer has not been run for
+# this knob. Acceptance test, to run freq-locked with plots.jl methodology and `arms=pb`: zgemvN square
+# at A≈L3 and A≈4×L3, Val(8) vs Val(12) arms of `_gemv_n_ri_run!`, median estimator. If Zen5 prefers 8,
+# that is the req#8b tell and this goes back to Measure — the Preference below is the escape hatch
+# meanwhile.
+const _CGEMVN_NC_BIG = @load_preference("cgemvn_nc_big", 3 * _vwidth(Float64) ÷ 2)::Int
+@inline _cgemvn_nc_big() = _CGEMVN_NC_BIG
 
 # The shipping panel, with NO reference to the measured knob. Internal BLAS-2 callers use THIS, not the
 # tier-selecting entry below — see the @noalloc note there.

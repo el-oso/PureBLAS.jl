@@ -80,15 +80,15 @@ end
 # pure half (the counting); `_tune_duel` does the timing and is exercised by the acceptance test in
 # bench/probes/tune_freshops_validate.jl plus the cross-process determinism check recorded below.
 @testitem "tuner: supermajority rule and its tie probability" begin
-    using PureBLAS: _tune_wins_it
+    using PureBLAS: _tune_wins_it, _tune_rounds, _TUNE_ROUNDS, _TUNE_ALPHA, _TUNE_NKNOBS
 
     # Default 5 rounds: 4 or 5 wins displaces, 3 does not. One spoiled round is survivable, two is not.
     @test _tune_wins_it(5, 5)
     @test _tune_wins_it(4, 5)
     @test !_tune_wins_it(3, 5)
     @test !_tune_wins_it(0, 5)
-    @test _tune_wins_it(4)              # 5 is the default
-    @test !_tune_wins_it(3)
+    @test _tune_wins_it(_TUNE_ROUNDS - 1)      # the default is DERIVED, so assert it relationally
+    @test !_tune_wins_it(_TUNE_ROUNDS - 2)
 
     # More rounds tightens it, which is how determinism is DIALLED rather than assumed.
     @test !_tune_wins_it(7, 9)
@@ -103,6 +103,24 @@ end
     @test tie_fp(13) < 0.002
     # ...and it must be monotone decreasing in rounds, or "dial it with `rounds`" would be false.
     @test all(tie_fp(r + 1) < tie_fp(r) for r in 3:20)
+
+    # ── THE ROUND COUNT IS DERIVED, and this pins the derivation so no literal can creep back.
+    # The rule: with `ncand` duels per sweep, the family-wise tie rate must fit the per-knob share of
+    # the one stated risk budget. Everything below follows from _TUNE_ALPHA alone.
+    budget = _TUNE_ALPHA / _TUNE_NKNOBS
+    for c in (2, 3, 4, 6, 8)
+        r = _tune_rounds(c)
+        @test c * tie_fp(r) <= budget                    # it MEETS the budget...
+        @test r == 5 || c * tie_fp(r - 1) > budget       # ...and is the SMALLEST r that does
+    end
+    # More candidates can never need fewer rounds — the multiple-comparisons correction, asserted.
+    @test all(_tune_rounds(c + 1) >= _tune_rounds(c) for c in 1:12)
+    # The default serves the widest sweep in the tree (6 candidates: _measure_axpy_unroll).
+    @test _TUNE_ROUNDS == _tune_rounds(6)
+    # And it is comfortably stricter than the 5 rounds that measurably failed: at 5 rounds a 6-candidate
+    # sweep flips ~70% of the time at a tie, which is what `axpy_band` was observed doing.
+    @test 6 * tie_fp(5) > 0.5
+    @test _TUNE_ROUNDS > 5
 end
 
 # The knob resolvers must return something USABLE on any host, including one where the measurement

@@ -305,8 +305,54 @@ phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which
 """
 @inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95
 
+# ROUND COUNT IS DERIVED, NOT PICKED. There is exactly ONE free choice in this whole rule and it is
+# `_TUNE_ALPHA` below; everything else follows by arithmetic from it.
+#
+# `_tune_wins_it` demands `rounds-1` wins, so at a GENUINE TIE one duel displaces with probability
+# `(rounds+1)/2^rounds` — that is exact, a property of the rule alone, and needs no assumption about
+# any machine. A sweep runs one duel PER CANDIDATE, so what governs whether a knob is stable is the
+# FAMILY-WISE rate `ncand·(rounds+1)/2^rounds`. Solve that for `rounds` and the constant disappears.
+#
+# Measured consequence of getting this wrong (2026-08-06, wintermute, one knob per fresh process, 5
+# rounds throughout): `cgemvn_nc_big` (2 candidates) and `ger_np` (3) came out STABLE while `axpy_band`
+# (6) and `axpy_dram` (4) still flipped. The instability tracked CANDIDATE COUNT — the signature of a
+# multiple-comparisons error, not of a noisy machine, and the reason a single global round count was
+# the wrong shape for this knob in the first place.
+#
+# WHY THIS IS NOT THE 5% MARGIN IN NEW CLOTHES. That margin was an empirical CLAIM about hardware
+# ("5% is above the probes' resolution on every fleet box") — unverified, and measurement later put the
+# real figure anywhere from 0.02% to 6.5% on ONE box. `_TUNE_ALPHA` claims nothing about hardware. It
+# is a stated risk budget: how often we are willing to let a library load ship a different kernel than
+# the last one WHEN THE CANDIDATES ARE GENUINELY TIED — in which case the two kernels are equivalent by
+# construction and the cost of the flip is bounded by δ. Spread over the ~13 Measure knobs in the tree,
+# 5% library-wide is ~0.4% per knob. Raise or lower it as a product decision; the rounds follow.
+const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a tie), the one dial
+# req8-ok: NOT a machine-dependent tuning value — it is a COUNT of the Measure-tier knobs in this tree,
+# used as the Bonferroni denominator that splits `_TUNE_ALPHA` across them. It depends on the source,
+# not on the host, so there is nothing to derive from a detected const. Being stale-high is the safe
+# direction (a larger denominator buys MORE rounds), so drift costs conservatism, never correctness.
+# Keep in step with bench/probes/knob_stability_audit.jl, which enumerates them.
+const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
+
 """
-    _tune_duel(fa, fb; rounds=5, reps=5, δ=2) -> Int
+    _tune_rounds(ncand) -> Int
+
+Rounds needed so that `ncand` duels together risk at most `_TUNE_ALPHA/_TUNE_NKNOBS` of a spurious
+displacement at a tie. Pure, integer, evaluated at the call site — so a sweep with 2 candidates does
+not pay for a sweep with 6, and adding a candidate automatically buys the rounds it costs.
+"""
+@inline function _tune_rounds(ncand::Int)
+    budget = _TUNE_ALPHA / _TUNE_NKNOBS
+    r = 5
+    while r < 25 && ncand * (r + 1) / 2.0^r > budget
+        r += 1
+    end
+    return r
+end
+const _TUNE_ROUNDS = _tune_rounds(6)        # widest sweep in the tree; the default for callers
+
+"""
+    _tune_duel(fa, fb; rounds=_TUNE_ROUNDS, reps=5, δ=2) -> Int
 
 How many of `rounds` the candidate `fb` beats the incumbent `fa`. Feed to [`_tune_wins_it`](@ref).
 Each round reduces BOTH arms with the MEDIAN of `reps` timings, then records ONE bit: who won. Arm
@@ -338,9 +384,10 @@ and only the policy half was ever legitimately a constant.
 Cost is `rounds*reps*2` timings (~50 at the defaults) — tens of ms once per process, so this stays a
 load-time self-tune and needs no pin and no persisted calibration.
 """
-function _tune_duel(fa::FA, fb::FB; rounds::Int = 5, reps::Int = 5, δ::Int = 2) where {FA, FB}
+function _tune_duel(fa::FA, fb::FB; rounds::Int = _TUNE_ROUNDS, reps::Int = 5, δ::Int = 2) where {FA, FB}
     fa(); fb()                                     # warmup, untimed (first touch + any JIT)
     wins = 0
+    need = rounds - 1                              # the supermajority `_tune_wins_it` will demand
     for r in 1:rounds
         local ta::UInt64, tb::UInt64
         if isodd(r)                                # ABBA: neither arm always runs second
@@ -349,12 +396,18 @@ function _tune_duel(fa::FA, fb::FB; rounds::Int = 5, reps::Int = 5, δ::Int = 2)
             tb = _tune_one(fb; reps = reps); ta = _tune_one(fa; reps = reps)
         end
         tb * 100 < ta * UInt64(100 - δ) && (wins += 1)
+        # EARLY EXIT once the verdict is settled — this is what pays for the round count. A candidate
+        # that has already lost twice cannot reach `rounds-1`, and most candidates in a sweep are
+        # hopeless, so the common case costs 2 rounds rather than `rounds`. Only a genuinely close
+        # contest runs to the end, which is exactly where the extra rounds are needed.
+        wins + (rounds - r) < need && return wins   # cannot still reach the threshold
+        wins >= need && return wins                 # already there; further rounds cannot unmake it
     end
     return wins
 end
 
 """
-    _tune_wins_it(wins, rounds=5) -> Bool
+    _tune_wins_it(wins, rounds=_TUNE_ROUNDS) -> Bool
 
 Does a candidate with `wins` of `rounds` displace the incumbent? Requires a SUPERMAJORITY (`rounds-1`),
 so one spoiled round — a mode hop, a stray interrupt — cannot decide what ships.
@@ -366,7 +419,7 @@ happened to fall below it, which was asserted fleet-wide and never verified. Not
 means the candidates are genuinely equivalent, so a flip costs at most `δ`; the old failure flipped
 between candidates differing by a real 3-4%.
 """
-@inline _tune_wins_it(wins::Int, rounds::Int = 5) = wins >= rounds - 1
+@inline _tune_wins_it(wins::Int, rounds::Int = _TUNE_ROUNDS) = wins >= rounds - 1
 
 """
     _tune_pick(t_inc, ts::NTuple{N,UInt64}) -> Int
