@@ -43,24 +43,34 @@ end
 #
 # STALE MEANS "src/ MOVED", NOT "the hash differs". A hash test flags every row in the file the moment
 # you commit anything — 133 of 133 on the first run of this — and a flag that is always on is a flag
-# nobody reads. `git diff --quiet <c>..HEAD -- src/` asks the question that actually matters: is the
+# nobody reads. `git diff --name-only <c>..HEAD -- src/` asks the question that actually matters: is the
 # measured code still the shipping code? A cell measured five doc commits ago is not stale.
+#
+# AND IT NAMES THE FILES, because a boolean is still too coarse to act on. Measured immediately after
+# shipping the boolean version: every BLAS-1 row on both boxes came up stale against `fd56167`, while
+# the only src commits since it were `937e906` (iamax), `457b2a7`/`5de2bde` (potrf upper) and a
+# net-zero revert — nothing that can touch `scal`/`axpy`/`dot`/`asum`. "Something moved" would have had
+# me re-sweep three boxes for ~8 hours to re-derive numbers that were already valid. The file list makes
+# that judgement possible without a per-op→per-file mapping nobody would maintain: the reader decides
+# relevance, which is the part a tool should not be guessing at.
 const HEAD = try
     readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`)
 catch
     "unknown"
 end
-const _SRCMOVED = Dict{String, Bool}()
-function srcmoved(c)
-    c in ("?", "unknown", HEAD) && return false
-    return get!(_SRCMOVED, c) do
+const _SRCDIFF = Dict{String, Vector{String}}()
+function srcdiff(c)
+    (c in ("?", "unknown", HEAD)) && return String[]
+    return get!(_SRCDIFF, c) do
         try
-            !success(`git -C $(@__DIR__) diff --quiet $c..HEAD -- ../src`)
+            fs = readchomp(`git -C $(@__DIR__) diff --name-only $c..HEAD -- ../src`)
+            isempty(fs) ? String[] : [replace(x, "src/" => "") for x in split(fs, "\n")]
         catch
-            false                              # commit not in this clone (fleet cache) — can't say, don't cry wolf
+            String[]                           # commit not in this clone (fleet cache) — can't say, don't cry wolf
         end
     end
 end
+srcmoved(c) = !isempty(srcdiff(c))
 
 med(v) = sort(v)[max(1, cld(length(v), 2))]
 # per-round ratio medians: chunk both arms' stored vectors into rounds of QN and divide elementwise
@@ -99,13 +109,13 @@ println("cells=", length(rows), "  below 1.0=", length(fails))
 # Reading only the worst-of column, I twice assumed inheritance that was not there. A one-sided gap
 # (we crush one reference, lose to the other) also usually means the loser implemented something the
 # winner did not, which changes what "close this cell" even means.
-println("HEAD=$HEAD   (a STALE row's pb arm predates a change to src/ — re-measure that cell before \
-reading it as a verdict on today's code)")
+println("HEAD=$HEAD   (STALE(c) = the pb arm was measured at c, and src/ has changed since. Check the \
+legend below:\n             if nothing in that file list can reach this op, the number still stands.)")
 println("\n  gap    ratio  spread  cell                          vs        vs_OB   vs_AOCL  cache")
 for (ratio, spread, lvl, op, sz, ref, f, per, pbc) in fails
     # a miss smaller than the cell's own round-to-round spread is not distinguishable from noise
     tag = (1.0 - ratio) <= spread ? "  <- within spread" : ""
-    srcmoved(pbc) && (tag *= "  <- STALE: src/ changed since $pbc")
+    srcmoved(pbc) && (tag *= "  <- STALE($pbc)")
     fmt(r) = haskey(per, r) ? rpad(round(per[r]; digits = 3), 8) : rpad("—", 8)
     println(rpad(string(round(100 * (1 - ratio); digits = 1), "%"), 7),
         rpad(round(ratio; digits = 3), 7), rpad(round(spread; digits = 3), 8),
@@ -115,3 +125,12 @@ end
 nnoise = count(r -> (1.0 - r[1]) <= r[2], fails)
 println("\n$(length(fails) - nnoise) of $(length(fails)) misses exceed their own round spread; ",
     "$nnoise are within it (lower bound on noise — process-level variation is larger).")
+
+stale = sort!(unique(r[9] for r in fails if srcmoved(r[9])))
+if !isempty(stale)
+    println("\nSTALE legend — src/ files changed between each measuring commit and HEAD=$HEAD.")
+    for c in stale
+        fs = srcdiff(c)
+        println("  $c → ", length(fs) <= 6 ? join(fs, ", ") : "$(join(first(fs, 6), ", ")) … +$(length(fs) - 6) more")
+    end
+end
