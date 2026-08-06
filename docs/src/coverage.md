@@ -455,8 +455,8 @@ symbols** — they appear only in commented-out lines of the stdlib and have no 
   rows clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly
   (0.9–0.99 at one or two sizes — often the smallest, where per-call overhead dominates and the
   measurement is least stable). The deepest remaining misses on Zen4 are `zpotrfU` (0.692), `gbtrf`
-  (0.732), `trtrs` (0.753) and the complex BLAS-2 n=1024 cluster (`zgeru` 0.818, `zgemvN` 0.849,
-  `zgemvT` 0.856, `zgemvC` 0.877). Pivoted QR (`geqp3`) **used to sit here** at 0.84 geo / 0.51 worst,
+  (0.731), `trtrs` (0.753) and the complex BLAS-2 n=1024 cluster (`zgeru` 0.817, `zgemvN` 0.848,
+  `zgemvT` 0.855, `zgemvC` 0.877). Pivoted QR (`geqp3`) **used to sit here** at 0.84 geo / 0.51 worst,
   an unblocked BLAS-2 implementation racing a blocked one; the blocked `dlaqps` port has since landed
   and it now gates on all three boxes (1.11 / 1.02 / 1.03). The other three that used to sit here —
   Bunch–Kaufman (`sytrf` was 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — shared that
