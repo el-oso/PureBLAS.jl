@@ -332,6 +332,7 @@ const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a
 # not on the host, so there is nothing to derive from a detected const. Being stale-high is the safe
 # direction (a larger denominator buys MORE rounds), so drift costs conservatism, never correctness.
 # Keep in step with bench/probes/knob_stability_audit.jl, which enumerates them.
+# req8-ok: a COUNT of Measure knobs in this source tree (Bonferroni denominator), not a machine value
 const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
 
 """
