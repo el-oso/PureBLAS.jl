@@ -1186,8 +1186,20 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             # MEDIAN per candidate, not min (see cpuinfo.jl `_tune_one`). This knob has OPPOSITE SIGN
             # across µarchs (Zen5→1, Zen3→4, Zen4→8), so it is exactly the case where the luckiest
             # window of one candidate must not decide what ships.
-            best = 4; bt = typemax(UInt64)
-            for np in (1, 2, 4, 8)
+            # ⚠ SEED `bt` WITH THE DEFAULT'S OWN MEASURED TIME, not `typemax`. With `bt = typemax`,
+            # `_tune_better(t, bt)` is `t*100 < typemax*95`, and `typemax*95` WRAPS to 2^64-95 — still
+            # astronomically above any real time, so the FIRST swept candidate always displaces and the
+            # declared default (`best = 4`) can never win. The effective incumbent was np=1 purely
+            # because it is first in the list, which silently voided the invariant the margin exists for
+            # ("ties go to the incumbent, which is the derived default", cpuinfo.jl). It bites hardest on
+            # exactly the noisy boxes the margin was built for: where all candidates sit within 5%, the
+            # shipped kernel was "first in the list", undocumented.
+            # Seeded this way the loop is extensionally identical to `_tune_pick` (bt starts at the
+            # incumbent and only decreases, so every displacement also clears the incumbent) — see the
+            # proof note there, and test/tuner_tests.jl for the pinned semantics.
+            best = 4
+            bt = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, best); reps = 5)
+            for np in (1, 2, 8)                        # the default is already timed as the incumbent
                 t = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, np); reps = 5)
                 _tune_better(t, bt) && (bt = t; best = np)
             end

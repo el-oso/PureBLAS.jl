@@ -168,9 +168,15 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
 n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
             x = fill(1.0, n); y = fill(0.5, n)
             W = _vwidth(Float64)
-            best = _UNROLL; bt = typemax(UInt64)
+            # ⚠ `bt` IS SEEDED WITH THE DEFAULT'S OWN MEASURED TIME, not `typemax`. `typemax*95` WRAPS to
+            # 2^64-95 — still far above any real time — so with a typemax seed the FIRST candidate always
+            # displaces and `best = _UNROLL` can never win a tie; the effective incumbent was whichever
+            # arm happened to be written first (Val(2)). That silently voided "ties go to the incumbent,
+            # which is the derived default" (cpuinfo.jl) on exactly the boxes the margin exists for.
+            best = _UNROLL; bt = typemax(UInt64)          # replaced immediately below, once px/py exist
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
+                bt = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: the incumbent _UNROLL=4, timed first
                 # SHAPE x DEPTH, not depth alone. Codes: u -> interleaved(u); 100+u -> phase(u, full
                 # width); 200+u -> phase(u, narrow/256-bit). Measured in situ (Fable's A/B, three fresh
                 # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
@@ -236,9 +242,11 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             n = max(4096, 2 * _L3_BYTES ÷ sizeof(Float64))
             x = fill(1.0, n); y = fill(0.5, n)
             W = _vwidth(Float64)
-            best = _UNROLL; bt = typemax(UInt64)
+            # Same typemax-seed defect as the band knob above — see the note there.
+            best = _UNROLL; bt = typemax(UInt64)          # replaced immediately below, once px/py exist
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
+                bt = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: the incumbent _UNROLL=4, timed first
                 # Literal `Val`s, same reason as the band knob above: a loop variable here produced the
                 # runtime dispatch that failed the @typestable contract on the public axpy! path.
                 t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
