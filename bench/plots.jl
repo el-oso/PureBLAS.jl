@@ -1238,12 +1238,20 @@ end
 # Reports only, unless something is genuinely eating a core: then it stops, since the alternative is
 # discovering it in the provenance afterwards. Override with `force-busy` when the contention is known
 # and accepted (e.g. deliberately benching two µarchs at once on different sockets).
+#
+# CHECKED AT BOTH ENDS, and the second check is the one that earned its keep. A start-only guard sees
+# a quiet box and then has nothing to say about the next three hours. On 2026-08-06 a `group=CL2`
+# screen started clean and an advisory agent began running its own checks on the same box mid-sweep;
+# the start guard passed, the run completed, and the numbers went into the cache with nothing marking
+# them. `busy=` in the cache header is the fix: the exit check cannot un-contend a finished run, but
+# it can stop the result from being read later as if the box had been quiet.
 const _BUSY_PCPU = 25.0
-function _contention_check()
+"Foreign processes at or above _BUSY_PCPU, as (pid, %cpu, cmdline). Excludes us and our children."
+function _busy_procs()
     out = try
         read(`ps -eo pid,ppid,pcpu,args --no-headers`, String)
     catch
-        return println("contention check: skipped (ps unavailable)")
+        return nothing                               # ps unavailable — unknown, not "clear"
     end
     me = getpid()
     busy = Tuple{Int, Float64, String}[]
@@ -1255,16 +1263,32 @@ function _contention_check()
         (pid == me || ppid == me) && continue        # us, and anything we spawned
         pc >= _BUSY_PCPU && push!(busy, (pid, pc, String(f[4])))
     end
-    if isempty(busy)
-        return println("contention check: clear (no foreign process ≥ $(_BUSY_PCPU)% CPU)")
-    end
     sort!(busy; by = x -> -x[2])
-    msg = join(("  pid=$(p)  $(c)% CPU  $(first(a, 100))" for (p, c, a) in busy), "\n")
-    "force-busy" in ARGS && return println("contention check: BUSY but force-busy given:\n", msg)
+    return busy
+end
+_busy_msg(busy) = join(("  pid=$(p)  $(c)% CPU  $(first(a, 100))" for (p, c, a) in busy), "\n")
+
+function _contention_check()
+    busy = _busy_procs()
+    isnothing(busy) && return println("contention check: skipped (ps unavailable)")
+    isempty(busy) && return println("contention check: clear (no foreign process ≥ $(_BUSY_PCPU)% CPU)")
+    "force-busy" in ARGS && return println("contention check: BUSY but force-busy given:\n", _busy_msg(busy))
     return error("REFUSING to benchmark: $(length(busy)) foreign process(es) ≥ $(_BUSY_PCPU)% CPU on \
         $(gethostname()). A contended L3/memory controller skews the PB and reference windows \
-        unequally and the run would have to be discarded.\n$msg\nWait for the box, or pass \
+        unequally and the run would have to be discarded.\n$(_busy_msg(busy))\nWait for the box, or pass \
         `force-busy` to measure anyway. Do NOT pattern-kill — kill only PIDs you launched.")
+end
+
+# Set by the exit check, stamped into the cache header so a contended run is self-identifying.
+_BUSY_AT_EXIT = ""
+function _contention_exit_check()
+    busy = _busy_procs()
+    (isnothing(busy) || isempty(busy)) && return nothing
+    global _BUSY_AT_EXIT = join(("$(p):$(c)%" for (p, c, _) in busy), ",")
+    @warn "BOX WAS CONTENDED AT END OF RUN — it was clear at the start, so this appeared during \
+        measurement. Treat every cell this run touched as suspect and re-measure on a quiet box; \
+        the cache header records it as `busy=`.\n$(_busy_msg(busy))"
+    return nothing
 end
 
 function save_cache(path, groups)
@@ -1294,7 +1318,8 @@ function save_cache(path, groups)
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
             "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())",
-            "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz"
+            "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
+            isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)"
         )
         # v3 record: ONE LINE PER CELL, one field per measured arm, each carrying its own timestamp and
         # commit. Per-arm provenance is what makes `arms=pb` safe to use: it rewrites only the pb field,
@@ -1525,6 +1550,7 @@ else
     _contention_check()
     l1, l2, l3, lp = run_benchmarks()
     cl1, cl2, cl3, clp = run_cmplx_benchmarks()
+    _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
     if subset
