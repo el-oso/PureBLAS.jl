@@ -326,7 +326,13 @@ end
         #     annotation on the backend entry (0.27%, identical with/without/`::typeof(x)`);
         #   · the harness's unused SECOND array (plots.jl's L1 maker is `(randn(s), randn(s))` but scal
         #     touches only c[1]) — dropping it moves neither arm (ob1 1.002, pb1 0.9946);
-        #   · unroll DEPTH and NON-TEMPORAL stores — falsified earlier, see the note below.
+        #   · unroll DEPTH and NON-TEMPORAL stores — falsified earlier, see the note below;
+        #   · INLINING into the caller's loop (the last structural difference from OpenBLAS, which
+        #     enters via an opaque ccall per call): forcing it back out of line reads 0.9912 against
+        #     0.9924 inlined — no change.
+        # What is left is the generated loop vs OpenBLAS's asm in this band on THIS µarch. Next probe
+        # if it is picked up: alignment sensitivity (offset the base pointer and see whether PB's
+        # deficit moves while OB's does not).
         if n * sizeof(T) > _L1_BYTES
             @inbounds @simd ivdep for j in 1:n
                 unsafe_store!(px, a * unsafe_load(px, j), j)
@@ -1010,9 +1016,27 @@ const _IAMAX_NB_STREAM = 4
     vs = [Symbol(:v, j) for j in 0:(NB - 1)]
     loads = [:($(vs[j + 1]) = abs(vload($V, xp + (o + $(j * W)) * $sz))) for j in 0:(NB - 1)]
     # BALANCED pairwise fold => depth log2(NB), not a left-fold chain of length NB.
+    #
+    # THE PREDICATE IS `!(b > a)`, NOT `a > b`, AND THAT IS A CORRECTNESS REQUIREMENT — not a style
+    # choice. `vifelse(a > b, a, b)` takes `b` whenever the compare is false, and a compare against NaN
+    # is ALWAYS false, so that form drops whichever operand sits in `a`. A NaN could therefore swallow a
+    # larger value at one node and then be dropped itself one node up:
+    #     node(v0,v1): 99 > NaN -> false -> takes NaN   (the 99 is gone)
+    #     node(·,v2v3): NaN > 1 -> false -> takes 1     (the NaN is gone too)
+    # leaving a root of all-1.0, so `any(!(m <= thr))` never fired and iamax returned its seed index.
+    # That shipped: PureBLAS.iamax was WRONG (returned 1, netlib/OpenBLAS return 2) for any Float64
+    # vector in this kernel's band (_L1_BYTES < n*sizeof(T) <= _L2_BYTES) holding a max followed by a
+    # NaN in the SAME LANE of a later block — e.g. n=4161, x[2]=99, x[10]=NaN. The header note claiming
+    # "vmaxpd propagates its second operand, so a NaN anywhere reaches the tree root" was false: a NaN
+    # only survives while it stays in the `b` slot, which is why NaN-then-max passed and max-then-NaN
+    # did not.
+    # `!(b > a)` keeps `a` unless `b` is STRICTLY greater, so neither operand is ever discarded in
+    # favour of a smaller one: for NaN-free data it is still the exact max, and when a NaN is present
+    # the root is either the true max or NaN — both of which fire the unordered detect. The walk is
+    # unchanged (per-block unordered guard + strict `>` scan), so first-occurrence on ties still holds.
     bal(items) = length(items) == 1 ? items[1] :
         (m = length(items) ÷ 2; a = bal(items[1:m]); b = bal(items[(m + 1):end]);
-         :(vifelse($a > $b, $a, $b)))
+         :(vifelse(!($b > $a), $a, $b)))
     tree = bal(Any[vs...])
     walks = [quote
             if any(!($(vs[j + 1]) <= thr))            # per-block unordered guard, cold path only
@@ -1132,9 +1156,21 @@ end
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); step = 4W
     lane = Vec(ntuple(i -> i, Val(W)))               # 1,2,…,W
     ld(o) = abs(vload(V, xp + o * sz))
-    m0 = ld(0); m1 = ld(W); m2 = ld(2W); m3 = ld(3W)
-    i0 = lane; i1 = lane + W; i2 = lane + 2W; i3 = lane + 3W
-    o = step
+    # SEED = broadcast |x[1]|, NOT the first blocks' own values — a CORRECTNESS requirement.
+    # `_amax_up` keeps its running max when `nv > m` is false, and every compare against NaN is false,
+    # so a NaN that lands IN THE SEED poisons that lane forever: no later element, however large, can
+    # ever displace it. Seeding each lane from ld(0..3W) made the first 4W elements act like netlib's
+    # x[1] — but netlib's `dmax` can only become NaN if x[1] itself is NaN (`abs(x[k]) > dmax` never
+    # succeeds for a NaN, so a NaN mid-vector is simply skipped). Broadcasting |x[1]| reproduces that
+    # exactly: NaN elsewhere never enters the running max, and a NaN at position 1 correctly makes every
+    # compare fail so index 1 is returned. This is the same defect that made `_iamax_tree!`'s fold drop
+    # the true max (see the note there); `_iamax_thresh!`/`_iamax_tree!` were already correct here
+    # because they broadcast `thr` from |x[1]|.
+    a1 = abs(unsafe_load(xp, 1))
+    seed_i = Vec(ntuple(_ -> 1, Val(W)))             # every lane starts at index 1, like netlib's ix
+    m0 = V(a1); m1 = V(a1); m2 = V(a1); m3 = V(a1)
+    i0 = seed_i; i1 = seed_i; i2 = seed_i; i3 = seed_i
+    o = 0                                            # nothing preloaded now, so start at the top
     @inbounds while o + step <= n                    # 4 independent chains (cheap inner update)
         (m0, i0) = _amax_up(m0, i0, ld(o), lane + o)
         (m1, i1) = _amax_up(m1, i1, ld(o + W), lane + (o + W))
@@ -1203,9 +1239,16 @@ end
     W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 4W
     clane = Vec(ntuple(i -> (i + 1) ÷ 2, Val(2W)))        # 1,1,2,2,…,W,W (complex index per real lane)
     magc(c) = _cmag2(vload(V, xp + 2c * sz))              # Vec{2W}, mₖ duplicated per pair
-    m0 = magc(0); m1 = magc(W); m2 = magc(2W); m3 = magc(3W)
-    i0 = clane; i1 = clane + W; i2 = clane + 2W; i3 = clane + 3W
-    c = step
+    # SEED = broadcast (|re|+|im|) of element 1, NOT the first blocks' own magnitudes — a CORRECTNESS
+    # requirement, identical to the real `_iamax_chain4!` case (see the note there). `_amax_up` keeps
+    # its running max whenever `nv > m` is false, and every compare against NaN is false, so a NaN in
+    # the seed poisons that lane permanently. Measured before this fix: PureBLAS.iamax on a
+    # ComplexF64 vector with z[2]=NaN+0im and z[10]=99+0im returned 1 where netlib returns 10.
+    a1 = abs(unsafe_load(xp, 1)) + abs(unsafe_load(xp, 2))   # |re|+|im| of the first complex element
+    seed_i = Vec(ntuple(_ -> 1, Val(2W)))                 # complex index 1 in every lane
+    m0 = V(a1); m1 = V(a1); m2 = V(a1); m3 = V(a1)
+    i0 = seed_i; i1 = seed_i; i2 = seed_i; i3 = seed_i
+    c = 0                                                 # nothing preloaded now, so start at the top
     @inbounds while c + step <= n                         # 4 independent chains (loop-carried max latency)
         (m0, i0) = _amax_up(m0, i0, magc(c), clane + c)
         (m1, i1) = _amax_up(m1, i1, magc(c + W), clane + (c + W))
