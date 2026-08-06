@@ -76,6 +76,35 @@
     @test !_tune_better(UInt64(10)^9, UInt64(10)^9)
 end
 
+# The DUEL rule that replaced the margin for knobs the margin could not resolve. `_tune_wins_it` is the
+# pure half (the counting); `_tune_duel` does the timing and is exercised by the acceptance test in
+# bench/probes/tune_freshops_validate.jl plus the cross-process determinism check recorded below.
+@testitem "tuner: supermajority rule and its tie probability" begin
+    using PureBLAS: _tune_wins_it
+
+    # Default 5 rounds: 4 or 5 wins displaces, 3 does not. One spoiled round is survivable, two is not.
+    @test _tune_wins_it(5, 5)
+    @test _tune_wins_it(4, 5)
+    @test !_tune_wins_it(3, 5)
+    @test !_tune_wins_it(0, 5)
+    @test _tune_wins_it(4)              # 5 is the default
+    @test !_tune_wins_it(3)
+
+    # More rounds tightens it, which is how determinism is DIALLED rather than assumed.
+    @test !_tune_wins_it(7, 9)
+    @test _tune_wins_it(8, 9)
+
+    # The tie false-positive rate is (rounds+1)/2^rounds — asserted so the docstring cannot drift from
+    # the arithmetic. This is the number that replaces "5% is above the probes' resolution", which was
+    # an unverified fleet-empirical claim; this one is exact and a property of the rule alone.
+    tie_fp(r) = (r + 1) / 2.0^r
+    @test tie_fp(5) ≈ 0.1875
+    @test tie_fp(9) ≈ 0.01953125
+    @test tie_fp(13) < 0.002
+    # ...and it must be monotone decreasing in rounds, or "dial it with `rounds`" would be false.
+    @test all(tie_fp(r + 1) < tie_fp(r) for r in 3:20)
+end
+
 # The knob resolvers must return something USABLE on any host, including one where the measurement
 # throws or is skipped (precompilation). `OncePerProcess` poisons the whole process if its initializer
 # raises, so every `_measure_*` is written to be total — this asserts the contract at the resolver.
