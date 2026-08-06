@@ -165,6 +165,7 @@ _tunestamp() = try
     join((
         "ger_np=$(PureBLAS._ger_np())",
         "gemvt_perscan=$(PureBLAS._gemvt_perscan_ok())",
+        "cgemvn_nc_big=$(PureBLAS._cgemvn_nc_big())",
     ), ",")
 catch e
     "unavailable($(typeof(e)))"

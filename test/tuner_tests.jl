@@ -63,6 +63,17 @@
 
     # A candidate slower than the incumbent can never win, whatever its neighbours do.
     @test _tune_pick(inc, (UInt64(2000), UInt64(1500))) == 0
+
+    # ── REGRESSION: the `bt = typemax(UInt64)` seed, which three sweeps used until 2026-08-06.
+    # `typemax(UInt64) * 95` WRAPS to 2^64-95 — still astronomically above any real elapsed time — so
+    # `_tune_better(t, typemax)` is TRUE for every candidate and the first one swept always displaces.
+    # The declared default (`best = 4` / `_UNROLL`) was therefore unreachable, and the effective
+    # incumbent was whichever arm happened to be written first. This asserts the arithmetic so the
+    # seed can never be "simplified" back.
+    @test typemax(UInt64) * UInt64(95) == typemax(UInt64) - UInt64(94)   # it wraps, it does not saturate
+    @test _tune_better(UInt64(10)^9, typemax(UInt64))                    # ⇒ anything beats a typemax seed
+    # ...whereas seeding with the incumbent's own measured time makes ties keep the default:
+    @test !_tune_better(UInt64(10)^9, UInt64(10)^9)
 end
 
 # The knob resolvers must return something USABLE on any host, including one where the measurement
