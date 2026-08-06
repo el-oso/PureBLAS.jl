@@ -1216,9 +1216,29 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 #   L2-resident   -> TREE. This is the failing band (n=1e4/3e4/1e5 = 0.964/0.976/0.942 vs AOCL) and the
 #                    only band where AOCL's structure beats ours.
 #   beyond L2     -> threshold form, NB=4 (the stream arm). It GATES (n=3e5 1.029, n=1e6 1.022).
+# The L1-resident band uses the TREE form at the RESIDENT width — form changes, width does not.
+#
+# Derived, not fitted. Per iteration of NB blocks the threshold form issues NB compares + (NB−1) ORs +
+# 1 test ≈ 2·NB mask ops, while the tree folds log-depth and issues ONE compare: (NB−1) folds + 1
+# compare + 1 test = NB+1. The mask work the tree removes therefore grows with NB — at NB=4 it is 8 ops
+# against 5 — so the tree wins wherever NB is more than about 2, on any ISA. (The abs is NOT part of
+# this: LLVM already folds it into the load as `vandpd (mem)`, which is AOCL's own `vandnpd` trick, so
+# both forms pay 1 op/vector there. An earlier note in this file claiming we issue a separate vload was
+# wrong — read off the AVX2 disassembly on galen.)
+#
+# Measured on galen (Zen3/AVX2, freq-locked, bench/probes/iamax_live.jl in plots.jl's rep-loop regime),
+# tree vs thresh at the RESIDENT width, PB/OpenBLAS:
+#     n=1000  1.937 -> 2.303 (+19%)   n=3000  1.940 -> 2.393 (+23%)
+#     n=10000 2.000 -> 2.068 (+3%)    n=30000 2.129 -> 2.188 (+3%)
+# n=3000 is the cell that missed: 0.966 vs AOCL, the largest real BLAS-1 gap on the fleet.
+#
+# NB stays `_IAMAX_NB_RESIDENT` rather than `_IAMAX_NB_TREE` on purpose. The two agree at
+# _SIMD_BYTES=32 (both 4) but are 2 vs 8 at 64, so passing NB_TREE here would change form AND width on
+# AVX-512 — and widening the resident band was already measured much worse (NB=8 threshold: 0.822 at
+# n=1e3). Keeping the width fixed makes this one variable on every ISA.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
-    (n * sizeof(T) <= _L1_BYTES ? _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, xp) :
+    (n * sizeof(T) <= _L1_BYTES ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
      n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
      _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)) :
     _iamax_chain4!(n, xp)
