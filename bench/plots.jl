@@ -166,6 +166,12 @@ _tunestamp() = try
         "ger_np=$(PureBLAS._ger_np())",
         "gemvt_perscan=$(PureBLAS._gemvt_perscan_ok())",
         "cgemvn_nc_big=$(PureBLAS._cgemvn_nc_big())",
+        # The axpy shape knobs were NOT stamped until 2026-08-06, and their absence bit immediately:
+        # the run that proved `axpy_dram`'s duel migration closed three gate cells could not show from
+        # its own artifact WHICH kernel produced it — the value had to be inferred from a separate
+        # acceptance test. A knob that selects a shipped kernel belongs in the provenance line.
+        "axpy_band=$(PureBLAS._axpy_band())",
+        "axpy_dram=$(PureBLAS._axpy_dram())",
     ), ",")
 catch e
     "unavailable($(typeof(e)))"
