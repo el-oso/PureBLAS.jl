@@ -306,6 +306,69 @@ phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which
 @inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95
 
 """
+    _tune_duel(fa, fb; rounds=5, reps=5, δ=2) -> Int
+
+How many of `rounds` the candidate `fb` beats the incumbent `fa`. Feed to [`_tune_wins_it`](@ref).
+Each round reduces BOTH arms with the MEDIAN of `reps` timings, then records ONE bit: who won. Arm
+order alternates per round (ABBA). One untimed warmup of each runs first.
+
+WHY THIS REPLACES A MARGIN ON TWO MEDIANS. The old rule compared one median against one median and
+demanded a fixed 5% win. Measured 2026-08-06 (wintermute, freq-locked, quiet): the complex gemvN NC
+pair differs by a stable ~3-4%, which sits just under that threshold, so NOISE decided whether it
+cleared — four fresh processes of the same binary resolved the knob to 8, 12, 8, 8. The threshold did
+not prevent the coin flip, it *caused* it, by putting the decision boundary inside the noise band.
+
+Counting round wins instead is distribution-free and self-calibrating: the evidence required scales
+with the machine's own noise without ever estimating a noise floor. On a quiet shape a reproducible
+3% win takes every round; on a noisy one it takes about half, and the supermajority refuses. Measured
+separation for that same pair, in the tuner's own regime — null (an arm against ITSELF) 2/5, power
+5/5. The margin could not resolve what this resolves cleanly.
+
+⚠ THE ORDER OF OPERATIONS IS THE WHOLE TRICK, and getting it backwards is why an earlier attempt
+failed. A sign test whose per-round statistic is a SINGLE timing makes every round a coin flip, and
+null then overlaps power at every number of rounds (measured: null up to 7/15 against power 4/15).
+AGGREGATE FIRST — median within a round — THEN count signs across rounds. Reducing twice is the point,
+not redundancy: the median kills within-round outliers, the sign count kills between-round drift and
+mode-hops.
+
+`δ` is a REGRET bound in percent — "do not churn the shipped kernel for less than this" — machine
+independent POLICY, not a noise estimate. That separation is the correction: the old 5% did both jobs
+and only the policy half was ever legitimately a constant.
+
+Cost is `rounds*reps*2` timings (~50 at the defaults) — tens of ms once per process, so this stays a
+load-time self-tune and needs no pin and no persisted calibration.
+"""
+function _tune_duel(fa::FA, fb::FB; rounds::Int = 5, reps::Int = 5, δ::Int = 2) where {FA, FB}
+    fa(); fb()                                     # warmup, untimed (first touch + any JIT)
+    wins = 0
+    for r in 1:rounds
+        local ta::UInt64, tb::UInt64
+        if isodd(r)                                # ABBA: neither arm always runs second
+            ta = _tune_one(fa; reps = reps); tb = _tune_one(fb; reps = reps)
+        else
+            tb = _tune_one(fb; reps = reps); ta = _tune_one(fa; reps = reps)
+        end
+        tb * 100 < ta * UInt64(100 - δ) && (wins += 1)
+    end
+    return wins
+end
+
+"""
+    _tune_wins_it(wins, rounds=5) -> Bool
+
+Does a candidate with `wins` of `rounds` displace the incumbent? Requires a SUPERMAJORITY (`rounds-1`),
+so one spoiled round — a mode hop, a stray interrupt — cannot decide what ships.
+
+DETERMINISM, the property the old fixed margin was defending: at an exact performance tie the chance of
+displacing is `(rounds+1)/2^rounds` — 18.75% at 5 rounds, 2% at 9, 0.17% at 13 — and it is DIALLED by
+`rounds` rather than assumed. The margin, by contrast, was deterministic only if the host's noise
+happened to fall below it, which was asserted fleet-wide and never verified. Note also that a tie here
+means the candidates are genuinely equivalent, so a flip costs at most `δ`; the old failure flipped
+between candidates differing by a real 3-4%.
+"""
+@inline _tune_wins_it(wins::Int, rounds::Int = 5) = wins >= rounds - 1
+
+"""
     _tune_pick(t_inc, ts::NTuple{N,UInt64}) -> Int
 
 Which candidate displaces the incumbent? `0` keeps it; otherwise the index into `ts`. Pure — no clock,

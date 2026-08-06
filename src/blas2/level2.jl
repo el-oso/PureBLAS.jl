@@ -863,14 +863,22 @@ const _CGEMVN_NCBIG_PREF = @load_preference("cgemvn_nc_big", nothing)
             # here. Do not "fix" it locally by dropping the tie-break to a plain `<`: that is the
             # comparison which made two fresh processes of one binary resolve the axpy knob to 208 and
             # to 4, and the tuner-regime noise floor that would justify it has never been measured.
-            bt0 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false)); reps = 5)
-            tw = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)); reps = 5)
-            t32 = _tune_one(() -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)); reps = 5)
-            # Selection goes through the PURE `_tune_pick` (cpuinfo.jl) rather than an open-coded loop,
-            # so the rule is unit-tested (test/tuner_tests.jl) instead of only exercisable by running a
-            # benchmark. Candidates smallest-first, so a tie between qualifiers keeps the cheaper panel.
-            i = _tune_pick(bt0, (tw, t32))
-            return i == 2 ? 3W ÷ 2 : i == 1 ? W : _CGEMVN_NC
+            # DUELS, not a margin on medians. Each candidate is run against the INCUMBENT over rotated
+            # rounds whose per-round statistic is itself a median; the winner needs a supermajority of
+            # rounds. That is what makes this knob resolvable at all — the pair differs by a stable
+            # ~3-4%, which sat just under the old 5% threshold, so noise decided whether it cleared and
+            # four fresh processes resolved 8, 12, 8, 8. See `_tune_duel` for the measured separation
+            # (null 2/5 against power 5/5 in this very regime) and for why aggregating BEFORE counting
+            # signs is the part that makes it work.
+            inc() = _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_CGEMVN_NC), Val(false))
+            wW = _tune_duel(inc, () -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(_vwidth(Float64)), Val(false)))
+            w32 = _tune_duel(inc, () -> _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(false), Val(3 * _vwidth(Float64) ÷ 2), Val(false)))
+            # Both are measured against the SAME incumbent, never against a running best, so the verdict
+            # cannot depend on which candidate happened to be tried first. Widest wins ties: if both earn
+            # a supermajority they are each clearly better than shipping, and the gate prefers 3W/2 here.
+            _tune_wins_it(w32) && return 3W ÷ 2
+            _tune_wins_it(wW) && return W
+            return _CGEMVN_NC
         catch
             return _CGEMVN_NC
         end
