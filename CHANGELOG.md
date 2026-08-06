@@ -6,11 +6,13 @@ All notable changes to PureBLAS.jl are documented here. The format follows
 
 ## Versioning
 
-Pre-1.0, following Julia's convention that **`0.x` → `0.(x+1)` is breaking**. Kernel and blocking
-changes reorder floating-point summation, so results change bit-for-bit even when the API does not —
-in a numerics library that is a breaking change, and it is why each performance phase takes a minor
-bump rather than a patch. Patch releases are reserved for work that provably cannot move a result
-(tooling, benchmarks, documentation).
+Pre-1.0, following Julia's convention that the **leading non-zero component** marks breaking changes:
+for `0.x.y`, bumping `x` is breaking and bumping `y` is not.
+
+**Performance work is a patch bump.** Optimising a kernel does not change the API, so it is not
+breaking — even though reordered summation moves results bit-for-bit, which is ordinary for any BLAS
+and is not an interface change. `0.2.0` is therefore reserved for a genuine break (for example
+resolving the deferred complex-dot ABI, which would change exported signatures), not spent on tuning.
 
 **`1.0.0` means the gate is met**: every routine ≥ `max(OpenBLAS, AOCL)` at every measured size on
 every microarchitecture in the fleet. Not a date, not a feature count — the project's actual thesis,
