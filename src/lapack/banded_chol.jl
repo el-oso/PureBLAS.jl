@@ -575,17 +575,94 @@ end
 # Failing-column reporting is uplo-independent for the repack path (leading minors of A do not
 # depend on which triangle is stored, and _pbtrf_blocked! already reports dpotf2-ordered global
 # columns), so it needs no translation.
+# Re-pack tile edge. The band walk touches an AB tile of TB×2TB and an ABL tile of TB×TB, so the
+# footprint is ~3·TB²·sizeof(T); size it to half L1 and round DOWN to a cache line's worth of elements.
+# req#8 Derive: pure residency over _L1_BYTES and sizeof(T), no fitted constant.
+#   AVX2/Zen3 F64 (L1=32K): floor(sqrt(32768/48)) = 26 → 24.    ComplexF64: → 16.
+@inline function _pbtrf_rp_tile(::Type{T}) where {T}
+    e = max(1, _CACHELINE ÷ sizeof(T))                 # elements per cache line
+    return max(e, (isqrt(_L1_BYTES ÷ (6 * sizeof(T))) ÷ e) * e)
+end
+
+# Does the DIAGONAL walk alias? Both passes step by `ld-1` elements per `d` (row −1, column +1), so the
+# byte stride is (ld-1)·sizeof(T). Count the distinct L1 SETS that stride visits and ask whether they
+# can hold the walk:
+#     sets touched = nsets / gcd(stride_lines, nsets)      capacity = sets_touched · associativity
+# aliased ⟺ capacity < the number of lines the walk needs (≈ kd, one line per element at this stride).
+# NOT `_alias_ld`/`_L1_WAY_BYTES`: those test stride % way_size == 0, i.e. collapse onto ONE set. The
+# kd=128 walk strides 1024 B against a 4096 B way, so it lands on FOUR sets — that predicate is false
+# and would have missed the very spike this exists for. (I shipped it that way first; the arithmetic
+# below is what the measurement actually says.)
+# Reproduces the measured galen behaviour exactly (L1=32K, 8-way ⇒ 64 sets):
+#     kd=64   stride  512 B, 8 lines, gcd 8 → 8 sets ·8 = 64 ≥ 64  ⇒ not aliased  (measured fine)
+#     kd=96   stride  768 B,12 lines, gcd 4 →16 sets ·8 =128 ≥ 96  ⇒ not aliased  (measured fine)
+#     kd=127  stride 1016 B — not line-aligned                     ⇒ not aliased  (measured fine)
+#     kd=128  stride 1024 B,16 lines, gcd16 → 4 sets ·8 = 32 < 128 ⇒ ALIASED      (3x spike)
+#     kd=129  stride 1032 B — not line-aligned                     ⇒ not aliased  (measured fine)
+@inline function _pbtrf_rp_aliased(ld::Int, kd::Int, ::Type{T}) where {T}
+    sb = (ld - 1) * sizeof(T)
+    (sb > 0 && sb % _CACHELINE == 0) || return false    # sub-line stride ⇒ the walk spreads naturally
+    nsets = max(1, _L1_BYTES ÷ (_CACHELINE * _L1D_ASSOC))
+    return (nsets ÷ gcd(sb ÷ _CACHELINE, nsets)) * _L1D_ASSOC < kd
+end
+
 function _pbtrf_repack_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
     ABL = _pbtrf_band(T, kd, n)                        # owned scratch — see _pbtrf_band for why not `undef`
-    @inbounds for j in 1:n                             # pack: ABU → conj-transposed lower band
-        for d in 0:min(kd, n - j)
-            ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])
+    # TILE ONLY WHEN THE WALK ALIASES. Blanket tiling was tried here before and REJECTED — the note
+    # above records it "helped kd=128/256 while HURTING kd=160/192/384". That split is exactly the
+    # aliasing signature: 128 and 256 are powers of two, 160/192/384 are not, and away from the spike
+    # the extra loop nest is pure overhead over an already-sequential walk. Measured on galen
+    # (bench/probes/pbtrf_repack_decomp.jl), pack / unpack µs at n=4096:
+    #     kd=120 175/297   126 233/333   127 215/324   **128 616/640**   129 204/340   130 255/351
+    # i.e. kd=128 costs 3x its immediate neighbours — a spike, not a scaling curve. It is 31.6% of the
+    # call there (against 17.3% at kd=96), ~706 µs of 3984 µs, and pbtrfU@128 is the only Zen3 LAPACK
+    # cell that loses to BOTH references (OB 0.951, AOCL 0.871).
+    # NOTE the scratch's ld cannot be padded instead: `_pbtrf_band` must return ld == kd+1 because
+    # `_pbtrf_blocked!`'s `_pb_blk` re-reads blocks at ld = LDAB-1, and a stale wrong ld silently reads
+    # the wrong elements (workspace.jl records that costing kd=64 a 2.10 -> 1.81 regression). Swapping
+    # which side is strided does not help either — AB and ABL both have ld = kd+1, so both diagonal
+    # walks have the same stride; the swap just moves the spike.
+    tb = (_pbtrf_rp_aliased(stride(AB, 2), kd, T) || _pbtrf_rp_aliased(stride(ABL, 2), kd, T)) ?
+        _pbtrf_rp_tile(T) : 0
+    if tb == 0
+        @inbounds for j in 1:n                         # pack: ABU → conj-transposed lower band
+            for d in 0:min(kd, n - j)
+                ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])
+            end
+        end
+    else
+        @inbounds for j0 in 1:tb:n                     # tiled pack: each AB column is touched over a
+            j1 = min(j0 + tb - 1, n)                   # CONTIGUOUS run of rows inside a tile, so the
+            for d0 in 0:tb:kd                          # stride-(ld-1) walk never leaves L1
+                d1 = min(d0 + tb - 1, kd)
+                for j in j0:j1
+                    dhi = min(d1, n - j)
+                    for d in d0:dhi
+                        ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])
+                    end
+                end
+            end
         end
     end
     _pbtrf_blocked!(ABL, n, kd)                        # may throw PosDefException(global col) — correct as-is
-    @inbounds for j in 1:n                             # unpack: L factor → ABU (U = Lᴴ)
-        for d in 0:min(kd, j - 1)
-            AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+    if tb == 0
+        @inbounds for j in 1:n                         # unpack: L factor → ABU (U = Lᴴ)
+            for d in 0:min(kd, j - 1)
+                AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+            end
+        end
+    else
+        @inbounds for j0 in 1:tb:n                     # tiled unpack, mirror of the pack above
+            j1 = min(j0 + tb - 1, n)
+            for d0 in 0:tb:kd
+                d1 = min(d0 + tb - 1, kd)
+                for j in j0:j1
+                    dhi = min(d1, j - 1)
+                    for d in d0:dhi
+                        AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+                    end
+                end
+            end
         end
     end
     return AB
