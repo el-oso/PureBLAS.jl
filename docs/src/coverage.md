@@ -123,16 +123,16 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>symv</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.05</span></td></tr>
 <tr><th><code>trmv</code></th><td class="b2"><span class="v">0.979</span><span class="n">n=4096</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.814</span><span class="n">n=128</span></td></tr>
 <tr><th><code>trsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.22</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>zgemvC</code></th><td class="b2"><span class="v">0.963</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.935</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.878</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgemvT</code></th><td class="b2"><span class="v">0.959</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgeru</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.844</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.857</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>zgemvC</code></th><td class="b2"><span class="v">0.963</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.935</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.848</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgemvT</code></th><td class="b2"><span class="v">0.959</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.855</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgeru</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.817</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.857</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.35</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>zhemv</code></th><td class="b3"><span class="v">0.919</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.24</span></td><td class="ok"><span class="v">1.38</span></td></tr>
-<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.1</span></td></tr>
-<tr><th><code>ztrmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>ztrsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zhemv</code></th><td class="b3"><span class="v">0.919</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.38</span></td></tr>
+<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.1</span></td></tr>
+<tr><th><code>ztrmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>ztrsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=1024</span></td></tr>
 </tbody></table>
 ```
 
@@ -218,19 +218,19 @@ html.dark .pbg-key{color:#98a1b3}
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
 | Cholesky (lower) | potrf | s/d/c/z | ✅ | 🐰 | 1.49 / 1.11 | 1.72 / 1.12 |
-| Cholesky (upper) | potrf `uplo='U'` | s/d/c/z | ✅ | 🐢 | 1.42 / 0.81 | 1.39 / 1.05 |
+| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 🐰 | 1.47 / 1.11 | 1.44 / 1.03 |
 | Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | 🐢 | 2.2 / 0.93 | 0.94 / 0.78 |
 | Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | 🐢 | 1.28 / 0.85 | 1.33 / 1.15 |
 | LU | getrf, gesv | s/d/c/z | ✅ | 🐢 | 1.37 / 1.03 | 1.76 / 0.98 |
 | LU solve | getrs [^solv] | s/d/c/z | ✅ | 🐢 | 1.05 / 0.99 | 0.93 / 0.85 |
 | QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | 🐢 | 1.94 / 1.65 | 1.54 / 0.93 |
-| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 🐢 | 0.34 / 0.18 | 0.34 / 0.19 |
-| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 🐢 | 1.39 / 1.04 | 1.40 / 0.99 |
+| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 🐰 | 1.34 / 1.14 | 1.20 / 1.02 |
+| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 🐰 | 1.41 / 1.07 | 1.43 / 1.00 |
 | Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 🐰 | 1.68 / 1.43 | 2.16 / 1.34 |
 | Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | 🐢 | 1.11 / 1.02 | 1.07 / 0.88 |
 | Least-squares | gels | s/d/c/z | ✅ | 🐰 | 2.42 / 1.93 | 1.88 / 1.28 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 🐰 | 1.23 / 1.12 | 1.17 / 1.05 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 🐢 | 1.13 / 0.98 | 1.31 / 1.14 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 🐰 | 1.31 / 1.08 | 1.35 / 1.25 |
 
 ## LAPACK — SVD
 
@@ -299,18 +299,23 @@ once the re-pack's diagonal walk starts to dominate. The panel width likewise ha
 regimes — clamping the wide-band width to `kd` collapses the in-band panel and was the
 routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 
-[^unblk]: **Measured as unblocked.** `geqp3` is a BLAS-2 implementation racing a blocked BLAS-3 one,
-    and its ratio degrades monotonically with `n` — the signature. Zen4 gate sweep (geomean / worst,
-    n = 8…4096): **0.34 / 0.18** vs OpenBLAS and **0.34 / 0.19** vs AOCL — the worst routine in the
-    real LAPACK surface. Confirmed from source, not inferred: `geqp3.jl`'s header states it is the
-    unblocked core. It had **never been benchmarked** before 2026-07-29 — it routed and passed
-    correctness, which reads as coverage while measuring nothing.
-    `sytrf`/`sytrs` were in exactly the same state and no longer are; see [^bk].
-    A blocked `dlaqps` port for `geqp3` was written and **verified correct** (pivots and R identical
-    to LAPACK, reconstruction to 1e-13, over full-rank/rank-deficient/graded input) but was **not
-    faster**, and larger panels were *worse* — the diagnostic that the cost is the panel's own
-    per-column BLAS-2 calls, not the trailing gemm. It is reverted, not shipped. The retry must reach
-    the kernels pointer-direct; see §5 of [Tuning](tuning.md).
+[^upper]: **Gates on Zen4 and Zen3; one Zen5 cell open.** The upper-triangle path (transpose-to-lower
+    via `Val{CJ}`, plus a loop swap that stopped the transpose reading `A` at a power-of-two `lda`)
+    clears both references at every size on Zen4 (worst 1.11 vs OpenBLAS, 1.03 vs AOCL) and on Zen3
+    (worst 1.06). The single residual is **Zen5 n=2048 at 0.972**; every other Zen5 size gates
+    (1.01–1.39). Per this page's convention the verdict is the Zen4 sweep, hence 🐰.
+
+[^unblk]: **Blocked, and now gating.** `geqp3` used to be the worst routine in the real LAPACK
+    surface: a BLAS-2 implementation racing a blocked BLAS-3 one, ratio degrading monotonically with
+    `n` — **0.34 / 0.18** vs OpenBLAS and **0.34 / 0.19** vs AOCL on the Zen4 sweep. It had **never
+    been benchmarked** before 2026-07-29 — it routed and passed correctness, which reads as coverage
+    while measuring nothing. `sytrf`/`sytrs` were in exactly the same state; see [^bk].
+    The first blocked `dlaqps` port was verified correct but **not faster**, and larger panels were
+    *worse* — the diagnostic that the cost is the panel's own per-column BLAS-2 calls, not the
+    trailing gemm. The shipped retry (`src/lapack/laqps.jl`, wired from `geqp3.jl`) reaches the
+    kernels pointer-direct, adds a SIMD downdate in the unblocked remainder and routes the `laqps`
+    gemv-T through the blocked kernel. The row now gates on **all three** boxes
+    (1.11 Zen3 / 1.02 Zen4 / 1.03 Zen5). See §5 of [Tuning](tuning.md).
 
 [^bk]: **Blocked since 2026-07-30.** `sytrf`/`hetrf` dispatched straight to the unblocked `_sytf2_*`
     (rank-1/rank-2 BLAS-2 column downdates) against OpenBLAS's blocked `dlasyf` — hence the old
@@ -446,17 +451,17 @@ symbols** — they appear only in commented-out lines of the stdlib and have no 
 - **Routing is complete** — see the fallthrough ratchet above. Every operation in the tables reaches
   PureBLAS after `activate()`, and every one is numerically LAPACK-accurate.
 - **Performance is typically well ahead of both references but not yet uniformly so.** On the Zen4
-  sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 7 of 33 measured
+  sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 35 of the 85 measured
   rows clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly
   (0.9–0.99 at one or two sizes — often the smallest, where per-call overhead dominates and the
-  measurement is least stable). **One row is still behind**: pivoted QR (`geqp3`, 0.84 geo / 0.51
-  worst), an unblocked BLAS-2 implementation racing a blocked one. It was 0.34 / 0.18; making
-  `_house_left!` reach the SIMD dot/axpy pointer-direct (rather than through the scalar Householder
-  body) recovered ~2.5×, but the blocked `dlaqps` port is still outstanding and is what closes it.
-  The other three that used to sit here —
+  measurement is least stable). The deepest remaining misses on Zen4 are `zpotrfU` (0.692), `gbtrf`
+  (0.732), `trtrs` (0.753) and the complex BLAS-2 n=1024 cluster (`zgeru` 0.818, `zgemvN` 0.849,
+  `zgemvT` 0.856, `zgemvC` 0.877). Pivoted QR (`geqp3`) **used to sit here** at 0.84 geo / 0.51 worst,
+  an unblocked BLAS-2 implementation racing a blocked one; the blocked `dlaqps` port has since landed
+  and it now gates on all three boxes (1.11 / 1.02 / 1.03). The other three that used to sit here —
   Bunch–Kaufman (`sytrf` was 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — shared that
-  diagnosis and were blocked on 2026-07-30: `sytrf` 1.39 / 1.04, `sytrs` 1.68 / 1.43 🐰,
-  `gbtrf` 1.49 / 0.93. This paragraph previously contradicted its own footnotes.
+  diagnosis and were blocked on 2026-07-30: `sytrf` 1.41 / 1.07 🐰, `sytrs` 1.69 / 1.46 🐰,
+  `gbtrf` 1.48 / 0.98. This paragraph previously contradicted its own footnotes.
   An earlier version of this summary said BLAS 1/2/3 and the core factorizations were "perf-gated
   `≥ OpenBLAS`". That was written against an OpenBLAS-only, geomean-flavoured reading; under the
   project's actual rule — `max(OpenBLAS, AOCL)` at every size — it does not hold, and the tables
