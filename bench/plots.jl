@@ -1222,6 +1222,51 @@ function _achieved_khz()
     return best
 end
 
+# CONTENTION GUARD — refuse to start a gate sweep on a box that is already busy.
+#
+# The gate is a PB/OB ratio measured in two adjacent windows on one core. A foreign job saturating
+# another core is not neutral: it contends for the shared L3 and the memory controller, which is
+# exactly where the bandwidth-bound BLAS-1/2 cells live, and it does so unevenly across the two
+# windows. On 2026-08-05 a stray `julia-1.13 --project=@plots` was found mid-sweep on neuromancer —
+# the run had to be discarded after the fact. A three-hour sweep deserves a one-second check first.
+#
+# `ps -eo` and NOT `pgrep julia | wc -l`: the count form self-matches (this process, and any wrapper
+# whose cmdline contains "julia"), which is the deadlock recorded in `bash-idle-loop-julia-selfmatch`.
+# Matching on %CPU instead of on a name is both stricter and immune to that — an idle sibling shell is
+# invisible, a busy foreign job of any name is not.
+#
+# Reports only, unless something is genuinely eating a core: then it stops, since the alternative is
+# discovering it in the provenance afterwards. Override with `force-busy` when the contention is known
+# and accepted (e.g. deliberately benching two µarchs at once on different sockets).
+const _BUSY_PCPU = 25.0
+function _contention_check()
+    out = try
+        read(`ps -eo pid,ppid,pcpu,args --no-headers`, String)
+    catch
+        return println("contention check: skipped (ps unavailable)")
+    end
+    me = getpid()
+    busy = Tuple{Int, Float64, String}[]
+    for ln in eachsplit(out, '\n')
+        f = split(strip(ln); limit = 4)
+        length(f) == 4 || continue
+        pid = tryparse(Int, f[1]); ppid = tryparse(Int, f[2]); pc = tryparse(Float64, f[3])
+        (isnothing(pid) || isnothing(ppid) || isnothing(pc)) && continue
+        (pid == me || ppid == me) && continue        # us, and anything we spawned
+        pc >= _BUSY_PCPU && push!(busy, (pid, pc, String(f[4])))
+    end
+    if isempty(busy)
+        return println("contention check: clear (no foreign process ≥ $(_BUSY_PCPU)% CPU)")
+    end
+    sort!(busy; by = x -> -x[2])
+    msg = join(("  pid=$(p)  $(c)% CPU  $(first(a, 100))" for (p, c, a) in busy), "\n")
+    "force-busy" in ARGS && return println("contention check: BUSY but force-busy given:\n", msg)
+    return error("REFUSING to benchmark: $(length(busy)) foreign process(es) ≥ $(_BUSY_PCPU)% CPU on \
+        $(gethostname()). A contended L3/memory controller skews the PB and reference windows \
+        unequally and the run would have to be discarded.\n$msg\nWait for the box, or pass \
+        `force-busy` to measure anyway. Do NOT pattern-kill — kill only PIDs you launched.")
+end
+
 function save_cache(path, groups)
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
@@ -1477,6 +1522,7 @@ if "plot" in ARGS
 elseif !("bench" in ARGS) && isfile(CACHE)
     g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
+    _contention_check()
     l1, l2, l3, lp = run_benchmarks()
     cl1, cl2, cl3, clp = run_cmplx_benchmarks()
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp)
