@@ -173,10 +173,10 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
             # displaces and `best = _UNROLL` can never win a tie; the effective incumbent was whichever
             # arm happened to be written first (Val(2)). That silently voided "ties go to the incumbent,
             # which is the derived default" (cpuinfo.jl) on exactly the boxes the margin exists for.
-            best = _UNROLL; bt = typemax(UInt64)          # replaced immediately below, once px/py exist
+            best = _UNROLL
             GC.@preserve x y begin
                 px = pointer(x); py = pointer(y)
-                bt = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: the incumbent _UNROLL=4, timed first
+                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0)   # req8-ok: the incumbent _UNROLL=4
                 # SHAPE x DEPTH, not depth alone. Codes: u -> interleaved(u); 100+u -> phase(u, full
                 # width); 200+u -> phase(u, narrow/256-bit). Measured in situ (Fable's A/B, three fresh
                 # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
@@ -187,29 +187,31 @@ n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
                 # _axpy_unrolled!(%3::Val, …)` propagates out of the measure, through `_axpy_dram()`, and
                 # breaks the @typestable contract on the PUBLIC `axpy!` path (strictmode_tests.jl:11).
                 # The guards const-fold: `W` and `_NVREG` are compile-time consts.
-                if 2 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 2)
-                end
-                if 4 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 4)
-                end
-                if 8 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_unrolled!(Val(8), n, 1.0e-9, px, py, 0); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 8)
-                end
-                if 4 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 104)
-                end
-                if 8 * W <= _NVREG
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 108)
-                end
+                # ⚠ DUELS. This knob flipped between 2 and 4 across fresh processes of one binary
+                # (measured 2026-08-06, wintermute, freq-locked, quiet: 2 2 4 4 4 4 2 2), so the margin
+                # was choosing the shipped kernel by coin toss here too. NOTE how that was nearly missed:
+                # an earlier 5-process sample drew 2 2 2 2 2 and was recorded as "stable". Five draws
+                # cannot see a ~50/50 flip — the acceptance test needs enough processes to resolve one,
+                # and the `tune=` stamp in the cache header is what exposed the disagreement.
+                # Each candidate duels the INCUMBENT over rotated rounds with a per-round median and a
+                # supermajority; first to earn it wins, so a later arm cannot displace on a difference
+                # the rule has already judged unresolvable. Literal `Val`s throughout: a loop variable
+                # makes `Val(u)` non-concrete and the runtime dispatch propagates out through
+                # `_axpy_band()` to break the @typestable contract on the PUBLIC axpy! path.
                 if W >= 8                                    # a narrow arm only exists at 512-bit
-                    t = _tune_one(() -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py); reps = 5)  # req8-ok: candidate arm, literal required for specialization
-                    _tune_better(t, bt) && (bt = t; best = 208)
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py))) && return 208  # req8-ok: candidate arm
+                end
+                if 8 * W <= _NVREG
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py))) && return 108  # req8-ok: candidate arm
+                end
+                if 4 * W <= _NVREG
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px, py))) && return 104  # req8-ok: candidate arm
+                end
+                if 8 * W <= _NVREG
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(8), n, 1.0e-9, px, py, 0))) && return 8  # req8-ok: candidate arm
+                end
+                if 2 * W <= _NVREG
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0))) && return 2  # req8-ok: candidate arm
                 end
             end
             return best
