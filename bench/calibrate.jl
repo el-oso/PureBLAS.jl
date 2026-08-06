@@ -12,7 +12,7 @@
 #
 # The parameters are swept as RUNTIME kernel args (no recompile per candidate) — that's why this is fast.
 
-using PureBLAS, LinearAlgebra, Printf, Chairmarks, TOML
+using PureBLAS, LinearAlgebra, Printf, Chairmarks, Statistics, TOML
 import PureBLAS: _ger_panel!, _vwidth, _L3_BYTES
 BLAS.set_num_threads(1)
 const DRYRUN = "dryrun" in ARGS
@@ -43,10 +43,18 @@ function calibrate_ger_np(::Type{T} = Float64) where {T}
     n0 = ceil(Int, sqrt(_L3_BYTES / sizeof(T))); sizes = (max(2048, n0 + (W - n0 % W) % W), 4096)
     probs = [(randn(T, n, n), randn(T, n), randn(T, n), n) for n in sizes]
     @printf("calibrate ger stream-count NP (%s, sizes %s, DRAM > %.0f MB):\n", T, sizes, _L3_BYTES / 2^20)
+    # MEDIAN, not `minimum`. This file reduced with `minimum(@be …).time` until 2026-08-06, in direct
+    # violation of the project's estimator rule (median never min — `min` is optimistic AND tail-blind,
+    # and a silent min once ranked an iamax unroll backwards at the cost of a day). It survived because
+    # `test/estimator_lint.jl` anchors its patterns on `.samples` / `s.time` / `ts|times|timings`, and
+    # `minimum(@be …).time` matches none of them — a blind spot now closed in the lint itself.
+    # It matters here more than almost anywhere: this file WRITES Preferences pins, so a mis-ranked
+    # candidate does not just mislead a reader, it ships.
+    _med(b) = median(Float64[s.time for s in b.samples])
     scores = zeros(length(cand))
     for (ci, NP) in pairs(cand)
         for (A, x, y, n) in probs
-            scores[ci] += minimum(@be runnp(A, x, y, NP) seconds = 0.4).time / n^2
+            scores[ci] += _med(@be runnp(A, x, y, NP) seconds = 0.4) / n^2
         end
         @printf("  NP = %d  →  %.3e\n", NP, scores[ci])
     end
