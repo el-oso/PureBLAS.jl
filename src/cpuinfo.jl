@@ -392,6 +392,25 @@ function _tune_duel(
     fa(); fb()                                     # warmup, untimed (first touch + any JIT)
     wins = 0
     need = rounds - 1                              # the supermajority `_tune_wins_it` will demand
+    # ⚠ TWO DIFFERENT QUESTIONS, AND δ ANSWERS ONLY THE SECOND. "Is the candidate faster?" is EVIDENCE
+    # and is settled by the sign count. "Is it faster by enough to be worth changing the shipped
+    # kernel?" is POLICY and is settled by δ. Testing δ inside each round conflates them, and that
+    # conflation rejected a real win: measured 2026-08-07 on wintermute, freq-locked and quiet, the
+    # axpy DRAM candidate 208 beats the incumbent by 5.6% pooled, but its PER-ROUND ratios ran
+    # 1.015 1.004 1.116 1.100 — two rounds under 2%, so a per-round δ=2 scored them as losses and the
+    # supermajority then refused a candidate that is 5.6% faster. Six fresh processes all resolved to
+    # the incumbent while a controlled gate-regime A/B put the candidate 3.9-10.2% ahead.
+    #
+    # It also disagreed with the α this test claims. `_tune_rounds` derives `rounds` from
+    # `(r+1)/2^r` = P(≥ r-1 wins of r | fair coin) — the null of a PURE sign test. δ inside the round
+    # makes the realized test stricter than the α it advertises, so the false-NEGATIVE rate was
+    # uncontrolled and unmeasured while the false-positive rate was over-bought.
+    #
+    # So: sign count at δ=0 (matches the derivation exactly), and the regret bound applied ONCE to the
+    # POOLED effect. Both protections the docstring argues for survive; each is now applied at the
+    # level it belongs to.
+    ratios = Vector{Float64}(undef, rounds)        # per-round ta/tb, pooled for the regret check
+    nr = 0
     for r in 1:rounds
         # `refresh` RESAMPLES THE OPERANDS between rounds, and for some knobs it is the difference
         # between a decidable and an undecidable question. Duelling resamples TIME; if the candidates'
@@ -409,15 +428,28 @@ function _tune_duel(
         else
             tb = _tune_one(fb; reps = reps); ta = _tune_one(fa; reps = reps)
         end
-        tb * 100 < ta * UInt64(100 - δ) && (wins += 1)
+        nr += 1; ratios[nr] = ta / tb               # >1 ⇒ candidate faster this round
+        tb < ta && (wins += 1)                      # EVIDENCE: pure sign test, δ handled below
         # EARLY EXIT once the verdict is settled — this is what pays for the round count. A candidate
         # that has already lost twice cannot reach `rounds-1`, and most candidates in a sweep are
         # hopeless, so the common case costs 2 rounds rather than `rounds`. Only a genuinely close
         # contest runs to the end, which is exactly where the extra rounds are needed.
         wins + (rounds - r) < need && return wins   # cannot still reach the threshold
-        wins >= need && return wins                 # already there; further rounds cannot unmake it
+        wins >= need && return _tune_regret(wins, ratios, nr, δ)
     end
-    return wins
+    return _tune_regret(wins, ratios, nr, δ)
+end
+
+# POLICY gate, applied once to the POOLED effect (see the note in `_tune_duel`). The sign count has
+# already established the candidate is faster; this asks whether it is faster by enough to justify
+# changing which kernel ships. Median over rounds for the same reason `_tune_one` medians over reps —
+# it is the estimator this project gates on, and it is insensitive to the window tails that a single
+# unlucky round contributes. Returning 0 makes a candidate that wins but does not clear the regret
+# bound indistinguishable from one that lost, which is exactly the intent: the incumbent holds.
+@inline function _tune_regret(wins::Int, ratios::Vector{Float64}, nr::Int, δ::Int)
+    nr == 0 && return wins
+    r = sort!(view(ratios, 1:nr))[(nr + 1) ÷ 2]
+    return r * 100 >= (100 + δ) ? wins : 0
 end
 
 """

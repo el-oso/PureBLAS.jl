@@ -330,7 +330,25 @@ end
     # range above L1 regressed Zen4 twice: first the tuned DEPTH broke n=1e4, then the tuned SHAPE broke
     # n=1e5/3e5 (1.018 -> 0.986 and 1.020 -> 0.981) while helping only past L3. Cache-resident streaming
     # and DRAM streaming are different problems and get different knobs.
-    u = n * sizeof(T) > _L3_BYTES ? _axpy_dram() : _axpy_band()
+    # ⚠ RESIDENCY COUNTS EVERY LIVE STREAM, AND axpy HAS TWO — `y` is read-modified-written and `x` is
+    # read, so the working set is 2·n·sizeof(T), not n·sizeof(T). This tested ONE stream and therefore
+    # mis-routed a whole regime on any box where 2n·sizeof(T) straddles L3.
+    #
+    # It was expensive. Wintermute (L3 = 16 MB): n=1e6 is a 16 MB working set — physically far-memory —
+    # but 8 MB > 16 MB is false, so the cell was governed by `_axpy_band`, whose probe sits at a 4 MB
+    # working set where the candidates are a 1-2% coin toss. Measured in the gate regime at that cell,
+    # the phase-narrow arm beats the band incumbent by 15.5%; that is the long-standing n=1e6 miss.
+    # Galen and neuromancer have 32 MB L3, so THEIR n=1e6 is genuinely mid-band and the incumbent is
+    # right there. Comparing the two produced an apparent "the winner inverts across microarchitectures"
+    # — which I wrongly took as proof the knob could not be derived. It was one formula evaluated in two
+    # different REGIMES at the same n, because the boxes have different L3.
+    #
+    # `>=` not `>`: a working set equal to the entire L3 leaves room for nothing else and behaves as
+    # non-resident, which is exactly what the 1.155 measurement at that cell shows.
+    # PDM: DERIVE tier — a residency criterion over a detected const, no new knob.
+    # (Line ~324's L1 cutoff has the same one-stream shape. Left alone deliberately: every cell it
+    # governs gates ≥ 1.0, so changing it would be an unmeasured edit to working code.)
+    u = 2 * n * sizeof(T) >= _L3_BYTES ? _axpy_dram() : _axpy_band()
     W = _vwidth(T)
     return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
         u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
