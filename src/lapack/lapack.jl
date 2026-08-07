@@ -391,14 +391,25 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
                 lever! = T <: BlasComplex ? _potrf_upper_lever_cmplx! : _potrf_upper_lever_real!
                 refill!(); _potrf_upper!(A0, n, _POTRF_BASE)        # untimed warmups (absorb JIT)
                 refill!(); lever!(A0, n)
-                td = Vector{UInt64}(undef, 5); tl = Vector{UInt64}(undef, 5)
-                for r in 1:5                          # interleaved (crude ABBA), MEDIAN-of-5
-                    refill!(); s = time_ns(); _potrf_upper!(A0, n, _POTRF_BASE); td[r] = time_ns() - s
-                    refill!(); s = time_ns(); lever!(A0, n);                     tl[r] = time_ns() - s
-                end
-                sort!(td); sort!(tl)
-                td[3] < tl[3] || return prev          # first n where the lever wins ⇒ cutoff is the
-                prev = n                              # last n where direct still won
+                # ⚠ EACH LADDER STEP IS A DUEL, not a bare `<` on two medians. A cutoff search is the
+                # WORST place for a coin-flip comparison: it stops at the first step the lever wins, so
+                # ONE noisy step truncates the whole search and the returned cutoff is wrong for every
+                # size above it. Measured 2026-08-07, one knob per fresh process: ComplexF64 resolved
+                # 20 / 16 / 18 / 12 — four different cutoffs from one binary, which is exactly what a
+                # per-step `<` produces on a shallow crossover.
+                # Orientation: `direct` is the CANDIDATE that must keep proving itself to continue the
+                # walk, so the δ regret bound biases toward exiting EARLY. That is the safe direction
+                # here and the pin comment in juliac/build.jl says why — being early costs only the
+                # tiny-n win, being late regresses n=16+.
+                dir!() = (refill!(); _potrf_upper!(A0, n, _POTRF_BASE))
+                lev!() = (refill!(); lever!(A0, n))
+                # ONE STRIKE, and two was measured WORSE. Requiring two consecutive non-wins
+                # before stopping sounded right for a shallow band, but it let the walk run PAST
+                # the crossover on a lucky step: ComplexF64 went from 18-with-an-occasional-20 to
+                # 16/18/20 across ten fresh processes. Reverted — the per-step duel alone is the
+                # better rule, and the residual +/-1 ladder step is the band itself.
+                _tune_wins_it(_tune_duel(lev!, dir!)) || return prev
+                prev = n
             end
             return prev                               # direct won across the whole bracket
         catch
