@@ -525,6 +525,7 @@ const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
     function _measure_gemvt_perscan()::Bool
         Base.generating_output() && return false     # never burn a measure during precompile
+        _f = _force_knob("gemvt_perscan"); _f >= 0 && return _f != 0  # instrument only, see _force_knob
         try
             # Probe INSIDE the window, derived: A ≈ 4×L2 (clearly past L2), m capped so x ≤ L1/2.
             m = min(isqrt(4 * _L2_BYTES ÷ sizeof(Float64)), _L1_BYTES ÷ 2 ÷ sizeof(Float64))
@@ -1145,6 +1146,7 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
     # Base-only, TOTAL (OncePerProcess poisons the whole process if the initializer throws) → catch → 4.
     function _measure_ger_np()::Int
         Base.generating_output() && return 4                     # don't burn a measure during precompilation
+        _f = _force_knob("ger_np"); _f >= 0 && return _f          # instrument only, see _force_knob
         try
             # ⚠ SQUARE, matching the shape the GATE scores. This probed n=64 columns against
             # m = 2·L3/64 rows — a 65536×64 tall-skinny panel — while bench/plots.jl measures `ger` at
