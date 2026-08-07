@@ -161,6 +161,7 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
 @static if isnothing(_AXPY_UNROLL_PREF)
     function _measure_axpy_unroll()::Int
         Base.generating_output() && return _UNROLL          # never burn a measure during precompile
+        _f = _force_knob("axpy_band"); _f >= 0 && return _f  # measurement instrument only, see _force_knob
         try
             # PROBE IN THE MIDDLE OF THE BAND IT GOVERNS. This knob covers L1 < bytes <= L3, and probing
 # at 4xL1 picked a shape that wins at 128 KB and LOSES at 800 KB / 2.4 MB — the sizes that
@@ -172,7 +173,22 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
 # and `p208` beats it by 37% there versus 1.6% at the neighbouring non-po2 size. So the knob
 # was being decided at a point where one arm is anomalously crippled — a pathological probe,
 # not a representative one.
-            n = _avoid_po2(max(4096, 2 * _L2_BYTES ÷ sizeof(Float64)), 8 * _vwidth(Float64))
+            # ⚠ PROBE AT THE TOP OF THE REGIME, NOT ITS MIDDLE — this knob governs everything from L1 up
+            # to L3 (a ~10x span of working set), and the arms' separation GROWS with stream length, so
+            # a probe in the middle measures the weakest point of the effect it is supposed to resolve.
+            # Measured 2026-08-07 on wintermute, freq-locked and quiet, forcing each arm through the
+            # real entry path and reading bench/plots.jl (two runs per arm):
+            #        n=1e5          n=3e5          n=1e6
+            #   4    1.009 1.010    1.001 1.004    0.969 0.983   <- MISSES
+            #   208  1.018 1.011    1.024 1.019    1.067 1.054   <- whole row gates
+            # Phase-narrow wins across the ENTIRE band range here, but by only ~1% at the old probe
+            # length (ws=4.2 MB) — inside the regret bound — so the duel scored it a tie and the knob
+            # resolved 4 or 208 depending on the process. That coin flip WAS the long-standing axpy
+            # n=1e6 bimodality: the cell read 1.001, 0.997, 0.967, 0.965, 0.962, 1.024 across runs on
+            # identical code, which is exactly the 8-9% gap between the two arms.
+            # Sizing to ws = 7/8·L3 keeps the probe inside the band regime (the router hands ws >= L3
+            # to `_axpy_dram`) while placing it where the arms are actually separable.
+            n = _avoid_po2(max(4096, 7 * _L3_BYTES ÷ (16 * sizeof(Float64))), 8 * _vwidth(Float64))
             W = _vwidth(Float64)
             # NB SETS OF OPERANDS, ROTATED PER ROUND. One buffer pair is one draw of page placement /
             # THP state / allocator addresses, and for THIS knob the winner depends on that draw: with
@@ -195,6 +211,12 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
                 rot(r) = (i = mod1(r, nb); pxr[] = pointer(xs[i]); pyr[] = pointer(ys[i]); nothing)
                 px() = pxr[]; py() = pyr[]
                 inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px(), py(), 0)   # req8-ok: the incumbent _UNROLL=4
+                # req8-ok: a MEASUREMENT-PRECISION budget in nanoseconds, not a machine value — it
+                # selects no kernel and appears in no shipped path. Each round-arm statistic is a median
+                # over ~this much signal, and `nrep` is DERIVED from it by timing the incumbent once, so
+                # a slower or faster box spends the same TIME rather than the same rep count.
+                _REP_BUDGET_NS = 20_000_000
+                nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
                 # SHAPE x DEPTH, not depth alone. Codes: u -> interleaved(u); 100+u -> phase(u, full
                 # width); 200+u -> phase(u, narrow/256-bit). Measured in situ (Fable's A/B, three fresh
                 # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
@@ -216,20 +238,30 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
                 # the rule has already judged unresolvable. Literal `Val`s throughout: a loop variable
                 # makes `Val(u)` non-concrete and the runtime dispatch propagates out through
                 # `_axpy_band()` to break the @typestable contract on the PUBLIC axpy! path.
+                # ⚠ `reps = _BAND_REPS`, NOT the `_tune_duel` default of 5. At this probe length one
+                # call is ~1.2 ms, so a 5-rep median is built from ~6 ms of signal and its round-to-round
+                # scatter swamped an effect the SAME comparison resolves cleanly with more samples:
+                # measured 2026-08-07 on wintermute, freq-locked and quiet, at exactly this n and with
+                # exactly these operands, phase-narrow reads 1.137 with every round in 1.107-1.143
+                # against a 0.36% floor — yet the 5-rep duel returned the incumbent in 7 of 10 fresh
+                # processes. A 15-round sign test cannot rescue a per-round statistic that is itself
+                # noisier than the effect; the aggregation has to happen where the noise is.
+                # This is the knob whose coin flip WAS the axpy n=1e6 bimodality (see the probe-length
+                # note above), so it is worth the extra ~0.2 s once per process on the lazy path.
                 if W >= 8                                    # a narrow arm only exists at 512-bit
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 208  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 208  # req8-ok: candidate arm
                 end
                 if 8 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 108  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 108  # req8-ok: candidate arm
                 end
                 if 4 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 104  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 104  # req8-ok: candidate arm
                 end
                 if 8 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(8), n, 1.0e-9, px(), py(), 0); refresh = rot)) && return 8  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(8), n, 1.0e-9, px(), py(), 0); reps = nrep, refresh = rot)) && return 8  # req8-ok: candidate arm
                 end
                 if 2 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px(), py(), 0); refresh = rot)) && return 2  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px(), py(), 0); reps = nrep, refresh = rot)) && return 2  # req8-ok: candidate arm
                 end
             end
             return best
@@ -258,6 +290,7 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
 @static if isnothing(_AXPY_DRAM_PREF)
     function _measure_axpy_dram()::Int
         Base.generating_output() && return _UNROLL
+        _f = _force_knob("axpy_dram"); _f >= 0 && return _f  # measurement instrument only, see _force_knob
         try
             # po2 probe length — see the note on the band knob above.
             n = _avoid_po2(max(4096, 2 * _L3_BYTES ÷ sizeof(Float64)), 8 * _vwidth(Float64))
@@ -270,25 +303,6 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             # ⚠ The symptom is BOX-DEPENDENT: this knob is stable on Zen5 and unstable on Zen4, and
             # `zaxpy_narrow` is the other way round. So rotation is applied uniformly to every Measure
             # knob rather than chased per box, where it would look fixed on whichever box was checked.
-            # ⚠⚠ FALSIFIED 2026-08-07 — DO NOT RE-CHASE "THE TUNER IS PICKING THE WRONG ARM HERE".
-            # A full day went into the theory that this knob should resolve 208 at n≈1e6 and that the
-            # probe was measuring the wrong regime. A standalone Chairmarks probe
-            # (bench/probes/axpy_band_shapes.jl) put phase-narrow 8-13% ahead of the incumbent at that
-            # size, reproducibly, against noise floors of 0.04-1.0%, under every combination of call
-            # structure (1 vs 30 dependent passes), operand provenance (fresh per sample vs a rotated
-            # pool) and probe length (ws=L3 vs ws=4·L3) that was tried. Three separate "fixes" were
-            # built on that number: a smaller probe, freshly-mapped pages per round, and a rewritten
-            # duel statistic.
-            # THEN THE ARM WAS FORCED IN SOURCE AND THE ACTUAL GATE WAS RUN. axpy n=1e6 went from
-            # 0.962 to 0.921 — phase-narrow is markedly SLOWER in production, and the tuner returning
-            # `_UNROLL` in 8/8 fresh processes was correct the whole time.
-            # The probe lies because it calls `_axpy_phase!`/`_axpy_unrolled!` directly through an
-            # @noinline wrapper on raw pointers, while production enters via axpy! -> _axpy_simd! ->
-            # the static ladder. That entry path is part of the regime, and it INVERTS the ranking.
-            # This is the 7th recurrence of "a probe's verdict is valid only in its regime" and the
-            # first where the regime variable was the CALL SITE rather than residency, provenance or
-            # shape. The gate is the arbiter; a probe that disagrees with it is evidence about the
-            # probe. Anything proposing to change this knob must show a GATE number, not a probe.
             nb = 4
             xs = [fill(1.0, n) for _ in 1:nb]
             ys = [fill(0.5, n) for _ in 1:nb]
@@ -652,6 +666,7 @@ const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
 @static if isnothing(_ZAXPY_NARROW_PREF)
     function _measure_zaxpy_narrow()::Bool                 # straight-line, no closures, TOTAL
         Base.generating_output() && return false           # never burn a measure during precompile
+        _f = _force_knob("zaxpy_narrow"); _f >= 0 && return _f != 0  # instrument only, see _force_knob
         try
             nn = _zaxpy_narrow_lanes(Float64); nw = 2 * _vwidth(Float64)
             nn == nw && return false

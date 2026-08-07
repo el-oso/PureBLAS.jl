@@ -326,6 +326,36 @@ phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which
 # the last one WHEN THE CANDIDATES ARE GENUINELY TIED — in which case the two kernels are equivalent by
 # construction and the cost of the flip is bounded by δ. Spread over the ~13 Measure knobs in the tree,
 # 5% library-wide is ~0.4% per knob. Raise or lower it as a product decision; the rounds follow.
+"""
+    _force_knob(name) -> Int      # -1 when unset
+
+`PUREBLAS_FORCE_<name>` overrides what a Measure-tier resolver returns, for ONE process, without
+editing source or setting a Preference. Purely a MEASUREMENT INSTRUMENT — nothing ships reading it.
+
+WHY IT EXISTS. Settling "is the tuner picking the wrong arm?" requires running the arm through the
+REAL entry path and reading `bench/plots.jl`, because a standalone probe can rank the arms backwards
+(see the falsification block in `simd_kernels.jl`: a probe put phase-narrow 8-13% ahead at axpy n=1e6
+while forcing it moved the gate 0.962 -> 0.921). Before this, forcing an arm meant one of:
+  - a Preference — but `bench/plots.jl` runs under `--project=bench`, which does NOT see the root
+    `LocalPreferences.toml`. Verified: the same key read 108 under `--project=.` and 4 under
+    `--project=bench`. Two full gate runs were spent producing the same configuration twice before the
+    `tune=` stamp exposed it.
+  - editing source and reverting — which works, and is one forgotten `git checkout` from a fake result.
+An env var is per-process, cannot outlive the run, and is invisible to a run that does not set it.
+
+SELF-DOCUMENTING BY CONSTRUCTION: `_tunestamp()` reads the RESOLVED values, so a forced run stamps its
+forcing into the cache header. A forced cache can never be mistaken for a measured one.
+
+Reading `ENV` here is trim-safe by placement, not by luck: every call site sits inside the
+`@static if isnothing(<pref>)` branch that a pinned/trim build does not compile at all.
+"""
+@inline function _force_knob(name::String)::Int
+    v = get(ENV, "PUREBLAS_FORCE_" * name, "")
+    isempty(v) && return -1
+    x = tryparse(Int, v)
+    return isnothing(x) ? -1 : x
+end
+
 const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a tie), the one dial
 # req8-ok: NOT a machine-dependent tuning value — it is a COUNT of the Measure-tier knobs in this tree,
 # used as the Bonferroni denominator that splits `_TUNE_ALPHA` across them. It depends on the source,
