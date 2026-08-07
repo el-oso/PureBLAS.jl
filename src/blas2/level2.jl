@@ -1137,6 +1137,20 @@ end
 # both; DIMMs rank-matched; OS/clock cancel in the PB/OB ratio; 4K-aliasing padded out; LLVM znver4≡znver5
 # codegen on the same silicon) — so this is a genuine tuning knob, not a µarch hack. Default 4 (a safe middle).
 const _GER_PANEL_U = 4                                          # x-vector unroll (ILP)
+# Complex ger panel budget — DERIVED from the register file, not swept. A complex column holds 2
+# `Vec{2W,T}` coefficient vectors, and `Vec{2W,T}` occupies exactly 2 native registers on every ISA
+# (2W·sizeof(T) = 2·_SIMD_BYTES by construction), so a column costs 4 registers; each unrolled x step
+# costs another 4 (the vector and its swap-adjacent partner). Reserving ~4 for addresses/temporaries:
+#     NP_max = (_NVREG - 4 - 4·U) ÷ 4
+# AVX-512 (_NVREG=32, U=2) → 5, so the ladder's 4 fits with room; AVX2 (_NVREG=16, U=1) → 2. Halving U
+# on the narrow file is what keeps NP ≥ 2 there at all — with U=2 an AVX2 box could only afford NP=1,
+# i.e. no panel. See [[register-ceiling-vs-structure]]: count the vectors actually held live.
+const _CGER_U = _NVREG >= 32 ? 2 : 1
+# ⚠ SNAPPED DOWN TO A POWER OF TWO, and that is a correctness requirement, not tidiness: the driver's
+# `Val` ladder only instantiates NP ∈ {2,4,8}, but advances `jc += np`. A raw budget of 5 selected the
+# Val(8) arm while striding 5, which reprocesses columns and reads past the last panel. Caught by the
+# correctness check, not by review.
+const _CGER_NP_MAX = (r = (_NVREG - 4 - 4 * _CGER_U) ÷ 4; r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1)
 # NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
@@ -1304,10 +1318,132 @@ end
     return A
 end
 
+# Complex rank-1 PANEL: NP columns per pass, x loaded once and reused across all of them — the complex
+# mirror of `_ger_panel!`. Structure and register accounting are the only differences worth stating:
+# a complex coefficient needs TWO live vectors per column (the α·y[j] broadcast and its sign-alternated
+# partner for the swap-adjacent product) against the real kernel's one, and each is `Vec{2W}` = two
+# native registers, so a column costs 4 registers here versus 1 there. That is why NP is capped by
+# `_NVREG` at the call site rather than inheriting the real path's value unexamined.
+@generated function _ger_panel_cmplx!(
+        Ap::Ptr{Complex{T}}, lda::Int, xp::Ptr{Complex{T}}, yp::Ptr{Complex{T}},
+        jc::Int, m::Int, α::Complex{T}, ::Val{NP}, ::Val{CJ}, ::Val{U}
+    ) where {T <: BlasReal, NP, CJ, U}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T); step = U * W
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    body = quote
+        pxr = Ptr{$T}(xp)                                  # real-interleaved views for the vector loads
+        par = Ptr{$T}(Ap)
+    end
+    for c in 1:NP
+        # ay = α·(cj ? conj(y[j]) : y[j]) — the SAME scalar the per-column path forms, so the two paths
+        # are bit-identical per element and the panel is a pure scheduling change.
+        push!(body.args, :($(Symbol(:yv, c)) = unsafe_load(yp, jc + $c)))
+        push!(body.args, :($(Symbol(:ay, c)) = α * $(CJ ? :(conj($(Symbol(:yv, c)))) : Symbol(:yv, c))))
+        push!(body.args, :($(Symbol(:ar, c)) = $V2(real($(Symbol(:ay, c))))))
+        push!(
+            body.args, :(
+                $(Symbol(:si, c)) = $V2($(Expr(:tuple, (iseven(l) ? :(-imag($(Symbol(:ay, c)))) :
+                                                        :(imag($(Symbol(:ay, c)))) for l in 0:(2W - 1))...)))
+            )
+        )
+        push!(body.args, :($(Symbol(:ac, c)) = par + (jc + $(c - 1)) * lda * 2 * $sz))
+    end
+    main = quote end
+    for u in 1:U
+        push!(main.args, :($(Symbol(:xv, u)) = vload($V2, pxr + (i + $((u - 1) * W)) * 2 * $sz)))
+        push!(main.args, :($(Symbol(:xs, u)) = shufflevector($(Symbol(:xv, u)), Val($swp))))
+    end
+    for c in 1:NP, u in 1:U
+        push!(main.args, :(p = $(Symbol(:ac, c)) + (i + $((u - 1) * W)) * 2 * $sz))
+        push!(main.args, :(t = muladd($(Symbol(:xv, u)), $(Symbol(:ar, c)), vload($V2, p))))
+        push!(main.args, :(vstore(muladd($(Symbol(:xs, u)), $(Symbol(:si, c)), t), p)))
+    end
+    tail = quote end
+    for c in 1:NP
+        push!(
+            tail.args, quote
+                j = i + 1
+                xr = unsafe_load(pxr, 2j - 1); xi = unsafe_load(pxr, 2j)
+                q = $(Symbol(:ac, c)); ar = real($(Symbol(:ay, c))); ai = imag($(Symbol(:ay, c)))
+                unsafe_store!(q, unsafe_load(q, 2j - 1) + ar * xr - ai * xi, 2j - 1)
+                unsafe_store!(q, unsafe_load(q, 2j) + ar * xi + ai * xr, 2j)
+            end
+        )
+    end
+    push!(body.args, :(i = 0))
+    push!(body.args, :(while i + $step <= m
+        $main; i += $step
+    end))
+    push!(body.args, :(while i < m
+        $tail; i += 1
+    end))
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Static Val ladder: runtime NP → compile-time Val{NP}, one branch, each arm statically dispatched (no
+# dynamic Val in the hot path → allocation-free, StrictMode-clean). Mirrors `_ger_paneldrv_np`.
+@inline function _ger_paneldrv_cmplx!(
+        m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool, np::Int
+    ) where {T <: BlasReal}
+    return cj ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true)) :
+        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false))
+end
+@inline function _ger_pdc_cj!(
+        m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}
+    ) where {T <: BlasReal, CJ}
+    GC.@preserve A x y begin
+        Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); csz = sizeof(Complex{T})
+        jc = 0
+        while jc + np <= n
+            if np == 2
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(2), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+            elseif np == 4
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(4), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+            else
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(8), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+            end
+            jc += np
+        end
+        @inbounds while jc < n                                              # remainder columns (< np)
+            yj = CJ ? conj(unsafe_load(yp, jc + 1)) : unsafe_load(yp, jc + 1)
+            ayj = α * yj
+            iszero(ayj) ||
+                _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xp, Ap + jc * lda * csz)
+            jc += 1
+        end
+    end
+    return A
+end
+
 # Complex rank-1: A[:,j] += (α·(cj ? conj(y[j]) : y[j]))·x — one complex axpy of x into each contiguous
 # column, reusing the L1 _axpy_cmplx_simd! kernel (like the real _ger_simd! reuses _axpy_simd!).
 function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T <: BlasReal}
     csz = sizeof(Complex{T})
+    # ⚠ DRAM-BOUND A → PANEL, exactly as the real path does. This asymmetry was a measured gate failure:
+    # real `ger` has routed A ≥ L3 to `_ger_paneldrv_np` (NP concurrent write streams) since the stream
+    # count was calibrated per box, and the complex path never got it — it ran ONE read+write stream at
+    # every size. Measured 2026-08-07 on wintermute, freq-locked, ALL ARMS SAME-RUN (so this is not the
+    # cross-run drift that manufactured a phantom miss on Zen3 the same day), zgeru vs AOCL:
+    #     n=512  A=4.2 MB  < L3   1.056 PASS
+    #     n=1024 A=16.8 MB ≥ L3   0.885 MISS
+    #     n=2048 A=67 MB   ≥ L3   0.883 MISS
+    #     n=4096 A=268 MB  ≥ L3   0.915 MISS
+    # Every cell above L3 misses and every cell below it passes — the split is exactly the threshold the
+    # real path switches at. Once A is DRAM-resident the op is bound by memory-level parallelism, and one
+    # stream cannot keep enough misses in flight; that is the same physics `_ger_np`'s own comment
+    # records ("optimal number of concurrent wide-SIMD write-streams ... intrinsic per-core property").
+    #
+    # NP is the per-box Measure knob CAPPED BY A DERIVED REGISTER BUDGET, not inherited outright: a
+    # complex column holds two `Vec{2W}` coefficient vectors (the α·y broadcast and its sign-alternated
+    # partner) against the real kernel's one, and `Vec{2W,T}` is always exactly 2 native registers
+    # (2W·sizeof(T) = 2·_SIMD_BYTES by construction), so a column costs 4 registers here versus 1 there.
+    # Spending the real path's NP=8 would be 32 registers of coefficients alone and spill on every ISA.
+    if m * n * csz >= _L3_BYTES
+        np = min(_ger_np(), _CGER_NP_MAX)
+        np >= 2 && return _ger_paneldrv_cmplx!(m, n, α, x, y, A, cj, np)
+        # np == 1 IS the per-column path below (one stream) — no separate arm needed.
+    end
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2)
         @inbounds for j in 1:n
