@@ -385,11 +385,24 @@ and only the policy half was ever legitimately a constant.
 Cost is `rounds*reps*2` timings (~50 at the defaults) — tens of ms once per process, so this stays a
 load-time self-tune and needs no pin and no persisted calibration.
 """
-function _tune_duel(fa::FA, fb::FB; rounds::Int = _TUNE_ROUNDS, reps::Int = 5, δ::Int = 2) where {FA, FB}
+function _tune_duel(
+        fa::FA, fb::FB; rounds::Int = _TUNE_ROUNDS, reps::Int = 5, δ::Int = 2,
+        refresh::RF = nothing
+    ) where {FA, FB, RF}
     fa(); fb()                                     # warmup, untimed (first touch + any JIT)
     wins = 0
     need = rounds - 1                              # the supermajority `_tune_wins_it` will demand
     for r in 1:rounds
+        # `refresh` RESAMPLES THE OPERANDS between rounds, and for some knobs it is the difference
+        # between a decidable and an undecidable question. Duelling resamples TIME; if the candidates'
+        # relative speed depends on state fixed ONCE PER PROCESS — page placement, THP promotion, the
+        # addresses the allocator happened to hand out — then every round re-measures the same draw and
+        # no number of rounds converges. `axpy_band` demonstrated it: with 15 rounds a tie-driven false
+        # positive has probability 0.05%, yet it still resolved 208 in some processes and 4 in others,
+        # which can only mean the winner genuinely differs per process. Rotating operands makes each
+        # round a fresh draw, so the sign count aggregates over placements — which is what production
+        # sees anyway, since callers do not all share one lucky allocation.
+        refresh === nothing || refresh(r)
         local ta::UInt64, tb::UInt64
         if isodd(r)                                # ABBA: neither arm always runs second
             ta = _tune_one(fa; reps = reps); tb = _tune_one(fb; reps = reps)
