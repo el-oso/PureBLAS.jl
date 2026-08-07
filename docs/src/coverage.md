@@ -94,7 +94,7 @@ html.dark .pbg-key{color:#98a1b3}
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>asum</code></th><td class="ok"><span class="v">1.26</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>dot</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.81</span></td><td class="ok"><span class="v">1.64</span></td><td class="ok"><span class="v">1.6</span></td></tr>
@@ -116,7 +116,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.42</span></td><td class="ok"><span class="v">1.21</span></td></tr>
 <tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.961</span><span class="n">n=4096</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.938</span><span class="n">n=2048</span></td></tr>
 <tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.948</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.741</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.12</span></td></tr>
 <tr><th><code>spmv</code></th><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.77</span></td><td class="ok"><span class="v">1.76</span></td></tr>
 <tr><th><code>symv</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.05</span></td></tr>
