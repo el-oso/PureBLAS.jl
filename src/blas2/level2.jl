@@ -741,10 +741,47 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     push!(body.args, :(return nothing))
     return body
 end
-# AVX2 complex gemvN driver: β-prescale y, then NC-column panels over full m (no m-blocking — full-m
-# column streams prefetch best; tall y-beyond-L2 shapes stay on the row-tile path via the caller).
-function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
-    NC = _CGEMVN_NC; sz = sizeof(T); αr = real(α); αi = imag(α)
+# NC IS A MEMORY-LEVEL-PARALLELISM KNOB, and it was a bare literal (`4`, justified by "OB uses 4" —
+# OpenBLAS's choice for OpenBLAS's kernel is not a derivation for ours). NC is how many A-column streams
+# run concurrently: while A is cache-resident there is no fill latency to hide and a wide panel only
+# costs register pressure and y-restreaming, but once A outgrows the caches more concurrent streams keep
+# more misses outstanding. So the optimum RISES with A's residency, and one constant is wrong at one end.
+#
+# Measured 2026-08-06, both boxes freq-locked, in plots.jl's own `_L2REP` regime, 3 rotated rounds with
+# the anchor arm duplicated as the run's noise floor (0.05-1.4%). Ratios vs the shipping NC=4:
+#   Zen4 (W=8, L2=1 MB, L3=16 MB)          Zen3 (W=4, L2=512 KB)
+#    n     A     A/L2   4     8    12   16      n     A    A/L2   2     4     6     8
+#   256  1.0MB    1   1.000 0.924 0.743 0.576  256  1.0MB   2  0.852 1.000 0.995 0.946
+#   512  4.2MB    4   0.999 1.076 0.972 0.845  512  4.2MB   8  0.870 0.993 1.029 0.878
+#  1024 16.8MB   16   0.980 1.090 1.132 1.080 1024 16.8MB  32  0.827 0.980 1.032 0.880
+#  2048 67.1MB   64   0.996 1.034 1.058 0.930 2048 67.1MB 128  0.787 0.988 1.036 0.930
+#
+# WHY MEASURE AND NOT DERIVE. The tier SHAPE is shared — NC rises with A/L2 and saturates at 3W/2, and
+# 2W is worse than the shipping value on both boxes, which is what bounds the candidate set above. But
+# the values are NOT: at A ≈ L2 Zen4 wants W/2 while the same rule gives Zen3 W/2 = 2, which measures
+# 0.852 there — a 15% regression. A residency formula fitted to Zen4 mispredicts a box we own, which is
+# precisely req#8b's tell for Measure tier. Only the LARGE-A tier is common ground: both boxes put the
+# optimum at 3W/2 once A > L3/2, and both put it above the shipping value.
+#
+# SO ONLY THAT TIER MOVES. Below L3/2 the shipping `_CGEMVN_NC` is kept byte-for-byte — no size on
+# either box regresses (Zen4 n=256/512 measure 1.000/0.999 at NC=4). Above it, the value is measured
+# on-host over the DERIVED candidate set {W, 3W/2}. The boundary (L3 residency) is Derive tier; the
+# value inside it is Measure tier. The A ≤ L3/2 tiers are left as a known-unclaimed +7.6% on Zen4 at
+# n=512 rather than shipping a rule that regresses Zen3 — widening the harness to three measured tiers
+# is the follow-up, and it needs its own fleet validation.
+@inline function _cgemvn_abytes(::Type{T}, m::Int, n::Int) where {T}
+    return 2 * m * n * sizeof(T)                    # A is complex: two reals per element
+end
+
+# Complex gemvN driver with NC fixed at COMPILE time: β-prescale y, then NC-column panels over full m
+# (no m-blocking — full-m column streams prefetch best; tall y-beyond-L2 shapes stay on the row-tile
+# path via the caller). NC is a `Val` rather than an Int so the @generated panel specializes per
+# candidate; a runtime `Val(nc)` would dispatch dynamically on every panel, and the tuner below needs to
+# call this at each candidate anyway.
+function _gemv_n_ri_run!(
+        m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}, ::Val{NC}, ::Val{PF}
+    ) where {T <: BlasReal, B0, NC, PF}
+    sz = sizeof(T); αr = real(α); αi = imag(α)
     # y is restreamed once per NC-column panel (n/NC times) → block m so the y-block fits ~½ L2 for tall
     # shapes; square mid-n (16m ≤ ½L2) runs one block (NB=m), which measured fastest (prefetch continuity).
     NB = (2 * m * sz <= _L2_BYTES ÷ 2) ? m : max(NC, (_L2_BYTES ÷ 2) ÷ (2 * sz))
@@ -762,8 +799,7 @@ function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{
             mb = min(NB, m - i0); ypb = yp + i0 * 2 * sz; Apb = Ap + i0 * 2 * sz
             jc = 0
             while jc + NC <= n
-                _CGEMVN_PF ? _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(true)) :
-                    _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(_CGEMVN_NC), Val(false))
+                _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(NC), Val(PF))
                 jc += NC
             end
             while jc < n
@@ -774,6 +810,75 @@ function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{
         end
     end
     return y
+end
+
+# NC FOR THE LARGE-A TIER: **DERIVE**, not Measure. This was a Measure-tier OncePerProcess until
+# 2026-08-07, and the demotion is the point — the knob never earned that tier, it inherited it by
+# analogy to `_ger_np` ("same class"), and its own data says otherwise.
+#
+# THE LITMUS TEST for Derive-vs-Measure: does the measured optimum SCALE WITH A DETECTED CONST across
+# boxes, or does it move while every detected const stays fixed? Scaling means the binding resource is
+# core structure, which the ISA/cache consts describe. Moving at fixed consts means the resource is
+# outside the detected set (memory latency, prefetcher depth, store-buffer drain) and no formula over
+# that set can reproduce it without a family branch — a per-µarch literal in disguise, which req#8b
+# bans. Measured winners for this knob, in the regime it governs (A > L3/2), square operands:
+#     Zen4 (W=8):  12   = 3W/2      [n=1024 1.132 and n=2048 1.058 vs shipping; gate 0.849 -> 0.989]
+#     Zen3 (W=4):   6   = 3W/2      [n=1024 1.032, n=2048 1.036 vs shipping]
+# The SAME formula on both, and the value tracks W — the signature of a core-structure bound. Note it
+# is specifically NOT the memory-level-parallelism story I first assumed: MAB/LFB counts do not double
+# when AVX-512 is enabled, so an MLP-bound optimum would not track W at all.
+#
+# WHY 3W/2 AND NOT 2W: 2W was measured WORSE than the shipping value on both boxes (Zen4 0.930 at
+# n=2048, Zen3 0.930 at n=2048) — each column holds a cr/ci broadcast pair alongside the Pv/Qv
+# accumulators, so past 3W/2 the panel spills. That is the register-file bound, and it is why the
+# candidate set was derived from W in the first place.
+#
+# WHAT THIS DELETES, all of it pure benefit: the OncePerProcess (so no first-call benchmark inside a
+# library, no @noalloc hazard on the paths that reach this, no pin required for the trim build), the
+# duel, and the nondeterminism that had it resolving 8/12/8/8 across fresh processes before the duel
+# and 12 after. A derived const is deterministic by construction and const-folds.
+#
+# ⚠ ZEN5 IS PREDICTED, NOT MEASURED (W=8 ⇒ 12). req#8b(b) requires a derived formula to reproduce the
+# fleet's measured optima before it is trusted to extrapolate, and neuromancer has not been run for
+# this knob. Acceptance test, to run freq-locked with plots.jl methodology and `arms=pb`: zgemvN square
+# at A≈L3 and A≈4×L3, Val(8) vs Val(12) arms of `_gemv_n_ri_run!`, median estimator. If Zen5 prefers 8,
+# that is the req#8b tell and this goes back to Measure — the Preference below is the escape hatch
+# meanwhile.
+const _CGEMVN_NC_BIG = @load_preference("cgemvn_nc_big", 3 * _vwidth(Float64) ÷ 2)::Int
+@inline _cgemvn_nc_big() = _CGEMVN_NC_BIG
+
+# The shipping panel, with NO reference to the measured knob. Internal BLAS-2 callers use THIS, not the
+# tier-selecting entry below — see the @noalloc note there.
+@inline function _gemv_n_ri_ship!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+    return _CGEMVN_PF ?
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(true)) :
+        _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(false))
+end
+
+# ⚠ THE MEASURED KNOB LIVES HERE AND NOWHERE UPSTREAM OF A @noalloc CONTRACT. `Base.OncePerProcess`'s
+# first-call init allocates (`jl_set_precompile_field_replace`), and `@assert_noalloc` is an ALL-PATHS
+# static proof — it does not care that a branch is dynamically unreachable. `trmv!`/`trsv!` carry that
+# contract and reach the complex gemvN kernel through `_tri_scat_cmplx!`, so routing them through this
+# function put 72 allocation sites into their proof and failed StrictMode. Same class as the axpy
+# OncePerProcess that had to leave the BLAS-2 path.
+# It is also the right split on the merits, not just to satisfy the checker: the triangular scatter's
+# operand is m×NB — a tall-skinny panel — never the large SQUARE regime this knob was measured in, so
+# consulting it there would be a probe-regime error even if it were free.
+function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+    # Below L3/2 keep the shipping panel byte-for-byte (no size on either box regresses there); above it,
+    # take the measured value. The BOUNDARY is Derive tier (L3 residency), the VALUE inside it is Measure.
+    if _cgemvn_abytes(T, m, n) > _L3_BYTES ÷ 2
+        nc = _cgemvn_nc_big()
+        # `nc` is one of three compile-time-known values, so branch to a specialization rather than
+        # building `Val(nc)` — and note the branch must be exhaustive over what the tuner can return,
+        # since falling through silently applies `_CGEMVN_NC` instead (correct, just not what was tuned).
+        if nc == 3 * _vwidth(T) ÷ 2
+            return _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(3 * _vwidth(T) ÷ 2), Val(false))
+        elseif nc == _vwidth(T)
+            return _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_vwidth(T)), Val(false))
+        end
+    end
+    return _gemv_n_ri_ship!(m, n, α, A, x, y, β, Val(B0))
 end
 
 # Complex gemv-N panel block: accumulate columns [jc, jc+Peff) of A into MR row-tiles of W complex, RMW
@@ -1047,8 +1152,20 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             # MEDIAN per candidate, not min (see cpuinfo.jl `_tune_one`). This knob has OPPOSITE SIGN
             # across µarchs (Zen5→1, Zen3→4, Zen4→8), so it is exactly the case where the luckiest
             # window of one candidate must not decide what ships.
-            best = 4; bt = typemax(UInt64)
-            for np in (1, 2, 4, 8)
+            # ⚠ SEED `bt` WITH THE DEFAULT'S OWN MEASURED TIME, not `typemax`. With `bt = typemax`,
+            # `_tune_better(t, bt)` is `t*100 < typemax*95`, and `typemax*95` WRAPS to 2^64-95 — still
+            # astronomically above any real time, so the FIRST swept candidate always displaces and the
+            # declared default (`best = 4`) can never win. The effective incumbent was np=1 purely
+            # because it is first in the list, which silently voided the invariant the margin exists for
+            # ("ties go to the incumbent, which is the derived default", cpuinfo.jl). It bites hardest on
+            # exactly the noisy boxes the margin was built for: where all candidates sit within 5%, the
+            # shipped kernel was "first in the list", undocumented.
+            # Seeded this way the loop is extensionally identical to `_tune_pick` (bt starts at the
+            # incumbent and only decreases, so every displacement also clears the incumbent) — see the
+            # proof note there, and test/tuner_tests.jl for the pinned semantics.
+            best = 4
+            bt = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, best); reps = 5)
+            for np in (1, 2, 8)                        # the default is already timed as the incumbent
                 t = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, np); reps = 5)
                 _tune_better(t, bt) && (bt = t; best = np)
             end
@@ -2304,8 +2421,11 @@ end
 # The OB-structure ri gemv (α folded, fresh accs, prefetch, m-blocked) beats the row-tile scatter on
 # BOTH ISAs for the tall off-diagonal shape (m≫k=NB, β=1) — measured 0.71–0.96× row-tile across m on
 # AVX-512, and it's the same kernel zgemvN already rides. (Was AVX-512→row-tile; that predated the ri tune.)
+# `_gemv_n_ri_ship!`, NOT `_gemv_n_ri_cmplx!`: trmv!/trsv! carry a @noalloc contract and the latter
+# consults a OncePerProcess whose init allocates — an all-paths proof fails on it even though this
+# operand (m×NB, tall-skinny) can never reach the large-square tier that knob selects for.
 @inline _tri_scat_cmplx!(yv, Av, xv, α::T) where {T} =
-    _gemv_n_ri_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
+    _gemv_n_ri_ship!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(T), Val(false))
 @inline _tri_scatT_cmplx!(yv, Av, xv, α::T, cj::Bool) where {T} =
     cj ? _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(true)) :
     _gemv_tc_cmplx!(size(Av, 1), size(Av, 2), α, Av, xv, one(T), yv, Val(false))

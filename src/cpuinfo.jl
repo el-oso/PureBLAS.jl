@@ -304,3 +304,196 @@ it feeds straight back into the run-to-run variance that makes that box hard to 
 phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which is the derived default.
 """
 @inline _tune_better(t::UInt64, best::UInt64) = t * 100 < best * 95
+
+# ROUND COUNT IS DERIVED, NOT PICKED. There is exactly ONE free choice in this whole rule and it is
+# `_TUNE_ALPHA` below; everything else follows by arithmetic from it.
+#
+# `_tune_wins_it` demands `rounds-1` wins, so at a GENUINE TIE one duel displaces with probability
+# `(rounds+1)/2^rounds` — that is exact, a property of the rule alone, and needs no assumption about
+# any machine. A sweep runs one duel PER CANDIDATE, so what governs whether a knob is stable is the
+# FAMILY-WISE rate `ncand·(rounds+1)/2^rounds`. Solve that for `rounds` and the constant disappears.
+#
+# Measured consequence of getting this wrong (2026-08-06, wintermute, one knob per fresh process, 5
+# rounds throughout): `cgemvn_nc_big` (2 candidates) and `ger_np` (3) came out STABLE while `axpy_band`
+# (6) and `axpy_dram` (4) still flipped. The instability tracked CANDIDATE COUNT — the signature of a
+# multiple-comparisons error, not of a noisy machine, and the reason a single global round count was
+# the wrong shape for this knob in the first place.
+#
+# WHY THIS IS NOT THE 5% MARGIN IN NEW CLOTHES. That margin was an empirical CLAIM about hardware
+# ("5% is above the probes' resolution on every fleet box") — unverified, and measurement later put the
+# real figure anywhere from 0.02% to 6.5% on ONE box. `_TUNE_ALPHA` claims nothing about hardware. It
+# is a stated risk budget: how often we are willing to let a library load ship a different kernel than
+# the last one WHEN THE CANDIDATES ARE GENUINELY TIED — in which case the two kernels are equivalent by
+# construction and the cost of the flip is bounded by δ. Spread over the ~13 Measure knobs in the tree,
+# 5% library-wide is ~0.4% per knob. Raise or lower it as a product decision; the rounds follow.
+const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a tie), the one dial
+# req8-ok: NOT a machine-dependent tuning value — it is a COUNT of the Measure-tier knobs in this tree,
+# used as the Bonferroni denominator that splits `_TUNE_ALPHA` across them. It depends on the source,
+# not on the host, so there is nothing to derive from a detected const. Being stale-high is the safe
+# direction (a larger denominator buys MORE rounds), so drift costs conservatism, never correctness.
+# Keep in step with bench/probes/knob_stability_audit.jl, which enumerates them.
+# req8-ok: a COUNT of Measure knobs in this source tree (Bonferroni denominator), not a machine value
+const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
+
+"""
+    _tune_rounds(ncand) -> Int
+
+Rounds needed so that `ncand` duels together risk at most `_TUNE_ALPHA/_TUNE_NKNOBS` of a spurious
+displacement at a tie. Pure, integer, evaluated at the call site — so a sweep with 2 candidates does
+not pay for a sweep with 6, and adding a candidate automatically buys the rounds it costs.
+"""
+@inline function _tune_rounds(ncand::Int)
+    budget = _TUNE_ALPHA / _TUNE_NKNOBS
+    r = 5
+    while r < 25 && ncand * (r + 1) / 2.0^r > budget
+        r += 1
+    end
+    return r
+end
+const _TUNE_ROUNDS = _tune_rounds(6)        # widest sweep in the tree; the default for callers
+
+"""
+    _tune_duel(fa, fb; rounds=_TUNE_ROUNDS, reps=5, δ=2) -> Int
+
+How many of `rounds` the candidate `fb` beats the incumbent `fa`. Feed to [`_tune_wins_it`](@ref).
+Each round reduces BOTH arms with the MEDIAN of `reps` timings, then records ONE bit: who won. Arm
+order alternates per round (ABBA). One untimed warmup of each runs first.
+
+WHY THIS REPLACES A MARGIN ON TWO MEDIANS. The old rule compared one median against one median and
+demanded a fixed 5% win. Measured 2026-08-06 (wintermute, freq-locked, quiet): the complex gemvN NC
+pair differs by a stable ~3-4%, which sits just under that threshold, so NOISE decided whether it
+cleared — four fresh processes of the same binary resolved the knob to 8, 12, 8, 8. The threshold did
+not prevent the coin flip, it *caused* it, by putting the decision boundary inside the noise band.
+
+Counting round wins instead is distribution-free and self-calibrating: the evidence required scales
+with the machine's own noise without ever estimating a noise floor. On a quiet shape a reproducible
+3% win takes every round; on a noisy one it takes about half, and the supermajority refuses. Measured
+separation for that same pair, in the tuner's own regime — null (an arm against ITSELF) 2/5, power
+5/5. The margin could not resolve what this resolves cleanly.
+
+⚠ THE ORDER OF OPERATIONS IS THE WHOLE TRICK, and getting it backwards is why an earlier attempt
+failed. A sign test whose per-round statistic is a SINGLE timing makes every round a coin flip, and
+null then overlaps power at every number of rounds (measured: null up to 7/15 against power 4/15).
+AGGREGATE FIRST — median within a round — THEN count signs across rounds. Reducing twice is the point,
+not redundancy: the median kills within-round outliers, the sign count kills between-round drift and
+mode-hops.
+
+`δ` is a REGRET bound in percent — "do not churn the shipped kernel for less than this" — machine
+independent POLICY, not a noise estimate. That separation is the correction: the old 5% did both jobs
+and only the policy half was ever legitimately a constant.
+
+Cost is `rounds*reps*2` timings (~50 at the defaults) — tens of ms once per process, so this stays a
+load-time self-tune and needs no pin and no persisted calibration.
+"""
+function _tune_duel(
+        fa::FA, fb::FB; rounds::Int = _TUNE_ROUNDS, reps::Int = 5, δ::Int = 2,
+        refresh::RF = nothing
+    ) where {FA, FB, RF}
+    fa(); fb()                                     # warmup, untimed (first touch + any JIT)
+    wins = 0
+    need = rounds - 1                              # the supermajority `_tune_wins_it` will demand
+    for r in 1:rounds
+        # `refresh` RESAMPLES THE OPERANDS between rounds, and for some knobs it is the difference
+        # between a decidable and an undecidable question. Duelling resamples TIME; if the candidates'
+        # relative speed depends on state fixed ONCE PER PROCESS — page placement, THP promotion, the
+        # addresses the allocator happened to hand out — then every round re-measures the same draw and
+        # no number of rounds converges. `axpy_band` demonstrated it: with 15 rounds a tie-driven false
+        # positive has probability 0.05%, yet it still resolved 208 in some processes and 4 in others,
+        # which can only mean the winner genuinely differs per process. Rotating operands makes each
+        # round a fresh draw, so the sign count aggregates over placements — which is what production
+        # sees anyway, since callers do not all share one lucky allocation.
+        refresh === nothing || refresh(r)
+        local ta::UInt64, tb::UInt64
+        if isodd(r)                                # ABBA: neither arm always runs second
+            ta = _tune_one(fa; reps = reps); tb = _tune_one(fb; reps = reps)
+        else
+            tb = _tune_one(fb; reps = reps); ta = _tune_one(fa; reps = reps)
+        end
+        tb * 100 < ta * UInt64(100 - δ) && (wins += 1)
+        # EARLY EXIT once the verdict is settled — this is what pays for the round count. A candidate
+        # that has already lost twice cannot reach `rounds-1`, and most candidates in a sweep are
+        # hopeless, so the common case costs 2 rounds rather than `rounds`. Only a genuinely close
+        # contest runs to the end, which is exactly where the extra rounds are needed.
+        wins + (rounds - r) < need && return wins   # cannot still reach the threshold
+        wins >= need && return wins                 # already there; further rounds cannot unmake it
+    end
+    return wins
+end
+
+"""
+    _tune_wins_it(wins, rounds=_TUNE_ROUNDS) -> Bool
+
+Does a candidate with `wins` of `rounds` displace the incumbent? Requires a SUPERMAJORITY (`rounds-1`),
+so one spoiled round — a mode hop, a stray interrupt — cannot decide what ships.
+
+DETERMINISM, the property the old fixed margin was defending: at an exact performance tie the chance of
+displacing is `(rounds+1)/2^rounds` — 18.75% at 5 rounds, 2% at 9, 0.17% at 13 — and it is DIALLED by
+`rounds` rather than assumed. The margin, by contrast, was deterministic only if the host's noise
+happened to fall below it, which was asserted fleet-wide and never verified. Note also that a tie here
+means the candidates are genuinely equivalent, so a flip costs at most `δ`; the old failure flipped
+between candidates differing by a real 3-4%.
+"""
+@inline _tune_wins_it(wins::Int, rounds::Int = _TUNE_ROUNDS) = wins >= rounds - 1
+
+"""
+    _tune_pick(t_inc, ts::NTuple{N,UInt64}) -> Int
+
+Which candidate displaces the incumbent? `0` keeps it; otherwise the index into `ts`. Pure — no clock,
+no allocation — so the SELECTION RULE is unit-testable independently of any measurement
+(`test/tuner_tests.jl`). Every Measure-tier sweep should route its decision through this rather than
+open-coding a loop, which is how the two properties below came to differ per site.
+
+TWO RULES, and the first is the one that is easy to get wrong:
+
+  * QUALIFY AGAINST THE INCUMBENT, never against a running best. The open-coded form
+    `_tune_better(t, bt) && (bt = t; best = c)` re-bases the comparison after each win, so what a
+    later candidate must beat depends on what happened to win earlier. Here `t_inc` is fixed.
+  * Among QUALIFIERS the margin applies again, ties going to the EARLIER candidate. Callers order
+    candidates smallest-first, so a tie keeps the cheaper one (fewer live registers, less scratch).
+
+⚠ HONEST NOTE ON WHAT THIS CHANGED: for a MONOTONE ladder (each candidate faster than the last) this
+is behaviourally IDENTICAL to the chained form — if `b` cannot beat `a` by the margin, both rules
+return `a`. The difference appears only when a later candidate qualifies against the incumbent while an
+earlier one that beat it did not, which cannot happen when times are ordered. So the rewrite buys
+testability and a stated invariant, NOT a different answer on the case that motivated it; the measured
+outcome was unchanged, and the unit tests below pin that down rather than letting the claim drift.
+"""
+@inline function _tune_pick(t_inc::UInt64, ts::NTuple{N, UInt64}) where {N}
+    best = 0
+    bt = t_inc
+    for i in 1:N
+        _tune_better(ts[i], t_inc) || continue        # qualify vs the INCUMBENT, fixed
+        (best == 0 || _tune_better(ts[i], bt)) && (best = i; bt = ts[i])
+    end
+    return best
+end
+
+# A PAIRED ABBA SIGN TEST WAS PROPOSED TO REPLACE THE MARGIN, BUILT, AND MEASURED. It does not work
+# here, and the reason is worth more than the rule was.
+#
+# The proposal (Fable, 2026-08-06): instead of comparing two block-timed medians against a fixed 5%,
+# run k adjacent pairs with the order alternated (ABBA), record only WHICH arm won each pair, and
+# displace on a supermajority. Attractive because it is distribution-free, needs no noise-floor
+# estimate, and self-scales — a noisy shape demands a bigger true gap, a quiet one accepts a small
+# reproducible win. The motivating case was the complex gemvN NC knob, where the 5% margin discards a
+# measured 3.9% (W vs 3W/2 at A≈L3 on Zen4).
+#
+# MEASURED on wintermute, freq-locked, quiet box, at the knob's own probe shape (1024², A≈L3), sweeping
+# k ∈ {9,15,21} and legs of r ∈ {1,5,15} calls — null (an arm against ITSELF), power (3W/2 over W) and
+# reverse (W over 3W/2), all in one run:
+#     r=1    null up to 6/15, power 4/15   → null and power OVERLAP at every k
+#     r=5    null up to 7/15, power 6/15
+#     r=15   null up to 7/9,  power 0/9
+# No (k, threshold) separates them. And the diagnosis is NOT that the test is weak: as the legs get
+# heavier the effect DISAPPEARS — at r=15 the plain median ratio is W/3W2 = 0.997, i.e. the two panel
+# widths are EQUAL in this regime. The 3.9% is real, but it lives in the GATE regime (fresh arrays per
+# sample, `_L1REP` dependent passes) and does not exist in the TUNER's regime (one pre-touched buffer,
+# back-to-back calls on hot data).
+#
+# SO THE PREMISE WAS WRONG: the margin is not discarding a real win. There is no win here to discard,
+# and no decision rule can select for an effect its own measurement regime does not reproduce. Which
+# makes this a probe-regime finding about the TUNERS themselves — they measure in a regime that differs
+# from the one the gate scores, so they can pick the wrong candidate however good the statistics are.
+# That is the open problem (see the task tracker); the threshold is not.
+# Do not re-propose the sign test without first showing the effect survives in the tuner's own regime.
+# Harness kept: bench/probes/tune_signtest_validate.jl (null + power + reverse + cross-process modes).

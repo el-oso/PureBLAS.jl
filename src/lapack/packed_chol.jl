@@ -51,19 +51,25 @@ const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
                     AP[_pp_l(j, j, n)] = T(2 * n + 2)
                 end
             end
-            best = 2 * vw; tbest = typemax(UInt64)
-            for c in (vw, 2 * vw, 3 * vw, 4 * vw)
+            # ⚠ DUELS AGAINST THE DECLARED DEFAULT. Two defects lived here, and they are the same two
+            # found in three other sweeps on 2026-08-06/07:
+            #   * `tbest = typemax(UInt64)` — `typemax*95` WRAPS to 2^64-95, still far above any real
+            #     time, so the FIRST candidate always displaced and `best = 2*vw` was unreachable. The
+            #     effective incumbent was whichever cut happened to be swept first (vw).
+            #   * a fixed-margin comparison on two medians, which decides by noise whenever the
+            #     candidates sit within the margin. Measured, one knob per fresh process: F64 resolved
+            #     8 / 16 — two different packed-Cholesky cuts shipping from one binary.
+            # Each candidate now duels the DECLARED DEFAULT over rotated rounds with a per-round median
+            # and a supermajority, so the default keeps ties and a lucky window cannot displace it.
+            # `refill!` stays OUTSIDE the timed region: the factorization is destructive, so every
+            # timed round must start from a fresh HPD packed matrix.
+            inc() = (refill!(); _pptrf_lower!(AP, n, 2 * vw))
+            for c in (vw, 3 * vw, 4 * vw)                          # the default is the incumbent
                 refill!(); _pptrf_lower!(AP, n, c)                 # untimed warmup (absorb JIT)
-                # MEDIAN of 5, not min — `refill!` is outside the timed region, so each round is a fresh
-                # destructive factorization and the estimator decides which cut SHIPS.
-                ts = Vector{UInt64}(undef, 5)
-                for r in 1:5
-                    refill!(); s = time_ns(); _pptrf_lower!(AP, n, c); ts[r] = time_ns() - s
-                end
-                sort!(ts); t = ts[3]
-                _tune_better(t, tbest) && (tbest = t; best = c)
+                cand() = (refill!(); _pptrf_lower!(AP, n, c))
+                _tune_wins_it(_tune_duel(inc, cand)) && return c
             end
-            return best
+            return 2 * vw
         catch
             return 2 * vw
         end
