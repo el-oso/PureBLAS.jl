@@ -16,7 +16,14 @@
 # 1:1 get an alias below; anything still unmatched is REPORTED, never silently skipped — an unmatched
 # row is exactly how a stale number would survive.
 #
-# Usage:  julia --project=bench bench/coverage_routing.jl bench/plots_data_*.txt
+# ⚠ PASS THE ZEN4 CACHE ONLY. These routing tables carry ONE verdict per row, and this page states
+# that verdict is the Zen4 sweep — the "Fleet status" section and several footnotes are written
+# against that convention. Feeding all three fleet caches silently min-es across boxes and changes the
+# answer: measured 2026-08-07 on the banded/tridiagonal/packed table, four of five rows moved, and
+# `Banded Cholesky` published as 0.891 MISSING when Zen4 alone reads 1.03 GATING. If the convention
+# ever changes to fleet-wide, change the prose and the footnotes in the same commit.
+#
+# Usage:  julia --project=bench bench/coverage_routing.jl bench/plots_data_avx512_wintermute.txt
 using Printf
 
 const QN = 48
@@ -106,7 +113,9 @@ end
 
 function main()
     paths = ARGS
-    isempty(paths) && error("usage: coverage_routing.jl <cache files...>")
+    isempty(paths) && error("usage: coverage_routing.jl <ZEN4 cache>")
+length(paths) == 1 || error("pass exactly ONE cache (the Zen4 sweep). Got $(length(paths)): " *
+    "these tables hold a single verdict per row and mixing boxes changes it — see the header note.")
     gates = cells(paths)
     ob = refstats(paths, "openblas"); ao = refstats(paths, "aocl")
 
@@ -122,7 +131,7 @@ function main()
         # TWO TABLE SHAPES: 8 columns (with geo/worst) and 5 (verdict only, e.g. eigensolvers).
 # The 5-column form was skipped by an earlier `>= 8` guard, which is why glyphs survived there.
 length(parts) >= 6 || continue
-wide = length(parts) >= 8
+wide = length(parts) >= 9   # 7-col row splits to 9 parts (leading/trailing empties); 5-col to 7
         rts = routines_of(String(parts[3]))
         gs = Float64[]; obs = Float64[]; aos = Float64[]
         miss = String[]

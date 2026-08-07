@@ -216,20 +216,20 @@ html.dark .pbg-key{color:#98a1b3}
 
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| Cholesky (lower) | potrf | s/d/c/z | ✅ | **0.984** | 1.42 / 1.04 | 1.67 / 0.984 |
-| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | **0.971** | 1.39 / 1.06 | 1.51 / 0.971 |
-| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.873** | 2.53 / 1.01 | 1.2 / 0.873 |
-| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | **0.823** | 1.4 / 0.823 | 1.35 / 1.14 |
-| LU | getrf, gesv | s/d/c/z | ✅ | **0.958** | 1.36 / 1.04 | 1.61 / 0.958 |
-| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.752** | 1.2 / 0.91 | 1.07 / 0.752 |
-| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.956** | 1.82 / 1.41 | 1.52 / 0.956 |
-| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.02 | 1.35 / 1.11 | 1.24 / 1.02 |
-| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1 | 1.39 / 1.04 | 1.44 / 1 |
-| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.32 | 1.69 / 1.44 | 2.12 / 1.32 |
-| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | **0.739** | 1.22 / 0.948 | 1.22 / 0.739 |
-| Least-squares | gels | s/d/c/z | ✅ | 1.26 | 2.39 / 1.64 | 1.86 / 1.26 |
-| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.04 | 1.26 / 1.08 | 1.22 / 1.04 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.09 | 1.31 / 1.09 | 1.35 / 1.17 |
+| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.08 | 1.48 / 1.08 | 1.64 / 1.13 |
+| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 1.03 | 1.47 / 1.11 | 1.44 / 1.03 |
+| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.914** | 2.82 / 1.01 | 1.2 / 0.914 |
+| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | **0.991** | 1.48 / 0.991 | 1.37 / 1.19 |
+| LU | getrf, gesv | s/d/c/z | ✅ | **0.991** | 1.37 / 1.04 | 1.71 / 0.991 |
+| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.987** | 1.25 / 1.14 | 1.11 / 0.987 |
+| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.956** | 1.94 / 1.56 | 1.54 / 0.956 |
+| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.02 | 1.34 / 1.14 | 1.2 / 1.02 |
+| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1 | 1.4 / 1.05 | 1.42 / 1 |
+| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.32 | 1.68 / 1.44 | 2.07 / 1.32 |
+| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | **0.739** | 1.13 / 0.948 | 1.1 / 0.739 |
+| Least-squares | gels | s/d/c/z | ✅ | 1.29 | 2.51 / 1.99 | 1.95 / 1.29 |
+| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.04 | 1.28 / 1.14 | 1.21 / 1.04 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.09 | 1.29 / 1.09 | 1.33 / 1.22 |
 
 ## LAPACK — SVD
 
@@ -270,11 +270,11 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.714** | 1.43 / 0.936 | 1.21 / 0.714 |
-| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | **0.998** | 1.34 / 0.998 | 1.28 / 1.03 |
-| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.988** | 1.37 / 1.1 | 1.06 / 0.988 |
-| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | **0.891** | 1.44 / 0.972 | 1.36 / 0.891 |
-| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.86** | 1.12 / 0.924 | 1.98 / 0.86 |
+| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.731** | 1.46 / 0.974 | 1.2 / 0.731 |
+| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 1 | 1.34 / 1 | 1.27 / 1.03 |
+| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.992** | 1.38 / 1.12 | 1.07 / 0.992 |
+| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 1.03 | 1.57 / 1.12 | 1.43 / 1.03 |
+| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.914** | 1.09 / 0.924 | 1.94 / 0.914 |
 
 ### Fleet status
 
