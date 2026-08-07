@@ -114,7 +114,10 @@ function main()
     unmatched = String[]; changed = 0
     for (i, ln) in enumerate(doc)
         startswith(ln, "| ") || continue
-        occursin("🐰", ln) || occursin("🐢", ln) || continue
+        # Trigger on ANY verdict form the Gated column has ever held — the retired glyphs, the escaped
+        # inline span from the bad first attempt, or the bolded number it holds now — so re-running is
+        # idempotent. Matching only the glyph made the script a no-op the moment it had run once.
+        occursin(r"🐰|🐢|<span class=\"pbg|\| *\*{0,2}[01]\.?[0-9]*\*{0,2} *\|", ln) || continue
         parts = split(ln, "|")
         # TWO TABLE SHAPES: 8 columns (with geo/worst) and 5 (verdict only, e.g. eigensolvers).
 # The 5-column form was skipped by an earlier `>= 8` guard, which is why glyphs survived there.
@@ -135,9 +138,15 @@ wide = length(parts) >= 8
             continue
         end
         isempty(miss) || push!(unmatched, "line $i PARTIAL: missing " * join(miss, ", "))
-        w = minimum(gs); b = band(w)
-        verdict = "<span class=\"pbg $b\" style=\"padding:.1em .45em;border-radius:.25em\">" *
-            @sprintf("%.3g", w) * "</span>"
+        w = minimum(gs)
+        # ⚠ MARKDOWN-SAFE, NOT INLINE HTML. A `<span>` inside a markdown table cell is ESCAPED by the
+        # Vitepress pipeline and publishes as literal `&lt;span class=&quot;pbg&quot;…` text — I shipped
+        # exactly that, and it read worse than the glyphs it replaced. The BLAS tables can carry colour
+        # because they are emitted as whole ```@raw html blocks; these routing tables cannot, because
+        # their cells hold Documenter footnote refs ([^upper]) which raw HTML would not resolve.
+        # So the verdict is the NUMBER, bolded when it misses. That still fixes the actual complaint
+        # against 🐰/🐢 — it distinguishes 0.999 from 0.61, which one glyph could not.
+        verdict = w >= 1.0 ? @sprintf("%.3g", w) : @sprintf("**%.3g**", w)
         parts[6] = " " * verdict * " "
         if wide                      # only the 7-column tables carry geo/worst columns
             parts[7] = @sprintf(" %.3g / %.3g ", geo(obs), isempty(obs) ? NaN : minimum(obs))
