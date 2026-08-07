@@ -94,9 +94,9 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>asum</code></th><td class="ok"><span class="v">1.26</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
+<tr><th><code>asum</code></th><td class="ok"><span class="v">1.26</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>dot</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.81</span></td><td class="ok"><span class="v">1.64</span></td><td class="ok"><span class="v">1.6</span></td></tr>
 <tr><th><code>iamax</code></th><td class="b2"><span class="v">0.97</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
@@ -125,7 +125,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>trsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.01</span></td></tr>
 <tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td></tr>
 <tr><th><code>zgemvC</code></th><td class="b2"><span class="v">0.963</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.935</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.848</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=1024</span></td></tr>
 <tr><th><code>zgemvT</code></th><td class="b2"><span class="v">0.959</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.855</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td></tr>
 <tr><th><code>zgeru</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.817</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.857</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.35</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td></tr>
