@@ -165,7 +165,14 @@ const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
             # PROBE IN THE MIDDLE OF THE BAND IT GOVERNS. This knob covers L1 < bytes <= L3, and probing
 # at 4xL1 picked a shape that wins at 128 KB and LOSES at 800 KB / 2.4 MB — the sizes that
 # actually fail on Zen4 (1e5, 3e5). 2xL2 sits above L2 and inside L3 on every fleet box.
-n = max(4096, 2 * _L2_BYTES ÷ sizeof(Float64))
+# ⚠ NOT A POWER OF TWO. `2*L2/8` and `2*L3/8` are both exact po2 (262144 and 4194304 on Zen4), and
+# po2 lengths are a cache-set-aliasing pathology — the codebase has `_avoid_po2` for exactly
+# this and this probe was not using it. Measured 2026-08-07 in the GATE regime: at n=262144
+# the incumbent `u4` takes 2317 us, SLOWER than at n=300000 (1948 us) despite fewer elements,
+# and `p208` beats it by 37% there versus 1.6% at the neighbouring non-po2 size. So the knob
+# was being decided at a point where one arm is anomalously crippled — a pathological probe,
+# not a representative one.
+            n = _avoid_po2(max(4096, 2 * _L2_BYTES ÷ sizeof(Float64)), 8 * _vwidth(Float64))
             W = _vwidth(Float64)
             # NB SETS OF OPERANDS, ROTATED PER ROUND. One buffer pair is one draw of page placement /
             # THP state / allocator addresses, and for THIS knob the winner depends on that draw: with
@@ -252,7 +259,8 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
     function _measure_axpy_dram()::Int
         Base.generating_output() && return _UNROLL
         try
-            n = max(4096, 2 * _L3_BYTES ÷ sizeof(Float64))
+            # po2 probe length — see the note on the band knob above.
+            n = _avoid_po2(max(4096, 2 * _L3_BYTES ÷ sizeof(Float64)), 8 * _vwidth(Float64))
             W = _vwidth(Float64)
             # NB OPERAND SETS, ROTATED PER ROUND — the same fix the band knob needed. Duels ALONE left
             # this one resolving 4/208 across fresh processes on Zen4 while its rotated sibling was
