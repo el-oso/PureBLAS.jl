@@ -270,6 +270,25 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             # ⚠ The symptom is BOX-DEPENDENT: this knob is stable on Zen5 and unstable on Zen4, and
             # `zaxpy_narrow` is the other way round. So rotation is applied uniformly to every Measure
             # knob rather than chased per box, where it would look fixed on whichever box was checked.
+            # ⚠⚠ FALSIFIED 2026-08-07 — DO NOT RE-CHASE "THE TUNER IS PICKING THE WRONG ARM HERE".
+            # A full day went into the theory that this knob should resolve 208 at n≈1e6 and that the
+            # probe was measuring the wrong regime. A standalone Chairmarks probe
+            # (bench/probes/axpy_band_shapes.jl) put phase-narrow 8-13% ahead of the incumbent at that
+            # size, reproducibly, against noise floors of 0.04-1.0%, under every combination of call
+            # structure (1 vs 30 dependent passes), operand provenance (fresh per sample vs a rotated
+            # pool) and probe length (ws=L3 vs ws=4·L3) that was tried. Three separate "fixes" were
+            # built on that number: a smaller probe, freshly-mapped pages per round, and a rewritten
+            # duel statistic.
+            # THEN THE ARM WAS FORCED IN SOURCE AND THE ACTUAL GATE WAS RUN. axpy n=1e6 went from
+            # 0.962 to 0.921 — phase-narrow is markedly SLOWER in production, and the tuner returning
+            # `_UNROLL` in 8/8 fresh processes was correct the whole time.
+            # The probe lies because it calls `_axpy_phase!`/`_axpy_unrolled!` directly through an
+            # @noinline wrapper on raw pointers, while production enters via axpy! -> _axpy_simd! ->
+            # the static ladder. That entry path is part of the regime, and it INVERTS the ranking.
+            # This is the 7th recurrence of "a probe's verdict is valid only in its regime" and the
+            # first where the regime variable was the CALL SITE rather than residency, provenance or
+            # shape. The gate is the arbiter; a probe that disagrees with it is evidence about the
+            # probe. Anything proposing to change this knob must show a GATE number, not a probe.
             nb = 4
             xs = [fill(1.0, n) for _ in 1:nb]
             ys = [fill(0.5, n) for _ in 1:nb]
@@ -337,11 +356,17 @@ end
     # It was expensive. Wintermute (L3 = 16 MB): n=1e6 is a 16 MB working set — physically far-memory —
     # but 8 MB > 16 MB is false, so the cell was governed by `_axpy_band`, whose probe sits at a 4 MB
     # working set where the candidates are a 1-2% coin toss. Measured in the gate regime at that cell,
-    # the phase-narrow arm beats the band incumbent by 15.5%; that is the long-standing n=1e6 miss.
-    # Galen and neuromancer have 32 MB L3, so THEIR n=1e6 is genuinely mid-band and the incumbent is
-    # right there. Comparing the two produced an apparent "the winner inverts across microarchitectures"
-    # — which I wrongly took as proof the knob could not be derived. It was one formula evaluated in two
-    # different REGIMES at the same n, because the boxes have different L3.
+    # the phase-narrow arm beats the band incumbent by 5.6-10%; that is the long-standing n=1e6 miss.
+    #
+    # ⚠ THIS DOES NOT EXPLAIN THE CROSS-µARCH SPLIT, and it was briefly claimed that it did. Measured
+    # L3/W on 2026-08-07: wintermute (Zen4) 16 MB / W=8, neuromancer (Zen5) 16 MB / W=8, galen (Zen3)
+    # 32 MB / W=4. Zen4 and Zen5 are IDENTICAL in L3, vector width and therefore regime at every n — and
+    # they still want opposite kernels: at ws=L3 and at ws=4·L3, phase-narrow beats the incumbent by
+    # 5.6-10% on Zen4 and LOSES by 0.6-1.4% on Zen5 (noise floors 0.04-0.71%, so both are resolvable).
+    # Only galen's boundary moves with its larger L3. So the shape knob is genuinely Measure tier: the
+    # optimum inverts between two µarchs on which every detected const is equal, which is precisely the
+    # req#8b tell for "not predictable from a detected const". The residency fix below is still correct
+    # on its own terms — a two-stream op has a two-stream working set — it just is not the explanation.
     #
     # `>=` not `>`: a working set equal to the entire L3 leaves room for nothing else and behaves as
     # non-resident, which is exactly what the 1.155 measurement at that cell shows.
