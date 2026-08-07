@@ -1146,9 +1146,26 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
     function _measure_ger_np()::Int
         Base.generating_output() && return 4                     # don't burn a measure during precompilation
         try
-            n = 64                                               # columns (multiple of max NP=8)
-            m = cld(2 * _L3_BYTES, n * sizeof(Float64))          # ~2×L3 rows ⇒ genuinely DRAM-bound
-            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(1.0, n)   # pre-touch pages (no first-touch bias)
+            # ⚠ SQUARE, matching the shape the GATE scores. This probed n=64 columns against
+            # m = 2·L3/64 rows — a 65536×64 tall-skinny panel — while bench/plots.jl measures `ger` at
+            # `randn(s,s)`. That is the same probe-regime defect found in `_measure_cgemvn_nc_big` the
+            # day before (32768×32 vs square), and here it had a measured cost: with the tall-skinny
+            # probe made REPRODUCIBLE by rotation the knob settled on 4, and the gate then read
+            # ger@2048 0.989 — a regression from 1.199, because np=8 is right for the square shape.
+            # Making a wrong-shape measurement stable just ships the wrong answer consistently.
+            # Square at ~2×L3 puts m = n ≈ 2048 on Zen4, which is exactly the cell that regressed.
+            n = max(64, isqrt(2 * _L3_BYTES ÷ sizeof(Float64)))
+            n -= n % 8                                           # multiple of the widest NP candidate
+            m = n
+            # NB OPERAND SETS, ROTATED PER ROUND. Fleet audit 2026-08-07 (one knob per fresh process):
+            # this knob resolved 4/2 on Zen3 and 8/4 on Zen4 — a coin toss on two of three boxes — while
+            # `axpy_band`, the only knob with rotation, was the ONLY one stable on all three. Duelling
+            # resamples time; when the winner depends on state fixed once per process (page placement,
+            # THP, allocator addresses) every round re-measures the same draw. `A` here is ~2×L3, so its
+            # placement is exactly the kind of per-process accident that decides a DRAM stream count.
+            nb = 3                                               # 3 × 2×L3 of scratch; enough to vary placement
+            As = [fill(1.0, m, n) for _ in 1:nb]
+            x = fill(1.0, m); y = fill(1.0, n)                   # pre-touched (no first-touch bias)
             # MEDIAN per candidate, not min (see cpuinfo.jl `_tune_one`). This knob has OPPOSITE SIGN
             # across µarchs (Zen5→1, Zen3→4, Zen4→8), so it is exactly the case where the luckiest
             # window of one candidate must not decide what ships.
@@ -1163,13 +1180,16 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             # Seeded this way the loop is extensionally identical to `_tune_pick` (bt starts at the
             # incumbent and only decreases, so every displacement also clears the incumbent) — see the
             # proof note there, and test/tuner_tests.jl for the pinned semantics.
-            best = 4
-            bt = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, best); reps = 5)
-            for np in (1, 2, 8)                        # the default is already timed as the incumbent
-                t = _tune_one(() -> _ger_paneldrv_np(m, n, 1.0, x, y, A, np); reps = 5)
-                _tune_better(t, bt) && (bt = t; best = np)
+            # DUELS + ROTATION, replacing the margin. `Ar` names the operand set for the current round;
+            # `rot` advances it, so each round is a fresh placement draw and the sign count aggregates
+            # over placements — which is what a caller sees, since callers do not share one allocation.
+            Ar = Ref(As[1])
+            rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
+            inc() = _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 4)
+            for np in (8, 2, 1)                        # widest first; the default (4) is the incumbent
+                _tune_wins_it(_tune_duel(inc, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], np); refresh = rot)) && return np
             end
-            return best
+            return 4
         catch
             return 4
         end

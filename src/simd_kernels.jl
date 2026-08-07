@@ -253,8 +253,18 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
         Base.generating_output() && return _UNROLL
         try
             n = max(4096, 2 * _L3_BYTES ÷ sizeof(Float64))
-            x = fill(1.0, n); y = fill(0.5, n)
             W = _vwidth(Float64)
+            # NB OPERAND SETS, ROTATED PER ROUND — the same fix the band knob needed. Duels ALONE left
+            # this one resolving 4/208 across fresh processes on Zen4 while its rotated sibling was
+            # stable (measured 2026-08-07, one knob per process). Duelling resamples TIME; when the
+            # winner depends on state fixed once per process — page placement, THP, allocator addresses
+            # — every round re-measures the same draw and more rounds converge harder onto it.
+            # ⚠ The symptom is BOX-DEPENDENT: this knob is stable on Zen5 and unstable on Zen4, and
+            # `zaxpy_narrow` is the other way round. So rotation is applied uniformly to every Measure
+            # knob rather than chased per box, where it would look fixed on whichever box was checked.
+            nb = 4
+            xs = [fill(1.0, n) for _ in 1:nb]
+            ys = [fill(0.5, n) for _ in 1:nb]
             # ⚠ DUELS, not a margin — this knob is THE reason the rule changed. Measured 2026-08-06,
             # wintermute, freq-locked and quiet, five fresh processes of the same binary under the old
             # margin rule: 208, 4, 2, 208, 4. THREE different kernels shipping from one binary, which is
@@ -267,16 +277,18 @@ const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
             # written out with literal `Val`s (a loop variable makes `Val(u)` non-concrete and produced
             # the runtime dispatch that failed the @typestable contract on the public axpy! path).
             best = _UNROLL
-            GC.@preserve x y begin
-                px = pointer(x); py = pointer(y)
-                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px, py, 0)   # req8-ok: the incumbent _UNROLL=4
+            GC.@preserve xs ys begin
+                pxr = Ref(pointer(xs[1])); pyr = Ref(pointer(ys[1]))
+                rot(r) = (i = mod1(r, nb); pxr[] = pointer(xs[i]); pyr[] = pointer(ys[i]); nothing)
+                px() = pxr[]; py() = pyr[]
+                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px(), py(), 0)   # req8-ok: the incumbent _UNROLL=4
                 # Ordered widest-effect first; the first candidate to earn a supermajority wins, so a
                 # later one cannot displace on a difference the rule has already judged unresolvable.
                 if W >= 8
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px, py))) && return 208  # req8-ok: candidate arm
+                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 208  # req8-ok: candidate arm
                 end
-                _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px, py))) && return 108  # req8-ok: candidate arm
-                _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px, py, 0))) && return 2  # req8-ok: candidate arm
+                _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 108  # req8-ok: candidate arm
+                _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px(), py(), 0); refresh = rot)) && return 2  # req8-ok: candidate arm
             end
             return best
         catch
