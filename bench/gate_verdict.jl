@@ -90,7 +90,7 @@ for path in paths, ln in eachline(path)
     isnothing(want) || lvl == want || continue
     d = Dict{String, Vector{Float64}}(); stamp = Dict{String, String}()
     for f in p[4:end]
-        a, dt, cm, csv = split(f, "|"; limit = 4)
+        _p = split(f, "|"); a, dt, cm, csv = _p[1], _p[2], _p[3], _p[end]
         d[String(a)] = parse.(Float64, split(csv, ",")); stamp[String(a)] = String(dt)
     end
     haskey(d, "pb") || continue

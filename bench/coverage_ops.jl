@@ -39,7 +39,7 @@ for path in ARGS
         lvl, op, sz = String(p[1]), String(p[2]), parse(Int, p[3])
         d = Dict{String, Vector{Float64}}()
         for f in p[4:end]
-            a, _, _, csv = split(f, "|"; limit = 4)
+            _p = split(f, "|"); a, csv = _p[1], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         haskey(d, "pb") || continue

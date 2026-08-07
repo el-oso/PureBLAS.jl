@@ -26,7 +26,7 @@ function cells(path)
         d = Dict{String, Vector{Float64}}()
         c = Dict{String, String}()
         for f in p[4:end]
-            a, _, com, csv = split(f, "|"; limit = 4)
+            _p = split(f, "|"); a, com, csv = _p[1], _p[3], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
             c[String(a)] = String(com)
         end

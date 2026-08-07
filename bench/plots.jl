@@ -88,6 +88,15 @@ isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) sele
 struct ArmRec
     time::String
     commit::String
+    # Machine-state anchor AT THE TIME THIS ARM WAS MEASURED, in seconds. NaN for records written before
+    # this field existed. This is what makes a cached reference comparable at all: `arms=pb` measures PB
+    # today against OpenBLAS/AOCL captured days ago, and a same-run ratio cancels machine state while a
+    # CACHED ratio cancels nothing. The header already stamped an anchor, but only for the CURRENT run —
+    # the reference epoch's value was overwritten every time, so the correction the anchor exists for
+    # could never actually be computed. Measured 2026-08-07: references were 38 h older than the PB arm
+    # on both wintermute and galen, and galen's anchor moved 13.97 → 16.46 µs (17.8%) between two
+    # freq-locked runs, which is far larger than the gaps being adjudicated.
+    anchor::Float64
     q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
 end
 const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
@@ -100,8 +109,21 @@ _round_arms(r::Int) = circshift(_ACTIVE_ARMS, r - 1)
 # measurement, rather than at save time: a run that measures L1 at 14:00 and CL3 at 17:00 must not write
 # 17:00 against the L1 cells, which is exactly the imprecision the v2 single header commit had.
 _stamp(acc::ArmData) = CellData(
-    a => ArmRec(Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, q) for (a, q) in acc
+    a => ArmRec(Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), q) for (a, q) in acc
 )
+# Measured ONCE per run, lazily, on the first cell stamped — not at save time. Save time is the END of a
+# sweep that can run for hours, and the point of the field is to describe the machine while the arms were
+# actually being timed. One anchor per run (not per cell) is deliberate: arms within a run are compared
+# same-run and already cancel machine state; the field exists for the ACROSS-run comparison.
+const _RUN_ANCHOR = Ref{Union{Nothing, Float64}}(nothing)
+function _run_anchor()
+    isnothing(_RUN_ANCHOR[]) && (_RUN_ANCHOR[] = try
+            _anchor_secs()
+        catch
+            NaN
+        end)
+    return _RUN_ANCHOR[]::Float64
+end
 # Progress line only: median ratio of the first available reference against pb this round. Under
 # `arms=pb` there IS no reference in this round (that is the point of the mode), so fall back to pb's
 # median time in µs — a bare NaN told you nothing, and the per-round time is exactly what you want to
@@ -1335,8 +1357,13 @@ function save_cache(path, groups)
         #   <lvl> <op> <size> pb|<iso>|<commit>|t1,..,t48  openblas|<iso>|<commit>|t1,..  aocl|...
         # Times are SECONDS (the quantiles of that arm's sample times). Ratios are derived, never stored.
         for (lvl, d) in groups, (nm, op) in d, (s, cell) in op
+            # FIVE fields now: the anchor sits between commit and the times. The cache VERSION is
+            # deliberately NOT bumped — a bump refuses every existing cache, and re-measuring the
+            # OpenBLAS/AOCL arms is exactly what the reference cache exists to prevent. Readers accept
+            # 4-field (pre-anchor) and 5-field records side by side in one file; the csv is always the
+            # LAST field, so every reader splits and takes `p[end]` rather than `limit = 4`.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1e6; digits = 3))|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -1365,8 +1392,12 @@ function load_cache(path)
         lvl, nm, ssz = String(parts[1]), String(parts[2]), parse(Int, parts[3])
         cell = CellData()
         for f in parts[4:end]
-            a, tstamp, cmt, csv = split(f, "|"; limit = 4)
-            cell[String(a)] = ArmRec(String(tstamp), String(cmt), parse.(Float64, split(csv, ",")))
+            # 4-field (pre-anchor) and 5-field records coexist in one file — see the writer note. The
+            # times are ALWAYS last, so index from both ends rather than assuming a field count.
+            p = split(f, "|")
+            a, tstamp, cmt, csv = p[1], p[2], p[3], p[end]
+            anc = length(p) >= 5 ? something(tryparse(Float64, p[4]), NaN) * 1e-6 : NaN
+            cell[String(a)] = ArmRec(String(tstamp), String(cmt), anc, parse.(Float64, split(csv, ",")))
         end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)
@@ -1659,3 +1690,39 @@ for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in 
     @printf("%-3s %-8s %s   gate=%.3f %s\n", lvl, nm, txt, gate, gate >= 1.0 ? "PASS" : "FAIL")
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"
+
+# ── CROSS-RUN MACHINE-STATE DRIFT ─────────────────────────────────────────────────────────────────
+# A same-run ratio cancels machine state; a CACHED ratio cancels nothing. Under `arms=pb` the PB arm is
+# fresh and the references can be days old, so a drifted machine is indistinguishable from a code
+# change — and the drift here is NOT small: galen's anchor moved 13.97 → 16.46 µs (17.8%) between two
+# freq-locked runs on 2026-08-07, against gate gaps of 0.3%. Now that every arm carries the anchor it
+# was measured under, say so out loud. This REPORTS rather than rescales: a rescale would need the
+# anchor to be a faithful proxy for whatever moved the cell, which is unproven — an honest "this
+# comparison is not trustworthy to better than X%" is worth more than a wrong correction.
+let worst = 0.0, worstlbl = "", nold = 0
+    for lvl in keys(g), (nm, cells) in g[lvl], (s, cell) in cells
+        haskey(cell, _ARM_PB) || continue
+        ap = cell[_ARM_PB].anchor
+        isnan(ap) && continue
+        for r in _REF_ALL
+            haskey(cell, r) || continue
+            ar = cell[r].anchor
+            isnan(ar) && (nold += 1; continue)
+            d_ = abs(ap / ar - 1)
+            d_ > worst && (worst = d_; worstlbl = "$lvl/$nm@$s vs $r")
+        end
+    end
+    if nold > 0
+        @warn "$nold cached reference arm(s) predate the per-arm anchor — their machine state at " *
+            "capture is UNKNOWN, so no drift check is possible for them. Re-measure the references " *
+            "(without `arms=pb`) to make those cells adjudicable."
+    end
+    if worst > 0.02
+        pct = round(100 * worst; digits = 1)
+        @warn "MACHINE-STATE DRIFT $pct% between this run and the cached reference (worst: " *
+            "$worstlbl). Gaps smaller than this are NOT adjudicable from these numbers — re-measure " *
+            "both arms in one run before believing any cell within $pct% of 1.0."
+    elseif worst > 0
+        @printf("machine-state drift vs cached references: %.2f%% (worst: %s)\n", 100 * worst, worstlbl)
+    end
+end

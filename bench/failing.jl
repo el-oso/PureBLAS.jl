@@ -21,7 +21,7 @@ for path in ARGS
         d = Dict{String, Vector{Float64}}(); stamps = Dict{String, String}()
         for fld in p[4:end]
             isempty(fld) && continue
-            a, ts, _, s = split(fld, '|'; limit = 4)
+            _p = split(fld, '|'); a, ts, s = _p[1], _p[2], _p[end]
             d[a] = parse.(Float64, split(s, ',')); stamps[a] = ts
         end
         haskey(d, "pb") || continue

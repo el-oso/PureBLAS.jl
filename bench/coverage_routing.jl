@@ -49,7 +49,7 @@ function cells(paths)
         f[1] in ("LP", "CLP") || continue
         d = Dict{String, Vector{Float64}}()
         for g in f[4:end]
-            a, _, _, csv = split(g, "|"; limit = 4)
+            _p = split(g, "|"); a, csv = _p[1], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         haskey(d, "pb") || continue
@@ -72,7 +72,7 @@ function refstats(paths, ref)
         f[1] in ("LP", "CLP") || continue
         d = Dict{String, Vector{Float64}}()
         for g in f[4:end]
-            a, _, _, csv = split(g, "|"; limit = 4)
+            _p = split(g, "|"); a, csv = _p[1], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         (haskey(d, "pb") && haskey(d, ref)) || continue
