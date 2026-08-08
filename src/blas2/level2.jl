@@ -569,11 +569,19 @@ const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tu
 @inline _gemvt_u_max(nc::Int) = (u = 4; while u > 1 && nc * u + u + 2 > _NVREG; u ÷= 2; end; u)
 const _GEMVT_U_PREF = @load_preference("gemvt_u", nothing)
 const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default until the gate says move it
-# Runtime-resolved so the force hook can reach it (a const is baked at load and cannot be forced).
-@inline function _gemvt_u()
+# Runtime-resolved so the force hook can reach it (a const is baked at load and cannot be forced) —
+# but resolved ONCE PER PROCESS, never per call.
+# ⚠ `_force_knob` reads ENV, and ENV lookup in a BLAS-2 hot path is not free. The first cut called it on
+# every gemv, and the gate caught it immediately: Zen5 gemvT n=64 fell 0.959 -> 0.767 and n=128
+# 0.860 -> 0.813 with U unchanged at 1, i.e. the instrument itself was the regression, and it also
+# compressed the very U differences the experiment existed to resolve. Small-n BLAS-2 amortizes a
+# per-call dictionary lookup over very little work — the same class as the kwarg-overhead finding in
+# kb/findings/pureblas-gemv.md, where ~200 ns of calling convention dominated a 33 ns kernel.
+const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
     f = _force_knob("gemvt_u")
     return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
 end
+@inline _gemvt_u() = _GEMVT_U_ONCE()
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 @static if isnothing(_GEMVT_NC_PREF)
     function _measure_gemvt_nc()::Int
