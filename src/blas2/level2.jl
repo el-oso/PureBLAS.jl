@@ -497,6 +497,18 @@ end
         # invariance measured on Zen5, where seven levers (NC, U, fold, emission order, per-column,
         # software prefetch, lda padding) all leave the rate at 2.00 cycles/line. See
         # kb/findings/pureblas-zen5-gemvt-l2-invariant.md.
+        # ⚠⚠ MEASURED 2026-08-08 ON ZEN5 AND FALSIFIED. The arm stays, forceable, precisely because it
+        # is the idea two independent reviews reached for — do not rebuild it, read this:
+        #   arm                 cycles    fills     B/cy   cy/line  hwpf%  inst/line
+        #   preload    run 1    1.988e9   1.028e9   33.1    1.93    11.2     4.03
+        #   mem-operand         2.061e9   1.024e9   31.8    2.01     4.4     2.83
+        #   preload    run 2    2.177e9   1.024e9   30.1    2.13     5.9     4.06
+        #   AOCL                1.523e9   1.036e9   43.5    1.47    23.6     1.82
+        # The two preload runs STRADDLE the memory-operand arm (1.93 and 2.13 against 2.01), so the
+        # spread is run-to-run and the emission is not the cause. Binding the load into the FMA does
+        # NOT cap the rate. That makes EIGHT independent levers that leave 2.00 cycles/line untouched,
+        # and no ninth hypothesis is on the table — read the kb finding before inventing one, and
+        # prefer an experiment that can come back negative informatively over another arm.
         # Loading one chunk ahead ACROSS THE BACK-EDGE is what LLVM cannot fold back into a memory
         # operand, and unlike a `prefetch` instruction a real load is architecturally non-droppable.
         # THE LAST ITERATION IS PEELED, not guarded: preloading inside the loop would either branch
