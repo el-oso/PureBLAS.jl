@@ -426,8 +426,8 @@ end
 # gemv-T column-block: NC column-dots accumulated together, reusing each x W-chunk across the NC
 # columns (one set of horizontal sums per block) — cuts per-column overhead for small n. β folded
 # in; masked tail for the row remainder.
-@generated function _gemv_t_block!(
-        yp::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T}, m::Int,
+@noinline @generated function _gemv_t_block!(
+        yp::Ptr{T}, ps::NTuple{NC, Ptr{T}}, xp::Ptr{T}, m::Int,
         α::T, β::T, ::Val{NC}, ::Val{B0}, ::Val{U}, ::Val{PFB}
     ) where {T, NC, B0, U, PFB}
     # PFB = software-prefetch distance in BYTES ahead of each A column stream; 0 = no prefetch.
@@ -487,7 +487,7 @@ end
 # The hoist is kept: it is equivalent, it matches `_trmv_fused8!`, and it makes the intent legible
 # next to this note.
     for c in 1:NC
-        push!(body.args, :($(Symbol(:pc, c)) = Ab + $(c - 1) * lda * $sz))
+        push!(body.args, :($(Symbol(:pc, c)) = ps[$c]))
     end
     for c in 1:NC, u in 1:((fold || U == -1) ? 1 : U)
         push!(body.args, :($(Symbol(:a, c, :_, u)) = zero($V)))
@@ -787,7 +787,19 @@ const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
             #   U=1     0.951  0.856  0.728   0.996   1.014   0.974   1.040
             #   U=2     0.953  0.851  0.726   1.017   1.034   0.973   1.053
             #   U=4     1.042  0.853  0.721   1.009   0.993   0.983   1.044
-            # Dead flat at the two cells that matter. BOTH structural deltas vs AOCL's dgemv-T — the
+            # ⚠ AND THE M-UNROLL IS FALSIFIED ON ZEN3 TOO (2026-08-08) — the sweep above was ZEN5-ONLY, and
+# Zen3 is the box whose open cells are L3-resident rather than L2-resident, so it is a different
+# regime, not a repeat. AVX2 permits U<=2 (`_gemvt_u_max(4)` = 2 at 16 YMM). vs AOCL, arms=pb so
+# the reference cancels, with the baseline arm duplicated to size the run-to-run band:
+#     n=          64     128    256    512    1024   2048   4096
+#   U=1 run 1   1.155  1.085  1.058  1.069  0.963  0.956  1.083
+#   U=2         1.140  1.043  0.979  1.076  0.955  0.946  1.080
+#   U=0 preload 0.953  1.006  0.997  1.059  0.955  0.910  1.073
+#   U=1 run 2   1.155  1.084  1.059  1.062  0.953  0.951  1.082
+# The two open cells (1024, 2048) do not move. The REGISTER-PRELOAD arm is actively HARMFUL on
+# AVX2 — 0.953 at n=64 against 1.155, and 0.910 at n=2048 — which is what 16 YMM registers buys
+# you when the kernel needs 2·NC+1 of them; it is an AVX-512-only candidate at best.
+# Dead flat at the two cells that matter. BOTH structural deltas vs AOCL's dgemv-T — the
             # column count AND the m-unroll — are now measured and neither is the mechanism. The Zen5
             # n=128/256 deficit is NOT in this loop's shape.
             # What has NOT been tested: whether the blocked kernel should run AT ALL there. The
@@ -869,7 +881,7 @@ const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                     s = time_ns()
                     j = 0
                     while j + 4 <= n
-                        _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
+                        _gemv_t_block!(py + j * sz, ntuple(c -> pA + (j + c - 1) * ld * sz, Val(4)), px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
                         j += 4
                     end
                     e = time_ns() - s; r > 0 && (tbs[r] = e)
@@ -918,11 +930,11 @@ function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where
         j = 0
         while j + nc <= n
             if nc >= 16
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(16)), xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(8)), xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(4)), xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             end
             j += nc
         end
@@ -943,21 +955,21 @@ end
     ) where {NC, B0, T <: BlasReal}
     j = 0
     while j + NC <= n
-        p = yptr + j * sz; q = Aptr + j * lda * sz
+        p = yptr + j * sz; qs = ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(NC))
         if pf >= 8 * _CACHELINE                                                # req8-ok: candidate arm
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(8 * _CACHELINE))
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(8 * _CACHELINE))
         elseif pf >= 4 * _CACHELINE                                            # req8-ok: candidate arm
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(4 * _CACHELINE))
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(4 * _CACHELINE))
         elseif pf >= 2 * _CACHELINE                                            # req8-ok: candidate arm
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(2 * _CACHELINE))
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(2 * _CACHELINE))
         elseif u == -1
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(-1), Val(0))  # req8-ok: candidate arm
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(-1), Val(0))  # req8-ok: candidate arm
         elseif u >= 4
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
         elseif u >= 2
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(2), Val(0))  # req8-ok: candidate arm
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(2), Val(0))  # req8-ok: candidate arm
         else
-            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(0))
+            _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(0))
         end
         j += NC
     end
