@@ -447,10 +447,19 @@ end
     # column, trading loop overhead for latency. Independent accumulators cost NC·U registers and give
     # NC·U independent chains; the caller's `_gemvt_u_max` keeps that inside `_NVREG`.
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    # ACCUMULATOR FOLDING, derived — no knob. Independent (column, chunk) accumulators cost NC·U
+    # registers and give NC·U independent chains; that is the right trade while it FITS. Past `_NVREG`
+    # the spill costs more than the extra chains buy, so fold the U chunks of a column onto ONE
+    # accumulator: NC·U registers become NC, the chain depth per column becomes U, and the machine
+    # still has NC independent chains to cover FMA latency. This is exactly AOCL's
+    # `bli_dgemv_t_zen_int_avx512` shape (8 accumulators, 32 rows per iteration) and it is what makes
+    # NC=8 × U=4 register-legal on AVX-512: 8·4+4+2 = 38 > 32 independent, 8+4+2 = 14 folded.
+    fold = NC * U + U + 2 > _NVREG
+    acc(c, u) = Symbol(:a, c, :_, fold ? 1 : u)
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
-    for c in 1:NC, u in 1:U
+    for c in 1:NC, u in 1:(fold ? 1 : U)
         push!(body.args, :($(Symbol(:a, c, :_, u)) = zero($V)))
     end
     full = quote end
@@ -460,9 +469,9 @@ end
     for c in 1:NC, u in 1:U
         push!(
             full.args,
-            :($(Symbol(:a, c, :_, u)) = muladd(
+            :($(acc(c, u)) = muladd(
                 vload($V, Ab + (i + $((u - 1) * W) + $(c - 1) * lda) * $sz), $(Symbol(:xc, u)),
-                $(Symbol(:a, c, :_, u))
+                $(acc(c, u))
             ))
         )
     end
@@ -507,8 +516,9 @@ end
         )
     )
     for c in 1:NC
-        acc = Symbol(:a, c, :_, 1)                      # fold the chunk accumulators, then reduce
-        red = U == 1 ? :($acc) : foldl((p, u) -> :($p + $(Symbol(:a, c, :_, u))), 2:U; init = :($acc))
+        a1 = Symbol(:a, c, :_, 1)                       # fold the chunk accumulators, then reduce
+        red = (U == 1 || fold) ? :($a1) :
+            foldl((p, u) -> :($p + $(Symbol(:a, c, :_, u))), 2:U; init = :($a1))
         st = B0 ? :(unsafe_store!(yp, α * sc, $c)) :
             :(unsafe_store!(yp, muladd(β, unsafe_load(yp, $c), α * sc), $c))
         push!(body.args, :(sc = sum($red); $st))
@@ -2648,6 +2658,36 @@ end
     return 1
 end
 
+# ── real trmv (N forms): rows per block for the row-blocked driver `_trmv_rb8!` ──────────────────────
+#
+# WHY THIS EXISTS. `_trmv_fused8!` is PANEL-outer: for each 8-column panel it sweeps the whole x prefix
+# (read AND write). x is therefore re-streamed once per panel — n/8 times — so its traffic is
+# 2·8·(n²/16) = n² bytes, on top of the n²/2·sizeof(T) of A. That is invisible while x fits L1 and
+# dominates when it does not. Measured (both quantities are on the ratio table in `_trmv_fused_min`):
+#   L1D = 32 KiB (Zen3 galen, Zen4 wintermute): x at n=4096 is EXACTLY 32 KiB and both boxes dip —
+#     Zen3 0.970/0.967 over two runs, Zen4 0.990.
+#   L1D = 48 KiB (Zen5 neuromancer): x at n=4096 fits, and the same code reads 1.209.
+# n=2048 (x = 16 KiB = half of a 32 KiB L1) is clean everywhere: Zen3 1.014, Zen4 1.159.
+# So the predictor is `sizeof(x) vs L1D`, and the fix is to block the ROWS so the x segment under
+# accumulation stays resident while the A stream flows past it.
+#
+# DERIVE tier (req#8b): the criterion is pure residency over a detected const — give the x segment HALF
+# of L1D, leaving the other half for the A stream's in-flight lines. No µarch literal, no fitted number.
+# Fleet: 32 KiB L1D ⇒ 2048 rows (Float64) / 4096 (Float32); 48 KiB ⇒ 3072 / 6144.
+# `PUREBLAS_FORCE_trmv_rowblk=0` disables row blocking (the pre-2026-08-08 behaviour) so the arm can be
+# A/B'd through `bench/plots.jl`; any positive value forces that block size directly.
+const _TRMV_ROWBLK_PREF = @load_preference("trmv_rowblk", nothing)
+# Runtime-resolved but ONCE PER PROCESS — an ENV read per call is itself a regression in a BLAS-2 hot
+# path (see `_TRMV_FUSED_MIN_ONCE`, whose shape this mirrors). Pin wins over force (PDM: P first).
+const _TRMV_ROWBLK_ONCE = Base.OncePerProcess{Int}() do
+    something(_TRMV_ROWBLK_PREF, _force_knob("trmv_rowblk"))
+end
+@inline function _trmv_rowblk(::Type{T}) where {T}
+    f = _TRMV_ROWBLK_ONCE()
+    f >= 0 && return f                                   # 0 disables; > 0 forces the block size
+    return max(_vwidth(T), (_L1_BYTES ÷ (2 * sizeof(T))) & ~(_vwidth(T) - 1))
+end
+
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
@@ -2675,7 +2715,9 @@ end
     # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
     # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
-        return _trmv_fused8!(up, unit, n, A, x)
+        rbk = _trmv_rowblk(eltype(A))
+        return (rbk > 0 && n > rbk) ? _trmv_rb8!(up, unit, n, A, x, rbk) :
+            _trmv_fused8!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
@@ -2814,6 +2856,49 @@ end
                 end
                 hi = lo - 1
             end
+        end
+    end
+    return x
+end
+
+# ROW-BLOCKED driver over `_trmv_fused8!`, so the x segment under accumulation stays L1-resident.
+# See `_trmv_rowblk` above for the residency criterion and the measurement that motivates it.
+#
+# The block is a diagonal sub-triangle plus one off-diagonal rectangle, and the rectangle is a plain
+# gemv-N — so this adds NO new kernel: it reuses `_trmv_fused8!` for the triangle and the already-gated
+# `_gemv_n_simd!` for the rectangle, both on views (contiguous columns ⇒ same `stride(A,2)`).
+#
+# ORDER IS THE CORRECTNESS CONDITION, and it differs by uplo. Every read of x must see the ORIGINAL
+# value, because the triangle STORES `x[j] = t·A[j,j]` rather than accumulating.
+#   U,N: x_new[i] = Σ_{j≥i} A[i,j]·x_old[j]. Blocks ASCENDING; per block, triangle FIRST (x[R] is still
+#        original), then accumulate columns to the RIGHT (x below R untouched — those blocks come later).
+#   L,N: x_new[i] = Σ_{j≤i} A[i,j]·x_old[j]. Blocks DESCENDING; per block, triangle first, then
+#        accumulate columns to the LEFT (x above R untouched — those blocks come later).
+# Getting the block direction wrong reads already-overwritten x and produces a plausible wrong answer,
+# not a crash: the n ≤ rowblk cells (single block) would still pass, which is why the test sweeps
+# n straddling the block size.
+@inline function _trmv_rb8!(up::Bool, unit::Bool, n::Int, A, x, rbk::Int)
+    T = eltype(A); one_ = one(T)
+    if up
+        b = 0
+        while b < n
+            e = min(b + rbk, n); R = (b + 1):e
+            _trmv_fused8!(true, unit, e - b, view(A, R, R), view(x, R))
+            e < n && _gemv_n_simd!(
+                e - b, n - e, one_, view(A, R, (e + 1):n), view(x, (e + 1):n), view(x, R),
+                one_, Val(false)
+            )
+            b = e
+        end
+    else
+        e = n
+        while e > 0
+            b = max(e - rbk, 0); R = (b + 1):e
+            _trmv_fused8!(false, unit, e - b, view(A, R, R), view(x, R))
+            b > 0 && _gemv_n_simd!(
+                e - b, b, one_, view(A, R, 1:b), view(x, 1:b), view(x, R), one_, Val(false)
+            )
+            e = b
         end
     end
     return x
