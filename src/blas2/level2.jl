@@ -426,6 +426,17 @@ end
 # gemv-T column-block: NC column-dots accumulated together, reusing each x W-chunk across the NC
 # columns (one set of horizontal sums per block) — cuts per-column overhead for small n. β folded
 # in; masked tail for the row remainder.
+# Build the NC per-column base pointers as a tuple WITHOUT a closure. `ntuple(c -> …, Val(NC))` boxes
+# its closure here — 33 KB allocated per gemv call at n=256, one heap allocation per column block, and
+# a 28x slowdown on the gate. A @generated tuple expression has no closure to box.
+@inline @generated function _colbases(p::Ptr{T}, lda::Int, sz::Int, ::Val{NC}) where {T, NC}
+    # ⚠ `Expr(:meta, :inline)` IN THE BODY, not just `@inline` on the signature: @inline does NOT
+# propagate into a @generated function CodeInfo (Julia 1.12). Without it this does not inline, the
+# returned tuple is BOXED, and gemv! allocates ~170 B per column block — 10.8 KB per call at
+# n=256. Same hazard already recorded for the Vec-argument kernels.
+return Expr(:block, Expr(:meta, :inline), Expr(:tuple, (:(p + $(c - 1) * lda * sz) for c in 1:NC)...))
+end
+
 @noinline @generated function _gemv_t_block!(
         yp::Ptr{T}, ps::NTuple{NC, Ptr{T}}, xp::Ptr{T}, m::Int,
         α::T, β::T, ::Val{NC}, ::Val{B0}, ::Val{U}, ::Val{PFB}
@@ -881,7 +892,7 @@ const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                     s = time_ns()
                     j = 0
                     while j + 4 <= n
-                        _gemv_t_block!(py + j * sz, ntuple(c -> pA + (j + c - 1) * ld * sz, Val(4)), px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
+                        _gemv_t_block!(py + j * sz, _colbases(pA + j * ld * sz, ld, sz, Val(4)), px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
                         j += 4
                     end
                     e = time_ns() - s; r > 0 && (tbs[r] = e)
@@ -930,11 +941,11 @@ function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where
         j = 0
         while j + nc <= n
             if nc >= 16
-                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(16)), xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(16)), xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(8)), xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(8)), xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(yptr + j * sz, ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(4)), xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(4)), xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             end
             j += nc
         end
@@ -955,7 +966,7 @@ end
     ) where {NC, B0, T <: BlasReal}
     j = 0
     while j + NC <= n
-        p = yptr + j * sz; qs = ntuple(c -> Aptr + (j + c - 1) * lda * sz, Val(NC))
+        p = yptr + j * sz; qs = _colbases(Aptr + j * lda * sz, lda, sz, Val(NC))
         if pf >= 8 * _CACHELINE                                                # req8-ok: candidate arm
             _gemv_t_block!(p, qs, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(8 * _CACHELINE))
         elseif pf >= 4 * _CACHELINE                                            # req8-ok: candidate arm
