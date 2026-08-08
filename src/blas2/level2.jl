@@ -454,12 +454,13 @@ end
     # still has NC independent chains to cover FMA latency. This is exactly AOCL's
     # `bli_dgemv_t_zen_int_avx512` shape (8 accumulators, 32 rows per iteration) and it is what makes
     # NC=8 × U=4 register-legal on AVX-512: 8·4+4+2 = 38 > 32 independent, 8+4+2 = 14 folded.
-    fold = NC * U + U + 2 > _NVREG
+    # U == -1 is the register-preload arm (see below); it is a one-chunk shape, so it never folds.
+    fold = U != -1 && NC * U + U + 2 > _NVREG
     acc(c, u) = Symbol(:a, c, :_, fold ? 1 : u)
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
-    for c in 1:NC, u in 1:(fold ? 1 : U)
+    for c in 1:NC, u in 1:((fold || U == -1) ? 1 : U)
         push!(body.args, :($(Symbol(:a, c, :_, u)) = zero($V)))
     end
     full = quote end
@@ -487,13 +488,61 @@ end
             push!(full.args, :(_prefetch(Ab + (i + $(c - 1) * lda) * $sz + $PFB)))
         end
     end
-    push!(
-        body.args, :(
-            nfull = m - rem(m, $(U * W)); i = 0; while i < nfull
-                $full; i += $(U * W)
+    if U == -1
+        # ── U = -1: REGISTER-PRELOAD ARM (one W-chunk ahead), the last structural difference to AOCL.
+        # Every other emission makes the A load a MEMORY OPERAND of the FMA
+        # (`vfmadd231pd zmm, zmm, [mem]`), which binds the load to the FP µop: the load cannot retire
+        # into a register and run ahead on its own. That would cap achieved memory-level parallelism in
+        # a way that is INVARIANT to how many such FMAs are named per loop body — which is exactly the
+        # invariance measured on Zen5, where seven levers (NC, U, fold, emission order, per-column,
+        # software prefetch, lda padding) all leave the rate at 2.00 cycles/line. See
+        # kb/findings/pureblas-zen5-gemvt-l2-invariant.md.
+        # Loading one chunk ahead ACROSS THE BACK-EDGE is what LLVM cannot fold back into a memory
+        # operand, and unlike a `prefetch` instruction a real load is architecturally non-droppable.
+        # THE LAST ITERATION IS PEELED, not guarded: preloading inside the loop would either branch
+        # every iteration or read one chunk past the end. A masked/over-read here is a guard-page fault
+        # on a packed panel — see `directb-masked-oob-guardpage`. Registers: 2·NC+1 (9 at NC=4).
+        pre = quote end
+        push!(pre.args, :(xc1 = vload($V, xp + i * $sz)))
+        for c in 1:NC
+            push!(pre.args, :($(Symbol(:a, c, :_, 1)) = muladd($(Symbol(:p, c)), xc1, $(Symbol(:a, c, :_, 1)))))
+        end
+        for c in 1:NC
+            push!(pre.args, :($(Symbol(:p, c)) = vload($V, Ab + (i + $W + $(c - 1) * lda) * $sz)))
+        end
+        last_ = quote end
+        push!(last_.args, :(xc1 = vload($V, xp + i * $sz)))
+        for c in 1:NC
+            push!(last_.args, :($(Symbol(:a, c, :_, 1)) = muladd($(Symbol(:p, c)), xc1, $(Symbol(:a, c, :_, 1)))))
+        end
+        load0 = quote end
+        for c in 1:NC
+            push!(load0.args, :($(Symbol(:p, c)) = vload($V, Ab + (i + $(c - 1) * lda) * $sz)))
+        end
+        push!(
+            body.args, quote            # multi-statement body: `quote…end`, not `:( a; if … end )`
+                nfull = m - rem(m, $W)
+                i = 0
+                if nfull >= $W
+                    $load0
+                    while i < nfull - $W
+                        $pre
+                        i += $W
+                    end
+                    $last_
+                    i += $W
+                end
             end
         )
-    )
+    else
+        push!(
+            body.args, :(
+                nfull = m - rem(m, $(U * W)); i = 0; while i < nfull
+                    $full; i += $(U * W)
+                end
+            )
+        )
+    end
     # U>1 leaves up to U-1 whole W-chunks before the masked tail — sweep them at U=1 shape.
     if U > 1
         one_ = quote end
@@ -524,7 +573,7 @@ end
     )
     for c in 1:NC
         a1 = Symbol(:a, c, :_, 1)                       # fold the chunk accumulators, then reduce
-        red = (U == 1 || fold) ? :($a1) :
+        red = (U == 1 || U == -1 || fold) ? :($a1) :
             foldl((p, u) -> :($p + $(Symbol(:a, c, :_, u))), 2:U; init = :($a1))
         st = B0 ? :(unsafe_store!(yp, α * sc, $c)) :
             :(unsafe_store!(yp, muladd(β, unsafe_load(yp, $c), α * sc), $c))
@@ -606,6 +655,10 @@ const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default u
 # kb/findings/pureblas-gemv.md, where ~200 ns of calling convention dominated a 33 ns kernel.
 const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
     f = _force_knob("gemvt_u")
+    # `PUREBLAS_FORCE_gemvt_u=0` selects the REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`).
+    # 0 is otherwise meaningless as an unroll, and `_force_knob` already spends -1 on "unset", so this
+    # is the one spare value. See the U == -1 branch of the generator for what it tests and why.
+    f == 0 && return -1
     return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
 end
 @inline _gemvt_u() = _GEMVT_U_ONCE()
@@ -856,6 +909,8 @@ end
             _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(4 * _CACHELINE))
         elseif pf >= 2 * _CACHELINE                                            # req8-ok: candidate arm
             _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(2 * _CACHELINE))
+        elseif u == -1
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(-1), Val(0))  # req8-ok: candidate arm
         elseif u >= 4
             _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
         elseif u >= 2
