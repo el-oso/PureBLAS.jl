@@ -2658,36 +2658,6 @@ end
     return 1
 end
 
-# ── real trmv (N forms): rows per block for the row-blocked driver `_trmv_rb8!` ──────────────────────
-#
-# WHY THIS EXISTS. `_trmv_fused8!` is PANEL-outer: for each 8-column panel it sweeps the whole x prefix
-# (read AND write). x is therefore re-streamed once per panel — n/8 times — so its traffic is
-# 2·8·(n²/16) = n² bytes, on top of the n²/2·sizeof(T) of A. That is invisible while x fits L1 and
-# dominates when it does not. Measured (both quantities are on the ratio table in `_trmv_fused_min`):
-#   L1D = 32 KiB (Zen3 galen, Zen4 wintermute): x at n=4096 is EXACTLY 32 KiB and both boxes dip —
-#     Zen3 0.970/0.967 over two runs, Zen4 0.990.
-#   L1D = 48 KiB (Zen5 neuromancer): x at n=4096 fits, and the same code reads 1.209.
-# n=2048 (x = 16 KiB = half of a 32 KiB L1) is clean everywhere: Zen3 1.014, Zen4 1.159.
-# So the predictor is `sizeof(x) vs L1D`, and the fix is to block the ROWS so the x segment under
-# accumulation stays resident while the A stream flows past it.
-#
-# DERIVE tier (req#8b): the criterion is pure residency over a detected const — give the x segment HALF
-# of L1D, leaving the other half for the A stream's in-flight lines. No µarch literal, no fitted number.
-# Fleet: 32 KiB L1D ⇒ 2048 rows (Float64) / 4096 (Float32); 48 KiB ⇒ 3072 / 6144.
-# `PUREBLAS_FORCE_trmv_rowblk=0` disables row blocking (the pre-2026-08-08 behaviour) so the arm can be
-# A/B'd through `bench/plots.jl`; any positive value forces that block size directly.
-const _TRMV_ROWBLK_PREF = @load_preference("trmv_rowblk", nothing)
-# Runtime-resolved but ONCE PER PROCESS — an ENV read per call is itself a regression in a BLAS-2 hot
-# path (see `_TRMV_FUSED_MIN_ONCE`, whose shape this mirrors). Pin wins over force (PDM: P first).
-const _TRMV_ROWBLK_ONCE = Base.OncePerProcess{Int}() do
-    something(_TRMV_ROWBLK_PREF, _force_knob("trmv_rowblk"))
-end
-@inline function _trmv_rowblk(::Type{T}) where {T}
-    f = _TRMV_ROWBLK_ONCE()
-    f >= 0 && return f                                   # 0 disables; > 0 forces the block size
-    return max(_vwidth(T), (_L1_BYTES ÷ (2 * sizeof(T))) & ~(_vwidth(T) - 1))
-end
-
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
@@ -2715,9 +2685,7 @@ end
     # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
     # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
-        rbk = _trmv_rowblk(eltype(A))
-        return (rbk > 0 && n > rbk) ? _trmv_rb8!(up, unit, n, A, x, rbk) :
-            _trmv_fused8!(up, unit, n, A, x)
+        return _trmv_fused8!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
@@ -2861,48 +2829,24 @@ end
     return x
 end
 
-# ROW-BLOCKED driver over `_trmv_fused8!`, so the x segment under accumulation stays L1-resident.
-# See `_trmv_rowblk` above for the residency criterion and the measurement that motivates it.
-#
-# The block is a diagonal sub-triangle plus one off-diagonal rectangle, and the rectangle is a plain
-# gemv-N — so this adds NO new kernel: it reuses `_trmv_fused8!` for the triangle and the already-gated
-# `_gemv_n_simd!` for the rectangle, both on views (contiguous columns ⇒ same `stride(A,2)`).
-#
-# ORDER IS THE CORRECTNESS CONDITION, and it differs by uplo. Every read of x must see the ORIGINAL
-# value, because the triangle STORES `x[j] = t·A[j,j]` rather than accumulating.
-#   U,N: x_new[i] = Σ_{j≥i} A[i,j]·x_old[j]. Blocks ASCENDING; per block, triangle FIRST (x[R] is still
-#        original), then accumulate columns to the RIGHT (x below R untouched — those blocks come later).
-#   L,N: x_new[i] = Σ_{j≤i} A[i,j]·x_old[j]. Blocks DESCENDING; per block, triangle first, then
-#        accumulate columns to the LEFT (x above R untouched — those blocks come later).
-# Getting the block direction wrong reads already-overwritten x and produces a plausible wrong answer,
-# not a crash: the n ≤ rowblk cells (single block) would still pass, which is why the test sweeps
-# n straddling the block size.
-@inline function _trmv_rb8!(up::Bool, unit::Bool, n::Int, A, x, rbk::Int)
-    T = eltype(A); one_ = one(T)
-    if up
-        b = 0
-        while b < n
-            e = min(b + rbk, n); R = (b + 1):e
-            _trmv_fused8!(true, unit, e - b, view(A, R, R), view(x, R))
-            e < n && _gemv_n_simd!(
-                e - b, n - e, one_, view(A, R, (e + 1):n), view(x, (e + 1):n), view(x, R),
-                one_, Val(false)
-            )
-            b = e
-        end
-    else
-        e = n
-        while e > 0
-            b = max(e - rbk, 0); R = (b + 1):e
-            _trmv_fused8!(false, unit, e - b, view(A, R, R), view(x, R))
-            b > 0 && _gemv_n_simd!(
-                e - b, b, one_, view(A, R, 1:b), view(x, 1:b), view(x, R), one_, Val(false)
-            )
-            e = b
-        end
-    end
-    return x
-end
+# ⚠ ROW BLOCKING FOR THE n=4096 RESIDUAL: BUILT, MEASURED, FALSIFIED — do not re-chase.
+# The hypothesis was x traffic against L1D capacity. The panel-outer sweep re-streams the whole x
+# prefix once per 8-column panel, so x costs ~n^2 bytes on top of A, and the fleet looked like a
+# textbook capacity story: x at n=4096 is EXACTLY 32 KiB, which is L1D on Zen3 and Zen4 (both of
+# which dipped) and fits inside the 48 KiB of Zen5 (which reads 1.209); n=2048 (x = 16 KiB) was
+# clean everywhere. The predictor was 5-for-5.
+# `_trmv_rb8!` blocked the rows at half of L1D — diagonal sub-triangle through this kernel, the
+# off-diagonal rectangle through `_gemv_n_simd!` — which cuts the x re-stream at n=4096 from 512
+# panel passes to 2, i.e. recovers essentially ALL of the hypothesised traffic. Measured vs AOCL at
+# n=4096, both arms scored against the same cached reference so the reference cancels:
+#     galen (Zen3)       ON 0.955 | OFF 0.967 | ON again 0.942
+#     wintermute (Zen4)  ON 1.006 | OFF 1.002 | ON again 1.006
+# No win on either box, and Zen4 shows no dip at all in a clean run — its earlier 0.990 was noise.
+# Removing the traffic changed nothing, so CAPACITY IS NOT THE MECHANISM. Neither is set conflict:
+# n=2048 has the identical geometry (lda = 16384 B, a multiple of the 4096 B L1 way stride, so all
+# 8 panel columns map to one set) and is clean on every box. Both stories are dead.
+# What is left is Zen3 n=4096 alone, at ~0.95-0.97 over three runs. Whatever it is, it is not the
+# x stream — measure the A side before writing more code.
 
 # FUSED f-column trsv for the N forms (BLIS `trsv_unf_var2` shape), F fixed at 8.
 #
