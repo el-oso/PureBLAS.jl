@@ -466,7 +466,14 @@ end
     for u in 1:U
         push!(full.args, :($(Symbol(:xc, u)) = vload($V, xp + (i + $((u - 1) * W)) * $sz)))
     end
-    for c in 1:NC, u in 1:U
+    # EMISSION ORDER IS ROW-CHUNK-MAJOR (u outer, c inner), and it is not cosmetic when FOLDED.
+    # Column-major emission (`for c, u`) puts a column's U dependent FMAs back-to-back with nothing
+    # between them — a U-deep chain stalling on FMA latency — and bursts U consecutive lines from one
+    # stream before touching the next. Chunk-major interleaves: between two dependent FMAs on the same
+    # accumulator sit NC-1 independent ones, and the loads round-robin across the NC streams one line
+    # at a time. That is the order AOCL's `bli_dgemv_t_zen_int_avx512` emits. At U=1 the two orders are
+    # the same instruction sequence, so the shipped NC=4/U=1 path is untouched by this choice.
+    for u in 1:U, c in 1:NC
         push!(
             full.args,
             :($(acc(c, u)) = muladd(
@@ -921,8 +928,16 @@ end
         # resolve at RUNTIME so `PUREBLAS_FORCE_gemvt_nc` × `PUREBLAS_FORCE_gemvt_u` reaches this real
         # entry path; a compile-time const cannot be forced, which is how the first attempt at the U
         # experiment silently measured U=1 three times.
+        # ⚠ TWO TRAPS FOR THE NEXT GRID, both found by reading this ladder rather than the results.
+        # (1) There must be a branch per candidate NC or the force silently lands on a neighbour: the
+        #     first version of this ladder had only 8 and 4, so a run labelled `nc=16` actually
+        #     executed NC=8 and was recorded as a distinct arm. Val(16) is a real branch now.
+        # (2) `pf > 0` takes priority inside `_gemvt_cols!` and pins U to 1 — so a forced prefetch
+        #     distance cannot be combined with an unroll. The prefetch arm is falsified, so this is
+        #     left as-is deliberately; do not read a `pf=… u=4` run as having tested both.
         u = _gemvt_u(); pf = _gemvt_pf(); nc = _gemvt_nc()
         j = !blk ? 0 :
+            nc >= 16 ? _gemvt_cols!(Val(16), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz) :  # req8-ok: candidate arm
             nc >= 8 ? _gemvt_cols!(Val(8), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz) :  # req8-ok: candidate arm
             _gemvt_cols!(Val(4), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz)
         @inbounds while j < n           # remainder columns: per-column dot
