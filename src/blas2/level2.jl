@@ -953,9 +953,13 @@ end
 #    narrow shape (fewer live registers, shorter epilogue) is better. Predicate: `m·n·sizeof(T) ≤ _L2_BYTES`.
 # 2. HOW deep it may go — THE REGISTER FILE. The folded kernel holds NC accumulators + U x-vectors +
 #    ~2 temps, so the deep shape is legal iff `NC + U + 2 ≤ _NVREG`. This is what makes the choice
-#    adapt instead of being a per-µarch table: AVX-512 (32) admits 8×4; AVX2 (16) does not admit the
-#    pair at full depth and falls back by the same inequality, which is also what Zen3 measured
-#    (U=2 neutral, register-preload actively harmful there).
+#    adapt instead of being a per-µarch table.
+#    ⚠ NOTE THE INEQUALITY DOES NOT EXCLUDE AVX2: 8+4+2 = 14 ≤ 16, so Zen3 takes the deep shape too
+#    (its L2 is 512 KiB, so the window is n ≤ 256 for Float64 rather than n ≤ 362). An earlier draft of
+#    this comment asserted AVX2 would fall back — that was wrong, and checked only after writing it.
+#    Whether 14-of-16 YMM leaves enough headroom on AVX2 is an EMPIRICAL question the fleet validation
+#    answers; if Zen3 regresses, the missing physical term is register HEADROOM (14/32 is comfortable,
+#    14/16 is not), and it must be derived, not fitted after the fact.
 #
 # WHY THIS IS A DERIVATION AND NOT A FIT. The rate is set by lines-in-flight vs fill latency, and both
 # bounds above are inequalities over detected constants — nothing here is a tuned number. The measured
