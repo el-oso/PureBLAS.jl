@@ -92,113 +92,113 @@ html.dark .pbg-key{color:#98a1b3}
 #### BLAS-1
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>asum</code></th><td class="ok"><span class="v">1.26</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
-<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=30000</span></td></tr>
-<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.81</span></td><td class="ok"><span class="v">1.64</span></td><td class="ok"><span class="v">1.6</span></td></tr>
-<tr><th><code>iamax</code></th><td class="b2"><span class="v">0.97</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.74</span></td></tr>
-<tr><th><code>nrm2</code></th><td class="ok"><span class="v">1.72</span></td><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.87</span></td></tr>
-<tr><th><code>scal</code></th><td class="b2"><span class="v">0.977</span><span class="n">n=300000</span></td><td class="b1"><span class="v">0.992</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.998</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>zaxpy</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotc</code></th><td class="b1"><span class="v">0.995</span><span class="n">n=100000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.929</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotu</code></th><td class="b1"><span class="v">0.996</span><span class="n">n=100000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.913</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zscal</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=1000000</span></td></tr>
+<table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th></tr></thead><tbody>
+<tr><th><code>asum</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>dot</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.68</span></td></tr>
+<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.49</span></td></tr>
+<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.02</span></td></tr>
+<tr><th><code>scal</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=30000</span></td></tr>
+<tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.986</span><span class="n">n=30000</span></td></tr>
+<tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zscal</code></th><td class="ok"><span class="v">1.01</span></td></tr>
 </tbody></table>
 ```
 
 #### BLAS-2
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.42</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.961</span><span class="n">n=4096</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.938</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.948</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.741</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.77</span></td><td class="ok"><span class="v">1.76</span></td></tr>
-<tr><th><code>symv</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.979</span><span class="n">n=4096</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.814</span><span class="n">n=128</span></td></tr>
-<tr><th><code>trsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>zgemvC</code></th><td class="b2"><span class="v">0.963</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.935</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgemvT</code></th><td class="b2"><span class="v">0.959</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.855</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgeru</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.817</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.857</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.35</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>zhemv</code></th><td class="b3"><span class="v">0.919</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.38</span></td></tr>
-<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.1</span></td></tr>
-<tr><th><code>ztrmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>ztrsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=1024</span></td></tr>
+<table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th></tr></thead><tbody>
+<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.41</span></td></tr>
+<tr><th><code>gemvN</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=256</span></td></tr>
+<tr><th><code>gemvT</code></th><td class="b2"><span class="v">0.978</span><span class="n">n=256</span></td></tr>
+<tr><th><code>ger</code></th><td class="b2"><span class="v">0.984</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.09</span></td></tr>
+<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.77</span></td></tr>
+<tr><th><code>symv</code></th><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>trmv</code></th><td class="b3"><span class="v">0.948</span><span class="n">n=512</span></td></tr>
+<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.971</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>zgemvC</code></th><td class="b1"><span class="v">0.998</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgemvT</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zgeru</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td></tr>
+<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>ztrmv</code></th><td class="b2"><span class="v">0.983</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>ztrsv</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=1024</span></td></tr>
 </tbody></table>
 ```
 
 #### BLAS-3
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=256</span></td></tr>
-<tr><th><code>symm</code></th><td class="b3"><span class="v">0.929</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.954</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>syrk</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.941</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>trmm</code></th><td class="b3"><span class="v">0.885</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.923</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b4"><span class="v">0.804</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zgemm</code></th><td class="b4"><span class="v">0.807</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.92</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zhemm</code></th><td class="b3"><span class="v">0.9</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.938</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.985</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zherk</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>zsymm</code></th><td class="b3"><span class="v">0.887</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.944</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.907</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyrk</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.939</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=512</span></td></tr>
-<tr><th><code>ztrmm</code></th><td class="b4"><span class="v">0.824</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.933</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ztrmmR</code></th><td class="b4"><span class="v">0.779</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>ztrsm</code></th><td class="b2"><span class="v">0.983</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.02</span></td></tr>
-<tr><th><code>ztrsmR</code></th><td class="b4"><span class="v">0.785</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=128</span></td></tr>
+<table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th></tr></thead><tbody>
+<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.971</span><span class="n">n=128</span></td></tr>
+<tr><th><code>symm</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>syrk</code></th><td class="b3"><span class="v">0.94</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>trmm</code></th><td class="b3"><span class="v">0.942</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.945</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.92</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zherk</code></th><td class="b2"><span class="v">0.981</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zsymm</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zsyrk</code></th><td class="b3"><span class="v">0.937</span><span class="n">n=128</span></td></tr>
+<tr><th><code>ztrmm</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=256</span></td></tr>
+<tr><th><code>ztrmmR</code></th><td class="b2"><span class="v">0.967</span><span class="n">n=512</span></td></tr>
+<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.06</span></td></tr>
+<tr><th><code>ztrsmR</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=128</span></td></tr>
 </tbody></table>
 ```
 
 #### LAPACK
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbtrf</code></th><td class="b2"><span class="v">0.953</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.731</span><span class="n">n=128</span></td><td class="b4"><span class="v">0.714</span><span class="n">n=128</span></td></tr>
-<tr><th><code>gels</code></th><td class="ok"><span class="v">1.36</span></td><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.26</span></td></tr>
-<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>geqrf</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=32</span></td></tr>
-<tr><th><code>gesvd</code></th><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>getrf</code></th><td class="b2"><span class="v">0.957</span><span class="n">n=32</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=32</span></td></tr>
-<tr><th><code>getrs</code></th><td class="b4"><span class="v">0.752</span><span class="n">n=8</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=2048</span></td><td class="b4"><span class="v">0.793</span><span class="n">n=8</span></td></tr>
-<tr><th><code>gtsv</code></th><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.21</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.52</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.49</span></td></tr>
-<tr><th><code>gttrs</code></th><td class="b1"><span class="v">0.999</span><span class="n">n=65536</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>pbtrfL</code></th><td class="b2"><span class="v">0.988</span><span class="n">n=192</span></td><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.06</span></td></tr>
-<tr><th><code>pbtrfU</code></th><td class="b3"><span class="v">0.891</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=256</span></td></tr>
-<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.08</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrsL</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.913</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.873</span><span class="n">n=512</span></td></tr>
-<tr><th><code>potrsU</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td></tr>
-<tr><th><code>pptrfL</code></th><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.914</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.862</span><span class="n">n=32</span></td></tr>
-<tr><th><code>pptrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.923</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=128</span></td></tr>
-<tr><th><code>pstrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.828</span><span class="n">n=8</span></td></tr>
-<tr><th><code>pstrfU</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.941</span><span class="n">n=8</span></td></tr>
-<tr><th><code>ptsv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>pttrf</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.1</span></td></tr>
-<tr><th><code>pttrs</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=256</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td></tr>
-<tr><th><code>syev</code></th><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.19</span></td></tr>
-<tr><th><code>syevN</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.08</span></td></tr>
-<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.35</span></td></tr>
-<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.04</span></td><td class="b4"><span class="v">0.753</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.16</span></td><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.1</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.13</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>zheevN</code></th><td class="b2"><span class="v">0.978</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="b4"><span class="v">0.776</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.692</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.708</span><span class="n">n=32</span></td></tr>
+<table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th></tr></thead><tbody>
+<tr><th><code>gbtrf</code></th><td class="b4"><span class="v">0.724</span><span class="n">n=128</span></td></tr>
+<tr><th><code>gels</code></th><td class="ok"><span class="v">1.27</span></td></tr>
+<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>geqrf</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=32</span></td></tr>
+<tr><th><code>gesvd</code></th><td class="ok"><span class="v">1.06</span></td></tr>
+<tr><th><code>getrf</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=32</span></td></tr>
+<tr><th><code>getrs</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=8</span></td></tr>
+<tr><th><code>gtsv</code></th><td class="ok"><span class="v">1.2</span></td></tr>
+<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.5</span></td></tr>
+<tr><th><code>gttrs</code></th><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.1</span></td></tr>
+<tr><th><code>pbtrfU</code></th><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.08</span></td></tr>
+<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.902</span><span class="n">n=256</span></td></tr>
+<tr><th><code>potrsU</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.787</span><span class="n">n=32</span></td></tr>
+<tr><th><code>pptrfU</code></th><td class="b3"><span class="v">0.903</span><span class="n">n=128</span></td></tr>
+<tr><th><code>pstrf</code></th><td class="ok"><span class="v">1.06</span></td></tr>
+<tr><th><code>pstrfU</code></th><td class="ok"><span class="v">1.02</span></td></tr>
+<tr><th><code>ptsv</code></th><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>pttrf</code></th><td class="ok"><span class="v">1.12</span></td></tr>
+<tr><th><code>pttrs</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td></tr>
+<tr><th><code>syev</code></th><td class="ok"><span class="v">1.27</span></td></tr>
+<tr><th><code>syevN</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.32</span></td></tr>
+<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.995</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="b4"><span class="v">0.678</span><span class="n">n=32</span></td></tr>
 </tbody></table>
 ```
 ```@raw html
@@ -212,24 +212,25 @@ html.dark .pbg-key{color:#98a1b3}
 </p>
 ```
 
+
 ## LAPACK — factorizations & solves
 
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.08 | 1.48 / 1.08 | 1.64 / 1.13 |
-| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 1.03 | 1.47 / 1.11 | 1.44 / 1.03 |
-| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.914** | 2.82 / 1.01 | 1.2 / 0.914 |
-| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | **0.991** | 1.48 / 0.991 | 1.37 / 1.19 |
-| LU | getrf, gesv | s/d/c/z | ✅ | **0.991** | 1.37 / 1.04 | 1.71 / 0.991 |
-| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.987** | 1.25 / 1.14 | 1.11 / 0.987 |
-| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.956** | 1.94 / 1.56 | 1.54 / 0.956 |
-| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.02 | 1.34 / 1.14 | 1.2 / 1.02 |
-| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1 | 1.4 / 1.05 | 1.42 / 1 |
-| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.32 | 1.68 / 1.44 | 2.07 / 1.32 |
-| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | **0.739** | 1.13 / 0.948 | 1.1 / 0.739 |
-| Least-squares | gels | s/d/c/z | ✅ | 1.29 | 2.51 / 1.99 | 1.95 / 1.29 |
-| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.04 | 1.28 / 1.14 | 1.21 / 1.04 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.09 | 1.29 / 1.09 | 1.33 / 1.22 |
+| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.08 | 1.48 / 1.08 | 1.63 / 1.12 |
+| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 1.03 | 1.48 / 1.11 | 1.44 / 1.03 |
+| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.903** | 2.75 / 0.972 | 1.16 / 0.903 |
+| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | 1.02 | 1.47 / 1.02 | 1.36 / 1.14 |
+| LU | getrf, gesv | s/d/c/z | ✅ | **0.993** | 1.36 / 1.04 | 1.7 / 0.993 |
+| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.956** | 1.19 / 1.09 | 1.06 / 0.956 |
+| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.955** | 1.93 / 1.51 | 1.54 / 0.955 |
+| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.01 | 1.32 / 1.12 | 1.18 / 1.01 |
+| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1.02 | 1.41 / 1.02 | 1.42 / 1.03 |
+| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.31 | 1.68 / 1.45 | 2.06 / 1.31 |
+| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | 1.01 | 1.23 / 1.01 | 1.19 / 1.03 |
+| Least-squares | gels | s/d/c/z | ✅ | 1.27 | 2.49 / 1.97 | 1.92 / 1.27 |
+| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.06 | 1.22 / 1.11 | 1.16 / 1.06 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.26 | 1.35 / 1.3 | 1.39 / 1.26 |
 
 ## LAPACK — SVD
 
@@ -244,8 +245,8 @@ html.dark .pbg-key{color:#98a1b3}
 
 | Op | Routines | Types | Routes | Gated |
 |---|---|---|---|---|
-| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, ormtr | s/d/c/z | ✅ | 1.09 |
-| Symmetric / Hermitian (values only) | syev, sterf | s/d/c/z | ✅ | 1.09 |
+| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, ormtr | s/d/c/z | ✅ | 1.26 |
+| Symmetric / Hermitian (values only) | syev, sterf | s/d/c/z | ✅ | 1.26 |
 | Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | ⏳ |
 | Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | ⏳ |
 | Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | ⏳ |
@@ -270,16 +271,29 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 
 | Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
 |---|---|---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.731** | 1.46 / 0.974 | 1.2 / 0.731 |
+| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.724** | 1.48 / 0.96 | 1.21 / 0.724 |
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 1 | 1.34 / 1 | 1.27 / 1.03 |
-| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.992** | 1.38 / 1.12 | 1.07 / 0.992 |
-| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 1.03 | 1.57 / 1.12 | 1.43 / 1.03 |
-| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.914** | 1.09 / 0.924 | 1.94 / 0.914 |
+| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.992** | 1.38 / 1.13 | 1.07 / 0.992 |
+| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 1.03 | 1.56 / 1.12 | 1.42 / 1.03 |
+| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.788** | 1.06 / 0.903 | 1.9 / 0.788 |
 
 ### Fleet status
 
 The verdicts above are the **Zen4** sweep. Where Zen3/Zen5 have been measured they mostly agree; the
-known exception is banded Cholesky.
+known exceptions are banded Cholesky and complex `gemv`-T/C.
+
+**Complex `gemv`-T/C is an ISA split, and the Zen4-only table hides it.** Past L2 these route to a
+column-block whose width is chosen by a Measure-tier knob bounded by the register file:
+`regs = (2·NC + 2)·(HALF ? 1 : 2)`. On **AVX-512** that admits `NC = 8` narrow accumulators — eight
+concurrent column streams, matching what AOCL's fused `zdotxf` runs — and `zgemvT` then gates at every
+size on Zen4 (n=512 0.96→1.00, n=1024 0.91→1.02 vs AOCL). On **AVX2** the same formula needs 18 vector
+registers against 16 available, so Zen3 keeps `NC = 4` and its mid-band misses stand: `zgemvT`
+0.95–0.98 and `zgemvC` 0.94–0.96 vs AOCL at n=512…2048. That is a register-file limit, not an
+unexplored lever — closing it needs a different accumulator shape, not a wider block.
+
+The split below L2 is separate and derived, not tuned: while A is L2-resident the loop is
+FMA-latency-bound and prefers fewer, wider accumulators (measured n=256: 1.15 wide vs 1.04 narrow), so
+the wide arm is kept there on both ISAs.
 
 **`pbtrf`** gates fully on **Zen4** (Float64, `kd = 32…384`, n ∈ {1024, 4096}, both triangles:
 1.02–3.28× AOCL, 1.49–2.00× OpenBLAS) and beats **OpenBLAS on all three µarchs**, but it does
