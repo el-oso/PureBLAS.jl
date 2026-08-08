@@ -16,14 +16,23 @@
 # 1:1 get an alias below; anything still unmatched is REPORTED, never silently skipped — an unmatched
 # row is exactly how a stale number would survive.
 #
-# ⚠ PASS THE ZEN4 CACHE ONLY. These routing tables carry ONE verdict per row, and this page states
-# that verdict is the Zen4 sweep — the "Fleet status" section and several footnotes are written
-# against that convention. Feeding all three fleet caches silently min-es across boxes and changes the
-# answer: measured 2026-08-07 on the banded/tridiagonal/packed table, four of five rows moved, and
-# `Banded Cholesky` published as 0.891 MISSING when Zen4 alone reads 1.03 GATING. If the convention
-# ever changes to fleet-wide, change the prose and the footnotes in the same commit.
+# ⚠ ONE CACHE PER MICROARCHITECTURE, ONE COLUMN EACH — never several caches pooled into one verdict.
+# This tool used to REFUSE multiple caches. That guard identified a real hazard and drew the wrong
+# conclusion from it: fed the fleet, the old code min-ed ACROSS boxes into a single number, and on
+# 2026-08-07 that published `Banded Cholesky` as 0.891 MISSING when Zen4 alone read 1.03 GATING —
+# four of five rows on that table moved. POOLING is what is unsafe. Giving each box its own column is
+# not, and it is what these rows always needed: the gate is per box, so one verdict cannot express
+# "gates on Zen4, misses on Zen3" — precisely the complex gemv-T/C split. Same reasoning
+# bench/coverage_ops.jl already applies to the BLAS tables.
 #
-# Usage:  julia --project=bench bench/coverage_routing.jl bench/plots_data_avx512_wintermute.txt
+# Column order follows ARGUMENT order and must match the table headers in docs/src/coverage.md.
+# The `vs OB / vs AOCL geo/worst` columns stay scoped to the FIRST cache given and the header says so
+# ("Zen4 vs OB …"); they are a per-reference detail, not a per-box verdict.
+#
+# Usage:  julia --project=bench bench/coverage_routing.jl \
+#             bench/plots_data_avx512_wintermute.txt \
+#             bench/plots_data_avx2_galen.txt \
+#             bench/plots_data_zen5_neuromancer.txt
 using Printf
 
 const QN = 48
@@ -111,13 +120,36 @@ function routines_of(col)
     return out
 end
 
+"µarch label from a cache header, e.g. \"Zen4\" — the column key. Authoritative (the measuring box
+stamps its own CpuId), never re-derived from the filename."
+function uarch_of(path)
+    for ln in eachline(path)
+        startswith(ln, "#pbbench") || continue
+        m = match(r"uarch=(\S+)", ln)
+        return isnothing(m) ? basename(path) : String(m.captures[1])
+    end
+    return basename(path)
+end
+
 function main()
     paths = ARGS
-    isempty(paths) && error("usage: coverage_routing.jl <ZEN4 cache>")
-length(paths) == 1 || error("pass exactly ONE cache (the Zen4 sweep). Got $(length(paths)): " *
-    "these tables hold a single verdict per row and mixing boxes changes it — see the header note.")
-    gates = cells(paths)
-    ob = refstats(paths, "openblas"); ao = refstats(paths, "aocl")
+    isempty(paths) && error("usage: coverage_routing.jl <cache> [more…]  (one per microarchitecture)")
+    # ⚠ ONE COLUMN PER BOX — NOT one pooled verdict over several caches. The earlier version of this
+    # tool REFUSED multiple caches, and that guard was right about the hazard and wrong about the
+    # remedy: feeding it the fleet made it min ACROSS boxes into a single number, which published
+    # `Banded Cholesky` as 0.891 FAILING when Zen4 alone read 1.03. Pooling is what is unsafe; showing
+    # each box its own column is not, and it is what these rows needed all along — the gate is per box,
+    # so a single verdict cannot express "gates on Zen4, misses on Zen3" (exactly the complex gemv-T/C
+    # split). Same reasoning bench/coverage_ops.jl already applies to the BLAS tables.
+    boxes = [(uarch_of(p), p) for p in paths]
+    length(unique(first.(boxes))) == length(boxes) ||
+        error("two caches report the same uarch — that would silently overwrite a column: " *
+            join(first.(boxes), ", "))
+    gates_by = Dict(u => cells([p]) for (u, p) in boxes)
+    # geo/worst stay scoped to the FIRST cache given (by convention the Zen4 sweep) and the header
+    # says so; they are a per-reference detail, not a per-box verdict.
+    ob = refstats([last(boxes[1])], "openblas"); ao = refstats([last(boxes[1])], "aocl")
+    gates = gates_by[first(boxes[1])]
 
     doc = collect(eachline("docs/src/coverage.md"))
     unmatched = String[]; changed = 0
@@ -130,8 +162,12 @@ length(paths) == 1 || error("pass exactly ONE cache (the Zen4 sweep). Got $(leng
         parts = split(ln, "|")
         # TWO TABLE SHAPES: 8 columns (with geo/worst) and 5 (verdict only, e.g. eigensolvers).
 # The 5-column form was skipped by an earlier `>= 8` guard, which is why glyphs survived there.
-length(parts) >= 6 || continue
-wide = length(parts) >= 9   # 7-col row splits to 9 parts (leading/trailing empties); 5-col to 7
+# Shapes now scale with the number of boxes. With B per-box columns a row splits to
+#   narrow: Op|Routines|Types|Routes|<B verdicts>            -> 4 + B + 2 parts
+#   wide:   … plus vs-OB and vs-AOCL geo/worst               -> 4 + B + 2 + 2 parts
+        nb = length(boxes)
+        length(parts) >= 6 + nb || continue
+        wide = length(parts) >= 8 + nb
         rts = routines_of(String(parts[3]))
         gs = Float64[]; obs = Float64[]; aos = Float64[]
         miss = String[]
@@ -155,11 +191,18 @@ wide = length(parts) >= 9   # 7-col row splits to 9 parts (leading/trailing empt
         # their cells hold Documenter footnote refs ([^upper]) which raw HTML would not resolve.
         # So the verdict is the NUMBER, bolded when it misses. That still fixes the actual complaint
         # against 🐰/🐢 — it distinguishes 0.999 from 0.61, which one glyph could not.
-        verdict = w >= 1.0 ? @sprintf("%.3g", w) : @sprintf("**%.3g**", w)
-        parts[6] = " " * verdict * " "
-        if wide                      # only the 7-column tables carry geo/worst columns
-            parts[7] = @sprintf(" %.3g / %.3g ", geo(obs), isempty(obs) ? NaN : minimum(obs))
-            parts[8] = @sprintf(" %.3g / %.3g ", geo(aos), isempty(aos) ? NaN : minimum(aos))
+        verdict(x) = isnan(x) ? " — " : x >= 1.0 ? @sprintf("%.3g", x) : @sprintf("**%.3g**", x)
+        # One verdict cell per box, in the order the caches were given (= the header order).
+        for (k, (u, _)) in enumerate(boxes)
+            gu = Float64[]
+            for r in rts
+                haskey(gates_by[u], r) && append!(gu, last.(gates_by[u][r]))
+            end
+            parts[5 + k] = " " * verdict(isempty(gu) ? NaN : minimum(gu)) * " "
+        end
+        if wide                      # geo/worst columns follow the per-box block (first cache only)
+            parts[6 + length(boxes)] = @sprintf(" %.3g / %.3g ", geo(obs), isempty(obs) ? NaN : minimum(obs))
+            parts[7 + length(boxes)] = @sprintf(" %.3g / %.3g ", geo(aos), isempty(aos) ? NaN : minimum(aos))
         end
         doc[i] = join(parts, "|"); changed += 1
     end
