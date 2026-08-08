@@ -43,6 +43,23 @@ gemvt_u = 1
 gemvt_pf = 0
 trmv_fused_min = 1
 gemvt_deep = true
+# ── THE REMAINING MEASURE-TIER KNOBS ────────────────────────────────────────────────────────────────
+# Every knob whose `@static if isnothing(pref)` branch builds a `Base.OncePerProcess` MUST be pinned
+# here, or its one-time init (jl_set_precompile_field_replace) stays reachable and reddens any
+# all-paths AllocCheck proof that can reach it. Nine were missing, and they are exactly why three
+# dogfood items were erroring: `cgemvt_cfg` (BLAS-2, via complex gemv-T) and the LAPACK set below.
+# Values are the SAME ones juliac/build.jl already pins for the trim build, so the dogfood exercises
+# the shipping configuration rather than an invented one. test/req8_lint.jl guards the list.
+cgemvt_cfg = 4
+brd_nb = 8
+gbtrf_cross = 16
+pbtrf_cross_kd = 32
+pbtrf_nb = 40
+pbtrf_nb_small = 8
+pbtrf_u_native_kd = 256
+potrf_upper_direct_max = 12
+pptrf_spr_min = 8
+
 # Same again for the complex-axpy width decision: its OncePerProcess probe allocates a calibration
 # buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
 # the shipping path here); the dogfood checks alloc-freeness, not perf.

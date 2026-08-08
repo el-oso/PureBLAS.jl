@@ -2987,6 +2987,45 @@ end
 # LARGEST update onto a per-column fallback. Anchoring the remainder in the FIRST panel instead puts
 # it exactly where the off-panel work is zero, so every panel that does off-panel work is full and
 # the ragged fallback disappears entirely (hence no `_axpy_simd!` branch here, unlike `_trsv_fused8!`).
+# The fused F=8 pass, lifted out so the eight column bases arrive as an OPAQUE TUPLE across a
+# @noinline boundary. Same fix and same reason as `_gemv_t_block!`: written inline, LLVM
+# loop-strength-reduction rebuilds `c0..c7` into a SERIAL chain —
+#     vfmadd231pd zmm8, zmm1, [r14 + rdx]
+#     add rdx, r14                          ← 7 deep, so stream k waits on stream k-1
+# and here it costs far more than it did in gemv-T: at n=4096 the triangle is 64 MiB, past L3 on every
+# box in the fleet, and achieved DRAM bandwidth is outstanding_misses · 64 B / latency. Serialising
+# eight addresses at a ~200-300 cycle latency caps the bandwidth directly. "DRAM-bound" was never a
+# reason to stop — it says the DRAM path sets the rate, not that we are extracting what it offers.
+# Hoisting the bases as loop-invariant locals does NOT survive LSR (measured on the gemv-T side); the
+# opaque call boundary is what keeps them in eight independent registers.
+#
+# TWO ACCUMULATORS, NOT ONE. The inline version folded all eight FMAs into a single `acc` — a
+# dependent chain 8 deep per row-chunk. Two halves halve that chain for one extra vector add per
+# chunk. This REASSOCIATES the sum over a panel's 8 columns; that is the same class of
+# reassociation the panel blocking already performs, but it is not bit-identical to the old order, so
+# do not expect old and new to agree to the last ulp.
+@noinline function _trmv_f8pass!(
+        cs::NTuple{8, Ptr{T}}, xp::Ptr{T}, bs::NTuple{8, Vec{W, T}}, off::Int, top::Int, ::Val{W}
+    ) where {T, W}
+    sz = sizeof(T)
+    yp = xp + off * sz
+    i = 0
+    @inbounds while i + W <= top
+        o = i * sz
+        a = muladd(bs[1], vload(Vec{W, T}, cs[1] + o), vload(Vec{W, T}, yp + o))
+        b = muladd(bs[2], vload(Vec{W, T}, cs[2] + o), zero(Vec{W, T}))
+        a = muladd(bs[3], vload(Vec{W, T}, cs[3] + o), a)
+        b = muladd(bs[4], vload(Vec{W, T}, cs[4] + o), b)
+        a = muladd(bs[5], vload(Vec{W, T}, cs[5] + o), a)
+        b = muladd(bs[6], vload(Vec{W, T}, cs[6] + o), b)
+        a = muladd(bs[7], vload(Vec{W, T}, cs[7] + o), a)
+        b = muladd(bs[8], vload(Vec{W, T}, cs[8] + o), b)
+        vstore(a + b, yp + o)
+        i += W
+    end
+    return i
+end
+
 @inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -3004,15 +3043,10 @@ end
                     b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
                     b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
                     b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
-                    i = 0
-                    while i + W <= top
-                        o = i * sz; acc = vload(V, xp + o)
-                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
-                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
-                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
-                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
-                        vstore(acc, xp + o); i += W
-                    end
+                    i = _trmv_f8pass!(
+                        (c0, c1, c2, c3, c4, c5, c6, c7), xp,
+                        (b0, b1, b2, b3, b4, b5, b6, b7), 0, top, Val(W)
+                    )
                     while i < top
                         s = unsafe_load(xp, i + 1)
                         for k in lo:hi
@@ -3042,16 +3076,11 @@ end
                     b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
                     b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
                     b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
-                    yp = xp + hi * sz
-                    i = 0
-                    while i + W <= rest
-                        o = i * sz; acc = vload(V, yp + o)
-                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
-                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
-                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
-                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
-                        vstore(acc, yp + o); i += W
-                    end
+                    yp = xp + hi * sz             # still used by the scalar tail below
+                    i = _trmv_f8pass!(
+                        (c0, c1, c2, c3, c4, c5, c6, c7), xp,
+                        (b0, b1, b2, b3, b4, b5, b6, b7), hi, rest, Val(W)
+                    )
                     while i < rest
                         s = unsafe_load(yp, i + 1)
                         for k in lo:hi
