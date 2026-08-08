@@ -42,6 +42,7 @@ gemvt_nc = 4
 gemvt_u = 1
 gemvt_pf = 0
 trmv_fused_min = 1
+gemvt_deep = true
 # Same again for the complex-axpy width decision: its OncePerProcess probe allocates a calibration
 # buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
 # the shipping path here); the dogfood checks alloc-freeness, not perf.

@@ -974,8 +974,22 @@ end
 # `_NVREG` and `_L2_BYTES` are compile-time consts, so this const-folds to a branch on m·n and stays
 # trim-safe — and, unlike the `OncePerProcess` tuner it replaces, it allocates nothing, which is what
 # keeps `gemv!`'s all-paths @noalloc contract provable.
+# `PUREBLAS_FORCE_gemvt_deep=0` disables the derived shape so the fleet validation can A/B it against
+# the narrow one IN ONE RUN. Gated on the pin like every other resolver here, so a pinned build (tests,
+# juliac) compiles it out and the all-paths @noalloc proof never sees a OncePerProcess.
+const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
+@static if isnothing(_GEMVT_DEEP_PREF)
+    const _GEMVT_DEEP_ONCE = Base.OncePerProcess{Int}() do
+        f = _force_knob("gemvt_deep")
+        return f >= 0 ? f : 1
+    end
+    @inline _gemvt_deep_on() = _GEMVT_DEEP_ONCE() != 0
+else
+    @inline _gemvt_deep_on() = _GEMVT_DEEP_PREF::Bool
+end
 @inline function _gemvt_deep(::Type{T}, m::Int, n::Int) where {T}
-    return m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
+    return _gemvt_deep_on() &&
+        m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
 end
 const _GEMVT_NC_DEEP = 8      # one x-load per 8 FMAs: the load:FMA ratio that clears the plateau
 const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines named, enough to cover L2
