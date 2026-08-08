@@ -645,14 +645,112 @@ const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
 # Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
 # _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
 # (1 shuffle feeds NC cols, x streamed once per block).
-const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int
+const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int   # legacy pin; superseded by _cgemvt_cfg()
 # AVX2: accumulate gemvT/C in native ymm (Vec{W}) so NC=4 columns fit → 4 concurrent load streams (see
 # _gemv_tc_block_cmplx!). AVX-512 keeps full-width Vec{2W} (32 zmm has room, already gates).
+# ⚠ MOVED UP from below `_cgemvt_cfg`: the config knob's default is `NC + (HALF ? 100 : 0)`, so both
+# consts must exist before it. Julia consts are load-ordered — the earlier arrangement referenced
+# `_CGEMVT_HALF` ~45 lines before its definition.
 const _CGEMVT_HALF = @load_preference("cgemvt_half", _vwidth(Float64) == 4)::Bool
 # Once A spills L2 (n≳768), gemvT/C is bandwidth-bound, not FMA-latency-bound (measured galen: n≥1024
 # both PB & OB run at L3/DRAM bandwidth, PB only ~92-94% of OB's). Same +192B A-stream prefetch that
 # fixed the gemvN ri valley saturates it here. AVX2-gated (AVX-512 gemvT already gates); Preferences knob.
 const _CGEMVT_PF = @load_preference("cgemvt_pf", _vwidth(Float64) == 4)::Bool
+# ── gemv-T/C column-block CONFIG: (NC, HALF) as ONE Measure knob ────────────────────────────────────
+# Encoding: `NC + (HALF ? 100 : 0)`. One knob because the two are not independent — HALF halves the
+# registers per column, which is exactly what buys a larger NC, so sweeping them separately would test
+# combinations the register file cannot hold.
+#
+# WHY THIS EXISTS. `_CGEMVT_NC = 4` was a bare literal whose comment said "swept per box" — a req#8b
+# violation with no Derive formula and no Measure harness (real gemv-T has `_gemvt_nc`; the complex path
+# never got one). It is also measurably wrong: disassembling AOCL 2026-08-07 shows `zgemv` trans routes
+# to `bli_zdotxf_zen_int_8_avx512` — a fused dot with FUSING FACTOR 8, i.e. eight concurrent column read
+# streams against our four — and the miss is broad rather than a single cell (Zen4 0.963/0.895/0.992 and
+# Zen3 0.980/0.945/0.945 at n=512/1024/2048 vs AOCL), which is the signature of a stream-count deficit
+# rather than one bad size. AOCL uses no prefetch and no non-temporal stores anywhere in that path
+# (verified: 64 vfmadd231pd, 28 vpermilpd, zero prefetch*/movnt*), so stream count is what is left.
+#
+# CANDIDATES ARE DERIVED FROM THE REGISTER FILE, not enumerated by hand. Each column holds p and q
+# accumulators of `Vec{lanes}` with lanes = HALF ? W : 2W, and a `Vec{lanes}` is `lanes*sizeof(T) /
+# _SIMD_BYTES` native registers — 1 when HALF, 2 when not. Plus xc and xcs at the same width, plus a
+# few for A-loads and addresses:
+#     regs(NC, HALF) = (2*NC + 2) * (HALF ? 1 : 2) + reserve
+# AVX-512 (_NVREG=32): (4,wide)=20+r, (8,half)=18+r, (4,half)=10+r  → all three fit.
+# AVX2    (_NVREG=16): (4,half)=10+r, (2,wide)=12+r fit; (8,half)=18+r does NOT.
+# Tier: MEASURE — stream count is the `_ger_np` class (port/prefetcher-dependent, sign-inverts across
+# µarchs), so it cannot be Derived; only the BOUNDS are derived, which is what req#8b asks for.
+@inline _cgemvt_regs(nc::Int, half::Bool) = (2 * nc + 2) * (half ? 1 : 2) + 6
+_cgemvt_fits(nc::Int, half::Bool) = _cgemvt_regs(nc, half) <= _NVREG
+# Incumbent for the L2-RESIDENT regime = today's shipped behaviour, so a tie keeps what ships.
+const _CGEMVT_CFG_DEFAULT = _CGEMVT_NC + (_CGEMVT_HALF ? 100 : 0)
+# Incumbent for the PAST-L2 regime = DERIVED: the most concurrent column streams the register file can
+# hold in the narrow layout. Physical criterion — past L2 the loop is bandwidth/MLP-bound, so streams
+# are the resource, and the narrow layout is what makes them affordable. AVX-512 → 8 (matching AOCL's
+# fused zdotxf factor of 8, arrived at independently from the register budget), AVX2 → 4.
+#
+# ⚠ WHY THE INCUMBENT MOVED HERE INSTEAD OF LEAVING IT TO THE DUEL. Measured 2026-08-07: with (4,wide)
+# as incumbent the duel resolved 108/4/108/4/108/4/108/4 across eight fresh processes — a systematic
+# alternation, not noise — while the GATE says (8,half) is decisively right past L2 on this box
+# (n=512 0.955→1.006, n=1024 0.912→1.017 when forced). Shipping a coin flip between a passing and a
+# missing kernel is the exact failure the duel rule exists to prevent, so the derived value becomes the
+# incumbent and ties go to it. The knob REMAINS Measure tier: a box whose optimum really is fewer
+# streams (Zen5 resolves `_ger_np()` = 1, so this is not hypothetical) can still displace it, but must
+# now clear the supermajority AND the regret bound to do so.
+const _CGEMVT_CFG_BIG = (
+    n = _cgemvt_fits(8, true) ? 8 : _cgemvt_fits(4, true) ? 4 : 2;
+    n + 100
+)
+const _CGEMVT_CFG_PREF = @load_preference("cgemvt_cfg", nothing)
+@static if isnothing(_CGEMVT_CFG_PREF)
+    function _measure_cgemvt_cfg()::Int
+        Base.generating_output() && return _CGEMVT_CFG_BIG     # never burn a measure at precompile
+        _f = _force_knob("cgemvt_cfg"); _f >= 0 && return _f       # instrument only, see _force_knob
+        try
+            T = Float64; W = _vwidth(T)
+            # PROBE WHERE THE KNOB IS DISPATCHED AND WHERE THE ARMS SEPARATE. Square A sized so the
+            # matrix lands at L3 — that is the worst measured cell on both locked boxes and it sits
+            # inside the broad 512..2048 miss band, so a winner here is a winner across the band. This
+            # is the axpy_band lesson: a probe in a regime where the arms tie cannot resolve the knob.
+            n = _avoid_po2(max(64, isqrt(_L3_BYTES ÷ (2 * sizeof(Complex{T})))), W)
+            nb = 3
+            As = [fill(Complex{T}(1.0e-3, 2.0e-3), n, n) for _ in 1:nb]   # rotated: fresh draw per round
+            x = fill(Complex{T}(0.5, -0.25), n)
+            y = fill(Complex{T}(0.0, 0.0), n)
+            Ar = Ref(As[1])
+            rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
+            α = Complex{T}(1.0, 0.0); β = Complex{T}(0.0, 0.0)
+            run(nc, half) = _gemv_tc_run!(n, n, α, Ar[], x, β, y, Val(false), nc, half)
+            inc() = run(Val(_CGEMVT_CFG_BIG - 100), Val(true))   # derived incumbent
+            # req8-ok: a MEASUREMENT-PRECISION budget in nanoseconds, not a machine value — selects no
+            # kernel, appears in no shipped path. Same fix `_measure_axpy_unroll` needed: a fixed 5-rep
+            # median rests on too little signal at this size and the duel under-resolves an effect the
+            # GATE measures at 11% (n=1024: 0.912 → 1.017 when the arm is forced). Deriving `nrep` from
+            # a time budget makes every box spend the same TIME rather than the same rep count.
+            _REP_BUDGET_NS = 20_000_000
+            nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
+            # Ordered widest-effect first; first to earn a supermajority wins. Guards const-fold, so a
+            # candidate the register file cannot hold is not even compiled on that ISA.
+            # Candidates are the alternatives to the DERIVED incumbent (fewer/wider streams). A box whose
+            # optimum really is fewer streams displaces it; a tie keeps the derived value.
+            if _CGEMVT_CFG_BIG != 104 && _cgemvt_fits(4, true)
+                _tune_wins_it(_tune_duel(inc, () -> run(Val(4), Val(true)); reps = nrep, refresh = rot)) && return 104  # req8-ok: candidate arm
+            end
+            if _CGEMVT_CFG_BIG != 4 && _cgemvt_fits(4, false)
+                _tune_wins_it(_tune_duel(inc, () -> run(Val(4), Val(false)); reps = nrep, refresh = rot)) && return 4  # req8-ok: candidate arm
+            end
+            if _CGEMVT_CFG_BIG != 2 && _cgemvt_fits(2, false)
+                _tune_wins_it(_tune_duel(inc, () -> run(Val(2), Val(false)); reps = nrep, refresh = rot)) && return 2  # req8-ok: candidate arm
+            end
+            return _CGEMVT_CFG_BIG
+        catch
+            return _CGEMVT_CFG_BIG
+        end
+    end
+    const _CGEMVT_CFG_ONCE = Base.OncePerProcess{Int}(_measure_cgemvt_cfg)
+    @inline _cgemvt_cfg() = _CGEMVT_CFG_ONCE()
+else
+    @inline _cgemvt_cfg() = _CGEMVT_CFG_PREF::Int
+end
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
@@ -1047,13 +1145,17 @@ end
     return body
 end
 
-function _gemv_tc_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}) where {T <: BlasReal, CJ}
-    z = iszero(β); csz = sizeof(Complex{T}); NC = _CGEMVT_NC
+# Knob-free runner: (NC, HALF) arrive as compile-time `Val`s so the block kernel specializes and the
+# hot loop carries no dynamic dispatch. The measure harness calls this directly with each candidate.
+function _gemv_tc_run!(
+        m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}, ::Val{NC}, ::Val{HALF}
+    ) where {T <: BlasReal, CJ, NC, HALF}
+    z = iszero(β); csz = sizeof(Complex{T})
     GC.@preserve A x y begin
         Ap = pointer(A); lda = stride(A, 2); xp = pointer(x); yp = pointer(y)
         j = 0
         while j + NC <= n                                         # NC-column blocks (shared x + swap)
-            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(_CGEMVT_HALF))
+            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(HALF))
             j += NC
         end
         @inbounds while j < n                                     # remainder columns: per-column dot
@@ -1064,6 +1166,43 @@ function _gemv_tc_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y
         end
     end
     return y
+end
+
+# Static ladder: the resolved (NC, HALF) config → compile-time `Val`s. One branch, each arm statically
+# dispatched, so the public complex gemv path stays allocation-free and StrictMode-clean (a dynamic
+# `Val(nc)` here would reintroduce the runtime dispatch that has broken the @typestable contract twice).
+# Arms the register file cannot hold on this ISA const-fold away.
+@inline function _gemv_tc_cmplx!(
+        m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}
+    ) where {T <: BlasReal, CJ}
+    # ⚠ THE OPTIMUM IS SIZE-DEPENDENT, SO THE RESIDENCY SPLIT IS PART OF THE KNOB — one global config is
+    # measurably wrong at one end or the other. Measured 2026-08-07 on wintermute, freq-locked, all arms
+    # SAME-RUN, forced via PUREBLAS_FORCE_cgemvt_cfg, vs AOCL:
+    #     n      A vs L2      NC=4 wide      NC=8 half
+    #     64     ≪ L2         1.007          0.986
+    #     128    ≪ L2         0.998          0.985
+    #     256    = L2         1.148          1.037
+    #     512    4×L2         0.955 MISS     1.006 PASS
+    #     1024   16×L2        0.912 MISS     1.017 PASS
+    #     2048   ≫ L2         1.004          1.004
+    # The crossover sits exactly where A stops fitting L2, which is the physical story this file already
+    # told: while A is L2-resident the loop is FMA-latency-bound and wants fewer, wider accumulators;
+    # once A streams from L3/DRAM it is bandwidth/MLP-bound and wants more concurrent column streams
+    # (AOCL's fused zdotxf runs 8 — see the `_cgemvt_cfg` note). Shipping NC=8 everywhere would have
+    # traded two mid-band misses for two small-n ones.
+    # DERIVE tier: the SPLIT is a residency criterion over `_L2_BYTES`; only the past-L2 arm is Measured.
+    if m * n * sizeof(Complex{T}) <= _L2_BYTES
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(_CGEMVT_HALF))
+    end
+    cfg = _cgemvt_cfg()
+    if _cgemvt_fits(8, true) && cfg == 108
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true))    # req8-ok: candidate arm
+    elseif cfg == 104
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true))    # req8-ok: candidate arm
+    elseif cfg == 2
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(2), Val(false))   # req8-ok: candidate arm
+    end
+    return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(_CGEMVT_HALF))
 end
 
 function _gemv!(
@@ -1150,7 +1289,35 @@ const _CGER_U = _NVREG >= 32 ? 2 : 1
 # `Val` ladder only instantiates NP ∈ {2,4,8}, but advances `jc += np`. A raw budget of 5 selected the
 # Val(8) arm while striding 5, which reprocesses columns and reads past the last panel. Caught by the
 # correctness check, not by review.
-const _CGER_NP_MAX = (r = (_NVREG - 4 - 4 * _CGER_U) ÷ 4; r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1)
+#
+# A `Vec{lanes,T}` costs `lanes*sizeof(T) ÷ _SIMD_BYTES` native registers — 2 wide (lanes=2W), 1 narrow
+# (lanes=W). Per column: 2 coefficient vectors. Per unroll step: the x vector and its swap partner.
+# Reserve ~4 for addresses/temporaries.
+@inline _cger_np_max(half::Bool) = (
+    v = half ? 1 : 2;
+    r = (_NVREG - 4 - 2 * _CGER_U * v) ÷ (2 * v);
+    r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1
+)
+const _CGER_NP_MAX_WIDE = _cger_np_max(false)
+const _CGER_NP_MAX_HALF = _cger_np_max(true)
+# ⚠⚠ FALSIFIED BY THE GATE 2026-08-08 — DO NOT RE-CHASE "MORE STREAMS VIA THE NARROW LAYOUT".
+# The idea (from the AOCL disassembly: its zaxpyv uses one `vbroadcastsd` per part, 2 registers per
+# column, which is how a competitor affords 8 streams where our wide layout affords 4) was to switch
+# the panel to `Vec{W}` coefficients and let NP reach the box's measured `_ger_np()` = 8. It is a
+# clean derivation and it MADE THINGS MUCH WORSE. Measured on wintermute, freq-locked, all arms
+# same-run, zgeru vs AOCL:
+#     n=1024   0.901  ->  0.742     <- severe regression at the L3 boundary
+#     n=2048   1.355  ->  1.334
+#     n=4096   1.401  ->  1.342
+# So the narrow layout does not simply buy streams: halving the vector halves the work per instruction
+# and doubles the instruction count on a kernel that is already store-bound, and the extra streams do
+# not pay for it. AOCL affording 8 streams is not evidence that 8 streams is what makes AOCL fast here
+# — it wins in the A≈L3 band with a ONE-stream axpyv (see `_axpy_cmplx_cold!`), so its register layout
+# was never the mechanism. Reading a competitor's shape is a hypothesis generator, not a result.
+# The kernel keeps its `Val{HALF}` parameter (it costs nothing and the arm stays measurable), but the
+# shipped layout is WIDE and NP stays capped by the wide budget.
+@inline _cger_half() = false
+@inline _cger_np() = min(_ger_np(), _CGER_NP_MAX_WIDE)
 # NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
@@ -1326,10 +1493,15 @@ end
 # `_NVREG` at the call site rather than inheriting the real path's value unexamined.
 @generated function _ger_panel_cmplx!(
         Ap::Ptr{Complex{T}}, lda::Int, xp::Ptr{Complex{T}}, yp::Ptr{Complex{T}},
-        jc::Int, m::Int, α::Complex{T}, ::Val{NP}, ::Val{CJ}, ::Val{U}
-    ) where {T <: BlasReal, NP, CJ, U}
-    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T); step = U * W
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+        jc::Int, m::Int, α::Complex{T}, ::Val{NP}, ::Val{CJ}, ::Val{U}, ::Val{HALF}
+    ) where {T <: BlasReal, NP, CJ, U, HALF}
+    # HALF picks the accumulator/coefficient width. `Vec{2W}` is 2 native registers, `Vec{W}` is 1, so
+    # a column costs 4 registers wide and 2 narrow — and that is precisely what caps NP. AOCL's zaxpyv
+    # uses the narrow layout (one `vbroadcastsd` per part), which is how it affords 8 streams where our
+    # wide layout could only afford 4. Same trick `_CGEMVT_HALF` already plays for gemv-T/C.
+    W = _vwidth(T); lanes = HALF ? W : 2W; cstep = lanes ÷ 2   # complex elements per vector
+    V2 = Vec{lanes, T}; sz = sizeof(T); step = U * cstep
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(lanes - 1))...)
     body = quote
         pxr = Ptr{$T}(xp)                                  # real-interleaved views for the vector loads
         par = Ptr{$T}(Ap)
@@ -1343,18 +1515,18 @@ end
         push!(
             body.args, :(
                 $(Symbol(:si, c)) = $V2($(Expr(:tuple, (iseven(l) ? :(-imag($(Symbol(:ay, c)))) :
-                                                        :(imag($(Symbol(:ay, c)))) for l in 0:(2W - 1))...)))
+                                                        :(imag($(Symbol(:ay, c)))) for l in 0:(lanes - 1))...)))
             )
         )
         push!(body.args, :($(Symbol(:ac, c)) = par + (jc + $(c - 1)) * lda * 2 * $sz))
     end
     main = quote end
     for u in 1:U
-        push!(main.args, :($(Symbol(:xv, u)) = vload($V2, pxr + (i + $((u - 1) * W)) * 2 * $sz)))
+        push!(main.args, :($(Symbol(:xv, u)) = vload($V2, pxr + (i + $((u - 1) * cstep)) * 2 * $sz)))
         push!(main.args, :($(Symbol(:xs, u)) = shufflevector($(Symbol(:xv, u)), Val($swp))))
     end
     for c in 1:NP, u in 1:U
-        push!(main.args, :(p = $(Symbol(:ac, c)) + (i + $((u - 1) * W)) * 2 * $sz))
+        push!(main.args, :(p = $(Symbol(:ac, c)) + (i + $((u - 1) * cstep)) * 2 * $sz))
         push!(main.args, :(t = muladd($(Symbol(:xv, u)), $(Symbol(:ar, c)), vload($V2, p))))
         push!(main.args, :(vstore(muladd($(Symbol(:xs, u)), $(Symbol(:si, c)), t), p)))
     end
@@ -1386,30 +1558,37 @@ end
 @inline function _ger_paneldrv_cmplx!(
         m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool, np::Int
     ) where {T <: BlasReal}
-    return cj ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true)) :
-        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false))
+    h = _cger_half()
+    return cj ?
+        (h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(true)) :
+        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(false))) :
+        (h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(true)) :
+        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(false)))
 end
 @inline function _ger_pdc_cj!(
-        m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}
-    ) where {T <: BlasReal, CJ}
+        m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}, ::Val{HALF}
+    ) where {T <: BlasReal, CJ, HALF}
     GC.@preserve A x y begin
         Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); csz = sizeof(Complex{T})
         jc = 0
         while jc + np <= n
             if np == 2
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(2), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(2), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             elseif np == 4
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(4), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(4), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             else
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(8), Val(CJ), Val(_CGER_U))  # req8-ok: candidate arm
+                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(8), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             end
             jc += np
         end
         @inbounds while jc < n                                              # remainder columns (< np)
             yj = CJ ? conj(unsafe_load(yp, jc + 1)) : unsafe_load(yp, jc + 1)
             ayj = α * yj
+            # `_cold!`, not `_simd!`: the driver only runs when A ≥ L3, so a remainder column is just
+            # as non-resident as a panel one. Sizing residency from the column's own bytes here would
+            # reintroduce the exact bug this path exists to fix.
             iszero(ayj) ||
-                _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xp, Ap + jc * lda * csz)
+                _axpy_cmplx_cold!(m, real(ayj), imag(ayj), xp, Ap + jc * lda * csz)
             jc += 1
         end
     end
@@ -1439,17 +1618,37 @@ function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T
     # partner) against the real kernel's one, and `Vec{2W,T}` is always exactly 2 native registers
     # (2W·sizeof(T) = 2·_SIMD_BYTES by construction), so a column costs 4 registers here versus 1 there.
     # Spending the real path's NP=8 would be 32 registers of coefficients alone and spill on every ISA.
-    if m * n * csz >= _L3_BYTES
-        np = min(_ger_np(), _CGER_NP_MAX)
+    cold = m * n * csz >= _L3_BYTES        # the CALLER's footprint — see `_axpy_cmplx_cold!`
+    if cold
+        np = _cger_np()          # measured stream count, capped by the chosen layout's register budget
         np >= 2 && return _ger_paneldrv_cmplx!(m, n, α, x, y, A, cj, np)
-        # np == 1 IS the per-column path below (one stream) — no separate arm needed.
+        # np == 1 IS the per-column path below (one stream) — no separate arm needed. This is the LIVE
+        # path on any box whose measured stream optimum is 1 (Zen5 resolves `_ger_np()` = 1), so the
+        # cold-column fix below is that box's whole remedy, not an edge case.
     end
+    # Val, not Bool: `cold` is loop-invariant, so a runtime flag would put a branch inside the
+    # per-column hot loop and block specialization of the axpy arm it selects.
+    return cold ? _ger_cmplx_percol!(m, n, α, x, y, A, cj, Val(true)) :
+        _ger_cmplx_percol!(m, n, α, x, y, A, cj, Val(false))
+end
+
+# Per-column complex ger. `cold` says the CALLER is sweeping past L3, so each column is non-resident
+# however small the column itself is — without it the callee sizes residency from its own 16 KiB
+# argument and picks the L1-resident arm for a stone-cold stream (see `_axpy_cmplx_cold!` for the full
+# post-mortem and the AOCL disassembly that found it).
+@inline function _ger_cmplx_percol!(
+        m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool, ::Val{COLD}
+    ) where {T <: BlasReal, COLD}
+    csz = sizeof(Complex{T})
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2)
         @inbounds for j in 1:n
             yj = cj ? conj(unsafe_load(yptr, j)) : unsafe_load(yptr, j)
             ayj = α * yj
-            iszero(ayj) || _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xptr, Aptr + (j - 1) * lda * csz)
+            iszero(ayj) && continue
+            p = Aptr + (j - 1) * lda * csz
+            COLD ? _axpy_cmplx_cold!(m, real(ayj), imag(ayj), xptr, p) :
+                _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xptr, p)
         end
     end
     return A

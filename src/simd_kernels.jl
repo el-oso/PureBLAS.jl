@@ -737,6 +737,35 @@ end
         _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
 
+"""
+    _axpy_cmplx_cold!(n, alr, ali, x, y)
+
+`_axpy_cmplx_simd!` for a buffer the CALLER knows is non-resident, skipping the residency test.
+
+⚠ RESIDENCY IS A PROPERTY OF THE CALLER'S FOOTPRINT, NOT THE CALLEE'S ARGUMENT. `_axpy_cmplx_simd!`
+sizes its decision from `n * 2 * sizeof(T)` — the length of the vector it was handed. That is right
+when the caller IS the whole operation, and wrong when the call is one column of a much larger sweep.
+Complex `ger` hit exactly that: at m=n=1024 each column is 16 KiB, so the callee measured 16 KiB,
+found it L1-resident (`2*bytes > _L1_BYTES` is FALSE at exactly 32 KiB = `_L1_BYTES`) and selected the
+interleaved `wide` arm — while the caller was sweeping a 16 MiB matrix in which every column is stone
+cold. The op's own axpy work established that past residency the phase-batched arm wins because it
+keeps more misses in flight; the ger path was dodging that arm precisely in the regime it exists for.
+
+Found by disassembling AOCL (2026-08-07): its `zgeru` is a per-column `bli_zaxpyv_zen_int_avx512` —
+ONE stream, no prefetch and no non-temporal stores anywhere in its complex L2 path (verified: 19
+`vpermilpd`, 16 `vfmadd132pd`, zero `prefetch*`/`movnt*`). So AOCL's advantage in the A≈L3 band is
+per-stream kernel SHAPE, not stream count or cache-policy tricks — and PB was running the wrong shape
+by its own rules.
+
+Same decision as the callee's non-resident branch, so nothing new is tuned here; and phase vs wide is
+a pure scheduling difference on an elementwise update, so results stay bit-identical.
+"""
+@inline function _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+    return _zaxpy_narrow() ?
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_wide!(n, alr, ali, x, y)
+end
+
 @generated function _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
