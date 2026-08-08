@@ -659,15 +659,25 @@ else
     @inline _gemvt_nc() = _GEMVT_NC_PREF::Int
 end
 
-const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
+# gemv-T blocked-vs-per-column ROUTE, as a 3-valued MODE (not a Bool) so the RESIDENCY arm is itself
+# forceable/shippable:
+#   0 = blocked kernel at every size (the residency window never opens)
+#   1 = per-column inside the derived window `A > L2 && x ≤ L1/2`, blocked outside   ← the old `true`
+#   2 = per-column at every size (the residency guard is DISABLED)
+# Mode 2 exists because the guard `A ≤ L2 ⇒ blocked` was itself only ever measured on Zen4, and Zen5's
+# two worst gemvT cells (n=128/256) sit inside it — see the falsification block below.
+# A Bool Preference (the historical spelling, still in test/Project.toml and juliac/build.jl) maps
+# false→0, true→1, so pinned/trim builds keep their exact behaviour.
+const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
+                             _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
-    function _measure_gemvt_perscan()::Bool
-        Base.generating_output() && return false     # never burn a measure during precompile
-        _f = _force_knob("gemvt_perscan"); _f >= 0 && return _f != 0  # instrument only, see _force_knob
+    function _measure_gemvt_perscan()::Int
+        Base.generating_output() && return 0         # never burn a measure during precompile
+        _f = _force_knob("gemvt_perscan"); _f >= 0 && return _f  # instrument only, see _force_knob
         try
             # Probe INSIDE the window, derived: A ≈ 4×L2 (clearly past L2), m capped so x ≤ L1/2.
             m = min(isqrt(4 * _L2_BYTES ÷ sizeof(Float64)), _L1_BYTES ÷ 2 ÷ sizeof(Float64))
-            m -= m % 4; m < 64 && return false
+            m -= m % 4; m < 64 && return 0
             n = m
             A = fill(1.0, m, n); x = fill(1.0, m); y = fill(0.0, n)
             GC.@preserve A x y begin
@@ -693,19 +703,24 @@ const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
                 end
                 sort!(tbs); sort!(tps)
                 mid = (nrep + 1) ÷ 2
-                return tps[mid] < tbs[mid]
+                # This duel only ever probes INSIDE the window, so it can resolve 0 vs 1 and nothing
+                # else. Mode 2 is reachable by force/Pin only, deliberately: nothing ships it yet.
+                return tps[mid] < tbs[mid] ? 1 : 0
             end
         catch
-            return false
+            return 0
         end
     end
-    const _GEMVT_PERSCAN_ONCE = Base.OncePerProcess{Bool}(_measure_gemvt_perscan)
-    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_ONCE()
+    const _GEMVT_PERSCAN_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_perscan)
+    @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_ONCE()
 else
-    @inline _gemvt_perscan_ok() = _GEMVT_PERSCAN_PREF::Bool
+    @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_PREF::Int
 end
-@inline _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T} =
-    m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2 && _gemvt_perscan_ok()
+@inline function _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T}
+    mode = _gemvt_perscan_mode()                     # ONE resolution per call, as before
+    mode >= 2 && return true                         # per-column everywhere (instrument arm)
+    return mode == 1 && m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2
+end
 
 @inline _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}) where {T <: BlasReal, B0} =
     _gemv_t_simd!(m, n, α, A, x, β, y, b0, !_gemvt_perscan(m, n, T))
