@@ -824,6 +824,33 @@ function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where
     return y
 end
 
+# The NC-column sweep of `_gemv_t_simd!`, lifted out so NC is a `Val` the caller picks at runtime.
+# Returns the first column index NOT covered (the caller's remainder loop starts there).
+@inline function _gemvt_cols!(
+        ::Val{NC}, ::Val{B0}, u::Int, pf::Int, yptr, Aptr, xptr, lda::Int, m::Int, n::Int,
+        α::T, β::T, sz::Int
+    ) where {NC, B0, T <: BlasReal}
+    j = 0
+    while j + NC <= n
+        p = yptr + j * sz; q = Aptr + j * lda * sz
+        if pf >= 8 * _CACHELINE                                                # req8-ok: candidate arm
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(8 * _CACHELINE))
+        elseif pf >= 4 * _CACHELINE                                            # req8-ok: candidate arm
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(4 * _CACHELINE))
+        elseif pf >= 2 * _CACHELINE                                            # req8-ok: candidate arm
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(2 * _CACHELINE))
+        elseif u >= 4
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
+        elseif u >= 2
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(2), Val(0))  # req8-ok: candidate arm
+        else
+            _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(NC), Val(B0), Val(1), Val(0))
+        end
+        j += NC
+    end
+    return j
+end
+
 @inline function _gemv_t_simd!(
         m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
     ) where {T <: BlasReal, B0}
@@ -876,29 +903,18 @@ end
         # So NC is Measure tier (it inverts across µarchs — the `_ger_np` shape), with the candidate set
         # DERIVED from the register file. This does NOT re-open the sweep's finding: that measured Zen4
         # cells which route per-column, on one box.
-        j = 0
-        # NC is FIXED AT 4 — falsified as a lever on every box (tables in `_measure_gemvt_nc`). The live
-        # parameter is the m-unroll U, resolved at runtime so `PUREBLAS_FORCE_gemvt_u` can force it
-        # through this real entry path; a compile-time const cannot be forced, which is how the first
-        # attempt at this experiment silently measured U=1 three times.
-        u = _gemvt_u(); pf = _gemvt_pf()
-        while blk && j + 4 <= n
-            p = yptr + j * sz; q = Aptr + j * lda * sz
-            if pf >= 8 * _CACHELINE                                                # req8-ok: candidate arm
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(8 * _CACHELINE))
-            elseif pf >= 4 * _CACHELINE                                            # req8-ok: candidate arm
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(4 * _CACHELINE))
-            elseif pf >= 2 * _CACHELINE                                            # req8-ok: candidate arm
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(2 * _CACHELINE))
-            elseif u >= 4
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
-            elseif u >= 2
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(2), Val(0))  # req8-ok: candidate arm
-            else
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(0))
-            end
-            j += 4
-        end
+        # NC AND U ARE NOW FORCEABLE TOGETHER, which is the point of this shape. Each was falsified
+        # ALONE — NC swept at U=1, U swept at NC=4 (tables in `_measure_gemvt_nc`) — but AOCL's
+        # `bli_dgemv_t_zen_int_avx512` is NC=8 **and** U=4 simultaneously: 32 rows per iteration, one
+        # x-load per 8 FMAs. That pairing is the one cell of the grid neither sweep visited, and it is
+        # the last structural delta left after routing, per-column and prefetch all died. Both knobs
+        # resolve at RUNTIME so `PUREBLAS_FORCE_gemvt_nc` × `PUREBLAS_FORCE_gemvt_u` reaches this real
+        # entry path; a compile-time const cannot be forced, which is how the first attempt at the U
+        # experiment silently measured U=1 three times.
+        u = _gemvt_u(); pf = _gemvt_pf(); nc = _gemvt_nc()
+        j = !blk ? 0 :
+            nc >= 8 ? _gemvt_cols!(Val(8), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz) :  # req8-ok: candidate arm
+            _gemvt_cols!(Val(4), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz)
         @inbounds while j < n           # remainder columns: per-column dot
             s = _dot_simd(m, Aptr + j * lda * sz, xptr, T)
             yj = unsafe_load(yptr, j + 1)
