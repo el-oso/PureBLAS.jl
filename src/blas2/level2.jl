@@ -428,8 +428,13 @@ end
 # in; masked tail for the row remainder.
 @generated function _gemv_t_block!(
         yp::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T}, m::Int,
-        α::T, β::T, ::Val{NC}, ::Val{B0}, ::Val{U}
-    ) where {T, NC, B0, U}
+        α::T, β::T, ::Val{NC}, ::Val{B0}, ::Val{U}, ::Val{PFB}
+    ) where {T, NC, B0, U, PFB}
+    # PFB = software-prefetch distance in BYTES ahead of each A column stream; 0 = no prefetch.
+    # WHY IT EXISTS (measured, not guessed — see the bandwidth decomposition in `_measure_gemvt_pf`):
+    # on Zen5 this loop reads A out of L2 at a FLAT 32 B/cycle at both n=128 and n=256 while AOCL
+    # sustains 37-44 B/cy on the same bytes, and out of L1 (n=64) it reaches 44 B/cy and BEATS AOCL.
+    # So the deficit is L2->L1 stream supply, not the arithmetic, the epilogue, or the entry path.
     # ⚠ NO DEFAULT ARG on a @generated function — juliac --trim fails on the default-arg trampoline
     # (it lowers to an `invoke ::Any`). Every call site passes Val(U) explicitly.
     # ⚠ M-UNROLL. At U=1 the loop does W rows per iteration: ONE x-load, NC FMAs, then increment and
@@ -460,6 +465,11 @@ end
                 $(Symbol(:a, c, :_, u))
             ))
         )
+    end
+    if PFB > 0                       # one prefetch per column per iteration, PFB bytes downstream
+        for c in 1:NC
+            push!(full.args, :(_prefetch(Ab + (i + $(c - 1) * lda) * $sz + $PFB)))
+        end
     end
     push!(
         body.args, :(
@@ -582,6 +592,39 @@ const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
     return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
 end
 @inline _gemvt_u() = _GEMVT_U_ONCE()
+# ── gemv-T A-stream software prefetch distance (bytes; 0 = off) ─────────────────────────────────────
+# The prefetch is a HINT (llvm.prefetch): architecturally non-faulting on x86, so reading past the end
+# of A is safe and needs no guard page (unlike the masked direct-B loads).
+# CANDIDATES ARE DERIVED from the line size — 0 (off) and 2/4/8 lines ahead. Nothing below one line is
+# meaningful and beyond ~8 lines the request is evicted before use.
+# TIER: MEASURE. Prefetch distance depends on the L2 hit latency and the hardware streamer's own
+# aggressiveness — the `_ger_np` class (not predictable from cache SIZE, which is all we detect) — so
+# the selection must be measured, and only the BOUNDS are derived. Shipped default 0 until the gate
+# moves it; forceable via PUREBLAS_FORCE_gemvt_pf (the value IS the byte distance).
+#
+# WHY THIS KNOB AND NOT ANOTHER KERNEL SHAPE. Achieved A-stream bandwidth, from the same-run gate
+# caches (Zen5, 2.0 GHz locked; bytes = reps·m·n·8 ÷ pooled-median time):
+#     n=        64(L1)  128(L2)  256(L2)  512(>L2)  1024   2048   4096
+#   AOCL         85.1     74.0     87.9     50.3     49.8   33.1   33.9   GB/s
+#   PB blocked   88.6     64.0     63.9     49.9     49.9   35.1   37.2
+#   PB per-col   49.8     48.8     61.7     48.2     48.5   40.3   28.7
+# PB is pinned at a FLAT 32 B/cycle out of L2 (64.0 and 63.9 GB/s at 2 GHz) while AOCL sustains
+# 37-44 B/cy on exactly the same bytes; out of L1 (n=64) PB reaches 44 B/cy and BEATS AOCL, and past
+# L2 (n≥512) the two converge because DRAM binds. That localises the whole deficit to L2→L1 stream
+# supply and FALSIFIES the two remaining in-kernel suspects on its own: the horizontal reduction and
+# the y load/store are one-per-column, so their cost per byte is HIGHEST at n=64 — the cell we win.
+# Same argument retires per-call entry overhead. The lever left is the stream, not the loop.
+const _GEMVT_PF_CANDIDATES = (0, 2 * _CACHELINE, 4 * _CACHELINE, 8 * _CACHELINE)
+const _GEMVT_PF_PREF = @load_preference("gemvt_pf", nothing)
+const _GEMVT_PF = something(_GEMVT_PF_PREF, 0)::Int   # req8-ok: shipped default until the gate says move it
+# Resolved ONCE PER PROCESS, never per call — an ENV lookup in this hot path is itself a regression
+# (it cost Zen5 gemvT n=64 0.959 -> 0.767 with the value unchanged; see `_GEMVT_U_ONCE`).
+const _GEMVT_PF_ONCE = Base.OncePerProcess{Int}() do
+    f = _force_knob("gemvt_pf")
+    return f >= 0 ? f : _GEMVT_PF
+end
+@inline _gemvt_pf() = _GEMVT_PF_ONCE()
+
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 @static if isnothing(_GEMVT_NC_PREF)
     function _measure_gemvt_nc()::Int
@@ -665,9 +708,33 @@ end
 #   1 = per-column inside the derived window `A > L2 && x ≤ L1/2`, blocked outside   ← the old `true`
 #   2 = per-column at every size (the residency guard is DISABLED)
 # Mode 2 exists because the guard `A ≤ L2 ⇒ blocked` was itself only ever measured on Zen4, and Zen5's
-# two worst gemvT cells (n=128/256) sit inside it — see the falsification block below.
+# two worst gemvT cells (n=128/256) sit inside it.
 # A Bool Preference (the historical spelling, still in test/Project.toml and juliac/build.jl) maps
 # false→0, true→1, so pinned/trim builds keep their exact behaviour.
+#
+# ⚠⚠ THE ROUTING IS FALSIFIED AS THE LEVER — DO NOT RE-CHASE. Measured 2026-08-08, every box
+# freq-locked (`fleet_freqlock.sh verify` achieved 2807 / 3675 / 1981 MHz), each arm a FULL
+# `bench/plots.jl bench op=gemvT` with PB+OpenBLAS+AOCL measured in the SAME run, forced through the
+# real entry path with `PUREBLAS_FORCE_gemvt_perscan`. Gate = min(vs OB, vs AOCL), pooled-quantile
+# median:
+#     Zen5 (neuromancer)  n=  64     128    256    512    1024   2048   4096
+#       mode 0  ← ships     1.018  0.863  0.733  0.991  1.012  1.061  1.092
+#       mode 1              1.013  0.855  0.735  0.974  0.906  0.918  1.044
+#       mode 2              0.587  0.646  0.703  0.977  0.921  0.927  0.805
+#     Zen4 (wintermute)
+#       mode 1  ← ships     1.046  1.030  0.986  1.088  1.175  1.044  1.101
+#       mode 0              1.038  1.034  0.989  1.033  0.939  0.956  1.096
+#     Zen3 (galen)
+#       mode 0  ← ships     1.101  1.026  1.037  1.024  0.971  0.942  1.030
+#       mode 1              1.105  1.026  1.023  0.977  0.970  0.686  1.074
+#       mode 2              0.853  0.870  1.004  0.973  0.969  0.687  0.787
+# EVERY box's shipped mode is already the best of the three at every size — the probe above picks
+# correctly on all of them, and mode 2 (per-column with the residency guard off) is catastrophic on
+# both boxes that ran it. The decisive cell is Zen5 n=256: blocked gives 0.733 and per-column 0.703,
+# i.e. TWO STRUCTURALLY UNRELATED KERNELS land within 4% of each other while AOCL is 37% ahead of
+# both. A deficit that survives swapping the whole kernel is not IN the kernel choice, so no routing
+# change can close it. (Zen4 mode 2 was not run: its contention guard refused twice, and with mode 2
+# dead 13/14 on the other two boxes the arm did not deserve a third slot.)
 const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
@@ -691,7 +758,7 @@ const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                     s = time_ns()
                     j = 0
                     while j + 4 <= n
-                        _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U))
+                        _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
                         j += 4
                     end
                     e = time_ns() - s; r > 0 && (tbs[r] = e)
@@ -740,11 +807,11 @@ function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where
         j = 0
         while j + nc <= n
             if nc >= 16
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
             end
             j += nc
         end
@@ -814,15 +881,21 @@ end
         # parameter is the m-unroll U, resolved at runtime so `PUREBLAS_FORCE_gemvt_u` can force it
         # through this real entry path; a compile-time const cannot be forced, which is how the first
         # attempt at this experiment silently measured U=1 three times.
-        u = _gemvt_u()
+        u = _gemvt_u(); pf = _gemvt_pf()
         while blk && j + 4 <= n
             p = yptr + j * sz; q = Aptr + j * lda * sz
-            if u >= 4
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(4))  # req8-ok: candidate arm
+            if pf >= 8 * _CACHELINE                                                # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(8 * _CACHELINE))
+            elseif pf >= 4 * _CACHELINE                                            # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(4 * _CACHELINE))
+            elseif pf >= 2 * _CACHELINE                                            # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(2 * _CACHELINE))
+            elseif u >= 4
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(4), Val(0))  # req8-ok: candidate arm
             elseif u >= 2
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(2))  # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(2), Val(0))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1))  # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1), Val(0))
             end
             j += 4
         end
@@ -1404,9 +1477,9 @@ end
     end
     cfg = _cgemvt_cfg()
     if _cgemvt_fits(8, true) && cfg == 108
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true), Val(_GEMVT_U))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))    # req8-ok: candidate arm
     elseif cfg == 104
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true), Val(_GEMVT_U))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))    # req8-ok: candidate arm
     elseif cfg == 2
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(2), Val(false))   # req8-ok: candidate arm
     end
@@ -2535,7 +2608,28 @@ end
 @inline function _trmv_fused_min(::Type{T}) where {T}
     f = _TRMV_FUSED_MIN_ONCE()
     f >= 0 && return f
-    return max(_TRI_NB, isqrt(_L2_BYTES ÷ (2 * sizeof(T)))) + 1
+    # ⚠ FUSED8 AT EVERY n. The old default (`max(_TRI_NB, isqrt(_L2_BYTES ÷ (2·sizeof(T)))) + 1`) sent
+    # small n to the unblocked `_trmv_simd!`, and that cut was A/B'd on 2026-07-31 (f552f13) — a DAY
+    # BEFORE `_trmv_fused8!` existed (447c46a, 2026-08-01). It was validated against a structure that
+    # no longer exists, and never re-litigated against the kernel it now guards.
+    # Re-litigated 2026-08-08 by forcing fused8 at every n through the real entry path, all three boxes
+    # freq-locked with the achieved clock verified, all arms same-run. trmv gate (min vs OB, vs AOCL):
+    #     n=          64     128    256     512    1024   2048   4096
+    #   Zen5 before  1.079  0.802  0.985   1.023  1.047  1.072  1.024
+    #   Zen5 fused8  1.515  1.052  0.971   1.030  1.049  1.065  0.991
+    #   Zen4 before  ~1.08  ~1.09  0.962   0.948  1.05   1.07   ~1.02
+    #   Zen4 fused8  1.481  1.132  1.025   1.025  1.020  1.129  0.961
+    #   Zen3 before  ~1.15  ~1.10  0.994   0.990  1.04   1.00   0.954
+    #   Zen3 fused8  1.460  1.085  0.991   1.016  1.040  1.001  0.966
+    # Zen5 n=128 — the worst trmv cell on the fleet — goes 0.802 -> 1.052, and Zen4 n=256/512 and Zen3
+    # n=512 all cross from miss to pass. WHY: `_trmv_simd!` walks one column at a time and re-reads AND
+    # re-writes the whole x prefix per column (three streams per A element); the fused sweep touches x
+    # once per 8 columns. AOCL runs a fused axpyf at exactly these sizes too — but at F=5 in AVX2
+    # (`bli_daxpyf_zen_int_5`, resolved through the cntx registration site), so this is NOT "match
+    # AOCL's width": we already fuse wider. It is that fusing at all beats the per-column x traffic.
+    # Residual, all in the DRAM regime and inside the ~4% run-to-run spread this file records for trmv:
+    # n=4096 reads 0.961/0.991/0.966. Tracked; do not conclude from one sweep.
+    return 1
 end
 
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
