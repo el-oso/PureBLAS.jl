@@ -563,6 +563,19 @@ const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
             # forcing an arm through `bench/plots.jl` is how that table was produced in the first place.
             # Do NOT re-enable this by "fixing" the probe's noise — fix its REGIME, then show it
             # reproduces the gate ordering on at least two boxes.
+            # ⚠⚠ AND NC IS FALSIFIED AS THE LEVER FOR THE WORST CELLS — measured on ZEN5 (native 512,
+            # where `_gemvt_perscan` is FALSE so EVERY size takes this blocked kernel), freq-locked,
+            # all arms same-run, each NC forced through the real entry path:
+            #     n=      64     128    256     512     1024    2048    4096
+            #   NC=4    0.959  0.860  0.723   1.010   1.026   0.975   1.044
+            #   NC=8    1.164  0.850  0.717   0.977   1.008   1.006   0.968
+            #   NC=16   1.075  0.829  0.695   0.768   0.867   0.866   0.975
+            # More chains make n=128 and n=256 SLIGHTLY WORSE, monotonically. The "native-512 Zen5 has
+            # twice the 512-bit FMA throughput so 4 dependent chains starve it" model predicted the
+            # opposite and is dead. NC=4 is right on every box and every size that matters.
+            # The remaining structural delta vs AOCL's kernel is therefore the M-UNROLL (it does 32 rows
+            # per iteration in 4 chunks of 8, one x-load per 8 FMAs; we do W rows with no unroll), NOT
+            # the column count — that is the next hypothesis, and it is untested.
             return 4                                               # req8-ok: gate-measured incumbent
             # (unreachable while the duel is disabled; kept so the candidate arms stay compiled+tested)
             for c in (16, 8)                                       # widest-effect first
