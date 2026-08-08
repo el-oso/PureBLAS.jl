@@ -194,6 +194,9 @@ _tunestamp() = try
         # acceptance test. A knob that selects a shipped kernel belongs in the provenance line.
         "axpy_band=$(PureBLAS._axpy_band())",
         "axpy_dram=$(PureBLAS._axpy_dram())",
+        # trmv's unblocked→fused8 crossover (Derive-tier default, but forceable — the sub-threshold side
+        # was validated against a structure `_trmv_fused8!` replaced, so a sweep is expected here).
+        "trmv_fused_min=$(PureBLAS._trmv_fused_min(Float64))",
     ), ",")
 catch e
     "unavailable($(typeof(e)))"
