@@ -98,8 +98,20 @@ const _prev_axu = load_preference(PUREBLAS_UUID, "axpy_unroll")
 const _prev_axd = load_preference(PUREBLAS_UUID, "axpy_dram")
 const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
+const _prev_gvtd = load_preference(PUREBLAS_UUID, "gemvt_deep")
+const _prev_gvu = load_preference(PUREBLAS_UUID, "gemvt_u")
+const _prev_gvpf = load_preference(PUREBLAS_UUID, "gemvt_pf")
+const _prev_gvnc = load_preference(PUREBLAS_UUID, "gemvt_nc")
+const _prev_cgvc = load_preference(PUREBLAS_UUID, "cgemvt_cfg")
+const _prev_tfm = load_preference(PUREBLAS_UUID, "trmv_fused_min")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
 set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-T column route (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gemvt_deep" => true; force = true)       # gemv-T deep-panel shape (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gemvt_u" => 1; force = true)           # gemv-T m-unroll (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gemvt_pf" => 0; force = true)          # gemv-T A-stream prefetch distance (Measure tier)
+set_preferences!(PUREBLAS_UUID, "gemvt_nc" => 4; force = true)          # gemv-T column count (Measure tier)
+set_preferences!(PUREBLAS_UUID, "cgemvt_cfg" => 4; force = true)        # complex gemv-T panel config (Measure tier)
+set_preferences!(PUREBLAS_UUID, "trmv_fused_min" => 1; force = true)    # trmv unblocked->fused8 crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
 set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => 12; force = true)  # tiny-upper potrf cutoff (Measure tier)
@@ -127,6 +139,36 @@ finally
         delete_preferences!(PUREBLAS_UUID, "gemvt_perscan"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => _prev_gvtp; force = true)
+    end
+    if _prev_gvtd === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_deep"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_deep" => _prev_gvtd; force = true)
+    end
+    if _prev_gvu === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_u"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_u" => _prev_gvu; force = true)
+    end
+    if _prev_gvpf === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_pf"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_pf" => _prev_gvpf; force = true)
+    end
+    if _prev_gvnc === nothing
+        delete_preferences!(PUREBLAS_UUID, "gemvt_nc"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "gemvt_nc" => _prev_gvnc; force = true)
+    end
+    if _prev_cgvc === nothing
+        delete_preferences!(PUREBLAS_UUID, "cgemvt_cfg"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "cgemvt_cfg" => _prev_cgvc; force = true)
+    end
+    if _prev_tfm === nothing
+        delete_preferences!(PUREBLAS_UUID, "trmv_fused_min"; force = true)
+    else
+        set_preferences!(PUREBLAS_UUID, "trmv_fused_min" => _prev_tfm; force = true)
     end
     if _prev_zaxn === nothing
         delete_preferences!(PUREBLAS_UUID, "zaxpy_narrow"; force = true)
