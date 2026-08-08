@@ -3013,7 +3013,8 @@ end
     @inbounds while i + W <= top
         o = i * sz
         a = muladd(bs[1], vload(Vec{W, T}, cs[1] + o), vload(Vec{W, T}, yp + o))
-        b = muladd(bs[2], vload(Vec{W, T}, cs[2] + o), zero(Vec{W, T}))
+        b = bs[2] * vload(Vec{W, T}, cs[2] + o)   # PLAIN MULTIPLY: an FMA against a zero addend
+                                                  # is the same op plus a materialised zero register
         a = muladd(bs[3], vload(Vec{W, T}, cs[3] + o), a)
         b = muladd(bs[4], vload(Vec{W, T}, cs[4] + o), b)
         a = muladd(bs[5], vload(Vec{W, T}, cs[5] + o), a)
@@ -3076,7 +3077,8 @@ end
                     b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
                     b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
                     b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
-                    yp = xp + hi * sz             # still used by the scalar tail below
+                    yp = xp + hi * sz             # for the SCALAR TAIL only; the helper
+                                                  # derives its own from (xp, off)
                     i = _trmv_f8pass!(
                         (c0, c1, c2, c3, c4, c5, c6, c7), xp,
                         (b0, b1, b2, b3, b4, b5, b6, b7), hi, rest, Val(W)
