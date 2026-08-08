@@ -186,7 +186,8 @@ end
 _tunestamp() = try
     join((
         "ger_np=$(PureBLAS._ger_np())",
-        "gemvt_perscan=$(PureBLAS._gemvt_perscan_ok())",
+        "gemvt_perscan=$(PureBLAS._gemvt_perscan_mode())",   # 0=blocked all n · 1=residency window · 2=per-column all n
+        "gemvt_u=$(PureBLAS._gemvt_u())",
         "cgemvn_nc_big=$(PureBLAS._cgemvn_nc_big())",
         # The axpy shape knobs were NOT stamped until 2026-08-06, and their absence bit immediately:
         # the run that proved `axpy_dram`'s duel migration closed three gate cells could not show from
