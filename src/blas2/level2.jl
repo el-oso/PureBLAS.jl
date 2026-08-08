@@ -460,6 +460,35 @@ end
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
+    # ── HOIST ONE INDEPENDENT BASE POINTER PER COLUMN. Writing the address inline as
+    # `Ab + (i + (c-1)*lda)*sz` lets LLVM strength-reduce it, and past NC=4 it emits a SERIAL CHAIN:
+    #   NC=4   vfmadd231pd zmm4, zmm5, [rsi + 8*r9]   ← four independent bases, 1 add in the loop
+    #          vfmadd231pd zmm3, zmm5, [r14 + 8*r9]
+    #          vfmadd231pd zmm2, zmm5, [r11 + 8*r9]
+    #          vfmadd231pd zmm1, zmm5, [rbx + 8*r9]
+    #   NC=8   vfmadd231pd zmm6, zmm9, [r10 + rbx]    ← SEVEN adds, each depending on the last
+    #          add rbx, r10
+    #          vfmadd231pd zmm5, zmm9, [r10 + rbx]
+    #          add rbx, r10                            ... 6 deep
+    # Stream k's address then cannot be computed until stream k-1's is, so the loads cannot issue in
+    # parallel and the extra columns buy no memory-level parallelism at all. THAT is why every NC=8
+    # arm measured identical to NC=4 (kb/findings/pureblas-zen5-gemvt-l2-invariant.md): the arm was
+    # crippled, not the hypothesis. `_trmv_fused8!` already hoists c0..c7 by hand for this reason.
+# ⚠ AND HOISTING DOES NOT FIX IT — measured, do not retry. With the bases hoisted as loop-invariant
+# pointers, LLVM loop-strength-reduction REBUILDS the identical 6-deep chain, and wrapping each
+# base in `Base.compilerbarrier(:const, …)` does not stop it either. The cause is x86-64's 16
+# GPRs: eight independent bases plus index, limit, xp, yp and temps do not fit, so LSR trades the
+# registers for the dependency. That is the right call for register pressure and the wrong one for
+# memory-level parallelism, and the preference is not expressible from Julia.
+# WHAT THIS INVALIDATES: every NC >= 8 arm ever measured here. None of them was a test of stream
+# count — the streams existed in the source and not in the machine code, which is exactly why
+# NC=8 could only ever come back "no different from NC=4". NC=4 is chain-free (four independent
+# bases, one `add` in the loop), which is why it ships.
+# The hoist is kept: it is equivalent, it matches `_trmv_fused8!`, and it makes the intent legible
+# next to this note.
+    for c in 1:NC
+        push!(body.args, :($(Symbol(:pc, c)) = Ab + $(c - 1) * lda * $sz))
+    end
     for c in 1:NC, u in 1:((fold || U == -1) ? 1 : U)
         push!(body.args, :($(Symbol(:a, c, :_, u)) = zero($V)))
     end
@@ -478,14 +507,14 @@ end
         push!(
             full.args,
             :($(acc(c, u)) = muladd(
-                vload($V, Ab + (i + $((u - 1) * W) + $(c - 1) * lda) * $sz), $(Symbol(:xc, u)),
+                vload($V, $(Symbol(:pc, c)) + (i + $((u - 1) * W)) * $sz), $(Symbol(:xc, u)),
                 $(acc(c, u))
             ))
         )
     end
     if PFB > 0                       # one prefetch per column per iteration, PFB bytes downstream
         for c in 1:NC
-            push!(full.args, :(_prefetch(Ab + (i + $(c - 1) * lda) * $sz + $PFB)))
+            push!(full.args, :(_prefetch($(Symbol(:pc, c)) + i * $sz + $PFB)))
         end
     end
     if U == -1
@@ -520,7 +549,7 @@ end
             push!(pre.args, :($(Symbol(:a, c, :_, 1)) = muladd($(Symbol(:p, c)), xc1, $(Symbol(:a, c, :_, 1)))))
         end
         for c in 1:NC
-            push!(pre.args, :($(Symbol(:p, c)) = vload($V, Ab + (i + $W + $(c - 1) * lda) * $sz)))
+            push!(pre.args, :($(Symbol(:p, c)) = vload($V, $(Symbol(:pc, c)) + (i + $W) * $sz)))
         end
         last_ = quote end
         push!(last_.args, :(xc1 = vload($V, xp + i * $sz)))
@@ -529,7 +558,7 @@ end
         end
         load0 = quote end
         for c in 1:NC
-            push!(load0.args, :($(Symbol(:p, c)) = vload($V, Ab + (i + $(c - 1) * lda) * $sz)))
+            push!(load0.args, :($(Symbol(:p, c)) = vload($V, $(Symbol(:pc, c)) + i * $sz)))
         end
         push!(
             body.args, quote            # multi-statement body: `quote…end`, not `:( a; if … end )`
@@ -560,7 +589,7 @@ end
         one_ = quote end
         push!(one_.args, :(xc1 = vload($V, xp + i * $sz)))
         for c in 1:NC
-            push!(one_.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz), xc1, $(Symbol(:a, c, :_, 1)))))
+            push!(one_.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, $(Symbol(:pc, c)) + i * $sz), xc1, $(Symbol(:a, c, :_, 1)))))
         end
         push!(
             body.args, :(
@@ -574,7 +603,7 @@ end
     push!(rmd.args, :(msk = lanes < (m - i)))
     push!(rmd.args, :(xcm = vload($V, xp + i * $sz, msk)))
     for c in 1:NC
-        push!(rmd.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz, msk), xcm, $(Symbol(:a, c, :_, 1)))))
+        push!(rmd.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, $(Symbol(:pc, c)) + i * $sz, msk), xcm, $(Symbol(:a, c, :_, 1)))))
     end
     push!(
         body.args, :(
