@@ -428,32 +428,66 @@ end
 # in; masked tail for the row remainder.
 @generated function _gemv_t_block!(
         yp::Ptr{T}, Ab::Ptr{T}, lda::Int, xp::Ptr{T}, m::Int,
-        α::T, β::T, ::Val{NC}, ::Val{B0}
-    ) where {T, NC, B0}
+        α::T, β::T, ::Val{NC}, ::Val{B0}, ::Val{U}
+    ) where {T, NC, B0, U}
+    # ⚠ NO DEFAULT ARG on a @generated function — juliac --trim fails on the default-arg trampoline
+    # (it lowers to an `invoke ::Any`). Every call site passes Val(U) explicitly.
+    # ⚠ M-UNROLL. At U=1 the loop does W rows per iteration: ONE x-load, NC FMAs, then increment and
+    # compare — bookkeeping amortized over NC=4 useful instructions. AOCL's dgemv-T does 32 rows per
+    # iteration (4 chunks of 8) so its overhead rides on 32 FMAs. That is the structural delta that
+    # SURVIVED after the column count was falsified on both boxes (see the NC tables in
+    # `_measure_gemvt_nc`): more columns hurt, so the remaining suspect is the row loop.
+    # Each (column, chunk) gets its OWN accumulator rather than folding chunks into one, which is where
+    # this differs from AOCL: shared accumulators would make each iteration a U-deep dependent chain per
+    # column, trading loop overhead for latency. Independent accumulators cost NC·U registers and give
+    # NC·U independent chains; the caller's `_gemvt_u_max` keeps that inside `_NVREG`.
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
-    for c in 1:NC
-        push!(body.args, :($(Symbol(:a, c)) = zero($V)))
+    for c in 1:NC, u in 1:U
+        push!(body.args, :($(Symbol(:a, c, :_, u)) = zero($V)))
     end
     full = quote end
-    push!(full.args, :(xc = vload($V, xp + i * $sz)))
-    for c in 1:NC
-        push!(full.args, :($(Symbol(:a, c)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz), xc, $(Symbol(:a, c)))))
+    for u in 1:U
+        push!(full.args, :($(Symbol(:xc, u)) = vload($V, xp + (i + $((u - 1) * W)) * $sz)))
+    end
+    for c in 1:NC, u in 1:U
+        push!(
+            full.args,
+            :($(Symbol(:a, c, :_, u)) = muladd(
+                vload($V, Ab + (i + $((u - 1) * W) + $(c - 1) * lda) * $sz), $(Symbol(:xc, u)),
+                $(Symbol(:a, c, :_, u))
+            ))
+        )
     end
     push!(
         body.args, :(
-            nfull = m - rem(m, $W); i = 0; while i < nfull
-                $full; i += $W
+            nfull = m - rem(m, $(U * W)); i = 0; while i < nfull
+                $full; i += $(U * W)
             end
         )
     )
+    # U>1 leaves up to U-1 whole W-chunks before the masked tail — sweep them at U=1 shape.
+    if U > 1
+        one_ = quote end
+        push!(one_.args, :(xc1 = vload($V, xp + i * $sz)))
+        for c in 1:NC
+            push!(one_.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz), xc1, $(Symbol(:a, c, :_, 1)))))
+        end
+        push!(
+            body.args, :(
+                n1 = m - rem(m, $W); while i < n1
+                    $one_; i += $W
+                end
+            )
+        )
+    end
     rmd = quote end
     push!(rmd.args, :(msk = lanes < (m - i)))
-    push!(rmd.args, :(xc = vload($V, xp + i * $sz, msk)))
+    push!(rmd.args, :(xcm = vload($V, xp + i * $sz, msk)))
     for c in 1:NC
-        push!(rmd.args, :($(Symbol(:a, c)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz, msk), xc, $(Symbol(:a, c)))))
+        push!(rmd.args, :($(Symbol(:a, c, :_, 1)) = muladd(vload($V, Ab + (i + $(c - 1) * lda) * $sz, msk), xcm, $(Symbol(:a, c, :_, 1)))))
     end
     push!(
         body.args, :(
@@ -463,9 +497,11 @@ end
         )
     )
     for c in 1:NC
+        acc = Symbol(:a, c, :_, 1)                      # fold the chunk accumulators, then reduce
+        red = U == 1 ? :($acc) : foldl((p, u) -> :($p + $(Symbol(:a, c, :_, u))), 2:U; init = :($acc))
         st = B0 ? :(unsafe_store!(yp, α * sc, $c)) :
             :(unsafe_store!(yp, muladd(β, unsafe_load(yp, $c), α * sc), $c))
-        push!(body.args, :(sc = sum($(Symbol(:a, c))); $st))
+        push!(body.args, :(sc = sum($red); $st))
     end
     push!(body.args, :(return nothing))
     return body
@@ -528,6 +564,16 @@ end
 # silicon and is not derivable (the `_ger_np` shape). See the routing note in `_gemv_t_simd!` for why
 # the existing Zen4 NC sweep does not settle this.
 const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
+# m-unroll for the blocked gemv-T kernel. DERIVED cap: NC·U accumulators + U x-vectors + ~2 temps must
+# fit `_NVREG`. At the shipped NC=4 that gives U ≤ 4 on AVX-512 (24 regs) and U ≤ 2 on AVX2 (14).
+@inline _gemvt_u_max(nc::Int) = (u = 4; while u > 1 && nc * u + u + 2 > _NVREG; u ÷= 2; end; u)
+const _GEMVT_U_PREF = @load_preference("gemvt_u", nothing)
+const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default until the gate says move it
+# Runtime-resolved so the force hook can reach it (a const is baked at load and cannot be forced).
+@inline function _gemvt_u()
+    f = _force_knob("gemvt_u")
+    return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
+end
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 @static if isnothing(_GEMVT_NC_PREF)
     function _measure_gemvt_nc()::Int
@@ -615,7 +661,7 @@ const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
                     s = time_ns()
                     j = 0
                     while j + 4 <= n
-                        _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true))
+                        _gemv_t_block!(py + j * sz, pA + j * ld * sz, ld, px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U))
                         j += 4
                     end
                     e = time_ns() - s; r > 0 && (tbs[r] = e)
@@ -659,11 +705,11 @@ function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where
         j = 0
         while j + nc <= n
             if nc >= 16
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
             elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true))  # req8-ok: candidate arm
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U))  # req8-ok: candidate arm
             end
             j += nc
         end
@@ -729,19 +775,20 @@ end
         # DERIVED from the register file. This does NOT re-open the sweep's finding: that measured Zen4
         # cells which route per-column, on one box.
         j = 0
-        nc = _gemvt_nc()
-        while blk && j + nc <= n
-            if nc >= 16
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(B0))  # req8-ok: candidate arm
-            elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(B0))  # req8-ok: candidate arm
+        # NC is FIXED AT 4 — falsified as a lever on every box (tables in `_measure_gemvt_nc`). The live
+        # parameter is the m-unroll U, resolved at runtime so `PUREBLAS_FORCE_gemvt_u` can force it
+        # through this real entry path; a compile-time const cannot be forced, which is how the first
+        # attempt at this experiment silently measured U=1 three times.
+        u = _gemvt_u()
+        while blk && j + 4 <= n
+            p = yptr + j * sz; q = Aptr + j * lda * sz
+            if u >= 4
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(4))  # req8-ok: candidate arm
+            elseif u >= 2
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(2))  # req8-ok: candidate arm
             else
-                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))  # req8-ok: candidate arm
+                _gemv_t_block!(p, q, lda, xptr, m, α, β, Val(4), Val(B0), Val(1))  # req8-ok: candidate arm
             end
-            j += nc
-        end
-        while blk && j + 4 <= n            # mid-remainder when nc > 4: one NC=4 block
-            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))  # req8-ok: candidate arm
             j += 4
         end
         @inbounds while j < n           # remainder columns: per-column dot
@@ -1322,9 +1369,9 @@ end
     end
     cfg = _cgemvt_cfg()
     if _cgemvt_fits(8, true) && cfg == 108
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true), Val(_GEMVT_U))    # req8-ok: candidate arm
     elseif cfg == 104
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true), Val(_GEMVT_U))    # req8-ok: candidate arm
     elseif cfg == 2
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(2), Val(false))   # req8-ok: candidate arm
     end
