@@ -987,6 +987,25 @@ const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
 else
     @inline _gemvt_deep_on() = _GEMVT_DEEP_PREF::Bool
 end
+# ── FLEET VALIDATION (req#8b: a derived formula must reproduce the measured optimum on the known
+# fleet before it is trusted to extrapolate). All arms SAME RUN so every cell is adjudicable; the
+# reference cancels. gemvT vs AOCL, derived shape ON vs OFF (`PUREBLAS_FORCE_gemvt_deep=0`):
+#                  n=64          n=128         n=256      | n>=512 (predicate FALSE)
+#   Zen5  OFF     0.977         0.820         0.743       |  drift <= 3.5%
+#         ON      1.098         1.055         1.065       |
+#   Zen4  OFF     0.964         1.035         0.990       |  drift <= 2.0%
+#         ON      1.114         1.038         0.996       |
+#   Zen3  OFF     1.071         1.078         1.031       |  drift <= 2.3%
+#         ON      1.366         1.052         1.023       |
+# Every box gains at n=64; Zen5 gains 29% and 43% at 128/256 and now PASSES EVERY SIZE (its n=256 was
+# 0.750, the worst gemv-T cell on the fleet). Zen3 gives back 1-2% at 128/256, inside the 3-4% band
+# that box shows — neither a win nor a loss that can be claimed.
+# THE CHECK THAT MATTERS IS THE RIGHT-HAND COLUMN: every out-of-window cell is unchanged on every box.
+# That is what says the predicate selects on the right physical quantity instead of coincidentally
+# helping — a formula that also moved n>=512 would be doing something other than what it claims.
+# Caution for whoever reads these numbers next: Zen4 n=2048 read 0.921 with the shape ON and 1.030
+# with it OFF, on a code path the predicate makes IDENTICAL. That is run-to-run noise, not a miss, and
+# it sizes the band on that cell at ~10%.
 @inline function _gemvt_deep(::Type{T}, m::Int, n::Int) where {T}
     return _gemvt_deep_on() &&
         m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
