@@ -627,9 +627,21 @@ const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
             # More chains make n=128 and n=256 SLIGHTLY WORSE, monotonically. The "native-512 Zen5 has
             # twice the 512-bit FMA throughput so 4 dependent chains starve it" model predicted the
             # opposite and is dead. NC=4 is right on every box and every size that matters.
-            # The remaining structural delta vs AOCL's kernel is therefore the M-UNROLL (it does 32 rows
-            # per iteration in 4 chunks of 8, one x-load per 8 FMAs; we do W rows with no unroll), NOT
-            # the column count — that is the next hypothesis, and it is untested.
+            # ⚠⚠ AND THE M-UNROLL IS FALSIFIED TOO (2026-08-08, Zen5, forced through the real entry
+            # path, ENV-overhead bug fixed first so U=1 reproduces the baseline):
+            #     n=      64     128    256     512     1024    2048    4096
+            #   U=1     0.951  0.856  0.728   0.996   1.014   0.974   1.040
+            #   U=2     0.953  0.851  0.726   1.017   1.034   0.973   1.053
+            #   U=4     1.042  0.853  0.721   1.009   0.993   0.983   1.044
+            # Dead flat at the two cells that matter. BOTH structural deltas vs AOCL's dgemv-T — the
+            # column count AND the m-unroll — are now measured and neither is the mechanism. The Zen5
+            # n=128/256 deficit is NOT in this loop's shape.
+            # What has NOT been tested: whether the blocked kernel should run AT ALL there. The
+            # blocked-vs-per-column routing (`_gemvt_perscan`, this file) sends A <= L2 to BLOCKED
+            # unconditionally, and that assumption was measured on Zen4. The per-column arm
+            # (`_dot_simd` per column) is right there in the remainder loop and is not currently
+            # reachable at A <= L2 on any box. THAT is the next experiment: make the residency arm of
+            # the routing forceable and try per-column at n=128/256 on Zen5.
             return 4                                               # req8-ok: gate-measured incumbent
             # (unreachable while the duel is disabled; kept so the candidate arms stay compiled+tested)
             for c in (16, 8)                                       # widest-effect first
