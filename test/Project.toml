@@ -27,6 +27,21 @@ ger_panel_np = 4
 # alloc-freeness, not perf -- and pinning is legitimate here precisely because the CI runner is known
 # hardware; real users on unknown hardware still auto-measure.
 gemvt_perscan = false
+# AND the gemv-T COLUMN COUNT, which was missing and left the whole BLAS-2 dogfood item ERRORING.
+# `_measure_gemvt_nc`'s `@static if isnothing(pref)` branch keeps a `Base.OncePerProcess` tuner
+# reachable from `gemv!`, whose one-time init allocates; AllocCheck proves ALL paths, so one reachable
+# tuner reddens the entire item. A red item is worse than no item: it looks like coverage and proves
+# nothing. This gap let an allocation regression (an `ntuple` closure boxing in `_gemv_t_block!`'s
+# caller, 28x on the Zen5 gate) reach master through a guard that was *designed* to catch exactly it.
+# 4 is the shipping value; the dogfood checks alloc-freeness, not perf.
+gemvt_nc = 4
+# And the three FORCE-HOOK resolvers. These were the ones that actually kept the item red: unlike
+# `gemvt_nc` they built their `OncePerProcess` UNCONDITIONALLY, so a pin overrode the value but did not
+# remove the resolver from the all-paths proof. They are now `@static if isnothing(pref)`-gated, and
+# pinning here compiles them out entirely. Values are the shipping defaults.
+gemvt_u = 1
+gemvt_pf = 0
+trmv_fused_min = 1
 # Same again for the complex-axpy width decision: its OncePerProcess probe allocates a calibration
 # buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
 # the shipping path here); the dogfood checks alloc-freeness, not perf.

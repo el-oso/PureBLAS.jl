@@ -705,6 +705,11 @@ const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default u
 # compressed the very U differences the experiment existed to resolve. Small-n BLAS-2 amortizes a
 # per-call dictionary lookup over very little work — the same class as the kwarg-overhead finding in
 # kb/findings/pureblas-gemv.md, where ~200 ns of calling convention dominated a 33 ns kernel.
+# ⚠ GATED ON THE PIN, not merely overridden by it. Unpinned, this `OncePerProcess` stays
+# reachable from the `gemv!`/`trmv!` @strict_contract, whose AllocCheck proof is ALL-PATHS, and its
+# one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
+# build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
+@static if isnothing(_GEMVT_U_PREF)
 const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
     f = _force_knob("gemvt_u")
     # `PUREBLAS_FORCE_gemvt_u=0` selects the REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`).
@@ -714,6 +719,9 @@ const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
     return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
 end
 @inline _gemvt_u() = _GEMVT_U_ONCE()
+else
+@inline _gemvt_u() = _GEMVT_U_PREF::Int
+end
 # ── gemv-T A-stream software prefetch distance (bytes; 0 = off) ─────────────────────────────────────
 # The prefetch is a HINT (llvm.prefetch): architecturally non-faulting on x86, so reading past the end
 # of A is safe and needs no guard page (unlike the masked direct-B loads).
@@ -741,11 +749,19 @@ const _GEMVT_PF_PREF = @load_preference("gemvt_pf", nothing)
 const _GEMVT_PF = something(_GEMVT_PF_PREF, 0)::Int   # req8-ok: shipped default until the gate says move it
 # Resolved ONCE PER PROCESS, never per call — an ENV lookup in this hot path is itself a regression
 # (it cost Zen5 gemvT n=64 0.959 -> 0.767 with the value unchanged; see `_GEMVT_U_ONCE`).
+# ⚠ GATED ON THE PIN, not merely overridden by it. Unpinned, this `OncePerProcess` stays
+# reachable from the `gemv!`/`trmv!` @strict_contract, whose AllocCheck proof is ALL-PATHS, and its
+# one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
+# build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
+@static if isnothing(_GEMVT_PF_PREF)
 const _GEMVT_PF_ONCE = Base.OncePerProcess{Int}() do
     f = _force_knob("gemvt_pf")
     return f >= 0 ? f : _GEMVT_PF
 end
 @inline _gemvt_pf() = _GEMVT_PF_ONCE()
+else
+@inline _gemvt_pf() = _GEMVT_PF_PREF::Int
+end
 
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 @static if isnothing(_GEMVT_NC_PREF)
@@ -926,6 +942,40 @@ end
 @inline _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}) where {T <: BlasReal, B0} =
     _gemv_t_simd!(m, n, α, A, x, β, y, b0, !_gemvt_perscan(m, n, T))
 
+# ── gemv-T PANEL SHAPE (NC columns × U row-chunks) — DERIVE tier, no measurement ─────────────────────
+#
+# gemv-T has ZERO reuse of A: every element is read once, so the kernel is a pure streaming problem and
+# the only question is how many 64 B lines it can keep in flight. Two detected constants fix the shape.
+#
+# 1. WHEN the deep shape is needed — L2 RESIDENCY. While A is served from L2 the fill path, not the
+#    memory system, sets the rate, and covering the L2→L1 latency needs many lines named per loop body.
+#    Once A exceeds L2 the memory system is the limit, extra concurrent streams stop paying, and the
+#    narrow shape (fewer live registers, shorter epilogue) is better. Predicate: `m·n·sizeof(T) ≤ _L2_BYTES`.
+# 2. HOW deep it may go — THE REGISTER FILE. The folded kernel holds NC accumulators + U x-vectors +
+#    ~2 temps, so the deep shape is legal iff `NC + U + 2 ≤ _NVREG`. This is what makes the choice
+#    adapt instead of being a per-µarch table: AVX-512 (32) admits 8×4; AVX2 (16) does not admit the
+#    pair at full depth and falls back by the same inequality, which is also what Zen3 measured
+#    (U=2 neutral, register-preload actively harmful there).
+#
+# WHY THIS IS A DERIVATION AND NOT A FIT. The rate is set by lines-in-flight vs fill latency, and both
+# bounds above are inequalities over detected constants — nothing here is a tuned number. The measured
+# Zen5 pure-load surface (bench/probes/l2_indep_streams.jl, L2-resident, startup subtracted) is the
+# VALIDATION of the formula, not its source:
+#     streams×burst   1×1    2×1    4×1    8×1    8×2    8×4    4×4
+#     B/cy           21.4   33.7   34.0   34.6   35.1   47.3   35.3
+# Only the 8×4 corner clears the plateau, and it needs BOTH legs — which is exactly why NC alone and U
+# alone each measured dead, and why the NC=8×U=4 PAIR also measured dead until the LSR address chain
+# was removed (see `_gemv_t_block!`): before that, "8 streams" was 4 streams plus a dependency.
+#
+# `_NVREG` and `_L2_BYTES` are compile-time consts, so this const-folds to a branch on m·n and stays
+# trim-safe — and, unlike the `OncePerProcess` tuner it replaces, it allocates nothing, which is what
+# keeps `gemv!`'s all-paths @noalloc contract provable.
+@inline function _gemvt_deep(::Type{T}, m::Int, n::Int) where {T}
+    return m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
+end
+const _GEMVT_NC_DEEP = 8      # one x-load per 8 FMAs: the load:FMA ratio that clears the plateau
+const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines named, enough to cover L2
+
 # `blk`-explicit entry: `true` forces the NC=4 blocked kernel regardless of `_gemvt_perscan`.
 # Exists for callers whose regime the perscan probe does NOT represent — the probe measures a CLEAN
 # standalone sweep, but `_laqps!`'s F-build re-sweeps the SAME trailing block once per panel column;
@@ -1054,7 +1104,22 @@ end
         # (2) `pf > 0` takes priority inside `_gemvt_cols!` and pins U to 1 — so a forced prefetch
         #     distance cannot be combined with an unroll. The prefetch arm is falsified, so this is
         #     left as-is deliberately; do not read a `pf=… u=4` run as having tested both.
-        u = _gemvt_u(); pf = _gemvt_pf(); nc = _gemvt_nc()
+        # DERIVED shape first (see `_gemvt_deep`). The force hooks below remain ONLY as instrument
+        # arms; in a pinned build their resolvers are compiled out entirely, so the shipping path is
+        # this branch plus a const-folded comparison on m*n.
+        u0 = _gemvt_u(); pf0 = _gemvt_pf(); nc0 = _gemvt_nc()
+        if _gemvt_deep(T, m, n) && nc0 == 4 && u0 == 1 && pf0 == 0
+            jd = !blk ? 0 : _gemvt_cols!(Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
+                                        yptr, Aptr, xptr, lda, m, n, α, β, sz)
+            @inbounds while jd < n
+                sd = _dot_simd(m, Aptr + jd * lda * sz, xptr, T)
+                yjd = unsafe_load(yptr, jd + 1)
+                unsafe_store!(yptr, (B0 ? zero(T) : β * yjd) + α * sd, jd + 1)
+                jd += 1
+            end
+            return y
+        end
+        u = u0; pf = pf0; nc = nc0
         j = !blk ? 0 :
             nc >= 16 ? _gemvt_cols!(Val(16), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz) :  # req8-ok: candidate arm
             nc >= 8 ? _gemvt_cols!(Val(8), Val(B0), u, pf, yptr, Aptr, xptr, lda, m, n, α, β, sz) :  # req8-ok: candidate arm
@@ -2761,12 +2826,21 @@ const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
 # a BLAS-2 hot path is itself a regression — the gemv-T m-unroll instrument cost Zen5 gemvT n=64
 # 0.959 -> 0.767 with the value unchanged (see `_GEMVT_U_ONCE` above, whose shape this mirrors exactly,
 # including being reachable from `trmv!`'s all-paths @noalloc proof). Pin wins over force (PDM: P first).
+# ⚠ GATED ON THE PIN, not merely overridden by it. Unpinned, this `OncePerProcess` stays
+# reachable from the `gemv!`/`trmv!` @strict_contract, whose AllocCheck proof is ALL-PATHS, and its
+# one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
+# build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
+@static if isnothing(_TRMV_FUSED_MIN_PREF)
 const _TRMV_FUSED_MIN_ONCE = Base.OncePerProcess{Int}() do
-    something(_TRMV_FUSED_MIN_PREF, _force_knob("trmv_fused_min"))
+    _force_knob("trmv_fused_min")
+end
+@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_ONCE()
+else
+@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_PREF::Int
 end
 # < 0 (the unset sentinel from `_force_knob`) ⇒ the derived default.
 @inline function _trmv_fused_min(::Type{T}) where {T}
-    f = _TRMV_FUSED_MIN_ONCE()
+    f = _trmv_fused_min_raw()
     f >= 0 && return f
     # ⚠ FUSED8 AT EVERY n. The old default (`max(_TRI_NB, isqrt(_L2_BYTES ÷ (2·sizeof(T)))) + 1`) sent
     # small n to the unblocked `_trmv_simd!`, and that cut was A/B'd on 2026-07-31 (f552f13) — a DAY
