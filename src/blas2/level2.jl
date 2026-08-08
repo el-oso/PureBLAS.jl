@@ -2494,6 +2494,35 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # few off-diagonal calls at mid n). y_I += α·Avᵀ·xv  (β=1 accumulate).
 @inline _tri_scatT!(yv, Av, xv, α) = _gemv_t_simd!(size(Av, 1), size(Av, 2), α, Av, xv, one(α), yv, Val(false))
 
+# ── real trmv: the n at which `_trmv_simd!` hands over (to `_trmv_fused8!` for N, blocked for T) ─────
+# DERIVE tier (cache residency), and BYTE-IDENTICAL to the predicate it replaces — see the block comment
+# inside `_trmv_blk!` for the A/B that fixed the criterion at HALF L2:
+#     n <= NB || 2·n²·sizeof(T) <= _L2_BYTES   ⟺   n <= max(_TRI_NB, isqrt(_L2_BYTES ÷ (2·sizeof(T))))
+# (n integer ⇒ n² <= L2/(2s) ⟺ n² <= L2 ÷ (2s) ⟺ n <= isqrt(L2 ÷ (2s)); exact, no float.)
+# Fleet: L2 = 1 MiB ⇒ 257 for Float64 / 363 for Float32 (Zen4 wintermute, Zen5 neuromancer);
+#        L2 = 512 KiB ⇒ 182 / 257 (Zen3 galen). `_TRI_NB` (=64 fleet-wide) is the floor.
+#
+# WHY IT IS A KNOB AND NOT JUST THE FORMULA: the A/B that validated this crossover (f552f13, 2026-07-31)
+# PREDATES `_trmv_fused8!` (447c46a, 2026-08-01). Below the threshold the loser was the OLD blocked
+# diagonal+tall-scatter structure, which no longer exists on the N path — so the n ≤ threshold side has
+# never been re-litigated against the fused kernel. `PUREBLAS_FORCE_trmv_fused_min=0` runs fused8 at every
+# n, a huge value runs `_trmv_simd!` at every n, and the crossover can be swept without editing source.
+const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
+# Resolved at RUNTIME so the force hook can reach it (a const is baked at load/precompile and cannot be
+# forced), but ONCE PER PROCESS, never per call: `_force_knob` reads ENV, and an ENV dictionary lookup in
+# a BLAS-2 hot path is itself a regression — the gemv-T m-unroll instrument cost Zen5 gemvT n=64
+# 0.959 -> 0.767 with the value unchanged (see `_GEMVT_U_ONCE` above, whose shape this mirrors exactly,
+# including being reachable from `trmv!`'s all-paths @noalloc proof). Pin wins over force (PDM: P first).
+const _TRMV_FUSED_MIN_ONCE = Base.OncePerProcess{Int}() do
+    something(_TRMV_FUSED_MIN_PREF, _force_knob("trmv_fused_min"))
+end
+# < 0 (the unset sentinel from `_force_knob`) ⇒ the derived default.
+@inline function _trmv_fused_min(::Type{T}) where {T}
+    f = _TRMV_FUSED_MIN_ONCE()
+    f >= 0 && return f
+    return max(_TRI_NB, isqrt(_L2_BYTES ÷ (2 * sizeof(T)))) + 1
+end
+
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
@@ -2516,7 +2545,8 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
     # blocking pays from n≈192 there, because trsv's per-column path carries the serial substitution
     # dependency and is latency-bound, so offloading the off-diagonal to gemv repays much earlier.
     # Two routines, one shape, different crossovers — do not unify them.
-    (n <= NB || 2 * n * n * sizeof(eltype(A)) <= _L2_BYTES) && return _trmv_simd!(up, tr, unit, n, A, x)
+    # Same predicate, hoisted into `_trmv_fused_min` so it is forceable — see the note above it.
+    n < _trmv_fused_min(eltype(A)) && return _trmv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
     # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1

@@ -169,6 +169,22 @@ end
     end
 end
 
+# `_trmv_fused_min` hoisted trmv's unblocked-vs-fused8 predicate out of `_trmv_blk!` so the crossover is
+# forceable (PUREBLAS_FORCE_trmv_fused_min). The whole point is that the SHIPPED routing is byte-identical
+# to the predicate it replaced — assert that directly rather than hope, over every n the routine can see.
+@testitem "trmv fused-vs-unblocked threshold == the predicate it replaced" begin
+    using PureBLAS
+    NB = PureBLAS._TRI_NB
+    L2 = PureBLAS._L2_BYTES
+    # Skip under a deliberate override — a forced/pinned sweep must not read as a red suite.
+    forced = !isnothing(PureBLAS._TRMV_FUSED_MIN_PREF) || haskey(ENV, "PUREBLAS_FORCE_trmv_fused_min")
+    @testset "$T" for T in (Float32, Float64)
+        fmin = PureBLAS._trmv_fused_min(T)
+        @test forced || fmin == max(NB, isqrt(L2 ÷ (2 * sizeof(T)))) + 1
+        @test forced || all(n -> (n <= NB || 2 * n * n * sizeof(T) <= L2) == (n < fmin), 1:16384)
+    end
+end
+
 @testitem "trmv/trsv strided + round-trip + AD + dim" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra, ForwardDiff
     import LinearAlgebra.BLAS as B
