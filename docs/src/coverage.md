@@ -215,45 +215,45 @@ html.dark .pbg-key{color:#98a1b3}
 
 ## LAPACK — factorizations & solves
 
-| Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
-|---|---|---|---|---|---|---|
-| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.08 | 1.48 / 1.08 | 1.63 / 1.12 |
-| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 1.03 | 1.48 / 1.11 | 1.44 / 1.03 |
-| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.903** | 2.75 / 0.972 | 1.16 / 0.903 |
-| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | 1.02 | 1.47 / 1.02 | 1.36 / 1.14 |
-| LU | getrf, gesv | s/d/c/z | ✅ | **0.993** | 1.36 / 1.04 | 1.7 / 0.993 |
-| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.956** | 1.19 / 1.09 | 1.06 / 0.956 |
-| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.955** | 1.93 / 1.51 | 1.54 / 0.955 |
-| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.01 | 1.32 / 1.12 | 1.18 / 1.01 |
-| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1.02 | 1.41 / 1.02 | 1.42 / 1.03 |
-| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.31 | 1.68 / 1.45 | 2.06 / 1.31 |
-| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | 1.01 | 1.23 / 1.01 | 1.19 / 1.03 |
-| Least-squares | gels | s/d/c/z | ✅ | 1.27 | 2.49 / 1.97 | 1.92 / 1.27 |
-| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.06 | 1.22 / 1.11 | 1.16 / 1.06 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.26 | 1.35 / 1.3 | 1.39 / 1.26 |
+| Op | Routines | Types | Routes | Zen4 | Zen3 | Zen5 | Zen4 vs OB geo/worst | Zen4 vs AOCL geo/worst |
+|---|---|---|---|---|---|---|---|---|
+| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.08 | 1.03 | **0.99** | 1.48 / 1.08 | 1.63 / 1.12 |
+| Cholesky (upper) | potrf `uplo='U'` [^upper] | s/d/c/z | ✅ | 1.03 | 1.06 | **0.975** | 1.48 / 1.11 | 1.44 / 1.03 |
+| Cholesky solve | potrs [^solv] | s/d/c/z | ✅ | **0.903** | **0.945** | **0.853** | 2.75 / 0.972 | 1.16 / 0.903 |
+| Pivoted Cholesky | pstrf [^ps] | s/d/c/z | ✅ | 1.02 | **0.989** | **0.952** | 1.47 / 1.02 | 1.36 / 1.14 |
+| LU | getrf, gesv | s/d/c/z | ✅ | **0.993** | **0.961** | 1.01 | 1.36 / 1.04 | 1.7 / 0.993 |
+| LU solve | getrs [^solv] | s/d/c/z | ✅ | **0.956** | **0.757** | **0.764** | 1.19 / 1.09 | 1.06 / 0.956 |
+| QR | geqrf, orgqr, ormqr | s/d/c/z | ✅ | **0.955** | 1.05 | **0.971** | 1.93 / 1.51 | 1.54 / 0.955 |
+| Pivoted QR | geqp3 [^unblk] | s/d/c/z | ✅ | 1.01 | 1.11 | 1.02 | 1.32 / 1.12 | 1.18 / 1.01 |
+| Bunch–Kaufman | sytrf, hetrf [^bk] | s/d/c/z | ✅ | 1.02 | 1.04 | 1.04 | 1.41 / 1.02 | 1.42 / 1.03 |
+| Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.31 | 1.44 | 1.4 | 1.68 / 1.45 | 2.06 / 1.31 |
+| Triangular solve | trtrs [^solv] | s/d/c/z | ✅ | 1.01 | 1.03 | 1 | 1.23 / 1.01 | 1.19 / 1.03 |
+| Least-squares | gels | s/d/c/z | ✅ | 1.27 | 1.32 | 1.26 | 2.49 / 1.97 | 1.92 / 1.27 |
+| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.06 | 1.08 | 1.05 | 1.22 / 1.11 | 1.16 / 1.06 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.26 | 1.17 | 1.12 | 1.35 / 1.3 | 1.39 / 1.26 |
 
 ## LAPACK — SVD
 
 `gesvd`/`gesdd` appear in the factorizations table above (gating). The remaining SVD rows are not yet gated:
 
-| Op | Routines | Types | Routes | Gated |
-|---|---|---|---|---|
-| SVD complex | gesvd, gesdd (z/c) | c/z | ✅ | ⏳ |
-| Generalized SVD | ggsvd, ggsvd3 | s/d/c/z | ✅ (rank-deficient) | ⏳ |
+| Op | Routines | Types | Routes | Zen4 | Zen3 | Zen5 |
+|---|---|---|---|---|---|---|
+| SVD complex | gesvd, gesdd (z/c) | c/z | ✅ | | | ⏳ |
+| Generalized SVD | ggsvd, ggsvd3 | s/d/c/z | ✅ (rank-deficient) | | | ⏳ |
 
 ## LAPACK — eigensolvers
 
-| Op | Routines | Types | Routes | Gated |
-|---|---|---|---|---|
-| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, ormtr | s/d/c/z | ✅ | 1.26 |
-| Symmetric / Hermitian (values only) | syev, sterf | s/d/c/z | ✅ | 1.26 |
-| Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | ⏳ |
-| Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | ⏳ |
-| Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | ⏳ |
-| Schur | gees | s/d/c/z | ✅ | ⏳ |
-| Generalized nonsym (QZ) | ggev, gges, gghrd, hgeqz, tgevc | s/d/c/z | ✅ | ⏳ |
-| Schur reordering | trexc, trsen | s/d/c/z | ✅ | ⏳ |
-| Sylvester / Lyapunov | trsyl | s/d/c/z | ✅ | ⏳ |
+| Op | Routines | Types | Routes | Zen4 | Zen3 | Zen5 |
+|---|---|---|---|---|---|---|
+| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, ormtr | s/d/c/z | ✅ | 1.26 | 1.17 | 1.12 |
+| Symmetric / Hermitian (values only) | syev, sterf | s/d/c/z | ✅ | 1.26 | 1.17 | 1.12 |
+| Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | | | ⏳ |
+| Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | | | ⏳ |
+| Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | | | ⏳ |
+| Schur | gees | s/d/c/z | ✅ | | | ⏳ |
+| Generalized nonsym (QZ) | ggev, gges, gghrd, hgeqz, tgevc | s/d/c/z | ✅ | | | ⏳ |
+| Schur reordering | trexc, trsen | s/d/c/z | ✅ | | | ⏳ |
+| Sylvester / Lyapunov | trsyl | s/d/c/z | ✅ | | | ⏳ |
 
 **Symmetric / Hermitian eigensolver.** With eigenvectors (`jobz='V'`) it clears both references on
 the Zen4 sweep (1.32 / 1.25 vs OpenBLAS, 1.36 / 1.19 vs AOCL). **Values-only (`jobz='N'`) does not**:
@@ -269,18 +269,24 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 
 ## LAPACK — banded / tridiagonal / packed
 
-| Op | Routines | Types | Routes | Gated | vs OB geo/worst | vs AOCL geo/worst |
-|---|---|---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.724** | 1.48 / 0.96 | 1.21 / 0.724 |
-| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 1 | 1.34 / 1 | 1.27 / 1.03 |
-| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.992** | 1.38 / 1.13 | 1.07 / 0.992 |
-| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 1.03 | 1.56 / 1.12 | 1.42 / 1.03 |
-| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.788** | 1.06 / 0.903 | 1.9 / 0.788 |
+| Op | Routines | Types | Routes | Zen4 | Zen3 | Zen5 | Zen4 vs OB geo/worst | Zen4 vs AOCL geo/worst |
+|---|---|---|---|---|---|---|---|---|
+| General banded LU | gbtrf, gbtrs [^gb] | s/d/c/z | ✅ | **0.724** | **0.954** | **0.725** | 1.48 / 0.96 | 1.21 / 0.724 |
+| General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 1 | 1 | **0.999** | 1.34 / 1 | 1.27 / 1.03 |
+| SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.992** | **0.989** | **0.989** | 1.38 / 1.13 | 1.07 / 0.992 |
+| Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | 1.03 | **0.872** | **0.964** | 1.56 / 1.12 | 1.42 / 1.03 |
+| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.788** | **0.822** | **0.832** | 1.06 / 0.903 | 1.9 / 0.788 |
 
 ### Fleet status
 
-The verdicts above are the **Zen4** sweep. Where Zen3/Zen5 have been measured they mostly agree; the
-known exceptions are banded Cholesky and complex `gemv`-T/C.
+**Every table on this page now carries one column per microarchitecture**, BLAS and LAPACK alike, each
+computed from that box's own sweep. A single pooled verdict was never the right shape: the gate is
+per box, so one number cannot express "gates on Zen4, misses on Zen3" — and pooling actively
+misreported rows (it once published banded Cholesky as 0.891 failing when Zen4 alone read 1.03). The
+`vs OB / vs AOCL geo/worst` columns remain scoped to Zen4 and are labelled as such.
+
+Where the boxes disagree the reason is usually the ISA, not the routine: see complex `gemv`-T/C
+above, and banded Cholesky below.
 
 **Complex `gemv`-T/C is an ISA split, and the Zen4-only table hides it.** Past L2 these route to a
 column-block whose width is chosen by a Measure-tier knob bounded by the register file:
@@ -297,8 +303,8 @@ the wide arm is kept there on both ISAs.
 
 **`pbtrf`** gates fully on **Zen4** (Float64, `kd = 32…384`, n ∈ {1024, 4096}, both triangles:
 1.02–3.28× AOCL, 1.49–2.00× OpenBLAS) and beats **OpenBLAS on all three µarchs**, but it does
-**not** yet clear AOCL fleet-wide. The table above shows it gating because that verdict is
-scoped to Zen4; on Zen3/Zen5 it would miss. Residuals are all `uplo='U'`
+**not** yet clear AOCL fleet-wide — which the per-box columns above now show directly instead of
+hiding behind a single Zen4 verdict. Residuals are all `uplo='U'`
 at mid bandwidth: Zen5 `kd=128/192/256/384` at 0.954–0.991, Zen3 `kd=128/160/192` at
 0.881–0.984 (plus `uplo='L'` `kd=160/192` at 0.959–0.995). Zen3 is the worst box and also the
 one whose `_pbtrf_ucross` bracket is derived from a narrower `_vwidth` (W=4 → the switch lands
@@ -316,7 +322,7 @@ routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
     via `Val{CJ}`, plus a loop swap that stopped the transpose reading `A` at a power-of-two `lda`)
     clears both references at every size on Zen4 (worst 1.11 vs OpenBLAS, 1.03 vs AOCL) and on Zen3
     (worst 1.06). The single residual is **Zen5 n=2048 at 0.972**; every other Zen5 size gates
-    (1.01–1.39). Per this page's convention the verdict is the Zen4 sweep, hence the gating band.
+    (1.01–1.39), which is why the Zen5 column reads below 1.0 while Zen4 and Zen3 gate.
 
 [^unblk]: **Blocked, and now gating.** `geqp3` used to be the worst routine in the real LAPACK
     surface: a BLAS-2 implementation racing a blocked BLAS-3 one, ratio degrading monotonically with
