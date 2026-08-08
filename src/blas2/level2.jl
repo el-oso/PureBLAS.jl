@@ -521,6 +521,65 @@ end
 #      `juliac/build.jl` for trim. Pinned there, the `@static if` compiles this branch out entirely and
 #      the all-paths proof sees only the shipping path. Auto-measurement remains the mechanism for real
 #      users on unknown hardware, which is the whole point of the Measure tier.
+# ── gemv-T blocked-kernel column count (NC) ─────────────────────────────────────────────────────────
+# Candidate set DERIVED from the register file: NC dot accumulators + the shared x vector + one A temp.
+# AVX-512 (_NVREG=32) → {4,8,16}; AVX2 (16) → {4,8}. The SELECTION is Measure tier: whether more chains
+# pay depends on 512-bit FMA throughput vs latency, which inverts between double-pumped and native-512
+# silicon and is not derivable (the `_ger_np` shape). See the routing note in `_gemv_t_simd!` for why
+# the existing Zen4 NC sweep does not settle this.
+const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
+const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
+@static if isnothing(_GEMVT_NC_PREF)
+    function _measure_gemvt_nc()::Int
+        Base.generating_output() && return 4                      # never burn a measure at precompile
+        _f = _force_knob("gemvt_nc"); _f >= 0 && return _f         # instrument only, see _force_knob
+        try
+            T = Float64
+            # PROBE IN THE BLOCKED REGIME THIS KNOB GOVERNS: square A at ~½L2, which is where the gate's
+            # missing cells live (n=128/256 → A = 128 KB/512 KB, both ≤ L2) and where the loop is
+            # compute-bound. Probing past L2 would measure a regime that routes per-column on Zen4 and is
+            # memory-bound everywhere — the axpy_band lesson: a probe where the arms tie cannot resolve.
+            n = _avoid_po2(max(32, isqrt(_L2_BYTES ÷ (2 * sizeof(T)))), _vwidth(T))
+            nb = 3
+            As = [fill(one(T), n, n) for _ in 1:nb]                # rotated: fresh draw per round
+            x = fill(one(T), n); y = fill(zero(T), n)
+            Ar = Ref(As[1]); rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
+            run(c) = _gemv_t_sweep_nc!(n, n, one(T), Ar[], x, zero(T), y, c)
+            inc() = run(4)
+            _REP_BUDGET_NS = 20_000_000   # req8-ok: measurement-precision budget, selects no kernel
+            nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
+            # ⚠⚠ THE DUEL IS DISABLED, AND THE GATE IS WHY. Measured 2026-08-08 on wintermute,
+            # freq-locked, all arms same-run, forcing each arm through the REAL entry path:
+            #     n=      64     128    256     512     1024    2048    4096
+            #   NC=4    1.024  1.026  0.978   1.162   1.207   1.043   1.102
+            #   NC=8    1.140  1.031  0.995   0.989   0.989   1.013   0.998
+            # NC=8 takes THREE passing cells to misses (512, 1024, 4096) and does not even close 256.
+            # This probe — square A at ~½L2, rotated operands, per-round medians, time-budgeted reps —
+            # nonetheless resolved 8 on this box. That is the THIRD knob today whose standalone probe
+            # ranked the arms against the gate (see the axpy_band post-mortem and `_cgemvt_cfg`), and the
+            # rule this project keeps re-learning is that a probe disagreeing with the gate is evidence
+            # about the PROBE. So the selection is off until a probe exists that reproduces the table
+            # above; the plumbing (candidate set, Val ladder, `PUREBLAS_FORCE_gemvt_nc`) stays, because
+            # forcing an arm through `bench/plots.jl` is how that table was produced in the first place.
+            # Do NOT re-enable this by "fixing" the probe's noise — fix its REGIME, then show it
+            # reproduces the gate ordering on at least two boxes.
+            return 4                                               # req8-ok: gate-measured incumbent
+            # (unreachable while the duel is disabled; kept so the candidate arms stay compiled+tested)
+            for c in (16, 8)                                       # widest-effect first
+                c in _GEMVT_NC_CANDIDATES || continue
+                _tune_wins_it(_tune_duel(inc, () -> run(c); reps = nrep, refresh = rot)) && return c  # req8-ok: candidate arm
+            end
+            return 4
+        catch
+            return 4
+        end
+    end
+    const _GEMVT_NC_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_nc)
+    @inline _gemvt_nc() = _GEMVT_NC_ONCE()
+else
+    @inline _gemvt_nc() = _GEMVT_NC_PREF::Int
+end
+
 const _GEMVT_PERSCAN_PREF = @load_preference("gemvt_perscan", nothing)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
     function _measure_gemvt_perscan()::Bool
@@ -578,6 +637,32 @@ end
 # in that repeated-sweep regime blocked won on Zen4 at EVERY size measured (in-context replay
 # 38 vs 30 GB/s at the n=2048 trailing shape; live geqp3 1.03-1.34x at n=256..2048) even though the
 # clean standalone probe ranks per-column ahead there (probe-regime-must-match-live).
+# Knob-free blocked gemv-T sweep at an explicit NC — what `_measure_gemvt_nc` duels. Kept separate from
+# `_gemv_t_simd!` so the harness exercises the SAME block kernel the shipped path uses, without the knob
+# lookup inside the timed region.
+function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where {T <: BlasReal}
+    GC.@preserve A x y begin
+        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        j = 0
+        while j + nc <= n
+            if nc >= 16
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(true))  # req8-ok: candidate arm
+            elseif nc >= 8
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(true))  # req8-ok: candidate arm
+            else
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(true))  # req8-ok: candidate arm
+            end
+            j += nc
+        end
+        @inbounds while j < n
+            s = _dot_simd(m, Aptr + j * lda * sz, xptr, T)
+            unsafe_store!(yptr, α * s, j + 1)
+            j += 1
+        end
+    end
+    return y
+end
+
 @inline function _gemv_t_simd!(
         m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
     ) where {T <: BlasReal, B0}
@@ -613,9 +698,37 @@ end
         # n=1024 cell (0.948 vs AOCL) by giving back others — a new tuning knob for a net wash. Left at 4.
         # NOTE this also retires the `_gemvt_nc` Measure-tier constant referenced in comments elsewhere
         # (e.g. banded_chol.jl): it was never implemented, and the measurement above says it should not be.
+        # ⚠ THE SWEEP ABOVE IS ZEN4-ONLY, AND ON ZEN4 THREE OF ITS FIVE COLUMNS ARE NOT LIVE. Re-read it
+        # against the routing: `_gemvt_perscan` is TRUE on Zen4, so n=512…2048 take the PER-COLUMN arm
+        # there — NC never applies. The cells where NC=8 actually loses on Zen4 are exactly the ones the
+        # blocked kernel does not run. Where blocked IS live on Zen4 (n=256, A ≤ L2) NC=8 WINS (+1.7%),
+        # and n=256 is Zen4's only gemvT miss (0.978).
+        # And perscan is FALSE on Zen5 and Zen3, so those boxes take blocked at EVERY size — a regime the
+        # sweep never covered. Zen5 is where this hurts: 0.863 at n=128 and 0.747 at n=256, the worst
+        # gemv cell on the fleet, both A ≤ L2 and both on this NC=4 kernel that Zen4 runs at 0.978.
+        # AOCL (disassembled 2026-08-08, `bli_dgemv_t_zen_int_avx512`): NC=8 accumulators, m unrolled ×4
+        # (32 rows/iteration, 1 x-load per 8 FMAs), no prefetch and no non-temporal stores anywhere in
+        # its 2.6 KB. Our NC=4 with no m-unroll is the whole structural delta. Native-512 Zen5 has twice
+        # Zen4's 512-bit FMA throughput, so 4 dependent chains cover Zen4's pipe and starve Zen5's —
+        # consistent with the collapse being confined to the compute-bound A ≤ L2 regime and recovering
+        # to 0.99–1.06 past L2 where memory hides it.
+        # So NC is Measure tier (it inverts across µarchs — the `_ger_np` shape), with the candidate set
+        # DERIVED from the register file. This does NOT re-open the sweep's finding: that measured Zen4
+        # cells which route per-column, on one box.
         j = 0
-        while blk && j + 4 <= n
-            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))
+        nc = _gemvt_nc()
+        while blk && j + nc <= n
+            if nc >= 16
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(16), Val(B0))  # req8-ok: candidate arm
+            elseif nc >= 8
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(8), Val(B0))  # req8-ok: candidate arm
+            else
+                _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))  # req8-ok: candidate arm
+            end
+            j += nc
+        end
+        while blk && j + 4 <= n            # mid-remainder when nc > 4: one NC=4 block
+            _gemv_t_block!(yptr + j * sz, Aptr + j * lda * sz, lda, xptr, m, α, β, Val(4), Val(B0))  # req8-ok: candidate arm
             j += 4
         end
         @inbounds while j < n           # remainder columns: per-column dot
