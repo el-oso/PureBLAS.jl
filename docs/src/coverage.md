@@ -24,8 +24,9 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   the other. A large win over a library that did not implement a routine is not evidence of speed
   (AOCL's packed Cholesky is ~6× slower than OpenBLAS's — near-reference code — so beating it there
   means little). Where a footnote gives numbers it names the reference.
-  Verdicts are from the **Zen4** sweep (`bench/plots.jl`, freq-locked); footnotes note fleet results
-  where Zen3/Zen5 have been measured.
+  Verdicts are **per microarchitecture** — every table carries a Zen4, Zen3 and Zen5 column, each from
+  that box's own `bench/plots.jl` sweep, freq-locked with the achieved clock verified and both
+  references measured in the same run. A cell is the worst size for that routine on that box.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
