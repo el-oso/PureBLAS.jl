@@ -987,25 +987,6 @@ const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
 else
     @inline _gemvt_deep_on() = _GEMVT_DEEP_PREF::Bool
 end
-# ── FLEET VALIDATION (req#8b: a derived formula must reproduce the measured optimum on the known
-# fleet before it is trusted to extrapolate). All arms SAME RUN so every cell is adjudicable; the
-# reference cancels. gemvT vs AOCL, derived shape ON vs OFF (`PUREBLAS_FORCE_gemvt_deep=0`):
-#                  n=64          n=128         n=256      | n>=512 (predicate FALSE)
-#   Zen5  OFF     0.977         0.820         0.743       |  drift <= 3.5%
-#         ON      1.098         1.055         1.065       |
-#   Zen4  OFF     0.964         1.035         0.990       |  drift <= 2.0%
-#         ON      1.114         1.038         0.996       |
-#   Zen3  OFF     1.071         1.078         1.031       |  drift <= 2.3%
-#         ON      1.366         1.052         1.023       |
-# Every box gains at n=64; Zen5 gains 29% and 43% at 128/256 and now PASSES EVERY SIZE (its n=256 was
-# 0.750, the worst gemv-T cell on the fleet). Zen3 gives back 1-2% at 128/256, inside the 3-4% band
-# that box shows — neither a win nor a loss that can be claimed.
-# THE CHECK THAT MATTERS IS THE RIGHT-HAND COLUMN: every out-of-window cell is unchanged on every box.
-# That is what says the predicate selects on the right physical quantity instead of coincidentally
-# helping — a formula that also moved n>=512 would be doing something other than what it claims.
-# Caution for whoever reads these numbers next: Zen4 n=2048 read 0.921 with the shape ON and 1.030
-# with it OFF, on a code path the predicate makes IDENTICAL. That is run-to-run noise, not a miss, and
-# it sizes the band on that cell at ~10%.
 @inline function _gemvt_deep(::Type{T}, m::Int, n::Int) where {T}
     return _gemvt_deep_on() &&
         m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
@@ -2987,46 +2968,23 @@ end
 # LARGEST update onto a per-column fallback. Anchoring the remainder in the FIRST panel instead puts
 # it exactly where the off-panel work is zero, so every panel that does off-panel work is full and
 # the ragged fallback disappears entirely (hence no `_axpy_simd!` branch here, unlike `_trsv_fused8!`).
-# The fused F=8 pass, lifted out so the eight column bases arrive as an OPAQUE TUPLE across a
-# @noinline boundary. Same fix and same reason as `_gemv_t_block!`: written inline, LLVM
-# loop-strength-reduction rebuilds `c0..c7` into a SERIAL chain —
-#     vfmadd231pd zmm8, zmm1, [r14 + rdx]
-#     add rdx, r14                          ← 7 deep, so stream k waits on stream k-1
-# and here it costs far more than it did in gemv-T: at n=4096 the triangle is 64 MiB, past L3 on every
-# box in the fleet, and achieved DRAM bandwidth is outstanding_misses · 64 B / latency. Serialising
-# eight addresses at a ~200-300 cycle latency caps the bandwidth directly. "DRAM-bound" was never a
-# reason to stop — it says the DRAM path sets the rate, not that we are extracting what it offers.
-# Hoisting the bases as loop-invariant locals does NOT survive LSR (measured on the gemv-T side); the
-# opaque call boundary is what keeps them in eight independent registers.
-#
-# TWO ACCUMULATORS, NOT ONE. The inline version folded all eight FMAs into a single `acc` — a
-# dependent chain 8 deep per row-chunk. Two halves halve that chain for one extra vector add per
-# chunk. This REASSOCIATES the sum over a panel's 8 columns; that is the same class of
-# reassociation the panel blocking already performs, but it is not bit-identical to the old order, so
-# do not expect old and new to agree to the last ulp.
-@noinline function _trmv_f8pass!(
-        cs::NTuple{8, Ptr{T}}, xp::Ptr{T}, bs::NTuple{8, Vec{W, T}}, off::Int, top::Int, ::Val{W}
-    ) where {T, W}
-    sz = sizeof(T)
-    yp = xp + off * sz
-    i = 0
-    @inbounds while i + W <= top
-        o = i * sz
-        a = muladd(bs[1], vload(Vec{W, T}, cs[1] + o), vload(Vec{W, T}, yp + o))
-        b = bs[2] * vload(Vec{W, T}, cs[2] + o)   # PLAIN MULTIPLY: an FMA against a zero addend
-                                                  # is the same op plus a materialised zero register
-        a = muladd(bs[3], vload(Vec{W, T}, cs[3] + o), a)
-        b = muladd(bs[4], vload(Vec{W, T}, cs[4] + o), b)
-        a = muladd(bs[5], vload(Vec{W, T}, cs[5] + o), a)
-        b = muladd(bs[6], vload(Vec{W, T}, cs[6] + o), b)
-        a = muladd(bs[7], vload(Vec{W, T}, cs[7] + o), a)
-        b = muladd(bs[8], vload(Vec{W, T}, cs[8] + o), b)
-        vstore(a + b, yp + o)
-        i += W
-    end
-    return i
-end
-
+# ⚠ THE LSR ADDRESS CHAIN IS *NOT* THE MECHANISM HERE — BUILT, MEASURED, REVERTED (2026-08-08).
+# This kernel has the same defect gemv-T had: LLVM rebuilds c0..c7 into a 7-deep serial `add` chain,
+# AND all eight FMAs fold into one accumulator (an 8-deep dependent chain). Both were fixed exactly as
+# in `_gemv_t_block!` — bases passed as an opaque NTuple across a @noinline boundary, column sum split
+# across two accumulators. Emitted code was verified optimal: 1 vmulpd + 7 vfmadd, eight INDEPENDENT
+# base registers, one add in the loop, chain depth 4.
+# It did not work. vs AOCL, before -> after, same methodology:
+#         n=64          n=128         n=256         n=4096
+#   Zen3  1.406→1.244   1.073→1.005   1.001→0.989   0.944→0.954
+#   Zen5  1.430→1.252   1.075→1.020   1.001→1.003   0.943→0.935
+# n=4096 — the whole target — did not move on either box, and n=64 lost ~12% on BOTH, same direction
+# and magnitude, which is too consistent to be drift: the @noinline boundary costs one call per panel
+# and at small n the fused pass is too short to amortise it.
+# CONCLUSION: the chain limits memory-level parallelism only where MLP is what binds. In gemv-T at L2
+# residency it was worth 43%; here at n=4096 it is worth nothing, so whatever caps trmv in the DRAM
+# regime is NOT address-generation concurrency. Do not re-apply this fix to trmv without first
+# identifying a mechanism that predicts a different outcome.
 @inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -3044,10 +3002,15 @@ end
                     b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
                     b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
                     b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
-                    i = _trmv_f8pass!(
-                        (c0, c1, c2, c3, c4, c5, c6, c7), xp,
-                        (b0, b1, b2, b3, b4, b5, b6, b7), 0, top, Val(W)
-                    )
+                    i = 0
+                    while i + W <= top
+                        o = i * sz; acc = vload(V, xp + o)
+                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                        vstore(acc, xp + o); i += W
+                    end
                     while i < top
                         s = unsafe_load(xp, i + 1)
                         for k in lo:hi
@@ -3077,12 +3040,16 @@ end
                     b2 = V(unsafe_load(xp, lo + 2)); b3 = V(unsafe_load(xp, lo + 3))
                     b4 = V(unsafe_load(xp, lo + 4)); b5 = V(unsafe_load(xp, lo + 5))
                     b6 = V(unsafe_load(xp, lo + 6)); b7 = V(unsafe_load(xp, lo + 7))
-                    yp = xp + hi * sz             # for the SCALAR TAIL only; the helper
-                                                  # derives its own from (xp, off)
-                    i = _trmv_f8pass!(
-                        (c0, c1, c2, c3, c4, c5, c6, c7), xp,
-                        (b0, b1, b2, b3, b4, b5, b6, b7), hi, rest, Val(W)
-                    )
+                    yp = xp + hi * sz
+                    i = 0
+                    while i + W <= rest
+                        o = i * sz; acc = vload(V, yp + o)
+                        acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
+                        acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
+                        acc = muladd(b4, vload(V, c4 + o), acc); acc = muladd(b5, vload(V, c5 + o), acc)
+                        acc = muladd(b6, vload(V, c6 + o), acc); acc = muladd(b7, vload(V, c7 + o), acc)
+                        vstore(acc, yp + o); i += W
+                    end
                     while i < rest
                         s = unsafe_load(yp, i + 1)
                         for k in lo:hi
