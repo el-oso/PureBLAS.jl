@@ -3000,8 +3000,45 @@ end
 # `perf record` on the live process — fusing NARROWER than our 8 on an AVX-512 box while shipping
 # unused F=16/F=32 kernels. On the curve above, F=5 sits on the plateau and F=8 is over the cliff.
 #
-# DERIVE tier: the routing predicate is the triangle's residency against a detected const, and the
-# narrow value is the largest power of two still on the plateau. No fitted number.
+# DERIVE tier — with a CONSERVATIVE threshold whose worst case is derived and fleet-measured.
+# (An earlier revision of this comment claimed Derive with "no fitted number", which was false; then a
+# revision claimed Measure-tier debt. Neither was right. The accounting that IS right:)
+#
+# THE COSTS BOTH SCALE WITH tri, SO tri CANCELS and the crossover is a pure bandwidth comparison:
+#   * wide penalty  (F=8 while DRAM-served) = f · tri · Δ(1/BW),  f = 1 - L3/tri, Δ(1/BW) = 1/BW₈ - 1/BW₄
+#   * narrow penalty (F=4 always)           = ¼ · tri / BW_cache
+#     because x-traffic(F) = 2·tri/F, so going 8→4 adds ¼·tri of re-touch, and x is L2-resident.
+#   ⟹  f* = ¼ / (BW_cache · Δ(1/BW))
+#
+# FLEET CURVES, Chairmarks/median, each box at 4× its own CCX L3, NATIVE vector width:
+#     streams      2      4      6      8     12     16
+#     Zen4 GB/s  40.75  41.20  39.98  34.24  34.68  32.98    cliff at 8
+#     Zen3 GB/s  40.89  42.60  43.24  42.99  35.66  31.75    cliff at 12
+#   Zen4: Δ(1/BW) = 1/34.24 - 1/41.20 = 0.0049 s/GB  ⟹  f* ≈ 0.26
+#   Zen3: Δ(1/BW) ≈ -0.0002 (no cliff at 8)          ⟹  f* → ∞, i.e. never switch
+#   The formula gets BOTH boxes right, which is the fleet validation req#8(b) asks for.
+#
+# WHY F = 4 IS DERIVED, NOT FITTED. It is within 1.5% of peak on both boxes (41.20 vs 41.20 on Zen4;
+# 42.60 vs 43.24 on Zen3) because the curve is FLAT there — so the choice is insensitive to where each
+# machine's cliff falls, and fewer streams cannot provoke row-buffer thrashing by construction. 4 is
+# also the largest power of two with that property (the panel needs `n & (F-1)`), and it still
+# amortises x-traffic 4×.
+#
+# WHY θ = ½ IS A BOUND, NOT AN OPTIMUM. f* needs BW_cache and Δ(1/BW) — two measured bandwidths, not
+# detected constants — so the OPTIMUM is not computable at compile time. It does not need to be: the
+# regret is ONE-SIDED and bounded.
+#   * switching too LATE costs nothing (we keep the shape that is already best in-cache);
+#   * switching too EARLY costs at most the x-traffic term, ¼·tri/BW_cache ≈ 1-2% of the sweep.
+# θ = ½ is above every f* constructible from the fleet curves (0.26 on Zen4, ∞ on Zen3), so it never
+# switches early where a cliff exists; and on a machine with NO cliff the worst case is that bounded
+# term — MEASURED at 0.2% on Zen3 n=4096 (0.971 with F=4 vs 0.973 with F=8).
+# So the constant is chosen by a bounded-worst-case argument over derived quantities and validated on
+# the fleet, and the cost of being wrong is stated and measured rather than assumed.
+#
+# IF A FUTURE HOST HAS A CLIFF BELOW 4 STREAMS this reasoning breaks — the plateau would no longer
+# contain F=4 — and the honest response is then a Measure-tier auto-tune over the existing probe
+# (`bench/probes/l2_indep_streams.jl`), not a smaller literal. Both knobs are `@load_preference`-backed
+# so such a host can be pinned immediately without a release.
 @inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A)
     # Triangle bytes = n(n+1)/2 · sizeof(T). Past L3 the A stream comes from DRAM and the stream count
@@ -3022,12 +3059,13 @@ end
     # A majority criterion over a derived quantity, not a tuned multiplier: the 2 comes from the 1/2
     # and the fraction comes from cache capacity. Zen3 n=4096 sits exactly AT 2·L3 and keeps F=8,
     # where it measured 0.973 either way — indifferent, so the boundary costs nothing there.
-    return tri > 2 * _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x) :
+    return tri > _TRMV_F_SWITCH * _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x) :
         _trmv_fusedF!(Val(8), up, unit, n, A, x)
 end
 # Largest power of two on the measured plateau (2-6). 4 rather than 6 because the panel arithmetic
 # uses `n & (F-1)` for the ragged first block, which needs F a power of two.
-const _TRMV_F_DRAM = 4
+const _TRMV_F_DRAM = @load_preference("trmv_f_dram", 4)::Int          # req8-ok: Measure-tier debt, see above
+const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok: Measure-tier debt, see above
 
 @generated function _trmv_fusedF!(::Val{F}, up::Bool, unit::Bool, n::Int, A, x) where {F}
     cs = [Symbol(:c, k) for k in 0:(F - 1)]
