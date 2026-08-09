@@ -16,6 +16,7 @@
 #                                                              #  its native Haswell kernels. On AMD MKL
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
+using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
 # Reference BLAS: OpenBLAS (default), Intel MKL (`mkl` arg), or AMD AOCL (`aocl` arg). Each package
 # LBT-forwards LinearAlgebra's BLAS+LAPACK to itself on load, so `B`/`LAPACK` below transparently measure
@@ -1353,7 +1354,88 @@ end
 # written. The A/B loses nothing, because the per-round output it is read from is printed either way.
 _forced_knobs() = sort([k for k in keys(ENV) if startswith(k, "PUREBLAS_FORCE_")])
 
+# ── ACTIVE PREFERENCES: the same hazard as PUREBLAS_FORCE_*, but persistent and invisible ────────────
+# A Preference pin overrides a Measure-tier auto-tune permanently, and `LocalPreferences.toml` is
+# GITIGNORED — so it shows in no diff, no review, and survives every `fleet_sync.sh` hard reset.
+#
+# This has now bitten twice, the second time for ten days after the first was "fixed":
+#   2026-07-30  `bench/LocalPreferences.toml` pinning `ger_panel_np = 1` found on wintermute AND galen.
+#               Removing it took wintermute ger n=2048 from 0.914 to 1.244.
+#   2026-08-09  the SAME pin was still live on neuromancer — never checked in that cleanup. Ten days of
+#               Zen5 ger/zgeru numbers went out through it, it falsified two source comments and a whole
+#               task premise ("Zen5 resolves _ger_np() = 1" — unpinned the box measures 8), and it
+#               laundered itself into a kb finding that later work then cited as a documented constant.
+#
+# `tune=` stamps the RESOLVED values, which is necessary but not sufficient: it cannot distinguish "8
+# because the tuner measured 8" from "8 because someone pinned it", and nobody diffs a header they have
+# no reason to suspect. So: enumerate the pins themselves and say so, loudly, at the top of every run.
+# Reported rather than refused — a pin is legitimate for calibration, and the trim build REQUIRES pins
+# for every Measure-tier knob. What is never legitimate is not knowing.
+# ⚠ DETECTION MUST USE THE RESOLVER, NOT A GUESS AT WHICH FILE. A first version of this walked the
+# ACTIVE PROJECT's LocalPreferences.toml/Project.toml only. That is not where Julia looks: Base's
+# `get_preferences` (loading.jl) merges the active project's workspace-to-root chain PLUS every entry of
+# `load_path()` — so under `--project=bench` a pin in `~/.julia/environments/v1.12/` is live and would
+# have been invisible to the check, i.e. the identical failure mode one directory over.
+# `Base.get_preferences(uuid)` returns exactly the merged set that the package will see; defaults live
+# in code and never in TOML, so anything it returns IS a pin. The file walk survives only to attribute
+# WHICH file, and is allowed to come up empty without weakening the verdict.
+const _PB_UUID = Base.UUID("cc9e14db-574f-4602-bf53-1167cc4b26d2")
+
+function _active_prefs()
+    merged = try
+        Base.get_preferences(_PB_UUID)
+    catch e
+        @warn "could not resolve preferences — treating as UNKNOWN, not as clear" exception = e
+        return ["<preference resolution failed>"]
+    end
+    isempty(merged) && return String[]
+    where = Dict{String, String}()
+    for dir in Base.load_path()
+        d = dirname(dir)
+        for (f, sect) in ((joinpath(d, "LocalPreferences.toml"), "PureBLAS"),
+                          (joinpath(d, "Project.toml"), "preferences"))
+            isfile(f) || continue
+            try
+                t = TOML.parsefile(f)
+                p = sect == "preferences" ? get(get(t, "preferences", Dict()), "PureBLAS", Dict()) :
+                    get(t, "PureBLAS", Dict())
+                p isa AbstractDict || continue
+                for k in keys(p)
+                    get!(where, String(k), f)
+                end
+            catch e
+                # NEVER silent: a parse failure here is the one thing this tool exists to not miss.
+                @warn "could not parse $f while attributing pins" exception = e
+            end
+        end
+    end
+    return sort(["$k = $v   ($(get(where, String(k), "source not located")))" for (k, v) in merged])
+end
+
+function _pref_check()
+    p = _active_prefs()
+    isempty(p) && return println("preference check: clear (no PureBLAS pin in $(dirname(Base.active_project())))")
+    @warn "PINNED PREFERENCES ARE ACTIVE — this run does NOT measure the shipped defaults for these \
+        knobs. A pin overrides its Measure-tier auto-tune silently and LocalPreferences.toml is \
+        gitignored, so nothing else will tell you.\n  " * join(p, "\n  ") *
+        "\nIf this is not deliberate calibration, clear them and re-run."
+    return nothing
+end
+
 function save_cache(path, groups)
+    # A PIN IS THE SAME CONDITION AS A FORCE VAR, ONLY PERSISTENT — and it is the one that actually did
+    # the damage, because the ten days of wrong Zen5 ger/zgeru numbers propagated through PUBLISHED
+    # CACHES, which a start-of-run @warn scrolled away by a 3-hour sweep does not touch. The two
+    # defences once offered for warn-not-refuse do not survive contact: calibration writes preferences,
+    # it does not need to write the GATE cache; and the trim build does not run plots.jl at all.
+    # `force-pins` is the deliberate escape, mirroring `force-busy`.
+    pinned = _active_prefs()
+    if !isempty(pinned) && !("force-pins" in ARGS)
+        @warn "CACHE NOT WRITTEN — $(length(pinned)) PureBLAS preference pin(s) are active, so the PB \
+            arm is not the shipped configuration:\n  $(join(pinned, "\n  "))\nClear them and re-run, or \
+            pass `force-pins` if a pinned cache is genuinely intended (calibration)."
+        return nothing
+    end
     forced = _forced_knobs()
     if !isempty(forced)
         @warn "CACHE NOT WRITTEN — $(length(forced)) PUREBLAS_FORCE_* variable(s) are set, so the PB \
@@ -1627,6 +1709,7 @@ elseif !("bench" in ARGS) && isfile(CACHE)
     g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     _contention_check()
+    _pref_check()          # pins are legitimate; not KNOWING about them is not
     l1, l2, l3, lp = run_benchmarks()
     cl1, cl2, cl3, clp = run_cmplx_benchmarks()
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header

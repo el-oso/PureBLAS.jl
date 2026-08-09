@@ -1258,8 +1258,11 @@ const _CGEMVT_CFG_DEFAULT = _CGEMVT_NC + (_CGEMVT_HALF ? 100 : 0)
 # (n=512 0.955→1.006, n=1024 0.912→1.017 when forced). Shipping a coin flip between a passing and a
 # missing kernel is the exact failure the duel rule exists to prevent, so the derived value becomes the
 # incumbent and ties go to it. The knob REMAINS Measure tier: a box whose optimum really is fewer
-# streams (Zen5 resolves `_ger_np()` = 1, so this is not hypothetical) can still displace it, but must
-# now clear the supermajority AND the regret bound to do so.
+# streams can still displace it, but must now clear the supermajority AND the regret bound to do so.
+# ⚠ This used to read "Zen5 resolves `_ger_np()` = 1, so this is not hypothetical". That was FALSE and
+# is the reason the example is gone rather than updated: neuromancer had an untracked
+# `bench/LocalPreferences.toml` pinning `ger_panel_np = 1`, so the auto-measure never ran there. With
+# the pin removed it resolves to **8** (2026-08-09). No box on the fleet is known to want 1.
 const _CGEMVT_CFG_BIG = (
     n = _cgemvt_fits(8, true) ? 8 : _cgemvt_fits(4, true) ? 4 : 2;
     n + 100
@@ -2186,9 +2189,12 @@ function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T
     if cold
         np = _cger_np()          # measured stream count, capped by the chosen layout's register budget
         np >= 2 && return _ger_paneldrv_cmplx!(m, n, α, x, y, A, cj, np)
-        # np == 1 IS the per-column path below (one stream) — no separate arm needed. This is the LIVE
-        # path on any box whose measured stream optimum is 1 (Zen5 resolves `_ger_np()` = 1), so the
-        # cold-column fix below is that box's whole remedy, not an edge case.
+        # np == 1 IS the per-column path below (one stream) — no separate arm needed.
+        # ⚠ This used to claim the np==1 arm was LIVE on Zen5 ("Zen5 resolves `_ger_np()` = 1"), making
+        # the cold-column fix below "that box's whole remedy". FALSE: that reading came from an
+        # untracked `bench/LocalPreferences.toml` on neuromancer pinning `ger_panel_np = 1`, which
+        # suppressed the auto-measure entirely. Unpinned it measures **8** (⇒ `_cger_np()` = 4), so the
+        # panel arm above is what actually runs there and this branch is currently dead on the fleet.
     end
     # Val, not Bool: `cold` is loop-invariant, so a runtime flag would put a branch inside the
     # per-column hot loop and block specialization of the axpy arm it selects.

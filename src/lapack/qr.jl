@@ -293,13 +293,26 @@ const _QR_UNBLK_MAX = 32
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
+# ⚠ THIS USED TO READ `_CGEMM_3M ? … : …` AND MEANT "is this the AVX2 box?". That was a hidden coupling,
+# not a derivation: `_CGEMM_3M` is a *complex-gemm algorithm* switch, and it happened to be `_W64 == 4`,
+# so it doubled as an ISA discriminator here. When the 3M default was flipped ON for AVX-512 on
+# 2026-08-09 (it wins 1.17–1.29× there), this line silently changed complex QR's crossover on Zen4 AND
+# Zen5 from ½·L3 to 2·L2 — contradicting the Zen5 measurement recorded right below, and reachable by no
+# test or gate row that the 3M change ran. Decoupled to the predicate it actually meant.
+#
+# Honest tiering: `_NARROW_SIMD` is a datapath-gated literal, i.e. Measure-tier debt by req#8b — but it
+# is PRE-EXISTING debt that was previously INVISIBLE behind `_CGEMM_3M`. Naming it neither creates nor
+# discharges it; it makes it auditable, and it keeps this line's behaviour byte-identical to what the
+# Zen5/galen numbers below were measured against.
+const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is enabled"
+#
 # Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
 # strong — it BEATS the blocked WY path while the matrix stays cache-resident (its O(n³) re-streams hit cache,
-# not DRAM). req#8: derive from residency, not a size literal. On the wide-SIMD box (AVX-512, _CGEMM_3M off)
+# not DRAM). req#8: derive from residency, not a size literal. On the wide-SIMD box (AVX-512)
 # unblocked wins to matrix ≈ ½L3 (neuromancer Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
-# box (_CGEMM_3M) the BLAS-2 panel is bandwidth-bound AND the chunked blocked path is efficient from small n,
+# box the BLAS-2 panel is bandwidth-bound AND the chunked blocked path is efficient from small n,
 # so unblocked only wins while the matrix is ~L2-resident (≤2·L2 ⇒ galen n≤256; n≥320 must reach blocked).
-@inline _zqr_unblk_max(::Type{T}) where {T} = _CGEMM_3M ? 2 * _L2_BYTES : _L3_BYTES ÷ 2
+@inline _zqr_unblk_max(::Type{T}) where {T} = _NARROW_SIMD ? 2 * _L2_BYTES : _L3_BYTES ÷ 2
 # Blocked panel width (COMPLEX), derived: the trailing gemm C−=V·W contracts over pb=nb, and once the matrix
 # spills cache each panel re-streams the trailing matrix from DRAM (total sweep traffic ∝ k/nb). Grow nb with
 # how many times the matrix exceeds ¼L3 so DRAM-sweep bytes stay bounded, capped at 4× where the BLAS-2 panel
@@ -365,8 +378,15 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
             # trailing matrix) — for nt≈mp≈n that spills L3 exactly when the matrix ITSELF fits L3 (the galen
             # n≈768–1100 dip band). Chunking columns bounds that scratch to ≤½L3 AND fuses each Cj's V·W downdate
             # while its Vᴴ·C is still L3-hot (read+write once vs ~5–6 matrix passes). ncb = nt (single chunk,
-            # bit-identical) when 3M is off (neuromancer). req#8: ncb from the 3M live-set residency ≤ ½·L3,
+            # bit-identical) when 3M is off. req#8: ncb from the 3M live-set residency ≤ ½·L3,
             # live set ≈ (sizeof(T) + 3·sizeof(real(T)))·mp·ncb (C chunk + its real split/product buffers).
+            #
+            # ⚠ UNLIKE `_zqr_unblk_max` above, this `_CGEMM_3M` test is CORRECT and stays: it asks "is 3M
+            # live?", and the scratch it bounds exists exactly when 3M runs. But that makes it a live
+            # BEHAVIOUR CHANGE on AVX-512 as of the 2026-08-09 default flip — chunking now activates on
+            # Zen4/Zen5, where `ncb = nt` (single chunk) before. It is the right shape by the argument
+            # above and is UNMEASURED on those boxes; zgeqrf must be re-gated there before the flip is
+            # trusted. (The old comment said "when 3M is off (neuromancer)" — stale, 3M is on there now.)
             ncb = _CGEMM_3M ? clamp(((_L3_BYTES ÷ 2) ÷ ((sizeof(T) + 3 * sizeof(real(T))) * mp)) & ~7, min(4 * _CNR, nt), nt) : nt
             jj = jt0
             while jj <= n
