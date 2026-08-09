@@ -52,7 +52,26 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # So gate on the DATAPATH, not a flat default: minner ON iff the vector unit is AVX2 (W<8) OR double-pumped,
 # OFF on native-512 (physical criterion over detected consts — CLAUDE.md req#7/#8; validated full-sweep on
 # the fleet: Zen3/Zen4 keep the gains, Zen5 reverts to the old path). Panel-width regimes below apply where on.
-const _GEMVN_MINNER = @load_preference("gemvn_minner", _vwidth(Float64) < 8 || _double_pumped(_HW))::Bool
+const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
+# ⚠ THE DEFAULT IS A DATAPATH-GATED BOOLEAN, which the PDM ladder names as a violation in the same
+# breath as `_double_pumped(_HW) ? 8 : 4` — a Measure-tier knob that has not been converted yet.
+# It is kept for now because converting it needs a fleet A/B that has never been run under valid
+# conditions: the Zen5 negative above (m-inner regressed there, worst n=1024 0.91 -> 0.85) was
+# measured BEFORE that box was found running with its frequency lock dropped — 4841 MHz against a
+# 2000 MHz base — so it is exactly the class of Zen5 result this session had to retract elsewhere.
+# `PUREBLAS_FORCE_gemvn_minner=1` (or 0) reaches the REAL entry path so the A/B can be redone on a
+# verified-locked box. Resolved ONCE PER PROCESS, never per call (an ENV read in a BLAS-2 hot path
+# is itself a regression), and `@static`-gated on the pin so a pinned/trim build compiles the
+# resolver out entirely and the all-paths @noalloc proof never sees a OncePerProcess.
+@static if isnothing(_GEMVN_MINNER_PREF)
+    const _GEMVN_MINNER_ONCE = Base.OncePerProcess{Bool}() do
+        f = _force_knob("gemvn_minner")
+        return f >= 0 ? f != 0 : (_vwidth(Float64) < 8 || _double_pumped(_HW))
+    end
+    @inline _gemvn_minner() = _GEMVN_MINNER_ONCE()
+else
+    @inline _gemvn_minner() = _GEMVN_MINNER_PREF::Bool
+end
 const _GEMVN_MINNER_U = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
 # Panel width (columns/panel = concurrent A-read streams; y re-streamed n/NP times) — three regimes:
 #  narrow  A ≤ 2·L2 (partially L2-resident band, e.g. f64 n=512 = 2 MB): few streams win. NP8 = 0.95 vs OB,
@@ -415,7 +434,7 @@ end
 @inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
     if n <= _GEMVN_RB
         _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0))
-    elseif _GEMVN_MINNER && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
+    elseif _gemvn_minner() && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
         _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
     else
         _gemv_n_paneldrv!(m, n, α, A, x, y, β, Val(B0))
