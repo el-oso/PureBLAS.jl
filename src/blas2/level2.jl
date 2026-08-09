@@ -3008,7 +3008,21 @@ end
     # is what limits achieved bandwidth, so drop to the plateau; inside L3 the wider panel wins by
     # touching x fewer times. `_L3_BYTES` is a compile-time const, so this is one comparison.
     tri = (n * (n + 1) ÷ 2) * sizeof(T)
-    return tri > _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x) :
+    # MAJORITY-DRAM criterion, not `tri > _L3_BYTES`. The stream-count penalty applies only to the
+    # fraction of A actually served from DRAM, which is `1 - L3/tri`. The bare `tri > _L3_BYTES` is
+    # far too loose at the boundary and it cost real cells — MEASURED, all arms same-run:
+    #                n=2048             n=4096
+    #     Zen4   1.137 -> 1.025     0.927 -> 0.970
+    #     Zen3   1.009 -> 1.007     0.973 -> 0.971   <- F=8 both times (32 MiB L3): the CONTROL
+    #     Zen5   1.245 -> 0.970     0.862 -> 1.039
+    # At n=2048 on a 16 MiB L3 the triangle is 16.79 MiB — a ratio of 1.0005, so the DRAM-served
+    # fraction is 0.0005, essentially nothing — yet the narrow panel gave up its x-traffic advantage
+    # anyway and lost 22% on Zen5. At n=4096 the ratio is 4.0 and the fraction is 0.75.
+    # So: switch when MORE THAN HALF the stream is DRAM-served, `1 - L3/tri > 1/2` <=> `tri > 2·L3`.
+    # A majority criterion over a derived quantity, not a tuned multiplier: the 2 comes from the 1/2
+    # and the fraction comes from cache capacity. Zen3 n=4096 sits exactly AT 2·L3 and keeps F=8,
+    # where it measured 0.973 either way — indifferent, so the boundary costs nothing there.
+    return tri > 2 * _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x) :
         _trmv_fusedF!(Val(8), up, unit, n, A, x)
 end
 # Largest power of two on the measured plateau (2-6). 4 rather than 6 because the panel arithmetic
