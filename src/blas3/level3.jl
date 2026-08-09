@@ -2116,41 +2116,57 @@ end
 # `_gemmtrsm_u_slab!` (reads U from the compact odd-ldu panel, col-major) but reads its own MR rows
 # STRAIGHT from B (in-register 8×8 transpose) for the subtract and writes solved rows to P (reuse) AND
 # transposed to B (final) — no standalone pack/unpack. REQUIRES W==MR==8 (AVX-512 f64), FULL stripe.
-@inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
-        Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
-        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
-    ) where {T, MR, NRV}
+# Body builder for the unpacked fusedT slab, shared by the runtime method below and the tiny-k `Val{NG}`
+# method further down. `s`/`KC` name runtime arguments (`Symbol`) or are literals; `ldp` likewise; `ng`, if
+# given, is the LITERAL gemm trip count and replaces the `s+MR : KC-1` bound with a `0:ng-1` counted loop.
+# WHY the literal-`ng` form exists: `@inline` does NOT propagate into a @generated body on Julia 1.12 (kb:
+# generated-inline-meta-hazard), so the runtime method survives as an `invoke` and its caller's `s`/`KC` can
+# never const-propagate in. That is harmless at large KC and first-order at tiny KC, where the four slabs
+# run only 0/8/16/24 gemm trips each: measured, the leaf sits 7-10x off its own FMA roofline at K=32 and
+# the miss is FLAT in n, the signature of per-iteration scaffolding rather than a fixed per-call cost
+# (bench/probes/trsm_leaf_shape.jl). Only the TRIP COUNT is lifted to compile time — the `s` offsets stay
+# runtime address math, which is cheap and, unlike inlining the whole sweep into one function, keeps the
+# 24 live accumulators inside ONE slab's register-allocation scope.
+function _slab_upk_fusedT_body(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int} = nothing
+    ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
-    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
-    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
-    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
-    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
-    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
     body = quote end
     for r in 0:(MR - 1), v in 0:(NRV - 1)
         push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
     end
     inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
     for v in 0:(NRV - 1)
-        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * $ldp + $(v * W)) * $sz)))
     end
     for r in 0:(MR - 1)
-        push!(inner.args, :(u = $V(unsafe_load(Up + ((s + $r) + kk * ldu) * $sz))))
+        push!(inner.args, :(u = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
         for v in 0:(NRV - 1)
             cs = Symbol(:c, r, :_, v)
             push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
         end
     end
-    push!(
-        body.args, :(
-            for kk in UnitRange(s + $MR, KC - 1)
-                $inner
-            end
+    if isnothing(ng)
+        push!(
+            body.args, :(
+                for kk in UnitRange($s + $MR, $KC - 1)
+                    $inner
+                end
+            )
         )
-    )
+    elseif ng > 0                                          # literal trip count; ng==0 emits no loop at all
+        push!(
+            body.args, :(
+                for kkoff in 0:$(ng - 1)
+                    kk = $s + $MR + kkoff
+                    $inner
+                end
+            )
+        )
+    end
     for v in 0:(NRV - 1)                                       # subtract: own rows read direct from B + transpose
         for l in 0:(W - 1)
-            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $(v * W + l)) * ldb) * $sz)))
         end
         brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
         push!(body.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
@@ -2160,12 +2176,12 @@ end
         end
     end
     for i in (MR - 1):-1:0                                     # back-substitution, critical-path-first
-        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        push!(body.args, :(d = $V(unsafe_load(rp + ($s + $i) * $sz))))
         for v in 0:(NRV - 1)
             push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
         end
         for j in (i - 1):-1:0
-            push!(body.args, :(u = $V(unsafe_load(Up + ((s + $j) + (s + $i) * ldu) * $sz))))
+            push!(body.args, :(u = $V(unsafe_load(Up + (($s + $j) + ($s + $i) * ldu) * $sz))))
             for v in 0:(NRV - 1)
                 cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
                 push!(body.args, :($cj = muladd(-u, $ci, $cj)))
@@ -2174,14 +2190,28 @@ end
     end
     for v in 0:(NRV - 1)                                       # store: → P row-major (reuse) AND transposed → B
         for r in 0:(MR - 1)
-            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + (($s + $r) * $ldp + $(v * W)) * $sz)))
         end
         ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:(W - 1))...)
         push!(body.args, Expr(:(=), ccs, :(_tr8x8($((Symbol(:c, r, :_, v) for r in 0:(MR - 1))...)))))
         for l in 0:(W - 1)
-            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + (($s) + (jc + $(v * W + l)) * ldb) * $sz)))
         end
     end
+    return body
+end
+
+@inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
+        Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
+        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
+    ) where {T, MR, NRV}
+    W = _vwidth(T)
+    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
+    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
+    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
+    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
+    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    body = _slab_upk_fusedT_body(T, MR, NRV, :s, :KC, :ldp)
     push!(body.args, :(return nothing))
     return body
 end
@@ -2396,6 +2426,76 @@ end
     end
     return
 end
+
+# TINY-K SLAB: identical body to the general slab, but the gemm trip count is a literal `Val{NG}` and the
+# P stride folds out of `Val{NRV}`. One specialization per (NG, NRV) actually reachable — NG runs over
+# multiples of MR below the tiny-k cap, so this is a handful of small functions, not a copy of the sweep.
+@generated function _gemmtrsm_u_slab_ng!(
+        ::Val{NG}, ::Val{NRV}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int
+    ) where {NG, NRV, T}
+    W = _vwidth(T); MR = _GT_MR
+    # Throw-body, never an assert: generation must succeed on AVX2 for StrictMode's inference dogfood
+    # even though the caller's fusedT branch is runtime-dead there (same rule as the general slab).
+    (W == 8 && MR == 8) ||
+        return :(throw(AssertionError("tiny fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    body = _slab_upk_fusedT_body(T, MR, NRV, :s, nothing, NRV * W, NG)
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
+# This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
+# kernels; expressed as one generator it is the same coverage with none of the maintenance.
+@inline @generated function _fusedT_stripe_tiny!(
+        ::Val{K}, ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        pU::Ptr{T}, ldu::Int, rp::Ptr{T}
+    ) where {K, NRVe, T}
+    MR = _GT_MR
+    K % MR == 0 || return :(throw(AssertionError("tiny fusedT stripe requires K%MR==0")))
+    body = Expr(:block, Expr(:meta, :inline))
+    for si in (K ÷ MR - 1):-1:0                     # bottom slab first: back-substitution runs upward
+        push!(
+            body.args,
+            :(_gemmtrsm_u_slab_ng!(
+                Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR)
+            ))
+        )
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Route a stripe to the straight-line sweep when KC is one of the multiples of MR at or below the tiny-k
+# entry cap `_TRSM_DBASE`. Both bounds are existing consts — no new tuning constant. The chain is emitted
+# from them at generation time, so a pinned `_TRSM_DBASE` re-derives its own coverage, and every `Val` is
+# a generation-time literal (trim-safe: no runtime→Val).
+@inline @generated function _fusedT_stripe_k!(
+        ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int, pU::Ptr{T},
+        ldu::Int, rp::Ptr{T}, KC::Int, nfull::Int, rem::Int, MR::Int, sz::Int
+    ) where {T, NRVe}
+    fall = :(return _fusedT_stripe!(Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz))
+    if _vwidth(T) != 8 || _GT_MR != 8
+        return quote
+            $(Expr(:meta, :inline))
+            $fall
+        end
+    end
+    chain = Expr(:block)
+    for K in _GT_MR:_GT_MR:_TRSM_DBASE
+        push!(
+            chain.args,
+            :(KC == $K && return _fusedT_stripe_tiny!(Val($K), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp))
+        )
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        if rem == 0                                  # rem>0 needs the ragged-tail mini-pack: general path
+            $chain
+        end
+        $fall
+    end
+end
 function _trsm_fused_L!(unit::Bool, A, B)
     T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
     W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
@@ -2448,13 +2548,13 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
             if fusedT && wid == NR
-                _fusedT_stripe!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += NR; continue
             elseif fusedT && NRV >= 3 && wid == 2 * W
-                _fusedT_stripe!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe_k!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += 2 * W; continue
             elseif fusedT && wid == W
-                _fusedT_stripe!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe_k!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += W; continue
             end
             if useT
