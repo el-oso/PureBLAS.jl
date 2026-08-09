@@ -53,6 +53,29 @@ _l1rep(s) = clamp(8_000_000 ÷ s, 30, 20000)          # plots.jl's _L1REP — th
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
 const OPS = Dict(
+    "gemvN" => (() -> (randn(N, N), randn(N), randn(N)),
+                (c, m) -> (for _ in 1:m
+                     P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0)
+                 end; c[3][1]),
+                (c, m) -> (for _ in 1:m
+                     B.gemv!('N', 1.0, c[1], c[2], 0.0, c[3])
+                 end; c[3][1])),
+    "gemvT" => (() -> (randn(N, N), randn(N), randn(N)),
+                (c, m) -> (for _ in 1:m
+                     P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0, trans = 'T')
+                 end; c[3][1]),
+                (c, m) -> (for _ in 1:m
+                     B.gemv!('T', 1.0, c[1], c[2], 0.0, c[3])
+                 end; c[3][1])),
+    # trmv is destructive, so BOTH arms restore x from a pristine copy per rep, exactly as plots.jl
+    # does. Without it repeated in-place x := A*x diverges and the timing measures denormals.
+    "trmv" => (() -> (randn(N, N), randn(N), randn(N)),
+               (c, m) -> (for _ in 1:m
+                    copyto!(c[3], c[2]); P.trmv!(c[1], c[3]; uplo = 'U')
+                end; c[3][1]),
+               (c, m) -> (for _ in 1:m
+                    copyto!(c[3], c[2]); B.trmv!('U', 'N', 'N', c[1], c[3])
+                end; c[3][1])),
     "axpy" => (() -> (randn(N), randn(N)),
                (c, m) -> (for _ in 1:m
                     P.axpy!(c[2], 1.7, c[1])
