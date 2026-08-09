@@ -39,7 +39,12 @@ while true
     t0 = time()
     try
         Revise.revise()                            # pick up src/ edits since the last command
-        Base.include(Main, abspath(cmd))
+        # `includet`, not `include`: it executes the file AND puts it under Revise tracking, so helper
+        # modules a probe pulls in (bench/measure.jl) are revised in place instead of being REPLACED.
+        # Plain `include` re-runs `module Measure ... end` and builds a NEW module object, which silently
+        # invalidates the `tstat` binding Main imported from the previous one — that cost a failed probe
+        # run earlier (`UndefVarError: tstat not defined in Main`, after the header had already printed).
+        Revise.includet(abspath(cmd))
         @printf("<<<HOT-DONE ok %s %.1fs>>>\n", cmd, time() - t0)
     catch e
         showerror(stdout, e, catch_backtrace())
