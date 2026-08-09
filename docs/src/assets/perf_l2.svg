@@ -123,15 +123,15 @@
 <circle cx="646.0" cy="107.5" r="2" fill="#1f77b4"/>
 <circle cx="681.0" cy="80.7" r="2" fill="#1f77b4"/>
 <circle cx="716.0" cy="77.7" r="2" fill="#1f77b4"/>
-<polygon points="506.0,82.2 541.0,108.9 576.0,104.1 611.0,113.6 646.0,108.2 681.0,108.7 716.0,108.7 716.0,122.7 681.0,135.9 646.0,122.3 611.0,116.9 576.0,115.7 541.0,114.5 506.0,112.9" fill="#2ca02c" opacity="0.11"/>
-<polyline points="506.0,94.9 541.0,110.6 576.0,112.2 611.0,115.5 646.0,117.2 681.0,123.2 716.0,120.0" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="506.0" cy="94.9" r="2" fill="#2ca02c"/>
-<circle cx="541.0" cy="110.6" r="2" fill="#2ca02c"/>
-<circle cx="576.0" cy="112.2" r="2" fill="#2ca02c"/>
-<circle cx="611.0" cy="115.5" r="2" fill="#2ca02c"/>
-<circle cx="646.0" cy="117.2" r="2" fill="#2ca02c"/>
-<circle cx="681.0" cy="123.2" r="2" fill="#2ca02c"/>
-<circle cx="716.0" cy="120.0" r="2" fill="#2ca02c"/>
+<polygon points="506.0,79.1 541.0,107.2 576.0,104.2 611.0,110.9 646.0,105.2 681.0,131.7 716.0,97.6 716.0,112.3 681.0,147.0 646.0,115.6 611.0,114.9 576.0,112.4 541.0,112.9 506.0,110.1" fill="#2ca02c" opacity="0.11"/>
+<polyline points="506.0,85.8 541.0,110.5 576.0,111.1 611.0,112.8 646.0,113.3 681.0,139.8 716.0,110.4" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="506.0" cy="85.8" r="2" fill="#2ca02c"/>
+<circle cx="541.0" cy="110.5" r="2" fill="#2ca02c"/>
+<circle cx="576.0" cy="111.1" r="2" fill="#2ca02c"/>
+<circle cx="611.0" cy="112.8" r="2" fill="#2ca02c"/>
+<circle cx="646.0" cy="113.3" r="2" fill="#2ca02c"/>
+<circle cx="681.0" cy="139.8" r="2" fill="#2ca02c"/>
+<circle cx="716.0" cy="110.4" r="2" fill="#2ca02c"/>
 <text x="611.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">ger</text>
 <line x1="506.0" y1="60" x2="506.0" y2="198" stroke="#f4f4f4"/>
 <text x="506.0" y="209" text-anchor="middle" font-size="8" fill="#999">64</text>
