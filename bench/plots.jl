@@ -1324,7 +1324,31 @@ function _contention_exit_check()
     return nothing
 end
 
+# A `PUREBLAS_FORCE_<knob>` run measures a DELIBERATELY NON-DEFAULT PureBLAS — it is an A/B probe, not
+# a gate measurement — so its numbers must never reach the cache. They did, and it cost three phantom
+# gate misses.
+#
+# On 2026-08-09 the Zen5 cache held pb=0.0498 s for L2/gemvT@256 against aocl=0.0367, published as a
+# 0.747 miss and treated as the campaign's hardest open cell. A controlled re-measure read 0.0321 s
+# (ratio 1.089, PASS), and `PUREBLAS_FORCE_gemvt_deep=0` reproduced 0.0500 s exactly: the record had
+# been written by an A/B round with that variable exported. gemvT@128 and trmv@256 went the same way.
+# A whole kb finding, a retraction, and a day of kernel work were built on top of it.
+#
+# `tune=` (below) was added for the untracked-LocalPreferences version of this bug and does NOT catch
+# it — the env hooks are resolved per knob and `gemvt_deep` was not among the values stamped. Rather
+# than chase the knob list, refuse the write: every forced knob is covered, including ones not yet
+# written. The A/B loses nothing, because the per-round output it is read from is printed either way.
+_forced_knobs() = sort([k for k in keys(ENV) if startswith(k, "PUREBLAS_FORCE_")])
+
 function save_cache(path, groups)
+    forced = _forced_knobs()
+    if !isempty(forced)
+        @warn "CACHE NOT WRITTEN — $(length(forced)) PUREBLAS_FORCE_* variable(s) are set, so the PB \
+            arm is not the shipped configuration:\n  $(join(("$k=$(ENV[k])" for k in forced), "\n  "))\n\
+            The per-round numbers above are the A/B result; read them there. Unset the variable(s) to \
+            produce a cacheable gate measurement."
+        return nothing
+    end
     open(path, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
         # (slug/isa) for the multi-host plot, and full provenance: CPU model, code commit, measure time,
