@@ -199,10 +199,42 @@ duplicated here.
 
 ## Where we are
 
-**Zen4 (AVX-512, double-pumped).** The tuning target; gates essentially everywhere. Real
-residuals are worst-size only (`syrk` 0.95, `syr2k` 0.97, `trmm` 0.98 — geomeans all ≥ 1.05).
-The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells: `zgeru` 0.906
-(n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
+### BLAS-3 is where the work is, and the shape of it is the same on every µarch
+
+`gemm` is the fastest thing on all three boxes and pulls *further* ahead as `n` grows — but the
+routines that build on that same engine fall *behind* AOCL at exactly the sizes where `gemm` wins
+most:
+
+| vs max(OpenBLAS, AOCL) | n=2048 | n=4096 |
+|---|---|---|
+| `gemm` — Zen4 / Zen3 / Zen5 | 1.150 / 1.150 / 1.168 | **1.252 / 1.280 / 1.308** |
+| `syrk` | 0.955 / 0.963 / 0.978 | **0.937 / 0.968 / 0.953** |
+| `syr2k` | 0.976 / 0.974 / 0.977 | 0.966 / 0.983 / 0.957 |
+
+`syrk`, `syr2k`, `symm`, `trmm` and `trsm` all route their trailing updates through the same
+`_gemm_core!` / `_microkernel_db!` engine. That engine is demonstrably 25–31% faster than AOCL at
+n=4096 on this silicon, so the ~30-point spread between it and the routines built on it is a
+**conversion loss, not a hardware limit** — and it reproduces on three microarchitectures, which
+makes it structural rather than a per-box tuning artifact. It is the single largest shared lever
+currently on the board.
+
+Two cells miss on **all three** boxes and are therefore the cross-µarch invariants worth attacking
+once rather than three times: **`trsm` n=32** (0.906 / 0.917 / 0.922 — a tiny-`n` per-call/leaf-rate
+problem, distinct from the mid-`n` composition question) and **`syrk`/`syr2k` n=4096** (the
+conversion gap above). By contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on
+Zen5, so those are µarch-specific.
+
+Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.909, `zsyrk`
+0.932, `zher2k` 0.907, `zsyr2k` 0.912, `ztrmm` 0.933 — with `ztrsm` (1.069) the one that gates.
+Here the engine itself (`zgemm`) misses, so it is a different problem from the real case and has to
+be fixed at the kernel before anything above it can convert.
+
+### Per microarchitecture
+
+**Zen4 (AVX-512, double-pumped).** The tuning target. Real BLAS-1/2 gate essentially everywhere;
+the residuals are the BLAS-3 set above (`trsm` 0.906 @ n=32, `syrk` 0.937 @ n=4096, `trmm` 0.950,
+`symm` 0.955). The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
+`zgeru` 0.906 (n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
 
 **Zen5 (AVX-512, native 512-bit).** Clears every AVX2 ceiling but shows a disjoint residual
 profile — the reason the gate is per-machine. Open: `gemvN` (0.942, n=2048), `ger` (0.896,
@@ -235,7 +267,13 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
 
 **Known open items** (tracked in [`ROADMAP.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/ROADMAP.md)):
 
-- `gemvT` n=2048 is now the one cell that misses on **all three** µarchs (0.96 / 0.94 / 0.97) — a
+- **BLAS-3 conversion gap** (above): `gemm` beats AOCL by 25–31% at n=4096 while `syrk`/`syr2k` on
+  the same engine sit at 0.94–0.97. Largest shared lever; reproduces on all three µarchs.
+- `trsm` n=32 misses on all three (0.906 / 0.917 / 0.922) — tiny-`n`, per-call/leaf-rate. Note the
+  mid-`n` side-L question is *separate* and was characterised at a ~0.95 codegen floor
+  (latency-bound back-substitution, register-walled at 32 zmm) after row-lane, left-looking,
+  nrhs-block, pack-lifetime and a full BLIS-structure framework all measured 0.94–0.99.
+- `gemvT` n=2048 is the one BLAS-2 cell that misses on **all three** µarchs (0.96 / 0.94 / 0.97) — a
   size-specific behaviour rather than three per-box stories, and the better-posed problem for it.
 - `gemvN` Zen5 n=2048 (0.942) and `ger` Zen5 n=2048 (0.896).
 - `trmv`/`trsv` Zen5 in the DRAM regime **now gate** (1.06 / 1.03 at n=4096) after the fuse-factor
