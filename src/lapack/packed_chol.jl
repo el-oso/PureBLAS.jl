@@ -64,12 +64,17 @@ const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
             # `refill!` stays OUTSIDE the timed region: the factorization is destructive, so every
             # timed round must start from a fresh HPD packed matrix.
             inc() = (refill!(); _pptrf_lower!(AP, n, 2 * vw))
-            for c in (vw, 3 * vw, 4 * vw)                          # the default is the incumbent
-                refill!(); _pptrf_lower!(AP, n, c)                 # untimed warmup (absorb JIT)
-                cand() = (refill!(); _pptrf_lower!(AP, n, c))
-                _tune_wins_it(_tune_duel(inc, cand)) && return c
-            end
-            return 2 * vw
+            # ⚠ WAS `for c in (vw, 3vw, 4vw) … && return c` — first-past-the-post over a hand-written
+            # order, not an argmin: it shipped whichever candidate happened to be listed first among
+            # those beating the incumbent, and never compared them to each other. Same defect measured
+            # on `_ger_np` (Zen5 shipped 8 while 1 was ~12% faster at the gate's n=2048).
+            # `_tune_duel_pick` keeps the fixed-incumbent bar and adds the argmin. `_tune_duel` does its
+            # own untimed warmup of both arms, so the explicit warmup line is no longer needed.
+            cand = ((vw, () -> (refill!(); _pptrf_lower!(AP, n, vw))),
+                    (3 * vw, () -> (refill!(); _pptrf_lower!(AP, n, 3 * vw))),
+                    (4 * vw, () -> (refill!(); _pptrf_lower!(AP, n, 4 * vw))))
+            w = _tune_duel_pick(inc, cand)
+            return isnothing(w) ? 2 * vw : w
         catch
             return 2 * vw
         end
