@@ -2488,11 +2488,9 @@ end
 # an existing array needs no restart, so an A/B knob added mid-session iterates in seconds. Generalises
 # the `_TRSM_FUSEDT_ON` / `_TRSM_FULLPACK_ON` convention this file already uses. Read once per `trsm!`
 # call (not per slab), so the load is free. Ships all-false: every index is an OFF-by-default probe knob.
-#   [1] tiny-k stripe width NR=2W instead of NR=NRV·W   (FALSIFIED — see the block above)
-#   [2] free — the tiny-k cold-operand prefetch it gated now ships unconditionally
+#   [1] tiny-k stripe width NR=2W instead of NR=NRV·W
 const _EXPFLAG = fill(false, 16)
 const _EXP_TINY_NR2 = 1
-const _EXP_TINY_PF = 2
 
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
 # This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
@@ -2503,37 +2501,7 @@ const _EXP_TINY_PF = 2
     ) where {K, NRVe, T}
     MR = _GT_MR
     K % MR == 0 || return :(throw(AssertionError("tiny fusedT stripe requires K%MR==0")))
-    W = _vwidth(T); sz = sizeof(T)
     body = Expr(:block, Expr(:meta, :inline))
-    # COLD-OPERAND PREFETCH. Measured (bench/probes/trsm32_roofline_aocl.jl): PB's kernel is 1.17x FASTER
-    # than AOCL with L1-resident operands (26.5 vs 22.7 GF) and 0.93x at the gate's 8 MB working set —
-    # PB degrades 2.06x from L1 to 8 MB, AOCL only 1.64x. So the whole gate deficit is cold-operand
-    # traffic, not arithmetic. The pattern is exactly known here: this stripe will touch rows [0,K) of
-    # columns [jc, jc+NRVe·W) of B, and the whole K×K upper triangle of U. Both are issued up front, in
-    # ascending address order, so the line fills overlap the first slab's gemm instead of stalling it.
-    # Leaves the microkernel — which already wins — completely untouched.
-    # (Prefetching the FULL block is right only because this path is tiny-k: B here is K·NRVe·W·sz ≤ 6 KB
-    # and U ≤ 8 KB, so the prefetched set fits L1 and cannot evict what it is warming.)
-    # NOTE the flag is tested in the EMITTED code, not here in the generator: a generator-time test would
-    # bake the choice in at first specialisation and the A/B switch would silently do nothing.
-    pf = Expr(:block)
-    for v in 0:(NRVe - 1), l in 0:(W - 1)           # one stream per B column of this stripe
-        col = v * W + l
-        for r in 0:(cld(K * sz, 64) - 1)            # 64 B lines down the column
-            push!(pf.args, :(_prefetch(pB + ((jc + $col) * ldb) * $sz + $(r * 64))))
-        end
-    end
-    for c in 0:(K - 1)                              # U columns: column c holds rows 0..c (upper)
-        for r in 0:(cld((c + 1) * sz, 64) - 1)
-            push!(pf.args, :(_prefetch(pU + ($c * ldu) * $sz + $(r * 64))))
-        end
-    end
-    # UNCONDITIONAL, not a knob. Measured on/off (bench/probes/trsm_pf_ab.jl, same-process ABBA, ABBA
-    # over residency): 16 KB 1.0005 · 256 KB 1.0003 · 1 MB 0.9986 · 4 MB 0.9775 · 8 MB 0.9447. Free when
-    # the operands are already hot and worth 5.5% when they are cold, with no crossover anywhere in
-    # between — so there is nothing to tune and a PDM knob would be tuning a monotone function. Bounded
-    # by construction: this path is tiny-k only, so the prefetched set is ≤ 6 KB of B + ≤ 8 KB of U.
-    append!(body.args, pf.args)
     for si in (K ÷ MR - 1):-1:0                     # bottom slab first: back-substitution runs upward
         args = :(Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR))
         push!(body.args, Expr(:call, :_gemmtrsm_u_slab_ng!, args.args...))
