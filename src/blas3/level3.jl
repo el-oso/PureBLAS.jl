@@ -2144,13 +2144,11 @@ end
 function _slab_upk_fusedT_body_1(
         ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int
     ) where {T}
-    return quote
-        if _EXPFLAG[_EXP6]
-            $(_slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, true))
-        else
-            $(_slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false))
-        end
-    end
+    # _EXP6 (subtract hoist) is NOT wired: emitting both orders behind a runtime branch doubles every
+    # slab specialisation and the build did not finish in 72 minutes. If it is ever revisited, select the
+    # order at GENERATION time and pay a session restart per arm instead — the runtime-toggle trick that
+    # works for cheap flags does not scale to a structurally different body.
+    return _slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false)
 end
 
 function _slab_body_ord(
@@ -2563,7 +2561,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP3  bypass the Val{NG} tiny chain (A/B arm)       Val{NG} CONFIRMED KEEP (5.2%, 5.7 SE, n=240)
 #   _EXP4  _fused_packP_tr! columns-outer (sequential)   FALSIFIED (1.0025, n=240, powered null)
 #   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
-#   _EXP6  subtract hoist: B load+transpose BEFORE the gemm (miss PLACEMENT lever)
+#   _EXP6  subtract hoist — NOT WIRED (both-orders emission doubles every slab; >72 min build)
 #   _EXP7.._EXP16  free
 
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
