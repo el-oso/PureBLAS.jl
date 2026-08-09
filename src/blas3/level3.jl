@@ -2130,6 +2130,17 @@ end
 function _slab_upk_fusedT_body(
         ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int} = nothing
     ) where {T}
+    return _slab_upk_fusedT_body_1(T, MR, NRV, s, KC, ldp, ng, 0)
+end
+
+# The core emitter. `vbase` shifts this sweep's v-columns to lane group `vbase` of the NRV·W-wide stripe:
+# P and B offsets keep the FULL stripe geometry (`ldp`, and the `jc + v*W` column), so per-v and fused
+# emit identical memory traffic and only the register working set differs. NOT a keyword — keywords do
+# not participate in dispatch, so a `; vbase` overload would silently REPLACE the method above rather
+# than sit beside it.
+function _slab_upk_fusedT_body_1(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int
+    ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     for r in 0:(MR - 1), v in 0:(NRV - 1)
@@ -2137,7 +2148,7 @@ function _slab_upk_fusedT_body(
     end
     inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
     for v in 0:(NRV - 1)
-        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * $ldp + $(v * W)) * $sz)))
+        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * $ldp + $((vbase + v) * W)) * $sz)))
     end
     for r in 0:(MR - 1)
         push!(inner.args, :(u = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
@@ -2166,7 +2177,10 @@ function _slab_upk_fusedT_body(
     end
     for v in 0:(NRV - 1)                                       # subtract: own rows read direct from B + transpose
         for l in 0:(W - 1)
-            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $(v * W + l)) * ldb) * $sz)))
+            push!(
+                body.args,
+                :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
+            )
         end
         brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
         push!(body.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
@@ -2190,12 +2204,18 @@ function _slab_upk_fusedT_body(
     end
     for v in 0:(NRV - 1)                                       # store: → P row-major (reuse) AND transposed → B
         for r in 0:(MR - 1)
-            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + (($s + $r) * $ldp + $(v * W)) * $sz)))
+            push!(
+                body.args,
+                :(vstore($(Symbol(:c, r, :_, v)), Pp + (($s + $r) * $ldp + $((vbase + v) * W)) * $sz))
+            )
         end
         ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:(W - 1))...)
         push!(body.args, Expr(:(=), ccs, :(_tr8x8($((Symbol(:c, r, :_, v) for r in 0:(MR - 1))...)))))
         for l in 0:(W - 1)
-            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + (($s) + (jc + $(v * W + l)) * ldb) * $sz)))
+            push!(
+                body.args,
+                :(vstore($(Symbol(:cc, l)), pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
+            )
         end
     end
     return body
@@ -2215,6 +2235,7 @@ end
     push!(body.args, :(return nothing))
     return body
 end
+
 
 # Ragged bottom slab (rem<MR rows, [base,KC) → no rows below, pure solve), one NR stripe. Rare (KC not a
 # multiple of MR = non-power-of-2 leaves). NRV column-vectors, runtime row count. P row stride ldp.
@@ -2444,6 +2465,33 @@ end
     return body
 end
 
+# FALSIFIED LEVER — per-v slab (MR live accumulators instead of MR·NRV). DO NOT RETRY.
+# The premise was sound and measured: the NRV=3 slab spills (asm scan, bench/probes/trsm_slab_spill.jl:
+# 40-51 stack vmov with 23-38 RELOADS at NRV=3, 30-41 with 0-1 reloads at NRV=2, zero at NRV=1), and the
+# v columns never couple, so sweeping them one at a time is the same arithmetic with half the registers.
+# It LOSES on every shape — same-process ABBA, bench/probes/trsm_perv_ab.jl, wintermute boost-locked:
+#   k=32 n=32 1.0015 · k=32 n=24 1.0764 · k=32 n=64 1.1091 · k=24 n=24 1.1039 · k=16 n=16 1.0370
+#   k=64 n=64 1.1953 · k=128 n=128 1.1031 · k=128 n=256 1.0939      (per-v/fused, >1 = per-v slower)
+# WHY: back-substitution is a SERIAL chain and the fused slab hides its latency with NRV-wide ILP —
+# NRV independent vector ops per step. Per-v runs that chain NRV times with none. The same effect is
+# already on record for the fullpack path ("its MR×NRV=24 v-lanes across the MR rows already saturate
+# ILP"). Spill traffic is real but second-order against back-sub latency; the register file is NOT the
+# binding constraint here, the dependency chain is.
+# WHAT THE SCAN DOES SUPPORT: NRV=2 is spill-free (0-1 reloads) AND keeps 2-wide ILP — that is the
+# surviving lever, and it also removes the ragged Val(1) tail stripe that n=32 gets under NR=24
+# (24+8 columns, so a quarter of them run at the very ILP the per-v result just showed is too thin).
+#
+# EXPERIMENT FLAG TABLE. Same-process A/B switches live here as INDICES into one pre-declared array,
+# never as new `const` bindings. Reason is workflow, not style: Revise cannot introduce a new const into
+# a loaded module, so every `const _FOO = Ref(false)` costs a full hot-session restart (~5 min of
+# PureBLAS precompile) — that happened twice on 2026-08-09 and is pure dead time. Mutating an element of
+# an existing array needs no restart, so an A/B knob added mid-session iterates in seconds. Generalises
+# the `_TRSM_FUSEDT_ON` / `_TRSM_FULLPACK_ON` convention this file already uses. Read once per `trsm!`
+# call (not per slab), so the load is free. Ships all-false: every index is an OFF-by-default probe knob.
+#   [1] tiny-k stripe width NR=2W instead of NR=NRV·W
+const _EXPFLAG = fill(false, 16)
+const _EXP_TINY_NR2 = 1
+
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
 # This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
 # kernels; expressed as one generator it is the same coverage with none of the maintenance.
@@ -2455,12 +2503,8 @@ end
     K % MR == 0 || return :(throw(AssertionError("tiny fusedT stripe requires K%MR==0")))
     body = Expr(:block, Expr(:meta, :inline))
     for si in (K ÷ MR - 1):-1:0                     # bottom slab first: back-substitution runs upward
-        push!(
-            body.args,
-            :(_gemmtrsm_u_slab_ng!(
-                Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR)
-            ))
-        )
+        args = :(Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR))
+        push!(body.args, Expr(:call, :_gemmtrsm_u_slab_ng!, args.args...))
     end
     push!(body.args, :(return nothing))
     return body
@@ -2540,17 +2584,24 @@ function _trsm_fused_L!(unit::Bool, A, B)
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
+        # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
+        # 23-38 reloads at NRV=3, 0-1 at NRV=2, 0 at NRV=1) AND an NR=24 stripe leaves n=32 as 24+8, so a
+        # quarter of the columns run as a Val(1) tail whose back-substitution has no ILP to hide its
+        # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
+        # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
+        # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
+        NRl = (_EXPFLAG[_EXP_TINY_NR2] && KC <= _TRSM_DBASE) ? 2 * W : NR
         jc = 0
         while jc < n
-            wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
+            wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
             # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
             # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
-            if fusedT && wid == NR
+            if fusedT && wid == NRl && NRl == NR
                 _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += NR; continue
-            elseif fusedT && NRV >= 3 && wid == 2 * W
+            elseif fusedT && wid == 2 * W
                 _fusedT_stripe_k!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += 2 * W; continue
             elseif fusedT && wid == W
@@ -2605,7 +2656,11 @@ function _trsm_fused_L!(unit::Bool, A, B)
                     end
                 end
             end
-            jc += NR
+            # `wid`, not NR: this path packs/solves/unpacks exactly `wid` real columns. Identical to the
+            # old `jc += NR` whenever NRl == NR (wid < NR only on the final partial stripe, where
+            # wid == n-jc ends the loop either way), but required once NRl < NR — there `wid` can be a
+            # full NRl stripe with columns still to come, and advancing by NR would SKIP NR-NRl of them.
+            jc += wid
         end
     end
     return B
