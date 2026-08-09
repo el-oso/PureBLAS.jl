@@ -2367,19 +2367,41 @@ end
 end
 # Pack B[:,jc:jc+wid) → P row-major (row i at Pp+i·NR) via 8×8 transpose for full 8-row × 8-col blocks;
 # scalar column-outer for the ragged row/col tails and the wid:NR zero-pad. Contiguous B reads throughout.
+# One 8x8 transposed block, factored out so the two visit orders below share an identical body.
+@inline function _packP_tr_blk!(
+        Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, NR::Int, sz::Int, i0::Int, vb::Int
+    )
+    V = Vec{8, Float64}
+    b = pB + (i0 + (jc + vb) * ldb) * sz
+    x0 = vload(V, b);             x1 = vload(V, b + ldb * sz);   x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
+    x4 = vload(V, b + 4ldb * sz); x5 = vload(V, b + 5ldb * sz);  x6 = vload(V, b + 6ldb * sz); x7 = vload(V, b + 7ldb * sz)
+    y0, y1, y2, y3, y4, y5, y6, y7 = _tr8x8(x0, x1, x2, x3, x4, x5, x6, x7)
+    p = Pp + (i0 * NR + vb) * sz
+    vstore(y0, p);              vstore(y1, p + NR * sz);   vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
+    vstore(y4, p + 4NR * sz);   vstore(y5, p + 5NR * sz);  vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    return nothing
+end
+
 @inline function _fused_packP_tr!(
         Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
         KC::Int, NR::Int, sz::Int
     )
     V = Vec{8, Float64}; ng = (KC >> 3) << 3; ncg = (wid >> 3) << 3
-    @inbounds for i0 in 0:8:(ng - 1), vb in 0:8:(ncg - 1)
-        b = pB + (i0 + (jc + vb) * ldb) * sz
-        x0 = vload(V, b);           x1 = vload(V, b + ldb * sz);   x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
-        x4 = vload(V, b + 4ldb * sz); x5 = vload(V, b + 5ldb * sz);  x6 = vload(V, b + 6ldb * sz); x7 = vload(V, b + 7ldb * sz)
-        y0, y1, y2, y3, y4, y5, y6, y7 = _tr8x8(x0, x1, x2, x3, x4, x5, x6, x7)
-        p = Pp + (i0 * NR + vb) * sz
-        vstore(y0, p);          vstore(y1, p + NR * sz);   vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
-        vstore(y4, p + 4NR * sz); vstore(y5, p + 5NR * sz);  vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    # LOOP ORDER IS THE EXPERIMENT (_EXPFLAG[_EXP4]).
+    # Shipped order is i0 (rows) OUTER, vb (columns) INNER: the inner step jumps 8*ldb bytes across the
+    # whole panel width, then the outer loop RETURNS to re-sweep at the next row block — a repeatedly
+    # restarting strided walk, which is the opposite of what a hardware prefetcher tracks. AOCL's pack is
+    # a monotone ascending unit-stride sweep. Swapping to vb OUTER, i0 INNER gives, per 8-column group,
+    # 8 concurrent unit-stride streams advancing one cache line per step, ascending through the panel.
+    # Same loads, same stores, same transposes — only the visit order changes.
+    if _EXPFLAG[_EXP4]
+        @inbounds for vb in 0:8:(ncg - 1), i0 in 0:8:(ng - 1)
+            _packP_tr_blk!(Pp, pB, ldb, jc, NR, sz, i0, vb)
+        end
+    else
+        @inbounds for i0 in 0:8:(ng - 1), vb in 0:8:(ncg - 1)
+            _packP_tr_blk!(Pp, pB, ldb, jc, NR, sz, i0, vb)
+        end
     end
     @inbounds for v in ncg:(wid - 1)                          # tail columns (contiguous B reads down the column)
         scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
@@ -2490,7 +2512,20 @@ end
 # call (not per slab), so the load is free. Ships all-false: every index is an OFF-by-default probe knob.
 #   [1] tiny-k stripe width NR=2W instead of NR=NRV·W
 const _EXPFLAG = fill(false, 16)
-const _EXP_TINY_NR2 = 1
+# SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
+# only — no new binding, so Revise applies it in-session with zero recompile.
+# Adding a named const per knob DEFEATS the table and costs a full restart each time: Revise declares a
+# new top-level const without running its initializer, and the `@eval PureBLAS const X = n` workaround
+# is unsafe when the const is read from a @generated body — it invalidates the generator, so JIT
+# recompilation lands inside timed rounds (measured A/A sigma 0.008 -> 0.139). Do not add names below.
+const _EXP1, _EXP2, _EXP3, _EXP4, _EXP5, _EXP6, _EXP7, _EXP8 = 1, 2, 3, 4, 5, 6, 7, 8
+const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11, 12, 13, 14, 15, 16
+# REGISTRY — update these COMMENTS, never the const list above:
+#   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
+#   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
+#   _EXP3  bypass the Val{NG} tiny chain (A/B arm)       under measurement
+#   _EXP4  _fused_packP_tr! columns-outer (sequential)   under measurement
+#   _EXP5.._EXP16  free
 
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
 # This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
@@ -2501,7 +2536,26 @@ const _EXP_TINY_NR2 = 1
     ) where {K, NRVe, T}
     MR = _GT_MR
     K % MR == 0 || return :(throw(AssertionError("tiny fusedT stripe requires K%MR==0")))
+    W = _vwidth(T); sz = sizeof(T)
     body = Expr(:block, Expr(:meta, :inline))
+    # Cold-operand prefetch of this stripe's B block + the U triangle, RUNTIME-gated on _EXPFLAG so one
+    # build serves both arms of the A/B (branch-switching cost ~7 min per arm-run: a checkout
+    # invalidates the pkgimage, so each arm paid a full precompile plus a 243 MB pkgimage load).
+    # The flag is tested in the EMITTED code, not in the generator — a generator-time test would bake
+    # the choice in at first specialisation and the toggle would silently do nothing.
+    pf = Expr(:block)
+    for v in 0:(NRVe - 1), l in 0:(W - 1)
+        col = v * W + l
+        for r in 0:(cld(K * sz, 64) - 1)
+            push!(pf.args, :(_prefetch(pB + ((jc + $col) * ldb) * $sz + $(r * 64))))
+        end
+    end
+    for c in 0:(K - 1)                              # U column c holds rows 0..c (upper triangle)
+        for r in 0:(cld((c + 1) * sz, 64) - 1)
+            push!(pf.args, :(_prefetch(pU + ($c * ldu) * $sz + $(r * 64))))
+        end
+    end
+    push!(body.args, :(_EXPFLAG[_EXP2] && $pf))
     for si in (K ÷ MR - 1):-1:0                     # bottom slab first: back-substitution runs upward
         args = :(Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR))
         push!(body.args, Expr(:call, :_gemmtrsm_u_slab_ng!, args.args...))
@@ -2534,7 +2588,7 @@ end
     end
     return quote
         $(Expr(:meta, :inline))
-        if rem == 0                                  # rem>0 needs the ragged-tail mini-pack: general path
+        if rem == 0 && !_EXPFLAG[_EXP3]      # rem>0 needs the ragged-tail mini-pack: general path
             $chain
         end
         $fall
@@ -2590,7 +2644,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
         # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
         # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
-        NRl = (_EXPFLAG[_EXP_TINY_NR2] && KC <= _TRSM_DBASE) ? 2 * W : NR
+        NRl = (_EXPFLAG[_EXP1] && KC <= _TRSM_DBASE) ? 2 * W : NR
         jc = 0
         while jc < n
             wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
