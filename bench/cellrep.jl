@@ -49,6 +49,11 @@ const _OPENBLAS = B.get_config().loaded_libs[1].libname
 const OP = ARGS[1]
 const N = parse(Int, ARGS[2])
 _l1rep(s) = clamp(8_000_000 ÷ s, 30, 20000)          # plots.jl's _L1REP — the regime must match
+_l2rep(s) = clamp(400_000_000 ÷ (s * s), 30, 20000)  # plots.jl's _L2REP — O(s²) work
+# WHICH formula an op gets is part of the regime, not a detail: `_l1rep` on an O(s²) op asks for
+# 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
+# timed deep in a steady state the gate never enters.
+const _L2OPS = ("gemvN", "gemvT", "trmv")
 
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
@@ -151,7 +156,7 @@ const OPS = Dict(
 )
 haskey(OPS, OP) || error("cellrep: unknown op $OP (have: $(join(sort(collect(keys(OPS))), ", ")))")
 mk, pbw, refw = OPS[OP]
-reps = _l1rep(N)
+reps = (OP in _L2OPS ? _l2rep : _l1rep)(N)
 
 "Median-of-samples time for one arm, Chairmarks, fresh input per sample (plots.jl's `evals=1` regime)."
 function armtime(work)
