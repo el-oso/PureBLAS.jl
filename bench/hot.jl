@@ -24,6 +24,10 @@ using PureBLAS, LinearAlgebra, Printf, Statistics
 
 const FIFO = ARGS[1]
 BLAS.set_num_threads(1)
+# Preload the shared measurement helper ONCE, tracked. Probes then guard with
+# `isdefined(Main, :Measure) || include(...)`, so they never rebuild the module and never invalidate
+# the `tstat` binding Main holds.
+Revise.includet(joinpath(@__DIR__, "measure.jl"))
 println("<<<HOT-READY>>> pid=", getpid())
 flush(stdout)
 
@@ -39,12 +43,14 @@ while true
     t0 = time()
     try
         Revise.revise()                            # pick up src/ edits since the last command
-        # `includet`, not `include`: it executes the file AND puts it under Revise tracking, so helper
-        # modules a probe pulls in (bench/measure.jl) are revised in place instead of being REPLACED.
-        # Plain `include` re-runs `module Measure ... end` and builds a NEW module object, which silently
-        # invalidates the `tstat` binding Main imported from the previous one — that cost a failed probe
-        # run earlier (`UndefVarError: tstat not defined in Main`, after the header had already printed).
-        Revise.includet(abspath(cmd))
+        # `Base.include` for the PROBE, deliberately. A probe is a script: its whole content is
+        # top-level side effects, and `Revise.includet` does NOT re-execute top-level code on a
+        # subsequent call — it only re-tracks method definitions. Dispatching an already-tracked probe
+        # through includet returned "ok" in 0.0s having run NOTHING, silently.
+        # `includet` is still right for a helper MODULE (see the measure.jl preload below), where the
+        # problem it solves is that a plain re-`include` builds a NEW module object and invalidates the
+        # binding Main imported from the previous one.
+        Base.include(Main, abspath(cmd))
         @printf("<<<HOT-DONE ok %s %.1fs>>>\n", cmd, time() - t0)
     catch e
         showerror(stdout, e, catch_backtrace())
