@@ -200,15 +200,33 @@ duplicated here.
 ## Where we are
 
 **Zen4 (AVX-512, double-pumped).** The tuning target; gates essentially everywhere. Real
-residuals are worst-size only (`syrk` 0.94, `syr2k` 0.97, `trmm` 0.97 — geomeans all ≥ 1.07).
-Complex residuals are the shared LAPACK gaps plus an n=1024 complex BLAS-2 cluster —
-`zgeru` 0.817, `zgemvN` 0.848, `zgemvT` 0.855, `zgemvC` 0.877, and shallower `ztrmv`/`ztrsv`
-dips (0.948).
+residuals are worst-size only (`syrk` 0.95, `syr2k` 0.97, `trmm` 0.98 — geomeans all ≥ 1.05).
+The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells: `zgeru` 0.906
+(n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
 
 **Zen5 (AVX-512, native 512-bit).** Clears every AVX2 ceiling but shows a disjoint residual
-profile — the reason the gate is per-machine. Open: `gemvN` mid-n (~0.90; the m-inner panel
-that fixed Zen3/Zen4 regressed here and is gated off) and `trmv`/`trsv` in the DRAM regime at
-n=4096.
+profile — the reason the gate is per-machine. Open: `gemvN` (0.942, n=2048), `ger` (0.896,
+n=2048) and the complex pair `zgemvN`/`zgeru` (0.895/0.892, n=2048).
+
+::: warning Numbers on this page changed materially on 2026-08-09 — several were never real
+
+`bench/plots.jl` merges its cache per arm, so an A/B run with a `PUREBLAS_FORCE_<knob>` variable
+exported persisted its **deliberately non-default** PureBLAS arm next to reference arms measured in
+a different run, and every render afterwards republished it as the gate number. The Zen5 `gemvT`
+n=256 cell was published at **0.751** on that basis; measured with all three arms in one run it is
+**1.09**, and `PUREBLAS_FORCE_gemvt_deep=0` reproduces the bad record exactly. `gemvT` n=128 and
+`trmv` n=256 came from the same contamination.
+
+Everything above is now re-measured with all arms in a single run per box, at one commit, under a
+verified frequency lock. `save_cache` refuses to write while any `PUREBLAS_FORCE_*` is set, so this
+class of error cannot recur silently. The corrections did **not** all favour PureBLAS — `ztrsv` on
+Zen4 went from 0.991 to 0.865 and `ger` on Zen5 from 0.996 to 0.896.
+
+One caveat that survives: `neuromancer` (Zen5) is a laptop rather than a dedicated bench box, and
+repeated sweeps there move worst-cells by several points — `gemvT` n=2048 read 1.16 and 0.977 in two
+runs an hour apart at the same commit. Treat Zen5 cells within a few points of 1.0 as unresolved
+rather than as measurements; Zen3 and Zen4 are stable.
+:::
 
 **Zen3 (AVX2).** The hardest target: 16 ymm registers vs AVX-512's 32 zmm. Real surface gates
 except `trmm`/`trsm` worst sizes; complex carries the widest residual set (`zdot`, `ztrmm`
@@ -217,8 +235,11 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
 
 **Known open items** (tracked in [`ROADMAP.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/ROADMAP.md)):
 
-- `gemvN` Zen5 mid-n (~0.90): needs a native-512 lever; no config fix found.
-- `trmv`/`trsv` Zen5 n=4096 just under parity, and the Zen3 L2→L3 blocking edge at n=512.
+- `gemvT` n=2048 is now the one cell that misses on **all three** µarchs (0.96 / 0.94 / 0.97) — a
+  size-specific behaviour rather than three per-box stories, and the better-posed problem for it.
+- `gemvN` Zen5 n=2048 (0.942) and `ger` Zen5 n=2048 (0.896).
+- `trmv`/`trsv` Zen5 in the DRAM regime **now gate** (1.06 / 1.03 at n=4096) after the fuse-factor
+  routing landed; the residual `trmv` cell moved to n=256.
 - `hpmv` still per-column — port the spmv AP-residency panel to complex.
 - `trsm`/`ztrsm` side-L remain the flagship AOCL gaps (4K power-of-two aliasing in the
   column-lane back-substitution); side-R (`trsmR`/`ztrsmR`) is now gate-measured and mostly clears.

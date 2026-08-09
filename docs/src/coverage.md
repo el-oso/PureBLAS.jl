@@ -94,15 +94,15 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>asum</code></th><td class="b1"><span class="v">0.994</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.2</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=3000</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=100000</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>asum</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.26</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=10000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="b2"><span class="v">0.978</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>dot</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.14</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.66</span></td><td class="ok"><span class="v">1.71</span></td><td class="ok"><span class="v">1.5</span></td></tr>
-<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>izamax</code></th><td class="ok"><span class="v">1.41</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.67</span></td></tr>
-<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.71</span></td><td class="ok"><span class="v">1.92</span></td></tr>
-<tr><th><code>scal</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.985</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.87</span></td><td class="ok"><span class="v">1.9</span></td></tr>
+<tr><th><code>scal</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.994</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.0</span></td></tr>
 <tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.983</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=300000</span></td></tr>
 <tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=300000</span></td></tr>
 <tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=300000</span></td></tr>
@@ -114,23 +114,23 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.39</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.969</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.939</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=2048</span></td><td class="b4"><span class="v">0.751</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ger</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.77</span></td><td class="ok"><span class="v">1.91</span></td><td class="ok"><span class="v">1.46</span></td></tr>
-<tr><th><code>symv</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.967</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.985</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=256</span></td></tr>
-<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.962</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.17</span></td><td class="ok"><span class="v">1.02</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=512</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.923</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zgeru</code></th><td class="b3"><span class="v">0.861</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.903</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.33</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td><td class="b3"><span class="v">0.924</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.38</span></td></tr>
-<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.1</span></td></tr>
-<tr><th><code>ztrmv</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>ztrsv</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.923</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.4</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.21</span></td></tr>
+<tr><th><code>gemvN</code></th><td class="b1"><span class="v">0.998</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gemvT</code></th><td class="b2"><span class="v">0.96</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>ger</code></th><td class="b2"><span class="v">0.973</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.896</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.33</span></td><td class="ok"><span class="v">1.12</span></td></tr>
+<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.77</span></td><td class="ok"><span class="v">1.98</span></td><td class="ok"><span class="v">1.76</span></td></tr>
+<tr><th><code>symv</code></th><td class="b2"><span class="v">0.96</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.977</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td></tr>
+<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.966</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.02</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.895</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgeru</code></th><td class="b3"><span class="v">0.906</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.892</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td><td class="b3"><span class="v">0.933</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.37</span></td></tr>
+<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>ztrmv</code></th><td class="b2"><span class="v">0.984</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.04</span></td></tr>
+<tr><th><code>ztrsv</code></th><td class="b3"><span class="v">0.865</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=1024</span></td></tr>
 </tbody></table>
 ```
 
@@ -469,12 +469,15 @@ symbols** — they appear only in commented-out lines of the stdlib and have no 
 - **Routing is complete** — see the fallthrough ratchet above. Every operation in the tables reaches
   PureBLAS after `activate()`, and every one is numerically LAPACK-accurate.
 - **Performance is typically well ahead of both references but not yet uniformly so.** On the Zen4
-  sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 35 of the 85 measured
+  sweep the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 36 of the 83 measured
   rows clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly
   (0.9–0.99 at one or two sizes — often the smallest, where per-call overhead dominates and the
-  measurement is least stable). The deepest remaining misses on Zen4 are `zpotrfU` (0.692), `gbtrf`
-  (0.731), `trtrs` (0.753) and the complex BLAS-2 n=1024 cluster (`zgeru` 0.817, `zgemvN` 0.848,
-  `zgemvT` 0.855, `zgemvC` 0.877). Pivoted QR (`geqp3`) **used to sit here** at 0.84 geo / 0.51 worst,
+  measurement is least stable). The deepest remaining misses on Zen4 are `zpotrfU` (0.663 at n=32),
+  `gbtrf` (0.671 at n=128) and `ztrsv` (0.865 at n=1024). `trtrs` **used to sit here** at 0.753 and
+  now gates at every size (worst 1.005); so do `zgemvT` and `zgemvC`, which were published at 0.855
+  and 0.877 as part of a "complex BLAS-2 n=1024 cluster" that the 2026-08-09 re-measure dissolved —
+  what remains of it is `zgeru` (0.906) and `ztrsv`, at one size each rather than four ops at one
+  size. Pivoted QR (`geqp3`) **used to sit here** at 0.84 geo / 0.51 worst,
   an unblocked BLAS-2 implementation racing a blocked one; the blocked `dlaqps` port has since landed
   and it now gates on all three boxes (1.11 / 1.02 / 1.03). The other three that used to sit here —
   Bunch–Kaufman (`sytrf` was 0.15, `sytrs` 0.52) and banded LU (`gbtrf`, 0.48) — shared that
