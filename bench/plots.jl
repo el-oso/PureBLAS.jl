@@ -45,11 +45,13 @@ const _ARM_PB = "pb"
 # `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
 # iteration path; it is also the one that can silently go stale, which is why every arm carries its own
 # timestamp+commit and the table reports reference age rather than hiding it.
-const _ARMS_SEL = (i = findfirst(a -> startswith(a, "arms="), ARGS);
-                   isnothing(i) ? nothing : split(ARGS[i][6:end], ","))
+const _ARMS_SEL = let i = findfirst(a -> startswith(a, "arms="), ARGS)   # `let` — see _SELOP
+    isnothing(i) ? nothing : split(ARGS[i][6:end], ",")
+end
 # One cell, not a whole op: `op=trmv size=512`. Sizes are matched exactly against the op's own list.
-const _SELSIZE = (i = findfirst(a -> startswith(a, "size="), ARGS);
-                  isnothing(i) ? nothing : parse(Int, ARGS[i][6:end]))
+const _SELSIZE = let i = findfirst(a -> startswith(a, "size="), ARGS)   # `let` — see _SELOP below
+    isnothing(i) ? nothing : parse(Int, ARGS[i][6:end])
+end
 # AOCL = AMD's Zen-tuned AOCL-BLIS + AOCL-libFLAME, shipped as the `AOCL_jll` artifact (AMD's own release,
 # NOT generic blis_jll/libflame_jll). We LBT-forward its artifact .so paths directly (BLAS→libblis-mt,
 # LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
@@ -151,8 +153,12 @@ const _W64P = PureBLAS._vwidth(Float64)
 # µarch slug DERIVED from CPU detection (CLAUDE.md req#7 — not a manual flag), so Zen4 vs Zen5 (both
 # AVX-512) disambiguate on their own: Zen4 is double-pumped 512, Zen5 is native. Override stays as an
 # escape hatch (`slug=`/`isa=`) for an unknown box. This fixes the "run Zen5 without slug=zen5 → mislabel".
-const _ISAOVR = (i = findfirst(a -> startswith(a, "isa="), ARGS); isnothing(i) ? nothing : ARGS[i][5:end])
-const _SLUGOVR = (i = findfirst(a -> startswith(a, "slug="), ARGS); isnothing(i) ? nothing : ARGS[i][6:end])
+const _ISAOVR = let i = findfirst(a -> startswith(a, "isa="), ARGS)   # `let` — see _SELOP
+    isnothing(i) ? nothing : ARGS[i][5:end]
+end
+const _SLUGOVR = let i = findfirst(a -> startswith(a, "slug="), ARGS)  # `let` — see _SELOP
+    isnothing(i) ? nothing : ARGS[i][6:end]
+end
 const _HWB = PureBLAS._HW
 const _AUTOSLUG = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "avx512" : "zen5") :   # Zen4 dp-512 vs Zen5 native
     _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
@@ -210,8 +216,15 @@ end
 const _LITE = "lite" in ARGS
 const _NODRAW = "nodraw" in ARGS   # fleet boxes: measure + cache only, skip SVG/table render (so their
 # working tree stays clean → `git pull` never blocks). Render centrally.
-const _SELOP = (i = findfirst(a -> startswith(a, "op="), ARGS); isnothing(i) ? nothing : ARGS[i][4:end])
-const _SELGRP = (i = findfirst(a -> startswith(a, "group="), ARGS); isnothing(i) ? nothing : ARGS[i][7:end])
+# `let`, not a bare `(i = …; …)`: the bare form leaks a GLOBAL `i`, which made every later top-level
+# `for` that uses `i` emit a soft-scope warning — including the per-arm cache merge, the one loop where
+# nobody wants to be wondering whether `i` is the local it looks like.
+const _SELOP = let i = findfirst(a -> startswith(a, "op="), ARGS)
+    isnothing(i) ? nothing : ARGS[i][4:end]
+end
+const _SELGRP = let i = findfirst(a -> startswith(a, "group="), ARGS)
+    isnothing(i) ? nothing : ARGS[i][7:end]
+end
 _want(lvl, nm) = (isnothing(_SELOP) && isnothing(_SELGRP)) || _SELOP == nm || _SELGRP == lvl
 _cap(szs, maxn) = Tuple(s for s in szs if s <= maxn)   # per-op size cap (e.g. skip 4096 for slow ops)
 # lite caps sizes at 1024 (drops the expensive 2048/4096 tail) — keeps the meaningful mid-n range while
