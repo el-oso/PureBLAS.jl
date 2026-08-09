@@ -1,8 +1,8 @@
 _Measured (provenance):_
 
-- **Zen3 · AVX2** (`galen`) — AMD Ryzen 9 5900X 12-Core Processor, commit `b22a127`, 2026-08-09T00:51
-- **Zen4 · AVX-512** (`wintermute`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `b22a127`, 2026-08-09T00:45
-- **Zen5 · AVX-512** (`neuromancer`) — AMD Ryzen AI 5 340 w/ Radeon 840M, commit `b22a127`, 2026-08-09T00:03
+- **Zen3 · AVX2** (`galen`) — AMD Ryzen 9 5900X 12-Core Processor, commit `d42a93a`, 2026-08-09T04:24
+- **Zen4 · AVX-512** (`wintermute`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `d42a93a`, 2026-08-09T04:29
+- **Zen5 · AVX-512** (`neuromancer`) — AMD Ryzen AI 5 340 w/ Radeon 840M, commit `d42a93a`, 2026-08-09T04:34
 
 ### Real
 
@@ -18,7 +18,7 @@ _Measured (provenance):_
 | `gemvT` | 1.04 (0.97) | 1.09 (1.00) | 1.07 (1.00) |
 | `ger` | 1.45 (1.10) | 1.10 (0.98) | 1.03 (0.97) |
 | `symv` | 1.11 (0.97) | 1.25 (0.96) | 1.24 (1.01) |
-| `trmv` | 0.99 (0.97) | 1.01 (0.98) | 1.06 (0.92) |
+| `trmv` | 1.00 (0.97) | 1.01 (0.97) | 1.04 (0.97) |
 | `trsv` | 1.05 (1.02) | 1.02 (0.97) | 1.03 (0.98) |
 | `spmv` | 6.08 (2.44) | 5.28 (2.28) | 4.64 (1.97) |
 | `gbmvN` | 1.04 (1.03) | 1.44 (1.40) | 1.28 (1.24) |
