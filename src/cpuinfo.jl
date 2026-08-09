@@ -498,6 +498,50 @@ between candidates differing by a real 3-4%.
 @inline _tune_wins_it(wins::Int, rounds::Int = _TUNE_ROUNDS) = wins >= rounds - 1
 
 """
+    _tune_duel_pick(inc, cands) -> value or `nothing`
+
+Duel-based sibling of [`_tune_pick`](@ref): the SAME two rules, for sweeps whose arms are closures
+rather than pre-measured times. `cands` is an iterable of `(value, thunk)`.
+
+**THE BUG THIS EXISTS TO KILL.** Every duel-based sweep open-coded
+
+    for c in (8, 2, 1)                                    # some fixed order
+        _tune_wins_it(_tune_duel(inc, arm(c))) && return c
+    end
+
+which returns **the first candidate that beats the incumbent, in list order** — not the best one. It
+never compares the candidates against each other, so a non-monotonic optimum is unreachable and the
+shipped value depends on how someone wrote a tuple literal. Measured consequence (2026-08-09, Zen5):
+`_ger_np` shipped 8 while the gate showed 1 faster by ~12% at n=2048; 8 came first, beat the incumbent
+4, and 1 was never evaluated. The same loop also explains that knob's `1 8 8 8 8` instability across
+fresh processes — not a tie, a FALL-THROUGH: when 8's duel misses its supermajority, control reaches
+2 (fails) and then 1 (wins), so the answer flips on which duels happened to land.
+
+Both of `_tune_pick`'s rules are preserved:
+
+  * **Qualification is against the FIXED incumbent**, never a running best — so what a candidate must
+    beat does not depend on what won earlier (that is the documented hazard, see `_tune_pick`).
+  * **Selection is an argmin AMONG QUALIFIERS.** Comparing two qualifiers to each other is not the
+    forbidden re-basing: they have each already cleared the same fixed bar.
+
+Ties go to the incumbent (`nothing`), matching `_tune_pick`'s `0`. Costs at most `2N-1` duels against
+the old `N`; this runs once per process at load time, never in a kernel.
+"""
+function _tune_duel_pick(inc::FA, cands; kwargs...) where {FA}
+    champ = nothing
+    champ_f = inc
+    for (v, f) in cands
+        _tune_wins_it(_tune_duel(inc, f; kwargs...)) || continue   # bar = the INCUMBENT, fixed
+        if isnothing(champ)
+            champ = v; champ_f = f
+        elseif _tune_wins_it(_tune_duel(champ_f, f; kwargs...))     # argmin among qualifiers only
+            champ = v; champ_f = f
+        end
+    end
+    return champ
+end
+
+"""
     _tune_pick(t_inc, ts::NTuple{N,UInt64}) -> Int
 
 Which candidate displaces the incumbent? `0` keeps it; otherwise the index into `ts`. Pure — no clock,

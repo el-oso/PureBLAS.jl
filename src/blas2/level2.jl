@@ -1936,10 +1936,16 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
             Ar = Ref(As[1])
             rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
             inc() = _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 4)
-            for np in (8, 2, 1)                        # widest first; the default (4) is the incumbent
-                _tune_wins_it(_tune_duel(inc, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], np); refresh = rot)) && return np
-            end
-            return 4
+            # ⚠ WAS `for np in (8, 2, 1) … && return np` — first-past-the-post over a hand-written
+            # order, NOT an argmin. It shipped 8 on Zen5 while the gate measured 1 faster by ~12% at
+            # n=2048, because 8 came first, beat the incumbent 4, and 1 was never evaluated; the same
+            # loop produced `1 8 8 8 8` across five fresh processes (a fall-through, not a tie).
+            # `_tune_duel_pick` keeps the fixed-incumbent bar and adds the missing argmin.
+            cand = ((8, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 8)),
+                    (2, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 2)),
+                    (1, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 1)))
+            w = _tune_duel_pick(inc, cand; refresh = rot)
+            return isnothing(w) ? 4 : w
         catch
             return 4
         end
