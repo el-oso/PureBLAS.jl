@@ -974,6 +974,27 @@ end
 # `_NVREG` and `_L2_BYTES` are compile-time consts, so this const-folds to a branch on m·n and stays
 # trim-safe — and, unlike the `OncePerProcess` tuner it replaces, it allocates nothing, which is what
 # keeps `gemv!`'s all-paths @noalloc contract provable.
+#
+# ⚠⚠ RETRACTION — WHAT THIS DOES AND DOES NOT FIX. An earlier revision of this file claimed the deep
+# shape took Zen5 from 0.742 to 1.065 at n=256 and made real gemv-T pass at every size. THAT WAS
+# MEASURED ON A BOX WHOSE FREQUENCY LOCK HAD SILENTLY DROPPED (verified afterwards at 4841 MHz against
+# a 2000 MHz base). Worse, the A/B was TWO SEPARATE `plots.jl` invocations — deep-ON full-arm, then
+# deep-OFF `arms=pb` — so a clock floating BETWEEN invocations does not cancel the way it does inside
+# a same-run ratio. "The reference cancels" is true within a run and was applied across runs.
+# Re-measured on the re-locked box, clock verified 1991 MHz BEFORE and 1990 MHz AFTER:
+#     n=          64     128    256    512    1024   2048   4096
+#   deep ON     1.097  0.848  0.747  1.012  1.012  1.040  1.034
+#   deep OFF    0.914  0.856  0.762  1.017  1.013  1.050  1.045
+# THE HONEST RESULT: the deep shape fixes n=64 (+20% here, +15.6% Zen4, +28% Zen3) and does NOTHING at
+# n=128/256, which stay at 0.85/0.75 — the cells this campaign set out to close are STILL OPEN. That is
+# consistent with Zen4 and Zen3, whose A/Bs ran on verified-locked boxes and also gained only at n=64;
+# Zen5 looked different solely because of the unlocked measurement.
+# What survives and is worth keeping: the shape itself (a real +20% at n=64 on every box), and the LSR
+# address-chain finding in `_gemv_t_block!` — every NC>=8 arm before that fix was four streams plus a
+# dependency, so those older tables measured something other than what they claimed. But the L2-resident
+# deficit at n=128/256 on native-512 Zen5 is NOT explained and NOT closed. Do not read the pure-load
+# surface above as a solution to it — it explains why 8x4 beats 4x1 in a synthetic loop, and that gain
+# does not transfer to the live kernel at those two sizes.
 # `PUREBLAS_FORCE_gemvt_deep=0` disables the derived shape so the fleet validation can A/B it against
 # the narrow one IN ONE RUN. Gated on the pin like every other resolver here, so a pinned build (tests,
 # juliac) compiles it out and the all-paths @noalloc proof never sees a OncePerProcess.
