@@ -28,7 +28,9 @@ for ln in readlines(ARGS[1])
     p = split(ln, "\t"); d = Dict{String,Vector{Float64}}()
     for f in p[4:end]
         isempty(f) && continue
-        a,_,_,s = split(f, "|"; limit=4); d[a] = parse.(Float64, split(s, ","))
+        # arm|time|commit|ANCHOR|samples — 5 fields. This was written against the 4-field format and
+        # threw on every current cache ("cannot parse \"20.894|0.0088…\" as Float64").
+        a,_,_,_,s = split(f, "|"; limit=5); d[a] = parse.(Float64, split(s, ","))
     end
     haskey(d, "pb") || continue
     push!(rat, minimum(median(d[r] ./ d["pb"]) for r in ("openblas","aocl") if haskey(d, r)))
