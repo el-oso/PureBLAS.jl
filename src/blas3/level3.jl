@@ -2138,15 +2138,60 @@ end
 # emit identical memory traffic and only the register working set differs. NOT a keyword — keywords do
 # not participate in dispatch, so a `; vbase` overload would silently REPLACE the method above rather
 # than sit beside it.
+# Emits BOTH orders behind a runtime branch on _EXPFLAG[_EXP6]. It must be runtime: this generator
+# runs at GENERATION time, so a generator-level test would bake the choice in at first specialisation
+# and the A/B toggle would silently do nothing (the same trap the _EXP2 prefetch generator hit).
 function _slab_upk_fusedT_body_1(
         ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int
     ) where {T}
+    return quote
+        if _EXPFLAG[_EXP6]
+            $(_slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, true))
+        else
+            $(_slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false))
+        end
+    end
+end
+
+function _slab_body_ord(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int, hoist::Bool
+    ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
-    for r in 0:(MR - 1), v in 0:(NRV - 1)
-        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    # _EXP6 — SUBTRACT HOIST (miss-placement lever). Shipped order is: zero the accumulators, run the
+    # gemm, THEN load B and transpose it, then back-substitute. That puts B's cold miss burst
+    # immediately in front of the dependent back-substitution chain, where nothing can hide it — and
+    # the bottom slab, which runs FIRST, has ng==0, so it is pure exposed latency.
+    # Hoisted order issues the B loads + transpose BEFORE the gemm and seeds the accumulators with
+    # -B instead of zero, flipping the gemm to c -= u*x. Identical instruction count and identical
+    # register pressure (the `bc`/`br` values die into the accumulators before the gemm begins), so the
+    # WARM arm must be a statistical null — that null is the built-in control for this lever.
+    # Counters justify the target: at the gate working set we already fetch the compulsory ~222
+    # lines/call from L3+DRAM and overlap ~91% of that latency; only a handful of EXPOSED misses remain.
+    subtract = quote end
+    for v in 0:(NRV - 1)
+        for l in 0:(W - 1)
+            push!(
+                subtract.args,
+                :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
+            )
+        end
+        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
+        push!(subtract.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
+        for r in 0:(MR - 1)
+            cs = Symbol(:c, r, :_, v)
+            # hoisted: seed with B (gemm will subtract into it); shipped: acc holds Σ, so B - Σ.
+            push!(subtract.args, :($cs = $(hoist ? Symbol(:br, r) : :($(Symbol(:br, r)) - $cs))))
+        end
     end
-    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    if hoist
+        append!(body.args, subtract.args)                 # B first: its misses overlap the gemm below
+    else
+        for r in 0:(MR - 1), v in 0:(NRV - 1)
+            push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+        end
+    end
+    inner = quote end                                     # gemm: acc[r][v] ±= U[s+r,kk]·P[kk][v]
     for v in 0:(NRV - 1)
         push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * $ldp + $((vbase + v) * W)) * $sz)))
     end
@@ -2154,7 +2199,10 @@ function _slab_upk_fusedT_body_1(
         push!(inner.args, :(u = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
         for v in 0:(NRV - 1)
             cs = Symbol(:c, r, :_, v)
-            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+            # hoisted accumulators already hold B, so the gemm SUBTRACTS; otherwise it sums and the
+            # subtract step below computes B - Σ.
+            push!(inner.args, hoist ? :($cs = muladd(-u, $(Symbol(:x, v)), $cs)) :
+                :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
         end
     end
     if isnothing(ng)
@@ -2175,20 +2223,9 @@ function _slab_upk_fusedT_body_1(
             )
         )
     end
-    for v in 0:(NRV - 1)                                       # subtract: own rows read direct from B + transpose
-        for l in 0:(W - 1)
-            push!(
-                body.args,
-                :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
-            )
-        end
-        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
-        push!(body.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
-        for r in 0:(MR - 1)
-            cs = Symbol(:c, r, :_, v)
-            push!(body.args, :($cs = $(Symbol(:br, r)) - $cs))
-        end
-    end
+    # Shipped order: B is read AFTER the gemm, so its miss burst lands directly in front of the
+    # dependent back-substitution. Hoisted order emitted this block before the gemm instead (_EXP6).
+    hoist || append!(body.args, subtract.args)
     for i in (MR - 1):-1:0                                     # back-substitution, critical-path-first
         push!(body.args, :(d = $V(unsafe_load(rp + ($s + $i) * $sz))))
         for v in 0:(NRV - 1)
@@ -2523,9 +2560,11 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 # REGISTRY — update these COMMENTS, never the const list above:
 #   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
 #   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
-#   _EXP3  bypass the Val{NG} tiny chain (A/B arm)       under measurement
-#   _EXP4  _fused_packP_tr! columns-outer (sequential)   under measurement
-#   _EXP5.._EXP16  free
+#   _EXP3  bypass the Val{NG} tiny chain (A/B arm)       Val{NG} CONFIRMED KEEP (5.2%, 5.7 SE, n=240)
+#   _EXP4  _fused_packP_tr! columns-outer (sequential)   FALSIFIED (1.0025, n=240, powered null)
+#   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
+#   _EXP6  subtract hoist: B load+transpose BEFORE the gemm (miss PLACEMENT lever)
+#   _EXP7.._EXP16  free
 
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
 # This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
@@ -2613,7 +2652,13 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
         # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
         # negligible in L1). Fixes the small-k setup floor (s=24/32, the only genuinely setup-bound points).
-        directA = KC * KC * sz <= _L1_BYTES
+        # _EXP5: force the compact-U pack even when A is L1-sized. directA skips the pack and lets the
+        # slabs read U as SCALAR DEMAND LOADS from inside the gemm loop AND from inside the serial
+        # back-substitution chain — where a cold line is a full memory latency with nothing to overlap it.
+        # The pack below is a unit-stride streaming read: same lines, fetched as one frontloaded burst.
+        # Counters say this is the only live degree of freedom: at the gate working set we already pull
+        # 222 lines/call from L3+DRAM against a ~256-line compulsory floor, so it is not a bytes problem.
+        directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5]
         pUsrc = pA; lduse = lda
         if !directA
             @inbounds for c in 0:(KC - 1)                     # pack A's upper triangle → compact U (odd ldu)
