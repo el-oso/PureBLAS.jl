@@ -1146,7 +1146,9 @@ function trmm!(
         # decisive only from n>=1536, direct winning the small/mid band. If confirmed the fix is a trmm-owned
         # Measure-tier crossover (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX], default =
         # today's value so migration is zero-risk), NOT a change to gemm's constant.
-    elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX
+    elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX + _EXPINT[2] &&
+            !_EXPFLAG[_EXP9]
+        _EXPINT[3] = 1        # WITNESS: this branch ran. Assert it before believing any A/B on _EXP9.
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
         # but regressed k=768 and the public po2 A-pad path — non-robust, not worth the split.)
