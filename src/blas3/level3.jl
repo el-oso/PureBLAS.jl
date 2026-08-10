@@ -1137,6 +1137,15 @@ function trmm!(
         # side-L real large → K-range-trimmed single-pass packed (the straddling tile contracts only its
         # nonzero p-band, not the full kc zero-band — that band was the ~kc/k waste that capped the naive
         # packed trmm). Else (side R, complex/AD, small) → recursion-over-gemm! (no regression).
+        # OPEN HYPOTHESIS (task #134), recorded not wired: `_GEMM_UNPACK_MAX` is gemm's UNPACKED-vs-BLOCKED
+        # crossover, derived as 2·(nvreg−4)·W = 448 on both AVX-512 boxes and 96 on AVX2. Here it decides
+        # something else — recursion-over-gemm vs single-pass packed trmm, a different kernel PAIR on a
+        # different shape family, never measured at its own boundary. The gate loses 9-13% in
+        # 448 < n <= 480 on exactly the two boxes where this const is 448, and nowhere on the box where it
+        # is 96. Corroborating: the side-R analog `_TRMM_RPACK` WAS measured directly and found packed
+        # decisive only from n>=1536, direct winning the small/mid band. If confirmed the fix is a trmm-owned
+        # Measure-tier crossover (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX], default =
+        # today's value so migration is zero-risk), NOT a change to gemm's constant.
     elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
@@ -2037,9 +2046,16 @@ const _TRSM_FUSED_BASE = @load_preference(
     _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
 )::Int
 # Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
-# scalar dense base wins on the sub-µs tiny solve. MEASURED Zen4 crossover k≈16 = 2·_GT_W (fused beats dense
-# from k=16: e.g. k=24 15.9 vs 9.3 GF); below it dense wins (k=8 2.2 vs 1.7). Keyed on the SIMD width (the
-# setup is _GT_W-lane transposes). NEEDS Zen3/Zen5 validation (req#8b).
+# scalar dense base wins on the sub-µs tiny solve. DERIVE, keyed on the SIMD width because the setup is
+# _GT_W-lane transposes. Now validated on BOTH µarchs, so the req#8b debt note is discharged:
+#   Zen4 (2·_GT_W = 16): fused beats dense from k=16 (k=24 15.9 vs 9.3 GF); below it dense wins
+#                        (k=8 2.2 vs 1.7 GF) — the crossover sits AT the formula.
+#   Zen3 (2·_GT_W =  8): direct-leaf paired A/B 2026-08-10, routing bypassed, correctness 2e-16..2e-15 —
+#                        fused/dense = 0.4932 (k=8), 0.5596 (12), 0.4747 (16), 0.8726 (24), 0.8335 (32).
+#                        Fused wins at EVERY k down to the formula's value, so the crossover is at or
+#                        below 8 and the formula is safe (conservative if anything) on AVX2.
+# Two boxes, opposite W, crossover tracking 2·_GT_W both times ⇒ physically predictable ⇒ stays DERIVE.
+# No Measure tier: that is for optima that INVERT across µarchs, and this one does not.
 const _TRSM_FUSED_MIN = 2 * _GT_W
 # Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
 # the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
@@ -2116,75 +2132,222 @@ end
 # `_gemmtrsm_u_slab!` (reads U from the compact odd-ldu panel, col-major) but reads its own MR rows
 # STRAIGHT from B (in-register 8×8 transpose) for the subtract and writes solved rows to P (reuse) AND
 # transposed to B (final) — no standalone pack/unpack. REQUIRES W==MR==8 (AVX-512 f64), FULL stripe.
-@inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
-        Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
-        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
-    ) where {T, MR, NRV}
+# Body builder for the unpacked fusedT slab, shared by the runtime method below and the tiny-k `Val{NG}`
+# method further down. `s`/`KC` name runtime arguments (`Symbol`) or are literals; `ldp` likewise; `ng`, if
+# given, is the LITERAL gemm trip count and replaces the `s+MR : KC-1` bound with a `0:ng-1` counted loop.
+# WHY the literal-`ng` form exists: `@inline` does NOT propagate into a @generated body on Julia 1.12 (kb:
+# generated-inline-meta-hazard), so the runtime method survives as an `invoke` and its caller's `s`/`KC` can
+# never const-propagate in. That is harmless at large KC and first-order at tiny KC, where the four slabs
+# run only 0/8/16/24 gemm trips each: measured, the leaf sits 7-10x off its own FMA roofline at K=32 and
+# the miss is FLAT in n, the signature of per-iteration scaffolding rather than a fixed per-call cost
+# (bench/probes/trsm_leaf_shape.jl). Only the TRIP COUNT is lifted to compile time — the `s` offsets stay
+# runtime address math, which is cheap and, unlike inlining the whole sweep into one function, keeps the
+# 24 live accumulators inside ONE slab's register-allocation scope.
+function _slab_upk_fusedT_body(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int} = nothing,
+        incaddr::Bool = false
+    ) where {T}
+    return _slab_upk_fusedT_body_1(T, MR, NRV, s, KC, ldp, ng, 0, incaddr)
+end
+
+# The core emitter. `vbase` shifts this sweep's v-columns to lane group `vbase` of the NRV·W-wide stripe:
+# P and B offsets keep the FULL stripe geometry (`ldp`, and the `jc + v*W` column), so per-v and fused
+# emit identical memory traffic and only the register working set differs. NOT a keyword — keywords do
+# not participate in dispatch, so a `; vbase` overload would silently REPLACE the method above rather
+# than sit beside it.
+# Emits BOTH orders behind a runtime branch on _EXPFLAG[_EXP6]. It must be runtime: this generator
+# runs at GENERATION time, so a generator-level test would bake the choice in at first specialisation
+# and the A/B toggle would silently do nothing (the same trap the _EXP2 prefetch generator hit).
+function _slab_upk_fusedT_body_1(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int,
+        incaddr::Bool = false
+    ) where {T}
+    # _EXP6 (subtract hoist) is NOT wired: emitting both orders behind a runtime branch doubles every
+    # slab specialisation and the build did not finish in 72 minutes. If it is ever revisited, select the
+    # order at GENERATION time and pay a session restart per arm instead — the runtime-toggle trick that
+    # works for cheap flags does not scale to a structurally different body.
+    return _slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false, Symbol(""), incaddr)
+end
+
+function _slab_body_ord(
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int, hoist::Bool,
+        pfx::Symbol = Symbol(""), incaddr::Bool = false
+    ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
-    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
-    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
-    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
-    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
-    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
     body = quote end
-    for r in 0:(MR - 1), v in 0:(NRV - 1)
-        push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+    # _EXP6 — SUBTRACT HOIST (miss-placement lever). Shipped order is: zero the accumulators, run the
+    # gemm, THEN load B and transpose it, then back-substitute. That puts B's cold miss burst
+    # immediately in front of the dependent back-substitution chain, where nothing can hide it — and
+    # the bottom slab, which runs FIRST, has ng==0, so it is pure exposed latency.
+    # Hoisted order issues the B loads + transpose BEFORE the gemm and seeds the accumulators with
+    # -B instead of zero, flipping the gemm to c -= u*x. Identical instruction count and identical
+    # register pressure (the `bc`/`br` values die into the accumulators before the gemm begins), so the
+    # WARM arm must be a statistical null — that null is the built-in control for this lever.
+    # Counters justify the target: at the gate working set we already fetch the compulsory ~222
+    # lines/call from L3+DRAM and overlap ~91% of that latency; only a handful of EXPOSED misses remain.
+    # `pfx` namespaces every local, so TWO independent slabs can be emitted into ONE body and the
+    # scheduler can overlap their back-substitution chains. That is the ILP lever: measured, PB runs at
+    # IPC 1.16 against AOCL's 2.20 and pays 114 ns more exposed first-touch latency, while its kernel is
+    # 6.8% FASTER once pages are resident. More chains in flight is the only thing that addresses that.
+    cc_(r, v) = Symbol(pfx, :c, r, :_, v)
+    u_ = Symbol(pfx, :u); d_ = Symbol(pfx, :d)
+    # INCREMENTAL B ADDRESSING (`incaddr`). The shipped form recomputes `(jc + c)*ldb` for each of the
+    # NRV*W column constants c, on BOTH the load and the store side — with `jc` and `ldb` runtime, that is
+    # a genuine integer multiply per access. Measured in the emitted code (P6, 2026-08-10): 27 `imul` and
+    # 192 scalar address instructions per slab, 22.1% of the out-of-loop instruction count, which itself
+    # is the 18.6% fixed cost the leaf's `1/GF = α + β/KC` fit prices. Neither the transpose (~3.2% of
+    # total) nor the back-substitution (~2.8%) dominates that cost — this addressing does.
+    # The columns touched are CONSECUTIVE (vbase*W .. vbase*W + NRV*W - 1), so one base pointer plus a
+    # running `+= ldb*sz` replaces every one of those multiplies. Bit-identical: addressing only, the
+    # arithmetic and its order are untouched.
+    pbl_ = Symbol(pfx, :pbl); pbs_ = Symbol(pfx, :pbs); ldbs_ = Symbol(pfx, :ldbs)
+    if incaddr
+        push!(body.args, :($ldbs_ = ldb * $sz))
+        push!(body.args, :($pbl_ = pB + (($s) + (jc + $(vbase * W)) * ldb) * $sz))
+        push!(body.args, :($pbs_ = $pbl_))
     end
-    inner = quote end                                     # gemm: acc[r][v] += U[s+r,kk]·P[kk][v]
+    bload_(v, l) = incaddr ? :($pbl_) :
+        :(pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz)
+    bstore_(v, l) = incaddr ? :($pbs_) :
+        :(pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz)
+    subtract = quote end
     for v in 0:(NRV - 1)
-        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * ldp + $(v * W)) * $sz)))
+        for l in 0:(W - 1)
+            push!(subtract.args, :($(Symbol(pfx, :bc, l)) = vload($V, $(bload_(v, l)))))
+            incaddr && push!(subtract.args, :($pbl_ = $pbl_ + $ldbs_))
+        end
+        brs = Expr(:tuple, (Symbol(pfx, :br, l) for l in 0:(W - 1))...)
+        push!(subtract.args, Expr(:(=), brs, :(_tr8x8($((Symbol(pfx, :bc, l) for l in 0:(W - 1))...)))))
+        for r in 0:(MR - 1)
+            cs = cc_(r, v)
+            # hoisted: seed with B (gemm will subtract into it); shipped: acc holds Σ, so B - Σ.
+            push!(subtract.args, :($cs = $(hoist ? Symbol(pfx, :br, r) : :($(Symbol(pfx, :br, r)) - $cs))))
+        end
+    end
+    if hoist
+        append!(body.args, subtract.args)                 # B first: its misses overlap the gemm below
+    else
+        for r in 0:(MR - 1), v in 0:(NRV - 1)
+            push!(body.args, :($(cc_(r, v)) = zero($V)))
+        end
+    end
+    inner = quote end                                     # gemm: acc[r][v] ±= U[s+r,kk]·P[kk][v]
+    for v in 0:(NRV - 1)
+        push!(inner.args, :($(Symbol(pfx, :x, v)) = vload($V, Pp + (kk * $ldp + $((vbase + v) * W)) * $sz)))
     end
     for r in 0:(MR - 1)
-        push!(inner.args, :(u = $V(unsafe_load(Up + ((s + $r) + kk * ldu) * $sz))))
+        push!(inner.args, :($u_ = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
         for v in 0:(NRV - 1)
-            cs = Symbol(:c, r, :_, v)
-            push!(inner.args, :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+            cs = cc_(r, v)
+            # hoisted accumulators already hold B, so the gemm SUBTRACTS; otherwise it sums and the
+            # subtract step below computes B - Σ.
+            push!(inner.args, hoist ? :($cs = muladd(-$u_, $(Symbol(pfx, :x, v)), $cs)) :
+                :($cs = muladd($u_, $(Symbol(pfx, :x, v)), $cs)))
         end
     end
-    push!(
-        body.args, :(
-            for kk in UnitRange(s + $MR, KC - 1)
-                $inner
-            end
+    if isnothing(ng)
+        push!(
+            body.args, :(
+                for kk in UnitRange($s + $MR, $KC - 1)
+                    $inner
+                end
+            )
         )
-    )
-    for v in 0:(NRV - 1)                                       # subtract: own rows read direct from B + transpose
-        for l in 0:(W - 1)
-            push!(body.args, :($(Symbol(:bc, l)) = vload($V, pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
-        end
-        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
-        push!(body.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
-        for r in 0:(MR - 1)
-            cs = Symbol(:c, r, :_, v)
-            push!(body.args, :($cs = $(Symbol(:br, r)) - $cs))
-        end
+    elseif ng > 0                                          # literal trip count; ng==0 emits no loop at all
+        push!(
+            body.args, :(
+                for kkoff in 0:$(ng - 1)
+                    kk = $s + $MR + kkoff
+                    $inner
+                end
+            )
+        )
     end
+    # Shipped order: B is read AFTER the gemm, so its miss burst lands directly in front of the
+    # dependent back-substitution. Hoisted order emitted this block before the gemm instead (_EXP6).
+    hoist || append!(body.args, subtract.args)
+    # NOT incrementalised, deliberately — MEASURED WORSE. The same trick that wins on B (below/above) was
+    # applied to U here: `(s+i)*ldu` is a runtime multiply per i and the j-addresses are consecutive, so a
+    # column pointer walked by ldu*sz removes them. It REGRESSED: leaf KC=128 gain fell 3.0% -> 1.5%, and
+    # gate n=512 went 0.6% NEGATIVE. Cause: the pointer update is a serial dependency inserted into the
+    # BACK-SUBSTITUTION, which is already the critical path — the addressing multiplies it removes were
+    # off the critical path, being computed in parallel with the chain. On B the same edit is a clear win
+    # because those addresses feed independent loads/stores. Do not retry without changing the chain.
     for i in (MR - 1):-1:0                                     # back-substitution, critical-path-first
-        push!(body.args, :(d = $V(unsafe_load(rp + (s + $i) * $sz))))
+        push!(body.args, :($d_ = $V(unsafe_load(rp + ($s + $i) * $sz))))
         for v in 0:(NRV - 1)
-            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+            push!(body.args, :($(cc_(i, v)) = $(cc_(i, v)) * $d_))
         end
         for j in (i - 1):-1:0
-            push!(body.args, :(u = $V(unsafe_load(Up + ((s + $j) + (s + $i) * ldu) * $sz))))
+            push!(body.args, :($u_ = $V(unsafe_load(Up + (($s + $j) + ($s + $i) * ldu) * $sz))))
             for v in 0:(NRV - 1)
-                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
-                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+                cj = cc_(j, v); ci = cc_(i, v)
+                push!(body.args, :($cj = muladd(-$u_, $ci, $cj)))
             end
         end
     end
     for v in 0:(NRV - 1)                                       # store: → P row-major (reuse) AND transposed → B
         for r in 0:(MR - 1)
-            push!(body.args, :(vstore($(Symbol(:c, r, :_, v)), Pp + ((s + $r) * ldp + $(v * W)) * $sz)))
+            push!(
+                body.args,
+                :(vstore($(cc_(r, v)), Pp + (($s + $r) * $ldp + $((vbase + v) * W)) * $sz))
+            )
         end
-        ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:(W - 1))...)
-        push!(body.args, Expr(:(=), ccs, :(_tr8x8($((Symbol(:c, r, :_, v) for r in 0:(MR - 1))...)))))
+        ccs = Expr(:tuple, (Symbol(pfx, :cc, l) for l in 0:(W - 1))...)
+        push!(body.args, Expr(:(=), ccs, :(_tr8x8($((cc_(r, v) for r in 0:(MR - 1))...)))))
         for l in 0:(W - 1)
-            push!(body.args, :(vstore($(Symbol(:cc, l)), pB + ((s) + (jc + $(v * W + l)) * ldb) * $sz)))
+            push!(body.args, :(vstore($(Symbol(pfx, :cc, l)), $(bstore_(v, l)))))
+            incaddr && push!(body.args, :($pbs_ = $pbs_ + $ldbs_))
         end
     end
+    return body
+end
+
+# PAIRED GENERAL SLAB (_EXP8) — the n=32 ILP win, generalised to any KC.
+# Emits slab si of TWO independent column-stripes into ONE body (locals namespaced by prefix `a`/`b`),
+# so the scheduler overlaps their back-substitution chains. Generated on (MR, NRV) ONLY — `s` and `KC`
+# stay runtime — so code size is bounded and this works at every KC, unlike the Val{K}-unrolled tiny
+# variant whose 16 slabs at KC=128 would explode.
+# WHY IT SHOULD PAY MORE AT MID-n THAN AT n=32: the serial chain is (KC/MR) slabs x MR rows, so KC=128
+# gives 128 dependent steps against n=32's 32 — four times the latency to hide, with still only one
+# chain in flight today. Zen4 misses exactly there (128 0.911, 256 0.936, 512 0.961, 1024 0.984).
+# Both stripes share one P of row stride 2*NRV*W: stripe A at column base 0, stripe B at NRV.
+# The two stripes are ADJACENT (the stripe loop emits consecutive stripes), so one `jc` plus a column
+# base of 0 and NRV addresses both — for B *and* for P. Passing two independent jc values would need
+# vbase to shift P only, which it does not: vbase shifts both.
+@inline @generated function _gemmtrsm_u_slab_pair!(
+        Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
+    ) where {T, MR, NRV}
+    W = _vwidth(T)
+    (W == 8 && MR == 8) ||
+        return :(throw(AssertionError("paired fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    ldp = 2 * NRV * W                                    # shared P: stripe A [0,NRV*W), stripe B [NRV*W,ldp)
+    body = quote end
+    append!(body.args, _slab_body_ord(T, MR, NRV, :s, :KC, ldp, nothing, 0, false, :a).args)
+    append!(body.args, _slab_body_ord(T, MR, NRV, :s, :KC, ldp, nothing, NRV, false, :b).args)
     push!(body.args, :(return nothing))
     return body
 end
+
+@inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
+        Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
+        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}, ::Val{ADDR}
+    ) where {T, MR, NRV, ADDR}
+    W = _vwidth(T)
+    # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
+    # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
+    # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
+    # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
+    (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    # `ADDR` selects the B-addressing form at GENERATION time via a TYPE PARAMETER, so each specialisation
+    # emits exactly one variant. It must not be an `_EXPFLAG` read inside this generator — that would bake
+    # the choice in at first specialisation and leave a silently dead A/B arm (the _EXP2 prefetch trap).
+    body = _slab_upk_fusedT_body(T, MR, NRV, :s, :KC, :ldp, nothing, ADDR)
+    push!(body.args, :(return nothing))
+    return body
+end
+
 
 # Ragged bottom slab (rem<MR rows, [base,KC) → no rows below, pure solve), one NR stripe. Rare (KC not a
 # multiple of MR = non-power-of-2 leaves). NRV column-vectors, runtime row count. P row stride ldp.
@@ -2316,19 +2479,41 @@ end
 end
 # Pack B[:,jc:jc+wid) → P row-major (row i at Pp+i·NR) via 8×8 transpose for full 8-row × 8-col blocks;
 # scalar column-outer for the ragged row/col tails and the wid:NR zero-pad. Contiguous B reads throughout.
+# One 8x8 transposed block, factored out so the two visit orders below share an identical body.
+@inline function _packP_tr_blk!(
+        Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, NR::Int, sz::Int, i0::Int, vb::Int
+    )
+    V = Vec{8, Float64}
+    b = pB + (i0 + (jc + vb) * ldb) * sz
+    x0 = vload(V, b);             x1 = vload(V, b + ldb * sz);   x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
+    x4 = vload(V, b + 4ldb * sz); x5 = vload(V, b + 5ldb * sz);  x6 = vload(V, b + 6ldb * sz); x7 = vload(V, b + 7ldb * sz)
+    y0, y1, y2, y3, y4, y5, y6, y7 = _tr8x8(x0, x1, x2, x3, x4, x5, x6, x7)
+    p = Pp + (i0 * NR + vb) * sz
+    vstore(y0, p);              vstore(y1, p + NR * sz);   vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
+    vstore(y4, p + 4NR * sz);   vstore(y5, p + 5NR * sz);  vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    return nothing
+end
+
 @inline function _fused_packP_tr!(
         Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
         KC::Int, NR::Int, sz::Int
     )
     V = Vec{8, Float64}; ng = (KC >> 3) << 3; ncg = (wid >> 3) << 3
-    @inbounds for i0 in 0:8:(ng - 1), vb in 0:8:(ncg - 1)
-        b = pB + (i0 + (jc + vb) * ldb) * sz
-        x0 = vload(V, b);           x1 = vload(V, b + ldb * sz);   x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
-        x4 = vload(V, b + 4ldb * sz); x5 = vload(V, b + 5ldb * sz);  x6 = vload(V, b + 6ldb * sz); x7 = vload(V, b + 7ldb * sz)
-        y0, y1, y2, y3, y4, y5, y6, y7 = _tr8x8(x0, x1, x2, x3, x4, x5, x6, x7)
-        p = Pp + (i0 * NR + vb) * sz
-        vstore(y0, p);          vstore(y1, p + NR * sz);   vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
-        vstore(y4, p + 4NR * sz); vstore(y5, p + 5NR * sz);  vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    # LOOP ORDER IS THE EXPERIMENT (_EXPFLAG[_EXP4]).
+    # Shipped order is i0 (rows) OUTER, vb (columns) INNER: the inner step jumps 8*ldb bytes across the
+    # whole panel width, then the outer loop RETURNS to re-sweep at the next row block — a repeatedly
+    # restarting strided walk, which is the opposite of what a hardware prefetcher tracks. AOCL's pack is
+    # a monotone ascending unit-stride sweep. Swapping to vb OUTER, i0 INNER gives, per 8-column group,
+    # 8 concurrent unit-stride streams advancing one cache line per step, ascending through the panel.
+    # Same loads, same stores, same transposes — only the visit order changes.
+    if _EXPFLAG[_EXP4]
+        @inbounds for vb in 0:8:(ncg - 1), i0 in 0:8:(ng - 1)
+            _packP_tr_blk!(Pp, pB, ldb, jc, NR, sz, i0, vb)
+        end
+    else
+        @inbounds for i0 in 0:8:(ng - 1), vb in 0:8:(ncg - 1)
+            _packP_tr_blk!(Pp, pB, ldb, jc, NR, sz, i0, vb)
+        end
     end
     @inbounds for v in ncg:(wid - 1)                          # tail columns (contiguous B reads down the column)
         scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
@@ -2391,10 +2576,210 @@ end
             unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * Ppw + v) * sz))
         end
     end
+    # INCREMENTAL B ADDRESSING, shipped on (Val(true)). Bit-identical — addressing only, arithmetic and
+    # its order untouched (verified bit-for-bit at KC=128/256 n=240, KC=128 n=128, and ragged KC=170 n=96).
+    # Measured leaf speedup, direct-call paired A/B at n=240: KC=64 0.9554, 128 0.9697, 192 0.9775,
+    # 256 0.9779 — largest at small KC, as a per-slab FIXED cost must be. End-to-end at the gate shape
+    # n=128: 0.9704 (SE 0.0025, n=92). At n>=512 it reads null because the leaf's TIME SHARE is only
+    # 29%/15% there, so a 3% leaf win dilutes below resolution — that is dilution, not a dead arm.
+    # Only ONE Val is instantiated so this costs no extra specialisation.
     for si in (nfull - 1):-1:0
-        _gemmtrsm_u_slab_upk_fusedT!(Pp, Ppw, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe))
+        _gemmtrsm_u_slab_upk_fusedT!(Pp, Ppw, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe), Val(true))
     end
     return
+end
+
+# TWO ADJACENT STRIPES, slabs interleaved — the n=32 ILP win generalised to any KC (_EXP8).
+# Same shape as _fusedT_stripe! but each `si` step solves BOTH stripes in one body, so two independent
+# back-substitution chains are in flight. `rem > 0` (ragged bottom rows) falls back to the single-stripe
+# path: the tail needs its own mini-pack and is rare (KC not a multiple of MR).
+@inline function _fusedT_stripe_pair!(
+        ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int, pU::Ptr{T},
+        ldu::Int, rp::Ptr{T}, KC::Int, nfull::Int, MR::Int, sz::Int
+    ) where {T, NRVe}
+    for si in (nfull - 1):-1:0
+        _gemmtrsm_u_slab_pair!(Pp, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe))
+    end
+    return
+end
+
+# TINY-K SLAB: identical body to the general slab, but the gemm trip count is a literal `Val{NG}` and the
+# P stride folds out of `Val{NRV}`. One specialization per (NG, NRV) actually reachable — NG runs over
+# multiples of MR below the tiny-k cap, so this is a handful of small functions, not a copy of the sweep.
+@generated function _gemmtrsm_u_slab_ng!(
+        ::Val{NG}, ::Val{NRV}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int
+    ) where {NG, NRV, T}
+    W = _vwidth(T); MR = _GT_MR
+    # Throw-body, never an assert: generation must succeed on AVX2 for StrictMode's inference dogfood
+    # even though the caller's fusedT branch is runtime-dead there (same rule as the general slab).
+    (W == 8 && MR == 8) ||
+        return :(throw(AssertionError("tiny fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    body = _slab_upk_fusedT_body(T, MR, NRV, :s, nothing, NRV * W, NG)
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# FALSIFIED LEVER — per-v slab (MR live accumulators instead of MR·NRV). DO NOT RETRY.
+# The premise was sound and measured: the NRV=3 slab spills (asm scan, bench/probes/trsm_slab_spill.jl:
+# 40-51 stack vmov with 23-38 RELOADS at NRV=3, 30-41 with 0-1 reloads at NRV=2, zero at NRV=1), and the
+# v columns never couple, so sweeping them one at a time is the same arithmetic with half the registers.
+# It LOSES on every shape — same-process ABBA, bench/probes/trsm_perv_ab.jl, wintermute boost-locked:
+#   k=32 n=32 1.0015 · k=32 n=24 1.0764 · k=32 n=64 1.1091 · k=24 n=24 1.1039 · k=16 n=16 1.0370
+#   k=64 n=64 1.1953 · k=128 n=128 1.1031 · k=128 n=256 1.0939      (per-v/fused, >1 = per-v slower)
+# WHY: back-substitution is a SERIAL chain and the fused slab hides its latency with NRV-wide ILP —
+# NRV independent vector ops per step. Per-v runs that chain NRV times with none. The same effect is
+# already on record for the fullpack path ("its MR×NRV=24 v-lanes across the MR rows already saturate
+# ILP"). Spill traffic is real but second-order against back-sub latency; the register file is NOT the
+# binding constraint here, the dependency chain is.
+# WHAT THE SCAN DOES SUPPORT: NRV=2 is spill-free (0-1 reloads) AND keeps 2-wide ILP — that is the
+# surviving lever, and it also removes the ragged Val(1) tail stripe that n=32 gets under NR=24
+# (24+8 columns, so a quarter of them run at the very ILP the per-v result just showed is too thin).
+#
+# EXPERIMENT FLAG TABLE. Same-process A/B switches live here as INDICES into one pre-declared array,
+# never as new `const` bindings. Reason is workflow, not style: Revise cannot introduce a new const into
+# a loaded module, so every `const _FOO = Ref(false)` costs a full hot-session restart (~5 min of
+# PureBLAS precompile) — that happened twice on 2026-08-09 and is pure dead time. Mutating an element of
+# an existing array needs no restart, so an A/B knob added mid-session iterates in seconds. Generalises
+# the `_TRSM_FUSEDT_ON` / `_TRSM_FULLPACK_ON` convention this file already uses. Read once per `trsm!`
+# call (not per slab), so the load is free. Ships all-false: every index is an OFF-by-default probe knob.
+#   [1] tiny-k stripe width NR=2W instead of NR=NRV·W
+# Integer companion to _EXPFLAG, pre-declared for the same reason: a new const costs a full session
+# restart (Revise leaves it unassigned, and the @eval workaround is unsafe when a @generated body reads
+# it). Sweeps assign an ELEMENT.
+#   _EXPINT[1]  extra Float64 slots between P and the U pack — workspace alignment (see the buf note)
+#               FALSIFIED 2026-08-10: flat over a full L1-way period on both boxes. Kept inert (0) so the
+#               negative result stays reproducible.
+#   _EXPINT[2..4]  free
+# WITNESS SLOTS exist because of the F1 failure on 2026-08-10: a pad sweep produced a clean, well-behaved,
+# entirely believable null while the knob's branch was never in the call graph for that shape at all
+# (square B at n=32 on AVX2 routes to `_trsm_dense_L!`). Reasoning about routing from the source is what
+# FAILED; a witness is an execution fact. Zero the slot, run one untimed call, assert it is 1 — then
+# measure. Never publish an A/B whose witness did not fire.
+const _EXPINT = fill(0, 4)
+const _EXPFLAG = fill(false, 16)
+# SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
+# only — no new binding, so Revise applies it in-session with zero recompile.
+# Adding a named const per knob DEFEATS the table and costs a full restart each time: Revise declares a
+# new top-level const without running its initializer, and the `@eval PureBLAS const X = n` workaround
+# is unsafe when the const is read from a @generated body — it invalidates the generator, so JIT
+# recompilation lands inside timed rounds (measured A/A sigma 0.008 -> 0.139). Do not add names below.
+const _EXP1, _EXP2, _EXP3, _EXP4, _EXP5, _EXP6, _EXP7, _EXP8 = 1, 2, 3, 4, 5, 6, 7, 8
+const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11, 12, 13, 14, 15, 16
+# REGISTRY — update these COMMENTS, never the const list above:
+#   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
+#   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
+#   _EXP3  bypass the Val{NG} tiny chain (A/B arm)       Val{NG} CONFIRMED KEEP (5.2%, 5.7 SE, n=240)
+#   _EXP4  _fused_packP_tr! columns-outer (sequential)   FALSIFIED (1.0025, n=240, powered null)
+#   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
+#   _EXP6  subtract hoist — NOT WIRED (both-orders emission doubles every slab; >72 min build)
+#   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
+#   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
+#          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
+#   _EXP9.._EXP16  free
+
+# ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
+# At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
+# so exactly ONE back-substitution chain is ever in flight: 4 slabs x MR rows of serial dependency,
+# twice. The two stripes are INDEPENDENT — nothing in stripe1 reads stripe0 — so emitting slab si of
+# both into ONE body lets the scheduler overlap the two chains.
+# WHY THIS AND NOT MORE TRAFFIC WORK: measured, PB's kernel is 6.8% FASTER than AOCL with pages resident
+# (1631 vs 1743 ns) but pays 114 ns MORE first-touch cost (777 vs 663) and runs at IPC 1.16 vs 2.20.
+# PB EXPOSES latency AOCL OVERLAPS. Seven traffic levers moved nothing because none shortens or
+# duplicates a dependency chain. Recovering the exposure gap puts PB ~110 ns ahead (~4.5%).
+# LAYOUT: both stripes share one P of row stride NR+W, stripe0 at P columns [0,NR), stripe1 at
+# [NR,NR+W) — expressed through the existing `vbase`, so no new addressing. jc is 0 for both; stripe1's
+# B columns fall out of vbase = NRV.
+# REGISTER BUDGET: MR*(NRV+1) = 32 accumulators, exactly the AVX-512 file. Affordable on the evidence
+# that NRV=3 already wins WHILE spilling 23-38 reloads — chains beat pressure on this kernel.
+# NOTE the U pointer parameter MUST be named `Up`: the emitted slab body references `Up` directly
+# (it is inlined here, not passed as an argument), so a `pU` parameter leaves the body resolving `Up`
+# to a nonexistent module global and it fails at RUNTIME, not at generation.
+@generated function _fusedT_pair_tiny!(
+        ::Val{K}, ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}
+    ) where {K, NRVe, T}
+    W = _vwidth(T); MR = _GT_MR
+    (W == 8 && MR == 8 && K % MR == 0) ||
+        return :(throw(AssertionError("tiny fusedT pair requires W==MR==8 and K%MR==0")))
+    ldp = (NRVe + 1) * W                       # one shared P: stripe0 [0,NRVe*W), stripe1 [NRVe*W, ldp)
+    body = quote end
+    for si in (K ÷ MR - 1):-1:0                # bottom slab first: back-substitution runs upward
+        s = si * MR; ng = K - s - MR
+        # stripe0: NRVe wide at P/B column base 0.  stripe1: 1 wide at base NRVe.
+        append!(body.args, _slab_body_ord(T, MR, NRVe, s, K, ldp, ng, 0, false, :a).args)
+        append!(body.args, _slab_body_ord(T, MR, 1, s, K, ldp, ng, NRVe, false, :b).args)
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
+# This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
+# kernels; expressed as one generator it is the same coverage with none of the maintenance.
+@inline @generated function _fusedT_stripe_tiny!(
+        ::Val{K}, ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        pU::Ptr{T}, ldu::Int, rp::Ptr{T}
+    ) where {K, NRVe, T}
+    MR = _GT_MR
+    K % MR == 0 || return :(throw(AssertionError("tiny fusedT stripe requires K%MR==0")))
+    W = _vwidth(T); sz = sizeof(T)
+    body = Expr(:block, Expr(:meta, :inline))
+    # Cold-operand prefetch of this stripe's B block + the U triangle, RUNTIME-gated on _EXPFLAG so one
+    # build serves both arms of the A/B (branch-switching cost ~7 min per arm-run: a checkout
+    # invalidates the pkgimage, so each arm paid a full precompile plus a 243 MB pkgimage load).
+    # The flag is tested in the EMITTED code, not in the generator — a generator-time test would bake
+    # the choice in at first specialisation and the toggle would silently do nothing.
+    pf = Expr(:block)
+    for v in 0:(NRVe - 1), l in 0:(W - 1)
+        col = v * W + l
+        for r in 0:(cld(K * sz, 64) - 1)
+            push!(pf.args, :(_prefetch(pB + ((jc + $col) * ldb) * $sz + $(r * 64))))
+        end
+    end
+    for c in 0:(K - 1)                              # U column c holds rows 0..c (upper triangle)
+        for r in 0:(cld((c + 1) * sz, 64) - 1)
+            push!(pf.args, :(_prefetch(pU + ($c * ldu) * $sz + $(r * 64))))
+        end
+    end
+    push!(body.args, :(_EXPFLAG[_EXP2] && $pf))
+    for si in (K ÷ MR - 1):-1:0                     # bottom slab first: back-substitution runs upward
+        args = :(Val($(K - si * MR - MR)), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, $(si * MR))
+        push!(body.args, Expr(:call, :_gemmtrsm_u_slab_ng!, args.args...))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Route a stripe to the straight-line sweep when KC is one of the multiples of MR at or below the tiny-k
+# entry cap `_TRSM_DBASE`. Both bounds are existing consts — no new tuning constant. The chain is emitted
+# from them at generation time, so a pinned `_TRSM_DBASE` re-derives its own coverage, and every `Val` is
+# a generation-time literal (trim-safe: no runtime→Val).
+@inline @generated function _fusedT_stripe_k!(
+        ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int, pU::Ptr{T},
+        ldu::Int, rp::Ptr{T}, KC::Int, nfull::Int, rem::Int, MR::Int, sz::Int
+    ) where {T, NRVe}
+    fall = :(return _fusedT_stripe!(Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp, KC, nfull, rem, MR, sz))
+    if _vwidth(T) != 8 || _GT_MR != 8
+        return quote
+            $(Expr(:meta, :inline))
+            $fall
+        end
+    end
+    chain = Expr(:block)
+    for K in _GT_MR:_GT_MR:_TRSM_DBASE
+        push!(
+            chain.args,
+            :(KC == $K && return _fusedT_stripe_tiny!(Val($K), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp))
+        )
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        if rem == 0 && !_EXPFLAG[_EXP3]      # rem>0 needs the ragged-tail mini-pack: general path
+            $chain
+        end
+        $fall
+    end
 end
 function _trsm_fused_L!(unit::Bool, A, B)
     T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
@@ -2407,15 +2792,42 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # column at stride ldu·sz, and a po2 ldu (KC=128) collapses those onto few L1 sets — an odd ld can never
     # be a way-stride multiple, so the re-reads stay conflict-free (mirrors _trsm_rpack's odd-ld trick).
     ldu = KC | 1
-    buf = _trsm_fused_buf(T, KC * NR + KC * ldu + KC)
+    # P is sized for the WIDEST stripe layout any path here can use, not just NR. The interleaved-pair
+    # paths share one P across two stripes: 2*NR columns for `_fusedT_stripe_pair!`, NR+W for the tiny
+    # `_fusedT_pair_tiny!`. Sizing P at NR silently overflowed into the U-pack region — harmless only by
+    # accident at k=32 (directA leaves that region unused and `rp` sits beyond the spill), which is
+    # exactly the kind of luck that turns into a corruption bug the moment directA is false.
+    #
+    # The sizing above is a CORRECTNESS fix and nothing more. An earlier version of this comment claimed
+    # the resulting OFFSET was performance-critical (Zen3 n=128 0.942->0.995, n=32 0.927->0.9165, "the
+    # only change is the layout"). RETRACTED 2026-08-10 — both halves were wrong:
+    #   * n=32 could not have been affected at all. Square B at n=32 on AVX2 fails the `_GT_TRANSPOSE`
+    #     conjunct below and routes to `_trsm_dense_L!`, which never allocates this buffer. bench/plots.jl
+    #     uses that same square shape, so the gate cell takes that path too. That delta was cross-run
+    #     drift between two commits, i.e. exactly the cross-run comparison our own rules forbid.
+    #   * n=128 does not survive a controlled test. `_EXPINT[1]` was swept over a FULL L1-way period
+    #     (0..512 slots = 4096 B = one way of a 32K 8-way L1) on both boxes: flat 1.000, and at Zen3
+    #     k=128 with a clean instrument (base SE 0.0012) flat to +-0.004. A P/U set-conflict mechanism
+    #     would have to show structure over a full period. It shows none.
+    # `_EXPINT[1]` is kept as an inert sweep knob (default 0) so the negative result stays reproducible.
+    # Do NOT reopen "workspace alignment" as a trsm lever without a NEW mechanism and a live-knob witness.
+    buf = _trsm_fused_buf(T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
-        pU = Pp + KC * NR * sz; rp = pU + KC * ldu * sz
+        # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
+        # write P columns up to 2*NR and would otherwise land on top of the U pack.
+        pU = Pp + (KC * 2 * NR + _EXPINT[1]) * sz; rp = pU + KC * ldu * sz
         # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
         # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
         # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
         # negligible in L1). Fixes the small-k setup floor (s=24/32, the only genuinely setup-bound points).
-        directA = KC * KC * sz <= _L1_BYTES
+        # _EXP5: force the compact-U pack even when A is L1-sized. directA skips the pack and lets the
+        # slabs read U as SCALAR DEMAND LOADS from inside the gemm loop AND from inside the serial
+        # back-substitution chain — where a cold line is a full memory latency with nothing to overlap it.
+        # The pack below is a unit-stride streaming read: same lines, fetched as one frontloaded burst.
+        # Counters say this is the only live degree of freedom: at the gate working set we already pull
+        # 222 lines/call from L3+DRAM against a ~256-line compulsory floor, so it is not a bytes problem.
+        directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5]
         pUsrc = pA; lduse = lda
         if !directA
             @inbounds for c in 0:(KC - 1)                     # pack A's upper triangle → compact U (odd ldu)
@@ -2440,21 +2852,52 @@ function _trsm_fused_L!(unit::Bool, A, B)
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
+        # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
+        # 23-38 reloads at NRV=3, 0-1 at NRV=2, 0 at NRV=1) AND an NR=24 stripe leaves n=32 as 24+8, so a
+        # quarter of the columns run as a Val(1) tail whose back-substitution has no ILP to hide its
+        # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
+        # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
+        # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
+        NRl = (_EXPFLAG[_EXP1] && KC <= _TRSM_DBASE) ? 2 * W : NR
+        # _EXP7 — ILP lever. At exactly n = NR+W with a tiny KC (the gate cell: k=32, n=32 = 24+8) solve
+        # BOTH stripes in one paired body so their independent back-substitution chains overlap, instead
+        # of running them back to back with only one chain ever in flight. Buffer note: the pair uses a
+        # shared P of row stride NR+W, which is <= the KC*NR+... allocation already made above.
+        # Pair path is ON by default now (measured 0.8522 paired/sequential, n=240, 22.7 SE,
+        # bit-for-bit identical output). _EXP7 is retained INVERTED as the A/B disable so the
+        # sequential arm stays reachable in-process.
+        if !_EXPFLAG[_EXP7] && fusedT && rem == 0 && n == NR + W && KC == 32
+            _fusedT_pair_tiny!(Val(32), Val(NRV), Pp, pB, ldb, 0, pUsrc, lduse, rp)
+        else
         jc = 0
         while jc < n
-            wid = min(NR, n - jc)                         # real columns this stripe (last may be < NR)
+            wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
             # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
             # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
-            if fusedT && wid == NR
-                _fusedT_stripe!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+            # PAIR TWO ADJACENT FULL STRIPES so their back-substitution chains overlap.
+            # DOMAIN IS SMALL KC, and that is measured, not assumed: at KC <= _TRSM_DBASE each slab's
+            # gemm runs only ~12 trips on average and cannot hide the serial chain, so a second chain
+            # pays (n=32 gate 0.898 -> 1.105). At larger KC the gemm already runs up to KC-s-MR trips
+            # and supplies that independent work itself, so pairing only adds register pressure
+            # (2*MR*NRV = 48 live accumulators against 32) — measured 6.2% / 4.2% / 2.6% SLOWER at
+            # k=128 / 256 / 512, the penalty shrinking exactly as the gemm's share of the slab grows.
+            # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
+            # rows) keeps the single-stripe path: the tail needs its own mini-pack.
+            if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
+                    KC <= _TRSM_DBASE && jc + 2 * NR <= n
+                _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
+                jc += 2 * NR; continue
+            end
+            if fusedT && wid == NRl && NRl == NR
+                _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += NR; continue
-            elseif fusedT && NRV >= 3 && wid == 2 * W
-                _fusedT_stripe!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+            elseif fusedT && wid == 2 * W
+                _fusedT_stripe_k!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += 2 * W; continue
             elseif fusedT && wid == W
-                _fusedT_stripe!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                _fusedT_stripe_k!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += W; continue
             end
             if useT
@@ -2505,8 +2948,13 @@ function _trsm_fused_L!(unit::Bool, A, B)
                     end
                 end
             end
-            jc += NR
+            # `wid`, not NR: this path packs/solves/unpacks exactly `wid` real columns. Identical to the
+            # old `jc += NR` whenever NRl == NR (wid < NR only on the final partial stripe, where
+            # wid == n-jc ends the loop either way), but required once NRl < NR — there `wid` can be a
+            # full NRl stripe with columns still to come, and advancing by NR would SKIP NR-NRl of them.
+            jc += wid
         end
+        end                                   # else-branch of the _EXP7 paired-stripe dispatch
     end
     return B
 end
@@ -2811,8 +3259,11 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
             # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
             # the scalar dense base (~15 GF) vs the fused leaf's ~26 GF. Measured Zen4 vs AOCL: k=48 0.53→0.94,
-            # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans / non-AVX-512 keep the dense base.
-            if up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE &&
+            # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans keep the dense base.
+            # `_GT_TRANSPOSE` REMOVED 2026-08-10 — same reason as the tiny-k bypass in `trsm!` (see the long
+            # note there): it is the fusedT slabs' capability bit, not a crossover, and it stranded AVX2 on
+            # the dense base at k=48/64 where the leaf measures 20.7% / 25.9% faster on galen.
+            if up && !tr && _TRSM_FUSED_ON[] &&
                     _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
                 return _trsm_fused_L!(unit, A, B)
             end
@@ -3266,9 +3717,21 @@ function trsm!(
             return B
         end
         # k in [_TRSM_FUSED_MIN, _TRSM_DBASE]: the fused gemmtrsm leaf beats the scalar dense base even here
-        # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans AVX-512, fusable),
+        # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans, fusable),
         # keeping the low-overhead tiny entry. Below _TRSM_FUSED_MIN the dense base wins (setup unamortized).
-        if sl && up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
+        # `_GT_TRANSPOSE` REMOVED 2026-08-10. It is a CAPABILITY bit for the 8x8-transpose fusedT slabs
+        # (_GT_W == 8), and it belongs inside the leaf — where it still is, at `useT` — not on the decision
+        # to ENTER the leaf. Used here it silently pinned all of AVX2 to the scalar dense base, and the
+        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on galen (Zen3), routing
+        # bypassed, correctness checked first at max|dense-fused| ~ 1.3e-15:
+        #     k=32  fused/dense 0.8381  SE 0.0018  n=105   (fused 16.2% FASTER)
+        #     k=48  fused/dense 0.7935  SE 0.0015  n=56    (20.7% faster)
+        #     k=64  fused/dense 0.7408  SE 0.0043  n=48    (25.9% faster)
+        # The leaf was already production-proven on AVX2 via the wide-B branch (_trsm_left!), which calls it
+        # with no such guard — so this deletes an unmeasured restriction, it does not enable new code.
+        # Float32 is still excluded by `_trsm_fusable` (eltype(B) === Float64, measured -18% if fused), and
+        # AVX-512 is unaffected because the conjunct was `true` there.
+        if sl && up && !tr && _TRSM_FUSED_ON[] && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
             return _trsm_fused_L!(unit, A, B)
         end
         # Side-L: the dispatch-skip criterion is n-DEPENDENT, exactly as the side-R note below says of
@@ -4352,12 +4815,15 @@ end
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
-# diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) from the
-# register file via `_at_rank_k_pack_cut` = (7·(nvreg−4)·W)/4 — same REGISTER-capacity criterion as gemm's
-# unpack cut, ×7/4 (vs gemm ×2) for the recursion's extra flop/split cost (see cpuinfo.jl). Reproduces galen
-# 84 (measured: recursion wins n≈40–80, packed decisive n≥96 — routes n=80→recursion, 96→packed; the old
-# literal 23 mis-routed n=48/80 to the slower packed path, causing the galen AOCL misses there). Predicts
-# Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX=448 placeholder — A/B on the AVX-512 boxes). Overridable per machine.
+# diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
+# `_at_rank_k_pack_cut`, which is PATH-DEPENDENT — read cpuinfo.jl:212-227 for the authoritative form:
+#   AVX2 multi-pack `_trgemm_packed!`  -> (7·(nvreg−4)·W)/4, reproduces galen 84 (measured: recursion wins
+#     n≈40–80, packed decisive n≥96; the old literal 23 mis-routed n=48/80 and caused the galen AOCL misses)
+#   AVX-512 unified single-pack `_trgemm_packed_u!` -> W, because half the pack traffic makes packed win
+#     from ≈W up.
+# An earlier version of this comment predicted "Zen4/Zen5 392" from the ×7/4 form. That is FALSIFIED and no
+# longer what the code computes: 392 mis-routed all n≤256 to the recursion and WAS the syrk n=128 gate miss
+# (Zen5 0.88 / Zen4 0.91); packed is +14% there. Fleet-validated AVX-512 -> W. Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
