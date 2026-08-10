@@ -24,7 +24,7 @@ using Chairmarks, Printf, Statistics
 include(joinpath(@__DIR__, "measure.jl"))
 using .Measure: tstat
 
-export ab
+export ab, sweep
 
 """
     ab(; name, arm, setup, work, reset=nothing, aa_rounds=40, min_rounds=40, samples=8,
@@ -90,6 +90,46 @@ function ab(; name::AbstractString, arm, setup, work, reset = nothing,
     isnothing(target) ||
         @printf("  target %.4f => %s\n", target, m <= target ? "MET" : "NOT met")
     return (m, se, verdict)
+end
+
+"""
+    sweep(; name, set, values, setup, work, reset=nothing, rounds=12, samples=6, base=first(values))
+
+Multi-VALUE sweep (a knob with more than two settings), reported as ratios against `base`.
+
+It exists because a sweep is NOT a series of independent timings and must not be written as one. The
+naive shape — measure base, then every value in a fixed order — puts every value AFTER the base within
+a round and pushes later values progressively further from it in time, so any within-round drift biases
+the whole row in one direction. I wrote exactly that, labelled it "ABBA-rotated", and it was neither.
+
+Here each round visits the values in a ROTATED order (round r starts at value r mod N) and re-times the
+base ADJACENT to each value, so every ratio is a locally-paired comparison and position within the round
+averages out across rounds. Statistic is the median of per-round ratios.
+"""
+function sweep(; name::AbstractString, set, values, setup, work, reset = nothing,
+        rounds::Int = 12, samples::Int = 6, base = first(values))
+    isnothing(reset) || reset()
+    t1(v) = (set(v); tstat(Float64[x.time for x in
+        (@be setup() (p -> work(p)) evals = 1 samples = samples).samples]))
+    vals = collect(values)
+    acc = Dict(v => Float64[] for v in vals)
+    for r in 1:rounds
+        order = circshift(vals, r)                      # rotate: no value is always measured last
+        for v in order
+            b1 = t1(base)                               # base re-timed ADJACENT to each value
+            tv = t1(v)
+            b2 = t1(base)
+            push!(acc[v], tv / ((b1 + b2) / 2))         # bracket the value with base on both sides
+        end
+    end
+    isnothing(reset) || reset()
+    println("\n=== SWEEP: ", name, "  (ratio vs ", base, "; <1 is FASTER) ===")
+    for v in vals
+        m = tstat(acc[v]); se = std(acc[v]) / sqrt(length(acc[v]))
+        @printf("  %-10s %.4f   SE %.4f   n=%d%s\n", string(v), m, se, length(acc[v]),
+                v == base ? "   <- base (sanity: must be ~1.000)" : "")
+    end
+    return Dict(v => tstat(acc[v]) for v in vals)
 end
 
 end # module
