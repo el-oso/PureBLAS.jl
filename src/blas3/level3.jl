@@ -2266,6 +2266,13 @@ function _slab_body_ord(
     # Shipped order: B is read AFTER the gemm, so its miss burst lands directly in front of the
     # dependent back-substitution. Hoisted order emitted this block before the gemm instead (_EXP6).
     hoist || append!(body.args, subtract.args)
+    # NOT incrementalised, deliberately — MEASURED WORSE. The same trick that wins on B (below/above) was
+    # applied to U here: `(s+i)*ldu` is a runtime multiply per i and the j-addresses are consecutive, so a
+    # column pointer walked by ldu*sz removes them. It REGRESSED: leaf KC=128 gain fell 3.0% -> 1.5%, and
+    # gate n=512 went 0.6% NEGATIVE. Cause: the pointer update is a serial dependency inserted into the
+    # BACK-SUBSTITUTION, which is already the critical path — the addressing multiplies it removes were
+    # off the critical path, being computed in parallel with the chain. On B the same edit is a clear win
+    # because those addresses feed independent loads/stores. Do not retry without changing the chain.
     for i in (MR - 1):-1:0                                     # back-substitution, critical-path-first
         push!(body.args, :($d_ = $V(unsafe_load(rp + ($s + $i) * $sz))))
         for v in 0:(NRV - 1)
