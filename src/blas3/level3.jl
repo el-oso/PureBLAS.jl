@@ -2611,7 +2611,8 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
 #   _EXP6  subtract hoist — NOT WIRED (both-orders emission doubles every slab; >72 min build)
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
-#   _EXP8  pair two ADJACENT full stripes at any KC (generalised ILP lever)
+#   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
+#          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
 #   _EXP9.._EXP16  free
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
@@ -2798,12 +2799,17 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
-            # _EXP8 — pair two ADJACENT full stripes so their back-substitution chains overlap. Same
-            # lever that took n=32 from 0.898 to 1.105; it should pay MORE here because the chain is
-            # (KC/MR)*MR = KC steps long (128 at KC=128 vs 32), all with one chain in flight today.
-            # Needs 2*NRV*W columns of P; the buffer is KC*NR + ... which covers it since 2*NRV*W = 2*NR
-            # only when both stripes are full — hence the `jc + 2NR <= n` guard.
-            if _EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR && jc + 2 * NR <= n
+            # PAIR TWO ADJACENT FULL STRIPES so their back-substitution chains overlap.
+            # DOMAIN IS SMALL KC, and that is measured, not assumed: at KC <= _TRSM_DBASE each slab's
+            # gemm runs only ~12 trips on average and cannot hide the serial chain, so a second chain
+            # pays (n=32 gate 0.898 -> 1.105). At larger KC the gemm already runs up to KC-s-MR trips
+            # and supplies that independent work itself, so pairing only adds register pressure
+            # (2*MR*NRV = 48 live accumulators against 32) — measured 6.2% / 4.2% / 2.6% SLOWER at
+            # k=128 / 256 / 512, the penalty shrinking exactly as the gemm's share of the slab grows.
+            # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
+            # rows) keeps the single-stripe path: the tail needs its own mini-pack.
+            if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
+                    KC <= _TRSM_DBASE && jc + 2 * NR <= n
                 _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
                 jc += 2 * NR; continue
             end
