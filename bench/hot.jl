@@ -24,6 +24,18 @@ using PureBLAS, LinearAlgebra, Printf, Statistics
 
 const FIFO = ARGS[1]
 BLAS.set_num_threads(1)
+# OPEN THE FIFO ONCE, AS A STREAM — this is what makes Revise work incrementally here.
+# The loop used to call `open(readline, FIFO)` per command. That blocks inside libuv WITHOUT yielding, so
+# Julia's scheduler never ran Revise's async file-watcher task: the revision queue stayed empty and a bare
+# `Revise.revise()` returned "success" having applied nothing. Silently — which cost a 30-minute A/B run
+# on stale code, caught only because that probe carried a witness counter. (`Revise.retry()` cannot help
+# either; it retries FAILED revisions, and nothing was ever queued to fail.)
+# Reading from a persistent stream goes through async I/O and DOES yield, so the watcher runs, only
+# CHANGED files are queued, and `revise()` is incremental — sub-second instead of the ~62 s whole-module
+# `revise(PureBLAS)` fallback, and no session restart (~200-300 s precompile) either.
+# The handle is opened read+write so WE hold a writer: with readers only, every client disconnect EOFs the
+# stream and spins the loop.
+const FIFO_R = open(FIFO, read = true, write = true)
 # Preload the shared measurement helper ONCE, tracked. Probes then guard with
 # `isdefined(Main, :Measure) || include(...)`, so they never rebuild the module and never invalidate
 # the `tstat` binding Main holds.
@@ -37,7 +49,7 @@ flush(stdout)
 
 while true
     cmd = try
-        strip(open(readline, FIFO))               # blocks until a writer sends a line
+        strip(readline(FIFO_R))                   # yields to the scheduler, so Revise's watcher runs
     catch e
         @warn "fifo read failed" exception = e
         break
@@ -46,21 +58,24 @@ while true
     cmd == "EXIT" && break
     t0 = time()
     try
-        # PICK UP src/ EDITS. `Revise.revise()` alone is NOT enough here and fails SILENTLY.
-        # Revise queues revisions from an async file-watcher task, but this loop blocks the scheduler in
-        # `open(readline, FIFO)` above, so that task never runs, the queue stays empty, and bare
-        # `revise()` "succeeds" having done nothing. `Revise.retry()` does not help either — there is no
-        # errored revision to retry; the change was never queued in the first place. Diagnosed 2026-08-10
-        # after a 30-minute A/B ran entirely on stale code and was saved only by a witness counter.
-        # `revise(PureBLAS)` re-evaluates the module directly, bypassing the watcher. It costs ~60 s, so
-        # it is gated on an mtime scan and skipped when nothing changed (the common case).
+        # PICK UP src/ EDITS. With the stream-based FIFO read above, the watcher task actually runs, so
+        # this is the normal INCREMENTAL path: only changed methods are re-evaluated, typically <1 s.
+        # It is verified, not assumed — the mtime high-water mark says whether src/ changed, and if it did
+        # but Revise applied nothing, that is the silent-staleness failure and we say so loudly and fall
+        # back to the whole-module re-eval rather than running a probe against stale code.
         newest = maximum(mtime(f) for (r, _, fs) in walkdir(SRC) for f in joinpath.(r, fs)
                          if endswith(f, ".jl"); init = 0.0)
         if newest > LAST_SRC[]
-            print("<<<HOT-REVISE src changed, re-evaluating PureBLAS ... ")
-            tr = @elapsed Revise.revise(PureBLAS)
+            nq = length(Revise.revision_queue)
+            tr = @elapsed Revise.revise()
+            if nq == 0                                    # watcher never saw it ⇒ incremental path failed
+                print("<<<HOT-REVISE watcher missed the edit, full module re-eval ... ")
+                tr += @elapsed Revise.revise(PureBLAS)
+                @printf("%.1fs>>>\n", tr)
+            else
+                @printf("<<<HOT-REVISE %d file(s) %.2fs>>>\n", nq, tr)
+            end
             LAST_SRC[] = newest
-            @printf("%.1fs>>>\n", tr)
             flush(stdout)
         end
         # `Base.include` for the PROBE, deliberately. A probe is a script: its whole content is
