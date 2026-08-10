@@ -1,0 +1,10 @@
+# Pre-existing probes that link a reference BLAS, from sessions before the cache-only rule was linted.
+# They are grandfathered so the lint fails on NEW violations instead of drowning in old ones — same
+# pattern as test/harness_baseline.txt. Do NOT add to this list: a new diagnostic that genuinely needs
+# a reference must carry an explicit `# refblas-ok: <reason>` marker in the file itself.
+# bench/probes/ is gitignored, so these are local debris; deleting them is always safe.
+bench/probes/axpy_chunk.jl
+bench/probes/axpy_phase_ab.jl
+bench/probes/gemvt_l2_fills.jl
+bench/probes/inproc_replication.jl
+bench/probes/trmv_fills.jl

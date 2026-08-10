@@ -44,8 +44,8 @@ across the fleet (AP-residency packed panel); `ger` sits at gate on all three bo
 ![BLAS-3 — PureBLAS/OpenBLAS ratio per op, three µarchs](assets/perf_l3.svg)
 
 `gemm` gates every size on all three boxes (Strassen–Winograd at large n runs 1.2–1.4×). The
-triangular/symmetric ops gate on AVX-512; on AVX2 the worst sizes of `trmm` (0.84) and `trsm`
-(0.89) are still open.
+triangular/symmetric ops gate on AVX-512; on AVX2 the worst size of `trmm` (0.84) is still open,
+while `trsm` now gates against OpenBLAS at every size on both available boxes (AVX2 worst 1.14).
 
 ![LAPACK — PureBLAS/OpenBLAS ratio per op, three µarchs](assets/perf_lapack.svg)
 
@@ -218,11 +218,23 @@ n=4096 on this silicon, so the ~30-point spread between it and the routines buil
 makes it structural rather than a per-box tuning artifact. It is the single largest shared lever
 currently on the board.
 
-Two cells miss on **all three** boxes and are therefore the cross-µarch invariants worth attacking
-once rather than three times: **`trsm` n=32** (0.906 / 0.917 / 0.922 — a tiny-`n` per-call/leaf-rate
-problem, distinct from the mid-`n` composition question) and **`syrk`/`syr2k` n=4096** (the
-conversion gap above). By contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on
-Zen5, so those are µarch-specific.
+**`trsm` n=32 was one such invariant and is now CLOSED on both available boxes** (2026-08-10): Zen4
+0.898 → 1.056 via interleaved back-substitution chains, and Zen3 0.927 → 1.102 by deleting a
+`_GT_TRANSPOSE` conjunct that was using an ISA *capability* bit as an unmeasured *crossover* and so
+pinned all of AVX2 to the scalar dense base — the fused leaf measured 15–52% faster there across the
+whole tiny-`k` range. Zen5 has not been re-swept (box offline), so its 0.91 predates both fixes.
+
+`trsm`'s residual has therefore MOVED from tiny-`n` to mid-`n` (Zen4 0.941 @ n=128), and it is now
+decomposed rather than guessed: fitting the leaf's rate as `1/GF = α + β/KC` puts the asymptotic
+microkernel rate at **44.4 GF, above PureBLAS's own dgemm (43.75)** — the inner loop is not the
+problem — with an 18.6% per-slab *fixed* cost at KC=128. An opcode histogram of the emitted slab
+prices that cost: scalar addressing ~22% and vector moves ~24% of it, against only ~3.2% of total leaf
+time for the two 8×8 transposes and ~2.8% for the back-substitution arithmetic. Removing the largest
+addressing population (recomputed `(jc + c)·ldb` products) was worth 3.0% at n=128, bit-identically.
+
+**`syrk`/`syr2k` n=4096** remains a genuine cross-µarch invariant (the conversion gap above). By
+contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on Zen5, so those are
+µarch-specific.
 
 Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.909, `zsyrk`
 0.932, `zher2k` 0.907, `zsyr2k` 0.912, `ztrmm` 0.933 — with `ztrsm` (1.069) the one that gates.
@@ -232,8 +244,8 @@ be fixed at the kernel before anything above it can convert.
 ### Per microarchitecture
 
 **Zen4 (AVX-512, double-pumped).** The tuning target. Real BLAS-1/2 gate essentially everywhere;
-the residuals are the BLAS-3 set above (`trsm` 0.906 @ n=32, `syrk` 0.937 @ n=4096, `trmm` 0.950,
-`symm` 0.955). The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
+the residuals are the BLAS-3 set above (`trsm` 0.941 @ n=128 — n=32 now gates at 1.056 — `syrk` 0.937
+@ n=4096, `trmm` 0.950, `symm` 0.955). The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
 `zgeru` 0.906 (n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
 
 **Zen5 (AVX-512, native 512-bit).** Clears every AVX2 ceiling but shows a disjoint residual
@@ -269,10 +281,13 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
 
 - **BLAS-3 conversion gap** (above): `gemm` beats AOCL by 25–31% at n=4096 while `syrk`/`syr2k` on
   the same engine sit at 0.94–0.97. Largest shared lever; reproduces on all three µarchs.
-- `trsm` n=32 misses on all three (0.906 / 0.917 / 0.922) — tiny-`n`, per-call/leaf-rate. Note the
-  mid-`n` side-L question is *separate* and was characterised at a ~0.95 codegen floor
-  (latency-bound back-substitution, register-walled at 32 zmm) after row-lane, left-looking,
-  nrhs-block, pack-lifetime and a full BLIS-structure framework all measured 0.94–0.99.
+- `trsm` n=32 **is closed** on both available boxes as of 2026-08-10 (Zen4 1.056, Zen3 1.102); the
+  Zen5 figure predates the fixes (box offline). The residual moved to mid-`n` (Zen4 0.941 @ n=128),
+  and the earlier "~0.95 codegen floor, latency-bound back-substitution, register-walled" reading is
+  **superseded**: fitting `1/GF = α + β/KC` on the leaf puts the asymptotic microkernel rate at 44.4 GF
+  — *above* PureBLAS's own dgemm — so the inner loop is not the limiter. The whole deficit is an 18.6%
+  per-slab fixed cost, of which an opcode histogram attributes ~22% to scalar addressing and ~24% to
+  vector moves, versus ~3.2% of total leaf time for the transposes and ~2.8% for the back-substitution.
 - `gemvT` n=2048 is the one BLAS-2 cell that misses on **all three** µarchs (0.96 / 0.94 / 0.97) — a
   size-specific behaviour rather than three per-box stories, and the better-posed problem for it.
 - `gemvN` Zen5 n=2048 (0.942) and `ger` Zen5 n=2048 (0.896).

@@ -176,6 +176,38 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
+- **ITERATE PROBES IN THE HOT REVISE SESSION (`bench/hot.jl`) — never relaunch `julia` per probe, and
+  never restart it just to pick up a `src/` edit.** A fresh launch pays a full pkgimage precompile
+  (**200–311 s** measured); a correctly configured Revise applies a method-body edit in **~3 s**.
+  ```bash
+  mkfifo /tmp/pbhot.fifo
+  julia --project=bench bench/hot.jl /tmp/pbhot.fifo > /tmp/pbhot.log 2>&1 &   # await <<<HOT-READY>>>
+  echo bench/probes/some_probe.jl > /tmp/pbhot.fifo                            # await <<<HOT-DONE>>>
+  ```
+  **The trap that makes Revise look broken:** a driver loop that calls `open(readline, FIFO)` per command
+  blocks inside libuv **without yielding**, so Julia's scheduler never runs Revise's async file-watcher
+  task. The revision queue stays empty and a bare `Revise.revise()` returns *"success" having applied
+  nothing* — silently, indistinguishable from "no changes". On 2026-08-10 a 30-minute A/B ran entirely on
+  stale code and was caught only because that probe carried a witness counter. `Revise.retry()` does NOT
+  help (it retries *errored* revisions; nothing was queued to fail), and a restart is NOT required.
+  The fix, already in `hot.jl`: open the FIFO **once as a stream** (`open(FIFO, read=true, write=true)` —
+  read+write so the process holds its own writer and the pipe never EOFs) and `readline` that handle.
+  Async I/O yields, the watcher runs, revision is incremental (**3.3 s**), and a bare `touch` triggers it.
+  `Revise.revise(PureBLAS)` (~62 s, whole module) stays only as an **announced fallback**. Diagnose any
+  recurrence with `Revise.pkgdatas` / `revision_queue` / `queue_errors`: tracked + empty queue + no errors
+  ⇒ scheduler starvation, not a Revise fault.
+  **VERIFY, don't assume.** Three failure modes look identical to a real measurement — stale code (above),
+  a **dead knob** (the flag's branch isn't in the call graph for that shape), and a **stale cache**
+  (`plots.jl` *without* its `bench` arg loads cached data and prints a complete, plausible, pre-change gate
+  table). So: read the `<<<HOT-REVISE …>>>` line, give every A/B knob an execution **witness** asserted
+  before timing, and read the benchmark provenance header every time.
+  Also: probes dispatch with `Base.include`, **not** `Revise.includet` (a probe is top-level side effects
+  and `includet` won't re-execute them — it returns "ok" in 0.0 s having run nothing); `includet` is right
+  only for a helper *module*. A newly added top-level `const` comes up **unassigned** (Revise applies
+  method definitions, not top-level statements) — prefer the pre-declared `_EXPFLAG`/`_EXPINT` tables so a
+  new knob is a new INDEX. Gate numbers still come from a standalone `plots.jl` run, which owns provenance.
+  Full write-up: `../kb/findings/julia-revise-hot-session-workflow.md`.
+
 - **SYNC THE FLEET WITH GIT, NEVER rsync — use `bench/fleet_sync.sh <box|all> [ref]`.**
   Commit and push first; the script fetches and hard-resets the box to a pushed ref, then re-verifies
   source parity by md5. Do not `rsync src/` to a fleet box, and do not hand-roll an `ssh … git reset`.

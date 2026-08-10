@@ -27,6 +27,12 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   Verdicts are **per microarchitecture** — every table carries a Zen4, Zen3 and Zen5 column, each from
   that box's own `bench/plots.jl` sweep, freq-locked with the achieved clock verified and both
   references measured in the same run. A cell is the worst size for that routine on that box.
+  **Columns are not always at the same commit.** Each box is re-swept when it is available, and the
+  Zen5 machine is currently offline, so its column reflects commit `2113738` (2026-08-09) while Zen4 and
+  Zen3 are at `17ae50d` / `b728740` (2026-08-10). The per-commit provenance for every column is stamped
+  in [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md) and
+  should be read alongside this page — a cell is evidence only about the commit it was measured at.
+  Concretely: `trsm` improved on Zen4 and Zen3 on 2026-08-10 and the Zen5 column has not yet seen it.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
@@ -138,13 +144,13 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.973</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td></tr>
-<tr><th><code>symm</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.921</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>syrk</code></th><td class="b3"><span class="v">0.936</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>trmm</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.916</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.921</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.821</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
+<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.973</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td></tr>
+<tr><th><code>symm</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.921</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>syrk</code></th><td class="b3"><span class="v">0.936</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>trmm</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.821</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
 <tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.816</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.975</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
