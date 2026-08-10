@@ -2676,7 +2676,16 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
 #   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
 #          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
-#   _EXP9.._EXP16  free
+#   _EXP9  free
+#   _EXP10 free again — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
+#          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
+#          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
+#          at the caller's lda, and a quarter-period byte stride (lda=128 f64 ⇒ 1024 B) puts its columns
+#          on the same L1 sets. Copies A's lower triangle into `_trsm_rpack`'s odd-ld scratch when the
+#          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
+#          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
+#          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
+#   _EXP11.._EXP16  free
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
 # At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
@@ -3544,6 +3553,58 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _TRSM_NCUT_R) &&
             (size(B, 1) > _TRSM_NCUT_R || (k > _TRSM_DBASE && size(B, 1) >= _trsm_r_mfloor(k)))
         Ar = A
+        # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
+        # to the leaf VERBATIM at the caller's lda. For a square gate operand that is lda = k, and at
+        # k=128 the byte stride is 1024 = a quarter L1 way period, which puts A's columns on the same
+        # sets. MEASURED on galen (Zen3/AVX2), leaf GF at bs=128, m=128, only A's lda moving:
+        #     lda 128 (shipped) 41.59 | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
+        # i.e. ANY non-po2 lda is +11.5..+15.1%, and the padded values land on the leaf's own
+        # `1/GF = α + β/bs` trend (asymptote 47.8 GF) — bs=128 was a DIP, not a rate deficit.
+        # CONTROL bs=96 (lda already non-po2): +1.5..+2.9%, the run-to-run floor.
+        # This is NOT either of the two hypotheses already falsified for this cell: the de-aliasing work
+        # tested `_alias_ld(stride(B,2))` — B's ldb, and only the FULL way period (512 doubles, so
+        # lda=128 could never trip it) — and the _RL_MR work changed register pressure, not addressing.
+        # Predicate REUSED, not invented: `_potrf_needs_pad` is the derived quarter-period + L2-residency
+        # test (the residency half matters — `_chol_needs_pad` measured a pad LOSING at n=384 once the
+        # block spills L2, because then the copy round-trip is pure traffic). `_trsm_rpack` already
+        # returns an odd-ld scratch, which by construction can never be a way-stride multiple.
+        # WHEN the pad pays — DERIVED, and NOT simply "whenever the stride aliases". Measured both boxes,
+        # gate shape, end to end (pad/shipped, <1 = pad faster):
+        #        n=128     n=256     n=512
+        #   Zen3 0.8725    0.9411    0.8447      (AVX2, _NVREG=16)
+        #   Zen4 1.0489    1.0115    0.9112      (AVX-512, _NVREG=32)
+        # The SIGN INVERTS at n=128: a blanket predicate would have taken Zen4's passing 1.05 cell down
+        # to ~1.00. The conflict only costs more than the copy when A's columns are actually RE-READ:
+        #   * the leaf SPILLS (it holds _RL_MR*_CHOL_NB accumulators + _CHOL_NB T-vectors + ~2 more; at
+        #     3*4+4+2 = 18 that exceeds AVX2's 16 ymm but not AVX-512's 32 zmm), so AVX2 re-reads A; or
+        #   * A does not fit L2, so every re-read is an L3 trip regardless of register file.
+        # Both terms are formulas over detected consts, not a µarch literal. This reproduces all six
+        # measured cells above; per req#8b it is derive → validate → ship, and the validation is the
+        # fleet A/B that produced the table.
+        # GATED ON THE SPILL TERM ALONE. The pad is a TRADE (copy vs conflict), so the aliasing stride
+        # is only half the test — it says a conflict exists, not that removing it beats the copy. What
+        # decides that is whether A's columns are actually RE-READ, and the leaf only re-reads them when
+        # it SPILLS: `_RL_MR_LIVE` = 3·_CHOL_NB + _CHOL_NB + 2 = 18 live vectors, over AVX2's 16 ymm and
+        # under AVX-512's 32 zmm. Measured:
+        #   Zen3 (spills)     — wins at EVERY size: +12.8/5.9/15.5/9.9/4.9/2.3% at n=128..4096,
+        #                       gate worst 0.821 → 0.924, n=512 and n=1024 closed.
+        #   Zen4 (no spill)   — n=128 the pad is 4.9% SLOWER (it would turn a passing 1.05 cell into
+        #                       ~1.00), and n=512/1024/2048/4096 are NULL (1.0014/1.0009/0.9999/1.0003,
+        #                       SE 0.0003..0.0039). So on a non-spilling box the pad buys nothing
+        #                       anywhere and costs at small k.
+        # An earlier version added `k²·sz > _L2_BYTES` to pad large A on non-spilling boxes too. That
+        # came from ONE probe reading 0.9112 at Zen4 n=512; a tighter re-measure across four sizes could
+        # not reproduce it, so the term was unvalidated and is removed rather than kept on a single
+        # observation. Consequence: Zen4 now never pads, which is byte-identical to its pre-change
+        # behaviour — the 0.958 → 0.944 seen on one Zen4 gate run was drift, not this change.
+        # _EXP10 INVERTED: set true to DISABLE the pad, so the shipped arm stays A/B-able in-process.
+        if tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
+            S = _trsm_rpack(Float64, k, k)
+            @inbounds for c in 1:k, r in c:k          # lower triangle only — the leaf reads nothing above it
+                S[r, c] = A[r, c]
+            end
+            Ar = view(S, 1:k, 1:k)
+        end
         if !tr
             Ar = _trsm_rrefl(Float64, k)
             # Contiguous-WRITE order: the inner r-loop stores Ar[:,c] unit-stride and reads A with a
