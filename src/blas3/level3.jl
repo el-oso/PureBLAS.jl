@@ -2740,15 +2740,19 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # accident at k=32 (directA leaves that region unused and `rp` sits beyond the spill), which is
     # exactly the kind of luck that turns into a corruption bug the moment directA is false.
     #
-    # THIS OFFSET IS PERFORMANCE-CRITICAL, not just a size. Widening P from KC*NR to KC*2*NR moves pU
-    # and rp, and this kernel is cache-set-aliasing sensitive (same class as `_trsm_rpack`'s odd-ld
-    # trick and `_potrf_pad`). MEASURED on Zen3/AVX2, where NONE of the pair paths can even fire
-    # (fusedT needs W==MR==8) so the ONLY change is the layout — 4 gate runs each:
-    #     n=32   0.927 -> 0.9165   -1.1%   (a regression this widening introduced)
-    #     n=128  0.942 -> 0.995    +5.6%
-    #     n=256  0.966 -> 0.978    +1.2%
-    # i.e. the workspace offset alone is worth ~5% at mid-n and costs ~1% at tiny k. `_EXPINT[1]` pads
-    # it so the tradeoff can be swept and turned into a DERIVED rule instead of an accident.
+    # The sizing above is a CORRECTNESS fix and nothing more. An earlier version of this comment claimed
+    # the resulting OFFSET was performance-critical (Zen3 n=128 0.942->0.995, n=32 0.927->0.9165, "the
+    # only change is the layout"). RETRACTED 2026-08-10 — both halves were wrong:
+    #   * n=32 could not have been affected at all. Square B at n=32 on AVX2 fails the `_GT_TRANSPOSE`
+    #     conjunct below and routes to `_trsm_dense_L!`, which never allocates this buffer. bench/plots.jl
+    #     uses that same square shape, so the gate cell takes that path too. That delta was cross-run
+    #     drift between two commits, i.e. exactly the cross-run comparison our own rules forbid.
+    #   * n=128 does not survive a controlled test. `_EXPINT[1]` was swept over a FULL L1-way period
+    #     (0..512 slots = 4096 B = one way of a 32K 8-way L1) on both boxes: flat 1.000, and at Zen3
+    #     k=128 with a clean instrument (base SE 0.0012) flat to +-0.004. A P/U set-conflict mechanism
+    #     would have to show structure over a full period. It shows none.
+    # `_EXPINT[1]` is kept as an inert sweep knob (default 0) so the negative result stays reproducible.
+    # Do NOT reopen "workspace alignment" as a trsm lever without a NEW mechanism and a live-knob witness.
     buf = _trsm_fused_buf(T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
@@ -4738,12 +4742,15 @@ end
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
-# diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) from the
-# register file via `_at_rank_k_pack_cut` = (7·(nvreg−4)·W)/4 — same REGISTER-capacity criterion as gemm's
-# unpack cut, ×7/4 (vs gemm ×2) for the recursion's extra flop/split cost (see cpuinfo.jl). Reproduces galen
-# 84 (measured: recursion wins n≈40–80, packed decisive n≥96 — routes n=80→recursion, 96→packed; the old
-# literal 23 mis-routed n=48/80 to the slower packed path, causing the galen AOCL misses there). Predicts
-# Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX=448 placeholder — A/B on the AVX-512 boxes). Overridable per machine.
+# diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
+# `_at_rank_k_pack_cut`, which is PATH-DEPENDENT — read cpuinfo.jl:212-227 for the authoritative form:
+#   AVX2 multi-pack `_trgemm_packed!`  -> (7·(nvreg−4)·W)/4, reproduces galen 84 (measured: recursion wins
+#     n≈40–80, packed decisive n≥96; the old literal 23 mis-routed n=48/80 and caused the galen AOCL misses)
+#   AVX-512 unified single-pack `_trgemm_packed_u!` -> W, because half the pack traffic makes packed win
+#     from ≈W up.
+# An earlier version of this comment predicted "Zen4/Zen5 392" from the ×7/4 form. That is FALSIFIED and no
+# longer what the code computes: 392 mis-routed all n≤256 to the recursion and WAS the syrk n=128 gate miss
+# (Zen5 0.88 / Zen4 0.91); packed is +14% there. Fleet-validated AVX-512 -> W. Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int

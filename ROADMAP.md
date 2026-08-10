@@ -399,7 +399,11 @@ Done & verified (2026-06-28):
 - [x] **Unpacked path** (BLASFEO-style size dispatch, ref arXiv:1902.08115): for tA='N' matrices with
       max(m,n,k) ≤ `_GEMM_UNPACK_MAX` (now **448**; started at 96) skip packing and run the microkernel
       directly on column-major data (`_gemm_unpacked!`, `_microkernel_unpacked!`). StrictMode-audited.
-      Beats the blocked path while A fits ~L2 — lifted n=64..448 to ~parity/above.
+      Beats the blocked path while the microkernel's accumulators stay REGISTER-bound — lifted n=64..448
+      to ~parity/above. (An earlier note here said "while A fits ~L2". That criterion is falsified: at the
+      Zen4 crossover one square operand is 448²·8 = 1.6 MB, far past a 1 MB L2, so the unpacked path
+      demonstrably wins while only L3-resident. The L2 fit only appeared to work because on this fleet the
+      small-L2 box is also the narrow-W box, making L2 and W collinear. See cpuinfo.jl:205-227.)
 
 Perf (Zen4/wintermute, Float64, single-thread, interleaved, `bench/bench_gemm.jl`): OpenBLAS ~45
 GFLOP/s; PureBLAS **geomean 0.999× across n=16..4096 — parity, beats OpenBLAS on most small/medium
