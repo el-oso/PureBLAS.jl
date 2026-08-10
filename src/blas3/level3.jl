@@ -2152,7 +2152,8 @@ function _slab_upk_fusedT_body_1(
 end
 
 function _slab_body_ord(
-        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int, hoist::Bool
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int, hoist::Bool,
+        pfx::Symbol = Symbol("")
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
@@ -2166,41 +2167,47 @@ function _slab_body_ord(
     # WARM arm must be a statistical null — that null is the built-in control for this lever.
     # Counters justify the target: at the gate working set we already fetch the compulsory ~222
     # lines/call from L3+DRAM and overlap ~91% of that latency; only a handful of EXPOSED misses remain.
+    # `pfx` namespaces every local, so TWO independent slabs can be emitted into ONE body and the
+    # scheduler can overlap their back-substitution chains. That is the ILP lever: measured, PB runs at
+    # IPC 1.16 against AOCL's 2.20 and pays 114 ns more exposed first-touch latency, while its kernel is
+    # 6.8% FASTER once pages are resident. More chains in flight is the only thing that addresses that.
+    cc_(r, v) = Symbol(pfx, :c, r, :_, v)
+    u_ = Symbol(pfx, :u); d_ = Symbol(pfx, :d)
     subtract = quote end
     for v in 0:(NRV - 1)
         for l in 0:(W - 1)
             push!(
                 subtract.args,
-                :($(Symbol(:bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
+                :($(Symbol(pfx, :bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
             )
         end
-        brs = Expr(:tuple, (Symbol(:br, l) for l in 0:(W - 1))...)
-        push!(subtract.args, Expr(:(=), brs, :(_tr8x8($((Symbol(:bc, l) for l in 0:(W - 1))...)))))
+        brs = Expr(:tuple, (Symbol(pfx, :br, l) for l in 0:(W - 1))...)
+        push!(subtract.args, Expr(:(=), brs, :(_tr8x8($((Symbol(pfx, :bc, l) for l in 0:(W - 1))...)))))
         for r in 0:(MR - 1)
-            cs = Symbol(:c, r, :_, v)
+            cs = cc_(r, v)
             # hoisted: seed with B (gemm will subtract into it); shipped: acc holds Σ, so B - Σ.
-            push!(subtract.args, :($cs = $(hoist ? Symbol(:br, r) : :($(Symbol(:br, r)) - $cs))))
+            push!(subtract.args, :($cs = $(hoist ? Symbol(pfx, :br, r) : :($(Symbol(pfx, :br, r)) - $cs))))
         end
     end
     if hoist
         append!(body.args, subtract.args)                 # B first: its misses overlap the gemm below
     else
         for r in 0:(MR - 1), v in 0:(NRV - 1)
-            push!(body.args, :($(Symbol(:c, r, :_, v)) = zero($V)))
+            push!(body.args, :($(cc_(r, v)) = zero($V)))
         end
     end
     inner = quote end                                     # gemm: acc[r][v] ±= U[s+r,kk]·P[kk][v]
     for v in 0:(NRV - 1)
-        push!(inner.args, :($(Symbol(:x, v)) = vload($V, Pp + (kk * $ldp + $((vbase + v) * W)) * $sz)))
+        push!(inner.args, :($(Symbol(pfx, :x, v)) = vload($V, Pp + (kk * $ldp + $((vbase + v) * W)) * $sz)))
     end
     for r in 0:(MR - 1)
-        push!(inner.args, :(u = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
+        push!(inner.args, :($u_ = $V(unsafe_load(Up + (($s + $r) + kk * ldu) * $sz))))
         for v in 0:(NRV - 1)
-            cs = Symbol(:c, r, :_, v)
+            cs = cc_(r, v)
             # hoisted accumulators already hold B, so the gemm SUBTRACTS; otherwise it sums and the
             # subtract step below computes B - Σ.
-            push!(inner.args, hoist ? :($cs = muladd(-u, $(Symbol(:x, v)), $cs)) :
-                :($cs = muladd(u, $(Symbol(:x, v)), $cs)))
+            push!(inner.args, hoist ? :($cs = muladd(-$u_, $(Symbol(pfx, :x, v)), $cs)) :
+                :($cs = muladd($u_, $(Symbol(pfx, :x, v)), $cs)))
         end
     end
     if isnothing(ng)
@@ -2225,15 +2232,15 @@ function _slab_body_ord(
     # dependent back-substitution. Hoisted order emitted this block before the gemm instead (_EXP6).
     hoist || append!(body.args, subtract.args)
     for i in (MR - 1):-1:0                                     # back-substitution, critical-path-first
-        push!(body.args, :(d = $V(unsafe_load(rp + ($s + $i) * $sz))))
+        push!(body.args, :($d_ = $V(unsafe_load(rp + ($s + $i) * $sz))))
         for v in 0:(NRV - 1)
-            push!(body.args, :($(Symbol(:c, i, :_, v)) = $(Symbol(:c, i, :_, v)) * d))
+            push!(body.args, :($(cc_(i, v)) = $(cc_(i, v)) * $d_))
         end
         for j in (i - 1):-1:0
-            push!(body.args, :(u = $V(unsafe_load(Up + (($s + $j) + ($s + $i) * ldu) * $sz))))
+            push!(body.args, :($u_ = $V(unsafe_load(Up + (($s + $j) + ($s + $i) * ldu) * $sz))))
             for v in 0:(NRV - 1)
-                cj = Symbol(:c, j, :_, v); ci = Symbol(:c, i, :_, v)
-                push!(body.args, :($cj = muladd(-u, $ci, $cj)))
+                cj = cc_(j, v); ci = cc_(i, v)
+                push!(body.args, :($cj = muladd(-$u_, $ci, $cj)))
             end
         end
     end
@@ -2241,15 +2248,15 @@ function _slab_body_ord(
         for r in 0:(MR - 1)
             push!(
                 body.args,
-                :(vstore($(Symbol(:c, r, :_, v)), Pp + (($s + $r) * $ldp + $((vbase + v) * W)) * $sz))
+                :(vstore($(cc_(r, v)), Pp + (($s + $r) * $ldp + $((vbase + v) * W)) * $sz))
             )
         end
-        ccs = Expr(:tuple, (Symbol(:cc, l) for l in 0:(W - 1))...)
-        push!(body.args, Expr(:(=), ccs, :(_tr8x8($((Symbol(:c, r, :_, v) for r in 0:(MR - 1))...)))))
+        ccs = Expr(:tuple, (Symbol(pfx, :cc, l) for l in 0:(W - 1))...)
+        push!(body.args, Expr(:(=), ccs, :(_tr8x8($((cc_(r, v) for r in 0:(MR - 1))...)))))
         for l in 0:(W - 1)
             push!(
                 body.args,
-                :(vstore($(Symbol(:cc, l)), pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
+                :(vstore($(Symbol(pfx, :cc, l)), pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
             )
         end
     end
@@ -2562,7 +2569,44 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP4  _fused_packP_tr! columns-outer (sequential)   FALSIFIED (1.0025, n=240, powered null)
 #   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
 #   _EXP6  subtract hoist — NOT WIRED (both-orders emission doubles every slab; >72 min build)
-#   _EXP7.._EXP16  free
+#   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
+#   _EXP8.._EXP16  free
+
+# ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
+# At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
+# so exactly ONE back-substitution chain is ever in flight: 4 slabs x MR rows of serial dependency,
+# twice. The two stripes are INDEPENDENT — nothing in stripe1 reads stripe0 — so emitting slab si of
+# both into ONE body lets the scheduler overlap the two chains.
+# WHY THIS AND NOT MORE TRAFFIC WORK: measured, PB's kernel is 6.8% FASTER than AOCL with pages resident
+# (1631 vs 1743 ns) but pays 114 ns MORE first-touch cost (777 vs 663) and runs at IPC 1.16 vs 2.20.
+# PB EXPOSES latency AOCL OVERLAPS. Seven traffic levers moved nothing because none shortens or
+# duplicates a dependency chain. Recovering the exposure gap puts PB ~110 ns ahead (~4.5%).
+# LAYOUT: both stripes share one P of row stride NR+W, stripe0 at P columns [0,NR), stripe1 at
+# [NR,NR+W) — expressed through the existing `vbase`, so no new addressing. jc is 0 for both; stripe1's
+# B columns fall out of vbase = NRV.
+# REGISTER BUDGET: MR*(NRV+1) = 32 accumulators, exactly the AVX-512 file. Affordable on the evidence
+# that NRV=3 already wins WHILE spilling 23-38 reloads — chains beat pressure on this kernel.
+# NOTE the U pointer parameter MUST be named `Up`: the emitted slab body references `Up` directly
+# (it is inlined here, not passed as an argument), so a `pU` parameter leaves the body resolving `Up`
+# to a nonexistent module global and it fails at RUNTIME, not at generation.
+@generated function _fusedT_pair_tiny!(
+        ::Val{K}, ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}
+    ) where {K, NRVe, T}
+    W = _vwidth(T); MR = _GT_MR
+    (W == 8 && MR == 8 && K % MR == 0) ||
+        return :(throw(AssertionError("tiny fusedT pair requires W==MR==8 and K%MR==0")))
+    ldp = (NRVe + 1) * W                       # one shared P: stripe0 [0,NRVe*W), stripe1 [NRVe*W, ldp)
+    body = quote end
+    for si in (K ÷ MR - 1):-1:0                # bottom slab first: back-substitution runs upward
+        s = si * MR; ng = K - s - MR
+        # stripe0: NRVe wide at P/B column base 0.  stripe1: 1 wide at base NRVe.
+        append!(body.args, _slab_body_ord(T, MR, NRVe, s, K, ldp, ng, 0, false, :a).args)
+        append!(body.args, _slab_body_ord(T, MR, 1, s, K, ldp, ng, NRVe, false, :b).args)
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
 
 # TINY-K STRIPE: the general stripe's `si` loop unrolled, so each slab gets its literal gemm trip count.
 # This is the "exhaustive specialisation" AOCL's tiny-k trsm bypass ships as 29-79 KB of hand-written
@@ -2688,6 +2732,16 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
         # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
         NRl = (_EXPFLAG[_EXP1] && KC <= _TRSM_DBASE) ? 2 * W : NR
+        # _EXP7 — ILP lever. At exactly n = NR+W with a tiny KC (the gate cell: k=32, n=32 = 24+8) solve
+        # BOTH stripes in one paired body so their independent back-substitution chains overlap, instead
+        # of running them back to back with only one chain ever in flight. Buffer note: the pair uses a
+        # shared P of row stride NR+W, which is <= the KC*NR+... allocation already made above.
+        # Pair path is ON by default now (measured 0.8522 paired/sequential, n=240, 22.7 SE,
+        # bit-for-bit identical output). _EXP7 is retained INVERTED as the A/B disable so the
+        # sequential arm stays reachable in-process.
+        if !_EXPFLAG[_EXP7] && fusedT && rem == 0 && n == NR + W && KC == 32
+            _fusedT_pair_tiny!(Val(32), Val(NRV), Pp, pB, ldb, 0, pUsrc, lduse, rp)
+        else
         jc = 0
         while jc < n
             wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
@@ -2759,6 +2813,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # full NRl stripe with columns still to come, and advancing by NR would SKIP NR-NRl of them.
             jc += wid
         end
+        end                                   # else-branch of the _EXP7 paired-stripe dispatch
     end
     return B
 end
