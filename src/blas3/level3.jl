@@ -2594,6 +2594,11 @@ end
 # the `_TRSM_FUSEDT_ON` / `_TRSM_FULLPACK_ON` convention this file already uses. Read once per `trsm!`
 # call (not per slab), so the load is free. Ships all-false: every index is an OFF-by-default probe knob.
 #   [1] tiny-k stripe width NR=2W instead of NR=NRV·W
+# Integer companion to _EXPFLAG, pre-declared for the same reason: a new const costs a full session
+# restart (Revise leaves it unassigned, and the @eval workaround is unsafe when a @generated body reads
+# it). Sweeps assign an ELEMENT.
+#   _EXPINT[1]  extra Float64 slots between P and the U pack — workspace alignment (see the buf note)
+const _EXPINT = fill(0, 4)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
@@ -2734,12 +2739,22 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # `_fusedT_pair_tiny!`. Sizing P at NR silently overflowed into the U-pack region — harmless only by
     # accident at k=32 (directA leaves that region unused and `rp` sits beyond the spill), which is
     # exactly the kind of luck that turns into a corruption bug the moment directA is false.
-    buf = _trsm_fused_buf(T, KC * 2 * NR + KC * ldu + KC)
+    #
+    # THIS OFFSET IS PERFORMANCE-CRITICAL, not just a size. Widening P from KC*NR to KC*2*NR moves pU
+    # and rp, and this kernel is cache-set-aliasing sensitive (same class as `_trsm_rpack`'s odd-ld
+    # trick and `_potrf_pad`). MEASURED on Zen3/AVX2, where NONE of the pair paths can even fire
+    # (fusedT needs W==MR==8) so the ONLY change is the layout — 4 gate runs each:
+    #     n=32   0.927 -> 0.9165   -1.1%   (a regression this widening introduced)
+    #     n=128  0.942 -> 0.995    +5.6%
+    #     n=256  0.966 -> 0.978    +1.2%
+    # i.e. the workspace offset alone is worth ~5% at mid-n and costs ~1% at tiny k. `_EXPINT[1]` pads
+    # it so the tradeoff can be swept and turned into a DERIVED rule instead of an accident.
+    buf = _trsm_fused_buf(T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
         # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
         # write P columns up to 2*NR and would otherwise land on top of the U pack.
-        pU = Pp + KC * 2 * NR * sz; rp = pU + KC * ldu * sz
+        pU = Pp + (KC * 2 * NR + _EXPINT[1]) * sz; rp = pU + KC * ldu * sz
         # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
         # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
         # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
