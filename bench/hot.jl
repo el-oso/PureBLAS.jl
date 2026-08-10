@@ -28,6 +28,10 @@ BLAS.set_num_threads(1)
 # `isdefined(Main, :Measure) || include(...)`, so they never rebuild the module and never invalidate
 # the `tstat` binding Main holds.
 Revise.includet(joinpath(@__DIR__, "measure.jl"))
+# mtime high-water mark for the src/ scan in the loop below (see the HOT-REVISE note there).
+const SRC = joinpath(@__DIR__, "..", "src")
+const LAST_SRC = Ref(maximum(mtime(f) for (r, _, fs) in walkdir(SRC) for f in joinpath.(r, fs)
+                             if endswith(f, ".jl"); init = 0.0))
 println("<<<HOT-READY>>> pid=", getpid())
 flush(stdout)
 
@@ -42,7 +46,23 @@ while true
     cmd == "EXIT" && break
     t0 = time()
     try
-        Revise.revise()                            # pick up src/ edits since the last command
+        # PICK UP src/ EDITS. `Revise.revise()` alone is NOT enough here and fails SILENTLY.
+        # Revise queues revisions from an async file-watcher task, but this loop blocks the scheduler in
+        # `open(readline, FIFO)` above, so that task never runs, the queue stays empty, and bare
+        # `revise()` "succeeds" having done nothing. `Revise.retry()` does not help either — there is no
+        # errored revision to retry; the change was never queued in the first place. Diagnosed 2026-08-10
+        # after a 30-minute A/B ran entirely on stale code and was saved only by a witness counter.
+        # `revise(PureBLAS)` re-evaluates the module directly, bypassing the watcher. It costs ~60 s, so
+        # it is gated on an mtime scan and skipped when nothing changed (the common case).
+        newest = maximum(mtime(f) for (r, _, fs) in walkdir(SRC) for f in joinpath.(r, fs)
+                         if endswith(f, ".jl"); init = 0.0)
+        if newest > LAST_SRC[]
+            print("<<<HOT-REVISE src changed, re-evaluating PureBLAS ... ")
+            tr = @elapsed Revise.revise(PureBLAS)
+            LAST_SRC[] = newest
+            @printf("%.1fs>>>\n", tr)
+            flush(stdout)
+        end
         # `Base.include` for the PROBE, deliberately. A probe is a script: its whole content is
         # top-level side effects, and `Revise.includet` does NOT re-execute top-level code on a
         # subsequent call — it only re-tracks method definitions. Dispatching an already-tracked probe
