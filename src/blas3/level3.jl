@@ -1137,6 +1137,15 @@ function trmm!(
         # side-L real large → K-range-trimmed single-pass packed (the straddling tile contracts only its
         # nonzero p-band, not the full kc zero-band — that band was the ~kc/k waste that capped the naive
         # packed trmm). Else (side R, complex/AD, small) → recursion-over-gemm! (no regression).
+        # OPEN HYPOTHESIS (task #134), recorded not wired: `_GEMM_UNPACK_MAX` is gemm's UNPACKED-vs-BLOCKED
+        # crossover, derived as 2·(nvreg−4)·W = 448 on both AVX-512 boxes and 96 on AVX2. Here it decides
+        # something else — recursion-over-gemm vs single-pass packed trmm, a different kernel PAIR on a
+        # different shape family, never measured at its own boundary. The gate loses 9-13% in
+        # 448 < n <= 480 on exactly the two boxes where this const is 448, and nowhere on the box where it
+        # is 96. Corroborating: the side-R analog `_TRMM_RPACK` WAS measured directly and found packed
+        # decisive only from n>=1536, direct winning the small/mid band. If confirmed the fix is a trmm-owned
+        # Measure-tier crossover (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX], default =
+        # today's value so migration is zero-risk), NOT a change to gemm's constant.
     elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
@@ -2037,9 +2046,16 @@ const _TRSM_FUSED_BASE = @load_preference(
     _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
 )::Int
 # Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
-# scalar dense base wins on the sub-µs tiny solve. MEASURED Zen4 crossover k≈16 = 2·_GT_W (fused beats dense
-# from k=16: e.g. k=24 15.9 vs 9.3 GF); below it dense wins (k=8 2.2 vs 1.7). Keyed on the SIMD width (the
-# setup is _GT_W-lane transposes). NEEDS Zen3/Zen5 validation (req#8b).
+# scalar dense base wins on the sub-µs tiny solve. DERIVE, keyed on the SIMD width because the setup is
+# _GT_W-lane transposes. Now validated on BOTH µarchs, so the req#8b debt note is discharged:
+#   Zen4 (2·_GT_W = 16): fused beats dense from k=16 (k=24 15.9 vs 9.3 GF); below it dense wins
+#                        (k=8 2.2 vs 1.7 GF) — the crossover sits AT the formula.
+#   Zen3 (2·_GT_W =  8): direct-leaf paired A/B 2026-08-10, routing bypassed, correctness 2e-16..2e-15 —
+#                        fused/dense = 0.4932 (k=8), 0.5596 (12), 0.4747 (16), 0.8726 (24), 0.8335 (32).
+#                        Fused wins at EVERY k down to the formula's value, so the crossover is at or
+#                        below 8 and the formula is safe (conservative if anything) on AVX2.
+# Two boxes, opposite W, crossover tracking 2·_GT_W both times ⇒ physically predictable ⇒ stays DERIVE.
+# No Measure tier: that is for optima that INVERT across µarchs, and this one does not.
 const _TRSM_FUSED_MIN = 2 * _GT_W
 # Same-process A/B switch: false ⇒ wide-B upper falls back to the invL leaf (old behaviour). Default on;
 # the Ref load is negligible vs the O(n²) solve. ponytail: exists for controlled A/B; harmless in prod.
@@ -2598,6 +2614,14 @@ end
 # restart (Revise leaves it unassigned, and the @eval workaround is unsafe when a @generated body reads
 # it). Sweeps assign an ELEMENT.
 #   _EXPINT[1]  extra Float64 slots between P and the U pack — workspace alignment (see the buf note)
+#               FALSIFIED 2026-08-10: flat over a full L1-way period on both boxes. Kept inert (0) so the
+#               negative result stays reproducible.
+#   _EXPINT[2..4]  free
+# WITNESS SLOTS exist because of the F1 failure on 2026-08-10: a pad sweep produced a clean, well-behaved,
+# entirely believable null while the knob's branch was never in the call graph for that shape at all
+# (square B at n=32 on AVX2 routes to `_trsm_dense_L!`). Reasoning about routing from the source is what
+# FAILED; a witness is an execution fact. Zero the slot, run one untimed call, assert it is 1 — then
+# measure. Never publish an A/B whose witness did not fire.
 const _EXPINT = fill(0, 4)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
@@ -3201,8 +3225,11 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
             # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
             # the scalar dense base (~15 GF) vs the fused leaf's ~26 GF. Measured Zen4 vs AOCL: k=48 0.53→0.94,
-            # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans / non-AVX-512 keep the dense base.
-            if up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE &&
+            # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans keep the dense base.
+            # `_GT_TRANSPOSE` REMOVED 2026-08-10 — same reason as the tiny-k bypass in `trsm!` (see the long
+            # note there): it is the fusedT slabs' capability bit, not a crossover, and it stranded AVX2 on
+            # the dense base at k=48/64 where the leaf measures 20.7% / 25.9% faster on galen.
+            if up && !tr && _TRSM_FUSED_ON[] &&
                     _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
                 return _trsm_fused_L!(unit, A, B)
             end
@@ -3656,9 +3683,21 @@ function trsm!(
             return B
         end
         # k in [_TRSM_FUSED_MIN, _TRSM_DBASE]: the fused gemmtrsm leaf beats the scalar dense base even here
-        # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans AVX-512, fusable),
+        # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans, fusable),
         # keeping the low-overhead tiny entry. Below _TRSM_FUSED_MIN the dense base wins (setup unamortized).
-        if sl && up && !tr && _TRSM_FUSED_ON[] && _GT_TRANSPOSE && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
+        # `_GT_TRANSPOSE` REMOVED 2026-08-10. It is a CAPABILITY bit for the 8x8-transpose fusedT slabs
+        # (_GT_W == 8), and it belongs inside the leaf — where it still is, at `useT` — not on the decision
+        # to ENTER the leaf. Used here it silently pinned all of AVX2 to the scalar dense base, and the
+        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on galen (Zen3), routing
+        # bypassed, correctness checked first at max|dense-fused| ~ 1.3e-15:
+        #     k=32  fused/dense 0.8381  SE 0.0018  n=105   (fused 16.2% FASTER)
+        #     k=48  fused/dense 0.7935  SE 0.0015  n=56    (20.7% faster)
+        #     k=64  fused/dense 0.7408  SE 0.0043  n=48    (25.9% faster)
+        # The leaf was already production-proven on AVX2 via the wide-B branch (_trsm_left!), which calls it
+        # with no such guard — so this deletes an unmeasured restriction, it does not enable new code.
+        # Float32 is still excluded by `_trsm_fusable` (eltype(B) === Float64, measured -18% if fused), and
+        # AVX-512 is unaffected because the conjunct was `true` there.
+        if sl && up && !tr && _TRSM_FUSED_ON[] && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
             return _trsm_fused_L!(unit, A, B)
         end
         # Side-L: the dispatch-skip criterion is n-DEPENDENT, exactly as the side-R note below says of
