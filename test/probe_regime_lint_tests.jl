@@ -10,3 +10,15 @@
         rep loop, fresh vs persistent operands), or `# regime-ok: <reason>`." probes = v
     @test isempty(v)
 end
+
+# A probe must never LINK a reference BLAS — references are cache-only for benchmarks (`arms=pb`), and
+# re-timing one both wastes the box and risks a published number whose two sides never saw the same
+# machine state. Only bench/plots.jl may forward LBT. Legacy violators are grandfathered in
+# test/probe_refblas_baseline.txt so this fails on NEW ones only.
+@testitem "ref-BLAS lint: no probe links OpenBLAS/AOCL" begin
+    include(joinpath(@__DIR__, "probe_refblas_lint.jl"))
+    v = probe_refblas_scan()
+    isempty(v) || @error "probe(s) link a reference BLAS; use the v3 cache (`arms=pb`), or mark the \
+        file `# refblas-ok: <reason>` if it is genuinely diagnostic." probes = v
+    @test isempty(v)
+end
