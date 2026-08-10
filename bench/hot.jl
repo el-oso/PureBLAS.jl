@@ -67,14 +67,17 @@ while true
                          if endswith(f, ".jl"); init = 0.0)
         if newest > LAST_SRC[]
             nq = length(Revise.revision_queue)
-            tr = @elapsed Revise.revise()
+            Revise.revise()
             if nq == 0                                    # watcher never saw it ⇒ incremental path failed
-                print("<<<HOT-REVISE watcher missed the edit, full module re-eval ... ")
-                tr += @elapsed Revise.revise(PureBLAS)
-                @printf("%.1fs>>>\n", tr)
+                println("<<<HOT-REVISE watcher missed the edit, full module re-eval>>>")
+                Revise.revise(PureBLAS)
             else
-                @printf("<<<HOT-REVISE %d file(s) %.2fs>>>\n", nq, tr)
+                println("<<<HOT-REVISE ", nq, " file(s)>>>")
             end
+            # No `@elapsed` here, deliberately: raw clocks are banned everywhere under bench/ and that
+            # lint has NO escape hatch by design, because every previous exemption was taken behind a
+            # plausible-sounding reason exactly like "it is only a progress message". The duration is
+            # already in the <<<HOT-DONE …>>> line below, so timing it here buys nothing anyway.
             LAST_SRC[] = newest
             flush(stdout)
         end
