@@ -124,11 +124,22 @@ function sweep(; name::AbstractString, set, values, setup, work, reset = nothing
     end
     isnothing(reset) || reset()
     println("\n=== SWEEP: ", name, "  (ratio vs ", base, "; <1 is FASTER) ===")
+    live = false
+    bias = abs(tstat(acc[base]) - 1)
     for v in vals
         m = tstat(acc[v]); se = std(acc[v]) / sqrt(length(acc[v]))
+        v == base || abs(m - 1) > max(4 * se, bias) && (live = true)
         @printf("  %-10s %.4f   SE %.4f   n=%d%s\n", string(v), m, se, length(acc[v]),
                 v == base ? "   <- base (sanity: must be ~1.000)" : "")
     end
+    # ARM LIVENESS, the check sweep() was missing while ab() had it. A knob that is not wired, or whose
+    # code path this shape does not route to, produces a flat 1.000 in every row — INDISTINGUISHABLE from
+    # a real null. That is not hypothetical: the Zen3 k=32 arm of the trsm pad sweep returned a clean,
+    # well-behaved null while `trsm!` was routing to _trsm_dense_L!, which never allocates the buffer the
+    # knob pads. Two full sweeps were interpreted before anyone read the routing.
+    live || println("  !! NO value differs from base by more than max(4*SE, bias). Either a true null, or ",
+                    "the knob is DEAD for this SHAPE — operand shape selects the code path. VERIFY THE ",
+                    "ROUTING (read the dispatch, print the cutoff consts) before reporting this as a null.")
     return Dict(v => tstat(acc[v]) for v in vals)
 end
 
