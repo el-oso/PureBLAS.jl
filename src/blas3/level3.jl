@@ -2263,6 +2263,33 @@ function _slab_body_ord(
     return body
 end
 
+# PAIRED GENERAL SLAB (_EXP8) — the n=32 ILP win, generalised to any KC.
+# Emits slab si of TWO independent column-stripes into ONE body (locals namespaced by prefix `a`/`b`),
+# so the scheduler overlaps their back-substitution chains. Generated on (MR, NRV) ONLY — `s` and `KC`
+# stay runtime — so code size is bounded and this works at every KC, unlike the Val{K}-unrolled tiny
+# variant whose 16 slabs at KC=128 would explode.
+# WHY IT SHOULD PAY MORE AT MID-n THAN AT n=32: the serial chain is (KC/MR) slabs x MR rows, so KC=128
+# gives 128 dependent steps against n=32's 32 — four times the latency to hide, with still only one
+# chain in flight today. Zen4 misses exactly there (128 0.911, 256 0.936, 512 0.961, 1024 0.984).
+# Both stripes share one P of row stride 2*NRV*W: stripe A at column base 0, stripe B at NRV.
+# The two stripes are ADJACENT (the stripe loop emits consecutive stripes), so one `jc` plus a column
+# base of 0 and NRV addresses both — for B *and* for P. Passing two independent jc values would need
+# vbase to shift P only, which it does not: vbase shifts both.
+@inline @generated function _gemmtrsm_u_slab_pair!(
+        Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int,
+        Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
+    ) where {T, MR, NRV}
+    W = _vwidth(T)
+    (W == 8 && MR == 8) ||
+        return :(throw(AssertionError("paired fusedT slab requires W==MR==8 (AVX-512 f64)")))
+    ldp = 2 * NRV * W                                    # shared P: stripe A [0,NRV*W), stripe B [NRV*W,ldp)
+    body = quote end
+    append!(body.args, _slab_body_ord(T, MR, NRV, :s, :KC, ldp, nothing, 0, false, :a).args)
+    append!(body.args, _slab_body_ord(T, MR, NRV, :s, :KC, ldp, nothing, NRV, false, :b).args)
+    push!(body.args, :(return nothing))
+    return body
+end
+
 @inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
         Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
         jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
@@ -2512,6 +2539,20 @@ end
     return
 end
 
+# TWO ADJACENT STRIPES, slabs interleaved — the n=32 ILP win generalised to any KC (_EXP8).
+# Same shape as _fusedT_stripe! but each `si` step solves BOTH stripes in one body, so two independent
+# back-substitution chains are in flight. `rem > 0` (ragged bottom rows) falls back to the single-stripe
+# path: the tail needs its own mini-pack and is rare (KC not a multiple of MR).
+@inline function _fusedT_stripe_pair!(
+        ::Val{NRVe}, Pp::Ptr{T}, pB::Ptr{T}, ldb::Int, jc::Int, pU::Ptr{T},
+        ldu::Int, rp::Ptr{T}, KC::Int, nfull::Int, MR::Int, sz::Int
+    ) where {T, NRVe}
+    for si in (nfull - 1):-1:0
+        _gemmtrsm_u_slab_pair!(Pp, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe))
+    end
+    return
+end
+
 # TINY-K SLAB: identical body to the general slab, but the gemm trip count is a literal `Val{NG}` and the
 # P stride folds out of `Val{NRV}`. One specialization per (NG, NRV) actually reachable — NG runs over
 # multiples of MR below the tiny-k cap, so this is a handful of small functions, not a copy of the sweep.
@@ -2570,7 +2611,8 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP5  force the compact-U pack at tiny k (directA OFF) — miss PLACEMENT lever
 #   _EXP6  subtract hoist — NOT WIRED (both-orders emission doubles every slab; >72 min build)
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
-#   _EXP8.._EXP16  free
+#   _EXP8  pair two ADJACENT full stripes at any KC (generalised ILP lever)
+#   _EXP9.._EXP16  free
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
 # At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
@@ -2686,10 +2728,17 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # column at stride ldu·sz, and a po2 ldu (KC=128) collapses those onto few L1 sets — an odd ld can never
     # be a way-stride multiple, so the re-reads stay conflict-free (mirrors _trsm_rpack's odd-ld trick).
     ldu = KC | 1
-    buf = _trsm_fused_buf(T, KC * NR + KC * ldu + KC)
+    # P is sized for the WIDEST stripe layout any path here can use, not just NR. The interleaved-pair
+    # paths share one P across two stripes: 2*NR columns for `_fusedT_stripe_pair!`, NR+W for the tiny
+    # `_fusedT_pair_tiny!`. Sizing P at NR silently overflowed into the U-pack region — harmless only by
+    # accident at k=32 (directA leaves that region unused and `rp` sits beyond the spill), which is
+    # exactly the kind of luck that turns into a corruption bug the moment directA is false.
+    buf = _trsm_fused_buf(T, KC * 2 * NR + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
-        pU = Pp + KC * NR * sz; rp = pU + KC * ldu * sz
+        # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
+        # write P columns up to 2*NR and would otherwise land on top of the U pack.
+        pU = Pp + KC * 2 * NR * sz; rp = pU + KC * ldu * sz
         # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
         # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
         # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
@@ -2749,6 +2798,15 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
             # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
+            # _EXP8 — pair two ADJACENT full stripes so their back-substitution chains overlap. Same
+            # lever that took n=32 from 0.898 to 1.105; it should pay MORE here because the chain is
+            # (KC/MR)*MR = KC steps long (128 at KC=128 vs 32), all with one chain in flight today.
+            # Needs 2*NRV*W columns of P; the buffer is KC*NR + ... which covers it since 2*NRV*W = 2*NR
+            # only when both stripes are full — hence the `jc + 2NR <= n` guard.
+            if _EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR && jc + 2 * NR <= n
+                _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
+                jc += 2 * NR; continue
+            end
             if fusedT && wid == NRl && NRl == NR
                 _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
                 jc += NR; continue
