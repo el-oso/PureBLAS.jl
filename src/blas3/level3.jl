@@ -2144,9 +2144,10 @@ end
 # runtime address math, which is cheap and, unlike inlining the whole sweep into one function, keeps the
 # 24 live accumulators inside ONE slab's register-allocation scope.
 function _slab_upk_fusedT_body(
-        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int} = nothing
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int} = nothing,
+        incaddr::Bool = false
     ) where {T}
-    return _slab_upk_fusedT_body_1(T, MR, NRV, s, KC, ldp, ng, 0)
+    return _slab_upk_fusedT_body_1(T, MR, NRV, s, KC, ldp, ng, 0, incaddr)
 end
 
 # The core emitter. `vbase` shifts this sweep's v-columns to lane group `vbase` of the NRV·W-wide stripe:
@@ -2158,18 +2159,19 @@ end
 # runs at GENERATION time, so a generator-level test would bake the choice in at first specialisation
 # and the A/B toggle would silently do nothing (the same trap the _EXP2 prefetch generator hit).
 function _slab_upk_fusedT_body_1(
-        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int
+        ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int,
+        incaddr::Bool = false
     ) where {T}
     # _EXP6 (subtract hoist) is NOT wired: emitting both orders behind a runtime branch doubles every
     # slab specialisation and the build did not finish in 72 minutes. If it is ever revisited, select the
     # order at GENERATION time and pay a session restart per arm instead — the runtime-toggle trick that
     # works for cheap flags does not scale to a structurally different body.
-    return _slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false)
+    return _slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false, Symbol(""), incaddr)
 end
 
 function _slab_body_ord(
         ::Type{T}, MR::Int, NRV::Int, s, KC, ldp, ng::Union{Nothing, Int}, vbase::Int, hoist::Bool,
-        pfx::Symbol = Symbol("")
+        pfx::Symbol = Symbol(""), incaddr::Bool = false
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
@@ -2189,13 +2191,30 @@ function _slab_body_ord(
     # 6.8% FASTER once pages are resident. More chains in flight is the only thing that addresses that.
     cc_(r, v) = Symbol(pfx, :c, r, :_, v)
     u_ = Symbol(pfx, :u); d_ = Symbol(pfx, :d)
+    # INCREMENTAL B ADDRESSING (`incaddr`). The shipped form recomputes `(jc + c)*ldb` for each of the
+    # NRV*W column constants c, on BOTH the load and the store side — with `jc` and `ldb` runtime, that is
+    # a genuine integer multiply per access. Measured in the emitted code (P6, 2026-08-10): 27 `imul` and
+    # 192 scalar address instructions per slab, 22.1% of the out-of-loop instruction count, which itself
+    # is the 18.6% fixed cost the leaf's `1/GF = α + β/KC` fit prices. Neither the transpose (~3.2% of
+    # total) nor the back-substitution (~2.8%) dominates that cost — this addressing does.
+    # The columns touched are CONSECUTIVE (vbase*W .. vbase*W + NRV*W - 1), so one base pointer plus a
+    # running `+= ldb*sz` replaces every one of those multiplies. Bit-identical: addressing only, the
+    # arithmetic and its order are untouched.
+    pbl_ = Symbol(pfx, :pbl); pbs_ = Symbol(pfx, :pbs); ldbs_ = Symbol(pfx, :ldbs)
+    if incaddr
+        push!(body.args, :($ldbs_ = ldb * $sz))
+        push!(body.args, :($pbl_ = pB + (($s) + (jc + $(vbase * W)) * ldb) * $sz))
+        push!(body.args, :($pbs_ = $pbl_))
+    end
+    bload_(v, l) = incaddr ? :($pbl_) :
+        :(pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz)
+    bstore_(v, l) = incaddr ? :($pbs_) :
+        :(pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz)
     subtract = quote end
     for v in 0:(NRV - 1)
         for l in 0:(W - 1)
-            push!(
-                subtract.args,
-                :($(Symbol(pfx, :bc, l)) = vload($V, pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
-            )
+            push!(subtract.args, :($(Symbol(pfx, :bc, l)) = vload($V, $(bload_(v, l)))))
+            incaddr && push!(subtract.args, :($pbl_ = $pbl_ + $ldbs_))
         end
         brs = Expr(:tuple, (Symbol(pfx, :br, l) for l in 0:(W - 1))...)
         push!(subtract.args, Expr(:(=), brs, :(_tr8x8($((Symbol(pfx, :bc, l) for l in 0:(W - 1))...)))))
@@ -2270,10 +2289,8 @@ function _slab_body_ord(
         ccs = Expr(:tuple, (Symbol(pfx, :cc, l) for l in 0:(W - 1))...)
         push!(body.args, Expr(:(=), ccs, :(_tr8x8($((cc_(r, v) for r in 0:(MR - 1))...)))))
         for l in 0:(W - 1)
-            push!(
-                body.args,
-                :(vstore($(Symbol(pfx, :cc, l)), pB + (($s) + (jc + $((vbase + v) * W + l)) * ldb) * $sz))
-            )
+            push!(body.args, :(vstore($(Symbol(pfx, :cc, l)), $(bstore_(v, l)))))
+            incaddr && push!(body.args, :($pbs_ = $pbs_ + $ldbs_))
         end
     end
     return body
@@ -2308,15 +2325,18 @@ end
 
 @inline @generated function _gemmtrsm_u_slab_upk_fusedT!(
         Pp::Ptr{T}, ldp::Int, pB::Ptr{T}, ldb::Int,
-        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}
-    ) where {T, MR, NRV}
+        jc::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, s::Int, KC::Int, ::Val{MR}, ::Val{NRV}, ::Val{ADDR}
+    ) where {T, MR, NRV, ADDR}
     W = _vwidth(T)
     # AVX-512-f64 (W==MR==8) only. Generate a throw-body (never an assert) for other widths so GENERATION
     # always succeeds: the driver's fusedT branch is runtime-dead off AVX-512 (gated by _GT_TRANSPOSE), but
     # StrictMode's full-inference dogfood still expands this @generated call on AVX2 — a generation-time
     # @assert there crashes CI (the W=4 runner). The throw-expr compiles cleanly and is never executed.
     (W == 8 && MR == 8) || return :(throw(AssertionError("fusedT slab requires W==MR==8 (AVX-512 f64)")))
-    body = _slab_upk_fusedT_body(T, MR, NRV, :s, :KC, :ldp)
+    # `ADDR` selects the B-addressing form at GENERATION time via a TYPE PARAMETER, so each specialisation
+    # emits exactly one variant. It must not be an `_EXPFLAG` read inside this generator — that would bake
+    # the choice in at first specialisation and leave a silently dead A/B arm (the _EXP2 prefetch trap).
+    body = _slab_upk_fusedT_body(T, MR, NRV, :s, :KC, :ldp, nothing, ADDR)
     push!(body.args, :(return nothing))
     return body
 end
@@ -2549,8 +2569,15 @@ end
             unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * Ppw + v) * sz))
         end
     end
+    # INCREMENTAL B ADDRESSING, shipped on (Val(true)). Bit-identical — addressing only, arithmetic and
+    # its order untouched (verified bit-for-bit at KC=128/256 n=240, KC=128 n=128, and ragged KC=170 n=96).
+    # Measured leaf speedup, direct-call paired A/B at n=240: KC=64 0.9554, 128 0.9697, 192 0.9775,
+    # 256 0.9779 — largest at small KC, as a per-slab FIXED cost must be. End-to-end at the gate shape
+    # n=128: 0.9704 (SE 0.0025, n=92). At n>=512 it reads null because the leaf's TIME SHARE is only
+    # 29%/15% there, so a 3% leaf win dilutes below resolution — that is dilution, not a dead arm.
+    # Only ONE Val is instantiated so this costs no extra specialisation.
     for si in (nfull - 1):-1:0
-        _gemmtrsm_u_slab_upk_fusedT!(Pp, Ppw, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe))
+        _gemmtrsm_u_slab_upk_fusedT!(Pp, Ppw, pB, ldb, jc, pU, ldu, rp, si * MR, KC, Val(MR), Val(NRVe), Val(true))
     end
     return
 end
