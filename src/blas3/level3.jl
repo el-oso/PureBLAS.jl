@@ -2677,7 +2677,9 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
 #          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
 #   _EXP9  free
-#   _EXP10 A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
+#   _EXP10 free again — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
+#          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
+#          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
 #          at the caller's lda, and a quarter-period byte stride (lda=128 f64 ⇒ 1024 B) puts its columns
 #          on the same L1 sets. Copies A's lower triangle into `_trsm_rpack`'s odd-ld scratch when the
 #          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
@@ -3566,7 +3568,21 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # test (the residency half matters — `_chol_needs_pad` measured a pad LOSING at n=384 once the
         # block spills L2, because then the copy round-trip is pure traffic). `_trsm_rpack` already
         # returns an odd-ld scratch, which by construction can never be a way-stride multiple.
-        if tr && _EXPFLAG[_EXP10] && _potrf_needs_pad(A, k)
+        # WHEN the pad pays — DERIVED, and NOT simply "whenever the stride aliases". Measured both boxes,
+        # gate shape, end to end (pad/shipped, <1 = pad faster):
+        #        n=128     n=256     n=512
+        #   Zen3 0.8725    0.9411    0.8447      (AVX2, _NVREG=16)
+        #   Zen4 1.0489    1.0115    0.9112      (AVX-512, _NVREG=32)
+        # The SIGN INVERTS at n=128: a blanket predicate would have taken Zen4's passing 1.05 cell down
+        # to ~1.00. The conflict only costs more than the copy when A's columns are actually RE-READ:
+        #   * the leaf SPILLS (it holds _RL_MR*_CHOL_NB accumulators + _CHOL_NB T-vectors + ~2 more; at
+        #     3*4+4+2 = 18 that exceeds AVX2's 16 ymm but not AVX-512's 32 zmm), so AVX2 re-reads A; or
+        #   * A does not fit L2, so every re-read is an L3 trip regardless of register file.
+        # Both terms are formulas over detected consts, not a µarch literal. This reproduces all six
+        # measured cells above; per req#8b it is derive → validate → ship, and the validation is the
+        # fleet A/B that produced the table.
+        if tr && _potrf_needs_pad(A, k) &&
+                (_RL_MR_LIVE > _NVREG || k * k * sizeof(Float64) > _L2_BYTES)
             S = _trsm_rpack(Float64, k, k)
             @inbounds for c in 1:k, r in c:k          # lower triangle only — the leaf reads nothing above it
                 S[r, c] = A[r, c]
