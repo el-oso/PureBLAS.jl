@@ -3581,8 +3581,24 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # Both terms are formulas over detected consts, not a µarch literal. This reproduces all six
         # measured cells above; per req#8b it is derive → validate → ship, and the validation is the
         # fleet A/B that produced the table.
-        if tr && _potrf_needs_pad(A, k) &&
-                (_RL_MR_LIVE > _NVREG || k * k * sizeof(Float64) > _L2_BYTES)
+        # GATED ON THE SPILL TERM ALONE. The pad is a TRADE (copy vs conflict), so the aliasing stride
+        # is only half the test — it says a conflict exists, not that removing it beats the copy. What
+        # decides that is whether A's columns are actually RE-READ, and the leaf only re-reads them when
+        # it SPILLS: `_RL_MR_LIVE` = 3·_CHOL_NB + _CHOL_NB + 2 = 18 live vectors, over AVX2's 16 ymm and
+        # under AVX-512's 32 zmm. Measured:
+        #   Zen3 (spills)     — wins at EVERY size: +12.8/5.9/15.5/9.9/4.9/2.3% at n=128..4096,
+        #                       gate worst 0.821 → 0.924, n=512 and n=1024 closed.
+        #   Zen4 (no spill)   — n=128 the pad is 4.9% SLOWER (it would turn a passing 1.05 cell into
+        #                       ~1.00), and n=512/1024/2048/4096 are NULL (1.0014/1.0009/0.9999/1.0003,
+        #                       SE 0.0003..0.0039). So on a non-spilling box the pad buys nothing
+        #                       anywhere and costs at small k.
+        # An earlier version added `k²·sz > _L2_BYTES` to pad large A on non-spilling boxes too. That
+        # came from ONE probe reading 0.9112 at Zen4 n=512; a tighter re-measure across four sizes could
+        # not reproduce it, so the term was unvalidated and is removed rather than kept on a single
+        # observation. Consequence: Zen4 now never pads, which is byte-identical to its pre-change
+        # behaviour — the 0.958 → 0.944 seen on one Zen4 gate run was drift, not this change.
+        # _EXP10 INVERTED: set true to DISABLE the pad, so the shipped arm stays A/B-able in-process.
+        if tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
             S = _trsm_rpack(Float64, k, k)
             @inbounds for c in 1:k, r in c:k          # lower triangle only — the leaf reads nothing above it
                 S[r, c] = A[r, c]
