@@ -546,6 +546,15 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
 # across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
 const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
+# Live vector count of the fused side-R leaf's top tier (`_trsm_rl_split_f64!` below): MR=3 row-tiers ×
+# _CHOL_NB column accumulators, plus the _CHOL_NB T-vectors and the diagonal/broadcast pair. Compared
+# against `_NVREG` this says whether that leaf SPILLS on this box — 3*4+4+2 = 18, over AVX2's 16 ymm and
+# under AVX-512's 32 zmm. `_trsm_right!` uses it to decide whether an lda conflict on A is worth a
+# de-aliasing copy: the conflict only outweighs the copy when A's columns are actually RE-READ, which
+# happens when the leaf spills (or when A does not fit L2). DERIVE (req#8) — a formula over detected
+# consts, not a µarch literal. Lives here, not in level3.jl, because `_CHOL_NB` is defined in this file
+# and level3.jl is included FIRST (PureBLAS.jl:20-21), so a const there cannot see it.
+const _RL_MR_LIVE = 3 * _CHOL_NB + _CHOL_NB + 2
 const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
