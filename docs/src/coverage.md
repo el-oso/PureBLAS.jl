@@ -32,7 +32,11 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   Zen3 are at `17ae50d` / `b728740` (2026-08-10). The per-commit provenance for every column is stamped
   in [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md) and
   should be read alongside this page — a cell is evidence only about the commit it was measured at.
-  Concretely: `trsm` improved on Zen4 and Zen3 on 2026-08-10 and the Zen5 column has not yet seen it.
+  Concretely: `trsm` improved on Zen4 and Zen3 on 2026-08-10, and `trsmR` improved on Zen3 the same day
+  (0.821 → 0.917, with n=512 and n=1024 crossing into PASS); the Zen5 column has seen neither. The
+  `trsmR` Zen4 cell moved 0.955 → 0.947 in the same refresh, but that is a RE-MEASUREMENT of unchanged
+  code, not a regression — the fix gates on a register-spill predicate that is false on AVX-512, so the
+  Zen4 side-R path is byte-identical to before. Run-to-run drift on this row is ~1%.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
@@ -150,7 +154,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>syrk</code></th><td class="b3"><span class="v">0.936</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>trmm</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
 <tr><th><code>trsm</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b4"><span class="v">0.821</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
 <tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.816</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.975</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>

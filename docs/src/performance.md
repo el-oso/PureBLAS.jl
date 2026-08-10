@@ -341,9 +341,17 @@ complex — by 5–80%.** The one residual vs AOCL is real **side-L `trsm` at mi
 0.92–0.97): a codegen-scheduling gap on the fused-leaf kernel — the fused-back-substitution's
 latency chain runs at ~2 IPC where BLIS's hand-scheduled assembly hides it — not a structural lever
 (building AOCL's own packed-triangle structure in portable SIMD.jl lands at the same ~0.95). Side-R
-`trsmR` (the potrf/getrf panel shape) PB *leads* overall (geomean 1.28–1.30 vs AOCL): both `transA`
-now route through the fused leaf via the reflection identity Ã = J·Aᵀ·J, which closed side-R `'T'`
-outright on Zen4 and left the worst size at 0.97 (n≥2048) — the former mid-n dip is gone.
+`trsmR` (the potrf/getrf panel shape): both `transA` route through the fused leaf via the reflection
+identity Ã = J·Aᵀ·J. Its long-standing AVX2 worst cell (n=128, 0.817 vs AOCL — the worst BLAS-3 cell on
+the fleet, and recorded in the kb as unexplained after two falsified hypotheses) was closed to **0.917
+on 2026-08-10**, with **n=512 and n=1024 crossing into PASS** (0.941→1.105, 0.985→1.086) and every size
+improving. Cause: at `transA='T'` the reflection branch does not fire, so A reaches the leaf **verbatim
+at the caller's lda**; for a square operand that is a power of two, and at k=128 the 1024-byte column
+stride is a quarter L1 way period. Padding A into an odd-`ld` scratch recovers 11.5–15.1% at the leaf.
+The pad is gated on whether the leaf actually **re-reads** A — i.e. whether it spills, which is true on
+AVX2's 16 ymm and false on AVX-512's 32 zmm — because on a non-spilling box the same pad measured *null*
+at n≥512 and 4.9% *slower* at n=128. Zen4 therefore never pads and is byte-identical to before; its worst
+size remains ~0.95 (n=2048).
 The former **small-n `gemm` dip** (~0.92× AOCL at
 n≤256, where BLIS's lower packing overhead won) is now **closed** by a *direct-B microkernel* that skips
 the B-pack entirely when B is contiguous in the k-index (col-major, no transpose) — dgemm now gates
