@@ -263,7 +263,11 @@ be fixed at the kernel before anything above it can convert.
 
 **Zen4 (AVX-512, double-pumped).** The tuning target. Real BLAS-1/2 gate essentially everywhere;
 the residuals are the BLAS-3 set above (`trsm` 0.941 @ n=128 — n=32 now gates at 1.056 — `syrk` 0.937
-@ n=4096, `trmm` 0.950, `symm` 0.955). The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
+@ n=4096, `trmm` 0.960 @ n=2048, `symm` 0.955). `trmm`'s crossover between recursion-over-`gemm!` and
+the packed routine is now derived as `5·_GEMM_UNPACK_MAX ÷ 2` rather than borrowed from gemm's own
+unpacked/blocked cut: n=512 and n=1024 went 0.951/0.945 → 0.994/0.996, moving the worst cell to n=2048,
+whose miss lies in the packed path itself and is a separate defect.
+The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
 `zgeru` 0.906 (n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
 
 **Zen5 (AVX-512, native 512-bit).** Clears every AVX2 ceiling but shows a disjoint residual
