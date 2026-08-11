@@ -23,6 +23,26 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 # to pin without a dedicated 2-box crossover campaign; a guessed formula would be worse than this literal.)
 # Preferences "trmm_rpack" pins it if a future box measures otherwise.
 const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
+
+# trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
+# recursion over `gemm!`. Its own constant as of task #134 — it used to read `_GEMM_UNPACK_MAX`, which is
+# gemm's UNPACKED-vs-BLOCKED crossover (2·(nvreg−4)·W = 448 on the AVX-512 boxes, 96 on AVX2). That is a
+# different kernel PAIR on a different shape family, and it had never been measured at THIS boundary: a
+# borrowed threshold, i.e. a routing predicate carrying no PDM discipline at all.
+#
+# PDM tier: MEASURE, and the tell is textbook — the optimum INVERTS across µarchs we own. Controlled
+# same-process A/B (recursion ÷ packed, <1 = recursion faster) on Zen4: 0.929 at n=449, 0.95-0.98 across
+# 480..2048, crossing 1.0 only near n≈3072; on Zen3 the same arm gives 1.001-1.032 at n=256..2048, i.e.
+# packed wins and today's value is already right there. Corroboration from the gate itself: Zen4 trmm
+# misses AOCL at exactly 512/1024/2048 (0.951/0.950/0.955) and PASSES at 4096 (1.037) — the miss band and
+# the recursion-faster band are the same band. There is no formula over cache/ISA consts to derive here;
+# the crossover tracks the ratio (gemm peak : packed-trmm peak), which is not a detected constant.
+#
+# DEFAULT IS TODAY'S VALUE, deliberately: this commit is a rename plus a seam, byte-identical in
+# behaviour, so the Measure-tier resolver can be added and gate-validated as a separate, revertible step.
+# `_measure_gemvt_nc` is the standing warning against skipping that — its duel is disabled because a
+# well-built probe once resolved an arm the gate then contradicted.
+const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", _GEMM_UNPACK_MAX)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
@@ -1146,7 +1166,7 @@ function trmm!(
         # decisive only from n>=1536, direct winning the small/mid band. If confirmed the fix is a trmm-owned
         # Measure-tier crossover (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX], default =
         # today's value so migration is zero-risk), NOT a change to gemm's constant.
-    elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX + _EXPINT[2] &&
+    elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _TRMM_PACK_MIN + _EXPINT[2] &&
             !_EXPFLAG[_EXP9]
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
