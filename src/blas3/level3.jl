@@ -2760,6 +2760,21 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          L1 set pressure, so there is no way to hold a load schedule apart from Julia here.
 #          CONSEQUENCE: the associativity model is NOT falsified, but any fix must change the ADDRESSES
 #          (the access pattern) rather than the order. Do not retry a scheduling variant of this.
+#          Then it held a STAGED PACK, which does change the addresses: copy the KC×wid panel through an
+#          odd-ld scratch (pass 1 reads each B column as ONE long contiguous run, so nothing collides;
+#          pass 2 transposes out of the scratch, whose stride is not a way-stride multiple). Both passes
+#          vectorised, gated on `_alias_ld(ldb)`, bit-identical, wired at both pack call sites.
+#          ALSO FALSIFIED, and decisively: packed path −1.3% at n=512 and −0.5% at n=1024 against
+#          ldb-pad ceilings of +3.9% and +3.0%; fusedT +0.2%/+0.3%; n=384 control flat everywhere.
+#          The extra streaming pass costs MORE than the ~18%-of-leaf aliasing it removes — the same
+#          verdict the scalar column-outer pack got (−0.9%), and vectorising both passes did not change
+#          it. Note also that fusedT SKIPS the pack entirely for full-width stripes (`fusedT && wid == W`
+#          takes `_fusedT_stripe_k!` and continues), so no packing-level change can reach the shipped
+#          AVX-512 path at the gate shape anyway.
+#          STANDING CONCLUSION: three packing/scheduling escapes are now falsified (column-outer scalar,
+#          load-schedule split, staged copy). The aliasing is real and worth 4.5% at n=512 / 2.0% at
+#          n=1024, but capturing it requires a microkernel whose B access is not eight aliased columns —
+#          i.e. a genuine row-lane family, not an edit to the pack. Do not attempt another pack variant.
 #   _EXP10 free again — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
 #          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
 #          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
