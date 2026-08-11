@@ -2235,6 +2235,24 @@ function _slab_upk_fusedT_body_1(
     # slab specialisation and the build did not finish in 72 minutes. If it is ever revisited, select the
     # order at GENERATION time and pay a session restart per arm instead — the runtime-toggle trick that
     # works for cheap flags does not scale to a structurally different body.
+    #
+    # GEMM ITERATION ROTATION — TRIED AND FALSIFIED (2026-08-11), and this one closes a whole class.
+    # Slabs run bottom-up, so slab `s` sums over kk ∈ [s+MR, KC) and the FIRST MR of those are exactly the
+    # rows the immediately preceding slab just wrote. FP accumulation is not reassociable, so on paper
+    # every accumulator chain threads those dependent head iterations before reaching the independent
+    # majority — a cross-slab dataflow fence, once per slab, 16 times per stripe at KC=128, and static
+    # accounting priced the serial spine at ~4% of a stripe. Rotating the loop to emit [s+2MR, KC) first
+    # and the dependent [s+MR, s+2MR) LAST should let the independent iterations issue while the previous
+    # chain drains, at identical instruction count and zero extra L1 footprint.
+    # Built behind a generation-time `gemmtrsm_rot` Preference (a restart per arm, per the note above).
+    # NULL: n=128 18.52 vs 18.55 GF, n=256 19.48 vs 19.43, n=512 19.84 vs 19.58, n=1024 20.29 vs 20.21 —
+    # all inside the ±1-2% run spread, against a ≥+2% bar at the binding cell.
+    # The arm was LIVE, not dead: 1162 → 1686 instructions, 8 → 16 branches, FMA 300 → 516 (the dependent
+    # tail peels and unrolls). So out-of-order execution ALREADY hides the fence, and the ~4% serial-spine
+    # estimate that motivated this does not survive contact — do not re-derive a lever from it.
+    # CONSEQUENCE: schedule-level ILP on this kernel is exhausted. Pairing (a second stripe) fails on L1
+    # capacity, rotation (self-supplied slack) is a null, and the chain itself is order-forced. What
+    # remains for n=128/256 is a formulation with a different B access, i.e. the row-lane family.
     return _slab_body_ord(T, MR, NRV, s, KC, ldp, ng, vbase, false, Symbol(""), incaddr)
 end
 
