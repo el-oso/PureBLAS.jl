@@ -1148,7 +1148,6 @@ function trmm!(
         # today's value so migration is zero-risk), NOT a change to gemm's constant.
     elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _GEMM_UNPACK_MAX + _EXPINT[2] &&
             !_EXPFLAG[_EXP9]
-        _EXPINT[3] = 1        # WITNESS: this branch ran. Assert it before believing any A/B on _EXP9.
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
         # but regressed k=768 and the public po2 A-pad path — non-robust, not worth the split.)
@@ -1761,7 +1760,6 @@ end
 
 # Driver: one NR-wide column stripe at a time; pack → slabs bottom-up → unpack.
 function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
-    _EXPFLAG[_EXP16] = true   # WITNESS: the complex side-L slab leaf ran. Assert before any ztrsm A/B.
     nrhs = size(B, 2); csz = sizeof(ComplexF64); sz = sizeof(Float64)
     NR = _ZGT_NR; MR = _ZGT_MR
     lda = stride(A, 2); ldb = stride(B, 2)
@@ -1995,7 +1993,6 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
 end
 
 function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
-    _EXPFLAG[_EXP11] = true   # WITNESS: the register-tile side-R leaf ran. Assert before any ztrsmR A/B.
     m = size(B, 1); W = _ZGT_W; NC = _ZRT_NC
     lda = stride(A, 2); ldb = stride(B, 2)
     nb = (k ÷ NC) * NC                       # columns covered by full tiles
@@ -2693,6 +2690,11 @@ end
 # (square B at n=32 on AVX2 routes to `_trsm_dense_L!`). Reasoning about routing from the source is what
 # FAILED; a witness is an execution fact. Zero the slot, run one untimed call, assert it is 1 — then
 # measure. Never publish an A/B whose witness did not fire.
+# A witness is PROBE SCAFFOLDING and is stripped once its campaign lands: unlike a knob (a read that
+# const-folds or costs one predictable branch), a witness is an unconditional STORE to module-global
+# state on a path that ships. Re-add one for the next campaign, in-session, via Revise — that is what the
+# slot table is for. Removing the ztrsmR/ztrsm/trmm witnesses is why the gate was re-measured at the
+# merge commit rather than at the commit that carried them.
 const _EXPINT = fill(0, 4)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
@@ -2722,7 +2724,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
-#   _EXP11 WITNESS ONLY (never an arm): set by `_trsm_zrt_R!`, the complex side-R register-tile leaf.
+#   _EXP11 free — was the `_trsm_zrt_R!` witness during the ztrsmR campaign; stripped when it landed.
 #   _EXP12 ztrsmR leaf column-block width NC=8 instead of `_ZRT_NC`(=4), on the reasoning that the
 #          leaf's B re-reads fall as k²/(2·NC) and 2·NC+2 = 18 vectors fits AVX-512's 32 zmm.
 #          FALSIFIED (Zen4, bit-identical output): 1.125 / 1.008 / 1.004 / 1.002 / 1.000 at
@@ -2751,8 +2753,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          not because it lost, but because it compiled to a BYTE-IDENTICAL loop: LLVM already emits
 #          vfnmadd there (that kernel's negated splat is used TWICE, `_zrt_tile!`'s was used once).
 #          See the `_zgt_slab!` header. Do not re-run the sibling audit on this kernel.
-#   _EXP16 WITNESS ONLY (never an arm): set by `_trsm_cgt_L!`, the complex side-L slab leaf.
-#   BOTH WITNESSES (_EXP11, _EXP16) ARE PROBE SCAFFOLDING — strip them before this branch merges.
+#   _EXP16 free — was the `_trsm_cgt_L!` witness during the same campaign; stripped when it landed.
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
 # At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
