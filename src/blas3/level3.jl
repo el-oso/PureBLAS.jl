@@ -30,19 +30,34 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
 # different kernel PAIR on a different shape family, and it had never been measured at THIS boundary: a
 # borrowed threshold, i.e. a routing predicate carrying no PDM discipline at all.
 #
-# PDM tier: MEASURE, and the tell is textbook — the optimum INVERTS across µarchs we own. Controlled
-# same-process A/B (recursion ÷ packed, <1 = recursion faster) on Zen4: 0.929 at n=449, 0.95-0.98 across
-# 480..2048, crossing 1.0 only near n≈3072; on Zen3 the same arm gives 1.001-1.032 at n=256..2048, i.e.
-# packed wins and today's value is already right there. Corroboration from the gate itself: Zen4 trmm
-# misses AOCL at exactly 512/1024/2048 (0.951/0.950/0.955) and PASSES at 4096 (1.037) — the miss band and
-# the recursion-faster band are the same band. There is no formula over cache/ISA consts to derive here;
-# the crossover tracks the ratio (gemm peak : packed-trmm peak), which is not a detected constant.
+# PDM tier: DERIVE — `5·_GEMM_UNPACK_MAX ÷ 2`, i.e. gemm's own crossover scaled by a single fleet-wide
+# coefficient. Zen3 → 240, Zen4/Zen5 → 1120. Scaling off `_GEMM_UNPACK_MAX` is not arbitrary: the route
+# this predicate chooses BETWEEN is recursion-over-`gemm!` versus packed trmm, so the competing path is
+# literally gemm and its unpacked/blocked crossover (itself derived from `_NVREG` and `W`) is the right
+# scale. A box we have never benchmarked therefore gets a crossover that tracks its register file and
+# vector width, which is the whole point of req#8.
 #
-# DEFAULT IS TODAY'S VALUE, deliberately: this commit is a rename plus a seam, byte-identical in
-# behaviour, so the Measure-tier resolver can be added and gate-validated as a separate, revertible step.
-# `_measure_gemvt_nc` is the standing warning against skipping that — its duel is disabled because a
-# well-built probe once resolved an arm the gate then contradicted.
-const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", _GEMM_UNPACK_MAX)::Int
+# HOW THE COEFFICIENT WAS OBTAINED, including what would falsify it. Gate-shape A/B on both boxes (full
+# `plots.jl` trmm sweep, shipped cut vs cut pinned past every size, PB-vs-PB medians, same commit) LOCATES
+# the crossover on each — packed and recursion swap winner between two adjacent gate sizes:
+#     Zen4  512 0.961 · 1024 0.952 (recursion faster)  |  2048 1.007 · 4096 1.005 (null)  ⇒ C ∈ [1024, 2048)
+#     Zen3  128 0.997 (null)  |  256 1.043 · 512 1.037 · 1024 1.016 (packed faster)       ⇒ C ∈ [128, 256)
+# Requiring one multiplier `m` to land inside BOTH intervals is a falsifiable test, and it falsifies
+# three of the four candidate bases outright — `m·W²` needs [8,16) vs [16,32), `m·_NVREG·W` needs [2,4)
+# vs [4,8), `m·L2_KiB` needs [0.25,0.5) vs [1,2): all disjoint. Only `m·_GEMM_UNPACK_MAX` admits a common
+# window, m ∈ [2.286, 2.667); 5/2 sits near its middle, so both boxes keep margin to the edges.
+#
+# HONEST LIMITS, so this is not read as stronger than it is: `m` is FITTED to two boxes, not predicted,
+# and the third (Zen5) was offline and could not be checked — its ISA consts equal Zen4's, so it inherits
+# 1120 untested. The intervals are one gate size wide, so `m`'s window is coarse. If a future box's
+# located crossover falls outside `m·_GEMM_UNPACK_MAX`, this is the wrong basis and the knob is Measure
+# tier after all — pin `trmm_pack_min` on that box and re-open #134 rather than nudging the coefficient
+# to fit three points, which is how a derivation becomes a lookup table with extra steps.
+#
+# DO NOT re-derive this from the in-process probe: it put the crossover near 3072 and called n=2048 a
+# 2.5% win for recursion, where the gate says null. `_measure_gemvt_nc`'s lesson — a probe disagreeing
+# with the gate is evidence about the PROBE — and the reason its own duel is disabled.
+const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) ÷ 2)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
