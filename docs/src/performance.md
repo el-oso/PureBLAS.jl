@@ -164,7 +164,25 @@ AVX-512 boxes.
 
 `zgemm` beats OpenBLAS fleet-wide (geomean 1.26–1.40; Karatsuba 3M at mid/large n). The
 rank-k ops gate within a few percent. `@simd ivdep` on the complex microkernel's k-loop (4 FMA/cell)
-helped the small-n complex trmm. The deepest AVX2 (Zen3) small-n dips remain open: `ztrmm`/`ztrmmR`
+helped the small-n complex trmm.
+
+**`ztrsmR` (complex side-R) improved at every size on 2026-08-11**, and the cause was codegen rather
+than blocking or cache. Four cells crossed into PASS — Zen4 n=32 0.974→1.196 and n=128 0.933→1.022,
+Zen3 n=32 0.829→1.091 and n=256 0.975→1.111 — and the fleet's worst complex-BLAS-3 cell, Zen3 n=128,
+went **0.768→0.926**. The cell was first *attributed*: it fits `1/GF = α + β/n` with an 83.5 GF
+asymptote (predicting n=192 to 0.2%), so it was a 14% per-call fixed cost, not a size-specific
+conflict; sum-of-parts came to 99.7% of the call, and PB's own `zgemm` is flat at ~42.6 GF from k=48
+to k=512 (≈95% of Zen4's double-pumped AVX-512 ceiling), which left the register-tile leaf as the
+whole target. Inside it, the update was written `muladd(V2(-cr), xv, …)` — the negation sitting on the
+*scalar* coefficient between its load and its splat, which blocks both the `vfnmadd` opcode and
+AVX-512's embedded broadcast `(mem){1to8}`. LLVM therefore emitted `vmovsd` + `vxorpd` +
+`vbroadcastsd` per coefficient: 96 instructions of coefficient preparation against 64 useful FMAs.
+Negating the B vector once per step instead is exact (`nswap(-v) == -nswap(v)`, so the swapped operand
+needs no separate handling) and takes the loop from **2.95 to 1.96 instructions per useful FMA**, with
+residuals identical to the last digit. Four cheaper hypotheses were falsified first — power-of-two
+`lda`/`ldb`, a wider column block, load-slot pressure, and tile-loop interchange — and the same rewrite
+applied to the complex *side-L* slab compiled byte-identical, because LLVM had already chosen `vfnmadd`
+there on its own. Remaining: Zen3 n=128 (0.926) and Zen4 n≥512 (~0.99). The deepest AVX2 (Zen3) small-n dips remain open: `ztrmm`/`ztrmmR`
 n=32 (~0.8), `ztrsm` 0.89 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+
 microkernel overhead on the small-n complex-L3 path. A direct-read fused-triangle base closed the trmm
 dips in development but its runtime `Val` args broke trim-safety and it was reverted; the trim-safe
@@ -295,7 +313,9 @@ both sides, `ztrsm`, `zgetrf`). The `potrf` small-n campaign (block-small Choles
   routing landed; the residual `trmv` cell moved to n=256.
 - `hpmv` still per-column — port the spmv AP-residency panel to complex.
 - `trsm`/`ztrsm` side-L remain the flagship AOCL gaps (4K power-of-two aliasing in the
-  column-lane back-substitution); side-R (`trsmR`/`ztrsmR`) is now gate-measured and mostly clears.
+  column-lane back-substitution); side-R (`trsmR`/`ztrsmR`) is now gate-measured and mostly clears —
+  `ztrsmR`'s worst cells improved on both measured boxes on 2026-08-11 (sign placement in the
+  register-tile leaf; see the CL3 section), leaving Zen3 n=128 at 0.926 and Zen4 n≥512 at ~0.99.
 - Real `geqrf` panel width is now hardware-derived (register-count floor `256/NVREG`, grown with
   the matrix vs L2) — it gates AOCL fleet-wide (worst ≥ 0.96), closing the former n=48 dip.
 - Complex LAPACK: `zgeqrf` worst-size still just under gate on Zen5; `zgesvd` blocked-bidiagonalization
