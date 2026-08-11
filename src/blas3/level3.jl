@@ -1689,6 +1689,17 @@ end
 # over B), then substitute the MR×MR diagonal triangle in register. `rc` holds the split reciprocals.
 # @generated for the unrolled row set; MUST emit Expr(:meta,:inline) — on Julia 1.12 `@inline` does not
 # propagate into a @generated body and the Vec accumulators would be stack-demoted (the zgemvC lesson).
+# SIGN PLACEMENT — this kernel does NOT have `_zrt_tile!`'s defect, and the measurement that proved it
+# is worth keeping so the "audit every signed broadcast" idea is not re-run here. `_zrt_tile!` wrote
+# `V2(-cr)` where the negated splat was used ONCE, so LLVM emitted vmovsd + vxorpd + vbroadcastsd per
+# coefficient (3 instructions, 2.95 per useful FMA) and folding the sign onto the vector operand was
+# worth up to 13.9%. Here `V(-ur)` is used TWICE per row-step, which is enough for LLVM to canonicalise
+# it into `vfnmadd231pd` by itself: the loop already compiles to 120 vfnmadd + 40 vfmadd + 80
+# vbroadcastsd, **zero vmovsd and zero vxorpd**, at 1.94 instructions per useful FMA — i.e. already at
+# the level `_zrt_tile!` only reached after its rewrite. The hand-folded variant (negate the two panel
+# vectors once per t, the two accumulators once per j) was written, proved correct over 75 (s, nrhs)
+# cells, and compiles to a BYTE-IDENTICAL histogram; its A/B was correspondingly null at all six sizes.
+# THE RULE, stated properly: a negated broadcast costs extra only when it is used ONCE. Reverted.
 @generated function _zgt_slab!(
         ::Val{MR}, pr::Ptr{Float64}, pim::Ptr{Float64}, pA::Ptr{Float64}, lda::Int,
         rc::Ptr{Float64}, r0::Int, kc::Int
@@ -1750,6 +1761,7 @@ end
 
 # Driver: one NR-wide column stripe at a time; pack → slabs bottom-up → unpack.
 function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
+    _EXPFLAG[_EXP16] = true   # WITNESS: the complex side-L slab leaf ran. Assert before any ztrsm A/B.
     nrhs = size(B, 2); csz = sizeof(ComplexF64); sz = sizeof(Float64)
     NR = _ZGT_NR; MR = _ZGT_MR
     lda = stride(A, 2); ldb = stride(B, 2)
@@ -1922,30 +1934,43 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
 
 # Rows r0..r0+W-1 of the NC-column block at jb: fold in every solved column i<jb (one B load shared by
 # all NC columns), then substitute the NC×NC triangle entirely in register.
+# SIGN PLACEMENT (`FOLD`) — where the update's minus sign lives, and it is worth 2/3 of the loop body.
+# The subtraction needs one negation per (i, t) coefficient pair OR one per i-step, and those are not
+# the same instruction count. Writing it on the scalar coefficient (`V2(-cr)`, FOLD=false) makes LLVM
+# emit vmovsd + vxorpd + vbroadcastsd per coefficient — 96 instructions per unrolled-by-4 iteration
+# against 64 useful vfmadd231pd — because an `fneg` between the load and the splat blocks BOTH the
+# vfnmadd opcode and AVX-512's embedded broadcast `(mem){1to8}`. Negating the B vector once instead
+# (FOLD=true) leaves the coefficients as bare loads that can fold straight into the FMA. It is exact,
+# not an approximation: `_zrt_nswap(-v) == -_zrt_nswap(v)` since nswap is a shuffle times a constant,
+# so xw needs no separate treatment, and the triangle gets the same rewrite via one `nv = -acc(t)`.
 @generated function _zrt_tile!(
-        ::Val{NC}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
+        ::Val{NC}, ::Val{FOLD}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
         rc::Ptr{Float64}, r0::Int, jb::Int
-    ) where {NC}
+    ) where {NC, FOLD}
     sz = sizeof(Float64); V2 = Vec{2 * _ZGT_W, Float64}
     a(t) = Symbol(:acc, t)
     ld = [:($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
     upd = [
         quote
             cr = unsafe_load(pAi, 2 * (jb + $t) * lda + 1); ci = unsafe_load(pAi, 2 * (jb + $t) * lda + 2)
-            $(a(t)) = muladd($V2(-cr), xv, muladd($V2(-ci), xw, $(a(t))))
+            $(a(t)) = $(FOLD ? :(muladd($V2(cr), xv, muladd($V2(ci), xw, $(a(t))))) :
+                :(muladd($V2(-cr), xv, muladd($V2(-ci), xw, $(a(t))))))
         end for t in 0:(NC - 1)
     ]
     tri = map(0:(NC - 1)) do t
+        src = FOLD ? :nv : a(t)                                  # the operand the feed multiplies by
         feed = [
             quote
                 cr = unsafe_load(pAt, 2 * (jb + $u) * lda + 1); ci = unsafe_load(pAt, 2 * (jb + $u) * lda + 2)
-                $(a(u)) = muladd($V2(-cr), $(a(t)), muladd($V2(-ci), sw, $(a(u))))
+                $(a(u)) = $(FOLD ? :(muladd($V2(cr), $src, muladd($V2(ci), sw, $(a(u))))) :
+                    :(muladd($V2(-cr), $src, muladd($V2(-ci), sw, $(a(u))))))
             end for u in (t + 1):(NC - 1)
         ]
         return quote
             rr = unsafe_load(rc, 2 * (jb + $t) + 1); ri = unsafe_load(rc, 2 * (jb + $t) + 2)
             $(a(t)) = $V2(rr) * $(a(t)) + $V2(ri) * _zrt_nswap($(a(t)))
-            sw = _zrt_nswap($(a(t)))
+            $(FOLD ? :(nv = -$(a(t))) : nothing)
+            sw = _zrt_nswap($src)
             pAt = pA + (jb + $t) * 2 * $sz                       # &A[jb+t+1, 1]; walk columns by lda
             $(feed...)
         end
@@ -1956,7 +1981,8 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
         @inbounds begin
             $(ld...)
             for i in 0:(jb - 1)
-                xv = vload($V2, pB + (i * ldb + r0) * 2 * $sz)
+                xv = $(FOLD ? :(-vload($V2, pB + (i * ldb + r0) * 2 * $sz)) :
+                    :(vload($V2, pB + (i * ldb + r0) * 2 * $sz)))
                 xw = _zrt_nswap(xv)
                 pAi = pA + i * 2 * $sz                           # &A[i+1, 1]
                 $(upd...)
@@ -1969,6 +1995,7 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
 end
 
 function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
+    _EXPFLAG[_EXP11] = true   # WITNESS: the register-tile side-R leaf ran. Assert before any ztrsmR A/B.
     m = size(B, 1); W = _ZGT_W; NC = _ZRT_NC
     lda = stride(A, 2); ldb = stride(B, 2)
     nb = (k ÷ NC) * NC                       # columns covered by full tiles
@@ -1980,8 +2007,16 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
             z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
             unsafe_store!(prc, real(z), 2j + 1); unsafe_store!(prc, imag(z), 2j + 2)
         end
-        for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
-            _zrt_tile!(Val(_ZRT_NC), pB, ldb, pA, lda, prc, r0, jb)
+        # `Val(!_EXPFLAG[_EXP14])` — the fold SHIPS ON; the flag is INVERTED so the old scalar-negate
+        # arm stays A/B-able in-process on a fleet box (see the _EXP14 registry note).
+        if _EXPFLAG[_EXP14]
+            for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
+                _zrt_tile!(Val(_ZRT_NC), Val(false), pB, ldb, pA, lda, prc, r0, jb)
+            end
+        else
+            for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
+                _zrt_tile!(Val(_ZRT_NC), Val(true), pB, ldb, pA, lda, prc, r0, jb)
+            end
         end
     end
     # ragged rows must finish BEFORE the column tail: that gemm reads every row of the solved block
@@ -2687,7 +2722,37 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
-#   _EXP11.._EXP16  free
+#   _EXP11 WITNESS ONLY (never an arm): set by `_trsm_zrt_R!`, the complex side-R register-tile leaf.
+#   _EXP12 ztrsmR leaf column-block width NC=8 instead of `_ZRT_NC`(=4), on the reasoning that the
+#          leaf's B re-reads fall as k²/(2·NC) and 2·NC+2 = 18 vectors fits AVX-512's 32 zmm.
+#          FALSIFIED (Zen4, bit-identical output): 1.125 / 1.008 / 1.004 / 1.002 / 1.000 at
+#          n=32/128/256/512/1024, i.e. slower or null everywhere. `kernel_report` explains it — NC=8 has
+#          the HIGHER arithmetic intensity (8.57 vs 5.85) and fewer mem ops per column (2.62 vs 3.25),
+#          so the kernel was never short of load slots and the wider block bought nothing but pressure.
+#          `_ZRT_NC`'s derivation is correct; arm removed.
+#   _EXP13 ztrsmR leaf tile-loop ORDER: r0-outer/jb-inner instead of jb-outer/r0-inner. Legal either way
+#          (a tile at jb consumes only columns < jb OF ITS OWN ROW BLOCK, and jb still ascends), and the
+#          working set differs by two cache levels — jb-outer re-streams the whole m×k B panel (128 KiB
+#          at n=128) from L2 per column block, r0-outer holds W×k = 8 KiB in L1.
+#          FALSIFIED (Zen4, bit-identical output): 1.051 / 1.015 / 1.026 / 1.016 / 1.007 / 1.004 at
+#          n=32..2048 — jb-outer wins at EVERY size. The L1 residency is real but irrelevant; jb-outer's
+#          inner r0 sweep walks each column contiguously and the hardware prefetcher covers the L2
+#          traffic, while r0-outer's jb sweep touches one 128-byte chunk per column at ldb stride.
+#          Arm removed. Do not re-propose loop interchange here on a working-set argument alone.
+#   _EXP14 INVERTED: set true to restore the old SCALAR-negate sign placement in `_zrt_tile!`. The
+#          vector-negate fold (Val{FOLD}=true) SHIPS ON — see the `_zrt_tile!` header for the mechanism.
+#          Static: the i-loop body goes from 2.95 to 1.96 instructions per useful FMA (vmovsd and vxorpd
+#          gone, loads folded into vbroadcastsd memory operands, vfnmadd231pd picked up).
+#          Measured Zen4, whole-op, residuals identical to the last digit: FOLD is faster by 13.9 / 6.8 /
+#          3.6 / 1.8 / 0.9 / 0.35% at n=32/128/256/512/1024/2048 — a monotone decay that tracks the
+#          leaf's shrinking share of the cell exactly, which is the signature of a real leaf win rather
+#          than a shift in the surrounding `_gemm_subR!`.
+#   _EXP15 was the _EXP14 sign fold carried to `_zgt_slab!` (complex side-L). REVERTED, arm removed —
+#          not because it lost, but because it compiled to a BYTE-IDENTICAL loop: LLVM already emits
+#          vfnmadd there (that kernel's negated splat is used TWICE, `_zrt_tile!`'s was used once).
+#          See the `_zgt_slab!` header. Do not re-run the sibling audit on this kernel.
+#   _EXP16 WITNESS ONLY (never an arm): set by `_trsm_cgt_L!`, the complex side-L slab leaf.
+#   BOTH WITNESSES (_EXP11, _EXP16) ARE PROBE SCAFFOLDING — strip them before this branch merges.
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
 # At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
