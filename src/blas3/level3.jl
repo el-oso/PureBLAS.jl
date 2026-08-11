@@ -2775,7 +2775,15 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          load-schedule split, staged copy). The aliasing is real and worth 4.5% at n=512 / 2.0% at
 #          n=1024, but capturing it requires a microkernel whose B access is not eight aliased columns —
 #          i.e. a genuine row-lane family, not an edit to the pack. Do not attempt another pack variant.
-#   _EXP10 free again — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
+#   _EXP10 free again. It briefly lifted the `KC <= _TRSM_DBASE` cap on paired adjacent stripes, to test
+#          whether pairing fails at KC=128 only because 2·MR·NRV = 48 accumulators spill against 32
+#          registers — under a pinned NRV=2 a pair needs exactly 32 and cannot spill. FALSIFIED, and it
+#          falsified the register explanation with it: lifting the cap costs −6.6/−5.7/−2.5% at
+#          k=128/256/512 at NRV=3 (reproducing the recorded figures) but −10.8/−7.4/−4.1% at NRV=2,
+#          i.e. pairing loses MORE where there is no spill. See the driver comment at the pairing gate
+#          for the capacity model that does fit. NRV=2 is also worse unpaired (17.86 vs 18.44 GF at
+#          n=128), so the shipped NRV=3 stands and no Preference change is warranted.
+#          Previously — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
 #          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
 #          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
 #          at the caller's lda, and a quarter-period byte stride (lda=128 f64 ⇒ 1024 B) puts its columns
@@ -3021,6 +3029,18 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # k=128 / 256 / 512, the penalty shrinking exactly as the gemm's share of the slab grows.
             # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
             # rows) keeps the single-stripe path: the tail needs its own mini-pack.
+            #
+            # THE REGISTER EXPLANATION ABOVE IS WRONG, and the correction matters because it kills the
+            # obvious follow-up. Re-measured 2026-08-11 on today's code: lifting the cap costs
+            # −6.6/−5.7/−2.5% at k=128/256/512 at the shipped NRV=3 (reproducing the recorded figures),
+            # but −10.8/−7.4/−4.1% under a PINNED NRV=2 — where a pair holds exactly 32 accumulators and
+            # CANNOT spill. Pairing loses MORE where there is no spill, so spilling is not the cause.
+            # What does scale the right way is L1 capacity for P: the stripe panel is KC·NR·8 bytes =
+            # 24 KiB at KC=128/NRV=3 against a 32 KiB L1, and pairing doubles it to 48 KiB; at NRV=2 it
+            # is 16 KiB → 32 KiB paired, i.e. exactly L1 with nothing left for U or B. Pairing at large
+            # KC is a CAPACITY failure, not a register failure. (NRV=2 is also worse unpaired — 17.86 vs
+            # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
+            # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
             if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
                     KC <= _TRSM_DBASE && jc + 2 * NR <= n
                 _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
