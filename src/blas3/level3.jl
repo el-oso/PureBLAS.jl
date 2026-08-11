@@ -2750,7 +2750,16 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
 #   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
 #          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
-#   _EXP9  free
+#   _EXP9  free again. It briefly held a HALF-LIVE load schedule for the 8×8 transpose pack: issue the
+#          eight B loads as two batches of four with `_tr8x8`'s first stage between, so only four
+#          po2-aliased lines are live at once — the pattern Zen3's four-column pack runs and does not
+#          suffer from. FALSIFIED, and the reason is worth keeping: +0.5% at n=512 against a +4.6%
+#          ldb-pad ceiling, −0.7% at n=1024, control flat, output bit-identical. `code_native` shows why
+#          — LLVM RE-MERGED the loads (7 of 8 still issue before the first shuffle), so the source-level
+#          split never reached the machine. The loads are independent and the optimiser has no model of
+#          L1 set pressure, so there is no way to hold a load schedule apart from Julia here.
+#          CONSEQUENCE: the associativity model is NOT falsified, but any fix must change the ADDRESSES
+#          (the access pattern) rather than the order. Do not retry a scheduling variant of this.
 #   _EXP10 free again — the A-side de-aliasing it gated SHIPPED unconditionally (see `_trsm_right!`),
 #          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
 #          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
