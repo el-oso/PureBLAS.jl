@@ -263,10 +263,13 @@ be fixed at the kernel before anything above it can convert.
 
 **Zen4 (AVX-512, double-pumped).** The tuning target. Real BLAS-1/2 gate essentially everywhere;
 the residuals are the BLAS-3 set above (`trsm` 0.941 @ n=128 — n=32 now gates at 1.056 — `syrk` 0.937
-@ n=4096, `trmm` 0.960 @ n=2048, `symm` 0.955). `trmm`'s crossover between recursion-over-`gemm!` and
+@ n=4096, `trmm` 0.958 @ n=2048, `symm` 0.955). `trmm`'s crossover between recursion-over-`gemm!` and
 the packed routine is now derived as `5·_GEMM_UNPACK_MAX ÷ 2` rather than borrowed from gemm's own
-unpacked/blocked cut: n=512 and n=1024 went 0.951/0.945 → 0.994/0.996, moving the worst cell to n=2048,
-whose miss lies in the packed path itself and is a separate defect.
+unpacked/blocked cut: in a controlled same-process A/B the two sizes whose route changes gained 4.0%
+and 5.1% (n=512, n=1024), which moved the worst cell to n=2048 — whose miss lies in the packed path
+itself and is a separate defect. Figures on this page come from the full 2026-08-11 re-sweep at
+`ee450bc`; treat sub-2% differences against an earlier snapshot as run-to-run spread rather than
+change, and see the note on [coverage](coverage.md) for why.
 The complex residuals are the shared LAPACK gaps plus a handful of BLAS-2 cells:
 `zgeru` 0.906 (n=1024), `zgemvN` 0.954 (n=512) and `ztrsv` 0.865 (n=1024).
 
