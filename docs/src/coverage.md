@@ -29,14 +29,18 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   references measured in the same run. A cell is the worst size for that routine on that box.
   **Columns are not always at the same commit.** Each box is re-swept when it is available, and the
   Zen5 machine is currently offline, so its column reflects commit `2113738` (2026-08-09) while Zen4 and
-  Zen3 are at `17ae50d` / `b728740` (2026-08-10). The per-commit provenance for every column is stamped
+  Zen3 are at `d84ca0e` (2026-08-11). The per-commit provenance for every column is stamped
   in [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md) and
   should be read alongside this page — a cell is evidence only about the commit it was measured at.
-  Concretely: `trsm` improved on Zen4 and Zen3 on 2026-08-10, and `trsmR` improved on Zen3 the same day
-  (0.821 → 0.917, with n=512 and n=1024 crossing into PASS); the Zen5 column has seen neither. The
-  `trsmR` Zen4 cell moved 0.955 → 0.947 in the same refresh, but that is a RE-MEASUREMENT of unchanged
-  code, not a regression — the fix gates on a register-spill predicate that is false on AVX-512, so the
-  Zen4 side-R path is byte-identical to before. Run-to-run drift on this row is ~1%.
+  Concretely: `trsm` improved on Zen4 and Zen3 on 2026-08-10, `trsmR` improved on Zen3 the same day
+  (0.821 → 0.917, with n=512 and n=1024 crossing into PASS), and `ztrsmR` improved on both boxes on
+  2026-08-11 (Zen4 worst 0.932 → 0.988, Zen3 worst 0.768 → 0.926, four cells crossing into PASS).
+  **The Zen5 column has seen none of these.** Its `ztrsmR` cell still reads 0.957 from the pre-fix
+  kernel; that is a stale number, not a µarch difference, and it will move when neuromancer returns.
+  The `trsmR` Zen4 cell moved 0.955 → 0.947 in an earlier refresh, but that is a RE-MEASUREMENT of
+  unchanged code, not a regression — that fix gates on a register-spill predicate that is false on
+  AVX-512, so the Zen4 side-R path is byte-identical to before. Run-to-run drift on these rows is ~1%,
+  which is why sub-1% moves between refreshes are not read as changes.
 - Element types: **s** = Float32, **d** = Float64, **c** = ComplexF32, **z** = ComplexF64.
 
 ## BLAS
@@ -153,8 +157,8 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>syrk</code></th><td class="b3"><span class="v">0.936</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>trmm</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
+<tr><th><code>trsm</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
 <tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.816</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.975</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
 <tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
@@ -165,7 +169,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>ztrmm</code></th><td class="b3"><span class="v">0.92</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.832</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
 <tr><th><code>ztrmmR</code></th><td class="b3"><span class="v">0.874</span><span class="n">n=128</span></td><td class="b4"><span class="v">0.791</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
 <tr><th><code>ztrsm</code></th><td class="b1"><span class="v">0.995</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>ztrsmR</code></th><td class="b3"><span class="v">0.932</span><span class="n">n=128</span></td><td class="b4"><span class="v">0.768</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
+<tr><th><code>ztrsmR</code></th><td class="b2"><span class="v">0.988</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.926</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
 </tbody></table>
 ```
 
@@ -220,6 +224,7 @@ html.dark .pbg-key{color:#98a1b3}
  <span>the number is the gate; colour only bands it</span>
 </p>
 ```
+
 
 
 ## LAPACK — factorizations & solves

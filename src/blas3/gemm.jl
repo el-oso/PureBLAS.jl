@@ -753,7 +753,13 @@ end
 # a rectangular A (m·k fits but n huge) would also prefer unpacked — refine to an A-fits-registers test if
 # skewed shapes matter. (n=128+ route to blocked-direct-B; measured galen best=blk from ~128.)
 const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max(_HW))::Int
-@inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX
+# `_EXPINT[2]` shifts the cut (its `_EXPINT[4]` witness was stripped once the campaign landed) — both
+# default-inert. `_GEMM_UNPACK_MAX` is gemm's own unpacked/blocked crossover (2·(nvreg−4)·W = 448 on both
+# AVX-512 boxes, 96 on AVX2), but the trsm/trmm side-R recursions hold m=n and split only k, so their
+# off-diagonal sub-gemms are SKEWED — at n=449 the shape is 449×~224×~224 and this `max()` sends every one
+# of them to the blocked path because ONE dim crossed. Suspected half of the 448 < n <= 480 gate cliff,
+# which appears on exactly the two boxes where this constant is 448 and on neither where it is 96.
+@inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX + @inbounds(_EXPINT[2])
 
 # Unpacked microkernel: full mr×nr tile, reading A (tA='N') and op(B) directly. alpha applied at
 # store (C already beta-scaled). TB selects op(B); a compile-time Val so the address folds.
