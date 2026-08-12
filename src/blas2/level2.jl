@@ -1762,10 +1762,18 @@ end
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(_CGEMVT_HALF))
     end
     cfg = _cgemvt_cfg()
+    # NO `Val(_GEMVT_U)`/`Val(_GEMVT_PF)` HERE. Those are the m-unroll and A-prefetch knobs of the REAL
+    # blocked kernel `_gemv_t_block!`; the complex block kernel `_gemv_tc_block_cmplx!` takes only
+    # (NC, CJ, HALF) and there has never been a `_gemv_tc_run!` method that accepts them. Passing them
+    # was a MethodError, not a slow path: `cfa09a4` appended U to these two complex call sites while
+    # adding it to the real kernel, and `a411e57` appended PF on top. It stayed latent because it needs
+    # all three of complex trans='T'/'C', A larger than L2, AND the OncePerProcess tuner landing on cfg
+    # 108/104 -- so it fires per machine and per process, and the 2026-08-12 wintermute sweep is the
+    # first thing that hit it (zgemvT/zgemvC dropped out of the cache entirely).
     if _cgemvt_fits(8, true) && cfg == 108
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true))    # req8-ok: candidate arm
     elseif cfg == 104
-        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))    # req8-ok: candidate arm
+        return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(4), Val(true))    # req8-ok: candidate arm
     elseif cfg == 2
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(2), Val(false))   # req8-ok: candidate arm
     end
