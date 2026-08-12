@@ -182,12 +182,26 @@ needs no separate handling) and takes the loop from **2.95 to 1.96 instructions 
 residuals identical to the last digit. Four cheaper hypotheses were falsified first — power-of-two
 `lda`/`ldb`, a wider column block, load-slot pressure, and tile-loop interchange — and the same rewrite
 applied to the complex *side-L* slab compiled byte-identical, because LLVM had already chosen `vfnmadd`
-there on its own. Remaining: Zen3 n=128 (0.926) and Zen4 n≥512 (~0.99). The deepest AVX2 (Zen3) small-n dips remain open: `ztrmm`/`ztrmmR`
-n=32 (~0.8), `ztrsm` 0.89 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+
-microkernel overhead on the small-n complex-L3 path. A direct-read fused-triangle base closed the trmm
-dips in development but its runtime `Val` args broke trim-safety and it was reverted; the trim-safe
-refix (compile-time `Val` dispatch) is a follow-up. (A non-po2-scratch attempt was also measured neutral
-and reverted.)
+there on its own. Remaining: Zen3 n=128 (0.926) and Zen4 n≥512 (~0.99).
+
+The complex `trmm` small-n dips were partly closed by a dispatch fix. `_uker_cmplx!` takes a `FULL`
+flag that selects unmasked A-loads and unmasked stores, and the two small-`trmm` drivers hardwired it
+off on every branch — so every tile ran masked even when full, which at these sizes is *every* tile.
+Dispatching it the way the gemm sweep always has is worth **+16.7%/+13.1%** at n=8/32 on Zen3 and
+**+0.4%/+3.6%/+3.8%/+2.7%** at n=8/32/48/128 on Zen4 (measured in one process with the arms
+alternated and verified bit-identical). `n=8` now gates on both microarchitectures for both ops, and
+Zen4 `ztrmmR` n=128 crossed AOCL (0.976 → 1.003). The split follows the ISA — a masked op is
+`vmaskmovpd` on AVX2 and k-register predication on AVX-512 — though the residual Zen4 gain is not
+fully explained by that alone.
+
+Still open on this path: `ztrmm`/`ztrmmR` n=32 (Zen3 0.933/0.871, Zen4 `ztrmm` 0.972), Zen3 n=128
+(0.932/0.982, which takes the *packed* path and so was untouched by the dispatch fix), `ztrsm` 0.89
+(n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+microkernel overhead on
+the small-n complex-L3 path. A direct-read fused-triangle base closed the trmm dips in development but
+its runtime `Val` args broke trim-safety and it was reverted; the trim-safe refix (compile-time `Val`
+dispatch) is a follow-up. (Two scratch-layout attempts were measured neutral and reverted: a
+non-po2 scratch, and sizing the shared `symm`/`hemm` scratch exactly — the latter is *slower* at
+power-of-two n, where an exact leading dimension is itself an aliasing stride.)
 
 ![Complex LAPACK — three µarchs](assets/perf_clapack.svg)
 
@@ -255,7 +269,8 @@ contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on Zen
 µarch-specific.
 
 Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.909, `zsyrk`
-0.932, `zher2k` 0.907, `zsyr2k` 0.912, `ztrmm` 0.933 — with `ztrsm` (1.069) the one that gates.
+0.932, `zher2k` 0.907, `zsyr2k` 0.912, `ztrmm` 0.933 — with `ztrsm` (1.069) the one that gates, and
+`ztrmmR` now within reach at 0.964 after the full-tile dispatch fix.
 Here the engine itself (`zgemm`) misses, so it is a different problem from the real case and has to
 be fixed at the kernel before anything above it can convert.
 
