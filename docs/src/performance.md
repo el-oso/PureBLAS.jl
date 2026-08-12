@@ -194,10 +194,23 @@ Zen4 `ztrmmR` n=128 crossed AOCL (0.976 → 1.003). The split follows the ISA �
 `vmaskmovpd` on AVX2 and k-register predication on AVX-512 — though the residual Zen4 gain is not
 fully explained by that alone.
 
-Still open on this path: `ztrmm`/`ztrmmR` n=32 (Zen3 0.933/0.871, Zen4 `ztrmm` 0.972), Zen3 n=128
-(0.932/0.982, which takes the *packed* path and so was untouched by the dispatch fix), `ztrsm` 0.89
-(n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+microkernel overhead on
-the small-n complex-L3 path.
+What remains open on this path is smaller than the raw ratios suggest, and separating the two took a
+second measurement. A targeted single-op run and a full sweep — same code, both with every arm inside
+one run — disagreed by 3–4% at n=32 (`ztrmm` 0.933 vs 0.903, `ztrmmR` 0.871 vs 0.839), which is the
+regime difference between measuring an operation alone and measuring it in sequence with the rest of
+the suite. The full sweep is the canonical artifact, so those are the numbers quoted here. More
+importantly, `bench/gate_gaps.jl` reports each cell's shortfall against its own round-to-round spread:
+
+- `ztrmmR` n=32 on Zen3 — 0.839, a 16.3% gap against a 0.047 spread. **Real.**
+- `ztrmm` n=128 on Zen3 vs AOCL — 0.917 at a spread of 0.003, the most tightly measured miss in the
+  whole table. **Real**, and on the *packed* path, which the dispatch fix provably never reached (its
+  control read exactly 1.000).
+- `ztrmm` n=32 on Zen3 — a 9.5% shortfall against a **0.115** spread. That cell is *within spread*: it
+  needs more rounds, not engineering, and optimising against it would be optimising against
+  measurement error.
+
+Also still open, and outside their spreads: `ztrsm` 0.89 (n=128) and a `zsymm`/`zhemm`/rank-2k small-n
+dip — materialize+microkernel overhead on the small-n complex-L3 path.
 
 That residual has since been decomposed rather than guessed at. Holding `k` at 32 and varying only the
 number of columns of `B` separates per-call cost from per-column cost through the public entry point,
@@ -281,9 +294,9 @@ addressing population (recomputed `(jc + c)·ldb` products) was worth 3.0% at n=
 contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on Zen5, so those are
 µarch-specific.
 
-Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.909, `zsyrk`
-0.932, `zher2k` 0.907, `zsyr2k` 0.912, `ztrmm` 0.933 — with `ztrsm` (1.069) the one that gates, and
-`ztrmmR` now within reach at 0.964 after the full-tile dispatch fix.
+Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.922, `zsyrk`
+0.941, `zher2k` 0.908, `zsyr2k` 0.894, `ztrmm` 0.943 — with `ztrsm` (1.067) the one that gates, and
+`ztrmmR` now within reach at 0.969 after the full-tile dispatch fix.
 Here the engine itself (`zgemm`) misses, so it is a different problem from the real case and has to
 be fixed at the kernel before anything above it can convert.
 
