@@ -369,7 +369,21 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
             jr = 0
             while jr < n
                 nre = min(nr, n - jr)
-                if full
+                # `Val{FULL}` (9th Val) gates MASKED vs unmasked A-loads inside the k-loop and masked vs
+                # unmasked stores in the epilogue. `_uker_sweep!` (gemm.jl) dispatches Val(true) whenever
+                # `mre == mr`; this driver used to hardwire Val(false) on BOTH branches, so every tile ran
+                # masked even when full — and at the failing gate sizes mr divides k, so EVERY tile is
+                # full and every mask is pure waste. `full` above is a different predicate: it only picks
+                # the tile HEIGHT (Val(_CMR) vs Val(1)), never the masking.
+                # Costly precisely where it hurt: on AVX2 a masked op is `vmaskmovpd` (expensive on AMD),
+                # on AVX-512 it is k-register predication (~free) — which matches the measured split,
+                # ztrmm/ztrmmR n=32 being 0.821/0.781 on Zen3 against 0.994/1.087 on Zen4.
+                if mre == mr                                     # full-height tile → unmasked
+                    _uker_cmplx!(
+                        Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
+                    )
+                elseif full
                     _uker_cmplx!(
                         Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
@@ -410,7 +424,15 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
                 Aop = Bp + 2 * plo * ldb * sz          # B-operand (A-slot): B cols [plo,phi)
                 Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
-                if full
+                # See the matching note in `_trmm_cmplx_small_L!`: the 9th Val is FULL (unmasked
+                # A-loads + unmasked stores), `_uker_sweep!` sets it whenever `mre == mr`, and this
+                # driver used to hardwire it false so every tile ran masked even when full.
+                if mre == mr                                     # full-height tile → unmasked
+                    _uker_cmplx!(
+                        Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
+                    )
+                elseif full
                     _uker_cmplx!(
                         Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
