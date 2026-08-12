@@ -3062,8 +3062,12 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
             # rows) keeps the single-stripe path: the tail needs its own mini-pack.
             #
-            # THE REGISTER EXPLANATION ABOVE IS WRONG, and the correction matters because it kills the
-            # obvious follow-up. Re-measured 2026-08-11 on today's code: lifting the cap costs
+            # THE REGISTER EXPLANATION ABOVE IS REAL BUT NOT BINDING — an earlier revision of this note
+            # called it simply "wrong", which overstated it. The spill is there: an asm audit counts 78
+            # spill/reload vector moves in the paired slab's loop against ZERO in the shipped 24-accumulator
+            # one (same detector, so the zero is trustworthy). What is wrong is treating the spill as the
+            # CAUSE, because removing it does not help — see the NRV=2 arm below.
+            # Re-measured 2026-08-11 on today's code: lifting the cap costs
             # −6.6/−5.7/−2.5% at k=128/256/512 at the shipped NRV=3 (reproducing the recorded figures),
             # but −10.8/−7.4/−4.1% under a PINNED NRV=2 — where a pair holds exactly 32 accumulators and
             # CANNOT spill. Pairing loses MORE where there is no spill, so spilling is not the cause.
