@@ -378,11 +378,11 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 # Costly precisely where it hurt: on AVX2 a masked op is `vmaskmovpd` (expensive on AMD),
                 # on AVX-512 it is k-register predication (~free) — which matches the measured split,
                 # ztrmm/ztrmmR n=32 being 0.821/0.781 on Zen3 against 0.994/1.087 on Zen4.
-                # _EXP11 INVERTED: set true to restore the old always-masked arm, so the shipped
-                # dispatch stays A/B-able IN ONE PROCESS. Cross-run is not admissible here — the
-                # pre-fix and post-fix gate cells come from different sweeps, and this box's own drift
-                # guard bounds such a comparison no tighter than its anchor spread.
-                if mre == mr && !_EXPFLAG[_EXP11]                 # full-height tile → unmasked
+                # Settled by an in-process ABBA A/B (both arms one process, bit-identical output),
+                # 6 rounds: Zen3 +16.7%/+13.1% at n=8/32 with the packed-path rows an exact 1.000
+                # control; Zen4 +0.4%/+3.6%/+3.8%/+2.7% at n=8/32/48/128 (no control row there —
+                # `_CTRMM_PACK` is `_vwidth==4`, so AVX-512 routes EVERY size through this driver).
+                if mre == mr                                     # full-height tile → unmasked
                     _uker_cmplx!(
                         Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
@@ -431,8 +431,7 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
                 # See the matching note in `_trmm_cmplx_small_L!`: the 9th Val is FULL (unmasked
                 # A-loads + unmasked stores), `_uker_sweep!` sets it whenever `mre == mr`, and this
                 # driver used to hardwire it false so every tile ran masked even when full.
-                # _EXP11 INVERTED — same in-process A/B arm as the side-L driver.
-                if mre == mr && !_EXPFLAG[_EXP11]                 # full-height tile → unmasked
+                if mre == mr                                     # full-height tile → unmasked
                     _uker_cmplx!(
                         Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
                         Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
@@ -2848,14 +2847,15 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
-#   _EXP11 INVERTED: set true to restore the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!`, i.e.
-#          the pre-fix behaviour where the 9th Val (FULL) of `_uker_cmplx!` was hardwired false on
-#          every branch. Default false ⇒ a full-height tile (`mre == mr`) dispatches unmasked, exactly
-#          as `_uker_sweep!` has always done. This exists because the pre/post comparison was otherwise
-#          CROSS-RUN: the pre-fix cells came from the ee450bc sweep and the post-fix ones from a later
-#          sweep, and wintermute's ztrmm@32-vs-OB moved 0.994 -> 0.972 across those two while a probe
-#          on the same box measured +5.2% the other way. Cross-run cannot adjudicate that; one process
-#          alternating both arms can. Strip the flag once the question is settled.
+#   _EXP11 free again. It briefly restored the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!` (the
+#          9th Val of `_uker_cmplx!`, FULL, hardwired false on every branch) so the full-height-tile
+#          dispatch could be A/B'd IN ONE PROCESS. It was needed because the pre/post comparison was
+#          otherwise cross-run on both sides and the two disagreed: a probe read +5.2% at ztrmm n=32 on
+#          Zen4 while the gate cell moved 0.994 (ee450bc) -> 0.972 (9951b1d) against 0.49% anchor drift.
+#          RESOLVED — 6 ABBA rounds, arms bit-identical: Zen3 +16.7%/+13.1% (n=8/32) with the AVX2
+#          packed-path rows an exact 1.000 control, Zen4 +0.4%/+3.6%/+3.8%/+2.7% (n=8/32/48/128). The
+#          fix is positive at every affected size on both boxes; the gate's 0.994 -> 0.972 was a
+#          cross-run artifact. Flag stripped — it sat in the hottest tiny-n tile loop.
 #          (Was the `_trsm_zrt_R!` witness during the ztrsmR campaign; stripped when that landed.)
 #   _EXP12 ztrsmR leaf column-block width NC=8 instead of `_ZRT_NC`(=4), on the reasoning that the
 #          leaf's B re-reads fall as k²/(2·NC) and 2·NC+2 = 18 vectors fits AVX-512's 32 zmm.
