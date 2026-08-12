@@ -3007,9 +3007,23 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # (po2 n) those 8 accesses share low-12 bits → 4K-aliasing stall (measured +3.5%@512 / +1.7%@1024 from
         # padding B). FALSIFIED fix: routing the aliased stride to the alias-free column-outer scalar pack
         # regressed −0.9% (the scalar per-element cost outweighs the aliasing) — do NOT retry. The residual is
-        # structural: AOCL reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose); PB's
-        # column-lane back-sub needs the transpose. The fusedT slab (below) removes the P round-trip but not
-        # the aliasing. Escaping it needs the row-lane microkernel family (Fable: net-negative — deferred).
+        # structural. THE OLD CLAIM HERE WAS WRONG and it cost real time before anyone checked it: it said
+        # AOCL "reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose)" and that
+        # escaping the aliasing needs a row-lane microkernel family. DISASSEMBLING THE SHIPPED LIBRARY
+        # REFUTES THAT (2026-08-12, AOCL_jll libblis-mt.so, not stripped). The kernel AOCL runs for this
+        # exact case is `bli_dgemmtrsm_u_zen4_asm_8x24`: a FUSED gemmtrsm at an 8×24 register tile — the
+        # same structure and the same tile shape as ours (_GT_MR=8, _GT_NR=NRV·W=24). Opcode mix: 375
+        # vfmadd231pd · 141 vbroadcastsd · 78 vmovupd + 56 vmovapd · 48 vshuff64x2 · 45 vmulpd ·
+        # 24 vscatterqpd + 24 kxnorw · 24 vfmsub231pd · 21 vsubpd. It SHUFFLES (48 cross-lane permutes),
+        # so "no transpose" is false, and it has ZERO gathers — reads come contiguously out of packed
+        # panels and only the write-back to arbitrarily-strided C is scattered under an all-ones mask
+        # (24 scatters × 8 lanes = 192 = exactly one 8×24 tile).
+        # Corroborated from our side: the no-transpose formulation that DOES exist in-tree (trsv per
+        # column, the AD/generic branch) measures 3.8–7.9× SLOWER, because putting rows in lanes pays the
+        # full back-substitution chain once per COLUMN instead of amortising it across NR columns.
+        # CONSEQUENCE: there is no row-lane microkernel to chase. Whatever AOCL's edge is at n=128/256,
+        # it is in the macro-kernel and packing strategy (`bli_dtrsm_lu_ker_var2`), not a different
+        # microkernel data layout. Do not re-open "row-lane" on the strength of this comment again.
         useT = _GT_TRANSPOSE
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
