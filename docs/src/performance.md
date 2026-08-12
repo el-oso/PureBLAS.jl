@@ -197,9 +197,22 @@ fully explained by that alone.
 Still open on this path: `ztrmm`/`ztrmmR` n=32 (Zen3 0.933/0.871, Zen4 `ztrmm` 0.972), Zen3 n=128
 (0.932/0.982, which takes the *packed* path and so was untouched by the dispatch fix), `ztrsm` 0.89
 (n=128), and a `zsymm`/`zhemm`/rank-2k small-n dip (0.94–0.97) — materialize+microkernel overhead on
-the small-n complex-L3 path. A direct-read fused-triangle base closed the trmm dips in development but
-its runtime `Val` args broke trim-safety and it was reverted; the trim-safe refix (compile-time `Val`
-dispatch) is a follow-up. (Two scratch-layout attempts were measured neutral and reverted: a
+the small-n complex-L3 path.
+
+That residual has since been decomposed rather than guessed at. Holding `k` at 32 and varying only the
+number of columns of `B` separates per-call cost from per-column cost through the public entry point,
+by fitting `1/GF = a·(1/c) + b`. At the gate shape `ztrmm` carries **15.9%** fixed per-call cost, while
+`zgemm` at the same `k` — same kernel family, no triangle — carries **0.7%** and holds its rate flat to
+within 0.8% across its whole sweep. Shared BLAS-3 entry cost is therefore negligible, and essentially
+all of `trmm`'s fixed cost is the O(k²) triangle materialize. A direct-read fused-triangle base closed
+the trmm dips in development but its runtime `Val` args broke trim-safety and it was reverted; the
+trim-safe refix (compile-time `Val` dispatch) is the follow-up, and this puts its value at about 15%
+against the 2.9–14.8% the individual cells need.
+
+A second and unrelated inefficiency shows in the same fit: with the triangle amortized to nothing,
+`trmm` still costs 0.1535 µs per column against `gemm`'s 0.2037 for *half* the multiply-accumulates —
+66% efficiency. That is the granularity of the K-TRIM tiling in steady state, not a fixed cost, and the
+triangle base would not address it. (Two scratch-layout attempts were measured neutral and reverted: a
 non-po2 scratch, and sizing the shared `symm`/`hemm` scratch exactly — the latter is *slower* at
 power-of-two n, where an exact leading dimension is itself an aliasing stride.)
 
