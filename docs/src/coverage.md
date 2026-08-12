@@ -108,19 +108,19 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>asum</code></th><td class="b1"><span class="v">0.994</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.3</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=10000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.998</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.996</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.13</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
-<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.68</span></td><td class="ok"><span class="v">1.86</span></td><td class="ok"><span class="v">1.5</span></td></tr>
-<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.53</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.67</span></td></tr>
-<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.0</span></td><td class="ok"><span class="v">1.95</span></td><td class="ok"><span class="v">1.9</span></td></tr>
-<tr><th><code>scal</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.983</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.994</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zscal</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>asum</code></th><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.31</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=10000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>dot</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.27</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
+<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.69</span></td><td class="ok"><span class="v">1.71</span></td><td class="ok"><span class="v">1.5</span></td></tr>
+<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.41</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.67</span></td></tr>
+<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.63</span></td><td class="ok"><span class="v">1.9</span></td></tr>
+<tr><th><code>scal</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=300000</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zscal</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1000000</span></td></tr>
 </tbody></table>
 ```
 
@@ -128,23 +128,25 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.4</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gemvN</code></th><td class="b1"><span class="v">0.996</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.924</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>ger</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=1024</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.779</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.4</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.21</span></td></tr>
+<tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gemvT</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="b4"><span class="v">0.779</span><span class="n">n=2048</span></td></tr>
 <tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.77</span></td><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.76</span></td></tr>
-<tr><th><code>symv</code></th><td class="b2"><span class="v">0.966</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.972</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td></tr>
-<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.977</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.17</span></td><td class="ok"><span class="v">1.02</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b2"><span class="v">0.953</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.895</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgeru</code></th><td class="b4"><span class="v">0.822</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.967</span><span class="n">n=512</span></td><td class="b4"><span class="v">0.839</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.32</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.37</span></td></tr>
-<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.11</span></td></tr>
-<tr><th><code>ztrmv</code></th><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>ztrsv</code></th><td class="b2"><span class="v">0.973</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.78</span></td><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.76</span></td></tr>
+<tr><th><code>symv</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.967</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td></tr>
+<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.02</span></td></tr>
+<tr><th><code>zgemvC</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=2048</span></td><td><span class="n">—</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b3"><span class="v">0.943</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.895</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgemvT</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td><span class="n">—</span></td></tr>
+<tr><th><code>zgeru</code></th><td class="b3"><span class="v">0.884</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.922</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.839</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.33</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td><td class="b3"><span class="v">0.926</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.37</span></td></tr>
+<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>ztrmv</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td></tr>
+<tr><th><code>ztrsv</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=1024</span></td></tr>
 </tbody></table>
 ```
 
@@ -152,24 +154,24 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.978</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td></tr>
-<tr><th><code>symm</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.903</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.961</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>syrk</code></th><td class="b3"><span class="v">0.94</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>trmm</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.929</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>trsm</code></th><td class="b2"><span class="v">0.95</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.946</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.909</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.9</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.822</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.982</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.928</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.908</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zherk</code></th><td class="b2"><span class="v">0.984</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zsymm</code></th><td class="b3"><span class="v">0.942</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.881</span><span class="n">n=8</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.913</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyrk</code></th><td class="b3"><span class="v">0.939</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
-<tr><th><code>ztrmm</code></th><td class="b3"><span class="v">0.935</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.931</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ztrmmR</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.871</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>ztrsmR</code></th><td class="b2"><span class="v">0.982</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.934</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
+<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td></tr>
+<tr><th><code>symm</code></th><td class="b2"><span class="v">0.954</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.924</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>syrk</code></th><td class="b3"><span class="v">0.934</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>trmm</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>trsm</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.922</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.817</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zhemm</code></th><td class="b2"><span class="v">0.982</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.924</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.908</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zherk</code></th><td class="b2"><span class="v">0.981</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zsymm</code></th><td class="b3"><span class="v">0.948</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.894</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.893</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zsyrk</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
+<tr><th><code>ztrmm</code></th><td class="b3"><span class="v">0.943</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.902</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
+<tr><th><code>ztrmmR</code></th><td class="b2"><span class="v">0.969</span><span class="n">n=512</span></td><td class="b4"><span class="v">0.839</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.07</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>ztrsmR</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.934</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
 </tbody></table>
 ```
 
@@ -177,41 +179,41 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbtrf</code></th><td class="b4"><span class="v">0.74</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.697</span><span class="n">n=128</span></td></tr>
-<tr><th><code>gels</code></th><td class="ok"><span class="v">1.26</span></td><td class="ok"><span class="v">1.38</span></td><td class="ok"><span class="v">1.3</span></td></tr>
-<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>geqrf</code></th><td class="b2"><span class="v">0.953</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=32</span></td></tr>
-<tr><th><code>gesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>getrf</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=32</span></td></tr>
-<tr><th><code>getrs</code></th><td class="b3"><span class="v">0.908</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.766</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.772</span><span class="n">n=8</span></td></tr>
-<tr><th><code>gtsv</code></th><td class="ok"><span class="v">1.21</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.49</span></td><td class="ok"><span class="v">1.52</span></td><td class="ok"><span class="v">1.54</span></td></tr>
+<tr><th><code>gbtrf</code></th><td class="b4"><span class="v">0.719</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.697</span><span class="n">n=128</span></td></tr>
+<tr><th><code>gels</code></th><td class="ok"><span class="v">1.28</span></td><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.3</span></td></tr>
+<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>geqrf</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=32</span></td></tr>
+<tr><th><code>gesvd</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>getrf</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=32</span></td></tr>
+<tr><th><code>getrs</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.774</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.772</span><span class="n">n=8</span></td></tr>
+<tr><th><code>gtsv</code></th><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.21</span></td></tr>
+<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.52</span></td><td class="ok"><span class="v">1.54</span></td></tr>
 <tr><th><code>gttrs</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=262144</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=262144</span></td></tr>
-<tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.11</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=192</span></td><td class="ok"><span class="v">1.08</span></td></tr>
-<tr><th><code>pbtrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.873</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=256</span></td></tr>
-<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.04</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.898</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.867</span><span class="n">n=512</span></td></tr>
-<tr><th><code>potrsU</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=512</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.774</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.827</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.874</span><span class="n">n=32</span></td></tr>
-<tr><th><code>pptrfU</code></th><td class="b3"><span class="v">0.902</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=128</span></td></tr>
-<tr><th><code>pstrf</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=8</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.841</span><span class="n">n=8</span></td></tr>
-<tr><th><code>pstrfU</code></th><td class="b3"><span class="v">0.936</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.898</span><span class="n">n=8</span></td></tr>
-<tr><th><code>ptsv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.11</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=192</span></td><td class="ok"><span class="v">1.08</span></td></tr>
+<tr><th><code>pbtrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.874</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=256</span></td></tr>
+<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.897</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.867</span><span class="n">n=512</span></td></tr>
+<tr><th><code>potrsU</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=512</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.773</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.837</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.874</span><span class="n">n=32</span></td></tr>
+<tr><th><code>pptrfU</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=128</span></td></tr>
+<tr><th><code>pstrf</code></th><td class="b4"><span class="v">0.765</span><span class="n">n=8</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.841</span><span class="n">n=8</span></td></tr>
+<tr><th><code>pstrfU</code></th><td class="b3"><span class="v">0.933</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.898</span><span class="n">n=8</span></td></tr>
+<tr><th><code>ptsv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.03</span></td></tr>
 <tr><th><code>pttrf</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.09</span></td></tr>
 <tr><th><code>pttrs</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td></tr>
-<tr><th><code>syev</code></th><td class="ok"><span class="v">1.26</span></td><td class="ok"><span class="v">1.17</span></td><td class="ok"><span class="v">1.1</span></td></tr>
-<tr><th><code>syevN</code></th><td class="b2"><span class="v">0.973</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.08</span></td></tr>
-<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.06</span></td></tr>
-<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.46</span></td><td class="ok"><span class="v">1.35</span></td></tr>
-<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.16</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.09</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.939</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.11</span></td><td><span class="n">—</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td><td><span class="n">—</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.994</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="b4"><span class="v">0.678</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.752</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.704</span><span class="n">n=32</span></td></tr>
+<tr><th><code>syev</code></th><td class="ok"><span class="v">1.26</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.1</span></td></tr>
+<tr><th><code>syevN</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.08</span></td></tr>
+<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.06</span></td></tr>
+<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.35</span></td></tr>
+<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.17</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.12</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="b4"><span class="v">0.695</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.765</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.704</span><span class="n">n=32</span></td></tr>
 </tbody></table>
 ```
 ```@raw html
@@ -224,14 +226,6 @@ html.dark .pbg-key{color:#98a1b3}
  <span>the number is the gate; colour only bands it</span>
 </p>
 ```
-
-
- <span><i style="background:#b3243a"></i>below 0.85</span>
- <span>the number is the gate; colour only bands it</span>
-</p>
-```
-
-
 
 ## LAPACK — factorizations & solves
 

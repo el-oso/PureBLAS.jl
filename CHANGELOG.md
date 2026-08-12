@@ -18,6 +18,25 @@ resolving the deferred complex-dot ABI, which would change exported signatures),
 every microarchitecture in the fleet. Not a date, not a feature count — the project's actual thesis,
 demonstrated.
 
+## [Unreleased]
+
+### Fixed
+
+- **Complex `gemv` with `trans='T'`/`'C'` threw a `MethodError` for any `A` larger than L2**, and with
+  it `zheev`/`zheevN` — so `eigen()` on a complex Hermitian matrix could throw. `_gemv_tc_cmplx!`
+  passed the real blocked kernel's `U`/`PF` knobs to `_gemv_tc_run!`, which has no method accepting
+  them; the complex block kernel takes only `(NC, CJ, HALF)`. It fired whenever the resolved config was
+  108 or 104, which is the *derived default* on AVX-512 and AVX2 respectively — not a rare tuner
+  outcome. Live since 2026-08-08. The test suite missed it because every existing `gemv` case is at
+  most 40×33 and therefore L2-resident, so the size-dependent branch was never taken; a regression test
+  now sizes `A` from the detected L2 and asserts that every arm the dispatch ladder can select has a
+  method.
+
+### Changed
+
+- Complex `trmm`/`trmmR` dispatch unmasked kernels for full-height tiles, as the gemm sweep already
+  did. Worth +16.7%/+13.1% at n=8/32 on Zen3 and +0.4–3.8% across n=8…128 on Zen4.
+
 ## [0.1.1] — "Instrument" — 2026-08-06
 
 No `src/` change: this release is entirely measurement infrastructure. Each of the four items exists
