@@ -30,7 +30,19 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
 # different kernel PAIR on a different shape family, and it had never been measured at THIS boundary: a
 # borrowed threshold, i.e. a routing predicate carrying no PDM discipline at all.
 #
-# PDM tier: DERIVE — `5·_GEMM_UNPACK_MAX ÷ 2`, i.e. gemm's own crossover scaled by a single fleet-wide
+# PDM tier: MEASURE-CALIBRATED, not DERIVE — an earlier revision claimed DERIVE and that was overstated.
+# The falsification test below (one multiplier must land inside both boxes' located intervals) has no
+# real power: it only rejects bases whose Zen4:Zen3 constant ratio falls outside (4, 16), which is all
+# three rejections have in common. A second basis survives that the test does not reject —
+# `m·_NVREG·W²` gives m ∈ [0.5, 1) on BOTH boxes, a WIDER common window than the one chosen — so the
+# data cannot identify the basis and this is a two-point fit with a free parameter. Worse, Zen5's
+# detected consts equal Zen4's, so the third fleet box cannot discriminate them either; only a machine
+# with a different register file or width can (on M5 the two predict ~280 vs ~64-128). Compare
+# `_TRMM_RPACK` above, which records a FLEET-FALSIFIED derivation for the directly analogous side-R
+# crossover and concludes "a guessed formula would be worse than this literal" — no argument has been
+# given for why side-L's crossover is sharp where side-R's was not. Treat the formula as a calibrated
+# value with the regret condition stated at the end, and re-open as Measure tier if a third µarch misses.
+# The value: `5·_GEMM_UNPACK_MAX ÷ 2`, i.e. gemm's own crossover scaled by a single fleet-wide
 # coefficient. Zen3 → 240, Zen4/Zen5 → 1120. Scaling off `_GEMM_UNPACK_MAX` is not arbitrary: the route
 # this predicate chooses BETWEEN is recursion-over-`gemm!` versus packed trmm, so the competing path is
 # literally gemm and its unpacked/blocked crossover (itself derived from `_NVREG` and `W`) is the right
@@ -3010,8 +3022,9 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # structural. THE OLD CLAIM HERE WAS WRONG and it cost real time before anyone checked it: it said
         # AOCL "reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose)" and that
         # escaping the aliasing needs a row-lane microkernel family. DISASSEMBLING THE SHIPPED LIBRARY
-        # REFUTES THAT (2026-08-12, AOCL_jll libblis-mt.so, not stripped). The kernel AOCL runs for this
-        # exact case is `bli_dgemmtrsm_u_zen4_asm_8x24`: a FUSED gemmtrsm at an 8×24 register tile — the
+        # REFUTES THAT (2026-08-12, AOCL_jll libblis-mt.so, not stripped). The BLOCKED kernel AOCL has
+        # for this case — WHICH IS NOT PROVEN TO BE THE ONE IT RUNS AT n=128/256; see the dispatch note
+        # below — is `bli_dgemmtrsm_u_zen4_asm_8x24`: a FUSED gemmtrsm at an 8×24 register tile — the
         # same structure and the same tile shape as ours (_GT_MR=8, _GT_NR=NRV·W=24). Opcode mix: 375
         # vfmadd231pd · 141 vbroadcastsd · 78 vmovupd + 56 vmovapd · 48 vshuff64x2 · 45 vmulpd ·
         # 24 vscatterqpd + 24 kxnorw · 24 vfmsub231pd · 21 vsubpd. It SHUFFLES (48 cross-lane permutes),
@@ -3021,9 +3034,22 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # Corroborated from our side: the no-transpose formulation that DOES exist in-tree (trsv per
         # column, the AD/generic branch) measures 3.8–7.9× SLOWER, because putting rows in lanes pays the
         # full back-substitution chain once per COLUMN instead of amortising it across NR columns.
-        # CONSEQUENCE: there is no row-lane microkernel to chase. Whatever AOCL's edge is at n=128/256,
-        # it is in the macro-kernel and packing strategy (`bli_dtrsm_lu_ker_var2`), not a different
-        # microkernel data layout. Do not re-open "row-lane" on the strength of this comment again.
+        # CONSEQUENCE: there is no row-lane microkernel to chase. Do not re-open "row-lane" on the
+        # strength of the old comment again.
+        #
+        # DISPATCH IS UNVERIFIED, AND THIS IS THE OPEN QUESTION. Identifying the blocked kernel by symbol
+        # shape proves the kernel EXISTS, not that it RUNS at our binding sizes. The same library ships a
+        # separate unpacked small-matrix family — `bli_dtrsm_small_AltXB_AuXB_AVX512` (AuXB = A-upper·X=B,
+        # i.e. exactly our case), `bli_trsm_small`, `bli_trsm_small_AVX512` — and `dtrsm_blis_impl`
+        # contains a dimension-dispatch maze (constants 49/50/58/96/120/138/199/1020/1811/2499/3219/
+        # 4299/13999 plus log10 calls, an indirect call) that plausibly routes n=128/256 there. That
+        # kernel is scalar-heavy and does NO packing (census: 532 vmovsd, 372 vmulsd, 174 vsubsd, 74
+        # vdivsd, 108 vfmadd231pd, 0 scatters). If it is what wins those cells, then the lever is ENTRY
+        # AND PACKING OVERHEAD — the recurring culprit in this repo — and not macro-kernel strategy, and
+        # every rate/IPC/tile comparison made against the blocked kernel was against the wrong code.
+        # SETTLE THIS BEFORE ACTING ON n=128/256: decode the branch region of `dtrsm_blis_impl` for
+        # (side=L, uplo=U, trans=N, m=n=128), or read `bla_trsm_amd.c` at the artifact's version, where
+        # those thresholds appear as named constants. No benchmark needed.
         useT = _GT_TRANSPOSE
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
