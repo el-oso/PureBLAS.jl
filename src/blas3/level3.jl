@@ -5380,30 +5380,45 @@ end
     size(m, 1) < n && (m = Matrix{ComplexF32}(undef, n, n); _SYMM_SCR_C32[] = m)
     return m
 end
-# Branch-free symmetric/Hermitian → dense fill: copy the stored triangle (contiguous column segments),
-# then mirror it to the other triangle. No per-element uplo/diagonal branch in the hot path.
-# Fill each column of Ad CONTIGUOUSLY (stored run + mirror run) so the write stream is sequential
-# (was strided mirror writes Ad[j,i]). The stored run is a contiguous column copy (SIMD); the mirror
-# reads the crossing row of A (strided load) but writes contiguously — trades strided writes for
-# strided reads (prefetchable, no write-combining stalls). herm: mirror conjugates, diagonal → real.
+# Tile edge for the symmetric/Hermitian → dense fill. DERIVE tier: the mirror half is a TRANSPOSE, so
+# the criterion is that a source tile and its destination tile are both L1-resident while the tile is
+# being written — `2·NB²·sizeof(T) ≤ ½·L1` ⇒ `NB = √(L1 / (4·sizeof(T)))`. Clamped to [4, 64]: below 4
+# the loop overhead dominates a tile, above 64 the tile stops fitting on any box in the fleet.
+@inline _symm_tile(::Type{T}) where {T} = clamp(isqrt(_L1_BYTES ÷ (4 * sizeof(T))), 4, 64)
+
+# Symmetric/Hermitian → dense fill, TILED.
+# The mirror half reads A[j,i] while writing Ad[i,j], i.e. a transpose, and a transpose done one column
+# at a time touches a new cache line per element: at n=256 complex the row walk has stride n·16 = 4096 B,
+# so every element costs its own line AND every line lands in the same L1 set. Measured cost of that:
+# `symm/gemm` = 1.065/1.069/1.053/1.026 at n=128/256/512/1024 on Zen4 — ~6% at n=256, which is ~219 µs
+# to move 2 MB, about 9 GB/s. That is the whole reason zsymm/zhemm miss AOCL at n≥128 while the zgemm
+# they call GATES (1.018 at n=256): the wrapper, not the engine.
+# Tiling fixes the reuse: within an NB×NB tile each fetched line of A serves NB values of j instead of
+# one. Tiles strictly inside a triangle are uniform, so the hot path keeps the branch-free property the
+# previous version was written for — only the diagonal tiles carry a per-element `_symstored` test.
 function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
-    @inbounds if up
-        for j in 1:n
-            @simd for i in 1:j
-                Ad[i, j] = A[i, j]
-            end                     # stored (i≤j): contiguous
-            for i in (j + 1):n
-                Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
-            end   # mirror (i>j): col j
-        end
-    else
-        for j in 1:n
-            @simd for i in j:n
-                Ad[i, j] = A[i, j]
-            end                     # stored (i≥j): contiguous
-            for i in 1:(j - 1)
-                Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
-            end   # mirror (i<j): col j
+    NB = _symm_tile(eltype(Ad))
+    @inbounds for jb in 1:NB:n
+        jhi = min(jb + NB - 1, n)
+        for ib in 1:NB:n
+            ihi = min(ib + NB - 1, n)
+            if ib == jb                                   # diagonal tile: straddles both triangles
+                for j in jb:jhi, i in ib:ihi
+                    Ad[i, j] = _symstored(up, i, j) ? A[i, j] : (herm ? conj(A[j, i]) : A[j, i])
+                end
+            elseif _symstored(up, ib, jb)                 # wholly stored: contiguous column runs
+                for j in jb:jhi
+                    @simd for i in ib:ihi
+                        Ad[i, j] = A[i, j]
+                    end
+                end
+            else                                          # wholly mirrored: transpose this tile
+                for j in jb:jhi
+                    @simd for i in ib:ihi
+                        Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
+                    end
+                end
+            end
         end
     end
     herm && @inbounds for i in 1:n
