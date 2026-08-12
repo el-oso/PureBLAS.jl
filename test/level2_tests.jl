@@ -22,6 +22,41 @@ end
     end
 end
 
+# REGRESSION. Complex gemv trans='T'/'C' threw a MethodError for every A LARGER THAN L2 on any box
+# where `_cgemvt_fits(8, true)` holds -- i.e. by default on AVX-512, not as a rare tuner outcome.
+# `_gemv_tc_cmplx!` dispatched `_gemv_tc_run!(..., Val(NC), Val(HALF), Val(_GEMVT_U), Val(_GEMVT_PF))`,
+# but U and PF are knobs of the REAL blocked kernel: the complex block kernel takes only (NC, CJ, HALF)
+# and no such `_gemv_tc_run!` method has ever existed. Live since 2026-08-08 (cfa09a4 added U to these
+# call sites, a411e57 added PF) and invisible to the suite because every existing gemv case is at most
+# 40x33 -- comfortably L2-resident, so the ladder never left its first branch. The tuner's own harness
+# calls the 10-arg form, so it did not trip either. Found only when a full fleet sweep dropped
+# zgemvT/zgemvC out of the cache entirely.
+# The size here is DERIVED from the detected L2 so the test stays past the branch on every box.
+@testitem "gemv complex T/C past L2 (tuner arm dispatch)" setup = [L2Oracle] begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    @testset "$T $tr" for T in (ComplexF32, ComplexF64), tr in ('T', 'C')
+        n = max(64, ceil(Int, sqrt(2 * PureBLAS._L2_BYTES / sizeof(T))))   # A is ~2x L2 => past the split
+        @test n * n * sizeof(T) > PureBLAS._L2_BYTES                        # the branch is actually taken
+        A = randn(T, n, n); x = randn(T, n); y0 = randn(T, n)
+        for (al, be) in ((one(T), zero(T)), (T(0.7), T(1.3)))
+            yref = copy(y0); B.gemv!(tr, al, A, x, be, yref)
+            yp = copy(y0); PureBLAS.gemv!(yp, A, x; alpha = al, beta = be, trans = tr)
+            @test l2err(yp, yref) < l2tol(T)
+        end
+    end
+    # Every arm the ladder can dispatch must HAVE a method. This is the invariant the bug violated, and
+    # it is checked statically so it holds regardless of which cfg this process's tuner happens to pick.
+    @testset "all cfg arms are callable" begin
+        T = ComplexF64
+        A = randn(T, 4, 4); x = randn(T, 4); y = zeros(T, 4); a = one(T); b = zero(T)
+        for (nc, half) in ((8, true), (4, true), (4, false), (2, false),
+                (PureBLAS._CGEMVT_NC, PureBLAS._CGEMVT_HALF)), cj in (false, true)
+            @test applicable(PureBLAS._gemv_tc_run!, 4, 4, a, A, x, b, y, Val(cj), Val(nc), Val(half))
+        end
+    end
+end
+
 @testitem "ger (geru/gerc) vs explicit outer product" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
     # Oracle is the explicit rank-1 update (LinearAlgebra.BLAS has geru! but not gerc!):
