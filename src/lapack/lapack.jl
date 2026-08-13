@@ -168,16 +168,33 @@ end
 # These now return the failing column (local, 1-based) or 0 — see `_chol_hyb_f64!`. On failure the buffered
 # variants return WITHOUT copying back, so A keeps its input contents exactly as before (the old code threw
 # from inside the base, which skipped the copy-back the same way).
+# THE BASE BUFFER IS AN ALIASING REMEDY, NOT A LOCALITY ONE — so its predicate has to be an aliasing test.
+# `stride(A,2) > n` fires on the EXISTENCE of a stride, which cannot tell ld = n+8 from ld = 4096, and the
+# copy round-trip is only worth its 2n² traffic in the second case. Measured on Zen4, ComplexF64, an
+# interior diagonal sub-block, buf/nobuf (bench/probes/zpu3_buf_worth_it.jl):
+#     n              16      32      48      64
+#     lda=512      1.176   0.562   0.469   0.486     ← aliased: 2× WIN
+#     lda=1024     1.191   0.563   0.511   0.483     ← aliased: 2× WIN
+#     lda=520      1.826   1.626   1.637   1.566     ← NOT aliased: 1.6× LOSS at every n
+# The loss row is the one production kept hitting: Lever C factors `view(M,1:n,1:n)` of `_potrf_pad`'s
+# scratch, whose ld that helper deliberately keeps OFF the way-stride — so the copy could never pay, and
+# it cost zpotrfU@32 1.95 µs of its 6.51 (`view` 5.380 vs `nobuf` 3.426, bench/probes/zpu2_buf_roundtrip.jl)
+# while its LOWER sibling on the same kernel at the same size gated at 1.245.
+# req#8 DERIVE, and no new knob: reuse `_potrf_needs_pad`'s byte-scaled way-stride test. `n` here is a base
+# block (≤ `_CPOTRF_BASE`), hence always L2-resident, so that predicate's residency clause is trivially
+# true and only the way-stride term survives.
+@inline _potf2_needs_buf(A, n) = A isa SubArray && stride(A, 2) > n &&
+    (stride(A, 2) * sizeof(eltype(A))) % (_L1_WAY_BYTES >> 2) == 0
 @inline function _potf2b_lower!(A, n::Int)
-    if eltype(A) <: BlasComplex                                         # SIMD Hermitian base (via contig buf if strided)
-        if A isa SubArray && stride(A, 2) > n && n >= 8
+    if eltype(A) <: BlasComplex                                         # SIMD Hermitian base (via contig buf if aliased)
+        if n >= 8 && _potf2_needs_buf(A, n)
             buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
             f = _cpotf2_lower!(buf, n); f == 0 || return f
             copyto!(A, buf); return 0
         end
         return _cpotf2_lower!(A, n)
     end
-    if n >= 128 && A isa SubArray && stride(A, 2) > n
+    if n >= 128 && _potf2_needs_buf(A, n)
         buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
         f = _potf2_lower!(buf, n); f == 0 || return f
         copyto!(A, buf); return 0
@@ -185,7 +202,7 @@ end
     return _potf2_lower!(A, n)
 end
 @inline function _potf2b_upper!(A, n::Int)
-    if n >= 128 && A isa SubArray && stride(A, 2) > n
+    if n >= 128 && _potf2_needs_buf(A, n)
         buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
         f = _potf2_upper!(buf, n); f == 0 || return f
         copyto!(A, buf); return 0
