@@ -297,6 +297,18 @@ contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on Zen
 Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.922, `zsyrk`
 0.941, `zher2k` 0.908, `zsyr2k` 0.894, `ztrmm` 0.943 — with `ztrsm` (1.067) the one that gates, and
 `ztrmmR` now within reach at 0.969 after the full-tile dispatch fix.
+
+`symm`/`hemm` are the exception, and the reason is worth recording. Complex symm used to materialize a
+dense n×n copy of the symmetric operand and call gemm; complex hemm avoided the copy but ran through a
+*fork* of the complex gemm driver that had drifted, hardwiring off the two specializations (overwrite-C
+when β=0, and the α=1 store) that the driver itself dispatches — precisely the case the benchmark
+measures. Wiring those back in and routing complex symm through the same packing path removes the copy
+entirely. Measured wrapper cost against a bare gemm of the same shape fell from 1.065/1.069/1.053/1.026
+at n=128/256/512/1024 to 1.026/1.017/1.004/1.002. On Zen4 `zhemm` now gates at every size from 32 up
+(1.004–1.012) and `zsymm`'s three remaining shortfalls are each smaller than that cell's own
+round-to-round spread; on Zen3 both gate across 128–2048 at 1.18–1.28. What is left in this family is
+tiny-n — n=8 and n=32, below the packing cut, still on the copy path — and real `symm` at n≥256, whose
+packed path has not yet had the same β=0 fold applied.
 Here the engine itself (`zgemm`) misses, so it is a different problem from the real case and has to
 be fixed at the kernel before anything above it can convert.
 
