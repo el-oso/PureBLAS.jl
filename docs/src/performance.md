@@ -69,6 +69,20 @@ Zen3): the two transposes are the entire remaining gap — remove them and PureB
 of AOCL — but they cannot simply be deleted, since factoring the upper triangle natively measures slower
 than the transpose route at every size and type.
 
+At `n = 32` the same route was losing for a *second*, independent aliasing reason, and the transposes
+were the wrong suspect. `zpotrfU@32` read 0.695 on Zen4 and 0.765 on Zen3 while its lower sibling, the
+same kernel at the same size, gated at 1.245/1.227. Decomposing before patching is what caught it: the
+two transposes account for only 1.28 µs of the 3.23 µs that upper costs over lower, so a fix aimed at
+them would have bought a fifth of the gap. The rest was a *copy that should never have happened*. The
+base kernel stages its block through a contiguous scratch when `A isa SubArray && stride(A,2) > n`, but
+that tests for the **existence** of a stride, whereas the staging is an **aliasing** remedy: it is worth
+2× at `lda = 512` or `1024` and costs 1.6× at `lda = 520`. The upper route hands it a view of a padded
+scratch whose leading dimension is deliberately kept *off* the way-stride, so the copy round-trip could
+never pay — it was pure loss on every call. Replacing the predicate with the byte-scaled way-stride test
+the padding helper already derives (no new tuning constant) took `zpotrfU@32` to **0.993 on Zen4** — a
+1.0% residual inside its own 6.3% round-to-round spread, i.e. no longer adjudicable — and **1.145 on
+Zen3**, with `n = 128` and `n = 256` picking up 7.5% and 5.0% from the same change.
+
 ### Tridiagonal
 
 `gtsv`, `gttrf`, `gttrs`, `pttrf`, `pttrs`, `ptsv` gate `≥ max(OpenBLAS, AOCL)` on **all three µarchs**,
