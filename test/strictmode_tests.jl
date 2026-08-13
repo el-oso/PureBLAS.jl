@@ -278,6 +278,13 @@ end
             A2 = randn(TC, 128, 128); A2 = A2 * A2' + 128I + zeros(TC, 128, 128)
             @assert_typestable P.potrf!(copy(A2); uplo = 'L')         # n>base → recursive nb=n/4 blocked
             @assert_typestable P._cpotrf_lower!(copy(A2), 128)
+            # UPPER was covered by NEITHER of the above: it is Lever C (conj-transpose → `_potrf_pad`
+            # scratch → `_cpotrf_lower!` → conj-transpose back), a different call graph that reaches
+            # `_tri_upper_to_lowerT!`/`_tri_lowerT_to_upper!` and `_potf2_needs_buf` — none of which any
+            # 'L' assertion roots. Both sizes: n≤base is the single-base window where `_potf2_needs_buf`
+            # decides, n>base takes the recursion.
+            @assert_typestable P.potrf!(copy(A); uplo = 'U')
+            @assert_typestable P.potrf!(copy(A2); uplo = 'U')
             # complex getf2 panel (`_cgetf2_simd!`, zgetrf base) + QR panel (`qr_unblocked!`, zgeqrf) —
             # both vectorize via the L1 complex kernels; typestable + alloc-free on the native hot path.
             G = randn(TC, 48, 48) + 48I; ip = zeros(Int, 48); pG = pointer(G); ldG = stride(G, 2)
