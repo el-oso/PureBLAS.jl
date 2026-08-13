@@ -32,6 +32,18 @@ demonstrated.
   now sizes `A` from the detected L2 and asserts that every arm the dispatch ladder can select has a
   method.
 
+- **The Cholesky base kernel staged its block through a scratch buffer whenever the input had *any*
+  leading-dimension slack**, but that staging exists to defeat power-of-two cache-set aliasing, and it
+  costs a full `n×n` copy round-trip each way. Measured on Zen4 at `n = 32/48/64`, the copy is worth
+  ~2× at `lda = 512` and `1024` and *loses* ~1.6× at `lda = 520`. Complex upper Cholesky factors a view
+  of a padded scratch whose leading dimension is deliberately kept off the way-stride, so it took the
+  losing branch on every call: `zpotrfU@32` read 0.695 vs OpenBLAS on Zen4 and 0.765 on Zen3, while the
+  *lower* path — same kernel, same size — gated at 1.245/1.227. The predicate is now the byte-scaled
+  way-stride test the padding helper already derives, so no new tuning constant enters. `zpotrfU@32`
+  → **0.993 on Zen4** (a 1.0% residual inside its own 6.3% spread) and **1.145 on Zen3**; `n = 128`
+  and `256` gain 7.5% and 5.0%. The two conj-transposes, the intuitive suspect, turned out to be only
+  1.28 µs of the 3.23 µs gap and were left untouched.
+
 ### Changed
 
 - Complex `trmm`/`trmmR` dispatch unmasked kernels for full-height tiles, as the gemm sweep already

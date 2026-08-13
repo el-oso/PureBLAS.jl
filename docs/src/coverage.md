@@ -33,7 +33,9 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   machine-state drift, no stale-reference warnings and no preference pins on either box. Every cell in
   those two columns is therefore adjudicable against the code that ships at that commit.
   **Zen5 is offline and its whole column is stale at `2113738` (2026-08-09).** Its `ztrsmR` still reads
-  the pre-fix kernel and its `trmm` predates the derived crossover; those are stale numbers, not µarch
+  the pre-fix kernel, its `trmm` predates the derived crossover, and its `zpotrfU` **0.704 @ n=32** is
+  the widest such gap on the page — it predates the `_potf2_needs_buf` aliasing fix, which measured
+  0.695 → 0.993 on Zen4 and 0.765 → 1.145 on Zen3 at that exact cell. Those are stale numbers, not µarch
   differences, and they will move when neuromancer returns. Per-cell provenance is stamped in
   [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md).
 
@@ -207,13 +209,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.06</span></td></tr>
 <tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.35</span></td></tr>
 <tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.17</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=1024</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="b4"><span class="v">0.695</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.765</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.704</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.19</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.09</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.13</span></td><td class="ok"><span class="v">1.05</span></td></tr>
+<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.12</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="b2"><span class="v">0.95</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.04</span></td><td class="b4"><span class="v">0.704</span><span class="n">n=32</span></td></tr>
 </tbody></table>
 ```
 ```@raw html
