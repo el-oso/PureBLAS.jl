@@ -5398,6 +5398,37 @@ end
 # previous version was written for — only the diagonal tiles carry a per-element `_symstored` test.
 function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     NB = _symm_tile(eltype(Ad))
+    # n ≤ NB ⇒ the WHOLE matrix is one diagonal tile, so the tiled loop below would put a per-element
+    # `_symstored` test on every element and gain nothing: at that size A is already L1-resident and
+    # there is no reuse to recover. Keep the branch-free two-loop form there. This is not hypothetical
+    # — shipping the tiled version without this guard cost the tiny-n cells (zhemm@8 0.973→0.924,
+    # measured), because the tile edge is 22 for ComplexF64 on a 32 KiB L1 and every gate size below it
+    # collapsed to the diagonal case. The tiled path only pays once the row walk actually strides.
+    if n <= NB
+        @inbounds if up
+            for j in 1:n
+                @simd for i in 1:j
+                    Ad[i, j] = A[i, j]
+                end
+                for i in (j + 1):n
+                    Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
+                end
+            end
+        else
+            for j in 1:n
+                @simd for i in j:n
+                    Ad[i, j] = A[i, j]
+                end
+                for i in 1:(j - 1)
+                    Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
+                end
+            end
+        end
+        herm && @inbounds for i in 1:n
+            Ad[i, i] = real(Ad[i, i])
+        end
+        return Ad
+    end
     @inbounds for jb in 1:NB:n
         jhi = min(jb + NB - 1, n)
         for ib in 1:NB:n
