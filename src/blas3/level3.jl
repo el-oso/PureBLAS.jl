@@ -5465,10 +5465,14 @@ end
 # per panel-column the stored run reads A[i,gp] direct; the MIRROR run reads A[gp,i] CONJUGATED
 # (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store). Mirrors _pack_A_sym! + the
 # conj that makes it Hermitian. Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
+# `HERM` is the ONLY difference between the Hermitian and complex-symmetric packs: the mirrored half
+# takes conj(A[j,i]) for Hermitian and A[j,i] unchanged for symmetric. It is a compile-time `Val` so the
+# sign folds away rather than costing a branch per element, and so complex symm can share this path
+# instead of materializing an n×n copy.
 function _pack_A_sym_cmplx!(
         ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
-        up::Bool, mr::Int
-    ) where {T}
+        up::Bool, mr::Int, ::Val{HERM}
+    ) where {T, HERM}
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
         base = pi * mr * kce; pbase = pi * mr; rhi = min(mr, mce - pbase)
@@ -5480,12 +5484,14 @@ function _pack_A_sym_cmplx!(
                     v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
                 end
                 for r in st_end:(rhi - 1)
-                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = -imag(v)
+                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v)
+                    ApI[o + r + 1] = HERM ? -imag(v) : imag(v)
                 end
             else                                           # mirror(conj) r∈[0,st_start); stored r∈[st_start,rhi)
                 st_start = clamp(ls, 0, rhi)
                 for r in 0:(st_start - 1)
-                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = -imag(v)
+                    v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v)
+                    ApI[o + r + 1] = HERM ? -imag(v) : imag(v)
                 end
                 for r in st_start:(rhi - 1)
                     v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
@@ -5502,14 +5508,53 @@ end
 # tiles) but each A-panel is packed from the Hermitian TRIANGLE on the fly (stored → SIMD _pack_A_cmplx!;
 # mirror/straddle → _pack_A_sym_cmplx! with conj) — reads the triangle ONCE, no materialize, no 2×
 # A-traffic. α at the microkernel store (A1=false); β·C up front. Reuses _microkernel_cmplx!.
-function _hemm_packed_L!(up::Bool, α, β, A, B, C)
+# Inner (ir,jr) microkernel sweep of the packed Hermitian/symmetric path, with B0 (overwrite C) and A1
+# (α=1 ⇒ pure interleave store) as compile-time `Val`s. Split out of `_hemm_packed_L!` so the driver can
+# branch ONCE into literal `Val`s per (b0, a1) instead of constructing `Val(b0)` at runtime, which would
+# be a trim violation. Four concrete instantiations; the ISA-sized `Val(_CMR)`/`Val(_CNR)` are unchanged.
+@inline function _hemm_pack_sweep!(
+        ::Val{B0}, ::Val{A1}, Cp0::Ptr{T}, ldc::Int, ARp::Ptr{T}, AIp::Ptr{T}, BRp::Ptr{T}, BIp::Ptr{T},
+        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, mr::Int, nr::Int, alr::T, ali::T, sz::Int
+    ) where {T, B0, A1}
+    jr = 0
+    while jr < nce
+        nre = min(nr, nce - jr); ir = 0
+        while ir < mce
+            mre = min(mr, mce - ir)
+            AR = Ptr{T}(ARp + div(ir, mr) * mr * kce * sz); AI = Ptr{T}(AIp + div(ir, mr) * mr * kce * sz)
+            BR = Ptr{T}(BRp + div(jr, nr) * nr * kce * sz); BI = Ptr{T}(BIp + div(jr, nr) * nr * kce * sz)
+            Cblk = Cp0 + (2 * (ic + ir) + 2 * (jc + jr) * ldc) * sz
+            if mre == mr && nre == nr
+                _microkernel_cmplx!(
+                    Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                    Val(_CMR), Val(_CNR), Val(1), Val(1), Val(B0), Val(A1)
+                )
+            else
+                _microkernel_cmplx_masked!(
+                    Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
+                    mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(B0), Val(A1)
+                )
+            end
+            ir += mr
+        end
+        jr += nr
+    end
+    return nothing
+end
+function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) where {HERM}
     Tc = eltype(C); T = real(Tc); n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _CMR * W; nr = _CNR
     kc = min(_CKC, n)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(C, n, m, convert(Tc, β)); ldc = stride(C, 2); sz = sizeof(T)
+    # β=0 ⇒ the first kc-block OVERWRITES C (Val{B0}), so the n² pre-scaling pass is dead work. Skipping
+    # it is also what makes β=0 correct on a C holding NaN/Inf: overwrite, never 0·C. Mirrors the gemm
+    # driver's `b0first` (gemm.jl:1658).
+    b0first = iszero(convert(Tc, β))
+    b0first || _scale_C!(C, n, m, convert(Tc, β))
+    ldc = stride(C, 2); sz = sizeof(T)
     alr = real(convert(Tc, α)); ali = imag(convert(Tc, α))
+    a1 = isone(convert(Tc, α))            # α=1 ⇒ pure interleave store, no multiply (gemm.jl:1737)
     GC.@preserve C ApR ApI BpR BpI begin
         Cp0 = Ptr{T}(pointer(C)); ARp = pointer(ApR); AIp = pointer(ApI); BRp = pointer(BpR); BIp = pointer(BpI)
         jc = 0
@@ -5518,34 +5563,31 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C)
             while pc < n
                 kce = min(kc, n - pc)
                 _pack_B_cmplx!(BpR, BpI, B, pc, jc, kce, nce, false, nr)
+                b0 = b0first && pc == 0       # overwrite only on the FIRST k-block; the rest accumulate
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
                     stored = up ? (a_hi <= pc) : (ic >= p_hi)     # read A[i,gp] direct (SIMD)
                     stored ? _pack_A_cmplx!(ApR, ApI, A, ic, pc, mce, kce, false, mr) :
-                        _pack_A_sym_cmplx!(ApR, ApI, A, ic, pc, mce, kce, up, mr)  # mirror/straddle (conj)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            AR = Ptr{T}(ARp + div(ir, mr) * mr * kce * sz); AI = Ptr{T}(AIp + div(ir, mr) * mr * kce * sz)
-                            BR = Ptr{T}(BRp + div(jr, nr) * nr * kce * sz); BI = Ptr{T}(BIp + div(jr, nr) * nr * kce * sz)
-                            Cblk = Cp0 + (2 * (ic + ir) + 2 * (jc + jr) * ldc) * sz
-                            if mre == mr && nre == nr
-                                _microkernel_cmplx!(
-                                    Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
-                                    Val(_CMR), Val(_CNR), Val(1), Val(1), Val(false), Val(false)
-                                )
-                            else
-                                _microkernel_cmplx_masked!(
-                                    Cblk, ldc, AR, AI, BR, BI, kce, alr, ali,
-                                    mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(false), Val(false)
-                                )
-                            end
-                            ir += mr
-                        end
-                        jr += nr
+                        _pack_A_sym_cmplx!(ApR, ApI, A, ic, pc, mce, kce, up, mr, Val(HERM))
+                    # B0/A1 were hardwired false here while `_gemm_cmplx_impl!` dispatches both. The gate
+                    # benchmark runs α=1, β=0 (plots.jl:879), i.e. EXACTLY the case both specializations
+                    # exist for, so this fork paid an n² zeroing pass plus a first-kc-block C read-back
+                    # that the gemm driver skips, and a complex multiply per store that α=1 makes free.
+                    # `b0`/`a1` are branched into literal `Val`s (never `Val(b0)`) — the trim-safe
+                    # concrete-Val dispatch the driver uses at gemm.jl:707.
+                    if b0
+                        a1 ?
+                            _hemm_pack_sweep!(Val(true), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
+                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz) :
+                            _hemm_pack_sweep!(Val(true), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
+                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz)
+                    else
+                        a1 ?
+                            _hemm_pack_sweep!(Val(false), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
+                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz) :
+                            _hemm_pack_sweep!(Val(false), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
+                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz)
                     end
                     ic += mc
                 end
@@ -5709,6 +5751,18 @@ const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW)):
 # gates on (zsymm n=128 = 1.06). So on AVX2 raise the cut past the whole gate range: hemm rides
 # materialize+3M like symm. (AVX-512 keeps 32 — 3M path is AVX2-only; leave the gating classic path.)
 const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 4096 : 32)::Int
+# Complex NON-Hermitian symm side-L uses the SAME packed kernel (`_hemm_packed_L!` with HERM=false):
+# identical blocking, identical microkernel, the only difference is that the mirrored half of the A-pack
+# does not conjugate. Same criterion ⇒ same cut, so this DEFAULTS TO `_CHEMM_PACK_CUT` rather than
+# introducing a second literal; it carries its own preference name only so the two can be pinned apart
+# if a box ever wants that. Before this, complex symm had no packed path at all and always materialized
+# an n×n copy — measured symm/gemm = 1.045 at n=256 even after the materialize was tiled, against a
+# zsymm gate of 0.976 there.
+# TIER NOTE: inherited, not derived. The packed-vs-materialize margin for hemm on AVX-512 was measured
+# small (packed faster by 0.9% at n=256 and 2.6% at n=512, ~neutral at 128/1024/2048), so the cut is
+# Pin-tier debt on BOTH knobs, not a validated optimum. Deriving it needs a packed-vs-materialize sweep
+# per box; do that before treating 32 as meaningful.
+const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
@@ -5728,7 +5782,10 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
     elseif herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
             _strided1(B) && _strided1(C)                     # packed Hermitian (no materialize, triangle once)
-        return _hemm_packed_L!(up, α, β, A, B, C)
+        return _hemm_packed_L!(up, α, β, A, B, C, Val(true))
+    elseif !herm && eltype(C) <: BlasComplex && side_left && n > _CSYMM_PACK_CUT &&
+            _strided1(B) && _strided1(C)                 # packed complex-symmetric: no materialize
+        return _hemm_packed_L!(up, α, β, A, B, C, Val(false))
     end
     Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
