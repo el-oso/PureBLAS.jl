@@ -5671,7 +5671,9 @@ function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T <: BlasReal}
     kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(C, n, m, β); ldc = stride(C, 2); sz = sizeof(T)
+    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
+    b0first || _scale_C!(C, n, m, β)
+    ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
         jc = 0
@@ -5680,6 +5682,7 @@ function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T <: BlasReal}
             while pc < n
                 kce = min(kc, n - pc)
                 _pack_B!(Bp, B, pc, jc, kce, nce, false, nr)
+                b0 = b0first && pc == 0
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
@@ -5696,10 +5699,18 @@ function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T <: BlasReal}
                             Apanel = App + (div(ir, mr) * mr * kce) * sz
                             Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
                             Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
+                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
+                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
+                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
+                            # Val(b0) — trim-safe, as at gemm.jl:707.
                             if mre == mr && nre == nr
-                                _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR))
+                                b0 ?
+                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
+                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
                             else
-                                _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR))
+                                b0 ?
+                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
                             end
                             ir += mr
                         end
@@ -5722,7 +5733,9 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T <: BlasReal}
     kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(M, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    _scale_C!(C, M, n, β); ldc = stride(C, 2); sz = sizeof(T)
+    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
+    b0first || _scale_C!(C, M, n, β)
+    ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
         jc = 0
@@ -5735,6 +5748,7 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T <: BlasReal}
                 stored ? _pack_B!(Bp, A, pc, jc, kce, nce, false, nr) :
                     mirror ? _pack_B!(Bp, A, pc, jc, kce, nce, true, nr) :
                     _pack_B_sym!(Bp, A, pc, jc, kce, nce, up, nr)
+                b0 = b0first && pc == 0
                 ic = 0
                 while ic < M
                     mce = min(mc, M - ic)
@@ -5747,10 +5761,18 @@ function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T <: BlasReal}
                             Apanel = App + (div(ir, mr) * mr * kce) * sz
                             Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
                             Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
+                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
+                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
+                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
+                            # Val(b0) — trim-safe, as at gemm.jl:707.
                             if mre == mr && nre == nr
-                                _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR))
+                                b0 ?
+                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
+                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
                             else
-                                _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR))
+                                b0 ?
+                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
+                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
                             end
                             ir += mr
                         end
