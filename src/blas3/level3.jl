@@ -4805,7 +4805,7 @@ function _ctrgemm_3m!(up::Bool, conjX::Bool, conjY::Bool, tXp::Bool, tYp::Bool, 
     rx = size(X, 1); cx = size(X, 2); ry = size(Y, 1); cy = size(Y, 2)
     t = _gemm_3m_scratch(Tr, rx * cx, ry * cy, n * n)
     GC.@preserve t begin
-        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)   # isbits — see the note in `_gemm_3m!` (gemm.jl)
         Xr = w(1, rx, cx); Xi = w(2, rx, cx); Xs = w(3, rx, cx)
         _split3!(Xr, Xi, Xs, X, conjX, rx, cx)
         if X === Y && conjX == conjY                       # syrk/zsyrk: X,Y split identically — split once

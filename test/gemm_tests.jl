@@ -94,6 +94,24 @@ end
     Al = randn(300, 300); Bl = randn(300, 300); Cl = zeros(300, 300)
     PureBLAS.gemm!(Cl, Al, Bl; beta = 0.0)                       # warmup (allocates scratch)
     @test (@allocated PureBLAS.gemm!(Cl, Al, Bl; beta = 0.0)) == 0
+    # COMPLEX, and specifically INSIDE the Karatsuba-3M window (_CGEMM_3M_MIN=48 ≤ max(m,n,k) ≤ 2048,
+    # min ≥ _CGEMM_3M_KMIN=16). This case had NO allocation coverage at any size, which is how
+    # `_gemm_3m!` shipped building nine `unsafe_wrap(Array, …)` headers per call — ~1 KB of steady-state
+    # allocation on every 3M gemm, live on AVX2 from the day 3M landed and invisible because the only
+    # allocation test here was real Float64. Fixed by taking `PtrMatrix` views over the pooled buffers
+    # (isbits ⇒ no header). n=128 sits in the window on every µarch; n=32 is the below-window control,
+    # so the pair also pins the routing, not just the total.
+    for nc in (32, 128)
+        Az = randn(ComplexF64, nc, nc); Bz = randn(ComplexF64, nc, nc); Cz = zeros(ComplexF64, nc, nc)
+        PureBLAS.gemm!(Cz, Az, Bz; alpha = one(ComplexF64), beta = zero(ComplexF64))   # warmup + pool growth
+        @test (@allocated PureBLAS.gemm!(Cz, Az, Bz; alpha = one(ComplexF64), beta = zero(ComplexF64))) == 0
+    end
+    # complex rank-k rides the same buffers through `_ctrgemm_3m!` (n ≥ _CSYRK_3M_MIN)
+    As = randn(ComplexF64, 300, 300); Cs = zeros(ComplexF64, 300, 300)
+    PureBLAS.syrk!(Cs, As; uplo = 'U', trans = 'N', alpha = true, beta = false)
+    @test (@allocated PureBLAS.syrk!(Cs, As; uplo = 'U', trans = 'N', alpha = true, beta = false)) == 0
+    PureBLAS.herk!(Cs, As; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
+    @test (@allocated PureBLAS.herk!(Cs, As; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)) == 0
 end
 
 @testitem "GEMM dimension mismatch is caught" begin
