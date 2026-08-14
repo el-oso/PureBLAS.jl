@@ -4841,8 +4841,12 @@ end
     #     zher2k    1.000   0.870  0.933  0.867  0.824
     # (* = CONTROL below `_CSYRK_3M_MIN`=256; all four tie at exactly 1.000 with relerr 0, proving the
     # arm was live.) `_EXPFLAG[_EXP11]` is INVERTED: 3M ships ON, the flag disables it for A/B.
+    # `_EXPFLAG[_EXP13]` lowers the rank-k 3M edge to gemm's own `_CGEMM_3M_MIN` — the A/B partner of
+    # the unpack bypass in `_syrk_blocked!`/`syr2k!`/`her2k!`. `_CSYRK_3M_MIN`=256 was set on AVX2 with
+    # no W=8 data, exactly like the width gate that was just deleted.
     if _CGEMM_3M && !_EXPFLAG[_EXP11] &&
-            _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
+            (_EXPFLAG[_EXP13] ? _CGEMM_3M_MIN : _CSYRK_3M_MIN) <= n <= _CGEMM_3M_MAX &&
+            k >= _CGEMM_3M_KMIN
         # large-n: Karatsuba-3M (the complex tri kernels plateau ~0.92 here). herk conjugates op(X) at
         # tr='C' (SA=-1) / op(Y) at tr='N' (SB=-1); syrk conjugates neither. tXp=tr, tYp=!tr.
         return _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
@@ -5267,7 +5271,12 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
         return _syrk_packed!(up, tr, convert(T, α), A, C, k)
     elseif T <: Union{ComplexF64, ComplexF32} && k > 0
         n = size(C, 1)
-        if !tr && n <= _CSYRK_UNPACK_MAX
+        # `_EXPFLAG[_EXP13]` — A/B arm for "let the 3M window win over the unpacked branch". For
+        # trans='N' this branch is tested BEFORE the packed path, and 3M lives inside `_csyrk_packed!`
+        # → `_ctrgemm_prod!`, so with `_CSYRK_UNPACK_MAX`=192 on AVX-512 the 3M route is UNREACHABLE at
+        # n≤192 and lowering `_CSYRK_3M_MIN` alone would be a dead knob. The flag also lowers that edge
+        # (see `_ctrgemm_prod!`), so the two halves are tested together — separately, neither moves.
+        if !tr && n <= _CSYRK_UNPACK_MAX && !_EXPFLAG[_EXP13]
             return _ctri_unpacked!(up, herm, α, A, C, k)
         elseif n > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
             return _csyrk_packed!(up, tr, herm, α, A, C, k)
@@ -5964,7 +5973,7 @@ function syr2k!(
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
-    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0
+    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_EXPFLAG[_EXP13]
         _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
         _ctri2_unpacked!(up, false, alpha, A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
@@ -5982,7 +5991,7 @@ function her2k!(
     )
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
-    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0
+    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_EXPFLAG[_EXP13]
         return (_ctri2_unpacked!(up, true, alpha, A, Bm, C, k); C)     # small-n trans='N': unpacked-tri (2 products)
     elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
