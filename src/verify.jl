@@ -51,7 +51,10 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
         # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
         # is verified below.
-        gemm!(bk, C3, A3, B3); symm!(bk, C3, A3, B3)
+        # complex gemm warms the 3M split/product pools too — they grow on first touch, so without this
+        # the new in-window `gemm!(bk, Cz3, Az3, Bz3)` assertion below would trip on pool growth rather
+        # than on a real per-call allocation.
+        gemm!(bk, C3, A3, B3); gemm!(bk, Cz3, Az3, Bz3); symm!(bk, C3, A3, B3)
         trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
         trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
         syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
@@ -109,6 +112,14 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             tbsv!(bk, ABs, um; uplo = 'U', trans = 'N', diag = 'N')
             # ── Level 3 (all matrix-matrix ops; scratch pre-warmed above; real + complex)
             gemm!(bk, C3, A3, B3)
+            # COMPLEX gemm, and deliberately at m=64 — INSIDE the Karatsuba-3M window
+            # (`_CGEMM_3M_MIN`=48 ≤ max(m,n,k) ≤ 2048, min ≥ `_CGEMM_3M_KMIN`=16). Until now every
+            # `gemm!` here was REAL, and 3M is complex-only, so the strict contract verified the one arm
+            # that cannot reach `_gemm_3m!`. That is how nine `unsafe_wrap(Array, …)` per call — ~1 KB of
+            # steady-state allocation — passed this check on AVX2 from the day 3M shipped. The other
+            # complex L3 calls below cannot substitute: they run at m=64, under `_CSYRK_3M_MIN`=256, so
+            # `herk!`/`her2k!` never enter rank-k 3M. One line, and it closes the whole class.
+            gemm!(bk, Cz3, Az3, Bz3)
             symm!(bk, C3, A3, B3)
             hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
             syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)

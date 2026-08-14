@@ -2330,8 +2330,18 @@ function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::In
     Tc = eltype(C); Tr = real(Tc)
     ra = size(A, 1); ca = size(A, 2); rb = size(B, 1); cb = size(B, 2)   # stored dims (trans folded by sub-gemm)
     t = _gemm_3m_scratch(Tr, ra * ca, rb * cb, m * n)   # grow-only flat buffers
-    GC.@preserve t begin      # unsafe_wrap the first r·c → CONTIGUOUS r×c matrix (ld=r; no strided top-left)
-        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+    GC.@preserve t begin      # view the first r·c as a CONTIGUOUS r×c matrix (ld=r; no strided top-left)
+        # `PtrMatrix`, NOT `unsafe_wrap(Array, …)`: an Array header is a heap object, so the old form
+        # allocated ~112 B PER WRAP PER CALL in steady state — 9 wraps ≈ 1008 B, measured (zgemm 1056 B,
+        # zherk 1008 B, zsyrk 672 B at 6 wraps; `bench/probes/sk8_3m_alloc.jl`). That broke the @noalloc
+        # contract on every 3M call and was live on AVX2 from the day 3M shipped, despite the design note
+        # calling this path zero-alloc; enabling 3M for W=8 carried it into AVX-512 and the .so, where
+        # `juliac/build.jl` does NOT pin `cgemm_3m` (so the branch is no longer trimmed dead).
+        # PtrMatrix is isbits ⇒ no header, and `_strided1(::PtrMatrix)` is true, so every consumer keeps
+        # the identical fast path: `_split3!`/`_combine3!` only take `pointer`/`stride(·,2)`, and
+        # `_gemm_real_dims!` normalizes through `_pm` regardless. The outer `GC.@preserve t` still roots
+        # the pooled buffers — which is what needs rooting; the wrapper never did.
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)
         Ar = w(1, ra, ca); Ai = w(2, ra, ca); As = w(3, ra, ca)
         Br = w(4, rb, cb); Bi = w(5, rb, cb); Bs = w(6, rb, cb)
         P1 = w(7, m, n); P2 = w(8, m, n); P3 = w(9, m, n)
@@ -2352,7 +2362,7 @@ function _hemm_3m_L!(up::Bool, herm::Bool, α, β, A, B, C)
     Tc = eltype(C); Tr = real(Tc); n = size(A, 1); m = size(B, 2)
     t = _gemm_3m_scratch(Tr, n * n, size(B, 1) * m, n * m)
     GC.@preserve t begin
-        w(i, r, c) = unsafe_wrap(Array, pointer(t[i]), (r, c))
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)   # isbits — see the note in `_gemm_3m!` above
         Ar = w(1, n, n); Ai = w(2, n, n); As = w(3, n, n)
         Br = w(4, n, m); Bi = w(5, n, m); Bs = w(6, n, m)
         P1 = w(7, n, m); P2 = w(8, n, m); P3 = w(9, n, m)
