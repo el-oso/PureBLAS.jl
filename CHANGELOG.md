@@ -61,6 +61,26 @@ demonstrated.
   **1.005**, `ztrsm` 1.067 → **1.095**. Zen3 is flat across the same sweep, which is the control: it
   already ran 3M. Not addressed, because they sit outside the 3M size window: `zgemm` at n=32 (0.910),
   and `zsyrk`/`zsyr2k`/`zher2k` at n≤128.
+- **Complex rank-k fuses the Karatsuba split into the pack and the combine into the tile write-back.**
+  3M previously paid two extra passes over the direct complex kernel: a strided split of the operands,
+  and three full `n×n` product buffers read back by a separate combine. The third Karatsuba panel is
+  now derived from the *packed* panels (the complex pack already deinterleaves into two real panels, so
+  the third is one add in an existing loop), and the combine runs per micro-tile into a small scratch,
+  with the triangle mask moving out of the microkernel's store into the combine bounds. Same kernels,
+  strictly less memory traffic, so it is never slower than the unfused path — measured 0.83–1.00
+  against it on both machines. Requires no new workspace and no new tuning constant.
+  With the overhead reduced, the window's lower edge could finally come down: `zsyrk@128` 0.894 →
+  **1.002** and `zsyr2k@128` 0.899 → **1.011** on Zen4, `zherk`/`zher2k` gaining margin (1.063 → 1.135,
+  1.068 → 1.111), and `zsyrk`/`zherk` at 128 rising to 1.037/1.036 on Zen3.
+  Two things this did **not** do, recorded because the first was expected to. Fusion does not remove the
+  size threshold: the pack is itself `O(n·k)` and 3M packs three panels where the direct kernel packs
+  two, so overhead-per-flop still decays as `1/n` and three real products structurally need three real
+  panels. It moved the crossover rather than deleting it — which is what allowed a single edge to serve
+  both machines for the first time. And that edge (128) is a **literal, labelled as one**: the crossover
+  carries a ratio of our own two microkernels' rates (complex is latency-bound on AVX2, throughput-bound
+  on AVX-512), so no cache/ISA constant predicts it, every throughput model gives the wrong sign, and
+  the formula that fits both machines has no physical criterion. Both failed derivations are recorded at
+  the constant so they are not repeated.
 - Complex `trmm`/`trmmR` dispatch unmasked kernels for full-height tiles, as the gemm sweep already
   did. Worth +16.7%/+13.1% at n=8/32 on Zen3 and +0.4–3.8% across n=8…128 on Zen4.
 
