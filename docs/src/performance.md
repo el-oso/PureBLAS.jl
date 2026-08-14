@@ -334,10 +334,41 @@ without being touched — `zhemm` 1.004 → **1.136**, `zsymm` 0.994 → **1.146
 `ztrsmR` 0.987 → **1.084**, `ztrmmR` 0.969 → **1.005**, `ztrsm` 1.067 → **1.095**. Zen3, which already
 ran 3M, is flat across the same sweep — which is the control that says the change did one thing only.
 
-What is left is entirely **small-n and outside the 3M window**: `zsyrk` 0.894 (n=128), `zsyr2k` 0.900,
-`zher2k` 0.912 (n=32), `ztrmm` 0.975, and `zgemm` 0.910 at n=32 — below the window's lower edge, so
-this lever cannot reach it. Those edges (48 for gemm, 256 for rank-k) were themselves set on AVX2 with
-no AVX-512 measurement behind them, which is the next thing to check rather than a new kernel.
+The rank-k window's lower edge was the next thing, and it turned into a lesson about knobs rather than
+about kernels. Below 256, complex rank-k could not reach 3M at all: for `trans='N'` the *unpacked*
+branch is tested before the packed path, and on AVX-512 that branch owns everything up to n=192 — so
+lowering the edge alone would have changed nothing. Fixing that exposed the real question: **where
+should the edge be?** The honest answer was that it is not derivable. The crossover carries a ratio of
+*our own two microkernels'* rates — the complex kernel is latency-bound on AVX2 and throughput-bound on
+AVX-512 — so no cache or ISA constant predicts it, every throughput model gives the wrong *sign*, and
+the tidy `768/W` that fits both machines has no physical criterion behind it. Worse, the measured
+crossovers were far apart (≈80 on Zen4, ≈160 on Zen3), so no single value existed: 128 would have cost
+Zen3's `zherk@128` 8.2%.
+
+So the overhead was removed instead of the threshold being located. 3M's cost over the direct complex
+kernel was two extra passes — a strided split of the operands, and three full n×n product buffers
+read back by the combine. Both are now fused away: the third Karatsuba panel is derived from the
+*packed* panels (the complex pack already deinterleaves into two real panels, so the third is one add
+in a loop that exists), and the combine happens per micro-tile into a small scratch instead of via n×n
+buffers, with the triangle mask moving from the microkernel's store into the combine bounds.
+
+That did not eliminate the threshold — and the reason is worth stating, because the original claim was
+that it would. **The pack itself is O(n·k), and 3M packs three panels where the direct kernel packs
+two.** That +50% is O(n·k) against O(n²·k) of product, so overhead-per-flop still decays as 1/n; three
+real products structurally require three real panels. What fusion bought was moving the crossover
+(≈160 → ≈112 on Zen3, below 64 on Zen4) until **one value finally served both machines**. Measured
+fused-vs-packed at n=128: 0.886/0.887 on Zen4, 0.956/0.963 on Zen3 — both win, so 128 ships, labelled
+in the source as the empirical bound it is rather than dressed as a derivation.
+
+The result on the gate: `zsyrk@128` 0.894 → **1.002** and `zsyr2k@128` 0.899 → **1.011** on Zen4, with
+`zherk` and `zher2k` gaining margin (1.063 → 1.135, 1.068 → 1.111); on Zen3 `zsyrk`/`zherk` at 128 rise
+to 1.037/1.036. Fusion is a strict improvement everywhere it applies — same kernels, strictly less
+traffic — measured 0.83–1.00 against the unfused path on both boxes.
+
+What remains is **n = 32 and below**, outside the window on every machine: `zsyr2k` 0.910 and `zher2k`
+0.906 on Zen4, `zgemm` 0.902, and `ztrmm` 0.972. Complex rank-2k also has a second, independent fence
+on AVX2, which is why Zen3's `zsyr2k@128` did not move; that path needs the rank-2k reformulation
+(one product plus a symmetrized add) rather than a window change.
 
 `symm`/`hemm` are the exception, and the reason is worth recording. Complex symm used to materialize a
 dense n×n copy of the symmetric operand and call gemm; complex hemm avoided the copy but ran through a
