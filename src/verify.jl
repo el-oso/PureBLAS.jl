@@ -42,6 +42,15 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
             Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
             ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
+            # COMPLEX counterparts. The contract previously verified `symm!`/`syrk!`/`syr2k!`/`trmm!`/
+            # `trsm!` and every factorization on REAL operands only, so any defect confined to a complex
+            # kernel was invisible to it — which is exactly how ~1 KB/call of `unsafe_wrap` allocation in
+            # the complex-only 3M path passed for a month. Hermitian PD (diag m+1, off-diag 1+0im) so
+            # zpotrf succeeds; `Atz` is the triangular operand for ztrmm/ztrsm (unit diagonal ⇒
+            # non-singular), `Btz` the one they overwrite, mirroring the real `At`/`Bt` pair.
+            Apdz = [i == j ? ComplexF64(m + 1) : ComplexF64(1) for i in 1:m, j in 1:m],
+            Awz3 = zeros(ComplexF64, m, m), tauz = Vector{ComplexF64}(undef, m),
+            Atz = ones(ComplexF64, m, m), Btz = ones(ComplexF64, m, m),
             # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
             kb = 8, APd = ones(m * (m + 1) ÷ 2), APz = ones(ComplexF64, m * (m + 1) ÷ 2),
             ABg = ones(2 * 8 + 1, m), ABs = ones(8 + 1, m), ABz = ones(ComplexF64, 8 + 1, m),
@@ -57,6 +66,13 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         gemm!(bk, C3, A3, B3); gemm!(bk, Cz3, Az3, Bz3); symm!(bk, C3, A3, B3)
         trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
         trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
+        # complex L3 + complex Cholesky warmup (own per-type workspaces and 3M pools)
+        symm!(bk, Cz3, Az3, Bz3); syrk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
+        syr2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
+        trmm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+        trsm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+        copyto!(Awz3, Apdz); potrf!(Awz3; uplo = 'L')
+        copyto!(Awz3, Apdz); getrf!(Awz3, ipiv); copyto!(Awz3, Apdz); geqrf!(Awz3, tauz)
         syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
         herk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
         syr2k!(bk, C3, A3, B3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
@@ -82,6 +98,9 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             dotu(bk, xz, yz)
             nrm2(bk, xz)                       # complex nrm2/asum now take the SIMD real-reinterpret path
             asum(bk, xz)
+            blascopy!(bk, yz, xz)
+            swap!(bk, xz, yz)
+            iamax(bk, xz)                      # izamax: swap-adjacent magnitude reduction (its own kernel)
             # ── Level 2 (dense hot paths; real + complex)
             gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'N')
             gemv!(bk, vm, Ad, um; alpha = 2.0, beta = 1.0, trans = 'T')
@@ -128,6 +147,15 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
             trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
             trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
+            # COMPLEX arms of the five L3 ops that were verified on the real path only. `hemm!`/`herk!`/
+            # `her2k!` above do NOT substitute: the symmetric (non-Hermitian) complex kernels are
+            # separate specializations — `zsymm`/`zsyrk`/`zsyr2k` conjugate nothing — and `ztrmm`/`ztrsm`
+            # share no code with any of them.
+            symm!(bk, Cz3, Az3, Bz3)
+            syrk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
+            syr2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
+            trmm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+            trsm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
             # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
             # their in-place pre-allocated-output forms). Via re-seeding probes so repeated @strict calls
             # always factor a fresh source (potrf would otherwise throw PosDefException on its L-output).
@@ -137,6 +165,15 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_getrf_probe(Aw, Apd, ipiv)
             _strict_geqrf_probe(Aw, Apd, tau)
             _strict_gesvd_probe(Aw, Apd, Usv, Ssv, Vtsv)
+            # COMPLEX factorizations — a wholly separate kernel set (`_cpotrf_lower!`, `_cgetf2_simd!`,
+            # the complex QR panel), previously outside the contract entirely. Same re-seeding probes so
+            # repeated @strict invocations stay 0-alloc and type-stable rather than re-factoring in place.
+            # gesvd is deliberately NOT included for complex: its in-place form caches a Float64
+            # SVDWorkspace and the complex path has not been shown 0-alloc — asserting it here without
+            # that evidence would be guessing, so it stays an open item rather than a silent pass.
+            _strict_potrf_probe(bk, Awz3, Apdz)
+            _strict_getrf_probe(Awz3, Apdz, ipiv)
+            _strict_geqrf_probe(Awz3, Apdz, tauz)
         end
         # Trim-compatibility guarantee (contracts.jl): the complex unpacked gemm kernel is the trim-critical
         # path (its runtime bool→Val flags were the union-split that regressed zgemm_64_/cgemm_64_). Fast/dev
