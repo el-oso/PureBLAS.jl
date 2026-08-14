@@ -4822,6 +4822,134 @@ function _ctrgemm_3m!(up::Bool, conjX::Bool, conjY::Bool, tXp::Bool, tYp::Bool, 
     end
     return C
 end
+# ── FUSED Karatsuba-3M rank-k: split INTO the pack, combine INTO the tile write-back ───────────────
+# WHY THIS EXISTS: `_ctrgemm_3m!` above is correct but carries TWO O(n²)-class passes that the packed
+# complex baseline does not — `_split3!` (read 2nk, write 3nk, which `_trgemm_packed!` then re-reads)
+# and three full n×n P arrays that are RMW'd once per kc-slice and read again by `_combine3_tri!`.
+# Those passes are the ENTIRE reason a size crossover exists: profitability is
+#     flop saving O(n²k)   vs   pass overhead O(n²),
+# so the ratio depends on n and a threshold appears. Locating that threshold turned out to be
+# underivable — it carries Δrate = 1/R_complex − 3/(4·R_real), a ratio of OUR OWN two microkernels'
+# rates (the complex kernel is latency-bound on AVX2 and throughput-bound on AVX-512), which no
+# cache/ISA constant predicts. Measured 3m/packed crossovers: ≈64-96 on Zen4 (W=8), ≈130-190 on Zen3
+# (W=4) — opposite in sign to every throughput model, and `768/W` fits both points with no criterion,
+# which req#8b classifies as a violation rather than a derivation.
+# So REMOVE the term instead of predicting it. With both passes fused there is no O(n²) cost left to
+# form a ratio against O(n²k), and profitability becomes n-INDEPENDENT — the same on/off question
+# `_CGEMM_3M` already answers. That deletes `_CSYRK_3M_MIN` as a size knob for a structural reason.
+#
+# HOW THE SPLIT FUSES FOR FREE: `_pack_A_cmplx!`/`_pack_B_cmplx!` (gemm.jl) ALREADY deinterleave complex
+# input into two REAL panels in one pass, in the same panel layout the real microkernel indexes. The
+# third Karatsuba panel is S = R ± I, so it is derived from the PACKED panels — contiguous and
+# cache-resident — by `_pack3_finish!` below, rather than by a second strided pass over the operand.
+# That also means the existing SIMD pack kernels are reused untouched. The conj (herk's ᴴ) folds in
+# here exactly as `_split3!`'s flag did: negate the I panel, then S = R + I.
+#
+# HOW THE COMBINE FUSES: `_combine3_tri!` is POINTWISE-LINEAR in P1/P2/P3, so it distributes over both
+# kc-slices and tiles. The three n×n P arrays collapse to one mr×nr tile scratch; `_microkernel!` takes
+# a raw pointer and arbitrary ldc, so that scratch is a legal target. C is then touched exactly once per
+# tile per kc-slice — strictly LESS traffic than the P-array RMW plus the final combine pass.
+# The triangle restriction moves OUT of the microkernel store (no `_microkernel_tri!`) and INTO the
+# combine bounds, so straddling tiles compute a full mre×nre product and mask only when writing C.
+#
+# SAFETY FLOOR: identical kernels to `_ctrgemm_3m!` with strictly less memory traffic, so it cannot be
+# slower than the unfused 3M at any n. "Wins at every n" is a STRUCTURAL argument, not a measurement —
+# the tile round-trip costs ~2/kce extra L1 ops per FMA (n-independent, ≤12.5% at `_CGEMM_3M_KMIN`=16,
+# <1% at kc=256) and the unpacked-vs-fused boundary on AVX-512 is a separate A/B.
+@inline function _pack3_finish!(pR::Ptr{T}, pI::Ptr{T}, pS::Ptr{T}, len::Int, cj::Bool) where {T}
+    if cj                                   # conjugated operand: I := -I, then S = R + I
+        @inbounds @simd ivdep for i in 1:len
+            r = unsafe_load(pR, i); v = -unsafe_load(pI, i)
+            unsafe_store!(pI, v, i); unsafe_store!(pS, r + v, i)
+        end
+    else
+        @inbounds @simd ivdep for i in 1:len
+            unsafe_store!(pS, unsafe_load(pR, i) + unsafe_load(pI, i), i)
+        end
+    end
+    return
+end
+# Combine one mre×nre tile of the three real products into complex C, masked to the `up` triangle.
+# C is read as interleaved Tr pairs: element (r,c) sits at ((c)*ldc + r)*2 (0-based) in Tr units.
+@inline function _combine3_tile!(
+        Cp0::Ptr{Tr}, ldc::Int, p1::Ptr{Tr}, p2::Ptr{Tr}, p3::Ptr{Tr}, ldt::Int,
+        mre::Int, nre::Int, r0::Int, c0::Int, up::Bool, ar::Tr, ai::Tr
+    ) where {Tr}
+    d = c0 - r0
+    @inbounds for j in 0:(nre - 1)
+        lo = up ? 0 : max(0, d + j)          # up: keep row ≤ col ⇒ i ≤ d+j;  lo: keep row ≥ col ⇒ i ≥ d+j
+        hi = up ? min(mre - 1, d + j) : mre - 1
+        lo > hi && continue
+        cb = (r0 + (c0 + j) * ldc) * 2; tb = j * ldt
+        @simd for i in lo:hi
+            a = unsafe_load(p1, tb + i + 1); b = unsafe_load(p2, tb + i + 1)
+            zr = a - b; zi = unsafe_load(p3, tb + i + 1) - a - b
+            or = unsafe_load(Cp0, cb + 2i + 1); oi = unsafe_load(Cp0, cb + 2i + 2)
+            unsafe_store!(Cp0, or + ar * zr - ai * zi, cb + 2i + 1)
+            unsafe_store!(Cp0, oi + ar * zi + ai * zr, cb + 2i + 2)
+        end
+    end
+    return
+end
+function _ctrgemm_3m_fused!(
+        ::Val{MR}, ::Val{NR}, up::Bool, conjX::Bool, conjY::Bool,
+        tXp::Bool, tYp::Bool, α::Tc, X, Y, C, k::Int
+    ) where {Tc, MR, NR}
+    Tr = real(Tc); n = size(C, 1); W = _vwidth(Tr); mr = MR * W; nr = NR
+    kc = min(_KC, k); mc = _at_mc_kc(_HW, Tr, kc, mr, cld(n, mr) * mr)
+    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    lenA = cld(mc, mr) * mr * kc; lenB = cld(nc, nr) * nr * kc
+    t = _gemm_3m_scratch(Tr, lenA, lenB, mr * nr)   # 1-3 A panels, 4-6 B panels, 7-9 tile scratch
+    ldc = stride(C, 2); sz = sizeof(Tr); ar = real(α); ai = imag(α)
+    GC.@preserve C t begin
+        Cp0 = Ptr{Tr}(pointer(C))
+        pAR = pointer(t[1]); pAI = pointer(t[2]); pAS = pointer(t[3])
+        pBR = pointer(t[4]); pBI = pointer(t[5]); pBS = pointer(t[6])
+        pT1 = pointer(t[7]); pT2 = pointer(t[8]); pT3 = pointer(t[9])
+        jc = 0
+        while jc < n
+            nce = min(nc, n - jc); pc = 0
+            while pc < k
+                kce = min(kc, k - pc)
+                _pack_B_cmplx!(t[4], t[5], Y, pc, jc, kce, nce, tYp, nr)
+                _pack3_finish!(pBR, pBI, pBS, cld(nce, nr) * nr * kce, conjY)
+                ic = 0
+                while ic < n
+                    mce = min(mc, n - ic)
+                    _pack_A_cmplx!(t[1], t[2], X, ic, pc, mce, kce, tXp, mr)
+                    _pack3_finish!(pAR, pAI, pAS, cld(mce, mr) * mr * kce, conjX)
+                    jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ir = 0
+                        while ir < mce
+                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+                            if !skip
+                                ao = (div(ir, mr) * mr * kce) * sz; bo = (div(jr, nr) * nr * kce) * sz
+                                if mre == mr && nre == nr        # triangle masking happens in the combine
+                                    _microkernel!(pT1, mr, pAR + ao, pBR + bo, kce, Val(MR), Val(NR), Val(true))
+                                    _microkernel!(pT2, mr, pAI + ao, pBI + bo, kce, Val(MR), Val(NR), Val(true))
+                                    _microkernel!(pT3, mr, pAS + ao, pBS + bo, kce, Val(MR), Val(NR), Val(true))
+                                else
+                                    _microkernel_masked!(pT1, mr, pAR + ao, pBR + bo, kce, mre, nre, Val(MR), Val(NR), Val(true))
+                                    _microkernel_masked!(pT2, mr, pAI + ao, pBI + bo, kce, mre, nre, Val(MR), Val(NR), Val(true))
+                                    _microkernel_masked!(pT3, mr, pAS + ao, pBS + bo, kce, mre, nre, Val(MR), Val(NR), Val(true))
+                                end
+                                _combine3_tile!(Cp0, ldc, pT1, pT2, pT3, mr, mre, nre, r0, c0, up, ar, ai)
+                            end
+                            ir += mr
+                        end
+                        jr += nr
+                    end
+                    ic += mc
+                end
+                pc += kc
+            end
+            jc += nc
+        end
+    end
+    return C
+end
 # ONE triangular-C complex product C[tri] += α·op(X)·op(Y)ᴴ (skip/full/tri tiles). herm conjugates the
 # ᴴ operand (tr='N' → Y via SB=-1; tr='C' → X via SA=-1); syrk conjugates neither. syrk/herk pass X=Y=A;
 # syr2k/her2k call twice (A,B then B,A). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc.
@@ -4841,15 +4969,26 @@ end
     #     zher2k    1.000   0.870  0.933  0.867  0.824
     # (* = CONTROL below `_CSYRK_3M_MIN`=256; all four tie at exactly 1.000 with relerr 0, proving the
     # arm was live.) `_EXPFLAG[_EXP11]` is INVERTED: 3M ships ON, the flag disables it for A/B.
-    # `_EXPFLAG[_EXP13]` lowers the rank-k 3M edge to gemm's own `_CGEMM_3M_MIN` — the A/B partner of
-    # the unpack bypass in `_syrk_blocked!`/`syr2k!`/`her2k!`. `_CSYRK_3M_MIN`=256 was set on AVX2 with
-    # no W=8 data, exactly like the width gate that was just deleted.
+    # `_EXPFLAG[_EXP15]` lowers the rank-k 3M edge to gemm's own `_CGEMM_3M_MIN`. It is SEPARATE from
+    # `_EXP13` (which only bypasses the unpacked branch) so the three arms can be measured independently:
+    #   neither          -> unpacked  (Zen4 n≤192) or packed (Zen3 n>16)
+    #   _EXP13           -> packed    on BOTH boxes
+    #   _EXP13+_EXP15    -> 3M        on both boxes
+    # That separation is the point: with one combined flag, Zen4 compared 3M-vs-UNPACKED while Zen3
+    # compared 3M-vs-PACKED, so the two "crossovers" (≈96-128 vs ≈192) were different trades and any
+    # formula fitted across them would encode the baseline difference, not physics.
     if _CGEMM_3M && !_EXPFLAG[_EXP11] &&
-            (_EXPFLAG[_EXP13] ? _CGEMM_3M_MIN : _CSYRK_3M_MIN) <= n <= _CGEMM_3M_MAX &&
+            (_EXPFLAG[_EXP15] ? _CGEMM_3M_MIN : _CSYRK_3M_MIN) <= n <= _CGEMM_3M_MAX &&
             k >= _CGEMM_3M_KMIN
         # large-n: Karatsuba-3M (the complex tri kernels plateau ~0.92 here). herk conjugates op(X) at
         # tr='C' (SA=-1) / op(Y) at tr='N' (SB=-1); syrk conjugates neither. tXp=tr, tYp=!tr.
-        return _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
+        # `_EXPFLAG[_EXP16]` selects the FUSED driver (split folded into the pack, combine folded into
+        # the tile write-back) — the arm that is supposed to remove the size crossover entirely.
+        Tr = real(T)
+        return _EXPFLAG[_EXP16] ?
+            _ctrgemm_3m_fused!(Val(_tri_mr(Tr)), Val(_NR), up, herm && tr, herm && !tr, tr, !tr,
+                Complex(alr, ali), X, Y, C, k) :
+            _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
     end
     if X === Y && _vwidth(T) == 4 && n <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
         return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
