@@ -2885,7 +2885,15 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          not because it lost, but because it compiled to a BYTE-IDENTICAL loop: LLVM already emits
 #          vfnmadd there (that kernel's negated splat is used TWICE, `_zrt_tile!`'s was used once).
 #          See the `_zgt_slab!` header. Do not re-run the sibling audit on this kernel.
-#   _EXP16 free — was the `_trsm_cgt_L!` witness during the same campaign; stripped when it landed.
+#   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
+#          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
+#          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
+#          Previously the `_trsm_cgt_L!` witness; stripped when that landed.
+#   (_EXP13 and _EXP15 were reused for the 3M band campaign — _EXP13 bypassed the unpacked branch,
+#    _EXP15 lowered the rank-k 3M edge — and are FREE AGAIN. Both were needed at once: with a single
+#    combined flag Zen4 compared 3M-vs-UNPACKED while Zen3 compared 3M-vs-PACKED, so the two apparent
+#    "crossovers" were different trades. Splitting them is what showed the fitted 768/W was encoding a
+#    baseline difference rather than physics. Keep that separation if the band is ever re-opened.)
 
 # ILP LEVER (_EXP7) — TWO STRIPES INTERLEAVED, one body per slab index.
 # At n = NR + W (the gate cell: 24 + 8 = 32) the leaf currently solves stripe0 then stripe1 SEQUENTIALLY,
@@ -4766,12 +4774,37 @@ end
 # blocked multi path at n≥1024 (1024 0.937 vs multi 0.948) — hand large-n back to multi. AVX-512 → 0.
 const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64) == 4 ? 512 : 0)::Int
 # n at/above which the complex rank-k product uses Karatsuba-3M (3 REAL tri-output products on split re/im).
-# Both complex tri kernels (unified NR=4, multi NR=6) plateau at 0.88-0.96 for n≥256 on AVX2 — the 4-FMA
-# complex microkernel's per-flop ceiling, the SAME one zgemm sidesteps with 3M (which gates 1.1-1.2 at
-# these sizes). 3M runs the gating real _trgemm_packed! at 25% fewer flops. AVX2-only (`_CGEMM_3M`);
-# windowed to [_CSYRK_3M_MIN, _CGEMM_3M_MAX] with k ≥ _CGEMM_3M_KMIN. Knob per box; retune the unified cap
-# to meet this after measuring. AVX-512 keeps the multi path (already gates 1.02-1.23).
-const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 256)::Int
+# 3M runs the gating real `_trgemm_packed!` machinery at 25% fewer flops; windowed to
+# [_CSYRK_3M_MIN, _CGEMM_3M_MAX] with k ≥ _CGEMM_3M_KMIN.
+#
+# THIS IS A LITERAL, AND IT IS LABELLED ONE — read the history before changing it.
+# It was 256, set on AVX2 with no AVX-512 data. Lowering it alone was a DEAD KNOB: for trans='N' the
+# unpacked branch is tested first, and with `_CSYRK_UNPACK_MAX`=192 on W=8 the 3M route was unreachable
+# below 192 (that shadowing is now removed — see `_ctrk_3m_ok`).
+# The honest attempt to DERIVE it failed, twice, and the record matters more than the number:
+#   * The crossover carries Δrate = 1/R_complex − 3/(4·R_real), a ratio of OUR OWN two microkernels
+#     (complex is latency-bound on AVX2, throughput-bound on AVX-512). No cache/ISA constant predicts it.
+#   * Measured crossovers moved OPPOSITE to every throughput model (Zen4 lower than Zen3, W=8 vs W=4).
+#     `768/W` fit both points with no physical criterion — req#8b calls that a violation, not a Derive.
+# FUSION CHANGED THE SITUATION but did NOT remove the threshold, and the reason is structural: fusing
+# the split into the pack and the combine into the tile write-back removes both O(n²) PASSES, but the
+# PACK ITSELF is O(nk) and 3M packs THREE panels where the complex baseline packs two. That +50% is
+# O(nk) against O(n²k) of product, so overhead-per-flop still falls as 1/n. Three real products
+# structurally require three real panels; the term cannot be removed.
+# WHAT FUSION DID BUY: the crossover fell from ≈160 to ≈112 on Zen3 and below 64 on Zen4, so ONE value
+# now serves both boxes — which was previously impossible (128 would have cost Zen3's zherk@128 8.2%).
+# Measured fused/packed, freq-locked, k=n (bench/probes/sk13_fused_arm.jl):
+#     n            64      96      128     192
+#     Zen4 zsyrk  0.930   0.902   0.886   0.860      Zen3 zsyrk  1.099  1.018  0.956  0.903
+#     Zen4 zherk  0.931   0.908   0.887   0.854      Zen3 zherk  1.106  1.021  0.963  0.909
+# 128 is the smallest ladder point where BOTH boxes win. Zen4 forgoes its n=64/96 gains, which are not
+# gate sizes. Re-measure both boxes before moving it; a value that helps one box and hurts the other is
+# exactly what this constant existed to avoid.
+const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 128)::Int
+# Does the rank-k 3M window apply? Hoisted so the unpacked branch can YIELD to it — without this the
+# unpacked path shadows 3M entirely for trans='N' at n ≤ _CSYRK_UNPACK_MAX (192 on AVX-512).
+@inline _ctrk_3m_ok(n::Int, k::Int) =
+    _CGEMM_3M && _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
 
 # C[tri] += α·(P1−P2 + i·(P3−P1−P2)) — triangular RMW combine of the 3 real Karatsuba products (caller
 # pre-scaled β·C). Mirror of _combine3! (gemm.jl) restricted to the stored triangle (loop bounds only;
@@ -4969,26 +5002,18 @@ end
     #     zher2k    1.000   0.870  0.933  0.867  0.824
     # (* = CONTROL below `_CSYRK_3M_MIN`=256; all four tie at exactly 1.000 with relerr 0, proving the
     # arm was live.) `_EXPFLAG[_EXP11]` is INVERTED: 3M ships ON, the flag disables it for A/B.
-    # `_EXPFLAG[_EXP15]` lowers the rank-k 3M edge to gemm's own `_CGEMM_3M_MIN`. It is SEPARATE from
-    # `_EXP13` (which only bypasses the unpacked branch) so the three arms can be measured independently:
-    #   neither          -> unpacked  (Zen4 n≤192) or packed (Zen3 n>16)
-    #   _EXP13           -> packed    on BOTH boxes
-    #   _EXP13+_EXP15    -> 3M        on both boxes
-    # That separation is the point: with one combined flag, Zen4 compared 3M-vs-UNPACKED while Zen3
-    # compared 3M-vs-PACKED, so the two "crossovers" (≈96-128 vs ≈192) were different trades and any
-    # formula fitted across them would encode the baseline difference, not physics.
-    if _CGEMM_3M && !_EXPFLAG[_EXP11] &&
-            (_EXPFLAG[_EXP15] ? _CGEMM_3M_MIN : _CSYRK_3M_MIN) <= n <= _CGEMM_3M_MAX &&
-            k >= _CGEMM_3M_KMIN
+    if !_EXPFLAG[_EXP11] && _ctrk_3m_ok(n, k)
         # large-n: Karatsuba-3M (the complex tri kernels plateau ~0.92 here). herk conjugates op(X) at
         # tr='C' (SA=-1) / op(Y) at tr='N' (SB=-1); syrk conjugates neither. tXp=tr, tYp=!tr.
-        # `_EXPFLAG[_EXP16]` selects the FUSED driver (split folded into the pack, combine folded into
-        # the tile write-back) — the arm that is supposed to remove the size crossover entirely.
+        # The FUSED driver SHIPS (split folded into the pack, combine folded into the tile write-back);
+        # `_EXPFLAG[_EXP16]` is INVERTED and selects the old unfused `_ctrgemm_3m!`, kept A/B-able
+        # in-process because Zen5 has not been measured. Fused is never slower than unfused — same
+        # kernels, strictly less traffic — measured fused/unfused 0.83-1.00 across both boxes.
         Tr = real(T)
         return _EXPFLAG[_EXP16] ?
+            _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k) :
             _ctrgemm_3m_fused!(Val(_tri_mr(Tr)), Val(_NR), up, herm && tr, herm && !tr, tr, !tr,
-                Complex(alr, ali), X, Y, C, k) :
-            _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
+                Complex(alr, ali), X, Y, C, k)
     end
     if X === Y && _vwidth(T) == 4 && n <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
         return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
@@ -5410,12 +5435,10 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
         return _syrk_packed!(up, tr, convert(T, α), A, C, k)
     elseif T <: Union{ComplexF64, ComplexF32} && k > 0
         n = size(C, 1)
-        # `_EXPFLAG[_EXP13]` — A/B arm for "let the 3M window win over the unpacked branch". For
-        # trans='N' this branch is tested BEFORE the packed path, and 3M lives inside `_csyrk_packed!`
-        # → `_ctrgemm_prod!`, so with `_CSYRK_UNPACK_MAX`=192 on AVX-512 the 3M route is UNREACHABLE at
-        # n≤192 and lowering `_CSYRK_3M_MIN` alone would be a dead knob. The flag also lowers that edge
-        # (see `_ctrgemm_prod!`), so the two halves are tested together — separately, neither moves.
-        if !tr && n <= _CSYRK_UNPACK_MAX && !_EXPFLAG[_EXP13]
+        # The unpacked branch YIELDS to the 3M window. It is tested before the packed path, and 3M lives
+        # inside `_csyrk_packed!` → `_ctrgemm_prod!`, so without this `_CSYRK_UNPACK_MAX`=192 shadowed
+        # 3M entirely below 192 on AVX-512 and lowering `_CSYRK_3M_MIN` was a dead knob.
+        if !tr && n <= _CSYRK_UNPACK_MAX && !_ctrk_3m_ok(n, k)
             return _ctri_unpacked!(up, herm, α, A, C, k)
         elseif n > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
             return _csyrk_packed!(up, tr, herm, α, A, C, k)
@@ -6112,7 +6135,7 @@ function syr2k!(
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
-    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_EXPFLAG[_EXP13]
+    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
         _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
         _ctri2_unpacked!(up, false, alpha, A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
@@ -6130,7 +6153,7 @@ function her2k!(
     )
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
-    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_EXPFLAG[_EXP13]
+    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
         return (_ctri2_unpacked!(up, true, alpha, A, Bm, C, k); C)     # small-n trans='N': unpacked-tri (2 products)
     elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
