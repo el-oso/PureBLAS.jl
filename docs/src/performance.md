@@ -308,9 +308,36 @@ addressing population (recomputed `(jc + c)·ldb` products) was worth 3.0% at n=
 contrast `symm` ≥ 256 and `trsmR` ≥ 2048 miss on Zen4/Zen3 but *gate* on Zen5, so those are
 µarch-specific.
 
-Complex BLAS-3 is further out and loses to AOCL almost across the board — `zgemm` 0.922, `zsyrk`
-0.941, `zher2k` 0.908, `zsyr2k` 0.894, `ztrmm` 0.943 — with `ztrsm` (1.067) the one that gates, and
-`ztrmmR` now within reach at 0.969 after the full-tile dispatch fix.
+Complex BLAS-3 **was** further out and lost to AOCL almost across the board — `zgemm` 0.922, `zsyrk`
+0.941, `zher2k` 0.908, `zsyr2k` 0.894, `ztrmm` 0.943, with only `ztrsm` gating. The cause was one
+routing constant, and it is worth recording because the evidence for it had been sitting in the
+repository for a month.
+
+`zsyrk`/`zherk`/`zsyr2k`/`zher2k` read 0.94–0.99 against AOCL on Zen4 while **the same source** read
+1.19–1.31 on Zen3. That inversion is not a microarchitecture property: the source routed a different
+*algorithm* per SIMD width. The Karatsuba-3M route — three **real** products on the split real/imaginary
+parts, 25% fewer flops than the direct four-FMA complex kernel — was enabled only for `_vwidth == 4`.
+Zen3 got the flop cut; Zen4 did not. The default's own comment said AVX-512 was *"untested"*, not
+falsified, and the internal notes listed "3M on AVX512" under **unbuilt** levers with the prediction
+that it would win there too "via the flop cut, since AVX512 complex is throughput- not latency-bound".
+
+It does, and the width test was deleted rather than retuned. Nothing physical made it width-dependent:
+the 25% reduction is algebraic, and 3M's split/combine overhead is O(n²) against O(n²·k) of product,
+which the existing size window already bounds — so the test was an artefact of only ever having
+measured AVX2, and removing it takes out a hardware-gated literal instead of adding a tuning knob.
+Measured in-process (Zen4, 3M/direct, so lower is faster): `zgemm` 0.797/0.787/0.818/0.801/0.800 at
+n=128…2048, rank-k 0.81–0.95. On the gate that is `zgemm` 0.952 → **1.213** at n=128 and 1.000 →
+**1.255** at 2048, `zsyrk` 0.958 → **1.133** at 512, and every complex rank-k cell at n ≥ 256 converted.
+
+The **secondary** effect is larger than the primary one: everything layered on complex gemm moved
+without being touched — `zhemm` 1.004 → **1.136**, `zsymm` 0.994 → **1.146**, `zherk` 0.982 → **1.053**,
+`ztrsmR` 0.987 → **1.084**, `ztrmmR` 0.969 → **1.005**, `ztrsm` 1.067 → **1.095**. Zen3, which already
+ran 3M, is flat across the same sweep — which is the control that says the change did one thing only.
+
+What is left is entirely **small-n and outside the 3M window**: `zsyrk` 0.894 (n=128), `zsyr2k` 0.900,
+`zher2k` 0.912 (n=32), `ztrmm` 0.975, and `zgemm` 0.910 at n=32 — below the window's lower edge, so
+this lever cannot reach it. Those edges (48 for gemm, 256 for rank-k) were themselves set on AVX2 with
+no AVX-512 measurement behind them, which is the next thing to check rather than a new kernel.
 
 `symm`/`hemm` are the exception, and the reason is worth recording. Complex symm used to materialize a
 dense n×n copy of the symmetric operand and call gemm; complex hemm avoided the copy but ran through a
@@ -323,8 +350,10 @@ at n=128/256/512/1024 to 1.026/1.017/1.004/1.002. On Zen4 `zhemm` now gates at e
 round-to-round spread; on Zen3 both gate across 128–2048 at 1.18–1.28. What is left in this family is
 tiny-n — n=8 and n=32, below the packing cut, still on the copy path — and real `symm` at n≥256, whose
 packed path has not yet had the same β=0 fold applied.
-Here the engine itself (`zgemm`) misses, so it is a different problem from the real case and has to
-be fixed at the kernel before anything above it can convert.
+This family used to carry the caveat that the engine itself (`zgemm`) missed, so nothing above it could
+convert. That is no longer true above the 3M window's lower edge — `zhemm` and `zsymm` now gate at
+1.136/1.146 on Zen4 purely because the engine improved. It remains true *below* it: `zgemm` at n=32 is
+untouched, and the tiny-n `symm`/`hemm` cells sit on the copy path beneath the packing cut.
 
 ### Per microarchitecture
 

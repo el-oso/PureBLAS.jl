@@ -33,10 +33,13 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   machine-state drift, no stale-reference warnings and no preference pins on either box. Every cell in
   those two columns is therefore adjudicable against the code that ships at that commit.
   **Zen5 is offline and its whole column is stale at `2113738` (2026-08-09).** Its `ztrsmR` still reads
-  the pre-fix kernel, its `trmm` predates the derived crossover, and its `zpotrfU` **0.704 @ n=32** is
-  the widest such gap on the page — it predates the `_potf2_needs_buf` aliasing fix, which measured
-  0.695 → 0.993 on Zen4 and 0.765 → 1.145 on Zen3 at that exact cell. Those are stale numbers, not µarch
-  differences, and they will move when neuromancer returns. Per-cell provenance is stamped in
+  the pre-fix kernel, its `trmm` predates the derived crossover, and its `zpotrfU` **0.704 @ n=32**
+  predates the `_potf2_needs_buf` aliasing fix (measured 0.695 → 0.993 on Zen4 and 0.765 → 1.145 on Zen3
+  at that exact cell). **Its whole complex BLAS-3 block is also pre-3M**: Zen5 is AVX-512, so it is
+  affected by the same width gate Zen4 was, and its `zgemm`/`zsyrk`/`zhemm`/`zsymm`/`ztrsmR` cells will
+  move substantially when it returns — on Zen4 those went 0.952 → 1.213, 0.958 → 1.133, 1.004 → 1.136,
+  0.994 → 1.146 and 0.987 → 1.084. Read none of the Zen5 complex-L3 column as a µarch difference; it is
+  simply older code. Per-cell provenance is stamped in
   [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md).
 
   **Read a full re-sweep as ±1–2%, not as change.** Because this sweep re-measured both references as
@@ -163,17 +166,17 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>trmm</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
 <tr><th><code>trsm</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
 <tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.922</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.817</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zhemm</code></th><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.934</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.908</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zherk</code></th><td class="b2"><span class="v">0.981</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zsymm</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.893</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyrk</code></th><td class="b3"><span class="v">0.941</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
-<tr><th><code>ztrmm</code></th><td class="b3"><span class="v">0.943</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.902</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ztrmmR</code></th><td class="b2"><span class="v">0.969</span><span class="n">n=512</span></td><td class="b4"><span class="v">0.839</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.07</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>ztrsmR</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=512</span></td><td class="b3"><span class="v">0.934</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.812</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zhemm</code></th><td class="ok"><span class="v">1.14</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
+<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zherk</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zsymm</code></th><td class="ok"><span class="v">1.15</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.899</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zsyrk</code></th><td class="b3"><span class="v">0.893</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
+<tr><th><code>ztrmm</code></th><td class="b2"><span class="v">0.975</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.925</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
+<tr><th><code>ztrmmR</code></th><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.854</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.1</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>ztrsmR</code></th><td class="ok"><span class="v">1.08</span></td><td class="b3"><span class="v">0.938</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
 </tbody></table>
 ```
 

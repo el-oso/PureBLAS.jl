@@ -46,6 +46,21 @@ demonstrated.
 
 ### Changed
 
+- **Karatsuba-3M is no longer restricted to AVX2, and complex BLAS-3 on AVX-512 moves with it.** The
+  3M route — three *real* products on the split real/imaginary parts, 25% fewer flops than the direct
+  four-FMA complex kernel — was gated on `_vwidth == 4`. That is why complex rank-k read 0.94–0.99 vs
+  AOCL on Zen4 while **the same source** read 1.19–1.31 on Zen3: not a microarchitecture difference,
+  a different algorithm per SIMD width. The gate's own comment recorded AVX-512 as *untested* rather
+  than falsified. Nothing physical made it width-dependent — the flop cut is algebraic and 3M's
+  split/combine cost is O(n²) against O(n²·k), already bounded by the existing size window — so the
+  test is **deleted**, removing a hardware-gated literal rather than adding a tuning knob.
+  Zen4 gate: `zgemm` 0.952 → **1.213** (n=128) and 1.000 → **1.255** (n=2048); `zsyrk` 0.958 →
+  **1.133** (n=512); every complex rank-k cell at n ≥ 256 converted. The knock-on is bigger than the
+  direct effect — untouched routines layered on complex gemm moved too: `zhemm` 1.004 → **1.136**,
+  `zsymm` 0.994 → **1.146**, `zherk` 0.982 → **1.053**, `ztrsmR` 0.987 → **1.084**, `ztrmmR` 0.969 →
+  **1.005**, `ztrsm` 1.067 → **1.095**. Zen3 is flat across the same sweep, which is the control: it
+  already ran 3M. Not addressed, because they sit outside the 3M size window: `zgemm` at n=32 (0.910),
+  and `zsyrk`/`zsyr2k`/`zher2k` at n≤128.
 - Complex `trmm`/`trmmR` dispatch unmasked kernels for full-height tiles, as the gemm sweep already
   did. Worth +16.7%/+13.1% at n=8/32 on Zen3 and +0.4–3.8% across n=8…128 on Zen4.
 
