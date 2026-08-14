@@ -1285,10 +1285,30 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 
 # Karatsuba 3M route for complex GEMM (see _gemm_3m!): 3 real gemms on split re/im, 25% fewer flops on
 # the gating real kernel. BEATS OB at mid-n on AVX2 where the 4-FMA complex kernel is latency-bound
-# (measured: 64×128×64 1.5×, 128³ 1.06×, 160³ 1.28×). Default ON for W=4 (AVX2 — the gap); OFF elsewhere
-# (Zen4/Zen5 complex kernel already near-peak; untested — Preferences-enable to try). Windowed to the
-# range where 3M's split/combine overhead is amortized; below _CGEMM_3M_MIN the blocked/unpacked paths win.
-const _CGEMM_3M = @load_preference("cgemm_3m", _W64 == 4)::Bool
+# (measured: 64×128×64 1.5×, 128³ 1.06×, 160³ 1.28×). Windowed to the range where 3M's split/combine
+# overhead is amortized; below _CGEMM_3M_MIN the blocked/unpacked paths win.
+#
+# WIDTH-INDEPENDENT (req#8). This defaulted to `_W64 == 4` — a datapath-gated literal, i.e. an
+# unconverted knob, and its own comment said AVX-512 was "untested", NOT falsified. The kb listed
+# "3M on AVX512" under `## Next algorithmic levers (unbuilt)` and predicted the outcome:
+# "likely wins there too via the flop cut, since AVX512 complex is throughput- not latency-bound"
+# (kb/findings/pureblas-strassen-3m-gemm.md:22,62). It does.
+#
+# There is no residency or latency criterion that would make this width-dependent: the 25% flop cut is
+# ALGEBRAIC, and the split/combine cost is O(n²) against O(n²·k) of product, which is exactly what the
+# MIN/MAX/KMIN window already bounds. So the width test was an artefact of only ever having measured
+# W=4, and removing it DELETES a datapath-gated literal rather than adding a knob.
+# Measured on wintermute (Zen4, W=8, freq-locked, in-process ABBA, 3m/base — bench/probes/sk2_*.jl):
+#     n        32*     64      128     256     512     1024    2048    4096*
+#     zgemm    0.999   0.872   0.797   0.787   0.818   0.801   0.800   1.002
+# (* = window-edge CONTROLS, outside MIN=48 / MAX=2048; both tie with relerr exactly 0, which is what
+# proves the arm was live — 3M re-associates, so an engaged arm CANNOT be bit-identical.)
+# Rank-k gains 15-23% on the same box (bench/probes/sk1_3m_avx512.jl); W=4 is unchanged — it already
+# ran 3M, which makes Zen3 the control for this change.
+# NOTE Zen5 is also W=8 and inherits this by formula, but is OFFLINE and therefore UNVALIDATED; the
+# `_EXP12`/`_EXP11` arms below are kept INVERTED (set true to DISABLE) so the old path stays A/B-able
+# in-process when it returns.
+const _CGEMM_3M = @load_preference("cgemm_3m", true)::Bool
 const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int    # max(m,n,k) ≥ this
 const _CGEMM_3M_MAX = @load_preference("cgemm_3m_max", 2048)::Int  # max(m,n,k) ≤ this
 const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) ≥ this (thin gemms: overhead dominates)
@@ -2542,7 +2562,10 @@ end
         if _strided1(A) && _strided1(B)
             rA = _root(A); rB = _root(B); rC = _root(C)
             GC.@preserve rA rB rC begin
-                if _CGEMM_3M && _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX &&
+                # `_EXPFLAG[_EXP12]` is INVERTED: 3M SHIPS ON, the flag DISABLES it, so the pre-3M
+                # AVX-512 path stays A/B-able in-process on a fleet box (Zen5 is still unvalidated).
+                if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
+                        _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX &&
                         min(m, n, k) >= _CGEMM_3M_KMIN
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                 elseif !tA && max(m, n, k) <= _CGEMM_UNPACK_MAX

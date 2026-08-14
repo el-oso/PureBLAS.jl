@@ -4831,7 +4831,18 @@ end
         alr::T, ali::T, X, Y, C, k::Int
     ) where {A1, NR, T}
     n = size(C, 1)
-    if _CGEMM_3M && _vwidth(T) == 4 && _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
+    # `_vwidth(T) == 4` REMOVED — see the derivation at `_CGEMM_3M` (gemm.jl): the 25% flop cut is
+    # algebraic, so nothing physical made this width-dependent; the test was an artefact of only ever
+    # having measured AVX2. Measured on Zen4 (W=8), 3m/base, bench/probes/sk1_3m_avx512.jl:
+    #     n         128*    256    512    1024   2048
+    #     zsyrk     1.000   0.842  0.874  0.832  0.811
+    #     zherk     1.000   0.869  0.945  0.868  0.824
+    #     zsyr2k    1.000   0.870  0.927  0.867  0.823
+    #     zher2k    1.000   0.870  0.933  0.867  0.824
+    # (* = CONTROL below `_CSYRK_3M_MIN`=256; all four tie at exactly 1.000 with relerr 0, proving the
+    # arm was live.) `_EXPFLAG[_EXP11]` is INVERTED: 3M ships ON, the flag disables it for A/B.
+    if _CGEMM_3M && !_EXPFLAG[_EXP11] &&
+            _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
         # large-n: Karatsuba-3M (the complex tri kernels plateau ~0.92 here). herk conjugates op(X) at
         # tr='C' (SA=-1) / op(Y) at tr='N' (SB=-1); syrk conjugates neither. tXp=tr, tYp=!tr.
         return _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k)
