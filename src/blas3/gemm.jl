@@ -2040,10 +2040,31 @@ end
     # crosses an unmapped page (flaky; reproduced via complex gebrd's trailing gemm). Same bug class as the
     # real path's direct-read fix — see kb `directb-masked-oob-guardpage`. The clamped column base is
     # loop-invariant, so hoist it out of the k-loop and add only the k-step inside.
-    for j in 1:NR
-        push!(body.args, :($(Symbol(:jc, j)) = jr + min($(j - 1), nre - 1)))
-        bbase = TB ? :(B + 2 * $(Symbol(:jc, j)) * $sz) : :(B + 2 * $(Symbol(:jc, j)) * ldb * $sz)
-        push!(body.args, :($(Symbol(:bb, j)) = $bbase))
+    # BOUNDARY LEAN (per-tile, not per-k). The clamped form costs one `min` AND one `imul` per column,
+    # every tile. On the FULL-COLUMN case (nre == NR) the clamp never bites, so the bases are simply
+    # consecutive columns — an arithmetic progression: ONE multiply, then adds. That case is the
+    # overwhelming majority (at n=32, NR=4 there are 8 full column-blocks and 0 partial ones).
+    # This matters because the per-tile boundary IS the tiny-n gap: on Zen3 at n=32 the shape is
+    # mr=4 x NR=4 => 64 tiles/call, math 256 cycles/tile, measured 380 => ~124 cycles/tile of boundary,
+    # ~33% of the hot call. AOCL's `bli_zgemmsup_rv_zen_asm_3x4m` runs ~15 cycles/tile with ZERO imul on
+    # its per-tile path, and 64 x the difference accounts for essentially the whole 17.9% Zen3 miss.
+    # NOT gated on `Val{FULL}`: FULL means all mr ROWS are valid (mre == mr) and says nothing about
+    # COLUMNS. A runtime branch on `nre` keeps this off the Val axis — an 11th Val would double an
+    # already 2^8-way specialization and feed straight into the pkgimage-size problem.
+    let fastb = quote end, slowb = quote end
+        for j in 1:NR
+            if j == 1
+                push!(fastb.args, :($(Symbol(:bb, 1)) =
+                    $(TB ? :(B + 2 * jr * $sz) : :(B + 2 * jr * ldb * $sz))))
+            else
+                push!(fastb.args, :($(Symbol(:bb, j)) = $(Symbol(:bb, 1)) + $(j - 1) * bstepc))
+            end
+            jcx = :(jr + min($(j - 1), nre - 1))
+            push!(slowb.args, :($(Symbol(:bb, j)) =
+                $(TB ? :(B + 2 * $jcx * $sz) : :(B + 2 * $jcx * ldb * $sz))))
+        end
+        push!(body.args, :(bstepc = $(TB ? :(2 * $sz) : :(2 * ldb * $sz))))
+        push!(body.args, Expr(:if, :(nre >= $NR), fastb, slowb))
     end
     for j in 1:NR
         bstep = TB ? :(2 * p * ldb * $sz) : :(2 * p * $sz)
@@ -2072,13 +2093,20 @@ end
     # the FMA's addend memory operand (β=1 costs 0 extra instructions — OB parity; not a separate load+add).
     (A1 && B0) || push!(body.args, :(avr = $V2W(alr)))                  # α_re broadcast (all but A1-overwrite)
     AR || push!(body.args, :(aialt = $V2W(ali) * $V2W($signt)))         # (−α_im,α_im,…): complex-α cross term
+    # BOUNDARY LEAN, epilogue side: the C address was recomputed per (mi,j) as
+    # `((jr + j-1)*ldc*2 + 2*(ir + (mi-1)*W)) * sz` — MR*NR multiplies by `ldc` per tile. Hoist the
+    # tile base and the column stride so the per-cell offsets are compile-time constants times one
+    # runtime stride, i.e. ONE multiply per tile instead of MR*NR. Bit-identical: the expression is
+    # just the same sum re-associated with the loop-invariant part factored out.
+    push!(body.args, :(cbase = C + ((jr * ldc + ir) * 2) * $sz))
+    push!(body.args, :(ldc2 = ldc * 2 * $sz))
     for j in 1:NR
         stores = quote end
         TRI && push!(stores.args, :(thr = d0 + $(j - 1)))               # tri-store threshold for this column
         for mi in 1:MR
             cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
             mk = TRI ? :mkl : Symbol(:m2, mi)                           # TRI ⇒ per-tile edge∧triangle mask (mkl)
-            q = :(C + ((jr + $(j - 1)) * ldc * 2 + 2 * (ir + $((mi - 1) * W))) * $sz)
+            q = :(cbase + $(j - 1) * ldc2 + $((mi - 1) * W * 2 * sz))
             vst(v) = FULL ? :(vstore($v, qq)) : :(vstore($v, qq, $mk))   # FULL ⇒ unmasked store/C-load
             cvl = FULL ? :(vload($V2W, qq)) : :(vload($V2W, qq, $mk))
             if B0 && A1                                                  # β=0, α=1: pure interleave store
