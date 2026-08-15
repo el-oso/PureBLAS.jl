@@ -61,6 +61,19 @@ demonstrated.
   **1.005**, `ztrsm` 1.067 → **1.095**. Zen3 is flat across the same sweep, which is the control: it
   already ran 3M. Not addressed, because they sit outside the 3M size window: `zgemm` at n=32 (0.910),
   and `zsyrk`/`zsyr2k`/`zher2k` at n≤128.
+- **Complex gemm's unpacked microkernel strength-reduces its per-tile addressing.** The B column bases
+  are an arithmetic progression on the full-column path (one multiply plus adds, rather than a `min`
+  and a multiply per column), and the C addresses use a hoisted tile base and column stride (one
+  multiply per tile instead of one per cell). Bit-identical — the same sum, re-associated with the
+  loop-invariant part factored out. Worth **~1.9% in the hot regime** at n=32 on Zen3, where the tile
+  count is highest (64 per call); **nothing in the cold regime**, which is what the gate scores, and
+  nothing measurable on Zen4 (16 tiles). Kept because PureBLAS's own LAPACK callers run hot — they
+  reuse their operands — but it moves no gate cell and none are re-published on its account.
+  Recorded alongside it: a **fused-m millikernel** (the m-loop moved inside the kernel, 64 calls → 8)
+  was built, verified across ~6000 shapes, measured at **2.4%** cold, and **reverted**. Eliminating
+  87.5% of the per-tile call overhead for 2.4% shows the call is worth ~10 cycles per tile rather than
+  the ~110 the boundary costs, so the remaining cost is inside the tile — most likely the epilogue,
+  which interleaves per cell with cross-lane shuffles where the reference combines once per tile.
 - **Complex rank-k fuses the Karatsuba split into the pack and the combine into the tile write-back.**
   3M previously paid two extra passes over the direct complex kernel: a strided split of the operands,
   and three full `n×n` product buffers read back by a separate combine. The third Karatsuba panel is
