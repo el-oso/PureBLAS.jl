@@ -2008,6 +2008,14 @@ end
     swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)                       # (1,0,3,2,…): swap re/im pairs
     signt = Expr(:tuple, (iseven(l) ? :(-one($T)) : :(one($T)) for l in 0:(2W - 1))...)  # (−1,1,−1,1,…)
     lanetuple = Expr(:tuple, (0:(2W - 1))...)
+    # NO `Expr(:meta, :inline)` here, DELIBERATELY — it was tried and measured NULL on this kernel
+    # (2026-08-15), unlike the `_deint_cmplx`/`_intlv_cmplx` generators above where it is load-bearing.
+    # The hypothesis came from a static opcode histogram showing 6 `pop` + 30 `mov` outside the k-loop,
+    # read as "the microkernel is not inlined". That was an ARTIFACT: `code_native` compiles the function
+    # STANDALONE, so it always emits a full register save/restore frame regardless of how it is inlined
+    # at its real call sites. Adding the meta moved zgemm@32 by 0.2% (6.563 → 6.552 µs) and made n=24/40
+    # slightly worse. Do not re-add it without a live A/B — and do not read a standalone disassembly as
+    # evidence about the shipped call graph.
     body = quote end
     # FULL (all mr rows valid): unmasked loads/stores — drops a vmaskmov from the hot loop. Edge tiles mask.
     FULL || push!(body.args, :(lanes2 = Vec{$(2W), Int}($lanetuple)))
@@ -2204,7 +2212,19 @@ function _gemm_cmplx_unpacked!(
     parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
     GC.@preserve parA parB parC begin
         Ap = Ptr{T}(pointer(A)); Bp = Ptr{T}(pointer(B)); Cp = Ptr{T}(pointer(C))
-        if max(m, n, k) >= _CUKER_NR6_MIN         # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
+        # `_EXPINT[3]` — NR A/B arm. On AVX-512 `_CNR`=4 and `_CUKER_NR6_MIN`=typemax, so the wider
+        # NR=6 tile is DISABLED there and every complex unpacked call runs a 16×4 tile: only
+        # 2·(mr/W)·NR = 16 accumulators of the 32 available, and n/NR column-blocks each re-reading A.
+        # At the failing `zgemm@32` cell that is 8 passes over A. Branch into LITERAL Vals (trim-safe;
+        # `Val(_EXPINT[3])` would be a runtime Val — see the pattern note at gemm.jl:707).
+        nrsel = @inbounds _EXPINT[3]
+        if nrsel == 6
+            _res_tb!(Val(6), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
+        elseif nrsel == 8
+            _res_tb!(Val(8), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
+        elseif nrsel == 12
+            _res_tb!(Val(12), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
+        elseif max(m, n, k) >= _CUKER_NR6_MIN     # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
             _res_tb!(Val(_CNR), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         else
             _res_tb!(Val(_CNR_SMALL), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
@@ -2578,6 +2598,13 @@ end
                         _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX &&
                         min(m, n, k) >= _CGEMM_3M_KMIN
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                    # `_CGEMM_UNPACK_MAX` is CORRECTLY placed for complex — do not re-chase it. Measured
+                    # packed/unpacked on Zen4 (bench/probes/zg2_unpacked_vs_packed.jl): 2.698 at n=8,
+                    # 1.483 / 1.662 / 1.237 / 1.336 at n=16/24/32/40, and 1.000 from 48 (where both arms
+                    # take 3M). The packed path is WORSE across the whole tiny band, so `zgemm@32`'s miss
+                    # vs AOCL (0.825 Zen3, 0.902 Zen4, matching OpenBLAS on both) is NOT a routing
+                    # problem. Its fixed-cost share is 4.5% at the gate shape (zg1_tiny_decomp.jl), so it
+                    # is not entry overhead either — the unpacked complex microkernel itself is the gap.
                 elseif !tA && max(m, n, k) <= _CGEMM_UNPACK_MAX
                     _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                 else
