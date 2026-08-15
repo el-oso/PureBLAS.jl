@@ -2141,6 +2141,113 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
 # TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
 # methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s ::Val{TB} through an untyped
 # arg is an "unresolved call" for --trim (the zgemm_64_/cgemm_64_ trim failure). Mirrors the real path.
+# ── FUSED-m MILLIKERNEL ───────────────────────────────────────────────────────────────────────────
+# The m-loop moves INSIDE the kernel, so a whole column-block costs ONE call instead of one per tile.
+#
+# WHY: the tiny-n gate cell is per-tile boundary cost, not the k-loop. Measured on Zen3 at n=32
+# (mr=4 x NR=4 => 64 tiles/call): math is 256 cycles/tile, wall is 380 => ~124 cycles/tile of boundary,
+# ~33% of the call. AOCL's `bli_zgemmsup_rv_zen_asm_3x4m` runs ~15 cycles/tile, and it gets there by
+# fusing its m-loop into the kernel — verified by disassembly, and 64 x the difference accounts for the
+# whole 17.9% Zen3 miss. Shaving the boundary in place was tried and is exhausted: strength-reducing the
+# per-tile B/C address multiplies bought ~1.9% hot and NOTHING cold (branch `uker-boundary-lean`).
+# What remains is structural — per call `_uker_sweep!` pays, PER TILE: `min`/`cld`, the FULL/masked
+# branch, marshalling a 25-argument call, and re-deriving the B column bases and alpha broadcasts that
+# are invariant across the whole column-block.
+#
+# WHAT IS HOISTED OUT OF THE ROW LOOP (all loop-invariant in ir): the NR B column bases, the alpha
+# broadcasts `avr`/`aialt`, and the C column stride. What stays per row-tile: accumulator init, the
+# k-reduction, and the store epilogue — those genuinely depend on ir.
+#
+# MILESTONE 1 SCOPE, deliberately narrow: FULL row tiles (mre == mr) and FULL column blocks
+# (nre == NR) only. That is exactly the failing shape — n=32 is divisible by mr and NR on BOTH boxes —
+# and it keeps every masked/partial/triangular path on the existing per-tile kernel, which is where the
+# OOB guards and the TRI logic live. The caller falls back for anything ragged.
+@generated function _uker_cmplx_m!(
+        C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir0::Int, nfull::Int,
+        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T,
+        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
+        ::Val{B0}, ::Val{A1}, ::Val{AR}
+    ) where {T, MR, NR, TB, SA, SB, B0, A1, AR}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}; V2W = Vec{2W, T}; mr = MR * W
+    ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
+    swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)
+    signt = Expr(:tuple, (iseven(l) ? :(-one($T)) : :(one($T)) for l in 0:(2W - 1))...)
+    body = quote end
+    # ── hoisted once per column-block ──
+    push!(body.args, :(bstepc = $(TB ? :(2 * $sz) : :(2 * ldb * $sz))))
+    push!(body.args, :($(Symbol(:bb, 1)) = $(TB ? :(B + 2 * jr * $sz) : :(B + 2 * jr * ldb * $sz))))
+    for j in 2:NR
+        push!(body.args, :($(Symbol(:bb, j)) = $(Symbol(:bb, 1)) + $(j - 1) * bstepc))
+    end
+    (A1 && B0) || push!(body.args, :(avr = $V2W(alr)))
+    AR || push!(body.args, :(aialt = $V2W(ali) * $V2W($signt)))
+    push!(body.args, :(ldc2 = ldc * 2 * $sz))
+    # ── per row-tile ──
+    tile = quote end
+    for mi in 1:MR, j in 1:NR
+        push!(tile.args, :($(Symbol(:cr, mi, :_, j)) = zero($V)))
+        push!(tile.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
+    end
+    inner = quote end
+    for mi in 1:MR
+        aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
+        push!(inner.args, :($(Symbol(:av, mi)) = vload($V2W, A + $aoff)))
+        push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
+    end
+    for j in 1:NR
+        bstep = TB ? :(2 * p * ldb * $sz) : :(2 * p * $sz)
+        push!(inner.args, :($(Symbol(:bp, j)) = $(Symbol(:bb, j)) + $bstep))
+        push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
+        push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
+        for mi in 1:MR
+            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+            arS = Symbol(:ar, mi); aiS = Symbol(:ai, mi); brS = Symbol(:br, j); biS = Symbol(:bi, j)
+            push!(inner.args, :($cr = muladd($arS, $brS, $cr)))
+            push!(inner.args, :($cr = muladd($(SA * SB == 1 ? :(-$aiS) : aiS), $biS, $cr)))
+            push!(inner.args, :($ci = muladd($(SB == 1 ? arS : :(-$arS)), $biS, $ci)))
+            push!(inner.args, :($ci = muladd($(SA == 1 ? aiS : :(-$aiS)), $brS, $ci)))
+        end
+    end
+    push!(tile.args, quote
+        @inbounds @simd ivdep for p in 0:(k - 1)
+            $inner
+        end
+    end)
+    push!(tile.args, :(cbase = C + ((jr * ldc + ir) * 2) * $sz))
+    for j in 1:NR, mi in 1:MR
+        cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+        q = :(cbase + $(j - 1) * ldc2 + $((mi - 1) * W * 2 * sz))
+        st = if B0 && A1
+            :(vstore(shufflevector($cr, $ci, Val($ilv)), qq))
+        elseif B0
+            AR ? :(vstore(avr * shufflevector($cr, $ci, Val($ilv)), qq)) :
+                :(let ziv = shufflevector($cr, $ci, Val($ilv))
+                    vstore(muladd(ziv, avr, shufflevector(ziv, Val($swp)) * aialt), qq)
+                end)
+        else
+            AR ? :(vstore(muladd(shufflevector($cr, $ci, Val($ilv)), avr, vload($V2W, qq)), qq)) :
+                :(let ziv = shufflevector($cr, $ci, Val($ilv))
+                    vstore(muladd(ziv, avr, muladd(shufflevector(ziv, Val($swp)), aialt, vload($V2W, qq))), qq)
+                end)
+        end
+        push!(tile.args, :(let qq = $q
+            $st
+        end))
+    end
+    # EXECUTION WITNESS (`_EXPINT[4]`): counts fused-kernel entries. Load-bearing during validation —
+    # the fused path computes the SAME FMAs in the SAME order as the per-tile path, so its output is
+    # bit-identical and correctness agreement proves NOTHING about whether it ran. Strip this before
+    # shipping (see the `_EXPINT`/witness note in level3.jl's registry).
+    push!(body.args, :(@inbounds _EXPINT[4] += 1))
+    push!(body.args, quote
+        @inbounds for ii in 0:(nfull - 1)
+            ir = ir0 + ii * $mr
+            $tile
+        end
+    end)
+    return body
+end
+
 @inline function _uker_sweep!(
         ::Val{NR}, Cp, ldc, Ap, lda, Bp, ldb, m::Int, n::Int, k::Int,
         alr, ali, W::Int, mr::Int, ::Val{TB}, ::Val{SA}, ::Val{SB},
@@ -2150,6 +2257,21 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
     while jr < n
         nre = min(NR, n - jr)
         ir = 0
+        # FUSED-m FAST PATH: a full column-block whose row range divides evenly into full tiles is the
+        # shape the gate cell hits (n=32 is divisible by mr and NR on every box). Run the whole column
+        # of tiles in ONE call so the B bases, alpha broadcasts and per-tile call marshalling are paid
+        # once instead of m/mr times. Everything ragged falls through to the per-tile loop below, which
+        # keeps the masked / partial / OOB-guarded paths exactly as they were.
+        # `mr == _CMR*W` guards that the sweep's runtime tile matches the `Val(_CMR)` the fused kernel is
+        # generated for (`_gemm_cmplx_unpacked!` always passes `mr = _CMR*W`, but the kernel is compiled
+        # against the Val, so assert it rather than assume). `MR` is NOT in scope here — the sweep takes
+        # `mr` at runtime and only `NR` as a Val.
+        if _EXPFLAG[_EXP13] && nre == NR && mr == _CMR * W && m >= mr
+            nfull = div(m, mr)
+            _uker_cmplx_m!(Cp, ldc, Ap, lda, 0, nfull, Bp, ldb, jr, k, alr, ali,
+                Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR))
+            ir = nfull * mr
+        end
         while ir < m
             mre = min(mr, m - ir)
             nrv = cld(mre, W)
