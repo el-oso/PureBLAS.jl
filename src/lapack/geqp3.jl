@@ -137,8 +137,8 @@ function geqp3!(
         tau::AbstractVector{T}
     ) where {T <: BlasFloat}
     m, n = size(A); k = min(m, n); R = real(T)
-    length(jpvt) >= n || throw(DimensionMismatch("geqp3!: length(jpvt) < n=$n"))
-    length(tau) >= k || throw(DimensionMismatch("geqp3!: length(tau) < min(size(A))=$k"))
+    length(jpvt) >= n || _throw_len_jpvt(:geqp3!, n)
+    length(tau) >= k || _throw_len_tau_mn(:geqp3!, k)
     @inbounds for j in 1:n
         jpvt[j] = j
     end

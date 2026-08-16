@@ -262,7 +262,7 @@ function _gbtrf_blocked!(
     # storage, so the factor is silently wrong rather than merely slow (verified: every nb > kl cell
     # diverges from _gbtf2!, every nb ≤ kl cell matches bit-exactly). `gbtrf!` gates on the stricter
     # kl ≥ 2·nb for performance reasons; this guard protects direct callers, including the tests.
-    nb <= KL || throw(ArgumentError("_gbtrf_blocked!: needs nb ≤ kl (got nb=$nb, kl=$KL)"))
+    nb <= KL || _throw_gbtrf_nb(nb, KL)
     kv = KU + KL
     mn = min(M, n)
     info = 0

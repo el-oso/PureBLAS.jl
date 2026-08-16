@@ -2647,6 +2647,16 @@ end
     end
     return C
 end
+# `lazy"…"` + `@noinline` for the same reasons as the shared throw helpers in core.jl — see the block
+# comment there for the root cause (≥4-arg `string(...)` despecialization under stock 1.13 inference,
+# and why `juliac`'s own build was never affected). These three take a single `Int` and so stayed under
+# the vararg threshold anyway, but they use `lazy"…"` too so the whole error surface is uniform and no
+# future edit that adds one more interpolation silently re-opens the issue.
+@noinline _throw_gemm_m(m::Int) = throw(DimensionMismatch(lazy"gemm!: op(A) rows ≠ size(C,1)=$m"))
+@noinline _throw_gemm_n(n::Int) = throw(DimensionMismatch(lazy"gemm!: op(B) cols ≠ size(C,2)=$n"))
+@noinline _throw_gemm_k(k::Int) =
+    throw(DimensionMismatch(lazy"gemm!: inner dimensions disagree (k=$k)"))
+
 function gemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N'
@@ -2655,12 +2665,9 @@ function gemm!(
     tA = transA != 'N'; tB = transB != 'N'
     m = size(C, 1); n = size(C, 2)
     k = tA ? size(A, 1) : size(A, 2)
-    (tA ? size(A, 2) : size(A, 1)) == m ||
-        throw(DimensionMismatch("gemm!: op(A) rows ≠ size(C,1)=$m"))
-    (tB ? size(B, 1) : size(B, 2)) == n ||
-        throw(DimensionMismatch("gemm!: op(B) cols ≠ size(C,2)=$n"))
-    (tB ? size(B, 2) : size(B, 1)) == k ||
-        throw(DimensionMismatch("gemm!: inner dimensions disagree (k=$k)"))
+    (tA ? size(A, 2) : size(A, 1)) == m || _throw_gemm_m(m)
+    (tB ? size(B, 1) : size(B, 2)) == n || _throw_gemm_n(n)
+    (tB ? size(B, 2) : size(B, 1)) == k || _throw_gemm_k(k)
     if T <: BlasFloat && C isa StridedMatrix && stride(C, 1) == 1
         _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
     else

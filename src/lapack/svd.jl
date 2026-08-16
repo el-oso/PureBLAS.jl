@@ -113,7 +113,7 @@ function gebd2!(
         tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}
     )
     m, n = size(A)
-    m >= n || throw(ArgumentError("gebd2!: requires m ≥ n (got $m×$n)"))
+    m >= n || _throw_mge_n(:gebd2!, m, n)
     @inbounds for i in 1:n
         xq = view(A, i:m, i)                      # left reflector zeros A[i+1:m, i]
         β, τq = _larfg!(xq)
@@ -209,7 +209,7 @@ function gebd2!(
         tauq::AbstractVector{T}, taup::AbstractVector{T}
     ) where {T <: Complex, R <: Real}
     m, n = size(A)
-    m >= n || throw(ArgumentError("gebd2!: requires m ≥ n (got $m×$n)"))
+    m >= n || _throw_mge_n(:gebd2!, m, n)
     @inbounds for i in 1:n
         β, τq = _larfg!(view(A, i:m, i))
         d[i] = β; tauq[i] = τq
@@ -661,7 +661,7 @@ function gebrd!(
         nb::Int = _brd_nb()
     )
     m, n = size(A)
-    m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
+    m >= n || _throw_mge_n(:gebrd!, m, n)
     k = n
     nx = nb
     if k <= nx || nb < 2
@@ -702,7 +702,7 @@ function gebrd!(
         taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _brd_nb()
     ) where {T <: Complex, R <: Real}
     m, n = size(A)
-    m >= n || throw(ArgumentError("gebrd!: requires m ≥ n (got $m×$n)"))
+    m >= n || _throw_mge_n(:gebrd!, m, n)
     k = n; nx = nb
     if k <= nx || nb < 2
         return gebd2!(A, d, e, tauq, taup)

@@ -92,7 +92,7 @@ function wy_apply!(
         trans::Char, C::AbstractMatrix{T}, Apanel::AbstractMatrix{T},
         Tm::AbstractMatrix{T}, ws::WYApplyWorkspace{T}
     ) where {T}
-    trans === 'N' || trans === 'T' || throw(ArgumentError("wy_apply!: trans must be 'N' or 'T', got $(repr(trans))"))
+    trans === 'N' || trans === 'T' || _throw_trans_nt(:wy_apply!, trans)
     m = size(Apanel, 1)
     bs = size(Apanel, 2)
     nc = size(C, 2)
