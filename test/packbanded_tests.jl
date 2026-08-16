@@ -95,9 +95,12 @@ end
 @testitem "gbmv wide-band vs OpenBLAS (conv path)" setup = [PackBand] begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B   # wide band (≥ SIMD width) exercises gbmv-T conv + per-column boundary
+    # ODD n included deliberately (added 2026-08-16). `_gbmv_n_simd!`'s wide-band path processes COLUMN
+    # PAIRS with a single-column remainder, and every n here used to be EVEN — so the remainder column
+    # was the one piece of the new loop no test could reach. 41/101/201 exercise it.
     @testset "$T $tr kl=$kl ku=$ku n=$n" for T in (Float32, Float64),
             tr in ('N', 'T'), (kl, ku) in ((7, 8), (15, 16), (31, 32), (63, 64), (95, 96)),
-            n in (40, 100, 200, 500)
+            n in (40, 41, 100, 101, 200, 201, 500)
 
         AB = randn(T, kl + ku + 1, n); x = randn(T, n); y0 = randn(T, n)
         for (al, be) in ((one(T), zero(T)), (T(0.7), T(1.3)))
@@ -107,11 +110,11 @@ end
         end
     end
 
-    # RECTANGULAR wide-band (added 2026-08-16). The block above is square-only, and that is exactly why
-    # the trans='T' conv-block OOB write survived: the two bounds on `chi` coincide when m == n, so no
-    # square shape can reach it. m > n is the case that writes past `y` (length n on 'T'); m < n adds
-    # the EMPTY-COLUMN suffix (columns j > m+ku, which exist only when n > m+ku) that the wide-band
-    # path had likewise never seen. Both directions, since they fail differently.
+    # RECTANGULAR wide-band (added 2026-08-16, same reason). The block above is square-only, so the
+    # EMPTY-COLUMN suffix — columns j > m+ku, which exist only when n > m+ku — never occurred on the
+    # wide-band path. That matters for the column-pair loop specifically: its skip guard has to stay
+    # PER COLUMN, because a guard hoisted to the pair would drop the live partner of the first empty
+    # column and silently lose a column of the product. m<n and m>n both, and odd n again.
     @testset "rect $T $tr $(m)x$(n) kl=$kl ku=$ku" for T in (Float32, Float64),
             tr in ('N', 'T'), (kl, ku) in ((15, 16), (31, 32)),
             (m, n) in ((40, 96), (96, 40), (40, 97), (97, 40))

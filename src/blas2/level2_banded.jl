@@ -47,16 +47,51 @@ end
 # 4-accumulator + horizontal-sum-of-zeros that's pure overhead for a sub-W dot; letting LLVM size the
 # reduction to the (tiny) band — scalar, no horizontal sum — is faster. (Wider band → `_dot_simd`.)
 # gbmv-N (y pre-scaled by β): conv kernel for narrow band, per-column axpy for wide.
+# One gbmv-N column: band-segment axpy of α·x[j] into y (mirrors `_gbt_one!` above). A plain `@inline`
+# function so EACH call site stamps its OWN copy of the body — which is the whole point of the pair
+# loop below. The `ihi < ilo` guard is PER COLUMN and must stay that way (see the comment there).
+@inline function _gbn_one!(
+        yp::Ptr{T}, Ap::Ptr{T}, xp::Ptr{T}, ldb::Int, sz::Int,
+        m::Int, kl::Int, ku::Int, α::T, j::Int
+    ) where {T <: BlasReal}
+    ilo = max(1, j - ku); ihi = min(m, j + kl)
+    ihi < ilo && return nothing
+    _axpy_simd!(ihi - ilo + 1, α * unsafe_load(xp, j),
+        Ap + ((ku + ilo - j) + (j - 1) * ldb) * sz, yp + (ilo - 1) * sz)
+    return nothing
+end
+
 @inline function _gbmv_n_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal}
     (kl + ku + 1) <= _GBMV_CONV_MAX && return _gbmv_conv!(m, n, kl, ku, α, AB, x, y)
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2); sz = sizeof(T)
-        @inbounds for j in 1:n
-            ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
-            len <= 0 && continue
-            segp = Ap + ((ku + ilo - j) + (j - 1) * ldb) * sz
-            _axpy_simd!(len, α * unsafe_load(xp, j), segp, yp + (ilo - 1) * sz)
+        # COLUMN-PAIR LOOP, DUPLICATED IN SOURCE (2026-08-16). LLVM 18 2×-unrolled the rolled form of
+        # this loop; LLVM 20's unroller declined, and that alone cost the AVX2 gate — galen `gbmvN`
+        # 1.06 → 0.96 vs the PINNED AOCL reference with this file untouched, per-size ratios flat in n
+        # (0.968…0.881), and the disassembly went 726 lines/30 FMAs (duplicated `.1` body) → 347/11.
+        # Two independent per-column chains are what the out-of-order core overlaps across the column
+        # boundary; one chain leaves the per-column latency exposed.
+        #
+        # Written as two CALLS rather than as an edge/interior split because `kl`/`ku` are runtime
+        # values: a split does NOT hand LLVM a constant-trip-count loop, it only removes the clamps and
+        # then hopes the unroller fires — the exact bet that just lost. Source-level duplication takes
+        # the unroller out of the equation; nothing in the default -O2/-O3 pipeline re-rolls it.
+        #
+        # The bodies are JUXTAPOSED, NEVER INTERLEAVED. Adjacent columns' band windows overlap in `y`
+        # and both read-modify-write it, so that overlap is a TRUE dependence: hand-pipelining the two
+        # inner loops, or putting `@simd ivdep` across the pair, is incorrect, not merely risky.
+        #
+        # Depth 2 is STRUCTURAL, not a PDM knob — it appears only as loop shape, never as a constant.
+        # The restored property ("≥2 independent chains") is binary rather than a tuned quantity, and 2
+        # is both the minimum that provides it and the depth LLVM 18's gating codegen proved on W=4 and
+        # W=8 alike. Going deeper would be a NEW optimisation and would need the Measure tier.
+        j = 1
+        @inbounds while j < n
+            _gbn_one!(yp, Ap, xp, ldb, sz, m, kl, ku, α, j)
+            _gbn_one!(yp, Ap, xp, ldb, sz, m, kl, ku, α, j + 1)
+            j += 2
         end
+        j == n && @inbounds _gbn_one!(yp, Ap, xp, ldb, sz, m, kl, ku, α, n)
     end
     return y
 end
