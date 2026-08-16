@@ -1868,10 +1868,16 @@ const _CGER_U = _NVREG >= 32 ? 2 : 1
 # A `Vec{lanes,T}` costs `lanes*sizeof(T) ÷ _SIMD_BYTES` native registers — 2 wide (lanes=2W), 1 narrow
 # (lanes=W). Per column: 2 coefficient vectors. Per unroll step: the x vector and its swap partner.
 # Reserve ~4 for addresses/temporaries.
+# THE Val LADDER, in one place (2026-08-16). `_ger_pdc_cj!` dispatches a COMPILE-TIME `Val` from a
+# RUNTIME np and its `else` arm is `Val(8)`, so any np the kernel has no arm for (3/5/6/7) strides by
+# np while writing 8 columns — off the end of A. Every np that reaches that kernel must therefore be
+# snapped DOWN to {1,2,4,8}. This lived as the same four-way ternary in two places; they must never
+# drift, so they now share one definition. `_snap_np(r) <= r` always (snap down, never up), which is
+# what keeps a snapped value inside whatever budget the caller computed.
+@inline _snap_np(r::Int) = r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1
 @inline _cger_np_max(half::Bool) = (
     v = half ? 1 : 2;
-    r = (_NVREG - 4 - 2 * _CGER_U * v) ÷ (2 * v);
-    r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1
+    _snap_np((_NVREG - 4 - 2 * _CGER_U * v) ÷ (2 * v))
 )
 const _CGER_NP_MAX_WIDE = _cger_np_max(false)
 const _CGER_NP_MAX_HALF = _cger_np_max(true)
@@ -1900,7 +1906,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # of two, so this is unreachable by default and only a hand-set `ger_panel_np` Preference selects it —
 # which is precisely why it must be clamped HERE, at the single point every caller resolves through,
 # rather than trusted to the candidate set. Same ladder as `_cger_np_max` so the two cannot drift.
-@inline _cger_np() = (r = min(_ger_np(), _CGER_NP_MAX_WIDE); r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1)
+@inline _cger_np() = _snap_np(min(_ger_np(), _CGER_NP_MAX_WIDE))
 # NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
