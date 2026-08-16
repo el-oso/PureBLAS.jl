@@ -22,8 +22,7 @@
 # min(m,n)).
 function gelsd!(A::AbstractMatrix{T}, B::AbstractMatrix{T}, rcond::Real) where {T <: BlasFloat}
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
-    size(B, 1) >= max(m, n) ||
-        throw(DimensionMismatch("gelsd!: size(B,1)=$(size(B, 1)) must be ≥ max(m,n)=$(max(m, n))"))
+    size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsd!, size(B, 1), max(m, n))
     s = Vector{R}(undef, mn)
     mn == 0 && return B, 0, s
     # economy SVD  A = U·diag(s)·Vᴴ  (U m×mn, s descending, Vt = Vᴴ mn×n)

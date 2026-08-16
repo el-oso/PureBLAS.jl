@@ -73,14 +73,13 @@ end
 
 function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: BlasFloat}
     trans === 'N' || trans === 'T' || trans === 'C' ||
-        throw(ArgumentError("gels!: trans must be 'N', 'T' or 'C', got $(repr(trans))"))
+        _throw_trans_ntc(:gels!, trans)
     (T <: Complex && trans === 'T') &&
         throw(ArgumentError("gels!: trans='T' invalid for complex element type — use 'C'"))
     # M = op(A), p×q. (A itself is left untouched; LAPACK overwrites A, we don't need to.)
     M = trans === 'N' ? Matrix{T}(A) : (trans === 'T' ? Matrix{T}(transpose(A)) : Matrix{T}(adjoint(A)))
     p, q = size(M); k = min(p, q)
-    size(B, 1) >= max(p, q) ||
-        throw(DimensionMismatch("gels!: size(B,1)=$(size(B, 1)) must be ≥ max(rows,cols of op(A))=$(max(p, q))"))
+    size(B, 1) >= max(p, q) || _throw_brows_opa(:gels!, size(B, 1), max(p, q))
     nrhs = size(B, 2)
     tau = Vector{T}(undef, k)
     if p >= q

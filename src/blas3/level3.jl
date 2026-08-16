@@ -1176,7 +1176,7 @@ function trmm!(
     )
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
-    (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trmm!: A must be $k×$k"))
+    (size(A, 1) == size(A, 2) == k) || _throw_square(:trmm!, k)
     # α==0 ⇒ B := 0, A not referenced (reference ?trmm). Placed HERE, above the dispatch, because all
     # four branches below apply α only after forming the product — the tiny real/complex bypasses and
     # the split-L path each route around `_trmm!` and would need the same guard individually.
@@ -3999,7 +3999,7 @@ function trsm!(
     )
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
-    (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("trsm!: A must be $k×$k"))
+    (size(A, 1) == size(A, 2) == k) || _throw_square(:trsm!, k)
     A = _trsm_matchel(A, B)
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
@@ -6032,7 +6032,7 @@ end
 function _symm_check(side_left, A, B, C)
     (size(C) == size(B)) || throw(DimensionMismatch("symm!: C and B must match"))
     k = side_left ? size(B, 1) : size(B, 2)
-    return (size(A, 1) == size(A, 2) == k) || throw(DimensionMismatch("symm!: A must be $k×$k"))
+    return (size(A, 1) == size(A, 2) == k) || _throw_square(:symm!, k)
 end
 function symm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; side::Char = 'L',

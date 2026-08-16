@@ -240,6 +240,6 @@ end
 # Recover n from a packed length L = n(n+1)/2 (exact integer inverse; validates the length).
 @inline function _pp_order(L::Int)
     n = (isqrt(8L + 1) - 1) >> 1
-    (n * (n + 1)) >> 1 == L || throw(DimensionMismatch("packed length $L is not n(n+1)/2"))
+    (n * (n + 1)) >> 1 == L || _throw_packed_len(L)
     return n
 end

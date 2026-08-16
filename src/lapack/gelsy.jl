@@ -109,8 +109,8 @@ end
 # Numerics identical to dtzrzf (its blocked trailing update is only a perf refinement of this core).
 function tzrzf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: BlasFloat}
     m, n = size(A)
-    m <= n || throw(ArgumentError("tzrzf!: requires m ≤ n (got $m×$n)"))
-    length(tau) >= m || throw(DimensionMismatch("tzrzf!: length(tau) < m=$m"))
+    m <= n || _throw_mle_n(:tzrzf!, m, n)
+    length(tau) >= m || _throw_len_m(:tzrzf!, m)
     L = n - m
     m == 0 && return A, tau
     if L == 0                                            # already upper triangular
@@ -159,9 +159,8 @@ function ormrz!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T <: BlasFloat}
-    (side == 'L' || side == 'R') || throw(ArgumentError("ormrz!: side must be 'L' or 'R', got $(repr(side))"))
-    (trans == 'N' || trans == 'T' || trans == 'C') ||
-        throw(ArgumentError("ormrz!: trans must be 'N', 'T' or 'C', got $(repr(trans))"))
+    (side == 'L' || side == 'R') || _throw_side_lr(:ormrz!, side)
+    (trans == 'N' || trans == 'T' || trans == 'C') || _throw_trans_ntc(:ormrz!, trans)
     (T <: Complex && trans == 'T') &&
         throw(ArgumentError("ormrz!: trans='T' invalid for complex — use 'C'"))
     k = length(tau); L = size(A, 2) - k
@@ -219,9 +218,8 @@ function gelsy!(
         rcond::Real
     ) where {T <: BlasFloat}
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
-    size(B, 1) >= max(m, n) ||
-        throw(DimensionMismatch("gelsy!: size(B,1)=$(size(B, 1)) must be ≥ max(m,n)=$(max(m, n))"))
-    length(jpvt) >= n || throw(DimensionMismatch("gelsy!: length(jpvt)=$(length(jpvt)) < n=$n"))
+    size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsy!, size(B, 1), max(m, n))
+    length(jpvt) >= n || _throw_len_jpvt(:gelsy!, n)
     tau = Vector{T}(undef, mn)
     geqp3!(A, jpvt, tau)                                 # A·P = Q·R  (rank-revealing)
     # ---- effective rank via the incremental condition estimator (dgelsy loop) ----

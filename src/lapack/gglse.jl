@@ -122,7 +122,7 @@ function gglse!(
     size(B, 2) == n || throw(DimensionMismatch("gglse!: A and B must have the same number of columns"))
     length(c) == m || throw(DimensionMismatch("gglse!: length(c) ≠ rows(A)"))
     length(d) == p || throw(DimensionMismatch("gglse!: length(d) ≠ rows(B)"))
-    (p <= n && n <= m + p) || throw(DimensionMismatch("gglse!: need p ≤ n ≤ m+p (got m=$m,n=$n,p=$p)"))
+    (p <= n && n <= m + p) || _throw_gglse_dims(m, n, p)
     np = n - p                                           # y₁ length
 
     # 1) RQ of B, explicit orthonormal factor G (Q = Gᴴ):  B_orig = R·Gᴴ,  R = B[1:p, np+1:n].

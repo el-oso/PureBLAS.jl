@@ -43,6 +43,15 @@ gemvt_u = 1
 gemvt_pf = 0
 trmv_fused_min = 1
 gemvt_deep = true
+# `gemvn_minner` was MISSING from this list (added 2026-08-16) — the exact omission the paragraph above
+# warns about, and it is what reddened the BLAS-2 @typestable item on Julia 1.13. Unpinned, the
+# `@static if isnothing(_GEMVN_MINNER_PREF)` branch keeps a `Base.OncePerProcess` reachable from
+# `gemv!`, whose first-call `lock()` descends through `yield()`/`wait()` into Base's
+# `OncePerThread{Task}` scheduler — which JET reports as "failed to optimize due to recursion". Nothing
+# in PureBLAS is unstable there; the fix is to stop compiling the resolver in at all. `false` is the
+# value juliac/build.jl:116 already pins for the trim build, so the dogfood exercises the shipping
+# configuration; the item checks type-stability, not which arm is faster.
+gemvn_minner = false
 # ── THE REMAINING MEASURE-TIER KNOBS ────────────────────────────────────────────────────────────────
 # Every knob whose `@static if isnothing(pref)` branch builds a `Base.OncePerProcess` MUST be pinned
 # here, or its one-time init (jl_set_precompile_field_replace) stays reachable and reddens any
