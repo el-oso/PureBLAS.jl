@@ -124,10 +124,33 @@ Both modes share ONE set of low-level kernels. Source map:
   NORMAL vs ARGUMENT retstyle) is unresolved; lands in M2 with GEMM's char/string ABI. Native API
   covers complex dot meanwhile.
 
-## Testing (ReTestItems — self-contained, individually triggerable)
+## Testing (TestItemRunner — self-contained, individually triggerable)
 
-- `runtests(PureBLAS)`; trigger one item via `runtests(PureBLAS; name="...")`. Use `@testsetup`
-  modules for shared oracle helpers so items are independent.
+- **NEVER activate `test/`. Use the MAIN project environment and `Pkg.test()`, always:**
+  ```bash
+  julia --project=. -e 'using Pkg; Pkg.test()'                                   # whole suite
+  julia --project=. -e 'using Pkg; Pkg.test(test_args=["Level-1 contiguous"])'   # one item by name
+  julia --project=. -e 'using Pkg; Pkg.Registry.update()'                        # need fresh deps? THIS
+  ```
+  `Pkg.test()` resolves the test dependencies in a **temporary environment**, so it picks up a
+  refreshed registry by itself and **writes no `test/Manifest.toml`**. `--project=test` — for *any*
+  Pkg operation, including `add`/`rm`/`update`/`resolve`/`instantiate` — is the ONLY thing that
+  creates that file, and **`test/Manifest.toml` must not exist**. If it appears, that is the signal
+  the wrong environment was used: delete it and fix the command. "Pkg regenerates it" is never true.
+  Activating `test/` also **rewrites `test/Project.toml` and strips every comment** — on 2026-08-16 it
+  destroyed 37 lines documenting why each Measure-tier knob is pinned (restored from git). To change a
+  test-only dep, edit the `[deps]` UUID line directly after backing the file up; that is the one
+  legitimate exception to "never hand-edit Project.toml", which targets version *management*.
+- Trigger one item via `Pkg.test(test_args=["<name regex>"])` — `runtests.jl` ANDs it with the
+  group/shard filter. Use `@testmodule Name begin … end` for shared oracle helpers so items are
+  independent (**not** ReTestItems' `@testsetup module`, which TestItemRunner does not recognize).
+- **Why not ReTestItems** (migrated 2026-08-16, commit `31168e6`): it cannot run on Julia 1.13. It
+  needs `Test.push_testset`/`pop_testset` — both REMOVED when testset state moved to `ScopedValues`,
+  which kept only the readers — and ReTestItems pushes/pops ACROSS function boundaries, which a
+  `ScopedValue`'s `with(…) do … end` nesting cannot express. Not shimmable. Both packages consume the
+  same `@testitem` macro from TestItems.jl, so all ~135 items were unchanged. Tradeoff accepted:
+  TestItemRunner is single-process (no `nworkers`/timeouts/retries); parallelism here is CI-job
+  sharding via `PUREBLAS_TEST_GROUP`/`PUREBLAS_SHARD`.
 - Correctness oracle = OpenBLAS via `LinearAlgebra.BLAS.*` over s/d/c/z, many `n`, strides, edges.
   Note: single-vector ops (nrm2/asum/iamax/scal) are spec'd `incx ≥ 1` (reference returns 0 for
   `incx<1`); only two-vector ops (axpy/dot) take negative/mismatched increments.
