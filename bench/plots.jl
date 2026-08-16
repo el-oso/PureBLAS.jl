@@ -224,6 +224,13 @@ end
 # exactly the thing worth catching, and it is invisible if this reads `lscpu` instead of `_HW`.
 # `dp=` (double-pumped) is included because it is derived, not detected — Zen3 and Zen4 share family 0x19
 # and are separated only by `simd`, so the resolved boolean is worth recording next to its inputs.
+# Bundled OpenBLAS version — the reference arm ships INSIDE Julia, so it changes when Julia does.
+_obversion() = try
+    string(pkgversion(OpenBLAS_jll))
+catch
+    "?"
+end
+
 _hwstamp() = try
     hw = PureBLAS._HW
     join((
@@ -1496,6 +1503,12 @@ function save_cache(path, groups)
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
             "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts",
+            # `julia=`/`llvm=`/`ob=` — the TOOLCHAIN. PureBLAS kernels are Julia source compiled by LLVM at
+            # load time, so the LLVM version is as much an input to a measured number as the source commit
+            # is; a toolchain bump moves every cell with no diff to explain it. `ob=` because Julia BUNDLES
+            # OpenBLAS: upgrading Julia silently swaps the reference arm, which is why a toolchain bump is
+            # the one case that REQUIRES re-measuring both arms instead of `arms=pb`.
+            "\tjulia=$(VERSION)\tllvm=$(Base.libllvm_version)\tob=$(_obversion())",
             "\thw=$(_hwstamp())\ttune=$(_tunestamp())",
             "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)"
