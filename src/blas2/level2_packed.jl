@@ -40,7 +40,7 @@ end
                 ajj = unsafe_load(cp)
                 s = _symv_col!(n - j, axj, cp + sz, xp + j * sz, yp + j * sz)
             end
-            unsafe_store!(yp, unsafe_load(yp, j) + axj * ajj + α * s, j)
+            _stc!(y, yp, j, unsafe_load(yp, j) + axj * ajj + α * s)
         end
     end
     return y
@@ -86,10 +86,16 @@ function _spmv_offblk_packed_expr(W, V, sz, NB, K, masked)
             push!(q.args, :($(Symbol(:d, c)) = muladd($(Symbol(:aa, v)), $(Symbol(:xx, v)), $(Symbol(:d, c)))))
         end
     end
+    # Stores go through the offset-aware checked accessor: the caller's `yp` already points into the
+    # middle of `y` (panel base `ybase`), so the check must be against `ybase + i + …`, not the local
+    # index. `rmn` is the masked variant's remaining-row count, i.e. its ACTIVE lane count; the
+    # unmasked arm writes a full W.
     for v in 1:K
+        off = :(i + $((v - 1) * W))
         push!(
-            q.args, masked ? :(vstore($(Symbol(:yy, v)), yp + (i + $((v - 1) * W)) * $sz, $(Symbol(:k, v)))) :
-                :(vstore($(Symbol(:yy, v)), yp + (i + $((v - 1) * W)) * $sz))
+            q.args, masked ?
+                :(_vstcb!(y, ybase, yp, $off, min($W, rmn - $((v - 1) * W)), $(Symbol(:yy, v)), $(Symbol(:k, v)))) :
+                :(_vstcb!(y, ybase, yp, $off, $W, $(Symbol(:yy, v))))
         )
     end
     return q
@@ -97,7 +103,7 @@ end
 
 # LOWER panel: NB×NB masked diagonal block (rows 0:NB-1) then off-block below (rows NB:M-1).
 @generated function _spmv_lpanel!(
-        M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T},
+        M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T}, y, ybase::Int,
         ::Val{MR}, ::Val{NB}
     ) where {T, MR, NB}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); mr = MR * W
@@ -116,7 +122,7 @@ end
         push!(body.args, :(yblk = vifelse(lanes >= $(c - 1), muladd($(Symbol(:xj, c)), acd, yblk), yblk)))
         push!(body.args, :($(Symbol(:d, c)) = muladd(vifelse(lanes > $(c - 1), acd, zv), xblk, $(Symbol(:d, c)))))
     end
-    push!(body.args, :(vstore(yblk, yp, mblk)))
+    push!(body.args, :(_vstcb!(y, ybase, yp, 0, $NB, yblk, mblk)))   # diagonal block: NB active rows
     push!(
         body.args, :(
             i = $NB; nfull = M - rem(M - $NB, $mr); while i < nfull
@@ -136,7 +142,7 @@ end
         )
     )
     for c in 1:NB
-        push!(body.args, :(unsafe_store!(yp, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, $c)), $c)))
+        push!(body.args, :(_stcb!(y, ybase, yp, $c, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, $c)))))
     end
     push!(body.args, :(return nothing))
     return body
@@ -144,7 +150,7 @@ end
 
 # UPPER panel: off-block rows 0:dboff-1 (dboff=M-NB) then NB×NB masked diagonal block at rows dboff:M-1.
 @generated function _spmv_upanel!(
-        M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T},
+        M::Int, α::T, bc::NTuple{NB, Ptr{T}}, xp::Ptr{T}, yp::Ptr{T}, y, ybase::Int,
         ::Val{MR}, ::Val{NB}
     ) where {T, MR, NB}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); mr = MR * W
@@ -182,9 +188,9 @@ end
         push!(body.args, :(yblk = vifelse(lanes <= $(c - 1), muladd($(Symbol(:xj, c)), acd, yblk), yblk)))
         push!(body.args, :($(Symbol(:d, c)) = muladd(vifelse(lanes < $(c - 1), acd, zv), xblk, $(Symbol(:d, c)))))
     end
-    push!(body.args, :(vstore(yblk, yp + dboff * $sz, mblk)))
+    push!(body.args, :(_vstcb!(y, ybase, yp, dboff, $NB, yblk, mblk)))   # diag block at dboff, NB rows
     for c in 1:NB
-        push!(body.args, :(unsafe_store!(yp, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, dboff + $c)), dboff + $c)))
+        push!(body.args, :(_stcb!(y, ybase, yp, dboff + $c, muladd(α, sum($(Symbol(:d, c))), unsafe_load(yp, dboff + $c)))))
     end
     push!(body.args, :(return nothing))
     return body
@@ -201,10 +207,11 @@ end
             jbl = jb                                                                # fresh, un-reassigned ⇒ the `bc` closures don't box jb (Core.Box → per-panel heap alloc)
             if up
                 bc = ntuple(c -> base + _pkU(jbl + c) * sz, Val(NB))                # A[i,jb+c] (1-based i≤jb+c) = base+(_pkU(jb+c)+i-1); 0-based row → +i
-                _spmv_upanel!(jbl + NB, α, bc, xp, yp, Val(_SYMV_MR), Val(NB))
+                _spmv_upanel!(jbl + NB, α, bc, xp, yp, _carrier(y), 0, Val(_SYMV_MR), Val(NB))   # yp not offset
             else
                 bc = ntuple(c -> base + (_pkL(jbl + c, n) + 1 - c) * sz, Val(NB))    # A[jb+i+1,jb+c] = base+(_pkL(jb+c,n)+1-c)+i
-                _spmv_lpanel!(n - jbl, α, bc, xp + jbl * sz, yp + jbl * sz, Val(_SYMV_MR), Val(NB))
+                # yp is offset by jbl elements ⇒ ybase = jbl, so the check lands on the right element
+                _spmv_lpanel!(n - jbl, α, bc, xp + jbl * sz, yp + jbl * sz, _carrier(y), _cbase(jbl), Val(_SYMV_MR), Val(NB))
             end
             jb += NB
         end
@@ -217,7 +224,7 @@ end
                 cp = base + _pkL(jb + 1, n) * sz; ajj = unsafe_load(cp)
                 s = _symv_col!(n - 1 - jb, axj, cp + sz, xp + (jb + 1) * sz, yp + (jb + 1) * sz)
             end
-            unsafe_store!(yp, unsafe_load(yp, jb + 1) + axj * ajj + α * s, jb + 1)
+            _stc!(y, yp, jb + 1, unsafe_load(yp, jb + 1) + axj * ajj + α * s)
             jb += 1
         end
     end
@@ -269,7 +276,9 @@ end
                 L > 0 && ((sr, si) = _hemv_col_cmplx!(L, real(tmp), imag(tmp), Ap + (base * 2 + 2) * szr, xp + (j * 2) * szr, yp + (j * 2) * szr))
                 ajj = unsafe_load(Ap, base * 2 + 1)               # real(A[j,j]) = AP[base+1]
             end
-            unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si), j)
+            # `ypc` is the complex view; index j is in COMPLEX elements, so `y` is the matching
+            # carrier (checking against the real-typed view would be wrong by 2x, permissively).
+            _stc!(y, ypc, j, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si))
         end
     end
     return y
@@ -313,13 +322,13 @@ end
                 @inbounds for j in 1:n
                     cp = Ap + _pkU(j) * sz; t = unsafe_load(xp, j)
                     _axpy_simd!(j - 1, t, cp, xp)
-                    unit || unsafe_store!(xp, t * unsafe_load(cp + (j - 1) * sz), j)
+                    unit || _stc!(x, xp, j, t * unsafe_load(cp + (j - 1) * sz))
                 end
             else                                   # L,N descending
                 @inbounds for j in n:-1:1
                     cp = Ap + _pkL(j, n) * sz; t = unsafe_load(xp, j)
                     _axpy_simd!(n - j, t, cp + sz, xp + j * sz)
-                    unit || unsafe_store!(xp, t * unsafe_load(cp), j)
+                    unit || _stc!(x, xp, j, t * unsafe_load(cp))
                 end
             end
         else
@@ -327,13 +336,13 @@ end
                 @inbounds for j in n:-1:1
                     cp = Ap + _pkU(j) * sz; xj = unsafe_load(xp, j)
                     s = _dot_simd(j - 1, cp, xp, T)
-                    unsafe_store!(xp, (unit ? xj : xj * unsafe_load(cp + (j - 1) * sz)) + s, j)
+                    _stc!(x, xp, j, (unit ? xj : xj * unsafe_load(cp + (j - 1) * sz)) + s)
                 end
             else                                   # L,T ascending
                 @inbounds for j in 1:n
                     cp = Ap + _pkL(j, n) * sz; xj = unsafe_load(xp, j)
                     s = _dot_simd(n - j, cp + sz, xp + j * sz, T)
-                    unsafe_store!(xp, (unit ? xj : xj * unsafe_load(cp)) + s, j)
+                    _stc!(x, xp, j, (unit ? xj : xj * unsafe_load(cp)) + s)
                 end
             end
         end
@@ -397,13 +406,13 @@ end
             if up                                  # U,N back: j descending
                 @inbounds for j in n:-1:1
                     cp = Ap + _pkU(j) * sz
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
+                    unit || _stc!(x, xp, j, unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz))
                     _axpy_simd!(j - 1, -unsafe_load(xp, j), cp, xp)
                 end
             else                                   # L,N forward: j ascending
                 @inbounds for j in 1:n
                     cp = Ap + _pkL(j, n) * sz
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(cp), j)
+                    unit || _stc!(x, xp, j, unsafe_load(xp, j) / unsafe_load(cp))
                     _axpy_simd!(n - j, -unsafe_load(xp, j), cp + sz, xp + j * sz)
                 end
             end
@@ -413,14 +422,14 @@ end
                     cp = Ap + _pkU(j) * sz
                     t = unsafe_load(xp, j) - _dot_simd(j - 1, cp, xp, T)
                     unit || (t /= unsafe_load(cp + (j - 1) * sz))
-                    unsafe_store!(xp, t, j)
+                    _stc!(x, xp, j, t)
                 end
             else                                   # L,T back: j descending
                 @inbounds for j in n:-1:1
                     cp = Ap + _pkL(j, n) * sz
                     t = unsafe_load(xp, j) - _dot_simd(n - j, cp + sz, xp + j * sz, T)
                     unit || (t /= unsafe_load(cp))
-                    unsafe_store!(xp, t, j)
+                    _stc!(x, xp, j, t)
                 end
             end
         end
