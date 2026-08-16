@@ -270,6 +270,16 @@ end
     # `ger_panel_np` Preference, which no candidate-set reasoning covers.
     @test PureBLAS._cger_np() in (1, 2, 4, 8)
 
+    # The snap itself, over every value any budget or Preference could produce. This is the axis the
+    # suite otherwise does not cover: BOTH memory-safety bugs found on 2026-08-16 were reachable only
+    # through a NON-DEFAULT knob, and every test here runs at defaults. Testing `_snap_np` directly
+    # covers all of them at once without spawning a process per pin.
+    # Verified out-of-band with the real env override (PUREBLAS_FORCE_ger_np): 3 -> 2, 5 -> 4, 6 -> 4,
+    # 7 -> 4. np=3 is the value that wrote 4096 elements past A before 76ffd06.
+    @test all(PureBLAS._snap_np(r) in (1, 2, 4, 8) for r in 1:64)
+    @test all(PureBLAS._snap_np(r) <= r for r in 1:64)          # snaps DOWN — stays inside the budget
+    @test all(PureBLAS._snap_np(r) == r for r in (1, 2, 4, 8))  # exact on the ladder itself
+
     tol(::Type{T}) where {T} = T <: Float32 ? 1.0f-4 : 1.0e-11
     @testset "T=$T cj=$cj np=$np m=$m n=$n" for T in (ComplexF32, ComplexF64),
             cj in (false, true), np in (2, 4, 8), m in (1, 7, 16), n in (1, 3, 8, 13)
