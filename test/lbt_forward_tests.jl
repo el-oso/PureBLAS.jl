@@ -230,9 +230,14 @@ end
     n = 48
     A = randn(n, n); Az = randn(ComplexF64, n, n)     # general NON-symmetric / non-Hermitian
     # A matrix guaranteed to have complex-conjugate eigenvalue pairs (real-packed VR path).
-    Bp = zeros(n, n); i = 1
-    while i + 1 <= n
-        Bp[i, i] = randn(); Bp[i + 1, i + 1] = Bp[i, i]; Bp[i, i + 1] = randn(); Bp[i + 1, i] = -Bp[i, i + 1]; i += 2
+    # `for i in 1:2:n-1` rather than a `while` with an outer `i` (fixed 2026-08-16): the old form
+    # assigned `i` outside the loop and `i += 2` inside it, which relies on soft-scope rules to bind
+    # the two together. That held under ReTestItems but broke here with
+    # `UndefVarError: 'i' not defined in local scope` — the loop variable form has no outer binding
+    # to lose, so it is correct under any scoping. Same indices: 1, 3, …, n-1.
+    Bp = zeros(n, n)
+    for i in 1:2:(n - 1)
+        Bp[i, i] = randn(); Bp[i + 1, i + 1] = Bp[i, i]; Bp[i, i + 1] = randn(); Bp[i + 1, i] = -Bp[i, i + 1]
     end
     Qr, _ = qr(randn(n, n)); Acp = Matrix(Qr) * Bp * Matrix(Qr)'
 

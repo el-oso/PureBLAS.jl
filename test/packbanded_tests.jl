@@ -1,4 +1,4 @@
-@testsetup module PackBand
+@testmodule PackBand begin
 using LinearAlgebra
 export l2err, l2tol, packtri_U, packtri_L, packband
 l2err(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
