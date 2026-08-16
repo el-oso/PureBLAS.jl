@@ -1,4 +1,4 @@
-@testsetup module Oracle
+@testmodule Oracle begin
 using LinearAlgebra
 import LinearAlgebra.BLAS as B
 export relerr, tol, B, TYPES, SIZES

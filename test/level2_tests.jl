@@ -1,4 +1,4 @@
-@testsetup module L2Oracle
+@testmodule L2Oracle begin
 using LinearAlgebra
 export l2err, l2tol
 l2err(a, b) = norm(a .- b) / max(norm(b), eps(Float64))

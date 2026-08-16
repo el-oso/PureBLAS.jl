@@ -215,7 +215,7 @@ end
     @test_throws DimensionMismatch PureBLAS.geqrf!(randn(5, 5), zeros(2))
 end
 
-@testsetup module WYHelpers
+@testmodule WYHelpers begin
 using PureBLAS, LinearAlgebra
 export explicit_v_panel, lapack_tau, wy_qtc!, wy_qc!
 
@@ -1274,11 +1274,24 @@ end
 
         mn = min(m, n)
         # Fails loudly if a future change makes the generator stop pivoting — the exact hole that let
-        # the old `A += n*I` version assert `ipiv == ipivl` while every pivot was trivially j. The
-        # threshold is a third, not a half: with kl subdiagonals a column pivots with probability
-        # ≈ kl/(kl+1), so kl=1 sits right ON one half and would flake.
-        if gen !== :dominant && kl > 0
-            @test count(!=(0), ipiv .- (1:mn)) >= mn ÷ 3
+        # the old `A += n*I` version assert `ipiv == ipivl` while every pivot was trivially j.
+        #
+        # RESTRICTED TO kl >= 2, and that restriction IS the fix for a real flake (2026-08-16). A column
+        # pivots with probability ≈ kl/(kl+1), so the non-trivial count is ≈ Binomial(mn-1, kl/(kl+1)).
+        # At kl=1 that is a fair coin: mn=8 gives mean 3.5, and the previous `>= mn÷3` (= 2) threshold
+        # failed whenever the draw came in at 0 or 1 — P = 6.25% per cell, over 8 such cells (4 types ×
+        # 2 pads, the (8,8,1,1) shape being the only kl=1 one). No threshold at kl=1 is both meaningful
+        # and reliable, so the check now rests on the kl>=2 shapes, where it sits far from the tail
+        # (kl=2, mn=20: mean 12.7 against a threshold of 5, ≈3.8σ down).
+        #
+        # WHY IT SURFACED ONLY NOW, and why it looked like a gbtrf bug: the seed is
+        # `hash((T, m, n, kl, ku, gen, pad))`, which hashes a DataType — and `hash(::DataType)` is NOT
+        # stable across Julia versions. Measured for this very cell: 1.12 → 16763250882009543865,
+        # 1.13 → 263051053535568488. So every Julia upgrade redraws every matrix and reshuffles which
+        # cells land in the tail. That is why 1.12 CI failed `ComplexF32 pad=0` while 1.13 failed
+        # `ComplexF64 pad=3` — one defect, different victim, and neither was a factorization error.
+        if gen !== :dominant && kl >= 2
+            @test count(!=(0), ipiv .- (1:mn)) >= mn ÷ 4
         end
 
         if m == n
@@ -1335,8 +1348,16 @@ end
 
         @test ipb == ipu
         @test infb == infu
+        # The factor bound scales with kl, not just with ‖U‖ (fixed 2026-08-16). A band entry
+        # accumulates up to `kl` rank-1 updates in `_gbtf2!`, which the blocked driver re-associates
+        # into ⌈kl/nb⌉ rank-nb gemms, so the legitimate divergence grows with the number of
+        # accumulation steps — a flat constant silently tightens as kl rises. The old flat `1e4·eps·‖U‖`
+        # was calibrated on the narrower shapes and left `Float32 40×40 kl=12 ku=0 gen=pivot` over by
+        # 1.45×/1.07×/1.03× at nb=2/3/5 while PASSING at nb=1 and nb=8 — exactly the signature of
+        # re-association, not of a factorization error: `ipiv` is bit-exact in every one of those cells,
+        # so both paths chose an identical pivot sequence and only the summation order differed.
         @test maximum(abs, ABb .- ABu) <=
-              1.0e4 * eps(real(T)) * max(maximum(abs, ABu), one(real(T)))
+              2.0e3 * (kl + 1) * eps(real(T)) * max(maximum(abs, ABu), one(real(T)))
         pad > 0 && @test all(==(T(-12345)), ABb[(kl + ku + kl + 2):ldab, :])
     end
 

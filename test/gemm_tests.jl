@@ -1,4 +1,4 @@
-@testsetup module GemmOracle
+@testmodule GemmOracle begin
 using LinearAlgebra
 export gerr, gtol
 gerr(a, b) = norm(a .- b) / max(norm(b), eps(Float64))

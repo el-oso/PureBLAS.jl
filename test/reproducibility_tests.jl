@@ -12,7 +12,7 @@
 # Scope is per-machine: a different vector width builds a different reduction tree, so cross-ISA
 # equality is not asserted either.
 
-@testsetup module ReproHelp
+@testmodule ReproHelp begin
 export shifted, biteq, biteqv
 # same values placed contiguously at byte-offset `off` in a fresh buffer → different alignment,
 # returned as a unit-stride view (so every offset, incl. 0, takes the SAME code path).
