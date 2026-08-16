@@ -54,13 +54,16 @@ demonstrated.
   column should be read as a microarchitecture difference. All eleven cells rose and five crossed the
   gate, but they split. `zsymm` 0.954 → **1.170**, `zhemm` 0.979 → **1.153** and `ztrsmR` 0.957 →
   **1.047** transferred in full; `zgemm` 0.947 → **0.996** and `zsyrk` 0.949 → **0.969** transferred
-  only partially, against Zen4's 0.952 → 1.213 and 0.958 → 1.133. The cause is real and is now
-  documented: Zen4's AVX-512 is *double-pumped* (one vector-FMA per cycle), so the FMA units bind and
-  Karatsuba's 25% flop cut converts nearly in full; Zen5 executes AVX-512 natively at twice the FMA
-  throughput, so its `gemm`/rank-k kernels are less FMA-bound and the same cut buys less. The routines
-  that transferred fully are those never dominated by the FMA ceiling. **Same ISA is not the same
-  roofline** — a flop-reduction result measured only on a double-pumped box is measured on the most
-  favourable silicon for that class of optimization. Plots, coverage tables and per-cell provenance
+  only partially, against Zen4's 0.952 → 1.213 and 0.958 → 1.133. **The cause is not yet known.** This
+  entry first attributed it to Zen5 having twice Zen4's FMA throughput; that was measured the same day
+  and is **retracted**. Using each box's classical-gemm OpenBLAS arm as the throughput probe — the
+  PureBLAS arm cannot serve, since Strassen-Winograd makes `2n³/t` read *above* the true ceiling — all
+  three boxes sustain the same per-cycle width: **7.48 / 6.84 / 6.89 F64 FMA lanes per cycle** on
+  Zen4 / Zen3 / Zen5, an 8-lane ceiling on every one. Zen5 is therefore not less FMA-bound; it has the
+  same lanes per cycle at a lower clock, and so the fleet's **lowest** F64 peak (31.7 GF vs Zen4's 44.9
+  and Zen3's 58.9 — the narrowest-ISA box has the highest peak, because it clocks highest). Untested
+  candidates for the real mechanism: Zen5's 48 KiB L1d, unique in the fleet, and the lower clock shifting
+  the memory-versus-compute balance. Plots, coverage tables and per-cell provenance
   regenerated for all three boxes; three footnotes corrected where they cited now-superseded Zen5
   numbers (`potrfU` n=2048 0.936 → 0.970, `pbtrf`'s `uplo='U'` residual narrowed from four cells to
   two, and `pstrf`'s OpenBLAS window moved off n=64 — with the two n=8 cells explicitly *not* counted

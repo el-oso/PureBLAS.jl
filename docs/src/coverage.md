@@ -46,12 +46,17 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   five crossed the gate — but they split cleanly in two. The `symm`/`hemm`/`trsmR` family transferred in
   full (`zsymm` 0.954 → 1.170 against Zen4's 0.994 → 1.146; `zhemm` 0.979 → 1.153; `ztrsmR` 0.957 →
   1.047), while **`zgemm` and `zsyrk` transferred only partially** — 0.947 → 0.996 and 0.949 → 0.969,
-  against Zen4's 0.952 → 1.213 and 0.958 → 1.133. That split is a genuine microarchitectural signal, not
-  older code: Zen4's AVX-512 is *double-pumped* (one vector-FMA per cycle), so on Zen4 the FMA units are
-  the binding constraint and Karatsuba-3M's 25% flop cut pays nearly in full. Zen5 executes AVX-512
-  natively at twice the FMA throughput, so its `gemm` and rank-k kernels are correspondingly less
-  FMA-bound and the same flop reduction buys proportionally less. The ops that transferred fully are the
-  ones whose cost was never dominated by the FMA ceiling. Per-cell provenance is stamped in
+  against Zen4's 0.952 → 1.213 and 0.958 → 1.133. That split is a genuine microarchitectural signal
+  rather than older code, but **its cause is currently unknown**: an earlier revision of this page
+  attributed it to Zen5 having twice Zen4's FMA throughput, and that explanation has since been measured
+  and **retracted**. Taking each box's classical-gemm OpenBLAS arm as an honest throughput probe (the
+  PureBLAS arm cannot serve here — Strassen-Winograd makes `2n³/t` overstate the hardware FMA rate), all
+  three boxes sustain the *same* per-cycle width: **7.48, 6.84 and 6.89 F64 FMA lanes per cycle** on
+  Zen4, Zen3 and Zen5, i.e. an 8-lane ceiling everywhere. Zen5 is therefore **not** less FMA-bound than
+  Zen4 — it has the same lanes per cycle at a lower clock, giving it the fleet's *lowest* F64 peak
+  (31.7 GF against Zen4's 44.9 and Zen3's 58.9; the narrowest-ISA box has the highest peak because it
+  clocks highest). Untested candidates for the real cause: Zen5's 48 KiB L1d, unique in the fleet, and
+  the lower clock shifting the memory-versus-compute balance. Per-cell provenance is stamped in
   [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md).
 
   **Read a full re-sweep as ±1–2%, not as change.** Because this sweep re-measured both references as
