@@ -162,7 +162,19 @@ end
                 unsafe_store!(yp, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s, j)
             end
         else   # wide band: conv (BLASFEO-style x-reuse) on full-band interior, per-column elsewhere
-            W = _vwidth(T); b = kl + ku + 1; clo = ku + 1; chi = (m - kl) - 2W
+            # BUG FIX 2026-08-16 — OUT-OF-BOUNDS WRITE on RECTANGULAR m > n. `chi` bounds the conv-block
+            # loop, and TWO separate limits apply, one per operand:
+            #   * x super-window (READ): the block loads up to x[j+kl+2W]  ⇒  j ≤ m - kl - 2W
+            #   * y block (WRITE): the block stores y[j .. j+W-1], and for trans='T' `y` has length n
+            #     (NOT m)                                                  ⇒  j + W - 1 ≤ n
+            # Only the first was applied. On SQUARE input `m - kl - 2W ≤ n` holds automatically, which is
+            # why every existing test passed — all wide-band cases were square. With m=96, n=40, kl=15,
+            # W=8 the old bound gave chi=65, so blocks ran to j=58 and wrote y[41..65]: 25 elements past
+            # the end of a 40-element array. Silent heap corruption — the segfault surfaced later, in an
+            # unrelated reduction over the corrupted result. `_gbmv_t_conv_block!`'s own docstring states
+            # the contract as "columns ku+1 … n-kl-2W", so the code contradicted its documentation.
+            W = _vwidth(T); b = kl + ku + 1; clo = ku + 1
+            chi = min((m - kl) - 2W, n - W + 1)
             j = 1
             @inbounds if chi >= clo + W - 1     # at least one conv block fits in-bounds
                 while j < clo

@@ -106,6 +106,24 @@ end
             @test l2err(yp, yr) < l2tol(T)
         end
     end
+
+    # RECTANGULAR wide-band (added 2026-08-16). The block above is square-only, and that is exactly why
+    # the trans='T' conv-block OOB write survived: the two bounds on `chi` coincide when m == n, so no
+    # square shape can reach it. m > n is the case that writes past `y` (length n on 'T'); m < n adds
+    # the EMPTY-COLUMN suffix (columns j > m+ku, which exist only when n > m+ku) that the wide-band
+    # path had likewise never seen. Both directions, since they fail differently.
+    @testset "rect $T $tr $(m)x$(n) kl=$kl ku=$ku" for T in (Float32, Float64),
+            tr in ('N', 'T'), (kl, ku) in ((15, 16), (31, 32)),
+            (m, n) in ((40, 96), (96, 40), (40, 97), (97, 40))
+
+        AB = randn(T, kl + ku + 1, n); nx = tr == 'N' ? n : m; ny = tr == 'N' ? m : n
+        x = randn(T, nx); y0 = randn(T, ny)
+        for (al, be) in ((one(T), zero(T)), (T(0.7), T(1.3)))
+            yr = copy(y0); B.gbmv!(tr, m, kl, ku, al, AB, x, be, yr)
+            yp = copy(y0); PureBLAS.gbmv!(yp, AB, x, m, kl, ku; trans = tr, alpha = al, beta = be)
+            @test l2err(yp, yr) < l2tol(T)
+        end
+    end
 end
 
 @testitem "sbmv/hbmv vs OpenBLAS banded" setup = [PackBand] begin
