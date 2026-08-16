@@ -28,9 +28,10 @@ for ln in readlines(ARGS[1])
     p = split(ln, "\t"); d = Dict{String,Vector{Float64}}()
     for f in p[4:end]
         isempty(f) && continue
-        # arm|time|commit|ANCHOR|samples — 5 fields. This was written against the 4-field format and
-        # threw on every current cache ("cannot parse \"20.894|0.0088…\" as Float64").
-        a,_,_,_,s = split(f, "|"; limit=5); d[a] = parse.(Float64, split(s, ","))
+        # arm|time|commit|anchor|freq|samples. The field count GROWS (4 → 5 anchor → 6 per-cell freq)
+        # and a fixed `limit=` threw on every bump ("cannot parse \"20.894|0.0088…\" as Float64").
+        # The csv is ALWAYS last — index from the end, per plots.jl'"'"'s extension invariant.
+        _p = split(f, "|"); a, s = _p[1], _p[end]; d[a] = parse.(Float64, split(s, ","))
     end
     haskey(d, "pb") || continue
     push!(rat, minimum(median(d[r] ./ d["pb"]) for r in ("openblas","aocl") if haskey(d, r)))

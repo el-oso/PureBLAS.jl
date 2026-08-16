@@ -14,9 +14,11 @@ for ln in readlines(CACHE)
     d = Dict{String, Vector{Float64}}()
     for f in p[4:end]
         isempty(f) && continue
-        # arm|time|commit|ANCHOR|samples — 5 fields. adjudicate.sh still splits at limit=4 and so
-        # feeds "anchor|samples" to `parse(Float64, …)`; it throws on any current cache.
-        a, _, _, _, s = split(f, "|"; limit = 5)
+        # arm|time|commit|anchor|freq|samples. The FIELD COUNT GROWS — it was 4, then 5 (anchor), now
+        # 6 (per-cell freq) — and a fixed `limit=` broke on every bump, twice, by feeding
+        # "anchor|samples" / "freq|samples" to `parse(Float64, …)`. The csv is ALWAYS last (plots.jl's
+        # stated extension invariant: append BEFORE the csv), so index from the end and never again.
+        _p = split(f, "|"); a, s = _p[1], _p[end]
         d[a] = parse.(Float64, split(s, ","))
     end
     haskey(d, "pb") || continue
