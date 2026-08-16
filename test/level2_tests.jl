@@ -257,3 +257,26 @@ end
         @test norm(Ap .- Ar) / max(norm(Ar), eps(Float64)) < tol(T)
     end
 end
+
+@testitem "complex ger panel np resolves to a Val the kernel implements" begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    # `_ger_pdc_cj!` strides its panel loop by the RUNTIME np but dispatches a COMPILE-TIME Val, and its
+    # `else` arm is Val(8). Any np without an arm (3/5/6/7) therefore advances by np while WRITING 8
+    # columns — a heap overwrite past A's last column, reproduced at 4096 stray elements before the
+    # 2026-08-16 snap. Unlike the real `_ger_paneldrv_np` (one Val{NP} drives both bound and stride, so
+    # every np is safe), the complex driver is only safe on the ladder. Assert the invariant at the
+    # single resolution point rather than trusting the measure candidates: the danger case is a hand-set
+    # `ger_panel_np` Preference, which no candidate-set reasoning covers.
+    @test PureBLAS._cger_np() in (1, 2, 4, 8)
+
+    tol(::Type{T}) where {T} = T <: Float32 ? 1.0f-4 : 1.0e-11
+    @testset "T=$T cj=$cj np=$np m=$m n=$n" for T in (ComplexF32, ComplexF64),
+            cj in (false, true), np in (2, 4, 8), m in (1, 7, 16), n in (1, 3, 8, 13)
+
+        α = T(0.7, -0.3); x = randn(T, m); y = randn(T, n); A0 = randn(T, m, n)
+        Ap = copy(A0); PureBLAS._ger_paneldrv_cmplx!(m, n, α, x, y, Ap, cj, np)
+        Ar = A0 .+ α .* x .* transpose(cj ? conj.(y) : y)   # explicit outer product, as at :60
+        @test norm(Ap .- Ar) / max(norm(Ar), eps(Float64)) < tol(real(T))
+    end
+end

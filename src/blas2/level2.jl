@@ -1892,7 +1892,15 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # The kernel keeps its `Val{HALF}` parameter (it costs nothing and the arm stays measurable), but the
 # shipped layout is WIDE and NP stays capped by the wide budget.
 @inline _cger_half() = false
-@inline _cger_np() = min(_ger_np(), _CGER_NP_MAX_WIDE)
+# SNAP TO THE Val LADDER, not just to the cap (2026-08-16). `_ger_pdc_cj!` strides the panel loop by the
+# RUNTIME `np` but dispatches a COMPILE-TIME `Val`, and its `else` arm assumes `Val(8)` — so any np the
+# kernel has no arm for (3/5/6/7) advances by np while writing 8 columns, running off the end of A. The
+# power-of-two snap in `_cger_np_max` exists for exactly this reason and says so, but it guards the CAP;
+# `min()` passes a smaller odd value straight through it. `_ger_np()`'s measured candidates are all powers
+# of two, so this is unreachable by default and only a hand-set `ger_panel_np` Preference selects it —
+# which is precisely why it must be clamped HERE, at the single point every caller resolves through,
+# rather than trusted to the candidate set. Same ladder as `_cger_np_max` so the two cannot drift.
+@inline _cger_np() = (r = min(_ger_np(), _CGER_NP_MAX_WIDE); r >= 8 ? 8 : r >= 4 ? 4 : r >= 2 ? 2 : 1)
 # NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
