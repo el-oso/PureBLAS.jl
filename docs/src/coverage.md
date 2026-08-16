@@ -32,14 +32,26 @@ This page tracks which `LinearAlgebra` operations route to PureBLAS after
   with **every reference arm measured in the same run as its PB arm** — the harness reported no
   machine-state drift, no stale-reference warnings and no preference pins on either box. Every cell in
   those two columns is therefore adjudicable against the code that ships at that commit.
-  **Zen5 is offline and its whole column is stale at `2113738` (2026-08-09).** Its `ztrsmR` still reads
-  the pre-fix kernel, its `trmm` predates the derived crossover, and its `zpotrfU` **0.704 @ n=32**
-  predates the `_potf2_needs_buf` aliasing fix (measured 0.695 → 0.993 on Zen4 and 0.765 → 1.145 on Zen3
-  at that exact cell). **Its whole complex BLAS-3 block is also pre-3M**: Zen5 is AVX-512, so it is
-  affected by the same width gate Zen4 was, and its `zgemm`/`zsyrk`/`zhemm`/`zsymm`/`ztrsmR` cells will
-  move substantially when it returns — on Zen4 those went 0.952 → 1.213, 0.958 → 1.133, 1.004 → 1.136,
-  0.994 → 1.146 and 0.987 → 1.084. Read none of the Zen5 complex-L3 column as a µarch difference; it is
-  simply older code. Per-cell provenance is stamped in
+  **Zen5 was fully re-swept on 2026-08-16 at commit `366b35e`**, closing the staleness gap that had
+  frozen its column at `2113738` (2026-08-09) across seven shipped changes. The box was freq-locked
+  with the achieved clock verified under load (1982 MHz, boost off, `amd_pstate=passive`), both
+  reference arms were re-measured in the same run rather than reused from the stale cache, and the run
+  was **gated on the full correctness suite passing first** (25083 pass) — a benchmark of unvalidated
+  code is not evidence. All three columns are therefore adjudicable against the code that ships at
+  their stated commit.
+
+  **The prediction this note used to make was half right, and the half that failed is the interesting
+  half.** It claimed Zen5's complex-L3 cells would move like Zen4's because both are AVX-512, and that
+  none of that column should be read as a µarch difference. Every one of the eleven cells did rise, and
+  five crossed the gate — but they split cleanly in two. The `symm`/`hemm`/`trsmR` family transferred in
+  full (`zsymm` 0.954 → 1.170 against Zen4's 0.994 → 1.146; `zhemm` 0.979 → 1.153; `ztrsmR` 0.957 →
+  1.047), while **`zgemm` and `zsyrk` transferred only partially** — 0.947 → 0.996 and 0.949 → 0.969,
+  against Zen4's 0.952 → 1.213 and 0.958 → 1.133. That split is a genuine microarchitectural signal, not
+  older code: Zen4's AVX-512 is *double-pumped* (one vector-FMA per cycle), so on Zen4 the FMA units are
+  the binding constraint and Karatsuba-3M's 25% flop cut pays nearly in full. Zen5 executes AVX-512
+  natively at twice the FMA throughput, so its `gemm` and rank-k kernels are correspondingly less
+  FMA-bound and the same flop reduction buys proportionally less. The ops that transferred fully are the
+  ones whose cost was never dominated by the FMA ceiling. Per-cell provenance is stamped in
   [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md).
 
   **Read a full re-sweep as ±1–2%, not as change.** Because this sweep re-measured both references as
@@ -113,19 +125,19 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>asum</code></th><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.31</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=10000</span></td></tr>
-<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.27</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=30000</span></td></tr>
-<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.69</span></td><td class="ok"><span class="v">1.71</span></td><td class="ok"><span class="v">1.5</span></td></tr>
-<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=1000000</span></td></tr>
-<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.41</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.67</span></td></tr>
-<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.63</span></td><td class="ok"><span class="v">1.9</span></td></tr>
-<tr><th><code>scal</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=300000</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>zscal</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>asum</code></th><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.31</span></td><td class="b1"><span class="v">0.992</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>axpy</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>dot</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=1000000</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=1000000</span></td><td class="b3"><span class="v">0.923</span><span class="n">n=10000</span></td></tr>
+<tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.27</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=30000</span></td></tr>
+<tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.69</span></td><td class="ok"><span class="v">1.71</span></td><td class="ok"><span class="v">1.7</span></td></tr>
+<tr><th><code>iamax</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>izamax</code></th><td class="ok"><span class="v">1.41</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.69</span></td></tr>
+<tr><th><code>nrm2</code></th><td class="ok"><span class="v">2.01</span></td><td class="ok"><span class="v">1.63</span></td><td class="ok"><span class="v">1.93</span></td></tr>
+<tr><th><code>scal</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=30000</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=300000</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1000000</span></td></tr>
+<tr><th><code>zaxpy</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=30000</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=300000</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.01</span></td><td class="b1"><span class="v">0.997</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zdotu</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=300000</span></td></tr>
+<tr><th><code>zscal</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=100000</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=300000</span></td></tr>
 </tbody></table>
 ```
 
@@ -133,25 +145,25 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.4</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>gemvT</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="b4"><span class="v">0.779</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.4</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.22</span></td></tr>
+<tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.941</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gemvT</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>ger</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.34</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.78</span></td><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.76</span></td></tr>
-<tr><th><code>symv</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.967</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=256</span></td></tr>
-<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.0</span></td></tr>
-<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.02</span></td></tr>
-<tr><th><code>zgemvC</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=2048</span></td><td><span class="n">—</span></td></tr>
-<tr><th><code>zgemvN</code></th><td class="b3"><span class="v">0.943</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.895</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgemvT</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td><span class="n">—</span></td></tr>
-<tr><th><code>zgeru</code></th><td class="b3"><span class="v">0.884</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.922</span><span class="n">n=1024</span></td><td class="b4"><span class="v">0.839</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.33</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>spmv</code></th><td class="ok"><span class="v">1.78</span></td><td class="ok"><span class="v">1.93</span></td><td class="ok"><span class="v">1.71</span></td></tr>
+<tr><th><code>symv</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.967</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.967</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>trmv</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=256</span></td></tr>
+<tr><th><code>trsv</code></th><td class="b2"><span class="v">0.965</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>zgbmvN</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.19</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>zgemvC</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.912</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgemvN</code></th><td class="b3"><span class="v">0.943</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgemvT</code></th><td class="b1"><span class="v">0.997</span><span class="n">n=4096</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.92</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgeru</code></th><td class="b3"><span class="v">0.884</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.922</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.904</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>zhbmv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.33</span></td><td class="ok"><span class="v">1.07</span></td></tr>
 <tr><th><code>zhemv</code></th><td class="ok"><span class="v">1.23</span></td><td class="b3"><span class="v">0.926</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.37</span></td></tr>
-<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.3</span></td><td class="ok"><span class="v">1.1</span></td></tr>
 <tr><th><code>ztrmv</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-<tr><th><code>ztrsv</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=1024</span></td></tr>
+<tr><th><code>ztrsv</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.939</span><span class="n">n=1024</span></td></tr>
 </tbody></table>
 ```
 
@@ -159,24 +171,24 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=256</span></td></tr>
-<tr><th><code>symm</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=4096</span></td></tr>
+<tr><th><code>gemm</code></th><td class="b2"><span class="v">0.976</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.977</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.992</span><span class="n">n=256</span></td></tr>
+<tr><th><code>symm</code></th><td class="b2"><span class="v">0.964</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>syr2k</code></th><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=4096</span></td></tr>
 <tr><th><code>syrk</code></th><td class="b3"><span class="v">0.934</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.962</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=4096</span></td></tr>
-<tr><th><code>trmm</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.968</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>trsm</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td></tr>
-<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.901</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.824</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zhemm</code></th><td class="ok"><span class="v">1.12</span></td><td class="b3"><span class="v">0.928</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=128</span></td></tr>
-<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zherk</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zsymm</code></th><td class="ok"><span class="v">1.13</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=512</span></td></tr>
-<tr><th><code>zsyrk</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.04</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=512</span></td></tr>
-<tr><th><code>ztrmm</code></th><td class="b2"><span class="v">0.971</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td></tr>
-<tr><th><code>ztrmmR</code></th><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.872</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>ztrsmR</code></th><td class="ok"><span class="v">1.09</span></td><td class="b3"><span class="v">0.931</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=128</span></td></tr>
+<tr><th><code>trmm</code></th><td class="b2"><span class="v">0.958</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.877</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>trsm</code></th><td class="b2"><span class="v">0.952</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=256</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>trsmR</code></th><td class="b3"><span class="v">0.949</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.91</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=512</span></td></tr>
+<tr><th><code>zgemm</code></th><td class="b3"><span class="v">0.933</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.82</span><span class="n">n=32</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zhemm</code></th><td class="ok"><span class="v">1.12</span></td><td class="b3"><span class="v">0.928</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.15</span></td></tr>
+<tr><th><code>zher2k</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.996</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zherk</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.13</span></td></tr>
+<tr><th><code>zsymm</code></th><td class="ok"><span class="v">1.13</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.17</span></td></tr>
+<tr><th><code>zsyr2k</code></th><td class="b3"><span class="v">0.91</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=128</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zsyrk</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.04</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=32</span></td></tr>
+<tr><th><code>ztrmm</code></th><td class="b2"><span class="v">0.971</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=32</span></td></tr>
+<tr><th><code>ztrmmR</code></th><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.872</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>ztrsm</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.08</span></td></tr>
+<tr><th><code>ztrsmR</code></th><td class="ok"><span class="v">1.09</span></td><td class="b3"><span class="v">0.931</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.05</span></td></tr>
 </tbody></table>
 ```
 
@@ -184,41 +196,41 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <table class="pbg"><thead><tr><th>routine</th><th>Zen4 · AVX-512</th><th>Zen3 · AVX2</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
-<tr><th><code>gbtrf</code></th><td class="b4"><span class="v">0.719</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.697</span><span class="n">n=128</span></td></tr>
-<tr><th><code>gels</code></th><td class="ok"><span class="v">1.28</span></td><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.3</span></td></tr>
-<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>geqrf</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=32</span></td></tr>
-<tr><th><code>gesvd</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.05</span></td></tr>
-<tr><th><code>getrf</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.974</span><span class="n">n=32</span></td></tr>
-<tr><th><code>getrs</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.774</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.772</span><span class="n">n=8</span></td></tr>
+<tr><th><code>gbtrf</code></th><td class="b4"><span class="v">0.719</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.706</span><span class="n">n=128</span></td></tr>
+<tr><th><code>gels</code></th><td class="ok"><span class="v">1.28</span></td><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.27</span></td></tr>
+<tr><th><code>geqp3</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.02</span></td></tr>
+<tr><th><code>geqrf</code></th><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.979</span><span class="n">n=32</span></td></tr>
+<tr><th><code>gesvd</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.03</span></td></tr>
+<tr><th><code>getrf</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.964</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>getrs</code></th><td class="b3"><span class="v">0.912</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.774</span><span class="n">n=8</span></td><td class="b4"><span class="v">0.8</span><span class="n">n=8</span></td></tr>
 <tr><th><code>gtsv</code></th><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.21</span></td></tr>
-<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.52</span></td><td class="ok"><span class="v">1.54</span></td></tr>
+<tr><th><code>gttrf</code></th><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.52</span></td><td class="ok"><span class="v">1.56</span></td></tr>
 <tr><th><code>gttrs</code></th><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=262144</span></td><td class="b1"><span class="v">0.999</span><span class="n">n=262144</span></td></tr>
-<tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.11</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=192</span></td><td class="ok"><span class="v">1.08</span></td></tr>
+<tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.11</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=192</span></td><td class="ok"><span class="v">1.07</span></td></tr>
 <tr><th><code>pbtrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.874</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=256</span></td></tr>
-<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.936</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.897</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.867</span><span class="n">n=512</span></td></tr>
+<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.897</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.848</span><span class="n">n=512</span></td></tr>
 <tr><th><code>potrsU</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=512</span></td><td class="ok"><span class="v">1.01</span></td></tr>
-<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.773</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.837</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.874</span><span class="n">n=32</span></td></tr>
-<tr><th><code>pptrfU</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=128</span></td></tr>
-<tr><th><code>pstrf</code></th><td class="b4"><span class="v">0.765</span><span class="n">n=8</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.841</span><span class="n">n=8</span></td></tr>
-<tr><th><code>pstrfU</code></th><td class="b3"><span class="v">0.933</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.898</span><span class="n">n=8</span></td></tr>
+<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.773</span><span class="n">n=32</span></td><td class="b4"><span class="v">0.837</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.866</span><span class="n">n=32</span></td></tr>
+<tr><th><code>pptrfU</code></th><td class="b3"><span class="v">0.905</span><span class="n">n=128</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.932</span><span class="n">n=128</span></td></tr>
+<tr><th><code>pstrf</code></th><td class="b4"><span class="v">0.765</span><span class="n">n=8</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.897</span><span class="n">n=8</span></td></tr>
+<tr><th><code>pstrfU</code></th><td class="b3"><span class="v">0.933</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td><td class="b3"><span class="v">0.907</span><span class="n">n=32</span></td></tr>
 <tr><th><code>ptsv</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.03</span></td></tr>
-<tr><th><code>pttrf</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.09</span></td></tr>
+<tr><th><code>pttrf</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.1</span></td></tr>
 <tr><th><code>pttrs</code></th><td class="b1"><span class="v">0.991</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td></tr>
-<tr><th><code>syev</code></th><td class="ok"><span class="v">1.26</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.1</span></td></tr>
+<tr><th><code>syev</code></th><td class="ok"><span class="v">1.26</span></td><td class="ok"><span class="v">1.2</span></td><td class="ok"><span class="v">1.2</span></td></tr>
 <tr><th><code>syevN</code></th><td class="b2"><span class="v">0.974</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.08</span></td></tr>
-<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.06</span></td></tr>
-<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.35</span></td></tr>
-<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.19</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.09</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=2048</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.917</span><span class="n">n=32</span></td></tr>
+<tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.04</span></td></tr>
+<tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.45</span></td><td class="ok"><span class="v">1.34</span></td></tr>
+<tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.19</span></td><td class="ok"><span class="v">1.1</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.01</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.94</span><span class="n">n=32</span></td></tr>
 <tr><th><code>zheev</code></th><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.13</span></td><td class="ok"><span class="v">1.05</span></td></tr>
 <tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.05</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.12</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td><td class="b1"><span class="v">0.991</span><span class="n">n=32</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="b2"><span class="v">0.95</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.04</span></td><td class="b4"><span class="v">0.704</span><span class="n">n=32</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.11</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="b2"><span class="v">0.95</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.04</span></td><td class="b2"><span class="v">0.953</span><span class="n">n=32</span></td></tr>
 </tbody></table>
 ```
 ```@raw html
@@ -324,7 +336,9 @@ the wide arm is kept there on both ISAs.
 1.02–3.28× AOCL, 1.49–2.00× OpenBLAS) and beats **OpenBLAS on all three µarchs**, but it does
 **not** yet clear AOCL fleet-wide — which the per-box columns above now show directly instead of
 hiding behind a single Zen4 verdict. Residuals are all `uplo='U'`
-at mid bandwidth: Zen5 `kd=128/192/256/384` at 0.954–0.991, Zen3 `kd=128/160/192` at
+at mid bandwidth: Zen5 `kd=128/256` at 0.989/0.969 (re-measured 2026-08-16 — `kd=192` now gates and
+`kd=384` lands on 1.0 within its own spread, so that residual narrowed from four cells to two),
+Zen3 `kd=128/160/192` at
 0.881–0.984 (plus `uplo='L'` `kd=160/192` at 0.959–0.995). Zen3 is the worst box and also the
 one whose `_pbtrf_ucross` bracket is derived from a narrower `_vwidth` (W=4 → the switch lands
 on 192, itself a 0.90 cell), so the leading hypothesis is a candidate bracket putting the
@@ -340,8 +354,10 @@ routine's only Zen4 gate miss. See §5.2 and §5.3 of [Tuning](tuning.md).
 [^upper]: **Gates on Zen4 and Zen3; one Zen5 cell open.** The upper-triangle path (transpose-to-lower
     via `Val{CJ}`, plus a loop swap that stopped the transpose reading `A` at a power-of-two `lda`)
     clears both references at every size on Zen4 (worst 1.11 vs OpenBLAS, 1.03 vs AOCL) and on Zen3
-    (worst 1.06). The single residual is **Zen5 n=2048 at 0.972**; every other Zen5 size gates
-    (1.01–1.39), which is why the Zen5 column reads below 1.0 while Zen4 and Zen3 gate.
+    (worst 1.06). The single residual is **Zen5 n=2048 at 0.970** (re-measured 2026-08-16; it read
+    0.936 on the stale column); every other Zen5 size gates, which is why the Zen5 column reads below
+    1.0 while Zen4 and Zen3 gate. The gap is 3.0% against a within-run spread of 0.002 — small, but
+    well clear of the noise that produced it, so it is a real cell rather than a rounding artifact.
 
 [^unblk]: **Blocked, and now gating.** `geqp3` used to be the worst routine in the real LAPACK
     surface: a BLAS-2 implementation racing a blocked BLAS-3 one, ratio degrading monotonically with
@@ -418,9 +434,12 @@ is req#8(b)'s "derive → validate on the **fleet** → ship" catching a one-box
     and on Zen3 (`W=4`) already two full lanes, so the ragged-tail fix does not reach it.
 
 [^ps]: `pstrf`'s blocked pivoted factorization clears **AOCL completely on both Zen4 and Zen5**, both
-    triangles, every size (Zen5: `uplo='L'` 1.07–1.75, `uplo='U'` 1.06–1.75). Against **OpenBLAS** it
-    clears everywhere except a narrow `uplo='U'` window that is consistent across µarchs and mild:
-    Zen4 n=48 **0.943** and n=64 **0.921**; Zen5 n=64 **0.978** only. Everything else runs 1.01–1.99.
+    triangles, every size (Zen5 re-measured 2026-08-16: worst 1.20 for `uplo='L'`, 1.19 for `uplo='U'`).
+    Against **OpenBLAS** it clears everywhere except a narrow window that is consistent across µarchs
+    and mild: Zen4 n=48 **0.943** and n=64 **0.921**; on Zen5 the window sits at small n rather than
+    n=64 — `pstrfU` n=32 **0.905** is the one cell clear of its own noise (spread 0.022), while
+    `pstrf` n=8 **0.876** and `pstrfU` n=8 **0.930** both fall *within* their round-to-round spread
+    (0.289 and 0.142 — tiny-n cells are too noisy to adjudicate and are not counted as misses).
     Those cells were known but had never been *gated* — the harness passed `uplo='L'` for both sides,
     so the separate 'U' code path (the pivoted panel and the trailing update both mirror) was never
     measured. A `pstrfU` row now tracks it. The large-n wins come from batching the pivot row swaps
