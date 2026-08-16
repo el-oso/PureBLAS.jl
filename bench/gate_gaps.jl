@@ -17,21 +17,37 @@
 # Usage:  julia --project=bench bench/gate_gaps.jl bench/plots_data_<uarch>_<host>.txt [more...]
 
 const QN = 48
+include(joinpath(@__DIR__, "freqgate.jl"))     # _freq_ref / _freq_of / _freq_offlock — see that file
+
+# A cell is skipped when ANY of its arms was measured off-lock, not just `pb`: the gate is a RATIO, so a
+# floated reference arm corrupts it exactly as much as a floated pb arm does.
+const OFFLOCK = []                             # (cache, lvl, op, size, [arm => kHz]) — reported, never averaged
+const FREQMETA = []                            # (cache, reference kHz, was-backfilled)
 
 function cells(path)
     out = []                                   # (lvl, op, size, Dict(arm => times), Dict(arm => commit))
+    ref, backfilled = 0, false
     for ln in eachline(path)
+        startswith(ln, "#pbbench") && ((ref, backfilled) = _freq_ref(ln); continue)
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
         p = split(ln, "\t"); length(p) >= 4 || continue
         d = Dict{String, Vector{Float64}}()
         c = Dict{String, String}()
+        drift = []
         for f in p[4:end]
             _p = split(f, "|"); a, com, csv = _p[1], _p[3], _p[end]
+            k = _freq_of(_p)
+            _freq_offlock(k, ref) && push!(drift, String(a) => k)
             d[String(a)] = parse.(Float64, split(csv, ","))
             c[String(a)] = String(com)
         end
+        if !isempty(drift)                     # NOT ADJUDICABLE — excluded from every verdict below
+            push!(OFFLOCK, (basename(path), String(p[1]), String(p[2]), parse(Int, p[3]), drift))
+            continue
+        end
         push!(out, (String(p[1]), String(p[2]), parse(Int, p[3]), d, c))
     end
+    push!(FREQMETA, (basename(path), ref, backfilled))
     return out
 end
 
@@ -97,7 +113,16 @@ end
 
 sort!(rows; by = first)
 fails = [r for r in rows if r[1] < 1.0]
-println("cells=", length(rows), "  below 1.0=", length(fails))
+println("cells=", length(rows), "  below 1.0=", length(fails),
+    isempty(OFFLOCK) ? "" : "  EXCLUDED(off-lock)=$(length(OFFLOCK))")
+# FREQUENCY PROVENANCE, printed unconditionally — a report that says nothing about the clock reads as
+# "the clock was fine", which is precisely the claim a backfilled cache cannot support.
+for (f, ref, bf) in FREQMETA
+    println("  freq ref ", rpad(replace(f, "plots_data_" => "", ".txt" => ""), 22),
+        ref == 0 ? "(none in header — no cell can be judged off-lock)" :
+        string(ref, "kHz", bf ? "  BACKFILLED from the run header: per-cell clocks are NOT measured " *
+            "samples, so no cell in this cache can be flagged" : "  (header achieved clock; cells >1% above it are excluded)"))
+end
 # BOTH REFERENCES ARE PRINTED, not just the binding one. The `ratio`/`vs` columns are the gate (worst
 # against the faster reference) — but reporting only that HIDES WHICH LIBRARY BINDS, and that is the
 # fact which tells you whether a caller inherits its callee's gap. Measured 2026-08-06, Zen3 n=32:
@@ -125,6 +150,17 @@ end
 nnoise = count(r -> (1.0 - r[1]) <= r[2], fails)
 println("\n$(length(fails) - nnoise) of $(length(fails)) misses exceed their own round spread; ",
     "$nnoise are within it (lower bound on noise — process-level variation is larger).")
+
+if !isempty(OFFLOCK)
+    println("\nOFF-LOCK — $(length(OFFLOCK)) cell(s) EXCLUDED from every number above. The clock stamped on \
+    these arms is\nmore than 1% above the cache header's achieved clock, so they were measured while the \
+    frequency lock\nwas floating and are NOT ADJUDICABLE. Re-measure them (`op=`/`group=`) and merge; the \
+    rest of the\nsweep stands.")
+    for (f, lvl, op, sz, drift) in OFFLOCK
+        println("  ", rpad("$lvl $op@$sz", 30), rpad(replace(f, "plots_data_" => "", ".txt" => ""), 22),
+            join(("$a=$(k)kHz" for (a, k) in drift), " "))
+    end
+end
 
 stale = sort!(unique(r[9] for r in fails if srcmoved(r[9])))
 if !isempty(stale)

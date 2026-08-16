@@ -13,6 +13,15 @@
 # Usage: julia --project=bench bench/coverage_ops.jl bench/plots_data_<uarch>_<host>.txt [more…] > out.md
 const QN = 48
 med(v) = (s = sort(v); s[max(1, cld(length(s), 2))])
+include(joinpath(@__DIR__, "freqgate.jl"))     # _freq_ref / _freq_of / _freq_offlock — see that file
+
+# OFF-LOCK CELLS ARE EXCLUDED AND REPORTED. A cell measured while the frequency lock was floating is not
+# adjudicable, and this table's verdict is a MIN over cells — so one drifted cell can set a whole
+# routine's published number. The report goes to STDERR because stdout is spliced verbatim into
+# docs/src/coverage.md; a partially excluded run must be visible to whoever runs the splice.
+const OFFLOCK = []                             # (cache, level, op, uarch, size, [arm => kHz])
+const FREQMETA = []                            # (cache, reference kHz, was-backfilled)
+const EXCLUDED = Dict{Tuple{String, String, String}, Int}()   # (level, op, uarch) => cells dropped
 
 # op => (level, types) — types are what the bench row actually exercises, not what the routine supports.
 const LEVEL = Dict{String, String}()
@@ -27,22 +36,32 @@ cells = Dict{Tuple{String, String, String}, Vector{Tuple{Int, Float64}}}()  # (l
 const UARCH = String[]                                    # column order = the order caches were given
 for path in ARGS
     ua = "?"
+    fref = 0
     for ln in eachline(path)
         if startswith(ln, "#pbbench")
             mu = match(r"uarch=(\S+)", ln); mi = match(r"isa=(\S+)", ln)
             ua = string(isnothing(mu) ? "?" : mu[1], isnothing(mi) ? "" : " · " * mi[1])
             ua in UARCH || push!(UARCH, ua)
+            fref, bf = _freq_ref(ln)
+            push!(FREQMETA, (basename(path), fref, bf))
             continue
         end
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
         p = split(ln, "\t"); length(p) >= 4 || continue
         lvl, op, sz = String(p[1]), String(p[2]), parse(Int, p[3])
         d = Dict{String, Vector{Float64}}()
+        drift = []
         for f in p[4:end]
             _p = split(f, "|"); a, csv = _p[1], _p[end]
+            _freq_offlock(_freq_of(_p), fref) && push!(drift, String(a) => _freq_of(_p))
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         haskey(d, "pb") || continue
+        if !isempty(drift)                     # any arm off-lock ⇒ the RATIO is not adjudicable
+            push!(OFFLOCK, (basename(path), lvlof(lvl), op, ua, sz, drift))
+            EXCLUDED[(lvlof(lvl), op, ua)] = get(EXCLUDED, (lvlof(lvl), op, ua), 0) + 1
+            continue
+        end
         # THE RATIO IS FORMED EXACTLY AS plots.jl DOES IT: elementwise over the sorted sample vectors
         # (`_ratio` = qref ./ qpb), then ONE median over all of them. This used to take the median of
         # per-round medians instead, which is a different statistic and DISAGREES AT MARGINAL CELLS —
@@ -114,7 +133,9 @@ html.dark .pbg-key{color:#98a1b3}
 """)
 
 for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
-    ops = sort(unique(k[2] for k in keys(cells) if k[1] == section))
+    # Ops are drawn from EXCLUDED as well as `cells`: a routine whose every cell was off-lock must still
+    # get a row, saying so. Dropping the row would render an unmeasurable routine as "not benchmarked".
+    ops = sort(unique(k[2] for k in Iterators.flatten((keys(cells), keys(EXCLUDED))) if k[1] == section))
     isempty(ops) && continue
     println("\n#### $section\n")
     println("```@raw html")
@@ -124,8 +145,12 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
         print("<tr><th><code>$op</code></th>")
         for ua in UARCH
             cs = sort(get(cells, (section, op, ua), Tuple{Int, Float64}[]); by = first)
+            nx = get(EXCLUDED, (section, op, ua), 0)    # cells dropped as off-lock
             if isempty(cs)
-                print("<td><span class=\"n\">—</span></td>")   # not measured on this box
+                # "—" means NOT MEASURED. If cells exist but every one was off-lock, say that instead:
+                # the two are opposite situations and must not print the same glyph.
+                print(nx == 0 ? "<td><span class=\"n\">—</span></td>" :
+                    "<td><span class=\"n\">off-lock ($nx)</span></td>")
                 continue
             end
             gs = [c[2] for c in cs]
@@ -133,6 +158,9 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
             # A passing row needs no size — it gates everywhere. A failing one names the cell to fix,
             # which is the actionable unit; the ratio alone would say nothing about where to look.
             sz = gate >= 1.0 ? "" : "<span class=\"n\">n=$(cs[argmin(gs)][1])</span>"
+            # A partially excluded routine is a PARTIAL verdict — the min is over fewer cells than the
+            # sweep measured, and the missing ones could be the worst. Say so in the cell itself.
+            nx > 0 && (sz *= "<span class=\"n\">−$nx off-lock</span>")
             gstr, cls = gatestr(gate)
             print("<td class=\"$cls\"><span class=\"v\">$gstr</span>$sz</td>")
         end
@@ -154,3 +182,22 @@ println("""
 </p>
 ```
 """)
+
+# ── FREQUENCY REPORT → STDERR (stdout is the doc page) ────────────────────────────────────────────
+for (f, ref, bf) in FREQMETA
+    println(stderr, "freq ref  ", rpad(replace(f, "plots_data_" => "", ".txt" => ""), 24),
+        ref == 0 ? "(none in header — no cell can be judged off-lock)" :
+        string(ref, "kHz", bf ? "  BACKFILLED from the run header — the per-cell clocks in this cache " *
+            "are NOT measured samples and cannot flag anything" : "  (header achieved clock; cells >1% above it are excluded)"))
+end
+if !isempty(OFFLOCK)
+    println(stderr, "\nOFF-LOCK: $(length(OFFLOCK)) cell(s) EXCLUDED from the table above — measured >1% \
+    above the cache\nheader's achieved clock, i.e. while the frequency lock was floating. NOT ADJUDICABLE. \
+    Any routine\nrow marked \"off-lock\" is a partial verdict; re-measure those cells (`op=`/`group=`) and \
+    re-splice.")
+    for (f, sect, op, ua, sz, drift) in OFFLOCK
+        println(stderr, "  ", rpad("$sect $op@$sz", 30), rpad(ua, 18),
+            rpad(replace(f, "plots_data_" => "", ".txt" => ""), 24),
+            join(("$a=$(k)kHz" for (a, k) in drift), " "))
+    end
+end
