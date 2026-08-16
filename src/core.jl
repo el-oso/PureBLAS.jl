@@ -81,6 +81,58 @@ end
     return nothing
 end
 
+# ── PRE-OFFSET POINTERS ─────────────────────────────────────────────────────────────────────────
+# Panel/tile kernels are handed a pointer that ALREADY points into the middle of the carrier
+# (`_spmv_lpanel!(…, yp + jbl*sz, …)`), and then index it from 0/1 locally. Checking the LOCAL index
+# against the carrier would validate the wrong element — and validate it permissively, since the
+# local index is always smaller. These variants take `base`, the 0-based element offset of `p` within
+# `a`, and check `base + i`.
+#
+# This is the common case in BLAS-3 and in every panel driver, so it is the general form; the
+# 4-argument versions above are the special case `base == 0`.
+# ── THE CARRIER MUST VANISH IN RELEASE, NOT JUST THE CHECK ──────────────────────────────────────
+# MEASURED (2026-08-17): threading `(y, ybase)` into the four @generated spmv panel kernels cost +4
+# instructions INSIDE the loop bodies (456 -> 460; prologue identical at 113). Those are NOT the
+# bounds check — `_CHECKED` is false there, so the check folds away completely. They are the cost of
+# two extra LIVE VALUES through the generated bodies perturbing register allocation. Pure overhead in
+# a build that cannot use them.
+#
+# So the carrier is passed through `_carrier`, which yields `nothing` in a release build. `_CHECKED`
+# is a compile-time const, so the ternary folds and the kernel SPECIALIZES on `::Nothing` — a
+# singleton, no register, no live range. The `::Nothing` methods below are the unchecked stores.
+#
+# This is what "free in release" has to mean for a signature change: not merely that the check
+# disappears, but that nothing about the argument survives to compete for registers.
+@inline _carrier(a) = _CHECKED ? a : nothing
+@inline _cbase(b::Integer) = _CHECKED ? b : 0
+
+@inline function _stcb!(a, base::Integer, p::Ptr{T}, i::Integer, v::T) where {T}
+    _CHECKED && checkbounds(a, base + i)
+    unsafe_store!(p, v, i)
+    return v
+end
+# Release-build methods: the carrier is `nothing`, so there is nothing to check and nothing live.
+@inline _stc!(::Nothing, p::Ptr{T}, i::Integer, v::T) where {T} = (unsafe_store!(p, v, i); v)
+@inline _stcb!(::Nothing, ::Integer, p::Ptr{T}, i::Integer, v::T) where {T} = (unsafe_store!(p, v, i); v)
+@inline _vstc!(::Nothing, p::Ptr{T}, off::Integer, ::Integer, v) where {T} =
+    (vstore(v, p + off * sizeof(T)); nothing)
+@inline _vstc!(::Nothing, p::Ptr{T}, off::Integer, ::Integer, v, msk) where {T} =
+    (vstore(v, p + off * sizeof(T), msk); nothing)
+@inline _vstcb!(::Nothing, ::Integer, p::Ptr{T}, off::Integer, ::Integer, v) where {T} =
+    (vstore(v, p + off * sizeof(T)); nothing)
+@inline _vstcb!(::Nothing, ::Integer, p::Ptr{T}, off::Integer, ::Integer, v, msk) where {T} =
+    (vstore(v, p + off * sizeof(T), msk); nothing)
+@inline function _vstcb!(a, base::Integer, p::Ptr{T}, off::Integer, nact::Integer, v) where {T}
+    _CHECKED && nact > 0 && checkbounds(a, (base + off + 1):(base + off + nact))
+    vstore(v, p + off * sizeof(T))
+    return nothing
+end
+@inline function _vstcb!(a, base::Integer, p::Ptr{T}, off::Integer, nact::Integer, v, msk) where {T}
+    _CHECKED && nact > 0 && checkbounds(a, (base + off + 1):(base + off + nact))
+    vstore(v, p + off * sizeof(T), msk)
+    return nothing
+end
+
 # Fortran BLAS start index for a (possibly negative) increment: walk backwards from the end.
 @inline _start(n::Integer, inc::Integer) = inc > 0 ? 1 : 1 + (1 - n) * inc
 
