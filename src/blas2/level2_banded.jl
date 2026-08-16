@@ -23,6 +23,7 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
 @inline function _gbmv_conv!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); b = kl + ku + 1
     lanes = Vec{W, Int}(ntuple(l -> l - 1, Val(W)))
+    yc = _carrier(y)      # `nothing` in release — see the register-pressure note on `_gbt_one!`
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2)
         i0 = 0
@@ -36,7 +37,7 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
                 av = vload(V, Ap + ((r1 - 1) + (j - 1) * ldb) * sz, msk)
                 acc = muladd(V(α * unsafe_load(xp, j)), av, acc)
             end
-            _vstc!(y, yp, i0, mm, acc, orow)   # mm = ACTIVE lanes, not W (masked tail is legitimate)
+            _vstc!(yc, yp, i0, mm, acc, orow)   # mm = ACTIVE lanes, not W (masked tail is legitimate)
             i0 += W
         end
     end
@@ -88,8 +89,18 @@ end
 
 # One gbmv-T column j with β fused.
 #
-# `y` is the CARRIER for the store's bounds check and is otherwise unused — never indexed through, so
-# it costs nothing in a release build (verified byte-identical, bench/probes/checked_carrier_asm.jl).
+# `y` is the CARRIER for the store's bounds check and is otherwise unused — never indexed through.
+#
+# ⚠ PASS IT AS `_carrier(y)`, NEVER AS `y`. MEASURED 2026-08-17, galen (Zen3/AVX2), controlled
+# same-box back-to-back A/B, `op=gbmvN arms=pb`:
+#     pre-migration 6ae9ee9  gate 0.879
+#     carrier passed raw     gate 0.862      <- 1.9% REGRESSION
+# AVX2 has 16 vector registers to AVX-512's 32, and `_gbmv_t_conv_block!` already holds W
+# accumulators plus the x super-window — it sits near the register ceiling (see kb
+# register-ceiling-vs-structure). One extra live argument is free at 32 registers and spills at 16,
+# which is why wintermute measured byte-identical and galen did not. `_carrier` folds the argument to
+# `nothing` in release, so it specializes to a singleton with no live range and the budget is
+# restored. Verifying byte-identity on ONE µarch does not generalize across vector widths.
 # Threading it here rather than leaving the helper on a bare `Ptr` is the point of the migration: this
 # store is the one that writes to `y`, and on trans='T' `y` has length n while the loop bounds are
 # derived from m — the exact confusion that produced the OOB write fixed in 186f63f.
@@ -161,6 +172,7 @@ end
 # gbmv-T with β FUSED (overwrite for β=0, no separate _scale_y! pass — that pass is ~1/band of the
 # work, dominant for narrow band). Narrow band (< W): scalar dot (no horizontal sum). Wider: _dot_simd.
 @inline function _gbmv_t_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, β::T, y) where {T <: BlasReal}
+    yc = _carrier(y)      # MUST be _carrier, not y — 1.9% AVX2 regression otherwise (see _gbt_one!)
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2); sz = sizeof(T)
         if (kl + ku + 1) < _vwidth(T)
@@ -169,7 +181,7 @@ end
                 for i in ilo:ihi
                     s = muladd(unsafe_load(Ap, base + (i - ilo) + 1), unsafe_load(xp, i), s)
                 end
-                _stc!(y, yp, j, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s)
+                _stc!(yc, yp, j, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s)
             end
         else   # wide band: conv (BLASFEO-style x-reuse) on full-band interior, per-column elsewhere
             # BUG FIX 2026-08-16 — OUT-OF-BOUNDS WRITE on RECTANGULAR m > n. `chi` bounds the conv-block
@@ -188,14 +200,14 @@ end
             j = 1
             @inbounds if chi >= clo + W - 1     # at least one conv block fits in-bounds
                 while j < clo
-                    _gbt_one!(y, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
+                    _gbt_one!(yc, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
                 end
                 while j + W - 1 <= chi
-                    _gbmv_t_conv_block!(y, yp, Ap, xp, ldb, sz, b, ku, α, β, j, Val(W)); j += W
+                    _gbmv_t_conv_block!(yc, yp, Ap, xp, ldb, sz, b, ku, α, β, j, Val(W)); j += W
                 end
             end
             @inbounds while j <= n
-                _gbt_one!(y, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
+                _gbt_one!(yc, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
             end
         end
     end

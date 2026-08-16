@@ -46,11 +46,18 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 # The unrolled body, U vectors per iteration. `U` is a `Val` so each arm is its own straight-line code.
 @generated function _axpy_unrolled!(::Val{U}, n::Int, a::T, x, y, pf::Int) where {U, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
-    body = [:(vstore(muladd(va, vload($V, px + o + $(j * W * sz)), vload($V, py + o + $(j * W * sz))),
-                     py + o + $(j * W * sz))) for j in 0:(U - 1)]
+    # Stores go through the checked accessor with `yc` as carrier. `yc` is `y` itself when the caller
+    # handed over an array, and `nothing` when it handed over a raw Ptr segment (nothing to check
+    # against) or when this is a release build — either way it specializes to a singleton and costs
+    # no register. Offsets here are ELEMENT counts from `py`, and `py` is `y`'s own base whenever
+    # `yc` is non-nothing, so base 0 is correct.
+    body = [:(_vstcb!(yc, 0, py, i + $(j * W), $W,
+            muladd(va, vload($V, px + o + $(j * W * sz)), vload($V, py + o + $(j * W * sz)))))
+        for j in 0:(U - 1)]
     return quote
         $(Expr(:meta, :inline))
         px = _ptr(x); py = _ptr(y); sz = $sz; step = $(U * W)
+        yc = _carrier_arr(y)
         GC.@preserve x y begin
             va = $V(a)
             i = 0
@@ -67,12 +74,12 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
             end
             while i + $W <= n
                 o = i * sz
-                vstore(muladd(va, vload($V, px + o), vload($V, py + o)), py + o)
+                _vstcb!(yc, 0, py, i, $W, muladd(va, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
             while i < n
                 j = i + 1
-                unsafe_store!(py, muladd(a, unsafe_load(px, j), unsafe_load(py, j)), j)
+                _stcb!(yc, 0, py, j, muladd(a, unsafe_load(px, j), unsafe_load(py, j)))
                 i += 1
             end
         end
@@ -97,10 +104,13 @@ end
     ys = [Symbol(:yv, j) for j in 0:(U - 1)]
     lds = [:($(xs[j + 1]) = vload($VL, px + o + $(j * L * sz))) for j in 0:(U - 1)]
     fms = [:($(ys[j + 1]) = muladd(va, $(xs[j + 1]), vload($VL, py + o + $(j * L * sz)))) for j in 0:(U - 1)]
-    sts = [:(vstore($(ys[j + 1]), py + o + $(j * L * sz))) for j in 0:(U - 1)]
+    # Stores stay BATCHED at the block tail — that batching is the whole point of this kernel (raises
+    # outstanding-load MLP without adding write streams). `_vstcb!` is a store, so the batch shape is
+    # preserved; in release it lowers to the identical `vstore`.
+    sts = [:(_vstcb!(yc, 0, py, i + $(j * L), $L, $(ys[j + 1]))) for j in 0:(U - 1)]
     return quote
         $(Expr(:meta, :inline))
-        px = _ptr(x); py = _ptr(y)
+        px = _ptr(x); py = _ptr(y); yc = _carrier_arr(y)
         GC.@preserve x y begin
             va = $VL(a); vaw = $V(a)
             i = 0; step = $(U * L)
@@ -113,12 +123,12 @@ end
             end
             while i + $W <= n
                 o = i * $sz
-                vstore(muladd(vaw, vload($V, px + o), vload($V, py + o)), py + o)
+                _vstcb!(yc, 0, py, i, $W, muladd(vaw, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
             while i < n
                 j = i + 1
-                unsafe_store!(py, muladd(a, unsafe_load(px, j), unsafe_load(py, j)), j)
+                _stcb!(yc, 0, py, j, muladd(a, unsafe_load(px, j), unsafe_load(py, j)))
                 i += 1
             end
         end
@@ -399,6 +409,7 @@ end
 
 @inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
+    xc = _carrier_arr(x)   # `x` itself when the caller passed an array; nothing for a Ptr segment
     GC.@preserve x begin
         va = V(a)
         i = 0
@@ -520,8 +531,10 @@ end
         # than merely putting the duplicate last. First-in-last-slot bounds only maximal-separation
         # drift — conservative, and its failure mode is calling a resolvable cell unresolvable.
         if n * sizeof(T) > _L1_BYTES
+            # `@simd ivdep` must stay: hand-unrolling was measured WORSE past L1 (see above). `_stcb!`
+            # is a plain store in release, so the vectorizer sees the same loop.
             @inbounds @simd ivdep for j in 1:n
-                unsafe_store!(px, a * unsafe_load(px, j), j)
+                _stcb!(xc, 0, px, j, a * unsafe_load(px, j))
             end
             return x
         end
@@ -537,20 +550,20 @@ end
         # measurement above says the value is not what is costing us, so it stays.
         while i + step <= n
             o = i * sz
-            vstore(va * vload(V, px + o), px + o)
-            vstore(va * vload(V, px + o + W * sz), px + o + W * sz)
-            vstore(va * vload(V, px + o + 2W * sz), px + o + 2W * sz)
-            vstore(va * vload(V, px + o + 3W * sz), px + o + 3W * sz)
+            _vstcb!(xc, 0, px, i, W, va * vload(V, px + o))
+            _vstcb!(xc, 0, px, i + W, W, va * vload(V, px + o + W * sz))
+            _vstcb!(xc, 0, px, i + 2W, W, va * vload(V, px + o + 2W * sz))
+            _vstcb!(xc, 0, px, i + 3W, W, va * vload(V, px + o + 3W * sz))
             i += step
         end
         while i + W <= n
             o = i * sz
-            vstore(va * vload(V, px + o), px + o)
+            _vstcb!(xc, 0, px, i, W, va * vload(V, px + o))
             i += W
         end
         while i < n
             j = i + 1
-            unsafe_store!(px, a * unsafe_load(px, j), j)
+            _stcb!(xc, 0, px, j, a * unsafe_load(px, j))
             i += 1
         end
     end
