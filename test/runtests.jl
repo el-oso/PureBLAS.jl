@@ -3,6 +3,25 @@
 #   julia --project=test -e 'using ReTestItems, PureBLAS; runtests(PureBLAS; name="...")'
 using ReTestItems
 using PureBLAS
+using Test
+
+# ── TEMPORARY 1.13 SHIM — DELETE WHEN ReTestItems SUPPORTS JULIA 1.13 ─────────────────────────────
+# ReTestItems (1.35.2, the newest release as of 2026-08-16) does `Test.TESTSET_PRINT_ENABLE[] = false`
+# to suppress per-testset printing, at three sites — two of them on the COMMON path, not just the
+# serial-executor branch, so no `nworkers` setting avoids it. Julia 1.13 turned that Base global into a
+# `ScopedValue`, which has no `setindex!`, so `Pkg.test()` dies before a single test item runs:
+#     MethodError: no method matching setindex!(::Base.ScopedValues.ScopedValue{Bool}, ::Bool)
+#
+# This is type piracy on Base, entered into deliberately and with the tradeoff understood: it is confined
+# to the test entry point, never ships in the package, and the alternative was benchmarking the fleet with
+# NO correctness gate at all. The only behavioural loss is that per-testset summaries stay enabled, so the
+# log is noisier — printing is exactly what the pirated call was suppressing.
+#
+# Guarded on the type, not just the version, so it evaporates the moment upstream migrates properly or the
+# global reverts to a Ref. Re-check on every ReTestItems bump; delete when the write is gone.
+@static if isdefined(Base, :ScopedValues) && Test.TESTSET_PRINT_ENABLE isa Base.ScopedValues.ScopedValue
+    Base.setindex!(::Base.ScopedValues.ScopedValue{Bool}, ::Bool) = nothing
+end
 
 # CI parallelizes the suite across jobs via PUREBLAS_TEST_GROUP (see .github/workflows/CI.yml):
 #   "checks" → only the inference-heavy dogfood (StrictMode strict contracts, TrimCheck trim-safety,
