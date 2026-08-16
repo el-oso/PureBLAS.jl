@@ -106,6 +106,20 @@ end
 @inline _carrier(a) = _CHECKED ? a : nothing
 @inline _cbase(b::Integer) = _CHECKED ? b : 0
 
+# Shared kernels (`_axpy_simd!`, `_axpy_unrolled!`, …) take `x`/`y` UNTYPED and normalize with
+# `_ptr`, so an argument is either a raw `Ptr` (a segment the caller already offset) or an array. When
+# it is an array, the carrier is ALREADY IN HAND — no signature change, no call-site churn, and every
+# native-API entry point becomes checkable for free. When it is a `Ptr` there is nothing to check
+# against, and this yields `nothing` (the unchecked methods).
+#
+# `y isa Ptr` is a TYPE test, so it resolves at specialization time and costs nothing either way.
+#
+# HONEST SCOPE: this covers callers that hand over a whole array. It does NOT cover the delegated
+# segment writes — `gbmv` passing `yp + (ilo-1)*sz`, `spr` passing a packed column base — which are
+# precisely where a wrong offset would land. Covering those needs the carrier threaded explicitly to
+# each call site (28 for `_axpy_simd!` alone); tracked in #148.
+@inline _carrier_arr(y) = (_CHECKED && !(y isa Ptr)) ? y : nothing
+
 @inline function _stcb!(a, base::Integer, p::Ptr{T}, i::Integer, v::T) where {T}
     _CHECKED && checkbounds(a, base + i)
     unsafe_store!(p, v, i)
