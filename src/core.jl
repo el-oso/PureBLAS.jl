@@ -24,6 +24,63 @@ const BlasFloat = Union{Float32, Float64, ComplexF32, ComplexF64}
 @inline _et(::Ptr{T}) where {T} = T
 @inline _et(a) = eltype(a)
 
+# ── CHECKED-CARRIER ACCESSORS ───────────────────────────────────────────────────────────────────
+#
+# THE PROBLEM THEY SOLVE. The SIMD fast paths hoist a `pointer(x)` out of the loop and address it by
+# byte offset — that is what makes them fast, and it is also why a wrong loop bound writes past the
+# array in silence. `@inbounds` is irrelevant here: `unsafe_store!`/`vstore` on a raw `Ptr` have NO
+# bounds check to elide, so `--check-bounds=yes` cannot see them under ANY setting. The gbmv OOB
+# write (186f63f) wrote 25 elements past a 40-element `y` and every test stayed green.
+#
+# THE FIX. Keep the hoisted pointer — most kernels already take the carrier (`x`, `y`, `AB`) and
+# derive the pointer internally, so the array is in scope for free. Route the store through a helper
+# that also checks the CARRIER, and gate the check on the compiler flag:
+#
+#   release  (`_CHECKED == false`): `false && checkbounds(...)` folds away at compile time. The
+#            emitted code is BYTE-IDENTICAL to the raw-Ptr form — measured on the `_axpy_phase!`
+#            shape, 176 vs 176 normalized instructions, textually equal. Zero cost, and trim-safe:
+#            the juliac build runs default flags so nothing survives into the .so.
+#   checked  (`julia --check-bounds=yes`): a real `checkbounds`, throwing a BoundsError naming the
+#            offending line. Costs ~1.03-1.5x (measured +54% in L1, +3% at n=3e4) — a debug/CI price.
+#
+# `Base.JLOptions().check_bounds == 1` is safe as a `const`: the pkgimage cache is KEYED on that flag
+# (`Base.CacheFlags`), so a checked run cannot pick up a cache built unchecked, and vice versa.
+# Preferred over `@boundscheck`/`@inbounds` propagation, which this codebase has been burned by
+# (`@inline` not propagating into `@generated` bodies, kb generated-inline-meta-hazard).
+#
+# WHY NOT JUST USE ARRAYS. Measured, and rejected: SIMD.jl's array `vstore` calls `pointer(a, i)` per
+# access and its store carries no TBAA/alias metadata, so LLVM cannot prove a wide store does not
+# clobber the Vector's own data-pointer field — the loop reloads `mov rcx, [rax]` after EVERY vector
+# store. Loads CSE fine; stores do not. Cost: +61% at axpy n=1000, +21% on the gbmv conv block.
+# The carrier here is passed for its BOUNDS, never indexed through — so no reload.
+#
+# MASKED / PARTIAL TILES: pass the ACTIVE span, not the full vector width. A direct-read microkernel
+# legitimately loads a clamped partial tile, and checking the full W lanes would false-positive on
+# correct code (the `directb` rule — see test/memsafe_verify.jl).
+const _CHECKED = Base.JLOptions().check_bounds == 1
+
+# Scalar store through a hoisted pointer, bounds-checked against its carrier. `i` is 1-based, in
+# ELEMENTS, matching `unsafe_store!`'s index convention.
+@inline function _stc!(a, p::Ptr{T}, i::Integer, v::T) where {T}
+    _CHECKED && checkbounds(a, i)
+    unsafe_store!(p, v, i)
+    return v
+end
+# Vector store of `nact` ACTIVE lanes at 0-based element offset `off`. `nact` is what the mask (or
+# the clamp) actually writes — never the nominal width, or a legitimately clamped tail trips it.
+@inline function _vstc!(a, p::Ptr{T}, off::Integer, nact::Integer, v) where {T}
+    _CHECKED && nact > 0 && checkbounds(a, (off + 1):(off + nact))
+    vstore(v, p + off * sizeof(T))
+    return nothing
+end
+# Masked variant: SIMD.jl writes only the masked lanes, but the mask is a runtime value, so the
+# caller states the active count it guarantees.
+@inline function _vstc!(a, p::Ptr{T}, off::Integer, nact::Integer, v, msk) where {T}
+    _CHECKED && nact > 0 && checkbounds(a, (off + 1):(off + nact))
+    vstore(v, p + off * sizeof(T), msk)
+    return nothing
+end
+
 # Fortran BLAS start index for a (possibly negative) increment: walk backwards from the end.
 @inline _start(n::Integer, inc::Integer) = inc > 0 ? 1 : 1 + (1 - n) * inc
 

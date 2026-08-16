@@ -36,7 +36,7 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
                 av = vload(V, Ap + ((r1 - 1) + (j - 1) * ldb) * sz, msk)
                 acc = muladd(V(α * unsafe_load(xp, j)), av, acc)
             end
-            vstore(acc, yp + i0 * sz, orow)
+            _vstc!(y, yp, i0, mm, acc, orow)   # mm = ACTIVE lanes, not W (masked tail is legitimate)
             i0 += W
         end
     end
@@ -87,9 +87,15 @@ end
 end
 
 # One gbmv-T column j with β fused.
-@inline function _gbt_one!(yp::Ptr{T}, Ap::Ptr{T}, xp::Ptr{T}, ldb::Int, sz::Int, m::Int, kl::Int, ku::Int, α::T, β::T, j::Int) where {T <: BlasReal}
+#
+# `y` is the CARRIER for the store's bounds check and is otherwise unused — never indexed through, so
+# it costs nothing in a release build (verified byte-identical, bench/probes/checked_carrier_asm.jl).
+# Threading it here rather than leaving the helper on a bare `Ptr` is the point of the migration: this
+# store is the one that writes to `y`, and on trans='T' `y` has length n while the loop bounds are
+# derived from m — the exact confusion that produced the OOB write fixed in 186f63f.
+@inline function _gbt_one!(y, yp::Ptr{T}, Ap::Ptr{T}, xp::Ptr{T}, ldb::Int, sz::Int, m::Int, kl::Int, ku::Int, α::T, β::T, j::Int) where {T <: BlasReal}
     s = _gbt_dot(Ap, xp, ldb, sz, m, kl, ku, j)
-    unsafe_store!(yp, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s, j)
+    _stc!(y, yp, j, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s)
     return nothing
 end
 
@@ -99,7 +105,7 @@ end
 # weakness at wide band). AB streamed contiguous. Caller guarantees the super-window is in bounds
 # (columns ku+1 … n-kl-2W). β fused. Last band-chunk masked (band not a multiple of W).
 @generated function _gbmv_t_conv_block!(
-        yp::Ptr{T}, Ap::Ptr{T}, xp::Ptr{T}, ldb::Int, sz::Int,
+        y, yp::Ptr{T}, Ap::Ptr{T}, xp::Ptr{T}, ldb::Int, sz::Int,
         b::Int, ku::Int, α::T, β::T, j::Int, ::Val{W}
     ) where {T, W}
     V = Vec{W, T}
@@ -141,8 +147,12 @@ end
             end
         )
     )
+    # The W output stores. `y` is the carrier for the bounds check (never indexed through). THIS is the
+    # block whose loop bound was wrong in 186f63f — the caller's `chi` let `j` run past `y`'s length on
+    # rectangular m > n, and these stores are what went off the end. Each writes exactly one element, so
+    # the check is per-column: no mask, no span.
     for c in 0:(W - 1)
-        push!(body.args, :(unsafe_store!(yp, (iszero(β) ? zero($T) : β * unsafe_load(yp, j + $c)) + α * sum($(Symbol(:acc, c))), j + $c)))
+        push!(body.args, :(_stc!(y, yp, j + $c, (iszero(β) ? zero($T) : β * unsafe_load(yp, j + $c)) + α * sum($(Symbol(:acc, c))))))
     end
     push!(body.args, :(return nothing))
     return body
@@ -159,7 +169,7 @@ end
                 for i in ilo:ihi
                     s = muladd(unsafe_load(Ap, base + (i - ilo) + 1), unsafe_load(xp, i), s)
                 end
-                unsafe_store!(yp, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s, j)
+                _stc!(y, yp, j, (iszero(β) ? zero(T) : β * unsafe_load(yp, j)) + α * s)
             end
         else   # wide band: conv (BLASFEO-style x-reuse) on full-band interior, per-column elsewhere
             # BUG FIX 2026-08-16 — OUT-OF-BOUNDS WRITE on RECTANGULAR m > n. `chi` bounds the conv-block
@@ -178,14 +188,14 @@ end
             j = 1
             @inbounds if chi >= clo + W - 1     # at least one conv block fits in-bounds
                 while j < clo
-                    _gbt_one!(yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
+                    _gbt_one!(y, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
                 end
                 while j + W - 1 <= chi
-                    _gbmv_t_conv_block!(yp, Ap, xp, ldb, sz, b, ku, α, β, j, Val(W)); j += W
+                    _gbmv_t_conv_block!(y, yp, Ap, xp, ldb, sz, b, ku, α, β, j, Val(W)); j += W
                 end
             end
             @inbounds while j <= n
-                _gbt_one!(yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
+                _gbt_one!(y, yp, Ap, xp, ldb, sz, m, kl, ku, α, β, j); j += 1
             end
         end
     end
@@ -253,7 +263,7 @@ end
                 segp = Ap + (1 + (j - 1) * ldb) * sz                   # AB[2, j]
                 s = _symv_col!(len, axj, segp, xp + j * sz, yp + j * sz)
             end
-            unsafe_store!(yp, unsafe_load(yp, j) + axj * ajj + α * s, j)
+            _stc!(y, yp, j, unsafe_load(yp, j) + axj * ajj + α * s)
         end
     end
     return y
@@ -285,7 +295,10 @@ end
                 end
                 ajj = unsafe_load(Ap, ((j - 1) * ldb) * 2 + 1)                           # real(AB[1,j])
             end
-            unsafe_store!(ypc, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si), j)
+            # `ypc` is the COMPLEX view of y (the kernel also holds a real-typed `yp` for the SIMD
+            # segments). Check against `y` itself, whose element type matches `ypc` — index j is in
+            # complex elements, so the carrier and the index agree.
+            _stc!(y, ypc, j, unsafe_load(ypc, j) + tmp * ajj + α * Complex{Tr}(sr, si))
         end
     end
     return y
@@ -343,12 +356,12 @@ end
             @inbounds for j in order
                 _, segp, len, dgp, xseg = cofs(j)
                 if solve
-                    unit || unsafe_store!(xp, unsafe_load(xp, j) / unsafe_load(dgp), j)
+                    unit || _stc!(x, xp, j, unsafe_load(xp, j) / unsafe_load(dgp))
                     _axpy_simd!(len, -unsafe_load(xp, j), segp, xseg)
                 else
                     t = unsafe_load(xp, j)
                     _axpy_simd!(len, t, segp, xseg)
-                    unit || unsafe_store!(xp, t * unsafe_load(dgp), j)
+                    unit || _stc!(x, xp, j, t * unsafe_load(dgp))
                 end
             end
         else                                            # transpose: dot form
@@ -358,11 +371,11 @@ end
                 if solve
                     t = unsafe_load(xp, j) - _dot_simd(len, segp, xseg, T)
                     unit || (t /= unsafe_load(dgp))
-                    unsafe_store!(xp, t, j)
+                    _stc!(x, xp, j, t)
                 else
                     xj = unsafe_load(xp, j)
                     s = _dot_simd(len, segp, xseg, T)
-                    unsafe_store!(xp, (unit ? xj : xj * unsafe_load(dgp)) + s, j)
+                    _stc!(x, xp, j, (unit ? xj : xj * unsafe_load(dgp)) + s)
                 end
             end
         end
