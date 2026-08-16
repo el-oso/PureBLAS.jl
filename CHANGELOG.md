@@ -46,6 +46,26 @@ demonstrated.
 
 ### Changed
 
+- **Zen5 re-swept; the 3M win transfers to AVX-512 only in proportion to how FMA-bound the kernel is.**
+  Zen5's published column had been frozen at `2113738` across seven shipped changes. A full both-arms
+  sweep at `366b35e` (freq-locked 1982 MHz verified under load, gated on the correctness suite passing
+  first — 25083 pass) closes that gap and **falsifies a prediction this project had published**: that
+  Zen5's complex-L3 cells would move like Zen4's *because both are AVX-512*, and that none of that
+  column should be read as a microarchitecture difference. All eleven cells rose and five crossed the
+  gate, but they split. `zsymm` 0.954 → **1.170**, `zhemm` 0.979 → **1.153** and `ztrsmR` 0.957 →
+  **1.047** transferred in full; `zgemm` 0.947 → **0.996** and `zsyrk` 0.949 → **0.969** transferred
+  only partially, against Zen4's 0.952 → 1.213 and 0.958 → 1.133. The cause is real and is now
+  documented: Zen4's AVX-512 is *double-pumped* (one vector-FMA per cycle), so the FMA units bind and
+  Karatsuba's 25% flop cut converts nearly in full; Zen5 executes AVX-512 natively at twice the FMA
+  throughput, so its `gemm`/rank-k kernels are less FMA-bound and the same cut buys less. The routines
+  that transferred fully are those never dominated by the FMA ceiling. **Same ISA is not the same
+  roofline** — a flop-reduction result measured only on a double-pumped box is measured on the most
+  favourable silicon for that class of optimization. Plots, coverage tables and per-cell provenance
+  regenerated for all three boxes; three footnotes corrected where they cited now-superseded Zen5
+  numbers (`potrfU` n=2048 0.936 → 0.970, `pbtrf`'s `uplo='U'` residual narrowed from four cells to
+  two, and `pstrf`'s OpenBLAS window moved off n=64 — with the two n=8 cells explicitly *not* counted
+  as misses, since their round-to-round spreads of 0.289 and 0.142 swamp their gaps).
+
 - **Karatsuba-3M is no longer restricted to AVX2, and complex BLAS-3 on AVX-512 moves with it.** The
   3M route — three *real* products on the split real/imaginary parts, 25% fewer flops than the direct
   four-FMA complex kernel — was gated on `_vwidth == 4`. That is why complex rank-k read 0.94–0.99 vs
