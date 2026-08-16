@@ -4748,7 +4748,8 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T <: BlasReal} =
-    (_unified_ok(T) || size(C, 1) <= _SYRK_UNIFIED_MAX) ? _trgemm_packed_u!(up, α, A, tr, C, k) :
+    (_unified_ok(T) || (_unified_layout_ok(T) && size(C, 1) <= _SYRK_UNIFIED_MAX)) ?
+    _trgemm_packed_u!(up, α, A, tr, C, k) :
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
 
 # Complex packed syrk/herk dispatch. X=Y=A (both operands the same array). tXp=tr, tYp=!tr (identical to
@@ -5144,7 +5145,25 @@ end
 # enough to hide FMA latency (W>=8, AVX-512: 8 accs). On AVX2 (W=4) it's just 4 accs = latency-
 # STARVED, so there we fall to the multi-pack _trgemm_packed! with the wider _MR×_NR tile (12 accs
 # on Zen3) — it double-packs A but that's cheaper than starving. (Zen3-swept 2026-07-02.)
-@inline _unified_ok(::Type{T}) where {T} = _vwidth(T) == _NR && _vwidth(T) >= 8
+# SPLIT INTO ITS TWO INDEPENDENT CLAUSES (2026-08-16) — they are not the same KIND of condition:
+#
+#   _unified_layout_ok  — a CORRECTNESS PRECONDITION of `_trgemm_packed_u!`. That kernel packs A once
+#                         into `mr = W`-row panels and then indexes the SAME buffer two ways,
+#                         `div(r0, mr)` for the A-operand and `div(c0, nr)` for the B-operand. The
+#                         second derivation is only valid when `nr == mr`, i.e. `_NR == _vwidth(T)`.
+#                         Violate it and the B-operand reads a panel that was never packed at that
+#                         stride — an out-of-bounds read of the pack buffer.
+#   _vwidth(T) >= 8     — a PERFORMANCE condition (ILP): W accumulators must hide FMA latency; on
+#                         AVX2's W=4 the unified kernel is latency-starved and we prefer multi-pack.
+#
+# They were AND-ed into one predicate, and the `_SYRK_UNIFIED_MAX` small-n bypass at `_syrk_packed!`
+# then OR-ed PAST the whole thing — waiving the correctness clause to buy the small-n performance the
+# other clause was about. Today that is unreachable (`_SYRK_PACK_CUT` = 84 > `_SYRK_UNIFIED_MAX` = 48
+# on AVX2; the cap is 0 on AVX-512, and F32/AVX2 is the mismatching case), but BOTH are
+# `@load_preference` knobs, so a pinned build reaches it — the same shape as the `_cger_np` OOB write
+# fixed in 76ffd06, where a guard sat on the cap instead of on the value every caller resolves through.
+@inline _unified_layout_ok(::Type{T}) where {T} = _vwidth(T) == _NR
+@inline _unified_ok(::Type{T}) where {T} = _unified_layout_ok(T) && _vwidth(T) >= 8
 
 # Unified single-pack syrk: pack A ONCE into W-row panels; the A-operand (vector load, panel ir) and
 # the B-operand (scalar broadcast, panel jr) both read that one buffer. 8×8 tile (MR=1) so both packs'
