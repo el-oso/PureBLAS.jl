@@ -210,6 +210,32 @@ catch e
     "unavailable($(typeof(e)))"
 end
 
+# DETECTED HARDWARE, stamped into the cache header as `hw=`. `uarch=`/`isa=`/`cpu=` are LABELS — a µarch
+# name, an ISA string and a marketing model string. None of them is the data that actually drives a single
+# tuning decision: every derived block size, cutoff and unroll is a formula over `_HW`'s fields (req#8), so
+# a cache that omits them cannot explain its own numbers.
+#
+# WHY THIS EXISTS (2026-08-16): building the fleet µarch table required ssh-ing three boxes and running
+# `lscpu`, because the caches carried the CPU's *name* but not its cache sizes, lane count, vendor/family
+# or datapath width. The same gap made a CI-only failure undiagnosable — CI records no hardware identity
+# at all, so a red run cannot be attributed to a code change versus a runner CPU rotation.
+#
+# Stamp what PureBLAS DETECTED, not what the OS reports: a Preferences override or a mis-detection is
+# exactly the thing worth catching, and it is invisible if this reads `lscpu` instead of `_HW`.
+# `dp=` (double-pumped) is included because it is derived, not detected — Zen3 and Zen4 share family 0x19
+# and are separated only by `simd`, so the resolved boolean is worth recording next to its inputs.
+_hwstamp() = try
+    hw = PureBLAS._HW
+    join((
+        "simd=$(hw.simd)", "w64=$(PureBLAS._vwidth(Float64))",
+        "l1=$(hw.l1)", "l2=$(hw.l2)", "l3=$(hw.l3)",
+        "vendor=$(hw.vendor)", "family=$(hw.family)", "nvreg=$(hw.nvreg)",
+        "datapath=$(PureBLAS._datapath_bytes(hw))", "dp=$(PureBLAS._double_pumped(hw))",
+    ), ",")
+catch e
+    "unavailable($(typeof(e)))"
+end
+
 # Iteration / robustness modes (for a fast dev loop — full `bench` remains the trustworthy artifact):
 #   bench lite       → few rounds + small sizes, ~1–2 min smoke (NOT gate numbers; cache is *_lite.txt)
 #   bench op=gemm    → measure ONLY that op, full methodology, MERGE into the (v2) cache
@@ -1469,7 +1495,8 @@ function save_cache(path, groups)
         end
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
-            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts\ttune=$(_tunestamp())",
+            "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts",
+            "\thw=$(_hwstamp())\ttune=$(_tunestamp())",
             "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)"
         )
@@ -1502,11 +1529,16 @@ function load_cache(path)
     for ln in eachline(path)
         isempty(strip(ln)) && continue
         if startswith(ln, "#pbbench")
-            kv = Dict(String(p[1]) => String(p[2]) for p in (split(x, "=") for x in split(ln, "\t")[2:end]) if length(p) == 2)
+            # `limit = 2`: `hw=` and `tune=` are themselves k=v lists, so their VALUES contain `=`. An
+            # unlimited split yields >2 parts for those fields, the `length(p) == 2` filter drops them, and
+            # they are written but unreadable — which is how `tune=` sat in every cache since 2026-08-06
+            # without any tool able to read it back. Split on the FIRST `=` only.
+            kv = Dict(String(p[1]) => String(p[2]) for p in (split(x, "=", limit = 2) for x in split(ln, "\t")[2:end]) if length(p) == 2)
             meta = (
                 version = parse(Int, get(kv, "version", "1")), slug = get(kv, "slug", "?"),
                 uarch = get(kv, "uarch", "?"), isa = get(kv, "isa", "?"), host = get(kv, "host", "?"),
                 cpu = get(kv, "cpu", "?"), commit = get(kv, "commit", "?"), time = get(kv, "time", "?"),
+                hw = get(kv, "hw", "?"), tune = get(kv, "tune", "?"), freq = get(kv, "freq", "?"),
             )
             continue
         end
