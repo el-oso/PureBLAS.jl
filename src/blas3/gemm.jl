@@ -64,8 +64,8 @@ end
 # The k loop stays a runtime loop; its body is fully unrolled over (MR vectors)×(NR cols).
 @generated function _microkernel!(
         C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
-    ) where {T, MR, NR, B0}
+        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false), ::Val{AS} = Val(MR)
+    ) where {T, MR, NR, B0, AS}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
     # prefetch the C output tile (NR columns) so the cold read-modify-write at the end overlaps the
@@ -78,9 +78,15 @@ end
         push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V)))
     end
     # k loop: load MR A-vectors, broadcast NR B-scalars, MR*NR FMAs
+    #
+    # AS is the packed-A panel p-stride in VECTOR rows, normally == MR (a panel packed for exactly
+    # this tile width). It is decoupled so a caller can consume a CONTIGUOUS sub-strip of a wider
+    # panel: rows are contiguous within a p-step (Ap[p*mr + r]), so strip g of an AS-wide panel is
+    # just base + g*W with the p-stride left at AS. No repacking, no shuffles — see the triangular
+    # staircase in _trmm_packed!.
     inner = quote end
     for mi in 1:MR
-        push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $MR + $(mi - 1)) * $(W * sz))))
+        push!(inner.args, :($(Symbol(:a, mi)) = vload($V, Ap + (p * $AS + $(mi - 1)) * $(W * sz))))
     end
     for j in 1:NR
         push!(inner.args, :($(Symbol(:b, j)) = $V(unsafe_load(Bp + (p * $NR + $(j - 1)) * $sz))))
