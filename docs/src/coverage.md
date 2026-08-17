@@ -132,7 +132,7 @@ html.dark .pbg-key{color:#98a1b3}
 <table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>asum</code></th><td class="ok"><span class="v">1.27</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>axpy</code></th><td class="b1"><span class="v">0.995</span><span class="n">n=1000000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.971</span><span class="n">n=300000</span></td></tr>
-<tr><th><code>dot</code></th><td class="b1"><span class="v">0.994</span><span class="n">n=300000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b3"><span class="v">0.871</span><span class="n">n=10000</span></td></tr>
+<tr><th><code>dot</code></th><td class="b1"><span class="v">0.994</span><span class="n">n=300000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.984</span><span class="n">n=300000</span></td></tr>
 <tr><th><code>dzasum</code></th><td class="ok"><span class="v">1.23</span></td><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=30000</span></td></tr>
 <tr><th><code>dznrm2</code></th><td class="ok"><span class="v">1.8</span></td><td class="ok"><span class="v">1.68</span></td><td class="ok"><span class="v">1.65</span></td></tr>
 <tr><th><code>iamax</code></th><td class="b2"><span class="v">0.971</span><span class="n">n=100000</span></td><td class="ok"><span class="v">1.0</span></td><td class="b1"><span class="v">0.995</span><span class="n">n=300000</span></td></tr>
