@@ -992,7 +992,11 @@ function _pack_A_tri!(
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
         base = pi * mr * kce
-        for p in 0:(kce - 1)
+        # Same k-range prune as the SIMD path above — keep the two in step.
+        mre = min(mr, mce - pi * mr); r0g = ic + pi * mr
+        plo = packed_upper ? max(0, r0g - pc) : 0
+        phi = packed_upper ? (kce - 1) : (min(kce, r0g + mre - pc) - 1)
+        for p in plo:phi
             for r in 0:(mr - 1)
                 lr = pi * mr + r
                 Ap[base + p * mr + r + 1] = if lr < mce
@@ -1026,7 +1030,18 @@ end
         Aptr = pointer(A); App = pointer(Ap); av = V(alpha); zv = zero(V)
         @inbounds for pi in 0:(np - 1)
             base = pi * mr * kce; r0g = ic + pi * mr; full = pi * mr + mr <= mce
-            for p in 0:(kce - 1)
+            # PRUNE THE UNREFERENCED k-RANGE — BLIS's `bli_trmm_prune_unref_mparts_k`. The consume loop
+            # already confines this panel to [plo, cnt): lower reads p < cnt, upper reads p >= plo.
+            # Everything outside that gets packed (as zeros) and then NEVER read — for a straddling
+            # block that is about HALF the panel, i.e. pure write traffic. Compute-side trimming was
+            # measured free (2026-08-17); the packing is the part that was still paying.
+            # DANGER: these bounds must stay identical to the consume side's plo/cnt in _trmm_packed!.
+            # Widen them there without widening here and the kernel reads STALE SCRATCH, not zeros —
+            # Ap is reused across calls, so the old code's zero-fill was load-bearing.
+            mre = min(mr, mce - pi * mr)
+            plo = packed_upper ? max(0, r0g - pc) : 0
+            phi = packed_upper ? (kce - 1) : (min(kce, r0g + mre - pc) - 1)
+            for p in plo:phi
                 gp = pc + p; rthr = gp - r0g; dst = App + (base + p * mr) * sz
                 if full
                     src = Aptr + (r0g + gp * lda) * sz
