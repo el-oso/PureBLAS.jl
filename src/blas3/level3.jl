@@ -6030,7 +6030,28 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             return _hemm_3m_L!(up, herm, α, β, A, B, C)
         end
     end
-    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT
+    # UPPER BOUND ON THE PACKED PATH (2026-08-17). symm has the SAME flop count as gemm (2·n²·m) —
+    # symmetry saves A-traffic, not arithmetic — so symm should run at gemm's speed. It did not:
+    #
+    #     wintermute   n=2048   PB gemm 0.3552s   PB symm 0.4150s   (symm 16.8% SLOWER, same flops)
+    #                  n=4096   PB gemm 2.5319s   PB symm 3.3013s   (symm 30.4% SLOWER)
+    #     AOCL for contrast     n=2048   its gemm 0.4530  its symm 0.4014  (theirs is FASTER than gemm)
+    #
+    # The whole deficit is that gemm rides Strassen (1.26-1.28x AOCL there) and the packed path cannot:
+    # it never reaches `_gemm_core!` at all. The fall-through below ALREADY materializes the symmetric
+    # operand and calls `_gemm_core!(…, false, false, …)` — an NN product, i.e. Strassen-eligible — so
+    # the fix is not new code, it is declining the packed path once Strassen can pay.
+    #
+    # The materialize is O(n²) against an O(n³) saving: ~33.5 MB at n=2048, ~0.7 ms at ~50 GB/s,
+    # against a 415 ms call — 0.16% — to buy a ~25% flop cut.
+    #
+    # `_strassen_depth > 0` is the exact predicate `_gemm_core!` will apply, so the two cannot disagree
+    # (a hand-written `n >= _STRASSEN_MIN` here could drift from the depth rule and silently route to a
+    # classical path with the materialize tax still paid — the worst of both).
+    strassen_pays = _STRASSEN && eltype(C) <: BlasReal && !herm &&
+        _strided1(A) && _strided1(B) && _strided1(C) &&
+        _strassen_depth(size(C, 1), size(C, 2), n) > 0
+    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT && !strassen_pays
         return side_left ?
             _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
             _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
