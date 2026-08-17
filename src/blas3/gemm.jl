@@ -2652,8 +2652,16 @@ end
             GC.@preserve rA rB rC begin
                 # `_EXPFLAG[_EXP12]` is INVERTED: 3M SHIPS ON, the flag DISABLES it, so the pre-3M
                 # AVX-512 path stays A/B-able in-process on a fleet box (Zen5 is still unvalidated).
+                # EXPERIMENT (`_EXPINT[7]` > 0 overrides _CGEMM_3M_MIN; 0 = ship default).
+                # 3M AT n<48 IS UNTESTED, not falsified. The measured table above marks n=32 with `*` —
+                # a window-edge CONTROL outside MIN=48 — so both arms ran the SAME path there and the
+                # 0.999 tie says nothing about 3M engaged at that size. The overhead argument actually
+                # favours trying it: split/combine is O(n²) against O(n²·k) of product, so at k=32 the
+                # overhead share is ~1/k ≈ 3% against an ALGEBRAIC 25% multiply cut. This is the last
+                # untested mechanism for the tiny-n complex cluster (routing, entry overhead and NR
+                # width are all measured-dead — see the note below and zgemm32_nr_ab.jl).
                 if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
-                        _CGEMM_3M_MIN <= max(m, n, k) <= _CGEMM_3M_MAX &&
+                        (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _CGEMM_3M_MIN) <= max(m, n, k) <= _CGEMM_3M_MAX &&
                         min(m, n, k) >= _CGEMM_3M_KMIN
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                     # `_CGEMM_UNPACK_MAX` is CORRECTLY placed for complex — do not re-chase it. Measured
