@@ -2816,7 +2816,15 @@ end
 # merge commit rather than at the commit that carried them.
 #   _EXPINT[5]  trmm kc override (0 = derived default) — the AOCL/BLIS `bli_trmm_determine_kc` arm
 #   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
-const _EXPINT = fill(0, 6)
+#   _EXPINT[7]  zgemm 3M MIN override (0 = _CGEMM_3M_MIN) — tests 3M below the shipped window
+#   _EXPINT[8]  spare
+#
+# ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
+# OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
+# that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
+# removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
+# read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
+const _EXPINT = fill(0, 8)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
