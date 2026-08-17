@@ -32,13 +32,14 @@ end
         @inbounds for j in 1:n
             axj = α * unsafe_load(xp, j)
             if up                                  # col j = A[1:j, j]; diag last
-                cp = Ap + _pkU(j) * sz
+                cp = _seg(AP, Ap, _pkU(j), j)      # j elements incl. the diagonal at the end
                 s = _symv_col!(j - 1, axj, cp, xp, yp)
                 ajj = unsafe_load(cp + (j - 1) * sz)
             else                                   # col j = A[j:n, j]; diag first
-                cp = Ap + _pkL(j, n) * sz
+                cp = _seg(AP, Ap, _pkL(j, n), n - j + 1)   # n-j+1 elements, diagonal first
                 ajj = unsafe_load(cp)
-                s = _symv_col!(n - j, axj, cp + sz, xp + j * sz, yp + j * sz)
+                # the strictly-lower run is cp+1 for n-j elements; x/y are offset by j
+                s = _symv_col!(n - j, axj, cp + sz, _seg(x, xp, j, n - j), _seg(y, yp, j, n - j))
             end
             _stc!(y, yp, j, unsafe_load(yp, j) + axj * ajj + α * s)
         end
@@ -523,12 +524,18 @@ end
         if up
             @inbounds for j in 1:n
                 xj = unsafe_load(xp, j)
-                iszero(xj) || _axpy_simd!(j, α * xj, xp, Ap + _pkU(j) * sz)
+                # Packed column j is AP[_pkU(j)+1 : _pkU(j)+j] — j elements. A wrong `_pkU` lands the
+                # whole column in the wrong place and `_axpy_simd!` cannot see it (raw Ptr operands),
+                # so the extent is validated here, where the offset is computed.
+                iszero(xj) || _axpy_simd!(j, α * xj, xp, _seg(AP, Ap, _pkU(j), j))
             end
         else
             @inbounds for j in 1:n
                 xj = unsafe_load(xp, j)
-                iszero(xj) || _axpy_simd!(n - j + 1, α * xj, xp + (j - 1) * sz, Ap + _pkL(j, n) * sz)
+                # Packed column j is AP[_pkL(j,n)+1 : … + (n-j+1)] — n-j+1 elements. Both operands
+                # validated: the x run too, since it is offset by (j-1) from a different array.
+                iszero(xj) || _axpy_simd!(n - j + 1, α * xj, _seg(x, xp, j - 1, n - j + 1),
+                    _seg(AP, Ap, _pkL(j, n), n - j + 1))
             end
         end
     end
