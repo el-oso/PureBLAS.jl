@@ -146,10 +146,18 @@ function main()
         error("two caches report the same uarch — that would silently overwrite a column: " *
             join(first.(boxes), ", "))
     gates_by = Dict(u => cells([p]) for (u, p) in boxes)
-    # geo/worst stay scoped to the FIRST cache given (by convention the Zen4 sweep) and the header
-    # says so; they are a per-reference detail, not a per-box verdict.
-    ob = refstats([last(boxes[1])], "openblas"); ao = refstats([last(boxes[1])], "aocl")
-    gates = gates_by[first(boxes[1])]
+    # geo/worst are a per-REFERENCE detail, not a per-box verdict, and the header names which box they
+    # describe. They used to be scoped to `boxes[1]`, i.e. to POSITION — which silently re-pointed them
+    # at a different µarch the moment the column order changed (columns are now sorted Zen3/Zen4/Zen5,
+    # so boxes[1] became Zen3). Pin them by NAME instead, so ordering the columns and choosing the
+    # reference box are independent decisions and the header cannot drift out of sync with the data.
+    refu = get(ENV, "PUREBLAS_COVERAGE_REF", "Zen4")
+    refi = findfirst(b -> occursin(refu, first(b)), boxes)
+    isnothing(refi) && error("geo/worst reference \"$refu\" is not among the caches given: " *
+        join(first.(boxes), ", ") * "  (set PUREBLAS_COVERAGE_REF)")
+    ob = refstats([last(boxes[refi])], "openblas"); ao = refstats([last(boxes[refi])], "aocl")
+    gates = gates_by[first(boxes[refi])]
+    println("geo/worst reference: ", first(boxes[refi]), "   column order: ", join(first.(boxes), " | "))
 
     doc = collect(eachline("docs/src/coverage.md"))
     unmatched = String[]; changed = 0
