@@ -1074,86 +1074,12 @@ function _trmm_bpf(::Type{T}, len::Int) where {T}
     length(v) < len && resize!(v, len)
     return v
 end
-# Triangular "staircase" consume for a diagonal-STRADDLING mr x nr tile.
-#
-# The tile's mr rows do not share a k-range: for a lower triangle row r needs p <= r, for an upper
-# one p >= r. The single-call form has to take the UNION of the rows' ranges, so the other rows grind
-# through packed zeros -- waste (mr-1)/m of the straddling work, which at gate sizes (one mc-block
-# covering the whole triangle) is every tile.
-#
-# Splitting per W-row strip makes the flop count exact while keeping the BULK segment -- the p-range
-# all MRV strips share -- at full Val(MRV) register blocking. Only the ragged steps run narrow, and
-# they are at most mr p-steps per tile. This is why _microkernel! takes AS: every strip reads the
-# SAME MRV-wide packed panel at its own offset, so nothing is repacked.
-#
-# ow (this pc-block is the tile's first contribution => beta=0) must ride the BULK call, which is the
-# only segment covering all mr rows. A bulk call with cnt==0 still stores its zeroed accumulators,
-# which is exactly the zero-init those rows need -- so it is issued unconditionally when ow.
-@generated function _trmm_stair!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, r0::Int, pc::Int, kce::Int,
-        ow::Bool, ::Val{MRV}, ::Val{NR}, ::Val{UP}
-    ) where {T, MRV, NR, UP}
-    W = _vwidth(T); sz = sizeof(T); mr = MRV * W
-    body = quote end
-    # per-strip k-range endpoints, clamped into the block
-    for g in 0:(MRV - 1)
-        e = UP ? :(clamp(r0 + $(g * W) - pc, 0, kce)) : :(clamp(r0 + $((g + 1) * W) - pc, 0, kce))
-        push!(body.args, :($(Symbol(:e, g)) = $e))
-    end
-    # bulk: the p-range shared by every strip (upper: from the LAST strip's start; lower: to the
-    # FIRST strip's end), full width, carries ow.
-    blo = UP ? Symbol(:e, MRV - 1) : :0
-    bcnt = UP ? :(kce - $(Symbol(:e, MRV - 1))) : Symbol(:e, 0)
-    push!(
-        body.args, :(
-            let lo = $blo, cnt = max(0, $bcnt), ap = Ap + lo * $(mr * sz), bp = Bp + lo * $(NR * sz)
-                if ow
-                    _microkernel!(C, ldc, ap, bp, cnt, Val($MRV), Val($NR), Val(true), Val($MRV))
-                elseif cnt > 0
-                    _microkernel!(C, ldc, ap, bp, cnt, Val($MRV), Val($NR), Val(false), Val($MRV))
-                end
-            end
-        )
-    )
-    # staircase: each remaining segment covers a strictly narrower set of strips, accumulating.
-    for g in 0:(MRV - 2)
-        # upper: segment g spans [e_g, e_{g+1}) over strips 0..g  (rows at the tile top)
-        # lower: segment g spans [e_g, e_{g+1}) over strips g+1..MRV-1 (rows below the first)
-        lo = Symbol(:e, g); hi = Symbol(:e, g + 1)
-        nv = UP ? g + 1 : MRV - 1 - g
-        crow = UP ? 0 : (g + 1) * W
-        arow = UP ? 0 : (g + 1) * W
-        push!(
-            body.args, :(
-                let len = $hi - $lo
-                    if len > 0
-                        _microkernel!(
-                            C + $(crow * sz), ldc, Ap + ($lo * $mr + $arow) * $sz,
-                            Bp + $lo * $(NR * sz), len, Val($nv), Val($NR), Val(false), Val($MRV)
-                        )
-                    end
-                end
-            )
-        )
-    end
-    push!(body.args, :(return nothing))
-    return Expr(:block, Expr(:meta, :inline), body)
-end
-
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T <: BlasReal, MRV}
     m = size(B, 1); n = size(B, 2); W = _vwidth(T); mr = MRV * W; nr = _NR
     packed_upper = (up != tr)
     kc = min(_KC, m); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     nblk = cld(m, kc); bpf_blk = cld(nc, nr) * nr * kc          # one packed pc-block slot (padded to kc)
-    # INVERTED experiment flag: the per-strip staircase SHIPS ON, `_EXP13` reverts to the single coarse
-    # union-range call so both arms are reachable in ONE process (cross-run A/B is not adjudicable).
-    # Hoisted here, not read per tile.
-    stair = !(@inbounds _EXPFLAG[_EXP13])
-    # Witness (`_EXPINT[4]`, the slot the gemm unpack campaign retired): encodes BOTH the arm and the
-    # tile width as `+MRV` (staircase) or `-MRV` (coarse), so a probe can prove which kernel it timed
-    # instead of trusting that a knob was live. One store per CALL — never inside the tile loop.
-    @inbounds _EXPINT[4] = stair ? MRV : -MRV
     Ap, _ = _gemm_scratch(T, cld(mc, mr) * mr * kc, 1)
     Bpf = _trmm_bpf(T, nblk * bpf_blk)
     ldc = stride(B, 2); sz = sizeof(T)
@@ -1193,15 +1119,7 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
                                     Apanel = App + (div(ir, mr) * mr * kce + plo * mr) * sz
                                     Bpanel = Bfp + (pb * bpf_blk + div(jr, nr) * nr * kce + plo * nr) * sz
                                     Cblk = Ptr{T}(Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz)
-                                    if mre == mr && nre == nr && !stored && stair
-                                        # straddling full tile: exact per-strip k-ranges (see _trmm_stair!).
-                                        # panel origins are taken at plo=0; the stair applies its own offsets.
-                                        As = Ptr{T}(App + div(ir, mr) * mr * kce * sz)
-                                        Bs = Ptr{T}(Bfp + (pb * bpf_blk + div(jr, nr) * nr * kce) * sz)
-                                        packed_upper ?
-                                            _trmm_stair!(Cblk, ldc, As, Bs, r0, pc, kce, ow, Val(MRV), Val(_NR), Val(true)) :
-                                            _trmm_stair!(Cblk, ldc, As, Bs, r0, pc, kce, ow, Val(MRV), Val(_NR), Val(false))
-                                    elseif mre == mr && nre == nr
+                                    if mre == mr && nre == nr
                                         ow ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR), Val(true)) :
                                             _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), cnt, Val(MRV), Val(_NR), Val(false))
                                     else
@@ -1306,11 +1224,7 @@ function trmm!(
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
         # but regressed k=768 and the public po2 A-pad path — non-robust, not worth the split.)
-        # `_EXPFLAG[_EXP15]` — arm B of the AVX2 K-trim A/B: force the unified 1-vector-row tile on a
-        # box where `_unified_ok` is false (W<8). That reaches the SAME (W-1)/m trim granularity as the
-        # staircase but by shrinking the tile (mr=W) instead of splitting it, so it trades the wide
-        # bulk's register blocking away. Arm A (staircase, ships on) is `!_EXPFLAG[_EXP13]`.
-        mrv = (_unified_ok(eltype(B)) || @inbounds(_EXPFLAG[_EXP15])) ? Val(1) : Val(_MR)
+        mrv = _unified_ok(eltype(B)) ? Val(1) : Val(_MR)
         # NOTE: no A-pad here (unlike trsm). trmm's po2-ld conflict is mild (~2%); the O(k²) A-copy to
         # pad it costs about the same, so padding is net-negative for trmm — measured. (trsm's conflict
         # was catastrophic 0.78→1.12, there the copy pays.)
