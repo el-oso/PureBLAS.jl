@@ -992,10 +992,10 @@ function _pack_A_tri!(
     np = cld(mce, mr)
     @inbounds for pi in 0:(np - 1)
         base = pi * mr * kce
-        # Same k-range prune as the SIMD path above — keep the two in step.
-        mre = min(mr, mce - pi * mr); r0g = ic + pi * mr
-        plo = packed_upper ? max(0, r0g - pc) : 0
-        phi = packed_upper ? (kce - 1) : (min(kce, r0g + mre - pc) - 1)
+        # Same k-range prune (and same inverted _EXP13 disable) as the SIMD path — keep the two in step.
+        mre = min(mr, mce - pi * mr); r0g = ic + pi * mr; prune = !(@inbounds _EXPFLAG[_EXP13])
+        plo = (prune && packed_upper) ? max(0, r0g - pc) : 0
+        phi = (prune && !packed_upper) ? (min(kce, r0g + mre - pc) - 1) : (kce - 1)
         for p in plo:phi
             for r in 0:(mr - 1)
                 lr = pi * mr + r
@@ -1038,9 +1038,12 @@ end
             # DANGER: these bounds must stay identical to the consume side's plo/cnt in _trmm_packed!.
             # Widen them there without widening here and the kernel reads STALE SCRATCH, not zeros —
             # Ap is reused across calls, so the old code's zero-fill was load-bearing.
-            mre = min(mr, mce - pi * mr)
-            plo = packed_upper ? max(0, r0g - pc) : 0
-            phi = packed_upper ? (kce - 1) : (min(kce, r0g + mre - pc) - 1)
+            # `_EXPFLAG[_EXP13]` is INVERTED: the prune SHIPS ON and the flag restores the old
+            # full-kce zero-fill, so both arms are reachable in ONE process (cross-run is not
+            # adjudicable, and a fleet A/B on this must be same-process).
+            mre = min(mr, mce - pi * mr); prune = !(@inbounds _EXPFLAG[_EXP13])
+            plo = (prune && packed_upper) ? max(0, r0g - pc) : 0
+            phi = (prune && !packed_upper) ? (min(kce, r0g + mre - pc) - 1) : (kce - 1)
             for p in plo:phi
                 gp = pc + p; rthr = gp - r0g; dst = App + (base + p * mr) * sz
                 if full
