@@ -2816,12 +2816,7 @@ end
 # merge commit rather than at the commit that carried them.
 #   _EXPINT[5]  trmm kc override (0 = derived default) — the AOCL/BLIS `bli_trmm_determine_kc` arm
 #   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
-#   _EXPINT[7]  gbmvN per-column axpy unroll depth (0 = default `_axpy_simd!` routing). LLVM 20
-#               declined the unroll LLVM 18 fired on this loop; -force-vector-interleave=2/4 recovers
-#               +1.3%/+4.2% (galen), so a DEEPER Val regenerates the same shape through a consistent
-#               pipeline — unlike hand-duplicating the body, which measured 11% worse.
-#   _EXPINT[8]  witness: the depth `_gbmv_n_simd!` actually used (0 = default path)
-const _EXPINT = fill(0, 8)
+const _EXPINT = fill(0, 6)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
