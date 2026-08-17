@@ -60,8 +60,28 @@ end
             # carrier approach could not cover this write at all. `_seg` validates each extent at the
             # point the offset arithmetic happens; in release it IS the pointer arithmetic it replaces.
             segp = _seg(AB, Ap, (ku + ilo - j) + (j - 1) * ldb, len)
-            _axpy_simd!(len, α * unsafe_load(xp, j), segp, _seg(y, yp, ilo - 1, len))
+            ysegp = _seg(y, yp, ilo - 1, len)
+            c = α * unsafe_load(xp, j)
+            # EXPERIMENT (_EXPINT[7], 0 = ship default). `_axpy_simd!` routes an L1-resident segment to
+            # `_axpy_unrolled!(Val(_UNROLL))` with _UNROLL=4 — a knob MEASURED for standalone axpy past
+            # L1. gbmvN's regime is different (short band segments, hot, n calls), and probe regime must
+            # match live. LLVM 18 unrolled this loop 2x and LLVM 20 declines (726/30 FMAs -> 347/11),
+            # which is the whole gbmvN AVX2 regression; -force-vector-interleave=2/4 recovers +1.3%/+4.2%
+            # on galen. A deeper Val regenerates that shape through a CONSISTENT pipeline — the reason
+            # hand-duplicating the body failed by 11% (kb: pureblas-gbmvn-source-unroll-falsified).
+            # Literal Vals only: `Val(runtime)` would be type-unstable in the hot loop.
+            u = @inbounds _EXPINT[7]
+            if u == 0
+                _axpy_simd!(len, c, segp, ysegp)
+            elseif u == 8
+                _axpy_unrolled!(Val(8), len, c, segp, ysegp, 0)
+            elseif u == 16
+                _axpy_unrolled!(Val(16), len, c, segp, ysegp, 0)
+            else
+                _axpy_unrolled!(Val(2), len, c, segp, ysegp, 0)
+            end
         end
+        @inbounds _EXPINT[8] = _EXPINT[7]        # witness: which depth this call actually ran
     end
     return y
 end
