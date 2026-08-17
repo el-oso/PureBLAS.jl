@@ -39,6 +39,8 @@ mutable struct L3Workspace{T}
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
     m3::NTuple{9, Vector{T}}   # _gemm_3m_scratch:    Karatsuba 3M buffers (Ar/Ai/As, Br/Bi/Bs, P1/P2/P3)
     str::Vector{Matrix{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
+    strbt::Matrix{T}      # _strassen_bt: transB route Bᵀ, EXACT k×n. Deliberately NOT a `str` slot —
+                          # the nested Winograd recursion owns that whole pool, so sharing would alias.
     cholpad::Matrix{T}    # _chol_pad:    faer potrf po2-ld whole-matrix pad, ld=n+8 (grows R×n)
     chold::Matrix{T}      # _chol_d:      faer potrf diag-block scratch, (_chol_block+8)×_chol_block
     cholt::Matrix{T}      # _chol_t:      faer potrf panel workspace, grows R×_chol_block
@@ -56,7 +58,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
-    Matrix{T}[],
+    Matrix{T}[], Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -185,6 +187,19 @@ end
 # (this exact bug — a `<` row test leaking an old ld — cost pbtrf kd=64 a 2.10→1.81 regression).
 # W is re-zeroed every call: the kernels write only the in-band triangle and rely on the rest being
 # zero, and which part is "the rest" moves with ib/i3, so a reused buffer must not carry stale values.
+# transB-Strassen Bᵀ buffer. EXACT k×n, not grow-only: `transpose!` requires an exact-shape dest, and
+# keeping ld == k contiguous avoids the strided-top-left cache hazard the recursion's quadrant reads
+# would otherwise hit. Realloc churn is negligible — this only fires at n ≥ _STRASSEN_MIN (1024), where
+# a single allocation is a rounding error against 7 half-size matrix products.
+function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
+    ws = _l3ws(T)
+    bt = ws.strbt
+    if size(bt, 1) != k || size(bt, 2) != n
+        bt = Matrix{T}(undef, k, n); ws.strbt = bt
+    end
+    return bt
+end
+
 function _pbtrf_work(::Type{T}, nb::Int) where {T}
     ws = _l3ws(T)
     w = ws.bandw

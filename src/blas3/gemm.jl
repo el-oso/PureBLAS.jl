@@ -2571,8 +2571,38 @@ end
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
-        if _STRASSEN && !tA && !tB && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
-            return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
+        if _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
+            if !tB
+                return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
+            elseif T === Float64
+                # transB route (recovered from branch `transb-strassen`, 2026-08-17). WHY IT MATTERS:
+                # the triangular/symmetric ops cannot satisfy `!tA && !tB`, so none of them could ride
+                # Strassen at all — `_rank_k` dispatches `(tr, !tr)`, i.e. ALWAYS one transposed, and
+                # symm issues `(false, tr)`. That is the recorded cause of the symm/syr2k/trmm large-n
+                # miss vs AOCL (kb pureblas-blas23-aocl-root-causes §6): gemm rides Strassen at
+                # 1.24-1.29x there and the triangular ops are left on the classical kernel.
+                #
+                # Materializing Bᵀ costs one transpose and lets the SAME NN recursion run. Measured on
+                # the original branch (galen/AVX2, n=2048/4096): 59.6/67.4 GFlops vs packed-transB
+                # 54.3/54.9 and OB 50.6/50.7 — 1.18-1.33x vs OB, and the win survives the transpose
+                # (~4% off the NN path).
+                #
+                # Float64 only, as measured. F32 is NOT assumed to follow: its Strassen base is a
+                # different tile and the transpose is half the bytes per flop, so the trade differs —
+                # extend only behind its own measurement.
+                # Use the in-tree W×W SIMD block transpose, NOT LinearAlgebra's `transpose!` (which the
+                # original branch imported). PureBLAS exists to replace LinearAlgebra's BLAS — taking a
+                # dependency on it for a kernel is backwards, and `_transpose_dense!` is blocked rather
+                # than naive, which matters at these sizes: a scalar transpose of k×n at n≥1024 is
+                # cache-hostile in exactly the direction the recursion then reads.
+                # SHAPES. With tB, op(B) is k×n, so B itself is stored n×k. `_transpose_dense!(At, A,
+                # m, k)` is documented as A::(k×m) -> At::(m×k) column-major, so mapping A:=B gives
+                # its k:=n and its m:=k — i.e. the call below. `Bt` is an exact k×n Matrix, whose
+                # storage IS that column-major layout, so `vec` aliases it with no copy.
+                Bt = _strassen_bt(Float64, k, n)
+                _transpose_dense!(vec(Bt), B, k, n)
+                return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
+            end
         end
         if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
             # NORMALIZE the container types here (see `_pm`/`_root` in ptrmat.jl). Every operand is
