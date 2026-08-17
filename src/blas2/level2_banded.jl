@@ -55,8 +55,12 @@ end
         @inbounds for j in 1:n
             ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
             len <= 0 && continue
-            segp = Ap + ((ku + ilo - j) + (j - 1) * ldb) * sz
-            _axpy_simd!(len, α * unsafe_load(xp, j), segp, yp + (ilo - 1) * sz)
+            # SEGMENT VALIDATION (2026-08-17). Both operands are built here and handed to a shared
+            # kernel as raw Ptrs — `_axpy_simd!` cannot see past them, which is why the per-store
+            # carrier approach could not cover this write at all. `_seg` validates each extent at the
+            # point the offset arithmetic happens; in release it IS the pointer arithmetic it replaces.
+            segp = _seg(AB, Ap, (ku + ilo - j) + (j - 1) * ldb, len)
+            _axpy_simd!(len, α * unsafe_load(xp, j), segp, _seg(y, yp, ilo - 1, len))
         end
     end
     return y
@@ -73,8 +77,8 @@ end
             len <= 0 && continue
             c = α * unsafe_load(xp, j)                        # complex scalar α·x[j]
             (real(c) == 0 && imag(c) == 0) && continue
-            segp = Ap + ((ku + ilo - j) + (j - 1) * ldb) * sz
-            _axpy_cmplx_simd!(len, real(c), imag(c), segp, yp + (ilo - 1) * sz)
+            segp = _seg(AB, Ap, (ku + ilo - j) + (j - 1) * ldb, len)
+            _axpy_cmplx_simd!(len, real(c), imag(c), segp, _seg(y, yp, ilo - 1, len))
         end
     end
     return y
@@ -267,13 +271,13 @@ end
             if up                                       # band A[max(1,j-k):j, j]; diag AB[k+1,j]
                 ilo = max(1, j - k); len = j - ilo
                 ajj = unsafe_load(Ap + (k + (j - 1) * ldb) * sz)
-                segp = Ap + ((k + ilo - j) + (j - 1) * ldb) * sz       # AB[k+1+ilo-j, j]
-                s = _symv_col!(len, axj, segp, xp + (ilo - 1) * sz, yp + (ilo - 1) * sz)
+                segp = _seg(AB, Ap, (k + ilo - j) + (j - 1) * ldb, len)  # AB[k+1+ilo-j, j]
+                s = _symv_col!(len, axj, segp, _seg(x, xp, ilo - 1, len), _seg(y, yp, ilo - 1, len))
             else                                        # band A[j:min(n,j+k), j]; diag AB[1,j]
                 ihi = min(n, j + k); len = ihi - j
                 ajj = unsafe_load(Ap + (j - 1) * ldb * sz)
-                segp = Ap + (1 + (j - 1) * ldb) * sz                   # AB[2, j]
-                s = _symv_col!(len, axj, segp, xp + j * sz, yp + j * sz)
+                segp = _seg(AB, Ap, 1 + (j - 1) * ldb, len)            # AB[2, j]
+                s = _symv_col!(len, axj, segp, _seg(x, xp, j, len), _seg(y, yp, j, len))
             end
             _stc!(y, yp, j, unsafe_load(yp, j) + axj * ajj + α * s)
         end

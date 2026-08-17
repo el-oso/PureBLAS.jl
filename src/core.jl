@@ -103,6 +103,69 @@ end
 #
 # This is what "free in release" has to mean for a signature change: not merely that the check
 # disappears, but that nothing about the argument survives to compete for registers.
+# ── SEGMENT VALIDATION: check where the OFFSET IS COMPUTED, not at every store ──────────────────
+#
+# THE OBSERVATION THAT DRIVES THIS. Every out-of-bounds write found in this library came from an
+# offset or extent computed from the WRONG operand — ONCE per call or per column — after which every
+# store rides it (kb pureblas-shape-blind-tests-oob-writes):
+#   * gbmv: `chi` bounded by the x READ limit, ignoring that `y` has length n on trans='T'
+#   * ger:  `np` striding 3 while the dispatched panel wrote 8 columns
+#   * spr:  a packed `_pkL`/`_pkU` offset landing in the wrong column
+# So per-store checking pays O(n) to catch an O(1) error. Validating the SEGMENT where it is built
+# costs two checks per column and fails AT the arithmetic that was wrong — a far better diagnostic
+# than a BoundsError deep inside a SIMD kernel.
+#
+# There are 126 segment constructions in this tree against 655 store sites: 5x smaller surface.
+#
+# MECHANISM is Julia's own (1.11+), not a bespoke one: `Base.memoryrefnew(ref, i, boundscheck::Bool)`
+# is an offsettable reference carrying provenance, with a COMPILE-TIME-SELECTABLE check — the same
+# `Expr(:boundscheck)` machinery `--check-bounds` already drives for `Array`.
+#
+# MEASURED FREE IN RELEASE, by construction rather than by luck (bench/probes/memoryref_segment.jl):
+#     pointer(A) + off*sz                        lines=29  branches=0
+#     Ptr{T}(pointer(memoryrefnew(ref,i,false))) lines=29  branches=0   <- IDENTICAL
+#     Ptr{T}(pointer(memoryrefnew(ref,i,true)))  lines=87  branches=2   <- the check, when enabled
+# Positive control verified: the checked form throws BoundsError on a bad offset, the unchecked form
+# does not. Offsets are 1-BASED (ref@4 - ref@1 = 24 bytes = 3 elements), matching kernel indexing.
+#
+# ⚠ `pointer(::MemoryRef{T})` returns `Ptr{Nothing}`, NOT `Ptr{T}`. A missed cast does not fail —
+# `unsafe_load` quietly returns `nothing` and a store would be the wrong width. That is the exact
+# silent-corruption class this exists to remove, so the cast lives HERE, once, never at call sites.
+"""
+    _seg(a, off, len) -> Ptr{T}
+
+Pointer to the `len`-element segment of `a` starting at 0-based element offset `off`. Under
+`--check-bounds=yes` both ends are validated against `a`'s own memory; in a release build this is
+exactly `pointer(a) + off*sizeof(T)`.
+
+Pass the TRUE length the caller will touch: `len` is what makes a segment that starts in bounds and
+runs off the end detectable.
+"""
+# ⚠ TAKE THE ALREADY-HOISTED POINTER. The first version of this derived the pointer itself
+# (`Ptr{T}(pointer(memoryrefnew(a.ref, off+1, false)))`). That is free in a STANDALONE function —
+# measured 29 lines vs 29 for raw arithmetic — but NOT inside a kernel loop, where the original code
+# hoists `Ap = pointer(AB)` once and does pure arithmetic per iteration. Re-deriving `a.ref` and
+# calling `pointer` every iteration cost **+63 instructions (+3.1%) on `_gbmv_n_simd!`** (2027 →
+# 2090), measured. The synthetic probe could not see it because it had nothing to hoist.
+#
+# So: the pointer stays hoisted by the caller and is passed in; `a` is used ONLY to validate the
+# extent. In release this compiles to exactly `p + off*sizeof(T)` — the arithmetic it replaces.
+@inline function _seg(a, p::Ptr{T}, off::Integer, len::Integer) where {T}
+    _CHECKED && _seg_check(a, off, len)
+    return p + Int(off) * sizeof(T)
+end
+# A raw Ptr carrier has nothing to validate against (C-ABI entry, or a segment already derived from
+# one) — passthrough, honestly unchecked rather than falsely reassuring.
+@inline _seg(::Ptr, p::Ptr{T}, off::Integer, len::Integer) where {T} = p + Int(off) * sizeof(T)
+@inline _seg(::Nothing, p::Ptr{T}, off::Integer, len::Integer) where {T} = p + Int(off) * sizeof(T)
+
+@noinline function _seg_check(a::Array, off::Integer, len::Integer)
+    len <= 0 && return nothing                                   # empty segment: nothing dereferenced
+    Base.memoryrefnew(a.ref, Int(off) + 1, true)                 # first element in bounds
+    Base.memoryrefnew(a.ref, Int(off) + Int(len), true)          # LAST element in bounds
+    return nothing
+end
+
 @inline _carrier(a) = _CHECKED ? a : nothing
 @inline _cbase(b::Integer) = _CHECKED ? b : 0
 
