@@ -1077,7 +1077,17 @@ end
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T <: BlasReal, MRV}
     m = size(B, 1); n = size(B, 2); W = _vwidth(T); mr = MRV * W; nr = _NR
     packed_upper = (up != tr)
-    kc = min(_KC, m); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
+    kc = min(_KC, m)
+    # EXPERIMENT (_EXPINT[5], 0 = off): a trmm-SPECIFIC kc — the AOCL/BLIS `bli_trmm_determine_kc` arm.
+    # At gate sizes the derived kc covers the WHOLE triangle in a single pc-block, so every tile packs
+    # through _pack_A_tri! and half the packed-A buffer is zero-fill. A smaller kc turns most of the
+    # triangle into fully-dense `stored` blocks (cheap _pack_A!, no zero-fill) plus wholly-skipped
+    # zpanels. This is a PACK-TRAFFIC / footprint lever, NOT the flop lever falsified on 2026-08-17 —
+    # the zero FMAs themselves measured free, so only the packing and residency can still be paying.
+    ov = @inbounds _EXPINT[5]
+    ov > 0 && (kc = min(max(ov, W), m))
+    @inbounds _EXPINT[6] = kc                    # witness: the kc this call actually ran with
+    mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     nblk = cld(m, kc); bpf_blk = cld(nc, nr) * nr * kc          # one packed pc-block slot (padded to kc)
     Ap, _ = _gemm_scratch(T, cld(mc, mr) * mr * kc, 1)
@@ -2786,7 +2796,9 @@ end
 # state on a path that ships. Re-add one for the next campaign, in-session, via Revise — that is what the
 # slot table is for. Removing the ztrsmR/ztrsm/trmm witnesses is why the gate was re-measured at the
 # merge commit rather than at the commit that carried them.
-const _EXPINT = fill(0, 4)
+#   _EXPINT[5]  trmm kc override (0 = derived default) — the AOCL/BLIS `bli_trmm_determine_kc` arm
+#   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
+const _EXPINT = fill(0, 6)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
