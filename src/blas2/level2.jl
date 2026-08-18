@@ -2824,6 +2824,8 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both AVX2 boxes (Zen4 1.03×, Zen3
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
+# PROBE TOGGLE (temporary) — see the `_tcut` use in `_trsv_blk!`. Forces T forms onto the blocked path.
+const _TRSV_T_FORCE_BLK = Ref(false)
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 
 # Reciprocal-of-diagonal scratch for REAL trsv (per type; single-thread — no MT here). Same mechanism the
@@ -3488,7 +3490,12 @@ end
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
-    (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
+    # PROBE TOGGLE (temporary): force T forms onto the BLOCKED path from n>NB, to measure in situ what
+    # `_TRI_T_UNB`'s own comment already claims for AVX-512 ("Zen5 blocks even at n=128, blk wins 1-6%
+    # ≤512"). That figure was taken on the standalone trsv row; inside potrs the T pass runs CACHE-WARM
+    # (pass 1 just streamed the same triangle), which is a different regime.
+    _tcut = _TRSV_T_FORCE_BLK[] ? NB : _TRI_T_UNB
+    (n <= NB || (tr && n <= _tcut)) && return _trsv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trsv_fused8!`) replaces the blocked
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
