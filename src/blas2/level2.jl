@@ -3261,6 +3261,107 @@ end
 #     them into registers took it to 0.71/0.84/1.06 at n=64/128/256. Runtime-bounded inner loops do
 #     not get unrolled, so the broadcasts must be written out explicitly.
 # Numerics: reassociated vs the per-column sweep; residual-checked, not bitwise.
+
+# ── fully-unrolled REGISTER-RESIDENT tiny-n triangular solve (N forms) ────────────────────────────
+# WHY THIS SHAPE. A tiny trsv is LATENCY-bound and serial: the chain is x₁→x₂→…→x_n, one dependent op
+# per column. Measured cost breakdown of `_trsv_simd!` (Zen4, floor-subtracted, 3-term fit
+# t = c + a·n + b·n²): c=2.11 ns, a=9.33 ns/COLUMN (~37 cycles), b=0.0675 ns/n² — at n=8 that is
+# 92% per-column and 5% arithmetic. `_trsv_fused8!` removes the per-column `_axpy_simd!` calls but its
+# triangle still round-trips x through memory (`unsafe_store!`/`unsafe_load` per element, ~5 cycles of
+# store-forwarding per hop). Holding x in SCALAR registers removes that last hop.
+#
+# SCALAR, NOT SIMD, AND THAT IS DELIBERATE. Putting x in one `Vec` would need a lane extract on every
+# chain step (the scalar multiplier for column j), which is *on* the critical path. Scalar registers
+# also make the kernel **W-INDEPENDENT**, so AVX2 (galen, W=4 — the worst cell at 0.743) gets exactly
+# the same code as AVX-512. This matches what AOCL does: `dtrsm_LLNU_small` is scalar (10 vmovsd,
+# 3 vsubsd, only 4 packed vmovupd), read statically from libflame.so.
+#
+# The reciprocals are computed UP FRONT and mutually independent, so the divides pipeline instead of
+# sitting on the substitution chain — the same fix that turned fused8's U/non-unit shape from 0.69 to
+# 1.10. `Expr(:meta, :inline)` is emitted into the body because `@inline` does NOT propagate into a
+# `@generated` CodeInfo on Julia 1.12+ (recorded hazard: without it, args pass BY POINTER and the
+# caller's accumulators get stack-demoted).
+@generated function _trsv_reg!(::Val{N}, ::Val{UP}, ::Val{UNIT}, A, x) where {N, UP, UNIT}
+    T = eltype(A)
+    sz = sizeof(T)
+    xs = [Symbol(:xv_, i) for i in 1:N]
+    cs = [Symbol(:cp_, j) for j in 1:N]
+    rs = [Symbol(:rc_, j) for j in 1:N]
+    body = Expr(:block)
+    push!(body.args, :(Ap = pointer(A)), :(xp = pointer(x)), :(lda = stride(A, 2)))
+    for j in 1:N                                   # column base pointers
+        push!(body.args, :($(cs[j]) = Ap + $((j - 1) * sz) * lda))
+    end
+    for i in 1:N                                   # x into registers, once
+        push!(body.args, :($(xs[i]) = unsafe_load(xp, $i)))
+    end
+    if !UNIT                                       # all reciprocals first: independent ⇒ pipelined
+        for j in 1:N
+            push!(body.args, :($(rs[j]) = inv(unsafe_load($(cs[j]), $j))))
+        end
+    end
+    order = UP ? (N:-1:1) : (1:N)
+    for j in order
+        UNIT || push!(body.args, :($(xs[j]) = $(xs[j]) * $(rs[j])))
+        rows = UP ? (1:(j - 1)) : ((j + 1):N)
+        for i in rows                              # independent of each other ⇒ pipeline under the chain
+            push!(body.args, :($(xs[i]) = $(xs[i]) - $(xs[j]) * unsafe_load($(cs[j]), $i)))
+        end
+    end
+    for i in 1:N                                   # store once
+        push!(body.args, :(unsafe_store!(xp, $(xs[i]), $i)))
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        @inbounds GC.@preserve A x begin
+            $body
+        end
+        return x
+    end
+end
+
+# Largest n solved by the fully-unrolled register-resident kernel.
+# PDM: P = `@load_preference`; D = DERIVED from the SCALAR FP REGISTER FILE.
+# Criterion: the kernel's whole working set is x (n scalar registers) plus a small fixed number of
+# temps (column pointer, reciprocal, the multiplier in flight, an address temp ⇒ ~4). It wins while
+# that fits, and degrades once the unrolled body spills. The governing count is the **x86-64 scalar FP
+# register file = 16 xmm**, which is UNIFORM across the whole fleet (Zen3/Zen4/Zen5) — deliberately NOT
+# `_NVREG` (=32 under AVX-512 here): this kernel is scalar and LLVM allocates it in xmm0-15, so the
+# vector-register count is the wrong resource. Being W-independent is the point — galen (AVX2, W=4) is
+# the worst getrs@8 cell and no AVX-512-width trick could close it.
+#   _TRSV_REG_MAX = _SCALAR_FPREGS - 4 = 12
+# VALIDATED against the measured knee (Zen4, all four shapes, worst-shape speedup vs `_trsv_simd!`):
+#   n     8      11     12     13     16
+#   min  2.03   2.55   2.47   1.73   1.75
+# i.e. the drop lands exactly between 12 and 13, as the residency model predicts. The kernel still WINS
+# at every n ≤ 16, so this bound is chosen for where the win is best-and-still-growing, not to avoid a
+# regression; raising it is safe on speed and costs only generated code (bodies are O(n²) statements).
+const _SCALAR_FPREGS = 16      # x86-64 xmm0-15; architectural, not µarch-dependent
+const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
+
+# Runtime n → `Val(n)` ladder, emitted from `_TRSV_REG_MAX` so the generated set tracks the bound and
+# no size is hand-listed. Falls through to `_trsv_simd!` above the unrolled set.
+@generated function _trsv_reg_val!(::Val{UP}, ::Val{UNIT}, n::Int, A, x) where {UP, UNIT}
+    body = :(_trsv_simd!($UP, false, $UNIT, n, A, x))
+    for N in _TRSV_REG_MAX:-1:1
+        body = Expr(:if, :(n == $N), :(_trsv_reg!(Val($N), Val($UP), Val($UNIT), A, x)), body)
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        $body
+    end
+end
+
+@inline function _trsv_reg_n!(up::Bool, unit::Bool, n::Int, A, x)
+    return if up
+        unit ? _trsv_reg_val!(Val(true), Val(true), n, A, x) :
+        _trsv_reg_val!(Val(true), Val(false), n, A, x)
+    else
+        unit ? _trsv_reg_val!(Val(false), Val(true), n, A, x) :
+        _trsv_reg_val!(Val(false), Val(false), n, A, x)
+    end
+end
+
 @inline function _trsv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -3368,6 +3469,23 @@ end
 
 @inline function _trsv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
+    # TINY/SMALL N FORMS. `_trsv_simd!` is dominated by its PER-COLUMN loop, not by arithmetic: a 3-term
+    # fit of its measured curve (t = c + a·n + b·n², Zen4, floor-subtracted, reps=32) gives c=2.11 ns,
+    # a=9.33 ns/COLUMN (~37 cycles), b=0.0675 ns/n² — at n=8 that is 2.6% fixed / 92.1% per-column /
+    # 5.3% arithmetic, and still 81% per-column at n=32. The cause is the `_axpy_simd!` call per column
+    # with lengths n-1..0, every one below the vector width, so each pays a call and a regime ladder to
+    # move at most W-1 scalars. Two replacements, measured (worst shape of the four, vs `_trsv_simd!`):
+    #   n ≤ _TRSV_REG_MAX → `_trsv_reg!`  x1.38-2.55, and it wins on ALL FOUR (uplo × diag) shapes.
+    # ONLY the register kernel is routed here. Sending 12 < n ≤ NB to `_trsv_fused8!` was tried and
+    # REVERTED: fused8 is shape-DEPENDENT at those sizes — it wins L/unit (1.35 at n=32) but LOSES
+    # U/non-unit (0.887 at n=32, 0.945 at 48, 0.984 at 64), and getrs issues exactly one of each, so the
+    # average looked positive while the gate went DOWN on all three boxes at n=32 (1.080→1.025 Zen4,
+    # 1.408→1.351 Zen3, 1.091→0.969 Zen5). A per-shape table beats an end-to-end average when the caller
+    # uses more than one shape.
+    if !tr && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) &&
+            x isa StridedVector && stride(x, 1) == 1
+        return _trsv_reg_n!(up, unit, n, A, x)
+    end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
     (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
