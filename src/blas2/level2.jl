@@ -3384,6 +3384,10 @@ end
 # one pass over the panel's 8 columns, one horizontal reduce per column per panel instead of per
 # column per row-block — and only the 8×8 triangle stays serial. That is the same trade
 # `_trsv_fused8!` makes for the N form, transposed: 8 fused dots instead of 8 fused axpys.
+# Panel width. F=8 matches `_trsv_fused8!` and the number of independent accumulators the kernel keeps
+# live; the routing bound below is expressed as a multiple of it rather than as a bare size literal.
+const _TRSV_T_F = 8
+
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -3635,7 +3639,19 @@ end
     # axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth on the same
     # bytes, which is the whole potrsL miss; blocking was measured at only 1.00-1.05 and is not it.
     # Needs unit-stride columns for the vector loads; anything else keeps the paths below.
-    if tr && n > NB && eltype(A) <: BlasReal && _strided1(A) &&
+    # LOWER ONLY, and that restriction is MEASURED, not cautious. Fused-vs-dots by shape (Zen4):
+    #   n            16     32     64    128    256    512   1024   2048
+    #   L,non-unit  1.03   1.48   1.48   1.53   1.39   1.22   1.23   1.82
+    #   L,unit      1.66   1.85   1.86   1.88   1.66   1.27   1.25   1.97
+    #   U,non-unit  0.95   0.76   0.79   0.87   0.99   1.01   1.04   1.43   <-- LOSES below n=512
+    #   U,unit      0.91   0.96   0.97   1.03   1.03   1.00   1.06   1.44
+    # Applying it to BOTH uplo (the first version of this commit) would have shipped a 13.5% regression
+    # on U/non-unit at n=128 — caught only by timing the shape the change was NOT motivated by. Upper
+    # keeps its existing, already-gated routing. `potrs` uses the lower form, which is the cluster this
+    # closes; `getrs(trans='T')` uses the upper form and is deliberately left alone.
+    # Lower bound is 2F (two panels): the tall region must span at least one full panel beyond the 8x8
+    # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
+    if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
             x isa StridedVector && stride(x, 1) == 1
         return _trsv_fused8_t!(up, unit, n, A, x)
     end
