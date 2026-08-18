@@ -31,6 +31,24 @@ if ! bench/cache_staleness.sh; then
 fi
 
 echo
+echo "══ 1b  pb arm vs its reference arms: same clock?"
+# `cache_staleness.sh` answers "is this cell measured against today's CODE"; this answers "is it
+# measured in the same MACHINE STATE as the references it is divided by". Both are needed: on
+# 2026-08-18 neuromancer's refresh was 100% current AND 100% invalid, because the box boosted to
+# 4.7 GHz for the whole sweep against references cached at 2.0 GHz, inflating every Zen5 ratio ~2.3x.
+# `freqgate.jl` structurally cannot see that (its reference is the header, which floated too).
+if ! bench/check_arm_clocks.sh; then
+    if [ -n "$FORCE" ]; then
+        echo "(--force given: publishing over clock-mismatched cells)"
+    else
+        echo
+        echo "REFUSING TO PUBLISH — these ratios divide arms measured at different clocks."
+        echo "Re-lock the box and re-measure (per the message above), or re-run with --force."
+        exit 1
+    fi
+fi
+
+echo
 echo "══ 2  rebuild artifacts (both reference views + tables)"
 build_artifacts || { echo "BUILD FAILED — nothing published"; exit 2; }
 
