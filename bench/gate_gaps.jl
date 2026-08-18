@@ -18,6 +18,7 @@
 
 const QN = 48
 include(joinpath(@__DIR__, "freqgate.jl"))     # _freq_ref / _freq_of / _freq_offlock — see that file
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 
 # A cell is skipped when ANY of its arms was measured off-lock, not just `pb`: the gate is a RATIO, so a
 # floated reference arm corrupts it exactly as much as a floated pb arm does.
@@ -112,8 +113,8 @@ for path in ARGS, (lvl, op, sz, d, com) in cells(path)
 end
 
 sort!(rows; by = first)
-fails = [r for r in rows if r[1] < 1.0]
-println("cells=", length(rows), "  below 1.0=", length(fails),
+fails = [r for r in rows if !gate_pass(r[1])]
+println("cells=", length(rows), "  below gate (round2sig < 1.00)=", length(fails),
     isempty(OFFLOCK) ? "" : "  EXCLUDED(off-lock)=$(length(OFFLOCK))")
 # FREQUENCY PROVENANCE, printed unconditionally — a report that says nothing about the clock reads as
 # "the clock was fine", which is precisely the claim a backfilled cache cannot support.

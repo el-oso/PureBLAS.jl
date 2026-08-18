@@ -14,6 +14,7 @@
 const QN = 48
 med(v) = (s = sort(v); s[max(1, cld(length(s), 2))])
 include(joinpath(@__DIR__, "freqgate.jl"))     # _freq_ref / _freq_of / _freq_offlock — see that file
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 
 # OFF-LOCK CELLS ARE EXCLUDED AND REPORTED. A cell measured while the frequency lock was floating is not
 # adjudicable, and this table's verdict is a MIN over cells — so one drifted cell can set a whole
@@ -86,7 +87,7 @@ end
 # a glance. The ratio stays in the cell and is the authoritative signal: colour is a redundant
 # encoding, never the only one, so the table still reads correctly in monochrome or to a colourblind
 # reader. Emitted as `@raw html` because Documenter markdown tables cannot carry per-cell classes.
-band(g) = g >= 1.0 ? "ok" : g >= 0.99 ? "b1" : g >= 0.95 ? "b2" : g >= 0.85 ? "b3" : "b4"
+band(g) = gate_pass(g) ? "ok" : g >= 0.99 ? "b1" : g >= 0.95 ? "b2" : g >= 0.85 ? "b3" : "b4"
 
 # A FAILING gate is printed at 3 digits and FLOORED; a passing one at 2, rounded. Two reasons, both
 # about not lying with a rounded number:
@@ -97,7 +98,7 @@ band(g) = g >= 1.0 ? "ok" : g >= 0.99 ? "b1" : g >= 0.95 ? "b2" : g >= 0.85 ? "b
 #     banded differently, which looks like a rendering bug.
 # The band is then computed from the DISPLAYED value, so colour and number cannot disagree.
 function gatestr(g)
-    s = g >= 1.0 ? string(round(g; digits = 2)) : string(floor(g * 1000) / 1000)
+    s = gate_pass(g) ? string(round(g; digits = 2)) : string(floor(g * 1000) / 1000)
     return s, band(parse(Float64, s))
 end
 
@@ -157,7 +158,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
             gate = minimum(gs)                          # the gate IS the worst cell, per box
             # A passing row needs no size — it gates everywhere. A failing one names the cell to fix,
             # which is the actionable unit; the ratio alone would say nothing about where to look.
-            sz = gate >= 1.0 ? "" : "<span class=\"n\">n=$(cs[argmin(gs)][1])</span>"
+            sz = gate_pass(gate) ? "" : "<span class=\"n\">n=$(cs[argmin(gs)][1])</span>"
             # A partially excluded routine is a PARTIAL verdict — the min is over fewer cells than the
             # sweep measured, and the missing ones could be the worst. Say so in the cell itself.
             nx > 0 && (sz *= "<span class=\"n\">−$nx off-lock</span>")

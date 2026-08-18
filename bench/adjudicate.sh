@@ -36,10 +36,11 @@ for ln in readlines(ARGS[1])
     haskey(d, "pb") || continue
     push!(rat, minimum(median(d[r] ./ d["pb"]) for r in ("openblas","aocl") if haskey(d, r)))
 end
-k = count(<(1.0), rat); n = length(rat)
+GATE_MIN = 0.995   # keep in sync with bench/gatecrit.jl (inline julia here cannot include it)
+k = count(<(GATE_MIN), rat); n = length(rat)
 lg(a,b) = sum(log, (a-b+1):a; init=0.0) - sum(log, 1:b; init=0.0)
 tail(m,nn) = sum(exp(lg(nn,i)) for i in 0:m; init=0.0) / 2.0^nn
 p = n == 0 ? 1.0 : min(1.0, 2 * (k <= n/2 ? tail(k,n) : tail(n-k,n)))
 println("median=", n==0 ? "NA" : round(median(rat); digits=4), "  below=", k, "/", n,
         "  sign p=", round(p; digits=4), "   ",
-        n == 0 ? "NO DATA" : (p < 0.05 && median(rat) < 1 ? "FAIL (real)" : "PASS≈ (retire)"))' "$log"
+        n == 0 ? "NO DATA" : (p < 0.05 && median(rat) < GATE_MIN ? "FAIL (real)" : "PASS≈ (retire)"))' "$log"

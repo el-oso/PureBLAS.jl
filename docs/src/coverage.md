@@ -3,7 +3,8 @@
 Which `LinearAlgebra` operations route to PureBLAS after `PureBLAS.activate()`, and how they measure.
 
 Every number is a **PB / max(OpenBLAS, AOCL) speed ratio**: the routine's worst (op, size) cell on that
-box, one column per microarchitecture. `≥ 1.0` gates; a miss is printed at three digits, floored, and
+box, one column per microarchitecture. `≥ 1.0` **to two significant digits** gates (so `0.995` passes,
+`0.9949` does not — see [Methodology](methodology.md)); a miss is printed at three digits, floored, and
 bolded (routing tables) or colour-banded (BLAS tables). **Routes** = forwards to PureBLAS via LBT after
 `activate()`; ⏳ = not gated yet. Types: **s** = Float32, **d** = Float64, **c** = ComplexF32,
 **z** = ComplexF64.

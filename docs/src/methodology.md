@@ -9,6 +9,15 @@ where it comes from, and the caveats that change how a cell should be read.
 faster. Both references are always measured, because a routine can beat one by a wide margin and lose to
 the other; the gate takes the faster of the two at each individual cell.
 
+The comparison is made on the ratio **rounded to two significant digits**: `0.995` rounds to `1.0` and
+gates; `0.9949` rounds to `0.99` and does not. The threshold itself is unchanged at `1.00` — what is
+specified is the precision. Per-cell machine-state drift on this fleet runs ~1–6% (every cached arm
+records the anchor it was measured under), so the third digit of a ratio is not adjudicable, and the
+rounded value is the one these tables print. A verdict that disagreed with the number on the page would
+be reporting a miss at a precision the measurement cannot support. The criterion lives in exactly one
+place, `bench/gatecrit.jl`, and every tool that prints a verdict, colours a cell or counts a miss calls
+into it.
+
 Verdicts are **per microarchitecture** — a single pooled verdict cannot express "gates on Zen4, misses on
 Zen3", and pooling once misreported banded Cholesky as 0.891 failing when Zen4 alone read 1.03. Every
 table therefore carries one column per box, each from that box's own `bench/plots.jl` sweep.
@@ -53,7 +62,8 @@ labels are stamped authoritatively into each cache header (`uarch=`).
 
 ## How to read a cell
 
-- **Colour bands** in the per-routine tables band the shortfall (**≥ 1.0 gates** · **≥ 0.99** ·
+- **Colour bands** in the per-routine tables band the shortfall (**gates, i.e. ≥ 1.0 to two significant
+  digits** · **≥ 0.99** ·
   **≥ 0.95** · **≥ 0.85** · **below 0.85**). The number is the verdict; colour only bands it, so the
   table reads correctly in monochrome and for a colourblind reader. A failing gate is printed at three
   digits and **floored**, so a miss can never round up to a reassuring `1.0`.

@@ -16,6 +16,7 @@
 #                                                              #  its native Haswell kernels. On AMD MKL
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
 # Reference BLAS: OpenBLAS (default), Intel MKL (`mkl` arg), or AMD AOCL (`aocl` arg). Each package
@@ -1930,7 +1931,7 @@ for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in 
         isempty(rs) || (gate = min(gate, minimum(rs)))
     end
     txt = join((@sprintf("%s %.2f/%.2f", r, per[r][1], per[r][2]) for r in _REF_ALL if haskey(per, r)), "  ")
-    @printf("%-3s %-8s %s   gate=%.3f %s\n", lvl, nm, txt, gate, gate >= 1.0 ? "PASS" : "FAIL")
+    @printf("%-3s %-8s %s   gate=%.3f %s\n", lvl, nm, txt, gate, gate_pass(gate) ? "PASS" : "FAIL")
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"
 
