@@ -96,6 +96,24 @@ jobs:
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
         run: julia --project=. juliac/build.jl
 
+  # The ONE artifact check that can run here. Everything else in the publish gate
+  # (bench/check_artifacts_current.sh) rebuilds the plots from bench/plots_data_*.txt, which are
+  # gitignored and never pushed — CI has no caches, so it cannot judge whether a plot matches its data.
+  # It CAN judge that the two reference views moved together, which is the failure that shipped: the
+  # OpenBLAS SVGs sat at bdb9497 while the AOCL set was re-rendered three times.
+  artifact-pairing:
+    name: Perf plot views paired (OpenBLAS ⟷ AOCL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needs the base commit to diff against
+      - name: Both reference views changed together
+        run: |
+          base='${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}'
+          case "$base" in ''|0000000000000000000000000000000000000000) echo "no base commit to diff (first push) — skipping"; exit 0 ;; esac
+          git diff --name-only "$base" '${{ github.sha }}' | bench/check_view_pairing.sh
+
   perf:
     name: Perf regression (PkgBenchmark judge)
     if: github.event_name == 'pull_request'
