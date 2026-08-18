@@ -631,6 +631,36 @@ function run_benchmarks()
                 end; c[3][1]
             )
         )
+        # ── trsv LOWER, and the TRANSPOSED form — the shapes real callers actually issue ────────────
+        # The `trsv` row above measures uplo='U', trans='N' ONLY. `potrs` issues L/N then L/T, and
+        # `getrs` issues L/N-unit then U/N (and the transposed pair for trans='T'), so NEITHER of
+        # potrs's shapes was gated. That hole hid a real miss: on 2026-08-18 `trsv` read 1.014/1.007/
+        # 1.001 on Zen5 at n=256/512/1024 while `potrsL` read 0.891/0.836/0.905 at the SAME sizes on the
+        # SAME box — the benchmark was measuring the one shape that was fine. The T form had no fused
+        # panel kernel at all (the N form has had `_trsv_fused8!` for months); adding `_trsv_fused8_t!`
+        # moved the T pass 1.4-1.5x. A kernel shape that no row measures can regress indefinitely, so
+        # both shapes are gated from here on.
+        let LO = Char(76)
+            for (nm, ul, tr) in (("trsvLN", LO, TN), ("trsvLT", LO, TT))
+                add(
+                    nm, s -> (
+                        A = randn(s, s) ./ (2s); for i in 1:s
+                            A[i, i] = 1 + abs(A[i, i])
+                        end; (A, randn(s), randn(s))
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            copyto!(c[3], c[2]); B.trsv!(ul, tr, TN, c[1], c[3])
+                        end; c[3][1]
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            copyto!(c[3], c[2]); PureBLAS.trsv!(c[1], c[3]; uplo = ul, trans = tr)
+                        end; c[3][1]
+                    )
+                )
+            end
+        end
         add(
             "spmv", pk, (c, m) -> (
                 for _ in 1:m

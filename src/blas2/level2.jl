@@ -2824,9 +2824,6 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both AVX2 boxes (Zen4 1.03×, Zen3
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
-# PROBE TOGGLE (temporary) — selects the fused T panel kernel in `_trsv_blk!`, so the new kernel can be
-# A/B'd against the incumbent through the identical production entry rather than from a closure.
-const _TRSV_T_FUSED = Ref(true)
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 
 # Reciprocal-of-diagonal scratch for REAL trsv (per type; single-thread — no MT here). Same mechanism the
@@ -3618,7 +3615,7 @@ end
     NB = _TRI_NB
     # TINY/SMALL N FORMS. `_trsv_simd!` is dominated by its PER-COLUMN loop, not by arithmetic: a 3-term
     # fit of its measured curve (t = c + a·n + b·n², Zen4, floor-subtracted, reps=32) gives c=2.11 ns,
-    # a=9.33 ns/COLUMN (~37 cycles), b=0.0675 ns/n² — at n=8 that is 2.6% fixed / 92.1% per-column /
+    # a=9.33 ns/COLUMN (~26 cycles at the locked 2.81 GHz), b=0.0675 ns/n² — at n=8 that is 2.6% fixed / 92.1% per-column /
     # 5.3% arithmetic, and still 81% per-column at n=32. The cause is the `_axpy_simd!` call per column
     # with lengths n-1..0, every one below the vector width, so each pays a call and a regime ladder to
     # move at most W-1 scalars. Two replacements, measured (worst shape of the four, vs `_trsv_simd!`):
@@ -3633,14 +3630,12 @@ end
             x isa StridedVector && stride(x, 1) == 1
         return _trsv_reg_n!(up, unit, n, A, x)
     end
-    # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
-    # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
     # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
     # had all along — 8 independent dot accumulators over the already-solved region instead of 8 fused
     # axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth on the same
     # bytes, which is the whole potrsL miss; blocking was measured at only 1.00-1.05 and is not it.
     # Needs unit-stride columns for the vector loads; anything else keeps the paths below.
-    if tr && n > NB && _TRSV_T_FUSED[] && eltype(A) <: BlasReal && _strided1(A) &&
+    if tr && n > NB && eltype(A) <: BlasReal && _strided1(A) &&
             x isa StridedVector && stride(x, 1) == 1
         return _trsv_fused8_t!(up, unit, n, A, x)
     end
