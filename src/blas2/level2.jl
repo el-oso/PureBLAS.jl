@@ -2824,8 +2824,9 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both AVX2 boxes (Zen4 1.03×, Zen3
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
-# PROBE TOGGLE (temporary) — see the `_tcut` use in `_trsv_blk!`. Forces T forms onto the blocked path.
-const _TRSV_T_FORCE_BLK = Ref(false)
+# PROBE TOGGLE (temporary) — selects the fused T panel kernel in `_trsv_blk!`, so the new kernel can be
+# A/B'd against the incumbent through the identical production entry rather than from a closure.
+const _TRSV_T_FUSED = Ref(true)
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 
 # Reciprocal-of-diagonal scratch for REAL trsv (per type; single-thread — no MT here). Same mechanism the
@@ -3364,6 +3365,150 @@ end
     end
 end
 
+# ── FUSED F=8 PANEL SWEEP FOR THE **T** FORMS ────────────────────────────────────────────────────
+# The N forms have had `_trsv_fused8!` for a while; the T forms never got the equivalent, and that
+# asymmetry IS the potrsL miss. `potrs` issues L/N then L/T over the SAME n²/2 triangle, so the two
+# passes move identical bytes — yet measured per-pass (bench/probes/potrs_pass_decomp.jl, one process,
+# production entries, floor-subtracted):
+#
+#     n           128    256    512   1024   2048
+#     Zen4 T/N    2.25   1.97   1.40   1.27   1.10      L,N 39.6 GB/s vs L,T 17.6 GB/s at n=128
+#     Zen5 T/N    2.06   1.65   1.56   1.27   1.11      L,N 28.3 GB/s vs L,T 13.7 GB/s at n=128
+#
+# and the ONE size where T/N approaches 1 (2048) is the ONE size where potrsL gates. Structure was
+# measured at ~0% and po2-`lda` padding at ~0-4%, so neither is the cause; and forcing the T form onto
+# the existing BLOCKED path buys only 1.00-1.05 (measured both boxes) — confirming `_TRI_T_UNB`'s own
+# recorded "1-6%" and proving blocking is not the answer.
+#
+# WHY THE T FORM WAS SLOWER. Back/forward substitution by dots (`_trsv_simd!`) issues ONE reduction per
+# column: n dependent `_dot_simd` calls, each with its own horizontal reduce on the critical path, and
+# x reloaded from memory every column. This kernel amortises that over a panel of F=8: the rows already
+# solved (the "tall" region) contribute to all 8 columns at once through 8 INDEPENDENT accumulators —
+# one pass over the panel's 8 columns, one horizontal reduce per column per panel instead of per
+# column per row-block — and only the 8×8 triangle stays serial. That is the same trade
+# `_trsv_fused8!` makes for the N form, transposed: 8 fused dots instead of 8 fused axpys.
+@inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)
+    T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    GC.@preserve A x begin
+        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+        if up                                     # U,T ⇒ Uᵀ lower ⇒ FORWARD, panels ascending
+            lo = 1
+            @inbounds while lo <= n
+                hi = min(n, lo + 7)
+                top = lo - 1                      # rows already solved: 1..lo-1, contiguous from row 1
+                if top > 0
+                    if hi - lo + 1 == 8
+                        c0 = Ap + (lo - 1) * lda * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                        c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                        c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                        a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+                        a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
+                        i = 0
+                        while i + W <= top
+                            o = i * sz; xv = vload(V, xp + o)
+                            a0 = muladd(vload(V, c0 + o), xv, a0); a1 = muladd(vload(V, c1 + o), xv, a1)
+                            a2 = muladd(vload(V, c2 + o), xv, a2); a3 = muladd(vload(V, c3 + o), xv, a3)
+                            a4 = muladd(vload(V, c4 + o), xv, a4); a5 = muladd(vload(V, c5 + o), xv, a5)
+                            a6 = muladd(vload(V, c6 + o), xv, a6); a7 = muladd(vload(V, c7 + o), xv, a7)
+                            i += W
+                        end
+                        s0 = sum(a0); s1 = sum(a1); s2 = sum(a2); s3 = sum(a3)
+                        s4 = sum(a4); s5 = sum(a5); s6 = sum(a6); s7 = sum(a7)
+                        while i < top             # scalar tail of the tall region
+                            xi = unsafe_load(xp, i + 1)
+                            s0 += unsafe_load(c0, i + 1) * xi; s1 += unsafe_load(c1, i + 1) * xi
+                            s2 += unsafe_load(c2, i + 1) * xi; s3 += unsafe_load(c3, i + 1) * xi
+                            s4 += unsafe_load(c4, i + 1) * xi; s5 += unsafe_load(c5, i + 1) * xi
+                            s6 += unsafe_load(c6, i + 1) * xi; s7 += unsafe_load(c7, i + 1) * xi
+                            i += 1
+                        end
+                        unsafe_store!(xp, unsafe_load(xp, lo) - s0, lo)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 1) - s1, lo + 1)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 2) - s2, lo + 2)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 3) - s3, lo + 3)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 4) - s4, lo + 4)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 5) - s5, lo + 5)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 6) - s6, lo + 6)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 7) - s7, lo + 7)
+                    else                          # ragged final panel
+                        for k in lo:hi
+                            s = _dot_simd(top, Ap + (k - 1) * lda * sz, xp, T)
+                            unsafe_store!(xp, unsafe_load(xp, k) - s, k)
+                        end
+                    end
+                end
+                for j in lo:hi                    # F×F triangle: chain is F, not n
+                    cp = Ap + (j - 1) * lda * sz
+                    s = unsafe_load(xp, j)
+                    for i in lo:(j - 1)
+                        s -= unsafe_load(cp, i) * unsafe_load(xp, i)
+                    end
+                    unsafe_store!(xp, unit ? s : s / unsafe_load(cp + (j - 1) * sz), j)
+                end
+                lo = hi + 1
+            end
+        else                                      # L,T ⇒ Lᵀ upper ⇒ BACKWARD, panels descending
+            hi = n
+            @inbounds while hi > 0
+                lo = max(1, hi - 7)
+                rest = n - hi                     # rows already solved: hi+1..n, contiguous below hi
+                if rest > 0
+                    if hi - lo + 1 == 8
+                        c0 = Ap + ((lo - 1) * lda + hi) * sz; c1 = c0 + lda * sz; c2 = c1 + lda * sz
+                        c3 = c2 + lda * sz; c4 = c3 + lda * sz; c5 = c4 + lda * sz
+                        c6 = c5 + lda * sz; c7 = c6 + lda * sz
+                        xb = xp + hi * sz
+                        a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+                        a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
+                        i = 0
+                        while i + W <= rest
+                            o = i * sz; xv = vload(V, xb + o)
+                            a0 = muladd(vload(V, c0 + o), xv, a0); a1 = muladd(vload(V, c1 + o), xv, a1)
+                            a2 = muladd(vload(V, c2 + o), xv, a2); a3 = muladd(vload(V, c3 + o), xv, a3)
+                            a4 = muladd(vload(V, c4 + o), xv, a4); a5 = muladd(vload(V, c5 + o), xv, a5)
+                            a6 = muladd(vload(V, c6 + o), xv, a6); a7 = muladd(vload(V, c7 + o), xv, a7)
+                            i += W
+                        end
+                        s0 = sum(a0); s1 = sum(a1); s2 = sum(a2); s3 = sum(a3)
+                        s4 = sum(a4); s5 = sum(a5); s6 = sum(a6); s7 = sum(a7)
+                        while i < rest
+                            xi = unsafe_load(xb, i + 1)
+                            s0 += unsafe_load(c0, i + 1) * xi; s1 += unsafe_load(c1, i + 1) * xi
+                            s2 += unsafe_load(c2, i + 1) * xi; s3 += unsafe_load(c3, i + 1) * xi
+                            s4 += unsafe_load(c4, i + 1) * xi; s5 += unsafe_load(c5, i + 1) * xi
+                            s6 += unsafe_load(c6, i + 1) * xi; s7 += unsafe_load(c7, i + 1) * xi
+                            i += 1
+                        end
+                        unsafe_store!(xp, unsafe_load(xp, lo) - s0, lo)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 1) - s1, lo + 1)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 2) - s2, lo + 2)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 3) - s3, lo + 3)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 4) - s4, lo + 4)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 5) - s5, lo + 5)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 6) - s6, lo + 6)
+                        unsafe_store!(xp, unsafe_load(xp, lo + 7) - s7, lo + 7)
+                    else
+                        for k in lo:hi
+                            s = _dot_simd(rest, Ap + ((k - 1) * lda + hi) * sz, xp + hi * sz, T)
+                            unsafe_store!(xp, unsafe_load(xp, k) - s, k)
+                        end
+                    end
+                end
+                for j in hi:-1:lo                 # F×F triangle, backward
+                    cp = Ap + (j - 1) * lda * sz
+                    s = unsafe_load(xp, j)
+                    for i in (j + 1):hi
+                        s -= unsafe_load(cp, i) * unsafe_load(xp, i)
+                    end
+                    unsafe_store!(xp, unit ? s : s / unsafe_load(cp + (j - 1) * sz), j)
+                end
+                hi = lo - 1
+            end
+        end
+    end
+    return x
+end
+
 @inline function _trsv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -3490,12 +3635,18 @@ end
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
-    # PROBE TOGGLE (temporary): force T forms onto the BLOCKED path from n>NB, to measure in situ what
-    # `_TRI_T_UNB`'s own comment already claims for AVX-512 ("Zen5 blocks even at n=128, blk wins 1-6%
-    # ≤512"). That figure was taken on the standalone trsv row; inside potrs the T pass runs CACHE-WARM
-    # (pass 1 just streamed the same triangle), which is a different regime.
-    _tcut = _TRSV_T_FORCE_BLK[] ? NB : _TRI_T_UNB
-    (n <= NB || (tr && n <= _tcut)) && return _trsv_simd!(up, tr, unit, n, A, x)
+    # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
+    # had all along — 8 independent dot accumulators over the already-solved region instead of 8 fused
+    # axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth on the same
+    # bytes, which is the whole potrsL miss; blocking was measured at only 1.00-1.05 and is not it.
+    # Needs unit-stride columns for the vector loads; anything else keeps the paths below.
+    if tr && n > NB && _TRSV_T_FUSED[] && eltype(A) <: BlasReal && _strided1(A) &&
+            x isa StridedVector && stride(x, 1) == 1
+        return _trsv_fused8_t!(up, unit, n, A, x)
+    end
+    # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
+    # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
+    (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trsv_fused8!`) replaces the blocked
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
