@@ -190,9 +190,119 @@ function _pptrf_lower_blocked!(AP::AbstractVector{T}, n::Int, nb::Int, W, V) whe
     return AP
 end
 
+# ── Blocked UPPER packed Cholesky ────────────────────────────────────────────────────────────────
+#
+# Same motivation as the lower path: the unblocked upper kernel is a left-looking per-column
+# tpsv+dot (dpptrf.f's shape) while dense potrf! is blocked + SIMD on the tuned L3 kernels. The
+# storage argument that produced the 2.9-3.9x same-flops gap is not uplo-specific.
+#
+# THE ASYMMETRY THAT SHAPES THIS CODE. For LOWER, the trailing update A22 -= A21·A21ᵀ uses a block
+# COLUMN, which is contiguous in lower-packed storage. For UPPER, A22 -= U12ᴴ·U12 needs a block ROW.
+# That is still cheap here — upper-packed column c stores rows 1..c contiguously, so rows r1..r2 of
+# column c are the contiguous run AP[_pp_u(r1,c) .. _pp_u(r2,c)] — but the PANEL is a row-block
+# (kb x ncols) rather than a column-block, and the trailing operand order flips to Aᴴ·B.
+@inline function _pp_unpack_brow!(R, AP, k::Int, kb::Int, c1::Int, c2::Int)
+    Z = zero(eltype(R))
+    @inbounds for cc in 1:(c2 - c1 + 1)
+        c = c1 + cc - 1
+        len = min(c, k + kb - 1) - k + 1        # rows above the diagonal are NOT stored
+        s = _pp_u(k, c)
+        for t in 0:(len - 1)
+            R[1 + t, cc] = AP[s + t]
+        end
+        for t in len:(kb - 1)
+            R[1 + t, cc] = Z                    # zero, so the gemm never reads scratch
+        end
+    end
+    return R
+end
+
+@inline function _pp_repack_brow!(AP, R, k::Int, kb::Int, c1::Int, c2::Int)
+    @inbounds for cc in 1:(c2 - c1 + 1)
+        c = c1 + cc - 1
+        len = min(c, k + kb - 1) - k + 1
+        s = _pp_u(k, c)
+        for t in 0:(len - 1)
+            AP[s + t] = R[1 + t, cc]
+        end
+    end
+    return AP
+end
+
+# Trailing block column for the UPPER path: rows r0..c of each column c in c1..c2.
+@inline function _pp_unpack_bcolU!(V, AP, r0::Int, c1::Int, c2::Int)
+    Z = zero(eltype(V)); m = c2 - r0 + 1
+    @inbounds for cc in 1:(c2 - c1 + 1)
+        c = c1 + cc - 1
+        len = c - r0 + 1
+        s = _pp_u(r0, c)
+        for t in 0:(len - 1)
+            V[1 + t, cc] = AP[s + t]
+        end
+        for t in len:(m - 1)
+            V[1 + t, cc] = Z
+        end
+    end
+    return V
+end
+
+@inline function _pp_repack_bcolU!(AP, V, r0::Int, c1::Int, c2::Int)
+    @inbounds for cc in 1:(c2 - c1 + 1)
+        c = c1 + cc - 1
+        s = _pp_u(r0, c)
+        for t in 0:(c - r0)
+            AP[s + t] = V[1 + t, cc]
+        end
+    end
+    return AP
+end
+
+# Right-looking blocked upper factorisation. `R` is the kb x ncols panel (nb x n scratch), `V` the
+# trailing block column (n x nb scratch).
+function _pptrf_upper_blocked!(AP::AbstractVector{T}, n::Int, nb::Int, R, V) where {T}
+    k = 1
+    while k <= n
+        kb = min(nb, n - k + 1); ncols = n - k + 1
+        _pp_unpack_brow!(R, AP, k, kb, k, n)
+        d = view(R, 1:kb, 1:kb)
+        try
+            potrf!(d; uplo = 'U')
+        catch e
+            e isa PosDefException ? throw(PosDefException(e.info + k - 1)) : rethrow()
+        end
+        # U11ᴴ · U12 = A12  (complex is HERMITIAN: 'C', not 'T' — the lower path shipped that bug once)
+        ncols > kb && trsm!(
+            view(R, 1:kb, (kb + 1):ncols), d;
+            side = 'L', uplo = 'U', transA = (T <: Complex ? 'C' : 'T'), diag = 'N'
+        )
+        _pp_repack_brow!(AP, R, k, kb, k, n)
+        r0 = k + kb; c1 = r0
+        while c1 <= n                                   # A22 -= U12ᴴ · U12, one block column at a time
+            jb = min(nb, n - c1 + 1); c2 = c1 + jb - 1; m = c2 - r0 + 1
+            _pp_unpack_bcolU!(V, AP, r0, c1, c2)
+            _gemm_core!(
+                view(V, 1:m, 1:jb),
+                view(R, 1:kb, (r0 - k + 1):(c2 - k + 1)),
+                view(R, 1:kb, (c1 - k + 1):(c2 - k + 1)),
+                -one(T), one(T), true, false, T <: Complex, false
+            )
+            _pp_repack_bcolU!(AP, V, r0, c1, c2)
+            c1 += nb
+        end
+        k += nb
+    end
+    return AP
+end
+
 function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
     n = _pp_order(length(AP))
     if uplo == 'U'
+        Tu = eltype(AP)
+        nbu = min(_PPTRF_BLK_NB, n)
+        if Tu <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
+            R = Matrix{Tu}(undef, nbu, n); V = Matrix{Tu}(undef, n, nbu)
+            return _pptrf_upper_blocked!(AP, n, nbu, R, V)
+        end
         # Left-looking, exactly as dpptrf.f does it: per column, ONE packed triangular solve
         # (Uᴴ·u = A[1:j-1, j]) then a dot product for the pivot. The previous form inlined both as a
         # scalar triple loop; the hand-rolled dot carries a loop-dependency LLVM will not vectorise, so
