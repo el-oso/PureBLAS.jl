@@ -5644,6 +5644,53 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     # measured), because the tile edge is 22 for ComplexF64 on a 32 KiB L1 and every gate size below it
     # collapsed to the diagonal case. The tiled path only pays once the row walk actually strides.
     if n <= NB
+        # POINTER PATH — the destination is our own `_symm_scr` VIEW, and SubArray indexing on every
+        # store is most of this function's cost at tiny n. Measured on galen (ComplexF64, materialise
+        # alone, floor-subtracted): writing into `view(scr,1:n,1:n)` vs into a plain `Matrix` costs
+        #     n=4 69.5 vs 43.8 (1.59x) · n=8 171.5 vs 100.3 (1.71x) · n=16 1.29x · n=32 1.09x
+        # i.e. ~71 ns of pure indexing overhead at n=8 — against a zhemm@8 gate gap of 78 ns. The gemm
+        # that follows takes the same view and pays only 2.6 ns for it, so the cost is specific to the
+        # per-element stores here, not to SubArrays in general. Raw pointers with the destination's own
+        # leading dimension sidestep it and work for any `ld` (the scratch is grown, so ld >= n).
+        Td = eltype(Ad)
+        if _strided1(Ad) && _strided1(A) && isbitstype(Td)
+            GC.@preserve Ad A begin
+                dp = pointer(Ad); ap = pointer(A)
+                # `Ptr + Int` is a BYTE offset in Julia, so column strides carry `sz`; the 2-arg
+                # `unsafe_load(p, i)` / `unsafe_store!(p, v, i)` are 1-based ELEMENT indexed. Same
+                # convention as the level2 kernels.
+                sz = sizeof(Td)
+                ldd = stride(Ad, 2) * sz; lda = stride(A, 2) * sz
+                @inbounds for j in 1:n
+                    dc = dp + (j - 1) * ldd                 # &Ad[1,j]  (element-indexed below)
+                    ac = ap + (j - 1) * lda                 # &A[1,j]
+                    if up
+                        for i in 1:j                        # stored: contiguous down column j
+                            unsafe_store!(dc, unsafe_load(ac, i), i)
+                        end
+                        for i in (j + 1):n                  # mirrored: A[j,i], a row walk
+                            v = unsafe_load(ap + (i - 1) * lda, j)
+                            unsafe_store!(dc, herm ? conj(v) : v, i)
+                        end
+                    else
+                        for i in j:n
+                            unsafe_store!(dc, unsafe_load(ac, i), i)
+                        end
+                        for i in 1:(j - 1)
+                            v = unsafe_load(ap + (i - 1) * lda, j)
+                            unsafe_store!(dc, herm ? conj(v) : v, i)
+                        end
+                    end
+                end
+                if herm
+                    @inbounds for i in 1:n
+                        d = dp + (i - 1) * ldd
+                        unsafe_store!(d, Td(real(unsafe_load(d, i))), i)
+                    end
+                end
+            end
+            return Ad
+        end
         @inbounds if up
             for j in 1:n
                 @simd for i in 1:j
