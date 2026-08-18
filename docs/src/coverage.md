@@ -217,7 +217,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>potrfU</code></th><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.06</span></td><td class="b4"><span class="v">0.845</span><span class="n">n=8</span></td></tr>
 <tr><th><code>potrsL</code></th><td class="b3"><span class="v">0.92</span><span class="n">n=2048</span></td><td class="b3"><span class="v">0.895</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.774</span><span class="n">n=512</span></td></tr>
 <tr><th><code>potrsU</code></th><td class="b2"><span class="v">0.972</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.935</span><span class="n">n=1024</span></td></tr>
-<tr><th><code>pptrfL</code></th><td class="b4"><span class="v">0.818</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.05</span></td><td class="b3"><span class="v">0.903</span><span class="n">n=32</span></td></tr>
+<tr><th><code>pptrfL</code></th><td class="ok"><span class="v">1.16</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.14</span></td></tr>
 <tr><th><code>pptrfU</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=128</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=256</span></td></tr>
 <tr><th><code>pstrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.1</span></td></tr>
 <tr><th><code>pstrfU</code></th><td class="b3"><span class="v">0.882</span><span class="n">n=8</span></td><td class="b3"><span class="v">0.89</span><span class="n">n=8</span></td><td class="b1"><span class="v">0.994</span><span class="n">n=32</span></td></tr>
@@ -311,7 +311,7 @@ is compact-WY block reflectors; and the divide-and-conquer solver (`stedc`) asse
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | **0.999** | 1 | **0.999** | 1.34 / 1 | 1.27 / 1.03 |
 | SPD tridiagonal | pttrf, pttrs, ptsv [^tri] | s/d/c/z | ✅ | **0.989** | **0.998** | **0.994** | 1.38 / 1.12 | 1.07 / 0.998 |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | **0.913** | 1.06 | **0.974** | 1.54 / 1.25 | 1.46 / 1.06 |
-| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | **0.819** | **0.969** | **0.904** | 1.61 / 0.969 | 2.87 / 1.04 |
+| Packed Cholesky | pptrf, pptrs [^pp] | s/d/c/z | ✅ | 1.03 | **0.969** | **0.975** | 1.61 / 0.969 | 2.87 / 1.04 |
 
 ### Fleet status
 
