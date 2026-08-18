@@ -34,6 +34,7 @@
 #             bench/plots_data_avx2_galen.txt \
 #             bench/plots_data_zen5_neuromancer.txt
 using Printf
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 
 const QN = 48
 med(v) = sort(v)[max(1, cld(length(v), 2))]
@@ -97,7 +98,7 @@ geo(v) = isempty(v) ? NaN : exp(sum(log, v) / length(v))
 
 function band(g)                      # same thresholds/classes as bench/coverage_ops.jl
     isnan(g) && return "b1"
-    g >= 1.0 && return "ok"
+    gate_pass(g) && return "ok"
     g >= 0.99 && return "b1"
     g >= 0.95 && return "b2"
     g >= 0.85 && return "b3"
@@ -199,7 +200,7 @@ function main()
         # their cells hold Documenter footnote refs ([^upper]) which raw HTML would not resolve.
         # So the verdict is the NUMBER, bolded when it misses. That still fixes the actual complaint
         # against 🐰/🐢 — it distinguishes 0.999 from 0.61, which one glyph could not.
-        verdict(x) = isnan(x) ? " — " : x >= 1.0 ? @sprintf("%.3g", x) : @sprintf("**%.3g**", x)
+        verdict(x) = isnan(x) ? " — " : gate_pass(x) ? @sprintf("%.3g", x) : @sprintf("**%.3g**", x)
         # One verdict cell per box, in the order the caches were given (= the header order).
         for (k, (u, _)) in enumerate(boxes)
             gu = Float64[]

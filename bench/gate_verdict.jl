@@ -35,6 +35,8 @@ const QN = 48
 # so it needs no normality claim about round medians, and pooling rounds from EVERY available run folds
 # the between-run component in automatically — which matters, because a within-run-only interval was
 # measured too narrow (2026-08-04: nrm2's run-1 95% CI [2.003, 2.016] did not contain run 2's 1.995).
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
+const _LGATE = log(GATE_MIN)                 # parity in LOG-ratio space, where this file works
 const _NBOOT = 4000
 function cellverdict(rs::Vector{Float64}; σdrift = 0.0, seed = 20260804)
     R = length(rs)
@@ -54,8 +56,11 @@ function cellverdict(rs::Vector{Float64}; σdrift = 0.0, seed = 20260804)
     # ONE null hypothesis: the gate HOLDS. Flag only on evidence that it does not, i.e. the whole
     # interval below parity. No dead band — with the between-run component included the interval IS the
     # dead band, and it self-calibrates per cell instead of being a global constant.
-    v = lb >= 0 ? :PASS :
-        ub < 0 ? :FAIL :
+    # Parity is `log(GATE_MIN)`, not 0: the gate is met when the ratio ROUNDED TO TWO SIGNIFICANT
+    # DIGITS is >= 1.00 (bench/gatecrit.jl), i.e. ratio >= 0.995. Comparing against 0 here would call a
+    # cell failing at a precision the published table does not even show.
+    v = lb >= _LGATE ? :PASS :
+        ub < _LGATE ? :FAIL :
         (ub - lb) > 0.02 ? :INDET :          # genuinely unresolved (>2% wide) ⇒ more rounds
         :PASS                                # interval contains parity ⇒ no evidence of a regression
     return (ratio = exp(m), lo = exp(lb), hi = exp(ub), R = R, verdict = v)

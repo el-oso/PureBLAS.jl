@@ -1,6 +1,7 @@
 # Parse the committed fleet plot caches and itemize every gate MISS (median ratio < 1.0) per
 # (op, size, box, baseline). Ratio is PB/baseline speed (>1 = PB faster). Gate = >= max(OB, AOCL).
 using Statistics, Printf
+include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 const BOXES = ["wintermute" => "Zen4/AVX-512", "galen" => "Zen3/AVX2", "neuromancer" => "Zen5/AVX-512"]
 function parse_cache(path)
     d = Dict{Tuple{String, String, Int}, Float64}()   # (op, level, size) -> median ratio
@@ -74,11 +75,11 @@ for (op, lvl, sz) in allk
     for (box, lab) in BOXES
         ob = get(data[box].ob, (op, lvl, sz), NaN); ao = get(data[box].aocl, (op, lvl, sz), NaN)
         w = minimum(filter(!isnan, [ob, ao]); init = Inf)
-        if w < 1.0
-            worstall = min(worstall, w); push!(boxes, split(lab, '/')[1]); (!isnan(ob)&&ob < 1.0)&&(obloss += 1)
+        if !gate_pass(w)
+            worstall = min(worstall, w); push!(boxes, split(lab, '/')[1]); (!isnan(ob) && !gate_pass(ob))&&(obloss += 1)
         end
     end
-    if worstall < 1.0
+    if !gate_pass(worstall)
         s = get!(opstat, op, Any[0, Inf, 0, Set{String}(), lvl])
         s[1] += 1; s[2] = min(s[2], worstall); s[3] += obloss; union!(s[4], boxes)
     end

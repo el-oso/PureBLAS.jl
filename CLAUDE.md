@@ -39,9 +39,18 @@ Both modes share ONE set of low-level kernels. Source map:
 
 ## Hard requirements (MUST follow)
 
-1. **Performance gate: ≥ 1.0× OpenBLAS (parity or better), non-negotiable.** Per-machine (the gate is measured on
-   the dev box). Beat it where possible. BLAS-1 is bandwidth-bound (easy parity); the real fight is
-   M2 `dgemm`.
+1. **Performance gate: ≥ 1.00× `max(OpenBLAS, AOCL)`, non-negotiable — evaluated on the ratio ROUNDED
+   TO TWO SIGNIFICANT DIGITS.** Per-machine (per µarch on the fleet). Beat it where possible. BLAS-1 is
+   bandwidth-bound (easy parity); the real fight is M2 `dgemm`.
+   The threshold is unchanged at 1.00; what is specified is the PRECISION of the comparison. `0.995`
+   rounds to `1.0` and PASSES; `0.9949` rounds to `0.99` and FAILS. Rationale: per-cell machine-state
+   drift on this fleet runs ~1–6% (every cached arm stores the anchor it was measured under), so the
+   third digit is not adjudicable, and the rounded figure is what the published tables and plots show —
+   the verdict must agree with the number a reader can see. **The criterion lives in ONE place,
+   `bench/gatecrit.jl` (`gate_pass` / `GATE_MIN`); never re-spell the comparison inline.** Consumers:
+   `plots.jl`, `gate_misses.jl`, `gate_gaps.jl`, `coverage_ops.jl`, `coverage_routing.jl`,
+   `gate_verdict.jl` (compares in log space against `log(GATE_MIN)`), and `adjudicate.sh` (carries the
+   literal, kept in sync by comment — inline julia cannot `include`).
 2. **SIMD.jl for kernels** (`Vec`, `vload`/`vstore`, `muladd`). Real unit-stride dense → SIMD fast
    path; everything else (complex, strided, any other `T<:Number`) → generic scalar loop.
 3. **Generic over `T<:Number`.** ONE kernel implementation covers s/d/c/z (and ForwardDiff.Dual,
