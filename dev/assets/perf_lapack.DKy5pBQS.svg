@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="962" height="1280" font-family="sans-serif">
 <rect width="962" height="1280" fill="white"/>
-<text x="481.0" y="26" text-anchor="middle" font-size="17" font-weight="bold">LAPACK — PureBLAS / OpenBLAS (PB/OpenBLAS ratio)</text>
+<text x="481.0" y="26" text-anchor="middle" font-size="17" font-weight="bold">LAPACK — PB / OpenBLAS ratio</text>
 <line x1="46" y1="42" x2="68" y2="42" stroke="#d62728" stroke-width="3"/>
 <text x="73" y="46" font-size="12">Zen3 · AVX2</text>
 <line x1="176" y1="42" x2="198" y2="42" stroke="#1f77b4" stroke-width="3"/>
