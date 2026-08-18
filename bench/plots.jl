@@ -1882,18 +1882,33 @@ else
                 ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
                 ("CLP", "clapack", "Complex LAPACK"),
             )
-            svg_panels(joinpath(adir, "perf_$(base)$(suf)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk, rb)
+            svg_panels(joinpath(adir, "perf_$(base)$(suf)$L.svg"), "$ttl — PB / $ref ratio", fleet, gk, rb)
         end
+        # THE TABLE IS THE DATA — nothing else. One pointer line, then the numbers. Provenance used to
+        # sit inline as a per-box bullet list at the top of both tables; it now lives in ONE generated
+        # file (below) that both views share, so it cannot be half-refreshed either.
         open(joinpath(tdir, "gen_table$(suf)$L.md"), "w") do io   # drift-proof numeric table: median (worst-cell) per op/µarch
-            println(io, "_Measured (provenance):_\n")
-            for (m, _) in fleet   # self-describing: CPU, code commit, measure time per µarch
-                println(io, "- **$(_ulabel(m))** (`$(m.host)`) — $(m.cpu), commit `$(m.commit)`, $(m.time)")
-            end
+            println(io, "PB / $ref speed ratio, median (worst cell) per op per µarch. ",
+                "Provenance: [`bench/provenance.md`](provenance.md).")
             println(io, "\n### Real\n\n", gen_table(fleet, ["L1", "L2", "L3", "LP"], rb))
             println(io, "\n### Complex\n\n", gen_table(fleet, ["CL1", "CL2", "CL3", "CLP"], rb))
         end
         println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
     end
+    # Provenance for EVERY artifact this invocation writes (both views come from the same caches, so it
+    # is written once, outside the view loop — two copies could disagree, one cannot).
+    open(joinpath(tdir, "provenance$L.md"), "w") do io
+        println(io, "# Benchmark provenance\n")
+        println(io, "The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ",
+            "generated tables in `docs/src/coverage.md`. Both reference views (OpenBLAS, AOCL) are ",
+            "rendered from this one cache set. Methodology: `docs/src/methodology.md`.\n")
+        println(io, "| µarch | host | CPU | commit | measured |")
+        println(io, "|---|---|---|---|---|")
+        for (m, _) in fleet
+            println(io, "| $(_ulabel(m)) | `$(m.host)` | $(m.cpu) | `$(m.commit)` | $(m.time) |")
+        end
+    end
+    println("wrote provenance$L.md")
 end
 # Gate summary for THIS host. v3 holds every arm in one cache, so this is the FIRST version that can
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of

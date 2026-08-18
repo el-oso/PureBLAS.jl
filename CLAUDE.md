@@ -229,7 +229,7 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   ref (catches "I synced my uncommitted tree" before a 3-hour sweep, not after).
 
 - **PUBLISH ARTIFACTS WITH `bench/publish.sh` — never by hand-running one generator.** Every published
-  number (the `perf_*.svg` pairs, `bench/gen_table*.md`, the generated tables in `docs/src/coverage.md`)
+  number (the `perf_*.svg` pairs, `bench/gen_table*.md`, `bench/provenance.md`, the generated tables in `docs/src/coverage.md`)
   is a pure function of the caches on disk, and `publish.sh` rebuilds the whole set in one fixed order:
   cell-staleness audit → both reference views → coverage tables → re-verify → print the `git add` line
   (it never commits or pushes). `bench/check_artifacts_current.sh` is the gate — it re-renders into a

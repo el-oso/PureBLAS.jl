@@ -178,7 +178,6 @@ println("""
  <span><i style="background:#c07d12"></i>≥ 0.95</span>
  <span><i style="background:#cf5a35"></i>≥ 0.85</span>
  <span><i style="background:#b3243a"></i>below 0.85</span>
- <span>the number is the gate; colour only bands it</span>
 </p>
 ```
 """)

@@ -50,12 +50,12 @@ stale=()
 for f in "$T"/perf_*.svg; do
     b=$(basename "$f"); cmp -s "$f" "docs/src/assets/$b" || stale+=("docs/src/assets/$b")
 done
-for f in "$T"/gen_table*.md; do
+for f in "$T"/gen_table*.md "$T"/provenance.md; do
     b=$(basename "$f"); cmp -s "$f" "bench/$b" || stale+=("bench/$b")
 done
 cmp -s docs/src/coverage.md "$BK" || stale+=("docs/src/coverage.md")
 
-n=$(ls "$T"/perf_*.svg "$T"/gen_table*.md 2>/dev/null | wc -l)
+n=$(ls "$T"/perf_*.svg "$T"/gen_table*.md "$T"/provenance.md 2>/dev/null | wc -l)
 if [ ${#stale[@]} -eq 0 ]; then
     echo "   => all $((n + 1)) artifacts match a fresh rebuild from the current caches"
 else

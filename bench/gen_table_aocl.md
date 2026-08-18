@@ -1,8 +1,4 @@
-_Measured (provenance):_
-
-- **Zen3 · AVX2** (`Zen3`) — AMD Ryzen 9 5900X 12-Core Processor, commit `ef13445`, 2026-08-18T12:35
-- **Zen4 · AVX-512** (`Zen4`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `ef13445`, 2026-08-18T12:42
-- **Zen5 · AVX-512** (`Zen5`) — AMD Ryzen AI 5 340 w/ Radeon 840M, commit `ef13445`, 2026-08-18T12:59
+PB / AOCL speed ratio, median (worst cell) per op per µarch. Provenance: [`bench/provenance.md`](provenance.md).
 
 ### Real
 
