@@ -69,7 +69,7 @@ html.dark .pbg-key{color:#98a1b3}
 <table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>gbmvN</code></th><td class="b3"><span class="v">0.884</span><span class="n">n=4096</span></td><td class="ok"><span class="v">1.43</span></td><td class="ok"><span class="v">1.27</span></td></tr>
 <tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.96</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.983</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=256</span></td></tr>
-<tr><th><code>gemvT</code></th><td class="b4"><span class="v">0.687</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td></tr>
+<tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.934</span><span class="n">n=2048</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=256</span></td><td class="b1"><span class="v">0.998</span><span class="n">n=2048</span></td></tr>
 <tr><th><code>ger</code></th><td class="b1"><span class="v">0.99</span><span class="n">n=512</span></td><td class="b2"><span class="v">0.95</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td></tr>
 <tr><th><code>sbmv</code></th><td class="ok"><span class="v">1.37</span></td><td class="ok"><span class="v">1.16</span></td><td class="ok"><span class="v">1.2</span></td></tr>
 <tr><th><code>spmv</code></th><td class="ok"><span class="v">1.97</span></td><td class="ok"><span class="v">1.87</span></td><td class="ok"><span class="v">1.62</span></td></tr>
