@@ -49,7 +49,7 @@ echo "   artifacts match a fresh rebuild"
 
 echo
 echo "══ 4  commit these (nothing was committed or pushed):"
-git status --short -- docs/src/assets bench/gen_table.md bench/gen_table_aocl.md docs/src/coverage.md
+git status --short -- docs/src/assets bench/gen_table.md bench/gen_table_aocl.md bench/provenance.md docs/src/coverage.md
 echo
 # Only the artifact paths — never bench/plots_data_*.txt (gitignored, ~11 MB each, and evidence, not output).
-echo "   git add docs/src/assets/perf_*.svg bench/gen_table.md bench/gen_table_aocl.md docs/src/coverage.md"
+echo "   git add docs/src/assets/perf_*.svg bench/gen_table.md bench/gen_table_aocl.md bench/provenance.md docs/src/coverage.md"
