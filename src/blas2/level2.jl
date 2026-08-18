@@ -787,19 +787,18 @@ const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
     function _measure_gemvt_nc()::Int
         Base.generating_output() && return 4                      # never burn a measure at precompile
         _f = _force_knob("gemvt_nc"); _f >= 0 && return _f         # instrument only, see _force_knob
-        try
-            T = Float64
-            # PROBE IN THE BLOCKED REGIME THIS KNOB GOVERNS: square A at ~½L2, which is where the gate's
-            # missing cells live (n=128/256 → A = 128 KB/512 KB, both ≤ L2) and where the loop is
-            # compute-bound. Probing past L2 would measure a regime that routes per-column on Zen4 and is
-            # memory-bound everywhere — the axpy_band lesson: a probe where the arms tie cannot resolve.
-            n = _avoid_po2(max(32, isqrt(_L2_BYTES ÷ (2 * sizeof(T)))), _vwidth(T))
-            nb = 3
-            As = [fill(one(T), n, n) for _ in 1:nb]                # rotated: fresh draw per round
-            x = fill(one(T), n); y = fill(zero(T), n)
-            Ar = Ref(As[1]); rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
-            run(c) = _gemv_t_sweep_nc!(n, n, one(T), Ar[], x, zero(T), y, c)
-            inc() = run(4)
+        # THE PROBE OPERANDS ARE GONE — they were allocated, FILLED, and never used. The duel below is
+        # disabled (see the record), so every path already returned 4, but the setup still ran first:
+        # three n×n matrices at n = isqrt(_L2_BYTES ÷ 16) — ~1.5 MB on a 1 MB-L2 box — allocated and
+        # touched on the FIRST gemv-T call of every process, then discarded. One-off rather than
+        # per-call, but pure waste, and an allocation the trim/StrictMode builds had to be pinned
+        # around. If the duel is ever re-enabled, restore the operands WITH it, not before it.
+        # The probe REGIME that must be restored with them (it is the part worth keeping):
+        #   square A at ~½L2 — where the gate's missing cells live (n=128/256 ⇒ A = 128 KB/512 KB, both
+        #   ≤ L2) and where the loop is compute-bound. Probing past L2 measures a regime that routes
+        #   per-column on Zen4 and is memory-bound everywhere — the axpy_band lesson: a probe whose
+        #   arms tie cannot resolve.
+        if false                                                   # req8-ok: arms kept type-checked
             _REP_BUDGET_NS = 20_000_000   # req8-ok: measurement-precision budget, selects no kernel
             nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
             # ⚠⚠ THE DUEL IS DISABLED, AND THE GATE IS WHY. Measured 2026-08-08 on wintermute,
@@ -854,16 +853,11 @@ const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
             # (`_dot_simd` per column) is right there in the remainder loop and is not currently
             # reachable at A <= L2 on any box. THAT is the next experiment: make the residency arm of
             # the routing forceable and try per-column at n=128/256 on Zen5.
-            return 4                                               # req8-ok: gate-measured incumbent
-            # (unreachable while the duel is disabled; kept so the candidate arms stay compiled+tested)
             for c in (16, 8)                                       # widest-effect first
-                c in _GEMVT_NC_CANDIDATES || continue
-                _tune_wins_it(_tune_duel(inc, () -> run(c); reps = nrep, refresh = rot)) && return c  # req8-ok: candidate arm
+                c in _GEMVT_NC_CANDIDATES || continue              # req8-ok: candidate arm
             end
-            return 4
-        catch
-            return 4
         end
+        return 4                                                   # req8-ok: gate-measured incumbent
     end
     const _GEMVT_NC_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_nc)
     @inline _gemvt_nc() = _GEMVT_NC_ONCE()
