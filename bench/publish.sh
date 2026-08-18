@@ -1,0 +1,55 @@
+#!/bin/bash
+# Regenerate EVERY published performance artifact from the caches on disk, in one fixed order.
+#
+# WHY ONE COMMAND. The pipeline is four generators over three caches, and running a subset of them is
+# what produced every artifact bug of 2026-08-17: SVGs re-rendered for one reference view but not the
+# other, tables regenerated but not the plots, plots regenerated but not the tables. Every partial state
+# is reachable by hand and none of them announces itself. There is no partial state here — the whole set
+# is rebuilt or nothing is.
+#
+# WHAT IT DOES NOT DO: it does not measure (no `bench` argument reaches plots.jl — see
+# bench/artifact_build.sh), it does not commit, and it does not push. It prints the `git add` line and
+# stops; pushing publishes the docs site, and that stays a human decision.
+#
+#   bench/publish.sh           # refuses if any published cell predates the shipping src/
+#   bench/publish.sh --force   # publish anyway (cell staleness is reported, not enforced)
+set -u
+cd "$(dirname "$0")/.." || exit 2
+source bench/artifact_build.sh
+FORCE=""; [ "${1:-}" = "--force" ] && FORCE=1
+
+echo "══ 1  cells vs src/"
+if ! bench/cache_staleness.sh; then
+    if [ -n "$FORCE" ]; then
+        echo "(--force given: publishing over stale cells)"
+    else
+        echo
+        echo "REFUSING TO PUBLISH — these caches carry cells measured against code that no longer ships."
+        echo "Refresh them (PB-only group runs, per the message above) or re-run with --force."
+        exit 1
+    fi
+fi
+
+echo
+echo "══ 2  rebuild artifacts (both reference views + tables)"
+build_artifacts || { echo "BUILD FAILED — nothing published"; exit 2; }
+
+echo
+echo "══ 3  verify the rebuild"
+bench/check_artifacts_current.sh ${FORCE:+--force} > /dev/null 2>&1
+v=$?
+if [ $v -eq 2 ]; then
+    echo "verifier could not run — inspect with: bench/check_artifacts_current.sh"; exit 2
+elif [ $v -ne 0 ] && [ -z "$FORCE" ]; then
+    # A rebuild that its own verifier still calls stale means the build is not a pure function of the
+    # caches. That is a bug in the pipeline, not a reason to commit.
+    echo "STILL STALE AFTER REBUILD — do not commit; run bench/check_artifacts_current.sh"; exit 1
+fi
+echo "   artifacts match a fresh rebuild"
+
+echo
+echo "══ 4  commit these (nothing was committed or pushed):"
+git status --short -- docs/src/assets bench/gen_table.md bench/gen_table_aocl.md docs/src/coverage.md
+echo
+# Only the artifact paths — never bench/plots_data_*.txt (gitignored, ~11 MB each, and evidence, not output).
+echo "   git add docs/src/assets/perf_*.svg bench/gen_table.md bench/gen_table_aocl.md docs/src/coverage.md"

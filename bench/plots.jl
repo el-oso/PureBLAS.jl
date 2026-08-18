@@ -21,7 +21,9 @@ using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); 
 # Reference BLAS: OpenBLAS (default), Intel MKL (`mkl` arg), or AMD AOCL (`aocl` arg). Each package
 # LBT-forwards LinearAlgebra's BLAS+LAPACK to itself on load, so `B`/`LAPACK` below transparently measure
 # against whichever is active — one code path, three baselines. AOCL (AMD-tuned BLIS + libFLAME) is a
-# SEPARATE baseline from OpenBLAS: its caches/SVGs carry an `_aocl` suffix and never mix with OpenBLAS's.
+# SEPARATE baseline from OpenBLAS: its SVGs/tables carry an `_aocl` suffix and never mix with OpenBLAS's.
+# NOTE: the v3 cache holds BOTH reference arms and the render emits BOTH views every time (see `_VIEWS`),
+# so `aocl` no longer selects which view is drawn — it is inert except under `mkl`.
 const REFBK = "aocl" in ARGS ? "aocl" : "mkl" in ARGS ? "mkl" : "openblas"
 REFBK == "mkl" && @eval using MKL
 
@@ -171,9 +173,17 @@ function _round_med(qs::ArmData)
     end
     return median(qs[_ARM_PB]) * 1e6
 end
-const REFNAME = REFBK == "mkl" ? "MKL" : REFBK == "aocl" ? "AOCL" : "OpenBLAS"
-# cache/SVG filename suffix: "" for OpenBLAS (the default baseline — its artefacts are UNTOUCHED), "_mkl"/"_aocl" otherwise
-const REFSUF = REFBK == "openblas" ? "" : "_$REFBK"
+_refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : "OpenBLAS"
+# SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
+_refsuf(r) = r == "openblas" ? "" : "_$r"
+const REFNAME = _refname(REFBK)
+const REFSUF = _refsuf(REFBK)
+# EVERY reference view is rendered in ONE invocation — the `aocl` argument no longer selects a view.
+# WHY: the two views read the SAME v3 cache, so they can only disagree if one was rendered and the other
+# was not. That is not hypothetical — on 2026-08-17 the OpenBLAS SVGs had sat at commit bdb9497 while the
+# AOCL set had been re-rendered three times, and the two published pages contradicted each other about
+# the same fleet. Rendering both together makes divergence unrepresentable rather than merely discouraged.
+const _VIEWS = REFBK == "mkl" ? ["mkl"] : _REF_ALL
 import LinearAlgebra.BLAS as B
 BLAS.set_num_threads(1)
 
@@ -282,6 +292,13 @@ end
 const _LITE = "lite" in ARGS
 const _NODRAW = "nodraw" in ARGS   # fleet boxes: measure + cache only, skip SVG/table render (so their
 # working tree stays clean → `git pull` never blocks). Render centrally.
+# `outdir=<dir>` redirects BOTH render outputs (the SVGs and gen_table*.md) into one directory instead of
+# docs/src/assets + bench/. Only bench/check_artifacts_current.sh uses it: it re-renders from the current
+# caches into a temp dir and diffs against the committed artifacts, which it cannot do if rendering
+# overwrites them first. Nothing about the measurement changes.
+const _OUTDIR = let i = findfirst(a -> startswith(a, "outdir="), ARGS)   # `let` — see _SELOP
+    isnothing(i) ? nothing : ARGS[i][8:end]
+end
 # `let`, not a bare `(i = …; …)`: the bare form leaks a GLOBAL `i`, which made every later top-level
 # `for` that uses `i` emit a soft-scope warning — including the per-arm cache merge, the one loop where
 # nobody wants to be wondering whether `i` is the local it looks like.
@@ -1696,7 +1713,7 @@ function _ref_age(g, ref::AbstractString = REFBK)
     return (minimum(stamps), maximum(stamps))
 end
 
-function svg_panels(path, title, fleet, gk)
+function svg_panels(path, title, fleet, gk, ref::AbstractString = REFBK)
     ops = _opsin(fleet, gk); isempty(ops) && return
     ncol = min(4, length(ops)); nrow = cld(length(ops), ncol)
     pw = 210; ph = 138; ml = 46; mt = 60; gx = 20; gy = 34; pad = 16
@@ -1717,7 +1734,7 @@ function svg_panels(path, title, fleet, gk)
         px = ml + ((k - 1) % ncol) * (pw + gx); py = mt + ((k - 1) ÷ ncol) * (ph + gy)
         series = Tuple{String, Vector{Tuple{Int, Vector{Float64}}}}[]; allsz = Int[]
         for (meta, g) in fleet
-            ps = _series(g, gk, op); (isnothing(ps) || isempty(ps)) && continue
+            ps = _series(g, gk, op, ref); (isnothing(ps) || isempty(ps)) && continue
             push!(series, (meta.slug, ps)); for (s, _) in ps
                 (s in allsz) || push!(allsz, s)
             end
@@ -1765,14 +1782,14 @@ function svg_panels(path, title, fleet, gk)
 end
 
 # Drift-proof numeric companion to the hand-annotated narrative table: median (worst-cell) per op per µarch.
-function gen_table(fleet, gkeys)
+function gen_table(fleet, gkeys, ref::AbstractString = REFBK)
     io = IOBuffer()
     println(io, "| op | ", join((_ulabel(m) for (m, _) in fleet), " | "), " |")
     println(io, "|---|", repeat("---|", length(fleet)))
     for gk in gkeys, op in _opsin(fleet, gk)
         cells = String[]
         for (_, g) in fleet
-            ps = _series(g, gk, op)
+            ps = _series(g, gk, op, ref)
             if isnothing(ps) || isempty(ps)
                 push!(cells, "–")
             else
@@ -1848,31 +1865,35 @@ else
     save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP")])
 end
 
-adir = joinpath(@__DIR__, "..", "docs", "src", "assets"); mkpath(adir)
+adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR; mkpath(adir)
+tdir = isnothing(_OUTDIR) ? (@__DIR__) : _OUTDIR
 # Draw the whole FLEET (every host cache on disk) as cross-µarch panel grids: 8 SVGs, NO per-host suffix
 # (a 3-line panel IS the per-host view). One SVG per group. `nodraw` skips this (fleet boxes measure only).
 fleet = _NODRAW ? [] : load_fleet()
 if isempty(fleet)
     println("no fleet caches on disk to plot")
 else
-    L = _LITE ? "_lite" : ""; ref = REFNAME
-    for (gk, base, ttl) in (
-            ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
-            ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
-            ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
-            ("CLP", "clapack", "Complex LAPACK"),
-        )
-        svg_panels(joinpath(adir, "perf_$(base)$(REFSUF)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk)
-    end
-    open(joinpath(@__DIR__, "gen_table$(REFSUF)$L.md"), "w") do io   # drift-proof numeric table: median (worst-cell) per op/µarch
-        println(io, "_Measured (provenance):_\n")
-        for (m, _) in fleet   # self-describing: CPU, code commit, measure time per µarch
-            println(io, "- **$(_ulabel(m))** (`$(m.host)`) — $(m.cpu), commit `$(m.commit)`, $(m.time)")
+    L = _LITE ? "_lite" : ""
+    for rb in _VIEWS                          # BOTH views, one invocation — see `_VIEWS`
+        ref = _refname(rb); suf = _refsuf(rb)
+        for (gk, base, ttl) in (
+                ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+                ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
+                ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
+                ("CLP", "clapack", "Complex LAPACK"),
+            )
+            svg_panels(joinpath(adir, "perf_$(base)$(suf)$L.svg"), "$ttl — PureBLAS / $ref (PB/$ref ratio)", fleet, gk, rb)
         end
-        println(io, "\n### Real\n\n", gen_table(fleet, ["L1", "L2", "L3", "LP"]))
-        println(io, "\n### Complex\n\n", gen_table(fleet, ["CL1", "CL2", "CL3", "CLP"]))
+        open(joinpath(tdir, "gen_table$(suf)$L.md"), "w") do io   # drift-proof numeric table: median (worst-cell) per op/µarch
+            println(io, "_Measured (provenance):_\n")
+            for (m, _) in fleet   # self-describing: CPU, code commit, measure time per µarch
+                println(io, "- **$(_ulabel(m))** (`$(m.host)`) — $(m.cpu), commit `$(m.commit)`, $(m.time)")
+            end
+            println(io, "\n### Real\n\n", gen_table(fleet, ["L1", "L2", "L3", "LP"], rb))
+            println(io, "\n### Complex\n\n", gen_table(fleet, ["CL1", "CL2", "CL3", "CLP"], rb))
+        end
+        println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
     end
-    println("wrote gen_table$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
 end
 # Gate summary for THIS host. v3 holds every arm in one cache, so this is the FIRST version that can
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of

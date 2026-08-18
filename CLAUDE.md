@@ -228,6 +228,20 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   and `op=`/merge runs keep working. The script refuses if local HEAD is not an ancestor of the target
   ref (catches "I synced my uncommitted tree" before a 3-hour sweep, not after).
 
+- **PUBLISH ARTIFACTS WITH `bench/publish.sh` — never by hand-running one generator.** Every published
+  number (the `perf_*.svg` pairs, `bench/gen_table*.md`, the generated tables in `docs/src/coverage.md`)
+  is a pure function of the caches on disk, and `publish.sh` rebuilds the whole set in one fixed order:
+  cell-staleness audit → both reference views → coverage tables → re-verify → print the `git add` line
+  (it never commits or pushes). `bench/check_artifacts_current.sh` is the gate — it re-renders into a
+  temp dir and byte-compares, so "cells current w.r.t. `src/`" and "artifacts current w.r.t. the cells"
+  fail as one. **Why:** on 2026-08-17 four independent staleness bugs shipped in one night — a cell
+  predating the code, the OpenBLAS SVGs stuck at `bdb9497` while the AOCL set was re-rendered three
+  times, the two views therefore contradicting each other about the same fleet, and prose asserting
+  something false about the plots. Running a subset of the generators is how each of them happened.
+  The render now emits **both** reference views per invocation (`_VIEWS` in `plots.jl`), so they cannot
+  diverge; `bench/check_view_pairing.sh` (CI job `artifact-pairing`) catches the residual case of a
+  partial `git add`, and is the only artifact check that runs in GitHub CI — the caches are gitignored.
+
 - **READ `../kb/findings/` BEFORE any perf diagnosis or gate campaign — before measuring, not after.**
   The sibling `kb/` is the cross-session knowledge hub: 25 digests of diagnostics, decisions, measured
   results, and **disproven hypotheses so nobody re-chases a dead end**. Start at
