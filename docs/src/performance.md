@@ -466,8 +466,10 @@ OpenBLAS is the default oracle above; this section adds a **second, tougher base
 own optimizing library (AOCL-BLIS for BLAS, AOCL-libFLAME for LAPACK), hand-tuned for these exact Zen
 chips. Everything here is **single-threaded** (BLIS pinned to one thread — verified: `dgemm` runs at
 one-core throughput), boost-locked, same methodology; caches/SVGs carry an `_aocl` suffix and never mix
-with the OpenBLAS artifacts. The plots below are **lite** (sizes capped at n=1024) — a fast pass that
-covers the meaningful range; the summary numbers are from a size-controlled probe.
+with the OpenBLAS artifacts. The plots below cover **exactly the same ground as the OpenBLAS plots
+above** — same 85 ops, same panels, same size sweep (to n=4096), same three µarchs, rendered from the
+same per-host cache: v3 measures every arm (PureBLAS, OpenBLAS, AOCL) interleaved in one run, so the
+two views differ only in which reference the ratio is taken against.
 
 The AOCL binary is a genuinely optimized build, not a reference fallback: measured directly against
 OpenBLAS, AOCL-BLIS `dgemm` matches it and AOCL-libFLAME `potrf`/`geqrf` **meet or beat** it (e.g.
@@ -529,7 +531,9 @@ tiny n (e.g. `potrf`/`getrf` show 4–160× at n≤32), which flatters PureBLAS 
 overhead, not an algorithmic gap. The mid/large-n figures in the table are the honest signal. The
 per-op numbers are generated to [`bench/gen_table_aocl.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table_aocl.md).
 
-> **Freshness note (interim).** These AOCL plots use *freshly remeasured* Zen3 (galen) and Zen4
-> (wintermute) caches (boost-locked); the Zen5 (neuromancer) line is from an earlier same-session run.
-> The µarch labels are now stamped authoritatively into each cache header (`uarch=`), fixing a prior
-> plot-labeling swap. A full same-commit fleet re-measure will follow.
+> **Freshness note.** All three boxes are boost-locked and stamped at the same commit, and the
+> OpenBLAS and AOCL views are rendered from that one cache set — so the provenance headers of
+> [`bench/gen_table.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table.md) and
+> [`bench/gen_table_aocl.md`](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/gen_table_aocl.md)
+> are identical by construction. The µarch labels are stamped authoritatively into each cache header
+> (`uarch=`), fixing a prior plot-labeling swap.
