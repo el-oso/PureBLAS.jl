@@ -43,15 +43,29 @@ for f in "${files[@]}"; do
             if (pb > 0 && ref > 0) {
                 d = (pb - ref) / ref * 100; if (d < 0) d = -d
                 tot++
-                if (d > TOL) { off++; if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%)\n", $1, $2, $3, pb/1000, refname, ref/1000, d }
+                if (d > TOL) {
+                    off++
+                    if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%)\n", $1, $2, $3, pb/1000, refname, ref/1000, d
+                    badop[$1 "/" $2] = 1; badgrp[$1] = 1     # scope for a TARGETED re-measure
+                } else ok++
                 if (d > worst) { worst = d }
             }
         }
         END {
             if (tot == 0) { print "   no cells carry both a pb and a reference clock — cannot check"; exit 0 }
-            if (off > 0) printf "   => %d/%d cells clock-mismatched, worst %.1f%% (tolerance %s%%)\n", off, tot, worst, TOL
-            else         printf "   => all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst
-            exit (off > 0)
+            if (off == 0) { printf "   => all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst; exit 0 }
+            printf "   => %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%)\n", off, tot, ok, worst, TOL
+            # THE POINT OF THE PER-CELL CLOCK: re-measure ONLY what is broken. A lock that floats
+            # part-way through a sweep leaves most cells VALID; condemning the whole cache and
+            # re-sweeping it wastes hours and is what this field exists to prevent.
+            no = 0; for (o in badop) no++
+            ng = 0; gl = ""; for (g in badgrp) { ng++; gl = gl " " g }
+            printf "   affected: %d op(s) in %d group(s):%s\n", no, ng, gl
+            printf "   targeted re-measure (groups, fewest julia startups):\n     for g in%s; do julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw; done\n", gl
+            printf "   per-op instead (finest scope, one startup each):\n    "
+            for (o in badop) { split(o, q, "/"); printf " op=%s", q[2] }
+            printf "\n"
+            exit 1
         }' "$f")
     st=$?
     printf '%s\n' "$out"
