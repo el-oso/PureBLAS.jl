@@ -21,6 +21,8 @@ makedocs(;
         "Tuning Constants" => "tuning.md",
         "Performance" => "performance.md",
         "LAPACK/BLAS Coverage" => "coverage.md",
+        "Methodology & Provenance" => "methodology.md",
+        "Performance Notes" => "notes.md",
     ],
 )
 
