@@ -22,6 +22,19 @@
 # validation before it is trusted to extrapolate (req#8: derive → validate on the fleet → ship).
 const _PPTRF_TPSV_MIN = 32
 
+# Block width for the blocked lower packed factorisation. PDM tier: PIN-able, default DERIVED from the
+# same criterion dense LU/Cholesky use — this faces the identical panel-vs-trailing-BLAS-3 tradeoff, so
+# it inherits `_lu_nb`'s validated shape rather than introducing a second unvalidated formula (req#8b).
+# NOTE the copy traffic is n³/(6·nb), so a LARGER nb is cheaper on copies but shrinks the BLAS-3
+# trailing update; this is the knob to sweep first if the blocked path underperforms.
+const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", _LU_NB)::Int
+
+# Smallest n where unpacking pays. MEASURED: 2.26× at n=32 (bench/probes/pptrf_unpack_strategy.jl), so
+# the crossover is below 32; it has NOT been measured between 8 and 32, and this value is provisional
+# until it is. Below it the unblocked BLAS-2 kernel is kept — at very small n the O(n²) copy stops
+# amortising against O(n³/3) work.
+const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
+
 # ── lower path: trailing-order below which the rank-1 downdate inlines instead of calling spr! ─────
 # SEPARATE KNOB from _PPTRF_TPSV_MIN above. The lower path reused that constant, but its table was
 # measured entirely on the UPPER path (tpsv-vs-inline); the lower path's question is spr!-vs-inline,
@@ -95,6 +108,88 @@ end
 # ── pptrf!: packed Cholesky factorization (dpptrf.f) ──────────────────────────────────────────────
 # uplo='U': A = Uᴴ·U (left-looking — solve Uᴴu = col then the diagonal). uplo='L': A = L·Lᴴ
 # (right-looking — scale column, rank-1 downdate). Overwrites AP. Throws PosDefException.
+# ── Blocked lower packed Cholesky ────────────────────────────────────────────────────────────────
+#
+# WHY. Measured 2026-08-18 (bench/probes/pptrf32_decomp.jl, same-flops control): our DENSE potrf! is
+# 2.9-3.9× faster than this file's packed kernel for identical n³/3 flops, because `_pptrf_lower!` is
+# an unblocked BLAS-2 column loop while potrf! is blocked + SIMD on the tuned L3 kernels. The gate gap
+# vs AOCL is 18%; the gap vs our own dense path is ~300%. End-to-end unpack→potrf!→repack measured
+# 2.26/3.05/3.46/3.68/3.91× at n=32/64/128/256/512 (bench/probes/pptrf_unpack_strategy.jl).
+#
+# WHY BLOCK-COLUMN AND NOT WHOLE-MATRIX. A whole-matrix unpack needs O(n²) scratch — 32 MB against
+# packed's 16 MB at n=2048 — which hands back exactly the memory packed storage exists to save. This
+# processes ONE block column at a time: O(n·nb) scratch (~0.8 MB at n=2048, nb=48).
+#
+# THE COPY TRAFFIC IS ~1%, which is what makes the bounded-memory form viable: each outer step touches
+# the trailing triangle once, so total copied elements are Σ(n−k)²/2 over n/nb steps = n³/(6·nb),
+# against n³/3 flops — at nb=48 that is 3/(6·48) ≈ 1%.
+@inline function _pp_unpack_bcol!(W, AP, n::Int, k::Int, kb::Int)
+    Z = zero(eltype(W))
+    @inbounds for jj in 1:kb
+        j = k + jj - 1
+        s = _pp_l(j, j, n); off = j - k        # rows 1..off of this W column sit ABOVE the diagonal
+        for i in 1:off
+            W[i, jj] = Z                       # not stored in packed form; zero so the gemm sees no garbage
+        end
+        for t in 0:(n - j)
+            W[off + 1 + t, jj] = AP[s + t]     # column j is CONTIGUOUS in lower-packed storage
+        end
+    end
+    return W
+end
+
+@inline function _pp_repack_bcol!(AP, W, n::Int, k::Int, kb::Int)
+    @inbounds for jj in 1:kb
+        j = k + jj - 1
+        s = _pp_l(j, j, n); off = j - k
+        for t in 0:(n - j)
+            AP[s + t] = W[off + 1 + t, jj]     # only the LOWER part is written back
+        end
+    end
+    return AP
+end
+
+# Right-looking blocked factorisation. `W` holds the current panel, `V` the trailing block column being
+# updated; both are n×nb scratch (only the leading m×kb / mm×jb corner is used).
+function _pptrf_lower_blocked!(AP::AbstractVector{T}, n::Int, nb::Int, W, V) where {T}
+    k = 1
+    while k <= n
+        kb = min(nb, n - k + 1); m = n - k + 1
+        _pp_unpack_bcol!(W, AP, n, k, kb)
+        d = view(W, 1:kb, 1:kb)
+        # NOTE: a PosDefException from the diagonal block carries a LOCAL index; it is rethrown with the
+        # global column so callers see the same info value the unblocked path reports.
+        try
+            potrf!(d; uplo = 'L')
+        catch e
+            e isa PosDefException ? throw(PosDefException(e.info + k - 1)) : rethrow()
+        end
+        # COMPLEX IS HERMITIAN, NOT SYMMETRIC: A = L·Lᴴ, so the panel solve is against L11ᴴ ('C') and the
+        # trailing update is A21·A21ᴴ (conjugated B), not the transposes the real case uses. Gating on
+        # `T <: BlasFloat` admits ComplexF32/ComplexF64, so getting this wrong is a WRONG ANSWER, not a
+        # slowdown — it broke zpptrf at n=64/129 when this path first shipped with 'T'/no-conjugate.
+        m > kb && trsm!(
+            view(W, (kb + 1):m, 1:kb), d;
+            side = 'R', uplo = 'L', transA = (T <: Complex ? 'C' : 'T'), diag = 'N'
+        )
+        _pp_repack_bcol!(AP, W, n, k, kb)
+        jj = k + kb
+        while jj <= n                                  # trailing update, one block column at a time
+            jb = min(nb, n - jj + 1); mm = n - jj + 1
+            _pp_unpack_bcol!(V, AP, n, jj, jb)
+            r0 = jj - k + 1
+            _gemm_core!(                                     # V -= A21 · A21ᵀ (real) / A21ᴴ (complex)
+                view(V, 1:mm, 1:jb), view(W, r0:m, 1:kb), view(W, r0:(r0 + jb - 1), 1:kb),
+                -one(T), one(T), false, true, false, T <: Complex
+            )
+            _pp_repack_bcol!(AP, V, n, jj, jb)
+            jj += nb
+        end
+        k += nb
+    end
+    return AP
+end
+
 function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
     n = _pp_order(length(AP))
     if uplo == 'U'
@@ -134,7 +229,21 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         # so the trailing triangle of order n-j is exactly the contiguous tail AP[_pp_l(j+1,j+1,n):end]
         # and the multiplier column is the contiguous run AP[_pp_l(j+1,j,n) .. _pp_l(n,j,n)] — spr!/hpr!
         # can take both as views with no packing or copy.
-        _pptrf_lower!(AP, n, _pptrf_spr_min(eltype(AP)))
+        # Blocked path when it can pay: it needs at least one full panel plus a trailing block to
+        # amortise the unpack, hence n > 2·nb. Everything else (AD eltypes, strided/offset vectors,
+        # small n) keeps the unblocked kernel unchanged.
+        T = eltype(AP)
+        # nb is CLAMPED to n: for n ≤ nb the loop degenerates to a single panel, i.e. exactly
+        # unpack→dense potrf!→repack, which is the 2.26× case measured at n=32. Gating on n > 2·nb
+        # would have excluded n=32 and n=48 — the very cells that miss the gate — so the threshold is
+        # on where the copy starts to amortise, not on having a trailing block.
+        nb = min(_PPTRF_BLK_NB, n)
+        if T <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
+            W = Matrix{T}(undef, n, nb); V = Matrix{T}(undef, n, nb)
+            _pptrf_lower_blocked!(AP, n, nb, W, V)
+        else
+            _pptrf_lower!(AP, n, _pptrf_spr_min(T))
+        end
     else
         throw(ArgumentError("pptrf!: uplo must be 'L' or 'U'"))
     end
