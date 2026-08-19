@@ -828,48 +828,24 @@ const _GEMVT_NC = @load_preference("gemvt_nc", 4)::Int   # req8-ok: falsified-de
 const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
-    function _measure_gemvt_perscan()::Int
-        Base.generating_output() && return 0         # never burn a measure during precompile
-        _f = _force_knob("gemvt_perscan"); _f >= 0 && return _f  # instrument only, see _force_knob
-        try
-            # Probe INSIDE the window, derived: A ≈ 4×L2 (clearly past L2), m capped so x ≤ L1/2.
-            m = min(isqrt(4 * _L2_BYTES ÷ sizeof(Float64)), _L1_BYTES ÷ 2 ÷ sizeof(Float64))
-            m -= m % 4; m < 64 && return 0
-            n = m
-            A = fill(1.0, m, n); x = fill(1.0, m); y = fill(0.0, n)
-            GC.@preserve A x y begin
-                pA = pointer(A); px = pointer(x); py = pointer(y); ld = stride(A, 2); sz = sizeof(Float64)
-                # MEDIAN, not min. Kept straight-line (constraint 1: no closures here), so the samples go
-                # into vectors rather than through `_tune_ab`. min-of-3 was the shipped estimator until
-                # 2026-08-05; it is optimistic and tail-blind, and it selects which gemv-T path SHIPS.
-                nrep = 5
-                tbs = Vector{UInt64}(undef, nrep); tps = Vector{UInt64}(undef, nrep)
-                for r in 0:nrep                              # r=0 untimed warmup; interleaved after
-                    s = time_ns()
-                    j = 0
-                    while j + 4 <= n
-                        _gemv_t_block!(py + j * sz, _colbases(pA + j * ld * sz, ld, sz, Val(4)), px, m, 1.0, 0.0, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))
-                        j += 4
-                    end
-                    e = time_ns() - s; r > 0 && (tbs[r] = e)
-                    s = time_ns()
-                    @inbounds for jj in 0:(n - 1)
-                        unsafe_store!(py, _dot_simd(m, pA + jj * ld * sz, px, Float64), jj + 1)
-                    end
-                    e = time_ns() - s; r > 0 && (tps[r] = e)
-                end
-                sort!(tbs); sort!(tps)
-                mid = (nrep + 1) ÷ 2
-                # This duel only ever probes INSIDE the window, so it can resolve 0 vs 1 and nothing
-                # else. Mode 2 is reachable by force/Pin only, deliberately: nothing ships it yet.
-                return tps[mid] < tbs[mid] ? 1 : 0
-            end
-        catch
-            return 0
-        end
-    end
-    const _GEMVT_PERSCAN_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_perscan)
-    @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_ONCE()
+    # DUEL DELETED 2026-08-19 — it was shipping a 27% regression once every ~6 processes.
+    # Resolved across 6 fresh processes per box: wintermute 1,1,1,1,1,1 but galen 0,0,0,0,1,0. The
+    # full-run fleet table above says Zen3 wants mode 0 at EVERY size and that mode 1 costs it
+    # gemvT@2048 = 0.942 -> 0.686. So one galen process in six silently shipped that, with nothing in
+    # the output to say which arm ran — and gemvT@2048 is itself an open gate task.
+    #
+    # WHY THE PROBE LOST TO THE TABLE: it timed 5 interleaved reps of one shape INSIDE the window, in
+    # process, against a `_dot_simd` column loop. The table is a full `bench/plots.jl op=gemvT` per
+    # arm, every box freq-locked, PB+OpenBLAS+AOCL measured in ONE run, forced through the real entry
+    # path. When a 5-rep micro-probe and the gate disagree, the gate wins — the standing rule here.
+    # The probe's own comment already conceded it 'only ever probes INSIDE the window'.
+    #
+    # Value comes from `_at_gemvt_perscan` (cpuinfo.jl), which is a KEYED LITERAL, not a derivation —
+    # see there for why no mechanism is claimed and why mode 0 is the default for unseen hardware.
+    # Ref, so `PUREBLAS_FORCE_gemvt_perscan` still reaches the real entry path; that hook is how the
+    # authoritative table was produced, so it must outlive the duel.
+    const _GEMVT_PERSCAN_REF = Ref{Int}(_at_gemvt_perscan(_HW))
+    @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_REF[]
 else
     @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_PREF::Int
 end
@@ -3938,6 +3914,12 @@ function _init_force_knobs!()
     @static if isnothing(_ZAXPY_NARROW_PREF)
         f = _force_knob("zaxpy_narrow")
         f >= 0 && (_ZAXPY_NARROW_REF[] = f != 0)
+    end
+    # gemv-T route mode. Mode 2 (per-column everywhere) is reachable ONLY here or by Pin — nothing
+    # ships it, and the deleted duel could not resolve it either.
+    @static if isnothing(_GEMVT_PERSCAN_PREF)
+        f = _force_knob("gemvt_perscan")
+        f >= 0 && (_GEMVT_PERSCAN_REF[] = f)
     end
     return
 end
