@@ -67,15 +67,15 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # `axpy_dram` is `_double_pumped(_HW) ? 208 : 4`. Neither allocates or benchmarks any more, so neither
 # needs pinning for trim. Codes, for reading the source: u = interleaved(u); 100+u = phase(u, full
 # width); 200+u = phase(u, narrow/256-bit).)
-# And `sytrf_cmult`: the complex Bunch-Kaufman block multiplier is a Measure-tier OncePerProcess
-# benchmark that allocates a 1024x1024 probe matrix. `sytrf_64_` is @ccallable, so leaving it unpinned
-# shipped that benchmark into the .so — and unlike the axpy knobs it was never caught by trim, because
-# its candidate loop is over plain integers (1,2,3,4) with no `Val`, so it is type-stable and trim has
-# no complaint. Nothing announced the gap; test/pin_lint.jl now does.
-# Value 2, not the 1 measured on Zen4: the measure's OWN failure path returns 2 with the comment
-# "the safer default: 1 MISSES on Zen3", and a trimmed .so is one binary that must be safe on any host.
-# NOTE this pins the MULTIPLIER, not `sytrf_nb` — pinning the latter takes a branch whose value is flat
-# and would discard the derived `_sytrf_nb_shape(n)` scaling entirely.
+# (`sytrf_cmult` was pinned here to 2, because the complex Bunch-Kaufman multiplier was a Measure-tier
+# OncePerProcess allocating a 1024x1024 probe matrix, and `sytrf_64_` is @ccallable so the .so shipped
+# that benchmark. Trim never caught it — the candidate loop is over plain integers with no `Val`, so it
+# is type-stable and trim had no complaint; test/pin_lint.jl is what announced the gap.
+# The duel was DELETED on 2026-08-19 and 2 became the in-code default, so the pin is gone with it. 2 was
+# always the right value for a single binary: the measure's own failure path returned it with the note
+# "the safer default: 1 MISSES on Zen3", and every flip the live duel produced picked 1 — i.e. the tuner
+# occasionally shipped the arm the source calls a miss. The default still multiplies the DERIVED
+# `_sytrf_nb_shape(n)`, so the size scaling the flat `sytrf_nb` pin would have discarded is preserved.)
 # And `potrf_upper_direct_max`: the tiny-UPPER cutoff (factor in place vs transpose onto the
 # vectorised lower kernel) is a Measure-tier OncePerProcess per eltype. `potrf_64_` is @ccallable, so
 # unpinned it would ship an on-host benchmark into the .so — the first call would time two Cholesky
@@ -92,7 +92,6 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # `potrf_upper_direct_max` above.
 const _prev_cgnb = load_preference(PUREBLAS_UUID, "cgemvn_nc_big")
 const _prev_pud = load_preference(PUREBLAS_UUID, "potrf_upper_direct_max")
-const _prev_sycm = load_preference(PUREBLAS_UUID, "sytrf_cmult")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 const _prev_gvtd = load_preference(PUREBLAS_UUID, "gemvt_deep")
 const _prev_gvu = load_preference(PUREBLAS_UUID, "gemvt_u")
@@ -106,7 +105,6 @@ set_preferences!(PUREBLAS_UUID, "gemvt_u" => 1; force = true)           # gemv-T
 set_preferences!(PUREBLAS_UUID, "gemvt_pf" => 0; force = true)          # gemv-T A-stream prefetch distance (Measure tier)
 set_preferences!(PUREBLAS_UUID, "trmv_fused_min" => 1; force = true)    # trmv unblocked->fused8 crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gemvn_minner" => false; force = true)  # gemv-N m-inner panel route (Measure tier)
-set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
 set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => 12; force = true)  # tiny-upper potrf cutoff (Measure tier)
 set_preferences!(PUREBLAS_UUID, "cgemvn_nc_big" => 8; force = true)      # complex gemvN large-A panel (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
@@ -154,11 +152,6 @@ finally
         delete_preferences!(PUREBLAS_UUID, "gemvn_minner"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "gemvn_minner" => _prev_gvnm; force = true)
-    end
-    if _prev_sycm === nothing
-        delete_preferences!(PUREBLAS_UUID, "sytrf_cmult"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => _prev_sycm; force = true)
     end
     if _prev_pud === nothing
         delete_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max"; force = true)
