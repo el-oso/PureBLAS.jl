@@ -44,9 +44,6 @@ const _prev_pbu = load_preference(PUREBLAS_UUID, "pbtrf_u_native_kd")
 # one for kd below it, where clamping to kd would collapse the in-band panel). Both are runtime
 # benchmarks. 8 is the Zen4 F64 optimum (= W).
 const _prev_pbns = load_preference(PUREBLAS_UUID, "pbtrf_nb_small")
-# And `pptrf_spr_min`: the packed lower path's spr!-vs-inline cutoff is a Measure-tier
-# OncePerProcess race. 8 is the Zen4 F64 optimum (= W).
-const _prev_ppsm = load_preference(PUREBLAS_UUID, "pptrf_spr_min")
 # And `gbtrf_cross`: the blocked-vs-unblocked band crossover is a Measure-tier OncePerProcess race and
 # a runtime benchmark is not trim-safe. 16 is the Zen4 value; Zen3 measures higher (blocking loses at
 # kl=16 there), so a trim build for AVX2 should re-pin this.
@@ -101,8 +98,6 @@ const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 const _prev_gvtd = load_preference(PUREBLAS_UUID, "gemvt_deep")
 const _prev_gvu = load_preference(PUREBLAS_UUID, "gemvt_u")
 const _prev_gvpf = load_preference(PUREBLAS_UUID, "gemvt_pf")
-const _prev_gvnc = load_preference(PUREBLAS_UUID, "gemvt_nc")
-const _prev_cgvc = load_preference(PUREBLAS_UUID, "cgemvt_cfg")
 const _prev_tfm = load_preference(PUREBLAS_UUID, "trmv_fused_min")
 const _prev_gvnm = load_preference(PUREBLAS_UUID, "gemvn_minner")
 set_preferences!(PUREBLAS_UUID, "ger_panel_np" => 4; force = true)
@@ -110,8 +105,6 @@ set_preferences!(PUREBLAS_UUID, "gemvt_perscan" => false; force = true)  # gemv-
 set_preferences!(PUREBLAS_UUID, "gemvt_deep" => true; force = true)       # gemv-T deep-panel shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gemvt_u" => 1; force = true)           # gemv-T m-unroll (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gemvt_pf" => 0; force = true)          # gemv-T A-stream prefetch distance (Measure tier)
-set_preferences!(PUREBLAS_UUID, "gemvt_nc" => 4; force = true)          # gemv-T column count (Measure tier)
-set_preferences!(PUREBLAS_UUID, "cgemvt_cfg" => 4; force = true)        # complex gemv-T panel config (Measure tier)
 set_preferences!(PUREBLAS_UUID, "trmv_fused_min" => 1; force = true)    # trmv unblocked->fused8 crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gemvn_minner" => false; force = true)  # gemv-N m-inner panel route (Measure tier)
 set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
@@ -125,7 +118,6 @@ set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocke
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
-set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => 8; force = true)       # packed lower spr-vs-inline cutoff (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gbtrf_cross" => 16; force = true)         # banded-LU blocking floor (Measure tier)
 
 @info "PureBLAS: building trimmed library" OUT
@@ -156,16 +148,6 @@ finally
         delete_preferences!(PUREBLAS_UUID, "gemvt_pf"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "gemvt_pf" => _prev_gvpf; force = true)
-    end
-    if _prev_gvnc === nothing
-        delete_preferences!(PUREBLAS_UUID, "gemvt_nc"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "gemvt_nc" => _prev_gvnc; force = true)
-    end
-    if _prev_cgvc === nothing
-        delete_preferences!(PUREBLAS_UUID, "cgemvt_cfg"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "cgemvt_cfg" => _prev_cgvc; force = true)
     end
     if _prev_tfm === nothing
         delete_preferences!(PUREBLAS_UUID, "trmv_fused_min"; force = true)
@@ -242,11 +224,6 @@ if _prev_gbnb === nothing
 else
     set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => _prev_gbnb; force = true)
 end
-if _prev_ppsm === nothing
-        delete_preferences!(PUREBLAS_UUID, "pptrf_spr_min"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "pptrf_spr_min" => _prev_ppsm; force = true)
-    end
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
 # is `.debug_*` sections, dead weight in a distributed drop-in. `--strip-debug` keeps the full symbol
