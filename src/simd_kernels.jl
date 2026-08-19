@@ -167,123 +167,14 @@ end
 const _AXPY_VW_F64 = Val(_vwidth(Float64))          # full width, F64 probe
 const _AXPY_VHW_F64 = Val(_vwidth(Float64) ÷ 2)     # narrow (half) width, F64 probe
 
-const _AXPY_UNROLL_PREF = @load_preference("axpy_unroll", nothing)
-@static if isnothing(_AXPY_UNROLL_PREF)
-    function _measure_axpy_unroll()::Int
-        Base.generating_output() && return _UNROLL          # never burn a measure during precompile
-        _f = _force_knob("axpy_band"); _f >= 0 && return _f  # measurement instrument only, see _force_knob
-        try
-            # PROBE IN THE MIDDLE OF THE BAND IT GOVERNS. This knob covers L1 < bytes <= L3, and probing
-# at 4xL1 picked a shape that wins at 128 KB and LOSES at 800 KB / 2.4 MB — the sizes that
-# actually fail on Zen4 (1e5, 3e5). 2xL2 sits above L2 and inside L3 on every fleet box.
-# ⚠ NOT A POWER OF TWO. `2*L2/8` and `2*L3/8` are both exact po2 (262144 and 4194304 on Zen4), and
-# po2 lengths are a cache-set-aliasing pathology — the codebase has `_avoid_po2` for exactly
-# this and this probe was not using it. Measured 2026-08-07 in the GATE regime: at n=262144
-# the incumbent `u4` takes 2317 us, SLOWER than at n=300000 (1948 us) despite fewer elements,
-# and `p208` beats it by 37% there versus 1.6% at the neighbouring non-po2 size. So the knob
-# was being decided at a point where one arm is anomalously crippled — a pathological probe,
-# not a representative one.
-            # ⚠ PROBE AT THE TOP OF THE REGIME, NOT ITS MIDDLE — this knob governs everything from L1 up
-            # to L3 (a ~10x span of working set), and the arms' separation GROWS with stream length, so
-            # a probe in the middle measures the weakest point of the effect it is supposed to resolve.
-            # Measured 2026-08-07 on wintermute, freq-locked and quiet, forcing each arm through the
-            # real entry path and reading bench/plots.jl (two runs per arm):
-            #        n=1e5          n=3e5          n=1e6
-            #   4    1.009 1.010    1.001 1.004    0.969 0.983   <- MISSES
-            #   208  1.018 1.011    1.024 1.019    1.067 1.054   <- whole row gates
-            # Phase-narrow wins across the ENTIRE band range here, but by only ~1% at the old probe
-            # length (ws=4.2 MB) — inside the regret bound — so the duel scored it a tie and the knob
-            # resolved 4 or 208 depending on the process. That coin flip WAS the long-standing axpy
-            # n=1e6 bimodality: the cell read 1.001, 0.997, 0.967, 0.965, 0.962, 1.024 across runs on
-            # identical code, which is exactly the 8-9% gap between the two arms.
-            # Sizing to ws = 7/8·L3 keeps the probe inside the band regime (the router hands ws >= L3
-            # to `_axpy_dram`) while placing it where the arms are actually separable.
-            n = _avoid_po2(max(4096, 7 * _L3_BYTES ÷ (16 * sizeof(Float64))), 8 * _vwidth(Float64))
-            W = _vwidth(Float64)
-            # NB SETS OF OPERANDS, ROTATED PER ROUND. One buffer pair is one draw of page placement /
-            # THP state / allocator addresses, and for THIS knob the winner depends on that draw: with
-            # 15 rounds a tie-driven false positive is 0.05%, yet fresh processes still resolved 208 in
-            # some and 4 in others, so the candidates' relative speed genuinely differs per placement.
-            # Rotating means the sign count aggregates over placements instead of re-measuring one.
-            # The pointers are read through `Ref`s so the candidate closures (which must stay
-            # allocation-free and literal-`Val`) see the current pair without being rebuilt per round.
-            nb = 4
-            xs = [fill(1.0, n) for _ in 1:nb]
-            ys = [fill(0.5, n) for _ in 1:nb]
-            # ⚠ `bt` IS SEEDED WITH THE DEFAULT'S OWN MEASURED TIME, not `typemax`. `typemax*95` WRAPS to
-            # 2^64-95 — still far above any real time — so with a typemax seed the FIRST candidate always
-            # displaces and `best = _UNROLL` can never win a tie; the effective incumbent was whichever
-            # arm happened to be written first (Val(2)). That silently voided "ties go to the incumbent,
-            # which is the derived default" (cpuinfo.jl) on exactly the boxes the margin exists for.
-            best = _UNROLL
-            GC.@preserve xs ys begin
-                pxr = Ref(pointer(xs[1])); pyr = Ref(pointer(ys[1]))
-                rot(r) = (i = mod1(r, nb); pxr[] = pointer(xs[i]); pyr[] = pointer(ys[i]); nothing)
-                px() = pxr[]; py() = pyr[]
-                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px(), py(), 0)   # req8-ok: the incumbent _UNROLL=4
-                # req8-ok: a MEASUREMENT-PRECISION budget in nanoseconds, not a machine value — it
-                # selects no kernel and appears in no shipped path. Each round-arm statistic is a median
-                # over ~this much signal, and `nrep` is DERIVED from it by timing the incumbent once, so
-                # a slower or faster box spends the same TIME rather than the same rep count.
-                _REP_BUDGET_NS = 20_000_000
-                nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
-                # SHAPE x DEPTH, not depth alone. Codes: u -> interleaved(u); 100+u -> phase(u, full
-                # width); 200+u -> phase(u, narrow/256-bit). Measured in situ (Fable's A/B, three fresh
-                # runs per box): Zen5 n=3e4 phase4 reads 1.063/1.099/1.111 vs shipped and BEATS OpenBLAS
-                # by ~2.6pp, while the interleaved-8 control reproduces the earlier width falsification
-                # (0.99). Zen4/Zen3 keep an interleaved arm. Depth alone could never express this.
-                # CANDIDATES ARE WRITTEN OUT, one literal `Val` each — NOT a loop over `Val(u)`. A loop
-                # variable makes `Val(u)` non-concrete, and the resulting `runtime dispatch detected:
-                # _axpy_unrolled!(%3::Val, …)` propagates out of the measure, through `_axpy_dram()`, and
-                # breaks the @typestable contract on the PUBLIC `axpy!` path (strictmode_tests.jl:11).
-                # The guards const-fold: `W` and `_NVREG` are compile-time consts.
-                # ⚠ DUELS. This knob flipped between 2 and 4 across fresh processes of one binary
-                # (measured 2026-08-06, wintermute, freq-locked, quiet: 2 2 4 4 4 4 2 2), so the margin
-                # was choosing the shipped kernel by coin toss here too. NOTE how that was nearly missed:
-                # an earlier 5-process sample drew 2 2 2 2 2 and was recorded as "stable". Five draws
-                # cannot see a ~50/50 flip — the acceptance test needs enough processes to resolve one,
-                # and the `tune=` stamp in the cache header is what exposed the disagreement.
-                # Each candidate duels the INCUMBENT over rotated rounds with a per-round median and a
-                # supermajority; first to earn it wins, so a later arm cannot displace on a difference
-                # the rule has already judged unresolvable. Literal `Val`s throughout: a loop variable
-                # makes `Val(u)` non-concrete and the runtime dispatch propagates out through
-                # `_axpy_band()` to break the @typestable contract on the PUBLIC axpy! path.
-                # ⚠ `reps = _BAND_REPS`, NOT the `_tune_duel` default of 5. At this probe length one
-                # call is ~1.2 ms, so a 5-rep median is built from ~6 ms of signal and its round-to-round
-                # scatter swamped an effect the SAME comparison resolves cleanly with more samples:
-                # measured 2026-08-07 on wintermute, freq-locked and quiet, at exactly this n and with
-                # exactly these operands, phase-narrow reads 1.137 with every round in 1.107-1.143
-                # against a 0.36% floor — yet the 5-rep duel returned the incumbent in 7 of 10 fresh
-                # processes. A 15-round sign test cannot rescue a per-round statistic that is itself
-                # noisier than the effect; the aggregation has to happen where the noise is.
-                # This is the knob whose coin flip WAS the axpy n=1e6 bimodality (see the probe-length
-                # note above), so it is worth the extra ~0.2 s once per process on the lazy path.
-                if W >= 8                                    # a narrow arm only exists at 512-bit
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 208  # req8-ok: candidate arm
-                end
-                if 8 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 108  # req8-ok: candidate arm
-                end
-                if 4 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(4), _AXPY_VW_F64, n, 1.0e-9, px(), py()); reps = nrep, refresh = rot)) && return 104  # req8-ok: candidate arm
-                end
-                if 8 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(8), n, 1.0e-9, px(), py(), 0); reps = nrep, refresh = rot)) && return 8  # req8-ok: candidate arm
-                end
-                if 2 * W <= _NVREG
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px(), py(), 0); reps = nrep, refresh = rot)) && return 2  # req8-ok: candidate arm
-                end
-            end
-            return best
-        catch
-            return _UNROLL
-        end
-    end
-    const _AXPY_UNROLL_ONCE = Base.OncePerProcess{Int}(_measure_axpy_unroll)
-    @inline _axpy_band() = _AXPY_UNROLL_ONCE()
-else
-    @inline _axpy_band() = _AXPY_UNROLL_PREF::Int
-end
+# DERIVE (2026-08-19), replacing the OncePerProcess duel: `_at_axpy_band` (cpuinfo.jl) keys on the
+# datapath — see there for the mechanism, the fleet table, and the one unresolved probe disagreement.
+# BEHAVIOUR-NEUTRAL BY CONSTRUCTION: the formula reproduces what the duel already resolved on each box
+# (Zen4 208, Zen3 4), so this buys determinism, not a new arm. That matters because the ENTIRE BLAS-1
+# gate ladder is governed by THIS knob on every fleet box — `2·n·8 ≤ 16 MB < L3` at n ≤ 1e6 — so an
+# unforced change here lands directly on gate cells, including the n=1e6 cell that 208 exists to close.
+const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
+@inline _axpy_band() = _AXPY_BAND
 
 # SECOND KNOB, DRAM REGIME — ITS OWN PREFERENCE AND ITS OWN GATE. It previously lived inside the
 # `axpy_unroll` block and fell back to `_AXPY_UNROLL_PREF`, which (a) silently collapsed two
@@ -291,66 +182,13 @@ end
 # `axpy_dram` preference to set, so the trim/.so build could not pin it — and req#8b requires every
 # Measure-tier knob to be pinned there, since a runtime benchmark is not trim-safe. That is exactly
 # what made `daxpy_64_` fail trim checking.
-const _AXPY_DRAM_PREF = @load_preference("axpy_dram", nothing)
-# One knob cannot serve both bands: probed at 4xL1 the winner was the
-# narrow phase body, and shipping it everywhere past L1 REGRESSED the L2/L3 cells on Zen4
-# (n=1e5 1.018 -> 0.986, n=3e5 1.020 -> 0.981) while helping only past L3. Same lesson as the first
-# split — a Measure knob governs the regime it was probed in, and nothing else. Probe at 2xL3, which
-# is unambiguously DRAM-resident on every fleet box.
-@static if isnothing(_AXPY_DRAM_PREF)
-    function _measure_axpy_dram()::Int
-        Base.generating_output() && return _UNROLL
-        _f = _force_knob("axpy_dram"); _f >= 0 && return _f  # measurement instrument only, see _force_knob
-        try
-            # po2 probe length — see the note on the band knob above.
-            n = _avoid_po2(max(4096, 2 * _L3_BYTES ÷ sizeof(Float64)), 8 * _vwidth(Float64))
-            W = _vwidth(Float64)
-            # NB OPERAND SETS, ROTATED PER ROUND — the same fix the band knob needed. Duels ALONE left
-            # this one resolving 4/208 across fresh processes on Zen4 while its rotated sibling was
-            # stable (measured 2026-08-07, one knob per process). Duelling resamples TIME; when the
-            # winner depends on state fixed once per process — page placement, THP, allocator addresses
-            # — every round re-measures the same draw and more rounds converge harder onto it.
-            # ⚠ The symptom is BOX-DEPENDENT: this knob is stable on Zen5 and unstable on Zen4, and
-            # `zaxpy_narrow` is the other way round. So rotation is applied uniformly to every Measure
-            # knob rather than chased per box, where it would look fixed on whichever box was checked.
-            nb = 4
-            xs = [fill(1.0, n) for _ in 1:nb]
-            ys = [fill(0.5, n) for _ in 1:nb]
-            # ⚠ DUELS, not a margin — this knob is THE reason the rule changed. Measured 2026-08-06,
-            # wintermute, freq-locked and quiet, five fresh processes of the same binary under the old
-            # margin rule: 208, 4, 2, 208, 4. THREE different kernels shipping from one binary, which is
-            # the Zen5 failure this file's own comments already record, reproduced on Zen4. The margin
-            # cannot separate these candidates because their differences sit inside its threshold, so
-            # noise picked the winner every time.
-            # `_tune_duel` runs each candidate against the INCUMBENT (_UNROLL) over rotated rounds whose
-            # per-round statistic is a median, and `_tune_wins_it` needs a supermajority — no noise floor
-            # is estimated, and a candidate that is merely lucky once cannot win. Candidates are still
-            # written out with literal `Val`s (a loop variable makes `Val(u)` non-concrete and produced
-            # the runtime dispatch that failed the @typestable contract on the public axpy! path).
-            best = _UNROLL
-            GC.@preserve xs ys begin
-                pxr = Ref(pointer(xs[1])); pyr = Ref(pointer(ys[1]))
-                rot(r) = (i = mod1(r, nb); pxr[] = pointer(xs[i]); pyr[] = pointer(ys[i]); nothing)
-                px() = pxr[]; py() = pyr[]
-                inc() = _axpy_unrolled!(Val(4), n, 1.0e-9, px(), py(), 0)   # req8-ok: the incumbent _UNROLL=4
-                # Ordered widest-effect first; the first candidate to earn a supermajority wins, so a
-                # later one cannot displace on a difference the rule has already judged unresolvable.
-                if W >= 8
-                    _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VHW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 208  # req8-ok: candidate arm
-                end
-                _tune_wins_it(_tune_duel(inc, () -> _axpy_phase!(Val(8), _AXPY_VW_F64, n, 1.0e-9, px(), py()); refresh = rot)) && return 108  # req8-ok: candidate arm
-                _tune_wins_it(_tune_duel(inc, () -> _axpy_unrolled!(Val(2), n, 1.0e-9, px(), py(), 0); refresh = rot)) && return 2  # req8-ok: candidate arm
-            end
-            return best
-        catch
-            return _UNROLL
-        end
-    end
-    const _AXPY_DRAM_ONCE = Base.OncePerProcess{Int}(_measure_axpy_dram)
-    @inline _axpy_dram() = _AXPY_DRAM_ONCE()
-else
-    @inline _axpy_dram() = _AXPY_DRAM_PREF::Int
-end
+# DERIVE (2026-08-19), replacing the OncePerProcess duel: `_at_axpy_dram` (cpuinfo.jl) keys on the
+# datapath, which is this knob's actual physical criterion — see there for the mechanism and the
+# measured fleet table. The duel it replaces resolved the 17%-SLOWER arm on wintermute in 7 of 9
+# fresh processes and flipped in the other 2, so the shipped kernel was both wrong and per-process
+# non-deterministic. Validated offline against the fleet descriptors in test/autotune_tests.jl.
+const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
+@inline _axpy_dram() = _AXPY_DRAM
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
 # dynamic `Val(u)` in the hot path, so this stays allocation-free and StrictMode-clean).

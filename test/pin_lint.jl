@@ -47,12 +47,17 @@ function pin_scan()
     end
     missing_pins = String[]
     for f in _jlfiles(_SRC)
-        src = read(f, String)
+        lines = readlines(f)
         # Measure tier == this file also runs an on-host benchmark. A pref with a nothing default but no
         # OncePerProcess anywhere in the file is a Pin/Derive-tier override (e.g. `simd_bytes`), which
         # needs no trim pin because nothing is benchmarked.
-        occursin("OncePerProcess", src) || continue
-        lines = readlines(f)
+        # COMMENTS DO NOT COUNT — same rule as the per-line scan below, which has always stripped them.
+        # Testing the raw text made a file "Measure tier" the moment someone MENTIONED the type in prose:
+        # writing "replaced a OncePerProcess duel" in cpuinfo.jl (which runs no benchmark at all) made
+        # this lint demand a pin for `simd_bytes`. Retiring the Measure tier means writing that sentence
+        # a lot, so the false positive would have recurred with every conversion.
+        codeonly = join((split(ln, '#')[1] for ln in lines), "\n")
+        occursin("OncePerProcess", codeonly) || continue
         for (i, ln) in enumerate(lines)
             code = split(ln, '#')[1]
             occursin(_PIN_OK, ln) && continue

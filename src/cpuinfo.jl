@@ -188,6 +188,31 @@ const _GEMM_SPLIT_S = 2
 # 64 to the wide path). Preferences-overridable ("gemm_split_max"); fleet-validate before trusting.
 @inline _at_gemm_split_max(hw, ::Type{T} = Float64) where {T} =
     (_at_gemm_split_mr(hw) + _at_gemm_mr(hw, T)) * _lanes(hw, T)
+# (c2) Real-axpy DRAM-regime arm. Past L3 the kernel is bandwidth-bound, so the FULL-width vector buys no
+# bandwidth on a datapath that must split it anyway — the narrow 256-bit phase arm (208) wins there and
+# only there. That criterion IS the datapath, so `_double_pumped` is the honest predictor rather than a
+# µarch lookup. Native-256 (Zen3) and native-512 (Zen5) parts both take the interleaved arm (4).
+# Measured, arms called directly at n=3e6 (bench/probes/axpy_arm_regime_ab.jl, µs, lower better):
+#   wintermute Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
+#   galen Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
+# Zen5 predicts 4; unconfirmed (that box's frequency lock was not holding). Replaced a OncePerProcess duel
+# that resolved the 17%-slower arm on wintermute in 7 of 9 processes and flipped in the other 2.
+@inline _at_axpy_dram(hw) = _double_pumped(hw) ? 208 : 4
+# (c3) Real-axpy CACHE-BAND arm (L1 < ws < L3). SAME predicate, SEPARATE knob — do not merge them; the
+# two regimes are independently measured and simd_kernels.jl records what happened the last time one
+# value was applied across both. This one is pinned down by the GATE rather than by a probe, because on
+# every fleet box the whole BLAS-1 size ladder (n ≤ 1e6, ws = 2·n·8 ≤ 16 MB) sits BELOW L3 and is
+# therefore governed here — `_axpy_dram` is not exercised by the gate at all.
+# The value reproduces each box's incumbent exactly, so the conversion is behaviour-neutral and buys only
+# determinism: Zen4 208 (the narrow arm that closed the long-standing n=1e6 miss, +5.6-10% at that cell),
+# Zen3 4. Zen5 also wants 4 — the narrow arm LOSES 0.6-1.4% there — and `_double_pumped` is what
+# separates Zen4 from Zen5, the two boxes with identical L3 and vector width. That inversion was read as
+# "not predictable from a detected const"; it is, just not from L3 or W.
+# NOTE (2026-08-19): a direct-call A/B probe measured the interleaved arm FASTER on wintermute at n=1e5
+# and n=1e6 (49.7 vs 52.8 µs, 815 vs 928 µs), contradicting the gate-regime numbers above. Not acted on
+# — the probe-regime rule says the in-situ gate measurement wins, and this knob's history is of probes
+# picking arms the gate then rejects. Unresolved; re-measure IN plots.jl before touching the value.
+@inline _at_axpy_band(hw) = _double_pumped(hw) ? 208 : 4
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-
@@ -362,6 +387,10 @@ const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a
 # not on the host, so there is nothing to derive from a detected const. Being stale-high is the safe
 # direction (a larger denominator buys MORE rounds), so drift costs conservatism, never correctness.
 # Keep in step with bench/probes/knob_stability_audit.jl, which enumerates them.
+# DELIBERATELY NOT LOWERED as knobs are converted (2026-08-19: cgemvt_cfg, gemvt_nc, pptrf_spr_min,
+# pstrf_rowcache, axpy_band, axpy_dram all demoted to Derive). Lowering it shrinks `_TUNE_ROUNDS`, i.e.
+# buys FEWER rounds for the duels that remain — the opposite of the retirement's intent. Per the note
+# above, drift high costs conservatism only. Reset it if the Measure tier is ever repopulated.
 # req8-ok: a COUNT of Measure knobs in this source tree (Bonferroni denominator), not a machine value
 const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
 

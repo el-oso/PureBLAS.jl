@@ -63,6 +63,27 @@
     @test P._at_cpotrf_base(tigerlake) == 64
     @test P._double_pumped(wintermute) && !P._double_pumped(neuromancer) && !P._double_pumped(tigerlake)
 
+    # ── Real-axpy DRAM arm (replaced a OncePerProcess duel, 2026-08-19) ───────────────────────────────
+    # Only the double-pumped part takes the narrow 256-bit phase arm; native-256 and native-512 both take
+    # the interleaved arm. Measured wintermute/galen (17% / 4%); Zen5 + Intel are predictions.
+    @test P._at_axpy_dram(wintermute) == 208
+    @test P._at_axpy_dram(galen) == 4
+    @test P._at_axpy_dram(neuromancer) == 4
+    @test P._at_axpy_dram(tigerlake) == 4
+    # Band-regime knob: same predicate, separate knob. These values reproduce what the retired duel
+    # resolved per box, so the conversion is behaviour-neutral — 208 on Zen4 is the arm that closes the
+    # n=1e6 gate cell, and the whole BLAS-1 ladder is governed by THIS knob (ws = 2·n·8 < L3 at n ≤ 1e6).
+    @test P._at_axpy_band(wintermute) == 208
+    @test P._at_axpy_band(galen) == 4
+    @test P._at_axpy_band(neuromancer) == 4   # narrow arm measured to LOSE 0.6-1.4% on Zen5
+    @test P._at_axpy_band(tigerlake) == 4
+    # NO live-machine equality assertion for these two. `test/Project.toml` pins `axpy_unroll = 4` and
+    # `axpy_dram = 4`, so under Pkg.test() the consts read 4 while the formula says 208 on Zen4 — a
+    # preference beating a default is the system working, not a stale const. (Those pins exist only to
+    # compile out the OncePerProcess resolvers for the all-paths noalloc proof; both knobs are Derive
+    # tier as of 2026-08-19, so there is no longer a resolver to remove and the pins are now dead.)
+    # The formula itself is fully covered by the per-descriptor assertions above, which no pin can mask.
+
     # ── The live machine's wired consts equal the formula applied to the detected _HW ─────────────────
     @test P._CPOTRF_BASE == P._at_cpotrf_base(P._HW)
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)

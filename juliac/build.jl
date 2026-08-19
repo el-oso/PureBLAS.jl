@@ -59,12 +59,13 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # And `zaxpy_narrow`: the complex-axpy width decision is a Measure-tier OncePerProcess benchmark, so it
 # allocates a probe buffer and is not trim-safe. `true` = the narrow arm, measured best on Zen4 and the
 # arm that closes the zaxpy gate cells; a trim build for a true-512-bit datapath should re-pin it.
-# And the two REAL-axpy shape knobs, `axpy_unroll` (L1..L3 band) and `axpy_dram` (past L3). Both are
-# Measure-tier OncePerProcess benchmarks that allocate a probe buffer, so both must be pinned or
-# `daxpy_64_` fails trim checking — which is exactly what it did. They are SEPARATE knobs measured in
-# separate regimes and must be pinned separately; collapsing them onto one value is what the
-# `_axpy_dram` fallback used to do. Codes: u = interleaved(u); 100+u = phase(u, full width);
-# 200+u = phase(u, narrow/256-bit). 4 = interleaved-4, the arm that is correct on every box measured.
+# (The two REAL-axpy shape knobs, `axpy_unroll` and `axpy_dram`, USED to be pinned here. Both were
+# converted to compile-time derivations on 2026-08-19 and their pins removed: a pin overrides the
+# derivation, and the `axpy_dram` pin of 4 was overriding it with the arm measured 17% SLOWER on a
+# double-pumped datapath. `axpy_unroll` is now the literal 4 — measured best on both boxes — and
+# `axpy_dram` is `_double_pumped(_HW) ? 208 : 4`. Neither allocates or benchmarks any more, so neither
+# needs pinning for trim. Codes, for reading the source: u = interleaved(u); 100+u = phase(u, full
+# width); 200+u = phase(u, narrow/256-bit).)
 # And `sytrf_cmult`: the complex Bunch-Kaufman block multiplier is a Measure-tier OncePerProcess
 # benchmark that allocates a 1024x1024 probe matrix. `sytrf_64_` is @ccallable, so leaving it unpinned
 # shipped that benchmark into the .so — and unlike the axpy knobs it was never caught by trim, because
@@ -91,8 +92,6 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 const _prev_cgnb = load_preference(PUREBLAS_UUID, "cgemvn_nc_big")
 const _prev_pud = load_preference(PUREBLAS_UUID, "potrf_upper_direct_max")
 const _prev_sycm = load_preference(PUREBLAS_UUID, "sytrf_cmult")
-const _prev_axu = load_preference(PUREBLAS_UUID, "axpy_unroll")
-const _prev_axd = load_preference(PUREBLAS_UUID, "axpy_dram")
 const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 const _prev_gvtd = load_preference(PUREBLAS_UUID, "gemvt_deep")
@@ -111,8 +110,6 @@ set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # compl
 set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
 set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => 12; force = true)  # tiny-upper potrf cutoff (Measure tier)
 set_preferences!(PUREBLAS_UUID, "cgemvn_nc_big" => 8; force = true)      # complex gemvN large-A panel (Measure tier)
-set_preferences!(PUREBLAS_UUID, "axpy_unroll" => 4; force = true)        # real-axpy band shape (Measure tier)
-set_preferences!(PUREBLAS_UUID, "axpy_dram" => 4; force = true)          # real-axpy DRAM shape (Measure tier)
 set_preferences!(PUREBLAS_UUID, "brd_nb" => 8; force = true)
 set_preferences!(PUREBLAS_UUID, "pbtrf_cross_kd" => 32; force = true)   # blocked-vs-unblocked band crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band panel width (Measure tier)
@@ -178,16 +175,6 @@ finally
         delete_preferences!(PUREBLAS_UUID, "cgemvn_nc_big"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "cgemvn_nc_big" => _prev_cgnb; force = true)
-    end
-    if _prev_axu === nothing
-        delete_preferences!(PUREBLAS_UUID, "axpy_unroll"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "axpy_unroll" => _prev_axu; force = true)
-    end
-    if _prev_axd === nothing
-        delete_preferences!(PUREBLAS_UUID, "axpy_dram"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "axpy_dram" => _prev_axd; force = true)
     end
     if _prev_brd === nothing
         delete_preferences!(PUREBLAS_UUID, "brd_nb"; force = true)
