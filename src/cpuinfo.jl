@@ -11,7 +11,7 @@
 
 using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize, cpuid
 using CPUSummary: cache_size
-using Preferences: @load_preference
+using Preferences: @load_preference, load_preference
 
 # Widest SIMD register in bytes. Preference override "simd_bytes" wins (cross-compile / pinning);
 # otherwise detect on the build machine. CpuId is x86-only, so guard for portability.
@@ -465,6 +465,34 @@ forcing into the cache header. A forced cache can never be mistaken for a measur
 Reading `ENV` here is trim-safe by placement, not by luck: every call site sits inside the
 `@static if isnothing(<pref>)` branch that a pinned/trim build does not compile at all.
 """
+# ── A/B override hooks for the knobs converted off the Measure tier (2026-08-19) ────────────────────
+# WHY THESE EXIST. Retiring the OncePerProcess duels also removed the only cheap way to test an
+# alternative arm: with the value baked into a derivation, answering "is 32 really better than 36 here?"
+# costs a source edit + commit + push + fleet_sync. That was paid twice in one day on `axpy_band`, and it
+# is why several converted values are still UNVERIFIED — notably the modal-derived ones, where a 5-of-6
+# majority was taken from a duel that was itself flipping. A force hook makes that
+# `PUREBLAS_FORCE_<knob>=<v> julia --project=bench bench/plots.jl bench op=<op> arms=pb`, ~10 minutes.
+#
+# SENTINEL -1 = not forced ⇒ the derived value stands. Read ONCE from `_init_force_knobs!` (called by
+# __init__), never per call: an ENV read in a BLAS hot path is itself a regression — measured, the
+# gemv-T m-unroll instrument cost Zen5 gemvT n=64 0.959 -> 0.767 with the VALUE unchanged.
+#
+# TRIM PAYS NOTHING: gated on `_FORCE_HOOKS`, which juliac/build.jl sets false, so the shared library
+# compiles no ENV access, no Refs, no branch. Instrumentation is a development affordance, not a shipped
+# feature. Defaults true so a normal JIT user can A/B without rebuilding.
+const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
+const _FK_NAMES = ("ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
+                   "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
+                   "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan")
+@static if _FORCE_HOOKS
+    # One Ref per knob, created at load. A Dict lookup happens ONCE per knob in __init__; the hot path
+    # only ever reads the Ref it captured.
+    const _FK = Dict{String, Base.RefValue{Int}}(n => Ref(-1) for n in _FK_NAMES)
+    @inline _fk(name::String) = _FK[name][]
+else
+    @inline _fk(::String) = -1
+end
+
 @inline function _force_knob(name::String)::Int
     v = get(ENV, "PUREBLAS_FORCE_" * name, "")
     isempty(v) && return -1

@@ -1189,8 +1189,10 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # 2 is therefore both the documented safe default AND the modal measurement (16 of 18 samples
     # across both boxes). Pin `sytrf_cmult` to retune for a specific machine.
     const _SYTRF_CMULT = something(_SYTRF_CMULT_PREF, 2)::Int   # req8-ok: documented safe default, table above
-    @inline _sytrf_nb(::Type{ComplexF64}, n::Int) = clamp(_SYTRF_CMULT * _sytrf_nb_shape(n), 16, 96)
-    @inline _sytrf_nb(::Type{ComplexF32}, n::Int) = clamp(_SYTRF_CMULT * _sytrf_nb_shape(n), 16, 96)
+    @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
+        clamp((f = _fk("sytrf_cmult"); f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
+    @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
+        clamp((f = _fk("sytrf_cmult"); f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = clamp(_sytrf_nb_shape(n), 16, 96)
 else
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = _SYTRF_NB_PREF::Int   # pinned (trim lands here)

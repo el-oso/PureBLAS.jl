@@ -526,7 +526,7 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
     # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
     # Width-derived: 32 ÷ _lanes(hw, Float64) reproduces all three boxes (4 / 4 / 8), each stable in
     # 6 of 6 fresh processes. See `_at_brd_nb` (cpuinfo.jl) for the caveat about codegen sensitivity.
-    @inline _brd_nb() = _at_brd_nb(_HW)
+    @inline _brd_nb() = (f = _fk("brd_nb"); f >= 0 ? f : _at_brd_nb(_HW))
 else
     @inline _brd_nb() = _BRD_NB_PREF::Int
 end

@@ -27,7 +27,12 @@ end
 # still says "tuned" while every pinned value now describes hardware that is not there. Comparing the
 # stored string against the live detection makes staleness self-announcing. The cost is one string
 # compare at load.
-const _TUNED_FOR = @load_preference("tuned_for", nothing)
+#
+# RUNTIME read into a Ref, not `@load_preference` into a const. The macro reads at COMPILE time and
+# registers the key via `Base.record_compiletime_preference`, so writing it would invalidate the
+# pkgimage — and `tune!()` writes exactly this key. That is what made an install cost precompile + tune
+# + RECOMPILE. Read at runtime, `load_preference` registers nothing, so tuning costs a restart.
+
 
 """
     is_tuned() -> Bool
@@ -35,7 +40,7 @@ const _TUNED_FOR = @load_preference("tuned_for", nothing)
 `true` when this machine has been tuned by [`tune!`](@ref) and the stored tuning still matches the
 detected hardware. Cheap: compares a stored fingerprint string against the detected one.
 """
-is_tuned() = !isnothing(_TUNED_FOR) && _TUNED_FOR == _tuning_fingerprint()
+is_tuned() = (f = load_preference(@__MODULE__, "tuned_for"); !isnothing(f) && f == _tuning_fingerprint())
 
 """
     tuning_status() -> NamedTuple
@@ -50,7 +55,7 @@ function tuning_status()
         v = load_preference(@__MODULE__, k)
         isnothing(v) || (pins[k] = v)
     end
-    return (tuned = is_tuned(), stored = _TUNED_FOR, current = cur, pins = pins)
+    return (tuned = is_tuned(), stored = load_preference(@__MODULE__, "tuned_for"), current = cur, pins = pins)
 end
 
 # The keys `bench/calibrate.jl` may write. Kept here so `tuning_status()` can report them without
@@ -92,3 +97,7 @@ function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_p
     dryrun || @info "PureBLAS.tune!: done. RELOAD Julia for the new pins to take effect."
     return nothing
 end
+
+# Called from `__init__`. Every read here is the RUNTIME `load_preference`, so none of it becomes a
+# compile-time dependency and none of it can invalidate the pkgimage — which is the whole point: a pin
+# written by `tune!()` takes effect on the next Julia start, with no rebuild.

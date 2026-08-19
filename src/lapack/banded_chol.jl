@@ -128,13 +128,13 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
 @static if isnothing(_PBTRF_NB_PREF)
     @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
     # Derived from vector width — see `_at_pbtrf_nb` (cpuinfo.jl) for the three-box table.
-    @inline _pbtrf_nb_tuned(::Type{Float32}) = _at_pbtrf_nb(_HW, Float32)
+    @inline _pbtrf_nb_tuned(::Type{Float32}) = (f = _fk("pbtrf_nb"); f >= 0 ? f : _at_pbtrf_nb(_HW, Float32))
     # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (wintermute Zen4 and
     # galen Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
     # also reproduces the F32/C32/C64 siblings, which differ per box. Reproduces the incumbent exactly.
     @inline _pbtrf_nb_tuned(::Type{Float64}) = 40
-    @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = _at_pbtrf_nb(_HW, ComplexF32)
-    @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = _at_pbtrf_nb(_HW, ComplexF64)
+    @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = (f = _fk("pbtrf_nb"); f >= 0 ? f : _at_pbtrf_nb(_HW, ComplexF32))
+    @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = (f = _fk("pbtrf_nb"); f >= 0 ? f : _at_pbtrf_nb(_HW, ComplexF64))
     @inline _pbtrf_nb_tuned(::Type{T}) where {T} = _pbtrf_nb_anchor(T)   # generic/AD eltypes never block
 else
     @inline _pbtrf_nb_tuned(::Type{<:Any}) = _PBTRF_NB_PREF::Int      # pinned (trim builds land here)
@@ -160,8 +160,8 @@ end
 const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
 @static if isnothing(_PBTRF_NBS_PREF)
     # F32 is exactly `_lanes(hw, Float32)` on all three boxes — a formula, not a table.
-    @inline _pbtrf_nb_small(::Type{Float32}) = _at_pbtrf_nbs(_HW, Float32)
-    @inline _pbtrf_nb_small(::Type{Float64}) = _at_pbtrf_nbs(_HW, Float64)
+    @inline _pbtrf_nb_small(::Type{Float32}) = (f = _fk("pbtrf_nb_small"); f >= 0 ? f : _at_pbtrf_nbs(_HW, Float32))
+    @inline _pbtrf_nb_small(::Type{Float64}) = (f = _fk("pbtrf_nb_small"); f >= 0 ? f : _at_pbtrf_nbs(_HW, Float64))
     # req8-ok: measured-identical literals — 8 in 6/6 processes on BOTH boxes (2026-08-19). The REAL
     # siblings are deliberately left on the duel: they are stable per box but INVERTED between them
     # (F32 wm=16 gl=8, F64 wm=8 gl=16), which no formula over width or cache reproduces.
@@ -184,9 +184,9 @@ const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
     # Zen4 F64 W=8 → 32, inside the measured 16 < kd* < 64).
     # Per-eltype OncePerProcess (complex kernels have 4× the flop density — a shared F64 crossover
     # would misplace them); lazy, so only eltypes actually used pay the one-shot ~10–100 ms tune.
-    @inline _pbtrf_cross(::Type{Float32}) = _at_pbtrf_cross(_HW, Float32)
-    @inline _pbtrf_cross(::Type{Float64}) = _at_pbtrf_cross(_HW, Float64)
-    @inline _pbtrf_cross(::Type{ComplexF32}) = _at_pbtrf_cross(_HW, ComplexF32)
+    @inline _pbtrf_cross(::Type{Float32}) = (f = _fk("pbtrf_cross_kd"); f >= 0 ? f : _at_pbtrf_cross(_HW, Float32))
+    @inline _pbtrf_cross(::Type{Float64}) = (f = _fk("pbtrf_cross_kd"); f >= 0 ? f : _at_pbtrf_cross(_HW, Float64))
+    @inline _pbtrf_cross(::Type{ComplexF32}) = (f = _fk("pbtrf_cross_kd"); f >= 0 ? f : _at_pbtrf_cross(_HW, ComplexF32))
     # req8-ok: measured-identical literal — 16 in 6/6 processes on BOTH boxes (2026-08-19). F64 and
     # C32 stay on the duel: both FLIP across processes (wm F64 32/32/32/32/24/32, gl F64 36/36/36/40/
     # 36/40), so there is no incumbent to reproduce and picking one needs gate evidence.
@@ -216,15 +216,15 @@ const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
 @static if isnothing(_PBTRF_UCROSS_PREF)
     # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
     # (192x4, 256, 192) and C64 flips on both wintermute (176/192/208) and neuromancer.
-    @inline _pbtrf_ucross(::Type{Float32}) = _at_pbtrf_ucross(_HW)
-    @inline _pbtrf_ucross(::Type{Float64}) = _at_pbtrf_ucross(_HW, Float64)
-    @inline _pbtrf_ucross(::Type{ComplexF32}) = _at_pbtrf_ucross(_HW)
+    @inline _pbtrf_ucross(::Type{Float32}) = (f = _fk("pbtrf_u_native_kd"); f >= 0 ? f : _at_pbtrf_ucross(_HW))
+    @inline _pbtrf_ucross(::Type{Float64}) = (f = _fk("pbtrf_u_native_kd"); f >= 0 ? f : _at_pbtrf_ucross(_HW, Float64))
+    @inline _pbtrf_ucross(::Type{ComplexF32}) = (f = _fk("pbtrf_u_native_kd"); f >= 0 ? f : _at_pbtrf_ucross(_HW))
     # C64 flipped 176/192/208 on Zen4 and 192..256 on Zen5 despite an IDENTICAL 1 MiB L2 — which is the
     # signature of a CROSSOVER, not of a broken tuner: at the switch point the two kernels are within
     # ~1% of each other BY DEFINITION, so the argmin over rungs wanders while the loss is ~nothing.
     # Being one rung off therefore costs ~nothing, and the sibling formula is the principled place to
     # sit. Galen measures 128 = exactly l2 ÷ 4096, agreeing with it outright.
-    @inline _pbtrf_ucross(::Type{ComplexF64}) = _at_pbtrf_ucross(_HW)
+    @inline _pbtrf_ucross(::Type{ComplexF64}) = (f = _fk("pbtrf_u_native_kd"); f >= 0 ? f : _at_pbtrf_ucross(_HW))
 else
     @inline _pbtrf_ucross(::Type{<:BlasFloat}) = _PBTRF_UCROSS_PREF::Int   # pinned (trim builds land here)
 end
