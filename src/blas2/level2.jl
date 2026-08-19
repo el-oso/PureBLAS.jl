@@ -3934,5 +3934,10 @@ function _init_force_knobs!()
     @static if isnothing(_TRMV_FUSED_MIN_PREF)
         _TRMV_FUSED_MIN_REF[] = _force_knob("trmv_fused_min")
     end
+    # simd_kernels.jl's complex-axpy width (Derive tier; this only forces it for A/B).
+    @static if isnothing(_ZAXPY_NARROW_PREF)
+        f = _force_knob("zaxpy_narrow")
+        f >= 0 && (_ZAXPY_NARROW_REF[] = f != 0)
+    end
     return
 end

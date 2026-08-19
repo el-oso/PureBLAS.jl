@@ -213,6 +213,21 @@ const _GEMM_SPLIT_S = 2
 # — the probe-regime rule says the in-situ gate measurement wins, and this knob's history is of probes
 # picking arms the gate then rejects. Unresolved; re-measure IN plots.jl before touching the value.
 @inline _at_axpy_band(hw) = _double_pumped(hw) ? 208 : 4
+# (c4) Complex-axpy width past L2. The narrow arm is a fixed 32-BYTE step; the wide arm is always two
+# registers' worth (2·_vwidth(Float64) Float64 lanes). On a memory-bound stream the wide vector only
+# pays off if the machine can actually move it in one go, so narrow wins exactly when the REAL datapath
+# is no wider than 32 B — `_datapath_bytes`, which already folds the double-pump fact in.
+# MEASURED, 6 fresh processes per box (the duel is stable here, unlike the real-axpy pair):
+#   galen Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
+#   wintermute Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
+#   neuromancer Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
+# ⚠ Zen5 is the one arm this formula CHANGES and the one nobody has measured. It agrees with what
+# simd_kernels.jl and test/Project.toml both already expect of a true-512-bit datapath ("a trim build
+# for a true-512-bit datapath should re-pin it"), but expectation is not measurement — verify on
+# neuromancer and demote this to a falsified-derivation literal if it disagrees.
+# NOTE `_double_pumped` alone is NOT the criterion: it would say Zen3 wants the wide arm, and Zen3
+# measures narrow 6/6. Only the datapath WIDTH separates the three correctly.
+@inline _at_zaxpy_narrow(hw) = _datapath_bytes(hw) <= 32
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-
