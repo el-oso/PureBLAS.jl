@@ -38,6 +38,13 @@ function __init__()
     catch
         String[]
     end
+    # `PUREBLAS_FORCE_<knob>` instrumentation overrides (level2.jl). Read ONCE here rather than from a
+    # `OncePerProcess` on first touch: these cache an env read and benchmark nothing, so the once-object
+    # was a lock-guarded call where a load suffices, and it kept a resolver inside the BLAS-2 all-paths
+    # @noalloc proof. Every write inside is `@static`-gated on its knob's pin, so a pinned/trim build
+    # compiles no env access into `__init__` at all. Each Ref is pre-seeded with its no-env default, so
+    # ordering here is not load-bearing — this only ever overrides.
+    _init_force_knobs!()
     return
 end
 

@@ -64,11 +64,13 @@ const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
 # is itself a regression), and `@static`-gated on the pin so a pinned/trim build compiles the
 # resolver out entirely and the all-paths @noalloc proof never sees a OncePerProcess.
 @static if isnothing(_GEMVN_MINNER_PREF)
-    const _GEMVN_MINNER_ONCE = Base.OncePerProcess{Bool}() do
-        f = _force_knob("gemvn_minner")
-        return f >= 0 ? f != 0 : (_vwidth(Float64) < 8 || _double_pumped(_HW))
-    end
-    @inline _gemvn_minner() = _GEMVN_MINNER_ONCE()
+    # Ref, not OncePerProcess (2026-08-19): this caches ONE env read and benchmarks nothing, so the
+    # once-object bought a lock-guarded call where a load suffices — and it kept a resolver inside the
+    # all-paths @noalloc proof. SEEDED with the no-env value, so the accessor is correct even before
+    # `__init__` runs; the once-object could not be, it would have run the resolver. The env read lives
+    # in `_init_force_knobs!` at the end of this file.
+    const _GEMVN_MINNER_REF = Ref{Bool}(_vwidth(Float64) < 8 || _double_pumped(_HW))
+    @inline _gemvn_minner() = _GEMVN_MINNER_REF[]
 else
     @inline _gemvn_minner() = _GEMVN_MINNER_PREF::Bool
 end
@@ -729,15 +731,12 @@ const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default u
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_GEMVT_U_PREF)
-const _GEMVT_U_ONCE = Base.OncePerProcess{Int}() do
-    f = _force_knob("gemvt_u")
-    # `PUREBLAS_FORCE_gemvt_u=0` selects the REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`).
-    # 0 is otherwise meaningless as an unroll, and `_force_knob` already spends -1 on "unset", so this
-    # is the one spare value. See the U == -1 branch of the generator for what it tests and why.
-    f == 0 && return -1
-    return f >= 1 ? min(f, _gemvt_u_max(4)) : _GEMVT_U
-end
-@inline _gemvt_u() = _GEMVT_U_ONCE()
+# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. `PUREBLAS_FORCE_gemvt_u=0` selects the
+# REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`); 0 is otherwise meaningless as an unroll and
+# `_force_knob` already spends -1 on "unset", so it is the one spare value. See the U == -1 branch of
+# the generator for what it tests and why. Env decoding lives in `_init_force_knobs!`.
+const _GEMVT_U_REF = Ref{Int}(_GEMVT_U)
+@inline _gemvt_u() = _GEMVT_U_REF[]
 else
 @inline _gemvt_u() = _GEMVT_U_PREF::Int
 end
@@ -773,11 +772,9 @@ const _GEMVT_PF = something(_GEMVT_PF_PREF, 0)::Int   # req8-ok: shipped default
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_GEMVT_PF_PREF)
-const _GEMVT_PF_ONCE = Base.OncePerProcess{Int}() do
-    f = _force_knob("gemvt_pf")
-    return f >= 0 ? f : _GEMVT_PF
-end
-@inline _gemvt_pf() = _GEMVT_PF_ONCE()
+# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
+const _GEMVT_PF_REF = Ref{Int}(_GEMVT_PF)
+@inline _gemvt_pf() = _GEMVT_PF_REF[]
 else
 @inline _gemvt_pf() = _GEMVT_PF_PREF::Int
 end
@@ -943,11 +940,9 @@ end
 # juliac) compiles it out and the all-paths @noalloc proof never sees a OncePerProcess.
 const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
 @static if isnothing(_GEMVT_DEEP_PREF)
-    const _GEMVT_DEEP_ONCE = Base.OncePerProcess{Int}() do
-        f = _force_knob("gemvt_deep")
-        return f >= 0 ? f : 1
-    end
-    @inline _gemvt_deep_on() = _GEMVT_DEEP_ONCE() != 0
+    # Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
+    const _GEMVT_DEEP_REF = Ref{Int}(1)
+    @inline _gemvt_deep_on() = _GEMVT_DEEP_REF[] != 0
 else
     @inline _gemvt_deep_on() = _GEMVT_DEEP_PREF::Bool
 end
@@ -2805,10 +2800,10 @@ const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_TRMV_FUSED_MIN_PREF)
-const _TRMV_FUSED_MIN_ONCE = Base.OncePerProcess{Int}() do
-    _force_knob("trmv_fused_min")
-end
-@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_ONCE()
+# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. Seeded with -1, `_force_knob`'s unset sentinel,
+# which the caller below already maps to the derived default.
+const _TRMV_FUSED_MIN_REF = Ref{Int}(-1)
+@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_REF[]
 else
 @inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_PREF::Int
 end
@@ -3903,4 +3898,41 @@ function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
         end
     end
     return x
+end
+
+# ── Force-knob env reads, hoisted out of the hot paths ──────────────────────────────────────────────
+# Called once from `__init__`. Each Ref is already seeded with its no-env default at precompile time,
+# so this only ever OVERRIDES — a build where `__init__` has not run still behaves correctly, which the
+# OncePerProcess these replace could not claim (it would have run the resolver on first touch).
+# Every write is `@static`-gated on the same pin as its accessor: a pinned/trim build must not compile
+# the env read at all (it is `get(ENV, ...)`, i.e. string+dict work landing in `__init__`), which is the
+# same reason the OncePerProcess was gated. `PUREBLAS_FORCE_<knob>` is INSTRUMENTATION ONLY — it exists
+# so "force this arm, run the gate" stays a ~10 min loop instead of a source edit + commit + fleet sync,
+# which is exactly what converting a knob to Derive costs you (measured on axpy_band, 2026-08-19).
+function _init_force_knobs!()
+    @static if isnothing(_GEMVN_MINNER_PREF)
+        f = _force_knob("gemvn_minner")
+        f >= 0 && (_GEMVN_MINNER_REF[] = f != 0)
+    end
+    @static if isnothing(_GEMVT_U_PREF)
+        f = _force_knob("gemvt_u")
+        # 0 ⇒ register-preload arm (-1); >=1 ⇒ that unroll, capped to fit `_NVREG`; <0 ⇒ keep default.
+        if f == 0
+            _GEMVT_U_REF[] = -1
+        elseif f >= 1
+            _GEMVT_U_REF[] = min(f, _gemvt_u_max(4))
+        end
+    end
+    @static if isnothing(_GEMVT_PF_PREF)
+        f = _force_knob("gemvt_pf")
+        f >= 0 && (_GEMVT_PF_REF[] = f)
+    end
+    @static if isnothing(_GEMVT_DEEP_PREF)
+        f = _force_knob("gemvt_deep")
+        f >= 0 && (_GEMVT_DEEP_REF[] = f)
+    end
+    @static if isnothing(_TRMV_FUSED_MIN_PREF)
+        _TRMV_FUSED_MIN_REF[] = _force_knob("trmv_fused_min")
+    end
+    return
 end
