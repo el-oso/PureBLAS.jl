@@ -125,70 +125,11 @@ const _PSTRF_FUSE_MAXL = @load_preference("pstrf_fuse_max", (_L1_BYTES ÷ 2) ÷ 
 # genuine Measure knob needs a harness with cold, per-rep contexts — worth doing, not done here.
 # ⚠ Zen4 Float64 only; needs fleet validation before it is trusted to extrapolate.
 const _PSTRF_ROWCACHE_PREF = @load_preference("pstrf_rowcache_min", 128)
-@static if false
-    # Races the REAL factorization both ways at each candidate order. An earlier version of this
-    # harness timed the two loop shapes in isolation and answered 32 — where the whole-op measurement
-    # says caching LOSES (n=48/64/96 all regress). Classic probe-vs-live: a synthetic matrix with a
-    # reset accumulator does not reproduce the cache state the live scatter leaves behind. Measure the
-    # thing that ships.
-    function _measure_pstrf_rowcache(::Type{T})::Int where {T}
-        vw = _vwidth(T)
-        R = real(T)
-        Base.generating_output() && return 16 * vw     # don't burn a measure during precompilation
-        try
-            cands = (2 * vw, 4 * vw, 8 * vw, 16 * vw)
-            wins = falses(length(cands))
-            for (ci, c) in pairs(cands)
-                A0 = Matrix{T}(undef, c, c)            # diagonally dominant ⇒ HPD, full rank, no early exit
-                @inbounds for q in 1:c, p in 1:c
-                    A0[p, q] = p == q ? T(4 * c) : T(1) / T(p + q)
-                end
-                A = similar(A0); piv = Vector{Int}(undef, c); work = zeros(R, 2c)
-                nb = min(_pstrf_nb(c), c); scr = Vector{T}(undef, nb + 2c)
-                run = ub -> begin
-                    copyto!(A, A0); fill!(work, zero(R))
-                    @inbounds for i in 1:c
-                        piv[i] = i
-                    end
-                    _pstrf_blocked!(A, piv, work, scr, R(-1), 1, real(A0[1, 1]), nb, Val(false), ub)
-                end
-                run(true); run(false)                              # untimed warmups (absorb JIT)
-                tbs = Vector{UInt64}(undef, 5); tns = Vector{UInt64}(undef, 5)
-                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
-                    s = time_ns(); run(false); tns[r] = time_ns() - s
-                    s = time_ns(); run(true); tbs[r] = time_ns() - s
-                end
-                sort!(tbs); sort!(tns); tb = tbs[3]; tn = tns[3]
-                wins[ci] = tb < tn
-            end
-            # The benefit is NOT monotone in n — measured on Zen4 it wins at tiny orders, LOSES at
-            # 48…96 (the extra store dominates while everything is L1-resident) and wins again from
-            # 128 up (the gather dominates). So "first candidate that wins" is the wrong search: it
-            # answered 16 and would have cached exactly where caching regresses. Take the smallest
-            # candidate from which every LARGER candidate also wins — the point past which the
-            # benefit is durable.
-            best = typemax(Int)
-            for ci in length(cands):-1:1
-                wins[ci] || break
-                best = cands[ci]
-            end
-            return best
-        catch
-            return typemax(Int)        # conservative: keep the un-cached form
-        end
-    end
-    const _PSTRF_RC_F32 = Base.OncePerProcess{Int}(() -> _measure_pstrf_rowcache(Float32))
-    const _PSTRF_RC_F64 = Base.OncePerProcess{Int}(() -> _measure_pstrf_rowcache(Float64))
-    const _PSTRF_RC_C32 = Base.OncePerProcess{Int}(() -> _measure_pstrf_rowcache(ComplexF32))
-    const _PSTRF_RC_C64 = Base.OncePerProcess{Int}(() -> _measure_pstrf_rowcache(ComplexF64))
-    @inline _pstrf_rowcache_min(::Type{Float32}) = _PSTRF_RC_F32()
-    @inline _pstrf_rowcache_min(::Type{Float64}) = _PSTRF_RC_F64()
-    @inline _pstrf_rowcache_min(::Type{ComplexF32}) = _PSTRF_RC_C32()
-    @inline _pstrf_rowcache_min(::Type{ComplexF64}) = _PSTRF_RC_C64()
-    @inline _pstrf_rowcache_min(::Type{T}) where {T} = typemax(Int)   # generic/AD: never cache
-else
-    @inline _pstrf_rowcache_min(::Type{<:Any}) = _PSTRF_ROWCACHE_PREF::Int   # pinned (trim builds)
-end
+# TIER: a VALIDATED LITERAL, not a Measure knob — the deliberate downgrade recorded above. The
+# OncePerProcess harness that used to live here was deleted (it was already `@static if false`): it
+# disagreed with the authoritative gate BOTH times it was written, in the same direction, because it
+# reused one buffer across reps and so kept A L1-warm — the very residency property the knob decides.
+@inline _pstrf_rowcache_min(::Type{<:Any}) = _PSTRF_ROWCACHE_PREF::Int
 
 # Returns `rank` (n if full-rank). `scr` is scratch: scr[1:nb] the contiguous panel-row gather (the
 # gemv's x, strided in A), scr[nb+1:nb+n] the UPPER path's contiguous output row (A[j,j+1:n] is
