@@ -290,6 +290,20 @@ const _GEMM_SPLIT_S = 2
 # when an unrelated inlining bug was fixed, so it is sensitive to codegen, not only to hardware —
 # re-check it after any change to the gebrd panel path.
 @inline _at_brd_nb(hw) = 32 ÷ _lanes(hw, Float64)
+
+# (c8) The last two convertible rows. WEAKER EVIDENCE THAN EVERYTHING ABOVE — labelled, not hidden.
+# gbtrf_cross C32: wintermute is a true 3-3 TIE across 6 processes (16,16,8,16,8,8) while neuromancer
+# and galen are both stably 16. So 16 does not overrule any box's stable measurement — it resolves a
+# coin flip in favour of what the other two agree on, and 16 is one of the two values the tied box
+# itself returns. Note this row does NOT follow the width split its C64 sibling does (8 / 16); the
+# AVX-512 boxes disagree with each other here, which is exactly why it is a literal and not a formula.
+@inline _at_gbtrf_cross(hw, ::Type{ComplexF32}) = 16
+# pbtrf_cross F64: flips on ALL THREE boxes, so this is a MODAL-of-modals — the weakest thing shipped
+# in this campaign. wintermute 32 (5/6), neuromancer 32 (4/6), galen 36 (4/6). The modals do split by
+# width, which is the only reason it is here rather than left to the tuner. Galen's candidates (36,40)
+# are not even in the same set as the other two boxes' (24,32), so do not read 32-vs-36 as one
+# crossover measured noisily — the ladders differ. Re-measure before trusting this on a new µarch.
+@inline _at_pbtrf_cross(hw, ::Type{Float64}) = _wide_simd(hw) ? 32 : 36
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-

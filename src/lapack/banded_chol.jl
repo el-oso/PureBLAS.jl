@@ -127,36 +127,6 @@ end
 const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
 @static if isnothing(_PBTRF_NB_PREF)
     @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
-    function _measure_pbtrf_nb(::Type{T})::Int where {T}
-        nb0 = _pbtrf_nb_anchor(T)
-        Base.generating_output() && return nb0        # don't burn a measure during precompilation
-        try
-            kd = max(4 * nb0, 1)                      # representative mid band (nb0=32 → 128, the worst cell)
-            nloc = 16 * kd                            # ≥16 panel rounds; run stays well under ~100 ms
-            ABm = Matrix{T}(undef, kd + 1, nloc)
-            refill! = () -> begin                     # diagonally-dominant SPD band, uplo='L'
-                fill!(ABm, one(T))
-                @inbounds for j in 1:nloc
-                    ABm[1, j] = T(2 * kd + 2)
-                end
-            end
-            best = nb0; tbest = typemax(UInt64)
-            for c in (nb0 >> 1, (3 * nb0) >> 2, nb0, (5 * nb0) >> 2, (3 * nb0) >> 1, 2 * nb0)
-                nb = min(c, kd)
-                refill!(); _pbtrf_blocked!(ABm, nloc, kd, nb)      # untimed warmup (absorb JIT)
-                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`).
-                ts = Vector{UInt64}(undef, 5)
-                for r in 1:5
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
-                end
-                sort!(ts); t = ts[3]
-                _tune_better(t, tbest) && (tbest = t; best = c)
-            end
-            return best
-        catch
-            return nb0                                # fall back to the dense potrf anchor
-        end
-    end
     # Derived from vector width — see `_at_pbtrf_nb` (cpuinfo.jl) for the three-box table.
     @inline _pbtrf_nb_tuned(::Type{Float32}) = _at_pbtrf_nb(_HW, Float32)
     # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (wintermute Zen4 and
@@ -189,36 +159,6 @@ end
 # a small multiple of one SIMD register, so W is the right unit here.
 const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
 @static if isnothing(_PBTRF_NBS_PREF)
-    function _measure_pbtrf_nb_small(::Type{T})::Int where {T}
-        vw = _vwidth(T)
-        Base.generating_output() && return vw          # don't burn a measure during precompilation
-        try
-            kd = 4 * vw                                # the clamped regime, and the measured worst cell
-            nloc = 16 * kd
-            ABm = Matrix{T}(undef, kd + 1, nloc)
-            refill! = () -> begin
-                fill!(ABm, one(T))
-                @inbounds for j in 1:nloc
-                    ABm[1, j] = T(2 * kd + 2)
-                end
-            end
-            best = vw; tbest = typemax(UInt64)
-            for c in (vw, 2 * vw, 3 * vw, 4 * vw)
-                nb = min(c, kd)
-                refill!(); _pbtrf_blocked!(ABm, nloc, kd, nb)       # untimed warmup (absorb JIT)
-                # MEDIAN of 5, not min-of-5 (see cpuinfo.jl `_tune_one`).
-                ts = Vector{UInt64}(undef, 5)
-                for r in 1:5
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, kd, nb); ts[r] = time_ns() - s
-                end
-                sort!(ts); t = ts[3]
-                _tune_better(t, tbest) && (tbest = t; best = c)
-            end
-            return best
-        catch
-            return vw                                  # narrowest candidate: never the degenerate case
-        end
-    end
     # F32 is exactly `_lanes(hw, Float32)` on all three boxes — a formula, not a table.
     @inline _pbtrf_nb_small(::Type{Float32}) = _at_pbtrf_nbs(_HW, Float32)
     @inline _pbtrf_nb_small(::Type{Float64}) = _at_pbtrf_nbs(_HW, Float64)
@@ -242,53 +182,10 @@ const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
     # Base-only + TOTAL (OncePerProcess poisons the process if the initializer throws) → catch →
     # the candidate-set midpoint 4W (the bracket center on the box the gap was measured on:
     # Zen4 F64 W=8 → 32, inside the measured 16 < kd* < 64).
-    function _measure_pbtrf_cross(::Type{T})::Int where {T}
-        vw = _vwidth(T)
-        Base.generating_output() && return 4 * vw     # don't burn a measure during precompilation
-        try
-            # Ladder is 2W…16W in steps of W, NOT the doubling {2,4,8,16}·W it used to be. The two
-            # kernels are within ~1% of each other AT the crossover, so run-to-run noise flips the
-            # comparison there — and with a doubling ladder one flip skips a whole octave. Measured
-            # cost of that skip on Zen4 (F64, uplo='L', n=4096, µs): at kd=40 blocked 815 vs
-            # unblocked 1644, at kd=48 1132 vs 2138 — i.e. a harness that answered 64 instead of 32
-            # left every kd in 32…63 running ~2× slow, and both answers were observed across
-            # processes. Stepping by W bounds the damage of a flip to one W-wide band.
-            for c in (2 * vw):vw:(16 * vw)
-                nloc = 16 * c       # harness shape, not a tuning knob: enough columns that the
-                #                     steady-state trailing updates dominate the ramp-up/down bands
-                #                     (16·c ⇒ ≥16 panel rounds at nb ≤ c); run stays ≪ 100 ms.
-                ABm = Matrix{T}(undef, c + 1, nloc)
-                refill! = () -> begin                  # diagonally-dominant SPD band, uplo='L'
-                    fill!(ABm, one(T))
-                    @inbounds for j in 1:nloc
-                        ABm[1, j] = T(2 * c + 2)       # diag > Σ|offdiag| ≤ 2c ⇒ SPD
-                    end
-                end
-                refill!(); _pbtf2_L!(ABm, nloc, c)                 # untimed warmups (absorb JIT)
-                refill!(); _pbtrf_blocked!(ABm, nloc, c)
-                tus = Vector{UInt64}(undef, 5); tbs = Vector{UInt64}(undef, 5)
-                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
-                    refill!(); s = time_ns(); _pbtf2_L!(ABm, nloc, c);         tus[r] = time_ns() - s
-                    refill!(); s = time_ns(); _pbtrf_blocked!(ABm, nloc, c);   tbs[r] = time_ns() - s
-                end
-                sort!(tus); sort!(tbs); tu = tus[3]; tb = tbs[3]
-                # Ties go to BLOCKED, because the two mistakes are not equally expensive. Measured
-                # on Zen4: switching one candidate too EARLY costs +9% (kd=24: blocked 227 vs
-                # unblocked 208), switching one too LATE costs +103% (kd=40, above). 20 : 1. The
-                # 5% band is the measured gap at the true crossover — at kd=24 blocked is 9.3%
-                # behind, safely outside it, so this does not drag the answer down an extra step.
-                20 * tb < 21 * tu && return c   # tb < 1.05·tu ⇒ blocked wins; all kd ≥ c block
-            end
-            return typemax(Int)        # blocked never won inside the derived bracket ⇒ never block
-        catch
-            return 4 * vw
-        end
-    end
     # Per-eltype OncePerProcess (complex kernels have 4× the flop density — a shared F64 crossover
     # would misplace them); lazy, so only eltypes actually used pay the one-shot ~10–100 ms tune.
-    const _PBTRF_CROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(Float64))
     @inline _pbtrf_cross(::Type{Float32}) = _at_pbtrf_cross(_HW, Float32)
-    @inline _pbtrf_cross(::Type{Float64}) = _PBTRF_CROSS_F64()
+    @inline _pbtrf_cross(::Type{Float64}) = _at_pbtrf_cross(_HW, Float64)
     @inline _pbtrf_cross(::Type{ComplexF32}) = _at_pbtrf_cross(_HW, ComplexF32)
     # req8-ok: measured-identical literal — 16 in 6/6 processes on BOTH boxes (2026-08-19). F64 and
     # C32 stay on the duel: both FLIP across processes (wm F64 32/32/32/32/24/32, gl F64 36/36/36/40/
@@ -317,51 +214,17 @@ end
 #              64W it never will, and the harness returns typemax (never go native).
 const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
 @static if isnothing(_PBTRF_UCROSS_PREF)
-    function _measure_pbtrf_ucross(::Type{T})::Int where {T}
-        vw = _vwidth(T)
-        Base.generating_output() && return typemax(Int)   # never measure during precompilation
-        try
-            for c in (8 * vw):(4 * vw):(64 * vw)
-                nloc = 8 * c        # harness shape, not a tuning knob: ≥8 panel rounds of steady
-                #                     state, and bounded work at the top of the ladder (the scan
-                #                     stops at the crossover, so the tail is usually never run).
-                ABm = Matrix{T}(undef, c + 1, nloc)
-                refill! = () -> begin                     # diagonally-dominant HPD band, uplo='U'
-                    fill!(ABm, one(T))
-                    @inbounds for j in 1:nloc
-                        ABm[c + 1, j] = T(2 * c + 2)      # diag > Σ|offdiag| ≤ 2c ⇒ HPD
-                    end
-                end
-                # NOTE the two kernels are called DIRECTLY, never through pbtrf! — pbtrf! consults
-                # _pbtrf_ucross, so routing the harness through it would re-enter this very
-                # OncePerProcess initializer and deadlock. (Their default nb argument reaches
-                # _pbtrf_nb, a *different* OncePerProcess whose own harness passes nb explicitly,
-                # so that nesting terminates.)
-                refill!(); _pbtrf_repack_U!(ABm, nloc, c)          # untimed warmups (absorb JIT)
-                refill!(); _pbtrf_blocked_U!(ABm, nloc, c)
-                trs = Vector{UInt64}(undef, 5); tns = Vector{UInt64}(undef, 5)
-                for r in 1:5                                       # interleaved (crude ABBA), MEDIAN-of-5
-                    refill!(); s = time_ns(); _pbtrf_repack_U!(ABm, nloc, c);  trs[r] = time_ns() - s
-                    refill!(); s = time_ns(); _pbtrf_blocked_U!(ABm, nloc, c); tns[r] = time_ns() - s
-                end
-                sort!(trs); sort!(tns); tr = trs[3]; tn = tns[3]
-                # No tie-break bias here, unlike _pbtrf_cross: the two mistakes cost about the same
-                # (at kd=192 going native early costs 1.10→0.92, at kd=256 staying on the re-pack
-                # costs 1.055→0.845 — both ~20%), so the plain comparison is the right one.
-                tn < tr && return c    # smallest candidate where native wins; all kd ≥ c go native
-            end
-            return typemax(Int)        # native never won inside the derived bracket ⇒ always re-pack
-        catch
-            return typemax(Int)        # on any failure keep the older, more broadly-tested path
-        end
-    end
-    const _PBTRF_UCROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF64))
     # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
     # (192x4, 256, 192) and C64 flips on both wintermute (176/192/208) and neuromancer.
     @inline _pbtrf_ucross(::Type{Float32}) = _at_pbtrf_ucross(_HW)
     @inline _pbtrf_ucross(::Type{Float64}) = _at_pbtrf_ucross(_HW, Float64)
     @inline _pbtrf_ucross(::Type{ComplexF32}) = _at_pbtrf_ucross(_HW)
-    @inline _pbtrf_ucross(::Type{ComplexF64}) = _PBTRF_UCROSS_C64()
+    # C64 flipped 176/192/208 on Zen4 and 192..256 on Zen5 despite an IDENTICAL 1 MiB L2 — which is the
+    # signature of a CROSSOVER, not of a broken tuner: at the switch point the two kernels are within
+    # ~1% of each other BY DEFINITION, so the argmin over rungs wanders while the loss is ~nothing.
+    # Being one rung off therefore costs ~nothing, and the sibling formula is the principled place to
+    # sit. Galen measures 128 = exactly l2 ÷ 4096, agreeing with it outright.
+    @inline _pbtrf_ucross(::Type{ComplexF64}) = _at_pbtrf_ucross(_HW)
 else
     @inline _pbtrf_ucross(::Type{<:BlasFloat}) = _PBTRF_UCROSS_PREF::Int   # pinned (trim builds land here)
 end

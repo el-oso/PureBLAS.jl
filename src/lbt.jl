@@ -45,6 +45,24 @@ function __init__()
     # compiles no env access into `__init__` at all. Each Ref is pre-seeded with its no-env default, so
     # ordering here is not load-bearing — this only ever overrides.
     _init_force_knobs!()
+    # ONE-TIME TUNING NOTICE. Compares a stored fingerprint against detected hardware — a string compare,
+    # no measurement, no allocation of consequence, and silent once tuned.
+    #
+    # ⚠ IT NOTIFIES; IT DOES NOT MEASURE, and must not be made to. Tuning happens ONCE at install time in
+    # deps/build.jl. Running it from here instead would put a multi-minute benchmark inside
+    # `using PureBLAS` — stalling every script, CI job and container build — and `set_preferences!`
+    # triggers a recompile, which is a hazard to perform from inside the load of the package being
+    # recompiled. If the stored fingerprint does not match this hardware the pins are ignored and this
+    # notice fires, which is the correct response to "installed somewhere else".
+    if !is_tuned() && !Base.generating_output() && isinteractive() &&
+            get(ENV, "PUREBLAS_QUIET_TUNE", "") != "1"
+        @info "PureBLAS is running on in-code defaults for this machine. `PureBLAS.tune!()` measures " *
+              "the few knobs that are not derivable from detected hardware and pins them (minutes, " *
+              "wants an idle machine). `PureBLAS.tuning_status()` for detail; PUREBLAS_QUIET_TUNE=1 " *
+              "to silence. Normally deps/build.jl has already done this at install time; you see this " *
+              "if the build was skipped, or if the hardware changed since (the stored fingerprint no " *
+              "longer matches), which is exactly when the old pins should NOT be trusted."
+    end
     return
 end
 

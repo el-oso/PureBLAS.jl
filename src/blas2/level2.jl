@@ -1765,71 +1765,21 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
 # trim/.so build MUST set it), the auto path is NEVER DEFINED → trivially trim-clean.
 const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
-@static if isnothing(_GER_NP_PREF)
-    # Base-only, TOTAL (OncePerProcess poisons the whole process if the initializer throws) → catch → 4.
-    function _measure_ger_np()::Int
-        Base.generating_output() && return 4                     # don't burn a measure during precompilation
-        _f = _force_knob("ger_np"); _f >= 0 && return _f          # instrument only, see _force_knob
-        try
-            # ⚠ SQUARE, matching the shape the GATE scores. This probed n=64 columns against
-            # m = 2·L3/64 rows — a 65536×64 tall-skinny panel — while bench/plots.jl measures `ger` at
-            # `randn(s,s)`. That is the same probe-regime defect found in `_measure_cgemvn_nc_big` the
-            # day before (32768×32 vs square), and here it had a measured cost: with the tall-skinny
-            # probe made REPRODUCIBLE by rotation the knob settled on 4, and the gate then read
-            # ger@2048 0.989 — a regression from 1.199, because np=8 is right for the square shape.
-            # Making a wrong-shape measurement stable just ships the wrong answer consistently.
-            # Square at ~2×L3 puts m = n ≈ 2048 on Zen4, which is exactly the cell that regressed.
-            n = max(64, isqrt(2 * _L3_BYTES ÷ sizeof(Float64)))
-            n -= n % 8                                           # multiple of the widest NP candidate
-            m = n
-            # NB OPERAND SETS, ROTATED PER ROUND. Fleet audit 2026-08-07 (one knob per fresh process):
-            # this knob resolved 4/2 on Zen3 and 8/4 on Zen4 — a coin toss on two of three boxes — while
-            # `axpy_band`, the only knob with rotation, was the ONLY one stable on all three. Duelling
-            # resamples time; when the winner depends on state fixed once per process (page placement,
-            # THP, allocator addresses) every round re-measures the same draw. `A` here is ~2×L3, so its
-            # placement is exactly the kind of per-process accident that decides a DRAM stream count.
-            nb = 3                                               # 3 × 2×L3 of scratch; enough to vary placement
-            As = [fill(1.0, m, n) for _ in 1:nb]
-            x = fill(1.0, m); y = fill(1.0, n)                   # pre-touched (no first-touch bias)
-            # MEDIAN per candidate, not min (see cpuinfo.jl `_tune_one`). This knob has OPPOSITE SIGN
-            # across µarchs (Zen5→1, Zen3→4, Zen4→8), so it is exactly the case where the luckiest
-            # window of one candidate must not decide what ships.
-            # ⚠ SEED `bt` WITH THE DEFAULT'S OWN MEASURED TIME, not `typemax`. With `bt = typemax`,
-            # `_tune_better(t, bt)` is `t*100 < typemax*95`, and `typemax*95` WRAPS to 2^64-95 — still
-            # astronomically above any real time, so the FIRST swept candidate always displaces and the
-            # declared default (`best = 4`) can never win. The effective incumbent was np=1 purely
-            # because it is first in the list, which silently voided the invariant the margin exists for
-            # ("ties go to the incumbent, which is the derived default", cpuinfo.jl). It bites hardest on
-            # exactly the noisy boxes the margin was built for: where all candidates sit within 5%, the
-            # shipped kernel was "first in the list", undocumented.
-            # Seeded this way the loop is extensionally identical to `_tune_pick` (bt starts at the
-            # incumbent and only decreases, so every displacement also clears the incumbent) — see the
-            # proof note there, and test/tuner_tests.jl for the pinned semantics.
-            # DUELS + ROTATION, replacing the margin. `Ar` names the operand set for the current round;
-            # `rot` advances it, so each round is a fresh placement draw and the sign count aggregates
-            # over placements — which is what a caller sees, since callers do not share one allocation.
-            Ar = Ref(As[1])
-            rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
-            inc() = _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 4)
-            # ⚠ WAS `for np in (8, 2, 1) … && return np` — first-past-the-post over a hand-written
-            # order, NOT an argmin. It shipped 8 on Zen5 while the gate measured 1 faster by ~12% at
-            # n=2048, because 8 came first, beat the incumbent 4, and 1 was never evaluated; the same
-            # loop produced `1 8 8 8 8` across five fresh processes (a fall-through, not a tie).
-            # `_tune_duel_pick` keeps the fixed-incumbent bar and adds the missing argmin.
-            cand = ((8, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 8)),
-                    (2, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 2)),
-                    (1, () -> _ger_paneldrv_np(m, n, 1.0, x, y, Ar[], 1)))
-            w = _tune_duel_pick(inc, cand; refresh = rot)
-            return isnothing(w) ? 4 : w
-        catch
-            return 4
-        end
-    end
-    const _GER_NP_ONCE = Base.OncePerProcess{Int}(_measure_ger_np)
-    @inline _ger_np() = _GER_NP_ONCE()
-else
-    @inline _ger_np() = _GER_NP_PREF::Int
-end
+# DUEL DELETED 2026-08-19 — the last OncePerProcess in the tree.
+# ger's panel stream count is an INTRINSIC PER-CORE property, not derivable: measured opposite-sign
+# across microarchitectures — Zen5 -> 1, Zen3 -> 4, Zen4 -> 8 — on boxes where Zen4 and Zen5 share L2,
+# L3, SIMD width AND register count. bench/calibrate.jl's header already documented exactly these three
+# values, and a 6-process-per-box scan on 2026-08-19 reproduced them. So this knob is not an open
+# derivation problem; it is a per-machine constant, and the project's answer to those is a PIN.
+#
+# 4 is the default because it is the incumbent this file's own duel fell back to (`isnothing(w) ? 4`
+# and the `catch`), i.e. the value already documented as the safe middle of the 1/2/4/8 ladder.
+# TO RECOVER YOUR MACHINE'S OPTIMUM: run `bench/calibrate.jl`, which sweeps NP as a RUNTIME kernel
+# argument (no recompile per candidate) and writes `ger_panel_np` into LocalPreferences.toml. On the
+# fleet that is worth 8 on Zen4 and 1 on Zen5 — this file records the gate measuring np=1 twelve
+# percent faster than np=8 at n=2048 there, so the pin is not cosmetic.
+const _GER_NP = something(_GER_NP_PREF, 4)::Int   # req8-ok: documented incumbent; per-box via bench/calibrate.jl
+@inline _ger_np() = _GER_NP
 
 @generated function _ger_panel!(
         Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},

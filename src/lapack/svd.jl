@@ -524,35 +524,6 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
     # benchmarks at load). TOTAL try/catch: OncePerProcess poisons the whole process if the initializer
     # throws. n=256 is the probe size — big enough that the panel/trailing balance is the thing being
     # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
-    function _measure_brd_nb()::Int
-        Base.generating_output() && return 16          # never benchmark during precompilation
-        try
-            n = 256
-            A0 = Matrix{ComplexF64}(undef, n, n)
-            @inbounds for j in 1:n, i in 1:n
-                A0[i, j] = ComplexF64(sinpi((i + 2j) / n), cospi((3i - j) / n))   # deterministic, no RNG dep
-            end
-            ws = _svdws(ComplexF64); _svd_grow_bidiag!(ws, n, n)
-            d = zeros(Float64, n); e = zeros(Float64, n - 1)
-            tq = Vector{ComplexF64}(undef, n); tp = Vector{ComplexF64}(undef, n)
-            A = similar(A0)
-            best = 16; bt = typemax(UInt64)
-            for nb in _BRD_NB_CANDS
-                copyto!(A, A0); gebrd!(A, d, e, tq, tp, ws; nb = nb)             # untimed warmup (JIT)
-                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`).
-                ts = Vector{UInt64}(undef, 5)
-                for r in 1:5
-                    copyto!(A, A0)
-                    s = time_ns(); gebrd!(A, d, e, tq, tp, ws; nb = nb); ts[r] = time_ns() - s
-                end
-                sort!(ts); t = ts[3]
-                _tune_better(t, bt) && (bt = t; best = nb)
-            end
-            return best
-        catch
-            return 16
-        end
-    end
     # Width-derived: 32 ÷ _lanes(hw, Float64) reproduces all three boxes (4 / 4 / 8), each stable in
     # 6 of 6 fresh processes. See `_at_brd_nb` (cpuinfo.jl) for the caveat about codegen sensitivity.
     @inline _brd_nb() = _at_brd_nb(_HW)
