@@ -1172,50 +1172,6 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
 @static if isnothing(_SYTRF_NB_PREF)
     @inline _sytrf_nb(::Type{T}, n::Int) where {T <: BlasReal} =
         clamp(_sytrf_nb_shape(n), 16, 96)
-    # Measure the multiplier once per process, on a Hermitian probe at a representative size.
-    function _measure_sytrf_cmult(::Type{T})::Int where {T}
-        Base.generating_output() && return 1
-        try
-            nloc = 1024          # PROBE REGIME: sytrf gates comfortably at n<=1024 (1.10-3.81) and is
-            # decided ONLY at n=2048/4096 (0.988 both). Probing at 384 chose a multiplier that suits a
-            # size the gate never fails at — measured 2026-08-05: with the median estimator that pick
-            # cost the row 1.073 -> 0.989 (5 runs, stable). Probe where the ratio is tight.
-            Am = Matrix{T}(undef, nloc, nloc)
-            ipv = Vector{Int}(undef, nloc)
-            refill! = () -> begin                       # deterministic Hermitian indefinite
-                R = real(T)
-                @inbounds for j in 1:nloc, i in 1:nloc
-                    re = R(((i * 7 + j * 13) % 101) - 50) / R(50)
-                    ip = R(((i * 11 + j * 5) % 97) - 48) / R(48)
-                    Am[i, j] = T(re, ip)
-                end
-                @inbounds for j in 1:nloc
-                    for i in (j + 1):nloc; Am[i, j] = conj(Am[j, i]); end
-                    Am[j, j] = real(Am[j, j])
-                end
-            end
-            best = 1; tbest = typemax(UInt64)
-            for m in (1, 2, 3, 4)
-                nb = clamp(m * _sytrf_nb_shape(nloc), 16, 96)
-                nb >= nloc && continue
-                refill!(); _sytrf_blocked_lower!(Am, ipv, nb, true)      # untimed warmup
-                # MEDIAN of 5, not min-of-3 (see cpuinfo.jl `_tune_one`). Bunch-Kaufman is data-dependent
-                # — the pivot sequence varies per refill — so the luckiest window is the worst possible
-                # summary of a block size.
-                ts = Vector{UInt64}(undef, 5)
-                for r in 1:5
-                    refill!(); s = time_ns()
-                    _sytrf_blocked_lower!(Am, ipv, nb, true)
-                    ts[r] = time_ns() - s
-                end
-                sort!(ts); t = ts[3]
-                _tune_better(t, tbest) && (tbest = t; best = m)
-            end
-            return best
-        catch
-            return 2                                    # the safer default: 1 MISSES on Zen3
-        end
-    end
     # THE MEASURE-TIER QUANTITY IS THE MULTIPLIER, NOT `nb` — so `sytrf_cmult` is what gets pinned.
     # Pinning `sytrf_nb` instead would take the `else` branch below, whose value is FLAT: it discards
     # `_sytrf_nb_shape(n)` entirely, so the trimmed .so would use one blocking factor at every n while
@@ -1224,19 +1180,17 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # @ccallable (cabi_lapack.jl), so the .so shipped a first-call benchmark that allocates a 1024×1024
     # matrix, and the comment below claiming "pinned (trim lands here)" was simply false.
     # Enforced by test/pin_lint.jl.
-    @static if isnothing(_SYTRF_CMULT_PREF)
-        const _SYTRF_CMULT_C64 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF64))
-        const _SYTRF_CMULT_C32 = Base.OncePerProcess{Int}(() -> _measure_sytrf_cmult(ComplexF32))
-        @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
-            clamp(_SYTRF_CMULT_C64() * _sytrf_nb_shape(n), 16, 96)
-        @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
-            clamp(_SYTRF_CMULT_C32() * _sytrf_nb_shape(n), 16, 96)
-    else
-        @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
-            clamp((_SYTRF_CMULT_PREF::Int) * _sytrf_nb_shape(n), 16, 96)
-        @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
-            clamp((_SYTRF_CMULT_PREF::Int) * _sytrf_nb_shape(n), 16, 96)
-    end
+    # DUEL DELETED 2026-08-19 — it could select the arm this file documents as a MISS.
+    # Resolved across 6 fresh processes per box: galen 2,2,2,2,2,2 but wintermute 1,2,2,2,2,2 (C64)
+    # and 2,1,2,2,2,2 (C32). Every flip picked 1 — and the `catch` above returns 2 with the comment
+    # "the safer default: 1 MISSES on Zen3". So the tuner's failure mode here was to occasionally
+    # ship the value the source itself calls a miss, ~1 process in 6, silently. Same class as the
+    # gemvt_perscan flip fixed the same day.
+    # 2 is therefore both the documented safe default AND the modal measurement (16 of 18 samples
+    # across both boxes). Pin `sytrf_cmult` to retune for a specific machine.
+    const _SYTRF_CMULT = something(_SYTRF_CMULT_PREF, 2)::Int   # req8-ok: documented safe default, table above
+    @inline _sytrf_nb(::Type{ComplexF64}, n::Int) = clamp(_SYTRF_CMULT * _sytrf_nb_shape(n), 16, 96)
+    @inline _sytrf_nb(::Type{ComplexF32}, n::Int) = clamp(_SYTRF_CMULT * _sytrf_nb_shape(n), 16, 96)
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = clamp(_sytrf_nb_shape(n), 16, 96)
 else
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = _SYTRF_NB_PREF::Int   # pinned (trim lands here)
