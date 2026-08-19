@@ -105,10 +105,21 @@ Both modes share ONE set of low-level kernels. Source map:
    - **P — Pin:** `@load_preference("name", <default>)`. A set Preference always wins (calibration,
      cross-compile, and the trim/.so build — which MUST pin any Measure-tier knob, since a runtime
      benchmark is not trim-safe).
+     **THE PIN TIER IS THE USER'S (or the build's) — NEVER THE AGENT'S.** An agent may only ever work in
+     Derive or Measure. Concretely: authoring the `<default>` argument is Derive-tier work and IS
+     allowed (a formula, or a falsified-derivation literal with its measured table, marked `req8-ok`);
+     supplying a VALUE for the preference that overrides it is NOT — that means no writing/editing any
+     `LocalPreferences.toml`, no adding pins to `juliac/build.jl`, and no *recommending* a pin as a
+     knob's resting state. A pin is a deployment decision for one machine or one shipped artifact; it
+     silently overrides every derivation, so an agent that pins can mask its own bad default and make
+     the fleet unreproducible. If a conversion leaves something that looks like it wants a pin, say so
+     and STOP — it is the user's call.
    - **D — Derive:** if the optimum is **physically predictable from a detected const** (cache RESIDENCY,
      SIMD width, register count), the default is a **FORMULA** over `_L1/L2/L3_BYTES`, `_vwidth`, `_NVREG`,
-     … — zero runtime cost, const-folds (trim-safe), adapts to unseen machines. E.g. `_GEMVN_RB_MAXA =
-     _L3_BYTES ÷ 4`, `_qr_nb`.
+     … — zero runtime cost, const-folds (trim-safe), adapts to unseen machines. Live examples to copy:
+     `_TRI_NB` (L1 residency of the diagonal block), `_qr_nb` (L2-residency ramp under a register-
+     invariant cap), `_TRSV_REG_MAX` (`_SCALAR_FPREGS − temps`, validated against a measured knee).
+     (`_GEMVN_RB_MAXA` was cited here for a while and does not exist — the real const is `_GEMVN_RB`.)
    - **M — Measure:** if the optimum is **NOT predictable from detected consts** — it depends on port
      balance / prefetcher / write-stream count and can INVERT sign across µarchs (the TELL: our own model
      mispredicts a box we HAVE) — the default is an **on-host auto-tune**: `Base.OncePerProcess` measuring
@@ -118,11 +129,22 @@ Both modes share ONE set of low-level kernels. Source map:
 
    **The decision D-vs-M IS the rule:** for every machine-dependent number, ask *"is this physically
    predictable from a detected const?"* — **Yes ⇒ Derive, No ⇒ Measure. There is NO third option.** A
-   fixed literal, or a datapath-gated literal like `_double_pumped(_HW) ? 8 : 4`, is NOT a valid answer —
-   it is a Measure-tier knob that hasn't been converted yet (correct only for the µarchs we've
-   benchmarked; wrong on unseen ones). When you write ANY tuning number, STATE its tier in the code
-   comment; if you can neither give a Derive formula nor a Measure harness+candidate-set, STOP — it's a
-   violation.
+   fixed literal is NOT a valid answer — it is a Measure-tier knob that hasn't been converted yet
+   (correct only for the µarchs we've benchmarked; wrong on unseen ones). When you write ANY tuning
+   number, STATE its tier in the code comment; if you can neither give a Derive formula nor a Measure
+   harness+candidate-set, STOP — it's a violation.
+
+   **NARROWED 2026-08-19 — when a µarch predicate IS the derivation.** This clause used to forbid
+   `_double_pumped(_HW) ? 8 : 4` outright. That over-reached: it is a violation when used as a lazy
+   two-way lookup for a knob whose real criterion is something else, but it is the CORRECT derivation
+   when the knob's physical criterion genuinely IS the datapath/vendor/family fact the predicate
+   encodes. `cpuinfo.jl` calls `_double_pumped` "silicon FACTS, not tuned magic" for exactly this
+   reason. Test to apply, and it must be argued in the comment: name the physical mechanism, show it
+   maps 1:1 onto the predicate, and give the fleet table. Worked example — `_axpy_dram`: Zen4
+   double-pumps 512-bit ops over a 256-bit path, so the narrow 256-bit phase kernel is the right arm
+   there and not on a native-256 AVX2 part; measured DRAM-regime, arm208 beats arm4 by 17% on Zen4 and
+   LOSES on Zen3. That is a mechanism, not a lookup table. A predicate used without that argument is
+   still a violation.
 
 ## ABI conventions (Mode 1)
 
