@@ -228,6 +228,19 @@ const _GEMM_SPLIT_S = 2
 # NOTE `_double_pumped` alone is NOT the criterion: it would say Zen3 wants the wide arm, and Zen3
 # measures narrow 6/6. Only the datapath WIDTH separates the three correctly.
 @inline _at_zaxpy_narrow(hw) = _datapath_bytes(hw) <= 32
+# (c5) gemv-T route mode. ⚠ THIS IS A KEYED LITERAL, NOT A DERIVATION, AND IT IS LABELLED AS ONE.
+# No mechanism was found linking the split to any detected const: `_double_pumped` happens to partition
+# the fleet correctly, but I could not argue WHY the datapath would decide per-column vs blocked gemv-T,
+# and a predicate that merely fits the boxes is not a mechanism (proved on `zaxpy_narrow` the same day,
+# where `_double_pumped` fit two boxes and was falsified 6/6 by the third). The L1-size hypothesis is
+# also FALSIFIED: Zen3 and Zen4 share a 32 KiB L1 and want OPPOSITE modes.
+# So this encodes the measured answer and nothing more. Mode 0 (blocked at every size) is the
+# CONSERVATIVE DEFAULT and what unseen hardware gets — it is best at every measured size on both
+# non-double-pumped boxes. Zen4 is a documented exception.
+# Source: the full-run fleet table in blas2/level2.jl (2026-08-08, every box freq-locked, PB+OB+AOCL in
+# ONE run per arm, forced through the real entry path) — the highest-quality evidence in the tree, and
+# far stronger than the 5-rep in-process duel this replaces.
+@inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-
