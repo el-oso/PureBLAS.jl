@@ -89,6 +89,27 @@
     @test P._at_pbtrf_ucross(Zen3) == 128
     @test P._at_pbtrf_ucross(tigerlake) == 1280 * 1024 ÷ 4096   # out-of-fleet: scales, no crash
 
+    # ── Same width criterion, second batch. Rows marked MODAL had ONE box flip; the 5-of-6 value is
+    # used, and the assertion records which box was modal so the provenance is not lost.
+    @test P._at_gbtrf_cross(Zen4, Float32) == 48 && P._at_gbtrf_cross(Zen5, Float32) == 48
+    @test P._at_gbtrf_cross(Zen3, Float32) == 64
+    @test P._at_gbtrf_cross(Zen4, Float64) == 32 && P._at_gbtrf_cross(Zen5, Float64) == 32
+    @test P._at_gbtrf_cross(Zen3, Float64) == 64          # MODAL on Zen3 (64,64,48,64,64,64)
+    @test P._at_gbtrf_cross(Zen4, ComplexF64) == 8 && P._at_gbtrf_cross(Zen5, ComplexF64) == 8
+    @test P._at_gbtrf_cross(Zen3, ComplexF64) == 16
+    @test P._at_pbtrf_cross(Zen4, Float32) == 32 && P._at_pbtrf_cross(Zen5, Float32) == 32
+    @test P._at_pbtrf_cross(Zen3, Float32) == 40          # MODAL on Zen3 (40,40,32,40,40,40)
+    @test P._at_pbtrf_cross(Zen4, ComplexF32) == 24  # MODAL on Zen4 (24x5, 16)
+    @test P._at_pbtrf_cross(Zen5, ComplexF32) == 24 && P._at_pbtrf_cross(Zen3, ComplexF32) == 16
+    # F64 ucross does NOT obey the `l2 ÷ 4096` formula its F32/C32 siblings do — Zen3 measures 192
+    # where that formula gives 128. Asserted as a table row so a future "unify these" edit fails here.
+    @test P._at_pbtrf_ucross(Zen4, Float64) == 256 && P._at_pbtrf_ucross(Zen5, Float64) == 256
+    @test P._at_pbtrf_ucross(Zen3, Float64) == 192        # MODAL on Zen3 (192x4, 256, 192)
+    @test P._at_pbtrf_ucross(Zen3, Float64) != P._at_pbtrf_ucross(Zen3)   # the two rules disagree
+    # brd_nb is a formula on all three boxes, each stable 6/6.
+    @test P._at_brd_nb(Zen4) == 4 && P._at_brd_nb(Zen5) == 4
+    @test P._at_brd_nb(Zen3) == 8
+
     @test P._at_axpy_dram(Zen4) == 208
     @test P._at_axpy_dram(Zen3) == 4
     @test P._at_axpy_dram(Zen5) == 4

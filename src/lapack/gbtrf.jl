@@ -111,13 +111,13 @@ const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
             return 32
         end
     end
-    const _GBTRF_CROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(Float64))
-    const _GBTRF_CROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(Float32))
-    const _GBTRF_CROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(ComplexF64))
     const _GBTRF_CROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(ComplexF32))
-    @inline _gbtrf_cross(::Type{Float64}) = _GBTRF_CROSS_F64()
-    @inline _gbtrf_cross(::Type{Float32}) = _GBTRF_CROSS_F32()
-    @inline _gbtrf_cross(::Type{ComplexF64}) = _GBTRF_CROSS_C64()
+    # Width-derived; see `_at_gbtrf_cross` (cpuinfo.jl) for the three-box table. Each box keeps its
+    # OWN measured crossover, which is what avoids the failure this file documents above — shipping
+    # a single one-box value took Zen3's gbtrf row from PASS (1.43/1.18) to FAIL (1.32/0.91).
+    @inline _gbtrf_cross(::Type{Float64}) = _at_gbtrf_cross(_HW, Float64)
+    @inline _gbtrf_cross(::Type{Float32}) = _at_gbtrf_cross(_HW, Float32)
+    @inline _gbtrf_cross(::Type{ComplexF64}) = _at_gbtrf_cross(_HW, ComplexF64)
     @inline _gbtrf_cross(::Type{ComplexF32}) = _GBTRF_CROSS_C32()
     @inline _gbtrf_cross(::Type{T}) where {T} = 32
 else
