@@ -49,61 +49,28 @@ const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 # req#8 tier: MEASURE — a call-overhead-vs-vectorised-work crossover, the same class as _GETF2_BASE
 # and _pbtrf_cross, not a residency bound. Candidates are DERIVED as {1,2,3,4}·W: the crossover is
 # where one SIMD store's worth of work starts to amortise a call, so the vector width is the unit.
-const _PPTRF_SPR_MIN_PREF = @load_preference("pptrf_spr_min", nothing)
-@static if isnothing(_PPTRF_SPR_MIN_PREF)
-    function _measure_pptrf_spr_min(::Type{T})::Int where {T}
-        vw = _vwidth(T)
-        Base.generating_output() && return 2 * vw     # don't burn a measure during precompilation
-        try
-            n = 4 * vw                                # the order where the cutoff bites hardest
-            len = (n * (n + 1)) >> 1
-            AP = Vector{T}(undef, len)
-            refill! = () -> begin                     # diagonally dominant ⇒ HPD in packed lower form
-                fill!(AP, one(T))
-                @inbounds for j in 1:n
-                    AP[_pp_l(j, j, n)] = T(2 * n + 2)
-                end
-            end
-            # ⚠ DUELS AGAINST THE DECLARED DEFAULT. Two defects lived here, and they are the same two
-            # found in three other sweeps on 2026-08-06/07:
-            #   * `tbest = typemax(UInt64)` — `typemax*95` WRAPS to 2^64-95, still far above any real
-            #     time, so the FIRST candidate always displaced and `best = 2*vw` was unreachable. The
-            #     effective incumbent was whichever cut happened to be swept first (vw).
-            #   * a fixed-margin comparison on two medians, which decides by noise whenever the
-            #     candidates sit within the margin. Measured, one knob per fresh process: F64 resolved
-            #     8 / 16 — two different packed-Cholesky cuts shipping from one binary.
-            # Each candidate now duels the DECLARED DEFAULT over rotated rounds with a per-round median
-            # and a supermajority, so the default keeps ties and a lucky window cannot displace it.
-            # `refill!` stays OUTSIDE the timed region: the factorization is destructive, so every
-            # timed round must start from a fresh HPD packed matrix.
-            inc() = (refill!(); _pptrf_lower!(AP, n, 2 * vw))
-            # ⚠ WAS `for c in (vw, 3vw, 4vw) … && return c` — first-past-the-post over a hand-written
-            # order, not an argmin: it shipped whichever candidate happened to be listed first among
-            # those beating the incumbent, and never compared them to each other. Same defect measured
-            # on `_ger_np` (Zen5 shipped 8 while 1 was ~12% faster at the gate's n=2048).
-            # `_tune_duel_pick` keeps the fixed-incumbent bar and adds the argmin. `_tune_duel` does its
-            # own untimed warmup of both arms, so the explicit warmup line is no longer needed.
-            cand = ((vw, () -> (refill!(); _pptrf_lower!(AP, n, vw))),
-                    (3 * vw, () -> (refill!(); _pptrf_lower!(AP, n, 3 * vw))),
-                    (4 * vw, () -> (refill!(); _pptrf_lower!(AP, n, 4 * vw))))
-            w = _tune_duel_pick(inc, cand)
-            return isnothing(w) ? 2 * vw : w
-        catch
-            return 2 * vw
-        end
-    end
-    const _PPTRF_SPR_F32 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(Float32))
-    const _PPTRF_SPR_F64 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(Float64))
-    const _PPTRF_SPR_C32 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(ComplexF32))
-    const _PPTRF_SPR_C64 = Base.OncePerProcess{Int}(() -> _measure_pptrf_spr_min(ComplexF64))
-    @inline _pptrf_spr_min(::Type{Float32}) = _PPTRF_SPR_F32()
-    @inline _pptrf_spr_min(::Type{Float64}) = _PPTRF_SPR_F64()
-    @inline _pptrf_spr_min(::Type{ComplexF32}) = _PPTRF_SPR_C32()
-    @inline _pptrf_spr_min(::Type{ComplexF64}) = _PPTRF_SPR_C64()
-    @inline _pptrf_spr_min(::Type{T}) where {T} = 2 * _vwidth(T)   # generic/AD eltypes
-else
-    @inline _pptrf_spr_min(::Type{<:Any}) = _PPTRF_SPR_MIN_PREF::Int   # pinned (trim builds land here)
-end
+# DERIVE (2026-08-19). The Measure duel here is deleted, and the reason is that this session's own
+# blocked packed Cholesky made the knob nearly dead. At n >= _PPTRF_BLK_MIN (16) `pptrf!` now routes
+# BlasFloat strided input to `_pptrf_lower_blocked!` (see the dispatch below), so `_pptrf_lower!` —
+# the only consumer of this cutoff — is reached solely for n < 16 or for generic/AD eltypes.
+#
+# TWO CONSEQUENCES, both measured:
+#  * The gate table above (cut8/16/32 at n=16..512, '16 = 2W is best or tied at every order <= 128')
+#    is STALE. It describes the unblocked path at sizes where production no longer runs it.
+#  * The duel probed at n = 4*vw, which is 32 for Float64 on AVX-512 — also the blocked regime. It was
+#    therefore timing a path production does not take, which is why it resolved 32 on wintermute (8/8)
+#    against a table that says 16, and 16 on galen (6/6). Neither answer governed anything.
+# A direct A/B of `_pptrf_lower!` at cut 8/16/32 (wintermute, n=16..256) is likewise off-regime and is
+# recorded only to show the disagreement, not as evidence for a value.
+#
+# So the value reverts to the DERIVED generic fallback that was always beneath the duel: 2*W, the
+# vector-width unit the crossover is expressed in (one SIMD store's work amortising a call). Blast
+# radius is tiny-n and AD, where correctness matters and a few ns do not. Preference override retained.
+# `@load_preference` stays at MODULE level, never in the body: an in-body load is a recorded hazard in
+# this tree (it does not const-fold the way the module-level form does). 0 is the unset sentinel, so the
+# per-type derivation still applies when no preference is set.
+const _PPTRF_SPR_PREF = @load_preference("pptrf_spr_min", 0)::Int   # req8-ok: unset sentinel, not a tuning value
+@inline _pptrf_spr_min(::Type{T}) where {T} = _PPTRF_SPR_PREF > 0 ? _PPTRF_SPR_PREF : 2 * _vwidth(T)
 
 # ── pptrf!: packed Cholesky factorization (dpptrf.f) ──────────────────────────────────────────────
 # uplo='U': A = Uᴴ·U (left-looking — solve Uᴴu = col then the diagonal). uplo='L': A = L·Lᴴ
