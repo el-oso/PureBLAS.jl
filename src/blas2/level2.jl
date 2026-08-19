@@ -1764,7 +1764,16 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
 # trim/.so build MUST set it), the auto path is NEVER DEFINED → trivially trim-clean.
-const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
+# ⚠ RUNTIME read, deliberately — NOT `@load_preference`. The MACRO reads at COMPILE time and calls
+# `Base.record_compiletime_preference`, which makes the value part of the precompile hash: writing this
+# pin would then invalidate the pkgimage and force a full rebuild. That turned "tune once" into
+# "precompile, tune, recompile" — ~35 min on an install here. `load_preference` called at runtime
+# records nothing (it only registers a dependency when `currently_compiling()`), so a pin written by
+# `tune!()` costs a restart, not a rebuild, and re-tuning later is free.
+# The value must therefore live in a Ref filled by `__init__`, NOT a const: Preferences' own docstring
+# warns that a preference cached in a module global will not be invalidated, which is exactly the
+# behaviour we want here but only if nothing else depends on the compile-time value.
+# ANY KEY `tune!()` WRITES MUST FOLLOW THIS PATTERN — see `_TUNABLE_KEYS` in tune.jl.
 # DUEL DELETED 2026-08-19 — the last OncePerProcess in the tree.
 # ger's panel stream count is an INTRINSIC PER-CORE property, not derivable: measured opposite-sign
 # across microarchitectures — Zen5 -> 1, Zen3 -> 4, Zen4 -> 8 — on boxes where Zen4 and Zen5 share L2,
@@ -1778,8 +1787,8 @@ const _GER_NP_PREF = @load_preference("ger_panel_np", nothing)
 # argument (no recompile per candidate) and writes `ger_panel_np` into LocalPreferences.toml. On the
 # fleet that is worth 8 on Zen4 and 1 on Zen5 — this file records the gate measuring np=1 twelve
 # percent faster than np=8 at n=2048 there, so the pin is not cosmetic.
-const _GER_NP = something(_GER_NP_PREF, 4)::Int   # req8-ok: documented incumbent; per-box via bench/calibrate.jl
-@inline _ger_np() = _GER_NP
+const _GER_NP = something(@load_preference("ger_panel_np", nothing), 4)::Int   # req8-ok: documented incumbent
+@inline _ger_np() = (f = _fk("ger_panel_np"); f >= 0 ? f : _GER_NP)
 
 @generated function _ger_panel!(
         Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},
@@ -3836,6 +3845,13 @@ end
 # so "force this arm, run the gate" stays a ~10 min loop instead of a source edit + commit + fleet sync,
 # which is exactly what converting a knob to Derive costs you (measured on axpy_band, 2026-08-19).
 function _init_force_knobs!()
+# The converted-knob overrides (cpuinfo.jl `_FK_NAMES`). One ENV read each, here and nowhere else.
+# Compiles to nothing when `_FORCE_HOOKS` is false, which juliac/build.jl sets for the trim build.
+@static if _FORCE_HOOKS
+    for n in _FK_NAMES
+        _FK[n][] = _force_knob(n)
+    end
+end
     @static if isnothing(_GEMVN_MINNER_PREF)
         f = _force_knob("gemvn_minner")
         f >= 0 && (_GEMVN_MINNER_REF[] = f != 0)
