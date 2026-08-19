@@ -782,88 +782,18 @@ else
 @inline _gemvt_pf() = _GEMVT_PF_PREF::Int
 end
 
-const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
-@static if isnothing(_GEMVT_NC_PREF)
-    function _measure_gemvt_nc()::Int
-        Base.generating_output() && return 4                      # never burn a measure at precompile
-        _f = _force_knob("gemvt_nc"); _f >= 0 && return _f         # instrument only, see _force_knob
-        # THE PROBE OPERANDS ARE GONE — they were allocated, FILLED, and never used. The duel below is
-        # disabled (see the record), so every path already returned 4, but the setup still ran first:
-        # three n×n matrices at n = isqrt(_L2_BYTES ÷ 16) — ~1.5 MB on a 1 MB-L2 box — allocated and
-        # touched on the FIRST gemv-T call of every process, then discarded. One-off rather than
-        # per-call, but pure waste, and an allocation the trim/StrictMode builds had to be pinned
-        # around. If the duel is ever re-enabled, restore the operands WITH it, not before it.
-        # The probe REGIME that must be restored with them (it is the part worth keeping):
-        #   square A at ~½L2 — where the gate's missing cells live (n=128/256 ⇒ A = 128 KB/512 KB, both
-        #   ≤ L2) and where the loop is compute-bound. Probing past L2 measures a regime that routes
-        #   per-column on Zen4 and is memory-bound everywhere — the axpy_band lesson: a probe whose
-        #   arms tie cannot resolve.
-        if false                                                   # req8-ok: arms kept type-checked
-            _REP_BUDGET_NS = 20_000_000   # req8-ok: measurement-precision budget, selects no kernel
-            nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
-            # ⚠⚠ THE DUEL IS DISABLED, AND THE GATE IS WHY. Measured 2026-08-08 on wintermute,
-            # freq-locked, all arms same-run, forcing each arm through the REAL entry path:
-            #     n=      64     128    256     512     1024    2048    4096
-            #   NC=4    1.024  1.026  0.978   1.162   1.207   1.043   1.102
-            #   NC=8    1.140  1.031  0.995   0.989   0.989   1.013   0.998
-            # NC=8 takes THREE passing cells to misses (512, 1024, 4096) and does not even close 256.
-            # This probe — square A at ~½L2, rotated operands, per-round medians, time-budgeted reps —
-            # nonetheless resolved 8 on this box. That is the THIRD knob today whose standalone probe
-            # ranked the arms against the gate (see the axpy_band post-mortem and `_cgemvt_cfg`), and the
-            # rule this project keeps re-learning is that a probe disagreeing with the gate is evidence
-            # about the PROBE. So the selection is off until a probe exists that reproduces the table
-            # above; the plumbing (candidate set, Val ladder, `PUREBLAS_FORCE_gemvt_nc`) stays, because
-            # forcing an arm through `bench/plots.jl` is how that table was produced in the first place.
-            # Do NOT re-enable this by "fixing" the probe's noise — fix its REGIME, then show it
-            # reproduces the gate ordering on at least two boxes.
-            # ⚠⚠ AND NC IS FALSIFIED AS THE LEVER FOR THE WORST CELLS — measured on ZEN5 (native 512,
-            # where `_gemvt_perscan` is FALSE so EVERY size takes this blocked kernel), freq-locked,
-            # all arms same-run, each NC forced through the real entry path:
-            #     n=      64     128    256     512     1024    2048    4096
-            #   NC=4    0.959  0.860  0.723   1.010   1.026   0.975   1.044
-            #   NC=8    1.164  0.850  0.717   0.977   1.008   1.006   0.968
-            #   NC=16   1.075  0.829  0.695   0.768   0.867   0.866   0.975
-            # More chains make n=128 and n=256 SLIGHTLY WORSE, monotonically. The "native-512 Zen5 has
-            # twice the 512-bit FMA throughput so 4 dependent chains starve it" model predicted the
-            # opposite and is dead. NC=4 is right on every box and every size that matters.
-            # ⚠⚠ AND THE M-UNROLL IS FALSIFIED TOO (2026-08-08, Zen5, forced through the real entry
-            # path, ENV-overhead bug fixed first so U=1 reproduces the baseline):
-            #     n=      64     128    256     512     1024    2048    4096
-            #   U=1     0.951  0.856  0.728   0.996   1.014   0.974   1.040
-            #   U=2     0.953  0.851  0.726   1.017   1.034   0.973   1.053
-            #   U=4     1.042  0.853  0.721   1.009   0.993   0.983   1.044
-            # ⚠ AND THE M-UNROLL IS FALSIFIED ON ZEN3 TOO (2026-08-08) — the sweep above was ZEN5-ONLY, and
-# Zen3 is the box whose open cells are L3-resident rather than L2-resident, so it is a different
-# regime, not a repeat. AVX2 permits U<=2 (`_gemvt_u_max(4)` = 2 at 16 YMM). vs AOCL, arms=pb so
-# the reference cancels, with the baseline arm duplicated to size the run-to-run band:
-#     n=          64     128    256    512    1024   2048   4096
-#   U=1 run 1   1.155  1.085  1.058  1.069  0.963  0.956  1.083
-#   U=2         1.140  1.043  0.979  1.076  0.955  0.946  1.080
-#   U=0 preload 0.953  1.006  0.997  1.059  0.955  0.910  1.073
-#   U=1 run 2   1.155  1.084  1.059  1.062  0.953  0.951  1.082
-# The two open cells (1024, 2048) do not move. The REGISTER-PRELOAD arm is actively HARMFUL on
-# AVX2 — 0.953 at n=64 against 1.155, and 0.910 at n=2048 — which is what 16 YMM registers buys
-# you when the kernel needs 2·NC+1 of them; it is an AVX-512-only candidate at best.
-# Dead flat at the two cells that matter. BOTH structural deltas vs AOCL's dgemv-T — the
-            # column count AND the m-unroll — are now measured and neither is the mechanism. The Zen5
-            # n=128/256 deficit is NOT in this loop's shape.
-            # What has NOT been tested: whether the blocked kernel should run AT ALL there. The
-            # blocked-vs-per-column routing (`_gemvt_perscan`, this file) sends A <= L2 to BLOCKED
-            # unconditionally, and that assumption was measured on Zen4. The per-column arm
-            # (`_dot_simd` per column) is right there in the remainder loop and is not currently
-            # reachable at A <= L2 on any box. THAT is the next experiment: make the residency arm of
-            # the routing forceable and try per-column at n=128/256 on Zen5.
-            for c in (16, 8)                                       # widest-effect first
-                c in _GEMVT_NC_CANDIDATES || continue              # req8-ok: candidate arm
-            end
-        end
-        return 4                                                   # req8-ok: gate-measured incumbent
-    end
-    const _GEMVT_NC_ONCE = Base.OncePerProcess{Int}(_measure_gemvt_nc)
-    @inline _gemvt_nc() = _GEMVT_NC_ONCE()
-else
-    @inline _gemvt_nc() = _GEMVT_NC_PREF::Int
-end
+# FALSIFIED-DERIVATION LITERAL (2026-08-19): the duel here has been dormant (an `if false`) since
+# 2026-08-08 — every path already returned 4 — so the OncePerProcess was a resolver wrapped around a
+# constant. Collapsed to that constant. The tier is stated honestly: this is NOT Measure and should
+# not pretend to be. The project's own latency x throughput criterion (_ILP_TARGET, cpuinfo.jl)
+# predicts EIGHT chains; every box on the fleet measures 4 best, monotonically worse at 8 and 16. A
+# derivation that predicts the wrong answer is falsified, and a falsified-derivation literal is a
+# better resting state than a live duel: reproducible, const-folding, and trim-safe.
+# _GEMVT_NC_CANDIDATES, the Val ladder and PUREBLAS_FORCE_gemvt_nc are retained above — forcing an arm
+# through bench/plots.jl is how the measured tables in this file were produced and how the next
+# attempt must be measured.
+const _GEMVT_NC = @load_preference("gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
+@inline _gemvt_nc() = _GEMVT_NC
 
 # gemv-T blocked-vs-per-column ROUTE, as a 3-valued MODE (not a Bool) so the RESIDENCY arm is itself
 # forceable/shippable:
@@ -1261,57 +1191,15 @@ const _CGEMVT_CFG_BIG = (
     n = _cgemvt_fits(8, true) ? 8 : _cgemvt_fits(4, true) ? 4 : 2;
     n + 100
 )
-const _CGEMVT_CFG_PREF = @load_preference("cgemvt_cfg", nothing)
-@static if isnothing(_CGEMVT_CFG_PREF)
-    function _measure_cgemvt_cfg()::Int
-        Base.generating_output() && return _CGEMVT_CFG_BIG     # never burn a measure at precompile
-        _f = _force_knob("cgemvt_cfg"); _f >= 0 && return _f       # instrument only, see _force_knob
-        try
-            T = Float64; W = _vwidth(T)
-            # PROBE WHERE THE KNOB IS DISPATCHED AND WHERE THE ARMS SEPARATE. Square A sized so the
-            # matrix lands at L3 — that is the worst measured cell on both locked boxes and it sits
-            # inside the broad 512..2048 miss band, so a winner here is a winner across the band. This
-            # is the axpy_band lesson: a probe in a regime where the arms tie cannot resolve the knob.
-            n = _avoid_po2(max(64, isqrt(_L3_BYTES ÷ (2 * sizeof(Complex{T})))), W)
-            nb = 3
-            As = [fill(Complex{T}(1.0e-3, 2.0e-3), n, n) for _ in 1:nb]   # rotated: fresh draw per round
-            x = fill(Complex{T}(0.5, -0.25), n)
-            y = fill(Complex{T}(0.0, 0.0), n)
-            Ar = Ref(As[1])
-            rot(r) = (Ar[] = As[mod1(r, nb)]; nothing)
-            α = Complex{T}(1.0, 0.0); β = Complex{T}(0.0, 0.0)
-            run(nc, half) = _gemv_tc_run!(n, n, α, Ar[], x, β, y, Val(false), nc, half)
-            inc() = run(Val(_CGEMVT_CFG_BIG - 100), Val(true))   # derived incumbent
-            # req8-ok: a MEASUREMENT-PRECISION budget in nanoseconds, not a machine value — selects no
-            # kernel, appears in no shipped path. Same fix `_measure_axpy_unroll` needed: a fixed 5-rep
-            # median rests on too little signal at this size and the duel under-resolves an effect the
-            # GATE measures at 11% (n=1024: 0.912 → 1.017 when the arm is forced). Deriving `nrep` from
-            # a time budget makes every box spend the same TIME rather than the same rep count.
-            _REP_BUDGET_NS = 20_000_000
-            nrep = clamp(Int(_REP_BUDGET_NS ÷ max(_tune_one(inc; reps = 3), UInt64(1))), 5, 40)
-            # Ordered widest-effect first; first to earn a supermajority wins. Guards const-fold, so a
-            # candidate the register file cannot hold is not even compiled on that ISA.
-            # Candidates are the alternatives to the DERIVED incumbent (fewer/wider streams). A box whose
-            # optimum really is fewer streams displaces it; a tie keeps the derived value.
-            if _CGEMVT_CFG_BIG != 104 && _cgemvt_fits(4, true)
-                _tune_wins_it(_tune_duel(inc, () -> run(Val(4), Val(true)); reps = nrep, refresh = rot)) && return 104  # req8-ok: candidate arm
-            end
-            if _CGEMVT_CFG_BIG != 4 && _cgemvt_fits(4, false)
-                _tune_wins_it(_tune_duel(inc, () -> run(Val(4), Val(false)); reps = nrep, refresh = rot)) && return 4  # req8-ok: candidate arm
-            end
-            if _CGEMVT_CFG_BIG != 2 && _cgemvt_fits(2, false)
-                _tune_wins_it(_tune_duel(inc, () -> run(Val(2), Val(false)); reps = nrep, refresh = rot)) && return 2  # req8-ok: candidate arm
-            end
-            return _CGEMVT_CFG_BIG
-        catch
-            return _CGEMVT_CFG_BIG
-        end
-    end
-    const _CGEMVT_CFG_ONCE = Base.OncePerProcess{Int}(_measure_cgemvt_cfg)
-    @inline _cgemvt_cfg() = _CGEMVT_CFG_ONCE()
-else
-    @inline _cgemvt_cfg() = _CGEMVT_CFG_PREF::Int
-end
+# DERIVE (2026-08-19): the duel is GONE. `_CGEMVT_CFG_BIG` above is already a complete derivation over
+# `_NVREG`, and it reproduces what the duel actually resolved on every box we have — galen (_NVREG=16)
+# fits (4,half) => 104, measured 104 in 6/6 fresh processes; wintermute (_NVREG=32) fits (8,half) =>
+# 108, measured 108 in 8/8. The duel could therefore only ever agree with the formula or coin-flip away
+# from it, and the comment above already records it alternating 108/4/108/4/108/4/108/4 across eight
+# processes with the old incumbent. A knob whose measurement can only confirm or corrupt its derivation
+# is not Measure tier; it is Derive with extra risk. Preference override retained (Pin rung).
+const _CGEMVT_CFG = @load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)::Int
+@inline _cgemvt_cfg() = _CGEMVT_CFG
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
