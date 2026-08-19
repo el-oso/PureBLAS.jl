@@ -157,16 +157,14 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
             return nb0                                # fall back to the dense potrf anchor
         end
     end
-    const _PBTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(Float32))
-    const _PBTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF32))
-    const _PBTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF64))
-    @inline _pbtrf_nb_tuned(::Type{Float32}) = _PBTRF_NB_F32()
+    # Derived from vector width — see `_at_pbtrf_nb` (cpuinfo.jl) for the three-box table.
+    @inline _pbtrf_nb_tuned(::Type{Float32}) = _at_pbtrf_nb(_HW, Float32)
     # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (wintermute Zen4 and
     # galen Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
     # also reproduces the F32/C32/C64 siblings, which differ per box. Reproduces the incumbent exactly.
     @inline _pbtrf_nb_tuned(::Type{Float64}) = 40
-    @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = _PBTRF_NB_C32()
-    @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = _PBTRF_NB_C64()
+    @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = _at_pbtrf_nb(_HW, ComplexF32)
+    @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = _at_pbtrf_nb(_HW, ComplexF64)
     @inline _pbtrf_nb_tuned(::Type{T}) where {T} = _pbtrf_nb_anchor(T)   # generic/AD eltypes never block
 else
     @inline _pbtrf_nb_tuned(::Type{<:Any}) = _PBTRF_NB_PREF::Int      # pinned (trim builds land here)
@@ -221,10 +219,9 @@ const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
             return vw                                  # narrowest candidate: never the degenerate case
         end
     end
-    const _PBTRF_NBS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(Float32))
-    const _PBTRF_NBS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(Float64))
-    @inline _pbtrf_nb_small(::Type{Float32}) = _PBTRF_NBS_F32()
-    @inline _pbtrf_nb_small(::Type{Float64}) = _PBTRF_NBS_F64()
+    # F32 is exactly `_lanes(hw, Float32)` on all three boxes — a formula, not a table.
+    @inline _pbtrf_nb_small(::Type{Float32}) = _at_pbtrf_nbs(_HW, Float32)
+    @inline _pbtrf_nb_small(::Type{Float64}) = _at_pbtrf_nbs(_HW, Float64)
     # req8-ok: measured-identical literals — 8 in 6/6 processes on BOTH boxes (2026-08-19). The REAL
     # siblings are deliberately left on the duel: they are stable per box but INVERTED between them
     # (F32 wm=16 gl=8, F64 wm=8 gl=16), which no formula over width or cache reproduces.
@@ -360,13 +357,13 @@ const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
             return typemax(Int)        # on any failure keep the older, more broadly-tested path
         end
     end
-    const _PBTRF_UCROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(Float32))
     const _PBTRF_UCROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(Float64))
-    const _PBTRF_UCROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF32))
     const _PBTRF_UCROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF64))
-    @inline _pbtrf_ucross(::Type{Float32}) = _PBTRF_UCROSS_F32()
+    # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
+    # (192x4, 256, 192) and C64 flips on both wintermute (176/192/208) and neuromancer.
+    @inline _pbtrf_ucross(::Type{Float32}) = _at_pbtrf_ucross(_HW)
     @inline _pbtrf_ucross(::Type{Float64}) = _PBTRF_UCROSS_F64()
-    @inline _pbtrf_ucross(::Type{ComplexF32}) = _PBTRF_UCROSS_C32()
+    @inline _pbtrf_ucross(::Type{ComplexF32}) = _at_pbtrf_ucross(_HW)
     @inline _pbtrf_ucross(::Type{ComplexF64}) = _PBTRF_UCROSS_C64()
 else
     @inline _pbtrf_ucross(::Type{<:BlasFloat}) = _PBTRF_UCROSS_PREF::Int   # pinned (trim builds land here)

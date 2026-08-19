@@ -241,6 +241,28 @@ const _GEMM_SPLIT_S = 2
 # ONE run per arm, forced through the real entry path) — the highest-quality evidence in the tree, and
 # far stronger than the 5-rep in-process duel this replaces.
 @inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
+# (c6) Banded-Cholesky panel widths and crossovers. THE FLEET SPLITS BY VECTOR WIDTH, not by µarch:
+# resolved 6 fresh processes on each of three boxes (2026-08-19), wintermute Zen4 and neuromancer Zen5
+# agree on every row below and galen Zen3 differs on every one — and what wintermute/neuromancer share
+# is simd=64, while `_double_pumped` SEPARATES them. Width is also the physically right unit here: a
+# panel width is counted in vector registers. Two independent AVX-512 boxes agreeing is what makes this
+# a criterion rather than the two-point fit that `zaxpy_narrow` and `ger_np` both punished today.
+#            knob            wm(Zen4)  neuro(Zen5)  galen(Zen3)
+#   pbtrf_nb      F32           8          8            16
+#   pbtrf_nb      C32/C64      32         32            24
+#   pbtrf_nb_small F32         16         16             8      (= exactly _lanes(hw, Float32))
+#   pbtrf_nb_small F64          8          8            16
+#   pbtrf_ucross  F32/C32     256        256           128      (= exactly hw.l2 ÷ 4096)
+# Only rows stable in ALL SIX processes on ALL THREE boxes are here; the rest keep their duel.
+@inline _wide_simd(hw) = hw.simd >= 64
+@inline _at_pbtrf_nb(hw, ::Type{Float32}) = _wide_simd(hw) ? 8 : 16
+@inline _at_pbtrf_nb(hw, ::Type{ComplexF32}) = _wide_simd(hw) ? 32 : 24
+@inline _at_pbtrf_nb(hw, ::Type{ComplexF64}) = _wide_simd(hw) ? 32 : 24
+# F32 is a real formula, not a table: one vector of lanes per panel step, reproduced on all three boxes.
+@inline _at_pbtrf_nbs(hw, ::Type{Float32}) = _lanes(hw, Float32)
+@inline _at_pbtrf_nbs(hw, ::Type{Float64}) = _wide_simd(hw) ? 8 : 16
+# Likewise a formula: the native-upper kernel wins once the band no longer fits this L2 fraction.
+@inline _at_pbtrf_ucross(hw) = hw.l2 ÷ 4096
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-

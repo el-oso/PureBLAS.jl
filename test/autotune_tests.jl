@@ -66,6 +66,29 @@
     # ── Real-axpy DRAM arm (replaced a OncePerProcess duel, 2026-08-19) ───────────────────────────────
     # Only the double-pumped part takes the narrow 256-bit phase arm; native-256 and native-512 both take
     # the interleaved arm. Measured wintermute/galen (17% / 4%); Zen5 + Intel are predictions.
+    # ── Banded-Cholesky width split (2026-08-19): reproduces 6/6 processes on all THREE boxes ────────
+    # wintermute(Zen4) and neuromancer(Zen5) agree on every row and galen(Zen3) differs on every one —
+    # what the first two share is simd=64, and `_double_pumped` SEPARATES them, so the criterion is
+    # vector width, not microarchitecture.
+    @test P._at_pbtrf_nb(wintermute, Float32) == 8
+    @test P._at_pbtrf_nb(neuromancer, Float32) == 8
+    @test P._at_pbtrf_nb(galen, Float32) == 16
+    @test P._at_pbtrf_nb(wintermute, ComplexF32) == 32 && P._at_pbtrf_nb(neuromancer, ComplexF32) == 32
+    @test P._at_pbtrf_nb(galen, ComplexF32) == 24
+    @test P._at_pbtrf_nb(wintermute, ComplexF64) == 32 && P._at_pbtrf_nb(neuromancer, ComplexF64) == 32
+    @test P._at_pbtrf_nb(galen, ComplexF64) == 24
+    # F32 small-panel is a FORMULA (one vector of lanes), not a table — it must track _lanes exactly.
+    @test P._at_pbtrf_nbs(wintermute, Float32) == 16 == P._lanes(wintermute, Float32)
+    @test P._at_pbtrf_nbs(neuromancer, Float32) == 16
+    @test P._at_pbtrf_nbs(galen, Float32) == 8 == P._lanes(galen, Float32)
+    @test P._at_pbtrf_nbs(wintermute, Float64) == 8 && P._at_pbtrf_nbs(neuromancer, Float64) == 8
+    @test P._at_pbtrf_nbs(galen, Float64) == 16
+    # ucross is a FORMULA over L2, and it separates the fleet correctly for a different reason than
+    # width does: wintermute and neuromancer share a 1 MiB L2, galen has 512 KiB.
+    @test P._at_pbtrf_ucross(wintermute) == 256 && P._at_pbtrf_ucross(neuromancer) == 256
+    @test P._at_pbtrf_ucross(galen) == 128
+    @test P._at_pbtrf_ucross(tigerlake) == 1280 * 1024 ÷ 4096   # out-of-fleet: scales, no crash
+
     @test P._at_axpy_dram(wintermute) == 208
     @test P._at_axpy_dram(galen) == 4
     @test P._at_axpy_dram(neuromancer) == 4
