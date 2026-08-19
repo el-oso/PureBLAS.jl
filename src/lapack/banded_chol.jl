@@ -158,11 +158,13 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
         end
     end
     const _PBTRF_NB_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(Float32))
-    const _PBTRF_NB_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(Float64))
     const _PBTRF_NB_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF32))
     const _PBTRF_NB_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb(ComplexF64))
     @inline _pbtrf_nb_tuned(::Type{Float32}) = _PBTRF_NB_F32()
-    @inline _pbtrf_nb_tuned(::Type{Float64}) = _PBTRF_NB_F64()
+    # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (wintermute Zen4 and
+    # galen Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
+    # also reproduces the F32/C32/C64 siblings, which differ per box. Reproduces the incumbent exactly.
+    @inline _pbtrf_nb_tuned(::Type{Float64}) = 40
     @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = _PBTRF_NB_C32()
     @inline _pbtrf_nb_tuned(::Type{ComplexF64}) = _PBTRF_NB_C64()
     @inline _pbtrf_nb_tuned(::Type{T}) where {T} = _pbtrf_nb_anchor(T)   # generic/AD eltypes never block
@@ -221,12 +223,13 @@ const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
     end
     const _PBTRF_NBS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(Float32))
     const _PBTRF_NBS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(Float64))
-    const _PBTRF_NBS_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(ComplexF32))
-    const _PBTRF_NBS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_nb_small(ComplexF64))
     @inline _pbtrf_nb_small(::Type{Float32}) = _PBTRF_NBS_F32()
     @inline _pbtrf_nb_small(::Type{Float64}) = _PBTRF_NBS_F64()
-    @inline _pbtrf_nb_small(::Type{ComplexF32}) = _PBTRF_NBS_C32()
-    @inline _pbtrf_nb_small(::Type{ComplexF64}) = _PBTRF_NBS_C64()
+    # req8-ok: measured-identical literals — 8 in 6/6 processes on BOTH boxes (2026-08-19). The REAL
+    # siblings are deliberately left on the duel: they are stable per box but INVERTED between them
+    # (F32 wm=16 gl=8, F64 wm=8 gl=16), which no formula over width or cache reproduces.
+    @inline _pbtrf_nb_small(::Type{ComplexF32}) = 8
+    @inline _pbtrf_nb_small(::Type{ComplexF64}) = 8
     @inline _pbtrf_nb_small(::Type{T}) where {T} = _vwidth(T)   # generic/AD eltypes never block
 else
     @inline _pbtrf_nb_small(::Type{<:Any}) = _PBTRF_NBS_PREF::Int    # pinned (trim builds land here)
@@ -289,11 +292,13 @@ const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
     const _PBTRF_CROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(Float32))
     const _PBTRF_CROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(Float64))
     const _PBTRF_CROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(ComplexF32))
-    const _PBTRF_CROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(ComplexF64))
     @inline _pbtrf_cross(::Type{Float32}) = _PBTRF_CROSS_F32()
     @inline _pbtrf_cross(::Type{Float64}) = _PBTRF_CROSS_F64()
     @inline _pbtrf_cross(::Type{ComplexF32}) = _PBTRF_CROSS_C32()
-    @inline _pbtrf_cross(::Type{ComplexF64}) = _PBTRF_CROSS_C64()
+    # req8-ok: measured-identical literal — 16 in 6/6 processes on BOTH boxes (2026-08-19). F64 and
+    # C32 stay on the duel: both FLIP across processes (wm F64 32/32/32/32/24/32, gl F64 36/36/36/40/
+    # 36/40), so there is no incumbent to reproduce and picking one needs gate evidence.
+    @inline _pbtrf_cross(::Type{ComplexF64}) = 16
 else
     @inline _pbtrf_cross(::Type{<:BlasFloat}) = _PBTRF_CROSS_PREF::Int   # pinned (trim builds land here)
 end
