@@ -56,9 +56,10 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 # Zen3 never; the Derive-only version regressed Zen3 gemvT to 0.69 vs AOCL). The decision is a
 # OncePerProcess runtime benchmark, so it is not trim-safe; pin it to compile the measure branch out.
 # `false` = always blocked = the conservative arm that is correct on every box measured so far.
-# And `zaxpy_narrow`: the complex-axpy width decision is a Measure-tier OncePerProcess benchmark, so it
-# allocates a probe buffer and is not trim-safe. `true` = the narrow arm, measured best on Zen4 and the
-# arm that closes the zaxpy gate cells; a trim build for a true-512-bit datapath should re-pin it.
+# (`zaxpy_narrow` was pinned here too, to `true`, with the note "a trim build for a true-512-bit
+# datapath should re-pin it". Converted to a derivation on 2026-08-19 — `_datapath_bytes(hw) <= 32`,
+# which IS that re-pin, computed instead of remembered — and the pin removed, because it would have
+# forced `true` on exactly the native-512 build the note was warning about.)
 # (The two REAL-axpy shape knobs, `axpy_unroll` and `axpy_dram`, USED to be pinned here. Both were
 # converted to compile-time derivations on 2026-08-19 and their pins removed: a pin overrides the
 # derivation, and the `axpy_dram` pin of 4 was overriding it with the arm measured 17% SLOWER on a
@@ -92,7 +93,6 @@ const _prev_gbnb = load_preference(PUREBLAS_UUID, "gbtrf_nb")
 const _prev_cgnb = load_preference(PUREBLAS_UUID, "cgemvn_nc_big")
 const _prev_pud = load_preference(PUREBLAS_UUID, "potrf_upper_direct_max")
 const _prev_sycm = load_preference(PUREBLAS_UUID, "sytrf_cmult")
-const _prev_zaxn = load_preference(PUREBLAS_UUID, "zaxpy_narrow")
 const _prev_gvtp = load_preference(PUREBLAS_UUID, "gemvt_perscan")
 const _prev_gvtd = load_preference(PUREBLAS_UUID, "gemvt_deep")
 const _prev_gvu = load_preference(PUREBLAS_UUID, "gemvt_u")
@@ -106,7 +106,6 @@ set_preferences!(PUREBLAS_UUID, "gemvt_u" => 1; force = true)           # gemv-T
 set_preferences!(PUREBLAS_UUID, "gemvt_pf" => 0; force = true)          # gemv-T A-stream prefetch distance (Measure tier)
 set_preferences!(PUREBLAS_UUID, "trmv_fused_min" => 1; force = true)    # trmv unblocked->fused8 crossover (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gemvn_minner" => false; force = true)  # gemv-N m-inner panel route (Measure tier)
-set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => true; force = true)    # complex-axpy width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "sytrf_cmult" => 2; force = true)       # complex BK block multiplier (Measure tier)
 set_preferences!(PUREBLAS_UUID, "potrf_upper_direct_max" => 12; force = true)  # tiny-upper potrf cutoff (Measure tier)
 set_preferences!(PUREBLAS_UUID, "cgemvn_nc_big" => 8; force = true)      # complex gemvN large-A panel (Measure tier)
@@ -155,11 +154,6 @@ finally
         delete_preferences!(PUREBLAS_UUID, "gemvn_minner"; force = true)
     else
         set_preferences!(PUREBLAS_UUID, "gemvn_minner" => _prev_gvnm; force = true)
-    end
-    if _prev_zaxn === nothing
-        delete_preferences!(PUREBLAS_UUID, "zaxpy_narrow"; force = true)
-    else
-        set_preferences!(PUREBLAS_UUID, "zaxpy_narrow" => _prev_zaxn; force = true)
     end
     if _prev_sycm === nothing
         delete_preferences!(PUREBLAS_UUID, "sytrf_cmult"; force = true)

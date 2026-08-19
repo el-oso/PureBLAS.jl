@@ -508,34 +508,29 @@ end
     end
 end
 
-# Is the past-L2 variant actually faster HERE? PDM **Measure** tier: it is a datapath property (Zen4
+# Is the past-L2 variant actually faster HERE? PDM **DERIVE** tier as of 2026-08-19 — `_at_zaxpy_narrow`
+# (cpuinfo.jl) = `_datapath_bytes(hw) <= 32`, with the measured fleet table there. The WINDOW is
+# likewise Derived: one stream leaving L2.
+#
+# THIS COMMENT USED TO SAY "Measure tier ... which no formula over the detected consts predicts — the
+# req#8b tell", and then named the mechanism in the same breath: "it is a datapath property (Zen4
 # double-pumps 512-bit ops over a 256-bit path, so the wide vector buys no bandwidth on a memory-bound
-# kernel; a true 512-bit datapath can flip the sign), which no formula over the detected consts predicts
-# — the req#8b tell. The WINDOW, by contrast, is Derived: one stream leaving L2.
+# kernel; a true 512-bit datapath can flip the sign)". That mechanism IS a formula over detected
+# consts — `_datapath_bytes` folds the double-pump fact in and already existed. The tell was misread:
+# not-predictable-from-simd-width is not the same as not-predictable-from-any-const. Same misreading
+# retired the real-axpy pair the same day.
+#
+# The naive guess `_double_pumped` is WRONG here and the measurement says so: it would give Zen3 the
+# wide arm, and Zen3 resolves narrow in 6 of 6 fresh processes. Only the datapath WIDTH separates the
+# three microarchitectures correctly. Zen5 is the one arm the formula changes and is UNMEASURED.
 @inline _zaxpy_narrow_lanes(::Type{T}) where {T} = 32 ÷ sizeof(T)      # 256 bits
 const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
 @static if isnothing(_ZAXPY_NARROW_PREF)
-    function _measure_zaxpy_narrow()::Bool                 # straight-line, no closures, TOTAL
-        Base.generating_output() && return false           # never burn a measure during precompile
-        _f = _force_knob("zaxpy_narrow"); _f >= 0 && return _f != 0  # instrument only, see _force_knob
-        try
-            nn = _zaxpy_narrow_lanes(Float64); nw = 2 * _vwidth(Float64)
-            nn == nw && return false
-            n = max(4096, 3 * _L2_BYTES ÷ sizeof(ComplexF64))   # inside the window: stream > L2
-            x = fill(ComplexF64(1.0, 0.5), n); y = fill(ComplexF64(0.25, -0.75), n)
-            # MEDIAN of interleaved rounds (`_tune_ab`, cpuinfo.jl) — was min-of-3, which is optimistic
-            # and tail-blind and is the estimator that ranked an iamax unroll backwards.
-            tn, tw = _tune_ab(
-                () -> _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(Float64)), n, 1.0e-9, 0.0, x, y),
-                () -> _axpy_cmplx_wide!(n, 1.0e-9, 0.0, x, y)
-            )
-            return tn < tw
-        catch
-            return false
-        end
-    end
-    const _ZAXPY_NARROW_ONCE = Base.OncePerProcess{Bool}(_measure_zaxpy_narrow)
-    @inline _zaxpy_narrow() = _ZAXPY_NARROW_ONCE()
+    # Seeded with the derived value; `PUREBLAS_FORCE_zaxpy_narrow` may override it in `__init__`
+    # (`_init_force_knobs!`, level2.jl). Ref rather than const so that hook survives the conversion —
+    # a Derive-tier knob with no override costs a source edit + commit + fleet_sync to A/B, measured.
+    const _ZAXPY_NARROW_REF = Ref{Bool}(_at_zaxpy_narrow(_HW))
+    @inline _zaxpy_narrow() = _ZAXPY_NARROW_REF[]
 else
     @inline _zaxpy_narrow() = _ZAXPY_NARROW_PREF::Bool
 end
