@@ -74,6 +74,7 @@ include("cabi/cabi_lapack2.jl")  # Mode 1: LAPACK batch 2 (gesv/posv/lacpy/larfg
 include("cabi/cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/ggsvd-complex to follow)
 include("cabi/cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
+include("tune.jl")          # per-machine tuning status + tune!() (spawns bench/calibrate.jl; NO benchmark here)
 
 # ── Precompile workload ────────────────────────────────────────────────────────────────────────────
 # Run the hot native kernels once at precompile time so their native code is cached in the .ji — first-call

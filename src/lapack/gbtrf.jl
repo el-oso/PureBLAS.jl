@@ -75,50 +75,13 @@ end
 # adapts to a box we have never measured.
 const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
 @static if isnothing(_GBTRF_CROSS_PREF)
-    function _measure_gbtrf_cross(::Type{T})::Int where {T}
-        Base.generating_output() && return 32          # conservative: unblocked wins on Zen3 at 16
-        try
-            for kl in (8, 16, 24, 32, 48)
-                ku = kl
-                nloc = 16 * kl
-                nb = _gbtrf_nb(T, kl)
-                nb > kl && continue
-                ldab = 2 * kl + ku + 1
-                ABm = Matrix{T}(undef, ldab, nloc)
-                ipv = Vector{Int}(undef, nloc)
-                refill! = () -> begin
-                    fill!(ABm, one(T))
-                    @inbounds for j in 1:nloc
-                        ABm[kl + ku + 1, j] = T(4 * (kl + ku))
-                    end
-                end
-                refill!(); _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)   # warmups
-                refill!(); _gbtf2!(kl, ku, nloc, ABm, ipv)
-                tbs = Vector{UInt64}(undef, 5); tus = Vector{UInt64}(undef, 5)
-                for r in 1:5                            # interleaved, MEDIAN-of-5 (was min-of-3)
-                    refill!(); s = time_ns()
-                    _gbtrf_blocked!(kl, ku, nloc, ABm, ipv, nb)
-                    tbs[r] = time_ns() - s
-                    refill!(); s = time_ns()
-                    _gbtf2!(kl, ku, nloc, ABm, ipv)
-                    tus[r] = time_ns() - s
-                end
-                sort!(tbs); sort!(tus); tb = tbs[3]; tu = tus[3]
-                tb < tu && return kl                    # smallest width where blocking wins
-            end
-            return 64                                   # blocking never won on the narrow candidates
-        catch
-            return 32
-        end
-    end
-    const _GBTRF_CROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_gbtrf_cross(ComplexF32))
     # Width-derived; see `_at_gbtrf_cross` (cpuinfo.jl) for the three-box table. Each box keeps its
     # OWN measured crossover, which is what avoids the failure this file documents above — shipping
     # a single one-box value took Zen3's gbtrf row from PASS (1.43/1.18) to FAIL (1.32/0.91).
     @inline _gbtrf_cross(::Type{Float64}) = _at_gbtrf_cross(_HW, Float64)
     @inline _gbtrf_cross(::Type{Float32}) = _at_gbtrf_cross(_HW, Float32)
     @inline _gbtrf_cross(::Type{ComplexF64}) = _at_gbtrf_cross(_HW, ComplexF64)
-    @inline _gbtrf_cross(::Type{ComplexF32}) = _GBTRF_CROSS_C32()
+    @inline _gbtrf_cross(::Type{ComplexF32}) = _at_gbtrf_cross(_HW, ComplexF32)
     @inline _gbtrf_cross(::Type{T}) where {T} = 32
 else
     @inline _gbtrf_cross(::Type{T}) where {T} = _GBTRF_CROSS_PREF::Int   # pinned (trim lands here)
