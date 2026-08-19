@@ -66,6 +66,29 @@
     # ── Real-axpy DRAM arm (replaced a OncePerProcess duel, 2026-08-19) ───────────────────────────────
     # Only the double-pumped part takes the narrow 256-bit phase arm; native-256 and native-512 both take
     # the interleaved arm. Measured Zen4/Zen3 (17% / 4%); Zen5 + Intel are predictions.
+    # ── Banded-Cholesky width split (2026-08-19): reproduces 6/6 processes on all THREE boxes ────────
+    # Zen4(Zen4) and Zen5(Zen5) agree on every row and Zen3(Zen3) differs on every one —
+    # what the first two share is simd=64, and `_double_pumped` SEPARATES them, so the criterion is
+    # vector width, not microarchitecture.
+    @test P._at_pbtrf_nb(Zen4, Float32) == 8
+    @test P._at_pbtrf_nb(Zen5, Float32) == 8
+    @test P._at_pbtrf_nb(Zen3, Float32) == 16
+    @test P._at_pbtrf_nb(Zen4, ComplexF32) == 32 && P._at_pbtrf_nb(Zen5, ComplexF32) == 32
+    @test P._at_pbtrf_nb(Zen3, ComplexF32) == 24
+    @test P._at_pbtrf_nb(Zen4, ComplexF64) == 32 && P._at_pbtrf_nb(Zen5, ComplexF64) == 32
+    @test P._at_pbtrf_nb(Zen3, ComplexF64) == 24
+    # F32 small-panel is a FORMULA (one vector of lanes), not a table — it must track _lanes exactly.
+    @test P._at_pbtrf_nbs(Zen4, Float32) == 16 == P._lanes(Zen4, Float32)
+    @test P._at_pbtrf_nbs(Zen5, Float32) == 16
+    @test P._at_pbtrf_nbs(Zen3, Float32) == 8 == P._lanes(Zen3, Float32)
+    @test P._at_pbtrf_nbs(Zen4, Float64) == 8 && P._at_pbtrf_nbs(Zen5, Float64) == 8
+    @test P._at_pbtrf_nbs(Zen3, Float64) == 16
+    # ucross is a FORMULA over L2, and it separates the fleet correctly for a different reason than
+    # width does: Zen4 and Zen5 share a 1 MiB L2, Zen3 has 512 KiB.
+    @test P._at_pbtrf_ucross(Zen4) == 256 && P._at_pbtrf_ucross(Zen5) == 256
+    @test P._at_pbtrf_ucross(Zen3) == 128
+    @test P._at_pbtrf_ucross(tigerlake) == 1280 * 1024 ÷ 4096   # out-of-fleet: scales, no crash
+
     @test P._at_axpy_dram(Zen4) == 208
     @test P._at_axpy_dram(Zen3) == 4
     @test P._at_axpy_dram(Zen5) == 4
