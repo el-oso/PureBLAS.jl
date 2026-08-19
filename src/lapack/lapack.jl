@@ -389,59 +389,21 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
     # elements per SIMD vector for this element type (complex packs two reals per element)
     @inline _potrf_udirect_ew(::Type{T}) where {T} =
         max(1, _vwidth(real(T)) ÷ (T <: Complex ? 2 : 1))
-    function _measure_potrf_udirect(::Type{T})::Int where {T}
-        Base.generating_output() && return 0          # never measure during precompilation
-        step = max(1, _potrf_udirect_ew(T) ÷ 2)       # sub-vector granularity — see the note above
-        first = cld(6, step) * step                   # cost-model floor n ≈ 6, on a ladder point
-        try
-            prev = 0
-            for n in first:step:_POTRF_BASE
-                A0 = Matrix{T}(undef, n, n)
-                refill! = () -> begin                 # diagonally-dominant HPD, upper triangle read
-                    fill!(A0, T(0.25))
-                    @inbounds for j in 1:n
-                        A0[j, j] = T(2 * n + 2)       # diag > Σ|offdiag| ⇒ HPD, no pivot failure
-                    end
-                end
-                # Called DIRECTLY, never through `_potrf_gen!` — that consults this very
-                # OncePerProcess and would re-enter its own initializer.
-                lever! = T <: BlasComplex ? _potrf_upper_lever_cmplx! : _potrf_upper_lever_real!
-                refill!(); _potrf_upper!(A0, n, _POTRF_BASE)        # untimed warmups (absorb JIT)
-                refill!(); lever!(A0, n)
-                # ⚠ EACH LADDER STEP IS A DUEL, not a bare `<` on two medians. A cutoff search is the
-                # WORST place for a coin-flip comparison: it stops at the first step the lever wins, so
-                # ONE noisy step truncates the whole search and the returned cutoff is wrong for every
-                # size above it. Measured 2026-08-07, one knob per fresh process: ComplexF64 resolved
-                # 20 / 16 / 18 / 12 — four different cutoffs from one binary, which is exactly what a
-                # per-step `<` produces on a shallow crossover.
-                # Orientation: `direct` is the CANDIDATE that must keep proving itself to continue the
-                # walk, so the δ regret bound biases toward exiting EARLY. That is the safe direction
-                # here and the pin comment in juliac/build.jl says why — being early costs only the
-                # tiny-n win, being late regresses n=16+.
-                dir!() = (refill!(); _potrf_upper!(A0, n, _POTRF_BASE))
-                lev!() = (refill!(); lever!(A0, n))
-                # ONE STRIKE, and two was measured WORSE. Requiring two consecutive non-wins
-                # before stopping sounded right for a shallow band, but it let the walk run PAST
-                # the crossover on a lucky step: ComplexF64 went from 18-with-an-occasional-20 to
-                # 16/18/20 across ten fresh processes. Reverted — the per-step duel alone is the
-                # better rule, and the residual +/-1 ladder step is the band itself.
-                _tune_wins_it(_tune_duel(lev!, dir!)) || return prev
-                prev = n
-            end
-            return prev                               # direct won across the whole bracket
-        catch
-            return 0                                  # on any failure keep the lever (broader coverage)
-        end
-    end
-    const _POTRF_UDIRECT_F32 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(Float32))
-    const _POTRF_UDIRECT_F64 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(Float64))
-    const _POTRF_UDIRECT_C32 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(ComplexF32))
-    const _POTRF_UDIRECT_C64 = Base.OncePerProcess{Int}(() -> _measure_potrf_udirect(ComplexF64))
-    @inline _potrf_udirect(::Type{Float32}) = _POTRF_UDIRECT_F32()
-    @inline _potrf_udirect(::Type{Float64}) = _POTRF_UDIRECT_F64()
-    @inline _potrf_udirect(::Type{ComplexF32}) = _POTRF_UDIRECT_C32()
-    @inline _potrf_udirect(::Type{ComplexF64}) = _POTRF_UDIRECT_C64()
-    @inline _potrf_udirect(::Type{<:Any}) = 0         # generic/AD eltypes never take the lever anyway
+    # DUEL DELETED 2026-08-19. This knob's own comments already confessed it: "20 / 16 / 18 / 12 —
+    # four different cutoffs from one binary", and ComplexF64 "16/18/20 across ten fresh processes".
+    # Re-measured 6 fresh processes per box: galen resolves 12 for F32/F64/C32 and 10/11/11/8/11/12 for
+    # C64; wintermute 24 (F32), 12/20/12/12/12/12 (F64), 20 (C32), 10/12/12/12/12/10 (C64).
+    #
+    # 12 is the default for three converging reasons, not one:
+    #   1. It is the DOCUMENTED SAFE DIRECTION. The comment above states the δ regret bound biases the
+    #      walk to exit early because "being early costs only the tiny-n win, being late regresses
+    #      n=16+". A fixed 12 is early by construction.
+    #   2. It is what juliac/build.jl has PINNED into the .so all along, so this makes the JIT path and
+    #      the shipped binary agree instead of diverging per process.
+    #   3. It is what galen already resolves for three of four eltypes.
+    # The cost is bounded and one-sided: on wintermute F32/C32 (which resolved 24/20) the tiny-n direct
+    # win is given up for n in 12..24. Pin `potrf_upper_direct_max` to recover it on a specific box.
+    @inline _potrf_udirect(::Type{<:Any}) = 12   # req8-ok: documented-conservative cutoff, table above
 else
     @inline _potrf_udirect(::Type{<:Any}) = _POTRF_UDIRECT_PREF::Int   # pinned (trim builds land here)
 end
