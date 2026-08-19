@@ -263,6 +263,33 @@ const _GEMM_SPLIT_S = 2
 @inline _at_pbtrf_nbs(hw, ::Type{Float64}) = _wide_simd(hw) ? 8 : 16
 # Likewise a formula: the native-upper kernel wins once the band no longer fits this L2 fraction.
 @inline _at_pbtrf_ucross(hw) = hw.l2 ÷ 4096
+# (c7) Banded-LU / banded-Cholesky crossovers and the bidiagonalisation panel — same vector-width
+# criterion as (c6), same three-box evidence. Rows marked MODAL had one box flip; its 5-of-6 value is
+# used and named, so nobody has to re-derive where the number came from.
+#          knob                  wm(Zen4)  neuro(Zen5)  galen(Zen3)
+#   gbtrf_cross  F32               48         48          64
+#   gbtrf_cross  F64               32         32          64  MODAL (64,64,48,64,64,64)
+#   gbtrf_cross  C64                8          8          16
+#   pbtrf_cross  F32               32         32          40  MODAL (40,40,32,40,40,40)
+#   pbtrf_cross  C32               24 MODAL   24          16      (24,24,24,24,24,16)
+#   pbtrf_ucross F64              256        256         192  MODAL (192x4, 256, 192)
+#   brd_nb                          4          4           8      (= exactly 32 ÷ _lanes(hw, Float64))
+# NOT converted, deliberately: gbtrf_cross C32 is a true 3-3 TIE on wintermute (16,16,8,16,8,8) — not a
+# modal; pbtrf_cross F64 flips on ALL THREE boxes; pbtrf_ucross C64 flips on two. Those need the
+# offline tuner, not a scan.
+@inline _at_gbtrf_cross(hw, ::Type{Float32}) = _wide_simd(hw) ? 48 : 64
+@inline _at_gbtrf_cross(hw, ::Type{Float64}) = _wide_simd(hw) ? 32 : 64
+@inline _at_gbtrf_cross(hw, ::Type{ComplexF64}) = _wide_simd(hw) ? 8 : 16
+@inline _at_pbtrf_cross(hw, ::Type{Float32}) = _wide_simd(hw) ? 32 : 40
+@inline _at_pbtrf_cross(hw, ::Type{ComplexF32}) = _wide_simd(hw) ? 24 : 16
+# F64 does NOT follow the `l2 ÷ 4096` formula the F32/C32 siblings obey — galen measures 192 where the
+# formula says 128 — so it is an explicit table row, not folded in. Papering over that would make the
+# formula look more general than it is.
+@inline _at_pbtrf_ucross(hw, ::Type{Float64}) = _wide_simd(hw) ? 256 : 192
+# A real formula on all three boxes. CAVEAT kept from the campaign plan: this knob's optimum once MOVED
+# when an unrelated inlining bug was fixed, so it is sensitive to codegen, not only to hardware —
+# re-check it after any change to the gebrd panel path.
+@inline _at_brd_nb(hw) = 32 ÷ _lanes(hw, Float64)
 # (d) Complex-Cholesky tuning. cpotf2 base row-unroll: line-rate match — unroll until one step consumes a
 # 64B cache line at datapath width (native-512 → 1 op, MR=1; double-pump/AVX2 32B → MR=2). base/nbmax:
 # implementation crossovers (fleet-measured cache-independent, width-dominant) → affine in W (width-

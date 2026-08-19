@@ -553,8 +553,9 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
             return 16
         end
     end
-    const _BRD_NB_ONCE = Base.OncePerProcess{Int}(_measure_brd_nb)
-    @inline _brd_nb() = _BRD_NB_ONCE()
+    # Width-derived: 32 ÷ _lanes(hw, Float64) reproduces all three boxes (4 / 4 / 8), each stable in
+    # 6 of 6 fresh processes. See `_at_brd_nb` (cpuinfo.jl) for the caveat about codegen sensitivity.
+    @inline _brd_nb() = _at_brd_nb(_HW)
 else
     @inline _brd_nb() = _BRD_NB_PREF::Int
 end

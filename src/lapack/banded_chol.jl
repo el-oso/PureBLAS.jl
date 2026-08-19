@@ -286,12 +286,10 @@ const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
     end
     # Per-eltype OncePerProcess (complex kernels have 4× the flop density — a shared F64 crossover
     # would misplace them); lazy, so only eltypes actually used pay the one-shot ~10–100 ms tune.
-    const _PBTRF_CROSS_F32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(Float32))
     const _PBTRF_CROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(Float64))
-    const _PBTRF_CROSS_C32 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_cross(ComplexF32))
-    @inline _pbtrf_cross(::Type{Float32}) = _PBTRF_CROSS_F32()
+    @inline _pbtrf_cross(::Type{Float32}) = _at_pbtrf_cross(_HW, Float32)
     @inline _pbtrf_cross(::Type{Float64}) = _PBTRF_CROSS_F64()
-    @inline _pbtrf_cross(::Type{ComplexF32}) = _PBTRF_CROSS_C32()
+    @inline _pbtrf_cross(::Type{ComplexF32}) = _at_pbtrf_cross(_HW, ComplexF32)
     # req8-ok: measured-identical literal — 16 in 6/6 processes on BOTH boxes (2026-08-19). F64 and
     # C32 stay on the duel: both FLIP across processes (wm F64 32/32/32/32/24/32, gl F64 36/36/36/40/
     # 36/40), so there is no incumbent to reproduce and picking one needs gate evidence.
@@ -357,12 +355,11 @@ const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
             return typemax(Int)        # on any failure keep the older, more broadly-tested path
         end
     end
-    const _PBTRF_UCROSS_F64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(Float64))
     const _PBTRF_UCROSS_C64 = Base.OncePerProcess{Int}(() -> _measure_pbtrf_ucross(ComplexF64))
     # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
     # (192x4, 256, 192) and C64 flips on both wintermute (176/192/208) and neuromancer.
     @inline _pbtrf_ucross(::Type{Float32}) = _at_pbtrf_ucross(_HW)
-    @inline _pbtrf_ucross(::Type{Float64}) = _PBTRF_UCROSS_F64()
+    @inline _pbtrf_ucross(::Type{Float64}) = _at_pbtrf_ucross(_HW, Float64)
     @inline _pbtrf_ucross(::Type{ComplexF32}) = _at_pbtrf_ucross(_HW)
     @inline _pbtrf_ucross(::Type{ComplexF64}) = _PBTRF_UCROSS_C64()
 else

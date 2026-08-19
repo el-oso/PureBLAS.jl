@@ -89,6 +89,27 @@
     @test P._at_pbtrf_ucross(galen) == 128
     @test P._at_pbtrf_ucross(tigerlake) == 1280 * 1024 ÷ 4096   # out-of-fleet: scales, no crash
 
+    # ── Same width criterion, second batch. Rows marked MODAL had ONE box flip; the 5-of-6 value is
+    # used, and the assertion records which box was modal so the provenance is not lost.
+    @test P._at_gbtrf_cross(wintermute, Float32) == 48 && P._at_gbtrf_cross(neuromancer, Float32) == 48
+    @test P._at_gbtrf_cross(galen, Float32) == 64
+    @test P._at_gbtrf_cross(wintermute, Float64) == 32 && P._at_gbtrf_cross(neuromancer, Float64) == 32
+    @test P._at_gbtrf_cross(galen, Float64) == 64          # MODAL on galen (64,64,48,64,64,64)
+    @test P._at_gbtrf_cross(wintermute, ComplexF64) == 8 && P._at_gbtrf_cross(neuromancer, ComplexF64) == 8
+    @test P._at_gbtrf_cross(galen, ComplexF64) == 16
+    @test P._at_pbtrf_cross(wintermute, Float32) == 32 && P._at_pbtrf_cross(neuromancer, Float32) == 32
+    @test P._at_pbtrf_cross(galen, Float32) == 40          # MODAL on galen (40,40,32,40,40,40)
+    @test P._at_pbtrf_cross(wintermute, ComplexF32) == 24  # MODAL on wintermute (24x5, 16)
+    @test P._at_pbtrf_cross(neuromancer, ComplexF32) == 24 && P._at_pbtrf_cross(galen, ComplexF32) == 16
+    # F64 ucross does NOT obey the `l2 ÷ 4096` formula its F32/C32 siblings do — galen measures 192
+    # where that formula gives 128. Asserted as a table row so a future "unify these" edit fails here.
+    @test P._at_pbtrf_ucross(wintermute, Float64) == 256 && P._at_pbtrf_ucross(neuromancer, Float64) == 256
+    @test P._at_pbtrf_ucross(galen, Float64) == 192        # MODAL on galen (192x4, 256, 192)
+    @test P._at_pbtrf_ucross(galen, Float64) != P._at_pbtrf_ucross(galen)   # the two rules disagree
+    # brd_nb is a formula on all three boxes, each stable 6/6.
+    @test P._at_brd_nb(wintermute) == 4 && P._at_brd_nb(neuromancer) == 4
+    @test P._at_brd_nb(galen) == 8
+
     @test P._at_axpy_dram(wintermute) == 208
     @test P._at_axpy_dram(galen) == 4
     @test P._at_axpy_dram(neuromancer) == 4
