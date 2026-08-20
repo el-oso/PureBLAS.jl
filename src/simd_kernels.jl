@@ -187,6 +187,7 @@ const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
 # measured fleet table. The duel it replaces resolved the 17%-SLOWER arm on wintermute in 7 of 9
 # fresh processes and flipped in the other 2, so the shipped kernel was both wrong and per-process
 # non-deterministic. Validated offline against the fleet descriptors in test/autotune_tests.jl.
+# PDM: Derived — arm 208 is the narrow 256-bit phase kernel, correct exactly where 512-bit ops are double-pumped over a 256-bit datapath. Mechanism named, not a fleet fit: +17% on Zen4, LOSES on Zen3, and Zen5 (native 512, not double-pumped) measures 4. Falsifier: a non-double-pumped box preferring 208. | tune: n/a — Derived
 const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 @inline _axpy_dram() = (f = _fk("axpy_dram"); f >= 0 ? f : _AXPY_DRAM)
 

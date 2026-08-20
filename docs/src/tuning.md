@@ -225,6 +225,51 @@ common form for implementation crossovers that are cache-independent but width-d
 The table above is the *residue* after that migration, and each row states which kind of
 residue it is.
 
+!!! note "The full inventory lives in [the Knob Registry](knobs.md)"
+    Every `@load_preference` key in `src/` — 118 of them — with its owning routine, default, syntactic
+    tier and `# PDM:` justification. That page is **generated** from the source by
+    `test/knob_registry.jl` and byte-verified by the suite, so it cannot drift. §4 and §4b below are the
+    hand-written *analysis*: which exceptions exist and why they are defensible.
+
+## 4b. Predicate-keyed knobs — the justification register
+
+§4 catalogs knobs that are a **literal** where a formula was wanted. This section catalogs the other
+non-formula shape: a knob keyed on a **µarch predicate** (`_double_pumped`, `_wide_simd`,
+`_datapath_bytes`). `CLAUDE.md` 8b permits these *only* when the knob's physical criterion genuinely
+IS the fact the predicate encodes, argued in the comment, with a fleet table. A predicate used as a
+convenient two-way lookup is a violation.
+
+**Why this register has to exist, and has to be enforced.** A binary predicate over a THREE-box fleet
+is nearly unconstrained: there are only three non-trivial partitions of three points, and we use two
+of them. So "it reproduces the fleet" is very weak evidence — it is roughly one bit. What separates a
+derivation from a curve fit is therefore not the fit; it is (a) a named mechanism, and (b) a stated
+falsifier. Every row below must carry both, or say plainly that it does not.
+
+Enforced by `test/predicate_knob_lint.jl`: every `_at_*` whose body calls a µarch predicate must
+appear here. A new one fails the suite until it is justified. This exists because a wrong
+justification survived twelve days in `cpuinfo.jl` (c5) — the comment asserted "no mechanism could be
+found", was then replaced by a `_wide_simd` mechanism that was **falsified by measurement before it
+shipped**, and nothing but a human reading it would have caught either state.
+
+| Knob | Predicate | Mechanism argued? | Falsifier — what would kill it | Grade |
+|---|---|---|---|---|
+| `_at_zaxpy_narrow` | `_datapath_bytes(hw) <= 32` | **Yes, and the criterion IS the predicate.** The knob chooses a narrow vs wide complex-axpy kernel; the physical question is literally how many bytes the datapath retires per cycle. | A box whose datapath is ≤32 B and wants the wide arm (or vice versa). Zen4 double-pumps 512-bit over a 256-bit path and measured narrow 6/6 — that is the case that made this a datapath question and not a width question. | **Sound** — predicate = criterion |
+| `_at_gemm_split_ok` | `nvreg >= 32 && simd >= 64` | **Yes** — an ISA *capability* test, not a tuning split: the split-reduction tile needs that many architectural registers to hold its accumulators. | A 32-register AVX-512 box where the split loses. Note this is a **feasibility** predicate; unlike the rest of the table it is not choosing between two viable arms. | **Sound** — capability, not tuning |
+| `_at_gemvt_perscan` | `_double_pumped(hw) ? 1 : 0` | **No, and it says so.** Labelled a keyed literal. A `_wide_simd` mechanism (loads per cache line) was written and falsified: it gives Zen5 mode 1, which loses ~10% at n=1024. | Already falsified once. The live falsifier: Zen4 and Zen5 differ ONLY in L1 (32 vs 48 KiB) yet cross over at x = 8 KiB and 4 KiB respectively — the **larger** L1 crosses **earlier**, anti-correlated with the only differing const, so no capacity rule fits. ⚠ UNTESTED: galen shares wintermute's 32 KiB L1; if it crosses where wintermute crosses, an L1 rule is back in play. That measurement is task #160 and has NOT been made. | **Honest** — declared non-derived, one open test |
+| `_at_axpy_dram`, `_at_axpy_band` | `_double_pumped(hw) ? 208 : 4` | **Yes** — arm 208 is the narrow 256-bit phase kernel, correct exactly where 512-bit ops are double-pumped over a 256-bit path. Measured +17% Zen4, loses on Zen3. | A native-512 box (not double-pumped) preferring arm 208, or a double-pumped box preferring 4. Zen5 is the live check and measures 4. | **Sound** — mechanism named |
+| `_at_pbtrf_nb` (F32/CF32/CF64), `_at_pbtrf_nbs` (F64), `_at_pbtrf_cross` (×4), `_at_gbtrf_cross` (×3), `_at_pbtrf_ucross` (F64) | `_wide_simd(hw) ? a : b` | **NOT ARGUED.** These say "the fleet splits by vector width" and give the table. That is a fit, not a mechanism — and per the note above, a 3-box fit is ~1 bit of evidence. | **No falsifier stated.** These are the weakest rows in the register and should be treated as *provisional*: a fourth µarch is as likely to break them as to confirm them. Panel widths plausibly SHOULD derive from residency (`kd`, `nb`, and the element size are all known) — nobody has tried. | **Weak** — fit, not derivation |
+
+**Reading the grades.** *Sound* = the predicate encodes the physical criterion and a falsifier is
+named. *Honest* = not a derivation, declared as such, with the failed attempts recorded so they are
+not retried. *Weak* = fits the fleet, no mechanism, no falsifier — acknowledged debt in the same
+sense as §4's validated literals, and the first thing to revisit when a fourth µarch appears.
+
+**When a knob is genuinely un-derivable**, that is not the end of the ladder — it is the entry
+condition for Measure, and (since the 2026-08 campaign) Measure means an offline `tune!()` pin, not a
+runtime duel. The bar for declaring it: name the physical quantity the optimum depends on, show it is
+NOT among the detected consts, and show the optimum inverts across boxes that agree on those consts.
+`_ger_np` (§5) is the worked example.
+
 ## 5. The Measure tier: `_ger_np` walkthrough
 
 When the D-vs-M question answers "No", the pattern to copy is `_ger_np` in

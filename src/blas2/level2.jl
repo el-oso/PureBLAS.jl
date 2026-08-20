@@ -789,6 +789,7 @@ end
 # _GEMVT_NC_CANDIDATES, the Val ladder and PUREBLAS_FORCE_gemvt_nc are retained above — forcing an arm
 # through bench/plots.jl is how the measured tables in this file were produced and how the next
 # attempt must be measured.
+# PDM: Derived-falsified — the project's own latency x throughput criterion (_ILP_TARGET) predicts EIGHT chains; every fleet box measures 4 best, monotonically worse at 8 and 16. A derivation that predicts the wrong answer is falsified, so the literal 4 ships with its table. Re-open only via the NC x U pair (AOCL runs NC=8 x U=4), which the 2026-08-20 grid found ties in the DRAM regime. | tune: not a tune!() candidate — measured µarch-INVARIANT (4 on all three boxes)
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 const _GEMVT_NC = something(_GEMVT_NC_PREF, 4)::Int   # req8-ok: falsified-derivation literal, see table above
 # ⚠ THE HOOK ABOVE WAS DEAD UNTIL 2026-08-20. The comment promised `PUREBLAS_FORCE_gemvt_nc` reached
@@ -837,6 +838,7 @@ end
 # both. A deficit that survives swapping the whole kernel is not IN the kernel choice, so no routing
 # change can close it. (Zen4 mode 2 was not run: its contention guard refused twice, and with mode 2
 # dead 13/14 on the other two boxes the arm did not deserve a third slot.)
+# PDM: Measured — Zen4 and Zen5 differ ONLY in L1 (32 vs 48 KiB) yet cross over at x = 8 vs 4 KiB: the LARGER L1 crosses EARLIER, anti-correlated with the only differing const, so no capacity rule fits. A `_wide_simd` derivation was written and falsified before shipping. OPEN: galen shares wintermute's 32 KiB L1 and its per-size crossover is unmeasured (task #160) — if it matches wintermute's, an L1 rule returns. | tune: not implemented; 3 modes x 4 sizes, est. ~2 min (needs a per-SIZE route pin, which the 3-valued mode knob cannot express)
 const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
@@ -1815,6 +1817,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # selecting a fallback from it.
 # RUN `PureBLAS.tune!()` to replace this with your machine's actual optimum (recovers 8 on Zen4, 4 on
 # Zen3). The default only has to be non-catastrophic until then.
+# PDM: Measured — optimum is 8/4/1 on Zen4/Zen3/Zen5; Zen4 and Zen3 agree on L2, L3, SIMD width and register count, so no formula over detected consts separates them. Depends on DRAM write-stream count, which is not a detected const. | tune: ~22 s measured (4 candidate arms x 8 rounds at n=2048, DRAM regime)
 const _GER_NP = something(@load_preference("ger_panel_np", nothing), 1)::Int   # req8-ok: minimax, table above
 @inline _ger_np() = (f = _fk("ger_panel_np"); f >= 0 ? f : _GER_NP)
 
