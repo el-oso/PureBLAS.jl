@@ -1,25 +1,32 @@
-# Per-box AUTOTUNE of PureBLAS parameters that a hardware feature-bit can't derive (memory-latency-class
-# things like the ger DRAM prefetch distance). Measures on THIS machine and writes the winners into the
-# active project's LocalPreferences.toml, which @load_preference then bakes into consts (and a per-µarch
-# frozen .so carries them). This is Option "A": the trim-safe half of the A+C hybrid — the SAME winners a
-# future load-time auto-calibration (Mode-2 only) would pick, just written once by hand here.
+# Per-machine AUTOTUNE. Measures the knobs that are NOT derivable from detected hardware and writes the
+# winners as Preferences pins. Run it once per machine; `PureBLAS.tune!()` drives it.
 #
-# RUN IT ON THE LOCKED BOX (after `sudo bench/fleet_freqlock.sh lock`) so the measurement is at the stable
-# clock — a boosting/throttling clock gives a wrong winner. `verify` first that the box is ✅ locked.
+#   julia --project=bench bench/calibrate.jl                 # measure + WRITE the preferences
+#   julia --project=bench bench/calibrate.jl dryrun          # measure + PRINT only
+#   julia --project=bench bench/calibrate.jl emit=/tmp/x.toml  # measure, write RESULT ONLY to that file
 #
-#   taskset -c <core> julia --project=bench bench/calibrate.jl          # measure + WRITE the preferences
-#   taskset -c <core> julia --project=bench bench/calibrate.jl dryrun   # measure + PRINT only (no write)
+# `emit=` exists so tune!() can run this in several INDEPENDENT PROCESSES and pin only what they agree
+# on. That is not belt-and-braces: the retired OncePerProcess tier failed precisely because a per-process
+# draw (page placement, allocator state) can change the winner, and one knob picked a 17%-slower arm in
+# 7 of 9 processes. More reps inside one process cannot see that; separate processes can.
 #
-# The parameters are swept as RUNTIME kernel args (no recompile per candidate) — that's why this is fast.
+# WHY THIS EXISTS AT ALL. `ger_panel_np` is measured 8 / 4 / 1 on Zen4 / Zen3 / Zen5 — and the first two
+# of those boxes share L2, L3, SIMD width and register count. No formula reproduces it. Shipping a single
+# default cost Zen5 29.5% against its own optimum and turned a gate PASS into a FAIL. This knob wants a
+# pin, and the shipped default (minimax `np=1`) only has to be non-catastrophic until one exists.
 
-using PureBLAS, LinearAlgebra, Printf, Chairmarks, Statistics, TOML
+using PureBLAS, LinearAlgebra, Printf, Statistics, TOML
 import PureBLAS: _ger_panel!, _vwidth, _L3_BYTES
+include(joinpath(@__DIR__, "measure.jl"))        # Measure.ab — the sanctioned Chairmarks harness
+include(joinpath(@__DIR__, "tune_harness.jl"))   # stabilise! / with_anchor / contention / decide
 BLAS.set_num_threads(1)
-const DRYRUN = "dryrun" in ARGS
 
-# ── ger DRAM path with an EXPLICIT stream count NP (the thing we're tuning): the m-inner panel over NP
-# concurrent wide-SIMD A-column RMW streams, prefetch off. The optimal NP is an intrinsic per-core property
-# (measured opposite-sign across µarchs — Zen5→1, Zen3→4, Zen4→8), so it must be measured, not derived.
+const DRYRUN = "dryrun" in ARGS
+const EMIT = let i = findfirst(a -> startswith(a, "emit="), ARGS)
+    isnothing(i) ? nothing : ARGS[i][6:end]
+end
+
+# ── ger DRAM path with an EXPLICIT stream count NP ──────────────────────────────────────────────────
 @noinline function _ger_np!(A::Matrix{T}, x, y, ::Val{NP}) where {T, NP}
     m, n = size(A)
     GC.@preserve A x y begin
@@ -33,52 +40,73 @@ const DRYRUN = "dryrun" in ARGS
     end
     return A
 end
-runnp(A, x, y, NP::Int) = NP == 1 ? _ger_np!(A, x, y, Val(1)) : NP == 2 ? _ger_np!(A, x, y, Val(2)) :
-    NP == 4 ? _ger_np!(A, x, y, Val(4)) : _ger_np!(A, x, y, Val(8))
+runnp(c, NP::Int) = NP == 1 ? _ger_np!(c..., Val(1)) : NP == 2 ? _ger_np!(c..., Val(2)) :
+    NP == 4 ? _ger_np!(c..., Val(4)) : _ger_np!(c..., Val(8))
 
-# Winner = the NP that MINIMIZES PB time (OB fixed ⇒ min PB-time = max PB/OB gate ratio). Swept only at the
-# DRAM sizes (A > L3) — the regime the panel serves; cache-resident ger stays on the per-column path.
+"""Winner for `ger_panel_np`, or `nothing` if the candidates are indistinguishable here."""
 function calibrate_ger_np(::Type{T} = Float64) where {T}
-    W = _vwidth(T); cand = [1, 2, 4, 8]
-    n0 = ceil(Int, sqrt(_L3_BYTES / sizeof(T))); sizes = (max(2048, n0 + (W - n0 % W) % W), 4096)
-    probs = [(randn(T, n, n), randn(T, n), randn(T, n), n) for n in sizes]
-    @printf("calibrate ger stream-count NP (%s, sizes %s, DRAM > %.0f MB):\n", T, sizes, _L3_BYTES / 2^20)
-    # MEDIAN, not `minimum`. This file reduced with `minimum(@be …).time` until 2026-08-06, in direct
-    # violation of the project's estimator rule (median never min — `min` is optimistic AND tail-blind,
-    # and a silent min once ranked an iamax unroll backwards at the cost of a day). It survived because
-    # `test/estimator_lint.jl` anchors its patterns on `.samples` / `s.time` / `ts|times|timings`, and
-    # `minimum(@be …).time` matches none of them — a blind spot now closed in the lint itself.
-    # It matters here more than almost anywhere: this file WRITES Preferences pins, so a mis-ranked
-    # candidate does not just mislead a reader, it ships.
-    _med(b) = median(Float64[s.time for s in b.samples])
-    scores = zeros(length(cand))
-    for (ci, NP) in pairs(cand)
-        for (A, x, y, n) in probs
-            scores[ci] += _med(@be runnp(A, x, y, NP) seconds = 0.4) / n^2
-        end
-        @printf("  NP = %d  →  %.3e\n", NP, scores[ci])
+    W = _vwidth(T)
+    n0 = ceil(Int, sqrt(_L3_BYTES / sizeof(T)))
+    n = max(2048, n0 + (W - n0 % W) % W)          # DRAM regime (A > L3) — the one the panel serves
+    setup() = (randn(T, n, n), randn(T, n), randn(T, n))
+    # Arm 1 is the INCUMBENT (the shipped default); `decide` only displaces it on a resolvable win.
+    inc = PureBLAS._ger_np()
+    cands = filter(!=(inc), [1, 2, 4, 8])
+    arms = vcat([inc => (c -> runnp(c, inc))], [np => (c -> runnp(c, np)) for np in cands])
+    @printf("  ger_panel_np @ n=%d (A = %.0f MB, DRAM): incumbent %d, candidates %s\n",
+            n, n^2 * sizeof(T) / 2^20, inc, cands)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    for r in res
+        @printf("    np=%-2d  %.4f  [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    best = cand[argmin(scores)]
-    @printf("  ⇒ BEST ger_panel_np = %d\n", best)
-    return best
+    if !ok
+        @printf("    ⇒ REFUSED: machine state moved %.1f%% across the measurement — not adjudicable\n",
+                100 * drift)
+        return nothing
+    end
+    name, verdict = decide(res; delta = 0.02)
+    if verdict === :tie
+        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+        return nothing
+    end
+    @printf("    ⇒ WINNER np=%d\n", name)
+    return name
 end
 
-# ── run every calibration, collect (key => value), write once ──────────────────────────────────────────
-prefs = Pair{String, Any}[]
-push!(prefs, "ger_panel_np" => calibrate_ger_np())
-# (add further runtime-swept params here as they arrive — same pattern)
+# ── driver ──────────────────────────────────────────────────────────────────────────────────────────
+la, busy = contention()
+if busy
+    @warn "machine is busy (1-min load $la) — a knob decided against someone else's workload is decided " *
+          "wrong. Re-run on an idle machine."
+    exit(3)
+end
+println("stabilising (burning the boost window so the ramp does not bias the first candidate)…")
+anchor, khz, steady = stabilise!()
+@printf("  anchor=%.3fus  clock=%.0fMHz  steady=%s\n", anchor * 1e6, khz / 1000, steady)
+steady || @warn "did not reach steady state; results may be biased by a moving clock"
 
-const LP = joinpath(dirname(Base.active_project()), "LocalPreferences.toml")   # active project (bench/) is where @load_preference reads
-if DRYRUN
-    println("\n[dryrun] would write to $LP under [PureBLAS]:")
+prefs = Pair{String, Any}[]
+w = calibrate_ger_np()
+isnothing(w) || push!(prefs, "ger_panel_np" => w)
+# (further knobs append here — same shape: measure, decide, push only on a resolvable win)
+
+if !isnothing(EMIT)
+    # RESULT ONLY. tune!() aggregates several of these and pins what they agree on.
+    # plain `key=value` — src/tune.jl parses this without a TOML dependency
+open(io -> foreach(p -> println(io, p.first, "=", p.second), prefs), EMIT, "w")
+    println("\n[emit] wrote $(length(prefs)) result(s) → $EMIT")
+elseif DRYRUN
+    println("\n[dryrun] would write under [PureBLAS]:")
     foreach(p -> println("  $(p.first) = $(p.second)"), prefs)
 else
-    d = isfile(LP) ? TOML.parsefile(LP) : Dict{String, Any}()      # merge — preserve other packages' + other PureBLAS prefs
+    LP = joinpath(dirname(Base.active_project()), "LocalPreferences.toml")
+    d = isfile(LP) ? TOML.parsefile(LP) : Dict{String, Any}()
     sect = get!(d, "PureBLAS", Dict{String, Any}())
     for p in prefs
         sect[p.first] = p.second
     end
+    sect["tuned_for"] = PureBLAS._tuning_fingerprint()
     open(io -> TOML.print(io, d), LP, "w")
-    println("\nwrote $(length(prefs)) preference(s) → $LP  [PureBLAS]")
-    println("(reload PureBLAS to bake them; a per-µarch frozen .so carries them forward)")
+    println("\nwrote $(length(prefs)) preference(s) + tuned_for → $LP")
+    println("(reload Julia to pick them up — they are read at runtime, so no recompile)")
 end

@@ -83,21 +83,69 @@ boosting or contended clock produces a wrong winner, which then gets pinned.
 function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_project())
     root = normpath(joinpath(@__DIR__, ".."))
     script = joinpath(root, "bench", "calibrate.jl")
-    isfile(script) || error("tune!: $script not found — tuning needs the full repository, not just " *
-                            "an installed package. Clone PureBLAS.jl and run tune!() from there.")
-    args = String[script]
-    dryrun && push!(args, "dryrun")
-    push!(args, "repeats=$(repeats)")
-    # `--project` is load-bearing: preferences are PER PROJECT. The same key has read 108 under
-    # `--project=.` and 4 under `--project=bench` in this repo, which cost two full gate runs before it
-    # was understood. The tuner must write where the CALLER's PureBLAS resolves its preferences from.
-    cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(project) $(args)`
-    @info "PureBLAS.tune!: running $(repeats) independent calibration process(es); this takes minutes." project
-    run(cmd)
-    dryrun || @info "PureBLAS.tune!: done. RELOAD Julia for the new pins to take effect."
-    return nothing
-end
+    isfile(script) || error("tune!: $script not found — tuning needs the full repository, not just an " *
+                            "installed package. Clone PureBLAS.jl and run tune!() from there.")
+    jl = Base.julia_cmd()
+    if dryrun
+        run(`$jl --startup-file=no --project=$(project) $script dryrun`)
+        return nothing
+    end
 
-# Called from `__init__`. Every read here is the RUNTIME `load_preference`, so none of it becomes a
-# compile-time dependency and none of it can invalidate the pkgimage — which is the whole point: a pin
-# written by `tune!()` takes effect on the next Julia start, with no rebuild.
+    # INDEPENDENT PROCESSES, then agreement. A per-process draw (page placement, allocator state) can
+    # change which arm wins — that is not a hypothesis, it is what made the retired OncePerProcess tier
+    # ship wrong kernels (one knob picked a 17%-SLOWER arm in 7 of 9 processes). Repeating inside one
+    # process cannot detect it; only separate processes can. A knob that does not agree across all of
+    # them is left at its in-code default and reported.
+    @info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
+    results = Dict{String, Any}[]
+    mktempdir() do dir
+        for k in 1:repeats
+            f = joinpath(dir, "run$k.toml")
+            try
+                run(`$jl --startup-file=no --project=$(project) $script emit=$f`)
+            catch e
+                @warn "tune!: calibration run $k failed; skipping it." e
+                continue
+            end
+            # Plain `key=value` lines, parsed here — deliberately NOT TOML, because TOML is not a
+# PureBLAS dependency and adding one to read three integers would be the wrong trade.
+isfile(f) || continue
+d = Dict{String, Any}()
+for ln in eachline(f)
+    kv = split(strip(ln), '='; limit = 2)
+    length(kv) == 2 && (d[strip(kv[1])] = something(tryparse(Int, strip(kv[2])), strip(kv[2])))
+end
+push!(results, d)
+        end
+    end
+    isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
+
+    agreed = Dict{String, Any}()
+    keys_ = union(keys.(results)...)
+    for k in keys_
+        vals = [get(r, k, nothing) for r in results]
+        if all(==(first(vals)), vals) && !isnothing(first(vals)) && length(vals) == length(results)
+            agreed[k] = first(vals)
+        else
+            @info "tune!: `$k` did not agree across runs $(vals) — leaving the default in place."
+        end
+    end
+
+    if isempty(agreed)
+        @info "tune!: nothing to pin (every knob tied or disagreed). The in-code defaults are adequate here."
+        return nothing
+    end
+    # Writing the pins is the ONE action that must land in the caller's project, because preferences are
+    # per project — the same key has read 108 under `--project=.` and 4 under `--project=bench` in this
+    # repo, which cost two full gate runs before it was understood.
+    # Written through Preferences, not by hand-editing the TOML: it resolves the right file for the
+    # ACTIVE project, and preferences are PER PROJECT — the same key has read 108 under `--project=.`
+    # and 4 under `--project=bench` in this repo, which cost two full gate runs before it was understood.
+    for (k, v) in agreed
+        set_preferences!(@__MODULE__, k => v; force = true)
+    end
+    set_preferences!(@__MODULE__, "tuned_for" => _tuning_fingerprint(); force = true)
+    @info "PureBLAS.tune!: pinned $(length(agreed)) knob(s)" agreed
+    @info "Restart Julia to pick them up. They are read at RUNTIME, so this costs no recompile."
+    return agreed
+end
