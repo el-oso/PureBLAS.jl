@@ -286,10 +286,19 @@ const _GEMM_SPLIT_S = 2
 # formula says 128 — so it is an explicit table row, not folded in. Papering over that would make the
 # formula look more general than it is.
 @inline _at_pbtrf_ucross(hw, ::Type{Float64}) = _wide_simd(hw) ? 256 : 192
-# A real formula on all three boxes. CAVEAT kept from the campaign plan: this knob's optimum once MOVED
-# when an unrelated inlining bug was fixed, so it is sensitive to codegen, not only to hardware —
-# re-check it after any change to the gebrd panel path.
-@inline _at_brd_nb(hw) = 32 ÷ _lanes(hw, Float64)
+# ⚠ WAS `32 ÷ _lanes(hw, Float64)` — FALSIFIED BY THE GATE 2026-08-20, and the way it failed matters.
+# That formula reproduced the duel EXACTLY on all three boxes (wm 4, galen 8, neuro 4, each stable 6/6),
+# so it passed every check available at conversion time. Forcing the alternative through the real gate:
+#     wintermute  brd_nb=4 -> gesvd 0.988 FAIL   |  brd_nb=8 -> 1.058 PASS   (+7.1%)
+#     neuromancer brd_nb=4 -> gesvd 1.053 PASS   |  brd_nb=8 -> 1.101 PASS   (+4.6%)
+#     galen       brd_nb=8 already (formula and answer agree; forcing 8 is a no-op)
+# The DUEL was picking the wrong arm on both AVX-512 boxes, and a derivation that faithfully reproduces
+# a wrong measurement inherits the error while looking rigorous. Three boxes agreeing with a broken
+# instrument is not evidence. 8 flat closes wintermute's gesvd miss outright.
+# The campaign plan already called this knob "the sharpest anti-Derive argument in the tree — its optimum
+# MOVED when an unrelated inlining bug was fixed". That caution was correct and was noted, then talked
+# past on the strength of the three-box fit. Re-A/B after any change to the gebrd panel path.
+@inline _at_brd_nb(hw) = 8   # req8-ok: gate-measured on all three boxes, see the table above
 
 # (c8) The last two convertible rows. WEAKER EVIDENCE THAN EVERYTHING ABOVE — labelled, not hidden.
 # gbtrf_cross C32: wintermute is a true 3-3 TIE across 6 processes (16,16,8,16,8,8) while neuromancer
