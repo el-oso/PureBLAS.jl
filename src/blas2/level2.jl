@@ -789,8 +789,20 @@ end
 # _GEMVT_NC_CANDIDATES, the Val ladder and PUREBLAS_FORCE_gemvt_nc are retained above — forcing an arm
 # through bench/plots.jl is how the measured tables in this file were produced and how the next
 # attempt must be measured.
-const _GEMVT_NC = @load_preference("gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
-@inline _gemvt_nc() = _GEMVT_NC
+const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
+const _GEMVT_NC = something(_GEMVT_NC_PREF, 4)::Int   # req8-ok: falsified-derivation literal, see table above
+# ⚠ THE HOOK ABOVE WAS DEAD UNTIL 2026-08-20. The comment promised `PUREBLAS_FORCE_gemvt_nc` reached
+# the real entry path, but `_gemvt_nc()` returned a plain const — so every run labelled `nc=8` or
+# `nc=16` silently executed NC=4, and the two would agree, which reads as "the default is right".
+# Same class as the dead `axpy_unroll`/`axpy_dram` hooks (fc825c7): listed as forceable, never read.
+# The null test that exposes it is forcing a knob to the value it ALREADY has and checking the arm
+# actually changed. Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
+@static if isnothing(_GEMVT_NC_PREF)
+const _GEMVT_NC_REF = Ref{Int}(_GEMVT_NC)
+@inline _gemvt_nc() = _GEMVT_NC_REF[]
+else
+@inline _gemvt_nc() = _GEMVT_NC_PREF::Int
+end
 
 # gemv-T blocked-vs-per-column ROUTE, as a 3-valued MODE (not a Bool) so the RESIDENCY arm is itself
 # forceable/shippable:
@@ -3884,6 +3896,12 @@ end
     @static if isnothing(_GEMVT_PF_PREF)
         f = _force_knob("gemvt_pf")
         f >= 0 && (_GEMVT_PF_REF[] = f)
+    end
+    @static if isnothing(_GEMVT_NC_PREF)
+        # ONLY the candidate set — the Val ladder branches at 4/8/16, so any other value would land on
+        # a neighbour and be recorded under a label it never ran (trap (1) in `_gemv_t_simd!`).
+        f = _force_knob("gemvt_nc")
+        f in _GEMVT_NC_CANDIDATES && (_GEMVT_NC_REF[] = f)
     end
     @static if isnothing(_GEMVT_DEEP_PREF)
         f = _force_knob("gemvt_deep")
