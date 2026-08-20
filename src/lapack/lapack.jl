@@ -32,6 +32,7 @@ const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # Derived (÷2 off the F64 anchor), µarch-invariant crossover like _CHOL_STH; knob "potrf_base_f32"; fleet-validate.
 # MUST be a top-level const (like every other tuning const here): @load_preference inside a function body is a
 # per-CALL runtime preferences lookup — it dominated microsecond small-n F32 factorizations (galen spotrf 0.02).
+# PDM: Derived(sibling) — sizeof-ratio derivation, not a borrowed literal: F32 is half the bytes of F64, so the same recursion-overhead floor sits at half the n. Documented in tuning.md §4 alongside `_POTRF_BASE`, whose own status is validated-literal (the residency guess sqrt(L1/8)=64 measured WORSE than 32). | tune: n/a — follows potrf_base
 const _POTRF_BASE_F32 = @load_preference("potrf_base_f32", _POTRF_BASE >> 1)::Int
 @inline _potrf_base(::Type{Float32}) = _POTRF_BASE_F32
 @inline _potrf_base(::Type{T}) where {T} = _POTRF_BASE

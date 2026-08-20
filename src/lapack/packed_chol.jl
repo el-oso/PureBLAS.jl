@@ -27,6 +27,7 @@ const _PPTRF_TPSV_MIN = 32
 # it inherits `_lu_nb`'s validated shape rather than introducing a second unvalidated formula (req#8b).
 # NOTE the copy traffic is n³/(6·nb), so a LARGER nb is cheaper on copies but shrinks the BLAS-3
 # trailing update; this is the knob to sweep first if the blocked path underperforms.
+# PDM: Literal(borrowed) — packed Cholesky's own blocked panel width, inheriting LU's `_LU_NB` as a prior. A real degree of freedom: pptrf works on PACKED storage, so its panel does not have LU's stride or its store-traffic profile, and _LU_NB is itself a falsified-derivation literal (see tuning.md §4) — an inherited value whose own justification is "the residency formula was wrong for LU". UNVALIDATED FOR THIS KERNEL. | tune: candidate — sweep nb against the pptrfL/pptrfU rows; both currently gate, so this is upside-hunting, not a fix
 const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", _LU_NB)::Int
 
 # Smallest n where unpacking pays. MEASURED: 2.26× at n=32 (bench/probes/pptrf_unpack_strategy.jl), so

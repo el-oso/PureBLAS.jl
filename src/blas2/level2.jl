@@ -1183,6 +1183,7 @@ const _CGEMVT_CFG_BIG = (
 # from it, and the comment above already records it alternating 108/4/108/4/108/4/108/4 across eight
 # processes with the old incumbent. A knob whose measurement can only confirm or corrupt its derivation
 # is not Measure tier; it is Derive with extra risk. Preference override retained (Pin rung).
+# PDM: Derived(sibling) — `_CGEMVT_CFG_BIG` is itself a complete derivation over `_NVREG` (see the DERIVE note above: galen _NVREG=16 fits (4,half)=>104, wintermute _NVREG=32 fits (8,half), each reproducing what the retired duel resolved 6/6). Coupled only because the derivation is named once and reused. | tune: n/a — Derived
 const _CGEMVT_CFG = @load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)::Int
 @inline _cgemvt_cfg() = _CGEMVT_CFG
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache

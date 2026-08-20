@@ -24,7 +24,7 @@ debt. The `# PDM:` marker is the human judgement and is the column that matters.
 | Predicate-keyed | 11 |
 | Pref-gated | 20 |
 
-**Audited: 5 / 118** knobs carry a `# PDM:` marker. The rest are the
+**Audited: 11 / 118** knobs carry a `# PDM:` marker. The rest are the
 worklist — an unaudited knob is one nobody has justified, which is exactly how redundant
 and duplicated knobs survive.
 
@@ -46,7 +46,7 @@ and duplicated knobs survive.
 | `cgemvn_nc` | `_CGEMVN_NC` | `4)::Int` | Literal | *unaudited* |
 | `cgemvn_nc_big` | `_CGEMVN_NC_BIG` | `3 * _vwidth(Float64) ÷ 2)::Int` | Derived | *unaudited* |
 | `cgemvn_pf` | `_CGEMVN_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `cgemvt_cfg` | `_CGEMVT_CFG` | `_CGEMVT_CFG_BIG)::Int` | Coupled | *unaudited* |
+| `cgemvt_cfg` | `_CGEMVT_CFG` | `_CGEMVT_CFG_BIG)::Int` | Coupled | Derived(sibling) — `_CGEMVT_CFG_BIG` is itself a complete derivation over `_NVREG` (see the DERIVE note above: galen _NVREG=16 fits (4,half)=>104, wintermute _NVREG=32 fits (8,half), each reproducing what the retired duel resolved 6/6). Coupled only because the derivation is named once and reused. \| tune: n/a — Derived |
 | `cgemvt_half` | `_CGEMVT_HALF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
 | `cgemvt_nc` | `_CGEMVT_NC` | `4)::Int` | Literal | *unaudited* |
 | `cgemvt_pf` | `_CGEMVT_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
@@ -90,7 +90,7 @@ and duplicated knobs survive.
 | Key | Const | Default | Tier | PDM justification |
 |---|---|---|---|---|
 | `chemm_pack_cut` | `_CHEMM_PACK_CUT` | `_vwidth(Float64) == 4 ? 4096 : 32)::Int` | Derived | *unaudited* |
-| `csymm_pack_cut` | `_CSYMM_PACK_CUT` | `_CHEMM_PACK_CUT)::Int` | Coupled | *unaudited* |
+| `csymm_pack_cut` | `_CSYMM_PACK_CUT` | `_CHEMM_PACK_CUT)::Int` | Coupled | Derived(sibling) — deliberate, argued coupling, not an accident: csymm side-L runs the SAME packed kernel as chemm (`_hemm_packed_L!` with HERM=false), identical blocking and microkernel, differing only in conjugation of the mirrored A-pack half. Same criterion ⇒ same cut, so it defaults to `_CHEMM_PACK_CUT` rather than repeating a literal that could drift out of step. \| tune: n/a — tune chemm_pack_cut and this follows |
 | `csyr2k_fused_max` | `_CSYR2K_FUSED_MAX` | `_vwidth(Float64) == 4 ? 192 : 0)::Int` | Derived | *unaudited* |
 | `csyr2k_pack_cut` | `_CSYR2K_PACK_CUT` | `8)::Int` | Literal | Literal — never swept (both arms of the retired ternary were identical, so no A/B could distinguish them); behaviour-neutral collapse, validated-by-gate not tuned. \| tune: not a tune!() candidate until someone sweeps it; sweep is cheap (one op, few candidates) but no evidence it moves the gate |
 | `csyrk_3m_min` | `_CSYRK_3M_MIN` | `128)::Int` | Literal | *unaudited* |
@@ -108,7 +108,7 @@ and duplicated knobs survive.
 | `symm_pack_cut` | `_SYMM_PACK_CUT` | `_at_symm_mat_max(_HW))::Int` | Derived | *unaudited* |
 | `syr2k_2pass` | `_SYR2K_2PASS` | `_vwidth(Float64) == 4 ? 128 : typemax(Int))::Int` | Derived | *unaudited* |
 | `syr2k_mr` | `_SYR2K_MR` | `_vwidth(Float64) == 4 ? 2 : _MR)::Int` | Derived | *unaudited* |
-| `syr2k_nr` | `_SYR2K_NR` | `_NR)::Int` | Coupled | *unaudited* |
+| `syr2k_nr` | `_SYR2K_NR` | `_NR)::Int` | Coupled | Literal(borrowed) — NOT a derivation and NOT redundant with gemm's _NR. This instantiates its OWN microkernel (`_trgemm_packed2!` at Val(_SYR2K_MR), Val(_SYR2K_NR)), so it is a real degree of freedom that merely INHERITS gemm's tuned NR as a prior. UNVALIDATED FOR THIS KERNEL: nobody has swept syr2k's own NR; it is right only insofar as the two microkernels share a register budget. \| tune: candidate — sweep NR over _NVREG-bounded values against the syr2k row before trusting the inherited value |
 | `syr2k_pack_cut` | `_SYR2K_PACK_CUT` | `_at_rank_k_pack_cut(_HW))::Int` | Derived | *unaudited* |
 | `syrk_dbase` | `_SYRK_DBASE` | `32)::Int` | Literal | *unaudited* |
 | `syrk_mr` | `_SYRK_MR` | `2)::Int` | Literal | *unaudited* |
@@ -116,7 +116,7 @@ and duplicated knobs survive.
 | `syrk_unified_max` | `_SYRK_UNIFIED_MAX` | `_vwidth(Float64) == 4 ? 48 : 0)::Int` | Derived | *unaudited* |
 | `trmm_ddirect` | `_TRMM_DDIRECT` | `4)` | Literal | *unaudited* |
 | `trmm_pack_min` | `_TRMM_PACK_MIN` | `(5 * _GEMM_UNPACK_MAX) ÷ 2)::Int` | Other | *unaudited* |
-| `trmm_rkc` | `_TRMM_RKC` | `_KC)::Int` | Coupled | *unaudited* |
+| `trmm_rkc` | `_TRMM_RKC` | `_KC)::Int` | Coupled | Literal(borrowed) — trmm's OWN k-block (`kc = min(_TRMM_RKC, k)`, feeding _at_mc_kc), inheriting gemm's _KC as a prior. A real degree of freedom, not a duplicate: trmm packs a TRIANGULAR operand, so its L1 residency arithmetic is not gemm's. UNVALIDATED FOR THIS KERNEL — the inherited value has never been swept against the trmm row. \| tune: candidate — same residency-bounded candidate set as gemm_kc, selection measured |
 | `trmm_rpack` | `_TRMM_RPACK` | `448)::Int` | Literal | *unaudited* |
 | `trsm_narrow_max` | `_TRSM_NARROW_MAX` | `4)::Int` | Literal | *unaudited* |
 | `ztrsm_gt_mr` | `_ZGT_MR` | `_ZGT_W)::Int` | Predicate-keyed | *unaudited* |
@@ -162,7 +162,7 @@ and duplicated knobs survive.
 | `cpotrf_base` | `_CPOTRF_BASE` | `_at_cpotrf_base(_HW))::Int` | Derived | *unaudited* |
 | `cpotrf_nbmax` | `_CPOTRF_NBMAX` | `_at_cpotrf_nbmax(_HW))::Int` | Derived | *unaudited* |
 | `potrf_base` | `_POTRF_BASE` | `32)::Int` | Literal | *unaudited* |
-| `potrf_base_f32` | `_POTRF_BASE_F32` | `_POTRF_BASE >> 1)::Int` | Coupled | *unaudited* |
+| `potrf_base_f32` | `_POTRF_BASE_F32` | `_POTRF_BASE >> 1)::Int` | Coupled | Derived(sibling) — sizeof-ratio derivation, not a borrowed literal: F32 is half the bytes of F64, so the same recursion-overhead floor sits at half the n. Documented in tuning.md §4 alongside `_POTRF_BASE`, whose own status is validated-literal (the residency guess sqrt(L1/8)=64 measured WORSE than 32). \| tune: n/a — follows potrf_base |
 | `potrf_pad` | `_POTRF_PAD` | `true)::Bool` | Flag | *unaudited* |
 | `potrf_upper_direct_max` | `_POTRF_UDIRECT_PREF` | `nothing)` | Pref-gated | *unaudited* |
 
@@ -171,7 +171,7 @@ and duplicated knobs survive.
 | Key | Const | Default | Tier | PDM justification |
 |---|---|---|---|---|
 | `pptrf_blk_min` | `_PPTRF_BLK_MIN` | `16)::Int` | Literal | *unaudited* |
-| `pptrf_blk_nb` | `_PPTRF_BLK_NB` | `_LU_NB)::Int` | Coupled | *unaudited* |
+| `pptrf_blk_nb` | `_PPTRF_BLK_NB` | `_LU_NB)::Int` | Coupled | Literal(borrowed) — packed Cholesky's own blocked panel width, inheriting LU's `_LU_NB` as a prior. A real degree of freedom: pptrf works on PACKED storage, so its panel does not have LU's stride or its store-traffic profile, and _LU_NB is itself a falsified-derivation literal (see tuning.md §4) — an inherited value whose own justification is "the residency formula was wrong for LU". UNVALIDATED FOR THIS KERNEL. \| tune: candidate — sweep nb against the pptrfL/pptrfU rows; both currently gate, so this is upside-hunting, not a fix |
 | `pptrf_spr_min` | `_PPTRF_SPR_PREF` | `0)::Int` | Literal | *unaudited* |
 
 ## LAPACK · pstrf

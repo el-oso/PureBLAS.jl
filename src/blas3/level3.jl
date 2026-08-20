@@ -10,6 +10,7 @@ const _TRMM_RPANEL = 512
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
+# PDM: Literal(borrowed) — trmm's OWN k-block (`kc = min(_TRMM_RKC, k)`, feeding _at_mc_kc), inheriting gemm's _KC as a prior. A real degree of freedom, not a duplicate: trmm packs a TRIANGULAR operand, so its L1 residency arithmetic is not gemm's. UNVALIDATED FOR THIS KERNEL — the inherited value has never been swept against the trmm row. | tune: candidate — same residency-bounded candidate set as gemm_kc, selection measured
 const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 # side-R packed cut: n > this → packed single-pass side-R, else direct/unpacked. NOT
 # register-capacity-governed: the plausible "= gemm's _GEMM_UNPACK_MAX (=2·_acc_cap)" derivation was
@@ -5315,6 +5316,7 @@ end
 const _SYR2K_MR = @load_preference("syr2k_mr", _vwidth(Float64) == 4 ? 2 : _MR)::Int
 # nr for the two-product tile (Preferences knob). Default _NR: widening to NR=5 with MR=2 was measured
 # NEUTRAL-to-worse on Zen3 (n=256 unchanged, n=1024 0.985→0.96) — the tile wasn't ILP-starved, so keep _NR.
+# PDM: Literal(borrowed) — NOT a derivation and NOT redundant with gemm's _NR. This instantiates its OWN microkernel (`_trgemm_packed2!` at Val(_SYR2K_MR), Val(_SYR2K_NR)), so it is a real degree of freedom that merely INHERITS gemm's tuned NR as a prior. UNVALIDATED FOR THIS KERNEL: nobody has swept syr2k's own NR; it is right only insofar as the two microkernels share a register budget. | tune: candidate — sweep NR over _NVREG-bounded values against the syr2k row before trusting the inherited value
 const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
 # n above which syr2k does TWO full-kernel passes (OpenBLAS-style) instead of the fused two-product tile.
 # On AVX2 the fused MR=2 tile has only 8 accumulators (ILP-starved on 16 regs); two _trgemm_packed! passes
@@ -6101,6 +6103,7 @@ const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4
 # small (packed faster by 0.9% at n=256 and 2.6% at n=512, ~neutral at 128/1024/2048), so the cut is
 # Pin-tier debt on BOTH knobs, not a validated optimum. Deriving it needs a packed-vs-materialize sweep
 # per box; do that before treating 32 as meaningful.
+# PDM: Derived(sibling) — deliberate, argued coupling, not an accident: csymm side-L runs the SAME packed kernel as chemm (`_hemm_packed_L!` with HERM=false), identical blocking and microkernel, differing only in conjugation of the mirrored A-pack half. Same criterion ⇒ same cut, so it defaults to `_CHEMM_PACK_CUT` rather than repeating a literal that could drift out of step. | tune: n/a — tune chemm_pack_cut and this follows
 const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
