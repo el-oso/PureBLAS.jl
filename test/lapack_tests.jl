@@ -1130,7 +1130,12 @@ end
     @testset "interchange $T n=$n $tag" for T in (Float32, Float64, ComplexF32, ComplexF64),
             n in (2, 7, 40, 129), tag in ("pivot", "mixed")
 
-        Random.seed!(hash((T, n, tag)))
+        # VERSION-STABLE SEED. `hash` is NOT stable across Julia releases, so seeding with it drew a
+        # different matrix on CI (1.12) than locally (1.13): the case was unreproducible by
+        # construction, and that is why master's red CI read as an AVX2-only kernel bug for two days
+        # when it was neither AVX2-specific nor a kernel bug.
+        Random.seed!(1000 * findfirst(==(T), (Float32, Float64, ComplexF32, ComplexF64)) +
+                     10 * n + (tag == "pivot" ? 1 : 2))
         dl = randn(T, n - 1); du = randn(T, n - 1)
         d = tag == "pivot" ? randn(T, n) .* real(T)(1.0e-3) :
             [i <= n ÷ 2 ? randn(T) + T(4) : randn(T) * real(T)(1.0e-3) for i in 1:n]
@@ -1143,7 +1148,18 @@ end
         PureBLAS.gtsv!(pdl, pd, pdu, pB)
         LA.gtsv!(rdl, rd, rdu, rB)
         tol = sqrt(eps(real(T))) * 100 * (norm(A) + 1)
-        @test maximum(abs, A * pB - B) < tol
+        # BACKWARD error, not a forward residual. A solver's contract is backward stability; a small
+        # forward residual is NOT implied by it and is not the solver's to promise. With the "pivot"
+        # tag the diagonal is ~1e-3, and Float32 at n=129 can draw cond(A) ~ 1e11 — there a forward
+        # residual of 724 against a tol of 0.57 is the MATRIX's doing, and LAPACK's residual is
+        # identical to the last bit (measured: |pB - rB| == 0 exactly, every seed). Normalising by
+        # ‖A‖·‖x‖ + ‖b‖ removes the conditioning. BOUND CHOSEN FROM MEASUREMENT, not taste: the worst
+        # backward error over this exact grid (4 types × 4 n × 2 tags, these seeds) is 0.35·eps
+        # (ComplexF32 n=2 pivot), so 16·eps is 46× headroom — enough to absorb platform and LLVM
+        # variation, tight enough to still fail a solver that is actually broken. 100·eps was the
+        # first draft and was a 286× rubber stamp.
+        nrmA = opnorm(A, Inf); nrmB = norm(B, Inf)
+        @test maximum(abs, A * pB - B) / (nrmA * norm(pB, Inf) + nrmB) < 16 * eps(real(T))
         @test maximum(abs, pB - rB) < tol
         @test maximum(abs, pd - rd) < tol
         n > 1 && @test maximum(abs, pdu - rdu) < tol
@@ -1155,7 +1171,7 @@ end
         @test maximum(abs, pf[2] - rf[2]) < tol                    # U diagonal
         n > 2 && @test maximum(abs, pf[4] - rf[4]) < tol           # du2 second superdiagonal
         Xg = PureBLAS.gttrs!('N', pf[1], pf[2], pf[3], pf[4], pf[5], copy(B))
-        @test maximum(abs, A * Xg - B) < tol
+        @test maximum(abs, A * Xg - B) / (nrmA * norm(Xg, Inf) + nrmB) < 16 * eps(real(T))
     end
 end
 
