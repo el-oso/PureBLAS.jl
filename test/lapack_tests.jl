@@ -1152,7 +1152,17 @@ end
         # forward residual is NOT implied by it and is not the solver's to promise. With the "pivot"
         # tag the diagonal is ~1e-3, and Float32 at n=129 can draw cond(A) ~ 1e11 — there a forward
         # residual of 724 against a tol of 0.57 is the MATRIX's doing, and LAPACK's residual is
-        # identical to the last bit (measured: |pB - rB| == 0 exactly, every seed). Normalising by
+        # identical to the last bit (measured: |pB - rB| == 0 exactly, every seed).
+        #
+        # ⚠ AND THE RESIDUAL IS LARGE BECAUSE THE SOLUTION IS LARGE — NOT because accuracy was lost.
+        # Measured against a BigFloat solve of the same A,B at cond(A) = 8.9e10: relative forward
+        # error 9.7e-08 for BOTH PureBLAS and OpenBLAS, i.e. essentially full Float32 accuracy, where
+        # the classical cond*eps bound would permit 1.1e+04. (cond*eps is a worst case over all
+        # right-hand sides; a random B rarely aligns with the offending singular direction, and
+        # tridiagonal partial pivoting is governed by componentwise conditioning, far smaller than the
+        # normwise cond for this structure.) Near-singular A simply makes ‖x‖ enormous, so an absolute
+        # residual ‖Ax - b‖ is large for a CORRECT answer. The old assertion penalised the magnitude
+        # of a right answer. Normalising by
         # ‖A‖·‖x‖ + ‖b‖ removes the conditioning. BOUND CHOSEN FROM MEASUREMENT, not taste: the worst
         # backward error over this exact grid (4 types × 4 n × 2 tags, these seeds) is 0.35·eps
         # (ComplexF32 n=2 pivot), so 16·eps is 46× headroom — enough to absorb platform and LLVM
