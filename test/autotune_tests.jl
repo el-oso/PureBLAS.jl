@@ -107,12 +107,11 @@
     @test P._at_pbtrf_ucross(galen, Float64) == 192        # MODAL on galen (192x4, 256, 192)
     @test P._at_pbtrf_ucross(galen, Float64) != P._at_pbtrf_ucross(galen)   # the two rules disagree
     # brd_nb is a formula on all three boxes, each stable 6/6.
-    # 8 on EVERY box. The width formula `32 ÷ _lanes(hw,Float64)` was FALSIFIED by the gate on
-    # 2026-08-20: wintermute gesvd 0.988 FAIL -> 1.058 PASS, neuromancer 1.053 -> 1.101. It had
-    # reproduced the duel exactly (wm 4, galen 8, neuro 4, stable 6/6 each), which is precisely how a
-    # wrong measurement propagates into a derivation that looks rigorous.
-    @test P._at_brd_nb(wintermute) == 8 && P._at_brd_nb(neuromancer) == 8
-    @test P._at_brd_nb(galen) == 8 && P._at_brd_nb(tigerlake) == 8
+    # brd_nb is NOT asserted here: it is machine-INVARIANT (8 on all three boxes, two ISAs) and so
+    # lives in svd.jl as `_BRD_NB`, PDM Exempt, not as an `_at_*` function of `hw`. It was briefly
+    # `_at_brd_nb(hw) = 8` — a function taking a hardware descriptor and ignoring it, which is the fake
+    # formula the PDM ladder forbids. This file asserts hardware DERIVATIONS; a constant belongs with
+    # its kernel.
 
     @test P._at_axpy_dram(wintermute) == 208
     @test P._at_axpy_dram(galen) == 4

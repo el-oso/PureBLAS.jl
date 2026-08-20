@@ -526,10 +526,31 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
     # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
     # Width-derived: 32 ÷ _lanes(hw, Float64) reproduces all three boxes (4 / 4 / 8), each stable in
     # 6 of 6 fresh processes. See `_at_brd_nb` (cpuinfo.jl) for the caveat about codegen sensitivity.
-    @inline _brd_nb() = (f = _fk("brd_nb"); f >= 0 ? f : _at_brd_nb(_HW))
+    @inline _brd_nb() = (f = _fk("brd_nb"); f >= 0 ? f : _BRD_NB)
 else
     @inline _brd_nb() = _BRD_NB_PREF::Int
 end
+# Bidiagonalisation panel width. PDM EXEMPT (machine-invariant) — deliberately NOT an `_at_*` function.
+# It briefly was `_at_brd_nb(hw) = 8`, which took a hardware descriptor and IGNORED it: a fake formula,
+# exactly the shape CLAUDE.md's PDM ladder forbids. Same classification as `_BT_NB` below, and for the
+# same kind of reason.
+#
+# THE EVIDENCE IS THAT IT DOES NOT MOVE. Gate-measured 2026-08-20 by forcing the alternative through
+# bench/plots.jl on every box: 8 wins on Zen3 (AVX2, 4 lanes), Zen4 and Zen5 (AVX-512, 8 lanes) alike —
+#   wintermute  4 -> gesvd 0.988 FAIL  |  8 -> 1.058 PASS   (+7.1%)
+#   neuromancer 4 -> gesvd 1.053 PASS  |  8 -> 1.101 PASS   (+4.6%)
+#   galen       8 already best
+# A value that is unchanged across two ISAs and three microarchitectures is not cache- or width-derived;
+# it is structural to the gebrd panel. Deriving it from `_lanes` is what produced the wrong answer: that
+# formula gave 4 on both AVX-512 boxes and shipped a 7% regression, because it faithfully reproduced
+# what the OncePerProcess duel had picked — and the duel was wrong. Reproducing the incumbent is a
+# safety property, not a correctness one.
+#
+# CAVEAT that outranks the fit: this knob's optimum once MOVED when an unrelated inlining bug was fixed,
+# so it tracks CODEGEN, not hardware. Re-A/B with PUREBLAS_FORCE_brd_nb after any change to the gebrd
+# panel path — that is a ten-minute check, and it is how this error was found.
+const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three boxes (table above)
+
 # Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
 # register-invariant compact-WY panel cap — the SAME value `_qr_nb` caps at (its comment: cap 32,
 # "µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs"). The panel is deep enough to amortize the rank-nb
