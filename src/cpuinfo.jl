@@ -242,12 +242,29 @@ const _GEMM_SPLIT_S = 2
 # EVIDENCE (bench/probes/gemvt_route_window.jl — per-column ÷ blocked, same-process paired A/B through
 # the REAL `gemv!` entry, `reps` matched to plots.jl's `_L2REP` so the regime IS the gate's, THREE
 # INDEPENDENT PROCESSES per box, both freq-locked):
-#     n=512    wintermute 1.113                   neuromancer 1.043 / 1.032 / 1.041   percol both
-#     n=1024   wintermute 1.254 / 1.248 / 1.238   neuromancer 0.865 / 0.903 / 0.912   OPPOSITE
-#     n=2048   wintermute 1.056 / 0.951 / 0.954   -- verdict FLIPS between processes, see below
-#     n=4096   wintermute 0.683                   neuromancer 0.794                   blocked both
-# So Zen4 -> 1, Zen5 -> 0 (it must NOT take per-column at n=1024, ~10% there), Zen3 -> 0 (forcing mode
-# 1 costs its op gate 29%). `_double_pumped` encodes exactly that, and nothing more.
+#              wintermute Zen4          galen Zen3               neuromancer Zen5
+#     n=512    1.113                    0.953/0.964/0.973        1.043/1.032/1.041
+#              percol                   BLOCKED                  percol
+#     n=1024   1.254/1.248/1.238        1.013/1.027/1.016        0.865/0.903/0.912
+#              percol                   percol                   BLOCKED
+#     n=2048   1.056/0.951/0.954        0.731/0.741/0.743        (1 proc: 1.117)
+#              FLIPS between processes  blocked                  --
+#     n=4096   0.683  blocked           --                       0.794  blocked
+#
+# EVERY PAIR OF BOXES DISAGREES AT SOME SIZE, and no detected const partitions them:
+#   * NOT L1 — wintermute and galen BOTH have 32 KiB L1 and want OPPOSITE arms at n=512. This was the
+#     last live derivation candidate (Zen4/Zen5 differ only in L1, so an L1 rule was arithmetically
+#     possible); galen kills it. Measured 2026-08-20, three processes, gate regime.
+#   * NOT L2 (galen 0.5 MiB vs 1 MiB), NOT L3 (32 vs 16 MiB), NOT SIMD width — wintermute and
+#     neuromancer share width 64 and disagree at n=1024.
+# So Zen4 -> 1, Zen5 -> 0 (must NOT take per-column at n=1024, ~10% there), Zen3 -> 0 (per-column loses
+# 3-5% at n=512 and 26% at n=2048; it wins only ~1.9% at n=1024, which mode 1 cannot buy without the
+# other two). `_double_pumped` encodes exactly that, and nothing more.
+#
+# ⚠ THE KNOB IS ALSO TOO COARSE, which the table makes obvious: the optimum is per-(box, SIZE), not
+# per-box. A single 3-valued mode cannot express "per-column at 1024 only", so galen leaves ~1.9% at
+# n=1024 and Zen5 leaves ~3.9% at n=512 (task #160). Closing either needs a per-size route pin from
+# `tune!()` — a knob-SHAPE change, not another predicate.
 #
 # ⚠ n=2048 IS NOT ADJUDICABLE AND MUST NOT BE ROUTED ON. A = 32 MiB = 2x L3; the gate cell re-measured
 # 0.960/1.001/0.899/0.938/0.939 at ONE HEAD (11.3% spread) and the A/B verdict above flips sign between

@@ -838,7 +838,7 @@ end
 # both. A deficit that survives swapping the whole kernel is not IN the kernel choice, so no routing
 # change can close it. (Zen4 mode 2 was not run: its contention guard refused twice, and with mode 2
 # dead 13/14 on the other two boxes the arm did not deserve a third slot.)
-# PDM: Measured — Zen4 and Zen5 differ ONLY in L1 (32 vs 48 KiB) yet cross over at x = 8 vs 4 KiB: the LARGER L1 crosses EARLIER, anti-correlated with the only differing const, so no capacity rule fits. A `_wide_simd` derivation was written and falsified before shipping. OPEN: galen shares wintermute's 32 KiB L1 and its per-size crossover is unmeasured (task #160) — if it matches wintermute's, an L1 rule returns. | tune: not implemented; 3 modes x 4 sizes, est. ~2 min (needs a per-SIZE route pin, which the 3-valued mode knob cannot express)
+# PDM: Measured — no detected const partitions the fleet: EVERY PAIR of boxes disagrees at some size. L1 was the last candidate and is FALSIFIED — wintermute and galen both have 32 KiB L1 and want opposite arms at n=512 (percol 1.113 vs blocked 0.953/0.964/0.973, three processes each). Not L2, not L3, not SIMD width either (wintermute/neuromancer share width 64 and disagree at n=1024). A `_wide_simd` derivation was written and falsified before shipping. | tune: not implemented; the knob is also too COARSE — the optimum is per-(box,size), so galen leaves ~1.9% at n=1024 and Zen5 ~3.9% at n=512 (#160). Needs a per-SIZE route pin, a knob-shape change, not a value.
 const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
