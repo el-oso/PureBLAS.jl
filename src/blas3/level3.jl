@@ -6251,8 +6251,24 @@ end
 # Overridable "syr2k_pack_cut".
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
-# recursion (which computes a dense n×n temp per diagonal block — the 2× waste). Tuned per machine.
-const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", _vwidth(Float64) == 4 ? 8 : 8)::Int
+# recursion (which computes a dense n×n temp per diagonal block — the 2× waste).
+#
+# ⚠ WAS `_vwidth(Float64) == 4 ? 8 : 8` — BOTH BRANCHES 8. A fake formula: it read as a width
+# derivation and const-folded to the literal 8 on every machine, while the comment claimed "Tuned per
+# machine". Collapsed to the constant it always was; this is a RECLASSIFICATION, byte-for-byte
+# behaviour-neutral (verified: both branches evaluate to 8, and `_vwidth(Float64)` is 4 on AVX2 / 8 on
+# AVX-512, so no box ever took a different arm). The same shape as the `_at_brd_nb(hw) = 8` fake
+# formula retired on 2026-08-19 — a knob that takes a hardware input and ignores it.
+#
+# HONEST STATUS: the value 8 is NOT a measured optimum. It has never been swept — it could not be,
+# since both arms were identical, so any A/B "confirming" it compared 8 against 8. What IS true is
+# that the shipped behaviour has always been 8 and the gate passes on it (zsyr2k Zen4 1.031 vs AOCL,
+# 2026-08-20 fleet run). Treat it as validated-by-gate, not as tuned.
+# A cut of 8 is also plausibly algorithm-intrinsic rather than cache-derived: it is the n below which
+# the packed kernel's setup cannot amortise at all, and its siblings sit at 16 (`csyrk_pack_cut`) and
+# 4 (`csyrk_pack_cut_t`) — same order, no width scaling in any of the three.
+# PDM: Literal — never swept (both arms of the retired ternary were identical, so no A/B could distinguish them); behaviour-neutral collapse, validated-by-gate not tuned. | tune: not a tune!() candidate until someone sweeps it; sweep is cheap (one op, few candidates) but no evidence it moves the gate
+const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", 8)::Int   # req8-ok: see above
 function syr2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false
