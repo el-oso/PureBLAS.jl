@@ -19,6 +19,7 @@ makedocs(;
         "Design" => "design.md",
         "SIMD & Hardware Adaptation" => "simd.md",
         "Tuning Constants" => "tuning.md",
+        "Knob Registry" => "knobs.md",
         "Performance" => "performance.md",
         "LAPACK/BLAS Coverage" => "coverage.md",
         "Methodology & Provenance" => "methodology.md",
