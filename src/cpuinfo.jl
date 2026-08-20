@@ -229,17 +229,43 @@ const _GEMM_SPLIT_S = 2
 # measures narrow 6/6. Only the datapath WIDTH separates the three correctly.
 @inline _at_zaxpy_narrow(hw) = _datapath_bytes(hw) <= 32
 # (c5) gemv-T route mode. ⚠ THIS IS A KEYED LITERAL, NOT A DERIVATION, AND IT IS LABELLED AS ONE.
-# No mechanism was found linking the split to any detected const: `_double_pumped` happens to partition
-# the fleet correctly, but I could not argue WHY the datapath would decide per-column vs blocked gemv-T,
-# and a predicate that merely fits the boxes is not a mechanism (proved on `zaxpy_narrow` the same day,
-# where `_double_pumped` fit two boxes and was falsified 6/6 by the third). The L1-size hypothesis is
-# also FALSIFIED: Zen3 and Zen4 share a 32 KiB L1 and want OPPOSITE modes.
-# So this encodes the measured answer and nothing more. Mode 0 (blocked at every size) is the
-# CONSERVATIVE DEFAULT and what unseen hardware gets — it is best at every measured size on both
-# non-double-pumped boxes. Zen4 is a documented exception.
-# Source: the full-run fleet table in blas2/level2.jl (2026-08-08, every box freq-locked, PB+OB+AOCL in
-# ONE run per arm, forced through the real entry path) — the highest-quality evidence in the tree, and
-# far stronger than the 5-rep in-process duel this replaces.
+# The label is CORRECT, and was re-confirmed the hard way on 2026-08-20: a `_wide_simd` "derivation"
+# was written, argued from a loads-per-cache-line mechanism, and FALSIFIED by measurement before it
+# shipped. Do not re-attempt a formula here without reading the table below.
+#
+# WHY NO FORMULA CAN WORK — the split lives at n=1024, where the two boxes are IDENTICAL in every
+# detected const this code can see: same L2 (1 MiB), same L3 (16 MiB), same `_NVREG` (32), same SIMD
+# width (64 B), same 8 MiB working set. They still want OPPOSITE arms, stably and by a wide margin.
+# That is the textbook Measure-tier tell from the PDM ladder: the optimum INVERTS across µarchs and
+# our own model mispredicts a box we HAVE.
+#
+# EVIDENCE (bench/probes/gemvt_route_window.jl — per-column ÷ blocked, same-process paired A/B through
+# the REAL `gemv!` entry, `reps` matched to plots.jl's `_L2REP` so the regime IS the gate's, THREE
+# INDEPENDENT PROCESSES per box, both freq-locked):
+#     n=512    wintermute 1.113                   neuromancer 1.043 / 1.032 / 1.041   percol both
+#     n=1024   wintermute 1.254 / 1.248 / 1.238   neuromancer 0.865 / 0.903 / 0.912   OPPOSITE
+#     n=2048   wintermute 1.056 / 0.951 / 0.954   -- verdict FLIPS between processes, see below
+#     n=4096   wintermute 0.683                   neuromancer 0.794                   blocked both
+# So Zen4 -> 1, Zen5 -> 0 (it must NOT take per-column at n=1024, ~10% there), Zen3 -> 0 (forcing mode
+# 1 costs its op gate 29%). `_double_pumped` encodes exactly that, and nothing more.
+#
+# ⚠ n=2048 IS NOT ADJUDICABLE AND MUST NOT BE ROUTED ON. A = 32 MiB = 2x L3; the gate cell re-measured
+# 0.960/1.001/0.899/0.938/0.939 at ONE HEAD (11.3% spread) and the A/B verdict above flips sign between
+# processes. The whole (NC x U) grid ties there too, including AOCL's own NC=8 x U=4. It is the
+# `OncePerProcess` failure mode appearing as a SIZE rather than a knob. See
+# kb/findings/pureblas-gate-repeatability-null-measurement.md.
+#
+# ⚠ TWO WEAKER INSTRUMENTS THAT HAVE ALREADY GIVEN WRONG ANSWERS HERE:
+#  (1) an OP-LEVEL gate cannot settle a PER-SIZE routing question, because this op's gate is dominated
+#      by the non-adjudicable n=2048 cell — that is how "mode 1 costs Zen5 2.0%" got read as evidence
+#      about routing, and how a previous revision claimed mode 0 was "best at every measured size";
+#  (2) a probe at reps=1 measures a COLD matrix while the gate runs `_L2REP(n)` reps on a warm one.
+#      That difference ALONE inverted the n=2048 verdict (1.087 percol-wins -> 0.951 blocked-wins).
+#
+# KNOWN RESIDUAL, not a bug: n=512 wants per-column on BOTH boxes (+11% Zen4, +3.9% Zen5), but Zen5
+# ships mode 0 and takes blocked there — leaving ~3.9% on a cell that gates at 0.993. No window over
+# detected consts separates n=512 from n=1024 (2 vs 8 MiB, identical caches), so closing it wants a PIN
+# from `tune!()`, not another predicate. Reported, not fixed: the Pin tier is the user's.
 @inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
 # (c6) Banded-Cholesky panel widths and crossovers. THE FLEET SPLITS BY VECTOR WIDTH, not by µarch:
 # resolved 6 fresh processes on each of three boxes (2026-08-19), wintermute Zen4 and neuromancer Zen5

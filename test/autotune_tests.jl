@@ -113,6 +113,17 @@
     # formula the PDM ladder forbids. This file asserts hardware DERIVATIONS; a constant belongs with
     # its kernel.
 
+    # gemv-T route mode. A `_wide_simd` "derivation" was attempted on 2026-08-20 and FALSIFIED before
+    # it shipped: it gives Zen5 mode 1, which takes per-column at n=1024 where blocked wins ~10% on
+    # that box (0.865/0.903/0.912 across three independent processes). Zen4 and Zen5 are identical in
+    # every detected const relevant here — L2, L3, `_NVREG`, SIMD width, working set — and still want
+    # OPPOSITE arms at n=1024, so this stays a KEYED LITERAL and the label is accurate, not lazy.
+    # Full evidence and the two weaker instruments that misled earlier attempts: cpuinfo.jl (c5).
+    @test P._at_gemvt_perscan(wintermute) == 1    # Zen4: percol 1.113 @512, 1.25 @1024
+    @test P._at_gemvt_perscan(neuromancer) == 0   # Zen5: percol LOSES ~10% @1024 — mode 1 regresses it
+    @test P._at_gemvt_perscan(galen) == 0         # AVX2: blocked, forcing mode 1 costs it 29%
+    @test P._at_gemvt_perscan(tigerlake) == 0     # unseen hardware gets the conservative arm
+
     @test P._at_axpy_dram(wintermute) == 208
     @test P._at_axpy_dram(galen) == 4
     @test P._at_axpy_dram(neuromancer) == 4
