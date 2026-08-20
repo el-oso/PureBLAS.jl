@@ -284,6 +284,23 @@ const _GEMM_SPLIT_S = 2
 # detected consts separates n=512 from n=1024 (2 vs 8 MiB, identical caches), so closing it wants a PIN
 # from `tune!()`, not another predicate. Reported, not fixed: the Pin tier is the user's.
 @inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
+# (c5b) The two BOUNDS of the per-column window, made pinnable 2026-08-21. They were hardcoded as
+# `_L2_BYTES` and `_L1_BYTES ÷ 2` inside the predicate; the defaults below are those same two values,
+# so an unpinned build routes IDENTICALLY — this is a knob-SHAPE change, not a behaviour change.
+#
+# WHY: the measured optimum is per-(box, SIZE), and a 3-valued mode cannot express it (see (c5)). With
+# the bounds exposed, the window `A > AMIN && x <= XMAX` CAN express every measured optimum:
+#     box          needs                       vs default (A > L2, x <= L1/2)
+#     wintermute   AMIN=1 MiB,  XMAX=16 KiB    IS the default — already optimal, nothing to pin
+#     galen        AMIN=2 MiB,  XMAX=8 KiB     AMIN raised (excludes n=512), XMAX halved (excludes 2048)
+#     neuromancer  AMIN=1 MiB,  XMAX=4 KiB     XMAX quartered (percol at n=512 only)
+# Those two rows are worth ~1.9% (galen n=1024) and ~3.9% (Zen5 n=512, on a cell that gates 0.988).
+# They also need `gemvt_perscan = 1`, since both boxes ship mode 0.
+#
+# ⚠ THE VALUES ABOVE ARE NOT PINNED HERE AND MUST NOT BE. The Pin tier is the user's; `tune!()` is the
+# route. They are recorded so the tuner has a derived candidate set to search rather than a blind one.
+@inline _at_gemvt_percol_amin(hw) = hw.l2
+@inline _at_gemvt_percol_xmax(hw) = hw.l1 ÷ 2
 # (c6) Banded-Cholesky panel widths and crossovers. THE FLEET SPLITS BY VECTOR WIDTH, not by µarch:
 # resolved 6 fresh processes on each of three boxes (2026-08-19), wintermute Zen4 and neuromancer Zen5
 # agree on every row below and galen Zen3 differs on every one — and what wintermute/neuromancer share

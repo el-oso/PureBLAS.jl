@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 118 of them. The PDM ladder
+Every `@load_preference` key in `src/` — 120 of them. The PDM ladder
 (`docs/src/tuning.md`) requires each to be **Derived** (default is a formula over detected
 consts) or **Measured** (it is not — which needs a justification and a `tune!()` cost).
 
@@ -17,14 +17,14 @@ debt. The `# PDM:` marker is the human judgement and is the column that matters.
 | Syntactic tier | Count |
 |---|---|
 | Coupled | 6 |
-| Derived | 41 |
+| Derived | 43 |
 | Flag | 4 |
 | Literal | 35 |
 | Other | 1 |
 | Predicate-keyed | 11 |
 | Pref-gated | 20 |
 
-**Audited: 16 / 118** knobs carry a `# PDM:` marker. The rest are the
+**Audited: 18 / 120** knobs carry a `# PDM:` marker. The rest are the
 worklist — an unaudited knob is one nobody has justified, which is exactly how redundant
 and duplicated knobs survive.
 
@@ -57,6 +57,8 @@ and duplicated knobs survive.
 | `gemvn_rb` | `_GEMVN_RB` | `_vwidth(Float64) == 4 ? 64 : 448)::Int` | Derived | *unaudited* |
 | `gemvt_deep` | `_GEMVT_DEEP_PREF` | `nothing)` | Pref-gated | *unaudited* |
 | `gemvt_nc` | `_GEMVT_NC_PREF` | `nothing)` | Pref-gated | Derived-falsified — the project's own latency x throughput criterion (_ILP_TARGET) predicts EIGHT chains; every fleet box measures 4 best, monotonically worse at 8 and 16. A derivation that predicts the wrong answer is falsified, so the literal 4 ships with its table. Re-open only via the NC x U pair (AOCL runs NC=8 x U=4), which the 2026-08-20 grid found ties in the DRAM regime. \| tune: not a tune!() candidate — measured µarch-INVARIANT (4 on all three boxes) |
+| `gemvt_percol_amin` | `_GEMVT_PERCOL_AMIN` | `_at_gemvt_percol_amin(_HW))::Int` | Derived | Measured(bounds) — the window's SHAPE is derived (A past L2, x still L1-resident) but its two edges are not: the measured optimum is per-(box,SIZE) and every pair of boxes disagrees at some size, so no formula places them. Exposing the edges is what makes the per-size optimum reachable at all — a 3-valued mode cannot express "per-column at n=1024 only". \| tune: candidate, and the candidate SET is derived — the edges only ever sit at cache-geometry boundaries (L1/2, L1/4, L2, 2*L2), so tune!() searches a handful of values, not a range |
+| `gemvt_percol_xmax` | `_GEMVT_PERCOL_XMAX` | `_at_gemvt_percol_xmax(_HW))::Int` | Derived | Measured(bounds) — upper edge of the same window; see gemvt_percol_amin. This is the edge that carries the money: it alone separates neuromancer's optimum (percol at n=512 only, XMAX=4 KiB) from the default L1/2=24 KiB that gives it percol through n=2048. \| tune: candidate, same derived candidate set |
 | `gemvt_perscan` | `_GEMVT_PERSCAN_PREF` | `nothing);` | Pref-gated | Measured — no detected const partitions the fleet: EVERY PAIR of boxes disagrees at some size. L1 was the last candidate and is FALSIFIED — wintermute and galen both have 32 KiB L1 and want opposite arms at n=512 (percol 1.113 vs blocked 0.953/0.964/0.973, three processes each). Not L2, not L3, not SIMD width either (wintermute/neuromancer share width 64 and disagree at n=1024). A `_wide_simd` derivation was written and falsified before shipping. \| tune: not implemented; the knob is also too COARSE — the optimum is per-(box,size), so galen leaves ~1.9% at n=1024 and Zen5 ~3.9% at n=512 (#160). Needs a per-SIZE route pin, a knob-shape change, not a value. |
 | `gemvt_pf` | `_GEMVT_PF_PREF` | `nothing)` | Pref-gated | *unaudited* |
 | `gemvt_u` | `_GEMVT_U_PREF` | `nothing)` | Pref-gated | *unaudited* |

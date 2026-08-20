@@ -863,10 +863,17 @@ const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
 else
     @inline _gemvt_perscan_mode() = _GEMVT_PERSCAN_PREF::Int
 end
+# The two WINDOW BOUNDS, pinnable since 2026-08-21. Defaults are the values that were hardcoded in the
+# predicate below (`_L2_BYTES`, `_L1_BYTES ÷ 2`), so an unpinned build routes IDENTICALLY — asserted in
+# test/autotune_tests.jl rather than asserted in prose.
+# PDM: Measured(bounds) — the window's SHAPE is derived (A past L2, x still L1-resident) but its two edges are not: the measured optimum is per-(box,SIZE) and every pair of boxes disagrees at some size, so no formula places them. Exposing the edges is what makes the per-size optimum reachable at all — a 3-valued mode cannot express "per-column at n=1024 only". | tune: candidate, and the candidate SET is derived — the edges only ever sit at cache-geometry boundaries (L1/2, L1/4, L2, 2*L2), so tune!() searches a handful of values, not a range
+const _GEMVT_PERCOL_AMIN = @load_preference("gemvt_percol_amin", _at_gemvt_percol_amin(_HW))::Int
+# PDM: Measured(bounds) — upper edge of the same window; see gemvt_percol_amin. This is the edge that carries the money: it alone separates neuromancer's optimum (percol at n=512 only, XMAX=4 KiB) from the default L1/2=24 KiB that gives it percol through n=2048. | tune: candidate, same derived candidate set
+const _GEMVT_PERCOL_XMAX = @load_preference("gemvt_percol_xmax", _at_gemvt_percol_xmax(_HW))::Int
 @inline function _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T}
     mode = _gemvt_perscan_mode()                     # ONE resolution per call, as before
     mode >= 2 && return true                         # per-column everywhere (instrument arm)
-    return mode == 1 && m * n * sizeof(T) > _L2_BYTES && m * sizeof(T) <= _L1_BYTES ÷ 2
+    return mode == 1 && m * n * sizeof(T) > _GEMVT_PERCOL_AMIN && m * sizeof(T) <= _GEMVT_PERCOL_XMAX
 end
 
 @inline _gemv_t_simd!(m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}) where {T <: BlasReal, B0} =
