@@ -64,7 +64,10 @@ function knob_rows()
             m = match(r"@load_preference\(\"([^\"]+)\"\s*,?(.*)$", ln)
             isnothing(m) && continue
             key = m.captures[1]
-            default = strip(String(m.captures[2]))
+            # Trim a trailing line comment: the capture runs to end-of-line, so `8)::Int  # req8-ok: …`
+            # would publish the marker text inside the Default column. Only strip a ` #` that follows
+            # whitespace, so a `#` inside a string default is left alone.
+            default = strip(replace(String(m.captures[2]), r"\s+#.*$" => ""))
             cm = match(r"^\s*const\s+(\w+)", ln)
             # the PDM marker may sit on any comment line just above
             pdm = ""
