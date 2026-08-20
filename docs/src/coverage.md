@@ -202,8 +202,8 @@ factorization.
 
 | Op | Routines | Types | Routes | Zen3 | Zen4 | Zen5 |
 |---|---|---|---|---|---|---|
-| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, stedc, steqr, ormtr | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
-| Symmetric / Hermitian (values only) | syev, sterf | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
+| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, ormtr, *stedc\*, steqr\** | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
+| Symmetric / Hermitian (values only) | syev, *sterf\** | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
 | Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | | | ⏳ |
 | Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | | | ⏳ |
 | Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | | | ⏳ |
@@ -211,6 +211,12 @@ factorization.
 | Generalized nonsym (QZ) | ggev, gges, gghrd, hgeqz, tgevc | s/d/c/z | ✅ | | | ⏳ |
 | Schur reordering | trexc, trsen | s/d/c/z | ✅ | | | ⏳ |
 | Sylvester / Lyapunov | trsyl | s/d/c/z | ✅ | | | ⏳ |
+
+*\* `stedc`, `steqr` and `sterf` are **implemented but not forwarded**: they are the internal
+building blocks `syev`/`heev` are composed from, and PureBLAS exposes no `stedc_64_`/`steqr_64_`/
+`sterf_64_` symbol, so a program calling one of them **directly** still reaches OpenBLAS. Every other
+routine in these two rows is forwarded and does route to PureBLAS. Verified against `src/cabi/`,
+2026-08-20.*
 
 ## LAPACK — banded / tridiagonal / packed
 
