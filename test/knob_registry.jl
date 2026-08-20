@@ -60,7 +60,18 @@ function knob_rows()
         endswith(f, ".jl") || continue
         rel = relpath(joinpath(root, f), joinpath(_KR_ROOT, "src"))
         lines = readlines(joinpath(root, f))
+        # A `# PDM:` marker binds to the NEXT `@load_preference`, and is CONSUMED by it.
+        # ⚠ The first version scanned UPWARD 12 lines from each knob, which silently gave a marker to
+        # every knob within 12 lines of it — 4 of 15 "audited" rows were a neighbour's justification
+        # (cgemv_rb, syr2k_2pass, cpotrf_base, pptrf_blk_min). A registry that mislabels a knob is
+        # worse than one that admits it is unaudited, so binding is now one-to-one and forward-only.
+        pending, pending_at = "", 0
         for (i, ln) in pairs(lines)
+            mp = match(r"#\s*PDM:\s*(.+?)\s*$", ln)
+            if !isnothing(mp)
+                pending, pending_at = String(mp.captures[1]), i
+                continue
+            end
             m = match(r"@load_preference\(\"([^\"]+)\"\s*,?(.*)$", ln)
             isnothing(m) && continue
             key = m.captures[1]
@@ -69,12 +80,10 @@ function knob_rows()
             # whitespace, so a `#` inside a string default is left alone.
             default = strip(replace(String(m.captures[2]), r"\s+#.*$" => ""))
             cm = match(r"^\s*const\s+(\w+)", ln)
-            # the PDM marker may sit on any comment line just above
-            pdm = ""
-            for j in max(1, i - 12):(i - 1)
-                mm = match(r"#\s*PDM:\s*(.+?)\s*$", lines[j])
-                isnothing(mm) || (pdm = String(mm.captures[1]))
-            end
+            # Consume a pending marker only if it sits within 12 lines — a marker further off belongs
+            # to something else (or to nothing), and guessing is what caused the mis-binding above.
+            pdm = (!isempty(pending) && i - pending_at <= 12) ? pending : ""
+            pending, pending_at = "", 0
             push!(rows, (; key, file = rel, family = _kr_family(rel),
                          const_name = isnothing(cm) ? "—" : String(cm.captures[1]),
                          default = isempty(default) ? "—" : default,
