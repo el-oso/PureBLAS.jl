@@ -107,8 +107,12 @@
     @test P._at_pbtrf_ucross(Zen3, Float64) == 192        # MODAL on Zen3 (192x4, 256, 192)
     @test P._at_pbtrf_ucross(Zen3, Float64) != P._at_pbtrf_ucross(Zen3)   # the two rules disagree
     # brd_nb is a formula on all three boxes, each stable 6/6.
-    @test P._at_brd_nb(Zen4) == 4 && P._at_brd_nb(Zen5) == 4
-    @test P._at_brd_nb(Zen3) == 8
+    # 8 on EVERY box. The width formula `32 ÷ _lanes(hw,Float64)` was FALSIFIED by the gate on
+    # 2026-08-20: Zen4 gesvd 0.988 FAIL -> 1.058 PASS, Zen5 1.053 -> 1.101. It had
+    # reproduced the duel exactly (wm 4, Zen3 8, neuro 4, stable 6/6 each), which is precisely how a
+    # wrong measurement propagates into a derivation that looks rigorous.
+    @test P._at_brd_nb(Zen4) == 8 && P._at_brd_nb(Zen5) == 8
+    @test P._at_brd_nb(Zen3) == 8 && P._at_brd_nb(tigerlake) == 8
 
     @test P._at_axpy_dram(Zen4) == 208
     @test P._at_axpy_dram(Zen3) == 4
