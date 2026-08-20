@@ -24,7 +24,7 @@ debt. The `# PDM:` marker is the human judgement and is the column that matters.
 | Predicate-keyed | 11 |
 | Pref-gated | 20 |
 
-**Audited: 11 / 118** knobs carry a `# PDM:` marker. The rest are the
+**Audited: 16 / 118** knobs carry a `# PDM:` marker. The rest are the
 worklist — an unaudited knob is one nobody has justified, which is exactly how redundant
 and duplicated knobs survive.
 
@@ -132,10 +132,10 @@ and duplicated knobs survive.
 
 | Key | Const | Default | Tier | PDM justification |
 |---|---|---|---|---|
-| `pbtrf_cross_kd` | `_PBTRF_CROSS_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `pbtrf_nb` | `_PBTRF_NB_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `pbtrf_nb_small` | `_PBTRF_NBS_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `pbtrf_u_native_kd` | `_PBTRF_UCROSS_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| `pbtrf_cross_kd` | `_PBTRF_CROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER. Two derivations attempted and FALSIFIED 2026-08-20, do not re-try: lanes-proportional (cross/lanes = 3,4,2,2 on wintermute vs 8,16,4,8 on galen) and fixed byte budget (cross*sizeof(T) = 192,256,128,128 vs 256,512,128,256). Neither constant within a box, let alone across. \| tune: candidate — pbtrf_cross F64 flips on ALL THREE boxes and is deliberately NOT converted (see cpuinfo c7) |
+| `pbtrf_nb` | `_PBTRF_NB_PREF` | `nothing)` | Pref-gated | Derived(width) — panel width counted in vector registers; see _at_pbtrf_nb in cpuinfo (c6) for the 3-box x 6-process table. Falsifier: a wide-SIMD box wanting the narrow width. \| tune: n/a — width follows the ISA |
+| `pbtrf_nb_small` | `_PBTRF_NBS_PREF` | `nothing)` | Pref-gated | Derived(width) — a panel width is counted in VECTOR REGISTERS, so SIMD width is the physical unit. The F32 method is a pure formula (_lanes(hw, Float32)) reproduced on all three boxes, which is the evidence that the unit is right; F64 is the keyed table row. Discriminating, not a fit: wintermute and neuromancer agree and share simd=64 while _double_pumped SEPARATES them. \| tune: n/a for F32 (formula); F64 row is a candidate |
+| `pbtrf_u_native_kd` | `_PBTRF_UCROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER, not a width: the vector-register mechanism that justifies pbtrf_nb does NOT extend to a size threshold. F64 measures 192 on galen where its own F32/C32 sibling formula (l2 / 4096) says 128, so the family does not obey one rule. Evidence is 6 processes x 3 boxes; MODAL rows named in cpuinfo (c7). \| tune: candidate — the F64 row is a modal-of-modals, the weakest thing shipped in this family |
 
 ## LAPACK · bunchkaufman
 
@@ -148,7 +148,7 @@ and duplicated knobs survive.
 
 | Key | Const | Default | Tier | PDM justification |
 |---|---|---|---|---|
-| `gbtrf_cross` | `_GBTRF_CROSS_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| `gbtrf_cross` | `_GBTRF_CROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER, derivation falsified (see pbtrf_cross_kd for the two dead ends and their arithmetic). The C32 row is NOT width-split like its C64 sibling: wintermute is a true 3-3 TIE (16,16,8,16,8,8) and the AVX-512 boxes disagree with each other, which is why it is a bare literal 16 and not a formula. \| tune: candidate — C32 is resolving a coin flip |
 | `gbtrf_nb` | `_GBTRF_NB_PREF` | `nothing)` | Pref-gated | *unaudited* |
 
 ## LAPACK · lapack

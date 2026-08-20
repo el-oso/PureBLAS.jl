@@ -124,6 +124,7 @@ end
 # NOT scaled by _vwidth: an earlier version bracketed on multiples of W and that was wrong — a W=4 box
 # (Zen3/AVX2) could then only reach 32, and measured 0.74-1.01 across kd = 96…256 because the optimum was
 # outside its own candidate set. The panel width is a blocking/overhead parameter, not a vector-width one.
+# PDM: Derived(width) — panel width counted in vector registers; see _at_pbtrf_nb in cpuinfo (c6) for the 3-box x 6-process table. Falsifier: a wide-SIMD box wanting the narrow width. | tune: n/a — width follows the ISA
 const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
 @static if isnothing(_PBTRF_NB_PREF)
     @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
@@ -157,6 +158,7 @@ end
 # the vector width {1,2,3,4}·W, probed at kd = 4W: unlike the wide-band bracket (which correctly is
 # NOT W-scaled, see above), the narrow-band optimum sits at the bottom of the range where a panel is
 # a small multiple of one SIMD register, so W is the right unit here.
+# PDM: Derived(width) — a panel width is counted in VECTOR REGISTERS, so SIMD width is the physical unit. The F32 method is a pure formula (_lanes(hw, Float32)) reproduced on all three boxes, which is the evidence that the unit is right; F64 is the keyed table row. Discriminating, not a fit: wintermute and neuromancer agree and share simd=64 while _double_pumped SEPARATES them. | tune: n/a for F32 (formula); F64 row is a candidate
 const _PBTRF_NBS_PREF = @load_preference("pbtrf_nb_small", nothing)
 @static if isnothing(_PBTRF_NBS_PREF)
     # F32 is exactly `_lanes(hw, Float32)` on all three boxes — a formula, not a table.
@@ -177,6 +179,7 @@ end
 end
 
 # ── crossover kd — MEASURE tier (see the tier discussion at pbtrf! above) ─────────────────────────
+# PDM: Literal(keyed) — CROSSOVER. Two derivations attempted and FALSIFIED 2026-08-20, do not re-try: lanes-proportional (cross/lanes = 3,4,2,2 on wintermute vs 8,16,4,8 on galen) and fixed byte budget (cross*sizeof(T) = 192,256,128,128 vs 256,512,128,256). Neither constant within a box, let alone across. | tune: candidate — pbtrf_cross F64 flips on ALL THREE boxes and is deliberately NOT converted (see cpuinfo c7)
 const _PBTRF_CROSS_PREF = @load_preference("pbtrf_cross_kd", nothing)
 @static if isnothing(_PBTRF_CROSS_PREF)
     # Base-only + TOTAL (OncePerProcess poisons the process if the initializer throws) → catch →
@@ -212,6 +215,7 @@ end
 #              by 2.3–3.3× at 6W/8W on Zen4); there is nothing for the native kernel to win back.
 #   upper 64W — a full band block already exceeds every fleet L2 by then; if native has not won by
 #              64W it never will, and the harness returns typemax (never go native).
+# PDM: Literal(keyed) — CROSSOVER, not a width: the vector-register mechanism that justifies pbtrf_nb does NOT extend to a size threshold. F64 measures 192 on galen where its own F32/C32 sibling formula (l2 / 4096) says 128, so the family does not obey one rule. Evidence is 6 processes x 3 boxes; MODAL rows named in cpuinfo (c7). | tune: candidate — the F64 row is a modal-of-modals, the weakest thing shipped in this family
 const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
 @static if isnothing(_PBTRF_UCROSS_PREF)
     # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
