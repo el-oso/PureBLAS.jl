@@ -33,9 +33,17 @@
         cur = ""
         for ln in split(src, '\n')
             m = match(r"^@inline (_at_\w+)\(", ln)
-            !isnothing(m) && (cur = m.captures[1])
-            # a non-`_at_` top-level definition ends the current knob's body
-            (startswith(ln, "const ") || startswith(ln, "function ")) && (cur = "")
+            if !isnothing(m)
+                cur = m.captures[1]
+            elseif startswith(ln, "const ") || startswith(ln, "function ") || startswith(ln, "@inline ")
+                # ANY other top-level definition ends the current knob's body.
+                # ⚠ This used to reset only on `const`/`function`, so a later `@inline _wide_simd(hw) =
+                # hw.simd >= 64` — a predicate DEFINITION, not a use — was credited to whichever `_at_`
+                # was last seen, flagging an innocent knob (`_at_gemvt_percol_xmax`, 2026-08-21). Same
+                # mis-attribution class as the knob-registry marker bug fixed the day before: a scanner
+                # that keeps state across a definition boundary blames the wrong symbol.
+                cur = ""
+            end
             isempty(cur) || !ispred(ln) || cur in keyed || push!(keyed, cur)
         end
         return keyed

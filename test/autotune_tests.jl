@@ -124,6 +124,28 @@
     @test P._at_gemvt_perscan(Zen3) == 0         # AVX2: blocked, forcing mode 1 costs it 29%
     @test P._at_gemvt_perscan(tigerlake) == 0     # unseen hardware gets the conservative arm
 
+    # gemv-T per-column WINDOW BOUNDS, exposed 2026-08-21. BEHAVIOUR-NEUTRALITY IS THE POINT: the
+    # defaults must be exactly the two values that were hardcoded in `_gemvt_perscan`, or an unpinned
+    # build silently re-routes gemv-T on every box. Asserted, not asserted-in-prose.
+    @test P._GEMVT_PERCOL_AMIN == P._L2_BYTES
+    @test P._GEMVT_PERCOL_XMAX == P._L1_BYTES ÷ 2
+    for hw in (Zen4, Zen3, Zen5, tigerlake)
+        @test P._at_gemvt_percol_amin(hw) == hw.l2
+        @test P._at_gemvt_percol_xmax(hw) == hw.l1 ÷ 2
+    end
+    # The window CAN express each box's measured per-size optimum — that is why the knob was reshaped.
+    # F64 square: per-column iff m*n*8 > AMIN && m*8 <= XMAX.
+    percol(hw, n, amin, xmax) = (n * n * 8 > amin) && (n * 8 <= xmax)
+    # Zen4: the DEFAULT bounds already are its optimum (percol 512..2048, blocked 4096)
+    @test [percol(Zen4, n, Zen4.l2, Zen4.l1 ÷ 2) for n in (512, 1024, 2048, 4096)] ==
+          [true, true, true, false]
+    # Zen3 wants percol at n=1024 ONLY -> AMIN 2 MiB (excludes 512), XMAX 8 KiB (excludes 2048)
+    @test [percol(Zen3, n, 2 * 1024^2, 8192) for n in (512, 1024, 2048, 4096)] ==
+          [false, true, false, false]
+    # Zen5 wants percol at n=512 ONLY -> XMAX 4 KiB
+    @test [percol(Zen5, n, Zen5.l2, 4096) for n in (512, 1024, 2048, 4096)] ==
+          [true, false, false, false]
+
     @test P._at_axpy_dram(Zen4) == 208
     @test P._at_axpy_dram(Zen3) == 4
     @test P._at_axpy_dram(Zen5) == 4
