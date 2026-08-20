@@ -1188,7 +1188,22 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # gemvt_perscan flip fixed the same day.
     # 2 is therefore both the documented safe default AND the modal measurement (16 of 18 samples
     # across both boxes). Pin `sytrf_cmult` to retune for a specific machine.
-    const _SYTRF_CMULT = something(_SYTRF_CMULT_PREF, 2)::Int   # req8-ok: documented safe default, table above
+    # ⚠ 3, NOT 2 — GATE-MEASURED 2026-08-20 on all three boxes by forcing each arm through plots.jl:
+    #     box          cmult=1   cmult=2   cmult=3
+    #     wintermute    1.034     1.011     1.060   (+4.8% over 2)
+    #     galen         1.087     1.082     1.115   (+3.0% over 2)
+    #     neuromancer   1.041     1.069     1.067   (-0.2%, a tie inside the noise floor)
+    # 3 wins on two boxes and ties on the third; no box meaningfully prefers 2.
+    #
+    # THE PREVIOUS JUSTIFICATION FOR 2 WAS FALSIFIED. The `catch` above returns 2 with the comment
+    # "the safer default: 1 MISSES on Zen3", and that was cited as the reason 2 was both safe and modal.
+    # Galen IS Zen3 and cmult=1 reads 1.087 PASS there — it does not miss. The comment is stale.
+    #
+    # AND THE DUEL NEVER PICKED 3. It resolved 2 in 16 of 18 samples across two boxes, and the deleted
+    # duel could only ever return its own candidates. Modal agreement across processes measures the
+    # TUNER'S CONSISTENCY, not the value's quality — the same failure as brd_nb, which matched the duel
+    # 6/6 on three boxes and was still 7% off. Only forcing the alternative through the gate finds these.
+    const _SYTRF_CMULT = something(_SYTRF_CMULT_PREF, 3)::Int   # req8-ok: gate-measured, table above
     @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
         clamp((f = _fk("sytrf_cmult"); f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
     @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
