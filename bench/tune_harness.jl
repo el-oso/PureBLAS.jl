@@ -27,7 +27,12 @@ using Chairmarks: @be
 using Statistics: median
 
 const ANCHOR_N = 1 << 16                       # fixed workload, L2-resident, no allocation per call
-const ANCHOR_TOL = 0.03                        # 3% — beyond this the machine changed, not the kernel
+# ⚠ CALIBRATED AGAINST THE ANCHOR'S OWN NOISE, not intuition. This was 3%, which is BELOW the
+# instrument's repeatability — 10 idle freq-locked reads on 2026-08-20 gave wintermute 5.3%,
+# neuromancer 6.0%, galen 22.2%. A guard tighter than its own instrument fires on nothing but noise:
+# at 3% it refused a clean +20.6% ger_panel_np win because the anchor moved 3.7%. See
+# kb/findings/pureblas-run-anchor-is-not-l2-resident-on-zen3.md.
+const ANCHOR_TOL = 0.08                        # above every box's measured anchor repeatability
 const STABILISE_MAX_S = 90.0                   # give up warming up after this and say so
 
 function _anchor_secs()

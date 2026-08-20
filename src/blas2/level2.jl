@@ -1787,7 +1787,23 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # argument (no recompile per candidate) and writes `ger_panel_np` into LocalPreferences.toml. On the
 # fleet that is worth 8 on Zen4 and 1 on Zen5 — this file records the gate measuring np=1 twelve
 # percent faster than np=8 at n=2048 there, so the pin is not cosmetic.
-const _GER_NP = something(@load_preference("ger_panel_np", nothing), 4)::Int   # req8-ok: documented incumbent
+# MINIMAX DEFAULT, gate-measured on all three boxes 2026-08-20 (op=ger, arms=pb, forced each arm):
+#     np       wintermute   galen    neuromancer     WORST
+#      1         0.884      0.970      1.013 PASS    0.884
+#      4         0.935      0.981      0.714 FAIL    0.714   <- was the default
+#      8         0.986      0.975      0.800 FAIL    0.800
+# THIS KNOB IS GENUINELY PER-MACHINE — the retired duel was RIGHT about it. Its per-box optima are
+# 8 / 4 / 1, and wintermute and neuromancer want 8 vs 1 despite sharing L2, L3, simd AND nvreg. No
+# formula reproduces that; a single value is a compromise by construction, not a derivation.
+# 1 is chosen by WORST CASE, which is the correct criterion for a value that must run on machines
+# nobody has measured: it is the only candidate that collapses nowhere, and the only one that lets
+# neuromancer pass at all. The previous default of 4 cost that box 29.5% against its own optimum and
+# turned a PASS into a FAIL — the largest regression of the OncePerProcess campaign, and self-inflicted:
+# the scan reported 8/4/1 with no pattern, which should have BLOCKED the conversion rather than
+# selecting a fallback from it.
+# RUN `PureBLAS.tune!()` to replace this with your machine's actual optimum (recovers 8 on Zen4, 4 on
+# Zen3). The default only has to be non-catastrophic until then.
+const _GER_NP = something(@load_preference("ger_panel_np", nothing), 1)::Int   # req8-ok: minimax, table above
 @inline _ger_np() = (f = _fk("ger_panel_np"); f >= 0 ? f : _GER_NP)
 
 @generated function _ger_panel!(
