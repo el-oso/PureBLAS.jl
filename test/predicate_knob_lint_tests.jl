@@ -48,6 +48,27 @@
         end
         return keyed
     end
+    # ── FIXTURE: the scanner tested against ground truth, including the case that broke it ──────────
+    # A bare `!isempty(result)` proves only that the scanner found SOMETHING; every failure of this
+    # scanner class has been MIS-attribution, which sails past that check. So the binder is pinned to a
+    # synthetic source whose correct answer is known by construction.
+    fixture = """
+    @inline _at_alpha(hw) = _double_pumped(hw) ? 1 : 0
+    @inline _at_beta(hw) = hw.l1 ÷ 2
+    @inline _wide_simd(hw) = hw.simd >= 64
+    @inline _at_gamma(hw) = _wide_simd(hw) ? 8 : 4
+    const _SOMETHING = 3
+    @inline _at_delta(hw) = hw.l2
+    """
+    got = scan(fixture)
+    # _at_alpha USES a predicate -> flagged. _at_beta does not -> not flagged.
+    # _at_gamma USES one -> flagged. _at_delta does not -> not flagged.
+    # ⚠ THE REAL BUG: `_wide_simd`'s own DEFINITION line contains "_wide_simd(", and the scanner used
+    # to still be "inside" _at_beta there, so _at_beta was flagged for its neighbour's definition.
+    # That is what this fixture exists to catch, and it is the same shape as three other bugs in this
+    # tree (knob-registry marker binding, the marker rewriter, the audit skip-test).
+    @test got == ["_at_alpha", "_at_gamma"]
+
     keyed = scan(cpu)
 
     @test !isempty(keyed)   # the scanner must actually find something, or it proves nothing
