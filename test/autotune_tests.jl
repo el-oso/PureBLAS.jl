@@ -169,3 +169,32 @@
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)
     @test P._CPOTF2_MR == P._at_cpotf2_mr(P._HW)
 end
+
+@testitem "trsm_base is clamped to the scratch it indexes" tags = [:unit] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    # `_trsm_base_invL!/_invR!` build the inverse in `view(_l3_tmp(T), 1:nb, 1:nb)`, a fixed
+    # _L3_NB×_L3_NB buffer — so the recursion base MUST NOT exceed _L3_NB. While `_TRSM_BASE` was a
+    # bare const the invariant was unreachable; making it a preference put it in the user's hands, and
+    # a pin is the one tier that cannot be exercised from here. Unclamped, `trsm_base = 4096` threw a
+    # BoundsError from inside the kernel naming neither the preference nor the limit (measured on all
+    # three fleet boxes, 2026-08-21). Both the const and the force hook are clamped; this pins both.
+    @test P._TRSM_BASE <= P._L3_NB
+    n = 192                                    # > _L3_NB, so the recursion descends past the base
+    A = randn(n, n) ./ (2n); for i in 1:n; A[i, i] = 1 + abs(A[i, i]); end
+    B0 = randn(n, n)
+    want = UpperTriangular(A) \ B0
+    if PureBLAS._FORCE_HOOKS
+        old = P._FK["trsm_base"][]
+        try
+            for v in (1, 2, 4096)              # a real pin lands inside these endpoints
+                P._FK["trsm_base"][] = v
+                @test P._trsm_base() <= P._L3_NB
+                B = copy(B0); P.trsm!(B, A; side = 'L', uplo = 'U')
+                @test norm(B - want, Inf) / max(1.0, norm(want, Inf)) < 1e-8
+            end
+        finally
+            P._FK["trsm_base"][] = old
+        end
+    end
+end
