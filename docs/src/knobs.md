@@ -24,7 +24,7 @@ debt. The `# PDM:` marker is the human judgement and is the column that matters.
 | Predicate-keyed | 11 |
 | Pref-gated | 20 |
 
-**Audited: 18 / 120** knobs carry a `# PDM:` marker. The rest are the
+**Audited: 23 / 120** knobs carry a `# PDM:` marker. The rest are the
 worklist — an unaudited knob is one nobody has justified, which is exactly how redundant
 and duplicated knobs survive.
 
@@ -67,8 +67,8 @@ and duplicated knobs survive.
 | `tri_c_t_unb` | `_TRI_C_T_UNB` | `1024)::Int` | Literal | *unaudited* |
 | `tri_nb` | `_TRI_NB` | `clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int` | Derived | *unaudited* |
 | `tri_t_unb` | `_TRI_T_UNB` | `512)::Int` | Literal | *unaudited* |
-| `trmv_f_dram` | `_TRMV_F_DRAM` | `4)::Int` | Literal | *unaudited* |
-| `trmv_f_switch` | `_TRMV_F_SWITCH` | `2)::Int` | Literal | *unaudited* |
+| `trmv_f_dram` | `_TRMV_F_DRAM` | `4)::Int` | Literal | Literal(constrained) — the measured plateau is F in 2..6 and the panel arithmetic uses `n & (F-1)` for the ragged first block, so F MUST be a power of two; 4 is the largest admissible value on the plateau. The choice is forced by the kernel's addressing, not fitted to a box. \| tune: low value — the whole plateau measures flat, so a pin buys nothing unless the addressing changes |
+| `trmv_f_switch` | `_TRMV_F_SWITCH` | `2)::Int` | Literal | Derived — NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. \| tune: n/a — Derived |
 | `trmv_fused_min` | `_TRMV_FUSED_MIN_PREF` | `nothing)` | Pref-gated | *unaudited* |
 | `trsv_reg_max` | `_TRSV_REG_MAX` | `_SCALAR_FPREGS - 4)::Int` | Derived | *unaudited* |
 | `zhemv_pf` | `_ZHEMV_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
@@ -163,7 +163,7 @@ and duplicated knobs survive.
 | `cpotf2_mr` | `_CPOTF2_MR` | `_at_cpotf2_mr(_HW))::Int` | Derived | *unaudited* |
 | `cpotrf_base` | `_CPOTRF_BASE` | `_at_cpotrf_base(_HW))::Int` | Derived | *unaudited* |
 | `cpotrf_nbmax` | `_CPOTRF_NBMAX` | `_at_cpotrf_nbmax(_HW))::Int` | Derived | *unaudited* |
-| `potrf_base` | `_POTRF_BASE` | `32)::Int` | Literal | *unaudited* |
+| `potrf_base` | `_POTRF_BASE` | `32)::Int` | Literal | Literal(invariant) — a RECURSION-OVERHEAD floor, not a residency block, so there is nothing to derive it from: the L1-residency guess sqrt(L1/8)=64 measures WORSE than 32, and the optimum is small and µarch-FLAT (16-32 on both fleet ISAs). Matches `_CHOL_SB`=32 independently. Fleet A/B validated (base=512 was up to 43.9x slower than OB). Falsifier: a box whose optimum is NOT in 16-32. Catalogued in docs/src/tuning.md §4. \| tune: not a candidate — measured µarch-invariant; a formula would add spurious variation, exactly as the falsified `_LU_NB` derivation did |
 | `potrf_base_f32` | `_POTRF_BASE_F32` | `_POTRF_BASE >> 1)::Int` | Coupled | Derived(sibling) — sizeof-ratio derivation, not a borrowed literal: F32 is half the bytes of F64, so the same recursion-overhead floor sits at half the n. Documented in tuning.md §4 alongside `_POTRF_BASE`, whose own status is validated-literal (the residency guess sqrt(L1/8)=64 measured WORSE than 32). \| tune: n/a — follows potrf_base |
 | `potrf_pad` | `_POTRF_PAD` | `true)::Bool` | Flag | *unaudited* |
 | `potrf_upper_direct_max` | `_POTRF_UDIRECT_PREF` | `nothing)` | Pref-gated | *unaudited* |
@@ -174,7 +174,7 @@ and duplicated knobs survive.
 |---|---|---|---|---|
 | `pptrf_blk_min` | `_PPTRF_BLK_MIN` | `16)::Int` | Literal | *unaudited* |
 | `pptrf_blk_nb` | `_PPTRF_BLK_NB` | `_LU_NB)::Int` | Coupled | Literal(borrowed) — packed Cholesky's own blocked panel width, inheriting LU's `_LU_NB` as a prior. A real degree of freedom: pptrf works on PACKED storage, so its panel does not have LU's stride or its store-traffic profile, and _LU_NB is itself a falsified-derivation literal (see tuning.md §4) — an inherited value whose own justification is "the residency formula was wrong for LU". UNVALIDATED FOR THIS KERNEL. \| tune: candidate — sweep nb against the pptrfL/pptrfU rows; both currently gate, so this is upside-hunting, not a fix |
-| `pptrf_spr_min` | `_PPTRF_SPR_PREF` | `0)::Int` | Literal | *unaudited* |
+| `pptrf_spr_min` | `_PPTRF_SPR_PREF` | `0)::Int` | Literal | Exempt — 0 is the UNSET SENTINEL, not a tuning value. When the preference is absent this reads 0 and the per-type derivation applies; a pin replaces it. Nothing to derive, because the number is not a size. (The module-level form is load-bearing: an in-body `@load_preference` does not const-fold here — a recorded hazard in this tree.) \| tune: n/a — sentinel |
 
 ## LAPACK · pstrf
 
@@ -219,7 +219,7 @@ and duplicated knobs survive.
 | `gemm_nr` | `_NR` | `_at_gemm_nr(_HW))::Int` | Derived | *unaudited* |
 | `gemm_split_max` | `_GEMM_SPLIT_MAX` | `_at_gemm_split_max(_HW))::Int` | Derived | *unaudited* |
 | `gemm_unpack_max` | `_GEMM_UNPACK_MAX` | `_at_gemm_unpack_max(_HW))::Int` | Derived | *unaudited* |
-| `strassen` | `_STRASSEN` | `_W64 == 4 \|\| _W64 == 8)::Bool` | Predicate-keyed | *unaudited* |
+| `strassen` | `_STRASSEN` | `_W64 == 4 \|\| _W64 == 8)::Bool` | Predicate-keyed | Flag — an on/off capability switch, not a size. ON for W=4/8 because Strassen's saving is a FLOP |
 | `strassen_maxdepth` | `_STRASSEN_MAXDEPTH` | `3)::Int` | Literal | *unaudited* |
 | `strassen_min` | `_STRASSEN_MIN` | `1024)::Int` | Literal | *unaudited* |
 

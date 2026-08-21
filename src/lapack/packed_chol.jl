@@ -70,6 +70,7 @@ const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 # `@load_preference` stays at MODULE level, never in the body: an in-body load is a recorded hazard in
 # this tree (it does not const-fold the way the module-level form does). 0 is the unset sentinel, so the
 # per-type derivation still applies when no preference is set.
+# PDM: Exempt — 0 is the UNSET SENTINEL, not a tuning value. When the preference is absent this reads 0 and the per-type derivation applies; a pin replaces it. Nothing to derive, because the number is not a size. (The module-level form is load-bearing: an in-body `@load_preference` does not const-fold here — a recorded hazard in this tree.) | tune: n/a — sentinel
 const _PPTRF_SPR_PREF = @load_preference("pptrf_spr_min", 0)::Int   # req8-ok: unset sentinel, not a tuning value
 @inline _pptrf_spr_min(::Type{T}) where {T} = _PPTRF_SPR_PREF > 0 ? _PPTRF_SPR_PREF : 2 * _vwidth(T)
 

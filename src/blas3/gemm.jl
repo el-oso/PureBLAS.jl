@@ -1319,6 +1319,9 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 # 1.26× at 4096). Split while min(m,n,k) ≥ _STRASSEN_MIN (base stays ≥ ~min/2), capped at _MAXDEPTH.
 # NN + real α/β only (trans/complex fall back). Default ON for W=4/8 (real gemm is throughput-bound on
 # both AVX2 and AVX-512 — Strassen's flop cut is ISA-independent); per-box threshold via Preferences.
+# PDM: Flag — an on/off capability switch, not a size. ON for W=4/8 because Strassen's saving is a FLOP
+# CUT, which is ISA-independent, and real gemm is throughput-bound on both AVX2 and AVX-512; the guard
+# exists only to exclude widths the packing path does not implement. | tune: n/a — capability, not tuning
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
