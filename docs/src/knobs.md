@@ -13,18 +13,9 @@ Every `@load_preference` key in `src/` — 120 of them.
 | **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
-| **Unaudited** | Nobody has classified it yet. Debt, not a verdict. |
 
-**Reviewed tier:** 62 Derived · 10 Measured · 40 Literal · 8 Exempt · 0 Unaudited.
-**Default form** (mechanical, all 120): 54 formula · 20 delegates · 6 sibling · 35 literal · 4 flag · 1 other.
-
-**120 / 120 reviewed.** ⚠ READ THE TWO LINES ABOVE TOGETHER. `Unaudited`
-means *nobody has classified it yet* — NOT that it is un-derived. The **default form** column
-is the mechanical evidence about those knobs, and it says 54 of 120 defaults are outright
-formulas over detected consts. Several of the `delegates` rows resolve through an `_at_*`
-formula under a different name too (e.g. `pbtrf_nb_small` → `_at_pbtrf_nbs`). So the library
-is *mostly derived*; the reviewed-tier counts are small because the review is young, and
-reading them alone understates it badly.
+**Tier:** 62 Derived · 10 Measured · 40 Literal · 8 Exempt.
+**Default form** (mechanical): 54 formula · 20 delegates · 6 sibling · 35 literal · 4 flag · 1 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -32,7 +23,7 @@ reading them alone understates it badly.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `axpy_dram` | formula | Derived | narrow 256-bit arm iff the datapath double-pumps; +17% Zen4, loses on Zen3. | n/a |
-| `axpy_unroll` | formula | Derived | formula over detected consts: `_at_axpy_band(_HW` | — |
+| `axpy_unroll` | formula | Derived | formula over detected consts: `_at_axpy_band(_HW)` | — |
 | `zaxpy_narrow` | delegates | Derived | the criterion IS the datapath: narrow arm iff _datapath_bytes <= 32. | n/a |
 
 ## BLAS-2 (gemv/ger/trmv/trsv)
@@ -105,14 +96,14 @@ reading them alone understates it badly.
 | `ctrsm_rec_l` | literal | Literal | recursion cut for complex trsm side-L; per-box. | candidate |
 | `gemmtrsm_mr` | formula | Derived | formula over detected consts: `min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV` | — |
 | `gemmtrsm_nrv` | formula | Derived | formula over detected consts: `_GT_NREG >= 32 ? 3 : 2` | — |
-| `symm_pack_cut` | formula | Derived | formula over detected consts: `_at_symm_mat_max(_HW` | — |
+| `symm_pack_cut` | formula | Derived | formula over detected consts: `_at_symm_mat_max(_HW)` | — |
 | `syr2k_2pass` | formula | Literal | two-pass enabled on AVX2 only (typemax disables it on AVX-512); measured, not derived. | candidate |
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
-| `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW` | — |
+| `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | rank-k row-block factor; 2 measured, not derived from the register file. | candidate |
-| `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW` | — |
+| `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
@@ -158,9 +149,9 @@ reading them alone understates it badly.
 | `chol_base_split` | formula | Derived | formula over detected consts: `_INTEL_AVX2` | — |
 | `chol_nb` | literal | Literal | trsm panel width, measured µarch-invariant; confirm on the fleet before deriving. | candidate |
 | `chol_nc` | literal | Literal | syrk column block, same status as chol_nb. | candidate |
-| `cpotf2_mr` | formula | Derived | formula over detected consts: `_at_cpotf2_mr(_HW` | — |
+| `cpotf2_mr` | formula | Derived | formula over detected consts: `_at_cpotf2_mr(_HW)` | — |
 | `cpotrf_base` | formula | Derived | 32 + 4*lanes: a width-independent overhead floor plus a per-lane slope. | n/a |
-| `cpotrf_nbmax` | formula | Derived | formula over detected consts: `_at_cpotrf_nbmax(_HW` | — |
+| `cpotrf_nbmax` | formula | Derived | formula over detected consts: `_at_cpotrf_nbmax(_HW)` | — |
 | `potrf_base` | literal | Literal | recursion-overhead floor, µarch-flat at 16-32; the residency guess 64 is worse. | no |
 | `potrf_base_f32` | sibling | Derived | sizeof ratio: F32 is half F64's bytes, so half the n. | n/a, follows potrf_base |
 | `potrf_pad` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
@@ -210,13 +201,13 @@ reading them alone understates it badly.
 | `cgemm_tiny` | literal | Literal | tiny-n bypass for complex gemm. | candidate |
 | `cgemm_unpack_max` | formula | Derived | formula over detected consts: `_W64 == 4 ? 40 : 192` | — |
 | `cuker_nr6_min` | formula | Derived | formula over detected consts: `_W64 == 4 ? 48 : typemax(Int` | — |
-| `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW` | — |
-| `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW` | — |
-| `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW` | — |
-| `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW` | — |
-| `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW` | — |
-| `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW` | — |
-| `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW` | — |
+| `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW)` | — |
+| `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW)` | — |
+| `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW)` | — |
+| `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW)` | — |
+| `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
+| `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
+| `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
 | `strassen_maxdepth` | literal | Literal | recursion depth cap; deeper trades flops for pack/add traffic. | candidate |
 | `strassen_min` | literal | Literal | split while min(m,n,k) >= this; measured, and the base stays >= ~min/2. | candidate |

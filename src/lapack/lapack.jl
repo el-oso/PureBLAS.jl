@@ -101,7 +101,7 @@ end
 # REGRESSES native-512 (Zen5) where MR=1 already saturates. The discriminator is L1D size: 32K on the
 # double-pump/AVX2 boxes, 48K on Zen5 (and Intel Tiger/Ice Lake+) native-512 — so key MR on `_L1_BYTES`
 # (Zen4 fam 25 / Zen5 fam 26 also differ, but L1D is the causal-adjacent cache signal + already a const).
-# PDM: Derived — formula over detected consts: `_at_cpotf2_mr(_HW`
+# PDM: Derived — formula over detected consts: `_at_cpotf2_mr(_HW)`
 const _CPOTF2_MR = @load_preference("cpotf2_mr", _at_cpotf2_mr(_HW))::Int   # req#8: derived 64÷datapath_bytes (2 double-pump/AVX2, 1 native-512)
 
 # Vectorized complex Hermitian Cholesky base (lower, A = L·Lᴴ). Complex analogue of `_chol_base_f64!`:
@@ -1284,7 +1284,7 @@ end
 # a big base cutoff added a discrete base→blocked step; nb=n/4 removes both. Per panel: factor the diagonal
 # jb-block RECURSIVELY (jb>base ⇒ blocks again; jb≤base ⇒ the vectorized unblocked base), trsm side-R 'C'
 # panel solve, herk 'N' rank-jb trailing downdate — all gating L3. BlasComplex only (Dual/upper → generic).
-# PDM: Derived — formula over detected consts: `_at_cpotrf_nbmax(_HW`
+# PDM: Derived — formula over detected consts: `_at_cpotrf_nbmax(_HW)`
 const _CPOTRF_NBMAX = @load_preference("cpotrf_nbmax", _at_cpotrf_nbmax(_HW))::Int   # req#8: derived 64+16·W (128/192)
 @inline _chol_nb(n::Int) = clamp((n >> 2) & ~15, 32, _CPOTRF_NBMAX)     # ~n/4, rounded to a multiple of 16
 function _cpotrf_lower!(A, n::Int)

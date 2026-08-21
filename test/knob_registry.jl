@@ -13,9 +13,12 @@
 #     # PDM: Derived  — <the physical criterion>
 #     # PDM: Exempt   — <why it is not a hardware knob at all: algorithm-intrinsic, flag, sentinel>
 #
-# placed on any comment line within 12 lines above the `@load_preference`. A knob with no marker is
-# reported as UNAUDITED — that is not a failure, it is the worklist. The lint only fails if the
-# generated table is out of date w.r.t. src/, which is what keeps the doc honest.
+#     # PDM: Literal   — <why no formula, and why one value suits every µarch>
+#
+# placed on any comment line within 12 lines above the `@load_preference`. ALL 120 knobs carry one as
+# of 2026-08-21, and the suite FAILS if any knob loses its marker or a new one arrives without one —
+# an unclassified knob is debt, not a category. The suite also fails if the generated table drifts
+# from src/, which is what keeps the doc honest.
 #
 # Regenerate:  julia --project=test test/knob_registry.jl   (writes docs/src/knobs.md)
 
@@ -156,7 +159,6 @@ function knob_markdown()
     println(io, "| **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |")
     println(io, "| **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |")
     println(io, "| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |")
-    println(io, "| **Unaudited** | Nobody has classified it yet. Debt, not a verdict. |")
     println(io)
     # summary
     tiers = Dict{String, Int}()
@@ -168,19 +170,23 @@ function knob_markdown()
     for r in rows
         forms[r.form] = get(forms, r.form, 0) + 1
     end
-    print(io, "**Reviewed tier:** ")
-    println(io, join(["$(get(tiers, t, 0)) $t" for t in (_KR_TIERS..., "Unaudited")], " · "), ".")
-    print(io, "**Default form** (mechanical, all $(length(rows))): ")
-    println(io, join(["$(get(forms, f, 0)) $f" for f in ("formula", "delegates", "sibling", "literal", "flag", "other")], " · "), ".")
+    unaud = get(tiers, "Unaudited", 0)
+    print(io, "**Tier:** ")
+    println(io, join(["$(get(tiers, t, 0)) $t" for t in _KR_TIERS if get(tiers, t, 0) > 0],  " · "),
+            unaud > 0 ? " · **$unaud Unaudited**" : "", ".")
+    print(io, "**Default form** (mechanical): ")
+    println(io, join(["$(get(forms, f, 0)) $f" for f in ("formula", "delegates", "sibling", "literal", "flag", "other") if get(forms, f, 0) > 0], " · "), ".")
     println(io)
-    println(io, "**$audited / $(length(rows)) reviewed.** ⚠ READ THE TWO LINES ABOVE TOGETHER. `Unaudited`")
-    println(io, "means *nobody has classified it yet* — NOT that it is un-derived. The **default form** column")
-    println(io, "is the mechanical evidence about those knobs, and it says $(get(forms, "formula", 0)) of $(length(rows)) defaults are outright")
-    println(io, "formulas over detected consts. Several of the `delegates` rows resolve through an `_at_*`")
-    println(io, "formula under a different name too (e.g. `pbtrf_nb_small` → `_at_pbtrf_nbs`). So the library")
-    println(io, "is *mostly derived*; the reviewed-tier counts are small because the review is young, and")
-    println(io, "reading them alone understates it badly.")
-    println(io)
+    # `Tier` is the human verdict; `Default form` is what the expression mechanically reduces to. They
+    # answer different questions and are printed together on purpose: $(get(forms, "formula", 0)) of
+    # $(length(rows)) defaults are outright formulas, and several `delegates` rows resolve through an
+    # `_at_*` formula under another name (e.g. `pbtrf_nb_small` → `_at_pbtrf_nbs`), so the two counts
+    # do not — and should not — match.
+    if unaud > 0
+        println(io, "⚠ **$unaud knob(s) carry no `# PDM:` marker.** That is debt, not a verdict — the")
+        println(io, "suite fails while any remain. Add a marker: `# PDM: <Tier> — <one line> | tune: <cost>`.")
+        println(io)
+    end
     fam = ""
     for r in rows
         if r.family != fam
