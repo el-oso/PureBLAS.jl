@@ -541,7 +541,8 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # feature. Defaults true so a normal JIT user can A/B without rebuilding.
 # PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
-const _FK_NAMES = ("ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
+const _FK_NAMES = ("trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
+                   "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
                    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan")
 @static if _FORCE_HOOKS
