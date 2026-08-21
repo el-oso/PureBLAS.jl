@@ -48,6 +48,7 @@
 # rank-1 band update against dger — NOT the panel width. Worth stating because the obvious next move,
 # routing that loop through `_ger!`, is the shape that has failed three times already on BLAS-2 entry
 # overhead; it needs measuring, not assuming.
+# PDM: Measured — banded LU panel width; the comment says outright it needs measuring, not assuming. | tune: candidate
 const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
 @static if isnothing(_GBTRF_NB_PREF)
     @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = clamp(8 * (1 + kl ÷ 128), 8, 48)

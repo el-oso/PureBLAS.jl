@@ -23,6 +23,7 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 # with cache — Zen3 L2=512K→~500, Zen4 L2=1M→~1200 — a candidate future SCALES derivation, but too soft/noisy
 # to pin without a dedicated 2-box crossover campaign; a guessed formula would be worse than this literal.)
 # Preferences "trmm_rpack" pins it if a future box measures otherwise.
+# PDM: Literal — measured pack threshold; a box that disagrees pins it rather than editing. | tune: candidate
 const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
 
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
@@ -70,6 +71,7 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
 # DO NOT re-derive this from the in-process probe: it put the crossover near 3072 and called n=2048 a
 # 2.5% win for recursion, where the gate says null. `_measure_gemvt_nc`'s lesson — a probe disagreeing
 # with the gate is evidence about the PROBE — and the reason its own duel is disabled.
+# PDM: Derived — 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | tune: n/a, follows gemm
 const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) ÷ 2)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
@@ -160,6 +162,7 @@ end
 # (Zen4 n=8 dropped 1.20→0.57 when widened to 8) while _trmm_small!'s 8×8 tile is one efficient op.
 # Widening only plausibly helps narrow SIMD (Zen3 W=4: len-4 axpy = a full register) — under A/B; keep 4
 # as the wide-SIMD-safe default. Preference lets a box override without a code push.
+# PDM: Literal — wide-SIMD-safe default for the direct path; per-box override without a code push. | tune: candidate
 const _TRMM_DDIRECT = @load_preference("trmm_ddirect", 4)
 # Small-k trmm at HALF flops and gemm throughput: materialize op(A) into a dense scratch (zeros in the
 # unstored half make every read safe), copy B to scratch (in-place source), then run the UNPACKED gemm
@@ -460,6 +463,7 @@ end
 # unpacked only 0.68–0.73, and ztrmm is pinned at the unpacked ceiling (0.77 ≈ 0.73). AVX-512 already
 # gates via the unpacked path (32 zmm give ample ILP) — restrict packed to AVX2 (W=4) so that gate is
 # untouched. Preferences knob "ctrmm_pack". Fable-designed, decomposition-confirmed 2026-07-05.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # Below this k the packed base's pack overhead loses to the unpacked K-TRIM (measured galen: k=8 0.46 vs
 # unpacked ~1.0, k=32 0.75 vs 0.85; crossover ≈48, k=64 packed 0.91 wins). Recursion bases (k>128 split)
@@ -469,6 +473,7 @@ const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # — the B-vs-M packing asymmetry) and small-n stays sub-gate either way, so a single derived crossover
 # doesn't pay; kept at the measured conservative value. Preferences-pinnable. (req#8: acknowledged debt —
 # the pack-amortization threshold resists a clean cache/ISA formula; revisit with an OB-style fused pack.)
+# PDM: Literal — complex trmm pack threshold. | tune: candidate
 const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
 
 # Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
@@ -1385,6 +1390,7 @@ const _TRSM_DBASE = 32
 # crossover and is not predictable from a detected const — it is a ratio of two kernels' constants.
 # ⚠ Zen4-measured; needs fleet confirmation (the Zen3 crossover looked the same, 2–4, but was taken
 # before the A-pad removal).
+# PDM: Literal — B-width below which the narrow path wins; measured, not derived. | tune: candidate
 const _TRSM_NARROW_MAX = @load_preference("trsm_narrow_max", 4)::Int
 # Column-blocked rank-1 update for the dense trsm base (non-transpose): B[brow0.., c] -= B[irow0, c]·acol
 # over all n columns. Holds the A-column vector across a block of 4 B-columns (reuse) and does the short
@@ -1733,6 +1739,7 @@ const _ZGT_NR = _ZGT_W
 # derivation that fixes it is structural rather than arithmetic — MR = W makes a slab exactly one W×W
 # transpose block, so slabs and pack blocks share ONE ragged region instead of each growing their own.
 # Confirmed on Zen4: MR ∈ {8,10,12} at NRV=1 measured 40.4 / 34.7 / 34.6 at k=128, W=8 winning.
+# PDM: Derived — formula over detected consts: `_ZGT_W`
 const _ZGT_MR = @load_preference("ztrsm_gt_mr", _ZGT_W)::Int
 # The leaf needs an in-register W×W transpose (`_tr8x8` / `_tr4x4`); other widths keep the dLN base.
 const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
@@ -1932,12 +1939,15 @@ end
 
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
+# PDM: Literal — trtri overhead plus extra flops sink small/mid n, so the direct path stops here. | tune: candidate
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
 # Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
 # off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
 # ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).
 # Wide B keeps the trtri-on-inverse base (_TRMM_BASE) — its invert is amortized by the big gemm. Per-box knob.
+# PDM: Literal — recursion cut for complex trsm side-L; per-box. | tune: candidate
 const _CTRSM_REC_L = @load_preference("ctrsm_rec_l", 64)::Int
+# PDM: Literal — B-width cut: at or below it, the j-outer narrow recursion wins. | tune: candidate
 const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: ≤ → narrow (j-outer recursion)
 # Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹), A⁻¹ triangular → reuse the trmm K-TRIM kernel on the inverse at
 # half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
@@ -2162,7 +2172,9 @@ end
 # MR·NRV accumulators + NRV RHS-slice + 2 broadcast/slack ≤ nreg. nreg=32(AVX-512)→8×24 f64 /8×48 f32;
 # nreg=16(AVX2)→6×8. Reproduces BLIS zen4 8×24 / haswell 6×8. Preferences-overridable (fleet calib).
 const _GT_NREG = _SIMD_BYTES >= 64 ? 32 : 16
+# PDM: Derived — formula over detected consts: `_GT_NREG >= 32 ? 3 : 2`
 const _GT_NRV = @load_preference("gemmtrsm_nrv", _GT_NREG >= 32 ? 3 : 2)::Int
+# PDM: Derived — formula over detected consts: `min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV`
 const _GT_MR = @load_preference("gemmtrsm_mr", min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV))::Int
 const _GT_W = _vwidth(Float64)                  # fused leaf is f64-only; SIMD lanes over RHS columns
 const _GT_NR = _GT_NRV * _GT_W                   # columns per stripe (SIMD-lane block width)
@@ -4777,12 +4789,14 @@ end
 # traffic dominates in cold cache at small n (measured: n=32 multi 0.90 vs unified 1.19). The unified
 # single-pack halves that traffic and wins for small n, but is latency-starved (W=4 accs) at larger n
 # (n=128 unified 0.73 vs multi 1.02) — so cap it low. AVX-512 uses unified everywhere (_unified_ok).
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0`
 const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) == 4 ? 48 : 0)::Int
 # Single-product triangular multi-pack row-tile MR. On AVX2 (W=4) the 12-acc gemm tile (MR=_MR=3) zero-pads
 # the remainder row-panel at n not divisible by 12 → small/mid-n syrk/syr2k below gate (n=64 0.81, 128 0.94,
 # 256 0.92 measured galen). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
 # single-product tri kernel → gates the whole AVX2 range (MR2 ≥ MR3 at every n=64..2048, exact correctness).
 # Width-conditional: only F64/AVX2 (W=4); F32/AVX2 and all of AVX-512 keep _MR. Knob "syrk_mr".
+# PDM: Literal — rank-k row-block factor; 2 measured, not derived from the register file. | tune: candidate
 const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
@@ -4812,6 +4826,7 @@ end
 # (the layouts coincide at CMR=1 ⇒ mr==nr==W; AVX-512 already gates 1.02-1.23, leave it). Knob per box.
 # Cap at 512: unified wins n≤512 (128 0.80→0.99), but its full-n pack loses cache reuse vs the mc/nc-
 # blocked multi path at n≥1024 (1024 0.937 vs multi 0.948) — hand large-n back to multi. AVX-512 → 0.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 512 : 0`
 const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64) == 4 ? 512 : 0)::Int
 # n at/above which the complex rank-k product uses Karatsuba-3M (3 REAL tri-output products on split re/im).
 # 3M runs the gating real `_trgemm_packed!` machinery at 25% fewer flops; windowed to
@@ -4840,6 +4855,7 @@ const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64
 # 128 is the smallest ladder point where BOTH boxes win. Zen4 forgoes its n=64/96 gains, which are not
 # gate sizes. Re-measure both boxes before moving it; a value that helps one box and hurts the other is
 # exactly what this constant existed to avoid.
+# PDM: Literal — lower bound for the 3M path; below it the Karatsuba overhead dominates. | tune: candidate
 const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 128)::Int
 # Does the rank-k 3M window apply? Hoisted so the unpacked branch can YIELD to it — without this the
 # unpacked path shadows 3M entirely for trans='N' at n ≤ _CSYRK_UNPACK_MAX (192 on AVX-512).
@@ -5090,6 +5106,7 @@ end
 # vs the mc/nc-blocked multi tri path (512 0.92 vs 0.944) — hand large-n back to multi. AVX-512 → 0.
 # Fused cap lowered 256→192 on AVX2 so n≥256 syr2k/her2k reach the 3M branch in _ctrgemm_prod! (measured:
 # n=256 3M = 1.04-1.06 vs fused 0.93-0.94). n≤128 stays fused (3M's two-pass overhead loses there: 0.89).
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 192 : 0`
 const _CSYR2K_FUSED_MAX = @load_preference("csyr2k_fused_max", _vwidth(Float64) == 4 ? 192 : 0)::Int
 @inline function _csyr2k_packed!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int)
     Tc = eltype(C); a = convert(Tc, α); n = size(C, 1)
@@ -5313,6 +5330,7 @@ end
 # tile than gemm: MR·NR + 2·MR + 2 ≤ (vector registers). W=4/AVX2 (16 ymm): MR=2 → 8 accs+4+2=14 fits;
 # gemm's MR=3 gives 12+6+2=20 → SPILL (the 0.65 large-n syr2k). W=8 (32 zmm): _MR=2 → 16+4+2=22, fine.
 # Overridable "syr2k_mr". (syrk uses the single-product kernel, only MR A-vectors → gemm's tile fits.)
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR`
 const _SYR2K_MR = @load_preference("syr2k_mr", _vwidth(Float64) == 4 ? 2 : _MR)::Int
 # nr for the two-product tile (Preferences knob). Default _NR: widening to NR=5 with MR=2 was measured
 # NEUTRAL-to-worse on Zen3 (n=256 unchanged, n=1024 0.985→0.96) — the tile wasn't ILP-starved, so keep _NR.
@@ -5322,6 +5340,7 @@ const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
 # On AVX2 the fused MR=2 tile has only 8 accumulators (ILP-starved on 16 regs); two _trgemm_packed! passes
 # (12 accs each) win at n>128 despite 2× C traffic (measured: n=512 0.94→1.00, n=1024 0.95→1.02). AVX-512
 # keeps the fused unified path (32 regs, not starved). Overridable "syr2k_2pass".
+# PDM: Literal — two-pass enabled on AVX2 only (typemax disables it on AVX-512); measured, not derived. | tune: candidate
 const _SYR2K_2PASS = @load_preference("syr2k_2pass", _vwidth(Float64) == 4 ? 128 : typemax(Int))::Int
 # Handles β internally: the two-pass path can OVERWRITE C on its first pass when β=0 (skipping the
 # separate scaleC zero-pass — measured the whole n=256 gate gap, since scaleC + 2 adds is 3 C-touches at
@@ -5356,6 +5375,7 @@ end
 # (≈ 2·DBASE/n of the flops). Large off-diagonal gemms keep the bulk at peak.
 # Recursion base for the diagonal (gemm→temp + triangle-add wastes 2× flops on b×b; smaller base =
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
+# PDM: Literal — diagonal-block base; larger pushes work into efficient off-diagonal gemms. | tune: candidate
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
@@ -5369,6 +5389,7 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # (Zen5 0.88 / Zen4 0.91); packed is +14% there. Fleet-validated AVX-512 -> W. Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
+# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW`
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
 # no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):
@@ -5376,7 +5397,9 @@ const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW
 # (n=8 gates 1.2× on AVX-512), packed wins n≥~24. trans='C'/'T' needs a transposed A-pack → recursion is
 # slow at every small n while the packed path amortizes it, so packed wins uniformly (route it from ~n=4).
 # Complex micro-tile is _CMR·W complex rows (AVX2 z: 4, AVX-512 z: 16). Per-machine Preferences knobs.
+# PDM: Literal — trans='N': recurse below this rather than pack. | tune: candidate
 const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int        # trans='N': recursion below this
+# PDM: Literal — trans='C'/'T': packing wins almost always, hence the much lower cut. | tune: candidate
 const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # trans='C'/'T': packed ~always
 # trans='N' complex n≤this ⇒ unpacked triangular kernel (`_ctri_unpacked!`): the packed path's operand-pack
 # + NR-remainder overhead and the recursion base's 2×-flop waste BOTH miss the gate at small n, while the
@@ -5390,6 +5413,7 @@ const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # tra
 #    Zen5 (neuro) unpacked ≥ packed at EVERY n≤256. Cutoff 192 is safe on both (avoids Zen4's n=256 packed
 #    preference) and lifts the n=128/192 complex rank-k the factorizations recurse through. (One formula for
 #    both µarchs remains req#8 debt.)
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 16 : 192`
 const _CSYRK_UNPACK_MAX = @load_preference("csyrk_unpack_max", _vwidth(Float64) == 4 ? 16 : 192)::Int
 
 # ── Unpacked triangular-output complex rank-k/rank-2k (small-n, trans='N'). Routes herk/syrk (and, via two
@@ -6085,12 +6109,14 @@ end
 # off the mistuned 96 (which routed n=112–192 to the slower packed path → the galen AOCL misses) to 256.
 # Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
 # Overridable "symm_pack_cut".
+# PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW`
 const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW))::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
 # conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
 # the materialize path routes to _gemm_core!'s Karatsuba-3M at mid-n — the SAME path complex symm already
 # gates on (zsymm n=128 = 1.06). So on AVX2 raise the cut past the whole gate range: hemm rides
 # materialize+3M like symm. (AVX-512 keeps 32 — 3M path is AVX2-only; leave the gating classic path.)
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 4096 : 32`
 const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4 ? 4096 : 32)::Int
 # Complex NON-Hermitian symm side-L uses the SAME packed kernel (`_hemm_packed_L!` with HERM=false):
 # identical blocking, identical microkernel, the only difference is that the mirrored half of the A-pack
@@ -6252,6 +6278,7 @@ end
 # Reproduces galen 84 (measured: recursion wins n≤80, packed wins n≥96 — the old literal 96 routed n=96 to
 # the slower recursion; 84 routes it to packed). Predicts Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX placeholder).
 # Overridable "syr2k_pack_cut".
+# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW`
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
 # recursion (which computes a dense n×n temp per diagonal block — the 2× waste).

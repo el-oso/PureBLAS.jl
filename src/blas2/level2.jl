@@ -52,6 +52,7 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # So gate on the DATAPATH, not a flat default: minner ON iff the vector unit is AVX2 (W<8) OR double-pumped,
 # OFF on native-512 (physical criterion over detected consts — CLAUDE.md req#7/#8; validated full-sweep on
 # the fleet: Zen3/Zen4 keep the gains, Zen5 reverts to the old path). Panel-width regimes below apply where on.
+# PDM: Measured — panel-width regime inverts across µarchs (Zen3/Zen4 keep the gain, Zen5 reverts). | tune: candidate
 const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
 # ⚠ THE DEFAULT IS A DATAPATH-GATED BOOLEAN, which the PDM ladder names as a violation in the same
 # breath as `_double_pumped(_HW) ? 8 : 4` — a Measure-tier knob that has not been converted yet.
@@ -88,6 +89,7 @@ const _GEMVN_MINNER_U = 4    # row-vector unroll (U·W rows/step): independent y
 #          runs 69-71 GB/s vs OB's 67 total, so the y-restream tax was the whole gap). Register-capped:
 #          NP+U+1 live vectors = 17 ≤ 32 on AVX-512; on 16-reg ISAs 12+4+1 spills → cap at assoc (=8, the
 #          fleet-verified AVX2 config).
+# PDM: Derived — formula over detected consts: `max(2, _L1D_ASSOC - 2`
 const _GEMVN_NP_NARROW = @load_preference("gemvn_np_narrow", max(2, _L1D_ASSOC - 2))::Int
 const _GEMVN_NP_WIDE = @load_preference(
     "gemvn_np_wide",
@@ -98,11 +100,14 @@ const _GEMVN_NP_WIDE = @load_preference(
     (lda * sizeof(T)) % _L1_WAY_BYTES == 0 && return min(_L1D_ASSOC, _GEMVN_NP_WIDE)
     return _GEMVN_NP_WIDE
 end
+# PDM: Derived — formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64`
 const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64)))::Int  # m-block: y-block ≤ ½L1 stays resident while sweeping all n columns
 # minner helps the mid-n/L3 regime (measured Zen4 PB-self: n=512-2048 ~8-10% faster) but the y-restream
 # regresses deep-DRAM n (4096 ~16% slower, where the old NP=8 path already gates 1.31×). So cap minner to
 # A ≲ a few × L3 and fall back to the old panel path beyond. Crossover is unmeasured on locked HW → tune.
+# PDM: Derived — formula over detected consts: `4 * _L3_BYTES`
 const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES)::Int  # max A bytes (m·n·sizeof) for minner
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448`
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
@@ -716,6 +721,7 @@ const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tu
 # m-unroll for the blocked gemv-T kernel. DERIVED cap: NC·U accumulators + U x-vectors + ~2 temps must
 # fit `_NVREG`. At the shipped NC=4 that gives U ≤ 4 on AVX-512 (24 regs) and U ≤ 2 on AVX2 (14).
 @inline _gemvt_u_max(nc::Int) = (u = 4; while u > 1 && nc * u + u + 2 > _NVREG; u ÷= 2; end; u)
+# PDM: Derived — row unroll capped by the register file: NC*U + U + 2 <= _NVREG. | tune: n/a
 const _GEMVT_U_PREF = @load_preference("gemvt_u", nothing)
 const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default until the gate says move it
 # Runtime-resolved so the force hook can reach it (a const is baked at load and cannot be forced) —
@@ -763,6 +769,7 @@ end
 # the y load/store are one-per-column, so their cost per byte is HIGHEST at n=64 — the cell we win.
 # Same argument retires per-call entry overhead. The lever left is the stream, not the loop.
 const _GEMVT_PF_CANDIDATES = (0, 2 * _CACHELINE, 4 * _CACHELINE, 8 * _CACHELINE)
+# PDM: Measured — prefetch distance depends on L2 hit latency and the hw streamer, neither detected; bounds derived, choice measured. | tune: candidate, 0/2/4/8 lines
 const _GEMVT_PF_PREF = @load_preference("gemvt_pf", nothing)
 const _GEMVT_PF = something(_GEMVT_PF_PREF, 0)::Int   # req8-ok: shipped default until the gate says move it
 # Resolved ONCE PER PROCESS, never per call — an ENV lookup in this hot path is itself a regression
@@ -935,6 +942,7 @@ end
 # `PUREBLAS_FORCE_gemvt_deep=0` disables the derived shape so the fleet validation can A/B it against
 # the narrow one IN ONE RUN. Gated on the pin like every other resolver here, so a pinned build (tests,
 # juliac) compiles it out and the all-paths @noalloc proof never sees a OncePerProcess.
+# PDM: Derived — NC=8 x U=4 gated on A <= L2 and the register budget; both detected consts. | tune: n/a
 const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
 @static if isnothing(_GEMVT_DEEP_PREF)
     # Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
@@ -1121,20 +1129,24 @@ end
 # 2 ymm each). gemvN is ILP-bound: more independent tiles hide Zen3's fma latency — but 2W-wide accs
 # eat the 16-ymm file fast, so MR=4 (4 chains, ~14 ymm) is the measured AVX2 optimum (MR=5 spills,
 # split-accumulators need MR too small to amortize A). AVX-512's 32 zmm has ample room. Swept per box.
+# PDM: Literal — split accumulators need MR small enough to amortise A; 4 fits both register files. | tune: low value
 const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
 # Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
 # _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
 # (1 shuffle feeds NC cols, x streamed once per block).
+# PDM: Exempt — legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | tune: n/a, dead
 const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int   # legacy pin; superseded by _cgemvt_cfg()
 # AVX2: accumulate gemvT/C in native ymm (Vec{W}) so NC=4 columns fit → 4 concurrent load streams (see
 # _gemv_tc_block_cmplx!). AVX-512 keeps full-width Vec{2W} (32 zmm has room, already gates).
 # ⚠ MOVED UP from below `_cgemvt_cfg`: the config knob's default is `NC + (HALF ? 100 : 0)`, so both
 # consts must exist before it. Julia consts are load-ordered — the earlier arrangement referenced
 # `_CGEMVT_HALF` ~45 lines before its definition.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CGEMVT_HALF = @load_preference("cgemvt_half", _vwidth(Float64) == 4)::Bool
 # Once A spills L2 (n≳768), gemvT/C is bandwidth-bound, not FMA-latency-bound (measured galen: n≥1024
 # both PB & OB run at L3/DRAM bandwidth, PB only ~92-94% of OB's). Same +192B A-stream prefetch that
 # fixed the gemvN ri valley saturates it here. AVX2-gated (AVX-512 gemvT already gates); Preferences knob.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CGEMVT_PF = @load_preference("cgemvt_pf", _vwidth(Float64) == 4)::Bool
 # ── gemv-T/C column-block CONFIG: (NC, HALF) as ONE Measure knob ────────────────────────────────────
 # Encoding: `NC + (HALF ? 100 : 0)`. One knob because the two are not independent — HALF halves the
@@ -1198,6 +1210,7 @@ const _CGEMV_NP = 8                                 # column-panel width when A 
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
 # Threshold keyed to detected L2 (A fits when m·n·sizeof(ComplexF64) ≤ L2) — NOT hardcoded, so Zen3's
 # 512 KiB L2 doesn't inherit Zen4's 1 MiB assumption and thrash mid-n (one-panel row-tile re-reads A).
+# PDM: Derived — L2/16: the m*n threshold where a resident panel stops beating a stream. | tune: n/a
 const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n complex threshold for one-panel mode
 # AVX2 complex gemvN: OpenBLAS-structure kernel (Fable-decomposed 2026-07-06). The mid-n valley (n=1024
 # 0.735) was NOT the shuffle (kb hypothesis, refuted by measurement) nor memory (PB's access streams at
@@ -1207,7 +1220,9 @@ const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n co
 # hoisted x-broadcast (cr,ci = α·x[jj] — NC mults/panel, amortized over m rows, not per row-tile), and a
 # +192 B prefetch on each A stream. Measured galen: n=1024 0.735→1.03, sweep 1.00–1.24× OB. Only 2
 # shuffles/row-iter (on Q, off the FMA ports). AVX2 only; AVX-512 keeps the row-tile path (already gates).
+# PDM: Literal — 4 columns per panel, matching what OpenBLAS uses; not swept independently. | tune: candidate
 const _CGEMVN_NC = @load_preference("cgemvn_nc", 4)::Int             # columns per panel (OB uses 4)
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  # A-stream prefetch (AVX2)
 @generated function _gemv_n_ri_panel!(
         yp::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, m::Int,
@@ -1385,6 +1400,7 @@ end
 # at A≈L3 and A≈4×L3, Val(8) vs Val(12) arms of `_gemv_n_ri_run!`, median estimator. If Zen5 prefers 8,
 # that is the req#8b tell and this goes back to Measure — the Preference below is the escape hatch
 # meanwhile.
+# PDM: Derived — formula over detected consts: `3 * _vwidth(Float64) ÷ 2`
 const _CGEMVN_NC_BIG = @load_preference("cgemvn_nc_big", 3 * _vwidth(Float64) ÷ 2)::Int
 @inline _cgemvn_nc_big() = _CGEMVN_NC_BIG
 
@@ -2393,10 +2409,12 @@ end
 # A-stream software prefetch in the blocked rect kernel — AVX2 only (matches `_CGEMVN_PF`: the narrow
 # machine's HW prefetcher can't sustain the NB concurrent A column streams; +192 B prefetch hides the
 # DRAM latency that leaves PB below AOCL at n≥2048. AVX-512 boxes don't need it — override via Preference.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _ZHEMV_PF = @load_preference("zhemv_pf", _vwidth(Float64) == 4)::Bool
 # Prefetch distance in row-tiles (1 tile = W complex = one 64 B line @ W=4). The large-n A read sits
 # deep in DRAM (n≥2048 ⇒ A ≫ L3), so hemv wants a longer look-ahead than gemvN's 3 lines to cover the
 # ~hundreds-of-cycles DRAM latency; empirical (a latency behaviour, not a datasheet number) — Preference.
+# PDM: Literal — prefetch depth in tiles for the Hermitian mat-vec. | tune: candidate
 const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
 
 @generated function _hemv_rect_cmplx!(
@@ -2668,6 +2686,7 @@ end
 # shows NB=128 REGRESSES mid-n 3–8% on Zen4 (128²·8 = 128 KB SPILLS the 32 KB L1) while NB=32/64 tie ≤2%;
 # so the block is capped at √(L1/8) and shrunk further on a smaller L1. Fleet L1 = 32 KB → √4096 = 64 EXACT
 # (no-op vs the old literal); a ≤16 KB-L1 box gets a smaller, still-resident block. `tri_nb` pref pins it.
+# PDM: Derived — formula over detected consts: `clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64`
 const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int
 # REAL trsv-T only (complex has its own `_TRI_C_T_UNB` below): unblocked (scalar back/forward-substitution
 # dots) up to here, blocked above. req#8: the blocked path offloads the bulk O(n²) off-diagonal work to the
@@ -2680,6 +2699,7 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # (a formula would inject unmeasured µarch variation). The old 1024 was MISTUNED: it forced the slower
 # unblocked path at n=768/1024, and at n=1024 unblocked is a gate MISS on both AVX2 boxes (Zen4 1.03×, Zen3
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
+# PDM: Literal — unblocked/blocked crossover for the transpose path; blocking fixes a measured regression above it. | tune: candidate
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 
@@ -2705,11 +2725,13 @@ const _TRSV_RRCP32 = Vector{Float32}(undef, _TRSV_RRCP_N)
 # fast OB-structure ri gemv (see _tri_scat_cmplx!), so blocking wins earlier — the unblocked column-axpy
 # re-streams x and dips at n=1024–2048 (0.83–0.86); route those to blocked+ri. n≤512 stays unblocked
 # (gates 0.96–1.53). Sweep the crossover per box via the knob.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 256 : 1024`
 const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ? 256 : 1024)::Int
 # COMPLEX trsv-T unblocked threshold — SEPARATE from real `_TRI_T_UNB` (which the real-only fleet A/B retuned
 # to 512). Kept at 1024 (the pre-retune value) so the complex path is byte-unchanged: complex ztrsv-T stays
 # unblocked ≤1024 as before. A complex-specific crossover sweep (the AVX2 n=1024–2048 dip noted above) is
 # DEFERRED to the parked complex batch; decoupling avoids silently retuning a gated complex op off a real A/B.
+# PDM: Literal — complex transpose unblocked/blocked crossover. | tune: candidate
 const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
@@ -2763,6 +2785,7 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # diagonal+tall-scatter structure, which no longer exists on the N path — so the n ≤ threshold side has
 # never been re-litigated against the fused kernel. `PUREBLAS_FORCE_trmv_fused_min=0` runs fused8 at every
 # n, a huge value runs `_trmv_simd!` at every n, and the crossover can be swept without editing source.
+# PDM: Measured — a crossover set by call overhead vs vectorised work; sweepable without editing code. | tune: candidate
 const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
 # Resolved at RUNTIME so the force hook can reach it (a const is baked at load/precompile and cannot be
 # forced), but ONCE PER PROCESS, never per call: `_force_knob` reads ENV, and an ENV dictionary lookup in
@@ -3196,6 +3219,7 @@ end
 # at every n ≤ 16, so this bound is chosen for where the win is best-and-still-growing, not to avoid a
 # regression; raising it is safe on speed and costs only generated code (bodies are O(n²) statements).
 const _SCALAR_FPREGS = 16      # x86-64 xmm0-15; architectural, not µarch-dependent
+# PDM: Derived — formula over detected consts: `_SCALAR_FPREGS - 4`
 const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
 
 # Runtime n → `Val(n)` ladder, emitted from `_TRSV_REG_MAX` so the generated set tracks the bound and

@@ -292,6 +292,7 @@ const _QR_UNBLK_MAX = 32
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.
 # Keyed via Preferences per box (Zen4 sweet spot measured).
+# PDM: Literal — complex QR panel; the Zen4 sweet spot, keyed per box via Preferences. | tune: candidate
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # ⚠ THIS USED TO READ `_CGEMM_3M ? … : …` AND MEANT "is this the AVX2 box?". That was a hidden coupling,
 # not a derivation: `_CGEMM_3M` is a *complex-gemm algorithm* switch, and it happened to be `_W64 == 4`,

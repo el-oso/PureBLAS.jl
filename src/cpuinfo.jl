@@ -15,6 +15,7 @@ using Preferences: @load_preference, load_preference
 
 # Widest SIMD register in bytes. Preference override "simd_bytes" wins (cross-compile / pinning);
 # otherwise detect on the build machine. CpuId is x86-only, so guard for portability.
+# PDM: Exempt — the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SIMD_BYTES = let p = @load_preference("simd_bytes", nothing)
     if p !== nothing
         Int(p)::Int
@@ -536,6 +537,7 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # TRIM PAYS NOTHING: gated on `_FORCE_HOOKS`, which juliac/build.jl sets false, so the shared library
 # compiles no ENV access, no Refs, no branch. Instrumentation is a development affordance, not a shipped
 # feature. Defaults true so a normal JIT user can A/B without rebuilding.
+# PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
 const _FK_NAMES = ("ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",

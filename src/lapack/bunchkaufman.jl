@@ -1166,7 +1166,9 @@ end
 # `sytrf_nb` is a Pin-tier USER override (force a flat nb); its default is the derived
 # `_sytrf_nb_shape(n)` and no benchmark sits behind it, so the trim build has nothing to compile out.
 # The Measure-tier knob in this file is `sytrf_cmult` below, which IS pinned in juliac/build.jl.
+# PDM: Derived — panel width from the shape function; only the multiplier below it is measured. | tune: n/a
 const _SYTRF_NB_PREF = @load_preference("sytrf_nb", nothing)   # pin-ok: user override, no benchmark behind it
+# PDM: Measured — the complex multiplier is the Measure-tier knob here; gate-measured 3, the duel never picked it. | tune: candidate
 const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
 @inline _sytrf_nb_shape(n::Int) = 8 * cld(isqrt(n), 8)
 @static if isnothing(_SYTRF_NB_PREF)

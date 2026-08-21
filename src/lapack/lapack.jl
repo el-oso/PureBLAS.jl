@@ -40,6 +40,7 @@ const _POTRF_BASE_F32 = @load_preference("potrf_base_f32", _POTRF_BASE >> 1)::In
 # Complex has NO fast SIMD base (the scalar potf2 above), so a 512 base = the whole factorization is scalar
 # (measured: zpotrf n≤512 = 0.15-0.49× — all base, no recursion). A small base hands the bulk to the fast
 # complex ztrsm!/zherk! recursion. Retune per box; Preferences knob "cpotrf_base".
+# PDM: Derived — 32 + 4*lanes: a width-independent overhead floor plus a per-lane slope. | tune: n/a
 const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int   # req#8: derived 32+4·W (48/64)
 # n≤base ⇒ ONE vectorized `_cpotf2_lower!` call; n>base ⇒ right-looking blocked (see _cpotrf_rl_lower!).
 # Base sweet spot is where the unblocked SIMD base still gates: AVX-512 (W=8) rides it to 64 (n=64 gates
@@ -100,6 +101,7 @@ end
 # REGRESSES native-512 (Zen5) where MR=1 already saturates. The discriminator is L1D size: 32K on the
 # double-pump/AVX2 boxes, 48K on Zen5 (and Intel Tiger/Ice Lake+) native-512 — so key MR on `_L1_BYTES`
 # (Zen4 fam 25 / Zen5 fam 26 also differ, but L1D is the causal-adjacent cache signal + already a const).
+# PDM: Derived — formula over detected consts: `_at_cpotf2_mr(_HW`
 const _CPOTF2_MR = @load_preference("cpotf2_mr", _at_cpotf2_mr(_HW))::Int   # req#8: derived 64÷datapath_bytes (2 double-pump/AVX2, 1 native-512)
 
 # Vectorized complex Hermitian Cholesky base (lower, A = L·Lᴴ). Complex analogue of `_chol_base_f64!`:
@@ -262,6 +264,7 @@ end
     sb % q == 0 && (sb % (q << 1) == 0 || n * n * sizeof(eltype(A)) <= _L2_BYTES)
 end
 
+# PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
 
 # Transposed-triangle copies for the UPPER → gating-LOWER reuse: Lever A (F64, U=Lᵀ) and Lever C (complex
@@ -386,6 +389,7 @@ end
 # at sizes the gate does not sample, while being wrong at 24+ is 40%+, and the scan cannot overshoot
 # there. It is also exactly why this is Measure tier and not a literal: no reasoning picks a point out
 # of a noisy band, only measurement on the host does.
+# PDM: Measured — a tiny-n crossover inside a noisy band; only host measurement resolves it. | tune: candidate
 const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
 @static if isnothing(_POTRF_UDIRECT_PREF)
     # elements per SIMD vector for this element type (complex packs two reals per element)
@@ -526,6 +530,7 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # their accumulators fit the register file on every ISA, and the small Cholesky base does not benefit from a
 # wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
 # across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
+# PDM: Literal — trsm panel width, measured µarch-invariant; confirm on the fleet before deriving. | tune: candidate
 const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
 # Live vector count of the fused side-R leaf's top tier (`_trsm_rl_split_f64!` below): MR=3 row-tiers ×
 # _CHOL_NB column accumulators, plus the _CHOL_NB T-vectors and the diagonal/broadcast pair. Compared
@@ -536,10 +541,12 @@ const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block
 # consts, not a µarch literal. Lives here, not in level3.jl, because `_CHOL_NB` is defined in this file
 # and level3.jl is included FIRST (PureBLAS.jl:20-21), so a const there cannot see it.
 const _RL_MR_LIVE = 3 * _CHOL_NB + _CHOL_NB + 2
+# PDM: Literal — syrk column block, same status as chol_nb. | tune: candidate
 const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
+# PDM: Derived — formula over detected consts: `_INTEL_AVX2`
 const _CHOL_BASE_SPLIT = @load_preference("chol_base_split", _INTEL_AVX2)::Bool
 @inline _clidx(i, k, ld) = (k - 1) * ld + i                              # 1-based linear index
 @inline _cvptr(p::Ptr{T}, i, k, ld) where {T} = p + (((k - 1) * ld + (i - 1)) * sizeof(T))   # byte Ptr to [i,k]
@@ -1277,6 +1284,7 @@ end
 # a big base cutoff added a discrete base→blocked step; nb=n/4 removes both. Per panel: factor the diagonal
 # jb-block RECURSIVELY (jb>base ⇒ blocks again; jb≤base ⇒ the vectorized unblocked base), trsm side-R 'C'
 # panel solve, herk 'N' rank-jb trailing downdate — all gating L3. BlasComplex only (Dual/upper → generic).
+# PDM: Derived — formula over detected consts: `_at_cpotrf_nbmax(_HW`
 const _CPOTRF_NBMAX = @load_preference("cpotrf_nbmax", _at_cpotrf_nbmax(_HW))::Int   # req#8: derived 64+16·W (128/192)
 @inline _chol_nb(n::Int) = clamp((n >> 2) & ~15, 32, _CPOTRF_NBMAX)     # ~n/4, rounded to a multiple of 16
 function _cpotrf_lower!(A, n::Int)

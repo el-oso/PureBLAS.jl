@@ -52,6 +52,7 @@ end
 # prefix EVERY column (n·n/2 extra traffic → the large-n decline). BLASFEO's dsymv is this same fused
 # panel. `bc` = NB per-column base Ptrs with bc[c] + (panel-local row i)·sz = A[row, col_c]; that identity
 # is what makes packed's variable column spacing address-uniform in the row (mirrors `_symv_*panel!`).
+# PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the decline on all 3 µarchs
 # The fused NB-column panel beats per-column at EVERY size where AP is streaming-bound — its real win is AP
 # STREAM PREFETCHABILITY (NB contiguous per-column bases → the HW prefetcher locks onto long sequential runs),
@@ -61,6 +62,7 @@ const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fl
 # (The old "n=512 −18%" note was the PRE-de-box panel paying a per-panel `Core.Box` heap alloc; that setup
 # cost is gone since the `jbl` fresh-local fix, so the panel now wins small-n too.) So gate on AP RESIDENCY,
 # not x+y: run the panel once the packed triangle itself spills L1 (below that, tiny-n setup isn't amortized).
+# PDM: Derived — formula over detected consts: `_L1_BYTES`
 const _SPMV_PANEL_MINAP = @load_preference("spmv_panel_minap", _L1_BYTES)::Int  # min AP bytes (n(n+1)/2·sizeof) to panel — fires ≈ n≥128 on 32KB L1
 
 function _spmv_offblk_packed_expr(W, V, sz, NB, K, masked)

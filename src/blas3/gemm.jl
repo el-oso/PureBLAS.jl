@@ -23,12 +23,16 @@ const _W64 = _vwidth(Float64)
 # MR/NR: galen 3/4, Zen4/Zen5 2/8 (behavior-preserving, was `_W64==4 ? …`). KC/MC/NC: Zen4 256/144/2040
 # (bit-identical), galen 512/72/2044, Zen5 384/96/1360 — the KC=512 raises galen's B-micropanel from ¼ to
 # ½ L1 (the "AVX-512-tile-on-AVX2" residency miss). Real-path (Float64/_NR); complex gemm uses `_CKC`.
+# PDM: Derived — formula over detected consts: `_at_gemm_mr(_HW`
 const _MR = @load_preference("gemm_mr", _at_gemm_mr(_HW))::Int
+# PDM: Derived — formula over detected consts: `_at_gemm_nr(_HW`
 const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
 # mc is derived per-CALLER from the LOCAL kc + element type via `_at_mc_kc` (joint residency
 # mc·kc·sizeof ≤ 30%·L2), not a single const — a standalone `_MC` bakes the canonical kc and
 # under-blocks small-kc callers (potrf's trailing gemm) / mis-sizes complex (16 B/elt). req#8.
+# PDM: Derived — formula over detected consts: `_at_gemm_nc(_HW`
 const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
+# PDM: Derived — formula over detected consts: `_at_gemm_kc(_HW`
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
 # Short-k split-reduction tile (cpuinfo.jl `_at_gemm_split_*`): tall _SMR·W×_SNR tile, S-way k-split, for the
 # small-n window where the wide tile under-fills. _SPLIT_OK const-folds the whole path off on AVX2 (already ≥1.0
@@ -36,6 +40,7 @@ const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel 
 const _SPLIT_OK = _at_gemm_split_ok(_HW)
 const _SMR = _at_gemm_split_mr(_HW)
 const _SNR = _at_gemm_split_nr(_HW)
+# PDM: Derived — formula over detected consts: `_at_gemm_split_max(_HW`
 const _GEMM_SPLIT_MAX = @load_preference("gemm_split_max", _at_gemm_split_max(_HW))::Int
 
 # Software prefetch hint (read, high locality, data cache) via the LLVM intrinsic. Used to pull the
@@ -752,6 +757,7 @@ end
 # Zen4/Zen5 448 (the validated literal, EXACT); overridable "gemm_unpack_max". ponytail: crude max() heuristic;
 # a rectangular A (m·k fits but n huge) would also prefer unpacked — refine to an A-fits-registers test if
 # skewed shapes matter. (n=128+ route to blocked-direct-B; measured galen best=blk from ~128.)
+# PDM: Derived — formula over detected consts: `_at_gemm_unpack_max(_HW`
 const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max(_HW))::Int
 # `_EXPINT[2]` shifts the cut (its `_EXPINT[4]` witness was stripped once the campaign landed) — both
 # default-inert. `_GEMM_UNPACK_MAX` is gemm's own unpacked/blocked crossover (2·(nvreg−4)·W = 448 on both
@@ -942,6 +948,7 @@ end
 # matrix can't fill one full tile of rows, so its 16-acc setup doesn't amortize over short k. Same masked/
 # edge kernels, Val(1) rows. DERIVED (req#8, was a bare 40): _at_gemm_mr·W → W=8=16 (measured: full tile now
 # beats mr1 at n=32, 0.833→0.860). W=4→12: sweep-validate galen (measured 40) or pin "gemm_mr1_max"=40 there.
+# PDM: Derived — formula over detected consts: `_at_gemm_mr1_max(_HW`
 const _GEMM_MR1_MAX = @load_preference("gemm_mr1_max", _at_gemm_mr1_max(_HW))::Int
 function _gemm_unpacked_mr1!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
@@ -1255,22 +1262,28 @@ end
 # W=8 AVX-512 (32 regs): 2×4 = 16 accs (Zen4/5). W=4 AVX2 (16 ymm): 1×6 = 12 accs + 2 + 2 = 16, an
 # EXACT fit — galen-swept 2026-07-02 (CNR=6 beat 4 at large n: more independent chains saturate the
 # FMA ports; CMR=2 or CNR=8 spill AVX2 and tank to ~0.5–0.67). Same 12-acc AVX2 lesson as real gemm.
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 1 : 2`
 const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 6 : 4`
 const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
 # Narrower nr for mid-small n: nr=6 doesn't divide most n → the last column-panel wastes compute on
 # masked (padded) columns. nr=4 divides 8,16,20,24,28,32,40,48,64 cleanly → no column masking; it trades
 # ~2 accumulator chains (worse large-n) for no-waste (better mid-small). W=4/AVX2 only (galen-swept:
 # nr=4 lifts n=20 0.71→0.79, n=32 0.78→0.86); on W=8 mid-small is the unpacked path's job → _CNR_SMALL
 # == _CNR makes the size branch a no-op. Crossover ≈ n=64.
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 4 : _CNR`
 const _CNR_SMALL = @load_preference("cgemm_nr_small", _W64 == 4 ? 4 : _CNR)::Int
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 64 : 0`
 const _CGEMM_NRSMALL_MAX = @load_preference("cgemm_nrsmall_max", _W64 == 4 ? 64 : 0)::Int
 # req#8: complex contraction block — the SPLIT of real _KC (BLIS stores kc per datatype). Complex B
 # micropanel is kc·nr·sizeof(ComplexF64) ≤ ½·L1; key on max(_CNR,_CNR_SMALL) so the small-nr branch
 # under-fills L1 (never overflows). Reproduces Zen4 256 (old _KC, complex path bit-identical); galen 168,
 # Zen5 384. Used at the complex-packed sites (_gemm_cmplx_impl!, _trgemm_cmplx_packed*, _hemm_packed_L!).
+# PDM: Derived — formula over detected consts: `_l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL`
 const _CKC = @load_preference("cgemm_kc", _l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL)))::Int
 # Small-n cutoff: below this the blocked machinery (pack + interleave-store) loses to the plain scalar
 # triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
+# PDM: Literal — tiny-n bypass for complex gemm. | tune: candidate
 const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
 # _CGEMM_TINY < max(m,n,k) ≤ this (and tA='N'): the UNPACKED tiny-n path. W=8: unpacked (skip pack,
 # free MR) beats blocked broadly on Zen4/32-reg → 192. W=4/AVX2: unpacked's per-panel re-deinterleave
@@ -1281,6 +1294,7 @@ const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
 # while A·B still fit L1. It collapses at n=48 (0.68, no cache blocking), but 3M (_CGEMM_3M_MIN=48) owns
 # n≥48, so 40 is a clean handoff (41-47 → blocked ~0.97, ungated). Was 12 (far too conservative). This
 # also lifts the small-n rank/hemm/symm ops that route through _gemm_core!. AVX-512 unchanged.
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 40 : 192`
 const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 192)::Int
 
 # Karatsuba 3M route for complex GEMM (see _gemm_3m!): 3 real gemms on split re/im, 25% fewer flops on
@@ -1308,9 +1322,13 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 # NOTE Zen5 is also W=8 and inherits this by formula, but is OFFLINE and therefore UNVALIDATED; the
 # `_EXP12`/`_EXP11` arms below are kept INVERTED (set true to DISABLE) so the old path stays A/B-able
 # in-process when it returns.
+# PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _CGEMM_3M = @load_preference("cgemm_3m", true)::Bool
+# PDM: Literal — lower edge of the 3M window on max(m,n,k). | tune: candidate
 const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int    # max(m,n,k) ≥ this
+# PDM: Literal — upper edge of the 3M window; above it the extra passes cost more than the flop cut. | tune: candidate
 const _CGEMM_3M_MAX = @load_preference("cgemm_3m_max", 2048)::Int  # max(m,n,k) ≤ this
+# PDM: Literal — 3M needs min(m,n,k) >= this or the Karatsuba overhead dominates a thin gemm. | tune: candidate
 const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) ≥ this (thin gemms: overhead dominates)
 
 # Strassen-Winograd for REAL gemm (see _gemm_strassen!): recursive 2×2 blocking, 7 half-size products
@@ -1323,7 +1341,9 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 # CUT, which is ISA-independent, and real gemm is throughput-bound on both AVX2 and AVX-512; the guard
 # exists only to exclude widths the packing path does not implement. | tune: n/a — capability, not tuning
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
+# PDM: Literal — split while min(m,n,k) >= this; measured, and the base stays >= ~min/2. | tune: candidate
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
+# PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
@@ -2168,6 +2188,7 @@ end
 # of their flops here and are LATENCY-bound — NR=4 gives only 8 accumulator chains ≈ Zen3's lat×tput
 # (zero slack). NR=6 → 12 chains (fits 16 ymm: 12 accs + ar/ai + br/bi) hides the FMA latency. Tiny-n
 # keeps NR=4 (NR=6's column remainder wastes more than the extra chains buy). Cutoff is per-box.
+# PDM: Derived — formula over detected consts: `_W64 == 4 ? 48 : typemax(Int`
 const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typemax(Int))::Int
 # TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
 # methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s ::Val{TB} through an untyped
