@@ -36,17 +36,22 @@ function _kr_family(rel)
     return replace(f, ".jl" => "")
 end
 
-"Classify a knob's DEFAULT expression. This is syntactic and deliberately conservative."
-function _kr_tier(default)
-    occursin(r"_at_[a-z]", default) && return "Derived"
-    occursin(r"_L1_BYTES|_L2_BYTES|_L3_BYTES|_vwidth|_NVREG|_lanes\(|_SIMD_BYTES|_CACHELINE|_l1_block|_acc_cap|_ILP_TARGET|_datapath_bytes|_SCALAR_FPREGS|_L1D_ASSOC|isqrt|sizeof", default) && return "Derived"
-    occursin(r"_W64|_double_pumped|_wide_simd|_INTEL_AVX2|_GT_NREG|_ZGT_W", default) && return "Predicate-keyed"
-    occursin(r"^\s*nothing", default) && return "Pref-gated"
-    occursin(r"^\s*(true|false)\s*\)", default) && return "Flag"
-    occursin(r"^\s*-?\d+\s*\)", default) && return "Literal"
-    occursin(r"^\s*_[A-Z]", default) && return "Coupled"
-    return "Other"
-end
+# THE ONLY TIERS. The PDM ladder asks one question — Derive, or Measure? — plus Exempt for knobs that
+# are not hardware tuning at all (sentinels, capability flags).
+#
+# ⚠ AN EARLIER VERSION OF THIS FILE CLASSIFIED KNOBS SYNTACTICALLY, from what the default EXPRESSION
+# looked like: Derived / Literal / Pref-gated / Predicate-keyed / Coupled / Flag / Other. That is not a
+# taxonomy the project uses — it is a description of source text — and publishing it as "Tier" next to
+# free-form marker labels (`Derived(sibling)`, `Literal(borrowed)`, `Measured(bounds)`, …) produced a
+# zoo that buried the actual question. The syntactic guess is gone; the tier is now exactly what a
+# human asserted in the marker, and nothing else.
+const _KR_TIERS = ("Derived", "Measured", "Literal", "Exempt")
+
+# STRICT marker syntax: `# PDM: <Tier> — <one concise line>`. Anything else is prose, not a marker.
+# This matters: `src/` already contained comments like "# PDM: DERIVE tier — a residency criterion…"
+# and "# PDM: P = `@load_preference`", written as prose long before the registry existed. A loose
+# pattern scooped those up and attached them to whichever knob happened to follow.
+const _KR_MARKER = Regex("#\\s*PDM:\\s*(" * join(_KR_TIERS, "|") * ")\\s+—\\s+(.+?)\\s*\$")
 
 """
     knob_rows() -> Vector{NamedTuple}
@@ -65,11 +70,12 @@ function knob_rows()
         # every knob within 12 lines of it — 4 of 15 "audited" rows were a neighbour's justification
         # (cgemv_rb, syr2k_2pass, cpotrf_base, pptrf_blk_min). A registry that mislabels a knob is
         # worse than one that admits it is unaudited, so binding is now one-to-one and forward-only.
-        pending, pending_at = "", 0
+        pending, pending_at, pending_tier = "", 0, ""
         for (i, ln) in pairs(lines)
-            mp = match(r"#\s*PDM:\s*(.+?)\s*$", ln)
+            mp = match(_KR_MARKER, ln)
             if !isnothing(mp)
-                pending, pending_at = String(mp.captures[1]), i
+                pending_tier = String(mp.captures[1])
+                pending, pending_at = String(mp.captures[2]), i
                 continue
             end
             m = match(r"@load_preference\(\"([^\"]+)\"\s*,?(.*)$", ln)
@@ -82,12 +88,13 @@ function knob_rows()
             cm = match(r"^\s*const\s+(\w+)", ln)
             # Consume a pending marker only if it sits within 12 lines — a marker further off belongs
             # to something else (or to nothing), and guessing is what caused the mis-binding above.
-            pdm = (!isempty(pending) && i - pending_at <= 12) ? pending : ""
-            pending, pending_at = "", 0
+            near = !isempty(pending) && i - pending_at <= 12
+            pdm = near ? pending : ""
+            tier = near ? pending_tier : "Unaudited"
+            pending, pending_at, pending_tier = "", 0, ""
             push!(rows, (; key, file = rel, family = _kr_family(rel),
                          const_name = isnothing(cm) ? "—" : String(cm.captures[1]),
-                         default = isempty(default) ? "—" : default,
-                         tier = _kr_tier(default), pdm))
+                         default = isempty(default) ? "—" : default, tier, pdm))
         end
     end
     return sort!(rows; by = r -> (r.family, r.key))
@@ -106,30 +113,27 @@ function knob_markdown()
     println(io, "    or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this")
     println(io, "    file is out of date.")
     println(io)
-    println(io, "Every `@load_preference` key in `src/` — $(length(rows)) of them. The PDM ladder")
-    println(io, "(`docs/src/tuning.md`) requires each to be **Derived** (default is a formula over detected")
-    println(io, "consts) or **Measured** (it is not — which needs a justification and a `tune!()` cost).")
+    println(io, "Every `@load_preference` key in `src/` — $(length(rows)) of them.")
     println(io)
-    println(io, "**Syntactic tier** is what the generator can see in the default expression; it is a")
-    println(io, "*classification aid, not a verdict*. `Literal` means \"a bare number is the default\" — it")
-    println(io, "may be a proven invariant (fine), a falsified derivation (fine, documented), or unconverted")
-    println(io, "debt. The `# PDM:` marker is the human judgement and is the column that matters.")
+    println(io, "| Tier | Meaning |")
+    println(io, "|---|---|")
+    println(io, "| **Derived** | Default is a formula over detected hardware consts. |")
+    println(io, "| **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |")
+    println(io, "| **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |")
+    println(io, "| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |")
+    println(io, "| **Unaudited** | Nobody has classified it yet. Debt, not a verdict. |")
     println(io)
     # summary
     tiers = Dict{String, Int}()
     for r in rows
         tiers[r.tier] = get(tiers, r.tier, 0) + 1
     end
-    audited = count(r -> !isempty(r.pdm), rows)
-    println(io, "| Syntactic tier | Count |")
-    println(io, "|---|---|")
-    for t in sort!(collect(keys(tiers)))
-        println(io, "| $t | $(tiers[t]) |")
-    end
+    audited = count(r -> r.tier != "Unaudited", rows)
+    print(io, "**Counts:** ")
+    println(io, join(["$(get(tiers, t, 0)) $t" for t in (_KR_TIERS..., "Unaudited")], " · "), ".")
     println(io)
-    println(io, "**Audited: $audited / $(length(rows))** knobs carry a `# PDM:` marker. The rest are the")
-    println(io, "worklist — an unaudited knob is one nobody has justified, which is exactly how redundant")
-    println(io, "and duplicated knobs survive.")
+    println(io, "**$audited / $(length(rows)) classified.** An unaudited knob is one nobody has justified —")
+    println(io, "which is how a redundant or mislabelled knob survives. The list below is the worklist.")
     println(io)
     fam = ""
     for r in rows
@@ -138,12 +142,25 @@ function knob_markdown()
             println(io)
             println(io, "## $fam")
             println(io)
-            println(io, "| Key | Const | Default | Tier | PDM justification |")
-            println(io, "|---|---|---|---|---|")
+            println(io, "| Knob | Tier | Why | `tune!()` |")
+            println(io, "|---|---|---|---|")
         end
-        j = isempty(r.pdm) ? "*unaudited*" : _kr_esc(r.pdm)
-        println(io, "| `$(r.key)` | `$(r.const_name)` | `$(_kr_esc(r.default))` | $(r.tier) | $j |")
+        # The marker's ` | tune: …` tail is a SEPARATE column, not text — escaping it into the prose
+        # (`\|`) is what it looked like first, and it read as noise.
+        why, tune = if occursin("|", r.pdm)
+            a, b = split(r.pdm, "|"; limit = 2)
+            (strip(a), replace(strip(b), r"^tune:\s*" => ""))
+        else
+            (r.pdm, "")
+        end
+        println(io, "| `$(r.key)` | $(r.tier) | $(isempty(why) ? "—" : _kr_esc(why)) | ",
+                isempty(tune) ? "—" : _kr_esc(tune), " |")
     end
+    println(io)
+    println(io, "---")
+    println(io)
+    println(io, "Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away")
+    println(io, "and made this table too wide to read. The knob key is the identifier that matters.")
     return String(take!(io))
 end
 

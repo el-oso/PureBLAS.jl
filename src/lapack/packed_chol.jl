@@ -27,7 +27,7 @@ const _PPTRF_TPSV_MIN = 32
 # it inherits `_lu_nb`'s validated shape rather than introducing a second unvalidated formula (req#8b).
 # NOTE the copy traffic is n³/(6·nb), so a LARGER nb is cheaper on copies but shrinks the BLAS-3
 # trailing update; this is the knob to sweep first if the blocked path underperforms.
-# PDM: Literal(borrowed) — packed Cholesky's own blocked panel width, inheriting LU's `_LU_NB` as a prior. A real degree of freedom: pptrf works on PACKED storage, so its panel does not have LU's stride or its store-traffic profile, and _LU_NB is itself a falsified-derivation literal (see tuning.md §4) — an inherited value whose own justification is "the residency formula was wrong for LU". UNVALIDATED FOR THIS KERNEL. | tune: candidate — sweep nb against the pptrfL/pptrfU rows; both currently gate, so this is upside-hunting, not a fix
+# PDM: Literal — own panel width, borrows _LU_NB, which is itself a falsified derivation. | tune: candidate
 const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", _LU_NB)::Int
 
 # Smallest n where unpacking pays. MEASURED: 2.26× at n=32 (bench/probes/pptrf_unpack_strategy.jl), so
@@ -70,7 +70,7 @@ const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 # `@load_preference` stays at MODULE level, never in the body: an in-body load is a recorded hazard in
 # this tree (it does not const-fold the way the module-level form does). 0 is the unset sentinel, so the
 # per-type derivation still applies when no preference is set.
-# PDM: Exempt — 0 is the UNSET SENTINEL, not a tuning value. When the preference is absent this reads 0 and the per-type derivation applies; a pin replaces it. Nothing to derive, because the number is not a size. (The module-level form is load-bearing: an in-body `@load_preference` does not const-fold here — a recorded hazard in this tree.) | tune: n/a — sentinel
+# PDM: Exempt — 0 is the unset sentinel, not a size. | tune: n/a
 const _PPTRF_SPR_PREF = @load_preference("pptrf_spr_min", 0)::Int   # req8-ok: unset sentinel, not a tuning value
 @inline _pptrf_spr_min(::Type{T}) where {T} = _PPTRF_SPR_PREF > 0 ? _PPTRF_SPR_PREF : 2 * _vwidth(T)
 
