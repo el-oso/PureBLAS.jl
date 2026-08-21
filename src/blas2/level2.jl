@@ -2174,12 +2174,12 @@ end
     return s
 end
 
-# PDM: Literal — DERIVABLE, not yet derived: symv panel width, a lanes multiple.
+# PDM: Literal — FLEET-VALIDATED 2026-08-21: a CAP, and the consumer's `min(_SYMV_NB, _vwidth(T))` is what makes it right (8 on AVX-512, 4 on AVX2). Halving NB costs 10-27% on all 3 boxes, so the cap binds and the value is not arbitrary.
 const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators in the microkernel)
 # symv row-panel height in vectors — its OWN const, NOT _GEMV_MR: symv's off-block fuses NB axpy +
 # NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
 # 16 ymm; the gemv-N MR=8 bump spilled symv (galen 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
-# PDM: Literal — DERIVABLE, not yet derived: register-file bound; its comment records gemv-N's MR=8 bump SPILLING symv (galen 1.13->0.86).
+# PDM: Literal — FLEET-VALIDATED 2026-08-21, best-or-tied on all 3 µarchs. MR=8 LOSES on both AVX-512 boxes (Zen4 -3.6% @1024, Zen5 -6.3/-3.0/-9.7%), so the register-file derivation is FALSIFIED, not unwritten. MR=6 loses 8-13% on AVX2. MR=2 is inconsistent (wins some sizes, loses others, on both boxes).
 const _SYMV_MR = 4
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
