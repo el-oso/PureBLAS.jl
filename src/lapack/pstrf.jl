@@ -91,6 +91,7 @@ _pstrf_nb(n::Int) = _lu_nb(n)
 #   • footprint spills L1  ⇒ SPLIT: gather the row first, gemv with beta=1, then a PURE-STORE scatter —
 #     two sequential-stride streams the prefetcher handles, instead of an RMW that defeats it.
 # PDM Derive: `_L1_BYTES`/`_CACHELINE` (detected) + a residency criterion; overridable "pstrf_fuse_max".
+# PDM: Derived — formula over detected consts: `(_L1_BYTES ÷ 2) ÷ _CACHELINE`
 const _PSTRF_FUSE_MAXL = @load_preference("pstrf_fuse_max", (_L1_BYTES ÷ 2) ÷ _CACHELINE)::Int
 
 # ── UPPER Schur-diagonal row cache: order above which it pays ─────────────────────────────────────
@@ -124,6 +125,7 @@ const _PSTRF_FUSE_MAXL = @load_preference("pstrf_fuse_max", (_L1_BYTES ÷ 2) ÷ 
 # So 128 comes from the gate table above, and the Preference override stays. Converting this to a
 # genuine Measure knob needs a harness with cold, per-rep contexts — worth doing, not done here.
 # ⚠ Zen4 Float64 only; needs fleet validation before it is trusted to extrapolate.
+# PDM: Literal — measured on Zen4 F64 ONLY; not yet fleet-validated, so not a derivation. | tune: candidate
 const _PSTRF_ROWCACHE_PREF = @load_preference("pstrf_rowcache_min", 128)
 # TIER: a VALIDATED LITERAL, not a Measure knob — the deliberate downgrade recorded above. The
 # OncePerProcess harness that used to live here was deleted (it was already `@static if false`): it

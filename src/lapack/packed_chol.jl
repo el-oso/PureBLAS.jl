@@ -34,6 +34,7 @@ const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", _LU_NB)::Int
 # the crossover is below 32; it has NOT been measured between 8 and 32, and this value is provisional
 # until it is. Below it the unblocked BLAS-2 kernel is kept — at very small n the O(n²) copy stops
 # amortising against O(n³/3) work.
+# PDM: Literal — smallest n where unpacking pays; measured 2.26x at n=32, untested between 8 and 32. | tune: candidate
 const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 
 # ── lower path: trailing-order below which the rank-1 downdate inlines instead of calling spr! ─────

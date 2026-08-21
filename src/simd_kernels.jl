@@ -173,6 +173,7 @@ const _AXPY_VHW_F64 = Val(_vwidth(Float64) ÷ 2)     # narrow (half) width, F64 
 # (Zen4 208, Zen3 4), so this buys determinism, not a new arm. That matters because the ENTIRE BLAS-1
 # gate ladder is governed by THIS knob on every fleet box — `2·n·8 ≤ 16 MB < L3` at n ≤ 1e6 — so an
 # unforced change here lands directly on gate cells, including the n=1e6 cell that 208 exists to close.
+# PDM: Derived — formula over detected consts: `_at_axpy_band(_HW`
 const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
 @inline _axpy_band() = (f = _fk("axpy_unroll"); f >= 0 ? f : _AXPY_BAND)
 
@@ -525,6 +526,7 @@ end
 # wide arm, and Zen3 resolves narrow in 6 of 6 fresh processes. Only the datapath WIDTH separates the
 # three microarchitectures correctly. Zen5 is the one arm the formula changes and is UNMEASURED.
 @inline _zaxpy_narrow_lanes(::Type{T}) where {T} = 32 ÷ sizeof(T)      # 256 bits
+# PDM: Derived — the criterion IS the datapath: narrow arm iff _datapath_bytes <= 32. | tune: n/a
 const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
 @static if isnothing(_ZAXPY_NARROW_PREF)
     # Seeded with the derived value; `PUREBLAS_FORCE_zaxpy_narrow` may override it in `__init__`

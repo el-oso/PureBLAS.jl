@@ -518,6 +518,7 @@ const _BRD_NB_CANDS = Tuple(sort!(collect(unique(
     clamp.((_vwidth(Float64) ÷ 2, _vwidth(Float64), 2 * _vwidth(Float64), _BRD_NB_MAX), 2, _BRD_NB_MAX)
 ))))::Tuple{Vararg{Int}}
 const _BRD_NB = _BRD_NB_MAX          # legacy name: buffer-sizing bound (NOT the chosen panel width)
+# PDM: Literal — machine-INVARIANT 8 on three boxes and two ISAs; a formula taking hw and ignoring it was removed. | tune: no
 const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
 @static if isnothing(_BRD_NB_PREF)
     # Measured ONCE per process on first bidiagonalization (no __init__, so a pinned/trimmed .so never
@@ -558,6 +559,7 @@ const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three box
 # (32) alike — deriving off _NVREG would evaluate to 32 on every real machine, so a formula adds nothing
 # (cf. `_TR_TB`). Bigger than the bidiag panel `_BRD_NB` (nb=16 here regressed large-n vectors). Pinned
 # (P-tier) for calibration/override; fleet-confirm the invariance if a very-wide-register box ever appears.
+# PDM: Literal — back-transform block, measured invariant; confirm on a very-wide-register box before deriving. | tune: candidate
 const _BT_NB = @load_preference("bt_nb", 32)::Int
 const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
 # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep

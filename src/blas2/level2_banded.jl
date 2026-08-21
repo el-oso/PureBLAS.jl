@@ -14,6 +14,7 @@
 # masked loads); wider band → per-column axpy (reads AB once, re-streams cache-resident y). On W=8 the
 # masked conv wins up to band 48; on AVX2 (W=4) the masked-load conv loses to axpy above band ~17
 # (measured crossover conv 1.05→axpy 1.09 at band 25, stable across n=256…4096). Overridable per machine.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 20 : 48`
 const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ? 20 : 48)::Int
 
 # gbmv-N "convolution" kernel: tile the OUTPUT y into W-row blocks kept in ONE register (no y-window
