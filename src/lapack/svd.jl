@@ -550,6 +550,7 @@ end
 # CAVEAT that outranks the fit: this knob's optimum once MOVED when an unrelated inlining bug was fixed,
 # so it tracks CODEGEN, not hardware. Re-A/B with PUREBLAS_FORCE_brd_nb after any change to the gebrd
 # panel path — that is a ten-minute check, and it is how this error was found.
+# PDM: Literal — machine-INVARIANT 8 on three boxes and two ISAs.
 const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three boxes (table above)
 
 # Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
@@ -561,6 +562,7 @@ const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three box
 # (P-tier) for calibration/override; fleet-confirm the invariance if a very-wide-register box ever appears.
 # PDM: Literal — back-transform block, measured invariant; confirm on a very-wide-register box before deriving. | tune: candidate
 const _BT_NB = @load_preference("bt_nb", 32)::Int
+# PDM: Exempt — a CORRECTNESS override, not a perf choice: bdsqr fails on clustered sigma, so all with-vectors SVD routes to D&C.
 const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
 # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
 # FAILS on near-degenerate singular-value clusters (two σ agreeing to relative spread

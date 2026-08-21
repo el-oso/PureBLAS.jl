@@ -203,6 +203,7 @@ end
     return res
 end
 
+# PDM: Literal — LAPACK's SMLSIZ: algorithm-intrinsic, machine-independent. tuning.md §4.
 const _STEDC_NB = 25   # req8-ok: LAPACK dstedc SMLSIZ — algorithm-intrinsic base-case crossover (NOT a
 # hardware tuning knob; machine-independent, like _SVD_DC_CROSS). steqr↔D&C switch.
 

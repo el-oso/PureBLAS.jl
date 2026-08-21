@@ -2513,6 +2513,7 @@ unpacked; complex: split-pack blocked, or an unpacked tiny-n path); AD element t
 # Direct tiny GEMM (max dim ≤ _GEMM_TINY): a plain register-accumulated triple loop. The masked 16×8
 # unpacked micro-kernel costs ~100–135 ns on a 2×2..6×6 problem (mask setup + dead lanes) — more than
 # OpenBLAS's entire ccall; the naive loop wins below W-sized problems.
+# PDM: Literal — below this the naive loop beats the packed path. TUNABLE.
 const _GEMM_TINY = 6
 # !tA tiny path: each C column is ONE masked W-vector (m ≤ W). Per column: k masked A-column loads ×
 # broadcast B scalars — FMA chains are per-column (ILP across the j loop), no 16-row mask machinery.

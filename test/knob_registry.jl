@@ -123,6 +123,44 @@ function bind_knobs(lines, rel = "?")
 end
 
 """
+    bare_rows() -> Vector{NamedTuple}
+
+Tuning constants that are NOT `@load_preference` keys — `const _X = <literal>` in `src/`.
+
+⚠ WHY THESE ARE HERE. The registry originally scanned preference keys only, and "all 120 audited, 0
+unaudited" was reported as full coverage of PureBLAS's tuning. It is not: a `const _TRSM_BASE = 32` is
+a tuning constant whether or not anyone wired a preference to it, and it is in a WORSE position than a
+knob — it cannot be pinned, cannot be tuned, and was invisible to the whole PDM audit. Found by asking
+which knobs `trtrs` uses and discovering the answer was "almost none from the registry": the real
+trsm side-L path runs on `_TRSM_BASE`, `_TRSM_NCUT`, `_TRSM_DBASE`, `_TRSM_FUSED_MIN`, `_TRMM_BASE`,
+none of them knobs. Same `# PDM:` marker contract applies.
+"""
+function bare_rows()
+    rows = NamedTuple[]
+    for (root, _, files) in walkdir(joinpath(_KR_ROOT, "src")), f in files
+        endswith(f, ".jl") || continue
+        rel = relpath(joinpath(root, f), joinpath(_KR_ROOT, "src"))
+        lines = readlines(joinpath(root, f))
+        pending, pending_at, pending_tier = "", 0, ""
+        for (i, ln) in pairs(lines)
+            mp = match(_KR_MARKER, ln)
+            if !isnothing(mp)
+                pending_tier = String(mp.captures[1]); pending, pending_at = String(mp.captures[2]), i
+                continue
+            end
+            m = match(r"^const (_[A-Z][A-Z_0-9]{2,})\s*=\s*(-?\d+|true|false)\s*(?:#.*)?$", ln)
+            isnothing(m) && continue
+            near = !isempty(pending) && i - pending_at <= 12
+            push!(rows, (; name = String(m.captures[1]), value = String(m.captures[2]),
+                         family = _kr_family(rel), tier = near ? pending_tier : "Unaudited",
+                         pdm = near ? pending : ""))
+            pending, pending_at, pending_tier = "", 0, ""
+        end
+    end
+    return sort!(rows; by = r -> (r.family, r.name))
+end
+
+"""
     knob_rows() -> Vector{NamedTuple}
 
 Every `@load_preference` key under `src/`, with its file, owning family, const name, default, default
@@ -213,6 +251,40 @@ function knob_markdown()
     println(io)
     println(io, "Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away")
     println(io, "and made this table too wide to read. The knob key is the identifier that matters.")
+
+    # ── the constants that are NOT preference keys ────────────────────────────────────────────────
+    bare = bare_rows()
+    bt = Dict{String, Int}()
+    for r in bare
+        bt[r.tier] = get(bt, r.tier, 0) + 1
+    end
+    println(io)
+    println(io, "## Tuning constants that are NOT knobs")
+    println(io)
+    println(io, "$(length(bare)) `const _X = <literal>` values in `src/` with no `@load_preference`.")
+    println(io, "They are tuning constants all the same — and in a WORSE position than a knob, because")
+    println(io, "they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit")
+    println(io, "above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely")
+    println(io, "on these, not on knobs.")
+    println(io)
+    print(io, "**Tier:** ")
+    println(io, join(["$(get(bt, t, 0)) $t" for t in (_KR_TIERS..., "Unaudited") if get(bt, t, 0) > 0], " · "), ".")
+    println(io)
+    fam2 = ""
+    for r in bare
+        if r.family != fam2
+            fam2 = r.family
+            println(io); println(io, "### $fam2"); println(io)
+            println(io, "| Const | Value | Tier | Why |")
+            println(io, "|---|---|---|---|")
+        end
+        why, tune = if occursin("|", r.pdm)
+            a, b = split(r.pdm, "|"; limit = 2); (strip(a), strip(b))
+        else
+            (r.pdm, "")
+        end
+        println(io, "| `$(r.name)` | $(r.value) | $(r.tier) | $(isempty(why) ? "—" : _kr_esc(why)) |")
+    end
     return String(take!(io))
 end
 

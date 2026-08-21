@@ -242,6 +242,7 @@ end
 # convergence — the pre-bisection is only a warm start. Measured: 0 (→1 iter) is fastest AND correctness is
 # unchanged (stress: clustered/graded/repeated/tiny-gap spectra all ~1.7e-14). Saves ~4 sec() evals/root, the
 # largest single cut to the small-n bdsdc merge cost (root-finding is ~45% of bdsdc). See kb pureblas-svd.
+# PDM: Literal — secular-equation bisection cap; 0 disables. TUNABLE.
 const _SEC_BISECT_CAP = 0
 # Secant step of the root finder, HOISTED out of _secular_root to a top-level function: as an inner
 # closure, its local `use_bisection` (a Bool reassigned across the loop/nested blocks) got boxed → Any →
@@ -738,6 +739,7 @@ function _combine_u!(U, um, cu, k::Int, rem::Int, n::Int)
     end
 end
 
+# PDM: Literal — divide-and-conquer cut. TUNABLE, algorithm-intrinsic so no formula.
 const _DC_THRESHOLD = 64
 
 # --- recursive divide-and-conquer driver (faer divide_and_conquer, Full-U, serial) --------------
