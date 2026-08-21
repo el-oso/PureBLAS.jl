@@ -55,6 +55,36 @@ function achieved_khz()
 end
 
 """
+    freq_locked() -> (locked::Bool, why::String)
+
+Is this box in the ONLY state a gate/tuning measurement is valid in — governor pinned, boost off,
+`scaling_min_freq == scaling_max_freq` (i.e. `sudo bench/fleet_freqlock.sh lock`)?
+
+⚠ THE TUNER DID NOT CHECK THIS UNTIL 2026-08-21, AND IT SHOULD HAVE BEEN FIRST. On that date
+neuromancer ran a full calibration at an achieved 4843 MHz against a 2000 MHz base — its lock had
+silently dropped (laptop, suspend/resume) — and produced an incoherent per-size verdict (per-column
+winning at n=512, losing at 1024, winning again at 2048 and 4096). The run was rejected only
+incidentally, because no window fitted that nonsense; had it fitted, the tuner would have PINNED a
+value measured on a floating clock. This repeats a documented incident: a kb finding was once retracted
+because "the box's frequency lock had silently dropped (4841 MHz against a 2000 MHz base)".
+A floating clock does not merely add noise — it drifts BETWEEN the arms of an A/B, which is the one
+error paired measurement cannot cancel.
+"""
+function freq_locked()
+    isdir("/sys/devices/system/cpu/cpu0/cpufreq") || return (true, "no cpufreq (not Linux) — unchecked")
+    b = tryparse(Int, strip(read("/sys/devices/system/cpu/cpufreq/boost", String)))
+    if !isnothing(b) && b != 0
+        return (false, "boost is ON (boost=$b) — run `sudo bench/fleet_freqlock.sh lock`")
+    end
+    lo = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq", String)))
+    hi = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", String)))
+    (isnothing(lo) || isnothing(hi)) && return (true, "cpufreq unreadable — unchecked")
+    lo == hi || return (false, "clock NOT pinned (min=$(lo÷1000) MHz, max=$(hi÷1000) MHz) — " *
+                               "run `sudo bench/fleet_freqlock.sh lock`")
+    return (true, "pinned at $(hi ÷ 1000) MHz, boost off")
+end
+
+"""
     contention() -> (loadavg, busy::Bool)
 
 1-minute load average, and whether the machine is too busy to tune. A user's laptop is not a locked fleet
@@ -66,15 +96,27 @@ anchor readings drifted 3.8% median / 8.9% max, while this fleet's quiet cross-r
 0.05%. So contention alone spans the entire decision margin, and refusing up front is much cheaper than
 discovering it via `with_anchor` after minutes of measurement.
 
-Threshold 1.5 allows for our own single-threaded load plus normal desktop idle.
+Threshold 1.5 allows for our own single-threaded load plus normal desktop idle ON A DEDICATED BOX.
+
+⚠ IT IS NOT UNIVERSAL, AND AN ABSOLUTE THRESHOLD IS THE WRONG SHAPE FOR A LAPTOP. Measured on
+neuromancer 2026-08-21: ZERO julia processes and a load average of 1.56 / 1.73 / 1.52 — a *persistent*
+desktop baseline (browser, indexers, trackers), not a decaying transient. That box therefore refuses
+to tune, forever, no matter how long anyone waits. Override with `PUREBLAS_TUNE_MAXLOAD`.
+
+Raising it is defensible because this check is only a cheap PRE-FILTER: `with_anchor` re-times a fixed
+workload around every measurement and refuses any knob whose machine state moved more than
+`ANCHOR_TOL`, so genuine interference is still caught per-knob rather than per-run. What the raised
+threshold buys is the chance to measure at all; what it does not buy is permission to trust a drifting
+result, and the anchor still owns that decision.
 """
+const MAXLOAD = something(tryparse(Float64, get(ENV, "PUREBLAS_TUNE_MAXLOAD", "")), 1.5)
 function contention()
     la = try
         parse(Float64, first(split(read("/proc/loadavg", String))))
     catch
         0.0    # unreadable (non-Linux): do not block, `with_anchor` still guards each knob
     end
-    return (la, la > 1.5)
+    return (la, la > MAXLOAD)
 end
 
 """

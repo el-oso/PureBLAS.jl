@@ -167,6 +167,16 @@ const KNOBS = (
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────
+# FREQUENCY LOCK FIRST — before contention, before anything. A value pinned from a boosting box is
+# worse than no pin: it is wrong in a way nothing downstream can detect, because the clock drifts
+# BETWEEN the arms of an A/B and paired measurement cannot cancel that.
+locked, why = freq_locked()
+if !locked
+    @error "REFUSING TO TUNE — $why. The frequency lock is the ONLY state a tuning measurement is " *
+           "valid in; a pin taken on a floating clock is a wrong answer with a confident face."
+    exit(4)
+end
+println("freq: $why")
 la, busy = contention()
 if busy
     @warn "machine is busy (1-min load $la) — a knob decided against someone else's workload is decided " *
@@ -177,6 +187,22 @@ println("stabilising (burning the boost window so the ramp does not bias the fir
 anchor, khz, steady = stabilise!()
 @printf("  anchor=%.3fus  clock=%.0fMHz  steady=%s\n", anchor * 1e6, khz / 1000, steady)
 steady || @warn "did not reach steady state; results may be biased by a moving clock"
+# ACHIEVED vs REQUESTED — the settings check above is NOT sufficient, which is the whole lesson here.
+# neuromancer 2026-08-21 reported boost=0, scaling_min==scaling_max==2000 MHz, governor `performance`
+# — every knob in the right position — and ran the calibration at an ACHIEVED 4843 MHz. The pstate
+# driver was not honouring the cap (it needs amd_pstate=passive), so the requested state and the real
+# clock disagreed by 2.4x. This is exactly why bench/fleet_freqlock.sh VERIFIES under load instead of
+# trusting what it wrote, and the tuner must do the same.
+let cap = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", String)))
+    if !isnothing(cap) && khz > 1.05 * cap
+        @error "REFUSING TO TUNE — achieved $(round(Int, khz/1000)) MHz against a requested cap of " *
+               "$(cap ÷ 1000) MHz. The cpufreq SETTINGS look locked but the clock is floating; the " *
+               "driver is ignoring them. Run `sudo bench/fleet_freqlock.sh lock` and check its verify " *
+               "step passes. A pin taken here would be measured on a clock that drifts BETWEEN the " *
+               "arms of an A/B — the one error paired measurement cannot cancel."
+        exit(5)
+    end
+end
 
 prefs = Pair{String, Any}[]
 for k in KNOBS

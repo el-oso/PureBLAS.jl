@@ -68,8 +68,15 @@ const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", 
 Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.
 A calibration run leaves its own load behind, so consecutive runs must be spaced or the second one
 refuses to measure. Bounded so a genuinely busy machine still makes progress rather than hanging.
+
+⚠ THE BOUNDS ARE SET BY HOW loadavg DECAYS, NOT BY TASTE. The 1-minute average is a LAGGING
+indicator with roughly a 1-minute time constant, so after a multi-minute run that pinned a core it
+needs several minutes to fall back under calibrate.jl's 1.5 threshold. Measured on galen 2026-08-21:
+zero julia processes running and the 1-min average still read 2.69 (5-min 1.71, 15-min 0.70). A 180 s
+cap therefore expired while the box was still "busy" by the very guard this exists to satisfy, and the
+next run refused. `below` sits just under calibrate.jl's threshold so satisfying this satisfies that.
 """
-function _wait_idle(; below::Float64 = 1.2, maxsecs::Int = 180)
+function _wait_idle(; below::Float64 = 1.4, maxsecs::Int = 600)
     t0 = time()
     while time() - t0 < maxsecs
         la = try
