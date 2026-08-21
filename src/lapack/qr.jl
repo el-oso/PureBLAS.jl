@@ -288,6 +288,7 @@ end
 # vwidth-scaled: the per-µarch unblocked crossover is unmeasured off Zen4 (a separate minor lever), and a
 # vw-scaled 16 would shrink Zen3's proven master range n≤32→16 with no data. ponytail: derive when fleet
 # unblocked-crossover data exists; preserving validated behavior beats an unvalidated formula here (req#8b).
+# PDM: Literal — unblocked/blocked crossover, unmeasured off Zen4; pinned flat deliberately. tuning.md §4.
 const _QR_UNBLK_MAX = 32
 # Complex panel width: the unblocked complex panel (SIMD zlarf: dotc+axpy per trailing col) is per-column-
 # call-bound, so a narrow panel hands the O(n²k) trailing update to the gating blocked complex gemm sooner.

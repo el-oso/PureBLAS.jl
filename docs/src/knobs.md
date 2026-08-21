@@ -30,7 +30,7 @@ Every `@load_preference` key in `src/` — 120 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `cgemv_mr` | literal | Literal | split accumulators need MR small enough to amortise A; 4 fits both register files. | low value |
+| `cgemv_mr` | literal | Literal | parameterises `_gemv_n_cmplx!`, which gemv-N NO LONGER USES (routed to _gemv_n_ri_cmplx!); reached only via hemv. Re-measure through zhemv, not zgemvN. | candidate, hemv shapes |
 | `cgemv_rb` | formula | Derived | L2/16: the m*n threshold where a resident panel stops beating a stream. | n/a |
 | `cgemvn_nc` | literal | Literal | 4 columns per panel, matching what OpenBLAS uses; not swept independently. | candidate |
 | `cgemvn_nc_big` | formula | Derived | formula over detected consts: `3 * _vwidth(Float64) ÷ 2` | — |
@@ -97,12 +97,12 @@ Every `@load_preference` key in `src/` — 120 of them.
 | `gemmtrsm_mr` | formula | Derived | formula over detected consts: `min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV` | — |
 | `gemmtrsm_nrv` | formula | Derived | formula over detected consts: `_GT_NREG >= 32 ? 3 : 2` | — |
 | `symm_pack_cut` | formula | Derived | formula over detected consts: `_at_symm_mat_max(_HW)` | — |
-| `syr2k_2pass` | formula | Literal | two-pass enabled on AVX2 only (typemax disables it on AVX-512); measured, not derived. | candidate |
+| `syr2k_2pass` | formula | Literal | AVX2-ONLY by construction: the default is typemax(Int) on AVX-512, which disables the branch. Zen3-only evidence is COMPLETE. | n/a off AVX2 |
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
-| `syrk_mr` | literal | Literal | rank-k row-block factor; 2 measured, not derived from the register file. | candidate |
+| `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
@@ -222,3 +222,108 @@ Every `@load_preference` key in `src/` — 120 of them.
 
 Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away
 and made this table too wide to read. The knob key is the identifier that matters.
+
+## Tuning constants that are NOT knobs
+
+34 `const _X = <literal>` values in `src/` with no `@load_preference`.
+They are tuning constants all the same — and in a WORSE position than a knob, because
+they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
+above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
+on these, not on knobs.
+
+**Tier:** 9 Derived · 23 Literal · 2 Exempt.
+
+
+### BLAS-1 SIMD kernels
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_IAMAX_NB_STREAM` | 4 | Derived | ILP chain count, ISA-invariant by the same latency x throughput argument. |
+| `_UNROLL` | 4 | Derived | 4 independent chains x W lanes, an ILP count tied to _ILP_TARGET. |
+
+### BLAS-2 (gemv/ger/trmv/trsv)
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_CGEMV_NP` | 8 | Derived | complex gemv-N panel width, same register-pressure argument as _GEMV_NP. DERIVABLE. |
+| `_GEMVN_MINNER_U` | 4 | Literal | row-unroll paired with the gemvn_minner knob; moves with it, not independently. |
+| `_GEMVT_NC_DEEP` | 8 | Derived | one x-load per 8 FMAs, the load:FMA ratio that clears the MLP plateau; guarded by _NVREG. |
+| `_GEMVT_U_DEEP` | 4 | Derived | 4 lines per stream, so NC*U = 32 lines named: enough to cover L2. |
+| `_GEMV_NP` | 8 | Derived | gemv-N panel width; the comment already reasons in MR and register pressure. DERIVABLE from _NVREG. |
+| `_GER_PANEL_U` | 4 | Literal | its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one. |
+| `_SCALAR_FPREGS` | 16 | Derived | x86 has 16 scalar FP registers, AArch64 32; exactly the _NVREG pattern. DERIVABLE, currently hardcoded. |
+| `_SYMV_MR` | 4 | Derived | register-file bound (its comment: 16 ymm, and the gemv-N MR=8 bump SPILLED symv). DERIVABLE from _NVREG. |
+| `_SYMV_NB` | 8 | Derived | symv panel width, a lanes multiple. DERIVABLE from _lanes. |
+| `_TRSV_T_F` | 8 | Literal | trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE. |
+
+### BLAS-3 (trmm/trsm/syrk/symm)
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_SYRK_BASE` | 48 | Literal | syrk recursion base before the off-diagonal gemm. TUNABLE. |
+| `_TRMM_RPANEL` | 512 | Literal | trmm side-R panel width. TUNABLE, should be a knob. |
+| `_TRSM_BASE` | 32 | Literal | trsm recursion base. TUNABLE and not a knob: unpinnable, untunable, and on trtrs's real path. |
+| `_TRSM_DBASE` | 32 | Literal | diagonal-block base; its own comment says 'could be a Preference'. TUNABLE. |
+| `_TRSM_NCUT` | 64 | Literal | B-width cut for side-L. TUNABLE, should be a knob. |
+| `_TRSM_NCUT_R` | 128 | Literal | B-width cut for side-R. TUNABLE, should be a knob. |
+| `_TRSM_R_FUSE` | 128 | Literal | side-R fuse threshold. TUNABLE, should be a knob. |
+| `_TRTRI_BASE` | 16 | Literal | triangular-inverse recursion base. TUNABLE, should be a knob. |
+
+### CPU detection
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_GEMM_SPLIT_S` | 2 | Literal | split-reduction factor, measured crossover ~n=56 on Zen4. TUNABLE. |
+| `_ILP_TARGET` | 16 | Literal | 2 x FMA latency(4) x FMA ports(2); an architectural assumption, and neither latency nor port count is detectable. |
+| `_TUNE_NKNOBS` | 12 | Exempt | a COUNT of Measure-tier knobs (the Bonferroni denominator), not a tuning value. |
+
+### LAPACK · eigen_dc
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_STEDC_NB` | 25 | Literal | LAPACK's SMLSIZ: algorithm-intrinsic, machine-independent. tuning.md §4. |
+
+### LAPACK · lapack
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_TR_TB` | 32 | Literal | residency-INVARIANT: two 32^2 F64 tiles = 16 KB, under any real L1. Deriving it would change nothing. |
+
+### LAPACK · lu
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_GETF2_BASE` | 16 | Literal | store-traffic algorithm switch, invariant of cache size. tuning.md §4. |
+| `_LU_NB` | 48 | Literal | residency derivation FLEET-FALSIFIED; the curve is parity-bumpy, not residency-shaped. tuning.md §4. |
+
+### LAPACK · packed_chol
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_PPTRF_TPSV_MIN` | 32 | Literal | call-overhead vs vectorised-work crossover, measured Zen4 ONLY; needs fleet validation. |
+
+### LAPACK · qr
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_QR_UNBLK_MAX` | 32 | Literal | unblocked/blocked crossover, unmeasured off Zen4; pinned flat deliberately. tuning.md §4. |
+
+### LAPACK · svd
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_BRD_NB` | 8 | Literal | machine-INVARIANT 8 on three boxes and two ISAs. |
+| `_SVD_DC_CROSS` | 1 | Exempt | a CORRECTNESS override, not a perf choice: bdsqr fails on clustered sigma, so all with-vectors SVD routes to D&C. |
+
+### LAPACK · svd_dc
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_DC_THRESHOLD` | 64 | Literal | divide-and-conquer cut. TUNABLE, algorithm-intrinsic so no formula. |
+| `_SEC_BISECT_CAP` | 0 | Literal | secular-equation bisection cap; 0 disables. TUNABLE. |
+
+### gemm (BLAS-3)
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |

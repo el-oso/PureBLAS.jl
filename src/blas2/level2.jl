@@ -39,6 +39,7 @@ end
 # (Zen5) re-expose it → MR=8 (Zen5 gemvN@256 was 0.86 at MR=4). Keyed on _double_pumped (silicon fact).
 const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
+# PDM: Derived — gemv-N panel width; the comment already reasons in MR and register pressure. DERIVABLE from _NVREG.
 const _GEMV_NP = 8             # gemv-N column-panel width
 # ── gemvN m-inner panel (OpenBLAS dgemv_n shape; see _gemv_n_paneldrv_minner!). The old panel path holds
 # a full row-block's y in registers and sweeps columns inner, so each of NP=8 A-columns is read in mr-row
@@ -75,6 +76,7 @@ const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
 else
     @inline _gemvn_minner() = _GEMVN_MINNER_PREF::Bool
 end
+# PDM: Literal — row-unroll paired with the gemvn_minner knob; moves with it, not independently.
 const _GEMVN_MINNER_U = 4    # row-vector unroll (U·W rows/step): independent y-accumulators to cover FMA latency (ILP)
 # Panel width (columns/panel = concurrent A-read streams; y re-streamed n/NP times) — three regimes:
 #  narrow  A ≤ 2·L2 (partially L2-resident band, e.g. f64 n=512 = 2 MB): few streams win. NP8 = 0.95 vs OB,
@@ -955,7 +957,9 @@ end
     return _gemvt_deep_on() &&
         m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
 end
+# PDM: Derived — one x-load per 8 FMAs, the load:FMA ratio that clears the MLP plateau; guarded by _NVREG.
 const _GEMVT_NC_DEEP = 8      # one x-load per 8 FMAs: the load:FMA ratio that clears the plateau
+# PDM: Derived — 4 lines per stream, so NC*U = 32 lines named: enough to cover L2.
 const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines named, enough to cover L2
 
 # `blk`-explicit entry: `true` forces the NC=4 blocked kernel regardless of `_gemvt_perscan`.
@@ -1129,7 +1133,7 @@ end
 # 2 ymm each). gemvN is ILP-bound: more independent tiles hide Zen3's fma latency — but 2W-wide accs
 # eat the 16-ymm file fast, so MR=4 (4 chains, ~14 ymm) is the measured AVX2 optimum (MR=5 spills,
 # split-accumulators need MR too small to amortize A). AVX-512's 32 zmm has ample room. Swept per box.
-# PDM: Literal — split accumulators need MR small enough to amortise A; 4 fits both register files. | tune: low value
+# PDM: Literal — parameterises `_gemv_n_cmplx!`, which gemv-N NO LONGER USES (routed to _gemv_n_ri_cmplx!); reached only via hemv. Re-measure through zhemv, not zgemvN. | tune: candidate, hemv shapes
 const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
 # Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
 # _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
@@ -1205,6 +1209,7 @@ const _CGEMVT_CFG_BIG = (
 # PDM: Derived — _CGEMVT_CFG_BIG is already a complete _NVREG derivation. | tune: n/a
 const _CGEMVT_CFG = @load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)::Int
 @inline _cgemvt_cfg() = _CGEMVT_CFG
+# PDM: Derived — complex gemv-N panel width, same register-pressure argument as _GEMV_NP. DERIVABLE.
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
@@ -1741,6 +1746,7 @@ end
 # DRAM sizes): Zen5→1, Zen3→4, Zen4→8. Every external cause was eliminated (memory subsystem scales fine on
 # both; DIMMs rank-matched; OS/clock cancel in the PB/OB ratio; 4K-aliasing padded out; LLVM znver4≡znver5
 # codegen on the same silicon) — so this is a genuine tuning knob, not a µarch hack. Default 4 (a safe middle).
+# PDM: Literal — its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one.
 const _GER_PANEL_U = 4                                          # x-vector unroll (ILP)
 # Complex ger panel budget — DERIVED from the register file, not swept. A complex column holds 2
 # `Vec{2W,T}` coefficient vectors, and `Vec{2W,T}` occupies exactly 2 native registers on every ISA
@@ -2168,10 +2174,12 @@ end
     return s
 end
 
+# PDM: Derived — symv panel width, a lanes multiple. DERIVABLE from _lanes.
 const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators in the microkernel)
 # symv row-panel height in vectors — its OWN const, NOT _GEMV_MR: symv's off-block fuses NB axpy +
 # NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
 # 16 ymm; the gemv-N MR=8 bump spilled symv (galen 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
+# PDM: Derived — register-file bound (its comment: 16 ymm, and the gemv-N MR=8 bump SPILLED symv). DERIVABLE from _NVREG.
 const _SYMV_MR = 4
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
@@ -3218,6 +3226,7 @@ end
 # i.e. the drop lands exactly between 12 and 13, as the residency model predicts. The kernel still WINS
 # at every n ≤ 16, so this bound is chosen for where the win is best-and-still-growing, not to avoid a
 # regression; raising it is safe on speed and costs only generated code (bodies are O(n²) statements).
+# PDM: Derived — x86 has 16 scalar FP registers, AArch64 32; exactly the _NVREG pattern. DERIVABLE, currently hardcoded.
 const _SCALAR_FPREGS = 16      # x86-64 xmm0-15; architectural, not µarch-dependent
 # PDM: Derived — formula over detected consts: `_SCALAR_FPREGS - 4`
 const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
@@ -3269,6 +3278,7 @@ end
 # `_trsv_fused8!` makes for the N form, transposed: 8 fused dots instead of 8 fused axpys.
 # Panel width. F=8 matches `_trsv_fused8!` and the number of independent accumulators the kernel keeps
 # live; the routing bound below is expressed as a multiple of it rather than as a bare size literal.
+# PDM: Literal — trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE.
 const _TRSV_T_F = 8
 
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)

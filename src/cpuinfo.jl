@@ -146,6 +146,7 @@ const _HW = (
 
 # (c) Datapath unrolls — criterion: latency×throughput. Keep ILP_TARGET independent FMA accumulator chains
 # in flight (2 × FMA_latency(4) × FMA_ports(2) = 16) to cover latency on all pipes + hide panel loads.
+# PDM: Literal — 2 x FMA latency(4) x FMA ports(2); an architectural assumption, and neither latency nor port count is detectable.
 const _ILP_TARGET = 16
 @inline _at_gemm_nr(hw, ::Type{T} = Float64) where {T} = max(_lanes(hw, T), _ILP_TARGET ÷ _lanes(hw, T))
 @inline function _at_gemm_mr(hw, ::Type{T} = Float64) where {T}                               # MR (row W-blocks)
@@ -180,6 +181,7 @@ end
 # via _GEMM_MR1_MAX — so it const-folds off on Zen3. Derived: S=2 (double ILP for the fill), cells=_ILP_TARGET÷S
 # arranged TALL (NR=2 → a B-reuse column pair; MR=cells÷NR), giving 4×2 on W=8. Validated n=32 0.85→1.07× OB
 # (wintermute Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
+# PDM: Literal — split-reduction factor, measured crossover ~n=56 on Zen4. TUNABLE.
 const _GEMM_SPLIT_S = 2
 @inline _at_gemm_split_ok(hw) = hw.nvreg >= 32 && hw.simd >= 64
 @inline _at_gemm_split_nr(hw) = 2
@@ -568,6 +570,7 @@ const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a
 # pstrf_rowcache, axpy_band, axpy_dram all demoted to Derive). Lowering it shrinks `_TUNE_ROUNDS`, i.e.
 # buys FEWER rounds for the duels that remain — the opposite of the retirement's intent. Per the note
 # above, drift high costs conservatism only. Reset it if the Measure tier is ever repopulated.
+# PDM: Exempt — a COUNT of Measure-tier knobs (the Bonferroni denominator), not a tuning value.
 # req8-ok: a COUNT of Measure knobs in this source tree (Bonferroni denominator), not a machine value
 const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
 

@@ -6,6 +6,7 @@
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
+# PDM: Literal — trmm side-R panel width. TUNABLE, should be a knob.
 const _TRMM_RPANEL = 512
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
@@ -1287,6 +1288,7 @@ end
 # solve runs at gemm speed instead of scalar back-substitution. The recursion's off-diagonal updates
 # are already gemm!. Real only (stability fine for the well-conditioned diagonal blocks trsm assumes);
 # complex/conj keep the scalar trsv base.
+# PDM: Literal — trsm recursion base. TUNABLE and not a knob: unpinnable, untunable, and on trtrs's real path.
 const _TRSM_BASE = 32
 # Small real triangular inverse: V (same uplo as A) = inv(A). Cast as a trsm: V solves A·V = I, so
 # V := A⁻¹·I via the vectorized dense-L base (contiguous A-column axpys) instead of a scalar
@@ -1299,6 +1301,7 @@ const _TRSM_BASE = 32
 # V12 = -V11·A12·V22; the opposite off-block is zeroed so V stays triangular (the invL base reads V dense).
 # Base blocks (≤ _TRTRI_BASE) use the identity-RHS dense solve. Diagonal blocks recurse with the same
 # uplo/unit; the off-diagonal block carries its actual (non-unit) values.
+# PDM: Literal — triangular-inverse recursion base. TUNABLE, should be a knob.
 const _TRTRI_BASE = 16
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
@@ -1366,11 +1369,14 @@ end
 # 4-way-unrolled `_axpy_simd!` (no-trans; trans strided → scalar). n³/2 flops (half of invert+gemm), no gemm
 # dispatch. Real non-conj; forward when up==tr. Used as the base ONLY when B is narrow — the per-column axpy
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
+# PDM: Literal — B-width cut for side-L. TUNABLE, should be a knob.
 const _TRSM_NCUT = 64          # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
+# PDM: Literal — B-width cut for side-R. TUNABLE, should be a knob.
 const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
 # Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
+# PDM: Literal — diagonal-block base; its own comment says 'could be a Preference'. TUNABLE.
 const _TRSM_DBASE = 32
 # Narrow-B cutoff: side-L trsm sweeps trsv per column when nrhs ≤ this. Set to 0 to disable.
 #
@@ -3764,6 +3770,7 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     end
     return B
 end
+# PDM: Literal — side-R fuse threshold. TUNABLE, should be a knob.
 const _TRSM_R_FUSE = 128       # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
 # BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
 # amortizes over O(m·k) solve work — tax = k/m — so it needs a FEW register-tiles of m, NOT the k-CEILING.
@@ -4200,6 +4207,7 @@ end
 # trans 'N': op(A)=A (n×k) ⇒ A·Aᴴ. trans 'T'/'C': op(A)=Aᴴ (A k×n) ⇒ Aᴴ·A. syrk: ᵀ (no conj),
 # any T<:Number. herk: Hermitian (conj), real α/β, diagonal forced real. Recursive: diagonal blocks
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
+# PDM: Literal — syrk recursion base before the off-diagonal gemm. TUNABLE.
 const _SYRK_BASE = 48
 
 @inline _symstored(up::Bool, i, j) = up ? (i <= j) : (i >= j)
@@ -4796,7 +4804,7 @@ const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) 
 # 256 0.92 measured galen). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
 # single-product tri kernel → gates the whole AVX2 range (MR2 ≥ MR3 at every n=64..2048, exact correctness).
 # Width-conditional: only F64/AVX2 (W=4); F32/AVX2 and all of AVX-512 keep _MR. Knob "syrk_mr".
-# PDM: Literal — rank-k row-block factor; 2 measured, not derived from the register file. | tune: candidate
+# PDM: Literal — AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | tune: n/a off AVX2
 const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
@@ -5340,7 +5348,7 @@ const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
 # On AVX2 the fused MR=2 tile has only 8 accumulators (ILP-starved on 16 regs); two _trgemm_packed! passes
 # (12 accs each) win at n>128 despite 2× C traffic (measured: n=512 0.94→1.00, n=1024 0.95→1.02). AVX-512
 # keeps the fused unified path (32 regs, not starved). Overridable "syr2k_2pass".
-# PDM: Literal — two-pass enabled on AVX2 only (typemax disables it on AVX-512); measured, not derived. | tune: candidate
+# PDM: Literal — AVX2-ONLY by construction: the default is typemax(Int) on AVX-512, which disables the branch. Zen3-only evidence is COMPLETE. | tune: n/a off AVX2
 const _SYR2K_2PASS = @load_preference("syr2k_2pass", _vwidth(Float64) == 4 ? 128 : typemax(Int))::Int
 # Handles β internally: the two-pass path can OVERWRITE C on its first pass when β=0 (skipping the
 # separate scaleC zero-pass — measured the whole n=256 gate gap, since scaleC + 2 adds is 3 C-touches at

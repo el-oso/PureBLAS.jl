@@ -274,6 +274,7 @@ const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B 
 # varies wildly by µarch); tiling confines each strided sweep to a `_TR_TB`² block that stays L1-resident, so
 # the O(n²) transpose cost shrinks uniformly and the lever ≈ the lower kernel on every box. TB=32 is
 # µarch-invariant (two 32² F64 tiles = 16 KB ≤ any real L1; complex 32² = 32 KB still fits typical L1).
+# PDM: Literal — residency-INVARIANT: two 32^2 F64 tiles = 16 KB, under any real L1. Deriving it would change nothing.
 const _TR_TB = 32
 @inline function _tri_upper_to_lowerT!(
         pm::Ptr{T}, ldM::Int, pa::Ptr{T}, lda::Int, n::Int,

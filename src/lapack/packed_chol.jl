@@ -20,6 +20,7 @@
 # 1.17→0.88 at n=32, i.e. it turns two passing sizes into misses.
 # ⚠ MEASURED ON ZEN4 ONLY — galen was off the network and Zen5 is not yet re-locked. Needs fleet
 # validation before it is trusted to extrapolate (req#8: derive → validate on the fleet → ship).
+# PDM: Literal — call-overhead vs vectorised-work crossover, measured Zen4 ONLY; needs fleet validation.
 const _PPTRF_TPSV_MIN = 32
 
 # Block width for the blocked lower packed factorisation. PDM tier: PIN-able, default DERIVED from the
