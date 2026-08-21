@@ -19,7 +19,7 @@ using LinearAlgebra: PosDefException
 # L1-residency (√(L1/8)=64 is WORSE than 32) — it is a recursion-overhead floor, matching `_CHOL_SB`=32.
 # INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
 # Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
-# PDM: Literal(invariant) — a RECURSION-OVERHEAD floor, not a residency block, so there is nothing to derive it from: the L1-residency guess sqrt(L1/8)=64 measures WORSE than 32, and the optimum is small and µarch-FLAT (16-32 on both fleet ISAs). Matches `_CHOL_SB`=32 independently. Fleet A/B validated (base=512 was up to 43.9x slower than OB). Falsifier: a box whose optimum is NOT in 16-32. Catalogued in docs/src/tuning.md §4. | tune: not a candidate — measured µarch-invariant; a formula would add spurious variation, exactly as the falsified `_LU_NB` derivation did
+# PDM: Literal — recursion-overhead floor, µarch-flat at 16-32; the residency guess 64 is worse. | tune: no
 const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # (The tiny-UPPER cutoff is `_potrf_udirect(T)` — a real MEASURE-tier auto-tune defined next to the
 # lever bodies below, near `_potrf_gen!`. It was briefly a literal 12 here, which req#8b classifies as
@@ -33,7 +33,7 @@ const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # Derived (÷2 off the F64 anchor), µarch-invariant crossover like _CHOL_STH; knob "potrf_base_f32"; fleet-validate.
 # MUST be a top-level const (like every other tuning const here): @load_preference inside a function body is a
 # per-CALL runtime preferences lookup — it dominated microsecond small-n F32 factorizations (galen spotrf 0.02).
-# PDM: Derived(sibling) — sizeof-ratio derivation, not a borrowed literal: F32 is half the bytes of F64, so the same recursion-overhead floor sits at half the n. Documented in tuning.md §4 alongside `_POTRF_BASE`, whose own status is validated-literal (the residency guess sqrt(L1/8)=64 measured WORSE than 32). | tune: n/a — follows potrf_base
+# PDM: Derived — sizeof ratio: F32 is half F64's bytes, so half the n. | tune: n/a, follows potrf_base
 const _POTRF_BASE_F32 = @load_preference("potrf_base_f32", _POTRF_BASE >> 1)::Int
 @inline _potrf_base(::Type{Float32}) = _POTRF_BASE_F32
 @inline _potrf_base(::Type{T}) where {T} = _POTRF_BASE

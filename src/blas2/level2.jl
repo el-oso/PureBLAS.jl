@@ -789,7 +789,7 @@ end
 # _GEMVT_NC_CANDIDATES, the Val ladder and PUREBLAS_FORCE_gemvt_nc are retained above — forcing an arm
 # through bench/plots.jl is how the measured tables in this file were produced and how the next
 # attempt must be measured.
-# PDM: Derived-falsified — the project's own latency x throughput criterion (_ILP_TARGET) predicts EIGHT chains; every fleet box measures 4 best, monotonically worse at 8 and 16. A derivation that predicts the wrong answer is falsified, so the literal 4 ships with its table. Re-open only via the NC x U pair (AOCL runs NC=8 x U=4), which the 2026-08-20 grid found ties in the DRAM regime. | tune: not a tune!() candidate — measured µarch-INVARIANT (4 on all three boxes)
+# PDM: Literal — _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | tune: no, µarch-invariant
 const _GEMVT_NC_PREF = @load_preference("gemvt_nc", nothing)
 const _GEMVT_NC = something(_GEMVT_NC_PREF, 4)::Int   # req8-ok: falsified-derivation literal, see table above
 # ⚠ THE HOOK ABOVE WAS DEAD UNTIL 2026-08-20. The comment promised `PUREBLAS_FORCE_gemvt_nc` reached
@@ -838,7 +838,7 @@ end
 # both. A deficit that survives swapping the whole kernel is not IN the kernel choice, so no routing
 # change can close it. (Zen4 mode 2 was not run: its contention guard refused twice, and with mode 2
 # dead 13/14 on the other two boxes the arm did not deserve a third slot.)
-# PDM: Measured — no detected const partitions the fleet: EVERY PAIR of boxes disagrees at some size. L1 was the last candidate and is FALSIFIED — wintermute and galen both have 32 KiB L1 and want opposite arms at n=512 (percol 1.113 vs blocked 0.953/0.964/0.973, three processes each). Not L2, not L3, not SIMD width either (wintermute/neuromancer share width 64 and disagree at n=1024). A `_wide_simd` derivation was written and falsified before shipping. | tune: not implemented; the knob is also too COARSE — the optimum is per-(box,size), so galen leaves ~1.9% at n=1024 and Zen5 ~3.9% at n=512 (#160). Needs a per-SIZE route pin, a knob-shape change, not a value.
+# PDM: Measured — every pair of boxes disagrees at some size; L1, L2, L3 and width all falsified. | tune: not yet
 const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
@@ -866,9 +866,9 @@ end
 # The two WINDOW BOUNDS, pinnable since 2026-08-21. Defaults are the values that were hardcoded in the
 # predicate below (`_L2_BYTES`, `_L1_BYTES ÷ 2`), so an unpinned build routes IDENTICALLY — asserted in
 # test/autotune_tests.jl rather than asserted in prose.
-# PDM: Measured(bounds) — the window's SHAPE is derived (A past L2, x still L1-resident) but its two edges are not: the measured optimum is per-(box,SIZE) and every pair of boxes disagrees at some size, so no formula places them. Exposing the edges is what makes the per-size optimum reachable at all — a 3-valued mode cannot express "per-column at n=1024 only". | tune: candidate, and the candidate SET is derived — the edges only ever sit at cache-geometry boundaries (L1/2, L1/4, L2, 2*L2), so tune!() searches a handful of values, not a range
+# PDM: Measured — window's lower edge; no formula places it (see gemvt_perscan). | tune: candidate, cache-boundary set
 const _GEMVT_PERCOL_AMIN = @load_preference("gemvt_percol_amin", _at_gemvt_percol_amin(_HW))::Int
-# PDM: Measured(bounds) — upper edge of the same window; see gemvt_percol_amin. This is the edge that carries the money: it alone separates neuromancer's optimum (percol at n=512 only, XMAX=4 KiB) from the default L1/2=24 KiB that gives it percol through n=2048. | tune: candidate, same derived candidate set
+# PDM: Measured — window's upper edge, and the one worth money (Zen5 wants 4 KiB, not L1/2). | tune: candidate
 const _GEMVT_PERCOL_XMAX = @load_preference("gemvt_percol_xmax", _at_gemvt_percol_xmax(_HW))::Int
 @inline function _gemvt_perscan(m::Int, n::Int, ::Type{T}) where {T}
     mode = _gemvt_perscan_mode()                     # ONE resolution per call, as before
@@ -1190,7 +1190,7 @@ const _CGEMVT_CFG_BIG = (
 # from it, and the comment above already records it alternating 108/4/108/4/108/4/108/4 across eight
 # processes with the old incumbent. A knob whose measurement can only confirm or corrupt its derivation
 # is not Measure tier; it is Derive with extra risk. Preference override retained (Pin rung).
-# PDM: Derived(sibling) — `_CGEMVT_CFG_BIG` is itself a complete derivation over `_NVREG` (see the DERIVE note above: galen _NVREG=16 fits (4,half)=>104, wintermute _NVREG=32 fits (8,half), each reproducing what the retired duel resolved 6/6). Coupled only because the derivation is named once and reused. | tune: n/a — Derived
+# PDM: Derived — _CGEMVT_CFG_BIG is already a complete _NVREG derivation. | tune: n/a
 const _CGEMVT_CFG = @load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)::Int
 @inline _cgemvt_cfg() = _CGEMVT_CFG
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
@@ -1825,7 +1825,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # selecting a fallback from it.
 # RUN `PureBLAS.tune!()` to replace this with your machine's actual optimum (recovers 8 on Zen4, 4 on
 # Zen3). The default only has to be non-catastrophic until then.
-# PDM: Measured — optimum is 8/4/1 on Zen4/Zen3/Zen5; Zen4 and Zen3 agree on L2, L3, SIMD width and register count, so no formula over detected consts separates them. Depends on DRAM write-stream count, which is not a detected const. | tune: ~22 s measured (4 candidate arms x 8 rounds at n=2048, DRAM regime)
+# PDM: Measured — optimum 8/4/1 on boxes that agree on L2/L3/width; tracks DRAM write streams. | tune: 22 s
 const _GER_NP = something(@load_preference("ger_panel_np", nothing), 1)::Int   # req8-ok: minimax, table above
 @inline _ger_np() = (f = _fk("ger_panel_np"); f >= 0 ? f : _GER_NP)
 
@@ -2989,7 +2989,7 @@ end
 end
 # Largest power of two on the measured plateau (2-6). 4 rather than 6 because the panel arithmetic
 # uses `n & (F-1)` for the ragged first block, which needs F a power of two.
-# PDM: Literal(constrained) — the measured plateau is F in 2..6 and the panel arithmetic uses `n & (F-1)` for the ragged first block, so F MUST be a power of two; 4 is the largest admissible value on the plateau. The choice is forced by the kernel's addressing, not fitted to a box. | tune: low value — the whole plateau measures flat, so a pin buys nothing unless the addressing changes
+# PDM: Derived — majority criterion: switch once tri > 2*L3. The 2 IS the 1/2. | tune: n/a
 const _TRMV_F_DRAM = @load_preference("trmv_f_dram", 4)::Int          # req8-ok: see above
 # PDM: Derived — NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | tune: n/a — Derived
 const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok: see above

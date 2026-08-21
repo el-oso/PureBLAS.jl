@@ -73,7 +73,7 @@ end
 # Candidate set is derived: multiples of the nb quantum (8). The probe times blocked against unblocked
 # at each candidate width and returns the smallest at which blocking actually wins, so the ladder
 # adapts to a box we have never measured.
-# PDM: Literal(keyed) — CROSSOVER, derivation falsified (see pbtrf_cross_kd for the two dead ends and their arithmetic). The C32 row is NOT width-split like its C64 sibling: wintermute is a true 3-3 TIE (16,16,8,16,8,8) and the AVX-512 boxes disagree with each other, which is why it is a bare literal 16 and not a formula. | tune: candidate — C32 is resolving a coin flip
+# PDM: Literal — crossover, derivation falsified; the C32 row is a 3-3 tie on Zen4. | tune: candidate
 const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
 @static if isnothing(_GBTRF_CROSS_PREF)
     # Width-derived; see `_at_gbtrf_cross` (cpuinfo.jl) for the three-box table. Each box keeps its

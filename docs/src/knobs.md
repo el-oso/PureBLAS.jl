@@ -5,226 +5,223 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 120 of them. The PDM ladder
-(`docs/src/tuning.md`) requires each to be **Derived** (default is a formula over detected
-consts) or **Measured** (it is not — which needs a justification and a `tune!()` cost).
+Every `@load_preference` key in `src/` — 120 of them.
 
-**Syntactic tier** is what the generator can see in the default expression; it is a
-*classification aid, not a verdict*. `Literal` means "a bare number is the default" — it
-may be a proven invariant (fine), a falsified derivation (fine, documented), or unconverted
-debt. The `# PDM:` marker is the human judgement and is the column that matters.
-
-| Syntactic tier | Count |
+| Tier | Meaning |
 |---|---|
-| Coupled | 6 |
-| Derived | 43 |
-| Flag | 4 |
-| Literal | 35 |
-| Other | 1 |
-| Predicate-keyed | 11 |
-| Pref-gated | 20 |
+| **Derived** | Default is a formula over detected hardware consts. |
+| **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |
+| **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
+| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
+| **Unaudited** | Nobody has classified it yet. Debt, not a verdict. |
 
-**Audited: 23 / 120** knobs carry a `# PDM:` marker. The rest are the
-worklist — an unaudited knob is one nobody has justified, which is exactly how redundant
-and duplicated knobs survive.
+**Counts:** 8 Derived · 4 Measured · 9 Literal · 2 Exempt · 97 Unaudited.
+
+**23 / 120 classified.** An unaudited knob is one nobody has justified —
+which is how a redundant or mislabelled knob survives. The list below is the worklist.
 
 
 ## BLAS-1 SIMD kernels
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `axpy_dram` | `_AXPY_DRAM` | `_at_axpy_dram(_HW))::Int` | Derived | Derived — arm 208 is the narrow 256-bit phase kernel, correct exactly where 512-bit ops are double-pumped over a 256-bit datapath. Mechanism named, not a fleet fit: +17% on Zen4, LOSES on Zen3, and Zen5 (native 512, not double-pumped) measures 4. Falsifier: a non-double-pumped box preferring 208. \| tune: n/a — Derived |
-| `axpy_unroll` | `_AXPY_BAND` | `_at_axpy_band(_HW))::Int` | Derived | *unaudited* |
-| `zaxpy_narrow` | `_ZAXPY_NARROW_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `axpy_dram` | Derived | narrow 256-bit arm iff the datapath double-pumps; +17% Zen4, loses on Zen3. | n/a |
+| `axpy_unroll` | Unaudited | — | — |
+| `zaxpy_narrow` | Unaudited | — | — |
 
 ## BLAS-2 (gemv/ger/trmv/trsv)
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `cgemv_mr` | `_CGEMV_MR` | `4)::Int` | Literal | *unaudited* |
-| `cgemv_rb` | `_CGEMV_RB` | `_L2_BYTES ÷ 16)::Int` | Derived | *unaudited* |
-| `cgemvn_nc` | `_CGEMVN_NC` | `4)::Int` | Literal | *unaudited* |
-| `cgemvn_nc_big` | `_CGEMVN_NC_BIG` | `3 * _vwidth(Float64) ÷ 2)::Int` | Derived | *unaudited* |
-| `cgemvn_pf` | `_CGEMVN_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `cgemvt_cfg` | `_CGEMVT_CFG` | `_CGEMVT_CFG_BIG)::Int` | Coupled | Derived(sibling) — `_CGEMVT_CFG_BIG` is itself a complete derivation over `_NVREG` (see the DERIVE note above: galen _NVREG=16 fits (4,half)=>104, wintermute _NVREG=32 fits (8,half), each reproducing what the retired duel resolved 6/6). Coupled only because the derivation is named once and reused. \| tune: n/a — Derived |
-| `cgemvt_half` | `_CGEMVT_HALF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `cgemvt_nc` | `_CGEMVT_NC` | `4)::Int` | Literal | *unaudited* |
-| `cgemvt_pf` | `_CGEMVT_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `gemvn_mb` | `_GEMVN_MB` | `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64)))::Int` | Derived | *unaudited* |
-| `gemvn_minner` | `_GEMVN_MINNER_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `gemvn_minner_maxa` | `_GEMVN_MINNER_MAXA` | `4 * _L3_BYTES)::Int` | Derived | *unaudited* |
-| `gemvn_np_narrow` | `_GEMVN_NP_NARROW` | `max(2, _L1D_ASSOC - 2))::Int` | Derived | *unaudited* |
-| `gemvn_rb` | `_GEMVN_RB` | `_vwidth(Float64) == 4 ? 64 : 448)::Int` | Derived | *unaudited* |
-| `gemvt_deep` | `_GEMVT_DEEP_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `gemvt_nc` | `_GEMVT_NC_PREF` | `nothing)` | Pref-gated | Derived-falsified — the project's own latency x throughput criterion (_ILP_TARGET) predicts EIGHT chains; every fleet box measures 4 best, monotonically worse at 8 and 16. A derivation that predicts the wrong answer is falsified, so the literal 4 ships with its table. Re-open only via the NC x U pair (AOCL runs NC=8 x U=4), which the 2026-08-20 grid found ties in the DRAM regime. \| tune: not a tune!() candidate — measured µarch-INVARIANT (4 on all three boxes) |
-| `gemvt_percol_amin` | `_GEMVT_PERCOL_AMIN` | `_at_gemvt_percol_amin(_HW))::Int` | Derived | Measured(bounds) — the window's SHAPE is derived (A past L2, x still L1-resident) but its two edges are not: the measured optimum is per-(box,SIZE) and every pair of boxes disagrees at some size, so no formula places them. Exposing the edges is what makes the per-size optimum reachable at all — a 3-valued mode cannot express "per-column at n=1024 only". \| tune: candidate, and the candidate SET is derived — the edges only ever sit at cache-geometry boundaries (L1/2, L1/4, L2, 2*L2), so tune!() searches a handful of values, not a range |
-| `gemvt_percol_xmax` | `_GEMVT_PERCOL_XMAX` | `_at_gemvt_percol_xmax(_HW))::Int` | Derived | Measured(bounds) — upper edge of the same window; see gemvt_percol_amin. This is the edge that carries the money: it alone separates neuromancer's optimum (percol at n=512 only, XMAX=4 KiB) from the default L1/2=24 KiB that gives it percol through n=2048. \| tune: candidate, same derived candidate set |
-| `gemvt_perscan` | `_GEMVT_PERSCAN_PREF` | `nothing);` | Pref-gated | Measured — no detected const partitions the fleet: EVERY PAIR of boxes disagrees at some size. L1 was the last candidate and is FALSIFIED — wintermute and galen both have 32 KiB L1 and want opposite arms at n=512 (percol 1.113 vs blocked 0.953/0.964/0.973, three processes each). Not L2, not L3, not SIMD width either (wintermute/neuromancer share width 64 and disagree at n=1024). A `_wide_simd` derivation was written and falsified before shipping. \| tune: not implemented; the knob is also too COARSE — the optimum is per-(box,size), so galen leaves ~1.9% at n=1024 and Zen5 ~3.9% at n=512 (#160). Needs a per-SIZE route pin, a knob-shape change, not a value. |
-| `gemvt_pf` | `_GEMVT_PF_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `gemvt_u` | `_GEMVT_U_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `ger_panel_np` | `_GER_NP` | `nothing), 1)::Int` | Pref-gated | Measured — optimum is 8/4/1 on Zen4/Zen3/Zen5; Zen4 and Zen3 agree on L2, L3, SIMD width and register count, so no formula over detected consts separates them. Depends on DRAM write-stream count, which is not a detected const. \| tune: ~22 s measured (4 candidate arms x 8 rounds at n=2048, DRAM regime) |
-| `tri_c_blk_min` | `_TRI_C_BLK_MIN` | `_vwidth(Float64) == 4 ? 256 : 1024)::Int` | Derived | *unaudited* |
-| `tri_c_t_unb` | `_TRI_C_T_UNB` | `1024)::Int` | Literal | *unaudited* |
-| `tri_nb` | `_TRI_NB` | `clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64))::Int` | Derived | *unaudited* |
-| `tri_t_unb` | `_TRI_T_UNB` | `512)::Int` | Literal | *unaudited* |
-| `trmv_f_dram` | `_TRMV_F_DRAM` | `4)::Int` | Literal | Literal(constrained) — the measured plateau is F in 2..6 and the panel arithmetic uses `n & (F-1)` for the ragged first block, so F MUST be a power of two; 4 is the largest admissible value on the plateau. The choice is forced by the kernel's addressing, not fitted to a box. \| tune: low value — the whole plateau measures flat, so a pin buys nothing unless the addressing changes |
-| `trmv_f_switch` | `_TRMV_F_SWITCH` | `2)::Int` | Literal | Derived — NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. \| tune: n/a — Derived |
-| `trmv_fused_min` | `_TRMV_FUSED_MIN_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `trsv_reg_max` | `_TRSV_REG_MAX` | `_SCALAR_FPREGS - 4)::Int` | Derived | *unaudited* |
-| `zhemv_pf` | `_ZHEMV_PF` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `zhemv_pf_tiles` | `_ZHEMV_PF_TILES` | `8)::Int` | Literal | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `cgemv_mr` | Unaudited | — | — |
+| `cgemv_rb` | Unaudited | — | — |
+| `cgemvn_nc` | Unaudited | — | — |
+| `cgemvn_nc_big` | Unaudited | — | — |
+| `cgemvn_pf` | Unaudited | — | — |
+| `cgemvt_cfg` | Derived | _CGEMVT_CFG_BIG is already a complete _NVREG derivation. | n/a |
+| `cgemvt_half` | Unaudited | — | — |
+| `cgemvt_nc` | Unaudited | — | — |
+| `cgemvt_pf` | Unaudited | — | — |
+| `gemvn_mb` | Unaudited | — | — |
+| `gemvn_minner` | Unaudited | — | — |
+| `gemvn_minner_maxa` | Unaudited | — | — |
+| `gemvn_np_narrow` | Unaudited | — | — |
+| `gemvn_rb` | Unaudited | — | — |
+| `gemvt_deep` | Unaudited | — | — |
+| `gemvt_nc` | Literal | _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | no, µarch-invariant |
+| `gemvt_percol_amin` | Measured | window's lower edge; no formula places it (see gemvt_perscan). | candidate, cache-boundary set |
+| `gemvt_percol_xmax` | Measured | window's upper edge, and the one worth money (Zen5 wants 4 KiB, not L1/2). | candidate |
+| `gemvt_perscan` | Measured | every pair of boxes disagrees at some size; L1, L2, L3 and width all falsified. | not yet |
+| `gemvt_pf` | Unaudited | — | — |
+| `gemvt_u` | Unaudited | — | — |
+| `ger_panel_np` | Measured | optimum 8/4/1 on boxes that agree on L2/L3/width; tracks DRAM write streams. | 22 s |
+| `tri_c_blk_min` | Unaudited | — | — |
+| `tri_c_t_unb` | Unaudited | — | — |
+| `tri_nb` | Unaudited | — | — |
+| `tri_t_unb` | Unaudited | — | — |
+| `trmv_f_dram` | Derived | majority criterion: switch once tri > 2*L3. The 2 IS the 1/2. | n/a |
+| `trmv_f_switch` | Derived | NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | n/a — Derived |
+| `trmv_fused_min` | Unaudited | — | — |
+| `trsv_reg_max` | Unaudited | — | — |
+| `zhemv_pf` | Unaudited | — | — |
+| `zhemv_pf_tiles` | Unaudited | — | — |
 
 ## BLAS-2 banded
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `gbmv_conv_max` | `_GBMV_CONV_MAX` | `_vwidth(Float64) == 4 ? 20 : 48)::Int` | Derived | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `gbmv_conv_max` | Unaudited | — | — |
 
 ## BLAS-2 packed
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `spmv_panel` | `_SPMV_PANEL` | `true)::Bool` | Flag | *unaudited* |
-| `spmv_panel_minap` | `_SPMV_PANEL_MINAP` | `_L1_BYTES)::Int` | Derived | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `spmv_panel` | Unaudited | — | — |
+| `spmv_panel_minap` | Unaudited | — | — |
 
 ## BLAS-3 (trmm/trsm/syrk/symm)
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `chemm_pack_cut` | `_CHEMM_PACK_CUT` | `_vwidth(Float64) == 4 ? 4096 : 32)::Int` | Derived | *unaudited* |
-| `csymm_pack_cut` | `_CSYMM_PACK_CUT` | `_CHEMM_PACK_CUT)::Int` | Coupled | Derived(sibling) — deliberate, argued coupling, not an accident: csymm side-L runs the SAME packed kernel as chemm (`_hemm_packed_L!` with HERM=false), identical blocking and microkernel, differing only in conjugation of the mirrored A-pack half. Same criterion ⇒ same cut, so it defaults to `_CHEMM_PACK_CUT` rather than repeating a literal that could drift out of step. \| tune: n/a — tune chemm_pack_cut and this follows |
-| `csyr2k_fused_max` | `_CSYR2K_FUSED_MAX` | `_vwidth(Float64) == 4 ? 192 : 0)::Int` | Derived | *unaudited* |
-| `csyr2k_pack_cut` | `_CSYR2K_PACK_CUT` | `8)::Int` | Literal | Literal — never swept (both arms of the retired ternary were identical, so no A/B could distinguish them); behaviour-neutral collapse, validated-by-gate not tuned. \| tune: not a tune!() candidate until someone sweeps it; sweep is cheap (one op, few candidates) but no evidence it moves the gate |
-| `csyrk_3m_min` | `_CSYRK_3M_MIN` | `128)::Int` | Literal | *unaudited* |
-| `csyrk_pack_cut` | `_CSYRK_PACK_CUT` | `16)::Int` | Literal | *unaudited* |
-| `csyrk_pack_cut_t` | `_CSYRK_PACK_CUT_T` | `4)::Int` | Literal | *unaudited* |
-| `csyrk_unified_max` | `_CSYRK_UNIFIED_MAX` | `_vwidth(Float64) == 4 ? 512 : 0)::Int` | Derived | *unaudited* |
-| `csyrk_unpack_max` | `_CSYRK_UNPACK_MAX` | `_vwidth(Float64) == 4 ? 16 : 192)::Int` | Derived | *unaudited* |
-| `ctrmm_pack` | `_CTRMM_PACK` | `_vwidth(Float64) == 4)::Bool` | Derived | *unaudited* |
-| `ctrmm_pack_min` | `_CTRMM_PACK_MIN` | `48)::Int` | Literal | *unaudited* |
-| `ctrsm_direct_max` | `_CTRSM_DIRECT_MAX` | `64)::Int` | Literal | *unaudited* |
-| `ctrsm_ncut` | `_CTRSM_NCUT` | `128)::Int` | Literal | *unaudited* |
-| `ctrsm_rec_l` | `_CTRSM_REC_L` | `64)::Int` | Literal | *unaudited* |
-| `gemmtrsm_mr` | `_GT_MR` | `min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV))::Int` | Predicate-keyed | *unaudited* |
-| `gemmtrsm_nrv` | `_GT_NRV` | `_GT_NREG >= 32 ? 3 : 2)::Int` | Predicate-keyed | *unaudited* |
-| `symm_pack_cut` | `_SYMM_PACK_CUT` | `_at_symm_mat_max(_HW))::Int` | Derived | *unaudited* |
-| `syr2k_2pass` | `_SYR2K_2PASS` | `_vwidth(Float64) == 4 ? 128 : typemax(Int))::Int` | Derived | *unaudited* |
-| `syr2k_mr` | `_SYR2K_MR` | `_vwidth(Float64) == 4 ? 2 : _MR)::Int` | Derived | *unaudited* |
-| `syr2k_nr` | `_SYR2K_NR` | `_NR)::Int` | Coupled | Literal(borrowed) — NOT a derivation and NOT redundant with gemm's _NR. This instantiates its OWN microkernel (`_trgemm_packed2!` at Val(_SYR2K_MR), Val(_SYR2K_NR)), so it is a real degree of freedom that merely INHERITS gemm's tuned NR as a prior. UNVALIDATED FOR THIS KERNEL: nobody has swept syr2k's own NR; it is right only insofar as the two microkernels share a register budget. \| tune: candidate — sweep NR over _NVREG-bounded values against the syr2k row before trusting the inherited value |
-| `syr2k_pack_cut` | `_SYR2K_PACK_CUT` | `_at_rank_k_pack_cut(_HW))::Int` | Derived | *unaudited* |
-| `syrk_dbase` | `_SYRK_DBASE` | `32)::Int` | Literal | *unaudited* |
-| `syrk_mr` | `_SYRK_MR` | `2)::Int` | Literal | *unaudited* |
-| `syrk_pack_cut` | `_SYRK_PACK_CUT` | `_at_rank_k_pack_cut(_HW))::Int` | Derived | *unaudited* |
-| `syrk_unified_max` | `_SYRK_UNIFIED_MAX` | `_vwidth(Float64) == 4 ? 48 : 0)::Int` | Derived | *unaudited* |
-| `trmm_ddirect` | `_TRMM_DDIRECT` | `4)` | Literal | *unaudited* |
-| `trmm_pack_min` | `_TRMM_PACK_MIN` | `(5 * _GEMM_UNPACK_MAX) ÷ 2)::Int` | Other | *unaudited* |
-| `trmm_rkc` | `_TRMM_RKC` | `_KC)::Int` | Coupled | Literal(borrowed) — trmm's OWN k-block (`kc = min(_TRMM_RKC, k)`, feeding _at_mc_kc), inheriting gemm's _KC as a prior. A real degree of freedom, not a duplicate: trmm packs a TRIANGULAR operand, so its L1 residency arithmetic is not gemm's. UNVALIDATED FOR THIS KERNEL — the inherited value has never been swept against the trmm row. \| tune: candidate — same residency-bounded candidate set as gemm_kc, selection measured |
-| `trmm_rpack` | `_TRMM_RPACK` | `448)::Int` | Literal | *unaudited* |
-| `trsm_narrow_max` | `_TRSM_NARROW_MAX` | `4)::Int` | Literal | *unaudited* |
-| `ztrsm_gt_mr` | `_ZGT_MR` | `_ZGT_W)::Int` | Predicate-keyed | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `chemm_pack_cut` | Unaudited | — | — |
+| `csymm_pack_cut` | Derived | same packed kernel as chemm, differing only by conjugation. | n/a, follows chemm |
+| `csyr2k_fused_max` | Unaudited | — | — |
+| `csyr2k_pack_cut` | Literal | never swept: the retired ternary had two identical arms. Validated by gate only. | unswept |
+| `csyrk_3m_min` | Unaudited | — | — |
+| `csyrk_pack_cut` | Unaudited | — | — |
+| `csyrk_pack_cut_t` | Unaudited | — | — |
+| `csyrk_unified_max` | Unaudited | — | — |
+| `csyrk_unpack_max` | Unaudited | — | — |
+| `ctrmm_pack` | Unaudited | — | — |
+| `ctrmm_pack_min` | Unaudited | — | — |
+| `ctrsm_direct_max` | Unaudited | — | — |
+| `ctrsm_ncut` | Unaudited | — | — |
+| `ctrsm_rec_l` | Unaudited | — | — |
+| `gemmtrsm_mr` | Unaudited | — | — |
+| `gemmtrsm_nrv` | Unaudited | — | — |
+| `symm_pack_cut` | Unaudited | — | — |
+| `syr2k_2pass` | Unaudited | — | — |
+| `syr2k_mr` | Unaudited | — | — |
+| `syr2k_nr` | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
+| `syr2k_pack_cut` | Unaudited | — | — |
+| `syrk_dbase` | Unaudited | — | — |
+| `syrk_mr` | Unaudited | — | — |
+| `syrk_pack_cut` | Unaudited | — | — |
+| `syrk_unified_max` | Unaudited | — | — |
+| `trmm_ddirect` | Unaudited | — | — |
+| `trmm_pack_min` | Unaudited | — | — |
+| `trmm_rkc` | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
+| `trmm_rpack` | Unaudited | — | — |
+| `trsm_narrow_max` | Unaudited | — | — |
+| `ztrsm_gt_mr` | Unaudited | — | — |
 
 ## CPU detection
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `force_hooks` | `_FORCE_HOOKS` | `true)::Bool` | Flag | *unaudited* |
-| `simd_bytes` | `_SIMD_BYTES` | `nothing)` | Pref-gated | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `force_hooks` | Unaudited | — | — |
+| `simd_bytes` | Unaudited | — | — |
 
 ## LAPACK · banded_chol
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `pbtrf_cross_kd` | `_PBTRF_CROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER. Two derivations attempted and FALSIFIED 2026-08-20, do not re-try: lanes-proportional (cross/lanes = 3,4,2,2 on wintermute vs 8,16,4,8 on galen) and fixed byte budget (cross*sizeof(T) = 192,256,128,128 vs 256,512,128,256). Neither constant within a box, let alone across. \| tune: candidate — pbtrf_cross F64 flips on ALL THREE boxes and is deliberately NOT converted (see cpuinfo c7) |
-| `pbtrf_nb` | `_PBTRF_NB_PREF` | `nothing)` | Pref-gated | Derived(width) — panel width counted in vector registers; see _at_pbtrf_nb in cpuinfo (c6) for the 3-box x 6-process table. Falsifier: a wide-SIMD box wanting the narrow width. \| tune: n/a — width follows the ISA |
-| `pbtrf_nb_small` | `_PBTRF_NBS_PREF` | `nothing)` | Pref-gated | Derived(width) — a panel width is counted in VECTOR REGISTERS, so SIMD width is the physical unit. The F32 method is a pure formula (_lanes(hw, Float32)) reproduced on all three boxes, which is the evidence that the unit is right; F64 is the keyed table row. Discriminating, not a fit: wintermute and neuromancer agree and share simd=64 while _double_pumped SEPARATES them. \| tune: n/a for F32 (formula); F64 row is a candidate |
-| `pbtrf_u_native_kd` | `_PBTRF_UCROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER, not a width: the vector-register mechanism that justifies pbtrf_nb does NOT extend to a size threshold. F64 measures 192 on galen where its own F32/C32 sibling formula (l2 / 4096) says 128, so the family does not obey one rule. Evidence is 6 processes x 3 boxes; MODAL rows named in cpuinfo (c7). \| tune: candidate — the F64 row is a modal-of-modals, the weakest thing shipped in this family |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `pbtrf_cross_kd` | Literal | a crossover, not a width; lanes- and byte-budget derivations both falsified. | candidate |
+| `pbtrf_nb` | Derived | a panel width is counted in vector registers. | n/a |
+| `pbtrf_nb_small` | Derived | same unit; the F32 method is the pure formula _lanes(hw, Float32). | n/a |
+| `pbtrf_u_native_kd` | Literal | crossover; F64 breaks the l2/4096 rule its F32 sibling obeys. | candidate |
 
 ## LAPACK · bunchkaufman
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `sytrf_cmult` | `_SYTRF_CMULT_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `sytrf_nb` | `_SYTRF_NB_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `sytrf_cmult` | Unaudited | — | — |
+| `sytrf_nb` | Unaudited | — | — |
 
 ## LAPACK · gbtrf
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `gbtrf_cross` | `_GBTRF_CROSS_PREF` | `nothing)` | Pref-gated | Literal(keyed) — CROSSOVER, derivation falsified (see pbtrf_cross_kd for the two dead ends and their arithmetic). The C32 row is NOT width-split like its C64 sibling: wintermute is a true 3-3 TIE (16,16,8,16,8,8) and the AVX-512 boxes disagree with each other, which is why it is a bare literal 16 and not a formula. \| tune: candidate — C32 is resolving a coin flip |
-| `gbtrf_nb` | `_GBTRF_NB_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `gbtrf_cross` | Literal | crossover, derivation falsified; the C32 row is a 3-3 tie on Zen4. | candidate |
+| `gbtrf_nb` | Unaudited | — | — |
 
 ## LAPACK · lapack
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `chol_base_split` | `_CHOL_BASE_SPLIT` | `_INTEL_AVX2)::Bool` | Predicate-keyed | *unaudited* |
-| `chol_nb` | `_CHOL_NB` | `4)::Int` | Literal | *unaudited* |
-| `chol_nc` | `_CHOL_NC` | `4)::Int` | Literal | *unaudited* |
-| `cpotf2_mr` | `_CPOTF2_MR` | `_at_cpotf2_mr(_HW))::Int` | Derived | *unaudited* |
-| `cpotrf_base` | `_CPOTRF_BASE` | `_at_cpotrf_base(_HW))::Int` | Derived | *unaudited* |
-| `cpotrf_nbmax` | `_CPOTRF_NBMAX` | `_at_cpotrf_nbmax(_HW))::Int` | Derived | *unaudited* |
-| `potrf_base` | `_POTRF_BASE` | `32)::Int` | Literal | Literal(invariant) — a RECURSION-OVERHEAD floor, not a residency block, so there is nothing to derive it from: the L1-residency guess sqrt(L1/8)=64 measures WORSE than 32, and the optimum is small and µarch-FLAT (16-32 on both fleet ISAs). Matches `_CHOL_SB`=32 independently. Fleet A/B validated (base=512 was up to 43.9x slower than OB). Falsifier: a box whose optimum is NOT in 16-32. Catalogued in docs/src/tuning.md §4. \| tune: not a candidate — measured µarch-invariant; a formula would add spurious variation, exactly as the falsified `_LU_NB` derivation did |
-| `potrf_base_f32` | `_POTRF_BASE_F32` | `_POTRF_BASE >> 1)::Int` | Coupled | Derived(sibling) — sizeof-ratio derivation, not a borrowed literal: F32 is half the bytes of F64, so the same recursion-overhead floor sits at half the n. Documented in tuning.md §4 alongside `_POTRF_BASE`, whose own status is validated-literal (the residency guess sqrt(L1/8)=64 measured WORSE than 32). \| tune: n/a — follows potrf_base |
-| `potrf_pad` | `_POTRF_PAD` | `true)::Bool` | Flag | *unaudited* |
-| `potrf_upper_direct_max` | `_POTRF_UDIRECT_PREF` | `nothing)` | Pref-gated | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `chol_base_split` | Unaudited | — | — |
+| `chol_nb` | Unaudited | — | — |
+| `chol_nc` | Unaudited | — | — |
+| `cpotf2_mr` | Unaudited | — | — |
+| `cpotrf_base` | Unaudited | — | — |
+| `cpotrf_nbmax` | Unaudited | — | — |
+| `potrf_base` | Literal | recursion-overhead floor, µarch-flat at 16-32; the residency guess 64 is worse. | no |
+| `potrf_base_f32` | Derived | sizeof ratio: F32 is half F64's bytes, so half the n. | n/a, follows potrf_base |
+| `potrf_pad` | Unaudited | — | — |
+| `potrf_upper_direct_max` | Unaudited | — | — |
 
 ## LAPACK · packed_chol
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `pptrf_blk_min` | `_PPTRF_BLK_MIN` | `16)::Int` | Literal | *unaudited* |
-| `pptrf_blk_nb` | `_PPTRF_BLK_NB` | `_LU_NB)::Int` | Coupled | Literal(borrowed) — packed Cholesky's own blocked panel width, inheriting LU's `_LU_NB` as a prior. A real degree of freedom: pptrf works on PACKED storage, so its panel does not have LU's stride or its store-traffic profile, and _LU_NB is itself a falsified-derivation literal (see tuning.md §4) — an inherited value whose own justification is "the residency formula was wrong for LU". UNVALIDATED FOR THIS KERNEL. \| tune: candidate — sweep nb against the pptrfL/pptrfU rows; both currently gate, so this is upside-hunting, not a fix |
-| `pptrf_spr_min` | `_PPTRF_SPR_PREF` | `0)::Int` | Literal | Exempt — 0 is the UNSET SENTINEL, not a tuning value. When the preference is absent this reads 0 and the per-type derivation applies; a pin replaces it. Nothing to derive, because the number is not a size. (The module-level form is load-bearing: an in-body `@load_preference` does not const-fold here — a recorded hazard in this tree.) \| tune: n/a — sentinel |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `pptrf_blk_min` | Unaudited | — | — |
+| `pptrf_blk_nb` | Literal | own panel width, borrows _LU_NB, which is itself a falsified derivation. | candidate |
+| `pptrf_spr_min` | Exempt | 0 is the unset sentinel, not a size. | n/a |
 
 ## LAPACK · pstrf
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `pstrf_fuse_max` | `_PSTRF_FUSE_MAXL` | `(_L1_BYTES ÷ 2) ÷ _CACHELINE)::Int` | Derived | *unaudited* |
-| `pstrf_rowcache_min` | `_PSTRF_ROWCACHE_PREF` | `128)` | Literal | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `pstrf_fuse_max` | Unaudited | — | — |
+| `pstrf_rowcache_min` | Unaudited | — | — |
 
 ## LAPACK · qr
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `qr_nb_c` | `_QR_NB_C` | `32)::Int` | Literal | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `qr_nb_c` | Unaudited | — | — |
 
 ## LAPACK · svd
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `brd_nb` | `_BRD_NB_PREF` | `nothing)` | Pref-gated | *unaudited* |
-| `bt_nb` | `_BT_NB` | `32)::Int` | Literal | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `brd_nb` | Unaudited | — | — |
+| `bt_nb` | Unaudited | — | — |
 
 ## gemm (BLAS-3)
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `cgemm_3m` | `_CGEMM_3M` | `true)::Bool` | Flag | *unaudited* |
-| `cgemm_3m_kmin` | `_CGEMM_3M_KMIN` | `16)::Int` | Literal | *unaudited* |
-| `cgemm_3m_max` | `_CGEMM_3M_MAX` | `2048)::Int` | Literal | *unaudited* |
-| `cgemm_3m_min` | `_CGEMM_3M_MIN` | `48)::Int` | Literal | *unaudited* |
-| `cgemm_kc` | `_CKC` | `_l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL)))::Int` | Derived | *unaudited* |
-| `cgemm_mr` | `_CMR` | `_W64 == 4 ? 1 : 2)::Int` | Predicate-keyed | *unaudited* |
-| `cgemm_nr` | `_CNR` | `_W64 == 4 ? 6 : 4)::Int` | Predicate-keyed | *unaudited* |
-| `cgemm_nr_small` | `_CNR_SMALL` | `_W64 == 4 ? 4 : _CNR)::Int` | Predicate-keyed | *unaudited* |
-| `cgemm_nrsmall_max` | `_CGEMM_NRSMALL_MAX` | `_W64 == 4 ? 64 : 0)::Int` | Predicate-keyed | *unaudited* |
-| `cgemm_tiny` | `_CGEMM_TINY` | `6)::Int` | Literal | *unaudited* |
-| `cgemm_unpack_max` | `_CGEMM_UNPACK_MAX` | `_W64 == 4 ? 40 : 192)::Int` | Predicate-keyed | *unaudited* |
-| `cuker_nr6_min` | `_CUKER_NR6_MIN` | `_W64 == 4 ? 48 : typemax(Int))::Int` | Predicate-keyed | *unaudited* |
-| `gemm_kc` | `_KC` | `_at_gemm_kc(_HW))::Int` | Derived | *unaudited* |
-| `gemm_mr` | `_MR` | `_at_gemm_mr(_HW))::Int` | Derived | *unaudited* |
-| `gemm_mr1_max` | `_GEMM_MR1_MAX` | `_at_gemm_mr1_max(_HW))::Int` | Derived | *unaudited* |
-| `gemm_nc` | `_NC` | `_at_gemm_nc(_HW))::Int` | Derived | *unaudited* |
-| `gemm_nr` | `_NR` | `_at_gemm_nr(_HW))::Int` | Derived | *unaudited* |
-| `gemm_split_max` | `_GEMM_SPLIT_MAX` | `_at_gemm_split_max(_HW))::Int` | Derived | *unaudited* |
-| `gemm_unpack_max` | `_GEMM_UNPACK_MAX` | `_at_gemm_unpack_max(_HW))::Int` | Derived | *unaudited* |
-| `strassen` | `_STRASSEN` | `_W64 == 4 \|\| _W64 == 8)::Bool` | Predicate-keyed | Flag — an on/off capability switch, not a size. ON for W=4/8 because Strassen's saving is a FLOP |
-| `strassen_maxdepth` | `_STRASSEN_MAXDEPTH` | `3)::Int` | Literal | *unaudited* |
-| `strassen_min` | `_STRASSEN_MIN` | `1024)::Int` | Literal | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `cgemm_3m` | Unaudited | — | — |
+| `cgemm_3m_kmin` | Unaudited | — | — |
+| `cgemm_3m_max` | Unaudited | — | — |
+| `cgemm_3m_min` | Unaudited | — | — |
+| `cgemm_kc` | Unaudited | — | — |
+| `cgemm_mr` | Unaudited | — | — |
+| `cgemm_nr` | Unaudited | — | — |
+| `cgemm_nr_small` | Unaudited | — | — |
+| `cgemm_nrsmall_max` | Unaudited | — | — |
+| `cgemm_tiny` | Unaudited | — | — |
+| `cgemm_unpack_max` | Unaudited | — | — |
+| `cuker_nr6_min` | Unaudited | — | — |
+| `gemm_kc` | Unaudited | — | — |
+| `gemm_mr` | Unaudited | — | — |
+| `gemm_mr1_max` | Unaudited | — | — |
+| `gemm_nc` | Unaudited | — | — |
+| `gemm_nr` | Unaudited | — | — |
+| `gemm_split_max` | Unaudited | — | — |
+| `gemm_unpack_max` | Unaudited | — | — |
+| `strassen` | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
+| `strassen_maxdepth` | Unaudited | — | — |
+| `strassen_min` | Unaudited | — | — |
 
 ## workspace
 
-| Key | Const | Default | Tier | PDM justification |
-|---|---|---|---|---|
-| `l3_nb` | `_L3_NB` | `clamp(_round_dn(isqrt(_L2_BYTES ÷ 32), 16), 16, 128))::Int` | Derived | *unaudited* |
+| Knob | Tier | Why | `tune!()` |
+|---|---|---|---|
+| `l3_nb` | Unaudited | — | — |
+
+---
+
+Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away
+and made this table too wide to read. The knob key is the identifier that matters.
