@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 120 of them.
+Every `@load_preference` key in `src/` — 128 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 120 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 62 Derived · 10 Measured · 40 Literal · 8 Exempt.
-**Default form** (mechanical): 54 formula · 20 delegates · 6 sibling · 35 literal · 4 flag · 1 other.
+**Tier:** 62 Derived · 10 Measured · 48 Literal · 8 Exempt.
+**Default form** (mechanical): 54 formula · 20 delegates · 6 sibling · 43 literal · 4 flag · 1 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -101,6 +101,7 @@ Every `@load_preference` key in `src/` — 120 of them.
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
+| `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
@@ -109,7 +110,14 @@ Every `@load_preference` key in `src/` — 120 of them.
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
 | `trmm_rkc` | sibling | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
 | `trmm_rpack` | literal | Literal | measured pack threshold; a box that disagrees pins it rather than editing. | candidate |
+| `trmm_rpanel` | literal | Literal | trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
+| `trsm_base` | literal | Literal | trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
+| `trsm_dbase` | literal | Literal | diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
 | `trsm_narrow_max` | literal | Literal | B-width below which the narrow path wins; measured, not derived. | candidate |
+| `trsm_ncut` | literal | Literal | B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
+| `trsm_ncut_r` | literal | Literal | B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
+| `trsm_r_fuse` | literal | Literal | side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
+| `trtri_base` | literal | Literal | triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | candidate, fleet-unmeasured |
 | `ztrsm_gt_mr` | formula | Derived | formula over detected consts: `_ZGT_W` | — |
 
 ## CPU detection
@@ -225,13 +233,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-33 `const _X = <literal>` values in `src/` with no `@load_preference`.
+25 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 31 Literal · 2 Exempt.
+**Tier:** 23 Literal · 2 Exempt.
 
 
 ### BLAS-1 SIMD kernels
@@ -254,19 +262,6 @@ on these, not on knobs.
 | `_SYMV_MR` | 4 | Literal | FLEET-VALIDATED 2026-08-21, best-or-tied on all 3 µarchs. MR=8 LOSES on both AVX-512 boxes (Zen4 -3.6% @1024, Zen5 -6.3/-3.0/-9.7%), so the register-file derivation is FALSIFIED, not unwritten. MR=6 loses 8-13% on AVX2. MR=2 is inconsistent (wins some sizes, loses others, on both boxes). |
 | `_SYMV_NB` | 8 | Literal | FLEET-VALIDATED 2026-08-21: a CAP, and the consumer's `min(_SYMV_NB, _vwidth(T))` is what makes it right (8 on AVX-512, 4 on AVX2). Halving NB costs 10-27% on all 3 boxes, so the cap binds and the value is not arbitrary. |
 | `_TRSV_T_F` | 8 | Literal | trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE. |
-
-### BLAS-3 (trmm/trsm/syrk/symm)
-
-| Const | Value | Tier | Why |
-|---|---|---|---|
-| `_SYRK_BASE` | 48 | Literal | syrk recursion base before the off-diagonal gemm. TUNABLE. |
-| `_TRMM_RPANEL` | 512 | Literal | trmm side-R panel width. TUNABLE, should be a knob. |
-| `_TRSM_BASE` | 32 | Literal | trsm recursion base. TUNABLE and not a knob: unpinnable, untunable, and on trtrs's real path. |
-| `_TRSM_DBASE` | 32 | Literal | diagonal-block base; its own comment says 'could be a Preference'. TUNABLE. |
-| `_TRSM_NCUT` | 64 | Literal | B-width cut for side-L. TUNABLE, should be a knob. |
-| `_TRSM_NCUT_R` | 128 | Literal | B-width cut for side-R. TUNABLE, should be a knob. |
-| `_TRSM_R_FUSE` | 128 | Literal | side-R fuse threshold. TUNABLE, should be a knob. |
-| `_TRTRI_BASE` | 16 | Literal | triangular-inverse recursion base. TUNABLE, should be a knob. |
 
 ### CPU detection
 
