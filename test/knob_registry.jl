@@ -47,6 +47,21 @@ end
 # human asserted in the marker, and nothing else.
 const _KR_TIERS = ("Derived", "Measured", "Literal", "Exempt")
 
+# What the default EXPRESSION reduces to. Mechanical, no judgement — and deliberately NOT called a
+# tier, which is the mistake that produced the zoo. It is reported because it is the best available
+# evidence about the 97 knobs nobody has classified yet: a `formula` default is almost certainly
+# Derived, and without this column the summary reads "8 Derived" and implies the library is barely
+# derived at all, when in fact 54 defaults are outright formulas.
+function _kr_form(default)
+    occursin(r"_at_[a-z]", default) && return "formula"
+    occursin(r"_L1_BYTES|_L2_BYTES|_L3_BYTES|_vwidth|_NVREG|_lanes\(|_SIMD_BYTES|_CACHELINE|_l1_block|_acc_cap|_ILP_TARGET|_datapath_bytes|_SCALAR_FPREGS|_L1D_ASSOC|_W64|_double_pumped|_wide_simd|_INTEL_AVX2|_GT_NREG|_ZGT_W|isqrt|sizeof", default) && return "formula"
+    occursin(r"^\s*nothing", default) && return "delegates"
+    occursin(r"^\s*(true|false)", default) && return "flag"
+    occursin(r"^\s*-?\d+", default) && return "literal"
+    occursin(r"^\s*_[A-Z]", default) && return "sibling"
+    return "other"
+end
+
 # STRICT marker syntax: `# PDM: <Tier> — <one concise line>`. Anything else is prose, not a marker.
 # This matters: `src/` already contained comments like "# PDM: DERIVE tier — a residency criterion…"
 # and "# PDM: P = `@load_preference`", written as prose long before the registry existed. A loose
@@ -94,7 +109,8 @@ function knob_rows()
             pending, pending_at, pending_tier = "", 0, ""
             push!(rows, (; key, file = rel, family = _kr_family(rel),
                          const_name = isnothing(cm) ? "—" : String(cm.captures[1]),
-                         default = isempty(default) ? "—" : default, tier, pdm))
+                         default = isempty(default) ? "—" : default,
+                         form = _kr_form(default), tier, pdm))
         end
     end
     return sort!(rows; by = r -> (r.family, r.key))
@@ -129,11 +145,22 @@ function knob_markdown()
         tiers[r.tier] = get(tiers, r.tier, 0) + 1
     end
     audited = count(r -> r.tier != "Unaudited", rows)
-    print(io, "**Counts:** ")
+    forms = Dict{String, Int}()
+    for r in rows
+        forms[r.form] = get(forms, r.form, 0) + 1
+    end
+    print(io, "**Reviewed tier:** ")
     println(io, join(["$(get(tiers, t, 0)) $t" for t in (_KR_TIERS..., "Unaudited")], " · "), ".")
+    print(io, "**Default form** (mechanical, all $(length(rows))): ")
+    println(io, join(["$(get(forms, f, 0)) $f" for f in ("formula", "delegates", "sibling", "literal", "flag", "other")], " · "), ".")
     println(io)
-    println(io, "**$audited / $(length(rows)) classified.** An unaudited knob is one nobody has justified —")
-    println(io, "which is how a redundant or mislabelled knob survives. The list below is the worklist.")
+    println(io, "**$audited / $(length(rows)) reviewed.** ⚠ READ THE TWO LINES ABOVE TOGETHER. `Unaudited`")
+    println(io, "means *nobody has classified it yet* — NOT that it is un-derived. The **default form** column")
+    println(io, "is the mechanical evidence about those knobs, and it says $(get(forms, "formula", 0)) of $(length(rows)) defaults are outright")
+    println(io, "formulas over detected consts. Several of the `delegates` rows resolve through an `_at_*`")
+    println(io, "formula under a different name too (e.g. `pbtrf_nb_small` → `_at_pbtrf_nbs`). So the library")
+    println(io, "is *mostly derived*; the reviewed-tier counts are small because the review is young, and")
+    println(io, "reading them alone understates it badly.")
     println(io)
     fam = ""
     for r in rows
@@ -142,8 +169,8 @@ function knob_markdown()
             println(io)
             println(io, "## $fam")
             println(io)
-            println(io, "| Knob | Tier | Why | `tune!()` |")
-            println(io, "|---|---|---|---|")
+            println(io, "| Knob | Default | Tier | Why | `tune!()` |")
+            println(io, "|---|---|---|---|---|")
         end
         # The marker's ` | tune: …` tail is a SEPARATE column, not text — escaping it into the prose
         # (`\|`) is what it looked like first, and it read as noise.
@@ -153,7 +180,7 @@ function knob_markdown()
         else
             (r.pdm, "")
         end
-        println(io, "| `$(r.key)` | $(r.tier) | $(isempty(why) ? "—" : _kr_esc(why)) | ",
+        println(io, "| `$(r.key)` | $(r.form) | $(r.tier) | $(isempty(why) ? "—" : _kr_esc(why)) | ",
                 isempty(tune) ? "—" : _kr_esc(tune), " |")
     end
     println(io)
