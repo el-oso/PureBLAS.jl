@@ -6,7 +6,7 @@
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
-# PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet
+# PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 @inline _trmm_rpanel() = (f = _fk("trmm_rpanel"); f >= 0 ? f : _TRMM_RPANEL)
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
@@ -1314,7 +1314,7 @@ const _TRSM_BASE = min(@load_preference("trsm_base", 32)::Int, _L3_NB)
 # V12 = -V11·A12·V22; the opposite off-block is zeroed so V stays triangular (the invL base reads V dense).
 # Base blocks (≤ _TRTRI_BASE) use the identity-RHS dense solve. Diagonal blocks recurse with the same
 # uplo/unit; the off-diagonal block carries its actual (non-unit) values.
-# PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet
+# PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 8/16/32/64 within noise on all 3 uarchs, both trsm sides (2026-08-21)
 const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
 @inline _trtri_base() = (f = _fk("trtri_base"); f >= 0 ? f : _TRTRI_BASE)
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
@@ -3787,7 +3787,7 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     end
     return B
 end
-# PDM: Literal — side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet
+# PDM: Literal — side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: TUNABLE and MIS-SPECIFIED — one scalar serves as BOTH the one-panel ceiling and the recursion leaf; no single value is right at n=128 and n=512 (Zen4 32 -> 0.900 vs 1.031). See task #169.
 const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
 @inline _trsm_r_fuse() = (f = _fk("trsm_r_fuse"); f >= 0 ? f : _TRSM_R_FUSE)
 # BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
@@ -4225,7 +4225,7 @@ end
 # trans 'N': op(A)=A (n×k) ⇒ A·Aᴴ. trans 'T'/'C': op(A)=Aᴴ (A k×n) ⇒ Aᴴ·A. syrk: ᵀ (no conj),
 # any T<:Number. herk: Hermitian (conj), real α/β, diagonal forced real. Recursive: diagonal blocks
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
-# PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet
+# PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (galen n=128) does not replicate (2026-08-21)
 const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
 @inline _syrk_base() = (f = _fk("syrk_base"); f >= 0 ? f : _SYRK_BASE)
 
