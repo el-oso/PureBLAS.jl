@@ -2989,8 +2989,10 @@ end
 end
 # Largest power of two on the measured plateau (2-6). 4 rather than 6 because the panel arithmetic
 # uses `n & (F-1)` for the ragged first block, which needs F a power of two.
-const _TRMV_F_DRAM = @load_preference("trmv_f_dram", 4)::Int          # req8-ok: Measure-tier debt, see above
-const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok: Measure-tier debt, see above
+# PDM: Literal(constrained) — the measured plateau is F in 2..6 and the panel arithmetic uses `n & (F-1)` for the ragged first block, so F MUST be a power of two; 4 is the largest admissible value on the plateau. The choice is forced by the kernel's addressing, not fitted to a box. | tune: low value — the whole plateau measures flat, so a pin buys nothing unless the addressing changes
+const _TRMV_F_DRAM = @load_preference("trmv_f_dram", 4)::Int          # req8-ok: see above
+# PDM: Derived — NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | tune: n/a — Derived
+const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok: see above
 
 @generated function _trmv_fusedF!(::Val{F}, up::Bool, unit::Bool, n::Int, A, x) where {F}
     cs = [Symbol(:c, k) for k in 0:(F - 1)]

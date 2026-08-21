@@ -19,6 +19,7 @@ using LinearAlgebra: PosDefException
 # L1-residency (√(L1/8)=64 is WORSE than 32) — it is a recursion-overhead floor, matching `_CHOL_SB`=32.
 # INVARIANT literal 32. `potrf_base` pref. (Residual, base-independent: F64-upper power-of-2 n spikes + the
 # Zen3 F32 recursion sitting >1.0 even at optimum — separate structural issues, not this base.)
+# PDM: Literal(invariant) — a RECURSION-OVERHEAD floor, not a residency block, so there is nothing to derive it from: the L1-residency guess sqrt(L1/8)=64 measures WORSE than 32, and the optimum is small and µarch-FLAT (16-32 on both fleet ISAs). Matches `_CHOL_SB`=32 independently. Fleet A/B validated (base=512 was up to 43.9x slower than OB). Falsifier: a box whose optimum is NOT in 16-32. Catalogued in docs/src/tuning.md §4. | tune: not a candidate — measured µarch-invariant; a formula would add spurious variation, exactly as the falsified `_LU_NB` derivation did
 const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # (The tiny-UPPER cutoff is `_potrf_udirect(T)` — a real MEASURE-tier auto-tune defined next to the
 # lever bodies below, near `_potrf_gen!`. It was briefly a literal 12 here, which req#8b classifies as
