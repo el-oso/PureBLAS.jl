@@ -23,16 +23,16 @@ const _W64 = _vwidth(Float64)
 # MR/NR: galen 3/4, Zen4/Zen5 2/8 (behavior-preserving, was `_W64==4 ? …`). KC/MC/NC: Zen4 256/144/2040
 # (bit-identical), galen 512/72/2044, Zen5 384/96/1360 — the KC=512 raises galen's B-micropanel from ¼ to
 # ½ L1 (the "AVX-512-tile-on-AVX2" residency miss). Real-path (Float64/_NR); complex gemm uses `_CKC`.
-# PDM: Derived — formula over detected consts: `_at_gemm_mr(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_mr(_HW)`
 const _MR = @load_preference("gemm_mr", _at_gemm_mr(_HW))::Int
-# PDM: Derived — formula over detected consts: `_at_gemm_nr(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_nr(_HW)`
 const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
 # mc is derived per-CALLER from the LOCAL kc + element type via `_at_mc_kc` (joint residency
 # mc·kc·sizeof ≤ 30%·L2), not a single const — a standalone `_MC` bakes the canonical kc and
 # under-blocks small-kc callers (potrf's trailing gemm) / mis-sizes complex (16 B/elt). req#8.
-# PDM: Derived — formula over detected consts: `_at_gemm_nc(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_nc(_HW)`
 const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
-# PDM: Derived — formula over detected consts: `_at_gemm_kc(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_kc(_HW)`
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
 # Short-k split-reduction tile (cpuinfo.jl `_at_gemm_split_*`): tall _SMR·W×_SNR tile, S-way k-split, for the
 # small-n window where the wide tile under-fills. _SPLIT_OK const-folds the whole path off on AVX2 (already ≥1.0
@@ -40,7 +40,7 @@ const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel 
 const _SPLIT_OK = _at_gemm_split_ok(_HW)
 const _SMR = _at_gemm_split_mr(_HW)
 const _SNR = _at_gemm_split_nr(_HW)
-# PDM: Derived — formula over detected consts: `_at_gemm_split_max(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_split_max(_HW)`
 const _GEMM_SPLIT_MAX = @load_preference("gemm_split_max", _at_gemm_split_max(_HW))::Int
 
 # Software prefetch hint (read, high locality, data cache) via the LLVM intrinsic. Used to pull the
@@ -757,7 +757,7 @@ end
 # Zen4/Zen5 448 (the validated literal, EXACT); overridable "gemm_unpack_max". ponytail: crude max() heuristic;
 # a rectangular A (m·k fits but n huge) would also prefer unpacked — refine to an A-fits-registers test if
 # skewed shapes matter. (n=128+ route to blocked-direct-B; measured galen best=blk from ~128.)
-# PDM: Derived — formula over detected consts: `_at_gemm_unpack_max(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_unpack_max(_HW)`
 const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max(_HW))::Int
 # `_EXPINT[2]` shifts the cut (its `_EXPINT[4]` witness was stripped once the campaign landed) — both
 # default-inert. `_GEMM_UNPACK_MAX` is gemm's own unpacked/blocked crossover (2·(nvreg−4)·W = 448 on both
@@ -948,7 +948,7 @@ end
 # matrix can't fill one full tile of rows, so its 16-acc setup doesn't amortize over short k. Same masked/
 # edge kernels, Val(1) rows. DERIVED (req#8, was a bare 40): _at_gemm_mr·W → W=8=16 (measured: full tile now
 # beats mr1 at n=32, 0.833→0.860). W=4→12: sweep-validate galen (measured 40) or pin "gemm_mr1_max"=40 there.
-# PDM: Derived — formula over detected consts: `_at_gemm_mr1_max(_HW`
+# PDM: Derived — formula over detected consts: `_at_gemm_mr1_max(_HW)`
 const _GEMM_MR1_MAX = @load_preference("gemm_mr1_max", _at_gemm_mr1_max(_HW))::Int
 function _gemm_unpacked_mr1!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,

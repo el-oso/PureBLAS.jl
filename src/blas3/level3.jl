@@ -5389,7 +5389,7 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # (Zen5 0.88 / Zen4 0.91); packed is +14% there. Fleet-validated AVX-512 -> W. Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
-# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW`
+# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
 # no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):
@@ -6109,7 +6109,7 @@ end
 # off the mistuned 96 (which routed n=112–192 to the slower packed path → the galen AOCL misses) to 256.
 # Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
 # Overridable "symm_pack_cut".
-# PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW`
+# PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW)`
 const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW))::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
 # conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
@@ -6278,7 +6278,7 @@ end
 # Reproduces galen 84 (measured: recursion wins n≤80, packed wins n≥96 — the old literal 96 routed n=96 to
 # the slower recursion; 84 routes it to packed). Predicts Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX placeholder).
 # Overridable "syr2k_pack_cut".
-# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW`
+# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_HW))::Int
 # Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
 # recursion (which computes a dense n×n temp per diagonal block — the 2× waste).

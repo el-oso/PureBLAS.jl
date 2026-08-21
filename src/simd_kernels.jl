@@ -173,7 +173,7 @@ const _AXPY_VHW_F64 = Val(_vwidth(Float64) ÷ 2)     # narrow (half) width, F64 
 # (Zen4 208, Zen3 4), so this buys determinism, not a new arm. That matters because the ENTIRE BLAS-1
 # gate ladder is governed by THIS knob on every fleet box — `2·n·8 ≤ 16 MB < L3` at n ≤ 1e6 — so an
 # unforced change here lands directly on gate cells, including the n=1e6 cell that 208 exists to close.
-# PDM: Derived — formula over detected consts: `_at_axpy_band(_HW`
+# PDM: Derived — formula over detected consts: `_at_axpy_band(_HW)`
 const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
 @inline _axpy_band() = (f = _fk("axpy_unroll"); f >= 0 ? f : _AXPY_BAND)
 
