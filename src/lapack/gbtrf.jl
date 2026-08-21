@@ -80,10 +80,10 @@ const _GBTRF_CROSS_PREF = @load_preference("gbtrf_cross", nothing)
     # Width-derived; see `_at_gbtrf_cross` (cpuinfo.jl) for the three-box table. Each box keeps its
     # OWN measured crossover, which is what avoids the failure this file documents above — shipping
     # a single one-box value took Zen3's gbtrf row from PASS (1.43/1.18) to FAIL (1.32/0.91).
-    @inline _gbtrf_cross(::Type{Float64}) = (f = _fk("gbtrf_cross"); f >= 0 ? f : _at_gbtrf_cross(_HW, Float64))
-    @inline _gbtrf_cross(::Type{Float32}) = (f = _fk("gbtrf_cross"); f >= 0 ? f : _at_gbtrf_cross(_HW, Float32))
-    @inline _gbtrf_cross(::Type{ComplexF64}) = (f = _fk("gbtrf_cross"); f >= 0 ? f : _at_gbtrf_cross(_HW, ComplexF64))
-    @inline _gbtrf_cross(::Type{ComplexF32}) = (f = _fk("gbtrf_cross"); f >= 0 ? f : _at_gbtrf_cross(_HW, ComplexF32))
+    @inline _gbtrf_cross(::Type{Float64}) = (f = _FKR_gbtrf_cross[]; f >= 0 ? f : _at_gbtrf_cross(_HW, Float64))
+    @inline _gbtrf_cross(::Type{Float32}) = (f = _FKR_gbtrf_cross[]; f >= 0 ? f : _at_gbtrf_cross(_HW, Float32))
+    @inline _gbtrf_cross(::Type{ComplexF64}) = (f = _FKR_gbtrf_cross[]; f >= 0 ? f : _at_gbtrf_cross(_HW, ComplexF64))
+    @inline _gbtrf_cross(::Type{ComplexF32}) = (f = _FKR_gbtrf_cross[]; f >= 0 ? f : _at_gbtrf_cross(_HW, ComplexF32))
     @inline _gbtrf_cross(::Type{T}) where {T} = 32
 else
     @inline _gbtrf_cross(::Type{T}) where {T} = _GBTRF_CROSS_PREF::Int   # pinned (trim lands here)

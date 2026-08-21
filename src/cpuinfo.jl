@@ -541,14 +541,29 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # feature. Defaults true so a normal JIT user can A/B without rebuilding.
 # PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
-const _FK_NAMES = ("trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
+const _FK_NAMES = ("bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "chol_nb", "chol_nc", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
                    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
                    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan")
 @static if _FORCE_HOOKS
-    # One Ref per knob, created at load. A Dict lookup happens ONCE per knob in __init__; the hot path
-    # only ever reads the Ref it captured.
-    const _FK = Dict{String, Base.RefValue{Int}}(n => Ref(-1) for n in _FK_NAMES)
+    # One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
+    #
+    # This block used to be a `Dict{String,Ref}` read through `_fk(name) = _FK[name][]`, and its own
+    # comment claimed "the hot path only ever reads the Ref it captured" — which the implementation did
+    # NOT do: every call hashed a String. It went unnoticed while the hooks sat on cold paths; wiring 28
+    # more (this campaign) put it inside hemm/L3 and StrictMode's @owned check caught it immediately:
+    # "hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): give the type a
+    # const-dispatched accessor instead of a runtime keyed lookup." That is the GKH ownership rule.
+    #
+    # `_FK` survives as a name => the SAME Ref map, because __init__ and the probes want to reach a knob
+    # by string. Only the hot accessors changed: they now read `_FKR_<knob>[]` directly.
+    for _n in _FK_NAMES
+        @eval const $(Symbol("_FKR_", _n)) = Ref(-1)
+    end
+    const _FK = Dict{String, Base.RefValue{Int}}(
+        n => getfield(@__MODULE__, Symbol("_FKR_", n)) for n in _FK_NAMES)
+    # Keyed reader — for __init__ and probes ONLY. Never call it from a kernel: it is the very lookup
+    # the named Refs exist to avoid.
     @inline _fk(name::String) = _FK[name][]
 else
     @inline _fk(::String) = -1

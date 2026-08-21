@@ -527,7 +527,7 @@ const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
     # measured, small enough to cost ~ms. Uses the OWNER's grow entry point; never touches its fields.
     # Width-derived: 32 ÷ _lanes(hw, Float64) reproduces all three boxes (4 / 4 / 8), each stable in
     # 6 of 6 fresh processes. See `_at_brd_nb` (cpuinfo.jl) for the caveat about codegen sensitivity.
-    @inline _brd_nb() = (f = _fk("brd_nb"); f >= 0 ? f : _BRD_NB)
+    @inline _brd_nb() = (f = _FKR_brd_nb[]; f >= 0 ? f : _BRD_NB)
 else
     @inline _brd_nb() = _BRD_NB_PREF::Int
 end
@@ -562,6 +562,7 @@ const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three box
 # (P-tier) for calibration/override; fleet-confirm the invariance if a very-wide-register box ever appears.
 # PDM: Literal — back-transform block, measured invariant; confirm on a very-wide-register box before deriving. | tune: candidate
 const _BT_NB = @load_preference("bt_nb", 32)::Int
+@inline _fh_bt_nb() = (f = _FKR_bt_nb[]; f >= 0 ? f : _BT_NB)
 # PDM: Exempt — a CORRECTNESS override, not a perf choice: bdsqr fails on clustered sigma, so all with-vectors SVD routes to D&C.
 const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
 # CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
@@ -634,7 +635,7 @@ end
 # Grow every m≥n-path buffer to fit a reduced M×N problem forming `nu` U-columns. Buffers are pure scratch
 # (fully re-initialized per call), so growth just reallocates when too small — nothing to preserve.
 function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
-    nbb = _BRD_NB; nbt = _BT_NB
+    nbb = _BRD_NB; nbt = _fh_bt_nb()
     ldu = M % 256 == 0 ? M + 8 : M
     ldv = N % 256 == 0 ? N + 8 : N
     ws.d = _gv(ws.d, N); ws.e = _gv(ws.e, max(N, 1)); ws.tauq = _gv(ws.tauq, N); ws.taup = _gv(ws.taup, N)
@@ -1376,7 +1377,7 @@ function _gesvd_core!(
     d = view(ws.d, 1:n); e = view(ws.e, 1:max(n - 1, 0))
     tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
     gebrd!(A, d, e, tauq, taup, ws)
-    nb = _BT_NB
+    nb = _fh_bt_nb()
     # B's left/right singular vectors (Lvec/Rvec, n×n): bdsqr below the crossover (less D&C overhead at
     # small n, like LAPACK gesdd's QR-below-SMLSIZ), divide-and-conquer above. Both write svals into d.
     Lvec = view(ws.Lvec, 1:n, 1:n); Rvec = view(ws.Rvec, 1:n, 1:n)
@@ -1614,7 +1615,7 @@ function _zgesvd_core!(
         bdsdc!(d, e, Lvec, Rvec, rws)
     end
     s = d
-    nb = _BT_NB                                          # grow the compact-WY back-transform buffers (complex ws)
+    nb = _fh_bt_nb()                                          # grow the compact-WY back-transform buffers (complex ws)
     ws.bt_T = _gm(ws.bt_T, nb, nb); ws.bt_G = _gm(ws.bt_G, nb, nb); ws.bt_W = _gm(ws.bt_W, nb, max(nu, n))
     # U_A = Q·[Lvec 0; 0 I]: realify Lvec into the complex staging, push the n+1:nu unit columns through Q
     # (they become the orthonormal complement of range(A) when full_u & m>n). Q applied BLOCKED (zunmbr).
