@@ -65,6 +65,26 @@ const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", 
                        "brd_nb", "sytrf_cmult")
 
 """
+Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.
+A calibration run leaves its own load behind, so consecutive runs must be spaced or the second one
+refuses to measure. Bounded so a genuinely busy machine still makes progress rather than hanging.
+"""
+function _wait_idle(; below::Float64 = 1.2, maxsecs::Int = 180)
+    t0 = time()
+    while time() - t0 < maxsecs
+        la = try
+            parse(Float64, first(split(read("/proc/loadavg", String))))
+        catch
+            return nothing        # unreadable (non-Linux): calibrate.jl's own guard still applies
+        end
+        la < below && return nothing
+        sleep(5)
+    end
+    @warn "tune!: machine still busy after $(maxsecs)s; the next run may refuse to measure."
+    return nothing
+end
+
+"""
     tune!(; dryrun = false, repeats = 3, project = Base.active_project())
 
 Measure this machine's optimal values for the tuning knobs that are NOT derivable from detected
@@ -101,6 +121,13 @@ function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_p
     mktempdir() do dir
         for k in 1:repeats
             f = joinpath(dir, "run$k.toml")
+            # LET THE BOX SETTLE FIRST. calibrate.jl refuses to measure on a busy machine (1-min
+            # loadavg > 1.5), and a run leaves its OWN load in that average — so back-to-back runs
+            # refuse themselves. Observed 2026-08-21: runs 2..N produced nothing on both fleet boxes
+            # while run 1 succeeded, and because a missing file was silently skipped, "unanimous
+            # agreement" was then satisfied by a SINGLE process. That is the exact failure the
+            # multi-process design exists to prevent, reintroduced by the guard it depends on.
+            k > 1 && _wait_idle()
             try
                 run(`$jl --startup-file=no --project=$(project) $script emit=$f`)
             catch e
@@ -117,6 +144,16 @@ for ln in eachline(f)
 end
 push!(results, d)
         end
+    end
+    # EVERY run must have produced a result. "Agreement across N independent processes" is the whole
+    # safeguard — a per-process draw is exactly what the retired OncePerProcess tier got wrong — and
+    # agreement among the SURVIVORS is not that. With runs silently dropped, one process could satisfy
+    # "unanimous" on its own, which is a single sample wearing the costume of a quorum.
+    if length(results) < repeats
+        @warn "tune!: only $(length(results)) of $(repeats) calibration runs produced a result — a " *
+              "dropped run makes 'unanimous' meaningless, so NOTHING is pinned. Re-run on an idle, " *
+              "frequency-locked machine." got = length(results) want = repeats
+        return nothing
     end
     isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
 

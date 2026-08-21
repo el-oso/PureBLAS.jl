@@ -141,8 +141,13 @@ function calibrate_gemvt_window()
                 "box, not just its value. Reporting, not pinning.")
         return Pair{String, Any}[]
     end
-    # Prefer the widest window that fits, so a don't-care size keeps today's behaviour where possible.
-    a, x = hit[argmax([count(n -> (n * n * 8 > aa) && (n * 8 <= xx), _GEMVT_SIZES) for (aa, xx) in hit])]
+    # NARROWEST fitting window, not the widest. Per-column is the NON-DEFAULT arm, so it is enabled only
+    # where it demonstrably wins; a size with no verdict must not be swept in by widening.
+    # ⚠ THIS WAS "widest" AND IT PICKED A KNOWN-BAD ARM. On galen the n=512 measurement was REFUSED
+    # (anchor moved 9.5%) and so became don't-care; the widest fit then chose amin=L2, which routes
+    # per-column at n=512 — where three earlier processes measured it LOSING ~4%. A refusal is MISSING
+    # DATA, not a tie, and widening into missing data is how a tuner ships a regression it never measured.
+    a, x = hit[argmin([count(n -> (n * n * 8 > aa) && (n * 8 <= xx), _GEMVT_SIZES) for (aa, xx) in hit])]
     if all(n -> isnothing(obs[n]) || obs[n] == false, _GEMVT_SIZES)
         println("    ⇒ per-column never wins here — mode 0 (the shipped default for non-Zen4) is right")
         return Pair{String, Any}[]

@@ -46,7 +46,18 @@ const ALIAS = Dict(
     "pbtrf" => ["pbtrfL", "pbtrfU"], "pptrf" => ["pptrfL", "pptrfU"],
     "getrf, gesv" => ["getrf"], "geqrf, orgqr, ormqr" => ["geqrf"],
     "sytrf, hetrf" => ["sytrf"], "sytrs, hetrs" => ["sytrs"],
-    "gesvd, gesdd" => ["gesvd"], "syev, heev" => ["syev", "syevN"],
+    "gesvd, gesdd" => ["gesvd"],
+    # EIGEN ROWS — mapped by JOBZ, and INCLUDING THE COMPLEX CELLS. Before 2026-08-21 all three rows
+    # resolved to the real `syev` cells only, so three rows whose Types column says s/d/c/z printed
+    # IDENTICAL numbers (1.27/1.28/1.22 on the 08-20 fleet) and the "Hermitian" row was publishing the
+    # SYMMETRIC result. The complex cells exist and gate lower (zheev 1.10, zheevN 1.069 on Zen4), so
+    # the old numbers were not just mislabelled but flattering.
+    # Cells: syev/zheev are jobz='V' (vectors), syevN/zheevN are jobz='N' (values only) — verified
+    # against the addh definitions in plots.jl, whose oracle is `syevd!` in every case.
+    "syev, heev" => ["syev", "syevN", "zheev", "zheevN"],
+    "syev, syevd, syevr" => ["syev", "syevN", "zheev", "zheevN"],
+    "syev, syevd, syevr, heev, sytrd, hetrd, ormtr, stedc, steqr" => ["syev", "zheev"],
+    "syev, sterf" => ["syevN", "zheevN"],
     "gttrf, gttrs, gtsv" => ["gttrf", "gttrs", "gtsv"],
     "pttrf, pttrs, ptsv" => ["pttrf", "pttrs", "ptsv"],
 )
@@ -108,6 +119,10 @@ end
 function routines_of(col)
     s = replace(col, "`" => "")
     s = replace(s, r"\[\^[a-z0-9]+\]" => "")          # drop footnote markers
+    # Markdown emphasis and escapes are PRESENTATION, not part of a routine name. Without this a cell
+    # written `*stedc\*, steqr\**` tokenises to `*stedc\*` and never matches anything — the routine is
+    # then silently reported missing for a reason that is purely typographic.
+    s = replace(s, "*" => "", "\\" => "")
     s = strip(s)
     haskey(ALIAS, s) && return ALIAS[s]
     # ...otherwise expand TOKEN BY TOKEN, because a column like "pbtrf, pbtrs" is two routines and only

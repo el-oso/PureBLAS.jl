@@ -185,7 +185,7 @@ html.dark .pbg-key{color:#98a1b3}
 | Triangular solve | trtrs | s/d/c/z | ✅ | **0.787** | **0.876** | 1.01 | 1.45 / 0.938 | 1.39 / 0.876 |
 | Least-squares | gels | s/d/c/z | ✅ | 1.32 | 1.23 | 1.21 | 2.56 / 2 | 1.95 / 1.23 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.07 | 1.06 | 1.11 | 1.34 / 1.18 | 1.26 / 1.06 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 | 1.4 / 1.28 | 1.45 / 1.29 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.02 | **0.965** | 1.08 | 1.39 / 0.965 | 1.54 / 1.1 |
 
 The `geo/worst` columns are per reference and scoped to Zen4; the per-box columns left of them are the
 gate. The solves (`potrs`/`getrs`/`trtrs`) are not yet gated — the band on those rows is for the
@@ -202,8 +202,8 @@ factorization.
 
 | Op | Routines | Types | Routes | Zen3 | Zen4 | Zen5 |
 |---|---|---|---|---|---|---|
-| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, ormtr, *stedc\*, steqr\** | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
-| Symmetric / Hermitian (values only) | syev, *sterf\** | s/d/c/z | ✅ | 1.27 | 1.28 | 1.22 |
+| Symmetric / Hermitian (vectors) | syev, syevd, syevr, heev, sytrd, hetrd, ormtr, *stedc\*, steqr\** | s/d/c/z | ✅ | 1.19 | 1.08 | 1.09 |
+| Symmetric / Hermitian (values only) | syev, *sterf\** | s/d/c/z | ✅ | 1.02 | **0.965** | 1.08 |
 | Sym-tridiagonal | stev, stegr, stebz, stein | s/d | ✅ | | | ⏳ |
 | Generalized symmetric | sygvd, hegvd | s/d/c/z | ✅ | | | ⏳ |
 | Nonsymmetric | geev, geevx, gebal, gehrd, hseqr, trevc, gebak | s/d/c/z | ✅ | | | ⏳ |
