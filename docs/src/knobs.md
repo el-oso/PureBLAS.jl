@@ -225,35 +225,34 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-34 `const _X = <literal>` values in `src/` with no `@load_preference`.
+33 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 9 Derived · 23 Literal · 2 Exempt.
+**Tier:** 31 Literal · 2 Exempt.
 
 
 ### BLAS-1 SIMD kernels
 
 | Const | Value | Tier | Why |
 |---|---|---|---|
-| `_IAMAX_NB_STREAM` | 4 | Derived | ILP chain count, ISA-invariant by the same latency x throughput argument. |
-| `_UNROLL` | 4 | Derived | 4 independent chains x W lanes, an ILP count tied to _ILP_TARGET. |
+| `_IAMAX_NB_STREAM` | 4 | Literal | DERIVABLE, not yet derived: ILP chain count, ISA-invariant by the latency x throughput argument. |
+| `_UNROLL` | 4 | Literal | DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET. |
 
 ### BLAS-2 (gemv/ger/trmv/trsv)
 
 | Const | Value | Tier | Why |
 |---|---|---|---|
-| `_CGEMV_NP` | 8 | Derived | complex gemv-N panel width, same register-pressure argument as _GEMV_NP. DERIVABLE. |
+| `_CGEMV_NP` | 8 | Literal | DERIVABLE, not yet derived: complex gemv-N panel width, same register argument as _GEMV_NP. |
 | `_GEMVN_MINNER_U` | 4 | Literal | row-unroll paired with the gemvn_minner knob; moves with it, not independently. |
-| `_GEMVT_NC_DEEP` | 8 | Derived | one x-load per 8 FMAs, the load:FMA ratio that clears the MLP plateau; guarded by _NVREG. |
-| `_GEMVT_U_DEEP` | 4 | Derived | 4 lines per stream, so NC*U = 32 lines named: enough to cover L2. |
-| `_GEMV_NP` | 8 | Derived | gemv-N panel width; the comment already reasons in MR and register pressure. DERIVABLE from _NVREG. |
+| `_GEMVT_NC_DEEP` | 8 | Literal | DERIVABLE, not yet derived: one x-load per 8 FMAs, the load:FMA ratio clearing the MLP plateau; _NVREG-guarded. |
+| `_GEMVT_U_DEEP` | 4 | Literal | DERIVABLE, not yet derived: 4 lines per stream, so NC*U = 32 lines named — enough to cover L2. |
+| `_GEMV_NP` | 8 | Literal | DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure. |
 | `_GER_PANEL_U` | 4 | Literal | its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one. |
-| `_SCALAR_FPREGS` | 16 | Derived | x86 has 16 scalar FP registers, AArch64 32; exactly the _NVREG pattern. DERIVABLE, currently hardcoded. |
-| `_SYMV_MR` | 4 | Derived | register-file bound (its comment: 16 ymm, and the gemv-N MR=8 bump SPILLED symv). DERIVABLE from _NVREG. |
-| `_SYMV_NB` | 8 | Derived | symv panel width, a lanes multiple. DERIVABLE from _lanes. |
+| `_SYMV_MR` | 4 | Literal | DERIVABLE, not yet derived: register-file bound; its comment records gemv-N's MR=8 bump SPILLING symv (galen 1.13->0.86). |
+| `_SYMV_NB` | 8 | Literal | DERIVABLE, not yet derived: symv panel width, a lanes multiple. |
 | `_TRSV_T_F` | 8 | Literal | trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE. |
 
 ### BLAS-3 (trmm/trsm/syrk/symm)

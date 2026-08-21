@@ -848,7 +848,7 @@ end
 # Reductions use 4 independent accumulators so the FMA/add latency is hidden — a single
 # accumulator is latency-bound (serial dependency) and leaves the pipeline idle at L1-resident
 # sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then a scalar tail.
-# PDM: Derived — 4 independent chains x W lanes, an ILP count tied to _ILP_TARGET.
+# PDM: Literal — DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET.
 const _UNROLL = 4
 
 @inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
@@ -1035,7 +1035,7 @@ const _IAMAX_NB_RESIDENT = max(1, 2 * _CACHELINE ÷ _SIMD_BYTES)
 # Zen4 4 blocks = 4 lines (n=1e6: 72.3 vs 64.3 GB/s for 2), Zen3 4 blocks = 2 lines (78.5, beating both 2
 # at 75.0 and 8 at 77.4). Deriving this as a line budget like the resident arm gives 8 on AVX2, which
 # MEASURED WORSE on galen at every size — so it is a chain count, not a byte budget.
-# PDM: Derived — ILP chain count, ISA-invariant by the same latency x throughput argument.
+# PDM: Literal — DERIVABLE, not yet derived: ILP chain count, ISA-invariant by the latency x throughput argument.
 # req8-ok: ILP chain count, ISA-invariant, incumbent value measured optimal on Zen3 and Zen4 (see above)
 const _IAMAX_NB_STREAM = 4
 # WIDTH IS NOT THE REMAINING GAP — measured 2026-08-04, wintermute, freq-locked, plots.jl op=iamax.

@@ -39,7 +39,7 @@ end
 # (Zen5) re-expose it → MR=8 (Zen5 gemvN@256 was 0.86 at MR=4). Keyed on _double_pumped (silicon fact).
 const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
 
-# PDM: Derived — gemv-N panel width; the comment already reasons in MR and register pressure. DERIVABLE from _NVREG.
+# PDM: Literal — DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure.
 const _GEMV_NP = 8             # gemv-N column-panel width
 # ── gemvN m-inner panel (OpenBLAS dgemv_n shape; see _gemv_n_paneldrv_minner!). The old panel path holds
 # a full row-block's y in registers and sweeps columns inner, so each of NP=8 A-columns is read in mr-row
@@ -957,9 +957,9 @@ end
     return _gemvt_deep_on() &&
         m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
 end
-# PDM: Derived — one x-load per 8 FMAs, the load:FMA ratio that clears the MLP plateau; guarded by _NVREG.
+# PDM: Literal — DERIVABLE, not yet derived: one x-load per 8 FMAs, the load:FMA ratio clearing the MLP plateau; _NVREG-guarded.
 const _GEMVT_NC_DEEP = 8      # one x-load per 8 FMAs: the load:FMA ratio that clears the plateau
-# PDM: Derived — 4 lines per stream, so NC*U = 32 lines named: enough to cover L2.
+# PDM: Literal — DERIVABLE, not yet derived: 4 lines per stream, so NC*U = 32 lines named — enough to cover L2.
 const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines named, enough to cover L2
 
 # `blk`-explicit entry: `true` forces the NC=4 blocked kernel regardless of `_gemvt_perscan`.
@@ -1209,7 +1209,7 @@ const _CGEMVT_CFG_BIG = (
 # PDM: Derived — _CGEMVT_CFG_BIG is already a complete _NVREG derivation. | tune: n/a
 const _CGEMVT_CFG = @load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)::Int
 @inline _cgemvt_cfg() = _CGEMVT_CFG
-# PDM: Derived — complex gemv-N panel width, same register-pressure argument as _GEMV_NP. DERIVABLE.
+# PDM: Literal — DERIVABLE, not yet derived: complex gemv-N panel width, same register argument as _GEMV_NP.
 const _CGEMV_NP = 8                                 # column-panel width when A doesn't fit cache
 # When A (m×n complex) fits ~L2, sweep all n columns in ONE panel (row-tile mode: A cache-resident, no
 # panel/y-restream overhead — faster at small n). Above, width-_CGEMV_NP panels stream A sequentially.
@@ -2174,12 +2174,12 @@ end
     return s
 end
 
-# PDM: Derived — symv panel width, a lanes multiple. DERIVABLE from _lanes.
+# PDM: Literal — DERIVABLE, not yet derived: symv panel width, a lanes multiple.
 const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators in the microkernel)
 # symv row-panel height in vectors — its OWN const, NOT _GEMV_MR: symv's off-block fuses NB axpy +
 # NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
 # 16 ymm; the gemv-N MR=8 bump spilled symv (galen 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
-# PDM: Derived — register-file bound (its comment: 16 ymm, and the gemv-N MR=8 bump SPILLED symv). DERIVABLE from _NVREG.
+# PDM: Literal — DERIVABLE, not yet derived: register-file bound; its comment records gemv-N's MR=8 bump SPILLING symv (galen 1.13->0.86).
 const _SYMV_MR = 4
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
@@ -3226,8 +3226,14 @@ end
 # i.e. the drop lands exactly between 12 and 13, as the residency model predicts. The kernel still WINS
 # at every n ≤ 16, so this bound is chosen for where the win is best-and-still-growing, not to avoid a
 # regression; raising it is safe on speed and costs only generated code (bodies are O(n²) statements).
-# PDM: Derived — x86 has 16 scalar FP registers, AArch64 32; exactly the _NVREG pattern. DERIVABLE, currently hardcoded.
-const _SCALAR_FPREGS = 16      # x86-64 xmm0-15; architectural, not µarch-dependent
+# PDM: Derived — architectural scalar FP register file: 16 (x86-64 xmm0-15) vs 32 (AArch64 v0-31). Same ISA fact as _NVREG, which was already derived; this one was hardcoded. | tune: n/a
+# DERIVED 2026-08-21, repaying debt. This was `= 16` with the comment "x86-64 xmm0-15; architectural"
+# sitting beside it — the derivation was written in prose and not in code, which is the exact shape
+# req#8 exists to forbid. BEHAVIOUR-NEUTRAL ON THIS FLEET by construction: all three boxes are x86-64,
+# so it still reads 16 and `_TRSV_REG_MAX = _SCALAR_FPREGS - 4 = 12` is unchanged. What it buys is the
+# ARM case, where 32 architectural FP registers are available and a hardcoded 16 would have silently
+# halved the trsv register budget on the M-series box in the roadmap.
+const _SCALAR_FPREGS = Sys.ARCH === :x86_64 ? 16 : 32
 # PDM: Derived — formula over detected consts: `_SCALAR_FPREGS - 4`
 const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
 
