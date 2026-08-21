@@ -6,8 +6,8 @@
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
-# PDM: Literal — trmm side-R panel width. TUNABLE, should be a knob.
-const _TRMM_RPANEL = 512
+# PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
@@ -1288,8 +1288,8 @@ end
 # solve runs at gemm speed instead of scalar back-substitution. The recursion's off-diagonal updates
 # are already gemm!. Real only (stability fine for the well-conditioned diagonal blocks trsm assumes);
 # complex/conj keep the scalar trsv base.
-# PDM: Literal — trsm recursion base. TUNABLE and not a knob: unpinnable, untunable, and on trtrs's real path.
-const _TRSM_BASE = 32
+# PDM: Literal — trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRSM_BASE = @load_preference("trsm_base", 32)::Int
 # Small real triangular inverse: V (same uplo as A) = inv(A). Cast as a trsm: V solves A·V = I, so
 # V := A⁻¹·I via the vectorized dense-L base (contiguous A-column axpys) instead of a scalar
 # strided-row dot — the scalar version was ~20× less efficient/flop and 44% of the invL base.
@@ -1301,8 +1301,8 @@ const _TRSM_BASE = 32
 # V12 = -V11·A12·V22; the opposite off-block is zeroed so V stays triangular (the invL base reads V dense).
 # Base blocks (≤ _TRTRI_BASE) use the identity-RHS dense solve. Diagonal blocks recurse with the same
 # uplo/unit; the off-diagonal block carries its actual (non-unit) values.
-# PDM: Literal — triangular-inverse recursion base. TUNABLE, should be a knob.
-const _TRTRI_BASE = 16
+# PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
     if nb <= _TRTRI_BASE
@@ -1369,15 +1369,15 @@ end
 # 4-way-unrolled `_axpy_simd!` (no-trans; trans strided → scalar). n³/2 flops (half of invert+gemm), no gemm
 # dispatch. Real non-conj; forward when up==tr. Used as the base ONLY when B is narrow — the per-column axpy
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
-# PDM: Literal — B-width cut for side-L. TUNABLE, should be a knob.
-const _TRSM_NCUT = 64          # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
-# PDM: Literal — B-width cut for side-R. TUNABLE, should be a knob.
-const _TRSM_NCUT_R = 128       # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
+# PDM: Literal — B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRSM_NCUT = @load_preference("trsm_ncut", 64)::Int  # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
+# PDM: Literal — B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRSM_NCUT_R = @load_preference("trsm_ncut_r", 128)::Int  # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
 # Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
-# PDM: Literal — diagonal-block base; its own comment says 'could be a Preference'. TUNABLE.
-const _TRSM_DBASE = 32
+# PDM: Literal — diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRSM_DBASE = @load_preference("trsm_dbase", 32)::Int
 # Narrow-B cutoff: side-L trsm sweeps trsv per column when nrhs ≤ this. Set to 0 to disable.
 #
 # The crossover is CONSTANT in k, not proportional to it. Blocked costs `setup + nrhs·b`, the sweep
@@ -3770,8 +3770,8 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     end
     return B
 end
-# PDM: Literal — side-R fuse threshold. TUNABLE, should be a knob.
-const _TRSM_R_FUSE = 128       # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
+# PDM: Literal — side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
 # BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
 # amortizes over O(m·k) solve work — tax = k/m — so it needs a FEW register-tiles of m, NOT the k-CEILING.
 # The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
@@ -4207,8 +4207,8 @@ end
 # trans 'N': op(A)=A (n×k) ⇒ A·Aᴴ. trans 'T'/'C': op(A)=Aᴴ (A k×n) ⇒ Aᴴ·A. syrk: ᵀ (no conj),
 # any T<:Number. herk: Hermitian (conj), real α/β, diagonal forced real. Recursive: diagonal blocks
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
-# PDM: Literal — syrk recursion base before the off-diagonal gemm. TUNABLE.
-const _SYRK_BASE = 48
+# PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
+const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
 
 @inline _symstored(up::Bool, i, j) = up ? (i <= j) : (i >= j)
 # β-prescale C's stored triangle. Branch-free, contiguous, triangle-only (was: all n² with a per-element
