@@ -69,22 +69,25 @@ end
 const _KR_MARKER = Regex("#\\s*PDM:\\s*(" * join(_KR_TIERS, "|") * ")\\s+—\\s+(.+?)\\s*\$")
 
 """
-    knob_rows() -> Vector{NamedTuple}
+    bind_knobs(lines, rel) -> Vector{NamedTuple}
 
-Scan src/ for every `@load_preference` key: its file, owning family, const name, default expression,
-syntactic tier, and any `# PDM:` marker within 12 lines above it.
+THE ONE marker-binding implementation. Extracted so it can be fixture-tested — see
+`test/knob_registry_tests.jl`, which pins it against a synthetic source whose answer is known by
+construction, INCLUDING two adjacent marked knobs.
+
+⚠ WHY THIS IS A NAMED FUNCTION AND NOT AN INLINE LOOP. Hand-rolled variants of exactly this scan have
+mis-attributed FOUR times in this tree: the first registry binder (upward 12-line scan gave a marker to
+every knob near it), `predicate_knob_lint` (state not reset at a definition boundary, blamed an
+innocent knob), the one-off marker rewriter (took the earliest marker in its window, not the nearest),
+and the audit skip-test (found a NEIGHBOUR's marker and silently skipped 16 knobs). Every one passed a
+`!isempty(result)` sanity check, because every one produced plausible output about the wrong symbol.
+If you need this logic somewhere else, CALL THIS — do not write the loop again.
+
+A `# PDM:` marker binds to the NEXT `@load_preference` and is CONSUMED by it: forward-only, one-to-one.
 """
-function knob_rows()
+function bind_knobs(lines, rel = "?")
     rows = NamedTuple[]
-    for (root, _, files) in walkdir(joinpath(_KR_ROOT, "src")), f in files
-        endswith(f, ".jl") || continue
-        rel = relpath(joinpath(root, f), joinpath(_KR_ROOT, "src"))
-        lines = readlines(joinpath(root, f))
-        # A `# PDM:` marker binds to the NEXT `@load_preference`, and is CONSUMED by it.
-        # ⚠ The first version scanned UPWARD 12 lines from each knob, which silently gave a marker to
-        # every knob within 12 lines of it — 4 of 15 "audited" rows were a neighbour's justification
-        # (cgemv_rb, syr2k_2pass, cpotrf_base, pptrf_blk_min). A registry that mislabels a knob is
-        # worse than one that admits it is unaudited, so binding is now one-to-one and forward-only.
+    let
         pending, pending_at, pending_tier = "", 0, ""
         for (i, ln) in pairs(lines)
             mp = match(_KR_MARKER, ln)
@@ -112,6 +115,22 @@ function knob_rows()
                          default = isempty(default) ? "—" : default,
                          form = _kr_form(default), tier, pdm))
         end
+    end
+    return rows
+end
+
+"""
+    knob_rows() -> Vector{NamedTuple}
+
+Every `@load_preference` key under `src/`, with its file, owning family, const name, default, default
+form, PDM tier and justification.
+"""
+function knob_rows()
+    rows = NamedTuple[]
+    for (root, _, files) in walkdir(joinpath(_KR_ROOT, "src")), f in files
+        endswith(f, ".jl") || continue
+        rel = relpath(joinpath(root, f), joinpath(_KR_ROOT, "src"))
+        append!(rows, bind_knobs(readlines(joinpath(root, f)), rel))
     end
     return sort!(rows; by = r -> (r.family, r.key))
 end
