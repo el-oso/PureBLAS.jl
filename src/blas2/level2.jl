@@ -1849,7 +1849,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # Zen3). The default only has to be non-catastrophic until then.
 # PDM: Measured — optimum 8/4/1 on boxes that agree on L2/L3/width; tracks DRAM write streams. | tune: 22 s
 const _GER_NP = something(@load_preference("ger_panel_np", nothing), 1)::Int   # req8-ok: minimax, table above
-@inline _ger_np() = (f = _fk("ger_panel_np"); f >= 0 ? f : _GER_NP)
+@inline _ger_np() = (f = _FKR_ger_panel_np[]; f >= 0 ? f : _GER_NP)
 
 @generated function _ger_panel!(
         Aptr::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T},
@@ -2424,6 +2424,7 @@ const _ZHEMV_PF = @load_preference("zhemv_pf", _vwidth(Float64) == 4)::Bool
 # ~hundreds-of-cycles DRAM latency; empirical (a latency behaviour, not a datasheet number) — Preference.
 # PDM: Literal — prefetch depth in tiles for the Hermitian mat-vec. | tune: candidate
 const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
+@inline _fh_zhemv_pf_tiles() = (f = _FKR_zhemv_pf_tiles[]; f >= 0 ? f : _ZHEMV_PF_TILES)
 
 @generated function _hemv_rect_cmplx!(
         M::Int, arp::Ptr{T}, ldc::Int, xrp::Ptr{T}, yrp::Ptr{T},
@@ -2457,7 +2458,7 @@ const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
         )
         # A-stream prefetch, +3 complex-tiles (192 B @ W=4) ahead per column, like the gemvN panel's
         # _CGEMVN_PF: hides the DRAM latency of the large-n A read (the residual vs AOCL at n≥2048).
-        _ZHEMV_PF && push!(loop.args, :(_prefetch(arp + o + $((c - 1)) * ldc * 2 * $sz + $(_ZHEMV_PF_TILES * 2W * sz))))
+        _ZHEMV_PF && push!(loop.args, :(_prefetch(arp + o + $((c - 1)) * ldc * 2 * $sz + $(_fh_zhemv_pf_tiles() * 2W * sz))))
     end
     push!(loop.args, :(vstore(yv, yrp + o)))
     push!(
@@ -2709,6 +2710,7 @@ const _TRI_NB = @load_preference("tri_nb", clamp(_round_dn(isqrt(_L1_BYTES ÷ 8)
 # 1.09× OB) that blocking FIXES (→0.95/0.87×). `tri_t_unb` pref pins it.
 # PDM: Literal — unblocked/blocked crossover for the transpose path; blocking fixes a measured regression above it. | tune: candidate
 const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
+@inline _fh_tri_t_unb() = (f = _FKR_tri_t_unb[]; f >= 0 ? f : _TRI_T_UNB)
 #                          trmv-T blocks at _TRI_NB (its unblocked L-form dips mid-n); N forms at _TRI_NB.
 
 # Reciprocal-of-diagonal scratch for REAL trsv (per type; single-thread — no MT here). Same mechanism the
@@ -2741,6 +2743,7 @@ const _TRI_C_BLK_MIN = @load_preference("tri_c_blk_min", _vwidth(Float64) == 4 ?
 # DEFERRED to the parked complex batch; decoupling avoids silently retuning a gated complex op off a real A/B.
 # PDM: Literal — complex transpose unblocked/blocked crossover. | tune: candidate
 const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
+@inline _fh_tri_c_t_unb() = (f = _FKR_tri_c_t_unb[]; f >= 0 ? f : _TRI_C_T_UNB)
 
 # Blocked trmv/trsv (real dense): the per-column kernel re-streams x from memory at large n. Block it
 # — each diagonal NB×NB block uses the per-column kernel (cache-resident), and the off-diagonal block
@@ -3556,7 +3559,7 @@ end
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
-    (n <= NB || (tr && n <= _TRI_T_UNB)) && return _trsv_simd!(up, tr, unit, n, A, x)
+    (n <= NB || (tr && n <= _fh_tri_t_unb())) && return _trsv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trsv_fused8!`) replaces the blocked
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
@@ -3781,7 +3784,7 @@ end
 
 @inline function _trsv_cmplx_blk!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
-    (n <= _TRI_C_BLK_MIN || (tr && n <= _TRI_C_T_UNB)) && return _trsv_cmplx!(up, tr, cj, unit, n, A, x)
+    (n <= _TRI_C_BLK_MIN || (tr && n <= _fh_tri_c_t_unb())) && return _trsv_cmplx!(up, tr, cj, unit, n, A, x)
     T = eltype(A)
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP (−)
         ib = (cld(n, NB) - 1) * NB

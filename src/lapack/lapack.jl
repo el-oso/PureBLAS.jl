@@ -410,7 +410,7 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
     #   3. It is what galen already resolves for three of four eltypes.
     # The cost is bounded and one-sided: on wintermute F32/C32 (which resolved 24/20) the tiny-n direct
     # win is given up for n in 12..24. Pin `potrf_upper_direct_max` to recover it on a specific box.
-    @inline _potrf_udirect(::Type{<:Any}) = (f = _fk("potrf_upper_direct_max"); f >= 0 ? f : 12)   # req8-ok: documented-conservative cutoff, table above
+    @inline _potrf_udirect(::Type{<:Any}) = (f = _FKR_potrf_upper_direct_max[]; f >= 0 ? f : 12)   # req8-ok: documented-conservative cutoff, table above
 else
     @inline _potrf_udirect(::Type{<:Any}) = _POTRF_UDIRECT_PREF::Int   # pinned (trim builds land here)
 end
@@ -533,6 +533,7 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
 # PDM: Literal — trsm panel width, measured µarch-invariant; confirm on the fleet before deriving. | tune: candidate
 const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
+@inline _fh_chol_nb() = (f = _FKR_chol_nb[]; f >= 0 ? f : _CHOL_NB)
 # Live vector count of the fused side-R leaf's top tier (`_trsm_rl_split_f64!` below): MR=3 row-tiers ×
 # _CHOL_NB column accumulators, plus the _CHOL_NB T-vectors and the diagonal/broadcast pair. Compared
 # against `_NVREG` this says whether that leaf SPILLS on this box — 3*4+4+2 = 18, over AVX2's 16 ymm and
@@ -544,6 +545,7 @@ const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block
 const _RL_MR_LIVE = 3 * _CHOL_NB + _CHOL_NB + 2
 # PDM: Literal — syrk column block, same status as chol_nb. | tune: candidate
 const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
+@inline _fh_chol_nc() = (f = _FKR_chol_nc[]; f >= 0 ? f : _CHOL_NC)
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
@@ -631,8 +633,8 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
     W = _vwidth(T); V = Vec{W, T}
     c0 = 1
     @inbounds while c0 <= bs
-        nb = min(_CHOL_NB, bs - c0 + 1)
-        if nb == _CHOL_NB
+        nb = min(_fh_chol_nb(), bs - c0 + 1)
+        if nb == _fh_chol_nb()
             d0 = inv(unsafe_load(p00, _clidx(c0, c0, ld)));         l10 = -unsafe_load(p00, _clidx(c0 + 1, c0, ld))
             d1 = inv(unsafe_load(p00, _clidx(c0 + 1, c0 + 1, ld))); l20 = -unsafe_load(p00, _clidx(c0 + 2, c0, ld)); l21 = -unsafe_load(p00, _clidx(c0 + 2, c0 + 1, ld))
             d2 = inv(unsafe_load(p00, _clidx(c0 + 2, c0 + 2, ld))); l30 = -unsafe_load(p00, _clidx(c0 + 3, c0, ld)); l31 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 1, ld)); l32 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 2, ld))
@@ -703,7 +705,7 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
                 i += W
             end
             while i <= m                                  # scalar tail (<W rows)
-                for dj in 0:(_CHOL_NB - 1)
+                for dj in 0:(_fh_chol_nb() - 1)
                     cc = c0 + dj; s = unsafe_load(p10, _clidx(i, cc, ld))
                     for k in 1:(cc - 1)
                         s = muladd(-unsafe_load(p00, _clidx(cc, k, ld)), unsafe_load(p10, _clidx(i, k, ld)), s)
@@ -723,7 +725,7 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
                 end
             end
         end
-        c0 += _CHOL_NB
+        c0 += _fh_chol_nb()
     end
     return nothing
 end
@@ -752,7 +754,7 @@ end
 function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}
     j = 1
-    @inbounds while j + _CHOL_NC - 1 <= m
+    @inbounds while j + _fh_chol_nc() - 1 <= m
         i = ((j - 1) ÷ W) * W + 1                # W-aligned triangular start (skip upper blocks)
         while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
             r1 = i + W; r2 = i + 2W
@@ -816,7 +818,7 @@ function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) wh
             vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
         end
         while i <= m
-            for dj in 0:(_CHOL_NC - 1)
+            for dj in 0:(_fh_chol_nc() - 1)
                 s = unsafe_load(p11, _clidx(i, j + dj, ld))
                 for c in 1:bs
                     s = muladd(-unsafe_load(p10, _clidx(j + dj, c, ld)), unsafe_load(p10, _clidx(i, c, ld)), s)
@@ -825,7 +827,7 @@ function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) wh
             end
             i += 1
         end
-        j += _CHOL_NC
+        j += _fh_chol_nc()
     end
     while j <= m
         _syrk_panel_f64!(p11, p10, j, m, bs, ld); j += 1
@@ -946,8 +948,8 @@ end
     W = _vwidth(T); V = Vec{W, T}
     c0 = 1
     @inbounds while c0 <= bs
-        nb = min(_CHOL_NB, bs - c0 + 1)
-        if nb == _CHOL_NB
+        nb = min(_fh_chol_nb(), bs - c0 + 1)
+        if nb == _fh_chol_nb()
             # FUSED: downdate (vs solved cols in T) + within-panel 4×4 solve in ONE register pass, store to T
             # once (kills the store/re-load round-trip of the old two-pass split kernel). +11–25% at the panel
             # shape (galen, bs=128). Coeffs from the diag factor p00; @simd ivdep kept on the downdate k-loop.
@@ -1024,7 +1026,7 @@ end
                 i += W
             end
             while i <= m                                          # scalar tail (<W rows), fused
-                for dj in 0:(_CHOL_NB - 1)
+                for dj in 0:(_fh_chol_nb() - 1)
                     cc = c0 + dj; s = unsafe_load(psrc, _clidx(i, cc, lds))
                     for k in 1:(cc - 1)
                         s = muladd(-unsafe_load(p00, _clidx(cc, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
@@ -1044,7 +1046,7 @@ end
                 end
             end
         end
-        c0 += _CHOL_NB
+        c0 += _fh_chol_nb()
     end
     return nothing
 end
@@ -1078,7 +1080,7 @@ end
     ) where {T}
     W = _vwidth(T); V = Vec{W, T}
     j = 1
-    @inbounds while j + _CHOL_NC - 1 <= m
+    @inbounds while j + _fh_chol_nc() - 1 <= m
         i = ((j - 1) ÷ W) * W + 1
         while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
             r1 = i + W; r2 = i + 2W
@@ -1142,7 +1144,7 @@ end
             vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
         end
         while i <= m
-            for dj in 0:(_CHOL_NC - 1)
+            for dj in 0:(_fh_chol_nc() - 1)
                 s = unsafe_load(p11, _clidx(i, j + dj, ld1))
                 for c in 1:bs
                     s = muladd(-unsafe_load(pT, _clidx(j + dj, c, ldt)), unsafe_load(pT, _clidx(i, c, ldt)), s)
@@ -1151,7 +1153,7 @@ end
             end
             i += 1
         end
-        j += _CHOL_NC
+        j += _fh_chol_nc()
     end
     while j <= m
         _syrk_panel_split_f64!(p11, ld1, pT, ldt, j, m, bs); j += 1

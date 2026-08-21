@@ -295,6 +295,7 @@ const _QR_UNBLK_MAX = 32
 # Keyed via Preferences per box (Zen4 sweet spot measured).
 # PDM: Literal — complex QR panel; the Zen4 sweet spot, keyed per box via Preferences. | tune: candidate
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
+@inline _fh_qr_nb_c() = (f = _FKR_qr_nb_c[]; f >= 0 ? f : _QR_NB_C)
 # ⚠ THIS USED TO READ `_CGEMM_3M ? … : …` AND MEANT "is this the AVX2 box?". That was a hidden coupling,
 # not a derivation: `_CGEMM_3M` is a *complex-gemm algorithm* switch, and it happened to be `_W64 == 4`,
 # so it doubled as an ISA discriminator here. When the 3M default was flipped ON for AVX-512 on
@@ -321,7 +322,7 @@ const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is ena
 # share (≈0.75·nb/n) starts to bite. Measured galen: 32 (n≤512) → 64 (768) → 96 (1024) → 128 (≥1280), gating
 # the whole range (nb=32 dips at n≥896, nb=64 dips at n≈320). Overridable base "qr_nb_c".
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
-    clamp(_QR_NB_C * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _QR_NB_C, 4 * _QR_NB_C)
+    clamp(_fh_qr_nb_c() * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _fh_qr_nb_c(), 4 * _fh_qr_nb_c())
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
 const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}

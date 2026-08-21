@@ -8,12 +8,13 @@
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
-@inline _trmm_rpanel() = (f = _fk("trmm_rpanel"); f >= 0 ? f : _TRMM_RPANEL)
+@inline _trmm_rpanel() = (f = _FKR_trmm_rpanel[]; f >= 0 ? f : _TRMM_RPANEL)
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
 # PDM: Literal — own k-block, borrows gemm's _KC; a triangular operand packs differently. | tune: candidate
 const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
+@inline _fh_trmm_rkc() = (f = _FKR_trmm_rkc[]; f >= 0 ? f : _TRMM_RKC)
 # side-R packed cut: n > this → packed single-pass side-R, else direct/unpacked. NOT
 # register-capacity-governed: the plausible "= gemm's _GEMM_UNPACK_MAX (=2·_acc_cap)" derivation was
 # FLEET-FALSIFIED. Measured direct-vs-packed (boost-locked, both boxes): the crossover is µarch-dependent
@@ -27,6 +28,7 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 # Preferences "trmm_rpack" pins it if a future box measures otherwise.
 # PDM: Literal — measured pack threshold; a box that disagrees pins it rather than editing. | tune: candidate
 const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
+@inline _fh_trmm_rpack() = (f = _FKR_trmm_rpack[]; f >= 0 ? f : _TRMM_RPACK)
 
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
 # recursion over `gemm!`. Its own constant as of task #134 — it used to read `_GEMM_UNPACK_MAX`, which is
@@ -166,6 +168,7 @@ end
 # as the wide-SIMD-safe default. Preference lets a box override without a code push.
 # PDM: Literal — wide-SIMD-safe default for the direct path; per-box override without a code push. | tune: candidate
 const _TRMM_DDIRECT = @load_preference("trmm_ddirect", 4)
+@inline _fh_trmm_ddirect() = (f = _FKR_trmm_ddirect[]; f >= 0 ? f : _TRMM_DDIRECT)
 # Small-k trmm at HALF flops and gemm throughput: materialize op(A) into a dense scratch (zeros in the
 # unstored half make every read safe), copy B to scratch (in-place source), then run the UNPACKED gemm
 # micro-kernels with a per-tile K-TRIM — each C-tile contracts only the p-range where M's triangle is
@@ -477,6 +480,7 @@ const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
 # the pack-amortization threshold resists a clean cache/ISA formula; revisit with an OB-style fused pack.)
 # PDM: Literal — complex trmm pack threshold. | tune: candidate
 const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
+@inline _fh_ctrmm_pack_min() = (f = _FKR_ctrmm_pack_min[]; f >= 0 ? f : _CTRMM_PACK_MIN)
 
 # Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
 # non-multiple-of-nr panel is partial (width nre∈1:_CNR-1); running it through the nr-wide masked kernel
@@ -684,11 +688,11 @@ end
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
-        return k <= _TRMM_DDIRECT ? _trmm_dense_L!(up, tr, unit, A, B) :
+        return k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up, tr, unit, A, B) :
             _trmm_small!(true, up, tr, unit, A, B)
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM small kernel (half flops);
         return !_strided1(B) ? _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B) :            # strided B → base
-            (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
+            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_L!(up, tr, cj, unit, k, A, B)     # AVX-512 / tiny-k → unpacked
     elseif k <= _TRMM_BASE                          # AD/generic: trmv on each B column (contiguous)
         @inbounds for c in axes(B, 2)
@@ -800,7 +804,7 @@ end
 function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {T <: BlasReal}
     m, k = size(B); W = _vwidth(T); mr = _MR * W; nr = _NR
     upM = (up != tr)
-    kc = min(_TRMM_RKC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
+    kc = min(_fh_trmm_rkc(), k); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
     _, Bp = _gemm_scratch(T, 0, cld(k, nr) * nr * kc)
     # Pre-pack ALL of B (the gemm A-operand) up front, before any C write — B IS C here, so packing it
     # once both captures the input (no separate copy pass; ~2% of runtime at 1024) and feeds the whole
@@ -870,9 +874,9 @@ end
 function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
-        return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+        return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
-    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _TRMM_RPACK
+    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack()
         return _trmm_packedR!(up, tr, unit, A, B, Float64)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
@@ -906,7 +910,7 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         return B
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM kernels (mirror side-L).
         return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :            # strided B → base
-            (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)    # AVX-512 / tiny-k → unpacked
     elseif k <= _TRMM_BASE                                # AD/generic: scalar column-axpy base
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
@@ -918,13 +922,13 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if k <= _TRMM_BASE
         if eltype(B) <: BlasReal && !cj
-            return k <= _TRMM_DDIRECT ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+            return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
                 _trmm_small!(false, up, tr, unit, A, B)
         elseif eltype(B) <: BlasComplex
             # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
             # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
             return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
-                (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
                 _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
         end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
@@ -1188,7 +1192,7 @@ end
 # (the strassen-3m-gemm lesson — a flop reduction on the gating base kernel).
 function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     k = size(B, 1); T = eltype(B)
-    k < 2 * _STRASSEN_MIN && return _trmm_packed!(up, tr, unit, one(T), A, B, mrv)
+    k < 2 * _fh_strassen_min() && return _trmm_packed!(up, tr, unit, one(T), A, B, mrv)
     h = k ÷ 2
     A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):k, (h + 1):k)
     off = up ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)     # upper→A12, lower→A21
@@ -1226,20 +1230,20 @@ function trmm!(
     if eltype(B) <: BlasReal && transA != 'C' && k <= _TRMM_BASE
         up_ = uplo == 'U'; tr_ = transA != 'N'; unit_ = diag == 'U'
         if sl
-            k <= _TRMM_DDIRECT ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
+            k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
         else
-            k <= _TRMM_DDIRECT ? _trmm_right_base!(up_, tr_, false, unit_, k, A, B) : _trmm_small!(false, up_, tr_, unit_, A, B)
+            k <= _fh_trmm_ddirect() ? _trmm_right_base!(up_, tr_, false, unit_, k, A, B) : _trmm_small!(false, up_, tr_, unit_, A, B)
         end
         isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE   # tiny complex: same skip (mirrors _trmm_left!/_right! complex base)
         up_ = uplo == 'U'; tr_ = transA != 'N'; cj_ = transA == 'C'; unit_ = diag == 'U'
         if sl
             !_strided1(B) ? _trmm_cmplx_base_L!(up_, tr_, cj_, unit_, k, A, B) :
-                (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up_, tr_, cj_, unit_, k, A, B) :
+                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up_, tr_, cj_, unit_, k, A, B) :
                 _trmm_cmplx_small_L!(up_, tr_, cj_, unit_, k, A, B)
         else
             !_strided1(B) ? _trmm_cmplx_base_R!(up_, tr_, cj_, unit_, k, A, B) :
-                (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up_, tr_, cj_, unit_, k, A, B) :
+                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up_, tr_, cj_, unit_, k, A, B) :
                 _trmm_cmplx_small_R!(up_, tr_, cj_, unit_, k, A, B)
         end
         isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
@@ -1302,7 +1306,7 @@ end
 # literal, and inside the hook so a forced value (a sweep, a probe) cannot escape it either.
 # PDM: Literal — trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16/32/48/64 all within noise on Zen3+Zen4+Zen5 (96 cells, 2026-08-21)
 const _TRSM_BASE = min(@load_preference("trsm_base", 32)::Int, _L3_NB)
-@inline _trsm_base() = (f = _fk("trsm_base"); f >= 0 ? min(f, _L3_NB) : _TRSM_BASE)
+@inline _trsm_base() = (f = _FKR_trsm_base[]; f >= 0 ? min(f, _L3_NB) : _TRSM_BASE)
 # Small real triangular inverse: V (same uplo as A) = inv(A). Cast as a trsm: V solves A·V = I, so
 # V := A⁻¹·I via the vectorized dense-L base (contiguous A-column axpys) instead of a scalar
 # strided-row dot — the scalar version was ~20× less efficient/flop and 44% of the invL base.
@@ -1316,7 +1320,7 @@ const _TRSM_BASE = min(@load_preference("trsm_base", 32)::Int, _L3_NB)
 # uplo/unit; the off-diagonal block carries its actual (non-unit) values.
 # PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 8/16/32/64 within noise on all 3 uarchs, both trsm sides (2026-08-21)
 const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
-@inline _trtri_base() = (f = _fk("trtri_base"); f >= 0 ? f : _TRTRI_BASE)
+@inline _trtri_base() = (f = _FKR_trtri_base[]; f >= 0 ? f : _TRTRI_BASE)
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
     if nb <= _trtri_base()
@@ -1385,16 +1389,16 @@ end
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
 # PDM: Literal — B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 32/64/128 within noise on Zen3+Zen4+Zen5 (2026-08-21)
 const _TRSM_NCUT = @load_preference("trsm_ncut", 64)::Int  # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
-@inline _trsm_ncut() = (f = _fk("trsm_ncut"); f >= 0 ? f : _TRSM_NCUT)
+@inline _trsm_ncut() = (f = _FKR_trsm_ncut[]; f >= 0 ? f : _TRSM_NCUT)
 # PDM: Literal — B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64/128/256 within noise on Zen3+Zen4+Zen5 (2026-08-21)
 const _TRSM_NCUT_R = @load_preference("trsm_ncut_r", 128)::Int  # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
-@inline _trsm_ncut_r() = (f = _fk("trsm_ncut_r"); f >= 0 ? f : _TRSM_NCUT_R)
+@inline _trsm_ncut_r() = (f = _FKR_trsm_ncut_r[]; f >= 0 ? f : _TRSM_NCUT_R)
 # Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
 # PDM: Literal — diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16/32/48/64 within noise on Zen3+Zen4+Zen5 (2026-08-21)
 const _TRSM_DBASE = @load_preference("trsm_dbase", 32)::Int
-@inline _trsm_dbase() = (f = _fk("trsm_dbase"); f >= 0 ? f : _TRSM_DBASE)
+@inline _trsm_dbase() = (f = _FKR_trsm_dbase[]; f >= 0 ? f : _TRSM_DBASE)
 # Narrow-B cutoff: side-L trsm sweeps trsv per column when nrhs ≤ this. Set to 0 to disable.
 #
 # The crossover is CONSTANT in k, not proportional to it. Blocked costs `setup + nrhs·b`, the sweep
@@ -1415,6 +1419,7 @@ const _TRSM_DBASE = @load_preference("trsm_dbase", 32)::Int
 # before the A-pad removal).
 # PDM: Literal — B-width below which the narrow path wins; measured, not derived. | tune: candidate
 const _TRSM_NARROW_MAX = @load_preference("trsm_narrow_max", 4)::Int
+@inline _fh_trsm_narrow_max() = (f = _FKR_trsm_narrow_max[]; f >= 0 ? f : _TRSM_NARROW_MAX)
 # Column-blocked rank-1 update for the dense trsm base (non-transpose): B[brow0.., c] -= B[irow0, c]·acol
 # over all n columns. Holds the A-column vector across a block of 4 B-columns (reuse) and does the short
 # rlen-remainder mask ONCE per row-block instead of once per column — the per-column `_axpy_simd!` (though
@@ -1964,26 +1969,29 @@ end
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
 # PDM: Literal — trtri overhead plus extra flops sink small/mid n, so the direct path stops here. | tune: candidate
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
+@inline _fh_ctrsm_direct_max() = (f = _FKR_ctrsm_direct_max[]; f >= 0 ? f : _CTRSM_DIRECT_MAX)
 # Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
 # off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
 # ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).
 # Wide B keeps the trtri-on-inverse base (_TRMM_BASE) — its invert is amortized by the big gemm. Per-box knob.
 # PDM: Literal — recursion cut for complex trsm side-L; per-box. | tune: candidate
 const _CTRSM_REC_L = @load_preference("ctrsm_rec_l", 64)::Int
+@inline _fh_ctrsm_rec_l() = (f = _FKR_ctrsm_rec_l[]; f >= 0 ? f : _CTRSM_REC_L)
 # PDM: Literal — B-width cut: at or below it, the j-outer narrow recursion wins. | tune: candidate
 const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: ≤ → narrow (j-outer recursion)
+@inline _fh_ctrsm_ncut() = (f = _FKR_ctrsm_ncut[]; f >= 0 ? f : _CTRSM_NCUT)
 # Complex trsm K-TRIM: op(A)⁻¹ = op(A⁻¹), A⁻¹ triangular → reuse the trmm K-TRIM kernel on the inverse at
 # half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
 function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)                  # register-tiled gemmtrsm leaf
         return _trsm_cgt_L!(unit, k, A, B)
     end
-    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)   # direct back-substitution
+    if !tr && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)   # direct back-substitution
         return _trsm_cmplx_dLN!(up, unit, k, A, B)                                # (no trtri)
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
-    return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
+    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
         _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
 end
 # Direct complex side-R column-substitution base (no trtri): X·op(A)=B in place, !tr (⟹ !cj), unit or
@@ -2059,7 +2067,7 @@ end
 # (the register count is spelled out rather than reusing `_GT_NREG`, which this file defines further down)
 const _ZRT_NC = @load_preference(
     "ztrsm_zrt_nc",
-    clamp(prevpow(2, max(2, isqrt(_CTRSM_REC_L ÷ 2))), 2, ((_SIMD_BYTES >= 64 ? 32 : 16) - 4) ÷ 2)
+    clamp(prevpow(2, max(2, isqrt(_fh_ctrsm_rec_l() ÷ 2))), 2, ((_SIMD_BYTES >= 64 ? 32 : 16) - 4) ÷ 2)
 )::Int
 const _ZRT_SWP = Val(ntuple(l -> (l - 1) ⊻ 1, Val(2 * _ZGT_W)))
 const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val(2 * _ZGT_W)))
@@ -2171,14 +2179,14 @@ function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     # `eltype(A) === eltype(B)` guards the same memory-safety hole documented on `_cgt_ok`: these bases
     # do `Ptr{eltype(B)}(pointer(A))`, so a mismatched A is read at the wrong element width and runs off
     # its allocation. Mismatched eltypes fall through to the generic path, which handles them correctly.
-    if !tr && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)   # transA='N' direct
+    if !tr && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)   # transA='N' direct
         return _trsm_cmplx_dRN!(up, unit, k, A, B)                               # column-substitution
-    elseif tr && cj && k <= _CTRSM_DIRECT_MAX && _strided1(B) && eltype(A) === eltype(B)  # transA='C'
+    elseif tr && cj && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)  # transA='C'
         return _trsm_cmplx_dRC!(up, unit, k, A, B)                                        # direct, no trtri
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
-    return (_CTRMM_PACK && k >= _CTRMM_PACK_MIN) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
+    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
         _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
 end
 
@@ -3628,7 +3636,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
             return _trsm_cgt_L!(unit, k, A, B)
         end
-        recbase = size(B, 2) <= _CTRSM_NCUT ? _CTRSM_REC_L : _TRMM_BASE
+        recbase = size(B, 2) <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
                 _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
@@ -3789,7 +3797,7 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
 end
 # PDM: Literal — side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: TUNABLE and MIS-SPECIFIED — one scalar serves as BOTH the one-panel ceiling and the recursion leaf; no single value is right at n=128 and n=512 (Zen4 32 -> 0.900 vs 1.031). See task #169.
 const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
-@inline _trsm_r_fuse() = (f = _fk("trsm_r_fuse"); f >= 0 ? f : _TRSM_R_FUSE)
+@inline _trsm_r_fuse() = (f = _FKR_trsm_r_fuse[]; f >= 0 ? f : _TRSM_R_FUSE)
 # BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
 # amortizes over O(m·k) solve work — tax = k/m — so it needs a FEW register-tiles of m, NOT the k-CEILING.
 # The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
@@ -3960,7 +3968,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # three µarchs) uniformly ≥ the invert+K-TRIM base for side-R — the trtri never amortizes here
         # (its O(k³/6) invert is 40–66% exposed even at k=256, where two 128-trtri bases capped 0.95 on AVX2
         # and direct-recurse beats the wide-B trtri path on AVX-512/Zen5 too). Trans keeps the ≤128 base.
-        recbase = (!tr || cj) ? _CTRSM_REC_L : _TRMM_BASE   # transA='N'/'C' → direct-base recursion; 'T' → trtri base
+        recbase = (!tr || cj) ? _fh_ctrsm_rec_l() : _TRMM_BASE   # transA='N'/'C' → direct-base recursion; 'T' → trtri base
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_R!(up, tr, cj, unit, k, A, B) :
                 _trsm_cmplx_base_R!(up, tr, cj, unit, k, A, B)
@@ -4168,7 +4176,7 @@ function trsm!(
     # k above — conservative by construction, and it captures the large wins (all of nrhs=1, out to
     # nrhs=16 at k=2048). Overridable via "trsm_narrow_max".
     # Only side='L': side='R' is narrow in its ROWS, a different kernel question, not measured here.
-    if sl && _TRSM_NARROW_MAX > 0 && size(B, 2) <= _TRSM_NARROW_MAX &&
+    if sl && _fh_trsm_narrow_max() > 0 && size(B, 2) <= _fh_trsm_narrow_max() &&
             _strided1(B) && size(B, 1) == k
         isone(alpha) || (B .*= alpha)          # trsv has no α; A⁻¹(αB) = α·A⁻¹B, so prescaling is exact
         @inbounds for j in 1:size(B, 2)
@@ -4227,7 +4235,7 @@ end
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
 # PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (galen n=128) does not replicate (2026-08-21)
 const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
-@inline _syrk_base() = (f = _fk("syrk_base"); f >= 0 ? f : _SYRK_BASE)
+@inline _syrk_base() = (f = _FKR_syrk_base[]; f >= 0 ? f : _SYRK_BASE)
 
 @inline _symstored(up::Bool, i, j) = up ? (i <= j) : (i >= j)
 # β-prescale C's stored triangle. Branch-free, contiguous, triangle-only (was: all n² with a per-element
@@ -4884,10 +4892,11 @@ const _CSYRK_UNIFIED_MAX = @load_preference("csyrk_unified_max", _vwidth(Float64
 # exactly what this constant existed to avoid.
 # PDM: Literal — lower bound for the 3M path; below it the Karatsuba overhead dominates. | tune: candidate
 const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 128)::Int
+@inline _fh_csyrk_3m_min() = (f = _FKR_csyrk_3m_min[]; f >= 0 ? f : _CSYRK_3M_MIN)
 # Does the rank-k 3M window apply? Hoisted so the unpacked branch can YIELD to it — without this the
 # unpacked path shadows 3M entirely for trans='N' at n ≤ _CSYRK_UNPACK_MAX (192 on AVX-512).
 @inline _ctrk_3m_ok(n::Int, k::Int) =
-    _CGEMM_3M && _CSYRK_3M_MIN <= n <= _CGEMM_3M_MAX && k >= _CGEMM_3M_KMIN
+    _CGEMM_3M && _fh_csyrk_3m_min() <= n <= _fh_cgemm_3m_max() && k >= _fh_cgemm_3m_kmin()
 
 # C[tri] += α·(P1−P2 + i·(P3−P1−P2)) — triangular RMW combine of the 3 real Karatsuba products (caller
 # pre-scaled β·C). Mirror of _combine3! (gemm.jl) restricted to the stored triangle (loop bounds only;
@@ -5404,6 +5413,7 @@ end
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 # PDM: Literal — diagonal-block base; larger pushes work into efficient off-diagonal gemms. | tune: candidate
 const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
+@inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? f : _SYRK_DBASE)
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
 # `_at_rank_k_pack_cut`, which is PATH-DEPENDENT — read cpuinfo.jl:212-227 for the authoritative form:
@@ -5426,8 +5436,10 @@ const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW
 # Complex micro-tile is _CMR·W complex rows (AVX2 z: 4, AVX-512 z: 16). Per-machine Preferences knobs.
 # PDM: Literal — trans='N': recurse below this rather than pack. | tune: candidate
 const _CSYRK_PACK_CUT = @load_preference("csyrk_pack_cut", 16)::Int        # trans='N': recursion below this
+@inline _fh_csyrk_pack_cut() = (f = _FKR_csyrk_pack_cut[]; f >= 0 ? f : _CSYRK_PACK_CUT)
 # PDM: Literal — trans='C'/'T': packing wins almost always, hence the much lower cut. | tune: candidate
 const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # trans='C'/'T': packed ~always
+@inline _fh_csyrk_pack_cut_t() = (f = _FKR_csyrk_pack_cut_t[]; f >= 0 ? f : _CSYRK_PACK_CUT_T)
 # trans='N' complex n≤this ⇒ unpacked triangular kernel (`_ctri_unpacked!`): the packed path's operand-pack
 # + NR-remainder overhead and the recursion base's 2×-flop waste BOTH miss the gate at small n, while the
 # unpacked complex microkernel (what zgemm rides) gates there. The cutoff is where the packed path's NR-tile
@@ -5550,7 +5562,7 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
         # 3M entirely below 192 on AVX-512 and lowering `_CSYRK_3M_MIN` was a dead knob.
         if !tr && n <= _CSYRK_UNPACK_MAX && !_ctrk_3m_ok(n, k)
             return _ctri_unpacked!(up, herm, α, A, C, k)
-        elseif n > (tr ? _CSYRK_PACK_CUT_T : _CSYRK_PACK_CUT)
+        elseif n > (tr ? _fh_csyrk_pack_cut_t() : _fh_csyrk_pack_cut())
             return _csyrk_packed!(up, tr, herm, α, A, C, k)
         end
     end
@@ -5572,7 +5584,7 @@ end
 # stack-allocated, exactly like the (single-typed) C views.
 function _syrk_rec!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int, scr, off::Int, n::Int)
     T = eltype(C); a = convert(T, α); cc = herm
-    if n <= _SYRK_DBASE
+    if n <= _fh_syrk_dbase()
         tmp = view(scr, 1:n, 1:n)
         if tr
             Ab = view(A, :, (off + 1):(off + n))
@@ -6167,7 +6179,7 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # branchy panel fill cost more than one gemm at tiny n. Reverted; tiny-n stays on materialize.)
     if side_left && eltype(C) <: BlasComplex && _CGEMM_3M && _strided1(A) && _strided1(B) && _strided1(C)
         m2 = size(B, 2)
-        if _CGEMM_3M_MIN <= max(n, m2) <= _CGEMM_3M_MAX && min(n, m2) >= _CGEMM_3M_KMIN
+        if _fh_cgemm_3m_min() <= max(n, m2) <= _fh_cgemm_3m_max() && min(n, m2) >= _fh_cgemm_3m_kmin()
             return _hemm_3m_L!(up, herm, α, β, A, B, C)
         end
     end
@@ -6242,7 +6254,7 @@ end
 # through the @inline _syrk_gemm! (not the non-inlined kwarg gemm!).
 function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr, off::Int, n::Int)
     T = eltype(C); a = convert(T, α); a2 = herm ? conj(a) : a; cc = herm
-    if n <= _SYRK_DBASE
+    if n <= _fh_syrk_dbase()
         r = (off + 1):(off + n); tmp = view(scr, 1:n, 1:n)
         # ONE product M = α·op(A)·op(B)ᴴ (her2k conjugates via cc; syr2k/real = plain transpose), then a
         # symmetrized triangle-add for the 2nd product op(B)op(A)ᴴ = Mᴴ (Mᵀ for syr2k/real): since
@@ -6326,6 +6338,7 @@ const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_
 # 4 (`csyrk_pack_cut_t`) — same order, no width scaling in any of the three.
 # PDM: Literal — never swept: the retired ternary had two identical arms. Validated by gate only. | tune: unswept
 const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", 8)::Int   # req8-ok: see above
+@inline _fh_csyr2k_pack_cut() = (f = _FKR_csyr2k_pack_cut[]; f >= 0 ? f : _CSYR2K_PACK_CUT)
 function syr2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false
@@ -6336,7 +6349,7 @@ function syr2k!(
     elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
         _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
         _ctri2_unpacked!(up, false, alpha, A, Bm, C, k)
-    elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
+    elseif eltype(C) <: BlasComplex && n > _fh_csyr2k_pack_cut() && k > 0
         _syrk_scaleC!(C, up, beta)
         _csyr2k_packed!(up, trans != 'N', false, alpha, A, Bm, C, k)
     else
@@ -6353,7 +6366,7 @@ function her2k!(
     _syrk_scaleC!(C, up, beta)
     if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
         return (_ctri2_unpacked!(up, true, alpha, A, Bm, C, k); C)     # small-n trans='N': unpacked-tri (2 products)
-    elseif eltype(C) <: BlasComplex && n > _CSYR2K_PACK_CUT && k > 0
+    elseif eltype(C) <: BlasComplex && n > _fh_csyr2k_pack_cut() && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
     end
     _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n)

@@ -175,7 +175,7 @@ const _AXPY_VHW_F64 = Val(_vwidth(Float64) ÷ 2)     # narrow (half) width, F64 
 # unforced change here lands directly on gate cells, including the n=1e6 cell that 208 exists to close.
 # PDM: Derived — formula over detected consts: `_at_axpy_band(_HW)`
 const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
-@inline _axpy_band() = (f = _fk("axpy_unroll"); f >= 0 ? f : _AXPY_BAND)
+@inline _axpy_band() = (f = _FKR_axpy_unroll[]; f >= 0 ? f : _AXPY_BAND)
 
 # SECOND KNOB, DRAM REGIME — ITS OWN PREFERENCE AND ITS OWN GATE. It previously lived inside the
 # `axpy_unroll` block and fell back to `_AXPY_UNROLL_PREF`, which (a) silently collapsed two
@@ -190,7 +190,7 @@ const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
 # non-deterministic. Validated offline against the fleet descriptors in test/autotune_tests.jl.
 # PDM: Derived — narrow 256-bit arm iff the datapath double-pumps; +17% Zen4, loses on Zen3. | tune: n/a
 const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
-@inline _axpy_dram() = (f = _fk("axpy_dram"); f >= 0 ? f : _AXPY_DRAM)
+@inline _axpy_dram() = (f = _FKR_axpy_dram[]; f >= 0 ? f : _AXPY_DRAM)
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
 # dynamic `Val(u)` in the hot path, so this stays allocation-free and StrictMode-clean).

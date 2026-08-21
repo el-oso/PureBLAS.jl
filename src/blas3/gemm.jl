@@ -1285,6 +1285,7 @@ const _CKC = @load_preference("cgemm_kc", _l1_block(_HW, ComplexF64, max(_CNR, _
 # triple loop. Width-adaptive default, Preferences-overridable (measured per machine).
 # PDM: Literal — tiny-n bypass for complex gemm. | tune: candidate
 const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
+@inline _fh_cgemm_tiny() = (f = _FKR_cgemm_tiny[]; f >= 0 ? f : _CGEMM_TINY)
 # _CGEMM_TINY < max(m,n,k) ≤ this (and tA='N'): the UNPACKED tiny-n path. W=8: unpacked (skip pack,
 # free MR) beats blocked broadly on Zen4/32-reg → 192. W=4/AVX2: unpacked's per-panel re-deinterleave
 # loses to the vectorized-pack blocked path by n≈16, and the CNR=6 tile + deinterleave temp spill, so
@@ -1326,10 +1327,13 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 const _CGEMM_3M = @load_preference("cgemm_3m", true)::Bool
 # PDM: Literal — lower edge of the 3M window on max(m,n,k). | tune: candidate
 const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int    # max(m,n,k) ≥ this
+@inline _fh_cgemm_3m_min() = (f = _FKR_cgemm_3m_min[]; f >= 0 ? f : _CGEMM_3M_MIN)
 # PDM: Literal — upper edge of the 3M window; above it the extra passes cost more than the flop cut. | tune: candidate
 const _CGEMM_3M_MAX = @load_preference("cgemm_3m_max", 2048)::Int  # max(m,n,k) ≤ this
+@inline _fh_cgemm_3m_max() = (f = _FKR_cgemm_3m_max[]; f >= 0 ? f : _CGEMM_3M_MAX)
 # PDM: Literal — 3M needs min(m,n,k) >= this or the Karatsuba overhead dominates a thin gemm. | tune: candidate
 const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) ≥ this (thin gemms: overhead dominates)
+@inline _fh_cgemm_3m_kmin() = (f = _FKR_cgemm_3m_kmin[]; f >= 0 ? f : _CGEMM_3M_KMIN)
 
 # Strassen-Winograd for REAL gemm (see _gemm_strassen!): recursive 2×2 blocking, 7 half-size products
 # instead of 8 (~14% fewer flops/level, compounding), each running the gating classical kernel as base.
@@ -1343,11 +1347,13 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # PDM: Literal — split while min(m,n,k) >= this; measured, and the base stays >= ~min/2. | tune: candidate
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
+@inline _fh_strassen_min() = (f = _FKR_strassen_min[]; f >= 0 ? f : _STRASSEN_MIN)
 # PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
+@inline _fh_strassen_maxdepth() = (f = _FKR_strassen_maxdepth[]; f >= 0 ? f : _STRASSEN_MAXDEPTH)
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
-    while s >= _STRASSEN_MIN && d < _STRASSEN_MAXDEPTH
+    while s >= _fh_strassen_min() && d < _fh_strassen_maxdepth()
         d += 1; s >>= 1
     end
     return d
@@ -2661,7 +2667,7 @@ end
         else
             _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
         end
-    elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _CGEMM_TINY
+    elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _fh_cgemm_tiny()
         # `_strided1(A)/(B)` is REQUIRED, not defensive: `_split3!` honours an arbitrary COLUMN stride via
         # `ldm` but hardcodes ROW stride 1 (`unsafe_load(pm, (j-1)*ldm*2 + 2i - 1)`). Its docstring says
         # "any column stride", which is exactly true and exactly why the row assumption reads as covered.
@@ -2686,8 +2692,8 @@ end
                 # untested mechanism for the tiny-n complex cluster (routing, entry overhead and NR
                 # width are all measured-dead — see the note below and zgemm32_nr_ab.jl).
                 if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
-                        (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _CGEMM_3M_MIN) <= max(m, n, k) <= _CGEMM_3M_MAX &&
-                        min(m, n, k) >= _CGEMM_3M_KMIN
+                        (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _fh_cgemm_3m_min()) <= max(m, n, k) <= _fh_cgemm_3m_max() &&
+                        min(m, n, k) >= _fh_cgemm_3m_kmin()
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                     # `_CGEMM_UNPACK_MAX` is CORRECTLY placed for complex — do not re-chase it. Measured
                     # packed/unpacked on Zen4 (bench/probes/zg2_unpacked_vs_packed.jl): 2.698 at n=8,

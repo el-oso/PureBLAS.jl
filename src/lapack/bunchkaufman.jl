@@ -1207,9 +1207,9 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # 6/6 on three boxes and was still 7% off. Only forcing the alternative through the gate finds these.
     const _SYTRF_CMULT = something(_SYTRF_CMULT_PREF, 3)::Int   # req8-ok: gate-measured, table above
     @inline _sytrf_nb(::Type{ComplexF64}, n::Int) =
-        clamp((f = _fk("sytrf_cmult"); f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
+        clamp((f = _FKR_sytrf_cmult[]; f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
     @inline _sytrf_nb(::Type{ComplexF32}, n::Int) =
-        clamp((f = _fk("sytrf_cmult"); f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
+        clamp((f = _FKR_sytrf_cmult[]; f >= 0 ? f : _SYTRF_CMULT) * _sytrf_nb_shape(n), 16, 96)
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = clamp(_sytrf_nb_shape(n), 16, 96)
 else
     @inline _sytrf_nb(::Type{T}, n::Int) where {T} = _SYTRF_NB_PREF::Int   # pinned (trim lands here)

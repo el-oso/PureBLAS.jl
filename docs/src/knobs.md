@@ -101,7 +101,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
-| `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet |
+| `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (galen n=128) does not replicate (2026-08-21) |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
@@ -110,14 +110,14 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
 | `trmm_rkc` | sibling | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
 | `trmm_rpack` | literal | Literal | measured pack threshold; a box that disagrees pins it rather than editing. | candidate |
-| `trmm_rpanel` | literal | Literal | trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet |
+| `trmm_rpanel` | literal | Literal | trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21) |
 | `trsm_base` | literal | Literal | trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 all within noise on Zen3+Zen4+Zen5 (96 cells, 2026-08-21) |
 | `trsm_dbase` | literal | Literal | diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
 | `trsm_narrow_max` | literal | Literal | B-width below which the narrow path wins; measured, not derived. | candidate |
 | `trsm_ncut` | literal | Literal | B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 32/64/128 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
 | `trsm_ncut_r` | literal | Literal | B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 64/128/256 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
-| `trsm_r_fuse` | literal | Literal | side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet |
-| `trtri_base` | literal | Literal | triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | NOT SWEPT — extremes {1,2,4096} verified correct on Zen4; no timing evidence yet |
+| `trsm_r_fuse` | literal | Literal | side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | TUNABLE and MIS-SPECIFIED — one scalar serves as BOTH the one-panel ceiling and the recursion leaf; no single value is right at n=128 and n=512 (Zen4 32 -> 0.900 vs 1.031). See task #169. |
+| `trtri_base` | literal | Literal | triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 8/16/32/64 within noise on all 3 uarchs, both trsm sides (2026-08-21) |
 | `ztrsm_gt_mr` | formula | Derived | formula over detected consts: `_ZGT_W` | — |
 
 ## CPU detection
