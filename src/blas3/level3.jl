@@ -8,6 +8,7 @@
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
+@inline _trmm_rpanel() = (f = _fk("trmm_rpanel"); f >= 0 ? f : _TRMM_RPANEL)
 # side-R packed kc: the triangular B-micropanel (nr=_NR wide, kc deep) is ½·L1 resident — the SAME
 # residency criterion as gemm's _KC (identical nr), so derive it from _KC rather than a hand-fit literal
 # (was 384 = ¾·L1, a req#8 violation). Preferences "trmm_rkc" pins it if trmm-R measures a different opt.
@@ -880,7 +881,7 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # measured 0.85 at 2048); the flat level touches B only twice. Diagonal FIRST (consumes the
         # panel's ORIGINAL values), then += off-diagonal (reads other, still-original panels).
         # upM → right-to-left; lower → left-to-right.
-        upM = (up != tr); P = _TRMM_RPANEL
+        upM = (up != tr); P = _trmm_rpanel()
         np = cld(k, P)
         for t in (upM ? ((np - 1):-1:0) : (0:(np - 1)))
             jc = t * P; pc = min(P, k - jc)
@@ -1290,6 +1291,7 @@ end
 # complex/conj keep the scalar trsv base.
 # PDM: Literal — trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRSM_BASE = @load_preference("trsm_base", 32)::Int
+@inline _trsm_base() = (f = _fk("trsm_base"); f >= 0 ? f : _TRSM_BASE)
 # Small real triangular inverse: V (same uplo as A) = inv(A). Cast as a trsm: V solves A·V = I, so
 # V := A⁻¹·I via the vectorized dense-L base (contiguous A-column axpys) instead of a scalar
 # strided-row dot — the scalar version was ~20× less efficient/flop and 44% of the invL base.
@@ -1303,9 +1305,10 @@ const _TRSM_BASE = @load_preference("trsm_base", 32)::Int
 # uplo/unit; the off-diagonal block carries its actual (non-unit) values.
 # PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
+@inline _trtri_base() = (f = _fk("trtri_base"); f >= 0 ? f : _TRTRI_BASE)
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     T = eltype(V)
-    if nb <= _TRTRI_BASE
+    if nb <= _trtri_base()
         fill!(V, zero(T))
         @inbounds for i in 1:nb
             V[i, i] = one(T)
@@ -1371,13 +1374,16 @@ end
 # count grows with n, so for wide B the invL/gemm base wins (routed by _TRSM_NCUT below).
 # PDM: Literal — B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRSM_NCUT = @load_preference("trsm_ncut", 64)::Int  # side-L: B width cut (invL wins from 96 down since the gemm clip; 64 keeps dense only for n≤64)
+@inline _trsm_ncut() = (f = _fk("trsm_ncut"); f >= 0 ? f : _TRSM_NCUT)
 # PDM: Literal — B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRSM_NCUT_R = @load_preference("trsm_ncut_r", 128)::Int  # side-R: B height cut (R's narrow path is stronger than L's — measured, 128 rides it at 1.7×)
+@inline _trsm_ncut_r() = (f = _fk("trsm_ncut_r"); f >= 0 ? f : _TRSM_NCUT_R)
 # Narrow-B dense-base cutoff. Re-swept at LOCKED CPU freq (2026-07-02): 32 beats 16 (n=32 cold
 # 0.565→0.75, worst-size = the gate metric); the old "16, raising hurts n=128" was a boost-noise artifact
 # (benchmark with CPU boost OFF). ponytail: could be a Preferences knob if the fleet diverges.
 # PDM: Literal — diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRSM_DBASE = @load_preference("trsm_dbase", 32)::Int
+@inline _trsm_dbase() = (f = _fk("trsm_dbase"); f >= 0 ? f : _TRSM_DBASE)
 # Narrow-B cutoff: side-L trsm sweeps trsv per column when nrhs ≤ this. Set to 0 to disable.
 #
 # The crossover is CONSTANT in k, not proportional to it. Blocked costs `setup + nrhs·b`, the sweep
@@ -3041,7 +3047,7 @@ end
         end
     end
     chain = Expr(:block)
-    for K in _GT_MR:_GT_MR:_TRSM_DBASE
+    for K in _GT_MR:_GT_MR:_trsm_dbase()
         push!(
             chain.args,
             :(KC == $K && return _fusedT_stripe_tiny!(Val($K), Val(NRVe), Pp, pB, ldb, jc, pU, ldu, rp))
@@ -3160,7 +3166,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
         # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
         # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
-        NRl = (_EXPFLAG[_EXP1] && KC <= _TRSM_DBASE) ? 2 * W : NR
+        NRl = (_EXPFLAG[_EXP1] && KC <= _trsm_dbase()) ? 2 * W : NR
         # _EXP7 — ILP lever. At exactly n = NR+W with a tiny KC (the gate cell: k=32, n=32 = 24+8) solve
         # BOTH stripes in one paired body so their independent back-substitution chains overlap, instead
         # of running them back to back with only one chain ever in flight. Buffer note: the pair uses a
@@ -3204,7 +3210,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
             # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
             # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
             if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
-                    KC <= _TRSM_DBASE && jc + 2 * NR <= n
+                    KC <= _trsm_dbase() && jc + 2 * NR <= n
                 _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
                 jc += 2 * NR; continue
             end
@@ -3572,7 +3578,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if eltype(B) <: BlasReal && !cj
         # narrow B → dense base (few axpy calls); wide B → invL base (gemm-efficient). n is invariant under
         # the side-L row split, so the choice is consistent through the recursion.
-        if size(B, 2) <= _TRSM_NCUT
+        if size(B, 2) <= _trsm_ncut()
             # Narrow B. Prefer the fused gemmtrsm leaf for eligible mid-k (_TRSM_FUSED_MIN ≤ k ≤ _TRSM_FUSED_BASE):
             # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
             # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
@@ -3585,7 +3591,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
                     _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
                 return _trsm_fused_L!(unit, A, B)
             end
-            k <= _TRSM_DBASE && return _trsm_dense_L!(up, tr, unit, A, B)
+            k <= _trsm_dbase() && return _trsm_dense_L!(up, tr, unit, A, B)
         elseif up && !tr && _GT_TRANSPOSE && _TRSM_FULLPACK_ON[] &&
                 _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
             # Whole-k packed sweep (shared solved-X panel, no recursion / re-pack). AVX-512-f64, large-k only.
@@ -3598,7 +3604,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # n≥256 to those k=32 invL leaves instead — the whole AVX2 n≥256 gap (Fable-diagnosed 2026-07-15;
             # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B)
-        elseif k <= _TRSM_BASE
+        elseif k <= _trsm_base()
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
     elseif eltype(B) <: BlasComplex                       # complex base (else fall through → gemm-blocked split)
@@ -3772,6 +3778,7 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
 end
 # PDM: Literal — side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lower-T real-f64 side-R fused-panel base cap (= potrf NB); recurse above
+@inline _trsm_r_fuse() = (f = _fk("trsm_r_fuse"); f >= 0 ? f : _TRSM_R_FUSE)
 # BATCH-dim (m = B-rows) floor for the fused side-R panel. Its O(k²) triangle setup (invert-diagonal/pack)
 # amortizes over O(m·k) solve work — tax = k/m — so it needs a FEW register-tiles of m, NOT the k-CEILING.
 # The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
@@ -3859,9 +3866,9 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     # that it needs the wide-B predicate to amortize. DERIVE tier (residency over `_L1_BYTES`, req#8) —
     # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
     # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
-    if !up && !unit && !cj && k <= _TRSM_R_FUSE && eltype(B) === Float64 && _strided1(B) &&
-            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _TRSM_NCUT_R) &&
-            (size(B, 1) > _TRSM_NCUT_R || (k > _TRSM_DBASE && size(B, 1) >= _trsm_r_mfloor(k)))
+    if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
+            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _trsm_ncut_r()) &&
+            (size(B, 1) > _trsm_ncut_r() || (k > _trsm_dbase() && size(B, 1) >= _trsm_r_mfloor(k)))
         Ar = A
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
         # to the leaf VERBATIM at the caller's lda. For a square gate operand that is lda = k, and at
@@ -3926,14 +3933,14 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
                 Ar[r, c] = A[k + 1 - c, k + 1 - r]
             end
         end
-        return _trsm_rl_fused_drv!(Ar, B, k, !tr, _alias_ld(stride(B, 2)) && k > _TRSM_DBASE)
+        return _trsm_rl_fused_drv!(Ar, B, k, !tr, _alias_ld(stride(B, 2)) && k > _trsm_dbase())
     end
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
         # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
-        if size(B, 1) <= _TRSM_NCUT_R
-            k <= _TRSM_DBASE && return _trsm_dense_R!(up, tr, unit, A, B)
-        elseif k <= _TRSM_BASE
+        if size(B, 1) <= _trsm_ncut_r()
+            k <= _trsm_dbase() && return _trsm_dense_R!(up, tr, unit, A, B)
+        elseif k <= _trsm_base()
             return _trsm_base_invR!(up, tr, unit, A, B)
         end
     elseif eltype(B) <: BlasComplex
@@ -4074,8 +4081,8 @@ function trsm!(
     # its panel trsm is exactly k=nb, n=ku, with ldb = 2kl+ku. Wide side-L now falls through to the
     # normal routing, which still reaches the fused leaf via _trsm_left! when it applies. Gated on the
     # same _TRSM_NCUT the narrow/wide split already uses, so no new tuning constant is introduced.
-    if k <= _TRSM_DBASE && eltype(B) <: BlasReal && transA != 'C' && isone(alpha) &&
-            !(side == 'L' && size(B, 2) > _TRSM_NCUT)
+    if k <= _trsm_dbase() && eltype(B) <: BlasReal && transA != 'C' && isone(alpha) &&
+            !(side == 'L' && size(B, 2) > _trsm_ncut())
         up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
         # SINGLE column, side-L: one trsv beats the dense base even down here. This path returns
         # before the narrow-B branch below, so without this the sweep never fires for k ≤ _TRSM_DBASE
@@ -4125,7 +4132,7 @@ function trsm!(
         # cell — which already reached the leaf — wins (1.03–1.57). Falling through also picks up the
         # `_alias_ld` handling the bypass skipped. Reuses the existing _TRSM_NCUT_R routing predicate, so
         # no new tuning constant is introduced (that const's own PDM debt is noted at its definition).
-        if !up && !unit && eltype(B) === Float64 && _strided1(B) && size(B, 1) > _TRSM_NCUT_R
+        if !up && !unit && eltype(B) === Float64 && _strided1(B) && size(B, 1) > _trsm_ncut_r()
             return _trsm_right!(up, tr, false, unit, A, B)
         end
         return _trsm_dense_R!(up, tr, unit, A, B)
@@ -4209,6 +4216,7 @@ end
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
 # PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: candidate, fleet-unmeasured
 const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
+@inline _syrk_base() = (f = _fk("syrk_base"); f >= 0 ? f : _SYRK_BASE)
 
 @inline _symstored(up::Bool, i, j) = up ? (i <= j) : (i >= j)
 # β-prescale C's stored triangle. Branch-free, contiguous, triangle-only (was: all n² with a per-element
