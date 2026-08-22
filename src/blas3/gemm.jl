@@ -1345,7 +1345,29 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 # CUT, which is ISA-independent, and real gemm is throughput-bound on both AVX2 and AVX-512; the guard
 # exists only to exclude widths the packing path does not implement. | tune: n/a — capability, not tuning
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
-# PDM: Literal — split while min(m,n,k) >= this; measured, and the base stays >= ~min/2. | tune: candidate
+# GATE-VALIDATED 2026-08-22, and the candidate 512 was REJECTED. Controlled A/B, both arms forced (so
+# neither could write the cache), back-to-back in one methodology, freq-locked, `arms=pb`:
+#
+#   n        512/1024 Zen4     512/1024 Zen3
+#   512        1.0573            1.0064
+#   1024       1.0107            0.9961
+#   2048       1.0227            1.0026
+#   4096       1.0067            1.0015
+#   CONTROL    1.0218 (n=32)     1.0214 (n=8)   <- strassen_min CANNOT affect these sizes
+#
+# The control cell is the whole reading. `strassen_min` is not consulted at n=8/32 — Strassen is nowhere
+# near enabled — so its ~2% "gain" IS the single-run noise floor. Against that floor only Zen4 n=512
+# (+5.7%) survives, and that is exactly the one cell where lowering the threshold turns Strassen ON.
+# Zen3 shows nothing anywhere. The gate aggregate moved 0.965->0.962 (Zen4) and 0.978->0.980 (Zen3):
+# no change either way.
+#
+# REJECTED because the cost/benefit does not clear the bar: one µarch, one size, on an op with ZERO gate
+# misses fleet-wide (so this buys margin, not a rescue), with Zen5 unmeasured — and [[152]] is the
+# standing precedent that a 3M-family threshold INVERTED on AVX-512 and lost 21-29%. Shipping a
+# Zen4-shaped default into an unmeasured Zen5 is how that regression happened.
+# Revisit only with a Zen5 arm; if 512 wins there too, the honest form is a µarch-keyed derivation, not
+# a flat literal.
+# PDM: Literal — split while min(m,n,k) >= this; the base stays >= ~min/2. | tune: 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above)
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
 @inline _fh_strassen_min() = (f = _FKR_strassen_min[]; f >= 0 ? f : _STRASSEN_MIN)
 # PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
