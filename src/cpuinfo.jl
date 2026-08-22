@@ -287,6 +287,40 @@ const _GEMM_SPLIT_S = 2
 # detected consts separates n=512 from n=1024 (2 vs 8 MiB, identical caches), so closing it wants a PIN
 # from `tune!()`, not another predicate. Reported, not fixed: the Pin tier is the user's.
 @inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
+# STRASSEN threshold and the trmm side-R pack cut — both key on the REAL DATAPATH WIDTH, and both are
+# derivations, not lookups. `_datapath_bytes` separates the fleet exactly: Zen3 is 32 B natively, Zen4
+# double-pumps its 512-bit ops over a 256-bit path so it is ALSO 32 B, and only Zen5 is a native 64 B
+# datapath. That is why Zen3 and Zen4 measure alike here and Zen5 does not — the split is silicon, not
+# a per-box table.
+#
+# MECHANISM (req#8's narrowed clause: name it, map it 1:1 onto the predicate, give the fleet table):
+# Strassen buys a FLOP CUT and pays in extra additions and memory passes. Doubling the datapath doubles
+# per-cycle FMA throughput, so the base gemm kernel gets ~2x faster per cycle while the extra Strassen
+# traffic does NOT — the flops-vs-traffic crossover moves DOWN, and the threshold must follow it down.
+# Same argument for the trmm side-R cut: raising it AVOIDS the packed path for k in 512..1792, and
+# packing is pure traffic that a wider datapath cannot accelerate.
+#
+# FLEET TABLE, freq-locked (boost off; Zen5 pinned 2000 MHz, 1980 achieved under load), every arm
+# correctness-checked before timing, ratio vs the SHIPPED value (>1 = candidate faster):
+#   strassen_min   n=256   n=512   n=1024  n=2048  n=4096
+#     Zen5  256    1.0155  1.0756  1.0625  1.0565  1.0000    <- ADOPTED; no losing cell
+#     Zen5  512    1.0005  1.0745  1.0626  1.0607  0.9995
+#     Zen5  128    0.9464  1.0006  1.0676  1.0590  1.0005    <- loses 5.4% at n=256
+#     Zen5  2048   1.0006  1.0009  0.9408  0.9366  0.9374    <- loses ~6% at large n
+#     Zen3/Zen4    FLAT at every size (74-cell sweeps on both boxes) => keep 1024
+#   Reproduced in FOUR Zen5 runs (2 unlocked + 2 locked); locked agrees with unlocked to ~0.5%, which
+#   also confirms the paired per-round ratio in Measure.ab is clock-invariant by construction.
+#
+#   trmm_rpack     n=256   n=512   n=1024  n=2048
+#     Zen5  1792   1.0011  1.0813  1.0703  0.9975    <- ADOPTED
+#     Zen5  896    1.0003  1.0806  1.0001  0.9986    <- helps n=512 only
+#     Zen5  224    0.8854  1.0000  0.9996  0.9981    <- loses 11.5% at n=256
+#     Zen3/Zen4    FLAT => keep 448
+# CAVEAT, stated because it cannot be gate-verified: `trmm_rpack` drives `_trmm_right!`, and
+# bench/plots.jl has NO real trmmR row (it benchmarks trmm side-L, trsm side-L, trsmR, and complex
+# ztrmmR). This knob is probe-measured only; the gate is blind to it. Coverage gap filed separately.
+@inline _at_strassen_min(hw) = _datapath_bytes(hw) >= 64 ? 256 : 1024
+@inline _at_trmm_rpack(hw) = _datapath_bytes(hw) >= 64 ? 1792 : 448
 # (c5b) The two BOUNDS of the per-column window, made pinnable 2026-08-21. They were hardcoded as
 # `_L2_BYTES` and `_L1_BYTES ÷ 2` inside the predicate; the defaults below are those same two values,
 # so an unpinned build routes IDENTICALLY — this is a knob-SHAPE change, not a behaviour change.

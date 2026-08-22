@@ -27,7 +27,7 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 # to pin without a dedicated 2-box crossover campaign; a guessed formula would be worse than this literal.)
 # Preferences "trmm_rpack" pins it if a future box measures otherwise.
 # PDM: Literal — measured pack threshold; a box that disagrees pins it rather than editing. | tune: candidate
-const _TRMM_RPACK = @load_preference("trmm_rpack", 448)::Int
+const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 @inline _fh_trmm_rpack() = (f = _FKR_trmm_rpack[]; f >= 0 ? f : _TRMM_RPACK)
 
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
