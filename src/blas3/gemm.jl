@@ -1373,7 +1373,7 @@ const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # Revisit only with a Zen5 arm AND a repeat that reproduces; if 512 wins there too, the honest form is a
 # µarch-keyed derivation, not a flat literal.
 # PDM: Literal — split while min(m,n,k) >= this; the base stays >= ~min/2. | tune: 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above)
-const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
+const _STRASSEN_MIN = @load_preference("strassen_min", _at_strassen_min(_HW))::Int      # split while min(m,n,k) ≥ this
 @inline _fh_strassen_min() = (f = _FKR_strassen_min[]; f >= 0 ? f : _STRASSEN_MIN)
 # PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int

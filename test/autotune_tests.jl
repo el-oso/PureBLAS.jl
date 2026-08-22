@@ -168,6 +168,31 @@
     @test P._CPOTRF_BASE == P._at_cpotrf_base(P._HW)
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)
     @test P._CPOTF2_MR == P._at_cpotf2_mr(P._HW)
+# ── strassen_min / trmm_rpack: derived from the REAL DATAPATH WIDTH ──────────────────────────────
+# Zen4 double-pumps 512-bit ops over a 256-bit path, so its effective datapath is 32 B — the SAME
+# as native-AVX2 Zen3. Only Zen5 is a native 64 B datapath. That is exactly why Zen3 and Zen4
+# measured FLAT on both knobs while Zen5 wants very different values, and it is why the predicate
+# is `_datapath_bytes` and not `_vwidth` (which cannot tell Zen4 from Zen5) or `_double_pumped`
+# (which cannot tell Zen3 from Zen5).
+@test P._datapath_bytes(galen) == 32
+@test P._datapath_bytes(wintermute) == 32
+@test P._datapath_bytes(neuromancer) == 64
+# Zen3/Zen4 keep the shipped values — the change must be a no-op off native-512.
+@test P._at_strassen_min(galen) == 1024
+@test P._at_strassen_min(wintermute) == 1024
+@test P._at_trmm_rpack(galen) == 448
+@test P._at_trmm_rpack(wintermute) == 448
+# Zen5 takes the measured optima (freq-locked, 4 runs for strassen_min, 2 locked for trmm_rpack):
+#   strassen_min 256  -> 1.0155/1.0756/1.0625/1.0565/1.0000 at n=256..4096, no losing cell
+#   trmm_rpack   1792 -> 1.0011/1.0813/1.0703 at n=256/512/1024
+@test P._at_strassen_min(neuromancer) == 256
+@test P._at_trmm_rpack(neuromancer) == 1792
+# Tigerlake is native-512 too, so it inherits the Zen5 side — a PREDICTION, never benchmarked.
+@test P._at_strassen_min(tigerlake) == 256
+@test P._at_trmm_rpack(tigerlake) == 1792
+# Live machine agrees with the formula applied to its own detected _HW.
+@test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
+@test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
 end
 
 @testitem "trsm_base is clamped to the scratch it indexes" tags = [:unit] begin

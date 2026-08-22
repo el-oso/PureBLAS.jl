@@ -15,7 +15,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
 **Tier:** 62 Derived · 10 Measured · 46 Literal · 10 Exempt.
-**Default form** (mechanical): 54 formula · 20 delegates · 6 sibling · 43 literal · 4 flag · 1 other.
+**Default form** (mechanical): 56 formula · 20 delegates · 6 sibling · 41 literal · 4 flag · 1 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -109,7 +109,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
 | `trmm_rkc` | sibling | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
-| `trmm_rpack` | literal | Literal | measured pack threshold; a box that disagrees pins it rather than editing. | candidate |
+| `trmm_rpack` | formula | Literal | measured pack threshold; a box that disagrees pins it rather than editing. | candidate |
 | `trmm_rpanel` | literal | Literal | trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21) |
 | `trsm_base` | literal | Literal | trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 all within noise on Zen3+Zen4+Zen5 (96 cells, 2026-08-21) |
 | `trsm_dbase` | literal | Literal | diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
@@ -218,7 +218,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
 | `strassen_maxdepth` | literal | Literal | recursion depth cap; deeper trades flops for pack/add traffic. | candidate |
-| `strassen_min` | literal | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
+| `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 
 ## workspace
 
