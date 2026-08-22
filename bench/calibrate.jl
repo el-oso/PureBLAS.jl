@@ -161,9 +161,89 @@ function calibrate_gemvt_window()
     return Pair{String, Any}["gemvt_perscan" => 1, "gemvt_percol_amin" => a, "gemvt_percol_xmax" => x]
 end
 
+# ── potrf uplo='U' tiny-n direct cutoff ─────────────────────────────────────────────────────────────
+# Measure tier because the optimum sits inside a NOISY BAND and no reasoning picks a point out of one.
+# Its own history is the warning: the retired duel read "20 / 16 / 18 / 12 — four different cutoffs from
+# one binary", and ComplexF64 gave 16/18/20 across ten fresh processes. `decide` is what makes running
+# it safe anyway — a candidate must clear BOTH a CI excluding 1.0 and a 2% margin, so an unresolvable
+# band returns :tie and the shipped 12 stands. Reporting "unresolvable on this host" is the useful
+# output; silently pinning a draw from the band is the failure mode.
+# Shapes are the SMALL uplo='U' factorizations the cutoff actually routes: the branch is n <= cutoff.
+function calibrate_potrf_udirect(::Type{T} = Float64) where {T}
+    inc = PureBLAS._potrf_udirect(T)
+    cands = filter(!=(inc), [8, 12, 16, 20, 24])
+    ns = (8, 12, 16, 20, 24, 32)
+    setup() = [(A = randn(T, n, n); (Matrix(A * A' + n * I), Matrix{T}(undef, n, n))) for n in ns]
+    run(v) = (cs -> begin
+        PureBLAS._FKR_potrf_upper_direct_max[] = v
+        for c in cs
+            copyto!(c[2], c[1]); PureBLAS.potrf!(c[2]; uplo = 'U')
+        end
+        c1 = cs[1][2]; c1[1]
+    end)
+    arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
+    @printf("  potrf_upper_direct_max: incumbent %d, candidates %s (n = %s)\n", inc, cands, ns)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    PureBLAS._FKR_potrf_upper_direct_max[] = -1
+    for r in res
+        @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    name, verdict = decide(res; delta = 0.02)
+# Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
+# the in-code default stands. That is the whole safety property for a knob like this one, whose own
+# history is four different answers from one binary.
+if verdict === :tie
+    println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    return Pair{String, Any}[]
+end
+@printf("    ⇒ WINNER cutoff=%s\n", name)
+return Pair{String, Any}["potrf_upper_direct_max" => parse(Int, string(name))]
+end
+
+# ── sytrf complex blocking multiplier ───────────────────────────────────────────────────────────────
+# The Measure-tier quantity here is the MULTIPLIER on `_sytrf_nb_shape(n)`, not nb itself. The in-code
+# fleet table says 3 wins on wintermute (+4.8%) and galen (+3.0%) and ties on neuromancer, while the
+# retired duel resolved 2 in 16 of 18 samples — i.e. the duel and the gate DISAGREED. That is exactly
+# the disagreement a calibrator should re-adjudicate on the host rather than inherit.
+function calibrate_sytrf_cmult(::Type{T} = ComplexF64) where {T}
+    inc = PureBLAS._SYTRF_CMULT
+    cands = filter(!=(inc), [1, 2, 3, 4])
+    n = 1024
+    # sytrf! factors IN PLACE and takes an ipiv vector; both the working copy and ipiv are allocated in
+    # setup (excluded from timing) so the measured region is the factorization alone. The matrix is
+    # COMPLEX SYMMETRIC (A + transpose(A)), not Hermitian — sytrf is the symmetric factorization, and
+    # `A + A'` would build a Hermitian matrix and exercise a different numerical path.
+    setup() = (A = randn(T, n, n); H = A + transpose(A);
+               (Matrix(H), Matrix{T}(undef, n, n), Vector{Int}(undef, n)))
+    run(v) = (c -> begin
+        PureBLAS._FKR_sytrf_cmult[] = v
+        copyto!(c[2], c[1]); PureBLAS.sytrf!(c[2], c[3]; uplo = 'L')
+        c[2][1]
+    end)
+    arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
+    @printf("  sytrf_cmult: incumbent %d, candidates %s (n = %d, %s)\n", inc, cands, n, T)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    PureBLAS._FKR_sytrf_cmult[] = -1
+    for r in res
+        @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    name, verdict = decide(res; delta = 0.02)
+# Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
+# the in-code default stands. That is the whole safety property for a knob like this one, whose own
+# history is four different answers from one binary.
+if verdict === :tie
+    println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    return Pair{String, Any}[]
+end
+@printf("    ⇒ WINNER cmult=%s\n", name)
+return Pair{String, Any}["sytrf_cmult" => parse(Int, string(name))]
+end
+
 const KNOBS = (
     (name = "ger_panel_np", fn = calibrate_ger_np),
     (name = "gemvt_percol_window", fn = calibrate_gemvt_window),
+    (name = "potrf_upper_direct_max", fn = calibrate_potrf_udirect),
+    (name = "sytrf_cmult", fn = calibrate_sytrf_cmult),
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────
