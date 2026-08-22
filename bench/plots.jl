@@ -702,7 +702,7 @@ function run_benchmarks()
     # ── BLAS-3 (O(n³), destructive trmm/trsm; fresh input per round) ──────────────────────────────────
     l3 = OpData[]
     let
-        NN = Char(78); LT = Char(76); UP = Char(85)
+        NN = Char(78); LT = Char(76); UP = Char(85); RT = Char(82)
         tri(s) = (
             A = randn(s, s) ./ (2s); for i in 1:s
                 A[i, i] = 1 + abs(A[i, i])
@@ -734,6 +734,19 @@ function run_benchmarks()
             "trmm", s -> (tri(s), randn(s, s)),
             c -> (B.trmm!(LT, UP, NN, NN, 1.0, c[1], c[2]); c[2][1]),
             c -> (PureBLAS.trmm!(c[2], c[1]; side = LT, uplo = UP); c[2][1])
+        )
+        addh(
+            # REAL side-R trmm. Its absence was a COVERAGE GAP, not an oversight of no consequence: the
+            # complex sibling `ztrmmR` exists precisely because "plots measured only side-L → the 0.24
+            # side-R routing bug went unseen" (see its comment below), and the real side never got the
+            # same treatment. `_trmm_right!` is a wholly separate driver from `_trmm_left!` — different
+            # packing decision, different base — and `trmm_rpack` (its pack cut, worth +8.1% on Zen5 at
+            # n=512) was tunable but NOT gate-verifiable while this row was missing.
+            # Shape mirrors ztrmmR (side='R', uplo='U', trans='N') so the real and complex rows measure
+            # the same routing.
+            "trmmR", s -> (tri(s), randn(s, s)),
+            c -> (B.trmm!(RT, UP, NN, NN, 1.0, c[1], c[2]); c[2][1]),
+            c -> (PureBLAS.trmm!(c[2], c[1]; side = RT, uplo = UP); c[2][1])
         )
         addh(
             "trsm", s -> (tri(s), randn(s, s)),
