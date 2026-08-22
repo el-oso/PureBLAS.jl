@@ -471,8 +471,21 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 # it exercises BOTH m- and n-masking on every box, and 100*8 = 800 B is not a way-stride multiple.
 # Small AND non-po2 also means it lands in L1/L2, where per-call overhead and edge handling dominate —
 # the regime the large sizes cannot speak to.
-const L2SZ = (64, 100, 128, 256, 512, 1000, 1024, 2048, 4096)
-const L3SZ = (8, 32, 100, 128, 256, 512, 1000, 1024, 2048, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
+# ONE NON-POWER-OF-TWO SIZE PER RESIDENCY BAND. A single non-po2 size is not enough: the two blind
+# spots it covers (cache-set aliasing and the masked partial-tile kernel) can both behave differently
+# in L1, L2, L3 and DRAM, and every pre-existing size is a power of two — hence aliasing, and hence a
+# multiple of both register-tile dims, so `_microkernel_masked!` was never entered at all.
+# Residency is identical on ALL THREE boxes for each (checked against 32/32/48 KiB L1, 512/1024/1024
+# KiB L2, 32/16/16 MiB L3), so a row means the same thing everywhere:
+#     n=50    19.5 KiB   L1     %mr=2  %nr=2   masks both
+#     n=100   78 KiB     L2     %mr=4  %nr=4   masks both
+#     n=1000  7.6 MiB    L3     %mr=8  %nr=0   masks m
+#     n=2100  33.6 MiB   DRAM   %mr=4  %nr=4   masks both
+# None is a way-stride multiple (n*8 % 4096 != 0), so they are clean on the aliasing axis; the po2
+# sizes beside them supply the aliasing case. n=300 was rejected: it is L3 on galen but L2 on the other
+# two, so the row would not mean the same thing per box.
+const L2SZ = (50, 64, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)
+const L3SZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
 const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations, to 4096
 # Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
 # the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
