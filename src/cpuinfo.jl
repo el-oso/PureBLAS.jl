@@ -80,6 +80,15 @@ const _L1D_ASSOC = @load_preference(
     end
 )::Int
 const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
+# Doubles per L1 way, as a PURE FUNCTION of (L1 bytes, associativity) so it can be tested against cache
+# geometries no fleet box has. It exists because the same quantity was once spelled
+# `max(64, _L1_BYTES ÷ 64)` — associativity hardcoded to 8 — which is right on every 32 KiB/8-way part
+# BY COINCIDENCE and wrong by 1.5x on Zen5's 48 KiB 12-way L1 (768 doubles where the truth is 512).
+# `_alias_ld` gates the trsm/trmm side-R de-aliasing copy on it, so on that box the guard tested
+# multiples of 6144 B and MISSED every power-of-two leading dimension — the exact strides that alias.
+# A const folded from the live machine can only ever be wrong on hardware you do not own; a pure
+# function can be tested against hardware you do not own. See test/autotune_tests.jl.
+@inline _way_doubles(l1::Int, assoc::Int) = max(64, max(_CACHELINE, l1 ÷ assoc) ÷ sizeof(Float64))
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
@@ -319,6 +328,15 @@ const _GEMM_SPLIT_S = 2
 # CAVEAT, stated because it cannot be gate-verified: `trmm_rpack` drives `_trmm_right!`, and
 # bench/plots.jl has NO real trmmR row (it benchmarks trmm side-L, trsm side-L, trsmR, and complex
 # ztrmmR). This knob is probe-measured only; the gate is blind to it. Coverage gap filed separately.
+# gemv-N m-inner panel: pays only while the FMA units, not the loads, are the bottleneck. m-inner
+# sweeps columns inner and needs ~NP concurrent STRIDED A-streams, which the prefetcher cannot sustain;
+# on a 32 B datapath the register reuse still wins, on a native 64 B path the loads dominate and it
+# does not. Same predicate as the two above, same reason: it IS the datapath.
+# Measured on all three boxes freq-locked and verified (see blas2/level2.jl for the table):
+#   datapath 32 (Zen3, Zen4-double-pumped) -> m-inner WINS  (gate 0.925 vs 0.901; 0.969 vs 0.953)
+#   datapath 64 (Zen5 native)              -> m-inner LOSES (n=512 0.916, n=1024 0.964)
+@inline _at_gemvn_minner(hw) = _datapath_bytes(hw) < 64
+
 @inline _at_strassen_min(hw) = _datapath_bytes(hw) >= 64 ? 256 : 1024
 @inline _at_trmm_rpack(hw) = _datapath_bytes(hw) >= 64 ? 1792 : 448
 # (c5b) The two BOUNDS of the per-column window, made pinnable 2026-08-21. They were hardcoded as
