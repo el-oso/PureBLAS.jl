@@ -279,7 +279,17 @@ end
 # at `dst + pp·mrstride`. @generated so the loads/shuffles/stores schedule statically.
 @generated function _tblk!(dst::Ptr{T}, src::Ptr{T}, lda::Int, mrstride::Int, av::Vec{W, T}, ::Val{W}) where {T, W}
     sz = sizeof(T); V = Vec{W, T}; q = Int(round(log2(W)))
-    body = quote end
+    # `av` is a Vec ARGUMENT, so this body MUST emit the inline meta: `@inline` does not propagate into
+    # @generated CodeInfo (Julia 1.12), and without it a Vec arg is passed BY POINTER and the CALLER's
+    # accumulators get stack-demoted. That is the failure `_fold2_cmplx` documents a few hundred lines
+    # down ("Any @generated helper taking/returning a Vec MUST carry it"), where it cost zgemvC
+    # 0.26-0.64 -> 1.06-1.37 vs OpenBLAS. This one was missed — found by auditing every Vec-taking
+    # @generated helper in src/ rather than by noticing it. Callers are `_pack_A_simd_T!` (transposed-A
+    # packing) and `_transpose_dense!`, i.e. the transposed-operand paths: trsmR (gate uses transA='T'),
+    # transposed gemm, and the potrf-upper transpose route.
+    body = quote
+        $(Expr(:meta, :inline))
+    end
     cur = [Symbol(:c_, r) for r in 0:(W - 1)]
     for r in 0:(W - 1)
         push!(body.args, :($(cur[r + 1]) = vload($V, src + $r * lda * $sz)))
