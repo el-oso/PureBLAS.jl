@@ -149,7 +149,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>syevN</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.97</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.08</span></td></tr>
 <tr><th><code>sytrf</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.07</span></td></tr>
 <tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.41</span></td><td class="ok"><span class="v">1.37</span></td><td class="ok"><span class="v">1.37</span></td></tr>
-<tr><th><code>trtrs</code></th><td class="b4"><span class="v">0.797</span><span class="n">n=256</span></td><td class="b4"><span class="v">0.773</span><span class="n">n=256</span></td><td class="ok"><span class="v">1.0</span></td></tr>
+<tr><th><code>trtrs</code></th><td class="b4"><span class="v">0.797</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=32</span></td><td class="ok"><span class="v">1.0</span></td></tr>
 <tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.21</span></td><td class="ok"><span class="v">1.16</span></td><td class="ok"><span class="v">1.15</span></td></tr>
 <tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.03</span></td></tr>
 <tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.04</span></td><td class="b3"><span class="v">0.937</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.98</span><span class="n">n=32</span></td></tr>
@@ -183,7 +183,7 @@ html.dark .pbg-key{color:#98a1b3}
 | Pivoted QR | geqp3 | s/d/c/z | ✅ | 1.1 | 1.02 | 1.02 | 1.34 / 1.13 | 1.18 / 1.02 |
 | Bunch–Kaufman | sytrf, hetrf | s/d/c/z | ✅ | 1.04 | 0.996 | 1.06 | 1.46 / 1.09 | 1.46 / 0.996 |
 | Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.4 | 1.36 | 1.36 | 1.96 / 1.52 | 2.21 / 1.36 |
-| Triangular solve | trtrs | s/d/c/z | ✅ | **0.781** | **0.75** | 0.998 | 1.15 / 0.858 | 1.11 / 0.75 |
+| Triangular solve | trtrs | s/d/c/z | ✅ | **0.781** | **0.945** | 0.998 | 1.27 / 0.945 | 1.24 / 1.01 |
 | Least-squares | gels | s/d/c/z | ✅ | 1.35 | 1.22 | 1.21 | 2.56 / 1.98 | 1.95 / 1.22 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.05 | 1.06 | 1.12 | 1.34 / 1.16 | 1.25 / 1.06 |
 | Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.02 | **0.971** | 1.08 | 1.38 / 0.971 | 1.53 / 1.11 |
