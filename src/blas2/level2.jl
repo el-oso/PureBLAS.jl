@@ -71,7 +71,31 @@ const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
     # all-paths @noalloc proof. SEEDED with the no-env value, so the accessor is correct even before
     # `__init__` runs; the once-object could not be, it would have run the resolver. The env read lives
     # in `_init_force_knobs!` at the end of this file.
-    const _GEMVN_MINNER_REF = Ref{Bool}(_vwidth(Float64) < 8 || _double_pumped(_HW))
+    # NOW A DERIVATION, not an unconverted Measure knob. `_vwidth(Float64) < 8 || _double_pumped(_HW)`
+    # is, on every part in existence, exactly `_datapath_bytes(hw) < 64` — Zen3 is natively 32 B, Zen4
+    # double-pumps 512-bit ops over a 256-bit path so it is ALSO 32 B, and only a native-512 part is
+    # 64 B. Spelling it as the datapath says WHY rather than enumerating which boxes.
+    #
+    # MECHANISM, and it is already stated a few lines above for the panel path: m-inner holds a full
+    # row-block's y in registers and sweeps columns inner, so it needs ~NP concurrent STRIDED A-streams
+    # and the hardware prefetcher cannot sustain them. On a 32 B datapath the FMA units are the
+    # bottleneck, so trading load efficiency for register reuse pays; double the datapath and the loads
+    # become the bottleneck, so the same trade stops paying. Datapath width IS the criterion.
+    #
+    # FLEET TABLE — all three boxes freq-locked and VERIFIED before and after, quiet (the contention
+    # guard refused and was re-run), gemvN, PB median µs, ratio minner=0 / minner=1:
+    #   Zen3 galen      m-inner WINS  gate 0.925 vs 0.901          -> datapath 32 -> true   (shipped)
+    #   Zen4 wintermute m-inner WINS  gate 0.969 vs 0.953          -> datapath 32 -> true   (shipped)
+    #   Zen5 neuromancer m-inner LOSES n=512 0.916, n=1024 0.964,
+    #                    wins n=2048 1.043, flat elsewhere         -> datapath 64 -> false  (shipped)
+    #
+    # THE ZEN5 NEGATIVE IS NOW VALID. It previously rested on a run taken at 4841 MHz against a
+    # 2000 MHz base — the lock had silently dropped — which is why this knob was left unconverted and
+    # flagged as a PDM violation. Re-measured on a verified-locked, quiet box the conclusion HOLDS: the
+    # old number was right for the wrong reasons. Note the Zen5 response is NON-MONOTONIC (loses at
+    # 512/1024, wins at 2048); `false` is right on balance because it avoids an 8.4% and a 3.6% loss at
+    # the cost of a 4.3% win, and no single boolean can capture that shape.
+    const _GEMVN_MINNER_REF = Ref{Bool}(_at_gemvn_minner(_HW))
     @inline _gemvn_minner() = _GEMVN_MINNER_REF[]
 else
     @inline _gemvn_minner() = _GEMVN_MINNER_PREF::Bool

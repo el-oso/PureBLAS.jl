@@ -916,7 +916,16 @@ end
 # (128 KB, %128) 0.887→1.018 (pad wins); n=384 (1.1 MB > L2, %128 not %256) 0.918→0.899 (pad LOSES).
 @inline function _chol_needs_pad(A, n)
     T = eltype(A); sb = stride(A, 2) * sizeof(T)      # aliasing is on the BYTE stride
-    return n >= 128 && sb % 1024 == 0 && (sb % 2048 == 0 || n * n * sizeof(T) <= _L2_BYTES)
+    # DERIVED from the detected way stride, not the literals 1024/2048. Those were quarter- and
+    # half-period of an ASSUMED 4096 B way stride ("Zen L1 = 64 sets × 64 B" above) — correct on the
+    # whole fleet only because 32 KiB/8-way and 48 KiB/12-way both give 4096 B, and wrong on any other
+    # geometry (a 4-way 32 KiB L1 aliases at 8192 B, so the literals would fire spuriously and pay an
+    # n² copy for aliasing that is not there). The sibling `_potrf_needs_pad` already derives exactly
+    # this as `_L1_WAY_BYTES >> 2`; having one spelled as a derivation and one as literals is the same
+    # duplication that let `_L1_WAY_D` hardcode assoc=8 and silently disable de-aliasing on Zen5.
+    # Behaviour is UNCHANGED on all three boxes (4096 >> 2 == 1024).
+    q = _L1_WAY_BYTES >> 2
+    return n >= 128 && sb % q == 0 && (sb % (q << 1) == 0 || n * n * sizeof(T) <= _L2_BYTES)
 end
 
 # Hybrid driver: the faer kernels are fastest at small/medium n but their syrk isn't cache-blocked, so

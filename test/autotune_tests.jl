@@ -257,3 +257,44 @@ end
         body." offenders = v
     @test isempty(v)
 end
+
+@testitem "L1 way stride tracks DETECTED associativity, never a hardcoded 8" tags = [:unit] begin
+    using PureBLAS
+    P = PureBLAS
+    # The way stride is L1_size / associativity — the address stride at which parallel streams collide
+    # in ONE L1 set. Streams separated by a multiple of it evict each other however large the cache is,
+    # which is why a power-of-two `lda` is pathological for any kernel running several column streams.
+    #
+    # This exists because the quantity was derived TWICE: `_L1_WAY_BYTES` (cpuinfo.jl) divides by the
+    # detected `_L1D_ASSOC` and is right, while `_L1_WAY_D` (level3.jl) used to spell it
+    # `max(64, _L1_BYTES ÷ 64)` — associativity baked in as 8. That agrees on every 32 KiB/8-way part
+    # BY COINCIDENCE (32K/8 = 4096) and is wrong by 1.5x on Zen5's 48 KiB 12-way L1 (48K/12 = 4096 too,
+    # but ÷64 gives 6144). `_alias_ld` gates the trsm/trmm side-R de-aliasing copy on it, so on Zen5 it
+    # tested multiples of 6144 and missed EVERY power-of-two lda — the exact strides that alias.
+    #
+    # A const folded from the live machine can only be wrong on hardware you do not own. A pure
+    # function can be tested against hardware you do not own, which is the point of the table below.
+    # Note `_L1D_ASSOC` falls back to 8-way when cpuid does not report — i.e. the fallback IS the
+    # assumption that was wrong on Zen5, so unknown CPUs are exactly the risk case.
+    line = P._CACHELINE
+    for (l1, assoc) in ((32 * 1024, 8),    # Zen3, Zen4
+                        (48 * 1024, 12),   # Zen5  <- the case the hardcoded form got wrong
+                        (64 * 1024, 16),   # Apple-ish / future wide L1
+                        (32 * 1024, 4),    # low-assoc part
+                        (128 * 1024, 8),   # large L1
+                        (48 * 1024, 8))    # 48K but 8-way: assoc must move the answer, not just L1
+        want = max(64, max(line, l1 ÷ assoc) ÷ sizeof(Float64))
+        @test P._way_doubles(l1, assoc) == want
+        # the property that actually matters: it tracks assoc, so halving assoc doubles the stride
+        @test P._way_doubles(l1, assoc) >= P._way_doubles(l1, 2 * assoc)
+    end
+    # REGRESSION PIN: the exact geometry the old hardcoded form got wrong.
+    @test P._way_doubles(48 * 1024, 12) == 512      # 4096 B — old form gave 768 (6144 B)
+    @test P._way_doubles(32 * 1024, 8) == 512       # unchanged on the 8-way boxes
+    # ONE derivation, not two: the live const must equal the pure function.
+    @test P._L1_WAY_D == P._way_doubles(P._L1_BYTES, P._L1D_ASSOC)
+    @test P._L1_WAY_D * sizeof(Float64) == P._L1_WAY_BYTES
+    # and the guard it gates must catch a power-of-two lda on this machine
+    @test P._alias_ld(P._L1_WAY_D)
+    @test !P._alias_ld(P._L1_WAY_D + 1)
+end

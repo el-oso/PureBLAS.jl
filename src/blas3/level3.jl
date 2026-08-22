@@ -4022,7 +4022,17 @@ end
 # every matrix column to the same L1 set → conflict misses on repeated column re-reads. Generalizes _badld
 # (po2-only): 1536 = 3·512 also aliases on a 32KB/8-way L1. Derived from detected L1 (req#8). Independent of
 # vector width (cache geometry, not ISA) — used by the side-R fused leaf's pT-scratch pack.
-const _L1_WAY_D = max(64, _L1_BYTES ÷ 64)      # doubles per L1 way (÷8-way ÷8-byte/double)
+# Doubles per L1 way. DERIVED from `_L1_WAY_BYTES`, which already divides by the DETECTED
+# `_L1D_ASSOC` — do not re-derive it here.
+#
+# This was `max(64, _L1_BYTES ÷ 64)`, i.e. "÷8-way ÷8-byte/double" with the associativity HARDCODED to
+# 8. That is right on every 32 KiB/8-way part BY COINCIDENCE and wrong anywhere else: Zen5 has a
+# 48 KiB 12-way L1, so the old form gave 768 doubles (6144 B) where the true way stride is 512 doubles
+# (4096 B). `_alias_ld` therefore tested multiples of 6144 on that box and MISSED every power-of-two
+# leading dimension — exactly the strides that alias — so the side-R de-aliasing guard it gates never
+# fired there. Found while chasing why gemv-N's m-inner panel loses only at po2 sizes on Zen5.
+# Zen3/Zen4 values are unchanged (4096 B both ways); only Zen5 moves.
+const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 @inline _alias_ld(ld::Int) = ld >= _L1_WAY_D && ld % _L1_WAY_D == 0
 # FALSIFIED 2026-07-30 (galen, freq-locked, plots.jl): extending this to the QUARTER way period
 # (`ld % (_L1_WAY_D>>2) == 0` gated on B being L2-resident, mirroring `_chol_needs_pad`'s fleet-measured
