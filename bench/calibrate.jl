@@ -239,11 +239,82 @@ end
 return Pair{String, Any}["sytrf_cmult" => parse(Int, string(name))]
 end
 
+# ── gemv-T prefetch distance ────────────────────────────────────────────────────────────────────────
+# Measure tier for a stated reason: prefetch distance depends on L2 hit latency and the hardware
+# streamer, and PureBLAS detects neither. The candidate SET is derived (`_GEMVT_PF_CANDIDATES`, a
+# multiple of the detected `_CACHELINE`), so the bounds adapt even though the choice cannot.
+# Regime is the one the knob serves: the file's own measurement localises gemv-T's deficit to the
+# L2->L1 stream supply, so A is sized to sit in L2, freshly written per sample, rep-looped like the gate.
+function calibrate_gemvt_pf(::Type{T} = Float64) where {T}
+    inc = PureBLAS._gemvt_pf()
+    cands = filter(!=(inc), collect(PureBLAS._GEMVT_PF_CANDIDATES))
+    n = max(256, isqrt(PureBLAS._L2_BYTES ÷ sizeof(T)))          # A ~ L2: the stream-supply regime
+    reps = _l2rep(n)
+    setup() = (randn(T, n, n), randn(T, n), zeros(T, n))
+    run(v) = (c -> begin
+        PureBLAS._GEMVT_PF_REF[] = v
+        for _ in 1:reps; PureBLAS.gemv!(c[3], c[1], c[2]; trans = 'T'); end
+        c[3][1]
+    end)
+    arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
+    @printf("  gemvt_pf: incumbent %d, candidates %s (n=%d, A=%.1f MiB ~ L2)\n",
+            inc, cands, n, n^2 * sizeof(T) / 2^20)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    PureBLAS._GEMVT_PF_REF[] = inc
+    for r in res
+        @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    name, verdict = decide(res; delta = 0.02)
+    if verdict === :tie
+        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+        return Pair{String, Any}[]
+    end
+    @printf("    ⇒ WINNER pf=%s\n", name)
+    return Pair{String, Any}["gemvt_pf" => parse(Int, string(name))]
+end
+
+# ── trmv fused8 lower-n bound ───────────────────────────────────────────────────────────────────────
+# The current default runs fused8 at EVERY n (the raw Ref reads -1 => no lower bound). That was decided
+# on 2026-08-08 by forcing fused8 through the real entry path on all three boxes. This calibrator
+# re-adjudicates it on the host: a positive value sends small n back to the unblocked `_trmv_simd!`.
+# Candidates bracket the sizes where a lower bound could matter at all.
+function calibrate_trmv_fused_min(::Type{T} = Float64) where {T}
+    inc = PureBLAS._trmv_fused_min_raw()
+    cands = filter(!=(inc), [-1, 64, 128, 256])
+    ns = (64, 128, 256, 512)
+    setup() = [(A = randn(T, n, n) ./ (2n); for i in 1:n; A[i, i] = 1 + abs(A[i, i]); end;
+                (A, randn(T, n), Vector{T}(undef, n))) for n in ns]
+    run(v) = (cs -> begin
+        PureBLAS._TRMV_FUSED_MIN_REF[] = v
+        for c in cs
+            copyto!(c[3], c[2]); PureBLAS.trmv!(c[1], c[3]; uplo = 'U')
+        end
+        cs[1][3][1]
+    end)
+    arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
+    @printf("  trmv_fused_min: incumbent %d (-1 = fused8 everywhere), candidates %s, n = %s\n",
+            inc, cands, ns)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    PureBLAS._TRMV_FUSED_MIN_REF[] = inc
+    for r in res
+        @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    name, verdict = decide(res; delta = 0.02)
+    if verdict === :tie
+        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+        return Pair{String, Any}[]
+    end
+    @printf("    ⇒ WINNER trmv_fused_min=%s\n", name)
+    return Pair{String, Any}["trmv_fused_min" => parse(Int, string(name))]
+end
+
 const KNOBS = (
     (name = "ger_panel_np", fn = calibrate_ger_np),
     (name = "gemvt_percol_window", fn = calibrate_gemvt_window),
     (name = "potrf_upper_direct_max", fn = calibrate_potrf_udirect),
     (name = "sytrf_cmult", fn = calibrate_sytrf_cmult),
+    (name = "gemvt_pf", fn = calibrate_gemvt_pf),
+    (name = "trmv_fused_min", fn = calibrate_trmv_fused_min),
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────
