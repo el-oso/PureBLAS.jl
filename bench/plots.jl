@@ -1421,20 +1421,56 @@ end
 const _BUSY_PCPU = 25.0
 "Foreign processes at or above _BUSY_PCPU, as (pid, %cpu, cmdline). Excludes us and our children."
 function _busy_procs()
-    out = try
-        read(`ps -eo pid,ppid,pcpu,args --no-headers`, String)
-    catch
-        return nothing                               # ps unavailable — unknown, not "clear"
+    # INSTANTANEOUS cpu, sampled over an interval — NOT `ps pcpu`, and NOT `ps cputimes`.
+    #
+    # `ps -eo pcpu` reports CPU averaged over the process's ENTIRE LIFETIME, so a browser tab that
+    # burned a core for two minutes and then went idle keeps reporting ~35% for as long as it lives.
+    # That false-positive refused a whole group run (CLP on neuromancer, 49 cells) on an idle box:
+    # ps said 34.9%, a 5-second sample of the same pid said 0.4%.
+    #
+    # The obvious fix — diffing `ps -eo cputimes` — is ALSO wrong and worse: cputimes is INTEGER
+    # SECONDS, so across a sub-second window a 100%-busy process accumulates 0.4 s and reports a
+    # delta of 0. That silently disables the guard rather than merely over-firing it. Caught by a
+    # null test that span a real CPU hog and watched the guard fail to see it.
+    #
+    # /proc/<pid>/stat gives utime+stime in CLOCK TICKS (~10 ms), which resolves a 25% threshold over
+    # a 0.4 s window comfortably. Non-Linux falls back to returning `nothing` = "unknown, not clear",
+    # which is the existing conservative behaviour when ps is unavailable.
+    isdir("/proc") || return nothing
+    hz = 100.0                                        # USER_HZ is 100 on every Linux target here
+    snap() = begin
+        d = Dict{Int, Tuple{Int, Float64}}()
+        for e in readdir("/proc")
+            pid = tryparse(Int, e); isnothing(pid) && continue
+            st = try
+                read(joinpath("/proc", e, "stat"), String)
+            catch
+                continue                              # process exited between readdir and read
+            end
+            k = findlast(')', st); isnothing(k) && continue     # comm can contain spaces/parens
+            fs = split(SubString(st, k + 2))
+            length(fs) < 22 && continue
+            ppid = tryparse(Int, fs[2]); isnothing(ppid) && continue
+            ut = tryparse(Float64, fs[12]); stt = tryparse(Float64, fs[13])
+            (isnothing(ut) || isnothing(stt)) && continue
+            d[pid] = (ppid, (ut + stt) / hz)
+        end
+        d
     end
+    a = snap(); t0 = time(); sleep(0.4); b = snap(); dt = max(time() - t0, 1e-3)
     me = getpid()
     busy = Tuple{Int, Float64, String}[]
-    for ln in eachsplit(out, '\n')
-        f = split(strip(ln); limit = 4)
-        length(f) == 4 || continue
-        pid = tryparse(Int, f[1]); ppid = tryparse(Int, f[2]); pc = tryparse(Float64, f[3])
-        (isnothing(pid) || isnothing(ppid) || isnothing(pc)) && continue
-        (pid == me || ppid == me) && continue        # us, and anything we spawned
-        pc >= _BUSY_PCPU && push!(busy, (pid, pc, String(f[4])))
+    for (pid, (ppid, c1)) in b
+        (pid == me || ppid == me) && continue          # us, and anything we spawned
+        haskey(a, pid) || continue                     # started mid-sample: no interval to measure
+        pc = (c1 - a[pid][2]) / dt * 100
+        pc >= _BUSY_PCPU || continue
+        args = try
+            replace(read(joinpath("/proc", string(pid), "cmdline"), String), '\0' => ' ')
+        catch
+            "?"
+        end
+        push!(busy, (pid, pc, strip(args)))
     end
     sort!(busy; by = x -> -x[2])
     return busy
