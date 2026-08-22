@@ -198,3 +198,26 @@ end
         end
     end
 end
+
+@testitem "chol_nb/chol_nc are structural, not tunable" tags = [:unit] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    # The fused Cholesky base kernel is HAND-UNROLLED for exactly four columns (d0..d3, l10..l32,
+    # indices c0..c0+3); the knob appears only as the guard `nb == _fh_chol_nb()`. Any other value does
+    # not run slower, it runs WRONG — measured 2026-08-22 on an oracle-confirmed PD matrix:
+    #   chol_nb=3  -> SILENTLY wrong, rel err 1.0e-01      chol_nb=1,2,8,16,32 -> PosDefException
+    #   chol_nc=2,3,8..128 -> SILENTLY wrong, 9.0e-02 .. 2.4e-01 (no exception at all)
+    # Both were `@load_preference` with a `tune: candidate` marker, so a pin silently corrupted every
+    # Cholesky in the process. They now validate at load and carry NO force hook.
+    @test P._CHOL_NB == 4
+    @test P._CHOL_NC == 4
+    @test P._fh_chol_nb() == 4
+    @test P._fh_chol_nc() == 4
+    # Not sweepable: a probe must not be able to reintroduce the corruption.
+    @test !haskey(P._FK, "chol_nb")
+    @test !haskey(P._FK, "chol_nc")
+    # And the shipped configuration factors correctly.
+    n = 256; A0 = randn(n, n); H = A0 * A0' + n * I
+    M = Matrix(H); P.potrf!(M; uplo = 'L'); L = tril(M)
+    @test norm(L * L' - H, Inf) / norm(H, Inf) < 1e-10
+end
