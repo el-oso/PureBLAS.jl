@@ -410,7 +410,7 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
     #   3. It is what galen already resolves for three of four eltypes.
     # The cost is bounded and one-sided: on wintermute F32/C32 (which resolved 24/20) the tiny-n direct
     # win is given up for n in 12..24. Pin `potrf_upper_direct_max` to recover it on a specific box.
-    @inline _potrf_udirect(::Type{<:Any}) = (f = _FKR_potrf_upper_direct_max[]; f >= 0 ? f : 12)   # req8-ok: documented-conservative cutoff, table above
+    @inline _potrf_udirect(::Type{<:Any}) = (f = _FKR_potrf_upper_direct_max[]; f >= 0 ? f : _at_potrf_udirect(_HW))
 else
     @inline _potrf_udirect(::Type{<:Any}) = _POTRF_UDIRECT_PREF::Int   # pinned (trim builds land here)
 end

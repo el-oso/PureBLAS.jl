@@ -335,6 +335,21 @@ const _GEMM_SPLIT_S = 2
 # Measured on all three boxes freq-locked and verified (see blas2/level2.jl for the table):
 #   datapath 32 (Zen3, Zen4-double-pumped) -> m-inner WINS  (gate 0.925 vs 0.901; 0.969 vs 0.953)
 #   datapath 64 (Zen5 native)              -> m-inner LOSES (n=512 0.916, n=1024 0.964)
+# potrf uplo='U' tiny-n DIRECT cutoff. The direct path keeps the upper triangle's columns live in
+# vector registers while factoring, so the register FILE sets how large n can get before it spills and
+# the blocked path wins. Hence `_NVREG`, not width or cache: it is a register-capacity crossover.
+# Measured with bench/calibrate.jl (stabilise + per-arm anchor + 8 rounds + `decide` requiring a CI
+# excluding 1.0 AND a 2% margin), each box freq-locked and verified, ratio vs the shipped 12:
+#   galen       nvreg=16  ->  8 0.990 | 16 0.988 | 20 0.946 | 24 0.860   => 12 (20 costs 5.4%)
+#   wintermute  nvreg=32  ->  8 0.979 | 16 1.004 | 20 1.068 | 24 1.016   => 20 (+6.8%)
+#   neuromancer nvreg=32  ->  8 0.982 | 16 1.002 | 20 1.082 | 24 1.001   => 20 (+8.2%)
+# Both 32-register boxes resolve 20 with a CI excluding 1.0; the 16-register box resolves 12 and would
+# LOSE 5.4% at 20 — so a flat 20 was not shippable and this is not a two-point fit.
+#
+# This knob's duel was DELETED in August as unresolvable ("20 / 16 / 18 / 12 — four different cutoffs
+# from one binary"). It was not unresolvable; the duel predated stabilise/anchor/decide.
+@inline _at_potrf_udirect(hw) = hw.nvreg >= 32 ? 20 : 12
+
 @inline _at_gemvn_minner(hw) = _datapath_bytes(hw) < 64
 
 @inline _at_strassen_min(hw) = _datapath_bytes(hw) >= 64 ? 256 : 1024

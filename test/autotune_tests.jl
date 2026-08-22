@@ -193,6 +193,35 @@
 # Live machine agrees with the formula applied to its own detected _HW.
 @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
 @test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
+# gemv-N m-inner: was an UNCONVERTED Measure-tier knob (a datapath-gated boolean the PDM ladder flags
+# as a violation) because the Zen5 negative justifying it had been measured at 4841 MHz against a
+# 2000 MHz base. Re-measured on all three boxes freq-locked and VERIFIED before/after, quiet: Zen3 and
+# Zen4 m-inner WINS (gate 0.925 vs 0.901; 0.969 vs 0.953), Zen5 LOSES (n=512 0.916, n=1024 0.964).
+# `_vwidth<8 || _double_pumped` IS `_datapath_bytes < 64` on every part, so it is spelled physically.
+# CAVEAT recorded in tuning.md: the Zen5 negative holds only at POWER-OF-TWO lda; at non-po2 sizes
+# m-inner wins there 8-21%, and the gate's L2SZ is entirely powers of two.
+@test P._at_gemvn_minner(galen)
+@test P._at_gemvn_minner(wintermute)
+@test !P._at_gemvn_minner(neuromancer)
+@test !P._at_gemvn_minner(tigerlake)      # native 512 too — a PREDICTION, never benchmarked
+@test P._at_gemvn_minner(P._HW) == (P._vwidth(Float64) < 8 || P._double_pumped(P._HW))
+
+# potrf uplo='U' tiny-n DIRECT cutoff: a REGISTER-CAPACITY crossover — the direct path holds the upper
+# triangle's columns live in vector registers, so the register FILE sets how large n gets before it
+# spills. Hence _NVREG, not width or cache. Calibrated per box (stabilise + anchor + 8 rounds +
+# `decide` needing a CI excluding 1.0 AND a 2% margin), freq-locked and verified:
+#   galen nvreg=16 -> 12   (20 costs -5.4%, 24 costs -14%)
+#   wintermute nvreg=32 -> 20 (+6.8%)      neuromancer nvreg=32 -> 20 (+8.2%)
+# The 16-register box actively LOSES at 20, so this is a real separation, not a two-point fit. Its duel
+# was deleted in August as unresolvable; it was not — the duel predated stabilise/anchor/decide.
+@test P._at_potrf_udirect(galen) == 12
+@test P._at_potrf_udirect(wintermute) == 20
+@test P._at_potrf_udirect(neuromancer) == 20
+@test P._at_potrf_udirect(tigerlake) == 20
+# NO live-machine equality assertion here, for the same reason the axpy pair above has none:
+# `test/Project.toml` pins `potrf_upper_direct_max = 12`, so under Pkg.test() the const reads 12 while
+# the formula says 20 on a 32-register box. A preference beating a default is the system working. The
+# formula itself is fully covered by the per-descriptor assertions above, which no pin can mask.
 end
 
 @testitem "trsm_base is clamped to the scratch it indexes" tags = [:unit] begin
