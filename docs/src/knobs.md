@@ -218,7 +218,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
 | `strassen_maxdepth` | literal | Literal | recursion depth cap; deeper trades flops for pack/add traffic. | candidate |
-| `strassen_min` | literal | Literal | split while min(m,n,k) >= this; measured, and the base stays >= ~min/2. | candidate |
+| `strassen_min` | literal | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 
 ## workspace
 
