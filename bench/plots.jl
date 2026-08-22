@@ -450,8 +450,29 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
 end
 
 const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
-const L2SZ = (64, 128, 256, 512, 1024, 2048, 4096)
-const L3SZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
+# n=1000 IS NOT DECORATION — it is the only non-power-of-two size in L2/L3, and it exists because
+# every other one aliases. A kernel running several concurrent column streams collides in one cache set
+# when `lda * sizeof(T)` is a multiple of the L1 way stride (4096 B on this whole fleet), and EVERY
+# power of two is. So a po2-only size list measures such kernels at their single pathological point, on
+# every box, uniformly — which produces no differential signal and hides the effect completely.
+# Concretely, measured 2026-08-22 on Zen5 gemv-N, m-inner arm vs the old path:
+#     511 wins 8.4% | 512 LOSES 8.8% | 513 flat | 1023 wins 10% | 1024 LOSES 5% | 1025 wins 8.5%
+#     2047 wins 21% | 2048 flat      | 2049 wins 20%
+# `gemvn_minner` is DISABLED on that box on the strength of the po2 column alone, while real callers —
+# who pass arbitrary n — would gain 8-21%. The same blind spot hid a hardcoded 8-way associativity in
+# `_L1_WAY_D` that switched off trsm/trmm de-aliasing on Zen5 entirely, and it is the reason the
+# potrf-upper and L3 syrk/trmm po2-lda findings were each stumbled into rather than measured.
+# 1000 is chosen because 1000*8 = 8000 B is NOT a multiple of 4096 (1536 would have been: 12288 B), and
+# it sits beside 1024 so the two are adjacent in every published table and plot.
+# n=100 COVERS A SECOND BLIND SPOT, distinct from aliasing: every other L2/L3 size is a multiple of
+# BOTH register-tile dimensions (mr = _MR*W = 16 or 8, nr = _NR = 8), so `_microkernel_masked!` — the
+# partial-tile path that exists solely for n not divisible by the tile — is never entered by the gate.
+# n=1000 does not fix that either (1000 % 8 == 0, so it masks m only). 100 % 16 = 4 and 100 % 8 = 4, so
+# it exercises BOTH m- and n-masking on every box, and 100*8 = 800 B is not a way-stride multiple.
+# Small AND non-po2 also means it lands in L1/L2, where per-call overhead and edge handling dominate —
+# the regime the large sizes cannot speak to.
+const L2SZ = (64, 100, 128, 256, 512, 1000, 1024, 2048, 4096)
+const L3SZ = (8, 32, 100, 128, 256, 512, 1000, 1024, 2048, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
 const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations, to 4096
 # Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
 # the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
