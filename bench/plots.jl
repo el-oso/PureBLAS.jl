@@ -1990,6 +1990,11 @@ else
     end
     println("wrote provenance$L.md")
 end
+# Per-cell anchor agreement required before a cross-run ratio is believed. 2% is the band the fleet's
+# own cached arms sit in (60-67% of cells on 2026-08-22); above it the pb and reference arms saw
+# different machine state and the ratio between them is not a measurement of the code.
+const _ADJ_TOL = 0.02
+
 # Gate summary for THIS host. v3 holds every arm in one cache, so this is the FIRST version that can
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of
 # eyeballing two separately-measured tables. `gate` is the worst over cells of min over references,
@@ -2003,14 +2008,40 @@ for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in 
     end
     isempty(per) && continue
     # worst cell against the FASTER reference at that cell = the gate margin
-    gate = Inf
-    for (_, cell) in cells
+    gate = Inf; gate_sz = 0; gate_adj = true; nnadj = 0
+    for (sz, cell) in cells
         haskey(cell, _ARM_PB) || continue
-        rs = [median(_ratio(cell[r].q, cell[_ARM_PB].q)) for r in _REF_ALL if haskey(cell, r)]
-        isempty(rs) || (gate = min(gate, minimum(rs)))
+        rs = Tuple{Float64, Bool}[]
+        for r in _REF_ALL
+            haskey(cell, r) || continue
+            # PER-CELL adjudicability: compare THIS cell's pb anchor against THIS cell's reference
+            # anchor. The run-level drift warning further down reports the WORST cell in the whole
+            # cache and tars every other cell with it — on 2026-08-22 Zen5 reported 25.2% drift driven
+            # solely by axpy@1e6, while two thirds of the cache sat under 2%. Reading that global
+            # figure instead of the per-cell one turned two ordinary cells into phantom regressions
+            # (trtrs 0.94->0.87, zgemvC 0.94->0.87); re-measured same-run they were 0.95 and 0.91, and
+            # an afternoon went into "diagnosing" them. Hence the standing rule "per-cell anchor, not
+            # run drift" — enforced in the output here rather than left to be remembered.
+            ap = cell[_ARM_PB].anchor; ar = cell[r].anchor
+            ok = !(isnan(ap) || isnan(ar)) && abs(ap / ar - 1) <= _ADJ_TOL
+            push!(rs, (median(_ratio(cell[r].q, cell[_ARM_PB].q)), ok))
+        end
+        isempty(rs) && continue
+        any(x -> !x[2], rs) && (nnadj += 1)
+        i = argmin(first.(rs))
+        if first(rs[i]) < gate
+            gate = first(rs[i]); gate_sz = sz; gate_adj = last(rs[i])
+        end
     end
     txt = join((@sprintf("%s %.2f/%.2f", r, per[r][1], per[r][2]) for r in _REF_ALL if haskey(per, r)), "  ")
-    @printf("%-3s %-8s %s   gate=%.3f %s\n", lvl, nm, txt, gate, gate_pass(gate) ? "PASS" : "FAIL")
+    # A verdict resting on a cell whose two arms saw different machine state is not a verdict. Say so
+    # ON the line that carries it, not in a footnote about some other cell.
+    flag = gate_adj ? "" :
+        @sprintf("  [BINDING CELL n=%d NOT ADJUDICABLE: anchors differ >%.0f%% — re-measure `op=%s` in ONE run]",
+                 gate_sz, 100 * _ADJ_TOL, nm)
+    note = (nnadj > 0 && gate_adj) ? @sprintf("  (%d non-adjudicable cell(s), not binding)", nnadj) : ""
+    @printf("%-3s %-8s %s   gate=%.3f %s%s%s\n", lvl, nm, txt, gate,
+            gate_pass(gate) ? "PASS" : "FAIL", flag, note)
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"
 
