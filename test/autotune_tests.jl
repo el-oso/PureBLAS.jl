@@ -246,3 +246,14 @@ end
     M = Matrix(H); P.potrf!(M; uplo = 'L'); L = tril(M)
     @test norm(L * L' - H, Inf) / norm(H, Inf) < 1e-10
 end
+
+@testitem "generated-meta lint: Vec-taking @generated helpers carry the inline meta" tags = [:unit] begin
+    include(joinpath(@__DIR__, "generated_meta_lint.jl"))
+    v = generated_meta_scan()
+    isempty(v) || @error "A @generated helper takes/returns a Vec without emitting Expr(:meta, :inline). \
+        `@inline` does NOT propagate into @generated CodeInfo (Julia 1.12), so the Vec is passed BY \
+        POINTER and the CALLER's accumulators are stack-demoted — the failure that cost zgemvC \
+        0.26-0.64 vs OpenBLAS. Emit `\$(Expr(:meta, :inline))` as the first statement of the returned \
+        body." offenders = v
+    @test isempty(v)
+end
