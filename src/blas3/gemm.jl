@@ -1365,8 +1365,13 @@ const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # misses fleet-wide (so this buys margin, not a rescue), with Zen5 unmeasured — and [[152]] is the
 # standing precedent that a 3M-family threshold INVERTED on AVX-512 and lost 21-29%. Shipping a
 # Zen4-shaped default into an unmeasured Zen5 is how that regression happened.
-# Revisit only with a Zen5 arm; if 512 wins there too, the honest form is a µarch-keyed derivation, not
-# a flat literal.
+# AND IT DOES NOT REPRODUCE. A second correctness-checked probe run on the SAME box (wintermute, same
+# probe, same shapes, hours apart) read n=512 -> 1.0022 and n=1024/n=2048 -> best = SHIPPED (1.0000),
+# against the first run's 1.0230 / 1.0235. Same silicon, opposite verdict: the "+2.3%" was run-to-run
+# variation, not an effect. Two runs disagreeing on one box is worth more than either run alone, and it
+# is why a single sweep must never move a default.
+# Revisit only with a Zen5 arm AND a repeat that reproduces; if 512 wins there too, the honest form is a
+# µarch-keyed derivation, not a flat literal.
 # PDM: Literal — split while min(m,n,k) >= this; the base stays >= ~min/2. | tune: 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above)
 const _STRASSEN_MIN = @load_preference("strassen_min", 1024)::Int      # split while min(m,n,k) ≥ this
 @inline _fh_strassen_min() = (f = _FKR_strassen_min[]; f >= 0 ? f : _STRASSEN_MIN)
