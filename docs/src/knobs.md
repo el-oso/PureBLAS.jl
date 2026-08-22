@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 62 Derived · 10 Measured · 48 Literal · 8 Exempt.
+**Tier:** 62 Derived · 10 Measured · 46 Literal · 10 Exempt.
 **Default form** (mechanical): 54 formula · 20 delegates · 6 sibling · 43 literal · 4 flag · 1 other.
 
 
@@ -155,8 +155,8 @@ Every `@load_preference` key in `src/` — 128 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `chol_base_split` | formula | Derived | formula over detected consts: `_INTEL_AVX2` | — |
-| `chol_nb` | literal | Literal | trsm panel width, measured µarch-invariant; confirm on the fleet before deriving. | candidate |
-| `chol_nc` | literal | Literal | syrk column block, same status as chol_nb. | candidate |
+| `chol_nb` | literal | Exempt | structural: hand-unrolled 4-column register tile, not a tuning size. | n/a — only 4 is correct |
+| `chol_nc` | literal | Exempt | structural: hand-unrolled 4-column register tile, not a tuning size. | n/a — only 4 is correct |
 | `cpotf2_mr` | formula | Derived | formula over detected consts: `_at_cpotf2_mr(_HW)` | — |
 | `cpotrf_base` | formula | Derived | 32 + 4*lanes: a width-independent overhead floor plus a per-lane slope. | n/a |
 | `cpotrf_nbmax` | formula | Derived | formula over detected consts: `_at_cpotrf_nbmax(_HW)` | — |

@@ -531,9 +531,28 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # their accumulators fit the register file on every ISA, and the small Cholesky base does not benefit from a
 # wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
 # across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
-# PDM: Literal — trsm panel width, measured µarch-invariant; confirm on the fleet before deriving. | tune: candidate
+# NOT TUNABLE — STRUCTURAL, AND VALIDATED. The fused base kernel below is HAND-UNROLLED for exactly four
+# columns (d0..d3, l10..l32, indices c0..c0+3); `_fh_chol_nb()` appears only as the guard
+# `nb == _fh_chol_nb()`. So any other value does not run slower, it runs WRONG:
+#     chol_nb = 1, 2, 8, 16, 32  -> PosDefException
+#     chol_nb = 3                -> SILENTLY WRONG, rel err 1.0e-01   <-- no exception at all
+#     chol_nb = 4                -> rel err 1.5e-15
+# (measured 2026-08-22, n=256, oracle-confirmed PD input; same on Zen3 and Zen4.)
+# nb=3 passes the guard and the body then reads c0+3, one column past intent; nb=8 passes the guard and
+# leaves four columns unfactored, surfacing later as a PosDefException far from the cause.
+#
+# It was exposed as a `@load_preference` while its own comment already said "proven-invariant Exempt" —
+# the marker said Literal/tune-candidate and contradicted the prose. A preference with exactly one legal
+# value is not a knob, it is a footgun: pinning chol_nb=3 silently corrupts every Cholesky in the
+# process. The preference is KEPT (removing it would break an existing LocalPreferences) but now fails
+# LOUDLY at load, naming itself, instead of corrupting results.
+# PDM: Exempt — structural: hand-unrolled 4-column register tile, not a tuning size. | tune: n/a — only 4 is correct
 const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
-@inline _fh_chol_nb() = (f = _FKR_chol_nb[]; f >= 0 ? f : _CHOL_NB)
+_CHOL_NB == 4 || throw(ArgumentError(
+    "PureBLAS: preference `chol_nb` = $_CHOL_NB is not supported — the fused Cholesky base kernel is " *
+    "hand-unrolled for exactly 4 columns, and any other value silently produces a WRONG factorization " *
+    "(or a misleading PosDefException). Remove the `chol_nb` pin from LocalPreferences.toml."))
+@inline _fh_chol_nb() = _CHOL_NB   # NO force hook: structural, not tunable — a sweep must not corrupt it
 # Live vector count of the fused side-R leaf's top tier (`_trsm_rl_split_f64!` below): MR=3 row-tiers ×
 # _CHOL_NB column accumulators, plus the _CHOL_NB T-vectors and the diagonal/broadcast pair. Compared
 # against `_NVREG` this says whether that leaf SPILLS on this box — 3*4+4+2 = 18, over AVX2's 16 ymm and
@@ -543,9 +562,24 @@ const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block
 # consts, not a µarch literal. Lives here, not in level3.jl, because `_CHOL_NB` is defined in this file
 # and level3.jl is included FIRST (PureBLAS.jl:20-21), so a const there cannot see it.
 const _RL_MR_LIVE = 3 * _CHOL_NB + _CHOL_NB + 2
-# PDM: Literal — syrk column block, same status as chol_nb. | tune: candidate
+# NOT TUNABLE — STRUCTURAL, and WORSE THAN chol_nb: every non-default value returns a silently wrong
+# factorization rather than throwing. Same hand-unrolled register tile, same guard-only use.
+#     chol_nc = 2, 3, 8, 16, 32, 64, 128 -> WRONG, rel err 9.0e-02 .. 2.4e-01, NO exception
+#     chol_nc = 1                        -> PosDefException
+#     chol_nc = 4                        -> rel err 1.2e-15
+# (measured 2026-08-22, n=256, oracle-confirmed PD input.)
+#
+# THIS IS ALSO WHY A PERF SWEEP MUST CHECK CORRECTNESS. bench/probes/knob_bulk_sweep.jl timed chol_nc at
+# 16/32/64/128 and reported 1.12x / 1.35x / 1.63x "wins" on Zen4. Those arms were not faster kernels —
+# they were the WRONG kernel, fast because it was not doing the work. `Measure.ab` takes a `check`
+# argument; not passing one is what let a corrupted arm be published as the campaign's biggest speedup.
+# PDM: Exempt — structural: hand-unrolled 4-column register tile, not a tuning size. | tune: n/a — only 4 is correct
 const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
-@inline _fh_chol_nc() = (f = _FKR_chol_nc[]; f >= 0 ? f : _CHOL_NC)
+_CHOL_NC == 4 || throw(ArgumentError(
+    "PureBLAS: preference `chol_nc` = $_CHOL_NC is not supported — the fused Cholesky base kernel is " *
+    "hand-unrolled for exactly 4 columns, and any other value SILENTLY produces a wrong factorization. " *
+    "Remove the `chol_nc` pin from LocalPreferences.toml."))
+@inline _fh_chol_nc() = _CHOL_NC   # NO force hook: structural, not tunable — a sweep must not corrupt it
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
