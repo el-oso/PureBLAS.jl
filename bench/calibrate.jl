@@ -78,8 +78,8 @@ function calibrate_ger_np(::Type{T} = Float64) where {T}
         return Pair{String, Any}[]
     end
     name, verdict = decide(res; delta = 0.02)
-    if verdict === :tie
-        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    if verdict !== :win
+        println(noswitch_msg(verdict))
         return Pair{String, Any}[]
     end
     @printf("    ⇒ WINNER np=%d\n", name)
@@ -192,8 +192,8 @@ function calibrate_potrf_udirect(::Type{T} = Float64) where {T}
 # Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
 # the in-code default stands. That is the whole safety property for a knob like this one, whose own
 # history is four different answers from one binary.
-if verdict === :tie
-    println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+if verdict !== :win
+    println(noswitch_msg(verdict))
     return Pair{String, Any}[]
 end
 @printf("    ⇒ WINNER cutoff=%s\n", name)
@@ -231,8 +231,8 @@ function calibrate_sytrf_cmult(::Type{T} = ComplexF64) where {T}
 # Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
 # the in-code default stands. That is the whole safety property for a knob like this one, whose own
 # history is four different answers from one binary.
-if verdict === :tie
-    println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+if verdict !== :win
+    println(noswitch_msg(verdict))
     return Pair{String, Any}[]
 end
 @printf("    ⇒ WINNER cmult=%s\n", name)
@@ -265,8 +265,8 @@ function calibrate_gemvt_pf(::Type{T} = Float64) where {T}
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
     name, verdict = decide(res; delta = 0.02)
-    if verdict === :tie
-        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    if verdict !== :win
+        println(noswitch_msg(verdict))
         return Pair{String, Any}[]
     end
     @printf("    ⇒ WINNER pf=%s\n", name)
@@ -300,8 +300,8 @@ function calibrate_trmv_fused_min(::Type{T} = Float64) where {T}
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
     name, verdict = decide(res; delta = 0.02)
-    if verdict === :tie
-        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    if verdict !== :win
+        println(noswitch_msg(verdict))
         return Pair{String, Any}[]
     end
     @printf("    ⇒ WINNER trmv_fused_min=%s\n", name)
@@ -341,8 +341,8 @@ function calibrate_gbtrf_cmult(::Type{T} = Float64) where {T}
         @printf("    cmult=%-3s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
     name, verdict = decide(res; delta = 0.02)
-    if verdict === :tie
-        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+    if verdict !== :win
+        println(noswitch_msg(verdict))
         return Pair{String, Any}[]
     end
     @printf("    ⇒ WINNER cmult=%s\n", name)

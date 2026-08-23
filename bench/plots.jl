@@ -17,6 +17,7 @@
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
+include(joinpath(@__DIR__, "freqlock.jl")); using .FreqLock   # THE frequency-lock criterion
 using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
 # Reference BLAS: OpenBLAS (default), Intel MKL (`mkl` arg), or AMD AOCL (`aocl` arg). Each package
@@ -1436,6 +1437,12 @@ function _achieved_khz()
     return best
 end
 
+# LOCK STATE lives in bench/freqlock.jl — THE single source of truth, shared with the calibrator.
+# `base=`/`boost=` in the header make `freq=` self-interpreting: freq/base ~ 1.0 is a locked run and a
+# ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its base clock.
+_lock_state() = FreqLock.lock_state()
+_require_lock() = FreqLock.require_lock(what = "measure a gate sweep")
+
 # CONTENTION GUARD — refuse to start a gate sweep on a box that is already busy.
 #
 # The gate is a PB/OB ratio measured in two adjacent windows on one core. A foreign job saturating
@@ -1527,6 +1534,23 @@ function _contention_check()
         $(gethostname()). A contended L3/memory controller skews the PB and reference windows \
         unequally and the run would have to be discarded.\n$(_busy_msg(busy))\nWait for the box, or pass \
         `force-busy` to measure anyway. Do NOT pattern-kill — kill only PIDs you launched.")
+end
+
+# The lock's EXIT check, mirroring the contention pair above. A start-only guard is not enough: on
+# 2026-08-23 a Zen5 sweep began under a valid lock and the lock came off DURING the run, so every cell
+# after that point was invalid while the run reported nothing. Re-reading the state at exit and
+# comparing it to the state at entry turns "not my fault" into "detected and recorded".
+_LOCK_AT_START = (0, 0, -1)
+_LOCK_CHANGED = ""
+function _lock_exit_check()
+    now = _lock_state()
+    now == _LOCK_AT_START && return nothing
+    global _LOCK_CHANGED = "start=$(_LOCK_AT_START)->end=$(now)"
+    @warn "FREQUENCY LOCK CHANGED DURING THE RUN — it was valid at the start, so this happened mid \
+        measurement. Every cell this run touched is INVALID by the frequency methodology; discard them \
+        and re-measure after `sudo bench/fleet_freqlock.sh lock`. The cache header records it as \
+        `lockchg=`.\n  $(_LOCK_CHANGED)"
+    return nothing
 end
 
 # Set by the exit check, stamped into the cache header so a contended run is self-identifying.
@@ -1680,7 +1704,12 @@ function save_cache(path, groups)
             # the one case that REQUIRES re-measuring both arms instead of `arms=pb`.
             "\tjulia=$(VERSION)\tllvm=$(Base.libllvm_version)\tob=$(_obversion())",
             "\thw=$(_hwstamp())\ttune=$(_tunestamp())",
+            # `base=`/`boost=` make `freq=` self-interpreting: freq/base ~ 1.0 is a locked run, and a
+            # ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its
+            # base clock. See `_lock_state`.
             "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
+            (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
+            isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)"
         )
         # v3 record: ONE LINE PER CELL, one field per measured arm, each carrying its own timestamp and
@@ -1929,10 +1958,13 @@ if "plot" in ARGS
 elseif !("bench" in ARGS) && isfile(CACHE)
     g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
+    _require_lock()        # an off-lock run is INVALID, not merely noisy — refuse at second zero
+    global _LOCK_AT_START = _lock_state()
     _contention_check()
     _pref_check()          # pins are legitimate; not KNOWING about them is not
     l1, l2, l3, lp = run_benchmarks()
     cl1, cl2, cl3, clp = run_cmplx_benchmarks()
+    _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
