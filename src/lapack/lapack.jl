@@ -139,14 +139,19 @@ function _cpotf2_lower!(A::AbstractMatrix{Tc}, n::Int) where {Tc <: BlasComplex}
                 end
                 vstore(_intlv_cmplx(ar, ai), base); i += W
             end
-            while i <= n                                                # scalar tail
-                sr = unsafe_load(cx(i, j)); si = unsafe_load(cx(i, j) + sz)
+            if i <= n                                                   # MASKED tail — the W-block body, one pass
+                # 2W REAL lanes carry W complex rows, so the mask is per-lane complex INDEX
+                # (1,1,2,2,…,W,W) — the `clane` idiom from simd_kernels.jl. Inactive lanes are never
+                # accessed, so the interleaved load cannot run off the end of the column.
+                msk = Vec(ntuple(l -> (l + 1) >> 1, Val(2W))) <= (n - i + 1)
+                base = cx(i, j); (ar, ai) = _deint_cmplx(vload(V2, base, msk))
                 for k in 1:(j - 1)
-                    l = cx(j, k); jr = unsafe_load(l); ji = unsafe_load(l + sz)
-                    vr = unsafe_load(cx(i, k)); vi = unsafe_load(cx(i, k) + sz)
-                    sr -= vr * jr + vi * ji; si -= vi * jr - vr * ji
+                    l = cx(j, k); sr = V(unsafe_load(l)); si = V(unsafe_load(l + sz))   # L[j,k]
+                    (vr, vi) = _deint_cmplx(vload(V2, cx(i, k), msk))    # -v·conj(L[j,k])
+                    ar = muladd(vr, -sr, ar); ar = muladd(vi, -si, ar)
+                    ai = muladd(vi, -sr, ai); ai = muladd(vr, si, ai)
                 end
-                unsafe_store!(cx(i, j), sr); unsafe_store!(cx(i, j) + sz, si); i += 1
+                vstore(_intlv_cmplx(ar, ai), base, msk)
             end
             d = unsafe_load(cx(j, j))                                    # diagonal is real (Hermitian)
             d > 0 || return j                       # failing column, LOCAL to this block; 0 = success
@@ -636,12 +641,13 @@ function _chol_base_f64!(p::Ptr{T}, n::Int, ld::Int) where {T}
             end
             vstore(acc, base); i += W
         end
-        while i <= n
-            s = unsafe_load(p, _clidx(i, j, ld))
+        if i <= n                                          # MASKED tail — the MR=1 body, one pass
+            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i + 1)   # inactive lanes are never accessed (no OOB)
+            base = _cvptr(p, i, j, ld); acc = vload(V, base, msk)
             for k in 1:(j - 1)
-                s = muladd(-unsafe_load(p, _clidx(j, k, ld)), unsafe_load(p, _clidx(i, k, ld)), s)
+                acc = muladd(V(-unsafe_load(p, _clidx(j, k, ld))), vload(V, _cvptr(p, i, k, ld), msk), acc)
             end
-            unsafe_store!(p, s, _clidx(i, j, ld)); i += 1
+            vstore(acc, base, msk)
         end
         d = unsafe_load(p, _clidx(j, j, ld))
         (d > 0) || return j                                # failing column (1-based, local); 0 ⇒ success
@@ -738,25 +744,36 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
                 vstore(a0, _cvptr(p10, i, c0, ld)); vstore(a1, _cvptr(p10, i, c0 + 1, ld)); vstore(a2, _cvptr(p10, i, c0 + 2, ld)); vstore(a3, _cvptr(p10, i, c0 + 3, ld))
                 i += W
             end
-            while i <= m                                  # scalar tail (<W rows)
-                for dj in 0:(_fh_chol_nb() - 1)
-                    cc = c0 + dj; s = unsafe_load(p10, _clidx(i, cc, ld))
-                    for k in 1:(cc - 1)
-                        s = muladd(-unsafe_load(p00, _clidx(cc, k, ld)), unsafe_load(p10, _clidx(i, k, ld)), s)
-                    end
-                    unsafe_store!(p10, s / unsafe_load(p00, _clidx(cc, cc, ld)), _clidx(i, cc, ld))
+            if i <= m                                 # MASKED tail (<W rows) — the MR=1 body, one pass
+                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
+                a0 = vload(V, _cvptr(p10, i, c0, ld), msk);     a1 = vload(V, _cvptr(p10, i, c0 + 1, ld), msk)
+                a2 = vload(V, _cvptr(p10, i, c0 + 2, ld), msk); a3 = vload(V, _cvptr(p10, i, c0 + 3, ld), msk)
+                for k in 1:(c0 - 1)
+                    v0 = vload(V, _cvptr(p10, i, k, ld), msk)
+                    a0 = muladd(V(-unsafe_load(p00, _clidx(c0, k, ld))), v0, a0)
+                    a1 = muladd(V(-unsafe_load(p00, _clidx(c0 + 1, k, ld))), v0, a1)
+                    a2 = muladd(V(-unsafe_load(p00, _clidx(c0 + 2, k, ld))), v0, a2)
+                    a3 = muladd(V(-unsafe_load(p00, _clidx(c0 + 3, k, ld))), v0, a3)
                 end
-                i += 1
+                a0 *= vd0
+                a1 = muladd(vl10, a0, a1); a1 *= vd1
+                a2 = muladd(vl20, a0, a2); a2 = muladd(vl21, a1, a2); a2 *= vd2
+                a3 = muladd(vl30, a0, a3); a3 = muladd(vl31, a1, a3); a3 = muladd(vl32, a2, a3); a3 *= vd3
+                vstore(a0, _cvptr(p10, i, c0, ld), msk);     vstore(a1, _cvptr(p10, i, c0 + 1, ld), msk)
+                vstore(a2, _cvptr(p10, i, c0 + 2, ld), msk); vstore(a3, _cvptr(p10, i, c0 + 3, ld), msk)
             end
-        else                                              # nb<4 remainder (rare — bs is a mult of 4 in rl32)
-            for i in 1:m
+        else                                              # nb<4 remainder, masked over ROWS
+            i = 1
+            while i <= m
+                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
                 for dj in 0:(nb - 1)
-                    cc = c0 + dj; s = unsafe_load(p10, _clidx(i, cc, ld))
+                    cc = c0 + dj; s = vload(V, _cvptr(p10, i, cc, ld), msk)
                     for k in 1:(cc - 1)
-                        s = muladd(-unsafe_load(p00, _clidx(cc, k, ld)), unsafe_load(p10, _clidx(i, k, ld)), s)
+                        s = muladd(V(-unsafe_load(p00, _clidx(cc, k, ld))), vload(V, _cvptr(p10, i, k, ld), msk), s)
                     end
-                    unsafe_store!(p10, s / unsafe_load(p00, _clidx(cc, cc, ld)), _clidx(i, cc, ld))
+                    vstore(s / V(unsafe_load(p00, _clidx(cc, cc, ld))), _cvptr(p10, i, cc, ld), msk)
                 end
+                i += W
             end
         end
         c0 += _fh_chol_nb()
@@ -775,13 +792,15 @@ end
         end
         vstore(a, b); i += W
     end
-    return @inbounds while i <= m
-        s = unsafe_load(p11, _clidx(i, j, ld))
+    @inbounds if i <= m                              # MASKED tail — the body above, one pass
+        msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
+        b = _cvptr(p11, i, j, ld); a = vload(V, b, msk)
         for c in 1:bs
-            s = muladd(-unsafe_load(p10, _clidx(j, c, ld)), unsafe_load(p10, _clidx(i, c, ld)), s)
+            a = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), vload(V, _cvptr(p10, i, c, ld), msk), a)
         end
-        unsafe_store!(p11, s, _clidx(i, j, ld)); i += 1
+        vstore(a, b, msk)
     end
+    return nothing
 end
 
 # trailing symmetric rank-bs update A11 (m×m) −= L10·L10ᵀ. Register-blocked MR rows × NC cols.
@@ -851,15 +870,20 @@ function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) wh
             end
             vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
         end
-        while i <= m
-            for dj in 0:(_fh_chol_nc() - 1)
-                s = unsafe_load(p11, _clidx(i, j + dj, ld))
-                for c in 1:bs
-                    s = muladd(-unsafe_load(p10, _clidx(j + dj, c, ld)), unsafe_load(p10, _clidx(i, c, ld)), s)
-                end
-                unsafe_store!(p11, s, _clidx(i, j + dj, ld))
+        if i <= m                                        # MASKED tail — the MR=1 body, one pass
+            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
+            b0 = _cvptr(p11, i, j, ld);     a0 = vload(V, b0, msk)
+            b1 = _cvptr(p11, i, j + 1, ld); a1 = vload(V, b1, msk)
+            b2 = _cvptr(p11, i, j + 2, ld); a2 = vload(V, b2, msk)
+            b3 = _cvptr(p11, i, j + 3, ld); a3 = vload(V, b3, msk)
+            for c in 1:bs
+                lic = vload(V, _cvptr(p10, i, c, ld), msk)
+                a0 = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), lic, a0)
+                a1 = muladd(V(-unsafe_load(p10, _clidx(j + 1, c, ld))), lic, a1)
+                a2 = muladd(V(-unsafe_load(p10, _clidx(j + 2, c, ld))), lic, a2)
+                a3 = muladd(V(-unsafe_load(p10, _clidx(j + 3, c, ld))), lic, a3)
             end
-            i += 1
+            vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
         end
         j += _fh_chol_nc()
     end
@@ -1068,25 +1092,36 @@ end
                 vstore(a2, _cvptr(pT, i, c0 + 2, ldt)); vstore(a3, _cvptr(pT, i, c0 + 3, ldt))
                 i += W
             end
-            while i <= m                                          # scalar tail (<W rows), fused
-                for dj in 0:(_fh_chol_nb() - 1)
-                    cc = c0 + dj; s = unsafe_load(psrc, _clidx(i, cc, lds))
-                    for k in 1:(cc - 1)
-                        s = muladd(-unsafe_load(p00, _clidx(cc, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
-                    end
-                    unsafe_store!(pT, s / unsafe_load(p00, _clidx(cc, cc, ld0)), _clidx(i, cc, ldt))
+            if i <= m                                        # MASKED tail (<W rows) — the MR=1 body, one pass
+                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)          # inactive lanes are never accessed (no OOB)
+                a0 = vload(V, _cvptr(psrc, i, c0, lds), msk);     a1 = vload(V, _cvptr(psrc, i, c0 + 1, lds), msk)
+                a2 = vload(V, _cvptr(psrc, i, c0 + 2, lds), msk); a3 = vload(V, _cvptr(psrc, i, c0 + 3, lds), msk)
+                for k in 1:(c0 - 1)
+                    vk = vload(V, _cvptr(pT, i, k, ldt), msk)
+                    a0 = muladd(V(-unsafe_load(p00, _clidx(c0, k, ld0))), vk, a0)
+                    a1 = muladd(V(-unsafe_load(p00, _clidx(c0 + 1, k, ld0))), vk, a1)
+                    a2 = muladd(V(-unsafe_load(p00, _clidx(c0 + 2, k, ld0))), vk, a2)
+                    a3 = muladd(V(-unsafe_load(p00, _clidx(c0 + 3, k, ld0))), vk, a3)
                 end
-                i += 1
+                a0 *= vd0
+                a1 = muladd(vl10, a0, a1); a1 *= vd1
+                a2 = muladd(vl20, a0, a2); a2 = muladd(vl21, a1, a2); a2 *= vd2
+                a3 = muladd(vl30, a0, a3); a3 = muladd(vl31, a1, a3); a3 = muladd(vl32, a2, a3); a3 *= vd3
+                vstore(a0, _cvptr(pT, i, c0, ldt), msk);     vstore(a1, _cvptr(pT, i, c0 + 1, ldt), msk)
+                vstore(a2, _cvptr(pT, i, c0 + 2, ldt), msk); vstore(a3, _cvptr(pT, i, c0 + 3, ldt), msk)
             end
         else
-            for i in 1:m                                          # nb<4 remainder (rare — bs mult of 4 in rl32)
+            i = 1
+            while i <= m                                          # nb<4 remainder, masked over ROWS
+                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
                 for dj in 0:(nb - 1)
-                    cc = c0 + dj; s = unsafe_load(psrc, _clidx(i, cc, lds))
+                    cc = c0 + dj; s = vload(V, _cvptr(psrc, i, cc, lds), msk)
                     for k in 1:(cc - 1)
-                        s = muladd(-unsafe_load(p00, _clidx(cc, k, ld0)), unsafe_load(pT, _clidx(i, k, ldt)), s)
+                        s = muladd(V(-unsafe_load(p00, _clidx(cc, k, ld0))), vload(V, _cvptr(pT, i, k, ldt), msk), s)
                     end
-                    unsafe_store!(pT, s / unsafe_load(p00, _clidx(cc, cc, ld0)), _clidx(i, cc, ldt))
+                    vstore(s / V(unsafe_load(p00, _clidx(cc, cc, ld0))), _cvptr(pT, i, cc, ldt), msk)
                 end
+                i += W
             end
         end
         c0 += _fh_chol_nb()
@@ -1105,13 +1140,15 @@ end
         end
         vstore(a, b); i += W
     end
-    return @inbounds while i <= m
-        s = unsafe_load(p11, _clidx(i, j, ld1))
+    @inbounds if i <= m                              # MASKED tail — the body above, one pass
+        msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
+        b = _cvptr(p11, i, j, ld1); a = vload(V, b, msk)
         for c in 1:bs
-            s = muladd(-unsafe_load(pT, _clidx(j, c, ldt)), unsafe_load(pT, _clidx(i, c, ldt)), s)
+            a = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), vload(V, _cvptr(pT, i, c, ldt), msk), a)
         end
-        unsafe_store!(p11, s, _clidx(i, j, ld1)); i += 1
+        vstore(a, b, msk)
     end
+    return nothing
 end
 
 # Split-ld faer trailing update: A11 (m×m at ld1, po2 is fine — registers carry the RMW across the
@@ -1186,15 +1223,20 @@ end
             end
             vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
         end
-        while i <= m
-            for dj in 0:(_fh_chol_nc() - 1)
-                s = unsafe_load(p11, _clidx(i, j + dj, ld1))
-                for c in 1:bs
-                    s = muladd(-unsafe_load(pT, _clidx(j + dj, c, ldt)), unsafe_load(pT, _clidx(i, c, ldt)), s)
-                end
-                unsafe_store!(p11, s, _clidx(i, j + dj, ld1))
+        if i <= m                                        # MASKED tail — the MR=1 body, one pass
+            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
+            b0 = _cvptr(p11, i, j, ld1);     a0 = vload(V, b0, msk)
+            b1 = _cvptr(p11, i, j + 1, ld1); a1 = vload(V, b1, msk)
+            b2 = _cvptr(p11, i, j + 2, ld1); a2 = vload(V, b2, msk)
+            b3 = _cvptr(p11, i, j + 3, ld1); a3 = vload(V, b3, msk)
+            for c in 1:bs
+                lic = vload(V, _cvptr(pT, i, c, ldt), msk)
+                a0 = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), lic, a0)
+                a1 = muladd(V(-unsafe_load(pT, _clidx(j + 1, c, ldt))), lic, a1)
+                a2 = muladd(V(-unsafe_load(pT, _clidx(j + 2, c, ldt))), lic, a2)
+                a3 = muladd(V(-unsafe_load(pT, _clidx(j + 3, c, ldt))), lic, a3)
             end
-            i += 1
+            vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
         end
         j += _fh_chol_nc()
     end
