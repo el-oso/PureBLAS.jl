@@ -80,4 +80,36 @@ function require_lock(; what::AbstractString = "measure")
         Override for a non-gate exploration only: PUREBLAS_BENCH_NOLOCK=1.""")
 end
 
+"""
+    check_achieved(khz; tol = 0.05, what = "measure")
+
+THE PIN IS NOT THE CLOCK. `lock_state` reads what the kernel was ASKED for. On a box whose pstate
+driver has drifted — a suspend/resume cycle on a laptop is enough — `scaling_min_freq ==
+scaling_max_freq == base` and `boost == 0` can all read perfectly while the core actually runs in
+the boost range.
+
+neuromancer did exactly that on 2026-08-23: pin 2000000, boost 0, and every cell of a ztrsmR run
+stamped ~4.8 GHz while its cached reference arms were taken at 1.98 GHz. The 2.43x clock ratio
+turned a 0.785 cell into 2.209 and an honest 1.23 into 2.88 — i.e. it would have published a
+uniform ~2.4x "win" across every size of the op. Nothing about the shape of that result looks like
+a kernel change, which is the only reason it was caught.
+
+`fleet_freqlock.sh lock` verifies the ACHIEVED frequency under load for precisely this reason, so a
+guard that only reads the pin inherits the entire failure mode it was written to prevent. Call this
+AFTER a load-bearing workload (the anchor), passing the achieved kHz.
+"""
+function check_achieved(khz::Integer; tol::Real = 0.05, what::AbstractString = "measure")
+    get(ENV, "PUREBLAS_BENCH_NOLOCK", "") == "1" && return nothing
+    (_, hi, _) = lock_state()
+    (hi == 0 || khz <= 0) && return nothing            # no cpufreq, or nothing sampled
+    khz <= hi * (1 + tol) && return nothing
+    over = round(100 * (khz / hi - 1); digits = 1)
+    error("""
+        REFUSING to $what: the core is running ABOVE the frequency it is pinned to.
+          achieved $(khz ÷ 1000) MHz under load vs a $(hi ÷ 1000) MHz ceiling ($over% over)
+        The pin reads correct but the hardware is ignoring it — the pstate driver has drifted.
+        Re-run `sudo bench/fleet_freqlock.sh lock` and confirm its verify step passes UNDER LOAD
+        before measuring anything. Ratios taken in this state divide two different machines.""")
+end
+
 end # module

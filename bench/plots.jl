@@ -1540,6 +1540,9 @@ end
 # 2026-08-23 a Zen5 sweep began under a valid lock and the lock came off DURING the run, so every cell
 # after that point was invalid while the run reported nothing. Re-reading the state at exit and
 # comparing it to the state at entry turns "not my fault" into "detected and recorded".
+# set on the measure path only: a plot-only render must never refuse on the live clock, since it is
+# reporting cells measured earlier under whatever state THEY record.
+const _MEASURED_ANYTHING = Ref(false)
 _LOCK_AT_START = (0, 0, -1)
 _LOCK_CHANGED = ""
 function _lock_exit_check()
@@ -1694,6 +1697,10 @@ function save_cache(path, groups)
         catch
             0
         end
+        # THE PIN IS NOT THE CLOCK — refuse a cache whose cells were measured above the pinned
+        # ceiling even though the pin reads correct. `_require_lock` at entry cannot see this; only
+        # a sample taken under load can. See FreqLock.check_achieved for the incident.
+        _MEASURED_ANYTHING[] && FreqLock.check_achieved(khz; what = "write a gate cache")
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
             "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts",
@@ -1959,6 +1966,7 @@ elseif !("bench" in ARGS) && isfile(CACHE)
     g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     _require_lock()        # an off-lock run is INVALID, not merely noisy — refuse at second zero
+    _MEASURED_ANYTHING[] = true
     global _LOCK_AT_START = _lock_state()
     _contention_check()
     _pref_check()          # pins are legitimate; not KNOWING about them is not
