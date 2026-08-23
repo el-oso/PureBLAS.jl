@@ -2155,10 +2155,48 @@ const _ZRT_CLANE = Vec(ntuple(l -> (l + 1) >> 1, Val(2 * _ZGT_W)))
     end
 end
 
+# One column group: every full row block, then the ragged rows under a mask. Split out so the NC ladder
+# below can reuse it at NC, 2 and 1 without three copies of the row loop.
+@inline function _zrt_colgroup!(
+        ::Val{NCv}, ::Val{FOLD}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
+        prc::Ptr{Float64}, jb::Int, m::Int, mb::Int, W::Int
+    ) where {NCv, FOLD}
+    for r0 in 0:W:(mb - 1)
+        _zrt_tile!(Val(NCv), Val(FOLD), Val(false), pB, ldb, pA, lda, prc, r0, jb, W)
+    end
+    mb < m && _zrt_tile!(Val(NCv), Val(FOLD), Val(true), pB, ldb, pA, lda, prc, mb, jb, m - mb)
+    return nothing
+end
+
+# The COLUMN ladder: NC-wide groups while they fit, then 2, then 1 — no `gemm_core!` + `dRN` tail.
+# A tile at column offset `jb` already subtracts EVERY previously solved column (its `for i in 0:(jb-1)`
+# loop), so a narrower tile at the tail does the trailing gemm's work AND the solve, in this kernel
+# rather than in two BLAS-2-ish calls. That is why the ladder REPLACES the old tail instead of
+# optimising it.
+# MEASURED Zen4 (m=k, PB-only GFlop/s), and it is a SMALLER win than the row tail was:
+#   n=50  29.58 -> 31.23  (+5.6%)     n=100  36.81 -> 38.13  (+3.6%)
+#   n=52  33.08 -> 33.08  (unchanged — it has no column tail, so this is the control)
+#   clean sizes unchanged: 48 35.58, 56 36.16, 96 40.56, 104 39.91, 128 41.85, 256 46.55
+# n=50 is still ~12% under its clean neighbour (31.23 vs 35.58 at n=48), so the column tail was NOT
+# the whole of the residual and something else remains at that size. Full progression there:
+# 23.11 (original) -> 29.58 (masked row tail) -> 31.23 (this ladder), i.e. +35% total.
+@inline function _zrt_sweep!(::Val{FOLD}, pB, ldb, pA, lda, prc, k, m, mb, W, NC) where {FOLD}
+    jb = 0
+    while jb + NC <= k
+        _zrt_colgroup!(Val(NC), Val(FOLD), pB, ldb, pA, lda, prc, jb, m, mb, W); jb += NC
+    end
+    while jb + 2 <= k
+        _zrt_colgroup!(Val(2), Val(FOLD), pB, ldb, pA, lda, prc, jb, m, mb, W); jb += 2
+    end
+    while jb < k
+        _zrt_colgroup!(Val(1), Val(FOLD), pB, ldb, pA, lda, prc, jb, m, mb, W); jb += 1
+    end
+    return nothing
+end
+
 function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
-    m = size(B, 1); W = _ZGT_W; NC = _ZRT_NC
+    m = size(B, 1); W = _ZGT_W
     lda = stride(A, 2); ldb = stride(B, 2)
-    nb = (k ÷ NC) * NC                       # columns covered by full tiles
     mb = (m ÷ W) * W                         # rows covered by full vector blocks
     rc = _trsm_fused_buf(Float64, 2 * k)
     GC.@preserve A B rc begin
@@ -2169,30 +2207,12 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
         end
         # `Val(!_EXPFLAG[_EXP14])` — the fold SHIPS ON; the flag is INVERTED so the old scalar-negate
         # arm stays A/B-able in-process on a fleet box (see the _EXP14 registry note).
-        # The ragged ROW block (m % W rows) rides the SAME tile under a mask — see `_zrt_tile!`. It must
-        # still finish BEFORE the column tail, so it is folded into this loop rather than appended after.
+        # The ragged ROW block (m % W rows) rides the SAME tile under a mask — see `_zrt_tile!`.
         if _EXPFLAG[_EXP14]
-            for jb in 0:NC:(nb - 1)
-                for r0 in 0:W:(mb - 1)
-                    _zrt_tile!(Val(_ZRT_NC), Val(false), Val(false), pB, ldb, pA, lda, prc, r0, jb, W)
-                end
-                mb < m && _zrt_tile!(Val(_ZRT_NC), Val(false), Val(true), pB, ldb, pA, lda, prc, mb, jb, m - mb)
-            end
+            _zrt_sweep!(Val(false), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
         else
-            for jb in 0:NC:(nb - 1)
-                for r0 in 0:W:(mb - 1)
-                    _zrt_tile!(Val(_ZRT_NC), Val(true), Val(false), pB, ldb, pA, lda, prc, r0, jb, W)
-                end
-                mb < m && _zrt_tile!(Val(_ZRT_NC), Val(true), Val(true), pB, ldb, pA, lda, prc, mb, jb, m - mb)
-            end
+            _zrt_sweep!(Val(true), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
         end
-    end
-    if nb < k
-        nb > 0 && _gemm_core!(
-            view(B, :, (nb + 1):k), view(B, :, 1:nb), view(A, 1:nb, (nb + 1):k),
-            -one(ComplexF64), one(ComplexF64), false, false, false, false
-        )
-        _trsm_cmplx_dRN!(true, unit, k - nb, view(A, (nb + 1):k, (nb + 1):k), view(B, :, (nb + 1):k))
     end
     return B
 end
