@@ -53,7 +53,7 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # So gate on the DATAPATH, not a flat default: minner ON iff the vector unit is AVX2 (W<8) OR double-pumped,
 # OFF on native-512 (physical criterion over detected consts — CLAUDE.md req#7/#8; validated full-sweep on
 # the fleet: Zen3/Zen4 keep the gains, Zen5 reverts to the old path). Panel-width regimes below apply where on.
-# PDM: Measured — panel-width regime inverts across µarchs (Zen3/Zen4 keep the gain, Zen5 reverts). | tune: candidate
+# PDM: Derived — `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | tune: n/a — derived, no host measurement needed
 const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
 # ⚠ THE DEFAULT IS A DATAPATH-GATED BOOLEAN, which the PDM ladder names as a violation in the same
 # breath as `_double_pumped(_HW) ? 8 : 4` — a Measure-tier knob that has not been converted yet.
