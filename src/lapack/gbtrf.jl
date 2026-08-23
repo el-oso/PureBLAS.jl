@@ -50,9 +50,23 @@
 # overhead; it needs measuring, not assuming.
 # PDM: Measured — banded LU panel width; the comment says outright it needs measuring, not assuming. | tune: candidate
 const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
+# THE MEASURE-TIER QUANTITY IS THE MULTIPLIER, NOT `nb` — exactly as for `sytrf_cmult`, and for the
+# same reason that file states: pinning `gbtrf_nb` takes the `else` branch, whose value is FLAT, so it
+# would DISCARD the kl-dependence entirely and use one panel width at every band width. A calibrator
+# that pinned a scalar here would therefore make the knob worse, which is why this one had no
+# calibrator while the other six did.
+# So the shape `8 * (1 + kl ÷ 128)` stays (band-width adaptive, and the µarch-dependent part was
+# already factored out into `gbtrf_cross`), and the tunable is a multiplier on it, defaulting to 1 so
+# behaviour is unchanged. Ref-backed like every other force hook, so tune!() can sweep it and
+# `PUREBLAS_FORCE_gbtrf_cmult` reaches the real entry path.
+# PDM: Measured — multiplier on the kl shape; the panel width itself is the shape, not the knob. | tune: candidate
+const _GBTRF_CMULT = @load_preference("gbtrf_cmult", 1)::Int
 @static if isnothing(_GBTRF_NB_PREF)
-    @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = clamp(8 * (1 + kl ÷ 128), 8, 48)
+    @inline _gbtrf_cmult() = (f = _FKR_gbtrf_cmult[]; f >= 0 ? f : _GBTRF_CMULT)
+    @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} =
+        clamp(_gbtrf_cmult() * 8 * (1 + kl ÷ 128), 8, 48)
 else
+    @inline _gbtrf_cmult() = _GBTRF_CMULT
     @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = _GBTRF_NB_PREF::Int
 end
 

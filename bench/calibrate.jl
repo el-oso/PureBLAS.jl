@@ -308,6 +308,47 @@ function calibrate_trmv_fused_min(::Type{T} = Float64) where {T}
     return Pair{String, Any}["trmv_fused_min" => parse(Int, string(name))]
 end
 
+# ── gbtrf banded-LU panel multiplier ────────────────────────────────────────────────────────────────
+# The tunable is the MULTIPLIER on the kl shape `8 * (1 + kl ÷ 128)`, never `nb` itself: pinning nb
+# takes a branch that ignores kl entirely and would use one panel width at every band width. Same
+# reasoning as `sytrf_cmult`, and the reason this knob had no calibrator until now.
+# Swept across BAND WIDTHS, not matrix sizes — kl is what the shape reacts to. kl=16 is included
+# deliberately: it is the cell where blocking wins on Zen4 and LOSES on Zen3 (bench/plots.jl's gbtrf row
+# went PASS 1.43/1.18 -> FAIL 1.32/0.91 when a Zen4-only nb was shipped), so a multiplier that helps on
+# one box must be checked there.
+function calibrate_gbtrf_cmult(::Type{T} = Float64) where {T}
+    inc = PureBLAS._gbtrf_cmult()
+    cands = filter(!=(inc), [1, 2, 3, 4])
+    n = 4096
+    kls = (16, 64, 128, 256)
+    # gbtrf!(kl, ku, m, AB) — band storage, factored IN PLACE. The pristine band and a working copy are
+    # both built in setup (excluded from timing) so the measured region is the factorization alone.
+    # Diagonally dominant so pivoting stays trivial and every arm does the same amount of work.
+    setup() = [(ab = randn(T, 3kl + 1, n); ab[2kl + 1, :] .+= 4kl;
+                (ab, copy(ab), kl)) for kl in kls]
+    run(v) = (cs -> begin
+        PureBLAS._FKR_gbtrf_cmult[] = v
+        for c in cs
+            copyto!(c[2], c[1]); PureBLAS.gbtrf!(c[3], c[3], n, c[2])
+        end
+        cs[1][2][1]
+    end)
+    arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
+    @printf("  gbtrf_cmult: incumbent %d, candidates %s (n=%d, kl = %s)\n", inc, cands, n, kls)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    PureBLAS._FKR_gbtrf_cmult[] = -1
+    for r in res
+        @printf("    cmult=%-3s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    name, verdict = decide(res; delta = 0.02)
+    if verdict === :tie
+        println("    ⇒ tie — candidates within noise; leaving the in-code default in place")
+        return Pair{String, Any}[]
+    end
+    @printf("    ⇒ WINNER cmult=%s\n", name)
+    return Pair{String, Any}["gbtrf_cmult" => parse(Int, string(name))]
+end
+
 const KNOBS = (
     (name = "ger_panel_np", fn = calibrate_ger_np),
     (name = "gemvt_percol_window", fn = calibrate_gemvt_window),
@@ -315,6 +356,7 @@ const KNOBS = (
     (name = "sytrf_cmult", fn = calibrate_sytrf_cmult),
     (name = "gemvt_pf", fn = calibrate_gemvt_pf),
     (name = "trmv_fused_min", fn = calibrate_trmv_fused_min),
+    (name = "gbtrf_cmult", fn = calibrate_gbtrf_cmult),
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────

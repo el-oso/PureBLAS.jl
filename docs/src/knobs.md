@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 128 of them.
+Every `@load_preference` key in `src/` — 129 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 128 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 62 Derived · 10 Measured · 46 Literal · 10 Exempt.
-**Default form** (mechanical): 56 formula · 20 delegates · 6 sibling · 41 literal · 4 flag · 1 other.
+**Tier:** 63 Derived · 10 Measured · 46 Literal · 10 Exempt.
+**Default form** (mechanical): 56 formula · 20 delegates · 6 sibling · 42 literal · 4 flag · 1 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -40,7 +40,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 | `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `gemvn_mb` | formula | Derived | formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64` | — |
-| `gemvn_minner` | delegates | Measured | panel-width regime inverts across µarchs (Zen3/Zen4 keep the gain, Zen5 reverts). | candidate |
+| `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
 | `gemvn_np_narrow` | formula | Derived | formula over detected consts: `max(2, _L1D_ASSOC - 2` | — |
 | `gemvn_rb` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448` | — |
@@ -147,6 +147,7 @@ Every `@load_preference` key in `src/` — 128 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
+| `gbtrf_cmult` | literal | Measured | multiplier on the kl shape; the panel width itself is the shape, not the knob. | candidate |
 | `gbtrf_cross` | delegates | Literal | crossover, derivation falsified; the C32 row is a 3-3 tie on Zen4. | candidate |
 | `gbtrf_nb` | delegates | Measured | banded LU panel width; the comment says outright it needs measuring, not assuming. | candidate |
 
