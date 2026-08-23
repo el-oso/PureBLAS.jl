@@ -2071,6 +2071,9 @@ const _ZRT_NC = @load_preference(
 )::Int
 const _ZRT_SWP = Val(ntuple(l -> (l - 1) ⊻ 1, Val(2 * _ZGT_W)))
 const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val(2 * _ZGT_W)))
+# Per-REAL-lane complex row index (1,1,2,2,…,W,W) — the `clane` idiom. A CONST because building it
+# inside the @generated body would put a closure in the generator, which Julia rejects as impure.
+const _ZRT_CLANE = Vec(ntuple(l -> (l + 1) >> 1, Val(2 * _ZGT_W)))
 @inline _zrt_nswap(v) = shufflevector(v, _ZRT_SWP) * _ZRT_NEG      # [-im, re, -im, re, …]
 
 # Rows r0..r0+W-1 of the NC-column block at jb: fold in every solved column i<jb (one B load shared by
@@ -2084,13 +2087,24 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
 # (FOLD=true) leaves the coefficients as bare loads that can fold straight into the FMA. It is exact,
 # not an approximation: `_zrt_nswap(-v) == -_zrt_nswap(v)` since nswap is a shuffle times a constant,
 # so xw needs no separate treatment, and the triangle gets the same rewrite via one `nv = -acc(t)`.
+# MSK=true is the ragged-ROW variant. Those rows used to fall into `_trsm_cmplx_dRN!` — the per-column
+# BLAS-2 path this very leaf exists to replace — and that, not the column tail, is what cost ztrsmR its
+# n=50/100 cells. Measured Zen4, m=k, PB-only GFlop/s: k=52 and k=100 have NO column tail at all and
+# still read 24.4 and 33.7 against 35.7 (k=48) and 39.8 (k=104), i.e. -30% and -15% from the row tail
+# alone. Lanes here are ROWS of B, so the tail is the SAME kernel under a mask rather than a different
+# algorithm. Inactive lanes are never accessed, so a masked load cannot run past the end of a column
+# (the property `directb-masked-oob-guardpage` requires of any direct-read microkernel).
+# `nact` = active COMPLEX rows; the mask is per REAL lane, hence the (l+1)>>1 `clane` form from
+# simd_kernels.jl (1,1,2,2,…,W,W).
 @generated function _zrt_tile!(
-        ::Val{NC}, ::Val{FOLD}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
-        rc::Ptr{Float64}, r0::Int, jb::Int
-    ) where {NC, FOLD}
+        ::Val{NC}, ::Val{FOLD}, ::Val{MSK}, pB::Ptr{Float64}, ldb::Int, pA::Ptr{Float64}, lda::Int,
+        rc::Ptr{Float64}, r0::Int, jb::Int, nact::Int
+    ) where {NC, FOLD, MSK}
     sz = sizeof(Float64); V2 = Vec{2 * _ZGT_W, Float64}
     a(t) = Symbol(:acc, t)
-    ld = [:($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    mskdef = MSK ? :(msk = _ZRT_CLANE <= nact) : nothing
+    ld = [MSK ? :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
+          :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
     upd = [
         quote
             cr = unsafe_load(pAi, 2 * (jb + $t) * lda + 1); ci = unsafe_load(pAi, 2 * (jb + $t) * lda + 2)
@@ -2116,14 +2130,20 @@ const _ZRT_NEG = Vec{2 * _ZGT_W, Float64}(ntuple(l -> isodd(l) ? -1.0 : 1.0, Val
             $(feed...)
         end
     end
-    st = [:(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    st = [MSK ? :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
+          :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    # NOTE: built here as plain conditionals, NOT via a helper function. Calling a module-level
+    # function from inside a @generated body trips "The function body AST ... is not pure".
+    xvld = MSK ? :(vload($V2, pB + (i * ldb + r0) * 2 * $sz, msk)) :
+           :(vload($V2, pB + (i * ldb + r0) * 2 * $sz))
+    xvex = FOLD ? :(-$xvld) : xvld
     return quote
         $(Expr(:meta, :inline))
         @inbounds begin
+            $(mskdef)
             $(ld...)
             for i in 0:(jb - 1)
-                xv = $(FOLD ? :(-vload($V2, pB + (i * ldb + r0) * 2 * $sz)) :
-                    :(vload($V2, pB + (i * ldb + r0) * 2 * $sz)))
+                xv = $(xvex)
                 xw = _zrt_nswap(xv)
                 pAi = pA + i * 2 * $sz                           # &A[i+1, 1]
                 $(upd...)
@@ -2149,19 +2169,24 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
         end
         # `Val(!_EXPFLAG[_EXP14])` — the fold SHIPS ON; the flag is INVERTED so the old scalar-negate
         # arm stays A/B-able in-process on a fleet box (see the _EXP14 registry note).
+        # The ragged ROW block (m % W rows) rides the SAME tile under a mask — see `_zrt_tile!`. It must
+        # still finish BEFORE the column tail, so it is folded into this loop rather than appended after.
         if _EXPFLAG[_EXP14]
-            for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
-                _zrt_tile!(Val(_ZRT_NC), Val(false), pB, ldb, pA, lda, prc, r0, jb)
+            for jb in 0:NC:(nb - 1)
+                for r0 in 0:W:(mb - 1)
+                    _zrt_tile!(Val(_ZRT_NC), Val(false), Val(false), pB, ldb, pA, lda, prc, r0, jb, W)
+                end
+                mb < m && _zrt_tile!(Val(_ZRT_NC), Val(false), Val(true), pB, ldb, pA, lda, prc, mb, jb, m - mb)
             end
         else
-            for jb in 0:NC:(nb - 1), r0 in 0:W:(mb - 1)
-                _zrt_tile!(Val(_ZRT_NC), Val(true), pB, ldb, pA, lda, prc, r0, jb)
+            for jb in 0:NC:(nb - 1)
+                for r0 in 0:W:(mb - 1)
+                    _zrt_tile!(Val(_ZRT_NC), Val(true), Val(false), pB, ldb, pA, lda, prc, r0, jb, W)
+                end
+                mb < m && _zrt_tile!(Val(_ZRT_NC), Val(true), Val(true), pB, ldb, pA, lda, prc, mb, jb, m - mb)
             end
         end
     end
-    # ragged rows must finish BEFORE the column tail: that gemm reads every row of the solved block
-    mb < m && nb > 0 &&
-        _trsm_cmplx_dRN!(true, unit, nb, view(A, 1:nb, 1:nb), view(B, (mb + 1):m, 1:nb))
     if nb < k
         nb > 0 && _gemm_core!(
             view(B, :, (nb + 1):k), view(B, :, 1:nb), view(A, 1:nb, (nb + 1):k),
