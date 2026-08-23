@@ -486,7 +486,14 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 # two, so the row would not mean the same thing per box.
 const L2SZ = (50, 64, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)
 const L3SZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
-const LPSZ = (8, 32, 128, 256, 512, 1024, 2048, 4096)   # LAPACK factorizations, to 4096
+# LAPACK factorizations, to 4096. NON-PO2 entries (50/100/1000/2100) are one per RESIDENCY BAND, the
+# same set L2SZ/L3SZ use — and they matter MORE here than anywhere else: the panel kernels these ops
+# route through (`_trsm_rl_split_f64!`, `_trsm_right_lower_f64!`) handle a sub-W row tail and a
+# `nb < _fh_chol_nb()` column remainder in SEPARATE code paths, and a po2-only ladder leaves BOTH
+# permanently empty. That is not hypothetical: those two tails were scalar loops walking the whole
+# solved prefix one row and one column at a time, worth -59% at n=50 on the side-R gate shape, and the
+# po2 ladder had reported the op as passing for months. See kb pureblas-nonpo2-sizes-were-invisible.
+const LPSZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)
 # Tridiagonal solvers are O(n), not O(n³) — at LPSZ's sizes they are microseconds of pure timer noise, and
 # the interesting behaviour (L2-resident vs streaming) only appears well past 4096. Swept to 262144.
 const TDSZ = (256, 1024, 4096, 16384, 65536, 262144)
