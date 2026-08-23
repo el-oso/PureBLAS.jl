@@ -23,6 +23,8 @@
 #
 # What we CANNOT do without root is stop the clock moving. What we can do is notice, and decline.
 
+include(joinpath(@__DIR__, "freqlock.jl"))   # THE frequency-lock criterion, single source of truth
+using .FreqLock
 using Chairmarks: @be
 using Statistics: median
 
@@ -70,19 +72,9 @@ because "the box's frequency lock had silently dropped (4841 MHz against a 2000 
 A floating clock does not merely add noise — it drifts BETWEEN the arms of an A/B, which is the one
 error paired measurement cannot cancel.
 """
-function freq_locked()
-    isdir("/sys/devices/system/cpu/cpu0/cpufreq") || return (true, "no cpufreq (not Linux) — unchecked")
-    b = tryparse(Int, strip(read("/sys/devices/system/cpu/cpufreq/boost", String)))
-    if !isnothing(b) && b != 0
-        return (false, "boost is ON (boost=$b) — run `sudo bench/fleet_freqlock.sh lock`")
-    end
-    lo = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq", String)))
-    hi = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", String)))
-    (isnothing(lo) || isnothing(hi)) && return (true, "cpufreq unreadable — unchecked")
-    lo == hi || return (false, "clock NOT pinned (min=$(lo÷1000) MHz, max=$(hi÷1000) MHz) — " *
-                               "run `sudo bench/fleet_freqlock.sh lock`")
-    return (true, "pinned at $(hi ÷ 1000) MHz, boost off")
-end
+# Delegates to THE shared criterion (bench/freqlock.jl). This function used to read cpu0 ALONE,
+# which passes a box that has one core pinned and the rest free to ramp — see the note there.
+freq_locked() = FreqLock.freq_locked()
 
 """
     contention() -> (loadavg, busy::Bool)
