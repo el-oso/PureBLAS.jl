@@ -226,18 +226,37 @@ end
                 cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(true)
             )
-            # masked-row kernel (partial rows): mre=12 → second row-vector partially masked
+            # masked-row kernel (partial rows): mre=12 → second row-vector partially masked. VW is the
+            # explicit vector-width Val (full register width here; the ≤W row tail passes the narrower
+            # `_at_tail_vw` — that instance is trim-covered from the ccallable roots via `_mrows_tail!`).
             @assert_typestable P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true)
+                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true), Val(W)
             )
             @assert_noalloc P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false)
+                1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false), Val(W)
             )
             @assert_trim_compatible P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
-                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true)
+                1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true), Val(W)
+            )
+            # NARROW row tail. `_mrows_tail!` picks the width at COMPILE time from two detected consts,
+            # so both arms must resolve statically; mre=2 is the width the shipped m=50 tail dispatches
+            # on a double-pumped part. Asserting the dispatcher (not just the kernel) is the point — a
+            # width choice that failed to const-fold would show up here as an instability, not as a
+            # slightly slower benchmark.
+            @assert_typestable P._mrows_tail!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
+            )
+            @assert_noalloc P._mrows_tail!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 2.0, 2, Val(P._NR), Val(false), Val(false)
+            )
+            @assert_trim_compatible P._mrows_tail!(
+                cup, mr, aup, mr, 0, bup, kk, 0, kk,
+                1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
             )
         end
         # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed

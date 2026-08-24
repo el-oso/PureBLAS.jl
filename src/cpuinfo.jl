@@ -200,6 +200,16 @@ const _GEMM_SPLIT_S = 2
 # 64 to the wide path). Preferences-overridable ("gemm_split_max"); fleet-validate before trusting.
 @inline _at_gemm_split_max(hw, ::Type{T} = Float64) where {T} =
     (_at_gemm_split_mr(hw) + _at_gemm_mr(hw, T)) * _lanes(hw, T)
+# (f) ROW-TAIL vector width. A row block with `mre < W` live rows still computes a WHOLE vector and masks
+# the store, so its cost is the vector's ISSUE cost, not its live lanes. On a double-pumped part a
+# full-width op occupies the FP pipes twice while a datapath-width op occupies them once — so a tail that
+# `_datapath_bytes` already covers costs HALF a full-width tail for the same live rows. Going narrower than
+# the datapath buys nothing: the path is the floor. The criterion is therefore the DATAPATH itself, which
+# is why this is a derivation and not a lookup — `_lanes` (the register width) is the wrong unit here
+# precisely because Zen4's register is wider than its pipes. Fleet: Zen4 32 B ⇒ 4 (half of W=8, the narrow
+# arm exists); Zen3 32 B = its own simd ⇒ 4 = W (identical, branch const-folds away); Zen5 64 B ⇒ 8 = W
+# (same). So only the double-pumped box takes the narrow arm, which is exactly where the mechanism is.
+@inline _at_tail_vw(hw, ::Type{T} = Float64) where {T} = max(1, _datapath_bytes(hw) ÷ sizeof(T))
 # (c2) Real-axpy DRAM-regime arm. Past L3 the kernel is bandwidth-bound, so the FULL-width vector buys no
 # bandwidth on a datapath that must split it anyway — the narrow 256-bit phase arm (208) wins there and
 # only there. That criterion IS the datapath, so `_double_pumped` is the honest predictor rather than a
