@@ -3244,6 +3244,17 @@ function _trsm_fused_L!(unit::Bool, A, B)
         jc = 0
         while jc < n
             wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
+            # PAD WIDTH, not NR. The fusedT branches below take wid in {NR, 2W, W}; everything else
+# falls here and USED TO BE PADDED OUT TO THE FULL NR with zeros, so a 2-column tail was
+# solved as 24 columns — 12x the work. The comment above says "gate n is a multiple of W,
+# so the tail is always 8 or 16 wide": TRUE when the ladder was all powers of two, FALSE
+# since the non-po2 sizes landed. n=50 stripes 24+24+2 and n=100 stripes 24x4+4, and those
+# 2- and 4-wide tails are exactly the red cells (Zen4 0.79, Zen5 0.80).
+# The pad is internal to P — the unpack writes back only `wid` columns — so narrowing it to
+# the smallest W-multiple covering wid is safe, and the solve already takes the stripe width
+# as a compile-time Val(NRV). NRVp in 1:NRV, so a 3-way branch covers it.
+            NRp  = min(NR, cld(wid, W) * W)
+            NRVp = NRp ÷ W
             # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
             # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
             # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
@@ -3289,16 +3300,16 @@ function _trsm_fused_L!(unit::Bool, A, B)
                 jc += W; continue
             end
             if useT
-                _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+                _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif useT4                                  # AVX2 vectorized 4×4 transpose pack (lever 2)
-                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
                 @inbounds for i in 0:(KC - 1)
-                    srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NR * sz
+                    srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NRp * sz
                     for v in 0:(wid - 1)
                         unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1)
                     end
-                    for v in wid:(NR - 1)
+                    for v in wid:(NRp - 1)
                         unsafe_store!(drow, zero(T), v + 1)
                     end
                 end
@@ -3306,24 +3317,39 @@ function _trsm_fused_L!(unit::Bool, A, B)
                 @inbounds for v in 0:(wid - 1)
                     scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
                     for i in 0:(KC - 1)
-                        unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + i * sz))
+                        unsafe_store!(dcol + i * NRp * sz, unsafe_load(scol + i * sz))
                     end
                 end
-                @inbounds for v in wid:(NR - 1), i in 0:(KC - 1)
-                    unsafe_store!(Pp + (i * NR + v) * sz, zero(T))
+                @inbounds for v in wid:(NRp - 1), i in 0:(KC - 1)
+                    unsafe_store!(Pp + (i * NRp + v) * sz, zero(T))
                 end
             end
-            rem > 0 && _gemmtrsm_u_tail!(Pp, NR, pUsrc, lduse, rp, nfull * MR, KC, Val(NRV))
-            for si in (nfull - 1):-1:0
-                _gemmtrsm_u_slab!(Pp, NR, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(NRV))
+            # Solve at the NARROWED stripe width. Val must be a compile-time constant, so branch on
+            # NRVp (1:NRV) rather than splicing a runtime value — a runtime->Val is exactly the
+            # `invoke ::Any` shape juliac --trim rejects.
+            if NRVp == 1
+                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(1))
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(1))
+                end
+            elseif NRVp == 2
+                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(2))
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(2))
+                end
+            else
+                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(NRV))
+                for si in (nfull - 1):-1:0
+                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(NRV))
+                end
             end
             if useT
-                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif useT4
-                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NR, sz)
+                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif rowouter
                 @inbounds for i in 0:(KC - 1)                 # unpack P → B row-outer (contiguous P reads)
-                    srow = Pp + i * NR * sz; drow = pB + (i + jc * ldb) * sz
+                    srow = Pp + i * NRp * sz; drow = pB + (i + jc * ldb) * sz
                     for v in 0:(wid - 1)
                         unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1))
                     end
@@ -3332,7 +3358,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
                 @inbounds for v in 0:(wid - 1)               # unpack column-outer (contiguous B writes)
                     scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
                     for i in 0:(KC - 1)
-                        unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NR * sz))
+                        unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NRp * sz))
                     end
                 end
             end
