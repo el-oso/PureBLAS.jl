@@ -1107,10 +1107,38 @@ function _gemm_unpacked_split!(
                         )
                     end
                 elseif nre == nr
-                    _microkernel_unpacked_mrows!(
-                        Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                        mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0)
-                    )
+                    # NOT W-aligned. This passed Val(_SMR) unconditionally, i.e. computed all
+                    # _SMR*W = 32 rows however few were live. At m=36 the tail has mre=4 and computed
+                    # 32 rows for 4 — total row work 64 for 36 live (78% waste) against 40 for m=40,
+                    # which IS W-aligned and takes the branch above. MEASURED (Zen4, m=n=k, beta=0):
+                    #   m=36 21.86 GF, m=44 27.21   vs   m=32 39.65, m=40 40.43, m=48 41.27
+                    # so -45% and -34% from this dispatch alone. Narrow to the vector-rows actually
+                    # needed, exactly as the W-aligned branch does with `vr`. _SMR=4 ⇒ cld(mre,W) ∈ 1:4.
+                    # WHY IT SURVIVED: the split path needs max(m,n,k) ≤ _GEMM_SPLIT_MAX (48), and the
+                    # gate ladder jumps 32 → 50, so NO published cell ever reaches a non-W-aligned
+                    # remainder here. Found by sweeping m one step at a time, not by the gate.
+                    vt = cld(mre, W)
+                    if vt == 1
+                        _microkernel_unpacked_mrows!(
+                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            mre, Val(1), Val(_SNR), Val(TB), Val(B0)
+                        )
+                    elseif vt == 2
+                        _microkernel_unpacked_mrows!(
+                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            mre, Val(2), Val(_SNR), Val(TB), Val(B0)
+                        )
+                    elseif vt == 3
+                        _microkernel_unpacked_mrows!(
+                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            mre, Val(3), Val(_SNR), Val(TB), Val(B0)
+                        )
+                    else
+                        _microkernel_unpacked_mrows!(
+                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                            mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0)
+                        )
+                    end
                 else
                     _microkernel_unpacked_edge!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
