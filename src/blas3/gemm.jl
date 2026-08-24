@@ -834,12 +834,17 @@ end
 # register blocking (A reused across columns, B across rows), masking only the row loads/stores.
 # Called with NR=_NR for the full-column partial-row case (concrete, common) and NR=nre for the
 # partial-column strip (NR small; see the dispatch barrier below). Folds beta (B0 ⇒ beta=0).
+# VW is the VECTOR WIDTH in elements: MR vectors of VW lanes cover MR·VW rows. Every steady-state caller
+# passes the register width `_vwidth(T)`; the ≤VW row TAIL passes a narrower one (`_mrows_tail!` below),
+# because a masked vector costs its full issue slot however few lanes are live. It is an explicit Val at
+# every call site on purpose — a defaulting trampoline would be an abstract-`Val` forward, which is the
+# `invoke ::Any` shape juliac --trim rejects.
 @generated function _microkernel_unpacked_mrows!(
         C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T, mre::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{B0}
-    ) where {T, MR, NR, TB, B0}
-    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{B0}, ::Val{VW}
+    ) where {T, MR, NR, TB, B0, VW}
+    W = VW; sz = sizeof(T); V = Vec{W, T}
     body = quote end
     lanetuple = Expr(:tuple, (0:(W - 1))...)   # literal (0,1,…,W-1); @generated body must be pure
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
@@ -886,6 +891,34 @@ end
     end
     push!(body.args, :(return nothing))
     return body
+end
+
+# ONE ≤W-row tail block, dispatched at the narrowest ISSUE width that covers `mre`.
+# The row tail computes a whole vector and masks the store, so `m = 50` (tail mre=2) and `m = 100`
+# (tail mre=4) each pay a full W=8 vector for 2 and 4 live rows. Masking is not the cost — under
+# AVX-512 it is free k-register predication — the ISSUE SLOT is: a 512-bit FMA on a double-pumped
+# datapath occupies the FMA pipe twice, a 256-bit one occupies it once, for the same live rows. So the
+# tail wants `_at_tail_vw` = the datapath width (cpuinfo.jl (f)), and nothing narrower.
+# Two rungs is the whole ladder, not a truncation: below the datapath a vector cannot go faster than the
+# path, and above it the register width is the only other legal size. Both are detected consts, so the
+# branch const-folds — on Zen3/Zen5 `_at_tail_vw == _vwidth` and this compiles to the `else` arm alone.
+@inline function _mrows_tail!(
+        C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
+        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T, mre::Int,
+        ::Val{NR}, ::Val{TB}, ::Val{B0}
+    ) where {T, NR, TB, B0}
+    if _at_tail_vw(_HW, T) < _vwidth(T) && mre <= _at_tail_vw(_HW, T)
+        _microkernel_unpacked_mrows!(
+            C, ldc, A, lda, ir, B, ldb, jr, k, alpha, beta,
+            mre, Val(1), Val(NR), Val(TB), Val(B0), Val(_at_tail_vw(_HW, T))
+        )
+    else
+        _microkernel_unpacked_mrows!(
+            C, ldc, A, lda, ir, B, ldb, jr, k, alpha, beta,
+            mre, Val(1), Val(NR), Val(TB), Val(B0), Val(_vwidth(T))
+        )
+    end
+    return nothing
 end
 
 # Partial-COLUMN strip (nre<nr): masked-row, vectorized, one k-loop per (row-vector, column) — less
@@ -937,14 +970,14 @@ end
                 Val(_MR), Val(_NR), Val(TB), Val(B0)
             )
         elseif cld(mre, W) == 1
-            _microkernel_unpacked_mrows!(
+            _mrows_tail!(
                 Cp, ldc, Ap, lda, ir, Bp, ldb, jrc, k, alpha, beta,
-                mre, Val(1), Val(_NR), Val(TB), Val(B0)
+                mre, Val(_NR), Val(TB), Val(B0)
             )
         else
             _microkernel_unpacked_mrows!(
                 Cp, ldc, Ap, lda, ir, Bp, ldb, jrc, k, alpha, beta,
-                mre, Val(_MR), Val(_NR), Val(TB), Val(B0)
+                mre, Val(_MR), Val(_NR), Val(TB), Val(B0), Val(_vwidth(T))
             )
         end
         ir += mr
@@ -983,9 +1016,9 @@ function _gemm_unpacked_mr1!(
                         Val(1), Val(_NR), Val(TB), Val(B0)
                     )
                 elseif nre == nr
-                    _microkernel_unpacked_mrows!(
+                    _mrows_tail!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                        mre, Val(1), Val(_NR), Val(TB), Val(B0)
+                        mre, Val(_NR), Val(TB), Val(B0)
                     )
                 else
                     _microkernel_unpacked_edge!(
@@ -1119,24 +1152,24 @@ function _gemm_unpacked_split!(
                     # remainder here. Found by sweeping m one step at a time, not by the gate.
                     vt = cld(mre, W)
                     if vt == 1
-                        _microkernel_unpacked_mrows!(
+                        _mrows_tail!(
                             Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(1), Val(_SNR), Val(TB), Val(B0)
+                            mre, Val(_SNR), Val(TB), Val(B0)
                         )
                     elseif vt == 2
                         _microkernel_unpacked_mrows!(
                             Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(2), Val(_SNR), Val(TB), Val(B0)
+                            mre, Val(2), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
                         )
                     elseif vt == 3
                         _microkernel_unpacked_mrows!(
                             Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(3), Val(_SNR), Val(TB), Val(B0)
+                            mre, Val(3), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
                         )
                     else
                         _microkernel_unpacked_mrows!(
                             Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0)
+                            mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
                         )
                     end
                 else
@@ -1233,19 +1266,19 @@ function _gemm_unpacked!(
                         else
                             _microkernel_unpacked_mrows!(
                                 Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                                mre, Val(_MR), Val(_NR), Val(TB), Val(B0)
+                                mre, Val(_MR), Val(_NR), Val(TB), Val(B0), Val(_vwidth(T))
                             )
                         end
                     elseif nre == nr                 # truly-partial rows (mre % W ≠ 0) → masked
                         if nv1
-                            _microkernel_unpacked_mrows!(
+                            _mrows_tail!(
                                 Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                                mre, Val(1), Val(_NR), Val(TB), Val(B0)
+                                mre, Val(_NR), Val(TB), Val(B0)
                             )
                         else
                             _microkernel_unpacked_mrows!(
                                 Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                                mre, Val(_MR), Val(_NR), Val(TB), Val(B0)
+                                mre, Val(_MR), Val(_NR), Val(TB), Val(B0), Val(_vwidth(T))
                             )
                         end
                     else                             # partial-column strip

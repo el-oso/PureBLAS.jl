@@ -229,7 +229,7 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                         _microkernel_unpacked_mrows!(
                             Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
                             one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
-                            Val(_NR), Val(false), Val(true)
+                            Val(_NR), Val(false), Val(true), Val(_vwidth(T))
                         )
                     elseif upM
                         _microkernel_unpacked_edge!(
@@ -293,7 +293,7 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                         _microkernel_unpacked_mrows!(
                             Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
                             one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
-                            Val(_NR), Val(false), Val(true)
+                            Val(_NR), Val(false), Val(true), Val(_vwidth(T))
                         )
                     else
                         # Edge kernel is COLUMN-serial and the A-operand is B itself: column j+1's
