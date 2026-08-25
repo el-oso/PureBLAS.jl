@@ -1706,6 +1706,21 @@ end
     # traded two mid-band misses for two small-n ones.
     # DERIVE tier: the SPLIT is a residency criterion over `_L2_BYTES`; only the past-L2 arm is Measured.
     if m * n * sizeof(Complex{T}) <= _L2_BYTES
+        # WIDTH IS AN ISSUE-SLOT MINIMISATION, and it is DERIVE tier: no literal, just the detected
+        # step. A masked tail costs a whole iteration regardless of how few rows survive the mask
+        # (kb `pureblas-tail-cost-is-the-issue-slot`), so the two arms cost
+        #     full: ceil(m/cstep)          half: ceil(m/(cstep/2)) / 2
+        # and half strictly wins exactly when the remainder is at most half a step — it absorbs the
+        # tail in a half-price iteration instead of a full-price one. Ties go to full, which has the
+        # longer loop body and fewer iterations of overhead. Measured wintermute (ratio half/full,
+        # NC=4, freq-locked): m=50 1.039/1.065, m=100 1.036/1.078 (T/C) where the rule picks half;
+        # m=128 0.992/1.008, m=256 0.995/1.024 where it picks full. Above L2 the residency ladder
+        # below owns the choice and this does not apply.
+        cstep = (_CGEMVT_HALF ? _vwidth(T) : 2 * _vwidth(T)) ÷ 2
+        r = rem(m, cstep)
+        if !_CGEMVT_HALF && !iszero(r) && 2r <= cstep
+            return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(true))
+        end
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(_CGEMVT_HALF))
     end
     cfg = _cgemvt_cfg()
