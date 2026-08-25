@@ -1297,23 +1297,34 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     # are never read and never written, which also keeps the store inside the array (no OOB).
     # Lane l (1-based) carries complex element (l+1)>>1; predicate is `<= (m - i)` remaining elements.
     # Generation-time literal, not an `ntuple` closure in the quote (that breaks @generated purity).
-    clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:(2W))...)
+    # ...at HALF the main vector's width, because a masked iteration costs its ISSUE SLOT rather than
+    # its live lanes (kb `pureblas-tail-cost-is-the-issue-slot`): a full-width masked tail costs a whole
+    # main iteration no matter how few rows survive the mask. Looping at half width costs half that and
+    # is never worse — a remainder of W-1 takes at most 2 half-steps, the same slots as 1 full one.
+    HW = W; VH = Vec{HW, T}; hstep = max(1, W ÷ 2)              # VH holds W/2 complex (half of V2's W)
+    hswp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(HW - 1))...)
+    hclane = Expr(:tuple, ((l + 1) >> 1 for l in 1:HW)...)
+    haltv = Expr(:tuple, (iseven(l) ? one(T) : -one(T) for l in 0:(HW - 1))...)
     tail = quote
-        msk = Vec($clane) <= (m - i)
+        msk = Vec($hclane) <= (m - i)
         off = i * 2 * $sz
+        haltv = $VH($haltv)
     end
     for c in 1:NC
         av = Symbol(:av, c)
-        push!(tail.args, :($av = vload($V2, $(Symbol(:b, c)) + off, msk)))
+        push!(tail.args, :($av = vload($VH, $(Symbol(:b, c)) + off, msk)))
+        # cr/ci are broadcasts of ONE scalar each; ci is already sign-folded by altv, whose lane 1 is
+        # +1, so ci[1] recovers the raw scalar and the half-width fold is a fresh multiply by haltv.
+        crh = :($VH($(Symbol(:cr, c))[1])); cih = :($VH($(Symbol(:ci, c))[1]) * haltv)
         if c == 1
-            push!(tail.args, :(Pv = $av * cr1; Qv = $av * ci1))
+            push!(tail.args, :(Pv = $av * $crh; Qv = $av * $cih))
         else
-            push!(tail.args, :(Pv = muladd($av, $(Symbol(:cr, c)), Pv)))
-            push!(tail.args, :(Qv = muladd($av, $(Symbol(:ci, c)), Qv)))
+            push!(tail.args, :(Pv = muladd($av, $crh, Pv)))
+            push!(tail.args, :(Qv = muladd($av, $cih, Qv)))
         end
     end
-    push!(tail.args, :(yv = vload($V2, yp + off, msk)))
-    push!(tail.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($swp))))
+    push!(tail.args, :(yv = vload($VH, yp + off, msk)))
+    push!(tail.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($hswp))))
     push!(tail.args, :(vstore(yv, yp + off, msk)))
     push!(body.args, :(i = 0))
     push!(
@@ -1325,8 +1336,8 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     )
     push!(
         body.args, :(
-            if i < m
-                $tail
+            while i < m
+                $tail; i += $hstep
             end
         )
     )
@@ -1604,6 +1615,12 @@ end
     # Interleaved complex: real lane l (1-based) carries complex element (l+1)>>1, so the lane-index
     # vector is [1,1,2,2,…] and the predicate is `<= (m - i)` remaining COMPLEX elements. Built as a
     # generation-time literal, NOT an `ntuple` closure inside the quote — that breaks @generated purity.
+    # It stays at FULL width here, unlike `_gemv_n_ri_panel!`'s half-width tail. Half width would cost
+    # half the issue slots (kb `pureblas-tail-cost-is-the-issue-slot`) and predicted +3.8% at m=100, but
+    # this kernel holds 2·NC live full-width accumulators and a half-width tail needs 2·NC MORE. That
+    # spilled the main loop: measured -8% at EVERY size, aligned ones included where the tail never runs
+    # (m=128 75.7 -> 69.8 GB/s, m=96 73.2 -> 67.1). Reverted 2026-08-25. The full-width masked tail adds
+    # no registers and no extra fold. FALSIFIED — do not re-try half width here without shrinking NC.
     clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:lanes)...)
     mtail = quote
         msk = Vec($clane) <= (m - i)
