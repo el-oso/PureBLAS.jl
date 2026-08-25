@@ -1290,24 +1290,31 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     push!(inner.args, :(yv = vload($V2, yp + off)))
     push!(inner.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($swp))))   # sign pre-folded into Qv
     push!(inner.args, :(vstore(yv, yp + off)))
+    # Masked row tail: ONE predicated iteration replaces the per-row scalar loop over the `m % W`
+    # remaining complex rows. Same defect and same fix as `_gemv_tc_block_cmplx!` — the scalar tail
+    # ran ~5-6x worse per row than the SIMD body, so every m not a multiple of W lost 15-22%.
+    # y is read-modify-write here, so the tail needs a masked LOAD and a masked STORE: inactive lanes
+    # are never read and never written, which also keeps the store inside the array (no OOB).
+    # Lane l (1-based) carries complex element (l+1)>>1; predicate is `<= (m - i)` remaining elements.
+    # Generation-time literal, not an `ntuple` closure in the quote (that breaks @generated purity).
+    clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:(2W))...)
     tail = quote
-        acr = zero($T); aci = zero($T)
-    end                  # scalar row tail (m % W complex rows)
-    for c in 1:NC
-        push!(
-            tail.args, quote
-                arr = unsafe_load($(Symbol(:b, c)), 2i + 1); aii = unsafe_load($(Symbol(:b, c)), 2i + 2)
-                acr += arr * $(Symbol(:cr, c))[1] - aii * $(Symbol(:ci, c))[1]
-                aci += arr * $(Symbol(:ci, c))[1] + aii * $(Symbol(:cr, c))[1]
-            end
-        )
+        msk = Vec($clane) <= (m - i)
+        off = i * 2 * $sz
     end
-    push!(
-        tail.args, quote
-            unsafe_store!(yp, unsafe_load(yp, 2i + 1) + acr, 2i + 1)
-            unsafe_store!(yp, unsafe_load(yp, 2i + 2) + aci, 2i + 2)
+    for c in 1:NC
+        av = Symbol(:av, c)
+        push!(tail.args, :($av = vload($V2, $(Symbol(:b, c)) + off, msk)))
+        if c == 1
+            push!(tail.args, :(Pv = $av * cr1; Qv = $av * ci1))
+        else
+            push!(tail.args, :(Pv = muladd($av, $(Symbol(:cr, c)), Pv)))
+            push!(tail.args, :(Qv = muladd($av, $(Symbol(:ci, c)), Qv)))
         end
-    )
+    end
+    push!(tail.args, :(yv = vload($V2, yp + off, msk)))
+    push!(tail.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($swp))))
+    push!(tail.args, :(vstore(yv, yp + off, msk)))
     push!(body.args, :(i = 0))
     push!(
         body.args, :(
@@ -1318,8 +1325,8 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     )
     push!(
         body.args, :(
-            while i < m
-                $tail; i += 1
+            if i < m
+                $tail
             end
         )
     )
@@ -1589,6 +1596,28 @@ end
             end
         )
     )
+    # Masked tail: ONE predicated vector iteration, accumulated into the SAME p/q registers as the
+    # main loop, so it must run BEFORE the fold below. It replaces a per-row scalar loop that walked
+    # `rem(m, cstep)` rows doing NC scalar FMA pairs each. That tail was ~5-6x worse per row than the
+    # SIMD body, so on Zen4 (cstep=8) every m not a multiple of 8 lost 15-22%: measured zgemvT
+    # 73.1 GB/s at m=96 vs 61.3 at m=100 — a 4-row remainder costing 20% of total runtime.
+    # Interleaved complex: real lane l (1-based) carries complex element (l+1)>>1, so the lane-index
+    # vector is [1,1,2,2,…] and the predicate is `<= (m - i)` remaining COMPLEX elements. Built as a
+    # generation-time literal, NOT an `ntuple` closure inside the quote — that breaks @generated purity.
+    clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:lanes)...)
+    mtail = quote
+        msk = Vec($clane) <= (m - i)
+        xc = vload($V2, xr + i * 2 * $sz, msk); xcs = shufflevector(xc, Val($swp))
+    end
+    for c in 1:NC
+        av = Symbol(:av, c)
+        push!(mtail.args, :($av = vload($V2, Ar + (i + $(c - 1) * lda) * 2 * $sz, msk)))
+        push!(mtail.args, :($(Symbol(:p, c)) = muladd($av, xc, $(Symbol(:p, c)))))
+        push!(mtail.args, :($(Symbol(:q, c)) = muladd($av, xcs, $(Symbol(:q, c)))))
+    end
+    push!(body.args, :(@inbounds if i < m
+        $mtail
+    end))
     for c in 1:NC
         pf = Symbol(:pf, c); qf = Symbol(:qf, c)   # unique names — must NOT collide with accumulators p$c/q$c
         push!(
@@ -1600,25 +1629,6 @@ end
             end
         )
     end
-    tail = quote
-        xrr = unsafe_load(xr, 2i + 1); xii = unsafe_load(xr, 2i + 2)
-    end
-    for c in 1:NC
-        push!(
-            tail.args, quote
-                arr = unsafe_load(Ar, 2 * (i + $(c - 1) * lda) + 1); aii = unsafe_load(Ar, 2 * (i + $(c - 1) * lda) + 2)
-                $(Symbol(:sr, c)) += arr * xrr + $(CJ ? :(aii * xii) : :(-aii * xii))
-                $(Symbol(:si, c)) += arr * xii + $(CJ ? :(-aii * xrr) : :(aii * xrr))
-            end
-        )
-    end
-    push!(
-        body.args, :(
-            @inbounds while i < m
-                $tail; i += 1
-            end
-        )
-    )
     for c in 1:NC
         push!(
             body.args, quote
