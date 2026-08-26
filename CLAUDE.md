@@ -286,6 +286,40 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   **Write back too** (`kb/CLAUDE.md` rule #2): a diagnosis, decision, or disproven idea belongs in a
   `findings/` file plus a `wiki/index.md` refresh. A commit message is not the kb — the kb sat dormant
   2026-07-12 → 2026-07-30 while five campaigns shipped.
+- **EXPLOIT StrictMode TO ITS MAXIMUM when tuning kernels or testing. Failing to is UNACCEPTABLE, not
+  merely suboptimal — its STATIC checks come BEFORE any hand-rolled analysis, probe, or guessed
+  mechanism.** StrictMode is not a generic third-party utility that happens to be installed: it is
+  **purpose-built for this project and the Pure ecosystem** — it exists precisely because these SIMD
+  kernels needed properties like "did this vectorize", "did it spill", "is there a scalar loop" made
+  checkable instead of discovered later with a profiler. It is a `[deps]` dependency of this project
+  (main env, NOT `bench/`). Hand-rolling an analysis it already provides is a process failure, and the
+  surface is far wider than the `kernel_report` that gets reached for by habit. Match the tool to the
+  symptom, and run it *before* writing a probe:
+
+  | symptom / question | tool |
+  |---|---|
+  | is there a scalar tail / glue loop? | `scalar_fp_loops`, `@assert_no_scalar_loops` |
+  | did this vectorize at all? | `@assert_vectorized` |
+  | did adding accumulators SPILL? (tell: the change hurts even ALIGNED sizes) | `spill_report`, `@assert_no_spill`, `register_report` |
+  | where do the cycles go — port pressure, IPC, recurrence depth? | `mca_report`, `@assert_mca` |
+  | arithmetic intensity / shuffle-port bound? | `kernel_report` |
+  | is this call actually inlined? | `@assert_inlined`, `inline_suggestions` |
+  | boxing / instability / allocation on a hot path | `@assert_noboxing`, `@assert_typestable`, `@assert_noalloc` |
+  | trim/.so safety | `@assert_trim_safe`, `explain_trim` |
+
+  **Why this is a rule:** on 2026-08-25/26 three separate investigations were run by edit-measure-revert
+  that a static check answers in seconds — eleven "SIMD body + scalar tail" kernels found one at a time
+  with 25-second sawtooth probes (`scalar_fp_loops` detects exactly that class, and its source comment
+  names it); a gemv-T/C regression that hurt even ALIGNED sizes, diagnosed as a register spill only
+  after writing the code (`spill_report`); and the `@generated` inline-meta hazard, tested by
+  edit/measure/revert and falsified (`@assert_inlined`). Two independent subagents also asserted
+  "PureBLAS has nothing equivalent to llvm-mca" — wrong; `mca_report` was always there.
+  **Notes:** `mca_report` needs `LLVM_full_jll` (`using LLVM_full_jll`, ~680 MiB **weak** dep — Julia
+  ships libLLVM but NOT the `llvm-mca` CLI; do **not** apt-install it). These checks are static and need
+  no privileges, unlike perf counters (`perf_event_paranoid` gates those on this fleet) — so the static
+  pass is always the cheaper first move. A check that reports "clean" for everything is worthless
+  evidence: give it a POSITIVE CONTROL (a known-bad shape) before believing a negative sweep.
+
 - **A sub-1.0 PB/OB ratio is NEVER a "ceiling" — it is an implementation gap.** OpenBLAS runs on the
   *same silicon*; if it reaches ≥1.0, the hardware is demonstrably capable, so any `PB/OB < 1.0` is an
   algorithm/kernel-formulation problem in PureBLAS, full stop. Do **not** write "ceiling," "near-ceiling,"
