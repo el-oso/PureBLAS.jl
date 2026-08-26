@@ -40,6 +40,14 @@ const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS
 # 1024 (panel 0.91→0.96 at m=1024). Derived from sizeof so cgetf2 (ComplexF32) tracks the same criterion.
 const _CGETF2_BASE = _GETF2_BASE * (sizeof(ComplexF64) ÷ sizeof(Float64))   # = 32
 
+# Complex izamax SIMD/scalar crossover — see the measured table at its use site in `_clu_fact1!`.
+# PDM: Literal — cost-ratio crossover between two ALGORITHMS (fixed SIMD setup vs per-element scalar
+# scan); no cache or ISA quantity to derive from. `max(4W, ...)` keeps the SIMD kernel's OOB-lane
+# precondition explicit rather than implied by the constant happening to be large.
+const _CIAMAX_SIMD_MIN = @load_preference(
+    "ciamax_simd_min", max(4 * _vwidth(Float64), 128)
+)::Int   # req8-ok: measured crossover, wintermute table at use site
+
 # Apply the sequential row interchanges recorded in ipiv[ip0+1 : ip0+np] to columns j1:j2 of panel view V,
 # LOCAL to V (ipiv holds GLOBAL rows = roff + local). Pivot t swaps V-row (rowbase+t) ↔ V-row (ipiv[ip0+t]
 # - roff). Used only inside _getf2_blocked! for the cross-half swaps; the flat base does its own swaps.
@@ -214,7 +222,20 @@ end
     lidx(i, k) = (k - 1) * ld + i
     cptr(i, k) = p + ((k - 1) * ld + (i - 1)) * csz
     nrows = mp - jl + 1
-    rel = if nrows >= 4 * _vwidth(R)                                # SIMD izamax needs n ≥ 4W (else OOB lanes)
+    # ALGORITHM-SWITCH CROSSOVER, not a residency block. `4*_vwidth(R)` (= 32 on AVX-512, 16 on AVX2)
+    # was far too low: it only ever encoded the SIMD kernel's OOB-lane requirement (n >= 4W), never
+    # where the SIMD kernel actually becomes FASTER. `_iamax_cmplx_simd!` carries ~197 cycles of fixed
+    # setup (horizontal argmax reduction + frame), so at panel lengths the scalar cabs1 argmax WINS —
+    # by 3.2x at n=32 and 2.0x at n=64. Measured wintermute (ns/call, SIMD vs scalar):
+    #     n=  32   78.9 / 24.9      n= 256   161.0 / 242.6   <- SIMD ahead from here
+    #     n=  64  105.9 / 54.0      n=1024   443.8 / 1001.4
+    #     n= 128  119.4 / 116.8     n=4096  1564.8 / 4042.5
+    # izamax was 35% of the zgetrf(50) panel (2.87 us of 8.11) at 7.3 cycles per complex element.
+    # req8-ok: a cost-ratio crossover between two ALGORITHMS with no cache or ISA quantity to derive
+    # from — same classification as `_GETF2_BASE` above; literal validated by the table. Still >= 4W,
+    # so the OOB-lane precondition the old guard enforced continues to hold by a wide margin.
+    # NEEDS FLEET VALIDATION: measured on Zen4 only; re-run on Zen3/Zen5 before trusting the value.
+    rel = if nrows >= _CIAMAX_SIMD_MIN                              # >= 4W always, see above
         _iamax_cmplx_simd!(nrows, Ptr{R}(cptr(jl, jl)))
     else
         b = 1; m = -one(R)                                          # scalar cabs1 argmax (LAPACK izamax metric)
