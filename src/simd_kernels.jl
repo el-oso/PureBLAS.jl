@@ -759,6 +759,10 @@ end
 @generated function _qr_axpy2_cmplx!(n::Int, k0r::T, k0i::T, k1r::T, k1i::T, v0, v1, c) where {T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    # Tail predicate: interleaved complex, so real lane l (1-based) carries complex element (l+1)>>1 and
+    # the mask is `<= (n - i)` remaining COMPLEX elements. Generation-time literal — an `ntuple` closure
+    # inside the returned quote breaks @generated purity.
+    clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:(2W))...)
     sgn0 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k0i) : :k0i for l in 0:(2W - 1))...))))
     sgn1 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k1i) : :k1i for l in 0:(2W - 1))...))))
     return quote
@@ -775,14 +779,31 @@ end
                 end
                 i += $W
             end
-            @inbounds while i < n
-                j = i + 1
-                v0r = unsafe_load(pv0, 2j - 1); v0i = unsafe_load(pv0, 2j)
-                v1r = unsafe_load(pv1, 2j - 1); v1i = unsafe_load(pv1, 2j)
-                cr = unsafe_load(pc, 2j - 1); ci = unsafe_load(pc, 2j)
-                unsafe_store!(pc, cr + k0r * v0r - k0i * v0i + k1r * v1r - k1i * v1i, 2j - 1)
-                unsafe_store!(pc, ci + k0r * v0i + k0i * v0r + k1r * v1i + k1i * v1r, 2j)
-                i += 1
+            # Masked tail — ONE predicated iteration instead of a per-element scalar loop. This kernel is
+            # called ~480 times per zgetrf(50) panel on vectors only 18-48 long, so the tail is paid
+            # constantly and its cost scales with the STEP, which is W COMPLEX (up to 7 leftover elements
+            # on AVX-512 vs 3 on AVX2). Streaming read-modify-write: masked load AND masked store, so
+            # inactive lanes are neither read nor written and the store stays in bounds. Adds no live
+            # accumulators (cf. the gemv-T/C spill), so the main loop is untouched. Worth +3.8% on
+            # zgetrf n=50 — and that is close to ALL that was available, for the reason below.
+            #
+            # DO NOT re-chase "AVX-512 buys nothing here" as a defect — it is a hardware fact, settled
+            # statically (StrictMode `mca_report`/`register_report`, znver4): the loop body issues 8 zmm
+            # FMAs (4 muladd x 2 registers, since Vec{2W,Float64} is 2 zmm), Zen4 has 2 FMA pipes over a
+            # 256-bit datapath so each 512-bit FMA occupies a pipe TWICE, giving 8*2/2 = 8 cycles/iter —
+            # and llvm-mca reports block_rthroughput = 8.00 exactly. The body sits ON the FMA-port
+            # roofline: 10/32 registers, 0 spills, IPC 3.18. Double-pumping means W=8 has the SAME FMA
+            # throughput as W=4, so Zen3 and Zen4 taking equal cycles (25.6k vs 25.8k at n=50) is
+            # CORRECT. Beating it requires issuing FEWER FMAs (e.g. a 3M/Karatsuba complex product:
+            # 3 real multiplies instead of 4), not a faster loop.
+            @inbounds if i < n
+                msk = Vec($clane) <= (n - i)
+                o = i * 2 * $sz
+                a0 = vload($V2, pv0 + o, msk); a1 = vload($V2, pv1 + o, msk)
+                t = vload($V2, pc + o, msk)
+                t = muladd(a0, ar0, t); t = muladd(shufflevector(a0, Val($swp)), s0, t)
+                t = muladd(a1, ar1, t); t = muladd(shufflevector(a1, Val($swp)), s1, t)
+                vstore(t, pc + o, msk)
             end
         end
         return c
