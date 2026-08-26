@@ -810,6 +810,65 @@ end
     end
 end
 
+# Multi-column form of `_qr_axpy2_cmplx!`: applies the SAME rank-2 update to `ncols` consecutive
+# trailing columns in ONE call, instead of one call per column.
+#
+# WHY: `_cgetf2_simd!` drove the single-column kernel ~240 times per zgetrf(50) panel, on vectors of
+# only 18-48 elements (2-6 main-loop iterations each). Measured per-call overhead by fitting
+# t = a + b*n over the range the panel actually uses: **a = 6.66 ns = 18.7 cycles**, which is 58% of
+# the call at n=18 and 34% at n=48. Folding the column loop inside removes that per-call cost
+# (~240 * 18.7 = 4.5 kcyc of a 66 kcyc factorization).
+#
+# The column loop stays OUTER and the row loop INNER — deliberately, and NOT to save the v0/v1 loads.
+# Hoisting rows outside would reuse those loads but would then have to rebuild the `ar0/ar1/s0/s1`
+# broadcasts per (row-block, column) instead of once per column, and the per-column op count comes out
+# the same either way. The win here is the call boundary, nothing else; do not "improve" this by
+# swapping the loops without measuring.
+#
+# BIT-IDENTICAL to the per-column form: each column sees the same four FMAs, in the same order, on the
+# same data. `lu.jl` relies on that (its blocked and flat panel paths must agree bit-for-bit).
+# u0/u1 are read from rows jl and jl+1 of each column rather than passed in, so no scratch is needed —
+# the caller must have already stored U[jl+1, jc] there (it does, in the pass just above the call).
+@generated function _qr_axpy2_cols_cmplx!(
+        n::Int, ncols::Int, prow0::Ptr{Complex{T}}, prow1::Ptr{Complex{T}},
+        pv0c::Ptr{Complex{T}}, pv1c::Ptr{Complex{T}}, pcc::Ptr{Complex{T}}, ldc::Int
+    ) where {T <: BlasReal}
+    W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
+    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
+    clane = Expr(:tuple, ((l + 1) >> 1 for l in 1:(2W))...)
+    sgn0 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k0i) : :k0i for l in 0:(2W - 1))...))))
+    sgn1 = :($V2($(Expr(:tuple, (iseven(l) ? :(-k1i) : :k1i for l in 0:(2W - 1))...))))
+    return quote
+        csz = sizeof(Complex{$T})
+        pv0 = Ptr{$T}(pv0c); pv1 = Ptr{$T}(pv1c)
+        @inbounds for jc in 0:(ncols - 1)
+            off = jc * ldc * csz
+            u0 = -unsafe_load(prow0 + off); u1 = -unsafe_load(prow1 + off)
+            k0r = real(u0); k0i = imag(u0); k1r = real(u1); k1i = imag(u1)
+            pc = Ptr{$T}(pcc + off)
+            ar0 = $V2(k0r); ar1 = $V2(k1r); s0 = $sgn0; s1 = $sgn1; i = 0
+            while i + $W <= n
+                o = i * 2 * $sz
+                a0 = vload($V2, pv0 + o); a1 = vload($V2, pv1 + o); t = vload($V2, pc + o)
+                t = muladd(a0, ar0, t); t = muladd(shufflevector(a0, Val($swp)), s0, t)
+                t = muladd(a1, ar1, t); t = muladd(shufflevector(a1, Val($swp)), s1, t)
+                vstore(t, pc + o)
+                i += $W
+            end
+            if i < n
+                msk = Vec($clane) <= (n - i)
+                o = i * 2 * $sz
+                a0 = vload($V2, pv0 + o, msk); a1 = vload($V2, pv1 + o, msk)
+                t = vload($V2, pc + o, msk)
+                t = muladd(a0, ar0, t); t = muladd(shufflevector(a0, Val($swp)), s0, t)
+                t = muladd(a1, ar1, t); t = muladd(shufflevector(a1, Val($swp)), s1, t)
+                vstore(t, pc + o, msk)
+            end
+        end
+        return nothing
+    end
+end
+
 @inline function _copy_simd!(n::Int, x, y) # T inferred from the pointer/array element type
     T = _et(x); px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
