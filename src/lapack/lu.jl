@@ -261,13 +261,25 @@ function _cgetf2_simd!(p::Ptr{Tc}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, i
         mt > 0 && _axpy_cmplx_simd!(mt, -real(u), -imag(u), cptr(jl + 1, jl), cptr(jl + 1, jl + 1))
         _clu_fact1!(p, ld, mp, jl + 1, pb, roff, ipiv, ioff) && info == 0 && (info = roff + jl + 1)
         mt2 = mp - jl - 1
-        for jc in (jl + 2):pb                                      # fused rank-2 trailing update
-            a0 = unsafe_load(p, lidx(jl, jc)); u0 = -a0
+        # Fused rank-2 trailing update, in TWO passes rather than one call per column.
+        # Pass 1 computes U[jl+1, jc] exactly as before and stores it; pass 2 applies the rank-2
+        # update to ALL trailing columns in ONE kernel call. Splitting this way is what lets the
+        # kernel read u0/u1 straight out of rows jl and jl+1 (pass 1 has already put them there),
+        # so no scratch is needed. Arithmetic per column is UNCHANGED and in the same order, so the
+        # result stays bit-identical to the flat sweep — `_getf2_blocked!` depends on that.
+        # Motivation: the per-column form cost 18.7 cycles of call overhead x ~240 calls per
+        # zgetrf(50) panel (measured by fitting t = a + b*n over the 18-48 element range the panel
+        # actually uses). See `_qr_axpy2_cols_cmplx!`.
+        for jc in (jl + 2):pb
+            a0 = unsafe_load(p, lidx(jl, jc))
             uc = unsafe_load(p, lidx(jl + 1, jc)) - a0 * unsafe_load(p, lidx(jl + 1, jl))  # U[jl+1,jc]
-            unsafe_store!(p, uc, lidx(jl + 1, jc)); u1 = -uc
-            mt2 > 0 && _qr_axpy2_cmplx!(
-                mt2, real(u0), imag(u0), real(u1), imag(u1),
-                cptr(jl + 2, jl), cptr(jl + 2, jl + 1), cptr(jl + 2, jc)
+            unsafe_store!(p, uc, lidx(jl + 1, jc))
+        end
+        if mt2 > 0 && pb >= jl + 2
+            _qr_axpy2_cols_cmplx!(
+                mt2, pb - jl - 1,
+                cptr(jl, jl + 2), cptr(jl + 1, jl + 2),
+                cptr(jl + 2, jl), cptr(jl + 2, jl + 1), cptr(jl + 2, jl + 2), ld
             )
         end
         jl += 2
