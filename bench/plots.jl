@@ -418,7 +418,15 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
             qs = Dict{String, Vector{Float64}}()
             for a in arms
                 w = a == _ARM_PB ? work_pb : (_use_ref!(a); work_ob)
+                # Bracket the window — see the note on the other measurement loop. THERE ARE TWO of
+                # them (this one drives L1/L2, the other the rep-pool levels) and instrumenting only
+                # one is why the first run with `flo|fhi` wrote EMPTY ranges for every L1/L2 cell:
+                # the field was present, the samples were never taken, and `cellcycles.jl` correctly
+                # reported `wobble ?` for cells that had in fact just been measured. If a third
+                # measurement path is ever added it needs these two calls too.
+                _khz_obs!(_cell_khz())
                 b = @be mk(s) (c -> w(c, reps)) evals = 1 samples = samples seconds = seconds
+                _khz_obs!(_cell_khz())
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
