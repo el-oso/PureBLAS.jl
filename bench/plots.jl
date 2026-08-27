@@ -1674,7 +1674,26 @@ function save_cache(path, groups)
             produce a cacheable gate measurement."
         return nothing
     end
-    open(path, "w") do io
+    # ── VALIDATE BEFORE TRUNCATING ────────────────────────────────────────────────────────────────
+    # `open(path, "w")` truncates IMMEDIATELY, so any guard that throws from inside the do-block
+    # destroys the cache it was protecting. That happened on 2026-08-27: neuromancer drifted above its
+    # pin, `check_achieved` correctly refused mid-write, and the 863-cell Zen5 cache — including the
+    # openblas/aocl reference arms that the "never re-measure a reference" rule exists to protect —
+    # was left at 0 bytes. Recovered only because an unrelated copy happened to be in /tmp.
+    # So the freq check runs HERE, before the file is opened, and the write itself goes to a temp file
+    # that is renamed over the target only after it closes cleanly. A crash mid-write now costs
+    # nothing; the previous cache survives untouched.
+    khz_pre = try
+        _achieved_khz()
+    catch
+        0
+    end
+    # THE PIN IS NOT THE CLOCK — refuse a cache whose cells were measured above the pinned ceiling
+    # even though the pin reads correct. `_require_lock` at entry cannot see this; only a sample taken
+    # under load can. See FreqLock.check_achieved for the incident.
+    _MEASURED_ANYTHING[] && FreqLock.check_achieved(khz_pre; what = "write a gate cache")
+    tmppath = path * ".tmp$(getpid())"
+    open(tmppath, "w") do io
         # header stamps the methodology version (so old numbers can't silently coexist), the µarch identity
         # (slug/isa) for the multi-host plot, and full provenance: CPU model, code commit, measure time,
         # and the RESOLVED Measure-tier tuning state (`tune=`).
@@ -1697,10 +1716,7 @@ function save_cache(path, groups)
         catch
             0
         end
-        # THE PIN IS NOT THE CLOCK — refuse a cache whose cells were measured above the pinned
-        # ceiling even though the pin reads correct. `_require_lock` at entry cannot see this; only
-        # a sample taken under load can. See FreqLock.check_achieved for the incident.
-        _MEASURED_ANYTHING[] && FreqLock.check_achieved(khz; what = "write a gate cache")
+        # (the freq guard now runs BEFORE the file is opened — see the note above `open(tmppath)`)
         println(
             io, "#pbbench\tversion=$(_BENCH_VERSION)\tslug=$SLUG\tuarch=$(_MYUARCH)\tisa=$ISA",
             "\thost=$(gethostname())\tcpu=$(_CPUNAME)\tcommit=$(_COMMIT)\ttime=$ts",
@@ -1740,6 +1756,10 @@ function save_cache(path, groups)
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
         end
     end
+    # Atomic publish: the previous cache is only replaced once the new one is complete on disk.
+    # `mv` within the same directory is a rename(2), so there is no window where the target is
+    # partial. If anything above threw, `tmppath` is left behind and the real cache is untouched.
+    mv(tmppath, path; force = true)
     return println("cached arm times → $path")
 end
 # Returns (groups, meta::NamedTuple). meta carries version/slug/isa/host from the header (µarch identity
