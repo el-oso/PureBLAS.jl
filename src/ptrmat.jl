@@ -88,6 +88,24 @@ end
 @inline _strided1(A) = A isa StridedMatrix && stride(A, 1) == 1
 @inline _strided1(::PtrMatrix) = true
 
+# VECTOR analogue of `_strided1`, and it exists for the same reason — with a measured incident behind it.
+#
+# The BLAS-2 fast-path predicates (`_l2_simd_ok`, `_l2c_simd_ok`) ask `x isa StridedVector && stride(x,1)
+# == 1`. `_strided1` was taught about `PtrMatrix` so the C-ABI's matrix argument passes; the VECTOR half
+# was never taught about `Ptr`, and the C-ABI passes raw `Ptr{T}` vectors. A raw pointer IS unit-stride
+# by construction — it is the densest possible representation — but `Ptr <: StridedVector` is false, so
+# every C-ABI BLAS-2 call failed the guard and fell to the generic scalar loop.
+#
+# MEASURED (Zen5, dgemv trans='T', A = 400x200, the PureOSQP inner-loop shape):
+#     OpenBLAS                                     10.40 us   1.00x
+#     PureBLAS, native call (Matrix, Vector)        6.54 us   1.59x   <- kernel is FASTER than OB
+#     PureBLAS, via activate()/LBT (PtrMatrix, Ptr) 104.08 us  0.10x   <- 16x slower, same kernel
+# So an application using `activate()` got the scalar path for every gemv while the gate — which calls
+# natively — saw the SIMD path and reported gemvT passing. No gate row could see it. Same class as the
+# `izamax` C-ABI miss recorded in level1.jl: "a wire-the-fastest-path miss that no gate row could see".
+@inline _dense1(x) = x isa StridedVector && stride(x, 1) == 1
+@inline _dense1(::Ptr) = true
+
 # ===== Container-type normalization for the gemm kernels =====
 #
 # The microkernels only ever consume `pointer`, `stride(·,2)` and the dims, but they were specialized on

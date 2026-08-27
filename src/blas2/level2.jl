@@ -23,14 +23,14 @@ end
     T = eltype(A)
     return incx == 1 && incy == 1 && T <: BlasReal && eltype(x) === T && eltype(y) === T &&
         _strided1(A) &&
-        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+        _dense1(x) && _dense1(y)
 end
 # Complex analog: unit-stride, contiguous, matching complex eltypes → the complex-SIMD L2 kernels apply.
 @inline function _l2c_simd_ok(A, x, y, incx::Integer, incy::Integer)
     T = eltype(A)
     return incx == 1 && incy == 1 && T <: BlasComplex && eltype(x) === T && eltype(y) === T &&
         _strided1(A) &&
-        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+        _dense1(x) && _dense1(y)
 end
 
 # gemv-N row-block height in vectors (mr = _GEMV_MR·W rows). MR=8 keeps 8 accumulators feeding both FMA
@@ -1005,7 +1005,10 @@ const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines
 # lookup inside the timed region.
 function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where {T <: BlasReal}
     GC.@preserve A x y begin
-        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
+        # unit-stride representation) and `pointer(::Ptr)` is undefined. `_ptr(::Ptr) = p` /
+        # `_ptr(a) = pointer(a)` const-folds either way, so the native path is unchanged.
+        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
         j = 0
         while j + nc <= n
             if nc >= 16
@@ -1059,7 +1062,10 @@ end
         m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
     ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
-        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
+        # unit-stride representation) and `pointer(::Ptr)` is undefined. `_ptr(::Ptr) = p` /
+        # `_ptr(a) = pointer(a)` const-folds either way, so the native path is unchanged.
+        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
         # Column blocking exists to amortise the x RE-READ across NC columns. It only pays in two
         # regimes, and LOSES between them — route on the physics rather than blocking unconditionally.
         #   • A ≤ L2: compute-bound, and the NC independent dot accumulators supply the ILP. Blocked.
@@ -1158,7 +1164,7 @@ end
     T = eltype(A)
     return incx == 1 && incy == 1 && T <: BlasComplex && eltype(x) === T && eltype(y) === T &&
         _strided1(A) &&
-        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+        _dense1(x) && _dense1(y)
 end
 
 # Complex gemv-N row-tile height (in W-complex vectors). Each y-tile is a Vec{2W} accumulator (AVX2 →
@@ -1985,7 +1991,10 @@ end
 
 @inline function _ger_panel_driver!(m::Int, n::Int, α::T, x, y, A, ::Val{NP}) where {T <: BlasReal, NP}
     GC.@preserve A x y begin
-        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
+        # unit-stride representation) and `pointer(::Ptr)` is undefined. `_ptr(::Ptr) = p` /
+        # `_ptr(a) = pointer(a)` const-folds either way, so the native path is unchanged.
+        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
         jc = 0
         while jc + NP <= n
             _ger_panel!(Aptr, lda, xptr, yptr, jc, m, α, 0, Val(NP), Val(_GER_PANEL_U))   # pf=0: NP is the lever
@@ -2018,7 +2027,10 @@ end
     m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (galen n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
-        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
+        # unit-stride representation) and `pointer(::Ptr)` is undefined. `_ptr(::Ptr) = p` /
+        # `_ptr(a) = pointer(a)` const-folds either way, so the native path is unchanged.
+        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
         @inbounds for j in 1:n
             ayj = α * unsafe_load(yptr, j)
             iszero(ayj) || _axpy_simd!(m, ayj, xptr, Aptr + (j - 1) * lda * sz, pf)  # A[:,j] += ayj·x
