@@ -234,7 +234,15 @@ end
     # req8-ok: a cost-ratio crossover between two ALGORITHMS with no cache or ISA quantity to derive
     # from — same classification as `_GETF2_BASE` above; literal validated by the table. Still >= 4W,
     # so the OOB-lane precondition the old guard enforced continues to hold by a wide margin.
-    # NEEDS FLEET VALIDATION: measured on Zen4 only; re-run on Zen3/Zen5 before trusting the value.
+    # FLEET-VALIDATED 2026-08-27, and the crossover is µarch-INVARIANT — it does NOT scale with W,
+    # which is why no formula over `_vwidth` can express it (SIMD/scalar time ratio, >1 = scalar wins):
+    #     nrows      32     64    128     256
+    #     Zen3 W=4  1.86   1.28   0.98    0.84
+    #     Zen4 W=8  3.17   1.96   1.02    0.66
+    #     Zen5 W=8  3.36   1.38   0.94    0.66
+    # Note the OLD guard was WORSE on the wider box (4W = 16 on AVX2, 32 on AVX-512), so AVX-512 took
+    # the slow path over a wider band — which reads as "AVX-512 buys nothing" and invites a hunt for a
+    # vectorisation defect that does not exist. On Zen3 every column of a 50-row panel was on it.
     rel = if nrows >= _CIAMAX_SIMD_MIN                              # >= 4W always, see above
         _iamax_cmplx_simd!(nrows, Ptr{R}(cptr(jl, jl)))
     else
