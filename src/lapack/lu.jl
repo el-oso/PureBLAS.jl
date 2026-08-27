@@ -44,9 +44,12 @@ const _CGETF2_BASE = _GETF2_BASE * (sizeof(ComplexF64) ÷ sizeof(Float64))   # =
 # PDM: Literal — cost-ratio crossover between two ALGORITHMS (fixed SIMD setup vs per-element scalar
 # scan); no cache or ISA quantity to derive from. `max(4W, ...)` keeps the SIMD kernel's OOB-lane
 # precondition explicit rather than implied by the constant happening to be large.
-const _CIAMAX_SIMD_MIN = @load_preference(
-    "ciamax_simd_min", max(4 * _vwidth(Float64), 128)
-)::Int   # req8-ok: measured crossover, wintermute table at use site
+# NOTE the single-line spelling: `test/knob_registry.jl` matches `@load_preference("key", …)` with a
+# SINGLE-LINE regex, so a wrapped call is silently invisible to the registry that exists to enumerate
+# every knob. Keep it on one line.
+# PDM: Literal — algorithm cost-ratio crossover (fixed SIMD setup vs per-element scalar scan); µarch-
+# INVARIANT (~128 on Zen3/Zen4/Zen5 alike), so no `_vwidth` formula can express it. tuning.md §4.
+const _CIAMAX_SIMD_MIN = @load_preference("ciamax_simd_min", max(4 * _vwidth(Float64), 128))::Int   # req8-ok: fleet-measured crossover ~128, table at use site
 
 # Apply the sequential row interchanges recorded in ipiv[ip0+1 : ip0+np] to columns j1:j2 of panel view V,
 # LOCAL to V (ipiv holds GLOBAL rows = roff + local). Pivot t swaps V-row (rowbase+t) ↔ V-row (ipiv[ip0+t]

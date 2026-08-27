@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 129 of them.
+Every `@load_preference` key in `src/` — 131 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 129 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 63 Derived · 10 Measured · 46 Literal · 10 Exempt.
-**Default form** (mechanical): 56 formula · 20 delegates · 6 sibling · 42 literal · 4 flag · 1 other.
+**Tier:** 63 Derived · 10 Measured · 48 Literal · 10 Exempt.
+**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 42 literal · 4 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -165,6 +165,13 @@ Every `@load_preference` key in `src/` — 129 of them.
 | `potrf_base_f32` | sibling | Derived | sizeof ratio: F32 is half F64's bytes, so half the n. | n/a, follows potrf_base |
 | `potrf_pad` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `potrf_upper_direct_max` | delegates | Measured | a tiny-n crossover inside a noisy band; only host measurement resolves it. | candidate |
+
+## LAPACK · lu
+
+| Knob | Default | Tier | Why | `tune!()` |
+|---|---|---|---|---|
+| `ciamax_simd_min` | formula | Literal | algorithm cost-ratio crossover (fixed SIMD setup vs per-element scalar scan); µarch- | — |
+| `key` | other | Literal | cost-ratio crossover between two ALGORITHMS (fixed SIMD setup vs per-element scalar | — |
 
 ## LAPACK · packed_chol
 
