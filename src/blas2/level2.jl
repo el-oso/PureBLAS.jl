@@ -135,6 +135,14 @@ const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES �
 const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES)::Int  # max A bytes (m·n·sizeof) for minner
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448`
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
+# Forceable accessors (the `_ger_np` shape: one const-resolved Ref load, folding to the const when
+# unforced — not a keyed lookup, so GKH-clean). Added 2026-08-27 to make the Zen5 COLD BAND testable:
+# with a fresh operand per sample (the gate regime) PB/OB is 0.84-0.94 CONTINUOUSLY over n=768-1280
+# while OpenBLAS's cold bandwidth is flat there, and n=1024 passing at 1.02 is the one size the po2
+# ladder happened to sample. These two knobs shape that regime and could not be A/B'd as load-time
+# consts. See kb `pureblas-zen5-gemvn-cold-band`.
+@inline _gemvn_rb() = (f = _FKR_gemvn_rb[]; f >= 0 ? f : _GEMVN_RB)
+@inline _gemvn_mb() = (f = _FKR_gemvn_mb[]; f >= 0 ? f : _GEMVN_MB)
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
 # gemv-N (column-major A makes it transpose-like — see kb finding): two regimes —
@@ -440,7 +448,7 @@ end
         np = _gemvn_minner_np(m, n, lda, T)      # regime-selected panel width (consts → Val below is static)
         i0 = 0
         while i0 < m
-            mb = min(_GEMVN_MB, m - i0)
+            mb = min(_gemvn_mb(), m - i0)
             yb = yptr + i0 * sz; Ab0 = Aptr + i0 * sz
             if B0                                        # β pre-scale this y-block once; panels then accumulate
                 @inbounds for i in 1:mb
@@ -465,7 +473,7 @@ end
 end
 
 @inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
-    if n <= _GEMVN_RB
+    if n <= _gemvn_rb()
         _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0))
     elseif _gemvn_minner() && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
         _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
