@@ -42,6 +42,22 @@ const _SMR = _at_gemm_split_mr(_HW)
 const _SNR = _at_gemm_split_nr(_HW)
 # PDM: Derived — formula over detected consts: `_at_gemm_split_max(_HW)`
 const _GEMM_SPLIT_MAX = @load_preference("gemm_split_max", _at_gemm_split_max(_HW))::Int
+# Forceable accessor (same shape as `_ger_np`): one const-resolved Ref load, folds to the const when
+# unforced. Exists so the "fleet-validate before trusting" note on `_at_gemm_split_max` is actionable
+# without a Preferences pin — a pin is the user's tier, an env force is not.
+#
+# FLEET NOTE, and the reason this hook was added: the derived 48 was validated on Zen4 2026-08-27 by
+# forcing 48/64/96/128 (square real gemm, L1-resident, % of the 44.9 GF peak):
+#     n      48(derived)   64      96     128
+#     50        82.4      79.8    79.8    79.7
+#     52        85.5      83.3    83.2    82.7
+#     56        94.0      95.2    95.7    94.8
+#     60        81.7      84.5    84.9    84.5
+# So the derivation is RIGHT where it binds (50/52 are the sizes just above the cap, and raising it
+# costs them 2.6 points) even though 56/60 would prefer a wider window. Do not raise it to chase the
+# n%W!=0 dip at n=50: that dip is WASTED TILE AREA in the wide path (4x7=28 tiles covering 64x56 to
+# compute 50x50), not a routing choice, and the split path is not its remedy — measured, not argued.
+@inline _gemm_split_max() = (f = _FKR_gemm_split_max[]; f >= 0 ? f : _GEMM_SPLIT_MAX)
 
 # Software prefetch hint (read, high locality, data cache) via the LLVM intrinsic. Used to pull the
 # C output tile toward cache at microkernel entry so the read-modify-write at the end (cold C from
@@ -1199,7 +1215,12 @@ function _gemm_unpacked!(
     end
     # Short-k split path: small-n window where the wide tile under-fills (needs ≥1 full tall row-tile so the
     # split kernel actually fires; else the NR=2 remainder loses B-reuse to the wide NR). Const-folds off on AVX2.
-    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, n, k) <= _GEMM_SPLIT_MAX
+    # `_gemm_split_max()` (not the bare const) so the cap is runtime-forceable via
+    # PUREBLAS_FORCE_gemm_split_max. Its own derivation note says "fleet-validate before trusting", and
+    # that could not be done at all while the value was a load-time const: an env A/B ran three
+    # identical builds and the witness printed 48 every time. The accessor reads one const-resolved Ref
+    # (the GKH-owned shape, not a keyed lookup) and const-folds to the derived value when unforced.
+    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, n, k) <= _gemm_split_max()
         return _gemm_unpacked_split!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
