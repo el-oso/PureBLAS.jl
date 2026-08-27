@@ -621,7 +621,7 @@ const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
 const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
                    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
-                   "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan")
+                   "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max")
 @static if _FORCE_HOOKS
     # One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
     #
