@@ -341,6 +341,55 @@ end
 # library as unchanged after the library had changed (bench/probes/pbtrf_tile_size.jl, 2026-08-06).
 # Lever A (real): U = Lᵀ exactly (UᵀU = LLᵀ = A). `_potrf_f64_lower!` THROWS on a non-positive pivot,
 # which is why this returns nothing — the throw happens before the transpose back, so A is unchanged.
+# ── NATIVE-UPPER hybrid: factor U in place, no whole-matrix transpose ─────────────────────────────
+# The transpose lever below is the right answer at small/mid n — the faer lower kernels gate there and
+# the O(n²) round-trip is cheap against O(n³) work. At LARGE n that inverts: the round-trip is four
+# extra n² DRAM passes (transpose in, transpose out, each reading and writing), and `_tri_upper_to_
+# lowerT!`'s own comment measures itself at 7.4 GB/s at n=2048 — far under stream rate, because a
+# transpose has no sequential access on one side.
+#
+# Measured cost of that round-trip (Zen4, cycles from the gate cache): PB's UPPER-minus-LOWER delta at
+# n=2100 is 11% of runtime, where AOCL's is 3% — AOCL factors 'U' natively (VERIFIED by disassembling
+# libflame: `dpotrf_` sends n>74 to netlib blocked left-looking on the requested triangle, no
+# transpose). That 8-point delta is the whole potrfU large-n miss: Zen4 1000/2100, Zen5 1000/2048/
+# 2100/4096.
+#
+# This is the exact TRANSPOSE-MIRROR of `_chol_hyb_f64!`, which is what makes it safe to add: same
+# recursion, same block boundaries, each BLAS-3 call replaced by its transpose-dual, so
+#     lower: A21 = trsm(side=R, uplo=L, transA=T);  A22 -= syrk(uplo=L, trans=N, A21)
+#     upper: A12 = trsm(side=L, uplo=U, transA=T);  A22 -= syrk(uplo=U, trans=T, A12)
+# with A12 = A21ᵀ throughout. Both call the same gating trsm!/syrk! kernels, so no new kernel is
+# introduced and no rounding-order argument is needed beyond the one potrf already makes (lapack.jl
+# already reassociates vs faer; there is no potrf bit-identity invariant, unlike LU's).
+# Crossover: native-upper vs the transpose lever. DERIVE tier — the criterion is cache RESIDENCY, the
+# one thing that actually decides it. The lever costs 4 extra n² DRAM passes against O(n³/3) of work,
+# so its relative cost is ~12·(n²·sizeof(T)/bandwidth) / (n³/3 / flops) — negligible while A is
+# cache-resident, dominant once A streams from DRAM. So switch where A stops fitting L3:
+#     n ≥ sqrt(_L3_BYTES / sizeof(T))
+# Zen4/Zen5 (16 MiB L3, F64): 1448. Zen3 (32 MiB): 2048. That places the switch between the passing
+# n=512-1024 cells (where the lever's small-n advantage is real and measured) and the failing
+# n=2048-4096 ones, without a literal. F32 gets a wider threshold automatically via sizeof.
+@inline _potrf_unative_min(::Type{T}) where {T} = isqrt(_L3_BYTES ÷ sizeof(T))
+
+function _chol_hyb_upper_f64!(M, n::Int, base::Int)
+    if n <= base
+        # Base: no native-upper leaf kernel exists, and writing one is a separate piece of work. Fall
+        # back to the transpose lever HERE, where it is cheap — the block is `base`-sized, so the
+        # round-trip is O(base²) per leaf, i.e. O(n·base) total rather than O(n²) once.
+        _potrf_upper_lever_real!(view(M, 1:n, 1:n), n)
+        return 0
+    end
+    h = n ÷ 2
+    f = _chol_hyb_upper_f64!(view(M, 1:h, 1:h), h, base)
+    f == 0 || return f
+    A12 = view(M, 1:h, (h + 1):n)
+    trsm!(A12, view(M, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
+    syrk!(view(M, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'T', alpha = -1, beta = 1)
+    f = _chol_hyb_upper_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
+    f == 0 || return h + f
+    return 0
+end
+
 @inline function _potrf_upper_lever_real!(A::AbstractMatrix{T}, n::Int) where {T}
     M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
     GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
@@ -465,6 +514,15 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # upper into the (alias-free) scratch's lower, factor, transpose L back. F32 rides the same faer path (now
     # generic over T<:BlasReal) — closing F32-upper once F32-lower gates.
     if _POTRF_PAD && up && (T === Float64 || T === Float32) && _strided1(A)
+        # Large n: factor the upper triangle NATIVELY (transpose-mirror hybrid) instead of paying the
+        # whole-matrix round-trip. The crossover is a RESIDENCY criterion, hence Derive tier: the
+        # round-trip's cost is 4 extra n² DRAM passes, which is negligible against O(n³) while the
+        # matrix is cache-resident and dominant once it is not. So switch when A stops fitting L3.
+        if n >= _potrf_unative_min(T)
+            f = _chol_hyb_upper_f64!(A, n, _chol_faer_base(T))
+            f == 0 || throw(PosDefException(f))
+            return A
+        end
         _potrf_upper_lever_real!(A, n)
         return A
     end
