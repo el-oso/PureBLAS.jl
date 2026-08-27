@@ -443,6 +443,18 @@ const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 
 _reps_cubic(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)
+# QUADRATIC sibling — for LP entries whose work is O(n²), not O(n³): a solve against an ALREADY
+# factored matrix with a single RHS (trtrs/getrs/sytrs/pttrs). Using `_reps_cubic` for those scales the
+# rep count by the wrong power, and the timed work per sample then swings 64x across the ladder:
+#     n         8      32      256     1024    2048
+#     reps    512     512        1        1       1     (cubic model)
+#     reps·n² 32.8k  524k      65.5k    1.05M   4.19M
+# It bottoms out at n=256, which is exactly where the measured cycle curves for all four ops bottom
+# out — trtrs read 983 cycles at n=32, 15 at n=256 and 348 at n=1024, i.e. cost FALLING 65x while the
+# problem grew 8x, which is impossible for an O(n²) kernel. At the bottom the reps clamp to 1, so a
+# sample times a single ~5 µs solve and the ratio measures call overhead rather than the kernel.
+# Same 20M budget, one power lower, so work per sample stays flat and every size is timed comparably.
+_reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 
 # Heavy O(n³) sweep for L3 / LAPACK. `@be` with `evals=1` runs a FRESH `mk(s)` per sample (the destructive
 # op mutates its input → one op per context) and EXCLUDES the mk allocation from the timed core — which
@@ -888,7 +900,7 @@ function run_benchmarks()
         addh(
             "getrs", _lufac,
             c -> (LinearAlgebra.LAPACK.getrs!(TN, c[1], c[2], c[3]); c[3][1]),
-            c -> (PureBLAS.getrs!(c[1], c[2], c[3]; trans = TN); c[3][1]); sizes = _cap(LPSZ, 2048)
+            c -> (PureBLAS.getrs!(c[1], c[2], c[3]; trans = TN); c[3][1]); sizes = _cap(LPSZ, 2048), repsof = _reps_quadratic
         )
         _chfac(s, uplo) = (C = _hpd(Float64, s); PureBLAS.potrf!(C; uplo = uplo); (C, randn(s)))
         for uplo in ('L', 'U')
@@ -902,7 +914,7 @@ function run_benchmarks()
             "trtrs", s -> (triu(_hpd(Float64, s)), randn(s)),
             c -> (LinearAlgebra.LAPACK.trtrs!(UP, TN, Char(78), c[1], c[2]); c[2][1]),
             c -> (PureBLAS.trtrs!(c[1], c[2]; uplo = UP, trans = TN, diag = Char(78)); c[2][1]);
-            sizes = _cap(LPSZ, 2048)
+            sizes = _cap(LPSZ, 2048), repsof = _reps_quadratic
         )
         # ── Symmetric-indefinite (Bunch-Kaufman), banded LU, pivoted QR, least squares ────────────────
         # A whole factorization+solve pair (sytrf/sytrs) plus four more real factorizations that had
@@ -922,7 +934,7 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         addh(
             "sytrs", _sytrfac,
             c -> (LinearAlgebra.LAPACK.sytrs!(LP, c[1], c[2], c[3]); c[3][1]),
-            c -> (PureBLAS.sytrs!(c[1], c[2], c[3]; uplo = LP); c[3][1]); sizes = _cap(LPSZ, 2048)
+            c -> (PureBLAS.sytrs!(c[1], c[2], c[3]; uplo = LP); c[3][1]); sizes = _cap(LPSZ, 2048), repsof = _reps_quadratic
         )
         # Banded LU: kd scales with n (a fixed narrow band makes this O(n) and hides the kernel).
         _gbd(s) = (kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
@@ -1018,7 +1030,7 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         addh(
             "pttrs", _ptf,
             c -> (LinearAlgebra.LAPACK.pttrs!(c[1], c[2], c[3]); c[3][1]),
-            c -> (PureBLAS.pttrs!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ
+            c -> (PureBLAS.pttrs!(c[1], c[2], c[3]); c[3][1]); sizes = TDSZ, repsof = _reps_quadratic
         )
         addh(
             "ptsv", _ptd,
