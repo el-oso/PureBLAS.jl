@@ -116,6 +116,15 @@ struct ArmRec
     # deliberately per-run because it exists for ACROSS-run comparison, whereas this exists to segment a
     # SINGLE run into valid and invalid parts.
     freq::Int
+    # IN-WINDOW clock RANGE (kHz) — the min and max observed by bracketing every timing window of this
+    # cell, not a single sample. `freq` above is one reading taken when the cell was stamped, i.e. the
+    # clock when the work FINISHED; under a variable clock that is not the clock the work ran at, and a
+    # cycles view built on it would be silently wrong. This pair makes the assumption checkable instead
+    # of assumed: `flo == fhi` is a genuinely steady window, and a wide spread says the cell's own
+    # timings span more than one clock state, so a cycles conversion for it carries that uncertainty.
+    # 0,0 for records written before this field existed (treated as "unknown", never as 0 Hz).
+    flo::Int
+    fhi::Int
     q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
 end
 const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
@@ -127,10 +136,14 @@ _round_arms(r::Int) = circshift(_ACTIVE_ARMS, r - 1)
 # Stamp each freshly measured arm with the time and commit it was measured at. Done HERE, at the point of
 # measurement, rather than at save time: a run that measures L1 at 14:00 and CL3 at 17:00 must not write
 # 17:00 against the L1 cells, which is exactly the imprecision the v2 single header commit had.
-_stamp(acc::ArmData) = CellData(
-    a => ArmRec(Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), q)
-        for (a, q) in acc
-)
+function _stamp(acc::ArmData)
+    lo, hi = _khz_range!()          # observed across THIS cell's windows; resets for the next cell
+    return CellData(
+        a => ArmRec(
+            Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi, q
+        ) for (a, q) in acc
+    )
+end
 
 # Achieved clock of the core THIS PROCESS is currently on, in kHz. Reads `/proc/self/stat` field 39 for
 # the CPU id, then that core's `scaling_cur_freq`.
@@ -141,6 +154,24 @@ _stamp(acc::ArmData) = CellData(
 # `taskset`-pinned, so the process's own core IS the core under test — the only clock that can affect
 # this cell's timings. Returns 0 (= unknown, never treated as off-lock) if anything is unreadable, so a
 # platform without cpufreq degrades to today's behaviour rather than marking every cell invalid.
+# In-window clock RANGE for the cell currently being measured. `_khz_obs!` is called immediately before
+# and after every arm's timing window (see the measurement loop); `_khz_range!` returns the observed
+# (min, max) and resets for the next cell. A zero sample means "unreadable" and is ignored rather than
+# treated as a 0 Hz clock.
+const _KHZ_LO = Ref(typemax(Int))
+const _KHZ_HI = Ref(0)
+function _khz_obs!(v::Int)
+    v > 0 || return nothing
+    _KHZ_LO[] = min(_KHZ_LO[], v)
+    _KHZ_HI[] = max(_KHZ_HI[], v)
+    return nothing
+end
+function _khz_range!()
+    lo, hi = _KHZ_LO[], _KHZ_HI[]
+    _KHZ_LO[] = typemax(Int); _KHZ_HI[] = 0
+    return hi == 0 ? (0, 0) : (lo, hi)
+end
+
 function _cell_khz()
     return try
         cpu = parse(Int, split(read("/proc/self/stat", String))[39])
@@ -430,6 +461,14 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
             qs = ArmData()
             for a in _round_arms(r)      # rotated (generalised ABBA); reference switch is outside the window
                 f = a == _ARM_PB ? pb1 : (_use_ref!(a); ob1)
+                # Bracket each arm's window with a clock sample. One sample AFTER the fact (what
+                # `_cell_khz()` alone gives) records the clock when we finished, not the clock the work
+                # actually ran at — fine while the box is pinned, wrong the moment it is not. Keeping
+                # the min/max ACROSS every window of this cell turns "assume pinned" into a measured
+                # range, so a cell that drifted mid-measurement says so instead of silently reporting a
+                # single number that was never true. Two /sys reads per arm-round against a ≥0.5 s
+                # window is unmeasurable overhead.
+                _khz_obs!(_cell_khz())
                 b = @be [mk(s) for _ in 1:reps] (
                     cs -> (
                         v = 0.0; for c in cs
@@ -437,6 +476,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                         end; v
                     )
                 ) evals = 1 samples = samples seconds = secs
+                _khz_obs!(_cell_khz())
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
@@ -1750,7 +1790,7 @@ function save_cache(path, groups)
             # rather than `limit = 4`. That invariant is the extension mechanism — append before the
             # csv, never after it.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -1796,8 +1836,13 @@ function load_cache(path)
             a, tstamp, cmt, csv = p[1], p[2], p[3], p[end]
             anc = length(p) >= 5 ? something(tryparse(Float64, p[4]), NaN) * 1e-6 : NaN
             khz = length(p) >= 6 ? something(tryparse(Int, p[5]), 0) : 0
+            # 8-field records add the in-window clock range (flo,fhi). Older records have no range and
+            # read as 0,0 = unknown — NOT as a 0 Hz clock, and not as "steady": a consumer must treat
+            # unknown as "cannot verify the window was pinned", which is exactly what those cells are.
+            flo = length(p) >= 8 ? something(tryparse(Int, p[6]), 0) : 0
+            fhi = length(p) >= 8 ? something(tryparse(Int, p[7]), 0) : 0
             cell[String(a)] =
-                ArmRec(String(tstamp), String(cmt), anc, khz, parse.(Float64, split(csv, ",")))
+                ArmRec(String(tstamp), String(cmt), anc, khz, flo, fhi, parse.(Float64, split(csv, ",")))
         end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)

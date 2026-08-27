@@ -29,7 +29,7 @@ const CACHE = ARGS[1]
 const SEL = ARGS[2:end]
 const ALL = "--all" in SEL
 
-rows = Tuple{String, String, Int, Dict{String, Tuple{Float64, Float64}}}[]
+rows = Tuple{String, String, Int, Dict{String, Tuple{Float64, Float64, Float64}}}[]
 for ln in readlines(CACHE)
     startswith(ln, "#") && continue
     p = split(ln, "\t")
@@ -37,16 +37,27 @@ for ln in readlines(CACHE)
     (ALL || p[2] in SEL) || continue
     n = tryparse(Int, p[3])
     isnothing(n) && continue
-    arms = Dict{String, Tuple{Float64, Float64}}()   # arm => (median seconds, kHz)
+    arms = Dict{String, Tuple{Float64, Float64, Float64}}()   # arm => (median s, kHz, in-window spread %)
     for f in p[4:end]
         isempty(f) && continue
         q = split(f, "|")
-        # arm|time|commit|anchor|freq|samples — the field count GROWS (it was 4, then 5, then 6) and
-        # the csv is ALWAYS last, so index from the END. Same invariant cellratios.jl relies on.
+        # arm|time|commit|anchor|freq[|flo|fhi]|samples — the field count GROWS (4, then 5, then 6, now
+        # 8) and the csv is ALWAYS last, so index from the END. Same invariant cellratios.jl relies on.
         length(q) >= 3 || continue
         secs = median(parse.(Float64, split(q[end], ","))) * 1.0e-3   # cache stores ms
-        khz = length(q) >= 3 ? something(tryparse(Float64, q[end - 1]), NaN) : NaN
-        arms[q[1]] = (secs, khz)
+        # DO NOT assume the clock was pinned. Newer records carry the min/max clock actually observed
+        # while this cell was being timed; use the MIDPOINT for the conversion and report the spread, so
+        # a variable clock degrades the number honestly instead of silently. Older records have only the
+        # single stamp-time sample: use it, and mark the spread UNKNOWN (NaN) rather than claiming 0%.
+        khz1 = length(q) >= 6 ? something(tryparse(Float64, q[5]), NaN) : NaN
+        lo = length(q) >= 8 ? something(tryparse(Float64, q[6]), NaN) : NaN
+        hi = length(q) >= 8 ? something(tryparse(Float64, q[7]), NaN) : NaN
+        khz, spread = if !isnan(lo) && !isnan(hi) && lo > 0
+            ((lo + hi) / 2, 100 * (hi - lo) / lo)
+        else
+            (khz1, NaN)
+        end
+        arms[q[1]] = (secs, khz, spread)
     end
     isempty(arms) || push!(rows, (p[1], p[2], n, arms))
 end
@@ -58,12 +69,12 @@ fmt(c) = isnan(c) ? "     —" : (c >= 1e6 ? string(round(c / 1e6; digits = 2), 
                                 c >= 1e3 ? string(round(c / 1e3; digits = 1), "k") :
                                 string(round(Int, c)))
 
-println("cycles per call (from each arm's OWN recorded clock). ref/pb > 1 ⇒ PB does LESS work.")
-println("Δclk = max spread between the arms' clocks; a large Δclk means the SECONDS ratio is not adjudicable.")
-@static if true
-    println(rpad("lvl", 5), rpad("op", 12), lpad("n", 7), lpad("PB", 10), lpad("OB", 10),
-            lpad("AOCL", 10), lpad("OB/PB", 8), lpad("AOCL/PB", 9), lpad("Δclk", 7))
-end
+println("cycles per call, from each arm's OWN clock (midpoint of its in-window min/max). ref/pb > 1 ⇒ PB does LESS work.")
+println("Δclk  = spread BETWEEN arms — large ⇒ the seconds ratio compares two machine states, not two kernels.")
+println("wobble = worst spread WITHIN one arm's own timing windows — large ⇒ the clock moved DURING the measurement,")
+println("         so that cell's cycle figures carry that much uncertainty. `?` = pre-range record, cannot verify.")
+println(rpad("lvl", 5), rpad("op", 12), lpad("n", 7), lpad("PB", 10), lpad("OB", 10),
+        lpad("AOCL", 10), lpad("OB/PB", 8), lpad("AOCL/PB", 9), lpad("Δclk", 7), lpad("wobble", 8))
 for (lvl, op, n, arms) in sort(rows, by = r -> (r[2], r[3]))
     haskey(arms, "pb") || continue
     pbc = cyc(arms["pb"])
@@ -71,9 +82,12 @@ for (lvl, op, n, arms) in sort(rows, by = r -> (r[2], r[3]))
     aoc = haskey(arms, "aocl") ? cyc(arms["aocl"]) : NaN
     ks = [a[2] for a in values(arms) if !isnan(a[2]) && a[2] > 0]
     dclk = isempty(ks) ? NaN : 100 * (maximum(ks) - minimum(ks)) / minimum(ks)
+    sp = [a[3] for a in values(arms) if !isnan(a[3])]
+    wob = isempty(sp) ? NaN : maximum(sp)
     println(rpad(lvl, 5), rpad(op, 12), lpad(n, 7), lpad(fmt(pbc), 10), lpad(fmt(obc), 10),
             lpad(fmt(aoc), 10),
             lpad(isnan(obc) ? "—" : string(round(obc / pbc; digits = 2)), 8),
             lpad(isnan(aoc) ? "—" : string(round(aoc / pbc; digits = 2)), 9),
-            lpad(isnan(dclk) ? "—" : string(round(dclk; digits = 1), "%"), 7))
+            lpad(isnan(dclk) ? "—" : string(round(dclk; digits = 1), "%"), 7),
+            lpad(isnan(wob) ? "?" : string(round(wob; digits = 1), "%"), 8))
 end
