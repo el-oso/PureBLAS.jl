@@ -370,11 +370,20 @@ end
 # n=512-1024 cells (where the lever's small-n advantage is real and measured) and the failing
 # n=2048-4096 ones, without a literal. F32 gets a wider threshold automatically via sizeof.
 @inline _potrf_unative_min(::Type{T}) where {T} = isqrt(_L3_BYTES ÷ sizeof(T))
-# Forceable. The residency argument above says the lever wins while A fits L3, and cites n=512-1024 as
-# "passing cells where the lever's small-n advantage is real and measured". On galen that is no longer
-# true: L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921 vs AOCL while
-# potrf@1000 (lower, same box, same run) reads 1.131. A 19% spread between an op and its own mirror is
-# not a residency effect. Hook so the crossover can be A/B'd instead of re-argued.
+# Forceable — and the first thing the hook bought was a FALSIFICATION of the suspicion that prompted it.
+#
+# The worry: on galen L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921
+# vs AOCL while potrf@1000 (lower, same box, same run) reads 1.131. A 19% spread between an op and its
+# own transpose mirror looked like a misplaced crossover.
+#
+# It is not. Measured galen 2026-08-28, boost-locked, PB/AOCL, 8 rounds, ABBA-rotated:
+#     potrfU@1000   lever 0.922, 0.920   native 0.891, 0.890   -> lever wins by 3.5%
+#     potrfU@512    lever 1.374          native 1.345          -> lever wins by 2.2%
+# Forcing native-upper down to n=1000 makes it WORSE. The residency derivation is placing the crossover
+# correctly, and potrfU@1000's deficit is the lever's own transpose round-trip (~2 passes over an 8MB A
+# against ~6.6ms of factorization, which is the right order for the observed gap), not the choice of
+# arm. Closing that cell means a cheaper transpose or a faster native-upper hybrid — NOT moving this
+# threshold. Do not re-chase the crossover.
 # Cold path — read once per potrf! call, not in any kernel.
 @inline _fh_potrf_unative_min(::Type{T}) where {T} =
     (f = _FKR_potrf_unative_min[]; f >= 0 ? f : _potrf_unative_min(T))
