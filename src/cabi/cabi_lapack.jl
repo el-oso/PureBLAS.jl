@@ -817,16 +817,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         # dense operand is CORRECT; it costs n³ rather than lauum's n³/3, which is why this lands at
         # 4n³/3 rather than the textbook 2n³/3 — still 1.5× less work than before, with no new kernel.
         # A real `lauum` would take the remaining 2×; that is a separate piece of work.
-        X = Matrix{$T}(undef, N, N)
-        Xv = view(X, 1:N, 1:N)
-        _trtri!(Xv, Am, N, ul == 'U', false)
-        $(
-            if T <: Complex
-                :(herk!(Am, Xv; uplo = ul, trans = (ul == 'L' ? 'C' : 'N'), alpha = true, beta = false))
-            else
-                :(syrk!(Am, Xv; uplo = ul, trans = (ul == 'L' ? 'T' : 'N'), alpha = one($T), beta = zero($T)))
-            end
-        )
+        potri!(Am; uplo = ul)          # ONE implementation, in lapack/inverses.jl
         unsafe_store!(info, Int64(0)); return
     end
 end
@@ -848,22 +839,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         )::Cvoid
         N = Int(unsafe_load(n)); ul = _cabi_char(uplo); dg = _cabi_char(diag)
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        N == 0 && (unsafe_store!(info, Int64(0)); return)
-        X = Matrix{$T}(undef, N, N)
-        # `view` of a Matrix, matching how every in-tree caller invokes `_trtri!` (it takes views of the
-        # L3 scratch). A fresh allocation rather than `_l3_tmp` because the recursion's own trsm bases
-        # reach for that scratch.
-        Xv = view(X, 1:N, 1:N)
-        _trtri!(Xv, Am, N, ul == 'U', dg == 'U')
-        if ul == 'L'
-            @inbounds for j in 1:N, i in j:N
-                Am[i, j] = Xv[i, j]
-            end
-        else
-            @inbounds for j in 1:N, i in 1:j
-                Am[i, j] = Xv[i, j]
-            end
-        end
+        trtri!(Am; uplo = ul, diag = dg)   # ONE implementation, in lapack/inverses.jl
         unsafe_store!(info, Int64(0)); return
     end
 end
