@@ -34,6 +34,31 @@ end
 const ONLY = let i = findfirst(a -> startswith(a, "only="), ARGS)
     isnothing(i) ? nothing : ARGS[i][6:end]
 end
+# ── UNLOCKED MODE ─────────────────────────────────────────────────────────────────────────────────
+# `PureBLAS.tune!()` is a USER-FACING entry point — `_GER_NP`'s comment literally tells users to run
+# it — but this script refused unless the machine was frequency-locked, and locking needs root. A
+# normal user has no `sudo` on their laptop, so the tuner was unreachable for exactly the people it
+# exists for. That is a design defect, not a safety property.
+#
+# What the lock actually protects is ABSOLUTE times. This script decides on a RATIO between arms run
+# back-to-back within a round, and since 2026-08-28 `Measure.ab` reduces those rounds in CYCLES
+# (time × the clock sampled around each window), which is invariant to boost: a faster clock shortens
+# both arms' elapsed time and leaves the cycle counts where they were. So the decision does not need
+# the lock; it needs the clock to be READABLE, which it is without privileges.
+#
+# `unlocked` therefore does not disable the safety checks — it TIGHTENS them, trading the lock for
+# more evidence:
+#   * `ANCHOR_TOL` 0.08 → 0.03, so the per-knob machine-state refusal does the work the lock did.
+#   * `decide` margin 0.02 → 0.05, so a marginal win under a moving clock is not pinned.
+#   * more rounds, so the bootstrap CI has to survive more of the drift.
+#   * the emitted TOML is stamped `measured_unlocked = true`, so a pin's provenance is never ambiguous.
+# The achieved-vs-requested check below is NOT relaxed: a clock that reports one thing and runs at
+# another (neuromancer 2026-08-21, 4843 MHz against a 2000 MHz cap) is a LYING clock, categorically
+# different from an honestly-boosting one, and no amount of cycle conversion can rescue it.
+const UNLOCKED = "unlocked" in ARGS
+const TOL = UNLOCKED ? 0.03 : ANCHOR_TOL
+const DELTA = UNLOCKED ? 0.05 : 0.02
+const ROUNDS = UNLOCKED ? 12 : 8
 # Rep count, verbatim from bench/plots.jl `_L2REP`. THE REGIME MUST MATCH THE GATE: at reps=1 a probe
 # measures a COLD matrix while the gate runs many reps on a warm one, and that difference alone has
 # INVERTED a routing verdict here (gemvT n=2048: 1.087 percol-wins -> 0.951 blocked-wins).
@@ -68,7 +93,7 @@ function calibrate_ger_np(::Type{T} = Float64) where {T}
     arms = vcat([inc => (c -> runnp(c, inc))], [np => (c -> runnp(c, np)) for np in cands])
     @printf("  ger_panel_np @ n=%d (A = %.0f MB, DRAM): incumbent %d, candidates %s\n",
             n, n^2 * sizeof(T) / 2^20, inc, cands)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     for r in res
         @printf("    np=%-2d  %.4f  [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
@@ -77,7 +102,7 @@ function calibrate_ger_np(::Type{T} = Float64) where {T}
                 100 * drift)
         return Pair{String, Any}[]
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
     if verdict !== :win
         println(noswitch_msg(verdict))
         return Pair{String, Any}[]
@@ -109,8 +134,8 @@ function calibrate_gemvt_window()
             setup() = (zeros(Float64, n), randn(Float64, n, n), randn(Float64, n))
             arms = ["blocked" => (c -> _route!(c[1], c[2], c[3], 0)),
                     "percol"  => (c -> _route!(c[1], c[2], c[3], 2))]
-            res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, reps = _l2rep(n),
-                                                          setup = setup))
+            res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, reps = _l2rep(n),
+                                                          setup = setup); tol = TOL)
             r = res[2]
             if !ok
                 @printf("    n=%-5d REFUSED (machine moved %.1f%%) — treated as don't-care\n", n, 100 * drift)
@@ -183,12 +208,12 @@ function calibrate_potrf_udirect(::Type{T} = Float64) where {T}
     end)
     arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
     @printf("  potrf_upper_direct_max: incumbent %d, candidates %s (n = %s)\n", inc, cands, ns)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     PureBLAS._FKR_potrf_upper_direct_max[] = -1
     for r in res
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
 # Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
 # the in-code default stands. That is the whole safety property for a knob like this one, whose own
 # history is four different answers from one binary.
@@ -222,12 +247,12 @@ function calibrate_sytrf_cmult(::Type{T} = ComplexF64) where {T}
     end)
     arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
     @printf("  sytrf_cmult: incumbent %d, candidates %s (n = %d, %s)\n", inc, cands, n, T)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     PureBLAS._FKR_sytrf_cmult[] = -1
     for r in res
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
 # Contract: a calibrator returns Pair{String,Any}[] — EMPTY on a tie, so tune!() pins nothing and
 # the in-code default stands. That is the whole safety property for a knob like this one, whose own
 # history is four different answers from one binary.
@@ -259,12 +284,12 @@ function calibrate_gemvt_pf(::Type{T} = Float64) where {T}
     arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
     @printf("  gemvt_pf: incumbent %d, candidates %s (n=%d, A=%.1f MiB ~ L2)\n",
             inc, cands, n, n^2 * sizeof(T) / 2^20)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     PureBLAS._GEMVT_PF_REF[] = inc
     for r in res
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
     if verdict !== :win
         println(noswitch_msg(verdict))
         return Pair{String, Any}[]
@@ -294,12 +319,12 @@ function calibrate_trmv_fused_min(::Type{T} = Float64) where {T}
     arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
     @printf("  trmv_fused_min: incumbent %d (-1 = fused8 everywhere), candidates %s, n = %s\n",
             inc, cands, ns)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     PureBLAS._TRMV_FUSED_MIN_REF[] = inc
     for r in res
         @printf("    %-6s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
     if verdict !== :win
         println(noswitch_msg(verdict))
         return Pair{String, Any}[]
@@ -335,12 +360,12 @@ function calibrate_gbtrf_cmult(::Type{T} = Float64) where {T}
     end)
     arms = vcat([inc => run(inc)], [v => run(v) for v in cands])
     @printf("  gbtrf_cmult: incumbent %d, candidates %s (n=%d, kl = %s)\n", inc, cands, n, kls)
-    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = 8, setup = setup))
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
     PureBLAS._FKR_gbtrf_cmult[] = -1
     for r in res
         @printf("    cmult=%-3s %.4f [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
     end
-    name, verdict = decide(res; delta = 0.02)
+    name, verdict = decide(res; delta = DELTA)
     if verdict !== :win
         println(noswitch_msg(verdict))
         return Pair{String, Any}[]
@@ -364,12 +389,23 @@ const KNOBS = (
 # worse than no pin: it is wrong in a way nothing downstream can detect, because the clock drifts
 # BETWEEN the arms of an A/B and paired measurement cannot cancel that.
 locked, why = freq_locked()
-if !locked
-    @error "REFUSING TO TUNE — $why. The frequency lock is the ONLY state a tuning measurement is " *
-           "valid in; a pin taken on a floating clock is a wrong answer with a confident face."
+if !locked && !UNLOCKED
+    @error "REFUSING TO TUNE — $why.\n" *
+           "  Locking needs root: `sudo bench/fleet_freqlock.sh lock`.\n" *
+           "  WITHOUT root, re-run with `unlocked`: the A/B then reduces in CYCLES (invariant to " *
+           "boost) and tightens its drift, margin and round count to compensate. That is the " *
+           "supported path for a normal user — see the UNLOCKED MODE note at the top of this file."
     exit(4)
 end
-println("freq: $why")
+if !locked
+    @warn "UNLOCKED calibration — $why.\n" *
+          "  Deciding on CYCLES, not wall time, so boost cancels rather than biasing an arm.\n" *
+          "  Tightened: anchor tol $(TOL), win margin $(DELTA), $(ROUNDS) rounds.\n" *
+          "  Emitted pins are stamped `measured_unlocked = true`. For the most reliable result, " *
+          "close other applications and leave the machine idle while this runs (~1 min)."
+else
+    println("freq: $why")
+end
 la, busy = contention()
 if busy
     @warn "machine is busy (1-min load $la) — a knob decided against someone else's workload is decided " *
@@ -421,6 +457,12 @@ else
         sect[p.first] = p.second
     end
     sect["tuned_for"] = PureBLAS._tuning_fingerprint()
+    # PROVENANCE: never leave it ambiguous whether a pin came from a locked box. A value measured on a
+    # boosting laptop is legitimate — the A/B reduces in cycles, so boost cancels — but it carries more
+    # uncertainty than one taken under a pinned clock, and whoever reads this file later must be able to
+    # tell which they are looking at without re-deriving it. Written only in unlocked mode so a locked
+    # run's file is unchanged.
+    UNLOCKED && (sect["measured_unlocked"] = true)
     open(io -> TOML.print(io, d), LP, "w")
     println("\nwrote $(length(prefs)) preference(s) + tuned_for → $LP")
     println("(reload Julia to pick them up — they are read at runtime, so no recompile)")

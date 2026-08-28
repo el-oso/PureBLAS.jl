@@ -37,6 +37,38 @@ substitute it locally.
 """
 tstat(ts::AbstractVector{<:Real}) = median(ts)
 
+# ── CYCLES, so a calibration survives an unlocked clock ───────────────────────────────────────────
+#
+# WHY. `PureBLAS.tune!()` is a USER-FACING entry point — `_GER_NP`'s own comment tells users to run it
+# — but `calibrate.jl` refused outright unless the machine was frequency-locked, which needs root.
+# A normal user has no `sudo` and cannot be asked to pin their laptop's clock, so the tuner was
+# effectively unreachable for the people it exists for.
+#
+# Wall time is the wrong unit on a boosting box: the SAME work takes less time at a higher clock, so a
+# drifting clock injects a difference between arms that has nothing to do with the code. CYCLES are
+# invariant to it — boost changes both the elapsed time and the frequency, and their product does not
+# move. Measuring in cycles removes the drift at the source instead of relying on it to cancel.
+#
+# The conversion needs the clock the work ACTUALLY ran at, not a nominal figure, so sample it around
+# each arm's window and use the midpoint. That is the same construction `bench/plots.jl` uses for its
+# per-cell `flo|fhi` range, and it is exact under a pinned clock (lo == hi) while degrading honestly
+# under a moving one: `khz_spread` is reported so a caller can see how much the clock moved DURING the
+# measurement rather than assuming it did not.
+#
+# `_khz()` reads the core this process is on (`/proc/self/stat` field 39), not a max over all cores —
+# a max would report an unrelated process's boost and condemn a good measurement. Returns 0 when
+# cpufreq is unreadable (non-Linux, some VMs), and callers then fall back to time, which is correct:
+# a platform that cannot report its clock is one where cycles cannot be computed either.
+function _khz()
+    return try
+        cpu = parse(Int, split(read("/proc/self/stat", String))[39])
+        f = "/sys/devices/system/cpu/cpu$(cpu)/cpufreq/scaling_cur_freq"
+        isfile(f) ? something(tryparse(Int, strip(read(f, String))), 0) : 0
+    catch
+        0
+    end
+end
+
 """
     report(label, ts; unit="ms", scale=1e3) -> String
 
@@ -88,6 +120,8 @@ function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> 
         end
     end
     ts = [Float64[] for _ in 1:n]                          # per-round MEDIAN of that window's samples
+    cyc = [Float64[] for _ in 1:n]                         # same, converted to CYCLES via the live clock
+    klo = Int[]; khi = Int[]                               # every clock sample taken during this A/B
     for r in 1:rounds
         # NO ORDER ALTERNATION — measured unnecessary, not assumed. bench/probes/abba_nulltest.jl runs two
         # IDENTICAL arms; an unbiased harness must read 1.000. Fixed order does:
@@ -105,24 +139,44 @@ function ab(arms::AbstractVector; rounds::Int = 8, reps::Int = 1, setup = () -> 
             # is the documented "ad-hoc harness" trap (gate numbers must come from the approved path),
             # and a hand loop yields ONE timing per window where @be yields hundreds — which is why the
             # hand-rolled intervals were needlessly wide.
+            # Bracket the window with a clock sample so this round's time can be converted to CYCLES.
+            # Two /sys reads against a ≥0.5 s window is unmeasurable overhead, and it is what lets a
+            # calibration run on an unlocked machine: cycles are invariant to boost, wall time is not.
+            k0 = _khz()
             b = @be setup() (c -> begin
                 for _ in 1:reps
                     f(c)
                 end
             end) evals = 1 samples = samples seconds = seconds
-            push!(ts[i], tstat(Float64[s.time for s in b.samples]))
+            k1 = _khz()
+            t = tstat(Float64[s.time for s in b.samples])
+            push!(ts[i], t)
+            kk = (k0 > 0 && k1 > 0) ? (k0 + k1) / 2 : 0.0
+            push!(cyc[i], kk > 0 ? t * kk * 1000.0 : NaN)   # NaN ⇒ no clock ⇒ caller falls back to time
+            kk > 0 && (push!(klo, min(k0, k1)); push!(khi, max(k0, k1)))
         end
     end
     out = NamedTuple[]
     rng = Random.MersenneTwister(seed)
+    # REDUCE IN CYCLES when the clock was readable, else in time. Cycles are what make this valid on an
+    # unlocked box: a boosting clock scales the elapsed time of BOTH arms and the cycle counts do not
+    # move, so the ratio is unaffected. Under a pinned clock the two units differ only by a constant
+    # factor and the ratio is identical — so this changes nothing for locked runs and is not a
+    # methodology fork. `usecycles` records which unit actually decided, so a caller never has to guess.
+    havecyc = all(i -> !any(isnan, cyc[i]), 1:n)
+    unit = havecyc ? cyc : ts
+    # How much the clock moved across the WHOLE A/B. Under a lock this is ~0; on a boosting laptop it is
+    # the number that says how much work the cycle conversion is doing. Reported, never silently hidden.
+    kspread = isempty(klo) ? NaN : (maximum(khi) - minimum(klo)) / minimum(klo)
     for i in 1:n
-        rel = [ts[1][r] / ts[i][r] for r in 1:rounds]      # per-round paired ratio vs arm 1
+        rel = [unit[1][r] / unit[i][r] for r in 1:rounds]  # per-round paired ratio vs arm 1
         m = tstat(rel)
         bs = [tstat(rel[rand(rng, 1:rounds, rounds)]) for _ in 1:nboot]
         sort!(bs)
         push!(out, (name = arms[i][1], ratio = m,
                     lo = bs[max(1, round(Int, 0.025nboot))], hi = bs[min(nboot, round(Int, 0.975nboot))],
-                    secs = tstat(ts[i]), rounds = rounds))
+                    secs = tstat(ts[i]), cycles = havecyc ? tstat(cyc[i]) : NaN,
+                    usecycles = havecyc, khz_spread = kspread, rounds = rounds))
     end
     return out
 end
