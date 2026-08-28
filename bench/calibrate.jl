@@ -391,10 +391,12 @@ const KNOBS = (
 locked, why = freq_locked()
 if !locked && !UNLOCKED
     @error "REFUSING TO TUNE — $why.\n" *
-           "  Locking needs root: `sudo bench/fleet_freqlock.sh lock`.\n" *
-           "  WITHOUT root, re-run with `unlocked`: the A/B then reduces in CYCLES (invariant to " *
-           "boost) and tightens its drift, margin and round count to compensate. That is the " *
-           "supported path for a normal user — see the UNLOCKED MODE note at the top of this file."
+           "  WITHOUT root (the normal case), re-run in unlocked mode:\n" *
+           "      PureBLAS.tune!(unlocked = true)          # the documented entry point\n" *
+           "      julia --project=bench bench/calibrate.jl unlocked   # or the script directly\n" *
+           "  It decides in CYCLES, which a boosting clock cannot bias, and tightens its drift " *
+           "tolerance, win margin and round count to compensate for the missing lock.\n" *
+           "  WITH root, you can instead pin the clock: `sudo bench/fleet_freqlock.sh lock`."
     exit(4)
 end
 if !locked
