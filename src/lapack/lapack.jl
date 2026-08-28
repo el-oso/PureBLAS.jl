@@ -370,6 +370,14 @@ end
 # n=512-1024 cells (where the lever's small-n advantage is real and measured) and the failing
 # n=2048-4096 ones, without a literal. F32 gets a wider threshold automatically via sizeof.
 @inline _potrf_unative_min(::Type{T}) where {T} = isqrt(_L3_BYTES ÷ sizeof(T))
+# Forceable. The residency argument above says the lever wins while A fits L3, and cites n=512-1024 as
+# "passing cells where the lever's small-n advantage is real and measured". On galen that is no longer
+# true: L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921 vs AOCL while
+# potrf@1000 (lower, same box, same run) reads 1.131. A 19% spread between an op and its own mirror is
+# not a residency effect. Hook so the crossover can be A/B'd instead of re-argued.
+# Cold path — read once per potrf! call, not in any kernel.
+@inline _fh_potrf_unative_min(::Type{T}) where {T} =
+    (f = _FKR_potrf_unative_min[]; f >= 0 ? f : _potrf_unative_min(T))
 
 function _chol_hyb_upper_f64!(M, n::Int, base::Int)
     if n <= base
@@ -518,7 +526,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         # whole-matrix round-trip. The crossover is a RESIDENCY criterion, hence Derive tier: the
         # round-trip's cost is 4 extra n² DRAM passes, which is negligible against O(n³) while the
         # matrix is cache-resident and dominant once it is not. So switch when A stops fitting L3.
-        if n >= _potrf_unative_min(T)
+        if n >= _fh_potrf_unative_min(T)
             f = _chol_hyb_upper_f64!(A, n, _chol_faer_base(T))
             f == 0 || throw(PosDefException(f))
             return A
