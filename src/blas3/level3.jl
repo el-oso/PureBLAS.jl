@@ -4907,6 +4907,10 @@ end
 # (n=128 unified 0.73 vs multi 1.02) — so cap it low. AVX-512 uses unified everywhere (_unified_ok).
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0`
 const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) == 4 ? 48 : 0)::Int
+# Forceable: the cap sits at 48 and the two measurements bracketing it are n=32 (unified 1.19 vs multi
+# 0.90) and n=128 (unified 0.73 vs multi 1.02). n=50 — a red cell — falls in the untested gap just above
+# the cap, so it has only ever run multi-pack. One A/B settles whether 48 is the right place to cut.
+@inline _fh_syrk_unified_max() = (f = _FKR_syrk_unified_max[]; f >= 0 ? f : _SYRK_UNIFIED_MAX)
 # Single-product triangular multi-pack row-tile MR. On AVX2 (W=4) the 12-acc gemm tile (MR=_MR=3) zero-pads
 # the remainder row-panel at n not divisible by 12 → small/mid-n syrk/syr2k below gate (n=64 0.81, 128 0.94,
 # 256 0.92 measured galen). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
@@ -4917,7 +4921,7 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T <: BlasReal} =
-    (_unified_ok(T) || (_unified_layout_ok(T) && size(C, 1) <= _SYRK_UNIFIED_MAX)) ?
+    (_unified_ok(T) || (_unified_layout_ok(T) && size(C, 1) <= _fh_syrk_unified_max())) ?
     _trgemm_packed_u!(up, α, A, tr, C, k) :
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
 
