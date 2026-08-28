@@ -4631,13 +4631,30 @@ function _trgemm_packed!(
                                     # the vectors that exist. gemm has done this on both its packed and unpacked
                                     # paths for a while; the triangular kernel never picked it up.
                                     #
-                                    # Measured galen 2026-08-28 (bench/probes/syrk_modmr_sawtooth.jl, n=49..72):
-                                    # cost/flop sawtooths with period mr=8 — offset 0 is 1.061, offset 4 (one clean
-                                    # vector) 1.171, and the non-W offsets 1.20–1.36; misaligned n costs 19.6% more
-                                    # per flop than aligned. This branch is the offset-4 class, which is exactly
-                                    # where the red cells syrk@100 (12·8+4) and syrk@2100 (262·8+4) sit.
-                                    # Sub-W remainders (offsets 1,2,3,5,6,7 — e.g. syrk@50 = 6·8+2) still need a
-                                    # mask and still fall through to `_microkernel_masked!` below.
+                                    # ⚠ SCOPE, measured and NARROWER than it first appears — read before citing this.
+                                    # This branch does NOT fire for uplo='U', which is what the gate benchmarks.
+                                    # For upper triangular the only partial row panel is the BOTTOM one, and every
+                                    # tile it owns is on the diagonal (`full` is false), so it goes to
+                                    # `_microkernel_tri!` and never reaches here. Verified: after this change
+                                    # syrk@100 read 0.899 (was 0.900) and syrk@2100 0.945 (was 0.943), and the
+                                    # sawtooth probe's misaligned penalty was 19.6% -> 20.0% with every offset
+                                    # moving ±2% in both directions — i.e. unchanged, with aligned n=64 as control.
+                                    # An earlier version of this comment claimed the branch targeted those two
+                                    # cells. It does not; that claim was falsified by the numbers above.
+                                    #
+                                    # It fires for uplo='L', where the bottom partial panel owns many FULL tiles —
+                                    # the configuration potrf's trailing update issues (`syrk!(…, uplo='L')`). That
+                                    # benefit is UNQUANTIFIED: potrf gates 1.049–1.99 on galen with this in place,
+                                    # but it gated before too, so the run does not isolate this branch. Kept
+                                    # because it is strictly fewer FMAs than the masked tile it replaces and
+                                    # mirrors gemm's own guard exactly — not because a measurement earned it.
+                                    #
+                                    # The sawtooth itself is real and is the residual gap (galen,
+                                    # bench/probes/syrk_modmr_sawtooth.jl, n=49..72): cost/flop has period mr=8,
+                                    # offset 0 = 1.061, offset 4 = 1.171, non-W offsets 1.20–1.36. Since this
+                                    # branch does not move it, the upper-triangular waste lives in
+                                    # `_microkernel_tri!` and the diagonal blocks, NOT in the masked kernel.
+                                    # That is where the next attempt should go.
                                     vr = div(mre, W)
                                     if vr == 1
                                         b0 ? _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(1), Val(NR), Val(true)) :
