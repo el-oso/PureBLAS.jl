@@ -54,7 +54,9 @@
     @test P._at_syrk_pack_cut(galen) == 8             # AVX2 MULTI-pack: 2W ; n=8→recursion, n≥32→packed
     @test P._at_syrk_pack_cut(wintermute) == 8        # AVX-512 UNIFIED: W, unchanged by the split
     @test P._at_syrk_pack_cut(neuromancer) == 8
-    @test P._at_syrk_pack_cut(tigerlake) == 2 * P._lanes(tigerlake, Float64)   # out-of-fleet: 2W, no crash
+    # tigerlake is AVX-512, so it takes the UNIFIED branch and the split must not move it: the 2W arm is
+    # reachable only on multi-pack. This is the out-of-fleet guard that the split changed nothing but AVX2.
+    @test P._at_syrk_pack_cut(tigerlake) == P._at_rank_k_pack_cut(tigerlake) == 8
     @test P._at_symm_mat_max(galen) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
     @test P._at_symm_mat_max(wintermute) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
     @test P._at_symm_mat_max(neuromancer) == 362
