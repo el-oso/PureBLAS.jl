@@ -4622,6 +4622,33 @@ function _trgemm_packed!(
                                 if full && mre == mr && nre == nr
                                     b0 ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(true)) :
                                         _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(false))
+                                elseif full && nre == nr && rem(mre, W) == 0
+                                    # W-ALIGNED PARTIAL ROWS → CLIP, don't mask. `_microkernel_masked!` is fully
+                                    # vectorized but masks only the STORES: it runs all MR row-vectors through the
+                                    # whole k-loop and retires `mre` rows, so a partial panel costs a FULL tile.
+                                    # `_microkernel_clip!` takes the packed-panel stride (Val(MR)) separately from
+                                    # the live vector count (Val(vr)), so it reads the same layout and computes only
+                                    # the vectors that exist. gemm has done this on both its packed and unpacked
+                                    # paths for a while; the triangular kernel never picked it up.
+                                    #
+                                    # Measured galen 2026-08-28 (bench/probes/syrk_modmr_sawtooth.jl, n=49..72):
+                                    # cost/flop sawtooths with period mr=8 — offset 0 is 1.061, offset 4 (one clean
+                                    # vector) 1.171, and the non-W offsets 1.20–1.36; misaligned n costs 19.6% more
+                                    # per flop than aligned. This branch is the offset-4 class, which is exactly
+                                    # where the red cells syrk@100 (12·8+4) and syrk@2100 (262·8+4) sit.
+                                    # Sub-W remainders (offsets 1,2,3,5,6,7 — e.g. syrk@50 = 6·8+2) still need a
+                                    # mask and still fall through to `_microkernel_masked!` below.
+                                    vr = div(mre, W)
+                                    if vr == 1
+                                        b0 ? _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(1), Val(NR), Val(true)) :
+                                            _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(1), Val(NR), Val(false))
+                                    elseif vr == 2
+                                        b0 ? _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(2), Val(NR), Val(true)) :
+                                            _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(2), Val(NR), Val(false))
+                                    else
+                                        b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(true)) :
+                                            _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(false))
+                                    end
                                 elseif full
                                     b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(true)) :
                                         _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(false))
