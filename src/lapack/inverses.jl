@@ -21,31 +21,88 @@
 # This is the "wire the fastest path" rule: a C-ABI shim must route to the FASTEST correct kernel, and
 # these two declined to.
 
+# ── _trtri_ip!: IN-PLACE blocked triangular inverse (dtrtri.f / dtrti2.f) ─────────────────────────
+# `_trtri!` in blas3/level3.jl is deliberately OUT-of-place: trsm calls it and needs its input intact.
+# For the standalone trtri/potri entries that is the wrong trade, and the gate shows it on both ends —
+# full-arms galen, PB/OpenBLAS, with the out-of-place version:
+#
+#   n        8     32     50    100    128    256    512   1000   1024   2048
+#   trtri  0.66   1.10   1.35   1.65   1.85   1.90   1.11   0.76   0.81   0.62
+#   potri  0.70   0.95   1.08   1.36   1.48   1.61   1.05   0.84   0.89   0.73
+#
+# One cause, two symptoms: an n×n scratch. At n=8 the allocation IS the runtime. At n≥1000 it doubles
+# the working set and writes n² where n²/2 is needed (the scratch is filled including its zero
+# triangle), so the memory traffic — not the flops — sets the ceiling. The flop count was already
+# LAPACK's by then, which is why the middle of the range is 1.6–1.9x and the ends still lose.
+#
+# Blocked recursion, LAPACK's own partitioning. Lower L = [L11 0; L21 L22]:
+#     L⁻¹ = [L11⁻¹ 0; −L22⁻¹·L21·L11⁻¹, L22⁻¹]
+# so invert both diagonal blocks in place, then update L21 with two trmm's against the ALREADY-inverted
+# blocks. Upper is the mirror. No scratch at any level.
+@inline function _trtri_ip_base!(A::AbstractMatrix{T}, up::Bool, unit::Bool) where {T}
+    n = size(A, 1)
+    dg = unit ? one(T) : zero(T)
+    if up
+        # Ascending i: writing A[i,j] never clobbers an A[k,j] with k > i that a later row still needs.
+        @inbounds for j in 1:n
+            ajj = unit ? -one(T) : (A[j, j] = inv(A[j, j]); -A[j, j])
+            for i in 1:(j - 1)
+                s = zero(T)
+                for k in i:(j - 1)
+                    s += ((unit && i == k) ? one(T) : A[i, k]) * A[k, j]
+                end
+                A[i, j] = ajj * s
+            end
+        end
+    else
+        # Descending i, for the same reason mirrored.
+        @inbounds for j in n:-1:1
+            ajj = unit ? -one(T) : (A[j, j] = inv(A[j, j]); -A[j, j])
+            for i in n:-1:(j + 1)
+                s = zero(T)
+                for k in (j + 1):i
+                    s += ((unit && i == k) ? one(T) : A[i, k]) * A[k, j]
+                end
+                A[i, j] = ajj * s
+            end
+        end
+    end
+    return A
+end
+
+function _trtri_ip!(A::AbstractMatrix{T}, up::Bool, unit::Bool) where {T}
+    n = size(A, 1)
+    n == 0 && return A
+    n <= _trtri_base() && return _trtri_ip_base!(A, up, unit)
+    h = n ÷ 2
+    A11 = view(A, 1:h, 1:h)
+    A22 = view(A, (h + 1):n, (h + 1):n)
+    dg = unit ? 'U' : 'N'
+    _trtri_ip!(A11, up, unit)
+    _trtri_ip!(A22, up, unit)
+    if up
+        A12 = view(A, 1:h, (h + 1):n)
+        trmm!(A12, A11; side = 'L', uplo = 'U', transA = 'N', diag = dg, alpha = -one(T))
+        trmm!(A12, A22; side = 'R', uplo = 'U', transA = 'N', diag = dg, alpha = one(T))
+    else
+        A21 = view(A, (h + 1):n, 1:h)
+        trmm!(A21, A22; side = 'L', uplo = 'L', transA = 'N', diag = dg, alpha = -one(T))
+        trmm!(A21, A11; side = 'R', uplo = 'L', transA = 'N', diag = dg, alpha = one(T))
+    end
+    return A
+end
+
 # ── trtri: in-place inverse of a triangular A (dtrtri.f) ──────────────────────────────────────────
 # Overwrites the `uplo` triangle of A with A⁻¹. `diag='U'` treats the diagonal as unit and leaves it.
-# `_trtri!` writes out-of-place (it reads A while building the inverse), so it needs one n×n scratch;
-# the triangle is then copied back. A fresh allocation rather than the shared L3 scratch, because the
-# recursion's own trsm bases reach for that.
+# Routes to `_trtri_ip!` — no scratch. See the table above it for why the out-of-place `_trtri!`, which
+# trsm needs for its own reasons, is the wrong kernel to reach for here.
 function trtri!(A::AbstractMatrix{T}; uplo::AbstractChar = 'L', diag::AbstractChar = 'N') where {T}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("trtri!: A must be square"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("trtri!: uplo must be 'L' or 'U'"))
     (diag == 'N' || diag == 'U') || throw(ArgumentError("trtri!: diag must be 'N' or 'U'"))
     n == 0 && return A
-    up = uplo == 'U'
-    X = Matrix{T}(undef, n, n)
-    Xv = view(X, 1:n, 1:n)
-    _trtri!(Xv, A, n, up, diag == 'U')
-    if up
-        @inbounds for j in 1:n, i in 1:j
-            A[i, j] = Xv[i, j]
-        end
-    else
-        @inbounds for j in 1:n, i in j:n
-            A[i, j] = Xv[i, j]
-        end
-    end
-    return A
+    return _trtri_ip!(A, uplo == 'U', diag == 'U')
 end
 
 # ── lauum: in-place triangular product (dlauum.f) ────────────────────────────────────────────────
