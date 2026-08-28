@@ -1967,6 +1967,13 @@ end
 
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
+# 64 IS NOT THE ztrsmR@100 GAP — measured, so don't spend the knob on it. galen 2026-08-28, PB/AOCL,
+# 8 rounds, ABBA: forcing 256 (which routes n=100 to the direct base instead of trtri+trmm) gave 0.907
+# against 0.913 for the shipped 64 — no gain, marginally worse. ztrsmR@100 misses on AOCL (vs_OB is
+# 1.16), so the deficit is inside the path, not in the choice of path.
+# NOTE the grade of that evidence: galen's llama-server went active mid-sweep and the contention guard
+# refused two of the six runs. The four that completed passed both entry and exit checks, so the A/B is
+# sound as SCREENING, but a near-parity re-test wants a quiet box.
 # PDM: Literal — trtri overhead plus extra flops sink small/mid n, so the direct path stops here. | tune: candidate
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
 @inline _fh_ctrsm_direct_max() = (f = _FKR_ctrsm_direct_max[]; f >= 0 ? f : _CTRSM_DIRECT_MAX)
