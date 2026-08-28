@@ -964,6 +964,15 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
             c -> (LinearAlgebra.LAPACK.trtri!(LP, TN, copy(c)); c[1, 1]),
             c -> (PureBLAS.trtri!(copy(c); uplo = LP, diag = TN); c[1, 1]); sizes = _cap(LPSZ, 2048)
         )
+        # `\` on a general matrix and `inv(A)` both land here through LBT. mk returns the LU factors so
+        # the timed core is the inversion, not the factorization.
+        _lufac2(s) = (F = randn(Float64, s, s) + s * LinearAlgebra.I;
+            Fa, ip, _ = LinearAlgebra.LAPACK.getrf!(Matrix{Float64}(F)); (Fa, ip))
+        addh(
+            "getri", _lufac2,
+            c -> (LinearAlgebra.LAPACK.getri!(copy(c[1]), copy(c[2])); c[1][1, 1]),
+            c -> (PureBLAS.getri!(copy(c[1]), c[2]); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
+        )
         addh(
             "sytri", _sytrfac,
             c -> (LinearAlgebra.LAPACK.sytri!(LP, copy(c[1]), c[2]); c[1][1, 1]),

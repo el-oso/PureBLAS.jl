@@ -41,7 +41,6 @@
 # blocks. Upper is the mirror. No scratch at any level.
 @inline function _trtri_ip_base!(A::AbstractMatrix{T}, up::Bool, unit::Bool) where {T}
     n = size(A, 1)
-    dg = unit ? one(T) : zero(T)
     if up
         # Ascending i: writing A[i,j] never clobbers an A[k,j] with k > i that a later row still needs.
         @inbounds for j in 1:n
@@ -196,5 +195,61 @@ function potri!(A::AbstractMatrix{T}; uplo::AbstractChar = 'L') where {T}
     up = uplo == 'U'
     trtri!(A; uplo = uplo, diag = 'N')     # A := M, the factor's inverse (in place, n³/3)
     _lauum!(A, up)                         # A := MᴴM (lower) / MMᴴ (upper), n³/3
+    return A
+end
+
+# ── getri: A⁻¹ from the LU factors in A (dgetri.f) ────────────────────────────────────────────────
+# The third shim with the same defect as its two siblings: it built a dense n×n identity, applied the
+# row pivots to it, and ran two trsm solves — 2n³, against LAPACK's 4n³/3 — plus the same n×n scratch
+# that set the ceiling for trtri/potri at both ends of the size range.
+#
+# LAPACK's algorithm, and the one used here:
+#   1. inv(U) in place                                     n³/3   (`trtri!`, now scratch-free)
+#   2. solve inv(A)·L = inv(U), block column at a time      n³
+#   3. undo the COLUMN pivots (inverse order)
+# Step 2 walks block columns right-to-left: stash the strict-lower part of the block (that is L), zero
+# it in A, subtract the already-computed columns to the right via one gemm, then a right-side unit-lower
+# trsm against the block's own diagonal. The workspace is n×nb, not n×n — nb from `_lu_nb`, the same
+# validated LU panel width, reused exactly as `_pstrf_nb` reuses it.
+function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
+    n = size(A, 1)
+    size(A, 2) == n || throw(DimensionMismatch("getri!: A must be square"))
+    length(ipiv) >= n || throw(DimensionMismatch("getri!: ipiv shorter than n"))
+    n == 0 && return A
+    trtri!(A; uplo = 'U', diag = 'N')                       # 1. inv(U), in place
+    nb = max(1, min(_lu_nb(n), n))
+    W = Matrix{T}(undef, n, nb)
+    j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
+    while j >= 1
+        jb = min(nb, n - j + 1)
+        # Stash L's strict-lower block and zero it in A. The jb×jb diagonal region is zeroed first: the
+        # unit-diagonal and strict-upper entries are never read by a correct trsm, but leaving them as
+        # uninitialised memory is a trap for any kernel that touches a full tile.
+        @inbounds for c in 1:jb, i in j:(j + jb - 1)
+            W[i, c] = zero(T)
+        end
+        @inbounds for jj in j:(j + jb - 1)
+            c = jj - j + 1
+            for i in (jj + 1):n
+                W[i, c] = A[i, jj]
+                A[i, jj] = zero(T)
+            end
+        end
+        if j + jb <= n
+            gemm!(view(A, 1:n, j:(j + jb - 1)), view(A, 1:n, (j + jb):n), view(W, (j + jb):n, 1:jb);
+                  alpha = -one(T), beta = one(T))
+        end
+        trsm!(view(A, 1:n, j:(j + jb - 1)), view(W, j:(j + jb - 1), 1:jb);
+              side = 'R', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T))
+        j -= nb
+    end
+    @inbounds for jj in (n - 1):-1:1                        # 3. undo the column pivots
+        jp = Int(ipiv[jj])
+        if jp != jj
+            for i in 1:n
+                A[i, jj], A[i, jp] = A[i, jp], A[i, jj]
+            end
+        end
+    end
     return A
 end

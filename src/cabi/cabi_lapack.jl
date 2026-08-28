@@ -776,19 +776,7 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
         end
         N = Int(unsafe_load(n)); Am = PtrMatrix(A, N, N, Int(unsafe_load(lda))); ip = PtrVector(ipiv, N)
-        X = zeros($T, N, N)
-        @inbounds for i in 1:N
-            X[i, i] = one($T)
-        end
-        GC.@preserve X begin
-            Xm = PtrMatrix(pointer(X), N, N, N)
-            _laswp!(Xm, ip, 1, N, 1, N)
-            trsm!(Xm, Am; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one($T))
-            trsm!(Xm, Am; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one($T))
-            @inbounds for j in 1:N, i in 1:N
-                Am[i, j] = Xm[i, j]
-            end
-        end
+        getri!(Am, ip)                 # ONE implementation, in lapack/inverses.jl
         unsafe_store!(info, Int64(0)); return
     end
 end
