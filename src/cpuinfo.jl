@@ -481,6 +481,38 @@ const _GEMM_SPLIT_S = 2
     W = _lanes(hw, T)
     return (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : (7 * _acc_cap(hw, T)) >> 2   # unified single-pack vs AVX2 multi-pack
 end
+# ONE PRODUCT vs TWO — why syrk does NOT share the cut above on the multi-pack path.
+#
+# The ×7/4·acc_cap form was calibrated for syr2k's shape and then reused for syrk on the stated grounds
+# that both are "the same REGISTER-capacity criterion". Measured on galen 2026-08-28 (full-arms, boost
+# locked, PB/AOCL, 8 rounds, ABBA-rotated), forcing each op's cut to route n either way:
+#
+#         n=8            n=32           n=50
+#   syrk    rec 10.42     rec 1.114      rec 0.837      <- packed WINS from n=32 (+14.9%, +5.0%)
+#           pack 10.07    pack 1.280     pack 0.879
+#   syr2k   rec 38.5      rec 3.74       rec 2.00       <- recursion WINS everywhere (+47%, +28%, +24%)
+#           pack 26.2     pack 2.93      pack 1.62
+#
+# Opposite crossovers, so no single cut is right for both: the shipped 84 costs syrk 5-15% at n=32/50,
+# and lowering it to fix that would have cost syr2k 24-28% — a regression nothing would have caught,
+# because syrk is the op with the visible gate miss and syr2k passes.
+#
+# The mechanism is the operand COUNT, not the register budget. syr2k's fused kernel packs BOTH A and B
+# per block where syrk packs A alone, so syr2k pays ~2x the pack traffic against the same 2x-flop
+# diagonal waste in the recursion, and needs many more rows before packing amortizes. That is the same
+# asymmetry `kb/findings/pureblas-l3-syrk-syr2k-symm.md` records when it explains why syr2k "sits ~7%
+# below parity while syrk (one product) mostly gates".
+#
+# So syrk's multi-pack crossover is 2W: the unified path's is W (validated fleet-wide, the 392->W fix),
+# and multi-pack packs A twice for the same work, so amortization needs about twice the rows. On galen
+# that is 8, which routes n=8 to the recursion (correct: it wins there by 3.5%) and n>=32 to packed.
+# HONEST LIMIT: the benchmark's L3 size list jumps 8 -> 32, so the crossover is bracketed to (8, 32] and
+# NOT pinned inside it. Every value in [8,31] routes the measured sizes identically; 2W is chosen for the
+# mechanism above, not fitted to a size that was measured. n in 9..31 is an extrapolation.
+@inline function _at_syrk_pack_cut(hw, ::Type{T} = Float64) where {T}
+    W = _lanes(hw, T)
+    return (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : 2 * W   # unified single-pack vs AVX2 multi-pack
+end
 # symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
 # copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
 # packed symmetric kernel at EVERY measured galen n (the packed path is dead weight on AVX2), and the only

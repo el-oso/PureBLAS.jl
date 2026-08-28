@@ -5507,11 +5507,13 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # (Zen5 0.88 / Zen4 0.91); packed is +14% there. Fleet-validated AVX-512 -> W. Overridable per machine.
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
-# PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`
-const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
-# The AVX-512 value was re-derived once (392 -> W) only because a force hook made the A/B cheap. The AVX2
-# branch has never had one, so its 84 has only ever been checked against OpenBLAS — which PB beats at
-# n=50 (1.05) while losing to AOCL there (0.84). Same knob, same bug class, one arm short of a decision.
+# SPLIT FROM syr2k 2026-08-28. This used to be `_at_rank_k_pack_cut` — shared with syr2k on the stated
+# grounds that both are the same register-capacity criterion. Measured on galen, they have OPPOSITE
+# crossovers on the multi-pack path (syrk wants packed from n=32, syr2k wants recursion through n=50),
+# so the shared 84 was costing syrk 5-15%. The full A/B table and the operand-count mechanism are at
+# `_at_syrk_pack_cut` in cpuinfo.jl. The AVX-512 arm is unchanged (both ops still resolve to W there).
+# PDM: Derived — formula over detected consts: `_at_syrk_pack_cut(_HW)`
+const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_syrk_pack_cut(_HW))::Int
 @inline _fh_syrk_pack_cut() = (f = _FKR_syrk_pack_cut[]; f >= 0 ? f : _SYRK_PACK_CUT)
 # n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
 # no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):

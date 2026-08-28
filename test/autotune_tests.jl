@@ -45,16 +45,23 @@
     @test P._at_gemm_unpack_max(galen) == 96          # 2·(16−4)·4 ; measured unpk/blk tie-band 80–112
     @test P._at_gemm_unpack_max(wintermute) == 448    # 2·(32−4)·8 ; EXACT match to the validated Zen4 literal
     @test P._at_gemm_unpack_max(neuromancer) == 448
+    # syr2k keeps the (7·acc_cap)/4 form: measured galen, its recursion beats packed by 24–28% at n=32/50.
     @test P._at_rank_k_pack_cut(galen) == 84          # AVX2 MULTI-pack path: (7·48)/4 ; n=80→recursion, 96→packed
     @test P._at_rank_k_pack_cut(wintermute) == 8      # AVX-512 UNIFIED single-pack: crossover ≈ W (the 392 the old
     @test P._at_rank_k_pack_cut(neuromancer) == 8     # formula gave mis-routed n≤256 → recursion → syrk n=128 miss)
+    # syrk splits off it (2026-08-28): ONE packed operand, not two, so multi-pack amortizes at 2W not
+    # (7·acc_cap)/4. AVX-512 is untouched — the unified branch still returns W for both ops.
+    @test P._at_syrk_pack_cut(galen) == 8             # AVX2 MULTI-pack: 2W ; n=8→recursion, n≥32→packed
+    @test P._at_syrk_pack_cut(wintermute) == 8        # AVX-512 UNIFIED: W, unchanged by the split
+    @test P._at_syrk_pack_cut(neuromancer) == 8
+    @test P._at_syrk_pack_cut(tigerlake) == 2 * P._lanes(tigerlake, Float64)   # out-of-fleet: 2W, no crash
     @test P._at_symm_mat_max(galen) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
     @test P._at_symm_mat_max(wintermute) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
     @test P._at_symm_mat_max(neuromancer) == 362
     @test P._at_symm_mat_max(tigerlake) == 404        # isqrt(1280K/8) — out-of-fleet auto-size, no crash
     # live wired consts equal the formula applied to the detected _HW
     @test P._GEMM_UNPACK_MAX == P._at_gemm_unpack_max(P._HW)
-    @test P._SYRK_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
+    @test P._SYRK_PACK_CUT == P._at_syrk_pack_cut(P._HW)
     @test P._SYR2K_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
     @test P._SYMM_PACK_CUT == P._at_symm_mat_max(P._HW)
 
