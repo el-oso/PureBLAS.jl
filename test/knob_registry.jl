@@ -20,7 +20,9 @@
 # an unclassified knob is debt, not a category. The suite also fails if the generated table drifts
 # from src/, which is what keeps the doc honest.
 #
-# Regenerate:  julia --project=test test/knob_registry.jl   (writes docs/src/knobs.md)
+# Regenerate:  julia --project=. test/knob_registry.jl   (writes docs/src/knobs.md)
+# NOT --project=test: activating test/ is what creates test/Manifest.toml (which must not exist) and
+# strips the comments out of test/Project.toml. This script only parses src/, so the main env is enough.
 
 const _KR_ROOT = normpath(joinpath(@__DIR__, ".."))
 

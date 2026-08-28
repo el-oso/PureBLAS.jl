@@ -82,7 +82,7 @@ default `cholesky!` gets the fast base with no change on your side.
 ## Testing
 
 ```bash
-julia --project=test test/runtests.jl
+julia --project=. -e 'using Pkg; Pkg.test()'
 # one item:
-julia --project=test -e 'using ReTestItems, PureBLAS; runtests(PureBLAS; name="Level-1 contiguous vs OpenBLAS")'
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["Level-1 contiguous vs OpenBLAS"])'
 ```
