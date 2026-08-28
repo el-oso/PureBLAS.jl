@@ -51,6 +51,7 @@ include("lapack/pttrf.jl")         # LAPACK: SPD tridiagonal LDLᴴ (pttrf/pttrs
 include("lapack/stebz.jl")         # LAPACK: sym-tridiag eigvals by bisection (stebz) / eigvecs by inverse iteration (stein)
 include("lapack/pstrf.jl")         # LAPACK: pivoted/semidefinite Cholesky (pstrf)
 include("lapack/solves.jl")        # LAPACK: solves on given factors (potrs/getrs/trtrs) — native + C-ABI share these
+include("lapack/inverses.jl")      # LAPACK: explicit inverses (trtri/potri) — native + C-ABI share these
 include("lapack/qlrq.jl")          # LAPACK: QL/RQ factorizations (geqlf/gerqf/orgql/orgrq/ormql/ormrq + complex duals)
 include("lapack/gelsy.jl")         # LAPACK: rank-deficient LS via RZ (gelsy/tzrzf/ormrz) — needs geqp3.jl + gels.jl
 include("lapack/gelsd.jl")         # LAPACK: rank-deficient LS via SVD (gelsd) — needs svd.jl

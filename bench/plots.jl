@@ -944,10 +944,26 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         # — the thing that ships is not the thing that is measured — and it stayed open longer because
         # nothing even listed these as uncovered.
         #
-        # The four below have native entry points, so they gate the way every other row does. potri,
-        # getri and trtri are C-ABI-only (no `PureBLAS.potri!`), which is exactly the reason getrs /
-        # potrs / trtrs went ungated until native entries were added for them — see the note above.
-        # They need the same treatment before they can be rows here.
+        # potri and trtri were C-ABI-only, which is exactly why getrs/potrs/trtrs went ungated until
+        # native entries were added for them (see the note above); they now have the same treatment in
+        # `lapack/inverses.jl`, and the shims call those, so there is one implementation. `getri` is
+        # still C-ABI-only and remains the last uncovered forwarded symbol.
+        #
+        # `mk` returns the FACTOR (potrf'd / already triangular) so the timed core is the inversion
+        # alone, matching how the getrs/potrs rows time the solve alone. Both arms copy, so the copy is
+        # common-mode.
+        _cholfac(s) = (A = _hpd(Float64, s); LinearAlgebra.LAPACK.potrf!(LP, A); A)
+        addh(
+            "potri", _cholfac,
+            c -> (LinearAlgebra.LAPACK.potri!(LP, copy(c)); c[1, 1]),
+            c -> (PureBLAS.potri!(copy(c); uplo = LP); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        _trifac(s) = tril(randn(Float64, s, s) + s * LinearAlgebra.I)
+        addh(
+            "trtri", _trifac,
+            c -> (LinearAlgebra.LAPACK.trtri!(LP, TN, copy(c)); c[1, 1]),
+            c -> (PureBLAS.trtri!(copy(c); uplo = LP, diag = TN); c[1, 1]); sizes = _cap(LPSZ, 2048)
+        )
         addh(
             "sytri", _sytrfac,
             c -> (LinearAlgebra.LAPACK.sytri!(LP, copy(c[1]), c[2]); c[1][1, 1]),
