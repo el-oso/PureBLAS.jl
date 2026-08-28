@@ -801,32 +801,46 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             A::Ptr{$T}, lda::Ptr{Int64}, info::Ptr{Int64}, lu::Clong
         )::Cvoid
         N = Int(unsafe_load(n)); ul = _cabi_char(uplo); Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        ct = $(T <: Complex ? 'C' : 'T')
-        X = zeros($T, N, N)
-        @inbounds for i in 1:N
-            X[i, i] = one($T)
-        end
-        GC.@preserve X begin
-            Xm = PtrMatrix(pointer(X), N, N, N)
-            if ul == 'L'
-                trsm!(Xm, Am; side = 'L', uplo = 'L', transA = 'N', alpha = one($T))
-                trsm!(Xm, Am; side = 'L', uplo = 'L', transA = ct, alpha = one($T))
-                @inbounds for j in 1:N, i in j:N
-                    Am[i, j] = Xm[i, j]
-                end     # lower triangle
+        N == 0 && (unsafe_store!(info, Int64(0)); return)
+        # trtri + triangular product, i.e. what LAPACK's potri does — NOT two dense solves.
+        #
+        # This used to build a dense N×N identity and run TWO trsm side-L solves against it: 2n³ flops,
+        # against LAPACK's 2n³/3 (trtri n³/3 + lauum n³/3). Three times the work. Measured by the user's
+        # PureOSQP run at n=200: 322 µs vs OpenBLAS 216 µs = 0.67× — losing at 1.49× the time while
+        # doing 3× the flops, which says the kernels were already ~2× more efficient per flop and the
+        # ALGORITHM was the whole gap.
+        #
+        # M = the triangular Cholesky factor's inverse (`_trtri!`, blocked, n³/3, skips the zero
+        # triangle). Then, for A = L·Lᴴ, A⁻¹ = L⁻ᴴ·L⁻¹ = Mᴴ·M — a rank-k update, so syrk/herk, which
+        # gate. Upper stores A = Uᴴ·U, giving A⁻¹ = U⁻¹·U⁻ᴴ = M·Mᴴ, hence trans='N' there.
+        # `_trtri!` zeroes the opposite triangle (its own comment says so), so feeding M to syrk as a
+        # dense operand is CORRECT; it costs n³ rather than lauum's n³/3, which is why this lands at
+        # 4n³/3 rather than the textbook 2n³/3 — still 1.5× less work than before, with no new kernel.
+        # A real `lauum` would take the remaining 2×; that is a separate piece of work.
+        X = Matrix{$T}(undef, N, N)
+        Xv = view(X, 1:N, 1:N)
+        _trtri!(Xv, Am, N, ul == 'U', false)
+        $(
+            if T <: Complex
+                :(herk!(Am, Xv; uplo = ul, trans = (ul == 'L' ? 'C' : 'N'), alpha = true, beta = false))
             else
-                trsm!(Xm, Am; side = 'L', uplo = 'U', transA = ct, alpha = one($T))
-                trsm!(Xm, Am; side = 'L', uplo = 'U', transA = 'N', alpha = one($T))
-                @inbounds for j in 1:N, i in 1:j
-                    Am[i, j] = Xm[i, j]
-                end     # upper triangle
+                :(syrk!(Am, Xv; uplo = ul, trans = (ul == 'L' ? 'T' : 'N'), alpha = one($T), beta = zero($T)))
             end
-        end
+        )
         unsafe_store!(info, Int64(0)); return
     end
 end
 
-# trtri: inverse of a triangular A (in place). Solve op(A)·X = I (one trsm), copy the uplo triangle back.
+# trtri: inverse of a triangular A (in place).
+#
+# WIRE-THE-FASTEST-PATH FIX (2026-08-28). This used to solve op(A)·X = I with ONE trsm against a dense
+# N×N identity, which is n³ flops. `_trtri!` (level3.jl) is the blocked recursive triangular inverse
+# that trsm itself uses internally — n³/3, because it never touches the zero triangle. The shim was
+# built on trsm and simply never routed to it, so the C-ABI entry ran 3× the necessary work while the
+# right kernel sat one file away, already gating and already carrying its own `trtri_base` knob.
+#
+# This is the same class as the izamax and BLAS-2 C-ABI misses: a shim that is correct, is tested, and
+# quietly declines the fast path. Nothing in the gate could see it — trtri has no benchmark cell.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "trtri_64_"))(
             uplo::Ptr{UInt8}, diag::Ptr{UInt8},
@@ -834,21 +848,20 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         )::Cvoid
         N = Int(unsafe_load(n)); ul = _cabi_char(uplo); dg = _cabi_char(diag)
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        X = zeros($T, N, N)
-        @inbounds for i in 1:N
-            X[i, i] = one($T)
-        end
-        GC.@preserve X begin
-            Xm = PtrMatrix(pointer(X), N, N, N)
-            trsm!(Xm, Am; side = 'L', uplo = ul, transA = 'N', diag = dg, alpha = one($T))
-            if ul == 'L'
-                @inbounds for j in 1:N, i in j:N
-                    Am[i, j] = Xm[i, j]
-                end
-            else
-                @inbounds for j in 1:N, i in 1:j
-                    Am[i, j] = Xm[i, j]
-                end
+        N == 0 && (unsafe_store!(info, Int64(0)); return)
+        X = Matrix{$T}(undef, N, N)
+        # `view` of a Matrix, matching how every in-tree caller invokes `_trtri!` (it takes views of the
+        # L3 scratch). A fresh allocation rather than `_l3_tmp` because the recursion's own trsm bases
+        # reach for that scratch.
+        Xv = view(X, 1:N, 1:N)
+        _trtri!(Xv, Am, N, ul == 'U', dg == 'U')
+        if ul == 'L'
+            @inbounds for j in 1:N, i in j:N
+                Am[i, j] = Xv[i, j]
+            end
+        else
+            @inbounds for j in 1:N, i in 1:j
+                Am[i, j] = Xv[i, j]
             end
         end
         unsafe_store!(info, Int64(0)); return
