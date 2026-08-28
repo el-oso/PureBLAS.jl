@@ -6404,6 +6404,7 @@ end
 # Overridable "syr2k_pack_cut".
 # PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`
 const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_HW))::Int
+@inline _fh_syr2k_pack_cut() = (f = _FKR_syr2k_pack_cut[]; f >= 0 ? f : _SYR2K_PACK_CUT)
 # Complex syr2k/her2k: n above which the two-product tri-output packed kernel beats the gemm-temp
 # recursion (which computes a dense n×n temp per diagonal block — the 2× waste).
 #
@@ -6429,7 +6430,7 @@ function syr2k!(
         trans::Char = 'N', alpha::Number = true, beta::Number = false
     )
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
-    if eltype(C) <: BlasReal && n > _SYR2K_PACK_CUT && k > 0
+    if eltype(C) <: BlasReal && n > _fh_syr2k_pack_cut() && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
         _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
