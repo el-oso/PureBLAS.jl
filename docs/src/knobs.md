@@ -104,7 +104,7 @@ Every `@load_preference` key in `src/` — 131 of them.
 | `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (galen n=128) does not replicate (2026-08-21) |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
-| `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
+| `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_syrk_pack_cut(_HW)` | — |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
