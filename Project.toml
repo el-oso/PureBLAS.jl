@@ -1,6 +1,6 @@
 name = "PureBLAS"
 uuid = "cc9e14db-574f-4602-bf53-1167cc4b26d2"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["el_oso"]
 
 [deps]
