@@ -936,6 +936,46 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
             c -> (LinearAlgebra.LAPACK.sytrs!(LP, c[1], c[2], c[3]); c[3][1]),
             c -> (PureBLAS.sytrs!(c[1], c[2], c[3]; uplo = LP); c[3][1]); sizes = _cap(LPSZ, 2048), repsof = _reps_quadratic
         )
+        # ── FORWARDED BUT NEVER BENCHMARKED: the inverse + least-squares/eigen family ─────────────────
+        # `cabi_forward.jl` LBT-forwards potri, getri, trtri, sytri, gelsy, gelsd and geev into user
+        # code. Not one of them had a gate cell. That is how a PureOSQP run found potri at 0.67x
+        # (322 us vs OpenBLAS 216 us at n=200) while every red-cell report said the fleet was fine: the
+        # gate cannot miss what it never measures. It is the same class as the C-ABI routing blind spot
+        # — the thing that ships is not the thing that is measured — and it stayed open longer because
+        # nothing even listed these as uncovered.
+        #
+        # The four below have native entry points, so they gate the way every other row does. potri,
+        # getri and trtri are C-ABI-only (no `PureBLAS.potri!`), which is exactly the reason getrs /
+        # potrs / trtrs went ungated until native entries were added for them — see the note above.
+        # They need the same treatment before they can be rows here.
+        addh(
+            "sytri", _sytrfac,
+            c -> (LinearAlgebra.LAPACK.sytri!(LP, copy(c[1]), c[2]); c[1][1, 1]),
+            c -> (PureBLAS.sytri!(copy(c[1]), c[2]; uplo = LP); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
+        )
+        # Least squares, square-ish and overdetermined-by-construction (m = n here, nrhs = 1) so the
+        # timed core is the factor-and-solve, not the shape handling. Capped at 1024 like `gels`.
+        _lsq(s) = (randn(Float64, s, s), randn(Float64, s, 1))
+        addh(
+            "gelsy", _lsq,
+            c -> (LinearAlgebra.LAPACK.gelsy!(copy(c[1]), copy(c[2]), -1.0); c[2][1]),
+            c -> (PureBLAS.gelsy!(copy(c[1]), copy(c[2]), zeros(Int, size(c[1], 2)), -1.0); c[2][1]);
+            sizes = _cap(LPSZ, 1024)
+        )
+        addh(
+            "gelsd", _lsq,
+            c -> (LinearAlgebra.LAPACK.gelsd!(copy(c[1]), copy(c[2]), -1.0); c[2][1]),
+            c -> (PureBLAS.gelsd!(copy(c[1]), copy(c[2]), -1.0); c[2][1]); sizes = _cap(LPSZ, 1024)
+        )
+        # Nonsymmetric eigenvalues, VALUES ONLY ('N','N'): the vector paths differ enough between
+        # implementations that timing them compares two algorithms rather than one kernel, the same
+        # reason gesvd is gated values-only. Capped at 1024 — geev is O(n^3) with a large constant and
+        # 2048+ would not be seconds-bounded at one sample.
+        addh(
+            "geev", s -> randn(Float64, s, s),
+            c -> (LinearAlgebra.LAPACK.geev!(TN, TN, copy(c)); c[1, 1]),
+            c -> (PureBLAS.geev!(TN, TN, copy(c)); c[1, 1]); sizes = _cap(LPSZ, 1024)
+        )
         # Banded LU: kd scales with n (a fixed narrow band makes this O(n) and hides the kernel).
         _gbd(s) = (kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
             for j in 1:s, i in 1:(2kl + ku + 1); AB[i, j] = randn(); end;
