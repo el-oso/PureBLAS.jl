@@ -35,14 +35,28 @@ for f in "${files[@]}"; do
     out=$(awk -F'\t' -v TOL="$tol" '
         /^#/ { next }
         NF >= 4 {
+            # EVERY reference, not just the first. The original took `else if (ref == 0)`, i.e. whichever
+            # reference appeared first in the record — and the arms are written in the order
+            # aocl, openblas, pb. A partial-arm run (`arms=pb,aocl force-arms`) refreshes pb AND aocl in
+            # one machine state while leaving openblas behind, so comparing pb to aocl alone reports
+            # 0.0% and the stale openblas anchor is never looked at. Caught 2026-08-28 on galen, on
+            # cells this session had just written that way. Compare against the WORST reference.
             pb = 0; ref = 0; refname = ""
+            nref = 0; split("", rfq); split("", rnm)
             for (i = 4; i <= NF; i++) {
                 n = split($i, a, "|")
                 if (n < 6) continue
                 fq = a[4] + 0
                 if (fq <= 0) continue
                 if (a[1] == "pb") pb = fq
-                else if (ref == 0) { ref = fq; refname = a[1] }
+                else { nref++; rfq[nref] = fq; rnm[nref] = a[1] }
+            }
+            if (pb > 0 && nref > 0) {
+                worstd = -1
+                for (r = 1; r <= nref; r++) {
+                    dd = (pb - rfq[r]) / rfq[r] * 100; if (dd < 0) dd = -dd
+                    if (dd > worstd) { worstd = dd; ref = rfq[r]; refname = rnm[r] }
+                }
             }
             if (pb > 0 && ref > 0) {
                 d = (pb - ref) / ref * 100; if (d < 0) d = -d
