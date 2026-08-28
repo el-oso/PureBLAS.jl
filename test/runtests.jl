@@ -1,6 +1,6 @@
 # Entry point: TestItemRunner discovers and runs every `@testitem` under test/. Items run in isolated
 # modules and can be triggered individually by name:
-#   julia --project=test -e 'using Pkg; Pkg.test("PureBLAS"; test_args=["Level-1 contiguous"])'
+#   julia --project=. -e 'using Pkg; Pkg.test(test_args=["Level-1 contiguous"])'
 using TestItemRunner
 using PureBLAS
 

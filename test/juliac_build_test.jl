@@ -7,7 +7,7 @@
 #
 # GATED by PUREBLAS_JULIAC_BUILD=1 because a cold `--trim` build is slow (~13 min: it precompiles PureBLAS
 # against a trimmed base image). Run it in a dedicated CI job / before a release, not on every Pkg.test().
-#   PUREBLAS_JULIAC_BUILD=1 julia --project=test -e 'using ReTestItems, PureBLAS; runtests(PureBLAS; name="juliac")'
+#   PUREBLAS_JULIAC_BUILD=1 julia --project=. -e 'using Pkg; Pkg.test(test_args=["juliac"])'
 
 @testitem "juliac --trim build + C-host LBT (authoritative; gated PUREBLAS_JULIAC_BUILD=1)" tags = [:juliac] begin
     using PureBLAS
