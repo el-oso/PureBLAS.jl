@@ -232,7 +232,7 @@ end
 @inline function _gemv_n_rowblock!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
     W = _vwidth(T); mr = _GEMV_MR * W
     GC.@preserve A x y begin
-        Aptr = pointer(A); yptr = pointer(y); xptr = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         i0 = 0
         while i0 + mr <= m
             _gemv_n_block!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, n, α, β, Val(_GEMV_MR), Val(B0))
@@ -327,7 +327,7 @@ end
 @inline function _gemv_n_paneldrv!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
     W = _vwidth(T); mr = _GEMV_MR * W
     GC.@preserve A x y begin
-        Aptr = pointer(A); yptr = pointer(y); xptr = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         if B0
             @inbounds for i in 1:m
                 unsafe_store!(yptr, zero(T), i)
@@ -444,7 +444,7 @@ end
 
 @inline function _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
-        Aptr = pointer(A); yptr = pointer(y); xptr = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         np = _gemvn_minner_np(m, n, lda, T)      # regime-selected panel width (consts → Val below is static)
         i0 = 0
         while i0 < m
@@ -1403,7 +1403,7 @@ function _gemv_n_ri_run!(
     # shapes; square mid-n (16m ≤ ½L2) runs one block (NB=m), which measured fastest (prefetch continuity).
     NB = (2 * m * sz <= _L2_BYTES ÷ 2) ? m : max(NC, (_L2_BYTES ÷ 2) ÷ (2 * sz))
     GC.@preserve A x y begin
-        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(pointer(y)); xp = Ptr{T}(pointer(x)); ldc = stride(A, 2)
+        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(_ptr(y)); xp = Ptr{T}(_ptr(x)); ldc = stride(A, 2)
         if B0
             @inbounds for i in 1:(2m)
                 unsafe_store!(yp, zero(T), i)
@@ -1551,7 +1551,7 @@ function _gemv_n_cmplx!(
     ) where {T <: BlasReal, B0, MR}
     W = _vwidth(T); mr = MR * W; sz = sizeof(T); αr = real(α); αi = imag(α)
     GC.@preserve A x y begin
-        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(pointer(y)); xp = Ptr{T}(pointer(x)); ldc = stride(A, 2)
+        Ap = Ptr{T}(pointer(A)); yp = Ptr{T}(_ptr(y)); xp = Ptr{T}(_ptr(x)); ldc = stride(A, 2)
         if B0
             @inbounds for i in 1:(2m)
                 unsafe_store!(yp, zero(T), i)
@@ -1680,7 +1680,7 @@ function _gemv_tc_run!(
     ) where {T <: BlasReal, CJ, NC, HALF}
     z = iszero(β); csz = sizeof(Complex{T})
     GC.@preserve A x y begin
-        Ap = pointer(A); lda = stride(A, 2); xp = pointer(x); yp = pointer(y)
+        Ap = pointer(A); lda = stride(A, 2); xp = _ptr(x); yp = _ptr(y)
         j = 0
         while j + NC <= n                                         # NC-column blocks (shared x + swap)
             _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(HALF))
@@ -2123,7 +2123,7 @@ end
         m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}, ::Val{HALF}
     ) where {T <: BlasReal, CJ, HALF}
     GC.@preserve A x y begin
-        Ap = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); csz = sizeof(Complex{T})
+        Ap = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); csz = sizeof(Complex{T})
         jc = 0
         while jc + np <= n
             if np == 2
@@ -2198,7 +2198,7 @@ end
     ) where {T <: BlasReal, COLD}
     csz = sizeof(Complex{T})
     GC.@preserve A x y begin
-        Aptr = pointer(A); xptr = pointer(x); yptr = pointer(y); lda = stride(A, 2)
+        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2)
         @inbounds for j in 1:n
             yj = cj ? conj(unsafe_load(yptr, j)) : unsafe_load(yptr, j)
             ayj = α * yj
@@ -2409,7 +2409,7 @@ end
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
     NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve A x y begin
-        base = pointer(A); xp = pointer(x); yp = pointer(y); lda = stride(A, 2); sz = sizeof(T)
+        base = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
         jb = 0
         while jb + NB <= n                                  # full column panels (unified kernel)
             if up
@@ -2599,8 +2599,8 @@ function _hemv_cmplx!(up::Bool, n::Int, α::Complex{T}, A, x, β::Complex{T}, y)
     iszero(α) && return y
     NB = _ZHEMV_NB; sz = sizeof(T); αr = real(α); αi = imag(α)
     GC.@preserve A x y begin
-        Ap = Ptr{T}(pointer(A)); xp = Ptr{T}(pointer(x)); yp = Ptr{T}(pointer(y))
-        Apc = Ptr{Complex{T}}(pointer(A)); xpc = Ptr{Complex{T}}(pointer(x)); ypc = Ptr{Complex{T}}(pointer(y))
+        Ap = Ptr{T}(pointer(A)); xp = Ptr{T}(_ptr(x)); yp = Ptr{T}(_ptr(y))
+        Apc = Ptr{Complex{T}}(pointer(A)); xpc = Ptr{Complex{T}}(_ptr(x)); ypc = Ptr{Complex{T}}(_ptr(y))
         ldc = stride(A, 2)
         jb = 0
         @inbounds while jb + NB <= n                           # full NB-column panels
@@ -2683,13 +2683,13 @@ end
 @inline function _l2v_simd_ok(A, x, incx::Integer)
     T = eltype(A)
     return incx == 1 && T <: BlasReal && eltype(x) === T &&
-        _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+        _strided1(A) && _dense1(x)
 end
 
 @inline function _trmv_simd!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A)
     GC.@preserve A x begin
-        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         if !tr                                   # x := A·x  (column axpy)
             if up                                # U,N: j ascending
                 @inbounds for j in 1:n
@@ -2731,7 +2731,7 @@ end
     # `_trsv_cmplx!` already uses, which is why this needs no duplicate branch bodies.
     userc = !unit && n <= length(rcp)
     GC.@preserve A x begin
-        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2); sz = sizeof(T)
+        Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         dp(j) = Ap + ((j - 1) * lda + (j - 1)) * sz          # &A[j,j]
         if userc                                 # r[j] = 1/A[j,j]: all independent ⇒ pipelined
             @inbounds @simd ivdep for j in 1:n
@@ -2955,7 +2955,7 @@ end
     n < _trmv_fused_min(eltype(A)) && return _trmv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
     # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
-    if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+    if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
         return _trmv_fused8!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
@@ -3128,7 +3128,7 @@ const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok:
     return quote
         T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
         GC.@preserve A x begin
-            Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+            Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
             r = n & $(F - 1); r = r == 0 ? $F : r      # ragged panel FIRST, where off-panel work is 0
             if up                                     # U,N: panels forward from column 1
                 lo = 1
@@ -3267,7 +3267,7 @@ end
     cs = [Symbol(:cp_, j) for j in 1:N]
     rs = [Symbol(:rc_, j) for j in 1:N]
     body = Expr(:block)
-    push!(body.args, :(Ap = pointer(A)), :(xp = pointer(x)), :(lda = stride(A, 2)))
+    push!(body.args, :(Ap = pointer(A)), :(xp = _ptr(x)), :(lda = stride(A, 2)))
     for j in 1:N                                   # column base pointers
         push!(body.args, :($(cs[j]) = Ap + $((j - 1) * sz) * lda))
     end
@@ -3379,7 +3379,7 @@ const _TRSV_T_F = 8
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
-        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+        Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
         if up                                     # U,T ⇒ Uᵀ lower ⇒ FORWARD, panels ascending
             lo = 1
             @inbounds while lo <= n
@@ -3501,7 +3501,7 @@ end
 @inline function _trsv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
-        Ap = pointer(A); xp = pointer(x); lda = stride(A, 2)
+        Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
         if up                                     # U,N: panels backward from column n
             hi = n
             @inbounds while hi > 0
@@ -3619,7 +3619,7 @@ end
     # 1.408→1.351 Zen3, 1.091→0.969 Zen5). A per-shape table beats an end-to-end average when the caller
     # uses more than one shape.
     if !tr && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) &&
-            x isa StridedVector && stride(x, 1) == 1
+            _dense1(x)
         return _trsv_reg_n!(up, unit, n, A, x)
     end
     # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
@@ -3640,7 +3640,7 @@ end
     # Lower bound is 2F (two panels): the tall region must span at least one full panel beyond the 8x8
     # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
     if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
-            x isa StridedVector && stride(x, 1) == 1
+            _dense1(x)
         return _trsv_fused8_t!(up, unit, n, A, x)
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
@@ -3650,7 +3650,7 @@ end
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
     # Requires unit-stride columns for the vector loads; anything else keeps the blocked path below.
-    if !tr && eltype(A) <: BlasReal && _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+    if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
         return _trsv_fused8!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
@@ -3695,7 +3695,7 @@ end
 @inline function _l2vc_ok(A, x, incx::Integer)
     T = eltype(A)
     return incx == 1 && T <: BlasComplex && eltype(x) === T &&
-        _strided1(A) && x isa StridedVector && stride(x, 1) == 1
+        _strided1(A) && _dense1(x)
 end
 
 # Barrier: resolve the runtime conj flag to a compile-time Val so _dot_cmplx_simd (@generated on Val{CJ})
@@ -3708,7 +3708,7 @@ end
 function _trmv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) where {}
     T = real(eltype(A)); csz = sizeof(Complex{T})
     GC.@preserve A x begin
-        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(pointer(x)); ldc = stride(A, 2)
+        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(_ptr(x)); ldc = stride(A, 2)
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
         if !tr                                               # x := A·x, column axpy
@@ -3763,7 +3763,7 @@ function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
     T = real(eltype(A)); csz = sizeof(Complex{T})
     userc = !unit && n <= 512                                # precompute reciprocals off the crit path
     GC.@preserve A x begin
-        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(pointer(x)); ldc = stride(A, 2)
+        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(_ptr(x)); ldc = stride(A, 2)
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
         rcp = _trsv_rcpbuf(T)

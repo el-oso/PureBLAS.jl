@@ -26,7 +26,7 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
     lanes = Vec{W, Int}(ntuple(l -> l - 1, Val(W)))
     yc = _carrier(y)      # `nothing` in release — see the register-pressure note on `_gbt_one!`
     GC.@preserve AB x y begin
-        Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2)
+        Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2)
         i0 = 0
         @inbounds while i0 < m
             mm = min(W, m - i0); orow = lanes < mm
@@ -52,7 +52,7 @@ end
 @inline function _gbmv_n_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal}
     (kl + ku + 1) <= _GBMV_CONV_MAX && return _gbmv_conv!(m, n, kl, ku, α, AB, x, y)
     GC.@preserve AB x y begin
-        Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2); sz = sizeof(T)
+        Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         @inbounds for j in 1:n
             ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
             len <= 0 && continue
@@ -71,7 +71,7 @@ end
 # element size (band segments are contiguous complex runs); pointers reinterpreted to the real type.
 @inline function _gbmv_n_cmplx_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasComplex}
     GC.@preserve AB x y begin
-        Ap = pointer(AB); xp = pointer(x); yp = pointer(y)   # Ptr{Complex} (kernel reinterprets via _reptr)
+        Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y)   # Ptr{Complex} (kernel reinterprets via _reptr)
         ldb = stride(AB, 2); sz = sizeof(T)                  # complex element size (bytes)
         @inbounds for j in 1:n
             ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
@@ -179,7 +179,7 @@ end
 @inline function _gbmv_t_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, β::T, y) where {T <: BlasReal}
     yc = _carrier(y)      # MUST be _carrier, not y — 1.9% AVX2 regression otherwise (see _gbt_one!)
     GC.@preserve AB x y begin
-        Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2); sz = sizeof(T)
+        Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         if (kl + ku + 1) < _vwidth(T)
             @inbounds for j in 1:n
                 ilo = max(1, j - ku); ihi = min(m, j + kl); base = (ku + ilo - j) + (j - 1) * ldb; s = zero(T)
@@ -266,7 +266,7 @@ end
 # ── sbmv: y := α·A·x + β·y, A symmetric banded (k diagonals on `up` side) ───────────────────────
 @inline function _sbmv_simd!(up::Bool, n::Int, k::Int, α::T, AB, x, y) where {T <: BlasReal}
     GC.@preserve AB x y begin
-        Ap = pointer(AB); xp = pointer(x); yp = pointer(y); ldb = stride(AB, 2); sz = sizeof(T)
+        Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         @inbounds for j in 1:n
             axj = α * unsafe_load(xp, j)
             if up                                       # band A[max(1,j-k):j, j]; diag AB[k+1,j]
@@ -292,8 +292,8 @@ end
 @inline function _hbmv_cmplx_simd!(up::Bool, n::Int, k::Int, α::T, AB, x, y) where {T <: BlasComplex}
     Tr = real(T)
     GC.@preserve AB x y begin
-        Ap = Ptr{Tr}(pointer(AB)); xp = Ptr{Tr}(pointer(x)); yp = Ptr{Tr}(pointer(y))
-        Apc = pointer(AB); xpc = pointer(x); ypc = pointer(y)     # Ptr{Complex}
+        Ap = Ptr{Tr}(pointer(AB)); xp = Ptr{Tr}(_ptr(x)); yp = Ptr{Tr}(_ptr(y))
+        Apc = pointer(AB); xpc = _ptr(x); ypc = _ptr(y)     # Ptr{Complex}
         ldb = stride(AB, 2); szr = sizeof(Tr)
         @inbounds for j in 1:n
             tmp = α * unsafe_load(xpc, j); sr = zero(Tr); si = zero(Tr)
@@ -363,7 +363,7 @@ end
 @inline function _tb_simd!(solve::Bool, up::Bool, tr::Bool, unit::Bool, n::Int, k::Int, AB, x)
     T = eltype(AB)
     GC.@preserve AB x begin
-        Ap = pointer(AB); xp = pointer(x); ldb = stride(AB, 2); sz = sizeof(T)
+        Ap = pointer(AB); xp = _ptr(x); ldb = stride(AB, 2); sz = sizeof(T)
         # column j: up ⇒ off-diag A[ilo:j-1,j] at AB[k+1+ilo-j,j], diag AB[k+1,j];
         #           !up ⇒ off-diag A[j+1:ihi,j] at AB[2,j],         diag AB[1,j]
         cofs(j) = up ? (max(1, j - k), Ap + ((k + max(1, j - k) - j) + (j - 1) * ldb) * sz, j - max(1, j - k), Ap + (k + (j - 1) * ldb) * sz, xp + (max(1, j - k) - 1) * sz) :
