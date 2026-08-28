@@ -169,3 +169,20 @@ function decide(res; delta::Float64 = 0.02)
     end
     return isnothing(best) ? (res[1].name, :tie) : (best.name, :win)
 end
+
+"""
+    noswitch_msg(verdict) -> String
+
+Why a knob was NOT pinned. Referenced at four sites in `calibrate.jl` and never defined — latent
+because a `:tie` was rarely reached at the old 2% margin; the unlocked mode's 5% margin makes ties
+common by design, which turned a silent hole into an `UndefVarError` mid-calibration.
+
+A tie is a RESULT, not a failure: it says the candidates are indistinguishable on this machine, so the
+in-code default stands. Saying that plainly matters — a user watching a tuner print nothing for a knob
+should not have to wonder whether it crashed.
+"""
+noswitch_msg(verdict::Symbol) =
+    verdict === :tie ?
+    "    ⇒ no pin: candidates are indistinguishable here (CI overlaps 1.0, or the margin is under the " *
+    "win threshold). The in-code default is adequate on this machine — this is a result, not a failure." :
+    "    ⇒ no pin: verdict $(verdict)."
