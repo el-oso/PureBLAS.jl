@@ -92,7 +92,7 @@ function _wait_idle(; below::Float64 = 1.4, maxsecs::Int = 600)
 end
 
 """
-    tune!(; dryrun = false, repeats = 3, project = Base.active_project())
+    tune!(; dryrun = false, repeats = 3, project = Base.active_project(), unlocked = false)
 
 Measure this machine's optimal values for the tuning knobs that are NOT derivable from detected
 hardware, and write them as Preferences pins. Reload PureBLAS afterwards for them to take effect.
@@ -102,19 +102,43 @@ them; a knob whose winner differs between processes, or whose candidates are wit
 is left at its in-code default and reported. That is deliberate — an unwritten pin means "the default is
 adequate here", keeps `LocalPreferences.toml` minimal, and lets a future code change re-adjudicate.
 
-Takes minutes. Run it on an idle, frequency-locked machine (`sudo bench/fleet_freqlock.sh lock`); a
-boosting or contended clock produces a wrong winner, which then gets pinned.
+Takes a few minutes (measured ~2 min locked, ~3.5 min unlocked, for the current 5 knobs).
 
-`dryrun = true` measures and prints without writing anything.
+## Frequency
+
+Best results come from a frequency-locked machine (`sudo bench/fleet_freqlock.sh lock`), because a
+pinned clock removes a whole class of measurement error at the source.
+
+**If you do not have root — the normal case — use `unlocked = true`.** It does not skip the safety
+checks; it changes the unit of measurement. The A/B then reduces in CYCLES rather than wall time, and
+cycles are invariant to boost: a faster clock shortens both arms' elapsed time and leaves the cycle
+counts where they were, so the RATIO the decision rests on is unaffected. To compensate for the missing
+lock it also tightens the machine-state drift tolerance (8% → 3%), raises the margin a candidate must
+beat the incumbent by (2% → 5%), and takes more rounds (8 → 12). Pins written this way are stamped
+`measured_unlocked = true` so their provenance is never ambiguous.
+
+Either way, run it on an **idle** machine — contention is a separate problem from clock speed, and
+calibration refuses outright on a busy box rather than pinning a knob decided against someone else's
+workload. Close other applications first.
+
+`dryrun = true` measures and prints without writing anything — worth doing first.
 """
-function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_project())
+function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_project(),
+               unlocked::Bool = false)
     root = normpath(joinpath(@__DIR__, ".."))
     script = joinpath(root, "bench", "calibrate.jl")
     isfile(script) || error("tune!: $script not found — tuning needs the full repository, not just an " *
                             "installed package. Clone PureBLAS.jl and run tune!() from there.")
     jl = Base.julia_cmd()
+    # `unlocked` must be reachable from HERE, not only from the script. `tune!()` is the documented
+    # entry point — the one `_GER_NP`'s comment tells users to run — so a flag that exists only on
+    # calibrate.jl leaves the refusal in place for everyone who follows the documentation. The kwarg
+    # is forwarded to every subprocess; see the UNLOCKED MODE note in bench/calibrate.jl for what it
+    # trades (decides in CYCLES, which boost cannot bias, and tightens drift/margin/rounds to
+    # compensate for the missing lock).
+    extra = unlocked ? ["unlocked"] : String[]
     if dryrun
-        run(`$jl --startup-file=no --project=$(project) $script dryrun`)
+        run(`$jl --startup-file=no --project=$(project) $script dryrun $extra`)
         return nothing
     end
 
@@ -136,7 +160,7 @@ function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_p
             # multi-process design exists to prevent, reintroduced by the guard it depends on.
             k > 1 && _wait_idle()
             try
-                run(`$jl --startup-file=no --project=$(project) $script emit=$f`)
+                run(`$jl --startup-file=no --project=$(project) $script emit=$f $extra`)
             catch e
                 @warn "tune!: calibration run $k failed; skipping it." e
                 continue
