@@ -45,12 +45,12 @@ end
     want = knob_markdown()
     path = joinpath(@__DIR__, "..", "docs", "src", "knobs.md")
     if !isfile(path)
-        @error "docs/src/knobs.md is missing — regenerate: julia --project=test test/knob_registry.jl"
+        @error "docs/src/knobs.md is missing — regenerate: julia --project=. test/knob_registry.jl"
         @test false
     else
         got = read(path, String)
         got == want || @error "docs/src/knobs.md is STALE w.r.t. src/. A knob was added, removed, or \
-            its default/`# PDM:` marker changed. Regenerate: julia --project=test test/knob_registry.jl"
+            its default/`# PDM:` marker changed. Regenerate: julia --project=. test/knob_registry.jl"
         @test got == want
     end
 end
