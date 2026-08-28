@@ -16,19 +16,19 @@
 @inline function _pk_simd_ok(AP, x, incx::Integer)
     T = eltype(AP)
     return incx == 1 && T <: BlasReal && eltype(x) === T &&
-        AP isa StridedVector && stride(AP, 1) == 1 && x isa StridedVector && stride(x, 1) == 1
+        _dense1(AP) && _dense1(x)
 end
 @inline function _pk2_simd_ok(AP, x, y, incx::Integer, incy::Integer)
     T = eltype(AP)
     return incx == 1 && incy == 1 && T <: BlasReal && eltype(x) === T && eltype(y) === T &&
-        AP isa StridedVector && stride(AP, 1) == 1 &&
-        x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+        _dense1(AP) &&
+        _dense1(x) && _dense1(y)
 end
 
 # ── spmv: y := α·A·x + β·y, A symmetric packed ─────────────────────────────────────────────────
 @inline function _spmv_simd!(up::Bool, n::Int, α::T, AP, x, y) where {T <: BlasReal}
     GC.@preserve AP x y begin
-        Ap = pointer(AP); xp = pointer(x); yp = pointer(y); sz = sizeof(T)
+        Ap = pointer(AP); xp = _ptr(x); yp = _ptr(y); sz = sizeof(T)
         @inbounds for j in 1:n
             axj = α * unsafe_load(xp, j)
             if up                                  # col j = A[1:j, j]; diag last
@@ -204,7 +204,7 @@ end
 @inline function _spmv_panel_driver!(up::Bool, n::Int, α::T, AP, x, y) where {T <: BlasReal}
     NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve AP x y begin
-        base = pointer(AP); xp = pointer(x); yp = pointer(y); sz = sizeof(T)
+        base = pointer(AP); xp = _ptr(x); yp = _ptr(y); sz = sizeof(T)
         jb = 0
         while jb + NB <= n
             jbl = jb                                                                # fresh, un-reassigned ⇒ the `bc` closures don't box jb (Core.Box → per-panel heap alloc)
@@ -265,8 +265,8 @@ end
 @inline function _hpmv_cmplx_simd!(up::Bool, n::Int, α::T, AP, x, y) where {T <: BlasComplex}
     Tr = real(T)
     GC.@preserve AP x y begin
-        Ap = Ptr{Tr}(pointer(AP)); xp = Ptr{Tr}(pointer(x)); yp = Ptr{Tr}(pointer(y))
-        xpc = pointer(x); ypc = pointer(y); szr = sizeof(Tr)
+        Ap = Ptr{Tr}(pointer(AP)); xp = Ptr{Tr}(_ptr(x)); yp = Ptr{Tr}(_ptr(y))
+        xpc = _ptr(x); ypc = _ptr(y); szr = sizeof(Tr)
         @inbounds for j in 1:n
             tmp = α * unsafe_load(xpc, j); sr = zero(Tr); si = zero(Tr)
             base = up ? _pkU(j) : _pkL(j, n)                      # 0-based complex index before column j
@@ -292,8 +292,8 @@ function _hpmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Numb
     # an OOB read for a reverse view. The real analogue `_pk2_simd_ok` checks all three strides; this gate
     # did not. Found 2026-08-01 by adversarial review.
     if incx == 1 && incy == 1 && eltype(AP) <: BlasComplex && eltype(x) === eltype(AP) && eltype(y) === eltype(AP) &&
-            AP isa StridedVector && stride(AP, 1) == 1 &&
-            x isa StridedVector && stride(x, 1) == 1 && y isa StridedVector && stride(y, 1) == 1
+            _dense1(AP) &&
+            _dense1(x) && _dense1(y)
         _scale_y!(Int(n), convert(eltype(AP), β), y, 1); iszero(α) && return y
         return _hpmv_cmplx_simd!(up, Int(n), convert(eltype(AP), α), AP, x, y)
     end
@@ -319,7 +319,7 @@ end
 @inline function _tpmv_simd!(up::Bool, tr::Bool, unit::Bool, n::Int, AP, x) where {}
     T = eltype(AP)
     GC.@preserve AP x begin
-        Ap = pointer(AP); xp = pointer(x); sz = sizeof(T)
+        Ap = pointer(AP); xp = _ptr(x); sz = sizeof(T)
         if !tr
             if up                                  # U,N ascending
                 @inbounds for j in 1:n
@@ -404,7 +404,7 @@ end
 @inline function _tpsv_simd!(up::Bool, tr::Bool, unit::Bool, n::Int, AP, x) where {}
     T = eltype(AP)
     GC.@preserve AP x begin
-        Ap = pointer(AP); xp = pointer(x); sz = sizeof(T)
+        Ap = pointer(AP); xp = _ptr(x); sz = sizeof(T)
         if !tr
             if up                                  # U,N back: j descending
                 @inbounds for j in n:-1:1
@@ -522,7 +522,7 @@ end
 @inline function _spr_simd!(up::Bool, n::Int, α::T, AP, x) where {T <: BlasReal}
     sz = sizeof(T)
     GC.@preserve AP x begin
-        Ap = pointer(AP); xp = pointer(x)
+        Ap = pointer(AP); xp = _ptr(x)
         if up
             @inbounds for j in 1:n
                 xj = unsafe_load(xp, j)
@@ -564,7 +564,7 @@ end
 @inline function _spr2_simd!(up::Bool, n::Int, α::T, AP, x, y) where {T <: BlasReal}
     sz = sizeof(T)
     GC.@preserve AP x y begin
-        Ap = pointer(AP); xp = pointer(x); yp = pointer(y)
+        Ap = pointer(AP); xp = _ptr(x); yp = _ptr(y)
         @inbounds for j in 1:n
             xj = unsafe_load(xp, j); yj = unsafe_load(yp, j)
             (iszero(xj) && iszero(yj)) && continue
