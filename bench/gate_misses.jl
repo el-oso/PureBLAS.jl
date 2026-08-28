@@ -28,6 +28,21 @@ for (box, _) in BOXES
         aocl = parse_cache("bench/plots_data_$(box)_aocl.txt"),
     )
 end
+# ── GUARD: this is a v1 reader and the caches are v3 ────────────────────────────────────────────────
+# It expects `plots_data_<host>.txt` + a separate `_aocl.txt`, with `size=vals;size=vals` in field 3.
+# v3 is `plots_data_<uarch>_<host>.txt` carrying ALL arms in one file as `arm|date|commit|anchor|…`
+# pipe records. Against a v3 cache every parse falls through and the script printed a clean, plausible
+# "0 misses" — a gate reporter whose failure mode is an all-clear. Observed 2026-08-28: it reported no
+# misses on a fleet that had 385.
+#
+# `bench/gate_gaps.jl <cache…>` supersedes it (same criterion via gatecrit.jl, plus per-cell round
+# spread and src-staleness). Refuse rather than under-report; if the reader is ever ported to v3,
+# delete this block.
+if all(isempty(data[box].ob) && isempty(data[box].aocl) for (box, _) in BOXES)
+    error("gate_misses.jl parsed 0 cells — it reads the RETIRED v1 cache format and would report a " *
+          "false all-clear. Use: julia --project=bench bench/gate_gaps.jl bench/plots_data_*.txt")
+end
+
 # all (op,lvl,size) keys
 allk = Set{Tuple{String, String, Int}}()
 for (box, _) in BOXES, k in keys(data[box].ob)
