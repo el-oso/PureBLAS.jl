@@ -5509,6 +5509,10 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
 # PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`
 const _SYRK_PACK_CUT = @load_preference("syrk_pack_cut", _at_rank_k_pack_cut(_HW))::Int
+# The AVX-512 value was re-derived once (392 -> W) only because a force hook made the A/B cheap. The AVX2
+# branch has never had one, so its 84 has only ever been checked against OpenBLAS — which PB beats at
+# n=50 (1.05) while losing to AOCL there (0.84). Same knob, same bug class, one arm short of a decision.
+@inline _fh_syrk_pack_cut() = (f = _FKR_syrk_pack_cut[]; f >= 0 ? f : _SYRK_PACK_CUT)
 # n above which complex syrk/herk take the single-pass packed triangular path (no 2×-flop diagonal waste,
 # no recursion — vs the wasteful _syrk_rec! below). TRANS-DEPENDENT crossover (measured, Zen4/Zen5):
 # trans='N' recursion base packs A's contiguous columns via the fast SIMD deinterleave → it WINS small-n
@@ -5634,7 +5638,7 @@ end
 # packed-tri; small → recursion.
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
     T = eltype(C)
-    if !herm && T <: BlasReal && size(C, 1) > _SYRK_PACK_CUT && k > 0
+    if !herm && T <: BlasReal && size(C, 1) > _fh_syrk_pack_cut() && k > 0
         return _syrk_packed!(up, tr, convert(T, α), A, C, k)
     elseif T <: Union{ComplexF64, ComplexF32} && k > 0
         n = size(C, 1)

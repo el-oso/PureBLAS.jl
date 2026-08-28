@@ -618,7 +618,7 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # feature. Defaults true so a normal JIT user can A/B without rebuilding.
 # PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
-const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
+const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "syrk_pack_cut", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
                    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
                    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max",
