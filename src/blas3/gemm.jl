@@ -2152,7 +2152,7 @@ end
     # cannot resolve through this @generated function (unresolved invoke ::Any → .so build fails). Every
     # call site MUST pass all 10 Vals + d0 + upper explicitly. (Regression guard: bench/juliac build.)
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}; V2W = Vec{2W, T}
-    ilv = Expr(:tuple, (iseven(l) ? l ÷ 2 : W + l ÷ 2 for l in 0:(2W - 1))...)
+    # (`ilv`, the split→interleaved shuffle, was removed with the split accumulators — see below.)
     swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)                       # (1,0,3,2,…): swap re/im pairs
     signt = Expr(:tuple, (iseven(l) ? :(-one($T)) : :(one($T)) for l in 0:(2W - 1))...)  # (−1,1,−1,1,…)
     lanetuple = Expr(:tuple, (0:(2W - 1))...)
@@ -2170,17 +2170,50 @@ end
     FULL || for mi in 1:MR
         push!(body.args, :($(Symbol(:m2, mi)) = lanes2 < 2 * (mre - $((mi - 1) * W))))
     end
+    # ── INTERLEAVED accumulators + SWAP-ADJACENT, not split accumulators + DEINTERLEAVE ──────────────
+    # Was: two Vec{W} accumulators per cell (cr, ci), fed by `_deint_cmplx(av)` — TWO cross-lane
+    # shufflevectors per A-load, inside the k-loop — and re-interleaved with a THIRD shuffle per cell in
+    # the store epilogue. Now: one Vec{2W} accumulator per cell held in the interleaved [r i r i…]
+    # domain, fed by ONE within-lane swap-adjacent shuffle, and stored with no interleave at all.
+    #
+    # WHY, measured (galen 2026-08-28). `kernel_report` on this kernel: 34 shuffle ops to 48 FP vector
+    # ops (0.71), against 0.25 for the real `_microkernel!`. The comment further down attributed the
+    # ~124 cycles/tile of excess to PER-TILE boundary setup; `bench/probes/zgemm32_k_scaling.jl`
+    # falsifies that — holding the kernel fixed and varying only k, cost per useful flop is FLAT
+    # (0.2018 -> 0.1987 ns/flop from k=32 to k=256, a 1.5% drop where a fixed per-tile cost would have
+    # amortised ~28%). The excess scales with k, so it is IN-LOOP: the shuffles, not the boundary.
+    #
+    # Flop count is UNCHANGED: 2 FMAs on Vec{2W} == the 4 FMAs on Vec{W} they replace, and the register
+    # footprint is the same (one Vec{2W} == two Vec{W}). The trade is 2 cross-lane shuffles -> 1
+    # within-lane shuffle + at most 1 sign multiply, plus MR*NR epilogue interleaves -> 0.
+    # This is the idiom `_scal_cmplx_simd!`/`_axpy_cmplx_simd!` already use (kb: "one shuffle vs 3 for
+    # deinterleave"); the gemm tile simply never adopted it.
+    #
+    # ⚠ SUMMATION ORDER changes in the imaginary lane: it now accumulates ai·br before ar·bi (the split
+    # form did the reverse). Same operations, same count, re-associated — so results can differ in the
+    # last ulp. gemm carries no bit-identity invariant (unlike LU); the suite compares against OpenBLAS
+    # with a tolerance. The REAL lane's order is unchanged.
+    _sgn(v) = v == 1 ? :(one($T)) : :(-one($T))
+    sgnA = Expr(:tuple, (iseven(l) ? :(one($T)) : _sgn(SA) for l in 0:(2W - 1))...)
+    sgnB = Expr(:tuple, (iseven(l) ? _sgn(-SA * SB) : _sgn(SB) for l in 0:(2W - 1))...)
+    needA = SA != 1                       # all-ones ⇒ skip the multiply entirely (the SA=1 common case)
+    needB = !(-SA * SB == 1 && SB == 1)
     for mi in 1:MR, j in 1:NR
-        push!(body.args, :($(Symbol(:cr, mi, :_, j)) = zero($V)))
-        push!(body.args, :($(Symbol(:ci, mi, :_, j)) = zero($V)))
+        push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V2W)))
     end
     inner = quote end
     for mi in 1:MR
         aoff = :((2 * (ir + $((mi - 1) * W)) + p * lda * 2) * $sz)
         aload = FULL ? :(vload($V2W, A + $aoff)) : :(vload($V2W, A + $aoff, $(Symbol(:m2, mi))))
         push!(inner.args, :($(Symbol(:av, mi)) = $aload))
-        push!(inner.args, :(($(Symbol(:ar, mi)), $(Symbol(:ai, mi))) = _deint_cmplx($(Symbol(:av, mi)))))
+        push!(inner.args, :($(Symbol(:as, mi)) = shufflevector($(Symbol(:av, mi)), Val($swp))))
+        # Conjugation signs fold into A (MR ops per k-step), NOT into the B broadcasts (NR ops). MR=1
+        # and NR=4 in the shape that matters, so this is 4x fewer sign multiplies.
+        needA && push!(inner.args, :($(Symbol(:aA, mi)) = $(Symbol(:av, mi)) * $V2W($sgnA)))
+        needB && push!(inner.args, :($(Symbol(:aB, mi)) = $(Symbol(:as, mi)) * $V2W($sgnB)))
     end
+    _asymA(mi) = needA ? Symbol(:aA, mi) : Symbol(:av, mi)
+    _asymB(mi) = needB ? Symbol(:aB, mi) : Symbol(:as, mi)
     # OOB FIX (direct-read B has NO padding, unlike a packed panel): the k-loop must not read columns
     # past the last valid one on a PARTIAL tile (nre < NR). The store epilogue already masks `j-1 ≥ nre`,
     # so clamping the READ column is sufficient — those lanes are computed and then discarded. Without the
@@ -2217,15 +2250,13 @@ end
     for j in 1:NR
         bstep = TB ? :(2 * p * ldb * $sz) : :(2 * p * $sz)
         push!(inner.args, :($(Symbol(:bp, j)) = $(Symbol(:bb, j)) + $bstep))
-        push!(inner.args, :($(Symbol(:br, j)) = $V(unsafe_load($(Symbol(:bp, j))))))
-        push!(inner.args, :($(Symbol(:bi, j)) = $V(unsafe_load($(Symbol(:bp, j)) + $sz))))
+        push!(inner.args, :($(Symbol(:br, j)) = $V2W(unsafe_load($(Symbol(:bp, j))))))
+        push!(inner.args, :($(Symbol(:bi, j)) = $V2W(unsafe_load($(Symbol(:bp, j)) + $sz))))
         for mi in 1:MR
-            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
-            ar = Symbol(:ar, mi); ai = Symbol(:ai, mi); br = Symbol(:br, j); bi = Symbol(:bi, j)
-            push!(inner.args, :($cr = muladd($ar, $br, $cr)))
-            push!(inner.args, :($cr = muladd($(SA * SB == 1 ? :(-$ai) : ai), $bi, $cr)))
-            push!(inner.args, :($ci = muladd($(SB == 1 ? ar : :(-$ar)), $bi, $ci)))
-            push!(inner.args, :($ci = muladd($(SA == 1 ? ai : :(-$ai)), $br, $ci)))
+            c = Symbol(:c, mi, :_, j); br = Symbol(:br, j); bi = Symbol(:bi, j)
+            # even lane: ar·br − SA·SB·ai·bi   odd lane: SA·ai·br + SB·ar·bi   — the signs live in aA/aB
+            push!(inner.args, :($c = muladd($(_asymA(mi)), $br, $c)))
+            push!(inner.args, :($c = muladd($(_asymB(mi)), $bi, $c)))
         end
     end
     push!(
@@ -2252,24 +2283,26 @@ end
         stores = quote end
         TRI && push!(stores.args, :(thr = d0 + $(j - 1)))               # tri-store threshold for this column
         for mi in 1:MR
-            cr = Symbol(:cr, mi, :_, j); ci = Symbol(:ci, mi, :_, j)
+            # The accumulator is ALREADY interleaved, so every `shufflevector(cr, ci, Val(ilv))` that
+            # used to appear here — MR*NR of them per tile — is gone. `ilv` is now unused by design.
+            cacc = Symbol(:c, mi, :_, j)
             mk = TRI ? :mkl : Symbol(:m2, mi)                           # TRI ⇒ per-tile edge∧triangle mask (mkl)
             q = :(cbase + $(j - 1) * ldc2 + $((mi - 1) * W * 2 * sz))
             vst(v) = FULL ? :(vstore($v, qq)) : :(vstore($v, qq, $mk))   # FULL ⇒ unmasked store/C-load
             cvl = FULL ? :(vload($V2W, qq)) : :(vload($V2W, qq, $mk))
-            if B0 && A1                                                  # β=0, α=1: pure interleave store
-                st = vst(:(shufflevector($cr, $ci, Val($ilv))))
+            if B0 && A1                                                  # β=0, α=1: store the accumulator as-is
+                st = vst(cacc)
             elseif B0                                                    # β=0: resv = α·z (real: 1 mul; complex: +cross)
-                st = AR ? vst(:(avr * shufflevector($cr, $ci, Val($ilv)))) :
+                st = AR ? vst(:(avr * $cacc)) :
                     :(
-                        let ziv = shufflevector($cr, $ci, Val($ilv))
+                        let ziv = $cacc
                             $(vst(:(muladd(ziv, avr, shufflevector(ziv, Val($swp)) * aialt))))
                     end
                     )
             else                                                         # accumulate: resv = C + α·z; C folds into the FMA addend
-                st = AR ? vst(:(muladd(shufflevector($cr, $ci, Val($ilv)), avr, $cvl))) :
+                st = AR ? vst(:(muladd($cacc, avr, $cvl))) :
                     :(
-                        let ziv = shufflevector($cr, $ci, Val($ilv))
+                        let ziv = $cacc
                             $(vst(:(muladd(ziv, avr, muladd(shufflevector(ziv, Val($swp)), aialt, $cvl)))))
                     end
                     )
