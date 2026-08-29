@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 132 of them.
+Every `@load_preference` key in `src/` — 133 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 132 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 8 Measured · 49 Literal · 10 Exempt.
-**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 43 literal · 4 flag · 2 other.
+**Tier:** 65 Derived · 8 Measured · 50 Literal · 10 Exempt.
+**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 44 literal · 4 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -228,6 +228,7 @@ Every `@load_preference` key in `src/` — 132 of them.
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
 | `strassen_maxdepth` | literal | Literal | recursion depth cap; deeper trades flops for pack/add traffic. | candidate |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
+| `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
 
 ## workspace
 
