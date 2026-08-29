@@ -13,7 +13,9 @@
 #
 # STALE MEANS "src/ MOVED", NOT "the hash differs" — the definition bench/gate_gaps.jl already uses. A
 # cell measured five doc commits ago is not stale. A hash comparison would flag every row the moment
-# anything is committed, and a flag that is always on gets ignored.
+# anything is committed, and a flag that is always on gets ignored. Since 2026-08-29 "moved" is judged
+# on the PARSED source, so a comment-only commit to src/ does not stale a cell either — see the
+# `semantic_only` helper below and bench/src_semantic_diff.jl.
 #
 # EXIT STATUS IS THE POINT: non-zero when any cache has cells older than the last src/ change, so this
 # can gate a publish rather than merely inform one.
@@ -30,6 +32,22 @@ fi
 
 HEAD_SHA=$(git rev-parse --short HEAD)
 echo "HEAD=$HEAD_SHA   (a cell is STALE iff src/ changed between its pb arm's commit and HEAD)"
+
+# "src/ MOVED" is judged on the PARSED source, not the file list. git's diff cannot tell a kernel edit
+# from a comment fix, so a single comment-only commit staled all 2790 cells on 2026-08-29 and left only
+# a full re-sweep or `--force` — and --force also waves through the real staleness this gate exists to
+# catch. bench/src_semantic_diff.jl compares Expr trees; see its header for why it is conservative.
+# Memoized: the same commit recurs across all three caches, and each check forks git per changed file.
+declare -A _SEMCACHE
+semantic_only() {                      # returns 0 when the src/ diff since $1 is comments/formatting
+    local c=$1
+    if [ -z "${_SEMCACHE[$c]:-}" ]; then
+        julia --startup-file=no bench/src_semantic_diff.jl "$c" >/dev/null 2>&1
+        # A missing/broken julia exits non-zero here, which reads as "real change" — the safe side.
+        _SEMCACHE[$c]=$?
+    fi
+    return "${_SEMCACHE[$c]}"
+}
 rc=0
 for f in "${files[@]}"; do
     box=$(basename "$f" .txt | sed 's/plots_data_//')
@@ -40,11 +58,13 @@ for f in "${files[@]}"; do
         total=$((total + n))
         if git cat-file -e "${c}^{commit}" 2>/dev/null; then
             nsrc=$(git diff --name-only "$c"..HEAD -- src/ 2>/dev/null | wc -l)
-            if [ "$nsrc" -gt 0 ]; then
+            if [ "$nsrc" -eq 0 ]; then
+                printf "   ok     %5d cells @ %-9s\n" "$n" "$c"
+            elif semantic_only "$c"; then
+                printf "   ok     %5d cells @ %-9s  %s src file(s) touched, comments/format only\n" "$n" "$c" "$nsrc"
+            else
                 stale=$((stale + n)); rc=1
                 printf "   STALE  %5d cells @ %-9s  %s src file(s) changed since\n" "$n" "$c" "$nsrc"
-            else
-                printf "   ok     %5d cells @ %-9s\n" "$n" "$c"
             fi
         else
             # A commit absent from this clone cannot be judged — do not cry wolf, but do not call it ok.
