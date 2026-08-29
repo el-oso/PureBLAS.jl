@@ -23,6 +23,29 @@
 # from 616/863 mismatched to 0/863 that way.
 #
 #   bench/check_arm_anchors.sh [tol_pct]     # default 5; every bench/plots_data_*.txt
+#
+# ⚠ ADVISORY, NOT A VERDICT — read this before treating a mismatch as a reason to discard data.
+#
+# This check was written 2026-08-29 on the assumption that anchor drift between the pb arm and its
+# reference arms means the ratio divides two machine states and is therefore invalid. That assumption
+# was never tested, and when it finally was, IT FAILED:
+#
+#   After an `arms=pb` refresh on neuromancer that this check called 96/863 cells mismatched (galen:
+#   737/893, worst 24.7%), the underlying measurements were compared directly:
+#     * all 1726 reference arms were BYTE-IDENTICAL before and after — `arms=pb` does not touch them;
+#     * for 108 cells whose kernel code had not changed, the pb TIMES were unchanged:
+#         median post/pre = 0.9997, p10 = 0.9815, p90 = 1.0154
+#       against the ~1.24x slowdown the 24% anchor drift would imply.
+#   The anchor moved. The measurements did not.
+#
+# LIKELY MECHANISM (user's hypothesis, and it fits): the benchmark kernels run `taskset`-pinned to one
+# core, so a floating background process perturbs the ANCHOR workload while leaving the pinned kernel
+# timings alone. The anchor is then measuring machine weather that the gate numbers are immune to.
+#
+# So: a mismatch here is a REASON TO LOOK, not a reason to discard. The question the anchor cannot
+# answer — and the one that actually matters — is "did the pb times move?". Compare pb medians for
+# cells whose code did not change between the two runs; that is the real test, and it is cheap.
+# `bench/publish.sh` therefore reports this and does NOT refuse on it.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-5}
