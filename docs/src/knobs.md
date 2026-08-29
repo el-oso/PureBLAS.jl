@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 131 of them.
+Every `@load_preference` key in `src/` — 132 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 131 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 64 Derived · 8 Measured · 49 Literal · 10 Exempt.
-**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 42 literal · 4 flag · 2 other.
+**Tier:** 65 Derived · 8 Measured · 49 Literal · 10 Exempt.
+**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 43 literal · 4 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -39,6 +39,7 @@ Every `@load_preference` key in `src/` — 131 of them.
 | `cgemvt_half` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
+| `cger_cold_den` | literal | Derived | DRAM residency of A with cache headroom, the `_trmv_blk!` criterion; fleet table above. | candidate |
 | `gemvn_mb` | formula | Derived | formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64` | — |
 | `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
