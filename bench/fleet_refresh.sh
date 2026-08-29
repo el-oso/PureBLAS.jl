@@ -63,10 +63,43 @@ esac
 echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
 [ "$MODE" = full ] && echo "=== FULL ARMS: all three arms per cell in one machine state (anchors match by construction) ==="
 echo "=== PRE-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
+
+# A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
+# on, so a group that died took its exit status with it (the pipeline reports tail's status, not
+# julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: wintermute's L1 group
+# crashed and neuromancer's CLP never ran, and BOTH boxes reported success — 112 cells silently stayed
+# at the previous commit and were published. `bench/cache_staleness.sh` caught it only afterwards.
+#
+# Two failure modes, deliberately handled differently:
+#   contention — plots.jl refuses when a foreign process is >= 25% CPU, and the agent driving this
+#                trips that itself at startup. Transient, so RETRY rather than lose the group.
+#   anything else — a crash or a real error. Report it and keep going so one bad group does not cost
+#                the other seven, but remember it and exit non-zero at the end.
+FAILED=""
 for g in L1 L2 L3 LP CL1 CL2 CL3 CLP; do
     echo "=== group $g ==="
-    # shellcheck disable=SC2086  # ARMSARG is deliberately unquoted: empty must expand to NO argument
-    taskset -c "$CORE" "$JL" --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw 2>&1 | tail -4
+    ok=0
+    for try in 1 2 3 4 5 6; do
+        # Capture, THEN tail — piping julia straight into `tail` reports tail's exit status, which is
+        # how the silent partial refresh happened in the first place.
+        # shellcheck disable=SC2086  # ARMSARG is deliberately unquoted: empty must expand to NO argument
+        out=$(taskset -c "$CORE" "$JL" --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw 2>&1)
+        st=$?
+        printf '%s\n' "$out" | tail -4
+        if [ $st -eq 0 ]; then ok=1; break; fi
+        if printf '%s' "$out" | grep -q "REFUSING to benchmark"; then
+            echo "    group $g: box contended, retry $try in 90s"; sleep 90; continue
+        fi
+        echo "    group $g: FAILED (exit $st, not contention) — see output above"; break
+    done
+    [ $ok -eq 1 ] || FAILED="$FAILED $g"
 done
 echo "=== POST-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
+if [ -n "$FAILED" ]; then
+    echo "=== REFRESH INCOMPLETE — these groups did NOT land:$FAILED"
+    echo "    Their cells still carry the PREVIOUS commit. Re-run them before publishing:"
+    for g in $FAILED; do echo "      taskset -c $CORE $JL --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw"; done
+    echo "    Then confirm with: bench/cache_staleness.sh"
+    exit 1
+fi
 echo "=== REFRESH DONE ==="
