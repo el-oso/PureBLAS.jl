@@ -4,6 +4,6 @@ The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ge
 
 | µarch | host | CPU | commit | measured |
 |---|---|---|---|---|
-| Zen3 · AVX2 | `galen` | AMD Ryzen 9 5900X 12-Core Processor | `89550f9` | 2026-08-29T11:54 |
-| Zen4 · AVX-512 | `wintermute` | AMD Ryzen 5 7640U w/ Radeon 760M Graphics | `209d484` | 2026-08-29T12:39 |
-| Zen5 · AVX-512 | `neuromancer` | AMD Ryzen AI 5 340 w/ Radeon 840M | `209d484` | 2026-08-29T12:51 |
+| Zen3 · AVX2 | `galen` | AMD Ryzen 9 5900X 12-Core Processor | `fd42689` | 2026-08-29T19:16 |
+| Zen4 · AVX-512 | `wintermute` | AMD Ryzen 5 7640U w/ Radeon 760M Graphics | `28ba82b` | 2026-08-29T19:33 |
+| Zen5 · AVX-512 | `neuromancer` | AMD Ryzen AI 5 340 w/ Radeon 840M | `fd42689` | 2026-08-29T19:45 |
