@@ -20,6 +20,12 @@ demonstrated.
 
 ## [Unreleased]
 
+## [0.1.2] — "Reachable" — 2026-08-29
+
+The name is the theme: the fast paths existed, and applications could not reach them. A BLAS-2 SIMD
+path unreachable through `activate()`, three inverse routines running the wrong algorithm behind a
+correct-looking shim, and seven forwarded LAPACK routines with no gate coverage at all.
+
 ### Fixed
 
 - **Complex `gemv` with `trans='T'`/`'C'` threw a `MethodError` for any `A` larger than L2**, and with
@@ -119,6 +125,52 @@ demonstrated.
   the constant so they are not repeated.
 - Complex `trmm`/`trmmR` dispatch unmasked kernels for full-height tiles, as the gemm sweep already
   did. Worth +16.7%/+13.1% at n=8/32 on Zen3 and +0.4–3.8% across n=8…128 on Zen4.
+
+### Fixed — reachability and algorithms (2026-08-28/29)
+
+- **The BLAS-2 SIMD path was unreachable through `activate()` — a 6.9× penalty on every complex and
+  real Level-2 call an application made.** `_l2_simd_ok` gated the SIMD kernels on
+  `x isa StridedVector`; the C-ABI passes raw `Ptr{T}`, and `Ptr <: StridedVector` is false, so every
+  BLAS-2 call routed through LBT fell to the generic scalar loop. Measured on one machine, same
+  workload, same kernel: `symv` **9.25 µs → 1.35 µs**. The gate never saw it because `bench/` calls
+  `PureBLAS.symv!` directly while applications go through the C-ABI — two different paths, only one
+  measured. A routing-parity regression test now asserts that the same operation called natively and
+  through `activate()` reaches the same code path.
+
+- **`potri` ran 3× the necessary flops; `trtri` and `getri` the same class.** All three solved against
+  a dense `n×n` identity — `potri` with *two* trsms (`2n³` against LAPACK's `2n³/3`), `trtri` with one
+  (`n³` against `n³/3`), `getri` with two plus pivots (`2n³` against dgetri's `4n³/3`) — while
+  `_trtri!`, the blocked recursive inverse that `trsm` already uses internally, sat one file away.
+  Rebuilt on LAPACK's own algorithms with native Mode-2 entry points in `lapack/inverses.jl` that the
+  C-ABI shims call, so there is one implementation each. `potri` **0.67× → 0.99–2.1**, `trtri` gates at
+  **1.030**. An intermediate step that reached LAPACK's flop count but kept an `n×n` scratch still lost
+  at both ends (n=8 and n≥1000) — recorded at the code, because once the flop count matches the
+  reference the binding constraint moves to memory traffic.
+
+- **Complex `gemm` tile: interleaved accumulators + swap-adjacent, replacing deinterleave.** The tile
+  held two `Vec{W}` accumulators per cell fed by two *cross-lane* shuffles per A-load inside the
+  k-loop, then re-interleaved with a third per cell in the epilogue — 34 shuffles to 48 FP vector ops,
+  against 0.25 for the real microkernel. Now one `Vec{2W}` accumulator in the interleaved domain, one
+  *within-lane* swap, no epilogue interleave. Same flop count, same register footprint. Closed
+  `zsymm` and `zhemm` at every size, `zgemm@32` 0.882 → 0.960, and `ztrsmR@100` 0.859 → 0.935.
+
+- **`syrk`'s pack crossover was shared with `syr2k`, which wants the opposite.** On the AVX2 multi-pack
+  path, measured: syrk wants packed from n=32 (+14.9%, +5.0%), syr2k wants the recursion throughout
+  (+47%, +28%, +24%). Lowering the shared cut to fix syrk's visible miss would have shipped a 24–28%
+  syr2k regression that no red cell would have reported. Split: syrk derives `2W` on multi-pack;
+  AVX-512 unchanged.
+
+### Added
+
+- Seven LBT-forwarded LAPACK routines gained gate coverage (`potri`, `getri`, `trtri`, `sytri`,
+  `gelsy`, `gelsd`, `geev`) — they shipped to users entirely unmeasured, which is how `potri` sat at
+  0.67× unnoticed.
+- CI now verifies the `--trim` `.so` is **callable**, not merely buildable: `juliac/ctest.c` is
+  compiled and run against the freshly built artifact, asserting daxpy through the C-ABI and both
+  `dgesvd` reconstructions under 1e-9.
+- `bench/gate_cycles.jl` (the gate re-derived in CPU cycles, as triage), `bench/check_arm_anchors.sh`
+  and `bench/check_cache_freshness.sh` — the last of which caught two local cache copies that were a
+  day behind their boxes.
 
 ## [0.1.1] — "Instrument" — 2026-08-06
 
