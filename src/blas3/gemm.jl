@@ -1470,9 +1470,31 @@ const _STRASSEN_MIN = @load_preference("strassen_min", _at_strassen_min(_HW))::I
 # PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 @inline _fh_strassen_maxdepth() = (f = _FKR_strassen_maxdepth[]; f >= 0 ? f : _STRASSEN_MAXDEPTH)
-# Prefer spending LESS Strassen depth over padding an odd dimension — see `_gemm_strassen!`.
-# PDM: Literal — 0 keeps the shipped pad arm; the depth-reduction alternative is under measurement. | tune: candidate
-const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 0)::Int
+# Prefer spending LESS Strassen depth over PADDING an odd dimension — see `_gemm_strassen!` for the
+# branch. Padding costs three extra O(n^2) DRAM passes (two `fill!`s, two operand copies, a copy-back)
+# plus three scratch slots; reducing depth costs flops. Which wins is a shape question, and it was
+# measured rather than argued.
+#
+# ONLY REACHABLE ON NATIVE AVX-512. The pad arm needs a high recursion depth, which needs a low
+# `strassen_min`, and `_at_strassen_min` (cpuinfo.jl:365) gives 256 only when `_datapath_bytes >= 64`.
+# Zen4 double-pumps so its datapath reads 32 -> 1024, same as AVX2. Checked on wintermute: trmm n=2100
+# takes D=1 on an even dimension, so nothing pads and this knob is a NO-OP there and on galen.
+#
+# GATE-MEASURED on neuromancer (Zen5), freq-locked, ABBA, pb-vs-pb (reference arm cancels):
+#     op    n=2100 t(nopad)/t(pad)   gate now -> projected
+#     trmm      0.782                 0.841 -> 1.076   RED -> PASS
+#     trsm      0.787                 0.871 -> 1.107   RED -> PASS
+#     gemm      1.030                 1.186 -> 1.152   still passes (the one real cost)
+# gemm at every OTHER size reads 0.999-1.009 — flat, because those sizes never pad. That flatness is
+# the point: raising `strassen_min` to 1024 instead also bought the 2100 win, but cost gemm 6-9% at
+# 512..2048 by cutting depth on sizes that were never padding in the first place.
+#
+# ⚠ trmm@2048 read 1.015 in the same run and that is NOISE, not a regression: n=2048 is divisible by 8,
+# so every sub-gemm of the split (1024,2048,1024 / 512,2048,512 / 256,2048,256) is clean at every level
+# and this knob cannot alter the code path. Enumerated, not assumed. It calibrates the n=2048 noise
+# floor at >=1.5%, which also means trmm@2048 (gate 1.002) is not adjudicable in either direction.
+# PDM: Literal — prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | tune: candidate
+const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: gate-measured, table above
 @inline _fh_strassen_nopad() = (f = _FKR_strassen_nopad[]; f >= 0 ? f : _STRASSEN_NOPAD)
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
@@ -2646,13 +2668,12 @@ end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
 function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
     T = eltype(C); D = _strassen_depth(m, n, k)
-    # PAD-VS-DEPTH, under measurement (`PUREBLAS_FORCE_strassen_nopad=1`). When a dimension is not a
-    # multiple of 2^D the else-branch below pads: three scratch slots, two `fill!`s, two operand copies
-    # and a copy-back — three extra O(n^2) DRAM passes. The alternative is to spend LESS Strassen: drop
-    # D until every dimension divides evenly, keeping whatever recursion is cleanly available and taking
-    # the in-place arm. Measured on neuromancer: at n=2100 the pad fires twice per trmm! call (levels
-    # 1050 and 525), and removing it via strassen_min=1024 was worth 24% on trmm and 19% on trsm — but
-    # that also cut DEPTH, which cost gemm 6-9%. This knob separates the two effects.
+    # PAD-VS-DEPTH. When a dimension is not a multiple of 2^D the else-branch below pads: three scratch
+    # slots, two `fill!`s, two operand copies and a copy-back — three extra O(n^2) DRAM passes. Spending
+    # LESS Strassen instead (drop D until every dimension divides evenly, then take the in-place arm) is
+    # cheaper wherever the padded call is not close to square. Default 1; the table and the fleet
+    # measurement are on `_STRASSEN_NOPAD` above, including why this is a no-op off native AVX-512.
+    # `PUREBLAS_FORCE_strassen_nopad=0` restores the unconditional pad arm for A/B.
     if _fh_strassen_nopad() == 1
         while D > 0 && !(m % (1 << D) == 0 && n % (1 << D) == 0 && k % (1 << D) == 0)
             D -= 1
