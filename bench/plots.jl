@@ -1780,6 +1780,44 @@ function _pref_check()
     return nothing
 end
 
+# ── IS THIS BOX LEGITIMATELY TUNED? (user ruling 2026-08-29: the gate is the TUNED machine) ──────────
+# Before this, ANY active pin refused the write, which meant a box that had run `PureBLAS.tune!()` could
+# not publish a gate number at all — the knob defaults are a fleet-wide MINIMAX (e.g. `ger_panel_np = 1`
+# is chosen so Zen5 passes; wintermute's own optimum is 8), so the shipped default is by construction not
+# what any single machine should run.
+#
+# The carve-out is deliberately NARROW, because the blanket refusal exists for a real incident: an
+# untracked pin of `ger_panel_np = 1` sandbagged every published ger number for ten days (see the `tune=`
+# note below). Both conditions must hold:
+#   1. EVERY active pin is a key `tune!()` itself owns (`_TUNABLE_KEYS`), plus its own `tuned_for` stamp.
+#      A hand-written pin, a leftover, or a key from some other experiment still refuses.
+#   2. `is_tuned()` — the stored `tuned_for` fingerprint matches the DETECTED hardware (src/tune.jl:43).
+#      A depot copied between machines, or a BIOS cache change, makes the fingerprint stale and refuses.
+# `PUREBLAS_FORCE_*` is NOT covered and still refuses unconditionally below: a forced arm is an A/B probe,
+# never a gate number. And the header stamps `tuned=` so a published cell says out loud that it describes
+# a tuned box rather than a fresh install.
+function _tuned_pins_ok()
+    merged = try
+        Base.get_preferences(_PB_UUID)
+    catch e
+        return (false, "preference resolution failed ($e)")
+    end
+    isempty(merged) && return (false, "no pins")
+    own = Set(String.(PureBLAS._TUNABLE_KEYS))
+    stray = sort([String(k) for k in keys(merged) if String(k) != "tuned_for" && !(String(k) in own)])
+    isempty(stray) || return (false, "pin(s) not owned by tune!(): " * join(stray, ", "))
+    haskey(merged, "tuned_for") ||
+        return (false, "pins present but no `tuned_for` stamp — not written by tune!()")
+    PureBLAS.is_tuned() ||
+        return (false, "`tuned_for` is STALE: it does not match this machine's detected hardware")
+    return (true, "")
+end
+_tuned_stamp() = (t = try
+        Base.get_preferences(_PB_UUID)
+    catch
+        Dict()
+    end; get(t, "tuned_for", ""))
+
 function save_cache(path, groups)
     # A PIN IS THE SAME CONDITION AS A FORCE VAR, ONLY PERSISTENT — and it is the one that actually did
     # the damage, because the ten days of wrong Zen5 ger/zgeru numbers propagated through PUBLISHED
@@ -1788,12 +1826,18 @@ function save_cache(path, groups)
     # it does not need to write the GATE cache; and the trim build does not run plots.jl at all.
     # `force-pins` is the deliberate escape, mirroring `force-busy`.
     pinned = _active_prefs()
-    if !isempty(pinned) && !("force-pins" in ARGS)
-        @warn "CACHE NOT WRITTEN — $(length(pinned)) PureBLAS preference pin(s) are active, so the PB \
-            arm is not the shipped configuration:\n  $(join(pinned, "\n  "))\nClear them and re-run, or \
-            pass `force-pins` if a pinned cache is genuinely intended (calibration)."
+    tuned_ok, tuned_why = _tuned_pins_ok()
+    if !isempty(pinned) && !tuned_ok && !("force-pins" in ARGS)
+        @warn "CACHE NOT WRITTEN — $(length(pinned)) PureBLAS preference pin(s) are active and this is \
+            NOT a recognised tuned state ($tuned_why), so the PB arm is not a configuration this project \
+            will stand behind:\n  $(join(pinned, "\n  "))\nEither clear the pins, or run \
+            `PureBLAS.tune!()` so the pins are tune!()-owned and fingerprint-matched, or pass \
+            `force-pins` if a pinned cache is genuinely intended (calibration)."
         return nothing
     end
+    tuned_ok && @info "TUNED-STATE CACHE — every active pin is tune!()-owned and the `tuned_for` \
+        fingerprint matches this machine, so this run is a valid gate measurement of the TUNED box \
+        (user ruling 2026-08-29). The header records `tuned=` so readers know it is not a fresh install."
     forced = _forced_knobs()
     if !isempty(forced)
         @warn "CACHE NOT WRITTEN — $(length(forced)) PUREBLAS_FORCE_* variable(s) are set, so the PB \
@@ -1861,7 +1905,13 @@ function save_cache(path, groups)
             "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
-            isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)"
+            isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
+            # `tuned=` — present ONLY when this cache describes a legitimately tuned box (see
+            # `_tuned_pins_ok`). Its absence means the shipped defaults were measured. A reader comparing
+            # two caches must diff this before diffing any ratio: a tuned and an untuned cache of the same
+            # commit are measuring different configurations, which is exactly the confusion the blanket
+            # pin-refusal used to prevent by making the tuned case impossible.
+            (ts_ = _tuned_stamp(); isempty(ts_) ? "" : "\ttuned=$(ts_)")
         )
         # v3 record: ONE LINE PER CELL, one field per measured arm, each carrying its own timestamp and
         # commit. Per-arm provenance is what makes `arms=pb` safe to use: it rewrites only the pb field,

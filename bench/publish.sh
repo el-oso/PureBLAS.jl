@@ -49,6 +49,30 @@ if ! bench/check_arm_clocks.sh; then
 fi
 
 echo
+echo "══ 1c  pb arm vs its reference arms: same MACHINE STATE?"
+# 1b asks whether the arms ran at the same CLOCK. This asks whether they ran in the same machine state
+# at all, which the clock cannot see: a box can hold its clock perfectly while its memory system, page
+# placement or thermal state drifts, and the per-cell ANCHOR (a fixed calibration workload re-timed
+# around every measurement) is the only field that records it.
+#
+# Not hypothetical, and not covered by any other check here. Both incidents shipped through 1a and 1b:
+#   galen  — 616 of 863 cells (71%) anchor-mismatched after an `arms=pb` refresh; its red count read 58,
+#            and the box was not 26 cells worse, the ARMS were.
+#   zen5   — 121 cells measured at anchor 26.07 against references at 18.26 (43%).
+# Neither cache_staleness.sh (commit staleness) nor check_artifacts_current.sh (rebuild compare) nor
+# freqgate.jl (clock) contains the word "anchor".
+if ! bench/check_arm_anchors.sh; then
+    if [ -n "$FORCE" ]; then
+        echo "(--force given: publishing over anchor-mismatched cells)"
+    else
+        echo
+        echo "REFUSING TO PUBLISH — these ratios divide arms measured in different machine states."
+        echo "Re-measure the named scope FULL-ARMS (no arms=pb), so all arms share one state, or --force."
+        exit 1
+    fi
+fi
+
+echo
 echo "══ 2  rebuild artifacts (both reference views + tables)"
 build_artifacts || { echo "BUILD FAILED — nothing published"; exit 2; }
 

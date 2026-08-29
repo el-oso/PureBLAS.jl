@@ -141,3 +141,37 @@ end
     @test np in (1, 2, 4, 8)
     @test _ger_np() === np
 end
+
+# Every knob `bench/calibrate.jl` can WRITE must be a knob `src/tune.jl` declares it OWNS.
+#
+# These two lists drifted apart in both directions (found 2026-08-29). calibrate wrote four keys that
+# `_TUNABLE_KEYS` did not list, which had two consequences: `tuning_status()` under-reported a tuned
+# machine, and — once `bench/plots.jl` began accepting a legitimately tuned box as a valid gate subject
+# (`_tuned_pins_ok`) — a properly tuned box would have had its cache REFUSED, because four of the pins
+# `tune!()` itself had just written looked unowned.
+#
+# Only the KNOBS ⊆ _TUNABLE_KEYS direction is asserted. The reverse gap is deliberate and must NOT be
+# "fixed": `gbtrf_cross`, `pbtrf_*` and `brd_nb` are declarable user pins with no calibrator, so
+# `tune!()` can never set them — pretending otherwise is what mis-scoped pbtrfU/gbtrf/gesvd as user
+# actions when they are code work.
+#
+# calibrate.jl is not loadable from the test env (it is a bench/ script with its own project), so the
+# list is read as TEXT — the same approach `test/knob_registry.jl` takes to src/.
+@testitem "tune registry: every calibrate.jl KNOB is declared in _TUNABLE_KEYS" tags = [:unit] begin
+    using PureBLAS: _TUNABLE_KEYS
+    calib = joinpath(@__DIR__, "..", "bench", "calibrate.jl")
+    @test isfile(calib)
+    src = read(calib, String)
+    m = match(r"const\s+KNOBS\s*=\s*\((.*?)\n\s*\)"s, src)
+    @test m !== nothing                       # if KNOBS is restructured, this lint must be updated, not deleted
+    written = Set(String.([x.captures[1] for x in eachmatch(r"\"([a-z0-9_]+)\"\s*=>", m.captures[1])]))
+    if isempty(written)                       # tolerate a different KNOBS shape: fall back to bare strings
+        written = Set(String.([x.captures[1] for x in eachmatch(r"\"([a-z0-9_]+)\"", m.captures[1])]))
+    end
+    @test !isempty(written)
+    undeclared = sort(collect(setdiff(written, Set(String.(_TUNABLE_KEYS)))))
+    isempty(undeclared) || @error "bench/calibrate.jl writes preference key(s) that src/tune.jl does " *
+        "not declare in _TUNABLE_KEYS. A tuned box would then look partly un-owned, and save_cache's " *
+        "tuned-state carve-out would refuse it." undeclared
+    @test isempty(undeclared)
+end
