@@ -1884,6 +1884,11 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # which is precisely why it must be clamped HERE, at the single point every caller resolves through,
 # rather than trusted to the candidate set. Same ladder as `_cger_np_max` so the two cannot drift.
 @inline _cger_np() = _snap_np(min(_ger_np(), _CGER_NP_MAX_WIDE))
+# Headroom divisor on the complex-ger DRAM-residency test — see the call site in `_ger_cmplx!`.
+# PDM: Literal — 1 reproduces the shipped `A >= L3` test; the headroom form is under measurement. | tune: candidate
+const _CGER_COLD_DEN = @load_preference("cger_cold_den", 1)::Int
+# `_force_knob`'s unset sentinel is -1, and a 0 divisor would trap, so anything below 1 means "unset".
+@inline _cger_cold_den() = (f = _FKR_cger_cold_den[]; f >= 1 ? f : _CGER_COLD_DEN)
 # NP resolution. A Preference (`ger_panel_np`, written by bench/calibrate.jl or the juliac build) PINS it;
 # else it is auto-measured ONCE per process on the first DRAM ger via `OncePerProcess` — no __init__, so a
 # trimmed .so never runs a benchmark at load. `@static if` (not DCE-by-faith): when the pref IS set (every
@@ -2172,7 +2177,14 @@ function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T
     # partner) against the real kernel's one, and `Vec{2W,T}` is always exactly 2 native registers
     # (2W·sizeof(T) = 2·_SIMD_BYTES by construction), so a column costs 4 registers here versus 1 there.
     # Spending the real path's NP=8 would be 32 registers of coefficients alone and spill on every ISA.
-    cold = m * n * csz >= _L3_BYTES        # the CALLER's footprint — see `_axpy_cmplx_cold!`
+    # HEADROOM DIVISOR, under measurement. `A >= L3` calls A DRAM-resident only when it fills the whole
+    # cache, but x, y and the write stream share L3 too, so an A that merely APPROACHES L3 is already
+    # non-resident in practice. `_trmv_blk!` in this same file makes exactly that argument and requires
+    # `2·A <= L2` rather than `A <= L2`, having measured that the no-headroom form was "fitted on Zen4
+    # and REGRESSED Zen3". Divisor 1 reproduces today's behaviour exactly; `PUREBLAS_FORCE_cger_cold_den=2`
+    # applies the trmv-style half-cache rule. Sentinel is -1, and a divisor of 0 would trap, so the
+    # accessor takes any forced value < 1 as "unset".
+    cold = m * n * csz >= _L3_BYTES ÷ _cger_cold_den()   # the CALLER's footprint — see `_axpy_cmplx_cold!`
     if cold
         np = _cger_np()          # measured stream count, capped by the chosen layout's register budget
         np >= 2 && return _ger_paneldrv_cmplx!(m, n, α, x, y, A, cj, np)
