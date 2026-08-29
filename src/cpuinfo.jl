@@ -200,11 +200,17 @@ const _GEMM_SPLIT_S = 2
 #
 # WAS `(_split_mr + _MR)·W` = 48 on W=8, and its own comment said "fleet-validate before trusting" — it
 # never was. Gate-measured 2026-08-30, freq-locked, ABBA, pb-vs-pb, forcing cap 48 vs 64:
-#     box            n=50 t(64)/t(48)   control spread   gemm@50 gate -> projected
-#     wintermute        0.9244           0.985-1.004      0.905 -> 0.979
-#     neuromancer       0.9628           0.993-1.002      0.878 -> 0.912   (3 replicates/arm)
-# n=50 is the ONLY gate size in the window; every other size routes identically in both arms and reads
-# flat, which is what makes the n=50 delta readable at all.
+#     box            cap A -> B    flipped cell   ratio    control spread   gate -> projected
+#     wintermute      48 -> 64      n=50           0.9244   0.985-1.004      0.905 -> 0.979
+#     neuromancer     48 -> 64      n=50           0.9628   0.993-1.002      0.878 -> 0.912  (3 reps)
+#     galen           28 -> 32      n=32           1.0002   0.995-1.005      0.974 -> 0.974  (3 reps)
+# On each box exactly ONE gate size changes routing; every other size routes identically in both arms
+# and reads flat, which is what makes the delta readable at all.
+#
+# GALEN IS THE REASON THIS FORMULA AND NOT A W=8 LITERAL. No formula can give 64 on W=8 while leaving
+# galen at 28, because galen's `_MR` is 3 where W=8 has 2 — so any change here moves galen too, from 28
+# to 32, which flips routing at its RED `gemm@32` (0.974). Measured: exactly neutral (1.0002). The
+# change is a real gain on both W=8 boxes and a no-op on AVX2, with no regression anywhere.
 #
 # ⚠ THE CROSSOVER IS BOUNDED, NOT LOCATED. The gate samples nothing between 32 and 100, so this measures
 # only that the cap belongs ABOVE 50 on W=8 — it cannot distinguish 56 from 64 from 128, because every
