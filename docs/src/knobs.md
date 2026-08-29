@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 131 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 63 Derived · 10 Measured · 48 Literal · 10 Exempt.
+**Tier:** 64 Derived · 8 Measured · 49 Literal · 10 Exempt.
 **Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 42 literal · 4 flag · 2 other.
 
 
@@ -58,7 +58,7 @@ Every `@load_preference` key in `src/` — 131 of them.
 | `tri_t_unb` | literal | Literal | unblocked/blocked crossover for the transpose path; blocking fixes a measured regression above it. | candidate |
 | `trmv_f_dram` | literal | Derived | majority criterion: switch once tri > 2*L3. The 2 IS the 1/2. | n/a |
 | `trmv_f_switch` | literal | Derived | NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | n/a — Derived |
-| `trmv_fused_min` | delegates | Measured | a crossover set by call overhead vs vectorised work; sweepable without editing code. | candidate |
+| `trmv_fused_min` | delegates | Literal | the L2-residency crossover was tried and falsified; fused8 wins at every n, all 3 boxes. | candidate |
 | `trsv_reg_max` | formula | Derived | formula over detected consts: `_SCALAR_FPREGS - 4` | — |
 | `zhemv_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `zhemv_pf_tiles` | literal | Literal | prefetch depth in tiles for the Hermitian mat-vec. | candidate |
@@ -149,7 +149,7 @@ Every `@load_preference` key in `src/` — 131 of them.
 |---|---|---|---|---|
 | `gbtrf_cmult` | literal | Measured | multiplier on the kl shape; the panel width itself is the shape, not the knob. | candidate |
 | `gbtrf_cross` | delegates | Literal | crossover, derivation falsified; the C32 row is a 3-3 tie on Zen4. | candidate |
-| `gbtrf_nb` | delegates | Measured | banded LU panel width; the comment says outright it needs measuring, not assuming. | candidate |
+| `gbtrf_nb` | delegates | Derived | panel width from the kl shape; only the multiplier below it is measured. | n/a |
 
 ## LAPACK · lapack
 
