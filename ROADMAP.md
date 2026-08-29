@@ -47,11 +47,21 @@ the C-ABI (`ctest.c`, incl. dgesvd). CI pinned to Julia 1.12 (trim is 1.12-speci
 - [ ] **Tag `0.1.0`** + GitHub release (notes from CHANGELOG).
 - [ ] **Register** — Registrator/JuliaHub PR (General) or the Pure-registry flow.
 
-**CI gap (not release-blocking, but close before tagging):** the authoritative trim-build test
-(`test/juliac_build_test.jl`) is `@test_skip`ped in normal `Pkg.test()` and **CI never sets
-`PUREBLAS_JULIAC_BUILD=1`** → the `.so` build is not exercised in CI (a trim break shipped undetected once;
-see kb `trim-generated-default-args`). Fix: add a dedicated CI job (tag-push + `workflow_dispatch`) running
-`Pkg.test(PureBLAS; test_args=["juliac"])` with the env var set, or keep running it manually before each tag.
+**CI gap — CLOSED 2026-08-29 (`8607a04`), and the original description of it was wrong.** This entry said
+"CI never sets `PUREBLAS_JULIAC_BUILD=1` → the `.so` build is not exercised in CI". Stale: the `trim-so`
+job has been running `juliac/build.jl` on every push and PR, so the BUILD was covered and a trim-verifier
+or link failure would have been caught.
+
+The real gap was narrower: **building the `.so` is not the same as the `.so` working.** Nothing in CI
+dlopened the artifact and called through the Fortran C-ABI, so a library that builds cleanly but is
+unusable — wrong symbol decoration, broken ABI, or the embedded runtime failing to self-init — would have
+shipped green. `juliac/ctest.c` is the only check for that, and it lived solely in the
+`PUREBLAS_JULIAC_BUILD=1`-gated `test/juliac_build_test.jl`, which re-runs the ~13-minute build itself and
+so never ran in CI.
+
+Fixed by reusing the `.so` the `trim-so` job already built and running `ctest.c` against it (seconds, not
+a second build), asserting daxpy through the C-ABI, `dgesvd info=0` at both sizes, and both n=160
+reconstructions under 1e-9. It runs on every push rather than only at a tag.
 
 ## Tuning methodology — analytical vs empirical (project vocabulary)
 
