@@ -195,11 +195,26 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gemm_split_ok(hw) = hw.nvreg >= 32 && hw.simd >= 64
 @inline _at_gemm_split_nr(hw) = 2
 @inline _at_gemm_split_mr(hw) = (_ILP_TARGET ÷ _GEMM_SPLIT_S) ÷ _at_gemm_split_nr(hw)
-# Upper size: split helps until the wide tile self-fills. One tall split tile (_split_mr·W rows) plus one
-# wide row-block (_MR·W) ≈ where the crossover sits (W=8: 32+16=48 — covers the measured wins 32/48, drops
-# 64 to the wide path). Preferences-overridable ("gemm_split_max"); fleet-validate before trusting.
+# Upper size: split helps until the wide tile self-fills. TWO tall split tiles (2·_split_mr·W rows), i.e.
+# the split path keeps paying until m would fill the wide tile twice over.
+#
+# WAS `(_split_mr + _MR)·W` = 48 on W=8, and its own comment said "fleet-validate before trusting" — it
+# never was. Gate-measured 2026-08-30, freq-locked, ABBA, pb-vs-pb, forcing cap 48 vs 64:
+#     box            n=50 t(64)/t(48)   control spread   gemm@50 gate -> projected
+#     wintermute        0.9244           0.985-1.004      0.905 -> 0.979
+#     neuromancer       0.9628           0.993-1.002      0.878 -> 0.912   (3 replicates/arm)
+# n=50 is the ONLY gate size in the window; every other size routes identically in both arms and reads
+# flat, which is what makes the n=50 delta readable at all.
+#
+# ⚠ THE CROSSOVER IS BOUNDED, NOT LOCATED. The gate samples nothing between 32 and 100, so this measures
+# only that the cap belongs ABOVE 50 on W=8 — it cannot distinguish 56 from 64 from 128, because every
+# cap >= 50 routes n=50 identically. `2·_split_mr` is the smallest clean criterion that clears 50; it is
+# not a measured optimum, and locating the real crossover needs a size sweep, not a cap sweep.
+#
+# NEITHER CELL FLIPS: 0.979 and 0.912 are both still short of the 0.995 bar. This is margin on two red
+# cells, not a gate win — shipped because it is a real, control-clean gain with no measured cost.
 @inline _at_gemm_split_max(hw, ::Type{T} = Float64) where {T} =
-    (_at_gemm_split_mr(hw) + _at_gemm_mr(hw, T)) * _lanes(hw, T)
+    2 * _at_gemm_split_mr(hw) * _lanes(hw, T)
 # (f) ROW-TAIL vector width. A row block with `mre < W` live rows still computes a WHOLE vector and masks
 # the store, so its cost is the vector's ISSUE cost, not its live lanes. On a double-pumped part a
 # full-width op occupies the FP pipes twice while a datapath-width op occupies them once — so a tail that
