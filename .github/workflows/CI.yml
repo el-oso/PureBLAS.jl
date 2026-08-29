@@ -96,6 +96,35 @@ jobs:
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
         run: julia --project=. juliac/build.jl
 
+      # BUILDING THE .so IS NOT THE SAME AS THE .so WORKING. The step above catches trim-verifier and
+      # link failures; it cannot catch a library that builds cleanly and is then unusable — wrong symbol
+      # decoration, a broken Fortran C-ABI, or the embedded runtime failing to self-init on first call.
+      # `juliac/ctest.c` is the only check that dlopens the artifact and calls THROUGH that ABI from a
+      # real C host, which is the entire point of shipping a .so for non-Julia consumers.
+      #
+      # It lived only in `test/juliac_build_test.jl`, gated behind PUREBLAS_JULIAC_BUILD=1 because that
+      # testitem re-runs the ~13-minute build itself. CI therefore never ran it, and ROADMAP.md listed
+      # "close before tagging" as an open item. Reusing the .so this job just built makes it seconds
+      # instead of a second build, so it runs on every push rather than only at a tag.
+      - name: C-host LBT smoke — ctest.c against the freshly built .so
+        run: |
+          set -euo pipefail
+          cc -O2 juliac/ctest.c -o /tmp/ctest -ldl -lm
+          # run from the repo root: ctest.c dlopens juliac/build/libpureblas.so by RELATIVE path
+          out=$(/tmp/ctest)
+          echo "$out"
+          grep -q 'daxpy: 12.0 24.0 36.0 48.0' <<<"$out" || { echo "FAIL: daxpy through the C-ABI"; exit 1; }
+          grep -q 'dgesvd: info=0'              <<<"$out" || { echo "FAIL: dgesvd info"; exit 1; }
+          grep -q 'dgesvd n=160: info=0'        <<<"$out" || { echo "FAIL: dgesvd n=160 info"; exit 1; }
+          # Both SVD reconstructions must reach machine precision THROUGH the C-ABI — an ABI that passes
+          # arguments subtly wrongly can still return info=0 while computing nonsense.
+          recon=$(sed -n 's/.*dgesvd n=160:.*recon|err|=\([0-9.eE+-]*\).*/\1/p' <<<"$out")
+          ortho=$(sed -n 's/.*dgesvd n=160:.*ortho|err|=\([0-9.eE+-]*\).*/\1/p' <<<"$out")
+          awk -v r="$recon" -v o="$ortho" 'BEGIN{
+                if (r == "" || o == "") { print "FAIL: could not parse recon/ortho errors"; exit 1 }
+                if (r+0 >= 1e-9 || o+0 >= 1e-9) { printf "FAIL: precision recon=%s ortho=%s\n", r, o; exit 1 }
+                printf "  C-ABI precision OK: recon=%s ortho=%s\n", r, o }'
+
   # The ONE artifact check that can run here. Everything else in the publish gate
   # (bench/check_artifacts_current.sh) rebuilds the plots from bench/plots_data_*.txt, which are
   # gitignored and never pushed — CI has no caches, so it cannot judge whether a plot matches its data.
