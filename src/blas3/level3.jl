@@ -470,6 +470,13 @@ end
 # untouched. Preferences knob "ctrmm_pack". Fable-designed, decomposition-confirmed 2026-07-05.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
+# Forceable so the AVX-512 side can be A/B'd without a Preferences pin (the pin tier is the user's).
+# `PUREBLAS_FORCE_ctrmm_pack=1` instantiates the packed drivers on W=8, where they have NEVER been
+# compiled — `mr = _CMR*W` is 16 there against 4 on AVX2, so the tile geometry is untested. Correctness
+# before timing, always. NOTE this makes the branch RUNTIME rather than compile-time, so the packed
+# drivers are now instantiated on AVX-512 (compile cost, per the note on `_trmm_rem_cmplx!`); if the
+# answer turns out to be "no", restore the const so W=8 stops paying for code it never runs.
+@inline _fh_ctrmm_pack() = (f = _FKR_ctrmm_pack[]; f >= 0 ? f == 1 : _CTRMM_PACK)
 # Below this k the packed base's pack overhead loses to the unpacked K-TRIM (measured galen: k=8 0.46 vs
 # unpacked ~1.0, k=32 0.75 vs 0.85; crossover ≈48, k=64 packed 0.91 wins). Recursion bases (k>128 split)
 # land ≥64 → packed; only tiny single-base trmm stays unpacked. Preferences knob "ctrmm_pack_min".
@@ -692,7 +699,7 @@ function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             _trmm_small!(true, up, tr, unit, A, B)
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM small kernel (half flops);
         return !_strided1(B) ? _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B) :            # strided B → base
-            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
+            (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_L!(up, tr, cj, unit, k, A, B)     # AVX-512 / tiny-k → unpacked
     elseif k <= _TRMM_BASE                          # AD/generic: trmv on each B column (contiguous)
         @inbounds for c in axes(B, 2)
@@ -910,7 +917,7 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         return B
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM kernels (mirror side-L).
         return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :            # strided B → base
-            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+            (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)    # AVX-512 / tiny-k → unpacked
     elseif k <= _TRMM_BASE                                # AD/generic: scalar column-axpy base
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
@@ -928,7 +935,7 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
             # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
             return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
-                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+                (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
                 _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
         end
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
@@ -1239,11 +1246,11 @@ function trmm!(
         up_ = uplo == 'U'; tr_ = transA != 'N'; cj_ = transA == 'C'; unit_ = diag == 'U'
         if sl
             !_strided1(B) ? _trmm_cmplx_base_L!(up_, tr_, cj_, unit_, k, A, B) :
-                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up_, tr_, cj_, unit_, k, A, B) :
+                (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up_, tr_, cj_, unit_, k, A, B) :
                 _trmm_cmplx_small_L!(up_, tr_, cj_, unit_, k, A, B)
         else
             !_strided1(B) ? _trmm_cmplx_base_R!(up_, tr_, cj_, unit_, k, A, B) :
-                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up_, tr_, cj_, unit_, k, A, B) :
+                (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up_, tr_, cj_, unit_, k, A, B) :
                 _trmm_cmplx_small_R!(up_, tr_, cj_, unit_, k, A, B)
         end
         isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
@@ -1998,7 +2005,7 @@ function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
-    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
+    return (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
         _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
 end
 # Direct complex side-R column-substitution base (no trtri): X·op(A)=B in place, !tr (⟹ !cj), unit or
@@ -2238,7 +2245,7 @@ function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     end
     T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
     _trtri!(Vv, A, k, up, unit)
-    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
+    return (_fh_ctrmm_pack() && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
         _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
 end
 

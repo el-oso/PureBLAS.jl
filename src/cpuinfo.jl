@@ -654,7 +654,7 @@ const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cge
                    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
                    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max",
-                   "gemvn_rb", "gemvn_mb", "cger_cold_den", "strassen_nopad")
+                   "gemvn_rb", "gemvn_mb", "cger_cold_den", "strassen_nopad", "ctrmm_pack")
 @static if _FORCE_HOOKS
     # One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
     #
