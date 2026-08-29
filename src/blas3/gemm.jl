@@ -1470,6 +1470,10 @@ const _STRASSEN_MIN = @load_preference("strassen_min", _at_strassen_min(_HW))::I
 # PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 @inline _fh_strassen_maxdepth() = (f = _FKR_strassen_maxdepth[]; f >= 0 ? f : _STRASSEN_MAXDEPTH)
+# Prefer spending LESS Strassen depth over padding an odd dimension — see `_gemm_strassen!`.
+# PDM: Literal — 0 keeps the shipped pad arm; the depth-reduction alternative is under measurement. | tune: candidate
+const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 0)::Int
+@inline _fh_strassen_nopad() = (f = _FKR_strassen_nopad[]; f >= 0 ? f : _STRASSEN_NOPAD)
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
     while s >= _fh_strassen_min() && d < _fh_strassen_maxdepth()
@@ -2641,7 +2645,20 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
 function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
-    T = eltype(C); D = _strassen_depth(m, n, k); p = 1 << D
+    T = eltype(C); D = _strassen_depth(m, n, k)
+    # PAD-VS-DEPTH, under measurement (`PUREBLAS_FORCE_strassen_nopad=1`). When a dimension is not a
+    # multiple of 2^D the else-branch below pads: three scratch slots, two `fill!`s, two operand copies
+    # and a copy-back — three extra O(n^2) DRAM passes. The alternative is to spend LESS Strassen: drop
+    # D until every dimension divides evenly, keeping whatever recursion is cleanly available and taking
+    # the in-place arm. Measured on neuromancer: at n=2100 the pad fires twice per trmm! call (levels
+    # 1050 and 525), and removing it via strassen_min=1024 was worth 24% on trmm and 19% on trsm — but
+    # that also cut DEPTH, which cost gemm 6-9%. This knob separates the two effects.
+    if _fh_strassen_nopad() == 1
+        while D > 0 && !(m % (1 << D) == 0 && n % (1 << D) == 0 && k % (1 << D) == 0)
+            D -= 1
+        end
+    end
+    p = 1 << D
     mp = cld(m, p) * p; np = cld(n, p) * p; kp = cld(k, p) * p
     a = convert(T, alpha); b = convert(T, beta)
     if mp == m && np == n && kp == k                       # already clean — recurse in place (β applied at top)
