@@ -60,9 +60,23 @@ end
 
 # The keys `bench/calibrate.jl` may write. Kept here so `tuning_status()` can report them without
 # loading the tuner, and so a key rename fails loudly in one place.
+#
+# ⚠ THIS LIST AND `bench/calibrate.jl`'s `KNOBS` HAD DRIFTED APART IN BOTH DIRECTIONS (found 2026-08-29).
+# calibrate WRITES `gemvt_percol_window`, `gemvt_pf`, `trmv_fused_min` and `gbtrf_cmult`, none of which
+# were listed here — so `tuning_status()` under-reported a tuned machine, and (once `bench/plots.jl`
+# began accepting a tuned box as a valid gate subject) a legitimately tuned box would have been REFUSED
+# because four of its own pins looked unowned. The four are added below.
+# The reverse gap is real too and is NOT a bug to fix by deletion: `gbtrf_cross`, `gbtrf_nb`,
+# `pbtrf_cross_kd`, `pbtrf_u_native_kd`, `pbtrf_nb`, `pbtrf_nb_small` and `brd_nb` are declared tunable
+# but have NO calibrator, so `tune!()` can never set them. They are kept here (the key is still a valid
+# user pin) but must not be counted as "covered by tune!()" — a plan that assumed they were mis-scoped
+# pbtrfU, gbtrf and gesvd as user actions when they are code work.
+# `test/tuner_tests.jl` now asserts `KNOBS ⊆ _TUNABLE_KEYS` so this cannot drift silently again.
 const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", "gbtrf_nb",
                        "pbtrf_cross_kd", "pbtrf_u_native_kd", "pbtrf_nb", "pbtrf_nb_small",
-                       "brd_nb", "sytrf_cmult")
+                       "brd_nb", "sytrf_cmult",
+                       # written by bench/calibrate.jl's KNOBS but previously unlisted here:
+                       "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult")
 
 """
 Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.
