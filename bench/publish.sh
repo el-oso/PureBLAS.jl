@@ -49,6 +49,24 @@ if ! bench/check_arm_clocks.sh; then
 fi
 
 echo
+echo "══ 1a2  is each local cache the newest its box has produced?"
+# The other three checks all reason INSIDE a file (cells vs source, arms vs arms). None of them can see
+# that the file itself is an old copy: fleet_sync.sh pushes SOURCE to the boxes, nothing pulls CACHES
+# back, so a box can re-measure and improve while the copy published from here stays behind.
+# Measured 2026-08-29: the local copy of neuromancer's cache was a day stale, and a whole analysis
+# reported 143 red / 126 anchor-mismatched / 26 artifacts for a box that actually had 115 / 0 / 0.
+if ! bench/check_cache_freshness.sh; then
+    if [ -n "$FORCE" ]; then
+        echo "(--force given: publishing from cache copies that may be behind their boxes)"
+    else
+        echo
+        echo "REFUSING TO PUBLISH — a local cache is older than the box that produced it, or could not"
+        echo "be verified. Pull it (see the scp line above) and re-run, or --force."
+        exit 1
+    fi
+fi
+
+echo
 echo "══ 1c  pb arm vs its reference arms: same MACHINE STATE?"
 # 1b asks whether the arms ran at the same CLOCK. This asks whether they ran in the same machine state
 # at all, which the clock cannot see: a box can hold its clock perfectly while its memory system, page
