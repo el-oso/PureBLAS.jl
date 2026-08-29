@@ -48,7 +48,7 @@
 # rank-1 band update against dger — NOT the panel width. Worth stating because the obvious next move,
 # routing that loop through `_ger!`, is the shape that has failed three times already on BLAS-2 entry
 # overhead; it needs measuring, not assuming.
-# PDM: Measured — banded LU panel width; the comment says outright it needs measuring, not assuming. | tune: candidate
+# PDM: Derived — panel width from the kl shape; only the multiplier below it is measured. | tune: n/a
 const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
 # THE MEASURE-TIER QUANTITY IS THE MULTIPLIER, NOT `nb` — exactly as for `sytrf_cmult`, and for the
 # same reason that file states: pinning `gbtrf_nb` takes the `else` branch, whose value is FLAT, so it

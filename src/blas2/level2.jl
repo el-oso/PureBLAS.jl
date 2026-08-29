@@ -2882,7 +2882,7 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # diagonal+tall-scatter structure, which no longer exists on the N path — so the n ≤ threshold side has
 # never been re-litigated against the fused kernel. `PUREBLAS_FORCE_trmv_fused_min=0` runs fused8 at every
 # n, a huge value runs `_trmv_simd!` at every n, and the crossover can be swept without editing source.
-# PDM: Measured — a crossover set by call overhead vs vectorised work; sweepable without editing code. | tune: candidate
+# PDM: Literal — the L2-residency crossover was tried and falsified; fused8 wins at every n, all 3 boxes. | tune: candidate
 const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
 # Resolved at RUNTIME so the force hook can reach it (a const is baked at load/precompile and cannot be
 # forced), but ONCE PER PROCESS, never per call: `_force_knob` reads ENV, and an ENV dictionary lookup in
