@@ -1,37 +1,57 @@
 # Design
 
-## One kernel set, two consumption modes
+## One kernel set, two ways in
 
-PureBLAS has a single set of low-level Level-1 kernels in BLAS-native `(n, …, inc)` form, written
-over a tiny accessor interface (`_ld`/`_st!`) that works uniformly over `Ptr{T}` (C-ABI) and
-`AbstractVector{T}` (native). Two layers sit on top:
+The kernels are written once, in BLAS-native `(n, …, inc)` form, over a small accessor interface —
+`_ld` and `_st!` in `core.jl` — that reads and writes uniformly through either a `Ptr{T}` or an
+`AbstractVector{T}`:
 
-- **Mode 2 — native API** (`backend.jl`, `native.jl`): ergonomic `AbstractVector` methods on a
-  `SIMDBackend <: AbstractBLAS1` (a TypeContracts interface). No `ccall` boundary, so the whole
-  call tree is plain Julia and **differentiable**.
-- **Mode 1 — C ABI** (`cabi.jl`): `@ccallable` ILP64 reference-BLAS symbols (`daxpy_64_`, by
-  reference, column-major, `Int64`). BLAS-1 has no character arguments, so there are no hidden
-  Fortran string-length args. Compiled to `libpureblas.so` by `juliac --trim`.
+```julia
+@inline _ld(p::Ptr, i::Integer) = unsafe_load(p, i)
+@inline _ld(a, i::Integer) = @inbounds a[i]
+```
+
+That is the whole trick behind having two front ends without two implementations. Two layers sit on
+top of the same kernels:
+
+The **native API** (`backend.jl`, `native.jl`) exposes ergonomic `AbstractArray` methods on a
+`SIMDBackend`, which satisfies a TypeContracts interface. There is no `ccall` boundary anywhere in the
+call tree, so it is all plain Julia the compiler can see into — which is what lets `ForwardDiff.Dual`
+flow through.
+
+The **C ABI** (`cabi/`) exposes 167 `@ccallable` ILP64 reference-BLAS and LAPACK symbols — `daxpy_64_`
+and the rest, arguments by reference, column-major, `Int64`. These serve two consumers. `juliac --trim`
+compiles them into `libpureblas.so` for C, C++ and Rust hosts, and `activate()` registers in-process
+`@cfunction` pointers to the same entry points so LinearAlgebra dispatches to them without any shared
+library involved.
+
+The implementation spans BLAS levels 1 through 3 — dense, packed and banded — and about forty LAPACK
+files covering the factorizations, solves, least squares, SVD and the eigensolvers.
 
 ## Generic over `T<:Number`
 
-One kernel implementation covers `s/d/c/z` and any other `T<:Number`. Real, unit-stride, dense
-inputs dispatch to a SIMD.jl path (`Vec{N,T}` at the detected register width — AVX-512 / AVX2 /
-NEON); everything else uses the generic scalar loop. The generic path is what lets `ForwardDiff.Dual`
-flow through.
+One implementation covers `s`, `d`, `c` and `z`, and anything else numeric. Unit-stride dense inputs
+dispatch to a SIMD.jl path using `Vec{N,T}` at the detected register width; everything else — strided
+data, unusual element types — runs the generic scalar loop. Keeping that scalar path around, rather
+than specialising it away, is what makes the library differentiable.
 
-## Why LBT forwarding into live Julia does not work (yet)
+Width detection covers AVX-512 and AVX2, and falls back to 16 bytes where it cannot identify the host,
+which is the right answer for SSE2 and NEON. The benchmark fleet is x86-64 only, so treat ARM as
+untested rather than supported.
 
-A `juliac --trim` library **embeds the Julia runtime**. Its `@ccallable` entry points are wrapped
-with `ijl_autoinit_and_adopt_thread`, which lazily initializes that runtime on first call — perfect
-for a non-Julia host. But `BLAS.lbt_forward` from inside a running Julia process makes LBT call a
-probe symbol (`isamax_64_`) during interface autodetection, which **double-initializes the shared
-`libjulia`** and aborts (signal 6).
+## Why the shared library cannot be forwarded into live Julia
 
-Therefore:
+A `juliac --trim` library embeds the Julia runtime. Its `@ccallable` entry points are wrapped in
+`ijl_autoinit_and_adopt_thread`, which initializes that runtime lazily on the first call — exactly what
+a C host needs. But calling `BLAS.lbt_forward` on it from inside a running Julia process makes LBT call
+a probe symbol (`isamax_64_`) while autodetecting the interface, and that second initialization of the
+shared `libjulia` aborts the process with signal 6.
 
-- Inside Julia, use **Mode 2** (native API / pkgimage) — also the AD-enabling path.
-- The `.so` is for **non-Julia consumers** and for proving **trim-compatibility** (the build
-  succeeds and exports all 30 BLAS-1 symbols; a C host runs it correctly — `juliac/ctest.c`).
-- Re-enabling LBT forwarding needs upstream juliac support for initializing against the host
-  runtime (or a runtime-free codegen path). Tracked in `ROADMAP.md`.
+So the division is:
+
+- Inside Julia, use `activate()`. It forwards `@cfunction` pointers to the in-process kernels and needs
+  no `.so` at all.
+- The `.so` is for non-Julia hosts, and keeping it building doubles as a standing check that the kernels
+  stay trim-compatible. `juliac/ctest.c` exercises it from C on every push.
+- Getting `lbt_forward` to work would need upstream juliac support for initializing against the host
+  runtime, or a codegen path with no embedded runtime. Tracked in `ROADMAP.md`.
