@@ -13,17 +13,29 @@ makedocs(;
     draft = false,
     source = "src",
     build = "build",
+    # GROUPED ON PURPOSE. DocumenterVitepress puts every TOP-LEVEL entry in the navbar, and ten
+    # flat entries with names this long do not fit: the menu ran over the site title (rendering
+    # "DesignPureBLAS.jl") on a narrow window and off the right edge on a wide one. A nested
+    # `name => [...]` becomes a navbar dropdown instead (vitepress_config.jl `pagelist2str`),
+    # so grouping keeps the bar to five short items. The sidebar still lists every page, which
+    # is what the flat navbar was duplicating.
     pages = [
         "Home" => "index.md",
         "Guide" => "guide.md",
-        "Design" => "design.md",
-        "SIMD & Hardware Adaptation" => "simd.md",
-        "Tuning Constants" => "tuning.md",
-        "Knob Registry" => "knobs.md",
-        "Performance" => "performance.md",
-        "LAPACK/BLAS Coverage" => "coverage.md",
-        "Methodology & Provenance" => "methodology.md",
-        "Performance Notes" => "notes.md",
+        "Internals" => [
+            "Design" => "design.md",
+            "SIMD & Hardware Adaptation" => "simd.md",
+        ],
+        "Tuning" => [
+            "Tuning Constants" => "tuning.md",
+            "Knob Registry" => "knobs.md",
+        ],
+        "Performance" => [
+            "Benchmarks" => "performance.md",
+            "LAPACK/BLAS Coverage" => "coverage.md",
+            "Methodology & Provenance" => "methodology.md",
+            "Performance Notes" => "notes.md",
+        ],
     ],
 )
 
