@@ -110,6 +110,12 @@ println("""
 .pbg{--l:#e3e6ee;--m:#5d6675;--ok:#1f8a5b;--b1:#7a8496;--b2:#c07d12;--b3:#cf5a35;--b4:#b3243a;
  --okbg:#e9f6ef;--b1bg:#f1f3f7;--b2bg:#fdf3e2;--b3bg:#fceee9;--b4bg:#fbe9ed;
  border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;display:table}
+/* The scroll container. Vitepress gets wide tables to scroll with `.vp-doc table{display:block;
+   overflow-x:auto}`; `.pbg` needs display:table for column sizing, and setting it removes that
+   container. Every th/td here is white-space:nowrap, so the table's min-content width exceeds a
+   narrow content column and it then overflows into the page outline instead of scrolling. Wrap
+   rather than drop the nowrap: a wrapped ratio cell is worse to read than a scrollbar. */
+.pbg-wrap{overflow-x:auto;margin:20px 0;max-width:100%}
 html.dark .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;--b2:#e0a63c;--b3:#f08055;--b4:#ff5f7a;
  --okbg:#12271d;--b1bg:#1a2130;--b2bg:#2a2113;--b3bg:#2c1a15;--b4bg:#2c1420}
 @media (prefers-color-scheme:dark){html:not(.light) .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;
@@ -140,7 +146,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
     isempty(ops) && continue
     println("\n#### $section\n")
     println("```@raw html")
-    println("<table class=\"pbg\"><thead><tr><th>routine</th>",
+    println("<div class=\"pbg-wrap\"><table class=\"pbg\"><thead><tr><th>routine</th>",
             join(("<th>$ua</th>" for ua in UARCH)), "</tr></thead><tbody>")
     for op in ops
         print("<tr><th><code>$op</code></th>")
@@ -167,7 +173,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
         end
         println("</tr>")
     end
-    println("</tbody></table>")
+    println("</tbody></table></div>")
     println("```")
 end
 

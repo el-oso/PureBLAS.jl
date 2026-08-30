@@ -3881,7 +3881,7 @@ const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lowe
 # The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
 # n≤128 (m=n≤128) missed its own best kernel → the Zen3 n=128 side-R dip (0.74 vs AOCL; the fused panel does
 # 0.87). Derived: max(_CHOLW SIMD row-tile, k>>2 setup-amortization) ⇒ 32 at k=128, admits the square-128 gate.
-# _CHOLW is µarch-derived (req#8). Fleet-safe: measured Zen3(Zen3) n=128 0.74→0.87 AND Zen4(Zen4)
+# _CHOLW is µarch-derived (req#8). Fleet-safe: measured Zen3 n=128 0.74→0.87 AND Zen4
 # 0.945→1.04 (both beat AOCL at n=64), 2026-07-16 — the fused panel is no-op-or-better at narrow m on both.
 _trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
 # Fused side-R lower driver: X·op(A)⁻¹ via the potrf panel leaf `_trsm_rl_split_f64!`, MC row-chunked.

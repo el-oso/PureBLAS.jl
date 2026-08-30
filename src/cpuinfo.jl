@@ -201,8 +201,8 @@ const _GEMM_SPLIT_S = 2
 # WAS `(_split_mr + _MR)·W` = 48 on W=8, and its own comment said "fleet-validate before trusting" — it
 # never was. Gate-measured 2026-08-30, freq-locked, ABBA, pb-vs-pb, forcing cap 48 vs 64:
 #     box            cap A -> B    flipped cell   ratio    control spread   gate -> projected
-#     Zen4      48 -> 64      n=50           0.9244   0.985-1.004      0.905 -> 0.979
-#     Zen5     48 -> 64      n=50           0.9628   0.993-1.002      0.878 -> 0.912  (3 reps)
+#     Zen4           48 -> 64      n=50           0.9244   0.985-1.004      0.905 -> 0.979
+#     Zen5           48 -> 64      n=50           0.9628   0.993-1.002      0.878 -> 0.912  (3 reps)
 #     Zen3           28 -> 32      n=32           1.0002   0.995-1.005      0.974 -> 0.974  (3 reps)
 # On each box exactly ONE gate size changes routing; every other size routes identically in both arms
 # and reads flat, which is what makes the delta readable at all.
@@ -236,8 +236,8 @@ const _GEMM_SPLIT_S = 2
 # only there. That criterion IS the datapath, so `_double_pumped` is the honest predictor rather than a
 # µarch lookup. Native-256 (Zen3) and native-512 (Zen5) parts both take the interleaved arm (4).
 # Measured, arms called directly at n=3e6 (bench/probes/axpy_arm_regime_ab.jl, µs, lower better):
-#   Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
-#   Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
+#   Zen4 double-pumped:  arm4 3412  arm208 2821  → 208 by 17%
+#   Zen3 native 256:     arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
 # Zen5 predicts 4; unconfirmed (that box's frequency lock was not holding). Replaced a OncePerProcess duel
 # that resolved the 17%-slower arm on Zen4 in 7 of 9 processes and flipped in the other 2.
 @inline _at_axpy_dram(hw) = _double_pumped(hw) ? 208 : 4
@@ -261,9 +261,9 @@ const _GEMM_SPLIT_S = 2
 # pays off if the machine can actually move it in one go, so narrow wins exactly when the REAL datapath
 # is no wider than 32 B — `_datapath_bytes`, which already folds the double-pump fact in.
 # MEASURED, 6 fresh processes per box (the duel is stable here, unlike the real-axpy pair):
-#   Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
+#   Zen3  simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
 #   Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
-#   Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
+#   Zen5  simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
 # ⚠ Zen5 is the one arm this formula CHANGES and the one nobody has measured. It agrees with what
 # simd_kernels.jl and test/Project.toml both already expect of a true-512-bit datapath ("a trim build
 # for a true-512-bit datapath should re-pin it"), but expectation is not measurement — verify on
@@ -371,9 +371,9 @@ const _GEMM_SPLIT_S = 2
 # the blocked path wins. Hence `_NVREG`, not width or cache: it is a register-capacity crossover.
 # Measured with bench/calibrate.jl (stabilise + per-arm anchor + 8 rounds + `decide` requiring a CI
 # excluding 1.0 AND a 2% margin), each box freq-locked and verified, ratio vs the shipped 12:
-#   Zen3       nvreg=16  ->  8 0.990 | 16 0.988 | 20 0.946 | 24 0.860   => 12 (20 costs 5.4%)
+#   Zen3  nvreg=16  ->  8 0.990 | 16 0.988 | 20 0.946 | 24 0.860   => 12 (20 costs 5.4%)
 #   Zen4  nvreg=32  ->  8 0.979 | 16 1.004 | 20 1.068 | 24 1.016   => 20 (+6.8%)
-#   Zen5 nvreg=32  ->  8 0.982 | 16 1.002 | 20 1.082 | 24 1.001   => 20 (+8.2%)
+#   Zen5  nvreg=32  ->  8 0.982 | 16 1.002 | 20 1.082 | 24 1.001   => 20 (+8.2%)
 # Both 32-register boxes resolve 20 with a CI excluding 1.0; the 16-register box resolves 12 and would
 # LOSE 5.4% at 20 — so a flat 20 was not shippable and this is not a two-point fit.
 #
@@ -392,9 +392,9 @@ const _GEMM_SPLIT_S = 2
 # WHY: the measured optimum is per-(box, SIZE), and a 3-valued mode cannot express it (see (c5)). With
 # the bounds exposed, the window `A > AMIN && x <= XMAX` CAN express every measured optimum:
 #     box          needs                       vs default (A > L2, x <= L1/2)
-#     Zen4   AMIN=1 MiB,  XMAX=16 KiB    IS the default — already optimal, nothing to pin
-#     Zen3        AMIN=2 MiB,  XMAX=8 KiB     AMIN raised (excludes n=512), XMAX halved (excludes 2048)
-#     Zen5  AMIN=1 MiB,  XMAX=4 KiB     XMAX quartered (percol at n=512 only)
+#     Zen4         AMIN=1 MiB,  XMAX=16 KiB   IS the default — already optimal, nothing to pin
+#     Zen3         AMIN=2 MiB,  XMAX=8 KiB    AMIN raised (excludes n=512), XMAX halved (excludes 2048)
+#     Zen5         AMIN=1 MiB,  XMAX=4 KiB    XMAX quartered (percol at n=512 only)
 # Those two rows are worth ~1.9% (Zen3 n=1024) and ~3.9% (Zen5 n=512, on a cell that gates 0.988).
 # They also need `gemvt_perscan = 1`, since both boxes ship mode 0.
 #
@@ -408,7 +408,7 @@ const _GEMM_SPLIT_S = 2
 # is simd=64, while `_double_pumped` SEPARATES them. Width is also the physically right unit here: a
 # panel width is counted in vector registers. Two independent AVX-512 boxes agreeing is what makes this
 # a criterion rather than the two-point fit that `zaxpy_narrow` and `ger_np` both punished today.
-#            knob            wm(Zen4)  neuro(Zen5)  Zen3(Zen3)
+#            knob             Zen4      Zen5         Zen3
 #   pbtrf_nb      F32           8          8            16
 #   pbtrf_nb      C32/C64      32         32            24
 #   pbtrf_nb_small F32         16         16             8      (= exactly _lanes(hw, Float32))
@@ -427,7 +427,7 @@ const _GEMM_SPLIT_S = 2
 # (c7) Banded-LU / banded-Cholesky crossovers and the bidiagonalisation panel — same vector-width
 # criterion as (c6), same three-box evidence. Rows marked MODAL had one box flip; its 5-of-6 value is
 # used and named, so nobody has to re-derive where the number came from.
-#          knob                  wm(Zen4)  neuro(Zen5)  Zen3(Zen3)
+#          knob                   Zen4      Zen5         Zen3
 #   gbtrf_cross  F32               48         48          64
 #   gbtrf_cross  F64               32         32          64  MODAL (64,64,48,64,64,64)
 #   gbtrf_cross  C64                8          8          16
