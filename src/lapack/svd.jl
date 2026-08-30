@@ -736,14 +736,16 @@ end
 # --- Stage 2: bidiagonal SVD via implicit-shift QR (Golub-Kahan / LAPACK dbdsqr core) -----------
 # Smaller singular value of the 2×2 [[f,g],[0,h]] — the Wilkinson shift. Approximate is fine: the
 # shift only affects convergence speed, never accuracy (the orthogonal sweeps preserve σ exactly).
-@inline function _svd_2x2_smin(f::Float64, g::Float64, h::Float64)
+# Generic over T<:Real (Float64 codegen unchanged — `zero(Float64) === 0.0`), so the bidiagonal QR stage
+# is reachable by a Dual/Float16/BigFloat SVD. Pure scalar; no pointer path to guard.
+@inline function _svd_2x2_smin(f::T, g::T, h::T) where {T <: Real}
     fa = abs(f); ga = abs(g); ha = abs(h)
     s = fa * fa + ga * ga + ha * ha
     p = fa * ha
-    disc = s * s - 4.0 * p * p
-    disc = disc < 0.0 ? 0.0 : disc
-    smax2 = 0.5 * (s + sqrt(disc))
-    smax2 == 0.0 && return 0.0
+    disc = s * s - 4 * p * p
+    disc = disc < zero(T) ? zero(T) : disc
+    smax2 = (s + sqrt(disc)) / 2
+    iszero(smax2) && return zero(T)
     return p / sqrt(smax2)
 end
 
@@ -798,11 +800,11 @@ end
 # accumulating the right rotations into V columns and the left rotations into U columns.
 # (LAPACK dbdsqr forward recurrence; shift folded as f=(d[l]²−shift²)/d[l], g=e[l].)
 function _bdsqr_sweep!(
-        d::AbstractVector{Float64}, e::AbstractVector{Float64}, l::Int, u::Int,
-        shift::Float64, U, V
-    )
+        d::AbstractVector{T}, e::AbstractVector{T}, l::Int, u::Int,
+        shift::T, U, V
+    ) where {T <: Real}
     @inbounds begin
-        f = shift == 0.0 ? d[l] : (d[l] - shift) * (sign(d[l]) + shift / d[l])
+        f = iszero(shift) ? d[l] : (d[l] - shift) * (sign(d[l]) + shift / d[l])
         g = e[l]
         for k in l:(u - 1)
             c, s, r = _givens(f, g)                  # right rotation (cols k,k+1)
@@ -829,25 +831,29 @@ end
 
 # Bidiagonal SVD: overwrite d with the singular values (descending, ≥0); accumulate left/right
 # rotations into U (cols) and V (cols) if provided, so that B₀ = U·diag(d)·Vᵀ. e is destroyed.
-function bdsqr!(d::AbstractVector{Float64}, e::AbstractVector{Float64}, U, V)
+# GENERIC over `T <: Real` (req#3). This stage is pure scalar Givens work — no pointer, no `vload`, no
+# `unsafe_load` anywhere in the body — so widening is annotations plus literals; `_givens` and
+# `_svd_2x2_smin` were already generic. For T === Float64 the emitted code is unchanged, since
+# `zero(Float64) === 0.0` and `eps(Float64)` is what the old `eps(Float64)` already was.
+function bdsqr!(d::AbstractVector{T}, e::AbstractVector{T}, U, V) where {T <: Real}
     n = length(d)
     n == 0 && return d
-    mx = 0.0                                          # scale the bidiagonal to O(1) so _givens is fast+safe
+    mx = zero(T)                                      # scale the bidiagonal to O(1) so _givens is fast+safe
     @inbounds for i in 1:n
         mx = max(mx, abs(d[i]))
     end
     @inbounds for i in 1:(n - 1)
         mx = max(mx, abs(e[i]))
     end
-    mx == 0.0 && return d
-    minv = 1.0 / mx
+    iszero(mx) && return d
+    minv = one(T) / mx
     @inbounds for i in 1:n
         d[i] *= minv
     end
     @inbounds for i in 1:(n - 1)
         e[i] *= minv
     end
-    tol = 8.0 * eps(Float64)
+    tol = 8 * eps(T)
     m = n
     iter = 0; maxit = 12 * n * n + 100
     while m > 1
@@ -855,19 +861,19 @@ function bdsqr!(d::AbstractVector{Float64}, e::AbstractVector{Float64}, U, V)
         iter > maxit && error("bdsqr!: failed to converge")
         @inbounds for i in 1:(m - 1)                      # deflate negligible superdiagonals
             if abs(e[i]) <= tol * (abs(d[i]) + abs(d[i + 1]))
-                e[i] = 0.0
+                e[i] = zero(T)
             end
         end
-        if e[m - 1] == 0.0
+        if iszero(e[m - 1])
             m -= 1
             continue
         end
         l = m - 1                                      # top of the bottom nonzero-e block
-        @inbounds while l >= 2 && e[l - 1] != 0.0
+        @inbounds while l >= 2 && !iszero(e[l - 1])
             l -= 1
         end
         shift = @inbounds _svd_2x2_smin(d[m - 1], e[m - 1], d[m])
-        @inbounds (d[l] == 0.0) && (shift = 0.0)       # avoid /0 in the shift fold
+        @inbounds iszero(d[l]) && (shift = zero(T))    # avoid /0 in the shift fold
         _bdsqr_sweep!(d, e, l, m, shift, U, V)
     end
     @inbounds for i in 1:n
@@ -875,7 +881,7 @@ function bdsqr!(d::AbstractVector{Float64}, e::AbstractVector{Float64}, U, V)
     end            # unscale the singular values
     # singular values nonnegative
     @inbounds for i in 1:n
-        if d[i] < 0.0
+        if d[i] < zero(T)
             d[i] = -d[i]
             !isnothing(V) && _rot_cols_negate!(V, i)
         end
@@ -1183,7 +1189,7 @@ end
 
 # Sort singular values descending, permuting U and V columns to match (selection sort: n is the
 # matrix dim, swaps are O(n) columns each — negligible vs the O(n³) sweeps). ponytail.
-function _svd_sort!(d::AbstractVector{Float64}, U, V)
+function _svd_sort!(d::AbstractVector{T}, U, V) where {T <: Real}
     n = length(d)
     @inbounds for i in 1:(n - 1)
         kmax = i
@@ -1485,6 +1491,68 @@ function gesvd!(
 end
 
 # In-place singular values: fill S (length min(m,n)). 0-alloc steady state.
+# ── GENERIC (T<:Real) SVD: singular VALUES ────────────────────────────────────────────────────────────
+# req#3, so a ForwardDiff.Dual / Float16 / BigFloat matrix can reach SVD at all. Like the generic QR this
+# is assembly from pieces that were already generic, not new numerics:
+#   * `_larfg!` (LAPACK τ), `_house_left!`, `_larf_right!` (hessenberg.jl, T<:Number) — the reflectors;
+#   * `bdsqr!`, `_bdsqr_sweep!`, `_svd_2x2_smin`, `_svd_sort!`, `_givens` — the bidiagonal QR stage,
+#     all pure scalar Givens work, widened to T<:Real above (Float64 codegen unchanged).
+# The Float64 path keeps its blocked `gebrd!` + dqds (`_dlasq1!`); this one is UNBLOCKED and skips dqds,
+# because blocking and dqds are performance, not correctness. Float64 remains the more specific method.
+#
+# Unblocked bidiagonalisation, LAPACK dgebd2, m >= n. `_larfg!` leaves x[1] at α and writes the essential
+# v into x[2:], and both appliers take v[1] ≡ 1 implicitly — so the whole view is passed and α ignored.
+function _gebrd_unblocked!(
+        A::AbstractMatrix{T}, d::AbstractVector{T}, e::AbstractVector{T},
+        tauq::AbstractVector{T}, taup::AbstractVector{T}
+    ) where {T <: Real}
+    m, n = size(A)
+    @inbounds for i in 1:n
+        βq, τq = _larfg!(view(A, i:m, i))                       # annihilate below the diagonal
+        d[i] = βq; tauq[i] = τq
+        i < n && _house_left!(view(A, i:m, (i + 1):n), view(A, i:m, i), τq)
+        if i < n
+            βp, τp = _larfg!(view(A, i, (i + 1):n))             # annihilate right of the superdiagonal
+            e[i] = βp; taup[i] = τp
+            i < m && _larf_right!(view(A, (i + 1):m, (i + 1):n), view(A, i, (i + 1):n), τp)
+        end
+    end
+    return A
+end
+
+function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{T}) where {T <: Real}
+    m, n = size(A)
+    min(m, n) == 0 && return S
+    if m < n                                                    # σ(A) = σ(Aᵀ) — reduce to the tall case
+        At = Matrix{T}(undef, n, m)
+        @inbounds for j in 1:n, i in 1:m
+            At[j, i] = A[i, j]
+        end
+        return gesvd_vals!(At, S)
+    end
+    d = zeros(T, n); e = zeros(T, max(n - 1, 0))
+    tauq = zeros(T, n); taup = zeros(T, n)
+    _gebrd_unblocked!(A, d, e, tauq, taup)
+    bdsqr!(d, e, nothing, nothing)
+    @inbounds for i in 1:min(length(S), n)
+        S[i] = d[i]
+    end
+    return S
+end
+
+function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T <: Real}
+    # Singular VECTORS for the generic path would need a generic orgbr (accumulate the bidiagonalisation
+    # reflectors into U and Vᵀ) plus vector-carrying bdsqr rotations. Not implemented — and an explicit
+    # error is the honest outcome, since silently returning values where vectors were asked for is the
+    # worse failure. Float64/complex keep the full driver.
+    want_vectors && throw(ArgumentError(
+        "gesvd!: singular vectors are implemented for Float64 and complex only; " *
+        "for $(T) pass want_vectors=false (singular values are supported)"))
+    S = Vector{T}(undef, min(size(A)...))
+    gesvd_vals!(A, S)
+    return (S,)
+end
+
 function gesvd_vals!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64})
     m, n = size(A)
     ws = _svdws()
