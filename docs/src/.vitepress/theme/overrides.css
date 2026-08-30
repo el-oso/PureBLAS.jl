@@ -1,0 +1,26 @@
+/* Loaded after DocumenterVitepress's style.css, so rules here win.
+
+   Anchored headings must clear the fixed navbar.
+
+   Vitepress pins `.VPNav` with `position:fixed` at `--vp-nav-height` (64px on desktop) and
+   reserves room for it on load with `.VPContent{padding-top:var(--vp-nav-height)}`, so a
+   freshly loaded page is fine. What this build ships no rule for is *scrolling to an anchor*:
+   there is no `scroll-padding-top` or `scroll-margin-top` anywhere in the bundle. So following
+   a heading permalink, a right-hand outline link, or a URL ending in `#section` scrolls that
+   heading to viewport y=0 -- underneath the bar, which then covers it.
+
+   `scroll-padding-top` on the scroll container is the general fix and covers every anchor
+   target; the `scroll-margin-top` on headings is a fallback for the same reason, so a heading
+   is still clear if something else becomes the scrolling element. */
+html {
+  scroll-padding-top: calc(var(--vp-nav-height, 64px) + 24px);
+}
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3,
+.vp-doc h4,
+.vp-doc h5,
+.vp-doc h6 {
+  scroll-margin-top: calc(var(--vp-nav-height, 64px) + 24px);
+}
