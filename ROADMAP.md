@@ -2,11 +2,22 @@
 
 Canonical status + next steps for this multi-session project. Update this file as milestones land.
 
-## STATUS (2026-07-18) — feature-complete, release-prep
+## STATUS (2026-08-30) — feature-complete, tagged v0.1.2, closing the single-thread performance gate
 
 **Functionally complete: BLAS Levels 1–3 (real + complex, s/d/c/z) + core LAPACK (potrf/getrf/geqrf/gesvd,
 real + complex).** Two integration modes (native AD-traceable API; `libpureblas.so` via `juliac --trim` for
 non-Julia hosts). See `README.md` / `CHANGELOG.md`.
+
+**Where the work is now, in one line each:**
+- **Coverage: DONE.** OpenBLAS fallthrough is **zero** and ratchet-enforced (`test/lbt_forward_tests.jl`);
+  the north-star worklist below is complete. What remains there is performance, not routing.
+- **Performance: the open front.** 352 of 2619 fleet cells sit below the gate (galen 115 / wintermute 114
+  / neuromancer 123). Read that number with care — **740 cells (28%) are within ±5% of parity**, and with
+  1–4% per-cell noise the count swings ±10–15 between refreshes. Judge a change by its targeted cells and
+  its controls, never by a count delta.
+- **Genericity: LU, QR and SVD-values now accept `T<:Real`** (2026-08-30), so forward-mode AD reaches all
+  three factorizations for the first time. That was M6's prerequisite; reverse mode is still unstarted.
+- **Deferred by standing decision:** M4 multithreading (do not start unless asked), registration.
 
 **The performance gate is now `PB ≥ max(OpenBLAS, AOCL-BLIS)`** (upgraded 2026-07-15 from ≥ OpenBLAS) — a
 sub-1.0 ratio vs *either* AMD-tuned baseline is a miss, never a "ceiling." Certified boost-locked on the AMD
@@ -20,7 +31,7 @@ Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated
   overhead fix) campaigns; **complex LAPACK** (zpotrf/zgetrf/zgeqrf/zgesvd) correct + committed.
 - **gate-gap campaign vs AOCL**: `trmm` Strassen-split (large-n) and `syrk`/`syr2k` AVX-512 pack-cut fix
   (small-n) shipped; `gemvT` NC-widen and the `gemmtrsm` macrokernel measured-and-**falsified** (documented).
-- **Tooling**: `req#8` lint (CI gate vs hardcoded tuning literals), Aqua, StrictMode 0.3.9
+- **Tooling**: `req#8` lint (CI gate vs hardcoded tuning literals), Aqua, StrictMode
   (`@assert_no_spill`/`@assert_memsafe` dogfood), `f32_aocl`/gate-miss bench harnesses.
 
 ### Open residuals (characterized; not release-blocking)
@@ -30,22 +41,31 @@ Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated
 - **`ger`/`gemvN`/`gemvT` per-µarch** small residuals (some memory-bandwidth-bound; NC-widen falsified for
   gemvT Zen5). `req#8` literal debt: mostly derived/classified; the remaining 72 are baselined in
   `test/req8_lint_baseline.txt` (documented invariants + algorithmic tiers) to whittle down.
-- **`hpmv`** per-column only (no packed panel). **Complex-dot ABI** symbols deferred (see "Key finding").
+- **`hpmv`** per-column only (no packed panel). (Complex-dot ABI: **resolved and forwarded**, see below.)
 
-## Release 0.1.0 — checklist (release-ready; tag/register on HOLD per user)
+## Release — tagged through **v0.1.2**, unregistered by choice
 
-**Done:** Aqua quality gate, CHANGELOG, accurate README/ROADMAP, clean Project.toml ([deps]/[compat]
-only — prefs pinned via the Preferences API in `juliac/build.jl`, not shipped), suite green
-(7943 pass / 1 gated-skip / 7944), `libpureblas.so` builds under `juliac --trim` and is verified through
-the C-ABI (`ctest.c`, incl. dgesvd). CI pinned to Julia 1.12 (trim is 1.12-specific).
+**Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
+registered** — that is a deliberate hold, not an oversight.
+
+**Done:** Aqua quality gate (incl. stale-deps, which caught a ~680 MiB `LLVM_full_jll` that had been a
+hard dependency for a dev-only tool), CHANGELOG, clean Project.toml ([deps]/[compat] only — prefs pinned
+via the Preferences API in `juliac/build.jl`, not shipped), `libpureblas.so` builds under
+`juliac --trim` and is verified through the C-ABI on every push (`ctest.c`, incl. dgesvd — the job
+dlopens the artifact the `trim-so` job already built, so a library that compiles but is unusable cannot
+ship green). CI pinned to Julia 1.12 (trim is 1.12-specific).
+
+**Suite:** 25433 pass / 0 fail / 1 error / 1 broken. The one error is a known `gelsy` trim-compatibility
+site (`Base._str_sizehint` + `Base.print` at `gelsy.jl:255`, string formatting the juliac verifier
+rejects); it is the documented baseline, not a regression.
 
 **Remaining (user-triggered):**
 - [ ] **Registry decision** — General vs the private "Pure" registry. All deps (incl. el-oso's own
-      StrictMode 0.3.9 / TypeContracts 0.14) resolve from **General**, so General registration is *not*
-      dep-blocked — it's a free policy call. General makes it public + pulls the two dev-tooling runtime
-      deps into every installer; the Pure registry keeps it self-contained alongside PureFFT.
-- [ ] **Tag `0.1.0`** + GitHub release (notes from CHANGELOG).
+      StrictMode / TypeContracts) resolve from **General**, so General registration is *not* dep-blocked
+      — it's a free policy call. General makes it public + pulls the dev-tooling runtime deps into every
+      installer; the Pure registry keeps it self-contained alongside PureFFT.
 - [ ] **Register** — Registrator/JuliaHub PR (General) or the Pure-registry flow.
+- [ ] **GitHub release notes** for the existing tags (from CHANGELOG).
 
 **CI gap — CLOSED 2026-08-29 (`8607a04`), and the original description of it was wrong.** This entry said
 "CI never sets `PUREBLAS_JULIAC_BUILD=1` → the `.so` build is not exercised in CI". Stale: the `trim-so`
@@ -364,25 +384,37 @@ THIS process's runtime → no second init. The `.so` remains the artifact for **
   change). Not auto-forwarded at load (the suite needs OpenBLAS as its correctness oracle).
 - The `.so` is still the artifact for **non-Julia consumers** (C/C++/Rust calling BLAS).
 
-**NORTH STAR — completely remove the OpenBLAS fallback** (user directive 2026-07-18): every symbol
-LinearAlgebra can call should route to PureBLAS. Prioritize *replacing* methods over leaving them on
-OpenBLAS. **Policy:** forward a symbol only when it is **self-consistent under a mixed backend** (correct
-even if its companions stay on OpenBLAS) — else you ship the NaN-Q class of bug (geqrf's faer-τ vs
-OpenBLAS orgqr, retracted 4b5454c). Coverage today: all BLAS 1–3; LAPACK getrf/potrf(real)/gesvd. Worklist:
+### ✅ NORTH STAR ACHIEVED (user directive 2026-07-18) — OpenBLAS fallthrough is **ZERO**
 
-- **Tier 1 (kernel exists → just C-ABI wrapper + forward):** complex LAPACK `zpotrf/zgetrf/zgeqrf/zgesvd`
-  (kernels done; `cabi_lapack.jl` wraps only real + `spotrf`); `gesdd` divide-conquer SVD (have
-  `svd_dc.jl`; Julia's `svd`/`svdvals` default to gesdd, not gesvd, so `svd()` doesn't route today);
-  solve/inverse companions `getrs/potrs/trtrs` (built on `trsm`) and `getri/potri` (`trtri`+`trsm`).
-- **Tier 2 (convention/moderate work):** QR routing — τ-consistent `geqrt`+`orgqr`+`ormqr` (emit LAPACK-τ
-  or implement PureBLAS orgqr/ormqr consuming faer-τ); Float32 `sgetrf/sgeqrf/sgesvd`.
-- **Tier 3 (new implementation):** eigensolvers `syev/heev/geev/gees` (none yet — see "unbuilt surface");
-  least squares `gels/gelsd`, pivoted QR `geqp3`, Bunch-Kaufman `sytrf`, banded/packed LAPACK.
-- **Coverage audit:** enumerate every LinearAlgebra-reachable symbol, diff vs `_LBT_REGISTRARS`, track the
-  shrinking OpenBLAS-fallthrough set as a gate toward zero.
+Every LAPACK symbol `LinearAlgebra` can `ccall` now forwards to PureBLAS after `activate()` — including
+the auxiliaries (`larf`/`larfg`/`lacpy`), the driver internals (`gebrd`/`bdsqr`/`bdsdc`/`hseqr`/`trevc`/
+`gebak`/`sytrd`/`hetrd`/`orgtr`/`ormtr`), the combined and expert drivers (`gesv`, `posv`, `gesvx` with
+equilibration + iterative refinement + condition/error bounds), the reordering routines
+(`trexc`/`trsen`/`tgsen`, real *and* complex), `trrfs`, `syconv`, complex `bdsqr`, and the
+rank-deficient generalized SVD (`ggsvd`, all s/d/c/z).
 
-Open risks: complex-dot return ABI (deferred to M2); AVX-512 on Zen4 is double-pumped (tune via
-Preferences knob).
+**It is a ratchet, not a claim:** `test/lbt_forward_tests.jl` enumerates every symbol the stdlib wraps
+and asserts the fallthrough count is **0**. The only two names excluded are `cstev_`/`zstev_`, which are
+not real LAPACK symbols (they appear only in commented-out stdlib lines and have no OpenBLAS export).
+The old Tier 1/2/3 worklist that stood here is **complete** and has been removed; see
+`docs/src/coverage.md` for the current routing tables.
+
+**The policy that got us here still binds any NEW symbol:** forward one only when it is
+**self-consistent under a mixed backend** (correct even if its companions stay on OpenBLAS) — else you
+ship the NaN-Q class of bug. The canonical example is live in this repo: `geqrf` stores **faer** τ
+(`H = I − v·vᵀ/τ`, `τ=Inf ⇒ identity`), not LAPACK's (`H = I − τ·v·vᵀ`, `τ=0`). Pairing our geqrf with a
+LAPACK-τ consumer was retracted in `4b5454c`, and the same trap was hit again on 2026-08-30 while making
+`geqrf!` generic — a τ convention is part of the contract and must not vary by element type.
+
+**What remains is PERFORMANCE, not coverage.** The second tier — all eigensolvers (symmetric, Hermitian,
+nonsymmetric, generalized, Schur), Sylvester/Schur reordering, `gesvx`, generalized SVD, and the
+remaining factorizations (indefinite, QL/RQ, RZ, pivoted Cholesky, banded/tridiagonal/packed,
+rank-deficient LS) — is routed and numerically LAPACK-accurate, but its `≥ max(OpenBLAS, AOCL)` gate is
+a scheduled follow-up campaign, not yet run.
+
+Open risk retired: the complex-dot return ABI (`c/zdotu`, `c/zdotc`) is **resolved and forwarded** —
+retstyle verified NORMAL (by value in xmm0:xmm1), registered at `cabi_forward.jl:59-60`.
+Still open: AVX-512 on Zen4 is double-pumped (tune via Preferences knob).
 
 ## M2 — flagship `dgemm` (✅ COMPLETE — history below; C-ABI char-arg symbols still open, see "Remaining / next")
 
@@ -983,8 +1015,21 @@ Studied OpenBLAS `develop` for beat-OpenBLAS wins. Prioritized:
 
 ## M6 — AD rules
 
-`PureBLASChainRulesExt` (weakdep) + Enzyme rules so Mode 2 supports reverse-mode through the
-in-place ops. (Native path is already ForwardDiff-traceable today.)
+`PureBLASChainRulesExt` (weakdep) + Enzyme rules so Mode 2 supports reverse-mode through the in-place
+ops. **Not started — there is no `ext/` directory yet.**
+
+**Forward mode is done and was the blocker.** Until 2026-08-30 only BLAS 1–3 and `potrf!` were generic;
+`getrf!`, `geqrf!` and `gesvd!` were signed to `Float64`, so a `ForwardDiff.Dual` hit a `MethodError`
+and **LU, QR and SVD were differentiable in neither direction**. All three now accept `T<:Real`
+(SVD for singular values; vectors are Float64/complex only and throw rather than silently returning
+values). CI-enforced by three testitems in `test/lapack_tests.jl` over
+Float64/Float32/Float16/BigFloat — Float32 alone proves nothing, since it is a `BlasReal` and rides the
+SIMD kernels.
+
+**Reverse mode does NOT need generic-`T` kernels** and should not be built on them: an `rrule` calls the
+fast Float64 primal and defines the adjoint separately, which beats pushing `Dual`s through a scalar
+fallback. Sensible first increment: `[weakdeps] ChainRulesCore` + rrules for gemm/trsm/trmm, gemv/ger,
+dot/nrm2 and potrf; LU/QR/SVD adjoints second, since that is where the subtlety lives.
 
 ## M7 — GPU backend (CUDA-first; gate vs cuBLAS, CUTLASS as structural reference)
 
@@ -1045,10 +1090,13 @@ sparse Cholesky.
 - **Eigensolvers** — `syev`/`heev` (symmetric/Hermitian), `geev` (general), `gees` (Schur). The largest
   missing LAPACK chunk; no milestone yet.
 - **C-ABI completions** — L3 `dgemm_64_`/`sgemm_64_` char args + hidden Fortran string-length args
-  (the L3 ABI M1 deferred), and the 4 complex-dot symbols (`c/zdotu`, `c/zdotc`; NORMAL vs ARGUMENT
-  retstyle). Native API already covers both meanwhile.
-- **Generic/AD paths** for QR (`geqrf`) and SVD (`gesvd`) — currently Float64-vector-specific; the
-  differentiable generic-`T` path is deferred.
+  (the L3 ABI M1 deferred). The 4 complex-dot symbols are **DONE**: retstyle verified NORMAL (returned
+  by value in xmm0:xmm1, not via an f2c hidden pointer), `@ccallable` in `cabi/cabi_cdot.jl` and
+  registered at `cabi_forward.jl:59-60`.
+- ~~**Generic/AD paths** for QR/SVD~~ — **DONE 2026-08-30** for `T<:Real`: `getrf!`, `geqrf!` and
+  `gesvd!` (values) accept any real element type, CI-enforced over Float64/Float32/Float16/BigFloat.
+  Singular VECTORS remain Float64/complex only and throw on the generic path; they need a generic
+  `orgbr` plus vector-carrying `bdsqr` rotations. Complex generic-`T` is untouched.
 - **`hpmv` packed panel** and **`hpr`/`hpr2` complex SIMD** — currently per-column / generic.
 
 ### Wishlist
