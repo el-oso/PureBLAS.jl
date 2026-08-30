@@ -1,19 +1,41 @@
 /* Loaded after DocumenterVitepress's style.css, so rules here win.
 
-   Anchored headings must clear the fixed navbar.
+   Anchored headings must clear the sticky bars at the top of the viewport.
 
-   Vitepress pins `.VPNav` with `position:fixed` at `--vp-nav-height` (64px on desktop) and
-   reserves room for it on load with `.VPContent{padding-top:var(--vp-nav-height)}`, so a
-   freshly loaded page is fine. What this build ships no rule for is *scrolling to an anchor*:
-   there is no `scroll-padding-top` or `scroll-margin-top` anywhere in the bundle. So following
-   a heading permalink, a right-hand outline link, or a URL ending in `#section` scrolls that
-   heading to viewport y=0 -- underneath the bar, which then covers it.
+   Vitepress pins `.VPNav` with `position:fixed` at `--vp-nav-height` (64px) and reserves room
+   for it on load with `.VPContent{padding-top:var(--vp-nav-height)}`, so a freshly loaded page
+   is fine. What the shipped bundle has no rule for is *scrolling to an anchor*: it contains no
+   `scroll-padding-top` and no `scroll-margin-top` at all. So following a heading permalink, a
+   right-hand outline link, or a URL ending in `#section` scrolls the target to viewport y=0 --
+   underneath the bars, which then cover it.
+
+   There are TWO bars, not one, and that is the part worth writing down. Below 1280px Vitepress
+   also shows `.VPLocalNav` (the strip carrying the page title and the "On this page" dropdown),
+   stacked directly under the navbar via `position:sticky; top:var(--vp-nav-height)`, and hides
+   it only at `@media (min-width:1280px)`. So a window narrower than 1280px needs an offset that
+   clears both, and one sized for the navbar alone still leaves the heading covered -- which is
+   exactly what a wide window will not reproduce.
+
+   Vitepress defines no `--vp-local-nav-height` to read, so that bar's height is written out
+   here: its inner `.menu` is `padding:12px 24px 11px` over `line-height:24px`, plus the 1px
+   `border-bottom` => 48px. If the theme restyles that bar, this number is what goes stale.
 
    `scroll-padding-top` on the scroll container is the general fix and covers every anchor
-   target; the `scroll-margin-top` on headings is a fallback for the same reason, so a heading
-   is still clear if something else becomes the scrolling element. */
+   target; `scroll-margin-top` on the headings is a fallback for the same offset, so a heading
+   stays clear if something other than the document becomes the scrolling element. */
+
+:root {
+  --pb-anchor-offset: calc(var(--vp-nav-height, 64px) + 24px);
+}
+
+@media (max-width: 1279px) {
+  :root {
+    --pb-anchor-offset: calc(var(--vp-nav-height, 64px) + 48px + 24px);
+  }
+}
+
 html {
-  scroll-padding-top: calc(var(--vp-nav-height, 64px) + 24px);
+  scroll-padding-top: var(--pb-anchor-offset);
 }
 
 .vp-doc h1,
@@ -22,5 +44,5 @@ html {
 .vp-doc h4,
 .vp-doc h5,
 .vp-doc h6 {
-  scroll-margin-top: calc(var(--vp-nav-height, 64px) + 24px);
+  scroll-margin-top: var(--pb-anchor-offset);
 }
