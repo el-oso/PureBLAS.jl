@@ -114,13 +114,15 @@ function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
             a = abs(A[il, jl]); a > pmax && (pmax = a; piv = il)
         end
         ipiv[ioff + jl] = roff + piv
-        if A[piv, jl] != 0.0
+        if !iszero(A[piv, jl])
             if piv != jl                                  # swap rows jl ↔ piv across the panel
                 for jc in 1:pb
                     A[jl, jc], A[piv, jc] = A[piv, jc], A[jl, jc]
                 end
             end
-            d = 1.0 / A[jl, jl]
+            # `one(eltype(A))`, not `1.0` — this tail is the path a Dual/BigFloat matrix takes, and a
+            # Float64 literal here would silently narrow the reciprocal before the multiply below.
+            d = one(eltype(A)) / A[jl, jl]
             for il in (jl + 1):mp
                 A[il, jl] *= d
             end     # scale column below the diagonal
@@ -358,11 +360,22 @@ const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
 # which over-decomposes into many small gemm! calls). Factor each nb-panel (getf2), swap the rest of the
 # rows (laswp), solve the row panel (trsm, L11⁻¹·A12), downdate the trailing (gemm, A22 −= L21·U12).
 # The cheap unblocked panel + ONE big rank-nb trailing gemm per step is the win. Returns (A, ipiv, info).
-function getrf!(A::AbstractMatrix{Float64}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...)))
+# GENERIC OVER `T <: Real`, not `Float64` — req#3: one implementation covers the whole family, and the
+# generic scalar path is what makes Mode 2 differentiable. A `ForwardDiff.Dual` matrix reaches the same
+# blocked algorithm; only the two hardware fast paths are gated away from it:
+#   * the pad scratch below is a Float64 GKH buffer (`_LU_PAD`) driven by raw `unsafe_copyto!`, so it is
+#     gated on `A isa StridedMatrix{Float64}` — which is also STRICTER than before, since the old
+#     signature let a non-strided Float64 matrix reach `_lu_needs_pad`'s `stride(A, 2)` and throw;
+#   * `_getf2!` already routes Float64-strided to `_getf2_simd!`, complex to `_cgetf2_simd!`, and
+#     everything else to its scalar tail — no change needed there.
+# `_getrf_core!`, `_getf2!` and `_laswp!` were all already untyped, so the blocked driver, the panel
+# factorisation and the row swaps are shared verbatim. Float64 keeps every fast path it had: with
+# `T === Float64` the guard below is a compile-time constant and folds away.
+function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...))) where {T <: Real}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
-    if _lu_needs_pad(A, m)                                # factor in a non-conflicting (ld=m+8) scratch
+    if A isa StridedMatrix{Float64} && _lu_needs_pad(A, m)   # factor in a non-conflicting (ld=m+8) scratch
         R = m + 8
         b = _LU_PAD[]
         (size(b, 1) < R || size(b, 2) < n) && (b = _LU_PAD[] = Matrix{Float64}(undef, R, n))
@@ -462,7 +475,9 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     return _getrf_core!(A, ipiv, nb)
 end
 # Convenience: allocate ipiv, return (A overwritten with L\U, ipiv, info).
-function getrf!(A::StridedMatrix{Float64})
+# `AbstractMatrix{<:Real}` to match the two-argument method — a Dual/BigFloat caller should not have to
+# hand-allocate ipiv just because its element type is not Float64.
+function getrf!(A::AbstractMatrix{<:Real})
     ipiv = Vector{Int}(undef, min(size(A)...))
     return getrf!(A, ipiv)
 end
