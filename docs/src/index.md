@@ -16,8 +16,8 @@ Measurements run single-threaded on frequency-locked machines (`amd_pstate=passi
 pinned to base clock) across Zen3/AVX2, Zen4/AVX-512 and Zen5/AVX-512. Both references are measured in
 the same round as PureBLAS, so the `max` compares numbers that saw one machine state rather than three.
 
-The [Coverage](coverage.md) page has the per-routine results, generated from the benchmark caches rather
-than typed in by hand — including every routine that currently misses.
+The [Coverage](coverage.md) page has the per-routine results, including every routine that currently
+misses.
 
 ## Two ways to use it
 
