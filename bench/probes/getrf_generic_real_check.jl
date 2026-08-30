@@ -14,9 +14,10 @@ function recon(A0, A, ipiv)
 end
 # Float16 is the important one: it is a bits Real that is NOT a BlasReal, so it takes the SAME generic
 # scalar path a ForwardDiff.Dual takes. Float32 does not prove genericity — it is a BlasReal and rides
-# the SIMD kernels. BigFloat is deliberately excluded: it hits a PRE-EXISTING codegen crash in trsm!
-# (segfault in emit_pointerref on both 1.12.7 and 1.13.0-rc3), unrelated to this signature change.
-for T in (Float64, Float32, Float16)
+# the SIMD kernels. BigFloat is the NON-BITS case: it must reach the generic path and never a
+# `pointer()` fast path — it used to segfault Julia's codegen until `_strided1` gained its
+# `isbitstype(eltype(A))` clause.
+for T in (Float64, Float32, Float16, BigFloat)
     for n in (8, 33, 64)
         A0 = T.(randn(n, n) + n*I)
         A = copy(A0); ipiv = Vector{Int}(undef, n)

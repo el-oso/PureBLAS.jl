@@ -85,7 +85,24 @@ end
 # Fast-path predicate: unit-stride-1 dense matrix. For a StridedMatrix argument this const-folds to the
 # identical `isa StridedMatrix && stride(A,1)==1` check the kernels used before (zero Mode-2 overhead);
 # PtrMatrix is not in the closed StridedMatrix Union, so it gets an explicit `true` method.
-@inline _strided1(A) = A isa StridedMatrix && stride(A, 1) == 1
+#
+# ⚠ `isbitstype(eltype(A))` IS LOAD-BEARING, not belt-and-braces. Every one of this predicate's ~79 call
+# sites uses it to gate a `pointer(A)` + `unsafe_load`/`unsafe_store!` fast path, so what the callers
+# actually need is "the elements are stored INLINE", which "unit stride" does not imply. A
+# `Matrix{BigFloat}` satisfies both original clauses — it is a dense Array with `stride(A,1)==1` — while
+# its buffer holds REFERENCES to heap-allocated mantissas. Taking `pointer` of it yields a Ptr into that
+# reference array, and emitting a `pointerref` on a non-bits type SEGFAULTS JULIA'S CODE GENERATOR
+# (`emit_pointerref`, intrinsics.cpp:804) — on 1.12.7 and 1.13.0-rc3 alike, with no Julia frames because
+# it dies during compilation, not execution.
+#
+# It crashed even when the guarded call was never REACHED: `_trsm!` does `isone(α) || _scal_all!(B, α)`,
+# and with α==1 that call never runs, but it is still compiled. So a runtime-dead branch was enough.
+# Found via getrf!'s widening to `T<:Real` (BigFloat now reaches trsm); the hazard predates it.
+#
+# Zero cost: `eltype(A)` is statically known at every call site, so `isbitstype` const-folds. Nothing
+# that works today changes — Float64/Float32/complex and ForwardDiff.Dual are all bits types.
+@inline _strided1(A) = A isa StridedMatrix && isbitstype(eltype(A)) && stride(A, 1) == 1
+# PtrMatrix wraps a raw pointer, so its elements are inline by construction.
 @inline _strided1(::PtrMatrix) = true
 
 # VECTOR analogue of `_strided1`, and it exists for the same reason — with a measured incident behind it.
