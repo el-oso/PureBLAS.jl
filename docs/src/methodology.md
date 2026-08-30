@@ -5,22 +5,22 @@ where it comes from, and the caveats that change how a cell should be read.
 
 ## The gate
 
-**PB ≥ max(OpenBLAS, AOCL), per (op, size, machine), single-threaded.** A ratio > 1.0 means PureBLAS is
-faster. Both references are always measured, because a routine can beat one by a wide margin and lose to
-the other; the gate takes the faster of the two at each individual cell.
+PureBLAS must be at least as fast as `max(OpenBLAS, AOCL)` for every combination of operation, size and
+machine, single-threaded. A ratio above 1.0 means PureBLAS is faster. Both references are always
+measured, because a routine can beat one comfortably and lose to the other, and the gate takes the
+faster of the two at each individual cell.
 
-The comparison is made on the ratio **rounded to two significant digits**: `0.995` rounds to `1.0` and
-gates; `0.9949` rounds to `0.99` and does not. The threshold itself is unchanged at `1.00` — what is
-specified is the precision. Per-cell machine-state drift on this fleet runs ~1–6% (every cached arm
-records the anchor it was measured under), so the third digit of a ratio is not adjudicable, and the
-rounded value is the one these tables print. A verdict that disagreed with the number on the page would
-be reporting a miss at a precision the measurement cannot support. The criterion lives in exactly one
-place, `bench/gatecrit.jl`, and every tool that prints a verdict, colours a cell or counts a miss calls
-into it.
+The comparison uses the ratio rounded to two significant digits, so `0.995` rounds to `1.0` and gates
+while `0.9949` rounds to `0.99` and does not. The threshold is still 1.00; what is specified is the
+precision. Per-cell machine-state drift on this fleet runs 1–6%, which every cached arm records as the
+anchor it was measured under, so the third digit of a ratio is not adjudicable and the rounded value is
+what these tables print. A verdict that disagreed with the number on the page would be claiming a miss
+at a precision the measurement cannot support. The criterion lives in one file, `bench/gatecrit.jl`, and
+every tool that prints a verdict, colours a cell or counts a miss calls into it.
 
-Verdicts are **per microarchitecture** — a single pooled verdict cannot express "gates on Zen4, misses on
-Zen3", and pooling once misreported banded Cholesky as 0.891 failing when Zen4 alone read 1.03. Every
-table therefore carries one column per box, each from that box's own `bench/plots.jl` sweep.
+Verdicts are per microarchitecture. A single pooled verdict cannot say "gates on Zen4, misses on Zen3",
+and pooling once reported banded Cholesky as failing at 0.891 when Zen4 on its own read 1.03. Every
+table carries one column per box, each from that box's own `bench/plots.jl` sweep.
 
 The dev fleet, gated independently (tuning for one µarch does not transfer):
 
@@ -59,6 +59,23 @@ compute each verdict from the stored quantile vectors.
 Both reference views (OpenBLAS and AOCL) are rendered from that one cache set in a single invocation, so
 their provenance is identical by construction and they cannot disagree about the same fleet. The µarch
 labels are stamped authoritatively into each cache header (`uarch=`).
+
+## The count is noisier than it looks
+
+Worth knowing before reading any total: **close to 30% of the 2619 fleet cells sit within ±5% of
+parity** — about 760 of them at the time of writing. Per-cell run-to-run noise is 1–4%, so a large slice
+of that population crosses the gate line in one direction or the other on any given sweep, with nothing
+having changed in the code.
+
+The practical effect is that the fleet's below-gate count moves by roughly ±10–15 between refreshes on
+its own. It happened on 2026-08-30: a refresh following two changes that had each been measured with
+controls and confirmed came back with the count *up*, 333 to 347. The changes were fine — the newly-red
+cells were BLAS-1 and BLAS-2 routines that neither change can reach, and a similar number of unrelated
+cells had gone green in the same sweep.
+
+So judge a change by the cells it targets and by control cells the change provably cannot affect, not by
+a movement in the total. The count is still the right long-run measure, since genuinely fixing a
+marginal cell does remove it from that population — it is just not a per-sweep progress bar.
 
 ## How to read a cell
 
@@ -106,13 +123,17 @@ vs 30 GFlops). It is a *mixed* competitor rather than uniformly tougher — its 
 while its `getrf` trails it — and it is tuned first for multi-threaded EPYC, so on these single-thread
 Zen parts it is a fair-but-not-dominant baseline.
 
-## Contamination class fixed on 2026-08-09
+## A way these numbers went wrong once
 
-`bench/plots.jl` merges its cache per arm, so an A/B run with a `PUREBLAS_FORCE_<knob>` variable
-exported persisted its **deliberately non-default** PureBLAS arm next to reference arms measured in a
-different run, and every render afterwards republished it as the gate number. The Zen5 `gemvT` n=256
-cell was published at 0.751 on that basis; measured with all three arms in one run it is 1.09, and
-`PUREBLAS_FORCE_gemvt_deep=0` reproduces the bad record exactly. `gemvT` n=128 and `trmv` n=256 came
-from the same contamination. `save_cache` now refuses to write while any `PUREBLAS_FORCE_*` is set, so
-the class cannot recur silently. The corrections did not all favour PureBLAS — `ztrsv` on Zen4 went from
-0.991 to 0.865 and `ger` on Zen5 from 0.996 to 0.896.
+Worth recording, because the failure was silent and the fix is now part of the harness.
+
+`bench/plots.jl` merges its cache one arm at a time. That meant an A/B run with a
+`PUREBLAS_FORCE_<knob>` variable still exported would save its deliberately non-default PureBLAS arm
+alongside reference arms measured in some other run, and every render afterwards republished that as the
+gate number. The Zen5 `gemvT` n=256 cell was published at 0.751 on that basis; measured properly with
+all three arms in one run it is 1.09, and setting `PUREBLAS_FORCE_gemvt_deep=0` reproduces the bad
+record exactly. `gemvT` n=128 and `trmv` n=256 came from the same source.
+
+`save_cache` now refuses to write while any `PUREBLAS_FORCE_*` is set, so a forced run cannot
+contaminate the cache. The corrections did not all flatter PureBLAS: `ztrsv` on Zen4 went from 0.991 to
+0.865, and `ger` on Zen5 from 0.996 to 0.896.
