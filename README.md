@@ -11,14 +11,16 @@ Requires Julia 1.12. MIT licensed.
 
 ## Why bother
 
-**It tunes itself to the machine it runs on.** OpenBLAS and AOCL ship kernels hand-written per
-microarchitecture, baked in when *they* were compiled — on a CPU they never benchmarked, they guess.
-PureBLAS reads the cache sizes, vector width and register count at load time and computes its block
-sizes from them. That is also why it is about 36k lines of code where OpenBLAS is a few hundred thousand
-lines of x86 kernels alone: one generic kernel replaces a table of hand-written ones.
+OpenBLAS and AOCL ship kernels that were hand-written for each microarchitecture and baked in when
+those libraries were compiled. Run them on a CPU nobody benchmarked and they are guessing. PureBLAS
+reads the cache sizes, vector width and register count when it loads, and works its block sizes out
+from those. It adapts to the machine instead of recognising it.
 
-**The kernels are ordinary Julia, so you can read and change them.** No assembly, no build system, no
-Fortran. A block size is a formula you can follow, not a constant in a table.
+That is also why it is roughly 36k lines of code, against a few hundred thousand lines of x86 kernels
+in OpenBLAS alone — one generic kernel does the job of a table of hand-written ones.
+
+And it is all ordinary Julia, so you can read it, step through it in the debugger, and change it. A
+block size is a formula you can follow rather than a number someone measured once.
 
 ## Two ways to use it
 
@@ -60,78 +62,72 @@ if you need to differentiate, call `PureBLAS.*` directly and read the section be
 
 ## What works
 
-**Every LAPACK symbol Julia can call now routes to PureBLAS.** That includes the eigensolvers,
-Schur reordering, generalized SVD, the expert drivers like `gesvx`, and the banded and packed routines —
-not just the headline factorizations. A test enumerates every symbol the standard library wraps and
-fails if any still falls through to OpenBLAS.
+Every LAPACK symbol Julia can call goes to PureBLAS — not just the headline factorizations, but the
+eigensolvers, Schur reordering, generalized SVD, expert drivers like `gesvx`, and the banded and packed
+routines too. A test walks every symbol the standard library wraps and fails if any of them still lands
+on OpenBLAS.
 
-**Performance.** The bar is `max(OpenBLAS, AOCL-BLIS)` — beating only one of them does not count. About
-87% of benchmarked cells meet it, single-threaded, on frequency-locked Zen3, Zen4 and Zen5 machines.
-The rest are tracked openly in [Performance Notes](docs/src/notes.md); most sit within a few percent.
+For speed the bar is `max(OpenBLAS, AOCL-BLIS)`, so beating one of them and losing to the other counts
+as a loss. About 87% of benchmarked cells clear it, single-threaded, on frequency-locked Zen3, Zen4 and
+Zen5 machines. The ones that do not are listed in [Performance Notes](docs/src/notes.md), and most of
+them are within a few percent.
 
-**Element types.** BLAS levels 1–3 are generic over `T<:Number` — `Float32`, `Float64`, and complex.
-Among the factorizations, Cholesky, LU, QR and SVD singular values accept any real element type;
-singular *vectors* are Float64 and complex only.
+BLAS levels 1–3 work for any `T<:Number`, so `Float32`, `Float64` and complex are all covered. Of the
+factorizations, Cholesky, LU, QR and SVD singular values take any real element type; singular *vectors*
+are Float64 and complex only.
 
-## Automatic differentiation: partial
+## Automatic differentiation
 
-Be aware of what this does and does not do today.
+Forward mode works. The kernels are generic, so a `ForwardDiff.Dual` passes straight through them, and
+the test suite differentiates `gemm`, `gemv`, `ger`, `trmm`, `trsm`, `trmv`, `trsv`, `symv`, `nrm2`,
+`asum`, `dot` and `potrf` against known derivatives.
 
-Because the kernels are generic, a `ForwardDiff.Dual` flows through them and **forward-mode
-differentiation works**. It is tested — eight test items check real derivatives through `gemm`, `gemv`,
-`ger`, `trmm`, `trsm`, `trmv`, `trsv`, `symv`, `nrm2`, `asum`, `dot` and `potrf`.
+It is slow, though. The SIMD kernels only fire for `Float32` and `Float64`, and a `Dual` is neither, so
+it falls back to plain scalar loops. You get the right answer at nothing like BLAS speed. Reverse mode
+does not work at all yet — there are no ChainRules or Enzyme rules.
 
-Two honest caveats:
+Where we want to end up is differentiation that runs at full BLAS speed, and the way to get there is
+reverse-mode rules rather than pushing `Dual` numbers through the kernels. An `rrule` can call the
+ordinary `Float64` kernel at full speed and write the adjoint as a couple more BLAS calls, which are
+also full speed — no element-by-element differentiation anywhere. That is the payoff for the kernels
+being Julia the compiler can see into instead of an opaque `ccall`, and it is why the project cares
+about AD in the first place.
 
-- **Reverse mode is not supported.** There are no ChainRules or Enzyme rules yet. That is planned work,
-  not finished work.
-- **Differentiating is correct but slow.** The SIMD kernels are selected on `T<:BlasReal`, and a `Dual`
-  is not one, so it falls to the generic scalar path. You get the right derivative at scalar speed, not
-  at BLAS speed.
-
-So today: useful if you need to differentiate through a linear-algebra call and correctness matters more
-than throughput. Not yet a replacement for a hand-written adjoint.
-
-**Where this is going.** The aim is differentiation at full BLAS speed, and the route is reverse-mode
-rules rather than pushing `Dual` numbers through the kernels. An `rrule` calls the ordinary `Float64`
-primal — the SIMD kernel, at full speed — and expresses the adjoint as more BLAS calls, which run at
-full speed too. Nothing has to be differentiated element by element.
-
-That is achievable because these kernels are Julia the compiler can see through, rather than an opaque
-`ccall`. It is the reason the project cares about AD at all. **None of it is written yet** — it is
-milestone M6 in [`ROADMAP.md`](ROADMAP.md), and the recent work making LU, QR and SVD generic was
-groundwork for it, not the thing itself.
+None of that is written yet. It is milestone M6 in [`ROADMAP.md`](ROADMAP.md). Making LU, QR and SVD
+work for any real element type was the groundwork.
 
 ## A shared library other languages can link
 
-This is a goal of the project, not a side effect: **a BLAS written in Julia that any language can use.**
-If it works, "written in Julia" stops being a constraint on who can benefit. A C program, a Rust crate
-or a Python extension links `libpureblas.so` the same way it would link OpenBLAS, and never needs to
-know what it was written in.
+Something we are deliberately aiming at, rather than a side effect: a BLAS written in Julia that any
+language can use. A C program, a Rust crate or a Python extension links `libpureblas.so` exactly as it
+would link OpenBLAS, and never has to care what it was written in.
 
 ```bash
 julia juliac/build.jl        # builds libpureblas.so
 ```
 
-The library exports the standard ILP64 BLAS symbols and initializes its own embedded runtime, so a
-non-Julia program can link it as its BLAS backend. CI builds it on every push and then calls into it
-from C — a library that compiles but does not work cannot ship green. See
+It exports the usual ILP64 BLAS symbols and starts its own embedded runtime, so a non-Julia program can
+use it as its BLAS backend. CI builds it on every push and then calls into it from C, because a library
+that compiles but does not actually work would otherwise sail through. See
 [`juliac/ctest.c`](juliac/ctest.c).
 
-Status: it builds and it works, but `juliac --trim` is experimental and Julia 1.12 specific, so treat
-this as promising rather than production-ready. The same `@ccallable` symbols serve both this and the
-in-process reroute above, so the C entry points are exercised constantly rather than bit-rotting.
+It builds and it works today, but `juliac --trim` is experimental and tied to Julia 1.12, so this is
+promising rather than something to put in production. The same `@ccallable` symbols serve both the
+shared library and the in-process reroute above, which keeps the C entry points exercised instead of
+quietly rotting.
 
 > Do not load this `.so` into a running Julia process. It embeds its own libjulia, which double-initializes
 > and aborts. Inside Julia, use `PureBLAS.activate()` instead — it needs no shared library at all.
 
 ## Limitations
 
-- **Single-threaded.** Multithreading is deliberately deferred.
-- **Singular vectors are Float64 and complex only.** The generic path computes singular values and
-  raises an error if you ask it for vectors, rather than quietly returning less than you asked for.
-- **A few large-`n` triangular and rank-k cells trail AOCL** by a couple of percent. This is the gap
-  between what LLVM emits and hand-written assembly, and closing it fully would mean writing assembly.
+Everything is single-threaded for now; multithreading is deliberately on hold.
+
+Singular vectors only work for Float64 and complex. Ask the generic path for vectors and it raises an
+error rather than quietly handing back less than you asked for.
+
+A handful of large-`n` triangular and rank-k cells trail AOCL by a couple of percent. That is the gap
+between what LLVM emits and hand-written assembly, and closing it properly would mean writing assembly.
 
 ## Developing
 
@@ -141,11 +137,11 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["Aqua"])'   # one item
 ```
 
-The suite checks results against OpenBLAS across every type, size and stride; forward-mode derivatives
-through the native kernels; package
-quality with Aqua; and a set of guarantees enforced with StrictMode — type stability, no allocation, no
-register spills, and compatibility with `juliac --trim`. There is also a lint that fails the build if a
-hardware-tuning constant is hardcoded instead of derived from detected CPU features.
+The suite checks results against OpenBLAS across every type, size and stride, differentiates the native
+kernels with ForwardDiff, and runs Aqua for package quality. StrictMode enforces a set of guarantees on
+the hot paths — type stability, no allocation, no register spills, and that everything still compiles
+under `juliac --trim`. A lint fails the build if someone hardcodes a hardware-tuning constant instead of
+deriving it from detected CPU features.
 
 [`ROADMAP.md`](ROADMAP.md) has the current status and what is planned. [`CLAUDE.md`](CLAUDE.md) has the
 rules the project holds itself to.
