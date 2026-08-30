@@ -130,8 +130,8 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
     @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
     # Derived from vector width — see `_at_pbtrf_nb` (cpuinfo.jl) for the three-box table.
     @inline _pbtrf_nb_tuned(::Type{Float32}) = (f = _FKR_pbtrf_nb[]; f >= 0 ? f : _at_pbtrf_nb(_HW, Float32))
-    # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (Zen4 Zen4 and
-    # Zen3 Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
+    # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (Zen4 and
+    # Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
     # also reproduces the F32/C32/C64 siblings, which differ per box. Reproduces the incumbent exactly.
     @inline _pbtrf_nb_tuned(::Type{Float64}) = 40
     @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = (f = _FKR_pbtrf_nb[]; f >= 0 ? f : _at_pbtrf_nb(_HW, ComplexF32))

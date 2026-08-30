@@ -564,7 +564,7 @@ lower clock shifting the memory-versus-compute balance.
 ## vs AOCL — the residuals
 
 **PureBLAS matches-or-beats AMD's own library on gemm and every LAPACK factorization — real and complex —
-by 5–80%.** Verified PB/AOCL at mid/large n (>1 = PureBLAS faster; Zen4 Zen4, single-thread),
+by 5–80%.** Verified PB/AOCL at mid/large n (>1 = PureBLAS faster; Zen4, single-thread),
 alongside PB/OpenBLAS for context:
 
 | op | PB / OpenBLAS | PB / AOCL |

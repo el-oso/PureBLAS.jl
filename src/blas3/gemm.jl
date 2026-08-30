@@ -1480,7 +1480,7 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 # Zen4 double-pumps so its datapath reads 32 -> 1024, same as AVX2. Checked on Zen4: trmm n=2100
 # takes D=1 on an even dimension, so nothing pads and this knob is a NO-OP there and on Zen3.
 #
-# GATE-MEASURED on Zen5 (Zen5), freq-locked, ABBA, pb-vs-pb (reference arm cancels):
+# GATE-MEASURED on Zen5, freq-locked, ABBA, pb-vs-pb (reference arm cancels):
 #     op    n=2100 t(nopad)/t(pad)   gate now -> projected
 #     trmm      0.782                 0.841 -> 1.076   RED -> PASS
 #     trsm      0.787                 0.871 -> 1.107   RED -> PASS

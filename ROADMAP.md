@@ -233,7 +233,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
         directly at k=8 = 0.999; the `trmm!`→`_trmm!`→`_trmm_left!` chain adds ~16% on a ~50ns 8×8 op.
         Tiny corner; not chased (would need a tiny-k fast-path in the public entry).
     - **potrf AVX2 decomposition (2026-07-04, session 2) — already well-tuned; no fruit found; TARGET IS
-      HASWELL not Zen3.** Full sub-kernel decomposition on Zen3 (Zen3): the trailing update `syrk!`
+      HASWELL not Zen3.** Full sub-kernel decomposition on Zen3: the trailing update `syrk!`
       **beats** OpenBLAS (128=1.03, 256=1.04), panel `trsm!` fine (0.95), faer base-64 excellent (1.30).
       The gap is the **faer path at n=128 = 0.87** (potrf n=128 IS that path), which degrades from base-64's
       1.30 because `_chol_rl(128)` splits into bs=64 blocks adding the fused trsm/syrk. **DISPROVEN levers
@@ -477,8 +477,8 @@ Remaining / next:
 - [x] **Complex GEMM SIMD path DONE (2026-07-02, commits 283af9b, 845486f, 813455f).** Was scalar
       (~0.2×); now split-pack blocked (4-real-FMA MAC, conj via Val signs, interleave-add store,
       vectorized packs, B0 overwrite for beta=0) + an unpacked tiny-n path. Tile W=8 2×4 / W=4 1×6
-      (12 accs = exact 16-ymm AVX2 fit). **Zen4 (Zen4/W=8) BEATS OpenBLAS at EVERY gate size**
-      (zC 1.12–1.49×, cC 1.01–1.48×). Zen3 (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
+      (12 accs = exact 16-ymm AVX2 fit). **Zen4 (W=8) BEATS OpenBLAS at EVERY gate size**
+      (zC 1.12–1.49×, cC 1.01–1.48×). Zen3 (AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
       F64 gates (1.18), F32 mid-small mostly gates; F64 mid-small n=16–64 = 0.81–0.92 residual (AVX2
       alpha=1 store fast-path d041349). zgemm in the L3 gate. Full suite 7243/7243 both machines.
       **CORRECTION (freq-locked re-measure): the earlier "n=32 F64 0.90 hardware floor" was a BOOST
@@ -863,11 +863,11 @@ locked freq (boost off). **Finding: the residual profiles are DISJOINT across µ
 transfer, which is exactly why the gate is per-machine.** Full `plots.jl bench` on each; caches
 `bench/plots_data_<host>.txt`, per-ISA SVGs.
 
-- **Zen4 (Zen4 mobile, AVX-512 double-pumped 256-bit):** all-green bar small-n 7640U-noise dips.
-- **Zen3 (Zen3, AVX2):** all-green except documented ceilings — potrf po2-conflict (0.88–0.95; the copy is
+- **Zen4 (mobile, AVX-512 double-pumped 256-bit):** all-green bar small-n 7640U-noise dips.
+- **Zen3 (AVX2):** all-green except documented ceilings — potrf po2-conflict (0.88–0.95; the copy is
   the gap, `d61b332` lower-triangle pad-copy cleared n=2048 & lifted the rest), trmm n=8 (materialize
   tiny-kernel wall), zgemm 0.95–0.958 (16-reg tile), gemvN-512 0.94 (L3 bandwidth), iamax addr-noise.
-- **Zen5 (Zen5, native AVX-512):** clears EVERY AVX2 ceiling (potrf 1.40, zgemm 1.14, trmm 1.09,
+- **Zen5 (native AVX-512):** clears EVERY AVX2 ceiling (potrf 1.40, zgemm 1.14, trmm 1.09,
   trsm 1.65) but surfaces NEW L2 gaps: **ger n=2048/4096 = 0.71/0.82** (write-bandwidth-bound — likely OB
   non-temporal stores vs our cached writes; reproduced tight on a quiet box, REAL), gemvN-256 0.87, gemm-32
   0.91, symm-256 0.94. Correctness bit-exact (gemm 0, potrf 2.8e-14, zgemm 7.6e-16). Detection auto-adapts
@@ -886,17 +886,17 @@ O(n), so `LPSZ` sizes are timer noise for them):
 
 | | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
 |---|---|---|---|---|---|---|
-| **Zen4 (Zen4)** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
-| **Zen3 (Zen3)** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
-| **Zen5 (Zen5)** | 1.28/1.22 | 1.62/1.54 | 1.06/1.05 | 1.12/1.12 | 1.00/**0.99** | 1.06/1.04 |
+| **Zen4** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
+| **Zen3** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
+| **Zen5** | 1.28/1.22 | 1.62/1.54 | 1.06/1.05 | 1.12/1.12 | 1.00/**0.99** | 1.06/1.04 |
 
 **vs OpenBLAS** (the binding reference for gttrs), same column order:
 
 | | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
 |---|---|---|---|---|---|---|
-| **Zen4 (Zen4)** | 1.50/1.43 | 1.62/1.54 | 1.00/1.00 | 1.13/1.13 | 1.73/1.68 | 1.36/1.33 |
-| **Zen3 (Zen3)** | 1.49/1.41 | 1.64/1.53 | 1.00/1.00 | 1.11/1.11 | 1.72/1.68 | 1.34/1.31 |
-| **Zen5 (Zen5)** | 1.51/1.43 | 1.64/1.57 | 1.00/1.00 | 1.12/1.12 | 1.72/1.67 | 1.35/1.32 |
+| **Zen4** | 1.50/1.43 | 1.62/1.54 | 1.00/1.00 | 1.13/1.13 | 1.73/1.68 | 1.36/1.33 |
+| **Zen3** | 1.49/1.41 | 1.64/1.53 | 1.00/1.00 | 1.11/1.11 | 1.72/1.68 | 1.34/1.31 |
+| **Zen5** | 1.51/1.43 | 1.64/1.57 | 1.00/1.00 | 1.12/1.12 | 1.72/1.67 | 1.35/1.32 |
 
 `pttrs` is 1.67–1.73 vs OB, so **AOCL is its only binding reference**; `gttrs` is 1.03–1.06 vs AOCL and
 sits at parity with OB (medians 0.9999–1.004, per-sample spread at n=4096 of 0.897–1.107 — where the

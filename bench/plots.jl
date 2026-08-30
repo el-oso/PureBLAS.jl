@@ -2266,10 +2266,12 @@ else
         println(io, "The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ",
             "generated tables in `docs/src/coverage.md`. Both reference views (OpenBLAS, AOCL) are ",
             "rendered from this one cache set. Methodology: `docs/src/methodology.md`.\n")
-        println(io, "| µarch | host | CPU | commit | measured |")
-        println(io, "|---|---|---|---|---|")
+        # Host name deliberately not published — µarch + CPU model identify the box for a reader, and
+        # the cache header keeps `host=` for local fleet tooling.
+        println(io, "| µarch | CPU | commit | measured |")
+        println(io, "|---|---|---|---|")
         for (m, _) in fleet
-            println(io, "| $(_ulabel(m)) | `$(m.host)` | $(m.cpu) | `$(m.commit)` | $(m.time) |")
+            println(io, "| $(_ulabel(m)) | $(m.cpu) | `$(m.commit)` | $(m.time) |")
         end
     end
     println("wrote provenance$L.md")

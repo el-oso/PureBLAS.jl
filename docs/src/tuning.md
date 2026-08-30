@@ -356,7 +356,7 @@ It was first written as a **`Bool`**, probed at `k = _TRSM_DBASE`. That was wron
 over, and only the fleet run caught it:
 
 1. **The winner depends on `k`, and `k` was the dimension nobody was looking at.** Fleet A/B
-   on Zen3/Zen3 at an aliasing `ldb`: scratch/in-place = 1.18 at k=16 (in-place wins),
+   on Zen3 at an aliasing `ldb`: scratch/in-place = 1.18 at k=16 (in-place wins),
    **1.00–1.02 at k=32**, 0.68–0.79 at k≥48 (scratch wins by 20–32%). That is physics, not
    noise — the copy-back costs O(m·k) against an O(m·k²) solve, so its relative price falls
    as 1/k and scratch can only pay above some k. A single Bool cannot represent a crossover.

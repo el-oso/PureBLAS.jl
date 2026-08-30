@@ -96,7 +96,7 @@ end
 #
 # `y` is the CARRIER for the store's bounds check and is otherwise unused — never indexed through.
 #
-# ⚠ PASS IT AS `_carrier(y)`, NEVER AS `y`. MEASURED 2026-08-17, Zen3 (Zen3/AVX2), controlled
+# ⚠ PASS IT AS `_carrier(y)`, NEVER AS `y`. MEASURED 2026-08-17, Zen3 (AVX2), controlled
 # same-box back-to-back A/B, `op=gbmvN arms=pb`:
 #     pre-migration 6ae9ee9  gate 0.879
 #     carrier passed raw     gate 0.862      <- 1.9% REGRESSION

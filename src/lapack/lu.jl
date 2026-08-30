@@ -24,7 +24,7 @@ _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 # than the real one (÷5 vs ÷8) — and is CAPPED at the complex-gemm kc micropanel `_clu_cap` (== `_CKC` for
 # ComplexF64: L1-residency `kc·nr·sizeof(T) ≤ ½L1`, per-T via `_l1_block`), beyond which the trailing zgemm
 # re-blocks k internally anyway. Floor keeps the panel lean at small n (the rank-2 panel factor dominates
-# there). Reproduces the rank-2-panel nb-sweep optima (Zen3 Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
+# there). Reproduces the rank-2-panel nb-sweep optima (Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
 @inline _clu_cap(::Type{T}) where {T <: BlasComplex} = _l1_block(_HW, T, max(_CNR, _CNR_SMALL))
 @inline _clu_nb(n::Int, ::Type{T}) where {T <: BlasComplex} = clamp((n ÷ 5) & ~15, 32, _clu_cap(T))
 

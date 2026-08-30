@@ -720,8 +720,8 @@ end
 # class as `_ger_np` ("intrinsic per-core property, NO derivable formula, OPPOSITE sign across µarchs"),
 # so it gets the same treatment: Preference-pinnable, else auto-measured once per process.
 # MEASURE tier (PDM): this is NOT physically predictable, so it must be measured, not guessed.
-# Per-column beats blocked NC=4 inside the window by up to 1.35× on Zen4 (Zen4) and NEVER wins on
-# Zen3 (Zen3) — per-column ÷ blocked, GB/s:
+# Per-column beats blocked NC=4 inside the window by up to 1.35× on Zen4 and NEVER wins on
+# Zen3 — per-column ÷ blocked, GB/s:
 #     n=      128   256   512   768  1024  1536  2048  3072  4096
 #   Zen4     0.83  0.90  1.10  1.09  1.22  1.30  1.13  0.80  0.71
 #   Zen3     0.81  0.86  0.92  0.90  0.97  0.84  0.74  0.74  0.80
@@ -1896,9 +1896,9 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # change flips, against the spread of the cells it does NOT flip — those are controls by construction,
 # since the divisor can only alter behaviour inside [L3/2, L3):
 #     box                flipped cell        ratio    control band   verdict
-#     Zen4 Zen4    n=1000 (15.3/16M)   0.9713   ±1.2%          -2.9%
+#     Zen4    n=1000 (15.3/16M)   0.9713   ±1.2%          -2.9%
 #     Zen3      Zen3    n=1024 (16/32M)     0.9711   ±1.7%          -2.9%
-#     Zen5 Zen5   n=1000 (15.3/16M)   1.0029   ±2.3%          null (24 samples/arm)
+#     Zen5   n=1000 (15.3/16M)   1.0029   ±2.3%          null (24 samples/arm)
 # Two µarchs gain 2.9% on DIFFERENT sizes — the rule reproducing, not a per-box fit — and the third is
 # unaffected. Zen5 needed 3 replicates/arm before its band was tight enough to adjudicate 3%; at 2
 # replicates a control swung 6.4% on its own. Do not read a Zen5 verdict off a 2-replicate run.
@@ -3238,8 +3238,8 @@ end
 # off-diagonal rectangle through `_gemv_n_simd!` — which cuts the x re-stream at n=4096 from 512
 # panel passes to 2, i.e. recovers essentially ALL of the hypothesised traffic. Measured vs AOCL at
 # n=4096, both arms scored against the same cached reference so the reference cancels:
-#     Zen3 (Zen3)       ON 0.955 | OFF 0.967 | ON again 0.942
-#     Zen4 (Zen4)  ON 1.006 | OFF 1.002 | ON again 1.006
+#     Zen3       ON 0.955 | OFF 0.967 | ON again 0.942
+#     Zen4  ON 1.006 | OFF 1.002 | ON again 1.006
 # No win on either box, and Zen4 shows no dip at all in a clean run — its earlier 0.990 was noise.
 # Removing the traffic changed nothing, so CAPACITY IS NOT THE MECHANISM. Neither is set conflict:
 # n=2048 has the identical geometry (lda = 16384 B, a multiple of the 4096 B L1 way stride, so all

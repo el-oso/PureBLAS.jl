@@ -464,7 +464,7 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
 end
 
 # The packed K-TRIM complex trmm base (near-peak PACKED microkernel) vs the weak unpacked _uker_cmplx!.
-# Measured (Zen3/Zen3): the packed complex kernel hits 0.94–0.95×OB at these short-k base shapes, the
+# Measured (Zen3): the packed complex kernel hits 0.94–0.95×OB at these short-k base shapes, the
 # unpacked only 0.68–0.73, and ztrmm is pinned at the unpacked ceiling (0.77 ≈ 0.73). AVX-512 already
 # gates via the unpacked path (32 zmm give ample ILP) — restrict packed to AVX2 (W=4) so that gate is
 # untouched. Preferences knob "ctrmm_pack". Fable-designed, decomposition-confirmed 2026-07-05.
@@ -3643,7 +3643,7 @@ end
 # binding lever: the fused-slab microkernel intrinsically runs ~40.6 GF vs PB's own dgemm 43 / AOCL trsm 42,
 # worst at small n (PB 31 vs AOCL 37 @128). It also shows a noise-level regression at po2 n=512, which the
 # no-regression contract forbids. Kept behind this toggle as the validated re-pack-free substrate.
-# FALSIFIED levers (measured Zen4 Zen4, boost-locked, in-process A/B — do NOT re-try; bench/
+# FALSIFIED levers (measured Zen4, boost-locked, in-process A/B — do NOT re-try; bench/
 # trsm_fullpack_gf.jl reproduces): (1) INVERTED-DIAGONAL epilogue (precompute inv of the MR×MR diagonal
 # block at pack time, replace the serial back-sub with X=Vss·acc) — REGRESSED small-k (k=128 30.2 vs
 # back-sub 31.5 GF), converged at large-k. The back-sub is NOT latency-bound: its MR×NRV=24 v-lanes across
@@ -3970,7 +3970,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
         # to the leaf VERBATIM at the caller's lda. For a square gate operand that is lda = k, and at
         # k=128 the byte stride is 1024 = a quarter L1 way period, which puts A's columns on the same
-        # sets. MEASURED on Zen3 (Zen3/AVX2), leaf GF at bs=128, m=128, only A's lda moving:
+        # sets. MEASURED on Zen3 (AVX2), leaf GF at bs=128, m=128, only A's lda moving:
         #     lda 128 (shipped) 41.59 | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
         # i.e. ANY non-po2 lda is +11.5..+15.1%, and the padded values land on the leaf's own
         # `1/GF = α + β/bs` trend (asymptote 47.8 GF) — bs=128 was a DIP, not a rate deficit.
@@ -4127,7 +4127,7 @@ const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 # solve into the ODD-ld rpack scratch and copy back, or just solve in place and eat the conflicts. Which
 # wins is NOT derivable from any detected const — it is the copy-back round-trip (m·k·8 B each way,
 # chunk-size-independent) traded against the conflict rate, and it INVERTS SIGN across µarchs we own:
-# Zen3/Zen3 measured scratch +41–49% at m=512/1024/1536, while Zen4/Zen4 measures the same scratch
+# Zen3 measured scratch +41–49% at m=512/1024/1536, while Zen4/Zen4 measures the same scratch
 # arm a 15–45% net LOSS (in-place 33.9/37.3/37.3 vs arm 23.4/29.1/33.9 GF at k=16/32/64, m=ldb=1024,
 # 2026-07-26). Sign inversion on benchmarked boxes is the ladder's explicit Measure tell — a literal or a
 # µarch-gated literal would be wrong on any unseen machine. Candidate set is the 2 strategies; the probe
@@ -4207,7 +4207,7 @@ function trsm!(
         # `_GT_TRANSPOSE` REMOVED 2026-08-10. It is a CAPABILITY bit for the 8x8-transpose fusedT slabs
         # (_GT_W == 8), and it belongs inside the leaf — where it still is, at `useT` — not on the decision
         # to ENTER the leaf. Used here it silently pinned all of AVX2 to the scalar dense base, and the
-        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on Zen3 (Zen3), routing
+        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on Zen3, routing
         # bypassed, correctness checked first at max|dense-fused| ~ 1.3e-15:
         #     k=32  fused/dense 0.8381  SE 0.0018  n=105   (fused 16.2% FASTER)
         #     k=48  fused/dense 0.7935  SE 0.0015  n=56    (20.7% faster)

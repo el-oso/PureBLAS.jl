@@ -312,7 +312,7 @@ const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is ena
 # Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
 # strong — it BEATS the blocked WY path while the matrix stays cache-resident (its O(n³) re-streams hit cache,
 # not DRAM). req#8: derive from residency, not a size literal. On the wide-SIMD box (AVX-512)
-# unblocked wins to matrix ≈ ½L3 (Zen5 Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
+# unblocked wins to matrix ≈ ½L3 (Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
 # box the BLAS-2 panel is bandwidth-bound AND the chunked blocked path is efficient from small n,
 # so unblocked only wins while the matrix is ~L2-resident (≤2·L2 ⇒ Zen3 n≤256; n≥320 must reach blocked).
 @inline _zqr_unblk_max(::Type{T}) where {T} = _NARROW_SIMD ? 2 * _L2_BYTES : _L3_BYTES ÷ 2

@@ -223,7 +223,7 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # the phase-narrow arm beats the band incumbent by 5.6-10%; that is the long-standing n=1e6 miss.
     #
     # ⚠ THIS DOES NOT EXPLAIN THE CROSS-µARCH SPLIT, and it was briefly claimed that it did. Measured
-    # L3/W on 2026-08-07: Zen4 (Zen4) 16 MB / W=8, Zen5 (Zen5) 16 MB / W=8, Zen3 (Zen3)
+    # L3/W on 2026-08-07: Zen4 16 MB / W=8, Zen5 16 MB / W=8, Zen3
     # 32 MB / W=4. Zen4 and Zen5 are IDENTICAL in L3, vector width and therefore regime at every n — and
     # they still want opposite kernels: at ws=L3 and at ws=4·L3, phase-narrow beats the incumbent by
     # 5.6-10% on Zen4 and LOSES by 0.6-1.4% on Zen5 (noise floors 0.04-0.71%, so both are resolvable).
@@ -445,7 +445,7 @@ end
 end
 
 # Complex axpy: y .+= (alr + i·ali)·x. Swap-pairs complex-multiply of x, fused straight into y.
-# DECOMPOSITION (Zen3 Zen3/AVX2, n=1M ≈ 32MB footprint = L3 edge, the worst point): the complex kernel
+# DECOMPOSITION (Zen3/AVX2, n=1M ≈ 32MB footprint = L3 edge, the worst point): the complex kernel
 # under-extracted bandwidth with NO register spills and no prefetch/unroll sensitivity (all falsified) — so
 # the residual was the compute critical path at the L3→DRAM transition, not memory. The old body was 4 vector
 # ops/lane (mul xv·arv, shuffle, FMA, then a standalone `y + ax` add). Folding the y-load into the FIRST FMA
@@ -1373,7 +1373,7 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # both forms pay 1 op/vector there. An earlier note in this file claiming we issue a separate vload was
 # wrong — read off the AVX2 disassembly on Zen3.)
 #
-# Measured on Zen3 (Zen3/AVX2, freq-locked, bench/probes/iamax_live.jl in plots.jl's rep-loop regime),
+# Measured on Zen3 (AVX2, freq-locked, bench/probes/iamax_live.jl in plots.jl's rep-loop regime),
 # tree vs thresh at the RESIDENT width, PB/OpenBLAS:
 #     n=1000  1.937 -> 2.303 (+19%)   n=3000  1.940 -> 2.393 (+23%)
 #     n=10000 2.000 -> 2.068 (+3%)    n=30000 2.129 -> 2.188 (+3%)

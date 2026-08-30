@@ -597,7 +597,7 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
 # the bulk through the FMA-efficient rank-k trailing (_trsm_right/_syrk) and confines the slow base to
-# ≤16-col diagonal blocks. Measured Zen3/Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
+# ≤16-col diagonal blocks. Measured Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
 # (n=64 14.5→19.9, gate 1.12→1.54×). bs = 2·th keeps the trailing panel L1-resident.
 # req#8 NOTE (validated 2026-07-16): th is a µarch-INVARIANT 16, NOT the width-scaled (MR+1)·W the earlier
 # comment guessed. Zen4 A/B (same harness, potrf PB/AOCL small-n): th=16 vs th=32(=4·_CHOLW) → th=16 WINS
@@ -1053,7 +1053,7 @@ function _chol_hyb_f64!(M, n::Int, base::Int)
 end
 
 # ── Fused panel driver: po2-strided AVX2 potrf without the whole-matrix pad round-trip ──────────────
-# Measured (Zen3/Zen3, kb pureblas-cholesky): the po2-stride tax lives in the trsm B-panel and the
+# Measured (Zen3, kb pureblas-cholesky): the po2-stride tax lives in the trsm B-panel and the
 # faer base reading A directly (syrk! packs both operands — stride-immune), and the whole-pad fix pays
 # an n² copy round-trip that IS the residual gate gap at n=256–1024. Fix: per NB=128 block, (1) factor
 # the diagonal block in a conflict-free scratch D, (2) solve the panel INTO a conflict-free workspace T
@@ -1068,10 +1068,10 @@ end
 # first update). Same math/order as _trsm_right_lower_f64! — the c0==1 register pass degenerates to
 # the first-touch copy (empty k-loop), fusing the copy-in.
 # THIS KERNEL SPILLS ON AVX2 — AND THAT IS NOT THE BOTTLENECK. DO NOT "FIX" IT BY SHRINKING MR.
-# Measured 2026-07-30 (`code_native` + bench/plots.jl op=trsmR, Zen3 Zen3 freq-locked). The MR=3 tier
+# Measured 2026-07-30 (`code_native` + bench/plots.jl op=trsmR, Zen3 freq-locked). The MR=3 tier
 # holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
 # `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
-#     Zen4 Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
+#     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
 #     Zen3      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
 # invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
@@ -1402,7 +1402,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     n = size(A, 1)
     n == 0 && return A
     if _NVREG == 16 && n > _chol_rl_max(T)
-        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3/Zen3,
+        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3,
         # 200–4000: transition dips 384/448/640 0.91-0.94→1.01-1.03, non-po2 large 0.98→1.00-1.03). It was
         # originally gated to po2-aliased strides only (its raison d'être was dodging the po2 pad round-trip),
         # but it's a better-composed blocked driver everywhere — the hybrid's generic trsm!(side=R,transA=T)

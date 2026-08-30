@@ -5,7 +5,7 @@ kernels supernodal sparse Cholesky calls** (dense diagonal factor + off-diagonal
 solve + `syrk`/`gemm` Schur update) — fast on **both AVX2 (Zen3) and AVX-512 (Zen4/Zen5), all sizes**.
 
 ## Fleet & method (definition of done for every item)
-- Boxes: **Zen4 Zen4/AVX-512**, **Zen3 Zen3/AVX2**, **Zen5 Zen5/AVX-512**.
+- Boxes: **Zen4/AVX-512**, **Zen3/AVX2**, **Zen5/AVX-512**.
 - Per fix: **diagnose** (decompose + roofline, don't guess the bottleneck) → **fix** → **boost-locked A/B
   on all 3 boxes vs BOTH OB and AOCL** (`sudo bench/fleet_freqlock.sh lock`) → **suite green** → merge.
   One op at a time; re-measure the touched op into the caches after each fix.

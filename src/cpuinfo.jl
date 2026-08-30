@@ -189,7 +189,7 @@ end
 # on AVX2 (16 regs) the _ILP_TARGET accumulators + load temps spill, AND small-n gemm there is already ≥1.0
 # via _GEMM_MR1_MAX — so it const-folds off on Zen3. Derived: S=2 (double ILP for the fill), cells=_ILP_TARGET÷S
 # arranged TALL (NR=2 → a B-reuse column pair; MR=cells÷NR), giving 4×2 on W=8. Validated n=32 0.85→1.07× OB
-# (Zen4 Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
+# (Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
 # PDM: Literal — split-reduction factor, measured crossover ~n=56 on Zen4. TUNABLE.
 const _GEMM_SPLIT_S = 2
 @inline _at_gemm_split_ok(hw) = hw.nvreg >= 32 && hw.simd >= 64
@@ -236,8 +236,8 @@ const _GEMM_SPLIT_S = 2
 # only there. That criterion IS the datapath, so `_double_pumped` is the honest predictor rather than a
 # µarch lookup. Native-256 (Zen3) and native-512 (Zen5) parts both take the interleaved arm (4).
 # Measured, arms called directly at n=3e6 (bench/probes/axpy_arm_regime_ab.jl, µs, lower better):
-#   Zen4 Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
-#   Zen3 Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
+#   Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
+#   Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
 # Zen5 predicts 4; unconfirmed (that box's frequency lock was not holding). Replaced a OncePerProcess duel
 # that resolved the 17%-slower arm on Zen4 in 7 of 9 processes and flipped in the other 2.
 @inline _at_axpy_dram(hw) = _double_pumped(hw) ? 208 : 4
@@ -261,9 +261,9 @@ const _GEMM_SPLIT_S = 2
 # pays off if the machine can actually move it in one go, so narrow wins exactly when the REAL datapath
 # is no wider than 32 B — `_datapath_bytes`, which already folds the double-pump fact in.
 # MEASURED, 6 fresh processes per box (the duel is stable here, unlike the real-axpy pair):
-#   Zen3 Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
-#   Zen4 Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
-#   Zen5 Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
+#   Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
+#   Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
+#   Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
 # ⚠ Zen5 is the one arm this formula CHANGES and the one nobody has measured. It agrees with what
 # simd_kernels.jl and test/Project.toml both already expect of a true-512-bit datapath ("a trim build
 # for a true-512-bit datapath should re-pin it"), but expectation is not measurement — verify on
@@ -285,7 +285,7 @@ const _GEMM_SPLIT_S = 2
 # EVIDENCE (bench/probes/gemvt_route_window.jl — per-column ÷ blocked, same-process paired A/B through
 # the REAL `gemv!` entry, `reps` matched to plots.jl's `_L2REP` so the regime IS the gate's, THREE
 # INDEPENDENT PROCESSES per box, both freq-locked):
-#              Zen4 Zen4          Zen3 Zen3               Zen5 Zen5
+#              Zen4          Zen3               Zen5
 #     n=512    1.113                    0.953/0.964/0.973        1.043/1.032/1.041
 #              percol                   BLOCKED                  percol
 #     n=1024   1.254/1.248/1.238        1.013/1.027/1.016        0.865/0.903/0.912
@@ -403,8 +403,8 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gemvt_percol_amin(hw) = hw.l2
 @inline _at_gemvt_percol_xmax(hw) = hw.l1 ÷ 2
 # (c6) Banded-Cholesky panel widths and crossovers. THE FLEET SPLITS BY VECTOR WIDTH, not by µarch:
-# resolved 6 fresh processes on each of three boxes (2026-08-19), Zen4 Zen4 and Zen5 Zen5
-# agree on every row below and Zen3 Zen3 differs on every one — and what Zen4/Zen5 share
+# resolved 6 fresh processes on each of three boxes (2026-08-19), Zen4 and Zen5
+# agree on every row below and Zen3 differs on every one — and what Zen4/Zen5 share
 # is simd=64, while `_double_pumped` SEPARATES them. Width is also the physically right unit here: a
 # panel width is counted in vector registers. Two independent AVX-512 boxes agreeing is what makes this
 # a criterion rather than the two-point fit that `zaxpy_narrow` and `ger_np` both punished today.
@@ -602,7 +602,7 @@ Should a candidate at time `t` displace the incumbent at `best`? Only if it wins
 WHY A MARGIN AND NOT `<`. A plain `t < best` switches on noise: when two candidates are within the
 probe's resolution the winner is whichever got the luckier window, so the pick changes from process to
 process — and since these knobs select a SHIPPED kernel, the emitted code then varies run to run.
-MEASURED on Zen5 (Zen5), 2026-08-05: two fresh processes of the SAME binary resolved the axpy
+MEASURED on Zen5, 2026-08-05: two fresh processes of the SAME binary resolved the axpy
 DRAM knob to 208 and to 4. That is not a tuning result, it is a coin flip that changes what executes, and
 it feeds straight back into the run-to-run variance that makes that box hard to measure at all.
 5% is above the probes' resolution on every fleet box and far below the gaps worth switching for (the
