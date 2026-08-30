@@ -6,6 +6,51 @@ detection that happens at compile time, and the rule that every tuning parameter
 detected hardware rather than a hardcoded per-microarchitecture literal. It also sets that against the
 ahead-of-time model used by C and Rust libraries like OpenBLAS and faer.
 
+## Why not just let the compiler vectorise it?
+
+This is the first question most people ask, and it deserves a straight answer, because the premise is
+correct: Julia's compiler *is* good at vectorising loops. Write the textbook three-line matrix multiply,
+put `@inbounds` and `@simd` on it, and LLVM really does turn the inner loop into AVX-512 code. You can
+check — the generated IR for that loop contains `fmul <8 x double>`, `fadd <8 x double>` and
+`load <8 x double>`, which is eight lanes at a time, exactly what you would hope for.
+
+Then you measure it against PureBLAS on the same machine, one thread, Float64:
+
+| n | naive loop | PureBLAS | |
+|---|---|---|---|
+| 256 | 0.70 GFlop/s | 43.6 GFlop/s | 62× |
+| 512 | 0.21 GFlop/s | 42.5 GFlop/s | 199× |
+| 1000 | 2.41 GFlop/s | 42.2 GFlop/s | 17× |
+
+Both are running vectorised code. The difference is not the instructions — it is where the numbers are
+coming from.
+
+Think about what the naive loop does to memory. To compute one entry of the result it walks a whole row
+of `A` and a whole column of `B`. Walking down a column means each step jumps a full row-length ahead in
+memory, so every value it wants sits in a different cache line. The CPU fetches 64 bytes and uses 8 of
+them. Do that a few billion times and the arithmetic units spend nearly all their time idle, waiting.
+Vectorising that loop makes the CPU wait eight lanes at a time. It does not make it wait less.
+
+What a real BLAS does is rearrange the *work* so that data, once fetched, gets used many times before it
+is evicted. It chops the matrices into blocks sized to fit in L1 and L2, copies each block into a small
+contiguous scratch buffer so the inner loop reads straight through memory, and holds a tile of the
+result in registers across the whole inner loop. None of that changes the arithmetic — the same
+multiplications happen in a different order — but it changes how often each number has to be fetched,
+and that is what the 17–200× is.
+
+A compiler will not do this for you, and not because it is not clever enough. Choosing block sizes needs
+the cache sizes, which are a property of the machine, not of the code. Packing operands into scratch
+buffers means allocating memory and copying data that the program you wrote never asked for. Reordering
+the loop nest that far changes the order of floating-point additions, which a compiler is not allowed to
+do on its own. These are algorithm-level decisions, and they belong to the library.
+
+That is also why the naive numbers above bounce around — 0.70, then 0.21, then 2.41 — while PureBLAS
+sits flat near 42 across all three sizes. The naive version is at the mercy of how each size happens to
+land in the cache; `n=512` is the worst because a power-of-two row length makes columns collide in the
+same cache sets. A blocked kernel is not at the mercy of anything: it decides the access pattern itself.
+
+The rest of this page is about how those decisions get made without hardcoding them for one CPU.
+
 ## The vector abstraction: one kernel, every width
 
 Hot kernels are written with [SIMD.jl](https://github.com/eschnett/SIMD.jl) — `Vec{N,T}` plus
