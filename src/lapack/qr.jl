@@ -431,6 +431,52 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}(
     end
     return V, Tm, G, Wb, Vt
 end
+# GENERIC UNBLOCKED QR (LAPACK dgeqr2) for any `T <: Real` that is not Float64 — req#3, so a
+# ForwardDiff.Dual matrix can reach QR at all. The Float64 `qr_unblocked!` below is a pointer/SIMD
+# kernel with no generic path, so this is a separate implementation rather than a widened signature —
+# but it is assembly, not invention: both primitives it needs are ALREADY generic over `T<:Real`.
+#   * `_larfg!` (svd.jl) returns `(β, τ)`, leaves `x[1]` at α and writes the essential `v` into `x[2:]`.
+#   * `_house_left!` (qlrq.jl) applies `H = I − τ·v·vᵀ` from the left and treats `v[1] ≡ 1` IMPLICITLY,
+#     so the column view is passed whole and `x[1]`'s actual value is ignored. Its own comment records
+#     that its scalar arm exists for "non-BlasReal T (Dual/AD, req: the scalar path stays
+#     differentiable)" — this is the caller that makes that arm reachable for QR.
+# No blocking: the WY/`_qr_ws` machinery is Float64-specific, and blocking is a performance
+# optimisation, not a correctness one. Float64 is a more specific method and keeps every fast path.
+# ⚠ THIS FILE'S `tau` IS THE **faer** CONVENTION, NOT LAPACK'S. The Float64 path stores τ_f such that
+#   H = I − v·vᵀ / τ_f      with  τ_f = Inf  meaning "identity, column already zero"
+# whereas `_larfg!` (svd.jl, shared with gebrd/geqlf) returns LAPACK's τ_L with
+#   H = I − τ_L·v·vᵀ        with  τ_L = 0    meaning identity.
+# They are reciprocals: τ_f = 1/τ_L, and τ_L = 0 ↔ τ_f = Inf. `test/lapack_tests.jl`'s `recon` states
+# the faer form explicitly, and `bench`'s own consumers read it that way.
+#
+# STORING LAPACK τ HERE WOULD MAKE THE CONVENTION DEPEND ON THE ELEMENT TYPE — Float64 faer, everything
+# else LAPACK — which is the invisible-landmine class that got the faer-τ/orgqr mismatch retracted in
+# `4b5454c`. So: APPLY with τ_L (what `_house_left!` wants) and STORE 1/τ_L (what every geqrf consumer
+# in this repo reads).
+function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Real}
+    m, n = size(A); k = min(m, n)
+    @inbounds for i in 1:k
+        β, τL = _larfg!(view(A, i:m, i))
+        i < n && _house_left!(view(A, i:m, (i + 1):n), view(A, i:m, i), τL)
+        tau[i] = iszero(τL) ? convert(T, Inf) : one(T) / τL     # faer τ; Inf ⇒ identity reflector
+        A[i, i] = β
+    end
+    return A
+end
+
+function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T <: Real}
+    m, n = size(A); k = min(m, n)
+    k == 0 && return A
+    length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
+    qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
+    return A
+end
+function geqrf!(A::AbstractMatrix{T}) where {T <: Real}
+    tau = Vector{T}(undef, min(size(A)...))
+    geqrf!(A, tau)
+    return A, tau
+end
+
 function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = 0)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
