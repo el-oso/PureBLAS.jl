@@ -21,6 +21,12 @@ One row per routine, generated from the caches by `bench/coverage_ops.jl`; `n=` 
 .pbg{--l:#e3e6ee;--m:#5d6675;--ok:#1f8a5b;--b1:#7a8496;--b2:#c07d12;--b3:#cf5a35;--b4:#b3243a;
  --okbg:#e9f6ef;--b1bg:#f1f3f7;--b2bg:#fdf3e2;--b3bg:#fceee9;--b4bg:#fbe9ed;
  border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;display:table}
+/* The scroll container. Vitepress gets wide tables to scroll with `.vp-doc table{display:block;
+   overflow-x:auto}`; `.pbg` needs display:table for column sizing, and setting it removes that
+   container. Every th/td here is white-space:nowrap, so the table's min-content width exceeds a
+   narrow content column and it then overflows into the page outline instead of scrolling. Wrap
+   rather than drop the nowrap: a wrapped ratio cell is worse to read than a scrollbar. */
+.pbg-wrap{overflow-x:auto;margin:20px 0;max-width:100%}
 html.dark .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;--b2:#e0a63c;--b3:#f08055;--b4:#ff5f7a;
  --okbg:#12271d;--b1bg:#1a2130;--b2bg:#2a2113;--b3bg:#2c1a15;--b4bg:#2c1420}
 @media (prefers-color-scheme:dark){html:not(.light) .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;
@@ -47,7 +53,7 @@ html.dark .pbg-key{color:#98a1b3}
 #### BLAS-1
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
+<div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>asum</code></th><td class="ok"><span class="v">1.34</span></td><td class="b2"><span class="v">0.988</span><span class="n">n=1000000</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>axpy</code></th><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.0</span></td><td class="b2"><span class="v">0.959</span><span class="n">n=300000</span></td></tr>
 <tr><th><code>dot</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td><td class="b4"><span class="v">0.844</span><span class="n">n=10000</span></td></tr>
@@ -61,13 +67,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>zdotc</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=300000</span></td></tr>
 <tr><th><code>zdotu</code></th><td class="b1"><span class="v">0.993</span><span class="n">n=100000</span></td><td class="ok"><span class="v">1.01</span></td><td class="b3"><span class="v">0.908</span><span class="n">n=1000000</span></td></tr>
 <tr><th><code>zscal</code></th><td class="ok"><span class="v">1.18</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=100000</span></td><td class="b1"><span class="v">0.993</span><span class="n">n=300000</span></td></tr>
-</tbody></table>
+</tbody></table></div>
 ```
 
 #### BLAS-2
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
+<div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>gbmvN</code></th><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.42</span></td><td class="ok"><span class="v">1.25</span></td></tr>
 <tr><th><code>gemvN</code></th><td class="b2"><span class="v">0.962</span><span class="n">n=50</span></td><td class="ok"><span class="v">1.0</span></td><td class="b4"><span class="v">0.782</span><span class="n">n=2100</span></td></tr>
 <tr><th><code>gemvT</code></th><td class="b3"><span class="v">0.867</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.902</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.902</span><span class="n">n=2100</span></td></tr>
@@ -89,13 +95,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>zhpmv</code></th><td class="ok"><span class="v">1.29</span></td><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.11</span></td></tr>
 <tr><th><code>ztrmv</code></th><td class="b3"><span class="v">0.94</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.987</span><span class="n">n=1024</span></td><td class="ok"><span class="v">1.06</span></td></tr>
 <tr><th><code>ztrsv</code></th><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.925</span><span class="n">n=1024</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=1024</span></td></tr>
-</tbody></table>
+</tbody></table></div>
 ```
 
 #### BLAS-3
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
+<div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>gemm</code></th><td class="b2"><span class="v">0.981</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.924</span><span class="n">n=100</span></td><td class="b3"><span class="v">0.898</span><span class="n">n=50</span></td></tr>
 <tr><th><code>symm</code></th><td class="b2"><span class="v">0.956</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=1000</span></td><td class="ok"><span class="v">1.06</span></td></tr>
 <tr><th><code>syr2k</code></th><td class="b3"><span class="v">0.948</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.92</span><span class="n">n=4096</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=4096</span></td></tr>
@@ -115,13 +121,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>ztrmmR</code></th><td class="b2"><span class="v">0.989</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.966</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.981</span><span class="n">n=128</span></td></tr>
 <tr><th><code>ztrsm</code></th><td class="b1"><span class="v">0.992</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=100</span></td><td class="ok"><span class="v">1.01</span></td></tr>
 <tr><th><code>ztrsmR</code></th><td class="b3"><span class="v">0.926</span><span class="n">n=100</span></td><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.985</span><span class="n">n=100</span></td></tr>
-</tbody></table>
+</tbody></table></div>
 ```
 
 #### LAPACK
 
 ```@raw html
-<table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
+<div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th></tr></thead><tbody>
 <tr><th><code>gbtrf</code></th><td class="b3"><span class="v">0.921</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=1000</span></td><td class="ok"><span class="v">1.0</span></td></tr>
 <tr><th><code>gels</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.22</span></td><td class="ok"><span class="v">1.18</span></td></tr>
 <tr><th><code>geqp3</code></th><td class="b3"><span class="v">0.851</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.961</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=50</span></td></tr>
@@ -160,7 +166,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.15</span></td></tr>
 <tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.13</span></td></tr>
 <tr><th><code>zpotrfU</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.04</span></td></tr>
-</tbody></table>
+</tbody></table></div>
 ```
 ```@raw html
 <p class="pbg-key">
