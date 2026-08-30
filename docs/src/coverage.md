@@ -1,16 +1,16 @@
 # LAPACK / BLAS coverage
 
-Which `LinearAlgebra` operations route to PureBLAS after `PureBLAS.activate()`, and how they measure.
+Which `LinearAlgebra` operations route to PureBLAS after `PureBLAS.activate()`, and how fast they are.
 
-Every number is a **PB / max(OpenBLAS, AOCL) speed ratio**: the routine's worst (op, size) cell on that
-box, one column per microarchitecture. `≥ 1.0` **to two significant digits** gates (so `0.995` passes,
-`0.9949` does not — see [Methodology](methodology.md)); a miss is printed at three digits, floored, and
-bolded (routing tables) or colour-banded (BLAS tables). **Routes** = forwards to PureBLAS via LBT after
-`activate()`; ⏳ = not gated yet. Types: **s** = Float32, **d** = Float64, **c** = ComplexF32,
-**z** = ComplexF64.
+Every number is a PB / max(OpenBLAS, AOCL) speed ratio — the routine's worst (op, size) cell on that
+box, one column per microarchitecture. A ratio of 1.0 or better, to two significant digits, gates, so
+0.995 passes and 0.9949 does not. A miss is printed at three digits and floored, then bolded in the
+routing tables or colour-banded in the BLAS ones. "Routes" means the call forwards to PureBLAS via LBT
+after `activate()`, and ⏳ marks a routine that is not gated yet. Types are s = Float32, d = Float64,
+c = ComplexF32, z = ComplexF64.
 
-Measurement, provenance and the caveats that change how a cell should be read:
-[Methodology](methodology.md). Per-routine analysis and history: [Notes](notes.md).
+How the measurements are taken and how to read a cell: [Methodology](methodology.md). Per-routine
+analysis and history: [Notes](notes.md).
 
 ## BLAS
 
@@ -216,11 +216,10 @@ factorization.
 | Schur reordering | trexc, trsen | s/d/c/z | ✅ | | | ⏳ |
 | Sylvester / Lyapunov | trsyl | s/d/c/z | ✅ | | | ⏳ |
 
-*\* `stedc`, `steqr` and `sterf` are **implemented but not forwarded**: they are the internal
-building blocks `syev`/`heev` are composed from, and PureBLAS exposes no `stedc_64_`/`steqr_64_`/
-`sterf_64_` symbol, so a program calling one of them **directly** still reaches OpenBLAS. Every other
-routine in these two rows is forwarded and does route to PureBLAS. Verified against `src/cabi/`,
-2026-08-20.*
+*\* `stedc`, `steqr` and `sterf` are implemented but not forwarded. They are the internal building
+blocks `syev`/`heev` are composed from, and PureBLAS exports no `stedc_64_`/`steqr_64_`/`sterf_64_`
+symbol, so a program that calls one of them directly still reaches OpenBLAS. Everything else in these
+two rows routes to PureBLAS. Checked against `src/cabi/`, 2026-08-20.*
 
 ## LAPACK — banded / tridiagonal / packed
 
@@ -236,34 +235,35 @@ routine in these two rows is forwarded and does route to PureBLAS. Verified agai
 
 ## Free via composition
 
-`exp`, `sqrt`, `log`, `^` of a matrix, `sylvester`/`lyap`, `pinv`, `nullspace`,
-`rank`, `cond`, `factorize` — computed in Julia on top of the routed
-`eigen`/`schur`/`svd`/`\` kernels; no separate LAPACK wrapper needed.
+`exp`, `sqrt`, `log` and `^` of a matrix, `sylvester`/`lyap`, `pinv`, `nullspace`, `rank`, `cond` and
+`factorize` are computed in Julia on top of the routed `eigen`/`schur`/`svd`/`\` kernels, so none of
+them needs a LAPACK wrapper of its own.
 
-## OpenBLAS fallthrough: ZERO
+## No OpenBLAS fallthrough
 
-**Every LAPACK symbol `LinearAlgebra` can `ccall` now forwards to PureBLAS after
-`activate()`** — including the auxiliaries (`larf`/`larfg`/`lacpy`), the driver internals
-(`gebrd`/`bdsqr`/`bdsdc`/`hseqr`/`trevc`/`gebak`/`sytrd`/`hetrd`/`orgtr`/`ormtr`), the
-combined and expert drivers (`gesv`, `posv`, **`gesvx`** with equilibration + iterative
-refinement + condition/error bounds), the reordering routines (`trexc`/`trsen`/**`tgsen`**,
-real *and* complex — the real path does the 2×2 conjugate-pair swap), **`trrfs`**,
-**`syconv`**, complex **`bdsqr`**, and the **rank-deficient generalized SVD** (`ggsvd`,
-all s/d/c/z). This is enforced by a machine-checkable ratchet test (`test/lbt_forward_tests.jl`)
-that enumerates every symbol the stdlib wraps and asserts the fallthrough count is **0**.
+Every LAPACK symbol `LinearAlgebra` can `ccall` forwards to PureBLAS after `activate()`. That includes
+the auxiliaries (`larf`/`larfg`/`lacpy`), the driver internals
+(`gebrd`/`bdsqr`/`bdsdc`/`hseqr`/`trevc`/`gebak`/`sytrd`/`hetrd`/`orgtr`/`ormtr`), the combined and
+expert drivers (`gesv`, `posv`, and `gesvx` with equilibration, iterative refinement and
+condition/error bounds), the reordering routines (`trexc`/`trsen`/`tgsen`, real and complex — the real
+path does the 2×2 conjugate-pair swap), `trrfs`, `syconv`, complex `bdsqr`, and the rank-deficient
+generalized SVD (`ggsvd`, all four types). A ratchet test (`test/lbt_forward_tests.jl`) enumerates
+every symbol the stdlib wraps and fails if the fallthrough count is anything but zero.
 
-The only two names excluded from the count are `cstev_`/`zstev_`, which are **not real LAPACK
-symbols** — they appear only in commented-out lines of the stdlib and have no OpenBLAS export.
+`cstev_` and `zstev_` are the only names left out of that count, and they are not real LAPACK symbols —
+they appear only in commented-out stdlib lines and have no OpenBLAS export.
 
 ## Summary
 
-- **Routing is complete** — every operation in the tables reaches PureBLAS after `activate()`, and every
-  one is numerically LAPACK-accurate. The ratchet gate above confirms zero OpenBLAS fallthrough.
-- **Performance is typically well ahead of both references but not yet uniformly so.** On the Zen4 sweep
-  the geomeans run ~1.0–2.4× across BLAS and the dense factorizations, and 36 of the 83 measured rows
-  clear `≥ max(OpenBLAS, AOCL)` at *every* size. The rest miss somewhere, usually narrowly. Which cells
-  and why: [Notes](notes.md).
-- **The second tier** — all eigensolvers (symmetric, Hermitian, nonsymmetric, generalized, Schur),
-  Sylvester/Schur-reordering, `gesvx`, generalized SVD, and the remaining factorizations (indefinite,
-  QL/RQ, RZ, pivoted Cholesky, banded/tridiagonal/packed, rank-deficient LS) — is routed and numerically
-  LAPACK-accurate, correctness-first; its `≥ max(OpenBLAS, AOCL)` gate is a scheduled follow-up campaign.
+Routing is complete. Every operation in the tables reaches PureBLAS after `activate()`, every one is
+numerically LAPACK-accurate, and the ratchet test above holds the OpenBLAS fallthrough at zero.
+
+Speed is usually ahead of both references, though not yet everywhere. On the Zen4 sweep the geomeans
+run about 1.0–2.4× across BLAS and the dense factorizations, and 36 of the 83 measured rows clear
+`max(OpenBLAS, AOCL)` at every size. The rest miss somewhere, mostly narrowly; [Notes](notes.md) says
+which cells and why.
+
+The eigensolvers (symmetric, Hermitian, nonsymmetric, generalized, Schur), Sylvester and Schur
+reordering, `gesvx`, the generalized SVD and the remaining factorizations (indefinite, QL/RQ, RZ,
+pivoted Cholesky, banded, tridiagonal, packed, rank-deficient least squares) are routed and
+LAPACK-accurate, but they were written correctness-first — gating them is a scheduled follow-up.
