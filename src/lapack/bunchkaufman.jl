@@ -1147,7 +1147,7 @@ end
 # A Preference still overrides, for calibration or to A/B the formula on an unseen box.
 #
 # THE FLEET SPLIT — this is the D-vs-M decision made by measurement, not by preference. Running the
-# same sweep on Zen3 (galen, W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
+# same sweep on Zen3 (Zen3, W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
 #
 #   sytrf F64, Zen3 PB/OB at the predicted nb:  1.44  1.47  1.37  1.24  1.17   (n=128…2048)
 #     gates at every size; argmax differs at n=128 (24: 1.58) and n=2048 (96: 1.19), worst loss 9%.
@@ -1183,7 +1183,7 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # matrix, and the comment below claiming "pinned (trim lands here)" was simply false.
     # Enforced by test/pin_lint.jl.
     # DUEL DELETED 2026-08-19 — it could select the arm this file documents as a MISS.
-    # Resolved across 6 fresh processes per box: galen 2,2,2,2,2,2 but wintermute 1,2,2,2,2,2 (C64)
+    # Resolved across 6 fresh processes per box: Zen3 2,2,2,2,2,2 but Zen4 1,2,2,2,2,2 (C64)
     # and 2,1,2,2,2,2 (C32). Every flip picked 1 — and the `catch` above returns 2 with the comment
     # "the safer default: 1 MISSES on Zen3". So the tuner's failure mode here was to occasionally
     # ship the value the source itself calls a miss, ~1 process in 6, silently. Same class as the
@@ -1192,9 +1192,9 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     # across both boxes). Pin `sytrf_cmult` to retune for a specific machine.
     # ⚠ 3, NOT 2 — GATE-MEASURED 2026-08-20 on all three boxes by forcing each arm through plots.jl:
     #     box          cmult=1   cmult=2   cmult=3
-    #     wintermute    1.034     1.011     1.060   (+4.8% over 2)
-    #     galen         1.087     1.082     1.115   (+3.0% over 2)
-    #     neuromancer   1.041     1.069     1.067   (-0.2%, a tie inside the noise floor)
+    #     Zen4    1.034     1.011     1.060   (+4.8% over 2)
+    #     Zen3         1.087     1.082     1.115   (+3.0% over 2)
+    #     Zen5   1.041     1.069     1.067   (-0.2%, a tie inside the noise floor)
     # 3 wins on two boxes and ties on the third; no box meaningfully prefers 2.
     #
     # THE PREVIOUS JUSTIFICATION FOR 2 WAS FALSIFIED. The `catch` above returns 2 with the comment

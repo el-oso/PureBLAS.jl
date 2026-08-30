@@ -5,7 +5,7 @@ kernels supernodal sparse Cholesky calls** (dense diagonal factor + off-diagonal
 solve + `syrk`/`gemm` Schur update) — fast on **both AVX2 (Zen3) and AVX-512 (Zen4/Zen5), all sizes**.
 
 ## Fleet & method (definition of done for every item)
-- Boxes: **wintermute Zen4/AVX-512**, **galen Zen3/AVX2**, **neuromancer Zen5/AVX-512**.
+- Boxes: **Zen4/AVX-512**, **Zen3/AVX2**, **Zen5/AVX-512**.
 - Per fix: **diagnose** (decompose + roofline, don't guess the bottleneck) → **fix** → **boost-locked A/B
   on all 3 boxes vs BOTH OB and AOCL** (`sudo bench/fleet_freqlock.sh lock`) → **suite green** → merge.
   One op at a time; re-measure the touched op into the caches after each fix.
@@ -28,8 +28,8 @@ has gaps the main plot doesn't show, plus its building blocks miss. Sub-items:
 
 | id | item | evidence | status |
 |----|------|----------|--------|
-| P0.1 | **F64-UPPER po2 aliasing** | ✅ **DONE** — whole-matrix pad at the generic-potrf entry (`_potrf_gen!`+`_potrf_needs_pad`, byte-scaled off `_L1_WAY_BYTES`; separate `padf` scratch). Fleet A/B: **Zen4/Zen5 (AVX-512) F64-U n≥192 all GATE** (n=512 0.72/0.78 vs 1.50 before; n=256 1.01/1.05 vs 1.64). **galen (AVX2) strict win** — pad on/off: n=256 2.44→1.51, n=512 1.73→0.99, n=1024 1.17→0.96, non-po2 neutral (fires only at po2, zero overhead regression). Also fixes F32-U + complex-U large-n. Gated F64-L faer path untouched. | task #77, committed |
-| Lever A | **F64-UPPER via faer-lower transpose (U=Lᵀ)** | ✅ **DONE** (supersedes P0.1's pad for F64-upper). Route ALL F64-upper through the gating faer LOWER kernels: transpose A-upper→scratch-lower (CACHE-BLOCKED 32×32 tile, else the strided cost is µarch-variable & regresses AVX2 large-n), `_potrf_f64_lower!`, transpose L→A-upper. Fleet OB/PB: **gates everywhere** except galen n=768 (0.96, unchanged) — n=128 **0.45–0.63→1.48–2.07**, n=256 0.67–0.99→1.09–1.80, n=512 0.99–1.38→1.05–1.58. Fixes the small-n floor (P0.3) + galen mid-n (P0.2-real). Only softening: galen n=1024/2048 ~1.0 vs P0.1 ~1.06 (within noise, uncommon supernode size). Correct 1e-5. | task #79 |
+| P0.1 | **F64-UPPER po2 aliasing** | ✅ **DONE** — whole-matrix pad at the generic-potrf entry (`_potrf_gen!`+`_potrf_needs_pad`, byte-scaled off `_L1_WAY_BYTES`; separate `padf` scratch). Fleet A/B: **Zen4/Zen5 (AVX-512) F64-U n≥192 all GATE** (n=512 0.72/0.78 vs 1.50 before; n=256 1.01/1.05 vs 1.64). **Zen3 (AVX2) strict win** — pad on/off: n=256 2.44→1.51, n=512 1.73→0.99, n=1024 1.17→0.96, non-po2 neutral (fires only at po2, zero overhead regression). Also fixes F32-U + complex-U large-n. Gated F64-L faer path untouched. | task #77, committed |
+| Lever A | **F64-UPPER via faer-lower transpose (U=Lᵀ)** | ✅ **DONE** (supersedes P0.1's pad for F64-upper). Route ALL F64-upper through the gating faer LOWER kernels: transpose A-upper→scratch-lower (CACHE-BLOCKED 32×32 tile, else the strided cost is µarch-variable & regresses AVX2 large-n), `_potrf_f64_lower!`, transpose L→A-upper. Fleet OB/PB: **gates everywhere** except Zen3 n=768 (0.96, unchanged) — n=128 **0.45–0.63→1.48–2.07**, n=256 0.67–0.99→1.09–1.80, n=512 0.99–1.38→1.05–1.58. Fixes the small-n floor (P0.3) + Zen3 mid-n (P0.2-real). Only softening: Zen3 n=1024/2048 ~1.0 vs P0.1 ~1.06 (within noise, uncommon supernode size). Correct 1e-5. | task #79 |
 | P0.2 | **F32 potrf Zen3** | generic recursion **1.24–1.78× slower** than OB at n=192–1024 on Zen3. F64-upper now fixed by Lever A; F32 has NO faer equivalent → needs a fused F32 base (Lever B). Open. | Lever B |
 | P0.3 | **potrf small-n (n=8/32/128)** | F64-upper n=128 FIXED by Lever A (→1.5–2.1). F32/complex small-n still on the generic recursion. | partly done (Lever A) |
 | P0.4 | **potrf n=2048 Zen5** | 0.98 vs AOCL (last-mile). | low |

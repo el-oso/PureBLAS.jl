@@ -24,7 +24,7 @@
 # ── _trtri_ip!: IN-PLACE blocked triangular inverse (dtrtri.f / dtrti2.f) ─────────────────────────
 # `_trtri!` in blas3/level3.jl is deliberately OUT-of-place: trsm calls it and needs its input intact.
 # For the standalone trtri/potri entries that is the wrong trade, and the gate shows it on both ends —
-# full-arms galen, PB/OpenBLAS, with the out-of-place version:
+# full-arms Zen3, PB/OpenBLAS, with the out-of-place version:
 #
 #   n        8     32     50    100    128    256    512   1000   1024   2048
 #   trtri  0.66   1.10   1.35   1.65   1.85   1.90   1.11   0.76   0.81   0.62

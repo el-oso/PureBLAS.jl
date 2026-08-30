@@ -96,7 +96,7 @@ const _L2_BYTES = let s = Int(cache_size(Val(2)))
     s > 0 ? s : 512 * 1024
 end
 
-# L3 TOTAL size in bytes. NOTE: CPUSummary.cache_size(Val(3)) returns a PER-CORE SHARE (wintermute: 2.67M),
+# L3 TOTAL size in bytes. NOTE: CPUSummary.cache_size(Val(3)) returns a PER-CORE SHARE (Zen4: 2.67M),
 # but L3 is shared — nc blocking wants the TOTAL. CpuId.cachesize()[3] gives the total (16M). Fallback 8M.
 const _L3_BYTES = @load_preference(
     "l3_bytes",
@@ -120,7 +120,7 @@ catch
     :Unknown
 end
 # CpuId.cpumodel()[:Family] is raw-packed (ext<<4 | base); display family adds ext only when base==0xF
-# (wintermute: raw 0xaf → 0xF + 0xA = 0x19 = Zen4; Zen5 = 0x1A). Baked to a const, Preferences-overridable.
+# (Zen4: raw 0xaf → 0xF + 0xA = 0x19 = Zen4; Zen5 = 0x1A). Baked to a const, Preferences-overridable.
 _display_family(raw::Integer) = (raw & 0x0F) == 0x0F ? Int(raw & 0x0F) + Int(raw >> 4) : Int(raw & 0x0F)
 const _CPU_FAMILY = @load_preference(
     "cpu_family",
@@ -136,7 +136,7 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # Hardware descriptor: the detected machine as a plain NamedTuple const (every field a load-time const →
 # the derivation functions below const-fold when called with `_HW`). The functions take a `hw` arg (not the
 # globals) so they are PURE and the fleet table is an offline unit test (test/autotune_tests.jl feeds
-# galen/Zen4/Zen5/TigerLake descriptors and asserts the measured optima). req#8.
+# Zen3/Zen4/Zen5/TigerLake descriptors and asserts the measured optima). req#8.
 const _HW = (
     simd = _SIMD_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
     vendor = _CPU_VENDOR, family = _CPU_FAMILY, nvreg = _NVREG,
@@ -164,7 +164,7 @@ const _ILP_TARGET = 16
 end
 # Below max(m,n,k) ≤ this, the single-row unpacked tile beats the full _MR·W-row tile (can't fill one full
 # tile of rows, so its 16-acc setup doesn't amortize). Criterion: the full tile's row height _MR·W. req#8
-# (was a bare 40). W=8 → 2·8=16 (routes n=32 to the full tile). NOTE: W=4 → 3·4=12, but galen measured
+# (was a bare 40). W=8 → 2·8=16 (routes n=32 to the full tile). NOTE: W=4 → 3·4=12, but Zen3 measured
 # gating at 40 — sweep/pin before trusting W=4 (see gemm.jl _GEMM_MR1_MAX).
 @inline _at_gemm_mr1_max(hw, ::Type{T} = Float64) where {T} = _at_gemm_mr(hw, T) * _lanes(hw, T)
 # (a) L1-resident block: a `unit`-element micro-operand per k-step stays in (num/den)·L1 across the sweep.
@@ -189,7 +189,7 @@ end
 # on AVX2 (16 regs) the _ILP_TARGET accumulators + load temps spill, AND small-n gemm there is already ≥1.0
 # via _GEMM_MR1_MAX — so it const-folds off on Zen3. Derived: S=2 (double ILP for the fill), cells=_ILP_TARGET÷S
 # arranged TALL (NR=2 → a B-reuse column pair; MR=cells÷NR), giving 4×2 on W=8. Validated n=32 0.85→1.07× OB
-# (wintermute Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
+# (Zen4); crossover ~n=56 (the wide tile self-fills beyond). req#8.
 # PDM: Literal — split-reduction factor, measured crossover ~n=56 on Zen4. TUNABLE.
 const _GEMM_SPLIT_S = 2
 @inline _at_gemm_split_ok(hw) = hw.nvreg >= 32 && hw.simd >= 64
@@ -201,14 +201,14 @@ const _GEMM_SPLIT_S = 2
 # WAS `(_split_mr + _MR)·W` = 48 on W=8, and its own comment said "fleet-validate before trusting" — it
 # never was. Gate-measured 2026-08-30, freq-locked, ABBA, pb-vs-pb, forcing cap 48 vs 64:
 #     box            cap A -> B    flipped cell   ratio    control spread   gate -> projected
-#     wintermute      48 -> 64      n=50           0.9244   0.985-1.004      0.905 -> 0.979
-#     neuromancer     48 -> 64      n=50           0.9628   0.993-1.002      0.878 -> 0.912  (3 reps)
-#     galen           28 -> 32      n=32           1.0002   0.995-1.005      0.974 -> 0.974  (3 reps)
+#     Zen4      48 -> 64      n=50           0.9244   0.985-1.004      0.905 -> 0.979
+#     Zen5     48 -> 64      n=50           0.9628   0.993-1.002      0.878 -> 0.912  (3 reps)
+#     Zen3           28 -> 32      n=32           1.0002   0.995-1.005      0.974 -> 0.974  (3 reps)
 # On each box exactly ONE gate size changes routing; every other size routes identically in both arms
 # and reads flat, which is what makes the delta readable at all.
 #
 # GALEN IS THE REASON THIS FORMULA AND NOT A W=8 LITERAL. No formula can give 64 on W=8 while leaving
-# galen at 28, because galen's `_MR` is 3 where W=8 has 2 — so any change here moves galen too, from 28
+# Zen3 at 28, because Zen3's `_MR` is 3 where W=8 has 2 — so any change here moves Zen3 too, from 28
 # to 32, which flips routing at its RED `gemm@32` (0.974). Measured: exactly neutral (1.0002). The
 # change is a real gain on both W=8 boxes and a no-op on AVX2, with no regression anywhere.
 #
@@ -236,10 +236,10 @@ const _GEMM_SPLIT_S = 2
 # only there. That criterion IS the datapath, so `_double_pumped` is the honest predictor rather than a
 # µarch lookup. Native-256 (Zen3) and native-512 (Zen5) parts both take the interleaved arm (4).
 # Measured, arms called directly at n=3e6 (bench/probes/axpy_arm_regime_ab.jl, µs, lower better):
-#   wintermute Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
-#   galen Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
+#   Zen4 double-pumped: arm4 3412  arm208 2821  → 208 by 17%
+#   Zen3 native 256:         arm4 3028  arm208 3146  → 4 (and at 6e6/12e6 too)
 # Zen5 predicts 4; unconfirmed (that box's frequency lock was not holding). Replaced a OncePerProcess duel
-# that resolved the 17%-slower arm on wintermute in 7 of 9 processes and flipped in the other 2.
+# that resolved the 17%-slower arm on Zen4 in 7 of 9 processes and flipped in the other 2.
 @inline _at_axpy_dram(hw) = _double_pumped(hw) ? 208 : 4
 # (c3) Real-axpy CACHE-BAND arm (L1 < ws < L3). SAME predicate, SEPARATE knob — do not merge them; the
 # two regimes are independently measured and simd_kernels.jl records what happened the last time one
@@ -251,7 +251,7 @@ const _GEMM_SPLIT_S = 2
 # Zen3 4. Zen5 also wants 4 — the narrow arm LOSES 0.6-1.4% there — and `_double_pumped` is what
 # separates Zen4 from Zen5, the two boxes with identical L3 and vector width. That inversion was read as
 # "not predictable from a detected const"; it is, just not from L3 or W.
-# NOTE (2026-08-19): a direct-call A/B probe measured the interleaved arm FASTER on wintermute at n=1e5
+# NOTE (2026-08-19): a direct-call A/B probe measured the interleaved arm FASTER on Zen4 at n=1e5
 # and n=1e6 (49.7 vs 52.8 µs, 815 vs 928 µs), contradicting the gate-regime numbers above. Not acted on
 # — the probe-regime rule says the in-situ gate measurement wins, and this knob's history is of probes
 # picking arms the gate then rejects. Unresolved; re-measure IN plots.jl before touching the value.
@@ -261,13 +261,13 @@ const _GEMM_SPLIT_S = 2
 # pays off if the machine can actually move it in one go, so narrow wins exactly when the REAL datapath
 # is no wider than 32 B — `_datapath_bytes`, which already folds the double-pump fact in.
 # MEASURED, 6 fresh processes per box (the duel is stable here, unlike the real-axpy pair):
-#   galen Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
-#   wintermute Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
-#   neuromancer Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
+#   Zen3       simd=32, dp=false → datapath 32 → narrow ... true  6/6 ✓
+#   Zen4  simd=64, dp=true  → datapath 32 → narrow ... true  6/6 ✓
+#   Zen5 simd=64, dp=false → datapath 64 → WIDE     ... UNMEASURED PREDICTION
 # ⚠ Zen5 is the one arm this formula CHANGES and the one nobody has measured. It agrees with what
 # simd_kernels.jl and test/Project.toml both already expect of a true-512-bit datapath ("a trim build
 # for a true-512-bit datapath should re-pin it"), but expectation is not measurement — verify on
-# neuromancer and demote this to a falsified-derivation literal if it disagrees.
+# Zen5 and demote this to a falsified-derivation literal if it disagrees.
 # NOTE `_double_pumped` alone is NOT the criterion: it would say Zen3 wants the wide arm, and Zen3
 # measures narrow 6/6. Only the datapath WIDTH separates the three correctly.
 @inline _at_zaxpy_narrow(hw) = _datapath_bytes(hw) <= 32
@@ -285,7 +285,7 @@ const _GEMM_SPLIT_S = 2
 # EVIDENCE (bench/probes/gemvt_route_window.jl — per-column ÷ blocked, same-process paired A/B through
 # the REAL `gemv!` entry, `reps` matched to plots.jl's `_L2REP` so the regime IS the gate's, THREE
 # INDEPENDENT PROCESSES per box, both freq-locked):
-#              wintermute Zen4          galen Zen3               neuromancer Zen5
+#              Zen4          Zen3               Zen5
 #     n=512    1.113                    0.953/0.964/0.973        1.043/1.032/1.041
 #              percol                   BLOCKED                  percol
 #     n=1024   1.254/1.248/1.238        1.013/1.027/1.016        0.865/0.903/0.912
@@ -295,17 +295,17 @@ const _GEMM_SPLIT_S = 2
 #     n=4096   0.683  blocked           --                       0.794  blocked
 #
 # EVERY PAIR OF BOXES DISAGREES AT SOME SIZE, and no detected const partitions them:
-#   * NOT L1 — wintermute and galen BOTH have 32 KiB L1 and want OPPOSITE arms at n=512. This was the
+#   * NOT L1 — Zen4 and Zen3 BOTH have 32 KiB L1 and want OPPOSITE arms at n=512. This was the
 #     last live derivation candidate (Zen4/Zen5 differ only in L1, so an L1 rule was arithmetically
-#     possible); galen kills it. Measured 2026-08-20, three processes, gate regime.
-#   * NOT L2 (galen 0.5 MiB vs 1 MiB), NOT L3 (32 vs 16 MiB), NOT SIMD width — wintermute and
-#     neuromancer share width 64 and disagree at n=1024.
+#     possible); Zen3 kills it. Measured 2026-08-20, three processes, gate regime.
+#   * NOT L2 (Zen3 0.5 MiB vs 1 MiB), NOT L3 (32 vs 16 MiB), NOT SIMD width — Zen4 and
+#     Zen5 share width 64 and disagree at n=1024.
 # So Zen4 -> 1, Zen5 -> 0 (must NOT take per-column at n=1024, ~10% there), Zen3 -> 0 (per-column loses
 # 3-5% at n=512 and 26% at n=2048; it wins only ~1.9% at n=1024, which mode 1 cannot buy without the
 # other two). `_double_pumped` encodes exactly that, and nothing more.
 #
 # ⚠ THE KNOB IS ALSO TOO COARSE, which the table makes obvious: the optimum is per-(box, SIZE), not
-# per-box. A single 3-valued mode cannot express "per-column at 1024 only", so galen leaves ~1.9% at
+# per-box. A single 3-valued mode cannot express "per-column at 1024 only", so Zen3 leaves ~1.9% at
 # n=1024 and Zen5 leaves ~3.9% at n=512 (task #160). Closing either needs a per-size route pin from
 # `tune!()` — a knob-SHAPE change, not another predicate.
 #
@@ -371,9 +371,9 @@ const _GEMM_SPLIT_S = 2
 # the blocked path wins. Hence `_NVREG`, not width or cache: it is a register-capacity crossover.
 # Measured with bench/calibrate.jl (stabilise + per-arm anchor + 8 rounds + `decide` requiring a CI
 # excluding 1.0 AND a 2% margin), each box freq-locked and verified, ratio vs the shipped 12:
-#   galen       nvreg=16  ->  8 0.990 | 16 0.988 | 20 0.946 | 24 0.860   => 12 (20 costs 5.4%)
-#   wintermute  nvreg=32  ->  8 0.979 | 16 1.004 | 20 1.068 | 24 1.016   => 20 (+6.8%)
-#   neuromancer nvreg=32  ->  8 0.982 | 16 1.002 | 20 1.082 | 24 1.001   => 20 (+8.2%)
+#   Zen3       nvreg=16  ->  8 0.990 | 16 0.988 | 20 0.946 | 24 0.860   => 12 (20 costs 5.4%)
+#   Zen4  nvreg=32  ->  8 0.979 | 16 1.004 | 20 1.068 | 24 1.016   => 20 (+6.8%)
+#   Zen5 nvreg=32  ->  8 0.982 | 16 1.002 | 20 1.082 | 24 1.001   => 20 (+8.2%)
 # Both 32-register boxes resolve 20 with a CI excluding 1.0; the 16-register box resolves 12 and would
 # LOSE 5.4% at 20 — so a flat 20 was not shippable and this is not a two-point fit.
 #
@@ -392,10 +392,10 @@ const _GEMM_SPLIT_S = 2
 # WHY: the measured optimum is per-(box, SIZE), and a 3-valued mode cannot express it (see (c5)). With
 # the bounds exposed, the window `A > AMIN && x <= XMAX` CAN express every measured optimum:
 #     box          needs                       vs default (A > L2, x <= L1/2)
-#     wintermute   AMIN=1 MiB,  XMAX=16 KiB    IS the default — already optimal, nothing to pin
-#     galen        AMIN=2 MiB,  XMAX=8 KiB     AMIN raised (excludes n=512), XMAX halved (excludes 2048)
-#     neuromancer  AMIN=1 MiB,  XMAX=4 KiB     XMAX quartered (percol at n=512 only)
-# Those two rows are worth ~1.9% (galen n=1024) and ~3.9% (Zen5 n=512, on a cell that gates 0.988).
+#     Zen4   AMIN=1 MiB,  XMAX=16 KiB    IS the default — already optimal, nothing to pin
+#     Zen3        AMIN=2 MiB,  XMAX=8 KiB     AMIN raised (excludes n=512), XMAX halved (excludes 2048)
+#     Zen5  AMIN=1 MiB,  XMAX=4 KiB     XMAX quartered (percol at n=512 only)
+# Those two rows are worth ~1.9% (Zen3 n=1024) and ~3.9% (Zen5 n=512, on a cell that gates 0.988).
 # They also need `gemvt_perscan = 1`, since both boxes ship mode 0.
 #
 # ⚠ THE VALUES ABOVE ARE NOT PINNED HERE AND MUST NOT BE. The Pin tier is the user's; `tune!()` is the
@@ -403,12 +403,12 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gemvt_percol_amin(hw) = hw.l2
 @inline _at_gemvt_percol_xmax(hw) = hw.l1 ÷ 2
 # (c6) Banded-Cholesky panel widths and crossovers. THE FLEET SPLITS BY VECTOR WIDTH, not by µarch:
-# resolved 6 fresh processes on each of three boxes (2026-08-19), wintermute Zen4 and neuromancer Zen5
-# agree on every row below and galen Zen3 differs on every one — and what wintermute/neuromancer share
+# resolved 6 fresh processes on each of three boxes (2026-08-19), Zen4 and Zen5
+# agree on every row below and Zen3 differs on every one — and what Zen4/Zen5 share
 # is simd=64, while `_double_pumped` SEPARATES them. Width is also the physically right unit here: a
 # panel width is counted in vector registers. Two independent AVX-512 boxes agreeing is what makes this
 # a criterion rather than the two-point fit that `zaxpy_narrow` and `ger_np` both punished today.
-#            knob            wm(Zen4)  neuro(Zen5)  galen(Zen3)
+#            knob            wm(Zen4)  neuro(Zen5)  Zen3(Zen3)
 #   pbtrf_nb      F32           8          8            16
 #   pbtrf_nb      C32/C64      32         32            24
 #   pbtrf_nb_small F32         16         16             8      (= exactly _lanes(hw, Float32))
@@ -427,7 +427,7 @@ const _GEMM_SPLIT_S = 2
 # (c7) Banded-LU / banded-Cholesky crossovers and the bidiagonalisation panel — same vector-width
 # criterion as (c6), same three-box evidence. Rows marked MODAL had one box flip; its 5-of-6 value is
 # used and named, so nobody has to re-derive where the number came from.
-#          knob                  wm(Zen4)  neuro(Zen5)  galen(Zen3)
+#          knob                  wm(Zen4)  neuro(Zen5)  Zen3(Zen3)
 #   gbtrf_cross  F32               48         48          64
 #   gbtrf_cross  F64               32         32          64  MODAL (64,64,48,64,64,64)
 #   gbtrf_cross  C64                8          8          16
@@ -435,7 +435,7 @@ const _GEMM_SPLIT_S = 2
 #   pbtrf_cross  C32               24 MODAL   24          16      (24,24,24,24,24,16)
 #   pbtrf_ucross F64              256        256         192  MODAL (192x4, 256, 192)
 #   brd_nb                          4          4           8      (= exactly 32 ÷ _lanes(hw, Float64))
-# NOT converted, deliberately: gbtrf_cross C32 is a true 3-3 TIE on wintermute (16,16,8,16,8,8) — not a
+# NOT converted, deliberately: gbtrf_cross C32 is a true 3-3 TIE on Zen4 (16,16,8,16,8,8) — not a
 # modal; pbtrf_cross F64 flips on ALL THREE boxes; pbtrf_ucross C64 flips on two. Those need the
 # offline tuner, not a scan.
 @inline _at_gbtrf_cross(hw, ::Type{Float32}) = _wide_simd(hw) ? 48 : 64
@@ -443,20 +443,20 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gbtrf_cross(hw, ::Type{ComplexF64}) = _wide_simd(hw) ? 8 : 16
 @inline _at_pbtrf_cross(hw, ::Type{Float32}) = _wide_simd(hw) ? 32 : 40
 @inline _at_pbtrf_cross(hw, ::Type{ComplexF32}) = _wide_simd(hw) ? 24 : 16
-# F64 does NOT follow the `l2 ÷ 4096` formula the F32/C32 siblings obey — galen measures 192 where the
+# F64 does NOT follow the `l2 ÷ 4096` formula the F32/C32 siblings obey — Zen3 measures 192 where the
 # formula says 128 — so it is an explicit table row, not folded in. Papering over that would make the
 # formula look more general than it is.
 @inline _at_pbtrf_ucross(hw, ::Type{Float64}) = _wide_simd(hw) ? 256 : 192
 
 # (c8) The last two convertible rows. WEAKER EVIDENCE THAN EVERYTHING ABOVE — labelled, not hidden.
-# gbtrf_cross C32: wintermute is a true 3-3 TIE across 6 processes (16,16,8,16,8,8) while neuromancer
-# and galen are both stably 16. So 16 does not overrule any box's stable measurement — it resolves a
+# gbtrf_cross C32: Zen4 is a true 3-3 TIE across 6 processes (16,16,8,16,8,8) while Zen5
+# and Zen3 are both stably 16. So 16 does not overrule any box's stable measurement — it resolves a
 # coin flip in favour of what the other two agree on, and 16 is one of the two values the tied box
 # itself returns. Note this row does NOT follow the width split its C64 sibling does (8 / 16); the
 # AVX-512 boxes disagree with each other here, which is exactly why it is a literal and not a formula.
 @inline _at_gbtrf_cross(hw, ::Type{ComplexF32}) = 16
 # pbtrf_cross F64: flips on ALL THREE boxes, so this is a MODAL-of-modals — the weakest thing shipped
-# in this campaign. wintermute 32 (5/6), neuromancer 32 (4/6), galen 36 (4/6). The modals do split by
+# in this campaign. Zen4 32 (5/6), Zen5 32 (4/6), Zen3 36 (4/6). The modals do split by
 # width, which is the only reason it is here rather than left to the tuner. Galen's candidates (36,40)
 # are not even in the same set as the other two boxes' (24,32), so do not read 32-vs-36 as one
 # crossover measured noisily — the ladders differ. Re-measure before trusting this on a new µarch.
@@ -485,17 +485,17 @@ const _GEMM_SPLIT_S = 2
 # microkernel's accumulator working set stays register-bound; it loses once the packed kernel's contiguous
 # reuse amortizes. Base quantity = the FP register file's accumulator capacity in elements:
 #   _acc_cap = (nvreg − 4)·W,  where 4 = the k-step's operand registers (MR A-loads + 1 B-broadcast; the same
-#   budget `_at_gemm_mr` reserves — galen's 3×4 tile uses all 16 regs: 12 acc + 3 A + 1 B). Op multiples are
+#   budget `_at_gemm_mr` reserves — Zen3's 3×4 tile uses all 16 regs: 12 acc + 3 A + 1 B). Op multiples are
 #   machine-INDEPENDENT op-shape calibration (like `_l1_block`'s ½, `_at_gemm_mc`'s 3/10): gemm pays 2 passes
 #   (read+write) to pack → ×2; rank-k's re-stream alternative is recursion (2×-flop diagonal + split overhead)
-#   so it packs slightly earlier → ×7/4. Reproduces galen (nvreg16,W4): gemm 96 (measured tie-band 80–112),
+#   so it packs slightly earlier → ×7/4. Reproduces Zen3 (nvreg16,W4): gemm 96 (measured tie-band 80–112),
 #   rank-k 84 (routes n=80→recursion, 96→packed). req#8.
 # PATH-DEPENDENT crossover (the ×7/4·acc_cap form was calibrated for the AVX2 MULTI-pack `_trgemm_packed!`,
 # whose double-A-pack keeps the recursion competitive to ~84). AVX-512 uses the UNIFIED single-pack
 # `_trgemm_packed_u!` (half the pack traffic, 8 well-fed accumulators, mirror `_unified_ok`: W≥8 && W==NR),
 # whose real crossover is ≈W — the recursion's 2×-flop diagonal waste + per-call overhead loses from ≈W up.
 # The 392 the old formula gave on AVX-512 (mis)routed all n≤256 to the recursion → the syrk n=128 gate miss
-# (Zen5 0.88 / Zen4 0.91); packed is +14% there (→~1.04). Fleet-validated: AVX-512 → W, galen AVX2 → 84.
+# (Zen5 0.88 / Zen4 0.91); packed is +14% there (→~1.04). Fleet-validated: AVX-512 → W, Zen3 AVX2 → 84.
 @inline _acc_cap(hw, ::Type{T} = Float64) where {T} = (hw.nvreg - 4) * _lanes(hw, T)
 @inline _at_gemm_unpack_max(hw, ::Type{T} = Float64) where {T} = 2 * _acc_cap(hw, T)
 @inline function _at_rank_k_pack_cut(hw, ::Type{T} = Float64) where {T}
@@ -505,7 +505,7 @@ end
 # ONE PRODUCT vs TWO — why syrk does NOT share the cut above on the multi-pack path.
 #
 # The ×7/4·acc_cap form was calibrated for syr2k's shape and then reused for syrk on the stated grounds
-# that both are "the same REGISTER-capacity criterion". Measured on galen 2026-08-28 (full-arms, boost
+# that both are "the same REGISTER-capacity criterion". Measured on Zen3 2026-08-28 (full-arms, boost
 # locked, PB/AOCL, 8 rounds, ABBA-rotated), forcing each op's cut to route n either way:
 #
 #         n=8            n=32           n=50
@@ -525,7 +525,7 @@ end
 # below parity while syrk (one product) mostly gates".
 #
 # So syrk's multi-pack crossover is 2W: the unified path's is W (validated fleet-wide, the 392->W fix),
-# and multi-pack packs A twice for the same work, so amortization needs about twice the rows. On galen
+# and multi-pack packs A twice for the same work, so amortization needs about twice the rows. On Zen3
 # that is 8, which routes n=8 to the recursion (correct: it wins there by 3.5%) and n>=32 to packed.
 # HONEST LIMIT: the benchmark's L3 size list jumps 8 -> 32, so the crossover is bracketed to (8, 32] and
 # NOT pinned inside it. Every value in [8,31] routes the measured sizes identically; 2W is chosen for the
@@ -536,12 +536,12 @@ end
 end
 # symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
 # copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
-# packed symmetric kernel at EVERY measured galen n (the packed path is dead weight on AVX2), and the only
+# packed symmetric kernel at EVERY measured Zen3 n (the packed path is dead weight on AVX2), and the only
 # thing that can kill it is the O(n²) copy evicting the gemm's resident A-block from L2 — i.e. when the
 # materialized n×n copy no longer fits L2. Threshold = side of a square that fills L2: n = √(L2/sizeof). Galen
 # measured a mat≈pack TIE at exactly n=256 = √(512K/8), pinning the fraction at 1. This lifts the cut off the
 # mistuned 96 (which routed n=112–192 to the slower packed path, the AOCL misses) up to 256, routing the whole
-# gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on wintermute). req#8.
+# gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on Zen4). req#8.
 @inline _at_symm_mat_max(hw, ::Type{T} = Float64) where {T} = Base.isqrt(hw.l2 ÷ sizeof(T))
 
 # ── PDM "Measure" tier: the estimator ───────────────────────────────────────────────────────────────
@@ -602,7 +602,7 @@ Should a candidate at time `t` displace the incumbent at `best`? Only if it wins
 WHY A MARGIN AND NOT `<`. A plain `t < best` switches on noise: when two candidates are within the
 probe's resolution the winner is whichever got the luckier window, so the pick changes from process to
 process — and since these knobs select a SHIPPED kernel, the emitted code then varies run to run.
-MEASURED on neuromancer (Zen5), 2026-08-05: two fresh processes of the SAME binary resolved the axpy
+MEASURED on Zen5, 2026-08-05: two fresh processes of the SAME binary resolved the axpy
 DRAM knob to 208 and to 4. That is not a tuning result, it is a coin flip that changes what executes, and
 it feeds straight back into the run-to-run variance that makes that box hard to measure at all.
 5% is above the probes' resolution on every fleet box and far below the gaps worth switching for (the
@@ -618,7 +618,7 @@ phase body won Zen4 by ~11% at n=1e6). Ties therefore go to the INCUMBENT, which
 # any machine. A sweep runs one duel PER CANDIDATE, so what governs whether a knob is stable is the
 # FAMILY-WISE rate `ncand·(rounds+1)/2^rounds`. Solve that for `rounds` and the constant disappears.
 #
-# Measured consequence of getting this wrong (2026-08-06, wintermute, one knob per fresh process, 5
+# Measured consequence of getting this wrong (2026-08-06, Zen4, one knob per fresh process, 5
 # rounds throughout): `cgemvn_nc_big` (2 candidates) and `ger_np` (3) came out STABLE while `axpy_band`
 # (6) and `axpy_dram` (4) still flipped. The instability tracked CANDIDATE COUNT — the signature of a
 # multiple-comparisons error, not of a noisy machine, and the reason a single global round count was
@@ -746,7 +746,7 @@ Each round reduces BOTH arms with the MEDIAN of `reps` timings, then records ONE
 order alternates per round (ABBA). One untimed warmup of each runs first.
 
 WHY THIS REPLACES A MARGIN ON TWO MEDIANS. The old rule compared one median against one median and
-demanded a fixed 5% win. Measured 2026-08-06 (wintermute, freq-locked, quiet): the complex gemvN NC
+demanded a fixed 5% win. Measured 2026-08-06 (Zen4, freq-locked, quiet): the complex gemvN NC
 pair differs by a stable ~3-4%, which sits just under that threshold, so NOISE decided whether it
 cleared — four fresh processes of the same binary resolved the knob to 8, 12, 8, 8. The threshold did
 not prevent the coin flip, it *caused* it, by putting the decision boundary inside the noise band.
@@ -781,7 +781,7 @@ function _tune_duel(
     # ⚠ TWO DIFFERENT QUESTIONS, AND δ ANSWERS ONLY THE SECOND. "Is the candidate faster?" is EVIDENCE
     # and is settled by the sign count. "Is it faster by enough to be worth changing the shipped
     # kernel?" is POLICY and is settled by δ. Testing δ inside each round conflates them, and that
-    # conflation rejected a real win: measured 2026-08-07 on wintermute, freq-locked and quiet, the
+    # conflation rejected a real win: measured 2026-08-07 on Zen4, freq-locked and quiet, the
     # axpy DRAM candidate 208 beats the incumbent by 5.6% pooled, but its PER-ROUND ratios ran
     # 1.015 1.004 1.116 1.100 — two rounds under 2%, so a per-round δ=2 scored them as losses and the
     # supermajority then refused a candidate that is 5.6% faster. Six fresh processes all resolved to
@@ -940,7 +940,7 @@ end
 # reproducible win. The motivating case was the complex gemvN NC knob, where the 5% margin discards a
 # measured 3.9% (W vs 3W/2 at A≈L3 on Zen4).
 #
-# MEASURED on wintermute, freq-locked, quiet box, at the knob's own probe shape (1024², A≈L3), sweeping
+# MEASURED on Zen4, freq-locked, quiet box, at the knob's own probe shape (1024², A≈L3), sweeping
 # k ∈ {9,15,21} and legs of r ∈ {1,5,15} calls — null (an arm against ITSELF), power (3W/2 over W) and
 # reverse (W over 3W/2), all in one run:
 #     r=1    null up to 6/15, power 4/15   → null and power OVERLAP at every k

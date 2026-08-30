@@ -56,7 +56,7 @@ end
 const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the decline on all 3 µarchs
 # The fused NB-column panel beats per-column at EVERY size where AP is streaming-bound — its real win is AP
 # STREAM PREFETCHABILITY (NB contiguous per-column bases → the HW prefetcher locks onto long sequential runs),
-# NOT x/y amortization. Measured galen/AVX2 (locked, direct A/B): the per-column path caps at ~33 GB/s (40%
+# NOT x/y amortization. Measured Zen3/AVX2 (locked, direct A/B): the per-column path caps at ~33 GB/s (40%
 # of the ~80 GB/s single-core L3 roofline) once AP spills L2, while the panel holds ~64–70 GB/s (1.7–2.1× at
 # n=256..2048). Gate-validated dip removal: spmv n=1024 1.00→1.98, whole curve flat ~2.0, no regression.
 # (The old "n=512 −18%" note was the PRE-de-box panel paying a per-panel `Core.Box` heap alloc; that setup

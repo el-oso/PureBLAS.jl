@@ -24,11 +24,11 @@ table carries one column per box, each from that box's own `bench/plots.jl` swee
 
 The dev fleet, gated independently (tuning for one µarch does not transfer):
 
-| µarch | host | ISA | role |
-|---|---|---|---|
-| Zen4 | `wintermute` | double-pumped AVX-512 | primary tuning target |
-| Zen3 | `galen` | AVX2, 16 ymm registers | hardest target |
-| Zen5 | `neuromancer` | native 512-bit AVX-512 | disjoint residual profile |
+| µarch | ISA | role |
+|---|---|---|
+| Zen4 | double-pumped AVX-512 | primary tuning target |
+| Zen3 | AVX2, 16 ymm registers | hardest target |
+| Zen5 | native 512-bit AVX-512 | disjoint residual profile |
 
 ## Measurement
 
@@ -122,18 +122,3 @@ OpenBLAS, AOCL-BLIS `dgemm` matches it and AOCL-libFLAME `potrf`/`geqrf` meet or
 vs 30 GFlops). It is a *mixed* competitor rather than uniformly tougher — its `geqrf` beats OpenBLAS
 while its `getrf` trails it — and it is tuned first for multi-threaded EPYC, so on these single-thread
 Zen parts it is a fair-but-not-dominant baseline.
-
-## A way these numbers went wrong once
-
-Worth recording, because the failure was silent and the fix is now part of the harness.
-
-`bench/plots.jl` merges its cache one arm at a time. That meant an A/B run with a
-`PUREBLAS_FORCE_<knob>` variable still exported would save its deliberately non-default PureBLAS arm
-alongside reference arms measured in some other run, and every render afterwards republished that as the
-gate number. The Zen5 `gemvT` n=256 cell was published at 0.751 on that basis; measured properly with
-all three arms in one run it is 1.09, and setting `PUREBLAS_FORCE_gemvt_deep=0` reproduces the bad
-record exactly. `gemvT` n=128 and `trmv` n=256 came from the same source.
-
-`save_cache` now refuses to write while any `PUREBLAS_FORCE_*` is set, so a forced run cannot
-contaminate the cache. The corrections did not all flatter PureBLAS: `ztrsv` on Zen4 went from 0.991 to
-0.865, and `ger` on Zen5 from 0.996 to 0.896.

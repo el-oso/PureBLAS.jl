@@ -250,7 +250,7 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   source parity by md5. Do not `rsync src/` to a fleet box, and do not hand-roll an `ssh … git reset`.
   **Why:** rsync copies the code but not its identity. `bench/plots.jl` stamps `commit=` into every
   cache header from `git rev-parse`, so an rsync'd box benchmarks new code while claiming its old
-  HEAD. On 2026-07-31 galen emitted a full gate sweep stamped `commit=ac96c00` while actually running
+  HEAD. On 2026-07-31 Zen3 emitted a full gate sweep stamped `commit=ac96c00` while actually running
   the tree from `78eafc7` — 13 commits and two perf fixes later. The numbers were fine, but the
   provenance in the published coverage table was false and **nothing in the artifact revealed it**;
   it was caught only by manually md5-ing both trees. A benchmark cache is evidence, and evidence needs

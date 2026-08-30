@@ -54,7 +54,7 @@ end
     end
 end
 
-# THE PIN IS NOT THE CLOCK. On 2026-08-23 neuromancer read min==max==2000000 with boost=0 and ran
+# THE PIN IS NOT THE CLOCK. On 2026-08-23 zen5 read min==max==2000000 with boost=0 and ran
 # every measured cell at ~4.8 GHz anyway (drifted pstate driver), inflating a whole op's ratios by
 # 2.43x against references taken at 1.98 GHz. `require_lock` cannot see that — only a sample taken
 # UNDER LOAD can — so `check_achieved` is a separate gate and needs its own must-say-NO fixture.
@@ -64,7 +64,7 @@ end
     if hi > 0                       # skip where there is no cpufreq to reason about
         @test isnothing(FreqLock.check_achieved(hi))                 # exactly at the ceiling: fine
         @test isnothing(FreqLock.check_achieved(round(Int, hi * 1.02)))  # within tolerance: fine
-        @test_throws ErrorException FreqLock.check_achieved(round(Int, hi * 2.4))  # the neuromancer case
+        @test_throws ErrorException FreqLock.check_achieved(round(Int, hi * 2.4))  # the zen5 case
     end
     @test isnothing(FreqLock.check_achieved(0))                      # nothing sampled: do not assert
     withenv("PUREBLAS_BENCH_NOLOCK" => "1") do

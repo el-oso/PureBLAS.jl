@@ -15,13 +15,13 @@
 # is WIDTH-ADAPTIVE (keyed on the Float64 lane count as an ISA proxy), Preferences-overridable per
 # host (the fleet calibration knob — see ROADMAP M7/Zen3 tuning):
 #   W64=8  AVX-512, 32 zmm : 2×8 = 16 accs  (Zen4/Zen5 — the tuned sweet spot, UNCHANGED)
-#   W64=4  AVX2,     16 ymm: 3×4 = 12 accs  (Zen3/galen — 2×8 spilled; 3×4 gates, galen-swept 2026-07-02)
+#   W64=4  AVX2,     16 ymm: 3×4 = 12 accs  (Zen3/Zen3 — 2×8 spilled; 3×4 gates, Zen3-swept 2026-07-02)
 #   W64=2  NEON,     32 regs: 2×8            (placeholder; tune on M5 later)
 # ponytail: per-width defaults below; override via Preferences "gemm_mr"/"gemm_nr" to sweep.
 const _W64 = _vwidth(Float64)
 # req#8: derived from detected hardware (cpuinfo.jl `_at_gemm_*`). Reproduce the fleet's tuned literals —
-# MR/NR: galen 3/4, Zen4/Zen5 2/8 (behavior-preserving, was `_W64==4 ? …`). KC/MC/NC: Zen4 256/144/2040
-# (bit-identical), galen 512/72/2044, Zen5 384/96/1360 — the KC=512 raises galen's B-micropanel from ¼ to
+# MR/NR: Zen3 3/4, Zen4/Zen5 2/8 (behavior-preserving, was `_W64==4 ? …`). KC/MC/NC: Zen4 256/144/2040
+# (bit-identical), Zen3 512/72/2044, Zen5 384/96/1360 — the KC=512 raises Zen3's B-micropanel from ¼ to
 # ½ L1 (the "AVX-512-tile-on-AVX2" residency miss). Real-path (Float64/_NR); complex gemm uses `_CKC`.
 # PDM: Derived — formula over detected consts: `_at_gemm_mr(_HW)`
 const _MR = @load_preference("gemm_mr", _at_gemm_mr(_HW))::Int
@@ -36,7 +36,7 @@ const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block �
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
 # Short-k split-reduction tile (cpuinfo.jl `_at_gemm_split_*`): tall _SMR·W×_SNR tile, S-way k-split, for the
 # small-n window where the wide tile under-fills. _SPLIT_OK const-folds the whole path off on AVX2 (already ≥1.0
-# there via _GEMM_MR1_MAX; would spill). req#8; measured n=32 0.85→1.07× OB (wintermute).
+# there via _GEMM_MR1_MAX; would spill). req#8; measured n=32 0.85→1.07× OB (Zen4).
 const _SPLIT_OK = _at_gemm_split_ok(_HW)
 const _SMR = _at_gemm_split_mr(_HW)
 const _SNR = _at_gemm_split_nr(_HW)
@@ -451,7 +451,7 @@ function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int
             else
                 # op(B)=B: B[gp, j0+c] — the contiguous B direction is down a column (p), so loop c-outer/
                 # p-inner: each read-stream is one sequential B column (1 stream vs nr strided), stores
-                # scatter into the hot Bp panel. Measured 1.3–1.35× faster pack than p-outer (galen).
+                # scatter into the hot Bp panel. Measured 1.3–1.35× faster pack than p-outer (Zen3).
                 for c in 0:(nr - 1)
                     j = j0 + c
                     @simd ivdep for p in 0:(kce - 1)
@@ -494,7 +494,7 @@ end
 # ── Direct-B microkernels (op(B)=B, no B-pack) ───────────────────────────────────────────────
 # A comes from the packed panel (contiguous, PMR vectors/k-step, VR live rows), but B is read STRAIGHT
 # from the user array: B[pc+p, jc+jr+j] = Bc + p + j·ldb — contiguous in the k-index p (col-major B), so
-# op(B)=B needs NO pack. Eliminates the entire B-pack pass (measured: n=192 0.93→0.98 vs AOCL on galen).
+# op(B)=B needs NO pack. Eliminates the entire B-pack pass (measured: n=192 0.93→0.98 vs AOCL on Zen3).
 # alpha is folded in the A-pack (as for _microkernel!), so no alpha here. VR<PMR ⇒ clip (no mask).
 @generated function _microkernel_db!(
         C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bc::Ptr{T}, ldb::Int, kc::Int,
@@ -779,10 +779,10 @@ end
 # it wins while the accumulator working set stays register-bound and loses once the blocked-direct-B path's
 # contiguous reuse amortizes. DERIVED (req#8) from the register file via `_at_gemm_unpack_max` = 2·(nvreg−4)·W
 # — a REGISTER-capacity criterion, not L2 residency (Zen4's crossover puts one operand at 1.6 MB ≫ L2, so
-# L2-residency is falsified; see cpuinfo.jl). Reproduces galen 96 (measured unpk/blk tie-band 80–112) and
+# L2-residency is falsified; see cpuinfo.jl). Reproduces Zen3 96 (measured unpk/blk tie-band 80–112) and
 # Zen4/Zen5 448 (the validated literal, EXACT); overridable "gemm_unpack_max". ponytail: crude max() heuristic;
 # a rectangular A (m·k fits but n huge) would also prefer unpacked — refine to an A-fits-registers test if
-# skewed shapes matter. (n=128+ route to blocked-direct-B; measured galen best=blk from ~128.)
+# skewed shapes matter. (n=128+ route to blocked-direct-B; measured Zen3 best=blk from ~128.)
 # PDM: Derived — formula over detected consts: `_at_gemm_unpack_max(_HW)`
 const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max(_HW))::Int
 # `_EXPINT[2]` shifts the cut (its `_EXPINT[4]` witness was stripped once the campaign landed) — both
@@ -1006,7 +1006,7 @@ end
 # Small-n unpacked driver with SINGLE-vector (W-row) tiles: below the full tile's row height (_MR·W) the
 # matrix can't fill one full tile of rows, so its 16-acc setup doesn't amortize over short k. Same masked/
 # edge kernels, Val(1) rows. DERIVED (req#8, was a bare 40): _at_gemm_mr·W → W=8=16 (measured: full tile now
-# beats mr1 at n=32, 0.833→0.860). W=4→12: sweep-validate galen (measured 40) or pin "gemm_mr1_max"=40 there.
+# beats mr1 at n=32, 0.833→0.860). W=4→12: sweep-validate Zen3 (measured 40) or pin "gemm_mr1_max"=40 there.
 # PDM: Derived — formula over detected consts: `_at_gemm_mr1_max(_HW)`
 const _GEMM_MR1_MAX = @load_preference("gemm_mr1_max", _at_gemm_mr1_max(_HW))::Int
 function _gemm_unpacked_mr1!(
@@ -1052,7 +1052,7 @@ end
 # Tall split-reduction microkernel: MR row-blocks × NR cols, S independent partial accumulators per cell,
 # summed at store — keeps MR·NR·S (=_ILP_TARGET) chains live from k=0 to cover the short-k fill the wide
 # tile leaves exposed. Full tile only (mr rows × NR cols, all in bounds); partials delegate to the wide
-# masked/edge kernels. Same store/beta folding as _microkernel_unpacked!. req#8; wintermute n=32 0.85→1.07×.
+# masked/edge kernels. Same store/beta folding as _microkernel_unpacked!. req#8; Zen4 n=32 0.85→1.07×.
 @generated function _microkernel_unpacked_split!(
         C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T,
@@ -1352,7 +1352,7 @@ end
 # 2 accumulators/tile ⇒ HALVE the real tile dims for register pressure (_CMR/_CNR, overridable).
 # Register budget per tile: 2·CMR·CNR (Cr,Ci accs) + 2·CMR (ar,ai) + 2 (br,bi) ≤ (vector registers).
 # W=8 AVX-512 (32 regs): 2×4 = 16 accs (Zen4/5). W=4 AVX2 (16 ymm): 1×6 = 12 accs + 2 + 2 = 16, an
-# EXACT fit — galen-swept 2026-07-02 (CNR=6 beat 4 at large n: more independent chains saturate the
+# EXACT fit — Zen3-swept 2026-07-02 (CNR=6 beat 4 at large n: more independent chains saturate the
 # FMA ports; CMR=2 or CNR=8 spill AVX2 and tank to ~0.5–0.67). Same 12-acc AVX2 lesson as real gemm.
 # PDM: Derived — formula over detected consts: `_W64 == 4 ? 1 : 2`
 const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
@@ -1360,7 +1360,7 @@ const _CMR = @load_preference("cgemm_mr", _W64 == 4 ? 1 : 2)::Int
 const _CNR = @load_preference("cgemm_nr", _W64 == 4 ? 6 : 4)::Int
 # Narrower nr for mid-small n: nr=6 doesn't divide most n → the last column-panel wastes compute on
 # masked (padded) columns. nr=4 divides 8,16,20,24,28,32,40,48,64 cleanly → no column masking; it trades
-# ~2 accumulator chains (worse large-n) for no-waste (better mid-small). W=4/AVX2 only (galen-swept:
+# ~2 accumulator chains (worse large-n) for no-waste (better mid-small). W=4/AVX2 only (Zen3-swept:
 # nr=4 lifts n=20 0.71→0.79, n=32 0.78→0.86); on W=8 mid-small is the unpacked path's job → _CNR_SMALL
 # == _CNR makes the size branch a no-op. Crossover ≈ n=64.
 # PDM: Derived — formula over detected consts: `_W64 == 4 ? 4 : _CNR`
@@ -1369,7 +1369,7 @@ const _CNR_SMALL = @load_preference("cgemm_nr_small", _W64 == 4 ? 4 : _CNR)::Int
 const _CGEMM_NRSMALL_MAX = @load_preference("cgemm_nrsmall_max", _W64 == 4 ? 64 : 0)::Int
 # req#8: complex contraction block — the SPLIT of real _KC (BLIS stores kc per datatype). Complex B
 # micropanel is kc·nr·sizeof(ComplexF64) ≤ ½·L1; key on max(_CNR,_CNR_SMALL) so the small-nr branch
-# under-fills L1 (never overflows). Reproduces Zen4 256 (old _KC, complex path bit-identical); galen 168,
+# under-fills L1 (never overflows). Reproduces Zen4 256 (old _KC, complex path bit-identical); Zen3 168,
 # Zen5 384. Used at the complex-packed sites (_gemm_cmplx_impl!, _trgemm_cmplx_packed*, _hemm_packed_L!).
 # PDM: Derived — formula over detected consts: `_l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL`
 const _CKC = @load_preference("cgemm_kc", _l1_block(_HW, ComplexF64, max(_CNR, _CNR_SMALL)))::Int
@@ -1381,8 +1381,8 @@ const _CGEMM_TINY = @load_preference("cgemm_tiny", 6)::Int
 # _CGEMM_TINY < max(m,n,k) ≤ this (and tA='N'): the UNPACKED tiny-n path. W=8: unpacked (skip pack,
 # free MR) beats blocked broadly on Zen4/32-reg → 192. W=4/AVX2: unpacked's per-panel re-deinterleave
 # loses to the vectorized-pack blocked path by n≈16, and the CNR=6 tile + deinterleave temp spill, so
-# only the tiniest n win → 12. Above this, blocked (with vectorized packs). galen-swept 2026-07-02.
-# AVX2: the unpacked direct-read complex kernel BEATS the blocked path through n≈40 (measured galen:
+# only the tiniest n win → 12. Above this, blocked (with vectorized packs). Zen3-swept 2026-07-02.
+# AVX2: the unpacked direct-read complex kernel BEATS the blocked path through n≈40 (measured Zen3:
 # n=16 1.20 vs 1.00, n=24 1.06 vs 0.94, n=32 0.99 vs 0.94, n=40 0.99 vs 0.97) — no pack/scratch overhead
 # while A·B still fit L1. It collapses at n=48 (0.68, no cache blocking), but 3M (_CGEMM_3M_MIN=48) owns
 # n≥48, so 40 is a clean handoff (41-47 → blocked ~0.97, ungated). Was 12 (far too conservative). This
@@ -1405,7 +1405,7 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 # ALGEBRAIC, and the split/combine cost is O(n²) against O(n²·k) of product, which is exactly what the
 # MIN/MAX/KMIN window already bounds. So the width test was an artefact of only ever having measured
 # W=4, and removing it DELETES a datapath-gated literal rather than adding a knob.
-# Measured on wintermute (Zen4, W=8, freq-locked, in-process ABBA, 3m/base — bench/probes/sk2_*.jl):
+# Measured on Zen4 (Zen4, W=8, freq-locked, in-process ABBA, 3m/base — bench/probes/sk2_*.jl):
 #     n        32*     64      128     256     512     1024    2048    4096*
 #     zgemm    0.999   0.872   0.797   0.787   0.818   0.801   0.800   1.002
 # (* = window-edge CONTROLS, outside MIN=48 / MAX=2048; both tie with relerr exactly 0, which is what
@@ -1457,7 +1457,7 @@ const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # misses fleet-wide (so this buys margin, not a rescue), with Zen5 unmeasured — and [[152]] is the
 # standing precedent that a 3M-family threshold INVERTED on AVX-512 and lost 21-29%. Shipping a
 # Zen4-shaped default into an unmeasured Zen5 is how that regression happened.
-# AND IT DOES NOT REPRODUCE. A second correctness-checked probe run on the SAME box (wintermute, same
+# AND IT DOES NOT REPRODUCE. A second correctness-checked probe run on the SAME box (Zen4, same
 # probe, same shapes, hours apart) read n=512 -> 1.0022 and n=1024/n=2048 -> best = SHIPPED (1.0000),
 # against the first run's 1.0230 / 1.0235. Same silicon, opposite verdict: the "+2.3%" was run-to-run
 # variation, not an effect. Two runs disagreeing on one box is worth more than either run alone, and it
@@ -1477,10 +1477,10 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 #
 # ONLY REACHABLE ON NATIVE AVX-512. The pad arm needs a high recursion depth, which needs a low
 # `strassen_min`, and `_at_strassen_min` (cpuinfo.jl:365) gives 256 only when `_datapath_bytes >= 64`.
-# Zen4 double-pumps so its datapath reads 32 -> 1024, same as AVX2. Checked on wintermute: trmm n=2100
-# takes D=1 on an even dimension, so nothing pads and this knob is a NO-OP there and on galen.
+# Zen4 double-pumps so its datapath reads 32 -> 1024, same as AVX2. Checked on Zen4: trmm n=2100
+# takes D=1 on an even dimension, so nothing pads and this knob is a NO-OP there and on Zen3.
 #
-# GATE-MEASURED on neuromancer (Zen5), freq-locked, ABBA, pb-vs-pb (reference arm cancels):
+# GATE-MEASURED on Zen5, freq-locked, ABBA, pb-vs-pb (reference arm cancels):
 #     op    n=2100 t(nopad)/t(pad)   gate now -> projected
 #     trmm      0.782                 0.841 -> 1.076   RED -> PASS
 #     trsm      0.787                 0.871 -> 1.107   RED -> PASS
@@ -1926,7 +1926,7 @@ function _gemm_cmplx_blocked!(
     )
     # Size-adaptive tile width: mid-small n use a narrower nr (fewer column-mask waste tiles, since nr=6
     # doesn't divide most n), large n use the wider register-optimal nr. No-op where _CNR_SMALL==_CNR
-    # (W=8: small n is handled by the unpacked path, blocked only sees large n). galen-swept 2026-07-02.
+    # (W=8: small n is handled by the unpacked path, blocked only sees large n). Zen3-swept 2026-07-02.
     ac = convert(eltype(C), alpha)
     a1 = isone(ac)              # alpha==1 ⇒ pure interleave store (no multiply)
     ar = iszero(imag(ac))       # alpha REAL (incl. −1, the subtract) ⇒ scale-only store (2 muls, no cross)
@@ -1953,7 +1953,7 @@ end
 # F32; only 3.3% at n=512). The packs are now vectorized: A's de-interleave is a contiguous Vec{2W}
 # load + shuffle (`_pack_A_cmplx_simd!`, used by `_pack_A_cmplx!`), B's is an `@simd ivdep` split into
 # the contiguous BpR/BpI panels. Structure stays blocked (pack B ONCE, reuse) — streaming B instead
-# was tried and LOST (re-reads B per row-tile: ~0.45 on galen). Complex `_scale_C!` is vectorized too.
+# was tried and LOST (re-reads B per row-tile: ~0.45 on Zen3). Complex `_scale_C!` is vectorized too.
 
 # Deinterleave a Vec{2W} [r i r i…] into (reals, imags) via one shuffle each (indices fold at compile).
 @inline @generated function _deint_cmplx(av::Vec{N, T}) where {N, T}
@@ -2202,7 +2202,7 @@ end
     # the store epilogue. Now: one Vec{2W} accumulator per cell held in the interleaved [r i r i…]
     # domain, fed by ONE within-lane swap-adjacent shuffle, and stored with no interleave at all.
     #
-    # WHY, measured (galen 2026-08-28). `kernel_report` on this kernel: 34 shuffle ops to 48 FP vector
+    # WHY, measured (Zen3 2026-08-28). `kernel_report` on this kernel: 34 shuffle ops to 48 FP vector
     # ops (0.71), against 0.25 for the real `_microkernel!`. The comment further down attributed the
     # ~124 cycles/tile of excess to PER-TILE boundary setup; `bench/probes/zgemm32_k_scaling.jl`
     # falsifies that — holding the kernel fixed and varying only k, cost per useful flop is FLAT
@@ -2804,7 +2804,7 @@ end
                 # 1.24-1.29x there and the triangular ops are left on the classical kernel.
                 #
                 # Materializing Bᵀ costs one transpose and lets the SAME NN recursion run. Measured on
-                # the original branch (galen/AVX2, n=2048/4096): 59.6/67.4 GFlops vs packed-transB
+                # the original branch (Zen3/AVX2, n=2048/4096): 59.6/67.4 GFlops vs packed-transB
                 # 54.3/54.9 and OB 50.6/50.7 — 1.18-1.33x vs OB, and the win survives the transpose
                 # (~4% off the NN path).
                 #

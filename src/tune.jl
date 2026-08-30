@@ -85,7 +85,7 @@ refuses to measure. Bounded so a genuinely busy machine still makes progress rat
 
 ⚠ THE BOUNDS ARE SET BY HOW loadavg DECAYS, NOT BY TASTE. The 1-minute average is a LAGGING
 indicator with roughly a 1-minute time constant, so after a multi-minute run that pinned a core it
-needs several minutes to fall back under calibrate.jl's 1.5 threshold. Measured on galen 2026-08-21:
+needs several minutes to fall back under calibrate.jl's 1.5 threshold. Measured on Zen3 2026-08-21:
 zero julia processes running and the 1-min average still read 2.69 (5-min 1.71, 15-min 0.70). A 180 s
 cap therefore expired while the box was still "busy" by the very guard this exists to satisfy, and the
 next run refused. `below` sits just under calibrate.jl's threshold so satisfying this satisfies that.

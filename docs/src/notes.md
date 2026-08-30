@@ -512,7 +512,7 @@ untouched, and the tiny-n `symm`/`hemm` cells sit on the copy path beneath the p
 
 `zpotrf` gates fleet-wide. `zgetrf` **now gates fleet-wide** (was Zen3 worst 0.80): a rank-2
 SIMD-`izamax` `getf2` panel, a derived complex block width, a base-32 crossover, and a po2-aliasing-dodge
-scratch. The only residual is galen n=256 (0.94), localized to PB's complex gemm at the trailing
+scratch. The only residual is Zen3 n=256 (0.94), localized to PB's complex gemm at the trailing
 208×208×48 shape (a gemm-kernel gap, not a getrf-structure one). `zgeqrf` **gates at every size
 fleet-wide** (1.07–1.83; was geomean 0.76–0.85): the complex trailing update was rebuilt to mirror the
 real path (`herk` for VᴴV at half the flops + `trmm` for TᴴW), the reflector norm moved from per-element
@@ -564,7 +564,7 @@ lower clock shifting the memory-versus-compute balance.
 ## vs AOCL — the residuals
 
 **PureBLAS matches-or-beats AMD's own library on gemm and every LAPACK factorization — real and complex —
-by 5–80%.** Verified PB/AOCL at mid/large n (>1 = PureBLAS faster; wintermute Zen4, single-thread),
+by 5–80%.** Verified PB/AOCL at mid/large n (>1 = PureBLAS faster; Zen4, single-thread),
 alongside PB/OpenBLAS for context:
 
 | op | PB / OpenBLAS | PB / AOCL |

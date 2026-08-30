@@ -40,7 +40,7 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 # prefetch block const-folds away, so the L1 `axpy` path (and every other 4-arg caller) is byte-identical.
 # `ger` passes `pf>0`: its `y` is a full A column, so at large m the sequential read-modify-write is
 # memory-latency-bound on high-latency memory (e.g. LPDDR5x) — one prefetch PER CACHE LINE across the
-# unrolled step (the HW prefetcher can't be relied on there) hides it (measured: neuromancer ger n=4096
+# unrolled step (the HW prefetcher can't be relied on there) hides it (measured: Zen5 ger n=4096
 # 0.88→~1.0). The prefetch may reach up to `pf` elements past the column end; `llvm.prefetch` lowers to a
 # non-faulting `prefetcht0`, so that's safe. Distance `pf` is a derived const (see `_GER_PF_BYTES`).
 # The unrolled body, U vectors per iteration. `U` is a `Val` so each arm is its own straight-line code.
@@ -185,7 +185,7 @@ const _AXPY_BAND = @load_preference("axpy_unroll", _at_axpy_band(_HW))::Int
 # what made `daxpy_64_` fail trim checking.
 # DERIVE (2026-08-19), replacing the OncePerProcess duel: `_at_axpy_dram` (cpuinfo.jl) keys on the
 # datapath, which is this knob's actual physical criterion — see there for the mechanism and the
-# measured fleet table. The duel it replaces resolved the 17%-SLOWER arm on wintermute in 7 of 9
+# measured fleet table. The duel it replaces resolved the 17%-SLOWER arm on Zen4 in 7 of 9
 # fresh processes and flipped in the other 2, so the shipped kernel was both wrong and per-process
 # non-deterministic. Validated offline against the fleet descriptors in test/autotune_tests.jl.
 # PDM: Derived — narrow 256-bit arm iff the datapath double-pumps; +17% Zen4, loses on Zen3. | tune: n/a
@@ -223,11 +223,11 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # the phase-narrow arm beats the band incumbent by 5.6-10%; that is the long-standing n=1e6 miss.
     #
     # ⚠ THIS DOES NOT EXPLAIN THE CROSS-µARCH SPLIT, and it was briefly claimed that it did. Measured
-    # L3/W on 2026-08-07: wintermute (Zen4) 16 MB / W=8, neuromancer (Zen5) 16 MB / W=8, galen (Zen3)
+    # L3/W on 2026-08-07: Zen4 16 MB / W=8, Zen5 16 MB / W=8, Zen3
     # 32 MB / W=4. Zen4 and Zen5 are IDENTICAL in L3, vector width and therefore regime at every n — and
     # they still want opposite kernels: at ws=L3 and at ws=4·L3, phase-narrow beats the incumbent by
     # 5.6-10% on Zen4 and LOSES by 0.6-1.4% on Zen5 (noise floors 0.04-0.71%, so both are resolvable).
-    # Only galen's boundary moves with its larger L3. So the shape knob is genuinely Measure tier: the
+    # Only Zen3's boundary moves with its larger L3. So the shape knob is genuinely Measure tier: the
     # optimum inverts between two µarchs on which every detected const is equal, which is precisely the
     # req#8b tell for "not predictable from a detected const". The residency fix below is still correct
     # on its own terms — a two-stream op has a two-stream working set — it just is not the explanation.
@@ -253,7 +253,7 @@ end
     GC.@preserve x begin
         va = V(a)
         i = 0
-        # Beyond L1, HAND-UNROLLING LOSES TO `@simd ivdep`. Measured 2026-07-30, wintermute freq-locked,
+        # Beyond L1, HAND-UNROLLING LOSES TO `@simd ivdep`. Measured 2026-07-30, Zen4 freq-locked,
         # one process, back-to-back, plots.jl's own L1 regime (`_L1REP` reps on the same vector) — GB/s of
         # this kernel vs the identical pointer loop written as `@simd ivdep for i in 1:n`:
         #     n=1e3  0.99   n=3e3  0.98   n=1e4  1.01   n=3e4  1.00
@@ -266,7 +266,7 @@ end
         # — PB/raw = 0.927 against the gate's PB/AOCL = 0.923, i.e. AOCL is simply achieving what the naive
         # loop achieves. The genuine DRAM regime (n=4e6, 32 MB) sits at 76-79 GB/s with PB/raw = 0.973.
         # PDM: DERIVE tier (L1 residency over a detected const), no new knob.
-        # OPEN CELL (2026-08-06, wintermute/Zen4 freq-locked): this branch reads ~0.993 vs OpenBLAS in
+        # OPEN CELL (2026-08-06, Zen4/Zen4 freq-locked): this branch reads ~0.993 vs OpenBLAS in
         # the L2 band — gate scal n=30000 0.992-0.993 over two independent runs. It is a FLAT ~0.6%
         # bandwidth difference, not a per-call cost: PB 174.2-174.9 GB/s vs OB 175.3-176.1 GB/s across
         # n=2e4/3e4/4e4, where every cell moves the same total bytes (plots.jl's reps ∝ 1/n). Zen3 does
@@ -378,7 +378,7 @@ end
             end
             return x
         end
-        # FALSIFIED 2026-07-30 (wintermute, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
+        # FALSIFIED 2026-07-30 (Zen4, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
         # n=1e6 (8 MB against a 16 MB L3, doubled by RMW read + dirty-writeback) and gates everywhere
         # smaller. Deepening the unroll to 8 for that regime — i.e. 8 cache lines in flight instead of
         # 4 — moved it 0.91 → 0.92, noise. So lines-in-flight is NOT the mechanism; do not re-try depth.
@@ -445,7 +445,7 @@ end
 end
 
 # Complex axpy: y .+= (alr + i·ali)·x. Swap-pairs complex-multiply of x, fused straight into y.
-# DECOMPOSITION (galen Zen3/AVX2, n=1M ≈ 32MB footprint = L3 edge, the worst point): the complex kernel
+# DECOMPOSITION (Zen3/AVX2, n=1M ≈ 32MB footprint = L3 edge, the worst point): the complex kernel
 # under-extracted bandwidth with NO register spills and no prefetch/unroll sensitivity (all falsified) — so
 # the residual was the compute critical path at the L3→DRAM transition, not memory. The old body was 4 vector
 # ops/lane (mul xv·arv, shuffle, FMA, then a standalone `y + ax` add). Folding the y-load into the FIRST FMA
@@ -659,7 +659,7 @@ end
     # values. AVX2 has 16 vector regs, AVX-512 has 32 — a hardcoded 4× put all 16 YMM into accumulators on
     # AVX2 and spilled (dotc/dotu small-n 0.75×).
     #
-    # RESERVE IS 4, MEASURED — it was 6, which is one register-pair too conservative on AVX2. galen (Zen3,
+    # RESERVE IS 4, MEASURED — it was 6, which is one register-pair too conservative on AVX2. Zen3 (Zen3,
     # AVX2), plots.jl's L1-sweep regime, 40 samples, GB/s median, standalone kernels differing only in UNR:
     #     n=1000   UNR 1/2/3/4 = 117.7 / 158.5 / 169.9 / 129.4     (shipped UNR=2 measured 155.5)
     #     n=3000               = 116.4 / 116.7 / 116.7 / 116.3
@@ -964,7 +964,7 @@ end
 # costs one load, one `abs` (a `vandpd`) and one `vaddpd` into an accumulator, so the loop's floor is set
 # by how many INDEPENDENT add chains are in flight: chains >= add_latency x add_pipes. On Zen4 that is
 # ~4 cycles x 2 pipes = 8; four chains leaves the pipes idle half the time.
-# MEASURED, and this is why it matters (wintermute, freq-locked, `bench/cellrep.jl`): at 16 KB of
+# MEASURED, and this is why it matters (Zen4, freq-locked, `bench/cellrep.jl`): at 16 KB of
 # L1-resident data our 4-chain kernel ran 2000 doubles in ~316 cycles = 1.26 cycles/vector where L1 can
 # sustain ~1.0. OpenBLAS ships TWO kernels for this and we tie the slower one:
 #     dasum_k_COOPERLAKE   4x zmm, 256 B/iter, serial fold   -> we WIN 1.227 (asum n=2000)
@@ -1046,7 +1046,7 @@ end
 #    in the hot path, unlike the chain kernel below. WIDTH-GENERAL (W=4 f64 / W=8 f32). Beats OpenBLAS
 #    1.6–2.1× on Zen4. (Old AVX2 chain was the worst AOCL miss: f64 0.55×, f32 0.32× — git log.)
 #
-#    It does NOT gate AOCL-BLIS. Measured 2026-08-03, wintermute, freq-locked, bench/plots.jl arms=pb,
+#    It does NOT gate AOCL-BLIS. Measured 2026-08-03, Zen4, freq-locked, bench/plots.jl arms=pb,
 #    pb/AOCL by size: n=1e3 0.967 | 3e3 1.039 | 1e4 0.957 | 3e4 0.974 | 1e5 0.937 | 3e5 1.03 | 1e6 1.016
 #    ⇒ gate 0.937. Two claims that used to stand here are FALSE and were removed: "gates AOCL at EVERY
 #    size" (unreproducible — it came from bench/iamax_nb.jl, which the kb already flags for stale seeding),
@@ -1093,7 +1093,7 @@ end
 # NB IS CHOSEN BY L2 RESIDENCY — PDM **Derive** tier, no knob, no preference, no runtime measurement.
 # Criterion: while the stream fits L2, load latency is low and two lines in flight cover it, so the
 # shorter loop (less per-iteration overhead, fewer live registers) wins; once the stream leaves L2 the
-# misses must be hidden by more outstanding lines, and 4 beats 2. Measured on wintermute (Zen4, L2 = 1 MB,
+# misses must be hidden by more outstanding lines, and 4 beats 2. Measured on Zen4 (Zen4, L2 = 1 MB,
 # freq-locked, plots.jl's own fresh-allocation regime, 90 samples, GB/s median) — NB=2 over NB=4:
 #     7 KB +12.7% | 23 KB +8.8% | 78 KB +5.1% | 234 KB +4.2% | 781 KB +4.2% | 1024 KB (=L2) +1.5%
 #     1562 KB −5.5% | 2343 KB −0.4% | 4.6 MB −7.6% | 7.6 MB −11.1% | 15 MB −9.5% | 30 MB −9.9%
@@ -1107,18 +1107,18 @@ end
 # wins; two lines is what keeps the load stream fed without lengthening the body. The ISA sets how many
 # blocks that is, which is the whole point of deriving it — AVX-512 (_SIMD_BYTES=64) → 2, AVX2 (32) → 4.
 # BOTH are the measured optimum on their box, and they are DIFFERENT NUMBERS: shipping the Zen4 value (2)
-# as a literal regressed galen's iamax from gate 1.022 (PASS) to 0.934 (FAIL), −18/−19% at n=1e3/3e3.
+# as a literal regressed Zen3's iamax from gate 1.022 (PASS) to 0.934 (FAIL), −18/−19% at n=1e3/3e3.
 # That is the req#8 lesson in one line: the constant that looked µarch-specific was a fixed byte budget.
 const _IAMAX_NB_RESIDENT = max(1, 2 * _CACHELINE ÷ _SIMD_BYTES)
 # STREAMING unroll — past L2 the criterion changes from bytes to ILP: independent compare chains to cover
 # the miss latency. Four is ISA-invariant here and is also the incumbent value, now validated BOTH ways —
 # Zen4 4 blocks = 4 lines (n=1e6: 72.3 vs 64.3 GB/s for 2), Zen3 4 blocks = 2 lines (78.5, beating both 2
 # at 75.0 and 8 at 77.4). Deriving this as a line budget like the resident arm gives 8 on AVX2, which
-# MEASURED WORSE on galen at every size — so it is a chain count, not a byte budget.
+# MEASURED WORSE on Zen3 at every size — so it is a chain count, not a byte budget.
 # PDM: Literal — DERIVABLE, not yet derived: ILP chain count, ISA-invariant by the latency x throughput argument.
 # req8-ok: ILP chain count, ISA-invariant, incumbent value measured optimal on Zen3 and Zen4 (see above)
 const _IAMAX_NB_STREAM = 4
-# WIDTH IS NOT THE REMAINING GAP — measured 2026-08-04, wintermute, freq-locked, plots.jl op=iamax.
+# WIDTH IS NOT THE REMAINING GAP — measured 2026-08-04, Zen4, freq-locked, plots.jl op=iamax.
 # AOCL's `bli_damaxv_zen_int_avx512` (the reference that binds here; OpenBLAS is at 2.04, we beat it 2x)
 # streams 512 B/iteration = 8 zmm, against our 128 B at NB=2, so NB=8 looked like the obvious lever.
 # It is decisively WORSE at every resident size — gate ratios NB=2 -> NB=8:
@@ -1371,9 +1371,9 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # against 5 — so the tree wins wherever NB is more than about 2, on any ISA. (The abs is NOT part of
 # this: LLVM already folds it into the load as `vandpd (mem)`, which is AOCL's own `vandnpd` trick, so
 # both forms pay 1 op/vector there. An earlier note in this file claiming we issue a separate vload was
-# wrong — read off the AVX2 disassembly on galen.)
+# wrong — read off the AVX2 disassembly on Zen3.)
 #
-# Measured on galen (Zen3/AVX2, freq-locked, bench/probes/iamax_live.jl in plots.jl's rep-loop regime),
+# Measured on Zen3 (AVX2, freq-locked, bench/probes/iamax_live.jl in plots.jl's rep-loop regime),
 # tree vs thresh at the RESIDENT width, PB/OpenBLAS:
 #     n=1000  1.937 -> 2.303 (+19%)   n=3000  1.940 -> 2.393 (+23%)
 #     n=10000 2.000 -> 2.068 (+3%)    n=30000 2.129 -> 2.188 (+3%)

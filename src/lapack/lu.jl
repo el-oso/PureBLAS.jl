@@ -20,11 +20,11 @@ const _LU_NB = 48       # blocked panel width base (small nb trims the panel/trs
 _lu_nb(n::Int) = clamp((n ÷ 8) & ~15, _LU_NB, 128)
 
 # Complex getrf panel width. Grows with n so the trailing rank-nb zgemm is compute-bound — measured
-# (galen): a rank-k zgemm gates only at k≳96 on AVX2 (k=48 → 0.85), so the complex panel must grow faster
+# (Zen3): a rank-k zgemm gates only at k≳96 on AVX2 (k=48 → 0.85), so the complex panel must grow faster
 # than the real one (÷5 vs ÷8) — and is CAPPED at the complex-gemm kc micropanel `_clu_cap` (== `_CKC` for
 # ComplexF64: L1-residency `kc·nr·sizeof(T) ≤ ½L1`, per-T via `_l1_block`), beyond which the trailing zgemm
 # re-blocks k internally anyway. Floor keeps the panel lean at small n (the rank-2 panel factor dominates
-# there). Reproduces the rank-2-panel nb-sweep optima (galen Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
+# there). Reproduces the rank-2-panel nb-sweep optima (Zen3/AVX2): 32@128, 48@256, 96@512, cap@≥1024.
 @inline _clu_cap(::Type{T}) where {T <: BlasComplex} = _l1_block(_HW, T, max(_CNR, _CNR_SMALL))
 @inline _clu_nb(n::Int, ::Type{T}) where {T <: BlasComplex} = clamp((n ÷ 5) & ~15, 32, _clu_cap(T))
 
@@ -36,7 +36,7 @@ const _GETF2_BASE = 16   # ≤ this ⇒ store-bound rank-1 sweep; above ⇒ BLAS
 # Complex base is WIDER than the real one, by the complex/real element-size ratio (=2): the complex base
 # is a rank-2 SIMD sweep (already halves the store traffic the recursion's cross-half gemm targets), so the
 # BLAS-3 split's benefit shrinks while its cost (skinny-k zgemm/ztrsm cross-updates on a TALL panel) grows,
-# pushing the flat/recurse crossover ~2× wider. Measured (galen): 32 beats both 16 and 64 for zgetrf 256/
+# pushing the flat/recurse crossover ~2× wider. Measured (Zen3): 32 beats both 16 and 64 for zgetrf 256/
 # 1024 (panel 0.91→0.96 at m=1024). Derived from sizeof so cgetf2 (ComplexF32) tracks the same criterion.
 const _CGETF2_BASE = _GETF2_BASE * (sizeof(ComplexF64) ÷ sizeof(Float64))   # = 32
 
@@ -184,7 +184,7 @@ end
 # SIMD panel (Float64) — RANK-2 blocked with SIMD idamax. Bit-identical pivots/result to the flat rank-1
 # sweep, but the trailing update touches each element ONCE per 2 columns (the rank-1 sweep is store-bound
 # BLAS-2, ~40% of getrf(256)) and the pivot argmax is vectorized (was ~30% scalar). Measured +48–82% on the
-# base (galen). Columns processed in pairs: factor jl, update col jl+1 by jl, factor jl+1, then one fused
+# base (Zen3). Columns processed in pairs: factor jl, update col jl+1 by jl, factor jl+1, then one fused
 # rank-2 update of the trailing (with the U[jl+1,·] row correction). Pivoting is a correctness boundary.
 function _getf2_simd!(p::Ptr{Float64}, ld::Int, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     info = 0; jl = 1
@@ -231,7 +231,7 @@ end
     # was far too low: it only ever encoded the SIMD kernel's OOB-lane requirement (n >= 4W), never
     # where the SIMD kernel actually becomes FASTER. `_iamax_cmplx_simd!` carries ~197 cycles of fixed
     # setup (horizontal argmax reduction + frame), so at panel lengths the scalar cabs1 argmax WINS —
-    # by 3.2x at n=32 and 2.0x at n=64. Measured wintermute (ns/call, SIMD vs scalar):
+    # by 3.2x at n=32 and 2.0x at n=64. Measured Zen4 (ns/call, SIMD vs scalar):
     #     n=  32   78.9 / 24.9      n= 256   161.0 / 242.6   <- SIMD ahead from here
     #     n=  64  105.9 / 54.0      n=1024   443.8 / 1001.4
     #     n= 128  119.4 / 116.8     n=4096  1564.8 / 4042.5
@@ -435,7 +435,7 @@ end
 
 # Complex padded scratch (mirror of the real `_LU_PAD`): a po2 leading dim aliases cache sets — the L1 page
 # is 4096 B, so `stride·sizeof(T) % 4096 == 0` maps every column onto the same set, thrashing the per-pivot
-# row-swaps + trsm/gemm view reads. MEASURED (galen): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
+# row-swaps + trsm/gemm view reads. MEASURED (Zen3): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
 # n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
 const _CLU_PAD64 = Ref(Matrix{ComplexF64}(undef, 0, 0))

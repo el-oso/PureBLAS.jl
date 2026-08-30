@@ -538,9 +538,9 @@ end
 #
 # THE EVIDENCE IS THAT IT DOES NOT MOVE. Gate-measured 2026-08-20 by forcing the alternative through
 # bench/plots.jl on every box: 8 wins on Zen3 (AVX2, 4 lanes), Zen4 and Zen5 (AVX-512, 8 lanes) alike —
-#   wintermute  4 -> gesvd 0.988 FAIL  |  8 -> 1.058 PASS   (+7.1%)
-#   neuromancer 4 -> gesvd 1.053 PASS  |  8 -> 1.101 PASS   (+4.6%)
-#   galen       8 already best
+#   Zen4  4 -> gesvd 0.988 FAIL  |  8 -> 1.058 PASS   (+7.1%)
+#   Zen5 4 -> gesvd 1.053 PASS  |  8 -> 1.101 PASS   (+4.6%)
+#   Zen3       8 already best
 # A value that is unchanged across two ISAs and three microarchitectures is not cache- or width-derived;
 # it is structural to the gebrd panel. Deriving it from `_lanes` is what produced the wrong answer: that
 # formula gave 4 on both AVX-512 boxes and shipped a 7% regression, because it faithfully reproduced

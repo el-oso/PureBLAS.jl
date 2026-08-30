@@ -11,8 +11,8 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 **Where the work is now, in one line each:**
 - **Coverage: DONE.** OpenBLAS fallthrough is **zero** and ratchet-enforced (`test/lbt_forward_tests.jl`);
   the north-star worklist below is complete. What remains there is performance, not routing.
-- **Performance: the open front.** 352 of 2619 fleet cells sit below the gate (galen 115 / wintermute 114
-  / neuromancer 123). Read that number with care — **740 cells (28%) are within ±5% of parity**, and with
+- **Performance: the open front.** 352 of 2619 fleet cells sit below the gate (Zen3 115 / Zen4 114
+  / Zen5 123). Read that number with care — **740 cells (28%) are within ±5% of parity**, and with
   1–4% per-cell noise the count swings ±10–15 between refreshes. Judge a change by its targeted cells and
   its controls, never by a count delta.
 - **Genericity: LU, QR and SVD-values now accept `T<:Real`** (2026-08-30), so forward-mode AD reaches all
@@ -21,7 +21,7 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 
 **The performance gate is now `PB ≥ max(OpenBLAS, AOCL-BLIS)`** (upgraded 2026-07-15 from ≥ OpenBLAS) — a
 sub-1.0 ratio vs *either* AMD-tuned baseline is a miss, never a "ceiling." Certified boost-locked on the AMD
-fleet (Zen3/AVX2 `galen`, Zen4/AVX-512 `wintermute`, Zen5/native-AVX-512 `neuromancer`) via
+fleet (Zen3/AVX2 `Zen3`, Zen4/AVX-512 `Zen4`, Zen5/native-AVX-512 `Zen5`) via
 `bench/fleet_freqlock.sh lock`; audit in `bench/gate_audit_2026-07-18.txt`, plots published to the docs.
 
 Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated):
@@ -140,15 +140,15 @@ Done & verified (426/426 tests passing as of 2026-06-28):
 - [x] TrimCheck `@validate` on the 9 `@ccallable` entry points (test/trim_tests.jl) — all trim-safe.
 - [x] README, DocumenterVitepress docs (Home/Guide/Design), CI.yml + docs.yml.
 - [x] **Performance gate MET** (`bench/bench_level1.jl`, Float64, single-thread, interleaved/
-      drift-robust, Zen4/wintermute, core-pinned): **0/24 op×size below 0.96×, min 0.977×, geomean
+      drift-robust, Zen4/Zen4, core-pinned): **0/24 op×size below 0.96×, min 0.977×, geomean
       1.41×** over n ∈ {1e3,1e4,1e5,1e6}. nrm2 4–8× (OpenBLAS dnrm2 is the slow scaled algo);
       scal/copy/asum ≥ parity; axpy/dot at parity. Implementation: reductions use 4 accumulators
       (latency-bound otherwise); elementwise kernels 4-way unrolled; nrm2 = SIMD sum-of-squares with
       scaled-lassq fallback on overflow/underflow.
-- [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 galen, Zen4/
-      AVX-512 wintermute, Zen5/native-AVX-512 neuromancer); boost-locked certification in "Fleet-gate
+- [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 Zen3, Zen4/
+      AVX-512 Zen4, Zen5/native-AVX-512 Zen5); boost-locked certification in "Fleet-gate
       certification" below. (Future M5 ARM box not yet acquired.)
-  - **Zen3 (galen, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
+  - **Zen3 (Zen3, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
     suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
     symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
     PASS except gemvN 0.80 / gbmvN 0.62, **all L3 FAIL (gemm 0.63, symm 0.58, syrk 0.59, syr2k 0.65,
@@ -157,30 +157,30 @@ Done & verified (426/426 tests passing as of 2026-06-28):
     accumulators` — sized for AVX-512's 32 registers; on AVX2's **16 ymm** it spills accumulators to
     stack every FMA. All L3/LAPACK build on gemm ⇒ the whole stack inherits it. **Fix = an
     architecture-adaptive tile, then per-op threshold retune** — a Zen3 tuning campaign analogous to
-    the wintermute small-n one. Baseline cache: `bench/plots_data_galen.txt` on galen. Per-machine gate
-    (unpinned; cpufreq pin needs sudo on galen).
+    the Zen4 small-n one. Baseline cache: `bench/plots_data_Zen3.txt` on Zen3. Per-machine gate
+    (unpinned; cpufreq pin needs sudo on Zen3).
     - **PROGRESS (2026-07-02, commit 8706372) — gemm GATES on Zen3.** Made the gemm tile (`_MR/_NR`)
       and unpacked-crossover (`_GEMM_UNPACK_MAX`) width-adaptive + Preferences-overridable
-      (`gemm_mr/gemm_nr/gemm_unpack_max` — the fleet calibration knob). Swept on galen:
+      (`gemm_mr/gemm_nr/gemm_unpack_max` — the fleet calibration knob). Swept on Zen3:
       **W=4 -> MR=3,NR=4 (12 accs, fits 16 ymm), unpack<=128**; W=8 unchanged (MR=2,NR=8,unpack<=448,
-      wintermute suite bit-identical). gemm worst **0.63->0.99**, geomean 1.18, gates every n=8..2048.
+      Zen4 suite bit-identical). gemm worst **0.63->0.99**, geomean 1.18, gates every n=8..2048.
       Lifted **geqrf/gesvd/iamax -> PASS**, symm 0.58->0.90, getrf 0.68->0.87. Full suite 7213/7213 on
-      BOTH galen (AVX2) and wintermute (AVX-512). Microkernels were already `Val{MR,NR}`-parameterized;
+      BOTH Zen3 (AVX2) and Zen4 (AVX-512). Microkernels were already `Val{MR,NR}`-parameterized;
       only driver consts changed.
     - **PROGRESS (2026-07-02, commit d1a748a) — syrk/syr2k/trmm structural fix (large-n gates).**
       Root found: the unified single-pack (syrk/syr2k/trmm) needs mr=nr=W (MR=1) → exactly W
       accumulators; on AVX2 that's 4 = latency-STARVED (opposite of gemm's spilling). Fixed:
       `_unified_ok` now requires W>=8, so W=4 routes to the multi-pack `_trgemm_packed!` with the wider
       `_MR×_NR`=12-acc tile. **syrk 0.57→geomean 0.98, syr2k 0.55→0.82, trmm 0.59→1.10** — all large-n
-      (n≥256) gate. W=8 unchanged (unified still on; wintermute 7213/7213). `_SYRK_DBASE` made
+      (n≥256) gate. W=8 unchanged (unified still on; Zen4 7213/7213). `_SYRK_DBASE` made
       Preferences-overridable.
     - **REMAINING Zen3 gaps:** **small-n (n≤128) syrk/syr2k** — recursion path: n=32 ~0.79, n=128 ~0.82
       (the gemm-into-temp diagonal base wastes 2× flops; `syrk_dbase` swept 8..48, does NOT gate → needs
-      a dedicated small-n triangular kernel, like the wintermute small-n campaign built per op). trsm
+      a dedicated small-n triangular kernel, like the Zen4 small-n campaign built per op). trsm
       0.68 (small-n n≤256; large-n gates), symm 0.90, potrf 0.67, getrf 0.88 (potrf/getrf follow once syrk
       small-n + trsm small-n gate). L2 gemvN / gbmvN **now done** (phase 1, see below). This is the Zen3
-      analogue of the wintermute small-n grind — a multi-op campaign.
-    - **UPDATE 2026-07-04 (autonomous) — re-measured galen (AVX2, boost OFF) + syrk/syr2k FIXED.** The
+      analogue of the Zen4 small-n grind — a multi-op campaign.
+    - **UPDATE 2026-07-04 (autonomous) — re-measured Zen3 (AVX2, boost OFF) + syrk/syr2k FIXED.** The
       2026-07-02 numbers above were partly stale (many lifted by the width-adaptive gemm/L3 landings +
       the const-dispatch workspace). CURRENT measured small-n gate state (bench/smalln_probe.jl, taskset
       -c 8): trmm ALL gate (1.06–1.25); getrf ALL gate; syr2k n≤128 gate. **syrk n=64/128/256 (0.83/0.94/
@@ -205,14 +205,14 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       is elsewhere in the faer base (`_chol_base_f64!` left-looking panel or `_trsm_right_lower_f64!`, both
       also 3·W-unrolled) — needs per-kernel decomposition, not a blanket tile change.
     - **UPDATE 2026-07-04 (session 2) — gemvN mid-band FIXED + residual triage (commit 676582e).**
-      Decomposed every remaining AVX2 gate FAIL to per-size on galen (boost off):
+      Decomposed every remaining AVX2 gate FAIL to per-size on Zen3 (boost off):
       - **gemvN — FIXED** the mid-band (n=128..768 sat ~0.90-0.94). Root cause: `_GEMV_MR=4`
         accumulators half-fed Zen3's two FMA units (~5-cyc latency wants ~10 independent chains) while
         A is still cache/L3-resident → FMA-latency-bound, not bandwidth. Two width-conditional consts
         (AVX2 only; AVX-512 verified bit-identical, W=8→MR=4/RB=448): `_GEMV_MR 4→8` (8 accs feed both
         FMA ports, 10/16 ymm, no spill; MR=10/12 spill+regress), `_GEMVN_RB 192→64` (with MR=8 the
         sequential-streaming panel path beats strided row-block for all n≥96, so route mid-n to it;
-        row-block only wins n≤64 where panel's m<mr all-masked tail dominates). galen real public gemvN
+        row-block only wins n≤64 where panel's m<mr all-masked tail dominates). Zen3 real public gemvN
         median: n=64 1.09→1.44, **128 0.91→0.98, 256 0.91→1.04**, 512 0.92→0.94, 1024 0.98→1.03,
         2048 1.03→1.07. Correctness nfail=0 over m,n∈{1..513}×{1..512}, s/d, α≠1, β≠0. **ONLY n=512
         remains** (0.93 median, min 0.91/max 0.97 — L3-bandwidth ceiling, A=2MB; a single-size ceiling
@@ -233,7 +233,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
         directly at k=8 = 0.999; the `trmm!`→`_trmm!`→`_trmm_left!` chain adds ~16% on a ~50ns 8×8 op.
         Tiny corner; not chased (would need a tiny-k fast-path in the public entry).
     - **potrf AVX2 decomposition (2026-07-04, session 2) — already well-tuned; no fruit found; TARGET IS
-      HASWELL not Zen3.** Full sub-kernel decomposition on galen (Zen3): the trailing update `syrk!`
+      HASWELL not Zen3.** Full sub-kernel decomposition on Zen3: the trailing update `syrk!`
       **beats** OpenBLAS (128=1.03, 256=1.04), panel `trsm!` fine (0.95), faer base-64 excellent (1.30).
       The gap is the **faer path at n=128 = 0.87** (potrf n=128 IS that path), which degrades from base-64's
       1.30 because `_chol_rl(128)` splits into bs=64 blocks adding the fused trsm/syrk. **DISPROVEN levers
@@ -250,7 +250,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       real-Haswell vs-MKL run; docs `performance.md` has a footnoted **Haswell\*** column (AVX2 proxy).
     - **Haswell static tuning via `llvm-mca` (2026-07-04, session 2) — one lever landed, auto-detected.**
       Workflow (reusable): `julia -C haswell` → `code_native` the kernel → `llvm-mca -mcpu=haswell` (already
-      on galen at `/usr/lib/llvm-20/bin`). Findings on the potrf kernels: **syrk 12-acc tile is throughput-
+      on Zen3 at `/usr/lib/llvm-20/bin`). Findings on the potrf kernels: **syrk 12-acc tile is throughput-
       optimal** on Haswell (6 cyc/iter = 12 FMA/2 units); **trsm diagonal** is inherently serial (unfixable);
       **chol_base k-reduction was latency-bound** (10 vs 4 cyc/iter — only 3 accumulators, each 2 serial FMAs
       after LLVM's ×2 unroll; Haswell's narrow OOO can't hide the 5-cyc FMA chain). **LANDED:** split each
@@ -266,7 +266,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
       block, factor the diag in a conflict-free D scratch, solve the panel INTO a conflict-free T via a
       split-ld faer trsm whose FIRST TOUCH reads po2 A21 (copy-in fused away), trailing update reads T
       (@inline split syrk when T ≤ L2/2, packed syrk! reading T above), single streaming writeback T→A21.
-      **galen (BenchmarkTools, boost off, taskset): PB/OB = 256 1.08 · 512 1.06–1.07 · 1024 1.04–1.05 ·
+      **Zen3 (BenchmarkTools, boost off, taskset): PB/OB = 256 1.08 · 512 1.06–1.07 · 1024 1.04–1.05 ·
       2048 1.03–1.04** (was 0.92/0.95/0.96/0.97 whole-pad; nopad ceiling 0.99–1.01 — the driver beats it
       because the composition is better, not just the stride fix). Decisive lever (per-stage decomposition):
       the MR=1×4 trsm gemm-pass was load-port-bound (25% slower than packed trsm!); upgrading it to the
@@ -291,7 +291,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            band-based and stable across n=256…4096 (NOT an AB-cache effect — axpy wins at n=64 too; and NOT
            latency — adding partial accumulators made it *worse*, both hypotheses tested & rejected). Fix:
            `_GBMV_CONV_MAX` width-adaptive (`W==4 ? 20 : 48`), one-line threshold, kernel body unchanged.
-           `src/level2_banded.jl`. Correct on galen (264 cases, all bands/α/β).
+           `src/level2_banded.jl`. Correct on Zen3 (264 cases, all bands/α/β).
          - **gemvN 0.80 → geomean 0.98 (n=256 rowblock cliff 0.74→0.90 fixed).** Root cause: the row-block
            path assumes A is cache-resident, but at n=256 A (512KB) exceeds Zen3's 512KB L2 → panel path
            (streams A once) wins. `_GEMVN_RB` width-adaptive (`W==4 ? 192 : 448`, the cut where n²·8B crosses
@@ -303,7 +303,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            *kernel* efficiency (invL base + dense back-sub), not routing → **moved to phase 2**. Knobs reverted
            (YAGNI; phase 2 re-adds the sweep surface). Large-n trsm (512+) already ~0.92–0.97.
          - **trsm/getrf UPDATE (2026-07-03, commits 63268ae + 6b0b2ab).** Decomposed the invL/invR base on
-           an idle galen core: the n=256 gap is the leaf **GEMM** (18µs/leaf, dominant), NOT the copyback
+           an idle Zen3 core: the n=256 gap is the leaf **GEMM** (18µs/leaf, dominant), NOT the copyback
            (~1.5% — the prior "copyback restructure needed" claim was WRONG; do not rebuild a packed
            `_trsm_kernel!`). The leaf shape is skewed (nb≤32 tiny, B wide) → routed its multiply through
            `_gemm_unpacked!` (no B-pack, `Val{B0}` overwrite; 0.72× packed time). **trsm n=256 0.85→~0.93,
@@ -333,10 +333,10 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            the packed path (`_trgemm_packed!`, per-microtile diagonal, no waste) beats it from n≈24.
            Added `_SYRK_PACK_CUT` (W==4 → 23, W==8 = `_GEMM_UNPACK_MAX` so unchanged) routing 24≤n≤128 off
            recursion onto packed: **n=32 0.75→0.80, n=128 0.75→0.88** (crossover measured n=12..32; recursion
-           still wins n≤20, e.g. n=16 1.08). Suite 7213/7213 on galen. `src/level3.jl`.
+           still wins n≤20, e.g. n=16 1.08). Suite 7213/7213 on Zen3. `src/level3.jl`.
          - **DISPROVEN (do NOT re-try): OpenBLAS scratch+copyback diagonal tile.** Implemented
            `_microkernel_tri_scratch!` (dense tile → stack scratch → bounded scalar triangular copy-back)
-           and A/B-tested vs the existing masked `_microkernel_tri!` on galen: **EQUAL** (geomean 0.901 vs
+           and A/B-tested vs the existing masked `_microkernel_tri!` on Zen3: **EQUAL** (geomean 0.901 vs
            0.902; n=32 0.83 vs 0.79, n=256 0.92 vs 0.94 — all noise). SIMD.jl masked stores on AVX2 are
            already cheap; the masked-store cost was never the bottleneck. Reverted.
          - **REMAINING:** n=32/128 syrk still ~0.80/0.88 (< gate) — the gap is general small-n kernel
@@ -344,7 +344,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
            (trsm n≤256 invL base) still open. Matching OpenBLAS's broadly-efficient small blocked kernel is
            the real (hard) lever.
       3. **Empirically certify Zen4 — DONE (2026-07-02): no regression.** Re-ran full `plots.jl` gate on
-         wintermute (Ryzen 5 7640U, Zen4, W=8) and diffed vs baseline: changed ops statistically identical
+         Zen4 (Ryzen 5 7640U, Zen4, W=8) and diffed vs baseline: changed ops statistically identical
          (gbmvN 1.34, gemvN 1.20 geomean; W=8 codegen bit-identical). The few sub-gate worst sizes (gemm n=8
          0.82, gemvN n=512 0.95, getrf 0.93) PRE-EXIST in the baseline and are this mobile chip's noise
          floor — not introduced by the phase-1/2 changes.
@@ -360,7 +360,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
      (`bench/lapack_baseline_<host>.txt`) that flags a ratio DROP even above the gate. Run pinned:
      `taskset -c 2 julia --project=bench bench/lapackbench.jl`.
   `bench/`: bench_gemm/bench_level1/l3bench (manual L1/L3 gate sweeps). Correctness is guarded by the
-  7130-item suite + StrictMode. `benchmark/base.json` is a machine-specific local baseline (wintermute).
+  7130-item suite + StrictMode. `benchmark/base.json` is a machine-specific local baseline (Zen4).
 
 ### ✅ In-process LBT forwarding — SOLVED (2026-07-18): `PureBLAS.activate()` reroutes the whole ecosystem
 
@@ -447,7 +447,7 @@ Done & verified (2026-06-28):
       demonstrably wins while only L3-resident. The L2 fit only appeared to work because on this fleet the
       small-L2 box is also the narrow-W box, making L2 and W collinear. See cpuinfo.jl:205-227.)
 
-Perf (Zen4/wintermute, Float64, single-thread, interleaved, `bench/bench_gemm.jl`): OpenBLAS ~45
+Perf (Zen4/Zen4, Float64, single-thread, interleaved, `bench/bench_gemm.jl`): OpenBLAS ~45
 GFLOP/s; PureBLAS **geomean 0.999× across n=16..4096 — parity, beats OpenBLAS on most small/medium
 sizes** (n=16: 1.19×, n=128: 1.19×, n=150: 1.07×, n=200: 1.08×, n=256: 1.04×); large n 512=0.99×,
 1024=0.99×, 2048/4096=0.97–0.98×; only 4/20 below 0.96× (n=33 0.84×, n=57 0.89×, n=96/100 ~0.95×).
@@ -477,13 +477,13 @@ Remaining / next:
 - [x] **Complex GEMM SIMD path DONE (2026-07-02, commits 283af9b, 845486f, 813455f).** Was scalar
       (~0.2×); now split-pack blocked (4-real-FMA MAC, conj via Val signs, interleave-add store,
       vectorized packs, B0 overwrite for beta=0) + an unpacked tiny-n path. Tile W=8 2×4 / W=4 1×6
-      (12 accs = exact 16-ymm AVX2 fit). **wintermute (Zen4/W=8) BEATS OpenBLAS at EVERY gate size**
-      (zC 1.12–1.49×, cC 1.01–1.48×). galen (Zen3/AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
+      (12 accs = exact 16-ymm AVX2 fit). **Zen4 (W=8) BEATS OpenBLAS at EVERY gate size**
+      (zC 1.12–1.49×, cC 1.01–1.48×). Zen3 (AVX2/W=4): large-n (96–2048) GATES 0.95–1.05, n=8
       F64 gates (1.18), F32 mid-small mostly gates; F64 mid-small n=16–64 = 0.81–0.92 residual (AVX2
       alpha=1 store fast-path d041349). zgemm in the L3 gate. Full suite 7243/7243 both machines.
       **CORRECTION (freq-locked re-measure): the earlier "n=32 F64 0.90 hardware floor" was a BOOST
-      artifact, NOT a hardware floor.** With boost disabled on both boxes: wintermute beats every size
-      (F64 1.12–1.53, F32 1.06–1.48); galen n=32 F64 = 1.03 HOT / ~0.93 cold, everything else ≥0.965.
+      artifact, NOT a hardware floor.** With boost disabled on both boxes: Zen4 beats every size
+      (F64 1.12–1.53, F32 1.06–1.48); Zen3 n=32 F64 = 1.03 HOT / ~0.93 cold, everything else ≥0.965.
       The kernel is sound — hot (the stated in-place-reps methodology) it BEATS OpenBLAS; the residual
       cold gap is a modest cold-cache effect from complex being 2× the bytes. Rejected-with-measurement
       alternatives (packless 0.76, pack-A-stream-B 0.44, vgather, packB-transpose): memory
@@ -863,11 +863,11 @@ locked freq (boost off). **Finding: the residual profiles are DISJOINT across µ
 transfer, which is exactly why the gate is per-machine.** Full `plots.jl bench` on each; caches
 `bench/plots_data_<host>.txt`, per-ISA SVGs.
 
-- **wintermute (Zen4 mobile, AVX-512 double-pumped 256-bit):** all-green bar small-n 7640U-noise dips.
-- **galen (Zen3, AVX2):** all-green except documented ceilings — potrf po2-conflict (0.88–0.95; the copy is
+- **Zen4 (mobile, AVX-512 double-pumped 256-bit):** all-green bar small-n 7640U-noise dips.
+- **Zen3 (AVX2):** all-green except documented ceilings — potrf po2-conflict (0.88–0.95; the copy is
   the gap, `d61b332` lower-triangle pad-copy cleared n=2048 & lifted the rest), trmm n=8 (materialize
   tiny-kernel wall), zgemm 0.95–0.958 (16-reg tile), gemvN-512 0.94 (L3 bandwidth), iamax addr-noise.
-- **neuromancer (Zen5, native AVX-512):** clears EVERY AVX2 ceiling (potrf 1.40, zgemm 1.14, trmm 1.09,
+- **Zen5 (native AVX-512):** clears EVERY AVX2 ceiling (potrf 1.40, zgemm 1.14, trmm 1.09,
   trsm 1.65) but surfaces NEW L2 gaps: **ger n=2048/4096 = 0.71/0.82** (write-bandwidth-bound — likely OB
   non-temporal stores vs our cached writes; reproduced tight on a quiet box, REAL), gemvN-256 0.87, gemm-32
   0.91, symm-256 0.94. Correctness bit-exact (gemm 0, potrf 2.8e-14, zgemm 7.6e-16). Detection auto-adapts
@@ -886,17 +886,17 @@ O(n), so `LPSZ` sizes are timer noise for them):
 
 | | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
 |---|---|---|---|---|---|---|
-| **wintermute (Zen4)** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
-| **galen (Zen3)** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
-| **neuromancer (Zen5)** | 1.28/1.22 | 1.62/1.54 | 1.06/1.05 | 1.12/1.12 | 1.00/**0.99** | 1.06/1.04 |
+| **Zen4** | 1.26/1.21 | 1.59/1.51 | 1.03/1.03 | 1.13/1.12 | 1.00/**0.99** | 1.07/1.05 |
+| **Zen3** | 1.27/1.20 | 1.62/1.52 | 1.05/1.05 | 1.11/1.11 | 1.00/**0.99** | 1.06/1.05 |
+| **Zen5** | 1.28/1.22 | 1.62/1.54 | 1.06/1.05 | 1.12/1.12 | 1.00/**0.99** | 1.06/1.04 |
 
 **vs OpenBLAS** (the binding reference for gttrs), same column order:
 
 | | gtsv | gttrf | gttrs | pttrf | pttrs | ptsv |
 |---|---|---|---|---|---|---|
-| **wintermute (Zen4)** | 1.50/1.43 | 1.62/1.54 | 1.00/1.00 | 1.13/1.13 | 1.73/1.68 | 1.36/1.33 |
-| **galen (Zen3)** | 1.49/1.41 | 1.64/1.53 | 1.00/1.00 | 1.11/1.11 | 1.72/1.68 | 1.34/1.31 |
-| **neuromancer (Zen5)** | 1.51/1.43 | 1.64/1.57 | 1.00/1.00 | 1.12/1.12 | 1.72/1.67 | 1.35/1.32 |
+| **Zen4** | 1.50/1.43 | 1.62/1.54 | 1.00/1.00 | 1.13/1.13 | 1.73/1.68 | 1.36/1.33 |
+| **Zen3** | 1.49/1.41 | 1.64/1.53 | 1.00/1.00 | 1.11/1.11 | 1.72/1.68 | 1.34/1.31 |
+| **Zen5** | 1.51/1.43 | 1.64/1.57 | 1.00/1.00 | 1.12/1.12 | 1.72/1.67 | 1.35/1.32 |
 
 `pttrs` is 1.67–1.73 vs OB, so **AOCL is its only binding reference**; `gttrs` is 1.03–1.06 vs AOCL and
 sits at parity with OB (medians 0.9999–1.004, per-sample spread at n=4096 of 0.897–1.107 — where the
@@ -957,18 +957,18 @@ deinterleave — it starves Zen3's shuffle ports.
   column-panel driver → gates AVX-512 small-mid (0.99–1.02), large-n memory-ceiling (~0.93, mirrors real
   gemvN). **AVX2 gemvN 0.5–0.7 (below gate): shuffle/throughput-bound TUNING residual** — a split-`Vec{W}`
   variant measured WORSE; fma primitives suffice (not intrinsic-blocked). TODO: AVX2 gemvN tuning.
-- **L2 geru/gerc DONE — gate both** (3b62394): per-column complex axpy — galen 0.97–1.31, wintermute 1.03–1.32.
-- **L2 hemv DONE — BEATS OB both** (77d8873): fused axpy+conj-dot column kernel (one A-column read). galen
-  1.28–1.87×, wintermute 1.21–2.01×.
+- **L2 geru/gerc DONE — gate both** (3b62394): per-column complex axpy — Zen3 0.97–1.31, Zen4 1.03–1.32.
+- **L2 hemv DONE — BEATS OB both** (77d8873): fused axpy+conj-dot column kernel (one A-column read). Zen3
+  1.28–1.87×, Zen4 1.21–2.01×.
 - **L2 trmv/trsv DONE** (e676b3f): per-column axpy(N)/dot(T/C) reuse, all 48 combos correct. trmv gates
-  both (galen 0.86–1.68), trsv gates AVX-512 (0.96–1.03), AVX2 0.84–0.94 (sequential solve + complex divide
+  both (Zen3 0.86–1.68), trsv gates AVX-512 (0.96–1.03), AVX2 0.84–0.94 (sequential solve + complex divide
   — AVX2 residual, but improves scalar 0.57). **⇒ complex L2 essentially complete** (symv skipped — no
   standard LinearAlgebra complex-symv oracle).
 - **L3 ctrmm/ctrsm side-L DONE — materialized-gemm bases** (9a5d3b1, b5ad32c): the complex bases re-read A
   n times (trmv/trsv-per-column); replaced with the real bases' strategy — ctrmm: materialize op(A) triangle
   once (`_mat_tri!`+conj) then B:=M·B; ctrsm: invert once via the now-generic `_trtri!` then B:=op(M⁻¹)·B —
   both via the gating SIMD complex gemm (reads A once). Correct nfail=0 all combos both boxes, 0-alloc warm.
-  ctrmm wintermute n=64 0.26→0.79 … 1024 0.97; ctrsm n=512 0.75→**0.97**, 1024→**1.00** (gate). galen
+  ctrmm Zen4 n=64 0.26→0.79 … 1024 0.97; ctrsm n=512 0.75→**0.97**, 1024→**1.00** (gate). Zen3
   improved but below gate (complex-gemm AVX2 ceiling + trtri/materialize+copyback overhead on small-n).
   NOT in strict dogfood (complex L3 scratch = keyed workspace fallback, 0-alloc but not const-dispatched).
 - **L3 ctrmm/ctrsm side-R DONE** (c7ce41a): materialized bases mirroring side-L (B:=B·M / B:=B·op(M⁻¹)),
@@ -1005,7 +1005,7 @@ Studied OpenBLAS `develop` for beat-OpenBLAS wins. Prioritized:
    impact (whole complex L3/L2/L1 surface), high effort.
 2. **Tall-skinny GEMM — NOT a gap (verified, dismissed).** Hypothesis: our `_use_unpacked` gates on
    `max(m,n,k)` while OpenBLAS gates on volume `M·N·K≤1e6`, so we'd pack tall-skinny that OB runs
-   direct. MEASURED on galen: PureBLAS already **beats** OB 1.14–2.64× on 4096×8×8-type shapes *despite*
+   direct. MEASURED on Zen3: PureBLAS already **beats** OB 1.14–2.64× on 4096×8×8-type shapes *despite*
    packing → no action (a switch to volume-gating might help further but the gate is already met).
 3. **Small SQUARE gemm n=8 (~0.82 Zen4).** We already skip packing there (`max=8≤128`), so it's
    dispatch/call overhead or mobile-chip noise, not packing — low ROI; revisit if it blocks a gate.
@@ -1036,7 +1036,7 @@ dot/nrm2 and potrf; LU/QR/SVD adjoints second, since that is where the subtlety 
 Requested 2026-07-01 ("extend PureBLAS to run on GPU and match cuBLAS and CUTLASS"). Planned
 2026-07-02; **start after the pinned certification + Zen3/Zen5 fleet gate runs** (user decision).
 
-**Hardware:** GeForce RTX (consumer) — NOT wintermute (verified: no NVIDIA device/driver, only the
+**Hardware:** GeForce RTX (consumer) — NOT Zen4 (verified: no NVIDIA device/driver, only the
 AMD Phoenix iGPU), so GPU dev/benching happens on the box that hosts the card. Consumer FP64 runs at
 1/64 rate — the FP64 gate is still fair (cuBLAS pays the same rate), but tensor-core paths are where
 the CUTLASS fight is.

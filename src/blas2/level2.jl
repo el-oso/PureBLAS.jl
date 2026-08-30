@@ -44,7 +44,7 @@ const _GEMV_NP = 8             # gemv-N column-panel width
 # ── gemvN m-inner panel (OpenBLAS dgemv_n shape; see _gemv_n_paneldrv_minner!). The old panel path holds
 # a full row-block's y in registers and sweeps columns inner, so each of NP=8 A-columns is read in mr-row
 # bursts with big gaps → the HW prefetcher can't sustain 8 strided streams (dips at first L3-resident size:
-# galen 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that the y-block stays L1-resident,
+# Zen3 512 0.92, Zen5 2048 0.91). OB inverts it: m-block small enough that the y-block stays L1-resident,
 # columns grouped per panel, inner loop streams m DOWN each column (tight, continuous per-column streams
 # the prefetchers lock onto), x broadcasts hoisted, y RMW'd from L1. HELPS on AVX2 (narrow → the extra
 # per-column streams win) and on double-pumped-512 Zen4 (each 512-bit pipe is occupied twice, hiding the
@@ -84,9 +84,9 @@ const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
     #
     # FLEET TABLE — all three boxes freq-locked and VERIFIED before and after, quiet (the contention
     # guard refused and was re-run), gemvN, PB median µs, ratio minner=0 / minner=1:
-    #   Zen3 galen      m-inner WINS  gate 0.925 vs 0.901          -> datapath 32 -> true   (shipped)
-    #   Zen4 wintermute m-inner WINS  gate 0.969 vs 0.953          -> datapath 32 -> true   (shipped)
-    #   Zen5 neuromancer m-inner LOSES n=512 0.916, n=1024 0.964,
+    #   Zen3 Zen3      m-inner WINS  gate 0.925 vs 0.901          -> datapath 32 -> true   (shipped)
+    #   Zen4 Zen4 m-inner WINS  gate 0.969 vs 0.953          -> datapath 32 -> true   (shipped)
+    #   Zen5 Zen5 m-inner LOSES n=512 0.916, n=1024 0.964,
     #                    wins n=2048 1.043, flat elsewhere         -> datapath 64 -> false  (shipped)
     #
     # THE ZEN5 NEGATIVE IS NOW VALID. It previously rested on a run taken at 4841 MHz against a
@@ -711,7 +711,7 @@ end
 #                                  amortising x is the whole game again.
 #
 # DECISION (Measure, req#8b — a one-box derivation was caught here). Inside that window, per-column
-# beats blocked NC=4 by up to 1.35× on wintermute (Zen4, 16 MB L3, mobile) and NEVER wins on galen
+# beats blocked NC=4 by up to 1.35× on Zen4 (Zen4, 16 MB L3, mobile) and NEVER wins on Zen3
 # (Zen3, 32 MB L3/CCX, desktop) — measured per-column ÷ blocked, GB/s:
 #     n=      128   256   512   768  1024  1536  2048  3072  4096
 #   Zen4     0.83  0.90  1.10  1.09  1.22  1.30  1.13  0.80  0.71   ⇒ window real
@@ -720,14 +720,14 @@ end
 # class as `_ger_np` ("intrinsic per-core property, NO derivable formula, OPPOSITE sign across µarchs"),
 # so it gets the same treatment: Preference-pinnable, else auto-measured once per process.
 # MEASURE tier (PDM): this is NOT physically predictable, so it must be measured, not guessed.
-# Per-column beats blocked NC=4 inside the window by up to 1.35× on wintermute (Zen4) and NEVER wins on
-# galen (Zen3) — per-column ÷ blocked, GB/s:
+# Per-column beats blocked NC=4 inside the window by up to 1.35× on Zen4 and NEVER wins on
+# Zen3 — per-column ÷ blocked, GB/s:
 #     n=      128   256   512   768  1024  1536  2048  3072  4096
 #   Zen4     0.83  0.90  1.10  1.09  1.22  1.30  1.13  0.80  0.71
 #   Zen3     0.81  0.86  0.92  0.90  0.97  0.84  0.74  0.74  0.80
 # Opposite sign across µarchs with no formula over detected consts predicting it — the `_ger_np` shape
 # ("intrinsic per-core property, NO derivable formula, OPPOSITE sign across µarchs"). A Derive-only
-# version of this route regressed galen gemvT to 0.69 vs AOCL, and a `_double_pumped` default would be a
+# version of this route regressed Zen3 gemvT to 0.69 vs AOCL, and a `_double_pumped` default would be a
 # 2-point fit dressed up as physics. So: auto-measured once per process, Preference only as the user's
 # override AFTER measuring, never as the shipped mechanism.
 #
@@ -861,14 +861,14 @@ end
 # `bench/plots.jl bench op=gemvT` with PB+OpenBLAS+AOCL measured in the SAME run, forced through the
 # real entry path with `PUREBLAS_FORCE_gemvt_perscan`. Gate = min(vs OB, vs AOCL), pooled-quantile
 # median:
-#     Zen5 (neuromancer)  n=  64     128    256    512    1024   2048   4096
+#     Zen5 (Zen5)  n=  64     128    256    512    1024   2048   4096
 #       mode 0  ← ships     1.018  0.863  0.733  0.991  1.012  1.061  1.092
 #       mode 1              1.013  0.855  0.735  0.974  0.906  0.918  1.044
 #       mode 2              0.587  0.646  0.703  0.977  0.921  0.927  0.805
-#     Zen4 (wintermute)
+#     Zen4 (Zen4)
 #       mode 1  ← ships     1.046  1.030  0.986  1.088  1.175  1.044  1.101
 #       mode 0              1.038  1.034  0.989  1.033  0.939  0.956  1.096
-#     Zen3 (galen)
+#     Zen3 (Zen3)
 #       mode 0  ← ships     1.101  1.026  1.037  1.024  0.971  0.942  1.030
 #       mode 1              1.105  1.026  1.023  0.977  0.970  0.686  1.074
 #       mode 2              0.853  0.870  1.004  0.973  0.969  0.687  0.787
@@ -884,9 +884,9 @@ const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
                              _p isa Bool ? (_p ? 1 : 0) : _p)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
     # DUEL DELETED 2026-08-19 — it was shipping a 27% regression once every ~6 processes.
-    # Resolved across 6 fresh processes per box: wintermute 1,1,1,1,1,1 but galen 0,0,0,0,1,0. The
+    # Resolved across 6 fresh processes per box: Zen4 1,1,1,1,1,1 but Zen3 0,0,0,0,1,0. The
     # full-run fleet table above says Zen3 wants mode 0 at EVERY size and that mode 1 costs it
-    # gemvT@2048 = 0.942 -> 0.686. So one galen process in six silently shipped that, with nothing in
+    # gemvT@2048 = 0.942 -> 0.686. So one Zen3 process in six silently shipped that, with nothing in
     # the output to say which arm ran — and gemvT@2048 is itself an open gate task.
     #
     # WHY THE PROBE LOST TO THE TABLE: it timed 5 interleaved reps of one shape INSIDE the window, in
@@ -1073,7 +1073,7 @@ end
         #     n times (x traffic ≈ A traffic at n=4096!), so amortising it is the whole game. Blocked.
         #   • in between — A past L2 but x still comfortably L1-hot — re-reading x is free, and the
         #     blocked kernel's extra concurrent A-column streams only cost prefetch/TLB. Per-column.
-        # Measured (wintermute, freq-locked, GB/s; per-column ÷ blocked NC=4):
+        # Measured (Zen4, freq-locked, GB/s; per-column ÷ blocked NC=4):
         #     n=      128    256    512    768   1024   1536   2048   3072   4096
         #   ratio    0.83   0.90   1.10   1.09   1.22   1.30   1.13   0.80   0.71
         # `_gemvt_perscan` below reproduces every one of those crossovers on this box: blocked at
@@ -1084,7 +1084,7 @@ end
         # the deficit is the BLOCKING, not the kernel.
         # NC=4 columns (⇒ 4 dot accumulators) per block. MEASURED-AND-KEPT, not an unexamined literal:
         # the standing hypothesis was that 4 chains half-fill Zen4's 2 FMA/cyc × ~4-cyc-latency pipe and
-        # that ≥8 would close the mid-n gemvT miss. FALSIFIED 2026-07-31 (wintermute, freq-locked, GF/s,
+        # that ≥8 would close the mid-n gemvT miss. FALSIFIED 2026-07-31 (Zen4, freq-locked, GF/s,
         # same-process A/B over the @generated Val{NC}):
         #     n=  256   512  1024  2048  4096
         #  NC=2  20.59 15.88 14.27  7.28  7.13
@@ -1185,7 +1185,7 @@ const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int   # legacy pin; superse
 # `_CGEMVT_HALF` ~45 lines before its definition.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CGEMVT_HALF = @load_preference("cgemvt_half", _vwidth(Float64) == 4)::Bool
-# Once A spills L2 (n≳768), gemvT/C is bandwidth-bound, not FMA-latency-bound (measured galen: n≥1024
+# Once A spills L2 (n≳768), gemvT/C is bandwidth-bound, not FMA-latency-bound (measured Zen3: n≥1024
 # both PB & OB run at L3/DRAM bandwidth, PB only ~92-94% of OB's). Same +192B A-stream prefetch that
 # fixed the gemvN ri valley saturates it here. AVX2-gated (AVX-512 gemvT already gates); Preferences knob.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
@@ -1230,7 +1230,7 @@ const _CGEMVT_CFG_DEFAULT = _CGEMVT_NC + (_CGEMVT_HALF ? 100 : 0)
 # incumbent and ties go to it. The knob REMAINS Measure tier: a box whose optimum really is fewer
 # streams can still displace it, but must now clear the supermajority AND the regret bound to do so.
 # ⚠ This used to read "Zen5 resolves `_ger_np()` = 1, so this is not hypothetical". That was FALSE and
-# is the reason the example is gone rather than updated: neuromancer had an untracked
+# is the reason the example is gone rather than updated: Zen5 had an untracked
 # `bench/LocalPreferences.toml` pinning `ger_panel_np = 1`, so the auto-measure never ran there. With
 # the pin removed it resolves to **8** (2026-08-09). No box on the fleet is known to want 1.
 const _CGEMVT_CFG_BIG = (
@@ -1238,8 +1238,8 @@ const _CGEMVT_CFG_BIG = (
     n + 100
 )
 # DERIVE (2026-08-19): the duel is GONE. `_CGEMVT_CFG_BIG` above is already a complete derivation over
-# `_NVREG`, and it reproduces what the duel actually resolved on every box we have — galen (_NVREG=16)
-# fits (4,half) => 104, measured 104 in 6/6 fresh processes; wintermute (_NVREG=32) fits (8,half) =>
+# `_NVREG`, and it reproduces what the duel actually resolved on every box we have — Zen3 (_NVREG=16)
+# fits (4,half) => 104, measured 104 in 6/6 fresh processes; Zen4 (_NVREG=32) fits (8,half) =>
 # 108, measured 108 in 8/8. The duel could therefore only ever agree with the formula or coin-flip away
 # from it, and the comment above already records it alternating 108/4/108/4/108/4/108/4 across eight
 # processes with the old incumbent. A knob whose measurement can only confirm or corrupt its derivation
@@ -1261,7 +1261,7 @@ const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n co
 # serial muladds/column forming an 8-cyc loop-carried chain. Fix: NC columns OUTER, rows inner, FRESH
 # Pv/Qv accumulators each row-iter (the y-RMW breaks all dep chains), α folded ONCE per column into the
 # hoisted x-broadcast (cr,ci = α·x[jj] — NC mults/panel, amortized over m rows, not per row-tile), and a
-# +192 B prefetch on each A stream. Measured galen: n=1024 0.735→1.03, sweep 1.00–1.24× OB. Only 2
+# +192 B prefetch on each A stream. Measured Zen3: n=1024 0.735→1.03, sweep 1.00–1.24× OB. Only 2
 # shuffles/row-iter (on Q, off the FMA ports). AVX2 only; AVX-512 keeps the row-tile path (already gates).
 # PDM: Literal — 4 columns per panel, matching what OpenBLAS uses; not swept independently. | tune: candidate
 const _CGEMVN_NC = @load_preference("cgemvn_nc", 4)::Int             # columns per panel (OB uses 4)
@@ -1456,7 +1456,7 @@ end
 # and 12 after. A derived const is deterministic by construction and const-folds.
 #
 # ⚠ ZEN5 IS PREDICTED, NOT MEASURED (W=8 ⇒ 12). req#8b(b) requires a derived formula to reproduce the
-# fleet's measured optima before it is trusted to extrapolate, and neuromancer has not been run for
+# fleet's measured optima before it is trusted to extrapolate, and Zen5 has not been run for
 # this knob. Acceptance test, to run freq-locked with plots.jl methodology and `arms=pb`: zgemvN square
 # at A≈L3 and A≈4×L3, Val(8) vs Val(12) arms of `_gemv_n_ri_run!`, median estimator. If Zen5 prefers 8,
 # that is the req#8b tell and this goes back to Measure — the Preference below is the escape hatch
@@ -1588,7 +1588,7 @@ end
 # One column-block of gemv-T/C: NC columns share each x W-chunk AND its swap (1 shuffle feeds NC cols),
 # and x is streamed once per block instead of re-read per column. Reduction mirrors _dot_cmplx_simd.
 # HALF: accumulate in the native-ymm Vec{W} (1 reg) rather than Vec{2W} (2 regs). Large-n gemvT/C is
-# bandwidth/MLP-bound (measured galen: n≥1024 both PB & OB run at L3/DRAM bw); Vec{2W} at NC=2 already
+# bandwidth/MLP-bound (measured Zen3: n≥1024 both PB & OB run at L3/DRAM bw); Vec{2W} at NC=2 already
 # eats all 16 ymm, capping concurrent column streams at 2. Vec{W} at NC=4 → 4 independent streams (OB's
 # AVX2 blocking) → more memory-level parallelism → saturates bw. Full-width kept for AVX-512 (32 regs).
 @inline @generated function _gemv_tc_block_cmplx!(
@@ -1704,7 +1704,7 @@ end
         m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}
     ) where {T <: BlasReal, CJ}
     # ⚠ THE OPTIMUM IS SIZE-DEPENDENT, SO THE RESIDENCY SPLIT IS PART OF THE KNOB — one global config is
-    # measurably wrong at one end or the other. Measured 2026-08-07 on wintermute, freq-locked, all arms
+    # measurably wrong at one end or the other. Measured 2026-08-07 on Zen4, freq-locked, all arms
     # SAME-RUN, forced via PUREBLAS_FORCE_cgemvt_cfg, vs AOCL:
     #     n      A vs L2      NC=4 wide      NC=8 half
     #     64     ≪ L2         1.007          0.986
@@ -1726,7 +1726,7 @@ end
         #     full: ceil(m/cstep)          half: ceil(m/(cstep/2)) / 2
         # and half strictly wins exactly when the remainder is at most half a step — it absorbs the
         # tail in a half-price iteration instead of a full-price one. Ties go to full, which has the
-        # longer loop body and fewer iterations of overhead. Measured wintermute (ratio half/full,
+        # longer loop body and fewer iterations of overhead. Measured Zen4 (ratio half/full,
         # NC=4, freq-locked): m=50 1.039/1.065, m=100 1.036/1.078 (T/C) where the rule picks half;
         # m=128 0.992/1.008, m=256 0.995/1.024 where it picks full. Above L2 the residency ladder
         # below owns the choice and this does not apply.
@@ -1744,7 +1744,7 @@ end
     # was a MethodError, not a slow path: `cfa09a4` appended U to these two complex call sites while
     # adding it to the real kernel, and `a411e57` appended PF on top. It stayed latent because it needs
     # all three of complex trans='T'/'C', A larger than L2, AND the OncePerProcess tuner landing on cfg
-    # 108/104 -- so it fires per machine and per process, and the 2026-08-12 wintermute sweep is the
+    # 108/104 -- so it fires per machine and per process, and the 2026-08-12 Zen4 sweep is the
     # first thing that hit it (zgemvT/zgemvC dropped out of the cache entirely).
     if _cgemvt_fits(8, true) && cfg == 108
         return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(8), Val(true))    # req8-ok: candidate arm
@@ -1862,7 +1862,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # The idea (from the AOCL disassembly: its zaxpyv uses one `vbroadcastsd` per part, 2 registers per
 # column, which is how a competitor affords 8 streams where our wide layout affords 4) was to switch
 # the panel to `Vec{W}` coefficients and let NP reach the box's measured `_ger_np()` = 8. It is a
-# clean derivation and it MADE THINGS MUCH WORSE. Measured on wintermute, freq-locked, all arms
+# clean derivation and it MADE THINGS MUCH WORSE. Measured on Zen4, freq-locked, all arms
 # same-run, zgeru vs AOCL:
 #     n=1024   0.901  ->  0.742     <- severe regression at the L3 boundary
 #     n=2048   1.355  ->  1.334
@@ -1896,14 +1896,14 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # change flips, against the spread of the cells it does NOT flip — those are controls by construction,
 # since the divisor can only alter behaviour inside [L3/2, L3):
 #     box                flipped cell        ratio    control band   verdict
-#     wintermute Zen4    n=1000 (15.3/16M)   0.9713   ±1.2%          -2.9%
-#     galen      Zen3    n=1024 (16/32M)     0.9711   ±1.7%          -2.9%
-#     neuromancer Zen5   n=1000 (15.3/16M)   1.0029   ±2.3%          null (24 samples/arm)
+#     Zen4    n=1000 (15.3/16M)   0.9713   ±1.2%          -2.9%
+#     Zen3      Zen3    n=1024 (16/32M)     0.9711   ±1.7%          -2.9%
+#     Zen5   n=1000 (15.3/16M)   1.0029   ±2.3%          null (24 samples/arm)
 # Two µarchs gain 2.9% on DIFFERENT sizes — the rule reproducing, not a per-box fit — and the third is
 # unaffected. Zen5 needed 3 replicates/arm before its band was tight enough to adjudicate 3%; at 2
 # replicates a control swung 6.4% on its own. Do not read a Zen5 verdict off a 2-replicate run.
 #
-# ⚠ THE FACTOR IS BRACKETED, NOT FITTED. den=4 (cold at a QUARTER of L3) was measured on wintermute and
+# ⚠ THE FACTOR IS BRACKETED, NOT FITTED. den=4 (cold at a QUARTER of L3) was measured on Zen4 and
 # is WRONG: n=512 (A = 4 MiB of a 16 MiB L3) regressed 8.3% (110623 -> 119791 µs) while every other size
 # stayed flat. At a quarter occupancy A really is resident and the per-column warm arm is correct. So
 # den=1 is too permissive (misses the 50-100% band, costs 2.9%), den=4 too aggressive, den=2 is the edge.
@@ -1941,16 +1941,16 @@ const _CGER_COLD_DEN = @load_preference("cger_cold_den", 2)::Int
 # fleet that is worth 8 on Zen4 and 1 on Zen5 — this file records the gate measuring np=1 twelve
 # percent faster than np=8 at n=2048 there, so the pin is not cosmetic.
 # MINIMAX DEFAULT, gate-measured on all three boxes 2026-08-20 (op=ger, arms=pb, forced each arm):
-#     np       wintermute   galen    neuromancer     WORST
+#     np       Zen4   Zen3    Zen5     WORST
 #      1         0.884      0.970      1.013 PASS    0.884
 #      4         0.935      0.981      0.714 FAIL    0.714   <- was the default
 #      8         0.986      0.975      0.800 FAIL    0.800
 # THIS KNOB IS GENUINELY PER-MACHINE — the retired duel was RIGHT about it. Its per-box optima are
-# 8 / 4 / 1, and wintermute and neuromancer want 8 vs 1 despite sharing L2, L3, simd AND nvreg. No
+# 8 / 4 / 1, and Zen4 and Zen5 want 8 vs 1 despite sharing L2, L3, simd AND nvreg. No
 # formula reproduces that; a single value is a compromise by construction, not a derivation.
 # 1 is chosen by WORST CASE, which is the correct criterion for a value that must run on machines
 # nobody has measured: it is the only candidate that collapses nowhere, and the only one that lets
-# neuromancer pass at all. The previous default of 4 cost that box 29.5% against its own optimum and
+# Zen5 pass at all. The previous default of 4 cost that box 29.5% against its own optimum and
 # turned a PASS into a FAIL — the largest regression of the OncePerProcess campaign, and self-inflicted:
 # the scan reported 8/4/1 with no pattern, which should have BLOCKED the conversion rather than
 # selecting a fallback from it.
@@ -2053,7 +2053,7 @@ end
     # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
     # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
     # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
-    m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (galen n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
+    m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
@@ -2185,7 +2185,7 @@ function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T
     # ⚠ DRAM-BOUND A → PANEL, exactly as the real path does. This asymmetry was a measured gate failure:
     # real `ger` has routed A ≥ L3 to `_ger_paneldrv_np` (NP concurrent write streams) since the stream
     # count was calibrated per box, and the complex path never got it — it ran ONE read+write stream at
-    # every size. Measured 2026-08-07 on wintermute, freq-locked, ALL ARMS SAME-RUN (so this is not the
+    # every size. Measured 2026-08-07 on Zen4, freq-locked, ALL ARMS SAME-RUN (so this is not the
     # cross-run drift that manufactured a phantom miss on Zen3 the same day), zgeru vs AOCL:
     #     n=512  A=4.2 MB  < L3   1.056 PASS
     #     n=1024 A=16.8 MB ≥ L3   0.885 MISS
@@ -2213,7 +2213,7 @@ function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T
         # np == 1 IS the per-column path below (one stream) — no separate arm needed.
         # ⚠ This used to claim the np==1 arm was LIVE on Zen5 ("Zen5 resolves `_ger_np()` = 1"), making
         # the cold-column fix below "that box's whole remedy". FALSE: that reading came from an
-        # untracked `bench/LocalPreferences.toml` on neuromancer pinning `ger_panel_np = 1`, which
+        # untracked `bench/LocalPreferences.toml` on Zen5 pinning `ger_panel_np = 1`, which
         # suppressed the auto-measure entirely. Unpinned it measures **8** (⇒ `_cger_np()` = 4), so the
         # panel arm above is what actually runs there and this branch is currently dead on the fleet.
     end
@@ -2298,7 +2298,7 @@ end
 const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators in the microkernel)
 # symv row-panel height in vectors — its OWN const, NOT _GEMV_MR: symv's off-block fuses NB axpy +
 # NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
-# 16 ymm; the gemv-N MR=8 bump spilled symv (galen 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
+# 16 ymm; the gemv-N MR=8 bump spilled symv (Zen3 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
 # PDM: Literal — FLEET-VALIDATED 2026-08-21, best-or-tied on all 3 µarchs. MR=8 LOSES on both AVX-512 boxes (Zen4 -3.6% @1024, Zen5 -6.3/-3.0/-9.7%), so the register-file derivation is FALSIFIED, not unwritten. MR=6 loses 8-13% on AVX2. MR=2 is inconsistent (wins some sizes, loses others, on both boxes).
 const _SYMV_MR = 4
 
@@ -2908,8 +2908,8 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # inside `_trmv_blk!` for the A/B that fixed the criterion at HALF L2:
 #     n <= NB || 2·n²·sizeof(T) <= _L2_BYTES   ⟺   n <= max(_TRI_NB, isqrt(_L2_BYTES ÷ (2·sizeof(T))))
 # (n integer ⇒ n² <= L2/(2s) ⟺ n² <= L2 ÷ (2s) ⟺ n <= isqrt(L2 ÷ (2s)); exact, no float.)
-# Fleet: L2 = 1 MiB ⇒ 257 for Float64 / 363 for Float32 (Zen4 wintermute, Zen5 neuromancer);
-#        L2 = 512 KiB ⇒ 182 / 257 (Zen3 galen). `_TRI_NB` (=64 fleet-wide) is the floor.
+# Fleet: L2 = 1 MiB ⇒ 257 for Float64 / 363 for Float32 (Zen4 Zen4, Zen5 Zen5);
+#        L2 = 512 KiB ⇒ 182 / 257 (Zen3 Zen3). `_TRI_NB` (=64 fleet-wide) is the floor.
 #
 # WHY IT IS A KNOB AND NOT JUST THE FORMULA: the A/B that validated this crossover (f552f13, 2026-07-31)
 # PREDATES `_trmv_fused8!` (447c46a, 2026-08-01). Below the threshold the loser was the OLD blocked
@@ -3238,8 +3238,8 @@ end
 # off-diagonal rectangle through `_gemv_n_simd!` — which cuts the x re-stream at n=4096 from 512
 # panel passes to 2, i.e. recovers essentially ALL of the hypothesised traffic. Measured vs AOCL at
 # n=4096, both arms scored against the same cached reference so the reference cancels:
-#     galen (Zen3)       ON 0.955 | OFF 0.967 | ON again 0.942
-#     wintermute (Zen4)  ON 1.006 | OFF 1.002 | ON again 1.006
+#     Zen3       ON 0.955 | OFF 0.967 | ON again 0.942
+#     Zen4  ON 1.006 | OFF 1.002 | ON again 1.006
 # No win on either box, and Zen4 shows no dip at all in a clean run — its earlier 0.990 was noise.
 # Removing the traffic changed nothing, so CAPACITY IS NOT THE MECHANISM. Neither is set conflict:
 # n=2048 has the identical geometry (lda = 16384 B, a multiple of the 4096 B L1 way stride, so all
@@ -3285,7 +3285,7 @@ end
 #
 # SCALAR, NOT SIMD, AND THAT IS DELIBERATE. Putting x in one `Vec` would need a lane extract on every
 # chain step (the scalar multiplier for column j), which is *on* the critical path. Scalar registers
-# also make the kernel **W-INDEPENDENT**, so AVX2 (galen, W=4 — the worst cell at 0.743) gets exactly
+# also make the kernel **W-INDEPENDENT**, so AVX2 (Zen3, W=4 — the worst cell at 0.743) gets exactly
 # the same code as AVX-512. This matches what AOCL does: `dtrsm_LLNU_small` is scalar (10 vmovsd,
 # 3 vsubsd, only 4 packed vmovupd), read statically from libflame.so.
 #
@@ -3340,7 +3340,7 @@ end
 # that fits, and degrades once the unrolled body spills. The governing count is the **x86-64 scalar FP
 # register file = 16 xmm**, which is UNIFORM across the whole fleet (Zen3/Zen4/Zen5) — deliberately NOT
 # `_NVREG` (=32 under AVX-512 here): this kernel is scalar and LLVM allocates it in xmm0-15, so the
-# vector-register count is the wrong resource. Being W-independent is the point — galen (AVX2, W=4) is
+# vector-register count is the wrong resource. Being W-independent is the point — Zen3 (AVX2, W=4) is
 # the worst getrs@8 cell and no AVX-512-width trick could close it.
 #   _TRSV_REG_MAX = _SCALAR_FPREGS - 4 = 12
 # VALIDATED against the measured knee (Zen4, all four shapes, worst-shape speedup vs `_trsv_simd!`):

@@ -1,8 +1,8 @@
 _Measured (provenance):_
 
-- **Zen3 · AVX2** (`galen`) — AMD Ryzen 9 5900X 12-Core Processor, commit `a1a2520`, 2026-07-15T19:19
-- **Zen5 · AVX-512** (`neuromancer`) — AMD Ryzen AI 5 340 w/ Radeon 840M, commit `1049531`, 2026-07-15T22:21
-- **Zen4 · AVX-512** (`wintermute`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `57b551a`, 2026-07-15T22:19
+- **Zen3 · AVX2** (`Zen3`) — AMD Ryzen 9 5900X 12-Core Processor, commit `a1a2520`, 2026-07-15T19:19
+- **Zen5 · AVX-512** (`Zen5`) — AMD Ryzen AI 5 340 w/ Radeon 840M, commit `1049531`, 2026-07-15T22:21
+- **Zen4 · AVX-512** (`Zen4`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `57b551a`, 2026-07-15T22:19
 
 ### Real
 

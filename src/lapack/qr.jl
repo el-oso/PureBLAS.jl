@@ -105,7 +105,7 @@ end
 # Unblocked panel reduction (faer port). RANK-2: factor columns in PAIRS — the two reflectors + the H0→col+1
 # cross-apply are the rank-1 path, but the BULK trailing columns (j≥col+2) get a FUSED rank-2 apply (one read
 # pass for both dots + one read/write pass for the rank-2 axpy) instead of two rank-1 sweeps, halving the
-# level-2 trailing traffic. g=v0ᵀv1 (once/pair) decouples the 2nd dot. Measured galen panel +57-74% (18→31
+# level-2 trailing traffic. g=v0ᵀv1 (once/pair) decouples the 2nd dot. Measured Zen3 panel +57-74% (18→31
 # GFlops), bit-identical to rank-1. Odd tail column / trivial reflectors fall back to rank-1.
 function qr_unblocked!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64})
     m, n = size(A); ld = stride(A, 2); k = min(m, n)
@@ -258,7 +258,7 @@ end
 # measured Zen4 floor 8 · _NVREG 32): Zen4/Zen5 (32 regs) → floor 8, Zen3 (16 regs) → floor 16. Grow one
 # floor per L2-overflow of the matrix; cap 32 (µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs — the
 # BLAS-2 panel share ≈0.75·nb/n bites there; also = old flat value, so tall/large-m·n caps at 32 = no
-# regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 galen (16→24→32),
+# regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 Zen3 (16→24→32),
 # formula reproduces both within ~5% (req#8b). Zen5 predicted = Zen4 (same NVREG/vw/L2) — needs confirm.
 #
 # FLAT nb = 4·_vwidth IS FALSIFIED ON BOTH BOXES — do not re-propose it. Branch `geqrf-nb-derived`
@@ -306,20 +306,20 @@ const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 # Honest tiering: `_NARROW_SIMD` is a datapath-gated literal, i.e. Measure-tier debt by req#8b — but it
 # is PRE-EXISTING debt that was previously INVISIBLE behind `_CGEMM_3M`. Naming it neither creates nor
 # discharges it; it makes it auditable, and it keeps this line's behaviour byte-identical to what the
-# Zen5/galen numbers below were measured against.
+# Zen5/Zen3 numbers below were measured against.
 const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is enabled"
 #
 # Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
 # strong — it BEATS the blocked WY path while the matrix stays cache-resident (its O(n³) re-streams hit cache,
 # not DRAM). req#8: derive from residency, not a size literal. On the wide-SIMD box (AVX-512)
-# unblocked wins to matrix ≈ ½L3 (neuromancer Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
+# unblocked wins to matrix ≈ ½L3 (Zen5: single to n≈700, collapses n≥1536). On the AVX2-complex
 # box the BLAS-2 panel is bandwidth-bound AND the chunked blocked path is efficient from small n,
-# so unblocked only wins while the matrix is ~L2-resident (≤2·L2 ⇒ galen n≤256; n≥320 must reach blocked).
+# so unblocked only wins while the matrix is ~L2-resident (≤2·L2 ⇒ Zen3 n≤256; n≥320 must reach blocked).
 @inline _zqr_unblk_max(::Type{T}) where {T} = _NARROW_SIMD ? 2 * _L2_BYTES : _L3_BYTES ÷ 2
 # Blocked panel width (COMPLEX), derived: the trailing gemm C−=V·W contracts over pb=nb, and once the matrix
 # spills cache each panel re-streams the trailing matrix from DRAM (total sweep traffic ∝ k/nb). Grow nb with
 # how many times the matrix exceeds ¼L3 so DRAM-sweep bytes stay bounded, capped at 4× where the BLAS-2 panel
-# share (≈0.75·nb/n) starts to bite. Measured galen: 32 (n≤512) → 64 (768) → 96 (1024) → 128 (≥1280), gating
+# share (≈0.75·nb/n) starts to bite. Measured Zen3: 32 (n≤512) → 64 (768) → 96 (1024) → 128 (≥1280), gating
 # the whole range (nb=32 dips at n≥896, nb=64 dips at n≈320). Overridable base "qr_nb_c".
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
     clamp(_fh_qr_nb_c() * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _fh_qr_nb_c(), 4 * _fh_qr_nb_c())
@@ -378,7 +378,7 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
             end
             # nc-CHUNK the trailing update over columns. On the AVX2-complex path (_CGEMM_3M) the two trailing
             # gemms route through Karatsuba-3M, which materializes O(mp·nt) real split/product scratch (~3× the
-            # trailing matrix) — for nt≈mp≈n that spills L3 exactly when the matrix ITSELF fits L3 (the galen
+            # trailing matrix) — for nt≈mp≈n that spills L3 exactly when the matrix ITSELF fits L3 (the Zen3
             # n≈768–1100 dip band). Chunking columns bounds that scratch to ≤½L3 AND fuses each Cj's V·W downdate
             # while its Vᴴ·C is still L3-hot (read+write once vs ~5–6 matrix passes). ncb = nt (single chunk,
             # bit-identical) when 3M is off. req#8: ncb from the 3M live-set residency ≤ ½·L3,
@@ -389,7 +389,7 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
             # BEHAVIOUR CHANGE on AVX-512 as of the 2026-08-09 default flip — chunking now activates on
             # Zen4/Zen5, where `ncb = nt` (single chunk) before. It is the right shape by the argument
             # above and is UNMEASURED on those boxes; zgeqrf must be re-gated there before the flip is
-            # trusted. (The old comment said "when 3M is off (neuromancer)" — stale, 3M is on there now.)
+            # trusted. (The old comment said "when 3M is off (Zen5)" — stale, 3M is on there now.)
             ncb = _CGEMM_3M ? clamp(((_L3_BYTES ÷ 2) ÷ ((sizeof(T) + 3 * sizeof(real(T))) * mp)) & ~7, min(4 * _CNR, nt), nt) : nt
             jj = jt0
             while jj <= n
@@ -499,7 +499,7 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
             # Skinny W=Vᵀ·C via the unpacked path — the crossover is a µARCH SPLIT (req#8; measured fleet):
             #  • AVX2 (W=4): the packed transA skinny gemm is STABLE at large mp, so unpacked wins only while Vᵀ
             #    (pb·mp·8 B) stays L2-resident (else it re-fetches Vᵀ per n-tile). Gate: Vᵀ≤½L2 ⇔ 16·pb·mp≤L2
-            #    (galen: unpacked +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536).
+            #    (Zen3: unpacked +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536).
             #  • AVX-512 (W=8): the packed transA skinny gemm COLLAPSES at large mp (neuro/wm: packed 16-28 vs
             #    unpacked ~30-42 GF for mp≥512), so unpacked wins for all non-tiny mp. Gate: mp>_GEMM_UNPACK_MAX.
             useskinny = _CHOLW == 4 ? (16 * pb * mp <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX)

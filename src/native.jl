@@ -7,7 +7,7 @@
 # zdotc/zscal on Zen4 — but it stopped one frame short: these nine forwards stayed out-of-line, so
 # every public BLAS-1 call still paid one un-inlined frame. `scal` was the op where that residue was
 # visible, and it did not move at all in b129a3c, which is what pointed here.
-# Measured on wintermute (freq-locked, bench/probes/scal_live.jl, which reproduces plots.jl's regime —
+# Measured on Zen4 (freq-locked, bench/probes/scal_live.jl, which reproduces plots.jl's regime —
 # fresh arrays per sample, `reps` dependent passes per sample) at the n=10000 gate cell:
 #     PureBLAS.scal!  0.9855-0.9935  |  _scal!(length(x),…) direct  1.0007-1.0026  |  bare loop  1.0058
 # i.e. the kernel already BEATS OpenBLAS and this frame gave the win back — the same shape as the

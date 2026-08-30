@@ -32,7 +32,7 @@ const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 # F64 faer base ported to Float32 — deferred, lower priority than F64 supernodes.) F64/Dual keep _POTRF_BASE.
 # Derived (÷2 off the F64 anchor), µarch-invariant crossover like _CHOL_STH; knob "potrf_base_f32"; fleet-validate.
 # MUST be a top-level const (like every other tuning const here): @load_preference inside a function body is a
-# per-CALL runtime preferences lookup — it dominated microsecond small-n F32 factorizations (galen spotrf 0.02).
+# per-CALL runtime preferences lookup — it dominated microsecond small-n F32 factorizations (Zen3 spotrf 0.02).
 # PDM: Derived — sizeof ratio: F32 is half F64's bytes, so half the n. | tune: n/a, follows potrf_base
 const _POTRF_BASE_F32 = @load_preference("potrf_base_f32", _POTRF_BASE >> 1)::Int
 @inline _potrf_base(::Type{Float32}) = _POTRF_BASE_F32
@@ -47,7 +47,7 @@ const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int 
 # 1.09), but on AVX2 (W=4) the narrower datapath makes the n=64 base memory-bound (0.76), so cap it at 32
 # (n≤32 gates, n>32 → rl). Keyed on _vwidth like the sibling cuts. Larger bases go memory-bound unblocked
 # unblocked (base=128 → n=128 0.72), smaller pay recursion/small-k overhead — like the real f64 path's
-# base-case threshold _CHOL_STH. ponytail: flat literal; galen(AVX2)/zen5 calibration via the knob.
+# base-case threshold _CHOL_STH. ponytail: flat literal; Zen3(AVX2)/zen5 calibration via the knob.
 
 # Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
 # columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
@@ -372,11 +372,11 @@ end
 @inline _potrf_unative_min(::Type{T}) where {T} = isqrt(_L3_BYTES ÷ sizeof(T))
 # Forceable — and the first thing the hook bought was a FALSIFICATION of the suspicion that prompted it.
 #
-# The worry: on galen L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921
+# The worry: on Zen3 L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921
 # vs AOCL while potrf@1000 (lower, same box, same run) reads 1.131. A 19% spread between an op and its
 # own transpose mirror looked like a misplaced crossover.
 #
-# It is not. Measured galen 2026-08-28, boost-locked, PB/AOCL, 8 rounds, ABBA-rotated:
+# It is not. Measured Zen3 2026-08-28, boost-locked, PB/AOCL, 8 rounds, ABBA-rotated:
 #     potrfU@1000   lever 0.922, 0.920   native 0.891, 0.890   -> lever wins by 3.5%
 #     potrfU@512    lever 1.374          native 1.345          -> lever wins by 2.2%
 # Forcing native-upper down to n=1000 makes it WORSE. The residency derivation is placing the crossover
@@ -431,7 +431,7 @@ end
 # transpose-plus-vectorised-lower (c_t·2n² + c_v·n³/3, c_v ≪ c_s), so the crossover is
 # n* = 6·c_t/(c_s − c_v) — a ratio of our OWN kernels' rates. Nothing in the cache hierarchy or the
 # ISA predicts it, it MOVES whenever either kernel improves, and it is TYPE-dependent: measured on
-# wintermute (bench/probes/potrf_upper_cross.jl, direct/transpose, <1 = direct wins)
+# Zen4 (bench/probes/potrf_upper_cross.jl, direct/transpose, <1 = direct wins)
 #     n            8      12      16      20      24      32
 #     Float64    0.767   0.815   1.026   0.829   1.415   1.825      ⇒ crossover ≈ 14-16
 #     ComplexF64 0.573   0.693   0.867   0.991   1.06    1.342      ⇒ crossover ≈ 22
@@ -452,7 +452,7 @@ end
 # quantisation error that sent n=9..15 to the lever needlessly. Half-width gives {8,12,16,20,...}.
 #
 # THE CROSSOVER IS A SHALLOW, NON-MONOTONIC BAND, not a point — do not read the returned value as
-# precise. Probe on wintermute (direct/transpose, <1 = direct wins):
+# precise. Probe on Zen4 (direct/transpose, <1 = direct wins):
 #     n=8 0.767   12 0.815   16 1.026   20 0.829   24 1.415   32 1.825
 # direct loses at 16 and wins again at 20, i.e. ~16-20 is within a few percent either way, and the
 # decisive loss only arrives at 24 (+41%). The harness scans ascending and returns the last n before
@@ -469,8 +469,8 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
         max(1, _vwidth(real(T)) ÷ (T <: Complex ? 2 : 1))
     # DUEL DELETED 2026-08-19. This knob's own comments already confessed it: "20 / 16 / 18 / 12 —
     # four different cutoffs from one binary", and ComplexF64 "16/18/20 across ten fresh processes".
-    # Re-measured 6 fresh processes per box: galen resolves 12 for F32/F64/C32 and 10/11/11/8/11/12 for
-    # C64; wintermute 24 (F32), 12/20/12/12/12/12 (F64), 20 (C32), 10/12/12/12/12/10 (C64).
+    # Re-measured 6 fresh processes per box: Zen3 resolves 12 for F32/F64/C32 and 10/11/11/8/11/12 for
+    # C64; Zen4 24 (F32), 12/20/12/12/12/12 (F64), 20 (C32), 10/12/12/12/12/10 (C64).
     #
     # 12 is the default for three converging reasons, not one:
     #   1. It is the DOCUMENTED SAFE DIRECTION. The comment above states the δ regret bound biases the
@@ -478,8 +478,8 @@ const _POTRF_UDIRECT_PREF = @load_preference("potrf_upper_direct_max", nothing)
     #      n=16+". A fixed 12 is early by construction.
     #   2. It is what juliac/build.jl has PINNED into the .so all along, so this makes the JIT path and
     #      the shipped binary agree instead of diverging per process.
-    #   3. It is what galen already resolves for three of four eltypes.
-    # The cost is bounded and one-sided: on wintermute F32/C32 (which resolved 24/20) the tiny-n direct
+    #   3. It is what Zen3 already resolves for three of four eltypes.
+    # The cost is bounded and one-sided: on Zen4 F32/C32 (which resolved 24/20) the tiny-n direct
     # win is given up for n in 12..24. Pin `potrf_upper_direct_max` to recover it on a specific box.
     @inline _potrf_udirect(::Type{<:Any}) = (f = _FKR_potrf_upper_direct_max[]; f >= 0 ? f : _at_potrf_udirect(_HW))
 else
@@ -504,7 +504,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # with c_v << c_s, so direct wins only while n < 6·c_t/(c_s − c_v): a ratio of IMPLEMENTATION
     # constants, not a structural boundary and not derivable from cache size or SIMD width.
     #
-    # Measured (wintermute/Zen4, freq-locked, bench/probes/potrf_upper_cross.jl, direct/transpose — <1
+    # Measured (Zen4/Zen4, freq-locked, bench/probes/potrf_upper_cross.jl, direct/transpose — <1
     # means direct wins):
     #     n            8      12      16      20      24      32      48      64
     #     Float64    0.767   0.815   1.026   0.829   1.415   1.825   2.721   3.24
@@ -597,7 +597,7 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
 # the bulk through the FMA-efficient rank-k trailing (_trsm_right/_syrk) and confines the slow base to
-# ≤16-col diagonal blocks. Measured galen/Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
+# ≤16-col diagonal blocks. Measured Zen3: bs32/th16 vs the old bs128/th64 gives +15–37% at n=48–192
 # (n=64 14.5→19.9, gate 1.12→1.54×). bs = 2·th keeps the trailing panel L1-resident.
 # req#8 NOTE (validated 2026-07-16): th is a µarch-INVARIANT 16, NOT the width-scaled (MR+1)·W the earlier
 # comment guessed. Zen4 A/B (same harness, potrf PB/AOCL small-n): th=16 vs th=32(=4·_CHOLW) → th=16 WINS
@@ -740,7 +740,7 @@ end
 
 # panel solve: L10 (m×bs) from L10·L00ᵀ = A10, in place on A10. FUSED — each NB=4 column panel downdates
 # against all prior columns AND does the within-panel triangular solve in ONE register pass (no store/re-load
-# round-trip between them), MR=3/2/1 tiers like _syrk_lower + a scalar tail. Measured galen: 80–92% of FMA
+# round-trip between them), MR=3/2/1 tiers like _syrk_lower + a scalar tail. Measured Zen3: 80–92% of FMA
 # peak vs the old two-pass ~47–58% (1.6–1.8×) — brings trsm-R to syrk's efficiency, the residual potrf lever.
 # The tile stays register-resident across downdate→solve. bs is a multiple of 4 in rl32 (powers of two down
 # to 4); the nb<4 remainder is a scalar fallback. Solve: L10[:,c] = (A10[:,c] − Σ_{k<c} L10[:,k]·L00[c,k])/L00[c,c].
@@ -997,10 +997,10 @@ end
 # n=2048 0.85→0.91 on the hybrid; W=8 stays off the AVX2 panel driver). AVX2 (16 regs) never halves — its
 # large-n path is the fused panel driver (n>_CHOL_RL_MAX), so its base = _CHOL_RL_MAX (all n≤224 → rl32).
 # AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
-# until the trailing submatrix outgrows L2 — measured galen crossover 224 (rl 37.8 vs panel 33.6) → 256
+# until the trailing submatrix outgrows L2 — measured Zen3 crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
-# 7⁄8 of that ≈ 224 → √(_L2_BYTES/8)·7⁄8 (galen 512 KB L2 → 224 EXACT). NB: the 7⁄8 is a ONE-POINT FIT to
-# galen's 224/256 bracket — the √-L2 form is physical but the coefficient is unvalidated off 512K; the only
+# 7⁄8 of that ≈ 224 → √(_L2_BYTES/8)·7⁄8 (Zen3 512 KB L2 → 224 EXACT). NB: the 7⁄8 is a ONE-POINT FIT to
+# Zen3's 224/256 bracket — the √-L2 form is physical but the coefficient is unvalidated off 512K; the only
 # extrapolation point in the fleet (Zen4 1 MB) is EXEMPTED below (W=8 branch). Validate on the next AVX2 box
 # with ≠512K L2 before trusting the scaling (a bare literal 224 has the same epistemic content today).
 # W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
@@ -1053,7 +1053,7 @@ function _chol_hyb_f64!(M, n::Int, base::Int)
 end
 
 # ── Fused panel driver: po2-strided AVX2 potrf without the whole-matrix pad round-trip ──────────────
-# Measured (galen/Zen3, kb pureblas-cholesky): the po2-stride tax lives in the trsm B-panel and the
+# Measured (Zen3, kb pureblas-cholesky): the po2-stride tax lives in the trsm B-panel and the
 # faer base reading A directly (syrk! packs both operands — stride-immune), and the whole-pad fix pays
 # an n² copy round-trip that IS the residual gate gap at n=256–1024. Fix: per NB=128 block, (1) factor
 # the diagonal block in a conflict-free scratch D, (2) solve the panel INTO a conflict-free workspace T
@@ -1068,11 +1068,11 @@ end
 # first update). Same math/order as _trsm_right_lower_f64! — the c0==1 register pass degenerates to
 # the first-touch copy (empty k-loop), fusing the copy-in.
 # THIS KERNEL SPILLS ON AVX2 — AND THAT IS NOT THE BOTTLENECK. DO NOT "FIX" IT BY SHRINKING MR.
-# Measured 2026-07-30 (`code_native` + bench/plots.jl op=trsmR, galen Zen3 freq-locked). The MR=3 tier
+# Measured 2026-07-30 (`code_native` + bench/plots.jl op=trsmR, Zen3 freq-locked). The MR=3 tier
 # holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
 # `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
-#     wintermute Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
-#     galen      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
+#     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
+#     Zen3      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
 # invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
 #     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
@@ -1094,7 +1094,7 @@ end
         if nb == _fh_chol_nb()
             # FUSED: downdate (vs solved cols in T) + within-panel 4×4 solve in ONE register pass, store to T
             # once (kills the store/re-load round-trip of the old two-pass split kernel). +11–25% at the panel
-            # shape (galen, bs=128). Coeffs from the diag factor p00; @simd ivdep kept on the downdate k-loop.
+            # shape (Zen3, bs=128). Coeffs from the diag factor p00; @simd ivdep kept on the downdate k-loop.
             d0 = inv(unsafe_load(p00, _clidx(c0, c0, ld0)));         l10 = -unsafe_load(p00, _clidx(c0 + 1, c0, ld0))
             d1 = inv(unsafe_load(p00, _clidx(c0 + 1, c0 + 1, ld0))); l20 = -unsafe_load(p00, _clidx(c0 + 2, c0, ld0)); l21 = -unsafe_load(p00, _clidx(c0 + 2, c0 + 1, ld0))
             d2 = inv(unsafe_load(p00, _clidx(c0 + 2, c0 + 2, ld0))); l30 = -unsafe_load(p00, _clidx(c0 + 3, c0, ld0)); l31 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 1, ld0)); l32 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 2, ld0))
@@ -1402,7 +1402,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     n = size(A, 1)
     n == 0 && return A
     if _NVREG == 16 && n > _chol_rl_max(T)
-        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured galen/Zen3,
+        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3,
         # 200–4000: transition dips 384/448/640 0.91-0.94→1.01-1.03, non-po2 large 0.98→1.00-1.03). It was
         # originally gated to po2-aliased strides only (its raison d'être was dodging the po2 pad round-trip),
         # but it's a better-composed blocked driver everywhere — the hybrid's generic trsm!(side=R,transA=T)
@@ -1410,7 +1410,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
         return _chol_panel_f64!(A, n)
     end
     # AVX2 reaches here only for n ≤ _CHOL_RL_MAX (rl32 regime): rl32's small 32-blocks are alias-tolerant
-    # (measured galen: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8% at po2-128) so the pad
+    # (measured Zen3: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8% at po2-128) so the pad
     # is dead weight — skip it. W=8 still pads (its larger rl blocks' po2-tolerance is unmeasured).
     if _NVREG != 16 && _chol_needs_pad(A, n)      # factor in a non-conflicting (ld = n+8) scratch, copy back
         R = n + 8

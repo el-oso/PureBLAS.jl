@@ -1,6 +1,6 @@
 _Measured (provenance):_
 
-- **Zen4 · AVX-512** (`wintermute`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `c587397`, 2026-08-01T16:52
+- **Zen4 · AVX-512** (`Zen4`) — AMD Ryzen 5 7640U w/ Radeon 760M Graphics, commit `c587397`, 2026-08-01T16:52
 
 ### Real
 

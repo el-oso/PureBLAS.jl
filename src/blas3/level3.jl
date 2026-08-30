@@ -464,13 +464,13 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
 end
 
 # The packed K-TRIM complex trmm base (near-peak PACKED microkernel) vs the weak unpacked _uker_cmplx!.
-# Measured (galen/Zen3): the packed complex kernel hits 0.94–0.95×OB at these short-k base shapes, the
+# Measured (Zen3): the packed complex kernel hits 0.94–0.95×OB at these short-k base shapes, the
 # unpacked only 0.68–0.73, and ztrmm is pinned at the unpacked ceiling (0.77 ≈ 0.73). AVX-512 already
 # gates via the unpacked path (32 zmm give ample ILP) — restrict packed to AVX2 (W=4) so that gate is
 # untouched. Preferences knob "ctrmm_pack". Fable-designed, decomposition-confirmed 2026-07-05.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CTRMM_PACK = @load_preference("ctrmm_pack", _vwidth(Float64) == 4)::Bool
-# Below this k the packed base's pack overhead loses to the unpacked K-TRIM (measured galen: k=8 0.46 vs
+# Below this k the packed base's pack overhead loses to the unpacked K-TRIM (measured Zen3: k=8 0.46 vs
 # unpacked ~1.0, k=32 0.75 vs 0.85; crossover ≈48, k=64 packed 0.91 wins). Recursion bases (k>128 split)
 # land ≥64 → packed; only tiny single-base trmm stays unpacked. Preferences knob "ctrmm_pack_min".
 # pack-vs-unpacked crossover: below this k the unpacked small kernel's lower setup beats the packed path's
@@ -485,7 +485,7 @@ const _CTRMM_PACK_MIN = @load_preference("ctrmm_pack_min", 48)::Int
 # Exact-width remainder column-tile for the packed complex trmm bases. The last column-tile of a
 # non-multiple-of-nr panel is partial (width nre∈1:_CNR-1); running it through the nr-wide masked kernel
 # computes (nr-nre) PAD columns — and for upper-N that tile sits at MAX K-trim depth (kc=k), so the pad
-# is charged at full depth (measured galen ztrmmR spike). Dispatch the runtime nre to a compile-time
+# is charged at full depth (measured Zen3 ztrmmR spike). Dispatch the runtime nre to a compile-time
 # Val{NR}=nre masked kernel so the pad columns are NEVER computed. REQUIRES the slot packed at row-stride
 # nre (see packed_R pack loop). B0=A1=true (overwrite; α folded outside). AVX2-only (packed path gated by
 # _CTRMM_PACK=W==4); the 5-way branch is compile cost there, never instantiated on AVX-512.
@@ -613,7 +613,7 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
     # B row-panel is materialized with ALL k cols at once (not a kc-blocked loop), so mc is the
     # CANONICAL 30%·L2 A-block (`_at_gemm_mc`), NOT the per-kc `_at_mc_kc` — keying it on the full k
-    # makes mc a moving target that over-blocks small-L2 boxes at small n (galen ztrmmR regression). req#8.
+    # makes mc a moving target that over-blocks small-L2 boxes at small n (Zen3 ztrmmR regression). req#8.
     mc = min(max(mr, (_at_gemm_mc(_HW) ÷ mr) * mr), cld(m, mr) * mr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mc * k, cld(k, nr) * nr * k)
     ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
@@ -1472,7 +1472,7 @@ end
 # (fwd) or upper (bwd), unit or non-unit diagonal. W-row blocks — downdate each block against the ALREADY-
 # SOLVED rows (vectorized; the 4-B-column unroll reuses the A row-block vector), then a scalar W×W diagonal
 # solve. Touches each B element ~once vs the dense base's ~k passes (store-bound BLAS-2). Bit-identical.
-# Measured galen: lower-unit (getrf) +119–151%; upper-non-unit (trsm gate) +44–47%. pL/pB = &·[1,1], ld col.
+# Measured Zen3: lower-unit (getrf) +119–151%; upper-non-unit (trsm gate) +44–47%. pL/pB = &·[1,1], ld col.
 @inline function _trsm_tile_L_f64!(up::Bool, unit::Bool, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int)
     W = _CHOLW; nb = k ÷ W
     @inline function doblock(rb)
@@ -1550,7 +1550,7 @@ function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
     lda = stride(A, 2); ldb = stride(B, 2); fwd = (up == tr)
     # Tile crossover (DERIVED, req#8): tile trades dense's ~k store-passes (∝ k²·n/W) for a per-block scalar
     # W×W triangular diagonal solve (∝ k·W·n, depth-W latency chain). Net win ⇒ k·W < k²/W ⇒ k > W². Fleet-
-    # validated: galen(W=4,W²=16) wins from k=32, wintermute(W=8,W²=64) from k=96. (Side-R tiles unconditionally
+    # validated: Zen3(W=4,W²=16) wins from k=32, Zen4(W=8,W²=64) from k=96. (Side-R tiles unconditionally
     # — it vectorizes its in-block solve over m, no W² term.) `_CHOLW*_CHOLW` const-folds at compile time.
     if !tr && T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
             stride(A, 1) == 1 && stride(B, 1) == 1 && k > _CHOLW * _CHOLW   # no-trans strided f64 → tile
@@ -1776,7 +1776,7 @@ const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
 #   KC²·sizeof(ComplexF64) ≤ L2  ⇒  KC ≤ √(L2 ÷ 16).
 # Zen4 (1 MB L2) ⇒ 256; Zen3 (512 KB L2) ⇒ 181. FLEET-VALIDATED, both boxes, and the second box is what
 # corrected it: the first derivation bounded the PACKED STRIPE by L1 (KC ≤ L1 ÷ (2·NR·8)), which gives
-# the same 256 on Zen4 but 512 on AVX2 because NR=W=4 halves the stripe — and at that base galen
+# the same 256 on Zen4 but 512 on AVX2 because NR=W=4 halves the stripe — and at that base Zen3
 # measured leaf/AOCL 1.005 at k=192 but 0.820 at k=256 and 0.818 at 512, regressing ztrsm@256 from
 # 0.851 to 0.787. The L1-stripe bound is not binding (KC=256/NR=8 fills L1 exactly on Zen4 and gates
 # fine); A's panel is, and NR=4 doubles the number of A re-reads on AVX2. `min` with the stripe bound
@@ -1967,11 +1967,11 @@ end
 
 # n above which trsm-L inverts (trtri) + K-TRIM trmm-on-inverse. At/below it (N case), the direct j-outer
 # solve above; the trtri overhead + extra flops sank small/mid-n. Per-box knob.
-# 64 IS NOT THE ztrsmR@100 GAP — measured, so don't spend the knob on it. galen 2026-08-28, PB/AOCL,
+# 64 IS NOT THE ztrsmR@100 GAP — measured, so don't spend the knob on it. Zen3 2026-08-28, PB/AOCL,
 # 8 rounds, ABBA: forcing 256 (which routes n=100 to the direct base instead of trtri+trmm) gave 0.907
 # against 0.913 for the shipped 64 — no gain, marginally worse. ztrsmR@100 misses on AOCL (vs_OB is
 # 1.16), so the deficit is inside the path, not in the choice of path.
-# NOTE the grade of that evidence: galen's llama-server went active mid-sweep and the contention guard
+# NOTE the grade of that evidence: Zen3's llama-server went active mid-sweep and the contention guard
 # refused two of the six runs. The four that completed passed both entry and exit checks, so the A/B is
 # sound as SCREENING, but a near-parity re-test wants a quiet box.
 # PDM: Literal — trtri overhead plus extra flops sink small/mid n, so the direct path stops here. | tune: candidate
@@ -2004,7 +2004,7 @@ end
 # Direct complex side-R column-substitution base (no trtri): X·op(A)=B in place, !tr (⟹ !cj), unit or
 # non-unit, A k×k upper/lower. Ascending columns when up (up≠tr, tr=false). The side-R mirror of
 # _trsm_cmplx_dLN! and the complex sibling of _trsm_dense_R! (same loop, complex SIMD kernels). Beats OB
-# for k≤64 (trtri-free) where the invert+trmm base's trtri is 40–66% exposed overhead (measured, galen).
+# for k≤64 (trtri-free) where the invert+trmm base's trtri is 40–66% exposed overhead (measured, Zen3).
 function _trsm_cmplx_dRN!(up::Bool, unit::Bool, k::Int, A, B)
     m = size(B, 1); T = eltype(B); csz = sizeof(T); ldb = stride(B, 2); lda = stride(A, 2)
     GC.@preserve A B begin
@@ -2873,7 +2873,7 @@ end
 # The premise was sound and measured: the NRV=3 slab spills (asm scan, bench/probes/trsm_slab_spill.jl:
 # 40-51 stack vmov with 23-38 RELOADS at NRV=3, 30-41 with 0-1 reloads at NRV=2, zero at NRV=1), and the
 # v columns never couple, so sweeping them one at a time is the same arithmetic with half the registers.
-# It LOSES on every shape — same-process ABBA, bench/probes/trsm_perv_ab.jl, wintermute boost-locked:
+# It LOSES on every shape — same-process ABBA, bench/probes/trsm_perv_ab.jl, Zen4 boost-locked:
 #   k=32 n=32 1.0015 · k=32 n=24 1.0764 · k=32 n=64 1.1091 · k=24 n=24 1.1039 · k=16 n=16 1.0370
 #   k=64 n=64 1.1953 · k=128 n=128 1.1031 · k=128 n=256 1.0939      (per-v/fused, >1 = per-v slower)
 # WHY: back-substitution is a SERIAL chain and the fused slab hides its latency with NRV-wide ILP —
@@ -2978,7 +2978,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
 #          at the caller's lda, and a quarter-period byte stride (lda=128 f64 ⇒ 1024 B) puts its columns
 #          on the same L1 sets. Copies A's lower triangle into `_trsm_rpack`'s odd-ld scratch when the
-#          derived `_potrf_needs_pad` fires. Leaf sweep, galen, bs=128 m=128, ONLY A's lda moving:
+#          derived `_potrf_needs_pad` fires. Leaf sweep, Zen3, bs=128 m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
 #   _EXP11 free again. It briefly restored the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!` (the
@@ -3643,7 +3643,7 @@ end
 # binding lever: the fused-slab microkernel intrinsically runs ~40.6 GF vs PB's own dgemm 43 / AOCL trsm 42,
 # worst at small n (PB 31 vs AOCL 37 @128). It also shows a noise-level regression at po2 n=512, which the
 # no-regression contract forbids. Kept behind this toggle as the validated re-pack-free substrate.
-# FALSIFIED levers (measured wintermute Zen4, boost-locked, in-process A/B — do NOT re-try; bench/
+# FALSIFIED levers (measured Zen4, boost-locked, in-process A/B — do NOT re-try; bench/
 # trsm_fullpack_gf.jl reproduces): (1) INVERTED-DIAGONAL epilogue (precompute inv of the MR×MR diagonal
 # block at pack time, replace the serial back-sub with X=Vss·acc) — REGRESSED small-k (k=128 30.2 vs
 # back-sub 31.5 GF), converged at large-k. The back-sub is NOT latency-bound: its MR×NRV=24 v-lanes across
@@ -3683,7 +3683,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # k=64 0.48→0.82, k=32 0.51→0.67. Tiny k / non-fusable / trans keep the dense base.
             # `_GT_TRANSPOSE` REMOVED 2026-08-10 — same reason as the tiny-k bypass in `trsm!` (see the long
             # note there): it is the fusedT slabs' capability bit, not a crossover, and it stranded AVX2 on
-            # the dense base at k=48/64 where the leaf measures 20.7% / 25.9% faster on galen.
+            # the dense base at k=48/64 where the leaf measures 20.7% / 25.9% faster on Zen3.
             if up && !tr && _TRSM_FUSED_ON[] &&
                     _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
                 return _trsm_fused_L!(unit, A, B)
@@ -3769,7 +3769,7 @@ end
 # contiguous). Mirror of the side-L tile with rows↔solve-columns swapped: block NC=4 SOLVE-COLUMNS, downdate
 # the block against the ALREADY-SOLVED columns in one W-wide sweep (reuse each solved column's m-vector across
 # the 4 block-cols), then a scalar in-block NC×NC coupling solve. coef(j,l)=A[j,l] (tr) or A[l,j]. Each B
-# element written ~once vs the dense base's ~k passes. Measured galen (trsmR gate, lower-T): +64–113%. Bit-id.
+# element written ~once vs the dense base's ~k passes. Measured Zen3 (trsmR gate, lower-T): +64–113%. Bit-id.
 @inline function _trsm_tile_R_f64!(up::Bool, tr::Bool, unit::Bool, pA::Ptr{Float64}, lda::Int, pB::Ptr{Float64}, ldb::Int, m::Int, k::Int)
     W = _CHOLW; NC = 4; nb = k ÷ NC; asc = (up != tr)
     @inline cf(j, l) = tr ? unsafe_load(pA, _clidx(j, l, lda)) : unsafe_load(pA, _clidx(l, j, lda))
@@ -3881,7 +3881,7 @@ const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lowe
 # The old guard `m > _TRSM_NCUT_R(128)` conflated this batch floor with the triangle ceiling, so EVERY square
 # n≤128 (m=n≤128) missed its own best kernel → the Zen3 n=128 side-R dip (0.74 vs AOCL; the fused panel does
 # 0.87). Derived: max(_CHOLW SIMD row-tile, k>>2 setup-amortization) ⇒ 32 at k=128, admits the square-128 gate.
-# _CHOLW is µarch-derived (req#8). Fleet-safe: measured galen(Zen3) n=128 0.74→0.87 AND wintermute(Zen4)
+# _CHOLW is µarch-derived (req#8). Fleet-safe: measured Zen3(Zen3) n=128 0.74→0.87 AND Zen4(Zen4)
 # 0.945→1.04 (both beat AOCL at n=64), 2026-07-16 — the fused panel is no-op-or-better at narrow m on both.
 _trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
 # Fused side-R lower driver: X·op(A)⁻¹ via the potrf panel leaf `_trsm_rl_split_f64!`, MC row-chunked.
@@ -3892,11 +3892,11 @@ _trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
 # `scratch=true` solves each chunk into the odd-ld rpack (conflict-free solved-column re-reads) then copies
 # back; `false` solves in place. Chosen by `k > _TRSM_DBASE` — DERIVE tier, and deliberately NOT a Measure
 # knob. Fleet A/B at aliasing ldb (2026-07-26) shows both boxes agree in-place clearly wins at k≤32
-# (Zen4 scratch/in-place 1.27–1.52, galen 1.18: the O(m·k) copy-back can't amortize against an O(m·k²)
-# solve that small) and scratch is a win-or-wash at k≥48 (galen 0.68–0.79, Zen4 0.84 at k=48, ~1.0 at 128).
+# (Zen4 scratch/in-place 1.27–1.52, Zen3 1.18: the O(m·k) copy-back can't amortize against an O(m·k²)
+# solve that small) and scratch is a win-or-wash at k≥48 (Zen3 0.68–0.79, Zen4 0.84 at k=48, ~1.0 at 128).
 # A Measure-tier crossover was tried and REMOVED: Zen4 is NOT monotone in k (0.84 at k=48 but 1.13 at
 # k=64), so "first k where scratch wins" has no stable answer — it returned different values in different
-# processes on the same box, cost galen 'T' 1024×48 0.688, and no margin (5/10/15%) fixed it. Don't
+# processes on the same box, cost Zen3 'T' 1024×48 0.688, and no margin (5/10/15%) fixed it. Don't
 # re-Measure this without first re-checking monotonicity.
 function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
     m = size(B, 1); ldb0 = stride(B, 2)
@@ -3970,7 +3970,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
         # to the leaf VERBATIM at the caller's lda. For a square gate operand that is lda = k, and at
         # k=128 the byte stride is 1024 = a quarter L1 way period, which puts A's columns on the same
-        # sets. MEASURED on galen (Zen3/AVX2), leaf GF at bs=128, m=128, only A's lda moving:
+        # sets. MEASURED on Zen3 (AVX2), leaf GF at bs=128, m=128, only A's lda moving:
         #     lda 128 (shipped) 41.59 | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
         # i.e. ANY non-po2 lda is +11.5..+15.1%, and the padded values land on the leaf's own
         # `1/GF = α + β/bs` trend (asymptote 47.8 GF) — bs=128 was a DIP, not a rate deficit.
@@ -4091,7 +4091,7 @@ end
 # A once into a padded-ld scratch (ld=k+8) removes the conflict (B-padding doesn't help — it's the A
 # sub-view packing). ponytail: only A needs it; B is solved in place. Cost O(k²) ≪ trsm O(k²n).
 # A-pad for power-of-2 leading dims: on AVX2 the O(k²) copy costs MORE than the po2 cache-set aliasing it
-# avoids — measured on an idle core (galen is shared → use a free core), disabling it lifts trsm n=512
+# avoids — measured on an idle core (Zen3 is shared → use a free core), disabling it lifts trsm n=512
 # 0.89→0.94, n=1024 0.95→0.98, n=2048 →1.02, and getrf (built on trsm) 0.88→0.96. The old "conflict is
 # catastrophic 0.78→1.12, the copy pays" was a pre-clean (contended / pre-trtri-fix) measurement. Kept
 # for AVX-512/other (untested there; trsm already gates), disabled on AVX2.
@@ -4112,7 +4112,7 @@ end
 # Zen3/Zen4 values are unchanged (4096 B both ways); only Zen5 moves.
 const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 @inline _alias_ld(ld::Int) = ld >= _L1_WAY_D && ld % _L1_WAY_D == 0
-# FALSIFIED 2026-07-30 (galen, freq-locked, plots.jl): extending this to the QUARTER way period
+# FALSIFIED 2026-07-30 (Zen3, freq-locked, plots.jl): extending this to the QUARTER way period
 # (`ld % (_L1_WAY_D>>2) == 0` gated on B being L2-resident, mirroring `_chol_needs_pad`'s fleet-measured
 # criterion at lapack.jl:722-731) does NOT move trsmR — worst 0.82 → 0.81 vs AOCL, i.e. noise.
 # The motivating correlation is real but NOT causal: the two sub-gate cells (ldb=128, 256) are exactly
@@ -4127,7 +4127,7 @@ const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 # solve into the ODD-ld rpack scratch and copy back, or just solve in place and eat the conflicts. Which
 # wins is NOT derivable from any detected const — it is the copy-back round-trip (m·k·8 B each way,
 # chunk-size-independent) traded against the conflict rate, and it INVERTS SIGN across µarchs we own:
-# galen/Zen3 measured scratch +41–49% at m=512/1024/1536, while wintermute/Zen4 measures the same scratch
+# Zen3 measured scratch +41–49% at m=512/1024/1536, while Zen4/Zen4 measures the same scratch
 # arm a 15–45% net LOSS (in-place 33.9/37.3/37.3 vs arm 23.4/29.1/33.9 GF at k=16/32/64, m=ldb=1024,
 # 2026-07-26). Sign inversion on benchmarked boxes is the ladder's explicit Measure tell — a literal or a
 # µarch-gated literal would be wrong on any unseen machine. Candidate set is the 2 strategies; the probe
@@ -4207,7 +4207,7 @@ function trsm!(
         # `_GT_TRANSPOSE` REMOVED 2026-08-10. It is a CAPABILITY bit for the 8x8-transpose fusedT slabs
         # (_GT_W == 8), and it belongs inside the leaf — where it still is, at `useT` — not on the decision
         # to ENTER the leaf. Used here it silently pinned all of AVX2 to the scalar dense base, and the
-        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on galen (Zen3), routing
+        # comment that justified it recorded no AVX2 measurement. Direct-call A/B on Zen3, routing
         # bypassed, correctness checked first at max|dense-fused| ~ 1.3e-15:
         #     k=32  fused/dense 0.8381  SE 0.0018  n=105   (fused 16.2% FASTER)
         #     k=48  fused/dense 0.7935  SE 0.0015  n=56    (20.7% faster)
@@ -4321,7 +4321,7 @@ end
 # trans 'N': op(A)=A (n×k) ⇒ A·Aᴴ. trans 'T'/'C': op(A)=Aᴴ (A k×n) ⇒ Aᴴ·A. syrk: ᵀ (no conj),
 # any T<:Number. herk: Hermitian (conj), real α/β, diagonal forced real. Recursive: diagonal blocks
 # recurse (scalar base), the off-diagonal block is a full gemm! — breadth-first correctness (gate later).
-# PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (galen n=128) does not replicate (2026-08-21)
+# PDM: Literal — syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (Zen3 n=128) does not replicate (2026-08-21)
 const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
 @inline _syrk_base() = (f = _FKR_syrk_base[]; f >= 0 ? f : _SYRK_BASE)
 
@@ -4651,12 +4651,12 @@ function _trgemm_packed!(
                                     #
                                     # It fires for uplo='L', where the bottom partial panel owns many FULL tiles —
                                     # the configuration potrf's trailing update issues (`syrk!(…, uplo='L')`). That
-                                    # benefit is UNQUANTIFIED: potrf gates 1.049–1.99 on galen with this in place,
+                                    # benefit is UNQUANTIFIED: potrf gates 1.049–1.99 on Zen3 with this in place,
                                     # but it gated before too, so the run does not isolate this branch. Kept
                                     # because it is strictly fewer FMAs than the masked tile it replaces and
                                     # mirrors gemm's own guard exactly — not because a measurement earned it.
                                     #
-                                    # The sawtooth itself is real and is the residual gap (galen,
+                                    # The sawtooth itself is real and is the residual gap (Zen3,
                                     # bench/probes/syrk_modmr_sawtooth.jl, n=49..72): cost/flop has period mr=8,
                                     # offset 0 = 1.061, offset 4 = 1.171, non-W offsets 1.20–1.36. Since this
                                     # branch does not move it, the upper-triangular waste lives in
@@ -4964,7 +4964,7 @@ const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) 
 @inline _fh_syrk_unified_max() = (f = _FKR_syrk_unified_max[]; f >= 0 ? f : _SYRK_UNIFIED_MAX)
 # Single-product triangular multi-pack row-tile MR. On AVX2 (W=4) the 12-acc gemm tile (MR=_MR=3) zero-pads
 # the remainder row-panel at n not divisible by 12 → small/mid-n syrk/syr2k below gate (n=64 0.81, 128 0.94,
-# 256 0.92 measured galen). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
+# 256 0.92 measured Zen3). MR=2 (mr=2W=8) divides those sizes AND keeps ample ILP (8 accs) for the
 # single-product tri kernel → gates the whole AVX2 range (MR2 ≥ MR3 at every n=64..2048, exact correctness).
 # Width-conditional: only F64/AVX2 (W=4); F32/AVX2 and all of AVX-512 keep _MR. Knob "syrk_mr".
 # PDM: Literal — AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | tune: n/a off AVX2
@@ -5553,8 +5553,8 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
 # `_at_rank_k_pack_cut`, which is PATH-DEPENDENT — read cpuinfo.jl:212-227 for the authoritative form:
-#   AVX2 multi-pack `_trgemm_packed!`  -> (7·(nvreg−4)·W)/4, reproduces galen 84 (measured: recursion wins
-#     n≈40–80, packed decisive n≥96; the old literal 23 mis-routed n=48/80 and caused the galen AOCL misses)
+#   AVX2 multi-pack `_trgemm_packed!`  -> (7·(nvreg−4)·W)/4, reproduces Zen3 84 (measured: recursion wins
+#     n≈40–80, packed decisive n≥96; the old literal 23 mis-routed n=48/80 and caused the Zen3 AOCL misses)
 #   AVX-512 unified single-pack `_trgemm_packed_u!` -> W, because half the pack traffic makes packed win
 #     from ≈W up.
 # An earlier version of this comment predicted "Zen4/Zen5 392" from the ×7/4 form. That is FALSIFIED and no
@@ -5563,7 +5563,7 @@ const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
 # (OpenBLAS-style dense-scratch + scalar triangular copyback for the diagonal tile was A/B-tested here
 # and measured EQUAL to the masked-store _microkernel_tri! on AVX2 — no gain, not adopted.)
 # SPLIT FROM syr2k 2026-08-28. This used to be `_at_rank_k_pack_cut` — shared with syr2k on the stated
-# grounds that both are the same register-capacity criterion. Measured on galen, they have OPPOSITE
+# grounds that both are the same register-capacity criterion. Measured on Zen3, they have OPPOSITE
 # crossovers on the multi-pack path (syrk wants packed from n=32, syr2k wants recursion through n=50),
 # so the shared 84 was costing syrk 5-15%. The full A/B table and the operand-count mechanism are at
 # `_at_syrk_pack_cut` in cpuinfo.jl. The AVX-512 arm is unchanged (both ops still resolve to W there).
@@ -5587,7 +5587,7 @@ const _CSYRK_PACK_CUT_T = @load_preference("csyrk_pack_cut_t", 4)::Int     # tra
 # unpacked complex microkernel (what zgemm rides) gates there. The cutoff is where the packed path's NR-tile
 # amortization overtakes unpacked — a microkernel-ramp crossover, µarch-specific (NOT a cache formula), so
 # it is `_vwidth`-keyed & Preferences-overridable. Measured boost-locked (bench/csyrk_avx2_calib.jl):
-#  • AVX2 (W=4, galen): the recursion base (n≤_CSYRK_PACK_CUT=16) 2×-wastes → zherk/zsyrk n=16 DIP to 0.87-
+#  • AVX2 (W=4, Zen3): the recursion base (n≤_CSYRK_PACK_CUT=16) 2×-wastes → zherk/zsyrk n=16 DIP to 0.87-
 #    0.91 (sub-gate). Unpacked-tri gates all 4 ops at n≤16 (herk 1.49/her2k 1.21) and beats the dip; packed
 #    overtakes by n=24, so cutoff=16.  • AVX-512 (W=8): packed's edge overhead is larger → unpacked wins
 #    broadly. Measured both boxes boost-locked: Zen4 (wm) unpacked ≥ packed to n=192 (packed reclaims n=256);
@@ -5852,7 +5852,7 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     # collapsed to the diagonal case. The tiled path only pays once the row walk actually strides.
     if n <= NB
         # POINTER PATH — the destination is our own `_symm_scr` VIEW, and SubArray indexing on every
-        # store is most of this function's cost at tiny n. Measured on galen (ComplexF64, materialise
+        # store is most of this function's cost at tiny n. Measured on Zen3 (ComplexF64, materialise
         # alone, floor-subtracted): writing into `view(scr,1:n,1:n)` vs into a plain `Matrix` costs
         #     n=4 69.5 vs 43.8 (1.59x) · n=8 171.5 vs 100.3 (1.71x) · n=16 1.29x · n=32 1.09x
         # i.e. ~71 ns of pure indexing overhead at n=8 — against a zhemm@8 gate gap of 78 ns. The gemm
@@ -6283,11 +6283,11 @@ end
 
 # n above which symm uses the single-pass packed kernel vs materialize (O(n²) dense copy of the triangle) +
 # the flagship gemm. DERIVED (req#8) via `_at_symm_mat_max` = √(L2/sizeof): a DIFFERENT criterion from the
-# rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured galen n (packed
+# rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured Zen3 n (packed
 # is dead weight on AVX2), and the only thing that unseats it is the O(n²) copy evicting the gemm's resident
 # L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Galen measured a mat≈pack
 # tie at EXACTLY n=256=√(512K/8) (they converge for all n≥256), pinning the fraction at 1. This lifts the cut
-# off the mistuned 96 (which routed n=112–192 to the slower packed path → the galen AOCL misses) to 256.
+# off the mistuned 96 (which routed n=112–192 to the slower packed path → the Zen3 AOCL misses) to 256.
 # Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
 # Overridable "symm_pack_cut".
 # PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW)`
@@ -6328,7 +6328,7 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # UPPER BOUND ON THE PACKED PATH (2026-08-17). symm has the SAME flop count as gemm (2·n²·m) —
     # symmetry saves A-traffic, not arithmetic — so symm should run at gemm's speed. It did not:
     #
-    #     wintermute   n=2048   PB gemm 0.3552s   PB symm 0.4150s   (symm 16.8% SLOWER, same flops)
+    #     Zen4   n=2048   PB gemm 0.3552s   PB symm 0.4150s   (symm 16.8% SLOWER, same flops)
     #                  n=4096   PB gemm 2.5319s   PB symm 3.3013s   (symm 30.4% SLOWER)
     #     AOCL for contrast     n=2048   its gemm 0.4530  its symm 0.4014  (theirs is FASTER than gemm)
     #
@@ -6456,7 +6456,7 @@ function _syr2k_dims(C, A, B, trans)
 end
 # n above which syr2k uses the single-pass fused packed kernel (else the gemm-temp recursion). Same
 # REGISTER-capacity criterion as syrk → shares `_at_rank_k_pack_cut` = (7·(nvreg−4)·W)/4 (see cpuinfo.jl).
-# Reproduces galen 84 (measured: recursion wins n≤80, packed wins n≥96 — the old literal 96 routed n=96 to
+# Reproduces Zen3 84 (measured: recursion wins n≤80, packed wins n≥96 — the old literal 96 routed n=96 to
 # the slower recursion; 84 routes it to packed). Predicts Zen4/Zen5 392 (was a _GEMM_UNPACK_MAX placeholder).
 # Overridable "syr2k_pack_cut".
 # PDM: Derived — formula over detected consts: `_at_rank_k_pack_cut(_HW)`

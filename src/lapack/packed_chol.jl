@@ -18,7 +18,7 @@
 #     n=64   cut0 0.884  cut16 0.904  cut32 0.940*        n=512  cut0 0.962  cut32 0.963*  cut96 0.950
 # 32 is best-or-within-noise at every order measured; 0 (always tpsv) costs 1.42→0.91 at n=16 and
 # 1.17→0.88 at n=32, i.e. it turns two passing sizes into misses.
-# ⚠ MEASURED ON ZEN4 ONLY — galen was off the network and Zen5 is not yet re-locked. Needs fleet
+# ⚠ MEASURED ON ZEN4 ONLY — Zen3 was off the network and Zen5 is not yet re-locked. Needs fleet
 # validation before it is trusted to extrapolate (req#8: derive → validate on the fleet → ship).
 # PDM: Literal — call-overhead vs vectorised-work crossover, measured Zen4 ONLY; needs fleet validation.
 const _PPTRF_TPSV_MIN = 32
@@ -61,9 +61,9 @@ const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 #  * The gate table above (cut8/16/32 at n=16..512, '16 = 2W is best or tied at every order <= 128')
 #    is STALE. It describes the unblocked path at sizes where production no longer runs it.
 #  * The duel probed at n = 4*vw, which is 32 for Float64 on AVX-512 — also the blocked regime. It was
-#    therefore timing a path production does not take, which is why it resolved 32 on wintermute (8/8)
-#    against a table that says 16, and 16 on galen (6/6). Neither answer governed anything.
-# A direct A/B of `_pptrf_lower!` at cut 8/16/32 (wintermute, n=16..256) is likewise off-regime and is
+#    therefore timing a path production does not take, which is why it resolved 32 on Zen4 (8/8)
+#    against a table that says 16, and 16 on Zen3 (6/6). Neither answer governed anything.
+# A direct A/B of `_pptrf_lower!` at cut 8/16/32 (Zen4, n=16..256) is likewise off-regime and is
 # recorded only to show the disagreement, not as evidence for a value.
 #
 # So the value reverts to the DERIVED generic fallback that was always beneath the duel: 2*W, the

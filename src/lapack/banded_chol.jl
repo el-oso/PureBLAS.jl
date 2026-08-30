@@ -130,8 +130,8 @@ const _PBTRF_NB_PREF = @load_preference("pbtrf_nb", nothing)
     @inline _pbtrf_nb_anchor(::Type{T}) where {T} = T <: Complex ? _CPOTRF_BASE : _potrf_base(T)
     # Derived from vector width — see `_at_pbtrf_nb` (cpuinfo.jl) for the three-box table.
     @inline _pbtrf_nb_tuned(::Type{Float32}) = (f = _FKR_pbtrf_nb[]; f >= 0 ? f : _at_pbtrf_nb(_HW, Float32))
-    # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (wintermute Zen4 and
-    # galen Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
+    # req8-ok: measured-identical literal — 40 in 6/6 processes on BOTH boxes (Zen4 and
+    # Zen3, 2026-08-19). Not a derivation: no formula over the detected consts was found that
     # also reproduces the F32/C32/C64 siblings, which differ per box. Reproduces the incumbent exactly.
     @inline _pbtrf_nb_tuned(::Type{Float64}) = 40
     @inline _pbtrf_nb_tuned(::Type{ComplexF32}) = (f = _FKR_pbtrf_nb[]; f >= 0 ? f : _at_pbtrf_nb(_HW, ComplexF32))
@@ -220,8 +220,8 @@ end
 const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
 @inline _fh_pbtrf_ucross_pref() = (f = _FKR_pbtrf_u_native_kd[]; f >= 0 ? f : _PBTRF_UCROSS_PREF)
 @static if isnothing(_fh_pbtrf_ucross_pref())
-    # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on galen
-    # (192x4, 256, 192) and C64 flips on both wintermute (176/192/208) and neuromancer.
+    # Exactly `hw.l2 ÷ 4096` on all three boxes. F64/C64 keep the duel: F64 flips on Zen3
+    # (192x4, 256, 192) and C64 flips on both Zen4 (176/192/208) and Zen5.
     @inline _pbtrf_ucross(::Type{Float32}) = (f = _FKR_pbtrf_u_native_kd[]; f >= 0 ? f : _at_pbtrf_ucross(_HW))
     @inline _pbtrf_ucross(::Type{Float64}) = (f = _FKR_pbtrf_u_native_kd[]; f >= 0 ? f : _at_pbtrf_ucross(_HW, Float64))
     @inline _pbtrf_ucross(::Type{ComplexF32}) = (f = _FKR_pbtrf_u_native_kd[]; f >= 0 ? f : _at_pbtrf_ucross(_HW))

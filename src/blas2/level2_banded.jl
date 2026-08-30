@@ -96,14 +96,14 @@ end
 #
 # `y` is the CARRIER for the store's bounds check and is otherwise unused — never indexed through.
 #
-# ⚠ PASS IT AS `_carrier(y)`, NEVER AS `y`. MEASURED 2026-08-17, galen (Zen3/AVX2), controlled
+# ⚠ PASS IT AS `_carrier(y)`, NEVER AS `y`. MEASURED 2026-08-17, Zen3 (AVX2), controlled
 # same-box back-to-back A/B, `op=gbmvN arms=pb`:
 #     pre-migration 6ae9ee9  gate 0.879
 #     carrier passed raw     gate 0.862      <- 1.9% REGRESSION
 # AVX2 has 16 vector registers to AVX-512's 32, and `_gbmv_t_conv_block!` already holds W
 # accumulators plus the x super-window — it sits near the register ceiling (see kb
 # register-ceiling-vs-structure). One extra live argument is free at 32 registers and spills at 16,
-# which is why wintermute measured byte-identical and galen did not. `_carrier` folds the argument to
+# which is why Zen4 measured byte-identical and Zen3 did not. `_carrier` folds the argument to
 # `nothing` in release, so it specializes to a singleton with no live range and the budget is
 # restored. Verifying byte-identity on ONE µarch does not generalize across vector widths.
 # Threading it here rather than leaving the helper on a bare `Ptr` is the point of the migration: this
