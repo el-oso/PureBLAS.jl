@@ -1712,3 +1712,90 @@ end
         @test (k2, l2) == (k, l) && a2 == al && b2 == be && R2 == R
     end
 end
+
+# ── generic `T<:Real` factorizations (req#3: Mode 2 must stay differentiable) ──────────────────────────
+# WHY THESE EXIST AS TESTS AND NOT PROBES. getrf!/geqrf!/gesvd! were widened from Float64 to T<:Real on
+# 2026-08-30 so a ForwardDiff.Dual matrix can reach LU/QR/SVD at all. Nothing in the suite covered a
+# non-Float64 Real, so the guarantee had NO CI protection: re-narrowing a signature, or reintroducing an
+# unguarded `pointer()` fast path, would have gone unnoticed. The latter is not hypothetical — a
+# `_strided1` that tested unit-stride without `isbitstype(eltype)` handed a `Matrix{BigFloat}` to
+# `pointerref` and SEGFAULTED Julia's codegen; it took a segfault to find, because no test looked.
+#
+# THE THREE ELEMENT TYPES ARE NOT INTERCHANGEABLE — each covers a different path:
+#   Float32   rides the SIMD kernels (it is a BlasReal) and so proves NOTHING about genericity;
+#   Float16   is a bits Real that is NOT a BlasReal ⇒ the generic scalar path a Dual takes;
+#   BigFloat  is NON-BITS ⇒ exercises every `pointer()` guard on the route.
+# Float64 is included so a regression in the fast path shows up here too.
+
+@testitem "getrf! — generic T<:Real: PA = LU across Float64/Float32/Float16/BigFloat" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(4242)
+    function recon_err(A0, A, ipiv)
+        m, n = size(A); k = min(m, n); T = eltype(A)
+        L = Matrix(LowerTriangular(A))
+        for i in 1:min(m, n)
+            L[i, i] = one(T)
+        end
+        U = Matrix(UpperTriangular(A))
+        p = collect(1:m)
+        for i in 1:k
+            p[i], p[ipiv[i]] = p[ipiv[i]], p[i]
+        end
+        return maximum(abs, (L * U)[:, 1:n] .- A0[p, :])
+    end
+    @testset "$T" for (T, tol) in ((Float64, 1.0e-12), (Float32, 1.0e-4), (Float16, 0.5), (BigFloat, 1.0e-60))
+        @testset "n=$n" for n in (8, 16, 33)
+            A0 = T.(randn(n, n) + n * I)
+            A = copy(A0); ipiv = Vector{Int}(undef, n)
+            PureBLAS.getrf!(A, ipiv)
+            @test recon_err(A0, A, ipiv) < tol
+        end
+        # the 1-arg convenience form must accept a non-Float64 Real too
+        _, ip, info = PureBLAS.getrf!(T.(randn(12, 12) + 12 * I))
+        @test info == 0 && length(ip) == 12
+    end
+end
+
+@testitem "geqrf! — generic T<:Real: A = QR under the faer tau convention" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(31415)
+    # faer convention (NOT LAPACK's): H_k = I − v·vᵀ/τ, and τ=Inf means the identity reflector. Storing
+    # LAPACK's τ here instead would make the convention depend on the ELEMENT TYPE — the mismatch class
+    # that got a faer-τ/orgqr pairing retracted once already.
+    function recon(F, tau, ::Type{T}) where {T}
+        m, n = size(F); k = min(m, n)
+        R = T[i <= j ? F[i, j] : zero(T) for i in 1:m, j in 1:n]
+        for kk in k:-1:1
+            isfinite(tau[kk]) || continue
+            v = zeros(T, m); v[kk] = one(T); v[(kk + 1):m] = F[(kk + 1):m, kk]
+            R .-= (v * (transpose(v) * R)) ./ tau[kk]
+        end
+        return R
+    end
+    @testset "$T" for (T, tol) in ((Float64, 1.0e-11), (Float32, 1.0e-4), (Float16, 0.1), (BigFloat, 1.0e-60))
+        @testset "$(m)x$(n)" for (m, n) in ((1, 1), (8, 8), (16, 8), (8, 16), (33, 20))
+            A0 = T.(randn(m, n))
+            F = copy(A0); tau = zeros(T, min(m, n))
+            PureBLAS.geqrf!(F, tau)
+            rel = maximum(abs, recon(F, tau, T) .- A0) / max(maximum(abs, A0), eps(T))
+            @test rel < tol
+        end
+    end
+end
+
+@testitem "gesvd! — generic T<:Real: singular values, and vectors refuse loudly" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(2718)
+    @testset "$T" for (T, tol) in ((Float64, 1.0e-12), (Float32, 1.0e-5), (Float16, 5.0e-2), (BigFloat, 1.0e-12))
+        @testset "$(m)x$(n)" for (m, n) in ((1, 1), (6, 6), (12, 7), (7, 12), (20, 20))
+            A64 = randn(m, n)
+            ref = svdvals(A64)                       # Float64 oracle — bounds BigFloat's achievable error
+            S = PureBLAS.gesvd!(T.(A64); want_vectors = false)[1]
+            @test maximum(abs, Float64.(S) .- ref) / ref[1] < tol
+        end
+    end
+    # Vectors are Float64/complex only. Silently returning values where vectors were asked for is the
+    # worse failure, so the generic path must throw.
+    @test_throws ArgumentError PureBLAS.gesvd!(Float16.(randn(4, 4)))
+    @test_throws ArgumentError PureBLAS.gesvd!(BigFloat.(randn(4, 4)); want_vectors = true)
+end
