@@ -89,8 +89,18 @@ Two honest caveats:
   is not one, so it falls to the generic scalar path. You get the right derivative at scalar speed, not
   at BLAS speed.
 
-So: useful if you need to differentiate through a linear-algebra call and correctness matters more than
-throughput. Not yet a replacement for a hand-written adjoint.
+So today: useful if you need to differentiate through a linear-algebra call and correctness matters more
+than throughput. Not yet a replacement for a hand-written adjoint.
+
+**Where this is going.** The aim is differentiation at full BLAS speed, and the route is reverse-mode
+rules rather than pushing `Dual` numbers through the kernels. An `rrule` calls the ordinary `Float64`
+primal — the SIMD kernel, at full speed — and expresses the adjoint as more BLAS calls, which run at
+full speed too. Nothing has to be differentiated element by element.
+
+That is achievable because these kernels are Julia the compiler can see through, rather than an opaque
+`ccall`. It is the reason the project cares about AD at all. **None of it is written yet** — it is
+milestone M6 in [`ROADMAP.md`](ROADMAP.md), and the recent work making LU, QR and SVD generic was
+groundwork for it, not the thing itself.
 
 ## A shared library other languages can link
 
