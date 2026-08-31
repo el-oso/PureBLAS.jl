@@ -5445,6 +5445,42 @@ end
 @inline _unified_layout_ok(::Type{T}) where {T} = _vwidth(T) == _NR
 @inline _unified_ok(::Type{T}) where {T} = _unified_layout_ok(T) && _vwidth(T) >= 8
 
+# The (jr, ir) micro-tile sweep over ONE packed panel of the unified syrk.
+#
+# Split out of `_trgemm_packed_u!` to flatten it: five nested BLIS loops plus the tile classification
+# put that function at depth 8, and the five loops are the algorithm and cannot go. Unlike
+# `_trgemm_packed!`, there is NO loop-invariant branch to hoist here — the β/α handling is inside
+# `_microkernel_u!` and the three-way classification is already flat — so this is a readability split
+# with no expected effect on generated code.
+function _trgemm_tiles_u!(
+        up::Bool, α::T, PA::Ptr{T}, Cp0::Ptr{T}, ldc::Int, sz::Int, pstr::Int,
+        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, mr::Int, nr::Int
+    ) where {T <: BlasReal}
+    jr = 0
+    while jr < nce
+        nre = min(nr, nce - jr); ir = 0
+        while ir < mce
+            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+            if !skip
+                a = PA + div(r0, mr) * pstr * sz; b = PA + div(c0, nr) * pstr * sz
+                Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
+                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
+                if full && mre == mr && nre == nr
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:full))
+                elseif full
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:masked))
+                else
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, c0 - r0, up, Val(1), Val(_NR), Val(:tri))
+                end
+            end
+            ir += mr
+        end
+        jr += nr
+    end
+    return nothing
+end
+
 # Unified single-pack syrk: pack A ONCE into W-row panels; the A-operand (vector load, panel ir) and
 # the B-operand (scalar broadcast, panel jr) both read that one buffer. 8×8 tile (MR=1) so both packs'
 # layouts coincide; α applied at the store (shared buffer ⇒ can't fold α into the pack).
@@ -5465,28 +5501,8 @@ function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <:
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
                 ic = 0
                 while ic < n
-                    mce = min(mc, n - ic); jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
-                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
-                            if !skip
-                                a = PA + div(r0, mr) * pstr * sz; b = PA + div(c0, nr) * pstr * sz
-                                Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
-                                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
-                                if full && mre == mr && nre == nr
-                                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:full))
-                                elseif full
-                                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:masked))
-                                else
-                                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, c0 - r0, up, Val(1), Val(_NR), Val(:tri))
-                                end
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
+                    mce = min(mc, n - ic)
+                    _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce, mr, nr)
                     ic += mc
                 end
                 pc += kc
