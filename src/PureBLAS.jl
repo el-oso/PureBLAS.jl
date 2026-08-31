@@ -4,6 +4,11 @@ module PureBLAS
 # generic `T<:Number` kernels, plugged into Julia two ways — directly (AD-friendly native API)
 # and as a libblastrampoline drop-in (juliac --trim → libpureblas.so). See ROADMAP.md for L2/L3.
 
+# Only the two lazy transpose wrappers, so `_lazyop` (ptrmat.jl) can fold `A'`/`transpose(A)` into a
+# BLAS trans char instead of packing them through generic indexing. Types only -- no LinearAlgebra
+# routine is called from the kernels.
+using LinearAlgebra: Adjoint, Transpose
+
 include("core.jl")          # type aliases, _ld/_st! accessors, lassq, |·|
 include("ptrmat.jl")        # PtrMatrix/PtrVector: isbits Ptr-backed operands for the C-ABI boundary
 include("cpuinfo.jl")       # SIMD width detection (const-folded, trim-safe)

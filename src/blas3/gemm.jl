@@ -2920,6 +2920,18 @@ function gemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N'
     )
+    # Fold a lazy `A'` / `transpose(A)` operand into the trans char. gemm accepts 'N'/'T'/'C', so every
+    # wrapper is expressible here (unlike syrk/herk -- see `_lazyop`). Only when the caller's own flag
+    # is 'N': composing a wrapper with an explicit flag is left alone rather than guessed at.
+    #
+    # Recurse with the unwrapped operand instead of reassigning `A`, which would widen it to a Union
+    # and cost inference in a hot entry. `_lazyop` is a per-type constant, so for a plain matrix the
+    # branch const-folds away entirely; `parent` of a wrapper is never a wrapper, so this bottoms out.
+    if transA == 'N' && _lazyop(A) != 'N'
+        return gemm!(C, parent(A), B; alpha, beta, transA = _lazyop(A), transB)
+    elseif transB == 'N' && _lazyop(B) != 'N'
+        return gemm!(C, A, parent(B); alpha, beta, transA, transB = _lazyop(B))
+    end
     T = eltype(C)
     tA = transA != 'N'; tB = transB != 'N'
     m = size(C, 1); n = size(C, 2)

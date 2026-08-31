@@ -5702,7 +5702,14 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
         # The unpacked branch YIELDS to the 3M window. It is tested before the packed path, and 3M lives
         # inside `_csyrk_packed!` → `_ctrgemm_prod!`, so without this `_CSYRK_UNPACK_MAX`=192 shadowed
         # 3M entirely below 192 on AVX-512 and lowering `_CSYRK_3M_MIN` was a dead knob.
-        if !tr && n <= _CSYRK_UNPACK_MAX && !_ctrk_3m_ok(n, k)
+        # `_strided1(A)` is REQUIRED, not an optimisation: `_ctri_unpacked!` reads the operand
+        # DIRECTLY (`_ctri_core!` takes `stride(X,2)` and `pointer(X)`), so an operand that is not
+        # pointer-able throws from inside the kernel. A complex `A'` is exactly that -- `Adjoint`
+        # conjugates, so it is not a strided view and Base defines no `strides` for it, and
+        # `herk!(C, A')` died with `MethodError(strides)` for every n <= 64 while n >= 128 silently
+        # escaped to the packed path below. The packed and recursive paths both index generically,
+        # so falling through is correct for any such operand.
+        if !tr && _strided1(A) && n <= _CSYRK_UNPACK_MAX && !_ctrk_3m_ok(n, k)
             return _ctri_unpacked!(up, herm, α, A, C, k)
         elseif n > (tr ? _fh_csyrk_pack_cut_t() : _fh_csyrk_pack_cut())
             return _csyrk_packed!(up, tr, herm, α, A, C, k)
@@ -5765,6 +5772,13 @@ function syrk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Number = true, beta::Number = false
     )
+    # syrk is SYMMETRIC: its vocabulary is 'N'/'T', a plain transpose. So `transpose(A)` folds, and so
+    # does a REAL `A'` (adjoint == transpose there) -- but a COMPLEX `A'` means the conjugate transpose,
+    # which 'T' does not express, so it must stay wrapped and take the generic path. `_lazyop` returns
+    # 'C' in exactly that case, so testing for 'T' is the whole guard.
+    if trans == 'N' && _lazyop(A) == 'T'
+        return syrk!(C, parent(A); uplo, trans = 'T', alpha, beta)
+    end
     n, k = _syrk_dims(C, A, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
@@ -5774,6 +5788,12 @@ function herk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Real = true, beta::Real = false
     )
+    # herk is HERMITIAN: its vocabulary is 'N'/'C', the conjugate transpose. The mirror of syrk above --
+    # `A'` folds at either eltype, while a COMPLEX `transpose(A)` does not (it means 'T', which herk
+    # does not express) and stays wrapped.
+    if trans == 'N' && _lazyop(A) == 'C'
+        return herk!(C, parent(A); uplo, trans = 'C', alpha, beta)
+    end
     n, k = _syrk_dims(C, A, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
     _syrk_blocked!(up, trans != 'N', true, alpha, A, C, k)
@@ -6486,10 +6506,17 @@ function syr2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false
     )
+    # Both operands share ONE trans char, so they fold together or not at all. Vocabulary as syrk.
+    if trans == 'N' && _lazyop(A) == 'T' && _lazyop(Bm) == 'T'
+        return syr2k!(C, parent(A), parent(Bm); uplo, trans = 'T', alpha, beta)
+    end
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     if eltype(C) <: BlasReal && n > _fh_syr2k_pack_cut() && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
-    elseif eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
+    elseif eltype(C) <: BlasComplex && trans == 'N' && _strided1(A) && _strided1(Bm) &&
+            0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
+        # Both operands must be pointer-able: `_ctri2_unpacked!` reads them directly. See the same
+        # guard in `_syrk_blocked!` for why (a complex `A'` has no `strides` method).
         _syrk_scaleC!(C, up, beta)                                     # small-n trans='N': unpacked-tri (2 products)
         _ctri2_unpacked!(up, false, alpha, A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && n > _fh_csyr2k_pack_cut() && k > 0
@@ -6505,9 +6532,16 @@ function her2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Real = false
     )
+    # Both operands share ONE trans char, so they fold together or not at all. Vocabulary as herk.
+    if trans == 'N' && _lazyop(A) == 'C' && _lazyop(Bm) == 'C'
+        return her2k!(C, parent(A), parent(Bm); uplo, trans = 'C', alpha, beta)
+    end
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
-    if eltype(C) <: BlasComplex && trans == 'N' && 0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
+    if eltype(C) <: BlasComplex && trans == 'N' && _strided1(A) && _strided1(Bm) &&
+            0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)
+        # Both operands must be pointer-able: `_ctri2_unpacked!` reads them directly. See the same
+        # guard in `_syrk_blocked!` for why (a complex `A'` has no `strides` method).
         return (_ctri2_unpacked!(up, true, alpha, A, Bm, C, k); C)     # small-n trans='N': unpacked-tri (2 products)
     elseif eltype(C) <: BlasComplex && n > _fh_csyr2k_pack_cut() && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)

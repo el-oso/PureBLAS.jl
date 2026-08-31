@@ -105,6 +105,22 @@ end
 # PtrMatrix wraps a raw pointer, so its elements are inline by construction.
 @inline _strided1(::PtrMatrix) = true
 
+# The BLAS op-char a lazy transpose wrapper STANDS FOR, or 'N' when the operand is not one.
+#
+# `A'` is `Adjoint`: transpose for real, CONJUGATE transpose for complex. `transpose(A)` is always the
+# plain transpose. Folding the wrapper into the caller's trans char turns a generically-indexed operand
+# back into a strided one, which is worth 1.05-1.16x on real BLAS-3 and 1.29-1.35x on complex `gemm`,
+# where packing through `getindex` pays conjugation and interleaving the pointer path does cheaply.
+#
+# This only NAMES the operation. Each call site folds it or not, because the trans vocabularies differ
+# and a wrong fold is a silent numerical error rather than a crash: `syrk` is 'N'/'T' (symmetric --
+# plain transpose), so a COMPLEX `Adjoint` is not expressible there and must be left alone; `herk` is
+# 'N'/'C' (Hermitian -- conjugated), so a complex `Transpose` is not expressible there. `gemm` has all
+# three and can fold anything. Sites therefore test for the specific char they accept.
+@inline _lazyop(A::Adjoint) = eltype(A) <: Complex ? 'C' : 'T'
+@inline _lazyop(A::Transpose) = 'T'
+@inline _lazyop(A) = 'N'
+
 # VECTOR analogue of `_strided1`, and it exists for the same reason — with a measured incident behind it.
 #
 # The BLAS-2 fast-path predicates (`_l2_simd_ok`, `_l2c_simd_ok`) ask `x isa StridedVector && stride(x,1)
