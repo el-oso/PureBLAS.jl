@@ -4618,6 +4618,97 @@ end
 # regular/masked microkernel fully-stored, triangular-store microkernel straddling. Packs A once per
 # (ic,pc) panel (reads A like a single gemm — no recursion re-reads). Real (BlasReal) only; α folded
 # into the packed A by _pack_A!. C's stored triangle must be β-pre-scaled by the caller.
+# ONE micro-tile of the triangular-output product, classified by its position against the diagonal.
+#
+# Split out of `_trgemm_packed!`'s innermost loop. Each of the four shape cases used to be written
+# TWICE there, once per β-mode, because the β choice is a `Val` and the loop only had a runtime
+# `Bool` — six leaves became twelve `b0 ? … : …` call sites and took that loop nest to depth 11.
+# `B0` is a type parameter here, so each case is written once and the choice costs nothing.
+@inline function _trgemm_tile!(
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
+        kce::Int, mre::Int, nre::Int, full::Bool, off::Int, up::Bool, W::Int
+    ) where {T <: BlasReal, MR, NR, B0}
+    if full && mre == MR * W && nre == NR
+        _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(NR), Val(B0))
+    elseif full && nre == NR && rem(mre, W) == 0
+        # W-ALIGNED PARTIAL ROWS → CLIP, don't mask. `_microkernel_masked!` is fully vectorized but
+        # masks only the STORES: it runs all MR row-vectors through the whole k-loop and retires
+        # `mre` rows, so a partial panel costs a FULL tile. `_microkernel_clip!` takes the
+        # packed-panel stride (Val(MR)) separately from the live vector count (Val(vr)), so it reads
+        # the same layout and computes only the vectors that exist. gemm has done this on both its
+        # packed and unpacked paths for a while; the triangular kernel never picked it up.
+        #
+        # ⚠ SCOPE, measured and NARROWER than it first appears — read before citing this.
+        # This branch does NOT fire for uplo='U', which is what the gate benchmarks. For upper
+        # triangular the only partial row panel is the BOTTOM one, and every tile it owns is on the
+        # diagonal (`full` is false), so it goes to `_microkernel_tri!` and never reaches here.
+        # Verified: after this change syrk@100 read 0.899 (was 0.900) and syrk@2100 0.945 (was
+        # 0.943), and the sawtooth probe's misaligned penalty was 19.6% -> 20.0% with every offset
+        # moving ±2% in both directions — i.e. unchanged, with aligned n=64 as control. An earlier
+        # version of this comment claimed the branch targeted those two cells. It does not; that
+        # claim was falsified by the numbers above.
+        #
+        # It fires for uplo='L', where the bottom partial panel owns many FULL tiles — the
+        # configuration potrf's trailing update issues (`syrk!(…, uplo='L')`). That benefit is
+        # UNQUANTIFIED: potrf gates 1.049–1.99 on Zen3 with this in place, but it gated before too,
+        # so the run does not isolate this branch. Kept because it is strictly fewer FMAs than the
+        # masked tile it replaces and mirrors gemm's own guard exactly — not because a measurement
+        # earned it.
+        #
+        # The sawtooth itself is real and is the residual gap (Zen3,
+        # bench/probes/syrk_modmr_sawtooth.jl, n=49..72): cost/flop has period mr=8, offset 0 =
+        # 1.061, offset 4 = 1.171, non-W offsets 1.20–1.36. Since this branch does not move it, the
+        # upper-triangular waste lives in `_microkernel_tri!` and the diagonal blocks, NOT in the
+        # masked kernel. That is where the next attempt should go.
+        vr = div(mre, W)
+        if vr == 1
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(1), Val(NR), Val(B0))
+        elseif vr == 2
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(2), Val(NR), Val(B0))
+        else
+            _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+        end
+    elseif full
+        _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+    else
+        _microkernel_tri!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, off, up, Val(MR), Val(NR), Val(B0))
+    end
+    return nothing
+end
+
+# The (jr, ir) micro-tile sweep over ONE packed (ic, pc) panel.
+#
+# `B0` — `OV && pc == 0`, i.e. whether this k-block overwrites C rather than accumulating — is
+# constant for the whole panel, so the caller resolves it once and passes it as a type parameter.
+# It used to be a runtime `Bool` re-tested at every micro-tile, inside the innermost of five loops.
+function _trgemm_tiles!(
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
+        ldc::Int, sz::Int, ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, W::Int
+    ) where {T <: BlasReal, MR, NR, B0}
+    mr = MR * W; nr = NR
+    jr = 0
+    while jr < nce
+        nre = min(nr, nce - jr); ir = 0
+        while ir < mce
+            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
+            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
+            if !skip
+                Apanel = App + (div(ir, mr) * mr * kce) * sz
+                Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
+                Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
+                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
+                _trgemm_tile!(
+                    Val(MR), Val(NR), Val(B0), Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                    kce, mre, nre, full, c0 - r0, up, W
+                )
+            end
+            ir += mr
+        end
+        jr += nr
+    end
+    return nothing
+end
+
 # General triangular-C gemm: C[uplo-triangle] += α·op(X)·op(Y) (X→A-operand, Y→B-operand), n×n result.
 # The reusable core behind syrk (Y=X) and syr2k (two passes). Real only; α folded into packed X.
 function _trgemm_packed!(
@@ -4642,76 +4733,10 @@ function _trgemm_packed!(
                 while ic < n
                     mce = min(mc, n - ic)
                     _pack_A!(Ap, X, ic, pc, mce, kce, tXp, α, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir); r0 = ic + ir; c0 = jc + jr
-                            skip = up ? (r0 > c0 + nre - 1) : (r0 + mre - 1 < c0)
-                            if !skip
-                                Apanel = App + (div(ir, mr) * mr * kce) * sz
-                                Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                                Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
-                                full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
-                                if full && mre == mr && nre == nr
-                                    b0 ? _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(true)) :
-                                        _microkernel!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(NR), Val(false))
-                                elseif full && nre == nr && rem(mre, W) == 0
-                                    # W-ALIGNED PARTIAL ROWS → CLIP, don't mask. `_microkernel_masked!` is fully
-                                    # vectorized but masks only the STORES: it runs all MR row-vectors through the
-                                    # whole k-loop and retires `mre` rows, so a partial panel costs a FULL tile.
-                                    # `_microkernel_clip!` takes the packed-panel stride (Val(MR)) separately from
-                                    # the live vector count (Val(vr)), so it reads the same layout and computes only
-                                    # the vectors that exist. gemm has done this on both its packed and unpacked
-                                    # paths for a while; the triangular kernel never picked it up.
-                                    #
-                                    # ⚠ SCOPE, measured and NARROWER than it first appears — read before citing this.
-                                    # This branch does NOT fire for uplo='U', which is what the gate benchmarks.
-                                    # For upper triangular the only partial row panel is the BOTTOM one, and every
-                                    # tile it owns is on the diagonal (`full` is false), so it goes to
-                                    # `_microkernel_tri!` and never reaches here. Verified: after this change
-                                    # syrk@100 read 0.899 (was 0.900) and syrk@2100 0.945 (was 0.943), and the
-                                    # sawtooth probe's misaligned penalty was 19.6% -> 20.0% with every offset
-                                    # moving ±2% in both directions — i.e. unchanged, with aligned n=64 as control.
-                                    # An earlier version of this comment claimed the branch targeted those two
-                                    # cells. It does not; that claim was falsified by the numbers above.
-                                    #
-                                    # It fires for uplo='L', where the bottom partial panel owns many FULL tiles —
-                                    # the configuration potrf's trailing update issues (`syrk!(…, uplo='L')`). That
-                                    # benefit is UNQUANTIFIED: potrf gates 1.049–1.99 on Zen3 with this in place,
-                                    # but it gated before too, so the run does not isolate this branch. Kept
-                                    # because it is strictly fewer FMAs than the masked tile it replaces and
-                                    # mirrors gemm's own guard exactly — not because a measurement earned it.
-                                    #
-                                    # The sawtooth itself is real and is the residual gap (Zen3,
-                                    # bench/probes/syrk_modmr_sawtooth.jl, n=49..72): cost/flop has period mr=8,
-                                    # offset 0 = 1.061, offset 4 = 1.171, non-W offsets 1.20–1.36. Since this
-                                    # branch does not move it, the upper-triangular waste lives in
-                                    # `_microkernel_tri!` and the diagonal blocks, NOT in the masked kernel.
-                                    # That is where the next attempt should go.
-                                    vr = div(mre, W)
-                                    if vr == 1
-                                        b0 ? _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(1), Val(NR), Val(true)) :
-                                            _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(1), Val(NR), Val(false))
-                                    elseif vr == 2
-                                        b0 ? _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(2), Val(NR), Val(true)) :
-                                            _microkernel_clip!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(MR), Val(2), Val(NR), Val(false))
-                                    else
-                                        b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(true)) :
-                                            _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(false))
-                                    end
-                                elseif full
-                                    b0 ? _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(true)) :
-                                        _microkernel_masked!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(MR), Val(NR), Val(false))
-                                else
-                                    b0 ? _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(MR), Val(NR), Val(true)) :
-                                        _microkernel_tri!(Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, c0 - r0, up, Val(MR), Val(NR), Val(false))
-                                end
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
+                    # β-mode resolved ONCE per panel, not once per micro-tile. See `_trgemm_tiles!`.
+                    b0 ?
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce, W) :
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce, W)
                     ic += mc
                 end
                 pc += kc
