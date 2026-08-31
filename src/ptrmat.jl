@@ -150,4 +150,12 @@ end
 # isbits value is a legitimate no-op there — the C caller owns it across the call).
 @inline _root(A::Array) = A
 @inline _root(A::PtrMatrix) = A
-@inline _root(A) = _root(parent(A))
+# Peel until peeling stops making progress. `parent` is the identity for anything that owns its own
+# buffer, so a bare `_root(parent(A))` recurses forever on any dense type that is not `Array` --
+# `FixedSizeArray` peels to a `Memory`, whose parent is itself, and gemm! died with a
+# StackOverflowError rather than a MethodError. Stopping at the fixed point roots the object that
+# actually owns the memory, which is all the callers need: they only ever `GC.@preserve` the result.
+@inline function _root(A)
+    p = parent(A)
+    return p === A ? A : _root(p)
+end
