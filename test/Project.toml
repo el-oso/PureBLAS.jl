@@ -1,6 +1,10 @@
 [deps]
 AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+# Test-only. FixedSizeArray is the concrete case for "a dense array that is not `Array`": it is
+# `<: DenseArray`, so it must ride the same strided fast path Array does, and `_root` must peel it
+# without recursing forever. Pure Julia, one small dependency (Collects).
+FixedSizeArrays = "3821ddf9-e5b5-40d5-8e25-6813ab96b5e2"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
