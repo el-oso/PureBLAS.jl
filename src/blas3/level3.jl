@@ -4626,8 +4626,13 @@ end
 # `B0` is a type parameter here, so each case is written once and the choice costs nothing.
 @inline function _trgemm_tile!(
         ::Val{MR}, ::Val{NR}, ::Val{B0}, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
-        kce::Int, mre::Int, nre::Int, full::Bool, off::Int, up::Bool, W::Int
+        kce::Int, mre::Int, nre::Int, full::Bool, off::Int, up::Bool
     ) where {T <: BlasReal, MR, NR, B0}
+    # DERIVE W from T, never take it as an `::Int` argument. `_vwidth(T)` const-folds, so `MR * W`
+    # and `rem(mre, W)` fold too; passing W in makes them runtime values and the `div`/`rem` become
+    # real integer divisions in the micro-tile loop. Measured: this function plus `_trgemm_tiles!`
+    # emitted 6 `idiv` when W was an argument, 0 when derived.
+    W = _vwidth(T)
     if full && mre == MR * W && nre == NR
         _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(NR), Val(B0))
     elseif full && nre == NR && rem(mre, W) == 0
@@ -4683,9 +4688,11 @@ end
 # It used to be a runtime `Bool` re-tested at every micro-tile, inside the innermost of five loops.
 function _trgemm_tiles!(
         ::Val{MR}, ::Val{NR}, ::Val{B0}, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
-        ldc::Int, sz::Int, ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, W::Int
+        ldc::Int, sz::Int, ic::Int, jc::Int, mce::Int, nce::Int, kce::Int
     ) where {T <: BlasReal, MR, NR, B0}
-    mr = MR * W; nr = NR
+    # See `_trgemm_tile!`: W is DERIVED, not passed, so `mr`/`nr` stay compile-time and the
+    # `div(ir, mr)` / `div(jr, nr)` in the tile loop below fold to shifts instead of `idiv`.
+    W = _vwidth(T); mr = MR * W; nr = NR
     jr = 0
     while jr < nce
         nre = min(nr, nce - jr); ir = 0
@@ -4699,7 +4706,7 @@ function _trgemm_tiles!(
                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                 _trgemm_tile!(
                     Val(MR), Val(NR), Val(B0), Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
-                    kce, mre, nre, full, c0 - r0, up, W
+                    kce, mre, nre, full, c0 - r0, up
                 )
             end
             ir += mr
@@ -4735,8 +4742,8 @@ function _trgemm_packed!(
                     _pack_A!(Ap, X, ic, pc, mce, kce, tXp, α, mr)
                     # β-mode resolved ONCE per panel, not once per micro-tile. See `_trgemm_tiles!`.
                     b0 ?
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce, W) :
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce, W)
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce) :
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce)
                     ic += mc
                 end
                 pc += kc
@@ -5454,8 +5461,12 @@ end
 # with no expected effect on generated code.
 function _trgemm_tiles_u!(
         up::Bool, α::T, PA::Ptr{T}, Cp0::Ptr{T}, ldc::Int, sz::Int, pstr::Int,
-        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, mr::Int, nr::Int
+        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int
     ) where {T <: BlasReal}
+    # DERIVED, not passed. The driver has `mr = W = _vwidth(T)` and `nr = _NR`, both compile-time
+    # constants; taking them as `::Int` arguments made `div(r0, mr)` / `div(c0, nr)` below into real
+    # integer divisions. Measured: 2 `idiv` when passed, 0 when derived.
+    mr = _vwidth(T); nr = _NR
     jr = 0
     while jr < nce
         nre = min(nr, nce - jr); ir = 0
@@ -5502,7 +5513,7 @@ function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <:
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic)
-                    _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce, mr, nr)
+                    _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce)
                     ic += mc
                 end
                 pc += kc
