@@ -79,3 +79,34 @@ end
     @test PureBLAS._lazyop(transpose(randn(ComplexF64, 4, 4))) == 'T'
     @test PureBLAS._lazyop(randn(4, 4)) == 'N'
 end
+
+@testitem "trmm!/trsm! are correct for a non-unit-stride output B" begin
+    using PureBLAS, LinearAlgebra
+    # The real trmm/trsm paths read and write B at its ld, i.e. they assume stride(B,1)==1. Handed a B
+    # where that is false they used to return silently WRONG NUMBERS -- no error, no NaN. Complex was
+    # unaffected (its branch routes to an index-based base under the same predicate), which is why this
+    # covers both element types: the real half is the regression, the complex half is the control.
+    #
+    # Two distinct shapes, because they fail the predicate for different reasons: a lazy `B'` inverts
+    # the strides, while a strided view has stride(B,1)==2. Neither is exotic -- `view(X, 1:2:2n, :)`
+    # is an ordinary Julia slice.
+    for T in (Float64, ComplexF64), n in (4, 8, 32, 64)
+        A = triu(randn(T, n, n)) + n * I
+        B0 = randn(T, n, n)
+
+        big = zeros(T, 2n, n); Bv = view(big, 1:2:(2n), 1:n); Bv .= B0
+        @test !PureBLAS._strided1(Bv)
+        PureBLAS.trmm!(Bv, A; side = 'L', uplo = 'U')
+        @test collect(Bv) ≈ UpperTriangular(A) * B0
+
+        Ba = copy(collect(B0'))'
+        @test !PureBLAS._strided1(Ba)
+        want = UpperTriangular(A) * collect(Ba)
+        PureBLAS.trmm!(Ba, A; side = 'L', uplo = 'U')
+        @test collect(Ba) ≈ want
+
+        Bs = view(big, 1:2:(2n), 1:n); Bs .= B0
+        PureBLAS.trsm!(Bs, A; side = 'L', uplo = 'U')
+        @test collect(Bs) ≈ UpperTriangular(A) \ B0
+    end
+end

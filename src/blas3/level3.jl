@@ -1224,6 +1224,24 @@ function trmm!(
         fill!(B, zero(eltype(B)))
         return B
     end
+    # NON-UNIT-STRIDE OUTPUT: stage through a contiguous copy.
+    #
+    # Every real path below -- the tiny bases, `_trmm_split_L!` and the `_trmm!` recursion -- reads and
+    # writes B at its ld, i.e. assumes `stride(B,1) == 1`. Handed a B where that is false (a lazy `B'`,
+    # or a strided view such as `view(X, 1:2:2n, 1:n)`) they returned silently WRONG NUMBERS: no error,
+    # no NaN, just a different matrix. Verified against OpenBLAS's `trmm!` on the same problem, and
+    # present since before the adjoint work -- complex was correct only because its branch has a genuine
+    # index-based base (`_trmm_cmplx_base_*!`) it routes to under the same predicate.
+    #
+    # The algorithm itself is fine: the identical values in a plain `Matrix` give the right answer. So
+    # copy in, run the normal routing, copy back. That is O(k·n) against the product's O(k²·n), and it
+    # is only paid by inputs that were previously wrong -- a `_strided1` B never enters here.
+    if eltype(B) <: BlasReal && !_strided1(B)
+        Bc = Matrix(B)
+        trmm!(Bc, A; side, uplo, transA, diag, alpha)
+        copyto!(B, Bc)
+        return B
+    end
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
     # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
@@ -4173,6 +4191,15 @@ function trsm!(
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || _throw_square(:trsm!, k)
     A = _trsm_matchel(A, B)
+    # NON-UNIT-STRIDE OUTPUT: stage through a contiguous copy. Same defect and same reasoning as
+    # `trmm!` -- the real paths read and write B at its ld and returned silently wrong numbers when
+    # `stride(B,1) != 1`. O(k·n) against the solve's O(k²·n), paid only by inputs that were wrong before.
+    if eltype(B) <: BlasReal && !_strided1(B)
+        Bc = Matrix(B)
+        trsm!(Bc, A; side, uplo, transA, diag, alpha)
+        copyto!(B, Bc)
+        return B
+    end
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
     # The bypass criterion is n-DEPENDENT for side-L, exactly as the side-R note below says of m.
