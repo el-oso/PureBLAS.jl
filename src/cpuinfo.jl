@@ -51,8 +51,18 @@ const _L1_BYTES = let s = Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
 
-# Cache-line size in bytes (folded to a const; 64 on all current x86/ARM). Governs software-prefetch
-# density — one prefetch per line (the ger column-RMW prefetch) — and the prefetch-distance unit.
+# Cache-line size in bytes (folded to a const). Governs software-prefetch density — one prefetch per
+# line (the ger column-RMW prefetch) — and the prefetch-distance unit.
+#
+# ⚠ The 64 fallback is an x86 figure and is WRONG on Apple Silicon, which uses 128-byte lines. It is
+# reached there because `CpuId.cachelinesize()` throws on any non-x86 host (CpuId's `cpuid` is an
+# all-zeros stub off x86), so the `catch` below takes over. Results stay correct — this only sets
+# prefetch density — but the tuning is mis-sized. Not fixed here because it cannot be validated: the
+# fleet is x86-64 only. The right fix when ARM hardware is available is a portable probe
+# (`/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size` on Linux, `hw.cachelinesize` via
+# `sysctl` on Darwin) rather than a hardcoded per-arch literal; `_L3_BYTES` and `_L1D_ASSOC` fall back
+# for the same reason and want the same probe. Meanwhile a user on such a host can pin the
+# Preference. See docs/src/design.md: ARM is untested, not supported.
 const _CACHELINE = let s = try
         Int(cachelinesize())
     catch
@@ -97,7 +107,41 @@ const _L2_BYTES = let s = Int(cache_size(Val(2)))
 end
 
 # L3 TOTAL size in bytes. NOTE: CPUSummary.cache_size(Val(3)) returns a PER-CORE SHARE (Zen4: 2.67M),
-# but L3 is shared — nc blocking wants the TOTAL. CpuId.cachesize()[3] gives the total (16M). Fallback 8M.
+# but L3 is shared — nc blocking wants the TOTAL. CpuId.cachesize()[3] gives the total (16M).
+#
+# The `max(…, _L2_BYTES)` floor is a COHERENCE guard, not a tuning choice. `_at_gemm_nc` sizes the
+# B-block as `(l3 ÷ 4) ÷ (kc · sizeof(T))`, so an L3 that reads SMALLER than L2 produces an nc-block
+# narrower than the mc-block it is supposed to contain — a broken 5-loop configuration. That is
+# exactly what a machine with no reportable L3 gets: the fallback is a fixed 8 MiB, and on any part
+# whose L2 exceeds it the invariant inverts.
+#
+# Measured on the real Apple M4 Pro descriptor (`hw.perflevel0`: l1d 128 KiB, l2 16 MiB, line 128 B;
+# `CpuId.cachesize()` throws off x86 so the fallback is what applies): with l3 = 8 MiB the formulas
+# give kc=1024 mc=612 nc=248 and l3 < l2; with l3 floored to l2 = 16 MiB, nc=504. Fleet-neutral —
+# every x86 box here has l3 ≫ l2 (Zen4 16M/1M, Zen3 32M/0.5M), so the floor never binds there.
+#
+# This is a guard, not ARM support. Deriving the real values needs a portable probe — Linux sysfs
+# `/sys/devices/system/cpu/cpu0/cache/index*/size`, Darwin `sysctl hw.perflevel0.l2cachesize`. Two
+# traps for whoever writes it: the UNPREFIXED Darwin keys (`hw.l1dcachesize`, `hw.l2cachesize`)
+# mirror perflevel1, i.e. the EFFICIENCY cores (64 KiB / 4 MiB), so the prefixed `perflevel0` keys
+# are the authoritative ones for P-cores; and `hw.cachesize[1]` (~3.18 GiB on an M4 Pro) is NOT a
+# cache size and must not be used as L3 — Apple exposes no SLC size at all.
+#
+# WHAT THE FLOOR IS STANDING IN FOR, and why it is acceptable meanwhile. M-series parts have no L3;
+# they have a System Level Cache that behaves like one (bandwidth comparable to x86 L3). Reported
+# sizes: ~32 MB on M4 Pro, ~64 MB on M4 Max, ~16 MB on the base M4. NONE of that is queryable — there
+# is no sysctl for it — so it cannot be Derived from a detected const (req#8's D-vs-M question
+# answers "No" here). The floor therefore leaves an M4 Pro at l3 = l2 = 16 MiB against a true ~32 MB
+# SLC: an UNDER-estimate, which is the safe direction. `nc` is `(l3 ÷ 4) ÷ (kc·sizeof(T))`, so
+# under-estimating makes the B-block smaller — more passes over B, but it still fits. Over-estimating
+# would thrash. Half-sized and correct beats guessed and wrong.
+#
+# For whoever wires this up on real hardware: `Sys.CPU_NAME` is "apple-m4" for the base M4, the Pro
+# AND the Max, so it CANNOT distinguish 16/32/64 MB on its own. The core-count split does —
+# `hw.perflevel0.physicalcpu`/`perflevel1.physicalcpu` read 10+4 on this M4 Pro (base M4 is 4+6, Max
+# is 12+4) — as does `hw.cpusubfamily`. A table keyed on that is a legitimate req8-ok literal, since
+# the quantity is genuinely not detectable; a table keyed on `Sys.CPU_NAME` is not, it is a wrong
+# answer for two of the three parts.
 const _L3_BYTES = @load_preference(
     "l3_bytes",
     let s = try
@@ -105,7 +149,7 @@ const _L3_BYTES = @load_preference(
         catch
             0
         end
-        s > 0 ? s : 8 * 1024 * 1024
+        max(s > 0 ? s : 8 * 1024 * 1024, _L2_BYTES)
     end
 )::Int
 
