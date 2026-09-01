@@ -245,8 +245,22 @@ end
 
 # Permute columns: X ← X[:, perm].
 function _ggs_permcols!(X::AbstractMatrix{T}, perm::Vector{Int}) where {T}
-    Xc = X[:, perm]
-    copyto!(X, Xc)
+    # Permuted elementwise, NOT with `X[:, perm]`. A non-scalar getindex reaches Base's
+    # `throw_checksize_error`, whose message is eagerly interpolated, so `--trim=safe` rejects the
+    # whole call tree (req#4). The elementwise loop is REQUIRED rather than stylistic: one call site
+    # (ggsvd.jl:663) passes `view(Q, :, 1:nl)`, and `collect(view(::SubArray, :, perm))` is still
+    # rejected — the `collect(view(...))` shortcut only works when the parent is an `Array`.
+    nc = length(perm); m = size(X, 1)
+    Xc = Matrix{T}(undef, m, nc)
+    @inbounds for j in 1:nc
+        pj = perm[j]
+        for i in 1:m
+            Xc[i, j] = X[i, pj]
+        end
+    end
+    @inbounds for j in 1:nc, i in 1:m
+        X[i, j] = Xc[i, j]
+    end
     return X
 end
 
