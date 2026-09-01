@@ -14,18 +14,32 @@ using CPUSummary: cache_size
 using Preferences: @load_preference, load_preference
 
 # Widest SIMD register in bytes. Preference override "simd_bytes" wins (cross-compile / pinning);
-# otherwise detect on the build machine. CpuId is x86-only, so guard for portability.
+# otherwise detect on the build machine.
+#
+# ⚠ CpuId must NOT be consulted off x86, and a try/catch is not enough to arrange that. Its `cpuid` is
+# an all-zeros stub on other architectures, so `simdbytes()` sees no feature bits and — per its own
+# docstring — RETURNS `sizeof(Int)` (8) instead of throwing. 8 clears a `> 0` guard, so the old `catch`
+# never fired and `_vwidth(Float64)` came out `8 ÷ 8 == 1`: every Float64 kernel compiled scalar on
+# Apple Silicon. Measured on an M4 Pro (user report, 2026-09-01) by pinning the Preference — gemm
+# n=200 0.890 → 0.429 ms and n=1000 110.0 → 55.3 ms, i.e. a flat 2×, which is exactly the W=1 → W=2
+# lane count. Key on `Sys.ARCH` instead: the wrong VALUE, not an exception, is the failure mode.
+#
+# 16 is a floor rather than a guess — aarch64 mandates 128-bit NEON. SVE can be wider but its width is
+# runtime-variable and so cannot fold to a const; a wider part is under-used, never mis-compiled. The
+# same floor covers x86 hosts whose feature leaves a VM has masked.
 # PDM: Exempt — the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SIMD_BYTES = let p = @load_preference("simd_bytes", nothing)
-    if p !== nothing
+    if !isnothing(p)
         Int(p)::Int
-    else
+    elseif Sys.ARCH === :x86_64 || Sys.ARCH === :i686
         b = try
             Int(simdbytes())
         catch
-            16  # conservative SSE2/NEON fallback when detection is unavailable (e.g. aarch64)
+            16  # detection unavailable (masked CPUID leaf) — SSE2 is the x86-64 baseline
         end
-        b > 0 ? b : 16
+        max(b, 16)
+    else
+        16  # NEON is architecturally 128-bit; CpuId cannot see it and reports sizeof(Int)
     end
 end
 
@@ -54,21 +68,28 @@ end
 # Cache-line size in bytes (folded to a const). Governs software-prefetch density — one prefetch per
 # line (the ger column-RMW prefetch) — and the prefetch-distance unit.
 #
-# ⚠ The 64 fallback is an x86 figure and is WRONG on Apple Silicon, which uses 128-byte lines. It is
-# reached there because `CpuId.cachelinesize()` throws on any non-x86 host (CpuId's `cpuid` is an
-# all-zeros stub off x86), so the `catch` below takes over. Results stay correct — this only sets
-# prefetch density — but the tuning is mis-sized. Not fixed here because it cannot be validated: the
-# fleet is x86-64 only. The right fix when ARM hardware is available is a portable probe
-# (`/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size` on Linux, `hw.cachelinesize` via
-# `sysctl` on Darwin) rather than a hardcoded per-arch literal; `_L3_BYTES` and `_L1D_ASSOC` fall back
-# for the same reason and want the same probe. Meanwhile a user on such a host can pin the
-# Preference. See docs/src/design.md: ARM is untested, not supported.
+# `CpuId.cachelinesize()` throws on any non-x86 host (its `cpuid` is an all-zeros stub off x86), so the
+# `catch` takes over there. The generic 64 is an x86 figure and is WRONG on Apple Silicon, which uses
+# 128-byte lines — confirmed as `hw.cachelinesize: 128` in the M4 Pro `sysctl` dump quoted in
+# kb/findings/apple-silicon-cache-detection.md. That is an architectural fact about the part, not a
+# tuned magic number, so it is keyed on the arch rather than probed; a `sysctl` subprocess at
+# precompile time would buy nothing here and could not be validated on this fleet either.
+#
+# Only prefetch density depends on this, so a wrong value costs tuning and never correctness.
+# `_L3_BYTES` (no SLC is queryable at all on M-series) and `_L1D_ASSOC` remain approximate on ARM for
+# the same reason — see docs/src/design.md: ARM is untested, not supported.
 const _CACHELINE = let s = try
         Int(cachelinesize())
     catch
         0
     end
-    s > 0 ? s : 64
+    if s > 0
+        s
+    elseif Sys.ARCH === :aarch64 && Sys.isapple()
+        128
+    else
+        64
+    end
 end
 
 # L1d associativity (ways), CPUID leaf 4 (Intel) / 0x8000001D (AMD) subleaf 0, ebx[22:31]+1 — the same
