@@ -210,6 +210,30 @@ const _STEDC_NB = 25   # req8-ok: LAPACK dstedc SMLSIZ — algorithm-intrinsic b
 # --- recursive D&C driver (dlaed0 recursion + dlaed1 merge + dlaed2 deflation + dlaed3 secular solve)
 # d (diag) → eigenvalues ascending; e (subdiag, length n-1) destroyed; Z (n×n) → eigenvectors (Z=I on
 # entry not required — the base case / n==1 seed Z themselves; parent slots are zeroed before recursing).
+# Indices where `deflated` is false, without `findall(!, deflated)`.
+#
+# `findall` with a PREDICATE goes down a generic path that reaches Base's eagerly-interpolated error
+# string, so `juliac --trim=safe` rejects it (req#4) — the same Base-owned `_str_sizehint(::Any)` /
+# `print(::IOBuffer, ::Any)` pair that non-scalar `getindex`, `falses`, and typed matrix literals
+# reach. (Bare `findall(v::Vector{Bool})` is fine; it is the f-predicate form that is rejected.)
+# Two passes so the result is exactly sized, matching what `findall` returned.
+function _dc_survivors(deflated::AbstractVector{Bool})
+    n = length(deflated)
+    cnt = 0
+    @inbounds for i in 1:n
+        deflated[i] || (cnt += 1)
+    end
+    out = Vector{Int}(undef, cnt)
+    c = 0
+    @inbounds for i in 1:n
+        if !deflated[i]
+            c += 1
+            out[c] = i
+        end
+    end
+    return out
+end
+
 function _dc_eigen!(
         d::AbstractVector{T}, e::AbstractVector{T}, Z::AbstractMatrix{T},
         nb::Int = _STEDC_NB
@@ -275,7 +299,20 @@ function _dc_eigen!(
 
     # --- dlaed2: physically sort (d,z,Q-columns) into global ascending d order.
     ord = sortperm(d)
-    dsort = d[ord]; zsort = z[ord]; Zsort = Z[:, ord]
+    # Gathered elementwise, NOT with `d[ord]` / `Z[:, ord]`. A non-scalar `getindex` routes through
+    # Base's `_unsafe_getindex` → `throw_checksize_error` (multidimensional.jl), whose message is
+    # eagerly interpolated, so `print_to_string` — and with it `_str_sizehint(::Any)` /
+    # `print(::IOBuffer, ::Any)` — becomes reachable and `juliac --trim=safe` rejects the call tree
+    # (req#4). The string is Base's, not ours; the fancy index is what reaches it. Same class as the
+    # `typed_hvcat` matrix literals in trsyl.jl. Linear-range `v[1:k]` and `view(...)` are fine.
+    dsort = Vector{T}(undef, n); zsort = Vector{T}(undef, n); Zsort = Matrix{T}(undef, n, n)
+    @inbounds for j in 1:n
+        oj = ord[j]
+        dsort[j] = d[oj]; zsort[j] = z[oj]
+        for r in 1:n
+            Zsort[r, j] = Z[r, oj]
+        end
+    end
     # dlaed2 COLTYP: sorted column i originates from Q1 (rows 1:k → type 1) or Q2 (rows k+1:n → type 3);
     # a cross-block Givens (rule b) turns the survivor DENSE (type 2). Drives the dlaed3 two-gemm split.
     coltyp = Vector{Int}(undef, n)
@@ -287,13 +324,13 @@ function _dc_eigen!(
     dmax = maximum(abs, dsort); zmax = maximum(abs, zsort)
     tol = T(32) * eps(T) * max(dmax, zmax)
 
-    deflated = falses(n)
+    deflated = fill(false, n)  # falses(): BitArray undef ctor is --trim=safe rejected
     @inbounds for i in 1:n
         if rho * abs(zsort[i]) <= tol
             deflated[i] = true    # rule (a): negligible z ⇒ already an exact eigenpair (e_i, dsort[i])
         end
     end
-    survivors = findall(!, deflated)
+    survivors = _dc_survivors(deflated)
     if length(survivors) >= 2
         pj = survivors[1]
         @inbounds for idx in 2:length(survivors)
@@ -322,7 +359,7 @@ function _dc_eigen!(
             end
         end
     end
-    survivor_idx = findall(!, deflated)
+    survivor_idx = _dc_survivors(deflated)
     K = length(survivor_idx)
 
     # Eigenvalues in sorted-column order: deflated slots keep dsort; survivor slots overwritten by the
@@ -335,7 +372,11 @@ function _dc_eigen!(
     R = Matrix{T}(undef, n, max(K, 0))     # survivor eigenvectors B·V (0 cols if none)
 
     if K > 0
-        dlambda = dsort[survivor_idx]; w = zsort[survivor_idx]
+        dlambda = Vector{T}(undef, K); w = Vector{T}(undef, K)
+        @inbounds for i in 1:K
+            si = survivor_idx[i]
+            dlambda[i] = dsort[si]; w[i] = zsort[si]
+        end
         lam = Vector{T}(undef, K); oidx = Vector{Int}(undef, K); mu = Vector{T}(undef, K)
         sec_ = (shift, mu_) -> _secular_eq_eigen(shift, mu_, w, dlambda, rho, K)
         wsq = zero(T)
@@ -504,8 +545,19 @@ function _stedc!(
     # global ascending sort of eigenvalues + eigenvector columns (blocks are each ascending but interleaved).
     if !issorted(view(d, 1:n))
         ord = sortperm(view(d, 1:n))
-        copyto!(view(d, 1:n), d[ord])       # copyto!(view, X), not slice-assign (setindex_shape_check --trim-unsafe)
-        copyto!(view(Z, :, 1:n), Z[:, ord])
+        # Gathered elementwise for the same reason as the `dsort`/`Zsort` permutation above: `d[ord]`
+        # and `Z[:, ord]` are non-scalar getindex, which reaches Base's interpolated
+        # `throw_checksize_error` and is --trim=safe rejected.
+        dtmp = Vector{T}(undef, n); Ztmp = Matrix{T}(undef, size(Z, 1), n)
+        @inbounds for p in 1:n
+            op = ord[p]
+            dtmp[p] = d[op]
+            for r in axes(Z, 1)
+                Ztmp[r, p] = Z[r, op]
+            end
+        end
+        copyto!(view(d, 1:n), dtmp)         # copyto!(view, X), not slice-assign (setindex_shape_check --trim-unsafe)
+        copyto!(view(Z, :, 1:n), Ztmp)
     end
     return d, Z
 end

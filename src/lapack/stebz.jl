@@ -50,6 +50,18 @@ end
     return (low + high) / 2
 end
 
+# Gather `v[idx]` elementwise. A non-scalar `getindex` with a Vector{Int} index routes through
+# Base's `_unsafe_getindex!` -> `throw_checksize_error` (multidimensional.jl), an eagerly
+# interpolated DimensionMismatch that `juliac --trim=safe` rejects (req#4). The string is Base's;
+# the fancy index is what reaches it. Linear-range `v[1:k]` and `view(...)` are unaffected.
+@inline function _stebz_gather(v::Vector{V}, idx::Vector{Int}) where {V}
+    out = Vector{V}(undef, length(idx))
+    @inbounds for (t, s) in enumerate(idx)
+        out[t] = v[s]
+    end
+    return out
+end
+
 """
     stebz!(range, order, vl, vu, il, iu, abstol, d, e) -> (w, iblock, isplit, info)
 
@@ -135,12 +147,12 @@ function stebz!(
     if range == 'I'                        # keep only the global index band il:iu (ascending)
         p = sortperm(w)
         idx = sort(p[Int(il):Int(iu)])     # positions of the wanted eigenvalues (block-major order)
-        w = w[idx]; iblock = iblock[idx]
+        w = _stebz_gather(w, idx); iblock = _stebz_gather(iblock, idx)
     end
 
     if order == 'E' && length(isplit) > 1
         p = sortperm(w)                    # ascending by value across blocks
-        w = w[p]; iblock = iblock[p]
+        w = _stebz_gather(w, p); iblock = _stebz_gather(iblock, p)
     end
     return w, iblock, isplit, 0
 end

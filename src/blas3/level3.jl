@@ -4171,15 +4171,22 @@ const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 # NOT applied when B's eltype is outside BlasFloat: that is the generic/AD path (e.g. Float64 A with
 # ForwardDiff.Dual B), which is type-generic scalar code, handles the mixture correctly today, and would
 # be broken by forcing a convert.
+# `lazy"…"` behind `@noinline`, for TRIM (req#4), not style: an eager interpolation builds the String
+# at the throw site via `Base.print_to_string`, whose heterogeneous loop lowers to
+# `_str_sizehint(φ ()::Any)` / `print(::IOBuffer, φ ()::Any)` — dynamic calls `juliac --trim=safe`
+# rejects. This one sat in `trsm!`'s entry, so every caller inherited it: it is what failed `trsyl!`
+# in the LAPACK trim dogfood (reported against trsyl.jl:723, a `trsm!` call). Same class as
+# `_throw_tri_square`/`_throw_tri_len` in backend.jl.
+@noinline _throw_trsm_eltype(TA, TB) = throw(
+    ArgumentError(
+        lazy"trsm!: eltype(A)=$TA cannot be represented in eltype(B)=$TB; convert the operands explicitly"
+    )
+)
+
 @inline function _trsm_matchel(A::AbstractMatrix, B::AbstractMatrix)
     TA, TB = eltype(A), eltype(B)
     (TA === TB || !(TB <: BlasFloat)) && return A
-    promote_type(TA, TB) === TB || throw(
-        ArgumentError(
-            "trsm!: eltype(A)=$TA cannot be represented in eltype(B)=$TB; " *
-                "convert the operands explicitly"
-        )
-    )
+    promote_type(TA, TB) === TB || _throw_trsm_eltype(TA, TB)
     return convert(AbstractMatrix{TB}, A)
 end
 

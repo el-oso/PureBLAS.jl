@@ -8,6 +8,18 @@
 # alongside hseqr.jl/trevc.jl which carry their own dlanv2/dlaln2 copies).  STANDALONE: not wired into
 # the PureBLAS module include list or the C-ABI — driven directly (or from trsen.jl).
 
+# 2x2 block builder that avoids a MATRIX LITERAL. `R[a b; c d]` lowers to `Base.typed_hvcat`,
+# whose argument-count error message interpolates eagerly, so `Base.print_to_string` -- and with
+# it `_str_sizehint(::Any)` / `print(::IOBuffer, ::Any)` -- becomes reachable and `juliac
+# --trim=safe` rejects the whole call tree. That is what made `trsyl!` trim-incompatible (req#4);
+# the string is Base's, not ours, but the literal is what reaches it. Assigning elementwise builds
+# the identical 2x2 with no hvcat on the path.
+@inline function _syl_vb2(::Type{R}, a, b, c, d) where {R}
+    M = Matrix{R}(undef, 2, 2)
+    M[1, 1] = a; M[1, 2] = b; M[2, 1] = c; M[2, 2] = d
+    return M
+end
+
 @inline function _syl_safmin(::Type{R}) where {R <: Real}
     sfmin = floatmin(R)
     small = one(R) / floatmax(R)
@@ -385,7 +397,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sarow(k1, k2 + 1, m, l2) + sgn * sbcol(k1, 1, l1 - 1, l2))
                     v21 = C[k2, l1] - (sarow(k2, k2 + 1, m, l1) + sgn * sbcol(k2, 1, l1 - 1, l1))
                     v22 = C[k2, l2] - (sarow(k2, k2 + 1, m, l2) + sgn * sbcol(k2, 1, l1 - 1, l2))
-                    vb = R[v11 v12; v21 v22]
+                    vb = _syl_vb2(R, v11, v12, v21, v22)
                     x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
@@ -449,7 +461,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sacol(k1, 1, k1 - 1, l2) + sgn * sbcol(k1, 1, l1 - 1, l2))
                     v21 = C[k2, l1] - (sacol(k2, 1, k1 - 1, l1) + sgn * sbcol(k2, 1, l1 - 1, l1))
                     v22 = C[k2, l2] - (sacol(k2, 1, k1 - 1, l2) + sgn * sbcol(k2, 1, l1 - 1, l2))
-                    vb = R[v11 v12; v21 v22]
+                    vb = _syl_vb2(R, v11, v12, v21, v22)
                     x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
@@ -513,7 +525,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sacol(k1, 1, k1 - 1, l2) + sgn * sbrow(k1, l2, l2 + 1, n))
                     v21 = C[k2, l1] - (sacol(k2, 1, k1 - 1, l1) + sgn * sbrow(k2, l1, l2 + 1, n))
                     v22 = C[k2, l2] - (sacol(k2, 1, k1 - 1, l2) + sgn * sbrow(k2, l2, l2 + 1, n))
-                    vb = R[v11 v12; v21 v22]
+                    vb = _syl_vb2(R, v11, v12, v21, v22)
                     x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
@@ -577,7 +589,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sarow(k1, k2 + 1, m, l2) + sgn * sbrow(k1, l2, l2 + 1, n))
                     v21 = C[k2, l1] - (sarow(k2, k2 + 1, m, l1) + sgn * sbrow(k2, l1, l2 + 1, n))
                     v22 = C[k2, l2] - (sarow(k2, k2 + 1, m, l2) + sgn * sbrow(k2, l2, l2 + 1, n))
-                    vb = R[v11 v12; v21 v22]
+                    vb = _syl_vb2(R, v11, v12, v21, v22)
                     x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22

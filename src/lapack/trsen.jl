@@ -521,7 +521,7 @@ function _dtrsen!(
             s = ONE
         else
             # S = scale / ( sqrt(scale²/rnorm + rnorm)·sqrt(rnorm) ),  rnorm = ‖X‖_F of the coupling solve
-            Rm = copy(T[1:n1, (n1 + 1):n])                 # off-diagonal coupling block T₁₂
+            Rm = collect(view(T, 1:n1, (n1 + 1):n))                 # off-diagonal coupling block T₁₂
             _, scale, _ = _dtrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
             rnorm = (
                 rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
@@ -536,7 +536,7 @@ function _dtrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            T11 = T[1:n1, 1:n1]; T22 = T[(n1 + 1):n, (n1 + 1):n]
+            T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(ONE)
             apply! = function (xv, kase)
                 Xm = reshape(xv, n1, n2)
@@ -581,7 +581,7 @@ function _ztrsen!(
         if m == n || m == 0
             s = one(R)
         else
-            Rm = C.(T[1:n1, (n1 + 1):n])
+            Rm = C.(view(T, 1:n1, (n1 + 1):n))
             _, scale, _ = _ztrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
             rnorm = (
                 rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
@@ -596,7 +596,7 @@ function _ztrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            T11 = T[1:n1, 1:n1]; T22 = T[(n1 + 1):n, (n1 + 1):n]
+            T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(one(R))
             apply! = function (xv, kase)
                 Xm = reshape(xv, n1, n2)

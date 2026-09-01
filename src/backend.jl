@@ -11,7 +11,7 @@ const DEFAULT_BACKEND = SIMDBackend()
 
 @inline function _eqlen(x, y)
     length(x) == length(y) ||
-        throw(DimensionMismatch("PureBLAS: length(x)=$(length(x)) ≠ length(y)=$(length(y))"))
+        throw(DimensionMismatch(lazy"PureBLAS: length(x)=$(length(x)) ≠ length(y)=$(length(y))"))
     return length(x)
 end
 
@@ -67,11 +67,11 @@ end
     tA = trans != 'N'; cj = trans == 'C'
     m, n = size(A)
     if tA
-        length(x) == m || throw(DimensionMismatch("gemv!('$trans'): length(x)=$(length(x)) ≠ size(A,1)=$m"))
-        length(y) == n || throw(DimensionMismatch("gemv!('$trans'): length(y)=$(length(y)) ≠ size(A,2)=$n"))
+        length(x) == m || throw(DimensionMismatch(lazy"gemv!('$trans'): length(x)=$(length(x)) ≠ size(A,1)=$m"))
+        length(y) == n || throw(DimensionMismatch(lazy"gemv!('$trans'): length(y)=$(length(y)) ≠ size(A,2)=$n"))
     else
-        length(x) == n || throw(DimensionMismatch("gemv!: length(x)=$(length(x)) ≠ size(A,2)=$n"))
-        length(y) == m || throw(DimensionMismatch("gemv!: length(y)=$(length(y)) ≠ size(A,1)=$m"))
+        length(x) == n || throw(DimensionMismatch(lazy"gemv!: length(x)=$(length(x)) ≠ size(A,2)=$n"))
+        length(y) == m || throw(DimensionMismatch(lazy"gemv!: length(y)=$(length(y)) ≠ size(A,1)=$m"))
     end
     _gemv!(tA, cj, m, n, alpha, A, x, 1, beta, y, 1)
     return y
@@ -83,17 +83,17 @@ end
         A::AbstractMatrix; conj::Bool = false
     )::AbstractMatrix
     m, n = size(A)
-    length(x) == m || throw(DimensionMismatch("ger!: length(x)=$(length(x)) ≠ size(A,1)=$m"))
-    length(y) == n || throw(DimensionMismatch("ger!: length(y)=$(length(y)) ≠ size(A,2)=$n"))
+    length(x) == m || throw(DimensionMismatch(lazy"ger!: length(x)=$(length(x)) ≠ size(A,1)=$m"))
+    length(y) == n || throw(DimensionMismatch(lazy"ger!: length(y)=$(length(y)) ≠ size(A,2)=$n"))
     _ger!(conj, m, n, alpha, x, 1, y, 1, A)
     return A
 end
 
 @inline function _symhemv_dims(A, x, y, op)
     n = size(A, 1)
-    size(A, 2) == n || throw(DimensionMismatch("$op: A is $(size(A, 1))×$(size(A, 2)), not square"))
-    length(x) == n || throw(DimensionMismatch("$op: length(x)=$(length(x)) ≠ size(A)=$n"))
-    length(y) == n || throw(DimensionMismatch("$op: length(y)=$(length(y)) ≠ size(A)=$n"))
+    size(A, 2) == n || throw(DimensionMismatch(lazy"$op: A is $(size(A, 1))×$(size(A, 2)), not square"))
+    length(x) == n || throw(DimensionMismatch(lazy"$op: length(x)=$(length(x)) ≠ size(A)=$n"))
+    length(y) == n || throw(DimensionMismatch(lazy"$op: length(y)=$(length(y)) ≠ size(A)=$n"))
     return n
 end
 
@@ -117,10 +117,23 @@ end
     return y
 end
 
+# The two throws are `lazy"…"` behind `@noinline`, the same idiom as `_throw_square` (core.jl), and it
+# is a TRIM requirement (req#4), not style. An eager `"$op: …$(size(A,2))…"` builds the String at the
+# throw site via `Base.print_to_string`, whose heterogeneous argument loop lowers to
+# `_str_sizehint(φ ()::Any)` / `print(::IOBuffer, φ ()::Any)` — dynamic calls the `juliac --trim=safe`
+# verifier rejects. Because `trsv!` and `trmv!` both route through here, that one eager interpolation
+# made every caller trim-incompatible: it is what failed `gelsy!` in the LAPACK trim dogfood, reported
+# against `gelsy.jl:255` (a `trsm!` call) -> `level3.jl:4228` (a `trsv!` call) -> here.
+# `LazyString` stores the parts and formats only if the message is actually rendered.
+@noinline _throw_tri_square(op, m::Int, k::Int) =
+    throw(DimensionMismatch(lazy"$op: A is $m×$k, not square"))
+@noinline _throw_tri_len(op, lx::Int, n::Int) =
+    throw(DimensionMismatch(lazy"$op: length(x)=$lx ≠ size(A)=$n"))
+
 @inline function _tri_dims(A, x, op)
     n = size(A, 1)
-    size(A, 2) == n || throw(DimensionMismatch("$op: A is $(size(A, 1))×$(size(A, 2)), not square"))
-    length(x) == n || throw(DimensionMismatch("$op: length(x)=$(length(x)) ≠ size(A)=$n"))
+    size(A, 2) == n || _throw_tri_square(op, size(A, 1), size(A, 2))
+    length(x) == n || _throw_tri_len(op, length(x), n)
     return n
 end
 
@@ -146,8 +159,8 @@ end
 
 # ── Level 2 packed storage (AP::AbstractVector) ────────────────────────────────────────────────
 @inline function _pkvec_dims(AP, x, n, op)
-    length(x) == n || throw(DimensionMismatch("$op: length(x)=$(length(x)) ≠ n=$n"))
-    length(AP) >= (n * (n + 1)) ÷ 2 || throw(DimensionMismatch("$op: length(AP)=$(length(AP)) < n(n+1)/2 for n=$n"))
+    length(x) == n || throw(DimensionMismatch(lazy"$op: length(x)=$(length(x)) ≠ n=$n"))
+    length(AP) >= (n * (n + 1)) ÷ 2 || throw(DimensionMismatch(lazy"$op: length(AP)=$(length(AP)) < n(n+1)/2 for n=$n"))
     return n
 end
 
@@ -195,7 +208,7 @@ end
         AP::AbstractVector; uplo::Char = 'U'
     )::AbstractVector
     n = length(x); _pkvec_dims(AP, x, n, "spr2!")
-    length(y) == n || throw(DimensionMismatch("spr2!: length(y)=$(length(y)) ≠ n=$n"))
+    length(y) == n || throw(DimensionMismatch(lazy"spr2!: length(y)=$(length(y)) ≠ n=$n"))
     _spr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
 end
 @inline function hpr!(
@@ -209,7 +222,7 @@ end
         AP::AbstractVector; uplo::Char = 'U'
     )::AbstractVector
     n = length(x); _pkvec_dims(AP, x, n, "hpr2!")
-    length(y) == n || throw(DimensionMismatch("hpr2!: length(y)=$(length(y)) ≠ n=$n"))
+    length(y) == n || throw(DimensionMismatch(lazy"hpr2!: length(y)=$(length(y)) ≠ n=$n"))
     _hpr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
 end
 
@@ -220,16 +233,16 @@ end
         alpha = one(eltype(AB)), beta = zero(eltype(AB))
     )::AbstractVector
     n = size(AB, 2); tA = trans != 'N'
-    size(AB, 1) >= kl + ku + 1 || throw(DimensionMismatch("gbmv!: size(AB,1)=$(size(AB, 1)) < kl+ku+1=$(kl + ku + 1)"))
-    length(x) == (tA ? m : n) || throw(DimensionMismatch("gbmv!('$trans'): length(x)=$(length(x)) ≠ $(tA ? m : n)"))
-    length(y) == (tA ? n : m) || throw(DimensionMismatch("gbmv!('$trans'): length(y)=$(length(y)) ≠ $(tA ? n : m)"))
+    size(AB, 1) >= kl + ku + 1 || throw(DimensionMismatch(lazy"gbmv!: size(AB,1)=$(size(AB, 1)) < kl+ku+1=$(kl + ku + 1)"))
+    length(x) == (tA ? m : n) || throw(DimensionMismatch(lazy"gbmv!('$trans'): length(x)=$(length(x)) ≠ $(tA ? m : n)"))
+    length(y) == (tA ? n : m) || throw(DimensionMismatch(lazy"gbmv!('$trans'): length(y)=$(length(y)) ≠ $(tA ? n : m)"))
     _gbmv!(tA, trans == 'C', m, n, kl, ku, alpha, AB, x, 1, beta, y, 1)
     return y
 end
 @inline function _sbvec_dims(AB, x, y, op)
     n = size(AB, 2)
-    length(x) == n || throw(DimensionMismatch("$op: length(x)=$(length(x)) ≠ n=$n"))
-    length(y) == n || throw(DimensionMismatch("$op: length(y)=$(length(y)) ≠ n=$n"))
+    length(x) == n || throw(DimensionMismatch(lazy"$op: length(x)=$(length(x)) ≠ n=$n"))
+    length(y) == n || throw(DimensionMismatch(lazy"$op: length(y)=$(length(y)) ≠ n=$n"))
     return n, size(AB, 1) - 1
 end
 @inline function sbmv!(
@@ -252,7 +265,7 @@ end
         ::SIMDBackend, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
-    n = size(AB, 2); length(x) == n || throw(DimensionMismatch("tbmv!: length(x)=$(length(x)) ≠ n=$n"))
+    n = size(AB, 2); length(x) == n || throw(DimensionMismatch(lazy"tbmv!: length(x)=$(length(x)) ≠ n=$n"))
     _tbmv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, size(AB, 1) - 1, AB, x, 1)
     return x
 end
@@ -260,7 +273,7 @@ end
         ::SIMDBackend, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
-    n = size(AB, 2); length(x) == n || throw(DimensionMismatch("tbsv!: length(x)=$(length(x)) ≠ n=$n"))
+    n = size(AB, 2); length(x) == n || throw(DimensionMismatch(lazy"tbsv!: length(x)=$(length(x)) ≠ n=$n"))
     _tbsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, size(AB, 1) - 1, AB, x, 1)
     return x
 end
