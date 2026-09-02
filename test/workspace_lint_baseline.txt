@@ -33,8 +33,8 @@
 # `if _strided1(A) && _strided1(B) && _use_unpacked(m,n,k)` (gemm.jl:2828/2844); `_gemm_blocked!` is that
 # `if`'s ELSE arm (:2858). Never both on one path. `_gemm_blocked!` is a pack+microkernel loop, not a
 # nested claimant.
-gpackA  _gemm_core! -> _gemm_blocked!
-gpackB  _gemm_core! -> _gemm_blocked!
+L3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
+L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
 
 # --- Higham-Hager estimator #2 (trsen.jl:402), DECLARED callback edge. `_lacn2_estimate` claims lacn2*
 # once at entry via `_lacn2e_bufs` (trsen.jl:415 — the ONLY call site of that accessor, and it is the only
@@ -48,27 +48,44 @@ gpackB  _gemm_core! -> _gemm_blocked!
 # None of trsv!/_dtrsyl!/_ztrsyl! calls `_lacn2_estimate` (there is no fourth call site), so no lacn2*
 # field is ever re-claimed inside the live claim. RE-READ THIS if a new caller of `_lacn2_estimate`
 # appears, or if either closure grows a call — that is exactly what the declared edge exists to catch.
-lacn2s  _lacn2_estimate -> _lacn2_estimate
-lacn2v  _lacn2_estimate -> _lacn2_estimate
-lacn2x  _lacn2_estimate -> _lacn2_estimate
+L3Workspace.lacn2s  _lacn2_estimate -> _lacn2_estimate
+L3Workspace.lacn2v  _lacn2_estimate -> _lacn2_estimate
+L3Workspace.lacn2x  _lacn2_estimate -> _lacn2_estimate
 
-# --- Higham-Hager estimator #1 (gecon.jl:49), DECLARED callback edge — same shape, different fields.
-# `_lacn2!` claims lacn* once at entry via `_lacn_bufs` (gecon.jl:51, the only call site; only claimant of
-# lacnx/lacnv/lacnsgn) and drives `applyop!` in a loop. The self-edge is again the merged-name tail: the
-# short-form `applyop!(x, adj) = …` defs at gecon.jl:178/227/259 absorb the `_lacn2!(applyop!, …)` calls
-# two lines below them (:180/:229/:261 — the only three). The closures run gecon!/trcon!/pocon!'s
-# solveA!/solveAH!, i.e. trsv!/getrs!/potrs!, none of which claims a lacn* field.
-lacnsgn  _lacn2! -> _lacn2!
-lacnv  _lacn2! -> _lacn2!
-lacnx  _lacn2! -> _lacn2!
+# --- 2026-09-03: the three `lacn*  _lacn2! -> _lacn2!` lines are GONE, and their own reason said why.
+# It read: "the short-form `applyop!(x, adj) = …` defs at gecon.jl:178/227/259 absorb the
+# `_lacn2!(applyop!, …)` calls two lines below them". That absorption was a SCANNER DEFECT, not the code:
+# `_bodies` kept attributing to a short-form def for the rest of the file, so `applyop!`'s "body" swallowed
+# the `_lacn2!` call below it and closed a fake cycle. A short-form def now ends on its own line (plus one
+# continuation when a trailing `=` puts the RHS on the next line). `applyop!` is 3 lines, as written.
+# The `lacn2*` trio ABOVE survives because `apply!`/`applyf` are `name = function …` LONG forms, whose
+# bodies really do run to an `end` — that distinction is now explicit in `_bodies`.
+# This is the third time a phantom self-edge was baselined with a confident reason. Same lesson as the
+# header: re-derive, do not re-read.
+
+# --- SVD: claim ONCE at the public entry, then THREAD THE WORKSPACE DOWN as an explicit argument. This is
+# the case the header calls "claim-once-and-thread-it-down", and it is legal by construction: the callee
+# never re-fetches the owner. `gesvd!` (svd.jl:1505) does `ws = _svdws()` + `_svd_grow!`, then passes it —
+# `_gesvd_core!(At, Usc, S, Vtsc, ws; …)` (:1517) and `_gesvd_core!(A, U, S, Vt, ws; …)` (:1522).
+# `gesvd_vals!` (:1589) likewise: `_svals_core!(At, S, ws)` (:1595) / `_svals_core!(A, S, ws)` (:1597).
+# Neither `_gesvd_core!` (:1409) nor `_svals_core!` (:1487) calls `_svdws()`; both take `ws` as a
+# parameter, so there is exactly ONE claim per call and the lint is seeing the caller's own claim
+# reflected through the callee. RE-READ THIS if either core ever fetches its own workspace.
+SVDWorkspace.dc_U  gesvd! -> _gesvd_core!
+SVDWorkspace.dc_diag  gesvd! -> _gesvd_core!
+SVDWorkspace.dc_subdiag  gesvd! -> _gesvd_core!
+SVDWorkspace.gebrd_X  gesvd_vals! -> _svals_core!
+SVDWorkspace.gebrd_Y  gesvd_vals! -> _svals_core!
+SVDWorkspace.labrd_arow  gesvd_vals! -> _svals_core!
+SVDWorkspace.labrd_tmp  gesvd_vals! -> _svals_core!
 
 # --- potrf pad: in `_potrf_gen!` (lapack.jl:489) the two levers are early-`return` branches guarded on
 # DISJOINT element types — Lever A `T === Float64 || T === Float32` (:533 → _potrf_upper_lever_real!, :543)
 # and Lever C `T <: BlasComplex` (:550 → _potrf_upper_lever_cmplx!, :551). `_potrf_gen!`'s own padf claim
 # (`_potrf_pad(T, n)`, :557) is only reached when neither returned. Mutually exclusive twice over: by
 # control flow and by type. Only one of the three ever claims padf per call.
-padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
-padf  _potrf_gen! -> _potrf_upper_lever_real!
+L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
+L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_real!
 
 # --- Strassen pool: `str` is ONE field holding a POOL of matrices, and the re-entrancy is BY DESIGN.
 # `_gemm_strassen!` (gemm.jl:2669) holds pad slots 1-3 via `_strassen_pad_scratch` across
@@ -76,4 +93,4 @@ padf  _potrf_gen! -> _potrf_upper_lever_real!
 # workspace.jl:417) across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in
 # `_str_fit!` (workspace.jl:406), not the field split, so a field-keyed lint cannot adjudicate it and must
 # not try. If that indexing changes, this baseline entry is NOT evidence of anything — read it again.
-str  _gemm_strassen! -> _strassen_rec!
+L3Workspace.str  _gemm_strassen! -> _strassen_rec!
