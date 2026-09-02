@@ -301,3 +301,33 @@ end
 @inline getrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = getrf!(A; kw...)
 @inline geqrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = geqrf!(A; kw...)
 @inline gesvd!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = gesvd!(A; kw...)
+
+# ── LAPACK solve/inverse/condition surface (the rest of the AbstractLAPACK contract). Same form as
+# above. Every one is IN-PLACE, so the contract is strict (type-stable + allocation-free) — see the
+# interface docstring in contracts.jl for why that is load-bearing rather than decorative. Where a
+# routine has both an in-place and an allocating convenience form (gbtrf!, gesvx!), the wrapper binds
+# the IN-PLACE one: the contract must not be satisfiable by a method that allocates.
+@inline potrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = potrs!(A, B; kw...)
+@inline potri!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = potri!(A; kw...)
+@inline pptrf!(::SIMDBackend, AP::AbstractVector; kw...)::AbstractVector = pptrf!(AP; kw...)
+@inline pptrs!(::SIMDBackend, AP::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pptrs!(AP, B; kw...)
+@inline pbtrf!(::SIMDBackend, AB::AbstractMatrix; kw...)::AbstractMatrix = pbtrf!(AB; kw...)
+@inline pbtrs!(::SIMDBackend, AB::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pbtrs!(AB, B; kw...)
+@inline pstrf!(::SIMDBackend, A::AbstractMatrix, piv::AbstractVector, tol::Real; kw...)::Tuple = pstrf!(A, piv, tol; kw...)
+@inline pocon!(::SIMDBackend, normA::Real, A::AbstractMatrix; kw...)::Real = pocon!(normA, A; kw...)
+@inline getrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = getrs!(A, ipiv, B; kw...)
+@inline getri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector)::AbstractMatrix = getri!(A, ipiv)
+@inline trtrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = trtrs!(A, B; kw...)
+@inline trtri!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = trtri!(A; kw...)
+@inline gecon!(::SIMDBackend, normA::Real, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Real = gecon!(normA, A, ipiv; kw...)
+@inline trcon!(::SIMDBackend, A::AbstractMatrix; kw...)::Real = trcon!(A; kw...)
+@inline trrfs!(::SIMDBackend, uplo::AbstractChar, trans::AbstractChar, diag::AbstractChar, A::AbstractMatrix, B::AbstractVecOrMat, X::AbstractVecOrMat, Ferr::AbstractVector, Berr::AbstractVector)::Tuple = trrfs!(uplo, trans, diag, A, B, X, Ferr, Berr)
+@inline gbtrf!(::SIMDBackend, kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix, ipiv::AbstractVector)::Tuple = gbtrf!(kl, ku, m, AB, ipiv)
+@inline gbtrs!(::SIMDBackend, trans::AbstractChar, kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat)::AbstractVecOrMat = gbtrs!(trans, kl, ku, m, AB, ipiv, B)
+@inline gtsv!(::SIMDBackend, dl::AbstractVector, d::AbstractVector, du::AbstractVector, B::AbstractVecOrMat)::AbstractVecOrMat = gtsv!(dl, d, du, B)
+@inline gttrf!(::SIMDBackend, dl::AbstractVector, d::AbstractVector, du::AbstractVector, du2::AbstractVector, ipiv::AbstractVector)::Tuple = gttrf!(dl, d, du, du2, ipiv)
+@inline gttrs!(::SIMDBackend, trans::AbstractChar, dl::AbstractVector, d::AbstractVector, du::AbstractVector, du2::AbstractVector, ipiv::AbstractVector, B::AbstractVecOrMat)::AbstractVecOrMat = gttrs!(trans, dl, d, du, du2, ipiv, B)
+@inline pttrf!(::SIMDBackend, D::AbstractVector, E::AbstractVector)::Tuple = pttrf!(D, E)
+@inline pttrs!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pttrs!(D, E, B; kw...)
+@inline ptsv!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::Tuple = ptsv!(D, E, B; kw...)
+@inline gesvx!(::SIMDBackend, fact::Char, trans::Char, A::AbstractMatrix, AF::AbstractMatrix, ipiv::AbstractVector, equed::Char, R::AbstractVector, C::AbstractVector, B::AbstractMatrix, X::AbstractMatrix, ferr::AbstractVector, berr::AbstractVector)::Tuple = gesvx!(fact, trans, A, AF, ipiv, equed, R, C, B, X, ferr, berr)

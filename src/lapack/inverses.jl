@@ -121,7 +121,11 @@ end
 # The ORDER matters: R11's syrk must read M21 before the trmm overwrites it. Upper is the mirror with
 # M = [M11 M12; 0 M22], R = MMᴴ, trmm on the right.
 #
-# The base does one dense syrk on a b×b block through a copy (syrk cannot alias C and A). That block's
+# The base does one dense syrk on a b×b block through a copy (syrk cannot alias C and A) into OWNED
+# scratch (`_lauum_tmp`), so the routine allocates nothing. The copy is safe against a reused buffer:
+# `copyto!` writes all n² entries before anything is read, and the triangle-zeroing only overwrites.
+# The recursion is strictly sequential (M11 subtree completes, then M22), so no two base cases are
+# ever live at once and the single shared buffer cannot be clobbered mid-use. That block's
 # 3x waste is bounded by 2b²/n² of the total — 0.2% at b=16, n=1024 — so the base stays small. It
 # reuses `_trtri_base()`: the same recursion-base criterion for the same triangular shape, and that
 # knob is already documented FLAT across 8/16/32/64 on all three µarchs.
@@ -129,8 +133,8 @@ function _lauum!(M::AbstractMatrix{T}, up::Bool) where {T}
     n = size(M, 1)
     n == 0 && return M
     if n <= _trtri_base()
-        Tmp = Matrix{T}(undef, n, n)
-        copyto!(Tmp, M)
+        Tmp = _lauum_tmp(T, n)          # owned scratch, reused across calls — no allocation
+        copyto!(Tmp, M)                 # writes all n² before any read; the zeroing below overwrites
         if up                                   # zero the strict lower so the dense product is exact
             @inbounds for j in 1:n, i in (j + 1):n
                 Tmp[i, j] = zero(T)
@@ -210,7 +214,10 @@ end
 # Step 2 walks block columns right-to-left: stash the strict-lower part of the block (that is L), zero
 # it in A, subtract the already-computed columns to the right via one gemm, then a right-side unit-lower
 # trsm against the block's own diagonal. The workspace is n×nb, not n×n — nb from `_lu_nb`, the same
-# validated LU panel width, reused exactly as `_pstrf_nb` reuses it.
+# validated LU panel width, reused exactly as `_pstrf_nb` reuses it — and it is OWNED (`_getri_work`),
+# so getri! allocates nothing. Safe against a reused buffer: each block column writes rows j:n of its
+# jb columns (the jb×jb diagonal zeroing plus the strict-lower stash) and reads only rows j:n; rows
+# 1:j−1 are never read, so no stale value from a previous call can be consumed.
 function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("getri!: A must be square"))
@@ -218,7 +225,7 @@ function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
     n == 0 && return A
     trtri!(A; uplo = 'U', diag = 'N')                       # 1. inv(U), in place
     nb = max(1, min(_lu_nb(n), n))
-    W = Matrix{T}(undef, n, nb)
+    W = _getri_work(T, n, nb)                               # owned scratch, reused — no allocation
     j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
     while j >= 1
         jb = min(nb, n - j + 1)

@@ -271,7 +271,7 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         Tu = eltype(AP)
         nbu = min(_PPTRF_BLK_NB, n)
         if Tu <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
-            R = Matrix{Tu}(undef, nbu, n); V = Matrix{Tu}(undef, n, nbu)
+            R, V = _pptrf_upper_work(Tu, n, nbu)   # owned scratch — see workspace.jl
             return _pptrf_upper_blocked!(AP, n, nbu, R, V)
         end
         # Left-looking, exactly as dpptrf.f does it: per column, ONE packed triangular solve
@@ -320,7 +320,7 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         # on where the copy starts to amortise, not on having a trailing block.
         nb = min(_PPTRF_BLK_NB, n)
         if T <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
-            W = Matrix{T}(undef, n, nb); V = Matrix{T}(undef, n, nb)
+            W, V = _pptrf_lower_work(T, n, nb)     # owned scratch — see workspace.jl
             _pptrf_lower_blocked!(AP, n, nb, W, V)
         else
             _pptrf_lower!(AP, n, _pptrf_spr_min(T))

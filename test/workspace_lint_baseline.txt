@@ -1,0 +1,50 @@
+# workspace self-alias lint baseline — claim-inside-a-claim pairs REVIEWED AS LEGAL, each with its reason.
+# The lint fails BOTH ways: a pair not listed here is a new finding, and a line here that no longer occurs
+# is stale (a removed caller must not leave a rubber stamp behind). Regenerate the raw list with
+#   julia test/workspace_lint.jl --baseline
+# and then re-justify every line by READING it. A line whose reason you cannot restate is not a pass.
+#
+# The lint is name-level and conservative: it treats a claim as live to the end of the enclosing method and
+# merges all methods of a name, so sequential re-claims, mutually exclusive if/ternary arms, and
+# claim-once-then-thread-it-down all show up here. That is the intended trade — over-approximate, then
+# justify in writing, exactly as req8_lint.jl does with its literals.
+
+# --- gemm packing: `_gemm_core!` and `_gemm_blocked!` are pack+microkernel loops, not nested claimants.
+# The pair exists only because all methods of a name are merged and `_gemm_core!`'s `At` claim
+# (gemm.jl:2844) and its `_gemm_blocked!` call (:2858) are the two arms of one `if _use_unpacked`.
+gpackA  _gemm_core! -> _gemm_blocked!
+gpackA  _gemm_core! -> _gemm_core!
+gpackB  _gemm_core! -> _gemm_blocked!
+gpackB  _gemm_core! -> _gemm_core!
+
+# --- Higham-Hager estimator, DECLARED callback edge (_CALLBACK_EDGES). `_lacn2!` claims lacn* once at
+# entry and drives `applyop!` in a loop; the closure (gecon!/trcon!/pocon!) runs trsv!/getrs!/potrs!, none
+# of which claims a lacn* field. The cycle here is the declared edge closing back on the caller, not a
+# second claim. This is the one pair whose safety rests on the closures, so re-read it if a NEW caller of
+# _lacn2! appears — that is precisely what the declared edge is for.
+lacnsgn  _lacn2! -> _lacn2!
+lacnv  _lacn2! -> _lacn2!
+lacnx  _lacn2! -> _lacn2!
+
+# --- potrf pad: `_potrf_gen!`, `_potrf_upper_lever_real!` and `_potrf_upper_lever_cmplx!` are three
+# mutually exclusive branches of `_potrf_gen!`, each of which `return`s. Only one ever claims padf per call.
+padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
+padf  _potrf_gen! -> _potrf_upper_lever_real!
+
+# --- pstrf: claimed once in pstrf! (:322, :346) and PASSED BY ARGUMENT into `_pstrf_blocked!`, which
+# re-derives only pstrfsw (:152). pstrf! is not recursive; the self-pairs are name-merged methods.
+pstrfs  pstrf! -> pstrf!
+pstrfsw  _pstrf_blocked! -> _pstrf_blocked!
+pstrfv  pstrf! -> pstrf!
+
+# --- Strassen pool: `str` is ONE field holding a POOL, and the re-entrancy is by design —
+# `_gemm_strassen!` holds slots 1-3 across `_strassen_rec!`, which holds ten slots (3+level*10+1 … +10)
+# across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in `_str_fit!`
+# (workspace.jl:368-387), not the field split, so a field-keyed lint cannot adjudicate it and must not try.
+# If the indexing in `_str_fit!` changes, this baseline entry is NOT evidence of anything — read it again.
+str  _gemm_strassen! -> _gemm_strassen!
+str  _gemm_strassen! -> _strassen_rec!
+
+# --- strbt: `_gemm_core!` claims it once (gemm.jl:2823) and holds it across `_gemm_strassen!`, which
+# claims `str` — a different field, deliberately (see the strbt field comment in workspace.jl).
+strbt  _gemm_core! -> _gemm_core!

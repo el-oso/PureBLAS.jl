@@ -103,12 +103,16 @@ else
     @inline _gbtrf_cross(::Type{T}) where {T} = _GBTRF_CROSS_PREF::Int   # pinned (trim lands here)
 end
 
-# gbtrf!(kl, ku, m, AB) → (AB, ipiv, info).  AB overwritten with L\U in band storage; ipiv the
-# min(m,n) pivot rows; info = index of the first exactly-zero pivot (0 if none). Allocates ipiv and
-# dispatches; the arity and the 3-tuple are load-bearing (the C-ABI wrapper destructures them).
-function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) where {T}
+# gbtrf!(kl, ku, m, AB, ipiv) → (AB, ipiv, info).  IN-PLACE form, mirroring `getrf!(A, ipiv)`: it
+# takes the caller's pivot buffer so `gbtrf!` can honour its `!` and factor allocation-free. AB is
+# overwritten with L\U in band storage; ipiv receives the min(m,n) pivot rows; info = index of the
+# first exactly-zero pivot (0 if none). This is Netlib's dgbtrf(M,N,KL,KU,AB,LDAB,IPIV,INFO) shape.
+function gbtrf!(
+        kl::Integer, ku::Integer, m::Integer,
+        AB::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}
+    ) where {T}
     _, n = size(AB)
-    ipiv = Vector{Int}(undef, min(Int(m), n))
+    length(ipiv) >= min(Int(m), n) || throw(DimensionMismatch("gbtrf!: length(ipiv) < min(m, size(AB,2))"))
     nb = _gbtrf_nb(T, Int(kl))
     # Blocking only pays when the in-band trailing block A22 is at least as tall as the panel is
     # wide (i2 = kl-nb ≥ nb). Reference dgbtrf's structural condition is the weaker nb ≤ kl, but at
@@ -123,6 +127,13 @@ min(Int(m), n) > nb
         info = _gbtf2!(kl, ku, m, AB, ipiv)
     end
     return AB, ipiv, info
+end
+
+# Convenience: allocate ipiv, return (AB overwritten with L\U, ipiv, info). The arity and the 3-tuple
+# are load-bearing (the C-ABI wrapper destructures them).
+function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) where {T}
+    _, n = size(AB)
+    return gbtrf!(kl, ku, m, AB, Vector{Int}(undef, min(Int(m), n)))
 end
 
 # _gbtf2!(kl, ku, m, AB, ipiv) → info.  Reference dgbtf2: UNBLOCKED banded LU, one rank-1 downdate

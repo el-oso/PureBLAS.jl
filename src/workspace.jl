@@ -52,6 +52,62 @@ mutable struct L3Workspace{T}
     gbw31::Matrix{T}      # _gbtrf_work:  gbtrf lower-corner WORK31, exactly (nb+1)×nb (ld load-bearing)
     gbs::Matrix{T}        # _gbtrf_work:  gbtrf dense L11 staging scratch, exactly nb×nb (ld load-bearing)
     sylw::Matrix{T}       # _sytrf_work:  dlasyf panel W (n×nb) + gather col; exact rows, grow-only cols
+    # ── Solve/inverse/condition scratch. These roles used to allocate per call inside their routines,
+    # which broke the `!` in-place promise: gecon!/trcon!/pocon! 352 B, potri!/getri! 592 B, pstrf! 640 B,
+    # trrfs! 1056 B (measured at n=8). Owned here like every other L3 buffer, they reach 0 alloc without
+    # the per-call lookup a task-local cache would add (+7.5 ns, which is 7.4% of a trmm! at n=8).
+    lacnx::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, candidate x (grows n)
+    lacnv::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, previous iterate v (grows n)
+    lacnsgn::Vector{Int}  # _lacn_bufs:  real-only sign-repeat test vector (grows n; empty for complex)
+    lauumt::Matrix{T}     # _lauum_tmp:  lauum dense-base zeroed triangle copy (≤ _trtri_base square)
+    getriw::Matrix{T}     # _getri_work: getri blocked inversion panel W (grows n×nb)
+    pstrfv::Vector{T}     # _pstrf_work: running dot products + scratch, 2n. REAL-typed, so it is reached
+                          # as `_l3ws(real(T)).pstrfv` — for complex A that is a DIFFERENT owner object
+                          # than `pstrfs` below, so the two can never alias.
+    pstrfs::Vector{T}     # _pstrf_work: blocked panel scratch (nb + 2n), element-typed
+    pstrfsw::Vector{Int}  # _pstrf_swaps: blocked pivot bookkeeping swj/swp, 2·nb as two DISJOINT views
+    trrfsr::Vector{T}     # _trrfs_work: residual r = op(A)·x − b (grows n), element-typed
+    trrfsa::Vector{T}     # _trrfs_work: |op(A)|·|x| + |b|  — REAL-typed, via `_l3ws(real(T))`
+    trrfst::Vector{T}     # _trrfs_work: LACN2 weight |r| + nz·eps·wabs — REAL-typed, via `_l3ws(real(T))`
+    # The SECOND Higham–Hager estimator. `_lacn2_estimate` (trsen.jl) is a separate implementation of the
+    # same algorithm as `_lacn2!` (gecon.jl), with different callers: trrfs! (trrfs.jl:141) and trsen!
+    # (trsen.jl:555, :614) vs gecon!/trcon!/pocon!. (trsyl! does NOT call it, despite the neighbouring
+    # file.) They get DISTINCT fields rather than sharing `lacn*` — proving the two can never be live at
+    # once would mean auditing every path through trsen/trrfs, and the cost of being
+    # wrong is silent numerical corruption. Three Vectors is cheap insurance. (Deduplicating the two
+    # estimators is the real fix and is left as separate work.) Note `lacn2s` is length n for BOTH real
+    # and complex here, unlike `lacnsgn` — `_lacn2_estimate` zeros a full-length isgn either way.
+    lacn2x::Vector{T}     # _lacn2e_bufs: candidate x
+    lacn2v::Vector{T}     # _lacn2e_bufs: previous iterate v
+    lacn2s::Vector{Int}   # _lacn2e_bufs: sign vector, always length n
+    # pptrf blocked packed Cholesky. These allocated per call and so broke `pptrf!`'s `!` promise for
+    # every n ≥ _PPTRF_BLK_MIN (16) — 16,560 B at n=32, growing with n. It measured 0 B at n=8 only
+    # because that is BELOW the blocking threshold and takes the unblocked arm, which is exactly how the
+    # bug survived an allocation audit: pick a size on the other side of every threshold.
+    pptrfw::Matrix{T}     # _pptrf_lower_work: lower panel W, n×nb
+    pptrfv::Matrix{T}     # _pptrf_{lower,upper}_work: trailing-update V, n×nb (shared — one uplo per call)
+    pptrfr::Matrix{T}     # _pptrf_upper_work: upper packed-row block R, nb×n (note the transposed shape)
+    gerfsr::Vector{T}     # _gerfs_work: residual r = b − op(A)·x (grows n), element-typed
+    gerfsw::Vector{T}     # _gerfs_work: |b| + |op(A)|·|x| — REAL-typed, via `_l3ws(real(T))`
+    gerfsd::Vector{T}     # _gerfs_work: refinement correction dx (grows n), element-typed
+    # SEPARATE FROM `trsm_tmp` ON PURPOSE — do not "simplify" the two together. The side-L ragged
+    # column-tail arm (level3.jl:4341) stages B into scratch, widens it to `_vwidth` columns, and holds
+    # that view ACROSS `_trsm!`; the complex path inside then took `trsm_tmp` again for `_trtri!`'s
+    # output (level3.jl:2017) and wrote A⁻¹ over the staged right-hand side. Measured wrong answers,
+    # relerr ~1.0: ComplexF32, side='L', k=32/48, nrhs=5/6, transA ∈ {T,C}. Note nrhs=5/transA='T' was
+    # CORRECT on the first call and wrong on the second — the corruption is history-dependent on the
+    # buffer's grown size, which is why a single-call test never saw it.
+    trsmw::Matrix{T}      # _trsm_widen: side-L ragged-tail staging, k × _vwidth
+    # SEPARATE FROM `rpack` ON PURPOSE — same shape of bug as `trsmw` above, found by test/workspace_lint.jl.
+    # The side-R pad arm (level3.jl:4045) copies A's lower triangle into scratch and holds that view across
+    # `_trsm_rl_fused_drv!`, which takes `rpack` AGAIN as its own solve scratch (level3.jl:3929) — same
+    # buffer, same base pointer, so the leaf writes the solution over the coefficients it is reading.
+    # Aliases whenever the second claim does not realloc, i.e. `mc0 = (_L2_BYTES÷2)÷(k·8) ≤ k`: unconditional
+    # on a 256 KiB-L2 AVX2 part at k=128; on Zen3 (512 KiB) only once an earlier call has grown the buffer
+    # to ≥265 rows — history-dependent, right on call 1, wrong on call 2, exactly like `trsmw`.
+    # The arm is AVX2-only (`_RL_MR_LIVE > _NVREG`), so no AVX-512 box can execute it; it was found by
+    # READING, and the fix is the field split, not an audit.
+    rpad::Matrix{T}       # _trsm_rpad: side-R pad-arm A copy, ODD ld (grows k×k)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -64,6 +120,14 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
     Matrix{T}(undef, 0, 0),
+    T[], T[], Int[],                                 # lacnx, lacnv, lacnsgn
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # lauumt, getriw
+    T[], T[], Int[],                                 # pstrfv, pstrfs, pstrfsw
+    T[], T[], T[],                                   # trrfsr, trrfsa, trrfst
+    T[], T[], Int[],                                 # lacn2x, lacn2v, lacn2s
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # pptrfw, pptrfv, pptrfr
+    T[], T[], T[],                                   # gerfsr, gerfsw, gerfsd
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # trsmw, rpad
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -330,4 +394,133 @@ function _strassen_lvl_scratch(::Type{Tr}, level::Int, mh::Int, nh::Int, kh::Int
     P5 = _str_fit!(p, b + 7, mh, nh, Tr); P6 = _str_fit!(p, b + 8, mh, nh, Tr)
     P7 = _str_fit!(p, b + 9, mh, nh, Tr); U = _str_fit!(p, b + 10, mh, nh, Tr)
     return TA, TB, P1, P2, P3, P4, P5, P6, P7, U
+end
+
+# ── Solve / inverse / condition-estimate scratch accessors ─────────────────────────────────────────
+# Same grow-on-demand, return-a-view shape as the L3 roles above. Each returns exactly the length the
+# caller asked for, so the routine body is unchanged apart from where the buffer comes from.
+#
+# The REAL-typed buffers (`pstrfv`, `trrfsa`, `trrfst`) are reached through `_l3ws(real(T))`. That works
+# because real(T) ∈ {Float64, Float32} is itself a const-dispatched owner, so it costs the same bare
+# field load and needs no second type parameter on `L3Workspace`. For complex `T` it is a different
+# owner object from the element-typed buffers, so a routine holding both can never alias them.
+
+# Higham–Hager 1-norm estimator scratch: candidate x, previous iterate v, and (real only) sign vector.
+function _lacn_bufs(::Type{T}, n::Int) where {T}
+    ws = _l3ws(T)
+    length(ws.lacnx) < n && (ws.lacnx = Vector{T}(undef, n))
+    length(ws.lacnv) < n && (ws.lacnv = Vector{T}(undef, n))
+    ns = T <: Real ? n : 0
+    length(ws.lacnsgn) < ns && (ws.lacnsgn = Vector{Int}(undef, ns))
+    return view(ws.lacnx, 1:n), view(ws.lacnv, 1:n), view(ws.lacnsgn, 1:ns)
+end
+
+# lauum dense-base scratch: an n×n zeroed copy of the stored triangle. n ≤ _trtri_base() by construction.
+function _lauum_tmp(::Type{T}, n::Int) where {T}
+    ws = _l3ws(T); b = ws.lauumt
+    if size(b, 1) < n || size(b, 2) < n
+        b = Matrix{T}(undef, n, n); ws.lauumt = b
+    end
+    return view(b, 1:n, 1:n)
+end
+
+# getri blocked-inversion panel W (n×nb).
+function _getri_work(::Type{T}, n::Int, nb::Int) where {T}
+    ws = _l3ws(T); b = ws.getriw
+    if size(b, 1) < n || size(b, 2) < nb
+        b = Matrix{T}(undef, n, nb); ws.getriw = b
+    end
+    return view(b, 1:n, 1:nb)
+end
+
+# pstrf scratch: `work` is REAL (running dot products, length 2n) and lives on the real owner; `scr` is
+# element-typed (length nb + 2n). Distinct owners for complex T ⇒ no aliasing.
+function _pstrf_work(::Type{T}, n::Int) where {T}
+    R = real(T); ws = _l3ws(R)
+    length(ws.pstrfv) < 2n && (ws.pstrfv = Vector{R}(undef, 2n))
+    return view(ws.pstrfv, 1:(2n))
+end
+function _pstrf_scr(::Type{T}, len::Int) where {T}
+    ws = _l3ws(T)
+    length(ws.pstrfs) < len && (ws.pstrfs = Vector{T}(undef, len))
+    return view(ws.pstrfs, 1:len)
+end
+
+# trrfs scratch: residual r (element-typed) plus two REAL accumulators on the real owner.
+function _trrfs_work(::Type{T}, n::Int) where {T}
+    R = real(T); ws = _l3ws(T); wr = _l3ws(R)
+    length(ws.trrfsr) < n && (ws.trrfsr = Vector{T}(undef, n))
+    length(wr.trrfsa) < n && (wr.trrfsa = Vector{R}(undef, n))
+    length(wr.trrfst) < n && (wr.trrfst = Vector{R}(undef, n))
+    return view(ws.trrfsr, 1:n), view(wr.trrfsa, 1:n), view(wr.trrfst, 1:n)
+end
+
+# pstrf blocked pivot bookkeeping: swj/swp, both length nb. One owned Int buffer, returned as two
+# DISJOINT views (1:nb and nb+1:2nb) so they cannot alias each other.
+function _pstrf_swaps(::Type{T}, nb::Int) where {T}
+    ws = _l3ws(T)
+    length(ws.pstrfsw) < 2nb && (ws.pstrfsw = Vector{Int}(undef, 2nb))
+    return view(ws.pstrfsw, 1:nb), view(ws.pstrfsw, (nb + 1):(2nb))
+end
+
+# Scratch for `_lacn2_estimate` (trsen.jl) — the second Higham–Hager estimator. Distinct fields from
+# `_lacn_bufs`; see the struct comment. The caller MUST initialise: unlike the old `fill`/`zeros` these
+# buffers carry the previous call's values.
+function _lacn2e_bufs(::Type{V}, n::Int) where {V}
+    ws = _l3ws(V)
+    length(ws.lacn2x) < n && (ws.lacn2x = Vector{V}(undef, n))
+    length(ws.lacn2v) < n && (ws.lacn2v = Vector{V}(undef, n))
+    length(ws.lacn2s) < n && (ws.lacn2s = Vector{Int}(undef, n))
+    return view(ws.lacn2x, 1:n), view(ws.lacn2v, 1:n), view(ws.lacn2s, 1:n)
+end
+
+# gerfs iterative-refinement scratch: residual r and correction dx (element-typed), plus the real
+# accumulator |b| + |op(A)|·|x| on the real owner. Three distinct fields ⇒ no aliasing.
+function _gerfs_work(::Type{T}, n::Int) where {T}
+    R = real(T); ws = _l3ws(T); wr = _l3ws(R)
+    length(ws.gerfsr) < n && (ws.gerfsr = Vector{T}(undef, n))
+    length(wr.gerfsw) < n && (wr.gerfsw = Vector{R}(undef, n))
+    length(ws.gerfsd) < n && (ws.gerfsd = Vector{T}(undef, n))
+    return view(ws.gerfsr, 1:n), view(wr.gerfsw, 1:n), view(ws.gerfsd, 1:n)
+end
+
+# pptrf blocked packed-Cholesky panels. Two shapes: the LOWER arm wants two n×nb blocks (W, V); the
+# UPPER arm wants an nb×n packed-row block (R) plus the same n×nb V. Only one uplo runs per call and the
+# blocked helpers do not nest, so V is shared between them; W and R are separate because their shapes are
+# transposes of each other and sharing would force a reallocation on every uplo switch.
+function _pptrf_lower_work(::Type{T}, n::Int, nb::Int) where {T}
+    ws = _l3ws(T)
+    (size(ws.pptrfw, 1) < n || size(ws.pptrfw, 2) < nb) && (ws.pptrfw = Matrix{T}(undef, n, nb))
+    (size(ws.pptrfv, 1) < n || size(ws.pptrfv, 2) < nb) && (ws.pptrfv = Matrix{T}(undef, n, nb))
+    return view(ws.pptrfw, 1:n, 1:nb), view(ws.pptrfv, 1:n, 1:nb)
+end
+function _pptrf_upper_work(::Type{T}, n::Int, nb::Int) where {T}
+    ws = _l3ws(T)
+    (size(ws.pptrfr, 1) < nb || size(ws.pptrfr, 2) < n) && (ws.pptrfr = Matrix{T}(undef, nb, n))
+    (size(ws.pptrfv, 1) < n || size(ws.pptrfv, 2) < nb) && (ws.pptrfv = Matrix{T}(undef, n, nb))
+    return view(ws.pptrfr, 1:nb, 1:n), view(ws.pptrfv, 1:n, 1:nb)
+end
+
+# Side-L ragged-column-tail staging for trsm (level3.jl:4341). Deliberately NOT `_trsm_tmp`: that arm
+# holds its staged B across `_trsm!`, which reaches for `trsm_tmp` again on the complex path
+# (level3.jl:2017) — see the `trsmw` field comment for the measured corruption.
+function _trsm_widen(::Type{T}, m::Int, n::Int) where {T}
+    ws = _l3ws(T); b = ws.trsmw
+    if size(b, 1) < m || size(b, 2) < n
+        b = Matrix{T}(undef, m, n); ws.trsmw = b
+    end
+    return b
+end
+
+# Side-R pad-arm A copy (level3.jl:4045). Deliberately NOT `_trsm_rpack`: that arm holds this copy across
+# `_trsm_rl_fused_drv!`, which takes `rpack` again as its solve scratch — see the `rpad` field comment.
+# Same odd-ld growth policy as `_trsm_rpack` (the leaf re-reads solved columns out of whichever buffer it
+# is handed, so a way-stride multiple would put them all in one cache set).
+function _trsm_rpad(::Type{T}, rows::Int, cols::Int) where {T}
+    ws = _l3ws(T); b = ws.rpad
+    need = rows + 8; iseven(need) && (need += 1)
+    if size(b, 1) < need || size(b, 2) < cols
+        b = Matrix{T}(undef, need, cols); ws.rpad = b
+    end
+    return b
 end

@@ -43,13 +43,12 @@ end
 end
 
 # ── _lacn2!: Higham–Hager 1-norm estimator of ‖op‖₁. `applyop!(x, adj)` overwrites x with op·x when
-# adj=false and opᴴ·x when adj=true. Returns the estimate. Allocates its own x/v/isgn workspace
-# (not a hot path). EXACT DLACON/ZLACON transcription — do not "simplify" the iteration.
+# adj=false and opᴴ·x when adj=true. Returns the estimate. The x/v/isgn scratch is owned by the
+# per-element-type L3Workspace (`_lacn_bufs`), so the estimator — and gecon!/trcon!/pocon! with it —
+# is allocation-free. EXACT DLACON/ZLACON transcription — do not "simplify" the iteration.
 function _lacn2!(applyop!, ::Type{T}, n::Int) where {T}
     R = real(T)
-    x = Vector{T}(undef, n)
-    v = Vector{T}(undef, n)
-    isgn = Vector{Int}(undef, T <: Real ? n : 0)   # real-only sign-repeat test vector
+    x, v, isgn = _lacn_bufs(T, n)                  # isgn: real-only sign-repeat test vector (len 0 if complex)
     itmax = 5
 
     fill!(x, one(T) / n)

@@ -33,15 +33,15 @@ function iamax end      # argmax|xᵢ|
 # bandwidth-bound L1 kernels are where a stray allocation or type instability is most costly, so
 # they carry the hardest guarantee. Verified by `@verify_strict SIMDBackend` (backend.jl).
 @strict_contract AbstractBLAS1 begin
-    axpy!(::Self, ::AbstractVector, ::Number, ::AbstractVector)::AbstractVector
-    scal!(::Self, ::Number, ::AbstractVector)::AbstractVector
-    blascopy!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector
-    swap!(::Self, ::AbstractVector, ::AbstractVector)::Nothing
-    dot(::Self, ::AbstractVector, ::AbstractVector)::Number
-    dotu(::Self, ::AbstractVector, ::AbstractVector)::Number
-    nrm2(::Self, ::AbstractVector)::Real
-    asum(::Self, ::AbstractVector)::Real
-    iamax(::Self, ::AbstractVector)::Integer
+    axpy!(::Self, ::AbstractVector, ::Number, ::AbstractVector)::AbstractVector => "y := y + a·x"
+    scal!(::Self, ::Number, ::AbstractVector)::AbstractVector => "x := a·x"
+    blascopy!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := x"
+    swap!(::Self, ::AbstractVector, ::AbstractVector)::Nothing => "exchange the contents of x and y"
+    dot(::Self, ::AbstractVector, ::AbstractVector)::Number => "conjugated inner product conj(x)·y"
+    dotu(::Self, ::AbstractVector, ::AbstractVector)::Number => "unconjugated inner product x·y"
+    nrm2(::Self, ::AbstractVector)::Real => "Euclidean norm ‖x‖₂ via scaled accumulation (overflow/underflow safe)"
+    asum(::Self, ::AbstractVector)::Real => "Σ|xᵢ| (complex: Σ|Re| + |Im|)"
+    iamax(::Self, ::AbstractVector)::Integer => "index of the first element of largest magnitude"
 end
 
 """
@@ -77,25 +77,25 @@ function hpr2! end  # A := α·x·yᴴ + ᾱ·y·xᴴ + A, A Hermitian packed (r
 # — dense (gemv/ger/symv/hemv/trmv/trsv), packed (spmv/hpmv/tpmv/tpsv/spr/spr2/hpr/hpr2), and banded
 # (gbmv/sbmv/hbmv/tbmv/tbsv), all verified by `@verify_strict SIMDBackend` (verify.jl).
 @strict_contract AbstractBLAS2 begin
-    gemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    ger!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix
-    symv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    hemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    trmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    trsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    spmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
-    hpmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
-    tpmv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector
-    tpsv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector
-    gbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::Integer, ::Integer, ::Integer)::AbstractVector
-    sbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    hbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    tbmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    tbsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector
-    spr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector
-    spr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
-    hpr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector
-    hpr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector
+    gemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := β·y + α·op(A)·x"
+    ger!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "A := α·x·yᵀ + A (geru / gerc)"
+    symv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric"
+    hemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian"
+    trmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular"
+    trsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular (solve)"
+    spmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric in packed storage"
+    hpmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian in packed storage"
+    tpmv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular packed"
+    tpsv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular packed (solve)"
+    gbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::Integer, ::Integer, ::Integer)::AbstractVector => "y := α·op(A)·x + β·y, A general banded"
+    sbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric banded"
+    hbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian banded"
+    tbmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular banded"
+    tbsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular banded (solve)"
+    spr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·xᵀ + A, symmetric packed rank-1"
+    spr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·yᵀ + α·y·xᵀ + A, symmetric packed rank-2"
+    hpr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·xᴴ + A, Hermitian packed rank-1 (α real)"
+    hpr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·yᴴ + ᾱ·y·xᴴ + A, Hermitian packed rank-2"
 end
 
 """
@@ -133,15 +133,15 @@ function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular
 # are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are
 # also built per concrete type, never as a Union, so they stay stack-allocated). All nine now gate 0-alloc.
 @strict_contract AbstractBLAS3 begin
-    gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    hemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    syrk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    herk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    syr2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    her2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    trmm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
-    trsm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix
+    gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(B)"
+    symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·A·B or α·B·A, A symmetric"
+    hemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·A·B or α·B·A, A Hermitian"
+    syrk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(A)ᵀ, C symmetric"
+    herk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(A)ᴴ, C Hermitian (α, β real)"
+    syr2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·(op(A)·op(B)ᵀ + op(B)·op(A)ᵀ), C symmetric"
+    her2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, C Hermitian"
+    trmm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "B := α·op(A)·B or α·B·op(A), A triangular"
+    trsm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "B := α·op(A)⁻¹·B or α·B·op(A)⁻¹, A triangular (solve)"
 end
 
 """
@@ -170,9 +170,77 @@ function gesvd! end  # SVD: A = U·Σ·Vᵀ → (U, S, Vᵀ)
 # bidiagonalization scratch comes from a cached Float64 SVDWorkspace (svd.jl). The convenience forms that
 # allocate pivots/τ/U/S/Vᵀ are unchanged; the allocation is the inherent output, and the C-ABI + strict
 # paths use the in-place forms.
+# (The contract itself is declared once, below, after the solve/inverse/condition names are introduced.)
+
+# ── The solve / inverse / condition-estimate surface, built on the four factorizations above.
+#
+# These live in `AbstractLAPACK` itself rather than a separate sub-interface. A split was tried and
+# reverted: it would have been a second interface with the same single implementation, and it works
+# against what `AbstractLAPACK`'s docstring already promises — "the single discoverable spec of a
+# swappable LAPACK backend" is less true, not more, when the spec is spread over two types. If a
+# second backend ever makes the 28-routine bar too high, split it THEN, against a real requirement.
+#
+# Every member is IN-PLACE and so carries the strict guarantee: type-stable AND allocation-free. That
+# is not decoration — each name ends in `!`, which in this package is a promise, and nine of them were
+# silently breaking it (measured at n=8: gecon!/trcon!/pocon! 352 B, potri!/getri! 592 B, pstrf! 640 B,
+# trrfs! 1056 B, gbtrf! 128 B, plus gesvx! allocating X/ferr/berr). The scratch behind them is owned
+# per element type by `L3Workspace` (workspace.jl); the two whose OUTPUTS were allocated internally
+# gained the in-place forms `gbtrf!(kl,ku,m,AB,ipiv)` and `gesvx!(…,B,X,ferr,berr)` that netlib's
+# IPIV/X/FERR/BERR arguments always implied. The allocating convenience forms are retained and are
+# deliberately NOT contract members — a contract satisfiable by a method that allocates means nothing.
+
+function potrs! end   # Cholesky solve:            A·X = B given the factor
+function potri! end   # Cholesky inverse:          A⁻¹ from the factor (trtri + lauum)
+function pptrf! end   # packed Cholesky factor
+function pptrs! end   # packed Cholesky solve
+function pbtrf! end   # band Cholesky factor
+function pbtrs! end   # band Cholesky solve
+function pstrf! end   # pivoted Cholesky (rank-revealing)
+function pocon! end   # posdef reciprocal condition estimate
+function getrs! end   # LU solve
+function getri! end   # LU inverse
+function trtrs! end   # triangular solve
+function trtri! end   # triangular inverse
+function gecon! end   # general reciprocal condition estimate
+function trcon! end   # triangular reciprocal condition estimate
+function trrfs! end   # triangular solve error bounds (ferr/berr)
+function gbtrf! end   # general banded LU factor
+function gbtrs! end   # general banded LU solve
+function gtsv! end    # tridiagonal solve (factor + solve)
+function gttrf! end   # tridiagonal LU factor
+function gttrs! end   # tridiagonal LU solve
+function pttrf! end   # SPD tridiagonal LDLᴴ factor
+function pttrs! end   # SPD tridiagonal solve
+function ptsv! end    # SPD tridiagonal solve (factor + solve)
+function gesvx! end   # expert general driver (equilibrate + factor + solve + error bounds)
+
 @strict_contract AbstractLAPACK begin
-    potrf!(::Self, ::AbstractMatrix)::AbstractMatrix
-    getrf!(::Self, ::AbstractMatrix)::Tuple
-    geqrf!(::Self, ::AbstractMatrix)::Tuple
-    gesvd!(::Self, ::AbstractMatrix)::Tuple
+    potrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor A = L·Lᴴ (or Uᴴ·U); overwrites the stored triangle"
+    getrf!(::Self, ::AbstractMatrix)::Tuple => "LU with partial pivoting, P·A = L·U → (A, ipiv, info)"
+    geqrf!(::Self, ::AbstractMatrix)::Tuple => "Householder QR, A = Q·R → (A, τ)"
+    gesvd!(::Self, ::AbstractMatrix)::Tuple => "SVD, A = U·Σ·Vᵀ → (U, S, Vᵀ)"
+    potrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from a Cholesky factor"
+    potri!(::Self, ::AbstractMatrix)::AbstractMatrix => "explicit inverse from a Cholesky factor (trtri then lauum)"
+    pptrf!(::Self, ::AbstractVector)::AbstractVector => "Cholesky factor in packed triangular storage"
+    pptrs!(::Self, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from a packed Cholesky factor"
+    pbtrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor of a symmetric/Hermitian band matrix"
+    pbtrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from a band Cholesky factor"
+    pstrf!(::Self, ::AbstractMatrix, ::AbstractVector, ::Real)::Tuple => "pivoted rank-revealing Cholesky → (A, piv, rank, info)"
+    pocon!(::Self, ::Real, ::AbstractMatrix)::Real => "reciprocal condition number of a posdef matrix, from its factor"
+    getrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from LU factors and pivots"
+    getri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from LU factors and pivots"
+    trtrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "triangular solve op(A)·X = B"
+    trtri!(::Self, ::AbstractMatrix)::AbstractMatrix => "explicit inverse of a triangular matrix, in place"
+    gecon!(::Self, ::Real, ::AbstractMatrix, ::AbstractVector)::Real => "reciprocal condition number of a general matrix, from its LU"
+    trcon!(::Self, ::AbstractMatrix)::Real => "reciprocal condition number of a triangular matrix"
+    trrfs!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVecOrMat, ::AbstractVector, ::AbstractVector)::Tuple => "forward/backward error bounds for a triangular solve → (ferr, berr)"
+    gbtrf!(::Self, ::Integer, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector)::Tuple => "banded LU with partial pivoting; ipiv is caller-provided → (AB, ipiv, info)"
+    gbtrs!(::Self, ::AbstractChar, ::Integer, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from banded LU factors"
+    gtsv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "tridiagonal solve — factor and solve in one pass"
+    gttrf!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::Tuple => "tridiagonal LU with partial pivoting"
+    gttrs!(::Self, ::AbstractChar, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from tridiagonal LU factors"
+    pttrf!(::Self, ::AbstractVector, ::AbstractVector)::Tuple => "LDLᴴ factor of an SPD tridiagonal matrix"
+    pttrs!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from an SPD tridiagonal LDLᴴ factor"
+    ptsv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::Tuple => "SPD tridiagonal solve — factor and solve in one pass"
+    gesvx!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Char, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "expert driver: equilibrate, factor, solve, refine, bound the error"
 end

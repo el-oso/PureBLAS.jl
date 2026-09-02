@@ -402,7 +402,18 @@ _trexc_dispatch!(wantq, T::AbstractMatrix{<:Complex}, Q, ifst, ilst) = _ztrexc!(
 function _lacn2_estimate(n::Int, apply!::F, ::Type{V}) where {F, V}
     R = real(V)
     ITMAX = 5
-    x = fill(V(one(R) / R(n)), n); v = zeros(V, n); isgn = zeros(Int, n)
+    # Owned scratch (workspace.jl) so trrfs!/trsen! allocate nothing here — this ran once per right-hand
+    # side, so it was 3·nrhs allocations per trrfs! call. The buffers are REUSED and carry the previous
+    # call's values, so what the old `fill`/`zeros` provided is now explicit.
+    #
+    # Only `fill!(x, …)` is load-bearing: x IS read before it is written (the first `apply!` consumes it).
+    # `v` is write-only in this function (`copyto!(v, x)` below; the n==1 path returns `abs(x[1])`), and
+    # `isgn` is always written by `_lacn2_sign!` before `_lacn2_signchanged` reads it. Their fills are
+    # therefore defensive, not required — kept because they are O(n) against an O(n²) estimator and they
+    # keep the buffer state independent of call history, which is what makes the poison-invariance test
+    # meaningful. Do not "optimise" them away without re-running that test.
+    x, v, isgn = _lacn2e_bufs(V, n)
+    fill!(x, V(one(R) / R(n))); fill!(v, zero(V)); fill!(isgn, 0)
     onenorm(w) = (
         s = zero(R); @inbounds for wi in w
             s += abs(wi)
@@ -538,10 +549,19 @@ function _dtrsen!(
             nn = n1 * n2
             T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(ONE)
+            # `_lacn2_estimate` hands the closure an owned-workspace VIEW, and `reshape(::SubArray, …)`
+            # goes through Base `_reshape` → `_throw_dmrs`, whose 8-piece eagerly-interpolated message
+            # despecialises to `print_to_string(::String, ::Vararg{Any})` and fails `--trim=safe`
+            # (`reshape(::Vector, …)` took Array's own method, which uses a trim-clean LazyString).
+            # A real n1×n2 Matrix dodges that AND keeps _dtrsyl! on the dense-Array path it had when x
+            # was a Vector. Hoisted out of the closure: allocated once per trsen! call, next to the two
+            # `collect`s above — `_lacn2_estimate` itself stays 0-alloc, which is what trrfs! needs.
+            Xm = similar(T11, n1, n2)
             apply! = function (xv, kase)
-                Xm = reshape(xv, n1, n2)
+                copyto!(Xm, xv)
                 _, sc, _ = kase == 1 ? _dtrsyl!('N', 'N', -1, T11, T22, Xm) :
                     _dtrsyl!('T', 'T', -1, T11, T22, Xm)
+                copyto!(xv, Xm)
                 scref[] = sc
                 return nothing
             end
@@ -598,10 +618,12 @@ function _ztrsen!(
             nn = n1 * n2
             T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(one(R))
+            Xm = similar(T11, n1, n2)          # see the _dtrsen! comment: no reshape(::SubArray) — trim
             apply! = function (xv, kase)
-                Xm = reshape(xv, n1, n2)
+                copyto!(Xm, xv)
                 _, sc, _ = kase == 1 ? _ztrsyl!('N', 'N', -1, T11, T22, Xm) :
                     _ztrsyl!('C', 'C', -1, T11, T22, Xm)
+                copyto!(xv, Xm)
                 scref[] = sc
                 return nothing
             end

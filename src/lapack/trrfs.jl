@@ -54,9 +54,10 @@ function trrfs!(
     safe1 = R(nz) * safmin
     safe2 = safe1 / eps_p
 
-    r = Vector{T}(undef, n)          # residual  r = op(A)·x − b
-    wabs = Vector{R}(undef, n)       # |op(A)|·|x| + |b|
-    wt = Vector{R}(undef, n)         # LACN2 weight  |r| + nz·eps·wabs (+safe1 as needed)
+    # Owned scratch (workspace.jl): r = residual op(A)·x − b (eltype T); wabs = |op(A)|·|x| + |b| and
+    # wt = LACN2 weight |r| + nz·eps·wabs (+safe1 as needed), both real. Reused across calls — every
+    # element of all three is written before it is read, on every column j and every branch.
+    r, wabs, wt = _trrfs_work(T, n)
 
     @inbounds for j in 1:nrhs
         # residual: r := op(A)·X[:,j] − B[:,j]
