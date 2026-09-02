@@ -331,3 +331,26 @@ end
 @inline pttrs!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pttrs!(D, E, B; kw...)
 @inline ptsv!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::Tuple = ptsv!(D, E, B; kw...)
 @inline gesvx!(::SIMDBackend, fact::Char, trans::Char, A::AbstractMatrix, AF::AbstractMatrix, ipiv::AbstractVector, equed::Char, R::AbstractVector, C::AbstractVector, B::AbstractMatrix, X::AbstractMatrix, ferr::AbstractVector, berr::AbstractVector)::Tuple = gesvx!(fact, trans, A, AF, ipiv, equed, R, C, B, X, ferr, berr)
+
+# ── QR / LQ / QL / RZ backend surface (the rest of the AbstractLAPACK contract). Same thin-wrapper
+# form. Only the 14 DISTINCT implementations get a method: `ungqr!`/`unglq!`/`ungql!`/`ungrq!` and
+# `unmqr!`/`unmlq!`/`unmql!`/`unmrq!`/`unmrz!` are `const un*! = or*!` aliases — the same function
+# object — so each `or*!` method below IS the `un*!` method. orgtr!/ungtr! are absent: they allocate
+# their output Q, so they cannot satisfy the strict guarantee yet (see contracts.jl).
+@inline gelqf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = gelqf!(A, tau)
+@inline geqlf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = geqlf!(A, tau)
+@inline gerqf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = gerqf!(A, tau)
+@inline geqp3!(::SIMDBackend, A::AbstractMatrix, jpvt::AbstractVector, tau::AbstractVector)::Tuple = geqp3!(A, jpvt, tau)
+@inline tzrzf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::Tuple = tzrzf!(A, tau)
+@inline orgqr!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = orgqr!(A, tau)
+@inline orglq!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = orglq!(A, tau)
+@inline orgql!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = orgql!(A, tau)
+@inline orgrq!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = orgrq!(A, tau)
+@inline ormqr!(::SIMDBackend, side::Char, trans::Char, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormqr!(side, trans, A, tau, C)
+@inline ormlq!(::SIMDBackend, side::Char, trans::Char, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormlq!(side, trans, A, tau, C)
+@inline ormql!(::SIMDBackend, side::Char, trans::Char, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormql!(side, trans, A, tau, C)
+@inline ormrq!(::SIMDBackend, side::Char, trans::Char, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormrq!(side, trans, A, tau, C)
+@inline ormrz!(::SIMDBackend, side::Char, trans::Char, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormrz!(side, trans, A, tau, C)
+# orgtr!/ungtr! bind the IN-PLACE (caller-supplied Q) forms — the 3-arg convenience forms allocate Q.
+@inline orgtr!(::SIMDBackend, uplo::Char, A::AbstractMatrix, tau::AbstractVector, Q::AbstractMatrix)::AbstractMatrix = orgtr!(uplo, A, tau, Q)
+@inline ungtr!(::SIMDBackend, uplo::Char, A::AbstractMatrix, tau::AbstractVector, Q::AbstractMatrix)::AbstractMatrix = ungtr!(uplo, A, tau, Q)

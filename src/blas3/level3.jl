@@ -1738,6 +1738,11 @@ function _trsm_cmplx_dLN!(up::Bool, unit::Bool, k::Int, A, B)
     nc = clamp((_L1_BYTES ÷ 2) ÷ (k * csz), 1, nrhs)             # RHS panel fitting ~½ L1 (A col shares it)
     GC.@preserve A B begin
         Ap = Ptr{Tc}(pointer(A)); Bp = Ptr{Tc}(pointer(B))
+        # `k <= length(rcp)` is guaranteed by `_fh_ctrsm_direct_max()`, which clamps to the buffer's
+        # capacity — see its definition. Guarding HERE instead would be wrong: `_dLN_panel!` below reads
+        # `rcp[j]` unconditionally, so skipping the fill would hand it stale reciprocals rather than
+        # fall back, and the BLAS-2 kernels only get away with a `userc` flag because they thread it
+        # into every consumer (`userc ? t * rcp[j] : t / …`, level2.jl:2779-2803).
         unit || @inbounds @simd for j in 1:k
             rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * lda + j))
         end
@@ -1994,7 +1999,20 @@ end
 # sound as SCREENING, but a near-parity re-test wants a quiet box.
 # PDM: Literal — trtri overhead plus extra flops sink small/mid n, so the direct path stops here. | tune: candidate
 const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
-@inline _fh_ctrsm_direct_max() = (f = _FKR_ctrsm_direct_max[]; f >= 0 ? f : _CTRSM_DIRECT_MAX)
+# CLAMPED TO THE RECIPROCAL BUFFER'S CAPACITY, and that clamp is load-bearing, not defensive.
+# `_trsm_cmplx_dLN!` fills `_trsv_rcpbuf(T)` — a FIXED 512-element global (level2.jl:3788) — with
+# `rcp[j]` for `j in 1:k` under `@inbounds`, and every caller of that routine gates only on
+# `k <= _fh_ctrsm_direct_max()`. That value comes from the `ctrsm_direct_max` preference (default 64,
+# declared above) OR a `PUREBLAS_FORCE_ctrsm_direct_max` env override, and NEITHER is range-checked
+# (`_force_knob` is a bare `tryparse(Int, …)`). knobs.md marks the knob `tune: candidate`, i.e. the
+# expected workflow — so pinning it above 512 would write past the end of a module global with bounds
+# checking compiled away. Safe at the shipped default (64); this makes it safe at any pin.
+# Same class as the `_EXPINT[7]` overflow that test/expint_lint.jl was written for, except this WRITES.
+# Clamping here rather than at the fill site is deliberate: `_dLN_panel!` reads `rcp[j]`
+# unconditionally, so a skipped fill would feed it stale reciprocals. Over the cap the direct path is
+# simply not taken and the trtri path handles it, which is correct at any k.
+@inline _fh_ctrsm_direct_max() =
+    min(let f = _FKR_ctrsm_direct_max[]; f >= 0 ? f : _CTRSM_DIRECT_MAX end, length(_TRSV_RCP64))
 # Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
 # off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
 # ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).

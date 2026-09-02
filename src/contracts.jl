@@ -214,6 +214,33 @@ function pttrs! end   # SPD tridiagonal solve
 function ptsv! end    # SPD tridiagonal solve (factor + solve)
 function gesvx! end   # expert general driver (equilibrate + factor + solve + error bounds)
 
+# ── QR / LQ / QL / RZ family: factorizations, Q-generators, Q-appliers ─────────────────────────────
+# 14 members, not 25 names. Nine of the public names — ungqr!/unglq!/ungql!/ungrq! and
+# unmqr!/unmlq!/unmql!/unmrq!/unmrz! — are `const un*! = or*!` aliases (qr.jl:590, lq.jl:133/:180,
+# qlrq.jl:120/:156/:230/:272, gelsy.jl:209). They are the SAME function object, so one backend method
+# on the `or*!` name IS the `un*!` method; contracting both would also be impossible, because
+# declaring `function ungqr! end` here (contracts.jl is included at PureBLAS.jl:20, long before
+# qr.jl:27) would make the later `const ungqr! = orgqr!` a redefinition error.
+# orgtr!/ungtr! ARE included, but only via their IN-PLACE forms `orgtr!(uplo, A, tau, Q)`. Their
+# 3-arg convenience forms allocate Q (netlib DORGTR overwrites A instead; PureBLAS returns a fresh Q),
+# and a contract satisfiable by an allocating method would be worth nothing.
+function gelqf! end   # LQ factorization: A = L·Q
+function geqlf! end   # QL factorization: A = Q·L
+function gerqf! end   # RQ factorization: A = R·Q
+function geqp3! end   # column-pivoted QR (rank-revealing): A·P = Q·R
+function tzrzf! end   # trapezoidal RZ: [R 0]·Z = [T 0]
+function orgqr! end   # form Q from geqrf reflectors (ungqr! is the same object)
+function orglq! end   # form Q from gelqf reflectors
+function orgql! end   # form Q from geqlf reflectors
+function orgrq! end   # form Q from gerqf reflectors
+function ormqr! end   # apply geqrf Q to C (unmqr! is the same object)
+function ormlq! end   # apply gelqf Q to C
+function ormql! end   # apply geqlf Q to C
+function ormrq! end   # apply gerqf Q to C
+function ormrz! end   # apply tzrzf Z to C
+function orgtr! end   # form Q from sytrd reflectors (in-place form)
+function ungtr! end   # form Q from hetrd reflectors (in-place form)
+
 @strict_contract AbstractLAPACK begin
     potrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor A = L·Lᴴ (or Uᴴ·U); overwrites the stored triangle"
     getrf!(::Self, ::AbstractMatrix)::Tuple => "LU with partial pivoting, P·A = L·U → (A, ipiv, info)"
@@ -243,4 +270,20 @@ function gesvx! end   # expert general driver (equilibrate + factor + solve + er
     pttrs!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from an SPD tridiagonal LDLᴴ factor"
     ptsv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::Tuple => "SPD tridiagonal solve — factor and solve in one pass"
     gesvx!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Char, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "expert driver: equilibrate, factor, solve, refine, bound the error"
+    gelqf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "LQ factorization A = L·Q, reflectors in A and tau"
+    geqlf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "QL factorization A = Q·L"
+    gerqf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "RQ factorization A = R·Q"
+    geqp3!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "column-pivoted QR, A·P = Q·R → (A, jpvt, tau)"
+    tzrzf!(::Self, ::AbstractMatrix, ::AbstractVector)::Tuple => "trapezoidal RZ reduction → (A, tau)"
+    orgqr!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from geqrf reflectors"
+    orglq!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from gelqf reflectors"
+    orgql!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from geqlf reflectors"
+    orgrq!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from gerqf reflectors"
+    ormqr!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply geqrf Q to C (side, trans)"
+    ormlq!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gelqf Q to C (side, trans)"
+    ormql!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply geqlf Q to C (side, trans)"
+    ormrq!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gerqf Q to C (side, trans)"
+    ormrz!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply tzrzf Z to C (side, trans)"
+    orgtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from sytrd reflectors into a caller-supplied Q"
+    ungtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from hetrd reflectors into a caller-supplied Q"
 end

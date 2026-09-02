@@ -54,7 +54,11 @@ end
 # what keeps n=8 ahead of the old code, measured 0.91×→1.07×).
 function _geqp3_house_dd!(
         A::AbstractMatrix{T}, i::Int, m::Int, n::Int, τ::T,
-        hbuf::Vector{T}, vn1::Vector{T}, vn2::Vector{T}, tol3z::T
+        # `AbstractVector`, not `Vector`: these now arrive as contiguous views of the owned workspace
+        # (`_geqp3_norms_work`). A `::Vector{T}` annotation would simply not match a `SubArray`, so the
+        # call would fail to dispatch rather than silently deoptimise — but widen it deliberately, and
+        # note the fast paths downstream gate on `_strided1`/`_dense1`, which a contiguous view satisfies.
+        hbuf::AbstractVector{T}, vn1::AbstractVector{T}, vn2::AbstractVector{T}, tol3z::T
     ) where {T <: BlasReal}
     len = m - i + 1; nc = n - i
     W = _vwidth(T)
@@ -144,8 +148,9 @@ function geqp3!(
     end
     n == 0 && return A, jpvt, tau
     tol3z = sqrt(eps(R))                                   # dlaqps recompute threshold (√ machine-eps)
-    vn1 = Vector{R}(undef, n)                              # current (downdated) partial column 2-norms
-    vn2 = Vector{R}(undef, n)                              # reference norm at last exact recompute
+    # Owned scratch (workspace.jl). vn1/vn2/hbuf are REAL-typed and live on `_l3ws(real(T))`; they are
+    # taken together because all three are allocated on EVERY path through this routine.
+    vn1, vn2, hbuf = _geqp3_norms_work(T, n)
     if T <: BlasReal && R === T && _strided1(A)
         _geqp3_norms!(A, m, n, vn1, vn2)                   # fused fast pass, _nrm2 fallback guard
     else
@@ -159,9 +164,9 @@ function geqp3!(
     if T <: BlasReal && R === T && _strided1(A) && k > _QR_UNBLK_MAX
         nb = clamp(_qr_nb(m, n), 1, k)
         if nb > 1
-            F = Matrix{T}(undef, n, nb)
-            auxv = Vector{T}(undef, nb)
-            wrow = Vector{T}(undef, n)                 # pivot-row delta buffer (see laqps.jl step 5)
+            # Blocked-panel scratch, owned. Reached only when `nb > 1`, which is why an allocation
+            # audit at a single small n cannot see it (F/auxv/wrow are ~94% of the bytes at n=129).
+            F, auxv, wrow = _geqp3_panel_work(T, n, nb)
             while k - j0 + 1 > nb
                 jb = min(nb, k - j0 + 1)
                 fjb = _laqps!(
@@ -181,7 +186,6 @@ function geqp3!(
         # path at n=48/64/96 (1.33×/1.24×/1.05×), crossing only at n=128 (0.96×). _QR_UNBLK_MAX
         # stays 32 — no gate cell sits in 48..96 and the crossover is unmeasured off Zen4; a
         # geqp3-specific derived crossover is a follow-up lever, not assumed here.
-        hbuf = Vector{R}(undef, n)                         # contiguous heads for the SIMD downdate
         @inbounds for i in j0:k
             pvt = i; maxn = vn1[i]
             for j in (i + 1):n

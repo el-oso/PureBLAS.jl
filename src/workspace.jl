@@ -108,6 +108,30 @@ mutable struct L3Workspace{T}
     # The arm is AVX2-only (`_RL_MR_LIVE > _NVREG`), so no AVX-512 box can execute it; it was found by
     # READING, and the fix is the field split, not an audit.
     rpad::Matrix{T}       # _trsm_rpad: side-R pad-arm A copy, ODD ld (grows k×k)
+    # geqp3 (column-pivoted QR). Six buffers, allocated per call before this: 384 B at n=8 rising to
+    # 12,952 B at n=129. Worth noting HOW that was found — the audit measured five sizes straddling the
+    # blocking threshold, because `vn1`/`vn2`/`hbuf` are allocated on every path while `F`/`auxv`/`wrow`
+    # appear only once `nb > 1`. A single-size check sees at most half the leak, which is precisely the
+    # trap that hid pptrf!'s blocked arm at n=8.
+    qp3vn1::Vector{T}     # _geqp3_norms_work: downdated partial column 2-norms — REAL, via _l3ws(real(T))
+    qp3vn2::Vector{T}     # _geqp3_norms_work: reference norm at last exact recompute — REAL
+    qp3hbuf::Vector{T}    # _geqp3_norms_work: contiguous heads for the SIMD downdate — REAL
+    qp3f::Matrix{T}       # _geqp3_panel_work: laqps block reflector F, n × nb (blocked arm only)
+    qp3auxv::Vector{T}    # _geqp3_panel_work: laqps auxiliary vector, length nb (blocked arm only)
+    qp3wrow::Vector{T}    # _geqp3_panel_work: pivot-row delta buffer, length n (blocked arm only)
+    # ormtr/unmtr blocked compact-WY scratch (eigen.jl). `_ormtr!`/`_unmtr!` built a fresh
+    # `WYApplyWorkspace{T}(n, nb, nc)` PLUS an nb×nb T factor (and, complex, a second nb×nb Gram) on every
+    # call — the scratch half of the orgtr!/ungtr! leak (~9.6 KB real / ~20 KB complex at n=64, on top of
+    # the returned Q). Four fields, one per role: `mtrv` is the only one that grows with n, the other three
+    # are bounded by nb (= `_qr_nb`) and nc. Grow-only; every element read is written first on the same
+    # call (the panel copy fills V[1:m,1:pb]; syrk!/herk! and gemm! all run with beta=false), so NO `fill!`
+    # is needed — the old code used `Matrix{T}(undef, …)` throughout, never `zeros`.
+    mtrv::Matrix{T}       # _ormtr_work: explicit unit-lower-trapezoid reflector panel V (grows n×nb)
+    mtrg::Matrix{T}       # _ormtr_work: VᵀV / VᴴV Gram scratch for wy_t!/_wy_t_cplx! (grows nb×nb)
+    mtrw::Matrix{T}       # _ormtr_work: VᵀC then (T or Tᵀ)·W apply scratch (grows nb×nc)
+    # `mtrt` is a DISTINCT field from `mtrg`, not a share: both are live at once inside wy_t!/_wy_t_cplx!,
+    # which builds T by reading G.
+    mtrt::Matrix{T}       # _ormtr_work: compact-WY T factor (grows nb×nb)
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -128,6 +152,10 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # pptrfw, pptrfv, pptrfr
     T[], T[], T[],                                   # gerfsr, gerfsw, gerfsd
     Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # trsmw, rpad
+    T[], T[], T[],                                   # qp3vn1, qp3vn2, qp3hbuf
+    Matrix{T}(undef, 0, 0), T[], T[],                # qp3f, qp3auxv, qp3wrow
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # mtrv, mtrg
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # mtrw, mtrt
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -523,4 +551,41 @@ function _trsm_rpad(::Type{T}, rows::Int, cols::Int) where {T}
         b = Matrix{T}(undef, need, cols); ws.rpad = b
     end
     return b
+end
+
+# geqp3 column-norm tracking. All three are REAL-typed, so they live on `_l3ws(real(T))` — the same
+# const-dispatched owner, no second type parameter needed. Allocated on EVERY geqp3! path.
+function _geqp3_norms_work(::Type{T}, n::Int) where {T}
+    R = real(T); ws = _l3ws(R)
+    length(ws.qp3vn1) < n && (ws.qp3vn1 = Vector{R}(undef, n))
+    length(ws.qp3vn2) < n && (ws.qp3vn2 = Vector{R}(undef, n))
+    length(ws.qp3hbuf) < n && (ws.qp3hbuf = Vector{R}(undef, n))
+    return view(ws.qp3vn1, 1:n), view(ws.qp3vn2, 1:n), view(ws.qp3hbuf, 1:n)
+end
+
+# geqp3 blocked panel (laqps). Reached only when `nb > 1`, which is why the allocation was invisible
+# below the blocking threshold. Element-typed, so a different owner from the REAL norms above for
+# complex T — they cannot alias.
+function _geqp3_panel_work(::Type{T}, n::Int, nb::Int) where {T}
+    ws = _l3ws(T)
+    (size(ws.qp3f, 1) < n || size(ws.qp3f, 2) < nb) && (ws.qp3f = Matrix{T}(undef, n, nb))
+    length(ws.qp3auxv) < nb && (ws.qp3auxv = Vector{T}(undef, nb))
+    length(ws.qp3wrow) < n && (ws.qp3wrow = Vector{T}(undef, n))
+    return view(ws.qp3f, 1:n, 1:nb), view(ws.qp3auxv, 1:nb), view(ws.qp3wrow, 1:n)
+end
+
+# ormtr/unmtr blocked back-transform scratch: V (n×nb), G (nb×nb), W (nb×nc), T factor (nb×nb).
+# Returns the WHOLE buffers, not views: `V`/`G`/`W` become the fields of a `WYApplyWorkspace{T}` (wy.jl,
+# included AFTER this file, so it cannot be an `L3Workspace` field type) and `wy_t!`/`wy_apply!` already
+# take their own `view(…, 1:bs, …)` sub-blocks. Grow-only, and the three nb-sized buffers only ever grow
+# to `_qr_nb`'s bounded width, so the leading-dimension drift `_gemm_3m_scratch` warns about is capped.
+# No `fill!`: the panel copy writes V[1:m,1:pb] entirely, wy_t! writes the full bs×bs T (zeroed strict
+# lower included), and every G/W producer is a beta=false syrk!/herk!/gemm!.
+function _ormtr_work(::Type{T}, n::Int, nb::Int, nc::Int) where {T}
+    ws = _l3ws(T)
+    (size(ws.mtrv, 1) < n || size(ws.mtrv, 2) < nb) && (ws.mtrv = Matrix{T}(undef, n, nb))
+    (size(ws.mtrg, 1) < nb || size(ws.mtrg, 2) < nb) && (ws.mtrg = Matrix{T}(undef, nb, nb))
+    (size(ws.mtrw, 1) < nb || size(ws.mtrw, 2) < nc) && (ws.mtrw = Matrix{T}(undef, nb, nc))
+    (size(ws.mtrt, 1) < nb || size(ws.mtrt, 2) < nb) && (ws.mtrt = Matrix{T}(undef, nb, nb))
+    return ws.mtrv, ws.mtrg, ws.mtrw, ws.mtrt
 end

@@ -77,6 +77,23 @@ _strict_gesvx_probe(bk, A, A0, AF, ipiv, R, C, Bw, B0, X, fe, be) =
         gesvx!(bk, 'N', 'N', A, AF, ipiv, 'N', R, C, Bw, X, fe, be); nothing
     )
 
+# ── QR/LQ/QL/RZ probes. Every one of these overwrites its input, and `@strict` calls its target
+# repeatedly, so each re-seeds from a pristine source with `copyto!` (allocation-free) and returns
+# `nothing` so the multi-output tuples never escape to the call site.
+_strict_qrfac_probe(f, Aw, A0, tau) = (copyto!(Aw, A0); f(Aw, tau); nothing)
+_strict_qp3_probe(Aw, A0, jp, tau) = (copyto!(Aw, A0); fill!(jp, 0); geqp3!(Aw, jp, tau); nothing)
+# Q-generators consume a FACTORED source, so the pristine copy is the factorization, not the raw A.
+_strict_orgq_probe(f, Aw, Af, tau) = (copyto!(Aw, Af); f(Aw, tau); nothing)
+# Q-appliers leave A alone and overwrite C.
+_strict_ormq_probe(f, Cw, C0, Af, tau) = (copyto!(Cw, C0); f('L', 'N', Af, tau, Cw); nothing)
+
+# orgtr!/ungtr! read A/tau and OVERWRITE the caller-supplied Q, so only Q needs re-seeding — and it does
+# need it: the in-place form zeroes Q itself (its off-diagonal zeros are READ by the block-reflector
+# gemms), so a repeated @strict call must not inherit the previous call's Q. Return nothing so Q does
+# not escape and get charged to the call site.
+_strict_orgtr_probe(bk, A, tau, Q) = (orgtr!(bk, 'L', A, tau, Q); nothing)
+_strict_ungtr_probe(bk, A, tau, Q) = (ungtr!(bk, 'L', A, tau, Q); nothing)
+
 if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
@@ -97,6 +114,10 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
             Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
             ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
+            # QR-family sources: a pristine A, and pre-factored copies for the Q-generators and
+            # Q-appliers (which need real reflectors, not raw data).
+            Aqr = ones(m, m), Aqw = zeros(m, m), tauq = Vector{Float64}(undef, m),
+            jpq = zeros(Int, m), Cqr = ones(m, m), Cqw = zeros(m, m),
             # COMPLEX counterparts. The contract previously verified `symm!`/`syrk!`/`syr2k!`/`trmm!`/
             # `trsm!` and every factorization on REAL operands only, so any defect confined to a complex
             # kernel was invisible to it — which is exactly how ~1 KB/call of `unsafe_wrap` allocation in
@@ -206,6 +227,17 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         _strict_pttrf_probe(bk, Dpw, Epw, Dp0, Ep0); _strict_pttrs_probe(bk, Bsw, Bs0, Dpf, Epf)
         _strict_ptsv_probe(bk, Dpw, Epw, Dp0, Ep0, Bsw, Bs0)
         _strict_gesvx_probe(bk, Asw, Aspd, AFx, ipivx, Rq, Cq, Bsw, Bs0, Xs, ferrs, berrs)
+        # QR-family factored sources. The Q-generators and Q-appliers need REAL reflectors, so each
+        # gets its own factorization of the same pristine A; reusing one factor across families would
+        # not exercise the distinct reflector layouts (QR stores below the diagonal, LQ to the right,
+        # QL/RQ at the opposite corners, RZ in the trapezoidal tail).
+        Afqr = copy(Aqr); geqrf!(Afqr, tauq)
+        Aflq = copy(Aqr); taul = Vector{Float64}(undef, m); gelqf!(Aflq, taul)
+        Afql = copy(Aqr); tauql = Vector{Float64}(undef, m); geqlf!(Afql, tauql)
+        Afrq = copy(Aqr); taurq = Vector{Float64}(undef, m); gerqf!(Afrq, taurq)
+        Afrz = copy(Aqr); taurz = Vector{Float64}(undef, m); tzrzf!(Afrz, taurz)
+        Aqtr = ones(m, m); tautr = Vector{Float64}(undef, m); Qtr = zeros(m, m)
+        Aztr = ones(ComplexF64, m, m); tauztr = Vector{ComplexF64}(undef, m); Qztr = zeros(ComplexF64, m, m)
         copyto!(Xs, Bs0); trtrs!(Achol, Xs; uplo = 'L')   # gesvx overwrote Xs — restore the solution
         @verify_strict SIMDBackend begin
             # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
@@ -370,6 +402,25 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             # factor-solve-refine chain rather than the scaling. Again the IN-PLACE form: X/ferr/berr
             # come from the caller, which is what netlib's OUT arguments always implied.
             _strict_gesvx_probe(bk, Asw, Aspd, AFx, ipivx, Rq, Cq, Bsw, Bs0, Xs, ferrs, berrs)
+            # ── QR / LQ / QL / RZ. 14 distinct implementations; the nine `un*!` names are `const`
+            # aliases of these same function objects, so verifying `or*!` verifies them too.
+            # orgtr!/ungtr! are absent — they allocate their output Q (see contracts.jl).
+            _strict_qrfac_probe(gelqf!, Aqw, Aqr, tauq)
+            _strict_qrfac_probe(geqlf!, Aqw, Aqr, tauq)
+            _strict_qrfac_probe(gerqf!, Aqw, Aqr, tauq)
+            _strict_qrfac_probe(tzrzf!, Aqw, Aqr, tauq)
+            _strict_qp3_probe(Aqw, Aqr, jpq, tauq)
+            _strict_orgq_probe(orgqr!, Aqw, Afqr, tauq)
+            _strict_orgq_probe(orglq!, Aqw, Aflq, taul)
+            _strict_orgq_probe(orgql!, Aqw, Afql, tauql)
+            _strict_orgq_probe(orgrq!, Aqw, Afrq, taurq)
+            _strict_ormq_probe(ormqr!, Cqw, Cqr, Afqr, tauq)
+            _strict_ormq_probe(ormlq!, Cqw, Cqr, Aflq, taul)
+            _strict_ormq_probe(ormql!, Cqw, Cqr, Afql, tauql)
+            _strict_ormq_probe(ormrq!, Cqw, Cqr, Afrq, taurq)
+            _strict_ormq_probe(ormrz!, Cqw, Cqr, Afrz, taurz)
+            _strict_orgtr_probe(bk, Aqtr, tautr, Qtr)
+            _strict_ungtr_probe(bk, Aztr, tauztr, Qztr)
         end
         # Trim-compatibility guarantee (contracts.jl): the complex unpacked gemm kernel is the trim-critical
         # path (its runtime bool→Val flags were the union-split that regressed zgemm_64_/cgemm_64_). Fast/dev
