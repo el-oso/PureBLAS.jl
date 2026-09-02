@@ -193,7 +193,11 @@ function _dlaexc!(
         return 0
     end
     nd = n1 + n2
-    D = zeros(R, nd, nd)
+    # D is an EXACT nd×nd view of a fixed 4×4 owned buffer, never the raw field: the dnorm loop below is
+    # `for x in D`, so handing over an oversized 4×4 at nd == 3 would fold 7 stale elements into `thresh`
+    # and silently change which swaps are accepted. Fully written by the copy loop, so no fill! is needed.
+    # u1/u2 are separate fields: in the n1=2,n2=2 branch u1 is still read and applied while u2 is live.
+    D, u1buf, u2buf = _laexc_work(R, nd)
     @inbounds for jj in 1:nd, ii in 1:nd
         D[ii, jj] = T[j1 + ii - 1, j1 + jj - 1]
     end
@@ -202,12 +206,18 @@ function _dlaexc!(
     end
     eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
     thresh = max(TEN * eps_p * dnorm, smlnum)
-    TL = view(D, 1:n1, 1:n1); TR = view(D, (n1 + 1):nd, (n1 + 1):nd); BB = view(D, 1:n1, (n1 + 1):nd)
-    x11, x21, x12, x22, scale, _, _ = _syl_dlasy2(false, false, -1, n1, n2, TL, TR, BB)
+    TL = view(D, 1:n1, 1:n1); TR = view(D, (n1 + 1):nd, (n1 + 1):nd)
+    # RHS block D[1:n1, n1+1:nd] as the four column-major scalars `_syl_dlasy2` actually reads.
+    bb11 = D[1, n1 + 1]
+    bb21 = n1 == 2 ? D[2, n1 + 1] : ZERO
+    bb12 = n2 == 2 ? D[1, n1 + 2] : ZERO
+    bb22 = (n1 == 2 && n2 == 2) ? D[2, n1 + 2] : ZERO
+    x11, x21, x12, x22, scale, _, _ = _syl_dlasy2(false, false, -1, n1, n2, TL, TR, bb11, bb21, bb12, bb22)
     k = n1 + n1 + n2 - 3
     if k == 1
         # n1=1, n2=2
-        u = R[scale, x11, x12]
+        u = u1buf
+        u[1] = scale; u[2] = x11; u[3] = x12
         _, tau = _exc_larfg!(u[3], view(u, 1:2)); u[3] = ONE
         t11 = T[j1, j1]
         _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
@@ -218,7 +228,8 @@ function _dlaexc!(
         wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
     elseif k == 2
         # n1=2, n2=1
-        u = R[-x11, -x21, scale]
+        u = u1buf
+        u[1] = -x11; u[2] = -x21; u[3] = scale
         _, tau = _exc_larfg!(u[1], view(u, 2:3)); u[1] = ONE
         t33 = T[j3, j3]
         _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
@@ -229,10 +240,12 @@ function _dlaexc!(
         wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
     else
         # n1=2, n2=2
-        u1 = R[-x11, -x21, scale]
+        u1 = u1buf
+        u1[1] = -x11; u1[2] = -x21; u1[3] = scale
         _, tau1 = _exc_larfg!(u1[1], view(u1, 2:3)); u1[1] = ONE
         temp = -tau1 * (x12 + u1[2] * x22)
-        u2 = R[-temp * u1[2] - x22, -temp * u1[3], scale]
+        u2 = u2buf
+        u2[1] = -temp * u1[2] - x22; u2[2] = -temp * u1[3]; u2[3] = scale
         _, tau2 = _exc_larfg!(u2[1], view(u2, 2:3)); u2[1] = ONE
         _exc_larfx_l!(u1, tau1, view(D, 1:3, 1:4)); _exc_larfx_r!(u1, tau1, view(D, 1:4, 1:3))
         _exc_larfx_l!(u2, tau2, view(D, 2:4, 1:4)); _exc_larfx_r!(u2, tau2, view(D, 1:4, 2:4))
@@ -482,14 +495,14 @@ end
 # ── DTRSEN / ZTRSEN reorder driver + condition numbers ────────────────────────────────────────────────
 # Returns (T, Q, w, s, sep, info).  job: 'N' reorder only, 'E' + S, 'V' + SEP, 'B' both.
 function _dtrsen!(
-        job::AbstractChar, wantq::Bool, select::AbstractVector{Bool},
-        T::AbstractMatrix{R}, Q::AbstractMatrix{R}
+        job::AbstractChar, wantq::Bool, select::AbstractVector,
+        T::AbstractMatrix{R}, Q::AbstractMatrix{R}, w::AbstractVector{<:Complex}
     ) where {R <: Real}
     ZERO = zero(R); ONE = one(R)
     n = size(T, 1)
     wants = job === 'E' || job === 'B'
     wantsp = job === 'V' || job === 'B'
-    sel = collect(Bool, select)
+    sel = select                            # read `sel[k] != 0` directly — no Bool copy of the caller's
     # count selected (respecting 2×2 conj pairs)
     m = 0; pair = false
     for k in 1:n
@@ -498,9 +511,9 @@ function _dtrsen!(
         end
         if k < n && T[k + 1, k] != ZERO
             pair = true
-            (sel[k] || sel[k + 1]) && (m += 2)
+            (sel[k] != 0 || sel[k + 1] != 0) && (m += 2)
         else
-            sel[k] && (m += 1)
+            sel[k] != 0 && (m += 1)
         end
     end
     n1 = m; n2 = n - m
@@ -512,10 +525,10 @@ function _dtrsen!(
             if pair
                 pair = false; continue
             end
-            swap = sel[k]
+            swap = sel[k] != 0
             if k < n && T[k + 1, k] != ZERO
                 pair = true
-                swap = swap || sel[k + 1]
+                swap = swap || sel[k + 1] != 0
             end
             if swap
                 ks += 1
@@ -532,7 +545,8 @@ function _dtrsen!(
             s = ONE
         else
             # S = scale / ( sqrt(scale²/rnorm + rnorm)·sqrt(rnorm) ),  rnorm = ‖X‖_F of the coupling solve
-            Rm = collect(view(T, 1:n1, (n1 + 1):n))                 # off-diagonal coupling block T₁₂
+            Rm, _, _, _ = _trsen_work(R, n1, n2)                    # off-diagonal coupling block T₁₂
+            copyto!(Rm, view(T, 1:n1, (n1 + 1):n))                  # fully overwritten ⇒ no fill!
             _, scale, _ = _dtrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
             rnorm = (
                 rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
@@ -547,16 +561,17 @@ function _dtrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
+            _, T11, T22, Xm = _trsen_work(R, n1, n2)   # all three fully overwritten before any read
+            copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(ONE)
             # `_lacn2_estimate` hands the closure an owned-workspace VIEW, and `reshape(::SubArray, …)`
             # goes through Base `_reshape` → `_throw_dmrs`, whose 8-piece eagerly-interpolated message
             # despecialises to `print_to_string(::String, ::Vararg{Any})` and fails `--trim=safe`
             # (`reshape(::Vector, …)` took Array's own method, which uses a trim-clean LazyString).
-            # A real n1×n2 Matrix dodges that AND keeps _dtrsyl! on the dense-Array path it had when x
-            # was a Vector. Hoisted out of the closure: allocated once per trsen! call, next to the two
-            # `collect`s above — `_lacn2_estimate` itself stays 0-alloc, which is what trrfs! needs.
-            Xm = similar(T11, n1, n2)
+            # `Xm` (owned, claimed above) is a 2-D n1×n2 array, which dodges that. It is now a SubArray of
+            # the workspace rather than a dense Matrix — still trim-safe (no reshape on the path), but it
+            # does put _dtrsyl! on the SubArray path; see the `trsenx` field comment in workspace.jl.
+            # `_lacn2_estimate` itself stays 0-alloc, which is what trrfs! needs.
             apply! = function (xv, kase)
                 copyto!(Xm, xv)
                 _, sc, _ = kase == 1 ? _dtrsyl!('N', 'N', -1, T11, T22, Xm) :
@@ -570,28 +585,28 @@ function _dtrsen!(
             sep = est == ZERO ? ZERO : scref[] / est
         end
     end
-    w = _diag_eigs(T)
-    return T, Q, w, s, sep, info
+    _diag_eigs!(w, T)
+    return T, Q, s, sep, info
 end
 
 function _ztrsen!(
-        job::AbstractChar, wantq::Bool, select::AbstractVector{Bool},
-        T::AbstractMatrix{C}, Q::AbstractMatrix{C}
+        job::AbstractChar, wantq::Bool, select::AbstractVector,
+        T::AbstractMatrix{C}, Q::AbstractMatrix{C}, w::AbstractVector{<:Complex}
     ) where {C <: Complex}
     R = real(C)
     n = size(T, 1)
     wants = job === 'E' || job === 'B'
     wantsp = job === 'V' || job === 'B'
-    sel = collect(Bool, select)
-    m = 0; @inbounds for i in eachindex(sel)
-        sel[i] && (m += 1)
+    sel = select                            # read `sel[k] != 0` directly — no Bool copy of the caller's
+    m = 0; @inbounds for i in 1:n
+        sel[i] != 0 && (m += 1)
     end   # not count(): mapreduce MappingRF is --trim-unsafe
     n1 = m; n2 = n - m
     s = one(R); sep = zero(R); info = 0
     if !(m == n || m == 0)
         ks = 0
         for k in 1:n
-            if sel[k]
+            if sel[k] != 0
                 ks += 1
                 k != ks && _ztrexc!(wantq, T, Q, k, ks)
             end
@@ -601,7 +616,8 @@ function _ztrsen!(
         if m == n || m == 0
             s = one(R)
         else
-            Rm = C.(view(T, 1:n1, (n1 + 1):n))
+            Rm, _, _, _ = _trsen_work(C, n1, n2)
+            copyto!(Rm, view(T, 1:n1, (n1 + 1):n))                  # fully overwritten ⇒ no fill!
             _, scale, _ = _ztrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
             rnorm = (
                 rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
@@ -616,9 +632,9 @@ function _ztrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            T11 = collect(view(T, 1:n1, 1:n1)); T22 = collect(view(T, (n1 + 1):n, (n1 + 1):n))
+            _, T11, T22, Xm = _trsen_work(C, n1, n2)   # see the _dtrsen! comment: no reshape(::SubArray)
+            copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
             scref = Ref(one(R))
-            Xm = similar(T11, n1, n2)          # see the _dtrsen! comment: no reshape(::SubArray) — trim
             apply! = function (xv, kase)
                 copyto!(Xm, xv)
                 _, sc, _ = kase == 1 ? _ztrsyl!('N', 'N', -1, T11, T22, Xm) :
@@ -631,13 +647,13 @@ function _ztrsen!(
             sep = est == zero(R) ? zero(R) : scref[] / est
         end
     end
-    w = _diag_eigs(T)
-    return T, Q, w, s, sep, info
+    _diag_eigs!(w, T)
+    return T, Q, s, sep, info
 end
 
-# eigenvalues from the (quasi-)triangular T diagonal
-function _diag_eigs(T::AbstractMatrix{R}) where {R <: Real}
-    n = size(T, 1); w = Vector{Complex{R}}(undef, n)
+# eigenvalues from the (quasi-)triangular T diagonal, into a caller-provided w
+function _diag_eigs!(w::AbstractVector{<:Complex}, T::AbstractMatrix{R}) where {R <: Real}
+    n = size(T, 1)
     @inbounds for k in 1:n
         w[k] = Complex(T[k, k], zero(R))
     end
@@ -649,7 +665,12 @@ function _diag_eigs(T::AbstractMatrix{R}) where {R <: Real}
     end
     return w
 end
-_diag_eigs(T::AbstractMatrix{C}) where {C <: Complex} = [T[k, k] for k in 1:size(T, 1)]
+function _diag_eigs!(w::AbstractVector{<:Complex}, T::AbstractMatrix{C}) where {C <: Complex}
+    @inbounds for k in 1:size(T, 1)
+        w[k] = T[k, k]
+    end
+    return w
+end
 
 function _one_norm(T)                                    # explicit (not sum(;dims)+maximum: MappingRF --trim-unsafe)
     mx = zero(real(eltype(T)))
@@ -663,7 +684,8 @@ function _one_norm(T)                                    # explicit (not sum(;di
 end
 
 """
-    trsen!(job, compq, select, T, Q) -> (T, Q, w, s, sep)
+    trsen!(job, compq, select, T, Q, w) -> (T, Q, w, s, sep)
+    trsen!(job, compq, select, T, Q)    -> (T, Q, w, s, sep)
 
 Reorder the eigenvalues selected by `select` (a `Bool`/`0-1` vector) to the leading diagonal block of
 the (quasi-)upper-triangular Schur form `T`, accumulating the swaps into `Q` when `compq='V'`
@@ -672,10 +694,13 @@ the (quasi-)upper-triangular Schur form `T`, accumulating the swaps into `Q` whe
 `'B'` both (`s`/`sep` default to `1`/`0` for the other jobs). `w` are the reordered eigenvalues (the
 `T` diagonal, with conjugate pairs for real `T`). For real `T`, `select` on either half of a
 conjugate pair selects the whole 2×2 block.
+
+`w` is the only allocated output; the 6-argument form takes the caller's (complex, length ≥ n) buffer
+and allocates nothing. It must not overlap `T` — `w` is filled from `T`'s diagonal at the very end.
 """
 function trsen!(
         job::AbstractChar, compq::AbstractChar, select::AbstractVector,
-        T::AbstractMatrix, Q::AbstractMatrix
+        T::AbstractMatrix, Q::AbstractMatrix, w::AbstractVector{<:Complex}
     )
     (job === 'N' || job === 'E' || job === 'V' || job === 'B') ||
         throw(ArgumentError("trsen!: job must be 'N', 'E', 'V' or 'B'"))
@@ -683,10 +708,30 @@ function trsen!(
     n = size(T, 1)
     size(T, 2) == n || throw(DimensionMismatch("trsen!: T must be square"))
     length(select) == n || throw(DimensionMismatch("trsen!: select must have length n"))
+    length(w) >= n || throw(DimensionMismatch("trsen!: length(w) < n"))
+    # `_diag_eigs!` reads T[k,k]/T[k+1,k] while writing w[k]/w[k+1] — an overlapping w corrupts both.
+    Base.mightalias(w, T) && throw(ArgumentError("trsen!: `w` must not alias `T`"))
     wantq = compq === 'V'
-    selb = Bool[select[i] != 0 for i in 1:n]
-    Tr, Qr, w, s, sep, _ = _trsen_dispatch!(job, wantq, selb, T, Q)
+    Tr, Qr, s, sep, _ = _trsen_dispatch!(job, wantq, select, T, Q, w)
     return Tr, Qr, w, s, sep
 end
-_trsen_dispatch!(job, wantq, sel, T::AbstractMatrix{<:Real}, Q) = _dtrsen!(job, wantq, sel, T, Q)
-_trsen_dispatch!(job, wantq, sel, T::AbstractMatrix{<:Complex}, Q) = _ztrsen!(job, wantq, sel, T, Q)
+
+# Allocating convenience form — unchanged behaviour and return value.
+function trsen!(
+        job::AbstractChar, compq::AbstractChar, select::AbstractVector,
+        T::AbstractMatrix, Q::AbstractMatrix
+    )
+    w = Vector{Complex{real(eltype(T))}}(undef, size(T, 1))
+    return trsen!(job, compq, select, T, Q, w)
+end
+
+_trsen_dispatch!(job, wantq, sel, T::AbstractMatrix{<:Real}, Q, w) = _dtrsen!(job, wantq, sel, T, Q, w)
+_trsen_dispatch!(job, wantq, sel, T::AbstractMatrix{<:Complex}, Q, w) = _ztrsen!(job, wantq, sel, T, Q, w)
+
+# 5-argument engine entry kept for the C-ABI shims (cabi_lapack.jl:2607/2635), which need `info` and the
+# allocated `w`. Same kernels; the buffer is the only difference.
+function _trsen_dispatch!(job, wantq, sel, T::AbstractMatrix, Q)
+    w = Vector{Complex{real(eltype(T))}}(undef, size(T, 1))
+    Tr, Qr, s, sep, info = _trsen_dispatch!(job, wantq, sel, T, Q, w)
+    return Tr, Qr, w, s, sep, info
+end

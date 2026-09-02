@@ -30,6 +30,9 @@ const _EXTRA_ACCESSORS = Dict("_trmm_bpf" => Set(["trmm_bpf"]))   # role outside
 # Higham–Hager estimators would otherwise be a silent hole: whatever their caller's closure does runs
 # INSIDE a live claim of lacn*/lacn2*. Declaring the closure names puts every one of them (all methods, all
 # callers, name-merged) in the graph. A new callback-taking routine that claims a field must be added here.
+# EVERY NAME HERE MUST RESOLVE TO A DEFINITION IN src/ OR ws_scan() ERRORS — the edges below were silently
+# dropped for their whole existence because `applyf`/`apply!` are anonymous-function assignments that
+# `_bodies` did not record, and a filtered-away edge looks exactly like a working one.
 const _CALLBACK_EDGES = Dict("_lacn2!" => ["applyop!"],                  # gecon.jl:49  ← gecon!/trcon!/pocon!
                              "_lacn2_estimate" => ["apply!", "applyf"])  # trsen.jl:402 ← trsen!/trrfs!
 
@@ -52,9 +55,30 @@ function _bodies()
     defl = r"^(?:@\w+\s+)*function\s+([A-Za-z_][A-Za-z0-9_!]*)"
     for p in _srcfiles()
         cur = ""
-        indoc = false
-        for l in readlines(p)
+        instr = false           # inside an open triple-quoted literal (docstring OR ordinary string)
+        for l0 in readlines(p)
+            # STRIP THE COMMENT TAIL BEFORE THE QUOTE MACHINE SEES IT. Counting `\"\"\"` on the raw
+            # line lets a triple quote written inside a COMMENT flip parity for the rest of the file.
+            # That is not hypothetical: src/lapack/eigen.jl:741 is a comment describing this very fix
+            # and contains a backticked triple quote, which put the scanner into string mode and
+            # swallowed EIGHT definitions after it — orgtr!/ungtr! (both forms), _sterf!, _syev!,
+            # _heev! — so the `_syev! -> _ormtr!` edge (a real claimant of mtrv/mtrg/mtrw/mtrt) went
+            # invisible, and the docstring below was mis-attributed as body lines. That is the exact
+            # phantom/hidden-edge class this scanner was repaired to remove, reintroduced by the
+            # repair itself, and in the HIDES-FINDINGS direction. The old `startswith(strip(l), …)`
+            # form did not have it. A `#` inside a string literal would truncate that line early —
+            # acceptable here, since the body of a string carries no calls worth graphing.
+            l = split(l0, '#')[1]
             s = strip(l)
+            # Skip the BODY of every triple-quoted literal, but kill attribution only for the ones that
+            # are actually docstrings. Those are two different jobs and the old code conflated them:
+            # it tested `strip(l)`, so an INDENTED `"""` — the llvmcall IR in `_prefetch`
+            # (blas3/gemm.jl:68/75) — set doc-mode and dropped the rest of that function on the floor.
+            # That direction HIDES findings, which is the dangerous way for this lint to be wrong.
+            if instr
+                instr = !occursin("\"\"\"", l)
+                continue            # a closing line's tail (`""", "entry",`) carries no call worth keeping
+            end
             # DOCSTRINGS TERMINATE ATTRIBUTION, and this is load-bearing, not tidiness. Lines are
             # attributed to the preceding definition until the next one, so a docstring written ABOVE a
             # function — the normal Julia placement — has its indented signature lines swallowed by
@@ -66,20 +90,31 @@ function _bodies()
             # once `_unmtr!` began claiming a field — so the edges had been there, silently wrong, since
             # the docstring was written. Every `"""`-above-a-signature in src/ (gesvx!, getrf!, …) is the
             # same shape, so this must be fixed here rather than by moving docstrings around the source.
-            if startswith(s, "\"\"\"")
-                # A one-line `"""text"""` opens and closes on the same line; anything else toggles.
-                (length(s) < 6 || !endswith(s, "\"\"\"")) && (indoc = !indoc)
-                cur = ""            # stop attributing; the next real def re-arms it
+            if occursin("\"\"\"", l)
+                # An ODD count leaves the literal open; an even one (`"""text"""`, `x = """a""" `) closes
+                # on the line. A DOCSTRING is one that starts at column 0 — `"""` or `raw"""`; anything
+                # else (indented, or `x = """…`) is an ordinary string and must not touch attribution.
+                isodd(count("\"\"\"", l)) && (instr = true)
+                (startswith(l, "\"\"\"") || startswith(l, "raw\"\"\"")) && (cur = "")
                 continue
             end
-            indoc && continue
             m = match(defl, s)
-            nm = m === nothing ? _shortdef(s) : m.captures[1]
+            nm = m === nothing ? _anondef(s) : m.captures[1]
             nm === nothing || (cur = nm; get!(b, cur, String[]))
             (cur != "" && !startswith(s, "#")) && push!(b[cur], split(l, '#')[1])
         end
     end
     return b
+end
+
+# `name = function (args)` / `name = (args) -> …`. The two Higham–Hager callbacks are written this way
+# (`applyf`, trrfs.jl:127; `apply!`, trsen.jl:560/622), and _shortdef never saw them — so the declared
+# `_lacn2_estimate` edges below had nothing to resolve to and were dropped in silence.
+const _ANONDEF = r"^([A-Za-z_][A-Za-z0-9_!]*)\s*=\s*(?:function\b|(?:\([^)]*\)|[A-Za-z_][A-Za-z0-9_!]*)\s*->)"
+function _anondef(s::AbstractString)
+    m = match(_ANONDEF, s)
+    m === nothing && return _shortdef(s)
+    return isdefined(Base, Symbol(m.captures[1])) ? nothing : m.captures[1]
 end
 
 # Short-form def `name(args) [where …] = rhs`, with the parens matched by COUNTING, not by regex. A regex
@@ -131,8 +166,15 @@ function ws_scan()
         claims[f] = cs
         union!(get!(calls, f, Set{String}()), setdiff(cl, Set(n for n in cl if isdefined(Base, Symbol(n)))))
     end
+    # A DECLARED EDGE THAT DOES NOT RESOLVE IS AN ERROR. Silently filtering to `g in names` is how both
+    # `_lacn2_estimate` edges sat inert while the header advertised them as the thing that closes the
+    # callback hole: a config entry that quietly does nothing is indistinguishable from one that works.
     for (f, gs) in _CALLBACK_EDGES
-        union!(get!(calls, f, Set{String}()), (g for g in gs if g in names))
+        f in names || error("workspace lint: declared callback edge source `$f` is not a definition in src/")
+        bad = filter(g -> !(g in names), gs)
+        isempty(bad) || error("workspace lint: declared callback edge(s) `$f` -> $bad do not resolve to a " *
+                              "definition in src/ (renamed callback, or a def form _bodies cannot see)")
+        union!(get!(calls, f, Set{String}()), gs)
     end
     reach(f) = (seen = Set{String}(); st = [f];
                 while !isempty(st); x = pop!(st);

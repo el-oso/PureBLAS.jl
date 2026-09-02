@@ -516,7 +516,7 @@ function _hgeqz!(
     atol = max(safmin, ulp * anorm); btol = max(safmin, ulp * bnorm)
     ascale = ONE / max(safmin, anorm); bscale = ONE / max(safmin, bnorm)
     info = 0
-    v = Vector{R}(undef, 3)
+    v = _hgeqz_v(R)              # owned length-3 shift vector; all 3 slots written before every larfg
     # Set eigenvalues ihi+1:n
     @inbounds for j in (ihi + 1):n
         if T[j, j] < ZERO
@@ -940,6 +940,15 @@ function _hgeqz!(
         end
         if !converged && info == 0
             info = ilast
+            # NON-CONVERGENCE: alphar/alphai[ilo:ilast] were never written this call, yet the loop
+            # below forms alpha[i] for ALL i. With the old fresh `Vector{R}(undef,n)` that was
+            # documented garbage (reference LAPACK marks 1:info invalid); with the OWNED hgzar/hgzai
+            # it would be the PREVIOUS call's eigenvalues — plausible-looking and worse, and
+            # `_ggev_core!`/`gges!` discard hgeqz's info, so nothing downstream would notice.
+            # Same fix, same reasoning as hseqr.jl's `_dlahqr!` non-convergence range.
+            @inbounds for i in ilo:min(ilast, n)
+                alphar[i] = zero(R); alphai[i] = zero(R)
+            end
         end
     end
     # Set eigenvalues 1:ilo-1
@@ -982,7 +991,7 @@ function hgeqz!(
     n = size(H, 1)
     wantt = job === 'S'; wantq = compq !== 'N'; wantz = compz !== 'N'
     _qz_init_qz!(compq, Q, n); _qz_init_qz!(compz, Z, n)
-    alphar = Vector{R}(undef, n); alphai = Vector{R}(undef, n)
+    alphar, alphai = _hgeqz_work(R, n)   # scratch only: `_hgeqz!` assigns both at every index, every exit
     info = _hgeqz!(wantt, wantq, wantz, H, T, Int(ilo), Int(ihi), alphar, alphai, beta, Q, Z)
     @inbounds for i in 1:n
         alpha[i] = Complex(alphar[i], alphai[i])

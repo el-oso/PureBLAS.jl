@@ -50,20 +50,24 @@ end
     return (low + high) / 2
 end
 
-# Gather `v[idx]` elementwise. A non-scalar `getindex` with a Vector{Int} index routes through
-# Base's `_unsafe_getindex!` -> `throw_checksize_error` (multidimensional.jl), an eagerly
+# Gather `out[t] = v[idx[t]]` elementwise. A non-scalar `getindex` with a Vector{Int} index routes
+# through Base's `_unsafe_getindex!` -> `throw_checksize_error` (multidimensional.jl), an eagerly
 # interpolated DimensionMismatch that `juliac --trim=safe` rejects (req#4). The string is Base's;
 # the fancy index is what reaches it. Linear-range `v[1:k]` and `view(...)` are unaffected.
-@inline function _stebz_gather(v::Vector{V}, idx::Vector{Int}) where {V}
-    out = Vector{V}(undef, length(idx))
-    @inbounds for (t, s) in enumerate(idx)
-        out[t] = v[s]
+# Annotations are ABSTRACT: `out`, `v` and `idx` are all workspace views under the in-place stebz!,
+# and a `::Vector` annotation would not match a SubArray at all (MethodError, not a slowdown).
+@inline function _stebz_gather!(
+        out::AbstractVector, v::AbstractVector, idx::AbstractVector{<:Integer}
+    )
+    @inbounds for t in eachindex(idx)
+        out[t] = v[Int(idx[t])]
     end
     return out
 end
 
 """
     stebz!(range, order, vl, vu, il, iu, abstol, d, e) -> (w, iblock, isplit, info)
+    stebz!(range, order, vl, vu, il, iu, abstol, d, e, w, iblock, isplit) -> (m, nsplit, info)
 
 Eigenvalues of the real symmetric tridiagonal matrix with diagonal `d` (length n) and off-diagonal
 `e` (length n−1) by Sturm-sequence bisection (LAPACK `dstebz`). `range`: `'A'` all, `'V'` those in
@@ -71,20 +75,38 @@ the half-open interval `(vl, vu]`, `'I'` those with index `il:iu` in ascending o
 groups eigenvalues by split block (ascending within block); `'E'` returns them globally ascending.
 `abstol ≤ 0` selects the default tolerance `eps·‖T‖`. Returns eigenvalues `w`, their block index
 `iblock`, the block boundaries `isplit`, and `info` (0 on success).
+
+The twelve-argument form is Reference-LAPACK dstebz's own signature: it writes into the caller's
+`w`, `iblock` and `isplit` (each length ≥ n) and allocates nothing, returning the COUNTS instead —
+`m` valid entries in `w`/`iblock`, `nsplit` in `isplit`. Read only `w[1:m]`, `iblock[1:m]` and
+`isplit[1:nsplit]`: everything beyond is stale from a previous call, not zero. The three output
+buffers must not alias `d`, `e` or each other — `isplit` is written while `d`/`e` are still being
+read, and `iblock` is written while the block loop is still walking `isplit`.
 """
 function stebz!(
         range::AbstractChar, order::AbstractChar, vl::T, vu::T, il::Integer, iu::Integer,
-        abstol::Real, d::AbstractVector{T}, e::AbstractVector{T}
+        abstol::Real, d::AbstractVector{T}, e::AbstractVector{T},
+        w::AbstractVector{T}, iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer}
     ) where {T <: Real}
     (range in ('A', 'V', 'I')) || throw(ArgumentError("stebz!: range must be 'A','V','I'"))
     (order in ('B', 'E')) || throw(ArgumentError("stebz!: order must be 'B' or 'E'"))
     n = length(d)
     length(e) >= n - 1 || throw(DimensionMismatch("stebz!: e must have length ≥ n-1"))
+    (length(w) >= n && length(iblock) >= n && length(isplit) >= n) ||
+        throw(DimensionMismatch("stebz!: w, iblock and isplit must each have length ≥ n"))
+    (
+        Base.mightalias(w, d) || Base.mightalias(w, e) ||
+            Base.mightalias(iblock, d) || Base.mightalias(iblock, e) ||
+            Base.mightalias(isplit, d) || Base.mightalias(isplit, e) ||
+            Base.mightalias(w, iblock) || Base.mightalias(w, isplit) ||
+            Base.mightalias(iblock, isplit)
+    ) &&
+        throw(ArgumentError("stebz!: `w`, `iblock` and `isplit` must not alias `d`, `e` or each other"))
     if n == 0
-        return T[], Int[], Int[], 0
+        return 0, 0, 0
     end
     if range == 'V' && vl >= vu
-        return T[], Int[], Int[], 0
+        return 0, 0, 0
     end
     if range == 'I' && (il < 1 || il > iu || iu > n)
         throw(ArgumentError("stebz!: require 1 ≤ il ≤ iu ≤ n"))
@@ -96,18 +118,22 @@ function stebz!(
     rtoli = ulp * relfac
 
     # ── split into decoupled blocks; build squared off-diagonals e2 (0 at splits); pivmin ──────────
-    e2 = zeros(T, max(n - 1, 1))
-    isplit = Int[]
+    # e2's old allocator was `zeros`; the zeroing is NOT load-bearing and the workspace view is undef:
+    # the loop below writes every index 1..n−1 unconditionally on both branches before either reader
+    # (the Gershgorin loop, `_sturm_negcount`) runs, and the only never-written slot — e2[1] at n==1 —
+    # is never read (both readers' loops are empty at n==1).
+    e2, perm, perm2, idx, gw, gi = _stebz_work(T, n)
+    ns = 0
     pivmin = one(T)
     @inbounds for j in 2:n
         t = e[j - 1]^2
         if abs(d[j] * d[j - 1]) * ulp^2 + safmin > t
-            e2[j - 1] = zero(T); push!(isplit, j - 1)      # negligible off-diagonal → split here
+            e2[j - 1] = zero(T); ns += 1; isplit[ns] = j - 1   # negligible off-diagonal → split here
         else
             e2[j - 1] = t; pivmin = max(pivmin, t)
         end
     end
-    push!(isplit, n)
+    ns += 1; isplit[ns] = n
     pivmin *= safmin
 
     # ── global Gershgorin bounds [gl,gu], norm, absolute tolerance atoli ────────────────────────────
@@ -128,10 +154,10 @@ function stebz!(
     # 'A': all; 'V': those in (vl,vu] via per-block Sturm counts at the interval ends; 'I': all here,
     # then sliced to the global index band il:iu below (robust under clustering, where value-boundary
     # bisection can miscount). Blocks emerge in natural order, ascending within block.
-    w = T[]; iblock = Int[]
+    mc = 0
     ibegin = 1
-    @inbounds for (jb, iend) in enumerate(isplit)
-        i1 = ibegin; i2 = iend; ibegin = iend + 1
+    @inbounds for jb in 1:ns
+        i1 = ibegin; i2 = Int(isplit[jb]); ibegin = i2 + 1
         if range == 'V'
             nlo = _sturm_negcount(d, e2, i1, i2, vl, pivmin)
             nhi = _sturm_negcount(d, e2, i1, i2, vu, pivmin)
@@ -140,21 +166,72 @@ function stebz!(
         end
         for kloc in (nlo + 1):nhi
             λ = _sturm_bisect(d, e2, i1, i2, kloc, gl, gu, pivmin, atoli, rtoli)
-            push!(w, λ); push!(iblock, jb)
+            mc += 1; w[mc] = λ; iblock[mc] = jb
         end
     end
 
+    # NOT `sortperm!`, and NOT the default algorithm — both were measured, both are wrong here:
+    #   * Base's default (adaptive) sort allocates a scratch buffer (1888 B at n=129); `QuickSort` is
+    #     fully in-place, and costs no reproducibility because Base's `Perm` ordering breaks ties by
+    #     index itself, so the permutation is identical to the default's whatever the algorithm
+    #     (verified over 200 tie-saturated inputs).
+    #   * `sortperm!` carries an `axes(ix) != axes(A)` guard whose message interpolates an `Any`, so it
+    #     lowers to the despecialized `string(...)` that `juliac --trim=safe` rejects — it failed the
+    #     LAPACK trim-compatibility dogfood. Seeding the identity and sorting under `Perm` is the same
+    #     computation without that guard.
     if range == 'I'                        # keep only the global index band il:iu (ascending)
-        p = sortperm(w)
-        idx = sort(p[Int(il):Int(iu)])     # positions of the wanted eigenvalues (block-major order)
-        w = _stebz_gather(w, idx); iblock = _stebz_gather(iblock, idx)
+        p = view(perm, 1:mc)
+        @inbounds for t in 1:mc
+            p[t] = t
+        end
+        sort!(p, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))
+        # Positions of the wanted eigenvalues, back in block-major (ascending position) order. Invert
+        # p into idx, then compact in place — the compaction target k never runs ahead of the read
+        # cursor t, so each slot is consumed before it is overwritten. O(m), and no second sort (the
+        # obvious `sort!(idx[il:iu])` allocates even under QuickSort).
+        @inbounds for r in 1:mc
+            idx[p[r]] = r
+        end
+        k = 0
+        @inbounds for t in 1:mc
+            r = idx[t]
+            if Int(il) <= r <= Int(iu)
+                k += 1; idx[k] = t
+            end
+        end
+        iv = view(idx, 1:k)
+        _stebz_gather!(gw, w, iv); _stebz_gather!(gi, iblock, iv)
+        @inbounds for t in 1:k
+            w[t] = gw[t]; iblock[t] = gi[t]
+        end
+        mc = k
     end
 
-    if order == 'E' && length(isplit) > 1
-        p = sortperm(w)                    # ascending by value across blocks
-        w = _stebz_gather(w, p); iblock = _stebz_gather(iblock, p)
+    if order == 'E' && ns > 1
+        p2 = view(perm2, 1:mc)             # own field: `perm` above is a different role (lesson 4)
+        @inbounds for t in 1:mc
+            p2[t] = t
+        end
+        sort!(p2, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))  # ascending by value
+        _stebz_gather!(gw, w, p2); _stebz_gather!(gi, iblock, p2)
+        @inbounds for t in 1:mc
+            w[t] = gw[t]; iblock[t] = gi[t]
+        end
     end
-    return w, iblock, isplit, 0
+    return mc, ns, 0
+end
+
+# Allocating convenience form — identical behaviour and return value to the pre-workspace stebz!:
+# `w`/`iblock` trimmed to the m eigenvalues found, `isplit` to the nsplit block boundaries.
+function stebz!(
+        range::AbstractChar, order::AbstractChar, vl::T, vu::T, il::Integer, iu::Integer,
+        abstol::Real, d::AbstractVector{T}, e::AbstractVector{T}
+    ) where {T <: Real}
+    n = length(d)
+    w = Vector{T}(undef, n); iblock = Vector{Int}(undef, n); isplit = Vector{Int}(undef, n)
+    m, ns, info = stebz!(range, order, vl, vu, il, iu, abstol, d, e, w, iblock, isplit)
+    resize!(w, m); resize!(iblock, m); resize!(isplit, ns)
+    return w, iblock, isplit, info
 end
 
 # ── inverse-iteration tridiagonal LU factor/solve (dlagtf / dlagts JOB=-1) ──────────────────────────
@@ -283,31 +360,47 @@ end
 
 """
     stein!(d, e, w, iblock, isplit) -> Z
+    stein!(d, e, w, iblock, isplit, Z) -> Z
 
 Eigenvectors of the real symmetric tridiagonal matrix `(d, e)` for the eigenvalues `w` (with block
 labels `iblock` and split boundaries `isplit` from [`stebz!`](@ref)) by inverse iteration (LAPACK
 `dstein`). Returns `Z` (n × length(w)); column j is the unit eigenvector for `w[j]`. Uses random
 restart and modified-Gram-Schmidt reorthogonalization against near eigenvectors within each block.
 Real-only, matching LAPACK (complex Hermitian eigenvectors back-transform these via `unmtr`).
+
+The six-argument form writes into the caller-provided `Z` (size ≥ n × length(w)) and allocates
+nothing. It ZEROES `Z[1:n, 1:m]` on entry, and that zeroing is load-bearing, not hygiene: only rows
+`b1:bn` of the current split block are ever written, and a tridiagonal eigenvector must be exactly
+zero outside its own block. `Z` must not alias `d`, `e`, `w`, `iblock` or `isplit` — all five are
+read on every column while `Z` is being filled in.
 """
 function stein!(
         d::AbstractVector{T}, e::AbstractVector{T}, w::AbstractVector{T},
-        iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer}
+        iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer},
+        Z::AbstractMatrix{T}
     ) where {T <: Real}
     n = length(d)
     m = length(w)
     length(e) >= n - 1 || throw(DimensionMismatch("stein!: e must have length ≥ n-1"))
-    Z = zeros(T, n, m)
+    (size(Z, 1) >= n && size(Z, 2) >= m) ||
+        throw(DimensionMismatch("stein!: Z must be at least n × length(w)"))
+    (
+        Base.mightalias(Z, d) || Base.mightalias(Z, e) || Base.mightalias(Z, w) ||
+            Base.mightalias(Z, iblock) || Base.mightalias(Z, isplit)
+    ) &&
+        throw(ArgumentError("stein!: `Z` must not alias `d`, `e`, `w`, `iblock` or `isplit`"))
+    @inbounds for j in 1:m, i in 1:n
+        Z[i, j] = zero(T)
+    end
     (m == 0 || n == 0) && return Z
 
     epsm = eps(T)                          # DLAMCH('P')
     odm1 = T(1) / 10; odm3 = T(1) / 1000; ten = T(10)
     maxits = 5; extra = 2
-    seed = Ref(UInt64(0x2545F4914F6CDD1D))  # deterministic restart seed (dstein's ISEED analogue)
 
-    # per-block scratch (max block size ≤ n)
-    av = Vector{T}(undef, n); bv = Vector{T}(undef, n); cv = Vector{T}(undef, n)
-    d2 = Vector{T}(undef, n); inn = Vector{Int}(undef, n); rhs = Vector{T}(undef, n)
+    # per-block scratch (max block size ≤ n) + the deterministic restart seed (dstein's ISEED
+    # analogue), which the accessor resets per call — exactly the old `Ref(…)`-inside-stein! semantics.
+    av, bv, cv, d2, rhs, inn, seed = _stein_work(T, n)
 
     j1 = 1
     nblkmax = 0; @inbounds for x in iblock
@@ -411,6 +504,15 @@ function stein!(
         end
     end
     return Z
+end
+
+# Allocating convenience form — identical behaviour and return value to the pre-workspace stein!
+# (the in-place form does the zeroing the old `zeros(T, n, m)` provided).
+function stein!(
+        d::AbstractVector{T}, e::AbstractVector{T}, w::AbstractVector{T},
+        iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer}
+    ) where {T <: Real}
+    return stein!(d, e, w, iblock, isplit, Matrix{T}(undef, length(d), length(w)))
 end
 
 # tiny local BLAS-1 helpers (keeps this file standalone; T<:Real, unit stride)

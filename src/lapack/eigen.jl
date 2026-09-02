@@ -754,7 +754,7 @@ function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::Abs
     # takes a SEPARATE output buffer by design (the docstring says A is not overwritten), so an
     # aliased call is a caller bug and must not be papered over by copying A internally — that would
     # reintroduce the allocation this method exists to remove.
-    Q === A && throw(ArgumentError("orgtr!: Q must not alias A (netlib overwrites A; this form does not)"))
+    Base.mightalias(Q, A) && throw(ArgumentError("orgtr!: Q must not alias A (netlib overwrites A; this form does not)"))
     fill!(Q, zero(T))                             # load-bearing: the off-diagonal zeros ARE read by the
     @inbounds for i in 1:n                        # block-reflector gemms — a reused Q must be re-zeroed
         Q[i, i] = one(T)
@@ -774,7 +774,7 @@ function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::Abs
     # takes a SEPARATE output buffer by design (the docstring says A is not overwritten), so an
     # aliased call is a caller bug and must not be papered over by copying A internally — that would
     # reintroduce the allocation this method exists to remove.
-    Q === A && throw(ArgumentError("ungtr!: Q must not alias A (netlib overwrites A; this form does not)"))
+    Base.mightalias(Q, A) && throw(ArgumentError("ungtr!: Q must not alias A (netlib overwrites A; this form does not)"))
     fill!(Q, zero(T))
     @inbounds for i in 1:n
         Q[i, i] = one(T)

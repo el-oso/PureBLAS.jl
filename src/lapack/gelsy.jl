@@ -122,7 +122,7 @@ function tzrzf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: BlasFl
     # zlatrz conjugation dance (identity on ℝ, so the real path is dlatrz unchanged): conjugate the
     # reflector row, generate on conj(pivot), store conj(τ) and conj(β); the right-apply then uses the
     # raw larfg τ (= conj(stored τ)) with dlarz/zlarz's ZGERC-conjugated essential.
-    buf = Vector{T}(undef, L + 1)                        # (z)larfg on the (non-contiguous) length-(L+1) row
+    buf = _tzrzf_buf(T, L + 1)                           # (z)larfg on the (non-contiguous) length-(L+1) row
     @inbounds for i in m:-1:1
         buf[1] = conj(A[i, i])
         for l in 1:L
@@ -220,11 +220,10 @@ function gelsy!(
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
     size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsy!, size(B, 1), max(m, n))
     length(jpvt) >= n || _throw_len_jpvt(:gelsy!, n)
-    tau = Vector{T}(undef, mn)
+    tau, xmin, xmax, work = _gelsy_work(T, mn, n)
     geqp3!(A, jpvt, tau)                                 # A·P = Q·R  (rank-revealing)
     # ---- effective rank via the incremental condition estimator (dgelsy loop) ----
     rank = 0
-    xmin = Vector{T}(undef, max(mn, 1)); xmax = Vector{T}(undef, max(mn, 1))
     if mn > 0 && abs(A[1, 1]) != zero(R)
         smax = abs(A[1, 1]); smin = smax
         xmin[1] = one(T); xmax[1] = one(T); rank = 1
@@ -247,7 +246,9 @@ function gelsy!(
         return B, 0
     end
     # ---- complete the orthogonal factorization (RZ) when column-rank-deficient ----
-    tauz = Vector{T}(undef, rank)
+    # EXACT-length view: ormrz! derives k = length(tau) and L = size(A,2) − k, so a longer buffer would
+    # silently change both and corrupt the result.
+    tauz = _gelsy_tauz(T, rank)
     rank < n && tzrzf!(view(A, 1:rank, 1:n), tauz)       # [R11 R12] = [T11 0]·Z
     # ---- B := Qᴴ·B  (dormqr/zunmqr 'Left','Transpose'/'Conjugate'; geqp3 reflectors untouched by RZ) ----
     _apply_Qh!(A, tau, view(B, 1:m, :), mn)
@@ -259,7 +260,6 @@ function gelsy!(
     # ---- B(1:n) := Zᴴ·[Y; 0]  (min-norm lift back through the RZ rotation) ----
     rank < n && ormrz!('L', T <: Complex ? 'C' : 'T', view(A, 1:rank, 1:n), tauz, view(B, 1:n, :))
     # ---- undo the column pivoting: X[jpvt[i]] = computed[i] ----
-    work = Vector{T}(undef, n)
     @inbounds for jc in 1:nrhs
         for i in 1:n
             work[jpvt[i]] = B[i, jc]

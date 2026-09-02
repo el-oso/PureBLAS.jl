@@ -1468,8 +1468,12 @@ function sytrs!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}, B::AbstractV
     size(A, 2) == n || throw(DimensionMismatch("sytrs!: A must be square"))
     size(B, 1) == n || throw(DimensionMismatch("sytrs!: size(B,1) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytrs!: uplo must be 'L' or 'U'"))
-    Bm = B isa AbstractVector ? reshape(B, n, 1) : B
-    uplo == 'L' ? _sytrs_lower!(A, ipiv, Bm, false) : _sytrs_upper!(A, ipiv, Bm, false)
+    # B goes to the kernels AS GIVEN — no `reshape(B, n, 1)` for a vector RHS. The kernels touch B only
+    # through `size(B,2)` (== 1 for a vector), `axes(B,2)` and `B[i,j]`, all legal on an AbstractVector
+    # with a trailing index of 1. The reshape cost 48 B (the Array header) on every vector-RHS call, and
+    # on a `view(B,:,1)` RHS it produced a `Base.ReshapedArray`, i.e. the `Base._throw_dmrs` path that
+    # fails `juliac --trim=safe` (same hazard as trsen.jl:552).
+    uplo == 'L' ? _sytrs_lower!(A, ipiv, B, false) : _sytrs_upper!(A, ipiv, B, false)
     return B
 end
 
@@ -1484,7 +1488,6 @@ function hetrs!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}, B::AbstractV
     size(B, 1) == n || throw(DimensionMismatch("hetrs!: size(B,1) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetrs!: uplo must be 'L' or 'U'"))
     herm = eltype(A) <: Complex
-    Bm = B isa AbstractVector ? reshape(B, n, 1) : B
-    uplo == 'L' ? _sytrs_lower!(A, ipiv, Bm, herm) : _sytrs_upper!(A, ipiv, Bm, herm)
+    uplo == 'L' ? _sytrs_lower!(A, ipiv, B, herm) : _sytrs_upper!(A, ipiv, B, herm)   # see sytrs!
     return B
 end

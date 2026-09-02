@@ -49,15 +49,16 @@ end
 # QR of B, apply Qᴴ to A, and return Q_B (n×n) + R (in the upper triangle of B; strict-lower still holds
 # reflectors, which gghrd! zeros). ct = conjugate-transpose char.
 function _ggev_qrB!(A::AbstractMatrix{T}, B::AbstractMatrix{T}, n::Int, ct::Char) where {T <: Number}
-    tau = zeros(T, n)
+    # No fill! on any of the four: geqrf! writes tau[1:min(m,n)] = tau[1:n] for the square B this path
+    # always passes (qr.jl:467/480 → qr_unblocked!, which assigns tau[i] for every i in 1:k), tauL is
+    # fully written by the loop below, `_ggev_formQ!` opens with its own fill!(Q, 0), and the gemm! runs
+    # beta=0 over all of tmp.
+    tau, tauL, Q, tmp = _ggev_qrb_work(T, n)
     geqrf!(B, tau)
-    tauL = similar(tau)
     @inbounds for i in 1:n
         tauL[i] = _ggev_tauL(tau[i])
     end
-    Q = Matrix{T}(undef, n, n)
     _ggev_formQ!(Q, B, tauL, n)
-    tmp = Matrix{T}(undef, n, n)
     gemm!(tmp, Q, A; transA = ct, transB = 'N', alpha = one(T), beta = zero(T))   # A := Qᴴ·A
     copyto!(A, tmp)
     return Q
@@ -118,78 +119,133 @@ function _ggev_normalize_cmplx!(VR::AbstractMatrix{C}, n::Int) where {C <: Compl
     return VR
 end
 
-# ── ggev core (REAL): returns (alphar, alphai, beta, VR). A/B overwritten (Schur form). ────────────────
+# ── ggev core (REAL), IN-PLACE: every output is caller-provided. A/B overwritten (Schur form). ─────────
+# `VR` doubles as the (unused) Q slot of gghrd!/hgeqz!: both take compq='N', under which `_qz_init_qz!`
+# is a no-op and every Q write is guarded by `ilq`, so the argument is never touched. That removes the
+# three empty placeholder matrices the allocating form used to build, with no workspace field.
+function _ggev_core!(
+        jobvl::Char, jobvr::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alphar::AbstractVector{T}, alphai::AbstractVector{T}, beta::AbstractVector{T},
+        VL::AbstractMatrix{T}, VR::AbstractMatrix{T}
+    ) where {T <: Real}
+    n = size(A, 1)
+    size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
+        throw(DimensionMismatch("ggev!: A and B must be square and the same size"))
+    jobvl === 'N' || throw(ArgumentError("ggev!: left eigenvectors (jobvl='V') not implemented"))
+    (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
+    wantvr = jobvr === 'V'
+    n == 0 && return nothing
+    alphaC = _ggev_cwork(T, n)
+    _ggev_qrB!(A, B, n, 'T')
+    if wantvr
+        gghrd!('N', 'I', A, B, VR, VR)
+        hgeqz!('S', 'N', 'V', A, B, alphaC, beta, VR, VR)
+        tgevc!('R', 'B', A, B, VL, VR)
+    else
+        gghrd!('N', 'N', A, B, VR, VR)
+        hgeqz!('E', 'N', 'N', A, B, alphaC, beta, VR, VR)
+    end
+    @inbounds for i in 1:n
+        alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
+    end
+    wantvr && _ggev_normalize_real!(VR, alphai, n)
+    return nothing
+end
+
+# Allocating form kept verbatim in behaviour and return value — `src/cabi/cabi_lapack.jl:1894` calls it.
 function _ggev_run!(jobvl::Char, jobvr::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
     n = size(A, 1)
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("ggev!: A and B must be square and the same size"))
     jobvl === 'N' || throw(ArgumentError("ggev!: left eigenvectors (jobvl='V') not implemented"))
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
-    wantvr = jobvr === 'V'
     alphar = zeros(T, n); alphai = zeros(T, n); beta = zeros(T, n)
-    VR = Matrix{T}(undef, n, wantvr ? n : 0)
+    VR = Matrix{T}(undef, n, jobvr === 'V' ? n : 0)
     n == 0 && return alphar, alphai, beta, VR
-    alphaC = Vector{Complex{T}}(undef, n)
-    Qd = Matrix{T}(undef, 0, 0)
-    _ggev_qrB!(A, B, n, 'T')
-    if wantvr
-        gghrd!('N', 'I', A, B, Qd, VR)
-        hgeqz!('S', 'N', 'V', A, B, alphaC, beta, Qd, VR)
-        VLd = Matrix{T}(undef, 0, 0)
-        tgevc!('R', 'B', A, B, VLd, VR)
-        @inbounds for i in 1:n
-            alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
-        end
-        _ggev_normalize_real!(VR, alphai, n)
-    else
-        gghrd!('N', 'N', A, B, Qd, Qd)
-        hgeqz!('E', 'N', 'N', A, B, alphaC, beta, Qd, Qd)
-        @inbounds for i in 1:n
-            alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
-        end
-    end
+    _ggev_core!(jobvl, jobvr, A, B, alphar, alphai, beta, VR, VR)
     return alphar, alphai, beta, VR
 end
 
-# ── ggev core (COMPLEX): returns (alpha, beta, VR). ───────────────────────────────────────────────────
-function _ggev_run!(jobvl::Char, jobvr::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Complex}
+# ── ggev core (COMPLEX), IN-PLACE. Same VR-as-dummy-Q argument as the real path. ───────────────────────
+function _ggev_core!(
+        jobvl::Char, jobvr::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alpha::AbstractVector{T}, beta::AbstractVector{T},
+        VL::AbstractMatrix{T}, VR::AbstractMatrix{T}
+    ) where {T <: Complex}
     n = size(A, 1)
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("ggev!: A and B must be square and the same size"))
     jobvl === 'N' || throw(ArgumentError("ggev!: left eigenvectors (jobvl='V') not implemented"))
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
     wantvr = jobvr === 'V'
-    alpha = zeros(T, n); beta = zeros(T, n)
-    VR = Matrix{T}(undef, n, wantvr ? n : 0)
-    n == 0 && return alpha, beta, VR
-    Qd = Matrix{T}(undef, 0, 0)
+    n == 0 && return nothing
     _ggev_qrB!(A, B, n, 'C')
     if wantvr
-        gghrd!('N', 'I', A, B, Qd, VR)
-        hgeqz!('S', 'N', 'V', A, B, alpha, beta, Qd, VR)
-        VLd = Matrix{T}(undef, 0, 0)
-        tgevc!('R', 'B', A, B, VLd, VR)
+        gghrd!('N', 'I', A, B, VR, VR)
+        hgeqz!('S', 'N', 'V', A, B, alpha, beta, VR, VR)
+        tgevc!('R', 'B', A, B, VL, VR)
         _ggev_normalize_cmplx!(VR, n)
     else
-        gghrd!('N', 'N', A, B, Qd, Qd)
-        hgeqz!('E', 'N', 'N', A, B, alpha, beta, Qd, Qd)
+        gghrd!('N', 'N', A, B, VR, VR)
+        hgeqz!('E', 'N', 'N', A, B, alpha, beta, VR, VR)
     end
+    return nothing
+end
+
+function _ggev_run!(jobvl::Char, jobvr::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Complex}
+    n = size(A, 1)
+    size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
+        throw(DimensionMismatch("ggev!: A and B must be square and the same size"))
+    jobvl === 'N' || throw(ArgumentError("ggev!: left eigenvectors (jobvl='V') not implemented"))
+    (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
+    alpha = zeros(T, n); beta = zeros(T, n)
+    VR = Matrix{T}(undef, n, jobvr === 'V' ? n : 0)
+    n == 0 && return alpha, beta, VR
+    _ggev_core!(jobvl, jobvr, A, B, alpha, beta, VR, VR)
     return alpha, beta, VR
 end
 
-# ── gges core (jobvsl='V', jobvsr='V'): Schur form S,P (A,B overwritten) + Schur vectors VSL,VSR. ──────
+# ── gges core (jobvsl='V', jobvsr='V'), IN-PLACE: Schur form S,P (A,B overwritten) + VSL,VSR. ──────────
+function _gges_core!(
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, alpha::AbstractVector{<:Complex},
+        beta::AbstractVector{T}, VSL::AbstractMatrix{T}, VSR::AbstractMatrix{T}
+    ) where {T <: Real}
+    n = size(A, 1)
+    size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
+        throw(DimensionMismatch("gges!: A and B must be square and the same size"))
+    n == 0 && return nothing
+    Qb = _ggev_qrB!(A, B, n, 'T')
+    copyto!(VSL, Qb)                                       # VSL starts as Q_B, gghrd/hgeqz post-multiply Q
+    gghrd!('V', 'I', A, B, VSL, VSR)
+    hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
+    return nothing
+end
+
+function _gges_core!(
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, alpha::AbstractVector{T},
+        beta::AbstractVector{T}, VSL::AbstractMatrix{T}, VSR::AbstractMatrix{T}
+    ) where {T <: Complex}
+    n = size(A, 1)
+    size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
+        throw(DimensionMismatch("gges!: A and B must be square and the same size"))
+    n == 0 && return nothing
+    Qb = _ggev_qrB!(A, B, n, 'C')
+    copyto!(VSL, Qb)
+    gghrd!('V', 'I', A, B, VSL, VSR)
+    hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
+    return nothing
+end
+
+# Allocating forms kept verbatim — `src/cabi/cabi_lapack.jl:1968/1990` call these.
 function _gges_run!(A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
     n = size(A, 1)
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("gges!: A and B must be square and the same size"))
-    alphar = zeros(T, n); alphai = zeros(T, n); beta = zeros(T, n)
+    beta = zeros(T, n)
     VSL = Matrix{T}(undef, n, n); VSR = Matrix{T}(undef, n, n)
     n == 0 && return A, B, Complex{T}[], beta, VSL, VSR
     alphaC = Vector{Complex{T}}(undef, n)
-    Qb = _ggev_qrB!(A, B, n, 'T')
-    copyto!(VSL, Qb)                                       # VSL starts as Q_B, gghrd/hgeqz post-multiply Q
-    gghrd!('V', 'I', A, B, VSL, VSR)
-    hgeqz!('S', 'V', 'V', A, B, alphaC, beta, VSL, VSR)
+    _gges_core!(A, B, alphaC, beta, VSL, VSR)
     return A, B, alphaC, beta, VSL, VSR
 end
 
@@ -200,22 +256,36 @@ function _gges_run!(A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Comp
     alpha = zeros(T, n); beta = zeros(T, n)
     VSL = Matrix{T}(undef, n, n); VSR = Matrix{T}(undef, n, n)
     n == 0 && return A, B, alpha, beta, VSL, VSR
-    Qb = _ggev_qrB!(A, B, n, 'C')
-    copyto!(VSL, Qb)
-    gghrd!('V', 'I', A, B, VSL, VSR)
-    hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
+    _gges_core!(A, B, alpha, beta, VSL, VSR)
     return A, B, alpha, beta, VSL, VSR
+end
+
+# Lesson 9 — `vr`/`vsl`/`vsr` are WRITTEN by gghrd!/hgeqz!/tgevc! while A and B are still being READ and
+# transformed, so an input passed as an output buffer is silent garbage rather than the netlib
+# overwrite-in-place a caller might expect. `vl === vr` / `vsl === vsr` are equally fatal (gghrd!
+# accumulates the LEFT rotations into VSL and the RIGHT ones into VSR simultaneously).
+@inline function _ggev_check_alias(A, B, VL, VR, f::String, nl::String, nr::String)
+    (Base.mightalias(VR, A) || Base.mightalias(VR, B)) && throw(ArgumentError("$f: $nr must not alias A or B"))
+    (Base.mightalias(VL, A) || Base.mightalias(VL, B)) && throw(ArgumentError("$f: $nl must not alias A or B"))
+    Base.mightalias(VL, VR) && throw(ArgumentError("$f: $nl and $nr must be distinct"))
+    return nothing
 end
 
 """
     ggev!(jobvl, jobvr, A, B) -> (alphar, alphai, beta, vl, vr)   [real]
     ggev!(jobvl, jobvr, A, B) -> (alpha, beta, vl, vr)             [complex]
+    ggev!(jobvl, jobvr, A, B, alphar, alphai, beta, vl, vr)        [real, in-place]
+    ggev!(jobvl, jobvr, A, B, alpha, beta, vl, vr)                 [complex, in-place]
 
 Generalized eigenvalues and (optionally) right eigenvectors of the pencil `(A,B)` — `A·x = λ·B·x` with
 `λ = α/β` (LAPACK dggev/zggev). `jobvr='V'` computes right eigenvectors into `vr`, `'N'` skips them.
 `jobvl='V'` (left eigenvectors) is not implemented (throws). For real `A,B`, a complex-conjugate
 eigenvalue pair occupies two consecutive `vr` columns as (real, imag) parts (LAPACK real convention).
 `A` and `B` are overwritten. `vl` is always empty (left vectors unsupported).
+
+The trailing-buffer form writes into the caller's `alphar`/`alphai`/`beta`/`vr` (`alpha`/`beta`/`vr` for
+complex) and allocates nothing; `vl` is accepted and ignored. It throws if `vl`/`vr` alias `A`, `B` or
+each other.
 """
 function ggev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
     alphar, alphai, beta, VR = _ggev_run!(Char(jobvl), Char(jobvr), A, B)
@@ -226,13 +296,43 @@ function ggev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B
     return alpha, beta, Matrix{T}(undef, size(A, 1), 0), VR
 end
 
+function ggev!(
+        jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alphar::AbstractVector{T}, alphai::AbstractVector{T}, beta::AbstractVector{T},
+        vl::AbstractMatrix{T}, vr::AbstractMatrix{T}
+    ) where {T <: Real}
+    _ggev_check_alias(A, B, vl, vr, "ggev!", "vl", "vr")
+    n = size(A, 1)
+    (length(alphar) == n && length(alphai) == n && length(beta) == n) ||
+        throw(DimensionMismatch("ggev!: alphar, alphai, beta must have length n"))
+    _ggev_core!(Char(jobvl), Char(jobvr), A, B, alphar, alphai, beta, vl, vr)
+    return alphar, alphai, beta, vl, vr
+end
+function ggev!(
+        jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alpha::AbstractVector{T}, beta::AbstractVector{T},
+        vl::AbstractMatrix{T}, vr::AbstractMatrix{T}
+    ) where {T <: Complex}
+    _ggev_check_alias(A, B, vl, vr, "ggev!", "vl", "vr")
+    n = size(A, 1)
+    (length(alpha) == n && length(beta) == n) ||
+        throw(DimensionMismatch("ggev!: alpha and beta must have length n"))
+    Base.mightalias(alpha, beta) && throw(ArgumentError("ggev!: alpha and beta must be distinct"))
+    _ggev_core!(Char(jobvl), Char(jobvr), A, B, alpha, beta, vl, vr)
+    return alpha, beta, vl, vr
+end
+
 """
     gges!(jobvsl, jobvsr, A, B) -> (A, B, alpha, beta, vsl, vsr)
+    gges!(jobvsl, jobvsr, A, B, alpha, beta, vsl, vsr)   [in-place]
 
 Generalized Schur decomposition of the pencil `(A,B)` (LAPACK dgges/zgges): `A`→`S`, `B`→`P` (generalized
 Schur form, `A₀ = vsl·S·vsrᴴ`, `B₀ = vsl·P·vsrᴴ`), `alpha`/`beta` the generalized eigenvalues (`λ=α/β`,
 `alpha` complex), and the Schur vectors `vsl`/`vsr`. Only `jobvsl=jobvsr='V'` is supported (what `schur(A,B)`
 requests); other values fall back to computing both sets of vectors. `A` and `B` are overwritten.
+
+The trailing-buffer form writes into the caller's `alpha`/`beta`/`vsl`/`vsr` and allocates nothing. It
+throws if `vsl`/`vsr` alias `A`, `B` or each other.
 """
 function gges!(jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
     S, P, alphaC, beta, VSL, VSR = _gges_run!(A, B)
@@ -241,4 +341,30 @@ end
 function gges!(jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Complex}
     S, P, alpha, beta, VSL, VSR = _gges_run!(A, B)
     return S, P, alpha, beta, VSL, VSR
+end
+
+function gges!(
+        jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alpha::AbstractVector{<:Complex}, beta::AbstractVector{T},
+        vsl::AbstractMatrix{T}, vsr::AbstractMatrix{T}
+    ) where {T <: Real}
+    _ggev_check_alias(A, B, vsl, vsr, "gges!", "vsl", "vsr")
+    n = size(A, 1)
+    (length(alpha) == n && length(beta) == n) ||
+        throw(DimensionMismatch("gges!: alpha and beta must have length n"))
+    _gges_core!(A, B, alpha, beta, vsl, vsr)
+    return A, B, alpha, beta, vsl, vsr
+end
+function gges!(
+        jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        alpha::AbstractVector{T}, beta::AbstractVector{T},
+        vsl::AbstractMatrix{T}, vsr::AbstractMatrix{T}
+    ) where {T <: Complex}
+    _ggev_check_alias(A, B, vsl, vsr, "gges!", "vsl", "vsr")
+    n = size(A, 1)
+    (length(alpha) == n && length(beta) == n) ||
+        throw(DimensionMismatch("gges!: alpha and beta must have length n"))
+    Base.mightalias(alpha, beta) && throw(ArgumentError("gges!: alpha and beta must be distinct"))
+    _gges_core!(A, B, alpha, beta, vsl, vsr)
+    return A, B, alpha, beta, vsl, vsr
 end
