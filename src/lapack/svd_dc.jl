@@ -876,6 +876,16 @@ end
 # scratch make this allocation-free.
 function bdsdc!(
         d::AbstractVector{Float64}, e::AbstractVector{Float64},
+        Lvec::AbstractMatrix{Float64}, Rvec::AbstractMatrix{Float64}
+    )
+    ws = _svdws()
+    _svd_grow_dc!(ws, length(d))
+    bdsdc!(d, e, Lvec, Rvec, ws)
+    return d                                     # singular values, written in place (ascending → see _dc!)
+end
+
+function bdsdc!(
+        d::AbstractVector{Float64}, e::AbstractVector{Float64},
         Lvec::AbstractMatrix{Float64}, Rvec::AbstractMatrix{Float64}, ws::SVDWorkspace{Float64}
     )
     n = length(d)

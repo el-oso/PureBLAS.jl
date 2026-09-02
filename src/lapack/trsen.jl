@@ -563,7 +563,7 @@ function _dtrsen!(
             nn = n1 * n2
             _, T11, T22, Xm = _trsen_work(R, n1, n2)   # all three fully overwritten before any read
             copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
-            scref = Ref(ONE)
+            scref = _trsen_sc(R); scref[1] = ONE   # owned 1-slot carrier, not a per-call Ref (16 B)
             # `_lacn2_estimate` hands the closure an owned-workspace VIEW, and `reshape(::SubArray, …)`
             # goes through Base `_reshape` → `_throw_dmrs`, whose 8-piece eagerly-interpolated message
             # despecialises to `print_to_string(::String, ::Vararg{Any})` and fails `--trim=safe`
@@ -577,12 +577,12 @@ function _dtrsen!(
                 _, sc, _ = kase == 1 ? _dtrsyl!('N', 'N', -1, T11, T22, Xm) :
                     _dtrsyl!('T', 'T', -1, T11, T22, Xm)
                 copyto!(xv, Xm)
-                scref[] = sc
+                scref[1] = sc
                 return nothing
             end
             # estimate ‖L⁻¹‖₁ of the Sylvester operator; SEP = scale/est (cancels trsyl's scaling)
             est = _lacn2_estimate(nn, apply!, R)
-            sep = est == ZERO ? ZERO : scref[] / est
+            sep = est == ZERO ? ZERO : scref[1] / est
         end
     end
     _diag_eigs!(w, T)
@@ -634,17 +634,18 @@ function _ztrsen!(
             nn = n1 * n2
             _, T11, T22, Xm = _trsen_work(C, n1, n2)   # see the _dtrsen! comment: no reshape(::SubArray)
             copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
-            scref = Ref(one(R))
+            # Owned 1-slot carrier (Vector{C}); the scale is real, so it rides as C and reads back `real`.
+            scref = _trsen_sc(C); scref[1] = one(C)
             apply! = function (xv, kase)
                 copyto!(Xm, xv)
                 _, sc, _ = kase == 1 ? _ztrsyl!('N', 'N', -1, T11, T22, Xm) :
                     _ztrsyl!('C', 'C', -1, T11, T22, Xm)
                 copyto!(xv, Xm)
-                scref[] = sc
+                scref[1] = C(sc)
                 return nothing
             end
             est = _lacn2_estimate(nn, apply!, C)
-            sep = est == zero(R) ? zero(R) : scref[] / est
+            sep = est == zero(R) ? zero(R) : real(scref[1]) / est
         end
     end
     _diag_eigs!(w, T)

@@ -374,6 +374,11 @@ mutable struct L3Workspace{T}
                           # no signature change. THE ACCESSOR RESETS IT TO `_STEIN_SEED0` ON EVERY CALL —
                           # see there; owning it removes the 16 B per-call RefValue without turning
                           # stein! into a stateful RNG.
+    trsensc::Vector{T}    # _trsen_sc: 1-element carrier for the scale `_dtrsyl!`/`_ztrsyl!` returns through
+                          # the `_lacn2_estimate` reverse-communication closure. Was a per-call `Ref(ONE)`,
+                          # the whole of trsen!'s measured 16 B/call at job ∈ {'V','B'}. A Vector{T}, not a
+                          # RefValue{real(T)}: the struct carries one type parameter, and the scale is always
+                          # REAL, so the complex path stores it as T (zero imaginary) and reads back `real`.
 end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
@@ -448,6 +453,7 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     T[], Int[], Int[], Int[], T[], Int[],            # stbe2, stbperm, stbperm2, stbidx, stbgw, stbgi
     T[], T[], T[], T[], T[], Int[],                  # stnav, stnbv, stncv, stnd2, stnrhs, stninn
     Ref(_STEIN_SEED0),                               # stnseed (reset per call by _stein_work)
+    T[],                                             # trsensc
 )
 
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -1016,6 +1022,14 @@ function _trsen_work(::Type{T}, n1::Int, n2::Int) where {T}
     ws.trsenx = _wsgrow(ws.trsenx, n1, n2)
     return view(ws.trsenr, 1:n1, 1:n2), view(ws.trsen11, 1:n1, 1:n1),
            view(ws.trsen22, 1:n2, 1:n2), view(ws.trsenx, 1:n1, 1:n2)
+end
+
+# 1-element scale carrier for trsen!'s `_lacn2_estimate` closure — see the `trsensc` field comment. The
+# caller seeds slot 1 before the estimate; the closure overwrites it on every kase.
+function _trsen_sc(::Type{T}) where {T}
+    ws = _l3ws(T)
+    ws.trsensc = _wsgrow(ws.trsensc, 1)
+    return ws.trsensc
 end
 
 # ── Bunch–Kaufman inverse ───────────────────────────────────────────────────────────────────────────

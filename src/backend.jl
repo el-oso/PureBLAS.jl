@@ -370,6 +370,7 @@ end
 @inline hseqr!(::SIMDBackend, job::AbstractChar, compz::AbstractChar, H::AbstractMatrix, ilo::Integer, ihi::Integer, w::AbstractVector, Z::AbstractMatrix)::Integer = hseqr!(job, compz, H, ilo, ihi, w, Z)
 @inline trevc!(::SIMDBackend, side::AbstractChar, howmny::AbstractChar, Ts::AbstractMatrix, VL::AbstractMatrix, VR::AbstractMatrix)::AbstractMatrix = trevc!(side, howmny, Ts, VL, VR)
 @inline trexc!(::SIMDBackend, compq::AbstractChar, Ts::AbstractMatrix, Q::AbstractMatrix, ifst::Integer, ilst::Integer)::Tuple = trexc!(compq, Ts, Q, ifst, ilst)
+@inline trsen!(::SIMDBackend, job::AbstractChar, compq::AbstractChar, select::AbstractVector, Ts::AbstractMatrix, Q::AbstractMatrix, w::AbstractVector)::Tuple = trsen!(job, compq, select, Ts, Q, w)
 @inline trsyl!(::SIMDBackend, transa::AbstractChar, transb::AbstractChar, isgn::Integer, A::AbstractMatrix, B::AbstractMatrix, C::AbstractMatrix)::Tuple = trsyl!(transa, transb, isgn, A, B, C)
 @inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, wr::AbstractVector, wi::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, wr, wi, VL, VR, scale)
 @inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, w::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, w, VL, VR, scale)
@@ -398,6 +399,8 @@ end
 
 # ── SVD front-half / generalized SVD. `bdsqr!` gets two methods: the real 4-argument form the contract
 # declares, and the complex 6-argument form, which is a separate kernel at a different arity.
+@inline gebrd!(::SIMDBackend, A::AbstractMatrix, d::AbstractVector, e::AbstractVector, tauq::AbstractVector, taup::AbstractVector)::AbstractMatrix = gebrd!(A, d, e, tauq, taup)
+@inline bdsdc!(::SIMDBackend, d::AbstractVector, e::AbstractVector, Lvec::AbstractMatrix, Rvec::AbstractMatrix)::AbstractVector = bdsdc!(d, e, Lvec, Rvec)
 @inline gebd2!(::SIMDBackend, A::AbstractMatrix, d::AbstractVector, e::AbstractVector, tauq::AbstractVector, taup::AbstractVector)::AbstractMatrix = gebd2!(A, d, e, tauq, taup)
 @inline bdsqr!(::SIMDBackend, d::AbstractVector, e::AbstractVector, U::Union{Nothing, AbstractMatrix}, V::Union{Nothing, AbstractMatrix})::AbstractVector = bdsqr!(d, e, U, V)
 @inline bdsqr!(::SIMDBackend, uplo::AbstractChar, d::AbstractVector, e::AbstractVector, Vt::AbstractMatrix, U::AbstractMatrix, C::AbstractMatrix)::Tuple = bdsqr!(uplo, d, e, Vt, U, C)
