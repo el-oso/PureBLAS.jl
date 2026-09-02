@@ -2058,8 +2058,9 @@ end
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 # ── gbtrf / gbtrs: general banded LU with partial pivoting (real+complex) ───────────────────────────────
-# {s,d,c,z}gbtrf_64_(m, n, kl, ku, AB, ldab, ipiv, info) — 0 chars. ipiv OUT (length min(m,n)); the
-# kernel allocates its own ipiv internally (gbtrf!(kl,ku,m,AB)->(AB,ipiv,info)), copied to the caller's.
+# {s,d,c,z}gbtrf_64_(m, n, kl, ku, AB, ldab, ipiv, info) — 0 chars. ipiv OUT (length min(m,n)). Routed
+# through the IN-PLACE `gbtrf!(kl,ku,m,AB,ipiv)` so the kernel pivots straight into the caller's buffer:
+# no interior Vector{Int} and no copy-back loop. (Was the 4-arg convenience form, which allocated.)
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "gbtrf_64_"))(
             m::Ptr{Int64}, n::Ptr{Int64}, kl::Ptr{Int64},
@@ -2068,11 +2069,8 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); KL = Int(unsafe_load(kl)); KU = Int(unsafe_load(ku))
         LD = Int(unsafe_load(ldab))
         ABm = PtrMatrix(AB, LD, N, LD)
-        _, ipv, inf = gbtrf!(KL, KU, M, ABm)
         ip = PtrVector(ipiv, min(M, N))
-        @inbounds for i in eachindex(ipv)
-            ip[i] = Int64(ipv[i])
-        end
+        _, _, inf = gbtrf!(KL, KU, M, ABm, ip)
         unsafe_store!(info, Int64(inf)); return
     end
 end

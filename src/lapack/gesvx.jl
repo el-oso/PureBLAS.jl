@@ -82,7 +82,10 @@ function _gerfs!(
     safe1 = (n + 1) * sfmin; safe2 = safe1 / epsm
     notran = trans == 'N'
     opel(i, k) = notran ? A[i, k] : (trans == 'T' ? A[k, i] : conj(A[k, i]))  # op(A)[i,k]
-    r = Vector{T}(undef, n); wrk = Vector{Tr}(undef, n); dx = Vector{T}(undef, n)
+    # Owned scratch (workspace.jl) so gesvx!'s refinement step allocates nothing. All three are fully
+    # written per RHS column before being read (r and wrk in the residual loop, dx by the getrs! solve),
+    # so reuse across calls and across columns carries nothing stale.
+    r, wrk, dx = _gerfs_work(T, n)
     @inbounds for j in 1:nrhs
         x = view(X, :, j); b = view(B, :, j)
         lstres = Tr(3)
@@ -170,21 +173,28 @@ _amax(A) = (
 )
 
 """
+    gesvx!(fact, trans, A, AF, ipiv, equed, R, C, B, X, ferr, berr) -> (X, equed, rcond, ferr, berr, rpgf)
     gesvx!(fact, trans, A, AF, ipiv, equed, R, C, B) -> (X, equed, rcond, ferr, berr, rpgf)
 
 Expert general solver (LAPACK `gesvx`). `fact ∈ {'F','N','E'}` (factored/notyet/equilibrate),
 `trans ∈ {'N','T','C'}`. Optionally equilibrates (`equed`), LU-factors into `AF`/`ipiv`, solves,
 iteratively refines, and returns error bounds + reciprocal condition number `rcond` and reciprocal
 pivot growth `rpgf`. `A`, `AF`, `ipiv`, `R`, `C`, `B` may be modified in place. Generic over s/d/c/z.
+
+The first form is the IN-PLACE one, mirroring `getrf!(A, ipiv)` / `gbtrf!(kl, ku, m, AB, ipiv)`: the
+caller supplies X (n×nrhs), ferr and berr — Netlib's `DGESVX` OUT arguments — so the driver honours
+its `!` and never allocates them. The second allocates the three and delegates.
 """
 function gesvx!(
         fact::Char, trans::Char, A::AbstractMatrix{T}, AF::AbstractMatrix{T},
         ipiv::AbstractVector{<:Integer}, equed::Char, R::AbstractVector{Tr},
-        C::AbstractVector{Tr}, B::AbstractMatrix{T}
+        C::AbstractVector{Tr}, B::AbstractMatrix{T}, X::AbstractMatrix{T},
+        ferr::AbstractVector{Tr}, berr::AbstractVector{Tr}
     ) where {T <: BlasFloat, Tr <: Real}
     n = size(A, 1); nrhs = size(B, 2)
-    X = Matrix{T}(undef, n, nrhs)
-    ferr = Vector{Tr}(undef, nrhs); berr = Vector{Tr}(undef, nrhs)
+    size(X) == (n, nrhs) || throw(DimensionMismatch("gesvx!: size(X) ≠ (size(A,1), size(B,2))"))
+    length(ferr) >= nrhs || throw(DimensionMismatch("gesvx!: length(ferr) < size(B,2)"))
+    length(berr) >= nrhs || throw(DimensionMismatch("gesvx!: length(berr) < size(B,2)"))
     n == 0 && return X, equed, one(Tr), ferr, berr, one(Tr)
 
     # 1) equilibrate (fact='E'): compute R,C, scale A, choose equed.
@@ -257,4 +267,18 @@ function gesvx!(
         end
     end
     return X, equed, rcond, ferr, berr, rpgf
+end
+
+# Convenience: allocate X/ferr/berr and delegate. The arity and the 6-tuple are load-bearing (the
+# C-ABI shims in cabi_lapack3.jl destructure them).
+function gesvx!(
+        fact::Char, trans::Char, A::AbstractMatrix{T}, AF::AbstractMatrix{T},
+        ipiv::AbstractVector{<:Integer}, equed::Char, R::AbstractVector{Tr},
+        C::AbstractVector{Tr}, B::AbstractMatrix{T}
+    ) where {T <: BlasFloat, Tr <: Real}
+    n = size(A, 1); nrhs = size(B, 2)
+    return gesvx!(
+        fact, trans, A, AF, ipiv, equed, R, C, B, Matrix{T}(undef, n, nrhs),
+        Vector{Tr}(undef, nrhs), Vector{Tr}(undef, nrhs)
+    )
 end

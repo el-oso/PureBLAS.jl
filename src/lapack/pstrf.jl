@@ -147,7 +147,9 @@ function _pstrf_blocked!(
     # unit-stride instead of striding A by lda. Carved out of the caller's owned `scr` (GKH) rather
     # than allocated here — scr is sized nb + 2n for exactly this.
     rowb = LOWER ? view(scr, 1:0) : view(scr, (nb + n + 1):(nb + 2n))
-    swj = Vector{Int}(undef, nb); swp = Vector{Int}(undef, nb)   # deferred leading row swaps (LOWER)
+    # Deferred leading row swaps (LOWER). Owned like `scr` above — two DISJOINT views of one Int buffer,
+    # so `pstrf!` allocates nothing. Both are fully written before being read on each `k` iteration.
+    swj, swp = _pstrf_swaps(T, nb)
     @inbounds for k in 1:nb:n
         jb = min(nb, n - k + 1)
         nsw = 0
@@ -317,7 +319,12 @@ function pstrf!(A::AbstractMatrix{T}, piv::AbstractVector{<:Integer}, tol::Real;
     @inbounds for i in 1:n
         piv[i] = i
     end
-    work = zeros(R, 2n)                                          # work[1:n] running dot products; [n+1:2n] scratch
+    work = _pstrf_work(T, n)                                     # work[1:n] running dot products; [n+1:2n] scratch
+    # MUST be zeroed: the unblocked path below reads work[i] at j=1 (`work[n+i] = real(A[i,i]) - work[i]`)
+    # before ever writing it, so the running dot products have to START at zero. The owned buffer carries
+    # the previous call's values. (The blocked driver resets work[k:n] per panel, but this is O(n) against
+    # an O(n³) factorization — one fill! covers both paths.)
+    fill!(work, zero(R))
     # Initial pivot = largest diagonal.
     pvt = 1; ajj = real(@inbounds A[1, 1])
     @inbounds for i in 2:n
@@ -336,7 +343,7 @@ function pstrf!(A::AbstractMatrix{T}, piv::AbstractVector{<:Integer}, tol::Real;
     # (identical algorithm — with k=1 the panel spans the full history and the swap deferral is a no-op).
     nb = min(_pstrf_nb(n), n)
     if T <: Union{BlasReal, BlasComplex}
-        scr = Vector{T}(undef, nb + 2n)     # +n: UPPER contiguous row cache (see rowb in _pstrf_blocked!)
+        scr = _pstrf_scr(T, nb + 2n)        # +n: UPPER contiguous row cache (see rowb in _pstrf_blocked!)
         rank = if lower
             _pstrf_blocked!(A, piv, work, scr, dstop, pvt, ajj, nb, Val(true))
         else

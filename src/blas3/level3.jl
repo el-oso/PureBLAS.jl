@@ -3984,7 +3984,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
             (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _trsm_ncut_r()) &&
             (size(B, 1) > _trsm_ncut_r() || (k > _trsm_dbase() && size(B, 1) >= _trsm_r_mfloor(k)))
-        Ar = A
+        # (No `Ar = A` seed here any more: it was dead once every arm gained its own `return`, and while
+        # dead it still gave the `Ar` slot a second type, which is the whole cause of the boxing below.)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
         # to the leaf VERBATIM at the caller's lda. For a square gate operand that is lda = k, and at
         # k=128 the byte stride is 1024 = a quarter L1 way period, which puts A's columns on the same
@@ -4030,12 +4031,26 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # observation. Consequence: Zen4 now never pads, which is byte-identical to its pre-change
         # behaviour — the 0.958 → 0.944 seen on one Zen4 gate run was drift, not this change.
         # _EXP10 INVERTED: set true to DISABLE the pad, so the shipped arm stays A/B-able in-process.
+        # Each arm calls the leaf DIRECTLY rather than assigning a shared `Ar` first. `Ar` used to take
+        # three different types here — `A` (whatever the caller passed), `view(S,…)`, and the `_trsm_rrefl`
+        # view — making it a union-typed local. With `A::Matrix` the union split and cost nothing; with
+        # `A::SubArray` it BOXED, allocating one 64 B SubArray per call and silently breaking the
+        # allocation-free half of trsm!'s strict contract for every caller that passes views (found via
+        # pptrf!'s owned-workspace panels, which do exactly that). `@verify_strict` had not caught it
+        # because it exercised `Matrix` arguments only. Splitting the branches keeps each call site
+        # concretely typed; the leaf simply specializes per arm, which is what union-splitting was doing
+        # on the Matrix path anyway.
+        _rfuse = _alias_ld(stride(B, 2)) && k > _trsm_dbase()
         if tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
-            S = _trsm_rpack(Float64, k, k)
+            # `_trsm_rpad`, NOT `_trsm_rpack`: `S` is held across `_trsm_rl_fused_drv!`, which takes
+            # `rpack` again for its own solve scratch (`scratch=true`, level3.jl:3929). Same field, same
+            # base pointer, same ld ⇒ the leaf writes the solution over the coefficients it is reading —
+            # whenever the second claim does not realloc (mc0 ≤ k). See the `rpad` comment in workspace.jl.
+            S = _trsm_rpad(Float64, k, k)
             @inbounds for c in 1:k, r in c:k          # lower triangle only — the leaf reads nothing above it
                 S[r, c] = A[r, c]
             end
-            Ar = view(S, 1:k, 1:k)
+            return _trsm_rl_fused_drv!(view(S, 1:k, 1:k), B, k, !tr, _rfuse)
         end
         if !tr
             Ar = _trsm_rrefl(Float64, k)
@@ -4047,8 +4062,9 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             @inbounds for c in 1:k, r in c:k
                 Ar[r, c] = A[k + 1 - c, k + 1 - r]
             end
+            return _trsm_rl_fused_drv!(Ar, B, k, !tr, _rfuse)
         end
-        return _trsm_rl_fused_drv!(Ar, B, k, !tr, _alias_ld(stride(B, 2)) && k > _trsm_dbase())
+        return _trsm_rl_fused_drv!(A, B, k, !tr, _rfuse)
     end
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
@@ -4326,7 +4342,9 @@ function trsm!(
     if sl && _strided1(B) && size(B, 1) == k && 1 < size(B, 2) < _vwidth(eltype(B)) &&
             eltype(B) <: BlasFloat
         nr = size(B, 2); w = _vwidth(eltype(B))
-        Bw = _trsm_tmp(eltype(B), k, w)                      # GKH-owned (L3Workspace), grows
+        # `_trsm_widen`, NOT `_trsm_tmp`: `Bv` below is held across the `_trsm!` call, whose complex
+        # path takes `trsm_tmp` for `_trtri!`'s output and would overwrite this staged RHS.
+        Bw = _trsm_widen(eltype(B), k, w)                    # GKH-owned (L3Workspace), grows
         Bv = view(Bw, 1:k, 1:w)
         @inbounds copyto!(view(Bv, :, 1:nr), B)
         @inbounds fill!(view(Bv, :, (nr + 1):w), zero(eltype(B)))
@@ -6033,8 +6051,24 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
         for ib in 1:NB:n
             ihi = min(ib + NB - 1, n)
             if ib == jb                                   # diagonal tile: straddles both triangles
-                for j in jb:jhi, i in ib:ihi
-                    Ad[i, j] = _symstored(up, i, j) ? A[i, j] : (herm ? conj(A[j, i]) : A[j, i])
+                # The stored/mirrored split is a SINGLE crossing per column (at i == j), so walk two
+                # contiguous runs instead of testing `_symstored` on every element — same move as the
+                # branch-free β-prescale above. `ib == jb` ⇒ `ihi == jhi`, so `j` always lies in
+                # `ib:ihi` and the run endpoints need no clamping; both `up ?` picks are loop-invariant
+                # and hoist. Measured on this tile (Zen4, verified freq lock, duplicated-anchor null
+                # control at 0.4%): 0.678 / 0.860 / 0.977 of the per-element branch at n = 64/128/256.
+                # `ifelse` was measured too and is WORSE — it inverts to 1.048 at n=256, because LLVM
+                # already partly if-converts this branch (14 → 21 cmov/blend, same jump count). Deleting
+                # the test beats predicating it; see kb/findings/ifelse-branchless-mostly-not-applicable.
+                for j in jb:jhi
+                    s0, s1 = up ? (ib, j) : (j, ihi)          # rows read from A's stored triangle
+                    m0, m1 = up ? (j + 1, ihi) : (ib, j - 1)  # rows mirrored from the other triangle
+                    @simd for i in s0:s1
+                        Ad[i, j] = A[i, j]
+                    end
+                    @simd for i in m0:m1
+                        Ad[i, j] = herm ? conj(A[j, i]) : A[j, i]
+                    end
                 end
             elseif _symstored(up, ib, jb)                 # wholly stored: contiguous column runs
                 for j in jb:jhi

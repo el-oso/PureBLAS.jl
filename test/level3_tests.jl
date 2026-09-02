@@ -168,3 +168,76 @@ end
         @test norm(X - R) <= 1.0e-10 * (norm(R) + 1)
     end
 end
+
+# Regression: the side-L ragged-column-tail arm (level3.jl, the `1 < nrhs < _vwidth` widening branch)
+# used to stage B into the SAME owned buffer that the complex `_trsm!` path takes for `_trtri!`'s
+# output. `_trtri!` then wrote A⁻¹ over the staged right-hand side and trsm! returned garbage —
+# measured relative error ~1.0, not a rounding difference.
+#
+# Two properties made it invisible to the existing tests, and both are why this item is shaped the way
+# it is. It needs nrhs STRICTLY BETWEEN 1 and `_vwidth(T)` (so ComplexF32 with its 8 lanes, nrhs 2..7 —
+# the common nrhs=1 and nrhs≥8 both miss it), and it is HISTORY-DEPENDENT on the scratch buffer's grown
+# size: nrhs=5/transA='T' was correct on the first call and wrong on the second. So each case is solved
+# TWICE against the same oracle, and a single-call check would not have caught the original bug.
+@testitem "trsm! side-L ragged column tail does not alias the trtri scratch (both calls)" begin
+    using PureBLAS, LinearAlgebra
+    for T in (ComplexF32, ComplexF64, Float32, Float64)
+        w = PureBLAS._vwidth(T)
+        w <= 2 && continue
+        for k in (32, 48), nrhs in 2:min(w - 1, 6), tA in ('N', 'T', 'C')
+            T <: Real && tA == 'C' && continue
+            A = tril(randn(T, k, k)) + T(k) * I
+            B0 = randn(T, k, nrhs)
+            opA = tA == 'N' ? A : (tA == 'T' ? transpose(A) : adjoint(A))
+            oracle = opA \ B0
+            tol = (T <: Union{Float32, ComplexF32}) ? 1.0f-3 : 1e-9
+            for rep in 1:2                      # the 2nd call is the one that used to corrupt
+                B = copy(B0)
+                PureBLAS.trsm!(B, A; side = 'L', uplo = 'L', transA = tA, diag = 'N', alpha = one(T))
+                @test isapprox(B, oracle; rtol = tol)
+            end
+        end
+    end
+end
+
+# Regression: the side-R pad arm (level3.jl, the `_potrf_needs_pad` branch of `_trsm_right!`) copied A's
+# lower triangle into `_trsm_rpack`'s buffer and then held that view ACROSS `_trsm_rl_fused_drv!`, which
+# claims `_trsm_rpack` AGAIN as its own solve scratch (`scratch=true`). Same field, same base pointer, so
+# the leaf wrote the solution over the coefficients it was still reading. Fixed by the `rpad` /
+# `_trsm_rpad` field split — same shape, and same fix, as the `trsmw` bug above.
+#
+# Two properties shape this item. (1) The arm is gated on `_RL_MR_LIVE > _NVREG` — the leaf only spills,
+# and so only pays for the de-aliasing copy, on a 16-register AVX2 file (18 > 16); with AVX-512's 32 it is
+# DEAD CODE. This item therefore cannot execute the bug on an AVX-512 box and says so via @test_skip
+# instead of passing vacuously. (2) Like `trsmw` it is history-dependent: the inner claim asks for
+# mc0 = max(_vwidth, (_L2_BYTES÷2)÷(k·8)) rows, which on a 512 KiB-L2 part exceeds the outer claim and
+# REALLOCATES on the first call — only the second call finds the buffer already grown and aliases. Hence
+# two solves per shape; a single-call check would not have caught it.
+@testitem "trsm! side-R pad arm does not alias the fused-leaf scratch (AVX2 only)" begin
+    using PureBLAS, LinearAlgebra
+    if PureBLAS._RL_MR_LIVE <= PureBLAS._NVREG
+        @info "side-R pad arm is dead on this CPU — it needs a spilling leaf (_RL_MR_LIVE > _NVREG), \
+            true only on a 16-register AVX2 file. No runtime test can reach the branch here; the static \
+            guard is test/workspace_lint_tests.jl." _RL_MR_LIVE = PureBLAS._RL_MR_LIVE _NVREG = PureBLAS._NVREG
+        @test_skip PureBLAS._RL_MR_LIVE > PureBLAS._NVREG
+    else
+        # Shapes DERIVED from the guards, not hardcoded, so this reaches the arm on any AVX2 box:
+        # `_potrf_needs_pad` wants lda·8 a multiple of a quarter L1 way and k ≥ 128; `_alias_ld` (which
+        # selects the aliasing `scratch=true` leaf) wants ldb a multiple of a whole L1 way in doubles.
+        ks = max(1, PureBLAS._L1_WAY_BYTES >> 5)          # lda granularity, in Float64 elements
+        k = ks * cld(128, ks)
+        m = PureBLAS._L1_WAY_D
+        A = tril(randn(k, k)) + k * I
+        B0 = randn(m, k)
+        # Witnesses: assert the branch is actually reached before trusting the numbers below.
+        @test PureBLAS._potrf_needs_pad(A, k)
+        @test PureBLAS._alias_ld(stride(B0, 2))
+        @test k > PureBLAS._trsm_dbase() && k <= PureBLAS._trsm_r_fuse() && m > PureBLAS._trsm_ncut_r()
+        oracle = B0 / transpose(A)
+        for rep in 1:2                                     # the 2nd call is the one that used to corrupt
+            B = copy(B0)
+            PureBLAS.trsm!(B, A; side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = 1.0)
+            @test isapprox(B, oracle; rtol = 1.0e-9)
+        end
+    end
+end
