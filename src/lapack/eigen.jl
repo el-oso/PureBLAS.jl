@@ -746,6 +746,15 @@ function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::Abs
     uplo === 'L' || throw(ArgumentError("orgtr!: only uplo='L' is implemented"))
     n = size(A, 1)
     size(Q) == (n, n) || throw(DimensionMismatch("orgtr!: size(Q) ≠ (size(A,1), size(A,1))"))
+    # Q MUST NOT ALIAS A. Netlib's DORGTR/ZUNGTR overwrite A with Q, so `orgtr!('L', A, tau, A)` is
+    # exactly what a caller migrating from LAPACK writes — and it is the one call that silently
+    # produces garbage here: `fill!(Q, ...)` below destroys the reflectors stored in A before
+    # `_ormtr!` reads them. Measured with genuine sytrd/hetrd reflectors at n=64: a distinct Q gives
+    # ‖Q'Q − I‖ = 2e-15, the aliased call gives 1.0, with no error raised. Throw instead: this form
+    # takes a SEPARATE output buffer by design (the docstring says A is not overwritten), so an
+    # aliased call is a caller bug and must not be papered over by copying A internally — that would
+    # reintroduce the allocation this method exists to remove.
+    Q === A && throw(ArgumentError("orgtr!: Q must not alias A (netlib overwrites A; this form does not)"))
     fill!(Q, zero(T))                             # load-bearing: the off-diagonal zeros ARE read by the
     @inbounds for i in 1:n                        # block-reflector gemms — a reused Q must be re-zeroed
         Q[i, i] = one(T)
@@ -757,6 +766,15 @@ function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::Abs
     uplo === 'L' || throw(ArgumentError("ungtr!: only uplo='L' is implemented"))
     n = size(A, 1)
     size(Q) == (n, n) || throw(DimensionMismatch("ungtr!: size(Q) ≠ (size(A,1), size(A,1))"))
+    # Q MUST NOT ALIAS A. Netlib's DORGTR/ZUNGTR overwrite A with Q, so `orgtr!('L', A, tau, A)` is
+    # exactly what a caller migrating from LAPACK writes — and it is the one call that silently
+    # produces garbage here: `fill!(Q, ...)` below destroys the reflectors stored in A before
+    # `_ormtr!` reads them. Measured with genuine sytrd/hetrd reflectors at n=64: a distinct Q gives
+    # ‖Q'Q − I‖ = 2e-15, the aliased call gives 1.0, with no error raised. Throw instead: this form
+    # takes a SEPARATE output buffer by design (the docstring says A is not overwritten), so an
+    # aliased call is a caller bug and must not be papered over by copying A internally — that would
+    # reintroduce the allocation this method exists to remove.
+    Q === A && throw(ArgumentError("ungtr!: Q must not alias A (netlib overwrites A; this form does not)"))
     fill!(Q, zero(T))
     @inbounds for i in 1:n
         Q[i, i] = one(T)
