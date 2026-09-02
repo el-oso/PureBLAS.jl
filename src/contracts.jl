@@ -252,9 +252,10 @@ function ungtr! end   # form Q from hetrd reflectors (in-place form)
 #     contracts.jl is included at PureBLAS.jl:20, long before hessenberg.jl.
 #   • `unghr!` (hessenberg.jl:344) is NOT an alias but a one-line forwarding METHOD onto `orghr!`, so it
 #     would need a backend method of its own for no new implementation. `orghr!` is the member.
-#   • `trsen!` — MEASURED 16 B/call at job∈{'V','B'} (Float64 AND ComplexF64, n=32): the `Base.RefValue`
-#     the `_lacn2_estimate` reverse-communication protocol carries `_dtrsyl!`'s `scale` out through.
-#     job∈{'N','E'} is 0 B, but the member would cover all four jobs, so it stays out until the Ref does.
+#   • `trsen!` WAS excluded at 16 B/call for job∈{'V','B'} — the `Base.RefValue` that carried `_dtrsyl!`'s
+#     `scale` out through the `_lacn2_estimate` reverse-communication closure. The Ref is now the owned
+#     `trsensc` slot (workspace.jl), so all four jobs are 0 B and the member covers them.
+function trsen! end   # reorder a Schur form and estimate the cluster's condition numbers (s, sep)
 function gebal! end   # balance a general matrix (permute + diagonal scale), in-place `scale`
 function gebak! end   # undo gebal's balancing on the eigen/Schur vectors
 function gehrd! end   # reduce to upper Hessenberg, H = Qᴴ·A·Q
@@ -293,9 +294,12 @@ function ggev! end    # generalized eigensolver driver (in-place output buffers)
 function gges! end    # generalized Schur driver (in-place output buffers)
 
 # ── SVD front-half / generalized SVD ─────────────────────────────────────────────────────────────
-# `gebrd!` and `bdsdc!` are absent BY SIGNATURE, not by measurement: both take a PureBLAS-internal
-# `SVDWorkspace` as a positional argument, so contracting them would pin the backend interface to this
-# implementation's scratch type rather than to a swappable surface. Both measure 0 B.
+# `gebrd!` and `bdsdc!` were previously absent BY SIGNATURE (both took a PureBLAS-internal `SVDWorkspace`
+# positionally, which would have pinned the backend interface to this implementation's scratch type).
+# Both already measured 0 B, so the fix was a workspace-free arity that fetches the GKH-owned workspace
+# instead of receiving one — the 6-/5-arg `ws` forms remain for internal callers.
+function gebrd! end   # blocked bidiagonal reduction A = Q·B·Pᴴ (workspace-free arity)
+function bdsdc! end   # bidiagonal SVD by divide-and-conquer (workspace-free arity)
 function gebd2! end   # unblocked bidiagonal reduction A = Q·B·Pᴴ
 function bdsqr! end   # bidiagonal SVD by implicit-shift QR (declared at its real 4-arg arity)
 function ggsvd! end   # generalized SVD of the pair (A,B) (in-place output buffers)
@@ -363,6 +367,7 @@ function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration 
     hseqr!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector, ::AbstractMatrix)::Integer => "Schur decomposition of an upper-Hessenberg matrix → info"
     trevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "right eigenvectors of a Schur form ('A') or their back-transform ('B')"
     trexc!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::Integer, ::Integer)::Tuple => "move the diagonal block at ifst to ilst, accumulating into Q"
+    trsen!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "reorder the selected cluster to the leading block, eigenvalues into w → (T, Q, w, s, sep)"
     trsyl!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "Sylvester equation op(A)·X ± X·op(B) = scale·C → (X, scale)"
     geev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "general eigensolver into caller buffers (real arity: wr, wi, VL, VR, scale)"
     gees!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::Tuple => "Schur decomposition into caller buffers → (T, Z, w)"
@@ -381,6 +386,8 @@ function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration 
     tgsen!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "reorder a generalized Schur form onto the selected cluster"
     ggev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized eigensolver into caller buffers (real arity: alphar, alphai, beta, vl, vr)"
     gges!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized Schur decomposition into caller buffers"
+    gebrd!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractMatrix => "blocked bidiagonal reduction A = Q·B·Pᴴ, reflectors in A"
+    bdsdc!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::AbstractVector => "bidiagonal SVD by divide-and-conquer, singular values in d, vectors into Lvec/Rvec"
     gebd2!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractMatrix => "unblocked bidiagonal reduction A = Q·B·Pᴴ, reflectors in A"
     bdsqr!(::Self, ::AbstractVector, ::AbstractVector, ::Union{Nothing, AbstractMatrix}, ::Union{Nothing, AbstractMatrix})::AbstractVector => "bidiagonal SVD by implicit-shift QR, singular values in d"
     ggsvd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::Tuple => "generalized SVD of (A,B) into caller buffers → (k, l)"

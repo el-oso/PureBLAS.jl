@@ -612,6 +612,9 @@ end
 
 const _SVDWS = SVDWorkspace{Float64}()
 @inline _svdws() = _SVDWS
+# Type-keyed form of the owner, so generic code can write `_svdws(T)` for real AND complex alike
+# (GKH ownership: resolved at compile time per type, never a runtime lookup).
+@inline _svdws(::Type{Float64}) = _SVDWS
 # Complex SVD values path: a separate owned workspace. Only the blocked-bidiag panels (gebrd_X/Y,
 # labrd_arow/tmp) are ever grown/used here — the singular-VECTOR buffers stay empty (vectors are the
 # follow-up). d,e stay real (local to the values entry), so they don't live in this complex workspace.
@@ -632,6 +635,14 @@ end
 @inline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
 @inline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
 
+# Grow ONLY the divide-and-conquer staging buffers `bdsdc!` reads (`_svd_grow!` also grows them, but it
+# sizes the whole m≥n vector path — far more than the bidiagonal-SVD entry needs on its own).
+function _svd_grow_dc!(ws::SVDWorkspace{T}, N::Int) where {T}
+    ws.dc_diag = _gv(ws.dc_diag, N); ws.dc_subdiag = _gv(ws.dc_subdiag, N)
+    ws.dc_U = _gm(ws.dc_U, N + 1, N + 1)
+    return ws
+end
+
 # Grow every m≥n-path buffer to fit a reduced M×N problem forming `nu` U-columns. Buffers are pure scratch
 # (fully re-initialized per call), so growth just reallocates when too small — nothing to preserve.
 function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
@@ -649,6 +660,22 @@ function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
     ws.bt_W = _gm(ws.bt_W, nbt, nu); ws.bt_Yb = _gm(ws.bt_Yb, nbt, nu)
     ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
     return ws
+end
+
+# Workspace-free arity — THE contracted entry point. The 6-arg forms below take a `SVDWorkspace`
+# positionally, which is a PureBLAS-internal scratch type: contracting that arity would pin the backend
+# interface to this implementation's scratch rather than to a swappable surface. This arity fetches the
+# GKH-owned workspace for `T` instead, so the public signature is (A, d, e, tauq, taup) — exactly what
+# the C-ABI shim already does inline at cabi_lapack2.jl. Still 0-alloc: the owner is a compile-time const
+# and `_svd_grow_bidiag!` only reallocates when a buffer is too small for this shape.
+function gebrd!(
+        A::AbstractMatrix{T}, d::AbstractVector, e::AbstractVector,
+        tauq::AbstractVector, taup::AbstractVector; nb::Int = _brd_nb()
+    ) where {T <: Number}
+    m, n = size(A)
+    ws = _svdws(T)
+    _svd_grow_bidiag!(ws, m, n)
+    return gebrd!(A, d, e, tauq, taup, ws; nb = nb)
 end
 
 # Blocked bidiagonalization driver (LAPACK dgebrd): blocked panels via _labrd! + two gemm! trailing

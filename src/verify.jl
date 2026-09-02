@@ -128,6 +128,8 @@ _strict_trevc_probe(bk, Tw, T0, VL, VR, VR0) =
     (copyto!(Tw, T0); copyto!(VR, VR0); trevc!(bk, 'R', 'B', Tw, VL, VR); nothing)
 _strict_trexc_probe(bk, Tw, T0, Q, Q0, ifst, ilst) =
     (copyto!(Tw, T0); copyto!(Q, Q0); trexc!(bk, 'V', Tw, Q, ifst, ilst); nothing)
+_strict_trsen_probe(bk, Tw, T0, Q, Q0, job, sel, w) =
+    (copyto!(Tw, T0); copyto!(Q, Q0); trsen!(bk, job, 'V', sel, Tw, Q, w); nothing)
 _strict_trsyl_probe(bk, C, C0, transa, transb, A, B) =
     (copyto!(C, C0); trsyl!(bk, transa, transb, 1, A, B, C); nothing)
 _strict_geevr_probe(bk, A, A0, wr, wi, VL, VR, scale) =
@@ -175,6 +177,10 @@ _strict_gges_probe(bk, A, A0, B, B0, alpha, beta, vsl, vsr) =
 
 _strict_gebd2_probe(bk, A, A0, d, e, tauq, taup) =
     (copyto!(A, A0); gebd2!(bk, A, d, e, tauq, taup); nothing)
+_strict_gebrd_probe(bk, A, A0, d, e, tauq, taup) =
+    (copyto!(A, A0); gebrd!(bk, A, d, e, tauq, taup); nothing)
+_strict_bdsdc_probe(bk, d, d0, e, e0, Lvec, Rvec) =
+    (copyto!(d, d0); copyto!(e, e0); bdsdc!(bk, d, e, Lvec, Rvec); nothing)
 _strict_bdsqr_probe(bk, d, d0, e, e0, U, V) =
     (copyto!(d, d0); copyto!(e, e0); bdsqr!(bk, d, e, U, V); nothing)
 _strict_bdsqrc_probe(bk, d, d0, e, e0, Vt, U, C) =
@@ -396,6 +402,9 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         evH = _strict_clean_hess!(copy(evAf))
         evw = Vector{ComplexF64}(undef, ms); evwr = zeros(ms); evwi = zeros(ms)
         evT = _strict_quasitri(ms); evQI = _strict_eye(Float64, ms)
+        # trsen!: `select` marks the leading cluster; `w` receives the eigenvalues (must not alias T).
+        tsnsel = zeros(Int, ms); tsnsel[1:(ms ÷ 2)] .= 1
+        tsnw = Vector{ComplexF64}(undef, ms)
         evVL = zeros(ms, 0); evU = _strict_utri(Float64, ms)
         ezA = _strict_nonsym(ComplexF64, ms); ezB = _strict_ddom(ComplexF64, ms, ms + 1)
         ezW1 = zeros(ComplexF64, ms, ms); ezW2 = zeros(ComplexF64, ms, ms)
@@ -461,6 +470,8 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         bqU = _strict_eye(Float64, svn); bqV = _strict_eye(Float64, svn)
         bqVt = _strict_eye(ComplexF64, svn); bqUz = _strict_eye(ComplexF64, svn)
         bqC = zeros(ComplexF64, svn, 0)
+        # bdsdc! writes both singular-vector sets into caller buffers (n×n each).
+        bdLv = zeros(svn, svn); bdRv = zeros(svn, svn)
         # Least squares. B is max(m,n)×nrhs (LAPACK ldb): rows 1:m hold b on entry, 1:n hold X on exit.
         lsB0 = ones(max(svm, svn), nrhs); lsBw = zeros(max(svm, svn), nrhs); lsjp = zeros(Int, svn)
         lszB0 = ones(ComplexF64, max(svm, svn), nrhs); lszBw = zeros(ComplexF64, max(svm, svn), nrhs)
@@ -769,6 +780,12 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_hseqr_probe(bk, evW1, evH, 'E', 'N', evilo, evihi, evw, evW3)
             _strict_trevc_probe(bk, evW1, evT, evVL, evW2, evQI)
             _strict_trexc_probe(bk, evW1, evT, evW2, evQI, 5, 1)
+            # trsen! at all four jobs: 'N'/'E' skip the sep estimate entirely, while 'V'/'B' run the
+            # `_lacn2_estimate` reverse-communication loop — the arm that carried the 16 B Ref.
+            _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'N', tsnsel, tsnw)
+            _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'E', tsnsel, tsnw)
+            _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'V', tsnsel, tsnw)
+            _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'B', tsnsel, tsnw)
             # transa='N' and 'T' are separate back-substitution orders; the third call feeds trsyl! a
             # quasi-triangular A so the `_syl_dlasy2` 2×2 arm (and its `t16` scratch) is on the path.
             _strict_trsyl_probe(bk, evW2, evC, 'N', 'N', evU, evU)
@@ -786,6 +803,8 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_hseqr_probe(bk, ezW1, ezH, 'E', 'N', ezilo, ezihi, ezw, ezW3)
             _strict_trevc_probe(bk, ezW1, ezU, ezVL, ezW2, ezQI)
             _strict_trexc_probe(bk, ezW1, ezU, ezW2, ezQI, 5, 1)
+            _strict_trsen_probe(bk, ezW1, ezU, ezW2, ezQI, 'N', tsnsel, tsnw)
+            _strict_trsen_probe(bk, ezW1, ezU, ezW2, ezQI, 'B', tsnsel, tsnw)
             _strict_trsyl_probe(bk, ezW2, ezC, 'N', 'N', ezU, ezU)
             _strict_trsyl_probe(bk, ezW2, ezC, 'C', 'N', ezU, ezU)
             _strict_geevc_probe(bk, ezW1, ezA, ezw, ezVL, ezW2, ezsc)
@@ -848,13 +867,16 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_tgsen_probe(bk, qzsel, ezW1, qzzS, ezW2, qzzP, ezW3, qzzZ, ezW4, qzzZ, qzzal, qzzbe)
             _strict_ggevc_probe(bk, ezW1, ezA, ezW2, ezB, qzzal, qzzbe, ezVL, ezW3)
             _strict_gges_probe(bk, ezW1, ezA, ezW2, ezB, ezw, qzzbe, ezW3, ezW4)
-            # ── SVD front half + generalized SVD. `gebrd!`/`bdsdc!` are absent by SIGNATURE, not by
-            # measurement (both take a PureBLAS-internal `SVDWorkspace`); see contracts.jl. `bdsqr!` is
+            # ── SVD front half + generalized SVD. `gebrd!`/`bdsdc!` are now asserted at their
+            # workspace-free arity (the `ws`-taking forms stay internal); see contracts.jl. `bdsqr!` is
             # asserted at all three shapes it actually gets: real with U/V, real with `nothing`/`nothing`
             # (the values-only path, a Union argument and so the one that could union-split), and the
             # complex 6-argument kernel, which shares no code with either.
             _strict_gebd2_probe(bk, svAw, svA, svd, sve, svtq, svtp)
             _strict_gebd2_probe(bk, svzAw, svzA, svd, sve, svztq, svztp)
+            _strict_gebrd_probe(bk, svAw, svA, svd, sve, svtq, svtp)
+            _strict_gebrd_probe(bk, svzAw, svzA, svd, sve, svztq, svztp)
+            _strict_bdsdc_probe(bk, bqd, bqd0, bqe, bqe0, bdLv, bdRv)
             _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, bqU, bqV)
             _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, nothing, nothing)
             _strict_bdsqrc_probe(bk, bqd, bqd0, bqe, bqe0, bqVt, bqUz, bqC)
