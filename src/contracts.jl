@@ -256,6 +256,12 @@ function ungtr! end   # form Q from hetrd reflectors (in-place form)
 #     `scale` out through the `_lacn2_estimate` reverse-communication closure. The Ref is now the owned
 #     `trsensc` slot (workspace.jl), so all four jobs are 0 B and the member covers them.
 function trsen! end   # reorder a Schur form and estimate the cluster's condition numbers (s, sep)
+# `sygvd!`/`hegvd!` are declared at their SIX-argument in-place arity. The 5-arg forms return `(w,)` at
+# jobz='N' and `(w, A)` at 'V' — a Union whose ARITY depends on a runtime Char, so they can never infer
+# concretely no matter how little they allocate. Taking `w` from the caller fixes both problems at once:
+# the return is always `A`, and the eigenvalue vector is no longer allocated per call.
+function sygvd! end   # generalized symmetric-definite eigenproblem (itype 1/2/3), eigenvalues into w
+function hegvd! end   # generalized Hermitian-definite eigenproblem (itype 1/2/3), eigenvalues into w
 function gebal! end   # balance a general matrix (permute + diagonal scale), in-place `scale`
 function gebak! end   # undo gebal's balancing on the eigen/Schur vectors
 function gehrd! end   # reduce to upper Hessenberg, H = Qᴴ·A·Q
@@ -368,6 +374,8 @@ function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration 
     trevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "right eigenvectors of a Schur form ('A') or their back-transform ('B')"
     trexc!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::Integer, ::Integer)::Tuple => "move the diagonal block at ifst to ilst, accumulating into Q"
     trsen!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "reorder the selected cluster to the leading block, eigenvalues into w → (T, Q, w, s, sep)"
+    sygvd!(::Self, ::Integer, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "generalized symmetric-definite eigenproblem, eigenvalues into w, eigenvectors into A"
+    hegvd!(::Self, ::Integer, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "generalized Hermitian-definite eigenproblem, eigenvalues into w, eigenvectors into A"
     trsyl!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "Sylvester equation op(A)·X ± X·op(B) = scale·C → (X, scale)"
     geev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "general eigensolver into caller buffers (real arity: wr, wi, VL, VR, scale)"
     gees!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::Tuple => "Schur decomposition into caller buffers → (T, Z, w)"

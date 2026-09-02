@@ -207,6 +207,66 @@ end
 const _STEDC_NB = 25   # req8-ok: LAPACK dstedc SMLSIZ — algorithm-intrinsic base-case crossover (NOT a
 # hardware tuning knob; machine-independent, like _SVD_DC_CROSS). steqr↔D&C switch.
 
+# --- owned scratch for the D&C recursion -----------------------------------------------------------
+# Every buffer below was a per-call `Vector`/`Matrix` inside `_dc_eigen!`/`_stedc!`; together they were
+# MEASURED at 231 416 B/call at n=64 (75% of `_syev!`'s 308 024 B), which is what kept sygvd!/hegvd! out
+# of the strict contract.
+#
+# ONE workspace serves every recursion level, exactly as `_dc!`/`_DCWork` (svd_dc.jl) does for the SVD
+# D&C, and for the same structural reason: `_dc_eigen!` recurses on the two halves FIRST and only then
+# touches the merge scratch, so a parent's merge cannot be live while a child runs. The base-case `ec`
+# sits below any recursion. Buffers are therefore sized for the ROOT n and sub-viewed per level. If that
+# recurse-then-merge order is ever broken, this aliases — the same failure class as the `trsm_tmp` and
+# `rpack` self-alias bugs, so keep merge scratch strictly after the recursive calls.
+#
+# GKH ownership: const owner per element type, resolved at compile time (never a runtime registry). Only
+# real T ever reaches here — `_heev!` runs the REAL `_stedc!` on its tridiagonal.
+mutable struct _EDCWork{T}
+    n::Int
+    ec::Vector{T}; z::Vector{T}; dsort::Vector{T}; zsort::Vector{T}
+    dlambda::Vector{T}; w::Vector{T}; lam::Vector{T}; mu::Vector{T}
+    zhat::Vector{T}; dtmp::Vector{T}; dout::Vector{T}
+    ord::Vector{Int}; coltyp::Vector{Int}; srcmap::Vector{Int}
+    oidx::Vector{Int}; gperm::Vector{Int}; ord2::Vector{Int}; surv::Vector{Int}
+    defl::Vector{Bool}
+    Zsort::Matrix{T}; R::Matrix{T}; V::Matrix{T}; B::Matrix{T}; Vg::Matrix{T}; Ztmp::Matrix{T}
+end
+
+_EDCWork{T}() where {T} = _EDCWork{T}(
+    0,
+    T[], T[], T[], T[], T[], T[], T[], T[], T[], T[], T[],
+    Int[], Int[], Int[], Int[], Int[], Int[], Int[],
+    Bool[],
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
+)
+
+# Grow to fit a root problem of size n. Pure scratch — every slot is written before it is read on each
+# level, so growth just reallocates when too small and preserves nothing.
+function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
+    ws.n >= n && return ws
+    m = max(n, 1)
+    fv() = Vector{T}(undef, m); iv() = Vector{Int}(undef, m)
+    ws.ec = fv(); ws.z = fv(); ws.dsort = fv(); ws.zsort = fv()
+    ws.dlambda = fv(); ws.w = fv(); ws.lam = fv(); ws.mu = fv()
+    ws.zhat = fv(); ws.dtmp = fv(); ws.dout = fv()
+    ws.ord = iv(); ws.coltyp = iv(); ws.srcmap = iv()
+    ws.oidx = iv(); ws.gperm = iv(); ws.ord2 = iv(); ws.surv = iv()
+    ws.defl = Vector{Bool}(undef, m)
+    ws.Zsort = Matrix{T}(undef, m, m); ws.R = Matrix{T}(undef, m, m)
+    ws.V = Matrix{T}(undef, m, m); ws.B = Matrix{T}(undef, m, m)
+    ws.Vg = Matrix{T}(undef, m, m); ws.Ztmp = Matrix{T}(undef, m, m)
+    ws.n = m
+    return ws
+end
+
+const _EDCWS_F64 = _EDCWork{Float64}()
+const _EDCWS_F32 = _EDCWork{Float32}()
+const _EDCWS_OTHER = IdDict{DataType, Any}()
+@inline _edcws(::Type{Float64}) = _EDCWS_F64
+@inline _edcws(::Type{Float32}) = _EDCWS_F32
+_edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER, T)::_EDCWork{T}
+
 # --- recursive D&C driver (dlaed0 recursion + dlaed1 merge + dlaed2 deflation + dlaed3 secular solve)
 # d (diag) → eigenvalues ascending; e (subdiag, length n-1) destroyed; Z (n×n) → eigenvectors (Z=I on
 # entry not required — the base case / n==1 seed Z themselves; parent slots are zeroed before recursing).
@@ -217,13 +277,9 @@ const _STEDC_NB = 25   # req8-ok: LAPACK dstedc SMLSIZ — algorithm-intrinsic b
 # `print(::IOBuffer, ::Any)` pair that non-scalar `getindex`, `falses`, and typed matrix literals
 # reach. (Bare `findall(v::Vector{Bool})` is fine; it is the f-predicate form that is rejected.)
 # Two passes so the result is exactly sized, matching what `findall` returned.
-function _dc_survivors(deflated::AbstractVector{Bool})
+# Writes into a caller-owned buffer and returns the exactly-sized VIEW (was an allocating `Vector{Int}`).
+function _dc_survivors!(out::AbstractVector{Int}, deflated::AbstractVector{Bool})
     n = length(deflated)
-    cnt = 0
-    @inbounds for i in 1:n
-        deflated[i] || (cnt += 1)
-    end
-    out = Vector{Int}(undef, cnt)
     c = 0
     @inbounds for i in 1:n
         if !deflated[i]
@@ -231,12 +287,12 @@ function _dc_survivors(deflated::AbstractVector{Bool})
             out[c] = i
         end
     end
-    return out
+    return view(out, 1:c)
 end
 
 function _dc_eigen!(
         d::AbstractVector{T}, e::AbstractVector{T}, Z::AbstractMatrix{T},
-        nb::Int = _STEDC_NB
+        nb::Int, ws::_EDCWork{T}
     ) where {T <: Real}
     n = length(d)
     if n == 0
@@ -253,7 +309,7 @@ function _dc_eigen!(
         @inbounds for i in 1:n
             Z[i, i] = one(T)
         end
-        ec = Vector{T}(undef, max(n - 1, 1))
+        ec = view(ws.ec, 1:max(n - 1, 1))       # owned: base case sits below any recursion
         @inbounds for i in 1:(n - 1)
             ec[i] = e[i]
         end
@@ -273,13 +329,15 @@ function _dc_eigen!(
     absr = abs(rho_raw)
     d[k] -= absr
     d[k + 1] -= absr
-    _dc_eigen!(d1, e1, Z1, nb)
-    _dc_eigen!(d2, e2, Z2, nb)
+    _dc_eigen!(d1, e1, Z1, nb, ws)
+    _dc_eigen!(d2, e2, Z2, nb, ws)
     n2 = n - k
+    # EVERYTHING below is merge scratch, and is only reached once BOTH children have returned — that is
+    # what makes one shared workspace safe across recursion levels. Do not hoist any of it above.
 
     # z = [last row of Q1 ; first row of Q2], sign-flip 2nd half if rho_raw<0, unit-normalize
     # (raw norm is exactly √2 — two unit rows of orthogonal matrices); rho := 2·|rho_raw|.
-    z = Vector{T}(undef, n)
+    z = view(ws.z, 1:n)
     @inbounds for j in 1:k
         z[j] = Z1[k, j]
     end
@@ -298,14 +356,22 @@ function _dc_eigen!(
     rho = T(2) * absr
 
     # --- dlaed2: physically sort (d,z,Q-columns) into global ascending d order.
-    ord = sortperm(d)
+    # Owned identity + `QuickSort` under `Perm`, NOT `sortperm`/`sortperm!` — see the measured note in
+    # stebz.jl:173: Base's adaptive default allocates a scratch buffer, and `sortperm!`'s
+    # `axes(ix) != axes(A)` guard interpolates an `Any` that `juliac --trim=safe` rejects. `Perm` breaks
+    # ties by index, so the permutation is identical to the default's.
+    ord = view(ws.ord, 1:n)
+    @inbounds for t in 1:n
+        ord[t] = t
+    end
+    sort!(ord, QuickSort, Base.Order.Perm(Base.Order.Forward, d))
     # Gathered elementwise, NOT with `d[ord]` / `Z[:, ord]`. A non-scalar `getindex` routes through
     # Base's `_unsafe_getindex` → `throw_checksize_error` (multidimensional.jl), whose message is
     # eagerly interpolated, so `print_to_string` — and with it `_str_sizehint(::Any)` /
     # `print(::IOBuffer, ::Any)` — becomes reachable and `juliac --trim=safe` rejects the call tree
     # (req#4). The string is Base's, not ours; the fancy index is what reaches it. Same class as the
     # `typed_hvcat` matrix literals in trsyl.jl. Linear-range `v[1:k]` and `view(...)` are fine.
-    dsort = Vector{T}(undef, n); zsort = Vector{T}(undef, n); Zsort = Matrix{T}(undef, n, n)
+    dsort = view(ws.dsort, 1:n); zsort = view(ws.zsort, 1:n); Zsort = view(ws.Zsort, 1:n, 1:n)
     @inbounds for j in 1:n
         oj = ord[j]
         dsort[j] = d[oj]; zsort[j] = z[oj]
@@ -315,7 +381,7 @@ function _dc_eigen!(
     end
     # dlaed2 COLTYP: sorted column i originates from Q1 (rows 1:k → type 1) or Q2 (rows k+1:n → type 3);
     # a cross-block Givens (rule b) turns the survivor DENSE (type 2). Drives the dlaed3 two-gemm split.
-    coltyp = Vector{Int}(undef, n)
+    coltyp = view(ws.coltyp, 1:n)
     @inbounds for i in 1:n
         coltyp[i] = ord[i] <= k ? 1 : 3
     end
@@ -324,13 +390,14 @@ function _dc_eigen!(
     dmax = maximum(abs, dsort); zmax = maximum(abs, zsort)
     tol = T(32) * eps(T) * max(dmax, zmax)
 
-    deflated = fill(false, n)  # falses(): BitArray undef ctor is --trim=safe rejected
+    deflated = view(ws.defl, 1:n)   # owned; explicitly zeroed (was `fill(false, n)` — falses() is
+    fill!(deflated, false)          # --trim=safe rejected, and the buffer is reused across levels)
     @inbounds for i in 1:n
         if rho * abs(zsort[i]) <= tol
             deflated[i] = true    # rule (a): negligible z ⇒ already an exact eigenpair (e_i, dsort[i])
         end
     end
-    survivors = _dc_survivors(deflated)
+    survivors = _dc_survivors!(ws.surv, deflated)
     if length(survivors) >= 2
         pj = survivors[1]
         @inbounds for idx in 2:length(survivors)
@@ -359,7 +426,8 @@ function _dc_eigen!(
             end
         end
     end
-    survivor_idx = _dc_survivors(deflated)
+    # Safe to reuse `ws.surv`: `survivors` above is fully consumed by the Givens loop before this point.
+    survivor_idx = _dc_survivors!(ws.surv, deflated)
     K = length(survivor_idx)
 
     # Eigenvalues in sorted-column order: deflated slots keep dsort; survivor slots overwritten by the
@@ -367,17 +435,17 @@ function _dc_eigen!(
     # single assembly pass at the end: j>0 ⇒ R[:,j] (secular combine), 0 ⇒ Zsort[:,i] (deflated column).
     # This replaces the old `Qout = copy(Zsort)` + per-survivor scatter + `Qout[:,ord2]` resort — THREE
     # O(n²) Q-copies/allocs per merge — with ONE write pass into Z (LAPACK dlaed2/dlaed3 assemble-once).
-    Dout = copy(dsort)
-    srcmap = zeros(Int, n)
-    R = Matrix{T}(undef, n, max(K, 0))     # survivor eigenvectors B·V (0 cols if none)
+    Dout = view(ws.dout, 1:n); copyto!(Dout, dsort)
+    srcmap = view(ws.srcmap, 1:n); fill!(srcmap, 0)
+    R = view(ws.R, 1:n, 1:max(K, 0))       # survivor eigenvectors B·V (0 cols if none)
 
     if K > 0
-        dlambda = Vector{T}(undef, K); w = Vector{T}(undef, K)
+        dlambda = view(ws.dlambda, 1:K); w = view(ws.w, 1:K)
         @inbounds for i in 1:K
             si = survivor_idx[i]
             dlambda[i] = dsort[si]; w[i] = zsort[si]
         end
-        lam = Vector{T}(undef, K); oidx = Vector{Int}(undef, K); mu = Vector{T}(undef, K)
+        lam = view(ws.lam, 1:K); oidx = view(ws.oidx, 1:K); mu = view(ws.mu, 1:K)
         sec_ = (shift, mu_) -> _secular_eq_eigen(shift, mu_, w, dlambda, rho, K)
         wsq = zero(T)
         @inbounds for i in 1:K
@@ -394,7 +462,7 @@ function _dc_eigen!(
         end
         # dlaed3 Löwner ẑ (numerically stable via the shift/mu δ representation, never dᵢ−λⱼ directly)
         delta(i, j) = (i == oidx[j]) ? -mu[j] : (dlambda[i] - dlambda[oidx[j]]) - mu[j]
-        zhat = Vector{T}(undef, K)
+        zhat = view(ws.zhat, 1:K)
         @inbounds for i in 1:K
             Wi = delta(i, i)
             for j in 1:K
@@ -404,7 +472,7 @@ function _dc_eigen!(
             zhat[i] = copysign(sqrt(max(-Wi, zero(T))), w[i])
         end
         # dlaed3 eigenvectors of D+ρzzᵀ restricted to survivors: v_j(i) = ẑᵢ/δᵢⱼ, unit-normalized
-        V = Matrix{T}(undef, K, K)
+        V = view(ws.V, 1:K, 1:K)
         @inbounds for j in 1:K
             ss = zero(T)
             for i in 1:K
@@ -422,7 +490,7 @@ function _dc_eigen!(
         # the dominant combine flops. B is gathered and V's rows permuted into grouped order (gperm); V's
         # COLUMNS (output eigenvectors, j) stay ascending, so the assembly below is unchanged. (De-risked:
         # full-length B gather retained — half-length packing of the zero halves is a follow-up.)
-        gperm = Vector{Int}(undef, K)        # secular index (1:K) reordered to [type1;type2;type3]
+        gperm = view(ws.gperm, 1:K)          # secular index (1:K) reordered to [type1;type2;type3]
         c1 = 0; c2 = 0; c3 = 0
         @inbounds for tp in 1:3, i in 1:K
             if coltyp[survivor_idx[i]] == tp
@@ -431,7 +499,7 @@ function _dc_eigen!(
             end
         end
         N12 = c1 + c2; N23 = c2 + c3
-        B = Matrix{T}(undef, n, K); Vg = Matrix{T}(undef, K, K)
+        B = view(ws.B, 1:n, 1:K); Vg = view(ws.Vg, 1:K, 1:K)
         @inbounds for gp in 1:K
             sc = survivor_idx[gperm[gp]]
             for r in 1:n
@@ -464,7 +532,11 @@ function _dc_eigen!(
     # final ascending re-sort merging deflated + secular eigenvalues, so the invariant ("d ascending
     # on return") holds for the parent's z-extraction (last row of Q1 / first row of Q2). Assemble Z's
     # columns in the ascending order directly from R (survivors) / Zsort (deflated) — one O(n²) pass.
-    ord2 = sortperm(Dout)
+    ord2 = view(ws.ord2, 1:n)               # owned identity + QuickSort/Perm — see the `ord` note above
+    @inbounds for t in 1:n
+        ord2[t] = t
+    end
+    sort!(ord2, QuickSort, Base.Order.Perm(Base.Order.Forward, Dout))
     @inbounds for p in 1:n
         d[p] = Dout[ord2[p]]
     end
@@ -500,6 +572,7 @@ function _stedc!(
     size(Z) == (n, n) || throw(DimensionMismatch("_stedc!: Z must be n×n"))
     (n == 0 || length(e) >= n - 1) || throw(DimensionMismatch("_stedc!: e too short"))
     n == 0 && return d, Z
+    ws = _edcws(T); _edc_grow!(ws, n)        # one owned workspace for the whole recursion
     fill!(Z, zero(T))
     epsT = eps(T)
     lo = 1
@@ -532,7 +605,7 @@ function _stedc!(
                     e[i] /= orgnrm
                 end
             end
-            _dc_eigen!(db, eb, Zb, nb)                           # solve the unit-scaled block (fills Zb)
+            _dc_eigen!(db, eb, Zb, nb, ws)                       # solve the unit-scaled block (fills Zb)
             if orgnrm != zero(T)
                 for i in lo:hi
                     d[i] *= orgnrm
@@ -544,11 +617,15 @@ function _stedc!(
 
     # global ascending sort of eigenvalues + eigenvector columns (blocks are each ascending but interleaved).
     if !issorted(view(d, 1:n))
-        ord = sortperm(view(d, 1:n))
+        ord = view(ws.ord, 1:n)             # owned identity + QuickSort/Perm — see the `_dc_eigen!` note
+        @inbounds for t in 1:n
+            ord[t] = t
+        end
+        sort!(ord, QuickSort, Base.Order.Perm(Base.Order.Forward, view(d, 1:n)))
         # Gathered elementwise for the same reason as the `dsort`/`Zsort` permutation above: `d[ord]`
         # and `Z[:, ord]` are non-scalar getindex, which reaches Base's interpolated
         # `throw_checksize_error` and is --trim=safe rejected.
-        dtmp = Vector{T}(undef, n); Ztmp = Matrix{T}(undef, size(Z, 1), n)
+        dtmp = view(ws.dtmp, 1:n); Ztmp = view(ws.Ztmp, 1:size(Z, 1), 1:n)
         @inbounds for p in 1:n
             op = ord[p]
             dtmp[p] = d[op]

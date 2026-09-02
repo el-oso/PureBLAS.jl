@@ -130,6 +130,10 @@ _strict_trexc_probe(bk, Tw, T0, Q, Q0, ifst, ilst) =
     (copyto!(Tw, T0); copyto!(Q, Q0); trexc!(bk, 'V', Tw, Q, ifst, ilst); nothing)
 _strict_trsen_probe(bk, Tw, T0, Q, Q0, job, sel, w) =
     (copyto!(Tw, T0); copyto!(Q, Q0); trsen!(bk, job, 'V', sel, Tw, Q, w); nothing)
+_strict_sygvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
+    (copyto!(Aw, A0); copyto!(Bw, B0); sygvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
+_strict_hegvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
+    (copyto!(Aw, A0); copyto!(Bw, B0); hegvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
 _strict_trsyl_probe(bk, C, C0, transa, transb, A, B) =
     (copyto!(C, C0); trsyl!(bk, transa, transb, 1, A, B, C); nothing)
 _strict_geevr_probe(bk, A, A0, wr, wi, VL, VR, scale) =
@@ -405,6 +409,14 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
         # trsen!: `select` marks the leading cluster; `w` receives the eigenvalues (must not alias T).
         tsnsel = zeros(Int, ms); tsnsel[1:(ms ÷ 2)] .= 1
         tsnw = Vector{ComplexF64}(undef, ms)
+        # sygvd!/hegvd!: A symmetric/Hermitian, B symmetric/Hermitian POSITIVE DEFINITE (potrf! must
+        # succeed). Diagonally dominant; the complex diagonals are real, as a Hermitian's must be.
+        gvA = Float64[i == j ? Float64(ms + 4) : 1.0 / (i + j) for i in 1:ms, j in 1:ms]
+        gvB = Float64[i == j ? Float64(ms + 8) : 0.5 / (i + j) for i in 1:ms, j in 1:ms]
+        gvAw = zeros(ms, ms); gvBw = zeros(ms, ms); gvw = zeros(ms)
+        gvzA = ComplexF64[i == j ? ComplexF64(ms + 4) : ComplexF64(1, 0.2) / (i + j) for i in 1:ms, j in 1:ms]
+        gvzB = ComplexF64[i == j ? ComplexF64(ms + 8) : ComplexF64(0.5, 0.1) / (i + j) for i in 1:ms, j in 1:ms]
+        gvzAw = zeros(ComplexF64, ms, ms); gvzBw = zeros(ComplexF64, ms, ms)
         evVL = zeros(ms, 0); evU = _strict_utri(Float64, ms)
         ezA = _strict_nonsym(ComplexF64, ms); ezB = _strict_ddom(ComplexF64, ms, ms + 1)
         ezW1 = zeros(ComplexF64, ms, ms); ezW2 = zeros(ComplexF64, ms, ms)
@@ -786,6 +798,16 @@ if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
             _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'E', tsnsel, tsnw)
             _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'V', tsnsel, tsnw)
             _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'B', tsnsel, tsnw)
+            # sygvd!/hegvd!: itype 1 vs 2/3 are different REDUCTIONS (trsm vs trmm) and itype 3 a
+            # different BACK-TRANSFORM (trmm vs trsm); jobz 'V' vs 'N' are different eigensolvers
+            # (_stedc! divide-and-conquer vs _sterf!). Both uplos: 'U' takes the mirror-to-lower path.
+            _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 1, 'V', 'L', gvw)
+            _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 2, 'V', 'U', gvw)
+            _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 3, 'V', 'L', gvw)
+            _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 1, 'N', 'U', gvw)
+            _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 1, 'V', 'L', gvw)
+            _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 3, 'V', 'U', gvw)
+            _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 1, 'N', 'L', gvw)
             # transa='N' and 'T' are separate back-substitution orders; the third call feeds trsyl! a
             # quasi-triangular A so the `_syl_dlasy2` 2×2 arm (and its `t16` scratch) is on the path.
             _strict_trsyl_probe(bk, evW2, evC, 'N', 'N', evU, evU)

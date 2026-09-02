@@ -371,6 +371,8 @@ end
 @inline trevc!(::SIMDBackend, side::AbstractChar, howmny::AbstractChar, Ts::AbstractMatrix, VL::AbstractMatrix, VR::AbstractMatrix)::AbstractMatrix = trevc!(side, howmny, Ts, VL, VR)
 @inline trexc!(::SIMDBackend, compq::AbstractChar, Ts::AbstractMatrix, Q::AbstractMatrix, ifst::Integer, ilst::Integer)::Tuple = trexc!(compq, Ts, Q, ifst, ilst)
 @inline trsen!(::SIMDBackend, job::AbstractChar, compq::AbstractChar, select::AbstractVector, Ts::AbstractMatrix, Q::AbstractMatrix, w::AbstractVector)::Tuple = trsen!(job, compq, select, Ts, Q, w)
+@inline sygvd!(::SIMDBackend, itype::Integer, jobz::AbstractChar, uplo::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, w::AbstractVector)::AbstractMatrix = sygvd!(itype, jobz, uplo, A, B, w)
+@inline hegvd!(::SIMDBackend, itype::Integer, jobz::AbstractChar, uplo::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, w::AbstractVector)::AbstractMatrix = hegvd!(itype, jobz, uplo, A, B, w)
 @inline trsyl!(::SIMDBackend, transa::AbstractChar, transb::AbstractChar, isgn::Integer, A::AbstractMatrix, B::AbstractMatrix, C::AbstractMatrix)::Tuple = trsyl!(transa, transb, isgn, A, B, C)
 @inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, wr::AbstractVector, wi::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, wr, wi, VL, VR, scale)
 @inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, w::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, w, VL, VR, scale)
