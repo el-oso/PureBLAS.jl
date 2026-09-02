@@ -36,17 +36,66 @@ const _EXTRA_ACCESSORS = Dict("_trmm_bpf" => Set(["trmm_bpf"]))   # role outside
 const _CALLBACK_EDGES = Dict("_lacn2!" => ["applyop!"],                  # gecon.jl:49  ← gecon!/trcon!/pocon!
                              "_lacn2_estimate" => ["apply!", "applyf"])  # trsen.jl:402 ← trsen!/trrfs!
 
-_srcfiles() = sort!([joinpath(r, f) for (r, _, fs) in walkdir(_SRC) for f in fs if endswith(f, ".jl")])
+# `src/verify.jl` is EXCLUDED, and that is a correctness fix, not a convenience. It is a probe harness:
+# `@verify_strict SIMDBackend begin … end` calls a few hundred routines SEQUENTIALLY at one nesting level.
+# A name-level call graph cannot tell that block apart from a function body, so every routine in it reads
+# as calling every routine after it — which manufactured 48 false findings the moment SVDWorkspace and
+# _GVDWork came under the lint (`gesvd!` "calling" `tbsv!` "calling" `stein!`). It defines no accessor and
+# sits on no algorithm path, so dropping it loses no coverage.
+# `src/contracts.jl` is excluded for the same reason in a different disguise. It is a wall of bare
+# forward declarations (`function tbsv! end`), so `_bodies()` opens a body for each one and attributes
+# every following line to it — including the `@strict_contract` member lists, which name every routine
+# in the package. That made `tbsv!` look like it called `gesvd!`. It defines no accessor either.
+const _SKIP = Set(["verify.jl", "contracts.jl"])
+_srcfiles() = sort!([joinpath(r, f) for (r, _, fs) in walkdir(_SRC)
+                     for f in fs if endswith(f, ".jl") && !(f in _SKIP)])
 
+# EVERY GKH-owned scratch struct, not just L3Workspace. `SVDWorkspace`, `_DCWork`, `_EDCWork`, `_TRDWork`
+# and `_GVDWork` hold reusable buffers with exactly the same self-alias hazard, and covering only
+# L3Workspace left ~70 roles unwatched (kb `gkh-borrow-design`, ranked item #2). Roles are keyed
+# `<Struct>.<field>` because field names COLLIDE across them — n, e, W, Z, tmp all recur — and merging
+# them by bare name would invent findings across unrelated workspaces.
+const _OWNER_CALLS = Dict("L3Workspace" => "_l3ws(",
+                          "SVDWorkspace" => "_svdws(",
+                          "_DCWork" => "_get_dcwork(",
+                          "_EDCWork" => "_edcws(",
+                          "_TRDWork" => "_trdws(",
+                          "_GVDWork" => "_gvdws(")
+
+# Struct => its field names. Two traps this must survive, both of them the SILENT-hole class:
+#   * several fields per line (`ec::Vector{T}; z::Vector{T}`) — `_EDCWork` is written that way, and a
+#     `^`-anchored regex sees only the first, so the line is split on `;` first;
+#   * CAPITALISED field names (`Zsort`, `R`, `V`, `B`, `Vg`, `Ztmp`) — the old `[a-z]` anchor would have
+#     dropped all six while the lint kept reporting clean.
+# The `all_fs` cross-check below is what turns either mistake into an error instead of silent under-coverage.
 function _ws_fields()
-    src = read(joinpath(_SRC, "workspace.jl"), String)
-    body = match(r"mutable struct L3Workspace\{T\}(.*?)\nend"s, src).captures[1]
-    fs = Set(m.captures[1] for m in eachmatch(r"^\s{4}([a-z][a-z0-9_]*)::"im, body))
-    # A field the name regex drops is a SILENT hole — the lint keeps passing while covering one role less.
-    # (During development `[a-z0-9]*` dropped `trsm_tmp`, i.e. the one field with a confirmed bug.)
-    all_fs = Set(m.captures[1] for m in eachmatch(r"^\s+([^\s:#]+)\s*::"m, body))
-    isempty(setdiff(all_fs, fs)) || error("workspace lint: unparsed L3Workspace field(s) $(setdiff(all_fs, fs))")
-    return fs
+    out = Dict{String, Set{String}}()
+    for p in _srcfiles()
+        src = read(p, String)
+        # `mutable` and the type parameters are both optional: `_DCWork` is a plain immutable `struct`
+        # with no parameters, and it is exactly the recursion-shared workspace most at risk here.
+        for m in eachmatch(r"(?:mutable\s+)?struct (\w+)(?:\{[^{}]*\})?\n(.*?)\nend"s, src)
+            name, body = m.captures[1], m.captures[2]
+            haskey(_OWNER_CALLS, name) || continue
+            fs, all_fs = Set{String}(), Set{String}()
+            for line in split(body, '\n')
+                code = split(line, '#')[1]
+                for part in split(code, ';')
+                    mm = match(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*::", part)
+                    mm === nothing || push!(fs, mm.captures[1])
+                    ma = match(r"^\s*([^\s:#]+)\s*::", part)
+                    ma === nothing || push!(all_fs, ma.captures[1])
+                end
+            end
+            isempty(setdiff(all_fs, fs)) ||
+                error("workspace lint: unparsed $name field(s) $(setdiff(all_fs, fs))")
+            out[name] = fs
+        end
+    end
+    missing_ = setdiff(Set(keys(_OWNER_CALLS)), Set(keys(out)))
+    isempty(missing_) ||
+        error("workspace lint: declared owner struct(s) $missing_ not found in src/ (renamed or removed)")
+    return out
 end
 
 # name => body lines, merged over all methods of that name (over-approximates: more findings, not fewer)
@@ -55,6 +104,7 @@ function _bodies()
     defl = r"^(?:@\w+\s+)*function\s+([A-Za-z_][A-Za-z0-9_!]*)"
     for p in _srcfiles()
         cur = ""
+        carry = 0               # lines still owed to a short-form def whose `=` ended the previous line
         instr = false           # inside an open triple-quoted literal (docstring OR ordinary string)
         for l0 in readlines(p)
             # STRIP THE COMMENT TAIL BEFORE THE QUOTE MACHINE SEES IT. Counting `\"\"\"` on the raw
@@ -99,9 +149,36 @@ function _bodies()
                 continue
             end
             m = match(defl, s)
-            nm = m === nothing ? _anondef(s) : m.captures[1]
+            isshort = false
+            nm = if m === nothing
+                x = _anondef(s)
+                # `name = function (args)` and `name = (args) -> begin` are LONG forms that happen to
+                # match the anon-def pattern; their bodies run to an `end`. Clearing `cur` after them
+                # dropped the two Higham-Hager callbacks (`apply!`, `applyf`) entirely, which took the
+                # declared `_lacn2!`/`_lacn2_estimate` edges with them — six baseline entries went stale.
+                isshort = !isnothing(x) && !occursin(r"=\s*function\b", s) &&
+                    !occursin(r"->\s*(?:begin)?\s*$", s)
+                x
+            else
+                m.captures[1]                       # long form: `function f(...)`, body runs to its `end`
+            end
             nm === nothing || (cur = nm; get!(b, cur, String[]))
             (cur != "" && !startswith(s, "#")) && push!(b[cur], split(l, '#')[1])
+            # A SHORT-FORM def (`f(x) = rhs`) ends ON ITS LINE. Leaving `cur` set attributed the REST OF
+            # THE FILE to it — native.jl:92 is `@inline tbsv!(AB, x; uplo=…) =` with the RHS on the next
+            # line, so `tbsv!` absorbed every following one-liner in native.jl and appeared to call
+            # `gesvd!`. That invented `tbsv! -> stein!`-shaped findings across SVDWorkspace roles.
+            # A trailing `=` means the RHS is on the next line, so hold attribution for exactly one more.
+            if isshort
+                if endswith(s, "=")
+                    carry = 1
+                else
+                    cur = ""
+                end
+            elseif carry > 0
+                carry -= 1
+                carry == 0 && (cur = "")
+            end
         end
     end
     return b
@@ -132,6 +209,16 @@ function _shortdef(s::AbstractString)
         c = s[j]; c == '(' && (d += 1); c == ')' && (d -= 1)
         if d == 0
             r = strip(s[nextind(s, j):end])
+            # A RETURN-TYPE ANNOTATION sits between the parens and the `=`: backend.jl writes every
+            # contract forward as `f(::SIMDBackend, …)::AbstractMatrix = f(…)`. Without this the whole
+            # file reads as ONE definition — the first `@inline function` in it absorbed 148 lines
+            # naming `gesvd!`, `stein!`, … and manufactured `tbsv! -> _gesvd_core!`-shaped findings
+            # across every SVDWorkspace role. Cut at the first `=` that is not `==`.
+            if startswith(r, "::")
+                k = findfirst(r"(?<![=!<>])=(?!=)", r)
+                isnothing(k) && return nothing
+                r = strip(r[first(k):end])
+            end
             startswith(r, "where") && (r = strip(replace(r, r"^where\s*(\{[^}]*\}|\S+)\s*" => "")))
             return (startswith(r, "=") && !startswith(r, "==")) ? nm : nothing
         end
@@ -147,9 +234,12 @@ function ws_scan()
     acc = Dict{String, Set{String}}(k => copy(v) for (k, v) in _EXTRA_ACCESSORS)
     for (f, lns) in bodies
         src = join(lns, '\n')
-        occursin("_l3ws(", src) || continue
-        for fld in fields
-            occursin(Regex("\\.\\Q$fld\\E\\b"), src) && push!(get!(acc, f, Set{String}()), fld)
+        for (structname, ownercall) in _OWNER_CALLS
+            occursin(ownercall, src) || continue          # attribute fields to the owner this body fetches
+            for fld in fields[structname]
+                occursin(Regex("\\.\\Q$fld\\E\\b"), src) &&
+                    push!(get!(acc, f, Set{String}()), string(structname, '.', fld))
+            end
         end
     end
     claims = Dict{String, Set{String}}()   # function => fields it claims directly
