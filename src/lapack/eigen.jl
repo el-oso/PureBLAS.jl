@@ -119,6 +119,36 @@ end
 # multiple of nb (keep blocking while the trailing syr2k spans ≥2 panels — else it is too small to amortize
 # the panel's BLAS-2 W-accumulation). Reuses `_sytd2_lower!` as the tail kernel — no separate base case.
 _sytrd_nb(n::Int) = _qr_nb(n, n)
+
+# Owned panel scratch for the tridiagonalizations. `W` is the dlatrd/zlatrd accumulated block, `tmp` its
+# per-column staging — together the LAST allocation on the `sygvd!`/`hegvd!` path (MEASURED 4 696 B F64 /
+# 9 112 B C64 at n=64, after the D&C migration took the other 231 416 B). Not recursive, so one owned set
+# suffices. Scoped here rather than as two more fields on `L3Workspace` — that struct is at 178 fields and
+# is the thing the GKH-borrow refactor exists to fix; `_ormtr_work`'s four buffers belong here too and
+# should move when that lands. `tau` is complex on the Hermitian path, `d`/`e` always real, hence {T,R}.
+mutable struct _TRDWork{T, R}
+    n::Int; nb::Int
+    W::Matrix{T}; tmp::Vector{T}
+end
+_TRDWork{T, R}() where {T, R} = _TRDWork{T, R}(0, 0, Matrix{T}(undef, 0, 0), T[])
+
+function _trd_grow!(ws::_TRDWork{T, R}, n::Int, nb::Int) where {T, R}
+    (ws.n >= n && ws.nb >= nb) && return ws
+    m = max(n, 1); b = max(nb, 1)
+    ws.W = Matrix{T}(undef, m, b); ws.tmp = Vector{T}(undef, b)
+    ws.n = m; ws.nb = b
+    return ws
+end
+
+const _TRDWS_F64 = _TRDWork{Float64, Float64}()
+const _TRDWS_F32 = _TRDWork{Float32, Float32}()
+const _TRDWS_C64 = _TRDWork{ComplexF64, Float64}()
+const _TRDWS_C32 = _TRDWork{ComplexF32, Float32}()
+@inline _trdws(::Type{Float64}) = _TRDWS_F64
+@inline _trdws(::Type{Float32}) = _TRDWS_F32
+@inline _trdws(::Type{ComplexF64}) = _TRDWS_C64
+@inline _trdws(::Type{ComplexF32}) = _TRDWS_C32
+
 function _sytrd_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{T},
         e::AbstractVector{T}, tau::AbstractVector{T}
@@ -131,8 +161,8 @@ function _sytrd_lower!(
         _sytd2_lower!(A, d, e, tau)
         return
     end
-    W = Matrix{T}(undef, n, nb)
-    tmp = Vector{T}(undef, nb)
+    ws = _trdws(T); _trd_grow!(ws, n, nb)
+    W = view(ws.W, 1:n, 1:nb); tmp = view(ws.tmp, 1:nb)
     kk = 1
     @inbounds while n - kk + 1 > nx
         pb = min(nb, n - kk)                          # ≤ ns−1 (each panel column needs a trailing row)
@@ -614,8 +644,8 @@ function _hetrd!(
         _hetd2_lower!(A, d, e, tau)
         return
     end
-    W = Matrix{T}(undef, n, nb)
-    tmp = Vector{T}(undef, nb)
+    ws = _trdws(T); _trd_grow!(ws, n, nb)
+    W = view(ws.W, 1:n, 1:nb); tmp = view(ws.tmp, 1:nb)
     kk = 1
     @inbounds while n - kk + 1 > nx
         pb = min(nb, n - kk)
@@ -1025,11 +1055,15 @@ end
 # jobz='V' returns eigenvectors in Z (columns, ascending eigenvalue order); 'N' returns empty Z.
 # A is destroyed (reduction workspace). uplo='U' is handled by mirroring the upper triangle into the
 # lower and running the LOWER path (A symmetric ⇒ A_L[i,j]=A[j,i], i>j). anrm pre-scaling per dsyev.
-function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
+# Buffered core — the whole dsyev algorithm over CALLER-OWNED d/e/tau/Z. 0-alloc, so an in-place entry
+# (sygvd!) can drive it without the per-call Vectors the allocating `_syev!` wrapper below still makes.
+# `Z` is untouched when `jobz == 'N'`. Returns `info`.
+function _syev_core!(
+        jobz::AbstractChar, uplo::AbstractChar, A::AbstractMatrix{T},
+        d::AbstractVector{T}, e::AbstractVector{T}, tau::AbstractVector{T}, Z::AbstractMatrix{T}
+    ) where {T <: Real}
     n = size(A, 1)
-    if n == 0
-        return T[], Matrix{T}(undef, 0, 0), 0
-    end
+    n == 0 && return 0
     wantz = jobz == 'V'
     if uplo == 'U'                                    # mirror upper → lower, then run the LOWER path
         @inbounds for j in 1:n, i in (j + 1):n
@@ -1056,21 +1090,17 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
         end
     end
 
-    d = Vector{T}(undef, n)
-    e = Vector{T}(undef, max(n - 1, 1))
-    tau = Vector{T}(undef, max(n - 1, 1))
     _sytrd_lower!(A, d, e, tau)                       # blocked tridiagonalization (dlatrd + syr2k)
 
     info = 0
     if wantz
-        Z = zeros(T, n, n)                            # identity start (stedc base fills it too, but n==1 skips)
+        fill!(Z, zero(T))                             # identity start (stedc base fills it too, but n==1 skips)
         @inbounds for i in 1:n
             Z[i, i] = one(T)
         end
         _stedc!(d, e, Z)                              # divide-and-conquer eigenvectors of T (ascending)
         _ormtr!(A, tau, Z; side = 'L', trans = 'N')  # V = Q·Z_T = eigenvectors of A (already ordered)
     else
-        Z = Matrix{T}(undef, 0, 0)
         info = _sterf!(d, e)                          # O(n²) values-only (dsterf); info>0 = non-convergence
     end
 
@@ -1080,6 +1110,20 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
             d[i] *= invσ
         end
     end
+    return info
+end
+
+function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
+    n = size(A, 1)
+    if n == 0
+        return T[], Matrix{T}(undef, 0, 0), 0
+    end
+    wantz = jobz == 'V'
+    d = Vector{T}(undef, n)
+    e = Vector{T}(undef, max(n - 1, 1))
+    tau = Vector{T}(undef, max(n - 1, 1))
+    Z = wantz ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
+    info = _syev_core!(jobz, uplo, A, d, e, tau, Z)
     return d, Z, info
 end
 
@@ -1087,12 +1131,15 @@ end
 # Mirrors _syev! but Hermitian: _hetrd! (real d,e; complex tau) → REAL _stedc!/_sterf! on the tridiagonal
 # → back-transform. Eigenvectors: real Z from _stedc! is embedded into a complex matrix, then rotated by
 # Q via _unmtr! (ALL n-1 reflectors). anrm pre-scaling on the complex magnitudes (unscale w after).
-function _heev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Complex}
-    R = real(T)
+# Buffered core — see `_syev_core!`. `Zr` is the REAL eigenvector matrix of the tridiagonal (what
+# `_stedc!` fills); `Z` is its complex embedding, rotated by Q. Both caller-owned; untouched at 'N'.
+function _heev_core!(
+        jobz::AbstractChar, uplo::AbstractChar, A::AbstractMatrix{T},
+        d::AbstractVector{R}, e::AbstractVector{R}, tau::AbstractVector{T},
+        Zr::AbstractMatrix{R}, Z::AbstractMatrix{T}
+    ) where {T <: Complex, R <: Real}
     n = size(A, 1)
-    if n == 0
-        return R[], Matrix{T}(undef, 0, 0), 0
-    end
+    n == 0 && return 0
     wantz = jobz == 'V'
     if uplo == 'U'                                    # mirror upper → lower (Hermitian: A_L[i,j]=conj(A[j,i]))
         @inbounds for j in 1:n, i in (j + 1):n
@@ -1118,25 +1165,20 @@ function _heev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Comple
         end
     end
 
-    d = Vector{R}(undef, n)
-    e = Vector{R}(undef, max(n - 1, 1))
-    tau = Vector{T}(undef, max(n - 1, 1))
     _hetrd!(A, d, e, tau)
 
     info = 0
     if wantz
-        Zr = zeros(R, n, n)                           # real eigenvectors of the tridiagonal T
+        fill!(Zr, zero(R))                            # real eigenvectors of the tridiagonal T
         @inbounds for i in 1:n
             Zr[i, i] = one(R)
         end
         _stedc!(d, e, Zr)
-        Z = Matrix{T}(undef, n, n)
         @inbounds for j in 1:n, i in 1:n
             Z[i, j] = T(Zr[i, j])
         end
         _unmtr!(A, tau, Z; side = 'L', trans = 'N')  # V = Q·Z_T = eigenvectors of A (already ordered)
     else
-        Z = Matrix{T}(undef, 0, 0)
         info = _sterf!(d, e)                          # info>0 = non-convergence
     end
 
@@ -1146,5 +1188,21 @@ function _heev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Comple
             d[i] *= invσ
         end
     end
+    return info
+end
+
+function _heev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Complex}
+    R = real(T)
+    n = size(A, 1)
+    if n == 0
+        return R[], Matrix{T}(undef, 0, 0), 0
+    end
+    wantz = jobz == 'V'
+    d = Vector{R}(undef, n)
+    e = Vector{R}(undef, max(n - 1, 1))
+    tau = Vector{T}(undef, max(n - 1, 1))
+    Zr = wantz ? Matrix{R}(undef, n, n) : Matrix{R}(undef, 0, 0)
+    Z = wantz ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
+    info = _heev_core!(jobz, uplo, A, d, e, tau, Zr, Z)
     return d, Z, info
 end
