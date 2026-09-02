@@ -6163,7 +6163,15 @@ function _pack_A_sym_cmplx!(
             if up                                          # stored r∈[0,st_end); mirror(conj) r∈[st_end,rhi)
                 st_end = clamp(ls + 1, 0, rhi)
                 for r in 0:(st_end - 1)
-                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
+                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v)
+                    # HERMITIAN DIAGONAL IS REAL BY CONVENTION. r == ls is the diagonal element
+                    # (ic+pbase+r == gp). Reference zhemm/zsymm never READ imag(A[i,i]) for the
+                    # Hermitian case, so a caller may legitimately leave junk there — LinearAlgebra's
+                    # own Hermitian wrapper does. Packing it verbatim made hemm! disagree with
+                    # OpenBLAS by ~2-4.5e-2 for every n >= 33 (the packed path; n <= 32 takes the
+                    # unpacked route and was correct, which is why this survived). hemv! and the
+                    # _symm_materialize! path both already realify, so hemm! was the odd one out.
+                    ApI[o + r + 1] = (HERM && r == ls) ? zero(T) : imag(v)
                 end
                 for r in st_end:(rhi - 1)
                     v = A[gp + 1, ic + pbase + r + 1]; ApR[o + r + 1] = real(v)
@@ -6176,7 +6184,8 @@ function _pack_A_sym_cmplx!(
                     ApI[o + r + 1] = HERM ? -imag(v) : imag(v)
                 end
                 for r in st_start:(rhi - 1)
-                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v); ApI[o + r + 1] = imag(v)
+                    v = A[ic + pbase + r + 1, gp + 1]; ApR[o + r + 1] = real(v)
+                    ApI[o + r + 1] = (HERM && r == ls) ? zero(T) : imag(v)   # see the upper branch
                 end
             end
             for r in rhi:(mr - 1)

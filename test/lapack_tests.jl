@@ -1799,3 +1799,28 @@ end
     @test_throws ArgumentError PureBLAS.gesvd!(Float16.(randn(4, 4)))
     @test_throws ArgumentError PureBLAS.gesvd!(BigFloat.(randn(4, 4)); want_vectors = true)
 end
+
+# Regression: `orgtr!`/`ungtr!`'s in-place forms take a SEPARATE output Q, but netlib's DORGTR/ZUNGTR
+# OVERWRITE A — so `orgtr!('L', A, tau, A)` is precisely what a caller migrating from LAPACK writes.
+# That call used to return silently with ‖Q'Q − I‖ = 1.0 (garbage): `fill!(Q, 0)` destroys the
+# reflectors stored in A before `_ormtr!` reads them. Measured with genuine sytrd/hetrd reflectors at
+# n=64 — a distinct Q gives 2e-15, the aliased call 1.0, no error raised.
+#
+# NOTE the test needs REAL reflectors. An earlier version of this check passed `tau = zeros(...)`, which
+# makes Q = I for both the aliased and non-aliased call — it reported "ok" for a live bug, and the tell
+# was that BOTH arms printed exactly 0.000e+00.
+@testitem "orgtr!/ungtr! reject an aliased output Q (netlib overwrites A; this form does not)" begin
+    using PureBLAS, LinearAlgebra
+    for (T, R, red, fn) in ((Float64, Float64, PureBLAS._sytrd_lower!, PureBLAS.orgtr!),
+                            (ComplexF64, Float64, PureBLAS._hetrd!, PureBLAS.ungtr!))
+        n = 32
+        S = randn(T, n, n); S = (S + S') / 2
+        A = copy(S); d = zeros(R, n); e = zeros(R, n - 1); tau = zeros(T, n)
+        red(A, d, e, tau)
+        @test count(!iszero, tau) > n ÷ 2            # guards against a vacuous zero-tau test
+        Q = zeros(T, n, n)
+        fn('L', copy(A), tau, Q)
+        @test isapprox(Q' * Q, Matrix{T}(I, n, n); atol = 1e-12)   # the good call still works
+        @test_throws ArgumentError fn('L', A, tau, A)              # the aliased one must THROW
+    end
+end

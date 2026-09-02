@@ -241,3 +241,29 @@ end
         end
     end
 end
+
+# Regression: the complex `hemm!` PACKED path copied the Hermitian diagonal's imaginary part verbatim
+# into the packed panel. Reference zhemm never READS imag(A[i,i]) — the Hermitian convention says it is
+# zero — so a caller may legitimately leave anything there, and LinearAlgebra's own `Hermitian` wrapper
+# does exactly that. PureBLAS then disagreed with OpenBLAS by ~2-4.5e-2.
+#
+# Two things made this survive: it needs junk in the diagonal's imaginary part (a matrix built as
+# `(A + A')/2` has an exactly-real diagonal and cannot expose it), AND n above the packing crossover —
+# n <= 32 takes the unpacked route and was always correct. `hemv!` and `_symm_materialize!` both already
+# realified, so `hemm!` was the odd one out; found by an adversarial review, not by the suite.
+@testitem "hemm! ignores the Hermitian diagonal's imaginary part (packed path, vs OpenBLAS)" begin
+    using PureBLAS, LinearAlgebra
+    for T in (ComplexF64, ComplexF32), side in ('L', 'R'), uplo in ('L', 'U'), n in (8, 16, 33, 64, 128)
+        nrhs = 3
+        A = randn(T, n, n); A = (A + A') / 2
+        for i in 1:n
+            A[i, i] += T(0, 0.5)          # junk the convention says must be ignored
+        end
+        B = side == 'L' ? randn(T, n, nrhs) : randn(T, nrhs, n)
+        pb = zeros(T, size(B))
+        PureBLAS.hemm!(pb, A, B; side = side, uplo = uplo, alpha = one(T), beta = zero(T))
+        ob = zeros(T, size(B))
+        BLAS.hemm!(side, uplo, one(T), A, B, zero(T), ob)
+        @test isapprox(pb, ob; rtol = T === ComplexF32 ? 1.0f-4 : 1e-12)
+    end
+end
