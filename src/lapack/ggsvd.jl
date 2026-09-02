@@ -97,12 +97,20 @@ function _ggs_larf_left!(C::AbstractMatrix{T}, u::AbstractVector{T}, τ::T) wher
     return C
 end
 
-# C := C·(I - τ·u·uᴴ), u explicit.
-function _ggs_larf_right!(C::AbstractMatrix{T}, u::AbstractVector{T}, τ::T) where {T}
+# C := C·(I - τ·u·uᴴ), u explicit. `w` is the caller-supplied accumulator, length ≥ mm (it was one
+# `Vector{T}(undef, mm)` PER REFLECTOR APPLICATION — the O(n²)-bytes-per-ggsvd! site).
+# THE `fill!` IS LOAD-BEARING AND LIVES HERE, not at the claim: the accumulation below is guarded by
+# `if uk != 0`, so a zero column writes nothing at all, while the consumer at the bottom reads `w[i]`
+# unconditionally — a degenerate u leaves w read-but-never-written. Zeroing per INVOCATION (not per
+# claim) is what lets one claim be threaded through a whole loop nest of reflector applications; do
+# NOT put a capacity guard on it, a skipped fill is an active wrong answer, not a latent one.
+# `AbstractVector{T}`, never `Vector{T}` — every caller passes a workspace `view`.
+function _ggs_larf_right!(C::AbstractMatrix{T}, u::AbstractVector{T}, τ::T, w::AbstractVector{T}) where {T}
     τ == zero(T) && return C
     mm, nn = size(C)
-    w = Vector{T}(undef, mm)
-    fill!(w, zero(T))
+    @inbounds for i in 1:mm
+        w[i] = zero(T)
+    end
     @inbounds for k in 1:nn
         uk = u[k]
         if uk != zero(T)
@@ -125,13 +133,14 @@ end
 # ── QR with column pivoting (dgeqpf semantics; exact column-norm recomputation) ──────────────────
 # Factors A (m×nc) in place: R above/on the diagonal (real diagonal), reflector tails below,
 # tau[i] the reflector scalars, jpvt the pivot map (A_orig[:, jpvt] = Q·R).
-function _ggs_geqpf!(A::AbstractMatrix{T}, tau::AbstractVector{T}, jpvt::Vector{Int}) where {T}
+# `jpvt` is `AbstractVector{Int}`, never `Vector{Int}` — it arrives as a workspace `view`.
+function _ggs_geqpf!(A::AbstractMatrix{T}, tau::AbstractVector{T}, jpvt::AbstractVector{Int}) where {T}
     mm, nn = size(A)
     @inbounds for j in 1:nn
         jpvt[j] = j
     end
     kk = min(mm, nn)
-    u = Vector{T}(undef, mm)
+    u = _ggsvd_u_qp(T, mm)          # own field: live across the _ggs_larf_left! below
     @inbounds for i in 1:kk
         jmax = i
         vmax = _ggs_nrm2(view(A, i:mm, i))
@@ -166,7 +175,7 @@ function _ggs_qr_apply_left!(
         C::AbstractMatrix{T}
     ) where {T}
     mm = size(Ablk, 1)
-    u = Vector{T}(undef, mm)
+    u = _ggsvd_u_applyl(T, mm)
     @inbounds for i in 1:kk
         u[1] = one(T)
         for r in (i + 1):mm
@@ -187,7 +196,7 @@ function _ggs_formQ!(
     @inbounds for i in 1:mm
         Qout[i, i] = one(T)
     end
-    u = Vector{T}(undef, mm)
+    u = _ggsvd_u_formq(T, mm)
     @inbounds for i in kk:-1:1
         u[1] = one(T)
         for r in (i + 1):mm
@@ -203,14 +212,23 @@ end
 # gets the SAME right-unitary W applied to its leading 1:c column blocks — so any invariant of the
 # form X·S or Q-accumulation is preserved exactly.
 # RQ of S (S ← [0 T], T upper-triangular real-diagonal), applied to S in place; the per-row right
-# reflectors (c, τ, w[1:c]) are RETURNED so the SAME W can be reused on other matrices via
-# _ggs_apply_rq_right! — a monomorphic apply (no Vararg — a Vararg{AbstractMatrix} here is NOT
-# specialized by the compiler, so `view(X,…)` would dispatch abstractly → --trim can't resolve it).
-function _ggs_gerq2!(S::AbstractMatrix{T}) where {T}
+# reflectors are RECORDED so the SAME W can be reused on other matrices via _ggs_apply_rq_right! — a
+# monomorphic apply (no Vararg — a Vararg{AbstractMatrix} here is NOT specialized by the compiler, so
+# `view(X,…)` would dispatch abstractly → --trim can't resolve it).
+# The old `Vector{Tuple{Int,T,Vector{T}}}` carrier is GONE: it allocated the vector itself, grew it by
+# `push!`, and RETAINED one `Vector{T}(undef, c)` per reflector (the second O(n²)-bytes site). The
+# three parallel caller buffers replace it — reflector j is (cs[j], taus[j], view(W, 1:cs[j], j)),
+# recorded in the same order the old `push!` produced. Returns the number of reflectors written.
+# `W` must have ≥ nn rows and ≥ ll columns; `u` ≥ nn entries; `cs`/`taus` ≥ ll entries; `w` ≥ ll-1
+# entries (the `_ggs_larf_right!` accumulator, threaded down rather than claimed here so that
+# `ggs_w` has exactly ONE claimant in this file — `_ggs_larf_right!` re-zeroes it per invocation).
+function _ggs_gerq2!(
+        S::AbstractMatrix{T}, cs::AbstractVector{Int}, taus::AbstractVector{T},
+        W::AbstractMatrix{T}, u::AbstractVector{T}, w::AbstractVector{T}
+    ) where {T}
     ll, nn = size(S)
-    refl = Tuple{Int, T, Vector{T}}[]
-    ll == 0 && return refl
-    u = Vector{T}(undef, nn)
+    ll == 0 && return 0
+    nr = 0
     @inbounds for i in ll:-1:1
         c = nn - ll + i
         # pivot-first conjugated row: [conj(S[i,c]); conj(S[i,1:c-1])]
@@ -221,37 +239,47 @@ function _ggs_gerq2!(S::AbstractMatrix{T}) where {T}
         τ = _ggs_larfg!(view(u, 1:c))
         β = u[1]                       # real value stored in T
         # right reflector H = I - τ·w·wᴴ with w = [u[2:c]; 1]: row i · H = [0…0 β]
-        wv = Vector{T}(undef, c)
+        nr += 1
+        wv = view(W, 1:c, nr)
         for j in 1:(c - 1)
             wv[j] = u[1 + j]
         end
-        wv[c] = one(T)
-        i > 1 && _ggs_larf_right!(view(S, 1:(i - 1), 1:c), wv, τ)
+        wv[c] = one(T)                 # 1:c written before use ⇒ no fill! of W
+        i > 1 && _ggs_larf_right!(view(S, 1:(i - 1), 1:c), wv, τ, w)
         for j in 1:(c - 1)
             S[i, j] = zero(T)
         end
         S[i, c] = β
-        push!(refl, (c, τ, wv))
+        cs[nr] = c
+        taus[nr] = τ
     end
-    return refl
+    return nr
 end
-# Apply the stored RQ right-reflectors (from _ggs_gerq2!) to X's leading columns — monomorphic on X.
-function _ggs_apply_rq_right!(refl::Vector{Tuple{Int, T, Vector{T}}}, X::AbstractMatrix{T}) where {T}
-    @inbounds for (c, τ, wv) in refl
-        _ggs_larf_right!(view(X, :, 1:c), wv, τ)
+# Apply the recorded RQ right-reflectors (from _ggs_gerq2!) to X's leading columns — monomorphic on X.
+function _ggs_apply_rq_right!(
+        cs::AbstractVector{Int}, taus::AbstractVector{T}, W::AbstractMatrix{T},
+        nrefl::Int, X::AbstractMatrix{T}, w::AbstractVector{T}
+    ) where {T}
+    @inbounds for j in 1:nrefl
+        c = cs[j]
+        _ggs_larf_right!(view(X, :, 1:c), view(W, 1:c, j), taus[j], w)
     end
     return X
 end
 
-# Permute columns: X ← X[:, perm].
-function _ggs_permcols!(X::AbstractMatrix{T}, perm::Vector{Int}) where {T}
+# Permute columns: X ← X[:, perm]. `perm` is `AbstractVector{Int}` — it arrives as a workspace `view`.
+# `Xc` (≥ size(X,1) × ≥ length(perm)) is the staging copy, threaded down rather than claimed here so
+# that `ggs_xc` has exactly ONE claimant: the two call sites ask for different shapes, and
+# `_wsgrow(::Matrix, r, c)` reallocates when EITHER dim is short, so claiming per call site would
+# thrash on any pair where neither shape dominates.
+function _ggs_permcols!(X::AbstractMatrix{T}, perm::AbstractVector{Int}, Xc::AbstractMatrix{T}) where {T}
     # Permuted elementwise, NOT with `X[:, perm]`. A non-scalar getindex reaches Base's
     # `throw_checksize_error`, whose message is eagerly interpolated, so `--trim=safe` rejects the
     # whole call tree (req#4). The elementwise loop is REQUIRED rather than stylistic: one call site
     # (ggsvd.jl:663) passes `view(Q, :, 1:nl)`, and `collect(view(::SubArray, :, perm))` is still
     # rejected — the `collect(view(...))` shortcut only works when the parent is an `Array`.
     nc = length(perm); m = size(X, 1)
-    Xc = Matrix{T}(undef, m, nc)
+    # Xc[1:m, 1:nc] is filled by the full row×column nest below before it is read ⇒ no fill!
     @inbounds for j in 1:nc
         pj = perm[j]
         for i in 1:m
@@ -620,12 +648,27 @@ function _ggs_ggsvp!(
     m, n = size(A)
     p = size(B, 1)
 
+    # THIS ROUTINE IS THE SOLE CLAIMANT of ggs_w, ggs_xc, ggs_rqw/rqc/rqtau and ggs_ur; each is
+    # claimed ONCE, here, at the covering shape, and threaded into the helpers. Two reasons, and both
+    # matter: (a) a claim inside a callee that its caller also claims is the `trsm_tmp`/`rpack`
+    # self-alias shape `test/workspace_lint.jl` rejects; (b) `_wsgrow(::Matrix, r, c)` is grow-only
+    # per-call but NOT per-dimension — it reallocates whenever EITHER dim is short, so the two
+    # differently-shaped `_ggs_permcols!` / RQ claim sites would thrash on every ggsvd! forever.
+    #   ggs_w:   _ggs_larf_right! accumulator; longest C has max(m,p,n) rows (A, Q, U or B's rows).
+    #   ggs_xc:  _ggs_permcols! runs on A (m×n) and on view(Q,:,1:nl) (n×nl≤n).
+    #   ggs_rqw: reflector length ≤ n; count is l ≤ min(p,n) at step 2, k ≤ min(m,n) at step 4.
+    #   ggs_ur:  _ggs_gerq2!'s pivot-first conjugated row, length ≤ n.
+    wlarf = _ggsvd_larf_w(T, max(m, p, n))
+    Xc = _ggsvd_permcols(T, max(m, n), n)
+    rqW, rqc, rqtau = _ggsvd_rq_work(T, n, min(max(m, p), n))
+    urq = _ggsvd_u_rq(T, n)
+
     # 1) QR with column pivoting of B: B·P = V·[S11 S12; 0 0]; update A := A·P.
     kb = min(p, n)
-    taub = Vector{T}(undef, kb)
-    jpvt = Vector{Int}(undef, n)
+    taub = _ggsvd_taub(T, kb)
+    jpvt = _ggsvd_jpvt(T, n)
     _ggs_geqpf!(B, taub, jpvt)
-    _ggs_permcols!(A, jpvt)
+    _ggs_permcols!(A, jpvt, Xc)
     l = 0
     @inbounds for i in 1:kb
         abs(B[i, i]) > tolb && (l += 1)
@@ -648,9 +691,9 @@ function _ggs_ggsvp!(
     # 2) RQ of (S11 S12) (l×n): → [0 T]·Z; update A := A·Zᴴ, Q := Q·Zᴴ.
     if l > 0 && n != l
         Brows = view(B, 1:l, 1:n)
-        refl = _ggs_gerq2!(Brows)
-        _ggs_apply_rq_right!(refl, A)
-        wantq && _ggs_apply_rq_right!(refl, Q)
+        nrefl = _ggs_gerq2!(Brows, rqc, rqtau, rqW, urq, wlarf)
+        _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, A, wlarf)
+        wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, Q, wlarf)
         # clean up B: leading zero block and strictly-lower of the trailing l×l T.
         @inbounds for j in 1:(n - l), i in 1:l
             B[i, j] = zero(T)
@@ -666,15 +709,15 @@ function _ggs_ggsvp!(
     if nl > 0
         A11 = view(A, 1:m, 1:nl)
         ka = min(m, nl)
-        taua = Vector{T}(undef, ka)
-        jp2 = Vector{Int}(undef, nl)
+        taua = _ggsvd_taua(T, ka)
+        jp2 = _ggsvd_jp2(T, nl)
         _ggs_geqpf!(A11, taua, jp2)
         @inbounds for i in 1:ka
             abs(A[i, i]) > tola && (k += 1)
         end
         l > 0 && _ggs_qr_apply_left!(A11, taua, ka, view(A, 1:m, (nl + 1):n))
         wantu && _ggs_formQ!(U, A11, taua, ka)
-        wantq && _ggs_permcols!(view(Q, :, 1:nl), jp2)
+        wantq && _ggs_permcols!(view(Q, :, 1:nl), jp2, Xc)
         # clean up A: strictly-lower of A(1:k,1:k); A(k+1:m, 1:nl) = 0.
         @inbounds for j in 1:(k - 1), i in (j + 1):k
             A[i, j] = zero(T)
@@ -692,8 +735,9 @@ function _ggs_ggsvp!(
     # 4) RQ of (T11 T12) = A(1:k, 1:nl): → [0 T12]·Z1; Q(:,1:nl) := Q(:,1:nl)·Z1ᴴ.
     if nl > k && k > 0
         Ak = view(A, 1:k, 1:nl)
-        refl = _ggs_gerq2!(Ak)
-        wantq && _ggs_apply_rq_right!(refl, view(Q, :, 1:nl))
+        # Step 2's rq record is dead here (consumed above), so the same buffers are reused.
+        nrefl2 = _ggs_gerq2!(Ak, rqc, rqtau, rqW, urq, wlarf)
+        wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl2, view(Q, :, 1:nl), wlarf)
         @inbounds for j in 1:(nl - k), i in 1:k
             A[i, j] = zero(T)
         end
@@ -705,7 +749,7 @@ function _ggs_ggsvp!(
     # 5) QR of A(k+1:m, nl+1:n); U(:,k+1:m) := U(:,k+1:m)·U2.
     if m > k && l > 0
         kk2 = min(m - k, l)
-        u = Vector{T}(undef, m)
+        u = _ggsvd_u_step5(T, m)
         @inbounds for i in 1:kk2
             τ = _ggs_larfg!(view(A, (k + i):m, nl + i))
             u[1] = one(T)
@@ -714,7 +758,7 @@ function _ggs_ggsvp!(
             end
             ulen = m - k - i + 1
             i < l && _ggs_larf_left!(view(A, (k + i):m, (nl + i + 1):n), view(u, 1:ulen), conj(τ))
-            wantu && _ggs_larf_right!(view(U, :, (k + i):m), view(u, 1:ulen), τ)
+            wantu && _ggs_larf_right!(view(U, :, (k + i):m), view(u, 1:ulen), τ, wlarf)
         end
         @inbounds for j in (nl + 1):n, i in (j - n + k + l + 1):m
             A[i, j] = zero(T)
@@ -734,8 +778,7 @@ function _ggs_tgsja!(
     ) where {T}
     RT = real(T)
     maxit = 40
-    wx = Vector{T}(undef, max(l, 1))
-    wy = Vector{T}(undef, max(l, 1))
+    wx, wy = _ggsvd_tgsja_work(T, max(l, 1))   # both write 1:len before the 1:len view is read
     upper = false
     converged = false
     @inbounds for _ in 1:maxit
@@ -855,6 +898,134 @@ function _ggs_tgsja!(
     return 0
 end
 
+# ── shared core: everything except the R extraction (whose shape depends on the k, l this returns) ──
+# Writes U, V, Q, alpha, beta in place and returns (k, l). Reproduces the convenience form's
+# `zeros(T, …)` outputs exactly: on the job=='N' branches NOTHING in _ggs_ggsvp!/_ggs_tgsja! writes
+# the corresponding matrix (every writer is `want*`-guarded), so the documented "skipped outputs are
+# zero matrices" behaviour depends entirely on that fill — hence the three `fill!`s below. On the
+# job!='N' branches the buffer IS fully overwritten (`_ggs_formQ!` and the Q=P / U=I branches each
+# `fill!` first), so no second zeroing is needed. `alpha`/`beta` are left uninitialised on purpose:
+# _ggs_tgsja!'s four endgame write ranges union to exactly 1:n in both the m-k<l and m-k≥l cases.
+function _ggsvd_core!(
+        jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar,
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, U::AbstractMatrix{T},
+        V::AbstractMatrix{T}, Q::AbstractMatrix{T},
+        alpha::AbstractVector, beta::AbstractVector
+    ) where {T}
+    m, n = size(A)
+    p = size(B, 1)
+    wantu = jobu == 'U'
+    wantv = jobv == 'V'
+    wantq = jobq == 'Q'
+    RT = real(T)
+
+    # dggsvd tolerances: these define the effective ranks k and l.
+    anorm = _ggs_norm1(A)
+    bnorm = _ggs_norm1(B)
+    tola = max(m, n) * max(anorm, floatmin(RT)) * eps(RT)
+    tolb = max(p, n) * max(bnorm, floatmin(RT)) * eps(RT)
+
+    wantu || fill!(U, zero(T))
+    wantv || fill!(V, zero(T))
+    wantq || fill!(Q, zero(T))
+
+    k, l = _ggs_ggsvp!(wantu, wantv, wantq, A, B, tola, tolb, U, V, Q)
+    info = _ggs_tgsja!(wantu, wantv, wantq, m, p, n, k, l, A, B, tola, tolb, alpha, beta, U, V, Q)
+    info == 0 || throw(ErrorException("ggsvd!: the Jacobi-type procedure failed to converge"))
+    return k, l
+end
+
+# R extraction into the leading (k+l)×(k+l) block of `R` — the layout LinearAlgebra's LAPACK.ggsvd!
+# wrapper returns. Only the UPPER triangle is assigned, so the block MUST be zeroed first (the
+# convenience form got that from `zeros`); a caller-provided buffer would otherwise return stale
+# garbage below the diagonal.
+function _ggsvd_extract_R!(
+        R::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+        m::Int, n::Int, k::Int, l::Int
+    ) where {T}
+    kl = k + l
+    @inbounds for j in 1:kl, i in 1:kl
+        R[i, j] = zero(T)
+    end
+    if m - k - l >= 0
+        @inbounds for j in 1:kl, i in 1:j
+            R[i, j] = A[i, n - kl + j]
+        end
+    else
+        @inbounds for j in 1:kl, i in 1:min(j, m)
+            R[i, j] = A[i, n - kl + j]
+        end
+        @inbounds for j in 1:kl, i in (m + 1):j
+            R[i, j] = B[i - k, n - kl + j]
+        end
+    end
+    return R
+end
+
+function _ggsvd_checkargs(
+        jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar,
+        A::AbstractMatrix, B::AbstractMatrix
+    )
+    (jobu == 'U' || jobu == 'N') ||
+        throw(ArgumentError("ggsvd!: jobu must be 'U' or 'N'"))
+    (jobv == 'V' || jobv == 'N') ||
+        throw(ArgumentError("ggsvd!: jobv must be 'V' or 'N'"))
+    (jobq == 'Q' || jobq == 'N') ||
+        throw(ArgumentError("ggsvd!: jobq must be 'Q' or 'N'"))
+    size(B, 2) == size(A, 2) ||
+        throw(DimensionMismatch("ggsvd!: A and B must have the same number of columns"))
+    return nothing
+end
+
+"""
+    ggsvd!(jobu, jobv, jobq, A, B, U, V, Q, alpha, beta, R) -> (k, l)
+
+In-place form: writes the decomposition into the caller's `U` (m×m), `V` (p×p), `Q` (n×n),
+`alpha`/`beta` (length ≥ n, element type `real(T)`) and `R`, and returns `(k, l)`. The meaningful
+part of `R` is `view(R, 1:k+l, 1:k+l)`, so size `R` at n×n (`k+l ≤ n` always); its leading
+`(k+l)×(k+l)` block is zeroed here, the rest is untouched. Allocation-free after the workspace has
+reached its high-water mark. `A` and `B` are overwritten, as in the convenience form.
+
+`U`, `V`, `Q` and `R` must not alias `A`, `B` or one another, and `alpha` must not alias `beta`:
+netlib's driver overwrites its inputs where this one does not, so an aliased output silently
+returns garbage (`_ggs_formQ!` `fill!`s `U` and then reads `A`; the `Q = P` branch `fill!`s `Q`
+while `B` is still live; the `R` extraction reads `A`/`B` while writing). An overlap `Base.mightalias`
+can see is rejected up front. The `R` size is checked only once `k+l` is known — a late throw costs
+the caller nothing, since `A` and `B` are destroyed by this routine either way.
+"""
+function ggsvd!(
+        jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar,
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, U::AbstractMatrix{T},
+        V::AbstractMatrix{T}, Q::AbstractMatrix{T}, alpha::AbstractVector,
+        beta::AbstractVector, R::AbstractMatrix{T}
+    ) where {T}
+    _ggsvd_checkargs(jobu, jobv, jobq, A, B)
+    m, n = size(A)
+    p = size(B, 1)
+    size(U) == (m, m) || throw(DimensionMismatch("ggsvd!: U must be m×m"))
+    size(V) == (p, p) || throw(DimensionMismatch("ggsvd!: V must be p×p"))
+    size(Q) == (n, n) || throw(DimensionMismatch("ggsvd!: Q must be n×n"))
+    length(alpha) >= n || throw(DimensionMismatch("ggsvd!: alpha must have length ≥ n"))
+    length(beta) >= n || throw(DimensionMismatch("ggsvd!: beta must have length ≥ n"))
+    aliased = Base.mightalias(U, A) || Base.mightalias(U, B) ||
+        Base.mightalias(V, A) || Base.mightalias(V, B) ||
+        Base.mightalias(Q, A) || Base.mightalias(Q, B) ||
+        Base.mightalias(R, A) || Base.mightalias(R, B) ||
+        Base.mightalias(U, V) || Base.mightalias(U, Q) || Base.mightalias(U, R) ||
+        Base.mightalias(V, Q) || Base.mightalias(V, R) || Base.mightalias(Q, R) ||
+        Base.mightalias(alpha, beta)
+    aliased && throw(
+        ArgumentError(
+            "ggsvd!: U, V, Q, R must not alias A, B or one another, and alpha must not alias beta"
+        )
+    )
+    k, l = _ggsvd_core!(jobu, jobv, jobq, A, B, U, V, Q, alpha, beta)
+    (size(R, 1) >= k + l && size(R, 2) >= k + l) ||
+        throw(DimensionMismatch("ggsvd!: R must be at least (k+l)×(k+l)"))
+    _ggsvd_extract_R!(R, A, B, m, n, k, l)
+    return k, l
+end
+
 """
     ggsvd!(jobu, jobv, jobq, A, B) -> (U, V, Q, alpha, beta, k, l, R)
 
@@ -868,55 +1039,28 @@ corresponding matrix or `'N'` to skip it (skipped outputs are returned as zero m
 `A` and `B` are overwritten (LAPACK semantics). Generalized singular values are
 `alpha[k+1:k+l] ./ beta[k+1:k+l]`. Element types: `Float32`/`Float64`/`ComplexF32`/`ComplexF64`;
 `alpha`/`beta` are always `real(T)`.
+
+This form allocates its own outputs, so it is not allocation-free; the scratch is owned, so the
+allocation is exactly the eight returned objects. `ggsvd!(jobu, jobv, jobq, A, B, U, V, Q, alpha,
+beta, R)` is the 0-alloc in-place form. `R` cannot be a caller buffer of the returned shape here,
+because `k+l` is only known after the factorization — hence the split.
 """
 function ggsvd!(
         jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}
     ) where {T}
-    (jobu == 'U' || jobu == 'N') ||
-        throw(ArgumentError("ggsvd!: jobu must be 'U' or 'N'"))
-    (jobv == 'V' || jobv == 'N') ||
-        throw(ArgumentError("ggsvd!: jobv must be 'V' or 'N'"))
-    (jobq == 'Q' || jobq == 'N') ||
-        throw(ArgumentError("ggsvd!: jobq must be 'Q' or 'N'"))
+    _ggsvd_checkargs(jobu, jobv, jobq, A, B)
     m, n = size(A)
     p = size(B, 1)
-    size(B, 2) == n || throw(DimensionMismatch("ggsvd!: A and B must have the same number of columns"))
-    wantu = jobu == 'U'
-    wantv = jobv == 'V'
-    wantq = jobq == 'Q'
     RT = real(T)
-
-    # dggsvd tolerances: these define the effective ranks k and l.
-    anorm = _ggs_norm1(A)
-    bnorm = _ggs_norm1(B)
-    tola = max(m, n) * max(anorm, floatmin(RT)) * eps(RT)
-    tolb = max(p, n) * max(bnorm, floatmin(RT)) * eps(RT)
-
-    U = zeros(T, m, m)
-    V = zeros(T, p, p)
-    Q = zeros(T, n, n)
-    k, l = _ggs_ggsvp!(wantu, wantv, wantq, A, B, tola, tolb, U, V, Q)
-
+    U = Matrix{T}(undef, m, m)
+    V = Matrix{T}(undef, p, p)
+    Q = Matrix{T}(undef, n, n)
     alpha = Vector{RT}(undef, n)
     beta = Vector{RT}(undef, n)
-    info = _ggs_tgsja!(wantu, wantv, wantq, m, p, n, k, l, A, B, tola, tolb, alpha, beta, U, V, Q)
-    info == 0 || throw(ErrorException("ggsvd!: the Jacobi-type procedure failed to converge"))
-
-    # R extraction — the layout LinearAlgebra's LAPACK.ggsvd! wrapper returns.
+    k, l = _ggsvd_core!(jobu, jobv, jobq, A, B, U, V, Q, alpha, beta)
     kl = k + l
-    R = zeros(T, kl, kl)
-    if m - k - l >= 0
-        @inbounds for j in 1:kl, i in 1:j
-            R[i, j] = A[i, n - kl + j]
-        end
-    else
-        @inbounds for j in 1:kl, i in 1:min(j, m)
-            R[i, j] = A[i, n - kl + j]
-        end
-        @inbounds for j in 1:kl, i in (m + 1):j
-            R[i, j] = B[i - k, n - kl + j]
-        end
-    end
+    R = Matrix{T}(undef, kl, kl)
+    _ggsvd_extract_R!(R, A, B, m, n, k, l)
     return U, V, Q, alpha, beta, k, l, R
 end

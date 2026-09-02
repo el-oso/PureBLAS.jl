@@ -170,27 +170,29 @@ function _geev_normalize_cmplx!(VR::AbstractMatrix{C}, n::Int) where {C <: Compl
     return VR
 end
 
-# ── geev core (REAL) — returns (WR, WI, VL, VR, ilo, ihi, scale, abnrm). A is overwritten (Schur form). ──
-function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}) where {T <: Real}
+# ── geev core (REAL), IN-PLACE — every output is the caller's buffer. Returns (ilo, ihi, abnrm). ────────
+# A is overwritten (Schur form). `VR` MUST NOT alias `A`: the reflectors are read out of A into VR and A is
+# then destructively reduced (the orgtr!('L',A,tau,A) failure class). Nothing here allocates: `tau`, the
+# complex eigenvalue staging `w` and the 0×0 `Z` placeholder are owned workspace.
+function _geev_run!(
+        balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T},
+        wr::AbstractVector{T}, wi::AbstractVector{T}, VL::AbstractMatrix{T},
+        VR::AbstractMatrix{T}, scale::AbstractVector{<:Real}
+    ) where {T <: Real}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("geev!: A must be square"))
     jobvl === 'N' || throw(ArgumentError("geev!: left eigenvectors (jobvl='V') not implemented"))
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("geev!: jobvr must be 'N' or 'V'"))
+    Base.mightalias(VR, A) && throw(ArgumentError("geev!: VR must not alias A (A is reduced destructively after Q is formed into VR)"))
     wantvr = jobvr === 'V'
-    wr = zeros(T, n); wi = zeros(T, n)
-    VL = Matrix{T}(undef, n, 0)
-    VR = Matrix{T}(undef, n, wantvr ? n : 0)
-    n == 0 && return wr, wi, VL, VR, 1, 0, T[], zero(T)
-    ilo, ihi, scale = gebal!(A; job = balanc)
+    n == 0 && return 1, 0, zero(T)
+    ilo, ihi = gebal!(A, scale; job = balanc)
     abnrm = _geev_lange1(A)
-    tau = zeros(T, max(n - 1, 0))
+    tau, Zdummy = _geev_work(T, n)                                 # tau fully written by gehrd! on every path
     gehrd!(A, ilo, ihi, tau)
-    w = Vector{Complex{T}}(undef, n)
+    w = _geev_cwork(T, n)                                          # complex staging for a REAL T (workspace.jl)
     if wantvr
-        @inbounds for j in 1:n, i in 1:n
-            VR[i, j] = A[i, j]
-        end   # reflectors → form Q
-        orghr!(VR, ilo, ihi, tau)
+        _orghr_into!(VR, A, ilo, ihi, tau)                         # reflectors → Q, straight into VR
         _geev_clear_hess!(A, ilo, ihi)                             # scrub reflectors → clean Hessenberg
         hseqr!('S', 'V', A, ilo, ihi, w, VR)                       # Schur T in A; VR := Schur vectors
         trevc!('R', 'B', A, VL, VR)                                # VR := right eigenvectors (balanced)
@@ -201,36 +203,45 @@ function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}
         _geev_normalize_real!(VR, wi, n)
     else
         _geev_clear_hess!(A, ilo, ihi)
-        Zdummy = Matrix{T}(undef, 0, 0)
         hseqr!('E', 'N', A, ilo, ihi, w, Zdummy)
         @inbounds for i in 1:n
             wr[i] = real(w[i]); wi[i] = imag(w[i])
         end
     end
+    return ilo, ihi, abnrm
+end
+
+# Allocating form — returns (WR, WI, VL, VR, ilo, ihi, scale, abnrm), exactly as the C-ABI shims expect.
+function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}) where {T <: Real}
+    n = size(A, 1)
+    wr = zeros(T, n); wi = zeros(T, n)
+    VL = Matrix{T}(undef, n, 0)
+    VR = Matrix{T}(undef, n, jobvr === 'V' ? n : 0)
+    scale = Vector{T}(undef, n)
+    ilo, ihi, abnrm = _geev_run!(balanc, jobvl, jobvr, A, wr, wi, VL, VR, scale)
     return wr, wi, VL, VR, ilo, ihi, scale, abnrm
 end
 
-# ── geev core (COMPLEX) — returns (W, VL, VR, ilo, ihi, scale, abnrm). ──────────────────────────────────
-function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}) where {T <: Complex}
+# ── geev core (COMPLEX), IN-PLACE — returns (ilo, ihi, abnrm). Same aliasing contract on VR. ────────────
+function _geev_run!(
+        balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T},
+        w::AbstractVector{T}, VL::AbstractMatrix{T}, VR::AbstractMatrix{T},
+        scale::AbstractVector{<:Real}
+    ) where {T <: Complex}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("geev!: A must be square"))
     jobvl === 'N' || throw(ArgumentError("geev!: left eigenvectors (jobvl='V') not implemented"))
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("geev!: jobvr must be 'N' or 'V'"))
+    Base.mightalias(VR, A) && throw(ArgumentError("geev!: VR must not alias A (A is reduced destructively after Q is formed into VR)"))
     R = real(T)
     wantvr = jobvr === 'V'
-    w = zeros(T, n)
-    VL = Matrix{T}(undef, n, 0)
-    VR = Matrix{T}(undef, n, wantvr ? n : 0)
-    n == 0 && return w, VL, VR, 1, 0, R[], zero(R)
-    ilo, ihi, scale = gebal!(A; job = balanc)
+    n == 0 && return 1, 0, zero(R)
+    ilo, ihi = gebal!(A, scale; job = balanc)
     abnrm = _geev_lange1(A)
-    tau = zeros(T, max(n - 1, 0))
+    tau, Zdummy = _geev_work(T, n)
     gehrd!(A, ilo, ihi, tau)
     if wantvr
-        @inbounds for j in 1:n, i in 1:n
-            VR[i, j] = A[i, j]
-        end
-        orghr!(VR, ilo, ihi, tau)
+        _orghr_into!(VR, A, ilo, ihi, tau)
         _geev_clear_hess!(A, ilo, ihi)
         hseqr!('S', 'V', A, ilo, ihi, w, VR)
         trevc!('R', 'B', A, VL, VR)
@@ -238,79 +249,109 @@ function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}
         _geev_normalize_cmplx!(VR, n)
     else
         _geev_clear_hess!(A, ilo, ihi)
-        Zdummy = Matrix{T}(undef, 0, 0)
         hseqr!('E', 'N', A, ilo, ihi, w, Zdummy)
     end
+    return ilo, ihi, abnrm
+end
+
+function _geev_run!(balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T}) where {T <: Complex}
+    R = real(T)
+    n = size(A, 1)
+    w = zeros(T, n)
+    VL = Matrix{T}(undef, n, 0)
+    VR = Matrix{T}(undef, n, jobvr === 'V' ? n : 0)
+    scale = Vector{R}(undef, n)
+    ilo, ihi, abnrm = _geev_run!(balanc, jobvl, jobvr, A, w, VL, VR, scale)
     return w, VL, VR, ilo, ihi, scale, abnrm
 end
 
-# ── gees core — Schur form (A overwritten) + Schur vectors. Permute-only balance keeps Z orthogonal. ────
-function _gees_run!(jobvs::Char, A::AbstractMatrix{T}) where {T <: Real}
+# ── gees core, IN-PLACE — Schur form (A overwritten) + Schur vectors. Permute-only balance keeps Z ──────
+# orthogonal. `w` is COMPLEX for both real and complex `T`: the real engine's hseqr! already produces one
+# complex vector, so taking it directly deletes BOTH the old wr/wi pair and `gees!`'s `complex.(wr, wi)`
+# broadcast. `VS` must not alias `A` (same reason as geev!'s VR).
+function _gees_run!(
+        jobvs::Char, A::AbstractMatrix{T}, w::AbstractVector{<:Complex},
+        VS::AbstractMatrix{T}, scale::AbstractVector{<:Real}
+    ) where {T <: Real}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gees!: A must be square"))
     (jobvs === 'N' || jobvs === 'V') || throw(ArgumentError("gees!: jobvs must be 'N' or 'V'"))
+    Base.mightalias(VS, A) && throw(ArgumentError("gees!: VS must not alias A (A is reduced destructively after Q is formed into VS)"))
     wantvs = jobvs === 'V'
-    wr = zeros(T, n); wi = zeros(T, n)
-    VS = Matrix{T}(undef, n, wantvs ? n : 0)
-    n == 0 && return wr, wi, VS
-    ilo, ihi, scale = gebal!(A; job = 'P')
-    tau = zeros(T, max(n - 1, 0))
+    n == 0 && return w, VS
+    ilo, ihi = gebal!(A, scale; job = 'P')
+    tau, Zdummy = _geev_work(T, n)
     gehrd!(A, ilo, ihi, tau)
-    w = Vector{Complex{T}}(undef, n)
     if wantvs
-        @inbounds for j in 1:n, i in 1:n
-            VS[i, j] = A[i, j]
-        end
-        orghr!(VS, ilo, ihi, tau)
+        _orghr_into!(VS, A, ilo, ihi, tau)
         _geev_clear_hess!(A, ilo, ihi)
         hseqr!('S', 'V', A, ilo, ihi, w, VS)
         gebak!('P', 'R', ilo, ihi, scale, VS)
     else
         _geev_clear_hess!(A, ilo, ihi)
-        Zdummy = Matrix{T}(undef, 0, 0)
         hseqr!('S', 'N', A, ilo, ihi, w, Zdummy)
     end
+    return w, VS
+end
+
+# Allocating form — returns (wr, wi, VS), exactly as the C-ABI shims expect.
+function _gees_run!(jobvs::Char, A::AbstractMatrix{T}) where {T <: Real}
+    n = size(A, 1)
+    w = Vector{Complex{T}}(undef, n)
+    VS = Matrix{T}(undef, n, jobvs === 'V' ? n : 0)
+    _gees_run!(jobvs, A, w, VS, Vector{T}(undef, n))
+    wr = zeros(T, n); wi = zeros(T, n)
     @inbounds for i in 1:n
         wr[i] = real(w[i]); wi[i] = imag(w[i])
     end
     return wr, wi, VS
 end
 
-function _gees_run!(jobvs::Char, A::AbstractMatrix{T}) where {T <: Complex}
+function _gees_run!(
+        jobvs::Char, A::AbstractMatrix{T}, w::AbstractVector{T},
+        VS::AbstractMatrix{T}, scale::AbstractVector{<:Real}
+    ) where {T <: Complex}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gees!: A must be square"))
     (jobvs === 'N' || jobvs === 'V') || throw(ArgumentError("gees!: jobvs must be 'N' or 'V'"))
+    Base.mightalias(VS, A) && throw(ArgumentError("gees!: VS must not alias A (A is reduced destructively after Q is formed into VS)"))
     wantvs = jobvs === 'V'
-    w = zeros(T, n)
-    VS = Matrix{T}(undef, n, wantvs ? n : 0)
     n == 0 && return w, VS
-    ilo, ihi, scale = gebal!(A; job = 'P')
-    tau = zeros(T, max(n - 1, 0))
+    ilo, ihi = gebal!(A, scale; job = 'P')
+    tau, Zdummy = _geev_work(T, n)
     gehrd!(A, ilo, ihi, tau)
     if wantvs
-        @inbounds for j in 1:n, i in 1:n
-            VS[i, j] = A[i, j]
-        end
-        orghr!(VS, ilo, ihi, tau)
+        _orghr_into!(VS, A, ilo, ihi, tau)
         _geev_clear_hess!(A, ilo, ihi)
         hseqr!('S', 'V', A, ilo, ihi, w, VS)
         gebak!('P', 'R', ilo, ihi, scale, VS)
     else
         _geev_clear_hess!(A, ilo, ihi)
-        Zdummy = Matrix{T}(undef, 0, 0)
         hseqr!('S', 'N', A, ilo, ihi, w, Zdummy)
     end
     return w, VS
 end
 
+function _gees_run!(jobvs::Char, A::AbstractMatrix{T}) where {T <: Complex}
+    n = size(A, 1)
+    w = zeros(T, n)
+    VS = Matrix{T}(undef, n, jobvs === 'V' ? n : 0)
+    _gees_run!(jobvs, A, w, VS, Vector{real(T)}(undef, n))
+    return w, VS
+end
+
 """
-    geev!(jobvl, jobvr, A) -> (WR, WI, VL, VR)   [real]
-    geev!(jobvl, jobvr, A) -> (W, VL, VR)         [complex]
+    geev!(jobvl, jobvr, A, wr, wi, VL, VR, scale) -> (WR, WI, VL, VR)   [real]
+    geev!(jobvl, jobvr, A, w, VL, VR, scale)      -> (W, VL, VR)        [complex]
+    geev!(jobvl, jobvr, A)                        -> as above, buffers allocated
 
 Eigenvalues and (optionally) right eigenvectors of a general square `A` (LAPACK dgeev/zgeev; balances
 with job='B'). `jobvr='V'` computes right eigenvectors into `VR`, `'N'` skips them. `jobvl='V'` (left
 eigenvectors) is not implemented (throws). For real `A`, a complex-conjugate eigenvalue pair occupies two
 consecutive `VR` columns as (real, imag) parts (LAPACK real convention). `A` is overwritten.
+
+The long forms take every output as a caller buffer (`VR` n×n for `jobvr='V'`, else n×0; `VL` n×0;
+`scale` real, length n) and allocate nothing. `VR` MUST NOT be `A`.
 """
 function geev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}) where {T <: Real}
     wr, wi, VL, VR = _geev_run!('B', Char(jobvl), Char(jobvr), A)
@@ -320,19 +361,48 @@ function geev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}) w
     w, VL, VR = _geev_run!('B', Char(jobvl), Char(jobvr), A)
     return w, VL, VR
 end
+function geev!(
+        jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T},
+        wr::AbstractVector{T}, wi::AbstractVector{T}, VL::AbstractMatrix{T},
+        VR::AbstractMatrix{T}, scale::AbstractVector{<:Real}
+    ) where {T <: Real}
+    _geev_run!('B', Char(jobvl), Char(jobvr), A, wr, wi, VL, VR, scale)
+    return wr, wi, VL, VR
+end
+function geev!(
+        jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T},
+        w::AbstractVector{T}, VL::AbstractMatrix{T}, VR::AbstractMatrix{T},
+        scale::AbstractVector{<:Real}
+    ) where {T <: Complex}
+    _geev_run!('B', Char(jobvl), Char(jobvr), A, w, VL, VR, scale)
+    return w, VL, VR
+end
 
 """
-    gees!(jobvs, A) -> (T, Z, w)
+    gees!(jobvs, A, w, VS, scale) -> (T, Z, w)
+    gees!(jobvs, A)               -> (T, Z, w)
 
 Schur decomposition of a general square `A` (LAPACK dgees/zgees): `A` is overwritten with the
 (quasi-)upper-triangular Schur form `T`, `Z` (returned) holds the Schur vectors when `jobvs='V'`
 (`A₀ = Z·T·Zᴴ`), and `w` the eigenvalues (complex). `jobvs='N'` computes `T`/`w` only.
+
+The 5-argument form takes the caller's `w` (complex, length n), `VS` (n×n for `jobvs='V'`, else n×0) and
+`scale` (real, length n) and allocates nothing. `VS` MUST NOT be `A`.
 """
 function gees!(jobvs::AbstractChar, A::AbstractMatrix{T}) where {T <: Real}
-    wr, wi, VS = _gees_run!(Char(jobvs), A)
-    return A, VS, complex.(wr, wi)
+    n = size(A, 1)
+    return gees!(jobvs, A, Vector{Complex{T}}(undef, n),
+                 Matrix{T}(undef, n, Char(jobvs) === 'V' ? n : 0), Vector{T}(undef, n))
 end
 function gees!(jobvs::AbstractChar, A::AbstractMatrix{T}) where {T <: Complex}
-    w, VS = _gees_run!(Char(jobvs), A)
+    n = size(A, 1)
+    return gees!(jobvs, A, zeros(T, n),
+                 Matrix{T}(undef, n, Char(jobvs) === 'V' ? n : 0), Vector{real(T)}(undef, n))
+end
+function gees!(
+        jobvs::AbstractChar, A::AbstractMatrix{T}, w::AbstractVector{<:Complex},
+        VS::AbstractMatrix{T}, scale::AbstractVector{<:Real}
+    ) where {T <: Number}
+    _gees_run!(Char(jobvs), A, w, VS, scale)
     return A, VS, w
 end

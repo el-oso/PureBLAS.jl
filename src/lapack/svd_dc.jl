@@ -431,10 +431,13 @@ end
 
 # deflate the merged problem. jc/js/jidx accumulate Jacobi rotations; perm/transpositions sized n.
 # Returns (jacobi_0i, jacobi_ij).
+# The scratch parameters are `AbstractVector`, not `Vector`: they come from `_DCWork`'s own `Vector`
+# fields today, but a concrete annotation rejects a `view` and would block folding `_DCWork` into
+# `SVDWorkspace` as sized views (lesson 3). Same for the three helpers below.
 function _deflate!(
-        diag, col0, jc::Vector{Float64}, js::Vector{Float64}, jidx::Vector{Int},
-        transp::Vector{Int}, perm::Vector{Int}, k::Int, n::Int,
-        real_ind::Vector{Int}, real_col::Vector{Int}
+        diag, col0, jc::AbstractVector{Float64}, js::AbstractVector{Float64},
+        jidx::AbstractVector{Int}, transp::AbstractVector{Int}, perm::AbstractVector{Int},
+        k::Int, n::Int, real_ind::AbstractVector{Int}, real_col::AbstractVector{Int}
     )
     epsd = eps(Float64); sml = floatmin(Float64)
     max_diag = 0.0
@@ -561,7 +564,7 @@ end
     return s
 end
 
-function _perturb_col0!(zhat, col0, diag, perm::Vector{Int}, s, shifts, mus, n::Int, m::Int)
+function _perturb_col0!(zhat, col0, diag, perm::AbstractVector{Int}, s, shifts, mus, n::Int, m::Int)
     if m == 0
         @inbounds for i in 1:n
             zhat[i] = 0.0
@@ -625,9 +628,10 @@ end
 # outer_perm[1]+1 which never collides with the li≥2 rows (index 0, if present, is always perm[1]), so its
 # contribution to the norm is a constant 1.0.
 function _compute_singular_vectors!(
-        um, vm, zhat, outer_perm::Vector{Int},
-        col_perm_inv::Vector{Int}, actual_n::Int, shifts, mus, n::Int, o::Int,
-        zhp::Vector{Float64}, dgp::Vector{Float64}, rowidx::Vector{Int}, vbuf::Vector{Float64}
+        um, vm, zhat, outer_perm::AbstractVector{Int},
+        col_perm_inv::AbstractVector{Int}, actual_n::Int, shifts, mus, n::Int, o::Int,
+        zhp::AbstractVector{Float64}, dgp::AbstractVector{Float64},
+        rowidx::AbstractVector{Int}, vbuf::AbstractVector{Float64}
     )
     @inbounds for k in 0:(n - 1)
         actual_k = (k >= actual_n) ? k : (actual_n - col_perm_inv[k + 1] - 1)
@@ -665,7 +669,7 @@ function _compute_singular_vectors!(
     return !isnothing(um) && (um[n + 1, n + 1] = 1.0)
 end
 
-function _compute_svd_of_m!(um, vm, diag, col0, outer_perm::Vector{Int}, n::Int, ws::_DCWork)
+function _compute_svd_of_m!(um, vm, diag, col0, outer_perm::AbstractVector{Int}, n::Int, ws::_DCWork)
     diag[1] = 0.0
     actual_n = n
     @inbounds while actual_n > 1 && diag[actual_n] == 0.0

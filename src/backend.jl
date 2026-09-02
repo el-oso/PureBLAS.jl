@@ -335,8 +335,8 @@ end
 # ── QR / LQ / QL / RZ backend surface (the rest of the AbstractLAPACK contract). Same thin-wrapper
 # form. Only the 14 DISTINCT implementations get a method: `ungqr!`/`unglq!`/`ungql!`/`ungrq!` and
 # `unmqr!`/`unmlq!`/`unmql!`/`unmrq!`/`unmrz!` are `const un*! = or*!` aliases — the same function
-# object — so each `or*!` method below IS the `un*!` method. orgtr!/ungtr! are absent: they allocate
-# their output Q, so they cannot satisfy the strict guarantee yet (see contracts.jl).
+# object — so each `or*!` method below IS the `un*!` method. orgtr!/ungtr! ARE here, but only through
+# their IN-PLACE (caller-supplied Q) forms; their 3-arg convenience forms allocate Q.
 @inline gelqf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = gelqf!(A, tau)
 @inline geqlf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = geqlf!(A, tau)
 @inline gerqf!(::SIMDBackend, A::AbstractMatrix, tau::AbstractVector)::AbstractMatrix = gerqf!(A, tau)
@@ -354,3 +354,59 @@ end
 # orgtr!/ungtr! bind the IN-PLACE (caller-supplied Q) forms — the 3-arg convenience forms allocate Q.
 @inline orgtr!(::SIMDBackend, uplo::Char, A::AbstractMatrix, tau::AbstractVector, Q::AbstractMatrix)::AbstractMatrix = orgtr!(uplo, A, tau, Q)
 @inline ungtr!(::SIMDBackend, uplo::Char, A::AbstractMatrix, tau::AbstractVector, Q::AbstractMatrix)::AbstractMatrix = ungtr!(uplo, A, tau, Q)
+
+# ── Nonsymmetric-eigen backend surface (AbstractLAPACK contract). Same thin-wrapper form; every one
+# binds the IN-PLACE method, so the contract cannot be satisfied by a form that allocates its own
+# output. One method per DISTINCT implementation: `unmhr!` is a `const` alias of `ormhr!`
+# (hessenberg.jl:379) and `unghr!` a one-line forwarding method onto `orghr!` (hessenberg.jl:344), so
+# neither adds an implementation to wrap. `geev!` gets TWO methods because its real and complex
+# in-place forms have different arities (wr+wi vs a single complex w) — the contract can only declare
+# one of them, so the complex arm is held to the guarantee by verify.jl instead.
+@inline gebal!(::SIMDBackend, A::AbstractMatrix, scale::AbstractVector; kw...)::Tuple = gebal!(A, scale; kw...)
+@inline gebak!(::SIMDBackend, job::AbstractChar, side::AbstractChar, ilo::Integer, ihi::Integer, scale::AbstractVector, V::AbstractMatrix)::AbstractMatrix = gebak!(job, side, ilo, ihi, scale, V)
+@inline gehrd!(::SIMDBackend, A::AbstractMatrix, ilo::Integer, ihi::Integer, tau::AbstractVector)::AbstractMatrix = gehrd!(A, ilo, ihi, tau)
+@inline orghr!(::SIMDBackend, A::AbstractMatrix, ilo::Integer, ihi::Integer, tau::AbstractVector)::AbstractMatrix = orghr!(A, ilo, ihi, tau)
+@inline ormhr!(::SIMDBackend, side::Char, trans::Char, ilo::Integer, ihi::Integer, A::AbstractMatrix, tau::AbstractVector, C::AbstractMatrix)::AbstractMatrix = ormhr!(side, trans, ilo, ihi, A, tau, C)
+@inline hseqr!(::SIMDBackend, job::AbstractChar, compz::AbstractChar, H::AbstractMatrix, ilo::Integer, ihi::Integer, w::AbstractVector, Z::AbstractMatrix)::Integer = hseqr!(job, compz, H, ilo, ihi, w, Z)
+@inline trevc!(::SIMDBackend, side::AbstractChar, howmny::AbstractChar, Ts::AbstractMatrix, VL::AbstractMatrix, VR::AbstractMatrix)::AbstractMatrix = trevc!(side, howmny, Ts, VL, VR)
+@inline trexc!(::SIMDBackend, compq::AbstractChar, Ts::AbstractMatrix, Q::AbstractMatrix, ifst::Integer, ilst::Integer)::Tuple = trexc!(compq, Ts, Q, ifst, ilst)
+@inline trsyl!(::SIMDBackend, transa::AbstractChar, transb::AbstractChar, isgn::Integer, A::AbstractMatrix, B::AbstractMatrix, C::AbstractMatrix)::Tuple = trsyl!(transa, transb, isgn, A, B, C)
+@inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, wr::AbstractVector, wi::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, wr, wi, VL, VR, scale)
+@inline geev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, w::AbstractVector, VL::AbstractMatrix, VR::AbstractMatrix, scale::AbstractVector)::Tuple = geev!(jobvl, jobvr, A, w, VL, VR, scale)
+@inline gees!(::SIMDBackend, jobvs::AbstractChar, A::AbstractMatrix, w::AbstractVector, VS::AbstractMatrix, scale::AbstractVector)::Tuple = gees!(jobvs, A, w, VS, scale)
+
+# ── Bunch-Kaufman backend surface. `sysv!`/`hesv!`/`syconv!` bind the 4-argument forms; the 3-argument
+# siblings allocate `ipiv`/`work`.
+@inline sytrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Integer = sytrf!(A, ipiv; kw...)
+@inline hetrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Integer = hetrf!(A, ipiv; kw...)
+@inline sytrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = sytrs!(A, ipiv, B; kw...)
+@inline hetrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = hetrs!(A, ipiv, B; kw...)
+@inline sytri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::AbstractMatrix = sytri!(A, ipiv; kw...)
+@inline hetri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::AbstractMatrix = hetri!(A, ipiv; kw...)
+@inline sysv!(::SIMDBackend, uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector)::Tuple = sysv!(uplo, A, B, ipiv)
+@inline hesv!(::SIMDBackend, uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector)::Tuple = hesv!(uplo, A, B, ipiv)
+@inline syconv!(::SIMDBackend, uplo::AbstractChar, A::AbstractMatrix, ipiv::AbstractVector, work::AbstractVector)::Tuple = syconv!(uplo, A, ipiv, work)
+
+# ── QZ / generalized-eigen backend surface. `ggev!` gets two methods for the same reason `geev!` does.
+@inline gghrd!(::SIMDBackend, compq::AbstractChar, compz::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, Q::AbstractMatrix, Z::AbstractMatrix; kw...)::Tuple = gghrd!(compq, compz, A, B, Q, Z; kw...)
+@inline hgeqz!(::SIMDBackend, job::AbstractChar, compq::AbstractChar, compz::AbstractChar, H::AbstractMatrix, Tm::AbstractMatrix, alpha::AbstractVector, beta::AbstractVector, Q::AbstractMatrix, Z::AbstractMatrix; kw...)::Integer = hgeqz!(job, compq, compz, H, Tm, alpha, beta, Q, Z; kw...)
+@inline tgevc!(::SIMDBackend, side::AbstractChar, howmny::AbstractChar, S::AbstractMatrix, Pm::AbstractMatrix, VL::AbstractMatrix, VR::AbstractMatrix)::Integer = tgevc!(side, howmny, S, Pm, VL, VR)
+@inline tgsen!(::SIMDBackend, select::AbstractVector, S::AbstractMatrix, Tm::AbstractMatrix, Q::AbstractMatrix, Z::AbstractMatrix, alpha::AbstractVector, beta::AbstractVector)::Tuple = tgsen!(select, S, Tm, Q, Z, alpha, beta)
+@inline ggev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, alphar::AbstractVector, alphai::AbstractVector, beta::AbstractVector, vl::AbstractMatrix, vr::AbstractMatrix)::Tuple = ggev!(jobvl, jobvr, A, B, alphar, alphai, beta, vl, vr)
+@inline ggev!(::SIMDBackend, jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, alpha::AbstractVector, beta::AbstractVector, vl::AbstractMatrix, vr::AbstractMatrix)::Tuple = ggev!(jobvl, jobvr, A, B, alpha, beta, vl, vr)
+@inline gges!(::SIMDBackend, jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, alpha::AbstractVector, beta::AbstractVector, vsl::AbstractMatrix, vsr::AbstractMatrix)::Tuple = gges!(jobvsl, jobvsr, A, B, alpha, beta, vsl, vsr)
+
+# ── SVD front-half / generalized SVD. `bdsqr!` gets two methods: the real 4-argument form the contract
+# declares, and the complex 6-argument form, which is a separate kernel at a different arity.
+@inline gebd2!(::SIMDBackend, A::AbstractMatrix, d::AbstractVector, e::AbstractVector, tauq::AbstractVector, taup::AbstractVector)::AbstractMatrix = gebd2!(A, d, e, tauq, taup)
+@inline bdsqr!(::SIMDBackend, d::AbstractVector, e::AbstractVector, U::Union{Nothing, AbstractMatrix}, V::Union{Nothing, AbstractMatrix})::AbstractVector = bdsqr!(d, e, U, V)
+@inline bdsqr!(::SIMDBackend, uplo::AbstractChar, d::AbstractVector, e::AbstractVector, Vt::AbstractMatrix, U::AbstractMatrix, C::AbstractMatrix)::Tuple = bdsqr!(uplo, d, e, Vt, U, C)
+@inline ggsvd!(::SIMDBackend, jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar, A::AbstractMatrix, B::AbstractMatrix, U::AbstractMatrix, V::AbstractMatrix, Q::AbstractMatrix, alpha::AbstractVector, beta::AbstractVector, R::AbstractMatrix)::Tuple = ggsvd!(jobu, jobv, jobq, A, B, U, V, Q, alpha, beta, R)
+
+# ── Least squares / constrained least squares / tridiagonal eigen. `gglse!`/`stebz!`/`stein!` bind the
+# trailing-buffer forms; their convenience siblings allocate x / w+iblock+isplit / Z.
+@inline gels!(::SIMDBackend, trans::Char, A::AbstractMatrix, B::AbstractMatrix)::Tuple = gels!(trans, A, B)
+@inline gelsy!(::SIMDBackend, A::AbstractMatrix, B::AbstractMatrix, jpvt::AbstractVector, rcond::Real)::Tuple = gelsy!(A, B, jpvt, rcond)
+@inline gglse!(::SIMDBackend, A::AbstractMatrix, c::AbstractVector, B::AbstractMatrix, d::AbstractVector, x::AbstractVector)::Tuple = gglse!(A, c, B, d, x)
+@inline stebz!(::SIMDBackend, range::AbstractChar, order::AbstractChar, vl::Real, vu::Real, il::Integer, iu::Integer, abstol::Real, d::AbstractVector, e::AbstractVector, w::AbstractVector, iblock::AbstractVector, isplit::AbstractVector)::Tuple = stebz!(range, order, vl, vu, il, iu, abstol, d, e, w, iblock, isplit)
+@inline stein!(::SIMDBackend, d::AbstractVector, e::AbstractVector, w::AbstractVector, iblock::AbstractVector, isplit::AbstractVector, Z::AbstractMatrix)::AbstractMatrix = stein!(d, e, w, iblock, isplit, Z)

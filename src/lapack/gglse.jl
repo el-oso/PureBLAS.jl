@@ -65,15 +65,16 @@ function _ggl_geqr2!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
 end
 
 # ĉ := Zᴴ·c  where Z = Q of the QR in `A` (tau).  Zᴴ = H(k)ᴴ···H(1)ᴴ ⟹ apply H(i)ᴴ forward i=1:k.
-function _ggl_apply_Zh!(A::AbstractMatrix{T}, tau::AbstractVector{T}, c::AbstractVector{T}, k::Int) where {T}
+# `cm` is an m×1 MATRIX, not a vector: `_house_left!` wants a matrix, and taking one directly avoids a
+# `reshape` — `reshape(::SubArray, m, 1)` routes to Base._throw_dmrs, which `juliac --trim=safe` rejects.
+function _ggl_apply_Zh!(A::AbstractMatrix{T}, tau::AbstractVector{T}, cm::AbstractMatrix{T}, k::Int) where {T}
     m = size(A, 1)
-    cm = reshape(c, m, 1)
     @inbounds for i in 1:k
         v = view(A, i:m, i); ai = v[1]; A[i, i] = one(T)  # v[1] ≡ 1
         _house_left!(view(cm, i:m, :), v, T <: Complex ? conj(tau[i]) : tau[i])
         A[i, i] = ai
     end
-    return c
+    return cm
 end
 
 # Unblocked RQ factorization of B (p×n, p ≤ n), accumulating the orthonormal factor into G (n×n).
@@ -108,42 +109,47 @@ end
 
 """
     gglse!(A, c, B, d) -> (x, res)
+    gglse!(A, c, B, d, x) -> (x, res)
 
 Solve the equality-constrained least-squares problem  minimize ‖A·x − c‖₂  subject to  B·x = d.
 `A` is m×n, `B` is p×n, `c` length m, `d` length p, requiring `p ≤ n ≤ m+p`. Returns the solution
 `x` (length n) and the residual norm `res = ‖A·x − c‖₂`. `A`, `B`, `c`, `d` are overwritten (LAPACK
 dgglse convention). Matches `LinearAlgebra.LAPACK.gglse!`.
+
+The five-argument form writes the solution into the caller-provided `x` (length ≥ n) and allocates
+nothing. `x` must not alias `A` or `c`: both are read AFTER `x` is formed, to compute the returned
+residual ‖A·x − c‖₂, so an aliased `x` silently corrupts it (`B` and `d` are fully consumed before
+`x` is written, so they are not restricted).
 """
 function gglse!(
         A::AbstractMatrix{T}, c::AbstractVector{T}, B::AbstractMatrix{T},
-        d::AbstractVector{T}
+        d::AbstractVector{T}, x::AbstractVector{T}
     ) where {T <: BlasFloat}
     m, n = size(A); p = size(B, 1)
     size(B, 2) == n || throw(DimensionMismatch("gglse!: A and B must have the same number of columns"))
     length(c) == m || throw(DimensionMismatch("gglse!: length(c) ≠ rows(A)"))
     length(d) == p || throw(DimensionMismatch("gglse!: length(d) ≠ rows(B)"))
     (p <= n && n <= m + p) || _throw_gglse_dims(m, n, p)
+    length(x) >= n || throw(DimensionMismatch("gglse!: length(x) must be ≥ cols(A)"))
+    (Base.mightalias(x, A) || Base.mightalias(x, c)) &&
+        throw(ArgumentError("gglse!: `x` must not alias `A` or `c` (both are read after x is formed, for the residual)"))
     np = n - p                                           # y₁ length
+    G, Atil, tauz, ĉ, y, r = _gglse_work(T, m, n, min(m, n))
 
     # 1) RQ of B, explicit orthonormal factor G (Q = Gᴴ):  B_orig = R·Gᴴ,  R = B[1:p, np+1:n].
-    G = Matrix{T}(undef, n, n)
     _ggl_gerq2_accumG!(B, G)
 
     # 2) Ã = A·Qᴴ = A·G  (m×n), then QR:  Ã = Z·T  (Z reflectors + T upper-trapezoidal in Ã).
-    Atil = Matrix{T}(undef, m, n)
     gemm!(Atil, A, G)                                    # Atil = A·G
-    tauz = Vector{T}(undef, min(m, n))
     _ggl_geqr2!(Atil, tauz)
 
-    # 3) ĉ = Zᴴ·c.
-    ĉ = Vector{T}(undef, m)
+    # 3) ĉ = Zᴴ·c.  (ĉ is an m×1 MATRIX — see _ggl_apply_Zh!'s reshape note.)
     @inbounds for i in 1:m
-        ĉ[i] = c[i]
+        ĉ[i, 1] = c[i]
     end
     _ggl_apply_Zh!(Atil, tauz, ĉ, min(m, n))
 
     # 4) y₂ = R⁻¹·d   (R = B[1:p, np+1:n], p×p upper-tri).  y[np+1:n] = y₂.
-    y = Vector{T}(undef, n)
     @inbounds for i in 1:p
         y[np + i] = d[i]
     end
@@ -151,31 +157,38 @@ function gglse!(
 
     # 5) ĉ₁ := ĉ₁ − T₁₂·y₂   (T₁₂ = Ã[1:np, np+1:n]).
     @inbounds for i in 1:np
-        s = ĉ[i]
+        s = ĉ[i, 1]
         for j in 1:p
             s -= Atil[i, np + j] * y[np + j]
         end
-        ĉ[i] = s
+        ĉ[i, 1] = s
     end
 
     # 6) y₁ = T₁₁⁻¹·ĉ₁   (T₁₁ = Ã[1:np,1:np] upper-tri).  y[1:np] = y₁.
     if np > 0
         @inbounds for i in 1:np
-            y[i] = ĉ[i]
+            y[i] = ĉ[i, 1]
         end
         _ggl_trsv_upper!(view(Atil, 1:np, 1:np), view(y, 1:np), np)
     end
 
-    # 7) x = Qᴴ·y = G·y.
-    x = Vector{T}(undef, n)
-    gemv!(x, G, y)
+    # 7) x = Qᴴ·y = G·y.   (gemv! wants an exactly-n destination, so take the leading block of x.)
+    xv = view(x, 1:n)
+    gemv!(xv, G, y)
 
     # residual ‖A·x − c‖₂, computed directly (A and c are untouched by the steps above).
-    r = Vector{T}(undef, m)
-    gemv!(r, A, x)                                        # r = A·x
+    gemv!(r, A, xv)                                       # r = A·x
     res = zero(real(T))
     @inbounds for i in 1:m
         res += abs2(r[i] - c[i])
     end
     return x, sqrt(res)
+end
+
+# Allocating convenience form — identical behaviour and return value to the pre-workspace gglse!.
+function gglse!(
+        A::AbstractMatrix{T}, c::AbstractVector{T}, B::AbstractMatrix{T},
+        d::AbstractVector{T}
+    ) where {T <: BlasFloat}
+    return gglse!(A, c, B, d, Vector{T}(undef, size(A, 2)))
 end

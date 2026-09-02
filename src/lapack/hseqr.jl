@@ -718,7 +718,7 @@ function hseqr!(
             Z[i, i] = one(T)
         end
     end
-    wr = Vector{T}(undef, n); wi = Vector{T}(undef, n)
+    wr, wi = _hseqr_work(T, n)                 # owned; no fill! on entry — see the info>0 branch below
     ilo = Int(ilo); ihi = Int(ihi)
     @inbounds for i in 1:(ilo - 1)
         wr[i] = H[i, i]; wi[i] = zero(T)
@@ -727,6 +727,15 @@ function hseqr!(
         wr[i] = H[i, i]; wi[i] = zero(T)
     end
     info = _dlahqr!(wantt, wantz, H, ilo, ihi, wr, wi, 1, n, Z)
+    # NON-CONVERGENCE: `_dlahqr!` leaves ilo:info unwritten, yet the loop below forms w[i] for ALL i.
+    # With a fresh `undef` vector that was documented garbage (reference LAPACK calls w[1:info] invalid);
+    # with an OWNED buffer it would be the PREVIOUS call's eigenvalues — plausible-looking and worse.
+    # Zero that range instead, so a failed call cannot masquerade as a converged one.
+    if info > 0
+        @inbounds for i in ilo:min(info, n)
+            wr[i] = zero(T); wi[i] = zero(T)
+        end
+    end
     @inbounds for i in 1:n
         w[i] = Complex(wr[i], wi[i])
     end

@@ -8,17 +8,9 @@
 # alongside hseqr.jl/trevc.jl which carry their own dlanv2/dlaln2 copies).  STANDALONE: not wired into
 # the PureBLAS module include list or the C-ABI — driven directly (or from trsen.jl).
 
-# 2x2 block builder that avoids a MATRIX LITERAL. `R[a b; c d]` lowers to `Base.typed_hvcat`,
-# whose argument-count error message interpolates eagerly, so `Base.print_to_string` -- and with
-# it `_str_sizehint(::Any)` / `print(::IOBuffer, ::Any)` -- becomes reachable and `juliac
-# --trim=safe` rejects the whole call tree. That is what made `trsyl!` trim-incompatible (req#4);
-# the string is Base's, not ours, but the literal is what reaches it. Assigning elementwise builds
-# the identical 2x2 with no hvcat on the path.
-@inline function _syl_vb2(::Type{R}, a, b, c, d) where {R}
-    M = Matrix{R}(undef, 2, 2)
-    M[1, 1] = a; M[1, 2] = b; M[2, 1] = c; M[2, 2] = d
-    return M
-end
+# (The 2x2 `_syl_vb2` RHS builder that used to live here is gone: `_syl_dlasy2` only ever read B[1,1],
+# B[2,1], B[1,2], B[2,2], so it now takes those four as SCALARS. That deletes the helper, its 112 B per
+# 2x2/2x2 block pair, and all four call sites' matrix build — the laziest form of "own the buffer".)
 
 @inline function _syl_safmin(::Type{R}) where {R <: Real}
     sfmin = floatmin(R)
@@ -97,12 +89,14 @@ const _SYL_RSWAP = (false, true, false, true)
 end
 
 # ── DLASY2 (Reference-LAPACK verbatim) — solve the small Sylvester op(TL)·X ± X·op(TR) = scale·B ───────
-# n1,n2 ∈ {1,2}. TL (n1×n1), TR (n2×n2), B (n1×n2) are passed as AbstractMatrix (0-based-safe views).
+# n1,n2 ∈ {1,2}. TL (n1×n1), TR (n2×n2) are passed as AbstractMatrix (0-based-safe views); the n1×n2 RHS
+# B arrives as the four SCALARS b11,b21,b12,b22 in column-major order (only those entries were ever read,
+# and the slots outside the actual n1×n2 shape are ignored — pass zero).
 # isgn = ±1 sets the sign; ltranl/ltranr transpose TL/TR. Returns (x11,x21,x12,x22, scale, xnorm, info)
 # (X is n1×n2, column-major into the four slots). This is the 2×2 conj-pair block solve — a bug locus.
 function _syl_dlasy2(
         ltranl::Bool, ltranr::Bool, isgn::Int, n1::Int, n2::Int,
-        TL::AbstractMatrix{R}, TR::AbstractMatrix{R}, B::AbstractMatrix{R}
+        TL::AbstractMatrix{R}, TR::AbstractMatrix{R}, b11::R, b21::R, b12::R, b22::R
     ) where {R <: Real}
     ZERO = zero(R); ONE = one(R); TWO = R(2); HALF = R(0.5); EIGHT = R(8)
     eps_p = eps(R)
@@ -118,9 +112,9 @@ function _syl_dlasy2(
         if bet <= smlnum
             tau1 = smlnum; bet = smlnum; info = 1
         end
-        gam = abs(B[1, 1])
+        gam = abs(b11)
         smlnum * gam > bet && (scale = ONE / gam)
-        x11 = (B[1, 1] * scale) / tau1
+        x11 = (b11 * scale) / tau1
         xnorm = abs(x11)
         return x11, x21, x12, x22, scale, xnorm, info
     elseif k == 2 || k == 3
@@ -141,7 +135,7 @@ function _syl_dlasy2(
             else
                 tmp2 = sgn * TR[1, 2]; tmp3 = sgn * TR[2, 1]
             end
-            btmp1 = B[1, 1]; btmp2 = B[1, 2]
+            btmp1 = b11; btmp2 = b12
         else
             smin = max(
                 eps_p * max(
@@ -156,7 +150,7 @@ function _syl_dlasy2(
             else
                 tmp2 = TL[2, 1]; tmp3 = TL[1, 2]
             end
-            btmp1 = B[1, 1]; btmp2 = B[2, 1]
+            btmp1 = b11; btmp2 = b21
         end
         tmp = (tmp1, tmp2, tmp3, tmp4)
         locu12 = (3, 4, 1, 2); locl21 = (2, 1, 4, 3); locu22 = (4, 3, 2, 1)
@@ -206,7 +200,12 @@ function _syl_dlasy2(
     smin = max(abs(TR[1, 1]), abs(TR[1, 2]), abs(TR[2, 1]), abs(TR[2, 2]))
     smin = max(smin, abs(TL[1, 1]), abs(TL[1, 2]), abs(TL[2, 1]), abs(TL[2, 2]))
     smin = max(eps_p * smin, smlnum)
-    t16 = zeros(R, 4, 4)
+    # `t16` arrives ZEROED from the accessor and that is LOAD-BEARING: the writes below cover only twelve
+    # of the sixteen entries — [1,4], [4,1], [2,3], [3,2] are never written — yet the complete-pivot search
+    # scans all sixteen and the elimination reads and updates them. Stale entries pick a wrong pivot, i.e.
+    # a wrong ANSWER, not noise. btmp/jpiv/tmpv need none (btmp fully written just below; jpiv[4] never
+    # written AND never read; tmpv written back-to-front so each read is of an already-written slot).
+    t16, btmp, jpiv, tmpv = _dlasy2_work(R)
     t16[1, 1] = TL[1, 1] + sgn * TR[1, 1]
     t16[2, 2] = TL[2, 2] + sgn * TR[1, 1]
     t16[3, 3] = TL[1, 1] + sgn * TR[2, 2]
@@ -223,8 +222,7 @@ function _syl_dlasy2(
         t16[1, 3] = sgn * TR[2, 1]; t16[2, 4] = sgn * TR[2, 1]
         t16[3, 1] = sgn * TR[1, 2]; t16[4, 2] = sgn * TR[1, 2]
     end
-    btmp = R[B[1, 1], B[2, 1], B[1, 2], B[2, 2]]
-    jpiv = zeros(Int, 4)
+    btmp[1] = b11; btmp[2] = b21; btmp[3] = b12; btmp[4] = b22
     for i in 1:3
         xmax = ZERO; ipsv = i; jpsv = i
         for ip in i:4, jp in i:4
@@ -263,8 +261,7 @@ function _syl_dlasy2(
             btmp[i] *= scale
         end
     end
-    tmpv = zeros(R, 4)
-    for i in 1:4
+    for i in 1:4                                   # tmpv (owned, above) is written back-to-front here
         kk = 5 - i
         temp = ONE / t16[kk, kk]
         tmpv[kk] = btmp[kk] * temp
@@ -397,8 +394,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sarow(k1, k2 + 1, m, l2) + sgn * sbcol(k1, 1, l1 - 1, l2))
                     v21 = C[k2, l1] - (sarow(k2, k2 + 1, m, l1) + sgn * sbcol(k2, 1, l1 - 1, l1))
                     v22 = C[k2, l2] - (sarow(k2, k2 + 1, m, l2) + sgn * sbcol(k2, 1, l1 - 1, l2))
-                    vb = _syl_vb2(R, v11, v12, v21, v22)
-                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
+                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), v11, v21, v12, v22)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
                 end
@@ -461,8 +457,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sacol(k1, 1, k1 - 1, l2) + sgn * sbcol(k1, 1, l1 - 1, l2))
                     v21 = C[k2, l1] - (sacol(k2, 1, k1 - 1, l1) + sgn * sbcol(k2, 1, l1 - 1, l1))
                     v22 = C[k2, l2] - (sacol(k2, 1, k1 - 1, l2) + sgn * sbcol(k2, 1, l1 - 1, l2))
-                    vb = _syl_vb2(R, v11, v12, v21, v22)
-                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
+                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, false, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), v11, v21, v12, v22)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
                 end
@@ -525,8 +520,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sacol(k1, 1, k1 - 1, l2) + sgn * sbrow(k1, l2, l2 + 1, n))
                     v21 = C[k2, l1] - (sacol(k2, 1, k1 - 1, l1) + sgn * sbrow(k2, l1, l2 + 1, n))
                     v22 = C[k2, l2] - (sacol(k2, 1, k1 - 1, l2) + sgn * sbrow(k2, l2, l2 + 1, n))
-                    vb = _syl_vb2(R, v11, v12, v21, v22)
-                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
+                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(true, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), v11, v21, v12, v22)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
                 end
@@ -589,8 +583,7 @@ function _dtrsyl!(
                     v12 = C[k1, l2] - (sarow(k1, k2 + 1, m, l2) + sgn * sbrow(k1, l2, l2 + 1, n))
                     v21 = C[k2, l1] - (sarow(k2, k2 + 1, m, l1) + sgn * sbrow(k2, l1, l2 + 1, n))
                     v22 = C[k2, l2] - (sarow(k2, k2 + 1, m, l2) + sgn * sbrow(k2, l2, l2 + 1, n))
-                    vb = _syl_vb2(R, v11, v12, v21, v22)
-                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), vb)
+                    x11, x21, x12, x22, scaloc, _, ie = _syl_dlasy2(false, true, isgn, 2, 2, Ablk(k1, k2), Bblk(l1, l2), v11, v21, v12, v22)
                     ie != 0 && (info = 1); scaleC!(scaloc)
                     C[k1, l1] = x11; C[k1, l2] = x12; C[k2, l1] = x21; C[k2, l2] = x22
                 end

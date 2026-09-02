@@ -188,7 +188,10 @@ function _tgevc_right!(
     ONE = one(R); ZERO = zero(R); SAFETY = R(100)
     safmin = _qz_safmin(R); ulp = eps(R)
     small = safmin * n / ulp; big = ONE / small; bignum = ONE / (safmin * n)
-    W = zeros(R, n, 6)   # cols: 1=Snorm(WORK j) 2=Pnorm(WORK N+j) 3=x.re 4=x.im 5=bt.re 6=bt.im
+    # cols: 1=Snorm(WORK j) 2=Pnorm(WORK N+j) 3=x.re 4=x.im 5=bt.re 6=bt.im. The accessor zeroes cols
+    # 3–4 (col 4 is never written at nw==1 yet is still passed to `_laln2` in a live argument slot);
+    # cols 1–2 and 5–6 are written before every read.
+    W, _ = _tgevc_work(R, n)
     # column 1-norms of strictly-upper (excluding diagonal blocks)
     anorm = abs(S[1, 1]); n > 1 && (anorm += abs(S[2, 1]))
     bnorm = abs(P[1, 1])
@@ -406,8 +409,8 @@ function _tgevc_right!(
     cabs1(z) = abs(real(z)) + abs(imag(z))
     safmin = _qz_safmin(R); ulp = eps(R)
     small = safmin * n / ulp; big = ONE / small; bignum = ONE / (safmin * n)
-    work = zeros(C, 2n)               # WORK(1:n)=x/sums, WORK(n+1:2n)=back-transform
-    rwork = zeros(R, 2n)              # RWORK(j)=Snorm, RWORK(n+j)=Pnorm
+    _, work = _tgevc_work(C, n)       # WORK(1:n)=x/sums, WORK(n+1:2n)=back-transform
+    rwork = _tgevc_rwork(C, n)        # RWORK(j)=Snorm, RWORK(n+j)=Pnorm (REAL-typed ⇒ a distinct owner)
     anorm = cabs1(S[1, 1]); bnorm = cabs1(P[1, 1])
     @inbounds for j in 2:n
         s = ZERO; b = ZERO

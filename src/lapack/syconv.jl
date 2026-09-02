@@ -10,18 +10,39 @@
 
 """
     syconv!(uplo, A, ipiv) -> (A, work)
+    syconv!(uplo, A, ipiv, work) -> (A, work)
 
 Convert the Bunch-Kaufman factors `(A, ipiv)` (as produced by `sytrf!`/`hetrf!`, `uplo` matching)
 into LAPACK's "convert" form in place: `work` (length `n`) receives the off-diagonal entry of each
 2×2 block of `D` (`0` where the pivot at that position is 1×1), and those entries are zeroed in `A`.
 Mirrors `LinearAlgebra.LAPACK.syconv!`. Generic over `T<:Number` (s/d/c/z).
+
+`work` is an OUTPUT, so it cannot come from the owned workspace; the 4-argument form takes it from the
+caller (`length(work) >= n`, `AbstractVector{T}` so a `PtrVector` from a C-ABI shim matches) and
+allocates nothing. It never READS `work` and writes every index `1:n` on every call, so an `undef`
+buffer is safe and a reused one can never hand back stale data.
+
+`work` must not alias `A`: the extraction reads `A[i-1,i]` into `work[i]` and then zeroes it, and the
+row interchanges afterwards permute A wholesale — an aliased buffer would corrupt both silently. The
+4-argument form throws an `ArgumentError` when `Base.mightalias` can see the overlap. (It cannot see
+through a raw pointer wrapper such as `PtrVector`, which `Base.mightalias` reports as non-aliasing
+because the wrapper is `isbits`; a C caller passing an overlapping `work` pointer is outside Julia's
+reach either way.)
 """
 function syconv!(uplo::AbstractChar, A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
+    return syconv!(uplo, A, ipiv, Vector{T}(undef, size(A, 1)))
+end
+
+function syconv!(
+        uplo::AbstractChar, A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
+        work::AbstractVector{T}
+    ) where {T}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("syconv!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("syconv!: length(ipiv) must equal size(A,1)"))
+    length(work) >= n || throw(DimensionMismatch("syconv!: length(work) must be at least size(A,1)"))
     (uplo == 'U' || uplo == 'L') || throw(ArgumentError("syconv!: uplo must be 'U' or 'L'"))
-    work = zeros(T, n)
+    Base.mightalias(work, A) && throw(ArgumentError("syconv!: `work` must not alias `A`"))
     ZERO = zero(T)
     n == 0 && return A, work
     @inbounds if uplo == 'U'

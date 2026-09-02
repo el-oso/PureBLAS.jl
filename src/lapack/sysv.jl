@@ -194,7 +194,7 @@ function sytri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("sytri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytri!: uplo must be 'L' or 'U'"))
-    work = Vector{eltype(A)}(undef, n)
+    work = _sytri_work(eltype(A), n)
     return uplo == 'L' ? _sytri_lower!(A, ipiv, false, work) : _sytri_upper!(A, ipiv, false, work)
 end
 
@@ -211,36 +211,51 @@ function hetri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     length(ipiv) == n || throw(DimensionMismatch("hetri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetri!: uplo must be 'L' or 'U'"))
     herm = eltype(A) <: Complex
-    work = Vector{eltype(A)}(undef, n)
+    work = _sytri_work(eltype(A), n)
     return uplo == 'L' ? _sytri_lower!(A, ipiv, herm, work) : _sytri_upper!(A, ipiv, herm, work)
 end
 
 # ── one-shot solve  A·X = B  (factor + solve) ───────────────────────────────────────────────────────
 
+# `ipiv` is an OUTPUT (element 2 of the returned tuple — the caller needs it to drive a later
+# `sytrs!`/`sytri!`), so it can NOT come from the owned L3Workspace: the next call would silently
+# overwrite a view the caller still holds. The 4-argument form below takes it from the caller instead,
+# mirroring `getrf!(A, ipiv)` / `gbtrf!(kl, ku, m, AB, ipiv)`; the 3-argument form is the allocating
+# convenience and is kept byte-for-byte in behaviour (same tuple, same element types).
+#
+# Aliasing (lesson 9): `ipiv` is `<:Integer` while A/B carry the numeric element type, and `sytrf!`
+# needs division, so an `ipiv` that aliases A or B is not expressible for any T this factorization
+# runs on — no guard is added. A and B must stay distinct, which was already true of the 3-arg form.
+
 """
     sysv!(uplo, A, B) -> (A, ipiv, B)
+    sysv!(uplo, A, B, ipiv) -> (A, ipiv, B)
 
 Solve the symmetric-indefinite system A·X = B in place: Bunch-Kaufman–factor A (`sytrf!`, in the `uplo`
 triangle) then solve (`sytrs!`). On return A holds the factors, `ipiv` the pivots, and B the solution X.
+The 4-argument form writes the pivots into the caller's `ipiv` (length `size(A,1)`, checked by `sytrf!`)
+and allocates nothing.
 """
-function sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat)
-    n = size(A, 1)
-    ipiv = Vector{Int}(undef, n)
+function sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
     sytrf!(A, ipiv; uplo = uplo)
     sytrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B
 end
+sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat) =
+    sysv!(uplo, A, B, Vector{Int}(undef, size(A, 1)))
 
 """
     hesv!(uplo, A, B) -> (A, ipiv, B)
+    hesv!(uplo, A, B, ipiv) -> (A, ipiv, B)
 
 Solve the Hermitian system A·X = B in place via the Hermitian Bunch-Kaufman factorization (`hetrf!` then
-`hetrs!`). For real `eltype(A)` this equals `sysv!`.
+`hetrs!`). For real `eltype(A)` this equals `sysv!`. The 4-argument form writes the pivots into the
+caller's `ipiv` and allocates nothing.
 """
-function hesv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat)
-    n = size(A, 1)
-    ipiv = Vector{Int}(undef, n)
+function hesv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
     hetrf!(A, ipiv; uplo = uplo)
     hetrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B
 end
+hesv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat) =
+    hesv!(uplo, A, B, Vector{Int}(undef, size(A, 1)))

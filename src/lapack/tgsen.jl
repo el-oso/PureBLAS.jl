@@ -92,7 +92,7 @@ end
 # tiny Matrix{R} temporaries; allocation is fine here and everything is trim-safe (no eval/closures).
 
 # Scaled Frobenius norm of A[i1:i2, jl:jh] (DLASSQ-style over/underflow safety).
-function _tgs_fnorm(A::Matrix{R}, i1::Int, i2::Int, jl::Int, jh::Int) where {R <: Real}
+function _tgs_fnorm(A::AbstractMatrix{R}, i1::Int, i2::Int, jl::Int, jh::Int) where {R <: Real}
     amax = zero(R)
     @inbounds for j in jl:jh, i in i1:i2
         amax = max(amax, abs(A[i, j]))
@@ -105,12 +105,13 @@ function _tgs_fnorm(A::Matrix{R}, i1::Int, i2::Int, jl::Int, jh::Int) where {R <
     return amax * sqrt(ss)
 end
 
-# C = op(A)·op(B) (op = transpose iff flag), small dense, allocating.
-function _tgs_matmul(ta::Bool, tb::Bool, A::Matrix{R}, B::Matrix{R}) where {R <: Real}
+# C = op(A)·op(B) (op = transpose iff flag), small dense, into a caller-supplied C. Every element of
+# C[1:m, 1:n] is assigned, so C never needs zeroing. C must not alias A or B (all call sites pass a
+# workspace ping/pong buffer distinct from both operands).
+function _tgs_matmul!(C::AbstractMatrix{R}, ta::Bool, tb::Bool, A::AbstractMatrix{R}, B::AbstractMatrix{R}) where {R <: Real}
     m = ta ? size(A, 2) : size(A, 1)
     kk = ta ? size(A, 1) : size(A, 2)
     n = tb ? size(B, 1) : size(B, 2)
-    C = Matrix{R}(undef, m, n)
     @inbounds for j in 1:n, i in 1:m
         s = zero(R)
         for k in 1:kk
@@ -124,8 +125,8 @@ function _tgs_matmul(ta::Bool, tb::Bool, A::Matrix{R}, B::Matrix{R}) where {R <:
 end
 
 # ── DGEQR2 on A[1:m, 1:k] (Householder QR, reflectors stored in place, τ[1:k] filled) ────────────
-function _tgs_geqr2!(A::Matrix{R}, m::Int, k::Int, τ::Vector{R}) where {R <: Real}
-    v = Vector{R}(undef, m)
+# `v` is caller-supplied staging (length ≥ m); v[1:lv] is written before every `_qz_larfg!`.
+function _tgs_geqr2!(A::AbstractMatrix{R}, m::Int, k::Int, τ::AbstractVector{R}, v::AbstractVector{R}) where {R <: Real}
     @inbounds for i in 1:k
         lv = m - i + 1
         for t in 1:lv
@@ -154,7 +155,7 @@ function _tgs_geqr2!(A::Matrix{R}, m::Int, k::Int, τ::Vector{R}) where {R <: Re
 end
 
 # ── DORG2R: overwrite A with the full m×m Q of the k reflectors stored by _tgs_geqr2! ────────────
-function _tgs_org2r!(A::Matrix{R}, m::Int, k::Int, τ::Vector{R}) where {R <: Real}
+function _tgs_org2r!(A::AbstractMatrix{R}, m::Int, k::Int, τ::AbstractVector{R}) where {R <: Real}
     @inbounds begin
         for j in (k + 1):m
             for l in 1:m
@@ -190,8 +191,8 @@ function _tgs_org2r!(A::Matrix{R}, m::Int, k::Int, τ::Vector{R}) where {R <: Re
 end
 
 # ── DGERQ2 on the k×n submatrix A[r0+1:r0+k, 1:n] (RQ; reflectors in place, τ[1:k]) ──────────────
-function _tgs_gerq2!(A::Matrix{R}, r0::Int, k::Int, n::Int, τ::Vector{R}) where {R <: Real}
-    v = Vector{R}(undef, n)
+# `v` is caller-supplied staging (length ≥ n); v[1:e] is written before every `_qz_larfg!`.
+function _tgs_gerq2!(A::AbstractMatrix{R}, r0::Int, k::Int, n::Int, τ::AbstractVector{R}, v::AbstractVector{R}) where {R <: Real}
     @inbounds for i in k:-1:1
         ri = r0 + i
         e = n - k + i
@@ -223,7 +224,7 @@ function _tgs_gerq2!(A::Matrix{R}, r0::Int, k::Int, n::Int, τ::Vector{R}) where
 end
 
 # ── DORGR2: overwrite the m×m A with the full Q of the k RQ reflectors (stored in rows m−k+1..m) ─
-function _tgs_orgr2!(A::Matrix{R}, m::Int, k::Int, τ::Vector{R}) where {R <: Real}
+function _tgs_orgr2!(A::AbstractMatrix{R}, m::Int, k::Int, τ::AbstractVector{R}) where {R <: Real}
     @inbounds begin
         if k < m
             for j in 1:m
@@ -263,8 +264,8 @@ end
 
 # ── DORM2R (square m×m factor F, k=m): apply Q ('N') or Qᵀ ('T') to C from side 'L'/'R' ──────────
 function _tgs_orm2r!(
-        left::Bool, trans::Bool, m::Int, F::Matrix{R}, τ::Vector{R},
-        C::Matrix{R}
+        left::Bool, trans::Bool, m::Int, F::AbstractMatrix{R}, τ::AbstractVector{R},
+        C::AbstractMatrix{R}
     ) where {R <: Real}
     ir = (left != trans) ? (m:-1:1) : (1:1:m)      # (L,N)/(R,T) descending; (L,T)/(R,N) ascending
     @inbounds for i in ir
@@ -301,8 +302,8 @@ end
 
 # ── DORMR2 (square m×m factor F, k=m): row-stored RQ reflectors, side 'L'/'R', op 'N'/'T' ────────
 function _tgs_ormr2!(
-        left::Bool, trans::Bool, m::Int, F::Matrix{R}, τ::Vector{R},
-        C::Matrix{R}
+        left::Bool, trans::Bool, m::Int, F::AbstractMatrix{R}, τ::AbstractVector{R},
+        C::AbstractMatrix{R}
     ) where {R <: Real}
     ir = (left != trans) ? (m:-1:1) : (1:1:m)
     @inbounds for i in ir
@@ -338,7 +339,7 @@ function _tgs_ormr2!(
 end
 
 # ── DGETC2: LU with complete pivoting on the nz×nz Z (tiny pivots perturbed to smin) ─────────────
-function _tgs_getc2!(Z::Matrix{R}, nz::Int, ip::Vector{Int}, jp::Vector{Int}) where {R <: Real}
+function _tgs_getc2!(Z::AbstractMatrix{R}, nz::Int, ip::AbstractVector{Int}, jp::AbstractVector{Int}) where {R <: Real}
     ZERO = zero(R)
     info = 0
     eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
@@ -384,8 +385,8 @@ end
 
 # ── DGESC2: solve Z·x = scale·rhs from the _tgs_getc2! factors (scale ≤ 1 guards overflow) ───────
 function _tgs_gesc2!(
-        Z::Matrix{R}, nz::Int, rhs::Vector{R}, ip::Vector{Int},
-        jp::Vector{Int}
+        Z::AbstractMatrix{R}, nz::Int, rhs::AbstractVector{R}, ip::AbstractVector{Int},
+        jp::AbstractVector{Int}
     ) where {R <: Real}
     ONE = one(R); TWO = R(2)
     eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
@@ -429,12 +430,13 @@ end
 # via the 2·n1·n2 Kronecker system with complete-pivot LU. Overwrites C←Rm, F←Lm. Returns
 # (scale, ierr); ierr > 0 ⟺ a pivot was perturbed (caller rejects the swap, as dtgex2 does).
 function _tgs_tgsy2!(
-        S::Matrix{R}, Tm::Matrix{R}, n1::Int, n2::Int,
-        C::Matrix{R}, Fm::Matrix{R}
+        S::AbstractMatrix{R}, Tm::AbstractMatrix{R}, n1::Int, n2::Int,
+        C::AbstractMatrix{R}, Fm::AbstractMatrix{R}
     ) where {R <: Real}
     p = n1 * n2; nz = 2 * p
-    Z = zeros(R, nz, nz)
-    rhs = Vector{R}(undef, nz)
+    # Z ARRIVES ZEROED from the accessor and that is load-bearing: it is built entirely by the `+=`/`-=`
+    # accumulation below, with no prior full write. rhs/ip/jp are fully written before any read.
+    Z, rhs, ip, jp = _tgsy2_work(R, nz)
     @inbounds for j in 1:n2, i in 1:n1
         r = (j - 1) * n1 + i
         for k in 1:n1                       # + S11[i,k]·Rm[k,j] / + T11[i,k]·Rm[k,j]
@@ -448,7 +450,6 @@ function _tgs_tgsy2!(
         rhs[r] = C[i, j]
         rhs[p + r] = Fm[i, j]
     end
-    ip = Vector{Int}(undef, nz); jp = Vector{Int}(undef, nz)
     ierr = _tgs_getc2!(Z, nz, ip, jp)
     scale = _tgs_gesc2!(Z, nz, rhs, ip, jp)
     @inbounds for j in 1:n2, i in 1:n1
@@ -559,7 +560,11 @@ function _dtgex2_big!(
     m = n1 + n2
     jm = j1 + m - 1
     jm <= n || return 0                    # LAPACK dtgex2 early no-op guard
-    S = Matrix{R}(undef, m, m); Tm = Matrix{R}(undef, m, m)
+    # Every temporary below is an owned fixed-size workspace view: n1,n2 ∈ {1,2} at every `_dtgex2!`
+    # call site, so m = n1+n2 ≤ 4 and nz = 2·n1·n2 ≤ 8. `_tgs_matmul` used to RETURN a fresh matrix and
+    # the caller rebound S/Tm/LI/IR; with fixed buffers those rebinds are `copyto!`s and the two nested
+    # products run through the M1/M2 ping-pong pair.
+    S, Tm, Cm, Fm = _tgex2_blocks(R, m, n1, n2)
     @inbounds for j in 1:m, i in 1:m
         S[i, j] = A[j1 + i - 1, j1 + j - 1]
         Tm[i, j] = B[j1 + i - 1, j1 + j - 1]
@@ -570,7 +575,6 @@ function _dtgex2_big!(
     thresha = max(TWENTY * eps_p * dnorma, smlnum)
     threshb = max(TWENTY * eps_p * dnormb, smlnum)
     # generalized Sylvester solve: S11·Rm − Lm·S22 = scale·S12, T11·Rm − Lm·T22 = scale·T12
-    Cm = Matrix{R}(undef, n1, n2); Fm = Matrix{R}(undef, n1, n2)
     @inbounds for j in 1:n2, i in 1:n1
         Cm[i, j] = S[i, n1 + j]
         Fm[i, j] = Tm[i, n1 + j]
@@ -578,18 +582,19 @@ function _dtgex2_big!(
     scale, ierr = _tgs_tgsy2!(S, Tm, n1, n2, Cm, Fm)
     ierr > 0 && return 1
     # left transform: QR of [−Lm; scale·I_n2]  →  full m×m Q in LI
-    LI = zeros(R, m, m)
+    # LI AND IR ARRIVE ZEROED from the accessor, both load-bearing: only LI[1:n1,1:n2] plus a unit
+    # sub-diagonal is written here yet `_tgs_geqr2!` reads all of LI[1:m,1:n2]; IR has only two sparse
+    # patterns written yet `_tgs_gerq2!` reads rows n2+1:n2+n1 across all of cols 1:m.
+    LI, IR, τl, τr, τl2, τr2, vq, vr = _tgex2_qr(R, m)
     @inbounds for j in 1:n2
         for i in 1:n1
             LI[i, j] = -Fm[i, j]
         end
         LI[n1 + j, j] = scale
     end
-    τl = Vector{R}(undef, m)
-    _tgs_geqr2!(LI, m, n2, τl)
+    _tgs_geqr2!(LI, m, n2, τl, vq)
     _tgs_org2r!(LI, m, n2, τl)
     # right transform: RQ of [scale·I_n1, Rm] (rows n2+1..m)  →  full m×m Q in IR
-    IR = zeros(R, m, m)
     @inbounds begin
         for j in 1:n2, i in 1:n1
             IR[n2 + i, n1 + j] = Cm[i, j]
@@ -598,28 +603,27 @@ function _dtgex2_big!(
             IR[n2 + i, i] = scale
         end
     end
-    τr = Vector{R}(undef, m)
-    _tgs_gerq2!(IR, n2, n1, m, τr)
+    _tgs_gerq2!(IR, n2, n1, m, τr, vr)
     _tgs_orgr2!(IR, m, n1, τr)
-    # tentative swap: S ← LIᵀ·S·IRᵀ, T likewise
-    S = _tgs_matmul(false, true, _tgs_matmul(true, false, LI, S), IR)
-    Tm = _tgs_matmul(false, true, _tgs_matmul(true, false, LI, Tm), IR)
-    SCPY = copy(S); TCPY = copy(Tm); IRCOP = copy(IR); LICOP = copy(LI)
+    # tentative swap: S ← LIᵀ·S·IRᵀ, T likewise (M1 = inner product, M2 = outer; both live at once)
+    M1, M2, PA, PB = _tgex2_mul(R, m)
+    _tgs_matmul!(M1, true, false, LI, S); _tgs_matmul!(M2, false, true, M1, IR); copyto!(S, M2)
+    _tgs_matmul!(M1, true, false, LI, Tm); _tgs_matmul!(M2, false, true, M1, IR); copyto!(Tm, M2)
+    SCPY, TCPY, IRCOP, LICOP = _tgex2_copies(R, m)
+    copyto!(SCPY, S); copyto!(TCPY, Tm); copyto!(IRCOP, IR); copyto!(LICOP, LI)
     # route 1: triangularize T by RQ (transform from the right)
-    τr2 = Vector{R}(undef, m)
-    _tgs_gerq2!(Tm, 0, m, m, τr2)
+    _tgs_gerq2!(Tm, 0, m, m, τr2, vr)
     _tgs_ormr2!(false, true, m, Tm, τr2, S)      # S ← S·Qᵀ
     _tgs_ormr2!(true, false, m, Tm, τr2, IR)     # IR ← Q·IR
     brqa21 = _tgs_fnorm(S, n2 + 1, m, 1, n2)
     # route 2: triangularize T by QR (transform from the left)
-    τl2 = Vector{R}(undef, m)
-    _tgs_geqr2!(TCPY, m, m, τl2)
+    _tgs_geqr2!(TCPY, m, m, τl2, vq)
     _tgs_orm2r!(true, true, m, TCPY, τl2, SCPY)  # SCPY ← Qᵀ·SCPY
     _tgs_orm2r!(false, false, m, TCPY, τl2, LICOP) # LICOP ← LICOP·Q
     bqra21 = _tgs_fnorm(SCPY, n2 + 1, m, 1, n2)
-    # weak stability test — pick the better route
+    # weak stability test — pick the better route (a rebind of four names before the buffers were owned)
     if bqra21 <= brqa21 && bqra21 <= thresha
-        S = SCPY; Tm = TCPY; IR = IRCOP; LI = LICOP
+        copyto!(S, SCPY); copyto!(Tm, TCPY); copyto!(IR, IRCOP); copyto!(LI, LICOP)
     elseif brqa21 >= thresha
         return 1
     end
@@ -627,8 +631,8 @@ function _dtgex2_big!(
         Tm[i, j] = ZERO
     end
     # strong stability test: ‖A_blk − LI·S·IR‖_F ≤ thresha and ‖B_blk − LI·T·IR‖_F ≤ threshb
-    PA = _tgs_matmul(false, false, _tgs_matmul(false, false, LI, S), IR)
-    PB = _tgs_matmul(false, false, _tgs_matmul(false, false, LI, Tm), IR)
+    _tgs_matmul!(M1, false, false, LI, S); _tgs_matmul!(PA, false, false, M1, IR)
+    _tgs_matmul!(M1, false, false, LI, Tm); _tgs_matmul!(PB, false, false, M1, IR)
     @inbounds for j in 1:m, i in 1:m
         PA[i, j] = A[j1 + i - 1, j1 + j - 1] - PA[i, j]
         PB[i, j] = B[j1 + i - 1, j1 + j - 1] - PB[i, j]
@@ -645,7 +649,9 @@ function _dtgex2_big!(
         B[j1 + i - 1, j1 + j - 1] = Tm[i, j]
     end
     # re-standardize the new 2×2 blocks (dlagv2) and fold those rotations into LI / IR
-    QL2 = zeros(R, m, m); IR2 = zeros(R, m, m)
+    # QL2/IR2 ARRIVE ZEROED, load-bearing: only their (1,1)/(m,m) entries and up to two 2×2 corner
+    # blocks are set below, yet both are then read IN FULL by `_tgs_matmul!` and the tmpA/tmpB loops.
+    QL2, IR2, tmpA, tmpB, w = _tgex2_rot(R, m, n1, n2)
     QL2[1, 1] = ONE; IR2[1, 1] = ONE
     QL2[m, m] = ONE; IR2[m, m] = ONE
     if n2 > 1
@@ -661,7 +667,6 @@ function _dtgex2_big!(
         IR2[n2 + 1, n2 + 2] = -snr; IR2[n2 + 2, n2 + 2] = csr
     end
     # off-diagonal (1:n2, n2+1:m) block of the standardized pair: QL2ᵀ·(·)·IR2 (block-local)
-    tmpA = Matrix{R}(undef, n2, n1); tmpB = Matrix{R}(undef, n2, n1)
     @inbounds for j in 1:n1, i in 1:n2
         sA = ZERO; sB = ZERO
         for k in 1:n2
@@ -679,11 +684,12 @@ function _dtgex2_big!(
         A[j1 + i - 1, j1 + n2 + j - 1] = sA
         B[j1 + i - 1, j1 + n2 + j - 1] = sB
     end
-    LI = _tgs_matmul(false, false, LI, QL2)
-    IR = _tgs_matmul(true, false, IR, IR2)
-    # accumulate into Q, Z
+    _tgs_matmul!(M1, false, false, LI, QL2); copyto!(LI, M1)
+    _tgs_matmul!(M1, true, false, IR, IR2); copyto!(IR, M1)
+    # accumulate into Q, Z — the only part of this routine that scales with n
+    bufq, bufz = _tgex2_accum(R, n, m)
     if wantq
-        buf = Matrix{R}(undef, n, m)
+        buf = bufq
         @inbounds for j in 1:m, i in 1:n
             s = ZERO
             for k in 1:m
@@ -696,7 +702,7 @@ function _dtgex2_big!(
         end
     end
     if wantz
-        buf = Matrix{R}(undef, n, m)
+        buf = bufz
         @inbounds for j in 1:m, i in 1:n
             s = ZERO
             for k in 1:m
@@ -709,7 +715,6 @@ function _dtgex2_big!(
         end
     end
     # update the off-block rows/columns of (A,B)
-    w = Vector{R}(undef, m)
     if jm < n
         @inbounds for j in (jm + 1):n
             for i in 1:m
@@ -971,23 +976,25 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # DTGSEN (IJOB=0 path only — reorder + eigenvalues, no PL/PR/DIF; see file header)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
+# `sel` is the CALLER's select vector, tested elementwise here — the entry no longer materialises a
+# `Bool[...]` comprehension. `alpha` (complex) and `beta` (real) are caller-provided outputs.
 function _dtgsen!(
-        sel::AbstractVector{Bool}, A::AbstractMatrix{R}, B::AbstractMatrix{R},
-        Q::AbstractMatrix{R}, Z::AbstractMatrix{R}
+        sel::AbstractVector, A::AbstractMatrix{R}, B::AbstractMatrix{R},
+        Q::AbstractMatrix{R}, Z::AbstractMatrix{R}, alpha::AbstractVector{<:Complex},
+        beta::AbstractVector{R}
     ) where {R <: Real}
     n = size(A, 1)
     ZERO = zero(R)
-    alphar = zeros(R, n); alphai = zeros(R, n); beta = zeros(R, n)
     # Collect the selected blocks at the top-left corner of (A,B).
     ks = 0; pair = false
     for k in 1:n
         if pair
             pair = false
         else
-            swap = sel[k]
+            swap = sel[k] != 0
             if k < n && A[k + 1, k] != ZERO
                 pair = true
-                swap = swap || sel[k + 1]
+                swap = swap || sel[k + 1] != 0
             end
             if swap
                 ks += 1
@@ -1005,6 +1012,9 @@ function _dtgsen!(
         end
     end
     # Compute generalized eigenvalues of the reordered pair and normalize (sign of B's diagonal).
+    # No fill! on the scratch: the loop below assigns alphar[k], alphai[k] and beta[k] at every k on
+    # both the 2×2 and the 1×1 branch (the old `zeros` was never load-bearing).
+    alphar, alphai = _tgsen_alpha_work(R, n)
     k = 1
     @inbounds while k <= n
         if k < n && A[k + 1, k] != ZERO
@@ -1026,7 +1036,10 @@ function _dtgsen!(
             k += 1
         end
     end
-    return A, B, alphar, alphai, beta, Q, Z
+    @inbounds for i in 1:n
+        alpha[i] = Complex(alphar[i], alphai[i])
+    end
+    return A, B, alpha, beta, Q, Z
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1104,14 +1117,15 @@ function _ztgexc!(
 end
 
 function _ztgsen!(
-        sel::AbstractVector{Bool}, A::AbstractMatrix{C}, B::AbstractMatrix{C},
-        Q::AbstractMatrix{C}, Z::AbstractMatrix{C}
+        sel::AbstractVector, A::AbstractMatrix{C}, B::AbstractMatrix{C},
+        Q::AbstractMatrix{C}, Z::AbstractMatrix{C}, alpha::AbstractVector{C},
+        beta::AbstractVector{C}
     ) where {C <: Complex}
     R = real(C)
     n = size(A, 1)
     ks = 0
     for k in 1:n
-        if sel[k]
+        if sel[k] != 0
             ks += 1
             if k != ks
                 info = _ztgexc!(true, true, A, B, Q, Z, k, ks)
@@ -1119,7 +1133,6 @@ function _ztgsen!(
             end
         end
     end
-    alpha = Vector{C}(undef, n); beta = Vector{C}(undef, n)
     safmin = _syl_safmin(R)
     @inbounds for k in 1:n
         dscale = abs(B[k, k])
@@ -1149,6 +1162,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 """
     tgsen!(select, S, T, Q, Z) -> (S, T, alpha, beta, Q, Z)
+    tgsen!(select, S, T, Q, Z, alpha, beta) -> (S, T, alpha, beta, Q, Z)   [in-place]
 
 Reorder the generalized Schur pair `(S,T)` (`S` (quasi-)upper-triangular, `T` upper-triangular,
 `Q·S·Zᴴ`/`Q·T·Zᴴ` the original matrix pair) so that the generalized eigenvalues selected by
@@ -1161,11 +1175,11 @@ Both paths are complete. The REAL path handles every adjacent-block swap combina
 1×1↔2×2, 2×2↔1×1, 2×2↔2×2 — complex-conjugate eigenvalue pairs reorder like LAPACK's dtgex2);
 a swap LAPACK would reject as too ill-conditioned (info=1) throws, matching the LAPACKException
 Julia's wrapper raises. The COMPLEX path has no 2×2 blocks (complex Schur form is triangular).
+
+The trailing-buffer form writes the eigenvalues into the caller's `alpha`/`beta` and allocates
+nothing. `select` is read elementwise (`select[i] != 0`), so any integer/Bool vector works.
 """
-function tgsen!(
-        select::AbstractVector, S::AbstractMatrix{R}, T::AbstractMatrix{R},
-        Q::AbstractMatrix{R}, Z::AbstractMatrix{R}
-    ) where {R <: Real}
+@inline function _tgsen_dims(select, S, T, Q, Z)
     n = size(S, 1)
     (
         n == size(S, 2) == size(T, 1) == size(T, 2) == size(Q, 1) == size(Q, 2) ==
@@ -1173,23 +1187,49 @@ function tgsen!(
     ) ||
         throw(DimensionMismatch("tgsen!: S, T, Q, Z must be square of matching size"))
     length(select) == n || throw(DimensionMismatch("tgsen!: select must have length n"))
-    sel = Bool[select[i] != 0 for i in 1:n]
-    Ar, Br, alphar, alphai, beta, Qr, Zr = _dtgsen!(sel, S, T, Q, Z)
-    alpha = Complex{R}.(alphar, alphai)
-    return Ar, Br, alpha, beta, Qr, Zr
+    return n
+end
+
+function tgsen!(
+        select::AbstractVector, S::AbstractMatrix{R}, T::AbstractMatrix{R},
+        Q::AbstractMatrix{R}, Z::AbstractMatrix{R}
+    ) where {R <: Real}
+    n = _tgsen_dims(select, S, T, Q, Z)
+    alpha = Vector{Complex{R}}(undef, n); beta = zeros(R, n)
+    return _dtgsen!(select, S, T, Q, Z, alpha, beta)
 end
 
 function tgsen!(
         select::AbstractVector, S::AbstractMatrix{C}, T::AbstractMatrix{C},
         Q::AbstractMatrix{C}, Z::AbstractMatrix{C}
     ) where {C <: Complex}
-    n = size(S, 1)
-    (
-        n == size(S, 2) == size(T, 1) == size(T, 2) == size(Q, 1) == size(Q, 2) ==
-            size(Z, 1) == size(Z, 2)
-    ) ||
-        throw(DimensionMismatch("tgsen!: S, T, Q, Z must be square of matching size"))
-    length(select) == n || throw(DimensionMismatch("tgsen!: select must have length n"))
-    sel = Bool[select[i] != 0 for i in 1:n]
-    return _ztgsen!(sel, S, T, Q, Z)
+    n = _tgsen_dims(select, S, T, Q, Z)
+    alpha = Vector{C}(undef, n); beta = Vector{C}(undef, n)
+    return _ztgsen!(select, S, T, Q, Z, alpha, beta)
+end
+
+# Lesson 9 — alpha and beta are pure outputs, written only in the final normalisation loop after every
+# swap, so an unrelated buffer is safe; `alpha === beta` is not (the complex path writes both at the
+# same index in one pass, so the second store would clobber the first).
+function tgsen!(
+        select::AbstractVector, S::AbstractMatrix{R}, T::AbstractMatrix{R},
+        Q::AbstractMatrix{R}, Z::AbstractMatrix{R}, alpha::AbstractVector{<:Complex},
+        beta::AbstractVector{R}
+    ) where {R <: Real}
+    n = _tgsen_dims(select, S, T, Q, Z)
+    (length(alpha) == n && length(beta) == n) ||
+        throw(DimensionMismatch("tgsen!: alpha and beta must have length n"))
+    return _dtgsen!(select, S, T, Q, Z, alpha, beta)
+end
+
+function tgsen!(
+        select::AbstractVector, S::AbstractMatrix{C}, T::AbstractMatrix{C},
+        Q::AbstractMatrix{C}, Z::AbstractMatrix{C}, alpha::AbstractVector{C},
+        beta::AbstractVector{C}
+    ) where {C <: Complex}
+    n = _tgsen_dims(select, S, T, Q, Z)
+    (length(alpha) == n && length(beta) == n) ||
+        throw(DimensionMismatch("tgsen!: alpha and beta must have length n"))
+    Base.mightalias(alpha, beta) && throw(ArgumentError("tgsen!: alpha and beta must be distinct"))
+    return _ztgsen!(select, S, T, Q, Z, alpha, beta)
 end

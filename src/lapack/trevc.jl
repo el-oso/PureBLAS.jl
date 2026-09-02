@@ -271,13 +271,14 @@ function _dtrevc_right!(over::Bool, T::AbstractMatrix{R}, VR::AbstractMatrix{R})
     ulp = eps(R)
     smlnum = unfl * (R(n) / ulp)
     bignum = (ONE - ulp) / smlnum
-    # column 1-norms of strict upper triangle
-    cnorm = zeros(R, n)
+    # column 1-norms of strict upper triangle. `cnorm` arrives ZEROED from the accessor and that is
+    # load-bearing: the loop below accumulates with `+=` and never touches cnorm[1], while the consumers
+    # (the bignum/xnorm tests) read cnorm[j] and cnorm[j-1] unconditionally with j reaching 1.
+    # xr/xi need no zeroing — every branch writes them down to 1:ki before any read.
+    cnorm, xr, xi = _trevc_rwork(R, n)          # WORK(1+N..) real part / WORK(1+N2..) imag part
     @inbounds for j in 2:n, i in 1:(j - 1)
         cnorm[j] += abs(T[i, j])
     end
-    xr = zeros(R, n)          # WORK(1+N .. )  real part
-    xi = zeros(R, n)          # WORK(1+N2 .. ) imag part
     ip = 0
     is = n
     ki = n
@@ -522,7 +523,7 @@ function _ztrevc_right!(over::Bool, T::AbstractMatrix{C}, VR::AbstractMatrix{C})
     unfl = _dtrevc_safmin(R)
     ulp = eps(R)
     smlnum = unfl * (R(n) / ulp)
-    x = zeros(C, n)
+    x = _trevc_work(C, n)     # owned; x[1:ki-1] and x[ki] written before any read, no fill! needed
     is = n
     @inbounds for ki in n:-1:1
         smin = max(ulp * cabs1(T[ki, ki]), smlnum)

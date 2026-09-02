@@ -241,6 +241,75 @@ function ormrz! end   # apply tzrzf Z to C
 function orgtr! end   # form Q from sytrd reflectors (in-place form)
 function ungtr! end   # form Q from hetrd reflectors (in-place form)
 
+# ── Nonsymmetric eigen family: balance, Hessenberg reduction, Schur, eigenvectors, drivers ────────
+# All measured 0-alloc + type-stable in their IN-PLACE forms (bench/probes/strict_contract_eligibility.jl),
+# which is what the members below bind. The allocating convenience siblings — `gebal!(A; job)`,
+# `gehrd!(A)`, `geev!(jobvl, jobvr, A)`, `gees!(jobvs, A)` — are deliberately NOT members, for the same
+# reason `gbtrf!`/`gesvx!`'s are not: a contract a method can satisfy while allocating its own output
+# is worth nothing. Three names are absent on purpose:
+#   • `unmhr!` — a `const un*! = or*!` alias (hessenberg.jl:379), so `ormhr!`'s method IS its method.
+#     Declaring `function unmhr! end` here would make that later `const` a redefinition error, because
+#     contracts.jl is included at PureBLAS.jl:20, long before hessenberg.jl.
+#   • `unghr!` (hessenberg.jl:344) is NOT an alias but a one-line forwarding METHOD onto `orghr!`, so it
+#     would need a backend method of its own for no new implementation. `orghr!` is the member.
+#   • `trsen!` — MEASURED 16 B/call at job∈{'V','B'} (Float64 AND ComplexF64, n=32): the `Base.RefValue`
+#     the `_lacn2_estimate` reverse-communication protocol carries `_dtrsyl!`'s `scale` out through.
+#     job∈{'N','E'} is 0 B, but the member would cover all four jobs, so it stays out until the Ref does.
+function gebal! end   # balance a general matrix (permute + diagonal scale), in-place `scale`
+function gebak! end   # undo gebal's balancing on the eigen/Schur vectors
+function gehrd! end   # reduce to upper Hessenberg, H = Qᴴ·A·Q
+function orghr! end   # form Q from gehrd's reflectors (unghr! forwards here)
+function ormhr! end   # apply gehrd's Q to C (unmhr! is the same object)
+function hseqr! end   # Schur decomposition of an upper-Hessenberg matrix (Francis double-shift QR)
+function trevc! end   # right eigenvectors of a (quasi-)triangular Schur form
+function trexc! end   # reorder one diagonal block of a Schur form
+function trsyl! end   # Sylvester equation op(A)·X ± X·op(B) = scale·C
+function geev! end    # general eigensolver driver (in-place output buffers)
+function gees! end    # Schur driver (in-place output buffers)
+
+# ── Bunch-Kaufman symmetric-indefinite / Hermitian family ────────────────────────────────────────
+# `sysv!`/`hesv!`/`syconv!` bind their 4-argument forms — the 3-argument convenience siblings allocate
+# `ipiv` / `work` and so cannot be members.
+function sytrf! end   # Bunch-Kaufman factor A = L·D·Lᵀ / U·D·Uᵀ (symmetric)
+function hetrf! end   # Bunch-Kaufman factor A = L·D·Lᴴ / U·D·Uᴴ (Hermitian)
+function sytrs! end   # solve from symmetric Bunch-Kaufman factors
+function hetrs! end   # solve from Hermitian Bunch-Kaufman factors
+function sytri! end   # explicit inverse from symmetric Bunch-Kaufman factors
+function hetri! end   # explicit inverse from Hermitian Bunch-Kaufman factors
+function sysv! end    # symmetric-indefinite solve: factor + solve (caller's ipiv)
+function hesv! end    # Hermitian solve: factor + solve (caller's ipiv)
+function syconv! end  # convert Bunch-Kaufman factors between LAPACK's two storage conventions
+
+# ── QZ / generalized-eigen family ────────────────────────────────────────────────────────────────
+# `tgsen!`/`ggev!`/`gges!` bind their trailing-buffer forms. `ggev!` is declared at its REAL arity
+# (alphar, alphai, beta): the complex in-place form takes one `alpha` instead and is therefore a
+# different arity, which a single contract member cannot express — it gets its own backend method and
+# its own `@verify_strict` line (backend.jl / verify.jl), so both arms are still held to the guarantee.
+function gghrd! end   # reduce a pencil (A,B) to generalized Hessenberg-triangular form
+function hgeqz! end   # generalized Schur form of a Hessenberg-triangular pencil (QZ iteration)
+function tgevc! end   # right eigenvectors of a generalized Schur form
+function tgsen! end   # reorder a generalized Schur form onto a selected cluster
+function ggev! end    # generalized eigensolver driver (in-place output buffers)
+function gges! end    # generalized Schur driver (in-place output buffers)
+
+# ── SVD front-half / generalized SVD ─────────────────────────────────────────────────────────────
+# `gebrd!` and `bdsdc!` are absent BY SIGNATURE, not by measurement: both take a PureBLAS-internal
+# `SVDWorkspace` as a positional argument, so contracting them would pin the backend interface to this
+# implementation's scratch type rather than to a swappable surface. Both measure 0 B.
+function gebd2! end   # unblocked bidiagonal reduction A = Q·B·Pᴴ
+function bdsqr! end   # bidiagonal SVD by implicit-shift QR (declared at its real 4-arg arity)
+function ggsvd! end   # generalized SVD of the pair (A,B) (in-place output buffers)
+
+# ── Least squares / constrained least squares / tridiagonal eigen ────────────────────────────────
+# `gelsd!` is absent: MEASURED 100 096 B/call at ComplexF64 (m=48, n=32) because its complex arm goes
+# through the complex `gesvd!`, itself the one factorization verify.jl already documents as not shown
+# 0-alloc. Its Float64 arm measures 0 B, so `gelsd!` becomes eligible the moment complex `gesvd!` does.
+function gels! end    # least-squares / min-norm solve over QR/LQ
+function gelsy! end   # rank-revealing least squares via column-pivoted QR + RZ
+function gglse! end   # equality-constrained least squares
+function stebz! end   # symmetric-tridiagonal eigenvalues by bisection (in-place w/iblock/isplit)
+function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration (in-place Z)
+
 @strict_contract AbstractLAPACK begin
     potrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor A = L·Lᴴ (or Uᴴ·U); overwrites the stored triangle"
     getrf!(::Self, ::AbstractMatrix)::Tuple => "LU with partial pivoting, P·A = L·U → (A, ipiv, info)"
@@ -286,4 +355,38 @@ function ungtr! end   # form Q from hetrd reflectors (in-place form)
     ormrz!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply tzrzf Z to C (side, trans)"
     orgtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from sytrd reflectors into a caller-supplied Q"
     ungtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from hetrd reflectors into a caller-supplied Q"
+    gebal!(::Self, ::AbstractMatrix, ::AbstractVector)::Tuple => "balance a general matrix into the caller's `scale` → (ilo, ihi)"
+    gebak!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::Integer, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "undo gebal's permutation and scaling on the eigen/Schur vectors"
+    gehrd!(::Self, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector)::AbstractMatrix => "reduce A[ilo:ihi, ilo:ihi] to upper Hessenberg, reflectors in A and tau"
+    orghr!(::Self, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector)::AbstractMatrix => "form Q in place from gehrd reflectors (A is overwritten with Q)"
+    ormhr!(::Self, ::Char, ::Char, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gehrd's Q to C (side, trans); A and tau are read-only"
+    hseqr!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector, ::AbstractMatrix)::Integer => "Schur decomposition of an upper-Hessenberg matrix → info"
+    trevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "right eigenvectors of a Schur form ('A') or their back-transform ('B')"
+    trexc!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::Integer, ::Integer)::Tuple => "move the diagonal block at ifst to ilst, accumulating into Q"
+    trsyl!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "Sylvester equation op(A)·X ± X·op(B) = scale·C → (X, scale)"
+    geev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "general eigensolver into caller buffers (real arity: wr, wi, VL, VR, scale)"
+    gees!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::Tuple => "Schur decomposition into caller buffers → (T, Z, w)"
+    sytrf!(::Self, ::AbstractMatrix, ::AbstractVector)::Integer => "Bunch-Kaufman factor of a symmetric matrix → info"
+    hetrf!(::Self, ::AbstractMatrix, ::AbstractVector)::Integer => "Bunch-Kaufman factor of a Hermitian matrix → info"
+    sytrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from symmetric Bunch-Kaufman factors"
+    hetrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from Hermitian Bunch-Kaufman factors"
+    sytri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from symmetric Bunch-Kaufman factors"
+    hetri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from Hermitian Bunch-Kaufman factors"
+    sysv!(::Self, ::Char, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVector)::Tuple => "symmetric-indefinite solve: sytrf! then sytrs!, pivots into the caller's ipiv"
+    hesv!(::Self, ::Char, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVector)::Tuple => "Hermitian solve: hetrf! then hetrs!, pivots into the caller's ipiv"
+    syconv!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "convert Bunch-Kaufman factors between LAPACK's two storage conventions"
+    gghrd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "reduce the pencil (A,B) to generalized Hessenberg-triangular form"
+    hgeqz!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Integer => "QZ iteration to generalized Schur form → info"
+    tgevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Integer => "right eigenvectors of a generalized Schur form"
+    tgsen!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "reorder a generalized Schur form onto the selected cluster"
+    ggev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized eigensolver into caller buffers (real arity: alphar, alphai, beta, vl, vr)"
+    gges!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized Schur decomposition into caller buffers"
+    gebd2!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractMatrix => "unblocked bidiagonal reduction A = Q·B·Pᴴ, reflectors in A"
+    bdsqr!(::Self, ::AbstractVector, ::AbstractVector, ::Union{Nothing, AbstractMatrix}, ::Union{Nothing, AbstractMatrix})::AbstractVector => "bidiagonal SVD by implicit-shift QR, singular values in d"
+    ggsvd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::Tuple => "generalized SVD of (A,B) into caller buffers → (k, l)"
+    gels!(::Self, ::Char, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "least-squares / minimum-norm solve of op(A)·X = B over QR/LQ"
+    gelsy!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Real)::Tuple => "rank-revealing least squares (pivoted QR + RZ) → (B, rank)"
+    gglse!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "equality-constrained least squares → (x, residual)"
+    stebz!(::Self, ::AbstractChar, ::AbstractChar, ::Real, ::Real, ::Integer, ::Integer, ::Real, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::Tuple => "symmetric-tridiagonal eigenvalues by bisection → (m, nsplit, info)"
+    stein!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "symmetric-tridiagonal eigenvectors by inverse iteration, into the caller's Z"
 end

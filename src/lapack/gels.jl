@@ -76,12 +76,28 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
         _throw_trans_ntc(:gels!, trans)
     (T <: Complex && trans === 'T') &&
         throw(ArgumentError("gels!: trans='T' invalid for complex element type — use 'C'"))
-    # M = op(A), p×q. (A itself is left untouched; LAPACK overwrites A, we don't need to.)
-    M = trans === 'N' ? Matrix{T}(A) : (trans === 'T' ? Matrix{T}(transpose(A)) : Matrix{T}(adjoint(A)))
-    p, q = size(M); k = min(p, q)
+    # M = op(A), p×q, on owned workspace. (A itself is left untouched — LAPACK overwrites A, we don't;
+    # that promise is exactly what forces M to exist even for trans='N'.)
+    ma, na = size(A)
+    p = trans === 'N' ? ma : na
+    q = trans === 'N' ? na : ma
+    k = min(p, q)
     size(B, 1) >= max(p, q) || _throw_brows_opa(:gels!, size(B, 1), max(p, q))
     nrhs = size(B, 2)
-    tau = Vector{T}(undef, k)
+    M, tau = _gels_work(T, p, q, k)
+    if trans === 'N'
+        @inbounds for j in 1:q, i in 1:p
+            M[i, j] = A[i, j]
+        end
+    elseif trans === 'T'
+        @inbounds for j in 1:q, i in 1:p
+            M[i, j] = A[j, i]
+        end
+    else
+        @inbounds for j in 1:q, i in 1:p
+            M[i, j] = conj(A[j, i])
+        end
+    end
     if p >= q
         # overdetermined:  x = R⁻¹·(Qᴴ·b)[1:q]
         _gels_factor!(M, tau)
@@ -89,7 +105,10 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
         trsm!(view(B, 1:q, :), view(M, 1:q, 1:q); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
     else
         # underdetermined min-norm:  Mᴴ = Q_r·R_r (tall QR),  M = R_rᴴ·Q_rᴴ,  x = Q_r·[R_r⁻ᴴ·b; 0]
-        Mh = Matrix{T}(adjoint(M))                         # q×p, tall
+        Mh = _gels_adj(T, q, p)                            # q×p, tall (own field: this arm only)
+        @inbounds for j in 1:p, i in 1:q
+            Mh[i, j] = conj(M[j, i])
+        end
         _gels_factor!(Mh, tau)                             # R_r = Mh[1:p,1:p] upper
         tc = T <: Complex ? 'C' : 'T'
         trsm!(view(B, 1:p, :), view(Mh, 1:p, 1:p); side = 'L', uplo = 'U', transA = tc, diag = 'N')  # w = R_r⁻ᴴ·b

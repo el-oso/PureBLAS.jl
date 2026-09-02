@@ -104,25 +104,40 @@ end
 end
 
 """
-    gebal!(A; job='B') -> (ilo, ihi, scale)
+    gebal!(A, scale; job='B') -> (ilo, ihi)
+    gebal!(A; job='B')        -> (ilo, ihi, scale)
 
 Balance a general square matrix `A` in place (LAPACK dgebal/zgebal). `job`:
 `'N'` none, `'P'` permute-only, `'S'` scale-only, `'B'` both (default). Returns the isolated-eigenvalue
 range `ilo:ihi` and the `scale` vector (permutation indices outside `ilo:ihi`, diagonal scaling factors
 within). The scaling loop copies dgebal exactly: radix `SCLFAC=2`, convergence `FACTOR=0.95`. Generic over
 `T<:Number`; `scale` is `real(T)`.
+
+The 2-argument form takes the caller's `scale` (length ≥ n, `real(T)`-valued) — the `getrf!(A, ipiv)`
+treatment — and allocates nothing; the 1-argument form is the allocating convenience wrapper.
+`scale[1:n]` is set to `one` on entry and THAT IS LOAD-BEARING: the `job='N'` and `n == 0` exits write
+nothing at all, so an unfilled (or reused) buffer would hand back live garbage where LAPACK returns
+all-ones.
 """
-function gebal!(A::AbstractMatrix{T}; job::Char = 'B') where {T <: Number}
+function gebal!(
+        A::AbstractMatrix{T}, scale::AbstractVector{<:Real}; job::Char = 'B'
+    ) where {T <: Number}
     R = real(T)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gebal!: A must be square"))
     (job === 'N' || job === 'P' || job === 'S' || job === 'B') ||
         throw(ArgumentError("gebal!: job must be one of N/P/S/B"))
-    scale = ones(R, n)                              # sane default for the degenerate l==1 exit
+    length(scale) >= n || throw(DimensionMismatch("gebal!: length(scale) < n"))
+    # `scale` is written while A is both read and written for the whole routine — an overlapping buffer
+    # corrupts both silently (see syconv!'s `work`). PtrVector/PtrMatrix are invisible to mightalias.
+    Base.mightalias(scale, A) && throw(ArgumentError("gebal!: `scale` must not alias `A`"))
+    @inbounds for i in 1:n                          # sane default for the degenerate l==1 / 'N' exits
+        scale[i] = one(R)
+    end
     k = 1; l = n
-    n == 0 && return k, l, scale
+    n == 0 && return k, l
     if job === 'N'
-        return k, l, scale                          # scale already all-ones; ilo=1, ihi=n
+        return k, l                                 # scale already all-ones; ilo=1, ihi=n
     end
 
     if job !== 'S'
@@ -211,6 +226,13 @@ function gebal!(A::AbstractMatrix{T}; job::Char = 'B') where {T <: Number}
     end
 
     @label finish
+    return k, l
+end
+
+# Allocating convenience form — unchanged behaviour and return value.
+function gebal!(A::AbstractMatrix{T}; job::Char = 'B') where {T <: Number}
+    scale = Vector{real(T)}(undef, size(A, 1))
+    k, l = gebal!(A, scale; job = job)
     return k, l, scale
 end
 
@@ -240,7 +262,7 @@ function gehrd!(
         tau[i] = zero(T)
     end
     (ihi - ilo < 1) && return A
-    v = Vector{T}(undef, ihi - ilo + 1)
+    v = _gehrd_work(T, Int(ihi) - Int(ilo) + 1)   # owned; v[1:m] fully written each iteration, no fill!
     @inbounds for i in Int(ilo):(Int(ihi) - 1)
         m = ihi - i                                  # reflector length (rows i+1:ihi)
         β, τ = _larfg!(view(A, (i + 1):ihi, i))          # essential v now in A[i+2:ihi,i]; A[i+1,i] left as α
@@ -267,11 +289,12 @@ end
 
 # ── orghr / unghr (LAPACK dorghr/zunghr) ────────────────────────────────────────────────────────────────
 """
-    orghr!(A, ilo, ihi, tau) -> Q
+    orghr!(A, ilo, ihi, tau) -> A   (A overwritten with Q)
 
 Form the orthogonal/unitary `Q = H(ilo)·H(ilo+1)···H(ihi-1)` from the reflectors produced by [`gehrd!`]
 (stored below the subdiagonal of `A`, coefficients `tau`). `Q` is `n×n` (identity outside `ilo:ihi`). `A` is
-overwritten with `Q` (LAPACK contract) and `Q` is returned. Generic over `T<:Number`; `unghr!` is an alias.
+overwritten with `Q` (LAPACK contract) and returned. Generic over `T<:Number`; `unghr!` is an alias.
+Use `_orghr_into!(Q, A, ilo, ihi, tau)` when `A` must survive.
 
 Direct reflector-to-identity accumulation (applies `H(i)` to `I` in decreasing `i`), mirroring `_ormtr!`/
 `_unmtr!` trans='N' — correctness-first, no dorgqr shift-trick needed.
@@ -282,13 +305,30 @@ function orghr!(
     ) where {T <: Number}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("orghr!: A must be square"))
-    Q = Matrix{T}(undef, n, n)
+    Q = _orghr_q(T, n)
+    _orghr_into!(Q, A, ilo, ihi, tau)
+    copyto!(A, Q)
+    return A                                   # A now HOLDS Q; `Q` itself is owned workspace and must
+end                                            # never escape — the next call overwrites it.
+
+# Non-destructive orghr: build Q into a caller-supplied buffer, leaving `A` (the reflector store) intact.
+# This is what lets `ormhr!` drop its `copy(A)`. `Q` MUST NOT alias `A`: the loop reads reflectors out of
+# `A[i+r, i]` while writing `Q[i+1:ihi, 1:n]`, exactly the `orgtr!('L', A, tau, A)` failure (eigen.jl:757)
+# — netlib overwrites A, this form does not, so an aliased call is silently wrong. Throw instead.
+function _orghr_into!(
+        Q::AbstractMatrix{T}, A::AbstractMatrix{T}, ilo::Integer, ihi::Integer,
+        tau::AbstractVector{T}
+    ) where {T <: Number}
+    n = size(A, 1)
+    size(A, 2) == n || throw(DimensionMismatch("orghr!: A must be square"))
+    (size(Q, 1) == n && size(Q, 2) == n) || throw(DimensionMismatch("orghr!: Q must be n×n"))
+    Base.mightalias(Q, A) && throw(ArgumentError("orghr!: Q must not alias A (the reflectors are read from A while Q is written)"))
     fill!(Q, zero(T))
     @inbounds for i in 1:n
         Q[i, i] = one(T)
     end
     if ihi - ilo >= 1
-        v = Vector{T}(undef, ihi - ilo + 1)
+        v = _orghr_v(T, Int(ihi) - Int(ilo) + 1)   # owned; v[1:m] fully written each iteration
         @inbounds for i in (Int(ihi) - 1):-1:Int(ilo)
             m = ihi - i
             v[1] = one(T)
@@ -298,7 +338,6 @@ function orghr!(
             _house_left!(view(Q, (i + 1):ihi, 1:n), view(v, 1:m), tau[i])
         end
     end
-    copyto!(A, Q)
     return Q
 end
 
@@ -308,8 +347,8 @@ unghr!(A::AbstractMatrix{T}, ilo::Integer, ihi::Integer, tau::AbstractVector{T})
 # ── ormhr / unmhr — apply Q from gehrd reflectors to a general matrix C ────────────────────────────────
 # LAPACK dormhr/zunmhr applies Q (or Qᴴ) WITHOUT first forming it (a dedicated reflector sweep). Correct-
 # ness-first / ponytail: `orghr!` already forms Q correctly and cheaply enough for this batch's scope (a
-# direct-LAPACK-caller symbol, not on any PureBLAS-internal hot path) — form Q on a COPY of A (orghr!
-# overwrites its input, but C-ABI dormhr/zunmhr must leave A unchanged) then apply via PureBLAS's own
+# direct-LAPACK-caller symbol, not on any PureBLAS-internal hot path) — form Q into owned workspace with
+# `_orghr_into!` (which leaves A unchanged, as C-ABI dormhr/zunmhr requires) then apply via PureBLAS's own
 # `gemm!` (trim-safe; avoids routing through `Base.:*`'s generic BLAS dispatch).
 """
     ormhr!(side, trans, ilo, ihi, A, tau, C) -> C    (real: trans ∈ {'N','T'})
@@ -323,20 +362,18 @@ function ormhr!(
         tau::AbstractVector{T}, C::AbstractMatrix{T}
     ) where {T <: Number}
     n = size(A, 1)
-    Q = orghr!(copy(A), ilo, ihi, tau)
+    # Both arms stage into a buffer of exactly size(C), so ONE role, one field. No fill!: each gemm! runs
+    # beta = 0, a pure overwrite of the whole tile.
+    Q, tmp = _ormhr_work(T, n, size(C, 1), size(C, 2))
+    _orghr_into!(Q, A, ilo, ihi, tau)          # non-destructive ⇒ the old `copy(A)` is gone
     ct = T <: Complex ? 'C' : 'T'
     top = trans == 'N' ? 'N' : ct
     if side == 'L'
-        m, ncol = size(C)
-        tmp = Matrix{T}(undef, m, ncol)
         gemm!(tmp, Q, C; transA = top, alpha = one(T), beta = zero(T))
-        copyto!(C, tmp)
     else
-        mrow, m = size(C)
-        tmp = Matrix{T}(undef, mrow, m)
         gemm!(tmp, C, Q; transB = top, alpha = one(T), beta = zero(T))
-        copyto!(C, tmp)
     end
+    copyto!(C, tmp)
     return C
 end
 const unmhr! = ormhr!

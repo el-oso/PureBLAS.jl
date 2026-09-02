@@ -801,7 +801,7 @@ end
 # (LAPACK dbdsqr forward recurrence; shift folded as f=(d[l]²−shift²)/d[l], g=e[l].)
 function _bdsqr_sweep!(
         d::AbstractVector{T}, e::AbstractVector{T}, l::Int, u::Int,
-        shift::T, U, V
+        shift::T, U::Union{Nothing, AbstractMatrix{T}}, V::Union{Nothing, AbstractMatrix{T}}
     ) where {T <: Real}
     @inbounds begin
         f = iszero(shift) ? d[l] : (d[l] - shift) * (sign(d[l]) + shift / d[l])
@@ -835,7 +835,13 @@ end
 # `unsafe_load` anywhere in the body — so widening is annotations plus literals; `_givens` and
 # `_svd_2x2_smin` were already generic. For T === Float64 the emitted code is unchanged, since
 # `zero(Float64) === 0.0` and `eps(Float64)` is what the old `eps(Float64)` already was.
-function bdsqr!(d::AbstractVector{T}, e::AbstractVector{T}, U, V) where {T <: Real}
+# `U`/`V` are NARROWED, not widened (they were bare `::Any`): a caller whose `U` inference has gone
+# abstract now gets a MethodError instead of a silent dynamic dispatch into `_rot_cols!` inside the
+# O(n³) sweep. Every call site is already `Nothing`, a `Matrix{Float64}` or a `SubArray` of one.
+function bdsqr!(
+        d::AbstractVector{T}, e::AbstractVector{T}, U::Union{Nothing, AbstractMatrix{T}},
+        V::Union{Nothing, AbstractMatrix{T}}
+    ) where {T <: Real}
     n = length(d)
     n == 0 && return d
     mx = zero(T)                                      # scale the bidiagonal to O(1) so _givens is fast+safe

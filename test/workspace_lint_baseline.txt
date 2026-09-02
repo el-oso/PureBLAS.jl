@@ -9,39 +9,71 @@
 # claim-once-then-thread-it-down all show up here. That is the intended trade — over-approximate, then
 # justify in writing, exactly as req8_lint.jl does with its literals.
 #
-# HISTORY WORTH KEEPING: this file previously carried 16 pairs. Seven of them — every `X -> X` self-edge —
+# HISTORY WORTH KEEPING: this file once carried 16 pairs. Seven of them — every `X -> X` self-edge —
 # were PHANTOMS produced by a scanner bug, not by the code: `_bodies` attributed lines to the preceding
 # definition, so a docstring written above a function had its indented signature lines read as calls by
 # whatever was defined before it. Where two methods of one name sat adjacent, that manufactured a self-call.
 # They were baselined with confident-sounding reasons ("the pair exists only because all methods of a name
-# are merged…") that described an artifact. The scanner now stops attributing at a `"""` at column 0.
-# The lesson is about baselines generally: a justification written for a finding you did not verify is
-# indistinguishable from one written for a finding that is real. Re-derive, do not re-read.
+# are merged…") that described an artifact. The lesson is about baselines generally: a justification
+# written for a finding you did not verify is indistinguishable from one written for a finding that is
+# real. Re-derive, do not re-read.
+#
+# 2026-09-02 — TWO MORE SCANNER DEFECTS FIXED, and this list is re-derived from source, not copied:
+#   * the declared `_lacn2_estimate` callback edges were INERT. `applyf`/`apply!` are anonymous-function
+#     ASSIGNMENTS, which `_bodies` did not record as definitions, so `(g for g in gs if g in names)` threw
+#     both edges away in silence while the header advertised them as the thing that closes the callback
+#     hole. `_bodies` now sees `name = function …` / `name = … ->`, and an unresolvable declared edge is
+#     an ERROR. The three `lacn2*` lines below are that fix landing — they are NEW, and they are real.
+#   * the docstring rule fired on an INDENTED `"""` too, so the llvmcall IR string inside `_prefetch`
+#     (blas3/gemm.jl:68/75) killed attribution for the rest of that function. That direction HIDES
+#     findings. Triple-quoted literals are now skipped wherever they sit; only a column-0 `"""`/`raw"""`
+#     stops attribution.
 
-# --- gemm packing: `_gemm_core!`'s `At` claim (gemm.jl:2844) and its `_gemm_blocked!` call (:2858) are the
-# two arms of one `if _use_unpacked` — never both on one path. `_gemm_blocked!` is a pack+microkernel loop,
-# not a nested claimant.
+# --- gemm packing: `_gemm_core!`'s gpackA/gpackB claim is `_gemm_scratch(T, m*k, 0)` in the `tA` arm of
+# `if _strided1(A) && _strided1(B) && _use_unpacked(m,n,k)` (gemm.jl:2828/2844); `_gemm_blocked!` is that
+# `if`'s ELSE arm (:2858). Never both on one path. `_gemm_blocked!` is a pack+microkernel loop, not a
+# nested claimant.
 gpackA  _gemm_core! -> _gemm_blocked!
 gpackB  _gemm_core! -> _gemm_blocked!
 
-# --- Higham-Hager estimator, DECLARED callback edge (_CALLBACK_EDGES). `_lacn2!` claims lacn* once at
-# entry and drives `applyop!` in a loop; the closure (gecon!/trcon!/pocon!) runs trsv!/getrs!/potrs!, none
-# of which claims a lacn* field. The cycle is the declared edge closing back on the caller, not a second
-# claim. This is the one pair whose safety rests on the closures, so re-read it if a NEW caller of
-# `_lacn2!` appears — that is precisely what the declared edge is for. (Note the second estimator,
-# `_lacn2_estimate` in trsen.jl, has its own DISTINCT fields lacn2* and so does not appear here.)
+# --- Higham-Hager estimator #2 (trsen.jl:402), DECLARED callback edge. `_lacn2_estimate` claims lacn2*
+# once at entry via `_lacn2e_bufs` (trsen.jl:415 — the ONLY call site of that accessor, and it is the only
+# claimant of lacn2x/lacn2v/lacn2s) and then drives its `apply!`/`applyf` callback in a loop. The cycle is
+# the declared edge closing back on the caller, an artifact of merged-name attribution: `_bodies` keeps
+# attributing after the closure's `end`, so each closure's body absorbs the enclosing routine's own
+# `_lacn2_estimate(…)` call (trrfs.jl:141, trsen.jl:569/630 — grep confirms those are the only three).
+# The REAL callback bodies are the safety argument, and they are small enough to read whole:
+#   applyf (trrfs.jl:127) → trsv! + a scalar scaling loop;
+#   apply! (trsen.jl:560/622) → copyto! + _dtrsyl!/_ztrsyl! + copyto!.
+# None of trsv!/_dtrsyl!/_ztrsyl! calls `_lacn2_estimate` (there is no fourth call site), so no lacn2*
+# field is ever re-claimed inside the live claim. RE-READ THIS if a new caller of `_lacn2_estimate`
+# appears, or if either closure grows a call — that is exactly what the declared edge exists to catch.
+lacn2s  _lacn2_estimate -> _lacn2_estimate
+lacn2v  _lacn2_estimate -> _lacn2_estimate
+lacn2x  _lacn2_estimate -> _lacn2_estimate
+
+# --- Higham-Hager estimator #1 (gecon.jl:49), DECLARED callback edge — same shape, different fields.
+# `_lacn2!` claims lacn* once at entry via `_lacn_bufs` (gecon.jl:51, the only call site; only claimant of
+# lacnx/lacnv/lacnsgn) and drives `applyop!` in a loop. The self-edge is again the merged-name tail: the
+# short-form `applyop!(x, adj) = …` defs at gecon.jl:178/227/259 absorb the `_lacn2!(applyop!, …)` calls
+# two lines below them (:180/:229/:261 — the only three). The closures run gecon!/trcon!/pocon!'s
+# solveA!/solveAH!, i.e. trsv!/getrs!/potrs!, none of which claims a lacn* field.
 lacnsgn  _lacn2! -> _lacn2!
 lacnv  _lacn2! -> _lacn2!
 lacnx  _lacn2! -> _lacn2!
 
-# --- potrf pad: `_potrf_gen!`, `_potrf_upper_lever_real!` and `_potrf_upper_lever_cmplx!` are three
-# mutually exclusive branches of `_potrf_gen!`, each of which `return`s. Only one ever claims padf per call.
+# --- potrf pad: in `_potrf_gen!` (lapack.jl:489) the two levers are early-`return` branches guarded on
+# DISJOINT element types — Lever A `T === Float64 || T === Float32` (:533 → _potrf_upper_lever_real!, :543)
+# and Lever C `T <: BlasComplex` (:550 → _potrf_upper_lever_cmplx!, :551). `_potrf_gen!`'s own padf claim
+# (`_potrf_pad(T, n)`, :557) is only reached when neither returned. Mutually exclusive twice over: by
+# control flow and by type. Only one of the three ever claims padf per call.
 padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
 padf  _potrf_gen! -> _potrf_upper_lever_real!
 
-# --- Strassen pool: `str` is ONE field holding a POOL, and the re-entrancy is BY DESIGN —
-# `_gemm_strassen!` holds slots 1-3 across `_strassen_rec!`, which holds ten slots (3+level*10+1 … +10)
-# across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in `_str_fit!`
-# (workspace.jl), not the field split, so a field-keyed lint cannot adjudicate it and must not try.
-# If the indexing in `_str_fit!` changes, this baseline entry is NOT evidence of anything — read it again.
+# --- Strassen pool: `str` is ONE field holding a POOL of matrices, and the re-entrancy is BY DESIGN.
+# `_gemm_strassen!` (gemm.jl:2669) holds pad slots 1-3 via `_strassen_pad_scratch` across
+# `_strassen_rec!`, which takes ten slots at base `3 + level*10` (`_strassen_lvl_scratch`,
+# workspace.jl:417) across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in
+# `_str_fit!` (workspace.jl:406), not the field split, so a field-keyed lint cannot adjudicate it and must
+# not try. If that indexing changes, this baseline entry is NOT evidence of anything — read it again.
 str  _gemm_strassen! -> _strassen_rec!
