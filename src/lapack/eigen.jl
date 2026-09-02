@@ -468,8 +468,8 @@ function _ormtr!(
     (n <= 2 || nc == 0) && return C          # no reflectors (H_1..H_{n-2})
     k = n - 2                                 # reflector count
     nb = clamp(_qr_nb(n, nc), 1, k)           # derived panel width (cache-residency; shared with QR)
-    ws = WYApplyWorkspace{T}(n, nb, nc)
-    Tm = Matrix{T}(undef, nb, nb)
+    Vb, Gb, Wb, Tm = _ormtr_work(T, n, nb, nc)   # GKH-owned scratch (workspace.jl) — was 4 fresh Matrices
+    ws = WYApplyWorkspace{T}(Vb, Gb, Wb)
     nblk = cld(k, nb)
     order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
     @inbounds for b in order
@@ -699,8 +699,8 @@ function _unmtr!(
     (n <= 1 || nc == 0) && return C           # no reflectors (H_1..H_{n-1} needs n≥2)
     k = n - 1                                  # reflector count (complex: incl. the nontrivial H_{n-1})
     nb = clamp(_qr_nb(n, nc), 1, k)
-    ws = WYApplyWorkspace{T}(n, nb, nc)
-    Tm = Matrix{T}(undef, nb, nb); G = Matrix{T}(undef, nb, nb)
+    Vb, G, Wb, Tm = _ormtr_work(T, n, nb, nc)    # GKH-owned scratch (workspace.jl) — was 4 fresh Matrices
+    ws = WYApplyWorkspace{T}(Vb, G, Wb)          # `ws.G` unused here — `_wy_t_cplx!` takes `G` directly
     nblk = cld(k, nb)
     order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
     @inbounds for b in order
@@ -733,32 +733,56 @@ end
 # builds exactly Q = H_1·H_2·⋯. Only uplo='L' is implemented (mirrors `_sytd2_lower!`/`_hetrd!`'s own
 # restriction) — uplo='U' is a documented follow-up (a genuinely different reflector layout, not a
 # transpose of this one); callers get a clean ArgumentError rather than a silently-wrong Q.
-"""
-    orgtr!(uplo, A, tau) -> Q    (real)
-    ungtr!(uplo, A, tau) -> Q    (complex)
-
-Form the orthogonal/unitary `Q` from [`_sytd2_lower!`](@ref)/[`_hetrd!`](@ref)'s reflectors (LAPACK
-dorgtr/zungtr). Only `uplo='L'` is implemented. Returns a fresh `n×n` `Q` (does not overwrite `A`).
-"""
-function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Real}
+#
+# IN-PLACE forms first, docstring below them. That layout was originally a WORKAROUND for a scanner bug
+# in test/workspace_lint.jl — `_bodies` attributed every line up to the next `function` to the PRECEDING
+# definition, so a docstring whose signature lines read `orgtr!(…)`/`ungtr!(…)` injected phantom
+# `_unmtr! -> orgtr!` edges and made the lint report `_unmtr!` as re-claiming mtrv/mtrg/mtrw/mtrt.
+# THE LINT IS NOW FIXED (it stops attributing at a `"""` at column 0), so the constraint is gone and the
+# docstring may be moved back above the definitions if anyone prefers that. Keeping it here is a
+# free-choice style matter, NOT a requirement — the earlier "do not hoist it back" note was true only
+# while the scanner was broken. Fixing the lint also deleted seven phantom self-edges from its baseline.
+function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::AbstractMatrix{T}) where {T <: Real}
     uplo === 'L' || throw(ArgumentError("orgtr!: only uplo='L' is implemented"))
     n = size(A, 1)
-    Q = zeros(T, n, n)
-    @inbounds for i in 1:n
+    size(Q) == (n, n) || throw(DimensionMismatch("orgtr!: size(Q) ≠ (size(A,1), size(A,1))"))
+    fill!(Q, zero(T))                             # load-bearing: the off-diagonal zeros ARE read by the
+    @inbounds for i in 1:n                        # block-reflector gemms — a reused Q must be re-zeroed
         Q[i, i] = one(T)
     end
     _ormtr!(A, tau, Q; side = 'L', trans = 'N')
     return Q
 end
-function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Complex}
+function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::AbstractMatrix{T}) where {T <: Complex}
     uplo === 'L' || throw(ArgumentError("ungtr!: only uplo='L' is implemented"))
     n = size(A, 1)
-    Q = zeros(T, n, n)
+    size(Q) == (n, n) || throw(DimensionMismatch("ungtr!: size(Q) ≠ (size(A,1), size(A,1))"))
+    fill!(Q, zero(T))
     @inbounds for i in 1:n
         Q[i, i] = one(T)
     end
     _unmtr!(A, tau, Q; side = 'L', trans = 'N')
     return Q
+end
+"""
+    orgtr!(uplo, A, tau, Q) -> Q    (real,    in-place: caller supplies Q, allocation-free)
+    orgtr!(uplo, A, tau)    -> Q    (real,    convenience: allocates Q)
+    ungtr!(uplo, A, tau, Q) -> Q    (complex, in-place)
+    ungtr!(uplo, A, tau)    -> Q    (complex, convenience: allocates Q)
+
+Form the orthogonal/unitary `Q` from [`_sytd2_lower!`](@ref)/[`_hetrd!`](@ref)'s reflectors (LAPACK
+dorgtr/zungtr). Only `uplo='L'` is implemented. `Q` must be `n×n` (`n = size(A,1)`); it is overwritten
+with the identity and then swept by the `_ormtr!`/`_unmtr!` trans='N' sweep, so its previous contents
+are irrelevant. `A` is NOT overwritten (unlike Netlib dorgtr/zungtr) — the 3-argument form allocates
+the returned `Q` and is otherwise identical; the 4-argument form allocates nothing at all.
+"""
+function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Real}
+    n = size(A, 1)
+    return orgtr!(uplo, A, tau, Matrix{T}(undef, n, n))
+end
+function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Complex}
+    n = size(A, 1)
+    return ungtr!(uplo, A, tau, Matrix{T}(undef, n, n))
 end
 
 # ── Values-only tridiagonal eigensolver (LAPACK dsterf) — O(n²) root-free PWK QL/QR, no vectors ───────

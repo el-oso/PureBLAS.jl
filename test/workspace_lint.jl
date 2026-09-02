@@ -52,8 +52,27 @@ function _bodies()
     defl = r"^(?:@\w+\s+)*function\s+([A-Za-z_][A-Za-z0-9_!]*)"
     for p in _srcfiles()
         cur = ""
+        indoc = false
         for l in readlines(p)
             s = strip(l)
+            # DOCSTRINGS TERMINATE ATTRIBUTION, and this is load-bearing, not tidiness. Lines are
+            # attributed to the preceding definition until the next one, so a docstring written ABOVE a
+            # function — the normal Julia placement — has its indented signature lines swallowed by
+            # whatever was defined before it. Those lines look exactly like calls: a `"""` block above
+            # `orgtr!` containing `orgtr!(uplo, A, tau, Q)` injected phantom `_unmtr! -> orgtr!` and
+            # `_unmtr! -> ungtr!` edges, and the lint then reported 8 aliasing pairs that do not exist
+            # (`_ormtr!` is real-only, `_unmtr!` complex-only; for complex T they do not even share an
+            # `_l3ws` owner, and neither calls the other). It was a FALSE POSITIVE that only surfaced
+            # once `_unmtr!` began claiming a field — so the edges had been there, silently wrong, since
+            # the docstring was written. Every `"""`-above-a-signature in src/ (gesvx!, getrf!, …) is the
+            # same shape, so this must be fixed here rather than by moving docstrings around the source.
+            if startswith(s, "\"\"\"")
+                # A one-line `"""text"""` opens and closes on the same line; anything else toggles.
+                (length(s) < 6 || !endswith(s, "\"\"\"")) && (indoc = !indoc)
+                cur = ""            # stop attributing; the next real def re-arms it
+                continue
+            end
+            indoc && continue
             m = match(defl, s)
             nm = m === nothing ? _shortdef(s) : m.captures[1]
             nm === nothing || (cur = nm; get!(b, cur, String[]))
