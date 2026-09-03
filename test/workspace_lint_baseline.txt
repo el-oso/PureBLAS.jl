@@ -33,8 +33,8 @@
 # `if _strided1(A) && _strided1(B) && _use_unpacked(m,n,k)` (gemm.jl:2828/2844); `_gemm_blocked!` is that
 # `if`'s ELSE arm (:2858). Never both on one path. `_gemm_blocked!` is a pack+microkernel loop, not a
 # nested claimant.
-L3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
-L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
+BLAS3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
+BLAS3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
 
 # --- Higham-Hager estimator #2 (trsen.jl:402), DECLARED callback edge. `_lacn2_estimate` claims lacn2*
 # once at entry via `_lacn2e_bufs` (trsen.jl:415 — the ONLY call site of that accessor, and it is the only
@@ -48,9 +48,9 @@ L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
 # None of trsv!/_dtrsyl!/_ztrsyl! calls `_lacn2_estimate` (there is no fourth call site), so no lacn2*
 # field is ever re-claimed inside the live claim. RE-READ THIS if a new caller of `_lacn2_estimate`
 # appears, or if either closure grows a call — that is exactly what the declared edge exists to catch.
-L3Workspace.lacn2s  _lacn2_estimate -> _lacn2_estimate
-L3Workspace.lacn2v  _lacn2_estimate -> _lacn2_estimate
-L3Workspace.lacn2x  _lacn2_estimate -> _lacn2_estimate
+EigWorkspace.lacn2s  _lacn2_estimate -> _lacn2_estimate
+EigWorkspace.lacn2v  _lacn2_estimate -> _lacn2_estimate
+EigWorkspace.lacn2x  _lacn2_estimate -> _lacn2_estimate
 
 # --- 2026-09-03: the three `lacn*  _lacn2! -> _lacn2!` lines are GONE, and their own reason said why.
 # It read: "the short-form `applyop!(x, adj) = …` defs at gecon.jl:178/227/259 absorb the
@@ -84,8 +84,8 @@ SVDWorkspace.labrd_tmp  gesvd_vals! -> _svals_core!
 # and Lever C `T <: BlasComplex` (:550 → _potrf_upper_lever_cmplx!, :551). `_potrf_gen!`'s own padf claim
 # (`_potrf_pad(T, n)`, :557) is only reached when neither returned. Mutually exclusive twice over: by
 # control flow and by type. Only one of the three ever claims padf per call.
-L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
-L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_real!
+BLAS3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
+BLAS3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_real!
 
 # --- Strassen pool: `str` is ONE field holding a POOL of matrices, and the re-entrancy is BY DESIGN.
 # `_gemm_strassen!` (gemm.jl:2669) holds pad slots 1-3 via `_strassen_pad_scratch` across
@@ -93,4 +93,4 @@ L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_real!
 # workspace.jl:417) across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in
 # `_str_fit!` (workspace.jl:406), not the field split, so a field-keyed lint cannot adjudicate it and must
 # not try. If that indexing changes, this baseline entry is NOT evidence of anything — read it again.
-L3Workspace.str  _gemm_strassen! -> _strassen_rec!
+BLAS3Workspace.str  _gemm_strassen! -> _strassen_rec!

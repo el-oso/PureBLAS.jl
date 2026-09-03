@@ -148,7 +148,7 @@ function geqp3!(
     end
     n == 0 && return A, jpvt, tau
     tol3z = sqrt(eps(R))                                   # dlaqps recompute threshold (√ machine-eps)
-    # Owned scratch (workspace.jl). vn1/vn2/hbuf are REAL-typed and live on `_l3ws(real(T))`; they are
+    # Owned scratch (workspace.jl). vn1/vn2/hbuf are REAL-typed and live on `_lstsqws(real(T))`; they are
     # taken together because all three are allocated on EVERY path through this routine.
     vn1, vn2, hbuf = _geqp3_norms_work(T, n)
     if T <: BlasReal && R === T && _strided1(A)

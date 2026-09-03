@@ -70,7 +70,7 @@ end
 # Float32-real path: PureBLAS's gesvd! has no Float32-real kernel (svd.jl covers Float64 + complex).
 # Compute in Float64 — MORE accurate than sgelsd but the same min-norm LS solution to Float32 tolerance.
 # ponytail: promote-to-Float64; add a native Float32 SVD kernel if Float32 gelsd perf ever matters.
-# The Float64 staging lives on `_l3ws(Float64)` — a different owner object from the Float32 workspace,
+# The Float64 staging lives on `_lstsqws(Float64)` — a different owner object from the Float32 workspace,
 # so it cannot alias the Float32 caller's buffers. `_gelsd_promote_work`'s first argument sizes BOTH the
 # A staging and the B staging, so it is called with max(m,n) (B's ldb-mandated row count) and the A
 # staging is then narrowed to its own m×n leading block.

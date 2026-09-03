@@ -55,7 +55,13 @@ _srcfiles() = sort!([joinpath(r, f) for (r, _, fs) in walkdir(_SRC)
 # L3Workspace left ~70 roles unwatched (kb `gkh-borrow-design`, ranked item #2). Roles are keyed
 # `<Struct>.<field>` because field names COLLIDE across them — n, e, W, Z, tmp all recur — and merging
 # them by bare name would invent findings across unrelated workspaces.
-const _OWNER_CALLS = Dict("L3Workspace" => "_l3ws(",
+const _OWNER_CALLS = Dict("BLAS3Workspace" => "_blas3ws(",      # the former L3Workspace, split by family
+                          "EigWorkspace" => "_eigws(",
+                          "GenEigWorkspace" => "_geneigws(",
+                          "LstsqWorkspace" => "_lstsqws(",
+                          "TridiagWorkspace" => "_tridiagws(",
+                          "GsvdWorkspace" => "_gsvdws(",
+                          "FactWorkspace" => "_factws(",
                           "SVDWorkspace" => "_svdws(",
                           "_DCWork" => "_get_dcwork(",
                           "_EDCWork" => "_edcws(",

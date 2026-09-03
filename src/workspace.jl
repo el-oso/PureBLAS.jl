@@ -32,7 +32,11 @@ const _L3_NB = @load_preference("l3_nb", clamp(_round_dn(isqrt(_L2_BYTES ÷ 32),
 # req8-ok: RNG seed, host-invariant by construction — stebz.jl:306's value, kept identical.
 const _STEIN_SEED0 = 0x2545f4914f6cdd1d
 
-mutable struct L3Workspace{T}
+# BLAS3Workspace — 19 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct BLAS3Workspace{T}
     diag::Matrix{T}       # _l3_tmp:      fixed _L3_NB×_L3_NB diagonal-block scratch
     trtri::Matrix{T}      # _trtri_tmp:   blocked-trtri off-block gemm scratch (≤ _TRSM_BASE/2 square)
     trsm_tmp::Matrix{T}   # _trsm_tmp:    trsm invL/invR copyback temp (grows m×n)
@@ -53,51 +57,6 @@ mutable struct L3Workspace{T}
     cholpad::Matrix{T}    # _chol_pad:    faer potrf po2-ld whole-matrix pad, ld=n+8 (grows R×n)
     chold::Matrix{T}      # _chol_d:      faer potrf diag-block scratch, (_chol_block+8)×_chol_block
     cholt::Matrix{T}      # _chol_t:      faer potrf panel workspace, grows R×_chol_block
-    bandl::Matrix{T}      # _pbtrf_band:  pbtrf uplo='U' conj-transposed band re-pack, grows (kd+1)×n
-    bandw::Matrix{T}      # _pbtrf_work:  pbtrf corner work array W, exactly (nb+1)×nb (ld is load-bearing)
-    bands::Matrix{T}      # _pbtrf_work:  pbtrf dense diagonal-block scratch, exactly nb×nb (ld load-bearing)
-    gbw13::Matrix{T}      # _gbtrf_work:  gbtrf upper-corner WORK13, exactly (nb+1)×nb (ld load-bearing)
-    gbw31::Matrix{T}      # _gbtrf_work:  gbtrf lower-corner WORK31, exactly (nb+1)×nb (ld load-bearing)
-    gbs::Matrix{T}        # _gbtrf_work:  gbtrf dense L11 staging scratch, exactly nb×nb (ld load-bearing)
-    sylw::Matrix{T}       # _sytrf_work:  dlasyf panel W (n×nb) + gather col; exact rows, grow-only cols
-    # ── Solve/inverse/condition scratch. These roles used to allocate per call inside their routines,
-    # which broke the `!` in-place promise: gecon!/trcon!/pocon! 352 B, potri!/getri! 592 B, pstrf! 640 B,
-    # trrfs! 1056 B (measured at n=8). Owned here like every other L3 buffer, they reach 0 alloc without
-    # the per-call lookup a task-local cache would add (+7.5 ns, which is 7.4% of a trmm! at n=8).
-    lacnx::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, candidate x (grows n)
-    lacnv::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, previous iterate v (grows n)
-    lacnsgn::Vector{Int}  # _lacn_bufs:  real-only sign-repeat test vector (grows n; empty for complex)
-    lauumt::Matrix{T}     # _lauum_tmp:  lauum dense-base zeroed triangle copy (≤ _trtri_base square)
-    getriw::Matrix{T}     # _getri_work: getri blocked inversion panel W (grows n×nb)
-    pstrfv::Vector{T}     # _pstrf_work: running dot products + scratch, 2n. REAL-typed, so it is reached
-                          # as `_l3ws(real(T)).pstrfv` — for complex A that is a DIFFERENT owner object
-                          # than `pstrfs` below, so the two can never alias.
-    pstrfs::Vector{T}     # _pstrf_work: blocked panel scratch (nb + 2n), element-typed
-    pstrfsw::Vector{Int}  # _pstrf_swaps: blocked pivot bookkeeping swj/swp, 2·nb as two DISJOINT views
-    trrfsr::Vector{T}     # _trrfs_work: residual r = op(A)·x − b (grows n), element-typed
-    trrfsa::Vector{T}     # _trrfs_work: |op(A)|·|x| + |b|  — REAL-typed, via `_l3ws(real(T))`
-    trrfst::Vector{T}     # _trrfs_work: LACN2 weight |r| + nz·eps·wabs — REAL-typed, via `_l3ws(real(T))`
-    # The SECOND Higham–Hager estimator. `_lacn2_estimate` (trsen.jl) is a separate implementation of the
-    # same algorithm as `_lacn2!` (gecon.jl), with different callers: trrfs! (trrfs.jl:141) and trsen!
-    # (trsen.jl:555, :614) vs gecon!/trcon!/pocon!. (trsyl! does NOT call it, despite the neighbouring
-    # file.) They get DISTINCT fields rather than sharing `lacn*` — proving the two can never be live at
-    # once would mean auditing every path through trsen/trrfs, and the cost of being
-    # wrong is silent numerical corruption. Three Vectors is cheap insurance. (Deduplicating the two
-    # estimators is the real fix and is left as separate work.) Note `lacn2s` is length n for BOTH real
-    # and complex here, unlike `lacnsgn` — `_lacn2_estimate` zeros a full-length isgn either way.
-    lacn2x::Vector{T}     # _lacn2e_bufs: candidate x
-    lacn2v::Vector{T}     # _lacn2e_bufs: previous iterate v
-    lacn2s::Vector{Int}   # _lacn2e_bufs: sign vector, always length n
-    # pptrf blocked packed Cholesky. These allocated per call and so broke `pptrf!`'s `!` promise for
-    # every n ≥ _PPTRF_BLK_MIN (16) — 16,560 B at n=32, growing with n. It measured 0 B at n=8 only
-    # because that is BELOW the blocking threshold and takes the unblocked arm, which is exactly how the
-    # bug survived an allocation audit: pick a size on the other side of every threshold.
-    pptrfw::Matrix{T}     # _pptrf_lower_work: lower panel W, n×nb
-    pptrfv::Matrix{T}     # _pptrf_{lower,upper}_work: trailing-update V, n×nb (shared — one uplo per call)
-    pptrfr::Matrix{T}     # _pptrf_upper_work: upper packed-row block R, nb×n (note the transposed shape)
-    gerfsr::Vector{T}     # _gerfs_work: residual r = b − op(A)·x (grows n), element-typed
-    gerfsw::Vector{T}     # _gerfs_work: |b| + |op(A)|·|x| — REAL-typed, via `_l3ws(real(T))`
-    gerfsd::Vector{T}     # _gerfs_work: refinement correction dx (grows n), element-typed
     # SEPARATE FROM `trsm_tmp` ON PURPOSE — do not "simplify" the two together. The side-L ragged
     # column-tail arm (level3.jl:4341) stages B into scratch, widens it to `_vwidth` columns, and holds
     # that view ACROSS `_trsm!`; the complex path inside then took `trsm_tmp` again for `_trtri!`'s
@@ -116,17 +75,68 @@ mutable struct L3Workspace{T}
     # The arm is AVX2-only (`_RL_MR_LIVE > _NVREG`), so no AVX-512 box can execute it; it was found by
     # READING, and the fix is the field split, not an audit.
     rpad::Matrix{T}       # _trsm_rpad: side-R pad-arm A copy, ODD ld (grows k×k)
-    # geqp3 (column-pivoted QR). Six buffers, allocated per call before this: 384 B at n=8 rising to
-    # 12,952 B at n=129. Worth noting HOW that was found — the audit measured five sizes straddling the
-    # blocking threshold, because `vn1`/`vn2`/`hbuf` are allocated on every path while `F`/`auxv`/`wrow`
-    # appear only once `nb > 1`. A single-size check sees at most half the leak, which is precisely the
-    # trap that hid pptrf!'s blocked arm at n=8.
-    qp3vn1::Vector{T}     # _geqp3_norms_work: downdated partial column 2-norms — REAL, via _l3ws(real(T))
-    qp3vn2::Vector{T}     # _geqp3_norms_work: reference norm at last exact recompute — REAL
-    qp3hbuf::Vector{T}    # _geqp3_norms_work: contiguous heads for the SIMD downdate — REAL
-    qp3f::Matrix{T}       # _geqp3_panel_work: laqps block reflector F, n × nb (blocked arm only)
-    qp3auxv::Vector{T}    # _geqp3_panel_work: laqps auxiliary vector, length nb (blocked arm only)
-    qp3wrow::Vector{T}    # _geqp3_panel_work: pivot-row delta buffer, length n (blocked arm only)
+end
+
+BLAS3Workspace{T}() where {T} = BLAS3Workspace{T}(
+    Matrix{T}(undef, _L3_NB, _L3_NB),       # diag
+    Matrix{T}(undef, 0, 0),                 # trtri
+    Matrix{T}(undef, 0, 0),                 # trsm_tmp
+    Matrix{T}(undef, 0, 0),                 # apad
+    Matrix{T}(undef, 0, 0),                 # rpack
+    Matrix{T}(undef, 0, 0),                 # rrefl
+    T[],                                    # ftrsm
+    Matrix{T}(undef, 0, 0),                 # potf2
+    Matrix{T}(undef, 0, 0),                 # padf
+    T[],                                    # gpackA
+    T[],                                    # gpackB
+    (T[], T[], T[], T[]),                   # cg
+    (T[], T[], T[], T[]),                   # s2
+    (T[], T[], T[], T[], T[], T[], T[], T[], T[]),# m3
+    Matrix{T}[],                            # str
+    Matrix{T}(undef, 0, 0),                 # strbt
+    Matrix{T}(undef, 0, 0),                 # cholpad
+    Matrix{T}(undef, 0, 0),                 # chold
+    Matrix{T}(undef, 0, 0),                 # cholt
+    Matrix{T}(undef, 0, 0),                 # trsmw
+    Matrix{T}(undef, 0, 0),                 # rpad
+)
+
+const _BLAS3WS_F64 = BLAS3Workspace{Float64}()
+const _BLAS3WS_F32 = BLAS3Workspace{Float32}()
+const _BLAS3WS_C64 = BLAS3Workspace{ComplexF64}()
+const _BLAS3WS_C32 = BLAS3Workspace{ComplexF32}()
+const _BLAS3WS_OTHER = IdDict{DataType, BLAS3Workspace}()
+@inline _blas3ws(::Type{Float64}) = _BLAS3WS_F64
+@inline _blas3ws(::Type{Float32}) = _BLAS3WS_F32
+@inline _blas3ws(::Type{ComplexF64}) = _BLAS3WS_C64
+@inline _blas3ws(::Type{ComplexF32}) = _BLAS3WS_C32
+_blas3ws(::Type{T}) where {T} = get!(() -> BLAS3Workspace{T}(), _BLAS3WS_OTHER, T)::BLAS3Workspace{T}
+
+####################################################################################################
+
+# EigWorkspace — 36 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct EigWorkspace{T}
+    # ── Solve/inverse/condition scratch. These roles used to allocate per call inside their routines,
+    # which broke the `!` in-place promise: gecon!/trcon!/pocon! 352 B, potri!/getri! 592 B, pstrf! 640 B,
+    # trrfs! 1056 B (measured at n=8). Owned here like every other L3 buffer, they reach 0 alloc without
+    # the per-call lookup a task-local cache would add (+7.5 ns, which is 7.4% of a trmm! at n=8).
+    lacnx::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, candidate x (grows n)
+    lacnv::Vector{T}      # _lacn_bufs:  Higham–Hager 1-norm estimator, previous iterate v (grows n)
+    lacnsgn::Vector{Int}  # _lacn_bufs:  real-only sign-repeat test vector (grows n; empty for complex)
+    # The SECOND Higham–Hager estimator. `_lacn2_estimate` (trsen.jl) is a separate implementation of the
+    # same algorithm as `_lacn2!` (gecon.jl), with different callers: trrfs! (trrfs.jl:141) and trsen!
+    # (trsen.jl:555, :614) vs gecon!/trcon!/pocon!. (trsyl! does NOT call it, despite the neighbouring
+    # file.) They get DISTINCT fields rather than sharing `lacn*` — proving the two can never be live at
+    # once would mean auditing every path through trsen/trrfs, and the cost of being
+    # wrong is silent numerical corruption. Three Vectors is cheap insurance. (Deduplicating the two
+    # estimators is the real fix and is left as separate work.) Note `lacn2s` is length n for BOTH real
+    # and complex here, unlike `lacnsgn` — `_lacn2_estimate` zeros a full-length isgn either way.
+    lacn2x::Vector{T}     # _lacn2e_bufs: candidate x
+    lacn2v::Vector{T}     # _lacn2e_bufs: previous iterate v
+    lacn2s::Vector{Int}   # _lacn2e_bufs: sign vector, always length n
     # ormtr/unmtr blocked compact-WY scratch (eigen.jl). `_ormtr!`/`_unmtr!` built a fresh
     # `WYApplyWorkspace{T}(n, nb, nc)` PLUS an nb×nb T factor (and, complex, a second nb×nb Gram) on every
     # call — the scratch half of the orgtr!/ungtr! leak (~9.6 KB real / ~20 KB complex at n=64, on top of
@@ -160,31 +170,31 @@ mutable struct L3Workspace{T}
                           # size(C,1)×size(C,2)) — mutually exclusive branches of one call, one role. No
                           # fill!: both gemm! sites run beta=0, a pure overwrite of the whole tile.
     hqrwr::Vector{T}      # _hseqr_work:  real hseqr! eigenvalue real-part scratch (grows n). REAL-typed, so
-                          # reached as `_l3ws(real(T)).hqrwr`. 2240 B F64 at n=129 (wr+wi); the COMPLEX
+                          # reached as `_eigws(real(T)).hqrwr`. 2240 B F64 at n=129 (wr+wi); the COMPLEX
                           # hseqr! path is already 0 B and claims neither field.
     hqrwi::Vector{T}      # _hseqr_work:  imaginary-part scratch (grows n). Own field — wr and wi are live
                           # simultaneously across the whole _dlahqr! call.
     trevcn::Vector{T}     # _trevc_rwork: trevc! column 1-norms of the strict upper triangle (grows n).
-                          # REAL-typed → `_l3ws(real(T))`. ZEROED BY THE ACCESSOR, load-bearing: the producer
+                          # REAL-typed → `_eigws(real(T))`. ZEROED BY THE ACCESSOR, load-bearing: the producer
                           # accumulates with `+=` and never touches cnorm[1], while the consumer reads
                           # cnorm[j] unconditionally for j down to 1.
     trevcxr::Vector{T}    # _trevc_rwork: real-path solution real part (grows n). REAL-typed.
     trevcxi::Vector{T}    # _trevc_rwork: real-path solution imaginary part (grows n). Own field — both are
                           # live across the whole complex-pair branch. Real trio measured 3328 B at n=129.
-    trevcx::Vector{T}     # _trevc_work:  complex-path solution (grows n), ELEMENT-typed → `_l3ws(T)`, a
+    trevcx::Vector{T}     # _trevc_work:  complex-path solution (grows n), ELEMENT-typed → `_eigws(T)`, a
                           # different owner object from the three real buffers above for complex T, so the
                           # two sets can never alias. 2152 B C64 at n=129.
     geevtau::Vector{T}    # _geev_work:   geev!/gees! gehrd reflector coefficients, length max(n-1,0) (grows).
                           # Own field, not `gehrdv`: it is live ACROSS the gehrd!→orghr! pair.
     geevw::Vector{T}      # _geev_cwork:  the REAL path's complex eigenvalue staging (grows n). The MIRROR of
                           # the pstrfv idiom — a COMPLEX-typed buffer needed by a REAL-typed T, so it is
-                          # reached as `_l3ws(Complex{T}).geevw`. Not used by the complex path (w is the
+                          # reached as `_eigws(Complex{T}).geevw`. Not used by the complex path (w is the
                           # output there).
     geevz0::Matrix{T}     # _geev_work:   the one shared 0×0 placeholder replacing geev!/gees!'s four
                           # `Zdummy` sites (~48 B of header each). Never grown, never written — hseqr! with
                           # compz='N' does not touch Z.
     laexcd::Matrix{T}     # _laexc_work:  _dlaexc! local diagonal-block copy D, FIXED 4×4 (nd = n1+n2 ≤ 4).
-                          # REAL-typed → `_l3ws(real(T))`. Handed out as an EXACT view(…,1:nd,1:nd): the
+                          # REAL-typed → `_eigws(real(T))`. Handed out as an EXACT view(…,1:nd,1:nd): the
                           # dnorm loop is `for x in D`, so an oversized 4×4 at nd==3 would fold 7 stale
                           # elements into the `thresh` rejection test.
     laexcu1::Vector{T}    # _laexc_work:  _dlaexc! reflector u / u1, FIXED length 3. REAL-typed.
@@ -204,20 +214,75 @@ mutable struct L3Workspace{T}
     trsen11::Matrix{T}    # _trsen_work:  T₁₁ block (grows n1×n1).
     trsen22::Matrix{T}    # _trsen_work:  T₂₂ block (grows n2×n2).
     trsenx::Matrix{T}     # _trsen_work:  Sylvester-apply staging Xm (grows n1×n2). Own field even though
-                          # job='B' uses Rm then Xm sequentially. All four are fully overwritten by their
-                          # copyto! before any read, so no fill!. CAVEAT recorded at trsen.jl:552-558: Xm is
-                          # a dense Matrix today to keep _dtrsyl! off the SubArray path. The view handed out
-                          # here IS a SubArray — trim-safe (no reshape) but a possible perf change; if it
-                          # measures, switch this one to the `_ormtr_work` whole-buffer idiom.
-    # ── Bunch–Kaufman (sysv.jl). ONE field for sytri! AND hetri!, not two: they are two entry points onto
-    # the identical `_sytri_lower!`/`_sytri_upper!` engine differing only in a `herm` Bool, so it is ONE
-    # role, and neither is re-entrant. Removes 1120 B F64 / 2184 B C64 at n=129.
-    sytriw::Vector{T}     # _sytri_work: sytri!/hetri! column staging (grows n). Element-typed — it holds
+                          # plain UInt64 field, so `_stein_randvec!(x, seed::Base.RefValue{UInt64})` needs
+                          # no signature change. THE ACCESSOR RESETS IT TO `_STEIN_SEED0` ON EVERY CALL —
+                          # see there; owning it removes the 16 B per-call RefValue without turning
+                          # stein! into a stateful RNG.
+    trsensc::Vector{T}    # _trsen_sc: 1-element carrier for the scale `_dtrsyl!`/`_ztrsyl!` returns through
+end
+
+EigWorkspace{T}() where {T} = EigWorkspace{T}(
+    T[],                                    # lacnx
+    T[],                                    # lacnv
+    Int[],                                  # lacnsgn
+    T[],                                    # lacn2x
+    T[],                                    # lacn2v
+    Int[],                                  # lacn2s
+    Matrix{T}(undef, 0, 0),                 # mtrv
+    Matrix{T}(undef, 0, 0),                 # mtrg
+    Matrix{T}(undef, 0, 0),                 # mtrw
+    Matrix{T}(undef, 0, 0),                 # mtrt
+    T[],                                    # gehrdv
+    Matrix{T}(undef, 0, 0),                 # orghrq
+    T[],                                    # orghrv
+    Matrix{T}(undef, 0, 0),                 # mhrq
+    Matrix{T}(undef, 0, 0),                 # mhrc
+    T[],                                    # hqrwr
+    T[],                                    # hqrwi
+    T[],                                    # trevcn
+    T[],                                    # trevcxr
+    T[],                                    # trevcxi
+    T[],                                    # trevcx
+    T[],                                    # geevtau
+    T[],                                    # geevw
+    Matrix{T}(undef, 0, 0),                 # geevz0
+    Matrix{T}(undef, 4, 4),                 # laexcd
+    Vector{T}(undef, 3),                    # laexcu1
+    Vector{T}(undef, 3),                    # laexcu2
+    Matrix{T}(undef, 4, 4),                 # syl16
+    Vector{T}(undef, 4),                    # sylbt
+    Vector{Int}(undef, 4),                  # sylpv
+    Vector{T}(undef, 4),                    # syltv
+    Matrix{T}(undef, 0, 0),                 # trsenr
+    Matrix{T}(undef, 0, 0),                 # trsen11
+    Matrix{T}(undef, 0, 0),                 # trsen22
+    Matrix{T}(undef, 0, 0),                 # trsenx
+    T[],                                    # trsensc
+)
+
+const _EIGWS_F64 = EigWorkspace{Float64}()
+const _EIGWS_F32 = EigWorkspace{Float32}()
+const _EIGWS_C64 = EigWorkspace{ComplexF64}()
+const _EIGWS_C32 = EigWorkspace{ComplexF32}()
+const _EIGWS_OTHER = IdDict{DataType, EigWorkspace}()
+@inline _eigws(::Type{Float64}) = _EIGWS_F64
+@inline _eigws(::Type{Float32}) = _EIGWS_F32
+@inline _eigws(::Type{ComplexF64}) = _EIGWS_C64
+@inline _eigws(::Type{ComplexF32}) = _EIGWS_C32
+_eigws(::Type{T}) where {T} = get!(() -> EigWorkspace{T}(), _EIGWS_OTHER, T)::EigWorkspace{T}
+
+####################################################################################################
+
+# GenEigWorkspace — 44 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct GenEigWorkspace{T}
                           # columns of A. No fill!: every read is preceded by a copyto! of exactly the slice
                           # about to be read, on the same call.
     # ── Generalized eigenproblem / QZ (qz.jl, tgevc_gen.jl, tgsen.jl, ggev.jl).
     hgzar::Vector{T}      # _hgeqz_work: real hgeqz! entry alphar scratch (grows n). REAL-typed →
-                          # `_l3ws(real(T))`. 2240 B at n=129; the COMPLEX hgeqz! path is already 0 B.
+                          # `_geneigws(real(T))`. 2240 B at n=129; the COMPLEX hgeqz! path is already 0 B.
     hgzai::Vector{T}      # _hgeqz_work: real hgeqz! entry alphai scratch (grows n). Own field — both are
                           # live across the whole `_hgeqz!` call.
     hgzv::Vector{T}       # _hgeqz_work: `_hgeqz!` implicit-shift Householder vector, FIXED length 3.
@@ -226,7 +291,7 @@ mutable struct L3Workspace{T}
                           # engine indexes it as W[j, 3+jw] with a RUNTIME column offset. 6296 B at n=129.
     tgvx::Vector{T}       # _tgevc_work:  tgevc! complex-path `work`, grows 2n, element-typed.
     tgvr::Vector{T}       # _tgevc_rwork: tgevc! complex-path `rwork`, grows 2n. REAL-typed →
-                          # `_l3ws(real(T))`, a different owner object from `tgvx` for complex T, so the
+                          # `_geneigws(real(T))`, a different owner object from `tgvx` for complex T, so the
                           # two can never alias.
     tgsar::Vector{T}      # _tgsen_alpha_work: `_dtgsen!` alphar scratch (grows n). REAL-typed.
     tgsai::Vector{T}      # _tgsen_alpha_work: `_dtgsen!` alphai scratch (grows n). REAL-typed.
@@ -279,7 +344,234 @@ mutable struct L3Workspace{T}
     ggqtmp::Matrix{T}     # _ggev_qrb_work: Qᴴ·A gemm destination (grows n×n). Written by a beta=0 gemm!,
                           # so no fill!. The four together measured 268,784 B F64 at n=129.
     ggevac::Vector{T}     # _ggev_cwork: real ggev!'s alphaC scratch (grows n). COMPLEX-typed for a REAL A,
-                          # so reached as `_l3ws(Complex{T}).ggevac` — same mirror as `geevw`, and a
+end
+
+GenEigWorkspace{T}() where {T} = GenEigWorkspace{T}(
+    T[],                                    # hgzar
+    T[],                                    # hgzai
+    Vector{T}(undef, 3),                    # hgzv
+    Matrix{T}(undef, 0, 0),                 # tgvw
+    T[],                                    # tgvx
+    T[],                                    # tgvr
+    T[],                                    # tgsar
+    T[],                                    # tgsai
+    Matrix{T}(undef, 4, 4),                 # tgxs
+    Matrix{T}(undef, 4, 4),                 # tgxt
+    Matrix{T}(undef, 2, 2),                 # tgxc
+    Matrix{T}(undef, 2, 2),                 # tgxf
+    Matrix{T}(undef, 8, 8),                 # tgxz
+    Vector{T}(undef, 8),                    # tgxrhs
+    Vector{Int}(undef, 8),                  # tgxip
+    Vector{Int}(undef, 8),                  # tgxjp
+    Matrix{T}(undef, 4, 4),                 # tgxli
+    Matrix{T}(undef, 4, 4),                 # tgxir
+    Vector{T}(undef, 4),                    # tgxtaul
+    Vector{T}(undef, 4),                    # tgxtaur
+    Vector{T}(undef, 4),                    # tgxtaul2
+    Vector{T}(undef, 4),                    # tgxtaur2
+    Vector{T}(undef, 4),                    # tgxvq
+    Vector{T}(undef, 4),                    # tgxvr
+    Matrix{T}(undef, 4, 4),                 # tgxm1
+    Matrix{T}(undef, 4, 4),                 # tgxm2
+    Matrix{T}(undef, 4, 4),                 # tgxpa
+    Matrix{T}(undef, 4, 4),                 # tgxpb
+    Matrix{T}(undef, 4, 4),                 # tgxscpy
+    Matrix{T}(undef, 4, 4),                 # tgxtcpy
+    Matrix{T}(undef, 4, 4),                 # tgxircop
+    Matrix{T}(undef, 4, 4),                 # tgxlicop
+    Matrix{T}(undef, 4, 4),                 # tgxql2
+    Matrix{T}(undef, 4, 4),                 # tgxir2
+    Matrix{T}(undef, 2, 2),                 # tgxta
+    Matrix{T}(undef, 2, 2),                 # tgxtb
+    Vector{T}(undef, 4),                    # tgxw
+    Matrix{T}(undef, 0, 0),                 # tgxbufq
+    Matrix{T}(undef, 0, 0),                 # tgxbufz
+    T[],                                    # ggqtau
+    T[],                                    # ggqtaul
+    Matrix{T}(undef, 0, 0),                 # ggqq
+    Matrix{T}(undef, 0, 0),                 # ggqtmp
+    T[],                                    # ggevac
+)
+
+const _GENEIGWS_F64 = GenEigWorkspace{Float64}()
+const _GENEIGWS_F32 = GenEigWorkspace{Float32}()
+const _GENEIGWS_C64 = GenEigWorkspace{ComplexF64}()
+const _GENEIGWS_C32 = GenEigWorkspace{ComplexF32}()
+const _GENEIGWS_OTHER = IdDict{DataType, GenEigWorkspace}()
+@inline _geneigws(::Type{Float64}) = _GENEIGWS_F64
+@inline _geneigws(::Type{Float32}) = _GENEIGWS_F32
+@inline _geneigws(::Type{ComplexF64}) = _GENEIGWS_C64
+@inline _geneigws(::Type{ComplexF32}) = _GENEIGWS_C32
+_geneigws(::Type{T}) where {T} = get!(() -> GenEigWorkspace{T}(), _GENEIGWS_OTHER, T)::GenEigWorkspace{T}
+
+####################################################################################################
+
+# LstsqWorkspace — 28 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct LstsqWorkspace{T}
+    # geqp3 (column-pivoted QR). Six buffers, allocated per call before this: 384 B at n=8 rising to
+    # 12,952 B at n=129. Worth noting HOW that was found — the audit measured five sizes straddling the
+    # blocking threshold, because `vn1`/`vn2`/`hbuf` are allocated on every path while `F`/`auxv`/`wrow`
+    # appear only once `nb > 1`. A single-size check sees at most half the leak, which is precisely the
+    # trap that hid pptrf!'s blocked arm at n=8.
+    qp3vn1::Vector{T}     # _geqp3_norms_work: downdated partial column 2-norms — REAL, via _lstsqws(real(T))
+    qp3vn2::Vector{T}     # _geqp3_norms_work: reference norm at last exact recompute — REAL
+    qp3hbuf::Vector{T}    # _geqp3_norms_work: contiguous heads for the SIMD downdate — REAL
+    qp3f::Matrix{T}       # _geqp3_panel_work: laqps block reflector F, n × nb (blocked arm only)
+    qp3auxv::Vector{T}    # _geqp3_panel_work: laqps auxiliary vector, length nb (blocked arm only)
+    qp3wrow::Vector{T}    # _geqp3_panel_work: pivot-row delta buffer, length n (blocked arm only)
+    # ── Least squares (gels.jl / gelsd.jl / gelsy.jl / gglse.jl) and symmetric-tridiagonal eigen
+    # (stebz.jl). All measured `undef`/`copy` today, so no zeroing is being lost except where stated.
+    gelsm::Matrix{T}      # _gels_work: gels! op(A) working copy (grows p×q). gels! deliberately does NOT
+                          # overwrite A, which is what forces this to exist even for trans='N'. The three
+                          # gels! fields measured 134,392 B F64 square / 533,904 B F64 wide at n=129.
+    gelsmh::Matrix{T}     # _gels_adj: gels! adjoint copy, UNDERDETERMINED ARM ONLY (grows q×p). Its own
+                          # accessor so the common arm never grows it.
+    gelstau::Vector{T}    # _gels_work: gels! Householder τ (grows min(p,q)).
+    gelsdu::Matrix{T}     # _gelsd_work: gelsd! SVD left factor U (grows m×min(m,n)).
+    gelsdvt::Matrix{T}    # _gelsd_work: gelsd! SVD right factor Vᴴ (grows min(m,n)×n).
+    gelsdc::Matrix{T}     # _gelsd_work: gelsd! C = Uᴴ·b, then Σ⁺ applied in place (grows min(m,n)×nrhs).
+                          # Written by a beta=0 gemm!, so no fill!.
+    gelsda::Matrix{T}     # _gelsd_work: gelsd! destructible copy of A for gesvd! (grows m×n). Becomes dead
+                          # if the team honours the docstring and lets gesvd! destroy A directly.
+    gelsdad::Matrix{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 A staging (grows m×n). Lives
+                          # on `_lstsqws(Float64)` — the mirror of the real()-indirection, reached UP from a
+                          # Float32 entry rather than down from a complex one.
+    gelsdbd::Matrix{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 B staging (grows m×nrhs).
+    gelsdsd::Vector{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 singular values (grows
+                          # min(m,n)) — the buffer the nested Float64 call's in-place form writes.
+    gelsytau::Vector{T}   # _gelsy_work: gelsy! geqp3 τ (grows min(m,n)).
+    gelsyxmin::Vector{T}  # _gelsy_work: `_laic1` job=2 iterate (grows max(min(m,n),1)).
+    gelsyxmax::Vector{T}  # _gelsy_work: `_laic1` job=1 iterate. Own field — both are live simultaneously
+                          # across the whole rank loop; sharing is a wrong answer, not a saving.
+    gelsytauz::Vector{T}  # _gelsy_work: RZ τ (grows min(m,n)). Own field — `gelsytau` is still read by
+                          # `_apply_Qh!` AFTER tauz is filled.
+    gelsyw::Vector{T}     # _gelsy_work: un-pivot gather buffer (grows n).
+    tzrzfb::Vector{T}     # _tzrzf_buf: tzrzf!'s (z)larfg staging row (grows (n-m)+1). Owed regardless of
+                          # gelsy! — tzrzf! is a public entry in its own right (also via SIMDBackend).
+                          # Measured 576 B F64 / 1088 B C64 at 64×129.
+    gglg::Matrix{T}       # _gglse_work: gglse! explicit RQ orthogonal factor G (grows n×n) — the single
+                          # biggest site; the six fields measured 272,192 B F64 / 543,704 B C64 at n=129.
+    gglat::Matrix{T}      # _gglse_work: Ã = A·G (grows m×n). Written by a beta=0 gemm!, so no fill!.
+    gglt::Vector{T}       # _gglse_work: QR τ (grows min(m,n)).
+    gglc::Matrix{T}       # _gglse_work: Zᴴ·c staging. A MATRIX (grows m×1), NOT a Vector, on purpose: the
+                          # accessor hands `_ggl_apply_Zh!` a view(…,1:m,1:1) so gglse.jl:70's
+                          # `reshape(c, m, 1)` is DELETED rather than relocated — a reshape of a SubArray
+                          # routes to Base._throw_dmrs and fails `juliac --trim=safe`.
+    gglyy::Vector{T}      # _gglse_work: transformed solution y = Q·x (grows n).
+    gglr::Vector{T}       # _gglse_work: residual A·x for the returned norm (grows m).
+end
+
+LstsqWorkspace{T}() where {T} = LstsqWorkspace{T}(
+    T[],                                    # qp3vn1
+    T[],                                    # qp3vn2
+    T[],                                    # qp3hbuf
+    Matrix{T}(undef, 0, 0),                 # qp3f
+    T[],                                    # qp3auxv
+    T[],                                    # qp3wrow
+    Matrix{T}(undef, 0, 0),                 # gelsm
+    Matrix{T}(undef, 0, 0),                 # gelsmh
+    T[],                                    # gelstau
+    Matrix{T}(undef, 0, 0),                 # gelsdu
+    Matrix{T}(undef, 0, 0),                 # gelsdvt
+    Matrix{T}(undef, 0, 0),                 # gelsdc
+    Matrix{T}(undef, 0, 0),                 # gelsda
+    Matrix{T}(undef, 0, 0),                 # gelsdad
+    Matrix{T}(undef, 0, 0),                 # gelsdbd
+    T[],                                    # gelsdsd
+    T[],                                    # gelsytau
+    T[],                                    # gelsyxmin
+    T[],                                    # gelsyxmax
+    T[],                                    # gelsytauz
+    T[],                                    # gelsyw
+    T[],                                    # tzrzfb
+    Matrix{T}(undef, 0, 0),                 # gglg
+    Matrix{T}(undef, 0, 0),                 # gglat
+    T[],                                    # gglt
+    Matrix{T}(undef, 0, 0),                 # gglc
+    T[],                                    # gglyy
+    T[],                                    # gglr
+)
+
+const _LSTSQWS_F64 = LstsqWorkspace{Float64}()
+const _LSTSQWS_F32 = LstsqWorkspace{Float32}()
+const _LSTSQWS_C64 = LstsqWorkspace{ComplexF64}()
+const _LSTSQWS_C32 = LstsqWorkspace{ComplexF32}()
+const _LSTSQWS_OTHER = IdDict{DataType, LstsqWorkspace}()
+@inline _lstsqws(::Type{Float64}) = _LSTSQWS_F64
+@inline _lstsqws(::Type{Float32}) = _LSTSQWS_F32
+@inline _lstsqws(::Type{ComplexF64}) = _LSTSQWS_C64
+@inline _lstsqws(::Type{ComplexF32}) = _LSTSQWS_C32
+_lstsqws(::Type{T}) where {T} = get!(() -> LstsqWorkspace{T}(), _LSTSQWS_OTHER, T)::LstsqWorkspace{T}
+
+####################################################################################################
+
+# TridiagWorkspace — 13 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct TridiagWorkspace{T}
+    stbe2::Vector{T}      # _stebz_work: stebz! squared off-diagonals (grows max(n-1,1)). The old allocator
+                          # was `zeros`, and the zeroing was checked and is NOT load-bearing: the split loop
+                          # writes every index 1..n-1 unconditionally before either reader runs, and the one
+                          # slot that stays unwritten (e2[1] at n==1) is never read.
+    stbperm::Vector{Int}  # _stebz_work: sortperm destination for the range=='I' band slice (grows n).
+    stbperm2::Vector{Int} # _stebz_work: sortperm destination for the order=='E' re-sort (grows n). A SECOND
+                          # field, overriding the audit's "one is genuinely enough" — its own argument for
+                          # sharing was "the first p is dead by then", which is precisely the never-overlap
+                          # reasoning lesson 4 forbids. Two Int vectors is cheap insurance.
+    stbidx::Vector{Int}   # _stebz_work: the sorted il:iu index band (grows n). Own field — the producer
+                          # reads `stbperm` while writing this.
+    stbgw::Vector{T}      # _stebz_work: permutation staging for w (grows n) — a permute needs a temp.
+    stbgi::Vector{Int}    # _stebz_work: permutation staging for iblock (grows n). Own field: different
+                          # element type, and both are live simultaneously.
+    stnav::Vector{T}      # _stein_work: stein! dlagtf `a` (grows n).
+    stnbv::Vector{T}      # _stein_work: stein! dlagtf `b` (grows n).
+    stncv::Vector{T}      # _stein_work: stein! dlagtf `c` (grows n).
+    stnd2::Vector{T}      # _stein_work: stein! dlagtf `d2` (grows n). The one slot `_dlagtf!` leaves
+                          # unwritten at bz==2 is also never read, so no fill!.
+    stnrhs::Vector{T}     # _stein_work: inverse-iteration iterate (grows n).
+    stninn::Vector{Int}   # _stein_work: dlagtf interchange record (grows n).
+    stnseed::Base.RefValue{UInt64}  # _stein_work: `_stein_randvec!` xorshift seed. Kept a RefValue, not a
+end
+
+TridiagWorkspace{T}() where {T} = TridiagWorkspace{T}(
+    T[],                                    # stbe2
+    Int[],                                  # stbperm
+    Int[],                                  # stbperm2
+    Int[],                                  # stbidx
+    T[],                                    # stbgw
+    Int[],                                  # stbgi
+    T[],                                    # stnav
+    T[],                                    # stnbv
+    T[],                                    # stncv
+    T[],                                    # stnd2
+    T[],                                    # stnrhs
+    Int[],                                  # stninn
+    Ref(_STEIN_SEED0),                      # stnseed
+)
+
+const _TRIDIAGWS_F64 = TridiagWorkspace{Float64}()
+const _TRIDIAGWS_F32 = TridiagWorkspace{Float32}()
+const _TRIDIAGWS_C64 = TridiagWorkspace{ComplexF64}()
+const _TRIDIAGWS_C32 = TridiagWorkspace{ComplexF32}()
+const _TRIDIAGWS_OTHER = IdDict{DataType, TridiagWorkspace}()
+@inline _tridiagws(::Type{Float64}) = _TRIDIAGWS_F64
+@inline _tridiagws(::Type{Float32}) = _TRIDIAGWS_F32
+@inline _tridiagws(::Type{ComplexF64}) = _TRIDIAGWS_C64
+@inline _tridiagws(::Type{ComplexF32}) = _TRIDIAGWS_C32
+_tridiagws(::Type{T}) where {T} = get!(() -> TridiagWorkspace{T}(), _TRIDIAGWS_OTHER, T)::TridiagWorkspace{T}
+
+####################################################################################################
+
+# GsvdWorkspace — 16 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct GsvdWorkspace{T}
+                          # so reached as `_gsvdws(Complex{T}).ggevac` — same mirror as `geevw`, and a
                           # DISTINCT field from it (geev! and ggev! are unrelated routines).
     # ── ggsvd! (ggsvd.jl). Sixteen roles. Two of them carry the whole allocation curve — `ggs_w` is one
     # allocation PER REFLECTOR APPLICATION and `ggs_rqw` replaces one retained `wv` per reflector, both
@@ -308,175 +600,127 @@ mutable struct L3Workspace{T}
     ggs_jp2::Vector{Int}  # _ggsvd_pivots: A11's column pivots (grows n). Own field.
     ggs_wx::Vector{T}     # _ggsvd_tgsja_work: `_ggs_tgsja!` wx (grows max(n,1)).
     ggs_wy::Vector{T}     # _ggsvd_tgsja_work: `_ggs_tgsja!` wy (grows max(n,1)).
-    # ── Least squares (gels.jl / gelsd.jl / gelsy.jl / gglse.jl) and symmetric-tridiagonal eigen
-    # (stebz.jl). All measured `undef`/`copy` today, so no zeroing is being lost except where stated.
-    gelsm::Matrix{T}      # _gels_work: gels! op(A) working copy (grows p×q). gels! deliberately does NOT
-                          # overwrite A, which is what forces this to exist even for trans='N'. The three
-                          # gels! fields measured 134,392 B F64 square / 533,904 B F64 wide at n=129.
-    gelsmh::Matrix{T}     # _gels_adj: gels! adjoint copy, UNDERDETERMINED ARM ONLY (grows q×p). Its own
-                          # accessor so the common arm never grows it.
-    gelstau::Vector{T}    # _gels_work: gels! Householder τ (grows min(p,q)).
-    gelsdu::Matrix{T}     # _gelsd_work: gelsd! SVD left factor U (grows m×min(m,n)).
-    gelsdvt::Matrix{T}    # _gelsd_work: gelsd! SVD right factor Vᴴ (grows min(m,n)×n).
-    gelsdc::Matrix{T}     # _gelsd_work: gelsd! C = Uᴴ·b, then Σ⁺ applied in place (grows min(m,n)×nrhs).
-                          # Written by a beta=0 gemm!, so no fill!.
-    gelsda::Matrix{T}     # _gelsd_work: gelsd! destructible copy of A for gesvd! (grows m×n). Becomes dead
-                          # if the team honours the docstring and lets gesvd! destroy A directly.
-    gelsdad::Matrix{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 A staging (grows m×n). Lives
-                          # on `_l3ws(Float64)` — the mirror of the real()-indirection, reached UP from a
-                          # Float32 entry rather than down from a complex one.
-    gelsdbd::Matrix{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 B staging (grows m×nrhs).
-    gelsdsd::Vector{T}    # _gelsd_promote_work: the Float32 wrapper's Float64 singular values (grows
-                          # min(m,n)) — the buffer the nested Float64 call's in-place form writes.
-    gelsytau::Vector{T}   # _gelsy_work: gelsy! geqp3 τ (grows min(m,n)).
-    gelsyxmin::Vector{T}  # _gelsy_work: `_laic1` job=2 iterate (grows max(min(m,n),1)).
-    gelsyxmax::Vector{T}  # _gelsy_work: `_laic1` job=1 iterate. Own field — both are live simultaneously
-                          # across the whole rank loop; sharing is a wrong answer, not a saving.
-    gelsytauz::Vector{T}  # _gelsy_work: RZ τ (grows min(m,n)). Own field — `gelsytau` is still read by
-                          # `_apply_Qh!` AFTER tauz is filled.
-    gelsyw::Vector{T}     # _gelsy_work: un-pivot gather buffer (grows n).
-    tzrzfb::Vector{T}     # _tzrzf_buf: tzrzf!'s (z)larfg staging row (grows (n-m)+1). Owed regardless of
-                          # gelsy! — tzrzf! is a public entry in its own right (also via SIMDBackend).
-                          # Measured 576 B F64 / 1088 B C64 at 64×129.
-    gglg::Matrix{T}       # _gglse_work: gglse! explicit RQ orthogonal factor G (grows n×n) — the single
-                          # biggest site; the six fields measured 272,192 B F64 / 543,704 B C64 at n=129.
-    gglat::Matrix{T}      # _gglse_work: Ã = A·G (grows m×n). Written by a beta=0 gemm!, so no fill!.
-    gglt::Vector{T}       # _gglse_work: QR τ (grows min(m,n)).
-    gglc::Matrix{T}       # _gglse_work: Zᴴ·c staging. A MATRIX (grows m×1), NOT a Vector, on purpose: the
-                          # accessor hands `_ggl_apply_Zh!` a view(…,1:m,1:1) so gglse.jl:70's
-                          # `reshape(c, m, 1)` is DELETED rather than relocated — a reshape of a SubArray
-                          # routes to Base._throw_dmrs and fails `juliac --trim=safe`.
-    gglyy::Vector{T}      # _gglse_work: transformed solution y = Q·x (grows n).
-    gglr::Vector{T}       # _gglse_work: residual A·x for the returned norm (grows m).
-    stbe2::Vector{T}      # _stebz_work: stebz! squared off-diagonals (grows max(n-1,1)). The old allocator
-                          # was `zeros`, and the zeroing was checked and is NOT load-bearing: the split loop
-                          # writes every index 1..n-1 unconditionally before either reader runs, and the one
-                          # slot that stays unwritten (e2[1] at n==1) is never read.
-    stbperm::Vector{Int}  # _stebz_work: sortperm destination for the range=='I' band slice (grows n).
-    stbperm2::Vector{Int} # _stebz_work: sortperm destination for the order=='E' re-sort (grows n). A SECOND
-                          # field, overriding the audit's "one is genuinely enough" — its own argument for
-                          # sharing was "the first p is dead by then", which is precisely the never-overlap
-                          # reasoning lesson 4 forbids. Two Int vectors is cheap insurance.
-    stbidx::Vector{Int}   # _stebz_work: the sorted il:iu index band (grows n). Own field — the producer
-                          # reads `stbperm` while writing this.
-    stbgw::Vector{T}      # _stebz_work: permutation staging for w (grows n) — a permute needs a temp.
-    stbgi::Vector{Int}    # _stebz_work: permutation staging for iblock (grows n). Own field: different
-                          # element type, and both are live simultaneously.
-    stnav::Vector{T}      # _stein_work: stein! dlagtf `a` (grows n).
-    stnbv::Vector{T}      # _stein_work: stein! dlagtf `b` (grows n).
-    stncv::Vector{T}      # _stein_work: stein! dlagtf `c` (grows n).
-    stnd2::Vector{T}      # _stein_work: stein! dlagtf `d2` (grows n). The one slot `_dlagtf!` leaves
-                          # unwritten at bz==2 is also never read, so no fill!.
-    stnrhs::Vector{T}     # _stein_work: inverse-iteration iterate (grows n).
-    stninn::Vector{Int}   # _stein_work: dlagtf interchange record (grows n).
-    stnseed::Base.RefValue{UInt64}  # _stein_work: `_stein_randvec!` xorshift seed. Kept a RefValue, not a
-                          # plain UInt64 field, so `_stein_randvec!(x, seed::Base.RefValue{UInt64})` needs
-                          # no signature change. THE ACCESSOR RESETS IT TO `_STEIN_SEED0` ON EVERY CALL —
-                          # see there; owning it removes the 16 B per-call RefValue without turning
-                          # stein! into a stateful RNG.
-    trsensc::Vector{T}    # _trsen_sc: 1-element carrier for the scale `_dtrsyl!`/`_ztrsyl!` returns through
-                          # the `_lacn2_estimate` reverse-communication closure. Was a per-call `Ref(ONE)`,
-                          # the whole of trsen!'s measured 16 B/call at job ∈ {'V','B'}. A Vector{T}, not a
-                          # RefValue{real(T)}: the struct carries one type parameter, and the scale is always
-                          # REAL, so the complex path stores it as T (zero imaginary) and reads back `real`.
 end
-L3Workspace{T}() where {T} = L3Workspace{T}(
-    Matrix{T}(undef, _L3_NB, _L3_NB), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    T[], T[], (T[], T[], T[], T[]), (T[], T[], T[], T[]),
-    (T[], T[], T[], T[], T[], T[], T[], T[], T[]),
-    Matrix{T}[], Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
-    Matrix{T}(undef, 0, 0),
-    T[], T[], Int[],                                 # lacnx, lacnv, lacnsgn
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # lauumt, getriw
-    T[], T[], Int[],                                 # pstrfv, pstrfs, pstrfsw
-    T[], T[], T[],                                   # trrfsr, trrfsa, trrfst
-    T[], T[], Int[],                                 # lacn2x, lacn2v, lacn2s
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # pptrfw, pptrfv, pptrfr
-    T[], T[], T[],                                   # gerfsr, gerfsw, gerfsd
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # trsmw, rpad
-    T[], T[], T[],                                   # qp3vn1, qp3vn2, qp3hbuf
-    Matrix{T}(undef, 0, 0), T[], T[],                # qp3f, qp3auxv, qp3wrow
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # mtrv, mtrg
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # mtrw, mtrt
-    # ── non-symmetric eigen ──
-    T[], Matrix{T}(undef, 0, 0), T[],                # gehrdv, orghrq, orghrv
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # mhrq, mhrc
-    T[], T[],                                        # hqrwr, hqrwi
-    T[], T[], T[], T[],                              # trevcn, trevcxr, trevcxi, trevcx
-    T[], T[], Matrix{T}(undef, 0, 0),                # geevtau, geevw, geevz0
-    Matrix{T}(undef, 4, 4), Vector{T}(undef, 3), Vector{T}(undef, 3),   # laexcd, laexcu1, laexcu2
-    Matrix{T}(undef, 4, 4), Vector{T}(undef, 4),     # syl16, sylbt
-    Vector{Int}(undef, 4), Vector{T}(undef, 4),      # sylpv, syltv
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # trsenr, trsen11
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # trsen22, trsenx
-    # ── Bunch–Kaufman ──
-    T[],                                             # sytriw
-    # ── QZ ──
-    T[], T[], Vector{T}(undef, 3),                   # hgzar, hgzai, hgzv
-    Matrix{T}(undef, 0, 0), T[], T[],                # tgvw, tgvx, tgvr
-    T[], T[],                                        # tgsar, tgsai
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxs, tgxt
-    Matrix{T}(undef, 2, 2), Matrix{T}(undef, 2, 2),  # tgxc, tgxf
-    Matrix{T}(undef, 8, 8), Vector{T}(undef, 8),     # tgxz, tgxrhs
-    Vector{Int}(undef, 8), Vector{Int}(undef, 8),    # tgxip, tgxjp
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxli, tgxir
-    Vector{T}(undef, 4), Vector{T}(undef, 4),        # tgxtaul, tgxtaur
-    Vector{T}(undef, 4), Vector{T}(undef, 4),        # tgxtaul2, tgxtaur2
-    Vector{T}(undef, 4), Vector{T}(undef, 4),        # tgxvq, tgxvr
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxm1, tgxm2
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxpa, tgxpb
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxscpy, tgxtcpy
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxircop, tgxlicop
-    Matrix{T}(undef, 4, 4), Matrix{T}(undef, 4, 4),  # tgxql2, tgxir2
-    Matrix{T}(undef, 2, 2), Matrix{T}(undef, 2, 2),  # tgxta, tgxtb
-    Vector{T}(undef, 4),                             # tgxw
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # tgxbufq, tgxbufz
-    T[], T[], Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[],  # ggqtau, ggqtaul, ggqq, ggqtmp, ggevac
-    # ── ggsvd ──
-    T[], Matrix{T}(undef, 0, 0), Int[], T[],         # ggs_w, ggs_rqw, ggs_rqc, ggs_rqtau
-    T[], T[], T[], T[], T[],                         # ggs_u, ggs_ul, ggs_uq, ggs_ur, ggs_u5
-    Matrix{T}(undef, 0, 0), T[], T[],                # ggs_xc, ggs_taub, ggs_taua
-    Int[], Int[], T[], T[],                          # ggs_jpvt, ggs_jp2, ggs_wx, ggs_wy
-    # ── least squares + stebz/stein ──
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[],   # gelsm, gelsmh, gelstau
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # gelsdu, gelsdvt
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),  # gelsdc, gelsda
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[],   # gelsdad, gelsdbd, gelsdsd
-    T[], T[], T[], T[], T[], T[],                    # gelsytau, gelsyxmin, gelsyxmax, gelsytauz, gelsyw, tzrzfb
-    Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0), T[],   # gglg, gglat, gglt
-    Matrix{T}(undef, 0, 0), T[], T[],                # gglc, gglyy, gglr
-    T[], Int[], Int[], Int[], T[], Int[],            # stbe2, stbperm, stbperm2, stbidx, stbgw, stbgi
-    T[], T[], T[], T[], T[], Int[],                  # stnav, stnbv, stncv, stnd2, stnrhs, stninn
-    Ref(_STEIN_SEED0),                               # stnseed (reset per call by _stein_work)
-    T[],                                             # trsensc
+
+GsvdWorkspace{T}() where {T} = GsvdWorkspace{T}(
+    T[],                                    # ggs_w
+    Matrix{T}(undef, 0, 0),                 # ggs_rqw
+    Int[],                                  # ggs_rqc
+    T[],                                    # ggs_rqtau
+    T[],                                    # ggs_u
+    T[],                                    # ggs_ul
+    T[],                                    # ggs_uq
+    T[],                                    # ggs_ur
+    T[],                                    # ggs_u5
+    Matrix{T}(undef, 0, 0),                 # ggs_xc
+    T[],                                    # ggs_taub
+    T[],                                    # ggs_taua
+    Int[],                                  # ggs_jpvt
+    Int[],                                  # ggs_jp2
+    T[],                                    # ggs_wx
+    T[],                                    # ggs_wy
 )
 
-# Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
-# four BLAS element types s/d/c/z. The IdDict fallback is ONLY for the open-ended non-gated set
-# (ForwardDiff.Dual & co. on the generic AD path), which can't have a compile-time owner and isn't a hot
-# path. Complex was on the fallback before — that cost the complex L3 hot path a ~130 ns `get!` per call
-# (and read as a runtime box to static alloc checks); const owners fix both.
-const _L3WS_F64 = L3Workspace{Float64}()
-const _L3WS_F32 = L3Workspace{Float32}()
-const _L3WS_C64 = L3Workspace{ComplexF64}()
-const _L3WS_C32 = L3Workspace{ComplexF32}()
-const _L3WS_OTHER = IdDict{DataType, L3Workspace}()
-@inline _l3ws(::Type{Float64}) = _L3WS_F64
-@inline _l3ws(::Type{Float32}) = _L3WS_F32
-@inline _l3ws(::Type{ComplexF64}) = _L3WS_C64
-@inline _l3ws(::Type{ComplexF32}) = _L3WS_C32
-_l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER, T)::L3Workspace{T}
+const _GSVDWS_F64 = GsvdWorkspace{Float64}()
+const _GSVDWS_F32 = GsvdWorkspace{Float32}()
+const _GSVDWS_C64 = GsvdWorkspace{ComplexF64}()
+const _GSVDWS_C32 = GsvdWorkspace{ComplexF32}()
+const _GSVDWS_OTHER = IdDict{DataType, GsvdWorkspace}()
+@inline _gsvdws(::Type{Float64}) = _GSVDWS_F64
+@inline _gsvdws(::Type{Float32}) = _GSVDWS_F32
+@inline _gsvdws(::Type{ComplexF64}) = _GSVDWS_C64
+@inline _gsvdws(::Type{ComplexF32}) = _GSVDWS_C32
+_gsvdws(::Type{T}) where {T} = get!(() -> GsvdWorkspace{T}(), _GSVDWS_OTHER, T)::GsvdWorkspace{T}
+
+####################################################################################################
+
+# FactWorkspace — 22 roles. Split out of the former 178-field L3Workspace so
+# each ALGORITHM FAMILY owns its own scratch and can carry its own M4 sharing decision
+# (kb: workspace-mt-ownership-per-buffer-not-uniform). Field lines and their comments are
+# unchanged from the original struct.
+mutable struct FactWorkspace{T}
+    bandl::Matrix{T}      # _pbtrf_band:  pbtrf uplo='U' conj-transposed band re-pack, grows (kd+1)×n
+    bandw::Matrix{T}      # _pbtrf_work:  pbtrf corner work array W, exactly (nb+1)×nb (ld is load-bearing)
+    bands::Matrix{T}      # _pbtrf_work:  pbtrf dense diagonal-block scratch, exactly nb×nb (ld load-bearing)
+    gbw13::Matrix{T}      # _gbtrf_work:  gbtrf upper-corner WORK13, exactly (nb+1)×nb (ld load-bearing)
+    gbw31::Matrix{T}      # _gbtrf_work:  gbtrf lower-corner WORK31, exactly (nb+1)×nb (ld load-bearing)
+    gbs::Matrix{T}        # _gbtrf_work:  gbtrf dense L11 staging scratch, exactly nb×nb (ld load-bearing)
+    sylw::Matrix{T}       # _sytrf_work:  dlasyf panel W (n×nb) + gather col; exact rows, grow-only cols
+    lauumt::Matrix{T}     # _lauum_tmp:  lauum dense-base zeroed triangle copy (≤ _trtri_base square)
+    getriw::Matrix{T}     # _getri_work: getri blocked inversion panel W (grows n×nb)
+    pstrfv::Vector{T}     # _pstrf_work: running dot products + scratch, 2n. REAL-typed, so it is reached
+                          # as `_factws(real(T)).pstrfv` — for complex A that is a DIFFERENT owner object
+                          # than `pstrfs` below, so the two can never alias.
+    pstrfs::Vector{T}     # _pstrf_work: blocked panel scratch (nb + 2n), element-typed
+    pstrfsw::Vector{Int}  # _pstrf_swaps: blocked pivot bookkeeping swj/swp, 2·nb as two DISJOINT views
+    trrfsr::Vector{T}     # _trrfs_work: residual r = op(A)·x − b (grows n), element-typed
+    trrfsa::Vector{T}     # _trrfs_work: |op(A)|·|x| + |b|  — REAL-typed, via `_factws(real(T))`
+    trrfst::Vector{T}     # _trrfs_work: LACN2 weight |r| + nz·eps·wabs — REAL-typed, via `_factws(real(T))`
+    # pptrf blocked packed Cholesky. These allocated per call and so broke `pptrf!`'s `!` promise for
+    # every n ≥ _PPTRF_BLK_MIN (16) — 16,560 B at n=32, growing with n. It measured 0 B at n=8 only
+    # because that is BELOW the blocking threshold and takes the unblocked arm, which is exactly how the
+    # bug survived an allocation audit: pick a size on the other side of every threshold.
+    pptrfw::Matrix{T}     # _pptrf_lower_work: lower panel W, n×nb
+    pptrfv::Matrix{T}     # _pptrf_{lower,upper}_work: trailing-update V, n×nb (shared — one uplo per call)
+    pptrfr::Matrix{T}     # _pptrf_upper_work: upper packed-row block R, nb×n (note the transposed shape)
+    gerfsr::Vector{T}     # _gerfs_work: residual r = b − op(A)·x (grows n), element-typed
+    gerfsw::Vector{T}     # _gerfs_work: |b| + |op(A)|·|x| — REAL-typed, via `_factws(real(T))`
+    gerfsd::Vector{T}     # _gerfs_work: refinement correction dx (grows n), element-typed
+                          # job='B' uses Rm then Xm sequentially. All four are fully overwritten by their
+                          # copyto! before any read, so no fill!. CAVEAT recorded at trsen.jl:552-558: Xm is
+                          # a dense Matrix today to keep _dtrsyl! off the SubArray path. The view handed out
+                          # here IS a SubArray — trim-safe (no reshape) but a possible perf change; if it
+                          # measures, switch this one to the `_ormtr_work` whole-buffer idiom.
+    # ── Bunch–Kaufman (sysv.jl). ONE field for sytri! AND hetri!, not two: they are two entry points onto
+    # the identical `_sytri_lower!`/`_sytri_upper!` engine differing only in a `herm` Bool, so it is ONE
+    # role, and neither is re-entrant. Removes 1120 B F64 / 2184 B C64 at n=129.
+    sytriw::Vector{T}     # _sytri_work: sytri!/hetri! column staging (grows n). Element-typed — it holds
+end
+
+FactWorkspace{T}() where {T} = FactWorkspace{T}(
+    Matrix{T}(undef, 0, 0),                 # bandl
+    Matrix{T}(undef, 0, 0),                 # bandw
+    Matrix{T}(undef, 0, 0),                 # bands
+    Matrix{T}(undef, 0, 0),                 # gbw13
+    Matrix{T}(undef, 0, 0),                 # gbw31
+    Matrix{T}(undef, 0, 0),                 # gbs
+    Matrix{T}(undef, 0, 0),                 # sylw
+    Matrix{T}(undef, 0, 0),                 # lauumt
+    Matrix{T}(undef, 0, 0),                 # getriw
+    T[],                                    # pstrfv
+    T[],                                    # pstrfs
+    Int[],                                  # pstrfsw
+    T[],                                    # trrfsr
+    T[],                                    # trrfsa
+    T[],                                    # trrfst
+    Matrix{T}(undef, 0, 0),                 # pptrfw
+    Matrix{T}(undef, 0, 0),                 # pptrfv
+    Matrix{T}(undef, 0, 0),                 # pptrfr
+    T[],                                    # gerfsr
+    T[],                                    # gerfsw
+    T[],                                    # gerfsd
+    T[],                                    # sytriw
+)
+
+const _FACTWS_F64 = FactWorkspace{Float64}()
+const _FACTWS_F32 = FactWorkspace{Float32}()
+const _FACTWS_C64 = FactWorkspace{ComplexF64}()
+const _FACTWS_C32 = FactWorkspace{ComplexF32}()
+const _FACTWS_OTHER = IdDict{DataType, FactWorkspace}()
+@inline _factws(::Type{Float64}) = _FACTWS_F64
+@inline _factws(::Type{Float32}) = _FACTWS_F32
+@inline _factws(::Type{ComplexF64}) = _FACTWS_C64
+@inline _factws(::Type{ComplexF32}) = _FACTWS_C32
+_factws(::Type{T}) where {T} = get!(() -> FactWorkspace{T}(), _FACTWS_OTHER, T)::FactWorkspace{T}
+
+####################################################################################################
+
 
 # Per-role accessors (unchanged signatures — call sites are untouched). Each returns/grows one owned field.
-_l3_tmp(::Type{T}) where {T} = _l3ws(T).diag
+_l3_tmp(::Type{T}) where {T} = _blas3ws(T).diag
 
 function _trtri_tmp(::Type{T}, m::Int, n::Int) where {T}
-    ws = _l3ws(T); b = ws.trtri
+    ws = _blas3ws(T); b = ws.trtri
     if size(b, 1) < m || size(b, 2) < n
         b = Matrix{T}(undef, m, n); ws.trtri = b
     end
@@ -484,7 +728,7 @@ function _trtri_tmp(::Type{T}, m::Int, n::Int) where {T}
 end
 
 function _trsm_tmp(::Type{T}, m::Int, n::Int) where {T}
-    ws = _l3ws(T); b = ws.trsm_tmp
+    ws = _blas3ws(T); b = ws.trsm_tmp
     if size(b, 1) < m || size(b, 2) < n
         b = Matrix{T}(undef, m, n); ws.trsm_tmp = b
     end
@@ -492,7 +736,7 @@ function _trsm_tmp(::Type{T}, m::Int, n::Int) where {T}
 end
 
 function _l3_apad(::Type{T}, k::Int) where {T}   # ld = k+8 (non-po2) to dodge cache-set aliasing
-    ws = _l3ws(T); b = ws.apad
+    ws = _blas3ws(T); b = ws.apad
     if size(b, 1) < k + 8 || size(b, 2) < k
         b = Matrix{T}(undef, k + 8, k); ws.apad = b
     end
@@ -503,7 +747,7 @@ end
 # L1 way stride, so the leaf's solved-column re-reads are conflict-free — vs an in-place po2/way-stride ldb
 # where they collide in one set. Grown odd-and-only (never shrinks) so the ld stays odd across reuse.
 function _trsm_rpack(::Type{T}, rows::Int, cols::Int) where {T}
-    ws = _l3ws(T); b = ws.rpack
+    ws = _blas3ws(T); b = ws.rpack
     need = rows + 8; iseven(need) && (need += 1)      # odd ld ⇒ never a way-stride multiple
     if size(b, 1) < need || size(b, 2) < cols
         b = Matrix{T}(undef, need, cols); ws.rpack = b
@@ -518,7 +762,7 @@ end
 # coefficient-column walks stay conflict-free whatever A's own lda is. Dedicated field — must NOT share
 # `apad` (trsm! can hold that across the recursion reaching this branch) or `rpack` (the dealias arm).
 function _trsm_rrefl(::Type{T}, k::Int) where {T}
-    ws = _l3ws(T); b = ws.rrefl
+    ws = _blas3ws(T); b = ws.rrefl
     need = k + 8; iseven(need) && (need += 1)
     if size(b, 1) < need || size(b, 2) < k
         b = Matrix{T}(undef, need, k); ws.rrefl = b
@@ -527,13 +771,13 @@ function _trsm_rrefl(::Type{T}, k::Int) where {T}
 end
 
 function _trsm_fused_buf(::Type{T}, len::Int) where {T}   # side-L gemmtrsm leaf: P stripe + recip (flat)
-    ws = _l3ws(T); b = ws.ftrsm
+    ws = _blas3ws(T); b = ws.ftrsm
     length(b) < len && (b = Vector{T}(undef, len); ws.ftrsm = b)
     return b
 end
 
 function _potf2_buf(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); b = ws.potf2
+    ws = _blas3ws(T); b = ws.potf2
     if size(b, 1) < n
         b = Matrix{T}(undef, n, n); ws.potf2 = b
     end
@@ -543,7 +787,7 @@ end
 # potrf whole-matrix pad: an alias-free leading dim (n+8, bumped +8 more if that ld would ITSELF land on the
 # L1 quarter-way stride) so the generic potrf recursion's trailing trsm!/syrk! read the copy conflict-free.
 function _potrf_pad(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); b = ws.padf
+    ws = _blas3ws(T); b = ws.padf
     need = n + 8
     (need * sizeof(T)) % (_L1_WAY_BYTES >> 2) == 0 && (need += 8)   # keep the scratch's own ld off the way-stride
     if size(b, 1) < need || size(b, 2) < n
@@ -560,7 +804,7 @@ end
 # WIDER band must not be reused by viewing a sub-block of it — that would hand the blocked kernel an ld
 # from the previous call. Measured: reusing a kd=256 buffer for kd=64 dropped that cell from 2.10 to 1.81.
 function _pbtrf_band(::Type{T}, kd::Int, n::Int) where {T}
-    ws = _l3ws(T); b = ws.bandl
+    ws = _factws(T); b = ws.bandl
     if size(b, 1) != kd + 1 || size(b, 2) < n
         b = Matrix{T}(undef, kd + 1, n); ws.bandl = b
     end
@@ -583,7 +827,7 @@ end
 # would otherwise hit. Realloc churn is negligible — this only fires at n ≥ _STRASSEN_MIN (1024), where
 # a single allocation is a rounding error against 7 half-size matrix products.
 function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _blas3ws(T)
     bt = ws.strbt
     if size(bt, 1) != k || size(bt, 2) != n
         bt = Matrix{T}(undef, k, n); ws.strbt = bt
@@ -592,7 +836,7 @@ function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
 end
 
 function _pbtrf_work(::Type{T}, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     w = ws.bandw
     if size(w, 1) != nb + 1 || size(w, 2) != nb
         w = Matrix{T}(undef, nb + 1, nb); ws.bandw = w
@@ -622,7 +866,7 @@ end
 # Deliberately NOT sharing pbtrf's bandw/bands: the two routines tune to different nb, so alternating
 # them would reallocate on every call under the exact-size test.
 function _gbtrf_work(::Type{T}, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     w13 = ws.gbw13
     if size(w13, 1) != nb + 1 || size(w13, 2) != nb
         w13 = Matrix{T}(undef, nb + 1, nb); ws.gbw13 = w13
@@ -652,7 +896,7 @@ end
 # the same step. The W view is handed out at exactly nb columns so a panel-boundary bug trips
 # @boundscheck in a debug build rather than silently reading the gather column.
 function _sytrf_work(::Type{T}, n::Int, nb::Int) where {T}
-    ws = _l3ws(T); b = ws.sylw
+    ws = _factws(T); b = ws.sylw
     ld = n + 8                                          # off the way stride (same lore as _l3_apad)
     (ld * sizeof(T)) % (_L1_WAY_BYTES >> 2) == 0 && (ld += 8)
     if size(b, 1) != ld || size(b, 2) < nb + 1
@@ -662,21 +906,21 @@ function _sytrf_work(::Type{T}, n::Int, nb::Int) where {T}
 end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
-    ws = _l3ws(T)
+    ws = _blas3ws(T)
     length(ws.gpackA) < lenA && resize!(ws.gpackA, lenA)
     length(ws.gpackB) < lenB && resize!(ws.gpackB, lenB)
     return ws.gpackA, ws.gpackB
 end
 
 function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
-    t = _l3ws(T).cg
+    t = _blas3ws(T).cg
     length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[2], lenA))
     length(t[3]) < lenB && (resize!(t[3], lenB); resize!(t[4], lenB))
     return t
 end
 
 function _syr2k_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
-    t = _l3ws(T).s2
+    t = _blas3ws(T).s2
     length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[3], lenA))
     length(t[2]) < lenB && (resize!(t[2], lenB); resize!(t[4], lenB))
     return t
@@ -691,7 +935,7 @@ end
 # strided access (measured: zgemm/ztrsm at n=128 tank 1.16→0.57 once the buffer is grown to 2048). Grow-
 # only avoids the MB-realloc churn of exact-sizing under ztrsm's varying recursion shapes.
 function _gemm_3m_scratch(::Type{Tr}, lenA::Int, lenB::Int, lenC::Int) where {Tr}
-    t = _l3ws(Tr).m3
+    t = _blas3ws(Tr).m3
     length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[2], lenA); resize!(t[3], lenA))
     length(t[4]) < lenB && (resize!(t[4], lenB); resize!(t[5], lenB); resize!(t[6], lenB))
     length(t[7]) < lenC && (resize!(t[7], lenC); resize!(t[8], lenC); resize!(t[9], lenC))
@@ -709,11 +953,11 @@ end
     return pool[i]
 end
 function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
-    p = _l3ws(Tr).str
+    p = _blas3ws(Tr).str
     return _str_fit!(p, 1, mp, kp, Tr), _str_fit!(p, 2, kp, np, Tr), _str_fit!(p, 3, mp, np, Tr)
 end
 function _strassen_lvl_scratch(::Type{Tr}, level::Int, mh::Int, nh::Int, kh::Int) where {Tr}
-    p = _l3ws(Tr).str; b = 3 + level * 10
+    p = _blas3ws(Tr).str; b = 3 + level * 10
     TA = _str_fit!(p, b + 1, mh, kh, Tr); TB = _str_fit!(p, b + 2, kh, nh, Tr)
     P1 = _str_fit!(p, b + 3, mh, nh, Tr); P2 = _str_fit!(p, b + 4, mh, nh, Tr)
     P3 = _str_fit!(p, b + 5, mh, nh, Tr); P4 = _str_fit!(p, b + 6, mh, nh, Tr)
@@ -726,14 +970,14 @@ end
 # Same grow-on-demand, return-a-view shape as the L3 roles above. Each returns exactly the length the
 # caller asked for, so the routine body is unchanged apart from where the buffer comes from.
 #
-# The REAL-typed buffers (`pstrfv`, `trrfsa`, `trrfst`) are reached through `_l3ws(real(T))`. That works
+# The REAL-typed buffers (`pstrfv`, `trrfsa`, `trrfst`) are reached through `_blas3ws(real(T))`. That works
 # because real(T) ∈ {Float64, Float32} is itself a const-dispatched owner, so it costs the same bare
 # field load and needs no second type parameter on `L3Workspace`. For complex `T` it is a different
 # owner object from the element-typed buffers, so a routine holding both can never alias them.
 
 # Higham–Hager 1-norm estimator scratch: candidate x, previous iterate v, and (real only) sign vector.
 function _lacn_bufs(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _eigws(T)
     length(ws.lacnx) < n && (ws.lacnx = Vector{T}(undef, n))
     length(ws.lacnv) < n && (ws.lacnv = Vector{T}(undef, n))
     ns = T <: Real ? n : 0
@@ -743,7 +987,7 @@ end
 
 # lauum dense-base scratch: an n×n zeroed copy of the stored triangle. n ≤ _trtri_base() by construction.
 function _lauum_tmp(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); b = ws.lauumt
+    ws = _factws(T); b = ws.lauumt
     if size(b, 1) < n || size(b, 2) < n
         b = Matrix{T}(undef, n, n); ws.lauumt = b
     end
@@ -752,7 +996,7 @@ end
 
 # getri blocked-inversion panel W (n×nb).
 function _getri_work(::Type{T}, n::Int, nb::Int) where {T}
-    ws = _l3ws(T); b = ws.getriw
+    ws = _factws(T); b = ws.getriw
     if size(b, 1) < n || size(b, 2) < nb
         b = Matrix{T}(undef, n, nb); ws.getriw = b
     end
@@ -762,19 +1006,19 @@ end
 # pstrf scratch: `work` is REAL (running dot products, length 2n) and lives on the real owner; `scr` is
 # element-typed (length nb + 2n). Distinct owners for complex T ⇒ no aliasing.
 function _pstrf_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R)
+    R = real(T); ws = _factws(R)
     length(ws.pstrfv) < 2n && (ws.pstrfv = Vector{R}(undef, 2n))
     return view(ws.pstrfv, 1:(2n))
 end
 function _pstrf_scr(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     length(ws.pstrfs) < len && (ws.pstrfs = Vector{T}(undef, len))
     return view(ws.pstrfs, 1:len)
 end
 
 # trrfs scratch: residual r (element-typed) plus two REAL accumulators on the real owner.
 function _trrfs_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(T); wr = _l3ws(R)
+    R = real(T); ws = _factws(T); wr = _factws(R)
     length(ws.trrfsr) < n && (ws.trrfsr = Vector{T}(undef, n))
     length(wr.trrfsa) < n && (wr.trrfsa = Vector{R}(undef, n))
     length(wr.trrfst) < n && (wr.trrfst = Vector{R}(undef, n))
@@ -784,7 +1028,7 @@ end
 # pstrf blocked pivot bookkeeping: swj/swp, both length nb. One owned Int buffer, returned as two
 # DISJOINT views (1:nb and nb+1:2nb) so they cannot alias each other.
 function _pstrf_swaps(::Type{T}, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     length(ws.pstrfsw) < 2nb && (ws.pstrfsw = Vector{Int}(undef, 2nb))
     return view(ws.pstrfsw, 1:nb), view(ws.pstrfsw, (nb + 1):(2nb))
 end
@@ -793,7 +1037,7 @@ end
 # `_lacn_bufs`; see the struct comment. The caller MUST initialise: unlike the old `fill`/`zeros` these
 # buffers carry the previous call's values.
 function _lacn2e_bufs(::Type{V}, n::Int) where {V}
-    ws = _l3ws(V)
+    ws = _eigws(V)
     length(ws.lacn2x) < n && (ws.lacn2x = Vector{V}(undef, n))
     length(ws.lacn2v) < n && (ws.lacn2v = Vector{V}(undef, n))
     length(ws.lacn2s) < n && (ws.lacn2s = Vector{Int}(undef, n))
@@ -803,7 +1047,7 @@ end
 # gerfs iterative-refinement scratch: residual r and correction dx (element-typed), plus the real
 # accumulator |b| + |op(A)|·|x| on the real owner. Three distinct fields ⇒ no aliasing.
 function _gerfs_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(T); wr = _l3ws(R)
+    R = real(T); ws = _factws(T); wr = _factws(R)
     length(ws.gerfsr) < n && (ws.gerfsr = Vector{T}(undef, n))
     length(wr.gerfsw) < n && (wr.gerfsw = Vector{R}(undef, n))
     length(ws.gerfsd) < n && (ws.gerfsd = Vector{T}(undef, n))
@@ -815,13 +1059,13 @@ end
 # blocked helpers do not nest, so V is shared between them; W and R are separate because their shapes are
 # transposes of each other and sharing would force a reallocation on every uplo switch.
 function _pptrf_lower_work(::Type{T}, n::Int, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     (size(ws.pptrfw, 1) < n || size(ws.pptrfw, 2) < nb) && (ws.pptrfw = Matrix{T}(undef, n, nb))
     (size(ws.pptrfv, 1) < n || size(ws.pptrfv, 2) < nb) && (ws.pptrfv = Matrix{T}(undef, n, nb))
     return view(ws.pptrfw, 1:n, 1:nb), view(ws.pptrfv, 1:n, 1:nb)
 end
 function _pptrf_upper_work(::Type{T}, n::Int, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _factws(T)
     (size(ws.pptrfr, 1) < nb || size(ws.pptrfr, 2) < n) && (ws.pptrfr = Matrix{T}(undef, nb, n))
     (size(ws.pptrfv, 1) < n || size(ws.pptrfv, 2) < nb) && (ws.pptrfv = Matrix{T}(undef, n, nb))
     return view(ws.pptrfr, 1:nb, 1:n), view(ws.pptrfv, 1:n, 1:nb)
@@ -831,7 +1075,7 @@ end
 # holds its staged B across `_trsm!`, which reaches for `trsm_tmp` again on the complex path
 # (level3.jl:2017) — see the `trsmw` field comment for the measured corruption.
 function _trsm_widen(::Type{T}, m::Int, n::Int) where {T}
-    ws = _l3ws(T); b = ws.trsmw
+    ws = _blas3ws(T); b = ws.trsmw
     if size(b, 1) < m || size(b, 2) < n
         b = Matrix{T}(undef, m, n); ws.trsmw = b
     end
@@ -843,7 +1087,7 @@ end
 # Same odd-ld growth policy as `_trsm_rpack` (the leaf re-reads solved columns out of whichever buffer it
 # is handed, so a way-stride multiple would put them all in one cache set).
 function _trsm_rpad(::Type{T}, rows::Int, cols::Int) where {T}
-    ws = _l3ws(T); b = ws.rpad
+    ws = _blas3ws(T); b = ws.rpad
     need = rows + 8; iseven(need) && (need += 1)
     if size(b, 1) < need || size(b, 2) < cols
         b = Matrix{T}(undef, need, cols); ws.rpad = b
@@ -851,10 +1095,10 @@ function _trsm_rpad(::Type{T}, rows::Int, cols::Int) where {T}
     return b
 end
 
-# geqp3 column-norm tracking. All three are REAL-typed, so they live on `_l3ws(real(T))` — the same
+# geqp3 column-norm tracking. All three are REAL-typed, so they live on `_blas3ws(real(T))` — the same
 # const-dispatched owner, no second type parameter needed. Allocated on EVERY geqp3! path.
 function _geqp3_norms_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R)
+    R = real(T); ws = _lstsqws(R)
     length(ws.qp3vn1) < n && (ws.qp3vn1 = Vector{R}(undef, n))
     length(ws.qp3vn2) < n && (ws.qp3vn2 = Vector{R}(undef, n))
     length(ws.qp3hbuf) < n && (ws.qp3hbuf = Vector{R}(undef, n))
@@ -865,7 +1109,7 @@ end
 # below the blocking threshold. Element-typed, so a different owner from the REAL norms above for
 # complex T — they cannot alias.
 function _geqp3_panel_work(::Type{T}, n::Int, nb::Int) where {T}
-    ws = _l3ws(T)
+    ws = _lstsqws(T)
     (size(ws.qp3f, 1) < n || size(ws.qp3f, 2) < nb) && (ws.qp3f = Matrix{T}(undef, n, nb))
     length(ws.qp3auxv) < nb && (ws.qp3auxv = Vector{T}(undef, nb))
     length(ws.qp3wrow) < n && (ws.qp3wrow = Vector{T}(undef, n))
@@ -880,7 +1124,7 @@ end
 # No `fill!`: the panel copy writes V[1:m,1:pb] entirely, wy_t! writes the full bs×bs T (zeroed strict
 # lower included), and every G/W producer is a beta=false syrk!/herk!/gemm!.
 function _ormtr_work(::Type{T}, n::Int, nb::Int, nc::Int) where {T}
-    ws = _l3ws(T)
+    ws = _eigws(T)
     (size(ws.mtrv, 1) < n || size(ws.mtrv, 2) < nb) && (ws.mtrv = Matrix{T}(undef, n, nb))
     (size(ws.mtrg, 1) < nb || size(ws.mtrg, 2) < nb) && (ws.mtrg = Matrix{T}(undef, nb, nb))
     (size(ws.mtrw, 1) < nb || size(ws.mtrw, 2) < nc) && (ws.mtrw = Matrix{T}(undef, nb, nc))
@@ -903,7 +1147,7 @@ end
 # gehrd! reflector staging. Length ihi-ilo+1 ≤ n; only 1:m is ever touched and m shrinks monotonically,
 # so a reused longer buffer is never read past m. No fill!.
 function _gehrd_work(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T); ws.gehrdv = _wsgrow(ws.gehrdv, len)
+    ws = _eigws(T); ws.gehrdv = _wsgrow(ws.gehrdv, len)
     return view(ws.gehrdv, 1:len)
 end
 
@@ -915,13 +1159,13 @@ end
 # building it and `v` belongs to `_orghr_into!` alone.
 # Q needs no fill! here: `_orghr_into!`'s own `fill!(Q, 0)` + unit-diagonal write is its first statement.
 function _orghr_q(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); ws.orghrq = _wsgrow(ws.orghrq, n, n)
+    ws = _eigws(T); ws.orghrq = _wsgrow(ws.orghrq, n, n)
     return view(ws.orghrq, 1:n, 1:n)
 end
 # `_orghr_into!`'s reflector staging. A DISTINCT field from `gehrdv` — ormhr! → `_orghr_into!` is a real
 # nesting chain. v[1]=1 and v[2:m] are written from A before `view(v,1:m)` is read, so no fill!.
 function _orghr_v(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T); ws.orghrv = _wsgrow(ws.orghrv, len)
+    ws = _eigws(T); ws.orghrv = _wsgrow(ws.orghrv, len)
     return view(ws.orghrv, 1:len)
 end
 
@@ -929,13 +1173,13 @@ end
 # `copy(A)` go) plus the gemm! staging tile for whichever of side='L'/'R' this call took. Neither needs
 # a fill!: Q is fully written by _orghr_into!, and the gemm! runs beta=0 over the whole mc×nc tile.
 function _ormhr_work(::Type{T}, n::Int, mc::Int, nc::Int) where {T}
-    ws = _l3ws(T)
+    ws = _eigws(T)
     ws.mhrq = _wsgrow(ws.mhrq, n, n)
     ws.mhrc = _wsgrow(ws.mhrc, mc, nc)
     return view(ws.mhrq, 1:n, 1:n), view(ws.mhrc, 1:mc, 1:nc)
 end
 
-# Real hseqr!'s wr/wi split. REAL-typed ⇒ `_l3ws(real(T))`; for the real method that is the same owner
+# Real hseqr!'s wr/wi split. REAL-typed ⇒ `_eigws(real(T))`; for the real method that is the same owner
 # object, but writing it this way keeps the idiom uniform and makes the complex case (which claims
 # neither — `_zlahqr!` carries the bulge in scalars and is already 0 B) unambiguous.
 # NO fill! on entry. One caveat for the caller: on non-convergence (info = i > 0) `_dlahqr!` leaves
@@ -943,20 +1187,20 @@ end
 # failure branch must zero (or otherwise mark) that range, or it hands back the PREVIOUS call's
 # eigenvalues instead of the old undef garbage.
 function _hseqr_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R)
+    R = real(T); ws = _eigws(R)
     ws.hqrwr = _wsgrow(ws.hqrwr, n)
     ws.hqrwi = _wsgrow(ws.hqrwi, n)
     return view(ws.hqrwr, 1:n), view(ws.hqrwi, 1:n)
 end
 
-# trevc! real-path scratch, all three REAL-typed on `_l3ws(real(T))`.
+# trevc! real-path scratch, all three REAL-typed on `_eigws(real(T))`.
 # `cnorm` IS ZEROED HERE and that is load-bearing: its only producer accumulates with `+=` over
 # 2:n and never writes cnorm[1] at all, while the consumer reads cnorm[j] and cnorm[j-1]
 # unconditionally with j reaching 1. A reused buffer would give both a stale cnorm[1] and
 # stale-plus-accumulated cnorm[2:n]. xr/xi need no fill!: each branch writes them down to 1:ki before
 # any read, and every subsequent read and scaling loop is bounded by 1:ki.
 function _trevc_rwork(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R)
+    R = real(T); ws = _eigws(R)
     ws.trevcn = _wsgrow(ws.trevcn, n)
     ws.trevcxr = _wsgrow(ws.trevcxr, n)
     ws.trevcxi = _wsgrow(ws.trevcxi, n)
@@ -968,7 +1212,7 @@ end
 # the three real buffers above and the two sets cannot alias. No fill!: x[1:ki-1] and x[ki] are written
 # before any read and reads never exceed 1:ki.
 function _trevc_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); ws.trevcx = _wsgrow(ws.trevcx, n)
+    ws = _eigws(T); ws.trevcx = _wsgrow(ws.trevcx, n)
     return view(ws.trevcx, 1:n)
 end
 
@@ -977,15 +1221,15 @@ end
 # neither calls the other — so one set of fields serves both. τ needs no fill!: gehrd! writes all of
 # 1:n-1 on every path, including its `ihi-ilo < 1` early return.
 function _geev_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); ws.geevtau = _wsgrow(ws.geevtau, max(n - 1, 0))
+    ws = _eigws(T); ws.geevtau = _wsgrow(ws.geevtau, max(n - 1, 0))
     return view(ws.geevtau, 1:max(n - 1, 0)), ws.geevz0
 end
 
 # The real path's COMPLEX eigenvalue staging — the mirror of the pstrfv idiom: a complex buffer needed by
-# a real T, so it lives on `_l3ws(Complex{R})`, itself a const-dispatched owner. Fully written by hseqr!
+# a real T, so it lives on `_eigws(Complex{R})`, itself a const-dispatched owner. Fully written by hseqr!
 # before it is read back, so no fill!.
 function _geev_cwork(::Type{R}, n::Int) where {R<:Real}
-    ws = _l3ws(Complex{R}); ws.geevw = _wsgrow(ws.geevw, n)
+    ws = _eigws(Complex{R}); ws.geevw = _wsgrow(ws.geevw, n)
     return view(ws.geevw, 1:n)
 end
 
@@ -994,7 +1238,7 @@ end
 # oversized buffer at nd==3 would fold 7 stale elements into the `thresh` rejection test and silently
 # change which swaps are accepted. u1/u2 are fully written by their `R[...]` producers, no fill!.
 function _laexc_work(::Type{T}, nd::Int) where {T}
-    ws = _l3ws(real(T))
+    ws = _eigws(real(T))
     return view(ws.laexcd, 1:nd, 1:nd), ws.laexcu1, ws.laexcu2
 end
 
@@ -1005,7 +1249,7 @@ end
 # btmp/jpiv/tmpv need none (btmp fully written by its literal; jpiv[4] never written AND never read;
 # tmpv written back-to-front so each read is of an already-written slot).
 function _dlasy2_work(::Type{T}) where {T}
-    ws = _l3ws(real(T))
+    ws = _eigws(real(T))
     fill!(ws.syl16, zero(real(T)))
     return ws.syl16, ws.sylbt, ws.sylpv, ws.syltv
 end
@@ -1015,7 +1259,7 @@ end
 # `collect(view(…))`, and Xm by `copyto!(Xm, xv)` as the first statement of the apply closure, so none
 # needs a fill!. See the `trsenx` field comment for the SubArray-vs-Matrix caveat on _dtrsyl!.
 function _trsen_work(::Type{T}, n1::Int, n2::Int) where {T}
-    ws = _l3ws(T)
+    ws = _eigws(T)
     ws.trsenr = _wsgrow(ws.trsenr, n1, n2)
     ws.trsen11 = _wsgrow(ws.trsen11, n1, n1)
     ws.trsen22 = _wsgrow(ws.trsen22, n2, n2)
@@ -1027,7 +1271,7 @@ end
 # 1-element scale carrier for trsen!'s `_lacn2_estimate` closure — see the `trsensc` field comment. The
 # caller seeds slot 1 before the estimate; the closure overwrites it on every kase.
 function _trsen_sc(::Type{T}) where {T}
-    ws = _l3ws(T)
+    ws = _eigws(T)
     ws.trsensc = _wsgrow(ws.trsensc, 1)
     return ws.trsensc
 end
@@ -1038,7 +1282,7 @@ end
 # Bool, neither re-entrant. Element-typed (it holds columns of A). No fill!: every read is preceded by a
 # copyto! of exactly the slice about to be read, and the tail past m = n-k (or k-1) is never touched.
 function _sytri_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T); ws.sytriw = _wsgrow(ws.sytriw, n)
+    ws = _factws(T); ws.sytriw = _wsgrow(ws.sytriw, n)
     return view(ws.sytriw, 1:n)
 end
 
@@ -1049,7 +1293,7 @@ end
 # both alpha halves at every index on every exit path, and all three of v's slots are written
 # immediately before each `_qz_larfg!` call.
 function _hgeqz_work(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R)
+    R = real(T); ws = _geneigws(R)
     ws.hgzar = _wsgrow(ws.hgzar, n)
     ws.hgzai = _wsgrow(ws.hgzai, n)
     return view(ws.hgzar, 1:n), view(ws.hgzai, 1:n)
@@ -1057,7 +1301,7 @@ end
 # `_hgeqz!`'s length-3 shift vector, in its OWN accessor rather than bundled above: alphar/alphai are
 # claimed by the hgeqz! ENTRY and `v` by the `_hgeqz!` engine the entry then calls, so one bundled
 # accessor would re-claim alphar/alphai from inside the entry's live claim of them.
-_hgeqz_v(::Type{T}) where {T} = _l3ws(real(T)).hgzv
+_hgeqz_v(::Type{T}) where {T} = _geneigws(real(T)).hgzv
 
 # tgevc! element-typed scratch: the real path's packed n×6 W and the complex path's 2n `work`. One call
 # takes one of the two. W stays a single matrix because the engine indexes it as W[j, 3+jw] with a
@@ -1068,7 +1312,7 @@ _hgeqz_v(::Type{T}) where {T} = _l3ws(real(T)).hgzv
 # memory into an argument. Cols 1–2 need none (written for every j in 2:n, and index 1 is never read);
 # cols 5–6 and all of `work` are fully written before read on every je-iteration.
 function _tgevc_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _geneigws(T)
     ws.tgvw = _wsgrow(ws.tgvw, n, 6)
     ws.tgvx = _wsgrow(ws.tgvx, 2n)
     W = view(ws.tgvw, 1:n, 1:6); fill!(view(W, :, 3:4), zero(T))
@@ -1079,14 +1323,14 @@ end
 # two cannot alias. rwork[j]/rwork[n+j] are written for every j in 2:n before any read, and rwork[1] /
 # rwork[n+1] are never read, so no fill!.
 function _tgevc_rwork(::Type{T}, n::Int) where {T}
-    R = real(T); ws = _l3ws(R); ws.tgvr = _wsgrow(ws.tgvr, 2n)
+    R = real(T); ws = _geneigws(R); ws.tgvr = _wsgrow(ws.tgvr, 2n)
     return view(ws.tgvr, 1:(2n))
 end
 
 # `_dtgsen!`'s alphar/alphai scratch (the entry combines them into the caller's complex alpha). REAL.
 # No fill!: the k-loop assigns alphar[k]/alphai[k]/beta[k] at every k on both the 2×2 and 1×1 branch.
 function _tgsen_alpha_work(::Type{R}, n::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     ws.tgsar = _wsgrow(ws.tgsar, n)
     ws.tgsai = _wsgrow(ws.tgsai, n)
     return view(ws.tgsar, 1:n), view(ws.tgsai, 1:n)
@@ -1097,7 +1341,7 @@ end
 # prior full write. rhs is fully written (all nz slots) and the pivot vectors are written by getc2
 # before any unwind reads them, so neither needs one.
 function _tgsy2_work(::Type{R}, nz::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     Z = view(ws.tgxz, 1:nz, 1:nz); fill!(Z, zero(R))
     return Z, view(ws.tgxrhs, 1:nz), view(ws.tgxip, 1:nz), view(ws.tgxjp, 1:nz)
 end
@@ -1105,7 +1349,7 @@ end
 # `_dtgex2_big!` diagonal blocks. m = n1+n2 ≤ 4, n1,n2 ∈ {1,2} — all four fully written by their copy
 # loops, no fill!. Exact views so a shape bug trips @boundscheck rather than reading a stale corner.
 function _tgex2_blocks(::Type{R}, m::Int, n1::Int, n2::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     return view(ws.tgxs, 1:m, 1:m), view(ws.tgxt, 1:m, 1:m),
            view(ws.tgxc, 1:n1, 1:n2), view(ws.tgxf, 1:n1, 1:n2)
 end
@@ -1118,7 +1362,7 @@ end
 # `_tgs_org2r!`/`_tgs_orgr2!` would have cleared themselves — 16 elements, not worth splitting.)
 # The τ and v fields need none: v[1..lv] is filled before each `_qz_larfg!` and τ[i] assigned before use.
 function _tgex2_qr(::Type{R}, m::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     LI = view(ws.tgxli, 1:m, 1:m); fill!(LI, zero(R))
     IR = view(ws.tgxir, 1:m, 1:m); fill!(IR, zero(R))
     return LI, IR, view(ws.tgxtaul, 1:m), view(ws.tgxtaur, 1:m),
@@ -1129,14 +1373,14 @@ end
 # inner-inside-outer and BOTH results are live at once; PA/PB are the two independent outer products.
 # Every element is assigned by `_tgs_matmul`'s own loop, so none needs a fill!.
 function _tgex2_mul(::Type{R}, m::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     return view(ws.tgxm1, 1:m, 1:m), view(ws.tgxm2, 1:m, 1:m),
            view(ws.tgxpa, 1:m, 1:m), view(ws.tgxpb, 1:m, 1:m)
 end
 
 # The four route-selection copies (SCPY/TCPY/IRCOP/LICOP). Fully written by their copy, no fill!.
 function _tgex2_copies(::Type{R}, m::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     return view(ws.tgxscpy, 1:m, 1:m), view(ws.tgxtcpy, 1:m, 1:m),
            view(ws.tgxircop, 1:m, 1:m), view(ws.tgxlicop, 1:m, 1:m)
 end
@@ -1145,7 +1389,7 @@ end
 # and two 2×2 corner blocks are set, and both are then read IN FULL by `_tgs_matmul` and by the
 # tmpA/tmpB loops. tmpA/tmpB/w are fully written before read.
 function _tgex2_rot(::Type{R}, m::Int, n1::Int, n2::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     QL2 = view(ws.tgxql2, 1:m, 1:m); fill!(QL2, zero(R))
     IR2 = view(ws.tgxir2, 1:m, 1:m); fill!(IR2, zero(R))
     return QL2, IR2, view(ws.tgxta, 1:n2, 1:n1), view(ws.tgxtb, 1:n2, 1:n1), view(ws.tgxw, 1:m)
@@ -1155,7 +1399,7 @@ end
 # whole O(n²) term. Separate fields per role even though the two blocks run sequentially. Fully written
 # by their gather loops, no fill!.
 function _tgex2_accum(::Type{R}, n::Int, m::Int) where {R}
-    ws = _l3ws(R)
+    ws = _geneigws(R)
     ws.tgxbufq = _wsgrow(ws.tgxbufq, n, m)
     ws.tgxbufz = _wsgrow(ws.tgxbufz, n, m)
     return view(ws.tgxbufq, 1:n, 1:m), view(ws.tgxbufz, 1:n, 1:m)
@@ -1166,7 +1410,7 @@ end
 # `_ggev_formQ!` opens with its own `fill!(Q, 0)`, the gemm! runs beta=0, tauL is fully written by its
 # loop, and tau is written by geqrf! over 1:min(m,n) = 1:n for the square B this path always passes.
 function _ggev_qrb_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _geneigws(T)
     ws.ggqtau = _wsgrow(ws.ggqtau, n)
     ws.ggqtaul = _wsgrow(ws.ggqtaul, n)
     ws.ggqq = _wsgrow(ws.ggqq, n, n)
@@ -1175,11 +1419,11 @@ function _ggev_qrb_work(::Type{T}, n::Int) where {T}
            view(ws.ggqq, 1:n, 1:n), view(ws.ggqtmp, 1:n, 1:n)
 end
 
-# Real ggev!'s complex alphaC staging — same mirror as `_geev_cwork`, on `_l3ws(Complex{R})`, but a
+# Real ggev!'s complex alphaC staging — same mirror as `_geev_cwork`, on `_geneigws(Complex{R})`, but a
 # DISTINCT field (geev! and ggev! are unrelated routines). hgeqz! assigns alpha[i] for every i in 1:n
 # before it is read back, so no fill!.
 function _ggev_cwork(::Type{R}, n::Int) where {R<:Real}
-    ws = _l3ws(Complex{R}); ws.ggevac = _wsgrow(ws.ggevac, n)
+    ws = _geneigws(Complex{R}); ws.ggevac = _wsgrow(ws.ggevac, n)
     return view(ws.ggevac, 1:n)
 end
 
@@ -1191,7 +1435,7 @@ end
 # consumer reads w[i] unconditionally. Do NOT add a capacity guard around it — a skipped fill here is an
 # active wrong answer, not a latent one.
 function _ggsvd_larf_w(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T); ws.ggs_w = _wsgrow(ws.ggs_w, len)
+    ws = _gsvdws(T); ws.ggs_w = _wsgrow(ws.ggs_w, len)
     w = view(ws.ggs_w, 1:len); fill!(w, zero(T))
     return w
 end
@@ -1200,7 +1444,7 @@ end
 # W is reflector i's retained `wv`, with its `c` and τ in two parallel vectors. The second O(n²) site.
 # Each column is written over 1:c before it is applied, so no fill!.
 function _ggsvd_rq_work(::Type{T}, rows::Int, k::Int) where {T}
-    ws = _l3ws(T)
+    ws = _gsvdws(T)
     ws.ggs_rqw = _wsgrow(ws.ggs_rqw, rows, k)
     ws.ggs_rqc = _wsgrow(ws.ggs_rqc, k)
     ws.ggs_rqtau = _wsgrow(ws.ggs_rqtau, k)
@@ -1211,20 +1455,20 @@ end
 # `_ggs_larf_left!` that any shared buffer would clobber, and the other four belong to different
 # helpers. Each writes u[1] plus the tail covering exactly the view it then passes on, so none is zeroed.
 _ggsvd_u_qp(::Type{T}, len::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_u = _wsgrow(ws.ggs_u, len); view(ws.ggs_u, 1:len))
+    (ws = _gsvdws(T); ws.ggs_u = _wsgrow(ws.ggs_u, len); view(ws.ggs_u, 1:len))
 _ggsvd_u_applyl(::Type{T}, len::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_ul = _wsgrow(ws.ggs_ul, len); view(ws.ggs_ul, 1:len))
+    (ws = _gsvdws(T); ws.ggs_ul = _wsgrow(ws.ggs_ul, len); view(ws.ggs_ul, 1:len))
 _ggsvd_u_formq(::Type{T}, len::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_uq = _wsgrow(ws.ggs_uq, len); view(ws.ggs_uq, 1:len))
+    (ws = _gsvdws(T); ws.ggs_uq = _wsgrow(ws.ggs_uq, len); view(ws.ggs_uq, 1:len))
 _ggsvd_u_rq(::Type{T}, len::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_ur = _wsgrow(ws.ggs_ur, len); view(ws.ggs_ur, 1:len))
+    (ws = _gsvdws(T); ws.ggs_ur = _wsgrow(ws.ggs_ur, len); view(ws.ggs_ur, 1:len))
 _ggsvd_u_step5(::Type{T}, len::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_u5 = _wsgrow(ws.ggs_u5, len); view(ws.ggs_u5, 1:len))
+    (ws = _gsvdws(T); ws.ggs_u5 = _wsgrow(ws.ggs_u5, len); view(ws.ggs_u5, 1:len))
 
 # `_ggs_permcols!`'s Xc. Called on A (m×n) and on view(Q,:,1:nl) (n×nl), so it must fit both — the
 # caller passes the shape it needs. Filled by a full row×column nest, no fill!.
 function _ggsvd_permcols(::Type{T}, rows::Int, cols::Int) where {T}
-    ws = _l3ws(T); ws.ggs_xc = _wsgrow(ws.ggs_xc, rows, cols)
+    ws = _gsvdws(T); ws.ggs_xc = _wsgrow(ws.ggs_xc, rows, cols)
     return view(ws.ggs_xc, 1:rows, 1:cols)
 end
 
@@ -1235,17 +1479,17 @@ end
 # No fill! on any: τ is written over 1:min(mm,nn) — the range later read — and `_ggs_geqpf!` writes
 # jpvt[j] = j over the full length it is handed.
 _ggsvd_taub(::Type{T}, kb::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_taub = _wsgrow(ws.ggs_taub, kb); view(ws.ggs_taub, 1:kb))
+    (ws = _gsvdws(T); ws.ggs_taub = _wsgrow(ws.ggs_taub, kb); view(ws.ggs_taub, 1:kb))
 _ggsvd_taua(::Type{T}, ka::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_taua = _wsgrow(ws.ggs_taua, ka); view(ws.ggs_taua, 1:ka))
+    (ws = _gsvdws(T); ws.ggs_taua = _wsgrow(ws.ggs_taua, ka); view(ws.ggs_taua, 1:ka))
 _ggsvd_jpvt(::Type{T}, n::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_jpvt = _wsgrow(ws.ggs_jpvt, n); view(ws.ggs_jpvt, 1:n))
+    (ws = _gsvdws(T); ws.ggs_jpvt = _wsgrow(ws.ggs_jpvt, n); view(ws.ggs_jpvt, 1:n))
 _ggsvd_jp2(::Type{T}, nl::Int) where {T} =
-    (ws = _l3ws(T); ws.ggs_jp2 = _wsgrow(ws.ggs_jp2, nl); view(ws.ggs_jp2, 1:nl))
+    (ws = _gsvdws(T); ws.ggs_jp2 = _wsgrow(ws.ggs_jp2, nl); view(ws.ggs_jp2, 1:nl))
 
 # `_ggs_tgsja!`'s wx/wy. Both write t in 1:len before the 1:len view is used, so no fill!.
 function _ggsvd_tgsja_work(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T)
+    ws = _gsvdws(T)
     ws.ggs_wx = _wsgrow(ws.ggs_wx, len)
     ws.ggs_wy = _wsgrow(ws.ggs_wy, len)
     return view(ws.ggs_wx, 1:len), view(ws.ggs_wy, 1:len)
@@ -1257,7 +1501,7 @@ end
 # Householder τ. Both fully written before read — M by the op(A) copy, τ[1:k] by geqrf!/_geqr2! — and
 # entries past k are never read, so a longer τ buffer is safe uninitialised.
 function _gels_work(::Type{T}, p::Int, q::Int, k::Int) where {T}
-    ws = _l3ws(T)
+    ws = _lstsqws(T)
     ws.gelsm = _wsgrow(ws.gelsm, p, q)
     ws.gelstau = _wsgrow(ws.gelstau, k)
     return view(ws.gelsm, 1:p, 1:q), view(ws.gelstau, 1:k)
@@ -1266,7 +1510,7 @@ end
 # gels!'s adjoint copy — UNDERDETERMINED ARM ONLY, hence its own accessor: the square/overdetermined
 # path never touches it and so never grows it. Fully written by the adjoint copy.
 function _gels_adj(::Type{T}, q::Int, p::Int) where {T}
-    ws = _l3ws(T); ws.gelsmh = _wsgrow(ws.gelsmh, q, p)
+    ws = _lstsqws(T); ws.gelsmh = _wsgrow(ws.gelsmh, q, p)
     return view(ws.gelsmh, 1:q, 1:p)
 end
 
@@ -1275,7 +1519,7 @@ end
 # read-modify-write that applies Σ⁺. `gelsda` becomes dead if gelsd! is ever allowed to destroy A, as
 # its own docstring already claims it does.
 function _gelsd_work(::Type{T}, m::Int, n::Int, mn::Int, nrhs::Int) where {T}
-    ws = _l3ws(T)
+    ws = _lstsqws(T)
     ws.gelsdu = _wsgrow(ws.gelsdu, m, mn)
     ws.gelsdvt = _wsgrow(ws.gelsdvt, mn, n)
     ws.gelsdc = _wsgrow(ws.gelsdc, mn, nrhs)
@@ -1284,12 +1528,12 @@ function _gelsd_work(::Type{T}, m::Int, n::Int, mn::Int, nrhs::Int) where {T}
            view(ws.gelsdc, 1:mn, 1:nrhs), view(ws.gelsda, 1:m, 1:n)
 end
 
-# The Float32-real gelsd! wrapper's Float64 staging. Lives on `_l3ws(Float64)` — the mirror of the
+# The Float32-real gelsd! wrapper's Float64 staging. Lives on `_lstsqws(Float64)` — the mirror of the
 # real()-indirection, reached UP from a Float32 entry rather than DOWN from a complex one, so it is a
 # different owner object from the Float32 buffers above and cannot alias them. All three fully written
 # (Bd by copyto!, Ad by the conversion, sd by the nested call) before any read.
 function _gelsd_promote_work(m::Int, n::Int, mn::Int, nrhs::Int)
-    ws = _l3ws(Float64)
+    ws = _lstsqws(Float64)
     ws.gelsdad = _wsgrow(ws.gelsdad, m, n)
     ws.gelsdbd = _wsgrow(ws.gelsdbd, m, nrhs)
     ws.gelsdsd = _wsgrow(ws.gelsdsd, mn)
@@ -1304,7 +1548,7 @@ end
 # view(tauz, 1:rank) — handing it the whole grown field silently changes k and L and corrupts the result.
 # That is why this returns exact-length views and not the raw buffers.
 function _gelsy_work(::Type{T}, mn::Int, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _lstsqws(T)
     ws.gelsytau = _wsgrow(ws.gelsytau, mn)
     ws.gelsyxmin = _wsgrow(ws.gelsyxmin, max(mn, 1))
     ws.gelsyxmax = _wsgrow(ws.gelsyxmax, max(mn, 1))
@@ -1318,14 +1562,14 @@ end
 # derives k = length(tau) and L = size(A,2) - k, so handing it the whole grown field would silently
 # change k and L and corrupt the result.
 function _gelsy_tauz(::Type{T}, rank::Int) where {T}
-    ws = _l3ws(T); ws.gelsytauz = _wsgrow(ws.gelsytauz, max(rank, 1))
+    ws = _lstsqws(T); ws.gelsytauz = _wsgrow(ws.gelsytauz, max(rank, 1))
     return view(ws.gelsytauz, 1:rank)
 end
 
 # tzrzf!'s (z)larfg staging row. Its own accessor because tzrzf! is a public entry in its own right, not
 # only a gelsy! internal. buf[1] and buf[2:L+1] are both written at the top of each iteration, no fill!.
 function _tzrzf_buf(::Type{T}, len::Int) where {T}
-    ws = _l3ws(T); ws.tzrzfb = _wsgrow(ws.tzrzfb, len)
+    ws = _lstsqws(T); ws.tzrzfb = _wsgrow(ws.tzrzfb, len)
     return view(ws.tzrzfb, 1:len)
 end
 
@@ -1335,7 +1579,7 @@ end
 # G is written by its explicit `G := I` nest, Ã and r by beta=0 gemm!/gemv!, τ by `_ggl_geqr2!` over
 # 1:min(m,n), chat by its copy loop, and y in two halves that together cover all of 1:n.
 function _gglse_work(::Type{T}, m::Int, n::Int, k::Int) where {T}
-    ws = _l3ws(T)
+    ws = _lstsqws(T)
     ws.gglg = _wsgrow(ws.gglg, n, n)
     ws.gglat = _wsgrow(ws.gglat, m, n)
     ws.gglt = _wsgrow(ws.gglt, k)
@@ -1355,7 +1599,7 @@ end
 # is built, which is the never-overlap reasoning lesson 4 forbids. idx/gw/gi are fully written by the
 # sort and the gather.
 function _stebz_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _tridiagws(T)
     ws.stbe2 = _wsgrow(ws.stbe2, max(n - 1, 1))
     ws.stbperm = _wsgrow(ws.stbperm, n)
     ws.stbperm2 = _wsgrow(ws.stbperm2, n)
@@ -1382,7 +1626,7 @@ end
 # `fill!`ed by whoever supplies it — only rows b1:bn of each column are ever written, and a tridiagonal
 # eigenvector has to be exactly zero outside its own split block, so an undef Z is a wrong answer.
 function _stein_work(::Type{T}, n::Int) where {T}
-    ws = _l3ws(T)
+    ws = _tridiagws(T)
     ws.stnav = _wsgrow(ws.stnav, n)
     ws.stnbv = _wsgrow(ws.stnbv, n)
     ws.stncv = _wsgrow(ws.stncv, n)

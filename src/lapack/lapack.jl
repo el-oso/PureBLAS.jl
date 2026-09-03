@@ -1327,21 +1327,21 @@ end
 @inline _chol_mc(::Type{T}) where {T} = max(_vwidth(T), (_L2_BYTES ÷ 2) ÷ (_chol_block(T) * sizeof(T)))
 
 function _chol_d(::Type{T}) where {T}   # diag block scratch, (_chol_block+8)×_chol_block
-    ws = _l3ws(T); b = ws.chold; nb = _chol_block(T)
+    ws = _blas3ws(T); b = ws.chold; nb = _chol_block(T)
     if size(b, 1) < nb + 8 || size(b, 2) < nb
         b = Matrix{T}(undef, nb + 8, nb); ws.chold = b
     end
     return b
 end
 function _chol_t(::Type{T}, R::Int) where {T}   # panel workspace, R×_chol_block
-    ws = _l3ws(T); b = ws.cholt; nb = _chol_block(T)
+    ws = _blas3ws(T); b = ws.cholt; nb = _chol_block(T)
     if size(b, 1) < R || size(b, 2) < nb
         b = Matrix{T}(undef, R, nb); ws.cholt = b
     end
     return b
 end
 function _chol_pad(::Type{T}, R::Int, n::Int) where {T}   # faer whole-matrix pad, ld=R (=n+8)
-    ws = _l3ws(T); b = ws.cholpad
+    ws = _blas3ws(T); b = ws.cholpad
     if size(b, 1) < R || size(b, 2) < n
         b = Matrix{T}(undef, R, n); ws.cholpad = b
     end
