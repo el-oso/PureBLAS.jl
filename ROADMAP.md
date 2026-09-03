@@ -1102,11 +1102,15 @@ sparse Cholesky.
 ### Tooling backlog
 
 - **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
-  MEASURED on the 2026-09-03 fleet refresh: neuromancer, full rebuild (every arm interleaved),
-  **343 cells in ~85 min = 4.0 cells/min**, i.e. ~15 s/cell and ~3.8 h for its 930 cells. With 3 arms ×
-  8 rounds that is ~0.6 s per timing window. The `arms=pb` merge path is ~3× cheaper (galen: 930 cells
-  in ~86 min = 10.8 cells/min at a higher clock), but a *full* rebuild cannot use it — `plots.jl` refuses
-  a partial arm set on a full run, correctly, because it would drop the reference arms.
+  MEASURED on the 2026-09-03 fleet refresh: neuromancer, full rebuild (every arm interleaved). The rate
+  DECAYS through the sweep as it reaches larger `n` and the LAPACK ops, so quote an interval rate, never
+  cells-done ÷ elapsed-since-launch:
+    343 cells @ 10:23, 496 @ 11:42  ⇒  **1.94 cells/min over that interval**, vs ~4.0 averaged from the
+    start — the early average overstates throughput by ~2× and understates the total by hours.
+  At the interval rate the 930 cells take **~6-8 h** on that box. With 3 arms × 8 rounds a cell is ~24
+  timing windows, so ~1.3 s per window at the later sizes. The `arms=pb` merge path is ~3× cheaper
+  (galen: 930 cells in ~86 min at a higher clock), but a *full* rebuild cannot use it — `plots.jl`
+  refuses a partial arm set on a full run, correctly, because it would drop the reference arms.
   The cost is real enough to discourage re-gating, which is the wrong incentive when the gate is the
   project's core contract. Directions, roughly by value:
   1. **Selective re-gate driven by a source-dependency map.** The report already gestures at this — its
