@@ -1099,6 +1099,32 @@ sparse Cholesky.
   `orgbr` plus vector-carrying `bdsqr` rotations. Complex generic-`T` is untouched.
 - **`hpmv` packed panel** and **`hpr`/`hpr2` complex SIMD** — currently per-column / generic.
 
+### Tooling backlog
+
+- **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
+  MEASURED on the 2026-09-03 fleet refresh: neuromancer, full rebuild (every arm interleaved),
+  **343 cells in ~85 min = 4.0 cells/min**, i.e. ~15 s/cell and ~3.8 h for its 930 cells. With 3 arms ×
+  8 rounds that is ~0.6 s per timing window. The `arms=pb` merge path is ~3× cheaper (galen: 930 cells
+  in ~86 min = 10.8 cells/min at a higher clock), but a *full* rebuild cannot use it — `plots.jl` refuses
+  a partial arm set on a full run, correctly, because it would drop the reference arms.
+  The cost is real enough to discourage re-gating, which is the wrong incentive when the gate is the
+  project's core contract. Directions, roughly by value:
+  1. **Selective re-gate driven by a source-dependency map.** The report already gestures at this — its
+     STALE(c) legend says *"if nothing in that file list can reach this op, the number still stands."*
+     Formalise op → source-files, then a commit range determines the ops that actually need re-measuring.
+     Most commits touch a handful of files; this is the difference between 4 h and minutes.
+  2. **Adaptive round count.** Rounds are fixed at 8 regardless of how decisive the cell is. A cell at
+     1.40× is settled after two; one at 0.998 may not be settled after twenty. Stop when the median's
+     interval clears (or fails to clear) `GATE_MIN`, with a floor and a cap. Must keep the estimator
+     median and stay inside `test/estimator_lint.jl`'s rules — this is a stopping rule, not a new
+     estimator, and it needs explicit approval before anyone writes timing code (CHAIRMARKS ONLY).
+  3. **Cost-aware budgeting.** Cell cost scales with `n`, so a few large-`n` cells dominate the wall
+     clock. A per-cell time budget would spend the sweep where the gate is actually in doubt.
+  What NOT to do, both already established: do not parallelise within a box (a contended L3 skews the PB
+  and reference windows unequally — the contention guard exists for this), and do not drop arms on a full
+  rebuild (that is the refusal above, and cross-run references are what made neuromancer's cache
+  unusable in the first place).
+
 ### Wishlist
 
 - **Pure-Julia reimplementation of BLASFEO kernel ideas.** BLASFEO (github.com/giaf/blasfeo, BSD-2)
