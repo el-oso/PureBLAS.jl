@@ -200,83 +200,89 @@ function _syl_dlasy2(
     smin = max(abs(TR[1, 1]), abs(TR[1, 2]), abs(TR[2, 1]), abs(TR[2, 2]))
     smin = max(smin, abs(TL[1, 1]), abs(TL[1, 2]), abs(TL[2, 1]), abs(TL[2, 2]))
     smin = max(eps_p * smin, smlnum)
-    # `t16` arrives ZEROED from the accessor and that is LOAD-BEARING: the writes below cover only twelve
-    # of the sixteen entries — [1,4], [4,1], [2,3], [3,2] are never written — yet the complete-pivot search
-    # scans all sixteen and the elimination reads and updates them. Stale entries pick a wrong pivot, i.e.
-    # a wrong ANSWER, not noise. btmp/jpiv/tmpv need none (btmp fully written just below; jpiv[4] never
+    # `t16` IS ZEROED AT THE BORROW and that is LOAD-BEARING: the writes below cover only twelve of the
+    # sixteen entries — [1,4], [4,1], [2,3], [3,2] are never written — yet the complete-pivot search scans
+    # all sixteen and the elimination reads and updates them. Stale entries pick a wrong pivot, i.e. a
+    # wrong ANSWER, not noise. btmp/jpiv/tmpv need none (btmp fully written just below; jpiv[4] never
     # written AND never read; tmpv written back-to-front so each read is of an already-written slot).
-    t16, btmp, jpiv, tmpv = _dlasy2_work(R)
-    t16[1, 1] = TL[1, 1] + sgn * TR[1, 1]
-    t16[2, 2] = TL[2, 2] + sgn * TR[1, 1]
-    t16[3, 3] = TL[1, 1] + sgn * TR[2, 2]
-    t16[4, 4] = TL[2, 2] + sgn * TR[2, 2]
-    if ltranl
-        t16[1, 2] = TL[2, 1]; t16[2, 1] = TL[1, 2]; t16[3, 4] = TL[2, 1]; t16[4, 3] = TL[1, 2]
-    else
-        t16[1, 2] = TL[1, 2]; t16[2, 1] = TL[2, 1]; t16[3, 4] = TL[1, 2]; t16[4, 3] = TL[2, 1]
-    end
-    if ltranr
-        t16[1, 3] = sgn * TR[1, 2]; t16[2, 4] = sgn * TR[1, 2]
-        t16[3, 1] = sgn * TR[2, 1]; t16[4, 2] = sgn * TR[2, 1]
-    else
-        t16[1, 3] = sgn * TR[2, 1]; t16[2, 4] = sgn * TR[2, 1]
-        t16[3, 1] = sgn * TR[1, 2]; t16[4, 2] = sgn * TR[1, 2]
-    end
-    btmp[1] = b11; btmp[2] = b21; btmp[3] = b12; btmp[4] = b22
-    for i in 1:3
-        xmax = ZERO; ipsv = i; jpsv = i
-        for ip in i:4, jp in i:4
-            if abs(t16[ip, jp]) >= xmax
-                xmax = abs(t16[ip, jp]); ipsv = ip; jpsv = jp
+    # The scope covers only this k==4 tail — the k∈{1,2} arms above return before ever needing scratch.
+    @scope arn begin
+        t16 = borrow!(arn, R, 4, 4); fill!(t16, ZERO)
+        btmp = borrow!(arn, R, 4)
+        jpiv = borrow!(arn, Int, 4)
+        tmpv = borrow!(arn, R, 4)
+        t16[1, 1] = TL[1, 1] + sgn * TR[1, 1]
+        t16[2, 2] = TL[2, 2] + sgn * TR[1, 1]
+        t16[3, 3] = TL[1, 1] + sgn * TR[2, 2]
+        t16[4, 4] = TL[2, 2] + sgn * TR[2, 2]
+        if ltranl
+            t16[1, 2] = TL[2, 1]; t16[2, 1] = TL[1, 2]; t16[3, 4] = TL[2, 1]; t16[4, 3] = TL[1, 2]
+        else
+            t16[1, 2] = TL[1, 2]; t16[2, 1] = TL[2, 1]; t16[3, 4] = TL[1, 2]; t16[4, 3] = TL[2, 1]
+        end
+        if ltranr
+            t16[1, 3] = sgn * TR[1, 2]; t16[2, 4] = sgn * TR[1, 2]
+            t16[3, 1] = sgn * TR[2, 1]; t16[4, 2] = sgn * TR[2, 1]
+        else
+            t16[1, 3] = sgn * TR[2, 1]; t16[2, 4] = sgn * TR[2, 1]
+            t16[3, 1] = sgn * TR[1, 2]; t16[4, 2] = sgn * TR[1, 2]
+        end
+        btmp[1] = b11; btmp[2] = b21; btmp[3] = b12; btmp[4] = b22
+        for i in 1:3
+            xmax = ZERO; ipsv = i; jpsv = i
+            for ip in i:4, jp in i:4
+                if abs(t16[ip, jp]) >= xmax
+                    xmax = abs(t16[ip, jp]); ipsv = ip; jpsv = jp
+                end
+            end
+            if ipsv != i
+                for c in 1:4
+                    t16[ipsv, c], t16[i, c] = t16[i, c], t16[ipsv, c]
+                end
+                btmp[i], btmp[ipsv] = btmp[ipsv], btmp[i]
+            end
+            if jpsv != i
+                for r in 1:4
+                    t16[r, jpsv], t16[r, i] = t16[r, i], t16[r, jpsv]
+                end
+            end
+            jpiv[i] = jpsv
+            abs(t16[i, i]) < smin && (info = 1; t16[i, i] = smin)
+            for j in (i + 1):4
+                t16[j, i] = t16[j, i] / t16[i, i]
+                btmp[j] = btmp[j] - t16[j, i] * btmp[i]
+                for kk in (i + 1):4
+                    t16[j, kk] = t16[j, kk] - t16[j, i] * t16[i, kk]
+                end
             end
         end
-        if ipsv != i
-            for c in 1:4
-                t16[ipsv, c], t16[i, c] = t16[i, c], t16[ipsv, c]
-            end
-            btmp[i], btmp[ipsv] = btmp[ipsv], btmp[i]
-        end
-        if jpsv != i
-            for r in 1:4
-                t16[r, jpsv], t16[r, i] = t16[r, i], t16[r, jpsv]
-            end
-        end
-        jpiv[i] = jpsv
-        abs(t16[i, i]) < smin && (info = 1; t16[i, i] = smin)
-        for j in (i + 1):4
-            t16[j, i] = t16[j, i] / t16[i, i]
-            btmp[j] = btmp[j] - t16[j, i] * btmp[i]
-            for kk in (i + 1):4
-                t16[j, kk] = t16[j, kk] - t16[j, i] * t16[i, kk]
+        abs(t16[4, 4]) < smin && (info = 1; t16[4, 4] = smin)
+        if (EIGHT * smlnum) * abs(btmp[1]) > abs(t16[1, 1]) ||
+                (EIGHT * smlnum) * abs(btmp[2]) > abs(t16[2, 2]) ||
+                (EIGHT * smlnum) * abs(btmp[3]) > abs(t16[3, 3]) ||
+                (EIGHT * smlnum) * abs(btmp[4]) > abs(t16[4, 4])
+            scale = (ONE / EIGHT) / max(abs(btmp[1]), abs(btmp[2]), abs(btmp[3]), abs(btmp[4]))
+            for i in 1:4
+                btmp[i] *= scale
             end
         end
-    end
-    abs(t16[4, 4]) < smin && (info = 1; t16[4, 4] = smin)
-    if (EIGHT * smlnum) * abs(btmp[1]) > abs(t16[1, 1]) ||
-            (EIGHT * smlnum) * abs(btmp[2]) > abs(t16[2, 2]) ||
-            (EIGHT * smlnum) * abs(btmp[3]) > abs(t16[3, 3]) ||
-            (EIGHT * smlnum) * abs(btmp[4]) > abs(t16[4, 4])
-        scale = (ONE / EIGHT) / max(abs(btmp[1]), abs(btmp[2]), abs(btmp[3]), abs(btmp[4]))
-        for i in 1:4
-            btmp[i] *= scale
+        for i in 1:4                                   # tmpv (owned, above) is written back-to-front here
+            kk = 5 - i
+            temp = ONE / t16[kk, kk]
+            tmpv[kk] = btmp[kk] * temp
+            for j in (kk + 1):4
+                tmpv[kk] = tmpv[kk] - (temp * t16[kk, j]) * tmpv[j]
+            end
         end
-    end
-    for i in 1:4                                   # tmpv (owned, above) is written back-to-front here
-        kk = 5 - i
-        temp = ONE / t16[kk, kk]
-        tmpv[kk] = btmp[kk] * temp
-        for j in (kk + 1):4
-            tmpv[kk] = tmpv[kk] - (temp * t16[kk, j]) * tmpv[j]
+        for i in 1:3
+            if jpiv[4 - i] != 4 - i
+                tmpv[4 - i], tmpv[jpiv[4 - i]] = tmpv[jpiv[4 - i]], tmpv[4 - i]
+            end
         end
+        x11 = tmpv[1]; x21 = tmpv[2]; x12 = tmpv[3]; x22 = tmpv[4]
+        xnorm = max(abs(tmpv[1]) + abs(tmpv[3]), abs(tmpv[2]) + abs(tmpv[4]))
+        return x11, x21, x12, x22, scale, xnorm, info
     end
-    for i in 1:3
-        if jpiv[4 - i] != 4 - i
-            tmpv[4 - i], tmpv[jpiv[4 - i]] = tmpv[jpiv[4 - i]], tmpv[4 - i]
-        end
-    end
-    x11 = tmpv[1]; x21 = tmpv[2]; x12 = tmpv[3]; x22 = tmpv[4]
-    xnorm = max(abs(tmpv[1]) + abs(tmpv[3]), abs(tmpv[2]) + abs(tmpv[4]))
-    return x11, x21, x12, x22, scale, xnorm, info
 end
 
 # ── DTRSYL (Reference-LAPACK verbatim), REAL quasi-triangular A (m×m), B (n×n) ─────────────────────────

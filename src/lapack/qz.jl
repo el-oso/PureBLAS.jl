@@ -516,460 +516,466 @@ function _hgeqz!(
     atol = max(safmin, ulp * anorm); btol = max(safmin, ulp * bnorm)
     ascale = ONE / max(safmin, anorm); bscale = ONE / max(safmin, bnorm)
     info = 0
-    v = _hgeqz_v(R)              # owned length-3 shift vector; all 3 slots written before every larfg
-    # Set eigenvalues ihi+1:n
-    @inbounds for j in (ihi + 1):n
-        if T[j, j] < ZERO
+    # The implicit-shift Householder vector. FIXED length 3, and all three slots are written immediately
+    # before every `_qz_larfg!`, so it needs no fill!. The scope spans the rest of the routine: `v` is
+    # used deep inside the QZ sweep loops, but the BORROW is here, at the top level of the scope, which
+    # is what `@scope` requires — one buffer for the whole call, not one per iteration.
+    @scope arn begin
+        v = borrow!(arn, R, 3)
+        # Set eigenvalues ihi+1:n
+        @inbounds for j in (ihi + 1):n
+            if T[j, j] < ZERO
+                if ilschr
+                    for jr in 1:j
+                        H[jr, j] = -H[jr, j]; T[jr, j] = -T[jr, j]
+                    end
+                else
+                    H[j, j] = -H[j, j]; T[j, j] = -T[j, j]
+                end
+                if ilz
+                    for jr in 1:n
+                        Z[jr, j] = -Z[jr, j]
+                    end
+                end
+            end
+            alphar[j] = H[j, j]; alphai[j] = ZERO; beta[j] = T[j, j]
+        end
+        if ihi >= ilo
+            ilast = ihi
             if ilschr
-                for jr in 1:j
-                    H[jr, j] = -H[jr, j]; T[jr, j] = -T[jr, j]
-                end
+                ifrstm = 1; ilastm = n
             else
-                H[j, j] = -H[j, j]; T[j, j] = -T[j, j]
+                ifrstm = ilo; ilastm = ihi
             end
-            if ilz
-                for jr in 1:n
-                    Z[jr, j] = -Z[jr, j]
+            iiter = 0; eshift = ZERO; maxit = 30 * (ihi - ilo + 1)
+            converged = false
+            jiter = 0
+            @inbounds while jiter < maxit
+                jiter += 1
+                # ═══ Split the matrix if possible ═══
+                route = 0            # 70, 80, 110  (0 = still searching)
+                ifirst = 0
+                if ilast == ilo
+                    route = 80
+                elseif abs(H[ilast, ilast - 1]) <= max(safmin, ulp * (abs(H[ilast, ilast]) + abs(H[ilast - 1, ilast - 1])))
+                    H[ilast, ilast - 1] = ZERO; route = 80
                 end
-            end
-        end
-        alphar[j] = H[j, j]; alphai[j] = ZERO; beta[j] = T[j, j]
-    end
-    if ihi >= ilo
-        ilast = ihi
-        if ilschr
-            ifrstm = 1; ilastm = n
-        else
-            ifrstm = ilo; ilastm = ihi
-        end
-        iiter = 0; eshift = ZERO; maxit = 30 * (ihi - ilo + 1)
-        converged = false
-        jiter = 0
-        @inbounds while jiter < maxit
-            jiter += 1
-            # ═══ Split the matrix if possible ═══
-            route = 0            # 70, 80, 110  (0 = still searching)
-            ifirst = 0
-            if ilast == ilo
-                route = 80
-            elseif abs(H[ilast, ilast - 1]) <= max(safmin, ulp * (abs(H[ilast, ilast]) + abs(H[ilast - 1, ilast - 1])))
-                H[ilast, ilast - 1] = ZERO; route = 80
-            end
-            if route == 0 && abs(T[ilast, ilast]) <= btol
-                T[ilast, ilast] = ZERO; route = 70
-            end
-            if route == 0
-                dropped = true
-                for j in (ilast - 1):-1:ilo
-                    if j == ilo
-                        ilazro = true
-                    elseif abs(H[j, j - 1]) <= max(safmin, ulp * (abs(H[j, j]) + abs(H[j - 1, j - 1])))
-                        H[j, j - 1] = ZERO; ilazro = true
-                    else
-                        ilazro = false
-                    end
-                    if abs(T[j, j]) < btol
-                        T[j, j] = ZERO
-                        ilazr2 = false
-                        if !ilazro
-                            temp = abs(H[j, j - 1]); temp2 = abs(H[j, j]); tempr = max(temp, temp2)
-                            if tempr < ONE && tempr != ZERO
-                                temp /= tempr; temp2 /= tempr
-                            end
-                            if temp * (ascale * abs(H[j + 1, j])) <= temp2 * (ascale * atol)
-                                ilazr2 = true
-                            end
-                        end
-                        if ilazro || ilazr2
-                            routed = false
-                            for jch in j:(ilast - 1)
-                                c, s, r = _lartg(H[jch, jch], H[jch + 1, jch])
-                                H[jch, jch] = r; H[jch + 1, jch] = ZERO
-                                _grot_rows!(H, jch, jch + 1, jch + 1, ilastm, c, s)
-                                _grot_rows!(T, jch, jch + 1, jch + 1, ilastm, c, s)
-                                ilq && _grot_cols!(Q, jch, jch + 1, 1, n, c, s)
-                                ilazr2 && (H[jch, jch - 1] = H[jch, jch - 1] * c)
-                                ilazr2 = false
-                                if abs(T[jch + 1, jch + 1]) >= btol
-                                    if jch + 1 >= ilast
-                                        route = 80
-                                    else
-                                        ifirst = jch + 1; route = 110
-                                    end
-                                    routed = true; break
-                                end
-                                T[jch + 1, jch + 1] = ZERO
-                            end
-                            routed || (route = 70)
+                if route == 0 && abs(T[ilast, ilast]) <= btol
+                    T[ilast, ilast] = ZERO; route = 70
+                end
+                if route == 0
+                    dropped = true
+                    for j in (ilast - 1):-1:ilo
+                        if j == ilo
+                            ilazro = true
+                        elseif abs(H[j, j - 1]) <= max(safmin, ulp * (abs(H[j, j]) + abs(H[j - 1, j - 1])))
+                            H[j, j - 1] = ZERO; ilazro = true
                         else
-                            for jch in j:(ilast - 1)
-                                c, s, r = _lartg(T[jch, jch + 1], T[jch + 1, jch + 1])
-                                T[jch, jch + 1] = r; T[jch + 1, jch + 1] = ZERO
-                                jch < ilastm - 1 && _grot_rows!(T, jch, jch + 1, jch + 2, ilastm, c, s)
-                                _grot_rows!(H, jch, jch + 1, jch - 1, ilastm, c, s)
-                                ilq && _grot_cols!(Q, jch, jch + 1, 1, n, c, s)
-                                c, s, r = _lartg(H[jch + 1, jch], H[jch + 1, jch - 1])
-                                H[jch + 1, jch] = r; H[jch + 1, jch - 1] = ZERO
-                                _grot_cols!(H, jch, jch - 1, ifrstm, jch, c, s)
-                                _grot_cols!(T, jch, jch - 1, ifrstm, jch - 1, c, s)
-                                ilz && _grot_cols!(Z, jch, jch - 1, 1, n, c, s)
-                            end
-                            route = 70
+                            ilazro = false
                         end
-                        dropped = false; break
-                    elseif ilazro
-                        ifirst = j; route = 110; dropped = false; break
+                        if abs(T[j, j]) < btol
+                            T[j, j] = ZERO
+                            ilazr2 = false
+                            if !ilazro
+                                temp = abs(H[j, j - 1]); temp2 = abs(H[j, j]); tempr = max(temp, temp2)
+                                if tempr < ONE && tempr != ZERO
+                                    temp /= tempr; temp2 /= tempr
+                                end
+                                if temp * (ascale * abs(H[j + 1, j])) <= temp2 * (ascale * atol)
+                                    ilazr2 = true
+                                end
+                            end
+                            if ilazro || ilazr2
+                                routed = false
+                                for jch in j:(ilast - 1)
+                                    c, s, r = _lartg(H[jch, jch], H[jch + 1, jch])
+                                    H[jch, jch] = r; H[jch + 1, jch] = ZERO
+                                    _grot_rows!(H, jch, jch + 1, jch + 1, ilastm, c, s)
+                                    _grot_rows!(T, jch, jch + 1, jch + 1, ilastm, c, s)
+                                    ilq && _grot_cols!(Q, jch, jch + 1, 1, n, c, s)
+                                    ilazr2 && (H[jch, jch - 1] = H[jch, jch - 1] * c)
+                                    ilazr2 = false
+                                    if abs(T[jch + 1, jch + 1]) >= btol
+                                        if jch + 1 >= ilast
+                                            route = 80
+                                        else
+                                            ifirst = jch + 1; route = 110
+                                        end
+                                        routed = true; break
+                                    end
+                                    T[jch + 1, jch + 1] = ZERO
+                                end
+                                routed || (route = 70)
+                            else
+                                for jch in j:(ilast - 1)
+                                    c, s, r = _lartg(T[jch, jch + 1], T[jch + 1, jch + 1])
+                                    T[jch, jch + 1] = r; T[jch + 1, jch + 1] = ZERO
+                                    jch < ilastm - 1 && _grot_rows!(T, jch, jch + 1, jch + 2, ilastm, c, s)
+                                    _grot_rows!(H, jch, jch + 1, jch - 1, ilastm, c, s)
+                                    ilq && _grot_cols!(Q, jch, jch + 1, 1, n, c, s)
+                                    c, s, r = _lartg(H[jch + 1, jch], H[jch + 1, jch - 1])
+                                    H[jch + 1, jch] = r; H[jch + 1, jch - 1] = ZERO
+                                    _grot_cols!(H, jch, jch - 1, ifrstm, jch, c, s)
+                                    _grot_cols!(T, jch, jch - 1, ifrstm, jch - 1, c, s)
+                                    ilz && _grot_cols!(Z, jch, jch - 1, 1, n, c, s)
+                                end
+                                route = 70
+                            end
+                            dropped = false; break
+                        elseif ilazro
+                            ifirst = j; route = 110; dropped = false; break
+                        end
+                    end
+                    if dropped
+                        info = n + 1; converged = false; break
                     end
                 end
-                if dropped
-                    info = n + 1; converged = false; break
+
+                # ═══ route 70: T(ilast,ilast)=0 — clear H(ilast,ilast-1) ═══
+                if route == 70
+                    c, s, r = _lartg(H[ilast, ilast], H[ilast, ilast - 1])
+                    H[ilast, ilast] = r; H[ilast, ilast - 1] = ZERO
+                    _grot_cols!(H, ilast, ilast - 1, ifrstm, ilast - 1, c, s)
+                    _grot_cols!(T, ilast, ilast - 1, ifrstm, ilast - 1, c, s)
+                    ilz && _grot_cols!(Z, ilast, ilast - 1, 1, n, c, s)
+                    route = 80
                 end
-            end
 
-            # ═══ route 70: T(ilast,ilast)=0 — clear H(ilast,ilast-1) ═══
-            if route == 70
-                c, s, r = _lartg(H[ilast, ilast], H[ilast, ilast - 1])
-                H[ilast, ilast] = r; H[ilast, ilast - 1] = ZERO
-                _grot_cols!(H, ilast, ilast - 1, ifrstm, ilast - 1, c, s)
-                _grot_cols!(T, ilast, ilast - 1, ifrstm, ilast - 1, c, s)
-                ilz && _grot_cols!(Z, ilast, ilast - 1, 1, n, c, s)
-                route = 80
-            end
+                # ═══ route 80: standardize trailing 1×1, set α,β ═══
+                if route == 80
+                    if T[ilast, ilast] < ZERO
+                        if ilschr
+                            for j in ifrstm:ilast
+                                H[j, ilast] = -H[j, ilast]; T[j, ilast] = -T[j, ilast]
+                            end
+                        else
+                            H[ilast, ilast] = -H[ilast, ilast]; T[ilast, ilast] = -T[ilast, ilast]
+                        end
+                        if ilz
+                            for j in 1:n
+                                Z[j, ilast] = -Z[j, ilast]
+                            end
+                        end
+                    end
+                    alphar[ilast] = H[ilast, ilast]; alphai[ilast] = ZERO; beta[ilast] = T[ilast, ilast]
+                    ilast -= 1
+                    if ilast < ilo
+                        converged = true; break
+                    end
+                    iiter = 0; eshift = ZERO
+                    if !ilschr
+                        ilastm = ilast
+                        ifrstm > ilast && (ifrstm = ilo)
+                    end
+                    continue     # GO TO 350
+                end
 
-            # ═══ route 80: standardize trailing 1×1, set α,β ═══
-            if route == 80
-                if T[ilast, ilast] < ZERO
-                    if ilschr
+                # ═══ route 110: QZ step ═══
+                iiter += 1
+                !ilschr && (ifrstm = ifirst)
+                # ── Compute shifts ──
+                usedouble = false
+                local s1::R, wr::R
+                if (iiter ÷ 10) * 10 == iiter
+                    # exceptional shift (single)
+                    if (R(maxit) * safmin) * abs(H[ilast, ilast - 1]) < abs(T[ilast - 1, ilast - 1])
+                        eshift = H[ilast, ilast - 1] / T[ilast - 1, ilast - 1]
+                    else
+                        eshift = eshift + ONE / (safmin * R(maxit))
+                    end
+                    s1 = ONE; wr = eshift
+                else
+                    s1, s2, wr, wr2, wi = _lag2(
+                        H[ilast - 1, ilast - 1], H[ilast, ilast - 1], H[ilast - 1, ilast],
+                        H[ilast, ilast], T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast], safmin * SAFETY
+                    )
+                    if abs((wr / s1) * T[ilast, ilast] - H[ilast, ilast]) >
+                            abs((wr2 / s2) * T[ilast, ilast] - H[ilast, ilast])
+                        wr, wr2 = wr2, wr; s1, s2 = s2, s1
+                    end
+                    wi != ZERO && (usedouble = true)
+                end
+
+                if !usedouble
+                    # ── Fiddle with shift to avoid overflow ──
+                    temp = min(ascale, ONE) * (HALF * safmax)
+                    scale = s1 > temp ? temp / s1 : ONE
+                    temp = min(bscale, ONE) * (HALF * safmax)
+                    abs(wr) > temp && (scale = min(scale, temp / abs(wr)))
+                    s1 = scale * s1; wr = scale * wr
+                    # ── Two consecutive small subdiagonals ──
+                    istart = ifirst
+                    for j in (ilast - 1):-1:(ifirst + 1)
+                        istart = j
+                        temp = abs(s1 * H[j, j - 1])
+                        temp2 = abs(s1 * H[j, j] - wr * T[j, j])
+                        tempr = max(temp, temp2)
+                        if tempr < ONE && tempr != ZERO
+                            temp /= tempr; temp2 /= tempr
+                        end
+                        if abs((ascale * H[j + 1, j]) * temp) <= (ascale * atol) * temp2
+                            break
+                        end
+                        istart = ifirst
+                    end
+                    # ── Single-shift QZ sweep ──
+                    temp = s1 * H[istart, istart] - wr * T[istart, istart]
+                    temp2 = s1 * H[istart + 1, istart]
+                    c, s, tempr = _lartg(temp, temp2)
+                    for j in istart:(ilast - 1)
+                        if j > istart
+                            c, s, r = _lartg(H[j, j - 1], H[j + 1, j - 1])
+                            H[j, j - 1] = r; H[j + 1, j - 1] = ZERO
+                        end
+                        _grot_rows!(H, j, j + 1, j, ilastm, c, s)
+                        _grot_rows!(T, j, j + 1, j, ilastm, c, s)
+                        ilq && _grot_cols!(Q, j, j + 1, 1, n, c, s)
+                        c, s, r = _lartg(T[j + 1, j + 1], T[j + 1, j])
+                        T[j + 1, j + 1] = r; T[j + 1, j] = ZERO
+                        _grot_cols!(H, j + 1, j, ifrstm, min(j + 2, ilast), c, s)
+                        _grot_cols!(T, j + 1, j, ifrstm, j, c, s)
+                        ilz && _grot_cols!(Z, j + 1, j, 1, n, c, s)
+                    end
+                    continue    # GO TO 350
+                end
+
+                # ═══ route 200: Francis double-shift ═══
+                if ifirst + 1 == ilast
+                    # 2×2 block with complex eigenvalues
+                    b22, b11, sr, cr, sl, cl = _lasv2(T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast])
+                    if b11 < ZERO
+                        cr = -cr; sr = -sr; b11 = -b11; b22 = -b22
+                    end
+                    _grot_rows!(H, ilast - 1, ilast, ilast - 1, ilastm, cl, sl)
+                    _grot_cols!(H, ilast - 1, ilast, ifrstm, ilast, cr, sr)
+                    ilast < ilastm && _grot_rows!(T, ilast - 1, ilast, ilast + 1, ilastm, cl, sl)
+                    ifrstm < ilast - 1 && _grot_cols!(T, ilast - 1, ilast, ifrstm, ifirst, cr, sr)
+                    ilq && _grot_cols!(Q, ilast - 1, ilast, 1, n, cl, sl)
+                    ilz && _grot_cols!(Z, ilast - 1, ilast, 1, n, cr, sr)
+                    T[ilast - 1, ilast - 1] = b11; T[ilast - 1, ilast] = ZERO
+                    T[ilast, ilast - 1] = ZERO; T[ilast, ilast] = b22
+                    if b22 < ZERO
                         for j in ifrstm:ilast
                             H[j, ilast] = -H[j, ilast]; T[j, ilast] = -T[j, ilast]
                         end
-                    else
-                        H[ilast, ilast] = -H[ilast, ilast]; T[ilast, ilast] = -T[ilast, ilast]
+                        if ilz
+                            for j in 1:n
+                                Z[j, ilast] = -Z[j, ilast]
+                            end
+                        end
+                        b22 = -b22
                     end
-                    if ilz
-                        for j in 1:n
-                            Z[j, ilast] = -Z[j, ilast]
+                    # recompute shift
+                    s1, tmpS2, wr, tmp2, wi = _lag2(
+                        H[ilast - 1, ilast - 1], H[ilast, ilast - 1], H[ilast - 1, ilast],
+                        H[ilast, ilast], T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast], safmin * SAFETY
+                    )
+                    if wi == ZERO
+                        continue      # standardization perturbed shift onto real line → GO TO 350
+                    end
+                    s1inv = ONE / s1
+                    a11 = H[ilast - 1, ilast - 1]; a21 = H[ilast, ilast - 1]
+                    a12 = H[ilast - 1, ilast]; a22 = H[ilast, ilast]
+                    c11r = s1 * a11 - wr * b11; c11i = -wi * b11
+                    c12 = s1 * a12; c21 = s1 * a21
+                    c22r = s1 * a22 - wr * b22; c22i = -wi * b22
+                    local cz::R, szr::R, szi::R
+                    if abs(c11r) + abs(c11i) + abs(c12) > abs(c21) + abs(c22r) + abs(c22i)
+                        t1 = _lapy3(c12, c11r, c11i)
+                        cz = c12 / t1; szr = -c11r / t1; szi = -c11i / t1
+                    else
+                        cz = _lapy2(c22r, c22i)
+                        if cz <= safmin
+                            cz = ZERO; szr = ONE; szi = ZERO
+                        else
+                            tempr = c22r / cz; tempi = c22i / cz
+                            t1 = _lapy2(cz, c21)
+                            cz = cz / t1; szr = -c21 * tempr / t1; szi = c21 * tempi / t1
                         end
                     end
-                end
-                alphar[ilast] = H[ilast, ilast]; alphai[ilast] = ZERO; beta[ilast] = T[ilast, ilast]
-                ilast -= 1
-                if ilast < ilo
-                    converged = true; break
-                end
-                iiter = 0; eshift = ZERO
-                if !ilschr
-                    ilastm = ilast
-                    ifrstm > ilast && (ifrstm = ilo)
-                end
-                continue     # GO TO 350
-            end
-
-            # ═══ route 110: QZ step ═══
-            iiter += 1
-            !ilschr && (ifrstm = ifirst)
-            # ── Compute shifts ──
-            usedouble = false
-            local s1::R, wr::R
-            if (iiter ÷ 10) * 10 == iiter
-                # exceptional shift (single)
-                if (R(maxit) * safmin) * abs(H[ilast, ilast - 1]) < abs(T[ilast - 1, ilast - 1])
-                    eshift = H[ilast, ilast - 1] / T[ilast - 1, ilast - 1]
+                    an = abs(a11) + abs(a12) + abs(a21) + abs(a22)
+                    bn = abs(b11) + abs(b22)
+                    wabs = abs(wr) + abs(wi)
+                    local cq::R, sqr::R, sqi::R
+                    if s1 * an > wabs * bn
+                        cq = cz * b11; sqr = szr * b22; sqi = -szi * b22
+                    else
+                        a1r = cz * a11 + szr * a12; a1i = szi * a12
+                        a2r = cz * a21 + szr * a22; a2i = szi * a22
+                        cq = _lapy2(a1r, a1i)
+                        if cq <= safmin
+                            cq = ZERO; sqr = ONE; sqi = ZERO
+                        else
+                            tempr = a1r / cq; tempi = a1i / cq
+                            sqr = tempr * a2r + tempi * a2i; sqi = tempi * a2r - tempr * a2i
+                        end
+                    end
+                    t1 = _lapy3(cq, sqr, sqi)
+                    cq = cq / t1; sqr = sqr / t1; sqi = sqi / t1
+                    tempr = sqr * szr - sqi * szi; tempi = sqr * szi + sqi * szr
+                    b1r = cq * cz * b11 + tempr * b22; b1i = tempi * b22
+                    b1a = _lapy2(b1r, b1i)
+                    b2r = cq * cz * b22 + tempr * b11; b2i = -tempi * b11
+                    b2a = _lapy2(b2r, b2i)
+                    beta[ilast - 1] = b1a; beta[ilast] = b2a
+                    alphar[ilast - 1] = (wr * b1a) * s1inv; alphai[ilast - 1] = (wi * b1a) * s1inv
+                    alphar[ilast] = (wr * b2a) * s1inv; alphai[ilast] = -(wi * b2a) * s1inv
+                    ilast = ifirst - 1
+                    if ilast < ilo
+                        converged = true; break
+                    end
+                    iiter = 0; eshift = ZERO
+                    if !ilschr
+                        ilastm = ilast
+                        ifrstm > ilast && (ifrstm = ilo)
+                    end
+                    continue    # GO TO 350
                 else
-                    eshift = eshift + ONE / (safmin * R(maxit))
-                end
-                s1 = ONE; wr = eshift
-            else
-                s1, s2, wr, wr2, wi = _lag2(
-                    H[ilast - 1, ilast - 1], H[ilast, ilast - 1], H[ilast - 1, ilast],
-                    H[ilast, ilast], T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast], safmin * SAFETY
-                )
-                if abs((wr / s1) * T[ilast, ilast] - H[ilast, ilast]) >
-                        abs((wr2 / s2) * T[ilast, ilast] - H[ilast, ilast])
-                    wr, wr2 = wr2, wr; s1, s2 = s2, s1
-                end
-                wi != ZERO && (usedouble = true)
-            end
-
-            if !usedouble
-                # ── Fiddle with shift to avoid overflow ──
-                temp = min(ascale, ONE) * (HALF * safmax)
-                scale = s1 > temp ? temp / s1 : ONE
-                temp = min(bscale, ONE) * (HALF * safmax)
-                abs(wr) > temp && (scale = min(scale, temp / abs(wr)))
-                s1 = scale * s1; wr = scale * wr
-                # ── Two consecutive small subdiagonals ──
-                istart = ifirst
-                for j in (ilast - 1):-1:(ifirst + 1)
-                    istart = j
-                    temp = abs(s1 * H[j, j - 1])
-                    temp2 = abs(s1 * H[j, j] - wr * T[j, j])
-                    tempr = max(temp, temp2)
-                    if tempr < ONE && tempr != ZERO
-                        temp /= tempr; temp2 /= tempr
-                    end
-                    if abs((ascale * H[j + 1, j]) * temp) <= (ascale * atol) * temp2
-                        break
-                    end
+                    # Usual case: 3×3 or larger — Francis implicit double shift
+                    ad11 = (ascale * H[ilast - 1, ilast - 1]) / (bscale * T[ilast - 1, ilast - 1])
+                    ad21 = (ascale * H[ilast, ilast - 1]) / (bscale * T[ilast - 1, ilast - 1])
+                    ad12 = (ascale * H[ilast - 1, ilast]) / (bscale * T[ilast, ilast])
+                    ad22 = (ascale * H[ilast, ilast]) / (bscale * T[ilast, ilast])
+                    u12 = T[ilast - 1, ilast] / T[ilast, ilast]
+                    ad11l = (ascale * H[ifirst, ifirst]) / (bscale * T[ifirst, ifirst])
+                    ad21l = (ascale * H[ifirst + 1, ifirst]) / (bscale * T[ifirst, ifirst])
+                    ad12l = (ascale * H[ifirst, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
+                    ad22l = (ascale * H[ifirst + 1, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
+                    ad32l = (ascale * H[ifirst + 2, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
+                    u12l = T[ifirst, ifirst + 1] / T[ifirst + 1, ifirst + 1]
+                    v[1] = (ad11 - ad11l) * (ad22 - ad11l) - ad12 * ad21 + ad21 * u12 * ad11l +
+                        (ad12l - ad11l * u12l) * ad21l
+                    v[2] = ((ad22l - ad11l) - ad21l * u12l - (ad11 - ad11l) - (ad22 - ad11l) + ad21 * u12) * ad21l
+                    v[3] = ad32l * ad21l
                     istart = ifirst
-                end
-                # ── Single-shift QZ sweep ──
-                temp = s1 * H[istart, istart] - wr * T[istart, istart]
-                temp2 = s1 * H[istart + 1, istart]
-                c, s, tempr = _lartg(temp, temp2)
-                for j in istart:(ilast - 1)
-                    if j > istart
-                        c, s, r = _lartg(H[j, j - 1], H[j + 1, j - 1])
-                        H[j, j - 1] = r; H[j + 1, j - 1] = ZERO
-                    end
-                    _grot_rows!(H, j, j + 1, j, ilastm, c, s)
-                    _grot_rows!(T, j, j + 1, j, ilastm, c, s)
-                    ilq && _grot_cols!(Q, j, j + 1, 1, n, c, s)
-                    c, s, r = _lartg(T[j + 1, j + 1], T[j + 1, j])
-                    T[j + 1, j + 1] = r; T[j + 1, j] = ZERO
-                    _grot_cols!(H, j + 1, j, ifrstm, min(j + 2, ilast), c, s)
-                    _grot_cols!(T, j + 1, j, ifrstm, j, c, s)
-                    ilz && _grot_cols!(Z, j + 1, j, 1, n, c, s)
-                end
-                continue    # GO TO 350
-            end
-
-            # ═══ route 200: Francis double-shift ═══
-            if ifirst + 1 == ilast
-                # 2×2 block with complex eigenvalues
-                b22, b11, sr, cr, sl, cl = _lasv2(T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast])
-                if b11 < ZERO
-                    cr = -cr; sr = -sr; b11 = -b11; b22 = -b22
-                end
-                _grot_rows!(H, ilast - 1, ilast, ilast - 1, ilastm, cl, sl)
-                _grot_cols!(H, ilast - 1, ilast, ifrstm, ilast, cr, sr)
-                ilast < ilastm && _grot_rows!(T, ilast - 1, ilast, ilast + 1, ilastm, cl, sl)
-                ifrstm < ilast - 1 && _grot_cols!(T, ilast - 1, ilast, ifrstm, ifirst, cr, sr)
-                ilq && _grot_cols!(Q, ilast - 1, ilast, 1, n, cl, sl)
-                ilz && _grot_cols!(Z, ilast - 1, ilast, 1, n, cr, sr)
-                T[ilast - 1, ilast - 1] = b11; T[ilast - 1, ilast] = ZERO
-                T[ilast, ilast - 1] = ZERO; T[ilast, ilast] = b22
-                if b22 < ZERO
-                    for j in ifrstm:ilast
-                        H[j, ilast] = -H[j, ilast]; T[j, ilast] = -T[j, ilast]
-                    end
-                    if ilz
-                        for j in 1:n
-                            Z[j, ilast] = -Z[j, ilast]
+                    tau = _qz_larfg!(v, 3); v[1] = ONE
+                    # Sweep
+                    for j in istart:(ilast - 2)
+                        if j > istart
+                            v[1] = H[j, j - 1]; v[2] = H[j + 1, j - 1]; v[3] = H[j + 2, j - 1]
+                            tau = _qz_larfg!(v, 3)
+                            H[j, j - 1] = v[1]; v[1] = ONE
+                            H[j + 1, j - 1] = ZERO; H[j + 2, j - 1] = ZERO
                         end
-                    end
-                    b22 = -b22
-                end
-                # recompute shift
-                s1, tmpS2, wr, tmp2, wi = _lag2(
-                    H[ilast - 1, ilast - 1], H[ilast, ilast - 1], H[ilast - 1, ilast],
-                    H[ilast, ilast], T[ilast - 1, ilast - 1], T[ilast - 1, ilast], T[ilast, ilast], safmin * SAFETY
-                )
-                if wi == ZERO
-                    continue      # standardization perturbed shift onto real line → GO TO 350
-                end
-                s1inv = ONE / s1
-                a11 = H[ilast - 1, ilast - 1]; a21 = H[ilast, ilast - 1]
-                a12 = H[ilast - 1, ilast]; a22 = H[ilast, ilast]
-                c11r = s1 * a11 - wr * b11; c11i = -wi * b11
-                c12 = s1 * a12; c21 = s1 * a21
-                c22r = s1 * a22 - wr * b22; c22i = -wi * b22
-                local cz::R, szr::R, szi::R
-                if abs(c11r) + abs(c11i) + abs(c12) > abs(c21) + abs(c22r) + abs(c22i)
-                    t1 = _lapy3(c12, c11r, c11i)
-                    cz = c12 / t1; szr = -c11r / t1; szi = -c11i / t1
-                else
-                    cz = _lapy2(c22r, c22i)
-                    if cz <= safmin
-                        cz = ZERO; szr = ONE; szi = ZERO
-                    else
-                        tempr = c22r / cz; tempi = c22i / cz
-                        t1 = _lapy2(cz, c21)
-                        cz = cz / t1; szr = -c21 * tempr / t1; szi = c21 * tempi / t1
-                    end
-                end
-                an = abs(a11) + abs(a12) + abs(a21) + abs(a22)
-                bn = abs(b11) + abs(b22)
-                wabs = abs(wr) + abs(wi)
-                local cq::R, sqr::R, sqi::R
-                if s1 * an > wabs * bn
-                    cq = cz * b11; sqr = szr * b22; sqi = -szi * b22
-                else
-                    a1r = cz * a11 + szr * a12; a1i = szi * a12
-                    a2r = cz * a21 + szr * a22; a2i = szi * a22
-                    cq = _lapy2(a1r, a1i)
-                    if cq <= safmin
-                        cq = ZERO; sqr = ONE; sqi = ZERO
-                    else
-                        tempr = a1r / cq; tempi = a1i / cq
-                        sqr = tempr * a2r + tempi * a2i; sqi = tempi * a2r - tempr * a2i
-                    end
-                end
-                t1 = _lapy3(cq, sqr, sqi)
-                cq = cq / t1; sqr = sqr / t1; sqi = sqi / t1
-                tempr = sqr * szr - sqi * szi; tempi = sqr * szi + sqi * szr
-                b1r = cq * cz * b11 + tempr * b22; b1i = tempi * b22
-                b1a = _lapy2(b1r, b1i)
-                b2r = cq * cz * b22 + tempr * b11; b2i = -tempi * b11
-                b2a = _lapy2(b2r, b2i)
-                beta[ilast - 1] = b1a; beta[ilast] = b2a
-                alphar[ilast - 1] = (wr * b1a) * s1inv; alphai[ilast - 1] = (wi * b1a) * s1inv
-                alphar[ilast] = (wr * b2a) * s1inv; alphai[ilast] = -(wi * b2a) * s1inv
-                ilast = ifirst - 1
-                if ilast < ilo
-                    converged = true; break
-                end
-                iiter = 0; eshift = ZERO
-                if !ilschr
-                    ilastm = ilast
-                    ifrstm > ilast && (ifrstm = ilo)
-                end
-                continue    # GO TO 350
-            else
-                # Usual case: 3×3 or larger — Francis implicit double shift
-                ad11 = (ascale * H[ilast - 1, ilast - 1]) / (bscale * T[ilast - 1, ilast - 1])
-                ad21 = (ascale * H[ilast, ilast - 1]) / (bscale * T[ilast - 1, ilast - 1])
-                ad12 = (ascale * H[ilast - 1, ilast]) / (bscale * T[ilast, ilast])
-                ad22 = (ascale * H[ilast, ilast]) / (bscale * T[ilast, ilast])
-                u12 = T[ilast - 1, ilast] / T[ilast, ilast]
-                ad11l = (ascale * H[ifirst, ifirst]) / (bscale * T[ifirst, ifirst])
-                ad21l = (ascale * H[ifirst + 1, ifirst]) / (bscale * T[ifirst, ifirst])
-                ad12l = (ascale * H[ifirst, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
-                ad22l = (ascale * H[ifirst + 1, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
-                ad32l = (ascale * H[ifirst + 2, ifirst + 1]) / (bscale * T[ifirst + 1, ifirst + 1])
-                u12l = T[ifirst, ifirst + 1] / T[ifirst + 1, ifirst + 1]
-                v[1] = (ad11 - ad11l) * (ad22 - ad11l) - ad12 * ad21 + ad21 * u12 * ad11l +
-                    (ad12l - ad11l * u12l) * ad21l
-                v[2] = ((ad22l - ad11l) - ad21l * u12l - (ad11 - ad11l) - (ad22 - ad11l) + ad21 * u12) * ad21l
-                v[3] = ad32l * ad21l
-                istart = ifirst
-                tau = _qz_larfg!(v, 3); v[1] = ONE
-                # Sweep
-                for j in istart:(ilast - 2)
-                    if j > istart
-                        v[1] = H[j, j - 1]; v[2] = H[j + 1, j - 1]; v[3] = H[j + 2, j - 1]
-                        tau = _qz_larfg!(v, 3)
-                        H[j, j - 1] = v[1]; v[1] = ONE
-                        H[j + 1, j - 1] = ZERO; H[j + 2, j - 1] = ZERO
-                    end
-                    v2 = v[2]; v3 = v[3]
-                    t2 = tau * v2; t3 = tau * v3
-                    # Apply 3×3 Householder from the LEFT to H, T
-                    for jc in j:ilastm
-                        temp = H[j, jc] + v2 * H[j + 1, jc] + v3 * H[j + 2, jc]
-                        H[j, jc] -= temp * tau; H[j + 1, jc] -= temp * t2; H[j + 2, jc] -= temp * t3
-                        temp2 = T[j, jc] + v2 * T[j + 1, jc] + v3 * T[j + 2, jc]
-                        T[j, jc] -= temp2 * tau; T[j + 1, jc] -= temp2 * t2; T[j + 2, jc] -= temp2 * t3
-                    end
-                    if ilq
-                        for jr in 1:n
-                            temp = Q[jr, j] + v2 * Q[jr, j + 1] + v3 * Q[jr, j + 2]
-                            Q[jr, j] -= temp * tau; Q[jr, j + 1] -= temp * t2; Q[jr, j + 2] -= temp * t3
+                        v2 = v[2]; v3 = v[3]
+                        t2 = tau * v2; t3 = tau * v3
+                        # Apply 3×3 Householder from the LEFT to H, T
+                        for jc in j:ilastm
+                            temp = H[j, jc] + v2 * H[j + 1, jc] + v3 * H[j + 2, jc]
+                            H[j, jc] -= temp * tau; H[j + 1, jc] -= temp * t2; H[j + 2, jc] -= temp * t3
+                            temp2 = T[j, jc] + v2 * T[j + 1, jc] + v3 * T[j + 2, jc]
+                            T[j, jc] -= temp2 * tau; T[j + 1, jc] -= temp2 * t2; T[j + 2, jc] -= temp2 * t3
                         end
-                    end
-                    # Zero j-th column of T (DLAGBC): swap rows to pivot, LU-factor, solve
-                    ilpivt = false
-                    temp = max(abs(T[j + 1, j + 1]), abs(T[j + 1, j + 2]))
-                    temp2 = max(abs(T[j + 2, j + 1]), abs(T[j + 2, j + 2]))
-                    local u1::R, u2::R, scale::R, w11::R, w12::R, w21::R, w22::R
-                    if max(temp, temp2) < safmin
-                        scale = ZERO; u1 = ONE; u2 = ZERO
-                    else
-                        if temp >= temp2
-                            w11 = T[j + 1, j + 1]; w21 = T[j + 2, j + 1]; w12 = T[j + 1, j + 2]; w22 = T[j + 2, j + 2]
-                            u1 = T[j + 1, j]; u2 = T[j + 2, j]
+                        if ilq
+                            for jr in 1:n
+                                temp = Q[jr, j] + v2 * Q[jr, j + 1] + v3 * Q[jr, j + 2]
+                                Q[jr, j] -= temp * tau; Q[jr, j + 1] -= temp * t2; Q[jr, j + 2] -= temp * t3
+                            end
+                        end
+                        # Zero j-th column of T (DLAGBC): swap rows to pivot, LU-factor, solve
+                        ilpivt = false
+                        temp = max(abs(T[j + 1, j + 1]), abs(T[j + 1, j + 2]))
+                        temp2 = max(abs(T[j + 2, j + 1]), abs(T[j + 2, j + 2]))
+                        local u1::R, u2::R, scale::R, w11::R, w12::R, w21::R, w22::R
+                        if max(temp, temp2) < safmin
+                            scale = ZERO; u1 = ONE; u2 = ZERO
                         else
-                            w21 = T[j + 1, j + 1]; w11 = T[j + 2, j + 1]; w22 = T[j + 1, j + 2]; w12 = T[j + 2, j + 2]
-                            u2 = T[j + 1, j]; u1 = T[j + 2, j]
+                            if temp >= temp2
+                                w11 = T[j + 1, j + 1]; w21 = T[j + 2, j + 1]; w12 = T[j + 1, j + 2]; w22 = T[j + 2, j + 2]
+                                u1 = T[j + 1, j]; u2 = T[j + 2, j]
+                            else
+                                w21 = T[j + 1, j + 1]; w11 = T[j + 2, j + 1]; w22 = T[j + 1, j + 2]; w12 = T[j + 2, j + 2]
+                                u2 = T[j + 1, j]; u1 = T[j + 2, j]
+                            end
+                            if abs(w12) > abs(w11)
+                                ilpivt = true
+                                w12, w11 = w11, w12; w22, w21 = w21, w22
+                            end
+                            temp = w21 / w11
+                            u2 = u2 - temp * u1; w22 = w22 - temp * w12; w21 = ZERO
+                            scale = ONE
+                            if abs(w22) < safmin
+                                scale = ZERO; u2 = ONE; u1 = -w12 / w11
+                            else
+                                abs(w22) < abs(u2) && (scale = abs(w22 / u2))
+                                abs(w11) < abs(u1) && (scale = min(scale, abs(w11 / u1)))
+                                u2 = (scale * u2) / w22
+                                u1 = (scale * u1 - w12 * u2) / w11
+                            end
                         end
-                        if abs(w12) > abs(w11)
-                            ilpivt = true
-                            w12, w11 = w11, w12; w22, w21 = w21, w22
+                        if ilpivt
+                            u1, u2 = u2, u1
                         end
-                        temp = w21 / w11
-                        u2 = u2 - temp * u1; w22 = w22 - temp * w12; w21 = ZERO
-                        scale = ONE
-                        if abs(w22) < safmin
-                            scale = ZERO; u2 = ONE; u1 = -w12 / w11
-                        else
-                            abs(w22) < abs(u2) && (scale = abs(w22 / u2))
-                            abs(w11) < abs(u1) && (scale = min(scale, abs(w11 / u1)))
-                            u2 = (scale * u2) / w22
-                            u1 = (scale * u1 - w12 * u2) / w11
+                        t1 = sqrt(scale^2 + u1^2 + u2^2)
+                        tau = ONE + scale / t1
+                        vs = -ONE / (scale + t1)
+                        v[1] = ONE; v[2] = vs * u1; v[3] = vs * u2
+                        v2 = v[2]; v3 = v[3]; t2 = tau * v2; t3 = tau * v3
+                        # Apply from the RIGHT
+                        for jr in ifrstm:min(j + 3, ilast)
+                            temp = H[jr, j] + v2 * H[jr, j + 1] + v3 * H[jr, j + 2]
+                            H[jr, j] -= temp * tau; H[jr, j + 1] -= temp * t2; H[jr, j + 2] -= temp * t3
                         end
-                    end
-                    if ilpivt
-                        u1, u2 = u2, u1
-                    end
-                    t1 = sqrt(scale^2 + u1^2 + u2^2)
-                    tau = ONE + scale / t1
-                    vs = -ONE / (scale + t1)
-                    v[1] = ONE; v[2] = vs * u1; v[3] = vs * u2
-                    v2 = v[2]; v3 = v[3]; t2 = tau * v2; t3 = tau * v3
-                    # Apply from the RIGHT
-                    for jr in ifrstm:min(j + 3, ilast)
-                        temp = H[jr, j] + v2 * H[jr, j + 1] + v3 * H[jr, j + 2]
-                        H[jr, j] -= temp * tau; H[jr, j + 1] -= temp * t2; H[jr, j + 2] -= temp * t3
-                    end
-                    for jr in ifrstm:(j + 2)
-                        temp = T[jr, j] + v2 * T[jr, j + 1] + v3 * T[jr, j + 2]
-                        T[jr, j] -= temp * tau; T[jr, j + 1] -= temp * t2; T[jr, j + 2] -= temp * t3
-                    end
-                    if ilz
-                        for jr in 1:n
-                            temp = Z[jr, j] + v2 * Z[jr, j + 1] + v3 * Z[jr, j + 2]
-                            Z[jr, j] -= temp * tau; Z[jr, j + 1] -= temp * t2; Z[jr, j + 2] -= temp * t3
+                        for jr in ifrstm:(j + 2)
+                            temp = T[jr, j] + v2 * T[jr, j + 1] + v3 * T[jr, j + 2]
+                            T[jr, j] -= temp * tau; T[jr, j + 1] -= temp * t2; T[jr, j + 2] -= temp * t3
                         end
+                        if ilz
+                            for jr in 1:n
+                                temp = Z[jr, j] + v2 * Z[jr, j + 1] + v3 * Z[jr, j + 2]
+                                Z[jr, j] -= temp * tau; Z[jr, j + 1] -= temp * t2; Z[jr, j + 2] -= temp * t3
+                            end
+                        end
+                        T[j + 1, j] = ZERO; T[j + 2, j] = ZERO
                     end
-                    T[j + 1, j] = ZERO; T[j + 2, j] = ZERO
+                    # Last elements: use Givens rotations
+                    jl = ilast - 1
+                    c, s, r = _lartg(H[jl, jl - 1], H[jl + 1, jl - 1])
+                    H[jl, jl - 1] = r; H[jl + 1, jl - 1] = ZERO
+                    _grot_rows!(H, jl, jl + 1, jl, ilastm, c, s)
+                    _grot_rows!(T, jl, jl + 1, jl, ilastm, c, s)
+                    ilq && _grot_cols!(Q, jl, jl + 1, 1, n, c, s)
+                    c, s, r = _lartg(T[jl + 1, jl + 1], T[jl + 1, jl])
+                    T[jl + 1, jl + 1] = r; T[jl + 1, jl] = ZERO
+                    _grot_cols!(H, jl + 1, jl, ifrstm, ilast, c, s)
+                    _grot_cols!(T, jl + 1, jl, ifrstm, ilast - 1, c, s)
+                    ilz && _grot_cols!(Z, jl + 1, jl, 1, n, c, s)
+                    continue    # GO TO 350
                 end
-                # Last elements: use Givens rotations
-                jl = ilast - 1
-                c, s, r = _lartg(H[jl, jl - 1], H[jl + 1, jl - 1])
-                H[jl, jl - 1] = r; H[jl + 1, jl - 1] = ZERO
-                _grot_rows!(H, jl, jl + 1, jl, ilastm, c, s)
-                _grot_rows!(T, jl, jl + 1, jl, ilastm, c, s)
-                ilq && _grot_cols!(Q, jl, jl + 1, 1, n, c, s)
-                c, s, r = _lartg(T[jl + 1, jl + 1], T[jl + 1, jl])
-                T[jl + 1, jl + 1] = r; T[jl + 1, jl] = ZERO
-                _grot_cols!(H, jl + 1, jl, ifrstm, ilast, c, s)
-                _grot_cols!(T, jl + 1, jl, ifrstm, ilast - 1, c, s)
-                ilz && _grot_cols!(Z, jl + 1, jl, 1, n, c, s)
-                continue    # GO TO 350
+            end
+            if !converged && info == 0
+                info = ilast
+                # NON-CONVERGENCE: alphar/alphai[ilo:ilast] were never written this call, yet the loop
+                # below forms alpha[i] for ALL i. With the old fresh `Vector{R}(undef,n)` that was
+                # documented garbage (reference LAPACK marks 1:info invalid); with the OWNED hgzar/hgzai
+                # it would be the PREVIOUS call's eigenvalues — plausible-looking and worse, and
+                # `_ggev_core!`/`gges!` discard hgeqz's info, so nothing downstream would notice.
+                # Same fix, same reasoning as hseqr.jl's `_dlahqr!` non-convergence range.
+                @inbounds for i in ilo:min(ilast, n)
+                    alphar[i] = zero(R); alphai[i] = zero(R)
+                end
             end
         end
-        if !converged && info == 0
-            info = ilast
-            # NON-CONVERGENCE: alphar/alphai[ilo:ilast] were never written this call, yet the loop
-            # below forms alpha[i] for ALL i. With the old fresh `Vector{R}(undef,n)` that was
-            # documented garbage (reference LAPACK marks 1:info invalid); with the OWNED hgzar/hgzai
-            # it would be the PREVIOUS call's eigenvalues — plausible-looking and worse, and
-            # `_ggev_core!`/`gges!` discard hgeqz's info, so nothing downstream would notice.
-            # Same fix, same reasoning as hseqr.jl's `_dlahqr!` non-convergence range.
-            @inbounds for i in ilo:min(ilast, n)
-                alphar[i] = zero(R); alphai[i] = zero(R)
+        # Set eigenvalues 1:ilo-1
+        @inbounds for j in 1:(ilo - 1)
+            if T[j, j] < ZERO
+                if ilschr
+                    for jr in 1:j
+                        H[jr, j] = -H[jr, j]; T[jr, j] = -T[jr, j]
+                    end
+                else
+                    H[j, j] = -H[j, j]; T[j, j] = -T[j, j]
+                end
+                if ilz
+                    for jr in 1:n
+                        Z[jr, j] = -Z[jr, j]
+                    end
+                end
             end
+            alphar[j] = H[j, j]; alphai[j] = ZERO; beta[j] = T[j, j]
         end
+        return info
     end
-    # Set eigenvalues 1:ilo-1
-    @inbounds for j in 1:(ilo - 1)
-        if T[j, j] < ZERO
-            if ilschr
-                for jr in 1:j
-                    H[jr, j] = -H[jr, j]; T[jr, j] = -T[jr, j]
-                end
-            else
-                H[j, j] = -H[j, j]; T[j, j] = -T[j, j]
-            end
-            if ilz
-                for jr in 1:n
-                    Z[jr, j] = -Z[jr, j]
-                end
-            end
-        end
-        alphar[j] = H[j, j]; alphai[j] = ZERO; beta[j] = T[j, j]
-    end
-    return info
 end
 
 """

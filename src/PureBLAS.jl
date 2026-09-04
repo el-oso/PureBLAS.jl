@@ -12,6 +12,7 @@ using LinearAlgebra: Adjoint, Transpose
 include("core.jl")          # type aliases, _ld/_st! accessors, lassq, |·|
 include("ptrmat.jl")        # PtrMatrix/PtrVector: isbits Ptr-backed operands for the C-ABI boundary
 include("cpuinfo.jl")       # SIMD width detection (const-folded, trim-safe)
+include("arena.jl")         # scratch arena: borrow shape+stride in a @scope, no field per role
 include("simd_kernels.jl")  # SIMD.jl fast paths (real, unit-stride, dense)
 include("blas1/level1.jl")        # low-level (n,…,inc) kernels — shared by both modes
 include("blas2/level2.jl")        # Level-2 gemv/ger/symv/hemv/trmv/trsv kernels (on the L1 column kernels)

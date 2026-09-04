@@ -193,90 +193,95 @@ function _dlaexc!(
         return 0
     end
     nd = n1 + n2
-    # D is an EXACT nd×nd view of a fixed 4×4 owned buffer, never the raw field: the dnorm loop below is
-    # `for x in D`, so handing over an oversized 4×4 at nd == 3 would fold 7 stale elements into `thresh`
-    # and silently change which swaps are accepted. Fully written by the copy loop, so no fill! is needed.
-    # u1/u2 are separate fields: in the n1=2,n2=2 branch u1 is still read and applied while u2 is live.
-    D, u1buf, u2buf = _laexc_work(R, nd)
-    @inbounds for jj in 1:nd, ii in 1:nd
-        D[ii, jj] = T[j1 + ii - 1, j1 + jj - 1]
-    end
-    dnorm = ZERO; @inbounds for x in D
-        dnorm = max(dnorm, abs(x))
-    end
-    eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
-    thresh = max(TEN * eps_p * dnorm, smlnum)
-    TL = view(D, 1:n1, 1:n1); TR = view(D, (n1 + 1):nd, (n1 + 1):nd)
-    # RHS block D[1:n1, n1+1:nd] as the four column-major scalars `_syl_dlasy2` actually reads.
-    bb11 = D[1, n1 + 1]
-    bb21 = n1 == 2 ? D[2, n1 + 1] : ZERO
-    bb12 = n2 == 2 ? D[1, n1 + 2] : ZERO
-    bb22 = (n1 == 2 && n2 == 2) ? D[2, n1 + 2] : ZERO
-    x11, x21, x12, x22, scale, _, _ = _syl_dlasy2(false, false, -1, n1, n2, TL, TR, bb11, bb21, bb12, bb22)
-    k = n1 + n1 + n2 - 3
-    if k == 1
-        # n1=1, n2=2
-        u = u1buf
-        u[1] = scale; u[2] = x11; u[3] = x12
-        _, tau = _exc_larfg!(u[3], view(u, 1:2)); u[3] = ONE
-        t11 = T[j1, j1]
-        _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
-        max(abs(D[3, 1]), abs(D[3, 2]), abs(D[3, 3] - t11)) > thresh && return 1
-        _exc_larfx_l!(u, tau, view(T, j1:(j1 + 2), j1:n))
-        _exc_larfx_r!(u, tau, view(T, 1:j2, j1:(j1 + 2)))
-        T[j3, j1] = ZERO; T[j3, j2] = ZERO; T[j3, j3] = t11
-        wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
-    elseif k == 2
-        # n1=2, n2=1
-        u = u1buf
-        u[1] = -x11; u[2] = -x21; u[3] = scale
-        _, tau = _exc_larfg!(u[1], view(u, 2:3)); u[1] = ONE
-        t33 = T[j3, j3]
-        _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
-        max(abs(D[2, 1]), abs(D[3, 1]), abs(D[1, 1] - t33)) > thresh && return 1
-        _exc_larfx_r!(u, tau, view(T, 1:j3, j1:(j1 + 2)))
-        _exc_larfx_l!(u, tau, view(T, j1:(j1 + 2), j2:n))
-        T[j1, j1] = t33; T[j2, j1] = ZERO; T[j3, j1] = ZERO
-        wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
-    else
-        # n1=2, n2=2
-        u1 = u1buf
-        u1[1] = -x11; u1[2] = -x21; u1[3] = scale
-        _, tau1 = _exc_larfg!(u1[1], view(u1, 2:3)); u1[1] = ONE
-        temp = -tau1 * (x12 + u1[2] * x22)
-        u2 = u2buf
-        u2[1] = -temp * u1[2] - x22; u2[2] = -temp * u1[3]; u2[3] = scale
-        _, tau2 = _exc_larfg!(u2[1], view(u2, 2:3)); u2[1] = ONE
-        _exc_larfx_l!(u1, tau1, view(D, 1:3, 1:4)); _exc_larfx_r!(u1, tau1, view(D, 1:4, 1:3))
-        _exc_larfx_l!(u2, tau2, view(D, 2:4, 1:4)); _exc_larfx_r!(u2, tau2, view(D, 1:4, 2:4))
-        max(abs(D[3, 1]), abs(D[3, 2]), abs(D[4, 1]), abs(D[4, 2])) > thresh && return 1
-        _exc_larfx_l!(u1, tau1, view(T, j1:(j1 + 2), j1:n))
-        _exc_larfx_r!(u1, tau1, view(T, 1:j4, j1:(j1 + 2)))
-        _exc_larfx_l!(u2, tau2, view(T, j2:(j2 + 2), j1:n))
-        _exc_larfx_r!(u2, tau2, view(T, 1:j4, j2:(j2 + 2)))
-        T[j3, j1] = ZERO; T[j3, j2] = ZERO; T[j4, j1] = ZERO; T[j4, j2] = ZERO
-        if wantq
-            _exc_larfx_r!(u1, tau1, view(Q, 1:n, j1:(j1 + 2)))
-            _exc_larfx_r!(u2, tau2, view(Q, 1:n, j2:(j2 + 2)))
+    # D is borrowed EXACTLY nd×nd, never a fixed 4×4: the dnorm loop below is `for x in D`, so an
+    # oversized buffer at nd == 3 would fold 7 stale elements into `thresh` and silently change which
+    # swaps are accepted. Fully written by the copy loop, so no fill! is needed. u1/u2 are separate
+    # borrows: in the n1=2,n2=2 branch u1 is still read and applied while u2 is live. The scope opens here
+    # rather than at the top because the n1=n2=1 arm above returns without any scratch at all.
+    @scope arn begin
+        D = borrow!(arn, R, nd, nd)
+        u1buf = borrow!(arn, R, 3)
+        u2buf = borrow!(arn, R, 3)
+        @inbounds for jj in 1:nd, ii in 1:nd
+            D[ii, jj] = T[j1 + ii - 1, j1 + jj - 1]
         end
+        dnorm = ZERO; @inbounds for x in D
+            dnorm = max(dnorm, abs(x))
+        end
+        eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
+        thresh = max(TEN * eps_p * dnorm, smlnum)
+        TL = view(D, 1:n1, 1:n1); TR = view(D, (n1 + 1):nd, (n1 + 1):nd)
+        # RHS block D[1:n1, n1+1:nd] as the four column-major scalars `_syl_dlasy2` actually reads.
+        bb11 = D[1, n1 + 1]
+        bb21 = n1 == 2 ? D[2, n1 + 1] : ZERO
+        bb12 = n2 == 2 ? D[1, n1 + 2] : ZERO
+        bb22 = (n1 == 2 && n2 == 2) ? D[2, n1 + 2] : ZERO
+        x11, x21, x12, x22, scale, _, _ = _syl_dlasy2(false, false, -1, n1, n2, TL, TR, bb11, bb21, bb12, bb22)
+        k = n1 + n1 + n2 - 3
+        if k == 1
+            # n1=1, n2=2
+            u = u1buf
+            u[1] = scale; u[2] = x11; u[3] = x12
+            _, tau = _exc_larfg!(u[3], view(u, 1:2)); u[3] = ONE
+            t11 = T[j1, j1]
+            _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
+            max(abs(D[3, 1]), abs(D[3, 2]), abs(D[3, 3] - t11)) > thresh && return 1
+            _exc_larfx_l!(u, tau, view(T, j1:(j1 + 2), j1:n))
+            _exc_larfx_r!(u, tau, view(T, 1:j2, j1:(j1 + 2)))
+            T[j3, j1] = ZERO; T[j3, j2] = ZERO; T[j3, j3] = t11
+            wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
+        elseif k == 2
+            # n1=2, n2=1
+            u = u1buf
+            u[1] = -x11; u[2] = -x21; u[3] = scale
+            _, tau = _exc_larfg!(u[1], view(u, 2:3)); u[1] = ONE
+            t33 = T[j3, j3]
+            _exc_larfx_l!(u, tau, view(D, 1:3, 1:3)); _exc_larfx_r!(u, tau, view(D, 1:3, 1:3))
+            max(abs(D[2, 1]), abs(D[3, 1]), abs(D[1, 1] - t33)) > thresh && return 1
+            _exc_larfx_r!(u, tau, view(T, 1:j3, j1:(j1 + 2)))
+            _exc_larfx_l!(u, tau, view(T, j1:(j1 + 2), j2:n))
+            T[j1, j1] = t33; T[j2, j1] = ZERO; T[j3, j1] = ZERO
+            wantq && _exc_larfx_r!(u, tau, view(Q, 1:n, j1:(j1 + 2)))
+        else
+            # n1=2, n2=2
+            u1 = u1buf
+            u1[1] = -x11; u1[2] = -x21; u1[3] = scale
+            _, tau1 = _exc_larfg!(u1[1], view(u1, 2:3)); u1[1] = ONE
+            temp = -tau1 * (x12 + u1[2] * x22)
+            u2 = u2buf
+            u2[1] = -temp * u1[2] - x22; u2[2] = -temp * u1[3]; u2[3] = scale
+            _, tau2 = _exc_larfg!(u2[1], view(u2, 2:3)); u2[1] = ONE
+            _exc_larfx_l!(u1, tau1, view(D, 1:3, 1:4)); _exc_larfx_r!(u1, tau1, view(D, 1:4, 1:3))
+            _exc_larfx_l!(u2, tau2, view(D, 2:4, 1:4)); _exc_larfx_r!(u2, tau2, view(D, 1:4, 2:4))
+            max(abs(D[3, 1]), abs(D[3, 2]), abs(D[4, 1]), abs(D[4, 2])) > thresh && return 1
+            _exc_larfx_l!(u1, tau1, view(T, j1:(j1 + 2), j1:n))
+            _exc_larfx_r!(u1, tau1, view(T, 1:j4, j1:(j1 + 2)))
+            _exc_larfx_l!(u2, tau2, view(T, j2:(j2 + 2), j1:n))
+            _exc_larfx_r!(u2, tau2, view(T, 1:j4, j2:(j2 + 2)))
+            T[j3, j1] = ZERO; T[j3, j2] = ZERO; T[j4, j1] = ZERO; T[j4, j2] = ZERO
+            if wantq
+                _exc_larfx_r!(u1, tau1, view(Q, 1:n, j1:(j1 + 2)))
+                _exc_larfx_r!(u2, tau2, view(Q, 1:n, j2:(j2 + 2)))
+            end
+        end
+        # ---- restandardize the swapped blocks (dlanv2 + rotations) ----
+        if n2 == 2
+            a, b, c, d, _, _, _, _, cs, sn = _exc_dlanv2(T[j1, j1], T[j1, j2], T[j2, j1], T[j2, j2])
+            T[j1, j1] = a; T[j1, j2] = b; T[j2, j1] = c; T[j2, j2] = d
+            _exc_rot_rows!(T, j1, j2, j1 + 2, n, cs, sn)
+            _exc_rot_cols!(T, j1, j2, 1, j1 - 1, cs, sn)
+            wantq && _exc_rot_cols!(Q, j1, j2, 1, n, cs, sn)
+        end
+        if n1 == 2
+            j3b = j1 + n2; j4b = j3b + 1
+            a, b, c, d, _, _, _, _, cs, sn = _exc_dlanv2(T[j3b, j3b], T[j3b, j4b], T[j4b, j3b], T[j4b, j4b])
+            T[j3b, j3b] = a; T[j3b, j4b] = b; T[j4b, j3b] = c; T[j4b, j4b] = d
+            j3b + 2 <= n && _exc_rot_rows!(T, j3b, j4b, j3b + 2, n, cs, sn)
+            _exc_rot_cols!(T, j3b, j4b, 1, j3b - 1, cs, sn)
+            wantq && _exc_rot_cols!(Q, j3b, j4b, 1, n, cs, sn)
+        end
+        return 0
     end
-    # ---- restandardize the swapped blocks (dlanv2 + rotations) ----
-    if n2 == 2
-        a, b, c, d, _, _, _, _, cs, sn = _exc_dlanv2(T[j1, j1], T[j1, j2], T[j2, j1], T[j2, j2])
-        T[j1, j1] = a; T[j1, j2] = b; T[j2, j1] = c; T[j2, j2] = d
-        _exc_rot_rows!(T, j1, j2, j1 + 2, n, cs, sn)
-        _exc_rot_cols!(T, j1, j2, 1, j1 - 1, cs, sn)
-        wantq && _exc_rot_cols!(Q, j1, j2, 1, n, cs, sn)
-    end
-    if n1 == 2
-        j3b = j1 + n2; j4b = j3b + 1
-        a, b, c, d, _, _, _, _, cs, sn = _exc_dlanv2(T[j3b, j3b], T[j3b, j4b], T[j4b, j3b], T[j4b, j4b])
-        T[j3b, j3b] = a; T[j3b, j4b] = b; T[j4b, j3b] = c; T[j4b, j4b] = d
-        j3b + 2 <= n && _exc_rot_rows!(T, j3b, j4b, j3b + 2, n, cs, sn)
-        _exc_rot_cols!(T, j3b, j4b, 1, j3b - 1, cs, sn)
-        wantq && _exc_rot_cols!(Q, j3b, j4b, 1, n, cs, sn)
-    end
-    return 0
 end
 
 # ── DTREXC (Reference-LAPACK verbatim), REAL quasi-triangular T ────────────────────────────────────────

@@ -434,30 +434,36 @@ function _tgs_tgsy2!(
         C::AbstractMatrix{R}, Fm::AbstractMatrix{R}
     ) where {R <: Real}
     p = n1 * n2; nz = 2 * p
-    # Z ARRIVES ZEROED from the accessor and that is load-bearing: it is built entirely by the `+=`/`-=`
-    # accumulation below, with no prior full write. rhs/ip/jp are fully written before any read.
-    Z, rhs, ip, jp = _tgsy2_work(R, nz)
-    @inbounds for j in 1:n2, i in 1:n1
-        r = (j - 1) * n1 + i
-        for k in 1:n1                       # + S11[i,k]·Rm[k,j] / + T11[i,k]·Rm[k,j]
-            Z[r, (j - 1) * n1 + k] += S[i, k]
-            Z[p + r, (j - 1) * n1 + k] += Tm[i, k]
+    @scope arn begin
+        # Z IS ZEROED HERE and that is load-bearing: it is built entirely by the `+=`/`-=` accumulation
+        # below, with no prior full write. rhs/ip/jp are fully written before any read, so they take the
+        # borrow as it comes. All four are exact (nz ≤ 8) and die with the scope.
+        Z = borrow!(arn, R, nz, nz); fill!(Z, zero(R))
+        rhs = borrow!(arn, R, nz)
+        ip = borrow!(arn, Int, nz)
+        jp = borrow!(arn, Int, nz)
+        @inbounds for j in 1:n2, i in 1:n1
+            r = (j - 1) * n1 + i
+            for k in 1:n1                       # + S11[i,k]·Rm[k,j] / + T11[i,k]·Rm[k,j]
+                Z[r, (j - 1) * n1 + k] += S[i, k]
+                Z[p + r, (j - 1) * n1 + k] += Tm[i, k]
+            end
+            for k in 1:n2                       # − Lm[i,k]·S22[k,j] / − Lm[i,k]·T22[k,j]
+                Z[r, p + (k - 1) * n1 + i] -= S[n1 + k, n1 + j]
+                Z[p + r, p + (k - 1) * n1 + i] -= Tm[n1 + k, n1 + j]
+            end
+            rhs[r] = C[i, j]
+            rhs[p + r] = Fm[i, j]
         end
-        for k in 1:n2                       # − Lm[i,k]·S22[k,j] / − Lm[i,k]·T22[k,j]
-            Z[r, p + (k - 1) * n1 + i] -= S[n1 + k, n1 + j]
-            Z[p + r, p + (k - 1) * n1 + i] -= Tm[n1 + k, n1 + j]
+        ierr = _tgs_getc2!(Z, nz, ip, jp)
+        scale = _tgs_gesc2!(Z, nz, rhs, ip, jp)
+        @inbounds for j in 1:n2, i in 1:n1
+            r = (j - 1) * n1 + i
+            C[i, j] = rhs[r]
+            Fm[i, j] = rhs[p + r]
         end
-        rhs[r] = C[i, j]
-        rhs[p + r] = Fm[i, j]
+        return scale, ierr
     end
-    ierr = _tgs_getc2!(Z, nz, ip, jp)
-    scale = _tgs_gesc2!(Z, nz, rhs, ip, jp)
-    @inbounds for j in 1:n2, i in 1:n1
-        r = (j - 1) * n1 + i
-        C[i, j] = rhs[r]
-        Fm[i, j] = rhs[p + r]
-    end
-    return scale, ierr
 end
 
 # ── DLAGV2: standardize the 2×2 diagonal block of (A,B) at (p,p) — B → triangular with the LAPACK
@@ -560,210 +566,242 @@ function _dtgex2_big!(
     m = n1 + n2
     jm = j1 + m - 1
     jm <= n || return 0                    # LAPACK dtgex2 early no-op guard
-    # Every temporary below is an owned fixed-size workspace view: n1,n2 ∈ {1,2} at every `_dtgex2!`
-    # call site, so m = n1+n2 ≤ 4 and nz = 2·n1·n2 ≤ 8. `_tgs_matmul` used to RETURN a fresh matrix and
-    # the caller rebound S/Tm/LI/IR; with fixed buffers those rebinds are `copyto!`s and the two nested
-    # products run through the M1/M2 ping-pong pair.
-    S, Tm, Cm, Fm = _tgex2_blocks(R, m, n1, n2)
-    @inbounds for j in 1:m, i in 1:m
-        S[i, j] = A[j1 + i - 1, j1 + j - 1]
-        Tm[i, j] = B[j1 + i - 1, j1 + j - 1]
-    end
-    eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
-    dnorma = _tgs_fnorm(S, 1, m, 1, m)
-    dnormb = _tgs_fnorm(Tm, 1, m, 1, m)
-    thresha = max(TWENTY * eps_p * dnorma, smlnum)
-    threshb = max(TWENTY * eps_p * dnormb, smlnum)
-    # generalized Sylvester solve: S11·Rm − Lm·S22 = scale·S12, T11·Rm − Lm·T22 = scale·T12
-    @inbounds for j in 1:n2, i in 1:n1
-        Cm[i, j] = S[i, n1 + j]
-        Fm[i, j] = Tm[i, n1 + j]
-    end
-    scale, ierr = _tgs_tgsy2!(S, Tm, n1, n2, Cm, Fm)
-    ierr > 0 && return 1
-    # left transform: QR of [−Lm; scale·I_n2]  →  full m×m Q in LI
-    # LI AND IR ARRIVE ZEROED from the accessor, both load-bearing: only LI[1:n1,1:n2] plus a unit
-    # sub-diagonal is written here yet `_tgs_geqr2!` reads all of LI[1:m,1:n2]; IR has only two sparse
-    # patterns written yet `_tgs_gerq2!` reads rows n2+1:n2+n1 across all of cols 1:m.
-    LI, IR, τl, τr, τl2, τr2, vq, vr = _tgex2_qr(R, m)
-    @inbounds for j in 1:n2
-        for i in 1:n1
-            LI[i, j] = -Fm[i, j]
+    # Every temporary below is a fixed-size arena borrow: n1,n2 ∈ {1,2} at every `_dtgex2!` call site, so
+    # m = n1+n2 ≤ 4 and nz = 2·n1·n2 ≤ 8. `_tgs_matmul` used to RETURN a fresh matrix and the caller
+    # rebound S/Tm/LI/IR; with borrowed buffers those rebinds are `copyto!`s and the two nested products
+    # run through the M1/M2 ping-pong pair. The scope spans the whole routine because LI/IR/w are read by
+    # the off-block update at the very end; every borrow sits at the top level of it, none in a loop.
+    @scope arn begin
+        # Diagonal blocks. All four are fully written by the copy loops below, so no fill!. Borrowed EXACTLY
+        # so a shape bug trips @boundscheck rather than reading a stale corner.
+        S = borrow!(arn, R, m, m)
+        Tm = borrow!(arn, R, m, m)
+        Cm = borrow!(arn, R, n1, n2)
+        Fm = borrow!(arn, R, n1, n2)
+        @inbounds for j in 1:m, i in 1:m
+            S[i, j] = A[j1 + i - 1, j1 + j - 1]
+            Tm[i, j] = B[j1 + i - 1, j1 + j - 1]
         end
-        LI[n1 + j, j] = scale
-    end
-    _tgs_geqr2!(LI, m, n2, τl, vq)
-    _tgs_org2r!(LI, m, n2, τl)
-    # right transform: RQ of [scale·I_n1, Rm] (rows n2+1..m)  →  full m×m Q in IR
-    @inbounds begin
-        for j in 1:n2, i in 1:n1
-            IR[n2 + i, n1 + j] = Cm[i, j]
+        eps_p = eps(R); smlnum = _syl_safmin(R) / eps_p
+        dnorma = _tgs_fnorm(S, 1, m, 1, m)
+        dnormb = _tgs_fnorm(Tm, 1, m, 1, m)
+        thresha = max(TWENTY * eps_p * dnorma, smlnum)
+        threshb = max(TWENTY * eps_p * dnormb, smlnum)
+        # generalized Sylvester solve: S11·Rm − Lm·S22 = scale·S12, T11·Rm − Lm·T22 = scale·T12
+        @inbounds for j in 1:n2, i in 1:n1
+            Cm[i, j] = S[i, n1 + j]
+            Fm[i, j] = Tm[i, n1 + j]
         end
-        for i in 1:n1
-            IR[n2 + i, i] = scale
-        end
-    end
-    _tgs_gerq2!(IR, n2, n1, m, τr, vr)
-    _tgs_orgr2!(IR, m, n1, τr)
-    # tentative swap: S ← LIᵀ·S·IRᵀ, T likewise (M1 = inner product, M2 = outer; both live at once)
-    M1, M2, PA, PB = _tgex2_mul(R, m)
-    _tgs_matmul!(M1, true, false, LI, S); _tgs_matmul!(M2, false, true, M1, IR); copyto!(S, M2)
-    _tgs_matmul!(M1, true, false, LI, Tm); _tgs_matmul!(M2, false, true, M1, IR); copyto!(Tm, M2)
-    SCPY, TCPY, IRCOP, LICOP = _tgex2_copies(R, m)
-    copyto!(SCPY, S); copyto!(TCPY, Tm); copyto!(IRCOP, IR); copyto!(LICOP, LI)
-    # route 1: triangularize T by RQ (transform from the right)
-    _tgs_gerq2!(Tm, 0, m, m, τr2, vr)
-    _tgs_ormr2!(false, true, m, Tm, τr2, S)      # S ← S·Qᵀ
-    _tgs_ormr2!(true, false, m, Tm, τr2, IR)     # IR ← Q·IR
-    brqa21 = _tgs_fnorm(S, n2 + 1, m, 1, n2)
-    # route 2: triangularize T by QR (transform from the left)
-    _tgs_geqr2!(TCPY, m, m, τl2, vq)
-    _tgs_orm2r!(true, true, m, TCPY, τl2, SCPY)  # SCPY ← Qᵀ·SCPY
-    _tgs_orm2r!(false, false, m, TCPY, τl2, LICOP) # LICOP ← LICOP·Q
-    bqra21 = _tgs_fnorm(SCPY, n2 + 1, m, 1, n2)
-    # weak stability test — pick the better route (a rebind of four names before the buffers were owned)
-    if bqra21 <= brqa21 && bqra21 <= thresha
-        copyto!(S, SCPY); copyto!(Tm, TCPY); copyto!(IR, IRCOP); copyto!(LI, LICOP)
-    elseif brqa21 >= thresha
-        return 1
-    end
-    @inbounds for j in 1:(m - 1), i in (j + 1):m
-        Tm[i, j] = ZERO
-    end
-    # strong stability test: ‖A_blk − LI·S·IR‖_F ≤ thresha and ‖B_blk − LI·T·IR‖_F ≤ threshb
-    _tgs_matmul!(M1, false, false, LI, S); _tgs_matmul!(PA, false, false, M1, IR)
-    _tgs_matmul!(M1, false, false, LI, Tm); _tgs_matmul!(PB, false, false, M1, IR)
-    @inbounds for j in 1:m, i in 1:m
-        PA[i, j] = A[j1 + i - 1, j1 + j - 1] - PA[i, j]
-        PB[i, j] = B[j1 + i - 1, j1 + j - 1] - PB[i, j]
-    end
-    sa = _tgs_fnorm(PA, 1, m, 1, m)
-    sb = _tgs_fnorm(PB, 1, m, 1, m)
-    (sa <= thresha && sb <= threshb) || return 1
-    # accepted: zero the (2,1) block and copy the swapped pair back
-    @inbounds for j in 1:n2, i in (n2 + 1):m
-        S[i, j] = ZERO
-    end
-    @inbounds for j in 1:m, i in 1:m
-        A[j1 + i - 1, j1 + j - 1] = S[i, j]
-        B[j1 + i - 1, j1 + j - 1] = Tm[i, j]
-    end
-    # re-standardize the new 2×2 blocks (dlagv2) and fold those rotations into LI / IR
-    # QL2/IR2 ARRIVE ZEROED, load-bearing: only their (1,1)/(m,m) entries and up to two 2×2 corner
-    # blocks are set below, yet both are then read IN FULL by `_tgs_matmul!` and the tmpA/tmpB loops.
-    QL2, IR2, tmpA, tmpB, w = _tgex2_rot(R, m, n1, n2)
-    QL2[1, 1] = ONE; IR2[1, 1] = ONE
-    QL2[m, m] = ONE; IR2[m, m] = ONE
-    if n2 > 1
-        csl, snl, csr, snr = _tgs_lagv2!(A, B, j1)
-        QL2[1, 1] = csl; QL2[2, 1] = snl; QL2[1, 2] = -snl; QL2[2, 2] = csl
-        IR2[1, 1] = csr; IR2[2, 1] = snr; IR2[1, 2] = -snr; IR2[2, 2] = csr
-    end
-    if n1 > 1
-        csl, snl, csr, snr = _tgs_lagv2!(A, B, j1 + n2)
-        QL2[n2 + 1, n2 + 1] = csl; QL2[n2 + 2, n2 + 1] = snl
-        QL2[n2 + 1, n2 + 2] = -snl; QL2[n2 + 2, n2 + 2] = csl
-        IR2[n2 + 1, n2 + 1] = csr; IR2[n2 + 2, n2 + 1] = snr
-        IR2[n2 + 1, n2 + 2] = -snr; IR2[n2 + 2, n2 + 2] = csr
-    end
-    # off-diagonal (1:n2, n2+1:m) block of the standardized pair: QL2ᵀ·(·)·IR2 (block-local)
-    @inbounds for j in 1:n1, i in 1:n2
-        sA = ZERO; sB = ZERO
-        for k in 1:n2
-            sA = muladd(QL2[k, i], A[j1 + k - 1, j1 + n2 + j - 1], sA)
-            sB = muladd(QL2[k, i], B[j1 + k - 1, j1 + n2 + j - 1], sB)
-        end
-        tmpA[i, j] = sA; tmpB[i, j] = sB
-    end
-    @inbounds for j in 1:n1, i in 1:n2
-        sA = ZERO; sB = ZERO
-        for k in 1:n1
-            sA = muladd(tmpA[i, k], IR2[n2 + k, n2 + j], sA)
-            sB = muladd(tmpB[i, k], IR2[n2 + k, n2 + j], sB)
-        end
-        A[j1 + i - 1, j1 + n2 + j - 1] = sA
-        B[j1 + i - 1, j1 + n2 + j - 1] = sB
-    end
-    _tgs_matmul!(M1, false, false, LI, QL2); copyto!(LI, M1)
-    _tgs_matmul!(M1, true, false, IR, IR2); copyto!(IR, M1)
-    # accumulate into Q, Z — the only part of this routine that scales with n
-    bufq, bufz = _tgex2_accum(R, n, m)
-    if wantq
-        buf = bufq
-        @inbounds for j in 1:m, i in 1:n
-            s = ZERO
-            for k in 1:m
-                s = muladd(Q[i, j1 + k - 1], LI[k, j], s)
+        scale, ierr = _tgs_tgsy2!(S, Tm, n1, n2, Cm, Fm)
+        ierr > 0 && return 1
+        # left transform: QR of [−Lm; scale·I_n2]  →  full m×m Q in LI
+        # LI AND IR ARE ZEROED AT THE BORROW, both load-bearing: only LI[1:n1,1:n2] plus a unit sub-diagonal
+        # is written here yet `_tgs_geqr2!` reads all of LI[1:m,1:n2]; IR has only two sparse patterns
+        # written yet `_tgs_gerq2!` reads rows n2+1:n2+n1 across all of cols 1:m. (Zeroing the whole m×m also
+        # covers the columns `_tgs_org2r!`/`_tgs_orgr2!` would have cleared themselves — 16 elements.)
+        # The τ and v borrows need none: v[1..lv] is filled before each `_qz_larfg!` and τ[i] assigned before
+        # use. `vq`/`vr` stay separate: they belong to `_tgs_geqr2!` and `_tgs_gerq2!`, two distinct helpers.
+        LI = borrow!(arn, R, m, m); fill!(LI, ZERO)
+        IR = borrow!(arn, R, m, m); fill!(IR, ZERO)
+        τl = borrow!(arn, R, m)
+        τr = borrow!(arn, R, m)
+        τl2 = borrow!(arn, R, m)
+        τr2 = borrow!(arn, R, m)
+        vq = borrow!(arn, R, 4)
+        vr = borrow!(arn, R, 4)
+        @inbounds for j in 1:n2
+            for i in 1:n1
+                LI[i, j] = -Fm[i, j]
             end
-            buf[i, j] = s
+            LI[n1 + j, j] = scale
         end
-        @inbounds for j in 1:m, i in 1:n
-            Q[i, j1 + j - 1] = buf[i, j]
-        end
-    end
-    if wantz
-        buf = bufz
-        @inbounds for j in 1:m, i in 1:n
-            s = ZERO
-            for k in 1:m
-                s = muladd(Z[i, j1 + k - 1], IR[k, j], s)
+        _tgs_geqr2!(LI, m, n2, τl, vq)
+        _tgs_org2r!(LI, m, n2, τl)
+        # right transform: RQ of [scale·I_n1, Rm] (rows n2+1..m)  →  full m×m Q in IR
+        @inbounds begin
+            for j in 1:n2, i in 1:n1
+                IR[n2 + i, n1 + j] = Cm[i, j]
             end
-            buf[i, j] = s
+            for i in 1:n1
+                IR[n2 + i, i] = scale
+            end
         end
-        @inbounds for j in 1:m, i in 1:n
-            Z[i, j1 + j - 1] = buf[i, j]
+        _tgs_gerq2!(IR, n2, n1, m, τr, vr)
+        _tgs_orgr2!(IR, m, n1, τr)
+        # tentative swap: S ← LIᵀ·S·IRᵀ, T likewise (M1 = inner product, M2 = outer; both live at once)
+        # M1/M2 are a ping/pong pair — the products nest inner-inside-outer, so BOTH are live at once; PA/PB
+        # are the two independent outer products. Every element is assigned by `_tgs_matmul!`'s own loop.
+        M1 = borrow!(arn, R, m, m)
+        M2 = borrow!(arn, R, m, m)
+        PA = borrow!(arn, R, m, m)
+        PB = borrow!(arn, R, m, m)
+        _tgs_matmul!(M1, true, false, LI, S); _tgs_matmul!(M2, false, true, M1, IR); copyto!(S, M2)
+        _tgs_matmul!(M1, true, false, LI, Tm); _tgs_matmul!(M2, false, true, M1, IR); copyto!(Tm, M2)
+        # The four route-selection copies. Fully written by the copyto! below, no fill!.
+        SCPY = borrow!(arn, R, m, m)
+        TCPY = borrow!(arn, R, m, m)
+        IRCOP = borrow!(arn, R, m, m)
+        LICOP = borrow!(arn, R, m, m)
+        copyto!(SCPY, S); copyto!(TCPY, Tm); copyto!(IRCOP, IR); copyto!(LICOP, LI)
+        # route 1: triangularize T by RQ (transform from the right)
+        _tgs_gerq2!(Tm, 0, m, m, τr2, vr)
+        _tgs_ormr2!(false, true, m, Tm, τr2, S)      # S ← S·Qᵀ
+        _tgs_ormr2!(true, false, m, Tm, τr2, IR)     # IR ← Q·IR
+        brqa21 = _tgs_fnorm(S, n2 + 1, m, 1, n2)
+        # route 2: triangularize T by QR (transform from the left)
+        _tgs_geqr2!(TCPY, m, m, τl2, vq)
+        _tgs_orm2r!(true, true, m, TCPY, τl2, SCPY)  # SCPY ← Qᵀ·SCPY
+        _tgs_orm2r!(false, false, m, TCPY, τl2, LICOP) # LICOP ← LICOP·Q
+        bqra21 = _tgs_fnorm(SCPY, n2 + 1, m, 1, n2)
+        # weak stability test — pick the better route (a rebind of four names before the buffers were owned)
+        if bqra21 <= brqa21 && bqra21 <= thresha
+            copyto!(S, SCPY); copyto!(Tm, TCPY); copyto!(IR, IRCOP); copyto!(LI, LICOP)
+        elseif brqa21 >= thresha
+            return 1
         end
-    end
-    # update the off-block rows/columns of (A,B)
-    if jm < n
-        @inbounds for j in (jm + 1):n
-            for i in 1:m
+        @inbounds for j in 1:(m - 1), i in (j + 1):m
+            Tm[i, j] = ZERO
+        end
+        # strong stability test: ‖A_blk − LI·S·IR‖_F ≤ thresha and ‖B_blk − LI·T·IR‖_F ≤ threshb
+        _tgs_matmul!(M1, false, false, LI, S); _tgs_matmul!(PA, false, false, M1, IR)
+        _tgs_matmul!(M1, false, false, LI, Tm); _tgs_matmul!(PB, false, false, M1, IR)
+        @inbounds for j in 1:m, i in 1:m
+            PA[i, j] = A[j1 + i - 1, j1 + j - 1] - PA[i, j]
+            PB[i, j] = B[j1 + i - 1, j1 + j - 1] - PB[i, j]
+        end
+        sa = _tgs_fnorm(PA, 1, m, 1, m)
+        sb = _tgs_fnorm(PB, 1, m, 1, m)
+        (sa <= thresha && sb <= threshb) || return 1
+        # accepted: zero the (2,1) block and copy the swapped pair back
+        @inbounds for j in 1:n2, i in (n2 + 1):m
+            S[i, j] = ZERO
+        end
+        @inbounds for j in 1:m, i in 1:m
+            A[j1 + i - 1, j1 + j - 1] = S[i, j]
+            B[j1 + i - 1, j1 + j - 1] = Tm[i, j]
+        end
+        # re-standardize the new 2×2 blocks (dlagv2) and fold those rotations into LI / IR
+        # QL2/IR2 ARE ZEROED AT THE BORROW, load-bearing: only their (1,1)/(m,m) entries and up to two 2×2
+        # corner blocks are set below, yet both are then read IN FULL by `_tgs_matmul!` and the tmpA/tmpB
+        # loops. tmpA/tmpB/w are fully written before read.
+        QL2 = borrow!(arn, R, m, m); fill!(QL2, ZERO)
+        IR2 = borrow!(arn, R, m, m); fill!(IR2, ZERO)
+        tmpA = borrow!(arn, R, n2, n1)
+        tmpB = borrow!(arn, R, n2, n1)
+        w = borrow!(arn, R, m)
+        QL2[1, 1] = ONE; IR2[1, 1] = ONE
+        QL2[m, m] = ONE; IR2[m, m] = ONE
+        if n2 > 1
+            csl, snl, csr, snr = _tgs_lagv2!(A, B, j1)
+            QL2[1, 1] = csl; QL2[2, 1] = snl; QL2[1, 2] = -snl; QL2[2, 2] = csl
+            IR2[1, 1] = csr; IR2[2, 1] = snr; IR2[1, 2] = -snr; IR2[2, 2] = csr
+        end
+        if n1 > 1
+            csl, snl, csr, snr = _tgs_lagv2!(A, B, j1 + n2)
+            QL2[n2 + 1, n2 + 1] = csl; QL2[n2 + 2, n2 + 1] = snl
+            QL2[n2 + 1, n2 + 2] = -snl; QL2[n2 + 2, n2 + 2] = csl
+            IR2[n2 + 1, n2 + 1] = csr; IR2[n2 + 2, n2 + 1] = snr
+            IR2[n2 + 1, n2 + 2] = -snr; IR2[n2 + 2, n2 + 2] = csr
+        end
+        # off-diagonal (1:n2, n2+1:m) block of the standardized pair: QL2ᵀ·(·)·IR2 (block-local)
+        @inbounds for j in 1:n1, i in 1:n2
+            sA = ZERO; sB = ZERO
+            for k in 1:n2
+                sA = muladd(QL2[k, i], A[j1 + k - 1, j1 + n2 + j - 1], sA)
+                sB = muladd(QL2[k, i], B[j1 + k - 1, j1 + n2 + j - 1], sB)
+            end
+            tmpA[i, j] = sA; tmpB[i, j] = sB
+        end
+        @inbounds for j in 1:n1, i in 1:n2
+            sA = ZERO; sB = ZERO
+            for k in 1:n1
+                sA = muladd(tmpA[i, k], IR2[n2 + k, n2 + j], sA)
+                sB = muladd(tmpB[i, k], IR2[n2 + k, n2 + j], sB)
+            end
+            A[j1 + i - 1, j1 + n2 + j - 1] = sA
+            B[j1 + i - 1, j1 + n2 + j - 1] = sB
+        end
+        _tgs_matmul!(M1, false, false, LI, QL2); copyto!(LI, M1)
+        _tgs_matmul!(M1, true, false, IR, IR2); copyto!(IR, M1)
+        # accumulate into Q, Z — the only part of this routine that scales with n
+        bufq, bufz = _tgex2_accum(R, n, m)
+        if wantq
+            buf = bufq
+            @inbounds for j in 1:m, i in 1:n
                 s = ZERO
                 for k in 1:m
-                    s = muladd(LI[k, i], A[j1 + k - 1, j], s)
+                    s = muladd(Q[i, j1 + k - 1], LI[k, j], s)
                 end
-                w[i] = s
+                buf[i, j] = s
             end
-            for i in 1:m
-                A[j1 + i - 1, j] = w[i]
-            end
-            for i in 1:m
-                s = ZERO
-                for k in 1:m
-                    s = muladd(LI[k, i], B[j1 + k - 1, j], s)
-                end
-                w[i] = s
-            end
-            for i in 1:m
-                B[j1 + i - 1, j] = w[i]
+            @inbounds for j in 1:m, i in 1:n
+                Q[i, j1 + j - 1] = buf[i, j]
             end
         end
-    end
-    if j1 > 1
-        @inbounds for i in 1:(j1 - 1)
-            for j in 1:m
+        if wantz
+            buf = bufz
+            @inbounds for j in 1:m, i in 1:n
                 s = ZERO
                 for k in 1:m
-                    s = muladd(A[i, j1 + k - 1], IR[k, j], s)
+                    s = muladd(Z[i, j1 + k - 1], IR[k, j], s)
                 end
-                w[j] = s
+                buf[i, j] = s
             end
-            for j in 1:m
-                A[i, j1 + j - 1] = w[j]
-            end
-            for j in 1:m
-                s = ZERO
-                for k in 1:m
-                    s = muladd(B[i, j1 + k - 1], IR[k, j], s)
-                end
-                w[j] = s
-            end
-            for j in 1:m
-                B[i, j1 + j - 1] = w[j]
+            @inbounds for j in 1:m, i in 1:n
+                Z[i, j1 + j - 1] = buf[i, j]
             end
         end
+        # update the off-block rows/columns of (A,B)
+        if jm < n
+            @inbounds for j in (jm + 1):n
+                for i in 1:m
+                    s = ZERO
+                    for k in 1:m
+                        s = muladd(LI[k, i], A[j1 + k - 1, j], s)
+                    end
+                    w[i] = s
+                end
+                for i in 1:m
+                    A[j1 + i - 1, j] = w[i]
+                end
+                for i in 1:m
+                    s = ZERO
+                    for k in 1:m
+                        s = muladd(LI[k, i], B[j1 + k - 1, j], s)
+                    end
+                    w[i] = s
+                end
+                for i in 1:m
+                    B[j1 + i - 1, j] = w[i]
+                end
+            end
+        end
+        if j1 > 1
+            @inbounds for i in 1:(j1 - 1)
+                for j in 1:m
+                    s = ZERO
+                    for k in 1:m
+                        s = muladd(A[i, j1 + k - 1], IR[k, j], s)
+                    end
+                    w[j] = s
+                end
+                for j in 1:m
+                    A[i, j1 + j - 1] = w[j]
+                end
+                for j in 1:m
+                    s = ZERO
+                    for k in 1:m
+                        s = muladd(B[i, j1 + k - 1], IR[k, j], s)
+                    end
+                    w[j] = s
+                end
+                for j in 1:m
+                    B[i, j1 + j - 1] = w[j]
+                end
+            end
+        end
+        return 0
     end
-    return 0
 end
 
 # Dispatcher matching DTGEX2's (N1,N2) signature — full coverage (1↔1, 1↔2, 2↔1, 2↔2).
