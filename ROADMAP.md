@@ -26,8 +26,23 @@ routine. The replacement is a byte-addressed bump allocator (`src/arena.jl`): a 
 `@scope` and takes `borrow!(tok, T, m, n[, ld])` handles that are valid until the block exits, at which
 point the bump pointer rewinds.
 
-**Where it stands: 180 → 20 fields.** What remains is exactly the BLAS-3 core — the seven GEMM/syr2k
-pack buffers, eight trsm/trtri scratch roles, five potrf ones.
+**Where it stands: 180 → 7 fields.** What remains is exactly the GEMM/syr2k pack buffers.
+
+**⚠ THE RE-GATE IS OWED AND NOT DONE.** Stage 4 is the first part of this conversion that touches gated
+code (trsm, trmm, potrf, trtri, getri), and it ships on `Pkg.test()` alone: 26121 pass / 0 fail / 3
+broken, twice. **No gate number has been taken on it.** A sweep of `L3 CL3 LP CLP` with `arms=pb` was
+started on galen (Zen3, locked 3675 MHz) and neuromancer (Zen5, locked 1984 MHz) at `0e40af5`;
+**wintermute (Zen4) is NOT covered** — its lock did not survive the 2026-09-04 crashes, and a
+floating-boost run is invalid rather than merely noisy. Zen4 is precisely where the double-pumped
+AVX-512 residuals live, so treat any two-box result as partial.
+
+**The one open defect, left open on purpose.** The stage-4 perf review objects that eight gated LEAF
+kernels now open their own `@scope`, i.e. a `try`/`finally` on a ~50 ns operation — and `arena.jl` itself
+records +7.5 ns being REJECTED as 7.4% of a tiny `trmm!`. The objection is fair but was made without
+running anything (the reviewer was forbidden to), and the fix is a large signature change threading five
+differently-shaped buffers through two recursive drivers on the gated path. **The re-gate adjudicates
+it**: if trsm/trmm small-n cells move, hoist the borrows to the `trsm!`/`trmm!` entries and thread the
+handles down; if they do not, the rewrite was never owed.
 
 | stage | scope | status |
 |---|---|---|
@@ -35,7 +50,7 @@ pack buffers, eight trsm/trtri scratch roles, five potrf ones.
 | 1 | the first 37 roles (tgex/laexc/syl/trsen fixed-size scratch) | ✅ `741af93` |
 | 2 | 15 LAPACK files' call sites | ✅ `5378866` |
 | 3 | the remaining 15 LAPACK files (52 roles) + the deletion pass | ✅ `5378866` |
-| 4 | the 13 trsm/trtri/potrf roles — **gate-visible, needs a re-gate** | in progress |
+| 4 | the 13 trsm/trtri/potrf roles | ✅ code `0e40af5`; **RE-GATE PENDING** |
 | — | the 7 GEMM/syr2k pack buffers | **deliberately NOT converted** — see below |
 
 **Why the pack buffers stay fields.** `gpackA`/`gpackB`/`cg`/`s2`/`m3`/`str`/`strbt` are touched on every
