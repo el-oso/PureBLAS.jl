@@ -16,8 +16,20 @@ CORE="${SCREEN_CORE:-4}"
 cache=$(ls bench/plots_data_*_$(hostname).txt 2>/dev/null | grep -v _lite | head -1)
 [ -n "$cache" ] || { echo "no v3 cache for $(hostname)"; exit 1; }
 log="bench/probes/adj_${op}_${n}_runs.log"; : > "$log"
-for _ in $(seq 1 "$K"); do
-    taskset -c "$CORE" julia --startup-file=no --project=bench bench/plots.jl bench "op=$op" "size=$n" nodraw > /dev/null 2>&1
+err="bench/probes/adj_${op}_${n}_err.log"; : > "$err"
+# GATE ON THE EXIT CODE. This loop used to send plots.jl to /dev/null and then read the cell out of the
+# cache regardless of whether the run had written it. When plots.jl REFUSES — which it does, loudly and
+# by design, if the frequency lock is not in the one valid state — every replication re-read the SAME
+# STALE CELL, and the sign test below duly reported `below=0/K, sign p=0.0078, PASS`. Eight measurements
+# that never happened, presented as a confident verdict. Measured 2026-09-04, off-lock on wintermute.
+# The refusal was the tool working correctly; discarding its output is what turned it into a fabrication.
+for i in $(seq 1 "$K"); do
+    if ! taskset -c "$CORE" julia --startup-file=no --project=bench bench/plots.jl bench "op=$op" "size=$n" nodraw >> "$err" 2>&1; then
+        echo "adjudicate: replication $i FAILED — plots.jl exited non-zero. Last lines:" >&2
+        tail -6 "$err" >&2
+        echo "adjudicate: ABORTING; a partial or stale log cannot be adjudicated." >&2
+        exit 2
+    fi
     awk -F'\t' -v o="$op" -v s="$n" '$2==o && $3==s' "$cache" >> "$log"
 done
 printf '%-22s ' "$op n=$n"
