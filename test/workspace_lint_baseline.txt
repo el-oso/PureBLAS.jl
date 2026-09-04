@@ -89,13 +89,22 @@ SVDWorkspace.gebrd_Y  gesvd_vals! -> _svals_core!
 SVDWorkspace.labrd_arow  gesvd_vals! -> _svals_core!
 SVDWorkspace.labrd_tmp  gesvd_vals! -> _svals_core!
 
-# --- potrf pad: in `_potrf_gen!` (lapack.jl:489) the two levers are early-`return` branches guarded on
-# DISJOINT element types — Lever A `T === Float64 || T === Float32` (:533 → _potrf_upper_lever_real!, :543)
-# and Lever C `T <: BlasComplex` (:550 → _potrf_upper_lever_cmplx!, :551). `_potrf_gen!`'s own padf claim
-# (`_potrf_pad(T, n)`, :557) is only reached when neither returned. Mutually exclusive twice over: by
-# control flow and by type. Only one of the three ever claims padf per call.
-L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_cmplx!
-L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_real!
+# --- 2026-09-04, stage 4 of the arena conversion: the two
+#       L3Workspace.padf  _potrf_gen! -> _potrf_upper_lever_{cmplx,real}!
+# lines are GONE, and — as with the `lacn2*` trio above — the reason is a change of MECHANISM, not a
+# re-judgement of the old one.
+#
+# WHAT THEY SAID, and it was true: in `_potrf_gen!` the two levers are early-`return` branches guarded on
+# DISJOINT element types — Lever A `T === Float64 || T === Float32` (→ `_potrf_upper_lever_real!`) and
+# Lever C `T <: BlasComplex` (→ `_potrf_upper_lever_cmplx!`). `_potrf_gen!`'s own `padf` claim
+# (`_potrf_pad(T, n)`) is reached only when neither returned. Mutually exclusive twice over, by control
+# flow AND by type, so only one of the three ever claimed `padf` per call.
+#
+# WHY THEY ARE GONE: `padf` is no longer a field. All three sites take `borrow!(arn, T, n, n,
+# _offway_ld(n, T))` inside their own `@scope`, so `claims[...]` names no `L3Workspace` field and there is
+# nothing left to pair. The mutual exclusion above is now IRRELEVANT rather than merely unused — three
+# borrows in three scopes are three disjoint bump ranges whether or not they are simultaneous, which is
+# the property the whole conversion buys. RE-DERIVE THIS, do not re-read it, if `padf` ever returns.
 
 # --- Strassen pool: `str` is ONE field holding a POOL of matrices, and the re-entrancy is BY DESIGN.
 # `_gemm_strassen!` (gemm.jl:2669) holds pad slots 1-3 via `_strassen_pad_scratch` across

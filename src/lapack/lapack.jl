@@ -52,8 +52,8 @@ const _CPOTRF_BASE = @load_preference("cpotrf_base", _at_cpotrf_base(_HW))::Int 
 # Contiguous scratch for the diagonal base block: the recursion's base is a view(A, js, js) whose
 # columns are parent_ld apart (poor locality, the memory-bound potf2). Copying it to a contiguous
 # buffer, factoring there, and copying back streams contiguous memory (better prefetch/TLB).
-# _potf2_buf (potrf diagonal-base contiguous buffer) is the per-type L3Workspace `potf2` field
-# (see src/workspace.jl).
+# The buffer is now BORROWED from the scratch arena (arena.jl) at the two `_potf2b_*!` sites below,
+# not the per-type L3Workspace `potf2` field — see the escape audit written at each `@scope`.
 
 # Unblocked right-looking Cholesky of an n×n block, lower triangle. Throws PosDefException at the first
 # non-positive pivot (LAPACK's info>0). Reads/writes only the lower triangle.
@@ -194,27 +194,57 @@ end
 # true and only the way-stride term survives.
 @inline _potf2_needs_buf(A, n) = A isa SubArray && stride(A, 2) > n &&
     (stride(A, 2) * sizeof(eltype(A))) % (_L1_WAY_BYTES >> 2) == 0
+#
+# ARENA ESCAPE AUDIT for the three `buf` borrows below (the hazard `@scope` cannot see — a handle stored
+# into a field/global or captured by a closure that outlives the block). `buf` reaches exactly two
+# callees at each site: `copyto!` (Base, elementwise through the handle's own getindex/setindex) and one
+# of `_cpotf2_lower!` / `_potf2_lower!` / `_potf2_upper!`, which take `pointer(buf)`/`stride(buf,2)` (or
+# plain indexing) and vload/vstore through them. None of the three stores its argument anywhere, none
+# builds a closure, and the copy-BACK happens inside the same block — so no handle outlives the scope.
+#
+# THE EXACT BORROW IS ALSO A FIX, not just a re-plumbing. `_potf2_buf` handed back `view(potf2, 1:n, 1:n)`
+# of the GROWN field, whose `stride(·,2)` is whatever the largest EARLIER call left behind — so this
+# "contiguous buffer", whose entire purpose is to de-alias a way-strided sub-block, could itself be handed
+# a way-aliased ld by call history. That is the hazard arena.jl records behind `_gemm_3m_scratch`'s
+# measured 1.16 -> 0.57 (the ascending gate sweep hides it; large-then-small does not). `borrow!(…, n, n)`
+# is ld = n by construction and cannot have that bug.
+#
+# SCOPE PLACEMENT: opened INSIDE the buffered branch, never at the function's head. These two functions
+# are the RECURSION LEAF of `_potrf_lower!`/`_potrf_upper!`/`_cpotrf_lower!`, and the buffered branch is
+# the rare one (an aliased sub-block); an entry-level borrow would put an unconditional arena claim on
+# every base call of every real potrf, which is precisely the gated hot path. Each scope closes before
+# this leaf returns, so the enclosing recursion never holds more than ONE of these at a time — the
+# depth-summed footprint is one n×n block, not one per level.
 @inline function _potf2b_lower!(A, n::Int)
     if eltype(A) <: BlasComplex                                         # SIMD Hermitian base (via contig buf if aliased)
         if n >= 8 && _potf2_needs_buf(A, n)
-            buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
-            f = _cpotf2_lower!(buf, n); f == 0 || return f
-            copyto!(A, buf); return 0
+            @scope arn begin
+                buf = borrow!(arn, eltype(A), n, n)                     # exact: ld = n, genuinely contiguous
+                copyto!(buf, A)
+                f = _cpotf2_lower!(buf, n); f == 0 || return f
+                copyto!(A, buf); return 0
+            end
         end
         return _cpotf2_lower!(A, n)
     end
     if n >= 128 && _potf2_needs_buf(A, n)
-        buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
-        f = _potf2_lower!(buf, n); f == 0 || return f
-        copyto!(A, buf); return 0
+        @scope arn begin
+            buf = borrow!(arn, eltype(A), n, n)
+            copyto!(buf, A)
+            f = _potf2_lower!(buf, n); f == 0 || return f
+            copyto!(A, buf); return 0
+        end
     end
     return _potf2_lower!(A, n)
 end
 @inline function _potf2b_upper!(A, n::Int)
     if n >= 128 && _potf2_needs_buf(A, n)
-        buf = _potf2_buf(eltype(A), n); copyto!(buf, A)
-        f = _potf2_upper!(buf, n); f == 0 || return f
-        copyto!(A, buf); return 0
+        @scope arn begin
+            buf = borrow!(arn, eltype(A), n, n)
+            copyto!(buf, A)
+            f = _potf2_upper!(buf, n); f == 0 || return f
+            copyto!(A, buf); return 0
+        end
     end
     return _potf2_upper!(A, n)
 end
@@ -388,27 +418,39 @@ end
 @inline _fh_potrf_unative_min(::Type{T}) where {T} =
     (f = _FKR_potrf_unative_min[]; f >= 0 ? f : _potrf_unative_min(T))
 
-function _chol_hyb_upper_f64!(M, n::Int, base::Int)
+# `pad` is the lever's transpose scratch, BORROWED BY THE CALLER (`_potrf_gen!`) and threaded down —
+# this driver is RECURSIVE, so it must not open a scope of its own: one per level would hold every
+# level's borrow at once (arena.jl's hole (b), measured 98 KB → 3.05 MB over 16 levels). The leaves are
+# reached STRICTLY SEQUENTIALLY, each finishing before the next begins, so ONE `base`-sized pad serves
+# all of them; the caller sizes it for the largest possible leaf.
+function _chol_hyb_upper_f64!(M, n::Int, base::Int, pad)
     if n <= base
         # Base: no native-upper leaf kernel exists, and writing one is a separate piece of work. Fall
         # back to the transpose lever HERE, where it is cheap — the block is `base`-sized, so the
         # round-trip is O(base²) per leaf, i.e. O(n·base) total rather than O(n²) once.
-        _potrf_upper_lever_real!(view(M, 1:n, 1:n), n)
+        _potrf_upper_lever_real!(view(M, 1:n, 1:n), n, pad)
         return 0
     end
     h = n ÷ 2
-    f = _chol_hyb_upper_f64!(view(M, 1:h, 1:h), h, base)
+    f = _chol_hyb_upper_f64!(view(M, 1:h, 1:h), h, base, pad)
     f == 0 || return f
     A12 = view(M, 1:h, (h + 1):n)
     trsm!(A12, view(M, 1:h, 1:h); side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
     syrk!(view(M, (h + 1):n, (h + 1):n), A12; uplo = 'U', trans = 'T', alpha = -1, beta = 1)
-    f = _chol_hyb_upper_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base)
+    f = _chol_hyb_upper_f64!(view(M, (h + 1):n, (h + 1):n), n - h, base, pad)
     f == 0 || return h + f
     return 0
 end
 
-@inline function _potrf_upper_lever_real!(A::AbstractMatrix{T}, n::Int) where {T}
-    M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
+# `M` is the caller's arena borrow (was `_potrf_pad(T, n)`), passed in rather than claimed here: this is
+# called BOTH directly by `_potrf_gen!` and from `_chol_hyb_upper_f64!`'s recursion leaf, and a borrow
+# taken here would be a borrow inside a recursion. Its ld is `_offway_ld(·, T)` at both call sites —
+# the SAME rule `_potrf_pad` applied (n+8, bumped a further +8 if that would itself land on the L1
+# quarter-way stride), which is load-bearing twice over: `_tri_upper_to_lowerT!`'s comment measures a
+# 2.1–3.8× penalty when the strided side aliases, and `_potf2_needs_buf` reads it back to decide the
+# base buffer is not worth its round-trip.
+@inline function _potrf_upper_lever_real!(A::AbstractMatrix{T}, n::Int, M) where {T}
+    ldM = stride(M, 2); lda = stride(A, 2)
     GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n)
     _potrf_f64_lower!(view(M, 1:n, 1:n))            # M lower ← L (throws ⇒ A upper unchanged)
     GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n)
@@ -417,13 +459,26 @@ end
 # Lever C (complex Hermitian): U = Lᴴ, so the transpose CONJUGATES (Val(true)) and column j of U is
 # column j of L — the index carries across unchanged. RETURNS the failing column (0 = success); the
 # caller throws, so that the transpose-back is skipped and A's upper triangle is left untouched.
+#
+# ARENA ESCAPE AUDIT for `M`. Unlike its real sibling this lever is NOT reached from any recursion — its
+# one call site is `_potrf_gen!` below, once per potrf! call — so the scope opens at this routine's own
+# entry and spans the whole round-trip. `M` reaches: `_tri_upper_to_lowerT!` / `_tri_lowerT_to_upper!`
+# (raw `pointer(M)` + ld, unsafe_load/store only), and `_cpotrf_lower!(view(M,1:n,1:n), n)`, which slices
+# it further and hands the slices to `_potf2b_lower!`, `trsm!` and `herk!`. None of those stores an
+# operand: the L3 kernels COPY into their own packing vectors, and `_potf2b_lower!` copies into its own
+# (nested, shorter-lived) borrow. No closure captures it. So no handle outlives this block.
+# The ld is `_offway_ld(n, T)` — `_potrf_pad`'s alias-free rule, reproduced exactly; the borrow is exact,
+# so it can no longer inherit an earlier, larger call's ld.
 @inline function _potrf_upper_lever_cmplx!(A::AbstractMatrix{T}, n::Int) where {T}
-    M = _potrf_pad(T, n); ldM = size(M, 1); lda = stride(A, 2)
-    GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
-    f = _cpotrf_lower!(view(M, 1:n, 1:n), n)
-    f == 0 || return f
-    GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
-    return 0
+    @scope arn begin
+        M = borrow!(arn, T, n, n, _offway_ld(n, T))
+        ldM = stride(M, 2); lda = stride(A, 2)
+        GC.@preserve A M _tri_upper_to_lowerT!(pointer(M), ldM, pointer(A), lda, n, Val(true))
+        f = _cpotrf_lower!(view(M, 1:n, 1:n), n)
+        f == 0 || return f
+        GC.@preserve A M _tri_lowerT_to_upper!(pointer(A), lda, pointer(M), ldM, n, Val(true))
+        return 0
+    end
 end
 
 # ── tiny-UPPER cutoff: the largest n still factored in place ──────────────────────────────────────
@@ -535,12 +590,33 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         # whole-matrix round-trip. The crossover is a RESIDENCY criterion, hence Derive tier: the
         # round-trip's cost is 4 extra n² DRAM passes, which is negligible against O(n³) while the
         # matrix is cache-resident and dominant once it is not. So switch when A stops fitting L3.
+        #
+        # ARENA ESCAPE AUDIT for both `pad` borrows below (they replace `_potrf_pad(T, n)`, which
+        # `_potrf_upper_lever_real!` used to claim for itself). The scope is opened HERE, in the
+        # non-recursive entry, because the native-upper driver `_chol_hyb_upper_f64!` is recursive and
+        # its LEAF is what needs the scratch: one borrow per level would hold them all at once. The
+        # handle reaches `_chol_hyb_upper_f64!` (which only forwards it down and into the lever),
+        # `_potrf_upper_lever_real!`, and from there `_tri_upper_to_lowerT!`/`_tri_lowerT_to_upper!`
+        # (raw pointer + ld) and `_potrf_f64_lower!(view(M,1:n,1:n))` — whose own callees
+        # (`_chol_panel_f64!`, `_chol_hyb_f64!`, `trsm!`, `syrk!`, `_chol_rl_f64!`) take pointers or
+        # pack into their own buffers and store no operand. Nothing is captured by a closure and no
+        # handle is returned, so nothing outlives either block.
         if n >= _fh_potrf_unative_min(T)
-            f = _chol_hyb_upper_f64!(A, n, _chol_faer_base(T))
-            f == 0 || throw(PosDefException(f))
+            fb = _chol_faer_base(T)
+            # ONE pad for every leaf: the halving recursion bottoms out at n ≤ fb and the leaves run
+            # strictly one after another, so the largest leaf (min(n, fb)) sizes the borrow and each
+            # leaf slices `view(pad, 1:n_leaf, 1:n_leaf)` out of it. ld stays `_offway_ld(·, T)`.
+            lb = min(n, fb)
+            @scope arn begin
+                pad = borrow!(arn, T, lb, lb, _offway_ld(lb, T))
+                f = _chol_hyb_upper_f64!(A, n, fb, pad)
+                f == 0 || throw(PosDefException(f))
+            end
             return A
         end
-        _potrf_upper_lever_real!(A, n)
+        @scope arn begin
+            _potrf_upper_lever_real!(A, n, borrow!(arn, T, n, n, _offway_ld(n, T)))
+        end
         return A
     end
     # Lever C: complex Hermitian UPPER via the gating _cpotrf_lower!. U = Lᴴ exactly (UᴴU = LLᴴ = A), so the
@@ -553,20 +629,38 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         end
         return A
     end
+    # THE THIRD padf CLAIM, and it is legal alongside the two levers above for the reason
+    # test/workspace_lint_baseline.txt records: Lever A (`T === Float64 || T === Float32`) and Lever C
+    # (`T <: BlasComplex`) are early RETURNS on DISJOINT element types, so this line is reached only when
+    # neither fired — mutually exclusive twice over, by control flow and by type. Under the arena that
+    # argument is no longer load-bearing for correctness (three exact borrows in three disjoint scopes
+    # cannot collide even if they were reachable together), but it is why the shapes stay independent.
+    #
+    # ARENA ESCAPE AUDIT for `b`: it is read as `pointer(b)` by the two triangle copies here, and passed
+    # as `view(b, 1:n, 1:n)`… which is now just `b` itself (the borrow is exactly n×n) into
+    # `_potrf_upper!`/`_potrf_lower!`. Those recurse over `view`s of it into `trsm!`/`syrk!`/`herk!` and
+    # `_potf2b_*!`; every one of them either takes a pointer or packs into its own buffer, none stores an
+    # operand, and no closure captures anything. The copy-back is inside the block. Nothing escapes.
+    # ld = `_offway_ld(n, T)`, exactly the rule `_potrf_pad` applied — and now it is a property of THIS
+    # call rather than of whatever size an earlier call grew the field to.
     if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
-        b = _potrf_pad(T, n); lda = stride(A, 2); ldb = size(b, 1); sz = sizeof(T)
-        GC.@preserve A b begin
-            pa = pointer(A); pb = pointer(b)
-            @inbounds for j in 0:(n - 1)          # copy only the `uplo` triangle: upper=col prefix (j+1), lower=col suffix (n-j)
-                up ? unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, j + 1) :
-                    unsafe_copyto!(pb + (j * ldb + j) * sz, pa + (j * lda + j) * sz, n - j)
-            end
-            let f = up ? _potrf_upper!(view(b, 1:n, 1:n), n, base) : _potrf_lower!(view(b, 1:n, 1:n), n, base)
-                f == 0 || throw(PosDefException(f))    # throw before copy-back ⇒ A unchanged
-            end
-            @inbounds for j in 0:(n - 1)          # factored triangle back; the opposite triangle of A is untouched (throws skip copy-back)
-                up ? unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, j + 1) :
-                    unsafe_copyto!(pa + (j * lda + j) * sz, pb + (j * ldb + j) * sz, n - j)
+        @scope arn begin
+            ldb = _offway_ld(n, T)
+            b = borrow!(arn, T, n, n, ldb)
+            lda = stride(A, 2); sz = sizeof(T)
+            GC.@preserve A b begin
+                pa = pointer(A); pb = pointer(b)
+                @inbounds for j in 0:(n - 1)          # copy only the `uplo` triangle: upper=col prefix (j+1), lower=col suffix (n-j)
+                    up ? unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, j + 1) :
+                        unsafe_copyto!(pb + (j * ldb + j) * sz, pa + (j * lda + j) * sz, n - j)
+                end
+                let f = up ? _potrf_upper!(b, n, base) : _potrf_lower!(b, n, base)
+                    f == 0 || throw(PosDefException(f))    # throw before copy-back ⇒ A unchanged
+                end
+                @inbounds for j in 0:(n - 1)          # factored triangle back; the opposite triangle of A is untouched (throws skip copy-back)
+                    up ? unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, j + 1) :
+                        unsafe_copyto!(pa + (j * lda + j) * sz, pb + (j * ldb + j) * sz, n - j)
+                end
             end
         end
         return A
@@ -1321,77 +1415,80 @@ end
     return nothing
 end
 
-# Owned conflict-free scratches (GKH ownership; single-thread — MT deferred project-wide). The 3 buffers
-# live in the per-T L3Workspace (see workspace.jl); accessors below grow them on demand.
+# Conflict-free scratches, BORROWED from the arena (arena.jl) rather than owned as `chold`/`cholt`/
+# `cholpad` fields — `_chol_d`/`_chol_t`/`_chol_pad` are gone with their call sites below. Their leading
+# dimensions were always the point (an ld that cannot collide in an L1 set), and they are reproduced
+# EXACTLY at each borrow; what changes is that the ld is now a property of THIS call instead of of
+# whatever size an earlier, larger call grew the field to.
 # _chol_mc: trsm row chunk — the mc×NB T slab the k-repasses re-read stays L2-resident (slab ≤ L2/2).
 @inline _chol_mc(::Type{T}) where {T} = max(_vwidth(T), (_L2_BYTES ÷ 2) ÷ (_chol_block(T) * sizeof(T)))
 
-function _chol_d(::Type{T}) where {T}   # diag block scratch, (_chol_block+8)×_chol_block
-    ws = _l3ws(T); b = ws.chold; nb = _chol_block(T)
-    if size(b, 1) < nb + 8 || size(b, 2) < nb
-        b = Matrix{T}(undef, nb + 8, nb); ws.chold = b
-    end
-    return b
-end
-function _chol_t(::Type{T}, R::Int) where {T}   # panel workspace, R×_chol_block
-    ws = _l3ws(T); b = ws.cholt; nb = _chol_block(T)
-    if size(b, 1) < R || size(b, 2) < nb
-        b = Matrix{T}(undef, R, nb); ws.cholt = b
-    end
-    return b
-end
-function _chol_pad(::Type{T}, R::Int, n::Int) where {T}   # faer whole-matrix pad, ld=R (=n+8)
-    ws = _l3ws(T); b = ws.cholpad
-    if size(b, 1) < R || size(b, 2) < n
-        b = Matrix{T}(undef, R, n); ws.cholpad = b
-    end
-    return b
-end
-
+# ARENA ESCAPE AUDIT for `Tb` (was `_chol_t(T, R)`) and `D` (was `_chol_d(T)`). Both are borrowed ONCE,
+# at this driver's entry and ABOVE its panel `while` loop — the loop is the reason the borrows cannot sit
+# where the work is: one per panel would consume Σ(panels) of arena for a buffer that is loop-invariant.
+# The scope spans the whole factorization. `Tb`/`D` reach only: `unsafe_copyto!` and the fused leaves
+# `_chol_rl_f64!`, `_trsm_rl_split_f64!`, `_syrk_lower_split_f64!` — all four take RAW POINTERS (`pT`,
+# `pD`) plus an ld and never see the handle at all — and `syrk!(view(A, …), view(Tb, 1:m, 1:bs))` on the
+# big-trailing arm, where `view(::PtrMatrix, r, r)` stays a `PtrMatrix` and the packing path copies out
+# of it. Nothing stores either handle, nothing captures them, neither is returned. `A` is the caller's
+# matrix and is untouched by the arena.
+#
+# THE TWO LEADING DIMENSIONS, REPRODUCED:
+#   ldT = R, computed HERE exactly as before — `(n+8)%128==0 ? n+16 : n+8`. Left as the in-place literal
+#     rather than swapped for `_offway_ld(n, T)`: the two agree identically at Float64 ((n+8)*8 % 1024 == 0
+#     ⟺ (n+8) % 128 == 0) but NOT at Float32, and this driver is on the gated spotrf AVX2 path, so the
+#     helper would be an unmeasured ld change there. What the borrow DOES fix is that `ldT` used to be
+#     `size(_chol_t(…), 1)` — the GROWN field's row count — so a call following a larger one ran at that
+#     call's ld and silently lost the alias-free property this line exists to provide. `ldT = R` now.
+#   ldD = _chol_block + 8, the field's exact shape ((nb+8)×nb); nb is a compile-time constant, so this
+#     one never grew and the borrow is byte-for-byte the old buffer.
 function _chol_panel_f64!(A, n::Int, blk::Int = _chol_block(eltype(A)))
     T = eltype(A)
     lda = stride(A, 2)
+    nb = _chol_block(T)
     R = (n + 8) % 128 == 0 ? n + 16 : n + 8                    # keep ldT itself alias-free
-    Tb = _chol_t(T, R)
-    ldT = size(Tb, 1); D = _chol_d(T); ldD = size(D, 1)
-    GC.@preserve A Tb D begin
-        pa = pointer(A); pT = pointer(Tb); pD = pointer(D)
-        j = 0
-        @inbounds while j < n
-            bs = min(blk, n - j)
-            pjj = _cvptr(pa, j + 1, j + 1, lda)
-            for c in 0:(bs - 1)                                   # diag block lower triangle → D (L1/L2)
-                unsafe_copyto!(pD + (c * ldD + c) * sizeof(T), pjj + (c * lda + c) * sizeof(T), bs - c)
-            end
-            let f = _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T))
-                f == 0 || throw(PosDefException(j + f))    # j = 0-based block offset, f = column within it
-            end
-            for c in 0:(bs - 1)                                   # factored diag back (tiny)
-                unsafe_copyto!(pjj + (c * lda + c) * sizeof(T), pD + (c * ldD + c) * sizeof(T), bs - c)
-            end
-            m = n - j - bs
-            if m > 0
-                p21 = _cvptr(pa, j + bs + 1, j + 1, lda)
-                i0 = 0                                        # fused panel solve → T, MC row chunks
-                while i0 < m
-                    mc = min(_chol_mc(T), m - i0)
-                    _trsm_rl_split_f64!(pD, ldD, p21 + i0 * sizeof(T), lda, pT + i0 * sizeof(T), ldT, bs, mc)
-                    i0 += mc
+    @scope arn begin
+        Tb = borrow!(arn, T, R, nb); ldT = R                   # panel workspace, R×NB
+        D = borrow!(arn, T, nb + 8, nb); ldD = nb + 8          # diag block scratch
+        GC.@preserve A Tb D begin
+            pa = pointer(A); pT = pointer(Tb); pD = pointer(D)
+            j = 0
+            @inbounds while j < n
+                bs = min(blk, n - j)
+                pjj = _cvptr(pa, j + 1, j + 1, lda)
+                for c in 0:(bs - 1)                               # diag block lower triangle → D (L1/L2)
+                    unsafe_copyto!(pD + (c * ldD + c) * sizeof(T), pjj + (c * lda + c) * sizeof(T), bs - c)
                 end
-                p22 = _cvptr(pa, j + bs + 1, j + bs + 1, lda)
-                if m * bs * sizeof(T) <= _L2_BYTES ÷ 2       # T slab L2-resident: fused inline syrk
-                    _syrk_lower_split_f64!(p22, lda, pT, ldT, m, bs)
-                else                                          # big trailing: cache-blocked syrk! reads T
-                    syrk!(
-                        view(A, (j + bs + 1):n, (j + bs + 1):n), view(Tb, 1:m, 1:bs);
-                        uplo = 'L', trans = 'N', alpha = -1, beta = 1
-                    )
+                let f = _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T))
+                    f == 0 || throw(PosDefException(j + f))    # j = 0-based block offset, f = column within it
                 end
-                for c in 0:(bs - 1)                               # stream the factor back to A21 ONCE
-                    unsafe_copyto!(p21 + c * lda * sizeof(T), pT + c * ldT * sizeof(T), m)
+                for c in 0:(bs - 1)                               # factored diag back (tiny)
+                    unsafe_copyto!(pjj + (c * lda + c) * sizeof(T), pD + (c * ldD + c) * sizeof(T), bs - c)
                 end
+                m = n - j - bs
+                if m > 0
+                    p21 = _cvptr(pa, j + bs + 1, j + 1, lda)
+                    i0 = 0                                    # fused panel solve → T, MC row chunks
+                    while i0 < m
+                        mc = min(_chol_mc(T), m - i0)
+                        _trsm_rl_split_f64!(pD, ldD, p21 + i0 * sizeof(T), lda, pT + i0 * sizeof(T), ldT, bs, mc)
+                        i0 += mc
+                    end
+                    p22 = _cvptr(pa, j + bs + 1, j + bs + 1, lda)
+                    if m * bs * sizeof(T) <= _L2_BYTES ÷ 2   # T slab L2-resident: fused inline syrk
+                        _syrk_lower_split_f64!(p22, lda, pT, ldT, m, bs)
+                    else                                      # big trailing: cache-blocked syrk! reads T
+                        syrk!(
+                            view(A, (j + bs + 1):n, (j + bs + 1):n), view(Tb, 1:m, 1:bs);
+                            uplo = 'L', trans = 'N', alpha = -1, beta = 1
+                        )
+                    end
+                    for c in 0:(bs - 1)                           # stream the factor back to A21 ONCE
+                        unsafe_copyto!(p21 + c * lda * sizeof(T), pT + c * ldT * sizeof(T), m)
+                    end
+                end
+                j += bs
             end
-            j += bs
         end
     end
     return A
@@ -1412,25 +1509,42 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # AVX2 reaches here only for n ≤ _CHOL_RL_MAX (rl32 regime): rl32's small 32-blocks are alias-tolerant
     # (measured Zen3: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8% at po2-128) so the pad
     # is dead weight — skip it. W=8 still pads (its larger rl blocks' po2-tolerance is unmeasured).
+    # ARENA ESCAPE AUDIT for `Mw` (was `_chol_pad(T, R, n)` + `view(b, 1:n, 1:n)`). Borrowed ONCE in this
+    # branch — the only place it is needed — and the scope spans the copy-in, the factorization and the
+    # copy-back. `_potrf_f64_lower!` is not recursive; its callers are `potrf!` and
+    # `_potrf_upper_lever_real!` (the transpose lever), and in the latter case this borrow simply nests
+    # inside the lever's own pad, which is the same two-buffers-live situation the two separate FIELDS
+    # had. `Mw` reaches `pointer(Mw)` (the two triangle copies) and `_chol_hyb_f64!`, whose own callees
+    # are `_chol_rl_f64!` (raw
+    # pointer + ld), `trsm!` and `syrk!` over `view`s that stay `PtrMatrix`. None of them stores an
+    # operand — the L3 paths pack into their own buffers — and none captures it in a closure. Nothing
+    # escapes: the copy-back is inside the block, and the PosDefException throw exits through the
+    # scope's `finally`, which only rewinds the bump pointer.
+    #
+    # ld = n+8, the field's exact rule ("faer potrf po2-ld whole-matrix pad, ld=n+8"), and now EXACT: the
+    # old `ldb = size(b, 1)` read the GROWN field, so a call following a larger one factored at that
+    # call's ld rather than at n+8 — the de-aliasing this branch exists for was history-dependent.
     if _NVREG != 16 && _chol_needs_pad(A, n)      # factor in a non-conflicting (ld = n+8) scratch, copy back
-        R = n + 8
-        b = _chol_pad(T, R, n)
-        Mw = view(b, 1:n, 1:n)
-        # explicit contiguous per-column copies — copyto! on SubArrays is elementwise (the LU pad lesson)
-        lda = stride(A, 2); ldb = size(b, 1)
-        GC.@preserve A b begin
-            pa = pointer(A); pb = pointer(b)
-            # Lower triangle only: the faer lower path reads/writes exclusively the lower triangle + diagonal
-            # (base kernel loads rows ≥ j, cols < j), and the scratch upper is never-read workspace. Copying
-            # column j from its diagonal down (n-j elts) halves the copy — the copy is the WHOLE pad overhead
-            # (~16 MB at n=1024), so this lifts the po2-input gate directly (2n²→n² moved).
-            @inbounds for j in 0:(n - 1)
-                unsafe_copyto!(pb + (j * ldb + j) * sizeof(T), pa + (j * lda + j) * sizeof(T), n - j)
-            end
-            f = _chol_hyb_f64!(Mw, n, base)
-            f == 0 || throw(PosDefException(f))            # throw BEFORE copy-back: A stays untouched
-            @inbounds for j in 0:(n - 1)
-                unsafe_copyto!(pa + (j * lda + j) * sizeof(T), pb + (j * ldb + j) * sizeof(T), n - j)
+        @scope arn begin
+            ldb = n + 8
+            # borrowed exactly n×n at ld = n+8, so `Mw` IS the old `view(b, 1:n, 1:n)` — no slicing needed
+            Mw = borrow!(arn, T, n, n, ldb)
+            # explicit contiguous per-column copies — copyto! on SubArrays is elementwise (the LU pad lesson)
+            lda = stride(A, 2)
+            GC.@preserve A Mw begin
+                pa = pointer(A); pb = pointer(Mw)
+                # Lower triangle only: the faer lower path reads/writes exclusively the lower triangle + diagonal
+                # (base kernel loads rows ≥ j, cols < j), and the scratch upper is never-read workspace. Copying
+                # column j from its diagonal down (n-j elts) halves the copy — the copy is the WHOLE pad overhead
+                # (~16 MB at n=1024), so this lifts the po2-input gate directly (2n²→n² moved).
+                @inbounds for j in 0:(n - 1)
+                    unsafe_copyto!(pb + (j * ldb + j) * sizeof(T), pa + (j * lda + j) * sizeof(T), n - j)
+                end
+                f = _chol_hyb_f64!(Mw, n, base)
+                f == 0 || throw(PosDefException(f))        # throw BEFORE copy-back: A stays untouched
+                @inbounds for j in 0:(n - 1)
+                    unsafe_copyto!(pa + (j * lda + j) * sizeof(T), pb + (j * ldb + j) * sizeof(T), n - j)
+                end
             end
         end
     else

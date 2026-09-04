@@ -177,11 +177,28 @@ const _TRMM_DDIRECT = @load_preference("trmm_ddirect", 4)
 function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     T = eltype(B); k = size(A, 1)
     upM = (up != tr)                                     # op(A)'s triangle after the on-store transpose
-    M = _l3_tmp(T); _mat_tri!(M, A, k, up, tr, unit)     # full matrix scratch: ldM = _L3_NB, no view
     W = _vwidth(T); mr = _MR * W; nr = _NR; sz = sizeof(T)
     ldM = _L3_NB; ldb = stride(B, 2)
+    # ESCAPE AUDIT (@scope arn): neither handle leaves this block. `M` is filled by `_mat_tri!` (which
+    # only indexes it) and thereafter read as `Mp = pointer(M)`; `Ec` is read/written through
+    # `Ep = pointer(Ec)`. The only callees either one reaches are `_mat_tri!` and the
+    # `_microkernel_unpacked!` / `_mrows!` / `_edge!` family — the microkernels take raw `Ptr`s plus
+    # dims, compute, store, and return; none of them assigns a pointer to a field, a global or a
+    # closure, and none outlives its own call. `B` is the caller's array and is what is returned;
+    # nothing borrowed is stored into it except elementwise values.
+    # `Ec` was `_trsm_tmp`, which handed back the whole GROWN field, so its `lde` depended on what an
+    # EARLIER call had asked for (the hazard arena.jl records behind the 1.16→0.57 `_gemm_3m_scratch`
+    # regression). The exact borrows below make `lde` a property of THIS call: _L3_NB side-L, mr side-R.
+    # The block keeps its original indentation — re-indenting 140 lines of a gated kernel to add three
+    # would bury the change (same convention as `_trsm_fused_L!`'s stripe loop below).
+    @scope arn begin
+    M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
+    _mat_tri!(M, A, k, up, tr, unit)
     if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
         n = size(B, 2)                                   # upM → top-down row-tiles (each reads rows ≥ its
+        # Hoisted above the tile loops — `@scope` forbids a borrow inside one and this shape is
+        # loop-invariant. Used only by the lower-M edge arm below.
+        Ec = borrow!(arn, T, _L3_NB, nr); lde = _L3_NB
         GC.@preserve M B begin                           # start, still untouched; registers hold the tile
             Mp = pointer(M); Bp = pointer(B)             # between read and store). lower → bottom-up.
             nt = cld(k, mr)
@@ -237,9 +254,7 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                             one(T), zero(T), mre, nre, false, true
                         )
                     else
-                        Ec = _trsm_tmp(T, _L3_NB, nr)    # kc×nre source copy (dodges the serial aliasing)
-                        lde = size(Ec, 1)
-                        GC.@preserve Ec begin
+                        GC.@preserve Ec begin            # kc×nre source copy (dodges the serial aliasing)
                             Ep = pointer(Ec)
                             @inbounds for j in 0:(nre - 1), p in 0:(kc - 1)
                                 unsafe_store!(Ep, unsafe_load(Bp, plo + p + (jr + j) * ldb + 1), p + j * lde + 1)
@@ -256,6 +271,7 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
         end
     else                                                 # B(m×k) := B·M, IN PLACE: upM → column-tiles
         m = size(B, 1)                                   # right-to-left (each reads cols ≤ its end, i.e.
+        Ec = borrow!(arn, T, mr, nr); lde = mr           # hoisted, loop-invariant (see the side-L note)
         GC.@preserve M B begin                           # untouched to its left); lower → left-to-right.
             Mp = pointer(M); Bp = pointer(B)
             nt = cld(k, nr)
@@ -299,7 +315,6 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
                         # Edge kernel is COLUMN-serial and the A-operand is B itself: column j+1's
                         # contraction re-reads columns already stored (they're inside [plo,phi) on both
                         # uplos). Compute the strip into a dest scratch, copy back after.
-                        Ec = _trsm_tmp(T, mr, nr); lde = size(Ec, 1)
                         GC.@preserve Ec begin
                             Ep = pointer(Ec)
                             _microkernel_unpacked_edge!(
@@ -320,36 +335,58 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
             end
         end
     end
+    end                                                  # @scope arn
     return B
 end
+# ESCAPE AUDIT (@scope arn), shared by the two bases below: no handle leaves either block. `Mv` and
+# `Btv` are passed only to `_mat_tri!` (indexes it), the broadcast conj, and `gemm!` — whose fast path
+# gates on `_strided1(C)` (gemm.jl:2949), a method `PtrMatrix` satisfies, so the borrowed product stays
+# on the complex SIMD path rather than dropping to `_gemm_generic!`. None of those retains a reference
+# past its own call; the product is copied element-by-element into the caller's `B` before the block
+# ends. `Mv` and `Btv` are SEPARATE borrows, so the materialized op cannot alias the product — the
+# `diag`/`trsm_tmp` field split these two used to rely on is reproduced by construction.
+# The copy-back is written out rather than left to `copyto!`: a `PtrMatrix` is `IndexCartesian`, so the
+# generic `copyto!` takes its dual-index arm, and this file's own explicit column loops (e.g. the
+# `_trmm_small!` edge arm) are the pattern that is known to vectorize here. Both bases are the
+# NON-strided-B fallback, so `B[i, j]` is generic indexing either way.
 # Complex trmm side-L base: materialize op(A)'s k×k triangle ONCE into scratch, then B := M·B via the
 # gating SIMD complex gemm — reads A once, vs trmv-per-column re-reading A's triangle n times (O(k²n)).
 # The complex analog of the real `_trmm_small!` (materialize + microkernel). k ≤ _TRMM_BASE = _L3_NB.
 function _trmm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     T = eltype(B); n = size(B, 2)
-    M = _l3_tmp(T); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)               # M = op(A) triangle (generic over T; no conj)
-    cj && @inbounds(Mv .= conj.(Mv))                # 'C' variant: conjugate the materialized op
-    Bt = _trsm_tmp(T, k, n); Btv = view(Bt, 1:k, 1:n)
-    gemm!(Btv, Mv, B)                               # Btv = M·B  (complex SIMD gemm)
-    copyto!(B, Btv)                                 # B := M·B
+    @scope arn begin
+        M = borrow!(arn, T, _L3_NB, _L3_NB)         # `diag`'s FIXED _L3_NB×_L3_NB shape
+        Mv = view(M, 1:k, 1:k)
+        _mat_tri!(Mv, A, k, up, tr, unit)           # M = op(A) triangle (generic over T; no conj)
+        cj && @inbounds(Mv .= conj.(Mv))            # 'C' variant: conjugate the materialized op
+        Btv = borrow!(arn, T, k, n)                 # EXACT k×n — ld no longer depends on call history
+        gemm!(Btv, Mv, B)                           # Btv = M·B  (complex SIMD gemm)
+        @inbounds for j in 1:n, i in 1:k            # B := M·B
+            B[i, j] = Btv[i, j]
+        end
+    end
     return B
 end
 
 # Complex trmm side-R base: B := B·op(A). Materialize op(A) once, then one SIMD complex gemm (B·M).
 function _trmm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     T = eltype(B); m = size(B, 1)
-    M = _l3_tmp(T); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)
-    cj && @inbounds(Mv .= conj.(Mv))
-    Bt = _trsm_tmp(T, m, k); Btv = view(Bt, 1:m, 1:k)
-    gemm!(Btv, B, Mv)                               # Btv = B·M
-    copyto!(B, Btv)
+    @scope arn begin
+        M = borrow!(arn, T, _L3_NB, _L3_NB)
+        Mv = view(M, 1:k, 1:k)
+        _mat_tri!(Mv, A, k, up, tr, unit)
+        cj && @inbounds(Mv .= conj.(Mv))
+        Btv = borrow!(arn, T, m, k)                 # EXACT m×k
+        gemm!(Btv, B, Mv)                           # Btv = B·M
+        @inbounds for j in 1:k, i in 1:m
+            B[i, j] = Btv[i, j]
+        end
+    end
     return B
 end
 
 # Complex small-k trmm side-L at HALF the flops of the materialize+dense-gemm base: materialize op(A)
-# into the _l3_tmp scratch, then per-row-tile K-TRIMmed _uker_cmplx! calls (contract only op(A)'s
+# into the _L3_NB×_L3_NB diag scratch, then per-row-tile K-TRIMmed _uker_cmplx! calls (contract only op(A)'s
 # nonzero p-range per tile — the 2× dense waste is the whole gap; ztrmm n=128 was 0.515 ≈ dense/2).
 # IN PLACE: B is operand AND target; each _uker_cmplx! call is atomic (all A/B loads precede all stores),
 # and the K-TRIM's p-range is exactly the not-yet-overwritten rows (upM top-down / else bottom-up) → no
@@ -357,12 +394,20 @@ end
 # call per row-tile). Fable-designed 2026-07-05.
 function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); n = size(B, 2)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
-    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
     ldM = _L3_NB; ldb = stride(B, 2)
+    # ESCAPE AUDIT (@scope arn): `M` does not leave this block. It is filled by `_mat_tri!` and the
+    # conj broadcast (both index it), then read only as `Mp = Ptr{T}(pointer(M))` inside this
+    # function's own tile loops and handed to `_uker_cmplx!` as a raw `Ptr` + `ldM`; that kernel
+    # loads, computes and stores into B, and keeps no pointer. `B` is the caller's and is the result.
+    # The FIXED _L3_NB×_L3_NB shape is borrowed verbatim because `ldM = _L3_NB` is what the kernel is
+    # given — sizing this borrow from `k` would silently change the A-operand's stride.
+    @scope arn begin
+    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+    Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     GC.@preserve M B begin
         Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
         onr = one(T); zr = zero(T)
@@ -411,6 +456,7 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
             end
         end
     end
+    end                                                     # @scope arn
     return B
 end
 
@@ -420,12 +466,17 @@ end
 # read columns are exactly the not-yet-overwritten ones, so no scratch (see _trmm_cmplx_small_L!).
 function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); m = size(B, 1)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)
-    cj && @inbounds(Mv .= conj.(Mv))
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR_SMALL; sz = sizeof(T)
     ldM = _L3_NB; ldb = stride(B, 2)
+    # ESCAPE AUDIT (@scope arn): as `_trmm_cmplx_small_L!` above — `M` reaches only `_mat_tri!`, the
+    # conj broadcast and `_uker_cmplx!` (raw `Ptr` + `ldM`), none of which retains it. FIXED
+    # _L3_NB×_L3_NB shape, because `ldM = _L3_NB` is the stride the kernel is handed.
+    @scope arn begin
+    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+    Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)
+    cj && @inbounds(Mv .= conj.(Mv))
     GC.@preserve M B begin
         Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
         onr = one(T); zr = zero(T); nt = cld(k, nr)
@@ -460,6 +511,7 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
             ir += mr
         end
     end
+    end                                                     # @scope arn
     return B
 end
 
@@ -532,14 +584,22 @@ end
 # in M (no mask); edge tiles use the masked kernel. α folded outside → A1=true. See kb pureblas-zen3-gate-strategy.
 function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     Tc = eltype(B); T = real(Tc); n = size(B, 2)
-    M = _l3_tmp(Tc); Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
-    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mr * k, cld(nc, nr) * nr * k)
     ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
+    # ESCAPE AUDIT (@scope arn): `M`/`Mv` do not leave this block. They reach `_mat_tri!`, the conj
+    # broadcast, and `_pack_A_cmplx!`, which copies M's trapezoid OUT into the gemm A-panel and keeps
+    # nothing. `_pack_A_cmplx!` gates its vectorized deinterleave on `_strided1(A)` (gemm.jl:1513),
+    # which a `PtrMatrix` view satisfies — the SIMD pack is preserved, not dropped to the scalar arm.
+    # The gemm pack buffers (`_gemm_scratch_cmplx`) stay GKH-owned fields, deliberately.
+    # FIXED _L3_NB×_L3_NB shape (the `diag` role), not sized from k.
+    @scope arn begin
+    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+    Mv = view(M, 1:k, 1:k)
+    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
     GC.@preserve M B ApR ApI BpR BpI begin
         Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
         BRp = pointer(BpR); BIp = pointer(BpI)
@@ -594,6 +654,7 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
             jc += nc
         end
     end
+    end                                                     # @scope arn
     return B
 end
 
@@ -601,8 +662,8 @@ end
 # operand is B itself (the gemm A-slot, m×k), packed per mc row-panel (its data is copied out → the
 # in-place aliasing dissolves; each output row depends only on its own B row, so B0-overwrite is safe
 # in any order). op(A) is the small B-slot operand, FUSED-packed ONCE up front straight from A (uplo/trans/
-# conj/unit + off-triangle zeros inline — no dense _mat_tri! materialize, no conj pass, no po2 _l3_tmp
-# stride): tile ji at fixed stride ji·nr·k storing only its [plo,phi) rows from slot-row 0 → TOUCHED
+# conj/unit + off-triangle zeros inline — no dense _mat_tri! materialize, no conj pass, no po2 _L3_NB
+# diag stride): tile ji at fixed stride ji·nr·k storing only its [plo,phi) rows from slot-row 0 → TOUCHED
 # footprint ~k²/2, packed once (no per-ic-panel repack — that regressed the recursion-fed large-k). boff
 # needs no plo term (row 0 IS op(A)-row plo); the A-pack keeps the +plo·mr offset (it packs all k B-cols).
 # Off-triangle zeros are real zeros in the packed panel (contribute 0, no mask); row/col edges use the
@@ -622,7 +683,7 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
         BRp = pointer(BpR); BIp = pointer(BpI)
         # FUSED triangle pack: op(A)'s K-trimmed column-tiles read STRAIGHT from A — uplo/trans/conj/unit
         # and the off-triangle zeros applied inline. No _mat_tri! dense materialize, no conj pass, no po2
-        # _l3_tmp stride. Tile ji → base ji·nr·k, rows [plo,phi), row-stride nre (=nr on full tiles; the
+        # _L3_NB diag stride. Tile ji → base ji·nr·k, rows [plo,phi), row-stride nre (=nr on full tiles; the
         # Route-A remainder slot keeps its pad-free nre). All A reads in-bounds ∀c (gj=jr+c<k, gp<phi≤k) →
         # unconditional load, triangle/diag by select; @simd ivdep on the contiguous BpR/BpI store.
         @inbounds for ji in 0:(cld(k, nr) - 1)
@@ -1312,8 +1373,9 @@ end
 # are already gemm!. Real only (stability fine for the well-conditioned diagonal blocks trsm assumes);
 # complex/conj keep the scalar trsv base.
 # HARD INVARIANT — `_TRSM_BASE ≤ _L3_NB`, ENFORCED, not merely documented. Both `_trsm_base_invL!` and
-# `_trsm_base_invR!` build the inverse in `view(_l3_tmp(T), 1:nb, 1:nb)`, and that scratch is a fixed
-# _L3_NB×_L3_NB matrix (workspace.jl:25, capped at 128) — so a base above it indexes past the buffer.
+# `_trsm_base_invR!` build the inverse in `view(borrow!(arn, T, _L3_NB, _L3_NB), 1:nb, 1:nb)` — the
+# `diag` role's FIXED _L3_NB×_L3_NB shape (capped at 128), borrowed rather than sized from the call
+# precisely so this invariant still binds — so a base above it indexes past the buffer.
 # The sibling `_TRMM_BASE = _L3_NB` (level3.jl:8) already carries this coupling in its comment.
 # While this was a bare const the invariant could not be violated. Making it a `@load_preference` (this
 # campaign) put it in the USER's hands, and a pin is exactly the tier an agent cannot test — so the
@@ -1339,7 +1401,24 @@ const _TRSM_BASE = min(@load_preference("trsm_base", 32)::Int, _L3_NB)
 # PDM: Literal — triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 8/16/32/64 within noise on all 3 uarchs, both trsm sides (2026-08-21)
 const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
 @inline _trtri_base() = (f = _FKR_trtri_base[]; f >= 0 ? f : _TRTRI_BASE)
+# NON-RECURSIVE ENTRY. `_trtri_rec!` below is self-recursive, and a `@scope` opened inside a recursion
+# holds every level's borrows at once (arena.jl measured 16 levels × 128 KiB growing the arena
+# 98 KB → 3.05 MB, permanently). So the scope is opened HERE, once, and the handle is threaded down.
+# ONE buffer serves every level. At level `nb` the off-block temp is h×m or m×h with h = nb÷2 and
+# m = cld(nb, 2), so cld(nb,2) × cld(nb,2) covers it; a deeper level runs at nb' ≤ cld(nb,2) and needs
+# cld(nb',2) ≤ cld(nb,2) — strictly smaller. Lifetimes never overlap either: a level touches `tmp`
+# only AFTER both of its recursive calls have returned, so the deeper uses are finished.
+# ESCAPE AUDIT (@scope arn): `tmp` does not leave the block. It is passed DOWN into `_trtri_rec!`
+# (legal — handles travel, tokens do not), which uses it only as a `view(tmp, …)` gemm destination and
+# then as a gemm source; `gemm!` gates on `_strided1(C)` (gemm.jl:2949), true for `PtrMatrix`, so the
+# borrowed C keeps the SIMD path. Neither `gemm!` nor `fill!` retains a reference. `V` is the caller's.
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
+    @scope arn begin
+        _trtri_rec!(V, A, nb, up, unit, borrow!(arn, eltype(V), cld(nb, 2), cld(nb, 2)))
+    end
+    return V
+end
+function _trtri_rec!(V, A, nb::Int, up::Bool, unit::Bool, tmp)
     T = eltype(V)
     if nb <= _trtri_base()
         fill!(V, zero(T))
@@ -1352,53 +1431,81 @@ function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     h = nb ÷ 2; m = nb - h
     A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):nb, (h + 1):nb)
     V11 = view(V, 1:h, 1:h); V22 = view(V, (h + 1):nb, (h + 1):nb)
-    _trtri!(V11, A11, h, up, unit)
-    _trtri!(V22, A22, m, up, unit)
+    # The recursive calls finish BEFORE this level touches `tmp`, so one shared buffer is safe (see the
+    # sizing argument on `_trtri!`). Each level slices the sub-block it needs out of it.
+    _trtri_rec!(V11, A11, h, up, unit, tmp)
+    _trtri_rec!(V22, A22, m, up, unit, tmp)
     if up
         A12 = view(A, 1:h, (h + 1):nb); V12 = view(V, 1:h, (h + 1):nb)
-        tmp = _trtri_tmp(T, h, m)
-        gemm!(tmp, A12, V22; alpha = true, beta = false)          # tmp = A12·V22   (h×m)
-        gemm!(V12, V11, tmp; alpha = -one(T), beta = false)       # V12 = -V11·tmp
+        t = view(tmp, 1:h, 1:m)
+        gemm!(t, A12, V22; alpha = true, beta = false)            # t = A12·V22   (h×m)
+        gemm!(V12, V11, t; alpha = -one(T), beta = false)         # V12 = -V11·t
         fill!(view(V, (h + 1):nb, 1:h), zero(T))                  # strict-lower stays 0
     else
         A21 = view(A, (h + 1):nb, 1:h); V21 = view(V, (h + 1):nb, 1:h)
-        tmp = _trtri_tmp(T, m, h)
-        gemm!(tmp, A21, V11; alpha = true, beta = false)          # tmp = A21·V11   (m×h)
-        gemm!(V21, V22, tmp; alpha = -one(T), beta = false)       # V21 = -V22·tmp
+        t = view(tmp, 1:m, 1:h)
+        gemm!(t, A21, V11; alpha = true, beta = false)            # t = A21·V11   (m×h)
+        gemm!(V21, V22, t; alpha = -one(T), beta = false)         # V21 = -V22·t
         fill!(view(V, 1:h, (h + 1):nb), zero(T))                  # strict-upper stays 0
     end
     return V
 end
-# _trsm_tmp (invL/invR copyback temp) lives in the per-type L3Workspace (see src/workspace.jl).
+# The invL/invR copyback temp is an ARENA BORROW (arena.jl), not a workspace field, and that is a fix as
+# well as a refactor: `_trsm_tmp` handed back the whole GROWN field, so `stride(tmp, 2)` depended on the
+# largest earlier call rather than on this one. The ascending gate sweep hides that; a caller going
+# large-then-small got a different library (arena.jl records the measured 1.16 → 0.57 `_gemm_3m_scratch`
+# case). An EXACT borrow cannot have that bug — the ld is now nb (side L) / m (side R), every call.
+#
+# ESCAPE AUDIT (@scope arn), both bases: no handle leaves the block. `iv` goes to `_trtri!` — which opens
+# its own NESTED scope for its off-block temp, so that temp is bump-allocated AFTER `iv` and cannot
+# overlap it — and then to `gemm!`/`_gemm_unpacked!` as the A operand. `tmp` is those calls' C operand
+# and is then read back element-by-element into the caller's `B`. `gemm!` gates on `_strided1(C)`
+# (gemm.jl:2949) and `_gemm_unpacked!` consumes only `pointer`/`stride(·,2)`/`parent`, all of which a
+# `PtrMatrix` answers correctly (`_strided1(::PtrMatrix)` is `true`), so the SIMD path is preserved.
+# None of those callees stores an operand; `B` is the caller's array and is what is returned.
+# The copy-back is spelled as an explicit loop rather than `copyto!` because `PtrMatrix` is
+# `IndexCartesian`; this is the same column-loop shape the rest of this file uses for a scratch → B pass.
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
 function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
-    iv = view(_l3_tmp(T), 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
-    tmp = view(_trsm_tmp(T, nb, n), 1:nb, 1:n)
-    # tmp := op(iv)·B. The leaf shape is skewed (nb ≤ _TRSM_BASE tiny, n wide) — the UNPACKED path (no
-    # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
-    # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
-    if tr
-        gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
-    else
-        _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+    @scope arn begin
+        ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape — ld stays _L3_NB, as before
+        iv = view(ivM, 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
+        tmp = borrow!(arn, T, nb, n)            # EXACT nb×n
+        # tmp := op(iv)·B. The leaf shape is skewed (nb ≤ _TRSM_BASE tiny, n wide) — the UNPACKED path (no
+        # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
+        # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
+        if tr
+            gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
+        else
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+        end
+        @inbounds for j in 1:n, i in 1:nb
+            B[i, j] = tmp[i, j]
+        end
     end
-    copyto!(B, tmp); return B
+    return B
 end
 # side R base: B := B·op(A)⁻¹ = B·op(inv(A)). tmp := B·op(iv) via the unpacked path (transB=op is a free
 # Val{TB}; skewed shape m wide, n=k=nb tiny → same unpacked win as invL).
 function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
     nb = size(A, 1); m = size(B, 1); T = eltype(B)
-    iv = view(_l3_tmp(T), 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
-    tmp = view(_trsm_tmp(T, m, nb), 1:m, 1:nb)
-    # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
-    # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
-    if tr
-        _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
-    else
-        _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+    @scope arn begin
+        ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape
+        iv = view(ivM, 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
+        tmp = borrow!(arn, T, m, nb)            # EXACT m×nb
+        # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
+        # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
+        if tr
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+        else
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+        end
+        @inbounds for j in 1:nb, i in 1:m
+            B[i, j] = tmp[i, j]
+        end
     end
-    copyto!(B, tmp); return B
+    return B
 end
 
 # Direct triangular solve base (side L): rank-1 substitution, the eliminate-rows axpy dispatched to the gated
@@ -1617,24 +1724,42 @@ end
 # Complex trsm side-L base: invert op(A)'s k×k triangle ONCE (generic _trtri! → M⁻¹, reads A once) then
 # B := op(M⁻¹)·B via the gating SIMD complex gemm — vs trsv-per-column re-reading A n times. (op(A)⁻¹ =
 # op(A⁻¹): the gemm carries the trans/conj on the inverse.) The complex analog of the real invL leaf.
+# ESCAPE AUDIT (@scope arn), both complex bases below: nothing escapes. `Vv` reaches `_trtri!` (which
+# opens its OWN nested scope, so its off-block temp is bump-allocated after `Vv` and cannot overlap it)
+# and then `_gemm_core!` as an operand; `Btv` is `_gemm_core!`'s C and is read back into the caller's `B`
+# before the block ends. `_gemm_core!` gates on `_strided1(C)` (gemm.jl:2791/2860), which `PtrMatrix`
+# satisfies, and otherwise consumes only `pointer`/`stride(·,2)`; it retains no operand. These are the
+# NON-strided-B fallback bases, so `B[i, j]` is generic indexing either way — the explicit loop replaces
+# `copyto!` because `PtrMatrix` is `IndexCartesian`. `Vv` and `Btv` are separate borrows, so the inverse
+# cannot alias the product (the `diag`/`trsm_tmp` field split, reproduced by construction).
 function _trsm_cmplx_base_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     T = eltype(B); n = size(B, 2)
-    V = _l3_tmp(T); Vv = view(V, 1:k, 1:k)
-    _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
-    Bt = _trsm_tmp(T, k, n); Btv = view(Bt, 1:k, 1:n)
-    _gemm_core!(Btv, Vv, B, one(T), zero(T), tr, false, cj, false)   # Btv = op(A⁻¹)·B
-    copyto!(B, Btv)
+    @scope arn begin
+        V = borrow!(arn, T, _L3_NB, _L3_NB)                          # `diag`'s FIXED shape
+        Vv = view(V, 1:k, 1:k)
+        _trtri!(Vv, A, k, up, unit)                                  # Vv = A⁻¹ (as-stored, non-conj)
+        Btv = borrow!(arn, T, k, n)                                  # EXACT k×n
+        _gemm_core!(Btv, Vv, B, one(T), zero(T), tr, false, cj, false)   # Btv = op(A⁻¹)·B
+        @inbounds for j in 1:n, i in 1:k
+            B[i, j] = Btv[i, j]
+        end
+    end
     return B
 end
 
 # Complex trsm side-R base: B := B·op(A)⁻¹ = B·op(A⁻¹). Invert once (_trtri!), then one SIMD complex gemm.
 function _trsm_cmplx_base_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     T = eltype(B); m = size(B, 1)
-    V = _l3_tmp(T); Vv = view(V, 1:k, 1:k)
-    _trtri!(Vv, A, k, up, unit)
-    Bt = _trsm_tmp(T, m, k); Btv = view(Bt, 1:m, 1:k)
-    _gemm_core!(Btv, B, Vv, one(T), zero(T), false, tr, false, cj)   # Btv = B·op(A⁻¹)
-    copyto!(B, Btv)
+    @scope arn begin
+        V = borrow!(arn, T, _L3_NB, _L3_NB)                          # `diag`'s FIXED shape
+        Vv = view(V, 1:k, 1:k)
+        _trtri!(Vv, A, k, up, unit)
+        Btv = borrow!(arn, T, m, k)                                  # EXACT m×k
+        _gemm_core!(Btv, B, Vv, one(T), zero(T), false, tr, false, cj)   # Btv = B·op(A⁻¹)
+        @inbounds for j in 1:k, i in 1:m
+            B[i, j] = Btv[i, j]
+        end
+    end
     return B
 end
 
@@ -1930,7 +2055,13 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
     nrhs = size(B, 2); csz = sizeof(ComplexF64); sz = sizeof(Float64)
     NR = _ZGT_NR; MR = _ZGT_MR
     lda = stride(A, 2); ldb = stride(B, 2)
-    buf = _trsm_fused_buf(Float64, 2 * k * NR + 2 * k)
+    # ESCAPE AUDIT (@scope arn): `buf` never leaves this block, and never leaves this FUNCTION — the only
+    # thing derived from it is the raw `pr`/`pim`/`rc` pointer triple, handed to `_zgt_pack!`,
+    # `_zgt_slab!` and `_zgt_unpack!`, all of which load/store through it and return. No callee stores a
+    # pointer, and nothing borrowed is written into `B` except the solved values. Borrowed ONCE at the
+    # routine's entry, above the `while jc < nrhs` stripe loop — the length is loop-invariant.
+    @scope arn begin
+    buf = borrow!(arn, Float64, 2 * k * NR + 2 * k)
     GC.@preserve A B buf begin
         pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B))
         pr = pointer(buf); pim = pr + k * NR * sz; rc = pim + k * NR * sz
@@ -1982,6 +2113,7 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
             jc += NR
         end
     end
+    end                                          # @scope arn
     return B
 end
 # Eligibility: ComplexF64 only (the plane split rides the f64 W×W transpose), unit-stride A and B,
@@ -2025,8 +2157,11 @@ const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
 # ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).
 # Wide B keeps the trtri-on-inverse base (_TRMM_BASE) — its invert is amortized by the big gemm. Per-box knob.
 # PDM: Literal — recursion cut for complex trsm side-L; per-box. | tune: candidate
-const _CTRSM_REC_L = @load_preference("ctrsm_rec_l", 64)::Int
-@inline _fh_ctrsm_rec_l() = (f = _FKR_ctrsm_rec_l[]; f >= 0 ? f : _CTRSM_REC_L)
+# `min(…, _L3_NB)`: same clamp and same reason as `_SYRK_DBASE` below — this knob bounds `k` at the
+# complex trmm/trsm bases, which slice `view(M, 1:k, 1:k)` out of the FIXED `_L3_NB × _L3_NB` `diag`
+# borrow. `_L3_NB` is a preference too and can be as low as 16, so the two can cross without the clamp.
+const _CTRSM_REC_L = min(@load_preference("ctrsm_rec_l", 64)::Int, _L3_NB)
+@inline _fh_ctrsm_rec_l() = (f = _FKR_ctrsm_rec_l[]; f >= 0 ? min(f, _L3_NB) : _CTRSM_REC_L)
 # PDM: Literal — B-width cut: at or below it, the j-outer narrow recursion wins. | tune: candidate
 const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: ≤ → narrow (j-outer recursion)
 @inline _fh_ctrsm_ncut() = (f = _FKR_ctrsm_ncut[]; f >= 0 ? f : _CTRSM_NCUT)
@@ -2039,10 +2174,21 @@ function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     if !tr && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)   # direct back-substitution
         return _trsm_cmplx_dLN!(up, unit, k, A, B)                                # (no trtri)
     end
-    T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
-    _trtri!(Vv, A, k, up, unit)                                      # Vv = A⁻¹ (as-stored, non-conj)
-    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
-        _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
+    # ESCAPE AUDIT (@scope arn): `Vv` does not leave the block. It is `_trtri!`'s output (that call opens
+    # its own nested scope for its off-block temp, bump-allocated after `Vv`, so no overlap) and then the
+    # A operand of `_trmm_cmplx_packed_L!` / `_trmm_cmplx_small_L!`, which read it — through
+    # `_pack_A_cmplx!` (gated on `_strided1`, true for `PtrMatrix`) and `_mat_tri!` respectively — and
+    # write only into `B`. Those two borrow their own `M` inside a NESTED scope, i.e. arena bytes taken
+    # AFTER `Vv`, so the inverse cannot be overwritten by the triangle they materialize; that is the
+    # `trsm_tmp`-vs-`diag` field separation reproduced by construction rather than by field naming.
+    T = eltype(B)
+    @scope arn begin
+        Vv = borrow!(arn, T, k, k)                                   # EXACT k×k
+        _trtri!(Vv, A, k, up, unit)                                  # Vv = A⁻¹ (as-stored, non-conj)
+        (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, false, k, Vv, B) :
+            _trmm_cmplx_small_L!(up, tr, cj, false, k, Vv, B)
+    end
+    return B
 end
 # Direct complex side-R column-substitution base (no trtri): X·op(A)=B in place, !tr (⟹ !cj), unit or
 # non-unit, A k×k upper/lower. Ascending columns when up (up≠tr, tr=false). The side-R mirror of
@@ -2248,7 +2394,12 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
     m = size(B, 1); W = _ZGT_W
     lda = stride(A, 2); ldb = stride(B, 2)
     mb = (m ÷ W) * W                         # rows covered by full vector blocks
-    rc = _trsm_fused_buf(Float64, 2 * k)
+    # ESCAPE AUDIT (@scope arn): `rc` holds only the k reciprocal diagonal entries. It is read as the raw
+    # `prc` pointer by `_zrt_sweep!` → `_zrt_colgroup!` → `_zrt_tile!`, which load from it and store into
+    # B; none of them keeps the pointer, and nothing borrowed reaches `B` except solved values. One
+    # borrow at the routine's entry, above every loop.
+    @scope arn begin
+    rc = borrow!(arn, Float64, 2 * k)
     GC.@preserve A B rc begin
         pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B)); prc = pointer(rc)
         @inbounds for j in 0:(k - 1)
@@ -2264,6 +2415,7 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
             _zrt_sweep!(Val(true), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
         end
     end
+    end                                      # @scope arn
     return B
 end
 
@@ -2279,10 +2431,19 @@ function _trsm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     elseif tr && cj && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)  # transA='C'
         return _trsm_cmplx_dRC!(up, unit, k, A, B)                                        # direct, no trtri
     end
-    T = eltype(B); Vv = view(_trsm_tmp(T, k, k), 1:k, 1:k)
-    _trtri!(Vv, A, k, up, unit)
-    return (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
-        _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
+    # ESCAPE AUDIT (@scope arn): mirror of `_trsm_cmplx_small_L!` above. `Vv` is `_trtri!`'s output and
+    # then the coefficient operand of `_trmm_cmplx_packed_R!` / `_trmm_cmplx_small_R!`, both of which only
+    # read it (the packed side-R variant packs op(A) straight from it, `_strided1`-gated, and `PtrMatrix`
+    # answers true) and write into `B`. `_trmm_cmplx_small_R!`'s own `M` is a NESTED borrow taken after
+    # `Vv`, so it cannot overlap the inverse it is reading.
+    T = eltype(B)
+    @scope arn begin
+        Vv = borrow!(arn, T, k, k)                                   # EXACT k×k
+        _trtri!(Vv, A, k, up, unit)
+        (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, false, k, Vv, B) :
+            _trmm_cmplx_small_R!(up, tr, cj, false, k, Vv, B)
+    end
+    return B
 end
 
 # ===== Fused gemmtrsm (side-L, upper, no-trans) — BLIS/AOCL-style diagonal-block leaf =====
@@ -3019,8 +3180,9 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          on a derived predicate rather than a flag. Kept as a note because the measurements matter:
 #          A-side de-aliasing for the fused side-R path (trsmR). At transA='T' the leaf reads A VERBATIM
 #          at the caller's lda, and a quarter-period byte stride (lda=128 f64 ⇒ 1024 B) puts its columns
-#          on the same L1 sets. Copies A's lower triangle into `_trsm_rpack`'s odd-ld scratch when the
-#          derived `_potrf_needs_pad` fires. Leaf sweep, Zen3, bs=128 m=128, ONLY A's lda moving:
+#          on the same L1 sets. Copies A's lower triangle into an `_odd_ld` arena borrow (the role that
+#          was the `rpad` field) when the derived `_potrf_needs_pad` fires. Leaf sweep, Zen3, bs=128
+#          m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
 #   _EXP11 free again. It briefly restored the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!` (the
@@ -3183,7 +3345,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # fixes the parent-matrix large-`lda` scatter + keeps the per-stripe U re-reads on a compact L2-resident
     # panel (else the off-diagonal gemm evicts it → DRAM). ldu is forced ODD (KC|1): the slab reads U down a
     # column at stride ldu·sz, and a po2 ldu (KC=128) collapses those onto few L1 sets — an odd ld can never
-    # be a way-stride multiple, so the re-reads stay conflict-free (mirrors _trsm_rpack's odd-ld trick).
+    # be a way-stride multiple, so the re-reads stay conflict-free (mirrors `_odd_ld`, arena.jl).
     ldu = KC | 1
     # P is sized for the WIDEST stripe layout any path here can use, not just NR. The interleaved-pair
     # paths share one P across two stripes: 2*NR columns for `_fusedT_stripe_pair!`, NR+W for the tiny
@@ -3204,7 +3366,16 @@ function _trsm_fused_L!(unit::Bool, A, B)
     #     would have to show structure over a full period. It shows none.
     # `_EXPINT[1]` is kept as an inert sweep knob (default 0) so the negative result stays reproducible.
     # Do NOT reopen "workspace alignment" as a trsm lever without a NEW mechanism and a live-knob witness.
-    buf = _trsm_fused_buf(T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
+    # ESCAPE AUDIT (@scope arn): `buf` does not leave this block, and nothing derived from it leaves this
+    # function. It is sliced into the raw `Pp` (P stripe) / `pU` (compact U) / `rp` (reciprocals)
+    # pointers, which go to `_fusedT_pair_tiny!`, `_fusedT_stripe_pair!`, `_fusedT_stripe_k!`,
+    # `_fused_packP_tr!`/`_tr4!`, `_gemmtrsm_u_slab!` and `_gemmtrsm_u_tail!`. Every one of those takes
+    # raw `Ptr`s plus dims, reads/writes through them and returns; none stores a pointer in a field, a
+    # global or a closure, and none outlives its call. Only solved values reach the caller's `B`.
+    # Borrowed ONCE at the routine's entry, above the `while jc < n` stripe loop (`@scope` forbids a
+    # borrow inside a loop, and the length is loop-invariant anyway).
+    @scope arn begin
+    buf = borrow!(arn, T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
         # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
@@ -3419,6 +3590,7 @@ function _trsm_fused_L!(unit::Bool, A, B)
         end
         end                                   # else-branch of the _EXP7 paired-stripe dispatch
     end
+    end                                       # @scope arn
     return B
 end
 
@@ -3640,7 +3812,13 @@ function _trsm_fused_full_L!(unit::Bool, A, B)
     lda = stride(A, 2); ldb = stride(B, 2)
     nfull = k ÷ MR; rem = k - nfull * MR
     packUlen = _mp_off(nfull, k, MR) + (rem > 0 ? rem * rem : 0)
-    buf = _trsm_fused_buf(T, k * NR + packUlen + k)
+    # ESCAPE AUDIT (@scope arn): as `_trsm_fused_L!` above. `buf` is sliced into the raw `Pp` / `MP` /
+    # `rp` pointers, consumed by `_pack_U_micro!`, `_fused_packP_tr!`/`_unpackP_tr!`,
+    # `_gemmtrsm_u_tail_packed!`, `_gemmtrsm_u_slab_packed!` and `_gemmtrsm_u_slab_fusedT!` — all raw-`Ptr`
+    # kernels that read/write and return, storing no pointer anywhere. Nothing borrowed outlives the block
+    # and only solved values land in the caller's `B`. One borrow at entry, above the stripe loop.
+    @scope arn begin
+    buf = borrow!(arn, T, k * NR + packUlen + k)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
         MP = Pp + k * NR * sz; rp = MP + packUlen * sz
@@ -3677,6 +3855,7 @@ function _trsm_fused_full_L!(unit::Bool, A, B)
             jc += NR
         end
     end
+    end                                       # @scope arn
     return B
 end
 # Same-process A/B switch for the whole-k packed sweep vs the recursion+single-leaf path.
@@ -3931,8 +4110,9 @@ const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int  # ponytail: lowe
 # 0.945→1.04 (both beat AOCL at n=64), 2026-07-16 — the fused panel is no-op-or-better at narrow m on both.
 _trsm_r_mfloor(k::Int) = max(_CHOLW, k >> 2)
 # Fused side-R lower driver: X·op(A)⁻¹ via the potrf panel leaf `_trsm_rl_split_f64!`, MC row-chunked.
-# `Ar` (k×k used, may be a larger grown workspace ⇒ k passed explicitly) holds LOWER-TRANSPOSE-layout
-# coefficients: A itself for op='T'; the reflected Ã=J·Aᵀ·J for op='N' (see `_trsm_rrefl`), in which case
+# `Ar` (k×k used; k is still passed explicitly because the 'T' arm hands `A` itself, whose dims are the
+# caller's) holds LOWER-TRANSPOSE-layout coefficients: A itself for op='T'; the reflected Ã=J·Aᵀ·J for
+# op='N', built into an odd-ld arena borrow by `_trsm_right!`'s reflect arm, in which case
 # `revB=true` hands the leaf a column-REVERSED view of B — base pointer at column k with a NEGATIVE column
 # stride. `_cvptr`/`_clidx` are plain affine Ptr arithmetic, so a negative ld is legal and copies nothing.
 # `scratch=true` solves each chunk into the odd-ld rpack (conflict-free solved-column re-reads) then copies
@@ -3954,7 +4134,21 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
             pB += (k - 1) * ldb0 * 8; ldb = -ldb0
         end
         if scratch
-            S = _trsm_rpack(Float64, mc0, k); lds = stride(S, 2)
+            # ESCAPE AUDIT (@scope arn): `S` does not leave this block. Only the raw `pS` derived from it
+            # is used, by `_trsm_rl_split_f64!` (which solves the chunk INTO it) and by the vstore/vload
+            # copy-back loop right here; that kernel takes a `Ptr{Float64}` + `lds`, writes through it and
+            # returns, and stores no pointer. Nothing borrowed reaches `B` except solved values.
+            # Borrowed once, above the `while i0 < m` chunk loop, and only on the arm that needs it.
+            # ODD ld PRESERVED — `_odd_ld(mc0)` is `_trsm_rpack`'s own rule (rows+8, bumped to odd), and it
+            # is load-bearing: an odd ld can never be a multiple of the power-of-2 L1 way stride, so the
+            # leaf's re-reads of already-solved columns cannot collide in one cache set. The exact borrow
+            # also pins `lds` to THIS call's mc0 instead of to whatever an earlier call had grown.
+            # DISJOINT FROM THE CALLER'S PAD/REFLECT BUFFER by construction: `_trsm_right!` borrows those
+            # in an OUTER scope, so this one starts past them — which is exactly the `rpad`-vs-`rpack`
+            # split (the leaf writing its solution over the coefficients it is reading) that needed a
+            # separate FIELD before.
+            @scope arn begin
+            S = borrow!(arn, Float64, mc0, k, _odd_ld(mc0)); lds = stride(S, 2)
             GC.@preserve S begin
                 pS = pointer(S); i0 = 0
                 while i0 < m
@@ -3972,6 +4166,7 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
                     i0 += mc
                 end
             end
+            end                                                   # @scope arn
         else
             i0 = 0
             while i0 < m
@@ -4027,8 +4222,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # lda=128 could never trip it) — and the _RL_MR work changed register pressure, not addressing.
         # Predicate REUSED, not invented: `_potrf_needs_pad` is the derived quarter-period + L2-residency
         # test (the residency half matters — `_chol_needs_pad` measured a pad LOSING at n=384 once the
-        # block spills L2, because then the copy round-trip is pure traffic). `_trsm_rpack` already
-        # returns an odd-ld scratch, which by construction can never be a way-stride multiple.
+        # block spills L2, because then the copy round-trip is pure traffic). The pad arm borrows at
+        # `_odd_ld(k)`, which by construction can never be a way-stride multiple.
         # WHEN the pad pays — DERIVED, and NOT simply "whenever the stride aliases". Measured both boxes,
         # gate shape, end to end (pad/shipped, <1 = pad faster):
         #        n=128     n=256     n=512
@@ -4060,8 +4255,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # behaviour — the 0.958 → 0.944 seen on one Zen4 gate run was drift, not this change.
         # _EXP10 INVERTED: set true to DISABLE the pad, so the shipped arm stays A/B-able in-process.
         # Each arm calls the leaf DIRECTLY rather than assigning a shared `Ar` first. `Ar` used to take
-        # three different types here — `A` (whatever the caller passed), `view(S,…)`, and the `_trsm_rrefl`
-        # view — making it a union-typed local. With `A::Matrix` the union split and cost nothing; with
+        # three different types here — `A` (whatever the caller passed), the pad copy, and the reflected
+        # copy — making it a union-typed local. With `A::Matrix` the union split and cost nothing; with
         # `A::SubArray` it BOXED, allocating one 64 B SubArray per call and silently breaking the
         # allocation-free half of trsm!'s strict contract for every caller that passes views (found via
         # pptrf!'s owned-workspace panels, which do exactly that). `@verify_strict` had not caught it
@@ -4069,28 +4264,44 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # concretely typed; the leaf simply specializes per arm, which is what union-splitting was doing
         # on the Matrix path anyway.
         _rfuse = _alias_ld(stride(B, 2)) && k > _trsm_dbase()
+        # ESCAPE AUDIT (@scope arn), both arms below: the borrowed coefficient copy does not leave its
+        # block. It is written from `A` here, then passed DOWN into `_trsm_rl_fused_drv!` (handles may
+        # travel; only the token may not), which reads it as `pA = pointer(Ar)` + `ldA` inside
+        # `_trsm_rl_split_f64!` and never stores it. Both arms `return` from INSIDE the scope, which runs
+        # the `finally` and rewinds — and, crucially, neither scope is live across `_trsm_right!`'s own
+        # recursive tail below, so no arena is held per recursion level.
+        # ODD ld PRESERVED (`_odd_ld(k)` — rows+8 bumped to odd), because the leaf re-reads solved columns
+        # out of whichever buffer it is handed and a way-stride multiple would put them all in one L1 set.
+        # DISJOINTNESS, which used to need two named FIELDS (`rpad`/`rrefl` vs `rpack`): the copy below is
+        # held across `_trsm_rl_fused_drv!`, whose `scratch=true` arm borrows its own solve scratch — but
+        # that borrow happens inside a NESTED scope, i.e. at arena bytes taken after these, so the leaf
+        # can no longer write its solution over the coefficients it is reading. Same base pointer, same
+        # ld, one buffer was the measured wrong-answer bug; separate borrows make it unrepresentable.
         if tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
-            # `_trsm_rpad`, NOT `_trsm_rpack`: `S` is held across `_trsm_rl_fused_drv!`, which takes
-            # `rpack` again for its own solve scratch (`scratch=true`, level3.jl:3929). Same field, same
-            # base pointer, same ld ⇒ the leaf writes the solution over the coefficients it is reading —
-            # whenever the second claim does not realloc (mc0 ≤ k). See the `rpad` comment in workspace.jl.
-            S = _trsm_rpad(Float64, k, k)
-            @inbounds for c in 1:k, r in c:k          # lower triangle only — the leaf reads nothing above it
-                S[r, c] = A[r, c]
+            # AVX2-ONLY ARM (`_RL_MR_LIVE > _NVREG`): no AVX-512 box can execute it, so it is verified by
+            # reading, not by running. Shape and stride are exactly what `_trsm_rpad` produced: a k×k
+            # lower-triangle copy of A at an odd leading dimension.
+            @scope arn begin
+                S = borrow!(arn, Float64, k, k, _odd_ld(k))
+                @inbounds for c in 1:k, r in c:k      # lower triangle only — the leaf reads nothing above it
+                    S[r, c] = A[r, c]
+                end
+                return _trsm_rl_fused_drv!(S, B, k, !tr, _rfuse)
             end
-            return _trsm_rl_fused_drv!(view(S, 1:k, 1:k), B, k, !tr, _rfuse)
         end
         if !tr
-            Ar = _trsm_rrefl(Float64, k)
-            # Contiguous-WRITE order: the inner r-loop stores Ar[:,c] unit-stride and reads A with a
-            # constant lda stride the prefetcher follows. Cache-BLOCKING this (8×8 tiles = one A line per
-            # tile row) was tried and measured uniformly WORSE — 32×48 0.85→0.69, 256×48 1.01→0.97 vs AOCL
-            # (Zen4, 2026-07-26): the tiles' computed triangular bounds cost more than the traffic they
-            # save. Do not re-try tiling here without measuring.
-            @inbounds for c in 1:k, r in c:k
-                Ar[r, c] = A[k + 1 - c, k + 1 - r]
+            @scope arn begin
+                Ar = borrow!(arn, Float64, k, k, _odd_ld(k))
+                # Contiguous-WRITE order: the inner r-loop stores Ar[:,c] unit-stride and reads A with a
+                # constant lda stride the prefetcher follows. Cache-BLOCKING this (8×8 tiles = one A line per
+                # tile row) was tried and measured uniformly WORSE — 32×48 0.85→0.69, 256×48 1.01→0.97 vs AOCL
+                # (Zen4, 2026-07-26): the tiles' computed triangular bounds cost more than the traffic they
+                # save. Do not re-try tiling here without measuring.
+                @inbounds for c in 1:k, r in c:k
+                    Ar[r, c] = A[k + 1 - c, k + 1 - r]
+                end
+                return _trsm_rl_fused_drv!(Ar, B, k, !tr, _rfuse)
             end
-            return _trsm_rl_fused_drv!(Ar, B, k, !tr, _rfuse)
         end
         return _trsm_rl_fused_drv!(A, B, k, !tr, _rfuse)
     end
@@ -4370,14 +4581,32 @@ function trsm!(
     if sl && _strided1(B) && size(B, 1) == k && 1 < size(B, 2) < _vwidth(eltype(B)) &&
             eltype(B) <: BlasFloat
         nr = size(B, 2); w = _vwidth(eltype(B))
-        # `_trsm_widen`, NOT `_trsm_tmp`: `Bv` below is held across the `_trsm!` call, whose complex
-        # path takes `trsm_tmp` for `_trtri!`'s output and would overwrite this staged RHS.
-        Bw = _trsm_widen(eltype(B), k, w)                    # GKH-owned (L3Workspace), grows
-        Bv = view(Bw, 1:k, 1:w)
-        @inbounds copyto!(view(Bv, :, 1:nr), B)
-        @inbounds fill!(view(Bv, :, (nr + 1):w), zero(eltype(B)))
-        _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, Bv)
-        @inbounds copyto!(B, view(Bv, :, 1:nr))
+        # THIS IS THE NON-RECURSIVE ENTRY, and the borrow belongs here: `Bv` is held across `_trsm!`,
+        # which recurses. Opening a scope inside that recursion would hold one staging buffer per level
+        # (arena.jl measured 16 levels × 128 KiB → 3.05 MB, never released); opened here it is exactly
+        # one, and the handle is threaded into the driver, which is what a handle is for.
+        # ESCAPE AUDIT (@scope arn): `Bv` does not outlive the block. It is the RHS operand of `_trsm!`
+        # and is copied back into the caller's `B` before the scope ends. `_trsm!` and everything under
+        # it treat B as a value operand — they solve in place through `pointer`/`stride(·,2)` and store
+        # nothing; `_strided1(::PtrMatrix)` is `true`, and `trsm!` has already gated `B` on `_strided1`,
+        # so every fast path downstream still fires with a borrowed RHS.
+        # SEPARATION PRESERVED BY CONSTRUCTION: this used to need its own `trsmw` FIELD, because the
+        # complex path inside `_trsm!` claimed `trsm_tmp` for `_trtri!`'s output and would have
+        # overwritten the staged RHS (measured relerr ~1.0 on ComplexF32, history-dependent). Those
+        # inner claims are now borrows taken in NESTED scopes, i.e. arena bytes past this one, so the
+        # collision is not expressible any more — but the note stays, because the reason the two must
+        # not share is unchanged.
+        @scope arn begin
+            Bv = borrow!(arn, eltype(B), k, w)               # EXACT k×w
+            @inbounds for j in 1:nr, i in 1:k                # stage the ragged RHS…
+                Bv[i, j] = B[i, j]
+            end
+            @inbounds fill!(view(Bv, :, (nr + 1):w), zero(eltype(B)))   # …zeroed, never undef (see above)
+            _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, Bv)
+            @inbounds for j in 1:nr, i in 1:k
+                B[i, j] = Bv[i, j]
+            end
+        end
         return B
     end
     # NOTE: a po2-`lda` A-pad used to sit here — when stride(A,2) was a bad (power-of-two) stride, A
@@ -4419,8 +4648,9 @@ function _syrk_scaleC!(C, up::Bool, β)
     end
     return C
 end
-# _L3_NB and the NB×NB diagonal-block scratch `_l3_tmp(T)` (the workspace `diag` field) live in
-# src/workspace.jl — const-dispatched for Float64/Float32 so it stays a bare field load, no lookup.
+# _L3_NB lives in src/workspace.jl. The NB×NB diagonal-block scratch that used to be the `diag` field
+# (`_l3_tmp(T)`) is now an arena borrow of that same FIXED _L3_NB×_L3_NB shape — `borrow!(arn, T,
+# _L3_NB, _L3_NB)`, arena.jl — taken at whichever routine needs it, never sized from the call.
 
 # Triangular-store microkernel: same FMA as the gemm masked microkernel, but on store keeps only the
 # stored-triangle entries — for a diagonal-straddling C-tile whose top-left global offset is (r0,c0),
@@ -5680,8 +5910,16 @@ end
 # Recursion base for the diagonal (gemm→temp + triangle-add wastes 2× flops on b×b; smaller base =
 # more work in efficient off-diagonal gemms). Preferences-overridable "syrk_dbase" (Zen3 sweep).
 # PDM: Literal — diagonal-block base; larger pushes work into efficient off-diagonal gemms. | tune: candidate
-const _SYRK_DBASE = @load_preference("syrk_dbase", 32)::Int
-@inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? f : _SYRK_DBASE)
+# `min(…, _L3_NB)` — the SAME hard clamp `_TRSM_BASE` (level3.jl:1391) carries, and for the same reason.
+# This knob bounds the leaf that slices `view(scr, 1:n, 1:n)` out of the FIXED `_L3_NB × _L3_NB` `diag`
+# borrow, so an unclamped value larger than `_L3_NB` slices past the end of that borrow. `_L3_NB` is
+# itself derived and resolves to 80 on a 256 KiB-L2 part, while this knob is tagged `tune: candidate` and
+# its own comment invites larger values — so 96 or 128 is inside the sweep range a user is told to try.
+# Before the arena that misconfiguration threw a `BoundsError` at the slice; the clamp plus the restored
+# `@boundscheck` on `view(::PtrMatrix, …)` (ptrmat.jl) are the two halves of keeping it loud.
+# The clamp is repeated inside the live-knob hook because `_FKR_syrk_dbase[]` bypasses the const entirely.
+const _SYRK_DBASE = min(@load_preference("syrk_dbase", 32)::Int, _L3_NB)
+@inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? min(f, _L3_NB) : _SYRK_DBASE)
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
 # `_at_rank_k_pack_cut`, which is PATH-DEPENDENT — read cpuinfo.jl:212-227 for the authoritative form:
@@ -5847,7 +6085,21 @@ function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
             return _csyrk_packed!(up, tr, herm, α, A, C, k)
         end
     end
-    return _syrk_rec!(up, tr, herm, α, A, C, k, _l3_tmp(eltype(C)), 0, size(C, 1))
+    # NON-RECURSIVE ENTRY: `_syrk_rec!` recurses, and it ALREADY threads this buffer down as `scr` (one
+    # buffer for every level — the leaves' lifetimes never overlap, since a level's leaf work happens
+    # before it hands `scr` on). So the scope belongs here, at the entry that calls the driver, not
+    # inside the recursion where one borrow per level would accumulate.
+    # ESCAPE AUDIT (@scope arn): `scr` does not leave the block. Inside `_syrk_rec!` it is only ever
+    # `view(scr, 1:n, 1:n)`, used as `_syrk_gemm!`'s C operand and then as `_add_tri!`'s source; the
+    # result is accumulated into the caller's `C` at the leaf. `_syrk_gemm!` is `_gemm_core!`, which
+    # gates on `_strided1(C)` (gemm.jl:2791/2860) — `true` for a `PtrMatrix` view — and otherwise takes
+    # only `pointer`/`stride(·,2)`; `_add_tri!` indexes. Neither retains the handle.
+    # FIXED _L3_NB×_L3_NB (the `diag` role's shape), not sized from n: `_fh_syrk_dbase()` is what bounds
+    # the leaf, and it is capped by that same _L3_NB.
+    @scope arn begin
+        _syrk_rec!(up, tr, herm, α, A, C, k, borrow!(arn, T, _L3_NB, _L3_NB), 0, size(C, 1))
+    end
+    return C
 end
 # One gemm sub-block through the @inline `_gemm_core!` (not the non-inlined kwarg gemm!): tr=false ⇒
 # C += α·A·Bᵀ (transB), tr=true ⇒ C += α·Aᵀ·B (transA); cc conjugates for the herm (herk) case.
@@ -6681,7 +6933,18 @@ function syr2k!(
         _csyr2k_packed!(up, trans != 'N', false, alpha, A, Bm, C, k)
     else
         _syrk_scaleC!(C, up, beta)
-        _syr2k_acc!(up, trans != 'N', false, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n)
+        # NON-RECURSIVE ENTRY, same shape as `_syrk_blocked!` above: `_syr2k_acc!` recurses and already
+        # threads this buffer down as `scr`, so the scope is opened here and the handle passed in.
+        # ESCAPE AUDIT (@scope arn): `scr` never leaves the block. Inside the driver it is only
+        # `view(scr, 1:n, 1:n)` — `_syrk_gemm!`'s C operand (that is `_gemm_core!`, gated on
+        # `_strided1(C)`, which `PtrMatrix` satisfies), then read elementwise into the caller's `C`.
+        # No callee stores it. FIXED _L3_NB×_L3_NB, the `diag` role's shape.
+        @scope arn begin
+            _syr2k_acc!(
+                up, trans != 'N', false, alpha, A, Bm, C, k,
+                borrow!(arn, eltype(C), _L3_NB, _L3_NB), 0, n
+            )
+        end
     end
     return C
 end
@@ -6703,6 +6966,12 @@ function her2k!(
     elseif eltype(C) <: BlasComplex && n > _fh_csyr2k_pack_cut() && k > 0
         return (_csyr2k_packed!(up, trans != 'N', true, alpha, A, Bm, C, k); C)
     end
-    _syr2k_acc!(up, trans != 'N', true, alpha, A, Bm, C, k, _l3_tmp(eltype(C)), 0, n)
+    # NON-RECURSIVE ENTRY; see the audit on the `syr2k!` arm above — identical handle, identical callees.
+    @scope arn begin
+        _syr2k_acc!(
+            up, trans != 'N', true, alpha, A, Bm, C, k,
+            borrow!(arn, eltype(C), _L3_NB, _L3_NB), 0, n
+        )
+    end
     return C
 end

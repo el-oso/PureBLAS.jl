@@ -19,6 +19,56 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
   three factorizations for the first time. That was M6's prerequisite; reverse mode is still unstarted.
 - **Deferred by standing decision:** M4 multithreading (do not start unless asked), registration.
 
+### Scratch arena — replacing the per-role workspace fields (2026-09-04, stages 0–3 landed)
+
+`L3Workspace` had grown to **180 fields, one per role**, most of them dedicated to a single LAPACK
+routine. The replacement is a byte-addressed bump allocator (`src/arena.jl`): a routine opens a lexical
+`@scope` and takes `borrow!(tok, T, m, n[, ld])` handles that are valid until the block exits, at which
+point the bump pointer rewinds.
+
+**Where it stands: 180 → 20 fields.** What remains is exactly the BLAS-3 core — the seven GEMM/syr2k
+pack buffers, eight trsm/trtri scratch roles, five potrf ones.
+
+| stage | scope | status |
+|---|---|---|
+| 0 | the arena itself + `PtrMatrix`/`PtrVector` handles + the `@scope` macro | ✅ `741af93` |
+| 1 | the first 37 roles (tgex/laexc/syl/trsen fixed-size scratch) | ✅ `741af93` |
+| 2 | 15 LAPACK files' call sites | ✅ `5378866` |
+| 3 | the remaining 15 LAPACK files (52 roles) + the deletion pass | ✅ `5378866` |
+| 4 | the 13 trsm/trtri/potrf roles — **gate-visible, needs a re-gate** | in progress |
+| — | the 7 GEMM/syr2k pack buffers | **deliberately NOT converted** — see below |
+
+**Why the pack buffers stay fields.** `gpackA`/`gpackB`/`cg`/`s2`/`m3`/`str`/`strbt` are touched on every
+single `gemm!` call, which is the one frequency at which a bump-allocate could plausibly cost more than a
+const-dispatched field load; and `str` is a POOL (`Vector{Matrix{T}}`) whose disjointness is slot-index
+arithmetic in `_str_fit!`, not a field split. Converting them is a separate decision, not yet taken.
+
+**Three properties the design rests on**, in decreasing strength:
+1. **The token cannot escape** — `@scope` rejects at EXPANSION TIME any use of the token other than as
+   `borrow!`'s first argument, any `borrow!` inside a loop/comprehension/closure in the block, and any
+   borrowed HANDLE returned from the block or left as its tail value.
+2. **Self-aliasing is impossible by construction** — two borrows are two disjoint bump ranges, so the
+   whole class of bug `test/workspace_lint.jl` exists to catch (`trsm_tmp`, `rpack`: a role re-claimed
+   from inside a live claim of itself, history-dependent, right on call 1 and wrong on call 2) cannot be
+   written.
+3. **An exact borrow removes a real hazard the fields have.** Today `_trsm_tmp`/`rpack`/`rrefl`/`padf`
+   hand back the whole GROWN field, so their `ld` depends on what an EARLIER call asked for —
+   `_gemm_3m_scratch` records a measured 1.16 → 0.57 regression from exactly that. The ascending gate
+   sweep hides it; a caller going large-then-small gets a different library.
+
+What is NOT covered, and is audited by reading plus `@fenced_scope` (a per-borrow `mmap` + `PROT_NONE`
+guard page, opt-in per scope): a handle stored into a field or global, or captured by a closure that
+outlives the block.
+
+**Cost, stated honestly:** a converted routine is no longer 0-allocation on its very first call at a new
+arena high-water — it is 0-allocation from the second (measured 1456 B on the first `trexc!` n=16, 0 B
+after). `L3Workspace` paid that at module load instead.
+
+**Standing caveat:** the arena is a process-global bump allocator, exactly as `_l3ws` is a process-global
+struct. That is not a regression in kind but it is one in degree — interleave two tasks and the failure
+is arbitrary cross-role aliasing where the struct's was bounded to one role. **A per-task owner is a
+precondition of enabling threads (M4), not an optimisation to weigh against its 9–12 ns.**
+
 **The performance gate is now `PB ≥ max(OpenBLAS, AOCL-BLIS)`** (upgraded 2026-07-15 from ≥ OpenBLAS) — a
 sub-1.0 ratio vs *either* AMD-tuned baseline is a miss, never a "ceiling." Certified boost-locked on the AMD
 fleet (Zen3/AVX2 `Zen3`, Zen4/AVX-512 `Zen4`, Zen5/native-AVX-512 `Zen5`) via

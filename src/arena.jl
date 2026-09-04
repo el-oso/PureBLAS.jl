@@ -207,6 +207,29 @@ end
 @noinline _throw_arena_ld() = throw(ArgumentError("borrow!: leading dimension is smaller than the row count"))
 @noinline _throw_arena_dims() = throw(ArgumentError("borrow!: dimensions must be non-negative"))
 
+# ── Anti-aliasing BETWEEN successive borrows ────────────────────────────────────────────────────────
+# This library fights cache-set aliasing everywhere — `_odd_ld`, `_offway_ld`, the `+8` pads, the po2-lda
+# findings. All of those act on the leading dimension WITHIN one buffer. The arena introduces a second,
+# new axis of the same hazard, ACROSS buffers: two borrows in one scope sit at a distance equal to the
+# first one's byte size, so a borrow whose size is a multiple of the way stride puts the next borrow on
+# the SAME cache sets. Separate `Matrix` fields were unrelated mallocs and could not do this.
+#
+# It is not hypothetical. `diag` is a FIXED `_L3_NB × _L3_NB` block, and at the fleet's `_L3_NB == 128`
+# that is exactly 2^17 bytes for Float64 and 2^18 for ComplexF64 — an exact multiple of the way stride
+# on every box. Every scope that borrows `diag` and then a gemm operand (`_trsm_base_invL!`/`_invR!`, the
+# real-trsm gate leaf; both complex trsm bases; both complex trmm bases; `_trmm_small!`) would put those
+# two operands on identical sets.
+#
+# So: nudge the BUMP — never the returned pointer, never the `ld` — by one alignment unit whenever a
+# borrow's size lands on the quarter-way stride. Same criterion and same remedy as `_offway_ld`, applied
+# one level out. Costs `_ARENA_ALIGN` bytes on the borrows that trip it and nothing on the rest; the
+# handle it returns is unchanged, so no caller can observe it except through the cache behaviour it
+# exists to fix. Const-folds to a mask and a select — `_ARENA_WAY_QUARTER` is a power of two.
+# `bytes > 0` guard: an empty borrow (the `n×0` placeholder `_geev_run!` hands hseqr! at compz='N') is a
+# multiple of everything and needs no nudge — it moves the bump by nothing at all.
+@inline _arena_offway(bytes::Int) =
+    (bytes > 0 && (bytes & (_ARENA_WAY_QUARTER - 1)) == 0) ? _ARENA_ALIGN : 0
+
 """
 Borrow an `m`×`n` column-major block with leading dimension `ld` (default `m`, i.e. exact). Valid until
 the enclosing `@scope` block exits. Bytes consumed are `ld*n*sizeof(T)`, aligned to `_ARENA_ALIGN` for
@@ -231,7 +254,7 @@ on a part with a wider line or a wider vector it is wider, and the code must not
         base = UInt(pointer(slab))
         adj = Int((-base) & (_ARENA_ALIGN - 1))
     end
-    a.off += adj + bytes
+    a.off += adj + bytes + _arena_offway(bytes)
     return PtrMatrix{T}(Ptr{T}(base + adj), m, n, ld)
 end
 
@@ -316,8 +339,8 @@ const _ARENA_MADV_DONTNEED = Cint(4)   # Linux MADV_DONTNEED
 # is no residency or latency criterion to derive it from and no candidate set to measure. It is bounded
 # from above by the smallest stock `vm.max_map_count` (65530), and this path never runs in a gated
 # measurement or in the trimmed `.so`.
-# req8-ok: sanitizer retention depth, not a machine-dependent tuning knob — bounded by the OS map limit.
 # PDM: Exempt — a debug sanitizer's retention depth, not hardware tuning; no host property favours one value.
+# req8-ok: sanitizer retention depth, not a machine-dependent tuning knob — bounded by the OS map limit.
 const _ARENA_FENCE_QUARANTINE = 4096
 const _ARENA_QUAR_PTR = Ptr{UInt8}[]
 const _ARENA_QUAR_LEN = Int[]
