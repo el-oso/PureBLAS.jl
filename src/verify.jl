@@ -220,7 +220,7 @@ _strict_utri(::Type{T}, n) where {T} =
 _strict_eye(::Type{T}, n) where {T} = T[i == j ? one(T) : zero(T) for i in 1:n, j in 1:n]
 # A REAL Schur form carrying one 2×2 conjugate-pair block. Without it every diagonal block is 1×1 and
 # `trexc!`/`trsyl!`/`trevc!` never reach their `dlaexc`/`dlasy2`/`dlaln2` 2×2 arms — half of each real
-# kernel, and the half that owns the `t16` / `laexcd` workspace buffers.
+# kernel, and the half that borrows the `t16` / `D` arena scratch.
 function _strict_quasitri(n)
     Tq = _strict_utri(Float64, n)
     Tq[1, 1] = 1.0; Tq[2, 2] = 1.0; Tq[1, 2] = 1.0; Tq[2, 1] = -1.0
