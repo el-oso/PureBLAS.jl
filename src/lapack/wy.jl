@@ -28,14 +28,20 @@ Caller-owned scratch for [`wy_t!`](@ref)/[`wy_apply!`](@ref), sized once per (ma
 max block size, max trailing columns) and reused across calls — zero-allocation after
 construction, matching PureSparse.jl's M5b numeric-loop contract (design_qr_m5b.md §A4.4/§A7.2).
 """
-struct WYApplyWorkspace{T}
-    V::Matrix{T}   # maxrows × maxbs: explicit-unit-diagonal reflector panel (the `Apanel` storage)
-    G::Matrix{T}   # maxbs × maxbs: VᵀV scratch (wy_t!'s own use)
-    W::Matrix{T}   # maxbs × maxncols: VᵀC / (T or Tᵀ)·W scratch
+# The storage type is a PARAMETER, not `Matrix{T}`: `_ormtr!`/`_unmtr!` (eigen.jl) now bundle three arena
+# borrows (arena.jl), which are `PtrMatrix{T}`, and a `Matrix{T}` field would reject them while an
+# `AbstractMatrix{T}` field would box (abstract STRUCT fields are the boxing hazard, not signatures).
+# One parameter, not three, because a bundle's three buffers always come from one allocator — all
+# `Matrix{T}` here and at the C-ABI sites, all `PtrMatrix{T}` from a `@scope`. Dispatch is unchanged:
+# `ws::WYApplyWorkspace{T}` is still the signature every consumer writes.
+struct WYApplyWorkspace{T, M <: AbstractMatrix{T}}
+    V::M   # maxrows × maxbs: explicit-unit-diagonal reflector panel (the `Apanel` storage)
+    G::M   # maxbs × maxbs: VᵀV scratch (wy_t!'s own use)
+    W::M   # maxbs × maxncols: VᵀC / (T or Tᵀ)·W scratch
 end
 
 function WYApplyWorkspace{T}(maxrows::Int, maxbs::Int, maxncols::Int) where {T}
-    return WYApplyWorkspace{T}(
+    return WYApplyWorkspace{T, Matrix{T}}(
         Matrix{T}(undef, max(maxrows, 1), max(maxbs, 1)),
         Matrix{T}(undef, max(maxbs, 1), max(maxbs, 1)),
         Matrix{T}(undef, max(maxbs, 1), max(maxncols, 1)),

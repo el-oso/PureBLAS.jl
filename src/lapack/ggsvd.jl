@@ -140,33 +140,38 @@ function _ggs_geqpf!(A::AbstractMatrix{T}, tau::AbstractVector{T}, jpvt::Abstrac
         jpvt[j] = j
     end
     kk = min(mm, nn)
-    u = _ggsvd_u_qp(T, mm)          # own field: live across the _ggs_larf_left! below
-    @inbounds for i in 1:kk
-        jmax = i
-        vmax = _ggs_nrm2(view(A, i:mm, i))
-        for j in (i + 1):nn
-            vj = _ggs_nrm2(view(A, i:mm, j))
-            if vj > vmax
-                vmax = vj; jmax = j
+    # Own borrow, hoisted above the loop (`@scope` rejects a borrow inside one, and the shape is
+    # loop-invariant): `u` is live across the `_ggs_larf_left!` below, which a shared buffer would
+    # clobber. It does not escape — the routine returns `A`, the caller's matrix.
+    @scope arn begin
+        u = borrow!(arn, T, mm)
+        @inbounds for i in 1:kk
+            jmax = i
+            vmax = _ggs_nrm2(view(A, i:mm, i))
+            for j in (i + 1):nn
+                vj = _ggs_nrm2(view(A, i:mm, j))
+                if vj > vmax
+                    vmax = vj; jmax = j
+                end
+            end
+            if jmax != i
+                for r in 1:mm
+                    A[r, i], A[r, jmax] = A[r, jmax], A[r, i]
+                end
+                jpvt[i], jpvt[jmax] = jpvt[jmax], jpvt[i]
+            end
+            τ = _ggs_larfg!(view(A, i:mm, i))
+            tau[i] = τ
+            if i < nn && τ != zero(T)
+                u[1] = one(T)
+                for r in (i + 1):mm
+                    u[r - i + 1] = A[r, i]
+                end
+                _ggs_larf_left!(view(A, i:mm, (i + 1):nn), view(u, 1:(mm - i + 1)), conj(τ))
             end
         end
-        if jmax != i
-            for r in 1:mm
-                A[r, i], A[r, jmax] = A[r, jmax], A[r, i]
-            end
-            jpvt[i], jpvt[jmax] = jpvt[jmax], jpvt[i]
-        end
-        τ = _ggs_larfg!(view(A, i:mm, i))
-        tau[i] = τ
-        if i < nn && τ != zero(T)
-            u[1] = one(T)
-            for r in (i + 1):mm
-                u[r - i + 1] = A[r, i]
-            end
-            _ggs_larf_left!(view(A, i:mm, (i + 1):nn), view(u, 1:(mm - i + 1)), conj(τ))
-        end
+        return A
     end
-    return A
 end
 
 # Apply Qᴴ of a factored block (reflectors in Ablk, kk of them) to C from the left (dorm2r 'L','C').
@@ -175,15 +180,21 @@ function _ggs_qr_apply_left!(
         C::AbstractMatrix{T}
     ) where {T}
     mm = size(Ablk, 1)
-    u = _ggsvd_u_applyl(T, mm)
-    @inbounds for i in 1:kk
-        u[1] = one(T)
-        for r in (i + 1):mm
-            u[r - i + 1] = Ablk[r, i]
+    # NOTHING ESCAPES: `u` reaches exactly one callee, `_ggs_larf_left!`, which reads it into a scalar
+    # accumulator and writes only `C`; it retains no reference. The routine returns `C`, the caller's
+    # matrix, never the handle. Own borrow rather than a share with `_ggs_formQ!`/`_ggs_geqpf!`: those
+    # are different helpers with their own live ranges (the old `ggs_ul` field's reason, preserved).
+    @scope arn begin
+        u = borrow!(arn, T, mm)                          # loop-invariant shape ⇒ hoisted above the loop
+        @inbounds for i in 1:kk
+            u[1] = one(T)
+            for r in (i + 1):mm
+                u[r - i + 1] = Ablk[r, i]
+            end
+            _ggs_larf_left!(view(C, i:mm, :), view(u, 1:(mm - i + 1)), conj(tau[i]))
         end
-        _ggs_larf_left!(view(C, i:mm, :), view(u, 1:(mm - i + 1)), conj(tau[i]))
+        return C
     end
-    return C
 end
 
 # Form the full mm×mm Q = H(1)···H(kk) from a factored block (dorg2r semantics).
@@ -196,15 +207,21 @@ function _ggs_formQ!(
     @inbounds for i in 1:mm
         Qout[i, i] = one(T)
     end
-    u = _ggsvd_u_formq(T, mm)
-    @inbounds for i in kk:-1:1
-        u[1] = one(T)
-        for r in (i + 1):mm
-            u[r - i + 1] = Ablk[r, i]
+    # NOTHING ESCAPES: `u`'s only callee is `_ggs_larf_left!` (accumulates into a scalar, writes `Qout`,
+    # keeps nothing). `Qout` is the caller's matrix and is what the routine returns. The borrow is sized
+    # from THIS call's `Qout` (mm), so the two call sites — `_ggs_formQ!(V, …)` and `_ggs_formQ!(U, …)`,
+    # p and m rows — each get an exact block instead of the old `max(m, p)` shared `ggs_uq` field.
+    @scope arn begin
+        u = borrow!(arn, T, mm)                          # loop-invariant shape ⇒ hoisted above the loop
+        @inbounds for i in kk:-1:1
+            u[1] = one(T)
+            for r in (i + 1):mm
+                u[r - i + 1] = Ablk[r, i]
+            end
+            _ggs_larf_left!(view(Qout, i:mm, :), view(u, 1:(mm - i + 1)), tau[i])
         end
-        _ggs_larf_left!(view(Qout, i:mm, :), view(u, 1:(mm - i + 1)), tau[i])
+        return Qout
     end
-    return Qout
 end
 
 # ── RQ elimination with co-application (zgerq2 + zunmr2 fused) ───────────────────────────────────
@@ -240,7 +257,11 @@ function _ggs_gerq2!(
         β = u[1]                       # real value stored in T
         # right reflector H = I - τ·w·wᴴ with w = [u[2:c]; 1]: row i · H = [0…0 β]
         nr += 1
-        wv = view(W, 1:c, nr)
+        # Two-step view, not `view(W, 1:c, nr)`: `W` is now an arena `PtrMatrix`, whose view methods
+        # cover (range,range) and (colon,integer) but not (range,integer) — the mixed form would fall
+        # back to a `SubArray`-of-`PtrMatrix`, which is not strided. Column-then-prefix stays a
+        # `PtrVector` here and a contiguous `SubArray` when `W` is an ordinary `Matrix`.
+        wv = view(view(W, :, nr), 1:c)
         for j in 1:(c - 1)
             wv[j] = u[1 + j]
         end
@@ -262,7 +283,7 @@ function _ggs_apply_rq_right!(
     ) where {T}
     @inbounds for j in 1:nrefl
         c = cs[j]
-        _ggs_larf_right!(view(X, :, 1:c), view(W, 1:c, j), taus[j], w)
+        _ggs_larf_right!(view(X, :, 1:c), view(view(W, :, j), 1:c), taus[j], w)   # see _ggs_gerq2!'s note
     end
     return X
 end
@@ -648,124 +669,147 @@ function _ggs_ggsvp!(
     m, n = size(A)
     p = size(B, 1)
 
-    # THIS ROUTINE IS THE SOLE CLAIMANT of ggs_w, ggs_xc, ggs_rqw/rqc/rqtau and ggs_ur; each is
-    # claimed ONCE, here, at the covering shape, and threaded into the helpers. Two reasons, and both
-    # matter: (a) a claim inside a callee that its caller also claims is the `trsm_tmp`/`rpack`
-    # self-alias shape `test/workspace_lint.jl` rejects; (b) `_wsgrow(::Matrix, r, c)` is grow-only
-    # per-call but NOT per-dimension — it reallocates whenever EITHER dim is short, so the two
-    # differently-shaped `_ggs_permcols!` / RQ claim sites would thrash on every ggsvd! forever.
-    #   ggs_w:   _ggs_larf_right! accumulator; longest C has max(m,p,n) rows (A, Q, U or B's rows).
-    #   ggs_xc:  _ggs_permcols! runs on A (m×n) and on view(Q,:,1:nl) (n×nl≤n).
-    #   ggs_rqw: reflector length ≤ n; count is l ≤ min(p,n) at step 2, k ≤ min(m,n) at step 4.
-    #   ggs_ur:  _ggs_gerq2!'s pivot-first conjugated row, length ≤ n.
-    wlarf = _ggsvd_larf_w(T, max(m, p, n))
-    Xc = _ggsvd_permcols(T, max(m, n), n)
-    rqW, rqc, rqtau = _ggsvd_rq_work(T, n, min(max(m, p), n))
-    urq = _ggsvd_u_rq(T, n)
+    # THIS ROUTINE BORROWS wlarf, Xc, rqW/rqc/rqtau and urq ONCE, here, at the covering shape, and
+    # threads them into the helpers — unchanged from the field design, and for the first of its two old
+    # reasons only: a claim inside a callee that its caller also claims was the `trsm_tmp`/`rpack`
+    # self-alias shape. The SECOND reason is retired by the arena — `_wsgrow(::Matrix, r, c)` reallocated
+    # whenever EITHER dim was short, so two differently-shaped claim sites thrashed forever; a borrow is
+    # exact and costs nothing to re-take. Keeping one covering borrow is still the smaller diff.
+    #   wlarf: _ggs_larf_right! accumulator; longest C has max(m,p,n) rows (A, Q, U or B's rows).
+    #   Xc:    _ggs_permcols! runs on A (m×n) and on view(Q,:,1:nl) (n×nl≤n).
+    #   rqW:   reflector length ≤ n; count is l ≤ min(p,n) at step 2, k ≤ min(m,n) at step 4.
+    #   urq:   _ggs_gerq2!'s pivot-first conjugated row, length ≤ n.
+    # Eight live borrows across four helper calls; `taua`/`jp2` and `u` are taken inside plain `if`
+    # branches, which `@scope` allows (only loops/comprehensions/closures are rejected). Nothing escapes:
+    # every handle dies here and the routine returns the two Ints `(k, l)`.
+    @scope arn begin
+        wlarf = borrow!(arn, T, max(m, p, n))
+        # Redundant-but-kept zeroing. `_ggs_larf_right!` re-zeroes w[1:size(C,1)] at every invocation
+        # (and returns early, reading nothing, when τ == 0), so the per-invocation fill already covers
+        # every read. The old accessor filled here too and its comment called that load-bearing; rather
+        # than adjudicate two comments that disagree, keep the O(max(m,p,n)) pass — it is one linear
+        # sweep inside an O(n³) driver, and arena bytes arrive uninitialised where a grown `Vector` did
+        # not. Delete it only with a positive control that a degenerate-u path still reads zeros.
+        fill!(wlarf, zero(T))
+        Xc = borrow!(arn, T, max(m, n), n)
+        rqW = borrow!(arn, T, n, min(max(m, p), n))
+        rqc = borrow!(arn, Int, min(max(m, p), n))
+        rqtau = borrow!(arn, T, min(max(m, p), n))
+        urq = borrow!(arn, T, n)
 
-    # 1) QR with column pivoting of B: B·P = V·[S11 S12; 0 0]; update A := A·P.
-    kb = min(p, n)
-    taub = _ggsvd_taub(T, kb)
-    jpvt = _ggsvd_jpvt(T, n)
-    _ggs_geqpf!(B, taub, jpvt)
-    _ggs_permcols!(A, jpvt, Xc)
-    l = 0
-    @inbounds for i in 1:kb
-        abs(B[i, i]) > tolb && (l += 1)
-    end
-    wantv && _ggs_formQ!(V, B, taub, kb)
-    # clean up B: strictly-lower of rows 1:l, and rows l+1:p entirely.
-    @inbounds for j in 1:(l - 1), i in (j + 1):l
-        B[i, j] = zero(T)
-    end
-    @inbounds for j in 1:n, i in (l + 1):p
-        B[i, j] = zero(T)
-    end
-    if wantq
-        fill!(Q, zero(T))
-        @inbounds for j in 1:n
-            Q[jpvt[j], j] = one(T)         # Q = P
+        # 1) QR with column pivoting of B: B·P = V·[S11 S12; 0 0]; update A := A·P.
+        kb = min(p, n)
+        # FOUR SEPARATE BORROWS — taub/jpvt here, taua/jp2 at step 3 — never two shared ones. That is the
+        # `ggs_taub`/`ggs_taua`+`ggs_jpvt`/`ggs_jp2` four-field property, and the arena preserves it
+        # unconditionally: distinct borrows are distinct bytes for the whole of this scope, which does not
+        # rewind until the routine returns. Stating the live ranges as they ACTUALLY are, rather than
+        # repeating workspace.jl's claim that taub outlives taua's creation: as written, taub's last read
+        # is `_ggs_formQ!(V, …)` below and jpvt's is the `Q = P` branch, both BEFORE step 3 borrows
+        # taua/jp2 — so today's ordering would survive sharing. Keeping them apart is what makes that
+        # ordering not load-bearing; a later edit moving a `taub` read past step 3 cannot silently
+        # clobber. Each is O(n) elements taken once per driver call, so the apartness is free.
+        taub = borrow!(arn, T, kb)
+        jpvt = borrow!(arn, Int, n)
+        _ggs_geqpf!(B, taub, jpvt)
+        _ggs_permcols!(A, jpvt, Xc)
+        l = 0
+        @inbounds for i in 1:kb
+            abs(B[i, i]) > tolb && (l += 1)
         end
-    end
-
-    # 2) RQ of (S11 S12) (l×n): → [0 T]·Z; update A := A·Zᴴ, Q := Q·Zᴴ.
-    if l > 0 && n != l
-        Brows = view(B, 1:l, 1:n)
-        nrefl = _ggs_gerq2!(Brows, rqc, rqtau, rqW, urq, wlarf)
-        _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, A, wlarf)
-        wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, Q, wlarf)
-        # clean up B: leading zero block and strictly-lower of the trailing l×l T.
-        @inbounds for j in 1:(n - l), i in 1:l
+        wantv && _ggs_formQ!(V, B, taub, kb)
+        # clean up B: strictly-lower of rows 1:l, and rows l+1:p entirely.
+        @inbounds for j in 1:(l - 1), i in (j + 1):l
             B[i, j] = zero(T)
         end
-        @inbounds for j in (n - l + 1):n, i in (j - n + l + 1):l
+        @inbounds for j in 1:n, i in (l + 1):p
             B[i, j] = zero(T)
         end
-    end
-
-    # 3) QR with column pivoting of A11 = A(:, 1:n-l): reveals k; A12 := U1ᴴ·A12; U := U1.
-    nl = n - l
-    k = 0
-    if nl > 0
-        A11 = view(A, 1:m, 1:nl)
-        ka = min(m, nl)
-        taua = _ggsvd_taua(T, ka)
-        jp2 = _ggsvd_jp2(T, nl)
-        _ggs_geqpf!(A11, taua, jp2)
-        @inbounds for i in 1:ka
-            abs(A[i, i]) > tola && (k += 1)
-        end
-        l > 0 && _ggs_qr_apply_left!(A11, taua, ka, view(A, 1:m, (nl + 1):n))
-        wantu && _ggs_formQ!(U, A11, taua, ka)
-        wantq && _ggs_permcols!(view(Q, :, 1:nl), jp2, Xc)
-        # clean up A: strictly-lower of A(1:k,1:k); A(k+1:m, 1:nl) = 0.
-        @inbounds for j in 1:(k - 1), i in (j + 1):k
-            A[i, j] = zero(T)
-        end
-        @inbounds for j in 1:nl, i in (k + 1):m
-            A[i, j] = zero(T)
-        end
-    elseif wantu
-        fill!(U, zero(T))
-        @inbounds for i in 1:m
-            U[i, i] = one(T)
-        end
-    end
-
-    # 4) RQ of (T11 T12) = A(1:k, 1:nl): → [0 T12]·Z1; Q(:,1:nl) := Q(:,1:nl)·Z1ᴴ.
-    if nl > k && k > 0
-        Ak = view(A, 1:k, 1:nl)
-        # Step 2's rq record is dead here (consumed above), so the same buffers are reused.
-        nrefl2 = _ggs_gerq2!(Ak, rqc, rqtau, rqW, urq, wlarf)
-        wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl2, view(Q, :, 1:nl), wlarf)
-        @inbounds for j in 1:(nl - k), i in 1:k
-            A[i, j] = zero(T)
-        end
-        @inbounds for j in (nl - k + 1):nl, i in (j - nl + k + 1):k
-            A[i, j] = zero(T)
-        end
-    end
-
-    # 5) QR of A(k+1:m, nl+1:n); U(:,k+1:m) := U(:,k+1:m)·U2.
-    if m > k && l > 0
-        kk2 = min(m - k, l)
-        u = _ggsvd_u_step5(T, m)
-        @inbounds for i in 1:kk2
-            τ = _ggs_larfg!(view(A, (k + i):m, nl + i))
-            u[1] = one(T)
-            for r in (k + i + 1):m
-                u[r - k - i + 1] = A[r, nl + i]
+        if wantq
+            fill!(Q, zero(T))
+            @inbounds for j in 1:n
+                Q[jpvt[j], j] = one(T)     # Q = P
             end
-            ulen = m - k - i + 1
-            i < l && _ggs_larf_left!(view(A, (k + i):m, (nl + i + 1):n), view(u, 1:ulen), conj(τ))
-            wantu && _ggs_larf_right!(view(U, :, (k + i):m), view(u, 1:ulen), τ, wlarf)
         end
-        @inbounds for j in (nl + 1):n, i in (j - n + k + l + 1):m
-            A[i, j] = zero(T)
-        end
-    end
 
-    return k, l
+        # 2) RQ of (S11 S12) (l×n): → [0 T]·Z; update A := A·Zᴴ, Q := Q·Zᴴ.
+        if l > 0 && n != l
+            Brows = view(B, 1:l, 1:n)
+            nrefl = _ggs_gerq2!(Brows, rqc, rqtau, rqW, urq, wlarf)
+            _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, A, wlarf)
+            wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl, Q, wlarf)
+            # clean up B: leading zero block and strictly-lower of the trailing l×l T.
+            @inbounds for j in 1:(n - l), i in 1:l
+                B[i, j] = zero(T)
+            end
+            @inbounds for j in (n - l + 1):n, i in (j - n + l + 1):l
+                B[i, j] = zero(T)
+            end
+        end
+
+        # 3) QR with column pivoting of A11 = A(:, 1:n-l): reveals k; A12 := U1ᴴ·A12; U := U1.
+        nl = n - l
+        k = 0
+        if nl > 0
+            A11 = view(A, 1:m, 1:nl)
+            ka = min(m, nl)
+            taua = borrow!(arn, T, ka)
+            jp2 = borrow!(arn, Int, nl)
+            _ggs_geqpf!(A11, taua, jp2)
+            @inbounds for i in 1:ka
+                abs(A[i, i]) > tola && (k += 1)
+            end
+            l > 0 && _ggs_qr_apply_left!(A11, taua, ka, view(A, 1:m, (nl + 1):n))
+            wantu && _ggs_formQ!(U, A11, taua, ka)
+            wantq && _ggs_permcols!(view(Q, :, 1:nl), jp2, Xc)
+            # clean up A: strictly-lower of A(1:k,1:k); A(k+1:m, 1:nl) = 0.
+            @inbounds for j in 1:(k - 1), i in (j + 1):k
+                A[i, j] = zero(T)
+            end
+            @inbounds for j in 1:nl, i in (k + 1):m
+                A[i, j] = zero(T)
+            end
+        elseif wantu
+            fill!(U, zero(T))
+            @inbounds for i in 1:m
+                U[i, i] = one(T)
+            end
+        end
+
+        # 4) RQ of (T11 T12) = A(1:k, 1:nl): → [0 T12]·Z1; Q(:,1:nl) := Q(:,1:nl)·Z1ᴴ.
+        if nl > k && k > 0
+            Ak = view(A, 1:k, 1:nl)
+            # Step 2's rq record is dead here (consumed above), so the same buffers are reused.
+            nrefl2 = _ggs_gerq2!(Ak, rqc, rqtau, rqW, urq, wlarf)
+            wantq && _ggs_apply_rq_right!(rqc, rqtau, rqW, nrefl2, view(Q, :, 1:nl), wlarf)
+            @inbounds for j in 1:(nl - k), i in 1:k
+                A[i, j] = zero(T)
+            end
+            @inbounds for j in (nl - k + 1):nl, i in (j - nl + k + 1):k
+                A[i, j] = zero(T)
+            end
+        end
+
+        # 5) QR of A(k+1:m, nl+1:n); U(:,k+1:m) := U(:,k+1:m)·U2.
+        if m > k && l > 0
+            kk2 = min(m - k, l)
+            u = borrow!(arn, T, m)             # hoisted above the `for i in 1:kk2` below
+            @inbounds for i in 1:kk2
+                τ = _ggs_larfg!(view(A, (k + i):m, nl + i))
+                u[1] = one(T)
+                for r in (k + i + 1):m
+                    u[r - k - i + 1] = A[r, nl + i]
+                end
+                ulen = m - k - i + 1
+                i < l && _ggs_larf_left!(view(A, (k + i):m, (nl + i + 1):n), view(u, 1:ulen), conj(τ))
+                wantu && _ggs_larf_right!(view(U, :, (k + i):m), view(u, 1:ulen), τ, wlarf)
+            end
+            @inbounds for j in (nl + 1):n, i in (j - n + k + l + 1):m
+                A[i, j] = zero(T)
+            end
+        end
+
+        return k, l
+    end
 end
 
 # ── dtgsja/ztgsja: Kogbetliantz cyclic Jacobi on the preprocessed pair + α/β/R endgame ────────────
@@ -778,124 +822,130 @@ function _ggs_tgsja!(
     ) where {T}
     RT = real(T)
     maxit = 40
-    wx, wy = _ggsvd_tgsja_work(T, max(l, 1))   # both write 1:len before the 1:len view is read
-    upper = false
-    converged = false
-    @inbounds for _ in 1:maxit
-        upper = !upper
-        for i in 1:(l - 1), j in (i + 1):l
-            a1 = zero(RT); a3 = zero(RT)
-            a2 = zero(T); b2 = zero(T)
-            k + i <= m && (a1 = real(A[k + i, n - l + i]))
-            k + j <= m && (a3 = real(A[k + j, n - l + j]))
-            b1 = real(B[i, n - l + i])
-            b3 = real(B[j, n - l + j])
-            if upper
-                k + i <= m && (a2 = A[k + i, n - l + j])
-                b2 = B[i, n - l + j]
-            else
-                k + j <= m && (a2 = A[k + j, n - l + i])
-                b2 = B[j, n - l + i]
-            end
-            csu, snu, csv, snv, csq, snq = _ggs_lags2(upper, a1, a2, a3, b1, b2, b3)
-            # rows of A (Uᴴ·A) and B (Vᴴ·B)
-            k + j <= m && _ggs_rot!(
-                view(A, k + j, (n - l + 1):n), view(A, k + i, (n - l + 1):n),
-                csu, conj(snu)
-            )
-            _ggs_rot!(view(B, j, (n - l + 1):n), view(B, i, (n - l + 1):n), csv, conj(snv))
-            # columns of A and B (·Q)
-            mkl = min(k + l, m)
-            mkl >= 1 && _ggs_rot!(view(A, 1:mkl, n - l + j), view(A, 1:mkl, n - l + i), csq, snq)
-            _ggs_rot!(view(B, 1:l, n - l + j), view(B, 1:l, n - l + i), csq, snq)
-            if upper
-                k + i <= m && (A[k + i, n - l + j] = zero(T))
-                B[i, n - l + j] = zero(T)
-            else
-                k + j <= m && (A[k + j, n - l + i] = zero(T))
-                B[j, n - l + i] = zero(T)
-            end
-            if T <: Complex                    # keep the working diagonals real (ztgsja)
-                k + i <= m && (A[k + i, n - l + i] = real(A[k + i, n - l + i]))
-                k + j <= m && (A[k + j, n - l + j] = real(A[k + j, n - l + j]))
-                B[i, n - l + i] = real(B[i, n - l + i])
-                B[j, n - l + j] = real(B[j, n - l + j])
-            end
-            wantu && k + j <= m && _ggs_rot!(view(U, :, k + j), view(U, :, k + i), csu, snu)
-            wantv && _ggs_rot!(view(V, :, j), view(V, :, i), csv, snv)
-            wantq && _ggs_rot!(view(Q, :, n - l + j), view(Q, :, n - l + i), csq, snq)
-        end
-        if !upper
-            # convergence: parallelism of corresponding rows of A and B
-            err = zero(RT)
-            for i in 1:min(l, m - k)
-                len = l - i + 1
-                for t in 1:len
-                    wx[t] = A[k + i, n - l + i + t - 1]
-                    wy[t] = B[i, n - l + i + t - 1]
+    # Borrowed above the `maxit` cycle loop — loop-invariant shape, so one pair serves every sweep, and
+    # `@scope` would reject a borrow inside the loop anyway. Both write 1:len before the 1:len view is
+    # read, so no fill!. Neither escapes; the routine returns an Int info code.
+    @scope arn begin
+        wx = borrow!(arn, T, max(l, 1))
+        wy = borrow!(arn, T, max(l, 1))
+        upper = false
+        converged = false
+        @inbounds for _ in 1:maxit
+            upper = !upper
+            for i in 1:(l - 1), j in (i + 1):l
+                a1 = zero(RT); a3 = zero(RT)
+                a2 = zero(T); b2 = zero(T)
+                k + i <= m && (a1 = real(A[k + i, n - l + i]))
+                k + j <= m && (a3 = real(A[k + j, n - l + j]))
+                b1 = real(B[i, n - l + i])
+                b3 = real(B[j, n - l + j])
+                if upper
+                    k + i <= m && (a2 = A[k + i, n - l + j])
+                    b2 = B[i, n - l + j]
+                else
+                    k + j <= m && (a2 = A[k + j, n - l + i])
+                    b2 = B[j, n - l + i]
                 end
-                err = max(err, _ggs_lapll!(view(wx, 1:len), view(wy, 1:len)))
+                csu, snu, csv, snv, csq, snq = _ggs_lags2(upper, a1, a2, a3, b1, b2, b3)
+                # rows of A (Uᴴ·A) and B (Vᴴ·B)
+                k + j <= m && _ggs_rot!(
+                    view(A, k + j, (n - l + 1):n), view(A, k + i, (n - l + 1):n),
+                    csu, conj(snu)
+                )
+                _ggs_rot!(view(B, j, (n - l + 1):n), view(B, i, (n - l + 1):n), csv, conj(snv))
+                # columns of A and B (·Q)
+                mkl = min(k + l, m)
+                mkl >= 1 && _ggs_rot!(view(A, 1:mkl, n - l + j), view(A, 1:mkl, n - l + i), csq, snq)
+                _ggs_rot!(view(B, 1:l, n - l + j), view(B, 1:l, n - l + i), csq, snq)
+                if upper
+                    k + i <= m && (A[k + i, n - l + j] = zero(T))
+                    B[i, n - l + j] = zero(T)
+                else
+                    k + j <= m && (A[k + j, n - l + i] = zero(T))
+                    B[j, n - l + i] = zero(T)
+                end
+                if T <: Complex                    # keep the working diagonals real (ztgsja)
+                    k + i <= m && (A[k + i, n - l + i] = real(A[k + i, n - l + i]))
+                    k + j <= m && (A[k + j, n - l + j] = real(A[k + j, n - l + j]))
+                    B[i, n - l + i] = real(B[i, n - l + i])
+                    B[j, n - l + j] = real(B[j, n - l + j])
+                end
+                wantu && k + j <= m && _ggs_rot!(view(U, :, k + j), view(U, :, k + i), csu, snu)
+                wantv && _ggs_rot!(view(V, :, j), view(V, :, i), csv, snv)
+                wantq && _ggs_rot!(view(Q, :, n - l + j), view(Q, :, n - l + i), csq, snq)
             end
-            if abs(err) <= min(tola, tolb)
-                converged = true
-                break
+            if !upper
+                # convergence: parallelism of corresponding rows of A and B
+                err = zero(RT)
+                for i in 1:min(l, m - k)
+                    len = l - i + 1
+                    for t in 1:len
+                        wx[t] = A[k + i, n - l + i + t - 1]
+                        wy[t] = B[i, n - l + i + t - 1]
+                    end
+                    err = max(err, _ggs_lapll!(view(wx, 1:len), view(wy, 1:len)))
+                end
+                if abs(err) <= min(tola, tolb)
+                    converged = true
+                    break
+                end
             end
         end
-    end
-    converged || return 1
+        converged || return 1
 
-    # endgame: α, β and the triangular R assembled into A (and B for the deficient-m rows)
-    @inbounds for i in 1:k
-        alpha[i] = one(RT)
-        beta[i] = zero(RT)
-    end
-    @inbounds for i in 1:min(l, m - k)
-        a1 = real(A[k + i, n - l + i])
-        b1 = real(B[i, n - l + i])
-        gamma = b1 / a1
-        if isfinite(gamma)
-            if gamma < 0
-                for t in (n - l + i):n
-                    B[i, t] = -B[i, t]
-                end
-                if wantv
-                    for r in 1:p
-                        V[r, i] = -V[r, i]
+        # endgame: α, β and the triangular R assembled into A (and B for the deficient-m rows)
+        @inbounds for i in 1:k
+            alpha[i] = one(RT)
+            beta[i] = zero(RT)
+        end
+        @inbounds for i in 1:min(l, m - k)
+            a1 = real(A[k + i, n - l + i])
+            b1 = real(B[i, n - l + i])
+            gamma = b1 / a1
+            if isfinite(gamma)
+                if gamma < 0
+                    for t in (n - l + i):n
+                        B[i, t] = -B[i, t]
+                    end
+                    if wantv
+                        for r in 1:p
+                            V[r, i] = -V[r, i]
+                        end
                     end
                 end
-            end
-            bk, ak, _ = _ggs_lartg(abs(gamma), one(RT))
-            beta[k + i] = bk
-            alpha[k + i] = ak
-            if alpha[k + i] >= beta[k + i]
-                s = one(RT) / alpha[k + i]
-                for t in (n - l + i):n
-                    A[k + i, t] *= s
+                bk, ak, _ = _ggs_lartg(abs(gamma), one(RT))
+                beta[k + i] = bk
+                alpha[k + i] = ak
+                if alpha[k + i] >= beta[k + i]
+                    s = one(RT) / alpha[k + i]
+                    for t in (n - l + i):n
+                        A[k + i, t] *= s
+                    end
+                else
+                    s = one(RT) / beta[k + i]
+                    for t in (n - l + i):n
+                        B[i, t] *= s
+                        A[k + i, t] = B[i, t]
+                    end
                 end
             else
-                s = one(RT) / beta[k + i]
+                alpha[k + i] = zero(RT)
+                beta[k + i] = one(RT)
                 for t in (n - l + i):n
-                    B[i, t] *= s
                     A[k + i, t] = B[i, t]
                 end
             end
-        else
-            alpha[k + i] = zero(RT)
-            beta[k + i] = one(RT)
-            for t in (n - l + i):n
-                A[k + i, t] = B[i, t]
-            end
         end
+        @inbounds for i in (m + 1):(k + l)
+            alpha[i] = zero(RT)
+            beta[i] = one(RT)
+        end
+        @inbounds for i in (k + l + 1):n
+            alpha[i] = zero(RT)
+            beta[i] = zero(RT)
+        end
+        return 0
     end
-    @inbounds for i in (m + 1):(k + l)
-        alpha[i] = zero(RT)
-        beta[i] = one(RT)
-    end
-    @inbounds for i in (k + l + 1):n
-        alpha[i] = zero(RT)
-        beta[i] = zero(RT)
-    end
-    return 0
 end
 
 # ── shared core: everything except the R extraction (whose shape depends on the k, l this returns) ──

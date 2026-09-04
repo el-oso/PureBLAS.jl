@@ -143,159 +143,172 @@ function _pstrf_blocked!(
     ) where {T, R <: Real, LOWER}
     n = size(A, 1)
     pvt = pvt_in; ajj = ajj_in
-    # UPPER only: contiguous copy of the row just written, so the Schur-diagonal loop above reads
-    # unit-stride instead of striding A by lda. Carved out of the caller's owned `scr` (GKH) rather
-    # than allocated here — scr is sized nb + 2n for exactly this.
-    rowb = LOWER ? view(scr, 1:0) : view(scr, (nb + n + 1):(nb + 2n))
-    # Deferred leading row swaps (LOWER). Owned like `scr` above — two DISJOINT views of one Int buffer,
-    # so `pstrf!` allocates nothing. Both are fully written before being read on each `k` iteration.
-    swj, swp = _pstrf_swaps(T, nb)
-    @inbounds for k in 1:nb:n
-        jb = min(nb, n - k + 1)
-        nsw = 0
-        for i in k:n
-            work[i] = zero(R)                       # per-panel reset (prior panels live in A[i,i])
-        end
-        for j in k:(k + jb - 1)
-            # Schur-complement diagonals. LOWER reads a contiguous column A[j+1:n, j-1]; UPPER would
-            # read the ROW A[j-1, j:n], strided by lda — a scalar gather where the lower form
-            # vectorises, run O(n²/2) times. Measured on Zen4 (whole-factorization cost of this loop
-            # alone): n=48 col 2.26 µs vs row 2.74 µs, n=64 3.18 vs 4.40 — i.e. 5.1% and 7.2% of the
-            # op, against gate deficits of 5.7% and 8.1%. It was the whole miss.
-            # The row is free, though: it is exactly what the previous column just computed, and that
-            # value passes through scratch on its way into A. `rowb` keeps it contiguous, so UPPER
-            # reads unit-stride like LOWER does. No staleness: rowb is refreshed at the end of every
-            # column, and the pivot swap for column j runs BEFORE column j's update, so the cached
-            # row is always post-swap.
-            # The `work[n+i] = real(A[i,i]) - work[i]` half MUST stay fused with the accumulate: A[i,i]
-            # is a strided diagonal read, and splitting this into two passes over i traverses it twice.
-            # Measured cost of getting that wrong: U n=64 0.921 → 0.852, n=96 1.007 → 0.899 — a
-            # regression on sizes the row cache never even touches. So the branch is hoisted out of
-            # the i-loop and each variant keeps the fusion.
-            if j > k
-                if LOWER
-                    for i in j:n
-                        work[i] += abs2(A[i, j - 1]); work[n + i] = real(A[i, i]) - work[i]
-                    end
-                elseif usebuf
-                    for i in j:n
-                        work[i] += abs2(rowb[i]); work[n + i] = real(A[i, i]) - work[i]
-                    end
-                else
-                    for i in j:n
-                        work[i] += abs2(A[j - 1, i]); work[n + i] = real(A[i, i]) - work[i]
-                    end
-                end
-            else
-                for i in j:n
-                    work[n + i] = real(A[i, i]) - work[i]
-                end
+    # Deferred leading row swaps (LOWER): arena borrows (arena.jl), not owned fields. Both are fully
+    # written before being read on each `k` iteration. They USED to be two DISJOINT views of one owned
+    # Int buffer, carved that way precisely so they could not alias; two independent borrows cannot
+    # alias either, so the disjointness is now structural and the view arithmetic is gone.
+    #
+    # ESCAPE AUDIT (@scope arn): neither handle leaves this block. `swj`/`swp` are written and read only
+    # by this function's own `j`-loop, and passed to exactly one callee — `_pstrf_apply_swaps_lower!`
+    # (top of this file), which is `@inline`, reads `swj[s]`/`swp[s]` to swap rows of `A`, and returns
+    # `A`; it stores neither in a field, a global, or a closure. No other callee sees them:
+    # `_pstrf_swap_lower!`/`_pstrf_swap_upper!`, `_gemv!` and `_pstrf_trailing!` (syrk!/herk!) are handed
+    # only `A` and slices of the caller's `scr`. There is no closure in this function, and both `return`
+    # sites inside the block return a bare `Int` rank.
+    @scope arn begin
+        swj = borrow!(arn, Int, nb)
+        swp = borrow!(arn, Int, nb)
+        # UPPER only: contiguous copy of the row just written, so the Schur-diagonal loop above reads
+        # unit-stride instead of striding A by lda. Carved out of the caller's `scr` (itself an arena
+        # borrow, taken in `pstrf!`) rather than borrowed here — scr is sized nb + 2n for exactly this.
+        rowb = LOWER ? view(scr, 1:0) : view(scr, (nb + n + 1):(nb + 2n))
+        @inbounds for k in 1:nb:n
+            jb = min(nb, n - k + 1)
+            nsw = 0
+            for i in k:n
+                work[i] = zero(R)                       # per-panel reset (prior panels live in A[i,i])
             end
-            if j > 1
-                pvt = j; mx = work[n + j]
-                for i in (j + 1):n
-                    (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
-                end
-                ajj = work[n + pvt]
-                if ajj <= dstop || isnan(ajj)
-                    A[j, j] = T(ajj)
-                    LOWER && _pstrf_apply_swaps_lower!(A, swj, swp, nsw, k - 1)   # flush before bailing
-                    return j - 1                            # rank-deficient: stop at numerical rank
-                end
-            end
-            if j != pvt
-                if LOWER                                    # leading cols 1:k-1 deferred to the panel flush
-                    _pstrf_swap_lower!(A, j, pvt, n, k)
-                    nsw += 1; swj[nsw] = j; swp[nsw] = pvt
-                else
-                    _pstrf_swap_upper!(A, j, pvt, n)
-                end
-                work[pvt] = work[j]
-                piv[j], piv[pvt] = piv[pvt], piv[j]
-            end
-            ajj = sqrt(ajj); A[j, j] = T(ajj)
-            if j < n
-                jk = j - k                                  # panel columns already factored (k:j-1)
-                invajj = one(R) / ajj
-                if LOWER
-                    if jk > 0                               # A[j+1:n,j] −= A[j+1:n,k:j-1]·conj(A[j,k:j-1])
-                        for t in 1:jk
-                            scr[t] = conj(A[j, k + t - 1])
+            for j in k:(k + jb - 1)
+                # Schur-complement diagonals. LOWER reads a contiguous column A[j+1:n, j-1]; UPPER would
+                # read the ROW A[j-1, j:n], strided by lda — a scalar gather where the lower form
+                # vectorises, run O(n²/2) times. Measured on Zen4 (whole-factorization cost of this loop
+                # alone): n=48 col 2.26 µs vs row 2.74 µs, n=64 3.18 vs 4.40 — i.e. 5.1% and 7.2% of the
+                # op, against gate deficits of 5.7% and 8.1%. It was the whole miss.
+                # The row is free, though: it is exactly what the previous column just computed, and that
+                # value passes through scratch on its way into A. `rowb` keeps it contiguous, so UPPER
+                # reads unit-stride like LOWER does. No staleness: rowb is refreshed at the end of every
+                # column, and the pivot swap for column j runs BEFORE column j's update, so the cached
+                # row is always post-swap.
+                # The `work[n+i] = real(A[i,i]) - work[i]` half MUST stay fused with the accumulate: A[i,i]
+                # is a strided diagonal read, and splitting this into two passes over i traverses it twice.
+                # Measured cost of getting that wrong: U n=64 0.921 → 0.852, n=96 1.007 → 0.899 — a
+                # regression on sizes the row cache never even touches. So the branch is hoisted out of
+                # the i-loop and each variant keeps the fusion.
+                if j > k
+                    if LOWER
+                        for i in j:n
+                            work[i] += abs2(A[i, j - 1]); work[n + i] = real(A[i, i]) - work[i]
                         end
-                        _gemv!(
-                            false, false, n - j, jk, -one(T), view(A, (j + 1):n, k:(j - 1)),
-                            view(scr, 1:jk), 1, one(T), view(A, (j + 1):n, j), 1
-                        )
+                    elseif usebuf
+                        for i in j:n
+                            work[i] += abs2(rowb[i]); work[n + i] = real(A[i, i]) - work[i]
+                        end
+                    else
+                        for i in j:n
+                            work[i] += abs2(A[j - 1, i]); work[n + i] = real(A[i, i]) - work[i]
+                        end
                     end
+                else
+                    for i in j:n
+                        work[n + i] = real(A[i, i]) - work[i]
+                    end
+                end
+                if j > 1
+                    pvt = j; mx = work[n + j]
                     for i in (j + 1):n
-                        A[i, j] *= invajj
+                        (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
                     end
-                else
-                    L = n - j
-                    if jk > 0                               # A[j,j+1:n] −= conj(A[k:j-1,j])ᵀ·A[k:j-1,j+1:n]
-                        for t in 1:jk
-                            scr[t] = conj(A[k + t - 1, j])
-                        end
-                        if L <= _PSTRF_FUSE_MAXL          # row stays L1-hot ⇒ fuse (no gather pass)
+                    ajj = work[n + pvt]
+                    if ajj <= dstop || isnan(ajj)
+                        A[j, j] = T(ajj)
+                        LOWER && _pstrf_apply_swaps_lower!(A, swj, swp, nsw, k - 1)   # flush before bailing
+                        return j - 1                            # rank-deficient: stop at numerical rank
+                    end
+                end
+                if j != pvt
+                    if LOWER                                    # leading cols 1:k-1 deferred to the panel flush
+                        _pstrf_swap_lower!(A, j, pvt, n, k)
+                        nsw += 1; swj[nsw] = j; swp[nsw] = pvt
+                    else
+                        _pstrf_swap_upper!(A, j, pvt, n)
+                    end
+                    work[pvt] = work[j]
+                    piv[j], piv[pvt] = piv[pvt], piv[j]
+                end
+                ajj = sqrt(ajj); A[j, j] = T(ajj)
+                if j < n
+                    jk = j - k                                  # panel columns already factored (k:j-1)
+                    invajj = one(R) / ajj
+                    if LOWER
+                        if jk > 0                               # A[j+1:n,j] −= A[j+1:n,k:j-1]·conj(A[j,k:j-1])
+                            for t in 1:jk
+                                scr[t] = conj(A[j, k + t - 1])
+                            end
                             _gemv!(
-                                true, false, jk, L, one(T), view(A, k:(j - 1), (j + 1):n),
-                                view(scr, 1:jk), 1, zero(T), view(scr, (nb + 1):(nb + L)), 1
+                                false, false, n - j, jk, -one(T), view(A, (j + 1):n, k:(j - 1)),
+                                view(scr, 1:jk), 1, one(T), view(A, (j + 1):n, j), 1
                             )
-                            if usebuf
+                        end
+                        for i in (j + 1):n
+                            A[i, j] *= invajj
+                        end
+                    else
+                        L = n - j
+                        if jk > 0                               # A[j,j+1:n] −= conj(A[k:j-1,j])ᵀ·A[k:j-1,j+1:n]
+                            for t in 1:jk
+                                scr[t] = conj(A[k + t - 1, j])
+                            end
+                            if L <= _PSTRF_FUSE_MAXL          # row stays L1-hot ⇒ fuse (no gather pass)
+                                _gemv!(
+                                    true, false, jk, L, one(T), view(A, k:(j - 1), (j + 1):n),
+                                    view(scr, 1:jk), 1, zero(T), view(scr, (nb + 1):(nb + L)), 1
+                                )
+                                if usebuf
+                                    for c in 1:L
+                                        v = (A[j, j + c] - scr[nb + c]) * invajj
+                                        A[j, j + c] = v; rowb[j + c] = v
+                                    end
+                                else
+                                    for c in 1:L
+                                        A[j, j + c] = (A[j, j + c] - scr[nb + c]) * invajj
+                                    end
+                                end
+                            else                              # row spills L1 ⇒ split: gather, gemv, pure store
                                 for c in 1:L
-                                    v = (A[j, j + c] - scr[nb + c]) * invajj
-                                    A[j, j + c] = v; rowb[j + c] = v
+                                    scr[nb + c] = A[j, j + c]
+                                end
+                                _gemv!(
+                                    true, false, jk, L, -one(T), view(A, k:(j - 1), (j + 1):n),
+                                    view(scr, 1:jk), 1, one(T), view(scr, (nb + 1):(nb + L)), 1
+                                )
+                                if usebuf
+                                    for c in 1:L
+                                        v = scr[nb + c] * invajj
+                                        A[j, j + c] = v; rowb[j + c] = v
+                                    end
+                                else
+                                    for c in 1:L
+                                        A[j, j + c] = scr[nb + c] * invajj
+                                    end
+                                end
+                            end
+                        else                              # first column of a panel: no history to apply
+                            if usebuf
+                                for c in (j + 1):n
+                                    v = A[j, c] * invajj
+                                    A[j, c] = v; rowb[c] = v
                                 end
                             else
-                                for c in 1:L
-                                    A[j, j + c] = (A[j, j + c] - scr[nb + c]) * invajj
+                                for c in (j + 1):n
+                                    A[j, c] *= invajj
                                 end
-                            end
-                        else                              # row spills L1 ⇒ split: gather, gemv, pure store
-                            for c in 1:L
-                                scr[nb + c] = A[j, j + c]
-                            end
-                            _gemv!(
-                                true, false, jk, L, -one(T), view(A, k:(j - 1), (j + 1):n),
-                                view(scr, 1:jk), 1, one(T), view(scr, (nb + 1):(nb + L)), 1
-                            )
-                            if usebuf
-                                for c in 1:L
-                                    v = scr[nb + c] * invajj
-                                    A[j, j + c] = v; rowb[j + c] = v
-                                end
-                            else
-                                for c in 1:L
-                                    A[j, j + c] = scr[nb + c] * invajj
-                                end
-                            end
-                        end
-                    else                              # first column of a panel: no history to apply
-                        if usebuf
-                            for c in (j + 1):n
-                                v = A[j, c] * invajj
-                                A[j, c] = v; rowb[c] = v
-                            end
-                        else
-                            for c in (j + 1):n
-                                A[j, c] *= invajj
                             end
                         end
                     end
                 end
             end
+            LOWER && _pstrf_apply_swaps_lower!(A, swj, swp, nsw, k - 1)   # batched leading row swaps
+            r0 = k + jb                                          # rank-jb BLAS-3 trailing update
+            if r0 <= n
+                _pstrf_trailing!(
+                    view(A, r0:n, r0:n),
+                    LOWER ? view(A, r0:n, k:(k + jb - 1)) : view(A, k:(k + jb - 1), r0:n),
+                    Val(LOWER), T
+                )
+            end
         end
-        LOWER && _pstrf_apply_swaps_lower!(A, swj, swp, nsw, k - 1)   # batched leading row swaps
-        r0 = k + jb                                          # rank-jb BLAS-3 trailing update
-        if r0 <= n
-            _pstrf_trailing!(
-                view(A, r0:n, r0:n),
-                LOWER ? view(A, r0:n, k:(k + jb - 1)) : view(A, k:(k + jb - 1), r0:n),
-                Val(LOWER), T
-            )
-        end
+        return n
     end
-    return n
 end
 
 """
@@ -319,112 +332,133 @@ function pstrf!(A::AbstractMatrix{T}, piv::AbstractVector{<:Integer}, tol::Real;
     @inbounds for i in 1:n
         piv[i] = i
     end
-    work = _pstrf_work(T, n)                                     # work[1:n] running dot products; [n+1:2n] scratch
-    # MUST be zeroed: the unblocked path below reads work[i] at j=1 (`work[n+i] = real(A[i,i]) - work[i]`)
-    # before ever writing it, so the running dot products have to START at zero. The owned buffer carries
-    # the previous call's values. (The blocked driver resets work[k:n] per panel, but this is O(n) against
-    # an O(n³) factorization — one fill! covers both paths.)
-    fill!(work, zero(R))
-    # Initial pivot = largest diagonal.
-    pvt = 1; ajj = real(@inbounds A[1, 1])
-    @inbounds for i in 2:n
-        d = real(A[i, i]); (d > ajj) && (ajj = d; pvt = i)
-    end
-    if ajj <= zero(R) || isnan(ajj)
-        @inbounds A[1, 1] = T(ajj)
-        return A, piv, 0, 1
-    end
-    dstop = tol < 0 ? n * eps(R) * ajj : R(tol)
-    # Blocked BLAS-3 path (dpstrf) once there is a trailing block worth a syrk; the unblocked kernel
-    # below stays for small n and for non-BLAS element types (generic/AD, where syrk!/gemv! have no
-    # SIMD path anyway). Identical results — the blocked form only defers the same updates.
-    # nb is CAPPED at n so small matrices take the same driver with a single panel and no trailing syrk:
-    # that still replaces the unblocked kernel's scalar rank-(j-1) column update with the SIMD `_gemv!`
-    # (identical algorithm — with k=1 the panel spans the full history and the swap deferral is a no-op).
-    nb = min(_pstrf_nb(n), n)
-    if T <: Union{BlasReal, BlasComplex}
-        scr = _pstrf_scr(T, nb + 2n)        # +n: UPPER contiguous row cache (see rowb in _pstrf_blocked!)
-        rank = if lower
-            _pstrf_blocked!(A, piv, work, scr, dstop, pvt, ajj, nb, Val(true))
+    # Arena borrows (arena.jl), not owned fields. `work[1:n]` holds the running dot products and
+    # `work[n+1:2n]` the Schur-complement diagonals; `scr` is the blocked driver's panel scratch
+    # (nb + 2n: the gathered gemv x, the contiguous output row, and the UPPER row cache).
+    #
+    # THE ANTI-ALIASING SPLIT IS NOW AUTOMATIC. `work` is REAL-typed and `scr` element-typed, and they
+    # used to be reached through two DIFFERENT owner objects (`_l3ws(real(T))` for `pstrfv` vs
+    # `_l3ws(T)` for `pstrfs`) for one reason only: on a complex A a single owner would have handed out
+    # overlapping storage. Two separate borrows from the bump pointer are disjoint by construction, so
+    # the split needs no owner trick and no comment at the field.
+    #
+    # ESCAPE AUDIT (@scope arn): no handle leaves this block. `work` and `scr` are passed DOWN into
+    # `_pstrf_blocked!` (this file), which slices them (`view(scr, 1:jk)`, `view(scr, nb+1:nb+L)`,
+    # `rowb`) and hands those slices to `_gemv!` as the x/y operands — a BLAS-2 kernel that reads,
+    # writes and returns, retaining nothing — and to nothing else; `_pstrf_swap_lower!`/`_upper!`,
+    # `_pstrf_apply_swaps_lower!` and `_pstrf_trailing!` (syrk!/herk!) never see either buffer. The
+    # unblocked path below touches `work` only in its own loops. There is no closure here, and every
+    # `return` inside the block returns `(A, piv, rank::Int, info::Int)` — `A` and `piv` are the
+    # caller's own arrays, so no borrowed handle is in the tuple.
+    @scope arn begin
+        work = borrow!(arn, R, 2n)                               # work[1:n] running dot products; [n+1:2n] scratch
+        # MUST be zeroed: the unblocked path below reads work[i] at j=1 (`work[n+i] = real(A[i,i]) - work[i]`)
+        # before ever writing it, so the running dot products have to START at zero. Arena scratch is
+        # uninitialized (as the owned buffer was stale), so the fill is required either way. (The blocked
+        # driver resets work[k:n] per panel, but this is O(n) against an O(n³) factorization — one fill!
+        # covers both paths.)
+        fill!(work, zero(R))
+        # Initial pivot = largest diagonal.
+        pvt = 1; ajj = real(@inbounds A[1, 1])
+        @inbounds for i in 2:n
+            d = real(A[i, i]); (d > ajj) && (ajj = d; pvt = i)
+        end
+        if ajj <= zero(R) || isnan(ajj)
+            @inbounds A[1, 1] = T(ajj)
+            return A, piv, 0, 1
+        end
+        dstop = tol < 0 ? n * eps(R) * ajj : R(tol)
+        # Blocked BLAS-3 path (dpstrf) once there is a trailing block worth a syrk; the unblocked kernel
+        # below stays for small n and for non-BLAS element types (generic/AD, where syrk!/gemv! have no
+        # SIMD path anyway). Identical results — the blocked form only defers the same updates.
+        # nb is CAPPED at n so small matrices take the same driver with a single panel and no trailing syrk:
+        # that still replaces the unblocked kernel's scalar rank-(j-1) column update with the SIMD `_gemv!`
+        # (identical algorithm — with k=1 the panel spans the full history and the swap deferral is a no-op).
+        nb = min(_pstrf_nb(n), n)
+        if T <: Union{BlasReal, BlasComplex}
+            scr = borrow!(arn, T, nb + 2n)  # +n: UPPER contiguous row cache (see rowb in _pstrf_blocked!)
+            rank = if lower
+                _pstrf_blocked!(A, piv, work, scr, dstop, pvt, ajj, nb, Val(true))
+            else
+                _pstrf_blocked!(A, piv, work, scr, dstop, pvt, ajj, nb, Val(false))
+            end
+            return A, piv, rank, (rank == n ? 0 : 1)
+        end
+        rank = n
+        @inbounds if lower
+            for j in 1:n
+                for i in j:n                                        # update Schur-complement diagonals
+                    (j > 1) && (work[i] += abs2(A[i, j - 1]))
+                    work[n + i] = real(A[i, i]) - work[i]
+                end
+                if j > 1
+                    pvt = j; mx = work[n + j]
+                    for i in (j + 1):n
+                        (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
+                    end
+                    ajj = work[n + pvt]
+                    if ajj <= dstop || isnan(ajj)
+                        A[j, j] = T(ajj); rank = j - 1; break
+                    end
+                end
+                if j != pvt
+                    _pstrf_swap_lower!(A, j, pvt, n)
+                    work[pvt] = work[j]
+                    piv[j], piv[pvt] = piv[pvt], piv[j]
+                end
+                ajj = sqrt(ajj); A[j, j] = T(ajj)
+                if j < n
+                    for l in 1:(j - 1)                                  # A[j+1:n,j] −= A[j+1:n,1:j-1]·conj(A[j,1:j-1])
+                        ajl = conj(A[j, l])
+                        for i in (j + 1):n
+                            A[i, j] -= A[i, l] * ajl
+                        end
+                    end
+                    invajj = one(R) / ajj
+                    for i in (j + 1):n
+                        A[i, j] *= invajj
+                    end
+                end
+            end
         else
-            _pstrf_blocked!(A, piv, work, scr, dstop, pvt, ajj, nb, Val(false))
+            for j in 1:n
+                for i in j:n
+                    (j > 1) && (work[i] += abs2(A[j - 1, i]))
+                    work[n + i] = real(A[i, i]) - work[i]
+                end
+                if j > 1
+                    pvt = j; mx = work[n + j]
+                    for i in (j + 1):n
+                        (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
+                    end
+                    ajj = work[n + pvt]
+                    if ajj <= dstop || isnan(ajj)
+                        A[j, j] = T(ajj); rank = j - 1; break
+                    end
+                end
+                if j != pvt
+                    _pstrf_swap_upper!(A, j, pvt, n)
+                    work[pvt] = work[j]
+                    piv[j], piv[pvt] = piv[pvt], piv[j]
+                end
+                ajj = sqrt(ajj); A[j, j] = T(ajj)
+                if j < n
+                    for c in (j + 1):n                                  # A[j,j+1:n] −= conj(A[1:j-1,j])·A[1:j-1,j+1:n]
+                        s = zero(T)
+                        for l in 1:(j - 1)
+                            s += conj(A[l, j]) * A[l, c]
+                        end
+                        A[j, c] -= s
+                    end
+                    invajj = one(R) / ajj
+                    for c in (j + 1):n
+                        A[j, c] *= invajj
+                    end
+                end
+            end
         end
         return A, piv, rank, (rank == n ? 0 : 1)
     end
-    rank = n
-    @inbounds if lower
-        for j in 1:n
-            for i in j:n                                        # update Schur-complement diagonals
-                (j > 1) && (work[i] += abs2(A[i, j - 1]))
-                work[n + i] = real(A[i, i]) - work[i]
-            end
-            if j > 1
-                pvt = j; mx = work[n + j]
-                for i in (j + 1):n
-                    (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
-                end
-                ajj = work[n + pvt]
-                if ajj <= dstop || isnan(ajj)
-                    A[j, j] = T(ajj); rank = j - 1; break
-                end
-            end
-            if j != pvt
-                _pstrf_swap_lower!(A, j, pvt, n)
-                work[pvt] = work[j]
-                piv[j], piv[pvt] = piv[pvt], piv[j]
-            end
-            ajj = sqrt(ajj); A[j, j] = T(ajj)
-            if j < n
-                for l in 1:(j - 1)                                  # A[j+1:n,j] −= A[j+1:n,1:j-1]·conj(A[j,1:j-1])
-                    ajl = conj(A[j, l])
-                    for i in (j + 1):n
-                        A[i, j] -= A[i, l] * ajl
-                    end
-                end
-                invajj = one(R) / ajj
-                for i in (j + 1):n
-                    A[i, j] *= invajj
-                end
-            end
-        end
-    else
-        for j in 1:n
-            for i in j:n
-                (j > 1) && (work[i] += abs2(A[j - 1, i]))
-                work[n + i] = real(A[i, i]) - work[i]
-            end
-            if j > 1
-                pvt = j; mx = work[n + j]
-                for i in (j + 1):n
-                    (work[n + i] > mx) && (mx = work[n + i]; pvt = i)
-                end
-                ajj = work[n + pvt]
-                if ajj <= dstop || isnan(ajj)
-                    A[j, j] = T(ajj); rank = j - 1; break
-                end
-            end
-            if j != pvt
-                _pstrf_swap_upper!(A, j, pvt, n)
-                work[pvt] = work[j]
-                piv[j], piv[pvt] = piv[pvt], piv[j]
-            end
-            ajj = sqrt(ajj); A[j, j] = T(ajj)
-            if j < n
-                for c in (j + 1):n                                  # A[j,j+1:n] −= conj(A[1:j-1,j])·A[1:j-1,j+1:n]
-                    s = zero(T)
-                    for l in 1:(j - 1)
-                        s += conj(A[l, j]) * A[l, c]
-                    end
-                    A[j, c] -= s
-                end
-                invajj = one(R) / ajj
-                for c in (j + 1):n
-                    A[j, c] *= invajj
-                end
-            end
-        end
-    end
-    return A, piv, rank, (rank == n ? 0 : 1)
 end
 
 # Convenience: allocate piv (LinearAlgebra.LAPACK.pstrf!-style return).

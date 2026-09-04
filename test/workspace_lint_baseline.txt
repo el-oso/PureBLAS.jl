@@ -36,21 +36,31 @@
 L3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
 L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
 
-# --- Higham-Hager estimator #2 (trsen.jl:402), DECLARED callback edge. `_lacn2_estimate` claims lacn2*
-# once at entry via `_lacn2e_bufs` (trsen.jl:415 — the ONLY call site of that accessor, and it is the only
-# claimant of lacn2x/lacn2v/lacn2s) and then drives its `apply!`/`applyf` callback in a loop. The cycle is
-# the declared edge closing back on the caller, an artifact of merged-name attribution: `_bodies` keeps
-# attributing after the closure's `end`, so each closure's body absorbs the enclosing routine's own
-# `_lacn2_estimate(…)` call (trrfs.jl:141, trsen.jl:569/630 — grep confirms those are the only three).
-# The REAL callback bodies are the safety argument, and they are small enough to read whole:
-#   applyf (trrfs.jl:127) → trsv! + a scalar scaling loop;
-#   apply! (trsen.jl:560/622) → copyto! + _dtrsyl!/_ztrsyl! + copyto!.
-# None of trsv!/_dtrsyl!/_ztrsyl! calls `_lacn2_estimate` (there is no fourth call site), so no lacn2*
-# field is ever re-claimed inside the live claim. RE-READ THIS if a new caller of `_lacn2_estimate`
-# appears, or if either closure grows a call — that is exactly what the declared edge exists to catch.
-L3Workspace.lacn2s  _lacn2_estimate -> _lacn2_estimate
-L3Workspace.lacn2v  _lacn2_estimate -> _lacn2_estimate
-L3Workspace.lacn2x  _lacn2_estimate -> _lacn2_estimate
+# --- 2026-09-04, stage 2 of the arena conversion: the three
+#       L3Workspace.lacn2{s,v,x}  _lacn2_estimate -> _lacn2_estimate
+# lines are GONE, and the reason is a change of MECHANISM, not a re-judgement of the old one.
+#
+# WHY THEY EXISTED (re-derived from the scanner, not copied from the entry they replace): a pair is
+# emitted when `fld ∈ claims[f]` and `fld ∈ claims[g]` for some `g ∈ reach(f)`. `_lacn2_estimate`
+# claimed lacn2x/lacn2v/lacn2s because its body called `_lacn2e_bufs`, and `g == f` was reachable
+# because `_CALLBACK_EDGES` declares `_lacn2_estimate -> apply!/applyf` while merged-name attribution
+# puts the callers' own `_lacn2_estimate(…)` calls inside those closures' bodies. Take away either half
+# and the pair cannot be produced.
+#
+# WHY THEY ARE GONE: the first half. `_lacn2_estimate` (trsen.jl) now opens an `@scope` and takes
+# `borrow!(arn, V, n)` ×2 + `borrow!(arn, Int, n)` from the arena, so its body names no `L3Workspace`
+# field at all and `claims["_lacn2_estimate"]` is empty. The `lacn2*` fields and `_lacn2e_bufs` still sit
+# in workspace.jl awaiting the serial field-deletion pass, but nothing CALLS the accessor, so there is no
+# claimant left to pair with. The DECLARED EDGE ITSELF STAYS — `_CALLBACK_EDGES` still names
+# `apply!`/`applyf`, and it must, because it is what would catch a future field re-claim through the
+# callback; only the finding it produced is gone.
+#
+# WHAT REPLACES THE SAFETY ARGUMENT, since the lint no longer makes one here: the arena's hazard is a
+# HANDLE outliving its `@scope`, which is a different question from a field being re-claimed, and
+# `@scope` cannot see it (it checks the TOKEN). It is audited by reading, at each converted site, and the
+# audit is written there: trsen.jl (`_lacn2_estimate`, and the `scref` scope that must span the estimate
+# AND the `sep = …` read) and trrfs.jl (`wt` is CAPTURED by `applyf`). RE-READ THOSE if a new caller of
+# `_lacn2_estimate` appears or either closure grows a call.
 
 # --- 2026-09-03: the three `lacn*  _lacn2! -> _lacn2!` lines are GONE, and their own reason said why.
 # It read: "the short-form `applyop!(x, adj) = …` defs at gecon.jl:178/227/259 absorb the

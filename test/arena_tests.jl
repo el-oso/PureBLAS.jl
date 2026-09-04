@@ -100,6 +100,27 @@ end
         @test a.depth == 0
     end
 
+    # The fold lands on the HIGH-WATER DEMAND, not on the sum of slab capacities. Summing capacities
+    # compounds `_arena_grow!`'s doubling into the permanent size: slab S, a call needing S+1 grows to 2S
+    # and coalesces to 3S; the next one-byte overflow of 3S grows to 6S and coalesces to 9S, and so on
+    # without bound. Drive exactly that pattern — a series of borrows each just over the slab held — and
+    # assert the resulting slab stays within a small factor of what was actually asked for.
+    begin
+        a = P._arena()
+        for _ in 1:6
+            want = length(a.slabs[1]) + 8
+            P.@scope s begin
+                v = P.borrow!(s, UInt8, want)
+                v[1] = 0x01
+                v[end] = 0x02
+            end
+        end
+        cap = length(a.slabs[1])
+        @test length(a.slabs) == 1
+        @test cap >= a.high                       # it must still cover the peak demand
+        @test cap <= 4 * a.high                   # …without the geometric blow-up (was 3^k of it)
+    end
+
     # Nested scopes: the inner rewind must not release the outer's borrows.
     P.@scope outer begin
         A = P.borrow!(outer, Float64, 32, 32)
@@ -234,6 +255,44 @@ end
         msg = expansion_error(leaky)
         @test occursin("escapes", msg)
     end
+
+    # (3) a borrowed HANDLE returned from the block. The token checks above say nothing about this — the
+    # handle points into bytes the scope rewinds on exit, so the caller reads scratch the next call
+    # overwrites. Rejected in VALUE POSITION only: `return A`, a tuple containing it, or the block's tail.
+    for escaped in (
+            :(
+                PureBLAS.@scope s begin
+                    A = PureBLAS.borrow!(s, Float64, 4, 4)
+                    return A
+                end
+            ),
+            :(
+                PureBLAS.@scope s begin
+                    A = PureBLAS.borrow!(s, Float64, 4, 4)
+                    return (A, 1)
+                end
+            ),
+            :(
+                PureBLAS.@scope s begin
+                    A = PureBLAS.borrow!(s, Float64, 4, 4)
+                    A
+                end
+            ),
+        )
+        msg = expansion_error(escaped)
+        @test occursin("borrowed handle", msg)
+    end
+
+    # …and the NARROWNESS is the point: reading THROUGH a handle and returning the value is the normal
+    # way to use one, and must keep expanding.
+    function reads_through()
+        P.@scope s begin
+            A = P.borrow!(s, Float64, 4, 4)
+            fill!(A, 3.0)
+            return sum(A)
+        end
+    end
+    @test reads_through() == 48.0
 
     # A legal block must still expand and run.
     P.@scope s begin

@@ -97,14 +97,22 @@ end
 # Pivoting is a correctness boundary — do not simplify.
 function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     _base = eltype(A) <: BlasComplex ? _CGETF2_BASE : _GETF2_BASE            # complex base is wider (rank-2)
-    if pb > _base && A isa StridedMatrix && stride(A, 1) == 1 &&              # wide → BLAS-3 split (generic:
+    # `_strided1`, NOT the inline `A isa StridedMatrix && stride(A,1)==1`. `StridedMatrix` is a CLOSED
+    # union that `PtrMatrix` is not in and cannot join, and `getrf!` is handed a `PtrMatrix` by every
+    # C-ABI entry — `{s,d,c,z}getrf_64_`, `dgesv_64_`, and gesvx.jl's shim — while `_getrf_core!` slices
+    # this panel out of it with a `(range, range)` view, which stays a `PtrMatrix`. All THREE gates below
+    # failed together for those callers, so the panel fell past the BLAS-3 split AND both SIMD kernels to
+    # the scalar tail underneath: scalar argmax, scalar row swap, scalar column scale, on every Mode-1 /
+    # LBT `getrf`. Nothing failed and no gate cell moved, because the sweep never calls through the
+    # pointer container. See kb `strided-gates-drop-pointer-operands-to-scalar`.
+    if pb > _base && _strided1(A) &&                                          # wide → BLAS-3 split (generic:
             (eltype(A) === Float64 || eltype(A) <: BlasComplex)               # rides trsm!/gemm!, incl. complex)
         return _getf2_blocked!(A, mp, pb, roff, ipiv, ioff)
     end
-    if A isa StridedMatrix{Float64} && stride(A, 1) == 1
+    if _strided1(A) && eltype(A) === Float64
         return GC.@preserve A _getf2_simd!(pointer(A), stride(A, 2), mp, pb, roff, ipiv, ioff)
     end
-    if A isa StridedMatrix && stride(A, 1) == 1 && eltype(A) <: BlasComplex
+    if _strided1(A) && eltype(A) <: BlasComplex
         return GC.@preserve A _cgetf2_simd!(pointer(A), stride(A, 2), mp, pb, roff, ipiv, ioff)
     end
     info = 0
@@ -375,7 +383,11 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
-    if A isa StridedMatrix{Float64} && _lu_needs_pad(A, m)   # factor in a non-conflicting (ld=m+8) scratch
+    # `_strided1(A) && T === Float64` rather than `A isa StridedMatrix{Float64}`: same reason as `_getf2!`
+    # above — the C-ABI hands this a `PtrMatrix{Float64}`, which failed the `isa` and so skipped the pad
+    # entirely, factoring straight onto a 512-aliased leading dimension for m >= 512. `_strided1`
+    # short-circuits before any `stride` call, preserving the property the original guard was picked for.
+    if T === Float64 && _strided1(A) && _lu_needs_pad(A, m)   # factor in a non-conflicting (ld=m+8) scratch
         R = m + 8
         b = _LU_PAD[]
         (size(b, 1) < R || size(b, 2) < n) && (b = _LU_PAD[] = Matrix{Float64}(undef, R, n))
@@ -443,7 +455,7 @@ const _CLU_PAD32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
 @inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64
 @inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
-    m >= 256 && A isa StridedMatrix && stride(A, 1) == 1 && (stride(A, 2) * sizeof(T)) % 4096 == 0
+    m >= 256 && _strided1(A) && (stride(A, 2) * sizeof(T)) % 4096 == 0   # `_strided1`: see `_getf2!` above
 
 # Complex LU (zgetrf): identical structure — no conj anywhere in L·U. `_getf2!`'s rank-2 SIMD panel pivots
 # on |·| (cabs1 = LAPACK izamax) and divides by the complex pivot correctly; `_getrf_core!` rides complex

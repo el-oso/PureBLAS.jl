@@ -901,24 +901,38 @@ function _sytrf_blocked_lower!(
         A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int, herm::Bool = false
     ) where {T}
     n = size(A, 1)
-    W, xs = _sytrf_work(T, n, nb)
-    info = 0
-    k = 1
-    @inbounds while k <= n
-        if k <= n - nb
-            kb, iinfo = herm ? _lahef_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb) :
-                _lasyf_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb)
-        else
-            iinfo = _sytf2_lower!(view(A, k:n, k:n), view(ipiv, k:n), herm)
-            kb = n - k + 1
+    # Arena borrows (arena.jl), not the owned `sylw` field: `W` is the dlasyf panel (n×nb) and `xs` the
+    # contiguous gather of a W ROW for the panel gemv. The `ld` IS load-bearing and is reproduced with
+    # `_offway_ld`, verbatim the rule the field carried (workspace.jl:479-480): W's columns are the
+    # trailing gemm's B operand and the panel gemv's y, both stride-sensitive, so the leading dimension
+    # is kept off the L1 quarter-way stride. Both are hoisted above the panel loop below — one borrow of
+    # each per factorization, not per panel. No `fill!`: every element read is written by the
+    # copy-then-gemv of the same step, exactly as with the field.
+    # NOTHING ESCAPES: `W`/`xs` go only to `_lasyf_lower!`/`_lahef_lower!`, which use them as scratch and
+    # forward slices onward to `_gemv!`, `_lasyf_diag!`(→`syr2k!`), `her2k!` and `_gemm_core!`. Every one
+    # of those writes through its arguments and returns; none stores a handle in a field, a global or a
+    # closure, and neither panel returns W or xs (both return `(kb, info)`, plain Ints).
+    @scope arn begin
+        W = borrow!(arn, T, n, nb, _offway_ld(n, T))
+        xs = borrow!(arn, T, nb)
+        info = 0
+        k = 1
+        @inbounds while k <= n
+            if k <= n - nb
+                kb, iinfo = herm ? _lahef_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb) :
+                    _lasyf_lower!(view(A, k:n, k:n), view(ipiv, k:n), W, xs, nb)
+            else
+                iinfo = _sytf2_lower!(view(A, k:n, k:n), view(ipiv, k:n), herm)
+                kb = n - k + 1
+            end
+            info == 0 && iinfo > 0 && (info = iinfo + k - 1)
+            for j in k:(k + kb - 1)
+                ipiv[j] = ipiv[j] > 0 ? ipiv[j] + k - 1 : ipiv[j] - k + 1
+            end
+            k += kb
         end
-        info == 0 && iinfo > 0 && (info = iinfo + k - 1)
-        for j in k:(k + kb - 1)
-            ipiv[j] = ipiv[j] > 0 ? ipiv[j] + k - 1 : ipiv[j] - k + 1
-        end
-        k += kb
+        return info
     end
-    return info
 end
 
 # Hermitian uplo='U' panel (zlahef upper). Same W convention as `_lahef_lower!` (unconjugated; see its
@@ -1103,21 +1117,28 @@ function _sytrf_blocked_upper!(
         A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int, herm::Bool = false
     ) where {T}
     n = size(A, 1)
-    W, xs = _sytrf_work(T, n, nb)
-    info = 0
-    k = n
-    @inbounds while k >= 1
-        if k > nb
-            kb, iinfo = herm ? _lahef_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb) :
-                _lasyf_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb)
-        else
-            iinfo = _sytf2_upper!(view(A, 1:k, 1:k), ipiv, herm)
-            kb = k
+    # Same two borrows, same `_offway_ld` reasoning, as `_sytrf_blocked_lower!` — see its comment.
+    # NOTHING ESCAPES: `W`/`xs` reach only `_lasyf_upper!`/`_lahef_upper!` and, through them, `_gemv!`,
+    # `_lasyf_diag!`(→`syr2k!`), `her2k!` and `_gemm_core!`; all write through and return, none retains a
+    # handle, and the panels return `(kb, info)`.
+    @scope arn begin
+        W = borrow!(arn, T, n, nb, _offway_ld(n, T))
+        xs = borrow!(arn, T, nb)
+        info = 0
+        k = n
+        @inbounds while k >= 1
+            if k > nb
+                kb, iinfo = herm ? _lahef_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb) :
+                    _lasyf_upper!(view(A, 1:k, 1:k), ipiv, W, xs, nb)
+            else
+                iinfo = _sytf2_upper!(view(A, 1:k, 1:k), ipiv, herm)
+                kb = k
+            end
+            info == 0 && iinfo > 0 && (info = iinfo)      # NO offset (leading sub-problem)
+            k -= kb
         end
-        info == 0 && iinfo > 0 && (info = iinfo)          # NO offset (leading sub-problem)
-        k -= kb
+        return info
     end
-    return info
 end
 
 # PDM tier: DERIVE — and unusually for this file, the formula is over a PROBLEM parameter (n) with NO

@@ -194,8 +194,12 @@ function sytri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("sytri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytri!: uplo must be 'L' or 'U'"))
-    work = _sytri_work(eltype(A), n)
-    return uplo == 'L' ? _sytri_lower!(A, ipiv, false, work) : _sytri_upper!(A, ipiv, false, work)
+    # One arena borrow of length n, threaded down as an explicit argument (both engines take `work`),
+    # so the only handle that leaves this scope is `A` — the matrix the caller owns.
+    @scope arn begin
+        work = borrow!(arn, eltype(A), n)
+        return uplo == 'L' ? _sytri_lower!(A, ipiv, false, work) : _sytri_upper!(A, ipiv, false, work)
+    end
 end
 
 """
@@ -211,8 +215,10 @@ function hetri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     length(ipiv) == n || throw(DimensionMismatch("hetri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetri!: uplo must be 'L' or 'U'"))
     herm = eltype(A) <: Complex
-    work = _sytri_work(eltype(A), n)
-    return uplo == 'L' ? _sytri_lower!(A, ipiv, herm, work) : _sytri_upper!(A, ipiv, herm, work)
+    @scope arn begin                       # same single borrow as sytri! — one field, one role, two entries
+        work = borrow!(arn, eltype(A), n)
+        return uplo == 'L' ? _sytri_lower!(A, ipiv, herm, work) : _sytri_upper!(A, ipiv, herm, work)
+    end
 end
 
 # ── one-shot solve  A·X = B  (factor + solve) ───────────────────────────────────────────────────────

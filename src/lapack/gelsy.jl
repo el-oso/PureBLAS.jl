@@ -122,32 +122,36 @@ function tzrzf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: BlasFl
     # zlatrz conjugation dance (identity on ℝ, so the real path is dlatrz unchanged): conjugate the
     # reflector row, generate on conj(pivot), store conj(τ) and conj(β); the right-apply then uses the
     # raw larfg τ (= conj(stored τ)) with dlarz/zlarz's ZGERC-conjugated essential.
-    buf = _tzrzf_buf(T, L + 1)                           # (z)larfg on the (non-contiguous) length-(L+1) row
-    @inbounds for i in m:-1:1
-        buf[1] = conj(A[i, i])
-        for l in 1:L
-            buf[l + 1] = conj(A[i, m + l])
-        end
-        β, τ = _larfg!(buf)                              # H_i annihilates A[i, m+1:n]; β real, τ = τ_larfg
-        for l in 1:L
-            A[i, m + l] = buf[l + 1]
-        end          # essential reflector row (conjugated domain)
-        tau[i] = conj(τ); A[i, i] = conj(β)
-        if τ != zero(T) && i > 1                         # apply H_i from the RIGHT to rows 1:i-1 (dlarz 'R')
-            for r in 1:(i - 1)
-                w = A[r, i]
-                for l in 1:L
-                    w += A[r, m + l] * A[i, m + l]
-                end
-                w *= τ
-                A[r, i] -= w
-                for l in 1:L
-                    A[r, m + l] -= w * conj(A[i, m + l])
+    # Borrowed above the `for i in m:-1:1` loop, which is what `@scope` requires: the shape is
+    # loop-invariant (L+1 for every i), so one borrow serves the whole reduction. `buf` never leaves.
+    @scope arn begin
+        buf = borrow!(arn, T, L + 1)                     # (z)larfg on the (non-contiguous) length-(L+1) row
+        @inbounds for i in m:-1:1
+            buf[1] = conj(A[i, i])
+            for l in 1:L
+                buf[l + 1] = conj(A[i, m + l])
+            end
+            β, τ = _larfg!(buf)                          # H_i annihilates A[i, m+1:n]; β real, τ = τ_larfg
+            for l in 1:L
+                A[i, m + l] = buf[l + 1]
+            end      # essential reflector row (conjugated domain)
+            tau[i] = conj(τ); A[i, i] = conj(β)
+            if τ != zero(T) && i > 1                     # apply H_i from the RIGHT to rows 1:i-1 (dlarz 'R')
+                for r in 1:(i - 1)
+                    w = A[r, i]
+                    for l in 1:L
+                        w += A[r, m + l] * A[i, m + l]
+                    end
+                    w *= τ
+                    A[r, i] -= w
+                    for l in 1:L
+                        A[r, m + l] -= w * conj(A[i, m + l])
+                    end
                 end
             end
         end
+        return A, tau
     end
-    return A, tau
 end
 
 # ── apply Z / Zᴴ from an RZ factorization (LAPACK dormrz/zunmrz via the unblocked dormr3/zunmr3) ─────
@@ -220,53 +224,64 @@ function gelsy!(
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
     size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsy!, size(B, 1), max(m, n))
     length(jpvt) >= n || _throw_len_jpvt(:gelsy!, n)
-    tau, xmin, xmax, work = _gelsy_work(T, mn, n)
-    geqp3!(A, jpvt, tau)                                 # A·P = Q·R  (rank-revealing)
-    # ---- effective rank via the incremental condition estimator (dgelsy loop) ----
-    rank = 0
-    if mn > 0 && abs(A[1, 1]) != zero(R)
-        smax = abs(A[1, 1]); smin = smax
-        xmin[1] = one(T); xmax[1] = one(T); rank = 1
-        while rank < mn
-            i = rank + 1
-            sminpr, s1, c1 = _laic1(2, view(xmin, 1:rank), smin, view(A, 1:rank, i), A[i, i])
-            smaxpr, s2, c2 = _laic1(1, view(xmax, 1:rank), smax, view(A, 1:rank, i), A[i, i])
-            smaxpr * rcond <= sminpr || break
-            @inbounds for kk in 1:rank
-                xmin[kk] *= s1; xmax[kk] *= s2
+    # xmin/xmax are SEPARATE borrows, not one buffer: both are live simultaneously across the whole rank
+    # loop, so sharing would be a wrong answer rather than a saving. `tauz` is borrowed later, inside the
+    # same scope, for the same reason it had its own field — `tau` is still read by `_apply_Qh!` after
+    # tauz is filled. Nothing escapes: the four handles die here, `B`/`jpvt` are the caller's, and the
+    # `rank == 0` early return unwinds through the scope's `finally`.
+    @scope arn begin
+        tau = borrow!(arn, T, mn)
+        xmin = borrow!(arn, T, max(mn, 1))
+        xmax = borrow!(arn, T, max(mn, 1))
+        work = borrow!(arn, T, n)
+        geqp3!(A, jpvt, tau)                             # A·P = Q·R  (rank-revealing)
+        # ---- effective rank via the incremental condition estimator (dgelsy loop) ----
+        rank = 0
+        if mn > 0 && abs(A[1, 1]) != zero(R)
+            smax = abs(A[1, 1]); smin = smax
+            xmin[1] = one(T); xmax[1] = one(T); rank = 1
+            while rank < mn
+                i = rank + 1
+                sminpr, s1, c1 = _laic1(2, view(xmin, 1:rank), smin, view(A, 1:rank, i), A[i, i])
+                smaxpr, s2, c2 = _laic1(1, view(xmax, 1:rank), smax, view(A, 1:rank, i), A[i, i])
+                smaxpr * rcond <= sminpr || break
+                @inbounds for kk in 1:rank
+                    xmin[kk] *= s1; xmax[kk] *= s2
+                end
+                xmin[rank + 1] = c1; xmax[rank + 1] = c2
+                smin = sminpr; smax = smaxpr; rank += 1
             end
-            xmin[rank + 1] = c1; xmax[rank + 1] = c2
-            smin = sminpr; smax = smaxpr; rank += 1
         end
-    end
-    if rank == 0                                         # A ≈ 0 ⇒ min-norm solution is 0
-        @inbounds for jc in 1:nrhs, r in 1:n
+        if rank == 0                                     # A ≈ 0 ⇒ min-norm solution is 0
+            @inbounds for jc in 1:nrhs, r in 1:n
+                B[r, jc] = zero(T)
+            end
+            return B, 0
+        end
+        # ---- complete the orthogonal factorization (RZ) when column-rank-deficient ----
+        # EXACT-length borrow: ormrz! derives k = length(tauz) and L = size(A,2) − k, so a longer buffer
+        # would silently change both and corrupt the result. `rank` is fixed by the loop above, so this
+        # borrow is not inside anything that repeats.
+        tauz = borrow!(arn, T, rank)
+        rank < n && tzrzf!(view(A, 1:rank, 1:n), tauz)   # [R11 R12] = [T11 0]·Z
+        # ---- B := Qᴴ·B  (dormqr/zunmqr 'Left','Transpose'/'Conjugate'; geqp3 reflectors untouched by RZ) ----
+        _apply_Qh!(A, tau, view(B, 1:m, :), mn)
+        # ---- solve T11·Y = (Qᴴ·B)[1:rank] ----
+        trsm!(view(B, 1:rank, :), view(A, 1:rank, 1:rank); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
+        @inbounds for jc in 1:nrhs, r in (rank + 1):n
             B[r, jc] = zero(T)
         end
-        return B, 0
-    end
-    # ---- complete the orthogonal factorization (RZ) when column-rank-deficient ----
-    # EXACT-length view: ormrz! derives k = length(tau) and L = size(A,2) − k, so a longer buffer would
-    # silently change both and corrupt the result.
-    tauz = _gelsy_tauz(T, rank)
-    rank < n && tzrzf!(view(A, 1:rank, 1:n), tauz)       # [R11 R12] = [T11 0]·Z
-    # ---- B := Qᴴ·B  (dormqr/zunmqr 'Left','Transpose'/'Conjugate'; geqp3 reflectors untouched by RZ) ----
-    _apply_Qh!(A, tau, view(B, 1:m, :), mn)
-    # ---- solve T11·Y = (Qᴴ·B)[1:rank] ----
-    trsm!(view(B, 1:rank, :), view(A, 1:rank, 1:rank); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
-    @inbounds for jc in 1:nrhs, r in (rank + 1):n
-        B[r, jc] = zero(T)
-    end
-    # ---- B(1:n) := Zᴴ·[Y; 0]  (min-norm lift back through the RZ rotation) ----
-    rank < n && ormrz!('L', T <: Complex ? 'C' : 'T', view(A, 1:rank, 1:n), tauz, view(B, 1:n, :))
-    # ---- undo the column pivoting: X[jpvt[i]] = computed[i] ----
-    @inbounds for jc in 1:nrhs
-        for i in 1:n
-            work[jpvt[i]] = B[i, jc]
+        # ---- B(1:n) := Zᴴ·[Y; 0]  (min-norm lift back through the RZ rotation) ----
+        rank < n && ormrz!('L', T <: Complex ? 'C' : 'T', view(A, 1:rank, 1:n), tauz, view(B, 1:n, :))
+        # ---- undo the column pivoting: X[jpvt[i]] = computed[i] ----
+        @inbounds for jc in 1:nrhs
+            for i in 1:n
+                work[jpvt[i]] = B[i, jc]
+            end
+            for i in 1:n
+                B[i, jc] = work[i]
+            end
         end
-        for i in 1:n
-            B[i, jc] = work[i]
-        end
+        return B, rank
     end
-    return B, rank
 end

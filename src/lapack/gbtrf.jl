@@ -260,201 +260,224 @@ function _gbtrf_blocked!(
     ldabs = stride(AB, 2)                              # NOT 2kl+ku+1: callers may pad
     ld2 = ldabs - 1
     ldw = nb + 1
-    W13, W31, S = _gbtrf_work(T, nb)                   # GKH-owned; W13/W31 arrive zeroed
-    p0 = pointer(AB); p13 = pointer(W13); p31 = pointer(W31); ps = pointer(S)
+    # Arena borrows (arena.jl), not owned fields. The SHAPES AND LDs ARE LOAD-BEARING and are the exact
+    # ones the deleted `_gbtrf_work` fields carried: W13/W31 are (nb+1)×nb with ld = ldw = nb+1, S is
+    # nb×nb with ld = nb, because the views built below — `PtrMatrix(p13, jb, j3, ldw)`,
+    # `PtrMatrix(p31, i3, jb, ldw)`, `PtrMatrix(ps, jb, jb, nb)` — hardcode those strides, so any other
+    # ld silently reads the wrong elements. Hence the explicit `ld` argument on every borrow rather than
+    # the default, even where the default coincides.
+    # W13/W31 MUST ARRIVE ZEROED (the accessor's `fill!`s, which a bump borrow does not do): their
+    # off-triangles have to stay zero across panels and which part is "the off-triangle" moves with
+    # i3/j3, so undefined slab bytes would feed the corner gemms. S is NOT zeroed — the accessor did not
+    # zero it either, and its jb×jb leading block is fully written by the L11 staging loop before Lv is
+    # ever read.
+    # ESCAPE AUDIT: no handle leaves this scope. W13/W31/S are indexed directly by the loops in this
+    # body; their contents reach only `fill!` (Base, writes and returns) and the `PtrMatrix` views
+    # Lv/W13v/W31v constructed HERE, which are passed DOWN to `trsm!` (level3.jl) and `_gemm_core!`
+    # (gemm.jl). Both write through their arguments and return — `_gemm_core!` PACKS into its own
+    # workspace, i.e. copies the data rather than keeping the pointer — and neither stores an operand in
+    # a field, a global or a closure. This function has no closure or `do` block at all, and its only
+    # return value is `info::Int`.
+    @scope arn begin
+        W13 = borrow!(arn, T, nb + 1, nb, ldw)         # reference WORK13 (upper corner A13)
+        W31 = borrow!(arn, T, nb + 1, nb, ldw)         # reference WORK31 (lower corner A31)
+        S = borrow!(arn, T, nb, nb, nb)                # dense L11 staging (deviation (1) above)
+        fill!(W13, z); fill!(W31, z)
+        p0 = pointer(AB); p13 = pointer(W13); p31 = pointer(W31); ps = pointer(S)
 
-    # Fill-in zeroing of the leading columns (dgbtrf DO 60), identical to the unblocked kernel.
-    @inbounds for j in (KU + 2):min(kv, n)
-        for i in (kv - j + 2):KL
-            AB[i, j] = z
+        # Fill-in zeroing of the leading columns (dgbtrf DO 60), identical to the unblocked kernel.
+        @inbounds for j in (KU + 2):min(kv, n)
+            for i in (kv - j + 2):KL
+                AB[i, j] = z
+            end
         end
-    end
 
-    ju = 1                                             # ONE variable across ALL panels (see DO 180)
-    GC.@preserve AB W13 W31 S begin
-        @inbounds for j in 1:nb:mn
-            jb = min(nb, mn - j + 1)
-            i2 = min(KL - jb, M - j - jb + 1)
-            i3 = min(jb, M - j - KL + 1)
+        ju = 1                                         # ONE variable across ALL panels (see DO 180)
+        GC.@preserve AB W13 W31 S begin
+            @inbounds for j in 1:nb:mn
+                jb = min(nb, mn - j + 1)
+                i2 = min(KL - jb, M - j - jb + 1)
+                i3 = min(jb, M - j - KL + 1)
 
-            # ── panel: unblocked factorization of the jb columns (DO 80) ──────────────────────────
-            for jj in j:(j + jb - 1)
-                if jj + kv <= n                        # zero the incoming column's fill-in
-                    for i in 1:KL
-                        AB[i, jj + kv] = z
+                # ── panel: unblocked factorization of the jb columns (DO 80) ──────────────────────
+                for jj in j:(j + jb - 1)
+                    if jj + kv <= n                    # zero the incoming column's fill-in
+                        for i in 1:KL
+                            AB[i, jj + kv] = z
+                        end
+                    end
+                    km = min(KL, M - jj)
+                    jp = 1; pmax = _gb_cabs1(AB[kv + 1, jj])
+                    for i in 2:(km + 1)
+                        a = _gb_cabs1(AB[kv + i, jj]); a > pmax && (pmax = a; jp = i)
+                    end
+                    ipiv[jj] = jp + jj - j             # PANEL-LOCAL; +j-1 is applied below
+                    if AB[kv + jp, jj] != z
+                        ju = max(ju, min(jj + KU + jp - 1, n))
+                        if jp != 1
+                            if jp + jj - 1 < j + KL
+                                # swap over the whole panel width; stride ldab-1 walks one column
+                                # right and one storage row up, i.e. along a row of A.
+                                for t in 0:(jb - 1)
+                                    r1 = kv + 1 + jj - j - t; r2 = kv + jp + jj - j - t
+                                    c = j + t
+                                    AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                                end
+                            else
+                                # the pivot row reaches A31, whose columns j..jj-1 live in W31
+                                for t in 0:(jj - j - 1)
+                                    r1 = kv + 1 + jj - j - t
+                                    w = jp + jj - j - KL
+                                    AB[r1, j + t], W31[w, 1 + t] = W31[w, 1 + t], AB[r1, j + t]
+                                end
+                                for t in 0:(j + jb - jj - 1)
+                                    r1 = kv + 1 - t; r2 = kv + jp - t
+                                    c = jj + t
+                                    AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                                end
+                            end
+                        end
+                        if km > 0
+                            d = one(T) / AB[kv + 1, jj]
+                            for i in 1:km
+                                AB[kv + 1 + i, jj] *= d
+                            end
+                            # rank-1 update confined to the PANEL (jm), not to ju: everything right
+                            # of the panel is deferred to the trsm/gemm below.
+                            jm = min(ju, j + jb - 1)
+                            for c in 1:(jm - jj)
+                                ujj = AB[kv + 1 - c, jj + c]
+                                if ujj != z
+                                    @simd ivdep for i in 1:km
+                                        AB[kv + 1 + i - c, jj + c] -= AB[kv + 1 + i, jj] * ujj
+                                    end
+                                end
+                            end
+                        end
+                    elseif info == 0
+                        info = jj
+                    end
+                    nw = min(jj - j + 1, i3)           # stash this column of A31 into W31
+                    for t in 1:nw
+                        W31[t, jj - j + 1] = AB[kv + KL + t - jj + j, jj]
                     end
                 end
-                km = min(KL, M - jj)
-                jp = 1; pmax = _gb_cabs1(AB[kv + 1, jj])
-                for i in 2:(km + 1)
-                    a = _gb_cabs1(AB[kv + i, jj]); a > pmax && (pmax = a; jp = i)
+
+                if j + jb <= n
+                    j2 = min(ju - j + 1, kv) - jb
+                    j3 = max(0, ju - j - kv + 1)
+
+                    # row interchanges on A12/A22/A32 (DLASWP over the ld-1 view at AB(kv+1-jb, j+jb)),
+                    # applied with the still-LOCAL ipiv values and composed in sequence.
+                    for t in 1:jb
+                        ip = ipiv[j + t - 1]
+                        if ip != t
+                            for q in 0:(j2 - 1)
+                                r1 = kv + 1 - jb + t - 1 - q
+                                r2 = kv + 1 - jb + ip - 1 - q
+                                c = j + jb + q
+                                AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
+                            end
+                        end
+                    end
+                    for i in j:(j + jb - 1)            # LOCAL → GLOBAL, after the laswp
+                        ipiv[i] = ipiv[i] + j - 1
+                    end
+
+                    # A13/A23/A33 columnwise (DO 110): these columns are past the band window, so
+                    # the swap is written out rather than expressed as a view.
+                    k2 = j - 1 + jb + j2
+                    for i in 1:j3
+                        jj = k2 + i
+                        for ii in (j + i - 1):(j + jb - 1)
+                            ip = ipiv[ii]              # GLOBAL here
+                            if ip != ii
+                                r1 = kv + 1 + ii - jj; r2 = kv + 1 + ip - jj
+                                AB[r1, jj], AB[r2, jj] = AB[r2, jj], AB[r1, jj]
+                            end
+                        end
+                    end
+
+                    # L11 → dense scratch (deviation (1)): unit lower, strictly-upper zeroed so the
+                    # kernel never reads live U11 through the aliasing triangle.
+                    for q in 1:jb
+                        for p in 1:(q - 1); S[p, q] = z; end
+                        S[q, q] = one(T)
+                        for p in (q + 1):jb; S[p, q] = AB[kv + 1 + p - q, j + q - 1]; end
+                    end
+                    Lv = PtrMatrix(ps, jb, jb, nb)
+                    A21v = _pb_blk(p0, ld2, ldabs, kv + 1 + jb, j, i2, jb)
+
+                    if j2 > 0
+                        A12v = _pb_blk(p0, ld2, ldabs, kv + 1 - jb, j + jb, jb, j2)
+                        trsm!(A12v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
+                            alpha = one(T))
+                        if i2 > 0
+                            A22v = _pb_blk(p0, ld2, ldabs, kv + 1, j + jb, i2, j2)
+                            _gemm_core!(A22v, A21v, A12v, -one(T), one(T), false, false, false, false)
+                        end
+                        if i3 > 0
+                            A32v = _pb_blk(p0, ld2, ldabs, kv + KL + 1 - jb, j + jb, i3, j2)
+                            W31v = PtrMatrix(p31, i3, jb, ldw)
+                            _gemm_core!(A32v, W31v, A12v, -one(T), one(T), false, false, false, false)
+                        end
+                    end
+
+                    if j3 > 0
+                        for jj in 1:j3                 # lower triangle of A13 → W13
+                            for ii in jj:jb
+                                W13[ii, jj] = AB[ii - jj + 1, jj + j + kv - 1]
+                            end
+                        end
+                        W13v = PtrMatrix(p13, jb, j3, ldw)
+                        trsm!(W13v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
+                            alpha = one(T))
+                        if i2 > 0
+                            A23v = _pb_blk(p0, ld2, ldabs, 1 + jb, j + kv, i2, j3)
+                            _gemm_core!(A23v, A21v, W13v, -one(T), one(T), false, false, false, false)
+                        end
+                        if i3 > 0
+                            A33v = _pb_blk(p0, ld2, ldabs, 1 + KL, j + kv, i3, j3)
+                            W31v = PtrMatrix(p31, i3, jb, ldw)
+                            _gemm_core!(A33v, W31v, W13v, -one(T), one(T), false, false, false, false)
+                        end
+                        for jj in 1:j3                 # and back into the band
+                            for ii in jj:jb
+                                AB[ii - jj + 1, jj + j + kv - 1] = W13[ii, jj]
+                            end
+                        end
+                    end
+                else
+                    for i in j:(j + jb - 1)            # the reference adjusts in BOTH branches
+                        ipiv[i] = ipiv[i] + j - 1
+                    end
                 end
-                ipiv[jj] = jp + jj - j                 # PANEL-LOCAL; +j-1 is applied below
-                if AB[kv + jp, jj] != z
-                    ju = max(ju, min(jj + KU + jp - 1, n))
+
+                # ── undo the panel interchanges on the LEFT columns (DO 170) ──────────────────────
+                # Restores dgbtf2's unpermuted-L convention (see the header) and, as a side effect,
+                # restores A31 to upper-triangular so its triangle fits back inside the band. Strictly
+                # DECREASING jj: the swaps are involutions, so reversed order is the exact inverse.
+                for jj in (j + jb - 1):-1:j
+                    jp = ipiv[jj] - jj + 1
                     if jp != 1
                         if jp + jj - 1 < j + KL
-                            # swap over the whole panel width; stride ldab-1 walks one column right
-                            # and one storage row up, i.e. along a row of A.
-                            for t in 0:(jb - 1)
+                            for t in 0:(jj - j - 1)
                                 r1 = kv + 1 + jj - j - t; r2 = kv + jp + jj - j - t
                                 c = j + t
                                 AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
                             end
                         else
-                            # the pivot row reaches A31, whose columns j..jj-1 live in W31
                             for t in 0:(jj - j - 1)
                                 r1 = kv + 1 + jj - j - t
                                 w = jp + jj - j - KL
                                 AB[r1, j + t], W31[w, 1 + t] = W31[w, 1 + t], AB[r1, j + t]
                             end
-                            for t in 0:(j + jb - jj - 1)
-                                r1 = kv + 1 - t; r2 = kv + jp - t
-                                c = jj + t
-                                AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
-                            end
                         end
                     end
-                    if km > 0
-                        d = one(T) / AB[kv + 1, jj]
-                        for i in 1:km
-                            AB[kv + 1 + i, jj] *= d
-                        end
-                        # rank-1 update confined to the PANEL (jm), not to ju: everything right of
-                        # the panel is deferred to the trsm/gemm below.
-                        jm = min(ju, j + jb - 1)
-                        for c in 1:(jm - jj)
-                            ujj = AB[kv + 1 - c, jj + c]
-                            if ujj != z
-                                @simd ivdep for i in 1:km
-                                    AB[kv + 1 + i - c, jj + c] -= AB[kv + 1 + i, jj] * ujj
-                                end
-                            end
-                        end
+                    nw = min(i3, jj - j + 1)
+                    for t in 1:nw
+                        AB[kv + KL + t - jj + j, jj] = W31[t, jj - j + 1]
                     end
-                elseif info == 0
-                    info = jj
-                end
-                nw = min(jj - j + 1, i3)               # stash this column of A31 into W31
-                for t in 1:nw
-                    W31[t, jj - j + 1] = AB[kv + KL + t - jj + j, jj]
-                end
-            end
-
-            if j + jb <= n
-                j2 = min(ju - j + 1, kv) - jb
-                j3 = max(0, ju - j - kv + 1)
-
-                # row interchanges on A12/A22/A32 (DLASWP over the ld-1 view at AB(kv+1-jb, j+jb)),
-                # applied with the still-LOCAL ipiv values and composed in sequence.
-                for t in 1:jb
-                    ip = ipiv[j + t - 1]
-                    if ip != t
-                        for q in 0:(j2 - 1)
-                            r1 = kv + 1 - jb + t - 1 - q
-                            r2 = kv + 1 - jb + ip - 1 - q
-                            c = j + jb + q
-                            AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
-                        end
-                    end
-                end
-                for i in j:(j + jb - 1)                # LOCAL → GLOBAL, after the laswp
-                    ipiv[i] = ipiv[i] + j - 1
-                end
-
-                # A13/A23/A33 columnwise (DO 110): these columns are past the band window, so the
-                # swap is written out rather than expressed as a view.
-                k2 = j - 1 + jb + j2
-                for i in 1:j3
-                    jj = k2 + i
-                    for ii in (j + i - 1):(j + jb - 1)
-                        ip = ipiv[ii]                  # GLOBAL here
-                        if ip != ii
-                            r1 = kv + 1 + ii - jj; r2 = kv + 1 + ip - jj
-                            AB[r1, jj], AB[r2, jj] = AB[r2, jj], AB[r1, jj]
-                        end
-                    end
-                end
-
-                # L11 → dense scratch (deviation (1)): unit lower, strictly-upper zeroed so the
-                # kernel never reads live U11 through the aliasing triangle.
-                for q in 1:jb
-                    for p in 1:(q - 1); S[p, q] = z; end
-                    S[q, q] = one(T)
-                    for p in (q + 1):jb; S[p, q] = AB[kv + 1 + p - q, j + q - 1]; end
-                end
-                Lv = PtrMatrix(ps, jb, jb, nb)
-                A21v = _pb_blk(p0, ld2, ldabs, kv + 1 + jb, j, i2, jb)
-
-                if j2 > 0
-                    A12v = _pb_blk(p0, ld2, ldabs, kv + 1 - jb, j + jb, jb, j2)
-                    trsm!(A12v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
-                        alpha = one(T))
-                    if i2 > 0
-                        A22v = _pb_blk(p0, ld2, ldabs, kv + 1, j + jb, i2, j2)
-                        _gemm_core!(A22v, A21v, A12v, -one(T), one(T), false, false, false, false)
-                    end
-                    if i3 > 0
-                        A32v = _pb_blk(p0, ld2, ldabs, kv + KL + 1 - jb, j + jb, i3, j2)
-                        W31v = PtrMatrix(p31, i3, jb, ldw)
-                        _gemm_core!(A32v, W31v, A12v, -one(T), one(T), false, false, false, false)
-                    end
-                end
-
-                if j3 > 0
-                    for jj in 1:j3                     # lower triangle of A13 → W13
-                        for ii in jj:jb
-                            W13[ii, jj] = AB[ii - jj + 1, jj + j + kv - 1]
-                        end
-                    end
-                    W13v = PtrMatrix(p13, jb, j3, ldw)
-                    trsm!(W13v, Lv; side = 'L', uplo = 'L', transA = 'N', diag = 'U',
-                        alpha = one(T))
-                    if i2 > 0
-                        A23v = _pb_blk(p0, ld2, ldabs, 1 + jb, j + kv, i2, j3)
-                        _gemm_core!(A23v, A21v, W13v, -one(T), one(T), false, false, false, false)
-                    end
-                    if i3 > 0
-                        A33v = _pb_blk(p0, ld2, ldabs, 1 + KL, j + kv, i3, j3)
-                        W31v = PtrMatrix(p31, i3, jb, ldw)
-                        _gemm_core!(A33v, W31v, W13v, -one(T), one(T), false, false, false, false)
-                    end
-                    for jj in 1:j3                     # and back into the band
-                        for ii in jj:jb
-                            AB[ii - jj + 1, jj + j + kv - 1] = W13[ii, jj]
-                        end
-                    end
-                end
-            else
-                for i in j:(j + jb - 1)                # the reference adjusts in BOTH branches
-                    ipiv[i] = ipiv[i] + j - 1
-                end
-            end
-
-            # ── undo the panel interchanges on the LEFT columns (DO 170) ──────────────────────────
-            # Restores dgbtf2's unpermuted-L convention (see the header) and, as a side effect,
-            # restores A31 to upper-triangular so its triangle fits back inside the band. Strictly
-            # DECREASING jj: the swaps are involutions, so reversed order is the exact inverse.
-            for jj in (j + jb - 1):-1:j
-                jp = ipiv[jj] - jj + 1
-                if jp != 1
-                    if jp + jj - 1 < j + KL
-                        for t in 0:(jj - j - 1)
-                            r1 = kv + 1 + jj - j - t; r2 = kv + jp + jj - j - t
-                            c = j + t
-                            AB[r1, c], AB[r2, c] = AB[r2, c], AB[r1, c]
-                        end
-                    else
-                        for t in 0:(jj - j - 1)
-                            r1 = kv + 1 + jj - j - t
-                            w = jp + jj - j - KL
-                            AB[r1, j + t], W31[w, 1 + t] = W31[w, 1 + t], AB[r1, j + t]
-                        end
-                    end
-                end
-                nw = min(i3, jj - j + 1)
-                for t in 1:nw
-                    AB[kv + KL + t - jj + j, jj] = W31[t, jj - j + 1]
                 end
             end
         end

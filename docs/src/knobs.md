@@ -243,13 +243,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-25 `const _X = <literal>` values in `src/` with no `@load_preference`.
+26 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 23 Literal · 2 Exempt.
+**Tier:** 23 Literal · 3 Exempt.
 
 
 ### BLAS-1 SIMD kernels
@@ -325,6 +325,12 @@ on these, not on knobs.
 |---|---|---|---|
 | `_DC_THRESHOLD` | 64 | Literal | divide-and-conquer cut. TUNABLE, algorithm-intrinsic so no formula. |
 | `_SEC_BISECT_CAP` | 0 | Literal | secular-equation bisection cap; 0 disables. TUNABLE. |
+
+### arena
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_ARENA_FENCE_QUARANTINE` | 4096 | Exempt | a debug sanitizer's retention depth, not hardware tuning; no host property favours one value. |
 
 ### gemm (BLAS-3)
 

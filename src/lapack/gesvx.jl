@@ -82,50 +82,58 @@ function _gerfs!(
     safe1 = (n + 1) * sfmin; safe2 = safe1 / epsm
     notran = trans == 'N'
     opel(i, k) = notran ? A[i, k] : (trans == 'T' ? A[k, i] : conj(A[k, i]))  # op(A)[i,k]
-    # Owned scratch (workspace.jl) so gesvx!'s refinement step allocates nothing. All three are fully
-    # written per RHS column before being read (r and wrk in the residual loop, dx by the getrs! solve),
-    # so reuse across calls and across columns carries nothing stale.
-    r, wrk, dx = _gerfs_work(T, n)
-    @inbounds for j in 1:nrhs
-        x = view(X, :, j); b = view(B, :, j)
-        lstres = Tr(3)
-        for _iter in 1:5
-            for i in 1:n                                    # r = b - op(A)·x  ; wrk = |b| + |op(A)|·|x|
-                acc = b[i]; w = abs(b[i])
-                for k in 1:n
-                    aik = opel(i, k); acc -= aik * x[k]; w += abs(aik) * abs(x[k])
+    # Arena borrows so gesvx!'s refinement step allocates nothing. All three are fully written per RHS
+    # column before being read (r and wrk in the residual loop, dx by the getrs! solve), so reused bytes
+    # carry nothing stale. `wrk` is REAL and now simply `borrow!(arn, Tr, n)` alongside the two
+    # element-typed ones — the `_l3ws(real(T))` "different owner ⇒ cannot alias" argument is replaced by
+    # disjoint byte ranges. Hoisted above `for j`/`for _iter`, where it already was.
+    # ESCAPE AUDIT: `dx` goes into `_lu_solve_vec!` (trsv! + pivot swaps) and comes back; nothing here
+    # retains a handle, and `_gerfs!` returns `ferr, berr` — the caller's own arrays.
+    @scope arn begin
+        r = borrow!(arn, T, n)
+        wrk = borrow!(arn, Tr, n)
+        dx = borrow!(arn, T, n)
+        @inbounds for j in 1:nrhs
+            x = view(X, :, j); b = view(B, :, j)
+            lstres = Tr(3)
+            for _iter in 1:5
+                for i in 1:n                                    # r = b - op(A)·x  ; wrk = |b| + |op(A)|·|x|
+                    acc = b[i]; w = abs(b[i])
+                    for k in 1:n
+                        aik = opel(i, k); acc -= aik * x[k]; w += abs(aik) * abs(x[k])
+                    end
+                    r[i] = acc; wrk[i] = w
                 end
-                r[i] = acc; wrk[i] = w
+                s = zero(Tr)                                     # componentwise backward error
+                for i in 1:n
+                    s = wrk[i] > safe2 ? max(s, abs(r[i]) / wrk[i]) :
+                        max(s, (abs(r[i]) + safe1) / (wrk[i] + safe1))
+                end
+                berr[j] = s
+                (s <= epsm || s > lstres / 2) && break
+                lstres = s
+                for i in 1:n
+                    dx[i] = r[i]
+                end                  # solve op(A)·δx = r on the LU factors
+                _lu_solve_vec!(trans, AF, ipiv, dx)
+                for i in 1:n
+                    x[i] += dx[i]
+                end
             end
-            s = zero(Tr)                                     # componentwise backward error
+            # ferr: w_i = |r_i| + (n+1)·eps·(|A||x|+|b|)_i ; ferr ≤ ‖A⁻¹‖_∞·‖w‖_∞ / ‖x‖_∞. r/wrk hold the
+            # last refinement step's residual and |b|+|A||x| — reuse wrk directly (it IS |b|+|op(A)||x|).
+            wmax = zero(Tr)
             for i in 1:n
-                s = wrk[i] > safe2 ? max(s, abs(r[i]) / wrk[i]) :
-                    max(s, (abs(r[i]) + safe1) / (wrk[i] + safe1))
+                wv = abs(r[i]) + (n + 1) * epsm * wrk[i]
+                wmax = max(wmax, wv)
             end
-            berr[j] = s
-            (s <= epsm || s > lstres / 2) && break
-            lstres = s
-            for i in 1:n
-                dx[i] = r[i]
-            end                  # solve op(A)·δx = r on the LU factors
-            _lu_solve_vec!(trans, AF, ipiv, dx)
-            for i in 1:n
-                x[i] += dx[i]
+            xmax = zero(Tr); for i in 1:n
+                xmax = max(xmax, abs(x[i]))
             end
+            ferr[j] = xmax > 0 ? ainv_inf * wmax / xmax : ainv_inf * wmax
         end
-        # ferr: w_i = |r_i| + (n+1)·eps·(|A||x|+|b|)_i ; ferr ≤ ‖A⁻¹‖_∞·‖w‖_∞ / ‖x‖_∞. r/wrk hold the
-        # last refinement step's residual and |b|+|A||x| — reuse wrk directly (it IS |b|+|op(A)||x|).
-        wmax = zero(Tr)
-        for i in 1:n
-            wv = abs(r[i]) + (n + 1) * epsm * wrk[i]
-            wmax = max(wmax, wv)
-        end
-        xmax = zero(Tr); for i in 1:n
-            xmax = max(xmax, abs(x[i]))
-        end
-        ferr[j] = xmax > 0 ? ainv_inf * wmax / xmax : ainv_inf * wmax
+        return ferr, berr
     end
-    return ferr, berr
 end
 
 # op(A)·δx = r on the LU factors (mirrors getrs_64_'s composition).

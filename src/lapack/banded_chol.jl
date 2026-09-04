@@ -253,7 +253,7 @@ end
 
 # Scalar dense lower potf2 (dpotf2.f pivot semantics, right-looking): factors S[1:m,1:m] in place,
 # returns 0 or the first failing column. Only runs on the pbtrf failure path (see (b) below).
-function _potf2L_col!(S::Matrix{T}, m::Int) where {T}
+function _potf2L_col!(S::AbstractMatrix{T}, m::Int) where {T}
     @inbounds for j in 1:m
         ajj = real(S[j, j])
         ajj > 0 || return j
@@ -273,7 +273,7 @@ end
 
 # Scalar dense UPPER potf2 (mirror of _potf2L_col!): factors S[1:m,1:m] in place from its upper
 # triangle, returns 0 or the first failing column. Failure path of _pbtrf_blocked_U! only.
-function _potf2U_col!(S::Matrix{T}, m::Int) where {T}
+function _potf2U_col!(S::AbstractMatrix{T}, m::Int) where {T}
     @inbounds for j in 1:m
         ajj = real(S[j, j])
         ajj > 0 || return j
@@ -319,94 +319,113 @@ function _pbtrf_blocked!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pbtr
     ld2 = ldabs - 1                                    # the LDAB-1 of every BLAS call in dpbtrf.f
     tc = T <: Complex ? 'C' : 'T'                      # dpbtrf 'Transpose' / zpbtrf 'Conjugate transpose'
     rone = one(real(T))
-    W, S = _pbtrf_work(T, nb)                          # GKH-owned; W arrives zeroed ONCE (see above),
-    #                                                    S is the dense diagonal-block scratch ((a)/(b))
-    p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
-    GC.@preserve AB W S begin
-        for i in 1:nb:n
-            ib = min(nb, n - i + 1)
-            # dpbtrf: CALL DPOTF2('L', IB, AB(1,I), LDAB-1, II) — via the dense scratch: copy the
-            # stored lower triangle of A11 in (zeroing the upper half so the factor kernel sees
-            # fully-defined data), run the tuned blocked potrf! there, copy the factor back.
-            @inbounds for q in 1:ib
-                for p in 1:(q - 1); S[p, q] = zero(T); end
-                for p in q:ib; S[p, q] = AB[1 + p - q, i + q - 1]; end
-            end
-            Sv = PtrMatrix(ps, ib, ib, nb)
-            ok = true
-            try
-                potrf!(Sv; uplo = 'L')
-            catch e
-                e isa PosDefException || rethrow()
-                ok = false
-            end
-            if !ok
-                # dpbtrf: IF(II≠0) INFO = I+II-1. Band data is still pristine — recover the exact
-                # failing column with the scalar dpotf2-ordered factor (reference dpbtrf runs
-                # potf2 on the diagonal block, so this IS the reference pivot sequence). If the
-                # scalar factor succeeds (blocked-vs-scalar roundoff tie on a borderline pivot),
-                # keep its factor and continue — matching what the reference would have done.
-                @inbounds for q in 1:ib, p in q:ib
-                    S[p, q] = AB[1 + p - q, i + q - 1]
+    # Arena borrows (arena.jl), not owned fields. Both leading dimensions are LOAD-BEARING and are the
+    # exact-ld default, NOT `_odd_ld`: the kernels build `PtrMatrix(pw, …, nb+1)` / `PtrMatrix(ps, …, nb)`
+    # views over these buffers, so their ld must be nb+1 / nb by construction (that is also the reference's
+    # LDWORK = NBMAX+1, odd so the column stride can't po2-alias). An exact borrow additionally removes the
+    # `!=`-not-`>=` hazard the fields carried — a stale WIDER buffer handing the next call the previous
+    # ld, measured at pbtrf kd=64 as 2.10 → 1.81.
+    # W is zeroed ONCE per call, as the reference does before its I-loop: the copy-in/copy-back touch only
+    # the in-band triangle and everything else must read as zero, and which part is "everything else" moves
+    # with ib/i3.
+    # ESCAPE AUDIT — nothing outlives this block. `W`/`S` are read and written only here; what crosses a
+    # call boundary is the `Sv`/`Wv` PtrMatrix views over them, handed DOWN to `potrf!`, `trsm!`,
+    # `syrk!`/`herk!`, `_gemm_core!` and `_potf2L_col!`. Every one of those is an in-place kernel that
+    # writes through the handle and returns a scalar or its own destination argument; none stores an
+    # operand in a field, a global or a closure (their own scratch comes from their own accessors), and no
+    # value built from `W`/`S` is returned — the function returns the caller's `AB`. The borrows sit above
+    # the `i`-loop, so this is two borrows per CALL, not per band block.
+    @scope arn begin
+        W = borrow!(arn, T, nb + 1, nb)                 # corner work array (LDWORK = nb+1)
+        S = borrow!(arn, T, nb, nb)                     # dense diagonal-block scratch ((a)/(b) above)
+        fill!(W, zero(T))
+        p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
+        GC.@preserve AB begin
+            for i in 1:nb:n
+                ib = min(nb, n - i + 1)
+                # dpbtrf: CALL DPOTF2('L', IB, AB(1,I), LDAB-1, II) — via the dense scratch: copy the
+                # stored lower triangle of A11 in (zeroing the upper half so the factor kernel sees
+                # fully-defined data), run the tuned blocked potrf! there, copy the factor back.
+                @inbounds for q in 1:ib
+                    for p in 1:(q - 1); S[p, q] = zero(T); end
+                    for p in q:ib; S[p, q] = AB[1 + p - q, i + q - 1]; end
                 end
-                col = _potf2L_col!(S, ib)
-                col != 0 && throw(PosDefException(i - 1 + col))
-            end
-            @inbounds for q in 1:ib, p in q:ib          # factor back into the band
-                AB[1 + p - q, i + q - 1] = S[p, q]
-            end
-            if i + ib <= n
-                i2 = min(kd - ib, n - i - ib + 1)      # dpbtrf: I2 — in-band panel rows
-                i3 = min(ib, n - i - kd + 1)           # dpbtrf: I3 — corner rows (≤0 ⇒ no corner)
-                if i2 > 0
-                    # dpbtrf: DTRSM('Right','Lower','T','N', I2, IB, 1, AB(1,I), LDAB-1,
-                    #               AB(1+IB,I), LDAB-1)          — A21 := A21·L11⁻ᴴ
-                    # (L11 read from the dense scratch Sv — same values, contiguous ld.)
-                    A21 = _pb_blk(p0, ld2, ldabs, 1 + ib, i, i2, ib)
-                    trsm!(A21, Sv; side = 'R', uplo = 'L', transA = tc, diag = 'N')
-                    # dpbtrf: DSYRK('Lower','N', I2, IB, -1, A21, LDAB-1, 1, AB(1,I+IB), LDAB-1)
-                    #                                              — A22 -= A21·A21ᴴ
-                    A22 = _pb_blk(p0, ld2, ldabs, 1, i + ib, i2, i2)
-                    if T <: Complex
-                        herk!(A22, A21; uplo = 'L', trans = 'N', alpha = -rone, beta = rone)
-                    else
-                        syrk!(A22, A21; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
-                    end
+                Sv = PtrMatrix(ps, ib, ib, nb)
+                ok = true
+                try
+                    potrf!(Sv; uplo = 'L')
+                catch e
+                    e isa PosDefException || rethrow()
+                    ok = false
                 end
-                if i3 > 0
-                    # dpbtrf DO 110/100: copy the (in-band) UPPER triangle of A31 into WORK:
-                    #   WORK(II,JJ) = AB(KD+1-JJ+II, JJ+I-1),  JJ=1:IB, II=1:MIN(JJ,I3)
-                    # (A31[ii,jj] = A[i+kd+ii-1, i+jj-1] sits at storage row 1+(kd+ii-jj) —
-                    #  in-band iff ii ≤ jj; the strictly-lower part of WORK stays 0.)
-                    @inbounds for jj in 1:ib, ii in 1:min(jj, i3)
-                        W[ii, jj] = AB[kd + 1 - jj + ii, jj + i - 1]
+                if !ok
+                    # dpbtrf: IF(II≠0) INFO = I+II-1. Band data is still pristine — recover the exact
+                    # failing column with the scalar dpotf2-ordered factor (reference dpbtrf runs
+                    # potf2 on the diagonal block, so this IS the reference pivot sequence). If the
+                    # scalar factor succeeds (blocked-vs-scalar roundoff tie on a borderline pivot),
+                    # keep its factor and continue — matching what the reference would have done.
+                    @inbounds for q in 1:ib, p in q:ib
+                        S[p, q] = AB[1 + p - q, i + q - 1]
                     end
-                    Wv = PtrMatrix(pw, i3, ib, nb + 1)
-                    # dpbtrf: DTRSM('Right','Lower','T','N', I3, IB, 1, A11, LDAB-1, WORK, LDWORK)
-                    #                                              — A31 := A31·L11⁻ᴴ (dense, in WORK)
-                    trsm!(Wv, Sv; side = 'R', uplo = 'L', transA = tc, diag = 'N')
+                    col = _potf2L_col!(S, ib)
+                    col != 0 && throw(PosDefException(i - 1 + col))
+                end
+                @inbounds for q in 1:ib, p in q:ib      # factor back into the band
+                    AB[1 + p - q, i + q - 1] = S[p, q]
+                end
+                if i + ib <= n
+                    i2 = min(kd - ib, n - i - ib + 1)  # dpbtrf: I2 — in-band panel rows
+                    i3 = min(ib, n - i - kd + 1)       # dpbtrf: I3 — corner rows (≤0 ⇒ no corner)
                     if i2 > 0
-                        # dpbtrf: DGEMM('N','T', I3, I2, IB, -1, WORK, LDWORK, AB(1+IB,I),
-                        #               LDAB-1, 1, AB(1+KD-IB, I+IB), LDAB-1)
-                        #                                          — A32 -= A31·A21ᴴ
-                        # (_gemm_core! directly: the public gemm! kwarg entry's StridedMatrix
-                        #  gate would bounce PtrMatrix to the generic kernel; this is the same
-                        #  internal entry the Mode-1 C-ABI uses.)
+                        # dpbtrf: DTRSM('Right','Lower','T','N', I2, IB, 1, AB(1,I), LDAB-1,
+                        #               AB(1+IB,I), LDAB-1)          — A21 := A21·L11⁻ᴴ
+                        # (L11 read from the dense scratch Sv — same values, contiguous ld.)
                         A21 = _pb_blk(p0, ld2, ldabs, 1 + ib, i, i2, ib)
-                        A32 = _pb_blk(p0, ld2, ldabs, 1 + kd - ib, i + ib, i3, i2)
-                        _gemm_core!(A32, Wv, A21, -one(T), one(T), false, true, false, T <: Complex)
+                        trsm!(A21, Sv; side = 'R', uplo = 'L', transA = tc, diag = 'N')
+                        # dpbtrf: DSYRK('Lower','N', I2, IB, -1, A21, LDAB-1, 1, AB(1,I+IB), LDAB-1)
+                        #                                              — A22 -= A21·A21ᴴ
+                        A22 = _pb_blk(p0, ld2, ldabs, 1, i + ib, i2, i2)
+                        if T <: Complex
+                            herk!(A22, A21; uplo = 'L', trans = 'N', alpha = -rone, beta = rone)
+                        else
+                            syrk!(A22, A21; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
+                        end
                     end
-                    # dpbtrf: DSYRK('Lower','N', I3, IB, -1, WORK, LDWORK, 1, AB(1,I+KD), LDAB-1)
-                    #                                          — A33 -= A31·A31ᴴ
-                    A33 = _pb_blk(p0, ld2, ldabs, 1, i + kd, i3, i3)
-                    if T <: Complex
-                        herk!(A33, Wv; uplo = 'L', trans = 'N', alpha = -rone, beta = rone)
-                    else
-                        syrk!(A33, Wv; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
-                    end
-                    # dpbtrf DO 130/120: copy the triangle back: AB(KD+1-JJ+II, JJ+I-1) = WORK(II,JJ)
-                    @inbounds for jj in 1:ib, ii in 1:min(jj, i3)
-                        AB[kd + 1 - jj + ii, jj + i - 1] = W[ii, jj]
+                    if i3 > 0
+                        # dpbtrf DO 110/100: copy the (in-band) UPPER triangle of A31 into WORK:
+                        #   WORK(II,JJ) = AB(KD+1-JJ+II, JJ+I-1),  JJ=1:IB, II=1:MIN(JJ,I3)
+                        # (A31[ii,jj] = A[i+kd+ii-1, i+jj-1] sits at storage row 1+(kd+ii-jj) —
+                        #  in-band iff ii ≤ jj; the strictly-lower part of WORK stays 0.)
+                        @inbounds for jj in 1:ib, ii in 1:min(jj, i3)
+                            W[ii, jj] = AB[kd + 1 - jj + ii, jj + i - 1]
+                        end
+                        Wv = PtrMatrix(pw, i3, ib, nb + 1)
+                        # dpbtrf: DTRSM('Right','Lower','T','N', I3, IB, 1, A11, LDAB-1, WORK, LDWORK)
+                        #                                              — A31 := A31·L11⁻ᴴ (dense, in WORK)
+                        trsm!(Wv, Sv; side = 'R', uplo = 'L', transA = tc, diag = 'N')
+                        if i2 > 0
+                            # dpbtrf: DGEMM('N','T', I3, I2, IB, -1, WORK, LDWORK, AB(1+IB,I),
+                            #               LDAB-1, 1, AB(1+KD-IB, I+IB), LDAB-1)
+                            #                                          — A32 -= A31·A21ᴴ
+                            # (_gemm_core! directly: the public gemm! kwarg entry's StridedMatrix
+                            #  gate would bounce PtrMatrix to the generic kernel; this is the same
+                            #  internal entry the Mode-1 C-ABI uses.)
+                            A21 = _pb_blk(p0, ld2, ldabs, 1 + ib, i, i2, ib)
+                            A32 = _pb_blk(p0, ld2, ldabs, 1 + kd - ib, i + ib, i3, i2)
+                            _gemm_core!(A32, Wv, A21, -one(T), one(T), false, true, false, T <: Complex)
+                        end
+                        # dpbtrf: DSYRK('Lower','N', I3, IB, -1, WORK, LDWORK, 1, AB(1,I+KD), LDAB-1)
+                        #                                          — A33 -= A31·A31ᴴ
+                        A33 = _pb_blk(p0, ld2, ldabs, 1, i + kd, i3, i3)
+                        if T <: Complex
+                            herk!(A33, Wv; uplo = 'L', trans = 'N', alpha = -rone, beta = rone)
+                        else
+                            syrk!(A33, Wv; uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
+                        end
+                        # dpbtrf DO 130/120: copy the triangle back: AB(KD+1-JJ+II, JJ+I-1) = WORK(II,JJ)
+                        @inbounds for jj in 1:ib, ii in 1:min(jj, i3)
+                            AB[kd + 1 - jj + ii, jj + i - 1] = W[ii, jj]
+                        end
                     end
                 end
             end
@@ -444,16 +463,31 @@ end
 # depend on which triangle is stored, and _pbtrf_blocked! already reports dpotf2-ordered global
 # columns), so it needs no translation.
 function _pbtrf_repack_U!(AB::AbstractMatrix{T}, n::Int, kd::Int) where {T}
-    ABL = _pbtrf_band(T, kd, n)                        # owned scratch — see _pbtrf_band for why not `undef`
-    @inbounds for j in 1:n                             # pack: ABU → conj-transposed lower band
-        for d in 0:min(kd, n - j)
-            ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])
+    # Arena borrow (arena.jl), not an owned field. EXACT (kd+1)×n at the default ld: ld == kd+1 is what
+    # the lower kernel's `stride(AB,2)` reads to form its LDAB-1 block views, so it is load-bearing — and
+    # an exact borrow structurally cannot reproduce the field's hazard of a WIDER kept buffer leaking a
+    # previous call's ld (measured: kd=64 dropped 2.10 → 1.81 when a kd=256 buffer was reused).
+    # Only the in-band entries are written before they are read, exactly as with the `undef` field.
+    # THE SCOPE SPANS ALL THREE STATEMENTS — pack, factor, unpack — because `ABL` carries the band across
+    # them; scoping only the pack would release it before the factorization reads it.
+    # ESCAPE AUDIT: `ABL` is handed DOWN to `_pbtrf_blocked!`, which opens its OWN nested `@scope` (whose
+    # borrows sit above ours in the bump and rewind on its exit, leaving ABL live), takes `pointer`/
+    # `stride` of it, and passes `_pb_blk` views over it to potrf!/trsm!/syrk!/herk!/_gemm_core! — all
+    # in-place kernels that retain nothing. `_pbtrf_blocked!` returns its own `AB` argument, i.e. `ABL`
+    # itself, and that return value is DISCARDED here; this function returns the caller's `AB`. A
+    # PosDefException thrown out of the factor unwinds through the scope's `finally`, which rewinds.
+    @scope arn begin
+        ABL = borrow!(arn, T, kd + 1, n)               # conj-transposed lower band, ld == kd+1
+        @inbounds for j in 1:n                         # pack: ABU → conj-transposed lower band
+            for d in 0:min(kd, n - j)
+                ABL[1 + d, j] = conj(AB[kd + 1 - d, j + d])
+            end
         end
-    end
-    _pbtrf_blocked!(ABL, n, kd)                        # may throw PosDefException(global col) — correct as-is
-    @inbounds for j in 1:n                             # unpack: L factor → ABU (U = Lᴴ)
-        for d in 0:min(kd, j - 1)
-            AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+        _pbtrf_blocked!(ABL, n, kd)                    # may throw PosDefException(global col) — correct as-is
+        @inbounds for j in 1:n                         # unpack: L factor → ABU (U = Lᴴ)
+            for d in 0:min(kd, j - 1)
+                AB[kd + 1 - d, j] = conj(ABL[1 + d, j - d])
+            end
         end
     end
     return AB
@@ -466,86 +500,97 @@ function _pbtrf_blocked_U!(AB::AbstractMatrix{T}, n::Int, kd::Int, nb::Int = _pb
     ld2 = ldabs - 1                                    # the LDAB-1 of every BLAS call in dpbtrf.f
     tc = T <: Complex ? 'C' : 'T'
     rone = one(real(T))
-    W, S = _pbtrf_work(T, nb)                          # GKH-owned; W arrives zeroed ONCE per call
-    p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
-    GC.@preserve AB W S begin
-        for i in 1:nb:n
-            ib = min(nb, n - i + 1)
-            # dpbtrf: CALL DPOTF2('U', IB, AB(KD+1,I), LDAB-1, II) — via the dense scratch (zero the
-            # unused lower half so the factor kernel sees fully-defined data).
-            @inbounds for q in 1:ib
-                for p in 1:q; S[p, q] = AB[kd + 1 + p - q, i + q - 1]; end
-                for p in (q + 1):ib; S[p, q] = zero(T); end
-            end
-            Sv = PtrMatrix(ps, ib, ib, nb)
-            ok = true
-            try
-                potrf!(Sv; uplo = 'U')
-            catch e
-                e isa PosDefException || rethrow()
-                ok = false
-            end
-            if !ok
-                # Band data is still pristine — recover the exact failing column with the scalar
-                # potf2-ordered factor (the reference's pivot sequence). If it succeeds (a blocked-vs-
-                # scalar roundoff tie on a borderline pivot) keep ITS factor and continue.
+    # Arena borrows (arena.jl) — same two roles, same load-bearing exact lds, same once-per-call zeroing
+    # of W as the lower kernel above; see that scope's header for the full reasoning.
+    # ESCAPE AUDIT — nothing outlives this block. `W`/`S` are read and written only here; the `Sv`/`Wv`
+    # PtrMatrix views over them go DOWN to `potrf!`, `trsm!`, `syrk!`/`herk!`, `_gemm_core!` and
+    # `_potf2U_col!`, all in-place kernels that write through the handle and retain no operand. Nothing
+    # built from `W`/`S` is returned — the function returns the caller's `AB`. The borrows sit above the
+    # `i`-loop: two per CALL, not per band block.
+    @scope arn begin
+        W = borrow!(arn, T, nb + 1, nb)                 # corner work array (LDWORK = nb+1)
+        S = borrow!(arn, T, nb, nb)                     # dense diagonal-block scratch
+        fill!(W, zero(T))
+        p0 = pointer(AB); pw = pointer(W); ps = pointer(S)
+        GC.@preserve AB begin
+            for i in 1:nb:n
+                ib = min(nb, n - i + 1)
+                # dpbtrf: CALL DPOTF2('U', IB, AB(KD+1,I), LDAB-1, II) — via the dense scratch (zero the
+                # unused lower half so the factor kernel sees fully-defined data).
                 @inbounds for q in 1:ib
                     for p in 1:q; S[p, q] = AB[kd + 1 + p - q, i + q - 1]; end
                     for p in (q + 1):ib; S[p, q] = zero(T); end
                 end
-                col = _potf2U_col!(S, ib)
-                col != 0 && throw(PosDefException(i - 1 + col))
-            end
-            @inbounds for q in 1:ib, p in 1:q           # factor back into the band
-                AB[kd + 1 + p - q, i + q - 1] = S[p, q]
-            end
-            if i + ib <= n
-                i2 = min(kd - ib, n - i - ib + 1)      # dpbtrf: I2 — in-band panel cols
-                i3 = min(ib, n - i - kd + 1)           # dpbtrf: I3 — corner cols (≤0 ⇒ no corner)
-                if i2 > 0
-                    # dpbtrf: DTRSM('Left','Upper','T','N', IB, I2, 1, AB(KD+1,I), LDAB-1,
-                    #               AB(KD+1-IB,I+IB), LDAB-1)      — A12 := U11⁻ᴴ·A12
-                    A12 = _pb_blk(p0, ld2, ldabs, kd + 1 - ib, i + ib, ib, i2)
-                    trsm!(A12, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
-                    # dpbtrf: DSYRK('Upper','T', I2, IB, -1, A12, LDAB-1, 1, AB(KD+1,I+IB), LDAB-1)
-                    #                                              — A22 -= A12ᴴ·A12
-                    A22 = _pb_blk(p0, ld2, ldabs, kd + 1, i + ib, i2, i2)
-                    if T <: Complex
-                        herk!(A22, A12; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
-                    else
-                        syrk!(A22, A12; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
-                    end
+                Sv = PtrMatrix(ps, ib, ib, nb)
+                ok = true
+                try
+                    potrf!(Sv; uplo = 'U')
+                catch e
+                    e isa PosDefException || rethrow()
+                    ok = false
                 end
-                if i3 > 0
-                    # dpbtrf DO 20/10: WORK(II,JJ) = AB(II-JJ+1, JJ+I+KD-1), JJ=1:I3, II=JJ:IB — the
-                    # LOWER triangle of A13. W is IB×I3 here, the mirror of the lower branch's I3×IB,
-                    # and its strictly-upper part stays 0 for the life of the call (W is zeroed once,
-                    # and copy-in/copy-back both touch only ii ≥ jj). The bound is NOT the lower
-                    # branch's `min(jj, i3)` mirrored: `ii in (i3-jj+1):ib` sends the band row index
-                    # ii-jj+1 to 2-i3 ≤ 0 at jj=i3, ii=1.
-                    @inbounds for jj in 1:i3, ii in jj:ib
-                        W[ii, jj] = AB[ii - jj + 1, jj + i + kd - 1]
+                if !ok
+                    # Band data is still pristine — recover the exact failing column with the scalar
+                    # potf2-ordered factor (the reference's pivot sequence). If it succeeds (a blocked-vs-
+                    # scalar roundoff tie on a borderline pivot) keep ITS factor and continue.
+                    @inbounds for q in 1:ib
+                        for p in 1:q; S[p, q] = AB[kd + 1 + p - q, i + q - 1]; end
+                        for p in (q + 1):ib; S[p, q] = zero(T); end
                     end
-                    Wv = PtrMatrix(pw, ib, i3, nb + 1)
-                    # dpbtrf: DTRSM('Left','Upper','T','N', IB, I3, 1, A11, LDAB-1, WORK, LDWORK)
-                    trsm!(Wv, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
+                    col = _potf2U_col!(S, ib)
+                    col != 0 && throw(PosDefException(i - 1 + col))
+                end
+                @inbounds for q in 1:ib, p in 1:q       # factor back into the band
+                    AB[kd + 1 + p - q, i + q - 1] = S[p, q]
+                end
+                if i + ib <= n
+                    i2 = min(kd - ib, n - i - ib + 1)  # dpbtrf: I2 — in-band panel cols
+                    i3 = min(ib, n - i - kd + 1)       # dpbtrf: I3 — corner cols (≤0 ⇒ no corner)
                     if i2 > 0
-                        # dpbtrf: DGEMM('T','N', I2, I3, IB, -1, AB(KD+1-IB,I+IB), LDAB-1, WORK,
-                        #               LDWORK, 1, AB(1+IB,I+KD), LDAB-1)   — A23 -= A12ᴴ·A13
+                        # dpbtrf: DTRSM('Left','Upper','T','N', IB, I2, 1, AB(KD+1,I), LDAB-1,
+                        #               AB(KD+1-IB,I+IB), LDAB-1)      — A12 := U11⁻ᴴ·A12
                         A12 = _pb_blk(p0, ld2, ldabs, kd + 1 - ib, i + ib, ib, i2)
-                        A23 = _pb_blk(p0, ld2, ldabs, 1 + ib, i + kd, i2, i3)
-                        _gemm_core!(A23, A12, Wv, -one(T), one(T), true, false, T <: Complex, false)
+                        trsm!(A12, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
+                        # dpbtrf: DSYRK('Upper','T', I2, IB, -1, A12, LDAB-1, 1, AB(KD+1,I+IB), LDAB-1)
+                        #                                              — A22 -= A12ᴴ·A12
+                        A22 = _pb_blk(p0, ld2, ldabs, kd + 1, i + ib, i2, i2)
+                        if T <: Complex
+                            herk!(A22, A12; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
+                        else
+                            syrk!(A22, A12; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
+                        end
                     end
-                    # dpbtrf: DSYRK('Upper','T', I3, IB, -1, WORK, LDWORK, 1, AB(KD+1,I+KD), LDAB-1)
-                    A33 = _pb_blk(p0, ld2, ldabs, kd + 1, i + kd, i3, i3)
-                    if T <: Complex
-                        herk!(A33, Wv; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
-                    else
-                        syrk!(A33, Wv; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
-                    end
-                    # dpbtrf DO 40/30: copy the lower triangle of A13 back into place
-                    @inbounds for jj in 1:i3, ii in jj:ib
-                        AB[ii - jj + 1, jj + i + kd - 1] = W[ii, jj]
+                    if i3 > 0
+                        # dpbtrf DO 20/10: WORK(II,JJ) = AB(II-JJ+1, JJ+I+KD-1), JJ=1:I3, II=JJ:IB — the
+                        # LOWER triangle of A13. W is IB×I3 here, the mirror of the lower branch's I3×IB,
+                        # and its strictly-upper part stays 0 for the life of the call (W is zeroed once,
+                        # and copy-in/copy-back both touch only ii ≥ jj). The bound is NOT the lower
+                        # branch's `min(jj, i3)` mirrored: `ii in (i3-jj+1):ib` sends the band row index
+                        # ii-jj+1 to 2-i3 ≤ 0 at jj=i3, ii=1.
+                        @inbounds for jj in 1:i3, ii in jj:ib
+                            W[ii, jj] = AB[ii - jj + 1, jj + i + kd - 1]
+                        end
+                        Wv = PtrMatrix(pw, ib, i3, nb + 1)
+                        # dpbtrf: DTRSM('Left','Upper','T','N', IB, I3, 1, A11, LDAB-1, WORK, LDWORK)
+                        trsm!(Wv, Sv; side = 'L', uplo = 'U', transA = tc, diag = 'N')
+                        if i2 > 0
+                            # dpbtrf: DGEMM('T','N', I2, I3, IB, -1, AB(KD+1-IB,I+IB), LDAB-1, WORK,
+                            #               LDWORK, 1, AB(1+IB,I+KD), LDAB-1)   — A23 -= A12ᴴ·A13
+                            A12 = _pb_blk(p0, ld2, ldabs, kd + 1 - ib, i + ib, ib, i2)
+                            A23 = _pb_blk(p0, ld2, ldabs, 1 + ib, i + kd, i2, i3)
+                            _gemm_core!(A23, A12, Wv, -one(T), one(T), true, false, T <: Complex, false)
+                        end
+                        # dpbtrf: DSYRK('Upper','T', I3, IB, -1, WORK, LDWORK, 1, AB(KD+1,I+KD), LDAB-1)
+                        A33 = _pb_blk(p0, ld2, ldabs, kd + 1, i + kd, i3, i3)
+                        if T <: Complex
+                            herk!(A33, Wv; uplo = 'U', trans = 'C', alpha = -rone, beta = rone)
+                        else
+                            syrk!(A33, Wv; uplo = 'U', trans = 'T', alpha = -one(T), beta = one(T))
+                        end
+                        # dpbtrf DO 40/30: copy the lower triangle of A13 back into place
+                        @inbounds for jj in 1:i3, ii in jj:ib
+                            AB[ii - jj + 1, jj + i + kd - 1] = W[ii, jj]
+                        end
                     end
                 end
             end

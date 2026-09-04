@@ -46,22 +46,41 @@ function _ggev_formQ!(Q::AbstractMatrix{T}, B::AbstractMatrix{T}, tauL::Abstract
     return Q
 end
 
-# QR of B, apply Qᴴ to A, and return Q_B (n×n) + R (in the upper triangle of B; strict-lower still holds
-# reflectors, which gghrd! zeros). ct = conjugate-transpose char.
-function _ggev_qrB!(A::AbstractMatrix{T}, B::AbstractMatrix{T}, n::Int, ct::Char) where {T <: Number}
-    # No fill! on any of the four: geqrf! writes tau[1:min(m,n)] = tau[1:n] for the square B this path
-    # always passes (qr.jl:467/480 → qr_unblocked!, which assigns tau[i] for every i in 1:k), tauL is
-    # fully written by the loop below, `_ggev_formQ!` opens with its own fill!(Q, 0), and the gemm! runs
-    # beta=0 over all of tmp.
-    tau, tauL, Q, tmp = _ggev_qrb_work(T, n)
-    geqrf!(B, tau)
-    @inbounds for i in 1:n
-        tauL[i] = _ggev_tauL(tau[i])
+# QR of B, apply Qᴴ to A, and leave R in the upper triangle of B (strict-lower still holds reflectors,
+# which gghrd! zeros). ct = conjugate-transpose char. `Qout`, when given, RECEIVES the explicit Q_B
+# (gges!'s VSL); ggev! passes nothing, since the QR is a LEFT transform and leaves the right eigenvectors
+# invariant. That out-parameter replaces the `return Q` the field-owned form had: under the arena Q is a
+# borrow that dies with the scope, so the copy has to happen INSIDE it.
+function _ggev_qrB!(
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, n::Int, ct::Char,
+        Qout::Union{Nothing, AbstractMatrix{T}} = nothing
+    ) where {T <: Number}
+    # Arena borrows (arena.jl), not owned fields. Q and tmp stay SEPARATE borrows: the gemm! reads Q while
+    # it writes tmp. No fill! on any of the four: geqrf! writes tau[1:min(m,n)] = tau[1:n] for the square B
+    # this path always passes (qr.jl:467/480 → qr_unblocked!, which assigns tau[i] for every i in 1:k),
+    # tauL is fully written by the loop below, `_ggev_formQ!` opens with its own fill!(Q, 0), and the gemm!
+    # runs beta=0 over all of tmp. Exact `ld` (no `_odd_ld`): the fields these replace were plain
+    # `_wsgrow` buffers with no anti-aliasing stride.
+    # ESCAPE AUDIT: nothing outlives the scope. `tau` goes only to geqrf!, which writes it and returns.
+    # `tauL`/`Q` go to `_ggev_formQ!` (above in this file — a scalar accumulation that writes Q, returns
+    # it, and stores nothing anywhere). `Q`/`tmp` go to gemm! (blas3/gemm.jl), which packs into its own
+    # workspace and retains neither operand. Both copyto!s run INSIDE the block, so the only things
+    # crossing the closing `end` are the caller's own `A` and `Qout`.
+    @scope arn begin
+        tau = borrow!(arn, T, n)
+        tauL = borrow!(arn, T, n)
+        Q = borrow!(arn, T, n, n)
+        tmp = borrow!(arn, T, n, n)
+        geqrf!(B, tau)
+        @inbounds for i in 1:n
+            tauL[i] = _ggev_tauL(tau[i])
+        end
+        _ggev_formQ!(Q, B, tauL, n)
+        gemm!(tmp, Q, A; transA = ct, transB = 'N', alpha = one(T), beta = zero(T))   # A := Qᴴ·A
+        copyto!(A, tmp)
+        isnothing(Qout) || copyto!(Qout, Q)
     end
-    _ggev_formQ!(Q, B, tauL, n)
-    gemm!(tmp, Q, A; transA = ct, transB = 'N', alpha = one(T), beta = zero(T))   # A := Qᴴ·A
-    copyto!(A, tmp)
-    return Q
+    return nothing
 end
 
 # dggev eigenvector normalization (REAL, real-packed VR): scale each eigenvector so its largest-magnitude
@@ -135,18 +154,28 @@ function _ggev_core!(
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
     wantvr = jobvr === 'V'
     n == 0 && return nothing
-    alphaC = _ggev_cwork(T, n)
-    _ggev_qrB!(A, B, n, 'T')
-    if wantvr
-        gghrd!('N', 'I', A, B, VR, VR)
-        hgeqz!('S', 'N', 'V', A, B, alphaC, beta, VR, VR)
-        tgevc!('R', 'B', A, B, VL, VR)
-    else
-        gghrd!('N', 'N', A, B, VR, VR)
-        hgeqz!('E', 'N', 'N', A, B, alphaC, beta, VR, VR)
-    end
-    @inbounds for i in 1:n
-        alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
+    # `alphaC` is the COMPLEX eigenvalue staging a REAL pencil still needs (hgeqz! reports α complex for
+    # both types), so the borrow is `Complex{T}` — the arena's answer to the field that had to live on
+    # `_l3ws(Complex{T})`. No fill!: hgeqz! assigns alpha[i] for every i in 1:n on every exit, before the
+    # split below reads it back.
+    # ESCAPE AUDIT: `alphaC` reaches only hgeqz! (qz.jl), which writes it and returns; gghrd!/tgevc! never
+    # see it and nothing stores it. The scope has to span the whole pipeline because hgeqz! is what fills
+    # alphaC and the alphar/alphai split is what empties it — both are inside, so no handle crosses the
+    # closing `end`. `_ggev_qrB!` opens its own nested scope, which is exactly what nesting is for.
+    @scope arn begin
+        alphaC = borrow!(arn, Complex{T}, n)
+        _ggev_qrB!(A, B, n, 'T')
+        if wantvr
+            gghrd!('N', 'I', A, B, VR, VR)
+            hgeqz!('S', 'N', 'V', A, B, alphaC, beta, VR, VR)
+            tgevc!('R', 'B', A, B, VL, VR)
+        else
+            gghrd!('N', 'N', A, B, VR, VR)
+            hgeqz!('E', 'N', 'N', A, B, alphaC, beta, VR, VR)
+        end
+        @inbounds for i in 1:n
+            alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
+        end
     end
     wantvr && _ggev_normalize_real!(VR, alphai, n)
     return nothing
@@ -214,8 +243,7 @@ function _gges_core!(
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("gges!: A and B must be square and the same size"))
     n == 0 && return nothing
-    Qb = _ggev_qrB!(A, B, n, 'T')
-    copyto!(VSL, Qb)                                       # VSL starts as Q_B, gghrd/hgeqz post-multiply Q
+    _ggev_qrB!(A, B, n, 'T', VSL)                          # VSL starts as Q_B, gghrd/hgeqz post-multiply Q
     gghrd!('V', 'I', A, B, VSL, VSR)
     hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
     return nothing
@@ -229,8 +257,7 @@ function _gges_core!(
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("gges!: A and B must be square and the same size"))
     n == 0 && return nothing
-    Qb = _ggev_qrB!(A, B, n, 'C')
-    copyto!(VSL, Qb)
+    _ggev_qrB!(A, B, n, 'C', VSL)                          # VSL starts as Q_B (see the real method above)
     gghrd!('V', 'I', A, B, VSL, VSR)
     hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
     return nothing

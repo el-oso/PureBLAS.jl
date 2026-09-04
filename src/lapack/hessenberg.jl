@@ -262,19 +262,30 @@ function gehrd!(
         tau[i] = zero(T)
     end
     (ihi - ilo < 1) && return A
-    v = _gehrd_work(T, Int(ihi) - Int(ilo) + 1)   # owned; v[1:m] fully written each iteration, no fill!
-    @inbounds for i in Int(ilo):(Int(ihi) - 1)
-        m = ihi - i                                  # reflector length (rows i+1:ihi)
-        β, τ = _larfg!(view(A, (i + 1):ihi, i))          # essential v now in A[i+2:ihi,i]; A[i+1,i] left as α
-        tau[i] = τ
-        v[1] = one(T)
-        for r in 2:m
-            v[r] = A[i + r, i]
+    # Arena borrow (arena.jl), not the old owned `gehrdv` field: the reflector staging vector, hoisted ABOVE
+    # the reflector loop as @scope requires. The length is loop-invariant (only the live prefix v[1:m]
+    # shrinks), and v[1:m] is fully written from A before it is read each iteration, so no fill!. Exact
+    # length, no anti-aliasing stride: the field it replaces named none.
+    # NOTHING ESCAPES. `vv = view(v, 1:m)` is a PtrVector alias of the borrow and reaches exactly two
+    # callees — `_larf_right!` (this file) and `_house_left!` (svd.jl). Both only READ v, elementwise or
+    # through a `pointer(v)` inside a `GC.@preserve` that ends with the call, and both return their `C`
+    # argument; neither stores it in a field, a global or a closure. `_larfg!` never sees it. The returned
+    # `A` and the written `tau` are the caller's own arrays.
+    @scope arn begin
+        v = borrow!(arn, T, Int(ihi) - Int(ilo) + 1)
+        @inbounds for i in Int(ilo):(Int(ihi) - 1)
+            m = ihi - i                                  # reflector length (rows i+1:ihi)
+            β, τ = _larfg!(view(A, (i + 1):ihi, i))          # essential v now in A[i+2:ihi,i]; A[i+1,i] left as α
+            tau[i] = τ
+            v[1] = one(T)
+            for r in 2:m
+                v[r] = A[i + r, i]
+            end
+            vv = view(v, 1:m)
+            _larf_right!(view(A, 1:ihi, (i + 1):ihi), vv, τ)                 # A := A·H(i)   (right, τ)
+            i < n && _house_left!(view(A, (i + 1):ihi, (i + 1):n), vv, conj(τ))  # A := H(i)ᴴ·A (left, conj τ)
+            A[i + 1, i] = β                                # subdiagonal element
         end
-        vv = view(v, 1:m)
-        _larf_right!(view(A, 1:ihi, (i + 1):ihi), vv, τ)                 # A := A·H(i)   (right, τ)
-        i < n && _house_left!(view(A, (i + 1):ihi, (i + 1):n), vv, conj(τ))  # A := H(i)ᴴ·A (left, conj τ)
-        A[i + 1, i] = β                                # subdiagonal element
     end
     return A
 end
@@ -305,11 +316,20 @@ function orghr!(
     ) where {T <: Number}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("orghr!: A must be square"))
-    Q = _orghr_q(T, n)
-    _orghr_into!(Q, A, ilo, ihi, tau)
-    copyto!(A, Q)
-    return A                                   # A now HOLDS Q; `Q` itself is owned workspace and must
-end                                            # never escape — the next call overwrites it.
+    # Arena borrow (arena.jl), not the old owned `orghrq` field: the n×n accumulation target. Exact ld (= n)
+    # — the field it replaces named no anti-aliasing stride — and no fill! here, because `_orghr_into!`'s
+    # first statement is its own fill!(Q, 0) + unit-diagonal write.
+    # NOTHING ESCAPES. `Q` reaches exactly two callees: `_orghr_into!` (below — it writes Q and returns it,
+    # and that return value is discarded here) and `copyto!`, which reads it. `_orghr_into!` opens its own
+    # nested @scope for its `v`, whose borrow is released before this one; it retains nothing across the
+    # call. By the time this block exits the values live in the caller's `A`, and the handle dies here.
+    @scope arn begin
+        Q = borrow!(arn, T, n, n)
+        _orghr_into!(Q, A, ilo, ihi, tau)
+        copyto!(A, Q)
+    end
+    return A                                   # A now HOLDS Q; the borrow itself is dead past the @scope.
+end
 
 # Non-destructive orghr: build Q into a caller-supplied buffer, leaving `A` (the reflector store) intact.
 # This is what lets `ormhr!` drop its `copy(A)`. `Q` MUST NOT alias `A`: the loop reads reflectors out of
@@ -328,14 +348,23 @@ function _orghr_into!(
         Q[i, i] = one(T)
     end
     if ihi - ilo >= 1
-        v = _orghr_v(T, Int(ihi) - Int(ilo) + 1)   # owned; v[1:m] fully written each iteration
-        @inbounds for i in (Int(ihi) - 1):-1:Int(ilo)
-            m = ihi - i
-            v[1] = one(T)
-            for r in 2:m
-                v[r] = A[i + r, i]
+        # Arena borrow (arena.jl), not the old owned `orghrv` field: reflector staging, hoisted ABOVE the
+        # loop as @scope requires (the length is loop-invariant; v[1:m] is fully written from A before it is
+        # read, so no fill!). Still a buffer DISTINCT from gehrd!'s — ormhr! → _orghr_into! is a real nesting
+        # chain — but under the arena that is automatic: each scope bumps its own bytes.
+        # NOTHING ESCAPES. `view(v, 1:m)` reaches only `_house_left!` (svd.jl), which reads it (elementwise,
+        # or via `pointer(v)` inside a `GC.@preserve` bounded by the call) and returns its `C` argument. The
+        # `Q` returned below is the CALLER's matrix — never this borrow.
+        @scope arn begin
+            v = borrow!(arn, T, Int(ihi) - Int(ilo) + 1)
+            @inbounds for i in (Int(ihi) - 1):-1:Int(ilo)
+                m = ihi - i
+                v[1] = one(T)
+                for r in 2:m
+                    v[r] = A[i + r, i]
+                end
+                _house_left!(view(Q, (i + 1):ihi, 1:n), view(v, 1:m), tau[i])
             end
-            _house_left!(view(Q, (i + 1):ihi, 1:n), view(v, 1:m), tau[i])
         end
     end
     return Q
@@ -347,7 +376,7 @@ unghr!(A::AbstractMatrix{T}, ilo::Integer, ihi::Integer, tau::AbstractVector{T})
 # ── ormhr / unmhr — apply Q from gehrd reflectors to a general matrix C ────────────────────────────────
 # LAPACK dormhr/zunmhr applies Q (or Qᴴ) WITHOUT first forming it (a dedicated reflector sweep). Correct-
 # ness-first / ponytail: `orghr!` already forms Q correctly and cheaply enough for this batch's scope (a
-# direct-LAPACK-caller symbol, not on any PureBLAS-internal hot path) — form Q into owned workspace with
+# direct-LAPACK-caller symbol, not on any PureBLAS-internal hot path) — form Q into an arena borrow with
 # `_orghr_into!` (which leaves A unchanged, as C-ABI dormhr/zunmhr requires) then apply via PureBLAS's own
 # `gemm!` (trim-safe; avoids routing through `Base.:*`'s generic BLAS dispatch).
 """
@@ -362,18 +391,30 @@ function ormhr!(
         tau::AbstractVector{T}, C::AbstractMatrix{T}
     ) where {T <: Number}
     n = size(A, 1)
-    # Both arms stage into a buffer of exactly size(C), so ONE role, one field. No fill!: each gemm! runs
-    # beta = 0, a pure overwrite of the whole tile.
-    Q, tmp = _ormhr_work(T, n, size(C, 1), size(C, 2))
-    _orghr_into!(Q, A, ilo, ihi, tau)          # non-destructive ⇒ the old `copy(A)` is gone
-    ct = T <: Complex ? 'C' : 'T'
-    top = trans == 'N' ? 'N' : ct
-    if side == 'L'
-        gemm!(tmp, Q, C; transA = top, alpha = one(T), beta = zero(T))
-    else
-        gemm!(tmp, C, Q; transB = top, alpha = one(T), beta = zero(T))
+    # Arena borrows (arena.jl), replacing the owned `mhrq`/`mhrc` pair: ormhr!'s OWN Q — distinct from
+    # orghr!'s because ormhr! NESTS `_orghr_into!`, which under the arena is automatic — and the gemm!
+    # staging tile. Both side='L'/'R' arms stage into a buffer of exactly size(C), mutually exclusive
+    # branches of one call, so ONE borrow. Exact lds (neither field named an anti-aliasing stride). No
+    # fill!: Q is fully written by `_orghr_into!`, and each gemm! runs beta = 0, a pure overwrite of the
+    # whole mc×nc tile.
+    # NOTHING ESCAPES. `Q` reaches `_orghr_into!` (writes it, returns it — return discarded; it opens its
+    # own nested @scope whose borrow is released first) and `gemm!` as a read-only operand. `tmp` reaches
+    # `gemm!` as its C argument and then `copyto!`. `gemm!` packs/reads its operands and writes its output
+    # tile within the call — it stores no operand in a field, a global or a closure — and the result is
+    # copied into the caller's `C` before this block exits. Only `C` (the caller's) is returned.
+    @scope arn begin
+        Q = borrow!(arn, T, n, n)
+        tmp = borrow!(arn, T, size(C, 1), size(C, 2))
+        _orghr_into!(Q, A, ilo, ihi, tau)          # non-destructive ⇒ the old `copy(A)` is gone
+        ct = T <: Complex ? 'C' : 'T'
+        top = trans == 'N' ? 'N' : ct
+        if side == 'L'
+            gemm!(tmp, Q, C; transA = top, alpha = one(T), beta = zero(T))
+        else
+            gemm!(tmp, C, Q; transB = top, alpha = one(T), beta = zero(T))
+        end
+        copyto!(C, tmp)
     end
-    copyto!(C, tmp)
     return C
 end
 const unmhr! = ormhr!

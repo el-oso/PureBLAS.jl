@@ -723,10 +723,15 @@ function _dtgex2_big!(
         end
         _tgs_matmul!(M1, false, false, LI, QL2); copyto!(LI, M1)
         _tgs_matmul!(M1, true, false, IR, IR2); copyto!(IR, M1)
-        # accumulate into Q, Z — the only part of this routine that scales with n
-        bufq, bufz = _tgex2_accum(R, n, m)
+        # accumulate into Q, Z — the only part of this routine that scales with n, i.e. the whole O(n²)
+        # term. ONE n×m borrow serves BOTH roles: the wantq and wantz blocks run strictly sequentially and
+        # each fully writes buf[1:n,1:m] in its gather loop before reading it back, so the two never need to
+        # be live at once (`_tgex2_accum` kept a field per role only because a field cannot be re-lent).
+        # No fill! for the same reason: every element is assigned by the gather loop. NOTHING ESCAPES —
+        # `buf` is read and written only by the four loops immediately below, is passed to no callee, and
+        # dies with the scope opened at the top of this routine.
+        buf = borrow!(arn, R, n, m)
         if wantq
-            buf = bufq
             @inbounds for j in 1:m, i in 1:n
                 s = ZERO
                 for k in 1:m
@@ -739,7 +744,6 @@ function _dtgex2_big!(
             end
         end
         if wantz
-            buf = bufz
             @inbounds for j in 1:m, i in 1:n
                 s = ZERO
                 for k in 1:m
@@ -1050,34 +1054,42 @@ function _dtgsen!(
         end
     end
     # Compute generalized eigenvalues of the reordered pair and normalize (sign of B's diagonal).
-    # No fill! on the scratch: the loop below assigns alphar[k], alphai[k] and beta[k] at every k on
-    # both the 2×2 and the 1×1 branch (the old `zeros` was never load-bearing).
-    alphar, alphai = _tgsen_alpha_work(R, n)
-    k = 1
-    @inbounds while k <= n
-        if k < n && A[k + 1, k] != ZERO
-            a11 = A[k, k]; a21 = A[k + 1, k]; a12 = A[k, k + 1]; a22 = A[k + 1, k + 1]
-            b11 = B[k, k]; b12 = B[k, k + 1]; b22 = B[k + 1, k + 1]
-            s1, s2, wr1, wr2, wi = _tgs_dlag2(a11, a21, a12, a22, b11, b12, b22, _syl_safmin(R))
-            beta[k] = s1; beta[k + 1] = s2
-            alphar[k] = wr1; alphar[k + 1] = wr2
-            alphai[k] = wi; alphai[k + 1] = -wi
-            k += 2
-        else
-            if B[k, k] < ZERO
-                for i in 1:n
-                    A[k, i] = -A[k, i]; B[k, i] = -B[k, i]
-                    Q[i, k] = -Q[i, k]
+    # The alphar/alphai scratch is an arena borrow (arena.jl), not an owned field: both are hoisted ABOVE
+    # the eigenvalue walk (a `while`, so a borrow inside it would be rejected anyway) and the scope spans
+    # the walk plus the combine loop that folds them into the caller's complex `alpha` — the last read.
+    # No fill!: the walk assigns alphar[k], alphai[k] and beta[k] at every k on both the 2×2 and the 1×1
+    # branch (the old `zeros` was never load-bearing). NOTHING ESCAPES: neither handle is passed to any
+    # callee (`_tgs_dlag2` takes scalars), stored, or captured; the returned tuple carries the caller's
+    # own `alpha`/`beta`/`A`/`B`/`Q`/`Z`, never the borrows.
+    @scope arn begin
+        alphar = borrow!(arn, R, n)
+        alphai = borrow!(arn, R, n)
+        k = 1
+        @inbounds while k <= n
+            if k < n && A[k + 1, k] != ZERO
+                a11 = A[k, k]; a21 = A[k + 1, k]; a12 = A[k, k + 1]; a22 = A[k + 1, k + 1]
+                b11 = B[k, k]; b12 = B[k, k + 1]; b22 = B[k + 1, k + 1]
+                s1, s2, wr1, wr2, wi = _tgs_dlag2(a11, a21, a12, a22, b11, b12, b22, _syl_safmin(R))
+                beta[k] = s1; beta[k + 1] = s2
+                alphar[k] = wr1; alphar[k + 1] = wr2
+                alphai[k] = wi; alphai[k + 1] = -wi
+                k += 2
+            else
+                if B[k, k] < ZERO
+                    for i in 1:n
+                        A[k, i] = -A[k, i]; B[k, i] = -B[k, i]
+                        Q[i, k] = -Q[i, k]
+                    end
                 end
+                alphar[k] = A[k, k]; alphai[k] = ZERO; beta[k] = B[k, k]
+                k += 1
             end
-            alphar[k] = A[k, k]; alphai[k] = ZERO; beta[k] = B[k, k]
-            k += 1
         end
+        @inbounds for i in 1:n
+            alpha[i] = Complex(alphar[i], alphai[i])
+        end
+        return A, B, alpha, beta, Q, Z
     end
-    @inbounds for i in 1:n
-        alpha[i] = Complex(alphar[i], alphai[i])
-    end
-    return A, B, alpha, beta, Q, Z
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════

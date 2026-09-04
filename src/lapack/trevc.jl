@@ -271,243 +271,257 @@ function _dtrevc_right!(over::Bool, T::AbstractMatrix{R}, VR::AbstractMatrix{R})
     ulp = eps(R)
     smlnum = unfl * (R(n) / ulp)
     bignum = (ONE - ulp) / smlnum
-    # column 1-norms of strict upper triangle. `cnorm` arrives ZEROED from the accessor and that is
-    # load-bearing: the loop below accumulates with `+=` and never touches cnorm[1], while the consumers
-    # (the bignum/xnorm tests) read cnorm[j] and cnorm[j-1] unconditionally with j reaching 1.
-    # xr/xi need no zeroing — every branch writes them down to 1:ki before any read.
-    cnorm, xr, xi = _trevc_rwork(R, n)          # WORK(1+N..) real part / WORK(1+N2..) imag part
-    @inbounds for j in 2:n, i in 1:(j - 1)
-        cnorm[j] += abs(T[i, j])
-    end
-    ip = 0
-    is = n
-    ki = n
-    @inbounds while ki >= 1
-        skip = false
-        if ip == 1
-            skip = true       # this column handled by the previous (complex pair)
-        else
-            if ki != 1 && T[ki, ki - 1] != ZERO
-                ip = -1
-            end
+    # Arena borrows (arena.jl), not owned fields. All three are hoisted above the `ki` loop — they are
+    # loop-invariant length-n buffers, and a borrow inside the loop is rejected by `@scope` anyway.
+    # `cnorm` MUST be zeroed HERE, exactly as the accessor it replaces did, and that is load-bearing:
+    # the loop below accumulates with `+=` and never touches cnorm[1], while the consumers (the
+    # bignum/xnorm tests) read cnorm[j] and cnorm[j-1] unconditionally with j reaching 1. An arena
+    # borrow hands back UNDEFINED bytes, so dropping the fill! would feed stale slab content into those
+    # tests. xr/xi need no zeroing — every branch writes them down to 1:ki before any read.
+    # Exact `ld` (no `_odd_ld`/`_offway_ld`): these are vectors, and the fields they replace carried no
+    # anti-aliasing stride requirement.
+    # NOTHING ESCAPES this scope. cnorm/xr/xi are read and written only by the loop below; the single
+    # callee that sees their contents is `_dlaln2`, which takes SCALARS (`xr[j]`, `xi[j-1]`, …) and
+    # returns scalars — no handle crosses the call. `_iamax` is passed a `view(VR, …)`, never a borrow.
+    # The function's return value is `VR`, the caller's own matrix. No closure, field or global here.
+    @scope arn begin
+        cnorm = borrow!(arn, R, n)                  # WORK(1+N..) column 1-norms
+        xr = borrow!(arn, R, n)                     # WORK(1+N2..) real part
+        xi = borrow!(arn, R, n)                     # imaginary part
+        fill!(cnorm, ZERO)
+        @inbounds for j in 2:n, i in 1:(j - 1)
+            cnorm[j] += abs(T[i, j])
         end
-        if !skip
-            wr = T[ki, ki]; wi = ZERO
-            ip != 0 && (wi = sqrt(abs(T[ki, ki - 1])) * sqrt(abs(T[ki - 1, ki])))
-            smin = max(ulp * (abs(wr) + abs(wi)), smlnum)
-
-            if ip == 0
-                # ---- real right eigenvector ----
-                xr[ki] = ONE
-                for k in 1:(ki - 1)
-                    xr[k] = -T[k, ki]
-                end
-                jnxt = ki - 1
-                j = ki - 1
-                while j >= 1
-                    if j > jnxt
-                        j -= 1; continue
-                    end
-                    j1 = j; j2 = j; jnxt = j - 1
-                    if j > 1 && T[j, j - 1] != ZERO
-                        j1 = j - 1; jnxt = j - 2
-                    end
-                    if j1 == j2
-                        x11, _, _, _, scale, xnorm =
-                            _dlaln2(1, 1, smin, T[j, j], ZERO, ZERO, ZERO, xr[j], ZERO, ZERO, ZERO, wr, ZERO)
-                        if xnorm > ONE && cnorm[j] > bignum / xnorm
-                            x11 /= xnorm; scale /= xnorm
-                        end
-                        if scale != ONE
-                            for k in 1:ki
-                                xr[k] *= scale
-                            end
-                        end
-                        xr[j] = x11
-                        for k in 1:(j - 1)
-                            xr[k] -= x11 * T[k, j]
-                        end
-                    else
-                        x11, x21, _, _, scale, xnorm =
-                            _dlaln2(
-                            2, 1, smin, T[j - 1, j - 1], T[j - 1, j], T[j, j - 1], T[j, j],
-                            xr[j - 1], xr[j], ZERO, ZERO, wr, ZERO
-                        )
-                        if xnorm > ONE
-                            beta = max(cnorm[j - 1], cnorm[j])
-                            if beta > bignum / xnorm
-                                x11 /= xnorm; x21 /= xnorm; scale /= xnorm
-                            end
-                        end
-                        if scale != ONE
-                            for k in 1:ki
-                                xr[k] *= scale
-                            end
-                        end
-                        xr[j - 1] = x11; xr[j] = x21
-                        for k in 1:(j - 2)
-                            xr[k] -= x11 * T[k, j - 1]
-                        end
-                        for k in 1:(j - 2)
-                            xr[k] -= x21 * T[k, j]
-                        end
-                    end
-                    j = j1 - 1
-                end
-                # copy x or Z·x to VR and normalize
-                if !over
-                    for k in 1:ki
-                        VR[k, is] = xr[k]
-                    end
-                    ii = _iamax(view(VR, :, is), ki)
-                    remax = ONE / abs(VR[ii, is])
-                    for k in 1:ki
-                        VR[k, is] *= remax
-                    end
-                    for k in (ki + 1):n
-                        VR[k, is] = ZERO
-                    end
-                else
-                    if ki > 1
-                        for row in 1:n
-                            acc = xr[ki] * VR[row, ki]
-                            for k in 1:(ki - 1)
-                                acc += VR[row, k] * xr[k]
-                            end
-                            VR[row, ki] = acc
-                        end
-                    end
-                    ii = _iamax(view(VR, :, ki), n)
-                    remax = ONE / abs(VR[ii, ki])
-                    for k in 1:n
-                        VR[k, ki] *= remax
-                    end
-                end
+        ip = 0
+        is = n
+        ki = n
+        @inbounds while ki >= 1
+            skip = false
+            if ip == 1
+                skip = true       # this column handled by the previous (complex pair)
             else
-                # ---- complex right eigenvector (pair at columns ki-1, ki) ----
-                if abs(T[ki - 1, ki]) >= abs(T[ki, ki - 1])
-                    xr[ki - 1] = ONE
-                    xi[ki] = wi / T[ki - 1, ki]
-                else
-                    xr[ki - 1] = -wi / T[ki, ki - 1]
-                    xi[ki] = ONE
-                end
-                xr[ki] = ZERO; xi[ki - 1] = ZERO
-                for k in 1:(ki - 2)
-                    xr[k] = -xr[ki - 1] * T[k, ki - 1]
-                    xi[k] = -xi[ki] * T[k, ki]
-                end
-                jnxt = ki - 2
-                j = ki - 2
-                while j >= 1
-                    if j > jnxt
-                        j -= 1; continue
-                    end
-                    j1 = j; j2 = j; jnxt = j - 1
-                    if j > 1 && T[j, j - 1] != ZERO
-                        j1 = j - 1; jnxt = j - 2
-                    end
-                    if j1 == j2
-                        x11, _, x12, _, scale, xnorm =
-                            _dlaln2(1, 2, smin, T[j, j], ZERO, ZERO, ZERO, xr[j], ZERO, xi[j], ZERO, wr, wi)
-                        if xnorm > ONE && cnorm[j] > bignum / xnorm
-                            x11 /= xnorm; x12 /= xnorm; scale /= xnorm
-                        end
-                        if scale != ONE
-                            for k in 1:ki
-                                xr[k] *= scale; xi[k] *= scale
-                            end
-                        end
-                        xr[j] = x11; xi[j] = x12
-                        for k in 1:(j - 1)
-                            xr[k] -= x11 * T[k, j]
-                        end
-                        for k in 1:(j - 1)
-                            xi[k] -= x12 * T[k, j]
-                        end
-                    else
-                        x11, x21, x12, x22, scale, xnorm =
-                            _dlaln2(
-                            2, 2, smin, T[j - 1, j - 1], T[j - 1, j], T[j, j - 1], T[j, j],
-                            xr[j - 1], xr[j], xi[j - 1], xi[j], wr, wi
-                        )
-                        if xnorm > ONE
-                            beta = max(cnorm[j - 1], cnorm[j])
-                            if beta > bignum / xnorm
-                                rec = ONE / xnorm
-                                x11 *= rec; x12 *= rec; x21 *= rec; x22 *= rec; scale *= rec
-                            end
-                        end
-                        if scale != ONE
-                            for k in 1:ki
-                                xr[k] *= scale; xi[k] *= scale
-                            end
-                        end
-                        xr[j - 1] = x11; xr[j] = x21; xi[j - 1] = x12; xi[j] = x22
-                        for k in 1:(j - 2)
-                            xr[k] -= x11 * T[k, j - 1]
-                        end
-                        for k in 1:(j - 2)
-                            xr[k] -= x21 * T[k, j]
-                        end
-                        for k in 1:(j - 2)
-                            xi[k] -= x12 * T[k, j - 1]
-                        end
-                        for k in 1:(j - 2)
-                            xi[k] -= x22 * T[k, j]
-                        end
-                    end
-                    j = j1 - 1
-                end
-                # copy and normalize the pair
-                if !over
-                    for k in 1:ki
-                        VR[k, is - 1] = xr[k]; VR[k, is] = xi[k]
-                    end
-                    emax = ZERO
-                    for k in 1:ki
-                        emax = max(emax, abs(VR[k, is - 1]) + abs(VR[k, is]))
-                    end
-                    remax = ONE / emax
-                    for k in 1:ki
-                        VR[k, is - 1] *= remax; VR[k, is] *= remax
-                    end
-                    for k in (ki + 1):n
-                        VR[k, is - 1] = ZERO; VR[k, is] = ZERO
-                    end
-                else
-                    if ki > 2
-                        for row in 1:n
-                            accr = xr[ki - 1] * VR[row, ki - 1]
-                            acci = xi[ki] * VR[row, ki]
-                            for k in 1:(ki - 2)
-                                accr += VR[row, k] * xr[k]
-                                acci += VR[row, k] * xi[k]
-                            end
-                            VR[row, ki - 1] = accr; VR[row, ki] = acci
-                        end
-                    else
-                        for row in 1:n
-                            VR[row, ki - 1] *= xr[ki - 1]
-                            VR[row, ki] *= xi[ki]
-                        end
-                    end
-                    emax = ZERO
-                    for k in 1:n
-                        emax = max(emax, abs(VR[k, ki - 1]) + abs(VR[k, ki]))
-                    end
-                    remax = ONE / emax
-                    for k in 1:n
-                        VR[k, ki - 1] *= remax; VR[k, ki] *= remax
-                    end
+                if ki != 1 && T[ki, ki - 1] != ZERO
+                    ip = -1
                 end
             end
-            is -= 1
-            ip != 0 && (is -= 1)
+            if !skip
+                wr = T[ki, ki]; wi = ZERO
+                ip != 0 && (wi = sqrt(abs(T[ki, ki - 1])) * sqrt(abs(T[ki - 1, ki])))
+                smin = max(ulp * (abs(wr) + abs(wi)), smlnum)
+
+                if ip == 0
+                    # ---- real right eigenvector ----
+                    xr[ki] = ONE
+                    for k in 1:(ki - 1)
+                        xr[k] = -T[k, ki]
+                    end
+                    jnxt = ki - 1
+                    j = ki - 1
+                    while j >= 1
+                        if j > jnxt
+                            j -= 1; continue
+                        end
+                        j1 = j; j2 = j; jnxt = j - 1
+                        if j > 1 && T[j, j - 1] != ZERO
+                            j1 = j - 1; jnxt = j - 2
+                        end
+                        if j1 == j2
+                            x11, _, _, _, scale, xnorm =
+                                _dlaln2(1, 1, smin, T[j, j], ZERO, ZERO, ZERO, xr[j], ZERO, ZERO, ZERO, wr, ZERO)
+                            if xnorm > ONE && cnorm[j] > bignum / xnorm
+                                x11 /= xnorm; scale /= xnorm
+                            end
+                            if scale != ONE
+                                for k in 1:ki
+                                    xr[k] *= scale
+                                end
+                            end
+                            xr[j] = x11
+                            for k in 1:(j - 1)
+                                xr[k] -= x11 * T[k, j]
+                            end
+                        else
+                            x11, x21, _, _, scale, xnorm =
+                                _dlaln2(
+                                2, 1, smin, T[j - 1, j - 1], T[j - 1, j], T[j, j - 1], T[j, j],
+                                xr[j - 1], xr[j], ZERO, ZERO, wr, ZERO
+                            )
+                            if xnorm > ONE
+                                beta = max(cnorm[j - 1], cnorm[j])
+                                if beta > bignum / xnorm
+                                    x11 /= xnorm; x21 /= xnorm; scale /= xnorm
+                                end
+                            end
+                            if scale != ONE
+                                for k in 1:ki
+                                    xr[k] *= scale
+                                end
+                            end
+                            xr[j - 1] = x11; xr[j] = x21
+                            for k in 1:(j - 2)
+                                xr[k] -= x11 * T[k, j - 1]
+                            end
+                            for k in 1:(j - 2)
+                                xr[k] -= x21 * T[k, j]
+                            end
+                        end
+                        j = j1 - 1
+                    end
+                    # copy x or Z·x to VR and normalize
+                    if !over
+                        for k in 1:ki
+                            VR[k, is] = xr[k]
+                        end
+                        ii = _iamax(view(VR, :, is), ki)
+                        remax = ONE / abs(VR[ii, is])
+                        for k in 1:ki
+                            VR[k, is] *= remax
+                        end
+                        for k in (ki + 1):n
+                            VR[k, is] = ZERO
+                        end
+                    else
+                        if ki > 1
+                            for row in 1:n
+                                acc = xr[ki] * VR[row, ki]
+                                for k in 1:(ki - 1)
+                                    acc += VR[row, k] * xr[k]
+                                end
+                                VR[row, ki] = acc
+                            end
+                        end
+                        ii = _iamax(view(VR, :, ki), n)
+                        remax = ONE / abs(VR[ii, ki])
+                        for k in 1:n
+                            VR[k, ki] *= remax
+                        end
+                    end
+                else
+                    # ---- complex right eigenvector (pair at columns ki-1, ki) ----
+                    if abs(T[ki - 1, ki]) >= abs(T[ki, ki - 1])
+                        xr[ki - 1] = ONE
+                        xi[ki] = wi / T[ki - 1, ki]
+                    else
+                        xr[ki - 1] = -wi / T[ki, ki - 1]
+                        xi[ki] = ONE
+                    end
+                    xr[ki] = ZERO; xi[ki - 1] = ZERO
+                    for k in 1:(ki - 2)
+                        xr[k] = -xr[ki - 1] * T[k, ki - 1]
+                        xi[k] = -xi[ki] * T[k, ki]
+                    end
+                    jnxt = ki - 2
+                    j = ki - 2
+                    while j >= 1
+                        if j > jnxt
+                            j -= 1; continue
+                        end
+                        j1 = j; j2 = j; jnxt = j - 1
+                        if j > 1 && T[j, j - 1] != ZERO
+                            j1 = j - 1; jnxt = j - 2
+                        end
+                        if j1 == j2
+                            x11, _, x12, _, scale, xnorm =
+                                _dlaln2(1, 2, smin, T[j, j], ZERO, ZERO, ZERO, xr[j], ZERO, xi[j], ZERO, wr, wi)
+                            if xnorm > ONE && cnorm[j] > bignum / xnorm
+                                x11 /= xnorm; x12 /= xnorm; scale /= xnorm
+                            end
+                            if scale != ONE
+                                for k in 1:ki
+                                    xr[k] *= scale; xi[k] *= scale
+                                end
+                            end
+                            xr[j] = x11; xi[j] = x12
+                            for k in 1:(j - 1)
+                                xr[k] -= x11 * T[k, j]
+                            end
+                            for k in 1:(j - 1)
+                                xi[k] -= x12 * T[k, j]
+                            end
+                        else
+                            x11, x21, x12, x22, scale, xnorm =
+                                _dlaln2(
+                                2, 2, smin, T[j - 1, j - 1], T[j - 1, j], T[j, j - 1], T[j, j],
+                                xr[j - 1], xr[j], xi[j - 1], xi[j], wr, wi
+                            )
+                            if xnorm > ONE
+                                beta = max(cnorm[j - 1], cnorm[j])
+                                if beta > bignum / xnorm
+                                    rec = ONE / xnorm
+                                    x11 *= rec; x12 *= rec; x21 *= rec; x22 *= rec; scale *= rec
+                                end
+                            end
+                            if scale != ONE
+                                for k in 1:ki
+                                    xr[k] *= scale; xi[k] *= scale
+                                end
+                            end
+                            xr[j - 1] = x11; xr[j] = x21; xi[j - 1] = x12; xi[j] = x22
+                            for k in 1:(j - 2)
+                                xr[k] -= x11 * T[k, j - 1]
+                            end
+                            for k in 1:(j - 2)
+                                xr[k] -= x21 * T[k, j]
+                            end
+                            for k in 1:(j - 2)
+                                xi[k] -= x12 * T[k, j - 1]
+                            end
+                            for k in 1:(j - 2)
+                                xi[k] -= x22 * T[k, j]
+                            end
+                        end
+                        j = j1 - 1
+                    end
+                    # copy and normalize the pair
+                    if !over
+                        for k in 1:ki
+                            VR[k, is - 1] = xr[k]; VR[k, is] = xi[k]
+                        end
+                        emax = ZERO
+                        for k in 1:ki
+                            emax = max(emax, abs(VR[k, is - 1]) + abs(VR[k, is]))
+                        end
+                        remax = ONE / emax
+                        for k in 1:ki
+                            VR[k, is - 1] *= remax; VR[k, is] *= remax
+                        end
+                        for k in (ki + 1):n
+                            VR[k, is - 1] = ZERO; VR[k, is] = ZERO
+                        end
+                    else
+                        if ki > 2
+                            for row in 1:n
+                                accr = xr[ki - 1] * VR[row, ki - 1]
+                                acci = xi[ki] * VR[row, ki]
+                                for k in 1:(ki - 2)
+                                    accr += VR[row, k] * xr[k]
+                                    acci += VR[row, k] * xi[k]
+                                end
+                                VR[row, ki - 1] = accr; VR[row, ki] = acci
+                            end
+                        else
+                            for row in 1:n
+                                VR[row, ki - 1] *= xr[ki - 1]
+                                VR[row, ki] *= xi[ki]
+                            end
+                        end
+                        emax = ZERO
+                        for k in 1:n
+                            emax = max(emax, abs(VR[k, ki - 1]) + abs(VR[k, ki]))
+                        end
+                        remax = ONE / emax
+                        for k in 1:n
+                            VR[k, ki - 1] *= remax; VR[k, ki] *= remax
+                        end
+                    end
+                end
+                is -= 1
+                ip != 0 && (is -= 1)
+            end
+            ip == 1 && (ip = 0)
+            ip == -1 && (ip = 1)
+            ki -= 1
         end
-        ip == 1 && (ip = 0)
-        ip == -1 && (ip = 1)
-        ki -= 1
     end
     return VR
 end
@@ -523,58 +537,68 @@ function _ztrevc_right!(over::Bool, T::AbstractMatrix{C}, VR::AbstractMatrix{C})
     unfl = _dtrevc_safmin(R)
     ulp = eps(R)
     smlnum = unfl * (R(n) / ulp)
-    x = _trevc_work(C, n)     # owned; x[1:ki-1] and x[ki] written before any read, no fill! needed
-    is = n
-    @inbounds for ki in n:-1:1
-        smin = max(ulp * cabs1(T[ki, ki]), smlnum)
-        for k in 1:(ki - 1)
-            x[k] = -T[k, ki]
-        end
-        x[ki] = one(C)
-        λ = T[ki, ki]
-        # back-substitution: (T[1:ki-1,1:ki-1] − λ)·x = rhs
-        for j in (ki - 1):-1:1
-            djj = T[j, j] - λ
-            cabs1(djj) < smin && (djj = Complex(smin, zero(R)))
-            xj = x[j] / djj
-            x[j] = xj
-            for k in 1:(j - 1)
-                x[k] -= xj * T[k, j]
+    # Arena borrow (arena.jl), not an owned field. Hoisted above the `ki` loop: it is a loop-invariant
+    # length-n buffer, and `@scope` rejects a borrow inside the loop anyway. No fill! — exactly as the
+    # accessor it replaces documented: x[1:ki-1] and x[ki] are written before any read and reads never
+    # exceed 1:ki, so undefined arena bytes are never observed. Exact `ld` (the field carried no
+    # anti-aliasing stride requirement).
+    # NOTHING ESCAPES this scope: `x` is read and written only inside the loop below and never passed to
+    # any callee at all — the only calls here are `cabs1`, a local closure over scalars. The return value
+    # is `VR`, the caller's own matrix; no field, global or closure retains a handle.
+    @scope arn begin
+        x = borrow!(arn, C, n)
+        is = n
+        @inbounds for ki in n:-1:1
+            smin = max(ulp * cabs1(T[ki, ki]), smlnum)
+            for k in 1:(ki - 1)
+                x[k] = -T[k, ki]
             end
-        end
-        if !over
-            for k in 1:ki
-                VR[k, is] = x[k]
-            end
-            ii = 1; best = cabs1(VR[1, is])
-            for k in 2:ki
-                c = cabs1(VR[k, is]); c > best && (best = c; ii = k)
-            end
-            remax = one(R) / cabs1(VR[ii, is])
-            for k in 1:ki
-                VR[k, is] *= remax
-            end
-            for k in (ki + 1):n
-                VR[k, is] = zero(C)
-            end
-            is -= 1
-        else
-            if ki > 1
-                for row in 1:n
-                    acc = x[ki] * VR[row, ki]
-                    for k in 1:(ki - 1)
-                        acc += VR[row, k] * x[k]
-                    end
-                    VR[row, ki] = acc
+            x[ki] = one(C)
+            λ = T[ki, ki]
+            # back-substitution: (T[1:ki-1,1:ki-1] − λ)·x = rhs
+            for j in (ki - 1):-1:1
+                djj = T[j, j] - λ
+                cabs1(djj) < smin && (djj = Complex(smin, zero(R)))
+                xj = x[j] / djj
+                x[j] = xj
+                for k in 1:(j - 1)
+                    x[k] -= xj * T[k, j]
                 end
             end
-            ii = 1; best = cabs1(VR[1, ki])
-            for k in 2:n
-                c = cabs1(VR[k, ki]); c > best && (best = c; ii = k)
-            end
-            remax = one(R) / cabs1(VR[ii, ki])
-            for k in 1:n
-                VR[k, ki] *= remax
+            if !over
+                for k in 1:ki
+                    VR[k, is] = x[k]
+                end
+                ii = 1; best = cabs1(VR[1, is])
+                for k in 2:ki
+                    c = cabs1(VR[k, is]); c > best && (best = c; ii = k)
+                end
+                remax = one(R) / cabs1(VR[ii, is])
+                for k in 1:ki
+                    VR[k, is] *= remax
+                end
+                for k in (ki + 1):n
+                    VR[k, is] = zero(C)
+                end
+                is -= 1
+            else
+                if ki > 1
+                    for row in 1:n
+                        acc = x[ki] * VR[row, ki]
+                        for k in 1:(ki - 1)
+                            acc += VR[row, k] * x[k]
+                        end
+                        VR[row, ki] = acc
+                    end
+                end
+                ii = 1; best = cabs1(VR[1, ki])
+                for k in 2:n
+                    c = cabs1(VR[k, ki]); c > best && (best = c; ii = k)
+                end
+                remax = one(R) / cabs1(VR[ii, ki])
+                for k in 1:n
+                    VR[k, ki] *= remax
+                end
             end
         end
     end

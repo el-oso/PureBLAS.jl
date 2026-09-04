@@ -122,103 +122,117 @@ function stebz!(
     # the loop below writes every index 1..n−1 unconditionally on both branches before either reader
     # (the Gershgorin loop, `_sturm_negcount`) runs, and the only never-written slot — e2[1] at n==1 —
     # is never read (both readers' loops are empty at n==1).
-    e2, perm, perm2, idx, gw, gi = _stebz_work(T, n)
-    ns = 0
-    pivmin = one(T)
-    @inbounds for j in 2:n
-        t = e[j - 1]^2
-        if abs(d[j] * d[j - 1]) * ulp^2 + safmin > t
-            e2[j - 1] = zero(T); ns += 1; isplit[ns] = j - 1   # negligible off-diagonal → split here
-        else
-            e2[j - 1] = t; pivmin = max(pivmin, t)
-        end
-    end
-    ns += 1; isplit[ns] = n
-    pivmin *= safmin
-
-    # ── global Gershgorin bounds [gl,gu], norm, absolute tolerance atoli ────────────────────────────
-    gu = d[1]; gl = d[1]; tprev = zero(T)
-    @inbounds for j in 1:(n - 1)
-        tcur = sqrt(e2[j])
-        gu = max(gu, d[j] + tprev + tcur)
-        gl = min(gl, d[j] - tprev - tcur)
-        tprev = tcur
-    end
-    gu = max(gu, d[n] + tprev); gl = min(gl, d[n] - tprev)
-    tnorm = max(abs(gl), abs(gu))
-    gl = gl - fudge * tnorm * ulp * n - fudge * 2 * pivmin
-    gu = gu + fudge * tnorm * ulp * n + fudge * pivmin
-    atoli = abstol <= 0 ? ulp * tnorm : T(abstol)
-
-    # ── per block, bisect the selected eigenvalues ─────────────────────────────────────────────────
-    # 'A': all; 'V': those in (vl,vu] via per-block Sturm counts at the interval ends; 'I': all here,
-    # then sliced to the global index band il:iu below (robust under clustering, where value-boundary
-    # bisection can miscount). Blocks emerge in natural order, ascending within block.
-    mc = 0
-    ibegin = 1
-    @inbounds for jb in 1:ns
-        i1 = ibegin; i2 = Int(isplit[jb]); ibegin = i2 + 1
-        if range == 'V'
-            nlo = _sturm_negcount(d, e2, i1, i2, vl, pivmin)
-            nhi = _sturm_negcount(d, e2, i1, i2, vu, pivmin)
-        else                               # 'A' and 'I' start from the full block
-            nlo = 0; nhi = i2 - i1 + 1
-        end
-        for kloc in (nlo + 1):nhi
-            λ = _sturm_bisect(d, e2, i1, i2, kloc, gl, gu, pivmin, atoli, rtoli)
-            mc += 1; w[mc] = λ; iblock[mc] = jb
-        end
-    end
-
-    # NOT `sortperm!`, and NOT the default algorithm — both were measured, both are wrong here:
-    #   * Base's default (adaptive) sort allocates a scratch buffer (1888 B at n=129); `QuickSort` is
-    #     fully in-place, and costs no reproducibility because Base's `Perm` ordering breaks ties by
-    #     index itself, so the permutation is identical to the default's whatever the algorithm
-    #     (verified over 200 tie-saturated inputs).
-    #   * `sortperm!` carries an `axes(ix) != axes(A)` guard whose message interpolates an `Any`, so it
-    #     lowers to the despecialized `string(...)` that `juliac --trim=safe` rejects — it failed the
-    #     LAPACK trim-compatibility dogfood. Seeding the identity and sorting under `Perm` is the same
-    #     computation without that guard.
-    if range == 'I'                        # keep only the global index band il:iu (ascending)
-        p = view(perm, 1:mc)
-        @inbounds for t in 1:mc
-            p[t] = t
-        end
-        sort!(p, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))
-        # Positions of the wanted eigenvalues, back in block-major (ascending position) order. Invert
-        # p into idx, then compact in place — the compaction target k never runs ahead of the read
-        # cursor t, so each slot is consumed before it is overwritten. O(m), and no second sort (the
-        # obvious `sort!(idx[il:iu])` allocates even under QuickSort).
-        @inbounds for r in 1:mc
-            idx[p[r]] = r
-        end
-        k = 0
-        @inbounds for t in 1:mc
-            r = idx[t]
-            if Int(il) <= r <= Int(iu)
-                k += 1; idx[k] = t
+    # Six arena borrows for one call, all hoisted here (which is where the accessor already sat — none of
+    # the shapes depends on a loop index). `perm`/`perm2` stay SEPARATE borrows, for the reason the field
+    # comment gave: "the first is dead by the time the second is built" is the never-overlap reasoning
+    # that has been wrong here before. `sort!(p, QuickSort, Perm(...))` over a pointer-backed vector is
+    # fine — it is fully in-place, so it never needs `similar`.
+    # ESCAPE AUDIT: `stebz!` returns `(mc, ns, 0)`; every borrow is written and read inside this scope,
+    # and the results are copied out into the caller's `w`/`iblock`/`isplit`.
+    @scope arn begin
+        e2 = borrow!(arn, T, max(n - 1, 1))
+        perm = borrow!(arn, Int, n)
+        perm2 = borrow!(arn, Int, n)
+        idx = borrow!(arn, Int, n)
+        gw = borrow!(arn, T, n)
+        gi = borrow!(arn, Int, n)
+        ns = 0
+        pivmin = one(T)
+        @inbounds for j in 2:n
+            t = e[j - 1]^2
+            if abs(d[j] * d[j - 1]) * ulp^2 + safmin > t
+                e2[j - 1] = zero(T); ns += 1; isplit[ns] = j - 1   # negligible off-diagonal → split here
+            else
+                e2[j - 1] = t; pivmin = max(pivmin, t)
             end
         end
-        iv = view(idx, 1:k)
-        _stebz_gather!(gw, w, iv); _stebz_gather!(gi, iblock, iv)
-        @inbounds for t in 1:k
-            w[t] = gw[t]; iblock[t] = gi[t]
-        end
-        mc = k
-    end
+        ns += 1; isplit[ns] = n
+        pivmin *= safmin
 
-    if order == 'E' && ns > 1
-        p2 = view(perm2, 1:mc)             # own field: `perm` above is a different role (lesson 4)
-        @inbounds for t in 1:mc
-            p2[t] = t
+        # ── global Gershgorin bounds [gl,gu], norm, absolute tolerance atoli ────────────────────────────
+        gu = d[1]; gl = d[1]; tprev = zero(T)
+        @inbounds for j in 1:(n - 1)
+            tcur = sqrt(e2[j])
+            gu = max(gu, d[j] + tprev + tcur)
+            gl = min(gl, d[j] - tprev - tcur)
+            tprev = tcur
         end
-        sort!(p2, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))  # ascending by value
-        _stebz_gather!(gw, w, p2); _stebz_gather!(gi, iblock, p2)
-        @inbounds for t in 1:mc
-            w[t] = gw[t]; iblock[t] = gi[t]
+        gu = max(gu, d[n] + tprev); gl = min(gl, d[n] - tprev)
+        tnorm = max(abs(gl), abs(gu))
+        gl = gl - fudge * tnorm * ulp * n - fudge * 2 * pivmin
+        gu = gu + fudge * tnorm * ulp * n + fudge * pivmin
+        atoli = abstol <= 0 ? ulp * tnorm : T(abstol)
+
+        # ── per block, bisect the selected eigenvalues ─────────────────────────────────────────────────
+        # 'A': all; 'V': those in (vl,vu] via per-block Sturm counts at the interval ends; 'I': all here,
+        # then sliced to the global index band il:iu below (robust under clustering, where value-boundary
+        # bisection can miscount). Blocks emerge in natural order, ascending within block.
+        mc = 0
+        ibegin = 1
+        @inbounds for jb in 1:ns
+            i1 = ibegin; i2 = Int(isplit[jb]); ibegin = i2 + 1
+            if range == 'V'
+                nlo = _sturm_negcount(d, e2, i1, i2, vl, pivmin)
+                nhi = _sturm_negcount(d, e2, i1, i2, vu, pivmin)
+            else                               # 'A' and 'I' start from the full block
+                nlo = 0; nhi = i2 - i1 + 1
+            end
+            for kloc in (nlo + 1):nhi
+                λ = _sturm_bisect(d, e2, i1, i2, kloc, gl, gu, pivmin, atoli, rtoli)
+                mc += 1; w[mc] = λ; iblock[mc] = jb
+            end
         end
+
+        # NOT `sortperm!`, and NOT the default algorithm — both were measured, both are wrong here:
+        #   * Base's default (adaptive) sort allocates a scratch buffer (1888 B at n=129); `QuickSort` is
+        #     fully in-place, and costs no reproducibility because Base's `Perm` ordering breaks ties by
+        #     index itself, so the permutation is identical to the default's whatever the algorithm
+        #     (verified over 200 tie-saturated inputs).
+        #   * `sortperm!` carries an `axes(ix) != axes(A)` guard whose message interpolates an `Any`, so it
+        #     lowers to the despecialized `string(...)` that `juliac --trim=safe` rejects — it failed the
+        #     LAPACK trim-compatibility dogfood. Seeding the identity and sorting under `Perm` is the same
+        #     computation without that guard.
+        if range == 'I'                        # keep only the global index band il:iu (ascending)
+            p = view(perm, 1:mc)
+            @inbounds for t in 1:mc
+                p[t] = t
+            end
+            sort!(p, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))
+            # Positions of the wanted eigenvalues, back in block-major (ascending position) order. Invert
+            # p into idx, then compact in place — the compaction target k never runs ahead of the read
+            # cursor t, so each slot is consumed before it is overwritten. O(m), and no second sort (the
+            # obvious `sort!(idx[il:iu])` allocates even under QuickSort).
+            @inbounds for r in 1:mc
+                idx[p[r]] = r
+            end
+            k = 0
+            @inbounds for t in 1:mc
+                r = idx[t]
+                if Int(il) <= r <= Int(iu)
+                    k += 1; idx[k] = t
+                end
+            end
+            iv = view(idx, 1:k)
+            _stebz_gather!(gw, w, iv); _stebz_gather!(gi, iblock, iv)
+            @inbounds for t in 1:k
+                w[t] = gw[t]; iblock[t] = gi[t]
+            end
+            mc = k
+        end
+
+        if order == 'E' && ns > 1
+            p2 = view(perm2, 1:mc)             # own field: `perm` above is a different role (lesson 4)
+            @inbounds for t in 1:mc
+                p2[t] = t
+            end
+            sort!(p2, QuickSort, Base.Order.Perm(Base.Order.Forward, view(w, 1:mc)))  # ascending by value
+            _stebz_gather!(gw, w, p2); _stebz_gather!(gi, iblock, p2)
+            @inbounds for t in 1:mc
+                w[t] = gw[t]; iblock[t] = gi[t]
+            end
+        end
+        return mc, ns, 0
     end
-    return mc, ns, 0
 end
 
 # Allocating convenience form — identical behaviour and return value to the pre-workspace stebz!:
@@ -345,17 +359,22 @@ end
 # Random start vector, uniform in (−1,1). ponytail: LAPACK uses DLARNV(2,ISEED,…) (the dlaruv 512-word
 # multiplicative-congruential table). Its ONLY role is a generic nonzero start for inverse iteration;
 # the residual/orthonormality that validate a returned eigenvector cannot distinguish RNGs. A per-call
-# xorshift with a persisting seed reproduces DLARNV's substance (fresh random restart, seed advances)
+# xorshift with an advancing seed reproduces DLARNV's substance (fresh random restart, seed advances)
 # without transcribing 512 magic constants. Upgrade to a true dlaruv port only if bit-identical LAPACK
 # reproduction is ever required.
-@inline function _stein_randvec!(x::AbstractVector{T}, seed::Base.RefValue{UInt64}) where {T <: Real}
-    s = seed[]
+#
+# TAKES AND RETURNS THE SEED BY VALUE — it used to take a `Base.RefValue{UInt64}` that lived as an
+# L3Workspace field, purely because the callee needed a mutable cell to write the advanced state back
+# through. It carried NO state between calls: the accessor reset it to `_STEIN_SEED0` on every `stein!`,
+# which is what makes identical input give bit-identical output (test/reproducibility_tests.jl). A plain
+# `UInt64` threaded through the call reproduces that exactly, and needs neither a field nor a borrow.
+@inline function _stein_randvec!(x::AbstractVector{T}, seed::UInt64) where {T <: Real}
+    s = seed
     @inbounds for i in eachindex(x)
         s ⊻= s << 13; s ⊻= s >> 7; s ⊻= s << 17           # xorshift64
         x[i] = 2 * (T(s >> 11) / T(UInt64(1) << 53)) - one(T)   # uniform in (−1,1)
     end
-    seed[] = s
-    return x
+    return s
 end
 
 """
@@ -398,112 +417,127 @@ function stein!(
     odm1 = T(1) / 10; odm3 = T(1) / 1000; ten = T(10)
     maxits = 5; extra = 2
 
-    # per-block scratch (max block size ≤ n) + the deterministic restart seed (dstein's ISEED
-    # analogue), which the accessor resets per call — exactly the old `Ref(…)`-inside-stein! semantics.
-    av, bv, cv, d2, rhs, inn, seed = _stein_work(T, n)
+    # Per-block scratch (max block size ≤ n), six arena borrows hoisted above `for nblk` / `while j` —
+    # the shapes are bounded by n, not by the block, so nothing needed moving.
+    # The restart seed (dstein's ISEED analogue) is NOT a borrow and is no longer a field: it carried no
+    # state between calls (the accessor reset it to `_STEIN_SEED0` every time, which is what makes
+    # identical input give bit-identical output), so it is a plain local threaded through
+    # `_stein_randvec!`, which now RETURNS the advanced value. Same semantics, one field and one
+    # RefValue less, and no scope needed for it.
+    # ESCAPE AUDIT: `stein!` returns `Z`, the caller's matrix; every borrow is sliced into `av1`…`r1`
+    # and consumed by `_dlagtf!`/`_dlagts!`/`_stein_randvec!` inside this scope.
+    @scope arn begin
+        av = borrow!(arn, T, n)
+        bv = borrow!(arn, T, n)
+        cv = borrow!(arn, T, n)
+        d2 = borrow!(arn, T, n)
+        rhs = borrow!(arn, T, n)
+        inn = borrow!(arn, Int, n)
+        seed = _STEIN_SEED0
 
-    j1 = 1
-    nblkmax = 0; @inbounds for x in iblock
-        nblkmax = max(nblkmax, Int(x))
-    end   # not maximum(): abstract-elt MappingRF is --trim-unsafe
-    @inbounds for nblk in 1:nblkmax
-        b1 = nblk == 1 ? 1 : Int(isplit[nblk - 1]) + 1
-        bn = Int(isplit[nblk])
-        bz = bn - b1 + 1
-        gpind = j1
-        # reorthogonalization / stopping criteria for this block
-        onenrm = abs(d[b1]) + (bz > 1 ? abs(e[b1]) : zero(T))
-        if bz > 1
-            onenrm = max(onenrm, abs(d[bn]) + abs(e[bn - 1]))
-        end
-        for i in (b1 + 1):(bn - 1)
-            onenrm = max(onenrm, abs(d[i]) + abs(e[i - 1]) + abs(e[i]))
-        end
-        ortol = odm3 * onenrm
-        dtpcrt = sqrt(odm1 / bz)
-
-        jblk = 0
-        xjm = zero(T)
-        j = j1
-        while j <= m
-            if iblock[j] != nblk
-                j1 = j; break
+        j1 = 1
+        nblkmax = 0; @inbounds for x in iblock
+            nblkmax = max(nblkmax, Int(x))
+        end   # not maximum(): abstract-elt MappingRF is --trim-unsafe
+        @inbounds for nblk in 1:nblkmax
+            b1 = nblk == 1 ? 1 : Int(isplit[nblk - 1]) + 1
+            bn = Int(isplit[nblk])
+            bz = bn - b1 + 1
+            gpind = j1
+            # reorthogonalization / stopping criteria for this block
+            onenrm = abs(d[b1]) + (bz > 1 ? abs(e[b1]) : zero(T))
+            if bz > 1
+                onenrm = max(onenrm, abs(d[bn]) + abs(e[bn - 1]))
             end
-            jblk += 1
-            xj = w[j]
-
-            if bz == 1
-                Z[b1, j] = one(T)
-                xjm = xj
-                (j == m) && (j1 = j + 1)
-                j += 1
-                continue
+            for i in (b1 + 1):(bn - 1)
+                onenrm = max(onenrm, abs(d[i]) + abs(e[i - 1]) + abs(e[i]))
             end
+            ortol = odm3 * onenrm
+            dtpcrt = sqrt(odm1 / bz)
 
-            # nudge apart eigenvalues that are too close (dstein perturbation)
-            if jblk > 1
-                eps1 = abs(epsm * xj); pertol = ten * eps1
-                (xj - xjm < pertol) && (xj = xjm + pertol)
-            end
+            jblk = 0
+            xjm = zero(T)
+            j = j1
+            while j <= m
+                if iblock[j] != nblk
+                    j1 = j; break
+                end
+                jblk += 1
+                xj = w[j]
 
-            av1 = view(av, 1:bz); bv1 = view(bv, 1:(bz - 1)); cv1 = view(cv, 1:(bz - 1))
-            d21 = view(d2, 1:max(bz - 2, 1)); inn1 = view(inn, 1:bz); r1 = view(rhs, 1:bz)
+                if bz == 1
+                    Z[b1, j] = one(T)
+                    xjm = xj
+                    (j == m) && (j1 = j + 1)
+                    j += 1
+                    continue
+                end
 
-            _stein_randvec!(r1, seed)
-            copyto!(av1, view(d, b1:bn))
-            copyto!(bv1, view(e, b1:(bn - 1)))
-            copyto!(cv1, view(e, b1:(bn - 1)))
-            tol = zero(T)
-            _dlagtf!(av1, xj, bv1, cv1, tol, d21, inn1)
+                # nudge apart eigenvalues that are too close (dstein perturbation)
+                if jblk > 1
+                    eps1 = abs(epsm * xj); pertol = ten * eps1
+                    (xj - xjm < pertol) && (xj = xjm + pertol)
+                end
 
-            its = 0; nrmchk = 0
-            while true
-                its += 1
-                (its > maxits) && break      # nonconvergence — accept last iterate anyway
-                # scale the RHS (dstein SCL) then solve (T−λ)·x = scaled-RHS
+                av1 = view(av, 1:bz); bv1 = view(bv, 1:(bz - 1)); cv1 = view(cv, 1:(bz - 1))
+                d21 = view(d2, 1:max(bz - 2, 1)); inn1 = view(inn, 1:bz); r1 = view(rhs, 1:bz)
+
+                seed = _stein_randvec!(r1, seed)   # advances WITHIN the call, reset per call at entry
+                copyto!(av1, view(d, b1:bn))
+                copyto!(bv1, view(e, b1:(bn - 1)))
+                copyto!(cv1, view(e, b1:(bn - 1)))
+                tol = zero(T)
+                _dlagtf!(av1, xj, bv1, cv1, tol, d21, inn1)
+
+                its = 0; nrmchk = 0
+                while true
+                    its += 1
+                    (its > maxits) && break      # nonconvergence — accept last iterate anyway
+                    # scale the RHS (dstein SCL) then solve (T−λ)·x = scaled-RHS
+                    jmax = _iamax(r1)
+                    scl = bz * onenrm * max(epsm, abs(av1[bz])) / abs(r1[jmax])
+                    @simd for t in 1:bz
+                        r1[t] *= scl
+                    end
+                    tol = _dlagts!(av1, bv1, cv1, d21, inn1, r1, tol)
+
+                    # modified Gram-Schmidt against near eigenvectors of this block
+                    if jblk != 1
+                        (abs(xj - xjm) > ortol) && (gpind = j)
+                        if gpind != j
+                            for i in gpind:(j - 1)
+                                ztr = -_dot(r1, view(Z, b1:bn, i))
+                                _axpy!(ztr, view(Z, b1:bn, i), r1)
+                            end
+                        end
+                    end
+
+                    jmax = _iamax(r1)
+                    nrm = abs(r1[jmax])
+                    (nrm < dtpcrt) && continue   # not yet at stopping criterion
+                    nrmchk += 1
+                    (nrmchk < extra + 1) && continue
+                    break
+                end
+
+                # normalize (2-norm 1, sign so the largest component is positive)
+                scl = one(T) / _nrm2(r1)
                 jmax = _iamax(r1)
-                scl = bz * onenrm * max(epsm, abs(av1[bz])) / abs(r1[jmax])
+                (r1[jmax] < zero(T)) && (scl = -scl)
                 @simd for t in 1:bz
                     r1[t] *= scl
                 end
-                tol = _dlagts!(av1, bv1, cv1, d21, inn1, r1, tol)
-
-                # modified Gram-Schmidt against near eigenvectors of this block
-                if jblk != 1
-                    (abs(xj - xjm) > ortol) && (gpind = j)
-                    if gpind != j
-                        for i in gpind:(j - 1)
-                            ztr = -_dot(r1, view(Z, b1:bn, i))
-                            _axpy!(ztr, view(Z, b1:bn, i), r1)
-                        end
-                    end
+                for t in 1:bz
+                    Z[b1 + t - 1, j] = r1[t]
                 end
 
-                jmax = _iamax(r1)
-                nrm = abs(r1[jmax])
-                (nrm < dtpcrt) && continue   # not yet at stopping criterion
-                nrmchk += 1
-                (nrmchk < extra + 1) && continue
-                break
+                xjm = xj
+                (j == m) && (j1 = j + 1)
+                j += 1
             end
-
-            # normalize (2-norm 1, sign so the largest component is positive)
-            scl = one(T) / _nrm2(r1)
-            jmax = _iamax(r1)
-            (r1[jmax] < zero(T)) && (scl = -scl)
-            @simd for t in 1:bz
-                r1[t] *= scl
-            end
-            for t in 1:bz
-                Z[b1 + t - 1, j] = r1[t]
-            end
-
-            xjm = xj
-            (j == m) && (j1 = j + 1)
-            j += 1
         end
+        return Z
     end
-    return Z
 end
 
 # Allocating convenience form — identical behaviour and return value to the pre-workspace stein!

@@ -2939,7 +2939,14 @@ function gemm!(
     (tA ? size(A, 2) : size(A, 1)) == m || _throw_gemm_m(m)
     (tB ? size(B, 1) : size(B, 2)) == n || _throw_gemm_n(n)
     (tB ? size(B, 2) : size(B, 1)) == k || _throw_gemm_k(k)
-    if T <: BlasFloat && C isa StridedMatrix && stride(C, 1) == 1
+    # `_strided1(C)`, NOT `C isa StridedMatrix && stride(C,1)==1`. The two agree for every argument the
+    # closed StridedMatrix Union covers (`_strided1` adds only `isbitstype(eltype)`, which `T<:BlasFloat`
+    # already implies here), and they differ on exactly one thing: `PtrMatrix`, which is not in that Union
+    # and so used to fall SILENTLY to the generic scalar triple loop. That trap was worked around twice by
+    # hand — gbtrf.jl and bunchkaufman.jl both call `_gemm_core!` directly and say why — and the stage-3
+    # arena conversion walked straight into it a third time in `ormhr!`/`unmhr!`, where an arena-borrowed
+    # `tmp` is gemm!'s C. Fixing the gate is the one-line root cause; the hand workarounds stay valid.
+    if T <: BlasFloat && _strided1(C)
         _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
     else
         _gemm_generic!(tA, tB, transA == 'C', transB == 'C', m, n, k, alpha, A, B, beta, C)

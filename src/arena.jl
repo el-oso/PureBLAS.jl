@@ -93,8 +93,10 @@ mutable struct Arena
     cur::Int                       # index of the slab currently being bumped
     off::Int                       # bytes consumed in slabs[cur]
     depth::Int                     # scope nesting; coalesce to one slab when it returns to 0
+    carried::Int                   # bytes already consumed in slabs 1..cur-1 of THIS scope chain
+    high::Int                      # peak bytes ever actually demanded, in one contiguous run
 end
-Arena() = Arena([UInt8[]], 1, 0, 0)
+Arena() = Arena([UInt8[]], 1, 0, 0, 0, 0)
 
 # The scope token. Only `@scope` constructs one, and the macro forbids it from being stored or passed
 # anywhere except as `borrow!`'s first argument — that is what makes the escape hazard a compile error.
@@ -138,15 +140,24 @@ end
     # instead, so a converted routine is no longer 0-allocation on its very first call at a new peak — it
     # is 0-allocation from the second. Nothing in the suite asserts on the first call; if a routine ever
     # needs first-call-zero-alloc, pre-touch the peak rather than removing the coalesce.
-    if a.depth == 0 && length(a.slabs) > 1
-        tot = 0
-        for sl in a.slabs
-            tot += length(sl)
+    #
+    # COALESCE TO THE HIGH-WATER *DEMAND*, NOT TO THE SUM OF SLAB CAPACITIES. Summing capacities compounds
+    # `_arena_grow!`'s doubling into the permanent size, so the arena balloons geometrically on a sequence
+    # of small overflows instead of converging on the peak: with a slab of S, a call needing S+1 grows to
+    # 2S, capacities sum to 3S, and the NEXT one-byte overflow of 3S grows to 6S and coalesces to 9S — 9x
+    # the memory ever asked for, and it keeps multiplying. `a.high` records what was actually demanded
+    # (`carried + off + need` at each grow, which is exactly the contiguous run the doubling failed to
+    # supply), so the fold lands on that. Never shrink below the slab already held: this is a high-water
+    # allocator, and re-growing a slab we just released would put an allocation back on a hot path.
+    if a.depth == 0
+        a.carried = 0
+        if length(a.slabs) > 1
+            want = max(a.high, length(a.slabs[1]))
+            resize!(a.slabs, 1)
+            a.slabs[1] = Vector{UInt8}(undef, want)
+            a.cur = 1
+            a.off = 0
         end
-        resize!(a.slabs, 1)
-        a.slabs[1] = Vector{UInt8}(undef, tot)
-        a.cur = 1
-        a.off = 0
     end
     return nothing
 end
@@ -154,6 +165,12 @@ end
 # Cold path: move to the next slab. The current slab is KEPT, so every handle already handed out in this
 # scope chain stays valid — growth never invalidates a live borrow.
 @noinline function _arena_grow!(a::Arena, need::Int)
+    # Record the true demand BEFORE switching slabs. `carried + off` is what this scope chain has already
+    # consumed, `need` is what would not fit; their sum is the contiguous run the next coalesce must
+    # provide. This is the only place the high-water is updated, and it is the cold path — the hot
+    # `borrow!` bump stays a pointer add with no max() in it.
+    a.carried += a.off
+    a.high = max(a.high, a.carried + need)
     a.cur += 1
     if a.cur > length(a.slabs) || length(a.slabs[a.cur]) < need
         a.cur > length(a.slabs) && push!(a.slabs, UInt8[])
@@ -192,7 +209,10 @@ end
 
 """
 Borrow an `m`×`n` column-major block with leading dimension `ld` (default `m`, i.e. exact). Valid until
-the enclosing `@scope` block exits. Bytes consumed are `ld*n*sizeof(T)`, 64-byte aligned for every `T`.
+the enclosing `@scope` block exits. Bytes consumed are `ld*n*sizeof(T)`, aligned to `_ARENA_ALIGN` for
+every `T` — that is `max(_SIMD_BYTES, _CACHELINE)`, DERIVED from the detected hardware (req#8), not the
+64 an earlier draft of this docstring named. On a 32-byte-vector AVX2 part with a 64-byte line it is 64;
+on a part with a wider line or a wider vector it is wider, and the code must not assume either number.
 """
 @inline function borrow!(s::ArenaScope, ::Type{T}, m::Int, n::Int, ld::Int = m) where {T}
     # Non-isbits element types (BigFloat is the live case — it is a handle onto mpfr limbs) cannot be
@@ -237,15 +257,16 @@ end
 # `ForwardDiff.Dual` it would set the value to NaN while leaving the partials at zero, i.e. a derivative
 # that looks computed.
 #
-# WHAT IT COSTS, AND THE CEILING THAT ENDS A RUN. RSS is fine — MADV_DONTNEED returns the pages, so a
-# fenced sweep holds flat (measured 2026-09-04: 580k borrows, RSS unchanged at 580 MB). What is never
-# reclaimed is the MAPPING: each released borrow leaves VMAs behind (~0.069 permanently retained per
-# borrow at the 29-borrows-per-scope shape `_dtgex2_big!` has — 580k borrows took the map count 334 →
-# 40389). The ceiling is `vm.max_map_count`: 1048576 on wintermute (≈15M borrows) but 65530 on a stock
-# Linux box (≈0.95M borrows), past which `mmap` fails and `_throw_arena_mmap` ends the run. `_syl_dlasy2`
-# alone is ~4k calls × 4 borrows at n=64, so a fenced FULL-SUITE run is not obviously under the stock
-# limit. Fence one routine or one testitem, not everything; if a long fenced run is really wanted, raise
-# `vm.max_map_count` first. (This is why the fence is per-scope opt-in and not a mode.)
+# WHAT IT COSTS. RSS is fine — MADV_DONTNEED returns the pages, so a fenced sweep holds flat (measured
+# 2026-09-04: 580k borrows, RSS unchanged at 580 MB). The MAPPINGS used not to be: each released borrow
+# left VMAs behind (~0.069 permanently retained per borrow at the 29-borrows-per-scope shape
+# `_dtgex2_big!` has — 580k borrows took the map count 334 → 40389), against a `vm.max_map_count` of
+# 1048576 on wintermute but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
+# ends the run INSIDE THE SANITIZER rather than in the code under test. `_syl_dlasy2` alone is ~4k calls ×
+# 4 borrows at n=64, so a fenced full-suite run was not obviously under the stock limit and the
+# "fence everything" hatch was hollow. `_ARENA_FENCE_QUARANTINE` (below) fixes that: releases are held
+# poisoned in a bounded FIFO and munmapped once they age out, so the footprint is capped. The fence stays
+# per-scope opt-in all the same — it is ~1000× the cost of a bump, so it is a debugging tool, not a mode.
 const _ARENA_PROT_NONE = Cint(0)
 const _ARENA_PROT_RW = Cint(3)                # PROT_READ | PROT_WRITE
 const _ARENA_MAP_PRIVATE_ANON = Cint(0x22)    # MAP_PRIVATE | MAP_ANONYMOUS (Linux)
@@ -279,6 +300,28 @@ end
 
 const _ARENA_MADV_DONTNEED = Cint(4)   # Linux MADV_DONTNEED
 
+# QUARANTINE, rather than poison-forever. `mprotect`-and-keep is the strongest possible check — the
+# address can never be handed out again, so a stale handle faults no matter how much later it is used —
+# but it retains one mapping per released borrow (~0.069 VMAs permanently per borrow at the shape
+# `_dtgex2_big!` has; 580k borrows took the map count 334 → 40389). The ceiling is `vm.max_map_count`,
+# and past it `mmap` fails, so the run dies inside the sanitizer instead of inside the code under test.
+# That made the "fence the whole suite" hatch above hollow. So: keep the most RECENT releases poisoned
+# and `munmap` the ones that age out. A use-after-release is still caught for that many subsequent
+# borrows, which covers the hazard this exists to find — a handle used just after its scope exits — and
+# the fence's address-space footprint becomes bounded instead of unbounded.
+# TIER: a sanitizer budget, not a machine-dependent tuning constant; the PDM ladder does not apply (no
+# generated-code property depends on it). The value is set by the SMALLEST default `vm.max_map_count`
+# in the wild, 65530, leaving an order of magnitude for the rest of the process's mappings.
+# A sanitizer's retention depth, and no property of the host makes one depth better than another — there
+# is no residency or latency criterion to derive it from and no candidate set to measure. It is bounded
+# from above by the smallest stock `vm.max_map_count` (65530), and this path never runs in a gated
+# measurement or in the trimmed `.so`.
+# req8-ok: sanitizer retention depth, not a machine-dependent tuning knob — bounded by the OS map limit.
+# PDM: Exempt — a debug sanitizer's retention depth, not hardware tuning; no host property favours one value.
+const _ARENA_FENCE_QUARANTINE = 4096
+const _ARENA_QUAR_PTR = Ptr{UInt8}[]
+const _ARENA_QUAR_LEN = Int[]
+
 function _arena_efence_release!(nlive::Int)
     while length(_ARENA_FENCE_PTR) > nlive
         p = pop!(_ARENA_FENCE_PTR)
@@ -296,6 +339,12 @@ function _arena_efence_release!(nlive::Int)
         # exactly that) would hold ~240 MB it can never use again. MADV_DONTNEED drops the pages while
         # LEAVING the mapping reserved, so the address stays poisoned and the memory comes back.
         ccall(:madvise, Cint, (Ptr{UInt8}, Csize_t, Cint), p, n, _ARENA_MADV_DONTNEED)
+        # …and hold the poisoned mapping in a bounded FIFO. Only once it ages out of the quarantine is the
+        # address space actually returned; until then the guarantee above is unchanged.
+        push!(_ARENA_QUAR_PTR, p); push!(_ARENA_QUAR_LEN, n)
+        while length(_ARENA_QUAR_PTR) > _ARENA_FENCE_QUARANTINE
+            ccall(:munmap, Cint, (Ptr{UInt8}, Csize_t), popfirst!(_ARENA_QUAR_PTR), popfirst!(_ARENA_QUAR_LEN))
+        end
     end
     return nothing
 end
@@ -394,6 +443,70 @@ end
     )
 end
 
+# ── Handle escape, the hazard the token check does NOT cover ────────────────────────────────────────
+# The two checks above track the TOKEN, which is what makes a borrow impossible to take outside the block.
+# They say nothing about the HANDLE a borrow returns, and a handle that outlives the scope is a pointer
+# into rewound (and, at the next call, overwritten) arena bytes — a use-after-free that reads plausible
+# numbers rather than faulting. The lexical cases of that are cheap to catch here, so catch them rather
+# than leaving the whole hazard to `@fenced_scope` at runtime and to reading:
+#   * `return A` (or `return (A, k)`, `return [A]`) where `A` was bound by a `borrow!` in this scope;
+#   * the block's own TAIL VALUE being such a name — `@scope` expands to a `try`, whose value is the
+#     body's, so a trailing bare `A` hands the handle straight to the caller.
+# Deliberately NARROW: only a handle in VALUE POSITION is rejected. `return sum(A)` is fine and common,
+# and so is passing `A` down into a callee — handles are meant to be passed, only not to outlive. What is
+# still not caught, and still needs the fence and a reading audit: storage into a field or global, and
+# capture by a closure that outlives the block.
+function _arena_borrowed_names(ex, s::Symbol, acc::Vector{Symbol} = Symbol[])
+    if ex isa Expr
+        if ex.head === :(=) && ex.args[1] isa Symbol && _arena_borrows(ex.args[2], s)
+            push!(acc, ex.args[1]::Symbol)
+        end
+        # do not descend into a nested `@scope`: its borrows are its own
+        if !(ex.head === :macrocall && !isempty(ex.args) && _arena_is_scope_macro(ex.args[1]))
+            for a in ex.args
+                _arena_borrowed_names(a, s, acc)
+            end
+        end
+    end
+    return acc
+end
+
+_arena_in_value_position(ex, names) =
+    ex isa Symbol ? (ex in names) :
+    (ex isa Expr && ex.head in (:tuple, :vect) && any(a -> _arena_in_value_position(a, names), ex.args))
+
+@noinline function _throw_arena_handle(n::Symbol)
+    error(
+        "@scope: the borrowed handle `" * String(n) * "` is returned from the scope. It points into arena " *
+            "bytes that the scope rewinds on exit, so the caller would read scratch that the next call " *
+            "overwrites. Copy what you need into a caller-owned array before the block ends, or move the " *
+            "@scope up to the caller and pass the handle DOWN."
+    )
+end
+
+function _arena_check_handles(ex, names::Vector{Symbol})
+    isempty(names) && return nothing
+    ex isa Expr || return nothing
+    if ex.head === :return && length(ex.args) == 1 && _arena_in_value_position(ex.args[1], names)
+        for n in names
+            _arena_in_value_position(ex.args[1], [n]) && _throw_arena_handle(n)
+        end
+    end
+    for a in ex.args
+        _arena_check_handles(a, names)
+    end
+    return nothing
+end
+
+# The tail value of the block, skipping line-number nodes and trailing comments.
+function _arena_tail(ex)
+    (ex isa Expr && ex.head === :block) || return ex
+    for i in length(ex.args):-1:1
+        ex.args[i] isa LineNumberNode || return _arena_tail(ex.args[i])
+    end
+    return nothing
+end
+
 function _arena_check(ex, s::Symbol)
     ex isa Expr || return nothing
     if ex.head in _ARENA_REPEATING
@@ -411,17 +524,25 @@ end
     @scope s begin … end
 
 Open an arena scope bound to token `s`. Inside, `borrow!(s, T, m, n[, ld])` hands out scratch valid until
-the block exits, at which point the bump pointer rewinds. Two rules are enforced when this macro EXPANDS:
-the TOKEN may appear only as `borrow!`'s first argument, and no `borrow!` may sit LEXICALLY inside a loop,
-comprehension or closure in this block.
+the block exits, at which point the bump pointer rewinds. Three rules are enforced when this macro EXPANDS:
+the TOKEN may appear only as `borrow!`'s first argument; no `borrow!` may sit LEXICALLY inside a loop,
+comprehension or closure in this block; and no borrowed HANDLE may be `return`ed from the block or be its
+tail value.
 
-Those are lexical checks on the unexpanded body, not a proof. Three things they do not catch — see the
-header comment for the measurements: a returned or stored HANDLE (only the token is tracked), a loop
-emitted by another macro, and recursion. `@fenced_scope` is the runtime check for the first.
+Those are lexical checks on the unexpanded body, not a proof. What they still do not catch — see the
+header comment for the measurements: a handle STORED into a field or global or captured by a closure that
+outlives the block, a loop emitted by another macro, and recursion. `@fenced_scope` is the runtime check
+for the handle cases.
 """
 macro scope(s::Symbol, body)
     _arena_uses_token(body, s) && _throw_arena_escape(s)
     _arena_check(body, s)
+    let names = _arena_borrowed_names(body, s), t = _arena_tail(body)
+        _arena_check_handles(body, names)
+        for n in names
+            _arena_in_value_position(t, [n]) && _throw_arena_handle(n)
+        end
+    end
     return quote
         $(esc(s)) = _arena_enter!(_arena())
         try

@@ -420,9 +420,15 @@ _trexc_dispatch!(wantq, T::AbstractMatrix{<:Complex}, Q, ifst, ilst) = _ztrexc!(
 function _lacn2_estimate(n::Int, apply!::F, ::Type{V}) where {F, V}
     R = real(V)
     ITMAX = 5
-    # Owned scratch (workspace.jl) so trrfs!/trsen! allocate nothing here — this ran once per right-hand
-    # side, so it was 3·nrhs allocations per trrfs! call. The buffers are REUSED and carry the previous
-    # call's values, so what the old `fill`/`zeros` provided is now explicit.
+    # Arena borrows so trrfs!/trsen! allocate nothing here — this ran once per right-hand side, so it was
+    # 3·nrhs allocations per trrfs! call. The bytes are REUSED and carry whatever the previous borrow at
+    # this offset left, so what the old `fill`/`zeros` provided is still explicit below.
+    #
+    # SIZE HONESTLY: these are O(n) in THIS function's `n`, but `n` is not the caller's matrix order at
+    # every call site. trrfs! passes its own n; `_dtrsen!`/`_ztrsen!` pass `nn = n1*n2`, up to n²/4. So
+    # the deepest nesting in stage 2 is also the widest: three n²/4 borrows live across the whole
+    # estimator, inside the caller's own scope, above `apply!` → `_dtrsyl!`, which opens the stage-1
+    # scope at trsyl.jl:209.
     #
     # Only `fill!(x, …)` is load-bearing: x IS read before it is written (the first `apply!` consumes it).
     # `v` is write-only in this function (`copyto!(v, x)` below; the n==1 path returns `abs(x[1])`), and
@@ -430,42 +436,49 @@ function _lacn2_estimate(n::Int, apply!::F, ::Type{V}) where {F, V}
     # therefore defensive, not required — kept because they are O(n) against an O(n²) estimator and they
     # keep the buffer state independent of call history, which is what makes the poison-invariance test
     # meaningful. Do not "optimise" them away without re-running that test.
-    x, v, isgn = _lacn2e_bufs(V, n)
-    fill!(x, V(one(R) / R(n))); fill!(v, zero(V)); fill!(isgn, 0)
-    onenorm(w) = (
-        s = zero(R); @inbounds for wi in w
-            s += abs(wi)
-        end; s
-    )
-    apply!(x, 1)                                           # X ← A·(1/n)
-    n == 1 && return abs(x[1])
-    est = onenorm(x)
-    _lacn2_sign!(x, isgn, V)
-    apply!(x, 2)                                           # X ← Aᵀ·ξ
-    jmax = _lacn2_imax(x); iter = 2
-    while true
-        fill!(x, zero(V)); x[jmax] = one(V)
-        apply!(x, 1)                                       # X ← A·e_jmax
-        copyto!(v, x); estold = est; est = onenorm(x)
-        conv = V <: Complex ? (est <= estold) : (!_lacn2_signchanged(x, isgn) || est <= estold)
-        conv && break
+    # ESCAPE AUDIT: `x` crosses the `apply!` callback five times. The three closures that reach here are
+    # `applyf` (trrfs.jl) and the two `apply!`s (`_dtrsen!`/`_ztrsen!` below); each writes through `x`
+    # and returns, none stores it. `v`/`isgn` never leave this function.
+    @scope arn begin
+        x = borrow!(arn, V, n)
+        v = borrow!(arn, V, n)
+        isgn = borrow!(arn, Int, n)          # length n for BOTH real and complex (unlike gecon's lacnsgn)
+        fill!(x, V(one(R) / R(n))); fill!(v, zero(V)); fill!(isgn, 0)
+        onenorm(w) = (
+            s = zero(R); @inbounds for wi in w
+                s += abs(wi)
+            end; s
+        )
+        apply!(x, 1)                                           # X ← A·(1/n)
+        n == 1 && return abs(x[1])
+        est = onenorm(x)
         _lacn2_sign!(x, isgn, V)
-        apply!(x, 2)                                       # X ← Aᵀ·ξ
-        jlast = jmax; jmax = _lacn2_imax(x)
-        cyc = V <: Complex ? (abs(x[jlast]) != abs(x[jmax])) : (x[jlast] != abs(x[jmax]))
-        (cyc && iter < ITMAX) || break
-        iter += 1
+        apply!(x, 2)                                           # X ← Aᵀ·ξ
+        jmax = _lacn2_imax(x); iter = 2
+        while true
+            fill!(x, zero(V)); x[jmax] = one(V)
+            apply!(x, 1)                                       # X ← A·e_jmax
+            copyto!(v, x); estold = est; est = onenorm(x)
+            conv = V <: Complex ? (est <= estold) : (!_lacn2_signchanged(x, isgn) || est <= estold)
+            conv && break
+            _lacn2_sign!(x, isgn, V)
+            apply!(x, 2)                                       # X ← Aᵀ·ξ
+            jlast = jmax; jmax = _lacn2_imax(x)
+            cyc = V <: Complex ? (abs(x[jlast]) != abs(x[jmax])) : (x[jlast] != abs(x[jmax]))
+            (cyc && iter < ITMAX) || break
+            iter += 1
+        end
+        # alternating-sign probe vector for one more estimate
+        asgn = one(R)
+        @inbounds for i in 1:n
+            x[i] = V(asgn * (one(R) + R(i - 1) / R(n - 1)))
+            asgn = -asgn
+        end
+        apply!(x, 1)
+        temp = R(2) * (onenorm(x) / R(3 * n))
+        temp > est && (est = temp)
+        return est
     end
-    # alternating-sign probe vector for one more estimate
-    asgn = one(R)
-    @inbounds for i in 1:n
-        x[i] = V(asgn * (one(R) + R(i - 1) / R(n - 1)))
-        asgn = -asgn
-    end
-    apply!(x, 1)
-    temp = R(2) * (onenorm(x) / R(3 * n))
-    temp > est && (est = temp)
-    return est
 end
 @inline function _lacn2_sign!(x, isgn, ::Type{V}) where {V}
     R = real(V)
@@ -550,15 +563,24 @@ function _dtrsen!(
             s = ONE
         else
             # S = scale / ( sqrt(scale²/rnorm + rnorm)·sqrt(rnorm) ),  rnorm = ‖X‖_F of the coupling solve
-            Rm, _, _, _ = _trsen_work(R, n1, n2)                    # off-diagonal coupling block T₁₂
-            copyto!(Rm, view(T, 1:n1, (n1 + 1):n))                  # fully overwritten ⇒ no fill!
-            _, scale, _ = _dtrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
-            rnorm = (
-                rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
-                    rn2 += abs2(x)
-                end; sqrt(rn2)
-            )
-            s = rnorm == ZERO ? ONE : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
+            # Exact n1×n2 borrow, default ld: the old `trsenr` field carried no anti-aliasing ld, and the
+            # only consumer is `_dtrsyl!`, which strides by `ld` like any other operand.
+            # ESCAPE AUDIT: `Rm` is written by `copyto!`, handed DOWN to `_dtrsyl!` — which solves in place
+            # and returns it as its first value, discarded here into `_` — and then read by the Frobenius
+            # loop, all inside this block. trsyl.jl assigns no field and no global (its own scratch is the
+            # stage-1 `@scope` at trsyl.jl:209) and its `_syl_dlasy2` callee takes scalars, so nothing
+            # retains the handle. What leaves the scope is the scalar `s`.
+            @scope arn begin
+                Rm = borrow!(arn, R, n1, n2)                        # off-diagonal coupling block T₁₂
+                copyto!(Rm, view(T, 1:n1, (n1 + 1):n))              # fully overwritten ⇒ no fill!
+                _, scale, _ = _dtrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
+                rnorm = (
+                    rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
+                        rn2 += abs2(x)
+                    end; sqrt(rn2)
+                )
+                s = rnorm == ZERO ? ONE : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
+            end
         end
     end
     if info == 0 && wantsp
@@ -566,28 +588,52 @@ function _dtrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            _, T11, T22, Xm = _trsen_work(R, n1, n2)   # all three fully overwritten before any read
-            copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
-            scref = _trsen_sc(R); scref[1] = ONE   # owned 1-slot carrier, not a per-call Ref (16 B)
-            # `_lacn2_estimate` hands the closure an owned-workspace VIEW, and `reshape(::SubArray, …)`
-            # goes through Base `_reshape` → `_throw_dmrs`, whose 8-piece eagerly-interpolated message
-            # despecialises to `print_to_string(::String, ::Vararg{Any})` and fails `--trim=safe`
-            # (`reshape(::Vector, …)` took Array's own method, which uses a trim-clean LazyString).
-            # `Xm` (owned, claimed above) is a 2-D n1×n2 array, which dodges that. It is now a SubArray of
-            # the workspace rather than a dense Matrix — still trim-safe (no reshape on the path), but it
-            # does put _dtrsyl! on the SubArray path; see the `trsenx` field comment in workspace.jl.
-            # `_lacn2_estimate` itself stays 0-alloc, which is what trrfs! needs.
-            apply! = function (xv, kase)
-                copyto!(Xm, xv)
-                _, sc, _ = kase == 1 ? _dtrsyl!('N', 'N', -1, T11, T22, Xm) :
-                    _dtrsyl!('T', 'T', -1, T11, T22, Xm)
-                copyto!(xv, Xm)
-                scref[1] = sc
-                return nothing
+            # ONE scope for the whole SEP estimate — the four buffers have the SAME lifetime, so they are
+            # borrowed together rather than in a second nested scope. THE SCOPE SPANS THE ESTIMATE AND THE
+            # READ. `scref` is a 1-slot carrier for the scale that `_dtrsyl!` returns through the closure;
+            # it is CAPTURED by `apply!`, written on every kase, and read at `sep = …` AFTER
+            # `_lacn2_estimate` has returned. Scoping only the `apply!` block would release it before that
+            # read — the one way to get this role wrong. The borrows sit ABOVE the closure, as the macro
+            # requires (a `borrow!` lexically inside `apply!` is rejected at expansion time).
+            #
+            # SIZE: T11 is n1×n1, T22 n2×n2, Xm n1×n2 — these GROW with the caller's order (unlike the
+            # stage-1 fixed roles), and `_lacn2_estimate` nests its own three n1·n2 borrows inside this
+            # scope, above `_dtrsyl!`'s stage-1 scope at trsyl.jl:209. Exact ld throughout: the fields
+            # these replace carried no anti-aliasing ld, and every consumer strides by `ld`.
+            #
+            # ESCAPE AUDIT. `T11`/`T22`/`Xm`/`scref` are captured by the local closure `apply!`, which is
+            # passed to `_lacn2_estimate` and CALLED there; that function only invokes the callback (it
+            # never stores it or the handles, and its own x/v/isgn are its own borrows). Through the
+            # callback the handles reach `_dtrsyl!`, which solves in place, returns `Xm` as a discarded
+            # `_`, and assigns no field or global. `apply!` itself is a local that dies with the block, and
+            # only the scalar `sep` leaves. Nothing is returned, stored in a field, or captured by anything
+            # outliving this scope.
+            @scope sca begin
+                T11 = borrow!(sca, R, n1, n1)
+                T22 = borrow!(sca, R, n2, n2)
+                Xm = borrow!(sca, R, n1, n2)          # all three fully overwritten before any read
+                scref = borrow!(sca, R, 1); scref[1] = ONE
+                copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
+                # `_lacn2_estimate` hands the closure an arena VECTOR, and `reshape(::SubArray, …)`
+                # goes through Base `_reshape` → `_throw_dmrs`, whose 8-piece eagerly-interpolated message
+                # despecialises to `print_to_string(::String, ::Vararg{Any})` and fails `--trim=safe`
+                # (`reshape(::Vector, …)` took Array's own method, which uses a trim-clean LazyString).
+                # `Xm` is a 2-D n1×n2 handle, which dodges that: the staging is `copyto!`, never a reshape.
+                # It is now a `PtrMatrix` — isbits and strided, so this also takes _dtrsyl! OFF the SubArray
+                # path the workspace view had put it on. `_lacn2_estimate` itself stays 0-alloc, which is
+                # what trrfs! needs.
+                apply! = function (xv, kase)
+                    copyto!(Xm, xv)
+                    _, sc, _ = kase == 1 ? _dtrsyl!('N', 'N', -1, T11, T22, Xm) :
+                        _dtrsyl!('T', 'T', -1, T11, T22, Xm)
+                    copyto!(xv, Xm)
+                    scref[1] = sc
+                    return nothing
+                end
+                # estimate ‖L⁻¹‖₁ of the Sylvester operator; SEP = scale/est (cancels trsyl's scaling)
+                est = _lacn2_estimate(nn, apply!, R)
+                sep = est == ZERO ? ZERO : scref[1] / est
             end
-            # estimate ‖L⁻¹‖₁ of the Sylvester operator; SEP = scale/est (cancels trsyl's scaling)
-            est = _lacn2_estimate(nn, apply!, R)
-            sep = est == ZERO ? ZERO : scref[1] / est
         end
     end
     _diag_eigs!(w, T)
@@ -621,15 +667,21 @@ function _ztrsen!(
         if m == n || m == 0
             s = one(R)
         else
-            Rm, _, _, _ = _trsen_work(C, n1, n2)
-            copyto!(Rm, view(T, 1:n1, (n1 + 1):n))                  # fully overwritten ⇒ no fill!
-            _, scale, _ = _ztrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
-            rnorm = (
-                rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
-                    rn2 += abs2(x)
-                end; sqrt(rn2)
-            )
-            s = rnorm == zero(R) ? one(R) : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
+            # ESCAPE AUDIT: identical to `_dtrsen!`'s — `Rm` is filled by `copyto!`, passed DOWN to
+            # `_ztrsyl!` (in-place solve; its return of `Rm` is discarded into `_`), then read by the
+            # Frobenius loop, all inside the block. trsyl.jl assigns no field and no global, so nothing
+            # retains the handle; only the scalar `s` leaves.
+            @scope arn begin
+                Rm = borrow!(arn, C, n1, n2)
+                copyto!(Rm, view(T, 1:n1, (n1 + 1):n))              # fully overwritten ⇒ no fill!
+                _, scale, _ = _ztrsyl!('N', 'N', -1, view(T, 1:n1, 1:n1), view(T, (n1 + 1):n, (n1 + 1):n), Rm)
+                rnorm = (
+                    rn2 = zero(real(eltype(Rm))); @inbounds for x in Rm
+                        rn2 += abs2(x)
+                    end; sqrt(rn2)
+                )
+                s = rnorm == zero(R) ? one(R) : scale / (sqrt(scale^2 / rnorm + rnorm) * sqrt(rnorm))
+            end
         end
     end
     if wantsp
@@ -637,20 +689,33 @@ function _ztrsen!(
             sep = _one_norm(T)
         else
             nn = n1 * n2
-            _, T11, T22, Xm = _trsen_work(C, n1, n2)   # see the _dtrsen! comment: no reshape(::SubArray)
-            copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
-            # Owned 1-slot carrier (Vector{C}); the scale is real, so it rides as C and reads back `real`.
-            scref = _trsen_sc(C); scref[1] = one(C)
-            apply! = function (xv, kase)
-                copyto!(Xm, xv)
-                _, sc, _ = kase == 1 ? _ztrsyl!('N', 'N', -1, T11, T22, Xm) :
-                    _ztrsyl!('C', 'C', -1, T11, T22, Xm)
-                copyto!(xv, Xm)
-                scref[1] = C(sc)
-                return nothing
+            # One scope for all four, as in `_dtrsen!` — same lifetime, so no second nested scope, and the
+            # borrows sit above the closure because the macro rejects a `borrow!` inside one. `scref` is
+            # the 1-slot carrier; the scale is real, so it rides as C and reads back `real`. The scope must
+            # span the estimate AND the `sep = …` read below, because the closure is what writes the slot.
+            # Xm stays a 2-D handle for the same trim reason spelled out in `_dtrsen!` (no reshape on the
+            # staging path); as a `PtrMatrix` it is isbits and strided, keeping _ztrsyl! off the SubArray path.
+            # ESCAPE AUDIT: `T11`/`T22`/`Xm`/`scref` are captured only by the local `apply!`, which
+            # `_lacn2_estimate` calls but never stores; from there they reach `_ztrsyl!`, which solves in
+            # place, returns `Xm` into a discarded `_`, and assigns no field or global. Only the scalar
+            # `sep` leaves the block.
+            @scope sca begin
+                T11 = borrow!(sca, C, n1, n1)
+                T22 = borrow!(sca, C, n2, n2)
+                Xm = borrow!(sca, C, n1, n2)
+                scref = borrow!(sca, C, 1); scref[1] = one(C)
+                copyto!(T11, view(T, 1:n1, 1:n1)); copyto!(T22, view(T, (n1 + 1):n, (n1 + 1):n))
+                apply! = function (xv, kase)
+                    copyto!(Xm, xv)
+                    _, sc, _ = kase == 1 ? _ztrsyl!('N', 'N', -1, T11, T22, Xm) :
+                        _ztrsyl!('C', 'C', -1, T11, T22, Xm)
+                    copyto!(xv, Xm)
+                    scref[1] = C(sc)
+                    return nothing
+                end
+                est = _lacn2_estimate(nn, apply!, C)
+                sep = est == zero(R) ? zero(R) : real(scref[1]) / est
             end
-            est = _lacn2_estimate(nn, apply!, C)
-            sep = est == zero(R) ? zero(R) : real(scref[1]) / est
         end
     end
     _diag_eigs!(w, T)

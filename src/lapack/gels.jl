@@ -76,7 +76,7 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
         _throw_trans_ntc(:gels!, trans)
     (T <: Complex && trans === 'T') &&
         throw(ArgumentError("gels!: trans='T' invalid for complex element type — use 'C'"))
-    # M = op(A), p×q, on owned workspace. (A itself is left untouched — LAPACK overwrites A, we don't;
+    # M = op(A), p×q, on borrowed arena scratch. (A itself is left untouched — LAPACK overwrites A, we don't;
     # that promise is exactly what forces M to exist even for trans='N'.)
     ma, na = size(A)
     p = trans === 'N' ? ma : na
@@ -84,38 +84,48 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
     k = min(p, q)
     size(B, 1) >= max(p, q) || _throw_brows_opa(:gels!, size(B, 1), max(p, q))
     nrhs = size(B, 2)
-    M, tau = _gels_work(T, p, q, k)
-    if trans === 'N'
-        @inbounds for j in 1:q, i in 1:p
-            M[i, j] = A[i, j]
+    # M and Mh are borrowed at EXACTLY p×q / q×p with ld = the row count. Criterion for taking the
+    # default (exact) ld rather than `_odd_ld`: it reproduces today's stride. `_wsgrow` hands back the
+    # GROWN matrix, whose ld equals the row count on every call that sets a new high-water mark — which
+    # is every call in an ascending size sweep, i.e. the whole gate. Exact ld keeps that and makes it
+    # unconditional, so a caller going large-then-small stops getting a different library. Padding to
+    # `_odd_ld` would be a NEW stride (gels is gated at square power-of-two n) and is not taken on
+    # theory alone. Nothing escapes: both handles die with the scope, `A`/`B` are the caller's.
+    @scope arn begin
+        M = borrow!(arn, T, p, q)
+        tau = borrow!(arn, T, k)
+        if trans === 'N'
+            @inbounds for j in 1:q, i in 1:p
+                M[i, j] = A[i, j]
+            end
+        elseif trans === 'T'
+            @inbounds for j in 1:q, i in 1:p
+                M[i, j] = A[j, i]
+            end
+        else
+            @inbounds for j in 1:q, i in 1:p
+                M[i, j] = conj(A[j, i])
+            end
         end
-    elseif trans === 'T'
-        @inbounds for j in 1:q, i in 1:p
-            M[i, j] = A[j, i]
+        if p >= q
+            # overdetermined:  x = R⁻¹·(Qᴴ·b)[1:q]
+            _gels_factor!(M, tau)
+            _apply_Qh!(M, tau, view(B, 1:p, :), k)
+            trsm!(view(B, 1:q, :), view(M, 1:q, 1:q); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
+        else
+            # underdetermined min-norm:  Mᴴ = Q_r·R_r (tall QR),  M = R_rᴴ·Q_rᴴ,  x = Q_r·[R_r⁻ᴴ·b; 0]
+            Mh = borrow!(arn, T, q, p)                     # q×p, tall — this arm only, hence the borrow here
+            @inbounds for j in 1:p, i in 1:q
+                Mh[i, j] = conj(M[j, i])
+            end
+            _gels_factor!(Mh, tau)                         # R_r = Mh[1:p,1:p] upper
+            tc = T <: Complex ? 'C' : 'T'
+            trsm!(view(B, 1:p, :), view(Mh, 1:p, 1:p); side = 'L', uplo = 'U', transA = tc, diag = 'N')  # w = R_r⁻ᴴ·b
+            @inbounds for j in 1:nrhs, r in (p + 1):q
+                B[r, j] = zero(T)
+            end
+            _apply_Q!(Mh, tau, view(B, 1:q, :), k)         # x = Q_r·[w; 0]
         end
-    else
-        @inbounds for j in 1:q, i in 1:p
-            M[i, j] = conj(A[j, i])
-        end
+        return A, B
     end
-    if p >= q
-        # overdetermined:  x = R⁻¹·(Qᴴ·b)[1:q]
-        _gels_factor!(M, tau)
-        _apply_Qh!(M, tau, view(B, 1:p, :), k)
-        trsm!(view(B, 1:q, :), view(M, 1:q, 1:q); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
-    else
-        # underdetermined min-norm:  Mᴴ = Q_r·R_r (tall QR),  M = R_rᴴ·Q_rᴴ,  x = Q_r·[R_r⁻ᴴ·b; 0]
-        Mh = _gels_adj(T, q, p)                            # q×p, tall (own field: this arm only)
-        @inbounds for j in 1:p, i in 1:q
-            Mh[i, j] = conj(M[j, i])
-        end
-        _gels_factor!(Mh, tau)                             # R_r = Mh[1:p,1:p] upper
-        tc = T <: Complex ? 'C' : 'T'
-        trsm!(view(B, 1:p, :), view(Mh, 1:p, 1:p); side = 'L', uplo = 'U', transA = tc, diag = 'N')  # w = R_r⁻ᴴ·b
-        @inbounds for j in 1:nrhs, r in (p + 1):q
-            B[r, j] = zero(T)
-        end
-        _apply_Q!(Mh, tau, view(B, 1:q, :), k)             # x = Q_r·[w; 0]
-    end
-    return A, B
 end

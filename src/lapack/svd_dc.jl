@@ -72,7 +72,10 @@ end
 @inline function _jac_right!(M::AbstractMatrix{Float64}, ca::Int, cb::Int, c::Float64, s::Float64)
     (c == 1.0 && s == 0.0) && return
     a0 = ca + 1; b0 = cb + 1; nr = size(M, 1)
-    return if M isa StridedMatrix && stride(M, 1) == 1
+    # `_strided1(M)`: not reachable with a `PtrMatrix` today (`_DCWork.bufA/bufB` and `SVDWorkspace.dc_U`
+    # are plain `Matrix`, and `bdsdc_64_` copies before calling), but written for the container rather
+    # than for today's callers — see the note at `_rot_cols!` in svd.jl.
+    return if _strided1(M)
         ld = stride(M, 2)
         GC.@preserve M begin
             p = pointer(M); vc = _CVF(c); vs = _CVF(s); i = 1

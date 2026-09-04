@@ -121,11 +121,11 @@ end
 # The ORDER matters: R11's syrk must read M21 before the trmm overwrites it. Upper is the mirror with
 # M = [M11 M12; 0 M22], R = MMᴴ, trmm on the right.
 #
-# The base does one dense syrk on a b×b block through a copy (syrk cannot alias C and A) into OWNED
-# scratch (`_lauum_tmp`), so the routine allocates nothing. The copy is safe against a reused buffer:
-# `copyto!` writes all n² entries before anything is read, and the triangle-zeroing only overwrites.
-# The recursion is strictly sequential (M11 subtree completes, then M22), so no two base cases are
-# ever live at once and the single shared buffer cannot be clobbered mid-use. That block's
+# The base does one dense syrk on a b×b block through a copy (syrk cannot alias C and A) into an ARENA
+# BORROW taken in the base arm only, so the routine allocates nothing. The copy is safe against reused
+# bytes: `copyto!` writes all n² entries before anything is read, and the triangle-zeroing only
+# overwrites. The recursion is strictly sequential (M11 subtree completes, then M22), so no two base
+# cases are ever live at once and the borrow is released before the next one is taken. That block's
 # 3x waste is bounded by 2b²/n² of the total — 0.2% at b=16, n=1024 — so the base stays small. It
 # reuses `_trtri_base()`: the same recursion-base criterion for the same triangular shape, and that
 # knob is already documented FLAT across 8/16/32/64 on all three µarchs.
@@ -133,24 +133,35 @@ function _lauum!(M::AbstractMatrix{T}, up::Bool) where {T}
     n = size(M, 1)
     n == 0 && return M
     if n <= _trtri_base()
-        Tmp = _lauum_tmp(T, n)          # owned scratch, reused across calls — no allocation
-        copyto!(Tmp, M)                 # writes all n² before any read; the zeroing below overwrites
-        if up                                   # zero the strict lower so the dense product is exact
-            @inbounds for j in 1:n, i in (j + 1):n
-                Tmp[i, j] = zero(T)
+        # THE SCOPE IS THE LEAF ARM, NOT THE FUNCTION. `_lauum!` RECURSES, and arena borrows accumulate
+        # per level (arena.jl's hazard (b)) — but only the base case borrows and every ancestor frame
+        # borrows nothing, so the DEPTH-SUMMED footprint is one `b×b` block, not one per level, exactly
+        # as the single owned buffer was. Scoping the whole body would put a try/finally on every
+        # recursive frame to hold nothing.
+        # Borrowed EXACTLY n×n, so `ld == n`: the field's `ld` was the GROWN row count (whatever an
+        # earlier, larger call left behind), which is history-dependent; the block is ≤ `_trtri_base()`
+        # square and L1-resident, and the incumbent carried no padding rule, so exact is the same stride
+        # policy with the history removed. See the ld note in the commit for the criterion.
+        @scope arn begin
+            Tmp = borrow!(arn, T, n, n)
+            copyto!(Tmp, M)                 # writes all n² before any read; the zeroing below overwrites
+            if up                                   # zero the strict lower so the dense product is exact
+                @inbounds for j in 1:n, i in (j + 1):n
+                    Tmp[i, j] = zero(T)
+                end
+            else
+                @inbounds for j in 1:n, i in 1:(j - 1)
+                    Tmp[i, j] = zero(T)
+                end
             end
-        else
-            @inbounds for j in 1:n, i in 1:(j - 1)
-                Tmp[i, j] = zero(T)
+            if T <: Complex
+                herk!(M, Tmp; uplo = up ? 'U' : 'L', trans = up ? 'N' : 'C', alpha = true, beta = false)
+            else
+                syrk!(M, Tmp; uplo = up ? 'U' : 'L', trans = up ? 'N' : 'T',
+                      alpha = one(T), beta = zero(T))
             end
+            return M
         end
-        if T <: Complex
-            herk!(M, Tmp; uplo = up ? 'U' : 'L', trans = up ? 'N' : 'C', alpha = true, beta = false)
-        else
-            syrk!(M, Tmp; uplo = up ? 'U' : 'L', trans = up ? 'N' : 'T',
-                  alpha = one(T), beta = zero(T))
-        end
-        return M
     end
     ct = T <: Complex ? 'C' : 'T'
     h = n ÷ 2
@@ -214,7 +225,7 @@ end
 # Step 2 walks block columns right-to-left: stash the strict-lower part of the block (that is L), zero
 # it in A, subtract the already-computed columns to the right via one gemm, then a right-side unit-lower
 # trsm against the block's own diagonal. The workspace is n×nb, not n×n — nb from `_lu_nb`, the same
-# validated LU panel width, reused exactly as `_pstrf_nb` reuses it — and it is OWNED (`_getri_work`),
+# validated LU panel width, reused exactly as `_pstrf_nb` reuses it — and it is an ARENA BORROW,
 # so getri! allocates nothing. Safe against a reused buffer: each block column writes rows j:n of its
 # jb columns (the jb×jb diagonal zeroing plus the strict-lower stash) and reads only rows j:n; rows
 # 1:j−1 are never read, so no stale value from a previous call can be consumed.
@@ -225,38 +236,44 @@ function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
     n == 0 && return A
     trtri!(A; uplo = 'U', diag = 'N')                       # 1. inv(U), in place
     nb = max(1, min(_lu_nb(n), n))
-    W = _getri_work(T, n, nb)                               # owned scratch, reused — no allocation
-    j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
-    while j >= 1
-        jb = min(nb, n - j + 1)
-        # Stash L's strict-lower block and zero it in A. The jb×jb diagonal region is zeroed first: the
-        # unit-diagonal and strict-upper entries are never read by a correct trsm, but leaving them as
-        # uninitialised memory is a trap for any kernel that touches a full tile.
-        @inbounds for c in 1:jb, i in j:(j + jb - 1)
-            W[i, c] = zero(T)
+    # One arena borrow, EXACTLY n×nb (`ld == n`), held across every block column — hoisted above the
+    # `while`, which is where it already was: the shape is loop-invariant, so nothing needed moving and
+    # `@scope`'s loop rule has nothing to reject. It does NOT escape: `W` is only ever sliced into
+    # `gemm!`/`trsm!` arguments, and `getri!` returns `A`.
+    @scope arn begin
+        W = borrow!(arn, T, n, nb)
+        j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
+        while j >= 1
+            jb = min(nb, n - j + 1)
+            # Stash L's strict-lower block and zero it in A. The jb×jb diagonal region is zeroed first: the
+            # unit-diagonal and strict-upper entries are never read by a correct trsm, but leaving them as
+            # uninitialised memory is a trap for any kernel that touches a full tile.
+            @inbounds for c in 1:jb, i in j:(j + jb - 1)
+                W[i, c] = zero(T)
+            end
+            @inbounds for jj in j:(j + jb - 1)
+                c = jj - j + 1
+                for i in (jj + 1):n
+                    W[i, c] = A[i, jj]
+                    A[i, jj] = zero(T)
+                end
+            end
+            if j + jb <= n
+                gemm!(view(A, 1:n, j:(j + jb - 1)), view(A, 1:n, (j + jb):n), view(W, (j + jb):n, 1:jb);
+                      alpha = -one(T), beta = one(T))
+            end
+            trsm!(view(A, 1:n, j:(j + jb - 1)), view(W, j:(j + jb - 1), 1:jb);
+                  side = 'R', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T))
+            j -= nb
         end
-        @inbounds for jj in j:(j + jb - 1)
-            c = jj - j + 1
-            for i in (jj + 1):n
-                W[i, c] = A[i, jj]
-                A[i, jj] = zero(T)
+        @inbounds for jj in (n - 1):-1:1                        # 3. undo the column pivots
+            jp = Int(ipiv[jj])
+            if jp != jj
+                for i in 1:n
+                    A[i, jj], A[i, jp] = A[i, jp], A[i, jj]
+                end
             end
         end
-        if j + jb <= n
-            gemm!(view(A, 1:n, j:(j + jb - 1)), view(A, 1:n, (j + jb):n), view(W, (j + jb):n, 1:jb);
-                  alpha = -one(T), beta = one(T))
-        end
-        trsm!(view(A, 1:n, j:(j + jb - 1)), view(W, j:(j + jb - 1), 1:jb);
-              side = 'R', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T))
-        j -= nb
+        return A
     end
-    @inbounds for jj in (n - 1):-1:1                        # 3. undo the column pivots
-        jp = Int(ipiv[jj])
-        if jp != jj
-            for i in 1:n
-                A[i, jj], A[i, jp] = A[i, jp], A[i, jj]
-            end
-        end
-    end
-    return A
 end
