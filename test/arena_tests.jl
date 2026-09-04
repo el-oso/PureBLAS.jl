@@ -41,6 +41,30 @@
         end
     end
 
+    # ANTI-ALIASING BETWEEN SUCCESSIVE BORROWS. A borrow whose byte size is a multiple of the way stride
+    # would otherwise put the NEXT borrow in the same scope on identical cache sets — the arena's own
+    # version of the po2-lda hazard this library fights with `_odd_ld`/`_offway_ld`/the +8 pads, except
+    # ACROSS buffers rather than within one. The live case is `diag`, a FIXED `_L3_NB × _L3_NB` block:
+    # at `_L3_NB == 128` that is exactly 2^17 bytes for Float64 and 2^18 for ComplexF64, so every gated
+    # trsm/trmm base that borrows `diag` and then a gemm operand would have aliased them.
+    let q = P._ARENA_WAY_QUARTER
+        P.@scope s begin
+            # a borrow sized to an exact multiple of the quarter-way stride…
+            A = P.borrow!(s, UInt8, 4 * q, 1)
+            B = P.borrow!(s, UInt8, 64, 1)
+            d = UInt(pointer(B)) - UInt(pointer(A))
+            @test d > 4 * q                          # …must NOT leave B exactly 4q after A
+            @test d % q != 0                         # …nor on the same set by any multiple
+            @test d <= 4 * q + 2 * P._ARENA_ALIGN    # …and the nudge is one alignment unit, not a gap
+        end
+        # the nudge must NOT fire on a size that is already off the stride — no wasted bytes
+        P.@scope s begin
+            A = P.borrow!(s, UInt8, 4 * q + 8, 1)
+            B = P.borrow!(s, UInt8, 64, 1)
+            @test UInt(pointer(B)) - UInt(pointer(A)) <= 4 * q + 8 + P._ARENA_ALIGN
+        end
+    end
+
     # Non-overlap over many shapes and strides. Stated as "the byte RANGES do not intersect" rather than
     # "B starts after A ends": if a growth intervenes the two live in different slabs and their relative
     # order is whatever mmap chose, but they must still never share a byte.

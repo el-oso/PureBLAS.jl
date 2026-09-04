@@ -66,12 +66,24 @@ end
 # a contiguous PtrVector. Column-major: sub-block (1,1) sits at ptr + (i0 + j0·ld); ld is unchanged.
 @inline _vspan(::Colon, n::Int) = (0, n)
 @inline _vspan(r::AbstractUnitRange{<:Integer}, ::Int) = (Int(first(r)) - 1, length(r))
+# `@boundscheck` is NOT decoration here, and its absence was a real regression. A `view(::Matrix, 1:n, 1:n)`
+# with n past the parent throws a `BoundsError`; this method used to be bare pointer arithmetic that
+# happily returned a larger PtrMatrix pointing past the end. Under the arena the bytes past a borrow are
+# a LIVE OUTER BORROW of the same call chain, so what used to be a loud throw became deterministic
+# cross-role corruption — exactly the class the rpad/rpack and trsmw field splits exist to prevent,
+# re-entering through a different door. Found 2026-09-04 by the stage-4 review: `_syrk_rec!` slices
+# `view(scr, 1:n, 1:n)` out of a FIXED `_L3_NB × _L3_NB` borrow with `n <= _fh_syrk_dbase()`, and
+# `_SYRK_DBASE` had no `min(…, _L3_NB)` clamp (its sibling `_TRSM_BASE` does). Both halves are now fixed;
+# this one is the general backstop, since it restores the check for EVERY borrow slice, not just that one.
+# Cost is a handful of comparisons in front of a view that precedes an O(n³) kernel, and `@inbounds` at a
+# call site still elides it — the single-column overload above already carried one.
 @inline function Base.view(
         A::PtrMatrix{T}, I::Union{Colon, AbstractUnitRange{<:Integer}},
         J::Union{Colon, AbstractUnitRange{<:Integer}}
     ) where {T}
     i0, ni = _vspan(I, A.m)
     j0, nj = _vspan(J, A.n)
+    @boundscheck (i0 >= 0 && j0 >= 0 && i0 + ni <= A.m && j0 + nj <= A.n) || throw(BoundsError(A, (I, J)))
     return PtrMatrix(A.ptr + (i0 + j0 * A.ld) * sizeof(T), ni, nj, A.ld)
 end
 @inline function Base.view(A::PtrMatrix{T}, ::Colon, j::Integer) where {T}
@@ -91,6 +103,7 @@ end
     return PtrVector(A.ptr + ((Int(first(I)) - 1) + (j - 1) * A.ld) * sizeof(T), length(I))
 end
 @inline function Base.view(v::PtrVector{T}, I::AbstractUnitRange{<:Integer}) where {T}
+    @boundscheck (isempty(I) || (first(I) >= 1 && last(I) <= length(v))) || throw(BoundsError(v, I))
     return PtrVector(v.ptr + (Int(first(I)) - 1) * sizeof(T), length(I))
 end
 
