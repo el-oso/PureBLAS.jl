@@ -54,96 +54,108 @@ function trrfs!(
     safe1 = R(nz) * safmin
     safe2 = safe1 / eps_p
 
-    # Owned scratch (workspace.jl): r = residual op(A)·x − b (eltype T); wabs = |op(A)|·|x| + |b| and
-    # wt = LACN2 weight |r| + nz·eps·wabs (+safe1 as needed), both real. Reused across calls — every
-    # element of all three is written before it is read, on every column j and every branch.
-    r, wabs, wt = _trrfs_work(T, n)
+    # Arena borrows: r = residual op(A)·x − b (eltype T); wabs = |op(A)|·|x| + |b| and wt = LACN2 weight
+    # |r| + nz·eps·wabs (+safe1 as needed), both REAL. `borrow!(arn, R, n)` next to `borrow!(arn, T, n)`
+    # replaces the old `_l3ws(real(T))` indirection: byte ranges in one arena are disjoint by
+    # construction, so the "different owner object ⇒ cannot alias" argument is no longer needed at all.
+    # Every element of all three is written before it is read, on every column j and every branch.
+    # HOISTED above `for j in 1:nrhs` — which is where it already was; the shapes do not depend on j.
+    # ESCAPE AUDIT, and this is the most fragile line in the conversion: `wt` is CAPTURED (not passed)
+    # by the `applyf` closure below. The closure is built inside the `for j` body, handed straight to
+    # `_lacn2_estimate`, and dies with that iteration — all of it inside this scope — so no handle
+    # outlives the borrow. `@scope` cannot see a capture; if `applyf` is ever returned or stored, this
+    # role must come back off the arena.
+    @scope arn begin
+        r = borrow!(arn, T, n)
+        wabs = borrow!(arn, R, n)
+        wt = borrow!(arn, R, n)
 
-    @inbounds for j in 1:nrhs
-        # residual: r := op(A)·X[:,j] − B[:,j]
-        for i in 1:n
-            r[i] = X[i, j]
-        end
-        trmv!(A, r; uplo = uplo, trans = trans, diag = diag)
-        for i in 1:n
-            r[i] -= B[i, j]
-        end
+        @inbounds for j in 1:nrhs
+            # residual: r := op(A)·X[:,j] − B[:,j]
+            for i in 1:n
+                r[i] = X[i, j]
+            end
+            trmv!(A, r; uplo = uplo, trans = trans, diag = diag)
+            for i in 1:n
+                r[i] -= B[i, j]
+            end
 
-        for i in 1:n
-            wabs[i] = _bk_cabs1(B[i, j])
-        end
-        if notran
-            if upper
-                for k in 1:n
-                    xk = _bk_cabs1(X[k, j])
-                    hi = nounit ? k : (k - 1)
-                    for i in 1:hi
-                        wabs[i] += _bk_cabs1(A[i, k]) * xk
+            for i in 1:n
+                wabs[i] = _bk_cabs1(B[i, j])
+            end
+            if notran
+                if upper
+                    for k in 1:n
+                        xk = _bk_cabs1(X[k, j])
+                        hi = nounit ? k : (k - 1)
+                        for i in 1:hi
+                            wabs[i] += _bk_cabs1(A[i, k]) * xk
+                        end
+                        !nounit && (wabs[k] += xk)
                     end
-                    !nounit && (wabs[k] += xk)
+                else
+                    for k in 1:n
+                        xk = _bk_cabs1(X[k, j])
+                        lo = nounit ? k : (k + 1)
+                        for i in lo:n
+                            wabs[i] += _bk_cabs1(A[i, k]) * xk
+                        end
+                        !nounit && (wabs[k] += xk)
+                    end
                 end
             else
-                for k in 1:n
-                    xk = _bk_cabs1(X[k, j])
-                    lo = nounit ? k : (k + 1)
-                    for i in lo:n
-                        wabs[i] += _bk_cabs1(A[i, k]) * xk
+                if upper
+                    for k in 1:n
+                        s = nounit ? zero(R) : _bk_cabs1(X[k, j])
+                        hi = nounit ? k : (k - 1)
+                        for i in 1:hi
+                            s += _bk_cabs1(A[i, k]) * _bk_cabs1(X[i, j])
+                        end
+                        wabs[k] += s
                     end
-                    !nounit && (wabs[k] += xk)
+                else
+                    for k in 1:n
+                        s = nounit ? zero(R) : _bk_cabs1(X[k, j])
+                        lo = nounit ? k : (k + 1)
+                        for i in lo:n
+                            s += _bk_cabs1(A[i, k]) * _bk_cabs1(X[i, j])
+                        end
+                        wabs[k] += s
+                    end
                 end
             end
-        else
-            if upper
-                for k in 1:n
-                    s = nounit ? zero(R) : _bk_cabs1(X[k, j])
-                    hi = nounit ? k : (k - 1)
-                    for i in 1:hi
-                        s += _bk_cabs1(A[i, k]) * _bk_cabs1(X[i, j])
-                    end
-                    wabs[k] += s
-                end
-            else
-                for k in 1:n
-                    s = nounit ? zero(R) : _bk_cabs1(X[k, j])
-                    lo = nounit ? k : (k + 1)
-                    for i in lo:n
-                        s += _bk_cabs1(A[i, k]) * _bk_cabs1(X[i, j])
-                    end
-                    wabs[k] += s
-                end
+            s = zero(R)
+            for i in 1:n
+                s = wabs[i] > safe2 ? max(s, _bk_cabs1(r[i]) / wabs[i]) :
+                    max(s, (_bk_cabs1(r[i]) + safe1) / (wabs[i] + safe1))
             end
-        end
-        s = zero(R)
-        for i in 1:n
-            s = wabs[i] > safe2 ? max(s, _bk_cabs1(r[i]) / wabs[i]) :
-                max(s, (_bk_cabs1(r[i]) + safe1) / (wabs[i] + safe1))
-        end
-        Berr[j] = s
+            Berr[j] = s
 
-        for i in 1:n
-            wt[i] = wabs[i] > safe2 ? _bk_cabs1(r[i]) + R(nz) * eps_p * wabs[i] :
-                _bk_cabs1(r[i]) + R(nz) * eps_p * wabs[i] + safe1
-        end
-        applyf = function (xv, kase)
-            if kase == 1
-                trsv!(A, xv; uplo = uplo, trans = transt, diag = diag)
-                for i in 1:n
-                    xv[i] *= wt[i]
-                end
-            else
-                for i in 1:n
-                    xv[i] *= wt[i]
-                end
-                trsv!(A, xv; uplo = uplo, trans = transn, diag = diag)
+            for i in 1:n
+                wt[i] = wabs[i] > safe2 ? _bk_cabs1(r[i]) + R(nz) * eps_p * wabs[i] :
+                    _bk_cabs1(r[i]) + R(nz) * eps_p * wabs[i] + safe1
             end
-            return nothing
+            applyf = function (xv, kase)
+                if kase == 1
+                    trsv!(A, xv; uplo = uplo, trans = transt, diag = diag)
+                    for i in 1:n
+                        xv[i] *= wt[i]
+                    end
+                else
+                    for i in 1:n
+                        xv[i] *= wt[i]
+                    end
+                    trsv!(A, xv; uplo = uplo, trans = transn, diag = diag)
+                end
+                return nothing
+            end
+            ferr_j = _lacn2_estimate(n, applyf, T)
+            lstres = zero(R)
+            for i in 1:n
+                lstres = max(lstres, _bk_cabs1(X[i, j]))
+            end
+            Ferr[j] = lstres != zero(R) ? ferr_j / lstres : ferr_j
         end
-        ferr_j = _lacn2_estimate(n, applyf, T)
-        lstres = zero(R)
-        for i in 1:n
-            lstres = max(lstres, _bk_cabs1(X[i, j]))
-        end
-        Ferr[j] = lstres != zero(R) ? ferr_j / lstres : ferr_j
+        return Ferr, Berr
     end
-    return Ferr, Berr
 end

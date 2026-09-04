@@ -173,7 +173,8 @@ end
 # ── geev core (REAL), IN-PLACE — every output is the caller's buffer. Returns (ilo, ihi, abnrm). ────────
 # A is overwritten (Schur form). `VR` MUST NOT alias `A`: the reflectors are read out of A into VR and A is
 # then destructively reduced (the orgtr!('L',A,tau,A) failure class). Nothing here allocates: `tau`, the
-# complex eigenvalue staging `w` and the 0×0 `Z` placeholder are owned workspace.
+# complex eigenvalue staging `w` and the empty `Z` placeholder are ARENA BORROWS (arena.jl), taken once at
+# entry and live for the whole pipeline.
 function _geev_run!(
         balanc::Char, jobvl::Char, jobvr::Char, A::AbstractMatrix{T},
         wr::AbstractVector{T}, wi::AbstractVector{T}, VL::AbstractMatrix{T},
@@ -188,24 +189,37 @@ function _geev_run!(
     n == 0 && return 1, 0, zero(T)
     ilo, ihi = gebal!(A, scale; job = balanc)
     abnrm = _geev_lange1(A)
-    tau, Zdummy = _geev_work(T, n)                                 # tau fully written by gehrd! on every path
-    gehrd!(A, ilo, ihi, tau)
-    w = _geev_cwork(T, n)                                          # complex staging for a REAL T (workspace.jl)
-    if wantvr
-        _orghr_into!(VR, A, ilo, ihi, tau)                         # reflectors → Q, straight into VR
-        _geev_clear_hess!(A, ilo, ihi)                             # scrub reflectors → clean Hessenberg
-        hseqr!('S', 'V', A, ilo, ihi, w, VR)                       # Schur T in A; VR := Schur vectors
-        trevc!('R', 'B', A, VL, VR)                                # VR := right eigenvectors (balanced)
-        gebak!(balanc, 'R', ilo, ihi, scale, VR)                   # undo balancing
-        @inbounds for i in 1:n
-            wr[i] = real(w[i]); wi[i] = imag(w[i])
-        end
-        _geev_normalize_real!(VR, wi, n)
-    else
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('E', 'N', A, ilo, ihi, w, Zdummy)
-        @inbounds for i in 1:n
-            wr[i] = real(w[i]); wi[i] = imag(w[i])
+    # Arena borrows (arena.jl), replacing the `geevtau`/`geevw`/`geevz0` fields. All three are taken at
+    # ENTRY and live to the end of the pipeline: `tau` is live ACROSS the gehrd!→_orghr_into! pair, and `w`
+    # across hseqr!→the wr/wi split. Exact `ld` on all three — none of these fields carried an anti-aliasing
+    # ld. `Z0` is the n×0 stand-in for the old shared 0×0 placeholder; hseqr! with compz='N' sets
+    # wantz=false and never touches it (hseqr.jl:714).
+    # ESCAPE AUDIT: `tau` reaches gehrd! and _orghr_into!, `w` reaches hseqr!, `Z0` reaches hseqr! (and
+    # through it _dlahqr!). Every one of those writes through its argument and returns; none stores a
+    # reference in a field, a global or a closure, and nothing borrowed here is returned — the return value
+    # is the `(ilo, ihi, abnrm)` tuple of scalars, and every matrix/vector OUTPUT (wr/wi/VL/VR/scale) is the
+    # caller's own buffer.
+    @scope arn begin
+        tau = borrow!(arn, T, max(n - 1, 0))                        # fully written by gehrd! on every path
+        w = borrow!(arn, Complex{T}, n)                             # complex eigenvalue staging for a REAL T
+        Z0 = borrow!(arn, T, n, 0)                                  # unreferenced Z for compz='N'
+        gehrd!(A, ilo, ihi, tau)
+        if wantvr
+            _orghr_into!(VR, A, ilo, ihi, tau)                     # reflectors → Q, straight into VR
+            _geev_clear_hess!(A, ilo, ihi)                         # scrub reflectors → clean Hessenberg
+            hseqr!('S', 'V', A, ilo, ihi, w, VR)                   # Schur T in A; VR := Schur vectors
+            trevc!('R', 'B', A, VL, VR)                            # VR := right eigenvectors (balanced)
+            gebak!(balanc, 'R', ilo, ihi, scale, VR)               # undo balancing
+            @inbounds for i in 1:n
+                wr[i] = real(w[i]); wi[i] = imag(w[i])
+            end
+            _geev_normalize_real!(VR, wi, n)
+        else
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('E', 'N', A, ilo, ihi, w, Z0)
+            @inbounds for i in 1:n
+                wr[i] = real(w[i]); wi[i] = imag(w[i])
+            end
         end
     end
     return ilo, ihi, abnrm
@@ -238,18 +252,26 @@ function _geev_run!(
     n == 0 && return 1, 0, zero(R)
     ilo, ihi = gebal!(A, scale; job = balanc)
     abnrm = _geev_lange1(A)
-    tau, Zdummy = _geev_work(T, n)
-    gehrd!(A, ilo, ihi, tau)
-    if wantvr
-        _orghr_into!(VR, A, ilo, ihi, tau)
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('S', 'V', A, ilo, ihi, w, VR)
-        trevc!('R', 'B', A, VL, VR)
-        gebak!(balanc, 'R', ilo, ihi, scale, VR)
-        _geev_normalize_cmplx!(VR, n)
-    else
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('E', 'N', A, ilo, ihi, w, Zdummy)
+    # Arena borrows, same contract as the real method above — no `w` here, the caller owns it (T is already
+    # complex). `tau` is live across gehrd!→_orghr_into!; `Z0` is the n×0 placeholder hseqr! ignores under
+    # compz='N'. ESCAPE AUDIT: `tau` reaches gehrd! and _orghr_into!, `Z0` reaches hseqr!/_zlahqr!; each
+    # writes through its argument and returns, none retains it, and neither handle is returned or stored —
+    # the outputs (w/VL/VR/scale) are all caller buffers.
+    @scope arn begin
+        tau = borrow!(arn, T, max(n - 1, 0))
+        Z0 = borrow!(arn, T, n, 0)
+        gehrd!(A, ilo, ihi, tau)
+        if wantvr
+            _orghr_into!(VR, A, ilo, ihi, tau)
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('S', 'V', A, ilo, ihi, w, VR)
+            trevc!('R', 'B', A, VL, VR)
+            gebak!(balanc, 'R', ilo, ihi, scale, VR)
+            _geev_normalize_cmplx!(VR, n)
+        else
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('E', 'N', A, ilo, ihi, w, Z0)
+        end
     end
     return ilo, ihi, abnrm
 end
@@ -280,16 +302,23 @@ function _gees_run!(
     wantvs = jobvs === 'V'
     n == 0 && return w, VS
     ilo, ihi = gebal!(A, scale; job = 'P')
-    tau, Zdummy = _geev_work(T, n)
-    gehrd!(A, ilo, ihi, tau)
-    if wantvs
-        _orghr_into!(VS, A, ilo, ihi, tau)
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('S', 'V', A, ilo, ihi, w, VS)
-        gebak!('P', 'R', ilo, ihi, scale, VS)
-    else
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('S', 'N', A, ilo, ihi, w, Zdummy)
+    # Arena borrows, as in `_geev_run!`. `w` is the CALLER's (complex for a real T), so only the gehrd τ and
+    # the n×0 Z placeholder are borrowed. ESCAPE AUDIT: `tau` reaches gehrd! and _orghr_into!, `Z0` reaches
+    # hseqr! (compz='N' ⇒ wantz=false, so it is never even read); both callees write through the argument
+    # and return without retaining it, and the return value here is `(w, VS)` — both caller buffers.
+    @scope arn begin
+        tau = borrow!(arn, T, max(n - 1, 0))
+        Z0 = borrow!(arn, T, n, 0)
+        gehrd!(A, ilo, ihi, tau)
+        if wantvs
+            _orghr_into!(VS, A, ilo, ihi, tau)
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('S', 'V', A, ilo, ihi, w, VS)
+            gebak!('P', 'R', ilo, ihi, scale, VS)
+        else
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('S', 'N', A, ilo, ihi, w, Z0)
+        end
     end
     return w, VS
 end
@@ -318,16 +347,22 @@ function _gees_run!(
     wantvs = jobvs === 'V'
     n == 0 && return w, VS
     ilo, ihi = gebal!(A, scale; job = 'P')
-    tau, Zdummy = _geev_work(T, n)
-    gehrd!(A, ilo, ihi, tau)
-    if wantvs
-        _orghr_into!(VS, A, ilo, ihi, tau)
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('S', 'V', A, ilo, ihi, w, VS)
-        gebak!('P', 'R', ilo, ihi, scale, VS)
-    else
-        _geev_clear_hess!(A, ilo, ihi)
-        hseqr!('S', 'N', A, ilo, ihi, w, Zdummy)
+    # Same borrows and the same escape audit as the real `_gees_run!` above: `tau` is live across
+    # gehrd!→_orghr_into!, `Z0` is the n×0 Z that hseqr!('S','N', …) never touches, and neither handle is
+    # returned or stored by any callee — `(w, VS)` are the caller's buffers.
+    @scope arn begin
+        tau = borrow!(arn, T, max(n - 1, 0))
+        Z0 = borrow!(arn, T, n, 0)
+        gehrd!(A, ilo, ihi, tau)
+        if wantvs
+            _orghr_into!(VS, A, ilo, ihi, tau)
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('S', 'V', A, ilo, ihi, w, VS)
+            gebak!('P', 'R', ilo, ihi, scale, VS)
+        else
+            _geev_clear_hess!(A, ilo, ihi)
+            hseqr!('S', 'N', A, ilo, ihi, w, Z0)
+        end
     end
     return w, VS
 end

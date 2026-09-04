@@ -498,31 +498,49 @@ function _ormtr!(
     (n <= 2 || nc == 0) && return C          # no reflectors (H_1..H_{n-2})
     k = n - 2                                 # reflector count
     nb = clamp(_qr_nb(n, nc), 1, k)           # derived panel width (cache-residency; shared with QR)
-    Vb, Gb, Wb, Tm = _ormtr_work(T, n, nb, nc)   # GKH-owned scratch (workspace.jl) — was 4 fresh Matrices
-    ws = WYApplyWorkspace{T}(Vb, Gb, Wb)
-    nblk = cld(k, nb)
-    order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
-    @inbounds for b in order
-        pc = (b - 1) * nb + 1
-        pb = min(nb, k - pc + 1)
-        rs = pc + 1                           # first row H_pc acts on (v_pc[1] at row pc+1)
-        m = n - rs + 1                        # panel rows (pc+1 : n)
-        Vp = view(ws.V, 1:m, 1:pb)            # build explicit unit-lower-trapezoid panel
-        for c in 1:pb
-            g = pc + c - 1                    # global reflector column
-            for r in 1:(c - 1)
-                Vp[r, c] = zero(T)
+    # Arena borrows (arena.jl), not the four owned fields this used to take from `_ormtr_work`: V is the
+    # explicit unit-lower-trapezoid panel (n×nb — the only role that grows with n), G the VᵀV Gram, W the
+    # VᵀC / Tᵀ·W apply scratch, Tm the compact-WY T factor. G and Tm stay TWO DISTINCT borrows because
+    # `wy_t!` reads G while writing Tm — the same reason `mtrg` and `mtrt` were two fields, not a share.
+    # Exact ld (what the fields' own `Matrix{T}(undef, …)` gave); no anti-aliasing ld was ever claimed here.
+    # No `fill!`: the panel loop below writes all of V[1:m,1:pb], `wy_t!` writes the full pb×pb Tm
+    # (explicit-zero strict lower included), and every G/W producer is a beta=false syrk!/gemm!.
+    # All four are hoisted ABOVE the block loop (they are loop-invariant — sized by nb/nc, not by b), so
+    # the loop rule has nothing to reject.
+    #
+    # NOTHING ESCAPES. The handles reach exactly: `WYApplyWorkspace` — a LOCAL bundle, itself dead at the
+    # end of this block — and `wy_t!`/`wy_apply!` (wy.jl), which forward them to `syrk!`, `gemm!` and
+    # `trmm!`; those write through their arguments and return `Tm`/`C`, none of them stores an operand.
+    # `Vp`/`Tv` are `view`s of borrows, and `view(::PtrMatrix, …)` returns a `PtrMatrix` (ptrmat.jl), so
+    # they are handles too and die here with the rest. The only value leaving the block is `C`, which is
+    # the caller's own matrix.
+    @scope arn begin
+        ws = WYApplyWorkspace(borrow!(arn, T, n, nb), borrow!(arn, T, nb, nb), borrow!(arn, T, nb, nc))
+        Tm = borrow!(arn, T, nb, nb)
+        nblk = cld(k, nb)
+        order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
+        @inbounds for b in order
+            pc = (b - 1) * nb + 1
+            pb = min(nb, k - pc + 1)
+            rs = pc + 1                           # first row H_pc acts on (v_pc[1] at row pc+1)
+            m = n - rs + 1                        # panel rows (pc+1 : n)
+            Vp = view(ws.V, 1:m, 1:pb)            # build explicit unit-lower-trapezoid panel
+            for c in 1:pb
+                g = pc + c - 1                    # global reflector column
+                for r in 1:(c - 1)
+                    Vp[r, c] = zero(T)
+                end
+                Vp[c, c] = one(T)
+                for r in (c + 1):m
+                    Vp[r, c] = A[rs + r - 1, g]   # essential v_g = A[g+2:n, g]
+                end
             end
-            Vp[c, c] = one(T)
-            for r in (c + 1):m
-                Vp[r, c] = A[rs + r - 1, g]   # essential v_g = A[g+2:n, g]
-            end
+            Tv = view(Tm, 1:pb, 1:pb)
+            wy_t!(Tv, Vp, view(tau, pc:(pc + pb - 1)), ws.G)
+            wy_apply!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
         end
-        Tv = view(Tm, 1:pb, 1:pb)
-        wy_t!(Tv, Vp, view(tau, pc:(pc + pb - 1)), ws.G)
-        wy_apply!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
+        return C
     end
-    return C
 end
 
 # ── Complex Hermitian tridiagonalization TAIL/base (LAPACK zhetd2, LOWER) — Hermitian analogue of
@@ -729,31 +747,41 @@ function _unmtr!(
     (n <= 1 || nc == 0) && return C           # no reflectors (H_1..H_{n-1} needs n≥2)
     k = n - 1                                  # reflector count (complex: incl. the nontrivial H_{n-1})
     nb = clamp(_qr_nb(n, nc), 1, k)
-    Vb, G, Wb, Tm = _ormtr_work(T, n, nb, nc)    # GKH-owned scratch (workspace.jl) — was 4 fresh Matrices
-    ws = WYApplyWorkspace{T}(Vb, G, Wb)          # `ws.G` unused here — `_wy_t_cplx!` takes `G` directly
-    nblk = cld(k, nb)
-    order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
-    @inbounds for b in order
-        pc = (b - 1) * nb + 1
-        pb = min(nb, k - pc + 1)
-        rs = pc + 1
-        m = n - rs + 1
-        Vp = view(ws.V, 1:m, 1:pb)
-        for c in 1:pb
-            g = pc + c - 1
-            for r in 1:(c - 1)
-                Vp[r, c] = zero(T)
+    # Arena borrows, the complex mirror of `_ormtr!` above — same four roles (V n×nb, G nb×nb, W nb×nc,
+    # Tm nb×nb), same exact ld, same reason G and Tm are two distinct borrows (`_wy_t_cplx!` reads the
+    # Hermitian Gram G while writing Tm). The Gram is passed as `ws.G`, which IS the mtrg borrow — the old
+    # comment here said "`ws.G` unused, `_wy_t_cplx!` takes `G` directly" only because the accessor handed
+    # back a bare tuple alongside the bundle; it is one buffer either way.
+    # NOTHING ESCAPES: identical audit to `_ormtr!` — the handles reach the local `WYApplyWorkspace`,
+    # `_wy_t_cplx!` and `_wy_apply_cplx!` (both just above in this file) and through them `herk!`/`gemm!`/
+    # `trmm!`, which write through their arguments and retain nothing. Only `C` leaves the block.
+    @scope arn begin
+        ws = WYApplyWorkspace(borrow!(arn, T, n, nb), borrow!(arn, T, nb, nb), borrow!(arn, T, nb, nc))
+        Tm = borrow!(arn, T, nb, nb)
+        nblk = cld(k, nb)
+        order = trans === 'N' ? (nblk:-1:1) : (1:nblk)
+        @inbounds for b in order
+            pc = (b - 1) * nb + 1
+            pb = min(nb, k - pc + 1)
+            rs = pc + 1
+            m = n - rs + 1
+            Vp = view(ws.V, 1:m, 1:pb)
+            for c in 1:pb
+                g = pc + c - 1
+                for r in 1:(c - 1)
+                    Vp[r, c] = zero(T)
+                end
+                Vp[c, c] = one(T)
+                for r in (c + 1):m
+                    Vp[r, c] = A[rs + r - 1, g]
+                end
             end
-            Vp[c, c] = one(T)
-            for r in (c + 1):m
-                Vp[r, c] = A[rs + r - 1, g]
-            end
+            Tv = view(Tm, 1:pb, 1:pb)
+            _wy_t_cplx!(Tv, Vp, view(tau, pc:(pc + pb - 1)), ws.G)
+            _wy_apply_cplx!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
         end
-        Tv = view(Tm, 1:pb, 1:pb)
-        _wy_t_cplx!(Tv, Vp, view(tau, pc:(pc + pb - 1)), G)
-        _wy_apply_cplx!(trans, view(C, rs:n, 1:nc), Vp, Tv, ws)
+        return C
     end
-    return C
 end
 
 # ── orgtr / ungtr — form Q from sytrd/hetrd reflectors (LOWER only) ────────────────────────────────────

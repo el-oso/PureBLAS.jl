@@ -157,6 +157,14 @@ end
     (stride(x, 1) == 1 && n >= 4 * _vwidth(T)) || return 0
     GC.@preserve x return _iamax_cmplx_simd!(Int(n), Ptr{T}(pointer(x)))
 end
+# An arena borrow (`borrow!(s, T, n)`, arena.jl) is a `PtrVector`, which is neither a `Ptr` nor in the
+# `StridedVector` union — so a converted routine's scratch would fall to the generic `= 0` above and run
+# the SCALAR argmax, where the `view(ws.field, 1:n)` it replaces took the StridedVector method. That is
+# the izamax miss recorded three lines up, re-arriving through the workspace refactor. ONE forwarding
+# method rather than a real/complex pair: `pointer` re-dispatches onto whichever `Ptr` method fits, and
+# a non-`BlasReal` element type still lands on the generic `= 0`. No `GC.@preserve` — a PtrVector's
+# buffer is owned by the arena slab (or by a C caller), never by this argument.
+@inline _iamax_simd_try(n::Integer, x::PtrVector) = _iamax_simd_try(n, pointer(x))
 
 @inline function _iamax(n::Integer, x, incx::Integer)
     n <= 0 && return 0

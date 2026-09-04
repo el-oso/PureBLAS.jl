@@ -37,28 +37,36 @@ function gelsd!(
         throw(ArgumentError("gelsd!: `s` must not alias `A` or `B`"))
     mn == 0 && return B, 0, s
     sv = view(s, 1:mn)
-    # economy SVD  A = U·diag(s)·Vᴴ  (U m×mn, s descending, Vt = Vᴴ mn×n)
-    U, Vt, C, Ac = _gelsd_work(T, m, n, mn, nrhs)
-    @inbounds for j in 1:n, i in 1:m           # gesvd! destroys its A; A itself stays the caller's
-        Ac[i, j] = A[i, j]
+    # economy SVD  A = U·diag(s)·Vᴴ  (U m×mn, s descending, Vt = Vᴴ mn×n). All four are borrowed at the
+    # exact shape with the default (exact) ld — same criterion as gels!: `_wsgrow` already gives ld =
+    # row count at every new high-water mark, so exact ld reproduces the gate's stride and removes the
+    # dependence on call history. None of the four escapes; `s`/`B` are the caller's.
+    @scope arn begin
+        U = borrow!(arn, T, m, mn)
+        Vt = borrow!(arn, T, mn, n)
+        C = borrow!(arn, T, mn, nrhs)
+        Ac = borrow!(arn, T, m, n)
+        @inbounds for j in 1:n, i in 1:m       # gesvd! destroys its A; A itself stays the caller's
+            Ac[i, j] = A[i, j]
+        end
+        gesvd!(Ac, U, sv, Vt)
+        # effective rank: σ_i ≤ tol treated as zero (dlalsd: rcond∉(0,1) ⇒ rounding unit)
+        rcnd = (rcond <= 0 || rcond >= 1) ? _gelsd_eps(R, mn) : R(rcond)
+        tol = rcnd * sv[1]
+        rank = 0
+        @inbounds for i in 1:mn
+            sv[i] > tol && (rank += 1)
+        end
+        # c := Uᴴ·b  (mn × nrhs)
+        gemm!(C, U, view(B, 1:m, :); transA = 'C', alpha = one(T), beta = zero(T))
+        # apply Σ⁺ (drop the reciprocals of the thresholded-to-zero singular values)
+        @inbounds for jc in 1:nrhs, i in 1:mn
+            C[i, jc] = sv[i] > tol ? C[i, jc] / sv[i] : zero(T)
+        end
+        # X := V·c = (Vᴴ)ᴴ·c  (n × nrhs) → B(1:n)   (C already holds Uᴴb, so overwriting B(1:m) is safe)
+        gemm!(view(B, 1:n, :), Vt, C; transA = 'C', alpha = one(T), beta = zero(T))
+        return B, rank, s
     end
-    gesvd!(Ac, U, sv, Vt)
-    # effective rank: σ_i ≤ tol treated as zero (dlalsd: rcond∉(0,1) ⇒ rounding unit)
-    rcnd = (rcond <= 0 || rcond >= 1) ? _gelsd_eps(R, mn) : R(rcond)
-    tol = rcnd * sv[1]
-    rank = 0
-    @inbounds for i in 1:mn
-        sv[i] > tol && (rank += 1)
-    end
-    # c := Uᴴ·b  (mn × nrhs)
-    gemm!(C, U, view(B, 1:m, :); transA = 'C', alpha = one(T), beta = zero(T))
-    # apply Σ⁺ (drop the reciprocals of the thresholded-to-zero singular values)
-    @inbounds for jc in 1:nrhs, i in 1:mn
-        C[i, jc] = sv[i] > tol ? C[i, jc] / sv[i] : zero(T)
-    end
-    # X := V·c = (Vᴴ)ᴴ·c  (n × nrhs) → B(1:n)   (C already holds Uᴴb, so overwriting B(1:m) is safe)
-    gemm!(view(B, 1:n, :), Vt, C; transA = 'C', alpha = one(T), beta = zero(T))
-    return B, rank, s
 end
 
 # Allocating convenience form — identical behaviour and return value to the pre-workspace gelsd!.
@@ -70,10 +78,12 @@ end
 # Float32-real path: PureBLAS's gesvd! has no Float32-real kernel (svd.jl covers Float64 + complex).
 # Compute in Float64 — MORE accurate than sgelsd but the same min-norm LS solution to Float32 tolerance.
 # ponytail: promote-to-Float64; add a native Float32 SVD kernel if Float32 gelsd perf ever matters.
-# The Float64 staging lives on `_l3ws(Float64)` — a different owner object from the Float32 workspace,
-# so it cannot alias the Float32 caller's buffers. `_gelsd_promote_work`'s first argument sizes BOTH the
-# A staging and the B staging, so it is called with max(m,n) (B's ldb-mandated row count) and the A
-# staging is then narrowed to its own m×n leading block.
+# The Float64 staging is BORROWED as Float64 out of the same arena the Float32 entry uses — byte ranges
+# are disjoint by construction, so the old "different owner object from the Float32 workspace" argument
+# (a `_l3ws(Float64)` reached UP from a Float32 entry) is retired rather than restated. The A and B
+# staging share a row count, so `mb = max(m,n)` (B's ldb-mandated rows) sizes both and the A staging is
+# then narrowed to its own m×n leading block. The nested Float64 `gelsd!` below opens its OWN scope
+# inside this one — perfectly nested, so its borrows sit above these and rewind first.
 function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::Real, s::AbstractVector{<:Real})
     m, n = size(A); mn = min(m, n); nrhs = size(B, 2); mb = max(m, n)
     size(B, 1) >= mb || _throw_brows_mn(:gelsd!, size(B, 1), mb)
@@ -81,22 +91,26 @@ function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::R
     (Base.mightalias(s, A) || Base.mightalias(s, B)) &&
         throw(ArgumentError("gelsd!: `s` must not alias `A` or `B`"))
     mn == 0 && return B, 0, s
-    Ad0, Bd, sd = _gelsd_promote_work(mb, n, mn, nrhs)
-    Ad = view(Ad0, 1:m, 1:n)
-    @inbounds for j in 1:n, i in 1:m
-        Ad[i, j] = Float64(A[i, j])
+    @scope arn begin
+        Ad0 = borrow!(arn, Float64, mb, n)
+        Bd = borrow!(arn, Float64, mb, nrhs)
+        sd = borrow!(arn, Float64, mn)
+        Ad = view(Ad0, 1:m, 1:n)
+        @inbounds for j in 1:n, i in 1:m
+            Ad[i, j] = Float64(A[i, j])
+        end
+        @inbounds for j in 1:nrhs, i in 1:mb
+            Bd[i, j] = Float64(B[i, j])
+        end
+        _, rank, _ = gelsd!(Ad, Bd, rcond, sd)
+        @inbounds for j in 1:nrhs, i in 1:mb
+            B[i, j] = Float32(Bd[i, j])
+        end
+        @inbounds for i in 1:mn
+            s[i] = Float32(sd[i])
+        end
+        return B, rank, s
     end
-    @inbounds for j in 1:nrhs, i in 1:mb
-        Bd[i, j] = Float64(B[i, j])
-    end
-    _, rank, _ = gelsd!(Ad, Bd, rcond, sd)
-    @inbounds for j in 1:nrhs, i in 1:mb
-        B[i, j] = Float32(Bd[i, j])
-    end
-    @inbounds for i in 1:mn
-        s[i] = Float32(sd[i])
-    end
-    return B, rank, s
 end
 
 function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::Real)

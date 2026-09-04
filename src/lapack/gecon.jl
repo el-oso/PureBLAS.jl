@@ -43,55 +43,31 @@ end
 end
 
 # ── _lacn2!: Higham–Hager 1-norm estimator of ‖op‖₁. `applyop!(x, adj)` overwrites x with op·x when
-# adj=false and opᴴ·x when adj=true. Returns the estimate. The x/v/isgn scratch is owned by the
-# per-element-type L3Workspace (`_lacn_bufs`), so the estimator — and gecon!/trcon!/pocon! with it —
-# is allocation-free. EXACT DLACON/ZLACON transcription — do not "simplify" the iteration.
+# adj=false and opᴴ·x when adj=true. Returns the estimate. The x/v/isgn scratch is BORROWED from the
+# arena for the duration of one call (arena.jl), so the estimator — and gecon!/trcon!/pocon! with it —
+# is allocation-free from the second call at any given size (the first at a new arena high-water pays
+# one slab resize). EXACT DLACON/ZLACON transcription — do not "simplify" the iteration.
 function _lacn2!(applyop!, ::Type{T}, n::Int) where {T}
     R = real(T)
-    x, v, isgn = _lacn_bufs(T, n)                  # isgn: real-only sign-repeat test vector (len 0 if complex)
-    itmax = 5
+    # Arena borrows (arena.jl), not owned fields: x/v are the candidate and the previous iterate, isgn the
+    # real-only sign-repeat test vector (DLACON has it, ZLACON does not — length 0 for complex, exactly as
+    # the field it replaces). All three are hoisted above the iteration below, so the scope holds three
+    # borrows for one estimator call. NOTHING ESCAPES: `x` is handed to `applyop!`, whose three closures
+    # (gecon!/trcon!/pocon!, further down this file) only forward it to `trsv!` and the pivot permutations
+    # and return it; none retains it, and `v`/`isgn` never cross the callback at all.
+    @scope arn begin
+        x = borrow!(arn, T, n)
+        v = borrow!(arn, T, n)
+        isgn = borrow!(arn, Int, T <: Real ? n : 0)
+        itmax = 5
 
-    fill!(x, one(T) / n)
-    applyop!(x, false)                              # x ← op·x   (KASE 1, JUMP 1)
-    if n == 1
-        v[1] = x[1]
-        return abs(v[1])
-    end
-    est = _cond_absum(x)
-    @inbounds for i in eachindex(x)
-        x[i] = _cond_sign(x[i])
-    end
-    if T <: Real
-        @inbounds for i in eachindex(x)
-            isgn[i] = round(Int, real(x[i]))
+        fill!(x, one(T) / n)
+        applyop!(x, false)                              # x ← op·x   (KASE 1, JUMP 1)
+        if n == 1
+            v[1] = x[1]
+            return abs(v[1])
         end
-    end
-    applyop!(x, true)                               # x ← opᴴ·x  (KASE 2, JUMP 2)
-    j = _cond_iamax(x)
-    iter = 2
-
-    final = false
-    while true                                      # MAIN LOOP (iterations 2..ITMAX)
-        fill!(x, zero(T)); @inbounds x[j] = one(T)
-        applyop!(x, false)                          # x ← op·eⱼ  (KASE 1, JUMP 3)
-        copyto!(v, x)
-        estold = est
-        est = _cond_absum(v)
-
-        if T <: Real                                # real: repeated sign vector ⇒ converged (→ final)
-            same = true
-            @inbounds for i in eachindex(x)
-                if round(Int, real(_cond_sign(x[i]))) != isgn[i]
-                    same = false; break
-                end
-            end
-            same && (final = true)
-        end
-        if !final && est <= estold                  # cycling test (both real & complex) ⇒ final
-            final = true
-        end
-        final && break
-
+        est = _cond_absum(x)
         @inbounds for i in eachindex(x)
             x[i] = _cond_sign(x[i])
         end
@@ -100,29 +76,64 @@ function _lacn2!(applyop!, ::Type{T}, n::Int) where {T}
                 isgn[i] = round(Int, real(x[i]))
             end
         end
-        applyop!(x, true)                           # x ← opᴴ·x  (KASE 2, JUMP 4)
-        jlast = j
+        applyop!(x, true)                               # x ← opᴴ·x  (KASE 2, JUMP 2)
         j = _cond_iamax(x)
-        if abs(x[jlast]) != abs(x[j]) && iter < itmax
-            iter += 1
-            continue
-        end
-        break
-    end
+        iter = 2
 
-    # FINAL STAGE: alternate signed test vector xᵢ = ±(1 + (i-1)/(n-1)); take max with est.
-    altsgn = one(R)
-    @inbounds for i in 1:n
-        x[i] = T(altsgn * (one(R) + R(i - 1) / R(n - 1)))
-        altsgn = -altsgn
+        final = false
+        while true                                      # MAIN LOOP (iterations 2..ITMAX)
+            fill!(x, zero(T)); @inbounds x[j] = one(T)
+            applyop!(x, false)                          # x ← op·eⱼ  (KASE 1, JUMP 3)
+            copyto!(v, x)
+            estold = est
+            est = _cond_absum(v)
+
+            if T <: Real                                # real: repeated sign vector ⇒ converged (→ final)
+                same = true
+                @inbounds for i in eachindex(x)
+                    if round(Int, real(_cond_sign(x[i]))) != isgn[i]
+                        same = false; break
+                    end
+                end
+                same && (final = true)
+            end
+            if !final && est <= estold                  # cycling test (both real & complex) ⇒ final
+                final = true
+            end
+            final && break
+
+            @inbounds for i in eachindex(x)
+                x[i] = _cond_sign(x[i])
+            end
+            if T <: Real
+                @inbounds for i in eachindex(x)
+                    isgn[i] = round(Int, real(x[i]))
+                end
+            end
+            applyop!(x, true)                           # x ← opᴴ·x  (KASE 2, JUMP 4)
+            jlast = j
+            j = _cond_iamax(x)
+            if abs(x[jlast]) != abs(x[j]) && iter < itmax
+                iter += 1
+                continue
+            end
+            break
+        end
+
+        # FINAL STAGE: alternate signed test vector xᵢ = ±(1 + (i-1)/(n-1)); take max with est.
+        altsgn = one(R)
+        @inbounds for i in 1:n
+            x[i] = T(altsgn * (one(R) + R(i - 1) / R(n - 1)))
+            altsgn = -altsgn
+        end
+        applyop!(x, false)                              # x ← op·x   (KASE 1, JUMP 5)
+        temp = 2 * (_cond_absum(x) / (3 * n))
+        if temp > est
+            copyto!(v, x)
+            est = temp
+        end
+        return est
     end
-    applyop!(x, false)                              # x ← op·x   (KASE 1, JUMP 5)
-    temp = 2 * (_cond_absum(x) / (3 * n))
-    if temp > est
-        copyto!(v, x)
-        est = temp
-    end
-    return est
 end
 
 @inline _cond_onenorm(norm::Char) = (norm == '1' || norm == 'O' || norm == 'o')

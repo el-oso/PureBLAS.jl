@@ -1570,8 +1570,15 @@ function _trsm_dense_L!(up::Bool, tr::Bool, unit::Bool, A, B)
     # W×W triangular diagonal solve (∝ k·W·n, depth-W latency chain). Net win ⇒ k·W < k²/W ⇒ k > W². Fleet-
     # validated: Zen3(W=4,W²=16) wins from k=32, Zen4(W=8,W²=64) from k=96. (Side-R tiles unconditionally
     # — it vectorizes its in-block solve over m, no W² term.) `_CHOLW*_CHOLW` const-folds at compile time.
-    if !tr && T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
-            stride(A, 1) == 1 && stride(B, 1) == 1 && k > _CHOLW * _CHOLW   # no-trans strided f64 → tile
+    # `_strided1`, not the inline `isa StridedMatrix && stride(·,1)==1`: `trsm!`'s public entry already
+    # gates B on `_strided1`, so a `PtrMatrix` reaches here, and `PtrMatrix` is not in the closed
+    # `StridedMatrix` union. gbtrf.jl:413 and cabi_lapack2.jl:30 both call with two `PtrMatrix` operands.
+    # kb `strided-gates-drop-pointer-operands-to-scalar`.
+    # ⚠ SEPARATE ISSUE recorded there, NOT fixed by this line: every caller caps k at 32 (`_trsm_dbase()`
+    # = 32, `_trtri_base()` = 16), so `k > _CHOLW²` = `k > 64` makes this branch DEAD on AVX-512 for every
+    # argument type. Only W=4 parts reach it. Fixing the predicate buys nothing on Zen4/Zen5 by itself.
+    if !tr && T === Float64 && _strided1(A) && _strided1(B) &&
+            k > _CHOLW * _CHOLW                                             # no-trans strided f64 → tile
         GC.@preserve A B _trsm_tile_L_f64!(up, unit, pointer(A), lda, pointer(B), ldb, k, n)
         return B
     end
@@ -2662,8 +2669,7 @@ end
 # (cheap; L2-resident). Whole-B packing (P=KC×n) was measured WORSE (P spills L1) — keep P per-stripe.
 # Float64 only: for Float32 the invL leaf (2×-flop at ~2×-higher f32 gemm peak) already beats the fused
 # leaf even at n=128 (measured −18% if fused) — f32 stays on invL. The kernel itself is T-generic.
-@inline _trsm_fusable(A, B) = eltype(B) === Float64 &&
-    A isa StridedMatrix && B isa StridedMatrix && stride(A, 1) == 1 && stride(B, 1) == 1
+@inline _trsm_fusable(A, B) = eltype(B) === Float64 && _strided1(A) && _strided1(B)
 # Transpose-packing B (col-major, stride ldb) → P (row-major, stride NR) has one unavoidable strided side.
 # Row-outer keeps P writes contiguous but reads B at stride ldb·sz: for a leading dim whose byte stride
 # shares a big power-of-2 factor with the L1 way size, the NR reads collapse onto few sets (n=256→2 sets,
@@ -3891,8 +3897,12 @@ end
 function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     m = size(B, 1); k = size(A, 2); T = eltype(B); sz = sizeof(T); ldb = stride(B, 2)
     asc = (up != tr)
-    if T === Float64 && A isa StridedMatrix && B isa StridedMatrix &&
-            stride(A, 1) == 1 && stride(B, 1) == 1 && k >= 4 && m >= _CHOLW    # strided f64 (trsmR gate) → tile
+    # `_strided1`: getri!, `_pptrf_lower_blocked!` and banded_chol.jl:384/405 all reach here with arena
+    # borrows now, and a `PtrMatrix` is not a `StridedMatrix`. Without this the side-R solve falls to the
+    # per-column `_axpy_simd!`/`_scal_simd_ptr!` loop instead of the tile kernel, which side-R takes
+    # unconditionally. kb `strided-gates-drop-pointer-operands-to-scalar`.
+    if T === Float64 && _strided1(A) && _strided1(B) &&
+            k >= 4 && m >= _CHOLW                                             # strided f64 (trsmR gate) → tile
         GC.@preserve A B _trsm_tile_R_f64!(up, tr, unit, pointer(A), stride(A, 2), pointer(B), ldb, m, k)
         return B
     end

@@ -188,213 +188,227 @@ function _tgevc_right!(
     ONE = one(R); ZERO = zero(R); SAFETY = R(100)
     safmin = _qz_safmin(R); ulp = eps(R)
     small = safmin * n / ulp; big = ONE / small; bignum = ONE / (safmin * n)
-    # cols: 1=Snorm(WORK j) 2=Pnorm(WORK N+j) 3=x.re 4=x.im 5=bt.re 6=bt.im. The accessor zeroes cols
-    # 3–4 (col 4 is never written at nw==1 yet is still passed to `_laln2` in a live argument slot);
-    # cols 1–2 and 5–6 are written before every read.
-    W, _ = _tgevc_work(R, n)
-    # column 1-norms of strictly-upper (excluding diagonal blocks)
-    anorm = abs(S[1, 1]); n > 1 && (anorm += abs(S[2, 1]))
-    bnorm = abs(P[1, 1])
-    @inbounds for j in 2:n
-        temp = ZERO; temp2 = ZERO
-        iend = S[j, j - 1] == ZERO ? j - 1 : j - 2
-        for i in 1:iend
-            temp += abs(S[i, j]); temp2 += abs(P[i, j])
+    # cols: 1=Snorm(WORK j) 2=Pnorm(WORK N+j) 3=x.re 4=x.im 5=bt.re 6=bt.im. Kept ONE borrow, not six,
+    # because the engine indexes it as W[j, 3+jw] with a RUNTIME column offset. Cols 3–4 are zeroed once
+    # here, exactly as the accessor did: col 3 is belt-and-braces (the je-loop re-clears it), col 4 is the
+    # one that matters — at nw==1 it is never written, yet W[j,4]/W[j+1,4] are still passed to `_laln2`
+    # in live argument slots (dead there for na==1, but an undef borrow would feed uninitialised memory
+    # into an argument). Cols 1–2 and 5–6 are written before every read. Exact ld (no anti-aliasing ld:
+    # the field it replaces was a plain n×6 `_wsgrow`).
+    # ESCAPE AUDIT: `W` never leaves this frame. The only callees below are `_laln2`, `_lag2`, `_ladiv`
+    # and `_qz_safmin`, and every one of them takes and returns SCALARS (`W[j,3]`, `W[j+1,4]`, …) — no
+    # callee receives the handle, there is no closure or `do` block here, and the result reaches the
+    # caller by element-wise stores into `VR`, never by aliasing `W`. The two `return`s inside the scope
+    # (`je - 1` and `0`) are `Int`s. So no handle outlives the block.
+    @scope arn begin
+        W = borrow!(arn, R, n, 6)
+        for jw in 3:4, jr in 1:n
+            W[jr, jw] = ZERO
         end
-        W[j, 1] = temp; W[j, 2] = temp2
-        for i in (iend + 1):min(j + 1, n)
-            temp += abs(S[i, j]); temp2 += abs(P[i, j])
+        # column 1-norms of strictly-upper (excluding diagonal blocks)
+        anorm = abs(S[1, 1]); n > 1 && (anorm += abs(S[2, 1]))
+        bnorm = abs(P[1, 1])
+        @inbounds for j in 2:n
+            temp = ZERO; temp2 = ZERO
+            iend = S[j, j - 1] == ZERO ? j - 1 : j - 2
+            for i in 1:iend
+                temp += abs(S[i, j]); temp2 += abs(P[i, j])
+            end
+            W[j, 1] = temp; W[j, 2] = temp2
+            for i in (iend + 1):min(j + 1, n)
+                temp += abs(S[i, j]); temp2 += abs(P[i, j])
+            end
+            anorm = max(anorm, temp); bnorm = max(bnorm, temp2)
         end
-        anorm = max(anorm, temp); bnorm = max(bnorm, temp2)
-    end
-    ascale = ONE / max(anorm, safmin); bscale = ONE / max(bnorm, safmin)
-    ieig = n + 1
-    ilcplx = false
-    je = n
-    @inbounds while je >= 1
-        if ilcplx
-            ilcplx = false; je -= 1; continue
-        end
-        nw = 1
-        if je > 1 && S[je, je - 1] != ZERO
-            ilcplx = true; nw = 2
-        end
-        # singular pencil → unit eigenvector
-        if !ilcplx && abs(S[je, je]) <= safmin && abs(P[je, je]) <= safmin
-            ieig -= 1
-            for jr in 1:n
-                VR[jr, ieig] = ZERO
+        ascale = ONE / max(anorm, safmin); bscale = ONE / max(bnorm, safmin)
+        ieig = n + 1
+        ilcplx = false
+        je = n
+        @inbounds while je >= 1
+            if ilcplx
+                ilcplx = false; je -= 1; continue
             end
-            VR[ieig, ieig] = ONE
-            je -= 1; continue
-        end
-        # clear work x columns
-        for jw in 0:(nw - 1), jr in 1:n
-            W[jr, 3 + jw] = ZERO
-        end
-        local acoef, bcoefr, bcoefi, acoefa, bcoefa
-        if !ilcplx
-            temp = ONE / max(abs(S[je, je]) * ascale, abs(P[je, je]) * bscale, safmin)
-            salfar = (temp * S[je, je]) * ascale
-            sbeta = (temp * P[je, je]) * bscale
-            acoef = sbeta * ascale
-            bcoefr = salfar * bscale
-            bcoefi = ZERO
-            scale = ONE
-            lsa = abs(sbeta) >= safmin && abs(acoef) < small
-            lsb = abs(salfar) >= safmin && abs(bcoefr) < small
-            lsa && (scale = (small / abs(sbeta)) * min(anorm, big))
-            lsb && (scale = max(scale, (small / abs(salfar)) * min(bnorm, big)))
-            if lsa || lsb
-                scale = min(scale, ONE / (safmin * max(ONE, abs(acoef), abs(bcoefr))))
-                acoef = lsa ? ascale * (scale * sbeta) : scale * acoef
-                bcoefr = lsb ? bscale * (scale * salfar) : scale * bcoefr
+            nw = 1
+            if je > 1 && S[je, je - 1] != ZERO
+                ilcplx = true; nw = 2
             end
-            acoefa = abs(acoef); bcoefa = abs(bcoefr)
-            W[je, 3] = ONE; xmax = ONE
-            for jr in 1:(je - 1)
-                W[jr, 3] = bcoefr * P[jr, je] - acoef * S[jr, je]
-            end
-        else
-            s1, tmp1, bcoefr, tmp2, bcoefi = _lag2(
-                S[je - 1, je - 1], S[je, je - 1], S[je - 1, je],
-                S[je, je], P[je - 1, je - 1], P[je - 1, je], P[je, je], safmin * SAFETY
-            )
-            acoef = s1
-            bcoefi == ZERO && return je - 1   # info
-            acoefa = abs(acoef); bcoefa = abs(bcoefr) + abs(bcoefi)
-            scale = ONE
-            (acoefa * ulp < safmin && acoefa >= safmin) && (scale = (safmin / ulp) / acoefa)
-            (bcoefa * ulp < safmin && bcoefa >= safmin) && (scale = max(scale, (safmin / ulp) / bcoefa))
-            safmin * acoefa > ascale && (scale = ascale / (safmin * acoefa))
-            safmin * bcoefa > bscale && (scale = min(scale, bscale / (safmin * bcoefa)))
-            if scale != ONE
-                acoef = scale * acoef; acoefa = abs(acoef)
-                bcoefr = scale * bcoefr; bcoefi = scale * bcoefi
-                bcoefa = abs(bcoefr) + abs(bcoefi)
-            end
-            temp = acoef * S[je, je - 1]
-            temp2r = acoef * S[je, je] - bcoefr * P[je, je]
-            temp2i = -bcoefi * P[je, je]
-            if abs(temp) >= abs(temp2r) + abs(temp2i)
-                W[je, 3] = ONE; W[je, 4] = ZERO
-                W[je - 1, 3] = -temp2r / temp; W[je - 1, 4] = -temp2i / temp
-            else
-                W[je - 1, 3] = ONE; W[je - 1, 4] = ZERO
-                temp = acoef * S[je - 1, je]
-                W[je, 3] = (bcoefr * P[je - 1, je - 1] - acoef * S[je - 1, je - 1]) / temp
-                W[je, 4] = bcoefi * P[je - 1, je - 1] / temp
-            end
-            xmax = max(abs(W[je, 3]) + abs(W[je, 4]), abs(W[je - 1, 3]) + abs(W[je - 1, 4]))
-            creala = acoef * W[je - 1, 3]; cimaga = acoef * W[je - 1, 4]
-            crealb = bcoefr * W[je - 1, 3] - bcoefi * W[je - 1, 4]
-            cimagb = bcoefi * W[je - 1, 3] + bcoefr * W[je - 1, 4]
-            cre2a = acoef * W[je, 3]; cim2a = acoef * W[je, 4]
-            cre2b = bcoefr * W[je, 3] - bcoefi * W[je, 4]
-            cim2b = bcoefi * W[je, 3] + bcoefr * W[je, 4]
-            for jr in 1:(je - 2)
-                W[jr, 3] = -creala * S[jr, je - 1] + crealb * P[jr, je - 1] - cre2a * S[jr, je] + cre2b * P[jr, je]
-                W[jr, 4] = -cimaga * S[jr, je - 1] + cimagb * P[jr, je - 1] - cim2a * S[jr, je] + cim2b * P[jr, je]
-            end
-        end
-        dmin = max(ulp * acoefa * anorm, ulp * bcoefa * bnorm, safmin)
-        # Columnwise triangular solve of (a S - b P) x = 0
-        il2by2 = false
-        j = je - nw
-        while j >= 1
-            if !il2by2 && j > 1 && S[j, j - 1] != ZERO
-                il2by2 = true; j -= 1; continue    # handle as 2×2 next (when it is j:j+1)
-            end
-            na = il2by2 ? 2 : 1
-            bd1 = P[j, j]; bd2 = il2by2 ? P[j + 1, j + 1] : ZERO
-            x11, x21, x12, x22, scale, xnorm, iinfo = _laln2(
-                false, na, nw, dmin, acoef,
-                S[j, j], S[j, j + 1], S[j + 1, j], S[j + 1, j + 1], bd1, bd2,
-                W[j, 3], W[j + 1, 3], W[j, 4], W[j + 1, 4], bcoefr, bcoefi
-            )
-            if scale < ONE
-                for jw in 0:(nw - 1), jr in 1:je
-                    W[jr, 3 + jw] *= scale
-                end
-            end
-            xmax = max(scale * xmax, xnorm)
-            # store solution
-            W[j, 3] = x11; nw == 2 && (W[j, 4] = x12)
-            if na == 2
-                W[j + 1, 3] = x21; nw == 2 && (W[j + 1, 4] = x22)
-            end
-            if j > 1
-                xscale = ONE / max(ONE, xmax)
-                temp = acoefa * W[j, 1] + bcoefa * W[j, 2]
-                il2by2 && (temp = max(temp, acoefa * W[j + 1, 1] + bcoefa * W[j + 1, 2]))
-                temp = max(temp, acoefa, bcoefa)
-                if temp > bignum * xscale
-                    for jw in 0:(nw - 1), jr in 1:je
-                        W[jr, 3 + jw] *= xscale
-                    end
-                    xmax *= xscale
-                end
-                for ja in 1:na
-                    if ilcplx
-                        creala = acoef * W[j + ja - 1, 3]; cimaga = acoef * W[j + ja - 1, 4]
-                        crealb = bcoefr * W[j + ja - 1, 3] - bcoefi * W[j + ja - 1, 4]
-                        cimagb = bcoefi * W[j + ja - 1, 3] + bcoefr * W[j + ja - 1, 4]
-                        for jr in 1:(j - 1)
-                            W[jr, 3] += -creala * S[jr, j + ja - 1] + crealb * P[jr, j + ja - 1]
-                            W[jr, 4] += -cimaga * S[jr, j + ja - 1] + cimagb * P[jr, j + ja - 1]
-                        end
-                    else
-                        creala = acoef * W[j + ja - 1, 3]; crealb = bcoefr * W[j + ja - 1, 3]
-                        for jr in 1:(j - 1)
-                            W[jr, 3] += -creala * S[jr, j + ja - 1] + crealb * P[jr, j + ja - 1]
-                        end
-                    end
-                end
-            end
-            il2by2 = false
-            j -= 1
-        end
-        # Copy eigenvector to VR (back-transform if ilback)
-        ieig -= nw
-        if ilback
-            for jw in 0:(nw - 1)
+            # singular pencil → unit eigenvector
+            if !ilcplx && abs(S[je, je]) <= safmin && abs(P[je, je]) <= safmin
+                ieig -= 1
                 for jr in 1:n
-                    W[jr, 5 + jw] = W[1, 3 + jw] * VR[jr, 1]
+                    VR[jr, ieig] = ZERO
                 end
-                for jc in 2:je, jr in 1:n
-                    W[jr, 5 + jw] += W[jc, 3 + jw] * VR[jr, jc]
+                VR[ieig, ieig] = ONE
+                je -= 1; continue
+            end
+            # clear work x columns
+            for jw in 0:(nw - 1), jr in 1:n
+                W[jr, 3 + jw] = ZERO
+            end
+            local acoef, bcoefr, bcoefi, acoefa, bcoefa
+            if !ilcplx
+                temp = ONE / max(abs(S[je, je]) * ascale, abs(P[je, je]) * bscale, safmin)
+                salfar = (temp * S[je, je]) * ascale
+                sbeta = (temp * P[je, je]) * bscale
+                acoef = sbeta * ascale
+                bcoefr = salfar * bscale
+                bcoefi = ZERO
+                scale = ONE
+                lsa = abs(sbeta) >= safmin && abs(acoef) < small
+                lsb = abs(salfar) >= safmin && abs(bcoefr) < small
+                lsa && (scale = (small / abs(sbeta)) * min(anorm, big))
+                lsb && (scale = max(scale, (small / abs(salfar)) * min(bnorm, big)))
+                if lsa || lsb
+                    scale = min(scale, ONE / (safmin * max(ONE, abs(acoef), abs(bcoefr))))
+                    acoef = lsa ? ascale * (scale * sbeta) : scale * acoef
+                    bcoefr = lsb ? bscale * (scale * salfar) : scale * bcoefr
+                end
+                acoefa = abs(acoef); bcoefa = abs(bcoefr)
+                W[je, 3] = ONE; xmax = ONE
+                for jr in 1:(je - 1)
+                    W[jr, 3] = bcoefr * P[jr, je] - acoef * S[jr, je]
+                end
+            else
+                s1, tmp1, bcoefr, tmp2, bcoefi = _lag2(
+                    S[je - 1, je - 1], S[je, je - 1], S[je - 1, je],
+                    S[je, je], P[je - 1, je - 1], P[je - 1, je], P[je, je], safmin * SAFETY
+                )
+                acoef = s1
+                bcoefi == ZERO && return je - 1   # info
+                acoefa = abs(acoef); bcoefa = abs(bcoefr) + abs(bcoefi)
+                scale = ONE
+                (acoefa * ulp < safmin && acoefa >= safmin) && (scale = (safmin / ulp) / acoefa)
+                (bcoefa * ulp < safmin && bcoefa >= safmin) && (scale = max(scale, (safmin / ulp) / bcoefa))
+                safmin * acoefa > ascale && (scale = ascale / (safmin * acoefa))
+                safmin * bcoefa > bscale && (scale = min(scale, bscale / (safmin * bcoefa)))
+                if scale != ONE
+                    acoef = scale * acoef; acoefa = abs(acoef)
+                    bcoefr = scale * bcoefr; bcoefi = scale * bcoefi
+                    bcoefa = abs(bcoefr) + abs(bcoefi)
+                end
+                temp = acoef * S[je, je - 1]
+                temp2r = acoef * S[je, je] - bcoefr * P[je, je]
+                temp2i = -bcoefi * P[je, je]
+                if abs(temp) >= abs(temp2r) + abs(temp2i)
+                    W[je, 3] = ONE; W[je, 4] = ZERO
+                    W[je - 1, 3] = -temp2r / temp; W[je - 1, 4] = -temp2i / temp
+                else
+                    W[je - 1, 3] = ONE; W[je - 1, 4] = ZERO
+                    temp = acoef * S[je - 1, je]
+                    W[je, 3] = (bcoefr * P[je - 1, je - 1] - acoef * S[je - 1, je - 1]) / temp
+                    W[je, 4] = bcoefi * P[je - 1, je - 1] / temp
+                end
+                xmax = max(abs(W[je, 3]) + abs(W[je, 4]), abs(W[je - 1, 3]) + abs(W[je - 1, 4]))
+                creala = acoef * W[je - 1, 3]; cimaga = acoef * W[je - 1, 4]
+                crealb = bcoefr * W[je - 1, 3] - bcoefi * W[je - 1, 4]
+                cimagb = bcoefi * W[je - 1, 3] + bcoefr * W[je - 1, 4]
+                cre2a = acoef * W[je, 3]; cim2a = acoef * W[je, 4]
+                cre2b = bcoefr * W[je, 3] - bcoefi * W[je, 4]
+                cim2b = bcoefi * W[je, 3] + bcoefr * W[je, 4]
+                for jr in 1:(je - 2)
+                    W[jr, 3] = -creala * S[jr, je - 1] + crealb * P[jr, je - 1] - cre2a * S[jr, je] + cre2b * P[jr, je]
+                    W[jr, 4] = -cimaga * S[jr, je - 1] + cimagb * P[jr, je - 1] - cim2a * S[jr, je] + cim2b * P[jr, je]
                 end
             end
-            for jw in 0:(nw - 1), jr in 1:n
-                VR[jr, ieig + jw] = W[jr, 5 + jw]
+            dmin = max(ulp * acoefa * anorm, ulp * bcoefa * bnorm, safmin)
+            # Columnwise triangular solve of (a S - b P) x = 0
+            il2by2 = false
+            j = je - nw
+            while j >= 1
+                if !il2by2 && j > 1 && S[j, j - 1] != ZERO
+                    il2by2 = true; j -= 1; continue    # handle as 2×2 next (when it is j:j+1)
+                end
+                na = il2by2 ? 2 : 1
+                bd1 = P[j, j]; bd2 = il2by2 ? P[j + 1, j + 1] : ZERO
+                x11, x21, x12, x22, scale, xnorm, iinfo = _laln2(
+                    false, na, nw, dmin, acoef,
+                    S[j, j], S[j, j + 1], S[j + 1, j], S[j + 1, j + 1], bd1, bd2,
+                    W[j, 3], W[j + 1, 3], W[j, 4], W[j + 1, 4], bcoefr, bcoefi
+                )
+                if scale < ONE
+                    for jw in 0:(nw - 1), jr in 1:je
+                        W[jr, 3 + jw] *= scale
+                    end
+                end
+                xmax = max(scale * xmax, xnorm)
+                # store solution
+                W[j, 3] = x11; nw == 2 && (W[j, 4] = x12)
+                if na == 2
+                    W[j + 1, 3] = x21; nw == 2 && (W[j + 1, 4] = x22)
+                end
+                if j > 1
+                    xscale = ONE / max(ONE, xmax)
+                    temp = acoefa * W[j, 1] + bcoefa * W[j, 2]
+                    il2by2 && (temp = max(temp, acoefa * W[j + 1, 1] + bcoefa * W[j + 1, 2]))
+                    temp = max(temp, acoefa, bcoefa)
+                    if temp > bignum * xscale
+                        for jw in 0:(nw - 1), jr in 1:je
+                            W[jr, 3 + jw] *= xscale
+                        end
+                        xmax *= xscale
+                    end
+                    for ja in 1:na
+                        if ilcplx
+                            creala = acoef * W[j + ja - 1, 3]; cimaga = acoef * W[j + ja - 1, 4]
+                            crealb = bcoefr * W[j + ja - 1, 3] - bcoefi * W[j + ja - 1, 4]
+                            cimagb = bcoefi * W[j + ja - 1, 3] + bcoefr * W[j + ja - 1, 4]
+                            for jr in 1:(j - 1)
+                                W[jr, 3] += -creala * S[jr, j + ja - 1] + crealb * P[jr, j + ja - 1]
+                                W[jr, 4] += -cimaga * S[jr, j + ja - 1] + cimagb * P[jr, j + ja - 1]
+                            end
+                        else
+                            creala = acoef * W[j + ja - 1, 3]; crealb = bcoefr * W[j + ja - 1, 3]
+                            for jr in 1:(j - 1)
+                                W[jr, 3] += -creala * S[jr, j + ja - 1] + crealb * P[jr, j + ja - 1]
+                            end
+                        end
+                    end
+                end
+                il2by2 = false
+                j -= 1
             end
-            iend = n
-        else
-            for jw in 0:(nw - 1), jr in 1:n
-                VR[jr, ieig + jw] = W[jr, 3 + jw]
+            # Copy eigenvector to VR (back-transform if ilback)
+            ieig -= nw
+            if ilback
+                for jw in 0:(nw - 1)
+                    for jr in 1:n
+                        W[jr, 5 + jw] = W[1, 3 + jw] * VR[jr, 1]
+                    end
+                    for jc in 2:je, jr in 1:n
+                        W[jr, 5 + jw] += W[jc, 3 + jw] * VR[jr, jc]
+                    end
+                end
+                for jw in 0:(nw - 1), jr in 1:n
+                    VR[jr, ieig + jw] = W[jr, 5 + jw]
+                end
+                iend = n
+            else
+                for jw in 0:(nw - 1), jr in 1:n
+                    VR[jr, ieig + jw] = W[jr, 3 + jw]
+                end
+                iend = je
             end
-            iend = je
+            # scale eigenvector
+            xmaxv = ZERO
+            if ilcplx
+                for jj in 1:iend
+                    xmaxv = max(xmaxv, abs(VR[jj, ieig]) + abs(VR[jj, ieig + 1]))
+                end
+            else
+                for jj in 1:iend
+                    xmaxv = max(xmaxv, abs(VR[jj, ieig]))
+                end
+            end
+            if xmaxv > safmin
+                xscale = ONE / xmaxv
+                for jw in 0:(nw - 1), jr in 1:iend
+                    VR[jr, ieig + jw] *= xscale
+                end
+            end
+            je -= 1
         end
-        # scale eigenvector
-        xmaxv = ZERO
-        if ilcplx
-            for jj in 1:iend
-                xmaxv = max(xmaxv, abs(VR[jj, ieig]) + abs(VR[jj, ieig + 1]))
-            end
-        else
-            for jj in 1:iend
-                xmaxv = max(xmaxv, abs(VR[jj, ieig]))
-            end
-        end
-        if xmaxv > safmin
-            xscale = ONE / xmaxv
-            for jw in 0:(nw - 1), jr in 1:iend
-                VR[jr, ieig + jw] *= xscale
-            end
-        end
-        je -= 1
+        return 0
     end
-    return 0
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -409,110 +423,123 @@ function _tgevc_right!(
     cabs1(z) = abs(real(z)) + abs(imag(z))
     safmin = _qz_safmin(R); ulp = eps(R)
     small = safmin * n / ulp; big = ONE / small; bignum = ONE / (safmin * n)
-    _, work = _tgevc_work(C, n)       # WORK(1:n)=x/sums, WORK(n+1:2n)=back-transform
-    rwork = _tgevc_rwork(C, n)        # RWORK(j)=Snorm, RWORK(n+j)=Pnorm (REAL-typed ⇒ a distinct owner)
-    anorm = cabs1(S[1, 1]); bnorm = cabs1(P[1, 1])
-    @inbounds for j in 2:n
-        s = ZERO; b = ZERO
-        for i in 1:(j - 1)
-            s += cabs1(S[i, j]); b += cabs1(P[i, j])
-        end
-        rwork[j] = s; rwork[n + j] = b
-        anorm = max(anorm, s + cabs1(S[j, j])); bnorm = max(bnorm, b + cabs1(P[j, j]))
-    end
-    ascale = ONE / max(anorm, safmin); bscale = ONE / max(bnorm, safmin)
-    ieig = n + 1
-    @inbounds for je in n:-1:1
-        ieig -= 1
-        if cabs1(S[je, je]) <= safmin && abs(real(P[je, je])) <= safmin
-            for jr in 1:n
-                VR[jr, ieig] = CZERO
+    # No fill! on either borrow, exactly as the accessors had none: `work[1:n]` is written for every jr
+    # in 1:n at the top of each je-iteration and `work[n+1:2n]` for every jr in 1:n before it is read
+    # back; `rwork[j]`/`rwork[n+j]` are written for every j in 2:n before any read, and rwork[1] /
+    # rwork[n+1] are never read. Exact lds — the fields they replace were plain 2n `_wsgrow`s.
+    # `rwork` is REAL-typed and `work` element-typed; two separate borrows can no more alias than the two
+    # owner objects they replace did.
+    # ESCAPE AUDIT: neither handle leaves this frame. The only callees reached from the loops below are
+    # `_zladiv` and `_qz_safmin`, both scalar-in/scalar-out; `cabs1` is a local closure defined ABOVE
+    # this scope over no borrow (it takes its argument by value); nothing is stored in a field or global,
+    # and the eigenvectors reach the caller by element-wise stores into `VR`. The single `return 0` is an
+    # `Int`. So no handle outlives the block.
+    @scope arn begin
+        work = borrow!(arn, C, 2n)     # WORK(1:n)=x/sums, WORK(n+1:2n)=back-transform
+        rwork = borrow!(arn, R, 2n)    # RWORK(j)=Snorm, RWORK(n+j)=Pnorm (REAL-typed ⇒ a distinct owner)
+        anorm = cabs1(S[1, 1]); bnorm = cabs1(P[1, 1])
+        @inbounds for j in 2:n
+            s = ZERO; b = ZERO
+            for i in 1:(j - 1)
+                s += cabs1(S[i, j]); b += cabs1(P[i, j])
             end
-            VR[ieig, ieig] = CONE
-            continue
+            rwork[j] = s; rwork[n + j] = b
+            anorm = max(anorm, s + cabs1(S[j, j])); bnorm = max(bnorm, b + cabs1(P[j, j]))
         end
-        temp = ONE / max(cabs1(S[je, je]) * ascale, abs(real(P[je, je])) * bscale, safmin)
-        salpha = (temp * S[je, je]) * ascale
-        sbeta = (temp * real(P[je, je])) * bscale
-        acoeff = sbeta * ascale
-        bcoeff = salpha * bscale
-        lsa = abs(sbeta) >= safmin && abs(acoeff) < small
-        lsb = cabs1(salpha) >= safmin && cabs1(bcoeff) < small
-        scale = ONE
-        lsa && (scale = (small / abs(sbeta)) * min(anorm, big))
-        lsb && (scale = max(scale, (small / cabs1(salpha)) * min(bnorm, big)))
-        if lsa || lsb
-            scale = min(scale, ONE / (safmin * max(ONE, abs(acoeff), cabs1(bcoeff))))
-            acoeff = lsa ? ascale * (scale * sbeta) : scale * acoeff
-            bcoeff = lsb ? bscale * (scale * salpha) : scale * bcoeff
-        end
-        acoefa = abs(acoeff); bcoefa = cabs1(bcoeff)
-        xmax = ONE
-        for jr in 1:n
-            work[jr] = CZERO
-        end
-        work[je] = CONE
-        dmin = max(ulp * acoefa * anorm, ulp * bcoefa * bnorm, safmin)
-        for jr in 1:(je - 1)
-            work[jr] = acoeff * S[jr, je] - bcoeff * P[jr, je]
-        end
-        work[je] = CONE
-        for j in (je - 1):-1:1
-            d = acoeff * S[j, j] - bcoeff * P[j, j]
-            cabs1(d) <= dmin && (d = complex(dmin))
-            if cabs1(d) < ONE
-                if cabs1(work[j]) >= bignum * cabs1(d)
-                    temp = ONE / cabs1(work[j])
-                    for jr in 1:je
-                        work[jr] *= temp
-                    end
+        ascale = ONE / max(anorm, safmin); bscale = ONE / max(bnorm, safmin)
+        ieig = n + 1
+        @inbounds for je in n:-1:1
+            ieig -= 1
+            if cabs1(S[je, je]) <= safmin && abs(real(P[je, je])) <= safmin
+                for jr in 1:n
+                    VR[jr, ieig] = CZERO
                 end
+                VR[ieig, ieig] = CONE
+                continue
             end
-            work[j] = _zladiv(-work[j], d)
-            if j > 1
-                if cabs1(work[j]) > ONE
-                    temp = ONE / cabs1(work[j])
-                    if acoefa * rwork[j] + bcoefa * rwork[n + j] >= bignum * temp
+            temp = ONE / max(cabs1(S[je, je]) * ascale, abs(real(P[je, je])) * bscale, safmin)
+            salpha = (temp * S[je, je]) * ascale
+            sbeta = (temp * real(P[je, je])) * bscale
+            acoeff = sbeta * ascale
+            bcoeff = salpha * bscale
+            lsa = abs(sbeta) >= safmin && abs(acoeff) < small
+            lsb = cabs1(salpha) >= safmin && cabs1(bcoeff) < small
+            scale = ONE
+            lsa && (scale = (small / abs(sbeta)) * min(anorm, big))
+            lsb && (scale = max(scale, (small / cabs1(salpha)) * min(bnorm, big)))
+            if lsa || lsb
+                scale = min(scale, ONE / (safmin * max(ONE, abs(acoeff), cabs1(bcoeff))))
+                acoeff = lsa ? ascale * (scale * sbeta) : scale * acoeff
+                bcoeff = lsb ? bscale * (scale * salpha) : scale * bcoeff
+            end
+            acoefa = abs(acoeff); bcoefa = cabs1(bcoeff)
+            xmax = ONE
+            for jr in 1:n
+                work[jr] = CZERO
+            end
+            work[je] = CONE
+            dmin = max(ulp * acoefa * anorm, ulp * bcoefa * bnorm, safmin)
+            for jr in 1:(je - 1)
+                work[jr] = acoeff * S[jr, je] - bcoeff * P[jr, je]
+            end
+            work[je] = CONE
+            for j in (je - 1):-1:1
+                d = acoeff * S[j, j] - bcoeff * P[j, j]
+                cabs1(d) <= dmin && (d = complex(dmin))
+                if cabs1(d) < ONE
+                    if cabs1(work[j]) >= bignum * cabs1(d)
+                        temp = ONE / cabs1(work[j])
                         for jr in 1:je
                             work[jr] *= temp
                         end
                     end
                 end
-                ca = acoeff * work[j]; cb = bcoeff * work[j]
-                for jr in 1:(j - 1)
-                    work[jr] += ca * S[jr, j] - cb * P[jr, j]
+                work[j] = _zladiv(-work[j], d)
+                if j > 1
+                    if cabs1(work[j]) > ONE
+                        temp = ONE / cabs1(work[j])
+                        if acoefa * rwork[j] + bcoefa * rwork[n + j] >= bignum * temp
+                            for jr in 1:je
+                                work[jr] *= temp
+                            end
+                        end
+                    end
+                    ca = acoeff * work[j]; cb = bcoeff * work[j]
+                    for jr in 1:(j - 1)
+                        work[jr] += ca * S[jr, j] - cb * P[jr, j]
+                    end
                 end
             end
-        end
-        if ilback
-            for jr in 1:n
-                acc = CZERO
-                for jc in 1:je
-                    acc += VR[jr, jc] * work[jc]
+            if ilback
+                for jr in 1:n
+                    acc = CZERO
+                    for jc in 1:je
+                        acc += VR[jr, jc] * work[jc]
+                    end
+                    work[n + jr] = acc
                 end
-                work[n + jr] = acc
+                isrc = n; iend = n
+            else
+                isrc = 0; iend = je
             end
-            isrc = n; iend = n
-        else
-            isrc = 0; iend = je
-        end
-        xmaxv = ZERO
-        for jr in 1:iend
-            xmaxv = max(xmaxv, cabs1(work[isrc + jr]))
-        end
-        if xmaxv > safmin
-            temp = ONE / xmaxv
+            xmaxv = ZERO
             for jr in 1:iend
-                VR[jr, ieig] = temp * work[isrc + jr]
+                xmaxv = max(xmaxv, cabs1(work[isrc + jr]))
             end
-        else
-            iend = 0
+            if xmaxv > safmin
+                temp = ONE / xmaxv
+                for jr in 1:iend
+                    VR[jr, ieig] = temp * work[isrc + jr]
+                end
+            else
+                iend = 0
+            end
+            for jr in (iend + 1):n
+                VR[jr, ieig] = CZERO
+            end
         end
-        for jr in (iend + 1):n
-            VR[jr, ieig] = CZERO
-        end
+        return 0
     end
-    return 0
 end
 
 """

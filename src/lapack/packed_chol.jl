@@ -270,9 +270,21 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
     if uplo == 'U'
         Tu = eltype(AP)
         nbu = min(_PPTRF_BLK_NB, n)
-        if Tu <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
-            R, V = _pptrf_upper_work(Tu, n, nbu)   # owned scratch — see workspace.jl
-            return _pptrf_upper_blocked!(AP, n, nbu, R, V)
+        # `_dense1(AP)`, not the inline `AP isa StridedVector && stride(AP,1)==1`: `{s,d,c,z}pptrf_64_`
+        # builds a `PtrVector` over the caller's packed buffer (cabi_lapack.jl), and `PtrVector` is not in
+        # the closed `StridedVector` union — so every C-ABI `pptrf` skipped this whole BLOCKED arm and took
+        # the unblocked per-column `tpsv!` path instead. kb `strided-gates-drop-pointer-operands-to-scalar`.
+        if Tu <: BlasFloat && _dense1(AP) && n >= _PPTRF_BLK_MIN
+            # Arena borrows, EXACT shapes: the packed-row block R is nb×n (`ld == nbu`) and the
+            # trailing-update block V is n×nb (`ld == n`). The two used to SHARE the `pptrfv` field
+            # across uplo; separate borrows are strictly safer and cost nothing, since only one uplo
+            # runs per call. `ld` is exact rather than padded because the field it replaces carried no
+            # padding rule either — its `ld` was just the grown row count.
+            @scope arn begin
+                R = borrow!(arn, Tu, nbu, n)
+                V = borrow!(arn, Tu, n, nbu)
+                return _pptrf_upper_blocked!(AP, n, nbu, R, V)
+            end
         end
         # Left-looking, exactly as dpptrf.f does it: per column, ONE packed triangular solve
         # (Uᴴ·u = A[1:j-1, j]) then a dot product for the pivot. The previous form inlined both as a
@@ -319,9 +331,12 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         # would have excluded n=32 and n=48 — the very cells that miss the gate — so the threshold is
         # on where the copy starts to amortise, not on having a trailing block.
         nb = min(_PPTRF_BLK_NB, n)
-        if T <: BlasFloat && AP isa StridedVector && stride(AP, 1) == 1 && n >= _PPTRF_BLK_MIN
-            W, V = _pptrf_lower_work(T, n, nb)     # owned scratch — see workspace.jl
-            _pptrf_lower_blocked!(AP, n, nb, W, V)
+        if T <: BlasFloat && _dense1(AP) && n >= _PPTRF_BLK_MIN   # `_dense1`: see the uplo='U' arm above
+            @scope arn begin                       # two n×nb borrows, exact ld — see the uplo='U' arm
+                W = borrow!(arn, T, n, nb)
+                V = borrow!(arn, T, n, nb)
+                _pptrf_lower_blocked!(AP, n, nb, W, V)
+            end
         else
             _pptrf_lower!(AP, n, _pptrf_spr_min(T))
         end
@@ -349,7 +364,7 @@ function _pptrf_lower!(AP::AbstractVector, n::Int, cut::Int)
         end
         if m > cut
             xs = _pp_l(j + 1, j, n)
-            if !cplx && eltype(AP) <: BlasReal && AP isa StridedVector && stride(AP, 1) == 1
+            if !cplx && eltype(AP) <: BlasReal && _dense1(AP)   # `_dense1`: see pptrf!'s blocked arms
                 # Straight to the kernel: no SubArrays, no public entry. See _spr_simd_lower_ptr!
                 # for the per-call measurement that motivated this.
                 T = eltype(AP)

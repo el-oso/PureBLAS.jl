@@ -947,9 +947,11 @@ function _hgeqz!(
                 info = ilast
                 # NON-CONVERGENCE: alphar/alphai[ilo:ilast] were never written this call, yet the loop
                 # below forms alpha[i] for ALL i. With the old fresh `Vector{R}(undef,n)` that was
-                # documented garbage (reference LAPACK marks 1:info invalid); with the OWNED hgzar/hgzai
-                # it would be the PREVIOUS call's eigenvalues — plausible-looking and worse, and
-                # `_ggev_core!`/`gges!` discard hgeqz's info, so nothing downstream would notice.
+                # documented garbage (reference LAPACK marks 1:info invalid); with the owned hgzar/hgzai
+                # it was the PREVIOUS call's eigenvalues — plausible-looking and worse — and with the
+                # arena borrow (hgeqz!, below) it is whatever the last borrower of those bytes left
+                # there, which is worse still. `_ggev_core!`/`gges!` discard hgeqz's info, so nothing
+                # downstream would notice; this zeroing is what makes an unwritten range harmless.
                 # Same fix, same reasoning as hseqr.jl's `_dlahqr!` non-convergence range.
                 @inbounds for i in ilo:min(ilast, n)
                     alphar[i] = zero(R); alphai[i] = zero(R)
@@ -997,12 +999,29 @@ function hgeqz!(
     n = size(H, 1)
     wantt = job === 'S'; wantq = compq !== 'N'; wantz = compz !== 'N'
     _qz_init_qz!(compq, Q, n); _qz_init_qz!(compz, Z, n)
-    alphar, alphai = _hgeqz_work(R, n)   # scratch only: `_hgeqz!` assigns both at every index, every exit
-    info = _hgeqz!(wantt, wantq, wantz, H, T, Int(ilo), Int(ihi), alphar, alphai, beta, Q, Z)
-    @inbounds for i in 1:n
-        alpha[i] = Complex(alphar[i], alphai[i])
+    # The real/imag halves of the eigenvalues, split because `_hgeqz!` is the DHGEQZ transcription and
+    # writes them separately; they are recombined into `alpha` below. Arena borrows (arena.jl), not the
+    # owned `hgzar`/`hgzai` fields. REAL-typed — `R` already IS the real element type here (the complex
+    # entry is `_zhgeqz!`, which claims nothing), so this is the `_l3ws(real(T))` owner the fields named.
+    # Exact length-n borrows, default ld: the fields carried no anti-aliasing stride, and no fill! (every
+    # exit path of `_hgeqz!` assigns both halves at every index — see its non-convergence arm, which
+    # zeroes ilo:ilast precisely so unwritten scratch is never read).
+    # The scope SPANS BOTH STATEMENTS: `alphar`/`alphai` are written by `_hgeqz!` and read back by the
+    # recombination loop, so it cannot close between them.
+    # ESCAPE AUDIT: both handles go DOWN into `_hgeqz!` (this file, above) and nowhere else. `_hgeqz!`
+    # only indexes them (`alphar[j] = …`, `alphai[i] = …` — every use is a subscript, verified) and
+    # never passes them to a callee, stores them in a field, or assigns a global; its own scratch is the
+    # stage-1 `@scope` it opens for the length-3 shift vector. The recombination loop reads them into
+    # the caller's `alpha`, so what leaves this block is `info` and values copied into caller storage.
+    @scope arn begin
+        alphar = borrow!(arn, R, n)
+        alphai = borrow!(arn, R, n)
+        info = _hgeqz!(wantt, wantq, wantz, H, T, Int(ilo), Int(ihi), alphar, alphai, beta, Q, Z)
+        @inbounds for i in 1:n
+            alpha[i] = Complex(alphar[i], alphai[i])
+        end
+        return info
     end
-    return info
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════════

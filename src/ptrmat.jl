@@ -78,6 +78,18 @@ end
     @boundscheck (1 <= j <= A.n) || throw(BoundsError(A, (:, j)))
     return PtrVector(A.ptr + (j - 1) * A.ld * sizeof(T), A.m)
 end
+# …and a PARTIAL column, `view(A, k:n, j)`. Without this method the pair (UnitRange, Integer) misses
+# every overload above and falls to Base's generic `view`, giving a `SubArray{T,1,PtrMatrix{T},…}` —
+# which is NOT a `StridedVector` (PtrMatrix is not in that closed Union), so `_dense1` returns false and
+# the operand drops off the SIMD path. Found 2026-09-04 by the stage-3 arena review: sytrf!/hetrf!'s
+# four panel drivers slice exactly this shape as the gemv OUTPUT (`view(W, k:n, k)`, eight sites), so
+# the entire BLAS-2 half of the Bunch–Kaufman panel had silently become the generic scalar loop the
+# moment `W` became a borrow. Same wire-the-fastest-path class as `_dense1(::PtrVector)` below.
+@inline function Base.view(A::PtrMatrix{T}, I::AbstractUnitRange{<:Integer}, j::Integer) where {T}
+    @boundscheck ((1 <= j <= A.n) && (isempty(I) || (first(I) >= 1 && last(I) <= A.m))) ||
+        throw(BoundsError(A, (I, j)))
+    return PtrVector(A.ptr + ((Int(first(I)) - 1) + (j - 1) * A.ld) * sizeof(T), length(I))
+end
 @inline function Base.view(v::PtrVector{T}, I::AbstractUnitRange{<:Integer}) where {T}
     return PtrVector(v.ptr + (Int(first(I)) - 1) * sizeof(T), length(I))
 end
@@ -138,6 +150,14 @@ end
 # `izamax` C-ABI miss recorded in level1.jl: "a wire-the-fastest-path miss that no gate row could see".
 @inline _dense1(x) = x isa StridedVector && stride(x, 1) == 1
 @inline _dense1(::Ptr) = true
+# ...and `PtrVector`, for the SAME reason one step further out. An arena borrow (`borrow!(s, T, n)`,
+# arena.jl) hands back a `PtrVector`, which — like `Ptr` and unlike the `view(ws.field, 1:n)` it
+# replaces — is not in the `StridedVector` union. Every scratch vector a converted LAPACK routine feeds
+# to `trsv!`/`trmv!`/`gemv!` would therefore have silently dropped to the generic scalar loop: same
+# wire-the-fastest-path miss as the two above, arriving through the workspace refactor instead of the
+# C-ABI. Unit-stride and elements-inline both hold by construction (`borrow!` returns a heap `Vector`
+# for a non-isbits `T` rather than a pointer), exactly as for `_strided1(::PtrMatrix)`.
+@inline _dense1(::PtrVector) = true
 
 # ===== Container-type normalization for the gemm kernels =====
 #

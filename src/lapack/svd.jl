@@ -59,7 +59,12 @@ end
 @inline function _house_left!(C::AbstractMatrix{T}, v::AbstractVector{T}, τ::T) where {T <: Real}
     τ == zero(T) && return C
     len, nc = size(C)
-    if T <: BlasReal && len > 1 && _strided1(C) && v isa StridedVector && stride(v, 1) == 1
+    # `_dense1(v)`, not the inlined `v isa StridedVector && stride(v,1)==1` this used to spell: hessenberg.jl's
+    # gehrd!/_orghr_into! now stage their reflector in an arena `PtrVector` (arena.jl), which is unit-stride
+    # by construction but is NOT in the `StridedVector` union — so the raw predicate would have silently
+    # dropped both to the generic scalar loop below. Same wire-the-fastest-path miss `_dense1` was added for
+    # in ptrmat.jl; widening only, every operand that passed before still passes.
+    if T <: BlasReal && len > 1 && _strided1(C) && _dense1(v)
         sz = sizeof(T)
         GC.@preserve C v begin
             pc = pointer(C); pv = pointer(v); ld = stride(C, 2)
@@ -789,7 +794,14 @@ end
 @inline function _rot_cols!(M::AbstractMatrix{Float64}, j1::Int, j2::Int, c::Float64, s::Float64)
     s == 0.0 && return M
     nr = size(M, 1)
-    if M isa StridedMatrix && stride(M, 1) == 1
+    # `_strided1(M)`, not the inline spelling. NOT reachable with a `PtrMatrix` today — every caller tree
+    # (bdsqr!'s `SVDWorkspace` views, `_steqr!`'s `_GVDWork.Z`, and the C-ABI wrappers, which copy into a
+    # fresh `Matrix` first) terminates in a real `Matrix`. It is written this way because that is a fact
+    # about TODAY's callers, not about this function: the moment the arena conversion reaches svd.jl or
+    # eigen_dc.jl, `M` becomes a `PtrMatrix` and the inline `isa` would drop this loop to the scalar tail
+    # SILENTLY, with no test failure and no gate row moving. kb
+    # `strided-gates-drop-pointer-operands-to-scalar` — the same trap has now fired five times.
+    if _strided1(M)
         ld = stride(M, 2)
         GC.@preserve M begin
             p = pointer(M); vc = _CVF(c); vs = _CVF(s); i = 1

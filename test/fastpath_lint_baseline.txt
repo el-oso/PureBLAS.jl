@@ -1,0 +1,22 @@
+# fast-path predicate lint baseline — REVIEWED `isa Strided*` value tests, each with its reason.
+#
+# THIS FILE IS EMPTY ON PURPOSE, and that is the interesting part: all thirteen sites that existed on
+# 2026-09-04 were converted to `_strided1` / `_dense1` rather than baselined, because eleven of the
+# thirteen were REACHABLE with a `PtrMatrix`/`PtrVector` and the two that were not are only unreachable
+# by accident of which workspaces have been converted so far. Regenerate the raw list with
+#   julia test/fastpath_lint.jl --baseline
+#
+# WHEN A LINE BELONGS HERE. Not every `isa Strided*` is a defect. A `::StridedMatrix{T}` METHOD SIGNATURE
+# is dispatch, not a fast-path gate, and the scanner already ignores those (it only looks at `isa` in
+# value position). What could legitimately land here is a gate gua**rding something a pointer-backed
+# container genuinely cannot do — `parent`, `resize!`, `similar` into the same storage, or handing the
+# argument to an external routine that requires a real Array. Write that reason down; a line whose reason
+# you cannot restate is not a pass.
+#
+# WHAT THIS LINT IS FOR. `StridedMatrix`/`StridedVector` are CLOSED unions. `PtrMatrix`/`PtrVector` are
+# not in them and never can be, so an inline `x isa StridedVector && stride(x,1)==1` routes every
+# pointer-backed operand to the generic scalar path — correct answers, no test failure, no gate row
+# moving, because the sweep never calls through that container. It had happened five times before the
+# lint existed, twice through the C-ABI shims and twice through the arena conversion, and the worst
+# instance sent EVERY Mode-1/LBT `getrf` down the scalar tail. Full write-up:
+# ../kb/findings/strided-gates-drop-pointer-operands-to-scalar.md

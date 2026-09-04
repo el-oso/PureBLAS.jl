@@ -54,10 +54,12 @@ end
 # what keeps n=8 ahead of the old code, measured 0.91×→1.07×).
 function _geqp3_house_dd!(
         A::AbstractMatrix{T}, i::Int, m::Int, n::Int, τ::T,
-        # `AbstractVector`, not `Vector`: these now arrive as contiguous views of the owned workspace
-        # (`_geqp3_norms_work`). A `::Vector{T}` annotation would simply not match a `SubArray`, so the
-        # call would fail to dispatch rather than silently deoptimise — but widen it deliberately, and
-        # note the fast paths downstream gate on `_strided1`/`_dense1`, which a contiguous view satisfies.
+        # `AbstractVector`, not `Vector`: these arrive as arena `PtrVector` borrows (they were contiguous
+        # workspace views before). A `::Vector{T}` annotation would not match either, so the call would
+        # fail to dispatch rather than silently deoptimise — but widen it deliberately, and note the fast
+        # paths downstream gate on `_strided1`/`_dense1`. A contiguous view satisfies `_dense1` by being
+        # a `StridedVector`; a `PtrVector` satisfies it only through the explicit method in ptrmat.jl —
+        # without that it would take the SCALAR path here, silently.
         hbuf::AbstractVector{T}, vn1::AbstractVector{T}, vn2::AbstractVector{T}, tol3z::T
     ) where {T <: BlasReal}
     len = m - i + 1; nc = n - i
@@ -90,10 +92,16 @@ function _geqp3_house_dd!(
     end
     V = Vec{W, T}
     j = 1
-    @inbounds begin
+    # POINTER form, not SIMD.jl's array form. `vload(V, vn1, k)` only accepts the `DenseVector` /
+    # contiguous-`SubArray` union, so it MethodErrors on the `PtrVector` these now arrive as — a hard
+    # failure, not a deoptimisation, and it is the shape the C-ABI would have hit too if it ever reached
+    # this kernel (it does not: `_geqp3_house_dd!` is only called from `geqp3!`, which is why the
+    # container was never exercised). `pointer(x, k)` is defined for Vector, contiguous SubArray and
+    # PtrVector alike, and lowers to the same address arithmetic the array form does internally.
+    GC.@preserve vn1 vn2 hbuf @inbounds begin
         while j + W - 1 <= nc
-            v1 = vload(V, vn1, i + j); v2 = vload(V, vn2, i + j)
-            h = vload(V, hbuf, j)
+            v1 = vload(V, pointer(vn1, i + j)); v2 = vload(V, pointer(vn2, i + j))
+            h = vload(V, pointer(hbuf, j))
             q = abs(h) / v1
             temp = max(one(T) - q * q, zero(T))
             r = v1 / v2
@@ -105,7 +113,7 @@ function _geqp3_house_dd!(
                     _geqp3_dd1!(A, i, m, i + j + l, hbuf[j + l], vn1, vn2, tol3z)
                 end
             else
-                vstore(vifelse(zero1, v1, v1 * sqrt(temp)), vn1, i + j)
+                vstore(vifelse(zero1, v1, v1 * sqrt(temp)), pointer(vn1, i + j))
             end
             j += W
         end
@@ -148,45 +156,79 @@ function geqp3!(
     end
     n == 0 && return A, jpvt, tau
     tol3z = sqrt(eps(R))                                   # dlaqps recompute threshold (√ machine-eps)
-    # Owned scratch (workspace.jl). vn1/vn2/hbuf are REAL-typed and live on `_l3ws(real(T))`; they are
-    # taken together because all three are allocated on EVERY path through this routine.
-    vn1, vn2, hbuf = _geqp3_norms_work(T, n)
-    if T <: BlasReal && R === T && _strided1(A)
-        _geqp3_norms!(A, m, n, vn1, vn2)                   # fused fast pass, _nrm2 fallback guard
-    else
-        @inbounds for j in 1:n
-            nrm = _nrm2(m, view(A, :, j), 1); vn1[j] = nrm; vn2[j] = nrm
-        end
-    end
-    # blocked dlaqps panels (laqps.jl) — real strided above the unblocked crossover; unblocked loop
-    # below factors the tail and remains the fallback (also the complex / non-strided path).
-    j0 = 1
-    if T <: BlasReal && R === T && _strided1(A) && k > _QR_UNBLK_MAX
-        nb = clamp(_qr_nb(m, n), 1, k)
-        if nb > 1
-            # Blocked-panel scratch, owned. Reached only when `nb > 1`, which is why an allocation
-            # audit at a single small n cannot see it (F/auxv/wrow are ~94% of the bytes at n=129).
-            F, auxv, wrow = _geqp3_panel_work(T, n, nb)
-            while k - j0 + 1 > nb
-                jb = min(nb, k - j0 + 1)
-                fjb = _laqps!(
-                    m, n - j0 + 1, j0 - 1, jb, view(A, 1:m, j0:n),
-                    view(jpvt, j0:n), view(tau, j0:k),
-                    view(vn1, j0:n), view(vn2, j0:n), auxv, view(F, 1:(n - j0 + 1), 1:jb), wrow
-                )
-                fjb <= 0 && break
-                j0 += fjb
+    # ONE scope for the whole routine. vn1/vn2/hbuf are REAL and are borrowed together because all three
+    # are needed on EVERY path; the blocked-panel trio is borrowed from the SAME token further down,
+    # inside the `nb > 1` arm, so it costs nothing on the paths that never take it. Being REAL next to
+    # element-typed borrows needs no argument now — one arena, disjoint byte ranges — where the fields
+    # needed "they live on a different `_l3ws` owner".
+    # ESCAPE AUDIT: every handle is passed into `_geqp3_norms!` / `_laqps!` / `_geqp3_house_dd!` and
+    # written through; `geqp3!` returns `A, jpvt, tau`, all caller-owned.
+    @scope arn begin
+        vn1 = borrow!(arn, R, n)
+        vn2 = borrow!(arn, R, n)
+        hbuf = borrow!(arn, R, n)
+        if T <: BlasReal && R === T && _strided1(A)
+            _geqp3_norms!(A, m, n, vn1, vn2)                   # fused fast pass, _nrm2 fallback guard
+        else
+            @inbounds for j in 1:n
+                nrm = _nrm2(m, view(A, :, j), 1); vn1[j] = nrm; vn2[j] = nrm
             end
         end
-    end
-    if T <: BlasReal && R === T && _strided1(A)
-        # fast unblocked loop: same pivot/swap/larfg, apply+downdate via _geqp3_house_dd! (SIMD
-        # downdate, bitwise-identical results — see the kernel header for the measurements).
-        # NOTE (measured 2026-08-02, Zen4): with this loop the UNBLOCKED path also beats the blocked
-        # path at n=48/64/96 (1.33×/1.24×/1.05×), crossing only at n=128 (0.96×). _QR_UNBLK_MAX
-        # stays 32 — no gate cell sits in 48..96 and the crossover is unmeasured off Zen4; a
-        # geqp3-specific derived crossover is a follow-up lever, not assumed here.
+        # blocked dlaqps panels (laqps.jl) — real strided above the unblocked crossover; unblocked loop
+        # below factors the tail and remains the fallback (also the complex / non-strided path).
+        j0 = 1
+        if T <: BlasReal && R === T && _strided1(A) && k > _QR_UNBLK_MAX
+            nb = clamp(_qr_nb(m, n), 1, k)
+            if nb > 1
+                # Blocked-panel scratch, borrowed from the enclosing scope. Reached only when `nb > 1`,
+                # which is why an allocation audit at a single small n cannot see it (F/auxv/wrow are
+                # ~94% of the bytes at n=129). ABOVE the `while` panel loop, where it already sat — the
+                # shape does not depend on the panel index, so nothing needed hoisting. `F` is EXACTLY
+                # n×nb (`ld == n`), matching the incumbent field's unpadded stride policy.
+                F = borrow!(arn, T, n, nb)
+                auxv = borrow!(arn, T, nb)
+                wrow = borrow!(arn, T, n)
+                while k - j0 + 1 > nb
+                    jb = min(nb, k - j0 + 1)
+                    fjb = _laqps!(
+                        m, n - j0 + 1, j0 - 1, jb, view(A, 1:m, j0:n),
+                        view(jpvt, j0:n), view(tau, j0:k),
+                        view(vn1, j0:n), view(vn2, j0:n), auxv, view(F, 1:(n - j0 + 1), 1:jb), wrow
+                    )
+                    fjb <= 0 && break
+                    j0 += fjb
+                end
+            end
+        end
+        if T <: BlasReal && R === T && _strided1(A)
+            # fast unblocked loop: same pivot/swap/larfg, apply+downdate via _geqp3_house_dd! (SIMD
+            # downdate, bitwise-identical results — see the kernel header for the measurements).
+            # NOTE (measured 2026-08-02, Zen4): with this loop the UNBLOCKED path also beats the blocked
+            # path at n=48/64/96 (1.33×/1.24×/1.05×), crossing only at n=128 (0.96×). _QR_UNBLK_MAX
+            # stays 32 — no gate cell sits in 48..96 and the crossover is unmeasured off Zen4; a
+            # geqp3-specific derived crossover is a follow-up lever, not assumed here.
+            @inbounds for i in j0:k
+                pvt = i; maxn = vn1[i]
+                for j in (i + 1):n
+                    if vn1[j] > maxn
+                        maxn = vn1[j]; pvt = j
+                    end
+                end
+                if pvt != i
+                    for r in 1:m
+                        t = A[r, i]; A[r, i] = A[r, pvt]; A[r, pvt] = t
+                    end
+                    jpvt[i], jpvt[pvt] = jpvt[pvt], jpvt[i]
+                    vn1[pvt] = vn1[i]; vn2[pvt] = vn2[i]
+                end
+                β, τ = _larfg!(view(A, i:m, i)); tau[i] = τ
+                A[i, i] = β                                    # _larfg! leaves x[1]=α; place R's diagonal
+                i < n && _geqp3_house_dd!(A, i, m, n, τ, hbuf, vn1, vn2, tol3z)
+            end
+            return A, jpvt, tau
+        end
         @inbounds for i in j0:k
+            # ---- pivot: column of maximal partial norm over i:n → swap to position i ----
             pvt = i; maxn = vn1[i]
             for j in (i + 1):n
                 if vn1[j] > maxn
@@ -200,52 +242,32 @@ function geqp3!(
                 jpvt[i], jpvt[pvt] = jpvt[pvt], jpvt[i]
                 vn1[pvt] = vn1[i]; vn2[pvt] = vn2[i]
             end
+            # ---- reflector for column i (rows i:m); β lands on the diagonal ----
             β, τ = _larfg!(view(A, i:m, i)); tau[i] = τ
-            A[i, i] = β                                    # _larfg! leaves x[1]=α; place R's diagonal
-            i < n && _geqp3_house_dd!(A, i, m, n, τ, hbuf, vn1, vn2, tol3z)
-        end
-        return A, jpvt, tau
-    end
-    @inbounds for i in j0:k
-        # ---- pivot: column of maximal partial norm over i:n → swap to position i ----
-        pvt = i; maxn = vn1[i]
-        for j in (i + 1):n
-            if vn1[j] > maxn
-                maxn = vn1[j]; pvt = j
-            end
-        end
-        if pvt != i
-            for r in 1:m
-                t = A[r, i]; A[r, i] = A[r, pvt]; A[r, pvt] = t
-            end
-            jpvt[i], jpvt[pvt] = jpvt[pvt], jpvt[i]
-            vn1[pvt] = vn1[i]; vn2[pvt] = vn2[i]
-        end
-        # ---- reflector for column i (rows i:m); β lands on the diagonal ----
-        β, τ = _larfg!(view(A, i:m, i)); tau[i] = τ
-        A[i, i] = β                                        # _larfg! leaves x[1]=α; place R's diagonal
-        # ---- apply H_iᴴ to the trailing columns; then downdate their partial norms ----
-        if i < n
-            _house_left!(view(A, i:m, (i + 1):n), view(A, i:m, i), _geqp3_tau_Qh(τ))
-            for j in (i + 1):n
-                if !iszero(vn1[j])
-                    temp = one(R) - (abs(A[i, j]) / vn1[j])^2
-                    temp = max(temp, zero(R))
-                    temp2 = temp * (vn1[j] / vn2[j])^2
-                    if temp2 <= tol3z                      # downdated norm degraded → recompute exactly
-                        if i < m
-                            nrm = _nrm2(m - i, view(A, (i + 1):m, j), 1); vn1[j] = nrm; vn2[j] = nrm
+            A[i, i] = β                                        # _larfg! leaves x[1]=α; place R's diagonal
+            # ---- apply H_iᴴ to the trailing columns; then downdate their partial norms ----
+            if i < n
+                _house_left!(view(A, i:m, (i + 1):n), view(A, i:m, i), _geqp3_tau_Qh(τ))
+                for j in (i + 1):n
+                    if !iszero(vn1[j])
+                        temp = one(R) - (abs(A[i, j]) / vn1[j])^2
+                        temp = max(temp, zero(R))
+                        temp2 = temp * (vn1[j] / vn2[j])^2
+                        if temp2 <= tol3z                      # downdated norm degraded → recompute exactly
+                            if i < m
+                                nrm = _nrm2(m - i, view(A, (i + 1):m, j), 1); vn1[j] = nrm; vn2[j] = nrm
+                            else
+                                vn1[j] = zero(R); vn2[j] = zero(R)
+                            end
                         else
-                            vn1[j] = zero(R); vn2[j] = zero(R)
+                            vn1[j] = vn1[j] * sqrt(temp)
                         end
-                    else
-                        vn1[j] = vn1[j] * sqrt(temp)
                     end
                 end
             end
         end
+        return A, jpvt, tau
     end
-    return A, jpvt, tau
 end
 
 # Convenience: allocate jpvt + tau, return (A overwritten, jpvt, tau).
