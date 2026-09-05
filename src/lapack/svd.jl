@@ -1709,12 +1709,29 @@ function _zgesvd_core!(
     m, n = size(A)
     nu = (full_u && m > n) ? m : n
     _svd_grow_bidiag!(ws, m, n)
-    d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0))
-    tauq = Vector{T}(undef, n); taup = Vector{T}(undef, n)
+    # ARENA ESCAPE AUDIT (@scope arn). Nine borrows, all released here; nothing borrowed reaches the
+    # caller. `d`/`e` go into gebrd! and then bdsqr!/bdsdc!, which write them and return them; `s = d` is
+    # read out element-by-element into the caller's `S`. `Lvec`/`Rvec` are written by the bidiagonal SVD
+    # and read into `UA`/`VA`. `UA` is copied into the caller's `U` and `VA` is conjugate-transposed into
+    # the caller's `Vt` — both COPIES, so the returned tuple holds only caller storage. `VQ`/`VP` reach
+    # only `_zapply_reflectors_left!`, which uses them as reflector panels and returns its `C` argument.
+    # `_svd_sort!` permutes in place and returns nothing borrowed.
+    #
+    # Every callee takes `AbstractVector`/`AbstractMatrix`, so a PtrMatrix is accepted — and the two
+    # rotation kernels these reach, `_rot_cols!` (this file) and `_jac_right!` (svd_dc.jl), were moved off
+    # `isa StridedMatrix` onto `_strided1` in the stage-3 fast-path audit precisely so this conversion
+    # would not silently drop them to the scalar path. That was written then as a change for a file the
+    # arena had not reached yet; this is the commit that reaches it.
+    @scope arn begin
+    d = borrow!(arn, Float64, n); fill!(d, 0.0)
+    e = borrow!(arn, Float64, max(n - 1, 0)); fill!(e, 0.0)
+    # `zeros`, not `undef`, in the original — kept. gebrd! writes both, but the zeroing was not verified
+    # dead and an O(n) fill against an O(mn²) reduction is not worth the risk of finding out here.
+    tauq = borrow!(arn, T, n); taup = borrow!(arn, T, n)
     gebrd!(A, d, e, tauq, taup, ws)                     # complex bidiagonalization (real d,e; complex τ)
     # REAL bidiagonal SVD: B = Lvec·diag(d)·Rvecᵀ (bdsqr below the crossover, D&C above — mirror the real
     # core). Lvec/Rvec are REAL (B is real bidiagonal); the D&C reuses the Float64 global workspace.
-    Lvec = Matrix{Float64}(undef, n, n); Rvec = Matrix{Float64}(undef, n, n)
+    Lvec = borrow!(arn, Float64, n, n); Rvec = borrow!(arn, Float64, n, n)
     if n <= _SVD_DC_CROSS
         fill!(Lvec, 0.0); fill!(Rvec, 0.0)
         @inbounds for i in 1:n
@@ -1732,7 +1749,7 @@ function _zgesvd_core!(
     ws.bt_T = _gm(ws.bt_T, nb, nb); ws.bt_G = _gm(ws.bt_G, nb, nb); ws.bt_W = _gm(ws.bt_W, nb, max(nu, n))
     # U_A = Q·[Lvec 0; 0 I]: realify Lvec into the complex staging, push the n+1:nu unit columns through Q
     # (they become the orthonormal complement of range(A) when full_u & m>n). Q applied BLOCKED (zunmbr).
-    UA = Matrix{T}(undef, m, nu)
+    UA = borrow!(arn, T, m, nu)
     fill!(UA, zero(T))
     @inbounds for j in 1:n, i in 1:n
         UA[i, j] = T(Lvec[i, j])
@@ -1740,7 +1757,7 @@ function _zgesvd_core!(
     @inbounds for j in (n + 1):nu
         UA[j, j] = one(T)
     end
-    VQ = Matrix{T}(undef, m, n)                          # explicit unit-trapezoid Q panel (un-conjugated essentials)
+    VQ = borrow!(arn, T, m, n)                           # explicit unit-trapezoid Q panel (un-conjugated essentials)
     fill!(VQ, zero(T))
     @inbounds for j in 1:n
         VQ[j, j] = one(T)
@@ -1750,12 +1767,12 @@ function _zgesvd_core!(
     end
     _zapply_reflectors_left!(VQ, tauq, UA, n, nb, 0, ws)
     # V_A = P·Rvec (realify Rvec, apply the right reflectors BLOCKED; P essentials are CONJUGATED).
-    VA = Matrix{T}(undef, n, n)
+    VA = borrow!(arn, T, n, n)
     @inbounds for j in 1:n, i in 1:n
         VA[i, j] = T(Rvec[i, j])
     end
     if n > 1
-        VP = Matrix{T}(undef, n, n - 1)
+        VP = borrow!(arn, T, n, n - 1)   # an `if`, not a loop — one borrow per call, which @scope allows
         fill!(VP, zero(T))
         @inbounds for j in 1:(n - 1)
             VP[j + 1, j] = one(T)
@@ -1774,6 +1791,7 @@ function _zgesvd_core!(
     end
     _svd_ctranspose!(Vt, VA)                             # Vt = V_Aᴴ (CONJUGATE transpose — n×n)
     return U, S, Vt
+    end                                                  # @scope arn
 end
 
 # Complex full SVD (in-place; caller provides U/S/Vt). m<n via the CONJUGATE transpose: SVD(Aᴴ)=Ū·Σ·V̄ᴴ ⟹
