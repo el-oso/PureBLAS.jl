@@ -401,6 +401,7 @@ function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration 
     ggsvd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::Tuple => "generalized SVD of (A,B) into caller buffers → (k, l)"
     gels!(::Self, ::Char, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "least-squares / minimum-norm solve of op(A)·X = B over QR/LQ"
     gelsy!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Real)::Tuple => "rank-revealing least squares (pivoted QR + RZ) → (B, rank)"
+    gelsd!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::Real, ::AbstractVector)::Tuple => "minimum-norm least squares by SVD, singular values into the caller's s → (B, rank, s)"
     gglse!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "equality-constrained least squares → (x, residual)"
     stebz!(::Self, ::AbstractChar, ::AbstractChar, ::Real, ::Real, ::Integer, ::Integer, ::Real, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::Tuple => "symmetric-tridiagonal eigenvalues by bisection → (m, nsplit, info)"
     stein!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "symmetric-tridiagonal eigenvectors by inverse iteration, into the caller's Z"

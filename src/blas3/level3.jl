@@ -191,7 +191,7 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     # regression). The exact borrows below make `lde` a property of THIS call: _L3_NB side-L, mr side-R.
     # The block keeps its original indentation — re-indenting 140 lines of a gated kernel to add three
     # would bury the change (same convention as `_trsm_fused_L!`'s stripe loop below).
-    @scope arn begin
+    @leafscope arn begin      # inlines the trmm microkernel — see `_trsm_fused_L!`
     M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
     _mat_tri!(M, A, k, up, tr, unit)
     if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
@@ -2060,7 +2060,7 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
     # `_zgt_slab!` and `_zgt_unpack!`, all of which load/store through it and return. No callee stores a
     # pointer, and nothing borrowed is written into `B` except the solved values. Borrowed ONCE at the
     # routine's entry, above the `while jc < nrhs` stripe loop — the length is loop-invariant.
-    @scope arn begin
+    @leafscope arn begin      # inlines a SIMD kernel — see `_trsm_fused_L!`
     buf = borrow!(arn, Float64, 2 * k * NR + 2 * k)
     GC.@preserve A B buf begin
         pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B))
@@ -3374,7 +3374,12 @@ function _trsm_fused_L!(unit::Bool, A, B)
     # global or a closure, and none outlives its call. Only solved values reach the caller's `B`.
     # Borrowed ONCE at the routine's entry, above the `while jc < n` stripe loop (`@scope` forbids a
     # borrow inside a loop, and the length is loop-invariant anyway).
-    @scope arn begin
+    # `@leafscope`: this function inlines the fused side-L kernels, and `trsm@50` measured 3-5% below its
+    # pre-arena value on both Zen3 and Zen4 with the handler in place. Unlike `_trsm_rl_fused_drv!` the
+    # spill count here did not move (14 either way), so if this recovers the loss the cost is the
+    # handler's own enter/leave rather than register pressure — and if it does not, the cause is the
+    # borrow or its layout, not the scope. Either way the measurement discriminates.
+    @leafscope arn begin
     buf = borrow!(arn, T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
     GC.@preserve A B buf begin
         pA = pointer(A); pB = pointer(B); Pp = pointer(buf)

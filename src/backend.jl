@@ -412,6 +412,12 @@ end
 # trailing-buffer forms; their convenience siblings allocate x / w+iblock+isplit / Z.
 @inline gels!(::SIMDBackend, trans::Char, A::AbstractMatrix, B::AbstractMatrix)::Tuple = gels!(trans, A, B)
 @inline gelsy!(::SIMDBackend, A::AbstractMatrix, B::AbstractMatrix, jpvt::AbstractVector, rcond::Real)::Tuple = gelsy!(A, B, jpvt, rcond)
+# `gelsd!` joins its siblings only now (2026-09-05). It was the LAST allocating member of the audited
+# LAPACK surface, and the allocation was never in gelsd.jl: the complex path inherited 100,128 B at
+# 48x32 from `_zgesvd_core!`, which built nine per-call temporaries because svd.jl had not been through
+# the arena conversion. Real gelsd! measured 0 B throughout. With those nine borrowed the complex path
+# measures the same 0 B as the real one, so the contract can finally be declared.
+@inline gelsd!(::SIMDBackend, A::AbstractMatrix, B::AbstractMatrix, rcond::Real, s::AbstractVector)::Tuple = gelsd!(A, B, rcond, s)
 @inline gglse!(::SIMDBackend, A::AbstractMatrix, c::AbstractVector, B::AbstractMatrix, d::AbstractVector, x::AbstractVector)::Tuple = gglse!(A, c, B, d, x)
 @inline stebz!(::SIMDBackend, range::AbstractChar, order::AbstractChar, vl::Real, vu::Real, il::Integer, iu::Integer, abstol::Real, d::AbstractVector, e::AbstractVector, w::AbstractVector, iblock::AbstractVector, isplit::AbstractVector)::Tuple = stebz!(range, order, vl, vu, il, iu, abstol, d, e, w, iblock, isplit)
 @inline stein!(::SIMDBackend, d::AbstractVector, e::AbstractVector, w::AbstractVector, iblock::AbstractVector, isplit::AbstractVector, Z::AbstractMatrix)::AbstractMatrix = stein!(d, e, w, iblock, isplit, Z)
