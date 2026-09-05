@@ -4147,7 +4147,15 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
             # in an OUTER scope, so this one starts past them — which is exactly the `rpad`-vs-`rpack`
             # split (the leaf writing its solution over the coefficients it is reading) that needed a
             # separate FIELD before.
-            @scope arn begin
+            # `@leafscope`, NOT `@scope`, and this is the one site the distinction was measured on.
+            # `_trsm_rl_split_f64!` is `@inline`d into this function and holds 18 live vectors; a Zen 3
+            # core has 16. `@scope`'s `try`/`finally` lowers to an exception handler that LLVM must be
+            # conservative around for the whole function, which took this function from 113 vector spills
+            # to 172 and `trsmR@100/128` from 1.037/0.978 to 0.746/0.708. Dropping the handler put the
+            # spill count back to 113 exactly and `trsmR@100` back to 1.035. AVX-512 boxes were never
+            # affected — they have 14 spare vector registers — which is why the whole thing was
+            # AVX2-only and invisible on the machine it was written on.
+            @leafscope arn begin
             S = borrow!(arn, Float64, mc0, k, _odd_ld(mc0)); lds = stride(S, 2)
             GC.@preserve S begin
                 pS = pointer(S); i0 = 0

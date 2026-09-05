@@ -84,6 +84,13 @@ struct. That is not a regression in kind but it is one in degree — interleave 
 is arbitrary cross-role aliasing where the struct's was bounded to one role. **A per-task owner is a
 precondition of enabling threads (M4), not an optimisation to weigh against its 9–12 ns.**
 
+**THE ARENA IS A PREREQUISITE FOR M4, AND REVERTING IT IS NOT AN OPTION (user, 2026-09-05.)** This
+governs how a stage-4 regression may be resolved: it must be FIXED, never reverted to fields, however
+convenient a smaller diff looks. The reason is the caveat above read forwards — going per-task costs the
+arena ONE line (`_arena() = _ARENA_TASK()` over a `Base.OncePerTask`), whereas per-task ownership of a
+180-field `L3Workspace` means duplicating 180 grown buffers per task. The conversion is what makes
+threading affordable, so "revert and keep the 20-field result" trades a milestone for a week.
+
 **The performance gate is now `PB ≥ max(OpenBLAS, AOCL-BLIS)`** (upgraded 2026-07-15 from ≥ OpenBLAS) — a
 sub-1.0 ratio vs *either* AMD-tuned baseline is a miss, never a "ceiling." Certified boost-locked on the AMD
 fleet (Zen3/AVX2 `Zen3`, Zen4/AVX-512 `Zen4`, Zen5/native-AVX-512 `Zen5`) via

@@ -104,6 +104,7 @@ struct ArenaScope
     a::Arena
     cur::Int
     off::Int
+    depth::Int    # the depth this scope entered AT — see `_arena_exit!` for why it is stored, not counted
 end
 
 # GKH ownership: one const owner, resolved at compile time, no runtime lookup.
@@ -121,15 +122,22 @@ const _ARENA = Arena()
 @inline _arena() = _ARENA
 
 @inline function _arena_enter!(a::Arena)
-    a.depth += 1
-    return ArenaScope(a, a.cur, a.off)
+    d = a.depth + 1
+    a.depth = d
+    return ArenaScope(a, a.cur, a.off, d)
 end
 
 @inline function _arena_exit!(s::ArenaScope)
     a = s.a
     a.cur = s.cur
     a.off = s.off
-    a.depth -= 1
+    # ABSOLUTE, not `a.depth -= 1`. `@leafscope` has no exception handler, so a throw passing through one
+    # skips its exit entirely. Restoring `cur`/`off` was already absolute — they come from the scope
+    # struct — but a decrement would leave the COUNTER permanently high, and `depth == 0` is what gates
+    # the coalesce below, so one escaped throw would disable coalescing for the life of the process.
+    # Writing the depth this scope entered at, minus one, means the first enclosing scope that does run
+    # its exit repairs the count as well as the pointer. Costs the same single store.
+    a.depth = s.depth - 1
     # Cold, and only after a call that grew: fold the slab chain into ONE slab of the peak size, so the
     # fresh-slab page offset is TRANSIENT — it exists on the growing call only, and from the next call the
     # layout is contiguous and deterministic per call path. That matters because this library is
@@ -421,12 +429,12 @@ end
 
 # A nested `@scope` carries its own token and gets its own checks when IT expands. Match on the last
 # component so `PureBLAS.@scope` is recognised as well as a bare `@scope`.
-function _arena_is_scope_macro(f)
-    f === Symbol("@scope") && return true
-    f isa GlobalRef && return f.name === Symbol("@scope")
-    f isa Expr && f.head === :. && length(f.args) == 2 && return f.args[2] === QuoteNode(Symbol("@scope"))
-    return false
-end
+_arena_is_named_macro(f, nm::Symbol) =
+    f === nm ? true :
+    f isa GlobalRef ? f.name === nm :
+    (f isa Expr && f.head === :. && length(f.args) == 2 && f.args[2] === QuoteNode(nm))
+_arena_is_scope_macro(f) = _arena_is_named_macro(f, Symbol("@scope"))
+_arena_is_leafscope_macro(f) = _arena_is_named_macro(f, Symbol("@leafscope"))
 
 function _arena_uses_token(ex, s::Symbol)
     ex === s && return true
@@ -440,7 +448,7 @@ end
 function _arena_borrows(ex, s::Symbol)
     ex isa Expr || return false
     _arena_borrow_call(ex, s) && return true
-    ex.head === :macrocall && !isempty(ex.args) && _arena_is_scope_macro(ex.args[1]) && return false
+    _arena_nested_scope(ex) && return false      # a nested scope's borrows are its own, either flavour
     return any(a -> _arena_borrows(a, s), ex.args)
 end
 
@@ -484,8 +492,8 @@ function _arena_borrowed_names(ex, s::Symbol, acc::Vector{Symbol} = Symbol[])
         if ex.head === :(=) && ex.args[1] isa Symbol && _arena_borrows(ex.args[2], s)
             push!(acc, ex.args[1]::Symbol)
         end
-        # do not descend into a nested `@scope`: its borrows are its own
-        if !(ex.head === :macrocall && !isempty(ex.args) && _arena_is_scope_macro(ex.args[1]))
+        # do not descend into a nested scope of either flavour: its borrows are its own
+        if !_arena_nested_scope(ex)
             for a in ex.args
                 _arena_borrowed_names(a, s, acc)
             end
@@ -558,14 +566,7 @@ outlives the block, a loop emitted by another macro, and recursion. `@fenced_sco
 for the handle cases.
 """
 macro scope(s::Symbol, body)
-    _arena_uses_token(body, s) && _throw_arena_escape(s)
-    _arena_check(body, s)
-    let names = _arena_borrowed_names(body, s), t = _arena_tail(body)
-        _arena_check_handles(body, names)
-        for n in names
-            _arena_in_value_position(t, [n]) && _throw_arena_handle(n)
-        end
-    end
+    _arena_checks(body, s)
     return quote
         $(esc(s)) = _arena_enter!(_arena())
         try
@@ -573,6 +574,82 @@ macro scope(s::Symbol, body)
         finally
             _arena_exit!($(esc(s)))
         end
+    end
+end
+
+# The three expansion-time checks, shared by `@scope` and `@leafscope`.
+function _arena_checks(body, s::Symbol)
+    _arena_uses_token(body, s) && _throw_arena_escape(s)
+    _arena_check(body, s)
+    names = _arena_borrowed_names(body, s)
+    t = _arena_tail(body)
+    _arena_check_handles(body, names)
+    for n in names
+        _arena_in_value_position(t, [n]) && _throw_arena_handle(n)
+    end
+    return nothing
+end
+
+# ── Early-return rewriting, which is what `finally` was doing for free ───────────────────────────────
+# `try …  finally` releases the arena on THREE exit paths: falling off the end, `return`, and a throw.
+# `@leafscope` drops the handler, so it must reproduce the first two itself — and forgetting the second is
+# not a subtle bug. Measured on galen 2026-09-05: a prototype that released only on the tail path left
+# `_trsm_right!`'s pad arm (which `return`s from inside the block) never rewinding, so every call bumped
+# further, `_arena_grow!` took a fresh 140 KiB slab each time, and `trsmR@128` went 0.708 -> 0.408 — worse
+# than the bug it was meant to fix, because the benchmark was then timing page faults.
+#
+# Do NOT descend into a nested function, closure or `do` block: a `return` in there belongs to that
+# function, not to this scope, and rewriting it would release an arena the closure may not even be running
+# under. A nested `@scope`/`@leafscope` is likewise left alone — it emits its own release.
+_arena_nested_scope(ex) =
+    ex isa Expr && ex.head === :macrocall && !isempty(ex.args) &&
+        (_arena_is_scope_macro(ex.args[1]) || _arena_is_leafscope_macro(ex.args[1]))
+
+function _arena_rewrite_returns(ex, s::Symbol, rv::Symbol, exitf)
+    ex isa Expr || return ex
+    (ex.head in (:(->), :function, :do) || _arena_nested_scope(ex)) && return ex
+    if ex.head === :return
+        v = isempty(ex.args) ? nothing : _arena_rewrite_returns(ex.args[1], s, rv, exitf)
+        # bind first, release second, return third — the value must be computed while the arena is
+        # still live, since it may READ through a handle (`return sum(A)` is legal and common).
+        return Expr(:block, Expr(:(=), rv, v), Expr(:call, exitf, s), Expr(:return, rv))
+    end
+    return Expr(ex.head, Any[_arena_rewrite_returns(a, s, rv, exitf) for a in ex.args]...)
+end
+
+"""
+    @leafscope s begin … end
+
+`@scope` with NO exception handler, for the innermost SIMD kernels — and nowhere else.
+
+WHY IT EXISTS, measured rather than assumed. `try`/`finally` lowers to `jl_enter_handler` plus a
+`returns_twice` setjmp, around which LLVM must be conservative for the WHOLE function. That is free in a
+dispatch-level routine and ruinous in one that inlines a register-hungry kernel: `_trsm_rl_fused_drv!`
+inlines `_trsm_rl_split_f64!`, which holds 18 live vectors, and a Zen 3 core has 16 vector registers.
+Adding the handler took that function from 113 vector spills to 172 (+52%) and `trsmR@100/128` from
+1.037/0.978 to 0.746/0.708 against the gate. Removing it again put the spill count back to 113 EXACTLY —
+the pre-arena figure — and `trsmR@100` back to 1.035. On the AVX-512 boxes, which have 14 spare vector
+registers, the same change is invisible; that is why the whole effect was AVX2-only.
+
+WHAT YOU GIVE UP, stated plainly: a throw passing through this block does not release its arena bytes
+here. That is survivable and bounded, because `_arena_exit!` restores `cur`/`off`/`depth` ABSOLUTELY from
+the scope struct — so the first ENCLOSING scope that does run its exit repairs everything at once. The
+rule that follows: **`@leafscope` must have a `@scope` above it in the call chain.** A leaf whose only
+scope is its own should use `@scope`; the handler costs nothing unless a kernel is inlined beside it.
+"""
+macro leafscope(s::Symbol, body)
+    _arena_checks(body, s)
+    # The rewritten `return`s are inside the ESCAPED body, so the release call must be a GlobalRef into
+    # this module rather than a bare symbol the caller's scope would have to resolve, and the temporary
+    # must be a gensym so it cannot collide with a caller's variable.
+    rv = gensym("arena_rv")
+    rewritten = _arena_rewrite_returns(body, s, rv, GlobalRef(@__MODULE__, :_arena_exit!))
+    tv = gensym("arena_tv")
+    return quote
+        $(esc(s)) = _arena_enter!(_arena())
+        local $(esc(tv)) = $(esc(rewritten))
+        _arena_exit!($(esc(s)))
+        $(esc(tv))
     end
 end
 
