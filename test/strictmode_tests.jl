@@ -350,6 +350,92 @@ end
     end
 end
 
+# Eigen family — the contract members that were DECLARED but never proved anywhere.
+#
+# `gebal!`, `gehrd!`, `orghr!`, `ormhr!`, `hseqr!` and `geev!` are all @strict_contract members
+# (src/contracts.jl:368-380) and src/verify.jl carries purpose-built probes for every one of them
+# (`_strict_gehrd_probe` &c, ~20 call sites). None of it has ever run. Those call sites live inside the
+# `if StrictMode.proofs_loaded()` block, and a package cannot have the proving tier loaded during its OWN
+# precompile — that is the one moment src/verify.jl executes. The block was equally dead under 0.3.10,
+# where the guard asked `backend_available()` about a weak-dep extension that is likewise never loaded
+# there. So the tiers are: src/ REPORTS (the value-free IR scan, all StrictMode has available to it), and
+# test/ PROVES — and the proving half simply had no home for this family until now.
+#
+# `test_signatures` (StrictModeTest 0.4) is the right tool rather than a per-call macro, for two reasons
+# beyond not having to build valid eigen inputs. It takes SIGNATURES, so `Char` is a TYPE here: one entry
+# analyses `geev!` for every jobvl/jobvr combination at once, where the src probes pinned 'N','V' and
+# never covered the 'N','N' arm that bench/plots.jl:1003 actually benchmarks. And it costs nothing to
+# list a large shape, so these are the n the gate cares about rather than an n=24 toy.
+#
+# GUARANTEE CHOICE, deliberate: `:typestable` only. NOT `:noalloc` — `gehrd!`'s blocked rewrite (the
+# "flagged, not built" follow-up in hessenberg.jl:248, and the whole of geev's 0.039-0.076 gate gap) will
+# route its trailing update through `gemm!`, and nothing reaching `gemm!` can pass a static all-paths
+# noalloc proof: `_gemm_strassen!`'s pad pool is a lazily sized `Vector{Matrix}` that the proof counts on
+# every path, runtime-dead or not. Gating :noalloc here would red the moment the gap is fixed and the
+# pressure would be to weaken it. Steady-state allocation is asserted separately below, warmed, which is
+# the property that actually holds and survives blocking.
+@testitem "StrictMode dogfood: eigen family (gebal/gehrd/orghr/ormhr/hseqr/geev)" tags = [:checks] begin
+    using StrictModeTest, StrictMode, LinearAlgebra
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping eigen dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        bk = P.DEFAULT_BACKEND
+        SB = typeof(bk)
+        MD = Matrix{Float64}; VD = Vector{Float64}
+        MZ = Matrix{ComplexF64}; VZ = Vector{ComplexF64}
+        test_signatures(
+            [
+                # balance / un-balance
+                (P.gebal!, (SB, MD, VD)),
+                (P.gebal!, (SB, MZ, VD)),
+                (P.gebak!, (SB, Char, Char, Int, Int, VD, MD)),
+                (P.gebak!, (SB, Char, Char, Int, Int, VD, MZ)),
+                # Hessenberg reduction and its Q — the stage that owns 69% of the geev cell
+                (P.gehrd!, (SB, MD, Int, Int, VD)),
+                (P.gehrd!, (SB, MZ, Int, Int, VZ)),
+                (P.orghr!, (SB, MD, Int, Int, VD)),
+                (P.orghr!, (SB, MZ, Int, Int, VZ)),
+                (P.ormhr!, (SB, Char, Char, Int, Int, MD, VD, MD)),
+                (P.ormhr!, (SB, Char, Char, Int, Int, MZ, VZ, MZ)),
+                # Francis QR — both job/compz arms, since Char is a type here
+                (P.hseqr!, (SB, Char, Char, MD, Int, Int, VZ, MD)),
+                (P.hseqr!, (SB, Char, Char, MZ, Int, Int, VZ, MZ)),
+                # the drivers (real arity carries wr/wi separately, complex a single w)
+                (P.geev!, (SB, Char, Char, MD, VD, VD, MD, MD, VD)),
+                (P.geev!, (SB, Char, Char, MZ, VZ, MZ, MZ, VD)),
+            ];
+            guarantees = (:typestable,)
+        )
+        # Steady state, warmed — the counterpart the static proof cannot express (see the note above and
+        # the file header). n is small because this asserts a property, not a rate.
+        #
+        # MEASURED INSIDE A FUNCTION, AND THROUGH THE CONST BINDING — neither is stylistic, and both were
+        # established by measurement here rather than assumed. A @testitem body is module scope, so its
+        # `bk`/`A`/`sc` are untyped globals and the call is dynamically dispatched, which BOXES a non-heap
+        # return value: `gebal!` returns `Tuple{Int64,Int64}`, and measured at item scope that is a steady
+        # 32 B (2×8 + header, padded) the kernel never allocates. A function wrapper alone does not fix it
+        # either, because `P = PureBLAS` is a non-const global, so `P.gebal!` inside the function is still
+        # a dynamic lookup — it has to be the const `PureBLAS` binding. Inside a function and through that
+        # binding it is 0 B on every job arm at both n (bench/probes/gebal_alloc.jl).
+        # None of this shows up in gemm_tests.jl only because those kernels return their `C` argument,
+        # which is already on the heap; any routine returning a tuple or a scalar needs this shape or the
+        # check measures Julia's dispatch rather than the kernel.
+        function _eigen_steady(bk)
+            n = 24
+            A0 = randn(n, n); A = copy(A0); sc = ones(n); tau = Vector{Float64}(undef, n)
+            PureBLAS.gebal!(bk, A, sc)                             # warm
+            copyto!(A, A0); a_gebal = @allocated PureBLAS.gebal!(bk, A, sc)
+            copyto!(A, A0); PureBLAS.gehrd!(bk, A, 1, n, tau)      # warm the arena high-water
+            copyto!(A, A0); a_gehrd = @allocated PureBLAS.gehrd!(bk, A, 1, n, tau)
+            return (a_gebal, a_gehrd)
+        end
+        @test _eigen_steady(bk) == (0, 0)
+        @test true
+    end
+end
+
 # LAPACK finish-all surface — trim-compatibility dogfood. In the :checks (analysis="full") project with
 # TrimCheck loaded, @test_trim_compatible runs juliac's AUTHORITATIVE verify_typeinf_trim (the same
 # verifier as juliac/build.jl). This is the dev-time net that was MISSING when the trsyl `scale` Core.Box
