@@ -12,14 +12,6 @@ c = ComplexF32, z = ComplexF64.
 How the measurements are taken and how to read a cell: [Methodology](methodology.md). Per-routine
 analysis and history: [Notes](notes.md).
 
-!!! warning "Zen5 column is one commit behind (2026-09-03)"
-    Zen3 and Zen4 were re-measured at `dc1d1a1`; **Zen5 is still at `1496d1a` (2026-08-30)**, so its
-    column describes code that has since changed — 52 source files differ between the two commits,
-    including the eigen stack and the BLAS-3 packed-tile drivers. Compare the Zen5 column with the
-    other two only where the routine is untouched by that range. A full Zen5 rebuild is running and
-    this page will be regenerated when it lands. Per-box commit and timestamp:
-    [provenance](https://github.com/el-oso/PureBLAS.jl/blob/master/bench/provenance.md).
-
 ## BLAS
 
 One row per routine, generated from the caches by `bench/coverage_ops.jl`; `n=` names the worst cell.
