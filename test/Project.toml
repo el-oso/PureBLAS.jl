@@ -1,12 +1,10 @@
 [deps]
-AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 # Test-only. FixedSizeArray is the concrete case for "a dense array that is not `Array`": it is
 # `<: DenseArray`, so it must ride the same strided fast path Array does, and `_root` must peel it
 # without recursing forever. Pure Julia, one small dependency (Collects).
 FixedSizeArrays = "3821ddf9-e5b5-40d5-8e25-6813ab96b5e2"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
-JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
@@ -14,10 +12,21 @@ StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 # ITS dependencies now, not StrictMode's. The `@assert_*` macros still exist and still compile, but
 # in 0.4 they only REPORT — the `@test_*` forms are what gate the build. That split is what makes
 # 0.4 breaking, and why this dep must exist even though no `using StrictModeTest` existed before.
+# AllocCheck and JET were dropped from [deps] with it: in 0.3 they were StrictMode WEAK deps that had
+# to be `using`-ed to activate the analysis extension, and in 0.4 they are StrictModeTest's ordinary
+# deps, loaded with it. Nothing here calls either package's own API. TrimCheck stays because
+# `trim_tests.jl` calls `@validate` directly.
 StrictModeTest = "a64655d1-1e86-453c-b761-1219f9f51c2b"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
 TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
+
+# The only bound here, and the only one that was missing anywhere: the main Project.toml already
+# constrains StrictMode, but StrictModeTest appears in no other manifest, so without this a future
+# breaking release would resolve silently into `Pkg.test()`. The remaining test deps are left
+# unbounded as they have always been.
+[compat]
+StrictModeTest = "0.4"
 
 # `analysis = "full"` and `fail_mode = "error"` were removed here in the 0.4 migration: 0.4 deleted
 # both keys (one analysis engine per package; throw-vs-warn is now a property of each guarantee).
