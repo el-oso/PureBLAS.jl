@@ -1,5 +1,9 @@
 # Design
 
+How the kernels are written once and reached two ways, how they stay generic over the element type, and
+why the shared library is for non-Julia hosts only. For where the scratch memory comes from — the bump
+allocator that replaced 180 named workspace fields with 7 — see [Scratch Arena](arena.md).
+
 ## One kernel set, two ways in
 
 The kernels are written once, in BLAS-native `(n, …, inc)` form, over a small accessor interface —
