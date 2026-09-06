@@ -8,15 +8,13 @@
 # AND @strict on each representative call (type-stable + allocation-free), since AbstractBLAS1/2/3 are
 # @strict_contracts. The @strict calls self-gate on the `checks_enabled` preference.
 #
-# WHICH HALF ACTUALLY RUNS, MEASURED — read this before adding a member. `LocalPreferences.toml` sets
-# `[StrictMode] analysis = "full"`, and `StrictMode.backend_available()` is FALSE in the main env
-# (AllocCheck/JET are test-only), so the `if` below is FALSE and the @strict half of this block does not
-# execute at PureBLAS's own precompile. What DOES run every time is `TypeContracts.@verify SIMDBackend`
-# — the method surface + declared return types of all 78 members — because that is inside @verify_strict
-# but the `if` guards the whole let. The @strict half runs when the block is entered with the backend
-# loaded, i.e. the test suite's strictmode dogfood, where `_noalloc_mode` is `:static` (AllocCheck's
-# proof, falling back to empirical `@allocated`).
-# Do NOT use StrictMode 0.3.10's `:fast` heuristic (`_alloc_signals`) as the eligibility test for a new
+# WHICH HALF ACTUALLY RUNS, MEASURED — read this before adding a member. `StrictMode.proofs_loaded()`
+# is FALSE in the main env (StrictModeTest, and with it AllocCheck/JET/TrimCheck, is test-only), so the
+# @strict half of this block does no proving at PureBLAS's own precompile. What DOES run every time is
+# `TypeContracts.@verify SIMDBackend` — the method surface + declared return types of all 78 members —
+# because that is inside @verify_strict but the `if` guards the whole let. The @strict half proves when
+# the block is entered with StrictModeTest loaded, i.e. the test suite's strictmode dogfood.
+# Do NOT use StrictMode's IR heuristic (`_alloc_signals`) as the eligibility test for a new
 # member: the control run in bench/probes/strict_heuristic_control.jl flags EVERY already-contracted
 # LAPACK member — gemm!, potrf!, getrf!, geqrf!, potrs!, getri!, pstrf!, the whole QR family — at a
 # measured 0 B. The predicate that means something here is empirical @allocated after warm-up, plus a
@@ -234,7 +232,17 @@ function _strict_clean_hess!(H)
     return H
 end
 
-if StrictMode.analysis_mode() === :fast || StrictMode.backend_available()
+# StrictMode 0.4 deleted both names this line used to call. `analysis_mode()` is gone outright — 0.4 has
+# one engine per package and `checks_enabled()` is the whole on/off switch — and `backend_available()`
+# became `proofs_loaded()`, which asks whether StrictModeTest is loaded rather than whether a particular
+# analysis backend resolved. Together they made this a HARD break: the package stopped precompiling at
+# all rather than merely stopping gating, which is the failure mode StrictMode's own migration.jl says it
+# measured on three of eight consumers.
+#
+# The condition keeps its meaning. It used to read "cheap heuristic mode, or a real backend is present";
+# it now reads "checks are on, or the proving package is loaded" — the second disjunct is the one that
+# matters, since `@verify_strict`'s `@strict` half only does real work when StrictModeTest is there.
+if StrictMode.checks_enabled() || StrictMode.proofs_loaded()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
             Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),

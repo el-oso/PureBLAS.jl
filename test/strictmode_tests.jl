@@ -3,16 +3,25 @@
 # compile-time Preference (test/Project.toml ships them enabled); when disabled the macros are
 # zero-cost no-ops, so we skip rather than pass vacuously. Mirrors PureFFT's strictmode dogfood.
 #
-# NOTE: @assert_noalloc is backed by AllocCheck (static, all-paths proof) ONLY in analysis="full"
-# (our config); in :fast it degrades to a runtime check. The kernels here must be alloc-free on
-# every path, so :full is the right mode. Driver steady-state (allocates scratch once) is guarded
-# separately with runtime @allocated in gemm_tests.jl, where static AllocCheck would false-positive.
+# NOTE (StrictMode/StrictModeTest 0.4): `@test_noalloc` is ALWAYS AllocCheck's static all-paths
+# proof now — 0.4 deleted the `analysis` preference and the `static = false` runtime form with it,
+# and it deletes the kwarg SILENTLY (an unrecognized `k = v` is parsed as a positional argument and
+# dropped), so a leftover `static = false` reads as an unchanged test while its meaning has flipped.
+# Two properties, two tools, and they are not interchangeable:
+#   * leaf kernels must be alloc-free on EVERY path       → `@test_noalloc` (the proof)
+#   * drivers holding grow-once scratch are alloc-free in  → `@test (@allocated f(...)) == 0`, after
+#     STEADY STATE, not on the first call                    a warm-up, as gemm_tests.jl does
+# A driver cannot use the proof: it can statically reach `gemm!` → `_gemm_strassen!`, whose pad/level
+# pool is a lazily sized `Vector{Matrix}` (workspace.jl `_str_fit!`), and an all-paths proof counts
+# that branch even where it is runtime-dead. StrictMode 0.4's `register_alloc_barrier!` would exempt
+# it, but it is a PROCESS-GLOBAL exemption and the pool re-allocates on shape change — so it would
+# weaken every other `@test_noalloc` here to buy a claim that is not quite true.
 
 @testitem "StrictMode dogfood: BLAS-1 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: TypeContracts 0.14.0's @verify emits a `_seal_verified!(@__MODULE__,…)`
     # that resolves `TypeContracts` in THIS module (@verify_strict esc's the forwarded @verify call), so
     # the name must be in scope here. Reach it through StrictMode (already a dep) — no new test dep.
-    using StrictMode, StrictMode.TypeContracts, AllocCheck, JET
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping dogfood (enable in test/Project.toml to run)"
         @test_skip StrictMode.checks_enabled()
@@ -49,7 +58,7 @@ end
 @testitem "StrictMode dogfood: BLAS-2 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: see the BLAS-1 item — @verify_strict's forwarded @verify (TypeContracts
     # 0.14.0) seals into this module, so `TypeContracts` must resolve here.
-    using StrictMode, StrictMode.TypeContracts, AllocCheck, JET
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts, AllocCheck, JET
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L2 dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -79,7 +88,7 @@ end
 end
 
 @testitem "StrictMode dogfood: L3 trsm/syrk/symm scratch + driver" tags = [:checks] begin
-    using StrictMode, AllocCheck, JET, LinearAlgebra
+    using StrictModeTest, StrictMode, AllocCheck, JET, LinearAlgebra
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L3 dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -99,18 +108,27 @@ end
         Atri = tri(32)
         @assert_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
         @assert_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
-        # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so this
-        # is the empirical warmed path (static=false); static AllocCheck would false-positive on the
-        # get!/IdDict lazy alloc. StrictMode macros reject kwargs, so we assert on the POSITIONAL
+        # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so what
+        # is asserted is the empirical WARMED path — and from StrictMode 0.4 that has to be spelled with
+        # runtime `@allocated`, not `@test_noalloc`. 0.4 dropped the `static = false` runtime form, so
+        # `@test_noalloc` is now ONLY AllocCheck's static all-paths proof, and every driver below can
+        # statically reach `gemm!` → `_gemm_strassen!`, whose pad/level pool is a lazily sized
+        # `Vector{Matrix}` (workspace.jl `_str_fit!`). That branch is runtime-dead at these shapes but an
+        # all-paths proof must still count it, so no warm-up can make the static form green. Same reason
+        # gemm_tests.jl guards its drivers this way; the file header above says so.
+        # StrictMode macros reject kwargs, so we assert on the POSITIONAL
         # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
         # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
         # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
         # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
         # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
-        P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
-        P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
-        @assert_noalloc P._trsm_base_invL!(false, false, false, Atri, randn(32, 256)) static = false
-        @assert_noalloc P._trsm_base_invR!(false, false, false, Atri, randn(256, 32)) static = false
+        # Operands are hoisted OUT of the measured expression: `@allocated` counts its whole argument
+        # list, where the macro form bound each argument before measuring.
+        BL = randn(32, 256); BR = randn(256, 32)
+        P._trsm_base_invL!(false, false, false, Atri, BL)
+        P._trsm_base_invR!(false, false, false, Atri, BR)
+        @test (@allocated P._trsm_base_invL!(false, false, false, Atri, BL)) == 0
+        @test (@allocated P._trsm_base_invR!(false, false, false, Atri, BR)) == 0
         # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
         # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
         Aup = (
@@ -118,9 +136,10 @@ end
                 M[i, i] += 128.0
             end; M
         )
-        P._trsm_fused_L!(false, Aup, randn(128, 256))                     # warm the ftrsm buffer
+        BF = randn(128, 256)
+        P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
         @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
-        @assert_noalloc P._trsm_fused_L!(false, Aup, randn(128, 256)) static = false
+        @test (@allocated P._trsm_fused_L!(false, Aup, BF)) == 0
         # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
         # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer. AVX-512-f64
         # ONLY: `_trsm_fused_full_L!` is dispatched (trsm.jl:_trsm_left!) solely under `_GT_TRANSPOSE` and has
@@ -132,16 +151,21 @@ end
                     M[i, i] += 512.0
                 end; M
             )
-            P._trsm_fused_full_L!(false, Auf, randn(512, 256))               # warm the ftrsm buffer
+            BFF = randn(512, 256)
+            P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
             @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
-            @assert_noalloc P._trsm_fused_full_L!(false, Auf, randn(512, 256)) static = false
+            @test (@allocated P._trsm_fused_full_L!(false, Auf, BFF)) == 0
         end
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
-        @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512) static = false
+        P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)            # warm the pack buffers
+        @test (@allocated P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)) == 0
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
-        @assert_noalloc P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32) static = false
-        @assert_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512) static = false
-        @assert_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs) static = false
+        P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)
+        @test (@allocated P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)) == 0
+        P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
+        @test (@allocated P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)) == 0
+        P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
+        @test (@allocated P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)) == 0
         # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
         # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
         # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
@@ -163,26 +187,33 @@ end
         # must stay typestable + alloc-free (the tri sweep resolves sb/a1/ar/nr to concrete Vals). trim-side
         # is covered ccallable-rooted in trim_tests.jl; here the type/alloc contract on the hot driver.
         Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
+        Cwz = zeros(ComplexF64, 48, 48)
         @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
-        @assert_noalloc P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40) static = false
-        @assert_noalloc P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, zeros(ComplexF64, 48, 48), 40) static = false
+        P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)
+        @test (@allocated P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)) == 0
+        P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)
+        @test (@allocated P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)) == 0
         @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
         # rank-2k (two products through the shared _ctri_core!)
         @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
-        @assert_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
-        @assert_noalloc P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, zeros(ComplexF64, 48, 48), 40) static = false
+        P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)
+        @test (@allocated P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)) == 0
+        P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, Cwz, 40)
+        @test (@allocated P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, Cwz, 40)) == 0
         # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
         Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
             Atr[d, d] = 1 + abs(Atr[d, d])
         end
+        Btr = randn(ComplexF64, 64, 48)
         @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
-        @assert_noalloc P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48)) static = false
+        P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)
+        @test (@allocated P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)) == 0
         @test true
     end
 end
 
 @testitem "StrictMode dogfood: GEMM hot paths" tags = [:checks] begin
-    using StrictMode, AllocCheck, JET, TrimCheck  # TrimCheck → @assert_trim_compatible runs the
+    using StrictModeTest, StrictMode, AllocCheck, JET, TrimCheck  # TrimCheck → @test_trim_compatible runs the
     # authoritative juliac verify_typeinf_trim here (test project is analysis="full"), not the heuristic.
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping GEMM dogfood"
@@ -195,20 +226,20 @@ end
             ap = pointer(Ap); bp = pointer(Bp); cp = pointer(C); ldc = mr
             # register-blocked microkernel: the hot path — must be tight
             @assert_typestable P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @assert_noalloc P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @assert_trim_compatible P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @test_noalloc P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @test_trim_compatible P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
             # StrictMode 0.3.9 @assert_no_spill: the µarch-derived _MR×_NR tile must fit the register file
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
             @assert_no_spill P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @assert_noalloc P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @test_noalloc P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
-            @assert_trim_compatible P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @test_trim_compatible P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             # clip kernel: W-aligned partial row-tile (reads _MR-strided panel, computes 1 live vector)
             @assert_typestable P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
-            @assert_noalloc P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
-            @assert_trim_compatible P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @test_noalloc P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @test_trim_compatible P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
         end
         # unpacked microkernel (small-matrix path): A is mr×k, B is k×nr, column-major
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
@@ -218,11 +249,11 @@ end
                 cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(true)
             )
-            @assert_noalloc P._microkernel_unpacked!(
+            @test_noalloc P._microkernel_unpacked!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 2.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(false)
             )
-            @assert_trim_compatible P._microkernel_unpacked!(
+            @test_trim_compatible P._microkernel_unpacked!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(true)
             )
@@ -233,11 +264,11 @@ end
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true), Val(W)
             )
-            @assert_noalloc P._microkernel_unpacked_mrows!(
+            @test_noalloc P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 2.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(false), Val(W)
             )
-            @assert_trim_compatible P._microkernel_unpacked_mrows!(
+            @test_trim_compatible P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true), Val(W)
             )
@@ -250,39 +281,39 @@ end
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
             )
-            @assert_noalloc P._mrows_tail!(
+            @test_noalloc P._mrows_tail!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 2.0, 2, Val(P._NR), Val(false), Val(false)
             )
-            @assert_trim_compatible P._mrows_tail!(
+            @test_trim_compatible P._mrows_tail!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
             )
         end
         # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed
         # zgemm_64_/cgemm_64_ trim-safety (four runtime `bool ? Val(true):Val(false)` flags → a Union{Val,Val}
-        # split that exceeds juliac's reachability limit). `@assert_trim_compatible` in the test project's
+        # split that exceeds juliac's reachability limit). `@test_trim_compatible` in the test project's
         # :full mode (TrimCheck loaded) runs juliac's AUTHORITATIVE verify_typeinf_trim over this exact kernel
         # graph — VERIFIED to reproduce the pre-fix failure (4 verifier errors) when rooted here, so the class
         # is caught in the strict-verify pass at dev-time, not only at the ccallable in trim_tests.jl on CI.
-        # NB the sibling `@assert_trim_safe` (heuristic TypeContracts scan) does NOT catch this reachability-
+        # NB the sibling `@test_trim_compatible` (heuristic TypeContracts scan) does NOT catch this reachability-
         # limit split — it's the known fast/full discrepancy: dev runs :fast (heuristic), tests run :full
         # (authoritative). trim_tests.jl stays as the ccallable-rooted belt (strict verify isn't perfect yet).
         for TC in (ComplexF64, ComplexF32)
             Az = randn(TC, 8, 8); Bz = randn(TC, 8, 8); Cz = zeros(TC, 8, 8)
-            @assert_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
-            @assert_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
+            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
+            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
         end
         # packing + generic path allocate nothing
         A = randn(8, 5); Bm = randn(5, 6); Cg = zeros(8, 6)
         @assert_typestable P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
-        @assert_noalloc P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
+        @test_noalloc P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
         @test true
     end
 end
 
 @testitem "StrictMode dogfood: complex Cholesky base (zpotf2)" tags = [:checks] begin
-    using StrictMode, AllocCheck, JET, LinearAlgebra
+    using StrictModeTest, StrictMode, AllocCheck, JET, LinearAlgebra
     if !StrictMode.checks_enabled()
         @test_skip StrictMode.checks_enabled()
     else
@@ -292,7 +323,7 @@ end
         for TC in (ComplexF64, ComplexF32)
             A = randn(TC, 48, 48); A = A * A' + 48I + zeros(TC, 48, 48)
             @assert_typestable P._cpotf2_lower!(copy(A), 48)
-            @assert_noalloc P._cpotf2_lower!(copy(A), 48)
+            @test_noalloc P._cpotf2_lower!(copy(A), 48)
             @assert_typestable P.potrf!(copy(A); uplo = 'L')          # n≤base → single base
             A2 = randn(TC, 128, 128); A2 = A2 * A2' + 128I + zeros(TC, 128, 128)
             @assert_typestable P.potrf!(copy(A2); uplo = 'L')         # n>base → recursive nb=n/4 blocked
@@ -309,25 +340,25 @@ end
             G = randn(TC, 48, 48) + 48I; ip = zeros(Int, 48); pG = pointer(G); ldG = stride(G, 2)
             GC.@preserve G begin
                 @assert_typestable P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
-                @assert_noalloc P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
+                @test_noalloc P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
             end
             Q = randn(TC, 48, 48); tau = similar(Q, 48)
             @assert_typestable P.qr_unblocked!(copy(Q), tau)
-            @assert_noalloc P.qr_unblocked!(copy(Q), tau)
+            @test_noalloc P.qr_unblocked!(copy(Q), tau)
         end
         @test true
     end
 end
 
 # LAPACK finish-all surface — trim-compatibility dogfood. In the :checks (analysis="full") project with
-# TrimCheck loaded, @assert_trim_compatible runs juliac's AUTHORITATIVE verify_typeinf_trim (the same
+# TrimCheck loaded, @test_trim_compatible runs juliac's AUTHORITATIVE verify_typeinf_trim (the same
 # verifier as juliac/build.jl). This is the dev-time net that was MISSING when the trsyl `scale` Core.Box
 # and the qr.jl complex-muladd / svd.jl permutedims union-splits shipped a non-building .so with CI green.
 # REQUIREMENT (memory lapack-strict-contract-required): a new LAPACK @ccallable entry point is not done
-# until asserted here. @assert_trim_compatible EXECUTES the call, so inputs must be runtime-valid (SPD /
+# until asserted here. @test_trim_compatible EXECUTES the call, so inputs must be runtime-valid (SPD /
 # pre-factored where the kernel demands it). Covers the full finish-all surface, real + complex.
 @testitem "StrictMode dogfood: LAPACK finish-all trim-compatibility" tags = [:checks] begin
-    using StrictMode, AllocCheck, JET, TrimCheck, LinearAlgebra
+    using StrictModeTest, StrictMode, AllocCheck, JET, TrimCheck, LinearAlgebra
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping LAPACK finish-all trim dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -341,9 +372,9 @@ end
         She = (M = randn(ComplexF64, n, n); M * M' + n * I)         # Hermitian PD
 
         # ── symmetric-indefinite solve/inverse (sytri/hetri need a real factorization first) ──
-        @assert_trim_compatible P.sysv!('L', copy(Ad), randn(n, 2))
-        @assert_trim_compatible P.sysv!('L', copy(Az), randn(ComplexF64, n, 2))
-        @assert_trim_compatible P.hesv!('L', copy(Ahe), randn(ComplexF64, n, 2))
+        @test_trim_compatible P.sysv!('L', copy(Ad), randn(n, 2))
+        @test_trim_compatible P.sysv!('L', copy(Az), randn(ComplexF64, n, 2))
+        @test_trim_compatible P.hesv!('L', copy(Ahe), randn(ComplexF64, n, 2))
         LDd = copy(Ad); ipd = zeros(Int, n); P.sytrf!(LDd, ipd; uplo = 'L')
         LDz = copy(Az); ipz = zeros(Int, n); P.sytrf!(LDz, ipz; uplo = 'L')
         LDh = copy(Ahe); iph = zeros(Int, n); P.hetrf!(LDh, iph; uplo = 'L')
@@ -360,71 +391,71 @@ ipb = zeros(Int, nbig)
 P.sytrf!(copy(Abd), ipb; uplo = 'L')                    # warm the owned W workspace first
 P.hetrf!(copy(Abh), ipb; uplo = 'L')
 for ul in ('L', 'U')
-    @assert_trim_compatible P.sytrf!(copy(Abd), zeros(Int, nbig); uplo = ul)
-    @assert_trim_compatible P.sytrf!(copy(Abz), zeros(Int, nbig); uplo = ul)
-    @assert_trim_compatible P.hetrf!(copy(Abh), zeros(Int, nbig); uplo = ul)
+    @test_trim_compatible P.sytrf!(copy(Abd), zeros(Int, nbig); uplo = ul)
+    @test_trim_compatible P.sytrf!(copy(Abz), zeros(Int, nbig); uplo = ul)
+    @test_trim_compatible P.hetrf!(copy(Abh), zeros(Int, nbig); uplo = ul)
 end
-@assert_trim_compatible P.sytri!(copy(LDd), ipd; uplo = 'L')
-        @assert_trim_compatible P.sytri!(copy(LDz), ipz; uplo = 'L')
-        @assert_trim_compatible P.hetri!(copy(LDh), iph; uplo = 'L')
+@test_trim_compatible P.sytri!(copy(LDd), ipd; uplo = 'L')
+        @test_trim_compatible P.sytri!(copy(LDz), ipz; uplo = 'L')
+        @test_trim_compatible P.hetri!(copy(LDh), iph; uplo = 'L')
         # ── QL / RQ (geqlf/gerqf + org/orm), real + complex ──
         Aqd = randn(n, k); tqd = zeros(Float64, k); Aqz = randn(ComplexF64, n, k); tqz = zeros(ComplexF64, k)
         Fqd = copy(Aqd); P.geqlf!(Fqd, tqd); Fqz = copy(Aqz); P.geqlf!(Fqz, tqz)
-        @assert_trim_compatible P.geqlf!(copy(Aqd), zeros(Float64, k))
-        @assert_trim_compatible P.orgql!(copy(Fqd), copy(tqd))
-        @assert_trim_compatible P.ormql!('L', 'N', copy(Fqd), tqd, randn(n, 3))
-        @assert_trim_compatible P.geqlf!(copy(Aqz), zeros(ComplexF64, k))
-        @assert_trim_compatible P.orgql!(copy(Fqz), copy(tqz))
-        @assert_trim_compatible P.ormql!('L', 'N', copy(Fqz), tqz, randn(ComplexF64, n, 3))
+        @test_trim_compatible P.geqlf!(copy(Aqd), zeros(Float64, k))
+        @test_trim_compatible P.orgql!(copy(Fqd), copy(tqd))
+        @test_trim_compatible P.ormql!('L', 'N', copy(Fqd), tqd, randn(n, 3))
+        @test_trim_compatible P.geqlf!(copy(Aqz), zeros(ComplexF64, k))
+        @test_trim_compatible P.orgql!(copy(Fqz), copy(tqz))
+        @test_trim_compatible P.ormql!('L', 'N', copy(Fqz), tqz, randn(ComplexF64, n, 3))
         Ard = randn(k, n); Arz = randn(ComplexF64, k, n)
         Grd = copy(Ard); P.gerqf!(Grd, tqd); Grz = copy(Arz); P.gerqf!(Grz, tqz)
-        @assert_trim_compatible P.gerqf!(copy(Ard), zeros(Float64, k))
-        @assert_trim_compatible P.orgrq!(copy(Grd), copy(tqd))
-        @assert_trim_compatible P.ormrq!('R', 'N', copy(Grd), tqd, randn(3, n))
-        @assert_trim_compatible P.gerqf!(copy(Arz), zeros(ComplexF64, k))
-        @assert_trim_compatible P.orgrq!(copy(Grz), copy(tqz))
+        @test_trim_compatible P.gerqf!(copy(Ard), zeros(Float64, k))
+        @test_trim_compatible P.orgrq!(copy(Grd), copy(tqd))
+        @test_trim_compatible P.ormrq!('R', 'N', copy(Grd), tqd, randn(3, n))
+        @test_trim_compatible P.gerqf!(copy(Arz), zeros(ComplexF64, k))
+        @test_trim_compatible P.orgrq!(copy(Grz), copy(tqz))
         # ── RZ (tzrzf/ormrz) ──
         Tzd = randn(k, n); ttd = zeros(Float64, k); P.tzrzf!(Tzd, ttd)
-        @assert_trim_compatible P.tzrzf!(randn(k, n), zeros(Float64, k))
-        @assert_trim_compatible P.tzrzf!(randn(ComplexF64, k, n), zeros(ComplexF64, k))
-        @assert_trim_compatible P.ormrz!('L', 'N', copy(Tzd), ttd, randn(n, 3))
+        @test_trim_compatible P.tzrzf!(randn(k, n), zeros(Float64, k))
+        @test_trim_compatible P.tzrzf!(randn(ComplexF64, k, n), zeros(ComplexF64, k))
+        @test_trim_compatible P.ormrz!('L', 'N', copy(Tzd), ttd, randn(n, 3))
         # ── pivoted Cholesky (pstrf) — SPD input ──
-        @assert_trim_compatible P.pstrf!(copy(Sd), zeros(Int, n), -1.0; uplo = 'L')
-        @assert_trim_compatible P.pstrf!(copy(She), zeros(Int, n), -1.0; uplo = 'L')
+        @test_trim_compatible P.pstrf!(copy(Sd), zeros(Int, n), -1.0; uplo = 'L')
+        @test_trim_compatible P.pstrf!(copy(She), zeros(Int, n), -1.0; uplo = 'L')
         # ── rank-deficient / constrained least squares ──
-        @assert_trim_compatible P.gelsd!(randn(n, k), randn(n, 2), -1.0)
-        @assert_trim_compatible P.gelsd!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), -1.0)
-        @assert_trim_compatible P.gelsy!(randn(n, k), randn(n, 2), zeros(Int, k), -1.0)
-        @assert_trim_compatible P.gelsy!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), zeros(Int, k), -1.0)
-        @assert_trim_compatible P.gglse!(randn(8, 6), randn(8), randn(4, 6), randn(4))
-        @assert_trim_compatible P.gglse!(randn(ComplexF64, 8, 6), randn(ComplexF64, 8), randn(ComplexF64, 4, 6), randn(ComplexF64, 4))
+        @test_trim_compatible P.gelsd!(randn(n, k), randn(n, 2), -1.0)
+        @test_trim_compatible P.gelsd!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), -1.0)
+        @test_trim_compatible P.gelsy!(randn(n, k), randn(n, 2), zeros(Int, k), -1.0)
+        @test_trim_compatible P.gelsy!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), zeros(Int, k), -1.0)
+        @test_trim_compatible P.gglse!(randn(8, 6), randn(8), randn(4, 6), randn(4))
+        @test_trim_compatible P.gglse!(randn(ComplexF64, 8, 6), randn(ComplexF64, 8), randn(ComplexF64, 4, 6), randn(ComplexF64, 4))
         # ── Sylvester (trsyl) + Schur reorder (trexc/trsen) ──
-        @assert_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(n, n)) + n * I, triu(randn(n, n)) + n * I, randn(n, n))
-        @assert_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(ComplexF64, n, n)) + n * I, triu(randn(ComplexF64, n, n)) + n * I, randn(ComplexF64, n, n))
-        @assert_trim_compatible P.trexc!('V', triu(randn(n, n)) + n * I, Matrix(1.0I, n, n), 2, n - 1)
-        @assert_trim_compatible P.trexc!('V', triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n), 2, n - 1)
-        @assert_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(n, n)) + n * I, Matrix(1.0I, n, n))
-        @assert_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n))
+        @test_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(n, n)) + n * I, triu(randn(n, n)) + n * I, randn(n, n))
+        @test_trim_compatible P.trsyl!('N', 'N', 1, triu(randn(ComplexF64, n, n)) + n * I, triu(randn(ComplexF64, n, n)) + n * I, randn(ComplexF64, n, n))
+        @test_trim_compatible P.trexc!('V', triu(randn(n, n)) + n * I, Matrix(1.0I, n, n), 2, n - 1)
+        @test_trim_compatible P.trexc!('V', triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n), 2, n - 1)
+        @test_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(n, n)) + n * I, Matrix(1.0I, n, n))
+        @test_trim_compatible P.trsen!('N', 'V', rand(Bool, n), triu(randn(ComplexF64, n, n)) + n * I, Matrix(ComplexF64(1)I, n, n))
         # ── generalized eigen (ggev/gges/sygvd/hegvd) — sygvd/hegvd need PD B ──
-        @assert_trim_compatible P.ggev!('N', 'V', randn(n, n), randn(n, n))
-        @assert_trim_compatible P.ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
-        @assert_trim_compatible P.gges!('V', 'V', randn(n, n), randn(n, n))
-        @assert_trim_compatible P.gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
-        @assert_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(8, 6), randn(6, 6))
-        @assert_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(ComplexF64, 8, 6), randn(ComplexF64, 6, 6))
-        @assert_trim_compatible P.sygvd!(1, 'V', 'U', copy(Ad), copy(Sd))
-        @assert_trim_compatible P.hegvd!(1, 'V', 'U', copy(Ahe), copy(She))
+        @test_trim_compatible P.ggev!('N', 'V', randn(n, n), randn(n, n))
+        @test_trim_compatible P.ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        @test_trim_compatible P.gges!('V', 'V', randn(n, n), randn(n, n))
+        @test_trim_compatible P.gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        @test_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(8, 6), randn(6, 6))
+        @test_trim_compatible P.ggsvd!('U', 'V', 'Q', randn(ComplexF64, 8, 6), randn(ComplexF64, 6, 6))
+        @test_trim_compatible P.sygvd!(1, 'V', 'U', copy(Ad), copy(Sd))
+        @test_trim_compatible P.hegvd!(1, 'V', 'U', copy(Ahe), copy(She))
         # ── symmetric-tridiagonal (stebz/stein), real ──
         dd = randn(n); ee = randn(n - 1)
-        @assert_trim_compatible P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
+        @test_trim_compatible P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
         w, ib, isp, _ = P.stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
-        @assert_trim_compatible P.stein!(copy(dd), copy(ee), w, ib, isp)
+        @test_trim_compatible P.stein!(copy(dd), copy(ee), w, ib, isp)
         # ── generalized SVD (ggsvd), Float64 full-rank ──
         # ── banded LU (gbtrf/gbtrs) — factor then solve ──
         ABd2 = randn(6, n); _, gip, _ = P.gbtrf!(2, 1, n, ABd2)
-        @assert_trim_compatible P.gbtrf!(2, 1, n, randn(6, n))
-        @assert_trim_compatible P.gbtrs!('N', 2, 1, n, copy(ABd2), gip, randn(n, 2))
-        @assert_trim_compatible P.gbtrf!(2, 1, n, randn(ComplexF64, 6, n))
+        @test_trim_compatible P.gbtrf!(2, 1, n, randn(6, n))
+        @test_trim_compatible P.gbtrs!('N', 2, 1, n, copy(ABd2), gip, randn(n, 2))
+        @test_trim_compatible P.gbtrf!(2, 1, n, randn(ComplexF64, 6, n))
         # BLOCKED path. The cells above are kl=2, so they can only ever reach `_gbtf2!` — a Base-only
         # scalar kernel — and the blocked port would ship trim-unvalidated, which is exactly the
         # failure the pbtrf item at test/lapack_tests.jl:24 is a post-mortem of. kl ≥ 2·nb is the
@@ -433,27 +464,27 @@ end
         ldgb = 2 * 32 + 8 + 1
         P.gbtrf!(32, 8, 64, randn(ldgb, 64))                 # warm the owned workspace first
         P.gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
-        @assert_trim_compatible P.gbtrf!(32, 8, 64, randn(ldgb, 64))
-        @assert_trim_compatible P.gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
+        @test_trim_compatible P.gbtrf!(32, 8, 64, randn(ldgb, 64))
+        @test_trim_compatible P.gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
         # ── SPD tridiagonal (pttrf/pttrs/ptsv) — factor then solve ──
         Dp = fill(4.0, n); Ep = fill(1.0, n - 1); Df = copy(Dp); Ef = copy(Ep); P.pttrf!(Df, Ef)
-        @assert_trim_compatible P.pttrf!(fill(4.0, n), fill(1.0, n - 1))
-        @assert_trim_compatible P.pttrs!(copy(Df), copy(Ef), randn(n, 2))
-        @assert_trim_compatible P.ptsv!(fill(4.0, n), fill(1.0, n - 1), randn(n, 2))
+        @test_trim_compatible P.pttrf!(fill(4.0, n), fill(1.0, n - 1))
+        @test_trim_compatible P.pttrs!(copy(Df), copy(Ef), randn(n, 2))
+        @test_trim_compatible P.ptsv!(fill(4.0, n), fill(1.0, n - 1), randn(n, 2))
         Dpz = fill(4.0, n); Epz = fill(1.0 + 0im, n - 1)
-        @assert_trim_compatible P.ptsv!(copy(Dpz), copy(Epz), randn(ComplexF64, n, 2))
+        @test_trim_compatible P.ptsv!(copy(Dpz), copy(Epz), randn(ComplexF64, n, 2))
         # ── general tridiagonal (gtsv/gttrf/gttrs) — factor then solve ──
         dl = fill(1.0, n - 1); dm = fill(4.0, n); du = fill(1.0, n - 1)
         du2 = zeros(Float64, n - 2); gtip = zeros(Int, n); P.gttrf!(copy(dl), copy(dm), copy(du), du2, gtip)
-        @assert_trim_compatible P.gtsv!(copy(dl), copy(dm), copy(du), randn(n, 2))
-        @assert_trim_compatible P.gttrf!(copy(dl), copy(dm), copy(du), zeros(Float64, n - 2), zeros(Int, n))
-        @assert_trim_compatible P.gtsv!(fill(1.0 + 0im, n - 1), fill(4.0 + 0im, n), fill(1.0 + 0im, n - 1), randn(ComplexF64, n, 2))
+        @test_trim_compatible P.gtsv!(copy(dl), copy(dm), copy(du), randn(n, 2))
+        @test_trim_compatible P.gttrf!(copy(dl), copy(dm), copy(du), zeros(Float64, n - 2), zeros(Int, n))
+        @test_trim_compatible P.gtsv!(fill(1.0 + 0im, n - 1), fill(4.0 + 0im, n), fill(1.0 + 0im, n - 1), randn(ComplexF64, n, 2))
         # ── banded / packed Cholesky (pbtrf/pbtrs, pptrf/pptrs) — SPD storage ──
         mkband(T) = (AB = zeros(T, 3, n); AB[1, :] .= T(10); AB[2, 1:(n - 1)] .= T(1); AB[3, 1:(n - 2)] .= T(0.5); AB)
         ABsd = mkband(Float64); P.pbtrf!(ABsd; uplo = 'L', kd = 2)
-        @assert_trim_compatible P.pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
-        @assert_trim_compatible P.pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)
-        @assert_trim_compatible P.pbtrf!(mkband(ComplexF64); uplo = 'L', kd = 2)
+        @test_trim_compatible P.pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
+        @test_trim_compatible P.pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)
+        @test_trim_compatible P.pbtrf!(mkband(ComplexF64); uplo = 'L', kd = 2)
         # kd=2 only reaches the UNBLOCKED kernel. The blocked kernels — the lower one, and the two
         # the 'U' path dispatches between — carry all the PtrMatrix/ld-1 band views and the tuned L3
         # calls, i.e. everything trim actually has to chew on, and none of it was covered here.
@@ -472,28 +503,32 @@ end
                 AB[kd + 1 - d, (1 + d):n] .= T(0.5)
             end; AB
         )
-        @assert_trim_compatible P.pbtrf!(wideband(Float64, 64); uplo = 'L', kd = 64)
-        @assert_trim_compatible P.pbtrf!(wideU(Float64, 64); uplo = 'U', kd = 64)
-        @assert_trim_compatible P._pbtrf_blocked!(wideband(Float64, 64), n, 64)
-        @assert_trim_compatible P._pbtrf_repack_U!(wideU(Float64, 64), n, 64)
-        @assert_trim_compatible P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
-        @assert_trim_compatible P._pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
-        @assert_trim_compatible P._pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
-        @assert_trim_compatible P._pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
+        @test_trim_compatible P.pbtrf!(wideband(Float64, 64); uplo = 'L', kd = 64)
+        @test_trim_compatible P.pbtrf!(wideU(Float64, 64); uplo = 'U', kd = 64)
+        @test_trim_compatible P._pbtrf_blocked!(wideband(Float64, 64), n, 64)
+        @test_trim_compatible P._pbtrf_repack_U!(wideU(Float64, 64), n, 64)
+        @test_trim_compatible P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
+        @test_trim_compatible P._pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
+        @test_trim_compatible P._pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
+        @test_trim_compatible P._pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
         # The corner work array W and the diagonal-block scratch S used to be allocated per CALL;
         # they are now GKH-owned (L3Workspace, via _pbtrf_work). Assert the steady state is actually
         # allocation-free — that IS the point of the ownership, and a per-call `Matrix` would sail
-        # through every correctness test. `static = false` because the FIRST call legitimately sizes
-        # the owned buffers; these calls run after the warm-ups above, so the buffers already exist.
+        # through every correctness test. Runtime `@allocated`, not `@test_noalloc`: the FIRST call
+        # legitimately sizes the owned buffers, and StrictMode 0.4 dropped the `static = false` runtime
+        # form, leaving `@test_noalloc` as a static all-paths proof that must count the (runtime-dead)
+        # `_gemm_strassen!` pad pool — see the L3 item above for the full reasoning.
         P._pbtrf_blocked!(wideband(Float64, 64), n, 64)          # size the owned scratch for nb(64)
-        @assert_noalloc P._pbtrf_blocked!(wideband(Float64, 64), n, 64) static = false
+        Wpb = wideband(Float64, 64)
+        @test (@allocated P._pbtrf_blocked!(Wpb, n, 64)) == 0
         P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
-        @assert_noalloc P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64) static = false
+        WpbU = wideU(Float64, 64)
+        @test (@allocated P._pbtrf_blocked_U!(WpbU, n, 64)) == 0
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
-        @assert_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
-        @assert_trim_compatible P.pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
-        @assert_trim_compatible P.pptrf!(pack(She); uplo = 'L')
+        @test_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
+        @test_trim_compatible P.pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
+        @test_trim_compatible P.pptrf!(pack(She); uplo = 'L')
         @test true
     end
 end
