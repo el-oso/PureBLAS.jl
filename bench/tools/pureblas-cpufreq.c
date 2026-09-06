@@ -46,6 +46,7 @@
 #include <limits.h>
 
 #define MAXCPU 512
+#define BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
 static int write_str(const char *path, const char *val, int quiet)
 {
@@ -153,10 +154,15 @@ int main(int argc, char **argv)
 
     if (strcmp(verb, "boost") == 0) {
         if (strcmp(arg, "0") != 0 && strcmp(arg, "1") != 0) return usage();
-        /* Not every platform exposes it (intel_pstate has no_turbo instead); quiet on absence. */
-        if (write_str("/sys/devices/system/cpu/cpufreq/boost", arg, 1) == 0) return 0;
-        fprintf(stderr, "pureblas-cpufreq: no cpufreq/boost on this platform\n");
-        return 1;
+        /* ABSENT and UNWRITABLE are different failures and must not print the same message. Not every
+         * platform exposes this knob (intel_pstate has no_turbo instead) — but running unprivileged
+         * also fails here, and reporting that as "no boost on this platform" sends the reader hunting
+         * for a hardware difference that does not exist. */
+        if (access(BOOST_PATH, F_OK) != 0) {
+            fprintf(stderr, "pureblas-cpufreq: no cpufreq/boost on this platform\n");
+            return 1;
+        }
+        return write_str(BOOST_PATH, arg, 0) == 0 ? 0 : 2;
     }
 
     if (strcmp(verb, "governor") == 0) {
@@ -166,8 +172,16 @@ int main(int argc, char **argv)
 
     if (strcmp(verb, "pstate") == 0) {
         if (!in_list(PSTATE_MODES, arg)) return usage();
-        if (write_str("/sys/devices/system/cpu/amd_pstate/status", arg, 1) == 0) return 0;
-        if (write_str("/sys/devices/system/cpu/intel_pstate/status", arg, 1) == 0) return 0;
+        /* Same distinction as `boost`: find the knob first, then report a write failure as a write
+         * failure rather than as a missing driver. */
+        static const char *const PSTATE_PATHS[] = {
+            "/sys/devices/system/cpu/amd_pstate/status",
+            "/sys/devices/system/cpu/intel_pstate/status", NULL
+        };
+        for (int i = 0; PSTATE_PATHS[i]; i++) {
+            if (access(PSTATE_PATHS[i], F_OK) != 0) continue;
+            return write_str(PSTATE_PATHS[i], arg, 0) == 0 ? 0 : 2;
+        }
         fprintf(stderr, "pureblas-cpufreq: no amd_pstate/intel_pstate status knob\n");
         return 1;
     }
