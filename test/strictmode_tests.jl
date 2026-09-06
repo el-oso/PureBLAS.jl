@@ -21,7 +21,7 @@
     # StrictMode.TypeContracts: TypeContracts 0.14.0's @verify emits a `_seal_verified!(@__MODULE__,…)`
     # that resolves `TypeContracts` in THIS module (@verify_strict esc's the forwarded @verify call), so
     # the name must be in scope here. Reach it through StrictMode (already a dep) — no new test dep.
-    using StrictModeTest, StrictMode, StrictMode.TypeContracts, AllocCheck, JET
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping dogfood (enable in test/Project.toml to run)"
         @test_skip StrictMode.checks_enabled()
@@ -58,7 +58,7 @@ end
 @testitem "StrictMode dogfood: BLAS-2 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: see the BLAS-1 item — @verify_strict's forwarded @verify (TypeContracts
     # 0.14.0) seals into this module, so `TypeContracts` must resolve here.
-    using StrictModeTest, StrictMode, StrictMode.TypeContracts, AllocCheck, JET
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L2 dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -88,7 +88,7 @@ end
 end
 
 @testitem "StrictMode dogfood: L3 trsm/syrk/symm scratch + driver" tags = [:checks] begin
-    using StrictModeTest, StrictMode, AllocCheck, JET, LinearAlgebra
+    using StrictModeTest, StrictMode, LinearAlgebra
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping L3 dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -213,8 +213,8 @@ end
 end
 
 @testitem "StrictMode dogfood: GEMM hot paths" tags = [:checks] begin
-    using StrictModeTest, StrictMode, AllocCheck, JET, TrimCheck  # TrimCheck → @test_trim_compatible runs the
-    # authoritative juliac verify_typeinf_trim here (test project is analysis="full"), not the heuristic.
+    using StrictModeTest, StrictMode, TrimCheck  # @test_trim_compatible runs the authoritative
+    # juliac verify_typeinf_trim (StrictModeTest depends on TrimCheck), not StrictMode's heuristic scan.
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping GEMM dogfood"
         @test_skip StrictMode.checks_enabled()
@@ -313,7 +313,7 @@ end
 end
 
 @testitem "StrictMode dogfood: complex Cholesky base (zpotf2)" tags = [:checks] begin
-    using StrictModeTest, StrictMode, AllocCheck, JET, LinearAlgebra
+    using StrictModeTest, StrictMode, LinearAlgebra
     if !StrictMode.checks_enabled()
         @test_skip StrictMode.checks_enabled()
     else
@@ -358,7 +358,7 @@ end
 # until asserted here. @test_trim_compatible EXECUTES the call, so inputs must be runtime-valid (SPD /
 # pre-factored where the kernel demands it). Covers the full finish-all surface, real + complex.
 @testitem "StrictMode dogfood: LAPACK finish-all trim-compatibility" tags = [:checks] begin
-    using StrictModeTest, StrictMode, AllocCheck, JET, TrimCheck, LinearAlgebra
+    using StrictModeTest, StrictMode, TrimCheck, LinearAlgebra
     if !StrictMode.checks_enabled()
         @info "StrictMode checks disabled — skipping LAPACK finish-all trim dogfood"
         @test_skip StrictMode.checks_enabled()
