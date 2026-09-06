@@ -56,8 +56,9 @@ Bunch–Kaufman, triangular and general solves, least squares, SVD, and the symm
 general eigensolvers. [Coverage](coverage.md) lists them with current numbers.
 
 Results are checked against OpenBLAS and LAPACK across types, sizes, strides and edge cases, and
-StrictMode contracts (`@assert_typestable`, `@assert_noalloc`, trim-safety) run against the hot paths as
-part of the suite.
+StrictMode contracts run against the hot paths as part of the suite — type stability and ownership
+through StrictMode's own `@assert_*`, and the allocation and `juliac --trim` guarantees through
+StrictModeTest's `@test_noalloc` / `@test_trim_compatible`, which prove rather than report.
 
 ## Differentiation
 

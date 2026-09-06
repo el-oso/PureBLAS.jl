@@ -79,7 +79,7 @@ jobs:
           PUREBLAS_TEST_GROUP: checks
 
   # AUTHORITATIVE trim gate: actually build libpureblas.so via juliac --trim=safe. The `checks` job's
-  # StrictMode @assert_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
+  # StrictModeTest @test_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
   # reachability-limit union-splits juliac catches (a green suite once shipped a non-building .so — the
   # complex-F32 LAPACK variants union-split geqrf!'s muladd). This is the only check that proves the .so
   # links for non-Julia hosts (req #4). Runs on 1.12 (juliac --trim is a 1.12 Compiler-stdlib feature).
