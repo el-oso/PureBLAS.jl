@@ -86,5 +86,5 @@ This is the one structural advantage a JIT-compiled BLAS has over a statically s
 the point of the project. OpenBLAS and BLIS have to choose their block sizes when *they* are compiled;
 PureBLAS chooses yours when it loads.
 
-MIT licensed. See the [Guide](guide.md), [Design](design.md) and
+MIT licensed. See the [Guide](guide.md), [Design](design.md), [Scratch Arena](arena.md) and
 [SIMD & Hardware Adaptation](simd.md).
