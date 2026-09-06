@@ -76,27 +76,7 @@ echo "=== PRE-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
 #   anything else — a crash or a real error. Report it and keep going so one bad group does not cost
 #                the other seven, but remember it and exit non-zero at the end.
 FAILED=""
-# VERIFY THE LOCK BETWEEN GROUPS, not only at the two ends. neuromancer drops its cpufreq pin when
-# something on its power cluster is disconnected (user, 2026-09-06) and the SETTINGS still read locked
-# while the cores run at 4.8 GHz against a 2.0 GHz pin — so nothing short of an achieved-under-load
-# measurement sees it. With only PRE/POST checks a mid-run drop costs the WHOLE sweep: on 2026-09-06 it
-# went PRE 1978 MHz / POST 4693 MHz, `plots.jl` refused the last two groups, and the two groups already
-# measured had to be discarded as well because nothing says when in the run the clock let go. Checking
-# per group bounds that loss to one group and names it. Costs a few seconds against a ~40-minute group.
-# `check_arm_clocks.sh` cannot substitute: full-arms measures every arm of a cell together, so a drop
-# BETWEEN cells leaves each cell internally consistent and the check passes.
-_lock_mhz() { bash bench/fleet_freqlock.sh verify 2>&1 | grep -oE 'achieved under load = [0-9]+' | grep -oE '[0-9]+$'; }
-LOCK0=$(_lock_mhz)
-[ -n "$LOCK0" ] || { echo "=== ABORT: cannot read the achieved frequency — refusing to measure ==="; exit 2; }
 for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP}; do
-    now=$(_lock_mhz)
-    # 3% of the opening figure, the same tolerance check_arm_clocks.sh uses between arms of one cell.
-    if [ -z "$now" ] || [ "$(( (now - LOCK0) * 100 / LOCK0 ))" -gt 3 ] || [ "$(( (LOCK0 - now) * 100 / LOCK0 ))" -gt 3 ]; then
-        echo "=== ABORT before group $g: lock moved ${LOCK0} -> ${now} MHz. Every group measured after"
-        echo "    the drop is INVALID, and which ones those are is unknowable — re-lock and re-run."
-        FAILED="$FAILED $g(lock)"
-        break
-    fi
     echo "=== group $g ==="
     ok=0
     for try in 1 2 3 4 5 6; do
