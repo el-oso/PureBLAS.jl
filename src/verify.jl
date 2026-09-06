@@ -239,10 +239,18 @@ end
 # all rather than merely stopping gating, which is the failure mode StrictMode's own migration.jl says it
 # measured on three of eight consumers.
 #
-# The condition keeps its meaning. It used to read "cheap heuristic mode, or a real backend is present";
-# it now reads "checks are on, or the proving package is loaded" — the second disjunct is the one that
-# matters, since `@verify_strict`'s `@strict` half only does real work when StrictModeTest is there.
-if StrictMode.checks_enabled() || StrictMode.proofs_loaded()
+# `proofs_loaded()` ALONE, and the disjunction is deliberately NOT carried over — this is where the
+# translation is easy to get wrong, and the first attempt did. 0.3.10's `analysis` preference defaulted to
+# `"full"`, NOT `:fast`, so `analysis_mode() === :fast` was FALSE wherever nothing set it, and
+# `backend_available()` was false in the main env (AllocCheck/JET being test-only). The old guard was
+# therefore FALSE at PureBLAS's own precompile and this whole block was SKIPPED there; it ran only where
+# the analysis backend was loaded, i.e. the test suite. Writing the 0.4 form as
+# `checks_enabled() || proofs_loaded()` inverts that: `checks_enabled()` defaults to TRUE, so the block
+# started executing every probe below at every precompile and printing a wall of `@noalloc` warnings from
+# the value-free IR scan — the very heuristic the paragraph above says flags EVERY contracted LAPACK
+# member at a measured 0 B. Minutes of precompile spent producing verdicts this file already documents as
+# worthless. `proofs_loaded()` is the exact translation of "a real backend is present".
+if StrictMode.proofs_loaded()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
             Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
