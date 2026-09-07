@@ -471,12 +471,62 @@ end
 # operand), `wy_apply!` via a `WYApplyWorkspace` built HERE from the same borrows, and `gemm!`/`trmm!` as
 # operands. `_gehd2!` opens its own nested scope for its staging vector, bump-allocated after these and
 # released first. What is returned is the caller's `A`.
+#
+# POWER-OF-TWO `lda` CACHE-SET ALIASING, and it is the dominant effect at the sizes the gate measures.
+# `_lahr2!` walks COLUMNS of the trailing matrix with `_gemv!`; at a power-of-two `lda` those addresses
+# collapse onto a couple of L1 sets, so an 8-way L1 holds a handful of lines of the column and every pass
+# conflict-misses. Measured on wintermute/Zen4, `gehrd!` alone, ms/n³ (×1e-9) which is FLAT for a pure
+# size effect:
+#     n=254  309 | n=255  311 | n=256 1786 | n=257  313 | n=258  295
+#     n=511  245 | n=512 1123 | n=513  238
+# — 5.8× at exactly 256 and 4.7× at exactly 512, a cliff at the power of two rather than a trend. It is
+# why `gehrd` was ~9× off the reference at n=256 while being only ~1.6× off at n=257, and why a `nb`
+# sweep across those sizes reported an impossible non-monotonicity in n.
+#
+# Remedy is this file's neighbours' remedy: factor in an alias-free copy. `_potrf_needs_pad` /
+# `_offway_ld` already exist for exactly this (`lapack.jl`); the two n² copies are nothing against an n³
+# reduction.
+#
+# PREDICATE — and getting this wrong is measurable, so it is worth stating why it is NOT `_alias_ld`.
+# `_alias_ld` (level3.jl) asks `ld >= _L1_WAY_D && ld % _L1_WAY_D == 0`, i.e. a FULL way period; on Zen4
+# a way is 512 doubles, so `_alias_ld(256)` is false. But a 2048-byte stride is HALF a way, and every
+# second column still lands on the same set — measured, padding under `_alias_ld` fixed n=512
+# (1123 → 179 ms/n³) and left n=256 untouched (1786 → 1716). `_potrf_needs_pad`'s quarter-way byte test
+# is the one that classifies both, which is why potrf does not have this hole. Reuse it rather than
+# invent a third predicate: same physical criterion, one place to re-derive.
+@inline _gehrd_needs_pad(A, nh::Int) =
+    _strided1(A) && nh >= 128 &&
+    (stride(A, 2) * sizeof(eltype(A))) % (_L1_WAY_BYTES >> 2) == 0
+
 function _gehrd_blocked!(
-        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}
+        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}; nb::Int = 0
     ) where {T <: BlasReal}
     n = size(A, 1)
+    # Alias-free working copy when the caller's `lda` is a way multiple. The recursive call cannot loop:
+    # `_offway_ld` is chosen so `_alias_ld` is false for it. ESCAPE AUDIT: `b` reaches only this same
+    # function and is copied back inside the block.
+    if _gehrd_needs_pad(A, ihi - ilo + 1)
+        @scope arn begin
+            ldb = _offway_ld(n, T)
+            b = borrow!(arn, T, n, n, ldb)
+            lda = stride(A, 2); sz = sizeof(T)
+            GC.@preserve A b begin
+                pa = pointer(A); pb = pointer(b)
+                @inbounds for j in 0:(n - 1)
+                    unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, n)
+                end
+                _gehrd_blocked!(b, ilo, ihi, tau; nb = nb)
+                @inbounds for j in 0:(n - 1)
+                    unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, n)
+                end
+            end
+        end
+        return A
+    end
     nh = ihi - ilo + 1
-    nb = clamp(_gehrd_nb(nh), 1, max(nh - 1, 1))
+    # `nb > 0` is a caller override for tuning sweeps only — the same idiom `geqrf!` uses. Production
+    # callers pass nothing and take the derivation.
+    nb = clamp(nb > 0 ? nb : _gehrd_nb(nh), 1, max(nh - 1, 1))
     nb < 2 && return _gehd2!(A, ilo, ihi, tau)
     @scope arn begin
         Y = borrow!(arn, T, ihi, nb)
