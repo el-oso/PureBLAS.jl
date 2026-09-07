@@ -736,7 +736,11 @@ function hseqr!(
         @inbounds for i in (ihi + 1):n
             wr[i] = H[i, i]; wi[i] = zero(T)
         end
-        info = _dlahqr!(wantt, wantz, H, ilo, ihi, wr, wi, 1, n, Z)
+        # `_dlaqr0!` (laqr.jl) is the multishift + aggressive-early-deflation driver; it falls back to
+        # `_dlahqr!` itself for an active block of `_LAQR_NMIN` or smaller, so this is the single entry
+        # point for both. It was 91% of the `geev` cell at n=1024 before the switch.
+        info = _strided1(H) ? _dlaqr0!(wantt, wantz, H, ilo, ihi, wr, wi, 1, n, Z) :
+            _dlahqr!(wantt, wantz, H, ilo, ihi, wr, wi, 1, n, Z)
         # NON-CONVERGENCE: `_dlahqr!` leaves ilo:info unwritten, yet the loop below forms w[i] for ALL i.
         # With a fresh `undef` vector that was documented garbage (reference LAPACK calls w[1:info]
         # invalid); with a BORROW it is whatever the previous occupant of those arena bytes wrote —
