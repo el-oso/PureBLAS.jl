@@ -23,6 +23,25 @@ include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate
 const OFFLOCK = []                             # (cache, level, op, uarch, size, [arm => kHz])
 const FREQMETA = []                            # (cache, reference kHz, was-backfilled)
 const EXCLUDED = Dict{Tuple{String, String, String}, Int}()   # (level, op, uarch) => cells dropped
+# (level, op, uarch) => every commit the pb arm of that op's cells was measured at. A row is honest only
+# if these agree ACROSS the whole row; see `row_commit` for what a disagreement renders as.
+const COMMITS = Dict{Tuple{String, String, String}, Vector{String}}()
+
+# The revision a ROW describes. `mixed` is not a cosmetic detail: a row whose boxes were swept at
+# different commits is exactly the provenance lie `fleet_sync.sh` exists to prevent (2026-07-31, galen
+# published a sweep stamped with a commit 13 behind the tree it ran). A targeted sweep moves one row to
+# a new revision; if it only reached two of three boxes, the row must SAY so rather than show the SHA of
+# whichever box happened to be listed first.
+function row_commit(section, op, uarchs)
+    cs = String[]
+    for ua in uarchs, c in get(COMMITS, (section, op, ua), String[])
+        push!(cs, c)
+    end
+    isempty(cs) && return ("—", "n")
+    u = unique(cs)
+    length(u) == 1 && return (first(u)[1:min(7, end)], "h")
+    return ("⚠ mixed", "hx")
+end
 
 # op => (level, types) — types are what the bench row actually exercises, not what the routine supports.
 const LEVEL = Dict{String, String}()
@@ -58,6 +77,17 @@ for path in ARGS
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
         haskey(d, "pb") || continue
+        # PROVENANCE: the commit the `pb` arm of THIS cell was measured at. Field layout per arm is
+        # `arm|timestamp|commit|freq|…|csv`, so the commit is element 3. Collected per (level, op, uarch)
+        # so the table can state, per row, the revision its numbers describe — which is the whole point
+        # of a targeted sweep: one row moves to a new revision while the rest keep theirs, and a reader
+        # can see which is which instead of assuming the table is uniform.
+        for f in p[4:end]
+            _q = split(f, "|")
+            if _q[1] == "pb" && length(_q) >= 3
+                push!(get!(COMMITS, (lvlof(lvl), op, ua), String[]), String(_q[3]))
+            end
+        end
         if !isempty(drift)                     # any arm off-lock ⇒ the RATIO is not adjudicable
             push!(OFFLOCK, (basename(path), lvlof(lvl), op, ua, sz, drift))
             EXCLUDED[(lvlof(lvl), op, ua)] = get(EXCLUDED, (lvlof(lvl), op, ua), 0) + 1
@@ -126,6 +156,10 @@ html.dark .pbg{--l:#242c3b;--m:#98a1b3;--ok:#4cc98d;--b1:#8891a3;--b2:#e0a63c;--
 .pbg td{border-left:1px solid var(--l);white-space:nowrap}
 .pbg .v{font-weight:600}
 .pbg .n{font-size:.82em;color:var(--m);margin-left:7px}
+/* provenance column: the revision a row's numbers were measured at. `hx` (mixed) is deliberately loud —
+   a row whose boxes were swept at different commits is not a uniform measurement and must not read as one. */
+.pbg td.h .n{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-left:0}
+.pbg td.hx{background:var(--b3bg)} .pbg td.hx .n{color:var(--b3);font-weight:600;margin-left:0}
 .pbg td.ok{background:var(--okbg)} .pbg td.ok .v{color:var(--ok)}
 .pbg td.b1{background:var(--b1bg)} .pbg td.b1 .v{color:var(--b1)}
 .pbg td.b2{background:var(--b2bg)} .pbg td.b2 .v{color:var(--b2)}
@@ -147,7 +181,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
     println("\n#### $section\n")
     println("```@raw html")
     println("<div class=\"pbg-wrap\"><table class=\"pbg\"><thead><tr><th>routine</th>",
-            join(("<th>$ua</th>" for ua in UARCH)), "</tr></thead><tbody>")
+            join(("<th>$ua</th>" for ua in UARCH)), "<th>swept at</th></tr></thead><tbody>")
     for op in ops
         print("<tr><th><code>$op</code></th>")
         for ua in UARCH
@@ -170,6 +204,9 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
             nx > 0 && (sz *= "<span class=\"n\">−$nx off-lock</span>")
             gstr, cls = gatestr(gate)
             print("<td class=\"$cls\"><span class=\"v\">$gstr</span>$sz</td>")
+        end
+        let (h, hcls) = row_commit(section, op, UARCH)
+            print("<td class=\"$hcls\"><span class=\"n\">$h</span></td>")
         end
         println("</tr>")
     end
