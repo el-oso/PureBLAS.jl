@@ -35,6 +35,7 @@ include("lapack/svd_dc.jl")        # LAPACK: SVD divide-and-conquer bidiagonal s
 include("lapack/eigen.jl")         # LAPACK: symmetric/Hermitian eigensolver (syev/heev) — sytrd/hetrd + steqr + ormtr/unmtr
 include("lapack/eigen_dc.jl")      # LAPACK: symmetric tridiagonal divide-and-conquer (stedc, Cuppen) — jobz='V' path
 include("lapack/lq.jl")            # LAPACK: LQ (gelqf/orglq/ormlq) — row-wise dual of QR, generic s/d/c/z
+include("lapack/bidiag_band.jl")   # LAPACK: two-stage bidiagonalization stage 1 (dense → band) — needs qr.jl + lq.jl
 include("lapack/bunchkaufman.jl")  # LAPACK: Bunch-Kaufman (sytrf/hetrf + sytrs/hetrs) symmetric-indefinite/Hermitian
 include("lapack/laqps.jl")         # LAPACK: blocked pivoted-QR panel (dlaqps) — BLAS-3 path for geqp3
 include("lapack/geqp3.jl")         # LAPACK: column-pivoted QR (geqp3) — rank-revealing, generic s/d/c/z
