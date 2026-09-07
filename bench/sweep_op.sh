@@ -28,14 +28,20 @@ OP="${1:-}"
 shift
 
 PUBLISH=1
+PARALLEL=0
+ARMS=""          # empty = every arm (pb + both references) in one window
 BOXES=()
 for a in "$@"; do
     case "$a" in
         --no-publish) PUBLISH=0 ;;
+        --parallel) PARALLEL=1 ;;
+        --arms=*) ARMS="${a#--arms=}" ;;
         -*) echo "unknown flag: $a"; exit 2 ;;
         *) BOXES+=("$a") ;;
     esac
 done
+ARMSARG=""
+[ -n "$ARMS" ] && ARMSARG="arms=$ARMS"
 [ ${#BOXES[@]} -gt 0 ] || BOXES=(galen wintermute neuromancer)
 
 SHA="$(git rev-parse HEAD)"
@@ -110,11 +116,35 @@ for b in "${BOXES[@]}"; do
 done
 
 # ── 3. measure, ALL ARMS, one op, one window per box ─────────────────────────────────────────────────
-echo "══ 3  measure op=$OP"
+echo "══ 3  measure op=$OP ${ARMSARG:+($ARMSARG)}${PARALLEL:+ }$([ "$PARALLEL" -eq 1 ] && echo '[parallel]')"
+# Boxes are independent machines, so concurrency across them costs nothing — the serialise-per-box rule
+# exists because two sweeps on ONE box contaminate each other, which this does not do. Each box's log is
+# kept whole and printed after the join, so interleaved output cannot make one box's numbers look like
+# another's.
+LOGDIR="$(mktemp -d)"
+measure_box() {
+    local b="$1"
+    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP $ARMSARG" \
+        > "$LOGDIR/$b.log" 2>&1 || echo "  $b  MEASURE FAILED (see $LOGDIR/$b.log)"
+}
+if [ "$PARALLEL" -eq 1 ]; then
+    pids=()
+    for b in "${BOXES[@]}"; do
+        echo "  ── $b  started"
+        measure_box "$b" & pids+=($!)
+    done
+    fail=0
+    for p in "${pids[@]}"; do wait "$p" || fail=1; done
+    [ "$fail" -eq 0 ] || echo "  (at least one box reported a failure)"
+else
+    for b in "${BOXES[@]}"; do
+        echo "  ── $b"
+        measure_box "$b"
+    done
+fi
 for b in "${BOXES[@]}"; do
     echo "  ── $b"
-    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP" \
-        2>&1 | grep -iE "^(L1|L2|L3|LP|CL1|CL2|CL3|CLP) +$OP|DRIFT|NOT ADJUDICABLE|ABORT|ERROR" || true
+    grep -iE "^(L1|L2|L3|LP|CL1|CL2|CL3|CLP) +$OP|DRIFT|NOT ADJUDICABLE|ABORT|ERROR" "$LOGDIR/$b.log" 2>/dev/null | sed 's/^/     /' || true
 done
 
 # ── 4. pull the caches back ──────────────────────────────────────────────────────────────────────────
