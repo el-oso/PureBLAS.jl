@@ -115,6 +115,32 @@ Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated
   `test/req8_lint_baseline.txt` (documented invariants + algorithmic tiers) to whittle down.
 - **`hpmv`** per-column only (no packed panel). (Complex-dot ABI: **resolved and forwarded**, see below.)
 
+### ⚠ TODO — REVIEW THE SAMPLING METHODOLOGY in `sweep_heavy` (raised 2026-09-07)
+`bench/plots.jl:466` takes FOUR interacting knobs per cell and it is not established that they compose
+sensibly at the large end: `samples` (Chairmarks), `seconds` (Chairmarks, 4.0 but **2.0 when s ≥ 1024**),
+`rounds = _rounds_heavy(s)` (plots.jl's own rotated-ABBA loop), and `reps = repsof(s)`
+(`_reps_cubic = clamp(20e6 ÷ s³, 1, 512)`).
+
+The specific worry: at n ≥ 1024 a Chairmarks window is capped at **2 seconds**, and one `geev` call there
+is ~0.9 s — so the window closes after roughly **two calls**, not the nominal 40 samples. The median that
+decides a gate cell is then taken over a handful of samples at exactly the sizes where a routine is
+slowest and the cell is most often marginal. Meanwhile at tiny n the same call is `reps`-multiplied up to
+512×, so the effective statistical weight across the ladder is wildly uneven — and nothing reports the
+achieved sample count per cell, so a thin cell is indistinguishable from a well-sampled one.
+
+Concrete things to establish:
+- achieved samples per (op, size, arm) — instrument and report it, so thin cells are visible;
+- whether the 2.0 s large-n cap (added to halve cost) is buying speed at the price of adjudicability;
+- whether `rounds` should scale with the observed spread rather than with size alone;
+- the interaction with `_reps_cubic` at the small end, where 512 reps per sample may be over-weighting
+  cells that are pure call overhead.
+
+Prompted by a concrete miscount: I described the cost as "40 samples × 8 rounds = 320 calls per size",
+which is wrong — the time cap binds long before 40 samples at the top of the ladder. If the cost model is
+that easy to get wrong from the outside, the achieved counts belong in the output.
+This is METHODOLOGY, so it gates the credibility of every ratio in the coverage tables; treat it as
+higher priority than any single red cell.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
