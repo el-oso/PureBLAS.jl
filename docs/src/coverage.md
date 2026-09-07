@@ -140,7 +140,7 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>gelsy</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.973</span><span class="n">n=1000</span></td><td class="b1"><span class="v">0.994</span><span class="n">n=1000</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
 <tr><th><code>geqp3</code></th><td class="b3"><span class="v">0.904</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.986</span><span class="n">n=1000</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
 <tr><th><code>geqrf</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=50</span></td><td class="b3"><span class="v">0.944</span><span class="n">n=32</span></td><td class="b2"><span class="v">0.982</span><span class="n">n=32</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
-<tr><th><code>gesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.956</span><span class="n">n=1000</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
+<tr><th><code>gesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="b2"><span class="v">0.955</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.96</span><span class="n">n=1000</span></td><td class="h"><span class="n">854b5bf</span></td></tr>
 <tr><th><code>getrf</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.952</span><span class="n">n=2100</span></td><td class="b2"><span class="v">0.963</span><span class="n">n=50</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
 <tr><th><code>getri</code></th><td class="b3"><span class="v">0.938</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.948</span><span class="n">n=1000</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
 <tr><th><code>getrs</code></th><td class="b2"><span class="v">0.953</span><span class="n">n=100</span></td><td class="b4"><span class="v">0.837</span><span class="n">n=100</span></td><td class="b4"><span class="v">0.82</span><span class="n">n=100</span></td><td class="h"><span class="n">7b4942c</span></td></tr>
@@ -203,7 +203,7 @@ html.dark .pbg-key{color:#98a1b3}
 | Bunch–Kaufman solve | sytrs, hetrs | s/d/c/z | ✅ | 1.4 | 1.32 | 1.2 | 1.67 / 1.32 | 2.06 / 1.35 |
 | Triangular solve | trtrs | s/d/c/z | ✅ | 1.03 | **0.957** | **0.878** | 1.24 / 0.994 | 1.17 / 0.957 |
 | Least-squares | gels | s/d/c/z | ✅ | 1.03 | 1.21 | 1.2 | 2.33 / 1.35 | 1.76 / 1.21 |
-| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.03 | **0.955** | **0.956** | 1.19 / 1.04 | 1.15 / 0.955 |
+| SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.03 | **0.955** | **0.959** | 1.27 / 1.05 | 1.21 / 0.955 |
 | Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | 1.01 | **0.979** | 1.02 | 1.32 / 0.979 | 1.46 / 1.07 |
 
 The `geo/worst` columns are per reference and scoped to Zen4; the per-box columns left of them are the
