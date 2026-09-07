@@ -522,7 +522,11 @@ const _BRD_NB_MAX = max(16, 2 * _vwidth(Float64))
 const _BRD_NB_CANDS = Tuple(sort!(collect(unique(
     clamp.((_vwidth(Float64) ÷ 2, _vwidth(Float64), 2 * _vwidth(Float64), _BRD_NB_MAX), 2, _BRD_NB_MAX)
 ))))::Tuple{Vararg{Int}}
-const _BRD_NB = _BRD_NB_MAX          # legacy name: buffer-sizing bound (NOT the chosen panel width)
+# NOTE (2026-09-07): this line used to read `const _BRD_NB = _BRD_NB_MAX`, and line ~559 below then
+# redefined the SAME name as the chosen panel width 8. The second definition won, so the buffer sizing
+# in `_svd_grow_bidiag!`/`_svd_grow!` (`nbb = _BRD_NB`) allocated 8 columns while `_BRD_NB_CANDS` still
+# offered 16 — exactly the invariant the comment above promises cannot break. Sizing now reads
+# `_BRD_NB_MAX` directly, so there is one name per concept and the bound is the bound.
 # PDM: Literal — machine-INVARIANT 8 on three boxes and two ISAs; a formula taking hw and ignoring it was removed. | tune: no
 const _BRD_NB_PREF = @load_preference("brd_nb", nothing)
 @static if isnothing(_BRD_NB_PREF)
@@ -630,7 +634,7 @@ const _SVDWS_C32 = SVDWorkspace{ComplexF32}()
 
 # Grow only the blocked-bidiag panels (complex values path; vectors buffers untouched).
 function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
-    nbb = _BRD_NB
+    nbb = _BRD_NB_MAX                # the CANDIDATE bound, so any nb the tuner/force-hook picks fits
     ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
     ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 4 * nbb))  # 4·nb: fused _labrd!
     ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
@@ -651,7 +655,7 @@ end
 # Grow every m≥n-path buffer to fit a reduced M×N problem forming `nu` U-columns. Buffers are pure scratch
 # (fully re-initialized per call), so growth just reallocates when too small — nothing to preserve.
 function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
-    nbb = _BRD_NB; nbt = _fh_bt_nb()
+    nbb = _BRD_NB_MAX; nbt = _fh_bt_nb()   # candidate bound, not the chosen width (see _BRD_NB_MAX)
     ldu = M % 256 == 0 ? M + 8 : M
     ldv = N % 256 == 0 ? N + 8 : N
     ws.d = _gv(ws.d, N); ws.e = _gv(ws.e, max(N, 1)); ws.tauq = _gv(ws.tauq, N); ws.taup = _gv(ws.taup, N)
@@ -683,6 +687,52 @@ function gebrd!(
     return gebrd!(A, d, e, tauq, taup, ws; nb = nb)
 end
 
+# ── power-of-two `lda` aliasing in the bidiagonalization ────────────────────────────────────────────
+# `_labrd!`'s panel walks COLUMNS of A (the reflector, and the gemv operands `As[i:m, j]`) once per
+# column of the panel, and the two trailing `gemm!`s read A directly. At an `lda` that is a multiple of
+# the L1 quarter-way stride those column walks collapse onto a few cache sets, exactly as they do in
+# `gehrd` (`_gehrd_needs_pad`, hessenberg.jl) and `potrf`. Same predicate, same remedy.
+#
+# MEASURED (wintermute Zen4, bench/probes/gebrd_po2_pad.jl, GF/s of (8/3)n³): PB holds 17.6-18.0 GF at
+# every non-po2 n from 832 to 1152 and drops to 14.65 @1024, 13.47 @1536, 10.06 @2048. Padding the
+# CALLER'S A recovers +12.4% / +4.3% / +19.2%; padding the `gebrd_X`/`gebrd_Y` workspace instead is a
+# null (−1.5% / −0.1% / +10.1%) and "both" is indistinguishable from "A padded". So it is A's stride,
+# and only A's — do not re-chase the X/Y buffers.
+#
+# The two m×n copies are nothing against the O(m·n²) reduction, and the predicate over-fires on a
+# couple of harmless sizes (896 and 1152 both satisfy it and show no loss); that is the right trade
+# here, and it is the same over-firing `_gehrd_needs_pad` accepts.
+@inline _gebrd_needs_pad(A, m::Int, n::Int) =
+    _strided1(A) && n >= 128 &&
+    (stride(A, 2) * sizeof(eltype(A))) % _ARENA_WAY_QUARTER == 0
+
+# Factor in an alias-free copy. ESCAPE AUDIT (@scope arn): `b` reaches `_gebrd_run!` and its callees,
+# which read/write it elementwise or hand it to `gemm!`/`_gemv!` as an operand; none retains it. The
+# copy-back is inside the block, and `A` — the caller's storage — is what is returned. Mirrors
+# `_gehrd_padded!` (hessenberg.jl) line for line.
+function _gebrd_padded!(
+        A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
+        tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64}, nb::Int
+    )
+    m, n = size(A)
+    @scope arn begin
+        ldb = _offway_ld(m, Float64)
+        b = borrow!(arn, Float64, m, n, ldb)
+        lda = stride(A, 2); sz = sizeof(Float64)
+        GC.@preserve A b begin
+            pa = pointer(A); pb = pointer(b)
+            @inbounds for j in 0:(n - 1)
+                unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, m)
+            end
+            _gebrd_run!(b, d, e, tauq, taup, ws, nb)
+            @inbounds for j in 0:(n - 1)          # reflectors live in A's triangles — copy ALL of it back
+                unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, m)
+            end
+        end
+    end
+    return A
+end
+
 # Blocked bidiagonalization driver (LAPACK dgebrd): blocked panels via _labrd! + two gemm! trailing
 # updates, finishing the tail with the unblocked gebd2!. Requires m ≥ n.
 function gebrd!(
@@ -692,6 +742,18 @@ function gebrd!(
     )
     m, n = size(A)
     m >= n || _throw_mge_n(:gebrd!, m, n)
+    if _gebrd_needs_pad(A, m, n)
+        return _gebrd_padded!(A, d, e, tauq, taup, ws, nb)
+    end
+    return _gebrd_run!(A, d, e, tauq, taup, ws, nb)
+end
+
+# The reduction itself, on storage whose `lda` is already alias-free (or on the caller's A when it was).
+function _gebrd_run!(
+        A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
+        tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64}, nb::Int
+    )
+    m, n = size(A)
     k = n
     nx = nb
     if k <= nx || nb < 2
