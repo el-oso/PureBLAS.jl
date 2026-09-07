@@ -262,13 +262,53 @@ function gehrd!(
         tau[i] = zero(T)
     end
     (ihi - ilo < 1) && return A
-    # BLOCKED path (real only, for now — see `_gehrd_blocked!`). The unblocked body below stays the
-    # reference and still runs for complex, for a small active block, and as the blocked driver's own
-    # tail, so it is not dead code and the correctness tests cover both.
-    if T <: BlasReal && _strided1(A) && (Int(ihi) - Int(ilo) + 1) > _GEHRD_UNBLK_MAX
-        return _gehrd_blocked!(A, Int(ilo), Int(ihi), tau)
+    # PAD FIRST, and independently of which path runs below. The power-of-two `lda` aliasing documented
+    # at `_gehrd_needs_pad` hits the COLUMN WALK, which both the blocked panel and the unblocked
+    # reduction do — so gating the pad behind the blocking dispatch leaves exactly the sizes that alias
+    # but do not block without it. Measured: at n=128 (stride 1024 B = the quarter-way, and `nh > 128`
+    # false so no blocking) padding alone is 2.9x — 5.05 ms -> 1.75 ms — and n=128 was `geev`'s worst
+    # gate cell at 0.572 while n=512/1024 passed comfortably.
+    if T <: BlasReal && _gehrd_needs_pad(A, Int(ihi) - Int(ilo) + 1)
+        return _gehrd_padded!(A, Int(ilo), Int(ihi), tau)
     end
-    return _gehd2!(A, Int(ilo), Int(ihi), tau)
+    return _gehrd_run!(A, Int(ilo), Int(ihi), tau)
+end
+
+# Path choice once aliasing is out of the way: blocked above the crossover, unblocked below. The
+# unblocked body stays the reference and still runs for complex, for a small active block, and as the
+# blocked driver's own tail, so it is not dead code and the correctness tests cover both.
+@inline function _gehrd_run!(
+        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}
+    ) where {T <: Number}
+    if T <: BlasReal && _strided1(A) && (ihi - ilo + 1) > _GEHRD_UNBLK_MAX
+        return _gehrd_blocked!(A, ilo, ihi, tau)
+    end
+    return _gehd2!(A, ilo, ihi, tau)
+end
+
+# Factor in an alias-free copy, then run whichever path fits. ESCAPE AUDIT (@scope arn): `b` reaches
+# `_gehrd_run!` and its callees, all of which read/write it elementwise or hand it to `gemm!`/`trmm!`/
+# `_gemv!` as an operand; none retains it. The copy-back is inside the block and `A` is what is returned.
+function _gehrd_padded!(
+        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}
+    ) where {T <: BlasReal}
+    n = size(A, 1)
+    @scope arn begin
+        ldb = _offway_ld(n, T)
+        b = borrow!(arn, T, n, n, ldb)
+        lda = stride(A, 2); sz = sizeof(T)
+        GC.@preserve A b begin
+            pa = pointer(A); pb = pointer(b)
+            @inbounds for j in 0:(n - 1)
+                unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, n)
+            end
+            _gehrd_run!(b, ilo, ihi, tau)
+            @inbounds for j in 0:(n - 1)
+                unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, n)
+            end
+        end
+    end
+    return A
 end
 
 # Unblocked reduction (LAPACK dgehd2), the reference path. Extracted from `gehrd!` unchanged so the
@@ -502,27 +542,9 @@ function _gehrd_blocked!(
         A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}; nb::Int = 0
     ) where {T <: BlasReal}
     n = size(A, 1)
-    # Alias-free working copy when the caller's `lda` is a way multiple. The recursive call cannot loop:
-    # `_offway_ld` is chosen so `_alias_ld` is false for it. ESCAPE AUDIT: `b` reaches only this same
-    # function and is copied back inside the block.
-    if _gehrd_needs_pad(A, ihi - ilo + 1)
-        @scope arn begin
-            ldb = _offway_ld(n, T)
-            b = borrow!(arn, T, n, n, ldb)
-            lda = stride(A, 2); sz = sizeof(T)
-            GC.@preserve A b begin
-                pa = pointer(A); pb = pointer(b)
-                @inbounds for j in 0:(n - 1)
-                    unsafe_copyto!(pb + (j * ldb) * sz, pa + (j * lda) * sz, n)
-                end
-                _gehrd_blocked!(b, ilo, ihi, tau; nb = nb)
-                @inbounds for j in 0:(n - 1)
-                    unsafe_copyto!(pa + (j * lda) * sz, pb + (j * ldb) * sz, n)
-                end
-            end
-        end
-        return A
-    end
+    # Aliasing is handled one level up, in `gehrd!` via `_gehrd_padded!` — it has to be, because the
+    # column walk that aliases is done by the unblocked path too, and that path is reached at sizes
+    # this function never sees.
     nh = ihi - ilo + 1
     # `nb > 0` is a caller override for tuning sweeps only — the same idiom `geqrf!` uses. Production
     # callers pass nothing and take the derivation.
