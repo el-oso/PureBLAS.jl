@@ -19,15 +19,26 @@ source bench/artifact_build.sh
 FORCE=""; [ "${1:-}" = "--force" ] && FORCE=1
 
 echo "══ 1  cells vs src/"
+# DISCLOSE, DO NOT REFUSE — changed 2026-09-07 when targeted sweeps landed.
+#
+# This gate used to abort. That was right while a published table said nothing about WHERE its numbers
+# came from: a stale cell then silently described code that no longer shipped, and the reader had no way
+# to tell. `bench/sweep_op.sh` makes staleness the NORMAL state by design — it re-measures one op across
+# the fleet and deliberately leaves every other row at the revision it was last measured at — so an
+# abort here would make targeted sweeps unpublishable, which defeats the point of having them.
+#
+# What replaced the prohibition is disclosure: `coverage_ops.jl` now emits a per-row "swept at" column
+# (one short SHA when the whole row agrees, a loud `⚠ mixed` when its boxes disagree). A stale row is
+# therefore visible AS stale in the artifact itself, which is the property the refusal was protecting.
+# The summary below still prints in full, so a run that quietly went stale is still loud in the log.
+#
+# The other gates stay HARD: 1b (arms measured at different clocks) and 1a2 (a local cache behind the
+# box that produced it) are not disclosable — they make a ratio wrong rather than merely old.
 if ! bench/cache_staleness.sh; then
-    if [ -n "$FORCE" ]; then
-        echo "(--force given: publishing over stale cells)"
-    else
-        echo
-        echo "REFUSING TO PUBLISH — these caches carry cells measured against code that no longer ships."
-        echo "Refresh them (PB-only group runs, per the message above) or re-run with --force."
-        exit 1
-    fi
+    echo
+    echo "NOTE: stale cells present (above). Publishing anyway — each table row states the revision it"
+    echo "was measured at in its \"swept at\" column, so a stale row is disclosed rather than hidden."
+    echo "Refresh a single row with:  bench/sweep_op.sh <op> --parallel"
 fi
 
 echo
@@ -96,14 +107,21 @@ build_artifacts || { echo "BUILD FAILED — nothing published"; exit 2; }
 
 echo
 echo "══ 3  verify the rebuild"
-bench/check_artifacts_current.sh ${FORCE:+--force} > /dev/null 2>&1
-v=$?
+# `check_artifacts_current.sh` bundles TWO checks: 1/2 cache-vs-src staleness, 2/2 committed-artifacts-
+# vs-a-fresh-rebuild. Only the SECOND belongs here. The first is step 1's business and is now disclosed
+# rather than fatal (targeted sweeps make staleness permanent by design); gating on the composite exit
+# code made every targeted publish fail with "STILL STALE AFTER REBUILD" while the artifacts were in
+# fact byte-identical to a fresh rebuild. What this step must catch is a build that is NOT a pure
+# function of the caches — so match on that line specifically.
+_av="$(bench/check_artifacts_current.sh ${FORCE:+--force} 2>&1)"; v=$?
 if [ $v -eq 2 ]; then
     echo "verifier could not run — inspect with: bench/check_artifacts_current.sh"; exit 2
-elif [ $v -ne 0 ] && [ -z "$FORCE" ]; then
-    # A rebuild that its own verifier still calls stale means the build is not a pure function of the
-    # caches. That is a bug in the pipeline, not a reason to commit.
-    echo "STILL STALE AFTER REBUILD — do not commit; run bench/check_artifacts_current.sh"; exit 1
+fi
+if ! printf '%s' "$_av" | grep -q "artifacts match a fresh rebuild"; then
+    # A rebuild whose own verifier says the artifacts differ means the build is not a pure function of
+    # the caches. That is a bug in the pipeline, not a reason to commit.
+    echo "ARTIFACTS DIFFER FROM A FRESH REBUILD — do not commit; run bench/check_artifacts_current.sh"
+    exit 1
 fi
 echo "   artifacts match a fresh rebuild"
 
