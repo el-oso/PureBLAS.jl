@@ -551,7 +551,13 @@ function _gehrd_blocked!(
     nb = clamp(nb > 0 ? nb : _gehrd_nb(nh), 1, max(nh - 1, 1))
     nb < 2 && return _gehd2!(A, ilo, ihi, tau)
     @scope arn begin
-        Y = borrow!(arn, T, ihi, nb)
+        # `Y`'s OWN leading dimension has to dodge the way stride too. `_lahr2!` walks columns of Y with
+        # `_gemv!` exactly as it walks columns of A, so a default ld of `ihi` reproduces the aliasing the
+        # caller's matrix was just padded to avoid — at n=256 that is a 2048-byte stride, half an L1 way.
+        # The tell was a non-monotonic nb sweep on locked Zen5 with A deliberately NON-aliased: nb=8/16/32
+        # all ~6.7-6.9 ms while nb=24/48 came in at 5.9/6.3 — the powers of two losing, not a block-size
+        # curve. Same remedy and same helper as the caller-side pad.
+        Y = borrow!(arn, T, ihi, nb, _offway_ld(ihi, T))
         Tm = borrow!(arn, T, nb, nb)
         Vp = borrow!(arn, T, max(ihi - ilo, 1), nb)
         Wk = borrow!(arn, T, nb, max(n, 1))
