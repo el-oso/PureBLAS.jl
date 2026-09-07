@@ -331,7 +331,28 @@ end
     nh >= 6000 && (ns = 256)
     return max(2, ns - (ns % 2))
 end
-const _LAQR_NMIN = 75      # below this, dlahqr is faster than the multishift machinery (ILAENV ispec 12)
+# Below this active-block size `dlahqr` beats the multishift machinery, so `_dlaqr0!` delegates to it.
+#
+# NOT LAPACK's 75. That value is ILAENV's, and it does not transfer: it is calibrated against reference
+# LAPACK's own `dlahqr`, whereas this repo's `_dlahqr!` is a tuned port, so the multishift path has to
+# clear a higher bar here. Below n≈200 it does not — `_dlaqr5!`'s far-field GEMM is the whole point of
+# the sweep, and at these sizes `_iparmq_ns` gives ns=10, i.e. 5 bulges accumulated into a 20-wide `U`,
+# which is too small a GEMM to pay for the AED window solve and the shift bookkeeping around it.
+#
+# MEASURED, both µarchs, `_dlaqr0!` / `_dlahqr!` on the same Hessenberg input, Chairmarks median, cold
+# operand per sample, BOTH BOXES FREQUENCY-LOCKED (>1 means the multishift driver is SLOWER):
+#     n        90    100    120    128    160    200    256
+#     Zen3   2.094  1.771  1.513  1.307  1.822  1.612  0.721
+#     Zen4   2.090  1.818  1.929  1.543  1.930  1.740  0.698
+# The two boxes agree to within a few percent and cross between 200 and 256, so this is a property of
+# the implementation rather than of one machine. 200 is the largest measured size where `dlahqr` still
+# wins; the gate ladder has nothing between 200 and 256, so any value in [200, 255] is equivalent there.
+#
+# This cost a real gate cell: at `_LAQR_NMIN = 75` the n=100 `geev` cell was 73.5% `hseqr` and failed at
+# 0.985 on locked Zen3 — the failure was this crossover, not a kernel gap.
+# req8-ok: a falsified derivation. The optimum is a property of the two drivers' relative cost, not of a
+# detected cache or ISA constant, and the fleet table above is the evidence. | tune: candidate
+const _LAQR_NMIN = 200
 const _LAQR_NIBBLE = 14    # skip a sweep when AED deflated ≥ this % of the window (ispec 14)
 const _LAQR_KNWSWP = 500   # above this nh, widen the window to 3·ns/2 (ispec 13)
 const _LAQR_KEXNW = 5      # exceptional window growth after this many deflation-free iterations
