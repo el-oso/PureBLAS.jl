@@ -262,6 +262,21 @@ function gehrd!(
         tau[i] = zero(T)
     end
     (ihi - ilo < 1) && return A
+    # BLOCKED path (real only, for now — see `_gehrd_blocked!`). The unblocked body below stays the
+    # reference and still runs for complex, for a small active block, and as the blocked driver's own
+    # tail, so it is not dead code and the correctness tests cover both.
+    if T <: BlasReal && _strided1(A) && (Int(ihi) - Int(ilo) + 1) > _GEHRD_UNBLK_MAX
+        return _gehrd_blocked!(A, Int(ilo), Int(ihi), tau)
+    end
+    return _gehd2!(A, Int(ilo), Int(ihi), tau)
+end
+
+# Unblocked reduction (LAPACK dgehd2), the reference path. Extracted from `gehrd!` unchanged so the
+# blocked driver can call it for its tail block and so complex keeps a correct route.
+function _gehd2!(
+        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}
+    ) where {T <: Number}
+    n = size(A, 1)
     # Arena borrow (arena.jl), not the old owned `gehrdv` field: the reflector staging vector, hoisted ABOVE
     # the reflector loop as @scope requires. The length is loop-invariant (only the live prefix v[1:m]
     # shrinks), and v[1:m] is fully written from A before it is read each iteration, so no fill!. Exact
@@ -286,6 +301,229 @@ function gehrd!(
             i < n && _house_left!(view(A, (i + 1):ihi, (i + 1):n), vv, conj(τ))  # A := H(i)ᴴ·A (left, conj τ)
             A[i + 1, i] = β                                # subdiagonal element
         end
+    end
+    return A
+end
+
+# ── Blocked Hessenberg reduction (LAPACK dgehrd + dlahr2) ───────────────────────────────────────────────
+#
+# WHY: the unblocked reduction above is BLAS-2 throughout — one `_larf_right!` + one `_house_left!` per
+# column, both rank-1 over the whole trailing matrix. The reference is blocked and spends its time in
+# GEMM, and the gap that opens is not a constant factor but a widening one: measured on Zen5 at n=256 /
+# 512 / 1024 the ref/PB ratio for `gehrd` alone was 0.033 / 0.017 / 0.012, i.e. 30x -> 82x, which is the
+# signature of a level-2-versus-level-3 gap rather than a kernel gap (kb: geev-gap-is-an-unblocked-gehrd).
+# `gehrd!` is 69% of the eigenvalues-only `geev!` the gate benchmarks, and `geev` is the worst cell on the
+# fleet — 0.076 Zen4 / 0.039 Zen3 / 0.065 Zen5 at n=1024. The docstring above has called this out as
+# "the perf follow-up — flagged, not built" since the routine landed.
+#
+# WHAT: `_lahr2!` is a faithful dlahr2 port. It reduces `nb` panel columns while ACCUMULATING
+# `Y = A·V·T`, which is what lets the trailing matrix be updated with a single rank-nb GEMM per panel
+# instead of a rank-1 update per column. The structure mirrors `_labrd!` (svd.jl), this codebase's
+# existing blocked-reduction panel: same `_gemv!`-direct idiom, same "copy a strided row into a
+# contiguous temp before the gemv" shape.
+#
+# REAL ONLY for now, deliberately. `bench/plots.jl:1003` benchmarks `geev` on `randn(Float64, s, s)`, so
+# the real path closes the measured cell; zlahr2 needs conjugation in six places and is a separate port
+# with its own correctness surface. Complex keeps the unblocked route, which is correct and merely slow —
+# the same real/complex split `_labrd!` / `_labrd_seq!` already uses.
+
+# nb: DERIVED, and the derivation is borrowed rather than invented. `_qr_nb`'s criterion is L2 residency
+# of the reflector panel under a register-invariant cap, and gehrd's panel is the same shape (ihi×nb held
+# across a trailing GEMM) with the same access pattern, so the same ramp applies. Reusing it also means a
+# future re-derivation of the QR ramp carries here for free instead of drifting.
+@inline _gehrd_nb(nh::Int) = _qr_nb(nh, nh)
+
+# Unblocked→blocked crossover. LITERAL, and flagged as such (req#8b): LAPACK's own ILAENV ships nx=128
+# for dgehrd, and this is that value pending a fleet sweep of the crossover — the blocked path must
+# amortize one Y accumulation plus a WY apply over the panel, so it loses on a small active block, but
+# WHERE it loses has not been measured here on any µarch. Do not read 128 as derived.
+# ponytail: measure the crossover per µarch and derive it, once the geev cells are green. | tune: candidate
+const _GEHRD_UNBLK_MAX = 128
+
+# Tiny triangular kernels for the panel. nb ≤ 32, so these are O(nb²) scalar loops rather than `trmv!`
+# calls: at this size the public wrapper's kwarg dispatch dominates the arithmetic, the same reason
+# `_labrd!` reaches for `_gemv!` instead of `gemv!`. Loop directions are chosen so each `w[i]` is written
+# only after every entry it reads — ascending for the two that read w[r≥i], descending for the others.
+@inline function _lahr_LTU!(w, V, m::Int)          # w := tril(V, unit)ᵀ·w
+    @inbounds for i in 1:m
+        s = w[i]
+        for r in (i + 1):m
+            s = muladd(V[r, i], w[r], s)
+        end
+        w[i] = s
+    end
+    return w
+end
+@inline function _lahr_UTN!(w, U, m::Int)          # w := triu(U)ᵀ·w
+    @inbounds for i in m:-1:1
+        s = U[i, i] * w[i]
+        for r in 1:(i - 1)
+            s = muladd(U[r, i], w[r], s)
+        end
+        w[i] = s
+    end
+    return w
+end
+@inline function _lahr_LNU!(w, V, m::Int)          # w := tril(V, unit)·w
+    @inbounds for i in m:-1:1
+        s = w[i]
+        for r in 1:(i - 1)
+            s = muladd(V[i, r], w[r], s)
+        end
+        w[i] = s
+    end
+    return w
+end
+@inline function _lahr_UNN!(w, U, m::Int)          # w := triu(U)·w
+    @inbounds for i in 1:m
+        s = U[i, i] * w[i]
+        for r in (i + 1):m
+            s = muladd(U[i, r], w[r], s)
+        end
+        w[i] = s
+    end
+    return w
+end
+
+# Direct gemv, as `_labrd!`'s `_lg!` — skips the kwarg wrapper's dispatch in a loop of tiny calls.
+@inline _hg!(yv, Av, xv, α::T, β::T, tr::Bool) where {T} =
+    _gemv!(tr, false, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
+
+# LAPACK dlahr2: reduce panel columns k..k+nb-1 of A(1:ihi, :), producing the reflectors (in A, below the
+# subdiagonal), `tau[k..k+nb-1]`, the nb×nb block factor `Tm`, and `Y[1:ihi, 1:nb] = A·V·T`.
+# Index map from the reference, which passes `A(1,K)` and works in a local frame: local `A(r,c)` is global
+# `A[r, k+c-1]`, and local row `K+j` is global row `k+j`. `w`/`tmp` are nb-length scratch.
+function _lahr2!(
+        A::AbstractMatrix{T}, k::Int, nb::Int, ihi::Int, tau::AbstractVector{T},
+        Tm::AbstractMatrix{T}, Y::AbstractMatrix{T}, w::AbstractVector{T}, tmp::AbstractVector{T}
+    ) where {T <: BlasReal}
+    ei = zero(T)
+    @inbounds for j in 1:nb
+        col = k + j - 1                                   # global column this reflector zeroes below
+        if j > 1
+            jm = j - 1
+            # A(k+1:ihi, col) -= Y(k+1:ihi, 1:j-1) · A(col, k:col-1)ᵀ   (a ROW of A → contiguous temp)
+            for t in 1:jm
+                tmp[t] = A[col, k + t - 1]
+            end
+            _hg!(view(A, (k + 1):ihi, col), view(Y, (k + 1):ihi, 1:jm), view(tmp, 1:jm), -one(T), one(T), false)
+            # Apply I − V·T·Vᵀ to that column from the left.
+            for t in 1:jm
+                w[t] = A[k + t, col]
+            end
+            _lahr_LTU!(w, view(A, (k + 1):(k + jm), k:(col - 1)), jm)
+            _hg!(view(w, 1:jm), view(A, (k + j):ihi, k:(col - 1)), view(A, (k + j):ihi, col), one(T), one(T), true)
+            _lahr_UTN!(w, view(Tm, 1:jm, 1:jm), jm)
+            _hg!(view(A, (k + j):ihi, col), view(A, (k + j):ihi, k:(col - 1)), view(w, 1:jm), -one(T), one(T), false)
+            _lahr_LNU!(w, view(A, (k + 1):(k + jm), k:(col - 1)), jm)
+            for t in 1:jm
+                A[k + t, col] -= w[t]
+            end
+            A[col, col - 1] = ei                          # restore the subdiagonal the previous step held at 1
+        end
+        # H(j) annihilating A(k+j+1:ihi, col); `_larfg!` leaves v in x[2:end] and x[1] as α.
+        β, τ = _larfg!(view(A, (k + j):ihi, col))
+        tau[col] = τ
+        ei = β
+        A[k + j, col] = one(T)
+        # Y(k+1:ihi, j) = A(k+1:ihi, k+j:ihi)·v, then corrected by the earlier columns and scaled by τ.
+        _hg!(view(Y, (k + 1):ihi, j), view(A, (k + 1):ihi, (k + j):ihi), view(A, (k + j):ihi, col), one(T), zero(T), false)
+        if j > 1
+            jm = j - 1
+            _hg!(view(Tm, 1:jm, j), view(A, (k + j):ihi, k:(col - 1)), view(A, (k + j):ihi, col), one(T), zero(T), true)
+            _hg!(view(Y, (k + 1):ihi, j), view(Y, (k + 1):ihi, 1:jm), view(Tm, 1:jm, j), -one(T), one(T), false)
+        end
+        for r in (k + 1):ihi
+            Y[r, j] *= τ
+        end
+        if j > 1
+            jm = j - 1
+            for t in 1:jm
+                Tm[t, j] *= -τ
+            end
+            _lahr_UNN!(view(Tm, 1:jm, j), view(Tm, 1:jm, 1:jm), jm)
+        end
+        Tm[j, j] = τ
+    end
+    A[k + nb, k + nb - 1] = ei
+    # Y(1:k, 1:nb): the rows ABOVE the panel, which the column loop never touches.
+    if k >= 1
+        @inbounds for c in 1:nb, r in 1:k
+            Y[r, c] = A[r, k + c]
+        end
+        trmm!(view(Y, 1:k, 1:nb), view(A, (k + 1):(k + nb), k:(k + nb - 1)); side = 'R', uplo = 'L', diag = 'U')
+        if ihi > k + nb
+            gemm!(
+                view(Y, 1:k, 1:nb), view(A, 1:k, (k + nb + 1):ihi), view(A, (k + nb + 1):ihi, k:(k + nb - 1));
+                alpha = one(T), beta = one(T)
+            )
+        end
+        trmm!(view(Y, 1:k, 1:nb), view(Tm, 1:nb, 1:nb); side = 'R', uplo = 'U')
+    end
+    return A
+end
+
+# Blocked driver (LAPACK dgehrd). Panels of `nb` through `_lahr2!`, each followed by the rank-nb right
+# update and one WY block-reflector apply on the left; the tail below the crossover finishes unblocked.
+#
+# ESCAPE AUDIT (@scope arn): none of `Y`/`Tm`/`Vp`/`Wk`/`w`/`tmp` leaves the block. They reach `_lahr2!`
+# (which only reads/writes them elementwise and through `_gemv!`/`trmm!`/`gemm!`, none of which retain an
+# operand), `wy_apply!` via a `WYApplyWorkspace` built HERE from the same borrows, and `gemm!`/`trmm!` as
+# operands. `_gehd2!` opens its own nested scope for its staging vector, bump-allocated after these and
+# released first. What is returned is the caller's `A`.
+function _gehrd_blocked!(
+        A::AbstractMatrix{T}, ilo::Int, ihi::Int, tau::AbstractVector{T}
+    ) where {T <: BlasReal}
+    n = size(A, 1)
+    nh = ihi - ilo + 1
+    nb = clamp(_gehrd_nb(nh), 1, max(nh - 1, 1))
+    nb < 2 && return _gehd2!(A, ilo, ihi, tau)
+    @scope arn begin
+        Y = borrow!(arn, T, ihi, nb)
+        Tm = borrow!(arn, T, nb, nb)
+        Vp = borrow!(arn, T, max(ihi - ilo, 1), nb)
+        Wk = borrow!(arn, T, nb, max(n, 1))
+        Gm = borrow!(arn, T, nb, nb)
+        w = borrow!(arn, T, nb)
+        tmp = borrow!(arn, T, nb)
+        ws = WYApplyWorkspace{T, typeof(Vp)}(Vp, Gm, Wk)
+        i = ilo
+        while ihi - i > _GEHRD_UNBLK_MAX
+            ib = min(nb, ihi - i)
+            ib < 2 && break
+            _lahr2!(A, i, ib, ihi, tau, Tm, Y, w, tmp)
+            # Right update: A(1:ihi, i+ib:ihi) -= Y·V ᵀ, with V's leading entry held at 1 for the GEMM.
+            ei = A[i + ib, i + ib - 1]
+            A[i + ib, i + ib - 1] = one(T)
+            gemm!(
+                view(A, 1:ihi, (i + ib):ihi), view(Y, 1:ihi, 1:ib), view(A, (i + ib):ihi, i:(i + ib - 1));
+                transB = 'T', alpha = -one(T), beta = one(T)
+            )
+            A[i + ib, i + ib - 1] = ei
+            # The columns INSIDE the panel that the rank-nb update above does not reach.
+            if ib > 1
+                trmm!(
+                    view(Y, 1:i, 1:(ib - 1)), view(A, (i + 1):(i + ib - 1), i:(i + ib - 2));
+                    side = 'R', uplo = 'L', transA = 'T', diag = 'U'
+                )
+                @inbounds for c in 1:(ib - 1), r in 1:i
+                    A[r, i + c] -= Y[r, c]
+                end
+            end
+            # Left apply of the block reflector to everything right of the panel.
+            if i + ib <= n
+                mv = ihi - i
+                @inbounds for c in 1:ib, r in 1:mv
+                    Vp[r, c] = r == c ? one(T) : (r > c ? A[i + r, i + c - 1] : zero(T))
+                end
+                wy_apply!(
+                    'T', view(A, (i + 1):ihi, (i + ib):n), view(Vp, 1:mv, 1:ib),
+                    view(Tm, 1:ib, 1:ib), ws
+                )
+            end
+            i += ib
+        end
+        _gehd2!(A, i, ihi, tau)
     end
     return A
 end

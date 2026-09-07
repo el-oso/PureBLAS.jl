@@ -861,7 +861,12 @@ end
 @testitem "gehrd (Hessenberg reduction) vs LAPACK — H = Qᴴ·A·Q reconstruct, orghr Q unitary" begin
     using PureBLAS, LinearAlgebra
     maxe(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(y)), 1.0e-300)
-    @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (1, 2, 5, 20, 64)
+    # n=160 is ABOVE `_GEHRD_UNBLK_MAX` (128), so it is the only size here that reaches the blocked
+    # driver — every smaller one exercises the unblocked reference path only. Without it the blocked
+    # `gehrd!`/`_lahr2!` added for the geev gap would have shipped with no test coverage at all. The
+    # real types route through the blocked path at that size; the complex ones stay unblocked by
+    # design, so this one size covers both halves of the dispatch.
+    @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (1, 2, 5, 20, 64, 160)
         A0 = randn(T, n, n)
         H = copy(A0); tau = zeros(T, max(n - 1, 0)); PureBLAS.gehrd!(H, 1, n, tau)
         Q = PureBLAS.orghr!(copy(H), 1, n, tau)
