@@ -16,6 +16,95 @@
 # singular value (the spectrum shows a >10-order gap between the smallest true σ and the null cluster).
 @inline _gelsd_eps(::Type{R}, mn::Int) where {R <: Real} = R(max(mn, 1)) * eps(R)
 
+# ── Fast full-rank path: solve the BIDIAGONAL, never form the singular vectors ─────────────────────────
+# gelsd needs the SVD only to DETECT rank. For a full-rank A the minimum-norm solution IS the ordinary
+# least-squares solution, and `gebrd!` already hands us A = Q·B·Pᵀ with B upper bidiagonal — so
+# min‖A·x − b‖ becomes min‖B·y − Qᵀb‖ with x = P·y, and that bidiagonal solve is O(n) back-substitution.
+# Both singular-vector sets drop out; the SVD shrinks to a values-only dqds on the bidiagonal.
+#
+# WHY (kb `gelsd-forms-vectors-lapack-does-not.md`): PB's gelsd at n=1000 was 412.5 ms vs LAPACK's
+# 209.0. `gebrd` itself is at PARITY (148.2 vs 152.0) — the whole gap is that we compose a full economy
+# SVD (`gesvd!` = 89.8% of PB's time) where dgelsd's `dlalsd` applies its D&C directly to the RHS and
+# never forms U or V. Rather than port dlasda/dlalsa, drop the vectors entirely. Measured pricing of
+# gebrd + values-only dqds against the reference (bench/probes/gelsd_valsonly.jl, Zen4):
+#     n=256   9.511 ms ref vs 5.338 → 1.78      n=512  62.272 vs 41.311 → 1.51
+#     n=1000  211.593 ms ref vs 179.410 → 1.18   (the O(n²) applies below are inside the noise)
+#
+# WHEN IT DECLINES. Rank deficiency is the reason gelsd exists, and at the rank cut the two paths'
+# null-σ floors differ by a few ulp — so a bare `rank == n` test would let a ~1e-16 pivot into the
+# back-substitution and return a ‖x‖~1e14 answer where the SVD path returns the min-norm solution. The
+# guard therefore demands a MARGIN: σ_min > √eps·σ₁ (κ₂ < 6.7e7). That also bounds the solve: for an
+# upper bidiagonal B, ‖B⁻¹‖ ≥ 1/|dᵢ| for every i, hence |dᵢ| ≥ σ_min > 0 — no tiny pivot is reachable.
+# Anything below the margin falls back to the composed SVD, which is what the SVD is FOR.
+#
+# Returns the rank (== n) when it solved, 0 when it declined and the caller must take the SVD path (B is
+# untouched in that case; only `s` has been written, with the same singular values the SVD path produces).
+_gelsd_fast!(::AbstractMatrix, ::AbstractMatrix, ::Real, ::AbstractVector) = 0
+
+function _gelsd_fast!(
+        A::AbstractMatrix{Float64}, B::AbstractMatrix{Float64}, rcond::Real,
+        s::AbstractVector{Float64}
+    )
+    m, n = size(A)
+    (m >= n && n >= 1) || return 0                # m<n is min-norm-underdetermined: not a back-substitution
+    ws = _svdws(Float64)
+    _svd_grow_bidiag!(ws, m, n)
+    ws.d = _gv(ws.d, n); ws.e = _gv(ws.e, max(n, 1))
+    ws.tauq = _gv(ws.tauq, n); ws.taup = _gv(ws.taup, n)
+    # `VQ` is the SVD path's Q-reflector panel; here it holds gebrd's whole output, whose lower triangle
+    # IS that panel. A `Matrix` (not an arena borrow) on purpose: `_house_left!` takes its SIMD path only
+    # for a `_dense1` v, and a column view of a `PtrMatrix` is not a `StridedVector` (ptrmat.jl) — it
+    # would have silently walked scalar over the O(m·n) reflector applies.
+    ws.VQ = _gm(ws.VQ, m, n)
+    ne = max(n - 1, 0)
+    Ac = view(ws.VQ, 1:m, 1:n)
+    d = view(ws.d, 1:n); e = view(ws.e, 1:ne)
+    tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
+    @inbounds for j in 1:n, i in 1:m
+        Ac[i, j] = A[i, j]
+    end
+    gebrd!(Ac, d, e, tauq, taup, ws)              # A = Q·B·Pᵀ, B upper bidiagonal (d, e)
+    @scope arn begin
+        # Singular VALUES on a COPY — dqds destroys its (d,e), and (d,e) is the operator we solve with.
+        # The copy of d lands directly in the caller's `s`, which is where the values belong anyway.
+        ecp = borrow!(arn, Float64, max(ne, 1))
+        @inbounds for i in 1:n
+            s[i] = d[i]
+        end
+        @inbounds for i in 1:ne
+            ecp[i] = e[i]
+        end
+        sv = view(s, 1:n); ev = view(ecp, 1:ne)
+        _dlasq1!(sv, ev, ws.dqds_Z, ws.dqds_st) != 0 && bdsqr!(sv, ev, nothing, nothing)
+        rcnd = (rcond <= 0 || rcond >= 1) ? _gelsd_eps(Float64, n) : Float64(rcond)
+        (sv[n] > rcnd * sv[1] && sv[n] > sqrt(eps(Float64)) * sv[1]) || return 0
+    end
+    nrhs = size(B, 2)
+    # c := Qᵀ·b.  Q = H₁⋯H_n ⇒ Qᵀ = H_n⋯H₁, so apply in FORWARD order. H_i acts on rows i:m with
+    # v_i[1] ≡ 1 (`_house_left!` ignores v[1]; the diagonal of Ac holds d, not the unit).
+    # NOTE for the C-ABI arity (cabi_lapack.jl): there `B` is a `PtrMatrix`, and a SubArray of one is not
+    # a `StridedMatrix`, so `_strided1` is false and this walks the scalar arm — O(m·n·nrhs), ~1% of the
+    # routine at n=1000, nrhs=1. Widening `_strided1` to SubArrays-of-PtrMatrix touches every kernel, so
+    # it is not done here; revisit if a wide-nrhs C-ABI caller ever makes it matter.
+    @inbounds for i in 1:n
+        _house_left!(view(B, i:m, 1:nrhs), view(Ac, i:m, i), tauq[i])
+    end
+    # y := B⁻¹·c.  Rows n+1:m of c are the least-squares residual and drop out of the solve.
+    @inbounds for jc in 1:nrhs
+        B[n, jc] /= d[n]
+        for i in (n - 1):-1:1
+            B[i, jc] = (B[i, jc] - e[i] * B[i + 1, jc]) / d[i]
+        end
+    end
+    # x := P·y.  P = R₁⋯R_{n−1} ⇒ apply in REVERSE order. R_i acts on rows i+1:n with w_i[1] ≡ 1 (at
+    # column i+1) and w_i[2:] = Ac[i, i+2:n] — a ROW slice, hence the scalar `_house_left!` arm; it is
+    # O(n²) total against the O(m·n²) bidiagonalization.
+    @inbounds for i in (n - 1):-1:1
+        _house_left!(view(B, (i + 1):n, 1:nrhs), view(Ac, i, (i + 1):n), taup[i])
+    end
+    return n
+end
+
 # Solve min‖A·X − B‖₂ (A m×n). B is size ≥ max(m,n) × nrhs (LAPACK ldb): input rows 1:m hold b,
 # output rows 1:n hold X. rcond thresholds the singular values (∉(0,1) ⇒ machine precision, per
 # dlalsd). Overwrites A and B. Returns (B, rank, s) with s the descending singular values (length
@@ -36,6 +125,10 @@ function gelsd!(
     (Base.mightalias(s, A) || Base.mightalias(s, B)) &&
         throw(ArgumentError("gelsd!: `s` must not alias `A` or `B`"))
     mn == 0 && return B, 0, s
+    # Full-rank, well-conditioned, real, m ≥ n ⇒ solve the bidiagonal directly and skip both singular
+    # vector sets (see `_gelsd_fast!`). It returns 0 — having touched only `s` — when it declines.
+    rkf = _gelsd_fast!(A, B, rcond, s)
+    rkf > 0 && return B, rkf, s
     sv = view(s, 1:mn)
     # economy SVD  A = U·diag(s)·Vᴴ  (U m×mn, s descending, Vt = Vᴴ mn×n). All four are borrowed at the
     # exact shape with the default (exact) ld — same criterion as gels!: `_wsgrow` already gives ld =
