@@ -353,6 +353,14 @@ end
 # req8-ok: a falsified derivation. The optimum is a property of the two drivers' relative cost, not of a
 # detected cache or ISA constant, and the fleet table above is the evidence. | tune: candidate
 const _LAQR_NMIN = 200
+
+# ILAENV's 75, kept SEPARATE and at LAPACK's value. Reference LAPACK uses one constant for two jobs —
+# the dlahqr fallback above, and the "expect enough deflation that another sweep is wasted" test in the
+# driver — because for it they are the same notion of "small". They are not the same here: raising the
+# fallback to 200 also raised the skip threshold, which changed behaviour at sizes whose DRIVER CHOICE
+# was untouched. Measured on locked Zen3, ref/pb: n=512 1.371 -> 1.233 and n=1024 1.414 -> 1.242, a
+# 10-12% regression on identical code paths. The deflation heuristic keeps its own calibrated value.
+const _LAQR_SKIPMIN = 75
 const _LAQR_NIBBLE = 14    # skip a sweep when AED deflated ≥ this % of the window (ispec 14)
 const _LAQR_KNWSWP = 500   # above this nh, widen the window to 3·ns/2 (ispec 13)
 const _LAQR_KEXNW = 5      # exceptional window growth after this many deflation-free iterations
@@ -650,7 +658,7 @@ function _dlaqr0!(
             kbot -= ld
             ks = kbot - ls + 1
             # ---- skip the sweep when AED deflated enough that another one is likely wasted ----
-            if ld == 0 || (100 * ld <= nw * _LAQR_NIBBLE && kbot - ktop + 1 > min(_LAQR_NMIN, nwmax))
+            if ld == 0 || (100 * ld <= nw * _LAQR_NIBBLE && kbot - ktop + 1 > min(_LAQR_SKIPMIN, nwmax))
                 ns = min(nsmax, nsr, max(2, kbot - ktop))
                 ns -= ns % 2
                 if ndfl % _LAQR_KEXSH == 0
