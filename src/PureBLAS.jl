@@ -42,6 +42,7 @@ include("lapack/gels.jl")          # LAPACK: least-squares / min-norm solve (gel
 include("lapack/gecon.jl")         # LAPACK: condition estimation (gecon/trcon/pocon) — Higham–Hager estimator
 include("lapack/hessenberg.jl")    # LAPACK: Hessenberg reduction (gebal/gehrd/orghr) — nonsymmetric-eigen front half
 include("lapack/hseqr.jl")         # LAPACK: Schur decomposition of upper-Hessenberg (hseqr, Francis double-shift QR)
+include("lapack/laqr.jl")          # LAPACK: multishift QR + aggressive early deflation (dlaqr0/5) — hseqr's perf path
 include("lapack/trevc.jl")         # LAPACK: right eigenvectors of Schur form (trevc, back-substitution)
 include("lapack/geev.jl")          # LAPACK: general eigensolver drivers (geev/gees + gebak) — eigen/eigvals/schur
 include("lapack/sygvd.jl")         # LAPACK: generalized sym/Herm-definite eigensolver (sygvd/hegvd) — eigen(Sym,Sym)
