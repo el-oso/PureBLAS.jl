@@ -132,7 +132,7 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th><th>swept at</th><th>toolchain</th></tr></thead><tbody>
-<tr><th><code>gbtrf</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">efd357a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
+<tr><th><code>gbtrf</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">efd357a</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>gbtrs</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.03</span></td><td><span class="n">—</span></td><td class="h"><span class="n">42563f8</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>geev</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.933</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.939</span><span class="n">n=256</span></td><td class="h"><span class="n">a1742db</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>gels</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.21</span></td><td class="ok"><span class="v">1.2</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
@@ -149,8 +149,8 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>gttrs</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.05</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>pbtrfU</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.92</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.854</span><span class="n">n=128</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>potrf</code></th><td class="b4"><span class="v">0.759</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=2100</span></td><td class="b2"><span class="v">0.965</span><span class="n">n=2100</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>potrfU</code></th><td class="b4"><span class="v">0.783</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.945</span><span class="n">n=1000</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
+<tr><th><code>potrf</code></th><td class="b4"><span class="v">0.772</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=2100</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=8</span></td><td class="h"><span class="n">ef1793a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
+<tr><th><code>potrfU</code></th><td class="b4"><span class="v">0.779</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=1000</span></td><td class="h"><span class="n">ef1793a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
 <tr><th><code>potri</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.04</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>potrsL</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>potrsU</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=512</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
@@ -191,8 +191,8 @@ html.dark .pbg-key{color:#98a1b3}
 
 | Op | Routines | Types | Routes | Zen3 | Zen4 | Zen5 | Zen4 vs OB geo/worst | Zen4 vs AOCL geo/worst |
 |---|---|---|---|---|---|---|---|---|
-| Cholesky (lower) | potrf | s/d/c/z | ✅ | **0.759** | **0.948** | **0.964** | 1.49 / 1.05 | 1.56 / 0.948 |
-| Cholesky (upper) | potrf `uplo='U'` | s/d/c/z | ✅ | **0.783** | **0.918** | **0.945** | 1.5 / 1.09 | 1.35 / 0.918 |
+| Cholesky (lower) | potrf | s/d/c/z | ✅ | **0.772** | **0.958** | **0.958** | 1.47 / 0.971 | 1.54 / 0.958 |
+| Cholesky (upper) | potrf `uplo='U'` | s/d/c/z | ✅ | **0.782** | **0.918** | **0.949** | 1.5 / 1.03 | 1.35 / 0.918 |
 | Cholesky solve | potrs | s/d/c/z | ✅ | **0.984** | 1.02 | **0.792** | 2.83 / 1.17 | 1.25 / 1.02 |
 | Pivoted Cholesky | pstrf | s/d/c/z | ✅ | **0.936** | **0.915** | **0.946** | 1.31 / 0.915 | 1.27 / 0.97 |
 | LU | getrf, gesv | s/d/c/z | ✅ | 1.01 | **0.952** | **0.963** | 1.36 / 1.05 | 1.46 / 0.952 |
