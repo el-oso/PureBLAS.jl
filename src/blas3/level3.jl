@@ -3538,7 +3538,18 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
         # reads and writes B IN PLACE, so its reversal would have to be applied twice consistently. The
         # scalar packs get the flip for free in their index arithmetic. Cost is one O(KC·NR) pack per
         # stripe against O(KC²·NR) of solve — measure before reaching for the vector variants.
-        useT = _GT_TRANSPOSE
+        # `!rev` on the 8-wide pack but NOT the 4-wide one below, because that is where they MEASURED
+        # differently — potrfU native arm, µs, after the reversed packs landed:
+        #     n            512     768    1000
+        #     galen  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
+        #     neuro  W=8  lever 1709.7  5536.7 11996.1   native 2126.0  6759.3 14666.8   (−24/−22/−22%)
+        # and neuromancer's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
+        # reversal made it worse, not better. Hypothesis (not verified): reversing 8 f64 lanes is a full
+        # cross-lane vpermpd per vector — 16 per block across pack+unpack, on top of `_tr8x8`'s own
+        # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
+        # which is what it did before and what measured better. The 8-wide reversed code stays (it is
+        # correct, and verified) so a future profile can re-test it cheaply.
+        useT = _GT_TRANSPOSE && !rev
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         # `!rev` on fusedT and NOT on useT: the fusedT slabs SKIP the pack round-trip entirely (they read
