@@ -1,0 +1,15 @@
+# Build-tool environment for the `juliac --trim` .so build. Deliberately SEPARATE from the package's
+# own Project.toml: JuliaC is a build tool, not a dependency of PureBLAS, and the shipped package must
+# not gain a dep for it.
+#
+# WHY IT EXISTS AT ALL. Julia 1.12 shipped the juliac driver in-tree at share/julia/juliac/juliac.jl.
+# Julia 1.13 REMOVED it — rc4 carries only share/julia/test/trimming/juliac-*.jl, which are test
+# fixtures, not the driver — because it was extracted into the registered package JuliaC.jl
+# (JuliaLang/JuliaC.jl). `juliac/build.jl` falls back to this environment when the in-tree script is
+# absent, which is every Julia >= 1.13.
+[deps]
+JuliaC = "acedd4c2-ced6-4a15-accc-2607eb759ba2"
+
+[compat]
+JuliaC = "0.3"
+julia = "1.12"
