@@ -2878,14 +2878,29 @@ end
 # AVX2 vectorized transpose pack (W==4): B[:,jc:jc+wid) → P row-major via 4×4 transpose for full 4-row×4-col
 # blocks, scalar tails/zero-pad. Replaces the scalar rowouter/column-outer pack (Fable: ~20-25% of the AVX2
 # leaf's cycles). Same row-major P layout the slab reads — no microkernel change.
+# `rev` folds the anti-transpose's row reversal (P row i ← B row KC-1-i) into the vectorised pack, so
+# `trsm(side='L', uplo='U', transA='T')` keeps the 4×4 transpose instead of falling to the scalar pack.
+# The block for P rows i0..i0+3 comes from B rows KC-4-i0..KC-1-i0 — one contiguous vector load, as
+# before — with the LANES reversed so lane l holds B row KC-1-i0-l. After `_tr4x4`, y_l[v] = B row
+# KC-1-i0-l, which is exactly P row i0+l. Row coverage stays disjoint: the vector part takes B rows
+# KC-ng..KC-1 and the ragged tail takes 0..KC-1-ng.
+#
+# WHY IT EXISTS: routing `rev` to the scalar pack first (the cheap first cut) measured a 7-63% residual
+# against the no-trans leaf on galen — pack+unpack is 2·KC·n elements against KC²·n of solve, i.e. ~2/KC
+# of the work, so a scalar pack an order slower than this one lands right on that residual. The "~1%"
+# estimate that justified the scalar cut assumed the per-element cost stayed comparable; it does not.
 @inline function _fused_packP_tr4!(
         Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
-        KC::Int, NR::Int, sz::Int
+        KC::Int, NR::Int, sz::Int, rev::Bool = false
     )
     V = Vec{4, Float64}; ng = (KC >> 2) << 2; ncg = (wid >> 2) << 2
     @inbounds for i0 in 0:4:(ng - 1), vb in 0:4:(ncg - 1)
-        b = pB + (i0 + (jc + vb) * ldb) * sz
+        b = pB + ((rev ? KC - 4 - i0 : i0) + (jc + vb) * ldb) * sz
         x0 = vload(V, b); x1 = vload(V, b + ldb * sz); x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
+        if rev
+            x0 = shufflevector(x0, Val((3, 2, 1, 0))); x1 = shufflevector(x1, Val((3, 2, 1, 0)))
+            x2 = shufflevector(x2, Val((3, 2, 1, 0))); x3 = shufflevector(x3, Val((3, 2, 1, 0)))
+        end
         y0, y1, y2, y3 = _tr4x4(x0, x1, x2, x3)
         p = Pp + (i0 * NR + vb) * sz
         vstore(y0, p); vstore(y1, p + NR * sz); vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
@@ -2893,39 +2908,52 @@ end
     @inbounds for v in ncg:(wid - 1)                          # tail columns (contiguous B reads down the column)
         scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
         for i in 0:(KC - 1)
-            unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + i * sz))
+            unsafe_store!(dcol + i * NR * sz, unsafe_load(scol + (rev ? KC - 1 - i : i) * sz))
         end
     end
     @inbounds for i in ng:(KC - 1)                            # tail rows (only full-col groups left)
         for v in 0:(ncg - 1)
-            unsafe_store!(Pp + (i * NR + v) * sz, unsafe_load(pB + (i + (jc + v) * ldb) * sz))
+            unsafe_store!(
+                Pp + (i * NR + v) * sz,
+                unsafe_load(pB + ((rev ? KC - 1 - i : i) + (jc + v) * ldb) * sz)
+            )
         end
     end
     return @inbounds for v in wid:(NR - 1), i in 0:(KC - 1)
         unsafe_store!(Pp + (i * NR + v) * sz, zero(Float64))
     end
 end
+# Mirror of the pack: after `_tr4x4`, x_v[l] is P row i0+l, and it belongs at B row KC-1-i0-l. Writing a
+# contiguous vector at B row KC-4-i0 means slot j lands at KC-4-i0+j, so the stored lane order is the
+# reverse of x_v — hence the same `shufflevector` on the STORE side.
 @inline function _fused_unpackP_tr4!(
         Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, wid::Int,
-        KC::Int, NR::Int, sz::Int
+        KC::Int, NR::Int, sz::Int, rev::Bool = false
     )
     V = Vec{4, Float64}; ng = (KC >> 2) << 2; ncg = (wid >> 2) << 2
     @inbounds for i0 in 0:4:(ng - 1), vb in 0:4:(ncg - 1)
         p = Pp + (i0 * NR + vb) * sz
         y0 = vload(V, p); y1 = vload(V, p + NR * sz); y2 = vload(V, p + 2NR * sz); y3 = vload(V, p + 3NR * sz)
         x0, x1, x2, x3 = _tr4x4(y0, y1, y2, y3)
-        b = pB + (i0 + (jc + vb) * ldb) * sz
+        if rev
+            x0 = shufflevector(x0, Val((3, 2, 1, 0))); x1 = shufflevector(x1, Val((3, 2, 1, 0)))
+            x2 = shufflevector(x2, Val((3, 2, 1, 0))); x3 = shufflevector(x3, Val((3, 2, 1, 0)))
+        end
+        b = pB + ((rev ? KC - 4 - i0 : i0) + (jc + vb) * ldb) * sz
         vstore(x0, b); vstore(x1, b + ldb * sz); vstore(x2, b + 2ldb * sz); vstore(x3, b + 3ldb * sz)
     end
     @inbounds for v in ncg:(wid - 1)
         scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
         for i in 0:(KC - 1)
-            unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NR * sz))
+            unsafe_store!(dcol + (rev ? KC - 1 - i : i) * sz, unsafe_load(scol + i * NR * sz))
         end
     end
     return @inbounds for i in ng:(KC - 1)
         for v in 0:(ncg - 1)
-            unsafe_store!(pB + (i + (jc + v) * ldb) * sz, unsafe_load(Pp + (i * NR + v) * sz))
+            unsafe_store!(
+                pB + ((rev ? KC - 1 - i : i) + (jc + v) * ldb) * sz,
+                unsafe_load(Pp + (i * NR + v) * sz)
+            )
         end
     end
 end
@@ -3491,7 +3519,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
         # scalar packs get the flip for free in their index arithmetic. Cost is one O(KC·NR) pack per
         # stripe against O(KC²·NR) of solve — measure before reaching for the vector variants.
         useT = _GT_TRANSPOSE && !rev
-        useT4 = (W == 4) && !rev                                     # AVX2: vectorized 4×4 transpose pack (lever 2)
+        useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
         # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
@@ -3572,7 +3600,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
             if useT
                 _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif useT4                                  # AVX2 vectorized 4×4 transpose pack (lever 2)
-                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
+                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
             elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
                 @inbounds for i in 0:(KC - 1)
                     # rev: P row i takes B row KC-1-i (the J·B of the anti-transpose identity)
@@ -3617,7 +3645,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
             if useT
                 _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif useT4
-                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
+                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
             elseif rowouter
                 @inbounds for i in 0:(KC - 1)                 # unpack P → B row-outer (contiguous P reads)
                     # rev: P row i belongs at B row KC-1-i (undo the J of J·X)
