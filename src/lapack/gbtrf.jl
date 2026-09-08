@@ -184,45 +184,16 @@ function _gbtf2!(
                 for i in 1:km
                     AB[kv + 1 + i, j] *= d
                 end
-                # Rank-1 trailing update within the band. The multiplier column L is contiguous
-                # (AB[kv+2 … kv+1+km, j]) and each target slice AB[kv+2+j-jj … , jj] is contiguous
-                # too, so every one of these is a plain axpy — route it to the tuned kernel.
-                #
-                # WHY, MEASURED (wintermute Zen4, bench/probes/gbtrf_kl_step.jl, fixed n=1024, cost
-                # normalised by n·kl² work): the `@simd ivdep` loop below costs ~0.54–0.59 ns/unit for
-                # every kl ≤ 31 and then STEPS to 0.239 at kl=32 — 2.25× at a single increment, with
-                # ldab moving only 94→97 and the machine code identical (kl is a runtime value). The
-                # edge sits exactly at 2·VF·UF = 2·8·2 = 32, i.e. LLVM's runtime trip-count guard for
-                # taking the interleaved-by-2 vector body. Below it the loop runs the un-interleaved
-                # path, and the binding gate cell (n=128 ⇒ kl=16) lives entirely in that regime.
-                # `_axpy_simd!` has no such guard — it is explicit `vload`/`vstore` with its own
-                # unroll — so the short lengths get the same code the long ones do. Zen3 and Zen5 show
-                # smooth curves with no step, so this is a Zen4 codegen edge, not a portable one; the
-                # kernel is correct on all of them either way.
-                if T <: BlasReal && _strided1(AB)
-                    lda = stride(AB, 2); sz = sizeof(T)
-                    GC.@preserve AB begin
-                        pab = pointer(AB)
-                        lp = pab + ((j - 1) * lda + kv + 1) * sz          # L(j+1..j+km, j)
-                        for jj in (j + 1):ju
-                            ujj = AB[kv + 1 + j - jj, jj]                 # U(j,jj)
-                            iszero(ujj) && continue
-                            yp = pab + ((jj - 1) * lda + kv + 1 + j - jj) * sz
-                            _axpy_simd!(km, -ujj, lp, yp)                 # A(j+i,jj) −= L(j+i,j)·U(j,jj)
-                        end
-                    end
-                else
-                    for jj in (j + 1):ju
-                        ujj = AB[kv + 1 + j - jj, jj]
-                        if ujj != z
-                            # `ivdep`: the loop STORES into column jj and LOADS from column j, and
-                            # jj > j always (jj runs j+1:ju), so they are distinct columns of AB and
-                            # cannot alias — but alias analysis cannot see that and otherwise has to
-                            # assume a store→load dependency. Measured 1.03–1.19× on the isolated
-                            # downdate, which is 87–97% of the whole routine.
-                            @simd ivdep for i in 1:km
-                                AB[kv + 1 + i + j - jj, jj] -= AB[kv + 1 + i, j] * ujj
-                            end
+                for jj in (j + 1):ju                       # rank-1 trailing update within the band
+                    ujj = AB[kv + 1 + j - jj, jj]          # U(j,jj)
+                    if ujj != z
+                        # `ivdep`: the loop STORES into column jj and LOADS from column j, and
+                        # jj > j always (jj runs j+1:ju), so they are distinct columns of AB and
+                        # cannot alias — but alias analysis cannot see that and otherwise has to
+                        # assume a store→load dependency. Measured 1.03–1.19× on the isolated
+                        # downdate, which is 87–97% of the whole routine.
+                        @simd ivdep for i in 1:km
+                            AB[kv + 1 + i + j - jj, jj] -= AB[kv + 1 + i, j] * ujj  # A(j+i,jj) -= L(j+i,j)·U(j,jj)
                         end
                     end
                 end
