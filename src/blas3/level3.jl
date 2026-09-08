@@ -3336,7 +3336,31 @@ end
         $fall
     end
 end
-function _trsm_fused_L!(unit::Bool, A, B)
+# `rev` = solve the ANTI-TRANSPOSED problem. With J the row-reversal, J·Aᵀ·J is upper triangular when A
+# is upper, and  Aᵀ X = B  ⟺  (J Aᵀ J)(J X) = J B.  So an upper/no-trans slab kernel serves transA='T'
+# unchanged — only the PACK index maps flip. That is what makes this cheap: the slab, tail and
+# back-substitution kernels below are untouched, and after packing they execute the same instructions on
+# the same addresses as the no-trans case. Verified for all eight (uplo, trans, diag) combinations,
+# relerr ≤ 3.4e-16.
+#
+# SCOPE, and why the gates say `up` rather than dropping the uplo test entirely. In general
+# Ũ[i,j] = tr ? A[K-1-j, K-1-i] : A[K-1-i, K-1-j], so for `up` the flipped pack reads A's UPPER triangle
+# (r ≤ c, contiguous by column, as below) while for `!up` it would have to read the LOWER one — a
+# different walk. Only the two `up` cases are implemented and verified here: (up, !tr) keeps its existing
+# behaviour with rev=false, and (up, tr) — exactly what upper Cholesky's
+# trsm!(side='L', uplo='U', transA='T') needs — takes the flip. The `!up` pair still falls through to
+# `_trsm_base_invL!` / the ½-split recursion and pays the same deficit; extending to them is a second
+# pack walk, not a new kernel.
+#
+# `rev` here is the OPERATOR's uplo: the effective triangle is upper iff `up != tr`, so rev = !(up != tr),
+# which for the two `up` cases the gates admit is simply `tr`. Getting that predicate backwards silently
+# double-applies the swap and still runs — check it against the identity, do not eyeball it.
+# When it is set: A is packed flipped, so `directA` cannot be used (the flip needs a negative row stride,
+# which is not expressible as a (pointer, ldu) pair), and the vectorised B packs (`useT`/`useT4`/`fusedT`)
+# are bypassed for the scalar ones — the reversal folds into their index arithmetic for free, whereas the
+# transposing packs would each need a lane reversal. That costs O(KC·NR) per stripe against O(KC²·NR) of
+# solve, ~1% at the KC=125 the Cholesky path uses; revisit only if a profile says otherwise.
+function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
     T = eltype(B); KC = size(A, 1); n = size(B, 2); sz = sizeof(T)
     W = _vwidth(T); NRV = _GT_NRV; MR = _GT_MR; NR = NRV * W
     lda = stride(A, 2); ldb = stride(B, 2)
@@ -3396,18 +3420,34 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # The pack below is a unit-stride streaming read: same lines, fetched as one frontloaded burst.
         # Counters say this is the only live degree of freedom: at the gate working set we already pull
         # 222 lines/call from L3+DRAM against a ~256-line compulsory floor, so it is not a bytes problem.
-        directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5]
+        directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5] && !rev
         pUsrc = pA; lduse = lda
         if !directA
-            @inbounds for c in 0:(KC - 1)                     # pack A's upper triangle → compact U (odd ldu)
-                for r in 0:c
-                    unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1)
+            if rev
+                # Ũ = J·Aᵀ·J, i.e. Ũ[i,j] = A[KC-1-j, KC-1-i]. Walk the SOURCE the same way as below
+                # (by column c, rows r ≤ c) so A is still read contiguously; only the writes into the
+                # compact panel become ldu-strided. i = KC-1-c, j = KC-1-r, and r ≤ c ⟹ i ≤ j, so the
+                # result is upper-triangular exactly as the kernels require.
+                @inbounds for c in 0:(KC - 1)
+                    for r in 0:c
+                        unsafe_store!(
+                            pU, unsafe_load(pA, r + c * lda + 1),
+                            (KC - 1 - c) + (KC - 1 - r) * ldu + 1
+                        )
+                    end
+                end
+            else
+                @inbounds for c in 0:(KC - 1)                 # pack A's upper triangle → compact U (odd ldu)
+                    for r in 0:c
+                        unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1)
+                    end
                 end
             end
             pUsrc = pU; lduse = ldu
         end
         @inbounds for i in 0:(KC - 1)                          # recips always packed (contiguous rp panel)
-            unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, i + i * lda + 1)), i + 1)
+            ii = rev ? KC - 1 - i : i                          # Ũ[i,i] = A[KC-1-i, KC-1-i]
+            unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, ii + ii * lda + 1)), i + 1)
         end
         # AVX-512 f64: vectorized 8×8-transpose pack (const-folds). NOTE: the transpose reads 8 B-columns at
         # stride ldb·sz simultaneously for the in-register 8×8 block — when ldb·sz is a big power-of-2 multiple
@@ -3445,8 +3485,13 @@ function _trsm_fused_L!(unit::Bool, A, B)
         # SETTLE THIS BEFORE ACTING ON n=128/256: decode the branch region of `dtrsm_blis_impl` for
         # (side=L, uplo=U, trans=N, m=n=128), or read `bla_trsm_amd.c` at the artifact's version, where
         # those thresholds appear as named constants. No benchmark needed.
-        useT = _GT_TRANSPOSE
-        useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
+        # `!rev` on the three transposing packs: each would need a lane reversal to fold in the flip
+        # (an 8-lane `shufflevector` for useT/fusedT, a 4-lane one for useT4), and `fusedT` additionally
+        # reads and writes B IN PLACE, so its reversal would have to be applied twice consistently. The
+        # scalar packs get the flip for free in their index arithmetic. Cost is one O(KC·NR) pack per
+        # stripe against O(KC²·NR) of solve — measure before reaching for the vector variants.
+        useT = _GT_TRANSPOSE && !rev
+        useT4 = (W == 4) && !rev                                     # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         fusedT = _TRSM_FUSEDT_ON[] && useT               # Lever 1: skip the pack round-trip (full stripes)
         # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
@@ -3530,7 +3575,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
                 _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
                 @inbounds for i in 0:(KC - 1)
-                    srow = pB + (i + jc * ldb) * sz; drow = Pp + i * NRp * sz
+                    # rev: P row i takes B row KC-1-i (the J·B of the anti-transpose identity)
+                    srow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz; drow = Pp + i * NRp * sz
                     for v in 0:(wid - 1)
                         unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1)
                     end
@@ -3541,8 +3587,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
             else                                          # contiguous B reads; strided P writes (po2-immune)
                 @inbounds for v in 0:(wid - 1)
                     scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
-                    for i in 0:(KC - 1)
-                        unsafe_store!(dcol + i * NRp * sz, unsafe_load(scol + i * sz))
+                    for i in 0:(KC - 1)                      # rev: read B row KC-1-i into P row i
+                        unsafe_store!(dcol + i * NRp * sz, unsafe_load(scol + (rev ? KC - 1 - i : i) * sz))
                     end
                 end
                 @inbounds for v in wid:(NRp - 1), i in 0:(KC - 1)
@@ -3574,7 +3620,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
                 _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz)
             elseif rowouter
                 @inbounds for i in 0:(KC - 1)                 # unpack P → B row-outer (contiguous P reads)
-                    srow = Pp + i * NRp * sz; drow = pB + (i + jc * ldb) * sz
+                    # rev: P row i belongs at B row KC-1-i (undo the J of J·X)
+                    srow = Pp + i * NRp * sz; drow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz
                     for v in 0:(wid - 1)
                         unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1))
                     end
@@ -3582,8 +3629,8 @@ function _trsm_fused_L!(unit::Bool, A, B)
             else
                 @inbounds for v in 0:(wid - 1)               # unpack column-outer (contiguous B writes)
                     scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
-                    for i in 0:(KC - 1)
-                        unsafe_store!(dcol + i * sz, unsafe_load(scol + i * NRp * sz))
+                    for i in 0:(KC - 1)                      # rev: P row i belongs at B row KC-1-i
+                        unsafe_store!(dcol + (rev ? KC - 1 - i : i) * sz, unsafe_load(scol + i * NRp * sz))
                     end
                 end
             end
@@ -3910,23 +3957,23 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # `_GT_TRANSPOSE` REMOVED 2026-08-10 — same reason as the tiny-k bypass in `trsm!` (see the long
             # note there): it is the fusedT slabs' capability bit, not a crossover, and it stranded AVX2 on
             # the dense base at k=48/64 where the leaf measures 20.7% / 25.9% faster on Zen3.
-            if up && !tr && _TRSM_FUSED_ON[] &&
+            if up && _TRSM_FUSED_ON[] &&
                     _TRSM_FUSED_MIN <= k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
-                return _trsm_fused_L!(unit, A, B)
+                return _trsm_fused_L!(unit, A, B, tr)
             end
             k <= _trsm_dbase() && return _trsm_dense_L!(up, tr, unit, A, B)
         elseif up && !tr && _GT_TRANSPOSE && _TRSM_FULLPACK_ON[] &&
                 _TRSM_FULLPACK_MIN <= k <= _TRSM_FULLPACK_MAX && _trsm_fusable(A, B)
             # Whole-k packed sweep (shared solved-X panel, no recursion / re-pack). AVX-512-f64, large-k only.
             return _trsm_fused_full_L!(unit, A, B)
-        elseif up && !tr && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
+        elseif up && _TRSM_FUSED_ON[] && k <= _TRSM_FUSED_BASE && _trsm_fusable(A, B)
             # Fused gemmtrsm leaf (1× flop). Fires at EVERY k ≤ base diagonal block, INCLUDING the ones the
             # n≥256 recursion descends into (B width unbounded — the leaf stripes over B's columns). The
             # recursion's off-diagonal `_gemm_sub!` stays peak dgemm; only the diagonal block is fused (1× flop)
             # vs invL's 2×-flop k=32 leaves. The old `size(B,2) ≤ base` restriction (AVX2 only) sent wide-B
             # n≥256 to those k=32 invL leaves instead — the whole AVX2 n≥256 gap (Fable-diagnosed 2026-07-15;
             # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
-            return _trsm_fused_L!(unit, A, B)
+            return _trsm_fused_L!(unit, A, B, tr)
         elseif k <= _trsm_base()
             return _trsm_base_invL!(up, tr, unit, A, B)
         end
@@ -4518,8 +4565,8 @@ function trsm!(
         # with no such guard — so this deletes an unmeasured restriction, it does not enable new code.
         # Float32 is still excluded by `_trsm_fusable` (eltype(B) === Float64, measured -18% if fused), and
         # AVX-512 is unaffected because the conjunct was `true` there.
-        if sl && up && !tr && _TRSM_FUSED_ON[] && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
-            return _trsm_fused_L!(unit, A, B)
+        if sl && up && _TRSM_FUSED_ON[] && k >= _TRSM_FUSED_MIN && _trsm_fusable(A, B)
+            return _trsm_fused_L!(unit, A, B, tr)
         end
         # Side-L: the dispatch-skip criterion is n-DEPENDENT, exactly as the side-R note below says of
         # m. Skipping ~60ns of dispatch only pays while the whole solve is itself O(100ns); with wide B
