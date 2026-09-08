@@ -472,8 +472,23 @@ function _chol_hyb_upper_f64!(M, n::Int, base::Int, pad)
         # Base: no native-upper leaf kernel exists, and writing one is a separate piece of work. Fall
         # back to the transpose lever HERE, where it is cheap — the block is `base`-sized, so the
         # round-trip is O(base²) per leaf, i.e. O(n·base) total rather than O(n²) once.
-        _potrf_upper_lever_real!(view(M, 1:n, 1:n), n, pad)
-        return 0
+        #
+        # THE CATCH IS LOAD-BEARING, not defensive. The lever's inner `_potrf_f64_lower!` THROWS
+        # PosDefException on a non-positive-definite block, and its `info` is the failing index within
+        # THIS LEAF. Letting that propagate skips the recursion's `h + f` lifting below, so the index
+        # the caller finally sees is leaf-local rather than global. Measured: at n=257, uplo='U', PB
+        # reported info=128 and 129 where LAPACK reports 256 and 257 — exactly one missing `h = n÷2`.
+        # Returning it instead lets the lifting run. This was latent until `_potrf_unative_min` was
+        # re-derived to the base (aaf2bd1): before that these n took the lever directly and never
+        # entered this recursion, so CI had never exercised the path.
+        f = 0
+        try
+            _potrf_upper_lever_real!(view(M, 1:n, 1:n), n, pad)
+        catch e
+            e isa PosDefException || rethrow()
+            f = e.info
+        end
+        return f
     end
     h = n ÷ 2
     f = _chol_hyb_upper_f64!(view(M, 1:h, 1:h), h, base, pad)
