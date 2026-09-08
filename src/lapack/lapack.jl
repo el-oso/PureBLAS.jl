@@ -399,7 +399,29 @@ end
 # Zen4/Zen5 (16 MiB L3, F64): 1448. Zen3 (32 MiB): 2048. That places the switch between the passing
 # n=512-1024 cells (where the lever's small-n advantage is real and measured) and the failing
 # n=2048-4096 ones, without a literal. F32 gets a wider threshold automatically via sizeof.
-@inline _potrf_unative_min(::Type{T}) where {T} = isqrt(_L3_BYTES ÷ sizeof(T))
+# ⚠ RE-DERIVED 2026-09-08. The L3-residency form below (`isqrt(_L3_BYTES ÷ sizeof(T))` = 2048 on Zen3,
+# 1448 on Zen4/Zen5) rested on an UNSTATED second premise: that native's BLAS-3 pair is no faster than
+# the lower path's, so the lever's 4 extra n² passes were worth paying to reach a better factorization.
+# That premise was true only because native's `trsm(side='L', uplo='U', transA='T')` had no fused leaf —
+# every fused gate in `_trsm_left!` required `up && !tr`. It now has one (the anti-transpose,
+# level3.jl), so the leg is gone and the lever's remaining job is just the leaf-sized block, which
+# `_chol_hyb_upper_f64!` already falls back to on its own.
+#
+# Native vs lever, all three boxes on 1.13.0-rc4, freq-locked, gain of native (µs measured, see
+# bench/probes/potrfU_native_vs_lever.jl):
+#     n        galen W=4    wintermute W=8   neuromancer W=8
+#     512        +5.6%          −0.2%            −0.7%
+#     768        +6.9%          +2.3%            −1.9%
+#     1000      +10.6%          +0.7%            +0.7%
+#     1500      +11.4%       (both native)    (both native)
+# Native is a clear win on AVX2 and a wash on both AVX-512 boxes — every AVX-512 figure is inside this
+# fleet's ±2% run-to-run floor. Never worse anywhere, so the threshold collapses to the base: take
+# native whenever the driver would recurse at all.
+#
+# This is a Derive-tier re-argument (a premise was falsified, so the criterion changed), NOT a threshold
+# nudge — the old comment's "do not re-chase the crossover" was right about nudging it, and the two
+# force-hook checks before the trsm fix both confirmed the lever won. What changed is the code beneath.
+@inline _potrf_unative_min(::Type{T}) where {T} = _chol_faer_base(T)
 # Forceable — and the first thing the hook bought was a FALSIFICATION of the suspicion that prompted it.
 #
 # The worry: on Zen3 L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921
