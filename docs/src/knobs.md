@@ -243,13 +243,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-26 `const _X = <literal>` values in `src/` with no `@load_preference`.
+33 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 23 Literal · 3 Exempt.
+**Tier:** 30 Literal · 3 Exempt.
 
 
 ### BLAS-1 SIMD kernels
@@ -287,11 +287,28 @@ on these, not on knobs.
 |---|---|---|---|
 | `_STEDC_NB` | 25 | Literal | LAPACK's SMLSIZ: algorithm-intrinsic, machine-independent. tuning.md §4. |
 
+### LAPACK · hessenberg
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_GEHRD_UNBLK_MAX` | 128 | Literal | LAPACK ILAENV nx for dgehrd, carried over UNMEASURED here; owed a fleet crossover sweep. |
+
 ### LAPACK · lapack
 
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_TR_TB` | 32 | Literal | residency-INVARIANT: two 32^2 F64 tiles = 16 KB, under any real L1. Deriving it would change nothing. |
+
+### LAPACK · laqr
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_LAQR_KEXNW` | 5 | Literal | LAPACK dlaqr0 KEXNW, algorithm-intrinsic and machine-independent. |
+| `_LAQR_KEXSH` | 6 | Literal | LAPACK dlaqr0 KEXSH, algorithm-intrinsic and machine-independent. |
+| `_LAQR_KNWSWP` | 500 | Literal | LAPACK ispec 13 window-widening threshold, algorithm-intrinsic and machine-independent. |
+| `_LAQR_NIBBLE` | 14 | Literal | LAPACK ispec 14 (NIBBLE), algorithm-intrinsic and machine-independent. |
+| `_LAQR_NMIN` | 200 | Literal | dlahqr-vs-dlaqr0 crossover; derivation falsified, fleet table above is the evidence. |
+| `_LAQR_SKIPMIN` | 75 | Literal | LAPACK dlaqr0/ILAENV convergence constant, algorithm-intrinsic and machine-independent. |
 
 ### LAPACK · lu
 
