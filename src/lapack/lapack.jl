@@ -1498,17 +1498,30 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     T = eltype(A)
     n = size(A, 1)
     n == 0 && return A
-    if _NVREG == 16 && n > _chol_rl_max(T)
-        # AVX2: the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3,
-        # 200–4000: transition dips 384/448/640 0.91-0.94→1.01-1.03, non-po2 large 0.98→1.00-1.03). It was
-        # originally gated to po2-aliased strides only (its raison d'être was dodging the po2 pad round-trip),
-        # but it's a better-composed blocked driver everywhere — the hybrid's generic trsm!(side=R,transA=T)
-        # is the side-R-T laggard the panel driver's fused split-ld trsm avoids. (AVX-512 W=8 stays below.)
-        return _chol_panel_f64!(A, n)
-    end
-    # AVX2 reaches here only for n ≤ _CHOL_RL_MAX (rl32 regime): rl32's small 32-blocks are alias-tolerant
-    # (measured Zen3: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8% at po2-128) so the pad
-    # is dead weight — skip it. W=8 still pads (its larger rl blocks' po2-tolerance is unmeasured).
+    # ⚠ THE AVX2 EARLY RETURN TO `_chol_panel_f64!` LIVED HERE AND WAS REMOVED 2026-09-08. Its comment
+    # claimed "the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3,
+    # 200–4000)". That was measured under Julia 1.12 / LLVM 18 and INVERTED on 1.13.0-rc4 / LLVM 20 —
+    # the same stale-provenance failure as gbtrf's nb step, on the same day.
+    #
+    # MEASURED on galen (Zen3, rc4, freq-locked, bench/probes/potrf_galen_n256.jl), panel vs the padded
+    # hybrid, µs:
+    #     n        256      320      384      512      768
+    #     panel  223.77   466.79   816.06  1498.76  4018.71
+    #     hybrid 158.54   265.75   474.99  1025.26  3438.43
+    #     panel   −29.2%   −43.1%   −41.8%   −31.6%   −14.4%
+    # and the hybrid arm was HANDICAPPED (it allocated its scratch inside the timed region, which the
+    # arena path does not), so the real margin is wider.
+    #
+    # The symptom in the gate was a CLIFF, not a po2 dip: PB holds 44–45 GF/s and beats OpenBLAS
+    # 1.54–1.58× for n ≤ `_chol_rl_max` (=224 on galen), then falls to ~24 GF/s the moment n crosses into
+    # the panel driver — 0.845 @240, 0.767 @256, 0.618 @384. Two paths, one of them half the speed of the
+    # other, with the crossover in the middle of the gate ladder.
+    #
+    # AVX2 now falls through to the same hybrid (padded where the stride needs it) that AVX-512 uses.
+    # `_chol_panel_f64!` is retained, unreferenced, pending a re-measure on a box still on LLVM 18.
+    # (The line that used to sit here — "AVX2 reaches here only for n ≤ _CHOL_RL_MAX" — is no longer
+    # true now that the panel-driver early return is gone; AVX2 reaches here at every n. What survives
+    # of it is the rl32 pad exemption, restated on the condition above.)
     # ARENA ESCAPE AUDIT for `Mw` (was `_chol_pad(T, R, n)` + `view(b, 1:n, 1:n)`). Borrowed ONCE in this
     # branch — the only place it is needed — and the scope spans the copy-in, the factorization and the
     # copy-back. `_potrf_f64_lower!` is not recursive; its callers are `potrf!` and
@@ -1524,7 +1537,12 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # ld = n+8, the field's exact rule ("faer potrf po2-ld whole-matrix pad, ld=n+8"), and now EXACT: the
     # old `ldb = size(b, 1)` read the GROWN field, so a call following a larger one factored at that
     # call's ld rather than at n+8 — the de-aliasing this branch exists for was history-dependent.
-    if _NVREG != 16 && _chol_needs_pad(A, n)      # factor in a non-conflicting (ld = n+8) scratch, copy back
+    # AVX2 keeps skipping the pad in the rl32 regime (n ≤ `_chol_rl_max`): rl32's small 32-blocks are
+    # alias-tolerant there (measured Zen3: rl32-direct ≥ pad on every po2 stride/subview in-range, +7–8%
+    # at po2-128), and that measurement is NOT the one that went stale — the ladder above still shows
+    # 44–45 GF/s and 1.54–1.58× over OpenBLAS across that whole range on rc4. Above it, AVX2 now takes
+    # the same padded hybrid as AVX-512 instead of the panel driver.
+    if (_NVREG != 16 || n > _chol_rl_max(T)) && _chol_needs_pad(A, n)
         @scope arn begin
             ldb = n + 8
             # borrowed exactly n×n at ld = n+8, so `Mw` IS the old `view(b, 1:n, 1:n)` — no slicing needed
