@@ -149,8 +149,8 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>gttrs</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>pbtrfL</code></th><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.09</span></td><td class="ok"><span class="v">1.05</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>pbtrfU</code></th><td class="b3"><span class="v">0.911</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.92</span><span class="n">n=128</span></td><td class="b3"><span class="v">0.854</span><span class="n">n=128</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>potrf</code></th><td class="b4"><span class="v">0.772</span><span class="n">n=256</span></td><td class="b2"><span class="v">0.958</span><span class="n">n=2100</span></td><td class="b2"><span class="v">0.957</span><span class="n">n=8</span></td><td class="h"><span class="n">ef1793a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
-<tr><th><code>potrfU</code></th><td class="b4"><span class="v">0.779</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.918</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.949</span><span class="n">n=1000</span></td><td class="h"><span class="n">ef1793a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
+<tr><th><code>potrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.951</span><span class="n">n=2100</span></td><td class="b2"><span class="v">0.954</span><span class="n">n=8</span></td><td class="h"><span class="n">0f1cc14</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
+<tr><th><code>potrfU</code></th><td class="b3"><span class="v">0.874</span><span class="n">n=1000</span></td><td class="b3"><span class="v">0.916</span><span class="n">n=2100</span></td><td class="b3"><span class="v">0.947</span><span class="n">n=1000</span></td><td class="h"><span class="n">0f1cc14</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
 <tr><th><code>potri</code></th><td class="ok"><span class="v">1.0</span></td><td class="ok"><span class="v">1.01</span></td><td class="ok"><span class="v">1.04</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>potrsL</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.942</span><span class="n">n=2048</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>potrsU</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=512</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
@@ -191,8 +191,8 @@ html.dark .pbg-key{color:#98a1b3}
 
 | Op | Routines | Types | Routes | Zen3 | Zen4 | Zen5 | Zen4 vs OB geo/worst | Zen4 vs AOCL geo/worst |
 |---|---|---|---|---|---|---|---|---|
-| Cholesky (lower) | potrf | s/d/c/z | ✅ | **0.772** | **0.958** | **0.958** | 1.47 / 0.971 | 1.54 / 0.958 |
-| Cholesky (upper) | potrf `uplo='U'` | s/d/c/z | ✅ | **0.782** | **0.918** | **0.949** | 1.5 / 1.03 | 1.35 / 0.918 |
+| Cholesky (lower) | potrf | s/d/c/z | ✅ | 1.01 | **0.951** | **0.955** | 1.48 / 0.999 | 1.55 / 0.951 |
+| Cholesky (upper) | potrf `uplo='U'` | s/d/c/z | ✅ | **0.874** | **0.917** | **0.947** | 1.51 / 1.07 | 1.35 / 0.917 |
 | Cholesky solve | potrs | s/d/c/z | ✅ | **0.984** | 1.02 | **0.792** | 2.83 / 1.17 | 1.25 / 1.02 |
 | Pivoted Cholesky | pstrf | s/d/c/z | ✅ | **0.936** | **0.915** | **0.946** | 1.31 / 0.915 | 1.27 / 0.97 |
 | LU | getrf, gesv | s/d/c/z | ✅ | 1.01 | **0.952** | **0.963** | 1.36 / 1.05 | 1.46 / 0.952 |

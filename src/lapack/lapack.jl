@@ -414,6 +414,28 @@ end
 # against ~6.6ms of factorization, which is the right order for the observed gap), not the choice of
 # arm. Closing that cell means a cheaper transpose or a faster native-upper hybrid — NOT moving this
 # threshold. Do not re-chase the crossover.
+#
+# RE-CHECKED 2026-09-08 on 1.13.0-rc4/LLVM 20 — because both inputs to the verdict above had changed
+# (the toolchain, and the LEVER's inner lower path, which got 29-43% faster on AVX2 at 0f1cc14). The
+# DIRECTION inverted; the MAGNITUDE does not justify moving anything. Gain of native over lever, µs:
+#     n        galen        wintermute      neuromancer
+#     512     −0.7%          +0.6%           −0.8%
+#     768     +1.4%          −0.3%           +1.2%
+#     1000    +1.4%          +3.8%           −0.2%
+#     1500    +6.5%          (both native)   (both native)
+# At the BINDING cells (n=1000 on galen and neuromancer) that is +1.4% and −0.2% — inside this fleet's
+# ~1-2% run-to-run floor. So the conclusion stands on magnitude even though its 2026-08-28 supporting
+# numbers (lever 0.922 vs native 0.891) no longer reproduce. Still do not re-chase it.
+#
+# AND THE REAL BAR IS NOT THE ARM CHOICE. Per-arm times, galen n=1000 (µs, from the v3 cache):
+#     potrf  (lower)   aocl 7950.7   openblas 7629.4   pb 7103.6  -> 1.074 PASS
+#     potrfU (upper)   aocl 6749.9   openblas 7781.0   pb 7710.9  -> 0.875 FAIL
+# AOCL's UPPER is 15% faster than AOCL's own LOWER, while OpenBLAS's upper is slightly slower than its
+# lower (what column-major normally dictates). So AOCL has a genuinely better upper-Cholesky path here
+# and it is the binding reference. Our transpose round-trip is 8.5% (measured: U−L = 570 µs vs the two
+# transposes in isolation = 573 µs, a near-exact match) — but eliminating it entirely only reaches our
+# LOWER path's 7103.6, i.e. 0.950. Gating potrfU@1000 needs ~5% BEYOND a free transpose, on top of a
+# lower path that already beats both references. Do not size that work off the transpose alone.
 # Cold path — read once per potrf! call, not in any kernel.
 @inline _fh_potrf_unative_min(::Type{T}) where {T} =
     (f = _FKR_potrf_unative_min[]; f >= 0 ? f : _potrf_unative_min(T))
