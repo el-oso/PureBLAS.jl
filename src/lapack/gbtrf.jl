@@ -63,8 +63,38 @@ const _GBTRF_NB_PREF = @load_preference("gbtrf_nb", nothing)
 const _GBTRF_CMULT = @load_preference("gbtrf_cmult", 1)::Int
 @static if isnothing(_GBTRF_NB_PREF)
     @inline _gbtrf_cmult() = (f = _FKR_gbtrf_cmult[]; f >= 0 ? f : _GBTRF_CMULT)
+    # `max(kl ÷ 128, kl >= 96)` — the ORIGINAL was `kl ÷ 128`, i.e. the first step at kl=128. That
+    # step position was fitted on Zen4 under Julia 1.12/LLVM 18 (the table above), and BOTH halves of
+    # that provenance went stale: the fleet is now on 1.13.0-rc4/LLVM 20, which changed gbtrf codegen
+    # enough to move gbtrf's whole gate row by 0.39 on Zen4 with no code change.
+    #
+    # Re-measured on all three boxes at rc4, at the GATE shapes (bench/probes/gbtrf_nb_fleet.jl, ms):
+    #
+    #     n (kl)      live      galen Zen3        wintermute Zen4     neuromancer Zen5
+    #     512  (64)     8    0.250 → best 24        0.281 best         0.321 best
+    #     1000 (125)    8    1.415 → 1.255 @16      1.441 → 1.388 @16  1.765 → 1.763 @16
+    #     1024 (128)   16    1.336 → 1.147 @12      1.389 best         1.782 best
+    #     2048 (256)   24    7.399 best @24         9.121 → 9.080 @16  11.838 → 11.486 @16
+    #
+    # kl=125 is galen's BINDING cell and nb=16 is best-or-tied on ALL THREE boxes there (+12.7% galen,
+    # +3.8% Zen4, +0.1% Zen5), so moving the first step down to kl≥96 is a fleet improvement rather
+    # than a one-box fit. `max(…)` keeps every other range EXACTLY as it was — kl<96 stays 8, kl in
+    # 128..255 stays 16, kl≥256 stays on the ÷128 ladder — so the only cells that move are the ones
+    # measured above.
+    #
+    # NOT a µarch predicate, deliberately. The obvious mechanism ("AVX2 needs deeper k because its
+    # trailing gemm is slower") is FALSIFIED by this project's own finding that Zen4's W=8 double-pumps
+    # to the SAME FMA throughput as W=4 (kb `double-pumped-avx512-no-gain`) — Zen3 and Zen4 have equal
+    # throughput here yet want different nb, so width is not the criterion and a `_wide_simd` split
+    # would be a lookup table wearing a formula's clothes.
+    #
+    # LEFT ON THE TABLE, measured and deliberately not taken: galen wants nb=24 at kl=64 (+13.0%) and
+    # both AVX-512 boxes want nb=16 at kl=256 (+0.5% / +3.1%, and Zen5's 2048 cell is its binding one
+    # at 0.994). Neither is taken here because each would move a range where the boxes DISAGREE — galen
+    # loses 1.9% at kl=256 with nb=16 — and its own binding cell is elsewhere. One change, one measured
+    # justification.
     @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} =
-        clamp(_gbtrf_cmult() * 8 * (1 + kl ÷ 128), 8, 48)
+        clamp(_gbtrf_cmult() * 8 * (1 + max(kl ÷ 128, kl >= 96)), 8, 48)
 else
     @inline _gbtrf_cmult() = _GBTRF_CMULT
     @inline _gbtrf_nb(::Type{T}, kl::Int) where {T} = _GBTRF_NB_PREF::Int
