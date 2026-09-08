@@ -467,6 +467,71 @@ end
 # level's borrow at once (arena.jl's hole (b), measured 98 KB → 3.05 MB over 16 levels). The leaves are
 # reached STRICTLY SEQUENTIALLY, each finishing before the next begins, so ONE `base`-sized pad serves
 # all of them; the caller sizes it for the largest possible leaf.
+# ── Left-looking blocked native-upper Cholesky (netlib dpotrf('U') structure) ───────────────────────
+# WHY THIS SHAPE. The halving D&C driver below splits its flops roughly 50/50 between trsm and syrk;
+# left-looking puts ~80% of them in ONE gemm. Per block column j of width jb, netlib does
+#     syrk('U','T')  A(j:j+jb, j:j+jb) -= A(1:j-1, j:j+jb)ᵀ·A(1:j-1, j:j+jb)
+#     factor the jb×jb diagonal block
+#     gemm('T','N')  A(j:j+jb, j+jb:n) -= A(1:j-1, j:j+jb)ᵀ·A(1:j-1, j+jb:n)
+#     trsm('L','U','T')  A(j:j+jb, j+jb:n) = R11⁻ᵀ·(that)
+# and in COLUMN-MAJOR every one of those operands is a contiguous column panel — which is the half of
+# the AOCL-asymmetry hypothesis that survived: AOCL's upper is 15% faster than its own lower on Zen3
+# while OpenBLAS's upper is slightly SLOWER, and left-looking lower would need stride-lda row strips
+# where upper does not.
+#
+# ⚠ THE PAYOFF IS NOT ESTABLISHED. The whole argument is "move flops from trsm/syrk into gemm", so it
+# only pays if gemm is faster than what those already achieve. MEASURED on galen at the panel shape
+# (bench/probes/gemm_tn_skinny.jl): gemm('T','N') runs 51.2 GF at M=64 and 54.6 at M=128, against the
+# fused trsm's 50.3 GF at k=500 and the lower path's 46.9 GF whole-factorization average. That is a
+# COIN FLIP against the ~53 GF this needs, and the orientation half of the hypothesis was REFUTED for
+# our gemm — ('N','T') at the lower panel shape runs 51.4-53.1 GF, indistinguishable from ('T','N'), so
+# nothing is inherited from operand contiguity alone. Gate this against the halving driver before
+# wiring it into dispatch; it is written to be measured, not assumed.
+#
+# `nb` PDM: Derive — panel residency. The live panel A(1:j-1, j:j+jb) is (j-1)×jb and is re-read by
+# both the syrk and the gemm, so it wants to sit in L2: jb·n·sizeof(T) ≤ _L2_BYTES. Clamped below by
+# the register tile (a panel narrower than MR wastes the microkernel) and above by the faer base, past
+# which the diagonal-block leaf stops being the cheap case.
+@inline function _chol_ll_nb(::Type{T}, n::Int) where {T}
+    fit = _L2_BYTES ÷ (max(n, 1) * sizeof(T))
+    return clamp(fit & ~7, 8, min(_chol_faer_base(T), 128))
+end
+
+# Returns 0, or the (global, 1-based) index of the leading minor that is not positive definite.
+function _chol_ll_upper_f64!(A, n::Int, pad, nb::Int = _chol_ll_nb(Float64, n))
+    j = 1
+    @inbounds while j <= n
+        jb = min(nb, n - j + 1)
+        d = view(A, j:(j + jb - 1), j:(j + jb - 1))
+        if j > 1                                     # trailing-panel updates (k = j-1 columns above)
+            syrk!(d, view(A, 1:(j - 1), j:(j + jb - 1)); uplo = 'U', trans = 'T', alpha = -1, beta = 1)
+        end
+        f = 0                                        # factor the diagonal block via the lever leaf
+        try
+            _potrf_upper_lever_real!(d, jb, pad)
+        catch e
+            e isa PosDefException || rethrow()
+            f = e.info
+        end
+        f == 0 || return j - 1 + f                   # lift to a global index
+        if j + jb <= n
+            R = view(A, j:(j + jb - 1), (j + jb):n)
+            if j > 1
+                # `_gemm_core!`, not `gemm!`: the public entry gates on `C isa StridedMatrix`, which a
+                # `PtrMatrix` (what an arena borrow hands back) is not, so it would silently drop to the
+                # generic kernel — the wire-the-fastest-path miss gbtrf.jl documents at its own gemm.
+                _gemm_core!(
+                    R, view(A, 1:(j - 1), j:(j + jb - 1)), view(A, 1:(j - 1), (j + jb):n),
+                    -1.0, 1.0, true, false, false, false
+                )
+            end
+            trsm!(R, d; side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
+        end
+        j += jb
+    end
+    return 0
+end
+
 function _chol_hyb_upper_f64!(M, n::Int, base::Int, pad)
     if n <= base
         # Base: no native-upper leaf kernel exists, and writing one is a separate piece of work. Fall
