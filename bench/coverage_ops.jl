@@ -28,6 +28,10 @@ const EXCLUDED = Dict{Tuple{String, String, String}, Int}()   # (level, op, uarc
 const COMMITS = Dict{Tuple{String, String, String}, Vector{String}}()
 # uarch => (julia, llvm) from that box's cache header. See the parse site for why this is surfaced.
 const TOOLCHAIN = Dict{String, Tuple{String, String}}()
+# uarch => the commit in that box's cache HEADER, i.e. the run that most recently rewrote it. A cell
+# whose own pb-arm commit equals this was measured by that run, so the header's toolchain describes it;
+# a cell from an earlier run was NOT, and its toolchain is simply not recorded anywhere.
+const HEADCOMMIT = Dict{String, String}()
 
 # The revision a ROW describes. `mixed` is not a cosmetic detail: a row whose boxes were swept at
 # different commits is exactly the provenance lie `fleet_sync.sh` exists to prevent (2026-07-31, galen
@@ -50,16 +54,34 @@ end
 # box, not per routine) and that is deliberate — while the fleet is split EVERY row is a cross-compiler
 # comparison, so every row should say so rather than the reader having to hunt for one footnote.
 #
-# ⚠ LIMITATION, stated because it will bite during the 1.12 → 1.13 migration: `julia=`/`llvm=` live in
-# the cache HEADER, not in the per-arm fields (which DO carry their own `commit`). A targeted sweep
-# rewrites the header while leaving other rows' cells untouched, so a cache holding a MIX of
-# 1.12-measured and 1.13-measured cells reads as uniform here. Until the version is stamped per arm the
-# way the commit is, this column is only fully trustworthy right after a full sweep — during the
-# migration read it together with "swept at", which does distinguish the rows.
-function row_toolchain(uarchs)
-    vs = unique(String[first(get(TOOLCHAIN, ua, ("?", "?"))) for ua in uarchs])
-    isempty(vs) && return ("—", "n")
-    length(vs) == 1 && return (first(vs), "h")
+# `julia=`/`llvm=` live in the cache HEADER, not in the per-arm fields (which DO carry their own
+# `commit`), and a targeted sweep REWRITES that header while leaving every other row's cells untouched.
+# So the header's toolchain describes only the cells the latest run actually measured. Naively printing
+# it per row is a provenance lie of exactly the kind the "swept at" column exists to prevent — and not a
+# hypothetical one: after the gbtrf sweep of 2026-09-08 all three headers said 1.13.0-rc4 while most
+# rows still held cells measured on 1.12.7 and 1.13.0-rc3.
+#
+# So a row only claims a toolchain when its own pb-arm commits match that box's header commit, i.e. the
+# cells were produced by the run that wrote the header. Anything older reports `?` — the toolchain for
+# those cells is genuinely not recorded anywhere, and saying so is the honest answer. Stamping the
+# version per ARM (as the commit already is) is the real fix and would make `?` disappear; until then
+# this understates rather than overstates.
+function row_toolchain(section, op, uarchs)
+    vs = String[]
+    unknown = false
+    for ua in uarchs
+        cs = get(COMMITS, (section, op, ua), String[])
+        isempty(cs) && continue
+        hc = get(HEADCOMMIT, ua, "")
+        if !isempty(hc) && all(==(hc), cs)
+            push!(vs, first(get(TOOLCHAIN, ua, ("?", "?"))))
+        else
+            unknown = true          # measured before the run that wrote this header
+        end
+    end
+    u = unique(vs)
+    isempty(u) && return (unknown ? "?" : "—", "n")
+    length(u) == 1 && return (unknown ? first(u) * " +?" : first(u), unknown ? "hx" : "h")
     return ("⚠ mixed", "hx")
 end
 
@@ -95,6 +117,8 @@ for path in ARGS
             # the toolchain that produced it.
             mj = match(r"julia=(\S+)", ln); ml = match(r"llvm=(\S+)", ln)
             TOOLCHAIN[ua] = (isnothing(mj) ? "?" : String(mj[1]), isnothing(ml) ? "?" : String(ml[1]))
+            mc = match(r"commit=(\S+)", ln)
+            HEADCOMMIT[ua] = isnothing(mc) ? "" : String(mc[1])
             continue
         end
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
@@ -239,7 +263,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
         let (h, hcls) = row_commit(section, op, UARCH)
             print("<td class=\"$hcls\"><span class=\"n\">$h</span></td>")
         end
-        let (t, tcls) = row_toolchain(UARCH)
+        let (t, tcls) = row_toolchain(section, op, UARCH)
             print("<td class=\"$tcls\"><span class=\"n\">$t</span></td>")
         end
         println("</tr>")
