@@ -479,6 +479,23 @@ end
 # while OpenBLAS's upper is slightly SLOWER, and left-looking lower would need stride-lda row strips
 # where upper does not.
 #
+# ⛔ MEASURED AND FALSIFIED 2026-09-08 — DO NOT WIRE THIS IN, AND DO NOT REBUILD IT. Kept only as the
+# evidence. galen (Zen3, rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
+#     n        512    768   1000   1024   1500    2048
+#     halving 1028.7 3188.6 6982.7 7392.3 22632.9 56023.1     43.5-51.1 GF
+#     left-lk 1035.5 3261.6 7230.5 7803.5 25249.4 57537.1     43.2-49.8 GF
+#     ll/hv    0.993  0.978  0.966  0.947   0.896   0.974
+# It loses at every size with the derived nb. An nb sweep at n=1000 shows the derivation is part of it
+# (it picks 64; 96-128 is the optimum at 6840.6 µs), and at nb=96 left-looking does edge ahead by 2.1%
+# — which would move potrfU on galen from 0.932 to ~0.952, still nowhere near the 0.995 gate.
+#
+# THE PREMISE IS WHAT DIED, and it is the useful part. The argument was "move ~80% of the flops from
+# trsm/syrk into gemm". But the two drivers run at the SAME RATE — 43.5-51.1 GF against 43.2-49.8 — so
+# the halving driver is already achieving gemm rate and there are no flops to rescue. AOCL's 15%
+# upper-over-lower advantage on Zen3 therefore does NOT come from this structure; whatever it is, it is
+# not "more of the work is in gemm". Anyone re-opening potrfU should start by finding out what AOCL's
+# upper actually does differently, not by restructuring ours again.
+#
 # ⚠ THE PAYOFF IS NOT ESTABLISHED. The whole argument is "move flops from trsm/syrk into gemm", so it
 # only pays if gemm is faster than what those already achieve. MEASURED on galen at the panel shape
 # (bench/probes/gemm_tn_skinny.jl): gemm('T','N') runs 51.2 GF at M=64 and 54.6 at M=128, against the
