@@ -2897,13 +2897,17 @@ end
     @inbounds for i0 in 0:4:(ng - 1), vb in 0:4:(ncg - 1)
         b = pB + ((rev ? KC - 4 - i0 : i0) + (jc + vb) * ldb) * sz
         x0 = vload(V, b); x1 = vload(V, b + ldb * sz); x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
-        if rev
-            x0 = shufflevector(x0, Val((3, 2, 1, 0))); x1 = shufflevector(x1, Val((3, 2, 1, 0)))
-            x2 = shufflevector(x2, Val((3, 2, 1, 0))); x3 = shufflevector(x3, Val((3, 2, 1, 0)))
-        end
         y0, y1, y2, y3 = _tr4x4(x0, x1, x2, x3)
+        # NO LANE PERMUTE. Load the block unreversed, then permute the STORE OFFSETS: with the block
+        # taken from B rows KC-4-i0.., y_j = B row KC-4-i0+j, which belongs at P row i0+3-j. Reversing
+        # lanes with `shufflevector` instead costs a cross-lane permute per vector (a full vpermpd at
+        # 8 lanes) and measured a 22-24% REGRESSION on Zen5; this form is free.
         p = Pp + (i0 * NR + vb) * sz
-        vstore(y0, p); vstore(y1, p + NR * sz); vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
+        if rev
+            vstore(y0, p + 3NR * sz); vstore(y1, p + 2NR * sz); vstore(y2, p + NR * sz); vstore(y3, p)
+        else
+            vstore(y0, p); vstore(y1, p + NR * sz); vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
+        end
     end
     @inbounds for v in ncg:(wid - 1)                          # tail columns (contiguous B reads down the column)
         scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
@@ -2933,12 +2937,13 @@ end
     V = Vec{4, Float64}; ng = (KC >> 2) << 2; ncg = (wid >> 2) << 2
     @inbounds for i0 in 0:4:(ng - 1), vb in 0:4:(ncg - 1)
         p = Pp + (i0 * NR + vb) * sz
-        y0 = vload(V, p); y1 = vload(V, p + NR * sz); y2 = vload(V, p + 2NR * sz); y3 = vload(V, p + 3NR * sz)
-        x0, x1, x2, x3 = _tr4x4(y0, y1, y2, y3)
-        if rev
-            x0 = shufflevector(x0, Val((3, 2, 1, 0))); x1 = shufflevector(x1, Val((3, 2, 1, 0)))
-            x2 = shufflevector(x2, Val((3, 2, 1, 0))); x3 = shufflevector(x3, Val((3, 2, 1, 0)))
+        # mirror of the pack: permute the LOAD offsets, not the lanes
+        y0, y1, y2, y3 = if rev
+            vload(V, p + 3NR * sz), vload(V, p + 2NR * sz), vload(V, p + NR * sz), vload(V, p)
+        else
+            vload(V, p), vload(V, p + NR * sz), vload(V, p + 2NR * sz), vload(V, p + 3NR * sz)
         end
+        x0, x1, x2, x3 = _tr4x4(y0, y1, y2, y3)
         b = pB + ((rev ? KC - 4 - i0 : i0) + (jc + vb) * ldb) * sz
         vstore(x0, b); vstore(x1, b + ldb * sz); vstore(x2, b + 2ldb * sz); vstore(x3, b + 3ldb * sz)
     end
@@ -2960,7 +2965,6 @@ end
 # Pack B[:,jc:jc+wid) → P row-major (row i at Pp+i·NR) via 8×8 transpose for full 8-row × 8-col blocks;
 # scalar column-outer for the ragged row/col tails and the wid:NR zero-pad. Contiguous B reads throughout.
 # One 8x8 transposed block, factored out so the two visit orders below share an identical body.
-const _REV8 = Val((7, 6, 5, 4, 3, 2, 1, 0))
 
 @inline function _packP_tr_blk!(
         Pp::Ptr{Float64}, pB::Ptr{Float64}, ldb::Int, jc::Int, NR::Int, sz::Int, i0::Int, vb::Int,
@@ -2972,16 +2976,16 @@ const _REV8 = Val((7, 6, 5, 4, 3, 2, 1, 0))
     b = pB + ((rev ? KC - 8 - i0 : i0) + (jc + vb) * ldb) * sz
     x0 = vload(V, b);             x1 = vload(V, b + ldb * sz);   x2 = vload(V, b + 2ldb * sz); x3 = vload(V, b + 3ldb * sz)
     x4 = vload(V, b + 4ldb * sz); x5 = vload(V, b + 5ldb * sz);  x6 = vload(V, b + 6ldb * sz); x7 = vload(V, b + 7ldb * sz)
-    if rev
-        x0 = shufflevector(x0, _REV8); x1 = shufflevector(x1, _REV8)
-        x2 = shufflevector(x2, _REV8); x3 = shufflevector(x3, _REV8)
-        x4 = shufflevector(x4, _REV8); x5 = shufflevector(x5, _REV8)
-        x6 = shufflevector(x6, _REV8); x7 = shufflevector(x7, _REV8)
-    end
     y0, y1, y2, y3, y4, y5, y6, y7 = _tr8x8(x0, x1, x2, x3, x4, x5, x6, x7)
     p = Pp + (i0 * NR + vb) * sz
-    vstore(y0, p);              vstore(y1, p + NR * sz);   vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
-    vstore(y4, p + 4NR * sz);   vstore(y5, p + 5NR * sz);  vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    # store-offset permute, not a lane permute — see `_fused_packP_tr4!`
+    if rev
+        vstore(y0, p + 7NR * sz); vstore(y1, p + 6NR * sz); vstore(y2, p + 5NR * sz); vstore(y3, p + 4NR * sz)
+        vstore(y4, p + 3NR * sz); vstore(y5, p + 2NR * sz); vstore(y6, p + NR * sz);  vstore(y7, p)
+    else
+        vstore(y0, p);            vstore(y1, p + NR * sz);  vstore(y2, p + 2NR * sz); vstore(y3, p + 3NR * sz)
+        vstore(y4, p + 4NR * sz); vstore(y5, p + 5NR * sz); vstore(y6, p + 6NR * sz); vstore(y7, p + 7NR * sz)
+    end
     return nothing
 end
 
@@ -3028,15 +3032,14 @@ end
     V = Vec{8, Float64}; ng = (KC >> 3) << 3; ncg = (wid >> 3) << 3
     @inbounds for i0 in 0:8:(ng - 1), vb in 0:8:(ncg - 1)
         p = Pp + (i0 * NR + vb) * sz
-        y0 = vload(V, p);          y1 = vload(V, p + NR * sz);   y2 = vload(V, p + 2NR * sz); y3 = vload(V, p + 3NR * sz)
-        y4 = vload(V, p + 4NR * sz); y5 = vload(V, p + 5NR * sz);  y6 = vload(V, p + 6NR * sz); y7 = vload(V, p + 7NR * sz)
-        x0, x1, x2, x3, x4, x5, x6, x7 = _tr8x8(y0, y1, y2, y3, y4, y5, y6, y7)
-        if rev
-            x0 = shufflevector(x0, _REV8); x1 = shufflevector(x1, _REV8)
-            x2 = shufflevector(x2, _REV8); x3 = shufflevector(x3, _REV8)
-            x4 = shufflevector(x4, _REV8); x5 = shufflevector(x5, _REV8)
-            x6 = shufflevector(x6, _REV8); x7 = shufflevector(x7, _REV8)
+        y0, y1, y2, y3, y4, y5, y6, y7 = if rev     # load-offset permute, not a lane permute
+            vload(V, p + 7NR * sz), vload(V, p + 6NR * sz), vload(V, p + 5NR * sz), vload(V, p + 4NR * sz),
+            vload(V, p + 3NR * sz), vload(V, p + 2NR * sz), vload(V, p + NR * sz),  vload(V, p)
+        else
+            vload(V, p),            vload(V, p + NR * sz),  vload(V, p + 2NR * sz), vload(V, p + 3NR * sz),
+            vload(V, p + 4NR * sz), vload(V, p + 5NR * sz), vload(V, p + 6NR * sz), vload(V, p + 7NR * sz)
         end
+        x0, x1, x2, x3, x4, x5, x6, x7 = _tr8x8(y0, y1, y2, y3, y4, y5, y6, y7)
         b = pB + ((rev ? KC - 8 - i0 : i0) + (jc + vb) * ldb) * sz
         vstore(x0, b);           vstore(x1, b + ldb * sz);   vstore(x2, b + 2ldb * sz); vstore(x3, b + 3ldb * sz)
         vstore(x4, b + 4ldb * sz); vstore(x5, b + 5ldb * sz);  vstore(x6, b + 6ldb * sz); vstore(x7, b + 7ldb * sz)
@@ -3549,7 +3552,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
         # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
         # which is what it did before and what measured better. The 8-wide reversed code stays (it is
         # correct, and verified) so a future profile can re-test it cheaply.
-        useT = _GT_TRANSPOSE && !rev
+        useT = _GT_TRANSPOSE
         useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
         rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
         # `!rev` on fusedT and NOT on useT: the fusedT slabs SKIP the pack round-trip entirely (they read
