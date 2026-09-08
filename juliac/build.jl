@@ -7,15 +7,36 @@ const ROOT = normpath(joinpath(@__DIR__, ".."))
 const OUTDIR = joinpath(@__DIR__, "build")
 mkpath(OUTDIR)
 
+# ── juliac driver resolution: in-tree (1.12) or the JuliaC.jl package (1.13+) ───────────────────────
+# Julia 1.12 ships the driver at share/julia/juliac/juliac.jl. Julia 1.13 REMOVED it — rc4 carries only
+# share/julia/test/trimming/juliac-{buildscript,trim-base,trim-stdlib}.jl, which are test fixtures, not
+# the driver — because juliac was extracted into the registered package JuliaC.jl (JuliaLang/JuliaC.jl,
+# v0.3.x, compat julia 1.10-1). Verified 2026-09-08: this script died on 1.13.0-rc4 at its own
+# existence check, which is exactly the breakage to expect from the 1.12 → 1.13 fleet move.
+#
+# The in-tree script is PREFERRED where it exists so the 1.12 CI job stays byte-for-byte unchanged;
+# everything else falls back to the package env in `juliac/toolenv`. The two take identical flags
+# (`--output-lib`, `--trim=safe`, `--compile-ccallable`, `--experimental`, `--verbose`), so the artifact
+# is the same either way — only the project the driver itself runs in differs, hence the explicit
+# `--project=$ROOT` on the fallback (the in-tree form gets it from `--project` on the julia command).
+# DELETE the in-tree branch once CI is on >= 1.13 and 1.12 is no longer built.
 const JULIAC = normpath(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl"))
-isfile(JULIAC) || error("juliac.jl not found at $JULIAC — needs Julia ≥ 1.12")
+const TOOLENV = joinpath(@__DIR__, "toolenv")
 
 const DLEXT = Sys.iswindows() ? "dll" : (Sys.isapple() ? "dylib" : "so")
 const OUT = joinpath(OUTDIR, "libpureblas." * DLEXT)
 const ENTRY = joinpath(@__DIR__, "entry.jl")
 
-cmd = `$(Base.julia_cmd()) --startup-file=no --project=$ROOT $JULIAC
-       --output-lib $OUT --experimental --trim=safe --compile-ccallable --verbose $ENTRY`
+const JCFLAGS = `--output-lib $OUT --experimental --trim=safe --compile-ccallable --verbose`
+cmd = if isfile(JULIAC)
+    @info "juliac: in-tree driver" JULIAC
+    `$(Base.julia_cmd()) --startup-file=no --project=$ROOT $JULIAC $JCFLAGS $ENTRY`
+else
+    @info "juliac: in-tree driver absent (Julia $(VERSION)) — using JuliaC.jl from $TOOLENV"
+    run(`$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV -e "using Pkg; Pkg.instantiate()"`)
+    `$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV
+     -e "using JuliaC; JuliaC.main(ARGS)" -- --project=$ROOT $JCFLAGS $ENTRY`
+end
 
 # Pin `ger_panel_np` for the trim build ONLY. ger!'s OncePerProcess auto-calibration branch (a runtime
 # benchmark) is not trim-safe; setting the preference makes the `@static if` compile that branch out. The

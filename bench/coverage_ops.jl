@@ -26,6 +26,8 @@ const EXCLUDED = Dict{Tuple{String, String, String}, Int}()   # (level, op, uarc
 # (level, op, uarch) => every commit the pb arm of that op's cells was measured at. A row is honest only
 # if these agree ACROSS the whole row; see `row_commit` for what a disagreement renders as.
 const COMMITS = Dict{Tuple{String, String, String}, Vector{String}}()
+# uarch => (julia, llvm) from that box's cache header. See the parse site for why this is surfaced.
+const TOOLCHAIN = Dict{String, Tuple{String, String}}()
 
 # The revision a ROW describes. `mixed` is not a cosmetic detail: a row whose boxes were swept at
 # different commits is exactly the provenance lie `fleet_sync.sh` exists to prevent (2026-07-31, galen
@@ -40,6 +42,24 @@ function row_commit(section, op, uarchs)
     isempty(cs) && return ("—", "n")
     u = unique(cs)
     length(u) == 1 && return (first(u)[1:min(7, end)], "h")
+    return ("⚠ mixed", "hx")
+end
+
+# The toolchain a row's numbers were produced under. Mirrors `row_commit`: one value when the whole row
+# agrees, a loud `mixed` when it does not. Redundant across rows by construction (the toolchain is per
+# box, not per routine) and that is deliberate — while the fleet is split EVERY row is a cross-compiler
+# comparison, so every row should say so rather than the reader having to hunt for one footnote.
+#
+# ⚠ LIMITATION, stated because it will bite during the 1.12 → 1.13 migration: `julia=`/`llvm=` live in
+# the cache HEADER, not in the per-arm fields (which DO carry their own `commit`). A targeted sweep
+# rewrites the header while leaving other rows' cells untouched, so a cache holding a MIX of
+# 1.12-measured and 1.13-measured cells reads as uniform here. Until the version is stamped per arm the
+# way the commit is, this column is only fully trustworthy right after a full sweep — during the
+# migration read it together with "swept at", which does distinguish the rows.
+function row_toolchain(uarchs)
+    vs = unique(String[first(get(TOOLCHAIN, ua, ("?", "?"))) for ua in uarchs])
+    isempty(vs) && return ("—", "n")
+    length(vs) == 1 && return (first(vs), "h")
     return ("⚠ mixed", "hx")
 end
 
@@ -64,6 +84,17 @@ for path in ARGS
             ua in UARCH || push!(UARCH, ua)
             fref, bf = _freq_ref(ln)
             push!(FREQMETA, (basename(path), fref, bf))
+            # TOOLCHAIN, per box. The header has carried `julia=` and `llvm=` all along and NO artifact
+            # rendered them — which is exactly how the fleet ran split for an unknown length of time
+            # without anyone seeing it: wintermute on 1.12.7/LLVM 18.1.7 while galen and neuromancer were
+            # on 1.13.0-rc3/LLVM 20.1.8. Measured 2026-09-08 on fixed silicon, the same gbtrf inner loop
+            # is 2.4-3.3x faster under LLVM 20, so a split fleet makes every CROSS-BOX comparison a
+            # comparison of compilers as much as of microarchitectures. The references are native
+            # libraries and do not move with Julia, so a newer LLVM lifts only PB's side of the ratio.
+            # It is a column, not a footnote, because the number in each cell is only meaningful next to
+            # the toolchain that produced it.
+            mj = match(r"julia=(\S+)", ln); ml = match(r"llvm=(\S+)", ln)
+            TOOLCHAIN[ua] = (isnothing(mj) ? "?" : String(mj[1]), isnothing(ml) ? "?" : String(ml[1]))
             continue
         end
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
@@ -181,7 +212,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
     println("\n#### $section\n")
     println("```@raw html")
     println("<div class=\"pbg-wrap\"><table class=\"pbg\"><thead><tr><th>routine</th>",
-            join(("<th>$ua</th>" for ua in UARCH)), "<th>swept at</th></tr></thead><tbody>")
+            join(("<th>$ua</th>" for ua in UARCH)), "<th>swept at</th><th>toolchain</th></tr></thead><tbody>")
     for op in ops
         print("<tr><th><code>$op</code></th>")
         for ua in UARCH
@@ -207,6 +238,9 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
         end
         let (h, hcls) = row_commit(section, op, UARCH)
             print("<td class=\"$hcls\"><span class=\"n\">$h</span></td>")
+        end
+        let (t, tcls) = row_toolchain(UARCH)
+            print("<td class=\"$tcls\"><span class=\"n\">$t</span></td>")
         end
         println("</tr>")
     end

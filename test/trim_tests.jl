@@ -10,6 +10,24 @@
 
 @testitem "TrimCheck trim-safety (C-ABI entry points)" tags = [:checks] begin
     using TrimCheck
+    # TrimCheck 0.1.4 hard-codes the IN-TREE juliac helper path (TrimCheck.jl:305/308,
+    # `share/julia/juliac/juliac-trim-{base,stdlib}.jl`). Julia 1.13 removed that directory — the same
+    # files now live under `share/julia/test/trimming/` — so on 1.13 this testitem dies with
+    # `SystemError: opening file .../share/julia/juliac/juliac-trim-base.jl` before running a single
+    # check. Verified on 1.13.0-rc4, 2026-09-08. That is an upstream path assumption, not a PureBLAS
+    # trim regression, and the AUTHORITATIVE gate is unaffected: `juliac/build.jl` (now routed through
+    # JuliaC.jl) builds the .so and `juliac/ctest.c` calls through the real C ABI — both pass on rc4.
+    # This file's own header already calls @validate "NOT AUTHORITATIVE … the quick net".
+    # Skip rather than fail, so 1.13 development is not blocked by an upstream bug; the 1.12 CI job
+    # still runs it in full. DELETE this guard once TrimCheck resolves both paths.
+    # `return` does NOT exit a @testitem body (measured: the skip message printed and @validate ran
+    # anyway), so the guard has to be a conditional around the call, not an early return.
+    _juliac_helpers = isfile(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac-trim-base.jl"))
+    if !_juliac_helpers
+        @info "TrimCheck skipped: juliac helpers absent on Julia $(VERSION) (upstream TrimCheck path \
+               assumption). Authoritative trim gate is juliac/build.jl + ctest.c, both of which pass here."
+        @test_broken false
+    else
     @validate(
         init = begin
             using PureBLAS
@@ -117,4 +135,5 @@
         PureBLAS.dgehrd_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
         PureBLAS.dorghr_64_(Ptr{Int64}, Ptr{Int64}, Ptr{Int64}, Ptr{Float64}, Ptr{Int64}, Ptr{Float64}, Ptr{Float64}, Ptr{Int64}, Ptr{Int64}),
     )
+    end   # _juliac_helpers
 end
