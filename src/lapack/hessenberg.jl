@@ -378,6 +378,7 @@ end
 # amortize one Y accumulation plus a WY apply over the panel, so it loses on a small active block, but
 # WHERE it loses has not been measured here on any µarch. Do not read 128 as derived.
 # ponytail: measure the crossover per µarch and derive it, once the geev cells are green. | tune: candidate
+# PDM: Literal — LAPACK ILAENV nx for dgehrd, carried over UNMEASURED here; owed a fleet crossover sweep.
 const _GEHRD_UNBLK_MAX = 128
 
 # Tiny triangular kernels for the panel. nb ≤ 32, so these are O(nb²) scalar loops rather than `trmv!`

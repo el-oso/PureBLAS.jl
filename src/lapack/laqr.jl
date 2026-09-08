@@ -352,6 +352,7 @@ end
 # 0.985 on locked Zen3 — the failure was this crossover, not a kernel gap.
 # req8-ok: a falsified derivation. The optimum is a property of the two drivers' relative cost, not of a
 # detected cache or ISA constant, and the fleet table above is the evidence. | tune: candidate
+# PDM: Literal — dlahqr-vs-dlaqr0 crossover; derivation falsified, fleet table above is the evidence.
 const _LAQR_NMIN = 200
 
 # ILAENV's 75, kept SEPARATE and at LAPACK's value. Reference LAPACK uses one constant for two jobs —
@@ -360,10 +361,20 @@ const _LAQR_NMIN = 200
 # fallback to 200 also raised the skip threshold, which changed behaviour at sizes whose DRIVER CHOICE
 # was untouched. Measured on locked Zen3, ref/pb: n=512 1.371 -> 1.233 and n=1024 1.414 -> 1.242, a
 # 10-12% regression on identical code paths. The deflation heuristic keeps its own calibrated value.
+# The five below are Reference-LAPACK's own dlaqr0/ILAENV constants, carried over at their published
+# values. They parameterise the ALGORITHM (when to skip a sweep, how fast to grow the AED window, when
+# to take exceptional shifts) — convergence heuristics of the multishift QR iteration, not tuning over
+# any detected cache size or vector width, and they take the same values in every LAPACK build on every
+# machine. Deriving them from hardware consts would be inventing a dependence that is not there.
+# PDM: Literal — LAPACK dlaqr0/ILAENV convergence constant, algorithm-intrinsic and machine-independent.
 const _LAQR_SKIPMIN = 75
+# PDM: Literal — LAPACK ispec 14 (NIBBLE), algorithm-intrinsic and machine-independent.
 const _LAQR_NIBBLE = 14    # skip a sweep when AED deflated ≥ this % of the window (ispec 14)
+# PDM: Literal — LAPACK ispec 13 window-widening threshold, algorithm-intrinsic and machine-independent.
 const _LAQR_KNWSWP = 500   # above this nh, widen the window to 3·ns/2 (ispec 13)
+# PDM: Literal — LAPACK dlaqr0 KEXNW, algorithm-intrinsic and machine-independent.
 const _LAQR_KEXNW = 5      # exceptional window growth after this many deflation-free iterations
+# PDM: Literal — LAPACK dlaqr0 KEXSH, algorithm-intrinsic and machine-independent.
 const _LAQR_KEXSH = 6      # exceptional shifts after this many deflation-free iterations
 
 # ── Aggressive early deflation (dlaqr2 semantics) ────────────────────────────────────────────────────
