@@ -132,7 +132,7 @@ html.dark .pbg-key{color:#98a1b3}
 
 ```@raw html
 <div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th><th>swept at</th><th>toolchain</th></tr></thead><tbody>
-<tr><th><code>gbtrf</code></th><td class="b3"><span class="v">0.909</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.984</span><span class="n">n=2048</span></td><td class="b1"><span class="v">0.994</span><span class="n">n=2048</span></td><td class="h"><span class="n">c44f20f</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
+<tr><th><code>gbtrf</code></th><td class="b2"><span class="v">0.985</span><span class="n">n=1000</span></td><td class="b2"><span class="v">0.975</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.0</span></td><td class="h"><span class="n">efd357a</span></td><td class="h"><span class="n">1.13.0-rc4</span></td></tr>
 <tr><th><code>gbtrs</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.03</span></td><td><span class="n">—</span></td><td class="h"><span class="n">42563f8</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>geev</code></th><td class="b3"><span class="v">0.931</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.933</span><span class="n">n=256</span></td><td class="b3"><span class="v">0.939</span><span class="n">n=256</span></td><td class="h"><span class="n">a1742db</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>gels</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.21</span></td><td class="ok"><span class="v">1.2</span></td><td class="h"><span class="n">7b4942c</span></td><td class="n"><span class="n">?</span></td></tr>
@@ -240,7 +240,7 @@ two rows routes to PureBLAS. Checked against `src/cabi/`, 2026-08-20.*
 
 | Op | Routines | Types | Routes | Zen3 | Zen4 | Zen5 | Zen4 vs OB geo/worst | Zen4 vs AOCL geo/worst |
 |---|---|---|---|---|---|---|---|---|
-| General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | **0.908** | **0.984** | **0.994** | 1.67 / 1.23 | 1.61 / 0.984 |
+| General banded LU | gbtrf, gbtrs | s/d/c/z | ✅ | **0.986** | **0.975** | 1 | 1.65 / 1.28 | 1.58 / 0.975 |
 | General tridiagonal | gtsv, gttrf, gttrs | s/d/c/z | ✅ | 1 | 1 | 0.999 | 1.34 / 1 | 1.27 / 1.03 |
 | SPD tridiagonal | pttrf, pttrs, ptsv | s/d/c/z | ✅ | **0.975** | **0.961** | **0.948** | 1.38 / 1.13 | 1.06 / 0.961 |
 | Banded Cholesky | pbtrf, pbtrs | s/d/c/z | ✅ | **0.911** | **0.921** | **0.855** | 1.48 / 1.12 | 1.35 / 0.921 |
