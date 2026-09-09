@@ -37,7 +37,24 @@ end
 # units to cover the ~5-cyc latency; MR=4 half-fills the pipe at cache-resident mid-n. Double-pumped Zen4
 # occupies each 512-bit pipe TWICE, self-hiding the latency → MR=4 suffices. AVX2 (Zen3) and NATIVE-512
 # (Zen5) re-expose it → MR=8 (Zen5 gemvN@256 was 0.86 at MR=4). Keyed on _double_pumped (silicon fact).
-const _GEMV_MR = _double_pumped(_HW) ? 4 : (_vwidth(Float64) >= 4 ? 8 : 4)
+# NOT derivable: Zen4 wants 4 while Zen3 and Zen5-mobile want 8, and after the 2026-09-09
+# datapath fix NO detected const separates them (Zen4 and Zen5-mobile are BOTH double-pumped, same L2,
+# same L3, same nvreg; only L1 32 vs 48 KiB and the family differ, and fitting a rule to that is a
+# two-point curve fit). Calibrated by `bench/calibrate.jl`; default 8 until a host pins otherwise.
+#
+# WHY THE PREDICATE DIED. It was `_double_pumped ? 4 : 8`, justified by "Zen5 gemvN@256 was 0.86 at
+# MR=4" — but that measurement was taken on neuromancer, which reads FP256 and is therefore
+# double-pumped, so the predicate handed the very box that measured MR=4 as WORSE exactly MR=4.
+#
+# FLEET TABLE (gate-exact regime, GB/s, freq-locked):
+#   Zen4 wintermute  MR=4 -> MR=8:  n=50 92.6->72.4 (-21.8%)  n=100 78.3->60.7 (-22.5%, a red cell)
+#                                   n=256 83.6->85.8 (+2.6%)  n=1000 62.3->58.0 (-7.0%)
+#   Zen5-mobile neuromancer: MR=4 measured 0.86 at gemvN@256, i.e. wants 8
+#   Zen3 galen: wants 8 (AVX2 re-exposes FMA latency; 8 accumulators cover it)
+# So 8 is right on two of three boxes and Zen4's 4 is recoverable by calibration — which is the whole
+# contract of the Measure tier, and the only form that is also correct on silicon nobody has benchmarked.
+# PDM: Measured — not derivable; Zen4 wants 4, Zen3/Zen5-mobile want 8, and no detected const separates Zen4 from Zen5-mobile (both double-pumped, same L2/L3/nvreg). Calibrated by bench/calibrate.jl `calibrate_gemv_mr`.
+const _GEMV_MR = @load_preference("gemv_mr", 8)::Int
 
 # PDM: Literal — DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure.
 const _GEMV_NP = 8             # gemv-N column-panel width
@@ -324,8 +341,13 @@ end
     return body
 end
 
-@inline function _gemv_n_paneldrv!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
-    W = _vwidth(T); mr = _GEMV_MR * W
+# `MR` is a PARAMETER, not the const read inline, so `bench/calibrate.jl` can A/B row-block heights in ONE
+# process against the REAL driver — the `_ger_np!(…, Val(NP))` shape the ger calibrator already uses.
+# Production passes `Val(_GEMV_MR)` from `_gemv_n_simd!`, so the shipped path is unchanged and still
+# const-folds. Without this the knob could only be A/B'd by editing the const and comparing ACROSS
+# processes, which is the cross-run comparison this project's methodology forbids.
+@inline function _gemv_n_paneldrv!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, ::Val{MR} = Val(_GEMV_MR)) where {T <: BlasReal, B0, MR}
+    W = _vwidth(T); mr = MR * W
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         if B0
@@ -342,7 +364,7 @@ end
             Peff = min(_GEMV_NP, n - jc)
             i0 = 0
             while i0 + mr <= m   # full row-blocks: unmasked (no per-block mask overhead)
-                _gemv_n_panel_full!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, jc, Peff, α, Val(_GEMV_MR))
+                _gemv_n_panel_full!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, jc, Peff, α, Val(MR))
                 i0 += mr
             end
             mre = m - i0          # masked remainder
@@ -355,7 +377,7 @@ end
                 elseif nv == 3
                     _gemv_n_panel!(yb, Ab, lda, xptr, jc, Peff, mre, α, Val(3))
                 else
-                    _gemv_n_panel!(yb, Ab, lda, xptr, jc, Peff, mre, α, Val(_GEMV_MR))
+                    _gemv_n_panel!(yb, Ab, lda, xptr, jc, Peff, mre, α, Val(MR))
                 end
             end
             jc += _GEMV_NP

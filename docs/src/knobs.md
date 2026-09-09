@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 133 of them.
+Every `@load_preference` key in `src/` — 135 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 133 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 8 Measured · 50 Literal · 10 Exempt.
-**Default form** (mechanical): 57 formula · 20 delegates · 6 sibling · 44 literal · 4 flag · 2 other.
+**Tier:** 65 Derived · 9 Measured · 50 Literal · 11 Exempt.
+**Default form** (mechanical): 58 formula · 20 delegates · 6 sibling · 45 literal · 4 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -40,6 +40,7 @@ Every `@load_preference` key in `src/` — 133 of them.
 | `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cger_cold_den` | literal | Derived | DRAM residency of A with cache headroom, the `_trmv_blk!` criterion; fleet table above. | candidate |
+| `gemv_mr` | literal | Measured | not derivable; Zen4 wants 4, Zen3/Zen5-mobile want 8, and no detected const separates Zen4 from Zen5-mobile (both double-pumped, same L2/L3/nvreg). Calibrated by bench/calibrate.jl `calibrate_gemv_mr`. | — |
 | `gemvn_mb` | formula | Derived | formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64` | — |
 | `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
@@ -126,6 +127,7 @@ Every `@load_preference` key in `src/` — 133 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `force_hooks` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
+| `fp_datapath_bytes` | formula | Exempt | a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and | — |
 | `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 
 ## LAPACK · banded_chol

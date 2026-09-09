@@ -76,7 +76,11 @@ const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", 
                        "pbtrf_cross_kd", "pbtrf_u_native_kd", "pbtrf_nb", "pbtrf_nb_small",
                        "brd_nb", "sytrf_cmult",
                        # written by bench/calibrate.jl's KNOBS but previously unlisted here:
-                       "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult")
+                       "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
+                       # 2026-09-09: gemv-N row-block height. Measure tier by necessity — after the
+                       # datapath correction no detected const separates Zen4 (wants 4) from
+                       # Zen5-mobile (wants 8); see bench/calibrate.jl `calibrate_gemv_mr`.
+                       "gemv_mr")
 
 """
 Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.

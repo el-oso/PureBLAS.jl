@@ -236,7 +236,14 @@ const _SLUGOVR = let i = findfirst(a -> startswith(a, "slug="), ARGS)  # `let` �
     isnothing(i) ? nothing : ARGS[i][6:end]
 end
 const _HWB = PureBLAS._HW
-const _AUTOSLUG = _W64P == 8 ? (PureBLAS._double_pumped(_HWB) ? "avx512" : "zen5") :   # Zen4 dp-512 vs Zen5 native
+# The slug is a BOX LABEL and must be STABLE: it names the cache file (`plots_data_$(SLUG)_$(host).txt`,
+# :1531), keys the plot series (:2098) and is referenced by bench/artifact_build.sh and
+# coverage_routing.jl. It used to key on `_double_pumped`, which was a proxy for "Zen4 vs Zen5" — that
+# stopped being true on 2026-09-09 when the datapath became a detected CPUID fact and neuromancer (a
+# Krackan mobile Zen5) correctly turned out double-pumped. Keying the LABEL on the µarch family keeps
+# neuromancer on "zen5" and avoids colliding it with wintermute's "avx512" / orphaning its cached
+# reference arms. The physical fact is stamped separately into every header as `datapath=`/`dp=` (:315).
+const _AUTOSLUG = _W64P == 8 ? (PureBLAS._CPU_FAMILY == 0x1A ? "zen5" : "avx512") :
     _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
 # ISA is the instruction set (AVX-512 for BOTH Zen4 double-pumped and Zen5 native — the native-vs-pumped
 # distinction is a µarch trait, carried by `uarch=` now, not the ISA). Keeping them both AVX-512 avoids the

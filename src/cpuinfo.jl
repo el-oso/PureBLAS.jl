@@ -9,7 +9,7 @@
 #   Zen3     (AVX2)     -> 32 bytes -> Vec{4,Float64}, Vec{8,Float32}
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
-using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize, cpuid
+using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize, cpuid, hasleaf
 using CPUSummary: cache_size
 using Preferences: @load_preference, load_preference
 
@@ -198,22 +198,65 @@ const _CPU_FAMILY = @load_preference(
 # Architectural vector registers: 32 (AVX-512, AArch64 NEON) vs 16 (AVX2/SSE) — the register budget cap.
 const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 
+# FP EXECUTION DATAPATH WIDTH in bytes — a DETECTED CAPABILITY, not an identity lookup.
+#
+# A "double-pumped" core has full-width vector REGISTERS but a narrower FP datapath: a 512-bit FMA
+# occupies the 256-bit pipes twice. AMD reports this directly in CPUID Fn8000_001A EAX ("performance
+# optimization identifiers"): bit0 FP128, bit2 FP256, bit3 FP512 = "512-bit AVX full-width pipelines".
+#
+# WHY A CAPABILITY BIT AND NOT A FAMILY/MODEL TABLE. This was a family lookup (`family == 0x19`) until
+# 2026-09-09, when it was found WRONG: family 0x1A covers both native-512 parts (Granite Ridge desktop,
+# Turin server, Strix Halo) and double-pumped mobile ones (Strix Point, Krackan). neuromancer — a
+# Krackan Ryzen AI 5 340 — was declared native and ran TEN arms off the wrong datapath; correcting just
+# `_at_gemvn_minner` was worth +24.8% on gemvN@2100, the fleet's worst gate cell. A model table would
+# not have fixed it either: AMD firmware can switch Turin between FP512 and FP256 mode on the SAME
+# silicon, so identity does not determine the fact. The bit does, and it describes parts nobody has
+# benchmarked — which is the whole point of req#7/#8.
+#
+# Verified against live CPUID on all three fleet boxes and public dumps for every Zen5 variant:
+#   galen Zen3 0b0110 FP256 · wintermute Zen4 0b0110 FP256 · neuromancer Krackan 0b0110 FP256
+#   Granite Ridge 0x0A FP512 · Turin 0x0A · Strix Halo 0x0A · Strix Point 0x06 · Krackan 0x06
+# Zen1 reads FP128, i.e. a 16 B datapath, which no one has ever tuned for and now falls out for free.
+#
+# NON-AMD: the leaf does not exist, so this degrades to the register width — exactly the previous
+# default for every non-AMD part, so nothing regresses. `hasleaf` is REQUIRED: `CpuId.cpufeature` has no
+# max-leaf guard and Intel returns the highest basic leaf's data for out-of-range queries, which would
+# make bit 2 garbage there.
+# PDM: Exempt — a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and
+# trim builds, not for tuning.
+const _FP_DATAPATH_BYTES = @load_preference("fp_datapath_bytes", let w = _SIMD_BYTES
+        ok = (Sys.ARCH === :x86_64 || Sys.ARCH === :i686) && (try
+                hasleaf(0x8000_001a)
+            catch
+                false
+            end)
+        if !ok
+            w
+        elseif (try cpufeature(:FP128) catch; false end)
+            min(w, 16)
+        elseif (try cpufeature(:FP256) catch; false end)
+            min(w, 32)
+        else
+            w
+        end
+    end
+)::Int
+
 # Hardware descriptor: the detected machine as a plain NamedTuple const (every field a load-time const →
 # the derivation functions below const-fold when called with `_HW`). The functions take a `hw` arg (not the
 # globals) so they are PURE and the fleet table is an offline unit test (test/autotune_tests.jl feeds
 # Zen3/Zen4/Zen5/TigerLake descriptors and asserts the measured optima). req#8.
 const _HW = (
-    simd = _SIMD_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
+    simd = _SIMD_BYTES, fpw = _FP_DATAPATH_BYTES, l1 = _L1_BYTES, l2 = _L2_BYTES, l3 = _L3_BYTES,
     vendor = _CPU_VENDOR, family = _CPU_FAMILY, nvreg = _NVREG,
 )
 
 @inline _lanes(hw, ::Type{T}) where {T} = max(1, hw.simd ÷ sizeof(T))
-# Double-pumped SIMD: full-width registers but HALF-width FP datapath (a 512-bit op occupies the 256-bit
-# pipes twice). NOT CPUID-discoverable — the one legitimate family lookup (silicon FACTS, not tuned magic):
-# AMD family 0x19 + AVX-512 = Zen4 (Zen3 shares 0x19 but simd==32 excludes it). Zen5 (0x1A) + all Intel
-# AVX-512 = native. Extend as µarchs appear; unknown families default to native (the conservative side).
-@inline _double_pumped(hw) = hw.simd == 64 && hw.vendor === :AMD && hw.family == 0x19
-@inline _datapath_bytes(hw) = _double_pumped(hw) ? hw.simd ÷ 2 : hw.simd
+# Double-pumped SIMD: full-width registers but a HALF-width FP datapath. Read straight off the detected
+# `fpw` (see `_FP_DATAPATH_BYTES`) — no vendor, family or model branch, so it is correct on silicon
+# nobody has benchmarked. `min` keeps a pinned `simd_bytes` cross-compile coherent with a detected fpw.
+@inline _datapath_bytes(hw) = min(hw.simd, hw.fpw)
+@inline _double_pumped(hw) = hw.fpw < hw.simd
 
 @inline _round_dn(x::Int, m::Int) = max(m, x - rem(x, m))        # largest multiple of m ≤ x (≥ m)
 @inline _avoid_po2(x::Int, m::Int) = ispow2(x) ? x - m : x       # dodge power-of-2 strides (set aliasing)
@@ -391,7 +434,19 @@ const _GEMM_SPLIT_S = 2
 # ships mode 0 and takes blocked there — leaving ~3.9% on a cell that gates at 0.993. No window over
 # detected consts separates n=512 from n=1024 (2 vs 8 MiB, identical caches), so closing it wants a PIN
 # from `tune!()`, not another predicate. Reported, not fixed: the Pin tier is the user's.
-@inline _at_gemvt_perscan(hw) = _double_pumped(hw) ? 1 : 0
+# DEFAULT 0, predicate DROPPED (2026-09-09). It was `_double_pumped(hw) ? 1 : 0`, i.e. mode 1 for Zen4.
+# Two reasons it goes:
+#  (1) The datapath fix would flip neuromancer (FP256) from 0 to 1 — and the notes above record mode 1
+#      costing Zen5 2.0%. Keeping the predicate would ship a known regression on that box.
+#  (2) Mode 1 was never actually shipping anywhere. Zen4's derivation said 1, but this machine pins
+#      `gemvt_perscan = false` and `juliac/build.jl:123` pins it false for the trim build, so every
+#      box already runs mode 0. The predicate's Zen4 win (+11% at n=512) is unrealised either way.
+# The notes above are explicit that this is a PER-SIZE routing question that no window over detected
+# consts can settle (n=512 vs n=1024 have identical caches), and that it wants a PIN from `tune!()`.
+# `bench/calibrate.jl:125 calibrate_gemvt_window` already exists for exactly that. So: ship the arm that
+# is correct on two of three boxes and unrealised on the third, and let the Pin tier recover Zen4's cell.
+# PDM: Literal — falsified derivation; per-size routing belongs to `tune!()`, not a µarch predicate. | req8-ok
+@inline _at_gemvt_perscan(hw) = 0
 # STRASSEN threshold and the trmm side-R pack cut — both key on the REAL DATAPATH WIDTH, and both are
 # derivations, not lookups. `_datapath_bytes` separates the fleet exactly: Zen3 is 32 B natively, Zen4
 # double-pumps its 512-bit ops over a 256-bit path so it is ALSO 32 B, and only Zen5 is a native 64 B
@@ -448,8 +503,24 @@ const _GEMM_SPLIT_S = 2
 
 @inline _at_gemvn_minner(hw) = _datapath_bytes(hw) < 64
 
-@inline _at_strassen_min(hw) = _datapath_bytes(hw) >= 64 ? 256 : 1024
-@inline _at_trmm_rpack(hw) = _datapath_bytes(hw) >= 64 ? 1792 : 448
+# FALSIFIED PREDICATE, now a fleet-evidenced literal (2026-09-09). This was
+# `_datapath_bytes(hw) >= 64 ? 256 : 1024`, justified as "Zen3 and Zen4 measured FLAT while Zen5 wants
+# very different values". That reasoning died with the datapath fix: the box that supplied the "Zen5
+# native-512" optimum is neuromancer, which reads FP256 — a 32 B datapath, the SAME side as Zen3/Zen4.
+# So the real fleet evidence is: FLAT on two boxes (zen3, zen4 — see test/autotune_tests.jl), and 256
+# WINS on the third (freq-locked, 4 runs, 1.0155/1.0756/1.0625/1.0565/1.0000 at n=256..4096, no losing
+# cell). A value that is flat on two machines and wins on the third is a LITERAL with fleet evidence,
+# not a derivation — and keeping the predicate would now flip neuromancer to 1024, the arm it measured
+# as WORSE. The mechanism prose was backwards on its face too: cheaper FMAs make Strassen's
+# flops-for-adds trade LESS attractive, not more.
+# PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
+@inline _at_strassen_min(hw) = 256
+# FALSIFIED PREDICATE, now a fleet-evidenced literal — same story as `_at_strassen_min` directly above.
+# Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on neuromancer
+# (2 locked runs: 1.0011/1.0813/1.0703 at n=256/512/1024) — and neuromancer is a 32 B datapath, so the
+# predicate would now hand it 448, the arm it measured as worse.
+# PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
+@inline _at_trmm_rpack(hw) = 1792
 # (c5b) The two BOUNDS of the per-column window, made pinnable 2026-08-21. They were hardcoded as
 # `_L2_BYTES` and `_L1_BYTES ÷ 2` inside the predicate; the defaults below are those same two values,
 # so an unpinned build routes IDENTICALLY — this is a knob-SHAPE change, not a behaviour change.

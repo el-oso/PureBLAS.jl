@@ -5,13 +5,31 @@
 @testitem "AutoTune: formulas reproduce fleet-measured optima" begin
     using PureBLAS
     P = PureBLAS
-    hw(simd, l1, l2, l3, vendor, family, nvreg) =
-        (simd = simd, l1 = l1, l2 = l2, l3 = l3, vendor = vendor, family = family, nvreg = nvreg)
+    # `fpw` = FP execution datapath width in bytes, detected from CPUID Fn8000_001A on the real host
+    # (see `_FP_DATAPATH_BYTES`). It defaults to `simd` (native full-width) so only double-pumped
+    # descriptors have to say so. Stating it EXPLICITLY is the point: before 2026-09-09 this was inferred
+    # from `family`, which cannot express that family 0x1A holds BOTH native-512 parts (Granite Ridge,
+    # Turin) and double-pumped mobile ones (Strix, Krackan) — and AMD firmware can even switch the same
+    # Turin die between the two.
+    hw(simd, l1, l2, l3, vendor, family, nvreg; fpw = simd) =
+        (simd = simd, fpw = fpw, l1 = l1, l2 = l2, l3 = l3, vendor = vendor, family = family, nvreg = nvreg)
     #                     simd        l1        l2         l3       vendor  fam   nvreg
     zen3 = hw(32, 32 * 1024, 512 * 1024, 32 * 1024^2, :AMD, 0x19, 16)  # Zen3, AVX2 (L2 512K, L3 1 CCD)
-    zen4 = hw(64, 32 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x19, 32)   # Zen4, double-pumped 512
-    zen5 = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32)   # Zen5, native 512
+    zen4 = hw(64, 32 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x19, 32; fpw = 32)   # Zen4, double-pumped 512
+    zen5 = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32)   # Zen5 DESKTOP/SERVER (Granite Ridge,
+    #                                                                 Turin): FP512, genuinely native
+    # Zen5 MOBILE (Strix/Krackan) — reads FP256, so it must land with zen4 on every datapath-keyed knob.
+    # This is neuromancer (Ryzen AI 5 340, family 0x1A model 0x60); the old family lookup called it native.
+    zen5m = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32; fpw = 32)
     tigerlake = hw(64, 48 * 1024, 1280 * 1024, 12 * 1024^2, :Intel, 0x06, 32)  # never benchmarked — prediction
+    #                                                        (no Fn8000_001A on Intel ⇒ fpw = simd)
+
+    # The detected fact itself, and that the host descriptor carries it.
+    @test P._datapath_bytes(zen5m) == 32
+    @test P._double_pumped(zen5m)
+    @test !P._double_pumped(zen5)
+    @test P._HW.fpw == P._FP_DATAPATH_BYTES
+    @test P._double_pumped(P._HW) == (P._HW.fpw < P._HW.simd)
 
     # ── Complex Cholesky (wired to derived defaults): must reproduce the measured optima ──────────────
     @test P._at_cpotrf_base(zen3) == 48
@@ -128,10 +146,17 @@
     # every detected const relevant here — L2, L3, `_NVREG`, SIMD width, working set — and still want
     # OPPOSITE arms at n=1024, so this stays a KEYED LITERAL and the label is accurate, not lazy.
     # Full evidence and the two weaker instruments that misled earlier attempts: cpuinfo.jl (c5).
-    @test P._at_gemvt_perscan(zen4) == 1    # Zen4: percol 1.113 @512, 1.25 @1024
-    @test P._at_gemvt_perscan(zen5) == 0   # Zen5: percol LOSES ~10% @1024 — mode 1 regresses it
-    @test P._at_gemvt_perscan(zen3) == 0         # AVX2: blocked, forcing mode 1 costs it 29%
-    @test P._at_gemvt_perscan(tigerlake) == 0     # unseen hardware gets the conservative arm
+    # PREDICATE DROPPED 2026-09-09 — now a flat 0 for every descriptor. Two reasons, both in cpuinfo.jl:
+    #  (1) the datapath correction would have flipped Zen5-MOBILE (FP256 ⇒ double-pumped) from 0 to 1,
+    #      and mode 1 is recorded as costing that box ~10% @1024 — a known regression, shipped by
+    #      derivation;
+    #  (2) mode 1 was never actually reaching any box: wintermute pins `gemvt_perscan = false` and
+    #      juliac/build.jl:123 pins it false for the trim build.
+    # Zen4's win (percol 1.113 @512, 1.25 @1024) is real but is now recovered by a PIN, not a predicate
+    # — the same contract `gemv_mr` moved to. The `gemvt_perscan` preference already exists for that.
+    for d in (zen3, zen4, zen5, zen5m, tigerlake)
+        @test P._at_gemvt_perscan(d) == 0
+    end
 
     # gemv-T per-column WINDOW BOUNDS, exposed 2026-08-21. BEHAVIOUR-NEUTRALITY IS THE POINT: the
     # defaults must be exactly the two values that were hardcoded in `_gemvt_perscan`, or an unpinned
@@ -177,28 +202,22 @@
     @test P._CPOTRF_BASE == P._at_cpotrf_base(P._HW)
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)
     @test P._CPOTF2_MR == P._at_cpotf2_mr(P._HW)
-# ── strassen_min / trmm_rpack: derived from the REAL DATAPATH WIDTH ──────────────────────────────
-# Zen4 double-pumps 512-bit ops over a 256-bit path, so its effective datapath is 32 B — the SAME
-# as native-AVX2 Zen3. Only Zen5 is a native 64 B datapath. That is exactly why Zen3 and Zen4
-# measured FLAT on both knobs while Zen5 wants very different values, and it is why the predicate
-# is `_datapath_bytes` and not `_vwidth` (which cannot tell Zen4 from Zen5) or `_double_pumped`
-# (which cannot tell Zen3 from Zen5).
+# ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
+# These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
+# while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
+# "Zen5" box supplying the native-512 optimum is neuromancer, which reads FP256 from CPUID
+# Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
+# "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
+# hand neuromancer the arm it measured as WORSE.
 @test P._datapath_bytes(zen3) == 32
 @test P._datapath_bytes(zen4) == 32
-@test P._datapath_bytes(zen5) == 64
-# Zen3/Zen4 keep the shipped values — the change must be a no-op off native-512.
-@test P._at_strassen_min(zen3) == 1024
-@test P._at_strassen_min(zen4) == 1024
-@test P._at_trmm_rpack(zen3) == 448
-@test P._at_trmm_rpack(zen4) == 448
-# Zen5 takes the measured optima (freq-locked, 4 runs for strassen_min, 2 locked for trmm_rpack):
-#   strassen_min 256  -> 1.0155/1.0756/1.0625/1.0565/1.0000 at n=256..4096, no losing cell
-#   trmm_rpack   1792 -> 1.0011/1.0813/1.0703 at n=256/512/1024
-@test P._at_strassen_min(zen5) == 256
-@test P._at_trmm_rpack(zen5) == 1792
-# Tigerlake is native-512 too, so it inherits the Zen5 side — a PREDICTION, never benchmarked.
-@test P._at_strassen_min(tigerlake) == 256
-@test P._at_trmm_rpack(tigerlake) == 1792
+@test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native
+@test P._datapath_bytes(zen5m) == 32     # Strix / Krackan: FP256, lands with zen4
+# One value everywhere — no descriptor changes it.
+for d in (zen3, zen4, zen5, zen5m, tigerlake)
+    @test P._at_strassen_min(d) == 256
+    @test P._at_trmm_rpack(d) == 1792
+end
 # Live machine agrees with the formula applied to its own detected _HW.
 @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
 @test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)

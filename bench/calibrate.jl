@@ -374,7 +374,51 @@ function calibrate_gbtrf_cmult(::Type{T} = Float64) where {T}
     return Pair{String, Any}["gbtrf_cmult" => parse(Int, string(name))]
 end
 
+# ── gemv_mr: row-block height in vectors (mr = MR·W rows) ───────────────────────────────────────────
+# MEASURE TIER BY NECESSITY. Zen4 wants 4 while Zen3 and Zen5-mobile want 8, and after the 2026-09-09
+# datapath correction NO detected const separates them: Zen4 and Zen5-mobile are BOTH double-pumped,
+# with the same L2, L3 and register count. Only L1 (32 vs 48 KiB) and the family differ, and a rule fit
+# to that is a two-point curve fit — the failure that produced the bug this knob is being rescued from.
+# Fleet evidence behind the shipped default of 8 (gate-exact regime, freq-locked, GB/s):
+#   Zen4  MR=4 -> 8: n=50 92.6->72.4 (-21.8%), n=100 78.3->60.7 (-22.5%), n=256 83.6->85.8 (+2.6%)
+#   Zen5-mobile: MR=4 measured 0.86 at gemvN@256, i.e. wants 8;  Zen3: wants 8
+# So 8 is right on two boxes of three and this calibrator is how Zen4 recovers its 4.
+#
+# SIZES: MR trades accumulator count against register pressure, and the fleet split shows up at
+# CACHE-RESIDENT mid-n (n=100 is a red cell on Zen4), not at DRAM scale where bandwidth dominates.
+# Measure there. Arms run through the REAL driver via `Val(MR)` — the `_ger_np!(…, Val(NP))` shape —
+# so this is not a prototype that can diverge from the shipped kernel.
+function calibrate_gemv_mr(::Type{T} = Float64) where {T}
+    inc = PureBLAS._GEMV_MR
+    cands = filter(!=(inc), [4, 8])
+    isempty(cands) && return Pair{String, Any}[]
+    n = 100                                        # the cell the fleet split is largest at
+    setup() = (randn(T, n, n), randn(T, n), randn(T, n))
+    run(c, MR) = MR == 4 ?
+        PureBLAS._gemv_n_paneldrv!(n, n, one(T), c[1], c[2], c[3], zero(T), Val(true), Val(4)) :
+        PureBLAS._gemv_n_paneldrv!(n, n, one(T), c[1], c[2], c[3], zero(T), Val(true), Val(8))
+    arms = vcat([inc => (c -> run(c, inc))], [mr => (c -> run(c, mr)) for mr in cands])
+    @printf("  gemv_mr @ n=%d (cache-resident, where the fleet split is largest): incumbent %d, candidates %s\n",
+        n, inc, cands)
+    res, ok, drift = with_anchor(() -> Measure.ab(arms; rounds = ROUNDS, setup = setup); tol = TOL)
+    for r in res
+        @printf("    MR=%-2d  %.4f  [%.4f, %.4f]\n", r.name, r.ratio, r.lo, r.hi)
+    end
+    if !ok
+        @printf("    ⇒ REFUSED: machine state moved %.1f%% across the measurement — not adjudicable\n", 100 * drift)
+        return Pair{String, Any}[]
+    end
+    name, verdict = decide(res; delta = DELTA)
+    if verdict !== :win
+        println(noswitch_msg(verdict))
+        return Pair{String, Any}[]
+    end
+    @printf("    ⇒ WINNER MR=%d\n", name)
+    return Pair{String, Any}["gemv_mr" => name]
+end
+
 const KNOBS = (
+    (name = "gemv_mr", fn = calibrate_gemv_mr),
     (name = "ger_panel_np", fn = calibrate_ger_np),
     (name = "gemvt_percol_window", fn = calibrate_gemvt_window),
     (name = "potrf_upper_direct_max", fn = calibrate_potrf_udirect),
