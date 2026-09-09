@@ -44,7 +44,14 @@ function row_commit(section, op, uarchs)
         push!(cs, c)
     end
     isempty(cs) && return ("—", "n")
-    u = unique(cs)
+    # COMPARE ON A COMMON PREFIX, not with `==`. git chooses its abbreviation length per REPOSITORY
+    # (object count), so the same commit is recorded `7aae0d6` on one box and `7aae0d6b` on another —
+    # and a raw string compare then reports `⚠ mixed` for a row every box measured identically.
+    # Observed 2026-09-09: wintermute wrote 8 chars while galen and neuromancer wrote 7, and every
+    # BLAS-3 row read mixed. Abbreviations of one commit are prefixes of one another, so truncating to
+    # the shortest present is the correct comparison; genuinely different commits still differ.
+    n = minimum(length, cs)
+    u = unique(c[1:n] for c in cs)
     length(u) == 1 && return (first(u)[1:min(7, end)], "h")
     return ("⚠ mixed", "hx")
 end
@@ -73,7 +80,10 @@ function row_toolchain(section, op, uarchs)
         cs = get(COMMITS, (section, op, ua), String[])
         isempty(cs) && continue
         hc = get(HEADCOMMIT, ua, "")
-        if !isempty(hc) && all(==(hc), cs)
+        # Prefix compare, same reason as `row_commit`: the header and the cells can carry different
+        # abbreviation lengths of the SAME commit, which made every row read `?` in the toolchain column.
+        np = isempty(hc) ? 0 : min(length(hc), minimum(length, cs))
+        if np > 0 && all(c -> c[1:np] == hc[1:np], cs)
             push!(vs, first(get(TOOLCHAIN, ua, ("?", "?"))))
         else
             unknown = true          # measured before the run that wrote this header
