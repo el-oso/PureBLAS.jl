@@ -433,7 +433,71 @@ end
 # Pack a kc_eff×nc_eff block of op(B) into nr-col panels (zero-padded). `boff` lets the block be written
 # into the middle of a larger panel buffer (used by the in-place trmm, which packs a whole B column-panel
 # across all pc-blocks before overwriting B). AbstractVector so a `view` into that buffer is accepted.
-function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
+# ── B-pack: COMPILE-TIME nr on the hot width ─────────────────────────────────────────────────────
+# `_pack_B_dyn!` below is the original, and it stays the fallback for any width. The problem it has is
+# that `nr` is a runtime `::Int`: every caller derives it from a `Val{NR}` type parameter or from the
+# `_NR` const, so the value IS known at each call site, but Julia specializes on TYPE, not value, and
+# this function is far too big to inline — so the constant never reaches the loop body.
+#
+# That matters because the tB=true branch's inner loop is `for c in 0:(nr-1)`, i.e. FOUR iterations on
+# AVX2. With a runtime bound LLVM must emit the full vectorized-loop scaffolding — guard, preheader,
+# vector body, scalar remainder — around what should be one 32-byte move. Measured on the runtime-nr
+# signature: 28 `<4 x double>` but 31 `vector.body` / 8 `vector.ph` across 620 LLVM lines.
+#
+# Why it was worth chasing: the syrk phase decomposition (bench/probes/syrk_small_phasefrac.jl, galen
+# 1875dad, in-situ Profile attribution, consistency 0.956-1.027) put pack B at 23.6% of syrk@50 and
+# 17.3% of syrk@100 — TWICE pack A's share for the same data volume, which is the tell that the cost is
+# scaffolding rather than traffic. Isolated A/B, byte-identical output (bench/probes/packb_val_ab.jl):
+#     n=50  1.060 -> 0.500 us (2.12x)    n=100 3.060 -> 1.570 (1.95x)
+#     n=250 29.96 -> 15.14  us (1.98x)   n=500 89.56 -> 59.21 (1.51x)
+# The dispatch below costs one integer compare per packed block (not per element), against a pack that
+# is O(kce·nce).
+@inline function _pack_B!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
+    nr == _NR && return _pack_B_val!(Bp, B, pc, jc, kce, nce, tB, Val(_NR), boff)
+    return _pack_B_dyn!(Bp, B, pc, jc, kce, nce, tB, nr, boff)
+end
+
+# Compile-time-nr twin of `_pack_B_dyn!`. Same memory order, same zero-fill of the ragged tail; the ONLY
+# difference is that `NR` is a type parameter, so the c-loops have constant trip counts.
+function _pack_B_val!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, ::Val{NR}, boff::Int = 0) where {T, NR}
+    np = cld(nce, NR)
+    @inbounds for ji in 0:(np - 1)
+        base = boff + ji * NR * kce
+        if ji * NR + NR <= nce
+            j0 = jc + ji * NR
+            if tB
+                for p in 0:(kce - 1)
+                    gp = pc + p
+                    @simd ivdep for c in 0:(NR - 1)
+                        Bp[base + p * NR + c + 1] = B[j0 + c + 1, gp + 1]
+                    end
+                end
+            else
+                for c in 0:(NR - 1)
+                    j = j0 + c
+                    @simd ivdep for p in 0:(kce - 1)
+                        Bp[base + p * NR + c + 1] = B[pc + p + 1, j + 1]
+                    end
+                end
+            end
+            continue
+        end
+        for p in 0:(kce - 1)
+            for c in 0:(NR - 1)
+                lc = ji * NR + c
+                Bp[base + p * NR + c + 1] = if lc < nce
+                    gj = jc + lc; gp = pc + p
+                    tB ? B[gj + 1, gp + 1] : B[gp + 1, gj + 1]
+                else
+                    zero(T)
+                end
+            end
+        end
+    end
+    return
+end
+
+function _pack_B_dyn!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * nr * kce
