@@ -2528,7 +2528,7 @@ end
     return body
 end
 
-@inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y) where {T <: BlasReal}
+@inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP}
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
@@ -2538,9 +2538,9 @@ end
         jb = 0
         while jb + NB <= n                                  # full column panels (unified kernel)
             if up
-                _symv_upperpanel!(jb + NB, α, base + jb * lda * sz, lda, xp, yp, Val(_SYMV_MR), Val(NB))
+                _symv_upperpanel!(jb + NB, α, base + jb * lda * sz, lda, xp, yp, Val(MRP), Val(NB))
             else
-                _symv_lowerpanel!(n - jb, α, base + (jb + jb * lda) * sz, lda, xp + jb * sz, yp + jb * sz, Val(_SYMV_MR), Val(NB))
+                _symv_lowerpanel!(n - jb, α, base + (jb + jb * lda) * sz, lda, xp + jb * sz, yp + jb * sz, Val(MRP), Val(NB))
             end
             jb += NB
         end
