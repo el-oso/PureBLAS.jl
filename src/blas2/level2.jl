@@ -2418,6 +2418,28 @@ const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators i
 # of that is structural (8 strided column streams plus x and a y RMW, versus one contiguous stream),
 # but the gate only asks for AOCL's ~5%.
 const _SYMV_MR = 2
+const _SYMV_MR_RESIDENT = 4
+
+# WHICH MR: a RESIDENCY criterion, not a flat literal. Every measured gain for MR=2 is out of L3 and
+# the only measured loss is in it, so the split is where the stored triangle stops fitting:
+#     wintermute (L3 16 MiB)   n=1024 1.0044   n=2048 1.0453   n=4096 1.0361
+#     galen      (L3 32 MiB)   n=1024 1.0063   n=2048 1.0159   n=4096 1.0015
+#     neuromancer(L3 16 MiB)   n=1024 0.9892   n=2048 1.0208   n=4096 1.0002
+# The lone loss (neuromancer n=1024, -1.1%) is NOT harmless: sytri is 93.3% symv-bound and its red
+# cells are at n=1000/1024 on that box, so a flat MR=2 moved sytri@1000 0.973->0.948 and @1024
+# 0.972->0.956. Gating on residency keeps every out-of-L3 gain and gives that size back.
+#
+# Half of L3 is the threshold rather than all of it because symv also streams x and y and shares L3
+# with them; at exactly L3 the triangle is already thrashing (wintermute n=2048 is 16.1 MiB against
+# a 16.0 MiB L3 and wants MR=2). It costs galen +0.6% at n=1024, which is the price of not losing
+# 1.1% on neuromancer at the same size.
+#
+# ⚠ MECHANISM NOT ESTABLISHED — this is a residency-shaped rule fitted to 3 sizes x 3 boxes, not a
+# derivation. The obvious mechanism is FALSIFIED: a LARGER MR should have helped by visiting each of
+# the NB=8 column streams deeper before jumping lda (DRAM row locality), and the sign is opposite.
+@inline function _symv_mr(n::Int, ::Type{T}) where {T}
+    return (n * (n + 1) ÷ 2) * sizeof(T) >= (_L3_BYTES ÷ 2) ? _SYMV_MR : _SYMV_MR_RESIDENT
+end
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
 # accumulating gemv-N into y (yp) and gemv-T into the d_c (one A load feeds both). masked ⇒ guard
@@ -2554,7 +2576,14 @@ end
     return body
 end
 
-@inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP}
+@inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y) where {T <: BlasReal}
+    # Residency-gated row-panel height (see `_symv_mr`). Two specializations, chosen once per call
+    # against a driver that then loops over n columns — not in any inner loop.
+    return _symv_mr(n, T) == 2 ? _symv_simd_mr!(up, n, α, A, x, y, Val(2)) :
+           _symv_simd_mr!(up, n, α, A, x, y, Val(4))
+end
+
+@inline function _symv_simd_mr!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP}) where {T <: BlasReal, MRP}
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
