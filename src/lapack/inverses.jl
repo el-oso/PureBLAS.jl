@@ -253,7 +253,6 @@ end
 # galen's own optimum anyway (0.940 -> ~0.958). Changing it would be a per-µarch fit for cells that
 # already pass on two boxes. Left as `_lu_nb` until there is a reason and a rule.
 @inline _getri_nb(n::Int) = n >= 512 ? 192 : _lu_nb(n)
-
 # PUBLIC ENTRY: positional only. The block width hook lives on the internal `_getri!` below, NOT as a
 # keyword on this method — at n=8 the whole call is ~400 ns, so a keyword-sorting frame on the public
 # path is a measurable fraction of it, and `getri@8` is already the routine's worst cell (0.68-0.81
@@ -276,6 +275,29 @@ function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int)
     # `while`, which is where it already was: the shape is loop-invariant, so nothing needed moving and
     # `@scope`'s loop rule has nothing to reject. It does NOT escape: `W` is only ever sliced into
     # `gemm!`/`trsm!` arguments, and `getri!` returns `A`.
+    #
+    # ⛔ SMALL-n UNBLOCKED PATH: MEASURED AND REJECTED (2026-09-10). `getri@8` is this routine's worst
+    # cell everywhere (0.694 galen, 0.806 wintermute; AOCL ~1.47x ahead), and at n <= nb there is only
+    # ONE block column, so the W scratch, the arena and the side-R trsm are all fixed cost around a
+    # single tiny solve. LAPACK's unblocked dgetri inner loop — a length-n work VECTOR and one gemv
+    # per column, no scratch matrix, no trsm, no arena — looked like the obvious answer. It is not:
+    #
+    #   in-process ABBA, Chairmarks median, blocked / unblocked
+    #     n=8  366 vs 401 ns (0.913)   n=16  1242 vs 1392 (0.892)
+    #     n=32 4960 vs 5250  (0.945)   n=48 11602 vs 12348 (0.940)
+    #
+    # The blocked path wins at EVERY size the crossover would have covered, so there is no crossover.
+    # The premise was also wrong: at n <= nb the blocked path never calls `gemm!` at all (the
+    # `j + jb <= n` guard below is false), so it is trtri + ONE trsm, and the unblocked form replaces
+    # that one trsm with n-1 `gemv!` entries at ~60 ns each. It cannot win.
+    #
+    # The rejected version also allocated: a bare `Vector{T}(undef, n)` is 128-480 B, which would have
+    # reddened the all-paths AllocCheck proof on `_strict_getri_probe` (src/verify.jl:604, run at
+    # n=32 where `_lu_nb(32)=48`, i.e. exactly in the rejected path's range). The arena `borrow!` it
+    # was avoiding costs the same 40 ns, so the allocation bought nothing either.
+    #
+    # THE REAL TARGET at n=8 is the 181 ns one-block body — zeroing an 8x8 W, copying 28 elements and
+    # one `trsm!` keyword entry — not the choice of algorithm.
     @scope arn begin
         W = borrow!(arn, T, n, nb)
         j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
