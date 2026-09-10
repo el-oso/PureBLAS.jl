@@ -229,13 +229,19 @@ end
 # so getri! allocates nothing. Safe against a reused buffer: each block column writes rows j:n of its
 # jb columns (the jb×jb diagonal zeroing plus the strict-lower stash) and reads only rows j:n; rows
 # 1:j−1 are never read, so no stale value from a previous call can be consumed.
-function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}) where {T}
+function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer};
+                nb::Int = 0) where {T}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("getri!: A must be square"))
     length(ipiv) >= n || throw(DimensionMismatch("getri!: ipiv shorter than n"))
     n == 0 && return A
     trtri!(A; uplo = 'U', diag = 'N')                       # 1. inv(U), in place
-    nb = max(1, min(_lu_nb(n), n))
+    # `nb` is a parameter ONLY so a probe can A/B the block width against the real routine in one
+    # process; `nb = 0` means "use the default" and is what every caller passes. The default is
+    # `_lu_nb`, which is tuned for GETRF's shapes (a panel factor plus a square-ish trailing gemm),
+    # not getri's (a rank-nb update into a TALL-SKINNY n×nb C, plus a side-R trsm). A borrowed
+    # constant is a hypothesis, and this makes it measurable instead of assumed.
+    nb = nb > 0 ? min(nb, n) : max(1, min(_lu_nb(n), n))
     # One arena borrow, EXACTLY n×nb (`ld == n`), held across every block column — hoisted above the
     # `while`, which is where it already was: the shape is loop-invariant, so nothing needed moving and
     # `@scope`'s loop rule has nothing to reject. It does NOT escape: `W` is only ever sliced into
