@@ -254,8 +254,13 @@ end
 # already pass on two boxes. Left as `_lu_nb` until there is a reason and a rule.
 @inline _getri_nb(n::Int) = n >= 512 ? 192 : _lu_nb(n)
 
-function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer};
-                nb::Int = 0) where {T}
+# PUBLIC ENTRY: positional only. The block width hook lives on the internal `_getri!` below, NOT as a
+# keyword on this method — at n=8 the whole call is ~400 ns, so a keyword-sorting frame on the public
+# path is a measurable fraction of it, and `getri@8` is already the routine's worst cell (0.68-0.81
+# across the fleet). A probe knob must not cost the shipped path anything.
+getri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}) = _getri!(A, ipiv, 0)
+
+function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int) where {T}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("getri!: A must be square"))
     length(ipiv) >= n || throw(DimensionMismatch("getri!: ipiv shorter than n"))
