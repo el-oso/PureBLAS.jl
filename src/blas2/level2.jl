@@ -2391,7 +2391,33 @@ const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators i
 # NB dot accumulators per column, so it is far more register-hungry than plain gemv-N. 4 fits AVX2's
 # 16 ymm; the gemv-N MR=8 bump spilled symv (Zen3 1.13→0.86). AVX-512 kept 4 before, keeps 4 here.
 # PDM: Literal — FLEET-VALIDATED 2026-08-21, best-or-tied on all 3 µarchs. MR=8 LOSES on both AVX-512 boxes (Zen4 -3.6% @1024, Zen5 -6.3/-3.0/-9.7%), so the register-file derivation is FALSIFIED, not unwritten. MR=6 loses 8-13% on AVX2. MR=2 is inconsistent (wins some sizes, loses others, on both boxes).
-const _SYMV_MR = 4
+#
+# ↑ SUPERSEDED 2026-09-11: "MR=2 is inconsistent" was measured L3-RESIDENT. symv's red cells
+# (2048 / 2100 / 4096) have working sets of 16.1 / 17.0 / 64.1 MiB against a 16 MiB L3 — a different
+# regime, in which MR=2 is the better value on essentially every point of the fleet. MR=2 / MR=4,
+# gate-exact, ONE SIZE PER PROCESS, every MR verified against a dense symmetric reference:
+#     box            n=1024    n=2048    n=4096
+#     wintermute     1.0044    1.0453    1.0361
+#     galen          1.0063    1.0159    1.0015
+#     neuromancer    0.9892    1.0208    1.0002
+# Eight of nine points win or tie; the one loss is neuromancer n=1024 at -1.1%, where symv has no
+# red cell. Bounded regret: worst -1.1%, best +4.5%, and the gains sit exactly on the out-of-L3
+# sizes that are red. That is a validated literal, not a per-µarch fit — the same value is best on
+# all three µarchs.
+#
+# ⚠ The MECHANISM is NOT established, and the obvious one is falsified: I predicted a LARGER MR
+# would help by visiting each of the NB=8 column streams deeper before jumping lda (DRAM row
+# locality). The sign is the opposite. Do not re-derive from that story. `_symv_simd!` keeps its
+# `Val{MR}` parameter so the next attempt starts from a measurement.
+#
+# MR=6 and above lose badly out of L3 on every box (0.87-0.96), so this is not "smaller is always
+# better" either — 2 and 4 are close and everything above them falls away.
+#
+# Also measured, for whoever picks symv up next: it is NOT bandwidth-bound. Against a same-bytes
+# `asum` read stream on wintermute, symv reaches 0.700 / 0.627 / 0.652 at n=1024 / 2048 / 4096. Part
+# of that is structural (8 strided column streams plus x and a y RMW, versus one contiguous stream),
+# but the gate only asks for AOCL's ~5%.
+const _SYMV_MR = 2
 
 # Codegen helper (runs at @generated expansion): emit a K-vector off-diagonal row-block at row `i`,
 # accumulating gemv-N into y (yp) and gemv-T into the d_c (one A load feeds both). masked ⇒ guard
