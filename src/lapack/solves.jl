@@ -40,6 +40,30 @@ function trtrs!(
     size(A, 2) == n || throw(DimensionMismatch("trtrs!: A must be square"))
     Bm = _gt_asmat(B)
     size(Bm, 1) == n || throw(DimensionMismatch("trtrs!: size(B,1) must equal n"))
+    # SINGLE RHS -> trsv, and hand it the VECTOR rather than `view(Bm, :, 1)`. Both halves matter and
+    # both were measured separately on getrs: `trsm!`'s own `nrhs == 1 -> trsv!` path is nested inside
+    # its `k <= _trsm_dbase()` tiny-k bypass so it never fires above k~32, and passing a SubArray of
+    # `_gt_asmat`'s reshape instead of the plain Vector costs a further 1.6-4.9%.
+    #
+    # MEASURED FOR THIS SHAPE, on all three boxes (bench/probes/trtrs_nrhs1.jl, gate-exact regime,
+    # one size per PROCESS, both arms verified against `LAPACK.trtrs!`), trsv/trsm:
+    #   n            100     128     256     1024    2048
+    #   wintermute   1.023   1.024   1.047   1.011   1.009 (tie)
+    #   galen        1.029   1.023   1.027   1.019     -
+    #   neuromancer  1.026   1.045   1.082   1.026     -
+    # Wins on every box at every size, tight CIs. Target cells: trtrs@100 0.879 wintermute / 0.883
+    # neuromancer, @128 0.954, @256 0.983, @1024 0.975, @2048 0.962 (the @32/@50 cells carry spreads
+    # of 0.44-0.58 and are noise, not targets).
+    #
+    # trtrs's shape is NOT getrs's — one solve, uplo from the caller, versus L/unit then U — so it was
+    # measured in its own right rather than inheriting getrs's conclusion. That distinction is why
+    # 8d22af1, which put this in `trsm!` and thereby changed trtrs/potrs/sytrs on one routine's
+    # evidence, had to be reverted.
+    if size(Bm, 2) == 1 && T <: BlasReal && stride(Bm, 1) == 1
+        b = B isa AbstractVector ? B : view(Bm, :, 1)
+        trsv!(A, b; uplo = uplo, trans = trans, diag = diag)
+        return B
+    end
     trsm!(Bm, A; side = 'L', uplo = uplo, transA = trans, diag = diag, alpha = one(T))
     return B
 end
