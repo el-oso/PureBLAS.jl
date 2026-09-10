@@ -4590,28 +4590,6 @@ function trsm!(
         copyto!(B, Bc)
         return B
     end
-    # ── SINGLE RHS, side-L: one trsv beats the blocked solve at EVERY k, not just tiny k ─────────────
-    # This check used to live inside the `k <= _trsm_dbase()` bypass below, so it only ever fired for
-    # tiny k. Every LAPACK solve-on-given-factors issues side-L trsm with a VECTOR B — `getrs!` does
-    # two of them (L/unit then U), and so do `trtrs!`, `potrs!`, `sytrs!` and `gesvx` — so at nrhs=1
-    # they were all paying panel/packing/blocking overhead to solve for one column.
-    #
-    # Measured Zen4, gate-exact regime (fresh LU factors per sample, `_reps_quadratic` reps in the
-    # timed core), full `getrs!` both ways, verified against `LAPACK.getrs!` at every size,
-    # trsv/trsm ratio:
-    #     k=8  2.176   50 1.063   100 1.040   128 1.041   256 1.051   512 1.025   1024 1.009   2048 1.006(tie)
-    # It wins everywhere and loses nowhere; the gain decays monotonically in k exactly as an
-    # overhead-amortisation story predicts. Gate cells this lands on (all AOCL-bound while at parity
-    # with OpenBLAS): getrs@100 0.824 wintermute / 0.851 neuromancer, getrs@256 0.922 / 0.894.
-    #
-    # Conditions mirror what trsv! can actually express: side-L only (trsv has no side), alpha==1
-    # (trsv does not scale), unit-stride B. Restricted to BlasReal because that is what was measured —
-    # the complex path is untested here and a silent regression on the CL cells is not worth the
-    # symmetry.
-    if sl && size(B, 2) == 1 && isone(alpha) && eltype(B) <: BlasReal && _strided1(B)
-        trsv!(A, view(B, :, 1); uplo = uplo, trans = transA, diag = diag)
-        return B
-    end
     # tiny-k fast path: skip the _trsm!/_trsm_left!/_trsm_right! dispatch chain (~3 non-inlined calls ≈ 60ns,
     # which dominates when the solve itself is only ~100ns) and go straight to the base kernel.
     # The bypass criterion is n-DEPENDENT for side-L, exactly as the side-R note below says of m.
@@ -4630,10 +4608,16 @@ function trsm!(
     if k <= _trsm_dbase() && eltype(B) <: BlasReal && transA != 'C' && isone(alpha) &&
             !(side == 'L' && size(B, 2) > _trsm_ncut())
         up = uplo == 'U'; tr = transA != 'N'; unit = diag == 'U'
-        # (The single-column side-L case is handled above for ALL k, so it never reaches here.
-        # Retained note: nrhs=1 ONLY — at nrhs=2 and 4 in this range the dense base wins
-        # (k=32: 711 vs 802 ns, 751 vs 1573), because it amortises across columns while the sweep
-        # re-walks A each time.)
+        # SINGLE column, side-L: one trsv beats the dense base even down here. This path returns
+        # before the narrow-B branch below, so without this the sweep never fires for k ≤ _TRSM_DBASE
+        # — exactly the sizes most dominated by per-call overhead. Measured Zen4 (ns, dense base vs
+        # trsv): k=8 151→121, k=16 251→211, k=24 361→311, k=32 481→421, i.e. 12–20% faster.
+        # nrhs=1 ONLY: at nrhs=2 and 4 in this range the dense base wins (k=32: 711 vs 802, 751 vs
+        # 1573), because it amortises across columns while the sweep re-walks A each time.
+        if sl && size(B, 2) == 1 && _strided1(B)
+            trsv!(A, view(B, :, 1); uplo = uplo, trans = transA, diag = diag)
+            return B
+        end
         # k in [_TRSM_FUSED_MIN, _TRSM_DBASE]: the fused gemmtrsm leaf beats the scalar dense base even here
         # (Zen4: k=24 15.9 vs 9.4, k=32 13.5 vs 11.1 GF) — take it too (side-L up-notrans, fusable),
         # keeping the low-overhead tiny entry. Below _TRSM_FUSED_MIN the dense base wins (setup unamortized).
