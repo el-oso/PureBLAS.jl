@@ -60,7 +60,6 @@ function getrs!(
     size(Bm, 1) == n || throw(DimensionMismatch("getrs!: size(B,1) must equal n"))
     nrhs = size(Bm, 2)
     if trans == 'N'
-        _laswp!(Bm, ipiv, 1, n, 1, nrhs)                                              # P·B
         # SINGLE RHS: two trsv beat two blocked trsm. `trsm!` has an `nrhs == 1 -> trsv!` fast path
         # already, but it is nested inside the `k <= _trsm_dbase()` tiny-k bypass, so above k~32 a
         # one-column solve pays panel, packing and blocking overhead for a single column. Solvers on
@@ -80,12 +79,31 @@ function getrs!(
         # shapes (potrs issues L/'N' then L/'T'; trtrs is a single solve) were never measured. It is
         # confined to getrs and to trans='N' here because that is what the evidence covers and what
         # the gate exercises. The 'T'/'C' branch below is deliberately left alone.
+        # AFTER the trsv routing the path still measured 1.6-4.9% slower than a hand-rolled solve, and
+        # finding the cause took three wrong guesses worth recording so they are not re-tried:
+        #   • `_laswp!` — EXONERATED. Specialising it on `j1 == j2` bought nothing (2.66/4.46/0.76%
+        #     after, vs 2.1/4.5/1.6 before), and inlining the swap at this call site bought nothing
+        #     either (0.997/1.002/1.003 with `_laswp!` restored, i.e. identical). It is not the cost.
+        #   • the ENTRY frame (size checks, `_gt_asmat`, the kwarg wrapper) — EXONERATED at 0.1-0.9%,
+        #     though `blas2-entry-overhead-blocks-blocked-lapack` made it the prior suspect.
+        #   • the `SubArray` — THE CAUSE. See the line below.
+        # The decomposition that settled it is `bench/probes/getrs_laswp_nrhs1.jl`: three arms
+        # differing in ONE step each. The lesson is that the first probe's hand-rolled arm differed
+        # from the shipped path in TWO ways at once, and the whole delta got attributed to the first
+        # of them.
         if nrhs == 1 && T <: BlasReal && stride(Bm, 1) == 1
-            b = view(Bm, :, 1)
+            # PASS THE VECTOR ITSELF, not `view(Bm, :, 1)`. `_gt_asmat` reshapes a vector RHS to n×1,
+            # and handing `trsv!` a SubArray of that reshape instead of the plain `Vector` cost the
+            # entire residual above: 1.64/4.90/1.03% -> 0.42/0.41/0.13% at n=100/256/512 from this
+            # line alone. The branch is on a TYPE, so it resolves at compile time and the vector case
+            # carries no runtime test.
+            b = B isa AbstractVector ? B : view(Bm, :, 1)
+            _laswp!(Bm, ipiv, 1, n, 1, nrhs)                                          # P·B
             trsv!(A, b; uplo = 'L', trans = 'N', diag = 'U')                          # L·Y = P·B
             trsv!(A, b; uplo = 'U', trans = 'N', diag = 'N')                          # U·X = Y
             return B
         end
+        _laswp!(Bm, ipiv, 1, n, 1, nrhs)                                              # P·B
         trsm!(Bm, A; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T)) # L·Y = P·B
         trsm!(Bm, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one(T)) # U·X = Y
     elseif trans == 'T' || trans == 'C'
