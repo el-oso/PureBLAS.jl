@@ -97,6 +97,27 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP}; do
         FAILED="$FAILED $g(lock)"
         break
     fi
+    # LET THE BOX COOL BETWEEN GROUPS, or the anchors will not match the cached references.
+    #
+    # An `arms=pb` group runs ~3x faster than the full-arms group that produced the cached OpenBLAS
+    # and AOCL arms, so back-to-back pb groups leave the box in a HOTTER, denser-duty state than the
+    # references were measured in. The per-cell anchor records exactly that, and `check_arm_anchors.sh`
+    # then declares the cells not adjudicable — the sweep is wasted even though the clock never moved.
+    #
+    # Measured 2026-09-10 on neuromancer: a back-to-back pb refresh left 697/930 cells
+    # anchor-mismatched (worst 15.7%) with the lock verified at 1990 MHz throughout. Re-running the
+    # single group L3 after a 300 s idle gap, nothing else changed, dropped it to 601/930 and removed
+    # L3 from the affected list entirely. So the mismatch is thermal carry-over between groups, NOT an
+    # irreconcilable machine-state difference — which matters, because the documented repair for the
+    # latter is a FULL-ARMS sweep that re-measures the reference arms this project deliberately caches.
+    # A few minutes per group is far cheaper than that, and cheaper still than a discarded sweep.
+    #
+    # Skipped before the first group: `PRE-LOCK` has already just idled the box.
+    if [ -n "${_PB_NOTFIRST:-}" ]; then
+        echo "    (idle ${GROUP_GAP:-300}s so the box returns to the references' thermal state)"
+        sleep "${GROUP_GAP:-300}"
+    fi
+    _PB_NOTFIRST=1
     echo "=== group $g ==="
     ok=0
     for try in 1 2 3 4 5 6; do
