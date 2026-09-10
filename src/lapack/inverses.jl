@@ -229,6 +229,31 @@ end
 # so getri! allocates nothing. Safe against a reused buffer: each block column writes rows j:n of its
 # jb columns (the jb×jb diagonal zeroing plus the strict-lower stash) and reads only rows j:n; rows
 # 1:j−1 are never read, so no stale value from a previous call can be consumed.
+# getri's block width. It USED to borrow `_lu_nb`, which is tuned for GETRF — a panel factor plus a
+# square-ish trailing gemm. getri's inner shapes are different: a rank-nb update into a TALL-SKINNY
+# n×nb C, plus a side-R trsm. Measured, the borrowed constant is wrong at every size above 448.
+#
+# FLEET TABLE (`bench/probes/getri_nb_sweep.jl`, gate-exact regime, one size per PROCESS, every
+# candidate width verified against `LAPACK.getri!`), best nb and its gain over the `_lu_nb` default:
+#   n            128    256      384     448     512      768     1000            2048
+#   wintermute   32     32+8.3%  32+7.1% 32+6.0% 192+2.8% 192+1.1% 192+2.6%       192+2.6%
+#   galen         —     80+1.9%   —       —       —        —       192+1.0%        —
+#   neuromancer   —     32+9.5%   —       —      192+2.8%  —       192+1.7%       192+3.3%
+#
+# n >= 512 wants 192 on EVERY box and size measured, and `_lu_nb` can never reach it (it caps at
+# 128). The crossover is sharp: at n=448 nb=32 beats 192 by 7.3%, at n=512 nb=192 beats 32 by 9.0%.
+#
+# 192 is a VALIDATED LITERAL, not a derivation — it is not `_KC` (256 here), nor any other detected
+# const traced so far, and it is µarch-INVARIANT across Zen3/Zen4/Zen5, which is what makes shipping
+# it as a literal defensible rather than a per-box fit. req8-ok: fleet table above.
+#
+# ⚠ THE SMALL-n HALF IS DELIBERATELY LEFT ALONE. Below the crossover the boxes DISAGREE — wintermute
+# and neuromancer want 32 (+8.3%, +9.5% at n=256) while galen wants 80 (+1.9%) — so there is no
+# fleet-invariant value, and the only red cell down there (galen @256, 0.940) is not closed by
+# galen's own optimum anyway (0.940 -> ~0.958). Changing it would be a per-µarch fit for cells that
+# already pass on two boxes. Left as `_lu_nb` until there is a reason and a rule.
+@inline _getri_nb(n::Int) = n >= 512 ? 192 : _lu_nb(n)
+
 function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer};
                 nb::Int = 0) where {T}
     n = size(A, 1)
@@ -241,7 +266,7 @@ function getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer};
     # `_lu_nb`, which is tuned for GETRF's shapes (a panel factor plus a square-ish trailing gemm),
     # not getri's (a rank-nb update into a TALL-SKINNY n×nb C, plus a side-R trsm). A borrowed
     # constant is a hypothesis, and this makes it measurable instead of assumed.
-    nb = nb > 0 ? min(nb, n) : max(1, min(_lu_nb(n), n))
+    nb = nb > 0 ? min(nb, n) : max(1, min(_getri_nb(n), n))
     # One arena borrow, EXACTLY n×nb (`ld == n`), held across every block column — hoisted above the
     # `while`, which is where it already was: the shape is loop-invariant, so nothing needed moving and
     # `@scope`'s loop rule has nothing to reject. It does NOT escape: `W` is only ever sliced into
