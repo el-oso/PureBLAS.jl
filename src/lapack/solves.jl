@@ -61,6 +61,31 @@ function getrs!(
     nrhs = size(Bm, 2)
     if trans == 'N'
         _laswp!(Bm, ipiv, 1, n, 1, nrhs)                                              # P·B
+        # SINGLE RHS: two trsv beat two blocked trsm. `trsm!` has an `nrhs == 1 -> trsv!` fast path
+        # already, but it is nested inside the `k <= _trsm_dbase()` tiny-k bypass, so above k~32 a
+        # one-column solve pays panel, packing and blocking overhead for a single column. Solvers on
+        # given factors are the common caller of that shape — the gate's own `_lufac` passes a vector.
+        #
+        # Measured on ALL THREE boxes, gate-exact regime (fresh LU factors per sample,
+        # `_reps_quadratic` reps in the timed core), full `getrs!` both ways, every arm verified
+        # against `LAPACK.getrs!`, one size per PROCESS. trsv/trsm:
+        #   wintermute Zen4  n=8 2.176  50 1.063  100 1.040  128 1.041  256 1.051  512 1.025  1024 1.009
+        #   galen      Zen3       —     50 1.090  100 1.050        —    256 1.034  512 1.013  1024 1.007
+        #   neuromancer Zen5      —     50 1.067  100 1.065        —    256 1.081  512 1.031  1024 1.016
+        # Wins on every box at every size up to 1024 and ties at 2048; the gain decays monotonically
+        # in n, as an overhead-amortisation story predicts.
+        #
+        # ⚠ SCOPE IS DELIBERATE. An earlier attempt (8d22af1, reverted in 862e1fd) put this in `trsm!`
+        # itself, where it silently reached `trtrs!`, `potrs!`, `sytrs!` and `gesvx` — routines whose
+        # shapes (potrs issues L/'N' then L/'T'; trtrs is a single solve) were never measured. It is
+        # confined to getrs and to trans='N' here because that is what the evidence covers and what
+        # the gate exercises. The 'T'/'C' branch below is deliberately left alone.
+        if nrhs == 1 && T <: BlasReal && stride(Bm, 1) == 1
+            b = view(Bm, :, 1)
+            trsv!(A, b; uplo = 'L', trans = 'N', diag = 'U')                          # L·Y = P·B
+            trsv!(A, b; uplo = 'U', trans = 'N', diag = 'N')                          # U·X = Y
+            return B
+        end
         trsm!(Bm, A; side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T)) # L·Y = P·B
         trsm!(Bm, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = one(T)) # U·X = Y
     elseif trans == 'T' || trans == 'C'
