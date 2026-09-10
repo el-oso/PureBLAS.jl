@@ -53,8 +53,54 @@ end
 #   Zen3 galen: wants 8 (AVX2 re-exposes FMA latency; 8 accumulators cover it)
 # So 8 is right on two of three boxes and Zen4's 4 is recoverable by calibration — which is the whole
 # contract of the Measure tier, and the only form that is also correct on silicon nobody has benchmarked.
-# PDM: Measured — not derivable; Zen4 wants 4, Zen3/Zen5-mobile want 8, and no detected const separates Zen4 from Zen5-mobile (both double-pumped, same L2/L3/nvreg). Calibrated by bench/calibrate.jl `calibrate_gemv_mr`.
-const _GEMV_MR = @load_preference("gemv_mr", 8)::Int
+# PDM: Measured — the PANEL path's height; see `_gemvn_rowblock_mr` below, which DERIVES the row-block
+# path's height instead. A pin still wins for both (P tier), and disables the derivation.
+const _GEMV_MR_PREF = @load_preference("gemv_mr", nothing)
+const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
+
+# ── ROW-BLOCK HEIGHT: DERIVED FROM THE CALL, NOT FROM THE µARCH (2026-09-10) ────────────────────────
+# The row-block driver blocks m rows `mr = MR*W` at a time:
+#     while i0 + mr <= m ... end;  mre = m - i0  -> masked remainder
+# so the cost of a given MR is set by TWO facts about the CALL, both known at run time:
+#   1. `MR*W > m` is DEGENERATE — the loop never executes, the whole call falls into the masked
+#      branch, and (mr-m)/mr of every lane is wasted. At W=8 that is every m < 64 under MR=8.
+#   2. otherwise the masked tail costs `m mod MR*W` rows, so a height that divides m is free and one
+#      that leaves a large remainder pays for it once per call.
+# Neither fact mentions the microarchitecture, which is why this is a Derive and not the Measure-tier
+# literal it used to be: `_GEMV_MR` was a fleet-minimax constant that every untuned box got wrong at
+# some m, and pinning it per host cannot fix machines nobody has benchmarked (req#7/#8).
+#
+# Ties prefer the LARGER height, because more accumulators hide more FMA latency when the tail cost
+# is equal — that is the one µarch-flavoured term, and it only breaks ties.
+#
+# FLEET TABLE, gate-exact regime, in-process A/B of the SHIPPED kernel, non-overlapping CIs.
+# "law" = the height this function returns; ✓ = it is the measured winner.
+#   galen  Zen3 W=4:  m=32 ->8 ✓(1.87)  m=50 ->6 ✓(1.49)  m=64 ->8 ✓(2.03)                     3/3
+#   neuro  Zen5 W=8:  32 ->4 ✓(1.23)  50 ->6 ✓(1.14)  64 ->8 ✓(1.42)  100 ->6 ✓(1.04)
+#                     128 ->8 ✓(1.02)  256 ->8 ✓(1.40)  448 ->8 ✓(1.11)                        7/7
+#   winter Zen4 W=8:  32 ->4 ✓(1.11)  50 ->6 ✓(1.15)  64 ->8 ✓(1.32)  100 ->6 ✗(MR=2 wins)
+#                     128 ->8 ✓(1.03)  256 ->8 ✓(1.74)  448 ->8 ✓(1.14)                        6/7
+# 16/17. The one miss (wintermute m=100) costs 5.8% against MR=2 there; against the SHIPPED MR=8 the
+# rule still wins by 24% on Zen5 and 38% at m=32, so its bounded regret is far smaller than the
+# constant's. Ratios are vs MR=2 within each row, so read them across a row, never down a column.
+#
+# The PANEL path (n > `_gemvn_rb()`) is deliberately NOT covered: there the winner does not track the
+# remainder (measured: galen wants 8 almost everywhere, wintermute and neuromancer disagree size by
+# size) and the whole spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
+@inline function _gemvn_rowblock_mr(m::Int, W::Int)
+    best = 2
+    bestrem = typemax(Int)
+    for mr in (2, 4, 6, 8)          # ascending + `<=` below ⇒ ties resolve to the LARGER height
+        h = mr * W
+        h > m && continue           # degenerate: no full block would run at all
+        r = m % h
+        if r <= bestrem
+            bestrem = r
+            best = mr
+        end
+    end
+    return best                     # m < 2W: nothing qualifies, and the nv<=3 masked branches own it
+end
 
 # PDM: Literal — DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure.
 const _GEMV_NP = 8             # gemv-N column-panel width
@@ -502,7 +548,24 @@ end
 
 @inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
     if n <= _gemvn_rb()
-        _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0))
+        # Per-call row-block height (see `_gemvn_rowblock_mr`). A pin disables the derivation, and
+        # `isnothing(_GEMV_MR_PREF)` is a load-time const so the pinned build folds this away and
+        # emits ONE specialization, exactly as before. Unpinned, the branch runs once per gemv! call
+        # against a driver that then loops over m — not in any inner loop.
+        @static if isnothing(_GEMV_MR_PREF)
+            mr = _gemvn_rowblock_mr(m, _vwidth(T))
+            if mr == 8
+                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(8))
+            elseif mr == 6
+                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(6))
+            elseif mr == 4
+                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(4))
+            else
+                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(2))
+            end
+        else
+            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(_GEMV_MR))
+        end
     elseif _gemvn_minner() && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
         _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
     else

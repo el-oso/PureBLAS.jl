@@ -15,7 +15,7 @@ Every `@load_preference` key in `src/` — 135 of them.
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
 **Tier:** 65 Derived · 9 Measured · 50 Literal · 11 Exempt.
-**Default form** (mechanical): 58 formula · 20 delegates · 6 sibling · 45 literal · 4 flag · 2 other.
+**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 44 literal · 4 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -40,7 +40,7 @@ Every `@load_preference` key in `src/` — 135 of them.
 | `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cger_cold_den` | literal | Derived | DRAM residency of A with cache headroom, the `_trmv_blk!` criterion; fleet table above. | candidate |
-| `gemv_mr` | literal | Measured | not derivable; Zen4 wants 4, Zen3/Zen5-mobile want 8, and no detected const separates Zen4 from Zen5-mobile (both double-pumped, same L2/L3/nvreg). Calibrated by bench/calibrate.jl `calibrate_gemv_mr`. | — |
+| `gemv_mr` | delegates | Measured | the PANEL path's height; see `_gemvn_rowblock_mr` below, which DERIVES the row-block | — |
 | `gemvn_mb` | formula | Derived | formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64` | — |
 | `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
