@@ -246,13 +246,19 @@ end
     return body
 end
 
-@inline function _gemv_n_rowblock!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
-    W = _vwidth(T); mr = _GEMV_MR * W
+# `MR` is a PARAMETER for the same reason `_gemv_n_paneldrv!` takes one: so a calibrator or probe can
+# A/B the row-block height against the REAL driver in ONE process. It matters MORE here than there,
+# because `_gemv_n_simd!` sends every `n <= _gemvn_rb()` (448 on Zen4) down THIS path — so a harness
+# that arms only the panel driver is measuring a path production does not take at small n. That is
+# exactly what `bench/calibrate.jl`'s first `calibrate_gemv_mr` did at n=100.
+@inline function _gemv_n_rowblock!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0},
+                                   ::Val{MR} = Val(_GEMV_MR)) where {T <: BlasReal, B0, MR}
+    W = _vwidth(T); mr = MR * W
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
         i0 = 0
         while i0 + mr <= m
-            _gemv_n_block!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, n, α, β, Val(_GEMV_MR), Val(B0))
+            _gemv_n_block!(yptr + i0 * sz, Aptr + i0 * sz, lda, xptr, n, α, β, Val(MR), Val(B0))
             i0 += mr
         end
         mre = m - i0
@@ -265,7 +271,7 @@ end
             elseif nv == 3
                 _gemv_n_block_masked!(yb, Ab, lda, xptr, n, α, β, mre, Val(3), Val(B0))
             else
-                _gemv_n_block_masked!(yb, Ab, lda, xptr, n, α, β, mre, Val(_GEMV_MR), Val(B0))
+                _gemv_n_block_masked!(yb, Ab, lda, xptr, n, α, β, mre, Val(MR), Val(B0))
             end
         end
     end
