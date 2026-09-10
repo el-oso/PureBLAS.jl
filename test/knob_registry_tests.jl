@@ -54,3 +54,33 @@ end
         @test got == want
     end
 end
+
+# EVERY PREFERENCE KEY `bench/calibrate.jl` CAN WRITE MUST BE IN `PureBLAS._TUNABLE_KEYS`.
+#
+# The two lists have now drifted apart twice, and the second time was expensive. `_tuned_pins_ok()`
+# in bench/plots.jl treats any active pin that is NOT in `_TUNABLE_KEYS` as evidence the box is in an
+# unrecognised hand-pinned state, and `save_cache` then refuses to write. On 2026-09-10 `tune!()`
+# pinned `gemvt_percol_amin` and `gemvt_perscan` — both written by its own calibrators, neither
+# listed — so a full 8-group wintermute sweep measured for ~2 h and produced no cache at all.
+#
+# Static scan, deliberately: calibrate.jl lives in the `bench` env and must not be loaded here. The
+# keys it can emit are `"name" => value` literals in `Pair{String, Any}[...]` returns, which is the
+# same shape `test/knob_registry.jl` already relies on for `src/`.
+@testitem "knob registry: every key calibrate.jl writes is in _TUNABLE_KEYS" begin
+    using PureBLAS
+    src = read(joinpath(@__DIR__, "..", "bench", "calibrate.jl"), String)
+    # Only keys inside a `Pair{String, Any}[...]` literal are preference keys. A bare `"name" =>`
+    # elsewhere is an A/B ARM label (`"percol" => (c -> ...)`) or a local status flag, not a pin.
+    emitted = Set{String}()
+    for blk in eachmatch(r"Pair\{String,\s*Any\}\[(.*?)\]"s, src),
+        m in eachmatch(r"\"([a-z][a-z0-9_]*)\"\s*=>", blk.captures[1])
+
+        push!(emitted, m.captures[1])
+    end
+    unlisted = sort(collect(setdiff(emitted, Set(PureBLAS._TUNABLE_KEYS))))
+    isempty(unlisted) || @error "bench/calibrate.jl can write preference key(s) absent from \
+        `PureBLAS._TUNABLE_KEYS` (src/tune.jl). A pin on an unlisted key makes bench/plots.jl refuse \
+        to save the gate cache — silently, from the sweep's point of view. Add them to \
+        `_TUNABLE_KEYS`." keys = unlisted
+    @test isempty(unlisted)
+end

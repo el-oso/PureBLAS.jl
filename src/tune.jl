@@ -77,6 +77,16 @@ const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", 
                        "brd_nb", "sytrf_cmult",
                        # written by bench/calibrate.jl's KNOBS but previously unlisted here:
                        "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
+                       # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole wintermute sweep.
+                       # `gemvt_percol_window` above is the KNOB's name in `KNOBS`, not a preference
+                       # key — that calibrator writes `gemvt_percol_amin`/`gemvt_percol_xmax`, and the
+                       # perscan calibrator writes `gemvt_perscan`. None of those three were listed, so
+                       # `bench/plots.jl`'s `_tuned_pins_ok()` classified them as pins "not owned by
+                       # tune!()" and `save_cache` REFUSED — silently as far as the sweep log was
+                       # concerned. All 8 groups measured for ~2 h on 2026-09-10 and wrote nothing.
+                       # `test/knob_registry_tests.jl` now lints this list against the key literals in
+                       # calibrate.jl so a rename or a new knob fails the suite instead of a sweep.
+                       "gemvt_percol_amin", "gemvt_percol_xmax", "gemvt_perscan",
                        # 2026-09-09: gemv-N row-block height. Measure tier by necessity — after the
                        # datapath correction no detected const separates Zen4 (wants 4) from
                        # Zen5-mobile (wants 8); see bench/calibrate.jl `calibrate_gemv_mr`.
@@ -143,6 +153,18 @@ workload. Close other applications first.
 """
 function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_project(),
                unlocked::Bool = false)
+    # `project` steers the CALIBRATION SUBPROCESSES, but `set_preferences!` below writes to the
+    # CALLER's active project — it has no project argument. If those differ, the knobs are measured
+    # under one preference set and pinned into another, which is the exact per-project confusion the
+    # write-site comment warns about (the same key reads 108 under `--project=.` and 4 under
+    # `--project=bench` in this repo). Observed 2026-09-10: `tune!(project="bench")` from a
+    # `--project=.` session measured against bench's pins and wrote `gemv_mr = 4` into the main env,
+    # where the gate never reads it. Refuse instead of splitting them.
+    if normpath(project) != normpath(Base.active_project())
+        error("tune!: `project` ($(project)) is not the active project ($(Base.active_project())). " *
+              "Pins are written to the ACTIVE project, so a mismatch would measure one preference " *
+              "set and pin another. Relaunch julia with `--project=$(project)` and call tune!() there.")
+    end
     root = normpath(joinpath(@__DIR__, ".."))
     script = joinpath(root, "bench", "calibrate.jl")
     isfile(script) || error("tune!: $script not found — tuning needs the full repository, not just an " *

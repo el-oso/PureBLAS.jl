@@ -480,8 +480,32 @@ let cap = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling
 end
 
 prefs = Pair{String, Any}[]
+# The MERGED preference view (LocalPreferences.toml + any Project.toml `[preferences]`), which is what
+# `@load_preference` actually resolved at load time — not just the file this script writes.
+const _ACTIVE_PREFS = try
+    Base.get_preferences(Base.PkgId(PureBLAS).uuid)
+catch
+    Dict{String, Any}()
+end
+# AN ALREADY-PINNED KNOB CANNOT BE CALIBRATED — skip it, loudly, instead of crashing.
+# The Measure-tier resolvers are `@static if isnothing(<KEY>_PREF)`-gated (see `_GEMVT_PF_REF` in
+# src/blas2/level2.jl:837 and its siblings `_GEMVT_NC_REF`, `_TRMV_FUSED_MIN_REF`,
+# `_GEMVN_MINNER_REF`): a pinned build must not COMPILE the resolver at all, because it allocates on
+# first use and would redden the all-paths AllocCheck proof on `gemv!`/`trmv!`. So the Ref the
+# calibrator writes does not exist on a pinned box, and `PureBLAS._GEMVT_PF_REF[] = v` throws
+# `UndefVarError` — which is what killed all 3 of `tune!()`'s runs on wintermute on 2026-09-10 and,
+# because a failed run is dropped, produced "0 of 3 runs" and pinned nothing at all.
+# Skipping is not a workaround, it is the correct answer twice over: the resolver is gone, and even
+# if it were not, the pin outranks whatever the calibration decided. Re-tuning a pinned knob means
+# clearing its pin first — a deployment decision, i.e. the user's.
 for k in KNOBS
     isnothing(ONLY) || k.name == ONLY || continue
+    if haskey(_ACTIVE_PREFS, k.name)
+        println("\n── $(k.name) ── SKIPPED: already pinned in LocalPreferences.toml " *
+                "(the pin compiles out the resolver this calibrator drives, and outranks it anyway). " *
+                "Clear the pin to re-tune this knob.")
+        continue
+    end
     println("\n── $(k.name) ──")
     append!(prefs, k.fn())
 end
