@@ -25,6 +25,14 @@ TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 # constrains StrictMode, but StrictModeTest appears in no other manifest, so without this a future
 # breaking release would resolve silently into `Pkg.test()`. The remaining test deps are left
 # unbounded as they have always been.
+# TrimCheck upstream v0.1.4 looks for juliac's trim helpers at the 1.12 path
+# (`share/julia/juliac/juliac-trim-base.jl`), which does not exist on 1.13 — so `@validate` could not
+# run and `trim_tests.jl` skipped itself with a `@test_broken`. This fork fixes the path resolution.
+# Kept as a [sources] entry rather than a compat bound because the fix is not upstream yet; drop it
+# once it is released.
+[sources]
+TrimCheck = {url = "https://github.com/el-oso/TrimCheck.jl", rev = "julia-1.13"}
+
 [compat]
 StrictModeTest = "0.4"
 
