@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 135 of them.
+Every `@load_preference` key in `src/` — 136 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 135 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 9 Measured · 50 Literal · 11 Exempt.
-**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 44 literal · 4 flag · 2 other.
+**Tier:** 65 Derived · 9 Measured · 50 Literal · 12 Exempt.
+**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 44 literal · 5 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -128,6 +128,7 @@ Every `@load_preference` key in `src/` — 135 of them.
 |---|---|---|---|---|
 | `force_hooks` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `fp_datapath_bytes` | formula | Exempt | a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and | — |
+| `madvise_hugepages` | flag | Exempt | a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable. | — |
 | `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 
 ## LAPACK · banded_chol

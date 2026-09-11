@@ -286,3 +286,4 @@ end
     throw(ArgumentError(lazy"_gbtrf_blocked!: needs nb ≤ kl (got nb=$nb, kl=$kl)"))
 @noinline _throw_packed_len(L::Int) =
     throw(DimensionMismatch(lazy"packed length $L is not n(n+1)/2"))
+
