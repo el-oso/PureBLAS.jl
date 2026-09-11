@@ -2558,6 +2558,21 @@ end
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
+    #
+    # ⛔ LOWERING NB IN THE DRAM REGIME: MEASURED AND FALSIFIED 2026-09-11. NB is monotonically
+    # best-at-the-cap, and by a wide margin — wintermute, gate-exact, all values verified against a
+    # dense symmetric reference, relative to NB=8:
+    #     n=2048   NB=1 0.408   NB=2 0.621   NB=4 0.813   NB=8 1.000
+    #     n=4096   NB=1 0.453   NB=2 0.634   NB=4 0.830   NB=8 1.000
+    # The motivating observation was real but its explanation was not: at n=4096, both out of L3,
+    # galen (NB=4) sits at 0.985 of a same-bytes `asum` read stream while wintermute (NB=8) sits at
+    # 0.652, which looked like "fewer concurrent streams win out of L3"
+    # ([[pureblas-dram-stream-count]]). It is not causal — forcing NB=4 on wintermute makes it WORSE,
+    # not better. NB is not merely a stream count: it is how many columns share one pass over x and y,
+    # so halving it doubles the x/y loads per element of A. That traffic is L1/L2, which is why it is
+    # invisible in a DRAM roofline comparison and yet dominates here.
+    # The galen-vs-wintermute gap therefore remains UNEXPLAINED, and both NB and MR are at their
+    # measured optima. Do not re-chase stream count.
     NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve A x y begin
         base = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
