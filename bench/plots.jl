@@ -957,19 +957,34 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         # still C-ABI-only and remains the last uncovered forwarded symbol.
         #
         # `mk` returns the FACTOR (potrf'd / already triangular) so the timed core is the inversion
-        # alone, matching how the getrs/potrs rows time the solve alone. Both arms copy, so the copy is
-        # common-mode.
+        # alone, matching how the getrs/potrs rows time the solve alone.
+        #
+        # ⛔ THE TIMED CORE MUST NOT ALLOCATE. These rows used to call `…!(copy(c))`, defended as
+        # "both arms copy, so the copy is common-mode". Common-mode it is; harmless it is not. The
+        # setup already hands the core `reps` FRESH contexts, each used exactly once (`evals=1`), so
+        # the copy was redundant — and at small n it dominated: 592 B per call at n=8 against a 140 ns
+        # kernel, 512 calls per sample. That allocation drove GC INTO the timed window, and GC is what
+        # produced the published bands: measured on wintermute 2026-09-11, trtri@8 samples split into
+        # GC-free 106 us and GC-hit 764 us (7.2x), 2% of samples at n=8 and 12% at n=32, which is
+        # exactly the round-level bimodality (round medians 103/247/119/241/113/248/251/253 us).
+        # Dropping the copy takes GC to 0.0% of samples and the n=8 median down 20% — the cell stops
+        # timing the allocator and starts timing the kernel.
+        # The kernels themselves were never the problem: `trtri!` measures 0 B at n=8 and n=256, and
+        # `src/verify.jl`'s entry-point contracts (`_strict_trtri_probe` et al.) already refresh their
+        # operand the allocation-free way, with `copyto!` into a preallocated buffer.
+        # Every other row here (sytrs, gbtrf, geqp3, …) already passed `c` straight through; these
+        # eight were the outliers. KEEP IT THAT WAY — `bench/check_sweep_noalloc.jl` asserts it.
         _cholfac(s) = (A = _hpd(Float64, s); LinearAlgebra.LAPACK.potrf!(LP, A); A)
         addh(
             "potri", _cholfac,
-            c -> (LinearAlgebra.LAPACK.potri!(LP, copy(c)); c[1, 1]),
-            c -> (PureBLAS.potri!(copy(c); uplo = LP); c[1, 1]); sizes = _cap(LPSZ, 2048)
+            c -> (LinearAlgebra.LAPACK.potri!(LP, c); c[1, 1]),
+            c -> (PureBLAS.potri!(c; uplo = LP); c[1, 1]); sizes = _cap(LPSZ, 2048)
         )
         _trifac(s) = tril(randn(Float64, s, s) + s * LinearAlgebra.I)
         addh(
             "trtri", _trifac,
-            c -> (LinearAlgebra.LAPACK.trtri!(LP, TN, copy(c)); c[1, 1]),
-            c -> (PureBLAS.trtri!(copy(c); uplo = LP, diag = TN); c[1, 1]); sizes = _cap(LPSZ, 2048)
+            c -> (LinearAlgebra.LAPACK.trtri!(LP, TN, c); c[1, 1]),
+            c -> (PureBLAS.trtri!(c; uplo = LP, diag = TN); c[1, 1]); sizes = _cap(LPSZ, 2048)
         )
         # `\` on a general matrix and `inv(A)` both land here through LBT. mk returns the LU factors so
         # the timed core is the inversion, not the factorization.
@@ -980,27 +995,30 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         end
         addh(
             "getri", _lufac2,
-            c -> (LinearAlgebra.LAPACK.getri!(copy(c[1]), copy(c[2])); c[1][1, 1]),
-            c -> (PureBLAS.getri!(copy(c[1]), c[2]); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
+            c -> (LinearAlgebra.LAPACK.getri!(c[1], c[2]); c[1][1, 1]),
+            c -> (PureBLAS.getri!(c[1], c[2]); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
         )
         addh(
             "sytri", _sytrfac,
-            c -> (LinearAlgebra.LAPACK.sytri!(LP, copy(c[1]), c[2]); c[1][1, 1]),
-            c -> (PureBLAS.sytri!(copy(c[1]), c[2]; uplo = LP); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
+            c -> (LinearAlgebra.LAPACK.sytri!(LP, c[1], c[2]); c[1][1, 1]),
+            c -> (PureBLAS.sytri!(c[1], c[2]; uplo = LP); c[1][1, 1]); sizes = _cap(LPSZ, 2048)
         )
         # Least squares, square-ish and overdetermined-by-construction (m = n here, nrhs = 1) so the
         # timed core is the factor-and-solve, not the shape handling. Capped at 1024 like `gels`.
         _lsq(s) = (randn(Float64, s, s), randn(Float64, s, 1))
+        # gelsy needs a pivot vector; it belongs in the CONTEXT, not in the timed core. `zeros(Int, n)`
+        # inside the closure allocated 8n B on every call — the same defect as the `copy`s above.
+        _lsqp(s) = (randn(Float64, s, s), randn(Float64, s, 1), zeros(Int, s))
         addh(
-            "gelsy", _lsq,
-            c -> (LinearAlgebra.LAPACK.gelsy!(copy(c[1]), copy(c[2]), -1.0); c[2][1]),
-            c -> (PureBLAS.gelsy!(copy(c[1]), copy(c[2]), zeros(Int, size(c[1], 2)), -1.0); c[2][1]);
+            "gelsy", _lsqp,
+            c -> (LinearAlgebra.LAPACK.gelsy!(c[1], c[2], -1.0); c[2][1]),
+            c -> (PureBLAS.gelsy!(c[1], c[2], c[3], -1.0); c[2][1]);
             sizes = _cap(LPSZ, 1024)
         )
         addh(
             "gelsd", _lsq,
-            c -> (LinearAlgebra.LAPACK.gelsd!(copy(c[1]), copy(c[2]), -1.0); c[2][1]),
-            c -> (PureBLAS.gelsd!(copy(c[1]), copy(c[2]), -1.0); c[2][1]); sizes = _cap(LPSZ, 1024)
+            c -> (LinearAlgebra.LAPACK.gelsd!(c[1], c[2], -1.0); c[2][1]),
+            c -> (PureBLAS.gelsd!(c[1], c[2], -1.0); c[2][1]); sizes = _cap(LPSZ, 1024)
         )
         # Nonsymmetric eigenvalues, VALUES ONLY ('N','N'): the vector paths differ enough between
         # implementations that timing them compares two algorithms rather than one kernel, the same
@@ -1008,8 +1026,8 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         # 2048+ would not be seconds-bounded at one sample.
         addh(
             "geev", s -> randn(Float64, s, s),
-            c -> (LinearAlgebra.LAPACK.geev!(TN, TN, copy(c)); c[1, 1]),
-            c -> (PureBLAS.geev!(TN, TN, copy(c)); c[1, 1]); sizes = _cap(LPSZ, 1024)
+            c -> (LinearAlgebra.LAPACK.geev!(TN, TN, c); c[1, 1]),
+            c -> (PureBLAS.geev!(TN, TN, c); c[1, 1]); sizes = _cap(LPSZ, 1024)
         )
         # Banded LU: kd scales with n (a fixed narrow band makes this O(n) and hides the kernel).
         _gbd(s) = (kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
@@ -1027,8 +1045,8 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         )
         addh(
             "gels", s -> (randn(s, s), randn(s, 1)),
-            c -> (LinearAlgebra.LAPACK.gels!(TN, copy(c[1]), copy(c[2])); c[2][1]),
-            c -> (PureBLAS.gels!(TN, copy(c[1]), copy(c[2])); c[2][1]); sizes = _cap(LPSZ, 1024)
+            c -> (LinearAlgebra.LAPACK.gels!(TN, c[1], c[2]); c[2][1]),
+            c -> (PureBLAS.gels!(TN, c[1], c[2]); c[2][1]); sizes = _cap(LPSZ, 1024)
         )
         # Pivoted (semidefinite) Cholesky — blocked dpstrf: BLAS-2 pivoted panel + rank-jb syrk trailing,
         # with the leading row swaps batched per panel (they are stride-lda and were ~47% of the runtime).
