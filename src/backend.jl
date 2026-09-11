@@ -73,6 +73,7 @@ end
         length(x) == n || throw(DimensionMismatch(lazy"gemv!: length(x)=$(length(x)) ≠ size(A,2)=$n"))
         length(y) == m || throw(DimensionMismatch(lazy"gemv!: length(y)=$(length(y)) ≠ size(A,1)=$m"))
     end
+    _advise_huge!(A)                      # DRAM-resident A: 2 MiB pages, +17-19% (see core.jl)
     _gemv!(tA, cj, m, n, alpha, A, x, 1, beta, y, 1)
     return y
 end
@@ -85,6 +86,7 @@ end
     m, n = size(A)
     length(x) == m || throw(DimensionMismatch(lazy"ger!: length(x)=$(length(x)) ≠ size(A,1)=$m"))
     length(y) == n || throw(DimensionMismatch(lazy"ger!: length(y)=$(length(y)) ≠ size(A,2)=$n"))
+    _advise_huge!(A)                      # DRAM-resident A: 2 MiB pages, +9.7% (see core.jl)
     _ger!(conj, m, n, alpha, x, 1, y, 1, A)
     return A
 end
@@ -103,7 +105,8 @@ end
         uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))
     )::AbstractVector
     n = _symhemv_dims(A, x, y, "symv!")
-    _symv!(uplo == 'U', n, alpha, A, x, 1, beta, y, 1)
+    _advise_huge!(A)                      # DRAM-resident A: 2 MiB pages, +38.6% (see core.jl)
+    _symv!(uplo == Char(85), n, alpha, A, x, 1, beta, y, 1)
     return y
 end
 

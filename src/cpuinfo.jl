@@ -1095,3 +1095,55 @@ end
 # That is the open problem (see the task tracker); the threshold is not.
 # Do not re-propose the sign test without first showing the effect survives in the tuner's own regime.
 # Harness kept: bench/probes/tune_signtest_validate.jl (null + power + reverse + cross-process modes).
+# ── HUGE-PAGE ADVICE FOR DRAM-RESIDENT BLAS-2 OPERANDS ───────────────────────────────────────────
+# BLAS-2 streams several columns of A at once, `lda*sizeof(T)` bytes apart, so with 4 KiB pages each
+# inner iteration touches as many distinct pages as there are concurrent column streams. That is a
+# TLB-walk rate the hardware cannot hide once A leaves L3, and it is the whole of symv's AVX-512
+# plateau: counters on neuromancer at n=8192 show the SAME cycles (1.05x) and instructions (1.07x)
+# as an equivalent pure read stream but 2.60x the dTLB-load-misses.
+#
+# A 2 MiB page covers 256 KiB of column stride and collapses that rate. Measured on wintermute at
+# n=4096, madvise alone, no kernel change (bench/probes/thp_sweep.jl):
+#     symv +38.6% · gemvT +18.5% · gemvN +17.2% · ger +9.7% · syrk 0.0% · gemm 0.0%
+# BLAS-3 is flat BECAUSE it packs its operands into contiguous panels — it already has the locality
+# huge pages would buy, which is independent confirmation of the mechanism rather than a null.
+#
+# WHY THIS IS SAFE. `madvise` is ADVISORY: it changes how the kernel backs pages, never their
+# contents, addresses or semantics, and a failure is simply ignored. It is a no-op where THP is
+# `never`, and off Linux the call is not compiled at all.
+#
+# WHY IT IS GATED ON L3. The syscall costs ~1-2 µs. At the threshold the operation itself is
+# ~0.4 ms, so the advice is <0.5% of it and pays for itself many times over; below the threshold A
+# is cache-resident, there is nothing to win, and the syscall would be pure overhead on exactly the
+# small-n cells that are hardest to hold. So it fires ONLY when A cannot fit in L3.
+#
+# PDM: Exempt — a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable.
+const _MADVISE_HUGEPAGES = @load_preference("madvise_hugepages", true)::Bool
+const _MADV_HUGEPAGE = Cint(14)
+const _HUGEPAGE_BYTES = 2 * 1024 * 1024
+
+"""
+Ask the kernel to back `A`'s pages with huge pages, if `A` is large enough to be DRAM-resident.
+Advisory and best-effort: any failure is ignored. Returns nothing.
+"""
+@inline function _advise_huge!(A::AbstractMatrix{T}) where {T}
+    @static if _MADVISE_HUGEPAGES && Sys.islinux()
+        # Only DRAM-resident operands, and only ones we can take a real pointer to.
+        if T <: Union{BlasReal, BlasComplex} && _strided1(A)
+            nb = length(A) * sizeof(T)
+            if nb > _L3_BYTES
+                GC.@preserve A begin
+                    p = UInt(pointer(A))
+                    # madvise needs a page-aligned start; round UP and shrink to stay inside A.
+                    s = (p + _HUGEPAGE_BYTES - 1) & ~UInt(_HUGEPAGE_BYTES - 1)
+                    if s < p + nb
+                        len = (p + nb - s) & ~UInt(_HUGEPAGE_BYTES - 1)
+                        len == 0 || @ccall madvise(Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
+                                                   _MADV_HUGEPAGE::Cint)::Cint
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
