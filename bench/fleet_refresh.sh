@@ -27,6 +27,14 @@ JL="${JULIA:-julia}"
 # Default core per box, matching what fleet_freqlock.sh verifies under load (it must be the SAME core,
 # or the lock is verified somewhere the work does not run): wintermute 2, galen 6, neuromancer 8.
 # Override with BENCH_CORE=<n>.
+#
+# SWEEP_EXTRA passes extra words to plots.jl. Its one intended use is `force-busy` on a box with a
+# RESIDENT co-tenant pinned to the OTHER die, where the global contention guard cannot see that the
+# two share no L3 and would refuse forever. galen is the case: llama-server is pinned to CPUs
+# 0-5,12-17 (CCD0's L3 domain) while CORE=6 sits in 6-11,18-23 with its own L3, so
+# `SWEEP_EXTRA=force-busy bench/fleet_refresh.sh` is honest there — and plots.jl stamps `busy=` into
+# the cache header either way, so the run is self-identifying. Do NOT use it to paper over a
+# co-tenant on the SAME die; that is the contention the guard exists to catch.
 case "${BENCH_CORE:-}" in
     "") case "$(hostname)" in
             wintermute)  CORE=2 ;;
@@ -124,7 +132,8 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP}; do
         # Capture, THEN tail — piping julia straight into `tail` reports tail's exit status, which is
         # how the silent partial refresh happened in the first place.
         # shellcheck disable=SC2086  # ARMSARG is deliberately unquoted: empty must expand to NO argument
-        out=$(taskset -c "$CORE" "$JL" --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw 2>&1)
+        # shellcheck disable=SC2086  # SWEEP_EXTRA is deliberately unquoted: empty must expand to NO argument
+        out=$(taskset -c "$CORE" "$JL" --project=bench bench/plots.jl bench group=$g $ARMSARG ${SWEEP_EXTRA:-} nodraw 2>&1)
         st=$?
         printf '%s\n' "$out" | tail -4
         if [ $st -eq 0 ]; then ok=1; break; fi
