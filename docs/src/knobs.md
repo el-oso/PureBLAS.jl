@@ -245,13 +245,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-34 `const _X = <literal>` values in `src/` with no `@load_preference`.
+33 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 29 Literal · 3 Exempt · 2 Unaudited.
+**Tier:** 29 Literal · 3 Exempt · 1 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -272,7 +272,6 @@ on these, not on knobs.
 | `_GEMV_NP` | 8 | Literal | DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure. |
 | `_GER_PANEL_U` | 4 | Literal | its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one. |
 | `_SYMV_MR` | 2 | Unaudited | — |
-| `_SYMV_MR_RESIDENT` | 4 | Unaudited | — |
 | `_SYMV_NB` | 8 | Literal | FLEET-VALIDATED 2026-08-21: a CAP, and the consumer's `min(_SYMV_NB, _vwidth(T))` is what makes it right (8 on AVX-512, 4 on AVX2). Halving NB costs 10-27% on all 3 boxes, so the cap binds and the value is not arbitrary. |
 | `_TRSV_T_F` | 8 | Literal | trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE. |
 
