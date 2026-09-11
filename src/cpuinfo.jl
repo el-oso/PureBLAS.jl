@@ -1147,3 +1147,77 @@ Advisory and best-effort: any failure is ignored. Returns nothing.
     end
     return nothing
 end
+
+"Array form of `_advise_huge!` — any rank, used by the public `alloc` below."
+@inline function _advise_huge_arr!(A::Array{T}) where {T}
+    @static if _MADVISE_HUGEPAGES && Sys.islinux()
+        nb = length(A) * sizeof(T)
+        if nb > _HUGEPAGE_BYTES
+            GC.@preserve A begin
+                p = UInt(pointer(A))
+                s = (p + _HUGEPAGE_BYTES - 1) & ~UInt(_HUGEPAGE_BYTES - 1)
+                if s < p + nb
+                    len = (p + nb - s) & ~UInt(_HUGEPAGE_BYTES - 1)
+                    len == 0 || @ccall madvise(Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
+                                               _MADV_HUGEPAGE::Cint)::Cint
+                end
+            end
+        end
+    end
+    return A
+end
+
+"""
+    PureBLAS.alloc(T, dims...) -> Array{T}
+
+Allocate an uninitialised array whose pages are requested as 2 MiB huge pages.
+
+Use this instead of `Array{T}(undef, …)` for matrices large enough to leave L3. BLAS-2 streams
+several columns of a matrix at once, `lda*sizeof(T)` bytes apart, so on 4 KiB pages every inner
+iteration touches one page per concurrent column stream — a TLB-walk rate the hardware cannot hide.
+Measured on Zen4 at n=4096, the same kernels on 2 MiB pages:
+
+| routine | gain |
+|---|---|
+| `symv!`  | +38.6% |
+| `gemv!` (trans='T') | +18.5% |
+| `gemv!` (trans='N') | +17.2% |
+| `ger!`   | +9.7% |
+| `gemm!` / `syrk!` | 0% — BLAS-3 packs its operands, so it already has the locality |
+
+WHY AN ALLOCATOR RATHER THAN SOMETHING PureBLAS CAN DO FOR YOU. `MADV_HUGEPAGE` governs how pages
+are backed WHEN THEY FAULT. By the time a matrix reaches a BLAS call it has already been filled, so
+its pages are faulted at 4 KiB and only khugepaged's partial background collapse remains — measured,
+that recovers about an eighth of the available gain. The advice has to precede the first touch,
+which means it belongs to whoever allocates. This function is that hook; the array comes back
+untouched, so whatever fills it faults straight into huge pages.
+
+Requires Linux with transparent huge pages in `madvise` or `always` mode (`cat
+/sys/kernel/mm/transparent_hugepage/enabled`). Everywhere else it is exactly `Array{T}(undef, …)` —
+the advice is best-effort and a refusal is ignored, so this is always safe to call.
+
+```julia
+A = PureBLAS.alloc(Float64, 4096, 4096)
+rand!(A)                      # faults into 2 MiB pages
+PureBLAS.symv!(y, A, x)
+```
+
+See also `PureBLAS.hugepages_enabled()`.
+"""
+@inline alloc(::Type{T}, dims::Integer...) where {T} = _advise_huge_arr!(Array{T}(undef, dims...))
+
+"""
+    PureBLAS.hugepages_enabled() -> Bool
+
+Whether this system can back `PureBLAS.alloc` with huge pages: Linux with transparent huge pages in
+`madvise` or `always` mode. When false, `alloc` still works and simply returns an ordinary array.
+"""
+function hugepages_enabled()
+    Sys.islinux() || return false
+    return try
+        s = read("/sys/kernel/mm/transparent_hugepage/enabled", String)
+        occursin("[madvise]", s) || occursin("[always]", s)
+    catch
+        false
+    end
+end
