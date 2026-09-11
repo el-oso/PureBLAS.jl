@@ -168,13 +168,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.44</span></td><td class="ok"><span class="v">1.39</span></td><td class="ok"><span class="v">1.31</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
 <tr><th><code>trtri</code></th><td class="b1"><span class="v">0.99</span><span class="n">n=2048</span></td><td class="b1"><span class="v">0.99</span><span class="n">n=8</span></td><td class="ok"><span class="v">1.0</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
 <tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.04</span></td><td class="b3"><span class="v">0.927</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=2048</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.08</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.972</span><span class="n">n=50</span></td><td class="ok"><span class="v">1.02</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.02</span></td><td class="b4"><span class="v">0.823</span><span class="n">n=50</span></td><td class="b4"><span class="v">0.844</span><span class="n">n=100</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.18</span></td><td class="ok"><span class="v">1.04</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.11</span></td><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.15</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.01</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.0</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="n"><span class="n">?</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.15</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.08</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="b2"><span class="v">0.978</span><span class="n">n=50</span></td><td class="ok"><span class="v">1.02</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.0</span></td><td class="b4"><span class="v">0.824</span><span class="n">n=50</span></td><td class="b4"><span class="v">0.844</span><span class="n">n=100</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.31</span></td><td class="ok"><span class="v">1.18</span></td><td class="ok"><span class="v">1.04</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.15</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.01</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.0</span></td><td class="hx"><span class="n">⚠ mixed</span></td><td class="hx"><span class="n">1.13.0-rc4 +?</span></td></tr>
 </tbody></table></div>
 ```
 ```@raw html
@@ -204,7 +204,7 @@ html.dark .pbg-key{color:#98a1b3}
 | Triangular solve | trtrs | s/d/c/z | ✅ | 1.04 | **0.924** | **0.97** | 1.32 / 1.05 | 1.24 / 0.924 |
 | Least-squares | gels | s/d/c/z | ✅ | 1.05 | 1.22 | 1.19 | 2.38 / 1.35 | 1.79 / 1.22 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.03 | **0.951** | **0.984** | 1.31 / 1.04 | 1.24 / 0.951 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | **0.965** | **0.972** | 1.04 | 1.38 / 0.972 | 1.53 / 1.09 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | **0.965** | **0.972** | 1.04 | 1.38 / 0.972 | 1.52 / 1.09 |
 
 The `geo/worst` columns are per reference and scoped to Zen4; the per-box columns left of them are the
 gate. The solves (`potrs`/`getrs`/`trtrs`) are not yet gated — the band on those rows is for the
