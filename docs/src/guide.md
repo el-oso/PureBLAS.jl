@@ -79,3 +79,42 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 # a single item:
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["Level-1 contiguous vs OpenBLAS"])'
 ```
+
+## Large matrices: huge pages
+
+BLAS-2 reads several columns of a matrix at once, `lda * sizeof(T)` bytes apart. On the default
+4 KiB pages that means every inner iteration touches one page per concurrent column stream, and once
+the matrix is too big for L3 the resulting TLB-walk rate is what limits the routine — not bandwidth,
+and not the kernel. Measured on Zen4 at n = 4096, the same kernels on 2 MiB pages:
+
+| routine | gain |
+|---|---|
+| `symv!` | +38.6% |
+| `gemv!`, `trans='T'` | +18.5% |
+| `gemv!`, `trans='N'` | +17.2% |
+| `ger!` | +9.7% |
+| `gemm!`, `syrk!` | 0% |
+
+BLAS-3 gains nothing because it packs its operands into contiguous panels, so it already has the
+locality huge pages would buy.
+
+Allocate such matrices with `PureBLAS.alloc` and they are backed by 2 MiB pages:
+
+```julia
+A = PureBLAS.alloc(Float64, 4096, 4096)
+rand!(A)                       # faults straight into huge pages
+PureBLAS.symv!(y, A, x)
+```
+
+The timing is the whole point, and it is why this is an allocator rather than something PureBLAS can
+do on your behalf. `MADV_HUGEPAGE` decides how pages are backed **when they fault**; by the time a
+matrix reaches a BLAS call it has already been filled, so its pages are fixed at 4 KiB and only the
+kernel's partial background collapse remains — worth about an eighth of the gain. PureBLAS does ask
+for the promotion at its BLAS-2 entry points for matrices above L3, so existing code gets that
+eighth for free, but the full win needs the advice before the first write.
+
+`PureBLAS.hugepages_enabled()` reports whether the system can honour it: Linux with transparent huge
+pages in `madvise` or `always` mode. Elsewhere `alloc` is exactly `Array{T}(undef, …)`, so it is
+always safe to call. Setting `transparent_hugepage=always` system-wide gets the same benefit for
+matrices you allocate by other means. To switch the entry-point advice off, set the
+`madvise_hugepages` preference to `false`.
