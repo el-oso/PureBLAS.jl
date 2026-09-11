@@ -1076,9 +1076,52 @@ const _GEMVT_DEEP_PREF = @load_preference("gemvt_deep", nothing)
 else
     @inline _gemvt_deep_on() = _GEMVT_DEEP_PREF::Bool
 end
-@inline function _gemvt_deep(::Type{T}, m::Int, n::Int) where {T}
-    return _gemvt_deep_on() &&
-        m * n * sizeof(T) <= _L2_BYTES && (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG
+@inline function _gemvt_deep(::Type{T}, m::Int, n::Int, lda::Int) where {T}
+    (_GEMVT_NC_DEEP + _GEMVT_U_DEEP + 2) <= _NVREG || return false
+    _gemvt_deep_on() || return false
+    m * n * sizeof(T) <= _L2_BYTES && return true   # compute-bound: the original gate, unchanged
+    return _gemvt_x_l1_resident(T, m, lda)
+end
+
+# PAST L2 the shape is not automatically right, and the criterion is x, not A. The 8x4 body is
+# LOAD-SLOT bound ([[gemvt-falsified-req8-lint]]): it issues one x-load per 8 FMAs where NC=4/U=1
+# issues one per 4. That halving only pays while those x loads HIT IN L1, and x leaves L1 two ways —
+# by CAPACITY as m (the reduction length) grows, and by CONFLICT when the NC column streams sit a
+# whole L1 way period apart, which puts all 8 of them on the same sets.
+# Measured on wintermute 2026-09-11 (Zen4, freq-locked, 18 shapes, ONE SHAPE AND ONE ARM PER PROCESS,
+# forced through this real entry path; ratio = 8x4 ÷ NC=4, `bench/probes/gemvt_nc8u4_crossover.jl`):
+#     m     2100  2200  2350  2500 |2560| 2650  2800  3000 |3072| 3200 |3584| |4096| 4200 |9216|
+#   ratio   1.125 1.106 1.103 1.097|0.995|1.093 1.051 1.040|0.962|1.002|0.936| |0.920|0.961|0.890|
+#                                   ^alias                  ^alias        ^alias ^alias ^cap ^alias
+# Both terms are needed and each alone is FALSIFIED — see the kb finding:
+#   • A/L3 capacity fitted the five SQUARE sizes and looked like a clean crossover at ~3xL3. Killed by
+#     a controlled pair: 2100x4200 and 4200x2100 have IDENTICAL A/L3 = 4.21 and opposite outcomes
+#     (1.125 vs 0.961). The square sweep merely had m rising in lockstep with A.
+#   • A pure-m (or pure x/L1) rule fitted it too. Killed by a REGISTERED PREDICTION: at fixed n=2100,
+#     m = 2560 -> 3000 -> 3072 -> 3200 alternates the alias bit and the ratios are NON-monotone
+#     (0.995, 1.040, 0.962, 1.002). A pure-m rule requires monotonicity.
+# CROSS-CHECKED on neuromancer (Zen5, 48 KiB/12-way L1 — note the way period is the SAME 4096 B, since
+# 48K/12 = 32K/8, so the alias term transfers unchanged). Same probe, same regime, n=2100:
+#     m     2100 |3072| 3200  4000  4800
+#   ratio   1.071|0.990|1.009 1.023 1.033
+#                 ^alias
+# The alias term REPRODUCES INDEPENDENTLY: 3072 is the only loss on that box and it sits BETWEEN two
+# winners, so the non-monotonicity is not a Zen4 artifact.
+# ⚠ PDM: BOTH terms are Derived, and the second one only after a false start worth recording.
+#   • ALIAS: the way period is `_L1_WAY_BYTES`, already divided by the DETECTED `_L1D_ASSOC`
+#     (byte-scaled here rather than via level3's doubles-only `_alias_ld`, which is included after this
+#     file and would also be wrong for F32).
+#   • CAPACITY: plain `x <= _L1_BYTES` — x must FIT in L1. An earlier `3/4 * _L1_BYTES`, fitted on
+#     wintermute alone between m=3000 (24000 B, 1.040) and m=3200 (25600 B, 1.002), was FALSIFIED by
+#     Zen5: m=4800 is x/L1 = 0.78 there and still WINS (1.033), so the bound is not an L1 fraction.
+#     Plain L1 captures strictly more wins with no regression on either box — on Zen4 it admits m=3200
+#     (1.002, a harmless neutral) and still excludes m=4200 (33600 B, 0.961). That Zen4 boundary is
+#     SHARP at L1: 2.5% over capacity and the shape loses.
+# ⚠ UNTESTED BAND: on Zen5, x between 38400 B (largest measured, 1.033) and 49152 B (this bound) has
+# no data. Zen4's transition is sharp at its own L1, which is why the bound is written as capacity.
+@inline function _gemvt_x_l1_resident(::Type{T}, m::Int, lda::Int) where {T}
+    return m * sizeof(T) <= _L1_BYTES &&
+        (lda * sizeof(T)) % _L1_WAY_BYTES != 0
 end
 # PDM: Literal — DERIVABLE, not yet derived: one x-load per 8 FMAs, the load:FMA ratio clearing the MLP plateau; _NVREG-guarded.
 const _GEMVT_NC_DEEP = 8      # one x-load per 8 FMAs: the load:FMA ratio that clears the plateau
@@ -1223,7 +1266,7 @@ end
         # arms; in a pinned build their resolvers are compiled out entirely, so the shipping path is
         # this branch plus a const-folded comparison on m*n.
         u0 = _gemvt_u(); pf0 = _gemvt_pf(); nc0 = _gemvt_nc()
-        if _gemvt_deep(T, m, n) && nc0 == 4 && u0 == 1 && pf0 == 0
+        if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1 && pf0 == 0
             jd = !blk ? 0 : _gemvt_cols!(Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
                                         yptr, Aptr, xptr, lda, m, n, α, β, sz)
             @inbounds while jd < n
