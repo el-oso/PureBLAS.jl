@@ -1082,6 +1082,89 @@ end
     return s
 end
 
+# ── DUAL REDUCTIONS: the `dupEven` formulation (docs/src/dual.md) ──────────────────────────────────
+# A Vec{2W} over the interleaved [v p v p …] buffer holds W duals. `dupEven(x) = [x_v, x_v, …]` — an
+# in-lane duplicate-even shuffle, the same cost class as the complex swap — puts the VALUE in both lanes of
+# its pair, so ONE op per vector produces both halves of the reduction and the parity fold
+# (`_fold2_cmplx`, gemm.jl) lands them as [Σ even lanes, Σ odd lanes]:
+#   nrm2:  acc = muladd(x, dupEven(x), acc)   → [Σ x_v²,  Σ x_v·x_p]      d‖x‖ = Σ x_v x_p / ‖x‖
+#   asum:  acc += flipsign(x, dupEven(x))     → [Σ |x_v|, Σ flipsign(x_p, x_v)]   sign BIT, as ForwardDiff's abs
+# The value lane never multiplies a partial, so an infinite partial cannot NaN-poison the value (the
+# `sgn = [0, b]` swap-adjacent form would compute `t + 0·x_p` there). The ε² term Σ x_p² is never formed —
+# that is the complex kernel's `bd`, and the ε²-leak test is what catches a reinterpret-as-complex mistake.
+# `n` counts DUAL elements; `xp` is the real Ptr; results are the two real sums, the caller builds the Dual.
+# `Expr(:meta, :inline)` in the generated body: `@inline` does not propagate into @generated CodeInfo.
+@inline @generated function _dup_even(v::Vec{N, T}) where {N, T}
+    dup = Expr(:tuple, (2 * (l ÷ 2) for l in 0:(N - 1))...)                      # 0,0,2,2,…
+    return :($(Expr(:meta, :inline)); shufflevector(v, Val($dup)))
+end
+# flipsign by the sign BIT, as integer ops: `v ⊻ (s & signmask)`. SIMD.jl's `flipsign(v, s)` is
+# `vifelse(signbit(s), -v, v)`, which lowered to TWO ops (`vpmovq2m` + masked `vxorpd`) and put dual asum at
+# 0.48x its complex twin in L1; the bit form is ONE `vpternlogq` on AVX-512 (`vandpd`+`vxorpd` on AVX2).
+# Measured n=1e3: 75 → 98.5 GB/s, n=1e4: 0.86 → 0.99x of complex (bench/probes/dual_asum_flip.jl).
+# Bit-identical to `flipsign` for every input, ±0.0 and NaN included — both act on the sign bit only.
+@inline _uint(::Type{Float64}) = UInt64
+@inline _uint(::Type{Float32}) = UInt32
+@inline function _flipsign_bits(v::Vec{N, T}, s::Vec{N, T}) where {N, T <: BlasReal}
+    VI = Vec{N, _uint(T)}
+    m = VI(reinterpret(_uint(T), -zero(T)))                                      # the sign bit
+    return reinterpret(Vec{N, T}, reinterpret(VI, v) ⊻ (reinterpret(VI, s) & m))
+end
+@inline function _sumsq_dual_simd(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = _UNROLL * W
+    a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+    i = 0
+    @inbounds while i + step <= n
+        o = 2 * i * sz
+        v0 = vload(V, xp + o); v1 = vload(V, xp + o + 2W * sz)
+        v2 = vload(V, xp + o + 4W * sz); v3 = vload(V, xp + o + 6W * sz)
+        a0 = muladd(v0, _dup_even(v0), a0); a1 = muladd(v1, _dup_even(v1), a1)
+        a2 = muladd(v2, _dup_even(v2), a2); a3 = muladd(v3, _dup_even(v3), a3)
+        i += step
+    end
+    acc = (a0 + a1) + (a2 + a3)
+    @inbounds while i + W <= n
+        v = vload(V, xp + 2 * i * sz); acc = muladd(v, _dup_even(v), acc); i += W
+    end
+    f = _fold2_cmplx(acc)                                  # [Σ x_v², Σ x_v·x_p]
+    ss = f[1]; sp = f[2]
+    @inbounds while i < n
+        j = i + 1; v = unsafe_load(xp, 2j - 1); p = unsafe_load(xp, 2j)
+        ss = muladd(v, v, ss); sp = muladd(v, p, sp); i += 1
+    end
+    return ss, sp
+end
+# Eight chains, as the real `_asum_simd` (FP-add latency x add pipes — see its note).
+@inline function _asum_dual_simd(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 8 * W
+    a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+    a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
+    i = 0
+    @inbounds while i + step <= n
+        o = 2 * i * sz
+        v = vload(V, xp + o); a0 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 2W * sz); a1 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 4W * sz); a2 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 6W * sz); a3 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 8W * sz); a4 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 10W * sz); a5 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 12W * sz); a6 += _flipsign_bits(v, _dup_even(v))
+        v = vload(V, xp + o + 14W * sz); a7 += _flipsign_bits(v, _dup_even(v))
+        i += step
+    end
+    acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))
+    @inbounds while i + W <= n
+        v = vload(V, xp + 2 * i * sz); acc += _flipsign_bits(v, _dup_even(v)); i += W
+    end
+    f = _fold2_cmplx(acc)                                  # [Σ |x_v|, Σ flipsign(x_p, x_v)]
+    sa = f[1]; sp = f[2]
+    @inbounds while i < n
+        j = i + 1; v = unsafe_load(xp, 2j - 1); p = unsafe_load(xp, 2j)
+        sa += abs(v); sp += flipsign(p, v); i += 1
+    end
+    return sa, sp
+end
+
 # SIMD argmax for BLAS iamax: 1-based index of the first element with maximal |x|. Real unit-stride;
 # assumes n ≥ 4W (caller routes shorter / strided / complex to the scalar loop). Two implementations,
 # selected by ISA at build time (`_SIMD_BYTES` const-folds → trim-safe, no runtime branch):
