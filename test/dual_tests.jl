@@ -161,13 +161,15 @@ end
     @test PureBLAS.iamax([Dual{Nothing}(3.0, -5.0), Dual{Nothing}(3.0, 1.0)]) == 1
     @test PureBLAS.iamax([Dual{Nothing}(3.0, 1.0), Dual{Nothing}(3.0, -5.0)]) == 1
     for n in (31, 4W, 4W + 3, 200, 1003)                                 # scalar path (n < 4W) and every SIMD tier
+        # positions scale with n: on AVX2 `4W == 16`, and the fixed 10/20/30 of the first draft indexed past the end
+        i1, i2, i3 = n ÷ 4, n ÷ 2, 3n ÷ 4
         x = DualT.mkd(ones(n), randn(n))
-        x[10] = Dual{Nothing}(3.0, -5.0); x[20] = Dual{Nothing}(-3.0, 100.0)   # |value| tie, partials differ
-        @test PureBLAS.iamax(x) == 10 == DualT.ref_iamax(x)
-        x[30] = Dual{Nothing}(1.0, 1.0e6)                                 # a huge PARTIAL is not a magnitude
-        @test PureBLAS.iamax(x) == 10
-        x[30] = Dual{Nothing}(1.0, Inf)
-        @test PureBLAS.iamax(x) == 10
+        x[i1] = Dual{Nothing}(3.0, -5.0); x[i2] = Dual{Nothing}(-3.0, 100.0)   # |value| tie, partials differ
+        @test PureBLAS.iamax(x) == i1 == DualT.ref_iamax(x)
+        x[i3] = Dual{Nothing}(1.0, 1.0e6)                                 # a huge PARTIAL is not a magnitude
+        @test PureBLAS.iamax(x) == i1
+        x[i3] = Dual{Nothing}(1.0, Inf)
+        @test PureBLAS.iamax(x) == i1
     end
     # netlib oracle: NaN/Inf in the VALUE lane, every position of a vector spanning the kernel tiers
     for n in (3, 4W + 1, 100), pos in unique((1, 2, n ÷ 2, n)), v in (NaN, Inf, -Inf)
