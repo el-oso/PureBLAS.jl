@@ -8,6 +8,14 @@
 @inline function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _copy_simd!(Int(n), x, y)
+    # A complex vector is a contiguous 2n-real buffer and copy involves no arithmetic, so the real
+    # SIMD kernel serves them as-is. LLVM does NOT vectorize the scalar loop below for ComplexF64 — it emits
+    # a `memmove` call (bench/probes/cplx_copy_vec.jl: `_vectorized=false`), 1.9x slower than `_copy_simd!`
+    # while L1-resident (89 vs 170 GB/s at n=1e3) and level from L2 on (within 2% at n=1e4/1e5).
+    if incx == 1 && incy == 1 && _cplx2(x, y)
+        GC.@preserve x y _copy_simd!(2 * Int(n), _reptr(x), _reptr(y))
+        return y
+    end
     ix = _start(n, incx); iy = _start(n, incy)
     @inbounds for _ in 1:n
         _st!(y, iy, _ld(x, ix)); ix += incx; iy += incy
@@ -19,6 +27,12 @@ end
 @inline function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return nothing
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _swap_simd!(Int(n), x, y)
+    # Same reasoning as `_copy!`; here the scalar loop lowers to memcpy+memmove through a temporary and runs
+    # 2.4-3.1x slower than `_swap_simd!` at every size measured (n=1e3..1e5, same probe).
+    if incx == 1 && incy == 1 && _cplx2(x, y)
+        GC.@preserve x y _swap_simd!(2 * Int(n), _reptr(x), _reptr(y))
+        return nothing
+    end
     ix = _start(n, incx); iy = _start(n, incy)
     @inbounds for _ in 1:n
         t = _ld(x, ix); _st!(x, ix, _ld(y, iy)); _st!(y, iy, t)
