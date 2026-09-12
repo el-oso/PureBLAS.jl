@@ -1,7 +1,8 @@
 # Dual numbers: BLAS-1 for forward-mode AD
 
-Status: **design agreed, not yet implemented.** This page records the design, the measurements it
-rests on, and the decisions taken — including the ones that closed off tempting alternatives.
+Status: **steps 1 and 2 implemented** (2026-09-12; see "Implementation notes" at the end), **step 3 not
+started.** This page records the design, the measurements it rests on, and the decisions taken —
+including the ones that closed off tempting alternatives.
 
 `ForwardDiff.Dual{Tag,V,1}` and `Complex{V}` have **byte-identical memory layout**, so PureBLAS can
 serve forward-mode AD from the same SIMD machinery it uses for complex. Nothing else in the Julia
@@ -222,3 +223,41 @@ targets.
 ⚠ Zen5 (neuromancer) is not gate-authoritative: its lock drops on power change, and it reads **FP256**
 (`test/autotune_tests.jl:21-23` — Strix/Krackan, `fpw = 32`, double-pumped, lands with Zen4). Do not
 build a width argument on "Zen5 is native-512"; that is a retracted claim from an old family lookup.
+
+## Implementation notes (steps 1 and 2, 2026-09-12)
+
+Measured after step 2, same method as the baseline table above (wintermute, Chairmarks median of 6
+rounds, plots.jl regime, `bench/probes/dual_twins.jl`) — dual GB/s ÷ complex twin:
+
+| op | n=1e3 | n=1e4 | n=1e5 | n=1e6 | before |
+|---|---|---|---|---|---|
+| axpy | 1.00 | 1.01 | 1.01 | 1.02 | 0.82 0.80 1.03 1.00 |
+| scal | 1.00 | 1.00 | 1.01 | 1.01 | 0.69 0.65 0.77 0.99 |
+| copy | 1.00 | 1.03 | 1.01 | 1.01 | — |
+| swap | 1.00 | 1.05 | 0.99 | 1.02 | — |
+| dot | 0.20 | 0.34 | 0.40 | 0.58 | 0.37 0.34 0.49 0.92 (generic loop; step 3) |
+| asum | 0.60 | 0.99 | 0.98 | 1.01 | 0.21 0.18 0.23 0.61 |
+| iamax | 1.17 | 1.20 | 1.20 | 1.18 | 0.37 0.29 0.29 0.36 |
+| nrm2 | 0.73 | 1.00 | 1.00 | 0.97 | 0.07 0.06 0.08 0.20 |
+
+What `@code_native` settled: `dupEven` emits `vmovddup` (in-lane, one per vector, no cross-lane shuffle);
+nrm2 is `vmovddup` + FMA. SIMD.jl's `flipsign` lowered to **two** ops (`vpmovq2m` + masked `vxorpd`) and
+put asum at 0.48× in L1; written as `v ⊻ (dupEven(v) & signmask)` it is one `vpternlogq`
+(`_flipsign_bits`), 0.60× in L1 and parity from L2. In-L1 nrm2/asum sit at the extra op priced above;
+not yet run through `mca_report`.
+
+**Deviation from this design — nrm2's overflow fallback.** The page said "falls back to the existing Dual
+lassq loop". The 1e200-scale test it prescribed showed that loop is numerically wrong there: `_lassq`
+divides Duals and ForwardDiff's quotient rule squares the ~1e200 denominator, so the partial is garbage
+(one input: −1.66 vs analytic −1.39; `LinearAlgebra.norm` over Duals — the intended oracle — gave −1.47,
+broken the same way). The overflow path is now `_nrm2_dual_scaled`: real lassq over the values, partial
+`Σ (x_v/scale)·x_p / √ssq`. The generic scalar loop for `N ≠ 1` / nested duals keeps the old behaviour.
+The test oracle at extreme scale is the analytic partial, not `ForwardDiff.derivative` on `norm`.
+
+Step 1 findings: the phase-kernel `U` parameterisation is byte-identical at `U=4` (code_native, 202 =
+202 instructions); `U=8` on AVX-512 is +1.3% [1.004, 1.024] at n=3e4 and a tie at 2e4/6e4, so it does
+not by itself close zaxpy@3e4. The real-alpha zaxpy bypass costs nothing measurable (compare-not-taken
+0.990 [0.961, 1.025] at n=1e3) and wins 8.7% with a real alpha. LLVM does not vectorize the scalar
+complex copy/swap loops (memmove / memcpy+memmove); routed onto the real kernels: copy 1.9× in L1, level
+from L2; swap 2.4–3.1× everywhere. The complex iamax scaffold is byte-identical after taking the
+magnitude as a codegen parameter (352 = 352 / 426 = 426 instructions, F64/F32).
