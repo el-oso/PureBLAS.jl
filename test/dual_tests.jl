@@ -393,9 +393,13 @@ end
         n = 96
         Ad = Dual{Nothing}.(randn(n, n), randn(n, n)); Bd = Dual{Nothing}.(randn(n, n), randn(n, n)); Cd = zeros(eltype(Ad), n, n)
         ad = Dual{Nothing}(1.7, 0.3)
-        PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)       # grow the plane pool once at this size (grow-only, like 3M)
-        @test_noalloc PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        # No `@test_noalloc` on gemm!: the StrictMode 0.4 proof is static and all-paths, and nothing reaching gemm!
+        # passes it (kb `strictmode-04-static-only-noalloc`: Strassen's lazily sized pool is counted even when
+        # runtime-dead). The dual route adds only the grow-only plane pool, the same class as complex 3M.
         @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.syrk!(Cd, Ad; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
+        @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)
         @test true
     end
 end
@@ -463,9 +467,10 @@ end
     end
     # d/dt through the entries against the closed form
     A0 = randn(30, 20); dA = randn(30, 20); x0 = randn(20); dx = randn(20); y0 = randn(30)
-    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(y0 .+ zero(t), A0 .+ t .* dA, x0 .+ t .* dx), 0.3) ≈ dA * x0 + A0 * dx
-    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(x0 .+ zero(t), A0 .+ t .* dA, y0 .+ zero(t); trans = 'T'), 0.3) ≈ transpose(dA) * y0
-    @test ForwardDiff.derivative(t -> vec(PureBLAS.ger!(one(t), y0 .+ zero(t), x0 .+ t .* dx, A0 .+ zero(t))), 0.3) ≈ vec(y0 * transpose(dx))
+    # at t = 0: the first closed form is the derivative of a product that is QUADRATIC in t
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(y0 .+ zero(t), A0 .+ t .* dA, x0 .+ t .* dx), 0.0) ≈ dA * x0 + A0 * dx
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(x0 .+ zero(t), A0 .+ t .* dA, y0 .+ zero(t); trans = 'T'), 0.0) ≈ transpose(dA) * y0
+    @test ForwardDiff.derivative(t -> vec(PureBLAS.ger!(one(t), y0 .+ zero(t), x0 .+ t .* dx, A0 .+ zero(t))), 0.0) ≈ vec(y0 * transpose(dx))
     L = randn(20, 20) ./ 40 + 2I; dL = randn(20, 20) ./ 40
     @test ForwardDiff.derivative(t -> PureBLAS.trsv!(L .+ t .* dL, x0 .+ zero(t); uplo = 'L'), 0.0) ≈ -tril(L) \ (tril(dL) * (tril(L) \ x0))
 end
