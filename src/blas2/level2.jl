@@ -2274,17 +2274,25 @@ end
 # partner for the swap-adjacent product) against the real kernel's one, and each is `Vec{2W}` = two
 # native registers, so a column costs 4 registers here versus 1 there. That is why NP is capped by
 # `_NVREG` at the call site rather than inheriting the real path's value unexamined.
-@generated function _ger_panel_cmplx!(
-        Ap::Ptr{Complex{T}}, lda::Int, xp::Ptr{Complex{T}}, yp::Ptr{Complex{T}},
-        jc::Int, m::Int, α::Complex{T}, ::Val{NP}, ::Val{CJ}, ::Val{U}, ::Val{HALF}
-    ) where {T <: BlasReal, NP, CJ, U, HALF}
+# THE SAME BODY SERVES THE DUAL ger (docs/src/dual_l2.md §2.3): the inner update is the axpy form
+# `A += ay·x` with the hoisted pair scalar `ay = α·y[j]`, so the tag is exactly the axpy tag — `_pair_shuf`
+# (swap-adjacent / duplicate-even) and the sign vector (`[−ai,+ai,…]` / `[0,+ai,…]`). Of the four scalar
+# products in α·x_i·y_j only `x_p·y_p` is ε², and it never forms: `x_p` only ever meets `ay_v`. The scalar tail
+# is per-algebra. The complex instantiation is byte-identical (bench/probes/dual_l23_native.jl).
+@inline _ger_panel_cmplx!(Ap::Ptr{Complex{T}}, lda::Int, xp::Ptr{Complex{T}}, yp::Ptr{Complex{T}}, jc::Int, m::Int, α::Complex{T}, np::Val, cj::Val, u::Val, half::Val) where {T <: BlasReal} =
+    _ger_pair_panel!(Val(:cplx), Ap, lda, xp, yp, jc, m, α, np, cj, u, half)
+@generated function _ger_pair_panel!(
+        ::Val{ALG}, Ap::Ptr{P}, lda::Int, xp::Ptr{P}, yp::Ptr{P},
+        jc::Int, m::Int, α::P, ::Val{NP}, ::Val{CJ}, ::Val{U}, ::Val{HALF}
+    ) where {ALG, P, NP, CJ, U, HALF}
+    T = fieldtype(P, 1); cplx = ALG === :cplx
     # HALF picks the accumulator/coefficient width. `Vec{2W}` is 2 native registers, `Vec{W}` is 1, so
     # a column costs 4 registers wide and 2 narrow — and that is precisely what caps NP. AOCL's zaxpyv
     # uses the narrow layout (one `vbroadcastsd` per part), which is how it affords 8 streams where our
     # wide layout could only afford 4. Same trick `_CGEMVT_HALF` already plays for gemv-T/C.
     W = _vwidth(T); lanes = HALF ? W : 2W; cstep = lanes ÷ 2   # complex elements per vector
     V2 = Vec{lanes, T}; sz = sizeof(T); step = U * cstep
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(lanes - 1))...)
+    swp = _pair_shuf(ALG, lanes)
     body = quote
         pxr = Ptr{$T}(xp)                                  # real-interleaved views for the vector loads
         par = Ptr{$T}(Ap)
@@ -2292,17 +2300,19 @@ end
     for c in 1:NP
         # ay = α·(cj ? conj(y[j]) : y[j]) — the SAME scalar the per-column path forms, so the two paths
         # are bit-identical per element and the panel is a pure scheduling change.
+        ay = Symbol(:ay, c)
+        re = cplx ? :(real($ay)) : :(_parts($ay)[1]); im = cplx ? :(imag($ay)) : :(_parts($ay)[2])
         push!(body.args, :($(Symbol(:yv, c)) = unsafe_load(yp, jc + $c)))
-        push!(body.args, :($(Symbol(:ay, c)) = α * $(CJ ? :(conj($(Symbol(:yv, c)))) : Symbol(:yv, c))))
-        push!(body.args, :($(Symbol(:ar, c)) = $V2(real($(Symbol(:ay, c))))))
+        push!(body.args, :($ay = α * $(CJ ? :(conj($(Symbol(:yv, c)))) : Symbol(:yv, c))))
+        push!(body.args, :($(Symbol(:ar, c)) = $V2($re)))
         push!(
             body.args, :(
                 $(Symbol(:si, c)) = $V2(
                     $(
                         Expr(
                             :tuple, (
-                                iseven(l) ? :(-imag($(Symbol(:ay, c)))) :
-                                    :(imag($(Symbol(:ay, c)))) for l in 0:(lanes - 1)
+                                iseven(l) ? (cplx ? :(-$im) : zero(T)) :
+                                    im for l in 0:(lanes - 1)
                             )...
                         )
                     )
@@ -2327,8 +2337,12 @@ end
             tail.args, quote
                 j = i + 1
                 xr = unsafe_load(pxr, 2j - 1); xi = unsafe_load(pxr, 2j)
-                q = $(Symbol(:ac, c)); ar = real($(Symbol(:ay, c))); ai = imag($(Symbol(:ay, c)))
-                unsafe_store!(q, unsafe_load(q, 2j - 1) + ar * xr - ai * xi, 2j - 1)
+                q = $(Symbol(:ac, c)); ar = $(cplx ? :(real($(Symbol(:ay, c)))) : :(_parts($(Symbol(:ay, c)))[1]))
+                ai = $(cplx ? :(imag($(Symbol(:ay, c)))) : :(_parts($(Symbol(:ay, c)))[2]))
+                $(
+                    cplx ? :(unsafe_store!(q, unsafe_load(q, 2j - 1) + ar * xr - ai * xi, 2j - 1)) :   # same association as before
+                        :(unsafe_store!(q, unsafe_load(q, 2j - 1) + ar * xr, 2j - 1))
+                )
                 unsafe_store!(q, unsafe_load(q, 2j) + ar * xi + ai * xr, 2j)
             end
         )
@@ -2354,9 +2368,10 @@ end
 
 # Static Val ladder: runtime NP → compile-time Val{NP}, one branch, each arm statically dispatched (no
 # dynamic Val in the hot path → allocation-free, StrictMode-clean). Mirrors `_ger_paneldrv_np`.
+# The ger drivers are generic over the pair type `P` (Complex{T} or Dual{Tag,T,1}); complex unchanged.
 @inline function _ger_paneldrv_cmplx!(
-        m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool, np::Int
-    ) where {T <: BlasReal}
+        m::Int, n::Int, α::P, x, y, A, cj::Bool, np::Int
+    ) where {P}
     h = _cger_half()
     return cj ?
         (
@@ -2369,18 +2384,18 @@ end
         )
 end
 @inline function _ger_pdc_cj!(
-        m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}, ::Val{HALF}
-    ) where {T <: BlasReal, CJ, HALF}
+        m::Int, n::Int, α::P, x, y, A, np::Int, ::Val{CJ}, ::Val{HALF}
+    ) where {P, CJ, HALF}
     GC.@preserve A x y begin
-        Ap = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); csz = sizeof(Complex{T})
+        Ap = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); csz = sizeof(P)
         jc = 0
         while jc + np <= n
             if np == 2
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(2), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
+                _ger_pair_panel!(_palg(P), Ap, lda, xp, yp, jc, m, α, Val(2), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             elseif np == 4
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(4), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
+                _ger_pair_panel!(_palg(P), Ap, lda, xp, yp, jc, m, α, Val(4), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             else
-                _ger_panel_cmplx!(Ap, lda, xp, yp, jc, m, α, Val(8), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
+                _ger_pair_panel!(_palg(P), Ap, lda, xp, yp, jc, m, α, Val(8), Val(CJ), Val(_CGER_U), Val(HALF))  # req8-ok: candidate arm
             end
             jc += np
         end
@@ -2391,7 +2406,7 @@ end
             # as non-resident as a panel one. Sizing residency from the column's own bytes here would
             # reintroduce the exact bug this path exists to fix.
             iszero(ayj) ||
-                _axpy_cmplx_cold!(m, real(ayj), imag(ayj), xp, Ap + jc * lda * csz)
+                _axpy_pair_cold!(_palg(P), m, _parts(ayj)..., xp, Ap + jc * lda * csz)
             jc += 1
         end
     end
@@ -2400,8 +2415,8 @@ end
 
 # Complex rank-1: A[:,j] += (α·(cj ? conj(y[j]) : y[j]))·x — one complex axpy of x into each contiguous
 # column, reusing the L1 _axpy_cmplx_simd! kernel (like the real _ger_simd! reuses _axpy_simd!).
-function _ger_cmplx!(m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool) where {T <: BlasReal}
-    csz = sizeof(Complex{T})
+function _ger_cmplx!(m::Int, n::Int, α::P, x, y, A, cj::Bool) where {P}
+    csz = sizeof(P)
     # ⚠ DRAM-BOUND A → PANEL, exactly as the real path does. This asymmetry was a measured gate failure:
     # real `ger` has routed A ≥ L3 to `_ger_paneldrv_np` (NP concurrent write streams) since the stream
     # count was calibrated per box, and the complex path never got it — it ran ONE read+write stream at
@@ -2448,9 +2463,9 @@ end
 # argument and picks the L1-resident arm for a stone-cold stream (see `_axpy_cmplx_cold!` for the full
 # post-mortem and the AOCL disassembly that found it).
 @inline function _ger_cmplx_percol!(
-        m::Int, n::Int, α::Complex{T}, x, y, A, cj::Bool, ::Val{COLD}
-    ) where {T <: BlasReal, COLD}
-    csz = sizeof(Complex{T})
+        m::Int, n::Int, α::P, x, y, A, cj::Bool, ::Val{COLD}
+    ) where {P, COLD}
+    csz = sizeof(P)
     GC.@preserve A x y begin
         Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2)
         @inbounds for j in 1:n
@@ -2458,8 +2473,9 @@ end
             ayj = α * yj
             iszero(ayj) && continue
             p = Aptr + (j - 1) * lda * csz
-            COLD ? _axpy_cmplx_cold!(m, real(ayj), imag(ayj), xptr, p) :
-                _axpy_cmplx_simd!(m, real(ayj), imag(ayj), xptr, p)
+            ar, ai = _parts(ayj)
+            COLD ? _axpy_pair_cold!(_palg(P), m, ar, ai, xptr, p) :
+                _axpy_pair_simd!(_palg(P), m, ar, ai, xptr, p)
         end
     end
     return A
@@ -2473,6 +2489,9 @@ function _ger!(cj::Bool, m::Integer, n::Integer, α::Number, x, incx::Integer, y
     end
     if _l2c_ok(A, x, y, incx, incy)
         return _ger_cmplx!(Int(m), Int(n), convert(eltype(A), α), x, y, A, cj)
+    end
+    if _l2p_ok(A, x, y, incx, incy)                          # dual pairs: gerc == geru (conj is the identity)
+        return _ger_cmplx!(Int(m), Int(n), convert(eltype(A), α), x, y, A, false)
     end
     iy = _start(n, incy)
     @inbounds for j in 1:n
