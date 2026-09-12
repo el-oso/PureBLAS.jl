@@ -241,3 +241,93 @@ Answered in §2.4: rides the tagged gemv/axpy/dot; the diagonal is one scalar pa
    op counts being identical for every op on this level (gemvN drops one hoisted scalar multiply per column,
    nothing in the loop).
 4. `spill_report` on the dual gemvN `NC=6` instantiation before the first probe (§5, item 1).
+
+## Implementation notes (2026-09-13, after the sparring round)
+
+Shipped on branch `dual-l2l3`: gemvN, gemvT (and 'C' → 'T'), ger (gerc → geru), trmv, trsv. **symv is dropped
+from this round** (sparring point 4): PureBLAS has no SIMD complex symv to tag either — `zsymv` runs the generic
+loop (`_symv!`), so the 0.83–0.88 "parity" in the triage is two scalar loops. Complex symv is an ungated gap of
+the same class `_scal_cmplx_simd!` was before `zscalc`; a symv kernel is separate work for both algebras.
+
+### Measured (galen, Zen3, same probe and regime as the triage; median of 6 rounds)
+
+Complex-twin time ÷ dual time on identical bytes, after tagging:
+
+| op | n=32 | n=128 | n=512 | n=1024 | n=2048 | n=4096 | before (generic loop) |
+|---|---|---|---|---|---|---|---|
+| gemvN | 1.05 | 1.01 | 1.00 | 1.01 | 1.01 | 1.00 | 0.25 … 0.47 |
+| gemvT | 1.00 | 1.01 | 0.99 | 1.00 | 1.01 | 1.02 | 0.31 … 0.47 |
+| ger | 1.24 | 1.09 | 1.03 | 1.00 | 1.01 | 1.02 | 0.43 … 0.83 |
+| trmv | 0.98 | 0.98 | 1.01 | 1.00 | 1.02 | 1.02 | 0.69 … 0.47 |
+| trsv | 0.90 | 0.93 | 1.00 | 1.00 | 1.01 | 1.01 | 0.71 … 0.46 |
+
+The bar (§5: equal time to the twin, op counts being identical) holds for gemvN/gemvT/trmv at every n and for
+ger everywhere (it is *faster* in cache: the hoisted `α·y[j]` is one scalar multiply cheaper per column). trsv
+is 10 % / 7 % behind at n = 32 / 128 and at parity from 512: the residual is the scalar diagonal step — one
+real division plus a pair multiply per column against the complex reciprocal multiply — which is a larger share
+of a small solve. Before the reciprocal hoist it read 0.79 / 0.84, so the hoist was worth 11 points.
+
+### The gate: 94 of 102 complex instantiations byte-identical; the other 8 are not adjudicable
+
+`bench/probes/dual_l23_native.jl` baselines every complex body, driver and entry on the pre-edit tree (100
+specs, 2 real types) and diffs after each op. Every **body** — gemvN panel (nc 1/4/6, pf on/off), gemvT block
+(4 arms × CJ), ger panel (np 2/4/8 × CJ × HALF) — and every driver and entry (`_gemv_n_ri_run!`,
+`_gemv_n_ri_cmplx!`, `_gemv_tc_run!`, `_gemv_tc_cmplx!`, `_ger_pdc_cj!`, `_ger_cmplx_percol!`, `_ger_cmplx!`,
+`_trmv_cmplx!`, `_trsv_cmplx!`, `_gemv!`, `_ger!`) is byte-identical, both types. The drivers are generic over
+the pair type `P` (they read `_parts(α)`, tag the kernels with `_palg(P)`, build results with `_mkpair`) and
+that generalisation moved nothing — the copy fallback was not needed.
+
+The 8 that differ are `_trmv_cmplx_blk!`, `_trsv_cmplx_blk!`, `_trmv!`, `_trsv!` (× 2 types): same
+instruction count, same opcode multiset, ~100 of 688 lines differing only in stack-slot offsets and register
+names. **That drift reproduces on the unedited `a0f0a703` tree in a fresh process**
+(`bench/probes/dual_l23_basecheck.jl`: a second worktree at the base commit, cold julia, compared against the
+hot session's baselines — the same four functions drift, `hemv` and `_gemv_n_ri_run!` do not). LLVM's frame
+layout of these large inlined drivers is not stable across processes, so byte-identity cannot adjudicate them;
+`bench/probes/dual_l23_regnorm.jl` records the residual as register/slot renaming only. A first attempt to
+"fix" it by copying the ladders for dual (per the ship-as-a-copy rule) changed nothing, which is what prompted
+the base-tree check; the copies were reverted.
+
+Two real complex regressions were caught by the gate during the work and fixed before any commit landed on
+its own: the ger scalar tail had its operand association changed by the tag splice (`load + (a·b − c·d)` vs
+`load + a·b − c·d`; +25 instructions, and a different rounding), and an early `_pair_rcp` one-liner failed to
+parse under Revise and took `_trsv_cmplx!` with it. The probe folds callee serials (`j__f_1234`) on both
+sides; without that fold every driver reads as "different" after a Revise.
+
+### Histograms, complex vs dual main loop (part 2 of the probe)
+
+* gemvN nc1 / nc4: EQUAL modulo shuffle class (`vshufpd` → `vunpcklpd`; F32 `vshufps` → `vpshufb`) — the
+  zero-unpack lowers to ONE instruction as predicted. nc6 (F64, the AVX2 past-L3/2 arm) and nc12 (F32): the
+  dual loop carries one extra `vxorpd` / `vmovdqa` — the zero register rematerialised inside the loop, exactly
+  the §5 spill concern. It is a zeroing idiom (no execution uop on Zen3) and the measured n = 2048/4096 cells,
+  which run that arm, sit at 1.00–1.01, so it was left alone rather than dropping the arm.
+* gemvT: the loop is algebra-agnostic in source; the per-algebra epilogue changes register allocation and the
+  loop shows ±`vmovapd` moves (F64 nc4 full-width: one FEWER for dual; F32 nc4 full: +6, nc8 half: −16).
+  The default arms on both ISAs (nc4 half, nc8 half F64, nc2) are EQUAL. Measured parity at every n.
+* ger: EQUAL modulo shuffle class on all 12 arms (`vshufpd`/`vshufps` → `vmovddup`/`vmovsldup`).
+
+### Sparring point 3, answered by the lane algebra (and confirmed by the histogram)
+
+`Pv = Σ a·[c_v,c_v]` already delivers `a_v·c_v` (value lane) and `a_p·c_v` (partial lane) in one FMA; the only
+cross-lane term is `a_v·c_p` → partial lane. Applying `dupEven` to A (the proposal) costs one shuffle per
+A-vector, i.e. NC per row-iteration; accumulating `Qv = Σ a·[c_p,c_p]` and moving its even lanes once per
+row-iteration costs ONE shuffle regardless of NC — the same count the complex kernel pays, and the complex
+kernel already works this way. Splitting x into planes does not remove it: the term that must change lanes is
+A's value lane, which is interleaved by definition. The two-source zero-unpack is that one shuffle with no
+lane ever multiplied by zero (an Inf in the discarded `Σ a_p·c_p` lane cannot reach the value), and LLVM picks
+the ISA form itself from the one `shufflevector(zero, q, pat)` source; on AVX2 it is `vunpcklpd`. The AVX-512
+lowering (a zero-masked permute) is unverified: galen is the only box this work may touch.
+
+### trsv: the reciprocal IS hoisted, through the complex buffer
+
+`1/(c + dε) = 1/c − (d/c²)ε` is stored as the two reals `(r, −d·r²)` in a `Complex` slot of the existing
+512-entry buffer (`_pair_rcp`) and read back with `_mkpair` (`_rcp_mul`); no complex arithmetic touches it,
+so the trap does not apply. Complex `_trsv_cmplx!` stayed byte-identical through the change (the complex
+methods of both helpers inline to the previous expressions).
+
+### Tests
+
+`test/dual_tests.jl`: "Dual L2: gemv N/T/C, ger, trmv, trsv match the plane formulas" (15 shapes × 2 types,
+every uplo/trans/diag, dual α and a zero-value β), "ε²-leak and infinite-partial hygiene + ForwardDiff
+derivatives through the entries", and the `:checks` item "BLAS-2 dual strict contract" (`@test_noalloc` /
+`@test_typestable` on the five entries). The BLAS-1 iamax item indexed past `n` on AVX2 (`4W = 16`; the tie
+positions were fixed at 10/20/30) — found running the suite on galen, fixed in its own commit.

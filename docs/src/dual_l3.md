@@ -194,3 +194,70 @@ lines), one interleaved `_combine_dual!` per shape class (full, triangular; dual
   (`A*B` on `Matrix{Dual}` falls to a scalar loop today, everywhere in the ecosystem), and syrk/trmm/trsm
   are 30-line drivers over the same split/combine once it exists. If only a quarter ships: gemm with a
   `k ≥ 16` floor and the generic loop below, i.e. the complex 3M's own window without the upper edge.
+
+## Implementation notes (2026-09-13, after the sparring round)
+
+### Sparring point 1 — the cost model, confirmed by measurement
+
+Dual gemm is three real gemms with no cancellation and no window; complex 3M is three real gemms plus a sum
+plane per operand and a cancelling combine. The sub-gemms go through `_gemm_core!` (not `_gemm_real_dims!`),
+so they take Strassen where real gemm does. Measured on galen (median of 4 rounds, plots.jl's CL3 regime),
+zgemm ÷ dual on identical bytes, with dgemm for scale:
+
+| n | dual ms | zgemm ms | dgemm ms | zgemm/dual | dual/(3·dgemm) |
+|---|---|---|---|---|---|
+| 8 | 0.0004 | 0.0001 | 0.0001 | 0.35 | 1.39 |
+| 16 | 0.001 | 0.001 | 0.000 | 0.70 | 1.31 |
+| 32 | 0.006 | 0.006 | 0.002 | 0.96 | 1.15 |
+| 48 | 0.015 | 0.016 | 0.004 | 1.05 | 1.19 |
+| 128 | 0.265 | 0.268 | 0.080 | 1.01 | 1.11 |
+| 512 | 16.6 | 16.0 | 5.10 | 0.96 | 1.09 |
+| 1024 | 117.9 | 124.3 | 37.3 | 1.05 | 1.06 |
+| 2048 | 834 | 977 | 272 | **1.17** | 1.02 |
+
+So the bar — dual ≥ the complex twin — holds from n = 48 and is within noise at 32 and 512 (0.96); at 2048,
+where the twin leaves its 3M window and the dual sub-gemms ride Strassen, dual is 17 % faster. The
+`dual/(3·dgemm)` column is the O(n²) overhead share: 2–15 %, shrinking with n. Below 32 the three entry
+overheads and the split dominate (0.35 at n = 8) — still 2× the generic loop's 0.17 — so the route is taken
+above `_fh_cgemm_tiny()` (= 6), the complex floor, reused as is. The triage's 0.12 became 1.0–1.17.
+
+Thin k, m = n = 1024 (the adversarial §5 case): dual beats the generic loop at every k (1.5× at k = 1, 7.7× at
+k = 32) and beats zgemm from k = 16; below that the O(n²) planes are not amortised (0.44 at k = 1). No k floor
+was added: below 16 the alternative is the generic loop, which is slower still. The honest fix for thin k, if
+it ever matters, is k tagged L2 gers — not a floor.
+
+### Sparring point 2 — scratch, with numbers
+
+Peak scratch is 6 planes: `A_v, A_p` (m×k), `B_v, B_p` (k×n), `P1, P2` (m×n) — for square n exactly `6n²`
+reals = **the byte size of the three dual operands** (each 2n² reals), i.e. a 2× footprint, from the same
+grow-only pool as complex 3M (slots 1,2 / 4,5 / 7,8 of `_gemm_3m_scratch`). At n = 4096 Float64 that is
+805 MB, on a 30 GB box; the real Strassen path at the same n already holds ~440 MB of Winograd level scratch
+(10 buffers per level, depth 3), so the dual route is the same order as what the fastest real path does, and
+nothing pages. Correction to the sparring premise: `_split3!` does NOT panel — complex 3M splits the whole
+operand and bounds its scratch only by the `_CGEMM_3M_MAX = 2048` window (9 × 32 MB there). The two costs
+that remain real: the pool never shrinks (a process that once ran a 4096² dual gemm keeps 805 MB resident —
+complex 3M has the same property at 288 MB), and paneling would cap it at the price of losing Strassen on the
+panels. Unpaneled is what shipped; the panel loop is the upgrade path if the footprint is objected to.
+
+### The compositions (galen, complex twin ÷ dual, side L, median of 6)
+
+| op | n=32 | n=128 | n=512 | n=1024 |
+|---|---|---|---|---|
+| syrk (real syrk + real syr2k) | 0.88 | 1.17 | 1.14 | 1.17 |
+| trmm (three real trmms) | 0.81 | 0.98 | 1.04 | 1.00 |
+| trsm (two real trsms + one trmm; no dual division) | 0.82 | 1.07 | 1.06 | 1.04 |
+
+At n = 32 the complex twins' tiny-k arms (`_trmm_cmplx_small_*`, the gemmtrsm leaf) have no dual counterpart
+and the three entries cost more than the work — as §5 predicted. From 128 the compositions sit at or above
+the twin. `herk` routes to `syrk` on a Dual (identity conjugation; `trans='C'` → `'T'`), the same decision as
+`hemv → symv` and `dotc == dotu`. Correctness: `bench/probes/dual_l3_check.jl` — every uplo/trans/side/diag,
+n ∈ {1,3,8,17,64,129,257} × k ∈ {1,5,32,130}, both real types, dual α and a zero-value β, plus a
+`ForwardDiff.derivative` through `trsm!` against `−L⁻¹ dL L⁻¹ B` — 0 failures; the same in
+`test/dual_tests.jl` ("Dual L3: syrk/herk/trmm/trsm compositions …").
+
+### What the L3 route never touches
+
+No complex function changed on L3. The additions are `_split2!`, `_combine_dual!`, `_combine_dual_tri!`,
+`_zero_diag!`, `_copy_plane!`, the four drivers (`_gemm_dual3!`, `_syrk_dual!`, `_trmm_dual!`, `_trsm_dual!`)
+and one branch in each of `gemm!`, `syrk!`, `herk!`, `trmm!`, `trsm!` behind `_pairT`, which is `false` for
+every type in the main env — so the branches fold away without ForwardDiff and the `--trim` build is unaffected.
