@@ -55,13 +55,14 @@ end
     end
     # Dual vector (ForwardDiff extension loaded): a REAL alpha scales value and partial alike, so it is the
     # real scal over the 2n-real buffer — exactly the complex bypass above. A dual alpha (nonzero partial)
-    # multiplies element by element and takes the generic loop below (its SIMD body is step 3 of the design).
+    # runs the complex scal body under the dual multiply rule (`_pair_shuf`).
     if incx == 1 && _pairalg(x)
         av, ap = _parts(convert(_et(x), a))
         if iszero(ap)
             GC.@preserve x _scal_simd!(2 * Int(n), av, _pairreal(x))
             return x
         end
+        return _scal_pair_simd!(Val(:dual), Int(n), av, ap, x)
     end
     ix = _start(n, incx)
     @inbounds for _ in 1:n
