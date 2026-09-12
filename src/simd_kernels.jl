@@ -473,8 +473,12 @@ end
 # The phase shape is CATASTROPHIC while resident (78.6 vs 129.7 at n=1e3) and the narrow width only pays
 # once a stream leaves L2 — applying it globally cost zaxpy 0.952→0.877 and, because complex `ger` calls
 # this per COLUMN at exactly those short lengths, zgeru 0.909→0.754. Do not hoist the switch.
-@generated function _axpy_cmplx_phase!(::Val{LANES}, n::Int, alr::T, ali::T, x, y) where {LANES, T <: BlasReal}
-    V = Vec{LANES, T}; sz = sizeof(T); cpx = LANES ÷ 2; U = 4
+#
+# `U` = vector groups per block, a `Val` so each arm is straight-line code (same as real `_axpy_phase!`).
+# It was a hardcoded 4 here while the real kernel ships a U=8 band arm (`_axpy_simd!`'s 208 case), so the
+# complex kernel could never hold as many loads in flight as its real twin. `_ZAXPY_PHASE_U` derives it.
+@generated function _axpy_cmplx_phase!(::Val{LANES}, ::Val{U}, n::Int, alr::T, ali::T, x, y) where {LANES, U, T <: BlasReal}
+    V = Vec{LANES, T}; sz = sizeof(T); cpx = LANES ÷ 2
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(LANES - 1))...)
     sgn = :($V($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(LANES - 1))...))))
     lx = [:($(Symbol(:xv, u)) = vload($V, px + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
@@ -532,6 +536,19 @@ end
 # wide arm, and Zen3 resolves narrow in 6 of 6 fresh processes. Only the datapath WIDTH separates the
 # three microarchitectures correctly. Zen5 is the one arm the formula changes and is UNMEASURED.
 @inline _zaxpy_narrow_lanes(::Type{T}) where {T} = 32 ÷ sizeof(T)      # 256 bits
+# PHASE-KERNEL UNROLL — PDM **Derive** tier, criterion = REGISTER BUDGET. Each group of the phase body
+# keeps its x, y and result vectors live across the block (that is what phase separation means: all loads
+# land before any store), so a group costs 3 registers; `arv`, `sv` and the two FMA temporaries reserve
+# 4 more. `U = (nvreg − 4) ÷ 3` is the widest block that fits, capped at 8 — the real kernel's widest
+# shipped arm (`_axpy_simd!` 208), so the two twins never diverge in shape.
+#   AVX2 (16 regs)   → (16−4)÷3 = 4  — the value that was hardcoded here, so AVX2 code is UNCHANGED.
+#   AVX-512 (32 regs) → (32−4)÷3 = 9 → 8.
+# `_ZAXPY_PHASE_UV` is the pre-built `Val` for the same trim reason as `_AXPY_VW_F64`: a `Val(u)` built
+# from a const inside the ladder is fine, but a module-level singleton makes the "no construction at all"
+# property explicit and shared by all three call sites.
+# PDM: Derived — formula over `_NVREG`; the fleet table is in bench/probes/zaxpy_phase_u.jl (Zen4).
+const _ZAXPY_PHASE_U = min(8, (_NVREG - 4) ÷ 3)
+const _ZAXPY_PHASE_UV = Val(_ZAXPY_PHASE_U)
 # PDM: Derived — the criterion IS the datapath: narrow arm iff _datapath_bytes <= 32. | tune: n/a
 const _ZAXPY_NARROW_PREF = @load_preference("zaxpy_narrow", nothing)
 @static if isnothing(_ZAXPY_NARROW_PREF)
@@ -582,13 +599,13 @@ end
     # Past L2 keeps its own **Measure** knob untouched — it is a datapath question (see `_zaxpy_narrow`),
     # it was measured in its own regime, and those sizes gate today.
     bytes > _L2_BYTES && return _zaxpy_narrow() ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
         _axpy_cmplx_wide!(n, alr, ali, x, y)
     # Derived band rule. Narrow lanes (256-bit) — NOT full width: at n=1e4 on Zen5 the full-width phase
     # arm measured 0.890 against the narrow arm's 1.011, so the win is the SCHEDULING STRUCTURE, not the
     # vector width. Same conclusion as real axpy, reached independently here.
     return 2 * bytes > _L1_BYTES ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
         _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
 
@@ -617,7 +634,7 @@ a pure scheduling difference on an elementwise update, so results stay bit-ident
 """
 @inline function _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
     return _zaxpy_narrow() ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), n, alr, ali, x, y) :
+        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
         _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
 
