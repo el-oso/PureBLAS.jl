@@ -51,6 +51,16 @@ function _pairreal end
 function _parts end
 function _mkpair end
 @inline _pairreal(x::_CplxArg) = _reptr(x)
+# TYPE-level twins for the L2/L3 routing (docs/src/dual_l2.md §3, dual_l3.md §2.1): a strided VIEW of a
+# `Matrix{Dual}` is not a `DenseArray`, so the value predicate above misses it while `_strided1` accepts the
+# complex equivalent. The extension adds the Dual methods; here `Complex` gets the same accessors so a driver
+# generalised over the pair type reads `_parts(α)` / `_mkpair(P, v, p)` for BOTH algebras.
+#   _pairT(P)           true iff `P` is Dual{Tag,V<:BlasReal,1}
+#   _pairvT(P)          the real type V under a pair type
+@inline _pairT(@nospecialize(_)) = false
+@inline _pairvT(::Type{Complex{T}}) where {T} = T
+@inline _parts(z::Complex) = (real(z), imag(z))
+@inline _mkpair(::Type{Complex{T}}, v, p) where {T} = Complex{T}(v, p)
 @inline _pairv(x) = eltype(_pairreal(x))     # the real type V under a pair vector (static; the pointer is dead)
 # Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
 @inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)

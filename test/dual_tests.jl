@@ -333,3 +333,67 @@ end
             DualNative.hist(DualNative.native_labelled(PureBLAS._dot_pair_simd, (C, Int, CV, CV, Type{T}, Val{false})))
     end
 end
+
+# ── BLAS-3 (docs/src/dual_l3.md): planar route — three real products on value/partial planes ────────
+@testitem "Dual L3: gemm planar route matches the plane formula (shapes, trans, dual α/β, zero-value α)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    for V in (Float64, Float32), (m, n, k) in ((7, 5, 3), (8, 8, 8), (9, 4, 17), (33, 31, 65), (129, 200, 3), (3, 200, 129), (257, 255, 256))
+        tol = 32 * sqrt(eps(V)) * max(m, n, k)
+        for tA in (false, true), tB in (false, true),
+                (αd, βd) in (
+                    (Dual{Nothing}(V(1.7), V(0.3)), Dual{Nothing}(V(0.9), V(-0.2))),
+                    (Dual{Nothing}(V(0), V(0.5)), Dual{Nothing}(V(0), V(0.7))),      # zero VALUE, live partial: must not quick-return
+                    (Dual{Nothing}(V(1), V(0)), Dual{Nothing}(V(0), V(0))),
+                )          # β == 0: C is not read
+            A = DualT.mkd(randn(V, (tA ? (k, m) : (m, k))...), randn(V, (tA ? (k, m) : (m, k))...))
+            B = DualT.mkd(randn(V, (tB ? (n, k) : (k, n))...), randn(V, (tB ? (n, k) : (k, n))...))
+            C = DualT.mkd(randn(V, m, n), randn(V, m, n))
+            oA(X) = tA ? transpose(X) : X; oB(X) = tB ? transpose(X) : X
+            Av = value.(A); Ap = partials.(A, 1); Bv = value.(B); Bp = partials.(B, 1)
+            P1 = oA(Av) * oB(Bv); P2 = oA(Av) * oB(Bp) + oA(Ap) * oB(Bv)          # A_p·B_p is ε²: absent
+            av, ap = value(αd), partials(αd, 1); bv, bp = value(βd), partials(βd, 1)
+            Rv = av .* P1 .+ bv .* value.(C); Rp = av .* P2 .+ ap .* P1 .+ bv .* partials.(C, 1) .+ bp .* value.(C)
+            R = PureBLAS.gemm!(copy(C), A, B; alpha = αd, beta = βd, transA = tA ? 'T' : 'N', transB = tB ? 'T' : 'N')
+            @test isapprox(value.(R), Rv; rtol = tol, atol = tol)
+            @test isapprox(partials.(R, 1), Rp; rtol = tol, atol = tol)
+            @test eltype(R) === eltype(C)
+        end
+    end
+    # 'C' on a Dual is the transpose (conj is the identity on Dual <: Real), on both the pair route and the generic loop
+    A = DualT.mkd(randn(20, 30), randn(20, 30)); B = DualT.mkd(randn(20, 10), randn(20, 10))
+    @test PureBLAS.gemm!(zeros(eltype(A), 30, 10), A, B; transA = 'C') == PureBLAS.gemm!(zeros(eltype(A), 30, 10), A, B; transA = 'T')
+end
+
+@testitem "Dual L3: gemm ε²-leak and a ForwardDiff derivative through gemm!" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    # partials ~1e155: A_p·B_p would overflow if it were ever formed; the value must be the exact real product
+    A = DualT.mkd(randn(64, 64), 1.0e155 .* randn(64, 64)); B = DualT.mkd(randn(64, 64), 1.0e155 .* randn(64, 64))
+    R = PureBLAS.gemm!(zeros(eltype(A), 64, 64), A, B)
+    @test all(isfinite, value.(R)) && all(isfinite, partials.(R, 1))
+    @test value.(R) ≈ value.(A) * value.(B)
+    A0 = randn(20, 30); dA = randn(20, 30); B0 = randn(30, 10)
+    f(t) = vec(PureBLAS.gemm!(zeros(eltype(t), 20, 10), A0 .+ t .* dA, B0 .+ zero(t)))
+    @test ForwardDiff.derivative(f, 0.5) ≈ vec(dA * B0)
+    # a strided view misses the pair predicate and takes the generic loop; both agree
+    Cs = view(zeros(eltype(A), 128, 64), 1:2:128, :)
+    @test PureBLAS.gemm!(Cs, A, B) ≈ R
+end
+
+@testitem "StrictMode dogfood: BLAS-3 dual strict contract" tags = [:checks] begin
+    using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
+    using ForwardDiff: Dual
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping dual L3 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        n = 96
+        Ad = Dual{Nothing}.(randn(n, n), randn(n, n)); Bd = Dual{Nothing}.(randn(n, n), randn(n, n)); Cd = zeros(eltype(Ad), n, n)
+        ad = Dual{Nothing}(1.7, 0.3)
+        PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)       # grow the plane pool once at this size (grow-only, like 3M)
+        @test_noalloc PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        @test true
+    end
+end
