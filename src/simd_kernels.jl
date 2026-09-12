@@ -75,6 +75,16 @@ function _mkpair end
 _pair_shuf(ALG, N) = Expr(:tuple, (ALG === :cplx ? (isodd(l) ? l - 1 : l + 1) : 2 * (l ÷ 2) for l in 0:(N - 1))...)
 _pair_sgn(ALG, N, V, ::Type{T}) where {T} =
     :($V($(Expr(:tuple, (iseven(l) ? (ALG === :cplx ? :(-ali) : zero(T)) : :ali for l in 0:(N - 1))...))))
+# THE ODD-LANE SELECT (gemv-N, docs/src/dual_l2.md §2.1): the cross-lane term of an accumulator `q = Σ a·c`
+# must land on the odd lane. :cplx has the sign pre-folded into `c` and swaps; :dual takes q's EVEN lanes onto
+# the odd lanes and ZERO onto the even lanes through a two-source shuffle — one shuffle-class op either way, and
+# no lane is multiplied by 0, so an Inf in q's discarded odd lane (`Σ a_p·c_p`, the ε² term) cannot poison the
+# value. `N` is the lane count of `V`; out lane l ← l (zero source) for even l, `N + l − 1` (q's lane l−1) for odd.
+_pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
+    :(shufflevector($q, Val($(Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...))))) :
+    :(shufflevector(zero($V), $q, Val($(Expr(:tuple, (iseven(l) ? l : N + l - 1 for l in 0:(N - 1))...)))))
+# The tag of a pair TYPE, for drivers generic over `P` (the extension adds the Dual method).
+@inline _palg(::Type{Complex{T}}) where {T} = Val(:cplx)
 
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)

@@ -297,8 +297,10 @@ end
 # because `_gemv_n_simd!` sends every `n <= _gemvn_rb()` (448 on Zen4) down THIS path — so a harness
 # that arms only the panel driver is measuring a path production does not take at small n. That is
 # exactly what `bench/calibrate.jl`'s first `calibrate_gemv_mr` did at n=100.
-@inline function _gemv_n_rowblock!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0},
-                                   ::Val{MR} = Val(_GEMV_MR)) where {T <: BlasReal, B0, MR}
+@inline function _gemv_n_rowblock!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0},
+        ::Val{MR} = Val(_GEMV_MR)
+    ) where {T <: BlasReal, B0, MR}
     W = _vwidth(T); mr = MR * W
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
@@ -582,10 +584,10 @@ end
 # a 28x slowdown on the gate. A @generated tuple expression has no closure to box.
 @inline @generated function _colbases(p::Ptr{T}, lda::Int, sz::Int, ::Val{NC}) where {T, NC}
     # ⚠ `Expr(:meta, :inline)` IN THE BODY, not just `@inline` on the signature: @inline does NOT
-# propagate into a @generated function CodeInfo (Julia 1.12). Without it this does not inline, the
-# returned tuple is BOXED, and gemv! allocates ~170 B per column block — 10.8 KB per call at
-# n=256. Same hazard already recorded for the Vec-argument kernels.
-return Expr(:block, Expr(:meta, :inline), Expr(:tuple, (:(p + $(c - 1) * lda * sz) for c in 1:NC)...))
+    # propagate into a @generated function CodeInfo (Julia 1.12). Without it this does not inline, the
+    # returned tuple is BOXED, and gemv! allocates ~170 B per column block — 10.8 KB per call at
+    # n=256. Same hazard already recorded for the Vec-argument kernels.
+    return Expr(:block, Expr(:meta, :inline), Expr(:tuple, (:(p + $(c - 1) * lda * sz) for c in 1:NC)...))
 end
 
 @noinline @generated function _gemv_t_block!(
@@ -636,18 +638,18 @@ end
     # parallel and the extra columns buy no memory-level parallelism at all. THAT is why every NC=8
     # arm measured identical to NC=4 (kb/findings/pureblas-zen5-gemvt-l2-invariant.md): the arm was
     # crippled, not the hypothesis. `_trmv_fused8!` already hoists c0..c7 by hand for this reason.
-# ⚠ AND HOISTING DOES NOT FIX IT — measured, do not retry. With the bases hoisted as loop-invariant
-# pointers, LLVM loop-strength-reduction REBUILDS the identical 6-deep chain, and wrapping each
-# base in `Base.compilerbarrier(:const, …)` does not stop it either. The cause is x86-64's 16
-# GPRs: eight independent bases plus index, limit, xp, yp and temps do not fit, so LSR trades the
-# registers for the dependency. That is the right call for register pressure and the wrong one for
-# memory-level parallelism, and the preference is not expressible from Julia.
-# WHAT THIS INVALIDATES: every NC >= 8 arm ever measured here. None of them was a test of stream
-# count — the streams existed in the source and not in the machine code, which is exactly why
-# NC=8 could only ever come back "no different from NC=4". NC=4 is chain-free (four independent
-# bases, one `add` in the loop), which is why it ships.
-# The hoist is kept: it is equivalent, it matches `_trmv_fused8!`, and it makes the intent legible
-# next to this note.
+    # ⚠ AND HOISTING DOES NOT FIX IT — measured, do not retry. With the bases hoisted as loop-invariant
+    # pointers, LLVM loop-strength-reduction REBUILDS the identical 6-deep chain, and wrapping each
+    # base in `Base.compilerbarrier(:const, …)` does not stop it either. The cause is x86-64's 16
+    # GPRs: eight independent bases plus index, limit, xp, yp and temps do not fit, so LSR trades the
+    # registers for the dependency. That is the right call for register pressure and the wrong one for
+    # memory-level parallelism, and the preference is not expressible from Julia.
+    # WHAT THIS INVALIDATES: every NC >= 8 arm ever measured here. None of them was a test of stream
+    # count — the streams existed in the source and not in the machine code, which is exactly why
+    # NC=8 could only ever come back "no different from NC=4". NC=4 is chain-free (four independent
+    # bases, one `add` in the loop), which is why it ships.
+    # The hoist is kept: it is equivalent, it matches `_trmv_fused8!`, and it makes the intent legible
+    # next to this note.
     for c in 1:NC
         push!(body.args, :($(Symbol(:pc, c)) = ps[$c]))
     end
@@ -668,10 +670,12 @@ end
     for u in 1:U, c in 1:NC
         push!(
             full.args,
-            :($(acc(c, u)) = muladd(
-                vload($V, $(Symbol(:pc, c)) + (i + $((u - 1) * W)) * $sz), $(Symbol(:xc, u)),
-                $(acc(c, u))
-            ))
+            :(
+                $(acc(c, u)) = muladd(
+                    vload($V, $(Symbol(:pc, c)) + (i + $((u - 1) * W)) * $sz), $(Symbol(:xc, u)),
+                    $(acc(c, u))
+                )
+            )
         )
     end
     if PFB > 0                       # one prefetch per column per iteration, PFB bytes downstream
@@ -845,7 +849,11 @@ end
 const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
 # m-unroll for the blocked gemv-T kernel. DERIVED cap: NC·U accumulators + U x-vectors + ~2 temps must
 # fit `_NVREG`. At the shipped NC=4 that gives U ≤ 4 on AVX-512 (24 regs) and U ≤ 2 on AVX2 (14).
-@inline _gemvt_u_max(nc::Int) = (u = 4; while u > 1 && nc * u + u + 2 > _NVREG; u ÷= 2; end; u)
+@inline _gemvt_u_max(nc::Int) = (
+    u = 4; while u > 1 && nc * u + u + 2 > _NVREG
+        u ÷= 2
+    end; u
+)
 # PDM: Derived — row unroll capped by the register file: NC*U + U + 2 <= _NVREG. | tune: n/a
 const _GEMVT_U_PREF = @load_preference("gemvt_u", nothing)
 const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default until the gate says move it
@@ -862,14 +870,14 @@ const _GEMVT_U = something(_GEMVT_U_PREF, 1)::Int   # req8-ok: shipped default u
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_GEMVT_U_PREF)
-# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. `PUREBLAS_FORCE_gemvt_u=0` selects the
-# REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`); 0 is otherwise meaningless as an unroll and
-# `_force_knob` already spends -1 on "unset", so it is the one spare value. See the U == -1 branch of
-# the generator for what it tests and why. Env decoding lives in `_init_force_knobs!`.
-const _GEMVT_U_REF = Ref{Int}(_GEMVT_U)
-@inline _gemvt_u() = _GEMVT_U_REF[]
+    # Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. `PUREBLAS_FORCE_gemvt_u=0` selects the
+    # REGISTER-PRELOAD arm (U = -1 inside `_gemv_t_block!`); 0 is otherwise meaningless as an unroll and
+    # `_force_knob` already spends -1 on "unset", so it is the one spare value. See the U == -1 branch of
+    # the generator for what it tests and why. Env decoding lives in `_init_force_knobs!`.
+    const _GEMVT_U_REF = Ref{Int}(_GEMVT_U)
+    @inline _gemvt_u() = _GEMVT_U_REF[]
 else
-@inline _gemvt_u() = _GEMVT_U_PREF::Int
+    @inline _gemvt_u() = _GEMVT_U_PREF::Int
 end
 # ── gemv-T A-stream software prefetch distance (bytes; 0 = off) ─────────────────────────────────────
 # The prefetch is a HINT (llvm.prefetch): architecturally non-faulting on x86, so reading past the end
@@ -904,11 +912,11 @@ const _GEMVT_PF = something(_GEMVT_PF_PREF, 0)::Int   # req8-ok: shipped default
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_GEMVT_PF_PREF)
-# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
-const _GEMVT_PF_REF = Ref{Int}(_GEMVT_PF)
-@inline _gemvt_pf() = _GEMVT_PF_REF[]
+    # Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
+    const _GEMVT_PF_REF = Ref{Int}(_GEMVT_PF)
+    @inline _gemvt_pf() = _GEMVT_PF_REF[]
 else
-@inline _gemvt_pf() = _GEMVT_PF_PREF::Int
+    @inline _gemvt_pf() = _GEMVT_PF_PREF::Int
 end
 
 # FALSIFIED-DERIVATION LITERAL (2026-08-19): the duel here has been dormant (an `if false`) since
@@ -931,10 +939,10 @@ const _GEMVT_NC = something(_GEMVT_NC_PREF, 4)::Int   # req8-ok: falsified-deriv
 # The null test that exposes it is forcing a knob to the value it ALREADY has and checking the arm
 # actually changed. Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`.
 @static if isnothing(_GEMVT_NC_PREF)
-const _GEMVT_NC_REF = Ref{Int}(_GEMVT_NC)
-@inline _gemvt_nc() = _GEMVT_NC_REF[]
+    const _GEMVT_NC_REF = Ref{Int}(_GEMVT_NC)
+    @inline _gemvt_nc() = _GEMVT_NC_REF[]
 else
-@inline _gemvt_nc() = _GEMVT_NC_PREF::Int
+    @inline _gemvt_nc() = _GEMVT_NC_PREF::Int
 end
 
 # gemv-T blocked-vs-per-column ROUTE, as a 3-valued MODE (not a Bool) so the RESIDENCY arm is itself
@@ -971,8 +979,10 @@ end
 # change can close it. (Zen4 mode 2 was not run: its contention guard refused twice, and with mode 2
 # dead 13/14 on the other two boxes the arm did not deserve a third slot.)
 # PDM: Measured — every pair of boxes disagrees at some size; L1, L2, L3 and width all falsified. | tune: not yet
-const _GEMVT_PERSCAN_PREF = (_p = @load_preference("gemvt_perscan", nothing);
-                             _p isa Bool ? (_p ? 1 : 0) : _p)
+const _GEMVT_PERSCAN_PREF = (
+    _p = @load_preference("gemvt_perscan", nothing);
+    _p isa Bool ? (_p ? 1 : 0) : _p
+)
 @static if isnothing(_GEMVT_PERSCAN_PREF)
     # DUEL DELETED 2026-08-19 — it was shipping a 27% regression once every ~6 processes.
     # Resolved across 6 fresh processes per box: Zen4 1,1,1,1,1,1 but Zen3 0,0,0,0,1,0. The
@@ -1267,8 +1277,10 @@ end
         # this branch plus a const-folded comparison on m*n.
         u0 = _gemvt_u(); pf0 = _gemvt_pf(); nc0 = _gemvt_nc()
         if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1 && pf0 == 0
-            jd = !blk ? 0 : _gemvt_cols!(Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
-                                        yptr, Aptr, xptr, lda, m, n, α, β, sz)
+            jd = !blk ? 0 : _gemvt_cols!(
+                    Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
+                    yptr, Aptr, xptr, lda, m, n, α, β, sz
+                )
             @inbounds while jd < n
                 sd = _dot_simd(m, Aptr + jd * lda * sz, xptr, T)
                 yjd = unsafe_load(yptr, jd + 1)
@@ -1297,6 +1309,14 @@ end
 @inline function _l2c_ok(A, x, y, incx::Integer, incy::Integer)
     T = eltype(A)
     return incx == 1 && incy == 1 && T <: BlasComplex && eltype(x) === T && eltype(y) === T &&
+        _strided1(A) &&
+        _dense1(x) && _dense1(y)
+end
+# Dual-pair L2 eligibility (docs/src/dual_l2.md §3): the type-level mirror of `_l2c_ok`. `_pairT` is false for
+# every type in the main env, so this folds away there and the --trim build never sees the pair branches.
+@inline function _l2p_ok(A, x, y, incx::Integer, incy::Integer)
+    T = eltype(A)
+    return incx == 1 && incy == 1 && _pairT(T) && eltype(x) === T && eltype(y) === T &&
         _strided1(A) &&
         _dense1(x) && _dense1(y)
 end
@@ -1401,25 +1421,40 @@ const _CGEMV_RB = @load_preference("cgemv_rb", _L2_BYTES ÷ 16)::Int   # m·n co
 const _CGEMVN_NC = @load_preference("cgemvn_nc", 4)::Int             # columns per panel (OB uses 4)
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4`
 const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  # A-stream prefetch (AVX2)
-@generated function _gemv_n_ri_panel!(
-        yp::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, m::Int,
+# THE SAME BODY SERVES THE DUAL gemv-N (docs/src/dual_l2.md §2.1): `ALG` is the multiply-rule tag. Per column
+# the hoisted scalar α·x[j] is complex `(αr·xr − αi·xi, αr·xi + αi·xr)` and dual `(αv·xv, αv·xp + αp·xv)` — the
+# dropped term is ε². In the loop `Pv = Σ a·cr` already lands both `a_v·c_v` (value lane) and `a_p·c_v` (partial
+# lane); the remaining `a_v·c_p` sits on the EVEN lane of `Qv = Σ a·ci` and must reach the ODD lane with the even
+# lane receiving nothing. Complex does that with the swap + sign fold; dual uses `_pair_oddsel` — a two-source
+# shuffle against a zero vector — so no lane is ever multiplied by 0 (an infinite partial in Qv's discarded
+# odd lane, `Σ a_p·c_p`, cannot poison the value). One shuffle per row-iteration in both algebras; the
+# complex instantiation is the byte-identical body it always was (bench/probes/dual_l23_native.jl).
+@inline _gemv_n_ri_panel!(yp::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, m::Int, αr::T, αi::T, nc::Val, pf::Val) where {T} =
+    _gemv_n_pair_panel!(Val(:cplx), yp, Ab, ldc, xp, jc, m, αr, αi, nc, pf)
+@generated function _gemv_n_pair_panel!(
+        ::Val{ALG}, yp::Ptr{T}, Ab::Ptr{T}, ldc::Int, xp::Ptr{T}, jc::Int, m::Int,
         αr::T, αi::T, ::Val{NC}, ::Val{PF}
-    ) where {T, NC, PF}
+    ) where {ALG, T, NC, PF}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
     # Sign-fold: pre-multiply the ci broadcast by [+1,-1,+1,-1,…] (hoisted, once/column) so the per-row
     # epilogue becomes a plain FADD `(y+Pv)+shuffle(Qv)` instead of `muladd(shuffle(Qv), sgnv, y+Pv)` —
     # drops one FMA-port op per row-iter (the inner loop is FMA-bound). altv[swp[k]]·shuffle folds the
     # sgnv=[-1,+1,…] pattern into Qv; scalar-tail uses lane[1] (=+ci, unaffected). Fable-P2 2026-07-14.
+    # Dual needs no sign fold: the odd-lane select below takes Qv's even lanes as they are.
+    cplx = ALG === :cplx
     altv = Expr(:tuple, (iseven(l) ? one(T) : -one(T) for l in 0:(2W - 1))...)
-    body = quote
-        altv = $V2($altv)
-    end
+    body = cplx ? quote
+            altv = $V2($altv)
+        end : quote end
     for c in 1:NC                                   # hoist: α·x[jj] once per column, broadcast re/im
         push!(body.args, :($(Symbol(:b, c)) = Ab + (jc + $(c - 1)) * 2 * ldc * $sz))
         push!(body.args, :(xr = unsafe_load(xp, 2 * (jc + $(c - 1)) + 1); xi = unsafe_load(xp, 2 * (jc + $(c - 1)) + 2)))
-        push!(body.args, :($(Symbol(:cr, c)) = $V2(αr * xr - αi * xi)))
-        push!(body.args, :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr) * altv))   # sign-folded ci broadcast
+        push!(body.args, :($(Symbol(:cr, c)) = $V2($(cplx ? :(αr * xr - αi * xi) : :(αr * xr)))))
+        push!(
+            body.args, cplx ? :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr) * altv) :   # sign-folded ci broadcast
+                :($(Symbol(:ci, c)) = $V2(αr * xi + αi * xr))
+        )
     end
     inner = quote
         off = i * 2 * $sz
@@ -1436,7 +1471,7 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
         end
     end
     push!(inner.args, :(yv = vload($V2, yp + off)))
-    push!(inner.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($swp))))   # sign pre-folded into Qv
+    push!(inner.args, :(yv = (yv + Pv) + $(_pair_oddsel(ALG, V2, 2W, :Qv))))   # cplx: sign pre-folded into Qv
     push!(inner.args, :(vstore(yv, yp + off)))
     # Masked row tail: ONE predicated iteration replaces the per-row scalar loop over the `m % W`
     # remaining complex rows. Same defect and same fix as `_gemv_tc_block_cmplx!` — the scalar tail
@@ -1456,14 +1491,14 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
     tail = quote
         msk = Vec($hclane) <= (m - i)
         off = i * 2 * $sz
-        haltv = $VH($haltv)
     end
+    cplx && push!(tail.args, :(haltv = $VH($haltv)))
     for c in 1:NC
         av = Symbol(:av, c)
         push!(tail.args, :($av = vload($VH, $(Symbol(:b, c)) + off, msk)))
         # cr/ci are broadcasts of ONE scalar each; ci is already sign-folded by altv, whose lane 1 is
         # +1, so ci[1] recovers the raw scalar and the half-width fold is a fresh multiply by haltv.
-        crh = :($VH($(Symbol(:cr, c))[1])); cih = :($VH($(Symbol(:ci, c))[1]) * haltv)
+        crh = :($VH($(Symbol(:cr, c))[1])); cih = cplx ? :($VH($(Symbol(:ci, c))[1]) * haltv) : :($VH($(Symbol(:ci, c))[1]))
         if c == 1
             push!(tail.args, :(Pv = $av * $crh; Qv = $av * $cih))
         else
@@ -1472,7 +1507,7 @@ const _CGEMVN_PF = @load_preference("cgemvn_pf", _vwidth(Float64) == 4)::Bool  #
         end
     end
     push!(tail.args, :(yv = vload($VH, yp + off, msk)))
-    push!(tail.args, :(yv = (yv + Pv) + shufflevector(Qv, Val($hswp))))
+    push!(tail.args, :(yv = (yv + Pv) + $(_pair_oddsel(ALG, VH, HW, :Qv))))
     push!(tail.args, :(vstore(yv, yp + off, msk)))
     push!(body.args, :(i = 0))
     push!(
@@ -1529,10 +1564,12 @@ end
 # path via the caller). NC is a `Val` rather than an Int so the @generated panel specializes per
 # candidate; a runtime `Val(nc)` would dispatch dynamically on every panel, and the tuner below needs to
 # call this at each candidate anyway.
+# Generic over the PAIR type `P` (Complex{T} or Dual{Tag,T,1}): the drivers read the scalar parts through
+# `_parts` and tag the kernels with `_palg(P)`; the complex instantiation is unchanged (gate: dual_l23_native.jl).
 function _gemv_n_ri_run!(
-        m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}, ::Val{NC}, ::Val{PF}
-    ) where {T <: BlasReal, B0, NC, PF}
-    sz = sizeof(T); αr = real(α); αi = imag(α)
+        m::Int, n::Int, α::P, A, x, y, β::P, ::Val{B0}, ::Val{NC}, ::Val{PF}
+    ) where {P, B0, NC, PF}
+    T = _pairvT(P); sz = sizeof(T); αr, αi = _parts(α)
     # y is restreamed once per NC-column panel (n/NC times) → block m so the y-block fits ~½ L2 for tall
     # shapes; square mid-n (16m ≤ ½L2) runs one block (NB=m), which measured fastest (prefetch continuity).
     NB = (2 * m * sz <= _L2_BYTES ÷ 2) ? m : max(NC, (_L2_BYTES ÷ 2) ÷ (2 * sz))
@@ -1543,18 +1580,19 @@ function _gemv_n_ri_run!(
                 unsafe_store!(yp, zero(T), i)
             end
         elseif !isone(β)
-            _scal_cmplx_simd!(m, real(β), imag(β), y)
+            βr, βi = _parts(β)
+            _scal_pair_simd!(_palg(P), m, βr, βi, y)
         end
         i0 = 0
         while i0 < m
             mb = min(NB, m - i0); ypb = yp + i0 * 2 * sz; Apb = Ap + i0 * 2 * sz
             jc = 0
             while jc + NC <= n
-                _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(NC), Val(PF))
+                _gemv_n_pair_panel!(_palg(P), ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(NC), Val(PF))
                 jc += NC
             end
             while jc < n
-                _gemv_n_ri_panel!(ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(1), Val(false))
+                _gemv_n_pair_panel!(_palg(P), ypb, Apb, ldc, xp, jc, mb, αr, αi, Val(1), Val(false))
                 jc += 1
             end
             i0 += mb
@@ -1601,7 +1639,7 @@ const _CGEMVN_NC_BIG = @load_preference("cgemvn_nc_big", 3 * _vwidth(Float64) ÷
 
 # The shipping panel, with NO reference to the measured knob. Internal BLAS-2 callers use THIS, not the
 # tier-selecting entry below — see the @noalloc note there.
-@inline function _gemv_n_ri_ship!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+@inline function _gemv_n_ri_ship!(m::Int, n::Int, α::P, A, x, y, β::P, ::Val{B0}) where {P, B0}
     return _CGEMVN_PF ?
         _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(true)) :
         _gemv_n_ri_run!(m, n, α, A, x, y, β, Val(B0), Val(_CGEMVN_NC), Val(false))
@@ -1616,7 +1654,8 @@ end
 # It is also the right split on the merits, not just to satisfy the checker: the triangular scatter's
 # operand is m×NB — a tall-skinny panel — never the large SQUARE regime this knob was measured in, so
 # consulting it there would be a probe-regime error even if it were free.
-function _gemv_n_ri_cmplx!(m::Int, n::Int, α::Complex{T}, A, x, y, β::Complex{T}, ::Val{B0}) where {T <: BlasReal, B0}
+function _gemv_n_ri_cmplx!(m::Int, n::Int, α::P, A, x, y, β::P, ::Val{B0}) where {P, B0}
+    T = _pairvT(P)
     # Below L3/2 keep the shipping panel byte-for-byte (no size on either box regresses there); above it,
     # take the measured value. The BOUNDARY is Derive tier (L3 residency), the VALUE inside it is Measure.
     if _cgemvn_abytes(T, m, n) > _L3_BYTES ÷ 2
@@ -1725,11 +1764,19 @@ end
 # bandwidth/MLP-bound (measured Zen3: n≥1024 both PB & OB run at L3/DRAM bw); Vec{2W} at NC=2 already
 # eats all 16 ymm, capping concurrent column streams at 2. Vec{W} at NC=4 → 4 independent streams (OB's
 # AVX2 blocking) → more memory-level parallelism → saturates bw. Full-width kept for AVX-512 (32 regs).
-@inline @generated function _gemv_tc_block_cmplx!(
-        yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int,
-        xp::Ptr{Complex{T}}, m::Int, α::Complex{T}, β::Complex{T}, z::Bool,
-        ::Val{NC}, ::Val{CJ}, ::Val{HALF} = Val(false)
-    ) where {T, NC, CJ, HALF}
+# THE SAME BODY SERVES THE DUAL gemv-T (docs/src/dual_l2.md §2.2): the loop is algebra-agnostic (p = Σ a·x,
+# q = Σ a·swap(x)) and only the fold is per-algebra, exactly as `_dot_pair_simd` — :dual takes value = pf[1]
+# (the pf[2] = Σ a_p·x_p lane is ε² and is not touched) and partial = qf[1] + qf[2]; CJ is ignored (conj is the
+# identity on a Real). `P` is the pair type; its real type is `fieldtype(P, 1)` at generation time (no
+# extension method may be called inside a generator). The complex instantiation is byte-identical.
+@inline _gemv_tc_block_cmplx!(yp::Ptr{Complex{T}}, Ab::Ptr{Complex{T}}, lda::Int, xp::Ptr{Complex{T}}, m::Int, α::Complex{T}, β::Complex{T}, z::Bool, nc::Val, cj::Val, half::Val = Val(false)) where {T} =
+    _gemv_tc_pair_block!(Val(:cplx), yp, Ab, lda, xp, m, α, β, z, nc, cj, half)
+@inline @generated function _gemv_tc_pair_block!(
+        ::Val{ALG}, yp::Ptr{P}, Ab::Ptr{P}, lda::Int,
+        xp::Ptr{P}, m::Int, α::P, β::P, z::Bool,
+        ::Val{NC}, ::Val{CJ}, ::Val{HALF}
+    ) where {ALG, P, NC, CJ, HALF}
+    T = fieldtype(P, 1)
     W = _vwidth(T); lanes = HALF ? W : 2W; cstep = lanes ÷ 2; V2 = Vec{lanes, T}; sz = sizeof(T)
     swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(lanes - 1))...)
     body = quote
@@ -1780,24 +1827,28 @@ end
         push!(mtail.args, :($(Symbol(:p, c)) = muladd($av, xc, $(Symbol(:p, c)))))
         push!(mtail.args, :($(Symbol(:q, c)) = muladd($av, xcs, $(Symbol(:q, c)))))
     end
-    push!(body.args, :(@inbounds if i < m
-        $mtail
-    end))
+    push!(
+        body.args, :(
+            @inbounds if i < m
+                $mtail
+            end
+        )
+    )
     for c in 1:NC
         pf = Symbol(:pf, c); qf = Symbol(:qf, c)   # unique names — must NOT collide with accumulators p$c/q$c
         push!(
             body.args, quote
                 $pf = _fold2_cmplx($(Symbol(:p, c)))   # [Σ ar·xr, Σ ai·xi]  (parity-preserving fold; see gemm.jl)
                 $qf = _fold2_cmplx($(Symbol(:q, c)))   # [Σ ar·xi, Σ ai·xr]
-                $(Symbol(:sr, c)) = $pf[1] + $(CJ ? :($pf[2]) : :(-$pf[2]))
-                $(Symbol(:si, c)) = $qf[1] + $(CJ ? :(-$qf[2]) : :($qf[2]))
+                $(Symbol(:sr, c)) = $(ALG === :cplx ? :($pf[1] + $(CJ ? :($pf[2]) : :(-$pf[2]))) : :($pf[1]))
+                $(Symbol(:si, c)) = $(ALG === :cplx ? :($qf[1] + $(CJ ? :(-$qf[2]) : :($qf[2]))) : :($qf[1] + $qf[2]))
             end
         )
     end
     for c in 1:NC
         push!(
             body.args, quote
-                s = Complex($(Symbol(:sr, c)), $(Symbol(:si, c)))
+                s = _mkpair($P, $(Symbol(:sr, c)), $(Symbol(:si, c)))
                 yj = unsafe_load(yp, $c)
                 unsafe_store!(yp, z ? α * s : muladd(β, yj, α * s), $c)
             end
@@ -1809,20 +1860,25 @@ end
 
 # Knob-free runner: (NC, HALF) arrive as compile-time `Val`s so the block kernel specializes and the
 # hot loop carries no dynamic dispatch. The measure harness calls this directly with each candidate.
+# One column dot in the pair type: complex returns Complex, dual returns the bare (value, partial) pair — so
+# the wrap is per algebra. Generic over `P` (Complex{T} or Dual{Tag,T,1}); the complex driver code is unchanged.
+@inline _pair_coldot(::Type{Complex{T}}, m::Int, ap, xp, ::Val{CJ}) where {T, CJ} = _dot_cmplx_simd(m, ap, xp, T, Val(CJ))
+@inline _pair_coldot(::Type{P}, m::Int, ap, xp, ::Val{CJ}) where {P, CJ} =
+    _mkpair(P, _dot_pair_simd(Val(:dual), m, ap, xp, _pairvT(P), Val(false))...)
 function _gemv_tc_run!(
-        m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}, ::Val{NC}, ::Val{HALF}
-    ) where {T <: BlasReal, CJ, NC, HALF}
-    z = iszero(β); csz = sizeof(Complex{T})
+        m::Int, n::Int, α::P, A, x, β::P, y, ::Val{CJ}, ::Val{NC}, ::Val{HALF}
+    ) where {P, CJ, NC, HALF}
+    z = iszero(β); csz = sizeof(P)
     GC.@preserve A x y begin
         Ap = pointer(A); lda = stride(A, 2); xp = _ptr(x); yp = _ptr(y)
         j = 0
         while j + NC <= n                                         # NC-column blocks (shared x + swap)
-            _gemv_tc_block_cmplx!(yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(HALF))
+            _gemv_tc_pair_block!(_palg(P), yp + j * csz, Ap + j * lda * csz, lda, xp, m, α, β, z, Val(NC), Val(CJ), Val(HALF))
             j += NC
         end
         @inbounds while j < n                                     # remainder columns: per-column dot
             colp = Ap + j * lda * csz
-            s = _dot_cmplx_simd(m, colp, xp, T, Val(CJ))
+            s = _pair_coldot(P, m, colp, xp, Val(CJ))
             yj = y[j + 1]; y[j + 1] = (z ? zero(yj) : β * yj) + α * s
             j += 1
         end
@@ -1835,8 +1891,9 @@ end
 # `Val(nc)` here would reintroduce the runtime dispatch that has broken the @typestable contract twice).
 # Arms the register file cannot hold on this ISA const-fold away.
 @inline function _gemv_tc_cmplx!(
-        m::Int, n::Int, α::Complex{T}, A, x, β::Complex{T}, y, ::Val{CJ}
-    ) where {T <: BlasReal, CJ}
+        m::Int, n::Int, α::P, A, x, β::P, y, ::Val{CJ}
+    ) where {P, CJ}
+    T = _pairvT(P)
     # ⚠ THE OPTIMUM IS SIZE-DEPENDENT, SO THE RESIDENCY SPLIT IS PART OF THE KNOB — one global config is
     # measurably wrong at one end or the other. Measured 2026-08-07 on Zen4, freq-locked, all arms
     # SAME-RUN, forced via PUREBLAS_FORCE_cgemvt_cfg, vs AOCL:
@@ -1853,7 +1910,7 @@ end
     # (AOCL's fused zdotxf runs 8 — see the `_cgemvt_cfg` note). Shipping NC=8 everywhere would have
     # traded two mid-band misses for two small-n ones.
     # DERIVE tier: the SPLIT is a residency criterion over `_L2_BYTES`; only the past-L2 arm is Measured.
-    if m * n * sizeof(Complex{T}) <= _L2_BYTES
+    if m * n * sizeof(P) <= _L2_BYTES
         # WIDTH IS AN ISSUE-SLOT MINIMISATION, and it is DERIVE tier: no literal, just the detected
         # step. A masked tail costs a whole iteration regardless of how few rows survive the mask
         # (kb `pureblas-tail-cost-is-the-issue-slot`), so the two arms cost
@@ -1910,6 +1967,11 @@ function _gemv!(
             return iszero(β) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(true)) :
                 _gemv_n_ri_cmplx!(Int(m), Int(n), αc, A, x, y, βc, Val(false))
         end
+        if _l2p_ok(A, x, y, incx, incy)       # dual pairs → the SAME ri kernel, tagged (docs/src/dual_l2.md)
+            αd = convert(eltype(A), α); βd = convert(eltype(A), β)
+            return iszero(βd) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αd, A, x, y, βd, Val(true)) :
+                _gemv_n_ri_cmplx!(Int(m), Int(n), αd, A, x, y, βd, Val(false))
+        end
         _scale_y!(Int(m), β, y, incy)
         ix = _start(n, incx)
         @inbounds for j in 1:n
@@ -1937,6 +1999,10 @@ function _gemv!(
             αc = convert(eltype(A), α); βc = convert(eltype(A), β)
             return cj ? _gemv_tc_cmplx!(Int(m), Int(n), αc, A, x, βc, y, Val(true)) :
                 _gemv_tc_cmplx!(Int(m), Int(n), αc, A, x, βc, y, Val(false))
+        end
+        if _l2p_ok(A, x, y, incx, incy)                          # dual pairs: 'C' == 'T' (conj is the identity)
+            αd = convert(eltype(A), α); βd = convert(eltype(A), β)
+            return _gemv_tc_cmplx!(Int(m), Int(n), αd, A, x, βd, y, Val(false))
         end
         s0 = zero(_et(A)) * zero(_et(x))
         iy = _start(n, incy)
@@ -2231,8 +2297,16 @@ end
         push!(body.args, :($(Symbol(:ar, c)) = $V2(real($(Symbol(:ay, c))))))
         push!(
             body.args, :(
-                $(Symbol(:si, c)) = $V2($(Expr(:tuple, (iseven(l) ? :(-imag($(Symbol(:ay, c)))) :
-                                                        :(imag($(Symbol(:ay, c)))) for l in 0:(lanes - 1))...)))
+                $(Symbol(:si, c)) = $V2(
+                    $(
+                        Expr(
+                            :tuple, (
+                                iseven(l) ? :(-imag($(Symbol(:ay, c)))) :
+                                    :(imag($(Symbol(:ay, c)))) for l in 0:(lanes - 1)
+                            )...
+                        )
+                    )
+                )
             )
         )
         push!(body.args, :($(Symbol(:ac, c)) = par + (jc + $(c - 1)) * lda * 2 * $sz))
@@ -2260,12 +2334,20 @@ end
         )
     end
     push!(body.args, :(i = 0))
-    push!(body.args, :(while i + $step <= m
-        $main; i += $step
-    end))
-    push!(body.args, :(while i < m
-        $tail; i += 1
-    end))
+    push!(
+        body.args, :(
+            while i + $step <= m
+                $main; i += $step
+            end
+        )
+    )
+    push!(
+        body.args, :(
+            while i < m
+                $tail; i += 1
+            end
+        )
+    )
     push!(body.args, :(return nothing))
     return body
 end
@@ -2277,10 +2359,14 @@ end
     ) where {T <: BlasReal}
     h = _cger_half()
     return cj ?
-        (h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(true)) :
-        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(false))) :
-        (h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(true)) :
-        _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(false)))
+        (
+            h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(true)) :
+            _ger_pdc_cj!(m, n, α, x, y, A, np, Val(true), Val(false))
+        ) :
+        (
+            h ? _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(true)) :
+            _ger_pdc_cj!(m, n, α, x, y, A, np, Val(false), Val(false))
+        )
 end
 @inline function _ger_pdc_cj!(
         m::Int, n::Int, α::Complex{T}, x, y, A, np::Int, ::Val{CJ}, ::Val{HALF}
@@ -2951,15 +3037,19 @@ end
             if up                                # U,N: back-substitution, j descending
                 @inbounds for j in n:-1:1
                     cp = Ap + (j - 1) * lda * sz
-                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] :
-                                              unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
+                    unit || unsafe_store!(
+                        xp, userc ? unsafe_load(xp, j) * rcp[j] :
+                            unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j
+                    )
                     _axpy_simd!(j - 1, -unsafe_load(xp, j), cp, xp)
                 end
             else                                 # L,N: forward, j ascending
                 @inbounds for j in 1:n
                     cp = Ap + (j - 1) * lda * sz
-                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] :
-                                              unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j)
+                    unit || unsafe_store!(
+                        xp, userc ? unsafe_load(xp, j) * rcp[j] :
+                            unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz), j
+                    )
                     _axpy_simd!(n - j, -unsafe_load(xp, j), cp + j * sz, xp + j * sz)
                 end
             end
@@ -3103,12 +3193,12 @@ const _TRMV_FUSED_MIN_PREF = @load_preference("trmv_fused_min", nothing)
 # one-time init allocates — one reachable resolver reddens the entire BLAS-2 dogfood item. A pinned
 # build must not compile the resolver at all. Mirrors `_measure_gemvt_nc`.
 @static if isnothing(_TRMV_FUSED_MIN_PREF)
-# Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. Seeded with -1, `_force_knob`'s unset sentinel,
-# which the caller below already maps to the derived default.
-const _TRMV_FUSED_MIN_REF = Ref{Int}(-1)
-@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_REF[]
+    # Ref, not OncePerProcess — see `_GEMVN_MINNER_REF`. Seeded with -1, `_force_knob`'s unset sentinel,
+    # which the caller below already maps to the derived default.
+    const _TRMV_FUSED_MIN_REF = Ref{Int}(-1)
+    @inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_REF[]
 else
-@inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_PREF::Int
+    @inline _trmv_fused_min_raw() = _TRMV_FUSED_MIN_PREF::Int
 end
 # < 0 (the unset sentinel from `_force_knob`) ⇒ the derived default.
 @inline function _trmv_fused_min(::Type{T}) where {T}
@@ -3327,13 +3417,17 @@ const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok:
     cs = [Symbol(:c, k) for k in 0:(F - 1)]
     bs = [Symbol(:b, k) for k in 0:(F - 1)]
     # per-column bases and the F hoisted x values (the triangle overwrites x, so they are read first)
-    mkc(base) = Expr(:block, :($(cs[1]) = $base),
-                     (:($(cs[k + 1]) = $(cs[k]) + lda * sz) for k in 1:(F - 1))...)
+    mkc(base) = Expr(
+        :block, :($(cs[1]) = $base),
+        (:($(cs[k + 1]) = $(cs[k]) + lda * sz) for k in 1:(F - 1))...
+    )
     mkb = Expr(:block, (:($(bs[k + 1]) = V(unsafe_load(xp, lo + $k))) for k in 0:(F - 1))...)
-    fused(dst) = Expr(:block,
+    fused(dst) = Expr(
+        :block,
         :(o = i * sz; acc = vload(V, $dst + o)),
         (:(acc = muladd($(bs[k + 1]), vload(V, $(cs[k + 1]) + o), acc)) for k in 0:(F - 1))...,
-        :(vstore(acc, $dst + o); i += W))
+        :(vstore(acc, $dst + o); i += W)
+    )
     return quote
         T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
         GC.@preserve A x begin
@@ -3551,10 +3645,10 @@ end
 @inline function _trsv_reg_n!(up::Bool, unit::Bool, n::Int, A, x)
     return if up
         unit ? _trsv_reg_val!(Val(true), Val(true), n, A, x) :
-        _trsv_reg_val!(Val(true), Val(false), n, A, x)
+            _trsv_reg_val!(Val(true), Val(false), n, A, x)
     else
         unit ? _trsv_reg_val!(Val(false), Val(true), n, A, x) :
-        _trsv_reg_val!(Val(false), Val(false), n, A, x)
+            _trsv_reg_val!(Val(false), Val(false), n, A, x)
     end
 end
 
@@ -3718,7 +3812,7 @@ end
                 for j in hi:-1:lo                 # F×F triangle: chain is F, not n
                     cp = Ap + (j - 1) * lda * sz
                     xj = unit ? unsafe_load(xp, j) :
-                         unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
+                        unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
                     unsafe_store!(xp, xj, j)
                     for i in lo:(j - 1)
                         unsafe_store!(xp, unsafe_load(xp, i) - xj * unsafe_load(cp, i), i)
@@ -3765,7 +3859,7 @@ end
                 for j in lo:hi
                     cp = Ap + (j - 1) * lda * sz
                     xj = unit ? unsafe_load(xp, j) :
-                         unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
+                        unsafe_load(xp, j) / unsafe_load(cp + (j - 1) * sz)
                     unsafe_store!(xp, xj, j)
                     for i in (j + 1):hi
                         unsafe_store!(xp, unsafe_load(xp, i) - xj * unsafe_load(cp, i), i)
@@ -3800,8 +3894,10 @@ end
                         end
                     else
                         @inbounds for k in lo:hi
-                            _axpy_simd!(rest, -unsafe_load(xp, k),
-                                        Ap + ((k - 1) * lda + hi) * sz, xp + hi * sz)
+                            _axpy_simd!(
+                                rest, -unsafe_load(xp, k),
+                                Ap + ((k - 1) * lda + hi) * sz, xp + hi * sz
+                            )
                         end
                     end
                 end
@@ -4224,13 +4320,13 @@ end
 # so "force this arm, run the gate" stays a ~10 min loop instead of a source edit + commit + fleet sync,
 # which is exactly what converting a knob to Derive costs you (measured on axpy_band, 2026-08-19).
 function _init_force_knobs!()
-# The converted-knob overrides (cpuinfo.jl `_FK_NAMES`). One ENV read each, here and nowhere else.
-# Compiles to nothing when `_FORCE_HOOKS` is false, which juliac/build.jl sets for the trim build.
-@static if _FORCE_HOOKS
-    for n in _FK_NAMES
-        _FK[n][] = _force_knob(n)
+    # The converted-knob overrides (cpuinfo.jl `_FK_NAMES`). One ENV read each, here and nowhere else.
+    # Compiles to nothing when `_FORCE_HOOKS` is false, which juliac/build.jl sets for the trim build.
+    @static if _FORCE_HOOKS
+        for n in _FK_NAMES
+            _FK[n][] = _force_knob(n)
+        end
     end
-end
     @static if isnothing(_GEMVN_MINNER_PREF)
         f = _force_knob("gemvn_minner")
         f >= 0 && (_GEMVN_MINNER_REF[] = f != 0)
