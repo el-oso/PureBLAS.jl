@@ -1,8 +1,8 @@
 # Dual numbers: BLAS-1 for forward-mode AD
 
-Status: **steps 1 and 2 implemented** (2026-09-12; see "Implementation notes" at the end), **step 3 not
-started.** This page records the design, the measurements it rests on, and the decisions taken —
-including the ones that closed off tempting alternatives.
+Status: **all three steps implemented** (2026-09-12; see "Implementation notes" at the end). This page
+records the design, the measurements it rests on, and the decisions taken — including the ones that
+closed off tempting alternatives.
 
 `ForwardDiff.Dual{Tag,V,1}` and `Complex{V}` have **byte-identical memory layout**, so PureBLAS can
 serve forward-mode AD from the same SIMD machinery it uses for complex. Nothing else in the Julia
@@ -53,7 +53,9 @@ muladd(shuffle(x), sgn, muladd(x, arv, y))
 
 with `sgn = [−b, +b, …]` for complex and `[0, +b, …]` for dual. The second FMA runs over the whole
 vector either way. **The dual advantage is a scalar-op-count fact, not a kernel fact**, and the design
-does not claim otherwise.
+does not claim otherwise. (As shipped, the dual arm pairs `[0, +b, …]` with the **duplicate-even**
+shuffle rather than the swap — same op count, and it keeps the `0·` off the partial lane; see the NaN
+note under `dupEven`.)
 
 ## Measured: where dual actually loses today
 
@@ -169,7 +171,12 @@ silently miss both.
 
 The tag and its singletons live in **PureBLAS, not the extension**: a `@generated` body runs at the
 world age of its own definition, so a codegen hook defined later in an extension would be invisible
-inside the generator. The tag needs no ForwardDiff knowledge — it is "zero even lanes".
+inside the generator. The tag needs no ForwardDiff knowledge — it is `Val(:cplx)` / `Val(:dual)`, the
+same form the iamax scaffold uses, and it resolves to two codegen constants (`_pair_shuf`, the in-lane
+shuffle: swap-adjacent vs duplicate-even; `_pair_sgn`, the lane multiplier: `[−b, +b, …]` vs
+`[0, +b, …]`) plus, for dot, the epilogue. The complex entry names (`_dot_cmplx_simd`,
+`_axpy_cmplx_{simd,phase,wide}!`, `_scal_cmplx_simd!`) survive as `@inline` forwarders to the `:cplx`
+instantiation, so no complex caller changed.
 
 `Expr(:meta, :inline)` stays inside returned generator bodies; `@inline` does not propagate into
 `@generated` CodeInfo.
@@ -274,3 +281,54 @@ not by itself close zaxpy@3e4. The real-alpha zaxpy bypass costs nothing measura
 complex copy/swap loops (memmove / memcpy+memmove); routed onto the real kernels: copy 1.9× in L1, level
 from L2; swap 2.4–3.1× everywhere. The complex iamax scaffold is byte-identical after taking the
 magnitude as a codegen parameter (352 = 352 / 426 = 426 instructions, F64/F32).
+
+## Implementation notes (step 3, 2026-09-12)
+
+The three tagged bodies landed as three commits (dot, axpy, scal), each gated by
+`bench/probes/dual_step3_native.jl`: the complex instantiation's normalised `code_native` diffed
+against a pre-edit dump (20 cells — five bodies × F64/F32 × `Vector`/`Ptr` carrier), plus an opcode
+histogram of the **main SIMD loop** of the complex vs dual instantiation. Both gates held for all
+three ops, so **nothing shipped as a copy**:
+
+| body | complex code_native, before = after (F64 vec / ptr; F32 vec / ptr) | main-loop histogram, complex vs dual |
+|---|---|---|
+| `_dot_pair_simd` dotu / dotc | 201 = 201 / 199 = 199 ; 219 = 219 / 217 = 217 (dotc 232 / 230 ; 219 / 217) | 46 = 46 (F64), 45 = 45 (F32), raw-equal |
+| `_axpy_pair_phase!` | 213 = 213 / 209 = 209 ; 238 = 238 / 234 = 234 | 46 = 46 / 45 = 45, equal modulo 8 `vshufpd` ↔ 8 `vmovddup` |
+| `_axpy_pair_wide!` | 226 = 226 / 222 = 222 ; 251 = 251 / 247 = 247 | 54 = 54 / 53 = 53, same |
+| `_scal_pair_simd!` | 292 = 292 / 289 = 289 ; 257 = 257 / 254 = 254 | 46 = 46 / 45 = 45, same |
+
+The histogram is taken over the loop, not the whole function, because the epilogue is per-algebra by
+design (dot drops the ε² lane; the scalar tails differ) and because LLVM happens to auto-vectorise the
+complex scalar tail of dotu/axpy/scal (`vaddsubpd`) and not the dual one — tail code, not the kernel.
+The loop histogram is also a `@testitem` (`DualNative`), with a positive control (an FMA loop was
+found) and a negative one (the histogram is not blind).
+
+Measured with a **dual alpha** (`bench/probes/dual_twins3.jl`: axpy `Dual(1.7, 0.3)` vs
+`1.7 + 0.3im`, scal `Dual(1.0000001, 1e‑7)` vs `1.0000001 + 1e‑7im`, so both arms run the tagged
+complex-layout kernel and neither takes the real-alpha bypass; Chairmarks median of 6 rounds,
+wintermute, dual GB/s ÷ complex twin, two samples):
+
+| op | n=1e3 | n=1e4 | n=1e5 | n=1e6 | before (generic loop) |
+|---|---|---|---|---|---|
+| axpy (dual α) | 0.98–0.99 (188.6 vs 191.8 GB/s) | 1.00 | 1.00–1.01 | 1.00–1.02 | 0.61 0.80 0.93 1.03 |
+| scal (dual α) | 0.99 (166.5 vs 168.2) | 1.00 | 1.01 | 0.99 | 0.62 0.64 0.72 0.83 |
+| dot | 1.00 (152.5 vs 152.4) | 1.00 | 1.01 | 1.00 | 0.20 0.34 0.40 0.58 |
+
+The "before" row here is the true dual-alpha baseline against the true complex kernel — the step-2
+table's complex arm used a real alpha and so measured the real-axpy bypass (117 GB/s at n=1e3), not
+`_axpy_cmplx_wide!` (192 GB/s). Two things follow. First, the only residual is the ~1% at n=1e3 on
+axpy/scal, where the loop differs by one mnemonic (`vmovddup` for duplicate-even vs `vshufpd` for the
+swap) — it moved 0.98→0.99 between two samples and has not been chased. Second, an observation outside
+this step's scope: at n=1e3 the real-alpha bypass (real axpy over 2n reals, 117 GB/s) is markedly
+slower than the complex wide arm on the same bytes (192 GB/s), so the bypass may be the wrong arm in
+L1; not measured further here.
+
+Design on contact: the doc's "differ only by constants" held literally for axpy/scal — the tag resolves
+to a shuffle pattern and a sign vector and nothing else in the loop changes. For dot it held for the
+loop and the epilogue is per-algebra (value = `pfld[1]` alone; the discarded `Σ x_p y_p` lane must not
+even be multiplied by zero, since it may be `Inf`). The dual dot returns the bare `(value, partial)`
+tuple and `_dotu`/`_dotc` wrap it with `_mkpair`, so the kernel never sees a Dual type; `_pairv(x)`
+(the real type under a pair vector, static) was the one accessor the routing needed beyond the five.
+The NaN-hygiene item now covers the dual-alpha axpy/scal paths, which is why duplicate-even rather
+than the swap was the right shuffle for the dual arm: with the swap, an infinite partial would put
+`0·Inf` on the value lane, which the generic loop keeps finite.
