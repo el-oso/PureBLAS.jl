@@ -457,12 +457,15 @@ end
 # for a SCALAR multiplier, one swap-adjacent-pairs shuffle suffices — result = v·alr + swap(v)·[−ali,+ali…]
 # (= [r·alr − i·ali, i·alr + r·ali, …] on the interleaved [r i r i…] buffer). One shuffle/vector (vs 3 for
 # deinterleave+interleave), 4× unrolled to saturate memory bandwidth. `n` counts COMPLEX elements.
-@generated function _scal_cmplx_simd!(n::Int, alr::T, ali::T, x) where {T <: BlasReal}
+# `ALG` is the multiply-rule tag (`_pair_shuf`/`_pair_sgn`): the same body serves the dual scal
+# x .*= (ar + ε·ai) — only the shuffle, the sign vector and the scalar tail's `− ai·x_i` term change.
+@inline _scal_cmplx_simd!(n::Int, alr::T, ali::T, x) where {T <: BlasReal} = _scal_pair_simd!(Val(:cplx), n, alr, ali, x)
+@generated function _scal_pair_simd!(::Val{ALG}, n::Int, alr::T, ali::T, x) where {ALG, T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T); Wc = 2 * W          # reals per Vec = 2W; W complex
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)     # swap adjacent (re,im)
-    sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))  # [−ali,ali,…]
+    swp = _pair_shuf(ALG, 2W); sgn = _pair_sgn(ALG, 2W, V2, T)           # swap-adjacent [−ali,ali,…] / dup-even [0,ali,…]
+    tr = ALG === :cplx ? :(alr * re - ali * im) : :(alr * re)
     return quote
-        px = _reptr(x); arv = $V2(alr); sv = $sgn; step = 4 * $W          # 4 vectors = 4W complex/step
+        px = _pairreal(x); arv = $V2(alr); sv = $sgn; step = 4 * $W       # 4 vectors = 4W complex/step
         GC.@preserve x begin
             i = 0
             while i + step <= n
@@ -479,7 +482,7 @@ end
             end
             while i < n
                 j = i + 1; re = unsafe_load(px, 2j - 1); im = unsafe_load(px, 2j)
-                unsafe_store!(px, alr * re - ali * im, 2j - 1); unsafe_store!(px, alr * im + ali * re, 2j)
+                unsafe_store!(px, $tr, 2j - 1); unsafe_store!(px, alr * im + ali * re, 2j)
                 i += 1
             end
         end

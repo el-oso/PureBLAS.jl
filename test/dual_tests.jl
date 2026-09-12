@@ -135,6 +135,9 @@ end
     @test isinf(partials(r[7], 1)) && partials(r[2], 1) ≈ yp[2] + 1.7 * xp[2] + 0.3 * xv[2]
     r = PureBLAS.scal!(1.7, copy(x))
     @test all(isfinite, value.(r)) && value.(r) ≈ 1.7 .* xv
+    r = PureBLAS.scal!(ad, copy(x))                                      # dual alpha: the tagged SIMD body
+    @test all(isfinite, value.(r)) && value.(r) ≈ 1.7 .* xv
+    @test isinf(partials(r[7], 1)) && partials(r[2], 1) ≈ 1.7 * xp[2] + 0.3 * xv[2]
     r = PureBLAS.nrm2(x); @test isfinite(value(r)) && value(r) ≈ norm(xv)
     r = PureBLAS.asum(x); @test isfinite(value(r)) && value(r) ≈ sum(abs, xv)
     r = PureBLAS.dot(x, y); @test isfinite(value(r)) && value(r) ≈ dot(xv, yv)
@@ -313,6 +316,7 @@ end
         CV = Vector{Complex{T}}; DV = Vector{Dual{Nothing, T, 1}}
         L = Val{PureBLAS._zaxpy_narrow_lanes(T)}; U = typeof(PureBLAS._ZAXPY_PHASE_UV)
         specs = [
+            "scal" => (PureBLAS._scal_pair_simd!, (Int, T, T, CV), (Int, T, T, DV)),
             "axpy_phase" => (PureBLAS._axpy_pair_phase!, (L, U, Int, T, T, CV, CV), (L, U, Int, T, T, DV, DV)),
             "axpy_wide" => (PureBLAS._axpy_pair_wide!, (Int, T, T, CV, CV), (Int, T, T, DV, DV)),
             "dotu" => (PureBLAS._dot_pair_simd, (Int, CV, CV, Type{T}, Val{false}), (Int, DV, DV, Type{T}, Val{false})),
