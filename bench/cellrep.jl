@@ -192,6 +192,19 @@ const OPS = Dict(
             end
         ),
     ),
+    "zscalc" => (                                # genuinely complex alpha (see plots.jl)
+        () -> (randn(ComplexF64, N),),
+        (c, m) -> (
+            for _ in 1:m
+                P.scal!(0.8 + 0.6im, c[1])
+            end
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.scal!(0.8 + 0.6im, c[1])
+            end
+        ),
+    ),
     "zdotc" => (
         () -> (randn(ComplexF64, N), randn(ComplexF64, N)),
         (c, m) -> (

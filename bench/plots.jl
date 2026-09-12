@@ -1249,6 +1249,22 @@ function run_cmplx_benchmarks()
                         end; real(c[1][1])
                     ),
                 ),
+                # GENUINELY complex alpha, unit modulus (0.8+0.6i) so `m` in-place reps neither grow nor
+                # decay. The `zscal` row above scales by `1.0000001+0im`, which `_scal!` routes to the REAL
+                # kernel over 2n reals — so until this row existed `_scal_cmplx_simd!` had no gate coverage
+                # at all. The `zscal` row is deliberately left as it is: its cache history is evidence.
+                (
+                    "zscalc", (c, m) -> (
+                        for _ in 1:m
+                            B.scal!(0.8 + 0.6im, c[1])
+                        end; real(c[1][1])
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            PureBLAS.scal!(0.8 + 0.6im, c[1])
+                        end; real(c[1][1])
+                    ),
+                ),
                 (
                     "dznrm2", (c, m) -> (
                         s = 0.0; for _ in 1:m
