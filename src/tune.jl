@@ -18,8 +18,20 @@ using Preferences: @load_preference, load_preference, set_preferences!
 
 """Identity of the machine + library state that a tuning run is valid for."""
 function _tuning_fingerprint()
-    return string(_CPU_VENDOR, "/", _CPU_FAMILY, "/simd", _SIMD_BYTES,
-                  "/l1:", _L1_BYTES, "/l2:", _L2_BYTES, "/l3:", _L3_BYTES, "/nvreg", _NVREG)
+    return string(
+        _CPU_VENDOR, "/", _CPU_FAMILY, "/simd", _SIMD_BYTES,
+        "/l1:", _L1_BYTES, "/l2:", _L2_BYTES, "/l3:", _L3_BYTES, "/nvreg", _NVREG,
+        # THE TOOLCHAIN IS PART OF THE MACHINE, for tuning purposes. Every pinned value is a
+        # MEASURED crossover, and a crossover is a property of the emitted code as much as of
+        # the silicon — change the compiler and the value can move while the hardware has not.
+        # Found 2026-09-12: the fleet went 1.13.0-rc4 -> 1.13.0 (LLVM 20.1.8), and wintermute's
+        # five pins kept reporting `is_tuned() = true` because the fingerprint saw only cache
+        # sizes. The pins were stale and nothing said so. Julia's minor version and the LLVM
+        # version are the two that move codegen; the patch level is deliberately excluded so a
+        # bugfix release does not force a fleet-wide re-tune.
+        "/jl", VERSION.major, ".", VERSION.minor,
+        "/llvm", Base.libllvm_version.major, ".", Base.libllvm_version.minor
+    )
 end
 
 # A FINGERPRINT, NOT A BOOLEAN. `tuned = true` would go stale silently: move the depot to another
@@ -72,25 +84,27 @@ end
 # user pin) but must not be counted as "covered by tune!()" — a plan that assumed they were mis-scoped
 # pbtrfU, gbtrf and gesvd as user actions when they are code work.
 # `test/tuner_tests.jl` now asserts `KNOBS ⊆ _TUNABLE_KEYS` so this cannot drift silently again.
-const _TUNABLE_KEYS = ("ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", "gbtrf_nb",
-                       "pbtrf_cross_kd", "pbtrf_u_native_kd", "pbtrf_nb", "pbtrf_nb_small",
-                       "brd_nb", "sytrf_cmult",
-                       # written by bench/calibrate.jl's KNOBS but previously unlisted here:
-                       "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
-                       # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole wintermute sweep.
-                       # `gemvt_percol_window` above is the KNOB's name in `KNOBS`, not a preference
-                       # key — that calibrator writes `gemvt_percol_amin`/`gemvt_percol_xmax`, and the
-                       # perscan calibrator writes `gemvt_perscan`. None of those three were listed, so
-                       # `bench/plots.jl`'s `_tuned_pins_ok()` classified them as pins "not owned by
-                       # tune!()" and `save_cache` REFUSED — silently as far as the sweep log was
-                       # concerned. All 8 groups measured for ~2 h on 2026-09-10 and wrote nothing.
-                       # `test/knob_registry_tests.jl` now lints this list against the key literals in
-                       # calibrate.jl so a rename or a new knob fails the suite instead of a sweep.
-                       "gemvt_percol_amin", "gemvt_percol_xmax", "gemvt_perscan",
-                       # 2026-09-09: gemv-N row-block height. Measure tier by necessity — after the
-                       # datapath correction no detected const separates Zen4 (wants 4) from
-                       # Zen5-mobile (wants 8); see bench/calibrate.jl `calibrate_gemv_mr`.
-                       "gemv_mr")
+const _TUNABLE_KEYS = (
+    "ger_panel_np", "potrf_upper_direct_max", "gbtrf_cross", "gbtrf_nb",
+    "pbtrf_cross_kd", "pbtrf_u_native_kd", "pbtrf_nb", "pbtrf_nb_small",
+    "brd_nb", "sytrf_cmult",
+    # written by bench/calibrate.jl's KNOBS but previously unlisted here:
+    "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
+    # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole wintermute sweep.
+    # `gemvt_percol_window` above is the KNOB's name in `KNOBS`, not a preference
+    # key — that calibrator writes `gemvt_percol_amin`/`gemvt_percol_xmax`, and the
+    # perscan calibrator writes `gemvt_perscan`. None of those three were listed, so
+    # `bench/plots.jl`'s `_tuned_pins_ok()` classified them as pins "not owned by
+    # tune!()" and `save_cache` REFUSED — silently as far as the sweep log was
+    # concerned. All 8 groups measured for ~2 h on 2026-09-10 and wrote nothing.
+    # `test/knob_registry_tests.jl` now lints this list against the key literals in
+    # calibrate.jl so a rename or a new knob fails the suite instead of a sweep.
+    "gemvt_percol_amin", "gemvt_percol_xmax", "gemvt_perscan",
+    # 2026-09-09: gemv-N row-block height. Measure tier by necessity — after the
+    # datapath correction no detected const separates Zen4 (wants 4) from
+    # Zen5-mobile (wants 8); see bench/calibrate.jl `calibrate_gemv_mr`.
+    "gemv_mr",
+)
 
 """
 Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.
@@ -151,8 +165,10 @@ workload. Close other applications first.
 
 `dryrun = true` measures and prints without writing anything — worth doing first.
 """
-function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_project(),
-               unlocked::Bool = false)
+function tune!(;
+        dryrun::Bool = false, repeats::Int = 3, project = Base.active_project(),
+        unlocked::Bool = false
+    )
     # `project` steers the CALIBRATION SUBPROCESSES, but `set_preferences!` below writes to the
     # CALLER's active project — it has no project argument. If those differ, the knobs are measured
     # under one preference set and pinned into another, which is the exact per-project confusion the
@@ -161,14 +177,18 @@ function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_p
     # `--project=.` session measured against bench's pins and wrote `gemv_mr = 4` into the main env,
     # where the gate never reads it. Refuse instead of splitting them.
     if normpath(project) != normpath(Base.active_project())
-        error("tune!: `project` ($(project)) is not the active project ($(Base.active_project())). " *
-              "Pins are written to the ACTIVE project, so a mismatch would measure one preference " *
-              "set and pin another. Relaunch julia with `--project=$(project)` and call tune!() there.")
+        error(
+            "tune!: `project` ($(project)) is not the active project ($(Base.active_project())). " *
+                "Pins are written to the ACTIVE project, so a mismatch would measure one preference " *
+                "set and pin another. Relaunch julia with `--project=$(project)` and call tune!() there."
+        )
     end
     root = normpath(joinpath(@__DIR__, ".."))
     script = joinpath(root, "bench", "calibrate.jl")
-    isfile(script) || error("tune!: $script not found — tuning needs the full repository, not just an " *
-                            "installed package. Clone PureBLAS.jl and run tune!() from there.")
+    isfile(script) || error(
+        "tune!: $script not found — tuning needs the full repository, not just an " *
+            "installed package. Clone PureBLAS.jl and run tune!() from there."
+    )
     jl = Base.julia_cmd()
     # `unlocked` must be reachable from HERE, not only from the script. `tune!()` is the documented
     # entry point — the one `_GER_NP`'s comment tells users to run — so a flag that exists only on
@@ -206,14 +226,14 @@ function tune!(; dryrun::Bool = false, repeats::Int = 3, project = Base.active_p
                 continue
             end
             # Plain `key=value` lines, parsed here — deliberately NOT TOML, because TOML is not a
-# PureBLAS dependency and adding one to read three integers would be the wrong trade.
-isfile(f) || continue
-d = Dict{String, Any}()
-for ln in eachline(f)
-    kv = split(strip(ln), '='; limit = 2)
-    length(kv) == 2 && (d[strip(kv[1])] = something(tryparse(Int, strip(kv[2])), strip(kv[2])))
-end
-push!(results, d)
+            # PureBLAS dependency and adding one to read three integers would be the wrong trade.
+            isfile(f) || continue
+            d = Dict{String, Any}()
+            for ln in eachline(f)
+                kv = split(strip(ln), '='; limit = 2)
+                length(kv) == 2 && (d[strip(kv[1])] = something(tryparse(Int, strip(kv[2])), strip(kv[2])))
+            end
+            push!(results, d)
         end
     end
     # EVERY run must have produced a result. "Agreement across N independent processes" is the whole
@@ -222,8 +242,8 @@ push!(results, d)
     # "unanimous" on its own, which is a single sample wearing the costume of a quorum.
     if length(results) < repeats
         @warn "tune!: only $(length(results)) of $(repeats) calibration runs produced a result — a " *
-              "dropped run makes 'unanimous' meaningless, so NOTHING is pinned. Re-run on an idle, " *
-              "frequency-locked machine." got = length(results) want = repeats
+            "dropped run makes 'unanimous' meaningless, so NOTHING is pinned. Re-run on an idle, " *
+            "frequency-locked machine." got = length(results) want = repeats
         return nothing
     end
     isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
