@@ -700,10 +700,11 @@ by its own rules.
 Same decision as the callee's non-resident branch, so nothing new is tuned here; and phase vs wide is
 a pure scheduling difference on an elementwise update, so results stay bit-identical.
 """
-@inline function _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+@inline _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_cold!(Val(:cplx), n, alr, ali, x, y)
+@inline function _axpy_pair_cold!(alg::Val, n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}   # the dual ger takes it too
     return _zaxpy_narrow() ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
-        _axpy_cmplx_wide!(n, alr, ali, x, y)
+        _axpy_pair_phase!(alg, Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
+        _axpy_pair_wide!(alg, n, alr, ali, x, y)
 end
 
 @inline _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_wide!(Val(:cplx), n, alr, ali, x, y)
