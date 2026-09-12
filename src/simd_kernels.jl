@@ -54,6 +54,17 @@ function _mkpair end
 @inline _pairv(x) = eltype(_pairreal(x))     # the real type V under a pair vector (static; the pointer is dead)
 # Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
 @inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)
+# CODEGEN CONSTANTS OF THE MULTIPLY RULE — the tag the shared axpy/scal bodies take (`ALG` ∈ :cplx, :dual;
+# docs/src/dual.md step 3). Over the interleaved buffer, with `ar`/`ai` the scalar's two parts,
+#     muladd(shufflevector(x, Val(shuf)), sgn, x·ar)  ==  (ar + i·ai)·x   :cplx  swap-adjacent, [−ai, +ai, …]
+#                                                    ==  (ar + ε·ai)·x   :dual  duplicate-even, [0, +ai, …]
+# so the two algebras differ ONLY in these two constants; the complex instantiation is the byte-identical body
+# it always was (guarded by bench/probes/dual_step3_native.jl). :dual duplicates the VALUE lane instead of
+# swapping so that the zeroed product lands on x_v, never on x_p: an infinite partial then cannot poison the
+# value lane (the NaN-hygiene argument in dual.md), and `0·x_v` only misbehaves when the value is already Inf.
+_pair_shuf(ALG, N) = Expr(:tuple, (ALG === :cplx ? (isodd(l) ? l - 1 : l + 1) : 2 * (l ÷ 2) for l in 0:(N - 1))...)
+_pair_sgn(ALG, N, V, ::Type{T}) where {T} =
+    :($V($(Expr(:tuple, (iseven(l) ? (ALG === :cplx ? :(-ali) : zero(T)) : :ali for l in 0:(N - 1))...))))
 
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)
@@ -503,10 +514,15 @@ end
 # `U` = vector groups per block, a `Val` so each arm is straight-line code (same as real `_axpy_phase!`).
 # It was a hardcoded 4 here while the real kernel ships a U=8 band arm (`_axpy_simd!`'s 208 case), so the
 # complex kernel could never hold as many loads in flight as its real twin. `_ZAXPY_PHASE_U` derives it.
-@generated function _axpy_cmplx_phase!(::Val{LANES}, ::Val{U}, n::Int, alr::T, ali::T, x, y) where {LANES, U, T <: BlasReal}
+#
+# `ALG` is the multiply-rule tag (`_pair_shuf`/`_pair_sgn` above): the same body serves the dual axpy
+# y .+= (ar + ε·ai)·x — only the shuffle, the sign vector and the scalar tail's `− ai·x_i` term change.
+@inline _axpy_cmplx_phase!(l::Val, u::Val, n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} =
+    _axpy_pair_phase!(Val(:cplx), l, u, n, alr, ali, x, y)
+@generated function _axpy_pair_phase!(::Val{ALG}, ::Val{LANES}, ::Val{U}, n::Int, alr::T, ali::T, x, y) where {ALG, LANES, U, T <: BlasReal}
     V = Vec{LANES, T}; sz = sizeof(T); cpx = LANES ÷ 2
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(LANES - 1))...)
-    sgn = :($V($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(LANES - 1))...))))
+    swp = _pair_shuf(ALG, LANES); sgn = _pair_sgn(ALG, LANES, V, T)
+    tr = ALG === :cplx ? :(unsafe_load(py, 2j - 1) + alr * xr - ali * xi) : :(unsafe_load(py, 2j - 1) + alr * xr)
     lx = [:($(Symbol(:xv, u)) = vload($V, px + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
     ly = [:($(Symbol(:yv, u)) = vload($V, py + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
     cp = [
@@ -520,7 +536,7 @@ end
     st = [:(vstore($(Symbol(:rv, u)), py + (i + $u * $cpx) * 2 * $sz)) for u in 0:(U - 1)]
     return quote
         $(Expr(:meta, :inline))
-        px = _reptr(x); py = _reptr(y); arv = $V(alr); sv = $sgn; step = $U * $cpx
+        px = _pairreal(x); py = _pairreal(y); arv = $V(alr); sv = $sgn; step = $U * $cpx
         GC.@preserve x y begin
             i = 0
             @inbounds while i + step <= n
@@ -537,7 +553,7 @@ end
             end
             @inbounds while i < n
                 j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j)
-                unsafe_store!(py, unsafe_load(py, 2j - 1) + alr * xr - ali * xi, 2j - 1)
+                unsafe_store!(py, $tr, 2j - 1)
                 unsafe_store!(py, unsafe_load(py, 2j) + alr * xi + ali * xr, 2j)
                 i += 1
             end
@@ -620,19 +636,22 @@ end
 # retired: that measurement predates the `@generated`/`@inline` meta fix, which is exactly the bug that
 # made `Vec` args pass BY POINTER and demoted the caller's accumulators. At n=1000 the two now tie on
 # Zen4 (184.6 vs 184.9). Zen5 still prefers wide deep in L1, which the residency cut already honours.
-@inline function _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+@inline _axpy_cmplx_simd!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_simd!(Val(:cplx), n, alr, ali, x, y)
+# `alg` is the multiply-rule tag (`_pair_shuf`); the dual axpy takes the SAME residency ladder — the arms
+# are a scheduling choice over identical bytes, nothing in them is algebra-dependent.
+@inline function _axpy_pair_simd!(alg::Val, n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
     bytes = n * 2 * sizeof(T)                       # ONE array; the footprint is 2*bytes
     # Past L2 keeps its own **Measure** knob untouched — it is a datapath question (see `_zaxpy_narrow`),
     # it was measured in its own regime, and those sizes gate today.
     bytes > _L2_BYTES && return _zaxpy_narrow() ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
-        _axpy_cmplx_wide!(n, alr, ali, x, y)
+        _axpy_pair_phase!(alg, Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
+        _axpy_pair_wide!(alg, n, alr, ali, x, y)
     # Derived band rule. Narrow lanes (256-bit) — NOT full width: at n=1e4 on Zen5 the full-width phase
     # arm measured 0.890 against the narrow arm's 1.011, so the win is the SCHEDULING STRUCTURE, not the
     # vector width. Same conclusion as real axpy, reached independently here.
     return 2 * bytes > _L1_BYTES ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
-        _axpy_cmplx_wide!(n, alr, ali, x, y)
+        _axpy_pair_phase!(alg, Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
+        _axpy_pair_wide!(alg, n, alr, ali, x, y)
 end
 
 """
@@ -664,12 +683,13 @@ a pure scheduling difference on an elementwise update, so results stay bit-ident
         _axpy_cmplx_wide!(n, alr, ali, x, y)
 end
 
-@generated function _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+@inline _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_wide!(Val(:cplx), n, alr, ali, x, y)
+@generated function _axpy_pair_wide!(::Val{ALG}, n::Int, alr::T, ali::T, x, y) where {ALG, T <: BlasReal}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(2W - 1))...)
-    sgn = :($V2($(Expr(:tuple, (iseven(l) ? :(-ali) : :ali for l in 0:(2W - 1))...))))
+    swp = _pair_shuf(ALG, 2W); sgn = _pair_sgn(ALG, 2W, V2, T)             # the multiply-rule tag, see `_pair_shuf`
+    tr = ALG === :cplx ? :(unsafe_load(py, 2j - 1) + alr * xr - ali * xi) : :(unsafe_load(py, 2j - 1) + alr * xr)
     return quote
-        px = _reptr(x); py = _reptr(y); arv = $V2(alr); sv = $sgn; step = 4 * $W
+        px = _pairreal(x); py = _pairreal(y); arv = $V2(alr); sv = $sgn; step = 4 * $W
         GC.@preserve x y begin
             i = 0
             while i + step <= n
@@ -687,7 +707,7 @@ end
             end
             while i < n
                 j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j)
-                unsafe_store!(py, unsafe_load(py, 2j - 1) + alr * xr - ali * xi, 2j - 1)
+                unsafe_store!(py, $tr, 2j - 1)
                 unsafe_store!(py, unsafe_load(py, 2j) + alr * xi + ali * xr, 2j)
                 i += 1
             end

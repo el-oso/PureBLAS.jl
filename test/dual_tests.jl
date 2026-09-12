@@ -127,6 +127,12 @@ end
     r = PureBLAS.axpy!(copy(y), 1.7, x)
     @test all(isfinite, value.(r)) && value.(r) ≈ yv .+ 1.7 .* xv
     @test isinf(partials(r[7], 1))                                        # the partial lane carries the Inf
+    # DUAL alpha: the tagged SIMD body — the zeroed product must sit on the VALUE lane (duplicate-even), or
+    # `0·Inf` from an infinite partial would poison the value, which the generic loop keeps finite.
+    ad = ForwardDiff.Dual{Nothing}(1.7, 0.3)
+    r = PureBLAS.axpy!(copy(y), ad, x)
+    @test all(isfinite, value.(r)) && value.(r) ≈ yv .+ 1.7 .* xv
+    @test isinf(partials(r[7], 1)) && partials(r[2], 1) ≈ yp[2] + 1.7 * xp[2] + 0.3 * xv[2]
     r = PureBLAS.scal!(1.7, copy(x))
     @test all(isfinite, value.(r)) && value.(r) ≈ 1.7 .* xv
     r = PureBLAS.nrm2(x); @test isfinite(value(r)) && value(r) ≈ norm(xv)
@@ -305,7 +311,10 @@ end
     C = Val{:cplx}; D = Val{:dual}
     for T in (Float64, Float32)
         CV = Vector{Complex{T}}; DV = Vector{Dual{Nothing, T, 1}}
+        L = Val{PureBLAS._zaxpy_narrow_lanes(T)}; U = typeof(PureBLAS._ZAXPY_PHASE_UV)
         specs = [
+            "axpy_phase" => (PureBLAS._axpy_pair_phase!, (L, U, Int, T, T, CV, CV), (L, U, Int, T, T, DV, DV)),
+            "axpy_wide" => (PureBLAS._axpy_pair_wide!, (Int, T, T, CV, CV), (Int, T, T, DV, DV)),
             "dotu" => (PureBLAS._dot_pair_simd, (Int, CV, CV, Type{T}, Val{false}), (Int, DV, DV, Type{T}, Val{false})),
             "dotc" => (PureBLAS._dot_pair_simd, (Int, CV, CV, Type{T}, Val{true}), (Int, DV, DV, Type{T}, Val{true})),
         ]

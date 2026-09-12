@@ -94,13 +94,14 @@ end
         return _axpy_cmplx_simd!(Int(n), real(ac), imag(ac), x, y)   # interleaved-complex SIMD axpy
     end
     # Dual vectors, real alpha: y_v += a·x_v and y_p += a·x_p are one real axpy over the 2n-real buffer
-    # (see `_scal!`). A dual alpha takes the generic loop; its SIMD body is step 3 of docs/src/dual.md.
+    # (see `_scal!`). A dual alpha runs the complex axpy body under the dual multiply rule (`_pair_shuf`).
     if incx == 1 && incy == 1 && _pair2(x, y)
         av, ap = _parts(convert(_et(x), a))
         if iszero(ap)
             GC.@preserve x y _axpy_simd!(2 * Int(n), av, _pairreal(x), _pairreal(y))
             return y
         end
+        return _axpy_pair_simd!(Val(:dual), Int(n), av, ap, x, y)
     end
     ix = _start(n, incx); iy = _start(n, incy)
     @inbounds for _ in 1:n
