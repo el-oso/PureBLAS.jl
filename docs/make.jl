@@ -26,6 +26,7 @@ makedocs(;
             "Design" => "design.md",
             "Scratch Arena" => "arena.md",
             "SIMD & Hardware Adaptation" => "simd.md",
+            "Dual Numbers (forward-mode AD)" => "dual.md",
         ],
         "Tuning" => [
             "Tuning Constants" => "tuning.md",
