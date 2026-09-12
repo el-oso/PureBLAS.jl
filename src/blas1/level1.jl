@@ -8,12 +8,12 @@
 @inline function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _copy_simd!(Int(n), x, y)
-    # A complex vector is a contiguous 2n-real buffer and copy involves no arithmetic, so the real
+    # Complex and Dual vectors are contiguous 2n-real buffers and copy involves no arithmetic, so the real
     # SIMD kernel serves them as-is. LLVM does NOT vectorize the scalar loop below for ComplexF64 — it emits
     # a `memmove` call (bench/probes/cplx_copy_vec.jl: `_vectorized=false`), 1.9x slower than `_copy_simd!`
     # while L1-resident (89 vs 170 GB/s at n=1e3) and level from L2 on (within 2% at n=1e4/1e5).
-    if incx == 1 && incy == 1 && _cplx2(x, y)
-        GC.@preserve x y _copy_simd!(2 * Int(n), _reptr(x), _reptr(y))
+    if incx == 1 && incy == 1 && (_cplx2(x, y) || _pair2(x, y))
+        GC.@preserve x y _copy_simd!(2 * Int(n), _pairreal(x), _pairreal(y))
         return y
     end
     ix = _start(n, incx); iy = _start(n, incy)
@@ -29,8 +29,8 @@ end
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _swap_simd!(Int(n), x, y)
     # Same reasoning as `_copy!`; here the scalar loop lowers to memcpy+memmove through a temporary and runs
     # 2.4-3.1x slower than `_swap_simd!` at every size measured (n=1e3..1e5, same probe).
-    if incx == 1 && incy == 1 && _cplx2(x, y)
-        GC.@preserve x y _swap_simd!(2 * Int(n), _reptr(x), _reptr(y))
+    if incx == 1 && incy == 1 && (_cplx2(x, y) || _pair2(x, y))
+        GC.@preserve x y _swap_simd!(2 * Int(n), _pairreal(x), _pairreal(y))
         return nothing
     end
     ix = _start(n, incx); iy = _start(n, incy)
@@ -52,6 +52,16 @@ end
             return x
         end
         return _scal_cmplx_simd!(Int(n), real(ac), imag(ac), x)   # true complex → interleaved swap-multiply
+    end
+    # Dual vector (ForwardDiff extension loaded): a REAL alpha scales value and partial alike, so it is the
+    # real scal over the 2n-real buffer — exactly the complex bypass above. A dual alpha (nonzero partial)
+    # multiplies element by element and takes the generic loop below (its SIMD body is step 3 of the design).
+    if incx == 1 && _pairalg(x)
+        av, ap = _parts(convert(_et(x), a))
+        if iszero(ap)
+            GC.@preserve x _scal_simd!(2 * Int(n), av, _pairreal(x))
+            return x
+        end
     end
     ix = _start(n, incx)
     @inbounds for _ in 1:n
@@ -82,6 +92,15 @@ end
             return y
         end
         return _axpy_cmplx_simd!(Int(n), real(ac), imag(ac), x, y)   # interleaved-complex SIMD axpy
+    end
+    # Dual vectors, real alpha: y_v += a·x_v and y_p += a·x_p are one real axpy over the 2n-real buffer
+    # (see `_scal!`). A dual alpha takes the generic loop; its SIMD body is step 3 of docs/src/dual.md.
+    if incx == 1 && incy == 1 && _pair2(x, y)
+        av, ap = _parts(convert(_et(x), a))
+        if iszero(ap)
+            GC.@preserve x y _axpy_simd!(2 * Int(n), av, _pairreal(x), _pairreal(y))
+            return y
+        end
     end
     ix = _start(n, incx); iy = _start(n, incy)
     @inbounds for _ in 1:n
@@ -191,9 +210,9 @@ end
         v > 0 && return v
     end
     ix = _start(n, incx)
-    best = _l1(_ld(x, ix)); bi = 1; ix += incx
+    best = _l1v(_ld(x, ix)); bi = 1; ix += incx           # `_l1v`: |value| for Dual, `_l1` otherwise
     @inbounds for k in 2:n
-        v = _l1(_ld(x, ix))
+        v = _l1v(_ld(x, ix))
         if v > best
             best = v; bi = k
         end
