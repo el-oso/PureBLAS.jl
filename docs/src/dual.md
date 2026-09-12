@@ -229,10 +229,23 @@ build a width argument on "Zen5 is native-512"; that is a retracted claim from a
 Measured after step 2, same method as the baseline table above (wintermute, Chairmarks median of 6
 rounds, plots.jl regime, `bench/probes/dual_twins.jl`) — dual GB/s ÷ complex twin:
 
+⚠ **READ THE ALPHA COLUMN BEFORE THE RATIO.** axpy/scal have two regimes and only one of them is
+implemented. Step 2 routes a **real** alpha to the real kernel over 2n reals; a **dual** alpha (nonzero
+partial) still takes the generic scalar loop, because that is step 3. The first draft of this table
+printed the real-alpha 1.00 against a dual-alpha baseline of 0.82, which reads as "axpy is done" and
+would argue a reader out of step 3. Measured directly (axpy, n=1e3 / 1e4):
+
+| alpha | dual GB/s | complex GB/s | D/C |
+|---|---|---|---|
+| real (`Dual(1.7, 0.0)`) — bypass applies | 117.1 / 129.8 | 117.1 / 130.2 | **1.00 / 1.00** |
+| dual (`Dual(1.7, 0.3)`) — generic, step 3 | 95.8 / 103.5 | 116.8 / 129.8 | **0.82 / 0.80** |
+
 | op | n=1e3 | n=1e4 | n=1e5 | n=1e6 | before |
 |---|---|---|---|---|---|
-| axpy | 1.00 | 1.01 | 1.01 | 1.02 | 0.82 0.80 1.03 1.00 |
-| scal | 1.00 | 1.00 | 1.01 | 1.01 | 0.69 0.65 0.77 0.99 |
+| axpy (real α) | 1.00 | 1.01 | 1.01 | 1.02 | — (new path) |
+| axpy (dual α) | 0.82 | 0.80 | 1.01 | 1.00 | 0.82 0.80 1.03 1.00 — **unchanged, step 3** |
+| scal (real α) | 1.00 | 1.00 | 1.01 | 1.01 | — (new path) |
+| scal (dual α) | 0.69 | 0.66 | 0.90 | 0.94 | 0.69 0.65 0.77 0.99 — **unchanged, step 3** |
 | copy | 1.00 | 1.03 | 1.01 | 1.01 | — |
 | swap | 1.00 | 1.05 | 0.99 | 1.02 | — |
 | dot | 0.20 | 0.34 | 0.40 | 0.58 | 0.37 0.34 0.49 0.92 (generic loop; step 3) |
