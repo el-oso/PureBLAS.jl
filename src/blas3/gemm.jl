@@ -2325,14 +2325,22 @@ end
     let fastb = quote end, slowb = quote end
         for j in 1:NR
             if j == 1
-                push!(fastb.args, :($(Symbol(:bb, 1)) =
-                    $(TB ? :(B + 2 * jr * $sz) : :(B + 2 * jr * ldb * $sz))))
+                push!(
+                    fastb.args, :(
+                        $(Symbol(:bb, 1)) =
+                            $(TB ? :(B + 2 * jr * $sz) : :(B + 2 * jr * ldb * $sz))
+                    )
+                )
             else
                 push!(fastb.args, :($(Symbol(:bb, j)) = $(Symbol(:bb, 1)) + $(j - 1) * bstepc))
             end
             jcx = :(jr + min($(j - 1), nre - 1))
-            push!(slowb.args, :($(Symbol(:bb, j)) =
-                $(TB ? :(B + 2 * $jcx * $sz) : :(B + 2 * $jcx * ldb * $sz))))
+            push!(
+                slowb.args, :(
+                    $(Symbol(:bb, j)) =
+                        $(TB ? :(B + 2 * $jcx * $sz) : :(B + 2 * $jcx * ldb * $sz))
+                )
+            )
         end
         push!(body.args, :(bstepc = $(TB ? :(2 * $sz) : :(2 * ldb * $sz))))
         push!(body.args, Expr(:if, :(nre >= $NR), fastb, slowb))
@@ -2674,6 +2682,73 @@ function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::In
     end
     return C
 end
+
+# ── DUAL gemm: three real products on value/partial planes (docs/src/dual_l3.md) ────────────────────
+# `Dual{Tag,V,1}` operands (ForwardDiff extension loaded; `_pairT`): C := α·A·B + β·C with
+#     C_v = A_v·B_v          C_p = A_v·B_p + A_p·B_v          (A_p·B_p is ε² and is NEVER formed)
+# — the same scaffold as Karatsuba 3M above, minus the sum plane and minus the cancellation, so there is no
+# window: the planes come from the same grow-only pool (slots 1,2 / 4,5 / 7,8 of the nine), the products are the
+# REAL gemm through `_gemm_core!` (so large n rides Strassen exactly as `A*B` on `Matrix{Float64}` does), and
+# the combine applies the dual α, β elementwise over interleaved C. Peak scratch = 6 planes = the byte size of
+# the three dual operands themselves (2n² reals each). Conjugation flags are dropped: conj is the identity on
+# `Dual <: Real`, the same decision as dotc == dotu (dual.md). A dual α with zero value and a live partial is
+# handled by the combine (both parts multiply), which is why this path never quick-returns on `iszero(α)`.
+function _split2!(Xv, Xp, M, r::Int, c::Int)   # interleaved pairs → value / partial planes
+    Tr = eltype(Xv); ldm = stride(M, 2); ldx = stride(Xv, 2)
+    GC.@preserve M Xv Xp begin
+        pm = Ptr{Tr}(pointer(M)); pv = pointer(Xv); pp = pointer(Xp)
+        @inbounds for j in 1:c
+            mb = (j - 1) * ldm * 2; xb = (j - 1) * ldx
+            @simd for i in 1:r
+                unsafe_store!(pv, unsafe_load(pm, mb + 2i - 1), xb + i)
+                unsafe_store!(pp, unsafe_load(pm, mb + 2i), xb + i)
+            end
+        end
+    end
+    return
+end
+# C := α·(P1 + ε·P2) + β·C over interleaved C, α = αv + ε·αp, β = βv + ε·βp.  b0 ⇒ C is not read.
+#     C_v = αv·P1 + βv·C_v            C_p = αv·P2 + αp·P1 + βv·C_p + βp·C_v(old)
+function _combine_dual!(C, P1, P2, αv::Tr, αp::Tr, βv::Tr, βp::Tr, b0::Bool, m::Int, n::Int) where {Tr}
+    ldc = stride(C, 2); ldp = stride(P1, 2)
+    GC.@preserve C P1 P2 begin
+        pc = Ptr{Tr}(pointer(C)); p1 = pointer(P1); p2 = pointer(P2)
+        @inbounds for j in 1:n
+            cb = (j - 1) * ldc * 2; pb = (j - 1) * ldp
+            if b0
+                @simd for i in 1:m
+                    a = unsafe_load(p1, pb + i); b = unsafe_load(p2, pb + i)
+                    unsafe_store!(pc, αv * a, cb + 2i - 1); unsafe_store!(pc, muladd(αv, b, αp * a), cb + 2i)
+                end
+            else
+                @simd for i in 1:m
+                    a = unsafe_load(p1, pb + i); b = unsafe_load(p2, pb + i)
+                    ov = unsafe_load(pc, cb + 2i - 1); op = unsafe_load(pc, cb + 2i)
+                    unsafe_store!(pc, muladd(αv, a, βv * ov), cb + 2i - 1)
+                    unsafe_store!(pc, muladd(αv, b, muladd(αp, a, muladd(βv, op, βp * ov))), cb + 2i)
+                end
+            end
+        end
+    end
+    return
+end
+function _gemm_dual3!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::P, A, B, beta::P, C) where {P}
+    Tr = _pairvT(P)
+    ra = size(A, 1); ca = size(A, 2); rb = size(B, 1); cb = size(B, 2)   # stored dims (trans folded by sub-gemm)
+    t = _gemm_3m_scratch(Tr, ra * ca, rb * cb, m * n)
+    GC.@preserve t begin
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)
+        Av = w(1, ra, ca); Ap = w(2, ra, ca); Bv = w(4, rb, cb); Bp = w(5, rb, cb); P1 = w(7, m, n); P2 = w(8, m, n)
+        _split2!(Av, Ap, A, ra, ca); _split2!(Bv, Bp, B, rb, cb)
+        o = one(Tr); z = zero(Tr)
+        _gemm_core!(P1, Av, Bv, o, z, tA, tB, false, false)
+        _gemm_core!(P2, Av, Bp, o, z, tA, tB, false, false)
+        _gemm_core!(P2, Ap, Bv, o, o, tA, tB, false, false)
+        αv, αp = _parts(alpha); βv, βp = _parts(beta)
+        _combine_dual!(C, P1, P2, αv, αp, βv, βp, iszero(βv) && iszero(βp), m, n)   # both parts: β = 0 + ε·b reads C
+    end
+    return C
+end
 # Karatsuba-3M complex hemm/symm side-L: C := α·A_herm·B + β·C, with A split from its stored triangle by
 # _split3_sym! (no materialize, no n² complex scratch). Mirror of _gemm_3m! (tA=tB='N', k=n=size(A,1)).
 # herm=false ⇒ symm. `_combine3!` applies α and β (β=0 overwrites), so no separate scaleC. This deletes
@@ -3012,6 +3087,12 @@ function gemm!(
     # `tmp` is gemm!'s C. Fixing the gate is the one-line root cause; the hand workarounds stay valid.
     if T <: BlasFloat && _strided1(C)
         _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
+    elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
+            max(m, n, k) > _fh_cgemm_tiny()
+        # Dual planes (dual_l3.md). `_fh_cgemm_tiny` is reused as the floor below which three real sub-gemms plus
+        # the O(n²) split/combine lose to the generic loop; measured for dual in bench/probes/dual_gemm_check.jl.
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_dual3!(tA, tB, m, n, k, convert(T, alpha), _pm(A), _pm(B), convert(T, beta), _pm(C))
     else
         _gemm_generic!(tA, tB, transA == 'C', transB == 'C', m, n, k, alpha, A, B, beta, C)
     end

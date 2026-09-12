@@ -26,6 +26,8 @@ const _Dual1{V} = Dual{T, V, 1} where {T}
 const _DualArg{V} = Union{Ptr{<:_Dual1{V}}, DenseArray{<:_Dual1{V}}}
 
 PureBLAS._pairalg(::_DualArg{V}) where {V <: BlasReal} = true
+PureBLAS._pairT(::Type{<:_Dual1{V}}) where {V <: BlasReal} = true
+PureBLAS._pairvT(::Type{<:_Dual1{V}}) where {V} = V
 PureBLAS._pairreal(x::Ptr{D}) where {V <: BlasReal, D <: _Dual1{V}} = Ptr{V}(x)
 PureBLAS._pairreal(x::DenseArray{D}) where {V <: BlasReal, D <: _Dual1{V}} = Ptr{V}(pointer(x))
 PureBLAS._parts(d::Dual{T, V, 1}) where {T, V} = (value(d), partials(d, 1))
