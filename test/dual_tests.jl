@@ -492,3 +492,44 @@ end
         @test true
     end
 end
+
+@testitem "Dual L3: syrk/herk/trmm/trsm compositions match the plane formulas (every flag, side, diag)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    tri(M, up, unit) = (Tm = up ? triu(M) : tril(M); unit ? Tm - Diagonal(Tm) + I : Tm)
+    for V in (Float64, Float32), n in (1, 3, 8, 17, 64, 129), k in (1, 5, 33)
+        tol = 64 * sqrt(eps(V)) * max(n, k)
+        ≃(R, Rv, Rp) = isapprox(value.(R), Rv; rtol = tol, atol = tol) && isapprox(partials.(R, 1), Rp; rtol = tol, atol = tol)
+        αd = Dual{Nothing}(V(1.7), V(0.3)); βd = Dual{Nothing}(V(0), V(0.4)); av, ap, bv, bp = V(1.7), V(0.3), V(0), V(0.4)
+        for up in (true, false), tr in (false, true)
+            A = DualT.mkd(randn(V, (tr ? (k, n) : (n, k))...), randn(V, (tr ? (k, n) : (n, k))...)); Av = value.(A); Ap = partials.(A, 1)
+            C = DualT.mkd(randn(V, n, n), randn(V, n, n)); Cv = value.(C); Cp = partials.(C, 1)
+            oA(X) = tr ? transpose(X) : X
+            P1 = oA(Av) * transpose(oA(Av)); S2 = oA(Av) * transpose(oA(Ap)) + oA(Ap) * transpose(oA(Av))   # A_p·A_pᵀ is ε²: absent
+            msk = up ? triu(trues(n, n)) : tril(trues(n, n))
+            R = PureBLAS.syrk!(copy(C), A; uplo = up ? 'U' : 'L', trans = tr ? 'T' : 'N', alpha = αd, beta = βd)
+            @test ≃(R[msk], (av .* P1 .+ bv .* Cv)[msk], (av .* S2 .+ ap .* P1 .+ bv .* Cp .+ bp .* Cv)[msk])
+            @test R[.!msk] == C[.!msk]                                             # the other triangle is untouched
+            H = PureBLAS.herk!(copy(C), A; uplo = up ? 'U' : 'L', trans = tr ? 'C' : 'N', alpha = av, beta = bv)   # herk == syrk on a Dual
+            @test ≃(H[msk], (av .* P1 .+ bv .* Cv)[msk], (av .* S2 .+ bv .* Cp)[msk])
+        end
+        for sl in (true, false), up in (true, false), tr in (false, true), unit in (false, true)
+            Tri = DualT.mkd(randn(V, n, n) ./ V(2n), randn(V, n, n)); for i in 1:n
+                Tri[i, i] = Dual{Nothing}(V(2), V(0.1))
+            end
+            Tv = tri(value.(Tri), up, unit); Tp = tri(partials.(Tri, 1), up, false); unit && (Tp = Tp - Diagonal(Tp))   # A_p° for diag='U'
+            opv = tr ? transpose(Tv) : Tv; opp = tr ? transpose(Tp) : Tp
+            B = DualT.mkd(randn(V, (sl ? (n, k) : (k, n))...), randn(V, (sl ? (n, k) : (k, n))...)); Bv = value.(B); Bp = partials.(B, 1)
+            kw = (side = sl ? 'L' : 'R', uplo = up ? 'U' : 'L', transA = tr ? 'T' : 'N', diag = unit ? 'U' : 'N')
+            Mv = sl ? opv * Bv : Bv * opv; Mp = sl ? opv * Bp + opp * Bv : Bp * opv + Bv * opp
+            @test ≃(PureBLAS.trmm!(copy(B), Tri; kw..., alpha = αd), av .* Mv, av .* Mp .+ ap .* Mv)
+            Xv = sl ? opv \ Bv : Bv / opv; Xp = sl ? opv \ (Bp - opp * Xv) : (Bp - Xv * opp) / opv     # no dual division anywhere
+            @test ≃(PureBLAS.trsm!(copy(B), Tri; kw..., alpha = αd), av .* Xv, av .* Xp .+ ap .* Xv)
+            @test PureBLAS.trmm!(copy(B), Tri; kw..., transA = 'C') == PureBLAS.trmm!(copy(B), Tri; kw..., transA = 'T')
+        end
+    end
+    L0 = tril(randn(20, 20) ./ 40) + 2I; dL = tril(randn(20, 20) ./ 40); B0 = randn(20, 7)
+    @test ForwardDiff.derivative(t -> vec(PureBLAS.trsm!(B0 .+ zero(t), L0 .+ t .* dL; side = 'L', uplo = 'L')), 0.0) ≈ vec(-(L0 \ (dL * (L0 \ B0))))
+    A0 = randn(12, 30); dA = randn(12, 30)
+    @test ForwardDiff.derivative(t -> vec(triu(PureBLAS.syrk!(zeros(eltype(t), 12, 12), A0 .+ t .* dA))), 0.0) ≈ vec(triu(dA * A0' + A0 * dA'))
+end

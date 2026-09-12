@@ -2749,6 +2749,103 @@ function _gemm_dual3!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::P, A, B
     end
     return C
 end
+
+# ── DUAL syrk / trmm / trsm: compositions of the REAL routines on the planes (docs/src/dual_l3.md §2.2–2.4) ──
+# Same pool, same split, same combine; the public real entries do the products (so every real fast path — packed
+# syrk, the trsm bases, Strassen inside gemm — is inherited). trsm never divides by a dual: X_p = A_v⁻¹(B_p − A_p X_v).
+# `_zero_diag!` makes A_p° for diag='U': the partial of an implicit unit diagonal is 0, and the A_p product is
+# then a NON-unit trmm.
+@inline function _zero_diag!(X, k::Int)
+    @inbounds for j in 1:k
+        X[j, j] = zero(eltype(X))
+    end
+    return
+end
+@inline function _copy_plane!(dst, src, len::Int)     # contiguous planes (ld == rows), so a flat copy
+    GC.@preserve dst src unsafe_copyto!(pointer(dst), pointer(src), len)
+    return
+end
+function _combine_dual_tri!(C, P1, P2, αv::Tr, αp::Tr, βv::Tr, βp::Tr, b0::Bool, up::Bool, n::Int) where {Tr}
+    ldc = stride(C, 2); ldp = stride(P1, 2)          # the stored triangle only; the other one is never read
+    GC.@preserve C P1 P2 begin
+        pc = Ptr{Tr}(pointer(C)); p1 = pointer(P1); p2 = pointer(P2)
+        @inbounds for j in 1:n
+            cb = (j - 1) * ldc * 2; pb = (j - 1) * ldp; lo = up ? 1 : j; hi = up ? j : n
+            if b0
+                @simd for i in lo:hi
+                    a = unsafe_load(p1, pb + i); b = unsafe_load(p2, pb + i)
+                    unsafe_store!(pc, αv * a, cb + 2i - 1); unsafe_store!(pc, muladd(αv, b, αp * a), cb + 2i)
+                end
+            else
+                @simd for i in lo:hi
+                    a = unsafe_load(p1, pb + i); b = unsafe_load(p2, pb + i)
+                    ov = unsafe_load(pc, cb + 2i - 1); op = unsafe_load(pc, cb + 2i)
+                    unsafe_store!(pc, muladd(αv, a, βv * ov), cb + 2i - 1)
+                    unsafe_store!(pc, muladd(αv, b, muladd(αp, a, muladd(βv, op, βp * ov))), cb + 2i)
+                end
+            end
+        end
+    end
+    return
+end
+# C := α·op(A)·op(A)ᵀ + β·C:  value = syrk(A_v);  partial = syr2k(A_v, A_p)  (+ α_p·value through the combine)
+function _syrk_dual!(up::Bool, tr::Bool, alpha::P, A, beta::P, C, n::Int) where {P}
+    Tr = _pairvT(P); ra = size(A, 1); ca = size(A, 2)
+    t = _gemm_3m_scratch(Tr, ra * ca, 0, n * n)
+    GC.@preserve t begin
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)
+        Av = w(1, ra, ca); Ap = w(2, ra, ca); P1 = w(7, n, n); P2 = w(8, n, n)
+        _split2!(Av, Ap, A, ra, ca)
+        ul = up ? 'U' : 'L'; tc = tr ? 'T' : 'N'; o = one(Tr); z = zero(Tr)
+        syrk!(P1, Av; uplo = ul, trans = tc, alpha = o, beta = z)
+        syr2k!(P2, Av, Ap; uplo = ul, trans = tc, alpha = o, beta = z)
+        αv, αp = _parts(alpha); βv, βp = _parts(beta)
+        _combine_dual_tri!(C, P1, P2, αv, αp, βv, βp, iszero(βv) && iszero(βp), up, n)
+    end
+    return C
+end
+# B := α·op(A)·B (side L) / α·B·op(A) (side R):  B_p ← A_v·B_p + A_p°·B_v(old);  B_v ← A_v·B_v
+function _trmm_dual!(sl::Bool, up::Bool, tr::Bool, unit::Bool, alpha::P, A, B) where {P}
+    Tr = _pairvT(P); k = size(A, 1); m = size(B, 1); n = size(B, 2)
+    t = _gemm_3m_scratch(Tr, k * k, m * n, m * n)
+    GC.@preserve t begin
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)
+        Av = w(1, k, k); Ap = w(2, k, k); Bv = w(4, m, n); Bp = w(5, m, n); X = w(7, m, n)
+        _split2!(Av, Ap, A, k, k); _split2!(Bv, Bp, B, m, n)
+        unit && _zero_diag!(Ap, k)
+        side = sl ? 'L' : 'R'; ul = up ? 'U' : 'L'; tc = tr ? 'T' : 'N'; dg = unit ? 'U' : 'N'
+        _copy_plane!(X, Bv, m * n)
+        trmm!(X, Ap; side, uplo = ul, transA = tc, diag = 'N')                 # A_p°·B_v(old)
+        trmm!(Bp, Av; side, uplo = ul, transA = tc, diag = dg)                 # A_v·B_p
+        trmm!(Bv, Av; side, uplo = ul, transA = tc, diag = dg)                 # A_v·B_v
+        GC.@preserve X Bp _axpy_simd!(m * n, one(Tr), pointer(X), pointer(Bp))  # B_p' += A_p°·B_v(old)
+        αv, αp = _parts(alpha)
+        _combine_dual!(B, Bv, Bp, αv, αp, zero(Tr), zero(Tr), true, m, n)
+    end
+    return B
+end
+# op(A)·X = α·B (side L) / X·op(A) = α·B (side R):  X_v = A_v⁻¹B_v;  X_p = A_v⁻¹(B_p − A_p°·X_v)
+function _trsm_dual!(sl::Bool, up::Bool, tr::Bool, unit::Bool, alpha::P, A, B) where {P}
+    Tr = _pairvT(P); k = size(A, 1); m = size(B, 1); n = size(B, 2)
+    t = _gemm_3m_scratch(Tr, k * k, m * n, m * n)
+    GC.@preserve t begin
+        w(i, r, c) = PtrMatrix(pointer(t[i]), r, c, r)
+        Av = w(1, k, k); Ap = w(2, k, k); Bv = w(4, m, n); Bp = w(5, m, n); X = w(7, m, n)
+        _split2!(Av, Ap, A, k, k); _split2!(Bv, Bp, B, m, n)
+        unit && _zero_diag!(Ap, k)
+        side = sl ? 'L' : 'R'; ul = up ? 'U' : 'L'; tc = tr ? 'T' : 'N'; dg = unit ? 'U' : 'N'; o = one(Tr)
+        trsm!(Bv, Av; side, uplo = ul, transA = tc, diag = dg, alpha = o)      # X_v
+        _copy_plane!(X, Bv, m * n)
+        trmm!(X, Ap; side, uplo = ul, transA = tc, diag = 'N')                 # A_p°·X_v
+        GC.@preserve X Bp _axpy_simd!(m * n, -o, pointer(X), pointer(Bp))       # R = B_p − A_p°·X_v
+        trsm!(Bp, Av; side, uplo = ul, transA = tc, diag = dg, alpha = o)      # X_p
+        αv, αp = _parts(alpha)
+        _combine_dual!(B, Bv, Bp, αv, αp, zero(Tr), zero(Tr), true, m, n)
+    end
+    return B
+end
+# the pair-route predicate the L3 entries share: dual eltype, pointer-able operands of one element type
+@inline _l3p_ok(X, A) = _pairT(eltype(X)) && eltype(A) === eltype(X) && _strided1(X) && _strided1(A)
 # Karatsuba-3M complex hemm/symm side-L: C := α·A_herm·B + β·C, with A split from its stored triangle by
 # _split3_sym! (no materialize, no n² complex scratch). Mirror of _gemm_3m! (tA=tB='N', k=n=size(A,1)).
 # herm=false ⇒ symm. `_combine3!` applies α and β (β=0 overwrites), so no separate scaleC. This deletes
