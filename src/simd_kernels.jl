@@ -1537,20 +1537,34 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # shuffle — far cheaper than the cross-lane deinterleave). Result Vec{2W} has magnitude mₖ=|rₖ|+|iₖ|
 # DUPLICATED in each (re,im) lane-pair: [m0,m0,m1,m1,…]. Argmax then runs over 2W lanes with the complex
 # index duplicated per pair, so no deinterleave/extract shuffle at all — memory-bandwidth-bound like OB.
-@inline @generated function _cmag2(v::Vec{N, T}) where {N, T}
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)   # swap adjacent re↔im
-    return :($(Expr(:meta, :inline)); (av = abs(v); av + shufflevector(av, Val($swp))))
+# The same scaffold serves the DUAL argmax (docs/src/dual.md, "iamax"): the pair magnitude is |value| in
+# both lanes — `dupEven(|x|)` — so the argmax is over |value| only and ties keep the FIRST index, i.e. real
+# BLAS semantics; partials never enter the comparison. `ALG` selects the magnitude at codegen time
+# (`_pmag2`); the complex instantiation is the byte-identical body it always was (guarded by
+# bench/probes/iamax_pair_native.jl).
+@inline @generated function _pmag2(::Val{ALG}, av::Vec{N, T}) where {ALG, N, T}
+    if ALG === :cplx
+        swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)   # swap adjacent re↔im
+        return :($(Expr(:meta, :inline)); av + shufflevector(av, Val($swp)))   # |re|+|im| in both lanes
+    else
+        dup = Expr(:tuple, (2 * (l ÷ 2) for l in 0:(N - 1))...)                # 0,0,2,2,… duplicate-even
+        return :($(Expr(:meta, :inline)); shufflevector(av, Val($dup)))       # |value| in both lanes
+    end
 end
-@inline function _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+@inline _iamax_cmplx_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} = _iamax_pair_simd!(Val(:cplx), n, xp)
+# `alg` is passed as a VALUE (a `Val` singleton) and captured by `magc` as such — a static parameter used
+# inside a closure would be captured as a runtime `Symbol`, and `Val(sym)` there is dynamic dispatch.
+@inline function _iamax_pair_simd!(alg::Val{ALG}, n::Int, xp::Ptr{T}) where {ALG, T <: BlasReal}
     W = _vwidth(T); V = Vec{2W, T}; sz = sizeof(T); step = 4W
     clane = Vec(ntuple(i -> (i + 1) ÷ 2, Val(2W)))        # 1,1,2,2,…,W,W (complex index per real lane)
-    magc(c) = _cmag2(vload(V, xp + 2c * sz))              # Vec{2W}, mₖ duplicated per pair
+    magc(c) = _pmag2(alg, abs(vload(V, xp + 2c * sz)))   # Vec{2W}, mₖ duplicated per pair
     # SEED = broadcast (|re|+|im|) of element 1, NOT the first blocks' own magnitudes — a CORRECTNESS
     # requirement, identical to the real `_iamax_chain4!` case (see the note there). `_amax_up` keeps
     # its running max whenever `nv > m` is false, and every compare against NaN is false, so a NaN in
     # the seed poisons that lane permanently. Measured before this fix: PureBLAS.iamax on a
     # ComplexF64 vector with z[2]=NaN+0im and z[10]=99+0im returned 1 where netlib returns 10.
-    a1 = abs(unsafe_load(xp, 1)) + abs(unsafe_load(xp, 2))   # |re|+|im| of the first complex element
+    a1 = ALG === :cplx ? abs(unsafe_load(xp, 1)) + abs(unsafe_load(xp, 2)) :   # |re|+|im| of element 1
+        abs(unsafe_load(xp, 1))                                                # |value| of element 1
     seed_i = Vec(ntuple(_ -> 1, Val(2W)))                 # complex index 1 in every lane
     m0 = V(a1); m1 = V(a1); m2 = V(a1); m3 = V(a1)
     i0 = seed_i; i1 = seed_i; i2 = seed_i; i3 = seed_i
@@ -1570,7 +1584,7 @@ end
     if c < n                                               # masked remainder (no OOB read)
         rem = n - c
         rmsk = Vec(ntuple(i -> i, Val(2W))) <= 2 * rem     # real-lane mask (2 reals / complex)
-        av = abs(vload(V, xp + 2c * sz, rmsk)); mag = _cmag2_masked(av)
+        av = abs(vload(V, xp + 2c * sz, rmsk)); mag = _pmag2(alg, av)   # masked-out reals load as 0, |·| pairs stay 0
         cmsk = clane <= rem; take = (mag > m0) & cmsk
         m0 = vifelse(take, mag, m0); i0 = vifelse(take, clane + c, i0)
     end
@@ -1580,9 +1594,4 @@ end
         (ml > mx || (ml == mx && i0[l] < bi)) && (mx = ml; bi = i0[l])
     end
     return bi
-end
-# masked remainder magnitude: masked-out reals load as 0, so |·| pairs sum correctly (0 lanes stay 0).
-@inline @generated function _cmag2_masked(av::Vec{N, T}) where {N, T}
-    swp = Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...)
-    return :($(Expr(:meta, :inline)); av + shufflevector(av, Val($swp)))
 end
