@@ -220,7 +220,15 @@ end
 # 1-based index of the first element maximising |xᵢ| (complex: |Re|+|Im|). 0 if n ≤ 0.
 # Real unit-stride → SIMD argmax; complex unit-stride → complex SIMD argmax; else (strided, short, other
 # T) → scalar below.
-@inline _iamax_simd_try(n::Integer, x) = 0
+# The generic fallback also catches a dense Dual vector (ForwardDiff extension loaded): `_pairalg` is a
+# compile-time `false` for every other type, so this stays the `= 0` it always was for them. The dual
+# magnitude is |value| in both lanes of the pair (`_pmag2(Val(:dual), …)`) on the complex argmax scaffold.
+@inline function _iamax_simd_try(n::Integer, x)
+    _pairalg(x) || return 0
+    xp = _pairreal(x)
+    n < 4 * _vwidth(_et(xp)) && return 0
+    GC.@preserve x return _iamax_pair_simd!(Val(:dual), Int(n), xp)
+end
 @inline _iamax_simd_try(n::Integer, x::Ptr{T}) where {T <: BlasReal} =
     n < 4 * _vwidth(T) ? 0 : _iamax_simd!(Int(n), x)
 # Ptr{Complex} — the Mode-1 C-ABI shape. Without this method `icamax_64_`/`izamax_64_` fell through to
