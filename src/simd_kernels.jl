@@ -51,6 +51,7 @@ function _pairreal end
 function _parts end
 function _mkpair end
 @inline _pairreal(x::_CplxArg) = _reptr(x)
+@inline _pairv(x) = eltype(_pairreal(x))     # the real type V under a pair vector (static; the pointer is dead)
 # Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
 @inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)
 
@@ -700,7 +701,17 @@ end
 # q = Σ x·swap(y) = [Σxr·yi, Σxi·yr, …] — ONE shuffle (swap y) + 2 FMAs/iter, identical for dotu/dotc.
 # Deinterleave only the 2 accumulators ONCE at the end; CJ flips two combine signs. 4× unrolled for the
 # FMA-reduction latency. Returns Complex{T}. `n` counts COMPLEX elements.
-@generated function _dot_cmplx_simd(n::Int, x, y, ::Type{T}, ::Val{CJ}) where {T <: BlasReal, CJ}
+#
+# THE SAME BODY SERVES THE DUAL DOT (docs/src/dual.md, step 3): the loop is algebra-agnostic — p = Σ x·y =
+# [Σ x_v·y_v, Σ x_p·y_p] and q = Σ x·swap(y) = [Σ x_v·y_p, Σ x_p·y_v] — and only the EPILOGUE knows the
+# multiply rule. `ALG` selects it at codegen time: `:cplx` is the body above, byte-identical (guarded by
+# bench/probes/dual_step3_native.jl); `:dual` takes value = Σ x_v·y_v and partial = Σ (x_v·y_p + x_p·y_v),
+# DISCARDING the Σ x_p·y_p lane — that is the ε² term, and it may legitimately overflow (the ε²-leak test)
+# while the value stays finite, which is why it must never be folded in, not even multiplied by zero. `CJ`
+# is ignored for `:dual` (no conjugation on a Real; dotc == dotu). The dual instantiation returns the bare
+# `(value, partial)` pair; the caller wraps it with `_mkpair`, so nothing here knows the Dual type.
+@inline _dot_cmplx_simd(n::Int, x, y, ::Type{T}, cj::Val) where {T <: BlasReal} = _dot_pair_simd(Val(:cplx), n, x, y, T, cj)
+@generated function _dot_pair_simd(::Val{ALG}, n::Int, x, y, ::Type{T}, ::Val{CJ}) where {ALG, T <: BlasReal, CJ}
     W = _vwidth(T); V2 = Vec{2W, T}; sz = sizeof(T)
     # Unroll from the REGISTER BUDGET (req#8), not a literal: the 2·UNR `Vec{2W}` accumulators each take 2
     # physical vector registers, so keep 4·UNR ≤ Nregs−RESERVE, where RESERVE covers the live x/y/swap
@@ -732,8 +743,22 @@ end
             end
         )
     end
+    # Per-algebra epilogue (codegen constants). dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr; dotc (conj x):
+    # signs of the xi terms flip. dual: value=Σxv·yv, partial=Σxv·yp+Σxp·yv; the Σxp·yp lane is dropped.
+    if ALG === :cplx
+        fold = quote
+            sr = pfld[1] + $(CJ ? :(pfld[2]) : :(-pfld[2]))
+            si = qfld[1] + $(CJ ? :(-qfld[2]) : :(qfld[2]))
+        end
+        tail = :(sr += xr * yr + $(CJ ? :(xi * yi) : :(-xi * yi)); si += xr * yi + $(CJ ? :(-xi * yr) : :(xi * yr)))
+        ret = :(Complex{$T}(sr, si))
+    else
+        fold = :(sr = pfld[1]; si = qfld[1] + qfld[2])
+        tail = :(sr += xr * yr; si += xr * yi + xi * yr)
+        ret = :((sr, si))
+    end
     return quote
-        px = _reptr(x); py = _reptr(y); step = $UNR * $W
+        px = _pairreal(x); py = _pairreal(y); step = $UNR * $W
         $init
         GC.@preserve x y begin
             i = 0
@@ -750,18 +775,16 @@ end
                 end
                 i += $W
             end
-            # dotu: real=Σxr·yr−Σxi·yi, imag=Σxr·yi+Σxi·yr ;  dotc (conj x): signs of the xi terms flip.
             # Parity-preserving fold → [Σeven, Σodd] instead of deint + two full horizontal sums (see gemm.jl).
             pfld = _fold2_cmplx($psum)         # [Σxr·yr, Σxi·yi]  (unique names: $psum reads p0..p_{UNR-1})
             qfld = _fold2_cmplx($qsum)         # [Σxr·yi, Σxi·yr]
-            sr = pfld[1] + $(CJ ? :(pfld[2]) : :(-pfld[2]))
-            si = qfld[1] + $(CJ ? :(-qfld[2]) : :(qfld[2]))
+            $fold
             @inbounds while i < n
                 j = i + 1; xr = unsafe_load(px, 2j - 1); xi = unsafe_load(px, 2j); yr = unsafe_load(py, 2j - 1); yi = unsafe_load(py, 2j)
-                sr += xr * yr + $(CJ ? :(xi * yi) : :(-xi * yi)); si += xr * yi + $(CJ ? :(-xi * yr) : :(xi * yr))
+                $tail
                 i += 1
             end
-            return Complex{$T}(sr, si)
+            return $ret
         end
     end
 end
