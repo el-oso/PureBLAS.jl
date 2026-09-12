@@ -151,6 +151,25 @@ end
             ss = _sumsq_simd(2 * Int(n), _reptr(x), R)
             (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
         end                                                # non-finite/zero → complex lassq fallback below
+    elseif incx == 1 && _pairalg(x)
+        # Dual: ‖x‖ = √(Σ x_v²) with partial Σ x_v·x_p / ‖x‖ — one `dupEven` FMA kernel gives both sums
+        # (simd_kernels.jl). Guarded on BOTH sums: overflow/underflow of either takes the scaled slow path.
+        GC.@preserve x begin
+            xp = _pairreal(x)
+            ss, sp = _sumsq_dual_simd(Int(n), xp)
+            if isfinite(ss) && !iszero(ss) && isfinite(sp)
+                r = sqrt(ss)
+                return _mkpair(_et(x), r, sp / r)
+            end
+            # OVERFLOW/UNDERFLOW: NOT the generic Dual lassq loop below. The design (docs/src/dual.md) said to
+            # fall back to it, and the 1e200-scale test it prescribed showed that loop is numerically wrong
+            # there: `_lassq` divides Duals, and ForwardDiff's quotient rule squares the denominator, so at
+            # |x| ~ 1e200 the partial is garbage (measured −1.66 against the analytic −1.39; LinearAlgebra's
+            # own `norm` over Duals gave −1.47 — the oracle is broken the same way). The value is fine either
+            # way; only the derivative is lost. So scale on VALUES only — real lassq, no Dual division — and
+            # take the partial as Σ (x_v/scale)·x_p / √ssq, every term of which is bounded by |x_p|.
+            return _nrm2_dual_scaled(Int(n), xp, _et(x))
+        end
     end
     scale = zero(R); ssq = one(R)
     ix = _start(n, incx)
@@ -160,6 +179,24 @@ end
     return scale * sqrt(ssq)
 end
 
+# Dual nrm2, overflow/underflow-safe slow path (see the note in `_nrm2`). `xp` is the real Ptr over the
+# interleaved [v p …] buffer; `D` the vector's Dual type. Two scalar passes: real lassq over the values,
+# then the partial Σ (x_v/scale)·x_p / √ssq — no Dual arithmetic, so no Dual quotient rule to overflow.
+# All-zero input returns (0, 0), as the generic loop did (`Dual(0,0)·√Dual(1,0)`).
+@noinline function _nrm2_dual_scaled(n::Int, xp::Ptr{V}, ::Type{D}) where {V <: BlasReal, D}
+    scale = zero(V); ssq = one(V)
+    @inbounds for j in 1:n
+        scale, ssq = _lassq(scale, ssq, unsafe_load(xp, 2j - 1))
+    end
+    iszero(scale) && return _mkpair(D, zero(V), zero(V))
+    sp = zero(V)
+    @inbounds for j in 1:n
+        sp = muladd(unsafe_load(xp, 2j - 1) / scale, unsafe_load(xp, 2j), sp)
+    end
+    rs = sqrt(ssq)
+    return _mkpair(D, scale * rs, sp / rs)
+end
+
 # Σ |xᵢ|  (complex: Σ |Re|+|Im|). Returns a real scalar.
 @inline function _asum(n::Integer, x, incx::Integer)
     R = real(_et(x))
@@ -167,6 +204,12 @@ end
     (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
     (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
         (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
+    if incx == 1 && _pairalg(x)                            # Dual: Σ|x_v| with partial Σ flipsign(x_p, x_v)
+        GC.@preserve x begin
+            sa, sp = _asum_dual_simd(Int(n), _pairreal(x))
+            return _mkpair(_et(x), sa, sp)
+        end
+    end
     s = zero(R); ix = _start(n, incx)
     @inbounds for _ in 1:n
         s += _l1(_ld(x, ix)); ix += incx
