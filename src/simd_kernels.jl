@@ -51,9 +51,15 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
     # against) or when this is a release build — either way it specializes to a singleton and costs
     # no register. Offsets here are ELEMENT counts from `py`, and `py` is `y`'s own base whenever
     # `yc` is non-nothing, so base 0 is correct.
-    body = [:(_vstcb!(yc, 0, py, i + $(j * W), $W,
-            muladd(va, vload($V, px + o + $(j * W * sz)), vload($V, py + o + $(j * W * sz)))))
-        for j in 0:(U - 1)]
+    body = [
+        :(
+            _vstcb!(
+                yc, 0, py, i + $(j * W), $W,
+                muladd(va, vload($V, px + o + $(j * W * sz)), vload($V, py + o + $(j * W * sz)))
+            )
+        )
+            for j in 0:(U - 1)
+    ]
     return quote
         $(Expr(:meta, :inline))
         px = _ptr(x); py = _ptr(y); sz = $sz; step = $(U * W)
@@ -1182,10 +1188,13 @@ const _IAMAX_NB_STREAM = 4
     # the root is either the true max or NaN — both of which fire the unordered detect. The walk is
     # unchanged (per-block unordered guard + strict `>` scan), so first-occurrence on ties still holds.
     bal(items) = length(items) == 1 ? items[1] :
-        (m = length(items) ÷ 2; a = bal(items[1:m]); b = bal(items[(m + 1):end]);
-         :(vifelse(!($b > $a), $a, $b)))
+        (
+            m = length(items) ÷ 2; a = bal(items[1:m]); b = bal(items[(m + 1):end]);
+            :(vifelse(!($b > $a), $a, $b))
+        )
     tree = bal(Any[vs...])
-    walks = [quote
+    walks = [
+        quote
             if any(!($(vs[j + 1]) <= thr))            # per-block unordered guard, cold path only
                 bm = gmax; bl = 0
                 for l in 1:$W
@@ -1193,7 +1202,8 @@ const _IAMAX_NB_STREAM = 4
                 end
                 bl != 0 && (gmax = bm; bi = o + $(j * W) + bl; thr = $V(gmax))
             end
-        end for j in 0:(NB - 1)]
+        end for j in 0:(NB - 1)
+    ]
     return quote
         $(Expr(:meta, :inline))
         step = $(NB * W)
@@ -1231,7 +1241,8 @@ end
     loads = [:($(vs[j + 1]) = abs(vload($V, xp + (o + $(j * W)) * $sz))) for j in 0:(NB - 1)]
     cmps = [:($(cs[j + 1]) = $(vs[j + 1]) > thr) for j in 0:(NB - 1)]
     ortree = reduce((a, b) -> :($a | $b), cs)
-    walks = [quote
+    walks = [
+        quote
             if any($(cs[j + 1]))
                 bm = gmax; bl = 0
                 for l in 1:$W
@@ -1239,7 +1250,8 @@ end
                 end
                 bl != 0 && (gmax = bm; bi = o + $(j * W) + bl; thr = $V(gmax))
             end
-        end for j in 0:(NB - 1)]
+        end for j in 0:(NB - 1)
+    ]
     # Straight-line only: no ntuple, no closure, no tuple return. A closure in this loop body measured
     # 160× slower on 2026-07-31 and 300× on 2026-08-03. `Expr(:meta, :inline)` is emitted because
     # `@inline` does NOT propagate into @generated CodeInfo on 1.12.
@@ -1258,15 +1270,15 @@ end
     return quote
         $(Expr(:meta, :inline))
         step = $(NB * W)
-    # Seed from |x[1]|, NOT typemin — reference netlib `idamax` starts `DMAX = DABS(DX(1))`, and seeding
-    # lower silently changed the NaN contract WITH VECTOR LENGTH: `[NaN, 1.0]` returned 1 on the scalar
-    # path (n < 4W) but the index of the true max on this one, because a NaN never beats typemin and so
-    # got skipped, whereas seeding from x[1] makes every later compare-with-NaN false and pins the answer
-    # at 1. Same routine, two different semantics either side of an internal threshold (found 2026-07-31
-    # by the new netlib-oracle NaN testitem). For finite data this is identical — element 1 is simply
-    # accounted for up front instead of via the first compare — and it can only REDUCE cold-path entries,
-    # since the starting threshold is now a real element rather than typemin.
-    # `_iamax_simd_try` gates on n >= 4W, so x[1] always exists here.
+        # Seed from |x[1]|, NOT typemin — reference netlib `idamax` starts `DMAX = DABS(DX(1))`, and seeding
+        # lower silently changed the NaN contract WITH VECTOR LENGTH: `[NaN, 1.0]` returned 1 on the scalar
+        # path (n < 4W) but the index of the true max on this one, because a NaN never beats typemin and so
+        # got skipped, whereas seeding from x[1] makes every later compare-with-NaN false and pins the answer
+        # at 1. Same routine, two different semantics either side of an internal threshold (found 2026-07-31
+        # by the new netlib-oracle NaN testitem). For finite data this is identical — element 1 is simply
+        # accounted for up front instead of via the first compare — and it can only REDUCE cold-path entries,
+        # since the starting threshold is now a real element rather than typemin.
+        # `_iamax_simd_try` gates on n >= 4W, so x[1] always exists here.
         gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = $V(gmax); o = 0
         @inbounds while o + step <= n                 # dependency-free: NB independent compares vs `thr`
             $(loads...)
@@ -1385,9 +1397,11 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # n=1e3). Keeping the width fixed makes this one variable on every ISA.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
-    (n * sizeof(T) <= _L1_BYTES ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
-     n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
-     _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)) :
+    (
+        n * sizeof(T) <= _L1_BYTES ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
+        n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
+        _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)
+    ) :
     _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain

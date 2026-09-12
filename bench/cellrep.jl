@@ -58,101 +58,179 @@ const _L2OPS = ("gemvN", "gemvT", "trmv")
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
 const OPS = Dict(
-    "gemvN" => (() -> (randn(N, N), randn(N), randn(N)),
-                (c, m) -> (for _ in 1:m
-                     P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0)
-                 end; c[3][1]),
-                (c, m) -> (for _ in 1:m
-                     B.gemv!('N', 1.0, c[1], c[2], 0.0, c[3])
-                 end; c[3][1])),
-    "gemvT" => (() -> (randn(N, N), randn(N), randn(N)),
-                (c, m) -> (for _ in 1:m
-                     P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0, trans = 'T')
-                 end; c[3][1]),
-                (c, m) -> (for _ in 1:m
-                     B.gemv!('T', 1.0, c[1], c[2], 0.0, c[3])
-                 end; c[3][1])),
+    "gemvN" => (
+        () -> (randn(N, N), randn(N), randn(N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0)
+            end; c[3][1]
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.gemv!('N', 1.0, c[1], c[2], 0.0, c[3])
+            end; c[3][1]
+        ),
+    ),
+    "gemvT" => (
+        () -> (randn(N, N), randn(N), randn(N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0, trans = 'T')
+            end; c[3][1]
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.gemv!('T', 1.0, c[1], c[2], 0.0, c[3])
+            end; c[3][1]
+        ),
+    ),
     # trmv is destructive, so BOTH arms restore x from a pristine copy per rep, exactly as plots.jl
     # does. Without it repeated in-place x := A*x diverges and the timing measures denormals.
-    "trmv" => (() -> (randn(N, N), randn(N), randn(N)),
-               (c, m) -> (for _ in 1:m
-                    copyto!(c[3], c[2]); P.trmv!(c[1], c[3]; uplo = 'U')
-                end; c[3][1]),
-               (c, m) -> (for _ in 1:m
-                    copyto!(c[3], c[2]); B.trmv!('U', 'N', 'N', c[1], c[3])
-                end; c[3][1])),
-    "axpy" => (() -> (randn(N), randn(N)),
-               (c, m) -> (for _ in 1:m
-                    P.axpy!(c[2], 1.7, c[1])
-                end),
-               (c, m) -> (for _ in 1:m
-                    B.axpy!(1.7, c[1], c[2])
-                end)),
-    "dot" => (() -> (randn(N), randn(N)),
-              (c, m) -> (s = 0.0; for _ in 1:m
-                   s += P.dot(c[1], c[2])
-               end; s),
-              (c, m) -> (s = 0.0; for _ in 1:m
-                   s += B.dot(c[1], c[2])
-               end; s)),
-    "scal" => (() -> (randn(N),),
-               (c, m) -> (for _ in 1:m
-                    P.scal!(1.0000001, c[1])
-                end),
-               (c, m) -> (for _ in 1:m
-                    B.scal!(1.0000001, c[1])
-                end)),
-    "asum" => (() -> (randn(N),),
-               (c, m) -> (s = 0.0; for _ in 1:m
-                    s += P.asum(c[1])
-                end; s),
-               (c, m) -> (s = 0.0; for _ in 1:m
-                    s += B.asum(c[1])
-                end; s)),
-    "iamax" => (() -> (randn(N),),
-                (c, m) -> (s = 0; for _ in 1:m
-                     s += P.iamax(c[1])
-                 end; s),
-                (c, m) -> (s = 0; for _ in 1:m
-                     s += B.iamax(c[1])
-                 end; s)),
+    "trmv" => (
+        () -> (randn(N, N), randn(N), randn(N)),
+        (c, m) -> (
+            for _ in 1:m
+                copyto!(c[3], c[2]); P.trmv!(c[1], c[3]; uplo = 'U')
+            end; c[3][1]
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                copyto!(c[3], c[2]); B.trmv!('U', 'N', 'N', c[1], c[3])
+            end; c[3][1]
+        ),
+    ),
+    "axpy" => (
+        () -> (randn(N), randn(N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.axpy!(c[2], 1.7, c[1])
+            end
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.axpy!(1.7, c[1], c[2])
+            end
+        ),
+    ),
+    "dot" => (
+        () -> (randn(N), randn(N)),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += P.dot(c[1], c[2])
+            end; s
+        ),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += B.dot(c[1], c[2])
+            end; s
+        ),
+    ),
+    "scal" => (
+        () -> (randn(N),),
+        (c, m) -> (
+            for _ in 1:m
+                P.scal!(1.0000001, c[1])
+            end
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.scal!(1.0000001, c[1])
+            end
+        ),
+    ),
+    "asum" => (
+        () -> (randn(N),),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += P.asum(c[1])
+            end; s
+        ),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += B.asum(c[1])
+            end; s
+        ),
+    ),
+    "iamax" => (
+        () -> (randn(N),),
+        (c, m) -> (
+            s = 0; for _ in 1:m
+                s += P.iamax(c[1])
+            end; s
+        ),
+        (c, m) -> (
+            s = 0; for _ in 1:m
+                s += B.iamax(c[1])
+            end; s
+        ),
+    ),
     # Complex CL1 — call forms copied from plots.jl's cl1 block so the regime matches exactly
     # (PureBLAS.dot is the conjugating one, matching BLAS.dotc).
-    "zaxpy" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
-                (c, m) -> (for _ in 1:m
-                     P.axpy!(c[2], 1.7 + 0.3im, c[1])
-                 end),
-                (c, m) -> (for _ in 1:m
-                     B.axpy!(1.7 + 0.3im, c[1], c[2])
-                 end)),
-    "zscal" => (() -> (randn(ComplexF64, N),),
-                (c, m) -> (for _ in 1:m
-                     P.scal!(1.0000001 + 0im, c[1])
-                 end),
-                (c, m) -> (for _ in 1:m
-                     B.scal!(1.0000001 + 0im, c[1])
-                 end)),
-    "zdotc" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
-                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
-                     s += P.dot(c[1], c[2])
-                 end; real(s)),
-                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
-                     s += B.dotc(c[1], c[2])
-                 end; real(s))),
-    "zdotu" => (() -> (randn(ComplexF64, N), randn(ComplexF64, N)),
-                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
-                     s += P.dotu(c[1], c[2])
-                 end; real(s)),
-                (c, m) -> (s = zero(ComplexF64); for _ in 1:m
-                     s += B.dotu(c[1], c[2])
-                 end; real(s))),
-    "dzasum" => (() -> (randn(ComplexF64, N),),
-                 (c, m) -> (s = 0.0; for _ in 1:m
-                      s += P.asum(c[1])
-                  end; s),
-                 (c, m) -> (s = 0.0; for _ in 1:m
-                      s += B.asum(c[1])
-                  end; s)),
+    "zaxpy" => (
+        () -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.axpy!(c[2], 1.7 + 0.3im, c[1])
+            end
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.axpy!(1.7 + 0.3im, c[1], c[2])
+            end
+        ),
+    ),
+    "zscal" => (
+        () -> (randn(ComplexF64, N),),
+        (c, m) -> (
+            for _ in 1:m
+                P.scal!(1.0000001 + 0im, c[1])
+            end
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.scal!(1.0000001 + 0im, c[1])
+            end
+        ),
+    ),
+    "zdotc" => (
+        () -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+        (c, m) -> (
+            s = zero(ComplexF64); for _ in 1:m
+                s += P.dot(c[1], c[2])
+            end; real(s)
+        ),
+        (c, m) -> (
+            s = zero(ComplexF64); for _ in 1:m
+                s += B.dotc(c[1], c[2])
+            end; real(s)
+        ),
+    ),
+    "zdotu" => (
+        () -> (randn(ComplexF64, N), randn(ComplexF64, N)),
+        (c, m) -> (
+            s = zero(ComplexF64); for _ in 1:m
+                s += P.dotu(c[1], c[2])
+            end; real(s)
+        ),
+        (c, m) -> (
+            s = zero(ComplexF64); for _ in 1:m
+                s += B.dotu(c[1], c[2])
+            end; real(s)
+        ),
+    ),
+    "dzasum" => (
+        () -> (randn(ComplexF64, N),),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += P.asum(c[1])
+            end; s
+        ),
+        (c, m) -> (
+            s = 0.0; for _ in 1:m
+                s += B.asum(c[1])
+            end; s
+        ),
+    ),
 )
 haskey(OPS, OP) || error("cellrep: unknown op $OP (have: $(join(sort(collect(keys(OPS))), ", ")))")
 mk, pbw, refw = OPS[OP]

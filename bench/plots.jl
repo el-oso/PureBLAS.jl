@@ -187,11 +187,13 @@ end
 # same-run and already cancel machine state; the field exists for the ACROSS-run comparison.
 const _RUN_ANCHOR = Ref{Union{Nothing, Float64}}(nothing)
 function _run_anchor()
-    isnothing(_RUN_ANCHOR[]) && (_RUN_ANCHOR[] = try
+    isnothing(_RUN_ANCHOR[]) && (
+        _RUN_ANCHOR[] = try
             _anchor_secs()
         catch
             NaN
-        end)
+        end
+    )
     return _RUN_ANCHOR[]::Float64
 end
 # Progress line only: median ratio of the first available reference against pb this round. Under
@@ -204,7 +206,7 @@ function _round_med(qs::ArmData)
     for a in _REF_ARMS
         haskey(qs, a) && return median(_ratio(qs[a], qs[_ARM_PB]))
     end
-    return median(qs[_ARM_PB]) * 1e6
+    return median(qs[_ARM_PB]) * 1.0e6
 end
 _refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
@@ -273,21 +275,23 @@ end
 # LocalPreferences.toml — so a cache file must carry them to be reproducible from its own header.
 # Add a knob here whenever a new Measure-tier constant starts influencing a benched routine.
 _tunestamp() = try
-    join((
-        "ger_np=$(PureBLAS._ger_np())",
-        "gemvt_perscan=$(PureBLAS._gemvt_perscan_mode())",   # 0=blocked all n · 1=residency window · 2=per-column all n
-        "gemvt_u=$(PureBLAS._gemvt_u())",
-        "cgemvn_nc_big=$(PureBLAS._cgemvn_nc_big())",
-        # The axpy shape knobs were NOT stamped until 2026-08-06, and their absence bit immediately:
-        # the run that proved `axpy_dram`'s duel migration closed three gate cells could not show from
-        # its own artifact WHICH kernel produced it — the value had to be inferred from a separate
-        # acceptance test. A knob that selects a shipped kernel belongs in the provenance line.
-        "axpy_band=$(PureBLAS._axpy_band())",
-        "axpy_dram=$(PureBLAS._axpy_dram())",
-        # trmv's unblocked→fused8 crossover (Derive-tier default, but forceable — the sub-threshold side
-        # was validated against a structure `_trmv_fused8!` replaced, so a sweep is expected here).
-        "trmv_fused_min=$(PureBLAS._trmv_fused_min(Float64))",
-    ), ",")
+    join(
+        (
+            "ger_np=$(PureBLAS._ger_np())",
+            "gemvt_perscan=$(PureBLAS._gemvt_perscan_mode())",   # 0=blocked all n · 1=residency window · 2=per-column all n
+            "gemvt_u=$(PureBLAS._gemvt_u())",
+            "cgemvn_nc_big=$(PureBLAS._cgemvn_nc_big())",
+            # The axpy shape knobs were NOT stamped until 2026-08-06, and their absence bit immediately:
+            # the run that proved `axpy_dram`'s duel migration closed three gate cells could not show from
+            # its own artifact WHICH kernel produced it — the value had to be inferred from a separate
+            # acceptance test. A knob that selects a shipped kernel belongs in the provenance line.
+            "axpy_band=$(PureBLAS._axpy_band())",
+            "axpy_dram=$(PureBLAS._axpy_dram())",
+            # trmv's unblocked→fused8 crossover (Derive-tier default, but forceable — the sub-threshold side
+            # was validated against a structure `_trmv_fused8!` replaced, so a sweep is expected here).
+            "trmv_fused_min=$(PureBLAS._trmv_fused_min(Float64))",
+        ), ","
+    )
 catch e
     "unavailable($(typeof(e)))"
 end
@@ -315,12 +319,14 @@ end
 
 _hwstamp() = try
     hw = PureBLAS._HW
-    join((
-        "simd=$(hw.simd)", "w64=$(PureBLAS._vwidth(Float64))",
-        "l1=$(hw.l1)", "l2=$(hw.l2)", "l3=$(hw.l3)",
-        "vendor=$(hw.vendor)", "family=$(hw.family)", "nvreg=$(hw.nvreg)",
-        "datapath=$(PureBLAS._datapath_bytes(hw))", "dp=$(PureBLAS._double_pumped(hw))",
-    ), ",")
+    join(
+        (
+            "simd=$(hw.simd)", "w64=$(PureBLAS._vwidth(Float64))",
+            "l1=$(hw.l1)", "l2=$(hw.l2)", "l3=$(hw.l3)",
+            "vendor=$(hw.vendor)", "family=$(hw.family)", "nvreg=$(hw.nvreg)",
+            "datapath=$(PureBLAS._datapath_bytes(hw))", "dp=$(PureBLAS._double_pumped(hw))",
+        ), ","
+    )
 catch e
     "unavailable($(typeof(e)))"
 end
@@ -928,10 +934,10 @@ function run_benchmarks()
         # correctness tests but had NEVER been measured. Adding the rows is step 1 of the ALL-LAPACK
         # audit: a routine that is routed and tested still reads as covered while measuring nothing.
         # INDEFINITE, not positive definite. The original maker was (hpd + hpd')/2, which is PD, so
-# every Bunch-Kaufman pivot was 1x1 and the 2x2 branches of BOTH sytrf and sytrs were never
-# measured — the row reported a number for a code path real symmetric-indefinite input does
-# not take. A plain M + M' is the actual workload.
-_symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
+        # every Bunch-Kaufman pivot was 1x1 and the 2x2 branches of BOTH sytrf and sytrs were never
+        # measured — the row reported a number for a code path real symmetric-indefinite input does
+        # not take. A plain M + M' is the actual workload.
+        _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         addh(
             "sytrf", _symm_hpd,
             c -> (LinearAlgebra.LAPACK.sytrf!(LP, c); c[1, 1]),
@@ -1030,9 +1036,15 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
             c -> (PureBLAS.geev!(TN, TN, c); c[1, 1]); sizes = _cap(LPSZ, 1024)
         )
         # Banded LU: kd scales with n (a fixed narrow band makes this O(n) and hides the kernel).
-        _gbd(s) = (kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
-            for j in 1:s, i in 1:(2kl + ku + 1); AB[i, j] = randn(); end;
-            for j in 1:s; AB[kl + ku + 1, j] = 4 * (kl + ku); end; (kl, ku, AB))
+        _gbd(s) = (
+            kl = max(1, s ÷ 8); ku = kl; AB = zeros(Float64, 2kl + ku + 1, s);
+            for j in 1:s, i in 1:(2kl + ku + 1)
+                AB[i, j] = randn()
+            end;
+            for j in 1:s
+                AB[kl + ku + 1, j] = 4 * (kl + ku)
+            end; (kl, ku, AB)
+        )
         addh(
             "gbtrf", _gbd,
             c -> (LinearAlgebra.LAPACK.gbtrf!(c[1], c[2], size(c[3], 2), c[3]); c[3][1]),
@@ -1139,12 +1151,12 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         # (which is what `ref=aocl` re-points, so this row honours the AOCL comparison like every other).
         _pbref!(uplo::Char, n::Int, kd::Int, AB::Matrix{Float64}) =
             (
-                i = Ref{Int64}(0); ccall(
-                    (:dpbtrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
-                    (Ref{UInt8}, Ref{Int64}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Ref{Int64}, Clong),
-                    UInt8(uplo), Int64(n), Int64(kd), AB, Int64(size(AB, 1)), i, 1
-                ); i[]
-            )
+            i = Ref{Int64}(0); ccall(
+                (:dpbtrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                (Ref{UInt8}, Ref{Int64}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Ref{Int64}, Clong),
+                UInt8(uplo), Int64(n), Int64(kd), AB, Int64(size(AB, 1)), i, 1
+            ); i[]
+        )
         # Diagonally dominant ⇒ HPD for any kd, so no size in the sweep can fail to factor.
         function _pbd(kd, uplo)
             AB = zeros(Float64, kd + 1, BANDN)
@@ -1155,7 +1167,7 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
                     AB[uplo == 'L' ? 1 + i : kd + 1 - i, j] = randn() * 0.3
                 end
             end
-            AB
+            return AB
         end
         for uplo in ('L', 'U')
             addh(
@@ -1171,15 +1183,15 @@ _symm_hpd(s) = (M = randn(Float64, s, s); M .+ transpose(M))
         # rewrite. Cost is O(n³/6) but on packed storage, so the cubic reps heuristic applies as-is.
         _ppref!(uplo::Char, n::Int, AP::Vector{Float64}) =
             (
-                i = Ref{Int64}(0); ccall(
-                    (:dpptrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
-                    (Ref{UInt8}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Clong),
-                    UInt8(uplo), Int64(n), AP, i, 1
-                ); i[]
-            )
+            i = Ref{Int64}(0); ccall(
+                (:dpptrf_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                (Ref{UInt8}, Ref{Int64}, Ptr{Float64}, Ref{Int64}, Clong),
+                UInt8(uplo), Int64(n), AP, i, 1
+            ); i[]
+        )
         function _ppd(n, uplo)
             A = _hpd(Float64, n)
-            uplo == 'L' ? [A[i, j] for j in 1:n for i in j:n] : [A[i, j] for j in 1:n for i in 1:j]
+            return uplo == 'L' ? [A[i, j] for j in 1:n for i in j:n] : [A[i, j] for j in 1:n for i in 1:j]
         end
         _ppn(c) = (isqrt(8 * length(c) + 1) - 1) ÷ 2      # recover n from the packed length n(n+1)/2
         for uplo in ('L', 'U')
@@ -1658,7 +1670,7 @@ function _busy_procs()
         end
         d
     end
-    a = snap(); t0 = time(); sleep(0.4); b = snap(); dt = max(time() - t0, 1e-3)
+    a = snap(); t0 = time(); sleep(0.4); b = snap(); dt = max(time() - t0, 1.0e-3)
     me = getpid()
     busy = Tuple{Int, Float64, String}[]
     for (pid, (ppid, c1)) in b
@@ -1775,8 +1787,10 @@ function _active_prefs()
     where = Dict{String, String}()
     for dir in Base.load_path()
         d = dirname(dir)
-        for (f, sect) in ((joinpath(d, "LocalPreferences.toml"), "PureBLAS"),
-                          (joinpath(d, "Project.toml"), "preferences"))
+        for (f, sect) in (
+                (joinpath(d, "LocalPreferences.toml"), "PureBLAS"),
+                (joinpath(d, "Project.toml"), "preferences"),
+            )
             isfile(f) || continue
             try
                 t = TOML.parsefile(f)
@@ -1837,11 +1851,13 @@ function _tuned_pins_ok()
         return (false, "`tuned_for` is STALE: it does not match this machine's detected hardware")
     return (true, "")
 end
-_tuned_stamp() = (t = try
+_tuned_stamp() = (
+    t = try
         Base.get_preferences(_PB_UUID)
     catch
         Dict()
-    end; get(t, "tuned_for", ""))
+    end; get(t, "tuned_for", "")
+)
 
 function save_cache(path, groups)
     # A PIN IS THE SAME CONDITION AS A FORCE VAR, ONLY PERSISTENT — and it is the one that actually did
@@ -1927,7 +1943,7 @@ function save_cache(path, groups)
             # `base=`/`boost=` make `freq=` self-interpreting: freq/base ~ 1.0 is a locked run, and a
             # ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its
             # base clock. See `_lock_state`.
-            "\tanchor=$(round(anc * 1e6; digits = 3))us\tfreq=$(khz)kHz",
+            "\tanchor=$(round(anc * 1.0e6; digits = 3))us\tfreq=$(khz)kHz",
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
@@ -1953,7 +1969,7 @@ function save_cache(path, groups)
             # rather than `limit = 4`. That invariant is the extension mechanism — append before the
             # csv, never after it.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -1997,7 +2013,7 @@ function load_cache(path)
             # bump, and it is why `freq` slots in BEFORE the csv rather than after it.
             p = split(f, "|")
             a, tstamp, cmt, csv = p[1], p[2], p[3], p[end]
-            anc = length(p) >= 5 ? something(tryparse(Float64, p[4]), NaN) * 1e-6 : NaN
+            anc = length(p) >= 5 ? something(tryparse(Float64, p[4]), NaN) * 1.0e-6 : NaN
             khz = length(p) >= 6 ? something(tryparse(Int, p[5]), 0) : 0
             # 8-field records add the in-window clock range (flo,fhi). Older records have no range and
             # read as 0,0 = unknown — NOT as a 0 Hz clock, and not as "steady": a consumer must treat
@@ -2241,13 +2257,15 @@ else
         # `arms=` is for SUBSET re-measures (op=/group=), where merging keeps the references. A full run
         # must either measure everything or be told explicitly that a pb-only cache is what you want.
         if !isnothing(_ARMS_SEL) && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
-            error("""
+            error(
+                """
                 REFUSING to overwrite $CACHE with a partial arm set.
                   full run + arms=$(join(_ACTIVE_ARMS, ",")) would DROP: $(join(setdiff(_REF_ALL, _ACTIVE_ARMS), ", "))
                 A full `bench` REPLACES the cache; only op=/group= merges per arm. Either
                   • add op=<op> or group=<LVL>  (merges, keeps the reference arms), or
                   • drop `arms=` to measure every arm (~3x longer), or
-                  • pass `force-arms` if a pb-only cache really is intended.""")
+                  • pass `force-arms` if a pb-only cache really is intended."""
+            )
         end
         g = measured
     end
@@ -2277,8 +2295,10 @@ else
         # sit inline as a per-box bullet list at the top of both tables; it now lives in ONE generated
         # file (below) that both views share, so it cannot be half-refreshed either.
         open(joinpath(tdir, "gen_table$(suf)$L.md"), "w") do io   # drift-proof numeric table: median (worst-cell) per op/µarch
-            println(io, "PB / $ref speed ratio, median (worst cell) per op per µarch. ",
-                "Provenance: [`bench/provenance.md`](provenance.md).")
+            println(
+                io, "PB / $ref speed ratio, median (worst cell) per op per µarch. ",
+                "Provenance: [`bench/provenance.md`](provenance.md)."
+            )
             println(io, "\n### Real\n\n", gen_table(fleet, ["L1", "L2", "L3", "LP"], rb))
             println(io, "\n### Complex\n\n", gen_table(fleet, ["CL1", "CL2", "CL3", "CLP"], rb))
         end
@@ -2288,9 +2308,11 @@ else
     # is written once, outside the view loop — two copies could disagree, one cannot).
     open(joinpath(tdir, "provenance$L.md"), "w") do io
         println(io, "# Benchmark provenance\n")
-        println(io, "The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ",
+        println(
+            io, "The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ",
             "generated tables in `docs/src/coverage.md`. Both reference views (OpenBLAS, AOCL) are ",
-            "rendered from this one cache set. Methodology: `docs/src/methodology.md`.\n")
+            "rendered from this one cache set. Methodology: `docs/src/methodology.md`.\n"
+        )
         # Host name deliberately not published — µarch + CPU model identify the box for a reader, and
         # the cache header keeps `host=` for local fleet tooling.
         println(io, "| µarch | CPU | commit | measured |")
@@ -2348,11 +2370,15 @@ for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in 
     # A verdict resting on a cell whose two arms saw different machine state is not a verdict. Say so
     # ON the line that carries it, not in a footnote about some other cell.
     flag = gate_adj ? "" :
-        @sprintf("  [BINDING CELL n=%d NOT ADJUDICABLE: anchors differ >%.0f%% — re-measure `op=%s` in ONE run]",
-                 gate_sz, 100 * _ADJ_TOL, nm)
+        @sprintf(
+            "  [BINDING CELL n=%d NOT ADJUDICABLE: anchors differ >%.0f%% — re-measure `op=%s` in ONE run]",
+            gate_sz, 100 * _ADJ_TOL, nm
+        )
     note = (nnadj > 0 && gate_adj) ? @sprintf("  (%d non-adjudicable cell(s), not binding)", nnadj) : ""
-    @printf("%-3s %-8s %s   gate=%.3f %s%s%s\n", lvl, nm, txt, gate,
-            gate_pass(gate) ? "PASS" : "FAIL", flag, note)
+    @printf(
+        "%-3s %-8s %s   gate=%.3f %s%s%s\n", lvl, nm, txt, gate,
+        gate_pass(gate) ? "PASS" : "FAIL", flag, note
+    )
 end
 isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the cache/plots): $(join(_MISSING, ", "))"
 
