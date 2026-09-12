@@ -4021,31 +4021,42 @@ end
     return incx == 1 && T <: BlasComplex && eltype(x) === T &&
         _strided1(A) && _dense1(x)
 end
+# Dual-pair twin (docs/src/dual_l2.md §2.4-2.5): the same drivers, generic over the pair type.
+@inline function _l2vp_ok(A, x, incx::Integer)
+    T = eltype(A)
+    return incx == 1 && _pairT(T) && eltype(x) === T &&
+        _strided1(A) && _dense1(x)
+end
 
 # Barrier: resolve the runtime conj flag to a compile-time Val so _dot_cmplx_simd (@generated on Val{CJ})
 # doesn't dynamic-dispatch. Both branches return Complex{T} → type-stable.
 @inline _dot_cmplx_disp(L::Int, ap, xp, ::Type{T}, cj::Bool) where {T <: BlasReal} =
     cj ? _dot_cmplx_simd(L, ap, xp, T, Val(true)) : _dot_cmplx_simd(L, ap, xp, T, Val(false))
+# The pair-type dispatch the triangular drivers use: complex as above; dual wraps the bare (value, partial)
+# and ignores `cj` (conj is the identity on a Real).
+@inline _pair_dot_disp(::Type{Complex{T}}, L::Int, ap, xp, cj::Bool) where {T <: BlasReal} = _dot_cmplx_disp(L, ap, xp, T, cj)
+@inline _pair_dot_disp(::Type{P}, L::Int, ap, xp, cj::Bool) where {P} =
+    _mkpair(P, _dot_pair_simd(Val(:dual), L, ap, xp, _pairvT(P), Val(false))...)
 
 # Complex trmv (x := op(A)·x, A triangular, in place). N forms are per-column complex axpys into x; T/C
 # forms are per-column complex dots — reusing the gating L1 kernels (like ger/gemv-T). Diagonal scalar.
 function _trmv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) where {}
-    T = real(eltype(A)); csz = sizeof(Complex{T})
+    P = eltype(A); csz = sizeof(P)                          # pair type: Complex{T} or Dual{Tag,T,1} (dual_l2.md §2.4)
     GC.@preserve A x begin
-        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(_ptr(x)); ldc = stride(A, 2)
+        Ap = Ptr{P}(pointer(A)); xp = Ptr{P}(_ptr(x)); ldc = stride(A, 2)
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
         if !tr                                               # x := A·x, column axpy
             if up
                 @inbounds for j in 1:n
                     xj = unsafe_load(xp, j)
-                    j > 1 && _axpy_cmplx_simd!(j - 1, real(xj), imag(xj), colp(1, j), xp)
+                    j > 1 && _axpy_pair_simd!(_palg(P), j - 1, _parts(xj)..., colp(1, j), xp)
                     unit || unsafe_store!(xp, xj * unsafe_load(Ap, (j - 1) * ldc + j), j)
                 end
             else
                 @inbounds for j in n:-1:1
                     xj = unsafe_load(xp, j)
-                    j < n && _axpy_cmplx_simd!(n - j, real(xj), imag(xj), colp(j + 1, j), xp + j * csz)
+                    j < n && _axpy_pair_simd!(_palg(P), n - j, _parts(xj)..., colp(j + 1, j), xp + j * csz)
                     unit || unsafe_store!(xp, xj * unsafe_load(Ap, (j - 1) * ldc + j), j)
                 end
             end
@@ -4053,13 +4064,13 @@ function _trmv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
             if up
                 @inbounds for j in n:-1:1
                     s = unit ? unsafe_load(xp, j) : unsafe_load(xp, j) * djj(j)
-                    j > 1 && (s += _dot_cmplx_disp(j - 1, colp(1, j), xp, T, cj))
+                    j > 1 && (s += _pair_dot_disp(P, j - 1, colp(1, j), xp, cj))
                     unsafe_store!(xp, s, j)
                 end
             else
                 @inbounds for j in 1:n
                     s = unit ? unsafe_load(xp, j) : unsafe_load(xp, j) * djj(j)
-                    j < n && (s += _dot_cmplx_disp(n - j, colp(j + 1, j), xp + j * csz, T, cj))
+                    j < n && (s += _pair_dot_disp(P, n - j, colp(j + 1, j), xp + j * csz, cj))
                     unsafe_store!(xp, s, j)
                 end
             end
@@ -4080,54 +4091,64 @@ const _TRSV_RCP32 = Vector{ComplexF32}(undef, 512)
 @inline _trsv_rcpbuf(::Type{Float64}) = _TRSV_RCP64
 @inline _trsv_rcpbuf(::Type{Float32}) = _TRSV_RCP32
 @inline _crecip(d::Complex) = (r = real(d); i = imag(d); s = inv(muladd(r, r, i * i)); Complex(r * s, -i * s))
+# The DUAL diagonal reciprocal shares the complex buffer as raw pair storage (dual_l2.md §4.1): 1/(c + dε) =
+# 1/c − (d/c²)ε is stored as the two reals (r, −d·r²) in a Complex slot and read back with `_mkpair` — no complex
+# arithmetic ever touches it. `_rcp_mul` is `x * rcp` for complex (unchanged) and the pair product for dual.
+@inline _pair_rcp(::Type{Complex{T}}, d) where {T} = _crecip(d)
+@inline function _pair_rcp(::Type{P}, d) where {P}
+    v, p = _parts(d); r = inv(v)
+    return Complex(r, -p * r * r)
+end
+@inline _rcp_mul(::Type{Complex{T}}, x, z) where {T} = x * z
+@inline _rcp_mul(::Type{P}, x, z) where {P} = x * _mkpair(P, real(z), imag(z))
 
 # Complex trsv (solve op(A)·x = x in place). N forms = column substitution (axpy of −xⱼ into the rest);
 # T/C forms = dot-based row substitution. Diagonal reciprocals precomputed off the critical path.
 function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) where {}
-    T = real(eltype(A)); csz = sizeof(Complex{T})
-    userc = !unit && n <= 512                                # precompute reciprocals off the crit path
+    P = eltype(A); T = _pairvT(P); csz = sizeof(P)          # pair type: Complex{T} or Dual{Tag,T,1} (dual_l2.md §4.1)
+    userc = !unit && n <= 512                                # precompute reciprocals off the crit path (both algebras)
     GC.@preserve A x begin
-        Ap = Ptr{Complex{T}}(pointer(A)); xp = Ptr{Complex{T}}(_ptr(x)); ldc = stride(A, 2)
+        Ap = Ptr{P}(pointer(A)); xp = Ptr{P}(_ptr(x)); ldc = stride(A, 2)
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
         rcp = _trsv_rcpbuf(T)
         if userc                                             # r[j] = 1/diag (naive, pipelined)
             if !tr
                 @inbounds for j in 1:n
-                    rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * ldc + j))
+                    rcp[j] = _pair_rcp(P, unsafe_load(Ap, (j - 1) * ldc + j))
                 end
             else
                 @inbounds for j in 1:n
-                    rcp[j] = _crecip(djj(j))
+                    rcp[j] = _pair_rcp(P, djj(j))
                 end
             end
         end
         if !tr                                               # op = A: column-oriented substitution
             if up                                            # back-substitution (j descending)
                 @inbounds for j in n:-1:1
-                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
+                    unit || unsafe_store!(xp, userc ? _rcp_mul(P, unsafe_load(xp, j), rcp[j]) : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
                     xj = unsafe_load(xp, j)
-                    j > 1 && _axpy_cmplx_simd!(j - 1, real(-xj), imag(-xj), colp(1, j), xp)
+                    j > 1 && _axpy_pair_simd!(_palg(P), j - 1, _parts(-xj)..., colp(1, j), xp)
                 end
             else                                             # forward-substitution (j ascending)
                 @inbounds for j in 1:n
-                    unit || unsafe_store!(xp, userc ? unsafe_load(xp, j) * rcp[j] : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
+                    unit || unsafe_store!(xp, userc ? _rcp_mul(P, unsafe_load(xp, j), rcp[j]) : unsafe_load(xp, j) / unsafe_load(Ap, (j - 1) * ldc + j), j)
                     xj = unsafe_load(xp, j)
-                    j < n && _axpy_cmplx_simd!(n - j, real(-xj), imag(-xj), colp(j + 1, j), xp + j * csz)
+                    j < n && _axpy_pair_simd!(_palg(P), n - j, _parts(-xj)..., colp(j + 1, j), xp + j * csz)
                 end
             end
         else                                                 # op = Aᵀ: dot-based row substitution
             if up                                            # forward (j ascending)
                 @inbounds for j in 1:n
                     s = unsafe_load(xp, j)
-                    j > 1 && (s -= _dot_cmplx_disp(j - 1, colp(1, j), xp, T, cj))
-                    unsafe_store!(xp, unit ? s : (userc ? s * rcp[j] : s / djj(j)), j)
+                    j > 1 && (s -= _pair_dot_disp(P, j - 1, colp(1, j), xp, cj))
+                    unsafe_store!(xp, unit ? s : (userc ? _rcp_mul(P, s, rcp[j]) : s / djj(j)), j)
                 end
             else                                             # backward (j descending)
                 @inbounds for j in n:-1:1
                     s = unsafe_load(xp, j)
-                    j < n && (s -= _dot_cmplx_disp(n - j, colp(j + 1, j), xp + j * csz, T, cj))
-                    unsafe_store!(xp, unit ? s : (userc ? s * rcp[j] : s / djj(j)), j)
+                    j < n && (s -= _pair_dot_disp(P, n - j, colp(j + 1, j), xp + j * csz, cj))
+                    unsafe_store!(xp, unit ? s : (userc ? _rcp_mul(P, s, rcp[j]) : s / djj(j)), j)
                 end
             end
         end
@@ -4237,6 +4258,7 @@ function _trmv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
         return _trmv_blk!(up, tr, unit, Int(n), A, x)
     end
     _l2vc_ok(A, x, incx) && return _trmv_cmplx_blk!(up, tr, cj, unit, Int(n), A, x)
+    _l2vp_ok(A, x, incx) && return _trmv_cmplx_blk!(up, tr, false, unit, Int(n), A, x)   # dual: 'C' == 'T'
     n = Int(n); sx = _start(n, incx)
     el = (i, j) -> cj ? conj(A[i, j]) : A[i, j]
     if !tr                                       # x := A·x
@@ -4285,6 +4307,7 @@ function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
         return _trsv_blk!(up, tr, unit, Int(n), A, x)
     end
     _l2vc_ok(A, x, incx) && return _trsv_cmplx_blk!(up, tr, cj, unit, Int(n), A, x)
+    _l2vp_ok(A, x, incx) && return _trsv_cmplx_blk!(up, tr, false, unit, Int(n), A, x)   # dual: 'C' == 'T'
     n = Int(n); sx = _start(n, incx)
     el = (i, j) -> cj ? conj(A[i, j]) : A[i, j]
     if !tr                                       # solve A·x = b

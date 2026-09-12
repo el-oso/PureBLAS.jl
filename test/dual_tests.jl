@@ -399,3 +399,96 @@ end
         @test true
     end
 end
+
+# ── BLAS-2 (docs/src/dual_l2.md): the complex kernels, tagged with the dual multiply rule ─────────────
+@testitem "Dual L2: gemv N/T/C, ger, trmv, trsv match the plane formulas at awkward shapes (both real types)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    for V in (Float64, Float32), (m, n) in ((1, 1), (3, 2), (5, 7), (8, 8), (9, 4), (15, 17), (16, 16), (17, 33), (31, 65), (64, 100), (129, 129), (200, 3), (3, 200), (300, 300), (1000, 1003))
+        tol = 32 * sqrt(eps(V)) * max(m, n)
+        ≃(P, Rv, Rp) = isapprox(value.(P), Rv; rtol = tol, atol = tol) && isapprox(partials.(P, 1), Rp; rtol = tol, atol = tol)
+        A = DualT.mkd(randn(V, m, n), randn(V, m, n)); Av = value.(A); Ap = partials.(A, 1)
+        x = DualT.mkd(randn(V, n), randn(V, n)); xv = value.(x); xp = partials.(x, 1)
+        y = DualT.mkd(randn(V, m), randn(V, m)); yv = value.(y); yp = partials.(y, 1)
+        α = Dual{Nothing}(V(1.7), V(0.3)); β = Dual{Nothing}(V(0.9), V(-0.2)); av, ap = V(1.7), V(0.3); bv, bp = V(0.9), V(-0.2)
+        # gemv N: y := α·A·x + β·y, every ε² product absent
+        P1 = Av * xv; P2 = Av * xp + Ap * xv
+        r = PureBLAS.gemv!(copy(y), A, x; alpha = α, beta = β)
+        @test ≃(r, av .* P1 .+ bv .* yv, av .* P2 .+ ap .* P1 .+ bv .* yp .+ bp .* yv)
+        r0 = PureBLAS.gemv!(copy(y), A, x; alpha = α, beta = Dual{Nothing}(V(0), V(0.5)))   # β with zero value: y IS read
+        @test ≃(r0, av .* P1, av .* P2 .+ ap .* P1 .+ V(0.5) .* yv)
+        # gemv T and C (identical on a Dual)
+        Q1 = transpose(Av) * yv; Q2 = transpose(Av) * yp + transpose(Ap) * yv
+        rT = PureBLAS.gemv!(copy(x), A, y; alpha = α, beta = β, trans = 'T')
+        @test ≃(rT, av .* Q1 .+ bv .* xv, av .* Q2 .+ ap .* Q1 .+ bv .* xp .+ bp .* xv)
+        @test PureBLAS.gemv!(copy(x), A, y; alpha = α, beta = β, trans = 'C') == rT
+        # ger (and gerc == geru): A += α·y·xᵀ
+        G1 = yv * transpose(xv); G2 = yv * transpose(xp) + yp * transpose(xv)
+        rG = PureBLAS.ger!(α, y, x, copy(A))
+        @test ≃(rG, Av .+ av .* G1, Ap .+ av .* G2 .+ ap .* G1)
+        @test PureBLAS.ger!(α, y, x, copy(A); conj = true) == rG
+        if m == n
+            Tri = DualT.mkd(randn(V, n, n) ./ V(2n), randn(V, n, n)); for i in 1:n
+                Tri[i, i] = Dual{Nothing}(V(2), V(0.1))
+            end
+            for up in (true, false), tr in ('N', 'T', 'C'), dg in ('N', 'U')
+                U = up ? 'U' : 'L'
+                Tm = up ? triu(Tri) : tril(Tri); dg == 'U' && (Tm = Tm - Diagonal(Tm) + I)
+                op = tr == 'N' ? Tm : transpose(Tm)
+                v = PureBLAS.trmv!(Tri, copy(x); uplo = U, trans = tr, diag = dg)
+                @test ≃(v, value.(op) * xv, value.(op) * xp + partials.(op, 1) * xv)
+                s = PureBLAS.trsv!(Tri, copy(x); uplo = U, trans = tr, diag = dg)
+                back = op * s                                              # op·s must reproduce x (generic Dual arithmetic)
+                @test ≃(back, xv, xp)
+            end
+        end
+    end
+end
+
+@testitem "Dual L2: ε²-leak and infinite-partial hygiene on gemv/ger; ForwardDiff derivatives through the entries" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    n = 200
+    # partials ~1e155: any a_p·x_p / x_p·y_p product overflows — none may form
+    A = DualT.mkd(randn(n, n), 1.0e155 .* randn(n, n)); x = DualT.mkd(randn(n), 1.0e155 .* randn(n)); y = DualT.mkd(randn(n), randn(n))
+    for r in (PureBLAS.gemv!(copy(y), A, x), PureBLAS.gemv!(copy(y), A, x; trans = 'T'), vec(PureBLAS.ger!(1.0, y, x, copy(A))))
+        @test all(isfinite, value.(r))
+    end
+    @test value.(PureBLAS.gemv!(copy(y), A, x)) ≈ value.(A) * value.(x)
+    # an INFINITE partial must never poison a value lane (gemvN's odd-lane select never multiplies by 0)
+    xi = DualT.mkd(randn(n), randn(n)); xi[7] = Dual{Nothing}(1.0, Inf)
+    Ai = DualT.mkd(randn(n, n), randn(n, n)); Ai[5, 9] = Dual{Nothing}(1.0, Inf)
+    for r in (PureBLAS.gemv!(copy(y), Ai, xi), PureBLAS.gemv!(copy(y), Ai, xi; trans = 'T'), vec(PureBLAS.ger!(1.0, y, xi, copy(Ai))))
+        @test all(isfinite, value.(r))
+    end
+    # d/dt through the entries against the closed form
+    A0 = randn(30, 20); dA = randn(30, 20); x0 = randn(20); dx = randn(20); y0 = randn(30)
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(y0 .+ zero(t), A0 .+ t .* dA, x0 .+ t .* dx), 0.3) ≈ dA * x0 + A0 * dx
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(x0 .+ zero(t), A0 .+ t .* dA, y0 .+ zero(t); trans = 'T'), 0.3) ≈ transpose(dA) * y0
+    @test ForwardDiff.derivative(t -> vec(PureBLAS.ger!(one(t), y0 .+ zero(t), x0 .+ t .* dx, A0 .+ zero(t))), 0.3) ≈ vec(y0 * transpose(dx))
+    L = randn(20, 20) ./ 40 + 2I; dL = randn(20, 20) ./ 40
+    @test ForwardDiff.derivative(t -> PureBLAS.trsv!(L .+ t .* dL, x0 .+ zero(t); uplo = 'L'), 0.0) ≈ -tril(L) \ (tril(dL) * (tril(L) \ x0))
+end
+
+@testitem "StrictMode dogfood: BLAS-2 dual strict contract" tags = [:checks] begin
+    using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
+    using ForwardDiff: Dual
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping dual L2 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        bk = PureBLAS.DEFAULT_BACKEND
+        n = 300
+        Ad = Dual{Nothing}.(randn(n, n), randn(n, n)); xd = Dual{Nothing}.(randn(n), randn(n)); yd = Dual{Nothing}.(randn(n), randn(n))
+        ad = Dual{Nothing}(1.7, 0.3)
+        @test_noalloc PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad)
+        @test_noalloc PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad, trans = 'T')
+        @test_noalloc PureBLAS.ger!(bk, ad, xd, yd, Ad)
+        @test_noalloc PureBLAS.trmv!(bk, Ad, xd; uplo = 'U')
+        @test_noalloc PureBLAS.trsv!(bk, Ad, xd; uplo = 'U')
+        @test_typestable PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.ger!(bk, ad, xd, yd, Ad)
+        @test_typestable PureBLAS.trsv!(bk, Ad, xd; uplo = 'U')
+        @test true
+    end
+end
