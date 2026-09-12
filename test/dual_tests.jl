@@ -252,3 +252,71 @@ end
         @test true
     end
 end
+
+@testmodule DualNative begin
+    # Opcode histogram of the MAIN SIMD loop of a kernel (kb: loop-body-opcode-histogram): the epilogue of a
+    # tagged body is per-algebra by design (dot drops the ε² lane, the scalar tails differ), so what must
+    # match between the complex and dual instantiations is the unrolled vector loop — the backward-jump span
+    # holding the most FMAs. Shuffle-class mnemonics are folded into one bucket: swap-adjacent lowers to
+    # `vpermilpd`/`vshufpd`, duplicate-even to `vmovddup`/`vunpcklpd` — same port class, different immediate.
+    using InteractiveUtils
+    const SHUF = r"^v?(permil|shuf|movddup|movsldup|movshdup|unpck|pshuf|pshufd)"
+    function native_labelled(f, types)
+        io = IOBuffer(); code_native(io, f, types; debuginfo = :none, syntax = :intel)
+        lines = String[]
+        for l in eachline(IOBuffer(String(take!(io))))
+            s = strip(replace(l, r"[#;].*$" => ""))
+            isempty(s) && continue
+            if endswith(s, ":")
+                push!(lines, "LABEL " * chop(s))
+            elseif !startswith(s, ".")
+                push!(lines, replace(s, r"\s+" => " "))
+            end
+        end
+        return lines
+    end
+    isfma(x) = startswith(x, "vfmadd") || startswith(x, "vfmsub")
+    function mainloop(lines)
+        best = String[]; bestfma = -1
+        for (ji, l) in enumerate(lines)
+            m = match(r"^j[a-z]+ (\S+)$", l); isnothing(m) && continue
+            li = findfirst(==("LABEL " * m.captures[1]), lines)
+            (isnothing(li) || li > ji) && continue
+            span = filter(x -> !startswith(x, "LABEL"), lines[li:ji])
+            nf = count(isfma, span)
+            (nf > bestfma || (nf == bestfma && length(span) > length(best))) && (best = span; bestfma = nf)
+        end
+        return best
+    end
+    function hist(lines)
+        h = Dict{String, Int}()
+        for l in lines
+            op = first(split(l)); occursin(SHUF, op) && (op = "SHUF")
+            h[op] = get(h, op, 0) + 1
+        end
+        return h
+    end
+    loop(f, types) = mainloop(native_labelled(f, types))
+end
+
+@testitem "Dual: tagged bodies — complex and dual instantiations share the SIMD loop (opcode histogram)" setup = [DualT, DualNative] begin
+    using PureBLAS, ForwardDiff
+    using ForwardDiff: Dual
+    C = Val{:cplx}; D = Val{:dual}
+    for T in (Float64, Float32)
+        CV = Vector{Complex{T}}; DV = Vector{Dual{Nothing, T, 1}}
+        specs = [
+            "dotu" => (PureBLAS._dot_pair_simd, (Int, CV, CV, Type{T}, Val{false}), (Int, DV, DV, Type{T}, Val{false})),
+            "dotc" => (PureBLAS._dot_pair_simd, (Int, CV, CV, Type{T}, Val{true}), (Int, DV, DV, Type{T}, Val{true})),
+        ]
+        for (nm, (f, tc, td)) in specs
+            lc = DualNative.loop(f, (C, tc...)); ld = DualNative.loop(f, (D, td...))
+            @test count(DualNative.isfma, lc) >= 2                       # positive control: a real unrolled FMA loop was found
+            @test length(lc) == length(ld)
+            @test DualNative.hist(lc) == DualNative.hist(ld)
+        end
+        # negative control: the histogram is not blind — dotu's loop is not dotc's whole-function code
+        @test DualNative.hist(DualNative.loop(PureBLAS._dot_pair_simd, (C, Int, CV, CV, Type{T}, Val{false}))) !=
+            DualNative.hist(DualNative.native_labelled(PureBLAS._dot_pair_simd, (C, Int, CV, CV, Type{T}, Val{false})))
+    end
+end
