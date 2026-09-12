@@ -29,6 +29,31 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
 @inline _cplx2(::_CplxArg{T}, ::_CplxArg{T}) where {T <: BlasReal} = true      # both complex, same real T
 @inline _cplx2(@nospecialize(_), @nospecialize(_)) = false
 
+# ── PAIR ALGEBRAS: dual numbers ride the complex layout ─────────────────────────────────────────────
+# `ForwardDiff.Dual{Tag,V,1}` is byte-identical to `Complex{V}` — `value` then one partial, 16 B for
+# Float64 — so a dense unit-stride Dual vector IS a contiguous 2n-real buffer exactly as a complex one is.
+# Where NO element×element product occurs (copy, swap, axpy/scal by a REAL alpha) the real kernel over 2n
+# reals serves both algebras unchanged; the reductions get their own `dupEven` kernels below. Where a
+# product DOES occur the two algebras differ (complex `ac − bd`, dual `ac`), which is why a Dual vector
+# must never be reinterpreted as Complex and handed to a complex arithmetic kernel. Design and the trap:
+# docs/src/dual.md.
+#
+# The five accessors below are the ENTIRE surface the ForwardDiff extension (ext/PureBLASForwardDiffExt.jl)
+# implements — one method each, no kernels there. In the main env (no ForwardDiff) every `_pairalg` is
+# `false`, so the dual branches const-fold away and the --trim build never sees them.
+#   _pairalg(x)         true iff `x` is a dense unit-stride Dual{Tag,V<:BlasReal,1} vector (or Ptr)
+#   _pairreal(x)        Ptr{V} onto the interleaved [v p v p …] buffer (Complex too: `_reptr`)
+#   _parts(d)           (value, partial) of one pair element
+#   _mkpair(D, v, p)    build a `D` (the vector's own eltype, so its Tag) from value + partial
+#   _l1v(d)             |value| — iamax's magnitude, see core.jl
+@inline _pairalg(@nospecialize(_)) = false
+function _pairreal end
+function _parts end
+function _mkpair end
+@inline _pairreal(x::_CplxArg) = _reptr(x)
+# Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
+@inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)
+
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)
 

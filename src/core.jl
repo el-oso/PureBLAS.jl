@@ -216,6 +216,13 @@ end
 # |·| used by asum/iamax: BLAS uses |Re|+|Im| for complex (NOT the modulus), abs for real.
 @inline _l1(x::Real) = abs(x)
 @inline _l1(z::Complex) = abs(real(z)) + abs(imag(z))
+# iamax's magnitude: |·| of the VALUE only. Identical to `_l1` for every plain number; the ForwardDiff
+# extension overrides it for `Dual` so that `iamax` is the argmax of |value|, first occurrence — real-BLAS
+# semantics. `abs(::Dual)` is a Dual and ForwardDiff's `isless` is lexicographic (value, then partials),
+# so comparing `_l1` on duals would break value ties on the DERIVATIVE, i.e. on the seed direction; and
+# `iamax` is getrf's pivot selector, so that would make the LU pivot sequence seed-dependent. Decision
+# recorded in docs/src/dual.md. The scalar loop here and the SIMD kernel must agree, hence one accessor.
+@inline _l1v(x) = _l1(x)
 
 # One step of the LAPACK `lassq` scaled sum-of-squares (overflow/underflow safe) — the
 # correctness boundary for nrm2. Returns the updated (scale, ssq).
@@ -286,4 +293,3 @@ end
     throw(ArgumentError(lazy"_gbtrf_blocked!: needs nb ≤ kl (got nb=$nb, kl=$kl)"))
 @noinline _throw_packed_len(L::Int) =
     throw(DimensionMismatch(lazy"packed length $L is not n(n+1)/2"))
-
