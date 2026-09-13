@@ -77,6 +77,26 @@ end
             end
         end
         return C
+    elseif _pairT(T) && len > 1 && _strided1(C) && _dense1(v)
+        # Dual pairs (ForwardDiff extension loaded): the SAME dot+axpy shape on the pair-tagged BLAS-1
+        # kernels (docs/src/dual.md), which read the interleaved (value, partial) buffer directly. This
+        # panel was the scalar 38-45 % of a blocked dual geqrf (dual_lp.md §7) and, at n ≤ 32 where the
+        # whole QR is one unblocked panel, the reason dual geqrf sat at 0.8× LinearAlgebra's generic
+        # qrfactUnblocked! (same algorithm, so a scalar tie was the best this loop could do). `_pairT` is a
+        # compile-time `false` in the main env, so nothing here reaches a BlasReal instantiation.
+        sz = sizeof(T); R = _pairvT(T)
+        GC.@preserve C v begin
+            pc = pointer(C); pv = pointer(v); ld = stride(C, 2)
+            @inbounds for j in 1:nc
+                cp = pc + (j - 1) * ld * sz
+                c1 = unsafe_load(cp, 1)
+                w = τ * (c1 + _mkpair(T, _dot_pair_simd(Val(:dual), len - 1, cp + sz, pv + sz, R, Val(false))...))
+                unsafe_store!(cp, c1 - w, 1)
+                wv, wp = _parts(w)
+                _axpy_pair_simd!(Val(:dual), len - 1, -wv, -wp, pv + sz, cp + sz)
+            end
+        end
+        return C
     end
     @inbounds for j in 1:nc
         w = C[1, j]
