@@ -146,6 +146,33 @@ Both modes share ONE set of low-level kernels. Source map:
    LOSES on Zen3. That is a mechanism, not a lookup table. A predicate used without that argument is
    still a violation.
 
+9. **"IT WORKS" IS NOT A RESULT — MEASURE IT, OR IT IS NOT DONE. (HARD RULE.)** This project's entire
+   mandate is a PERFORMANCE gate (`PB ≥ max(OpenBLAS, AOCL)`, req#1). Correctness is table stakes, not
+   the deliverable. So **any change that alters which code runs** — a new dispatch path, a missing
+   method or workspace added, a type generalisation, a routing or predicate fix, a fallback — is
+   UNFINISHED until its ratio is measured and stated. Not "it dispatches now", not "tests pass", not
+   "derivatives match to 1e-12": **a number, against the reference that applies to it**, and ideally
+   across the size ladder, because the SHAPE of the curve is the diagnosis (a ratio that FALLS with n
+   means the routine is not amortising — see `geqrf` below).
+
+   **The rule exists because it was violated, and the violation shipped.** 2026-09-13: `_syev!` was a
+   `MethodError` on `ForwardDiff.Dual` because `_trdws` had no generic fallback. I added the fallback,
+   verified eigenvalues to 1.7e-13 and derivatives to 1.7e-12 against `ForwardDiff.derivative`, checked
+   seed-independence, and reported the gap CLOSED. I never timed it. It was measured only because a
+   DLP bench group happened to land days later, and it reads
+
+       dsyev1   n=32 1.95 → n=50 1.59 → n=100 1.12 → n=128 0.99 → n=256 0.66
+
+   — degrading monotonically on all three boxes, i.e. slower than LinearAlgebra's GENERIC fallback at
+   n≥128 and getting worse. The same session had already diagnosed exactly that curve shape for dual
+   `geqrf` (0.57/0.49/0.45, "does NOT reach a blocked path") and fixed it. Making a routine RUN and
+   calling that done is how a routine that runs 1.5× slower than the thing it replaces gets published
+   as a closed gap.
+
+   **The test, before you call anything done:** *can I state the ratio?* If not, it is not done — say
+   so explicitly ("dispatches and is correct; SPEED UNMEASURED") rather than implying completion. A
+   capability with no number attached is a liability, because it looks finished to the next reader.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
