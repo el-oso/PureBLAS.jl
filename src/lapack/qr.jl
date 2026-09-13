@@ -3,8 +3,9 @@
 # compact-WY (LAPACK dlarft/dlarfb) loop whose trailing update is PureBLAS's gated `gemm!` — so faer's
 # bespoke packed BLIS gemm is unneeded (we have one). faer convention: H_k = I − v_k v_kᵀ/τ_k, τ_k=Inf ⇒
 # identity; on output the upper triangle of A is R, the essential v_k (implicit v_k[k]=1) sit below the
-# diagonal of column k, τ[k] the coefficient. Float64-only (the proven-fast path); reuses the Cholesky
-# SIMD helpers (_CVF/_CHOLW/_clidx/_cvptr from lapack.jl). ponytail: generic/AD QR deferred.
+# diagonal of column k, τ[k] the coefficient. The blocked driver is generic over `T<:Real`; the SIMD panel
+# (Cholesky helpers _CVF/_CHOLW/_clidx/_cvptr from lapack.jl) is Float64, every other real gets the dgeqr2
+# panel and rides the same blocked trailing update (a Dual through the planar dual L3 route).
 
 # Compute the Householder reflector of column `col` in place (faer convention: H=I−τ·v·vᵀ, v[col]=1
 # implicit + essential below, R diagonal = β on output). Returns tinv (=τ), or Inf for a trivial reflector.
@@ -277,10 +278,15 @@ end
 # The complex-path root cause it identified is still sound — it is simply already fixed by the cap.
 # What remains genuinely unconfirmed is only the SMALL-n end on Zen5 (whether the 8→16 ramp beats a flat
 # 32 there, as it does on Zen4), NOT the large-n growth the branch measured.
-@inline _qr_nb(m::Int, n::Int) = (
+#
+# The ramp is an L2-RESIDENCY criterion in BYTES, so the element width enters as `sizeof(T)` (req#8): a
+# `Dual{Tag,Float64,1}` is 16 B and spills L2 at half the m·n a Float64 does. The two-arg form is the
+# Float64 ramp every other blocked driver (getrf/sytrd/gehrd/geqp3/band) keys on; unchanged.
+@inline _qr_nb(::Type{T}, m::Int, n::Int) where {T} = (
     fl = 256 ÷ _NVREG;
-    clamp(fl * cld(m * n * sizeof(Float64), _L2_BYTES), fl, 32)
+    clamp(fl * cld(m * n * sizeof(T), _L2_BYTES), fl, 32)
 )
+@inline _qr_nb(m::Int, n::Int) = _qr_nb(Float64, m, n)
 # Unblocked→blocked crossover (real): the SIMD rank-2 unblocked panel beats the blocked WY path only while
 # the matrix is TINY (measured n≤32 on Zen4) — blocked-nb is efficient enough to win from n≈48 up. Pinned
 # at 32 = the old flat _QR_NB, PRESERVING master's n≤32 unblocked crossover on every µarch (decoupled from
@@ -431,8 +437,19 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}(
     end
     return V, Tm, G, Wb, Vt
 end
+@inline _qr_ws(::Type{Float64}, m::Int, n::Int, nb::Int) = _qr_ws(m, n, nb)
+# Any other real T (Float32, Dual, BigFloat, …): a per-call workspace. ponytail: no owned pool per element
+# type — the GKH pool is one Ref per CONCRETE type and this signature is open; the alloc is O(m·nb + nb·n)
+# against the O(m·n·k) factorization, and the n=32–64 regime where a fresh alloc dominated Float64 is below
+# `_QR_UNBLK_MAX` (unblocked, no workspace) anyway. Vt exists only for the BlasReal skinny path.
+@inline function _qr_ws(::Type{T}, m::Int, n::Int, nb::Int) where {T}
+    return (
+        Matrix{T}(undef, m, nb), Matrix{T}(undef, nb, nb), Matrix{T}(undef, nb, nb), Matrix{T}(undef, nb, n),
+        T <: BlasReal ? Matrix{T}(undef, nb, m) : Matrix{T}(undef, 0, 0),
+    )
+end
 # GENERIC UNBLOCKED QR (LAPACK dgeqr2) for any `T <: Real` that is not Float64 — req#3, so a
-# ForwardDiff.Dual matrix can reach QR at all. The Float64 `qr_unblocked!` below is a pointer/SIMD
+# ForwardDiff.Dual matrix can reach QR at all. The Float64 `qr_unblocked!` above is a pointer/SIMD
 # kernel with no generic path, so this is a separate implementation rather than a widened signature —
 # but it is assembly, not invention: both primitives it needs are ALREADY generic over `T<:Real`.
 #   * `_larfg!` (svd.jl) returns `(β, τ)`, leaves `x[1]` at α and writes the essential `v` into `x[2:]`.
@@ -440,8 +457,9 @@ end
 #     so the column view is passed whole and `x[1]`'s actual value is ignored. Its own comment records
 #     that its scalar arm exists for "non-BlasReal T (Dual/AD, req: the scalar path stays
 #     differentiable)" — this is the caller that makes that arm reachable for QR.
-# No blocking: the WY/`_qr_ws` machinery is Float64-specific, and blocking is a performance
-# optimisation, not a correctness one. Float64 is a more specific method and keeps every fast path.
+# This is the PANEL of the blocked driver below (generic over `T<:Real` since 2026-09-13 — before that
+# every non-Float64 real ran this unblocked for the whole matrix, and a Dual geqrf was 0.45× generic at
+# n=256 while every other dual factorization amortised a BLAS-3 trailing update; docs/src/dual_lp.md §3).
 # ⚠ THIS FILE'S `tau` IS THE **faer** CONVENTION, NOT LAPACK'S. The Float64 path stores τ_f such that
 #   H = I − v·vᵀ / τ_f      with  τ_f = Inf  meaning "identity, column already zero"
 # whereas `_larfg!` (svd.jl, shared with gebrd/geqlf) returns LAPACK's τ_L with
@@ -464,20 +482,11 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <:
     return A
 end
 
+# ONE blocked driver for every `T<:Real` (req#3). Float64 gets the SIMD rank-2 panel + the owned workspace +
+# the unpacked skinny W; any other real gets the generic panel above and a per-call workspace, and its
+# trailing update goes through `syrk!`/`trmm!`/`gemm!` — which on a `Dual` are the planar real-kernel
+# compositions of dual_l3.md, so a dual QR rides the same BLAS-3 amortisation as potrf/getrf.
 function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T <: Real}
-    m, n = size(A); k = min(m, n)
-    k == 0 && return A
-    length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
-    qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
-    return A
-end
-function geqrf!(A::AbstractMatrix{T}) where {T <: Real}
-    tau = Vector{T}(undef, min(size(A)...))
-    geqrf!(A, tau)
-    return A, tau
-end
-
-function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::Int = 0)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
@@ -486,8 +495,8 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
         qr_unblocked!(view(A, 1:m, 1:n), view(tau, 1:k))
         return A
     end
-    nb = clamp(nb > 0 ? nb : _qr_nb(m, n), 1, k)    # nb>0 = caller override (tuning); else derive
-    V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
+    nb = clamp(nb > 0 ? nb : _qr_nb(T, m, n), 1, k)  # nb>0 = caller override (tuning); else derive
+    V, Tm, G, Wb, Vt = _qr_ws(T, m, n, nb)
     pc = 1
     @inbounds while pc <= k
         pb = min(nb, k - pc + 1)
@@ -502,15 +511,17 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
             #    (Zen3: unpacked +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536).
             #  • AVX-512 (W=8): the packed transA skinny gemm COLLAPSES at large mp (neuro/wm: packed 16-28 vs
             #    unpacked ~30-42 GF for mp≥512), so unpacked wins for all non-tiny mp. Gate: mp>_GEMM_UNPACK_MAX.
-            useskinny = _CHOLW == 4 ? (16 * pb * mp <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX)
+            #  The L2 gate is in BYTES: Vᵀ ≤ ½L2 ⇔ 2·pb·mp·sizeof(T) ≤ L2 (= 16·pb·mp for Float64). Only a
+            #  BlasReal has the unpacked kernel; every other T takes `gemm!` (on a Dual: the planar route).
+            useskinny = T <: BlasReal && (_CHOLW == 4 ? (2 * pb * mp * sizeof(T) <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX))
             if useskinny
                 for c in 1:pb, i in 1:mp                           # V and its transpose Vᵀ from A in ONE pass
-                    val = i == c ? 1.0 : (i > c ? A[pc + i - 1, pc + c - 1] : 0.0)
+                    val = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
                     Vv[i, c] = val; Vtv[c, i] = val
                 end
             else
                 for c in 1:pb, i in 1:mp
-                    Vv[i, c] = i == c ? 1.0 : (i > c ? A[pc + i - 1, pc + c - 1] : 0.0)
+                    Vv[i, c] = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
                 end
             end
             Gv = view(G, 1:pb, 1:pb)
@@ -518,10 +529,10 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
             # reads Gv[kk,c], kk<c; half the flops)
             Tv = view(Tm, 1:pb, 1:pb)                                       # compact-WY T (dlarft), λ=1/τ
             for c in 1:pb
-                tc = tau[pc + c - 1]; λ = isfinite(tc) ? 1.0 / tc : 0.0
+                tc = tau[pc + c - 1]; λ = isfinite(tc) ? one(T) / tc : zero(T)
                 Tv[c, c] = λ
                 for r in 1:(c - 1)
-                    s = 0.0
+                    s = zero(T)
                     for kk in r:(c - 1)
                         s = muladd(Tv[r, kk], Gv[kk, c], s)
                     end
@@ -531,8 +542,8 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
             C = view(A, pc:m, jt0:n)
             Wv = view(Wb, 1:pb, 1:nt)                                     # W = Vᵀ·C: skinny m=pb. When Vᵀ is
             if useskinny                                                  # L2-resident, the UNPACKED no-trans path
-                _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, 1.0, Vtv, C, 0.0, Wv)  # (Vᵀ prebuilt, streams C
-            else                                                          # in place) beats the packed transA gemm
+                _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, one(T), Vtv, C, zero(T), Wv)  # (Vᵀ prebuilt, streams
+            else                                                          # C in place) beats the packed transA gemm
                 gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)   # +8-17%; else packed kc-blocked wins.
             end
             trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'T')            # W := Tᵀ W (was a scalar latency-bound
@@ -545,8 +556,8 @@ function geqrf!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64}; nb::In
 end
 
 # Convenience: allocate tau, return (A overwritten with R + reflectors, tau).
-function geqrf!(A::StridedMatrix{Float64})
-    tau = Vector{Float64}(undef, min(size(A)...))
+function geqrf!(A::AbstractMatrix{T}) where {T <: Real}
+    tau = Vector{T}(undef, min(size(A)...))
     geqrf!(A, tau)
     return A, tau
 end
