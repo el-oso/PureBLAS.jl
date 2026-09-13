@@ -51,6 +51,16 @@ function _pairreal end
 function _parts end
 function _mkpair end
 @inline _pairreal(x::_CplxArg) = _reptr(x)
+# TYPE-level twins for the L2/L3 routing (docs/src/dual_l2.md §3, dual_l3.md §2.1): a strided VIEW of a
+# `Matrix{Dual}` is not a `DenseArray`, so the value predicate above misses it while `_strided1` accepts the
+# complex equivalent. The extension adds the Dual methods; here `Complex` gets the same accessors so a driver
+# generalised over the pair type reads `_parts(α)` / `_mkpair(P, v, p)` for BOTH algebras.
+#   _pairT(P)           true iff `P` is Dual{Tag,V<:BlasReal,1}
+#   _pairvT(P)          the real type V under a pair type
+@inline _pairT(@nospecialize(_)) = false
+@inline _pairvT(::Type{Complex{T}}) where {T} = T
+@inline _parts(z::Complex) = (real(z), imag(z))
+@inline _mkpair(::Type{Complex{T}}, v, p) where {T} = Complex{T}(v, p)
 @inline _pairv(x) = eltype(_pairreal(x))     # the real type V under a pair vector (static; the pointer is dead)
 # Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
 @inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)
@@ -65,6 +75,16 @@ function _mkpair end
 _pair_shuf(ALG, N) = Expr(:tuple, (ALG === :cplx ? (isodd(l) ? l - 1 : l + 1) : 2 * (l ÷ 2) for l in 0:(N - 1))...)
 _pair_sgn(ALG, N, V, ::Type{T}) where {T} =
     :($V($(Expr(:tuple, (iseven(l) ? (ALG === :cplx ? :(-ali) : zero(T)) : :ali for l in 0:(N - 1))...))))
+# THE ODD-LANE SELECT (gemv-N, docs/src/dual_l2.md §2.1): the cross-lane term of an accumulator `q = Σ a·c`
+# must land on the odd lane. :cplx has the sign pre-folded into `c` and swaps; :dual takes q's EVEN lanes onto
+# the odd lanes and ZERO onto the even lanes through a two-source shuffle — one shuffle-class op either way, and
+# no lane is multiplied by 0, so an Inf in q's discarded odd lane (`Σ a_p·c_p`, the ε² term) cannot poison the
+# value. `N` is the lane count of `V`; out lane l ← l (zero source) for even l, `N + l − 1` (q's lane l−1) for odd.
+_pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
+    :(shufflevector($q, Val($(Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...))))) :
+    :(shufflevector(zero($V), $q, Val($(Expr(:tuple, (iseven(l) ? l : N + l - 1 for l in 0:(N - 1))...)))))
+# The tag of a pair TYPE, for drivers generic over `P` (the extension adds the Dual method).
+@inline _palg(::Type{Complex{T}}) where {T} = Val(:cplx)
 
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)
@@ -680,10 +700,11 @@ by its own rules.
 Same decision as the callee's non-resident branch, so nothing new is tuned here; and phase vs wide is
 a pure scheduling difference on an elementwise update, so results stay bit-identical.
 """
-@inline function _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}
+@inline _axpy_cmplx_cold!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_cold!(Val(:cplx), n, alr, ali, x, y)
+@inline function _axpy_pair_cold!(alg::Val, n::Int, alr::T, ali::T, x, y) where {T <: BlasReal}   # the dual ger takes it too
     return _zaxpy_narrow() ?
-        _axpy_cmplx_phase!(Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
-        _axpy_cmplx_wide!(n, alr, ali, x, y)
+        _axpy_pair_phase!(alg, Val(_zaxpy_narrow_lanes(T)), _ZAXPY_PHASE_UV, n, alr, ali, x, y) :
+        _axpy_pair_wide!(alg, n, alr, ali, x, y)
 end
 
 @inline _axpy_cmplx_wide!(n::Int, alr::T, ali::T, x, y) where {T <: BlasReal} = _axpy_pair_wide!(Val(:cplx), n, alr, ali, x, y)
