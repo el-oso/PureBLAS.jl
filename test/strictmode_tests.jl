@@ -223,23 +223,23 @@ end
         W = P._vwidth(Float64); mr = P._MR * W; nr = P._NR; kc = 64
         Ap = randn(mr * kc); Bp = randn(nr * kc); C = zeros(mr, nr)
         GC.@preserve Ap Bp C begin
-            ap = pointer(Ap); bp = pointer(Bp); cp = pointer(C); ldc = mr
+            ap = pointer(Ap); bp = pointer(Bp); cptr = pointer(C); ldc = mr
             # register-blocked microkernel: the hot path — must be tight
-            @assert_typestable P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_noalloc P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_trim_compatible P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
             # StrictMode 0.3.9 @assert_no_spill: the µarch-derived _MR×_NR tile must fit the register file
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
-            @assert_no_spill P._microkernel!(cp, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_noalloc P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
-            @assert_typestable P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
-            @test_trim_compatible P._microkernel_masked!(cp, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @test_noalloc P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @assert_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @test_trim_compatible P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             # clip kernel: W-aligned partial row-tile (reads _MR-strided panel, computes 1 live vector)
-            @assert_typestable P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
-            @test_noalloc P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
-            @test_trim_compatible P._microkernel_clip!(cp, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @assert_typestable P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @test_noalloc P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @test_trim_compatible P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
         end
         # unpacked microkernel (small-matrix path): A is mr×k, B is k×nr, column-major
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
