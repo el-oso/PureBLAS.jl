@@ -62,8 +62,21 @@ esac
 # reference": the rule protects reference arms from pointless churn, not from a state mismatch that has
 # already invalidated them. Verify with `bench/check_arm_anchors.sh` after either mode.
 MODE="${1:-pb}"
+# SWEEP_ARMS overrides the arms string for this invocation. Its one intended use is the DUAL groups
+# (DL1/DL2/DL3/DLP), whose reference is not a vendor BLAS but LinearAlgebra's generic fallback, recorded
+# as the arm `generic`. Those ratios are only trustworthy when `generic` is measured in the SAME RUN as
+# the pb arm — that is the whole reason the dual groups do not divide by a cached reference — so they
+# need `arms=pb,generic` while the real and complex groups correctly stay `arms=pb` and reuse the cached
+# OpenBLAS/AOCL arms. One refresh cannot express both, hence two passes:
+#
+#   SWEEP_GROUPS="L1 L2 L3 LP CL1 CL2 CL3 CLP"  bench/fleet_refresh.sh
+#   SWEEP_GROUPS="DL1 DL2 DL3 DLP" SWEEP_ARMS="arms=pb,generic" bench/fleet_refresh.sh
+#
+# This does NOT open a hole for re-measuring vendor arms: `arms=pb` must still appear in the string (the
+# PreToolUse guard keys on it), and dropping it to measure openblas/aocl needs the user's explicit
+# per-run authorisation exactly as before.
 case "$MODE" in
-    pb)   ARMSARG="arms=pb" ;;
+    pb)   ARMSARG="${SWEEP_ARMS:-arms=pb}" ;;
     full) ARMSARG="" ;;
     *)    echo "usage: $0 [pb|full]   (pb = reuse cached reference arms; full = re-measure all arms)"; exit 2 ;;
 esac
@@ -96,7 +109,7 @@ FAILED=""
 _lock_mhz() { bash bench/fleet_freqlock.sh verify 2>&1 | grep -oE 'achieved under load = [0-9]+' | grep -oE '[0-9]+$'; }
 LOCK0=$(_lock_mhz)
 [ -n "$LOCK0" ] || { echo "=== ABORT: cannot read the achieved frequency — refusing to measure ==="; exit 2; }
-for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1}; do
+for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
     now=$(_lock_mhz)
     # 3% of the opening figure, the same tolerance check_arm_clocks.sh uses between arms of one cell.
     if [ -z "$now" ] || [ "$(( (now - LOCK0) * 100 / LOCK0 ))" -gt 3 ] || [ "$(( (LOCK0 - now) * 100 / LOCK0 ))" -gt 3 ]; then

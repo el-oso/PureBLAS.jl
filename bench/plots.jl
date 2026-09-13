@@ -1489,9 +1489,27 @@ function run_cmplx_benchmarks()
         dgen(s) = (A = dm(s, s); for i in 1:s
                 A[i, i] += s
             end; A)
-        DLPSZ = (32, 50, 100, 128, 256, 512)
+        # SIZES AND WINDOW BUDGET, both measured rather than copied from LP.
+        #
+        # LPSZ runs to 4096. DLP cannot: its REFERENCE is LinearAlgebra's generic factorization on a
+        # 16-byte non-BlasFloat (`eigvals`/`qr`/`lu` with no BLAS underneath), so the reference arm is
+        # itself O(n^3) with a large constant. Measured on wintermute: the whole group at n=128 took
+        # **14.5 minutes**, which extrapolates to hours at 256 and many hours at 512 — DLP alone would
+        # have dominated a full-fleet refresh that otherwise costs about an hour a box.
+        #
+        # Capped at 256, and the cap costs nothing worth having: the triage ratios are already monotone
+        # well before it (potri 8.42 -> 21.03, trtri 9.79 -> 20.84 over n=64 -> 256), so a 512 cell would
+        # buy a number nobody acts on at several hours a box.
+        #
+        # The window budget is cut because the measurement is stable, not to save precision: at n=128
+        # `dsyev1` read 19934/20029/20038/20030/20044/20062/20045/20040 us across 8 rounds — a 0.6%
+        # spread. Chairmarks was spending 4-second windows and 24 samples resolving something that is
+        # already flat to well under 1%, i.e. the cost was WINDOW-bound, not precision-bound. 10 samples
+        # in 1.5 s keeps far more resolution than the gate needs (`gate_pass` rounds to two significant
+        # digits) at a fraction of the wall clock.
+        DLPSZ = (32, 50, 100, 128, 256)
         addp(nm, mk, ob, pb) = _meas!(dlp, "DLP", nm,
-            () -> sweep_heavy(mk, ob, pb, _sizes(DLPSZ); samples = 24, refs = ["generic"]))
+            () -> sweep_heavy(mk, ob, pb, _sizes(DLPSZ); samples = 10, seconds = 1.5, refs = ["generic"]))
 
         addp("dpotrf1", dspd,
             c -> (cholesky(Symmetric(c, :L)); c[1, 1].value),
