@@ -1,6 +1,6 @@
 # Dual numbers: BLAS-3 design (Phase 1 — for sparring, nothing implemented)
 
-Status: **design only, 2026-09-12.** Companion to `dual.md` and `dual_l2.md`. Citations are into `a0f0a703`.
+Status: **implemented on branch `dual-l2l3` (2026-09-13); the design as sparred, then "Implementation notes" at the end.** Companion to `dual.md` and `dual_l2.md`. Citations are into `a0f0a703`.
 
 ## 0. Triage: what the generic scalar path achieves today
 

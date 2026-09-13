@@ -1,6 +1,6 @@
 # Dual numbers: BLAS-2 design (Phase 1 — for sparring, nothing implemented)
 
-Status: **design only, 2026-09-12.** Companion to `dual.md` (BLAS-1, shipped) and `dual_l3.md`. Every claim
+Status: **implemented on branch `dual-l2l3` (2026-09-13); the design as sparred, then "Implementation notes" at the end with what was measured.** Companion to `dual.md` (BLAS-1, shipped) and `dual_l3.md`. Every claim
 below is either a citation into the current tree (`a0f0a703`) or a number from the triage probe; where it is a
 prediction it says so.
 
