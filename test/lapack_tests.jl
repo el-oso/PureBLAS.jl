@@ -1777,8 +1777,10 @@ end
         end
         return R
     end
+    # (96,64)/(64,96)/(70,50) exceed _QR_UNBLK_MAX: the BLOCKED compact-WY driver, generic over T since
+    # 2026-09-13 (a partial last panel, a wide trailing block, and no trailing block on the last panel).
     @testset "$T" for (T, tol) in ((Float64, 1.0e-11), (Float32, 1.0e-4), (Float16, 0.1), (BigFloat, 1.0e-60))
-        @testset "$(m)x$(n)" for (m, n) in ((1, 1), (8, 8), (16, 8), (8, 16), (33, 20))
+        @testset "$(m)x$(n)" for (m, n) in ((1, 1), (8, 8), (16, 8), (8, 16), (33, 20), (96, 64), (64, 96), (70, 50))
             A0 = T.(randn(m, n))
             F = copy(A0); tau = zeros(T, min(m, n))
             PureBLAS.geqrf!(F, tau)
