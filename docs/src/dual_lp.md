@@ -24,8 +24,28 @@ value alone has lost the derivative, which is the entire point.
 | `trtri` | OK | 1.7e-18 | 1.1e-18 |
 | `potri` | OK | 1.4e-17 | 5.2e-18 |
 | `sytrf` | runs | no generic oracle compared |
-| `_syev!` | **MethodError** | does not accept `Dual` |
+| `pstrf` | OK | — (see the correction below) |
+| `gesvd` (values) | OK | returns `Vector{Dual}` |
+| `_syev!` | OK **since `18fc0e20`+** | eigenvalues 1.7e-13, **derivatives 1.7e-12** vs `ForwardDiff.derivative` |
 | `gesvd` (vectors) | **ArgumentError** | gated to Float64/complex by design (`svd.jl:1656`) |
+| `geqp3` | **MethodError** | genuinely gated: both methods are `where {T <: BlasFloat}` |
+
+### Correction (2026-09-13) — three of the four "gaps" were the PROBE, not the code
+
+An earlier revision of this page listed `_syev!`, `pstrf` and `geqp3` as `MethodError`s. Two of those
+were my triage probe calling the wrong signature, and I published them as missing capability:
+
+* **`pstrf!`** is `(A, piv, tol::Real; uplo)` and is declared `where {T}` — **no type restriction at
+  all**. The probe omitted `tol`. It has worked on duals the whole time.
+* **`_syev!`** is `(jobz::Char, uplo::Char, A)`, not `(A; uplo)`. The probe passed a keyword and one
+  positional. A `MethodError` was the correct answer to a wrong call.
+* **`geqp3!`** is the only real gate, and it is a type gate: `where {T <: BlasFloat}` on both methods.
+
+The lesson is that a `MethodError` says "no method for THESE arguments", not "this routine cannot do
+this" — and the difference is one `methods()` call away. Three probe bugs in one triage is a bad rate;
+read the signature before reporting a capability gap.
+
+`_syev!` did turn out to have a real, shallow defect underneath the bad call — see §8.
 
 `getrf`'s partial at 2.2e-16 is the one to notice: **pivoting already selects on |value|**, because
 `_l1v` (`core.jl`) exists precisely so `iamax` does not break value ties on the derivative. Had it
@@ -98,11 +118,11 @@ Float64 path — can `S` be obtained without materialising `Q`, or does the skew
 | gap | kind | note |
 |---|---|---|
 | `geqrf` blocked path for `T<:Real` | perf | **DONE** (§7): 0.57/0.49/0.45 → 1.67/2.56/2.75 at n=64/128/256 |
-| `_syev!` on `Dual` | dispatch | MethodError; symmetric eigen is `_syev!`, not `syev!` |
-| `pstrf` on `Dual` | dispatch | MethodError — and it is rank-terminating, see §6 |
-| `geqp3` on `Dual` | dispatch | MethodError — and it pivots on column norms, see §6 |
+| `_syev!` on `Dual` | dispatch | **DONE** (§8): the gap was `_trdws`, not the driver |
+| `pstrf` on `Dual` | — | **NOT A GAP** — my probe omitted `tol`; it always worked (§1 correction) |
+| `geqp3` on `Dual` | dispatch | **the one genuine gate**: both methods are `where {T <: BlasFloat}` |
 | `gesvd` singular **vectors** | feature | needs generic `orgbr` + vector-carrying `bdsqr`; **values already work** |
-| stopping-rule audit | **correctness** | clean for everything that currently dispatches; see below |
+| stopping-rule audit | **correctness** | clean for everything that dispatches, `pstrf` and `_syev!` included; see below |
 
 ## 6. The audit nothing else catches
 
@@ -120,15 +140,26 @@ Result — **clean for everything that currently dispatches**:
 |---|---|
 | `potrf` `getrf` `geqrf` `trtri` `potri` `sytrf` | seed-independent |
 | `getrf` **pivot sequence** (`ipiv`) | bit-identical across seeds |
-| `pstrf`, `geqp3` | could not be tested — MethodError on `Dual` |
+| **`pstrf`** — rank, pivots AND values | bit-identical across seeds (`dual_seed_pstrf.jl`) |
+| **`gesvd`** singular values | bit-identical across seeds |
+| **`_syev!`** eigenvalues | bit-identical across seeds (`syev_dual_verify.jl`) |
+| `geqp3` | still untestable — the one genuine `MethodError` |
 
-So the two routines whose branches would matter MOST are exactly the two that do not accept duals
-yet. That makes this audit a **gate on their implementation, not a clearance of it**: `pstrf`
-terminates on a rank criterion and `geqp3` pivots on column norms, and either can change the SHAPE of
-the answer (chosen rank, column order) rather than merely its ordering. Whoever implements them runs
-this probe as part of the work, and `gesvd`/`_syev!` iteration counts need the same treatment —
-extend the probe with an iteration-count witness, since a convergence test that exits one step early
-for one seed is invisible in the output alone.
+An earlier revision said `pstrf` "could not be tested" and framed this audit as a gate on future work.
+That was wrong, and wrong in the risky direction: `pstrf` terminates on a **rank criterion** and had
+been dispatching on duals all along, so a seed-dependent rank would have been a LIVE correctness bug
+in shipped code, not a hypothetical one. Tested now — rank 48 vs 48, pivots and values identical
+under two unrelated seed directions.
+
+`_syev!` matters for a second reason: it is the first **iterative** routine to reach dual dispatch.
+Everything else audited here is a direct factorization with at most a pivot comparison, whereas an
+eigensolver runs to a convergence test — and `<` on a `Dual` is lexicographic on (value, partial), so
+it could converge at a different iteration count per seed, giving eigenvalues correct to tolerance but
+*different* between seeds. It does not; the value plane is bit-identical.
+
+Still owed: `geqp3` when it accepts duals (it pivots on column norms, so it can change the column
+ORDER), and an iteration-count witness rather than an output comparison — a convergence test that
+exits one step early for one seed is invisible in the output when both results are within tolerance.
 
 ## 7. Result: (a) shipped, (b) measured and declined (2026-09-13, branch `geqrf-real-blocked`)
 
@@ -192,3 +223,51 @@ Dual — is 45 % of (a) at n=256 and the trailing update is already planar. A pa
 BLAS-1 dot/axpy kernels of `dual.md` behind `_house_left!`, which today gates its SIMD arm on
 `T <: BlasReal`) is the honest follow-on, worth up to ~1.8× on top of the 2.75 if the panel went to
 zero. Not done here.
+
+## 8. `_syev!`: the gap was the WORKSPACE, not the driver (2026-09-13)
+
+Once called correctly, `_syev!` still failed — but not on its own signature:
+
+    MethodError: no method matching _trdws(::Type{ForwardDiff.Dual{Nothing, Float64, 1}})
+
+`_sytrd_lower!` and `_syev!` are both `where {T <: Real}` and generic throughout. What was not generic
+was the scratch: `_trdws` had exactly four methods, one per `BlasFloat`, each returning a const owned
+pool (`_TRDWS_F64` …) — the GKH ownership pattern. An open type set cannot have a const pool, so a
+`Dual` found no method at all.
+
+**This is the same defect `_qr_ws` had**, fixed the same way: a generic
+`_trdws(::Type{T}) = _TRDWork{T, real(T)}()` allocating per call. The four consts still win by
+specificity, so every `BlasFloat` path is untouched; only types that have no pool pay an allocation,
+against an O(n³) reduction.
+
+That two independent routines had the identical hole suggests the class is worth sweeping rather than
+discovering one `MethodError` at a time: **every const-per-type owned workspace is a candidate**.
+
+Verified after the fix (n=32, `Dual{Nothing,Float64,1}`), and note the second line is the one that
+matters — a factorization can be right on the value and have silently lost the derivative:
+
+| | |
+|---|---|
+| eigenvalues vs `eigvals` | 1.7e-13 |
+| **derivatives vs `ForwardDiff.derivative`** | **1.7e-12** (against a derivative magnitude of 2.14, so not vacuous) |
+| seed-independent | yes — and `_syev!` is the first ITERATIVE routine to reach dual dispatch, so its convergence test was the real risk |
+
+### `_sytrd_nb` was mis-sizing the panel, silently
+
+`_sytrd_nb(n) = _qr_nb(n, n)` used the Float64 two-arg form, so a 16-byte `Dual` was blocked as if it
+were 8 — a req#8 violation that produces no error, just a wrong panel width. Now
+`_sytrd_nb(::Type{T}, n) = _qr_nb(T, n, n)`, with the 2-arg form kept for existing callers.
+
+**The complex `_hetrd!` call site is deliberately NOT typed.** Doing so would halve its panel
+(`sizeof(ComplexF64)` = 16 vs 8) and change shipped behaviour — `zheev`/`zheevN` publish at
+1.176/1.072 against the current blocking. The residency criterion arguably wants `sizeof(T)` there
+too, but that is a measured change needing a CLP sweep, not a free one taken as a side effect of a
+dual-number fix. Tracked here rather than silently applied.
+
+## 9. What is actually left
+
+| gap | kind |
+|---|---|
+| `geqp3` on `Dual` | the one genuine type gate (`where {T <: BlasFloat}`) |
+| `gesvd` singular **vectors** | deliberate; needs generic `orgbr` + vector-carrying `bdsqr`. Values work |
+| `geqrf` scalar panel | perf, not correctness: the generic panel is 38%/45% of dual `geqrf` at n=128/256 while the trailing update is already planar. Route `_house_left!`'s dot/axpy through the pair-tagged BLAS-1 kernels |
