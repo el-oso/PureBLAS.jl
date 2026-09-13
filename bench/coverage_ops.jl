@@ -98,7 +98,7 @@ end
 # op => (level, types) — types are what the bench row actually exercises, not what the routine supports.
 const LEVEL = Dict{String, String}()
 lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in ("L3", "CL3") ? "BLAS-3" :
-    l == "DL1" ? "Dual BLAS-1" : "LAPACK"
+    l == "DL1" ? "Dual BLAS-1" : l == "DL2" ? "Dual BLAS-2" : l == "DL3" ? "Dual BLAS-3" : "LAPACK"
 
 # WHICH ARMS THE RATIO IS TAKEN AGAINST, PER GROUP. Every group but DL1 divides by max(OpenBLAS, AOCL),
 # which is the gate. DL1 cannot: `ForwardDiff.Dual` is not a `BlasFloat`, so LinearAlgebra never reaches
@@ -111,7 +111,7 @@ lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in 
 # It is also why DL1 gets its OWN section rather than extra rows under BLAS-1: a Dual ratio is measured
 # against a different, much weaker bar, and putting it in the same table as the vendor-BLAS rows would
 # read as a gate verdict it is not.
-_refarms(l) = l == "DL1" ? ("generic",) : ("openblas", "aocl")
+_refarms(l) = startswith(l, "DL") ? ("generic",) : ("openblas", "aocl")
 
 # ONE COLUMN PER MICROARCHITECTURE. A single pooled verdict answers "does this routine gate SOMEWHERE",
 # which is the wrong question — the gate is per box. Pooling also makes progress invisible in exactly the
@@ -252,7 +252,7 @@ html.dark .pbg-key{color:#98a1b3}
 ```
 """)
 
-for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1")
+for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1", "Dual BLAS-2", "Dual BLAS-3")
     # Ops are drawn from EXCLUDED as well as `cells`: a routine whose every cell was off-lock must still
     # get a row, saying so. Dropping the row would render an unmeasurable routine as "not benchmarked".
     ops = sort(unique(k[2] for k in Iterators.flatten((keys(cells), keys(EXCLUDED))) if k[1] == section))
@@ -263,7 +263,7 @@ for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1")
     # generic fallback, which is a far weaker denominator, so the SAME colour means something much
     # smaller. Unlabelled, the two tables read as one verdict scale — and this section would be the
     # greenest page on the site while measuring the least.
-    section == "Dual BLAS-1" && println(
+    startswith(section, "Dual") && println(
         "Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Float64,1}` — ",
         "what a forward-mode AD user gets today without PureBLAS. `Dual` is not a `BlasFloat`, so no ",
         "vendor BLAS is reachable and there is no OpenBLAS/AOCL arm: these ratios are **not** gate ",
