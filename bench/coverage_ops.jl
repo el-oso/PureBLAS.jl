@@ -98,7 +98,8 @@ end
 # op => (level, types) — types are what the bench row actually exercises, not what the routine supports.
 const LEVEL = Dict{String, String}()
 lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in ("L3", "CL3") ? "BLAS-3" :
-    l == "DL1" ? "Dual BLAS-1" : l == "DL2" ? "Dual BLAS-2" : l == "DL3" ? "Dual BLAS-3" : "LAPACK"
+    l == "DL1" ? "Dual BLAS-1" : l == "DL2" ? "Dual BLAS-2" : l == "DL3" ? "Dual BLAS-3" :
+    l == "DLP" ? "Dual LAPACK" : "LAPACK"
 
 # WHICH ARMS THE RATIO IS TAKEN AGAINST, PER GROUP. Every group but DL1 divides by max(OpenBLAS, AOCL),
 # which is the gate. DL1 cannot: `ForwardDiff.Dual` is not a `BlasFloat`, so LinearAlgebra never reaches
@@ -252,7 +253,7 @@ html.dark .pbg-key{color:#98a1b3}
 ```
 """)
 
-for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1", "Dual BLAS-2", "Dual BLAS-3")
+for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1", "Dual BLAS-2", "Dual BLAS-3", "Dual LAPACK")
     # Ops are drawn from EXCLUDED as well as `cells`: a routine whose every cell was off-lock must still
     # get a row, saying so. Dropping the row would render an unmeasurable routine as "not benchmarked".
     ops = sort(unique(k[2] for k in Iterators.flatten((keys(cells), keys(EXCLUDED))) if k[1] == section))

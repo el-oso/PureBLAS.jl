@@ -39,6 +39,25 @@ include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate
 const QN = 48
 med(v) = sort(v)[max(1, cld(length(v), 2))]
 
+# IMPLEMENTED AND ROUTED, BUT NOT GATEABLE — no reference arm exists to divide by.
+#
+# `pbtrs!` and `pptrs!` ship in PureBLAS (`banded_chol.jl:605`, `packed_chol.jl:401`) and route, so the
+# Routines column and its ✅ are both truthful. What does not exist is a REFERENCE: LinearAlgebra.LAPACK
+# exposes no `pbtrs!`/`pptrs!` wrapper (checked: `isdefined` is false for both), and the harness reaches
+# OpenBLAS/AOCL only through those wrappers. Their benchmarked siblings `potrs` and `gbtrs` exist
+# precisely because LinearAlgebra DOES wrap those.
+#
+# Before this list they were reported as `PARTIAL: missing pbtrs, pptrs` on every publish — a warning
+# `publish.sh` says not to ignore, which had become a permanent one nobody could action. Worse, the row
+# still published a verdict (banded Cholesky 0.917) computed from `pbtrf` ALONE while naming two
+# routines, i.e. it overstated what had been measured.
+#
+# Listing them here makes the distinction explicit rather than silencing it: they are excluded from
+# `miss` and reported separately, so a genuinely unmapped routine is still loud. Gating them needs a
+# direct `ccall` to the LBT-forwarded `dpbtrs_`/`dpptrs_` symbols — real work, not a table edit. Delete
+# an entry the moment a reference becomes reachable and the check re-arms itself.
+const NO_REFERENCE = Set(["pbtrs", "pptrs"])
+
 # routine token in the docs  =>  cache row name(s). Only the ones that are not identity.
 const ALIAS = Dict(
     "potrf uplo='U'" => ["potrfU"], "potrf `uplo='U'`" => ["potrfU"], "potrf" => ["potrf"],
@@ -176,7 +195,7 @@ function main()
     println("geo/worst reference: ", first(boxes[refi]), "   column order: ", join(first.(boxes), " | "))
 
     doc = collect(eachline("docs/src/coverage.md"))
-    unmatched = String[]; changed = 0
+    unmatched = String[]; nogate = String[]; changed = 0
     for (i, ln) in enumerate(doc)
         startswith(ln, "| ") || continue
         # Trigger on ANY verdict form the Gated column has ever held — the retired glyphs, the escaped
@@ -194,10 +213,13 @@ function main()
         wide = length(parts) >= 8 + nb
         rts = routines_of(String(parts[3]))
         gs = Float64[]; obs = Float64[]; aos = Float64[]
+        noref = String[]
         miss = String[]
         for r in rts
             if haskey(gates, r)
                 append!(gs, last.(gates[r])); append!(obs, get(ob, r, Float64[])); append!(aos, get(ao, r, Float64[]))
+            elseif r in NO_REFERENCE
+                push!(noref, r)          # implemented + routed, but nothing to divide by — see NO_REFERENCE
             else
                 push!(miss, r)
             end
@@ -207,6 +229,12 @@ function main()
             continue
         end
         isempty(miss) || push!(unmatched, "line $i PARTIAL: missing " * join(miss, ", "))
+        # Reported, not silenced — but as a KNOWN category, so it cannot be mistaken for a mapping bug
+        # and cannot hide one either. The row's verdict is computed from its gateable routines only, and
+        # this line says which ones were left out and why.
+        isempty(noref) || push!(nogate, "line $i: " * join(noref, ", ") *
+            " — implemented and routed, but LinearAlgebra exposes no reference wrapper, so the row's " *
+            "verdict covers its OTHER routines only")
         w = minimum(gs)
         # ⚠ MARKDOWN-SAFE, NOT INLINE HTML. A `<span>` inside a markdown table cell is ESCAPED by the
         # Vitepress pipeline and publishes as literal `&lt;span class=&quot;pbg&quot;…` text — I shipped
@@ -235,6 +263,10 @@ function main()
     if !isempty(unmatched)
         println("\n⚠ ROWS NOT FULLY MAPPED — fix ALIAS or the Routines column, do not ignore:")
         foreach(x -> println("   ", x), unmatched)
+    end
+    if !isempty(nogate)
+        println("\nℹ NOT GATEABLE (implemented + routed, no reference arm to divide by — see NO_REFERENCE):")
+        foreach(x -> println("   ", x), nogate)
     end
     return
 end
