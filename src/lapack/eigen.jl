@@ -149,15 +149,13 @@ const _TRDWS_C32 = _TRDWork{ComplexF32, Float32}()
 @inline _trdws(::Type{Float32}) = _TRDWS_F32
 @inline _trdws(::Type{ComplexF64}) = _TRDWS_C64
 @inline _trdws(::Type{ComplexF32}) = _TRDWS_C32
-# EVERY OTHER ELEMENT TYPE GETS A PER-CALL WORKSPACE. The four consts above are owned pools, one per
-# BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a `ForwardDiff.Dual`
-# found no method at all and `_syev!` failed with `MethodError: _trdws(::Type{Dual{…}})` — even though
-# `_sytrd_lower!` and `_syev!` are both declared `where {T <: Real}` and are otherwise generic. The
-# gap was the WORKSPACE, not the driver: exactly the defect `_qr_ws` had before `geqrf-real-blocked`,
-# and fixed the same way. Allocating per call costs one `_TRDWork` per factorization — against an
-# O(n³) reduction, and only on the types that have no pool; the BlasFloat paths still hit the consts
-# above and are untouched, so nothing shipped changes.
-@inline _trdws(::Type{T}) where {T} = _TRDWork{T, real(T)}()
+# EVERY OTHER ELEMENT TYPE BORROWS FROM THE ARENA (inside `_sytrd_lower!`). The four consts above are
+# owned pools, one per BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a
+# `ForwardDiff.Dual` once found no `_trdws` method at all (`_syev!` was a MethodError, commit c6a9ef19).
+# The first fix was a per-call `_TRDWork{T}()` here, rationalised as "against an O(n³) reduction" — which
+# is exactly what the no-allocation rule for `!` routines forbids, so it is gone: a non-BlasFloat T takes
+# `W`/`tmp` from the arena, and the BlasFloat paths still hit the consts above, untouched. (A Dual no
+# longer reaches this reduction at all — `_syev!` is planar on pairs, see `_syev_pair!`.)
 
 function _sytrd_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{T},
@@ -171,8 +169,24 @@ function _sytrd_lower!(
         _sytd2_lower!(A, d, e, tau)
         return
     end
-    ws = _trdws(T); _trd_grow!(ws, n, nb)
-    W = view(ws.W, 1:n, 1:nb); tmp = view(ws.tmp, 1:nb)
+    if T <: BlasReal                                  # owned pool (Float64/Float32 consts) — the shipped route
+        ws = _trdws(T); _trd_grow!(ws, n, nb)
+        _sytrd_blocked!(A, d, e, tau, n, nb, nx, view(ws.W, 1:n, 1:nb), view(ws.tmp, 1:nb))
+    else                                              # any other real: borrow, never allocate (see `_trdws`)
+        @scope arn begin
+            W = borrow!(arn, T, n, nb); tmp = borrow!(arn, T, nb)
+            _sytrd_blocked!(A, d, e, tau, n, nb, nx, W, tmp)
+        end
+    end
+    return
+end
+
+# The blocked loop over a supplied panel workspace `W` (n×nb) and `tmp` (nb). `@inline` so the BlasReal
+# instantiations compile to the body they had when this sat in `_sytrd_lower!` itself.
+@inline function _sytrd_blocked!(
+        A::AbstractMatrix{T}, d::AbstractVector{T}, e::AbstractVector{T}, tau::AbstractVector{T},
+        n::Int, nb::Int, nx::Int, W, tmp
+    ) where {T <: Real}
     kk = 1
     @inbounds while n - kk + 1 > nx
         pb = min(nb, n - kk)                          # ≤ ns−1 (each panel column needs a trailing row)
