@@ -50,6 +50,7 @@ element type.
 ![Dual BLAS-1 — PB / LinearAlgebra generic ratio per op, three µarchs](assets/perf_dl1.svg)
 ![Dual BLAS-2 — PB / LinearAlgebra generic ratio per op, three µarchs](assets/perf_dl2.svg)
 ![Dual BLAS-3 — PB / LinearAlgebra generic ratio per op, three µarchs](assets/perf_dl3.svg)
+![Dual LAPACK — PB / LinearAlgebra generic ratio per op, three µarchs](assets/perf_dlp.svg)
 
 These numbers apply however you call PureBLAS. The native API (`PureBLAS.gemm!(…)`), the in-process
 reroute through `activate()`, and the `libpureblas.so` built for C hosts all run the same kernels.

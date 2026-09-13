@@ -1459,6 +1459,59 @@ function run_cmplx_benchmarks()
             c -> (LinearAlgebra.ldiv!(UpperTriangular(c[1]), c[2]); c[2][1].value),
             c -> (PureBLAS.trsm!(c[2], c[1]; side = Char(76), uplo = U); c[2][1].value))
     end
+
+    # ── DLP: LAPACK over Dual ────────────────────────────────────────────────────────────────────────
+    # Same contract as DL1/DL2/DL3: the reference is LinearAlgebra's GENERIC factorization, measured in
+    # the SAME run as the pb arm. See the DL1 note for why `generic` is not in `_REF_ALL`.
+    #
+    # WHY THIS GROUP HAS TO EXIST, stated plainly because it did not until now. The dual LAPACK
+    # speedups were found by a throwaway probe on ONE box: potri 21.0x, trtri 20.8x, potrf 7.2x,
+    # getrf 5.7x over the generic factorization. None of that was in the gate, so nothing was watching
+    # it — and `geqrf` is the proof that matters: it sat at 0.45x (WORSE than generic, degrading with n)
+    # for an unknown length of time, in a routine that had a green LP cell the whole while, because the
+    # LP cell measures Float64 and no cell measured a dual. A group whose numbers live only in a probe
+    # is a group that can regress silently.
+    #
+    # LPSZ is capped at 512: these are O(n^3) on a 16-byte type against a GENERIC reference that is
+    # itself O(n^3) and slow, so n=1024+ is minutes per cell for no extra signal (the ratios are already
+    # monotone by 256). `pstrf`/`gesvd`/`_syev!` are included deliberately — they branch on a
+    # comparison, so a cell on them is also a regression test for the seed-independence property
+    # (docs/src/dual_lp.md §6).
+    dlp = OpData[]
+    let
+        Dd = ForwardDiff.Dual{Nothing, Float64, 1}
+        rdd() = ForwardDiff.Dual{Nothing}(randn(), randn())
+        dm(m, n) = Dd[rdd() for _ in 1:m, _ in 1:n]
+        dv(n) = Dd[rdd() for _ in 1:n]
+        dspd(s) = (A = dm(s, s); A = A * transpose(A); for i in 1:s
+                A[i, i] += s
+            end; A)
+        dgen(s) = (A = dm(s, s); for i in 1:s
+                A[i, i] += s
+            end; A)
+        DLPSZ = (32, 50, 100, 128, 256, 512)
+        addp(nm, mk, ob, pb) = _meas!(dlp, "DLP", nm,
+            () -> sweep_heavy(mk, ob, pb, _sizes(DLPSZ); samples = 24, refs = ["generic"]))
+
+        addp("dpotrf1", dspd,
+            c -> (cholesky(Symmetric(c, :L)); c[1, 1].value),
+            c -> (PureBLAS.potrf!(c; uplo = 'L'); c[1, 1].value))
+        addp("dgetrf1", dgen,
+            c -> (lu(c); c[1, 1].value),
+            c -> (PureBLAS.getrf!(c, zeros(Int, size(c, 1))); c[1, 1].value))
+        addp("dgeqrf1", s -> dm(s, s),
+            c -> (qr(c); c[1, 1].value),
+            c -> (PureBLAS.geqrf!(c, dv(size(c, 1))); c[1, 1].value))
+        addp("dtrtri1", dgen,
+            c -> (inv(UpperTriangular(c)); c[1, 1].value),
+            c -> (PureBLAS.trtri!(c; uplo = 'U', diag = 'N'); c[1, 1].value))
+        addp("dpotri1", dspd,
+            c -> (inv(Symmetric(c, :L)); c[1, 1].value),
+            c -> (PureBLAS.potrf!(c; uplo = 'L'); PureBLAS.potri!(c; uplo = 'L'); c[1, 1].value))
+        addp("dsyev1", dspd,
+            c -> (eigvals(Symmetric(c, :L)); c[1, 1].value),
+            c -> (PureBLAS._syev!('N', 'L', c); c[1, 1].value))
+    end
     cl2 = OpData[]
     let
         sq(s) = (randn(T, s, s), randn(T, s), randn(T, s))
@@ -1719,7 +1772,7 @@ function run_cmplx_benchmarks()
             c -> (PureBLAS._heev!('N', 'L', c); real(c[1, 1]))
         )
     end
-    return cl1, cl2, cl3, clp, dl1, dl2, dl3
+    return cl1, cl2, cl3, clp, dl1, dl2, dl3, dlp
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
@@ -2391,10 +2444,10 @@ else
     _contention_check()
     _pref_check()          # pins are legitimate; not KNOWING about them is not
     l1, l2, l3, lp = run_benchmarks()
-    cl1, cl2, cl3, clp, dl1, dl2, dl3 = run_cmplx_benchmarks()
+    cl1, cl2, cl3, clp, dl1, dl2, dl3, dlp = run_cmplx_benchmarks()
     _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
-    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3)
+    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3, "DLP" => dlp)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
     if subset
         # subset re-measure: MERGE the measured op(s) into the existing (v2) cache, leaving the rest intact.
@@ -2450,7 +2503,7 @@ else
         end
         g = measured
     end
-    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3")])
+    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3", "DLP")])
 end
 
 adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR; mkpath(adir)
@@ -2487,7 +2540,7 @@ else
             # here asks for an arm that does not exist and renders an EMPTY Dual section in both views.
             # The section is therefore identical in the OpenBLAS and AOCL files, which is correct: there
             # is only one Dual denominator, so there is only one Dual table.
-            println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1", "DL2", "DL3"], "generic"))
+            println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1", "DL2", "DL3", "DLP"], "generic"))
         end
         println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
     end
@@ -2499,7 +2552,7 @@ else
     # denominator. `_refsuf("generic")` is deliberately NOT used in the name: there is only ever one
     # Dual panel, so it needs no view suffix to disambiguate it from a sibling that does not exist.
     for (gk, base, ttl) in (
-            ("DL1", "dl1", "Dual BLAS-1"), ("DL2", "dl2", "Dual BLAS-2"), ("DL3", "dl3", "Dual BLAS-3"),
+            ("DL1", "dl1", "Dual BLAS-1"), ("DL2", "dl2", "Dual BLAS-2"), ("DL3", "dl3", "Dual BLAS-3"), ("DLP", "dlp", "Dual LAPACK"),
         )
         svg_panels(
             joinpath(adir, "perf_$(base)$L.svg"),
@@ -2534,7 +2587,7 @@ const _ADJ_TOL = 0.02
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of
 # eyeballing two separately-measured tables. `gate` is the worst over cells of min over references,
 # i.e. the margin against whichever reference is faster at each individual size.
-for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3"), (nm, cells) in get(g, lvl, OpData[])
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3", "DLP"), (nm, cells) in get(g, lvl, OpData[])
     per = Dict{String, Tuple{Float64, Float64}}()
     for r in _REF_ALL
         ps = _series(g, lvl, nm, r)
