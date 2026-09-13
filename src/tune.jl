@@ -260,7 +260,20 @@ function tune!(;
     end
 
     if isempty(agreed)
-        @info "tune!: nothing to pin (every knob tied or disagreed). The in-code defaults are adequate here."
+        # STILL REFRESH THE FINGERPRINT. "Nothing to pin" is a RESULT — this machine was measured and
+        # its defaults won — so the box has been tuned even though no key changed. Returning without
+        # writing `tuned_for` deadlocks it: any pin already present (from an earlier tune, or a user's)
+        # plus a stale fingerprint makes `bench/plots.jl`'s `save_cache` refuse EVERY write, and
+        # re-running tune!() can never clear it because it pins nothing again.
+        #
+        # That deadlock happened on wintermute 2026-09-12: five pins from an earlier tune, the
+        # fingerprint extended with the toolchain (jl/LLVM), tune!() re-run, every knob tied, so
+        # `tuned_for` kept its pre-toolchain value. A CL1 sweep then printed "merged 56 cells" and
+        # `save_cache` silently refused with "CACHE NOT WRITTEN — tuned_for is STALE". The measurement
+        # was real, the numbers were reported, and nothing reached disk.
+        set_preferences!(@__MODULE__, "tuned_for" => _tuning_fingerprint(); force = true)
+        @info "tune!: nothing to pin (every knob tied or disagreed). The in-code defaults are adequate \
+            here; `tuned_for` refreshed so this machine still reads as tuned."
         return nothing
     end
     # Writing the pins is the ONE action that must land in the caller's project, because preferences are
