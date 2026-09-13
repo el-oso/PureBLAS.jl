@@ -347,6 +347,25 @@ so for a pair the unblocked panel now wins to n≈48–56, past the shared `_QR_
 ("before" = the published Zen3 fleet cells.) `dsyev1` is flat at ~1.8 instead of falling; the reference and PB
 now run the same algorithm, and the ratio is PB's real `syev 'V'` + `symm` against OpenBLAS's `syevr` + two gemms.
 
+`jobz='V'` changed too, so its ratio is stated (`dual_syev_v_ratio.jl`, vs ForwardDiff's `eigen(Symmetric{Dual})`,
+same regime): **1.77 / 1.64 / 1.29 / 1.63 / 1.43** at n=32/50/100/128/256. There is no "before": the dual-arithmetic
+`'V'` path went through `_stedc!` on a Dual and was never timed (it is not a DLP cell). The n=100 dip is a single
+run's number and was not chased.
+
+### 10.4 The `!` contract: dual `geqrf!` allocated 18 736 B per call; now 0
+
+`bench/probes/lapack_entry_alloc.jl` (warm first, `@allocated` on the 2nd and 3rd call, n=64): every LAPACK bang
+entry was 0 B on Float64 and on Dual except `geqrf!` on Dual — the generic `_qr_ws(::Type{T}, …)` built four fresh
+`Matrix{T}` per call (64·8·16 + 2·8·8·16 + 8·64·16 = 18 432 B + headers), rationalised in its comment as small
+"against the O(m·n·k) factorization" — the reasoning the rule forbids. Now: the blocked loop is `_geqrf_wy!` over a
+supplied workspace, Float64 hands it the owned pool exactly as before, every other `T` borrows inside a `@scope`
+(`Vt` 0×0 for a non-BlasReal — the skinny arm never reads it). All 14 entries read 0 B; the Float64 driver body is
+still same-count + same-multiset against the baseline. Same treatment for `_sytrd_lower!`: the per-call
+`_TRDWork{T}()` fallback from `c6a9ef19` is gone, non-BlasReal reals borrow `W`/`tmp` (`_sytrd_blocked!`); a Dual no
+longer reaches it at all. **Still allocating, pre-existing and on every type including Float64:** `_sytd2_lower!`
+builds its `v`/`w` scratch per call (192 B on Float16, 640 B on a Dual at n=96 via the blocked tail) — that is
+shipped Float64 code and gets its own byte-identity pass, not a side effect here.
+
 Byte identity (`dual_qr_native.jl`, `dual_syev_native.jl`; Float64, Float32, ComplexF64, ComplexF32): every
 instantiation of the edited functions is identical or same-count+same-multiset. The probe flags `_latrd_lower!`,
 `_sytrd_lower!` (F32), `_hetrd!`, `_heev!` (C32) as DIFFERENT by 1–31 instructions of `mov`/`lea`/`movabs` — none
