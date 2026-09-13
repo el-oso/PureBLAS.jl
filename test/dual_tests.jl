@@ -383,6 +383,31 @@ end
     @test PureBLAS.gemm!(Cs, A, B) ≈ R
 end
 
+@testitem "Dual LAPACK: blocked geqrf on a Dual matrix — R (value AND partial) vs generic qr, reflectors reconstruct" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    # n > _QR_UNBLK_MAX so the BLOCKED driver runs; its trailing update is syrk!/trmm!/gemm! on Dual — the
+    # planar dual L3 route. Before 2026-09-13 a Dual fell to the unblocked-only T<:Real method (dual_lp.md §3).
+    @testset "$(m)x$(n)" for (m, n) in ((96, 64), (64, 96), (70, 50))
+        A0 = randn(m, n); dA = randn(m, n); k = min(m, n)
+        A = DualT.mkd(A0, dA); F = copy(A); tau = Vector{eltype(A)}(undef, k)
+        PureBLAS.geqrf!(F, tau)
+        R = [i <= j ? F[i, j] : zero(eltype(F)) for i in 1:k, j in 1:n]
+        Rg = qr(A).R                                       # LinearAlgebra's generic (unblocked) Householder QR
+        @test value.(R) ≈ value.(Rg)
+        @test partials.(R, 1) ≈ partials.(Rg, 1)
+        # faer τ: H_k = I − v·vᵀ/τ, τ = Inf ⇒ identity; Q·R must reproduce A on both planes
+        Rf = [i <= j ? F[i, j] : zero(eltype(F)) for i in 1:m, j in 1:n]
+        for kk in k:-1:1
+            isfinite(tau[kk]) || continue
+            v = zeros(eltype(F), m); v[kk] = one(eltype(F)); v[(kk + 1):m] = F[(kk + 1):m, kk]
+            Rf .-= (v * (transpose(v) * Rf)) ./ tau[kk]
+        end
+        @test value.(Rf) ≈ A0
+        @test partials.(Rf, 1) ≈ dA
+    end
+end
+
 @testitem "StrictMode dogfood: BLAS-3 dual strict contract" tags = [:checks] begin
     using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
     using ForwardDiff: Dual
