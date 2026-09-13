@@ -1165,6 +1165,7 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
     if n == 0
         return T[], Matrix{T}(undef, 0, 0), 0
     end
+    _pairT(T) && _strided1(A) && return _syev_pair!(jobz, uplo, A)   # dual pairs: planar, below
     wantz = jobz == 'V'
     d = Vector{T}(undef, n)
     e = Vector{T}(undef, max(n - 1, 1))
@@ -1172,6 +1173,82 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
     Z = wantz ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
     info = _syev_core!(jobz, uplo, A, d, e, tau, Z)
     return d, Z, info
+end
+
+# ── Dual pairs: PLANAR symmetric eigensolve (docs/src/dual_lp.md §10) ───────────────────────────────
+# A = A_v + ε·A_p symmetric. First-order perturbation theory gives the partials in closed form:
+#   λ_p[i] = q_iᵀ·A_p·q_i           Q_p = Q·S,  S_ij = (Qᵀ A_p Q)_ij / (λ_j − λ_i)  (i ≠ j),  S_ii = 0.
+# So the VALUE plane goes through the real driver above (blocked sytrd + D&C + ormtr — the LP gate path) and
+# the partials cost one real `symm!` (B = A_p·Q, reading only the `uplo` triangle of A_p, the same contract
+# A has) plus n dots for 'N', or two more real gemms for 'V'. Nothing runs dual arithmetic. That matters
+# because the reference this is measured against, LinearAlgebra's `eigvals(Symmetric{Dual})`, IS this
+# planar route on LAPACK (ForwardDiff/src/dual.jl `_eigvals`: `eigen` of the value plane, then
+# `diag(Q'·A_p·Q)` as two full gemms), while the dual-arithmetic path here ran the scalar generic
+# reduction (a `symv!` plus a rank-2 update per column, neither with a SIMD arm on a pair) — it fell from
+# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, galen).
+#
+# CLUSTERS. The simple-eigenvalue formula needs q_i determined, which it is not inside a cluster of
+# numerically equal eigenvalues: the computed basis of that eigenspace is an arbitrary rotation, and the
+# diagonal of Q_cᵀ A_p Q_c is not the derivative. Degenerate perturbation theory is: the ASCENDING
+# eigenvalues of the projected block M = Q_cᵀ·A_p·Q_c are the (one-sided) derivatives of the ascending
+# eigenvalue branches. The cluster tolerance is the value-plane solver's own resolution, n·eps·max|λ|
+# (req8-ok: an algorithm constant — the absolute eigenvalue error bound of a backward-stable symmetric
+# solver, not a tuning knob): below it the computed Q_c is arbitrary and the block formula is the only
+# right answer; above it the simple formula is exact and the block formula would be off by O(|M_ij|).
+# 'V' inside a cluster: Q_c is rotated onto M's eigenvectors (the basis the branches actually converge to)
+# and S is zero within the cluster — a within-cluster vector derivative needs second-order data the
+# first-order formula does not carry; ForwardDiff's `_eigen` divides by zero there instead.
+function _syev_pair!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T}
+    R = _pairvT(T); n = size(A, 1)
+    wantz = jobz == 'V'
+    Av = Matrix{R}(undef, n, n); Ap = Matrix{R}(undef, n, n)
+    _split2!(Av, Ap, A, n, n)
+    w, Q, info = _syev!('V', uplo, Av)                        # value plane: the real driver, vectors needed
+    B = Matrix{R}(undef, n, n)
+    symm!(B, Ap, Q; side = 'L', uplo)                        # B = A_p·Q — only the `uplo` triangle of A_p is read
+    wp = Vector{R}(undef, n)
+    @inbounds for i in 1:n
+        wp[i] = dot(view(Q, :, i), view(B, :, i))            # λ_p[i] = q_iᵀ A_p q_i (overwritten inside clusters)
+    end
+    cid = Vector{Int}(undef, n)                              # cluster id per eigenvalue (for S below)
+    tol = n * eps(R) * max(abs(w[1]), abs(w[n]))             # w ascending ⇒ max|λ| is an end
+    i = 1
+    @inbounds while i <= n
+        j = i
+        while j < n && w[j + 1] - w[j] <= tol
+            j += 1
+        end
+        cid[i:j] .= i
+        if j > i                                             # degenerate cluster i:j — projected block
+            k = j - i + 1
+            Qc = Q[:, i:j]; Bc = B[:, i:j]
+            M = Matrix{R}(undef, k, k)
+            gemm!(M, transpose(Qc), Bc)                      # M = Q_cᵀ A_p Q_c (symmetric up to rounding)
+            wM, ZM, _ = _syev!(wantz ? 'V' : 'N', 'L', M)
+            wp[i:j] .= wM
+            if wantz                                         # rotate the cluster basis onto M's eigvecs
+                gemm!(view(Q, :, i:j), Qc, ZM); gemm!(view(B, :, i:j), Bc, ZM)
+            end
+        end
+        i = j + 1
+    end
+    wout = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        wout[i] = _mkpair(T, w[i], wp[i])
+    end
+    wantz || return wout, Matrix{T}(undef, 0, 0), info
+    S = Matrix{R}(undef, n, n)
+    gemm!(S, transpose(Q), B)                                # C = Qᵀ A_p Q, then S_ij = C_ij / (λ_j − λ_i)
+    @inbounds for j in 1:n, i in 1:n
+        S[i, j] = cid[i] == cid[j] ? zero(R) : S[i, j] / (w[j] - w[i])
+    end
+    Qp = Matrix{R}(undef, n, n)
+    gemm!(Qp, Q, S)                                          # Q_p = Q·S
+    Z = Matrix{T}(undef, n, n)
+    @inbounds for j in 1:n, i in 1:n
+        Z[i, j] = _mkpair(T, Q[i, j], Qp[i, j])
+    end
+    return wout, Z, info
 end
 
 # ── Engine: _heev!(jobz, uplo, A) → (w, Z, info). COMPLEX Hermitian eigensolver (native). ──────────────
