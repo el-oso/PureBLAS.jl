@@ -141,6 +141,38 @@ that easy to get wrong from the outside, the achieved counts belong in the outpu
 This is METHODOLOGY, so it gates the credibility of every ratio in the coverage tables; treat it as
 higher priority than any single red cell.
 
+#### Update 2026-09-13 — the first hard numbers, and a worked example of the win
+
+Measured wall-clock for a real refresh (`arms=pb`, one group per pass), which nobody had recorded:
+
+| box | LP | DLP | note |
+|---|---|---|---|
+| wintermute · Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
+| galen · Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
+
+Two things fall out, and both belong in the knob review:
+
+**1. Sweep time ≈ arm-measurements × window budget, nearly INDEPENDENT of n.** LP is 342 cells × 1 arm
+(36 ops × 20 sizes, references cached); DLP is 30 cells × 2 arms — 5.7× the arm-measurements — and LP's
+window is 2.7× bigger (40/4.0s vs 10/1.5s). 5.7 × 2.7 ≈ 15×, against ~10.5× observed (the gap is the
+2.0 s cap at n≥1024). A cell at n=4096 and one at n=32 cost about the SAME wall-clock, because the
+window is a time budget and `reps` shrinks to fill it. So cost is driven by the SHAPE of the ladder, not
+by the arithmetic — which is exactly why the per-(op,size) tuning this section asks for is worth doing.
+
+**2. DLP is the worked example that the knobs are mis-set, not merely unproven.** As first written
+(24 samples / 4.0 s, sizes to 512) a SINGLE size took **14m35s** and the full group extrapolated to
+hours per box. Cutting to 10 samples / 1.5 s and capping at 256 took the whole group to **3m19s**. The
+cut was free: `dsyev1` at n=128 already read a **0.6% spread across 8 rounds**, so Chairmarks was
+window-bound, not precision-bound, and `gate_pass` rounds to two significant digits anyway. Both arms
+shifted +0.9%, which cancels in the ratio the gate actually reads. That is a ~4.8× saving on one group
+from one afternoon's inspection; the same question has never been asked of the other eleven.
+
+**3. Why this keeps costing time.** Every ETA I gave this session was wrong, in both directions, because
+there was no recorded per-group duration to estimate from and the obvious proxy (clock) is the wrong
+one — see galen above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
+FP256 double-pumped, so it behaves like galen at half the clock. Durations now recorded in
+`kb/findings/` so the next session estimates from data.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
