@@ -173,6 +173,34 @@ Both modes share ONE set of low-level kernels. Source map:
    so explicitly ("dispatches and is correct; SPEED UNMEASURED") rather than implying completion. A
    capability with no number attached is a liability, because it looks finished to the next reader.
 
+10. **A `!` FUNCTION MUST NOT ALLOCATE. (HARD RULE — that is what the arena is FOR.)** Every
+   bang-suffixed entry point is allocation-free at steady state, for EVERY element type it accepts —
+   `Float64`, complex, `ForwardDiff.Dual`, and anything else that dispatches. Scratch comes from the
+   arena (`@scope arn begin … borrow!(arn, T, …) end`, `src/arena.jl`; `src/lapack/sysv.jl:192` is the
+   canonical pattern) or from caller-supplied workspace — never from a fresh `Matrix`/`Vector` in the
+   call. "Steady state" means from the SECOND call: the arena grows once at a new high-water mark and
+   `docs/src/arena.md` says so explicitly.
+
+   This is not aspirational, it is the measured status quo. `bench/probes/lapack_entry_alloc.jl`,
+   n=64, warm then `@allocated`: **13 of 14 LAPACK bang entries are 0 B** — `potrf!`, `getrf!`,
+   `trtri!`, `potri!`, `sytrf!`, `sytri!`, `geqrf!` on Float64, and all but one on Dual.
+
+   **Written down because I argued my way out of it.** Asked whether dual functions carried strict
+   contracts, I answered that LAPACK entries "legitimately allocate — `sytri!` borrows from the arena,
+   blocked drivers take workspace", and concluded `@test_noalloc` was the wrong instrument for LAPACK.
+   Every clause of that was wrong: `sytri!` measures **0 B** precisely BECAUSE it borrows from the
+   arena — borrowing is the mechanism that prevents allocation, not an admission of it. The one real
+   violation, dual `geqrf!` at **18736 B/call**, came from a generic `_qr_ws` allocating four fresh
+   `Matrix{T}` per call while the Float64 path forwarded to the owned pool. I had also written the
+   same defect myself in `_trdws` and rationalised it in a code comment as acceptable "against an
+   O(n³) reduction".
+
+   The failure mode to recognise: an unwritten invariant is one you can talk yourself out of with a
+   plausible-sounding cost argument. **Measure the entry (`@allocated`, warm, wrapped in a function
+   over pre-built operands — at top level it boxes the return and reports phantom bytes) before
+   claiming any allocation is justified.** A non-zero result on a `!` entry is a DEFECT TO FIX, never
+   an exemption to document.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
