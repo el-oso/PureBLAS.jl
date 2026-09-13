@@ -338,13 +338,14 @@ so for a pair the unblocked panel now wins to n≈48–56, past the shared `_QR_
 
 | n | `dsyev1` before | after | `dgeqrf1` before | after |
 |---|---|---|---|---|
-| 32 | 2.24 | **1.88** | 0.87 | **2.10** |
-| 50 | 1.62 | **1.82** | 1.30 | **1.88** |
-| 100 | 1.15 | **1.80** | 2.08 | **2.92** |
-| 128 | 1.00 | **1.64** | 2.36 | **3.25** |
-| 256 | 0.67 | **1.83** | 2.74 | **4.16** |
+| 32 | 2.24 | **1.89** | 0.87 | **2.10** |
+| 50 | 1.62 | **1.84** | 1.30 | **1.90** |
+| 100 | 1.15 | **1.81** | 2.08 | **2.96** |
+| 128 | 1.00 | **1.77** | 2.36 | **3.47** |
+| 256 | 0.67 | **1.96** | 2.74 | **4.14** |
 
-("before" = the published Zen3 fleet cells.) `dsyev1` is flat at ~1.8 instead of falling; the reference and PB
+("before" = the published Zen3 fleet cells; "after" = `3a6f315b`, the arena-workspace commit. The planar-only
+commit `6147e924` read 1.88/1.82/1.80/1.64/1.83 and 2.10/1.88/2.92/3.25/4.16 — the same picture within run drift.) `dsyev1` is flat at ~1.8 instead of falling; the reference and PB
 now run the same algorithm, and the ratio is PB's real `syev 'V'` + `symm` against OpenBLAS's `syevr` + two gemms.
 
 `jobz='V'` changed too, so its ratio is stated (`dual_syev_v_ratio.jl`, vs ForwardDiff's `eigen(Symmetric{Dual})`,
