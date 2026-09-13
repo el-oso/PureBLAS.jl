@@ -118,7 +118,8 @@ end
 # cache-residency width (same rank-nb-trailing-gemm criterion); the unblocked-tail crossover `nx` is a
 # multiple of nb (keep blocking while the trailing syr2k spans ≥2 panels — else it is too small to amortize
 # the panel's BLAS-2 W-accumulation). Reuses `_sytd2_lower!` as the tail kernel — no separate base case.
-_sytrd_nb(n::Int) = _qr_nb(n, n)
+_sytrd_nb(::Type{T}, n::Int) where {T} = _qr_nb(T, n, n)
+_sytrd_nb(n::Int) = _sytrd_nb(Float64, n)      # legacy 2-arg form; Float64 is what it always meant
 
 # Owned panel scratch for the tridiagonalizations. `W` is the dlatrd/zlatrd accumulated block, `tmp` its
 # per-column staging — together the LAST allocation on the `sygvd!`/`hegvd!` path (MEASURED 4 696 B F64 /
@@ -148,6 +149,15 @@ const _TRDWS_C32 = _TRDWork{ComplexF32, Float32}()
 @inline _trdws(::Type{Float32}) = _TRDWS_F32
 @inline _trdws(::Type{ComplexF64}) = _TRDWS_C64
 @inline _trdws(::Type{ComplexF32}) = _TRDWS_C32
+# EVERY OTHER ELEMENT TYPE GETS A PER-CALL WORKSPACE. The four consts above are owned pools, one per
+# BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a `ForwardDiff.Dual`
+# found no method at all and `_syev!` failed with `MethodError: _trdws(::Type{Dual{…}})` — even though
+# `_sytrd_lower!` and `_syev!` are both declared `where {T <: Real}` and are otherwise generic. The
+# gap was the WORKSPACE, not the driver: exactly the defect `_qr_ws` had before `geqrf-real-blocked`,
+# and fixed the same way. Allocating per call costs one `_TRDWork` per factorization — against an
+# O(n³) reduction, and only on the types that have no pool; the BlasFloat paths still hit the consts
+# above and are untouched, so nothing shipped changes.
+@inline _trdws(::Type{T}) where {T} = _TRDWork{T, real(T)}()
 
 function _sytrd_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{T},
@@ -155,7 +165,7 @@ function _sytrd_lower!(
     ) where {T <: Real}
     n = size(A, 1)
     n == 0 && return
-    nb = _sytrd_nb(n)
+    nb = _sytrd_nb(T, n)
     nx = 2 * nb                                       # unblocked-tail crossover (≥2 panels ⇒ blocking pays)
     if n <= nx || nb <= 1
         _sytd2_lower!(A, d, e, tau)
@@ -656,6 +666,11 @@ function _hetrd!(
     ) where {T <: Complex, R <: Real}
     n = size(A, 1)
     n == 0 && return
+    # DELIBERATELY the Float64-sized width, NOT `_sytrd_nb(T, n)`. Typing it here would halve the panel
+    # (sizeof(ComplexF64)=16 vs 8) and so CHANGE shipped complex behaviour — `zheev`/`zheevN` publish at
+    # 1.176/1.072 against this blocking, and re-tuning complex is not a side effect a dual-number fix
+    # gets to have. The residency criterion arguably wants `sizeof(T)` (req#8), but that is a measured
+    # change, not a free one: it needs a CLP sweep before it ships. Tracked, not silently taken.
     nb = _sytrd_nb(n)
     nx = 2 * nb
     if n <= nx || nb <= 1
