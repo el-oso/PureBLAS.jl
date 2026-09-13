@@ -279,4 +279,98 @@ applied.
 |---|---|
 | `geqp3` on `Dual` | the one genuine type gate (`where {T <: BlasFloat}`) |
 | `gesvd` singular **vectors** | deliberate; needs generic `orgbr` + vector-carrying `bdsqr`. Values work |
-| `geqrf` scalar panel | perf, not correctness: the generic panel is 38%/45% of dual `geqrf` at n=128/256 while the trailing update is already planar. Route `_house_left!`'s dot/axpy through the pair-tagged BLAS-1 kernels |
+| `geqrf` scalar panel | **DONE** (§10.2): `_house_left!` has a pair arm on the tagged dot/axpy; the n=32 panel went 32.4 → 13.8 µs |
+| `_syev!` on `Dual` degrading with n | **DONE** (§10.1): planar; 0.68× → 1.83× at n=256 |
+| `_QR_UNBLK_MAX` for pair types | data, not a change: with the tagged panel, unblocked beats blocked to n≈48–56 on Zen3 (§10.2), so the shared 32 is early for a Dual — same PDM-literal debt the Float64 knob already carries, one more row for its table |
+
+## 10. `_syev!` on a Dual: the reference was already planar (2026-09-14, branch `dual-syev`)
+
+### 10.1 The degradation and its cause
+
+DLP `dsyev1` fell monotonically with n on all three boxes (Zen4/Zen3/Zen5: 1.95/2.24/1.91 at n=32 → 0.66/0.67/0.69
+at 256). Decomposed on galen (`bench/probes/dual_syev_decomp.jl`, Chairmarks median of 10, fresh SPD operand per
+sample, one call per sample — the DLP regime):
+
+| n | path | ref | `_syev!` | `_sytrd_lower!` | `_sytd2_lower!` | `_sterf!` | n × `symv!` |
+|---|---|---|---|---|---|---|---|
+| 32 | unblocked (nb=16, nx=32) | 102 | 48 | 21 | 21 | 25 | 10 |
+| 128 | blocked | 1724 | 1713 | 1373 | 1069 | 326 | 512 |
+| 256 | blocked | 8246 | 12077 | **10837** | 8556 | 1232 | 4105 |
+
+(µs.) Three things the table settles. The iteration (`_sterf!`) is 10 % at n=256 — the guess that it was the
+O(n³)-ish part was wrong. The blocked reduction IS taken and is **slower than the unblocked one** on a Dual
+(10.8 vs 8.6 ms): its `syr2k!` lands on the generic `_syr2k_acc!`, and the `symv!` it shares with `_sytd2_lower!`
+is the scalar generic `_symv!` (no SIMD arm on a pair — dual_l2.md §2.6 left symv at tier 2), which alone is
+half of the unblocked reduction. So the dual-arithmetic route was scalar on ⅔ n³ flops.
+
+And the reference is not a generic dual eigensolver at all. `eigvals(Symmetric{Dual})` dispatches to
+**ForwardDiff's own `_eigvals`** (`ForwardDiff/src/dual.jl`): `eigen` of the VALUE plane through LAPACK, then
+`diag(Q' * A_p * Q)` as two full gemms. It is the closed form of this task's planar suggestion, riding OpenBLAS.
+That is why the ratio fell with n — PB was running scalar dual arithmetic against a vendor O(n³) path.
+
+### 10.2 What shipped
+
+**Planar `_syev!` for pair types** (`_syev_pair!`, eigen.jl; routed from `_syev!` on `_pairT(T) && _strided1(A)`):
+split A into (A_v, A_p); `_syev!('V', uplo, A_v)` on the real driver; `B = A_p·Q` by one real `symm!` (reads
+only the `uplo` triangle — the same contract A has); `λ_p[i] = q_iᵀ b_i` (n dots). For `'V'`, `C = Qᵀ B`,
+`S_ij = C_ij/(λ_j − λ_i)`, `Q_p = Q·S` (two more real gemms). **Degenerate clusters** — eigenvalues closer than
+`n·eps·max|λ|`, the value-plane solver's own resolution — take the projected block: `M = Q_cᵀ A_p Q_c`, its
+ascending eigenvalues are the derivatives of the ascending branches (degenerate perturbation theory, verified
+against a one-sided finite difference to 1e-6), and for `'V'` the cluster's columns of Q are rotated onto M's
+eigenvectors with S zero inside the cluster. ForwardDiff's reference gets the cluster case wrong (it reads the
+diagonal of `Q'A_pQ` in whatever basis LAPACK picked: `[-0.99, -0.38, 0.22]` where the block gives
+`[-2.73, 0.21, 1.37]` = the finite difference), so the test covers it against the block formula, not the oracle.
+Simple eigenvalues match ForwardDiff to 1e-13 (values and partials), eigenvector partials to 1e-12–1e-10.
+
+Planar accounting that justified it before writing (galen, `dual_syev_planar_bound.jl`, Float64): `_syev!('V')`
++ `symm!` + n dots = 54 / 127 / 534 / 951 / **4783** µs at n=32/50/100/128/256, against the dual path's 48 / 149 /
+883 / 1713 / 12077 — a win everywhere but n=32, where the fixed cost of the vector solve loses 6 µs (12 %). Not
+worth a size knob; noted.
+
+**Pair arm in `_house_left!`** (svd.jl): the same dot+axpy shape as the BlasReal arm on `_dot_pair_simd` /
+`_axpy_pair_simd!`. This was the whole of the `dgeqrf1` n=32 cell: at n ≤ 32 `geqrf!` is ONE `qr_unblocked!`
+panel (the crossover was never in play — both arms were unblocked), and that scalar panel ran 32.4 µs against
+27.7 for LinearAlgebra's `qrfactUnblocked!`, the same algorithm. Tagged: 13.8 µs. `bench/probes/dual_qr32.jl`
+after the change: unblocked 3.1 / 7.2 / 13.8 / 23.1 / 36.6 / 79.4 µs vs blocked 28.3 / 39.1 / 73.7 at n=40/48/64 —
+so for a pair the unblocked panel now wins to n≈48–56, past the shared `_QR_UNBLK_MAX = 32` (§9 row).
+
+### 10.3 Result (galen, Zen3, core 6, freq-locked; `bench/probes/dual_lp_ratios.jl`, the DLP probe shape, both arms same run)
+
+| n | `dsyev1` before | after | `dgeqrf1` before | after |
+|---|---|---|---|---|
+| 32 | 2.24 | **1.89** | 0.87 | **2.10** |
+| 50 | 1.62 | **1.84** | 1.30 | **1.90** |
+| 100 | 1.15 | **1.81** | 2.08 | **2.96** |
+| 128 | 1.00 | **1.77** | 2.36 | **3.47** |
+| 256 | 0.67 | **1.96** | 2.74 | **4.14** |
+
+("before" = the published Zen3 fleet cells; "after" = `3a6f315b`, the arena-workspace commit. The planar-only
+commit `6147e924` read 1.88/1.82/1.80/1.64/1.83 and 2.10/1.88/2.92/3.25/4.16 — the same picture within run drift.) `dsyev1` is flat at ~1.8 instead of falling; the reference and PB
+now run the same algorithm, and the ratio is PB's real `syev 'V'` + `symm` against OpenBLAS's `syevr` + two gemms.
+
+`jobz='V'` changed too, so its ratio is stated (`dual_syev_v_ratio.jl`, vs ForwardDiff's `eigen(Symmetric{Dual})`,
+same regime): **1.77 / 1.64 / 1.29 / 1.63 / 1.43** at n=32/50/100/128/256. There is no "before": the dual-arithmetic
+`'V'` path went through `_stedc!` on a Dual and was never timed (it is not a DLP cell). The n=100 dip is a single
+run's number and was not chased.
+
+### 10.4 The `!` contract: dual `geqrf!` allocated 18 736 B per call; now 0
+
+`bench/probes/lapack_entry_alloc.jl` (warm first, `@allocated` on the 2nd and 3rd call, n=64): every LAPACK bang
+entry was 0 B on Float64 and on Dual except `geqrf!` on Dual — the generic `_qr_ws(::Type{T}, …)` built four fresh
+`Matrix{T}` per call (64·8·16 + 2·8·8·16 + 8·64·16 = 18 432 B + headers), rationalised in its comment as small
+"against the O(m·n·k) factorization" — the reasoning the rule forbids. Now: the blocked loop is `_geqrf_wy!` over a
+supplied workspace, Float64 hands it the owned pool exactly as before, every other `T` borrows inside a `@scope`
+(`Vt` 0×0 for a non-BlasReal — the skinny arm never reads it). All 14 entries read 0 B; the Float64 driver body is
+still same-count + same-multiset against the baseline. Same treatment for `_sytrd_lower!`: the per-call
+`_TRDWork{T}()` fallback from `c6a9ef19` is gone, non-BlasReal reals borrow `W`/`tmp` (`_sytrd_blocked!`); a Dual no
+longer reaches it at all. **Still allocating, pre-existing and on every type including Float64:** `_sytd2_lower!`
+builds its `v`/`w` scratch per call (192 B on Float16, 640 B on a Dual at n=96 via the blocked tail) — that is
+shipped Float64 code and gets its own byte-identity pass, not a side effect here.
+
+Byte identity (`dual_qr_native.jl`, `dual_syev_native.jl`; Float64, Float32, ComplexF64, ComplexF32): every
+instantiation of the edited functions is identical or same-count+same-multiset. The probe flags `_latrd_lower!`,
+`_sytrd_lower!` (F32), `_hetrd!`, `_heev!` (C32) as DIFFERENT by 1–31 instructions of `mov`/`lea`/`movabs` — none
+of which were edited — and **the unedited master tree reproduces the same cells with the same deltas across two
+fresh processes** (3051 vs 3020 for `_latrd_lower!` Float64), so for those large drivers instruction COUNT is
+process drift too, not just order. Seed independence (`dual_seed_independence.jl`, `syev_dual_verify.jl`): clean;
+the planar `_syev!` has no dual comparison left to leak through.

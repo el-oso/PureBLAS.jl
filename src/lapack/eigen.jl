@@ -149,15 +149,13 @@ const _TRDWS_C32 = _TRDWork{ComplexF32, Float32}()
 @inline _trdws(::Type{Float32}) = _TRDWS_F32
 @inline _trdws(::Type{ComplexF64}) = _TRDWS_C64
 @inline _trdws(::Type{ComplexF32}) = _TRDWS_C32
-# EVERY OTHER ELEMENT TYPE GETS A PER-CALL WORKSPACE. The four consts above are owned pools, one per
-# BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a `ForwardDiff.Dual`
-# found no method at all and `_syev!` failed with `MethodError: _trdws(::Type{Dual{…}})` — even though
-# `_sytrd_lower!` and `_syev!` are both declared `where {T <: Real}` and are otherwise generic. The
-# gap was the WORKSPACE, not the driver: exactly the defect `_qr_ws` had before `geqrf-real-blocked`,
-# and fixed the same way. Allocating per call costs one `_TRDWork` per factorization — against an
-# O(n³) reduction, and only on the types that have no pool; the BlasFloat paths still hit the consts
-# above and are untouched, so nothing shipped changes.
-@inline _trdws(::Type{T}) where {T} = _TRDWork{T, real(T)}()
+# EVERY OTHER ELEMENT TYPE BORROWS FROM THE ARENA (inside `_sytrd_lower!`). The four consts above are
+# owned pools, one per BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a
+# `ForwardDiff.Dual` once found no `_trdws` method at all (`_syev!` was a MethodError, commit c6a9ef19).
+# The first fix was a per-call `_TRDWork{T}()` here, rationalised as "against an O(n³) reduction" — which
+# is exactly what the no-allocation rule for `!` routines forbids, so it is gone: a non-BlasFloat T takes
+# `W`/`tmp` from the arena, and the BlasFloat paths still hit the consts above, untouched. (A Dual no
+# longer reaches this reduction at all — `_syev!` is planar on pairs, see `_syev_pair!`.)
 
 function _sytrd_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{T},
@@ -171,8 +169,24 @@ function _sytrd_lower!(
         _sytd2_lower!(A, d, e, tau)
         return
     end
-    ws = _trdws(T); _trd_grow!(ws, n, nb)
-    W = view(ws.W, 1:n, 1:nb); tmp = view(ws.tmp, 1:nb)
+    if T <: BlasReal                                  # owned pool (Float64/Float32 consts) — the shipped route
+        ws = _trdws(T); _trd_grow!(ws, n, nb)
+        _sytrd_blocked!(A, d, e, tau, n, nb, nx, view(ws.W, 1:n, 1:nb), view(ws.tmp, 1:nb))
+    else                                              # any other real: borrow, never allocate (see `_trdws`)
+        @scope arn begin
+            W = borrow!(arn, T, n, nb); tmp = borrow!(arn, T, nb)
+            _sytrd_blocked!(A, d, e, tau, n, nb, nx, W, tmp)
+        end
+    end
+    return
+end
+
+# The blocked loop over a supplied panel workspace `W` (n×nb) and `tmp` (nb). `@inline` so the BlasReal
+# instantiations compile to the body they had when this sat in `_sytrd_lower!` itself.
+@inline function _sytrd_blocked!(
+        A::AbstractMatrix{T}, d::AbstractVector{T}, e::AbstractVector{T}, tau::AbstractVector{T},
+        n::Int, nb::Int, nx::Int, W, tmp
+    ) where {T <: Real}
     kk = 1
     @inbounds while n - kk + 1 > nx
         pb = min(nb, n - kk)                          # ≤ ns−1 (each panel column needs a trailing row)
@@ -1165,6 +1179,7 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
     if n == 0
         return T[], Matrix{T}(undef, 0, 0), 0
     end
+    _pairT(T) && _strided1(A) && return _syev_pair!(jobz, uplo, A)   # dual pairs: planar, below
     wantz = jobz == 'V'
     d = Vector{T}(undef, n)
     e = Vector{T}(undef, max(n - 1, 1))
@@ -1172,6 +1187,82 @@ function _syev!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T <: Real}
     Z = wantz ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
     info = _syev_core!(jobz, uplo, A, d, e, tau, Z)
     return d, Z, info
+end
+
+# ── Dual pairs: PLANAR symmetric eigensolve (docs/src/dual_lp.md §10) ───────────────────────────────
+# A = A_v + ε·A_p symmetric. First-order perturbation theory gives the partials in closed form:
+#   λ_p[i] = q_iᵀ·A_p·q_i           Q_p = Q·S,  S_ij = (Qᵀ A_p Q)_ij / (λ_j − λ_i)  (i ≠ j),  S_ii = 0.
+# So the VALUE plane goes through the real driver above (blocked sytrd + D&C + ormtr — the LP gate path) and
+# the partials cost one real `symm!` (B = A_p·Q, reading only the `uplo` triangle of A_p, the same contract
+# A has) plus n dots for 'N', or two more real gemms for 'V'. Nothing runs dual arithmetic. That matters
+# because the reference this is measured against, LinearAlgebra's `eigvals(Symmetric{Dual})`, IS this
+# planar route on LAPACK (ForwardDiff/src/dual.jl `_eigvals`: `eigen` of the value plane, then
+# `diag(Q'·A_p·Q)` as two full gemms), while the dual-arithmetic path here ran the scalar generic
+# reduction (a `symv!` plus a rank-2 update per column, neither with a SIMD arm on a pair) — it fell from
+# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, galen).
+#
+# CLUSTERS. The simple-eigenvalue formula needs q_i determined, which it is not inside a cluster of
+# numerically equal eigenvalues: the computed basis of that eigenspace is an arbitrary rotation, and the
+# diagonal of Q_cᵀ A_p Q_c is not the derivative. Degenerate perturbation theory is: the ASCENDING
+# eigenvalues of the projected block M = Q_cᵀ·A_p·Q_c are the (one-sided) derivatives of the ascending
+# eigenvalue branches. The cluster tolerance is the value-plane solver's own resolution, n·eps·max|λ|
+# (req8-ok: an algorithm constant — the absolute eigenvalue error bound of a backward-stable symmetric
+# solver, not a tuning knob): below it the computed Q_c is arbitrary and the block formula is the only
+# right answer; above it the simple formula is exact and the block formula would be off by O(|M_ij|).
+# 'V' inside a cluster: Q_c is rotated onto M's eigenvectors (the basis the branches actually converge to)
+# and S is zero within the cluster — a within-cluster vector derivative needs second-order data the
+# first-order formula does not carry; ForwardDiff's `_eigen` divides by zero there instead.
+function _syev_pair!(jobz::Char, uplo::Char, A::AbstractMatrix{T}) where {T}
+    R = _pairvT(T); n = size(A, 1)
+    wantz = jobz == 'V'
+    Av = Matrix{R}(undef, n, n); Ap = Matrix{R}(undef, n, n)
+    _split2!(Av, Ap, A, n, n)
+    w, Q, info = _syev!('V', uplo, Av)                        # value plane: the real driver, vectors needed
+    B = Matrix{R}(undef, n, n)
+    symm!(B, Ap, Q; side = 'L', uplo)                        # B = A_p·Q — only the `uplo` triangle of A_p is read
+    wp = Vector{R}(undef, n)
+    @inbounds for i in 1:n
+        wp[i] = dot(view(Q, :, i), view(B, :, i))            # λ_p[i] = q_iᵀ A_p q_i (overwritten inside clusters)
+    end
+    cid = Vector{Int}(undef, n)                              # cluster id per eigenvalue (for S below)
+    tol = n * eps(R) * max(abs(w[1]), abs(w[n]))             # w ascending ⇒ max|λ| is an end
+    i = 1
+    @inbounds while i <= n
+        j = i
+        while j < n && w[j + 1] - w[j] <= tol
+            j += 1
+        end
+        cid[i:j] .= i
+        if j > i                                             # degenerate cluster i:j — projected block
+            k = j - i + 1
+            Qc = Q[:, i:j]; Bc = B[:, i:j]
+            M = Matrix{R}(undef, k, k)
+            gemm!(M, transpose(Qc), Bc)                      # M = Q_cᵀ A_p Q_c (symmetric up to rounding)
+            wM, ZM, _ = _syev!(wantz ? 'V' : 'N', 'L', M)
+            wp[i:j] .= wM
+            if wantz                                         # rotate the cluster basis onto M's eigvecs
+                gemm!(view(Q, :, i:j), Qc, ZM); gemm!(view(B, :, i:j), Bc, ZM)
+            end
+        end
+        i = j + 1
+    end
+    wout = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        wout[i] = _mkpair(T, w[i], wp[i])
+    end
+    wantz || return wout, Matrix{T}(undef, 0, 0), info
+    S = Matrix{R}(undef, n, n)
+    gemm!(S, transpose(Q), B)                                # C = Qᵀ A_p Q, then S_ij = C_ij / (λ_j − λ_i)
+    @inbounds for j in 1:n, i in 1:n
+        S[i, j] = cid[i] == cid[j] ? zero(R) : S[i, j] / (w[j] - w[i])
+    end
+    Qp = Matrix{R}(undef, n, n)
+    gemm!(Qp, Q, S)                                          # Q_p = Q·S
+    Z = Matrix{T}(undef, n, n)
+    @inbounds for j in 1:n, i in 1:n
+        Z[i, j] = _mkpair(T, Q[i, j], Qp[i, j])
+    end
+    return wout, Z, info
 end
 
 # ── Engine: _heev!(jobz, uplo, A) → (w, Z, info). COMPLEX Hermitian eigensolver (native). ──────────────
