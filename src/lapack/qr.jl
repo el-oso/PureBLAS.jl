@@ -438,16 +438,11 @@ const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}(
     return V, Tm, G, Wb, Vt
 end
 @inline _qr_ws(::Type{Float64}, m::Int, n::Int, nb::Int) = _qr_ws(m, n, nb)
-# Any other real T (Float32, Dual, BigFloat, …): a per-call workspace. ponytail: no owned pool per element
-# type — the GKH pool is one Ref per CONCRETE type and this signature is open; the alloc is O(m·nb + nb·n)
-# against the O(m·n·k) factorization, and the n=32–64 regime where a fresh alloc dominated Float64 is below
-# `_QR_UNBLK_MAX` (unblocked, no workspace) anyway. Vt exists only for the BlasReal skinny path.
-@inline function _qr_ws(::Type{T}, m::Int, n::Int, nb::Int) where {T}
-    return (
-        Matrix{T}(undef, m, nb), Matrix{T}(undef, nb, nb), Matrix{T}(undef, nb, nb), Matrix{T}(undef, nb, n),
-        T <: BlasReal ? Matrix{T}(undef, nb, m) : Matrix{T}(undef, 0, 0),
-    )
-end
+# Any other real T (Float32, Dual, BigFloat, …) has no owned pool — the GKH pool is one Ref per CONCRETE type
+# and this signature is open — and BORROWS its workspace from the arena inside `geqrf!` instead. The per-call
+# `Matrix{T}` workspace that used to live here was the one allocating LAPACK bang entry (18 736 B per dual
+# `geqrf!` at n=64); "O(m·nb) against an O(m·n·k) factorization" is exactly the rationalisation the
+# no-allocation rule forbids.
 # GENERIC UNBLOCKED QR (LAPACK dgeqr2) for any `T <: Real` that is not Float64 — req#3, so a
 # ForwardDiff.Dual matrix can reach QR at all. The Float64 `qr_unblocked!` above is a pointer/SIMD
 # kernel with no generic path, so this is a separate implementation rather than a widened signature —
@@ -496,7 +491,29 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
         return A
     end
     nb = clamp(nb > 0 ? nb : _qr_nb(T, m, n), 1, k)  # nb>0 = caller override (tuning); else derive
-    V, Tm, G, Wb, Vt = _qr_ws(T, m, n, nb)
+    if T === Float64                                  # the owned GKH pool — the shipped route, untouched
+        V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
+        _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb, Vt)
+    else
+        # Every other T BORROWS from the arena (arena.jl): a `!` routine must not allocate, and the per-call
+        # `Matrix{T}` workspace this used to build measured 18 736 B per dual `geqrf!` at n=64
+        # (bench/probes/lapack_entry_alloc.jl) — the one LAPACK bang entry that was not clean. `Vt` exists
+        # only for the BlasReal skinny arm, so any other T borrows it 0×0 (zero bytes) and never reads it.
+        @scope arn begin
+            V = borrow!(arn, T, m, nb); Tm = borrow!(arn, T, nb, nb); G = borrow!(arn, T, nb, nb)
+            Wb = borrow!(arn, T, nb, n); Vt = T <: BlasReal ? borrow!(arn, T, nb, m) : borrow!(arn, T, 0, 0)
+            _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb, Vt)
+        end
+    end
+    return A
+end
+
+# The blocked compact-WY loop over a supplied workspace: `V` m×nb, `Tm`/`G` nb×nb, `Wb` nb×n, `Vt` nb×m (or
+# 0×0 when `T` is not a BlasReal). `@inline` so the Float64 instantiation compiles to the same body it had
+# when this loop sat in `geqrf!` itself.
+@inline function _geqrf_wy!(
+        A::AbstractMatrix{T}, tau::AbstractVector{T}, m::Int, n::Int, k::Int, nb::Int, V, Tm, G, Wb, Vt
+    ) where {T <: Real}
     pc = 1
     @inbounds while pc <= k
         pb = min(nb, k - pc + 1)
@@ -504,8 +521,8 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
         jt0 = pc + pb
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
-            # `Vtv` ONLY WHEN THE SKINNY PATH WILL USE IT. `_qr_ws(::Type{T}, …)` allocates the Vᵀ
-            # staging buffer as 0×0 for any non-`BlasReal` T, because only the skinny unpacked arm reads
+            # `Vtv` ONLY WHEN THE SKINNY PATH WILL USE IT. `Vt` is borrowed 0×0 for any non-`BlasReal` T
+            # (see `geqrf!`), because only the skinny unpacked arm reads
             # it and that arm is gated on `T <: BlasReal`. Building the view unconditionally therefore
             # threw `BoundsError: attempt to access 0×0 Matrix{Dual} at index [1:16, 1:96]` on every
             # blocked shape for Dual, Float16 and BigFloat — `view` bounds-checks at construction, so it
@@ -559,7 +576,7 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
         end
         pc += pb
     end
-    return A
+    return nothing
 end
 
 # Convenience: allocate tau, return (A overwritten with R + reflectors, tau).

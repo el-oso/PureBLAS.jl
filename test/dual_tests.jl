@@ -408,6 +408,81 @@ end
     end
 end
 
+@testitem "Dual LAPACK: unblocked geqrf (n ≤ _QR_UNBLK_MAX) — the pair-tagged Householder panel matches generic qr" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    # Every shape here is ≤ _QR_UNBLK_MAX on both dims, so geqrf! is ONE qr_unblocked! panel and every
+    # reflector application goes through the `_pairT` arm of `_house_left!` (pair-tagged dot + axpy, svd.jl).
+    @test PureBLAS._pairT(Dual{Nothing, Float64, 1})
+    @testset "$(V) $(m)x$(n)" for V in (Float64, Float32), (m, n) in ((32, 32), (32, 20), (20, 32), (7, 5), (2, 2))
+        A0 = randn(V, m, n); dA = randn(V, m, n); k = min(m, n)
+        A = DualT.mkd(A0, dA); F = copy(A); tau = Vector{eltype(A)}(undef, k)
+        PureBLAS.geqrf!(F, tau)
+        R = [i <= j ? F[i, j] : zero(eltype(F)) for i in 1:k, j in 1:n]
+        Rg = qr(A).R
+        @test value.(R) ≈ value.(Rg)
+        @test partials.(R, 1) ≈ partials.(Rg, 1)
+        Rf = [i <= j ? F[i, j] : zero(eltype(F)) for i in 1:m, j in 1:n]
+        for kk in k:-1:1
+            isfinite(tau[kk]) || continue
+            v = zeros(eltype(F), m); v[kk] = one(eltype(F)); v[(kk + 1):m] = F[(kk + 1):m, kk]
+            Rf .-= (v * (transpose(v) * Rf)) ./ tau[kk]
+        end
+        @test value.(Rf) ≈ A0
+        @test partials.(Rf, 1) ≈ dA
+    end
+end
+
+@testitem "Dual LAPACK: planar _syev! — values/partials vs ForwardDiff, vectors vs eigen, degenerate cluster = projected block" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    # The reference is ForwardDiff's OWN planar eigvals/eigen (LAPACK on the value plane); PB's planar route
+    # must agree wherever the first-order formula is well defined (simple eigenvalues).
+    @testset "$(V) n=$(n) uplo=$(uplo)" for V in (Float64, Float32), n in (1, 2, 9, 40), uplo in ('L', 'U')
+        X = randn(V, n, n); Av = X * X' + V(n) * I; Av = (Av + Av') / 2; Y = randn(V, n, n); Ap = (Y + Y') / 2
+        A = DualT.mkd(Av, Ap)
+        # only the `uplo` triangle may be read (the syev contract): poison the other one
+        C = copy(A)
+        for j in 1:n, i in 1:n
+            ((uplo == 'L' && i < j) || (uplo == 'U' && i > j)) && (C[i, j] = Dual{Nothing}(V(NaN), V(NaN)))
+        end
+        ref = eigvals(Symmetric(A, uplo == 'L' ? :L : :U))
+        w, Z, info = PureBLAS._syev!('N', uplo, copy(C))
+        @test info == 0 && size(Z) == (0, 0)
+        @test value.(w) ≈ value.(ref)
+        @test partials.(w, 1) ≈ partials.(ref, 1) atol = 200 * eps(V) * n * maximum(abs, Av)
+        wv, ZV, _ = PureBLAS._syev!('V', uplo, copy(C))
+        @test value.(wv) ≈ value.(ref) && partials.(wv, 1) ≈ partials.(w, 1)
+        if V === Float64                                       # vector partials: ForwardDiff's eigen, sign-aligned per column
+            E = eigen(Symmetric(A, uplo == 'L' ? :L : :U))
+            Qr = value.(E.vectors); Qv = value.(ZV)
+            sg = [sign(dot(Qr[:, j], Qv[:, j])) for j in 1:n]
+            @test Qv ≈ Qr .* sg'
+            @test partials.(ZV, 1) ≈ partials.(E.vectors, 1) .* sg' atol = 1e-7 * n * maximum(abs, Ap)
+        end
+    end
+    # DEGENERATE cluster: λ = 1 (×3) — the first-order derivatives of the ascending branches are the
+    # ascending eigenvalues of the projected block Q_cᵀ A_p Q_c (degenerate perturbation theory), which a
+    # one-sided finite difference of the sorted eigenvalues confirms. ForwardDiff's diag(Q'·A_p·Q) is NOT
+    # that (it depends on the arbitrary basis LAPACK picked in the eigenspace) and is excluded on purpose.
+    let n = 12
+        Qo = Matrix(qr(randn(n, n)).Q); lam = [1.0, 1.0, 1.0, 3.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        Av = Qo * Diagonal(lam) * Qo'; Av = (Av + Av') / 2; Y = randn(n, n); Ap = (Y + Y') / 2
+        w, Z, _ = PureBLAS._syev!('V', 'L', DualT.mkd(Av, Ap))
+        Qc = eigen(Symmetric(Av)).vectors[:, 1:3]
+        blk = eigvals(Symmetric(Qc' * Ap * Qc))
+        @test partials.(w[1:3], 1) ≈ blk rtol = 1e-8
+        h = 1e-6
+        fd = (eigvals(Symmetric(Av .+ h .* Ap)) .- eigvals(Symmetric(Av))) ./ h
+        @test partials.(w, 1) ≈ fd rtol = 1e-4
+        # the cluster's vectors were rotated onto the block's eigenvectors: they diagonalise the projected A_p
+        Qv = value.(Z)[:, 1:3]
+        @test Qv' * Qv ≈ I atol = 1e-12
+        M = Qv' * Ap * Qv
+        @test M ≈ Diagonal(diag(M)) atol = 1e-10
+    end
+end
+
 @testitem "StrictMode dogfood: BLAS-3 dual strict contract" tags = [:checks] begin
     using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
     using ForwardDiff: Dual
