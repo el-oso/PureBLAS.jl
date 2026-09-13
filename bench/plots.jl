@@ -505,7 +505,10 @@ _reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 # reps hack needed — Chairmarks amortizes internally).
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
-function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic)
+                                       # `refs` mirrors `sweep`'s override, for DL3 — see the note there.
+function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic, refs = nothing)
+    armlist = isnothing(refs) ? nothing :
+        vcat(_DO_PB ? [_ARM_PB] : String[], [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     out = Tuple{Int, CellData}[]
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
@@ -521,7 +524,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
         acc = ArmData(); rmeds = Float64[]
         for r in 1:rounds
             qs = ArmData()
-            for a in _round_arms(r)      # rotated (generalised ABBA); reference switch is outside the window
+            for a in (isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1))  # rotated (generalised ABBA); reference switch is outside the window
                 f = a == _ARM_PB ? pb1 : (_use_ref!(a); ob1)
                 # Bracket each arm's window with a clock sample. One sample AFTER the fact (what
                 # `_cell_khz()` alone gives) records the clock when we finished, not the clock the work
@@ -1382,11 +1385,79 @@ function run_cmplx_benchmarks()
                     (c, m) -> (s = zero(D); for _ in 1:m; s += PureBLAS.nrm2(c[1]); end; s.value)),
                 ("dasum1", (c, m) -> (s = zero(D); for _ in 1:m; s += sum(abs, c[1]); end; s.value),
                     (c, m) -> (s = zero(D); for _ in 1:m; s += PureBLAS.asum(c[1]); end; s.value)),
-                ("diamax1", (c, m) -> (s = 0; for _ in 1:m; s += argmax(abs.(c[1])); end; s),
+                # `findmax(abs, x)[2]`, NOT `argmax(abs.(x))`. The dotted form builds a full n-element
+                # temporary before it searches — measured 160072 B at n=10000, against 0 B for this one,
+                # and both return the same index (6059, which is also what `PureBLAS.iamax` returns).
+                # Timing the reference's ALLOCATION and calling the difference our speedup would inflate
+                # this row and nothing else: its sibling `dasum1` already uses the 2-arg `sum(abs, x)`.
+                # A reference arm has to be the fastest honest way to write the operation, or the ratio
+                # measures our kernel against a strawman.
+                ("diamax1", (c, m) -> (s = 0; for _ in 1:m; s += findmax(abs, c[1])[2]; end; s),
                     (c, m) -> (s = 0; for _ in 1:m; s += PureBLAS.iamax(c[1]); end; s)),
             )
             _meas!(dl1, "DL1", nm, () -> sweep(mkd, _sizes(L1SZ), ob, pb, _L1REP; refs = ["generic"]))
         end
+    end
+
+    # ── DL2 / DL3: BLAS-2 and BLAS-3 over Dual ───────────────────────────────────────────────────────
+    # Same contract as DL1: the reference is LinearAlgebra's GENERIC fallback over `Dual`, because no
+    # vendor BLAS has a dual path. See the DL1 note above for why `generic` is not in `_REF_ALL`.
+    #
+    # THE REFERENCE MUST BE THE FASTEST HONEST WAY TO WRITE THE OP, not the most obvious one — the
+    # `diamax1` row above measured `argmax(abs.(x))`, whose dotted temporary cost 160 KB a call at
+    # n=1e4, and the ratio flattered us by exactly that. So every reference below is the in-place
+    # 5-argument `mul!` / `lmul!` / `ldiv!` form, which is what LinearAlgebra actually dispatches a
+    # `Dual` matrix through and allocates nothing per call.
+    #
+    # L3 is capped at 2048 like CL3, and for a second reason beyond CL3's "10 min for little signal":
+    # the planar route holds SIX real planes of scratch, so 4096² F64 is ~805 MB (docs/src/dual_l3.md).
+    # That is the same order as real Strassen's level scratch at that size, but it is not a footprint
+    # to put in a default sweep.
+    dl2 = OpData[]
+    dl3 = OpData[]
+    let
+        D = ForwardDiff.Dual{Nothing, Float64, 1}
+        rd() = ForwardDiff.Dual{Nothing}(randn(), randn())
+        dvec(n) = D[rd() for _ in 1:n]
+        dmat(m, n) = D[rd() for _ in 1:m, _ in 1:n]
+        # unit-ish diagonal so trsv/trsm are well conditioned, mirroring `tri`/`ctri`
+        dtri(s) = (A = dmat(s, s) ./ (2s); for i in 1:s
+                A[i, i] = ForwardDiff.Dual{Nothing}(1 + abs(ForwardDiff.value(A[i, i])), randn())
+            end; A)
+        dsq(s) = (dmat(s, s), dvec(s), dvec(s))
+        dtriv(s) = (dtri(s), dvec(s), dvec(s))
+
+        add2(nm, mk, ob, pb) = _meas!(dl2, "DL2", nm, () -> sweep(mk, _sizes(L2SZ), ob, pb, _L2REP; refs = ["generic"]))
+        add2("dgemvN1", dsq,
+            (c, m) -> (for _ in 1:m; LinearAlgebra.mul!(c[3], c[1], c[2]); end; c[3][1].value),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]); end; c[3][1].value))
+        add2("dgemvT1", dsq,
+            (c, m) -> (for _ in 1:m; LinearAlgebra.mul!(c[3], transpose(c[1]), c[2]); end; c[3][1].value),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; trans = TT); end; c[3][1].value))
+        add2("dger1", dsq,
+            (c, m) -> (for _ in 1:m; LinearAlgebra.mul!(c[1], c[2], transpose(c[3]), true, true); end; c[1][1].value),
+            (c, m) -> (for _ in 1:m; PureBLAS.ger!(one(D), c[2], c[3], c[1]); end; c[1][1].value))
+        add2("dtrmv1", dtriv,
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); LinearAlgebra.lmul!(UpperTriangular(c[1]), c[3]); end; c[3][1].value),
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trmv!(c[1], c[3]; uplo = U); end; c[3][1].value))
+        add2("dtrsv1", dtriv,
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); LinearAlgebra.ldiv!(UpperTriangular(c[1]), c[3]); end; c[3][1].value),
+            (c, m) -> (for _ in 1:m; copyto!(c[3], c[2]); PureBLAS.trsv!(c[1], c[3]; uplo = U); end; c[3][1].value))
+
+        add3(nm, mk, ob, pb) = _meas!(dl3, "DL3", nm,
+            () -> sweep_heavy(mk, ob, pb, _sizes(_cap(L3SZ, 2048)); refs = ["generic"]))
+        add3("dgemm1", s -> (dmat(s, s), dmat(s, s), zeros(D, s, s)),
+            c -> (LinearAlgebra.mul!(c[3], c[1], c[2]); c[3][1].value),
+            c -> (PureBLAS.gemm!(c[3], c[1], c[2]); c[3][1].value))
+        add3("dsyrk1", s -> (dmat(s, s), zeros(D, s, s)),
+            c -> (LinearAlgebra.mul!(c[2], c[1], transpose(c[1])); c[2][1].value),
+            c -> (PureBLAS.syrk!(c[2], c[1]; uplo = U, trans = TN, alpha = one(D), beta = zero(D)); c[2][1].value))
+        add3("dtrmm1", s -> (dtri(s), dmat(s, s)),
+            c -> (LinearAlgebra.lmul!(UpperTriangular(c[1]), c[2]); c[2][1].value),
+            c -> (PureBLAS.trmm!(c[2], c[1]; side = Char(76), uplo = U); c[2][1].value))
+        add3("dtrsm1", s -> (dtri(s), dmat(s, s)),
+            c -> (LinearAlgebra.ldiv!(UpperTriangular(c[1]), c[2]); c[2][1].value),
+            c -> (PureBLAS.trsm!(c[2], c[1]; side = Char(76), uplo = U); c[2][1].value))
     end
     cl2 = OpData[]
     let
@@ -1648,7 +1719,7 @@ function run_cmplx_benchmarks()
             c -> (PureBLAS._heev!('N', 'L', c); real(c[1, 1]))
         )
     end
-    return cl1, cl2, cl3, clp, dl1
+    return cl1, cl2, cl3, clp, dl1, dl2, dl3
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
@@ -2302,10 +2373,10 @@ else
     _contention_check()
     _pref_check()          # pins are legitimate; not KNOWING about them is not
     l1, l2, l3, lp = run_benchmarks()
-    cl1, cl2, cl3, clp, dl1 = run_cmplx_benchmarks()
+    cl1, cl2, cl3, clp, dl1, dl2, dl3 = run_cmplx_benchmarks()
     _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
-    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1)
+    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
     if subset
         # subset re-measure: MERGE the measured op(s) into the existing (v2) cache, leaving the rest intact.
@@ -2361,7 +2432,7 @@ else
         end
         g = measured
     end
-    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1")])
+    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3")])
 end
 
 adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR; mkpath(adir)
@@ -2398,7 +2469,7 @@ else
             # here asks for an arm that does not exist and renders an EMPTY Dual section in both views.
             # The section is therefore identical in the OpenBLAS and AOCL files, which is correct: there
             # is only one Dual denominator, so there is only one Dual table.
-            println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1"], "generic"))
+            println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1", "DL2", "DL3"], "generic"))
         end
         println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
     end
@@ -2409,10 +2480,14 @@ else
     # — two files, both empty, both looking like a measured group with no gap. One file, one honest
     # denominator. `_refsuf("generic")` is deliberately NOT used in the name: there is only ever one
     # Dual panel, so it needs no view suffix to disambiguate it from a sibling that does not exist.
-    svg_panels(
-        joinpath(adir, "perf_dl1$L.svg"),
-        "Dual BLAS-1 (forward-mode AD) — PB / $(_refname("generic")) ratio", fleet, "DL1", "generic"
-    )
+    for (gk, base, ttl) in (
+            ("DL1", "dl1", "Dual BLAS-1"), ("DL2", "dl2", "Dual BLAS-2"), ("DL3", "dl3", "Dual BLAS-3"),
+        )
+        svg_panels(
+            joinpath(adir, "perf_$(base)$L.svg"),
+            "$ttl (forward-mode AD) — PB / $(_refname("generic")) ratio", fleet, gk, "generic"
+        )
+    end
     # Provenance for EVERY artifact this invocation writes (both views come from the same caches, so it
     # is written once, outside the view loop — two copies could disagree, one cannot).
     open(joinpath(tdir, "provenance$L.md"), "w") do io
@@ -2441,7 +2516,7 @@ const _ADJ_TOL = 0.02
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of
 # eyeballing two separately-measured tables. `gate` is the worst over cells of min over references,
 # i.e. the margin against whichever reference is faster at each individual size.
-for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1"), (nm, cells) in get(g, lvl, OpData[])
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3"), (nm, cells) in get(g, lvl, OpData[])
     per = Dict{String, Tuple{Float64, Float64}}()
     for r in _REF_ALL
         ps = _series(g, lvl, nm, r)
