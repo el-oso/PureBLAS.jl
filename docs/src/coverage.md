@@ -206,6 +206,19 @@ Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Flo
 <tr><th><code>dtrsv1</code></th><td class="ok"><span class="v">1.74</span></td><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.35</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
 </tbody></table></div>
 ```
+
+#### Dual BLAS-3
+
+Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Float64,1}` — what a forward-mode AD user gets today without PureBLAS. `Dual` is not a `BlasFloat`, so no vendor BLAS is reachable and there is no OpenBLAS/AOCL arm: these ratios are **not** gate verdicts and do not compare against `max(OpenBLAS, AOCL)`.
+
+```@raw html
+<div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th><th>swept at</th><th>toolchain</th></tr></thead><tbody>
+<tr><th><code>dgemm1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">2.33</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dsyrk1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.35</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dtrmm1</code></th><td><span class="n">—</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=8</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dtrsm1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.36</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+</tbody></table></div>
+```
 ```@raw html
 <p class="pbg-key">
  <span><i style="background:#1f8a5b"></i>gates (≥ 1.0)</span>

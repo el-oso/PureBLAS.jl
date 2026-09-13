@@ -2273,7 +2273,25 @@ function _ref_age(g, ref::AbstractString = REFBK)
 end
 
 function svg_panels(path, title, fleet, gk, ref::AbstractString = REFBK)
-    ops = _opsin(fleet, gk); isempty(ops) && return
+    ops = _opsin(fleet, gk)
+    # A GROUP WITH NO CELLS STILL WRITES A FILE. This used to `return` silently, which breaks the docs
+    # build rather than the plot: `docs/src/performance.md` references each panel by name, Documenter
+    # downgrades a missing image to a WARNING, and then vitepress hard-fails on the unresolved import
+    # ("Rollup failed to resolve import assets/perf_dl3.svg"). That took the Documentation workflow red
+    # three times in one day — once per newly wired group — because a group is referenced from the
+    # moment it is wired and measured only later. A placeholder makes the reference valid immediately
+    # and says, on the published page, that the group is pending rather than absent.
+    if isempty(ops)
+        W, H = 640, 96
+        open(path, "w") do io
+            println(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$W" height="$H" font-family="sans-serif">""")
+            println(io, """<rect width="$W" height="$H" fill="white"/>""")
+            println(io, """<text x="$(W ÷ 2)" y="38" text-anchor="middle" font-size="16" font-weight="bold">$title</text>""")
+            println(io, """<text x="$(W ÷ 2)" y="66" text-anchor="middle" font-size="13" fill="#666">not yet measured on any box in this fleet</text>""")
+            println(io, "</svg>")
+        end
+        return
+    end
     ncol = min(4, length(ops)); nrow = cld(length(ops), ncol)
     pw = 210; ph = 138; ml = 46; mt = 60; gx = 20; gy = 34; pad = 16
     W = ml + ncol * pw + (ncol - 1) * gx + pad
