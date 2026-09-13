@@ -78,7 +78,7 @@ if [ $bad -ne 0 ]; then
 CLOCK-MISMATCHED CELLS PRESENT — the PB arm and its reference arms were measured at different clocks,
 so those ratios compare two machine states and are INVALID (freq rule: discard, do not explain).
 Re-lock the box (`sudo bench/fleet_freqlock.sh lock`), confirm it HOLDS under load, and re-measure:
-    for g in L1 L2 L3 LP CL1 CL2 CL3 CLP DL1; do
+    for g in L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP; do
         julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw
     done
 MSG

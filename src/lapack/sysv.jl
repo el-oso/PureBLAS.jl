@@ -28,6 +28,70 @@
 # uplo='L': invert in place from A = L·D·Lᵀ (herm=false) or L·D·Lᴴ (herm=true). `work` is an n-length
 # scratch (the LAPACK WORK array). Only the lower triangle is read/written; result is the lower triangle
 # of the symmetric/Hermitian inverse.
+# THE CROSSING-STRIP SWAP, and why it is not the obvious one-element loop.
+#
+# The strip exchanges a COLUMN segment `A[jlo:jhi, kc]` (stride 1, contiguous) with a ROW segment
+# `A[kr, jlo:jhi]` (stride `lda`). At a power-of-two `lda` the row side is pathological: on Zen4,
+# lda=512 doubles is 4096 B, so EVERY element of the row sits on its own page and in the same L1 set.
+# Measured in isolation (`bench/probes/sytri_strip_ab.jl`), one full sweep of strips at n=512:
+#
+#     lda = n      (po2)   1370.7 us        lda = n + 8   56.3 us      -- 24x, from eight elements
+#
+# That is the whole of `sytri`'s non-symv time: the decomposition
+# (`bench/probes/sytri_decompose.jl`) puts symv at 0.99-1.07 of OpenBLAS's while PB's glue is 1295 us
+# of a 5362 us total at n=512, and `sytri@512` publishes 0.831.
+#
+# BATCHING THE SWAPS IS INVALID — checked, do not try it. The tempting fix is to collect every
+# interchange and apply one `A <- P A P'` at the end, which would be blocked and tiled and capture the
+# full 24x. It cannot be done: each iteration computes its column from `Asub = A[k+1:n, k+1:n]`, and the
+# swap writes `A[kp,j]` for j in k+1:kp-1, `A[i,kp]` for i>kp and `A[kp,kp]` — every one of those has
+# BOTH indices >= k+1, i.e. inside the trailing block the NEXT iteration reads. The swaps are part of
+# the recurrence, not a permutation of a finished result.
+#
+# Nor can the strip be made contiguous: it exchanges a column segment with a row segment, both in the
+# STORED lower (or upper) triangle, so one side is always strided — and `A[j,kp]`, the symmetric
+# alternative to `A[kp,j]`, is in the untouched triangle and not stored.
+#
+# So what is left is the FORMULATION, measured four ways at po2 lda (same probe):
+#     base (one-element read-modify-write)   1370.7 us
+#     gather / swap / scatter via `work`     1061.9 us   <- 22% better
+#     + software prefetch, D=8 / D=32        1487 / 1518 us  -- WORSE; the hw prefetcher already has the
+#                                            stride and a hint cannot fix a TLB miss
+#     tiled over j (TW=64)                   1381.9 us   -- inert, as it must be: reordering cannot
+#                                            reduce the page count when each element owns a page
+#
+# Three clean passes beat one interleaved read-modify-write because the RMW writes back to a line that
+# conflicts with the next read. But it INVERTS off the pathology — 111.9 us vs 56.3 at lda = n+8, 2x
+# WORSE — so it is gated on `_alias_ld` (level3.jl), the same full-L1-way-period predicate the trsm and
+# hessenberg po2 paths use. `work` is the sytri arena borrow, dead at swap time (its symv and dots are
+# done for this k), so staging costs no extra memory.
+@inline function _strip_swap!(A, work, jlo::Int, jhi::Int, kc::Int, kr::Int, herm::Bool)
+    ns = jhi - jlo + 1
+    ns <= 0 && return nothing
+    @inbounds if _alias_ld(stride(A, 2))
+        for t in 1:ns                                     # gather the strided row side
+            work[t] = A[kr, jlo + t - 1]
+        end
+        for t in 1:ns                                     # swap against the contiguous column side
+            tmp = A[jlo + t - 1, kc]
+            A[jlo + t - 1, kc] = herm ? conj(work[t]) : work[t]
+            work[t] = herm ? conj(tmp) : tmp
+        end
+        for t in 1:ns                                     # scatter back
+            A[kr, jlo + t - 1] = work[t]
+        end
+    else
+        for j in jlo:jhi
+            if herm
+                tmp = conj(A[j, kc]); A[j, kc] = conj(A[kr, j]); A[kr, j] = tmp
+            else
+                tmp = A[j, kc]; A[j, kc] = A[kr, j]; A[kr, j] = tmp
+            end
+        end
+    end
+    return nothing
+end
+
 function _sytri_lower!(
         A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, herm::Bool,
         work::AbstractVector{T}
@@ -86,13 +150,7 @@ function _sytri_lower!(
                         tmp = A[i, k]; A[i, k] = A[i, kp]; A[i, kp] = tmp
                     end
                 end
-                for j in (k + 1):(kp - 1)                     # crossing strip A[k+1:kp-1,k] ↔ A[kp,k+1:kp-1]
-                    if herm
-                        tmp = conj(A[j, k]); A[j, k] = conj(A[kp, j]); A[kp, j] = tmp
-                    else
-                        tmp = A[j, k]; A[j, k] = A[kp, j]; A[kp, j] = tmp
-                    end
-                end
+                _strip_swap!(A, work, k + 1, kp - 1, k, kp, herm)   # A[k+1:kp-1,k] ↔ A[kp,k+1:kp-1]
                 herm && (A[kp, k] = conj(A[kp, k]))
                 tmp = A[k, k]; A[k, k] = A[kp, kp]; A[kp, kp] = tmp
                 if kstep == 2
@@ -163,13 +221,7 @@ function _sytri_upper!(
                 for i in 1:(kp - 1)
                     tmp = A[i, k]; A[i, k] = A[i, kp]; A[i, kp] = tmp
                 end
-                for j in (kp + 1):(k - 1)                     # crossing strip A[kp+1:k-1,k] ↔ A[kp,kp+1:k-1]
-                    if herm
-                        tmp = conj(A[j, k]); A[j, k] = conj(A[kp, j]); A[kp, j] = tmp
-                    else
-                        tmp = A[j, k]; A[j, k] = A[kp, j]; A[kp, j] = tmp
-                    end
-                end
+                _strip_swap!(A, work, kp + 1, k - 1, k, kp, herm)   # A[kp+1:k-1,k] ↔ A[kp,kp+1:k-1]
                 herm && (A[kp, k] = conj(A[kp, k]))
                 tmp = A[k, k]; A[k, k] = A[kp, kp]; A[kp, kp] = tmp
                 if kstep == 2
