@@ -27,6 +27,9 @@ makedocs(;
             "Scratch Arena" => "arena.md",
             "SIMD & Hardware Adaptation" => "simd.md",
             "Dual Numbers (forward-mode AD)" => "dual.md",
+            "Dual BLAS-2" => "dual_l2.md",
+            "Dual BLAS-3" => "dual_l3.md",
+            "Dual LAPACK" => "dual_lp.md",
         ],
         "Tuning" => [
             "Tuning Constants" => "tuning.md",
