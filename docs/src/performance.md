@@ -38,5 +38,16 @@ cell; [Notes](notes.md) has the per-routine analysis and history.
 ![Complex BLAS-3 — PB / AOCL ratio per op, three µarchs](assets/perf_cl3_aocl.svg)
 ![Complex LAPACK — PB / AOCL ratio per op, three µarchs](assets/perf_clapack_aocl.svg)
 
+## vs LinearAlgebra generic (dual numbers)
+
+One section, not two, because there is no second reference to compare against.
+`ForwardDiff.Dual{Tag,Float64,1}` is not a `BlasFloat`, so LinearAlgebra dispatches to its own generic
+fallback and no vendor BLAS is ever reached — OpenBLAS and AOCL have no dual-number path at all. The
+denominator here is therefore what a forward-mode AD user gets today *without* PureBLAS, and these
+ratios are **not** gate verdicts: the gate is `PB ≥ max(OpenBLAS, AOCL)`, which is undefined for this
+element type.
+
+![Dual BLAS-1 — PB / LinearAlgebra generic ratio per op, three µarchs](assets/perf_dl1.svg)
+
 These numbers apply however you call PureBLAS. The native API (`PureBLAS.gemm!(…)`), the in-process
 reroute through `activate()`, and the `libpureblas.so` built for C hosts all run the same kernels.
