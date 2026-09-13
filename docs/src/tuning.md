@@ -114,15 +114,17 @@ the kernel sweeps over it. The canonical shape is
 Worked example: `_qr_nb` (`src/lapack/qr.jl`), the real blocked-QR panel width.
 
 ```julia
-@inline _qr_nb(m::Int, n::Int) = (
+@inline _qr_nb(::Type{T}, m::Int, n::Int) where {T} = (
     fl = 256 ÷ _NVREG;
-    clamp(fl * cld(m * n * sizeof(Float64), _L2_BYTES), fl, 32)
+    clamp(fl * cld(m * n * sizeof(T), _L2_BYTES), fl, 32)
 )
+@inline _qr_nb(m::Int, n::Int) = _qr_nb(Float64, m, n)   # the Float64 ramp the other blocked drivers key on
 ```
 
 Decode it term by term:
 
-- `cld(m·n·8, _L2_BYTES)` asks how many times the matrix overflows L2. While it stays
+- `cld(m·n·sizeof(T), _L2_BYTES)` asks how many times the matrix overflows L2 — in BYTES, so the
+  element width enters (a `Dual{Tag,Float64,1}` is 16 B and spills at half the m·n). While it stays
   L2-resident the trailing update re-streams from cache and a narrow panel is fine; once
   it spills, every panel re-streams the trailing matrix from DRAM (sweep traffic ∝ k/nb),
   so nb has to grow with the overflow factor to keep those bytes bounded.
