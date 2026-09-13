@@ -61,9 +61,23 @@ need_root() { [ "$(id -u)" -eq 0 ] || { echo "!! needs root: sudo $0 $*"; exit 1
 achieved_mhz() {
     local core="$1" c
     if command -v perf >/dev/null 2>&1; then
-        c=$(perf stat -x, -e cycles -- taskset -c "$core" timeout 1 bash -c 'while :; do :; done' 2>&1 \
-            | awk -F, 'tolower($0) ~ /cycles/ {gsub(/ /,"",$1); print $1; exit}')
-        [[ "$c" =~ ^[0-9]+$ ]] && { echo $(( c / 1000000 )); return; }
+        # DIVIDE BY THE WINDOW perf ACTUALLY MEASURED, not by an assumed 1 s. `timeout 1` does not
+        # guarantee a 1-second counting window — perf reports the enabled time in field 4 (ns), and on
+        # 2026-09-13 neuromancer returned 675463463 cycles over 341375879 ns. That is 1.98 GHz, exactly
+        # its 2000 MHz pin; dividing by 1e6 reported it as "675 MHz" and the box looked catastrophically
+        # throttled. The error is proportional (0.341 s window => 0.341x the true figure), so it always
+        # UNDER-reports, i.e. it condemns a healthy box rather than passing a broken one — but it cost a
+        # killed sweep and a long detour through platform_profile, RAPL and thermals before the CSV was
+        # read carefully. galen and wintermute were unaffected only because their windows landed near 1 s.
+        local out ns
+        out=$(perf stat -x, -e cycles -- taskset -c "$core" timeout 1 bash -c 'while :; do :; done' 2>&1 \
+            | awk -F, 'tolower($0) ~ /cycles/ {print; exit}')
+        c=$(printf '%s' "$out" | awk -F, '{gsub(/ /,"",$1); print $1}')
+        ns=$(printf '%s' "$out" | awk -F, '{gsub(/ /,"",$4); print $4}')
+        if [[ "$c" =~ ^[0-9]+$ ]] && [[ "$ns" =~ ^[0-9]+$ ]] && [ "$ns" -gt 0 ]; then
+            echo $(( c * 1000 / ns )); return           # cycles / ns * 1000 = MHz
+        fi
+        [[ "$c" =~ ^[0-9]+$ ]] && { echo $(( c / 1000000 )); return; }   # pre-5.x perf: no field 4
     fi
     taskset -c "$core" timeout 2 bash -c 'while :; do :; done' & local pid=$! s=0 n=0
     sleep 0.4
