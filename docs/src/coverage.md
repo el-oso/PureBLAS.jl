@@ -168,13 +168,13 @@ html.dark .pbg-key{color:#98a1b3}
 <tr><th><code>sytrs</code></th><td class="ok"><span class="v">1.48</span></td><td class="ok"><span class="v">1.4</span></td><td class="ok"><span class="v">1.32</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>trtri</code></th><td class="b3"><span class="v">0.935</span><span class="n">n=2048</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.07</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
 <tr><th><code>trtrs</code></th><td class="ok"><span class="v">1.11</span></td><td class="b3"><span class="v">0.925</span><span class="n">n=50</span></td><td class="b2"><span class="v">0.969</span><span class="n">n=2048</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.08</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.03</span></td><td class="b3"><span class="v">0.946</span><span class="n">n=50</span></td><td class="ok"><span class="v">1.02</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.01</span></td><td class="b4"><span class="v">0.825</span><span class="n">n=50</span></td><td class="b4"><span class="v">0.846</span><span class="n">n=100</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.32</span></td><td class="ok"><span class="v">1.18</span></td><td class="ok"><span class="v">1.05</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.16</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.06</span></td><td class="ok"><span class="v">1.01</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
-<tr><th><code>zpotrfU</code></th><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.02</span></td><td class="ok"><span class="v">1.01</span></td><td class="h"><span class="n">c78fbf4</span></td><td class="n"><span class="n">?</span></td></tr>
+<tr><th><code>zgeqrf</code></th><td class="ok"><span class="v">1.14</span></td><td class="ok"><span class="v">1.03</span></td><td class="ok"><span class="v">1.08</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zgesvd</code></th><td class="ok"><span class="v">1.02</span></td><td class="b3"><span class="v">0.94</span><span class="n">n=50</span></td><td class="ok"><span class="v">1.03</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zgetrf</code></th><td class="ok"><span class="v">1.01</span></td><td class="b4"><span class="v">0.824</span><span class="n">n=50</span></td><td class="b4"><span class="v">0.846</span><span class="n">n=100</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zheev</code></th><td class="ok"><span class="v">1.32</span></td><td class="ok"><span class="v">1.18</span></td><td class="ok"><span class="v">1.05</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zheevN</code></th><td class="ok"><span class="v">1.12</span></td><td class="ok"><span class="v">1.08</span></td><td class="ok"><span class="v">1.16</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zpotrf</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.05</span></td><td class="ok"><span class="v">1.01</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>zpotrfU</code></th><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.04</span></td><td class="ok"><span class="v">1.01</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
 </tbody></table></div>
 ```
 
@@ -213,10 +213,10 @@ Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Flo
 
 ```@raw html
 <div class="pbg-wrap"><table class="pbg"><thead><tr><th>routine</th><th>Zen3 · AVX2</th><th>Zen4 · AVX-512</th><th>Zen5 · AVX-512</th><th>swept at</th><th>toolchain</th></tr></thead><tbody>
-<tr><th><code>dgemm1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">2.33</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
-<tr><th><code>dsyrk1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.35</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
-<tr><th><code>dtrmm1</code></th><td><span class="n">—</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=8</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
-<tr><th><code>dtrsm1</code></th><td><span class="n">—</span></td><td class="ok"><span class="v">1.36</span></td><td><span class="n">—</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dgemm1</code></th><td class="ok"><span class="v">1.85</span></td><td class="ok"><span class="v">2.33</span></td><td class="ok"><span class="v">2.32</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dsyrk1</code></th><td class="ok"><span class="v">1.07</span></td><td class="ok"><span class="v">1.35</span></td><td class="ok"><span class="v">1.25</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dtrmm1</code></th><td class="ok"><span class="v">1.01</span></td><td class="b2"><span class="v">0.989</span><span class="n">n=8</span></td><td class="ok"><span class="v">1.05</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
+<tr><th><code>dtrsm1</code></th><td class="ok"><span class="v">1.81</span></td><td class="ok"><span class="v">1.36</span></td><td class="ok"><span class="v">1.62</span></td><td class="h"><span class="n">a02c382</span></td><td class="h"><span class="n">1.13.0</span></td></tr>
 </tbody></table></div>
 ```
 ```@raw html
@@ -246,7 +246,7 @@ Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Flo
 | Triangular solve | trtrs | s/d/c/z | ✅ | 1.1 | **0.916** | **0.969** | 1.34 / 1.04 | 1.24 / 0.916 |
 | Least-squares | gels | s/d/c/z | ✅ | 1.09 | 1.28 | 1.21 | 2.47 / 1.42 | 1.84 / 1.28 |
 | SVD | gesvd, gesdd | s/d/c/z | ✅ | 1.04 | **0.957** | **0.99** | 1.3 / 1.05 | 1.23 / 0.957 |
-| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | **0.952** | **0.964** | 1.05 | 1.38 / 0.964 | 1.52 / 1.1 |
+| Symmetric eigen | syev, syevd, syevr | s/d/c/z | ✅ | **0.952** | **0.964** | 1.05 | 1.38 / 0.964 | 1.53 / 1.1 |
 
 The `geo/worst` columns are per reference and scoped to Zen4; the per-box columns left of them are the
 gate. The solves (`potrs`/`getrs`/`trtrs`) are not yet gated — the band on those rows is for the
