@@ -666,11 +666,15 @@ function _hetrd!(
     ) where {T <: Complex, R <: Real}
     n = size(A, 1)
     n == 0 && return
-    # DELIBERATELY the Float64-sized width, NOT `_sytrd_nb(T, n)`. Typing it here would halve the panel
-    # (sizeof(ComplexF64)=16 vs 8) and so CHANGE shipped complex behaviour — `zheev`/`zheevN` publish at
-    # 1.176/1.072 against this blocking, and re-tuning complex is not a side effect a dual-number fix
-    # gets to have. The residency criterion arguably wants `sizeof(T)` (req#8), but that is a measured
-    # change, not a free one: it needs a CLP sweep before it ships. Tracked, not silently taken.
+    # DELIBERATELY the Float64-sized width, NOT `_sytrd_nb(T, n)`, and MEASURED rather than assumed.
+    # The width is `clamp(8 * cld(m·n·sizeof(T), L2), 8, 32)` — a coarse step function taking only
+    # 8/16/24/32 — so doubling `sizeof(T)` moves the BUCKET BOUNDARIES, not every value. Swept
+    # n=32:16:1200 on Zen4: the two sizings agree at 51 of 74 sizes and DIFFER at 23 (31%), the split
+    # opening at n=272, where Float64-sized gives 8 and ComplexF64-sized gives 16 — a DOUBLED panel.
+    # So typing this would change shipped complex behaviour over about a third of the size range, and
+    # `zheev`/`zheevN` publish at 1.176/1.072 against the current blocking. The residency criterion
+    # arguably DOES want `sizeof(T)` here (req#8) — but that is a measured change needing a CLP sweep,
+    # not a free one taken as a side effect of a dual-number fix. Deferred with its cost known.
     nb = _sytrd_nb(n)
     nx = 2 * nb
     if n <= nx || nb <= 1

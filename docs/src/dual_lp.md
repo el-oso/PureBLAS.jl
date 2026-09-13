@@ -258,11 +258,20 @@ matters — a factorization can be right on the value and have silently lost the
 were 8 — a req#8 violation that produces no error, just a wrong panel width. Now
 `_sytrd_nb(::Type{T}, n) = _qr_nb(T, n, n)`, with the 2-arg form kept for existing callers.
 
-**The complex `_hetrd!` call site is deliberately NOT typed.** Doing so would halve its panel
-(`sizeof(ComplexF64)` = 16 vs 8) and change shipped behaviour — `zheev`/`zheevN` publish at
-1.176/1.072 against the current blocking. The residency criterion arguably wants `sizeof(T)` there
-too, but that is a measured change needing a CLP sweep, not a free one taken as a side effect of a
-dual-number fix. Tracked here rather than silently applied.
+**The complex `_hetrd!` call site is deliberately NOT typed — and the cost of typing it was measured,
+not guessed.** The width is `clamp(8 · cld(m·n·sizeof(T), L2), 8, 32)`, a coarse step function taking
+only 8/16/24/32, so doubling `sizeof(T)` moves the bucket boundaries rather than every value. Swept
+n=32:16:1200 on Zen4: the two sizings **agree at 51 of 74 sizes and differ at 23 (31%)**, the split
+opening at **n=272**, where Float64-sized gives 8 and ComplexF64-sized gives **16 — a doubled panel**.
+So typing it changes shipped complex tridiagonalization (`hetrd` → `zheev`/`zheevN`/`hegvd`) across
+about a third of the size range, and `zheev`/`zheevN` publish at 1.176/1.072 against the current
+blocking.
+
+The residency criterion arguably *does* want `sizeof(T)` there too — this is a real req#8 debt, not a
+false alarm. But it is a **measured** change needing a CLP sweep, not a free one taken as a side
+effect of a dual-number fix, and the sweep now has its range: the cells that can move are the 23
+sizes from n=272 up where the buckets disagree. Deferred with its cost known rather than silently
+applied.
 
 ## 9. What is actually left
 
