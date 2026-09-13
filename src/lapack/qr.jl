@@ -504,7 +504,13 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
         jt0 = pc + pb
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
-            Vv = view(V, 1:mp, 1:pb); Vtv = view(Vt, 1:pb, 1:mp)
+            # `Vtv` ONLY WHEN THE SKINNY PATH WILL USE IT. `_qr_ws(::Type{T}, …)` allocates the Vᵀ
+            # staging buffer as 0×0 for any non-`BlasReal` T, because only the skinny unpacked arm reads
+            # it and that arm is gated on `T <: BlasReal`. Building the view unconditionally therefore
+            # threw `BoundsError: attempt to access 0×0 Matrix{Dual} at index [1:16, 1:96]` on every
+            # blocked shape for Dual, Float16 and BigFloat — `view` bounds-checks at construction, so it
+            # tripped before `useskinny` was ever consulted.
+            Vv = view(V, 1:mp, 1:pb)
             # Skinny W=Vᵀ·C via the unpacked path — the crossover is a µARCH SPLIT (req#8; measured fleet):
             #  • AVX2 (W=4): the packed transA skinny gemm is STABLE at large mp, so unpacked wins only while Vᵀ
             #    (pb·mp·8 B) stays L2-resident (else it re-fetches Vᵀ per n-tile). Gate: Vᵀ≤½L2 ⇔ 16·pb·mp≤L2
@@ -515,6 +521,7 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
             #  BlasReal has the unpacked kernel; every other T takes `gemm!` (on a Dual: the planar route).
             useskinny = T <: BlasReal && (_CHOLW == 4 ? (2 * pb * mp * sizeof(T) <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX))
             if useskinny
+                Vtv = view(Vt, 1:pb, 1:mp)                         # safe here: BlasReal ⇒ Vt is full-size
                 for c in 1:pb, i in 1:mp                           # V and its transpose Vᵀ from A in ONE pass
                     val = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
                     Vv[i, c] = val; Vtv[c, i] = val
