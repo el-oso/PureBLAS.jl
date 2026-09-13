@@ -96,7 +96,7 @@ FAILED=""
 _lock_mhz() { bash bench/fleet_freqlock.sh verify 2>&1 | grep -oE 'achieved under load = [0-9]+' | grep -oE '[0-9]+$'; }
 LOCK0=$(_lock_mhz)
 [ -n "$LOCK0" ] || { echo "=== ABORT: cannot read the achieved frequency — refusing to measure ==="; exit 2; }
-for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP}; do
+for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1}; do
     now=$(_lock_mhz)
     # 3% of the opening figure, the same tolerance check_arm_clocks.sh uses between arms of one cell.
     if [ -z "$now" ] || [ "$(( (now - LOCK0) * 100 / LOCK0 ))" -gt 3 ] || [ "$(( (LOCK0 - now) * 100 / LOCK0 ))" -gt 3 ]; then

@@ -16,6 +16,7 @@
 #                                                              #  its native Haswell kernels. On AMD MKL
 #                                                              #  throttles to a generic path — Intel only.)
 using PureBLAS, LinearAlgebra, Statistics, Printf
+using ForwardDiff              # DL1: the only group whose reference is a Julia implementation, not a BLAS
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 include(joinpath(@__DIR__, "freqlock.jl")); using .FreqLock   # THE frequency-lock criterion
 using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
@@ -69,6 +70,14 @@ ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
 # state — the failure mode where you measure AOCL's BLAS against OpenBLAS's LAPACK and never notice.
 function _use_ref!(name::AbstractString)
+    # DL1's reference is NOT a BLAS library. `Dual` is not a `BlasFloat`, so LinearAlgebra's generic
+    # fallback never reaches BLAS at all — there is nothing to forward, and forwarding would be a lie
+    # about what ran. This arm is deliberately kept OUT of `_REF_ALL` (hence out of `_VIEWS`) so the
+    # two-reference-view invariant is untouched and no bogus third view is rendered for every group.
+    if name == "generic"
+        BLAS.set_num_threads(1)
+        return name
+    end
     if name == "aocl"
         LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # BLAS   → libblis-mt.so
         LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # LAPACK → libflame.so
@@ -84,7 +93,19 @@ end
 # Reference arms available this run. `_REF_ARMS` is what gets measured; PureBLAS is always measured
 # unless the cache already holds it and only references were asked for.
 const _REF_ALL = REFBK == "mkl" ? ["mkl"] : ["openblas", "aocl"]
-const _REF_ARMS = isnothing(_ARMS_SEL) ? _REF_ALL : [a for a in _REF_ALL if a in _ARMS_SEL]
+# ⚠ REFERENCE ARMS ARE CACHE-ONLY BY DEFAULT. Omitting `arms=` used to mean "measure every arm", so
+# forgetting the flag silently re-ran OpenBLAS and AOCL — which is the whole reason the v3 cache stores
+# them. The default is now PB ONLY; re-measuring a reference is an explicit, typed-out request.
+#
+# WHY THE DEFAULT HAD TO FLIP RATHER THAN BE REMEMBERED. 2026-09-12: a `group=DL1` run without `arms=`
+# measured both reference arms. The PreToolUse guard that exists to stop exactly that had gone silently
+# dead — it jq-parsed a transcript that had grown to 1000 MB, taking 10.2 s against its 5 s timeout, so
+# the harness killed it and treated the timeout as non-blocking. Two independent safety nets (a rule I
+# must remember, and a hook) both failed in one afternoon; a default that cannot be forgotten does not.
+#
+# To measure a reference deliberately: `arms=pb,openblas,aocl` (or any subset). The user's standing
+# instruction is that this needs their explicit authorisation, per-run — it is not an agent decision.
+const _REF_ARMS = isnothing(_ARMS_SEL) ? String[] : [a for a in _REF_ALL if a in _ARMS_SEL]
 const _DO_PB = isnothing(_ARMS_SEL) || (_ARM_PB in _ARMS_SEL)
 const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _REF_ARMS)
 isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$(join(_REF_ALL, ","))")
@@ -208,7 +229,8 @@ function _round_med(qs::ArmData)
     end
     return median(qs[_ARM_PB]) * 1.0e6
 end
-_refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : "OpenBLAS"
+_refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" :
+    r == "generic" ? "LinearAlgebra generic" : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -415,8 +437,15 @@ _ratio(qref::Vector{Float64}, qpb::Vector{Float64}) = qref ./ qpb
 # address/alignment varies (essential for iamax — OpenBLAS idamax swings ~60% by address) and the mk
 # allocation is EXCLUDED from the timed core; `reps` amortizes the timer for tiny ops. All sample timings
 # feed the ratio distribution.
-function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15)
+# `refs` overrides the reference arm list for ONE group. Only DL1 uses it: its reference is
+# LinearAlgebra's own generic fallback over `Vector{Dual}` (what a ForwardDiff user gets without
+# PureBLAS), which is a different Julia IMPLEMENTATION rather than a different BLAS library — so it
+# cannot be an entry in `_REF_ALL` without inventing a third reference view for every other group, and
+# it must not be recorded under `openblas`/`aocl`, which would write false provenance into the cache.
+function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15, refs = nothing)
     out = Tuple{Int, CellData}[]
+    armlist = isnothing(refs) ? nothing :
+        vcat(_DO_PB ? [_ARM_PB] : String[], [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
         reps = repfn(s)
@@ -427,7 +456,7 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
         for r in 1:rounds
             # Rotate arm order every round (the ABBA generalisation): with k arms, rotating by r keeps
             # every arm equally often in the cold first slot, which is what the old A/B alternation did.
-            arms = _round_arms(r)
+            arms = isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1)
             qs = Dict{String, Vector{Float64}}()
             for a in arms
                 w = a == _ARM_PB ? work_pb : (_use_ref!(a); work_ob)
@@ -1317,6 +1346,48 @@ function run_cmplx_benchmarks()
             _meas!(cl1, "CL1", nm, () -> sweep(s -> (randn(T, s), randn(T, s)), _sizes(L1SZ), ob, pb, _L1REP))
         end
     end
+
+    # ── DL1: BLAS-1 over ForwardDiff.Dual{Tag,Float64,1} (forward-mode AD) ───────────────────────────
+    #
+    # WHY THIS GROUP HAS NO VENDOR REFERENCE. OpenBLAS and AOCL have no dual-number support at all —
+    # `Dual` is not a `BlasFloat`, so LinearAlgebra never forwards it to BLAS. The honest reference is
+    # therefore **LinearAlgebra's own generic fallback**, which is exactly what a ForwardDiff user gets
+    # today without PureBLAS. That is what the `generic` arm measures (see `_use_ref!`, which no-ops for
+    # it because there is no library to forward to). The arm is NOT in `_REF_ALL`, so `_VIEWS` still
+    # renders exactly the two reference views and no group gains a spurious third.
+    #
+    # The second, stricter bar is DL1 vs CL1 on IDENTICAL BYTES (`Dual{_,Float64,1}` and `ComplexF64`
+    # are both 16 B interleaved pairs — docs/src/dual.md). That needs no third arm: it is computable
+    # from the cached CL1 pb cells at the same n, and `coverage_ops.jl` derives it.
+    #
+    # `nrm2` is the cell that motivated the work: the generic path takes the Dual `lassq` loop with a
+    # division and branches per element, flat at ~4.8 GB/s (13-16x off the complex twin) before the
+    # dupEven kernel landed. `dot` here is `dotu` semantics; for Dual, `dotc == dotu` because
+    # `Dual <: Real` and ForwardDiff defines no `conj`.
+    dl1 = OpData[]
+    let
+        D = ForwardDiff.Dual{Nothing, Float64, 1}
+        mkd(s) = (D[ForwardDiff.Dual{Nothing}(randn(), randn()) for _ in 1:s],
+                  D[ForwardDiff.Dual{Nothing}(randn(), randn()) for _ in 1:s])
+        ad = ForwardDiff.Dual{Nothing}(1.7, 0.3)      # a DUAL alpha: exercises the tagged kernel, not
+        #                                               the real-alpha bypass (docs/src/dual.md)
+        for (nm, ob, pb) in (
+                ("daxpy1", (c, m) -> (for _ in 1:m; LinearAlgebra.axpy!(ad, c[1], c[2]); end; c[2][1].value),
+                    (c, m) -> (for _ in 1:m; PureBLAS.axpy!(c[2], ad, c[1]); end; c[2][1].value)),
+                ("dscal1", (c, m) -> (for _ in 1:m; LinearAlgebra.rmul!(c[1], ad); end; c[1][1].value),
+                    (c, m) -> (for _ in 1:m; PureBLAS.scal!(ad, c[1]); end; c[1][1].value)),
+                ("ddot1", (c, m) -> (s = zero(D); for _ in 1:m; s += LinearAlgebra.dot(c[1], c[2]); end; s.value),
+                    (c, m) -> (s = zero(D); for _ in 1:m; s += PureBLAS.dot(c[1], c[2]); end; s.value)),
+                ("dnrm21", (c, m) -> (s = zero(D); for _ in 1:m; s += LinearAlgebra.norm(c[1]); end; s.value),
+                    (c, m) -> (s = zero(D); for _ in 1:m; s += PureBLAS.nrm2(c[1]); end; s.value)),
+                ("dasum1", (c, m) -> (s = zero(D); for _ in 1:m; s += sum(abs, c[1]); end; s.value),
+                    (c, m) -> (s = zero(D); for _ in 1:m; s += PureBLAS.asum(c[1]); end; s.value)),
+                ("diamax1", (c, m) -> (s = 0; for _ in 1:m; s += argmax(abs.(c[1])); end; s),
+                    (c, m) -> (s = 0; for _ in 1:m; s += PureBLAS.iamax(c[1]); end; s)),
+            )
+            _meas!(dl1, "DL1", nm, () -> sweep(mkd, _sizes(L1SZ), ob, pb, _L1REP; refs = ["generic"]))
+        end
+    end
     cl2 = OpData[]
     let
         sq(s) = (randn(T, s, s), randn(T, s), randn(T, s))
@@ -1577,7 +1648,7 @@ function run_cmplx_benchmarks()
             c -> (PureBLAS._heev!('N', 'L', c); real(c[1, 1]))
         )
     end
-    return cl1, cl2, cl3, clp
+    return cl1, cl2, cl3, clp, dl1
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
@@ -2231,10 +2302,10 @@ else
     _contention_check()
     _pref_check()          # pins are legitimate; not KNOWING about them is not
     l1, l2, l3, lp = run_benchmarks()
-    cl1, cl2, cl3, clp = run_cmplx_benchmarks()
+    cl1, cl2, cl3, clp, dl1 = run_cmplx_benchmarks()
     _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
-    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp)
+    measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
     if subset
         # subset re-measure: MERGE the measured op(s) into the existing (v2) cache, leaving the rest intact.
@@ -2272,7 +2343,12 @@ else
         # and the loss only surfaced when gate_gaps reported `cells=0`.
         # `arms=` is for SUBSET re-measures (op=/group=), where merging keeps the references. A full run
         # must either measure everything or be told explicitly that a pb-only cache is what you want.
-        if !isnothing(_ARMS_SEL) && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
+        # ⚠ NOT gated on `!isnothing(_ARMS_SEL)` any more. That gate was only safe while omitting
+        # `arms=` MEANT "every arm"; now that the default is PB-only (see `_REF_ARMS`), a bare full
+        # `bench` measures no reference and would sail past this check straight into the 2026-08-06
+        # failure it was written for. Condition on what was ACTUALLY measured, never on how it was
+        # asked for.
+        if !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
             error(
                 """
                 REFUSING to overwrite $CACHE with a partial arm set.
@@ -2285,7 +2361,7 @@ else
         end
         g = measured
     end
-    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP")])
+    save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1")])
 end
 
 adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR; mkpath(adir)
@@ -2317,9 +2393,26 @@ else
             )
             println(io, "\n### Real\n\n", gen_table(fleet, ["L1", "L2", "L3", "LP"], rb))
             println(io, "\n### Complex\n\n", gen_table(fleet, ["CL1", "CL2", "CL3", "CLP"], rb))
+            # `"generic"`, NOT `rb`. DL1 has no openblas or aocl arm to divide by — `Dual` is not a
+            # `BlasFloat`, so LinearAlgebra never reaches a vendor BLAS (see `_use_ref!`). Passing `rb`
+            # here asks for an arm that does not exist and renders an EMPTY Dual section in both views.
+            # The section is therefore identical in the OpenBLAS and AOCL files, which is correct: there
+            # is only one Dual denominator, so there is only one Dual table.
+            println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1"], "generic"))
         end
         println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
     end
+    # DL1 IS RENDERED ONCE, OUTSIDE THE VIEW LOOP, AND THAT IS THE WHOLE POINT. `_VIEWS` is the two
+    # vendor references, and every other group legitimately has one panel per view. DL1 has neither
+    # arm: its reference is LinearAlgebra's generic fallback over `Dual`, recorded as `generic`. Left
+    # inside the loop it drew `perf_dl1.svg` against `openblas` and `perf_dl1_aocl.svg` against `aocl`
+    # — two files, both empty, both looking like a measured group with no gap. One file, one honest
+    # denominator. `_refsuf("generic")` is deliberately NOT used in the name: there is only ever one
+    # Dual panel, so it needs no view suffix to disambiguate it from a sibling that does not exist.
+    svg_panels(
+        joinpath(adir, "perf_dl1$L.svg"),
+        "Dual BLAS-1 (forward-mode AD) — PB / $(_refname("generic")) ratio", fleet, "DL1", "generic"
+    )
     # Provenance for EVERY artifact this invocation writes (both views come from the same caches, so it
     # is written once, outside the view loop — two copies could disagree, one cannot).
     open(joinpath(tdir, "provenance$L.md"), "w") do io
@@ -2348,7 +2441,7 @@ const _ADJ_TOL = 0.02
 # state the project's actual rule — PB ≥ max(OpenBLAS, AOCL) — from a single run, per cell, instead of
 # eyeballing two separately-measured tables. `gate` is the worst over cells of min over references,
 # i.e. the margin against whichever reference is faster at each individual size.
-for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP"), (nm, cells) in get(g, lvl, OpData[])
+for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1"), (nm, cells) in get(g, lvl, OpData[])
     per = Dict{String, Tuple{Float64, Float64}}()
     for r in _REF_ALL
         ps = _series(g, lvl, nm, r)

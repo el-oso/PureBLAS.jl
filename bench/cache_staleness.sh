@@ -85,7 +85,7 @@ if [ $rc -ne 0 ]; then
 
 STALE CELLS PRESENT — published numbers from these caches may describe code that no longer ships.
 Refresh with PB-only runs, which reuse the cached reference arms (never re-measure OpenBLAS/AOCL):
-    for g in L1 L2 L3 LP CL1 CL2 CL3 CLP; do
+    for g in L1 L2 L3 LP CL1 CL2 CL3 CLP DL1; do
         julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw
     done
 NOTE: a single full `bench arms=pb` with no op=/group= is REFUSED by design — a full run REPLACES the

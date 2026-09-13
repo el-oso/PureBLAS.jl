@@ -97,7 +97,21 @@ end
 
 # op => (level, types) — types are what the bench row actually exercises, not what the routine supports.
 const LEVEL = Dict{String, String}()
-lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in ("L3", "CL3") ? "BLAS-3" : "LAPACK"
+lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in ("L3", "CL3") ? "BLAS-3" :
+    l == "DL1" ? "Dual BLAS-1" : "LAPACK"
+
+# WHICH ARMS THE RATIO IS TAKEN AGAINST, PER GROUP. Every group but DL1 divides by max(OpenBLAS, AOCL),
+# which is the gate. DL1 cannot: `ForwardDiff.Dual` is not a `BlasFloat`, so LinearAlgebra never reaches
+# a vendor BLAS and there is no OpenBLAS or AOCL arm to divide by — its reference is LinearAlgebra's own
+# generic fallback, recorded under the arm name `generic` (see `_use_ref!` in plots.jl).
+#
+# This function is why DL1 needed a change here at all. The arm list used to be the literal
+# `("openblas", "aocl")`, so every DL1 cell found neither, hit `isempty(rs)` and was SKIPPED — the group
+# would have rendered as "not benchmarked" while sitting measured in the cache, with nothing saying so.
+# It is also why DL1 gets its OWN section rather than extra rows under BLAS-1: a Dual ratio is measured
+# against a different, much weaker bar, and putting it in the same table as the vendor-BLAS rows would
+# read as a gate verdict it is not.
+_refarms(l) = l == "DL1" ? ("generic",) : ("openblas", "aocl")
 
 # ONE COLUMN PER MICROARCHITECTURE. A single pooled verdict answers "does this routine gate SOMEWHERE",
 # which is the wrong question — the gate is per box. Pooling also makes progress invisible in exactly the
@@ -165,7 +179,7 @@ for path in ARGS
         # n=1e3 flipped verdict outright (round-pooled <1.0, gate 1.007). A published coverage table
         # that can say 🐢 where the gate says PASS is worse than no table.
         rs = Float64[]
-        for r in ("openblas", "aocl")
+        for r in _refarms(lvl)
             haskey(d, r) || continue
             m = min(length(d[r]), length(d["pb"]))
             m == 0 && continue
@@ -238,12 +252,22 @@ html.dark .pbg-key{color:#98a1b3}
 ```
 """)
 
-for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK")
+for section in ("BLAS-1", "BLAS-2", "BLAS-3", "LAPACK", "Dual BLAS-1")
     # Ops are drawn from EXCLUDED as well as `cells`: a routine whose every cell was off-lock must still
     # get a row, saying so. Dropping the row would render an unmeasurable routine as "not benchmarked".
     ops = sort(unique(k[2] for k in Iterators.flatten((keys(cells), keys(EXCLUDED))) if k[1] == section))
     isempty(ops) && continue
     println("\n#### $section\n")
+    # SAY WHAT THE BAR IS WHENEVER IT IS NOT THE GATE. Every other section divides by
+    # max(OpenBLAS, AOCL) and a green cell therefore means "gates". Dual divides by LinearAlgebra's
+    # generic fallback, which is a far weaker denominator, so the SAME colour means something much
+    # smaller. Unlabelled, the two tables read as one verdict scale — and this section would be the
+    # greenest page on the site while measuring the least.
+    section == "Dual BLAS-1" && println(
+        "Reference is **LinearAlgebra's generic fallback** over `ForwardDiff.Dual{Tag,Float64,1}` — ",
+        "what a forward-mode AD user gets today without PureBLAS. `Dual` is not a `BlasFloat`, so no ",
+        "vendor BLAS is reachable and there is no OpenBLAS/AOCL arm: these ratios are **not** gate ",
+        "verdicts and do not compare against `max(OpenBLAS, AOCL)`.\n")
     println("```@raw html")
     println("<div class=\"pbg-wrap\"><table class=\"pbg\"><thead><tr><th>routine</th>",
             join(("<th>$ua</th>" for ua in UARCH)), "<th>swept at</th><th>toolchain</th></tr></thead><tbody>")
