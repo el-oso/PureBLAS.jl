@@ -161,13 +161,15 @@ end
     @test PureBLAS.iamax([Dual{Nothing}(3.0, -5.0), Dual{Nothing}(3.0, 1.0)]) == 1
     @test PureBLAS.iamax([Dual{Nothing}(3.0, 1.0), Dual{Nothing}(3.0, -5.0)]) == 1
     for n in (31, 4W, 4W + 3, 200, 1003)                                 # scalar path (n < 4W) and every SIMD tier
+        # positions scale with n: on AVX2 `4W == 16`, and the fixed 10/20/30 of the first draft indexed past the end
+        i1, i2, i3 = n ÷ 4, n ÷ 2, 3n ÷ 4
         x = DualT.mkd(ones(n), randn(n))
-        x[10] = Dual{Nothing}(3.0, -5.0); x[20] = Dual{Nothing}(-3.0, 100.0)   # |value| tie, partials differ
-        @test PureBLAS.iamax(x) == 10 == DualT.ref_iamax(x)
-        x[30] = Dual{Nothing}(1.0, 1.0e6)                                 # a huge PARTIAL is not a magnitude
-        @test PureBLAS.iamax(x) == 10
-        x[30] = Dual{Nothing}(1.0, Inf)
-        @test PureBLAS.iamax(x) == 10
+        x[i1] = Dual{Nothing}(3.0, -5.0); x[i2] = Dual{Nothing}(-3.0, 100.0)   # |value| tie, partials differ
+        @test PureBLAS.iamax(x) == i1 == DualT.ref_iamax(x)
+        x[i3] = Dual{Nothing}(1.0, 1.0e6)                                 # a huge PARTIAL is not a magnitude
+        @test PureBLAS.iamax(x) == i1
+        x[i3] = Dual{Nothing}(1.0, Inf)
+        @test PureBLAS.iamax(x) == i1
     end
     # netlib oracle: NaN/Inf in the VALUE lane, every position of a vector spanning the kernel tiers
     for n in (3, 4W + 1, 100), pos in unique((1, 2, n ÷ 2, n)), v in (NaN, Inf, -Inf)
@@ -332,4 +334,207 @@ end
         @test DualNative.hist(DualNative.loop(PureBLAS._dot_pair_simd, (C, Int, CV, CV, Type{T}, Val{false}))) !=
             DualNative.hist(DualNative.native_labelled(PureBLAS._dot_pair_simd, (C, Int, CV, CV, Type{T}, Val{false})))
     end
+end
+
+# ── BLAS-3 (docs/src/dual_l3.md): planar route — three real products on value/partial planes ────────
+@testitem "Dual L3: gemm planar route matches the plane formula (shapes, trans, dual α/β, zero-value α)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    for V in (Float64, Float32), (m, n, k) in ((7, 5, 3), (8, 8, 8), (9, 4, 17), (33, 31, 65), (129, 200, 3), (3, 200, 129), (257, 255, 256))
+        tol = 32 * sqrt(eps(V)) * max(m, n, k)
+        for tA in (false, true), tB in (false, true),
+                (αd, βd) in (
+                    (Dual{Nothing}(V(1.7), V(0.3)), Dual{Nothing}(V(0.9), V(-0.2))),
+                    (Dual{Nothing}(V(0), V(0.5)), Dual{Nothing}(V(0), V(0.7))),      # zero VALUE, live partial: must not quick-return
+                    (Dual{Nothing}(V(1), V(0)), Dual{Nothing}(V(0), V(0))),
+                )          # β == 0: C is not read
+            A = DualT.mkd(randn(V, (tA ? (k, m) : (m, k))...), randn(V, (tA ? (k, m) : (m, k))...))
+            B = DualT.mkd(randn(V, (tB ? (n, k) : (k, n))...), randn(V, (tB ? (n, k) : (k, n))...))
+            C = DualT.mkd(randn(V, m, n), randn(V, m, n))
+            oA(X) = tA ? transpose(X) : X; oB(X) = tB ? transpose(X) : X
+            Av = value.(A); Ap = partials.(A, 1); Bv = value.(B); Bp = partials.(B, 1)
+            P1 = oA(Av) * oB(Bv); P2 = oA(Av) * oB(Bp) + oA(Ap) * oB(Bv)          # A_p·B_p is ε²: absent
+            av, ap = value(αd), partials(αd, 1); bv, bp = value(βd), partials(βd, 1)
+            Rv = av .* P1 .+ bv .* value.(C); Rp = av .* P2 .+ ap .* P1 .+ bv .* partials.(C, 1) .+ bp .* value.(C)
+            R = PureBLAS.gemm!(copy(C), A, B; alpha = αd, beta = βd, transA = tA ? 'T' : 'N', transB = tB ? 'T' : 'N')
+            @test isapprox(value.(R), Rv; rtol = tol, atol = tol)
+            @test isapprox(partials.(R, 1), Rp; rtol = tol, atol = tol)
+            @test eltype(R) === eltype(C)
+        end
+    end
+    # 'C' on a Dual is the transpose (conj is the identity on Dual <: Real), on both the pair route and the generic loop
+    A = DualT.mkd(randn(20, 30), randn(20, 30)); B = DualT.mkd(randn(20, 10), randn(20, 10))
+    @test PureBLAS.gemm!(zeros(eltype(A), 30, 10), A, B; transA = 'C') == PureBLAS.gemm!(zeros(eltype(A), 30, 10), A, B; transA = 'T')
+end
+
+@testitem "Dual L3: gemm ε²-leak and a ForwardDiff derivative through gemm!" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    # partials ~1e155: A_p·B_p would overflow if it were ever formed; the value must be the exact real product
+    A = DualT.mkd(randn(64, 64), 1.0e155 .* randn(64, 64)); B = DualT.mkd(randn(64, 64), 1.0e155 .* randn(64, 64))
+    R = PureBLAS.gemm!(zeros(eltype(A), 64, 64), A, B)
+    @test all(isfinite, value.(R)) && all(isfinite, partials.(R, 1))
+    @test value.(R) ≈ value.(A) * value.(B)
+    A0 = randn(20, 30); dA = randn(20, 30); B0 = randn(30, 10)
+    f(t) = vec(PureBLAS.gemm!(zeros(eltype(t), 20, 10), A0 .+ t .* dA, B0 .+ zero(t)))
+    @test ForwardDiff.derivative(f, 0.5) ≈ vec(dA * B0)
+    # a strided view misses the pair predicate and takes the generic loop; both agree
+    Cs = view(zeros(eltype(A), 128, 64), 1:2:128, :)
+    @test PureBLAS.gemm!(Cs, A, B) ≈ R
+end
+
+@testitem "StrictMode dogfood: BLAS-3 dual strict contract" tags = [:checks] begin
+    using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
+    using ForwardDiff: Dual
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping dual L3 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        n = 96
+        Ad = Dual{Nothing}.(randn(n, n), randn(n, n)); Bd = Dual{Nothing}.(randn(n, n), randn(n, n)); Cd = zeros(eltype(Ad), n, n)
+        ad = Dual{Nothing}(1.7, 0.3)
+        # No `@test_noalloc` on gemm!: the StrictMode 0.4 proof is static and all-paths, and nothing reaching gemm!
+        # passes it (kb `strictmode-04-static-only-noalloc`: Strassen's lazily sized pool is counted even when
+        # runtime-dead). The dual route adds only the grow-only plane pool, the same class as complex 3M.
+        @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.syrk!(Cd, Ad; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
+        @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)
+        @test true
+    end
+end
+
+# ── BLAS-2 (docs/src/dual_l2.md): the complex kernels, tagged with the dual multiply rule ─────────────
+@testitem "Dual L2: gemv N/T/C, ger, trmv, trsv match the plane formulas at awkward shapes (both real types)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    for V in (Float64, Float32), (m, n) in ((1, 1), (3, 2), (5, 7), (8, 8), (9, 4), (15, 17), (16, 16), (17, 33), (31, 65), (64, 100), (129, 129), (200, 3), (3, 200), (300, 300), (1000, 1003))
+        tol = 32 * sqrt(eps(V)) * max(m, n)
+        ≃(P, Rv, Rp) = isapprox(value.(P), Rv; rtol = tol, atol = tol) && isapprox(partials.(P, 1), Rp; rtol = tol, atol = tol)
+        A = DualT.mkd(randn(V, m, n), randn(V, m, n)); Av = value.(A); Ap = partials.(A, 1)
+        x = DualT.mkd(randn(V, n), randn(V, n)); xv = value.(x); xp = partials.(x, 1)
+        y = DualT.mkd(randn(V, m), randn(V, m)); yv = value.(y); yp = partials.(y, 1)
+        α = Dual{Nothing}(V(1.7), V(0.3)); β = Dual{Nothing}(V(0.9), V(-0.2)); av, ap = V(1.7), V(0.3); bv, bp = V(0.9), V(-0.2)
+        # gemv N: y := α·A·x + β·y, every ε² product absent
+        P1 = Av * xv; P2 = Av * xp + Ap * xv
+        r = PureBLAS.gemv!(copy(y), A, x; alpha = α, beta = β)
+        @test ≃(r, av .* P1 .+ bv .* yv, av .* P2 .+ ap .* P1 .+ bv .* yp .+ bp .* yv)
+        r0 = PureBLAS.gemv!(copy(y), A, x; alpha = α, beta = Dual{Nothing}(V(0), V(0.5)))   # β with zero value: y IS read
+        @test ≃(r0, av .* P1, av .* P2 .+ ap .* P1 .+ V(0.5) .* yv)
+        # gemv T and C (identical on a Dual)
+        Q1 = transpose(Av) * yv; Q2 = transpose(Av) * yp + transpose(Ap) * yv
+        rT = PureBLAS.gemv!(copy(x), A, y; alpha = α, beta = β, trans = 'T')
+        @test ≃(rT, av .* Q1 .+ bv .* xv, av .* Q2 .+ ap .* Q1 .+ bv .* xp .+ bp .* xv)
+        @test PureBLAS.gemv!(copy(x), A, y; alpha = α, beta = β, trans = 'C') == rT
+        # ger (and gerc == geru): A += α·y·xᵀ
+        G1 = yv * transpose(xv); G2 = yv * transpose(xp) + yp * transpose(xv)
+        rG = PureBLAS.ger!(α, y, x, copy(A))
+        @test ≃(rG, Av .+ av .* G1, Ap .+ av .* G2 .+ ap .* G1)
+        @test PureBLAS.ger!(α, y, x, copy(A); conj = true) == rG
+        if m == n
+            Tri = DualT.mkd(randn(V, n, n) ./ V(2n), randn(V, n, n)); for i in 1:n
+                Tri[i, i] = Dual{Nothing}(V(2), V(0.1))
+            end
+            for up in (true, false), tr in ('N', 'T', 'C'), dg in ('N', 'U')
+                U = up ? 'U' : 'L'
+                Tm = up ? triu(Tri) : tril(Tri); dg == 'U' && (Tm = Tm - Diagonal(Tm) + I)
+                op = tr == 'N' ? Tm : transpose(Tm)
+                v = PureBLAS.trmv!(Tri, copy(x); uplo = U, trans = tr, diag = dg)
+                @test ≃(v, value.(op) * xv, value.(op) * xp + partials.(op, 1) * xv)
+                s = PureBLAS.trsv!(Tri, copy(x); uplo = U, trans = tr, diag = dg)
+                back = op * s                                              # op·s must reproduce x (generic Dual arithmetic)
+                @test ≃(back, xv, xp)
+            end
+        end
+    end
+end
+
+@testitem "Dual L2: ε²-leak and infinite-partial hygiene on gemv/ger; ForwardDiff derivatives through the entries" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    n = 200
+    # partials ~1e155: any a_p·x_p / x_p·y_p product overflows — none may form
+    A = DualT.mkd(randn(n, n), 1.0e155 .* randn(n, n)); x = DualT.mkd(randn(n), 1.0e155 .* randn(n)); y = DualT.mkd(randn(n), randn(n))
+    for r in (PureBLAS.gemv!(copy(y), A, x), PureBLAS.gemv!(copy(y), A, x; trans = 'T'), vec(PureBLAS.ger!(1.0, y, x, copy(A))))
+        @test all(isfinite, value.(r))
+    end
+    @test value.(PureBLAS.gemv!(copy(y), A, x)) ≈ value.(A) * value.(x)
+    # an INFINITE partial must never poison a value lane (gemvN's odd-lane select never multiplies by 0)
+    xi = DualT.mkd(randn(n), randn(n)); xi[7] = Dual{Nothing}(1.0, Inf)
+    Ai = DualT.mkd(randn(n, n), randn(n, n)); Ai[5, 9] = Dual{Nothing}(1.0, Inf)
+    for r in (PureBLAS.gemv!(copy(y), Ai, xi), PureBLAS.gemv!(copy(y), Ai, xi; trans = 'T'), vec(PureBLAS.ger!(1.0, y, xi, copy(Ai))))
+        @test all(isfinite, value.(r))
+    end
+    # d/dt through the entries against the closed form
+    A0 = randn(30, 20); dA = randn(30, 20); x0 = randn(20); dx = randn(20); y0 = randn(30)
+    # at t = 0: the first closed form is the derivative of a product that is QUADRATIC in t
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(y0 .+ zero(t), A0 .+ t .* dA, x0 .+ t .* dx), 0.0) ≈ dA * x0 + A0 * dx
+    @test ForwardDiff.derivative(t -> PureBLAS.gemv!(x0 .+ zero(t), A0 .+ t .* dA, y0 .+ zero(t); trans = 'T'), 0.0) ≈ transpose(dA) * y0
+    @test ForwardDiff.derivative(t -> vec(PureBLAS.ger!(one(t), y0 .+ zero(t), x0 .+ t .* dx, A0 .+ zero(t))), 0.0) ≈ vec(y0 * transpose(dx))
+    L = randn(20, 20) ./ 40 + 2I; dL = randn(20, 20) ./ 40
+    @test ForwardDiff.derivative(t -> PureBLAS.trsv!(L .+ t .* dL, x0 .+ zero(t); uplo = 'L'), 0.0) ≈ -tril(L) \ (tril(dL) * (tril(L) \ x0))
+end
+
+@testitem "StrictMode dogfood: BLAS-2 dual strict contract" tags = [:checks] begin
+    using StrictModeTest, StrictMode, PureBLAS, ForwardDiff
+    using ForwardDiff: Dual
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping dual L2 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        bk = PureBLAS.DEFAULT_BACKEND
+        n = 300
+        Ad = Dual{Nothing}.(randn(n, n), randn(n, n)); xd = Dual{Nothing}.(randn(n), randn(n)); yd = Dual{Nothing}.(randn(n), randn(n))
+        ad = Dual{Nothing}(1.7, 0.3)
+        @test_noalloc PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad)
+        @test_noalloc PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad, trans = 'T')
+        @test_noalloc PureBLAS.ger!(bk, ad, xd, yd, Ad)
+        @test_noalloc PureBLAS.trmv!(bk, Ad, xd; uplo = 'U')
+        @test_noalloc PureBLAS.trsv!(bk, Ad, xd; uplo = 'U')
+        @test_typestable PureBLAS.gemv!(bk, yd, Ad, xd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.ger!(bk, ad, xd, yd, Ad)
+        @test_typestable PureBLAS.trsv!(bk, Ad, xd; uplo = 'U')
+        @test true
+    end
+end
+
+@testitem "Dual L3: syrk/herk/trmm/trsm compositions match the plane formulas (every flag, side, diag)" setup = [DualT] begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    using ForwardDiff: Dual, value, partials
+    tri(M, up, unit) = (Tm = up ? triu(M) : tril(M); unit ? Tm - Diagonal(Tm) + I : Tm)
+    for V in (Float64, Float32), n in (1, 3, 8, 17, 64, 129), k in (1, 5, 33)
+        tol = 64 * sqrt(eps(V)) * max(n, k)
+        ≃(R, Rv, Rp) = isapprox(value.(R), Rv; rtol = tol, atol = tol) && isapprox(partials.(R, 1), Rp; rtol = tol, atol = tol)
+        αd = Dual{Nothing}(V(1.7), V(0.3)); βd = Dual{Nothing}(V(0), V(0.4)); av, ap, bv, bp = V(1.7), V(0.3), V(0), V(0.4)
+        for up in (true, false), tr in (false, true)
+            A = DualT.mkd(randn(V, (tr ? (k, n) : (n, k))...), randn(V, (tr ? (k, n) : (n, k))...)); Av = value.(A); Ap = partials.(A, 1)
+            C = DualT.mkd(randn(V, n, n), randn(V, n, n)); Cv = value.(C); Cp = partials.(C, 1)
+            oA(X) = tr ? transpose(X) : X
+            P1 = oA(Av) * transpose(oA(Av)); S2 = oA(Av) * transpose(oA(Ap)) + oA(Ap) * transpose(oA(Av))   # A_p·A_pᵀ is ε²: absent
+            msk = up ? triu(trues(n, n)) : tril(trues(n, n))
+            R = PureBLAS.syrk!(copy(C), A; uplo = up ? 'U' : 'L', trans = tr ? 'T' : 'N', alpha = αd, beta = βd)
+            @test ≃(R[msk], (av .* P1 .+ bv .* Cv)[msk], (av .* S2 .+ ap .* P1 .+ bv .* Cp .+ bp .* Cv)[msk])
+            @test R[.!msk] == C[.!msk]                                             # the other triangle is untouched
+            H = PureBLAS.herk!(copy(C), A; uplo = up ? 'U' : 'L', trans = tr ? 'C' : 'N', alpha = av, beta = bv)   # herk == syrk on a Dual
+            @test ≃(H[msk], (av .* P1 .+ bv .* Cv)[msk], (av .* S2 .+ bv .* Cp)[msk])
+        end
+        for sl in (true, false), up in (true, false), tr in (false, true), unit in (false, true)
+            Tri = DualT.mkd(randn(V, n, n) ./ V(2n), randn(V, n, n)); for i in 1:n
+                Tri[i, i] = Dual{Nothing}(V(2), V(0.1))
+            end
+            Tv = tri(value.(Tri), up, unit); Tp = tri(partials.(Tri, 1), up, false); unit && (Tp = Tp - Diagonal(Tp))   # A_p° for diag='U'
+            opv = tr ? transpose(Tv) : Tv; opp = tr ? transpose(Tp) : Tp
+            B = DualT.mkd(randn(V, (sl ? (n, k) : (k, n))...), randn(V, (sl ? (n, k) : (k, n))...)); Bv = value.(B); Bp = partials.(B, 1)
+            kw = (side = sl ? 'L' : 'R', uplo = up ? 'U' : 'L', transA = tr ? 'T' : 'N', diag = unit ? 'U' : 'N')
+            Mv = sl ? opv * Bv : Bv * opv; Mp = sl ? opv * Bp + opp * Bv : Bp * opv + Bv * opp
+            @test ≃(PureBLAS.trmm!(copy(B), Tri; kw..., alpha = αd), av .* Mv, av .* Mp .+ ap .* Mv)
+            Xv = sl ? opv \ Bv : Bv / opv; Xp = sl ? opv \ (Bp - opp * Xv) : (Bp - Xv * opp) / opv     # no dual division anywhere
+            @test ≃(PureBLAS.trsm!(copy(B), Tri; kw..., alpha = αd), av .* Xv, av .* Xp .+ ap .* Xv)
+            @test PureBLAS.trmm!(copy(B), Tri; kw..., transA = 'C') == PureBLAS.trmm!(copy(B), Tri; kw..., transA = 'T')
+        end
+    end
+    L0 = tril(randn(20, 20) ./ 40) + 2I; dL = tril(randn(20, 20) ./ 40); B0 = randn(20, 7)
+    @test ForwardDiff.derivative(t -> vec(PureBLAS.trsm!(B0 .+ zero(t), L0 .+ t .* dL; side = 'L', uplo = 'L')), 0.0) ≈ vec(-(L0 \ (dL * (L0 \ B0))))
+    A0 = randn(12, 30); dA = randn(12, 30)
+    @test ForwardDiff.derivative(t -> vec(triu(PureBLAS.syrk!(zeros(eltype(t), 12, 12), A0 .+ t .* dA))), 0.0) ≈ vec(triu(dA * A0' + A0 * dA'))
 end

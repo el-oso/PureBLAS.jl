@@ -192,149 +192,149 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     # The block keeps its original indentation — re-indenting 140 lines of a gated kernel to add three
     # would bury the change (same convention as `_trsm_fused_L!`'s stripe loop below).
     @leafscope arn begin      # inlines the trmm microkernel — see `_trsm_fused_L!`
-    M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
-    _mat_tri!(M, A, k, up, tr, unit)
-    if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
-        n = size(B, 2)                                   # upM → top-down row-tiles (each reads rows ≥ its
-        # Hoisted above the tile loops — `@scope` forbids a borrow inside one and this shape is
-        # loop-invariant. Used only by the lower-M edge arm below.
-        Ec = borrow!(arn, T, _L3_NB, nr); lde = _L3_NB
-        GC.@preserve M B begin                           # start, still untouched; registers hold the tile
-            Mp = pointer(M); Bp = pointer(B)             # between read and store). lower → bottom-up.
-            nt = cld(k, mr)
-            for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
-                ir = t * mr; mre = min(mr, k - ir)
-                plo = upM ? ir : 0
-                phi = upM ? k : min(k, ir + mre)
-                Ap = Mp + plo * ldM * sz; kc = phi - plo
-                jr = 0
-                while jr < n
-                    nre = min(nr, n - jr)
-                    # The B-operand aliases the store target. Full-strip kernels hold the whole tile in
-                    # registers (safe). The EDGE kernel is W-row-block serial: for upper M the zero triangle
-                    # exactly masks the stale rows; for lower M it does NOT — copy the strip's source
-                    # columns to scratch first.
-                    if mre == mr && nre == nr
-                        _microkernel_unpacked!(
-                            Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
-                            one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
-                        )
-                    elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
-                        # W-aligned partial rows → UNMASKED clipped kernel, the ladder gemm already
-                        # ships (gemm.jl:1167-1196: "a smaller Val(vr) reads exactly the mre live rows
-                        # — no mask, no wasted vector"). The old binary `cld(mre,W)==1 ? Val(1) :
-                        # Val(_MR)` only had an exact answer for one row-vector: on AVX2 (_MR=3, W=4) a
-                        # k=8 trmm has mre=8 ⇒ masked Val(3), i.e. 12 rows computed for 8 live ones —
-                        # 50% wasted FMAs, and at n=8 that is 100% of the operation (Zen3 trmm n=8 was
-                        # 0.88 vs OB while Zen4, where _MR=2/W=8 lands on the exact Val(1), got 1.32).
-                        # mre ≤ mr = _MR·W and mre == mr is handled above, so vr < _MR here ⇒ vr ∈ {1,2}
-                        # for every current µarch; a wider _MR falls through to the masked path unharmed.
-                        # Aliasing-safe by this function's own rule (:140-143): full-strip kernels hold
-                        # the tile in registers between read and store; only `_edge!` is row-serial.
-                        if div(mre, W) == 1
+        M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
+        _mat_tri!(M, A, k, up, tr, unit)
+        if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
+            n = size(B, 2)                                   # upM → top-down row-tiles (each reads rows ≥ its
+            # Hoisted above the tile loops — `@scope` forbids a borrow inside one and this shape is
+            # loop-invariant. Used only by the lower-M edge arm below.
+            Ec = borrow!(arn, T, _L3_NB, nr); lde = _L3_NB
+            GC.@preserve M B begin                           # start, still untouched; registers hold the tile
+                Mp = pointer(M); Bp = pointer(B)             # between read and store). lower → bottom-up.
+                nt = cld(k, mr)
+                for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
+                    ir = t * mr; mre = min(mr, k - ir)
+                    plo = upM ? ir : 0
+                    phi = upM ? k : min(k, ir + mre)
+                    Ap = Mp + plo * ldM * sz; kc = phi - plo
+                    jr = 0
+                    while jr < n
+                        nre = min(nr, n - jr)
+                        # The B-operand aliases the store target. Full-strip kernels hold the whole tile in
+                        # registers (safe). The EDGE kernel is W-row-block serial: for upper M the zero triangle
+                        # exactly masks the stale rows; for lower M it does NOT — copy the strip's source
+                        # columns to scratch first.
+                        if mre == mr && nre == nr
                             _microkernel_unpacked!(
                                 Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
-                                one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                                one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
                             )
-                        else
-                            _microkernel_unpacked!(
-                                Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
-                                one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
-                            )
-                        end
-                    elseif nre == nr
-                        _microkernel_unpacked_mrows!(
-                            Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
-                            one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
-                            Val(_NR), Val(false), Val(true), Val(_vwidth(T))
-                        )
-                    elseif upM
-                        _microkernel_unpacked_edge!(
-                            Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
-                            one(T), zero(T), mre, nre, false, true
-                        )
-                    else
-                        GC.@preserve Ec begin            # kc×nre source copy (dodges the serial aliasing)
-                            Ep = pointer(Ec)
-                            @inbounds for j in 0:(nre - 1), p in 0:(kc - 1)
-                                unsafe_store!(Ep, unsafe_load(Bp, plo + p + (jr + j) * ldb + 1), p + j * lde + 1)
+                        elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
+                            # W-aligned partial rows → UNMASKED clipped kernel, the ladder gemm already
+                            # ships (gemm.jl:1167-1196: "a smaller Val(vr) reads exactly the mre live rows
+                            # — no mask, no wasted vector"). The old binary `cld(mre,W)==1 ? Val(1) :
+                            # Val(_MR)` only had an exact answer for one row-vector: on AVX2 (_MR=3, W=4) a
+                            # k=8 trmm has mre=8 ⇒ masked Val(3), i.e. 12 rows computed for 8 live ones —
+                            # 50% wasted FMAs, and at n=8 that is 100% of the operation (Zen3 trmm n=8 was
+                            # 0.88 vs OB while Zen4, where _MR=2/W=8 lands on the exact Val(1), got 1.32).
+                            # mre ≤ mr = _MR·W and mre == mr is handled above, so vr < _MR here ⇒ vr ∈ {1,2}
+                            # for every current µarch; a wider _MR falls through to the masked path unharmed.
+                            # Aliasing-safe by this function's own rule (:140-143): full-strip kernels hold
+                            # the tile in registers between read and store; only `_edge!` is row-serial.
+                            if div(mre, W) == 1
+                                _microkernel_unpacked!(
+                                    Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                    one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                                )
+                            else
+                                _microkernel_unpacked!(
+                                    Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                    one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
+                                )
                             end
-                            _microkernel_unpacked_edge!(
-                                Bp, ldb, Ap, ldM, ir, Ep - jr * lde * sz, lde, jr, kc,
-                                one(T), zero(T), mre, nre, false, true
+                        elseif nre == nr
+                            _microkernel_unpacked_mrows!(
+                                Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
+                                Val(_NR), Val(false), Val(true), Val(_vwidth(T))
                             )
-                        end
-                    end
-                    jr += nr
-                end
-            end
-        end
-    else                                                 # B(m×k) := B·M, IN PLACE: upM → column-tiles
-        m = size(B, 1)                                   # right-to-left (each reads cols ≤ its end, i.e.
-        Ec = borrow!(arn, T, mr, nr); lde = mr           # hoisted, loop-invariant (see the side-L note)
-        GC.@preserve M B begin                           # untouched to its left); lower → left-to-right.
-            Mp = pointer(M); Bp = pointer(B)
-            nt = cld(k, nr)
-            # Row-blocks OUTER: the in-place hazard is row-local (each tile reads/writes only its own
-            # rows), so row-blocks are independent — hoisting them keeps the 16×k A-slab L1-resident
-            # across its column tiles instead of re-streaming all m×k per tile (the wide-m killer).
-            ir = 0
-            while ir < m
-                mre = min(mr, m - ir)
-                for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
-                    jr = t * nr; nre = min(nr, k - jr)
-                    plo = upM ? 0 : jr
-                    phi = upM ? min(k, jr + nre) : k
-                    Bsp = Mp + plo * sz; kc = phi - plo
-                    if mre == mr && nre == nr
-                        _microkernel_unpacked!(
-                            Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
-                            one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
-                        )
-                    elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
-                        # W-aligned partial rows → unmasked clipped kernel (same ladder and same reasoning
-                        # as the side-L site above; vr ∈ {1,2} since mre < mr here).
-                        if div(mre, W) == 1
-                            _microkernel_unpacked!(
-                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
-                                one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                        elseif upM
+                            _microkernel_unpacked_edge!(
+                                Bp, ldb, Ap, ldM, ir, Bp + plo * sz, ldb, jr, kc,
+                                one(T), zero(T), mre, nre, false, true
                             )
                         else
-                            _microkernel_unpacked!(
-                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
-                                one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
-                            )
-                        end
-                    elseif nre == nr
-                        _microkernel_unpacked_mrows!(
-                            Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
-                            one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
-                            Val(_NR), Val(false), Val(true), Val(_vwidth(T))
-                        )
-                    else
-                        # Edge kernel is COLUMN-serial and the A-operand is B itself: column j+1's
-                        # contraction re-reads columns already stored (they're inside [plo,phi) on both
-                        # uplos). Compute the strip into a dest scratch, copy back after.
-                        GC.@preserve Ec begin
-                            Ep = pointer(Ec)
-                            _microkernel_unpacked_edge!(
-                                Ep - (ir + jr * lde) * sz, lde,
-                                Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
-                                one(T), zero(T), mre, nre, false, true
-                            )
-                            @inbounds for j in 0:(nre - 1), r in 0:(mre - 1)
-                                unsafe_store!(
-                                    Bp, unsafe_load(Ep, r + j * lde + 1),
-                                    ir + r + (jr + j) * ldb + 1
+                            GC.@preserve Ec begin            # kc×nre source copy (dodges the serial aliasing)
+                                Ep = pointer(Ec)
+                                @inbounds for j in 0:(nre - 1), p in 0:(kc - 1)
+                                    unsafe_store!(Ep, unsafe_load(Bp, plo + p + (jr + j) * ldb + 1), p + j * lde + 1)
+                                end
+                                _microkernel_unpacked_edge!(
+                                    Bp, ldb, Ap, ldM, ir, Ep - jr * lde * sz, lde, jr, kc,
+                                    one(T), zero(T), mre, nre, false, true
                                 )
                             end
                         end
+                        jr += nr
                     end
                 end
-                ir += mr
+            end
+        else                                                 # B(m×k) := B·M, IN PLACE: upM → column-tiles
+            m = size(B, 1)                                   # right-to-left (each reads cols ≤ its end, i.e.
+            Ec = borrow!(arn, T, mr, nr); lde = mr           # hoisted, loop-invariant (see the side-L note)
+            GC.@preserve M B begin                           # untouched to its left); lower → left-to-right.
+                Mp = pointer(M); Bp = pointer(B)
+                nt = cld(k, nr)
+                # Row-blocks OUTER: the in-place hazard is row-local (each tile reads/writes only its own
+                # rows), so row-blocks are independent — hoisting them keeps the 16×k A-slab L1-resident
+                # across its column tiles instead of re-streaming all m×k per tile (the wide-m killer).
+                ir = 0
+                while ir < m
+                    mre = min(mr, m - ir)
+                    for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
+                        jr = t * nr; nre = min(nr, k - jr)
+                        plo = upM ? 0 : jr
+                        phi = upM ? min(k, jr + nre) : k
+                        Bsp = Mp + plo * sz; kc = phi - plo
+                        if mre == mr && nre == nr
+                            _microkernel_unpacked!(
+                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                one(T), zero(T), Val(_MR), Val(_NR), Val(false), Val(true)
+                            )
+                        elseif nre == nr && rem(mre, W) == 0 && div(mre, W) <= 2
+                            # W-aligned partial rows → unmasked clipped kernel (same ladder and same reasoning
+                            # as the side-L site above; vr ∈ {1,2} since mre < mr here).
+                            if div(mre, W) == 1
+                                _microkernel_unpacked!(
+                                    Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                    one(T), zero(T), Val(1), Val(_NR), Val(false), Val(true)
+                                )
+                            else
+                                _microkernel_unpacked!(
+                                    Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                    one(T), zero(T), Val(2), Val(_NR), Val(false), Val(true)
+                                )
+                            end
+                        elseif nre == nr
+                            _microkernel_unpacked_mrows!(
+                                Bp, ldb, Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                one(T), zero(T), mre, cld(mre, W) == 1 ? Val(1) : Val(_MR),
+                                Val(_NR), Val(false), Val(true), Val(_vwidth(T))
+                            )
+                        else
+                            # Edge kernel is COLUMN-serial and the A-operand is B itself: column j+1's
+                            # contraction re-reads columns already stored (they're inside [plo,phi) on both
+                            # uplos). Compute the strip into a dest scratch, copy back after.
+                            GC.@preserve Ec begin
+                                Ep = pointer(Ec)
+                                _microkernel_unpacked_edge!(
+                                    Ep - (ir + jr * lde) * sz, lde,
+                                    Bp + plo * ldb * sz, ldb, ir, Bsp, ldM, jr, kc,
+                                    one(T), zero(T), mre, nre, false, true
+                                )
+                                @inbounds for j in 0:(nre - 1), r in 0:(mre - 1)
+                                    unsafe_store!(
+                                        Bp, unsafe_load(Ep, r + j * lde + 1),
+                                        ir + r + (jr + j) * ldb + 1
+                                    )
+                                end
+                            end
+                        end
+                    end
+                    ir += mr
+                end
             end
         end
-    end
     end                                                  # @scope arn
     return B
 end
@@ -404,58 +404,58 @@ function _trmm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     # The FIXED _L3_NB×_L3_NB shape is borrowed verbatim because `ldM = _L3_NB` is what the kernel is
     # given — sizing this borrow from `k` would silently change the A-operand's stride.
     @scope arn begin
-    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
-    Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
-    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
-    GC.@preserve M B begin
-        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
-        onr = one(T); zr = zero(T)
-        nt = cld(k, mr)
-        for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
-            ir = t * mr; mre = min(mr, k - ir)
-            plo = upM ? ir : 0                              # K-TRIM: op(A)'s nonzero p-range only
-            phi = upM ? k : min(k, ir + mre)
-            kc = phi - plo
-            Ap = Mp + 2 * plo * ldM * sz                   # M cols [plo,phi); kernel adds ir row offset
-            Bs = Bp + 2 * plo * sz                         # B-operand rows [plo,phi); kernel adds jr
-            full = cld(mre, W) >= _CMR
-            jr = 0
-            while jr < n
-                nre = min(nr, n - jr)
-                # `Val{FULL}` (9th Val) gates MASKED vs unmasked A-loads inside the k-loop and masked vs
-                # unmasked stores in the epilogue. `_uker_sweep!` (gemm.jl) dispatches Val(true) whenever
-                # `mre == mr`; this driver used to hardwire Val(false) on BOTH branches, so every tile ran
-                # masked even when full — and at the failing gate sizes mr divides k, so EVERY tile is
-                # full and every mask is pure waste. `full` above is a different predicate: it only picks
-                # the tile HEIGHT (Val(_CMR) vs Val(1)), never the masking.
-                # Costly precisely where it hurt: on AVX2 a masked op is `vmaskmovpd` (expensive on AMD),
-                # on AVX-512 it is k-register predication (~free) — which matches the measured split,
-                # ztrmm/ztrmmR n=32 being 0.821/0.781 on Zen3 against 0.994/1.087 on Zen4.
-                # Settled by an in-process ABBA A/B (both arms one process, bit-identical output),
-                # 6 rounds: Zen3 +16.7%/+13.1% at n=8/32 with the packed-path rows an exact 1.000
-                # control; Zen4 +0.4%/+3.6%/+3.8%/+2.7% at n=8/32/48/128 (no control row there —
-                # `_CTRMM_PACK` is `_vwidth==4`, so AVX-512 routes EVERY size through this driver).
-                if mre == mr                                     # full-height tile → unmasked
-                    _uker_cmplx!(
-                        Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
-                    )
-                elseif full
-                    _uker_cmplx!(
-                        Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
-                    )
-                else
-                    _uker_cmplx!(
-                        Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
-                    )
+        M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+        Mv = view(M, 1:k, 1:k)
+        _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+        cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
+        GC.@preserve M B begin
+            Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+            onr = one(T); zr = zero(T)
+            nt = cld(k, mr)
+            for t in (upM ? (0:(nt - 1)) : ((nt - 1):-1:0))
+                ir = t * mr; mre = min(mr, k - ir)
+                plo = upM ? ir : 0                              # K-TRIM: op(A)'s nonzero p-range only
+                phi = upM ? k : min(k, ir + mre)
+                kc = phi - plo
+                Ap = Mp + 2 * plo * ldM * sz                   # M cols [plo,phi); kernel adds ir row offset
+                Bs = Bp + 2 * plo * sz                         # B-operand rows [plo,phi); kernel adds jr
+                full = cld(mre, W) >= _CMR
+                jr = 0
+                while jr < n
+                    nre = min(nr, n - jr)
+                    # `Val{FULL}` (9th Val) gates MASKED vs unmasked A-loads inside the k-loop and masked vs
+                    # unmasked stores in the epilogue. `_uker_sweep!` (gemm.jl) dispatches Val(true) whenever
+                    # `mre == mr`; this driver used to hardwire Val(false) on BOTH branches, so every tile ran
+                    # masked even when full — and at the failing gate sizes mr divides k, so EVERY tile is
+                    # full and every mask is pure waste. `full` above is a different predicate: it only picks
+                    # the tile HEIGHT (Val(_CMR) vs Val(1)), never the masking.
+                    # Costly precisely where it hurt: on AVX2 a masked op is `vmaskmovpd` (expensive on AMD),
+                    # on AVX-512 it is k-register predication (~free) — which matches the measured split,
+                    # ztrmm/ztrmmR n=32 being 0.821/0.781 on Zen3 against 0.994/1.087 on Zen4.
+                    # Settled by an in-process ABBA A/B (both arms one process, bit-identical output),
+                    # 6 rounds: Zen3 +16.7%/+13.1% at n=8/32 with the packed-path rows an exact 1.000
+                    # control; Zen4 +0.4%/+3.6%/+3.8%/+2.7% at n=8/32/48/128 (no control row there —
+                    # `_CTRMM_PACK` is `_vwidth==4`, so AVX-512 routes EVERY size through this driver).
+                    if mre == mr                                     # full-height tile → unmasked
+                        _uker_cmplx!(
+                            Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
+                        )
+                    elseif full
+                        _uker_cmplx!(
+                            Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
+                        )
+                    else
+                        _uker_cmplx!(
+                            Bp, ldb, Ap, ldM, ir, Bs, ldb, jr, kc, onr, zr, mre, nre,
+                            Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
+                        )
+                    end
+                    jr += nr
                 end
-                jr += nr
             end
         end
-    end
     end                                                     # @scope arn
     return B
 end
@@ -473,44 +473,44 @@ function _trmm_cmplx_small_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, 
     # conj broadcast and `_uker_cmplx!` (raw `Ptr` + `ldM`), none of which retains it. FIXED
     # _L3_NB×_L3_NB shape, because `ldM = _L3_NB` is the stride the kernel is handed.
     @scope arn begin
-    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
-    Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)
-    cj && @inbounds(Mv .= conj.(Mv))
-    GC.@preserve M B begin
-        Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
-        onr = one(T); zr = zero(T); nt = cld(k, nr)
-        ir = 0
-        while ir < m
-            mre = min(mr, m - ir); full = cld(mre, W) >= _CMR
-            for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
-                jr = t * nr; nre = min(nr, k - jr)
-                plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
-                Aop = Bp + 2 * plo * ldb * sz          # B-operand (A-slot): B cols [plo,phi)
-                Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
-                # See the matching note in `_trmm_cmplx_small_L!`: the 9th Val is FULL (unmasked
-                # A-loads + unmasked stores), `_uker_sweep!` sets it whenever `mre == mr`, and this
-                # driver used to hardwire it false so every tile ran masked even when full.
-                if mre == mr                                     # full-height tile → unmasked
-                    _uker_cmplx!(
-                        Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
-                    )
-                elseif full
-                    _uker_cmplx!(
-                        Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
-                    )
-                else
-                    _uker_cmplx!(
-                        Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
-                        Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
-                    )
+        M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+        Mv = view(M, 1:k, 1:k)
+        _mat_tri!(Mv, A, k, up, tr, unit)
+        cj && @inbounds(Mv .= conj.(Mv))
+        GC.@preserve M B begin
+            Mp = Ptr{T}(pointer(M)); Bp = Ptr{T}(pointer(B))
+            onr = one(T); zr = zero(T); nt = cld(k, nr)
+            ir = 0
+            while ir < m
+                mre = min(mr, m - ir); full = cld(mre, W) >= _CMR
+                for t in (upM ? ((nt - 1):-1:0) : (0:(nt - 1)))
+                    jr = t * nr; nre = min(nr, k - jr)
+                    plo = upM ? 0 : jr; phi = upM ? min(k, jr + nre) : k; kc = phi - plo
+                    Aop = Bp + 2 * plo * ldb * sz          # B-operand (A-slot): B cols [plo,phi)
+                    Bop = Mp + 2 * plo * sz                # M (B-slot): rows [plo,phi)
+                    # See the matching note in `_trmm_cmplx_small_L!`: the 9th Val is FULL (unmasked
+                    # A-loads + unmasked stores), `_uker_sweep!` sets it whenever `mre == mr`, and this
+                    # driver used to hardwire it false so every tile ran masked even when full.
+                    if mre == mr                                     # full-height tile → unmasked
+                        _uker_cmplx!(
+                            Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(true), Val(false), 0, true
+                        )
+                    elseif full
+                        _uker_cmplx!(
+                            Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                            Val(_CMR), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
+                        )
+                    else
+                        _uker_cmplx!(
+                            Bp, ldb, Aop, ldb, ir, Bop, ldM, jr, kc, onr, zr, mre, nre,
+                            Val(1), Val(_CNR_SMALL), Val(false), Val(1), Val(1), Val(true), Val(true), Val(false), Val(false), Val(false), 0, true
+                        )
+                    end
                 end
+                ir += mr
             end
-            ir += mr
         end
-    end
     end                                                     # @scope arn
     return B
 end
@@ -596,64 +596,64 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     # The gemm pack buffers (`_gemm_scratch_cmplx`) stay GKH-owned fields, deliberately.
     # FIXED _L3_NB×_L3_NB shape (the `diag` role), not sized from k.
     @scope arn begin
-    M = borrow!(arn, Tc, _L3_NB, _L3_NB)
-    Mv = view(M, 1:k, 1:k)
-    _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
-    cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
-    GC.@preserve M B ApR ApI BpR BpI begin
-        Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
-        BRp = pointer(BpR); BIp = pointer(BpI)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc)
-            _pack_B_cmplx!(BpR, BpI, B, 0, jc, k, nce, false, nr)   # B[:, jc-panel], all k rows
-            rem = nce - (nce ÷ nr) * nr                    # partial column-tile width (0 if divisible)
-            if rem != 0                                    # repack the last slot at row-stride rem (pad-free,
-                jip = nce ÷ nr; basep = jip * nr * k       # so the NR=rem kernel computes no pad columns)
-                @inbounds for p in 0:(k - 1), c in 0:(rem - 1)
-                    v = B[p + 1, jc + jip * nr + c + 1]
-                    BpR[basep + p * rem + c + 1] = real(v); BpI[basep + p * rem + c + 1] = imag(v)
+        M = borrow!(arn, Tc, _L3_NB, _L3_NB)
+        Mv = view(M, 1:k, 1:k)
+        _mat_tri!(Mv, A, k, up, tr, unit)                       # M = op(A) triangle (other half zeroed)
+        cj && @inbounds(Mv .= conj.(Mv))                        # 'C' variant
+        GC.@preserve M B ApR ApI BpR BpI begin
+            Bp0 = Ptr{T}(pointer(B)); ARp = pointer(ApR); AIp = pointer(ApI)
+            BRp = pointer(BpR); BIp = pointer(BpI)
+            jc = 0
+            while jc < n
+                nce = min(nc, n - jc)
+                _pack_B_cmplx!(BpR, BpI, B, 0, jc, k, nce, false, nr)   # B[:, jc-panel], all k rows
+                rem = nce - (nce ÷ nr) * nr                    # partial column-tile width (0 if divisible)
+                if rem != 0                                    # repack the last slot at row-stride rem (pad-free,
+                    jip = nce ÷ nr; basep = jip * nr * k       # so the NR=rem kernel computes no pad columns)
+                    @inbounds for p in 0:(k - 1), c in 0:(rem - 1)
+                        v = B[p + 1, jc + jip * nr + c + 1]
+                        BpR[basep + p * rem + c + 1] = real(v); BpI[basep + p * rem + c + 1] = imag(v)
+                    end
                 end
-            end
-            ir = 0
-            while ir < k
-                mre = min(mr, k - ir)
-                plo = upM ? ir : 0                          # K-TRIM: op(A)'s nonzero p-range
-                phi = upM ? k : min(k, ir + mre); kc = phi - plo
-                _pack_A_cmplx!(ApR, ApI, Mv, ir, plo, mre, kc, false, mr)   # SIMD deinterleave from dense M
-                jr = 0
-                while jr < nce
-                    nre = min(nr, nce - jr); ji = div(jr, nr)
-                    boff = (ji * nr * k + plo * nr) * sz
-                    Cblk = Bp0 + (2 * ir + 2 * (jc + jr) * ldb) * sz
-                    AR = Ptr{T}(ARp); AI = Ptr{T}(AIp)
-                    BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
-                    if nre == nr
-                        if mre == mr
-                            _microkernel_cmplx!(
-                                Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                                Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true)
-                            )
-                        else
-                            _microkernel_cmplx_masked!(
-                                Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
-                                mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true)
+                ir = 0
+                while ir < k
+                    mre = min(mr, k - ir)
+                    plo = upM ? ir : 0                          # K-TRIM: op(A)'s nonzero p-range
+                    phi = upM ? k : min(k, ir + mre); kc = phi - plo
+                    _pack_A_cmplx!(ApR, ApI, Mv, ir, plo, mre, kc, false, mr)   # SIMD deinterleave from dense M
+                    jr = 0
+                    while jr < nce
+                        nre = min(nr, nce - jr); ji = div(jr, nr)
+                        boff = (ji * nr * k + plo * nr) * sz
+                        Cblk = Bp0 + (2 * ir + 2 * (jc + jr) * ldb) * sz
+                        AR = Ptr{T}(ARp); AI = Ptr{T}(AIp)
+                        BR = Ptr{T}(BRp + boff); BI = Ptr{T}(BIp + boff)
+                        if nre == nr
+                            if mre == mr
+                                _microkernel_cmplx!(
+                                    Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                    Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true)
+                                )
+                            else
+                                _microkernel_cmplx_masked!(
+                                    Cblk, ldb, AR, AI, BR, BI, kc, alr, ali,
+                                    mre, nre, Val(_CMR), Val(_CNR), Val(1), Val(1), Val(true), Val(true)
+                                )
+                            end
+                        else                                     # partial column-tile: stride-rem slot ⇒ plo*rem
+                            boffr = (ji * nr * k + plo * rem) * sz
+                            _trmm_rem_cmplx!(
+                                Cblk, ldb, AR, AI, Ptr{T}(BRp + boffr), Ptr{T}(BIp + boffr),
+                                kc, alr, ali, mre, nre, Val(_CMR), Val(1), Val(1)
                             )
                         end
-                    else                                     # partial column-tile: stride-rem slot ⇒ plo*rem
-                        boffr = (ji * nr * k + plo * rem) * sz
-                        _trmm_rem_cmplx!(
-                            Cblk, ldb, AR, AI, Ptr{T}(BRp + boffr), Ptr{T}(BIp + boffr),
-                            kc, alr, ali, mre, nre, Val(_CMR), Val(1), Val(1)
-                        )
+                        jr += nr
                     end
-                    jr += nr
+                    ir += mr
                 end
-                ir += mr
+                jc += nc
             end
-            jc += nc
         end
-    end
     end                                                     # @scope arn
     return B
 end
@@ -1283,6 +1283,11 @@ function trmm!(
     # the split-L path each route around `_trmm!` and would need the same guard individually.
     if eltype(B) <: Union{BlasReal, BlasComplex} && iszero(alpha)
         fill!(B, zero(eltype(B)))
+        return B
+    end
+    if _l3p_ok(B, A)                                                   # dual planes (docs/src/dual_l3.md §2.3); 'C' == 'T'
+        rA = _root(A); rB = _root(B)
+        GC.@preserve rA rB _trmm_dual!(sl, uplo == 'U', transA != 'N', diag == 'U', convert(eltype(B), alpha), _pm(A), _pm(B))
         return B
     end
     # NON-UNIT-STRIDE OUTPUT: stage through a contiguous copy.
@@ -2061,58 +2066,58 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
     # pointer, and nothing borrowed is written into `B` except the solved values. Borrowed ONCE at the
     # routine's entry, above the `while jc < nrhs` stripe loop — the length is loop-invariant.
     @leafscope arn begin      # inlines a SIMD kernel — see `_trsm_fused_L!`
-    buf = borrow!(arn, Float64, 2 * k * NR + 2 * k)
-    GC.@preserve A B buf begin
-        pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B))
-        pr = pointer(buf); pim = pr + k * NR * sz; rc = pim + k * NR * sz
-        @inbounds for j in 0:(k - 1)
-            z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
-            unsafe_store!(rc, real(z), 2j + 1); unsafe_store!(rc, imag(z), 2j + 2)
-        end
-        # Ragged rows go at the TOP for both the pack blocks and the slabs: the slab loop walks up from
-        # row k-MR, so k mod W is left over at row 0 either way. Anchoring the transpose blocks to the
-        # same end keeps ONE ragged region instead of one at each end.
-        rlo = k % _ZGT_W
-        jc = 0
-        while jc < nrhs
-            wid = min(NR, nrhs - jc)
-            pB0 = pB + jc * ldb * csz
-            lo = wid == NR ? rlo : k                     # ragged column stripe → scalar pack (no full block)
-            @inbounds for i0 in lo:_ZGT_W:(k - 1)
-                _zgt_pack!(pr, pim, pB0, ldb * csz, i0)
+        buf = borrow!(arn, Float64, 2 * k * NR + 2 * k)
+        GC.@preserve A B buf begin
+            pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B))
+            pr = pointer(buf); pim = pr + k * NR * sz; rc = pim + k * NR * sz
+            @inbounds for j in 0:(k - 1)
+                z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
+                unsafe_store!(rc, real(z), 2j + 1); unsafe_store!(rc, imag(z), 2j + 2)
             end
-            @inbounds for v in 0:(wid - 1)               # scalar pack for the ragged rows / ragged stripe
-                sc = pB0 + v * ldb * csz
-                for i in 0:(lo - 1)
-                    unsafe_store!(pr + (i * NR + v) * sz, unsafe_load(sc, 2i + 1))
-                    unsafe_store!(pim + (i * NR + v) * sz, unsafe_load(sc, 2i + 2))
+            # Ragged rows go at the TOP for both the pack blocks and the slabs: the slab loop walks up from
+            # row k-MR, so k mod W is left over at row 0 either way. Anchoring the transpose blocks to the
+            # same end keeps ONE ragged region instead of one at each end.
+            rlo = k % _ZGT_W
+            jc = 0
+            while jc < nrhs
+                wid = min(NR, nrhs - jc)
+                pB0 = pB + jc * ldb * csz
+                lo = wid == NR ? rlo : k                     # ragged column stripe → scalar pack (no full block)
+                @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                    _zgt_pack!(pr, pim, pB0, ldb * csz, i0)
                 end
-            end
-            @inbounds for v in wid:(NR - 1), i in 0:(k - 1)   # zero-pad the unused lanes of a short stripe
-                unsafe_store!(pr + (i * NR + v) * sz, 0.0)
-                unsafe_store!(pim + (i * NR + v) * sz, 0.0)
-            end
-            r0 = k - MR
-            while r0 >= 0
-                _zgt_slab!(Val(_ZGT_MR), pr, pim, pA, lda, rc, r0, k)
-                r0 -= MR
-            end
-            @inbounds for r in (r0 + MR - 1):-1:0        # ragged top rows, one at a time (Val(1) is literal)
-                _zgt_slab!(Val(1), pr, pim, pA, lda, rc, r, k)
-            end
-            @inbounds for i0 in lo:_ZGT_W:(k - 1)
-                _zgt_unpack!(pr, pim, pB0, ldb * csz, i0)
-            end
-            @inbounds for v in 0:(wid - 1)
-                dc = pB0 + v * ldb * csz
-                for i in 0:(lo - 1)
-                    unsafe_store!(dc, unsafe_load(pr + (i * NR + v) * sz), 2i + 1)
-                    unsafe_store!(dc, unsafe_load(pim + (i * NR + v) * sz), 2i + 2)
+                @inbounds for v in 0:(wid - 1)               # scalar pack for the ragged rows / ragged stripe
+                    sc = pB0 + v * ldb * csz
+                    for i in 0:(lo - 1)
+                        unsafe_store!(pr + (i * NR + v) * sz, unsafe_load(sc, 2i + 1))
+                        unsafe_store!(pim + (i * NR + v) * sz, unsafe_load(sc, 2i + 2))
+                    end
                 end
+                @inbounds for v in wid:(NR - 1), i in 0:(k - 1)   # zero-pad the unused lanes of a short stripe
+                    unsafe_store!(pr + (i * NR + v) * sz, 0.0)
+                    unsafe_store!(pim + (i * NR + v) * sz, 0.0)
+                end
+                r0 = k - MR
+                while r0 >= 0
+                    _zgt_slab!(Val(_ZGT_MR), pr, pim, pA, lda, rc, r0, k)
+                    r0 -= MR
+                end
+                @inbounds for r in (r0 + MR - 1):-1:0        # ragged top rows, one at a time (Val(1) is literal)
+                    _zgt_slab!(Val(1), pr, pim, pA, lda, rc, r, k)
+                end
+                @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                    _zgt_unpack!(pr, pim, pB0, ldb * csz, i0)
+                end
+                @inbounds for v in 0:(wid - 1)
+                    dc = pB0 + v * ldb * csz
+                    for i in 0:(lo - 1)
+                        unsafe_store!(dc, unsafe_load(pr + (i * NR + v) * sz), 2i + 1)
+                        unsafe_store!(dc, unsafe_load(pim + (i * NR + v) * sz), 2i + 2)
+                    end
+                end
+                jc += NR
             end
-            jc += NR
         end
-    end
     end                                          # @scope arn
     return B
 end
@@ -2151,7 +2156,11 @@ const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
 # unconditionally, so a skipped fill would feed it stale reciprocals. Over the cap the direct path is
 # simply not taken and the trtri path handles it, which is correct at any k.
 @inline _fh_ctrsm_direct_max() =
-    min(let f = _FKR_ctrsm_direct_max[]; f >= 0 ? f : _CTRSM_DIRECT_MAX end, length(_TRSV_RCP64))
+    min(
+    let f = _FKR_ctrsm_direct_max[]
+        f >= 0 ? f : _CTRSM_DIRECT_MAX
+    end, length(_TRSV_RCP64)
+)
 # Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
 # off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
 # ~0.85 at n=128; recursing into small bases + gemm subtracts recovers the blocking (rec=64 → 0.91).
@@ -2299,13 +2308,17 @@ const _ZRT_CLANE = Vec(ntuple(l -> (l + 1) >> 1, Val(2 * _ZGT_W)))
     sz = sizeof(Float64); V2 = Vec{2 * _ZGT_W, Float64}
     a(t) = Symbol(:acc, t)
     mskdef = MSK ? :(msk = _ZRT_CLANE <= nact) : nothing
-    ld = [MSK ? :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
-          :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    ld = [
+        MSK ? :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
+            :($(a(t)) = vload($V2, pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)
+    ]
     upd = [
         quote
             cr = unsafe_load(pAi, 2 * (jb + $t) * lda + 1); ci = unsafe_load(pAi, 2 * (jb + $t) * lda + 2)
-            $(a(t)) = $(FOLD ? :(muladd($V2(cr), xv, muladd($V2(ci), xw, $(a(t))))) :
-                :(muladd($V2(-cr), xv, muladd($V2(-ci), xw, $(a(t))))))
+            $(a(t)) = $(
+                FOLD ? :(muladd($V2(cr), xv, muladd($V2(ci), xw, $(a(t))))) :
+                    :(muladd($V2(-cr), xv, muladd($V2(-ci), xw, $(a(t)))))
+            )
         end for t in 0:(NC - 1)
     ]
     tri = map(0:(NC - 1)) do t
@@ -2313,8 +2326,10 @@ const _ZRT_CLANE = Vec(ntuple(l -> (l + 1) >> 1, Val(2 * _ZGT_W)))
         feed = [
             quote
                 cr = unsafe_load(pAt, 2 * (jb + $u) * lda + 1); ci = unsafe_load(pAt, 2 * (jb + $u) * lda + 2)
-                $(a(u)) = $(FOLD ? :(muladd($V2(cr), $src, muladd($V2(ci), sw, $(a(u))))) :
-                    :(muladd($V2(-cr), $src, muladd($V2(-ci), sw, $(a(u))))))
+                $(a(u)) = $(
+                    FOLD ? :(muladd($V2(cr), $src, muladd($V2(ci), sw, $(a(u))))) :
+                        :(muladd($V2(-cr), $src, muladd($V2(-ci), sw, $(a(u)))))
+                )
             end for u in (t + 1):(NC - 1)
         ]
         return quote
@@ -2326,12 +2341,14 @@ const _ZRT_CLANE = Vec(ntuple(l -> (l + 1) >> 1, Val(2 * _ZGT_W)))
             $(feed...)
         end
     end
-    st = [MSK ? :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
-          :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)]
+    st = [
+        MSK ? :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz, msk)) :
+            :(vstore($(a(t)), pB + ((jb + $t) * ldb + r0) * 2 * $sz)) for t in 0:(NC - 1)
+    ]
     # NOTE: built here as plain conditionals, NOT via a helper function. Calling a module-level
     # function from inside a @generated body trips "The function body AST ... is not pure".
     xvld = MSK ? :(vload($V2, pB + (i * ldb + r0) * 2 * $sz, msk)) :
-           :(vload($V2, pB + (i * ldb + r0) * 2 * $sz))
+        :(vload($V2, pB + (i * ldb + r0) * 2 * $sz))
     xvex = FOLD ? :(-$xvld) : xvld
     return quote
         $(Expr(:meta, :inline))
@@ -2399,22 +2416,22 @@ function _trsm_zrt_R!(unit::Bool, k::Int, A, B)
     # B; none of them keeps the pointer, and nothing borrowed reaches `B` except solved values. One
     # borrow at the routine's entry, above every loop.
     @scope arn begin
-    rc = borrow!(arn, Float64, 2 * k)
-    GC.@preserve A B rc begin
-        pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B)); prc = pointer(rc)
-        @inbounds for j in 0:(k - 1)
-            z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
-            unsafe_store!(prc, real(z), 2j + 1); unsafe_store!(prc, imag(z), 2j + 2)
+        rc = borrow!(arn, Float64, 2 * k)
+        GC.@preserve A B rc begin
+            pA = Ptr{Float64}(pointer(A)); pB = Ptr{Float64}(pointer(B)); prc = pointer(rc)
+            @inbounds for j in 0:(k - 1)
+                z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
+                unsafe_store!(prc, real(z), 2j + 1); unsafe_store!(prc, imag(z), 2j + 2)
+            end
+            # `Val(!_EXPFLAG[_EXP14])` — the fold SHIPS ON; the flag is INVERTED so the old scalar-negate
+            # arm stays A/B-able in-process on a fleet box (see the _EXP14 registry note).
+            # The ragged ROW block (m % W rows) rides the SAME tile under a mask — see `_zrt_tile!`.
+            if _EXPFLAG[_EXP14]
+                _zrt_sweep!(Val(false), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
+            else
+                _zrt_sweep!(Val(true), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
+            end
         end
-        # `Val(!_EXPFLAG[_EXP14])` — the fold SHIPS ON; the flag is INVERTED so the old scalar-negate
-        # arm stays A/B-able in-process on a fleet box (see the _EXP14 registry note).
-        # The ragged ROW block (m % W rows) rides the SAME tile under a mask — see `_zrt_tile!`.
-        if _EXPFLAG[_EXP14]
-            _zrt_sweep!(Val(false), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
-        else
-            _zrt_sweep!(Val(true), pB, ldb, pA, lda, prc, k, m, mb, W, _ZRT_NC)
-        end
-    end
     end                                      # @scope arn
     return B
 end
@@ -2694,8 +2711,10 @@ function _slab_body_ord(
             cs = cc_(r, v)
             # hoisted accumulators already hold B, so the gemm SUBTRACTS; otherwise it sums and the
             # subtract step below computes B - Σ.
-            push!(inner.args, hoist ? :($cs = muladd(-$u_, $(Symbol(pfx, :x, v)), $cs)) :
-                :($cs = muladd($u_, $(Symbol(pfx, :x, v)), $cs)))
+            push!(
+                inner.args, hoist ? :($cs = muladd(-$u_, $(Symbol(pfx, :x, v)), $cs)) :
+                    :($cs = muladd($u_, $(Symbol(pfx, :x, v)), $cs))
+            )
         end
     end
     if isnothing(ng)
@@ -3034,10 +3053,10 @@ end
         p = Pp + (i0 * NR + vb) * sz
         y0, y1, y2, y3, y4, y5, y6, y7 = if rev     # load-offset permute, not a lane permute
             vload(V, p + 7NR * sz), vload(V, p + 6NR * sz), vload(V, p + 5NR * sz), vload(V, p + 4NR * sz),
-            vload(V, p + 3NR * sz), vload(V, p + 2NR * sz), vload(V, p + NR * sz),  vload(V, p)
+                vload(V, p + 3NR * sz), vload(V, p + 2NR * sz), vload(V, p + NR * sz), vload(V, p)
         else
-            vload(V, p),            vload(V, p + NR * sz),  vload(V, p + 2NR * sz), vload(V, p + 3NR * sz),
-            vload(V, p + 4NR * sz), vload(V, p + 5NR * sz), vload(V, p + 6NR * sz), vload(V, p + 7NR * sz)
+            vload(V, p), vload(V, p + NR * sz), vload(V, p + 2NR * sz), vload(V, p + 3NR * sz),
+                vload(V, p + 4NR * sz), vload(V, p + 5NR * sz), vload(V, p + 6NR * sz), vload(V, p + 7NR * sz)
         end
         x0, x1, x2, x3, x4, x5, x6, x7 = _tr8x8(y0, y1, y2, y3, y4, y5, y6, y7)
         b = pB + ((rev ? KC - 8 - i0 : i0) + (jc + vb) * ldb) * sz
@@ -3455,261 +3474,261 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
     # handler's own enter/leave rather than register pressure — and if it does not, the cause is the
     # borrow or its layout, not the scope. Either way the measurement discriminates.
     @leafscope arn begin
-    buf = borrow!(arn, T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
-    GC.@preserve A B buf begin
-        pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
-        # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
-        # write P columns up to 2*NR and would otherwise land on top of the U pack.
-        pU = Pp + (KC * 2 * NR + _EXPINT[1]) * sz; rp = pU + KC * ldu * sz
-        # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
-        # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
-        # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
-        # negligible in L1). Fixes the small-k setup floor (s=24/32, the only genuinely setup-bound points).
-        # _EXP5: force the compact-U pack even when A is L1-sized. directA skips the pack and lets the
-        # slabs read U as SCALAR DEMAND LOADS from inside the gemm loop AND from inside the serial
-        # back-substitution chain — where a cold line is a full memory latency with nothing to overlap it.
-        # The pack below is a unit-stride streaming read: same lines, fetched as one frontloaded burst.
-        # Counters say this is the only live degree of freedom: at the gate working set we already pull
-        # 222 lines/call from L3+DRAM against a ~256-line compulsory floor, so it is not a bytes problem.
-        directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5] && !rev
-        pUsrc = pA; lduse = lda
-        if !directA
-            if rev
-                # Ũ = J·Aᵀ·J, i.e. Ũ[i,j] = A[KC-1-j, KC-1-i]. Walk the SOURCE the same way as below
-                # (by column c, rows r ≤ c) so A is still read contiguously; only the writes into the
-                # compact panel become ldu-strided. i = KC-1-c, j = KC-1-r, and r ≤ c ⟹ i ≤ j, so the
-                # result is upper-triangular exactly as the kernels require.
-                @inbounds for c in 0:(KC - 1)
-                    for r in 0:c
-                        unsafe_store!(
-                            pU, unsafe_load(pA, r + c * lda + 1),
-                            (KC - 1 - c) + (KC - 1 - r) * ldu + 1
-                        )
+        buf = borrow!(arn, T, KC * 2 * NR + _EXPINT[1] + KC * ldu + KC)
+        GC.@preserve A B buf begin
+            pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
+            # U and the reciprocals start past the WIDEST P layout (2*NR), not past NR — the paired stripes
+            # write P columns up to 2*NR and would otherwise land on top of the U pack.
+            pU = Pp + (KC * 2 * NR + _EXPINT[1]) * sz; rp = pU + KC * ldu * sz
+            # DIRECT-A (Fable lever #2): for an L1-resident triangle, skip the compact-U pack and read A's upper
+            # triangle STRAIGHT — the slab reads U[row,col]=A[row,col] at stride `lduse`, so pass pA/lda. Saves the
+            # O(k²/2) pack when A already fits L1 (the large-lda scatter + po2 odd-ldu the pack avoids are
+            # negligible in L1). Fixes the small-k setup floor (s=24/32, the only genuinely setup-bound points).
+            # _EXP5: force the compact-U pack even when A is L1-sized. directA skips the pack and lets the
+            # slabs read U as SCALAR DEMAND LOADS from inside the gemm loop AND from inside the serial
+            # back-substitution chain — where a cold line is a full memory latency with nothing to overlap it.
+            # The pack below is a unit-stride streaming read: same lines, fetched as one frontloaded burst.
+            # Counters say this is the only live degree of freedom: at the gate working set we already pull
+            # 222 lines/call from L3+DRAM against a ~256-line compulsory floor, so it is not a bytes problem.
+            directA = (KC * KC * sz <= _L1_BYTES) && !_EXPFLAG[_EXP5] && !rev
+            pUsrc = pA; lduse = lda
+            if !directA
+                if rev
+                    # Ũ = J·Aᵀ·J, i.e. Ũ[i,j] = A[KC-1-j, KC-1-i]. Walk the SOURCE the same way as below
+                    # (by column c, rows r ≤ c) so A is still read contiguously; only the writes into the
+                    # compact panel become ldu-strided. i = KC-1-c, j = KC-1-r, and r ≤ c ⟹ i ≤ j, so the
+                    # result is upper-triangular exactly as the kernels require.
+                    @inbounds for c in 0:(KC - 1)
+                        for r in 0:c
+                            unsafe_store!(
+                                pU, unsafe_load(pA, r + c * lda + 1),
+                                (KC - 1 - c) + (KC - 1 - r) * ldu + 1
+                            )
+                        end
+                    end
+                else
+                    @inbounds for c in 0:(KC - 1)                 # pack A's upper triangle → compact U (odd ldu)
+                        for r in 0:c
+                            unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1)
+                        end
                     end
                 end
-            else
-                @inbounds for c in 0:(KC - 1)                 # pack A's upper triangle → compact U (odd ldu)
-                    for r in 0:c
-                        unsafe_store!(pU, unsafe_load(pA, r + c * lda + 1), r + c * ldu + 1)
-                    end
-                end
+                pUsrc = pU; lduse = ldu
             end
-            pUsrc = pU; lduse = ldu
-        end
-        @inbounds for i in 0:(KC - 1)                          # recips always packed (contiguous rp panel)
-            ii = rev ? KC - 1 - i : i                          # Ũ[i,i] = A[KC-1-i, KC-1-i]
-            unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, ii + ii * lda + 1)), i + 1)
-        end
-        # AVX-512 f64: vectorized 8×8-transpose pack (const-folds). NOTE: the transpose reads 8 B-columns at
-        # stride ldb·sz simultaneously for the in-register 8×8 block — when ldb·sz is a big power-of-2 multiple
-        # (po2 n) those 8 accesses share low-12 bits → 4K-aliasing stall (measured +3.5%@512 / +1.7%@1024 from
-        # padding B). FALSIFIED fix: routing the aliased stride to the alias-free column-outer scalar pack
-        # regressed −0.9% (the scalar per-element cost outweighs the aliasing) — do NOT retry. The residual is
-        # structural. THE OLD CLAIM HERE WAS WRONG and it cost real time before anyone checked it: it said
-        # AOCL "reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose)" and that
-        # escaping the aliasing needs a row-lane microkernel family. DISASSEMBLING THE SHIPPED LIBRARY
-        # REFUTES THAT (2026-08-12, AOCL_jll libblis-mt.so, not stripped). The BLOCKED kernel AOCL has
-        # for this case — WHICH IS NOT PROVEN TO BE THE ONE IT RUNS AT n=128/256; see the dispatch note
-        # below — is `bli_dgemmtrsm_u_zen4_asm_8x24`: a FUSED gemmtrsm at an 8×24 register tile — the
-        # same structure and the same tile shape as ours (_GT_MR=8, _GT_NR=NRV·W=24). Opcode mix: 375
-        # vfmadd231pd · 141 vbroadcastsd · 78 vmovupd + 56 vmovapd · 48 vshuff64x2 · 45 vmulpd ·
-        # 24 vscatterqpd + 24 kxnorw · 24 vfmsub231pd · 21 vsubpd. It SHUFFLES (48 cross-lane permutes),
-        # so "no transpose" is false, and it has ZERO gathers — reads come contiguously out of packed
-        # panels and only the write-back to arbitrarily-strided C is scattered under an all-ones mask
-        # (24 scatters × 8 lanes = 192 = exactly one 8×24 tile).
-        # Corroborated from our side: the no-transpose formulation that DOES exist in-tree (trsv per
-        # column, the AD/generic branch) measures 3.8–7.9× SLOWER, because putting rows in lanes pays the
-        # full back-substitution chain once per COLUMN instead of amortising it across NR columns.
-        # CONSEQUENCE: there is no row-lane microkernel to chase. Do not re-open "row-lane" on the
-        # strength of the old comment again.
-        #
-        # DISPATCH IS UNVERIFIED, AND THIS IS THE OPEN QUESTION. Identifying the blocked kernel by symbol
-        # shape proves the kernel EXISTS, not that it RUNS at our binding sizes. The same library ships a
-        # separate unpacked small-matrix family — `bli_dtrsm_small_AltXB_AuXB_AVX512` (AuXB = A-upper·X=B,
-        # i.e. exactly our case), `bli_trsm_small`, `bli_trsm_small_AVX512` — and `dtrsm_blis_impl`
-        # contains a dimension-dispatch maze (constants 49/50/58/96/120/138/199/1020/1811/2499/3219/
-        # 4299/13999 plus log10 calls, an indirect call) that plausibly routes n=128/256 there. That
-        # kernel is scalar-heavy and does NO packing (census: 532 vmovsd, 372 vmulsd, 174 vsubsd, 74
-        # vdivsd, 108 vfmadd231pd, 0 scatters). If it is what wins those cells, then the lever is ENTRY
-        # AND PACKING OVERHEAD — the recurring culprit in this repo — and not macro-kernel strategy, and
-        # every rate/IPC/tile comparison made against the blocked kernel was against the wrong code.
-        # SETTLE THIS BEFORE ACTING ON n=128/256: decode the branch region of `dtrsm_blis_impl` for
-        # (side=L, uplo=U, trans=N, m=n=128), or read `bla_trsm_amd.c` at the artifact's version, where
-        # those thresholds appear as named constants. No benchmark needed.
-        # `!rev` on the three transposing packs: each would need a lane reversal to fold in the flip
-        # (an 8-lane `shufflevector` for useT/fusedT, a 4-lane one for useT4), and `fusedT` additionally
-        # reads and writes B IN PLACE, so its reversal would have to be applied twice consistently. The
-        # scalar packs get the flip for free in their index arithmetic. Cost is one O(KC·NR) pack per
-        # stripe against O(KC²·NR) of solve — measure before reaching for the vector variants.
-        # `!rev` on the 8-wide pack but NOT the 4-wide one below, because that is where they MEASURED
-        # differently — potrfU native arm, µs, after the reversed packs landed:
-        #     n            512     768    1000
-        #     galen  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
-        #     neuro  W=8  lever 1709.7  5536.7 11996.1   native 2126.0  6759.3 14666.8   (−24/−22/−22%)
-        # and neuromancer's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
-        # reversal made it worse, not better. Hypothesis (not verified): reversing 8 f64 lanes is a full
-        # cross-lane vpermpd per vector — 16 per block across pack+unpack, on top of `_tr8x8`'s own
-        # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
-        # which is what it did before and what measured better. The 8-wide reversed code stays (it is
-        # correct, and verified) so a future profile can re-test it cheaply.
-        useT = _GT_TRANSPOSE
-        useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
-        rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
-        # `!rev` on fusedT and NOT on useT: the fusedT slabs SKIP the pack round-trip entirely (they read
-        # B direct and write it back transposed), so they never see the reversal the pack applies and
-        # would be silently wrong under rev. The plain useT/useT4 packs do carry it — see
-        # `_packP_tr_blk!`/`_fused_packP_tr4!`. Reversing inside the fusedT slab generators is possible
-        # (one lane reverse on load and on store) but it is the hairiest code here; do it only if a
-        # profile says the pack round-trip is costing the rev path real time.
-        fusedT = _TRSM_FUSEDT_ON[] && useT && !rev       # Lever 1: skip the pack round-trip (full stripes)
-        # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
-        # 23-38 reloads at NRV=3, 0-1 at NRV=2, 0 at NRV=1) AND an NR=24 stripe leaves n=32 as 24+8, so a
-        # quarter of the columns run as a Val(1) tail whose back-substitution has no ILP to hide its
-        # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
-        # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
-        # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
-        NRl = (_EXPFLAG[_EXP1] && KC <= _trsm_dbase()) ? 2 * W : NR
-        # _EXP7 — ILP lever. At exactly n = NR+W with a tiny KC (the gate cell: k=32, n=32 = 24+8) solve
-        # BOTH stripes in one paired body so their independent back-substitution chains overlap, instead
-        # of running them back to back with only one chain ever in flight. Buffer note: the pair uses a
-        # shared P of row stride NR+W, which is <= the KC*NR+... allocation already made above.
-        # Pair path is ON by default now (measured 0.8522 paired/sequential, n=240, 22.7 SE,
-        # bit-for-bit identical output). _EXP7 is retained INVERTED as the A/B disable so the
-        # sequential arm stays reachable in-process.
-        if !_EXPFLAG[_EXP7] && fusedT && rem == 0 && n == NR + W && KC == 32
-            _fusedT_pair_tiny!(Val(32), Val(NRV), Pp, pB, ldb, 0, pUsrc, lduse, rp)
-        else
-        jc = 0
-        while jc < n
-            wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
-            # PAD WIDTH, not NR. The fusedT branches below take wid in {NR, 2W, W}; everything else
-# falls here and USED TO BE PADDED OUT TO THE FULL NR with zeros, so a 2-column tail was
-# solved as 24 columns — 12x the work. The comment above says "gate n is a multiple of W,
-# so the tail is always 8 or 16 wide": TRUE when the ladder was all powers of two, FALSE
-# since the non-po2 sizes landed. n=50 stripes 24+24+2 and n=100 stripes 24x4+4, and those
-# 2- and 4-wide tails are exactly the red cells (Zen4 0.79, Zen5 0.80).
-# The pad is internal to P — the unpack writes back only `wid` columns — so narrowing it to
-# the smallest W-multiple covering wid is safe, and the solve already takes the stripe width
-# as a compile-time Val(NRV). NRVp in 1:NRV, so a 3-way branch covers it.
-            NRp  = min(NR, cld(wid, W) * W)
-            NRVp = NRp ÷ W
-            # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
-            # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
-            # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
-            # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
-            # PAIR TWO ADJACENT FULL STRIPES so their back-substitution chains overlap.
-            # DOMAIN IS SMALL KC, and that is measured, not assumed: at KC <= _TRSM_DBASE each slab's
-            # gemm runs only ~12 trips on average and cannot hide the serial chain, so a second chain
-            # pays (n=32 gate 0.898 -> 1.105). At larger KC the gemm already runs up to KC-s-MR trips
-            # and supplies that independent work itself, so pairing only adds register pressure
-            # (2*MR*NRV = 48 live accumulators against 32) — measured 6.2% / 4.2% / 2.6% SLOWER at
-            # k=128 / 256 / 512, the penalty shrinking exactly as the gemm's share of the slab grows.
-            # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
-            # rows) keeps the single-stripe path: the tail needs its own mini-pack.
+            @inbounds for i in 0:(KC - 1)                          # recips always packed (contiguous rp panel)
+                ii = rev ? KC - 1 - i : i                          # Ũ[i,i] = A[KC-1-i, KC-1-i]
+                unsafe_store!(rp, unit ? one(T) : inv(unsafe_load(pA, ii + ii * lda + 1)), i + 1)
+            end
+            # AVX-512 f64: vectorized 8×8-transpose pack (const-folds). NOTE: the transpose reads 8 B-columns at
+            # stride ldb·sz simultaneously for the in-register 8×8 block — when ldb·sz is a big power-of-2 multiple
+            # (po2 n) those 8 accesses share low-12 bits → 4K-aliasing stall (measured +3.5%@512 / +1.7%@1024 from
+            # padding B). FALSIFIED fix: routing the aliased stride to the alias-free column-outer scalar pack
+            # regressed −0.9% (the scalar per-element cost outweighs the aliasing) — do NOT retry. The residual is
+            # structural. THE OLD CLAIM HERE WAS WRONG and it cost real time before anyone checked it: it said
+            # AOCL "reads B via row-lane direct-B broadcasts (1 contiguous stream, no transpose)" and that
+            # escaping the aliasing needs a row-lane microkernel family. DISASSEMBLING THE SHIPPED LIBRARY
+            # REFUTES THAT (2026-08-12, AOCL_jll libblis-mt.so, not stripped). The BLOCKED kernel AOCL has
+            # for this case — WHICH IS NOT PROVEN TO BE THE ONE IT RUNS AT n=128/256; see the dispatch note
+            # below — is `bli_dgemmtrsm_u_zen4_asm_8x24`: a FUSED gemmtrsm at an 8×24 register tile — the
+            # same structure and the same tile shape as ours (_GT_MR=8, _GT_NR=NRV·W=24). Opcode mix: 375
+            # vfmadd231pd · 141 vbroadcastsd · 78 vmovupd + 56 vmovapd · 48 vshuff64x2 · 45 vmulpd ·
+            # 24 vscatterqpd + 24 kxnorw · 24 vfmsub231pd · 21 vsubpd. It SHUFFLES (48 cross-lane permutes),
+            # so "no transpose" is false, and it has ZERO gathers — reads come contiguously out of packed
+            # panels and only the write-back to arbitrarily-strided C is scattered under an all-ones mask
+            # (24 scatters × 8 lanes = 192 = exactly one 8×24 tile).
+            # Corroborated from our side: the no-transpose formulation that DOES exist in-tree (trsv per
+            # column, the AD/generic branch) measures 3.8–7.9× SLOWER, because putting rows in lanes pays the
+            # full back-substitution chain once per COLUMN instead of amortising it across NR columns.
+            # CONSEQUENCE: there is no row-lane microkernel to chase. Do not re-open "row-lane" on the
+            # strength of the old comment again.
             #
-            # THE REGISTER EXPLANATION ABOVE IS REAL BUT NOT BINDING — an earlier revision of this note
-            # called it simply "wrong", which overstated it. The spill is there: an asm audit counts 78
-            # spill/reload vector moves in the paired slab's loop against ZERO in the shipped 24-accumulator
-            # one (same detector, so the zero is trustworthy). What is wrong is treating the spill as the
-            # CAUSE, because removing it does not help — see the NRV=2 arm below.
-            # Re-measured 2026-08-11 on today's code: lifting the cap costs
-            # −6.6/−5.7/−2.5% at k=128/256/512 at the shipped NRV=3 (reproducing the recorded figures),
-            # but −10.8/−7.4/−4.1% under a PINNED NRV=2 — where a pair holds exactly 32 accumulators and
-            # CANNOT spill. Pairing loses MORE where there is no spill, so spilling is not the cause.
-            # What does scale the right way is L1 capacity for P: the stripe panel is KC·NR·8 bytes =
-            # 24 KiB at KC=128/NRV=3 against a 32 KiB L1, and pairing doubles it to 48 KiB; at NRV=2 it
-            # is 16 KiB → 32 KiB paired, i.e. exactly L1 with nothing left for U or B. Pairing at large
-            # KC is a CAPACITY failure, not a register failure. (NRV=2 is also worse unpaired — 17.86 vs
-            # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
-            # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
-            if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
-                    KC <= _trsm_dbase() && jc + 2 * NR <= n
-                _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
-                jc += 2 * NR; continue
-            end
-            if fusedT && wid == NRl && NRl == NR
-                _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
-                jc += NR; continue
-            elseif fusedT && wid == 2 * W
-                _fusedT_stripe_k!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
-                jc += 2 * W; continue
-            elseif fusedT && wid == W
-                _fusedT_stripe_k!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
-                jc += W; continue
-            end
-            if useT
-                _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
-            elseif useT4                                  # AVX2 vectorized 4×4 transpose pack (lever 2)
-                _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
-            elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
-                @inbounds for i in 0:(KC - 1)
-                    # rev: P row i takes B row KC-1-i (the J·B of the anti-transpose identity)
-                    srow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz; drow = Pp + i * NRp * sz
-                    for v in 0:(wid - 1)
-                        unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1)
-                    end
-                    for v in wid:(NRp - 1)
-                        unsafe_store!(drow, zero(T), v + 1)
-                    end
-                end
-            else                                          # contiguous B reads; strided P writes (po2-immune)
-                @inbounds for v in 0:(wid - 1)
-                    scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
-                    for i in 0:(KC - 1)                      # rev: read B row KC-1-i into P row i
-                        unsafe_store!(dcol + i * NRp * sz, unsafe_load(scol + (rev ? KC - 1 - i : i) * sz))
-                    end
-                end
-                @inbounds for v in wid:(NRp - 1), i in 0:(KC - 1)
-                    unsafe_store!(Pp + (i * NRp + v) * sz, zero(T))
-                end
-            end
-            # Solve at the NARROWED stripe width. Val must be a compile-time constant, so branch on
-            # NRVp (1:NRV) rather than splicing a runtime value — a runtime->Val is exactly the
-            # `invoke ::Any` shape juliac --trim rejects.
-            if NRVp == 1
-                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(1))
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(1))
-                end
-            elseif NRVp == 2
-                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(2))
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(2))
-                end
+            # DISPATCH IS UNVERIFIED, AND THIS IS THE OPEN QUESTION. Identifying the blocked kernel by symbol
+            # shape proves the kernel EXISTS, not that it RUNS at our binding sizes. The same library ships a
+            # separate unpacked small-matrix family — `bli_dtrsm_small_AltXB_AuXB_AVX512` (AuXB = A-upper·X=B,
+            # i.e. exactly our case), `bli_trsm_small`, `bli_trsm_small_AVX512` — and `dtrsm_blis_impl`
+            # contains a dimension-dispatch maze (constants 49/50/58/96/120/138/199/1020/1811/2499/3219/
+            # 4299/13999 plus log10 calls, an indirect call) that plausibly routes n=128/256 there. That
+            # kernel is scalar-heavy and does NO packing (census: 532 vmovsd, 372 vmulsd, 174 vsubsd, 74
+            # vdivsd, 108 vfmadd231pd, 0 scatters). If it is what wins those cells, then the lever is ENTRY
+            # AND PACKING OVERHEAD — the recurring culprit in this repo — and not macro-kernel strategy, and
+            # every rate/IPC/tile comparison made against the blocked kernel was against the wrong code.
+            # SETTLE THIS BEFORE ACTING ON n=128/256: decode the branch region of `dtrsm_blis_impl` for
+            # (side=L, uplo=U, trans=N, m=n=128), or read `bla_trsm_amd.c` at the artifact's version, where
+            # those thresholds appear as named constants. No benchmark needed.
+            # `!rev` on the three transposing packs: each would need a lane reversal to fold in the flip
+            # (an 8-lane `shufflevector` for useT/fusedT, a 4-lane one for useT4), and `fusedT` additionally
+            # reads and writes B IN PLACE, so its reversal would have to be applied twice consistently. The
+            # scalar packs get the flip for free in their index arithmetic. Cost is one O(KC·NR) pack per
+            # stripe against O(KC²·NR) of solve — measure before reaching for the vector variants.
+            # `!rev` on the 8-wide pack but NOT the 4-wide one below, because that is where they MEASURED
+            # differently — potrfU native arm, µs, after the reversed packs landed:
+            #     n            512     768    1000
+            #     galen  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
+            #     neuro  W=8  lever 1709.7  5536.7 11996.1   native 2126.0  6759.3 14666.8   (−24/−22/−22%)
+            # and neuromancer's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
+            # reversal made it worse, not better. Hypothesis (not verified): reversing 8 f64 lanes is a full
+            # cross-lane vpermpd per vector — 16 per block across pack+unpack, on top of `_tr8x8`'s own
+            # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
+            # which is what it did before and what measured better. The 8-wide reversed code stays (it is
+            # correct, and verified) so a future profile can re-test it cheaply.
+            useT = _GT_TRANSPOSE
+            useT4 = (W == 4)                                             # AVX2: vectorized 4×4 transpose pack (lever 2)
+            rowouter = useT ? true : _fused_pack_rowouter(ldb, NR, sz)   # AVX2/edges: scalar orientation predicate
+            # `!rev` on fusedT and NOT on useT: the fusedT slabs SKIP the pack round-trip entirely (they read
+            # B direct and write it back transposed), so they never see the reversal the pack applies and
+            # would be silently wrong under rev. The plain useT/useT4 packs do carry it — see
+            # `_packP_tr_blk!`/`_fused_packP_tr4!`. Reversing inside the fusedT slab generators is possible
+            # (one lane reverse on load and on store) but it is the hairiest code here; do it only if a
+            # profile says the pack round-trip is costing the rev path real time.
+            fusedT = _TRSM_FUSEDT_ON[] && useT && !rev       # Lever 1: skip the pack round-trip (full stripes)
+            # Tiny-k stripe width. At KC ≤ _TRSM_DBASE the NRV=3 slab is the ONLY spilling shape (asm scan:
+            # 23-38 reloads at NRV=3, 0-1 at NRV=2, 0 at NRV=1) AND an NR=24 stripe leaves n=32 as 24+8, so a
+            # quarter of the columns run as a Val(1) tail whose back-substitution has no ILP to hide its
+            # serial chain — the exact deficit the falsified per-v experiment above quantified at +10-20%.
+            # NR=2W makes n=32 two clean Val(2) stripes: spill-free AND 2-wide ILP. U is KC²/2 ≤ 4 KB here so
+            # the extra per-stripe U re-read stays L1-resident, which is why this is a tiny-k-only choice.
+            NRl = (_EXPFLAG[_EXP1] && KC <= _trsm_dbase()) ? 2 * W : NR
+            # _EXP7 — ILP lever. At exactly n = NR+W with a tiny KC (the gate cell: k=32, n=32 = 24+8) solve
+            # BOTH stripes in one paired body so their independent back-substitution chains overlap, instead
+            # of running them back to back with only one chain ever in flight. Buffer note: the pair uses a
+            # shared P of row stride NR+W, which is <= the KC*NR+... allocation already made above.
+            # Pair path is ON by default now (measured 0.8522 paired/sequential, n=240, 22.7 SE,
+            # bit-for-bit identical output). _EXP7 is retained INVERTED as the A/B disable so the
+            # sequential arm stays reachable in-process.
+            if !_EXPFLAG[_EXP7] && fusedT && rem == 0 && n == NR + W && KC == 32
+                _fusedT_pair_tiny!(Val(32), Val(NRV), Pp, pB, ldb, 0, pUsrc, lduse, rp)
             else
-                rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(NRV))
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(NRV))
-                end
-            end
-            if useT
-                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
-            elseif useT4
-                _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
-            elseif rowouter
-                @inbounds for i in 0:(KC - 1)                 # unpack P → B row-outer (contiguous P reads)
-                    # rev: P row i belongs at B row KC-1-i (undo the J of J·X)
-                    srow = Pp + i * NRp * sz; drow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz
-                    for v in 0:(wid - 1)
-                        unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1))
+                jc = 0
+                while jc < n
+                    wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
+                    # PAD WIDTH, not NR. The fusedT branches below take wid in {NR, 2W, W}; everything else
+                    # falls here and USED TO BE PADDED OUT TO THE FULL NR with zeros, so a 2-column tail was
+                    # solved as 24 columns — 12x the work. The comment above says "gate n is a multiple of W,
+                    # so the tail is always 8 or 16 wide": TRUE when the ladder was all powers of two, FALSE
+                    # since the non-po2 sizes landed. n=50 stripes 24+24+2 and n=100 stripes 24x4+4, and those
+                    # 2- and 4-wide tails are exactly the red cells (Zen4 0.79, Zen5 0.80).
+                    # The pad is internal to P — the unpack writes back only `wid` columns — so narrowing it to
+                    # the smallest W-multiple covering wid is safe, and the solve already takes the stripe width
+                    # as a compile-time Val(NRV). NRVp in 1:NRV, so a 3-way branch covers it.
+                    NRp = min(NR, cld(wid, W) * W)
+                    NRVp = NRp ÷ W
+                    # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
+                    # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
+                    # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
+                    # branches (trim-safe: no runtime→Val). Non-W-multiple wid falls to the pack path below.
+                    # PAIR TWO ADJACENT FULL STRIPES so their back-substitution chains overlap.
+                    # DOMAIN IS SMALL KC, and that is measured, not assumed: at KC <= _TRSM_DBASE each slab's
+                    # gemm runs only ~12 trips on average and cannot hide the serial chain, so a second chain
+                    # pays (n=32 gate 0.898 -> 1.105). At larger KC the gemm already runs up to KC-s-MR trips
+                    # and supplies that independent work itself, so pairing only adds register pressure
+                    # (2*MR*NRV = 48 live accumulators against 32) — measured 6.2% / 4.2% / 2.6% SLOWER at
+                    # k=128 / 256 / 512, the penalty shrinking exactly as the gemm's share of the slab grows.
+                    # Hence the guard is the existing tiny-k cap, not a size literal. `rem > 0` (ragged bottom
+                    # rows) keeps the single-stripe path: the tail needs its own mini-pack.
+                    #
+                    # THE REGISTER EXPLANATION ABOVE IS REAL BUT NOT BINDING — an earlier revision of this note
+                    # called it simply "wrong", which overstated it. The spill is there: an asm audit counts 78
+                    # spill/reload vector moves in the paired slab's loop against ZERO in the shipped 24-accumulator
+                    # one (same detector, so the zero is trustworthy). What is wrong is treating the spill as the
+                    # CAUSE, because removing it does not help — see the NRV=2 arm below.
+                    # Re-measured 2026-08-11 on today's code: lifting the cap costs
+                    # −6.6/−5.7/−2.5% at k=128/256/512 at the shipped NRV=3 (reproducing the recorded figures),
+                    # but −10.8/−7.4/−4.1% under a PINNED NRV=2 — where a pair holds exactly 32 accumulators and
+                    # CANNOT spill. Pairing loses MORE where there is no spill, so spilling is not the cause.
+                    # What does scale the right way is L1 capacity for P: the stripe panel is KC·NR·8 bytes =
+                    # 24 KiB at KC=128/NRV=3 against a 32 KiB L1, and pairing doubles it to 48 KiB; at NRV=2 it
+                    # is 16 KiB → 32 KiB paired, i.e. exactly L1 with nothing left for U or B. Pairing at large
+                    # KC is a CAPACITY failure, not a register failure. (NRV=2 is also worse unpaired — 17.86 vs
+                    # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
+                    # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
+                    if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
+                            KC <= _trsm_dbase() && jc + 2 * NR <= n
+                        _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
+                        jc += 2 * NR; continue
                     end
-                end
-            else
-                @inbounds for v in 0:(wid - 1)               # unpack column-outer (contiguous B writes)
-                    scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
-                    for i in 0:(KC - 1)                      # rev: P row i belongs at B row KC-1-i
-                        unsafe_store!(dcol + (rev ? KC - 1 - i : i) * sz, unsafe_load(scol + i * NRp * sz))
+                    if fusedT && wid == NRl && NRl == NR
+                        _fusedT_stripe_k!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                        jc += NR; continue
+                    elseif fusedT && wid == 2 * W
+                        _fusedT_stripe_k!(Val(2), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                        jc += 2 * W; continue
+                    elseif fusedT && wid == W
+                        _fusedT_stripe_k!(Val(1), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, rem, MR, sz)
+                        jc += W; continue
                     end
+                    if useT
+                        _fused_packP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
+                    elseif useT4                                  # AVX2 vectorized 4×4 transpose pack (lever 2)
+                        _fused_packP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
+                    elseif rowouter                               # contiguous P writes; B read strided (non-aliasing)
+                        @inbounds for i in 0:(KC - 1)
+                            # rev: P row i takes B row KC-1-i (the J·B of the anti-transpose identity)
+                            srow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz; drow = Pp + i * NRp * sz
+                            for v in 0:(wid - 1)
+                                unsafe_store!(drow, unsafe_load(srow + v * ldb * sz), v + 1)
+                            end
+                            for v in wid:(NRp - 1)
+                                unsafe_store!(drow, zero(T), v + 1)
+                            end
+                        end
+                    else                                          # contiguous B reads; strided P writes (po2-immune)
+                        @inbounds for v in 0:(wid - 1)
+                            scol = pB + (jc + v) * ldb * sz; dcol = Pp + v * sz
+                            for i in 0:(KC - 1)                      # rev: read B row KC-1-i into P row i
+                                unsafe_store!(dcol + i * NRp * sz, unsafe_load(scol + (rev ? KC - 1 - i : i) * sz))
+                            end
+                        end
+                        @inbounds for v in wid:(NRp - 1), i in 0:(KC - 1)
+                            unsafe_store!(Pp + (i * NRp + v) * sz, zero(T))
+                        end
+                    end
+                    # Solve at the NARROWED stripe width. Val must be a compile-time constant, so branch on
+                    # NRVp (1:NRV) rather than splicing a runtime value — a runtime->Val is exactly the
+                    # `invoke ::Any` shape juliac --trim rejects.
+                    if NRVp == 1
+                        rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(1))
+                        for si in (nfull - 1):-1:0
+                            _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(1))
+                        end
+                    elseif NRVp == 2
+                        rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(2))
+                        for si in (nfull - 1):-1:0
+                            _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(2))
+                        end
+                    else
+                        rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(NRV))
+                        for si in (nfull - 1):-1:0
+                            _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(NRV))
+                        end
+                    end
+                    if useT
+                        _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
+                    elseif useT4
+                        _fused_unpackP_tr4!(Pp, pB, ldb, jc, wid, KC, NRp, sz, rev)
+                    elseif rowouter
+                        @inbounds for i in 0:(KC - 1)                 # unpack P → B row-outer (contiguous P reads)
+                            # rev: P row i belongs at B row KC-1-i (undo the J of J·X)
+                            srow = Pp + i * NRp * sz; drow = pB + ((rev ? KC - 1 - i : i) + jc * ldb) * sz
+                            for v in 0:(wid - 1)
+                                unsafe_store!(drow + v * ldb * sz, unsafe_load(srow, v + 1))
+                            end
+                        end
+                    else
+                        @inbounds for v in 0:(wid - 1)               # unpack column-outer (contiguous B writes)
+                            scol = Pp + v * sz; dcol = pB + (jc + v) * ldb * sz
+                            for i in 0:(KC - 1)                      # rev: P row i belongs at B row KC-1-i
+                                unsafe_store!(dcol + (rev ? KC - 1 - i : i) * sz, unsafe_load(scol + i * NRp * sz))
+                            end
+                        end
+                    end
+                    # `wid`, not NR: this path packs/solves/unpacks exactly `wid` real columns. Identical to the
+                    # old `jc += NR` whenever NRl == NR (wid < NR only on the final partial stripe, where
+                    # wid == n-jc ends the loop either way), but required once NRl < NR — there `wid` can be a
+                    # full NRl stripe with columns still to come, and advancing by NR would SKIP NR-NRl of them.
+                    jc += wid
                 end
-            end
-            # `wid`, not NR: this path packs/solves/unpacks exactly `wid` real columns. Identical to the
-            # old `jc += NR` whenever NRl == NR (wid < NR only on the final partial stripe, where
-            # wid == n-jc ends the loop either way), but required once NRl < NR — there `wid` can be a
-            # full NRl stripe with columns still to come, and advancing by NR would SKIP NR-NRl of them.
-            jc += wid
+            end                                   # else-branch of the _EXP7 paired-stripe dispatch
         end
-        end                                   # else-branch of the _EXP7 paired-stripe dispatch
-    end
     end                                       # @scope arn
     return B
 end
@@ -3938,43 +3957,43 @@ function _trsm_fused_full_L!(unit::Bool, A, B)
     # kernels that read/write and return, storing no pointer anywhere. Nothing borrowed outlives the block
     # and only solved values land in the caller's `B`. One borrow at entry, above the stripe loop.
     @scope arn begin
-    buf = borrow!(arn, T, k * NR + packUlen + k)
-    GC.@preserve A B buf begin
-        pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
-        MP = Pp + k * NR * sz; rp = MP + packUlen * sz
-        _pack_U_micro!(MP, rp, pA, lda, k, unit, MR, nfull, rem)
-        MPt = MP + _mp_off(nfull, k, MR) * sz
-        jc = 0
-        while jc < n
-            wid = min(NR, n - jc)
-            if _TRSM_FUSEDT_ON[] && wid == NR
-                # Fused first/last-touch transpose (Lever 1): no standalone pack/unpack. The ragged tail
-                # rows (rem<MR) still need to live in P for the full slabs' gemm reuse, so mini-pack them
-                # (rem×NR, tiny), solve, and unpack at stripe end; the full slabs read/write B directly.
-                if rem > 0
-                    b0 = nfull * MR
-                    @inbounds for v in 0:(NR - 1), i in 0:(rem - 1)                # pack tail rows B→P (contiguous cols)
-                        unsafe_store!(Pp + ((b0 + i) * NR + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
+        buf = borrow!(arn, T, k * NR + packUlen + k)
+        GC.@preserve A B buf begin
+            pA = pointer(A); pB = pointer(B); Pp = pointer(buf)
+            MP = Pp + k * NR * sz; rp = MP + packUlen * sz
+            _pack_U_micro!(MP, rp, pA, lda, k, unit, MR, nfull, rem)
+            MPt = MP + _mp_off(nfull, k, MR) * sz
+            jc = 0
+            while jc < n
+                wid = min(NR, n - jc)
+                if _TRSM_FUSEDT_ON[] && wid == NR
+                    # Fused first/last-touch transpose (Lever 1): no standalone pack/unpack. The ragged tail
+                    # rows (rem<MR) still need to live in P for the full slabs' gemm reuse, so mini-pack them
+                    # (rem×NR, tiny), solve, and unpack at stripe end; the full slabs read/write B directly.
+                    if rem > 0
+                        b0 = nfull * MR
+                        @inbounds for v in 0:(NR - 1), i in 0:(rem - 1)                # pack tail rows B→P (contiguous cols)
+                            unsafe_store!(Pp + ((b0 + i) * NR + v) * sz, unsafe_load(pB + ((b0 + i) + (jc + v) * ldb) * sz))
+                        end
+                        _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, b0, k, rem, Val(NRV))
+                        @inbounds for v in 0:(NR - 1), i in 0:(rem - 1)                # unpack tail rows P→B
+                            unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * NR + v) * sz))
+                        end
                     end
-                    _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, b0, k, rem, Val(NRV))
-                    @inbounds for v in 0:(NR - 1), i in 0:(rem - 1)                # unpack tail rows P→B
-                        unsafe_store!(pB + ((b0 + i) + (jc + v) * ldb) * sz, unsafe_load(Pp + ((b0 + i) * NR + v) * sz))
+                    for si in (nfull - 1):-1:0
+                        _gemmtrsm_u_slab_fusedT!(Pp, NR, pB, ldb, jc, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
                     end
+                else
+                    _fused_packP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
+                    rem > 0 && _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, nfull * MR, k, rem, Val(NRV))
+                    for si in (nfull - 1):-1:0
+                        _gemmtrsm_u_slab_packed!(Pp, NR, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
+                    end
+                    _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
                 end
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab_fusedT!(Pp, NR, pB, ldb, jc, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
-                end
-            else
-                _fused_packP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
-                rem > 0 && _gemmtrsm_u_tail_packed!(Pp, NR, MPt, rp, nfull * MR, k, rem, Val(NRV))
-                for si in (nfull - 1):-1:0
-                    _gemmtrsm_u_slab_packed!(Pp, NR, MP + _mp_off(si, k, MR) * sz, rp, si * MR, k, Val(MR), Val(NRV))
-                end
-                _fused_unpackP_tr!(Pp, pB, ldb, jc, wid, k, NR, sz)
+                jc += NR
             end
-            jc += NR
         end
-    end
     end                                       # @scope arn
     return B
 end
@@ -4276,24 +4295,24 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
             # affected — they have 14 spare vector registers — which is why the whole thing was
             # AVX2-only and invisible on the machine it was written on.
             @leafscope arn begin
-            S = borrow!(arn, Float64, mc0, k, _odd_ld(mc0)); lds = stride(S, 2)
-            GC.@preserve S begin
-                pS = pointer(S); i0 = 0
-                while i0 < m
-                    mc = min(mc0, m - i0)
-                    _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
-                    @inbounds for c in 1:k                     # copy S[1:mc,c] → B[i0+1:i0+mc,c] (SIMD, trim-safe)
-                        r = 1
-                        while r + _CHOLW - 1 <= mc
-                            vstore(vload(_CVF, _cvptr(pS, r, c, lds)), _cvptr(pB, i0 + r, c, ldb)); r += _CHOLW
+                S = borrow!(arn, Float64, mc0, k, _odd_ld(mc0)); lds = stride(S, 2)
+                GC.@preserve S begin
+                    pS = pointer(S); i0 = 0
+                    while i0 < m
+                        mc = min(mc0, m - i0)
+                        _trsm_rl_split_f64!(pA, ldA, pB + i0 * 8, ldb, pS, lds, k, mc)
+                        @inbounds for c in 1:k                     # copy S[1:mc,c] → B[i0+1:i0+mc,c] (SIMD, trim-safe)
+                            r = 1
+                            while r + _CHOLW - 1 <= mc
+                                vstore(vload(_CVF, _cvptr(pS, r, c, lds)), _cvptr(pB, i0 + r, c, ldb)); r += _CHOLW
+                            end
+                            while r <= mc
+                                unsafe_store!(pB, unsafe_load(pS, _clidx(r, c, lds)), _clidx(i0 + r, c, ldb)); r += 1
+                            end
                         end
-                        while r <= mc
-                            unsafe_store!(pB, unsafe_load(pS, _clidx(r, c, lds)), _clidx(i0 + r, c, ldb)); r += 1
-                        end
+                        i0 += mc
                     end
-                    i0 += mc
                 end
-            end
             end                                                   # @scope arn
         else
             i0 = 0
@@ -4581,6 +4600,11 @@ function trsm!(
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || _throw_square(:trsm!, k)
     A = _trsm_matchel(A, B)
+    if _l3p_ok(B, A)                                                   # dual planes (docs/src/dual_l3.md §2.4); 'C' == 'T'
+        rA = _root(A); rB = _root(B)
+        GC.@preserve rA rB _trsm_dual!(sl, uplo == 'U', transA != 'N', diag == 'U', convert(eltype(B), alpha), _pm(A), _pm(B))
+        return B
+    end
     # NON-UNIT-STRIDE OUTPUT: stage through a contiguous copy. Same defect and same reasoning as
     # `trmm!` -- the real paths read and write B at its ld and returned silently wrong numbers when
     # `stride(B,1) != 1`. O(k·n) against the solve's O(k²·n), paid only by inputs that were wrong before.
@@ -5710,8 +5734,10 @@ end
         Tr = real(T)
         return _EXPFLAG[_EXP16] ?
             _ctrgemm_3m!(up, herm && tr, herm && !tr, tr, !tr, Complex(alr, ali), X, Y, C, k) :
-            _ctrgemm_3m_fused!(Val(_tri_mr(Tr)), Val(_NR), up, herm && tr, herm && !tr, tr, !tr,
-                Complex(alr, ali), X, Y, C, k)
+            _ctrgemm_3m_fused!(
+                Val(_tri_mr(Tr)), Val(_NR), up, herm && tr, herm && !tr, tr, !tr,
+                Complex(alr, ali), X, Y, C, k
+            )
     end
     if X === Y && _vwidth(T) == 4 && n <= _CSYRK_UNIFIED_MAX   # herk/zsyrk: single-pack win
         return _ctrgemm_prod_u!(Val(A1), up, tr, herm, alr, ali, X, Y, C, k)
@@ -6292,6 +6318,11 @@ function syrk!(
         return syrk!(C, parent(A); uplo, trans = 'T', alpha, beta)
     end
     n, k = _syrk_dims(C, A, trans); up = uplo == 'U'
+    if _l3p_ok(C, A)                                                   # dual planes (docs/src/dual_l3.md §2.2)
+        rA = _root(A); rC = _root(C); T = eltype(C)
+        GC.@preserve rA rC _syrk_dual!(up, trans != 'N', convert(T, alpha), _pm(A), convert(T, beta), _pm(C), n)
+        return C
+    end
     _syrk_scaleC!(C, up, beta)
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
     return C
@@ -6306,6 +6337,8 @@ function herk!(
     if trans == 'N' && _lazyop(A) == 'C'
         return herk!(C, parent(A); uplo, trans = 'C', alpha, beta)
     end
+    # a Dual is Real: conj is the identity, so herk IS syrk (the dotc == dotu decision, docs/src/dual_l2.md §4.2)
+    _pairT(eltype(C)) && return syrk!(C, A; uplo, trans = trans == 'C' ? 'T' : trans, alpha, beta)
     n, k = _syrk_dims(C, A, trans); up = uplo == 'U'
     _syrk_scaleC!(C, up, beta)
     _syrk_blocked!(up, trans != 'N', true, alpha, A, C, k)
@@ -6659,16 +6692,24 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
                     # concrete-Val dispatch the driver uses at gemm.jl:707.
                     if b0
                         a1 ?
-                            _hemm_pack_sweep!(Val(true), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
-                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz) :
-                            _hemm_pack_sweep!(Val(true), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
-                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz)
+                            _hemm_pack_sweep!(
+                                Val(true), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
+                                ic, jc, mce, nce, kce, mr, nr, alr, ali, sz
+                            ) :
+                            _hemm_pack_sweep!(
+                                Val(true), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
+                                ic, jc, mce, nce, kce, mr, nr, alr, ali, sz
+                            )
                     else
                         a1 ?
-                            _hemm_pack_sweep!(Val(false), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
-                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz) :
-                            _hemm_pack_sweep!(Val(false), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
-                            ic, jc, mce, nce, kce, mr, nr, alr, ali, sz)
+                            _hemm_pack_sweep!(
+                                Val(false), Val(true), Cp0, ldc, ARp, AIp, BRp, BIp,
+                                ic, jc, mce, nce, kce, mr, nr, alr, ali, sz
+                            ) :
+                            _hemm_pack_sweep!(
+                                Val(false), Val(false), Cp0, ldc, ARp, AIp, BRp, BIp,
+                                ic, jc, mce, nce, kce, mr, nr, alr, ali, sz
+                            )
                     end
                     ic += mc
                 end
