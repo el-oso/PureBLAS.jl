@@ -58,9 +58,9 @@ mutable struct L3Workspace{T}
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
     m3::NTuple{9, Vector{T}}   # _gemm_3m_scratch:    Karatsuba 3M buffers (Ar/Ai/As, Br/Bi/Bs, P1/P2/P3)
-    str::Vector{Matrix{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
-    strbt::Matrix{T}      # _strassen_bt: transB route Bᵀ, EXACT k×n. Deliberately NOT a `str` slot —
-    # the nested Winograd recursion owns that whole pool, so sharing would alias.
+    str::Vector{Vector{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
+    strbt::Vector{T}      # _strassen_bt: transB route Bᵀ, k×n viewed over a flat slot. Deliberately NOT
+    # a `str` slot — the nested Winograd recursion owns that whole pool, so sharing would alias.
 end
 # ONE ARGUMENT PER LINE, TAGGED WITH ITS FIELD. The list is positional, and it was ~180 entries long
 # when the arena conversion started; the stage-1 pass mis-aligned it by two and shipped a
@@ -75,8 +75,8 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     (T[], T[], T[], T[]),                        # cg
     (T[], T[], T[], T[]),                        # s2
     (T[], T[], T[], T[], T[], T[], T[], T[], T[]), # m3
-    Matrix{T}[],                                 # str
-    Matrix{T}(undef, 0, 0),                      # strbt
+    Vector{T}[],                                 # str
+    T[],                                         # strbt
 )
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
 # four BLAS element types s/d/c/z. The IdDict fallback is ONLY for the open-ended non-gated set
@@ -116,17 +116,47 @@ _l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER, T)::L3Wor
 # (this exact bug — a `<` row test leaking an old ld — cost pbtrf kd=64 a 2.10→1.81 regression).
 # W is re-zeroed every call: the kernels write only the in-band triangle and rely on the rest being
 # zero, and which part is "the rest" moves with ib/i3, so a reused buffer must not carry stale values.
-# transB-Strassen Bᵀ buffer. EXACT k×n, not grow-only: `transpose!` requires an exact-shape dest, and
-# keeping ld == k contiguous avoids the strided-top-left cache hazard the recursion's quadrant reads
-# would otherwise hit. Realloc churn is negligible — this only fires at n ≥ _STRASSEN_MIN (1024), where
-# a single allocation is a rounding error against 7 half-size matrix products.
+# ── THE ONE GROWTH POINT ────────────────────────────────────────────────────────────────────────────
+# Every L3 pool below grows through `_ws_grow!`/`_ws_slot!` and nothing else allocates on the L3 path,
+# so ONE pair of `StrictMode.register_alloc_barrier!` calls scopes the static-proof exemption to exactly
+# "a workspace reached a new high-water mark" — the same contract `docs/src/arena.md` states for the
+# arena. That narrowness is the point: the kb rejected registering `_str_fit!` as a barrier on two
+# grounds (`strictmode-04-static-only-noalloc`), and BOTH are answered here rather than waved away.
+#   (1) "the exemption is process-global, so it weakens every other proof" — it is, which is why the
+#       registered thing is a two-line function that does nothing but grow a pool. A call whose only
+#       allocation is a pool reaching a new high-water mark is exactly the class meant to be exempt; a
+#       call that allocates anything else still falls through to AllocCheck's honest per-site proof.
+#   (2) "the pool is not a one-time-init barrier — `_str_fit!` re-allocates on shape mismatch, so
+#       calling it a barrier is a claim that is not true" — correct, and that is FIXED below, not
+#       excused. `_str_fit!` is now grow-only like every sibling pool, so the claim became true first
+#       and the registration follows it.
+#
+# `@noinline` is REQUIRED, not style: StrictModeTest recognizes a barrier only when the registered
+# function is ITSELF the `:invoke` callee, so an inlined one can never be registered.
+@noinline function _ws_grow!(v::Vector, n::Int)
+    length(v) < n && resize!(v, n)
+    return v
+end
+# Pool-slot variant: extend the slot vector, then grow slot `i` to `n`. Two entry points rather than one
+# because the pool extension is itself an allocation and must sit behind the barrier too.
+@noinline function _ws_slot!(pool::Vector{Vector{Tr}}, i::Int, n::Int) where {Tr}
+    while length(pool) < i
+        push!(pool, Tr[])
+    end
+    v = pool[i]
+    length(v) < n && resize!(v, n)
+    return v
+end
+
+# transB-Strassen Bᵀ buffer, k×n over a GROW-ONLY flat slot viewed at ld == k. `transpose!` needs an
+# exact-shape dest and the recursion's quadrant reads need contiguity, and a `PtrMatrix` over the first
+# k·n elements gives both — while a persistent max-sized MATRIX would not: it would hand a small-n call
+# after a large-n one a huge leading dim, which is the measured cache hazard recorded on
+# `_gemm_3m_scratch` below (zgemm/ztrsm n=128 1.16 → 0.57). Same shape as that pool, for that reason.
 function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
     ws = _l3ws(T)
-    bt = ws.strbt
-    if size(bt, 1) != k || size(bt, 2) != n
-        bt = Matrix{T}(undef, k, n); ws.strbt = bt
-    end
-    return bt
+    bt = _ws_grow!(ws.strbt, k * n)
+    return PtrMatrix(pointer(bt), k, n, k)
 end
 
 
@@ -134,22 +164,22 @@ end
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
     ws = _l3ws(T)
-    length(ws.gpackA) < lenA && resize!(ws.gpackA, lenA)
-    length(ws.gpackB) < lenB && resize!(ws.gpackB, lenB)
+    _ws_grow!(ws.gpackA, lenA)                    # through the one growth point, so ONE barrier covers it
+    _ws_grow!(ws.gpackB, lenB)
     return ws.gpackA, ws.gpackB
 end
 
 function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
     t = _l3ws(T).cg
-    length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[2], lenA))
-    length(t[3]) < lenB && (resize!(t[3], lenB); resize!(t[4], lenB))
+    _ws_grow!(t[1], lenA); _ws_grow!(t[2], lenA)
+    _ws_grow!(t[3], lenB); _ws_grow!(t[4], lenB)
     return t
 end
 
 function _syr2k_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
     t = _l3ws(T).s2
-    length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[3], lenA))
-    length(t[2]) < lenB && (resize!(t[2], lenB); resize!(t[4], lenB))
+    _ws_grow!(t[1], lenA); _ws_grow!(t[3], lenA)
+    _ws_grow!(t[2], lenB); _ws_grow!(t[4], lenB)
     return t
 end
 
@@ -163,33 +193,46 @@ end
 # only avoids the MB-realloc churn of exact-sizing under ztrsm's varying recursion shapes.
 function _gemm_3m_scratch(::Type{Tr}, lenA::Int, lenB::Int, lenC::Int) where {Tr}
     t = _l3ws(Tr).m3
-    length(t[1]) < lenA && (resize!(t[1], lenA); resize!(t[2], lenA); resize!(t[3], lenA))
-    length(t[4]) < lenB && (resize!(t[4], lenB); resize!(t[5], lenB); resize!(t[6], lenB))
-    length(t[7]) < lenC && (resize!(t[7], lenC); resize!(t[8], lenC); resize!(t[9], lenC))
+    _ws_grow!(t[1], lenA); _ws_grow!(t[2], lenA); _ws_grow!(t[3], lenA)
+    _ws_grow!(t[4], lenB); _ws_grow!(t[5], lenB); _ws_grow!(t[6], lenB)
+    _ws_grow!(t[7], lenC); _ws_grow!(t[8], lenC); _ws_grow!(t[9], lenC)
     return t
 end
 
 # Strassen scratch pool (real). Slots 1-3: odd-n pad buffers (Ap mp×kp, Bp kp×np, Cp mp×np). Slots
 # 4+: per-recursion-level Winograd buffers, 10 per level (TA mh×kh, TB kh×nh, P1..P7 + U all mh×nh) at
-# base 3+level*10. Exact-sized (realloc on shape mismatch — negligible at the large n Strassen runs at).
-@inline function _str_fit!(pool, i::Int, r::Int, c::Int, ::Type{Tr}) where {Tr}
-    while length(pool) < i
-        push!(pool, Matrix{Tr}(undef, 0, 0))
-    end
-    M = pool[i]; (size(M, 1) != r || size(M, 2) != c) && (pool[i] = Matrix{Tr}(undef, r, c))
-    return pool[i]
+# base 3+level*10.
+#
+# GROW-ONLY FLAT SLOTS VIEWED AT EXACT ld, the `_gemm_3m_scratch` shape — was exact-sized `Matrix`
+# slots that re-allocated on any shape mismatch. Two things change and both are deliberate:
+#   * the re-allocation is gone, which is what makes "this pool is a high-water barrier" TRUE rather
+#     than a convenient description (see the growth-point note above);
+#   * the handle is a `PtrMatrix`, isbits, so the whole recursion is ONE container world instead of
+#     two. That removes the `_str_like` bridge added in 9b8e8463 AND the boxing it worked around —
+#     a Matrix-scratch/PtrMatrix-operand mix made the seven recursive call sites' signature
+#     combinations multiply until inference gave up (1344 B/call at n=512, 5376 at n=1024).
+# ld is r, i.e. contiguous, NOT a max-ld top-left block: the cache hazard that would cause is measured
+# and recorded on `_gemm_3m_scratch` above.
+@inline function _str_fit!(pool::Vector{Vector{Tr}}, i::Int, r::Int, c::Int) where {Tr}
+    v = _ws_slot!(pool, i, r * c)
+    return PtrMatrix(pointer(v), r, c, r)
 end
+# No `GC.@preserve` on these handles, and it is not an oversight: the pool hangs off a `const`
+# L3Workspace (or the `const` IdDict fallback), so every slot is permanently reachable — the same
+# reason `PtrMatrix`'s own header calls `GC.@preserve parent(A)` a safe no-op. What DOES matter is that
+# no live handle is invalidated by a later grow: each level fits all ten of its slots before using any,
+# and deeper levels take disjoint slot indices.
 function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
     p = _l3ws(Tr).str
-    return _str_fit!(p, 1, mp, kp, Tr), _str_fit!(p, 2, kp, np, Tr), _str_fit!(p, 3, mp, np, Tr)
+    return _str_fit!(p, 1, mp, kp), _str_fit!(p, 2, kp, np), _str_fit!(p, 3, mp, np)
 end
 function _strassen_lvl_scratch(::Type{Tr}, level::Int, mh::Int, nh::Int, kh::Int) where {Tr}
     p = _l3ws(Tr).str; b = 3 + level * 10
-    TA = _str_fit!(p, b + 1, mh, kh, Tr); TB = _str_fit!(p, b + 2, kh, nh, Tr)
-    P1 = _str_fit!(p, b + 3, mh, nh, Tr); P2 = _str_fit!(p, b + 4, mh, nh, Tr)
-    P3 = _str_fit!(p, b + 5, mh, nh, Tr); P4 = _str_fit!(p, b + 6, mh, nh, Tr)
-    P5 = _str_fit!(p, b + 7, mh, nh, Tr); P6 = _str_fit!(p, b + 8, mh, nh, Tr)
-    P7 = _str_fit!(p, b + 9, mh, nh, Tr); U = _str_fit!(p, b + 10, mh, nh, Tr)
+    TA = _str_fit!(p, b + 1, mh, kh); TB = _str_fit!(p, b + 2, kh, nh)
+    P1 = _str_fit!(p, b + 3, mh, nh); P2 = _str_fit!(p, b + 4, mh, nh)
+    P3 = _str_fit!(p, b + 5, mh, nh); P4 = _str_fit!(p, b + 6, mh, nh)
+    P5 = _str_fit!(p, b + 7, mh, nh); P6 = _str_fit!(p, b + 8, mh, nh)
+    P7 = _str_fit!(p, b + 9, mh, nh); U = _str_fit!(p, b + 10, mh, nh)
     return TA, TB, P1, P2, P3, P4, P5, P6, P7, U
 end
 
