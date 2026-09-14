@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 138 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 9 Measured · 52 Literal · 12 Exempt.
-**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 46 literal · 5 flag · 2 other.
+**Tier:** 65 Derived · 9 Measured · 51 Literal · 13 Exempt.
+**Default form** (mechanical): 58 formula · 21 delegates · 5 sibling · 47 literal · 5 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -183,7 +183,7 @@ Every `@load_preference` key in `src/` — 138 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `pptrf_blk_min` | literal | Literal | smallest n where unpacking pays; measured 2.26x at n=32, untested between 8 and 32. | candidate |
-| `pptrf_blk_nb` | sibling | Literal | own panel width, borrows _LU_NB, which is itself a falsified derivation. | candidate |
+| `pptrf_blk_nb` | literal | Exempt | 0 is the "whole matrix" sentinel; a positive pin restores a fixed panel width. | n/a |
 | `pptrf_spr_min` | literal | Exempt | 0 is the unset sentinel, not a size. | n/a |
 
 ## LAPACK · pstrf
