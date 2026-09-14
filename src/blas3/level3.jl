@@ -2114,6 +2114,60 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
     end                                          # @scope arn
     return B
 end
+# ── The LOWER sibling, by reversal rather than a second SIMD kernel ────────────────────────────────────
+# WHY IT EXISTS. The leaf above only substitutes upward, so a LOWER solve fell through to
+# `_trsm_cmplx_dLN!` — the "BLAS-2 traffic pattern wearing a BLAS-3 name" the note above measures at
+# 0.64–0.74× AOCL. No gate cell saw it: the public `ztrsm` cell solves an UPPER triangle. But zgetrf's
+# panel update is exactly side-L LOWER UNIT (`U12 = L11⁻¹ A12`, lu.jl `_getrf_core!`), and a sampling
+# profile put that one trsm at ~30% of zgetrf at both n=50 and n=100. Measured on the exact LU shape
+# (Zen4, k=32, `bench/probes/zgetrf_trsm_shape.jl`): PB was 2.55× / 2.82× / 3.00× / 3.10× SLOWER than
+# AOCL at m = 4 / 18 / 36 / 68 — the whole of zgetrf's n=50..100 dip below AOCL on every µarch.
+#
+# HOW. Let J reverse index order. For L lower, J·L·J is UPPER (the diagonal maps onto itself, so a unit
+# diagonal stays unit), and  L·X = B  ⇔  (J·L·J)·(J·X) = J·B.  So: copy L reversed into a k×k scratch
+# (only the lower triangle is read, and it lands exactly on the upper triangle), reverse B's rows, run the
+# unchanged upper leaf, reverse B's rows back. The fast kernel is reused as-is — no new SIMD code, and
+# the reversal is O(k²) + O(2·k·m) against an O(k²·m) solve.
+#
+# The scratch is written ONLY on and above its diagonal. That is safe because the upper leaf never reads
+# below the diagonal — checked, not assumed: `bench/probes/zgetrf_trsm_lower.jl` poisons the strictly-lower
+# part of the scratch with NaN and requires a finite, correct result.
+# Same-process A/B switch, the `_TRSM_FUSED_ON` pattern: false ⇒ lower solves fall back to
+# `_trsm_cmplx_dLN!` exactly as before. ponytail: exists for controlled A/B; a Ref load against an O(k²·m) solve.
+const _CGT_LOWER_ON = Ref(true)
+@inline function _cgt_rev_rows!(B, k::Int)
+    ldb = stride(B, 2); nrhs = size(B, 2)
+    GC.@preserve B begin
+        p = Ptr{ComplexF64}(pointer(B))
+        @inbounds for c in 0:(nrhs - 1)
+            b0 = c * ldb
+            for i in 0:((k >> 1) - 1)
+                ia = b0 + i + 1; ib = b0 + (k - 1 - i) + 1
+                x = unsafe_load(p, ia); unsafe_store!(p, unsafe_load(p, ib), ia); unsafe_store!(p, x, ib)
+            end
+        end
+    end
+    return
+end
+function _trsm_cgt_lower_L!(unit::Bool, k::Int, A, B)
+    lda = stride(A, 2)
+    # ESCAPE AUDIT (@scope arn): `Ar` is read by `_trsm_cgt_L!` through `pointer`/`stride` only and never
+    # stored; it does not outlive this block. Borrowed once, outside every loop.
+    @scope arn begin
+        Ar = borrow!(arn, ComplexF64, k, k)             # EXACT k×k, ld = k (contiguous, `_cgt_ok`-shaped)
+        GC.@preserve A begin
+            pA = Ptr{ComplexF64}(pointer(A)); pR = pointer(Ar)
+            @inbounds for j in 0:(k - 1), i in j:(k - 1)     # A[i,j], i ≥ j  →  Ar[k-1-i, k-1-j] (upper)
+                unsafe_store!(pR, unsafe_load(pA, j * lda + i + 1), (k - 1 - j) * k + (k - 1 - i) + 1)
+            end
+        end
+        _cgt_rev_rows!(B, k)
+        _trsm_cgt_L!(unit, k, Ar, B)
+        _cgt_rev_rows!(B, k)
+    end
+    return B
+end
+
 # Eligibility: ComplexF64 only (the plane split rides the f64 W×W transpose), unit-stride A and B,
 # upper + no-trans (the substitution direction the slab hardcodes), and k within the L1 stripe bound.
 # BOTH eltypes are checked. Gating on `eltype(B)` alone is a memory-safety hole, not a typo: the leaf
@@ -4066,6 +4120,11 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # 40.4 GF against 35.7 for the two-64-leaves-plus-gemm recursion this recbase would pick.
         if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
             return _trsm_cgt_L!(unit, k, A, B)
+        end
+        # LOWER no-trans takes the same leaf by index reversal — see `_trsm_cgt_lower_L!`. This is zgetrf's
+        # panel solve, which fell to `_trsm_cmplx_dLN!` at ~3× AOCL's time before this branch existed.
+        if !up && !tr && _CGT_LOWER_ON[] && k <= _ZGT_BASE && _cgt_ok(A, B)
+            return _trsm_cgt_lower_L!(unit, k, A, B)
         end
         recbase = size(B, 2) <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
         if k <= recbase
