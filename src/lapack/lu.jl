@@ -461,10 +461,50 @@ const _CLU_PAD32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
 # on |·| (cabs1 = LAPACK izamax) and divides by the complex pivot correctly; `_getrf_core!` rides complex
 # trsm!/gemm! (the 3M path) for the trailing update. Pad-scratch dodges po2 lda aliasing (see `_clu_pad`).
 # (Oracle tests compare the PA=LU residual, not entries.)
+# ── SMALL n: ONE FLAT SWEEP, NOT BLOCKED LU ────────────────────────────────────────────────────────────
+# AOCL's zgetrf does not call ztrsm or zgemm at these sizes. Its libflame routes m,n ≤ 84 to one flat
+# whole-matrix SIMD right-looking LU (`fla_zgetrf_small_avx512`), and recurses down to that same kernel up
+# to ~1629 (read from the shipped artifact by Fable, 2026-09-14). The blocked path here was losing to it at
+# n=50/100 (Zen4 0.83/0.84) because at 32-wide panels the blocked update's trsm + gemm are small calls with
+# a large fixed cost. `_cgetf2_simd!` already IS a flat sweep — it swaps rows across all `pb` columns and
+# applies its fused rank-2 update out to column `pb` — so `pb = n` factors the whole matrix.
+#
+# MEASURED, paired in-process (ABKit ABBA), flat time / shipped blocked time, < 1 ⇒ flat wins:
+#     n      36   44   50   60   72   80   90  100  110  120  128
+#   Zen4    .80  .82  .79  .87  .94  .96  .86  .90  .92  .98 1.53
+#   Zen3    .85  .92  .89  .97  .98 1.01  .97 1.02  .99 1.07 1.52
+# PDM: Literal — an ALGORITHM-SWITCH crossover (store-bound flat sweep vs blocked BLAS-3 update), with no
+# cache or ISA quantity it is a function of: the residency candidate `isqrt(L1 ÷ sizeof(T))` = 45 is
+# FALSIFIED by flat winning at 50..110 on Zen4. Same classification as `_GETF2_BASE`/`_CIAMAX_SIMD_MIN`.
+# 112 takes every Zen4 win including n=100 and bounds Zen3's regret at ~1.5% (n=100, whose gate is 1.04).
+# req8-ok: fleet table above; Zen5 to be validated once its frequency lock holds
+const _CLU_FLAT_MAX = @load_preference("clu_flat_max", 112)::Int
+# Same-process A/B switch (the `_TRSM_FUSED_ON` pattern). ponytail: exists for controlled A/B.
+const _CLU_FLAT_ON = Ref(true)
+# Leading-dimension ALIASING, which is why n=64 and n=96 lost where their neighbours won. A column is
+# ld·sizeof(T) bytes, so columns fall into the same L1 set every p = WAY ÷ gcd(ld·sizeof(T), WAY) columns;
+# the flat sweep re-reads every trailing column at every pivot, so once more than `assoc` of them share a
+# set they evict each other. Confirmed, not inferred: at n=64 the SAME values stored at ld=72 ran 21%
+# (Zen4) / 15% (Zen3) faster than at ld=64. The criterion reproduces every measured size — n=64 puts 16
+# columns in a set, n=96 12, both > 8 ways; n=48/80 put 5 or fewer. PDM: Derived from `_L1_WAY_BYTES`
+# and `_L1D_ASSOC`; on Zen5 (48 KiB, 12-way) it predicts n=96 does NOT alias — a falsifiable check.
+@inline function _clu_flat_aliased(ld::Int, n::Int, ::Type{T}) where {T}
+    p = _L1_WAY_BYTES ÷ gcd(ld * sizeof(T), _L1_WAY_BYTES)
+    return cld(n, p) > _L1D_ASSOC
+end
+# ponytail: an aliased size falls back to the blocked path (measured faster than aliased-flat at 64/96).
+# Flat on a de-aliased ld=n+pad copy would win a further ~17% there — add it if 64/96 ever matter.
+
 function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _clu_nb(min(size(A)...), T)) where {T <: BlasComplex}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
+    # Tall or square only: `_cgetf2_simd!` factors `pb` columns and swaps across exactly those, so a wide
+    # matrix (n > m) would need its trailing columns swapped too — it keeps the blocked path.
+    if _CLU_FLAT_ON[] && n <= m && m <= _CLU_FLAT_MAX && _strided1(A) && !_clu_flat_aliased(stride(A, 2), n, T)
+        info = GC.@preserve A _cgetf2_simd!(Ptr{T}(pointer(A)), stride(A, 2), m, n, 0, ipiv, 0)
+        return A, ipiv, info
+    end
     if _clu_needs_pad(A, m, T)                            # factor in a non-conflicting scratch
         R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
         pref = _clu_pad(T); b = pref[]
