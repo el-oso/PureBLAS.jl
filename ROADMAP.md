@@ -2,7 +2,7 @@
 
 Canonical status + next steps for this multi-session project. Update this file as milestones land.
 
-## STATUS (2026-08-30) — feature-complete, tagged v0.1.2, closing the single-thread performance gate
+## STATUS (2026-09-14) — feature-complete, tagged v0.1.2, closing the single-thread performance gate
 
 **Functionally complete: BLAS Levels 1–3 (real + complex, s/d/c/z) + core LAPACK (potrf/getrf/geqrf/gesvd,
 real + complex).** Two integration modes (native AD-traceable API; `libpureblas.so` via `juliac --trim` for
@@ -11,13 +11,19 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 **Where the work is now, in one line each:**
 - **Coverage: DONE.** OpenBLAS fallthrough is **zero** and ratchet-enforced (`test/lbt_forward_tests.jl`);
   the north-star worklist below is complete. What remains there is performance, not routing.
-- **Performance: the open front.** 352 of 2619 fleet cells sit below the gate (Zen3 115 / Zen4 114
-  / Zen5 123). Read that number with care — **740 cells (28%) are within ±5% of parity**, and with
-  1–4% per-cell noise the count swings ±10–15 between refreshes. Judge a change by its targeted cells and
-  its controls, never by a count delta.
-- **Genericity: LU, QR and SVD-values now accept `T<:Real`** (2026-08-30), so forward-mode AD reaches all
-  three factorizations for the first time. That was M6's prerequisite; reverse mode is still unstarted.
+- **Performance: the open front.** 376 of 2800 fleet cells sit below the gate (Zen3 118 / Zen4 128 /
+  Zen5 130), last published at `ef76dac2`. Read that number with care — a large share of cells sit within
+  a few percent of parity, and per-cell noise reaches **~4% at n=2048**, so the count swings between
+  refreshes. Judge a change by its targeted cells and its controls, never by a count delta.
+- **ForwardDiff duals are a gated element type**, not just a thing that compiles — four groups
+  (DL1/DL2/DL3/DLP) divide by LinearAlgebra's generic fallback. See the dual section below.
+- **Every `!` entry is allocation-free at steady state** (req#10), and `gemm!` now carries a *static*
+  `@test_noalloc` on both Float64 and Dual.
 - **Deferred by standing decision:** M4 multithreading (do not start unless asked), registration.
+- **Zen5 is stale.** neuromancer's cache predates `ff5677ba` and its frequency lock has been dropping
+  (4841 MHz against a 2000 MHz pin). A setuid `pureblas-cpufreq` helper is built and staged there so the
+  lock can be restored without the user present; it needs one `sudo install` and `fleet_freqlock.sh` is
+  not yet wired to call it.
 
 ### Scratch arena — replacing the per-role workspace fields (2026-09-04, stages 0–3 landed)
 
@@ -28,13 +34,9 @@ point the bump pointer rewinds.
 
 **Where it stands: 180 → 7 fields.** What remains is exactly the GEMM/syr2k pack buffers.
 
-**⚠ THE RE-GATE IS OWED AND NOT DONE.** Stage 4 is the first part of this conversion that touches gated
-code (trsm, trmm, potrf, trtri, getri), and it ships on `Pkg.test()` alone: 26121 pass / 0 fail / 3
-broken, twice. **No gate number has been taken on it.** A sweep of `L3 CL3 LP CLP` with `arms=pb` was
-started on galen (Zen3, locked 3675 MHz) and neuromancer (Zen5, locked 1984 MHz) at `0e40af5`;
-**wintermute (Zen4) is NOT covered** — its lock did not survive the 2026-09-04 crashes, and a
-floating-boost run is invalid rather than merely noisy. Zen4 is precisely where the double-pumped
-AVX-512 residuals live, so treat any two-box result as partial.
+**Stage-4 re-gate: covered as of 2026-09-14.** It shipped on `Pkg.test()` alone and sat un-gated for
+ten days. It is now inside the all-groups `arms=pb` refresh at `ff5677ba` on Zen3 and Zen4; Zen5 follows
+once its lock is restored, and until then any conclusion is two-box and should be labelled so.
 
 **The one open defect, left open on purpose.** The stage-4 perf review objects that eight gated LEAF
 kernels now open their own `@scope`, i.e. a `try`/`finally` on a ~50 ns operation — and `arena.jl` itself
@@ -50,13 +52,20 @@ handles down; if they do not, the rewrite was never owed.
 | 1 | the first 37 roles (tgex/laexc/syl/trsen fixed-size scratch) | ✅ `741af93` |
 | 2 | 15 LAPACK files' call sites | ✅ `5378866` |
 | 3 | the remaining 15 LAPACK files (52 roles) + the deletion pass | ✅ `5378866` |
-| 4 | the 13 trsm/trtri/potrf roles | ✅ code `0e40af5`; **RE-GATE PENDING** |
+| 4 | the 13 trsm/trtri/potrf roles | ✅ `0e40af5`; re-gated Zen3+Zen4 at `ff5677ba`, Zen5 pending a lock |
 | — | the 7 GEMM/syr2k pack buffers | **deliberately NOT converted** — see below |
 
 **Why the pack buffers stay fields.** `gpackA`/`gpackB`/`cg`/`s2`/`m3`/`str`/`strbt` are touched on every
 single `gemm!` call, which is the one frequency at which a bump-allocate could plausibly cost more than a
-const-dispatched field load; and `str` is a POOL (`Vector{Matrix{T}}`) whose disjointness is slot-index
-arithmetic in `_str_fit!`, not a field split. Converting them is a separate decision, not yet taken.
+const-dispatched field load; and `str` is a POOL whose disjointness is slot-index arithmetic in
+`_str_fit!`, not a field split. Converting them to the arena is a separate decision, not yet taken.
+
+**They are all grow-only now, though (2026-09-14, `5f4a2eae`).** `str` and `strbt` were the last two
+that re-allocated on a shape change; they are flat `Vector{T}` slots viewed as `PtrMatrix` at exact `ld`,
+the shape `_gemm_3m_scratch` already used. Every pool grows through one `@noinline` `_ws_grow!`/
+`_ws_slot!`, which is what makes "this is a high-water barrier" a true statement rather than a convenient
+one — and that is what lets `gemm!` pass a static `@test_noalloc` with the barrier registered.
+`syrk!`/`trmm!` still reach other allocation sites and keep a warmed runtime assertion instead.
 
 **Three properties the design rests on**, in decreasing strength:
 1. **The token cannot escape** — `@scope` rejects at EXPANSION TIME any use of the token other than as
@@ -105,6 +114,36 @@ Landed since the 2026-07-11 potrf-campaign kickoff (all merged + fleet-validated
   (small-n) shipped; `gemvT` NC-widen and the `gemmtrsm` macrokernel measured-and-**falsified** (documented).
 - **Tooling**: `req#8` lint (CI gate vs hardcoded tuning literals), Aqua, StrictMode
   (`@assert_no_spill`/`@assert_memsafe` dogfood), `f32_aocl`/gate-miss bench harnesses.
+
+### ForwardDiff duals — a gated element type (2026-09-11 → 09-14)
+
+`Dual{Tag,Float64,1}` is 16 bytes interleaved, byte-identical to `ComplexF64`, so it rides the complex
+machinery's *layout* — but never its arithmetic: reinterpreting to complex is wrong wherever two elements
+multiply, because `(a+εb)(c+εd)` drops the `εε` term that `i·i` does not. L3 is therefore **planar**:
+three real products on the value and partial planes, no Karatsuba cancellation window.
+
+Four groups gate it: **DL1/DL2/DL3/DLP**, dividing by LinearAlgebra's generic fallback rather than a
+vendor BLAS (there is no dual OpenBLAS to beat). Those cells record both arms in the same run, which the
+real and complex groups do not need.
+
+Published at `ef76dac2`, geomean (worst cell):
+
+| | Zen3 | Zen4 | Zen5 |
+|---|---|---|---|
+| `dgemm1` | 8.29 (1.87) | 8.33 (2.31) | 7.70 (2.49) |
+| `dgeqrf1` | 3.11 (2.09) | 2.69 (1.82) | 2.78 (1.77) |
+| `dsyev1` | 1.85 (1.69) | 1.92 (1.75) | 1.97 (1.72) |
+
+No dual cell is below gate on any box. How `dsyev1` got there is worth keeping: it fell monotonically to
+**0.66–0.69** — slower than the generic fallback it replaced — because making `_syev!` merely *dispatch*
+on a Dual was reported as a closed gap without ever being timed. That is what req#9
+("it works" is not a result) was written for. The fix was a planar `_syev_pair!`; the curve is now flat
+1.69–2.03 across n=32–256.
+
+**Still open:** `geqp3` (a genuine `where {T<:BlasFloat}` type gate) and `gesvd` singular **vectors**
+(needs a generic `orgbr` plus a vector-carrying `bdsqr`; singular *values* already work). Details,
+including the seed-independence audit that ordinary correctness tests cannot catch, are in
+`docs/src/dual_lp.md`.
 
 ### Open residuals (characterized; not release-blocking)
 - **Large-n `trmm`/`syrk`/`trsm` vs AOCL** ~0.93–0.98 at n≥2048 — the LLVM-vs-hand-asm classical-microkernel
@@ -171,7 +210,32 @@ from one afternoon's inspection; the same question has never been asked of the o
 there was no recorded per-group duration to estimate from and the obvious proxy (clock) is the wrong
 one — see galen above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
 FP256 double-pumped, so it behaves like galen at half the clock. Durations now recorded in
-`kb/findings/` so the next session estimates from data.
+`kb/findings/sweep-wall-clock-reference.md` so the next session estimates from data.
+
+#### Update 2026-09-14 — the instrument matters more than the knobs
+
+A separate finding, and it bears on every ratio this section worries about. For a **PB-vs-PB** comparison
+(one flag, two arms) the sampling knobs above are second-order next to *where the arms sit relative to
+each other*:
+
+| instrument | A/A floor at n=2048 |
+|---|---|
+| cross-process, one forced value per process | **1–4%** |
+| in-process ABBA, median of per-round ratios (`bench/abkit.jl`) | **0.05–0.2%** |
+
+Roughly a thousandfold, because common-mode drift cancels inside each pair instead of being averaged
+over. The cross-process form read one gemm cell as +2.4%, +2.6% and −3.07% in three sessions and sent a
+day's conclusions the wrong way. Two consequences worth carrying:
+
+- **Use `ABKit.ab` for any flag A/B.** Its A/A floor is the admission test, and its arm-liveness check
+  catches the dead-flag null that looks exactly like a real null.
+- **Pairing cancels drift, not the operating point.** On an unlocked box a paired A/B is still valid for
+  a clock-independent question — but Strassen depth trades flops against memory traffic, so a box running
+  2.4× its pinned clock has a genuinely different optimum. That is why the Zen5 depth readings were set
+  aside rather than used.
+
+This does not retire the review above: it is about comparing two PB arms, while the coverage tables
+divide PB by a cached reference and cannot be paired that way.
 
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
