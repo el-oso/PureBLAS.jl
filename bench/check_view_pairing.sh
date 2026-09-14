@@ -17,6 +17,12 @@ rc=0
 for f in "${!seen[@]}"; do
     case "$f" in
         *_lite.svg) continue ;;                       # gitignored smoke artifacts; never committed
+        # DUAL groups (DL1/DL2/DL3/DLP) have ONE view and always will: their reference arm is
+        # LinearAlgebra's generic fallback, not a vendor BLAS, so there is no OpenBLAS-vs-AOCL pair to
+        # keep in step and `plots.jl` renders no `_aocl` counterpart for them. Without this the check
+        # fails every dual publish demanding a file that is not supposed to exist — which is exactly
+        # what it did on ef76dac2, the first commit to move perf_dl3/perf_dlp on their own.
+        docs/src/assets/perf_dl*.svg) continue ;;
         *_aocl.svg) other="${f%_aocl.svg}.svg" ;;
         *)          other="${f%.svg}_aocl.svg" ;;
     esac
