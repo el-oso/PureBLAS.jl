@@ -1531,7 +1531,44 @@ const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # PDM: Literal — split while min(m,n,k) >= this; the base stays >= ~min/2. | tune: 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above)
 const _STRASSEN_MIN = @load_preference("strassen_min", _at_strassen_min(_HW))::Int      # split while min(m,n,k) ≥ this
 @inline _fh_strassen_min() = (f = _FKR_strassen_min[]; f >= 0 ? f : _STRASSEN_MIN)
-# PDM: Literal — recursion depth cap; deeper trades flops for pack/add traffic. | tune: candidate
+# THE SECOND HALF OF A TWO-SIDED CONSTRAINT, not a duplicate of `strassen_min` — and the reason it is
+# not derivable was measured 2026-09-14, so this is no longer a bare literal.
+#
+# `_strassen_depth` splits while the PARENT is >= `strassen_min`, which bounds the base from below at
+# ~min/2 but says nothing about how many LEVELS that takes. The two are independent because the measured
+# optimum tracks BOTH and they disagree: at n=512 the fleet wants base 128 (two levels), at n=1024 it
+# wants base 256 (also two levels). A single base-size floor cannot accept base 128 at one n and reject
+# it at another, so "replace both knobs with one base-size rule" — which is what the design comment
+# above reads as promising — is not expressible. Measured, forced depth, 2 runs averaged, locked:
+#
+#   preferred depth   512 -> 2      1024 -> 2     2048 -> 3     3072 -> 4     4096 -> 3/4 (flat)
+#   base there        128           256           256           192           256
+#   n=512  base 256 vs 128   Zen4 -0.8% (INSIDE its own 0.93% spread)   Zen3 +1.0% (spread 0.14%)
+#   n=1024 base 256 vs 128   Zen4 -0.26%                               Zen3 -0.85%
+#
+# AND IT IS NOT PREDICTABLE FROM A DETECTED CONST. The residency candidate `B <= sqrt(L2/(3*sizeof(T)))`
+# gives 209 on Zen4 and reproduces its n=2048/3072 optima — then FAILS on Zen5, which has the SAME 1 MB
+# L2 and reads -0.0% where Zen4 reads +2.5%. A model that mispredicts a box we own is the PDM ladder's
+# own tell for Measure, not Derive.
+#
+# VALUE NOT MOVED, deliberately. Raising to 4 is Zen4-positive (n=3072 -3.4%, reproduced 3x) and
+# Zen3-negative (+0.79% at n=2048, +0.21% at 4096, on a box whose gemm@512 gates at 1.02) with Zen5
+# unmeasured — the exact profile the `strassen_min = 512` candidate above was rejected on, and rejected
+# correctly. n=2048 cannot adjudicate it either way: the same knob on the same code measured +2.4%,
+# +2.6% and -3.07% in three sessions (see the noise note on `_STRASSEN_NOPAD` below, corrected there).
+#
+# WHY A DEPTH CAP EXISTS AT ALL, which the old "deeper trades flops for pack/add traffic" did not say:
+# Winograd's error constant grows with LEVEL. Measured (`bench/probes/strassen_accuracy_depth.jl`,
+# max relative error in units of eps(T), classical = depth 0):
+#
+#   depth        0      1      2      3      4
+#   Float64   4.44   9.54  30.97  97.21 164.26   (n=2048)   ~3x per level
+#   Float32   2.77  11.92  29.04  87.73 160.77   (n=2048)   the SAME, in eps(T) units
+#
+# Type-INDEPENDENT once expressed in eps(T), so the cap is correctly a flat number and must NOT be
+# scaled by the mantissa — a plausible-sounding derivation that this table falsifies.
+# PDM: Literal — accuracy budget (~3x error per level, type-independent); performance side is Measure,
+# falsified above. | req8-ok: fleet tables above, two derivations falsified, value deliberately unmoved
 const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 @inline _fh_strassen_maxdepth() = (f = _FKR_strassen_maxdepth[]; f >= 0 ? f : _STRASSEN_MAXDEPTH)
 # Prefer spending LESS Strassen depth over PADDING an odd dimension — see `_gemm_strassen!` for the
@@ -1539,10 +1576,13 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 # plus three scratch slots; reducing depth costs flops. Which wins is a shape question, and it was
 # measured rather than argued.
 #
-# ONLY REACHABLE ON NATIVE AVX-512. The pad arm needs a high recursion depth, which needs a low
-# `strassen_min`, and `_at_strassen_min` (cpuinfo.jl:365) gives 256 only when `_datapath_bytes >= 64`.
-# Zen4 double-pumps so its datapath reads 32 -> 1024, same as AVX2. Checked on Zen4: trmm n=2100
-# takes D=1 on an even dimension, so nothing pads and this knob is a NO-OP there and on Zen3.
+# ⚠ STALE AS WRITTEN, corrected 2026-09-14: this described `_at_strassen_min` as
+# `_datapath_bytes(hw) >= 64 ? 256 : 1024`, and that predicate no longer exists — it was falsified and
+# replaced by `@inline _at_strassen_min(hw) = 256` (cpuinfo.jl:517), flat on the whole fleet. So
+# `strassen_min` is 256 EVERYWHERE, including Zen4 and Zen3, and the "only reachable on native AVX-512"
+# conclusion below does not follow from it. Verified on wintermute (Zen4, datapath 32): the running
+# value is 256, not 1024. Whether the pad arm is actually reached off AVX-512 is now an open question,
+# not a settled no-op — the gate table below was measured on Zen5 and still stands on its own terms.
 #
 # GATE-MEASURED on Zen5, freq-locked, ABBA, pb-vs-pb (reference arm cancels):
 #     op    n=2100 t(nopad)/t(pad)   gate now -> projected
@@ -1557,6 +1597,12 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 # so every sub-gemm of the split (1024,2048,1024 / 512,2048,512 / 256,2048,256) is clean at every level
 # and this knob cannot alter the code path. Enumerated, not assumed. It calibrates the n=2048 noise
 # floor at >=1.5%, which also means trmm@2048 (gate 1.002) is not adjudicable in either direction.
+# ⚠ THE >=1.5% FLOOR IS TOO OPTIMISTIC, corrected 2026-09-14. Forcing `strassen_maxdepth` 3 vs 4 at
+# gemm n=2048 — same box, same code, freq-locked, Chairmarks median of 12 — read +2.4%, +2.6% and
+# -3.07% across three sessions, and the depth-3 baseline itself moved 345.7 -> 362.1 ms. So n=2048's
+# process-to-process floor is ~4%, not 1.5%, and NOTHING at that size is adjudicable below ~4% from
+# single runs. The correct instrument there is `bench/adjudicate.sh` (K replications + sign test), not
+# a pair of runs — two runs at n=2048 will happily hand you a confident wrong sign.
 # PDM: Literal — prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | tune: candidate
 const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: gate-measured, table above
 @inline _fh_strassen_nopad() = (f = _FKR_strassen_nopad[]; f >= 0 ? f : _STRASSEN_NOPAD)
