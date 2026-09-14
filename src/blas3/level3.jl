@@ -1989,10 +1989,13 @@ end
 # vectors once per t, the two accumulators once per j) was written, proved correct over 75 (s, nrhs)
 # cells, and compiles to a BYTE-IDENTICAL histogram; its A/B was correspondingly null at all six sizes.
 # THE RULE, stated properly: a negated broadcast costs extra only when it is used ONCE. Reverted.
+# LOW mirrors the substitution direction: rows solved top-down, the accumulate reads the already-solved rows
+# ABOVE the slab (t < r0, i.e. A[r0+i, t] is strictly lower), and the triangle visits j = 0 → MR-1 updating
+# rows i > j. Every address expression is shared with the upper arm; only ranges and order flip.
 @generated function _zgt_slab!(
-        ::Val{MR}, pr::Ptr{Float64}, pim::Ptr{Float64}, pA::Ptr{Float64}, lda::Int,
+        ::Val{MR}, ::Val{LOW}, pr::Ptr{Float64}, pim::Ptr{Float64}, pA::Ptr{Float64}, lda::Int,
         rc::Ptr{Float64}, r0::Int, kc::Int
-    ) where {MR}
+    ) where {MR, LOW}
     sz = sizeof(Float64); NR = _ZGT_NR; V = Vec{_ZGT_W, Float64}
     ar(i) = Symbol(:ar, i); ai(i) = Symbol(:ai, i)
     ld = [
@@ -2009,13 +2012,13 @@ end
             $(ai(i)) = muladd($V(-ui), pv, muladd($V(-ur), pm, $(ai(i))))
         end for i in 0:(MR - 1)
     ]
-    tri = map((MR - 1):-1:0) do j
+    tri = map(LOW ? (0:(MR - 1)) : ((MR - 1):-1:0)) do j
         upd = [
             quote
                 ur = unsafe_load(pAj, 2 * (r0 + $i) + 1); ui = unsafe_load(pAj, 2 * (r0 + $i) + 2)
                 $(ar(i)) = muladd($V(ui), $(ai(j)), muladd($V(-ur), $(ar(j)), $(ar(i))))
                 $(ai(i)) = muladd($V(-ui), $(ar(j)), muladd($V(-ur), $(ai(j)), $(ai(i))))
-            end for i in 0:(j - 1)
+            end for i in (LOW ? ((j + 1):(MR - 1)) : (0:(j - 1)))
         ]
         return quote
             rr = unsafe_load(rc, 2 * (r0 + $j) + 1); ri = unsafe_load(rc, 2 * (r0 + $j) + 2)
@@ -2032,11 +2035,12 @@ end
             vstore($(ai(i)), pim + ($i + r0) * $NR * $sz)
         end for i in 0:(MR - 1)
     ]
+    tloop = LOW ? :(0:(r0 - 1)) : :((r0 + $MR):(kc - 1))    # the already-solved rows
     return quote
         $(Expr(:meta, :inline))
         @inbounds begin
             $(ld...)
-            for t in (r0 + $MR):(kc - 1)
+            for t in $tloop
                 pv = vload($V, pr + t * $NR * $sz); pm = vload($V, pim + t * $NR * $sz)
                 pAt = pA + t * lda * 2 * $sz
                 $(acc...)
@@ -2049,7 +2053,7 @@ end
 end
 
 # Driver: one NR-wide column stripe at a time; pack → slabs bottom-up → unpack.
-function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
+function _trsm_cgt_L!(::Val{LOW}, unit::Bool, k::Int, A, B) where {LOW}
     nrhs = size(B, 2); csz = sizeof(ComplexF64); sz = sizeof(Float64)
     NR = _ZGT_NR; MR = _ZGT_MR
     lda = stride(A, 2); ldb = stride(B, 2)
@@ -2067,21 +2071,23 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
                 z = unit ? one(ComplexF64) : _crecip(unsafe_load(Ptr{ComplexF64}(pA), j * lda + j + 1))
                 unsafe_store!(rc, real(z), 2j + 1); unsafe_store!(rc, imag(z), 2j + 2)
             end
-            # Ragged rows go at the TOP for both the pack blocks and the slabs: the slab loop walks up from
-            # row k-MR, so k mod W is left over at row 0 either way. Anchoring the transpose blocks to the
-            # same end keeps ONE ragged region instead of one at each end.
+            # Ragged rows sit at the END the substitution finishes on — the TOP for upper (slabs walk up from
+            # row k-MR), the BOTTOM for lower (slabs walk down from row 0) — so k mod W is left over at one
+            # end either way. Anchoring the transpose blocks to the opposite end keeps ONE ragged region.
             rlo = k % _ZGT_W
             jc = 0
             while jc < nrhs
                 wid = min(NR, nrhs - jc)
                 pB0 = pB + jc * ldb * csz
-                lo = wid == NR ? rlo : k                     # ragged column stripe → scalar pack (no full block)
-                @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                nv = wid == NR ? k - rlo : 0                 # rows packed by W×W blocks (ragged stripe → none)
+                b0 = LOW ? 0 : k - nv                        # first block row
+                s0 = LOW ? nv : 0; s1 = LOW ? k - 1 : k - nv - 1   # scalar-packed rows
+                @inbounds for i0 in b0:_ZGT_W:(b0 + nv - 1)
                     _zgt_pack!(pr, pim, pB0, ldb * csz, i0)
                 end
                 @inbounds for v in 0:(wid - 1)               # scalar pack for the ragged rows / ragged stripe
                     sc = pB0 + v * ldb * csz
-                    for i in 0:(lo - 1)
+                    for i in s0:s1
                         unsafe_store!(pr + (i * NR + v) * sz, unsafe_load(sc, 2i + 1))
                         unsafe_store!(pim + (i * NR + v) * sz, unsafe_load(sc, 2i + 2))
                     end
@@ -2090,20 +2096,31 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
                     unsafe_store!(pr + (i * NR + v) * sz, 0.0)
                     unsafe_store!(pim + (i * NR + v) * sz, 0.0)
                 end
-                r0 = k - MR
-                while r0 >= 0
-                    _zgt_slab!(Val(_ZGT_MR), pr, pim, pA, lda, rc, r0, k)
-                    r0 -= MR
+                if LOW
+                    r0 = 0
+                    while r0 + MR <= k
+                        _zgt_slab!(Val(_ZGT_MR), Val(true), pr, pim, pA, lda, rc, r0, k)
+                        r0 += MR
+                    end
+                    @inbounds for r in r0:(k - 1)            # ragged bottom rows, one at a time
+                        _zgt_slab!(Val(1), Val(true), pr, pim, pA, lda, rc, r, k)
+                    end
+                else
+                    r0 = k - MR
+                    while r0 >= 0
+                        _zgt_slab!(Val(_ZGT_MR), Val(false), pr, pim, pA, lda, rc, r0, k)
+                        r0 -= MR
+                    end
+                    @inbounds for r in (r0 + MR - 1):-1:0    # ragged top rows, one at a time (Val(1) is literal)
+                        _zgt_slab!(Val(1), Val(false), pr, pim, pA, lda, rc, r, k)
+                    end
                 end
-                @inbounds for r in (r0 + MR - 1):-1:0        # ragged top rows, one at a time (Val(1) is literal)
-                    _zgt_slab!(Val(1), pr, pim, pA, lda, rc, r, k)
-                end
-                @inbounds for i0 in lo:_ZGT_W:(k - 1)
+                @inbounds for i0 in b0:_ZGT_W:(b0 + nv - 1)
                     _zgt_unpack!(pr, pim, pB0, ldb * csz, i0)
                 end
                 @inbounds for v in 0:(wid - 1)
                     dc = pB0 + v * ldb * csz
-                    for i in 0:(lo - 1)
+                    for i in s0:s1
                         unsafe_store!(dc, unsafe_load(pr + (i * NR + v) * sz), 2i + 1)
                         unsafe_store!(dc, unsafe_load(pim + (i * NR + v) * sz), 2i + 2)
                     end
@@ -2114,59 +2131,13 @@ function _trsm_cgt_L!(unit::Bool, k::Int, A, B)
     end                                          # @scope arn
     return B
 end
-# ── The LOWER sibling, by reversal rather than a second SIMD kernel ────────────────────────────────────
-# WHY IT EXISTS. The leaf above only substitutes upward, so a LOWER solve fell through to
-# `_trsm_cmplx_dLN!` — the "BLAS-2 traffic pattern wearing a BLAS-3 name" the note above measures at
-# 0.64–0.74× AOCL. No gate cell saw it: the public `ztrsm` cell solves an UPPER triangle. But zgetrf's
-# panel update is exactly side-L LOWER UNIT (`U12 = L11⁻¹ A12`, lu.jl `_getrf_core!`), and a sampling
-# profile put that one trsm at ~30% of zgetrf at both n=50 and n=100. Measured on the exact LU shape
-# (Zen4, k=32, `bench/probes/zgetrf_trsm_shape.jl`): PB was 2.55× / 2.82× / 3.00× / 3.10× SLOWER than
-# AOCL at m = 4 / 18 / 36 / 68 — the whole of zgetrf's n=50..100 dip below AOCL on every µarch.
-#
-# HOW. Let J reverse index order. For L lower, J·L·J is UPPER (the diagonal maps onto itself, so a unit
-# diagonal stays unit), and  L·X = B  ⇔  (J·L·J)·(J·X) = J·B.  So: copy L reversed into a k×k scratch
-# (only the lower triangle is read, and it lands exactly on the upper triangle), reverse B's rows, run the
-# unchanged upper leaf, reverse B's rows back. The fast kernel is reused as-is — no new SIMD code, and
-# the reversal is O(k²) + O(2·k·m) against an O(k²·m) solve.
-#
-# The scratch is written ONLY on and above its diagonal. That is safe because the upper leaf never reads
-# below the diagonal — checked, not assumed: `bench/probes/zgetrf_trsm_lower.jl` poisons the strictly-lower
-# part of the scratch with NaN and requires a finite, correct result.
-# Same-process A/B switch, the `_TRSM_FUSED_ON` pattern: false ⇒ lower solves fall back to
-# `_trsm_cmplx_dLN!` exactly as before. ponytail: exists for controlled A/B; a Ref load against an O(k²·m) solve.
-const _CGT_LOWER_ON = Ref(true)
-@inline function _cgt_rev_rows!(B, k::Int)
-    ldb = stride(B, 2); nrhs = size(B, 2)
-    GC.@preserve B begin
-        p = Ptr{ComplexF64}(pointer(B))
-        @inbounds for c in 0:(nrhs - 1)
-            b0 = c * ldb
-            for i in 0:((k >> 1) - 1)
-                ia = b0 + i + 1; ib = b0 + (k - 1 - i) + 1
-                x = unsafe_load(p, ia); unsafe_store!(p, unsafe_load(p, ib), ia); unsafe_store!(p, x, ib)
-            end
-        end
-    end
-    return
-end
-function _trsm_cgt_lower_L!(unit::Bool, k::Int, A, B)
-    lda = stride(A, 2)
-    # ESCAPE AUDIT (@scope arn): `Ar` is read by `_trsm_cgt_L!` through `pointer`/`stride` only and never
-    # stored; it does not outlive this block. Borrowed once, outside every loop.
-    @scope arn begin
-        Ar = borrow!(arn, ComplexF64, k, k)             # EXACT k×k, ld = k (contiguous, `_cgt_ok`-shaped)
-        GC.@preserve A begin
-            pA = Ptr{ComplexF64}(pointer(A)); pR = pointer(Ar)
-            @inbounds for j in 0:(k - 1), i in j:(k - 1)     # A[i,j], i ≥ j  →  Ar[k-1-i, k-1-j] (upper)
-                unsafe_store!(pR, unsafe_load(pA, j * lda + i + 1), (k - 1 - j) * k + (k - 1 - i) + 1)
-            end
-        end
-        _cgt_rev_rows!(B, k)
-        _trsm_cgt_L!(unit, k, Ar, B)
-        _cgt_rev_rows!(B, k)
-    end
-    return B
-end
+# ── LOWER no-trans: the same leaf, native (`Val(true)`) ────────────────────────────────────────────────
+# zgetrf's blocked panel update is side-L LOWER UNIT (`U12 = L11⁻¹ A12`), and before 16639486 it fell to
+# `_trsm_cmplx_dLN!` at 2.55–3.10× AOCL's time (k=32, m=4..68). 16639486 routed it here by index reversal
+# (copy L reversed into a k×k scratch, reverse B's rows, upper leaf, reverse back); the native mirror
+# replaced that. Paired A/B, Zen4 (`bench/probes/zgetrf_trsm_lower_native.jl`): native/wrapper 0.784 /
+# 0.779 / 0.779 at 32×18/36/68, zgetrf 0.961 @128, 0.968 @256. Safety is tested, not argued: the lower
+# arm on an A whose strictly-upper part (and unit diagonal) is NaN returns a finite, correct result.
 
 # Eligibility: ComplexF64 only (the plane split rides the f64 W×W transpose), unit-stride A and B,
 # upper + no-trans (the substitution direction the slab hardcodes), and k within the L1 stripe bound.
@@ -2225,7 +2196,7 @@ const _CTRSM_NCUT = @load_preference("ctrsm_ncut", 128)::Int   # B-width cut: �
 # half the flops (large-n / trans). Small-n N → direct j-outer solve (no trtri; OB's approach).
 function _trsm_cmplx_small_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int, A, B)
     if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)                  # register-tiled gemmtrsm leaf
-        return _trsm_cgt_L!(unit, k, A, B)
+        return _trsm_cgt_L!(Val(false), unit, k, A, B)
     end
     if !tr && k <= _fh_ctrsm_direct_max() && _strided1(B) && eltype(A) === eltype(B)   # direct back-substitution
         return _trsm_cmplx_dLN!(up, unit, k, A, B)                                # (no trtri)
@@ -4119,12 +4090,12 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         # is taken before the narrow/wide split rather than from inside it — at k=128 one leaf measured
         # 40.4 GF against 35.7 for the two-64-leaves-plus-gemm recursion this recbase would pick.
         if up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
-            return _trsm_cgt_L!(unit, k, A, B)
+            return _trsm_cgt_L!(Val(false), unit, k, A, B)
         end
-        # LOWER no-trans takes the same leaf by index reversal — see `_trsm_cgt_lower_L!`. This is zgetrf's
-        # panel solve, which fell to `_trsm_cmplx_dLN!` at ~3× AOCL's time before this branch existed.
-        if !up && !tr && _CGT_LOWER_ON[] && k <= _ZGT_BASE && _cgt_ok(A, B)
-            return _trsm_cgt_lower_L!(unit, k, A, B)
+        # LOWER no-trans: the same leaf's native mirror. This is zgetrf's blocked panel solve (and getrs /
+        # potrs / trtrs lower), which fell to `_trsm_cmplx_dLN!` at ~3× AOCL's time before this branch.
+        if !up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
+            return _trsm_cgt_L!(Val(true), unit, k, A, B)
         end
         recbase = size(B, 2) <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
         if k <= recbase

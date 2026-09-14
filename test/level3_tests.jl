@@ -169,6 +169,36 @@ end
     end
 end
 
+# The complex gemmtrsm leaf solves LOWER natively (`Val(true)`). It must read only the strictly-lower part
+# (plus the diagonal when non-unit): an A poisoned with NaN above the diagonal must still give the right
+# answer, and poisoning one strictly-lower entry must bite (positive control — the test can fail).
+@testitem "complex gemmtrsm leaf: native lower is correct and never reads above the diagonal" begin
+    using PureBLAS, LinearAlgebra
+    T = ComplexF64
+    for k in (1, 7, 8, 9, 17, 32, 64), m in (1, 5, 8, 18), unit in (true, false)
+        L = tril(randn(T, k, k), -1) + 4I
+        Lp = copy(L)
+        for j in 1:k, i in 1:(j - 1)
+            Lp[i, j] = T(NaN, NaN)
+        end
+        unit && for i in 1:k
+            Lp[i, i] = T(NaN, NaN)
+        end
+        B0 = randn(T, k, m)
+        R = copy(B0); LinearAlgebra.BLAS.trsm!('L', 'L', 'N', unit ? 'U' : 'N', one(T), unit ? tril(L, -1) + I : L, R)
+        X = copy(B0); PureBLAS._trsm_cgt_L!(Val(true), unit, k, Lp, X)
+        @test all(isfinite, X)
+        @test norm(X - R) <= 1.0e-10 * (norm(R) + 1)
+        Xp = copy(B0); PureBLAS.trsm!(Xp, Lp; side = 'L', uplo = 'L', transA = 'N', diag = unit ? 'U' : 'N')
+        @test norm(Xp - R) <= 1.0e-10 * (norm(R) + 1)
+        if k > 1
+            C = copy(Lp); C[k, 1] = T(NaN, NaN)
+            Y = copy(B0); PureBLAS._trsm_cgt_L!(Val(true), unit, k, C, Y)
+            @test !all(isfinite, Y)
+        end
+    end
+end
+
 # Regression: the side-L ragged-column-tail arm (level3.jl, the `1 < nrhs < _vwidth` widening branch)
 # used to stage B into the SAME owned buffer that the complex `_trsm!` path takes for `_trtri!`'s
 # output. `_trtri!` then wrote A⁻¹ over the staged right-hand side and trsm! returned garbage —
