@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 136 of them.
+Every `@load_preference` key in `src/` — 137 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 136 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 9 Measured · 50 Literal · 12 Exempt.
-**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 44 literal · 5 flag · 2 other.
+**Tier:** 65 Derived · 9 Measured · 51 Literal · 12 Exempt.
+**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 45 literal · 5 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -229,7 +229,8 @@ Every `@load_preference` key in `src/` — 136 of them.
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
-| `strassen_maxdepth` | literal | Literal | recursion depth cap; deeper trades flops for pack/add traffic. | candidate |
+| `strassen_base` | literal | Literal | the BAND is measured (fleet table above); no detected const predicts it. The L2 | — |
+| `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
 

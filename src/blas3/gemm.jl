@@ -374,7 +374,10 @@ end
 
 # Transpose A (k×m, the transA='T' operand) into `At` (m×k, column-major) via the W×W SIMD block
 # transpose — so the unpacked microkernel can run it as a plain N·N product (no B-packing). At[i,p]=A[p,i].
-@inline function _transpose_dense!(At::Vector{T}, A, m::Int, k::Int) where {T}
+# `AbstractVector`, not `Vector`: the transB-Strassen caller now hands a `PtrVector` over the grow-only
+# `strbt` slot. Everything in the body goes through `pointer`/`setindex!`, which both containers provide
+# identically, and `PtrVector` is `IndexLinear` — so this widening costs the `Vector` callers nothing.
+@inline function _transpose_dense!(At::AbstractVector{T}, A, m::Int, k::Int) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); ov = Vec{W, T}(one(T))
     mfull = (m ÷ W) * W; kfull = (k ÷ W) * W
     GC.@preserve A At begin
@@ -1567,9 +1570,26 @@ const _STRASSEN_MIN = @load_preference("strassen_min", _at_strassen_min(_HW))::I
 #
 # Type-INDEPENDENT once expressed in eps(T), so the cap is correctly a flat number and must NOT be
 # scaled by the mantissa — a plausible-sounding derivation that this table falsifies.
-# PDM: Literal — accuracy budget (~3x error per level, type-independent); performance side is Measure,
-# falsified above. | req8-ok: fleet tables above, two derivations falsified, value deliberately unmoved
-const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
+# VALUE 3 -> 4 (2026-09-14), and only because `_STRASSEN_BASE` below now governs the depth. With the
+# base floor in place the cap is no longer what stops the recursion at any measured size EXCEPT n=3072
+# and n=4096, where a cap of 3 blocks the base rule from reaching its own answer:
+#
+#   n=3072  base rule wants depth 4 (base 192); cap 3 forces base 384 -> Zen4 3.8% SLOWER, Zen3 0.3%
+#   n=4096  base rule wants depth 4 (base 256); cap 3 forces base 512
+#
+# So 3 is not a cap on this knob's own criterion any more, it is an override of the other knob's. 4 is
+# the largest depth the fleet table measured, and the cap is deliberately NOT raised further: depth 5
+# first occurs at n >= 6144, which is outside the gate ladder and unmeasured. n=6144/8192 do move
+# (base 768 -> 384, 1024 -> 512) in the direction every measured cell supports — smaller base wins down
+# to 192 — but that is inference, not measurement, and it is why the cap stays at 4 rather than going.
+#
+# The accuracy budget still binds at 4, comfortably: ~3x error per level puts depth 4 at ~165-206 eps(T)
+# relative (table above), against ~4 eps for classical. For a BLAS-3 op that is not a correctness
+# concern, and the cap would have to reach ~7 before it became one.
+# PDM: Literal — accuracy budget (~3x error per level, type-independent); the performance side is
+# Measure and falsified above, so this bounds the BASE rule rather than competing with it.
+# req8-ok: fleet tables above, two derivations falsified, raised to the largest MEASURED depth
+const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 4)::Int
 @inline _fh_strassen_maxdepth() = (f = _FKR_strassen_maxdepth[]; f >= 0 ? f : _STRASSEN_MAXDEPTH)
 # Prefer spending LESS Strassen depth over PADDING an odd dimension — see `_gemm_strassen!` for the
 # branch. Padding costs three extra O(n^2) DRAM passes (two `fill!`s, two operand copies, a copy-back)
@@ -1606,9 +1626,40 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 3)::Int
 # PDM: Literal — prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | tune: candidate
 const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: gate-measured, table above
 @inline _fh_strassen_nopad() = (f = _FKR_strassen_nopad[]; f >= 0 ? f : _STRASSEN_NOPAD)
+# TWO DIFFERENT QUESTIONS, ONE PER LEVEL — this used to ask only the first one, for every level.
+#
+#   level 1     "is this problem big enough to Strassen at all?"   -> `strassen_min`, unchanged
+#   level 2+    "does the BASE stay big enough to run at throughput?" -> `_STRASSEN_BASE`
+#
+# The old loop applied the level-1 test all the way down, so it halved while the PARENT was >= min and
+# left the base anywhere in [min/2, min) = [128, 256). That band spans the measured optimum AND the
+# measured worst case, which is why a depth cap had to be bolted on top to stop it — and why the cap
+# then overshot in the other direction at large n (base 384 at n=3072, 512 at n=4096).
+#
+# MEASURED, paired in-process (ABKit ABBA, median of per-round ratios, A/A floor passed on every cell),
+# freq-locked and verified after each run. Ratio is (deeper base) / (shallower base); < 1 means the
+# DEEPER split won:
+#
+#   n      compare            Zen4 (2794 MHz)        Zen3 (3674 MHz)
+#   512    base 128 vs 256    1.0208  256 wins 2.1%  0.9936  128 wins 0.6%
+#   1024   base 128 vs 256    1.0264  256 wins 2.6%  1.0083  256 wins 0.8%
+#   1536   base 192 vs 384    (A/A SUSPECT)          0.9987  192 wins 0.1%
+#   2048   base 128 vs 256    1.0086  256 wins 0.9%  1.0044  256 wins 0.4%
+#   3072   base 192 vs 384    0.9620  192 wins 3.8%  0.9970  192 wins 0.3%
+#
+# Base 192-256 wins every cell on both boxes except Zen3 at n=512 (-0.6%). 192 is the floor because it
+# is the smallest base that won anywhere (n=1536, n=3072) while 128 lost at n=1024/2048 on both boxes.
+# PDM: Literal — the BAND is measured (fleet table above); no detected const predicts it. The L2
+# candidate `sqrt(L2/(3*sizeof(T)))` = 209 fits Zen4 and FAILS Zen5 at identical L2.
+# req8-ok: fleet table above, two boxes, paired instrument, one -0.6% cell accepted against +2.1/+3.8%
+const _STRASSEN_BASE = @load_preference("strassen_base", 192)::Int
+@inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
-    while s >= _fh_strassen_min() && d < _fh_strassen_maxdepth()
+    # `d == 0 ||` keeps level 1 on the original criterion, so every n < 512 routes EXACTLY as before —
+    # the fleet table above has no data below 512 and a rule must not move sizes it never measured.
+    while s >= _fh_strassen_min() && (d == 0 || (s >> 1) >= _fh_strassen_base()) &&
+            d < _fh_strassen_maxdepth()
         d += 1; s >>= 1
     end
     return d
@@ -2921,24 +2972,26 @@ end
 # are views (tiny headers, negligible at Strassen's large n). Dims must be divisible by 2^depth (the
 # entry pads odd/awkward sizes). Verified symbolically + numerically (~1e-14 vs the OB oracle).
 #
-# KEEP THE RECURSION MONOMORPHIC (req#10). `_strassen_lvl_scratch` hands back `Matrix{T}`, and a quadrant
-# `@view` of a `Matrix` is a `SubArray{…,Matrix}` — two container types, closed under sub-viewing, which
-# is the world the Float64 entry lives in and it infers cleanly. `_gemm_dual3!` instead passes `PtrMatrix`
-# planes, whose sub-views are `PtrMatrix`; pairing those operands with `Matrix` scratch multiplies the
-# child signatures level by level until inference gives up and the recursion BOXES its own quadrant
-# handles. Measured (`bench/probes/strassen_container_ab.jl`), same buffers, same n, only the handle type
-# differing: `Matrix` 0 B, `PtrMatrix` 448 B at n=512 and 1792 B at n=1024 — ×3 plane products = exactly
-# the 1344 B / 5376 B dual `gemm!` was leaking per call.
-# So match the scratch to the operand container: each world stays closed under sub-viewing and one
-# signature serves every level. `Matrix` operands take the identity, so the Float64 path's broadcast
-# codegen and its large-n gate behaviour are untouched — which is what the note on `_gemm_real_dims!`
-# above was protecting.
-@inline _str_like(::AbstractMatrix, M::Matrix) = M
-@inline function _str_like(::PtrMatrix, M::Matrix{T}) where {T}
-    # Exact-sized and contiguous by construction (`_str_fit!` reallocates on any shape mismatch), so
-    # ld == rows. Rooted for the call by the pool vector `_l3ws(T).str` itself, not by this handle.
-    return PtrMatrix(pointer(M), size(M, 1), size(M, 2), size(M, 1))
-end
+# KEEP THE RECURSION MONOMORPHIC (req#10), AND IN ONE CONTAINER WORLD. Each world is closed under
+# sub-viewing on its own — `Matrix` operands give `SubArray{…,Matrix}` quadrants that collapse back to
+# themselves, `PtrMatrix` operands give `PtrMatrix` quadrants — but MIXING them multiplies the seven
+# recursive call sites' signature combinations level by level until inference gives up and the recursion
+# BOXES its own quadrant handles. Measured (`bench/probes/strassen_container_ab.jl`), same buffers, same
+# n, only the handle type differing: matched 0 B, mixed 448 B at n=512 and 1792 B at n=1024 — ×3 plane
+# products = exactly the 1344 B / 5376 B dual `gemm!` was leaking per call.
+#
+# `9b8e8463` fixed that by matching the scratch to whichever world the operands arrived in. This goes
+# further and removes the second world: the entry below normalises A/B/C to `PtrMatrix` and
+# `_strassen_lvl_scratch` now hands back `PtrMatrix` too, so there is exactly ONE signature at every
+# level for every element type. It is a strictly smaller surface — no bridge function, no per-operand
+# dispatch — and it is what lets the scratch pool become grow-only flat slots, which is in turn what
+# makes `gemm!`'s no-allocation proof honest (see `_ws_grow!` in workspace.jl).
+#
+# The cost of putting the fifteen O(n²) Winograd combines on `PtrMatrix` was MEASURED first, because the
+# note on `_gemm_real_dims!` above exists to protect exactly this codegen (galen, Zen3,
+# `bench/probes/ptrmat_broadcast_cost.jl`, PtrMatrix/Matrix): a plain `@. C = A + B` is 0.997–0.988 at
+# n=256…2048, and the fused `@. C = α*(A+B+C)` shape the epilogue actually writes is 0.50–0.82, i.e.
+# faster. It is not a tax.
 function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) where {T}
     if depth == 0
         return _gemm_real_dims!(false, false, size(C, 1), size(C, 2), size(A, 2), alpha, beta, A, Bm, C)
@@ -2947,10 +3000,7 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
     A11 = @view A[1:mh, 1:kh]; A12 = @view A[1:mh, (kh + 1):k]; A21 = @view A[(mh + 1):m, 1:kh]; A22 = @view A[(mh + 1):m, (kh + 1):k]
     B11 = @view Bm[1:kh, 1:nh]; B12 = @view Bm[1:kh, (nh + 1):n]; B21 = @view Bm[(kh + 1):k, 1:nh]; B22 = @view Bm[(kh + 1):k, (nh + 1):n]
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
-    sTA, sTB, sP1, sP2, sP3, sP4, sP5, sP6, sP7, sU = _strassen_lvl_scratch(T, level, mh, nh, kh)
-    TA = _str_like(C, sTA); TB = _str_like(C, sTB); U = _str_like(C, sU)
-    P1 = _str_like(C, sP1); P2 = _str_like(C, sP2); P3 = _str_like(C, sP3); P4 = _str_like(C, sP4)
-    P5 = _str_like(C, sP5); P6 = _str_like(C, sP6); P7 = _str_like(C, sP7)
+    TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
     @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z)   # S1,T1 → P5
     @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z)   # S2,T2 → P6
@@ -2986,15 +3036,24 @@ function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
     p = 1 << D
     mp = cld(m, p) * p; np = cld(n, p) * p; kp = cld(k, p) * p
     a = convert(T, alpha); b = convert(T, beta)
-    if mp == m && np == n && kp == k                       # already clean — recurse in place (β applied at top)
-        _strassen_rec!(C, A, B, D, 0, a, b)
-    else                                                   # odd/awkward: pad to even^D with zeros, copy back
-        Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
-        fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= A
-        fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= B
-        _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
-        Cv = @view Cp[1:m, 1:n]
-        iszero(b) ? (@inbounds @. C = a * Cv) : (@inbounds @. C = a * Cv + b * C)
+    # ONE CONTAINER WORLD for the whole recursion (see the note on `_strassen_rec!`). The operands are
+    # already known strided here — the dispatch site in `_gemm_core!` tests `_strided1` on all three
+    # before routing to Strassen at all — so `_pm` is exactly the normalisation `_gemm_real_dims!`
+    # applies one level further down anyway. Roots come from `_root`, not the handles, which is why the
+    # `GC.@preserve` names rA/rB/rC and not the `PtrMatrix`es.
+    rA = _root(A); rB = _root(B); rC = _root(C)
+    GC.@preserve rA rB rC begin
+        pA = _pm(A); pB = _pm(B); pC = _pm(C)
+        if mp == m && np == n && kp == k                   # already clean — recurse in place (β applied at top)
+            _strassen_rec!(pC, pA, pB, D, 0, a, b)
+        else                                               # odd/awkward: pad to even^D with zeros, copy back
+            Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
+            fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= pA
+            fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= pB
+            _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
+            Cv = @view Cp[1:m, 1:n]
+            iszero(b) ? (@inbounds @. pC = a * Cv) : (@inbounds @. pC = a * Cv + b * pC)
+        end
     end
     return C
 end
@@ -3122,10 +3181,13 @@ end
                 # cache-hostile in exactly the direction the recursion then reads.
                 # SHAPES. With tB, op(B) is k×n, so B itself is stored n×k. `_transpose_dense!(At, A,
                 # m, k)` is documented as A::(k×m) -> At::(m×k) column-major, so mapping A:=B gives
-                # its k:=n and its m:=k — i.e. the call below. `Bt` is an exact k×n Matrix, whose
-                # storage IS that column-major layout, so `vec` aliases it with no copy.
+                # its k:=n and its m:=k — i.e. the call below. `Bt` is now a k×n `PtrMatrix` over a
+                # grow-only flat slot at ld == k, so its storage IS that column-major layout and a
+                # `PtrVector` over the same pointer aliases it with no copy. (`vec` would not: on a
+                # non-`Array` it builds a `ReshapedArray` — a heap header per call, and off the fast
+                # path — which is the whole reason this takes the pointer explicitly.)
                 Bt = _strassen_bt(Float64, k, n)
-                _transpose_dense!(vec(Bt), B, k, n)
+                _transpose_dense!(PtrVector(pointer(Bt), k * n), B, k, n)
                 return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
             end
         end
