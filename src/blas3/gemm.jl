@@ -374,7 +374,10 @@ end
 
 # Transpose A (k×m, the transA='T' operand) into `At` (m×k, column-major) via the W×W SIMD block
 # transpose — so the unpacked microkernel can run it as a plain N·N product (no B-packing). At[i,p]=A[p,i].
-@inline function _transpose_dense!(At::Vector{T}, A, m::Int, k::Int) where {T}
+# `AbstractVector`, not `Vector`: the transB-Strassen caller now hands a `PtrVector` over the grow-only
+# `strbt` slot. Everything in the body goes through `pointer`/`setindex!`, which both containers provide
+# identically, and `PtrVector` is `IndexLinear` — so this widening costs the `Vector` callers nothing.
+@inline function _transpose_dense!(At::AbstractVector{T}, A, m::Int, k::Int) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); ov = Vec{W, T}(one(T))
     mfull = (m ÷ W) * W; kfull = (k ÷ W) * W
     GC.@preserve A At begin
@@ -2875,24 +2878,26 @@ end
 # are views (tiny headers, negligible at Strassen's large n). Dims must be divisible by 2^depth (the
 # entry pads odd/awkward sizes). Verified symbolically + numerically (~1e-14 vs the OB oracle).
 #
-# KEEP THE RECURSION MONOMORPHIC (req#10). `_strassen_lvl_scratch` hands back `Matrix{T}`, and a quadrant
-# `@view` of a `Matrix` is a `SubArray{…,Matrix}` — two container types, closed under sub-viewing, which
-# is the world the Float64 entry lives in and it infers cleanly. `_gemm_dual3!` instead passes `PtrMatrix`
-# planes, whose sub-views are `PtrMatrix`; pairing those operands with `Matrix` scratch multiplies the
-# child signatures level by level until inference gives up and the recursion BOXES its own quadrant
-# handles. Measured (`bench/probes/strassen_container_ab.jl`), same buffers, same n, only the handle type
-# differing: `Matrix` 0 B, `PtrMatrix` 448 B at n=512 and 1792 B at n=1024 — ×3 plane products = exactly
-# the 1344 B / 5376 B dual `gemm!` was leaking per call.
-# So match the scratch to the operand container: each world stays closed under sub-viewing and one
-# signature serves every level. `Matrix` operands take the identity, so the Float64 path's broadcast
-# codegen and its large-n gate behaviour are untouched — which is what the note on `_gemm_real_dims!`
-# above was protecting.
-@inline _str_like(::AbstractMatrix, M::Matrix) = M
-@inline function _str_like(::PtrMatrix, M::Matrix{T}) where {T}
-    # Exact-sized and contiguous by construction (`_str_fit!` reallocates on any shape mismatch), so
-    # ld == rows. Rooted for the call by the pool vector `_l3ws(T).str` itself, not by this handle.
-    return PtrMatrix(pointer(M), size(M, 1), size(M, 2), size(M, 1))
-end
+# KEEP THE RECURSION MONOMORPHIC (req#10), AND IN ONE CONTAINER WORLD. Each world is closed under
+# sub-viewing on its own — `Matrix` operands give `SubArray{…,Matrix}` quadrants that collapse back to
+# themselves, `PtrMatrix` operands give `PtrMatrix` quadrants — but MIXING them multiplies the seven
+# recursive call sites' signature combinations level by level until inference gives up and the recursion
+# BOXES its own quadrant handles. Measured (`bench/probes/strassen_container_ab.jl`), same buffers, same
+# n, only the handle type differing: matched 0 B, mixed 448 B at n=512 and 1792 B at n=1024 — ×3 plane
+# products = exactly the 1344 B / 5376 B dual `gemm!` was leaking per call.
+#
+# `9b8e8463` fixed that by matching the scratch to whichever world the operands arrived in. This goes
+# further and removes the second world: the entry below normalises A/B/C to `PtrMatrix` and
+# `_strassen_lvl_scratch` now hands back `PtrMatrix` too, so there is exactly ONE signature at every
+# level for every element type. It is a strictly smaller surface — no bridge function, no per-operand
+# dispatch — and it is what lets the scratch pool become grow-only flat slots, which is in turn what
+# makes `gemm!`'s no-allocation proof honest (see `_ws_grow!` in workspace.jl).
+#
+# The cost of putting the fifteen O(n²) Winograd combines on `PtrMatrix` was MEASURED first, because the
+# note on `_gemm_real_dims!` above exists to protect exactly this codegen (galen, Zen3,
+# `bench/probes/ptrmat_broadcast_cost.jl`, PtrMatrix/Matrix): a plain `@. C = A + B` is 0.997–0.988 at
+# n=256…2048, and the fused `@. C = α*(A+B+C)` shape the epilogue actually writes is 0.50–0.82, i.e.
+# faster. It is not a tax.
 function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) where {T}
     if depth == 0
         return _gemm_real_dims!(false, false, size(C, 1), size(C, 2), size(A, 2), alpha, beta, A, Bm, C)
@@ -2901,10 +2906,7 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
     A11 = @view A[1:mh, 1:kh]; A12 = @view A[1:mh, (kh + 1):k]; A21 = @view A[(mh + 1):m, 1:kh]; A22 = @view A[(mh + 1):m, (kh + 1):k]
     B11 = @view Bm[1:kh, 1:nh]; B12 = @view Bm[1:kh, (nh + 1):n]; B21 = @view Bm[(kh + 1):k, 1:nh]; B22 = @view Bm[(kh + 1):k, (nh + 1):n]
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
-    sTA, sTB, sP1, sP2, sP3, sP4, sP5, sP6, sP7, sU = _strassen_lvl_scratch(T, level, mh, nh, kh)
-    TA = _str_like(C, sTA); TB = _str_like(C, sTB); U = _str_like(C, sU)
-    P1 = _str_like(C, sP1); P2 = _str_like(C, sP2); P3 = _str_like(C, sP3); P4 = _str_like(C, sP4)
-    P5 = _str_like(C, sP5); P6 = _str_like(C, sP6); P7 = _str_like(C, sP7)
+    TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
     @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z)   # S1,T1 → P5
     @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z)   # S2,T2 → P6
@@ -2940,15 +2942,24 @@ function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
     p = 1 << D
     mp = cld(m, p) * p; np = cld(n, p) * p; kp = cld(k, p) * p
     a = convert(T, alpha); b = convert(T, beta)
-    if mp == m && np == n && kp == k                       # already clean — recurse in place (β applied at top)
-        _strassen_rec!(C, A, B, D, 0, a, b)
-    else                                                   # odd/awkward: pad to even^D with zeros, copy back
-        Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
-        fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= A
-        fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= B
-        _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
-        Cv = @view Cp[1:m, 1:n]
-        iszero(b) ? (@inbounds @. C = a * Cv) : (@inbounds @. C = a * Cv + b * C)
+    # ONE CONTAINER WORLD for the whole recursion (see the note on `_strassen_rec!`). The operands are
+    # already known strided here — the dispatch site in `_gemm_core!` tests `_strided1` on all three
+    # before routing to Strassen at all — so `_pm` is exactly the normalisation `_gemm_real_dims!`
+    # applies one level further down anyway. Roots come from `_root`, not the handles, which is why the
+    # `GC.@preserve` names rA/rB/rC and not the `PtrMatrix`es.
+    rA = _root(A); rB = _root(B); rC = _root(C)
+    GC.@preserve rA rB rC begin
+        pA = _pm(A); pB = _pm(B); pC = _pm(C)
+        if mp == m && np == n && kp == k                   # already clean — recurse in place (β applied at top)
+            _strassen_rec!(pC, pA, pB, D, 0, a, b)
+        else                                               # odd/awkward: pad to even^D with zeros, copy back
+            Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
+            fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= pA
+            fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= pB
+            _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
+            Cv = @view Cp[1:m, 1:n]
+            iszero(b) ? (@inbounds @. pC = a * Cv) : (@inbounds @. pC = a * Cv + b * pC)
+        end
     end
     return C
 end
@@ -3076,10 +3087,13 @@ end
                 # cache-hostile in exactly the direction the recursion then reads.
                 # SHAPES. With tB, op(B) is k×n, so B itself is stored n×k. `_transpose_dense!(At, A,
                 # m, k)` is documented as A::(k×m) -> At::(m×k) column-major, so mapping A:=B gives
-                # its k:=n and its m:=k — i.e. the call below. `Bt` is an exact k×n Matrix, whose
-                # storage IS that column-major layout, so `vec` aliases it with no copy.
+                # its k:=n and its m:=k — i.e. the call below. `Bt` is now a k×n `PtrMatrix` over a
+                # grow-only flat slot at ld == k, so its storage IS that column-major layout and a
+                # `PtrVector` over the same pointer aliases it with no copy. (`vec` would not: on a
+                # non-`Array` it builds a `ReshapedArray` — a heap header per call, and off the fast
+                # path — which is the whole reason this takes the pointer explicitly.)
                 Bt = _strassen_bt(Float64, k, n)
-                _transpose_dense!(vec(Bt), B, k, n)
+                _transpose_dense!(PtrVector(pointer(Bt), k * n), B, k, n)
                 return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
             end
         end
