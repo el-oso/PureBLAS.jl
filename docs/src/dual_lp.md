@@ -365,7 +365,8 @@ still same-count + same-multiset against the baseline. Same treatment for `_sytr
 `_TRDWork{T}()` fallback from `c6a9ef19` is gone, non-BlasReal reals borrow `W`/`tmp` (`_sytrd_blocked!`); a Dual no
 longer reaches it at all. **Still allocating, pre-existing and on every type including Float64:** `_sytd2_lower!`
 builds its `v`/`w` scratch per call (192 B on Float16, 640 B on a Dual at n=96 via the blocked tail) — that is
-shipped Float64 code and gets its own byte-identity pass, not a side effect here.
+shipped Float64 code and gets its own byte-identity pass, not a side effect here. **CLOSED in `9b8e8463`;
+see §11.2** — both leaves now borrow from the arena, 0 B on Float64/ComplexF64/Dual, `syev` unchanged.
 
 Byte identity (`dual_qr_native.jl`, `dual_syev_native.jl`; Float64, Float32, ComplexF64, ComplexF32): every
 instantiation of the edited functions is identical or same-count+same-multiset. The probe flags `_latrd_lower!`,
@@ -374,3 +375,83 @@ of which were edited — and **the unedited master tree reproduces the same cell
 fresh processes** (3051 vs 3020 for `_latrd_lower!` Float64), so for those large drivers instruction COUNT is
 process drift too, not just order. Seed independence (`dual_seed_independence.jl`, `syev_dual_verify.jl`): clean;
 the planar `_syev!` has no dual comparison left to leak through.
+
+## 11. Fleet result and the two `!`-contract fixes (2026-09-14, `9b8e8463`)
+
+### 11.1 The DLP/DL3 gate, all three boxes, after the planar `_syev!` and pair-tagged panel
+
+Measured on the fleet under a verified lock (2794 / 3674 / 1972 MHz achieved under load), `arms=pb,generic`
+so both arms are recorded in the SAME run — which is why these cells carry no anchor question at all,
+unlike the `arms=pb` real groups. Published geomean (worst cell):
+
+| row | Zen3 · galen | Zen4 · wintermute | Zen5 · neuromancer |
+|---|---|---|---|
+| `dsyev1` | 1.15 (0.67) → **1.85 (1.69)** | 1.12 (0.66) → **1.92 (1.75)** | 1.13 (0.69) → **1.97 (1.72)** |
+| `dgeqrf1` | 2.08 (0.87) → **3.11 (2.09)** | 2.16 (0.82) → **2.69 (1.82)** | 2.24 (0.79) → **2.78 (1.77)** |
+| `dgemm1` | 8.21 (1.85) → 8.29 (1.87) | 8.13 (2.33) → 8.33 (2.31) | 7.61 (2.32) → 7.70 (2.49) |
+
+`dsyev1` per cell is now **flat in n** on every box — 1.88/1.86/1.85/1.80/1.69 (Zen3),
+1.96/1.90/1.96/1.92/1.75 (Zen4), 2.00/1.97/2.03/1.88/1.72 (Zen5) at n = 32/50/100/128/256. The curve that
+motivated req#9 — monotonically falling to 0.66–0.69 and therefore *slower than the generic fallback it
+replaces* — is gone. No dual cell on any box is below gate.
+
+### 11.2 `_sytd2_lower!` / `_hetd2_lower!`: the allocation §8 left open is closed
+
+§8 recorded `_sytd2_lower!` building `v`/`w` per call as "shipped Float64 code, gets its own pass". That
+pass is this one. Both the symmetric and the Hermitian leaf now open a `@scope` and `borrow!`, opened in
+the LEAF rather than at the two call sites so one borrow covers both reach paths (the whole reduction
+when `n ≤ 2·nb`, and the tail of every blocked `_sytrd_lower!`); nesting inside the non-BlasReal `@scope`
+in `_sytrd_lower!` is fine, each scope rewinds its own bump.
+
+`bench/probes/sytd2_alloc.jl`, leaf and driver, n = 48 and 256: **0 B on Float64, ComplexF64 and Dual**,
+spectrum residual ≤ 3.3e-15 on all three. Per req#9 the speed is stated too, and it is a null result:
+published `syev` is 1.41 → 1.40 / 1.46 → 1.46 / 1.34 → 1.34 across the fleet, i.e. unchanged.
+
+### 11.3 Dual `gemm!` was leaking 1344 B at n≥512, and the cause was not the one in the code
+
+Per call at steady state: 1344 B at n=512 **and n=600** (so not a power-of-two effect), 5376 B at n=1024,
+Dual only. `Profile.Allocs` at `sample_rate=1` put it inside `_strassen_rec!` and named the boxed types —
+`SubArray{Float64,2,Matrix{Float64}}` and, tellingly, `PtrMatrix{Float64}`, an ISBITS handle built
+precisely to avoid a heap header.
+
+It is a container-type MIX. Each world is closed under sub-viewing on its own: `Matrix` operands give
+`SubArray{…,Matrix}` quadrants that collapse back to themselves, `PtrMatrix` operands give `PtrMatrix`
+quadrants. But `_gemm_dual3!` passes `PtrMatrix` planes while `_strassen_lvl_scratch` hands back `Matrix`,
+so every level pairs the two and the seven recursive call sites' signature combinations multiply level by
+level until inference gives up. The A/B that settles it varies only the handle:
+
+| n | `_strassen_depth` | Matrix handles | PtrMatrix handles |
+|---|---|---|---|
+| 512 | 2 | 0 B | 448 B |
+| 1024 | 3 | 0 B | 1792 B |
+
+448 × 3 plane products = 1344; 1792 × 3 = 5376. Exact, both sizes. Matching the scratch to the operand
+container (`_str_like`) closes each world and one signature serves every level.
+
+**The first diagnosis — "depth 3 makes SubArray headers" — predicted the Matrix arm would leak too, and it
+measures 0 B.** That is why the A/B was run instead of the reading being shipped.
+
+Speed, per req#9, by controlled same-process A/B on galen (PB arm only, since nothing else changes; a
+cross-run comparison against a cached `generic` arm would not be adjudicable):
+
+| n | before `779e4051` | after | ratio |
+|---|---|---|---|
+| 256 | 2.097 ms | 2.003 ms | 0.955 |
+| 512 | 15.235 ms | 14.936 ms | 0.980 |
+| 1024 | 117.10 ms | 114.997 ms | 0.982 |
+| 2048 | 835.73 ms | 830.27 ms | 0.993 |
+
+Faster at every size, 0.7–4.5%. The Float64 path is untouched and that is verified rather than argued:
+`code_native` on `_strassen_rec!` specialized for `Matrix` arguments is 18478 instructions with an
+identical opcode multiset before and after, only the per-process label symbol differing.
+
+### 11.4 What is still open
+
+`gemm!`, `syrk!` and `trmm!` still cannot carry a **static** `@test_noalloc` on any element type. That is
+not this defect: AllocCheck proves ALL paths, and `_strassen_lvl_scratch`'s lazily sized `Vector{Matrix}`
+pool is counted even where it is runtime-dead. The two escapes are deleting the allocation site or
+registering a genuine high-water barrier, and the pool is neither today — it re-allocates on shape
+mismatch by design. Putting that scratch on the arena would make `_arena_grow!` the single barrier, and
+the broadcast cost of the `PtrMatrix` handles that route implies has been measured and is not a
+blocker (equal on a plain add, 0.50–0.82× on the fused combine, i.e. faster). Until then the instrument
+matching req#10 for BLAS-3 is a warmed runtime assertion, not the static proof.
