@@ -381,8 +381,7 @@ the planar `_syev!` has no dual comparison left to leak through.
 ### 11.1 The DLP/DL3 gate, all three boxes, after the planar `_syev!` and pair-tagged panel
 
 Measured on the fleet under a verified lock (2794 / 3674 / 1972 MHz achieved under load), `arms=pb,generic`
-so both arms are recorded in the SAME run — which is why these cells carry no anchor question at all,
-unlike the `arms=pb` real groups. Published geomean (worst cell):
+so both arms are recorded in the SAME run, as the dual groups require. Published geomean (worst cell):
 
 | row | Zen3 · galen | Zen4 · wintermute | Zen5 · neuromancer |
 |---|---|---|---|
