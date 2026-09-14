@@ -229,8 +229,12 @@ function _round_med(qs::ArmData)
     end
     return median(qs[_ARM_PB]) * 1.0e6
 end
+# A THIRD, DERIVED view — not a reference arm. It divides by whichever of `_REF_ALL` is faster at each
+# cell (see `_series`), so it draws the gate itself. It is NOT in `_VIEWS`: nothing is measured against
+# it and it has no gen_table of its own (the coverage table already reports this exact number).
+const _GATE_VIEW = "gate"
 _refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" :
-    r == "generic" ? "LinearAlgebra generic" : "OpenBLAS"
+    r == "generic" ? "LinearAlgebra generic" : r == _GATE_VIEW ? "faster of OpenBLAS and AOCL" : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -2323,8 +2327,24 @@ function _series(g, gk, op, ref::AbstractString = REFBK)
     isnothing(i) && return nothing
     out = Tuple{Int, Vector{Float64}}[]
     for (s, cell) in ops[i].second
-        (haskey(cell, ref) && haskey(cell, _ARM_PB)) || continue
-        push!(out, (s, _ratio(cell[ref].q, cell[_ARM_PB].q)))
+        haskey(cell, _ARM_PB) || continue
+        if ref == _GATE_VIEW
+            # THE GATE, drawn: per cell, divide by whichever reference is FASTER — i.e. the one with the
+            # smaller PB/ref median — which is `max(OpenBLAS, AOCL)` from req#1 and exactly the reference
+            # `bench/cellratios.jl` and the coverage table pick. Chosen PER SIZE, so one panel can switch
+            # references along its x-axis; that is correct, because the gate does too. Without this view a
+            # red coverage cell can be invisible on the OpenBLAS plot and only show on the AOCL one.
+            best = nothing
+            for r in _REF_ALL
+                haskey(cell, r) || continue
+                v = _ratio(cell[r].q, cell[_ARM_PB].q)
+                (isnothing(best) || median(v) < median(best)) && (best = v)
+            end
+            isnothing(best) || push!(out, (s, best))
+        else
+            haskey(cell, ref) || continue
+            push!(out, (s, _ratio(cell[ref].q, cell[_ARM_PB].q)))
+        end
     end
     return out
 end
@@ -2561,6 +2581,23 @@ else
             println(io, "\n### Dual (ForwardDiff, N=1) — reference is LinearAlgebra generic, NOT a vendor BLAS\n\n", gen_table(fleet, ["DL1", "DL2", "DL3", "DLP"], "generic"))
         end
         println("wrote gen_table$(suf)$L.md  (fleet: ", join((m.slug for (m, _) in fleet), ", "), ")")
+    end
+    # THE GATE VIEW — rendered once per real/complex group, outside the reference loop, for the same reason
+    # DL1 is below: it is not a reference arm, so rendering it inside `_VIEWS` would draw it twice. It exists
+    # because the coverage table reports `max(OpenBLAS, AOCL)` while each reference plot shows one library,
+    # so a red table cell could be invisible on the plot a reader looks at first (zgetrf n=50 on Zen4:
+    # 1.39 on the OpenBLAS plot, 0.83 on the AOCL plot, 0.83 in the table). MKL runs have one reference,
+    # where this view would only duplicate the MKL plot, so it is skipped there.
+    if REFBK != "mkl"
+        for (gk, base, ttl) in (
+                ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+                ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
+                ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
+                ("CLP", "clapack", "Complex LAPACK"),
+            )
+            svg_panels(joinpath(adir, "perf_$(base)$(_refsuf(_GATE_VIEW))$L.svg"),
+                "$ttl — PB / $(_refname(_GATE_VIEW)) (the gate)", fleet, gk, _GATE_VIEW)
+        end
     end
     # DL1 IS RENDERED ONCE, OUTSIDE THE VIEW LOOP, AND THAT IS THE WHOLE POINT. `_VIEWS` is the two
     # vendor references, and every other group legitimately has one panel per view. DL1 has neither

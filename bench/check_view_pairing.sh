@@ -23,12 +23,20 @@ for f in "${!seen[@]}"; do
         # fails every dual publish demanding a file that is not supposed to exist — which is exactly
         # what it did on ef76dac2, the first commit to move perf_dl3/perf_dlp on their own.
         docs/src/assets/perf_dl*.svg) continue ;;
-        *_aocl.svg) other="${f%_aocl.svg}.svg" ;;
-        *)          other="${f%.svg}_aocl.svg" ;;
+        *_aocl.svg) base="${f%_aocl.svg}" ;;
+        *_gate.svg) base="${f%_gate.svg}" ;;
+        *)          base="${f%.svg}" ;;
     esac
-    [ -n "${seen[$other]:-}" ] && continue
-    echo "UNPAIRED: $f changed but $other did not"
-    rc=1
+    # A real/complex plot is a SET OF THREE rendered from one cache in one invocation: the OpenBLAS view,
+    # the AOCL view, and the gate view (per cell, the faster of the two — `_GATE_VIEW` in plots.jl). All
+    # three must move together, or the page shows a gate plot that disagrees with the reference plots
+    # beside it about the same fleet.
+    for other in "$base.svg" "${base}_aocl.svg" "${base}_gate.svg"; do
+        [ "$other" = "$f" ] && continue
+        [ -n "${seen[$other]:-}" ] && continue
+        echo "UNPAIRED: $f changed but $other did not"
+        rc=1
+    done
 done
 if [ $rc -ne 0 ]; then
     cat <<'MSG'
