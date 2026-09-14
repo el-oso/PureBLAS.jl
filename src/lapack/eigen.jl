@@ -10,14 +10,32 @@
 # One Householder reflector per column; essential vᵢ stored in A[i+2:n, i] (vᵢ[1]≡1 implicit at row i+1),
 # tau[i] the standard LAPACK τ. The trailing symmetric matvec is PureBLAS symv! (the memory-bound half of
 # the 4/3·n³ flops). Copies dsytd2's τ/2 half-correction verbatim (w += (−τ/2·(wᵀv))·v).
+#
+# `v`/`w` come from the arena, not from two fresh `Vector{T}` per call (req#10). This was a defect on
+# EVERY element type, Float64 included — 640 B/call at Dual n=96 — and it is reachable two ways: as the
+# whole reduction when `n ≤ 2·nb`, and as the tail of `_sytrd_blocked!` on every blocked solve. The scope
+# is opened HERE rather than at the two call sites so both are covered by one borrow; nesting inside the
+# non-BlasReal `@scope` in `_sytrd_lower!` is fine — each scope rewinds its own bump.
 function _sytd2_lower!(
         A::AbstractMatrix{T}, d::AbstractVector{T},
         e::AbstractVector{T}, tau::AbstractVector{T}
     ) where {T <: Real}
     n = size(A, 1)
     n == 0 && return
-    v = Vector{T}(undef, n)
-    w = Vector{T}(undef, n)
+    @scope arn begin
+        v = borrow!(arn, T, n)
+        w = borrow!(arn, T, n)
+        _sytd2_lower_body!(A, d, e, tau, v, w, n)
+    end
+    return
+end
+
+# The body over supplied `v`/`w` scratch. `@inline` so the borrowed `PtrVector` handles fold in exactly
+# as the old `Vector` locals did.
+@inline function _sytd2_lower_body!(
+        A::AbstractMatrix{T}, d::AbstractVector{T},
+        e::AbstractVector{T}, tau::AbstractVector{T}, v, w, n::Int
+    ) where {T <: Real}
     @inbounds for i in 1:(n - 1)
         m = n - i
         col = view(A, (i + 1):n, i)
@@ -581,8 +599,18 @@ function _hetd2_lower!(
     ) where {T <: Complex, R <: Real}
     n = size(A, 1)
     n == 0 && return
-    v = Vector{T}(undef, n)
-    w = Vector{T}(undef, n)
+    @scope arn begin                              # arena, not two fresh Vectors per call — same req#10
+        v = borrow!(arn, T, n)                    # defect as `_sytd2_lower!`, same two reach paths
+        w = borrow!(arn, T, n)
+        _hetd2_lower_body!(A, d, e, tau, v, w, n)
+    end
+    return
+end
+
+@inline function _hetd2_lower_body!(
+        A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R},
+        tau::AbstractVector{T}, v, w, n::Int
+    ) where {T <: Complex, R <: Real}
     @inbounds for i in 1:(n - 1)
         m = n - i
         col = view(A, (i + 1):n, i)
