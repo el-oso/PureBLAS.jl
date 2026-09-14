@@ -409,12 +409,22 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     return _getrf_core!(A, ipiv, nb)
 end
 
+# Panel width for the panel starting with `rem` columns left: a tail narrower than one vector width (W)
+# is FOLDED into this panel instead of becoming its own. A sub-W tail cannot use a full-width kernel in any
+# of its three calls (getf2, trsm, gemm), so it pays their entry and edge costs for almost no work.
+# Paired A/B, nb=n / nb=48 (bench/probes/tail_merge_crossover.jl), tail r = n − 48:
+#   Zen4 W=8:  r=1 0.952  2 0.919  4 0.878  7 0.894 | 8 0.982  12 0.964  16 0.940  24 1.009  40 1.015
+#   Zen3 W=4:  r=1 0.954  2 0.977  4 0.970  7 0.994 | 8 1.021  12 1.206  24 1.197  40 1.141
+# Wider merges win on Zen4 and lose up to 20% on Zen3, so the bound is W, not a fraction of nb.
+# BOTH loops in `_getrf_core!` must use this — the deferred laswp replays the same partition.
+@inline _lu_pb(rem::Int, nb::Int) = rem < nb + _CHOLW ? rem : nb
+
 function _getrf_core!(A, ipiv, nb::Int)
     m, n = size(A); k = min(m, n)
     nb = clamp(nb, 1, k)
     info = 0; pc = 1
     @inbounds while pc <= k
-        pb = min(nb, k - pc + 1); mp = m - pc + 1
+        pb = _lu_pb(k - pc + 1, nb); mp = m - pc + 1
         pinfo = _getf2!(view(A, pc:m, pc:(pc + pb - 1)), mp, pb, pc - 1, ipiv, pc - 1)
         (info == 0 && pinfo != 0) && (info = pinfo)
         jt0 = pc + pb
@@ -438,7 +448,7 @@ function _getrf_core!(A, ipiv, nb::Int)
     # large-n laswp killer). Same permutation, reordered: column j gets ipiv from panels after its own.
     pc = 1
     @inbounds while pc <= k
-        pb = min(nb, k - pc + 1); jt0 = pc + pb
+        pb = _lu_pb(k - pc + 1, nb); jt0 = pc + pb
         jt0 <= k && _laswp!(A, ipiv, jt0, k, pc, pc + pb - 1)
         pc += pb
     end

@@ -23,13 +23,16 @@
 # PDM: Literal — call-overhead vs vectorised-work crossover, measured Zen4 ONLY; needs fleet validation.
 const _PPTRF_TPSV_MIN = 32
 
-# Block width for the blocked lower packed factorisation. PDM tier: PIN-able, default DERIVED from the
-# same criterion dense LU/Cholesky use — this faces the identical panel-vs-trailing-BLAS-3 tradeoff, so
-# it inherits `_lu_nb`'s validated shape rather than introducing a second unvalidated formula (req#8b).
-# NOTE the copy traffic is n³/(6·nb), so a LARGER nb is cheaper on copies but shrinks the BLAS-3
-# trailing update; this is the knob to sweep first if the blocked path underperforms.
-# PDM: Literal — own panel width, borrows _LU_NB, which is itself a falsified derivation. | tune: candidate
-const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", _LU_NB)::Int
+# Block width for the blocked packed factorisation. DEFAULT: the WHOLE matrix — one unpack, dense
+# `potrf!`, one repack. The dense Cholesky is already blocked and SIMD-tuned; re-blocking it over packed
+# storage only adds per-panel unpack/repack traffic and a trsm + trailing gemm the dense kernel does better.
+# The old default borrowed `_LU_NB` = 48 and was never swept. Paired A/B, Zen4, pptrfL, nb=n / nb=48:
+#   n=49..95 0.74–0.87 (every r = n−48 in 1..47), 96 0.772, 128 0.825, 192 0.728, 256 0.786, 512 0.741,
+#   1024 0.761;  nb=128 / nb=48: 0.849 @192, 0.973 @256, 0.961 @512, 0.934 @1024;  nb=256: 1.021 @512.
+# (bench/probes/tail_merge_crossover.jl, pptrf_nb_scan.jl.) Cost: the scratch is n×n instead of 2·n·48.
+# PDM: Exempt — 0 is the "whole matrix" sentinel; a positive pin restores a fixed panel width. | tune: n/a
+const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", 0)::Int   # req8-ok: sentinel, not a tuning value
+@inline _pptrf_nb(n::Int) = _PPTRF_BLK_NB > 0 ? min(_PPTRF_BLK_NB, n) : n
 
 # Smallest n where unpacking pays. MEASURED: 2.26× at n=32 (bench/probes/pptrf_unpack_strategy.jl), so
 # the crossover is below 32; it has NOT been measured between 8 and 32, and this value is provisional
@@ -269,7 +272,7 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
     n = _pp_order(length(AP))
     if uplo == 'U'
         Tu = eltype(AP)
-        nbu = min(_PPTRF_BLK_NB, n)
+        nbu = _pptrf_nb(n)
         # `_dense1(AP)`, not the inline `AP isa StridedVector && stride(AP,1)==1`: `{s,d,c,z}pptrf_64_`
         # builds a `PtrVector` over the caller's packed buffer (cabi_lapack.jl), and `PtrVector` is not in
         # the closed `StridedVector` union — so every C-ABI `pptrf` skipped this whole BLOCKED arm and took
@@ -282,8 +285,9 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
             # padding rule either — its `ld` was just the grown row count.
             @scope arn begin
                 R = borrow!(arn, Tu, nbu, n)
-                V = borrow!(arn, Tu, n, nbu)
-                return _pptrf_upper_blocked!(AP, n, nbu, R, V)
+                # One panel (nbu == n) has no trailing update, so V is never read: pass R, borrow nothing.
+                return nbu == n ? _pptrf_upper_blocked!(AP, n, nbu, R, R) :
+                    _pptrf_upper_blocked!(AP, n, nbu, R, borrow!(arn, Tu, n, nbu))
             end
         end
         # Left-looking, exactly as dpptrf.f does it: per column, ONE packed triangular solve
@@ -322,20 +326,17 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         # so the trailing triangle of order n-j is exactly the contiguous tail AP[_pp_l(j+1,j+1,n):end]
         # and the multiplier column is the contiguous run AP[_pp_l(j+1,j,n) .. _pp_l(n,j,n)] — spr!/hpr!
         # can take both as views with no packing or copy.
-        # Blocked path when it can pay: it needs at least one full panel plus a trailing block to
-        # amortise the unpack, hence n > 2·nb. Everything else (AD eltypes, strided/offset vectors,
-        # small n) keeps the unblocked kernel unchanged.
+        # Unpacked path for n ≥ _PPTRF_BLK_MIN; by default ONE panel (see `_PPTRF_BLK_NB`), i.e. exactly
+        # unpack→dense potrf!→repack. Everything else (AD eltypes, strided/offset vectors, small n) keeps
+        # the unblocked kernel unchanged.
         T = eltype(AP)
-        # nb is CLAMPED to n: for n ≤ nb the loop degenerates to a single panel, i.e. exactly
-        # unpack→dense potrf!→repack, which is the 2.26× case measured at n=32. Gating on n > 2·nb
-        # would have excluded n=32 and n=48 — the very cells that miss the gate — so the threshold is
-        # on where the copy starts to amortise, not on having a trailing block.
-        nb = min(_PPTRF_BLK_NB, n)
+        nb = _pptrf_nb(n)
         if T <: BlasFloat && _dense1(AP) && n >= _PPTRF_BLK_MIN   # `_dense1`: see the uplo='U' arm above
-            @scope arn begin                       # two n×nb borrows, exact ld — see the uplo='U' arm
+            @scope arn begin                       # n×nb borrows, exact ld — see the uplo='U' arm
                 W = borrow!(arn, T, n, nb)
-                V = borrow!(arn, T, n, nb)
-                _pptrf_lower_blocked!(AP, n, nb, W, V)
+                # one panel (nb == n): no trailing update, V is never read — see the uplo='U' arm
+                nb == n ? _pptrf_lower_blocked!(AP, n, nb, W, W) :
+                    _pptrf_lower_blocked!(AP, n, nb, W, borrow!(arn, T, n, nb))
             end
         else
             _pptrf_lower!(AP, n, _pptrf_spr_min(T))
