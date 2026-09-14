@@ -2874,6 +2874,25 @@ end
 # α=1,β=0; the top-level combine applies α,β. Buffers come from the per-level workspace pool; quadrants
 # are views (tiny headers, negligible at Strassen's large n). Dims must be divisible by 2^depth (the
 # entry pads odd/awkward sizes). Verified symbolically + numerically (~1e-14 vs the OB oracle).
+#
+# KEEP THE RECURSION MONOMORPHIC (req#10). `_strassen_lvl_scratch` hands back `Matrix{T}`, and a quadrant
+# `@view` of a `Matrix` is a `SubArray{…,Matrix}` — two container types, closed under sub-viewing, which
+# is the world the Float64 entry lives in and it infers cleanly. `_gemm_dual3!` instead passes `PtrMatrix`
+# planes, whose sub-views are `PtrMatrix`; pairing those operands with `Matrix` scratch multiplies the
+# child signatures level by level until inference gives up and the recursion BOXES its own quadrant
+# handles. Measured (`bench/probes/strassen_container_ab.jl`), same buffers, same n, only the handle type
+# differing: `Matrix` 0 B, `PtrMatrix` 448 B at n=512 and 1792 B at n=1024 — ×3 plane products = exactly
+# the 1344 B / 5376 B dual `gemm!` was leaking per call.
+# So match the scratch to the operand container: each world stays closed under sub-viewing and one
+# signature serves every level. `Matrix` operands take the identity, so the Float64 path's broadcast
+# codegen and its large-n gate behaviour are untouched — which is what the note on `_gemm_real_dims!`
+# above was protecting.
+@inline _str_like(::AbstractMatrix, M::Matrix) = M
+@inline function _str_like(::PtrMatrix, M::Matrix{T}) where {T}
+    # Exact-sized and contiguous by construction (`_str_fit!` reallocates on any shape mismatch), so
+    # ld == rows. Rooted for the call by the pool vector `_l3ws(T).str` itself, not by this handle.
+    return PtrMatrix(pointer(M), size(M, 1), size(M, 2), size(M, 1))
+end
 function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) where {T}
     if depth == 0
         return _gemm_real_dims!(false, false, size(C, 1), size(C, 2), size(A, 2), alpha, beta, A, Bm, C)
@@ -2882,7 +2901,10 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
     A11 = @view A[1:mh, 1:kh]; A12 = @view A[1:mh, (kh + 1):k]; A21 = @view A[(mh + 1):m, 1:kh]; A22 = @view A[(mh + 1):m, (kh + 1):k]
     B11 = @view Bm[1:kh, 1:nh]; B12 = @view Bm[1:kh, (nh + 1):n]; B21 = @view Bm[(kh + 1):k, 1:nh]; B22 = @view Bm[(kh + 1):k, (nh + 1):n]
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
-    TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
+    sTA, sTB, sP1, sP2, sP3, sP4, sP5, sP6, sP7, sU = _strassen_lvl_scratch(T, level, mh, nh, kh)
+    TA = _str_like(C, sTA); TB = _str_like(C, sTB); U = _str_like(C, sU)
+    P1 = _str_like(C, sP1); P2 = _str_like(C, sP2); P3 = _str_like(C, sP3); P4 = _str_like(C, sP4)
+    P5 = _str_like(C, sP5); P6 = _str_like(C, sP6); P7 = _str_like(C, sP7)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
     @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z)   # S1,T1 → P5
     @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z)   # S2,T2 → P6
