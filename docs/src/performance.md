@@ -16,6 +16,22 @@ OpenBLAS and
 against AOCL. [Methodology](methodology.md) covers how the measurements are taken and how to read a
 cell; [Notes](notes.md) has the per-routine analysis and history.
 
+## vs the gate
+
+These plots divide by whichever reference is faster at each point — `max(OpenBLAS, AOCL)`, the same
+number the coverage tables report. A point below the dashed line here is a real miss. The two sections
+after it show each library on its own, so a miss against AOCL can look like a comfortable win on the
+OpenBLAS plot; start here when you want to know where PureBLAS falls short.
+
+![BLAS-1 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_l1_gate.svg)
+![BLAS-2 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_l2_gate.svg)
+![BLAS-3 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_l3_gate.svg)
+![LAPACK — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_lapack_gate.svg)
+![Complex BLAS-1 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_cl1_gate.svg)
+![Complex BLAS-2 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_cl2_gate.svg)
+![Complex BLAS-3 — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_cl3_gate.svg)
+![Complex LAPACK — PB / faster of OpenBLAS and AOCL, three µarchs](assets/perf_clapack_gate.svg)
+
 ## vs OpenBLAS
 
 ![BLAS-1 — PB / OpenBLAS ratio per op, three µarchs](assets/perf_l1.svg)
