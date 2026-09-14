@@ -3204,7 +3204,7 @@ end
 #   _EXPINT[5]  trmm kc override (0 = derived default) — the AOCL/BLIS `bli_trmm_determine_kc` arm
 #   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
 #   _EXPINT[7]  zgemm 3M MIN override (0 = _CGEMM_3M_MIN) — tests 3M below the shipped window
-#   _EXPINT[8]  spare
+#   _EXPINT[8]  1 = restore the old `m >= _CHOLW` gate in `_trsm_dense_R!` (A/B arm; 0 ships: tile for any m)
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
@@ -3315,6 +3315,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
 #          Previously the `_trsm_cgt_L!` witness; stripped when that landed.
+#   _EXP15 INVERTED: set true to restore SCALAR m-tails in `_trsm_tile_R_f64!` (masked pass ships).
 #   (_EXP13 and _EXP15 were reused for the 3M band campaign — _EXP13 bypassed the unpacked branch,
 #    _EXP15 lowered the rank-k 3M edge — and are FREE AGAIN. Both were needed at once: with a single
 #    combined flag Zen4 compared 3M-vs-UNPACKED while Zen3 compared 3M-vs-PACKED, so the two apparent
@@ -4170,7 +4171,21 @@ end
             vstore(a0, _cvptr(pB, i, j0, ldb));     vstore(a1, _cvptr(pB, i, j0 + 1, ldb))
             vstore(a2, _cvptr(pB, i, j0 + 2, ldb)); vstore(a3, _cvptr(pB, i, j0 + 3, ldb)); i += W
         end
-        @inbounds while i <= m                               # m tail
+        # MASKED m tail, one pass, for 2..W-1 rows. ONE row stays scalar: the mask setup costs more than a
+        # single scalar row (Zen4 pptrfL, masked/scalar: 1 row 1.042, 2 rows 0.976, 3 0.931, 4 0.859, 7 0.786).
+        @inbounds if i < m && !_EXPFLAG[_EXP15]
+            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)  # inactive lanes are never accessed (no OOB)
+            a0 = vload(_CVF, _cvptr(pB, i, j0, ldb), msk);     a1 = vload(_CVF, _cvptr(pB, i, j0 + 1, ldb), msk)
+            a2 = vload(_CVF, _cvptr(pB, i, j0 + 2, ldb), msk); a3 = vload(_CVF, _cvptr(pB, i, j0 + 3, ldb), msk)
+            for l in solved
+                xv = vload(_CVF, _cvptr(pB, i, l, ldb), msk)
+                a0 = muladd(_CVF(-cf(j0, l)), xv, a0); a1 = muladd(_CVF(-cf(j0 + 1, l)), xv, a1)
+                a2 = muladd(_CVF(-cf(j0 + 2, l)), xv, a2); a3 = muladd(_CVF(-cf(j0 + 3, l)), xv, a3)
+            end
+            vstore(a0, _cvptr(pB, i, j0, ldb), msk);     vstore(a1, _cvptr(pB, i, j0 + 1, ldb), msk)
+            vstore(a2, _cvptr(pB, i, j0 + 2, ldb), msk); vstore(a3, _cvptr(pB, i, j0 + 3, ldb), msk); i = m + 1
+        end
+        @inbounds while i <= m                               # m tail (scalar; A/B arm only)
             for t in 0:(NC - 1)
                 s = unsafe_load(pB, _clidx(i, j0 + t, ldb))
                 for l in solved
@@ -4189,6 +4204,14 @@ end
                 end
                 unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, jj, ldb)); i += W
             end
+            if i < m && !_EXPFLAG[_EXP15]                    # masked for 2..W-1 rows (see doblock)
+                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
+                x = vload(_CVF, _cvptr(pB, i, jj, ldb), msk)
+                for u in rng
+                    x = muladd(_CVF(-cf(jj, j0 + u)), vload(_CVF, _cvptr(pB, i, j0 + u, ldb), msk), x)
+                end
+                unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, jj, ldb), msk); i = m + 1
+            end
             while i <= m
                 s = unsafe_load(pB, _clidx(i, jj, ldb))
                 for u in rng
@@ -4206,6 +4229,14 @@ end
                 x = muladd(_CVF(-cf(j, l)), vload(_CVF, _cvptr(pB, i, l, ldb)), x)
             end
             unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, j, ldb)); i += W
+        end
+        @inbounds if i < m && !_EXPFLAG[_EXP15]              # masked for 2..W-1 rows (see doblock)
+            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
+            x = vload(_CVF, _cvptr(pB, i, j, ldb), msk)
+            for l in solved
+                x = muladd(_CVF(-cf(j, l)), vload(_CVF, _cvptr(pB, i, l, ldb), msk), x)
+            end
+            unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, j, ldb), msk); i = m + 1
         end
         return @inbounds while i <= m
             s = unsafe_load(pB, _clidx(i, j, ldb))
@@ -4242,8 +4273,11 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     # borrows now, and a `PtrMatrix` is not a `StridedMatrix`. Without this the side-R solve falls to the
     # per-column `_axpy_simd!`/`_scal_simd_ptr!` loop instead of the tile kernel, which side-R takes
     # unconditionally. kb `strided-gates-drop-pointer-operands-to-scalar`.
+    # ANY m, not m >= W: with m < W rows the loop below is k²/2 axpy calls, a store→reload chain per pair.
+    # That was the pptrf n = nb+1..nb+7 cliff (one 48 panel + a 1..7-row side-R solve against it). Zen4,
+    # pptrfL tile/axpy-loop: 0.713 @49, 0.727 @50, 0.798 @52, 0.832 @55; n=48/56..64 and getrf@50 null.
     if T === Float64 && _strided1(A) && _strided1(B) &&
-            k >= 4 && m >= _CHOLW                                             # strided f64 (trsmR gate) → tile
+            k >= 4 && (m >= _CHOLW || (@inbounds _EXPINT[8]) == 0)          # strided f64 → tile
         GC.@preserve A B _trsm_tile_R_f64!(up, tr, unit, pointer(A), stride(A, 2), pointer(B), ldb, m, k)
         return B
     end
