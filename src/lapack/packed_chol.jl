@@ -29,7 +29,11 @@ const _PPTRF_TPSV_MIN = 32
 # The old default borrowed `_LU_NB` = 48 and was never swept. Paired A/B, Zen4, pptrfL, nb=n / nb=48:
 #   n=49..95 0.74–0.87 (every r = n−48 in 1..47), 96 0.772, 128 0.825, 192 0.728, 256 0.786, 512 0.741,
 #   1024 0.761;  nb=128 / nb=48: 0.849 @192, 0.973 @256, 0.961 @512, 0.934 @1024;  nb=256: 1.021 @512.
-# (bench/probes/tail_merge_crossover.jl, pptrf_nb_scan.jl.) Cost: the scratch is n×n instead of 2·n·48.
+#   pptrfU nb=n / nb=48: 1.026 @49 (the one loss), 0.879 @64, 0.870 @96, 0.831 @128, 0.788 @256, 0.755 @512,
+#   0.773 @1024.  Large n, nb=n / nb=128: pptrfL 0.882 @2048, 0.829 @4096; pptrfU 0.842 @2048, 0.786 @4096.
+# (bench/probes/tail_merge_crossover.jl, pptrf_nb_scan.jl, review_closeout.jl.) Zen3 lower: same shape, 0.70–0.89.
+# COST: the scratch is n×n instead of 2·n·48, and the grow-only arena keeps it (n=4096 F64 ≥ 128 MB). No
+# cap: a 128-wide cap measured 12–21% slower at 2048/4096. A memory cap is a policy call, not a speed one.
 # PDM: Exempt — 0 is the "whole matrix" sentinel; a positive pin restores a fixed panel width. | tune: n/a
 const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", 0)::Int   # req8-ok: sentinel, not a tuning value
 @inline _pptrf_nb(n::Int) = _PPTRF_BLK_NB > 0 ? min(_PPTRF_BLK_NB, n) : n

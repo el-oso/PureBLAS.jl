@@ -2135,7 +2135,8 @@ end
 # zgetrf's blocked panel update is side-L LOWER UNIT (`U12 = L11⁻¹ A12`), and before 16639486 it fell to
 # `_trsm_cmplx_dLN!` at 2.55–3.10× AOCL's time (k=32, m=4..68). 16639486 routed it here by index reversal
 # (copy L reversed into a k×k scratch, reverse B's rows, upper leaf, reverse back); the native mirror
-# replaced that. Paired A/B, Zen4 (`bench/probes/zgetrf_trsm_lower_native.jl`): native/wrapper 0.784 /
+# replaced that. Paired A/B, Zen4, on the pre-deletion tree that held both arms (the probe
+# `bench/probes/zgetrf_trsm_lower_native.jl` needs the wrapper back to re-run): native/wrapper 0.784 /
 # 0.779 / 0.779 at 32×18/36/68, zgetrf 0.961 @128, 0.968 @256. Safety is tested, not argued: the lower
 # arm on an A whose strictly-upper part (and unit diagonal) is NaN returns a finite, correct result.
 
@@ -3317,7 +3318,7 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          Previously the `_trsm_cgt_L!` witness; stripped when that landed.
 #   _EXP15 INVERTED: set true to restore SCALAR m-tails in `_trsm_tile_R_f64!` (masked pass ships).
 #   (_EXP13 and _EXP15 were reused for the 3M band campaign — _EXP13 bypassed the unpacked branch,
-#    _EXP15 lowered the rank-k 3M edge — and are FREE AGAIN. Both were needed at once: with a single
+#    _EXP15 lowered the rank-k 3M edge — and were freed afterwards; _EXP15 is LIVE again, see above. Both were needed at once: with a single
 #    combined flag Zen4 compared 3M-vs-UNPACKED while Zen3 compared 3M-vs-PACKED, so the two apparent
 #    "crossovers" were different trades. Splitting them is what showed the fitted 768/W was encoding a
 #    baseline difference rather than physics. Keep that separation if the band is ever re-opened.)
@@ -4172,7 +4173,8 @@ end
             vstore(a2, _cvptr(pB, i, j0 + 2, ldb)); vstore(a3, _cvptr(pB, i, j0 + 3, ldb)); i += W
         end
         # MASKED m tail, one pass, for 2..W-1 rows. ONE row stays scalar: the mask setup costs more than a
-        # single scalar row (Zen4 pptrfL, masked/scalar: 1 row 1.042, 2 rows 0.976, 3 0.931, 4 0.859, 7 0.786).
+        # single scalar row (Zen4 pptrfL, masked/scalar: 1 row 1.042, 2 rows 0.976, 3 0.931, 4 0.859, 7 0.786;
+        # Zen3 W=4: 1 row null, 2 rows 0.957, 3 rows 0.906).
         @inbounds if i < m && !_EXPFLAG[_EXP15]
             msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)  # inactive lanes are never accessed (no OOB)
             a0 = vload(_CVF, _cvptr(pB, i, j0, ldb), msk);     a1 = vload(_CVF, _cvptr(pB, i, j0 + 1, ldb), msk)
@@ -4276,8 +4278,12 @@ function _trsm_dense_R!(up::Bool, tr::Bool, unit::Bool, A, B)
     # ANY m, not m >= W: with m < W rows the loop below is k²/2 axpy calls, a store→reload chain per pair.
     # That was the pptrf n = nb+1..nb+7 cliff (one 48 panel + a 1..7-row side-R solve against it). Zen4,
     # pptrfL tile/axpy-loop: 0.713 @49, 0.727 @50, 0.798 @52, 0.832 @55; n=48/56..64 and getrf@50 null.
+    # Zen3 (W=4): 0.710 @49, 0.697 @50, 0.673 @51.
+    # But only from k >= 8 = two of the tile's NC=4 solve-column blocks: at k=4 (one block) the tile LOSES on
+    # short B. Zen4, trsm R,L,T,N tile/loop: k=4 m=1 0.879, m=2 1.300, m=4 1.210 | k=8 0.505/0.962/0.913 |
+    # k=16 0.291/0.607/0.507 (bench/probes/review_closeout.jl).
     if T === Float64 && _strided1(A) && _strided1(B) &&
-            k >= 4 && (m >= _CHOLW || (@inbounds _EXPINT[8]) == 0)          # strided f64 → tile
+            k >= 4 && (m >= _CHOLW || (k >= 8 && iszero(@inbounds _EXPINT[8])))   # strided f64 → tile
         GC.@preserve A B _trsm_tile_R_f64!(up, tr, unit, pointer(A), stride(A, 2), pointer(B), ldb, m, k)
         return B
     end
