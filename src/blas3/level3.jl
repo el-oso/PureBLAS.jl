@@ -1152,18 +1152,11 @@ end
 const _TRMM_BPF = IdDict{DataType, Vector}()
 const _TRMM_BPF_F64 = Float64[]
 const _TRMM_BPF_F32 = Float32[]
-@inline function _trmm_bpf(::Type{Float64}, len::Int)
-    length(_TRMM_BPF_F64) < len && resize!(_TRMM_BPF_F64, len)
-    return _TRMM_BPF_F64
-end
-@inline function _trmm_bpf(::Type{Float32}, len::Int)
-    length(_TRMM_BPF_F32) < len && resize!(_TRMM_BPF_F32, len)
-    return _TRMM_BPF_F32
-end
+@inline _trmm_bpf(::Type{Float64}, len::Int) = _ws_grow!(_TRMM_BPF_F64, len)   # one growth point (workspace.jl)
+@inline _trmm_bpf(::Type{Float32}, len::Int) = _ws_grow!(_TRMM_BPF_F32, len)
 function _trmm_bpf(::Type{T}, len::Int) where {T}
     v = get!(() -> T[], _TRMM_BPF, T)::Vector{T}
-    length(v) < len && resize!(v, len)
-    return v
+    return _ws_grow!(v, len)
 end
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T <: BlasReal, MRV}
     m = size(B, 1); n = size(B, 2); W = _vwidth(T); mr = MRV * W; nr = _NR
