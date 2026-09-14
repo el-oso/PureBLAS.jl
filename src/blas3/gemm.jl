@@ -1233,6 +1233,9 @@ function _gemm_unpacked_split!(
                     # WHY IT SURVIVED: the split path needs max(m,n,k) ≤ _GEMM_SPLIT_MAX (48), and the
                     # gate ladder jumps 32 → 50, so NO published cell ever reaches a non-W-aligned
                     # remainder here. Found by sweeping m one step at a time, not by the gate.
+                    # NOT the "exact cover" (whole vectors through the split kernel + a datapath-width tail):
+                    # measured SLOWER, Zen4 paired A/B exact/masked — dgemm 50³ 1.065, zgemm 50³ (3M) 1.068,
+                    # 41×8×33 1.04-1.07, geqrf n=49..55 1.005-1.015. Two calls lose to one masked call here.
                     vt = cld(mre, W)
                     if vt == 1
                         _mrows_tail!(
