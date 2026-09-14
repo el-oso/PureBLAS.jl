@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 137 of them.
+Every `@load_preference` key in `src/` — 138 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 137 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 9 Measured · 51 Literal · 12 Exempt.
-**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 45 literal · 5 flag · 2 other.
+**Tier:** 65 Derived · 9 Measured · 52 Literal · 12 Exempt.
+**Default form** (mechanical): 58 formula · 21 delegates · 6 sibling · 46 literal · 5 flag · 2 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -175,6 +175,7 @@ Every `@load_preference` key in `src/` — 137 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `ciamax_simd_min` | formula | Literal | algorithm cost-ratio crossover (fixed SIMD setup vs per-element scalar scan); µarch- | — |
+| `clu_flat_max` | literal | Literal | an ALGORITHM-SWITCH crossover (store-bound flat sweep vs blocked BLAS-3 update), with no | — |
 | `key` | other | Literal | cost-ratio crossover between two ALGORITHMS (fixed SIMD setup vs per-element scalar | — |
 
 ## LAPACK · packed_chol
