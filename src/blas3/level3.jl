@@ -2862,9 +2862,17 @@ end
     return nothing
 end
 
-# LEVER A PROTOTYPE (_EXPINT[9] == 1): the ragged column tail (wid ≤ W÷2) at L = W÷2 lanes, one vector per
-# row — a copy of `_gemmtrsm_u_slab!`/`_gemmtrsm_u_tail!` with the lane width as a parameter and NRV = 1.
-# P row stride is L. Copies, not a refactor, so the shipped kernels' codegen is untouched while A/B'd.
+# RAGGED COLUMN TAIL AT HALF WIDTH. The fused leaf stripes B NR=24 columns at a time; n ≢ 0 mod W leaves a
+# 1..W-1-column tail that the pack path used to pad to one full W-lane vector per row (NRV=1). At wid ≤ W÷2 that
+# is ≥ half dead lanes, and NRV=1 has no second chain to overlap them with. The measured tooth: ns/(k²·nrhs) at
+# k=48, nrhs 48 → 50 +19%, → 49 +21% (rows: +5%). These run the same slab and tail at L = W÷2 lanes — copies of
+# `_gemmtrsm_u_slab!`/`_gemmtrsm_u_tail!` with the lane width a parameter and NRV = 1; P row stride is L.
+# Paired A/B vs the padded tail, narrow/padded (bench/probes/trsm_tail_levers.jl):
+#   Zen4  0.939 @49, 0.940 @50, 0.939 @52, 0.968 @97, 0.967 @100, 0.972 @124; n=48/96 and wid>4 (55,102) null
+#   Zen5  0.931 @49, 0.931 @50, 0.947 @52, 0.970 @97, 0.970 @100, 0.973 @124; same nulls
+# FALSIFIED alongside it: folding the tail into the last full stripe as one NR+W = 32-column stripe (Val(4) slab)
+# — Zen4 1.023–1.045 slower at every eligible n, Zen5 0.984–1.005. And routing the tail out to trsv!/trsm!: wins
+# only for a 1-column tail, 1.056 @50 / 1.114 @100 slower (trsm_tail_route.jl).
 @inline @generated function _gemmtrsm_u_slab_l!(
         Pp::Ptr{T}, ldp::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T},
         s::Int, KC::Int, ::Val{MR}, ::Val{L}
@@ -3265,8 +3273,8 @@ end
 #   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
 #   _EXPINT[7]  zgemm 3M MIN override (0 = _CGEMM_3M_MIN) — tests 3M below the shipped window
 #   _EXPINT[8]  1 = restore the old `m >= _CHOLW` gate in `_trsm_dense_R!` (A/B arm; 0 ships: tile for any m)
-#   _EXPINT[9]  fused side-L leaf, ragged column tail (nrhs mod W): 0 shipped (padded W-lane slab), 1 = tail at
-#               W÷2 lanes (lever A), 2 = tail paired into the last full stripe as one NR+W stripe (lever B)
+#   _EXPINT[9]  1 = restore the PADDED W-lane slab for the fused side-L leaf's ragged column tail (A/B arm; 0 ships
+#               the W÷2-lane tail, see `_gemmtrsm_u_slab_l!`)
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
@@ -3682,10 +3690,9 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                 jc = 0
                 while jc < n
                     wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
-                    tmode = @inbounds _EXPINT[9]
-                    pairT = tmode == 2 && NRl == NR && NR < n - jc < NR + W && W == 8
-                    pairT && (wid = n - jc)
-                    narrowT = tmode == 1 && W == 8 && wid < W && 2 * wid <= W
+                    # A ragged column tail of ≤ W÷2 columns runs at W÷2 lanes instead of padding to W: the pad lanes are
+                    # dead work, and at NRV=1 there is no second chain for them to overlap. See `_gemmtrsm_u_slab_l!`.
+                    narrowT = W == 8 && wid < W && 2 * wid <= W && (@inbounds _EXPINT[9]) != 1
                     # PAD WIDTH, not NR. The fusedT branches below take wid in {NR, 2W, W}; everything else
                     # falls here and USED TO BE PADDED OUT TO THE FULL NR with zeros, so a 2-column tail was
                     # solved as 24 columns — 12x the work. The comment above says "gate n is a multiple of W,
@@ -3695,8 +3702,8 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                     # The pad is internal to P — the unpack writes back only `wid` columns — so narrowing it to
                     # the smallest W-multiple covering wid is safe, and the solve already takes the stripe width
                     # as a compile-time Val(NRV). NRVp in 1:NRV, so a 3-way branch covers it.
-                    NRp = pairT ? NR + W : narrowT ? W ÷ 2 : min(NR, cld(wid, W) * W)
-                    NRVp = pairT ? NRV + 1 : max(1, NRp ÷ W)
+                    NRp = narrowT ? W ÷ 2 : min(NR, cld(wid, W) * W)
+                    NRVp = max(1, NRp ÷ W)
                     # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
                     # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
                     # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
@@ -3726,7 +3733,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                     # KC is a CAPACITY failure, not a register failure. (NRV=2 is also worse unpaired — 17.86 vs
                     # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
                     # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
-                    if !pairT && !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
+                    if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
                             KC <= _trsm_dbase() && jc + 2 * NR <= n
                         _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
                         jc += 2 * NR; continue
@@ -3774,11 +3781,6 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                         rem > 0 && _gemmtrsm_u_tail_l!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(4))
                         for si in (nfull - 1):-1:0
                             _gemmtrsm_u_slab_l!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(4))
-                        end
-                    elseif pairT
-                        rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(4))
-                        for si in (nfull - 1):-1:0
-                            _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(4))
                         end
                     elseif NRVp == 1
                         rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(1))
