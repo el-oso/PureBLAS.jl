@@ -2862,6 +2862,65 @@ end
     return nothing
 end
 
+# LEVER A PROTOTYPE (_EXPINT[9] == 1): the ragged column tail (wid ≤ W÷2) at L = W÷2 lanes, one vector per
+# row — a copy of `_gemmtrsm_u_slab!`/`_gemmtrsm_u_tail!` with the lane width as a parameter and NRV = 1.
+# P row stride is L. Copies, not a refactor, so the shipped kernels' codegen is untouched while A/B'd.
+@inline @generated function _gemmtrsm_u_slab_l!(
+        Pp::Ptr{T}, ldp::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T},
+        s::Int, KC::Int, ::Val{MR}, ::Val{L}
+    ) where {T, MR, L}
+    sz = sizeof(T); V = Vec{L, T}
+    body = quote end
+    for r in 0:(MR - 1)
+        push!(body.args, :($(Symbol(:c, r)) = zero($V)))
+    end
+    inner = quote end
+    push!(inner.args, :(x = vload($V, Pp + (kk * ldp) * $sz)))
+    for r in 0:(MR - 1)
+        cs = Symbol(:c, r)
+        push!(inner.args, :($cs = muladd($V(unsafe_load(Up + ((s + $r) + kk * ldu) * $sz)), x, $cs)))
+    end
+    push!(
+        body.args, :(
+            for kk in UnitRange(s + $MR, KC - 1)
+                $inner
+            end
+        )
+    )
+    for r in 0:(MR - 1)
+        cs = Symbol(:c, r)
+        push!(body.args, :($cs = vload($V, Pp + ((s + $r) * ldp) * $sz) - $cs))
+    end
+    for i in (MR - 1):-1:0
+        ci = Symbol(:c, i)
+        push!(body.args, :($ci = $ci * $V(unsafe_load(rp + (s + $i) * $sz))))
+        for j in (i - 1):-1:0
+            cj = Symbol(:c, j)
+            push!(body.args, :($cj = muladd(-$V(unsafe_load(Up + ((s + $j) + (s + $i) * ldu) * $sz)), $ci, $cj)))
+        end
+    end
+    for r in 0:(MR - 1)
+        push!(body.args, :(vstore($(Symbol(:c, r)), Pp + ((s + $r) * ldp) * $sz)))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+@inline function _gemmtrsm_u_tail_l!(
+        Pp::Ptr{T}, ldp::Int, Up::Ptr{T}, ldu::Int, rp::Ptr{T}, base::Int,
+        KC::Int, ::Val{L}
+    ) where {T, L}
+    sz = sizeof(T); V = Vec{L, T}
+    @inbounds for i in (KC - 1):-1:base
+        q = Pp + (i * ldp) * sz
+        ci = vload(V, q) * V(unsafe_load(rp + i * sz)); vstore(ci, q)
+        for j in (i - 1):-1:base
+            qj = Pp + (j * ldp) * sz
+            vstore(muladd(-V(unsafe_load(Up + (j + i * ldu) * sz)), ci, vload(V, qj)), qj)
+        end
+    end
+    return nothing
+end
+
 # Driver: solve U·X = B in place, U upper KC×KC (view of A), B KC×n wide. up=true, no-trans, non-conj.
 # Column stripes OUTER (NR at a time) / slabs INNER: each stripe's P (KC×NR ≈ L1) is packed, fully solved
 # (all slabs), unpacked — P stays L1-hot for the whole stripe solve. U (KC×KC in L2) is re-read per stripe
@@ -3206,13 +3265,15 @@ end
 #   _EXPINT[6]  witness: the kc `_trmm_packed!` actually ran with (proves the knob was live)
 #   _EXPINT[7]  zgemm 3M MIN override (0 = _CGEMM_3M_MIN) — tests 3M below the shipped window
 #   _EXPINT[8]  1 = restore the old `m >= _CHOLW` gate in `_trsm_dense_R!` (A/B arm; 0 ships: tile for any m)
+#   _EXPINT[9]  fused side-L leaf, ragged column tail (nrhs mod W): 0 shipped (padded W-lane slab), 1 = tail at
+#               W÷2 lanes (lever A), 2 = tail paired into the last full stripe as one NR+W stripe (lever B)
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 8)
+const _EXPINT = fill(0, 9)
 const _EXPFLAG = fill(false, 16)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
@@ -3621,6 +3682,10 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                 jc = 0
                 while jc < n
                     wid = min(NRl, n - jc)                        # real columns this stripe (last may be < NRl)
+                    tmode = @inbounds _EXPINT[9]
+                    pairT = tmode == 2 && NRl == NR && NR < n - jc < NR + W && W == 8
+                    pairT && (wid = n - jc)
+                    narrowT = tmode == 1 && W == 8 && wid < W && 2 * wid <= W
                     # PAD WIDTH, not NR. The fusedT branches below take wid in {NR, 2W, W}; everything else
                     # falls here and USED TO BE PADDED OUT TO THE FULL NR with zeros, so a 2-column tail was
                     # solved as 24 columns — 12x the work. The comment above says "gate n is a multiple of W,
@@ -3630,8 +3695,8 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                     # The pad is internal to P — the unpack writes back only `wid` columns — so narrowing it to
                     # the smallest W-multiple covering wid is safe, and the solve already takes the stripe width
                     # as a compile-time Val(NRV). NRVp in 1:NRV, so a 3-way branch covers it.
-                    NRp = min(NR, cld(wid, W) * W)
-                    NRVp = NRp ÷ W
+                    NRp = pairT ? NR + W : narrowT ? W ÷ 2 : min(NR, cld(wid, W) * W)
+                    NRVp = pairT ? NRV + 1 : max(1, NRp ÷ W)
                     # fusedT handles any W-MULTIPLE stripe width at its TRUE NRV — the full NR (Val NRV) AND the
                     # ragged W / 2W tails that `n mod NR` produces — with NO padding (gate n is a multiple of W, so
                     # the tail is always 8 or 16 wide; that padding to NR was the whole small-n gap). Concrete-Val
@@ -3661,7 +3726,7 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                     # KC is a CAPACITY failure, not a register failure. (NRV=2 is also worse unpaired — 17.86 vs
                     # 18.44 GF at n=128 — so the shipped NRV=3 stands.) Do not retry pairing at KC=128 by
                     # shrinking NRV; it needs a smaller P footprint, which means a smaller KC for the paired path.
-                    if !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
+                    if !pairT && !_EXPFLAG[_EXP8] && fusedT && rem == 0 && NRl == NR &&
                             KC <= _trsm_dbase() && jc + 2 * NR <= n
                         _fusedT_stripe_pair!(Val(NRV), Pp, pB, ldb, jc, pUsrc, lduse, rp, KC, nfull, MR, sz)
                         jc += 2 * NR; continue
@@ -3705,7 +3770,17 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
                     # Solve at the NARROWED stripe width. Val must be a compile-time constant, so branch on
                     # NRVp (1:NRV) rather than splicing a runtime value — a runtime->Val is exactly the
                     # `invoke ::Any` shape juliac --trim rejects.
-                    if NRVp == 1
+                    if narrowT
+                        rem > 0 && _gemmtrsm_u_tail_l!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(4))
+                        for si in (nfull - 1):-1:0
+                            _gemmtrsm_u_slab_l!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(4))
+                        end
+                    elseif pairT
+                        rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(4))
+                        for si in (nfull - 1):-1:0
+                            _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(4))
+                        end
+                    elseif NRVp == 1
                         rem > 0 && _gemmtrsm_u_tail!(Pp, NRp, pUsrc, lduse, rp, nfull * MR, KC, Val(1))
                         for si in (nfull - 1):-1:0
                             _gemmtrsm_u_slab!(Pp, NRp, pUsrc, lduse, rp, si * MR, KC, Val(MR), Val(1))
