@@ -1,30 +1,28 @@
 # The scratch arena
 
-Every LAPACK routine needs scratch. PureBLAS used to give each one a named field on a struct:
-`L3Workspace` reached **180 fields**, most of them dedicated to a single routine — `trsen11`, `qp3wrow`,
-`ggs_rqtau`, `stnseed`. That shape has three costs beyond the ugliness. Every call site drags in scratch
-for routines it can never reach. The peak footprint is the sum of each role's maximum rather than the
-maximum of what is concurrently live. And it forces one sharing policy on every role, which is the wrong
-shape for the multithreading milestone.
+**The scratch arena is one growing block of memory. A routine borrows temporary matrices and vectors from it, and the arena takes them back automatically when the routine's code block ends.**
 
-The arena replaces it. A role does not own storage; it **borrows** a shape and stride for the duration of
-a lexical scope, and the bump pointer rewinds when the scope exits.
+Think of a notepad with a bookmark:
+
+1. When a routine starts a block, it puts a bookmark at the next free page.
+2. Each borrow uses the next free pages.
+3. When the block ends, the notepad goes back to the bookmark. The pages stay in the notepad for the next routine.
 
 ```julia
 @scope arn begin
-    W = borrow!(arn, T, n, nb)          # n×nb, leading dimension n
-    v = borrow!(arn, Int, n)            # a vector
-    _panel!(A, W, v)                    # handles pass DOWN freely
-end                                     # rewound here; W and v are dead
+    W = borrow!(arn, T, n, nb)          # an n×nb matrix, leading dimension n
+    v = borrow!(arn, Int, n)            # a vector of length n
+    _panel!(A, W, v)                    # pass the handles down to other functions
+end                                     # the arena takes W and v back here
 ```
-
-`L3Workspace` is now **7 fields** — the GEMM and syr2k packing buffers, which are genuinely shared
-allocator state rather than per-routine scratch.
 
 ## How it works
 
-The arena is a byte-addressed bump allocator over one slab. Entering a scope records the current
-position; leaving restores it. Nothing is freed individually and nothing is reference-counted.
+The arena keeps one position: which slab, which offset in that slab, and how deep the blocks are.
+
+1. At the start of a block, `@scope` records that position.
+2. Each `borrow!` gives a handle at the current offset, then moves the offset forward by the size of the borrow.
+3. At the end of the block, `@scope` sets the position back to the recorded value.
 
 ```mermaid
 sequenceDiagram
@@ -36,150 +34,127 @@ sequenceDiagram
     C->>A: borrow!(T, m, n)
     A-->>C: PtrMatrix at offset, offset += ld·n·sizeof(T)
     C->>A: borrow!(T, k)
-    A-->>C: PtrVector, offset advances again
+    A-->>C: PtrVector, offset moves forward again
     Note over C: kernels run; handles pass into callees
     C->>S: exit
-    S->>A: restore (slab, offset, depth) — both handles now dangle
+    S->>A: set (slab, offset, depth) back — both handles are now invalid
 ```
 
-Because a scope restores an absolute position rather than undoing individual borrows, an *enclosing*
-scope's exit repairs anything an inner one failed to release. That property is what makes the
-handler-free variant below safe.
+The position is set back to an exact recorded value. So when an outer block ends, it also takes back everything that an inner block did not.
 
 ### Growth
 
-If a borrow does not fit, the arena takes a **new slab and keeps the old one live**, so growth never
-invalidates a handle already handed out. At depth zero the chain folds back into a single slab sized to
-the high-water demand.
+1. If a borrow fits in the current slab, the arena moves the offset and gives the handle.
+2. If a borrow does not fit, the arena allocates a new slab. The old slab stays in use, so every handle already given out stays valid.
+3. The arena records the largest total size that was requested (the high-water demand).
+4. When the outermost block ends (depth 0), the arena joins its slabs into one slab of the high-water demand.
 
 ```mermaid
 flowchart LR
     A["borrow! wants N bytes"] --> B{"fits in the current slab?"}
-    B -- yes --> C["bump the offset<br/>return a handle"]
-    B -- no --> D["allocate a new slab<br/>KEEP the old one live"]
+    B -- yes --> C["move the offset<br/>return a handle"]
+    B -- no --> D["allocate a new slab<br/>keep the old one in use"]
     D --> E["record the high-water demand"]
     E --> C
-    C --> F{"scope exits at depth 0?"}
-    F -- no --> G["restore the saved position"]
-    F -- yes --> H["fold the chain into ONE slab<br/>sized to the high-water DEMAND"]
+    C --> F{"block ends at depth 0?"}
+    F -- no --> G["set the recorded position back"]
+    F -- yes --> H["join the slabs into ONE slab<br/>of the high-water demand"]
 ```
 
-Folding to the *demand* rather than to the sum of slab capacities matters: summing capacities compounds
-the growth doubling into the permanent size, so a slab of `S` overflowed by one byte becomes `2S`, folds
-to `3S`, and the next one-byte overflow gives `9S`, without bound.
+The joined slab has the size of the **demand**. This keeps the arena at the largest size that routines asked for.
 
 ### Handles
 
-`borrow!` returns `PtrMatrix{T}` or `PtrVector{T}` (`src/ptrmat.jl`) — isbits structs holding a pointer, a
-shape and a leading dimension. They index, `view`, and pass into kernels like an `Array`, and being isbits
-they cross a non-inlined call boundary without a heap box. A non-isbits element type such as `BigFloat`
-falls back to a heap `Matrix`, which is correct but not allocation-free; no gated path uses one.
+`borrow!` gives a `PtrMatrix{T}` or a `PtrVector{T}` (`src/ptrmat.jl`).
 
-**Slicing keeps the type.** `view(A, rows, cols)` on a `PtrMatrix` is another `PtrMatrix`; a column view is
-a `PtrVector`. That is load-bearing — see *the closed-union trap* below.
+- Each handle is a small fixed-size value: a pointer, a shape and a leading dimension.
+- You can index it, take a `view` of it, and pass it to a kernel, as you do with an `Array`.
+- It passes into a function that is not inlined with no heap allocation.
+- A `view` of a `PtrMatrix` is a `PtrMatrix`. A column view is a `PtrVector`.
+- For an element type that is not a fixed-size value, such as `BigFloat`, `borrow!` gives a heap `Matrix`. That result is correct, but it allocates. No gated path uses such a type.
 
-## What the macro enforces, and when
+## The rules `@scope` checks
 
-Three rules are checked when `@scope` **expands**, so a violation is a compile error rather than a lint
-finding or a debugging session.
+`@scope` checks three rules when it expands. If code breaks a rule, the error comes at compile time.
 
 ```mermaid
 flowchart TD
-    M["@scope arn begin … end"] --> R1{"does the TOKEN appear<br/>anywhere but as borrow!'s<br/>first argument?"}
-    R1 -- yes --> E1["error: the token escapes"]
+    M["@scope arn begin … end"] --> R1{"is the TOKEN used anywhere<br/>other than as borrow!'s<br/>first argument?"}
+    R1 -- yes --> E1["error: the token leaves the block"]
     R1 -- no --> R2{"is there a borrow! inside a<br/>for / while / comprehension /<br/>closure / do in this block?"}
-    R2 -- yes --> E2["error: a borrow in a loop<br/>consumes Σ(iterations)"]
-    R2 -- no --> R3{"is a borrowed HANDLE returned<br/>from the block, or its tail value?"}
-    R3 -- yes --> E3["error: the handle outlives<br/>the bytes it points at"]
+    R2 -- yes --> E2["error: a borrow in a loop<br/>uses memory on every iteration"]
+    R2 -- no --> R3{"does the block return a borrowed<br/>HANDLE, or end with one as its value?"}
+    R3 -- yes --> E3["error: the handle would point<br/>at memory the arena took back"]
     R3 -- no --> OK["expand"]
 ```
 
-The third rule is deliberately narrow: it rejects a handle in *value position* only. `return sum(A)` is
-normal and stays legal, and so does passing a handle down into a callee — handles are meant to travel,
-they are only forbidden from outliving.
+The third rule applies to the handle itself as a value. You can return a value computed from a handle, for example `return sum(A)`. You can pass a handle down to other functions.
 
-### What the checks do not catch
+### The rules you must keep yourself
 
-They are lexical checks on the unexpanded body, not a proof. Three holes, all measured:
+The checks read the source of the block. Keep these three rules yourself:
 
-| hole | why it cannot be closed lexically |
+| rule | why the macro cannot see it |
 |---|---|
-| a handle **stored** into a field or global, or captured by a closure that outlives the block | the handle is an ordinary local; only the token is tracked |
-| a loop emitted by **another macro** | the body is walked unexpanded, where `@turbo`/`@nloops` is a `macrocall` node, not a `for` |
-| **recursion** | not lexical, so no macro can see it — a self-recursive routine holding a scope per level holds every level's borrows at once |
+| Keep each handle in its block. Do not store it in a field or a global, and do not capture it in a closure that lives longer than the block. | The macro tracks the token. A handle is an ordinary local variable. |
+| Do not borrow in a loop that another macro makes (for example `@turbo` or `@nloops`). | The macro reads the body before other macros expand. There, such a loop is a macro call, not a `for`. |
+| In a recursive routine, remember that each level holds its own borrows at the same time. | Recursion is not visible in the source of one block. |
 
-For the first, `@fenced_scope` is the runtime answer: every borrow becomes its own `mmap` behind a
-`PROT_NONE` guard page, so *using* a released handle faults at the offending line instead of silently
-reading whatever the next borrow wrote. It is roughly a thousand times the cost of a bump, so it is
-opt-in per scope — written into the source of the routine being debugged, never a global mode.
+To test the first rule, use `@fenced_scope`:
+
+- Each borrow gets its own memory pages from `mmap`, with a `PROT_NONE` guard page after them.
+- A use of a handle after its block ends stops the program at that line.
+- It costs about one thousand times as much as a normal borrow. Add it to the source of the routine that you are testing, one block at a time.
 
 ## `@scope` or `@leafscope`
 
-`@scope` wraps its body in `try`/`finally` so the arena is released on all three exit paths: falling off
-the end, an early `return`, and a throw. That handler is free in a dispatch-level routine and **ruinous in
-one that inlines a register-hungry kernel**, because it lowers to `jl_enter_handler` plus a
-`returns_twice` setjmp, and LLVM must then be conservative about registers for the whole function.
+**Use `@leafscope` in a function that inlines a SIMD kernel. Use `@scope` everywhere else.**
 
-Measured on Zen 3, where the SIMD leaf holds 18 live vectors against a 16-register file:
+`@scope` puts its body in `try`/`finally`. So the arena takes the memory back on all three exit paths:
+
+1. The block runs to its end.
+2. The block returns early.
+3. The block throws an error.
+
+The `try`/`finally` handler costs nothing in a routine that only dispatches. In a function that inlines a SIMD kernel with many live vectors, the handler makes LLVM keep fewer values in registers for the whole function.
+
+Measured on Zen 3, where the SIMD leaf holds 18 live vectors and the CPU has 16 vector registers:
 
 | | vector spills in `_trsm_rl_fused_drv!` | `trsmR@100` | `trsmR@128` |
 |---|---|---|---|
-| before the arena | 113 | 1.037 | 0.978 |
-| with `@scope` (handler) | **172** | 0.746 | 0.708 |
-| with `@leafscope` | **113** | 1.035 | 0.973 |
+| `@scope` (with handler) | **172** | 0.746 | 0.708 |
+| `@leafscope` | **113** | 1.035 | 0.973 |
 
-The AVX-512 machines have fourteen spare vector registers and were unaffected — which is why the whole
-effect was invisible on the machine the conversion was written on.
+The AVX-512 machines have fourteen spare vector registers, so the handler did not change their results.
 
 ```mermaid
 flowchart TD
-    Q{"does this function inline<br/>a SIMD kernel?"} -- no --> S["@scope<br/>keeps the throw guarantee,<br/>costs nothing here"]
+    Q{"does this function inline<br/>a SIMD kernel?"} -- no --> S["@scope<br/>takes memory back on all<br/>three exit paths"]
     Q -- yes --> L["@leafscope<br/>no exception handler"]
-    L --> N["requires a @scope somewhere<br/>ABOVE it in the call chain"]
+    L --> N["needs a @scope somewhere<br/>ABOVE it in the call chain"]
 ```
 
-`@leafscope` reproduces the first two exit paths itself — it rewrites every `return` in the block to
-release first, skipping any `return` belonging to a nested closure or `do` block. It gives up only the
-throw path, and that is bounded rather than ignored: releasing restores the arena's position *absolutely*
-from the record made on entry, so the first enclosing scope that does run its exit repairs everything at
-once. Hence the rule in the diagram.
+`@leafscope` covers the first two exit paths itself. It changes each `return` in the block so that the return first gives the memory back. It skips a `return` that belongs to a closure or a `do` block inside it.
 
-## The closed-union trap
+For a thrown error, the `@scope` above it gives the memory back. That works because each block sets the position back to an exact recorded value. This is why a `@leafscope` needs a `@scope` above it.
 
-`StridedMatrix` and `StridedVector` are **closed** unions — `Array`, `SubArray`, `ReshapedArray`,
-`ReinterpretArray` and combinations. `PtrMatrix` and `PtrVector` are not in them and never can be. So a
-fast-path gate written inline as
+## Fast-path checks on borrowed operands
 
-```julia
-x isa StridedVector && stride(x, 1) == 1        # WRONG for a borrow
-```
+**To check whether an operand can take a fast path, use `_strided1(A)` for a matrix and `_dense1(x)` for a vector** (`src/ptrmat.jl`).
 
-sends every borrowed operand to the generic scalar path: right answer, no test failure, no gate cell
-moves. Use **`_strided1(A)`** and **`_dense1(x)`** (`src/ptrmat.jl`), which const-fold to the identical
-check for a Strided argument and carry explicit methods for the pointer types. `test/fastpath_lint.jl`
-fails the suite on a new bare `isa`.
+- For an `Array` or a `SubArray`, these give the same answer as `isa StridedMatrix` / `isa StridedVector`, and they fold to the same constant check.
+- They also accept `PtrMatrix` and `PtrVector`, which are outside Julia's closed `StridedMatrix` and `StridedVector` unions.
+- `test/fastpath_lint.jl` fails the test suite on a new bare `isa StridedVector && stride(x, 1) == 1` gate.
 
-This class had fired five times before the lint existed — twice through the C-ABI shims, twice through
-the conversion, and once in a way that sent **every** drop-in `getrf` down a scalar panel.
+## Costs and properties
 
-## Costs, stated plainly
+- **First call at a new largest size:** the routine allocates, because the arena grows. From the second call it allocates 0 bytes. Measured: 1456 bytes on the first `trexc!` call at n=16, then 0.
+- **Two borrows in one block never overlap.** Each borrow is its own range, so a routine cannot write over its own scratch.
+- **Each borrow has an exact shape.** Its leading dimension is the value that the call asks for, on every call, whatever earlier calls asked for.
 
-- A converted routine is **not** allocation-free on its very first call at a new arena high-water; it is
-  allocation-free from the second. The struct paid that cost at module load instead.
-- Two borrows in one scope are two disjoint ranges, so the self-aliasing bug class the old fields kept
-  producing — a role re-claimed from inside a live claim of itself, right on the first call and wrong on
-  the second — cannot be written any more.
-- A borrow is **exact**. A grown field handed back whatever leading dimension an earlier call had asked
-  for, which is a measured 1.16 → 0.57 hazard: an ascending benchmark sweep hides it, and a caller going
-  large-then-small gets a different library.
+## Threads
 
-## Threading
+There is one arena for the whole process.
 
-The arena is a process-global bump allocator, exactly as the struct it replaces was a process-global
-object. That is not a regression in kind, but it is one in degree: interleave two tasks and the failure is
-arbitrary cross-role aliasing, where the struct's was bounded to one role.
-
-A per-task owner is therefore a **precondition** of enabling threads, not an optimisation to weigh against
-its cost. It is also why the conversion was worth doing before that milestone: going per-task costs the
-arena one line, where per-task ownership of a 180-field struct means duplicating 180 grown buffers per
-task.
+- Before threads are enabled, each task must get its own arena.
+- That change is one line: `_arena() = _ARENA_TASK()` over a `Base.OncePerTask`.
