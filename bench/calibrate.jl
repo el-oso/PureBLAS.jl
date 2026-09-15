@@ -273,7 +273,12 @@ end
 function calibrate_gemvt_pf(::Type{T} = Float64) where {T}
     inc = PureBLAS._gemvt_pf()
     cands = filter(!=(inc), collect(PureBLAS._GEMVT_PF_CANDIDATES))
-    n = max(256, isqrt(PureBLAS._L2_BYTES ÷ sizeof(T)))          # A ~ L2: the stream-supply regime
+    # Measure where `pf` APPLIES: the prefetch only reaches the non-deep kernel, so a size where the deep
+    # shape runs times two identical arms. It used to be A ~ L2 (n = √(L2/8) ≈ 362), where deep IS the
+    # incumbent — neuromancer's pf=128 pin came from there. Smallest po2 n with A > L2: po2 ⇒ lda·8 is a
+    # multiple of the L1 way, so deep is ineligible by `_gemvt_deep`'s own rule.
+    n = nextpow(2, isqrt(PureBLAS._L2_BYTES ÷ sizeof(T)) + 1)
+    PureBLAS._gemvt_deep(T, n, n, n) && (println("  gemvt_pf: deep shape eligible at n=$n — no regime to calibrate"); return Pair{String, Any}[])
     reps = _l2rep(n)
     setup() = (randn(T, n, n), randn(T, n), zeros(T, n))
     run(v) = (c -> begin

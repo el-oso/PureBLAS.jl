@@ -1276,7 +1276,13 @@ end
         # arms; in a pinned build their resolvers are compiled out entirely, so the shipping path is
         # this branch plus a const-folded comparison on m*n.
         u0 = _gemvt_u(); pf0 = _gemvt_pf(); nc0 = _gemvt_nc()
-        if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1 && pf0 == 0
+        # `pf` does NOT gate the deep shape. It used to (`&& pf0 == 0`), so a `gemvt_pf` pin — which
+        # `tune!()` writes from ONE size where the deep shape is not the incumbent — switched the deep
+        # shape off at every size. neuromancer pinned pf=128 and paid for it; paired A/B there, deep /
+        # pf=128: 0.844 @64, 0.850 @128, 0.724 @256 (the gate cells were 0.855 / 0.737), while pf=128
+        # wins where deep is ineligible, 1.025 @512, 1.044 @1024. So the prefetch distance applies only
+        # to the non-deep kernel below (bench/probes: zen5_gemvt_pf.jl).
+        if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1
             jd = !blk ? 0 : _gemvt_cols!(
                     Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
                     yptr, Aptr, xptr, lda, m, n, α, β, sz
