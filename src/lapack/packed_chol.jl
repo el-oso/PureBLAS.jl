@@ -288,7 +288,8 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
             # runs per call. `ld` is exact rather than padded because the field it replaces carried no
             # padding rule either — its `ld` was just the grown row count.
             @scope arn begin
-                R = borrow!(arn, Tu, nbu, n)
+                # ld = `_offway_ld`, not nbu: see the uplo='L' arm. Upper, nb=n: 0.988 @2048, 0.943 @4096, null ≤1024.
+                R = borrow!(arn, Tu, nbu, n, _offway_ld(nbu, Tu))
                 # One panel (nbu == n) has no trailing update, so V is never read: pass R, borrow nothing.
                 return nbu == n ? _pptrf_upper_blocked!(AP, n, nbu, R, R) :
                     _pptrf_upper_blocked!(AP, n, nbu, R, borrow!(arn, Tu, n, nbu))
@@ -337,7 +338,12 @@ function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
         nb = _pptrf_nb(n)
         if T <: BlasFloat && _dense1(AP) && n >= _PPTRF_BLK_MIN   # `_dense1`: see the uplo='U' arm above
             @scope arn begin                       # n×nb borrows, exact ld — see the uplo='U' arm
-                W = borrow!(arn, T, n, nb)
+                # ld = `_offway_ld(n)`, NOT n. At power-of-two n an ld of n aliases L1 sets, so dense `potrf!`
+                # copied the whole panel into a second, padded n×n borrow and back (lapack.jl, `Mw`): at
+                # n=4096 the arena held 256 MB instead of 128. Padding here removes the copy. Zen4 paired A/B,
+                # nb=n, padded/ld=n: 0.912 @256, 0.948 @512, 0.935 @1024, 0.951 @2048, 0.980 @4096, n=1000
+                # control 1.003 (bench/probes/pptrf_offway_ld.jl).
+                W = borrow!(arn, T, n, nb, _offway_ld(n, T))
                 # one panel (nb == n): no trailing update, V is never read — see the uplo='U' arm
                 nb == n ? _pptrf_lower_blocked!(AP, n, nb, W, W) :
                     _pptrf_lower_blocked!(AP, n, nb, W, borrow!(arn, T, n, nb))
