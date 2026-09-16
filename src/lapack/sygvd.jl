@@ -145,14 +145,15 @@ function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
     return ws
 end
 
-const _GVDWS_F64 = _GVDWork{Float64, Float64}()
-const _GVDWS_F32 = _GVDWork{Float32, Float32}()
-const _GVDWS_C64 = _GVDWork{ComplexF64, Float64}()
-const _GVDWS_C32 = _GVDWork{ComplexF32, Float32}()
-@inline _gvdws(::Type{Float64}) = _GVDWS_F64
-@inline _gvdws(::Type{Float32}) = _GVDWS_F32
-@inline _gvdws(::Type{ComplexF64}) = _GVDWS_C64
-@inline _gvdws(::Type{ComplexF32}) = _GVDWS_C32
+# One workspace per thread (written during the call) — see `_l3ws`.
+const _GVDWS_F64 = Base.OncePerThread{_GVDWork{Float64, Float64}}(_GVDWork{Float64, Float64})
+const _GVDWS_F32 = Base.OncePerThread{_GVDWork{Float32, Float32}}(_GVDWork{Float32, Float32})
+const _GVDWS_C64 = Base.OncePerThread{_GVDWork{ComplexF64, Float64}}(_GVDWork{ComplexF64, Float64})
+const _GVDWS_C32 = Base.OncePerThread{_GVDWork{ComplexF32, Float32}}(_GVDWork{ComplexF32, Float32})
+@inline _gvdws(::Type{Float64}) = _GVDWS_F64()
+@inline _gvdws(::Type{Float32}) = _GVDWS_F32()
+@inline _gvdws(::Type{ComplexF64}) = _GVDWS_C64()
+@inline _gvdws(::Type{ComplexF32}) = _GVDWS_C32()
 
 # Shared validation for every gvd entry.
 @inline function _gvd_check(itype, jobz, uplo, A, B)

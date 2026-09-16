@@ -330,13 +330,16 @@ const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is ena
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
     clamp(_fh_qr_nb_c() * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _fh_qr_nb_c(), 4 * _fh_qr_nb_c())
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
-const _QR_WS_C = Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
+const _QR_WS_C = Base.OncePerThread{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
+    () -> Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
+)
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
-    V, Tm, G, Wb, Yb = _QR_WS_C[]
+    r = _QR_WS_C()
+    V, Tm, G, Wb, Yb = r[]
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
         V = Matrix{T}(undef, m, nb); Tm = Matrix{T}(undef, nb, nb)
         G = Matrix{T}(undef, nb, nb); Wb = Matrix{T}(undef, nb, n); Yb = Matrix{T}(undef, nb, n)
-        _QR_WS_C[] = (V, Tm, G, Wb, Yb)
+        r[] = (V, Tm, G, Wb, Yb)
     end
     return V, Tm, G, Wb, Yb
 end
@@ -422,18 +425,16 @@ end
 # PureBLAS's cache-blocked gemm! (VᵀV and the trailing get gemm; Y=TᵀW is tiny → scalar).
 # Cached blocked-QR workspace (V m×nb, Tm/G nb×nb, Wb/Yb nb×n) — a fresh 5-matrix alloc per call
 # dominated geqrf at n=32–64. Regrown on demand; single-thread (like the other L3/LAPACK scratches).
-const _QR_WS = Ref{NTuple{5, Matrix{Float64}}}(
-    (
-        Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0),
-        Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0), Matrix{Float64}(undef, 0, 0),
-    )
+const _QR_WS = Base.OncePerThread{Base.RefValue{NTuple{5, Matrix{Float64}}}}(
+    () -> Ref{NTuple{5, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 5))
 )
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
-    V, Tm, G, Wb, Vt = _QR_WS[]                                   # 5th slot repurposed Yb→Vt (nb×m): the
+    r = _QR_WS()
+    V, Tm, G, Wb, Vt = r[]                                   # 5th slot repurposed Yb→Vt (nb×m): the
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n || size(Vt, 2) < m
         V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)   # transposed V for the skinny
         G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Vt = Matrix{Float64}(undef, nb, m)
-        _QR_WS[] = (V, Tm, G, Wb, Vt)                             # W=Vᵀ·C as an unpacked no-trans gemm
+        r[] = (V, Tm, G, Wb, Vt)                             # W=Vᵀ·C as an unpacked no-trans gemm
     end
     return V, Tm, G, Wb, Vt
 end

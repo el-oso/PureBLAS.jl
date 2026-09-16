@@ -118,8 +118,12 @@ end
 # A borrows again and is handed bytes 0..128 — aliasing its own live handle. With a named field the same
 # race corrupts that one role; here it is arbitrary cross-role aliasing. The per-task owner is therefore a
 # PRECONDITION of enabling threads, not an optimisation to weigh against 9-12 ns.
-const _ARENA = Arena()
-@inline _arena() = _ARENA
+# ONE ARENA PER THREAD. A scope records a position and restores it, so two callers sharing one arena
+# would restore each other's positions and hand out overlapping borrows. `OncePerThread` is correct while
+# no scope contains a task-switch point (`test/yield_lint.jl` enforces that); `OncePerTask` is the drop-in
+# if a scope ever has to survive a yield — one line, at a measured 9-21 ns per scope instead of 2-4.
+const _ARENA = Base.OncePerThread{Arena}(Arena)
+@inline _arena() = _ARENA()
 
 @inline function _arena_enter!(a::Arena)
     d = a.depth + 1

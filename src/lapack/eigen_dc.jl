@@ -260,12 +260,13 @@ function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
     return ws
 end
 
-const _EDCWS_F64 = _EDCWork{Float64}()
-const _EDCWS_F32 = _EDCWork{Float32}()
-const _EDCWS_OTHER = IdDict{DataType, Any}()
-@inline _edcws(::Type{Float64}) = _EDCWS_F64
-@inline _edcws(::Type{Float32}) = _EDCWS_F32
-_edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER, T)::_EDCWork{T}
+# One workspace per thread (written during the call) — see `_l3ws`.
+const _EDCWS_F64 = Base.OncePerThread{_EDCWork{Float64}}(_EDCWork{Float64})
+const _EDCWS_F32 = Base.OncePerThread{_EDCWork{Float32}}(_EDCWork{Float32})
+const _EDCWS_OTHER = Base.OncePerThread{IdDict{DataType, Any}}(IdDict{DataType, Any})
+@inline _edcws(::Type{Float64}) = _EDCWS_F64()
+@inline _edcws(::Type{Float32}) = _EDCWS_F32()
+_edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER(), T)::_EDCWork{T}
 
 # --- recursive D&C driver (dlaed0 recursion + dlaed1 merge + dlaed2 deflation + dlaed3 secular solve)
 # d (diag) → eigenvalues ascending; e (subdiag, length n-1) destroyed; Z (n×n) → eigenvectors (Z=I on

@@ -437,3 +437,77 @@ end
         success(p) && @error "electric fence did not fault" stdout = so stderr = se
     end
 end
+
+# PER-THREAD OWNERSHIP. Every buffer a routine writes during a call — the arena and the eleven pools /
+# workspaces (`_l3ws`, trmm pack, symm scratch, LU/complex-LU pads, QR, SVD, SVD-DC, tridiagonal,
+# eigen-DC, generalized-eigen, trsv reciprocals) — is one per THREAD. Two callers sharing one arena would
+# restore each other's positions and hand out overlapping borrows; two callers sharing one pack buffer
+# would pack into the same bytes, and a `resize!` on one side moves memory the other still points into.
+#
+# These items need at least two threads. At `-t 1` they skip: TestItemRunner gives each worker one thread
+# unless JULIA_NUM_THREADS says otherwise.
+@testitem "arena + pools: each thread owns its own" tags = [:checks] begin
+    using PureBLAS, Base.Threads
+    if Threads.nthreads() < 2
+        @info "single-threaded worker — skipping per-thread ownership test"
+        @test_skip Threads.nthreads() >= 2
+    else
+        P = PureBLAS
+        n = Threads.nthreads()
+        ar = Vector{UInt}(undef, n); ws = Vector{UInt}(undef, n); pad = Vector{UInt}(undef, n)
+        Threads.@threads :static for t in 1:n
+            ar[t] = objectid(P._arena())
+            ws[t] = objectid(P._l3ws(Float64))
+            pad[t] = objectid(P._LU_PAD())
+        end
+        @test allunique(ar)
+        @test allunique(ws)
+        @test allunique(pad)
+    end
+end
+
+@testitem "arena + pools: concurrent calls give the same answers as serial ones" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Base.Threads
+    if Threads.nthreads() < 2
+        @info "single-threaded worker — skipping concurrent stress test"
+        @test_skip Threads.nthreads() >= 2
+    else
+        P = PureBLAS
+        nt = Threads.nthreads()
+        # A THREAD-DEPENDENT size on purpose: with one shared pool the threads would grow it against each
+        # other, and a `resize!` while another thread holds a pointer into it is the failure this guards.
+        sz(t) = 16t + 16
+        ops = map(1:nt) do t
+            n = sz(t)
+            A = randn(n, n); B = randn(n, n); U = triu(randn(n, n)) + n * I
+            S = randn(n, n); S = S + S'
+            (A = A, B = B, U = U, S = S)
+        end
+        want = map(1:nt) do t
+            o = ops[t]; n = sz(t)
+            (gemm = o.A * o.B, trsm = o.U \ o.B, symm = o.S * o.B, chol = cholesky(o.S + n * I).U)
+        end
+        bad = zeros(Int, nt)
+        Threads.@threads :static for t in 1:nt
+            o = ops[t]; w = want[t]; n = sz(t)
+            for _ in 1:50
+                C = zeros(n, n); P.gemm!(C, o.A, o.B)
+                isapprox(C, w.gemm; rtol = 1.0e-9) || (bad[t] += 1)
+                X = copy(o.B); P.trsm!(X, o.U; side = 'L', uplo = 'U')
+                isapprox(X, w.trsm; rtol = 1.0e-8) || (bad[t] += 1)
+                Y = zeros(n, n); P.symm!(Y, o.S, o.B)
+                isapprox(Y, w.symm; rtol = 1.0e-9) || (bad[t] += 1)
+                F = copy(o.S) + n * I; P.potrf!(F; uplo = 'U')
+                isapprox(triu(F), w.chol; rtol = 1.0e-8) || (bad[t] += 1)
+            end
+        end
+        @test sum(bad) == 0
+        # Every thread's arena is back at depth 0 with its slabs folded into one.
+        depths = zeros(Int, nt); slabs = zeros(Int, nt)
+        Threads.@threads :static for t in 1:nt
+            a = P._arena(); depths[t] = a.depth; slabs[t] = length(a.slabs)
+        end
+        @test all(iszero, depths)
+        @test all(isone, slabs)
+    end
+end

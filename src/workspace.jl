@@ -83,16 +83,19 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
 # (ForwardDiff.Dual & co. on the generic AD path), which can't have a compile-time owner and isn't a hot
 # path. Complex was on the fallback before — that cost the complex L3 hot path a ~130 ns `get!` per call
 # (and read as a runtime box to static alloc checks); const owners fix both.
-const _L3WS_F64 = L3Workspace{Float64}()
-const _L3WS_F32 = L3Workspace{Float32}()
-const _L3WS_C64 = L3Workspace{ComplexF64}()
-const _L3WS_C32 = L3Workspace{ComplexF32}()
-const _L3WS_OTHER = IdDict{DataType, L3Workspace}()
-@inline _l3ws(::Type{Float64}) = _L3WS_F64
-@inline _l3ws(::Type{Float32}) = _L3WS_F32
-@inline _l3ws(::Type{ComplexF64}) = _L3WS_C64
-@inline _l3ws(::Type{ComplexF32}) = _L3WS_C32
-_l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER, T)::L3Workspace{T}
+# ONE WORKSPACE PER THREAD, per type. These pools are written during a call (the pack buffers are the
+# gemm hot path), so two tasks sharing one would pack into the same bytes. `OncePerThread` keeps the
+# per-type const dispatch and adds one thread-local lookup; see `_arena()` for the per-task alternative.
+const _L3WS_F64 = Base.OncePerThread{L3Workspace{Float64}}(L3Workspace{Float64})
+const _L3WS_F32 = Base.OncePerThread{L3Workspace{Float32}}(L3Workspace{Float32})
+const _L3WS_C64 = Base.OncePerThread{L3Workspace{ComplexF64}}(L3Workspace{ComplexF64})
+const _L3WS_C32 = Base.OncePerThread{L3Workspace{ComplexF32}}(L3Workspace{ComplexF32})
+const _L3WS_OTHER = Base.OncePerThread{IdDict{DataType, L3Workspace}}(IdDict{DataType, L3Workspace})
+@inline _l3ws(::Type{Float64}) = _L3WS_F64()
+@inline _l3ws(::Type{Float32}) = _L3WS_F32()
+@inline _l3ws(::Type{ComplexF64}) = _L3WS_C64()
+@inline _l3ws(::Type{ComplexF32}) = _L3WS_C32()
+_l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER(), T)::L3Workspace{T}
 
 # Per-role accessors. Each returns/grows one owned field.
 

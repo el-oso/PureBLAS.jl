@@ -361,7 +361,7 @@ end
 
 # Reusable padded scratch (like Cholesky): a po2 / stride%512==0 leading dim aliases cache sets, slowing
 # the panel + laswp at large n; factor in an ld=m+8 buffer and copy back.
-const _LU_PAD = Ref(Matrix{Float64}(undef, 0, 0))
+const _LU_PAD = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 @inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
@@ -389,8 +389,9 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     # short-circuits before any `stride` call, preserving the property the original guard was picked for.
     if T === Float64 && _strided1(A) && _lu_needs_pad(A, m)   # factor in a non-conflicting (ld=m+8) scratch
         R = m + 8
-        b = _LU_PAD[]
-        (size(b, 1) < R || size(b, 2) < n) && (b = _LU_PAD[] = Matrix{Float64}(undef, R, n))
+        pad = _LU_PAD()
+        b = pad[]
+        (size(b, 1) < R || size(b, 2) < n) && (b = pad[] = Matrix{Float64}(undef, R, n))
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(eltype(A))
         info = GC.@preserve A b begin
@@ -462,10 +463,10 @@ end
 # row-swaps + trsm/gemm view reads. MEASURED (Zen3): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
 # n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
-const _CLU_PAD64 = Ref(Matrix{ComplexF64}(undef, 0, 0))
-const _CLU_PAD32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
-@inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64
-@inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32
+const _CLU_PAD64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
+const _CLU_PAD32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+@inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64()
+@inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32()
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
     m >= 256 && _strided1(A) && (stride(A, 2) * sizeof(T)) % 4096 == 0   # `_strided1`: see `_getf2!` above
 

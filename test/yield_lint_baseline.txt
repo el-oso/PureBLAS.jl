@@ -1,0 +1,30 @@
+# Reviewed task-switch points in src/. A line here is allowed to yield because it is NOT inside a kernel
+# and holds no `@scope`: per-thread scratch ownership (see src/arena.jl) only requires that no scope is
+# live across a task switch.
+#
+#   lbt.jl   — `activate()`/`status` printing. User-facing IO, no scratch, never called from a kernel.
+#   tune.jl  — the calibration driver: it sleeps while waiting for an idle machine and logs progress.
+#              It runs measurements through public entries; each of those opens and closes its own scope
+#              between the log lines, so no scope is ever live across one.
+#
+# Add a line here ONLY with such a reason. If a KERNEL ever needs to yield, do not baseline it: switch
+# the owners to `Base.OncePerTask` (one line each, measured 14.7 ns vs 1.5 ns per lookup) instead.
+lbt.jl:println(io, "  Call PureBLAS.activate() to forward $reg BLAS/LAPACK symbols to PureBLAS.")
+lbt.jl:println(io, " — $live/$reg forwarded symbols currently routed to PureBLAS kernels.")
+lbt.jl:println(io, "  Every high-level LinearAlgebra op (*, \\, mul!, lu, cholesky, qr, svd, eigen, schur,")
+lbt.jl:println(io, "  eigen(A,B), svd(A,B), least-squares, …) dispatches to PureBLAS. Low-level auxiliary")
+lbt.jl:println(io, "  symbols no high-level op reaches (larf, gebrd, hseqr, tgsen, …) remain OpenBLAS-backed;")
+lbt.jl:println(io, "  see the LAPACK/BLAS coverage docs for the exact list.")
+lbt.jl:println(io, "  Note: BLAS.get_config() still lists libopenblas — that is the LOADED library. activate()")
+lbt.jl:println(io, "  overlays per-symbol @cfunction forwards (lbt_set_forward); it does not swap the loaded")
+lbt.jl:println(io, "  library, so get_config cannot report PureBLAS. This status / is_active() is the check.")
+tune.jl:sleep(5)
+tune.jl:@warn "tune!: machine still busy after $(maxsecs)s; the next run may refuse to measure."
+tune.jl:@info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
+tune.jl:@warn "tune!: calibration run $k failed; skipping it." e
+tune.jl:@warn "tune!: only $(length(results)) of $(repeats) calibration runs produced a result — a " *
+tune.jl:isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
+tune.jl:@info "tune!: `$k` did not agree across runs $(vals) — leaving the default in place."
+tune.jl:@info "tune!: nothing to pin (every knob tied or disagreed). The in-code defaults are adequate \
+tune.jl:@info "PureBLAS.tune!: pinned $(length(agreed)) knob(s)" agreed
+tune.jl:@info "Restart Julia to pick them up. They are read at RUNTIME, so this costs no recompile."

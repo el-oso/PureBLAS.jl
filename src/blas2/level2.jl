@@ -3136,10 +3136,11 @@ const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 # columns (unblocked dispatch at :1695, diagonal blocks ≤ _TRI_NB elsewhere), and it is the only caller.
 # The `n <= length` guard below keeps a pinned-larger `tri_t_unb` correct rather than out-of-bounds.
 const _TRSV_RRCP_N = max(_TRI_NB, _TRI_T_UNB)
-const _TRSV_RRCP64 = Vector{Float64}(undef, _TRSV_RRCP_N)
-const _TRSV_RRCP32 = Vector{Float32}(undef, _TRSV_RRCP_N)
-@inline _trsv_rrcpbuf(::Type{Float64}) = _TRSV_RRCP64
-@inline _trsv_rrcpbuf(::Type{Float32}) = _TRSV_RRCP32
+# One buffer per thread: trsv writes the diagonal reciprocals into it on every call — see `_l3ws`.
+const _TRSV_RRCP64 = Base.OncePerThread{Vector{Float64}}(() -> Vector{Float64}(undef, _TRSV_RRCP_N))
+const _TRSV_RRCP32 = Base.OncePerThread{Vector{Float32}}(() -> Vector{Float32}(undef, _TRSV_RRCP_N))
+@inline _trsv_rrcpbuf(::Type{Float64}) = _TRSV_RRCP64()
+@inline _trsv_rrcpbuf(::Type{Float32}) = _TRSV_RRCP32()
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
 # AVX-512 its per-call/shuffle overhead made per-column faster ≤1024. On AVX2 the scatter now uses the
 # fast OB-structure ri gemv (see _tri_scat_cmplx!), so blocking wins earlier — the unblocked column-axpy
@@ -4092,10 +4093,10 @@ end
 # r[j]=1/diag up front (all independent → pipelined, throughput-bound) with a NAIVE reciprocal (the trsv
 # diagonal is well-conditioned; BLAS doesn't overflow-guard the inner divide), then MULTIPLY in the loop.
 # n ≤ _TRI_C_BLK_MIN (256) unblocked / 64-block ⇒ 512 covers it (else fall back to the divide).
-const _TRSV_RCP64 = Vector{ComplexF64}(undef, 512)
-const _TRSV_RCP32 = Vector{ComplexF32}(undef, 512)
-@inline _trsv_rcpbuf(::Type{Float64}) = _TRSV_RCP64
-@inline _trsv_rcpbuf(::Type{Float32}) = _TRSV_RCP32
+const _TRSV_RCP64 = Base.OncePerThread{Vector{ComplexF64}}(() -> Vector{ComplexF64}(undef, 512))
+const _TRSV_RCP32 = Base.OncePerThread{Vector{ComplexF32}}(() -> Vector{ComplexF32}(undef, 512))
+@inline _trsv_rcpbuf(::Type{Float64}) = _TRSV_RCP64()
+@inline _trsv_rcpbuf(::Type{Float32}) = _TRSV_RCP32()
 @inline _crecip(d::Complex) = (r = real(d); i = imag(d); s = inv(muladd(r, r, i * i)); Complex(r * s, -i * s))
 # The DUAL diagonal reciprocal shares the complex buffer as raw pair storage (dual_l2.md §4.1): 1/(c + dε) =
 # 1/c − (d/c²)ε is stored as the two reals (r, −d·r²) in a Complex slot and read back with `_mkpair` — no complex
