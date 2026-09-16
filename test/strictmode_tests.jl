@@ -11,11 +11,12 @@
 #   * leaf kernels must be alloc-free on EVERY path       → `@test_noalloc` (the proof)
 #   * drivers holding grow-once scratch are alloc-free in  → `@test (@allocated f(...)) == 0`, after
 #     STEADY STATE, not on the first call                    a warm-up, as gemm_tests.jl does
-# A driver cannot use the proof: it can statically reach `gemm!` → `_gemm_strassen!`, whose pad/level
-# pool is a lazily sized `Vector{Matrix}` (workspace.jl `_str_fit!`), and an all-paths proof counts
-# that branch even where it is runtime-dead. StrictMode 0.4's `register_alloc_barrier!` would exempt
-# it, but it is a PROCESS-GLOBAL exemption and the pool re-allocates on shape change — so it would
-# weaken every other `@test_noalloc` here to buy a claim that is not quite true.
+# Most drivers cannot use the proof: they statically reach allocation sites an all-paths proof counts
+# even where the branch is runtime-dead. `gemm!` is the exception since `5f4a2eae` — every L3 pool it
+# reaches is GROW-ONLY and grows through one `@noinline` function, so the barrier exemption states
+# something true. That proof is the `gemm!` item at the end of this file; it registers the barriers,
+# proves, then unregisters, because the registration is session-wide and would otherwise weaken every
+# other `@test_noalloc` in the same worker.
 
 @testitem "StrictMode dogfood: BLAS-1 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: TypeContracts 0.14.0's @verify emits a `_seal_verified!(@__MODULE__,…)`
@@ -616,5 +617,60 @@ end
         @test_trim_compatible P.pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
         @test_trim_compatible P.pptrf!(pack(She); uplo = 'L')
         @test true
+    end
+end
+
+# `gemm!` IS allocation-free on every path, and this proves it rather than warming a counter.
+#
+# AllocCheck's all-paths proof has exactly two escapes: delete the allocation site, or route it through
+# a registered barrier. `5f4a2eae` made the second one TRUE for the L3 pools — every pool (gemm/syr2k
+# packs, the 3M buffers, the Strassen level/pad slots, `strbt`) is grow-only and grows through ONE
+# `@noinline` function, `_ws_grow!`/`_ws_slot!`; the arena's own growth is `_arena_grow!`. A registered
+# barrier must BE the `:invoke` callee, which is why those three are `@noinline` at their definitions.
+#
+# The registration is session-wide and keyed on function identity, so this item UNREGISTERS afterwards:
+# left in place it would exempt those functions from every other `@test_noalloc` in the same worker.
+# The runtime `@allocated` checks elsewhere stay — they assert a different property (steady state on a
+# concrete shape) and they catch a pool that grows when it should not.
+@testitem "StrictMode dogfood: gemm! is statically allocation-free (barrier-exempt pools)" tags = [:checks] begin
+    using StrictModeTest, StrictMode, LinearAlgebra, ForwardDiff
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping gemm! static noalloc proof"
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!)
+            StrictMode.register_alloc_barrier!(f)
+        end
+        try
+            n = 64
+            A = randn(n, n); B = randn(n, n); C = zeros(n, n)
+            P.gemm!(C, A, B)                                   # warm: grow every pool once
+            @test_noalloc P.gemm!(C, A, B)
+            D = ForwardDiff.Dual{Nothing, Float64, 1}
+            Ad = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
+            Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
+            Cd = zeros(D, n, n)
+            P.gemm!(Cd, Ad, Bd)
+            @test_noalloc P.gemm!(Cd, Ad, Bd)
+            # POSITIVE CONTROL. `@test_noalloc` throws instead of recording a result, so a silent item
+            # would look identical to a vacuous one. With the exemption off, the pools' growth counts
+            # again and the SAME proof must fail — if this stops failing, the item proves nothing.
+            threw = false
+            set_ignore_barrier!(false)
+            try
+                @test_noalloc P.gemm!(C, A, B)
+            catch
+                threw = true
+            finally
+                set_ignore_barrier!(true)
+            end
+            @test threw
+        finally
+            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!)
+                delete!(StrictMode._ALLOC_BARRIERS, f)         # internal: no public unregister exists
+            end
+            StrictMode.clear_cache!()                          # the registration cached verdicts
+        end
     end
 end
