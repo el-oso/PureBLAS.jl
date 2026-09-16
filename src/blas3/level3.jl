@@ -835,7 +835,6 @@ end
 # O(mk) ≪ O(mk²/2)); op(A) packs per pc-block into nr-panels with zeros outside the triangle and only
 # the rows each column-tile actually contracts (per-tile K-trim at nr granularity — the trim that kept
 # the flat/recursion versions from gemm efficiency lived at panel granularity). Real non-conj.
-const _TRMM_BCR = Ref(Matrix{Float64}(undef, 0, 0))
 function _pack_B_triR!(
         Bp::Vector{T}, A, pc::Int, kce::Int, k::Int, upM::Bool, tr::Bool,
         unit::Bool, nr::Int
@@ -1149,13 +1148,14 @@ end
 # GKH ownership: const-dispatch the gated real types (_trmm_packed! is BlasReal-only, so Float64/Float32
 # are the only hot callers) → bare field load, no runtime `get!` (~130 ns) and no box signal. IdDict stays
 # as the open-ended fallback only.
-const _TRMM_BPF = IdDict{DataType, Vector}()
-const _TRMM_BPF_F64 = Float64[]
-const _TRMM_BPF_F32 = Float32[]
-@inline _trmm_bpf(::Type{Float64}, len::Int) = _ws_grow!(_TRMM_BPF_F64, len)   # one growth point (workspace.jl)
-@inline _trmm_bpf(::Type{Float32}, len::Int) = _ws_grow!(_TRMM_BPF_F32, len)
+# One buffer per thread (it is written during the call) — see `_l3ws`.
+const _TRMM_BPF = Base.OncePerThread{IdDict{DataType, Vector}}(IdDict{DataType, Vector})
+const _TRMM_BPF_F64 = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
+const _TRMM_BPF_F32 = Base.OncePerThread{Vector{Float32}}(() -> Float32[])
+@inline _trmm_bpf(::Type{Float64}, len::Int) = _ws_grow!(_TRMM_BPF_F64(), len)   # one growth point (workspace.jl)
+@inline _trmm_bpf(::Type{Float32}, len::Int) = _ws_grow!(_TRMM_BPF_F32(), len)
 function _trmm_bpf(::Type{T}, len::Int) where {T}
-    v = get!(() -> T[], _TRMM_BPF, T)::Vector{T}
+    v = get!(() -> T[], _TRMM_BPF(), T)::Vector{T}
     return _ws_grow!(v, len)
 end
 function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} = Val(_MR)) where {T <: BlasReal, MRV}
@@ -2178,7 +2178,7 @@ const _CTRSM_DIRECT_MAX = @load_preference("ctrsm_direct_max", 64)::Int
     min(
     let f = _FKR_ctrsm_direct_max[]
         f >= 0 ? f : _CTRSM_DIRECT_MAX
-    end, length(_TRSV_RCP64)
+    end, length(_TRSV_RCP64())
 )
 # Complex trsm-L recursion base for NARROW B (nrhs ≤ _CTRSM_NCUT): blocks > this SPLIT (row-halve + gemm
 # off-diagonal update, OB's structure); ≤ this bottom out in a small j-outer base. Monolithic j-outer caps
@@ -6496,39 +6496,44 @@ end
 # symm's output C is a FULL matrix (no triangle), so symm = gemm with a materialized full symmetric
 # A — correct flops (NO 2× waste, unlike syrk). Materialize the symmetric/Hermitian A into a dense
 # scratch (O(n²), amortized over the O(n²·m) gemm), then one gemm! carries α and β directly.
-const _SYMM_SCR = IdDict{DataType, Matrix}()
+const _SYMM_SCR = Base.OncePerThread{IdDict{DataType, Matrix}}(IdDict{DataType, Matrix})
 function _symm_scr(::Type{T}, n::Int) where {T}
-    m = get(_SYMM_SCR, T, nothing)
+    d = _SYMM_SCR()
+    m = get(d, T, nothing)
     if isnothing(m) || size(m, 1) < n
-        m = Matrix{T}(undef, n, n); _SYMM_SCR[T] = m
+        m = Matrix{T}(undef, n, n); d[T] = m
     end
     return m::Matrix{T}   # the IdDict values are abstract `Matrix` — assert or the view boxes (hemm 160 B)
 end
 # Const-dispatch the gated types (the IdDict get costs ~130 ns — dominates tiny symm/hemm). Complex too:
 # ComplexF64/F32 are the exact types hitting the tiny-n symm/hemm reds, and they were falling through to
 # the generic IdDict method above (~130 ns/call). Owned Refs kill that (GKH ownership, no runtime lookup).
-const _SYMM_SCR_F64 = Ref(Matrix{Float64}(undef, 0, 0))
-const _SYMM_SCR_F32 = Ref(Matrix{Float32}(undef, 0, 0))
-const _SYMM_SCR_C64 = Ref(Matrix{ComplexF64}(undef, 0, 0))
-const _SYMM_SCR_C32 = Ref(Matrix{ComplexF32}(undef, 0, 0))
+const _SYMM_SCR_F64 = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+const _SYMM_SCR_F32 = Base.OncePerThread{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
+const _SYMM_SCR_C64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
+const _SYMM_SCR_C32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
 @inline function _symm_scr(::Type{Float64}, n::Int)
-    m = _SYMM_SCR_F64[]
-    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); _SYMM_SCR_F64[] = m)
+    r = _SYMM_SCR_F64()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); r[] = m)
     return m
 end
 @inline function _symm_scr(::Type{Float32}, n::Int)
-    m = _SYMM_SCR_F32[]
-    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); _SYMM_SCR_F32[] = m)
+    r = _SYMM_SCR_F32()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
     return m
 end
 @inline function _symm_scr(::Type{ComplexF64}, n::Int)
-    m = _SYMM_SCR_C64[]
-    size(m, 1) < n && (m = Matrix{ComplexF64}(undef, n, n); _SYMM_SCR_C64[] = m)
+    r = _SYMM_SCR_C64()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{ComplexF64}(undef, n, n); r[] = m)
     return m
 end
 @inline function _symm_scr(::Type{ComplexF32}, n::Int)
-    m = _SYMM_SCR_C32[]
-    size(m, 1) < n && (m = Matrix{ComplexF32}(undef, n, n); _SYMM_SCR_C32[] = m)
+    r = _SYMM_SCR_C32()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{ComplexF32}(undef, n, n); r[] = m)
     return m
 end
 # Tile edge for the symmetric/Hermitian → dense fill. DERIVE tier: the mirror half is a TRANSPOSE, so
