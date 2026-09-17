@@ -1210,14 +1210,36 @@ Measured, not assumed — three bisects, each one full dogfood run:
 So the cause is exactly those two scheduler calls, and every threading design has them. The repo's
 established remedy is to make the scheduler unreachable, which here would mean not threading at all.
 
+**The blast radius is wider than one item.** The full suite on this branch fails in exactly two places,
+both the same artifact with the same "2 JET report(s)" signature, and nothing else:
+
+- `test/dual_tests.jl:487` — `trmm!`/`trsm!` on `ForwardDiff.Dual`;
+- `test/strictmode_tests.jl:379` — the eigen family's `test_signatures`, 4 findings: `gehrd!`,
+  `ormhr!` and two more, all of which reach `gemm!` for their block updates.
+
+Everything else in the suite passes, including the new threaded-gemm items and the `:checks` dogfood.
+So the decision below is not about one awkward test; it is about whether a threaded `gemm!` may be
+reachable from routines that carry JET-backed type-stability guarantees.
+
 Three ways forward, and **the choice is the user's** because each one changes either a shipped
 guarantee or the milestone's shape:
 
 1. **Thread only at the public `gemm!` boundary** — route the 29 internal `gemm!` call sites in
    `level3.jl` and `lapack/*` to `_gemm_core!`, which several already do deliberately. The dogfood
-   stays intact and threading becomes a decision each routine makes explicitly. Cost: trmm/trsm and
-   every blocked LAPACK driver never thread, so M4 needs a per-routine plan instead of getting them
-   free.
+   stays intact and threading becomes a decision each routine makes explicitly.
+   **Now priced, and it is expensive** (`bench/probes/lapack_thread_effect.jl`, frequency-locked, one
+   binary with `set_num_threads` as the only difference between arms, so the A/B is paired):
+
+   | op | n=256 | n=512 | n=1024 | n=2048 |
+   |---|---|---|---|---|
+   | potrf | 1.00 | 1.02 | 1.00 | 1.00 |
+   | getrf | 1.07 | 1.28 | 1.38 | **2.22** |
+   | geqrf | 1.00 | 1.40 | 1.24 | **1.45** |
+
+   Nothing regresses (worst cell 1.00), so this option would GIVE UP getrf 2.22× and geqrf 1.45× at
+   n=2048 to keep a lint clean about an artifact the repo already calls harmless. Note also that
+   **potrf gains nothing at any size** — it does not route its trailing update through `gemm!`, so it
+   needs its own splitter (syrk/trsm) regardless of which option is chosen.
 2. **Narrow the dogfood** for `trmm!`/`trsm!`, citing the recorded artifact. Cheapest, and it weakens
    a real guarantee on a real routine — not something to do unilaterally.
 3. **Compile threading out unless a preference is pinned.** Matches the repo's existing pattern for
