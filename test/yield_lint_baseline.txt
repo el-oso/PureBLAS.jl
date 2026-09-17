@@ -41,6 +41,6 @@ tune.jl:@info "tune!: `$k` did not agree across runs $(vals) — leaving the def
 tune.jl:@info "tune!: nothing to pin (every knob tied or disagreed). The in-code defaults are adequate \
 tune.jl:@info "PureBLAS.tune!: pinned $(length(agreed)) knob(s)" agreed
 tune.jl:@info "Restart Julia to pick them up. They are read at RUNTIME, so this costs no recompile."
-blas3/gemm.jl:(@atomic p.gen) == seen && wait(p.evs[i])
+blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:Threads.@spawn _gemm_pool_worker(p, i)
 blas3/gemm.jl:(@atomic p.done) < nw - 1 && yield()
