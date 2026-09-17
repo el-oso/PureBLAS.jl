@@ -248,13 +248,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-33 `const _X = <literal>` values in `src/` with no `@load_preference`.
+36 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 29 Literal · 3 Exempt · 1 Unaudited.
+**Tier:** 32 Literal · 3 Exempt · 1 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -359,3 +359,6 @@ on these, not on knobs.
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
+| `_MT_AMORTISE` | 32 | Literal | a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s |
+| `_MT_JOIN_CYCLES` | 1720 | Literal | the fork-join protocol's fixed cost in cycles. It is a property of the coherence |
+| `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
