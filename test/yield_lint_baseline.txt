@@ -7,10 +7,12 @@
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
 #
-#   gemm.jl  — the M4 thread pool, and these three lines are the ONLY yields in a kernel file, so read
-#              the reason carefully before adding a fourth.
+#   gemm.jl  — the M4 thread pool, and these four lines are the ONLY yields in a kernel file, so read
+#              the reason carefully before adding a fifth.
 #              * `Threads.@spawn _gemm_pool_worker` — pool construction, once per process, before any
 #                gemm has borrowed anything.
+#              * `lock(_MT_SETUP_LOCK) do` in `set_num_threads` — the same construction path, serialised
+#                so two concurrent first calls cannot each push a pool. Never reached from `gemm!`.
 #              * `wait(p.evs[i])` — an IDLE worker parking between jobs. It holds no scope: it has not
 #                been given a chunk yet, and the chunk it ran last returned before this line.
 #              * `yield()` in the driver's join — the driver has finished its OWN chunk (so its scope is
@@ -44,3 +46,4 @@ tune.jl:@info "Restart Julia to pick them up. They are read at RUNTIME, so this 
 blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:Threads.@spawn _gemm_pool_worker(p, i)
 blas3/gemm.jl:(@atomic p.done) < nw - 1 && yield()
+blas3/gemm.jl:lock(_MT_SETUP_LOCK) do

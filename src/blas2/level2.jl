@@ -180,6 +180,7 @@ const _GEMVN_MINNER_U = 4    # row-vector unroll (U·W rows/step): independent y
 #          fleet-verified AVX2 config).
 # PDM: Derived — formula over detected consts: `max(2, _L1D_ASSOC - 2`
 const _GEMVN_NP_NARROW = @load_preference("gemvn_np_narrow", max(2, _L1D_ASSOC - 2))::Int
+# PDM: Derived — formula over detected consts: register-capped `min(12, _NVREG - U - 1)` on a 32-register ISA, associativity-capped `_L1D_ASSOC` on 16 (the "wide" regime above)
 const _GEMVN_NP_WIDE = @load_preference(
     "gemvn_np_wide",
     _NVREG >= 32 ? min(12, _NVREG - _GEMVN_MINNER_U - 1) : _L1D_ASSOC

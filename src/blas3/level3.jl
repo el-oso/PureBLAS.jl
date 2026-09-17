@@ -1935,6 +1935,7 @@ const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
 # fine); A's panel is, and NR=4 doubles the number of A re-reads on AVX2. `min` with the stripe bound
 # keeps a hypothetical huge-L2 box from blowing L1. The real path learned the same lesson the same way
 # (_TRSM_FUSED_BASE keeps a literal 128 on non-AVX-512 because a bigger base REGRESSES n=256).
+# PDM: Derived — formula over detected consts: L2 residency of A's KC×KC panel, `isqrt(_L2_BYTES ÷ sizeof(ComplexF64))`, min'd with the L1 stripe bound; fleet-validated on Zen4+Zen3
 const _ZGT_BASE = @load_preference(
     "ztrsm_gt_base",
     min(
@@ -2289,6 +2290,7 @@ end
 # Measured: the un-rounded 5 left a 4-column tail per call and regressed ztrsmR@512 0.979→0.965 (spread
 # 0.001, so 14× the noise) while helping the sizes whose base call happened to divide evenly.
 # (the register count is spelled out rather than reusing `_GT_NREG`, which this file defines further down)
+# PDM: Derived — formula over detected consts: `prevpow(2, √(KC/2))` from the load-vs-fma balance at the base size, clamped by the register file `(nreg - 4) ÷ 2`
 const _ZRT_NC = @load_preference(
     "ztrsm_zrt_nc",
     clamp(prevpow(2, max(2, isqrt(_fh_ctrsm_rec_l() ÷ 2))), 2, ((_SIMD_BYTES >= 64 ? 32 : 16) - 4) ÷ 2)
@@ -2512,6 +2514,7 @@ const _GT_TRANSPOSE = (_GT_W == 8)
 # warm-micro MIS-TUNE — full-L1 nets +1.5–5.8pt on Zen4 (n=32 0.918→0.976, n≥512 +1.5–3.6pt), Zen5 INSENSITIVE
 # (safe). Non-AVX-512: keep the 128 literal — Zen3/AVX2 optimum (measured; a bigger base REGRESSES it, n=256
 # 0.996→0.85). req#8 Preferences-override "trsm_fused_base" still applies for calibration.
+# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; the non-AVX-512 arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
 const _TRSM_FUSED_BASE = @load_preference(
     "trsm_fused_base",
     _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
@@ -4121,6 +4124,7 @@ const _TRSM_FULLPACK_MAX = isqrt(_L3_BYTES ÷ sizeof(Float64))
 # P from L2, erasing the recursion's small-leaf L1 locality edge, so its lower overhead takes over): k ≥
 # 2·L1/(NR·sizeof). Measured Zen4 crossover is 256<k≤384; the formula gives ≈342. EMPIRICAL crossover —
 # req#8 debt (derive+fleet-validate), Preferences-overridable. Measured net: 512 0.889→0.90, 1024 0.94→0.97.
+# PDM: Derived — formula over detected consts: `cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64))`, the k at which the P-stripe outgrows 2·L1 (Zen4 measured 256<k≤384, formula 342; fleet validation still owed)
 const _TRSM_FULLPACK_MIN = @load_preference(
     "trsm_fullpack_min",
     cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64))
