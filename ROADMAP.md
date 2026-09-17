@@ -1276,8 +1276,13 @@ unconditional notify, which cannot lose a wake.
 
 - The threshold `_MT_JOIN_CYCLES` is measured on wintermute ONLY — req#8(b) needs galen and neuromancer
   before it is trusted to extrapolate.
-- n=192 (2.60) and n=1536 (3.13) sit below their neighbours; the chunk/`_NR` alignment and the DRAM
-  regime are the two suspects, neither measured.
+- **Scaling is 55% efficient at n=192 and 73% at n=1024, and chunk imbalance is NOT the reason.**
+  Measured the actual split (`_NR = 8`, 5 workers): n=192 → 32/40/40/40/40 columns, 4% above ideal;
+  n=256 → 48/48/56/48/56, 9%; n=1024 and n=1536 → 1.6%. Nowhere near the 45% shortfall, so imbalance
+  is excluded. Fork-join is excluded too by arithmetic: 1.3 µs against 65 µs of per-worker work at
+  n=192 is 2%. The remaining candidate, NOT yet measured, is that a column split has **every worker
+  read and pack the whole of A** — at n=192 that is five copies of a 295 KB panel. A two-dimensional
+  split (m as well as n) is what would reduce it, and that is a build, not a tweak.
 - **Every blocked LAPACK driver now threads for free, and NONE of that is measured.** `potrf!`,
   `getrf!`, `geqrf!` and the rest call `gemm!` for their trailing updates, so on a threaded process
   those updates now split. That may be a large win or a loss to fork-join churn on small trailing
