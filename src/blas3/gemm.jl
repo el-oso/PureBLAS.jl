@@ -3285,6 +3285,343 @@ end
 @noinline _throw_gemm_k(k::Int) =
     throw(DimensionMismatch(lazy"gemm!: inner dimensions disagree (k=$k)"))
 
+# ══ M4: THREADED GEMM ═══════════════════════════════════════════════════════════════════════════════
+# ONE split, in ONE place: the COLUMNS of C. Chunk `jr` is `C[:,jr] := α·op(A)·op(B)[:,jr] + β·C[:,jr]`,
+# which is a complete gemm in its own right, so every route below (tiny, Strassen, unpacked, blocked)
+# runs unchanged and none of them has to know it is running in parallel. `A` is read by every worker and
+# written by none; `B` and `C` are partitioned by column; so the only shared state is read-only and the
+# join is the only barrier.
+#
+# WHY THE SPLIT IS HERE, ABOVE `_gemm_core!`. Scratch is owned per THREAD (`_l3ws`, `_arena`), and that
+# is sound only because a kernel never yields — `test/yield_lint.jl` enforces it. A chunk body is an
+# ordinary gemm and yields nowhere, so two workers can never interleave on one thread's scratch. The
+# DRIVER does yield, at the join. So the split must sit where no borrow is live yet. **Do not move it
+# below a `@scope`**: that would hand one thread's arena to two tasks at once.
+#
+# WHY A PARKED POOL AND NOT `Threads.@spawn`. Req#10 — a `!` entry must not allocate — is not advisory
+# here: `gemm!` carries a static all-paths no-allocation proof (`test/strictmode_tests.jl`), and a task
+# spawned per call allocates on a reachable path, which fails that proof at compile time whether or not
+# threads are running. The pool allocates ONCE, at first use, behind `_gemm_pool_start!` — the same
+# registered-barrier shape as `_ws_grow!`. Measured on Zen4 (bench/probes/threading_forkjoin_cost.jl,
+# 4 workers): a pool wake is **616 ns** against **3058 ns** for `@spawn`+`fetch`.
+#
+# WHY THE POOL BLOCKS INSTEAD OF SPINNING. Same probe: a pool that spin-waits while IDLE made an
+# unrelated `@spawn` workload in the same process **3.38x slower**. A library may not tax its host for
+# doing nothing, so the workers wait on an event and are descheduled between calls.
+
+# PDM tier: DERIVE. The criterion is AMORTISATION and both of its terms are detected, not tuned.
+#   * The fork-join protocol costs a fixed number of CYCLES — a few cache-line round trips between the
+#     driver and the workers. That is a property of the coherence fabric, not of the kernel, so it does
+#     not scale with problem size and it is the thing that has to be amortised.
+#   * A core retires `_mt_flops_per_cycle(T)` flops: 2 flops per FMA, times the lanes, times two FMA
+#     pipes — halved on a double-pumped datapath, where a 512-bit FMA occupies the 256-bit pipes twice
+#     and so has the SAME throughput as the 256-bit form (kb `double-pumped-avx512-no-gain`).
+# A worker may only be woken for at least `_MT_AMORTISE` times the join cost, so the fixed price can
+# never exceed 1/`_MT_AMORTISE` of the call.
+#
+# `_MT_JOIN_CYCLES` is a MEASURED literal and is marked as such: 616 ns at wintermute's 2.79 GHz base
+# clock is ~1720 cycles. It is a protocol constant in the same sense as `_l1_block`'s ½, but it has been
+# measured on ONE box so far — galen and neuromancer must confirm it before it is trusted to extrapolate
+# (req#8 (b): derive → validate on the fleet → ship). req8-ok pending that check.
+# PDM: Literal — the fork-join protocol's fixed cost in cycles. It is a property of the coherence
+# fabric (a few cache-line round trips between driver and workers), not of the kernel or the cache
+# hierarchy, so no detected const predicts it and no formula is available. MEASURED ON ONE BOX SO FAR:
+# 616 ns for 4 workers at wintermute's 2.79 GHz base clock. galen and neuromancer must confirm it
+# before this is trusted to extrapolate — req#8(b). NOT req8-ok yet; this is named debt.
+const _MT_JOIN_CYCLES = 1720
+# PDM: Literal — a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s
+# 3/10: it states how much of a call the fixed join cost may consume (here at most 1/32), which is a
+# policy about acceptable overhead, not a property of any particular machine.
+const _MT_AMORTISE = 32
+@inline _mt_flops_per_cycle(::Type{T}) where {T} =
+    4 * (_double_pumped(_HW) ? max(1, _vwidth(T) ÷ 2) : _vwidth(T))
+# PDM: Derived — amortisation: a worker is only woken for at least `_MT_AMORTISE` times the fork-join
+# cost, priced in flops from the detected vector width and FMA datapath (`_mt_flops_per_cycle`).
+const _GEMM_MT_WORK = @load_preference(
+    "gemm_mt_work", _MT_JOIN_CYCLES * _MT_AMORTISE * _mt_flops_per_cycle(Float64)
+)::Int
+
+"""
+    _gemm_workers(m, n, k) -> Int
+
+Workers to split this gemm across; `1` means "run it serially on the calling thread". Capped three
+ways: by the threads that exist, by the amortisation floor above, and by `n` — a worker that cannot be
+given a whole `_NR`-wide column block is a worker whose microkernel runs ragged, which costs more than
+the thread saves.
+"""
+@inline function _gemm_workers(m::Int, n::Int, k::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    # Early-out BEFORE any division. This predicate sits on the entry of every gemm, including the ones
+    # that take tens of nanoseconds, and an integer divide is ~20-40 cycles — so the small-call path
+    # must reach a decision with multiplies and compares only. (On a single-threaded process the line
+    # above already ends it, which is why the gate never sees this at all.)
+    flops = 2 * m * n * k
+    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+end
+
+# The job is a set of ISBITS fields on a pre-existing mutable struct, not a closure and not a tuple of
+# containers: writing them allocates nothing, and pointers keep the struct concrete, so the pool does
+# not need a type parameter per container combination. That is also why threading is restricted to the
+# `_strided1` path — which is where every gemm big enough to be worth a thread already lives.
+mutable struct GemmPool{T}
+    @atomic gen::Int                 # bumped to publish a job; also the shutdown signal when negative
+    @atomic done::Int                # workers that have finished the current job
+    @atomic busy::Bool               # a claim, so two concurrent gemms cannot share one pool
+    @atomic failed::Bool             # a worker's chunk threw; the driver turns this into an error
+    const evs::Vector{Threads.Event} # one wake per worker
+    nw::Int                          # workers THIS call wants; surplus workers stand down
+    # ── job ──
+    Cp::Ptr{T}; Ap::Ptr{T}; Bp::Ptr{T}
+    m::Int; n::Int; k::Int
+    ldc::Int; lda::Int; ldb::Int
+    alpha::T; beta::T
+    tA::Bool; tB::Bool; cA::Bool; cB::Bool
+end
+
+# Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
+# every worker but the last drives full-width microkernel tiles.
+@inline function _gemm_chunk(n::Int, nw::Int, i::Int)
+    blocks = cld(n, _NR)
+    b0 = ((i - 1) * blocks) ÷ nw
+    b1 = (i * blocks) ÷ nw
+    j0 = b0 * _NR
+    return j0, min(n, b1 * _NR) - j0
+end
+
+# op(B)'s column slice. With `tB`, B is stored n×k and op(B)[:,jr] is B[jr,:] — a ROW slice, which is
+# the same leading dimension at an element offset, not a column offset. Both cases are one PtrMatrix.
+@inline function _gemm_bchunk(p::GemmPool{T}, j0::Int, len::Int) where {T}
+    return p.tB ? PtrMatrix{T}(p.Bp + j0 * sizeof(T), len, p.k, p.ldb) :
+        PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.k, len, p.ldb)
+end
+
+@inline function _gemm_run_chunk(p::GemmPool{T}, i::Int) where {T}
+    j0, len = _gemm_chunk(p.n, p.nw, i)
+    len > 0 || return nothing
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
+    Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
+    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB)
+    return nothing
+end
+
+# SPIN, THEN SLEEP — and the spin window is the whole design, not a detail. Measured (same probe, 4
+# workers, Zen4): a pool that only spins wakes in 570 ns but makes an unrelated workload in the same
+# process 3.11x slower while doing NOTHING; a pool that only sleeps costs ~4000 ns per wake, which is
+# worse than `@spawn`. Back-to-back BLAS calls land inside the spin window and pay the cheap price; an
+# idle process falls through to the sleep and costs its host nothing.
+#
+# The protocol has one trap, and `_SLEEPING` is the answer to it. A worker that found its job by
+# SPINNING must never later consume an event that was set for that same job — it would wake, see no new
+# generation, and spin again forever. So a worker ANNOUNCES that it is about to sleep, re-checks the
+# generation after announcing (or the wake races ahead of the sleep and is lost), and the driver wakes
+# only workers that announced.
+# PDM: Literal — how long an idle worker keeps spinning before it sleeps, in fence iterations. This is
+# a POLITENESS window, not a performance tuning: the two ends are measured and far apart (spin-only
+# wakes in 570 ns but taxes an unrelated workload in the same process by 3.1-3.4x; sleep-only costs
+# ~4000 ns and taxes nothing), so any value in a wide middle band buys the same thing — back-to-back
+# calls stay cheap, an idle process stops burning cores. It is the same knob OpenBLAS spells
+# THREAD_TIMEOUT. No detected const predicts it because the criterion is the HOST's behaviour, not the
+# hardware's.
+const _MT_SPINS = 2048
+
+@noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
+
+function _gemm_pool_worker(p::GemmPool, i::Int)
+    seen = 0
+    while true
+        # WAIT IN A LOOP AROUND THE PREDICATE, not on the wake. An event set for a job this worker
+        # already found by SPINNING is still set the next time it tries to sleep, so `wait` returns at
+        # once and proves nothing. The GENERATION is what says there is work. Without this loop that
+        # stale event makes the worker re-run the PREVIOUS chunk over live output — silently wrong
+        # results, and a `done` count that runs ahead of the driver.
+        while (@atomic p.gen) == seen
+            spun = false
+            for _ in 1:_MT_SPINS
+                if (@atomic p.gen) != seen
+                    spun = true
+                    break
+                end
+                Base.Threads.atomic_fence()
+            end
+            spun && break
+            wait(p.evs[i])
+        end
+        seen = @atomic p.gen
+        seen < 0 && return                      # shutdown
+        # A pool holds `nw_max` workers but a given call may want fewer; the surplus wake, see they are
+        # out of range, and go back to waiting WITHOUT touching `done`.
+        if i < p.nw
+            # `done` MUST be bumped even when the chunk throws. An unhandled exception in a `@spawn`ed
+            # task is stored in the task and surfaces only on `fetch`, which nothing here calls — so a
+            # worker that died would leave the driver waiting on a count that can never arrive. The
+            # flag turns that silent hang into a loud error at the call site.
+            try
+                _gemm_run_chunk(p, i)
+            catch
+                @atomic p.failed = true
+            finally
+                @atomic p.done += 1
+            end
+        end
+    end
+end
+
+# One pool per element type, created on first threaded use. `@noinline` with a single call site so the
+# allocation it does — the tasks, the events — is ONE registered barrier, exactly like `_ws_grow!`.
+@noinline function _gemm_pool_start!(p::GemmPool)
+    for i in 1:length(p.evs)
+        Threads.@spawn _gemm_pool_worker(p, i)
+    end
+    return p
+end
+
+@inline function _gemm_pool_new(::Type{T}) where {T}
+    nwmax = max(1, Threads.nthreads() - 1)
+    p = GemmPool{T}(
+        0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax], 1,
+        Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
+        zero(T), zero(T), false, false, false, false
+    )
+    return _gemm_pool_start!(p)
+end
+
+# Process-wide, one per element type — NOT per thread. A pool IS the shared resource; a per-thread pool
+# would give every caller its own set of workers and oversubscribe the machine immediately.
+#
+# A ONE-ELEMENT VECTOR, NOT `Base.OncePerProcess`, and the reason is recorded rather than guessed. A
+# `OncePerProcess` reachable from a kernel takes a `lock()` on its first call, and that lock descends
+# through `yield()`/`wait()` into Base's own `OncePerThread{Task}` scheduler, which JET reports as
+# "failed to optimize due to recursion". `test/Project.toml` already documents this exact artifact for
+# `gemvn_minner` — "Nothing in PureBLAS is unstable there; the fix is to stop compiling the resolver in
+# at all" — and its remedy there is a pin, which is not available to a pool that must exist at runtime.
+# So the pool is never created ON the gemm path: `set_num_threads` creates it, and `gemm!` only ever
+# reads `_MT_NTHREADS`, one atomic integer. An empty vector means threading is off; a `const` empty
+# `Vector` is precompile- and trim-safe, and reading element 1 of a concretely typed vector keeps every
+# consumer type-stable with no union in sight.
+const _GEMM_POOL_F64 = GemmPool{Float64}[]
+const _GEMM_POOL_F32 = GemmPool{Float32}[]
+@inline _gemm_poolvec(::Type{Float64}) = _GEMM_POOL_F64
+@inline _gemm_poolvec(::Type{Float32}) = _GEMM_POOL_F32
+@inline _gemm_pool(::Type{T}) where {T} = @inbounds _gemm_poolvec(T)[1]
+
+# Workers a threaded call may use, 1 = off. One atomic integer so the gemm entry costs a single load.
+const _MT_NTHREADS = Threads.Atomic{Int}(1)
+
+"""
+    set_num_threads(n::Integer) -> Int
+
+Use at most `n` threads inside PureBLAS's threaded kernels, and return the value actually set. `1`
+turns threading off. Capped at `Threads.nthreads()`, because the workers are Julia tasks and there is
+nothing to run them on beyond that.
+
+Threading is **off until you call this**. That is deliberate: a BLAS that silently takes every thread
+in the process is a surprise to whatever else the process is doing, and the shape matches
+`openblas_set_num_threads`, which is what a host expects to find.
+
+The worker pool is created on the first call that asks for more than one thread, and lives for the rest
+of the process — upstream reports that adopted threads which come and go leak their thread storage and
+heap, so a pool is created once and never retired. Later calls only change how many of those workers a
+call may use; they do not create or destroy threads.
+"""
+function set_num_threads(n::Integer)
+    nt = clamp(Int(n), 1, Threads.nthreads())
+    if nt > 1
+        isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
+        isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
+    end
+    _MT_NTHREADS[] = nt
+    return nt
+end
+
+"""
+    get_num_threads() -> Int
+
+Threads PureBLAS's threaded kernels may use; `1` means threading is off. See [`set_num_threads`](@ref).
+"""
+get_num_threads() = _MT_NTHREADS[]
+
+"""
+    _gemm_threaded!(C, A, B, alpha, beta, tA, tB, cA, cB, nw) -> nothing
+
+Run one gemm across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with
+the same result, whenever the pool is already in use — see the claim below.
+"""
+# The operands are NORMALIZED to `PtrMatrix` by the caller, and the signature says so on purpose. It
+# gives the whole threaded path exactly ONE specialization per element type instead of one per
+# container combination — the same reason the unpacked route normalizes (see `_pm`/`_root` above, and
+# the specialization census that motivated it). It is not only compile time: leaving this generic made
+# the inference graph reachable from a dual `trmm!` large enough that two calls in it fell back to
+# runtime dispatch, and `test/dual_tests.jl`'s `@assert_typestable` dogfood caught it.
+@noinline function _gemm_threaded!(
+        C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
+        alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int
+    ) where {T}
+    p = _gemm_pool(T)
+    # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
+    # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
+    # run serially on its own thread, which is the right answer anyway — the machine is already busy.
+    # ponytail: a single global claim, not a work-stealing scheduler. Upgrade to per-caller pools only
+    # if a measurement shows nested callers starving, which needs a nested-parallel benchmark first.
+    _, won = @atomicreplace p.busy false => true
+    # `_gemm_core!` returns different things on different routes, so discard it and return `nothing` on
+    # BOTH paths — otherwise this function's return type is a union and the instability propagates into
+    # every caller's inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
+    if !won
+        _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB)
+        return nothing
+    end
+    try
+        p.Cp = C.ptr; p.ldc = C.ld
+        p.Ap = A.ptr; p.lda = A.ld
+        p.Bp = B.ptr; p.ldb = B.ld
+        p.m = C.m; p.n = C.n; p.k = tA ? A.m : A.n
+        p.alpha = alpha; p.beta = beta
+        p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
+        p.nw = nw
+        @atomic p.done = 0
+        @atomic p.failed = false
+        @atomic p.gen += 1                       # publishes every field written above
+        # Notify UNCONDITIONALLY. The earlier version had each worker announce a `sleeping` flag and woke
+        # only those that had announced, to save a notify on the hot path. It deadlocked: with 4 workers
+        # and n=96 it stalled at `gen=524 done=0 sleeping=[1,1,1,1]` — the worker asleep, the wake never
+        # sent. An announce-then-sleep flag has a window no cheap ordering closes, and a lost wake here
+        # hangs the caller forever. An unconditional notify cannot lose one: the event may be left set
+        # spuriously, and the worker's predicate loop above treats a wake as "look again", not as "there
+        # is work", so a stale set costs one extra check and nothing else.
+        for i in 1:(nw - 1)
+            notify(p.evs[i])
+        end
+        # The driver takes the last chunk itself. The join below is in a `finally` because it must
+        # happen even when THIS chunk throws: the workers hold raw pointers into C, and the caller's
+        # `GC.@preserve` ends the moment this function returns. Unwinding past a live worker would let
+        # it write into memory the caller is free to release.
+        try
+            _gemm_run_chunk(p, nw)
+        finally
+            # The DRIVER spins; only idle WORKERS have to be polite. Two reasons this is not the same
+            # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
+            # so spinning costs the host nothing it was going to get back. And `wait` on an event can
+            # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
+            # The yield after the spin window is NOT optional: `@spawn` gives no placement guarantee, so
+            # two workers can share a thread, and a bare spin here then waits on a worker that can never
+            # be scheduled. That exact deadlock cost this session a probe run at 399% CPU.
+            while (@atomic p.done) < nw - 1
+                for _ in 1:_MT_SPINS
+                    (@atomic p.done) >= nw - 1 && break
+                    Base.Threads.atomic_fence()
+                end
+                (@atomic p.done) < nw - 1 && yield()
+            end
+        end
+        (@atomic p.failed) && _throw_gemm_worker()
+    finally
+        @atomic p.busy = false
+    end
+    return nothing
+end
+
 function gemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N'
@@ -3316,7 +3653,19 @@ function gemm!(
     # arena conversion walked straight into it a third time in `ormhr!`/`unmhr!`, where an arena-borrowed
     # `tmp` is gemm!'s C. Fixing the gate is the one-line root cause; the hand workarounds stay valid.
     if T <: BlasFloat && _strided1(C)
-        _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
+        # M4: split the columns across a parked pool when the call is big enough to pay for the join.
+        # Restricted to the real strided path because the pool carries POINTERS (see `GemmPool`), and
+        # that is where every gemm large enough to want a thread already lives.
+        nw = (T === Float64 || T === Float32) && _strided1(A) && _strided1(B) ?
+            _gemm_workers(m, n, k) : 1
+        if nw > 1
+            rA = _root(A); rB = _root(B); rC = _root(C)
+            GC.@preserve rA rB rC _gemm_threaded!(
+                _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
+            )
+        else
+            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
+        end
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()
         # Dual planes (dual_l3.md). `_fh_cgemm_tiny` is reused as the floor below which three real sub-gemms plus

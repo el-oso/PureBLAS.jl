@@ -118,3 +118,70 @@ end
     using PureBLAS
     @test_throws DimensionMismatch PureBLAS.gemm!(zeros(3, 3), zeros(3, 4), zeros(5, 3))
 end
+
+@testitem "threaded gemm: same answer as the serial path, and still 0 B" tags = [:checks] begin
+    using PureBLAS, Base.Threads
+    P = PureBLAS
+    # The split is by COLUMNS of C, so the shapes that matter are the ones where a chunk boundary can
+    # land badly: n not a multiple of the register tile, n smaller than the worker count, and both
+    # transpose flags — with `transB` a chunk of op(B) is a ROW slice of B, a different pointer walk
+    # from the column slice every other case uses.
+    # Threading is opt-in, so the default must be OFF even on a threaded worker — that is the check
+    # that a host which never asks for threads never gets them.
+    @test P.get_num_threads() == 1
+    @test P._gemm_workers(512, 512, 512) == 1
+    if Threads.nthreads() < 2
+        @info "single-threaded worker — threading cannot engage; checking it stays off"
+        @test P.set_num_threads(4) == 1
+    else
+        @test P.set_num_threads(Threads.nthreads()) == Threads.nthreads()
+        for (m, n, k) in ((256, 256, 256), (512, 300, 128), (200, 512, 333), (1024, 129, 64), (192, 7, 192))
+            for tA in (false, true), tB in (false, true)
+                A = tA ? randn(k, m) : randn(m, k)
+                B = tB ? randn(n, k) : randn(k, n)
+                C0 = randn(m, n)
+                al, be = 1.7, -0.3
+                Cs = copy(C0)
+                P._gemm_core!(Cs, A, B, al, be, tA, tB, false, false)
+                Ct = copy(C0)
+                P.gemm!(Ct, A, B; alpha = al, beta = be,
+                    transA = tA ? 'T' : 'N', transB = tB ? 'T' : 'N')
+                @test Ct ≈ Cs rtol = 1e-12
+            end
+        end
+        # req#10 holds on the threaded path too: the pool is built once, so a warm call allocates
+        # nothing even when it wakes four workers.
+        A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
+        @test P._gemm_workers(512, 512, 512) > 1
+        P.gemm!(C, A, B); P.gemm!(C, A, B)
+        @test (@allocated P.gemm!(C, A, B)) == 0
+        P.set_num_threads(1)                      # leave the process as we found it
+        @test P.get_num_threads() == 1
+    end
+end
+
+@testitem "threaded gemm: a concurrent caller falls back to serial, not to a shared pool" tags = [:checks] begin
+    using PureBLAS, Base.Threads
+    P = PureBLAS
+    if Threads.nthreads() < 2
+        @test_skip Threads.nthreads() >= 2
+    else
+        # Several callers hit `gemm!` at once. Exactly one may own the pool; the rest must run serially
+        # and still get the right answer. A wrong claim here would show up as two drivers publishing
+        # jobs into one pool, i.e. torn results — not as an error.
+        nt = min(4, Threads.nthreads())
+        P.set_num_threads(nt)
+        A = randn(300, 300); B = randn(300, 300)
+        want = similar(A); P._gemm_core!(want, A, B, 1.0, 0.0, false, false, false, false)
+        outs = [zeros(300, 300) for _ in 1:nt]
+        Threads.@threads :static for t in 1:nt
+            for _ in 1:8
+                P.gemm!(outs[t], A, B)
+            end
+        end
+        for t in 1:nt
+            @test outs[t] ≈ want rtol = 1e-12
+        end
+        P.set_num_threads(1)
+    end
+end
