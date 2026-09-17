@@ -1268,6 +1268,12 @@ guarantee or the milestone's shape:
 
 Correctness 20/20 shapes (both transpose flags), and **0 B allocated** warm, threaded or not.
 
+**The mid sizes are NOT adjudicable from a single run.** Five runs of identical code, frequency-locked:
+n=128 spans 2.71–2.94, n=192 spans 2.50–2.97, n=256 spans 2.73–2.97, n=384 spans 2.67–3.04 — a **±10%
+band**, wide enough to bracket any plausible change. n≥512 is tight (512: 3.41–3.42, 768: 3.67–3.74,
+1024: 3.61–3.86). So judge a threading change on n≥512 and on the serial control, never on one
+mid-size reading; a "regression" at n=256 from a single pair of runs means nothing.
+
 **Three bugs found and fixed while building it**, all recorded because each is a trap anyone would hit:
 a bare spin barrier **deadlocked at 399% CPU** (`@spawn` gives no placement guarantee, two workers
 shared a thread); a stale event could make a worker **re-run the previous chunk over live output**

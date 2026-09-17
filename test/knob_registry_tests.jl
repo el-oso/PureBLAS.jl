@@ -11,6 +11,8 @@
     #   * two ADJACENT marked knobs (the case that gave 4 rows a neighbour's justification);
     #   * a marked knob followed by an UNMARKED one (must not inherit);
     #   * prose containing "PDM:" that is NOT a marker (src/ really does contain these).
+    #   * a call SPLIT ACROSS LINES (the shape `gemm_mt_work` shipped in, which the physical-line
+    #     matcher never saw — the knob was missing from knobs.md and its marker was silently dropped).
     fx = split("""
     # PDM: Derived — alpha reason. | tune: n/a
     const _A = @load_preference("alpha", _L1_BYTES ÷ 2)::Int
@@ -19,13 +21,21 @@
     const _C = @load_preference("gamma", 32)::Int
     # PDM: P = `@load_preference`; D = DERIVED — prose, not a marker
     const _D = @load_preference("delta", 8)::Int
+    # PDM: Measured — epsilon reason. | tune: candidate
+    const _E = @load_preference(
+        "epsilon", _JOIN * _AMORT * _fpc(Float64)
+    )::Int
+    const _F = @load_preference("zeta", 4)::Int
     """, '\n')
     r = bind_knobs(fx)
-    @test [x.key for x in r] == ["alpha", "beta", "gamma", "delta"]
-    @test [x.tier for x in r] == ["Derived", "Literal", "Unaudited", "Unaudited"]
+    @test [x.key for x in r] == ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+    @test [x.tier for x in r] == ["Derived", "Literal", "Unaudited", "Unaudited", "Measured", "Unaudited"]
     @test r[1].pdm == "alpha reason. | tune: n/a"      # alpha keeps its own, not beta's
     @test r[3].pdm == ""                                # gamma does NOT inherit beta's marker
     @test r[4].tier == "Unaudited"                      # prose "PDM: P = …" must not bind
+    @test r[5].const_name == "_E"                       # the split call binds under ITS const name…
+    @test startswith(r[5].default, "_JOIN * _AMORT")    # …with the default read from the NEXT line
+    @test r[6].pdm == ""                                # and zeta does not inherit epsilon's marker
 end
 
 @testitem "knob registry: every knob carries a PDM marker" begin

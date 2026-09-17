@@ -90,6 +90,26 @@ If you need this logic somewhere else, CALL THIS — do not write the loop again
 
 A `# PDM:` marker binds to the NEXT `@load_preference` and is CONSUMED by it: forward-only, one-to-one.
 """
+# A `@load_preference(` call split across lines — the opening paren at the end of one line, the key on
+# the next — is joined into ONE logical line before matching. Until 2026-09-17 the matcher ran on the
+# physical line only, so such a call was never seen: `gemm_mt_work` in src/blas3/gemm.jl was written
+# that way, was absent from docs/src/knobs.md, and its `# PDM:` marker was silently DROPPED (the
+# pending marker was cleared by nothing and then consumed by whatever knob came next). The join is
+# lexical and bounded: lines are appended until the parentheses opened by `@load_preference(` balance.
+function _kr_logical(lines, i)
+    ln = lines[i]
+    j = findfirst("@load_preference(", ln)
+    isnothing(j) && return ln
+    depth = count(==('('), ln[first(j):end]) - count(==(')'), ln[first(j):end])
+    k = i
+    while depth > 0 && k < length(lines)
+        k += 1
+        ln *= " " * strip(lines[k])
+        depth += count(==('('), lines[k]) - count(==(')'), lines[k])
+    end
+    return ln
+end
+
 function bind_knobs(lines, rel = "?")
     rows = NamedTuple[]
     let
@@ -101,7 +121,8 @@ function bind_knobs(lines, rel = "?")
                 pending, pending_at = String(mp.captures[2]), i
                 continue
             end
-            m = match(r"@load_preference\(\"([^\"]+)\"\s*,?(.*)$", ln)
+            occursin("@load_preference(", ln) || continue
+            m = match(r"@load_preference\(\s*\"([^\"]+)\"\s*,?(.*)$", _kr_logical(lines, i))
             isnothing(m) && continue
             key = m.captures[1]
             # Trim a trailing line comment: the capture runs to end-of-line, so `8)::Int  # req8-ok: …`

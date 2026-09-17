@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 138 of them.
+Every `@load_preference` key in `src/` — 147 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 138 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 65 Derived · 9 Measured · 51 Literal · 13 Exempt.
-**Default form** (mechanical): 58 formula · 21 delegates · 5 sibling · 47 literal · 5 flag · 2 other.
+**Tier:** 70 Derived · 10 Measured · 51 Literal · 16 Exempt.
+**Default form** (mechanical): 64 formula · 22 delegates · 5 sibling · 47 literal · 5 flag · 4 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -45,6 +45,7 @@ Every `@load_preference` key in `src/` — 138 of them.
 | `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
 | `gemvn_np_narrow` | formula | Derived | formula over detected consts: `max(2, _L1D_ASSOC - 2` | — |
+| `gemvn_np_wide` | formula | Derived | formula over detected consts: register-capped `min(12, _NVREG - U - 1)` on a 32-register ISA, associativity-capped `_L1D_ASSOC` on 16 (the "wide" regime above) | — |
 | `gemvn_rb` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448` | — |
 | `gemvt_deep` | delegates | Derived | NC=8 x U=4 gated on A <= L2 and the register budget; both detected consts. | n/a |
 | `gemvt_nc` | delegates | Literal | _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | no, µarch-invariant |
@@ -115,19 +116,26 @@ Every `@load_preference` key in `src/` — 138 of them.
 | `trmm_rpanel` | literal | Literal | trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21) |
 | `trsm_base` | literal | Literal | trsm recursion base, on trtrs's real path (trtrs wraps trsm side-L). NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 all within noise on Zen3+Zen4+Zen5 (96 cells, 2026-08-21) |
 | `trsm_dbase` | literal | Literal | diagonal-block base; its own comment already said 'could be a Preference'. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16/32/48/64 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
+| `trsm_fullpack_min` | formula | Derived | formula over detected consts: `cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64))`, the k at which the P-stripe outgrows 2·L1 (Zen4 measured 256<k≤384, formula 342; fleet validation still owed) | — |
+| `trsm_fused_base` | formula | Derived | formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; the non-AVX-512 arm keeps a measured 128 (a bigger base regresses Zen3 n=256) | — |
 | `trsm_narrow_max` | literal | Literal | B-width below which the narrow path wins; measured, not derived. | candidate |
 | `trsm_ncut` | literal | Literal | B-width cut for side-L: at or below it the narrow recursion wins. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 32/64/128 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
 | `trsm_ncut_r` | literal | Literal | B-width cut for side-R. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 64/128/256 within noise on Zen3+Zen4+Zen5 (2026-08-21) |
 | `trsm_r_fuse` | literal | Literal | side-R fuse threshold. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | TUNABLE and MIS-SPECIFIED — one scalar serves as BOTH the one-panel ceiling and the recursion leaf; no single value is right at n=128 and n=512 (Zen4 32 -> 0.900 vs 1.031). See task #169. |
 | `trtri_base` | literal | Literal | triangular-inverse recursion base. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 8/16/32/64 within noise on all 3 uarchs, both trsm sides (2026-08-21) |
+| `ztrsm_gt_base` | formula | Derived | formula over detected consts: L2 residency of A's KC×KC panel, `isqrt(_L2_BYTES ÷ sizeof(ComplexF64))`, min'd with the L1 stripe bound; fleet-validated on Zen4+Zen3 | — |
 | `ztrsm_gt_mr` | formula | Derived | formula over detected consts: `_ZGT_W` | — |
+| `ztrsm_zrt_nc` | formula | Derived | formula over detected consts: `prevpow(2, √(KC/2))` from the load-vs-fma balance at the base size, clamped by the register file `(nreg - 4) ÷ 2` | — |
 
 ## CPU detection
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
+| `cpu_family` | other | Exempt | the detected CPU display family itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `force_hooks` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `fp_datapath_bytes` | formula | Exempt | a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and | — |
+| `l1d_assoc` | other | Exempt | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `l3_bytes` | formula | Exempt | the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `madvise_hugepages` | flag | Exempt | a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable. | — |
 | `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 
@@ -225,6 +233,7 @@ Every `@load_preference` key in `src/` — 138 of them.
 | `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW)` | — |
 | `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW)` | — |
 | `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW)` | — |
+| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (wintermute, 616 ns @ 2796 MHz). | no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped |
 | `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW)` | — |
 | `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
@@ -248,13 +257,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-36 `const _X = <literal>` values in `src/` with no `@load_preference`.
+37 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 32 Literal · 3 Exempt · 1 Unaudited.
+**Tier:** 2 Measured · 31 Literal · 3 Exempt · 1 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -360,5 +369,6 @@ on these, not on knobs.
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
 | `_MT_AMORTISE` | 32 | Literal | a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s |
-| `_MT_JOIN_CYCLES` | 1720 | Literal | the fork-join protocol's fixed cost in cycles. It is a property of the coherence |
+| `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
+| `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on wintermute (ns); feeds gemm_mt_work's shipped default |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |

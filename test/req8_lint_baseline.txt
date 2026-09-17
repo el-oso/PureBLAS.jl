@@ -72,3 +72,43 @@ svd.jl  const _BRD_NB = 16
 svd.jl  const _BT_NB = 32
 svd.jl  const _SVD_DC_CROSS = 96
 svd_dc.jl  const _DC_THRESHOLD = 64
+#
+# ── SURFACED 2026-09-17 BY MAKING THE SCAN RECURSIVE — NOT REVIEWED ────────────────────────────────
+# Until this date the lint ran `readdir(src)` without descending, so nothing under src/blas2/, src/blas3/
+# or src/lapack/ was ever scanned. The 32 lines below are what those directories contained the day the
+# scan was fixed. None has been derived, annotated or classified: they are named here so the lint could
+# be made recursive without either hiding them or blocking the branch that found them, and every one is
+# open req#8 debt to whittle down exactly like the block above. (The three M4 literals the same branch
+# introduced — `_MT_JOIN_*`, `_MT_AMORTISE`, `_MT_SPINS` — are NOT here; they carry `# req8-ok:`.)
+gemm.jl  Val(12)
+gemm.jl  Val(6)
+gemm.jl  Val(8)
+hessenberg.jl  const _GEHRD_UNBLK_MAX = 128
+lapack.jl  const _CHOL_NB = @load_preference("chol_nb", 4)::Int
+lapack.jl  const _CHOL_NC = @load_preference("chol_nc", 4)::Int
+laqr.jl  const _LAQR_KEXNW = 5
+laqr.jl  const _LAQR_KEXSH = 6
+laqr.jl  const _LAQR_KNWSWP = 500
+laqr.jl  const _LAQR_NIBBLE = 14
+laqr.jl  const _LAQR_NMIN = 200
+laqr.jl  const _LAQR_SKIPMIN = 75
+level2.jl  Val(6)
+level2.jl  const _CGER_COLD_DEN = @load_preference("cger_cold_den", 2)::Int
+level2.jl  const _GEMVT_NC_DEEP = 8
+level2.jl  const _GEMVT_U_DEEP = 4
+level2.jl  const _SYMV_MR = 2
+level2.jl  const _TRSV_T_F = 8
+level3.jl  Val(32)
+level3.jl  const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 128)::Int
+level3.jl  const _SYRK_BASE = @load_preference("syrk_base", 48)::Int
+level3.jl  const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
+level3.jl  const _TRSM_DBASE = @load_preference("trsm_dbase", 32)::Int
+level3.jl  const _TRSM_NARROW_MAX = @load_preference("trsm_narrow_max", 4)::Int
+level3.jl  const _TRSM_NCUT = @load_preference("trsm_ncut", 64)::Int
+level3.jl  const _TRSM_NCUT_R = @load_preference("trsm_ncut_r", 128)::Int
+level3.jl  const _TRSM_R_FUSE = @load_preference("trsm_r_fuse", 128)::Int
+level3.jl  const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
+packed_chol.jl  const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
+packed_chol.jl  const _PPTRF_TPSV_MIN = 32
+pstrf.jl  const _PSTRF_ROWCACHE_PREF = @load_preference("pstrf_rowcache_min", 128)
+svd.jl  const _BT_NB = @load_preference("bt_nb", 32)::Int

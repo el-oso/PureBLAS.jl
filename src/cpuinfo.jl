@@ -97,6 +97,7 @@ end
 # at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
 # index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
 # Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
+# PDM: Exempt — the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _L1D_ASSOC = @load_preference(
     "l1d_assoc",
     let w = try
@@ -163,6 +164,7 @@ end
 # is 12+4) — as does `hw.cpusubfamily`. A table keyed on that is a legitimate req8-ok literal, since
 # the quantity is genuinely not detectable; a table keyed on `Sys.CPU_NAME` is not, it is a wrong
 # answer for two of the three parts.
+# PDM: Exempt — the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _L3_BYTES = @load_preference(
     "l3_bytes",
     let s = try
@@ -187,6 +189,7 @@ end
 # CpuId.cpumodel()[:Family] is raw-packed (ext<<4 | base); display family adds ext only when base==0xF
 # (Zen4: raw 0xaf → 0xF + 0xA = 0x19 = Zen4; Zen5 = 0x1A). Baked to a const, Preferences-overridable.
 _display_family(raw::Integer) = (raw & 0x0F) == 0x0F ? Int(raw & 0x0F) + Int(raw >> 4) : Int(raw & 0x0F)
+# PDM: Exempt — the detected CPU display family itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _CPU_FAMILY = @load_preference(
     "cpu_family",
     try
