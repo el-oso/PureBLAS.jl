@@ -11,15 +11,20 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 **Where the work is now, in one line each:**
 - **Coverage: DONE.** OpenBLAS fallthrough is **zero** and ratchet-enforced (`test/lbt_forward_tests.jl`);
   the north-star worklist below is complete. What remains there is performance, not routing.
-- **Performance: the open front.** 376 of 2800 fleet cells sit below the gate (Zen3 118 / Zen4 128 /
-  Zen5 130), last published at `ef76dac2`. Read that number with care — a large share of cells sit within
-  a few percent of parity, and per-cell noise reaches **~4% at n=2048**, so the count swings between
-  refreshes. Judge a change by its targeted cells and its controls, never by a count delta.
+- **Performance: the open front.** **330 of 2790** fleet cells sit below the gate — Zen3 113 / Zen4 108
+  / Zen5 112 — recounted from the caches on disk on 2026-09-17 with `bench/gate_gaps.jl` (no
+  re-measurement; the arms are the cached ones and `gate_gaps` stamps each row with the commit that
+  measured it). The previous figure here, 376 at `ef76dac2`, was stale. Read the number with care:
+  **98 of the 330 are within their own round spread**, a large share sit within a few percent of
+  parity, and per-cell noise reaches ~4% at n=2048, so the count swings between refreshes. Judge a
+  change by its targeted cells and its controls, never by a count delta.
 - **ForwardDiff duals are a gated element type**, not just a thing that compiles — four groups
   (DL1/DL2/DL3/DLP) divide by LinearAlgebra's generic fallback. See the dual section below.
 - **Every `!` entry is allocation-free at steady state** (req#10), and `gemm!` now carries a *static*
   `@test_noalloc` on both Float64 and Dual.
-- **Deferred by standing decision:** M4 multithreading (do not start unless asked), registration.
+- **M4 multithreading STARTED 2026-09-16** at user request; the old "do not start unless asked"
+  deferral is lifted. Step 1 (per-thread scratch) is on master; step 2 (threaded gemm) is on branch
+  `m4-threaded-gemm` pending ONE user decision — see the M4 section. Registration is still deferred.
 - **Zen5 is stale.** neuromancer's cache predates `ff5677ba` and its frequency lock has been dropping
   (4841 MHz against a 2000 MHz pin). A setuid `pureblas-cpufreq` helper is built and staged there so the
   lock can be restored without the user present; it needs one `sudo install` and `fleet_freqlock.sh` is
