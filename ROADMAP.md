@@ -1167,8 +1167,11 @@ Measured: old library 8/8 pass, `5c960578` 3/3 segfault, `5c960578` built with
 - [JuliaLang/JuliaC.jl#152](https://github.com/JuliaLang/JuliaC.jl/issues/152) — runtime thread count
   for a compiled library; open, no solution.
 
-**When `minimal` lands**, this becomes one word in `juliac/build.jl` plus a rebuild. Until then the
-`.so` stays single-threaded, which is correct and unbroken: nothing shipped today runs it threaded.
+**When `minimal` lands**, this becomes one word in `juliac/build.jl` plus a rebuild, plus a
+`pureblas_set_num_threads` `@ccallable` wrapping `set_num_threads` so a C host can drive it the way it
+drives `openblas_set_num_threads`. Until then the `.so` stays single-threaded, which is correct and
+unbroken: `Threads.nthreads()` is 1 there, so `set_num_threads` clamps to 1 and never creates a pool.
+Verified after the refactor — the trimmed library builds and runs from a C host.
 
 **Design consequence to keep:** the worker pool must be **parked and long-lived**, never created and
 joined per call — upstream states ephemeral adopted threads leak their storage and heap.
