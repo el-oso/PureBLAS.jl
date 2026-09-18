@@ -191,7 +191,15 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     # regression). The exact borrows below make `lde` a property of THIS call: _L3_NB side-L, mr side-R.
     # The block keeps its original indentation — re-indenting 140 lines of a gated kernel to add three
     # would bury the change (same convention as `_trsm_fused_L!`'s stripe loop below).
-    @leafscope arn begin      # inlines the trmm microkernel — see `_trsm_fused_L!`
+    # `@scope`, NOT `@leafscope`. This leaf's only scope is its own — none of its five callers
+    # (`trmm!` 1310/1312, `_trmm_left!` 753, `_trmm_right!` 938, `_trmm_right_recur!` 986) opens one —
+    # and arena.jl's rule for that case is explicit: a `@leafscope` with no `@scope` above it leaks
+    # `depth` on a throw, since it has no handler and `_arena_exit!` never runs. A stuck `depth` is now
+    # WORSE than a leaked block: `gemm!`'s M4 threading guard reads `iszero(_arena().depth)`, so a
+    # thread that once threw through here would refuse to thread for the rest of the process.
+    # The handler is affordable HERE, unlike `_trsm_rl_fused_drv!` where it cost 59 spills: every caller
+    # reaches this only at `k <= _TRMM_BASE`. ⚠ AVX2 (Zen3) small-k trmm unconfirmed — measure before merge.
+    @scope arn begin          # inlines the trmm microkernel — see `_trsm_fused_L!`
         M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
         _mat_tri!(M, A, k, up, tr, unit)
         if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
@@ -6516,6 +6524,33 @@ const _SYMM_SCR_F64 = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> R
 const _SYMM_SCR_F32 = Base.OncePerThread{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
 const _SYMM_SCR_C64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
 const _SYMM_SCR_C32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+# PER-TASK TWINS, fetched ONLY when the call is about to thread. `_symm!` hands the materialized operand
+# to the threaded gemm, whose join YIELDS, and a yielded task usually resumes on a DIFFERENT thread
+# (measured: 39863 of 48000 yields migrated). A per-THREAD buffer can then be claimed by another task
+# while the workers are still reading it — measured 5/96 concurrent `symm!` results wrong, 0/96 serial.
+# Why a twin rather than converting the owners above: the comment above records the IdDict lookup at
+# ~130 ns DOMINATING tiny symm/hemm, and a per-task lookup costs ~13 ns more than a per-thread one. The
+# threaded branch is by construction a call large enough for 13 ns to be invisible; the serial branch
+# never yields, so it keeps the cheap per-thread owner and pays nothing.
+const _SYMM_SCR_MT_F64 = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+const _SYMM_SCR_MT_F32 = Base.OncePerTask{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
+@inline function _symm_scr_mt(::Type{Float64}, n::Int)
+    r = _SYMM_SCR_MT_F64()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); r[] = m)
+    return m
+end
+@inline function _symm_scr_mt(::Type{Float32}, n::Int)
+    r = _SYMM_SCR_MT_F32()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
+    return m
+end
+# Only the two real types ever thread (`_gemm_workers` is gated on them), so every other element type
+# resolves to the per-thread owner and this method is never reached from a threaded call. It exists so
+# the call site stays ONE type-stable expression instead of a branch inference has to prove unreachable.
+@inline _symm_scr_mt(::Type{T}, n::Int) where {T} = _symm_scr(T, n)
+
 @inline function _symm_scr(::Type{Float64}, n::Int)
     r = _SYMM_SCR_F64()
     m = r[]
@@ -7104,11 +7139,48 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             _strided1(B) && _strided1(C)                 # packed complex-symmetric: no materialize
         return _hemm_packed_L!(up, α, β, A, B, C, Val(false))
     end
-    Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
+    # Decide threading BEFORE choosing the buffer: a threaded call must materialize into the PER-TASK
+    # twin, because the buffer is handed to workers and the driver's join yields (see `_symm_scr_mt`).
+    # `iszero(_arena().depth)` mirrors `gemm!`'s guard — if a caller holds a live arena scope, threading
+    # here would expose ITS borrows to the same migration hazard.
+    T = eltype(C)
+    # `eltype(B) === T` because `_gemm_threaded!` takes three `PtrMatrix{T}`; `Ad` is built at `T`, but a
+    # mixed-type B would be a MethodError where `_gemm_core!` promotes. (`gemm!` guards the same way.)
+    nw = (T === Float64 || T === Float32) && eltype(B) === T &&
+        _strided1(B) && _strided1(C) && iszero(_arena().depth) ?
+        _gemm_workers(size(C, 1), size(C, 2), n) : 1
+    Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
-    T = eltype(C); aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
-    side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false) :  # complex — skip the kwarg layer
-        _gemm_core!(C, B, Ad, aT, bT, false, false, false, false)
+    aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
+    # ── M4: SPLIT THIS, BECAUSE IT IS A GEMM ────────────────────────────────────────────────────────
+    # Once the symmetric operand is materialized, this call is an ordinary NN product — the block above
+    # says exactly that, which is why Strassen is allowed to claim it — so it deserves the same column
+    # split `gemm!` has. It did not have one: `_gemm_core!` sits BELOW the split point (gemm.jl), and
+    # "skip the kwarg layer" predates M4. symm is the safest of the six L3 ops to split: the output is a
+    # FULL matrix (no triangle ⇒ no write conflict), there is no recursion, and the symmetric operand is
+    # read-only for every worker.
+    #
+    # THE SPLIT STAYS BELOW `_symm_materialize!`. Above it, every worker would build its own n×n copy of
+    # A — O(n²) duplicated per worker, and on side-L each worker needs ALL of A, not a slice.
+    #
+    # `Ad` is handed to the workers as an OPERAND, which is why it comes from the PER-TASK twin whenever
+    # `nw > 1` (chosen above, before the materialize). An earlier version of this comment argued the
+    # per-thread buffer was safe because a WORKER landing on the driver's thread never claims
+    # `_SYMM_SCR`. That is true and beside the point: the driver's join yields, the task migrates, and an
+    # unrelated task on the vacated thread takes the buffer the workers are still reading. Measured
+    # before the twin: 5/96 concurrent `symm!` results wrong, worst relative error 1.65, against 0/96
+    # serial. The `GC.@preserve` roots the storage; it never protected the CONTENTS.
+    if nw > 1
+        rA = _root(Ad); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC begin
+            side_left ?
+                _gemm_threaded!(_pm(C), _pm(Ad), _pm(B), aT, bT, false, false, false, false, nw) :
+                _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
+        end
+    else
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false) :  # complex — skip the kwarg layer
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false)
+    end
     return C
 end
 function _symm_check(side_left, A, B, C)

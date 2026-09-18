@@ -160,10 +160,10 @@ function _trd_grow!(ws::_TRDWork{T, R}, n::Int, nb::Int) where {T, R}
 end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
-const _TRDWS_F64 = Base.OncePerThread{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})
-const _TRDWS_F32 = Base.OncePerThread{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
-const _TRDWS_C64 = Base.OncePerThread{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
-const _TRDWS_C32 = Base.OncePerThread{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
+const _TRDWS_F64 = Base.OncePerTask{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})
+const _TRDWS_F32 = Base.OncePerTask{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
+const _TRDWS_C64 = Base.OncePerTask{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
+const _TRDWS_C32 = Base.OncePerTask{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
 @inline _trdws(::Type{Float64}) = _TRDWS_F64()
 @inline _trdws(::Type{Float32}) = _TRDWS_F32()
 @inline _trdws(::Type{ComplexF64}) = _TRDWS_C64()

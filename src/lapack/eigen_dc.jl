@@ -261,9 +261,9 @@ function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
 end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
-const _EDCWS_F64 = Base.OncePerThread{_EDCWork{Float64}}(_EDCWork{Float64})
-const _EDCWS_F32 = Base.OncePerThread{_EDCWork{Float32}}(_EDCWork{Float32})
-const _EDCWS_OTHER = Base.OncePerThread{IdDict{DataType, Any}}(IdDict{DataType, Any})
+const _EDCWS_F64 = Base.OncePerTask{_EDCWork{Float64}}(_EDCWork{Float64})
+const _EDCWS_F32 = Base.OncePerTask{_EDCWork{Float32}}(_EDCWork{Float32})
+const _EDCWS_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
 @inline _edcws(::Type{Float64}) = _EDCWS_F64()
 @inline _edcws(::Type{Float32}) = _EDCWS_F32()
 _edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER(), T)::_EDCWork{T}
