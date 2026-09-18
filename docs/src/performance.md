@@ -6,6 +6,10 @@ the dashed line is parity, so anything above it is a win. There is one curve per
 is the q10–q90 spread of the pooled per-round ratios. Everything is single-threaded, Float64 and
 ComplexF64.
 
+Single-threaded is the gate, and it is the only thing compared against OpenBLAS and AOCL on this page.
+For what PureBLAS's own threading buys — PureBLAS at six threads against PureBLAS at one, which is a
+scaling measurement and **not** a gate — see [Multi-threading](threading.md).
+
 Roughly 87% of the measured cells are at or above `max(OpenBLAS, AOCL)`. The ones that are not are
 listed in [Notes](notes.md), and most of them sit within a few percent.
 
