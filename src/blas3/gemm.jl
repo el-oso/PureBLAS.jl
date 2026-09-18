@@ -3763,7 +3763,29 @@ function gemm!(
         # M4: split the columns across a parked pool when the call is big enough to pay for the join.
         # Restricted to the real strided path because the pool carries POINTERS (see `GemmPool`), and
         # that is where every gemm large enough to want a thread already lives.
-        nw = (T === Float64 || T === Float32) && _strided1(A) && _strided1(B) ?
+        # ── REFUSE TO THREAD INSIDE A LIVE ARENA SCOPE ──────────────────────────────────────────────
+        # The join below YIELDS, and a yielded task usually resumes on a DIFFERENT THREAD — measured on
+        # this box, 39863 of 48000 yields migrated, and `OncePerThread` returned a different object after
+        # every one. So a driver that entered holding thread t1's scratch typically finishes on t3 while
+        # t1 is free for any other task to claim the same buffer. That is not two tasks interleaving on
+        # one thread, which the "a chunk never yields, so a worker runs as a nested interval" argument
+        # covered; it is two tasks on two threads writing one buffer at once. Measured consequence before
+        # this guard: concurrent `getrf!` 20/96 wrong (some NaN), `geqrf!` 17/96, against 0/96 serial.
+        #
+        # 23 internal `gemm!` call sites sit inside a held owner or a live `@scope`, and in every one the
+        # held object is a gemm OPERAND. Rather than audit them one at a time and hope, this asks the
+        # arena directly: if ANY scope is live on this thread, at any nesting depth, run serial. It is
+        # mechanical, it cannot be forgotten by a future caller, and it costs one field load — paid only
+        # by calls already large enough to have considered threading, so n=8..64 is untouched.
+        #
+        # Per-thread Refs that are NOT arena scopes (`_LU_PAD`, `_QR_WS`, the SVD/eigen pools) are not
+        # covered by this and are per-TASK owners instead; see their definitions.
+        # `eltype(A) === T === eltype(B)` for the same reason the dual branch below tests it: `T` is C's
+        # element type, and `_gemm_threaded!` takes three `PtrMatrix{T}`. A mixed-type call (`Float32` A
+        # into a `Float64` C, which `_gemm_core!` promotes happily) would hand it a `PtrMatrix{Float32}`
+        # and raise a MethodError where the serial path computed an answer.
+        nw = (T === Float64 || T === Float32) && eltype(A) === T && eltype(B) === T &&
+            _strided1(A) && _strided1(B) && iszero(_arena().depth) ?
             _gemm_workers(m, n, k) : 1
         if nw > 1
             rA = _root(A); rB = _root(B); rC = _root(C)

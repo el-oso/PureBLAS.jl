@@ -330,7 +330,7 @@ const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is ena
 @inline _zqr_nb(::Type{T}, m::Int, n::Int) where {T} =
     clamp(_fh_qr_nb_c() * cld(m * n * sizeof(T), _L3_BYTES ÷ 4), _fh_qr_nb_c(), 4 * _fh_qr_nb_c())
 # Complex blocked-QR workspace (GKH: a second owned Ref for ComplexF64, mirroring _QR_WS).
-const _QR_WS_C = Base.OncePerThread{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
+const _QR_WS_C = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
     () -> Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 )
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
@@ -425,7 +425,7 @@ end
 # PureBLAS's cache-blocked gemm! (VᵀV and the trailing get gemm; Y=TᵀW is tiny → scalar).
 # Cached blocked-QR workspace (V m×nb, Tm/G nb×nb, Wb/Yb nb×n) — a fresh 5-matrix alloc per call
 # dominated geqrf at n=32–64. Regrown on demand; single-thread (like the other L3/LAPACK scratches).
-const _QR_WS = Base.OncePerThread{Base.RefValue{NTuple{5, Matrix{Float64}}}}(
+const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{Float64}}}}(
     () -> Ref{NTuple{5, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 5))
 )
 @inline function _qr_ws(m::Int, n::Int, nb::Int)

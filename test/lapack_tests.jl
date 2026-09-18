@@ -350,6 +350,71 @@ end
     @test_throws DimensionMismatch PureBLAS.getrf!(randn(5, 5), zeros(Int, 2))
 end
 
+# REGRESSION: getrf!'s padded scratch, factored DESCENDING in one task.
+#
+# THE BUG. `getrf!` copies A into a per-task scratch when `m >= 512 && stride(A,2) % 512 == 0`, to
+# escape the aliased leading dimension. The copy strode by `R = m + 8`; `_getrf_core!` factored
+# `view(b, 1:m, 1:n)`, which strides by `size(b, 1)`. The scratch is REUSED whenever it is already big
+# enough, so after a LARGER call the two strides disagree and the columns are written to addresses the
+# factorization does not read. Silent wrong answer: no throw, no NaN, no `info`. Measured 1024-then-512
+# in one task: relative error **140** on ‖P·L·U − A‖.
+#
+# WHY NOTHING CAUGHT IT. Every ladder in this file ASCENDS, and on an ascending ladder the scratch is
+# regrown at each step so `size(b, 1)` happens to equal `m + 8` every time. The defect is invisible
+# unless one task goes big THEN small. The item above stops at 600×513 and never revisits a smaller
+# padded size, so it cannot reach this at all.
+#
+# The check is ABSOLUTE — rebuild P·L·U and compare to the input — so it cannot pass by agreeing with a
+# reference that was computed in the same polluted task. Order matters: the sizes below MUST stay in
+# this order and MUST stay in one testitem, because the per-task scratch is the state under test.
+@testitem "getrf! — DESCENDING padded ladder in one task: P·L·U = A (scratch stride regression)" begin
+    using PureBLAS, LinearAlgebra
+    # ‖P·L·U − A‖∞ / ‖A‖∞ from getrf!'s own output, undoing the interchanges last-pivot-first.
+    function plu_relerr(A0)
+        T = eltype(A0); m, n = size(A0); k = min(m, n)
+        F = copy(A0); ipiv = zeros(Int, k)
+        _, _, info = PureBLAS.getrf!(F, ipiv)
+        L = Matrix{T}(I, m, k); U = zeros(T, k, n)
+        for j in 1:n, i in 1:m
+            i <= j ? (i <= k && (U[i, j] = F[i, j])) : (j <= k && (L[i, j] = F[i, j]))
+        end
+        R = L * U
+        for p in k:-1:1
+            q = ipiv[p]
+            p == q || (for j in 1:n
+                R[p, j], R[q, j] = R[q, j], R[p, j]
+            end)
+        end
+        return maximum(abs, R .- A0) / max(one(real(T)), maximum(abs, A0)), info
+    end
+    # Powers of two so `stride(A,2) % 512 == 0` holds and the padded path is actually taken. 768 is not
+    # 512-aliased, so it skips the pad entirely and passes either way — kept so a failure localises.
+    #
+    # ASCENDING RUNS FIRST, and that order is load-bearing. Both arms share this testitem's task, so the
+    # scratch is shared: run descending first and it leaves the buffer 1032 wide, which makes the
+    # "ascending control" fail too. Measured with the fix disabled: descending 2 of 4 wrong AND ascending
+    # 2 of 4 wrong, which tells you nothing about direction. Ascending-first keeps the buffer growing
+    # monotonically, so that arm is a genuine control and only the descending arm can indict the stride.
+    @testset "$T" for T in (Float64, ComplexF64)
+        @testset "ascending (control — must pass even with the bug)" begin
+            for n in (512, 768, 1024)
+                A0 = randn(T, n, n) + n * I
+                e, info = plu_relerr(A0)
+                @test iszero(info)
+                @test e < 1.0e-10
+            end
+        end
+        @testset "descending (the regression)" begin
+            for n in (1024, 768, 512)
+                A0 = randn(T, n, n) + n * I
+                e, info = plu_relerr(A0)
+                @test iszero(info)
+                @test e < 1.0e-10
+            end
+        end
+    end
+end
+
 @testitem "potrf — ForwardDiff AD through the factor" begin
     using PureBLAS, LinearAlgebra, ForwardDiff
     # L[1,1] of [[x+4, 1],[1, 3]] = sqrt(x+4); d/dx = 1/(2 sqrt(x+4))

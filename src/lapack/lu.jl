@@ -361,7 +361,17 @@ end
 
 # Reusable padded scratch (like Cholesky): a po2 / stride%512==0 leading dim aliases cache sets, slowing
 # the panel + laswp at large n; factor in an ld=m+8 buffer and copy back.
-const _LU_PAD = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+#
+# PER TASK, NOT PER THREAD — and this one is load-bearing, not tidiness. `getrf!` holds this buffer
+# across its trailing `gemm!`, which THREADS, and whose join yields. A yielded task usually resumes on a
+# DIFFERENT thread (measured on Zen4: 39863 of 48000 yields migrated), so a per-thread owner hands the
+# resumed driver a different buffer while the original thread is free for another task to claim the one
+# it is still using. Measured before this change: 24 concurrent `getrf!` calls gave **20/96 wrong
+# results, some NaN**, against 0/96 serial. `_arena().depth` guards the scopes in `gemm!`; a plain Ref
+# owner like this one is not a scope, so it must be per-task instead.
+# Cost is nil here: `_lu_needs_pad` requires m >= 512, so the extra ~13 ns lookup lands only on calls
+# already in the millisecond range.
+const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 @inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
@@ -392,6 +402,18 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         pad = _LU_PAD()
         b = pad[]
         (size(b, 1) < R || size(b, 2) < n) && (b = pad[] = Matrix{Float64}(undef, R, n))
+        # The buffer is REUSED whenever it is already big enough, so after a larger call it is WIDER
+        # than m+8 — and `Mw` below strides by `size(b, 1)`, not by `R`. Copying at stride `R` then
+        # writes the columns to different addresses than `_getrf_core!` reads them from: a SILENT wrong
+        # factorization (measured: 1024 then 512 in one task gave relerr 140 on ‖PLU − A‖). Take the
+        # buffer's true leading dimension so the two can never disagree. Reallocating down to exactly
+        # `m+8` on every descent would also be correct, and would throw the buffer away each time.
+        # ponytail: a REUSED width is some earlier `m'+8`, and that is 512-aliased when `m' ≡ 504 (mod
+        # 512)` — reachable only from a view whose row count is not its leading dimension, since the
+        # predicate keys on `stride(A,2)`. That shape loses the pad's de-aliasing (perf, not
+        # correctness) and is equally reachable on a FIRST call, so it is pre-existing, not new here.
+        # Fix by choosing a pad that is never aliased if a gate cell ever lands on it.
+        R = size(b, 1)
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(eltype(A))
         info = GC.@preserve A b begin
@@ -463,8 +485,8 @@ end
 # row-swaps + trsm/gemm view reads. MEASURED (Zen3): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
 # n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
-const _CLU_PAD64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
-const _CLU_PAD32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+const _CLU_PAD64 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
+const _CLU_PAD32 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
 @inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64()
 @inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32()
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
@@ -522,6 +544,7 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
         pref = _clu_pad(T); b = pref[]
         (size(b, 1) < R || size(b, 2) < n) && (b = pref[] = Matrix{T}(undef, R, n))
+        R = size(b, 1)                                     # true width of the REUSED buffer — see the real twin
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(T)
         info = GC.@preserve A b begin

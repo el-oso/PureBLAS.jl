@@ -138,6 +138,8 @@ flowchart TD
 
 For a thrown error, the `@scope` above it gives the memory back. That works because each block sets the position back to an exact recorded value. This is why a `@leafscope` needs a `@scope` above it.
 
+**Since threading, a missing `@scope` above a `@leafscope` costs more than leaked bytes.** A thrown error leaves `depth` above zero, and a threaded `gemm!` refuses to run while `depth` is above zero (see [Threads](#Threads) below). So that thread would stop threading for the rest of the program. `_trmm_small!` was the one leaf whose only scope was its own; it now uses `@scope`, which it can afford because every one of its five callers reaches it only at `k <= _TRMM_BASE`.
+
 ## Fast-path checks on borrowed operands
 
 **To check whether an operand can take a fast path, use `_strided1(A)` for a matrix and `_dense1(x)` for a vector** (`src/ptrmat.jl`).
@@ -154,7 +156,35 @@ For a thrown error, the `@scope` above it gives the memory back. That works beca
 
 ## Threads
 
-There is one arena for the whole process.
+There is one arena per THREAD (`_ARENA` is a `Base.OncePerThread`), and that is safe only because of
+the rule in the next paragraph.
 
-- Before threads are enabled, each task must get its own arena.
-- That change is one line: `_arena() = _ARENA_TASK()` over a `Base.OncePerTask`.
+**A threaded `gemm!` refuses to run while any scope is live.** `gemm!` and `_symm!` thread only when
+`iszero(_arena().depth)`. The reason is task migration: the threaded driver yields in its join, and a
+yielded task usually resumes on a DIFFERENT thread — measured on Zen 4, 7491 of 9600 yields moved. A
+routine that entered holding thread `t1`'s borrow therefore finishes on `t3` while `t1`'s arena is free
+for any other task to claim the same bytes. The guard asks the arena directly instead of auditing the
+23 internal call sites one at a time, it cannot be forgotten by a future caller, and it costs one field
+load — paid only by calls already large enough to have considered threading.
+
+The consequence to know about: a routine that wraps its body in `@scope` gets no threading inside it.
+`trsm!` is the case in point.
+
+### Workspaces that are NOT the arena
+
+The pools that are not scopes — `_LU_PAD`, `_QR_WS`, the SVD / eigen / tridiagonal pools, the symm
+materialize twin — are keyed on the TASK (`Base.OncePerTask`), not the thread, for the same migration
+reason. Before that change, concurrent callers measured `getrf!` 20 of 96 results wrong (some `NaN`),
+`geqrf!` 17 of 96 and `symm!` 5 of 96, against 0 of 96 serial.
+
+**The cost is a one-off per task, not a tax per call.** A brand-new task touches those pools cold and
+allocates its own copies; under thread ownership it inherited whatever its thread already held. The
+second call in the same task allocates nothing. Same shape as the arena's own growth note above, and
+measured the same way — see `bench/probes/m4_trsm_and_task_cost.jl`. So a program that spawns many
+short-lived tasks each doing one large factorization pays this repeatedly; one that reuses a task pool
+pays it once per worker.
+
+Lookup cost is ~14.7 ns per task-keyed fetch against ~1.51 ns per thread-keyed one. That is why the
+hot small-op owners (`_TRMM_BPF`, the trsv reciprocal caches, the serial `_SYMM_SCR`) stayed
+thread-keyed: they are provably never live across a threaded call, and `test/perthread_lint.jl` holds
+each of those claims in a reviewed baseline.
