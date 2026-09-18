@@ -1,0 +1,198 @@
+# Multi-threading
+
+PureBLAS threads `gemm` — one split, over the columns of C, across a parked worker pool. Routines that
+call `gemm!` inherit it for free. Threading is **off** until you ask for it:
+
+```julia
+PureBLAS.set_num_threads(6)     # opt in; same shape as openblas_set_num_threads
+PureBLAS.get_num_threads()
+```
+
+## These numbers are NOT the gate
+
+The gate is `PB ≥ max(OpenBLAS, AOCL)`, **single-threaded**, and nothing on this page changes it. Every
+figure here is a **scaling** measurement: the same PureBLAS, on the same box, in the same process, with
+six threads instead of one.
+
+A threaded PureBLAS compared against a single-threaded OpenBLAS would be flattery, not parity, so that
+comparison is not made anywhere here. A real threaded gate needs freshly measured **threaded reference
+arms**, which is six to eight hours per box and has not been done.
+
+## How it is measured
+
+- **Six threads on every box**, pinned one per *physical* core. Galen has twelve and is capped to six so
+  the three boxes stay comparable. A second thread on a core shares the same FMA units, so pinning to
+  logical cores would measure contention rather than parallelism — and the sibling numbering differs per
+  box, which is a trap: `0,2,4,6,8,10` is six distinct cores on wintermute and only three on the others.
+- **`pb` and `pb_mt` are measured in one process, in rotated rounds**, so a speedup divides two windows
+  that saw the same machine state. It is a paired A/B, not two runs compared afterwards.
+- **A separate cache.** The gate sweep is pinned to ONE core on purpose; the mt arm needs six. Since the
+  two cannot share an invocation's affinity, an mt run writes `bench/mt_data_<uarch>_<host>.txt` and
+  never touches the gate cache. The name sits outside the `plots_data_*` glob that the artifact
+  generators and audits use, so these numbers cannot leak into a gate verdict.
+- **Median of per-round medians**, the same estimator the gate uses. The round spread is reported
+  because it is the precision of the thing doing the measuring.
+- Frequency-locked with boost off, verified by achieved clock **under load** — not by reading sysfs,
+  which on one box reported a perfect lock while the core ran at 4772 MHz against a 2000 MHz pin.
+
+Reproduce with:
+
+```bash
+taskset -c 0,1,2,3,4,5 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt nodraw
+julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
+```
+
+## What is threaded, and what is deliberately not
+
+`gemm` has the only splitter. `symm` routes its materialised product through it. `getrf`, `geqrf` and
+`trmm` inherit it through their trailing updates.
+
+Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `tbsv`, `tpsv`, `copy`,
+`asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
+is wrong with the measurement rather than right with the library.
+
+`trsm` is also flat, but for a different reason: it wraps its body in an arena scope, and a threaded
+`gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
+per-thread workspaces safe, so the flatness is a deliberate trade, not an oversight.
+
+The dual (`ForwardDiff.Dual`) groups carry no `pb_mt` arm at all: their reference is LinearAlgebra's
+generic fallback, which replaces the arm list, and dual element types cannot reach the threaded path.
+
+## Results
+
+Best speedup per operation, six threads against one, on each box.
+
+| op | galen (Zen3) | wintermute (Zen4) | neuromancer (Zen5) |
+|---|---|---|---|
+| L3 `gemm` | 4.68× @512 | 4.42× @1000 | 5.34× @1000 |
+| L3 `symm` | 4.00× @4096 | 4.10× @1000 | 4.82× @1000 |
+| LP `getrf` | 2.12× @4096 | 3.05× @4096 | 3.96× @4096 |
+| L3 `trmm` | 2.24× @4096 | 2.86× @4096 | 3.58× @4096 |
+| LP `geqrf` | 3.23× @2048 | 1.55× @4096 | 1.87× @512 |
+| LP `gesvd` | 1.28× @2048 | 1.25× @2048 | 1.70× @1000 |
+| LP `gelsd` | 1.25× @1000 | 1.00× @256 | 1.17× @1000 |
+| LP `potri` | 1.16× @2048 | 1.00× @512 | 1.00× @50 |
+| LP `syev` | 1.08× @2048 | 1.09× @2048 | 1.16× @1000 |
+| LP `getrs` | 1.00× @100 | 1.00× @8 | 1.13× @1000 |
+| LP `trtri` | 1.12× @2048 | 1.00× @32 | 1.00× @32 |
+| CL2 `ztrmv` | 1.01× @512 | 1.02× @512 | 1.07× @100 |
+| CLP `zheev` | 1.03× @2048 | 1.02× @1000 | 1.05× @2048 |
+
+### galen — Zen3, AVX2
+
+Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
+
+1104 cells, 0 off-lock, 887 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+
+**Where threading pays.** Best cell per operation:
+
+| op | best speedup | at n | round spread |
+|---|---|---|---|
+| L3 `gemm` | **4.68×** | 512 | 46% |
+| L3 `symm` | **4.00×** | 4096 | 0% |
+| LP `geqrf` | **3.23×** | 2048 | 4% |
+| L3 `trmm` | **2.24×** | 4096 | 8% |
+| LP `getrf` | **2.12×** | 4096 | 6% |
+| LP `gesvd` | **1.28×** | 2048 | 9% |
+| LP `gelsd` | **1.25×** | 1000 | 0% |
+| LP `potri` | **1.16×** | 2048 | 4% |
+| LP `trtri` | **1.12×** | 2048 | 5% |
+| LP `syev` | **1.08×** | 2048 | 3% |
+
+**Where threading COSTS.** Every cell that got slower with six threads:
+
+| op | n | speedup | round spread |
+|---|---|---|---|
+| LP `gesvd` | 512 | **0.36×** | 9% |
+| LP `gesvd` | 256 | **0.80×** | 6% |
+| LP `gesvd` | 1000 | **0.88×** | 86% |
+| LP `gesvd` | 1024 | **0.89×** | 82% |
+| LP `syev` | 8 | **0.94×** | 7% |
+
+### wintermute — Zen4, AVX-512
+
+Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 2813 MHz with boost off.
+
+1104 cells, 0 off-lock, 893 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+
+**Where threading pays.** Best cell per operation:
+
+| op | best speedup | at n | round spread |
+|---|---|---|---|
+| L3 `gemm` | **4.42×** | 1000 | 3% |
+| L3 `symm` | **4.10×** | 1000 | 0% |
+| LP `getrf` | **3.05×** | 4096 | 1% |
+| L3 `trmm` | **2.86×** | 4096 | 1% |
+| LP `geqrf` | **1.55×** | 4096 | 1% |
+| LP `gesvd` | **1.25×** | 2048 | 4% |
+| LP `syev` | **1.09×** | 2048 | 5% |
+
+**Where threading COSTS.** Every cell that got slower with six threads:
+
+| op | n | speedup | round spread |
+|---|---|---|---|
+| LP `gesvd` | 512 | **0.47×** | 115% |
+| LP `gesvd` | 256 | **0.79×** | 9% |
+| LP `pstrfU` | 4096 | **0.90×** | 13% |
+| LP `gelsd` | 1000 | **0.90×** | 12% |
+| CL2 `zhemv` | 2100 | **0.93×** | 24% |
+| LP `gesvd` | 1024 | **0.94×** | 26% |
+| LP `getrs` | 2048 | **0.94×** | 5% |
+
+### neuromancer — Zen5, AVX-512
+
+Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+
+1104 cells, 0 off-lock, 883 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+
+**Where threading pays.** Best cell per operation:
+
+| op | best speedup | at n | round spread |
+|---|---|---|---|
+| L3 `gemm` | **5.34×** | 1000 | 1% |
+| L3 `symm` | **4.82×** | 1000 | 0% |
+| LP `getrf` | **3.96×** | 4096 | 0% |
+| L3 `trmm` | **3.58×** | 4096 | 1% |
+| LP `geqrf` | **1.87×** | 512 | 2% |
+| LP `gesvd` | **1.70×** | 1000 | 3% |
+| LP `gelsd` | **1.17×** | 1000 | 1% |
+| LP `syev` | **1.16×** | 1000 | 0% |
+| LP `getrs` | **1.13×** | 1000 | 3% |
+| CL2 `ztrmv` | **1.07×** | 100 | 38% |
+| CLP `zheev` | **1.05×** | 2048 | 0% |
+
+**Where threading COSTS.** Every cell that got slower with six threads:
+
+| op | n | speedup | round spread |
+|---|---|---|---|
+| LP `gesvd` | 512 | **0.70×** | 88% |
+| CL1 `zdotc` | 1000000 | **0.88×** | 38% |
+| LP `gesvd` | 256 | **0.92×** | 28% |
+| CL1 `zscal` | 1000000 | **0.95×** | 59% |
+
+## Open: `gesvd` gets slower with threads
+
+`gesvd` is the one routine that is **worse** with threads, and it reproduces on all three
+microarchitectures — though not equally, which is itself a clue:
+
+| box | n=256 | n=512 | n=1000 | n=1024 | n=2048 |
+|---|---|---|---|---|---|
+| galen (Zen3) | 0.80× | 0.36× | 0.88× | 0.89× | 1.28× |
+| wintermute (Zen4) | 0.79× | 0.47× | 1.04× | 0.94× | 1.25× |
+| neuromancer (Zen5) | 0.92× | 0.70× | 1.70× | 1.50× | 1.62× |
+
+The root cause is **not yet known**. Three plausible explanations have been measured and rejected:
+
+- **Not the fork-join price.** A gemm is only allowed to thread when it is at least 32× the measured
+  join cost, so aggregate join overhead cannot exceed about 3%. The measured cost is ~1.29 ms per
+  dispatch against a 616 ns join — roughly 2000×, and still ~300× a full sleep-wake.
+- **Not the operand shape.** Skinny gemms were suspected, since every worker packs the whole of A. But
+  a shape grid shows thin-`n`, thin-`k` and thin-`m` gemms mostly speeding up 1.9–3.7×.
+- **Not the spin budget.** Setting the worker spin window to zero moved the bad band rather than
+  removing it, and left n≥512 unchanged.
+
+What is established: the threaded path genuinely runs (72 dispatches witnessed at n=512 via the pool's
+generation counter, zero at one thread), and `gemm` itself is unstable under threading at n=256 while
+being stable and fast at n≥512. Until this is understood, **do not enable threading for a workload
+dominated by SVD at these sizes**.
+
