@@ -90,7 +90,13 @@ for path in ARGS
     flips = String[]
     for (lvl, op, n, arms) in rows
         haskey(arms, "pb") || continue
-        refs = [k for k in keys(arms) if k != "pb"]
+        # WHITELIST, not "anything that is not pb". Two arms in the cache are PureBLAS or Julia, not a
+        # vendor BLAS, and neither belongs on the other side of a gate comparison: `generic` is
+        # LinearAlgebra's own fallback (the DL1/DL3 reference) and `pb_mt` is PureBLAS itself running
+        # multi-threaded. `generic` has polluted this line since the dual groups landed; `pb_mt` would
+        # make it read a threaded-PB-vs-single-threaded-PB ratio as a gate verdict. `gate_gaps.jl:102`
+        # already spells the same whitelist — this is the copy that was missed.
+        refs = [k for k in keys(arms) if k == "openblas" || k == "aocl" || k == "mkl"]
         isempty(refs) && continue
         pb = arms["pb"]
         # SECONDS ratio = the shipped gate. CYCLES ratio = the same comparison in the arm's own clock.

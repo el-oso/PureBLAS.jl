@@ -37,8 +37,14 @@ for f in "${files[@]}"; do
                 if (n < 6) continue
                 fq = a[n-1] + 0
                 if (fq <= 0) continue
+                # A VENDOR whitelist, not "the first arm that is not pb". This check exists to say
+                # whether a PB window and a REFERENCE window ran at the same clock — a cross-epoch
+                # claim. Two cached arms are neither: `generic` is LinearAlgebra's own fallback, and
+                # `pb_mt` is PureBLAS itself at N threads, measured in the SAME run as `pb`. Letting
+                # either land in `ref` reports a same-run pair as a verified cross-epoch comparison
+                # that never happened — and for `pb_mt` it would always read ~0% and look reassuring.
                 if (a[1] == "pb") pb = fq
-                else if (ref == 0) { ref = fq; refname = a[1] }
+                else if (ref == 0 && (a[1] == "openblas" || a[1] == "aocl" || a[1] == "mkl")) { ref = fq; refname = a[1] }
             }
             if (pb > 0 && ref > 0) {
                 d = (pb - ref) / ref * 100; if (d < 0) d = -d

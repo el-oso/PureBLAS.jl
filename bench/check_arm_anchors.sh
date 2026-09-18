@@ -71,8 +71,12 @@ for f in "${files[@]}"; do
                 if (n < 6) continue
                 fq = a[4] + 0
                 if (fq <= 0) continue
+                # VENDOR whitelist — see the same note in check_arm_clocks.sh. `generic` and `pb_mt` are
+                # not references: `pb_mt` in particular is measured in the SAME run as `pb`, so it would
+                # always read ~0% drift and could MASK a genuinely stale openblas/aocl anchor by
+                # winning the "worst reference" comparison below with a reassuring number.
                 if (a[1] == "pb") pb = fq
-                else { nref++; rfq[nref] = fq; rnm[nref] = a[1] }
+                else if (a[1] == "openblas" || a[1] == "aocl" || a[1] == "mkl") { nref++; rfq[nref] = fq; rnm[nref] = a[1] }
             }
             if (pb > 0 && nref > 0) {
                 worstd = -1
