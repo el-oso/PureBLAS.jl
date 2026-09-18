@@ -48,6 +48,35 @@ REFBK == "mkl" && @eval using MKL
 # per-backend benchmark code exists.
 using OpenBLAS_jll
 const _ARM_PB = "pb"
+# ── THE MULTI-THREADED PureBLAS ARM ────────────────────────────────────────────────────────────────
+# `pb_mt` runs the SAME `work_pb` closure as `pb`, with `PureBLAS.set_num_threads(_MT_NT)` instead of 1.
+# It is an ARM NAME, deliberately NOT a member of `_REF_ALL`/`_VIEWS`: adding it there would multiply
+# the SVG set, break `check_view_pairing.sh`, and need new image references or the docs build hard-fails.
+# As an arm it is purely additive — the per-arm merge writes one more record per cell and every existing
+# artifact stays byte-identical, so NO cache version bump.
+#
+# ⚠ THIS IS A SCALING MEASUREMENT, NOT A GATE. A threaded PureBLAS against a single-threaded OpenBLAS is
+# flattery, not parity. The gate stays `PB ≥ max(OB, AOCL)` single-threaded. A real threaded gate needs
+# fresh THREADED reference arms — 6-8 h per box, three boxes — and the standing rule is that measuring a
+# reference at all needs the user's explicit per-run authorisation. Everything downstream that adjudicates
+# must therefore skip this arm; `_is_vendor_ref` below is the single place that decides.
+const _ARM_PB_MT = "pb_mt"
+# Threads for the `pb_mt` arm. 6 on every box BY DECISION, not by detection: wintermute and neuromancer
+# have 6 physical cores and galen has 12, and capping galen to 6 is what keeps the three boxes
+# comparable. Pin one CPU per PHYSICAL core when running it — a second thread on a core shares the same
+# FMA units, so logical-core scaling measures contention, not parallelism:
+#   taskset -c 0,2,4,6,8,10 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
+# `mt=` overrides for a scaling curve; it is a harness setting, not a shipped tuning knob, so no PDM tier.
+const _MT_NT = let i = findfirst(a -> startswith(a, "mt="), ARGS)
+    isnothing(i) ? 6 : parse(Int, ARGS[i][4:end])
+end
+# Is this arm a VENDOR reference — i.e. may it appear on the other side of a gate comparison? `pb` and
+# `pb_mt` are both PureBLAS, and `generic` is LinearAlgebra's own fallback. Everything that adjudicates
+# or audits a PB-vs-reference pair must ask THIS, never `a != "pb"`.
+_is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl"
+_is_pb_arm(a::AbstractString) = a == _ARM_PB || a == _ARM_PB_MT
+# Set PureBLAS's thread count for the arm about to be timed. Called BETWEEN windows, never inside one.
+_use_pb!(a::AbstractString) = (PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
 # `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
 # iteration path; it is also the one that can silently go stale, which is why every arm carries its own
 # timestamp+commit and the table reports reference age rather than hiding it.
@@ -107,8 +136,17 @@ const _REF_ALL = REFBK == "mkl" ? ["mkl"] : ["openblas", "aocl"]
 # instruction is that this needs their explicit authorisation, per-run — it is not an agent decision.
 const _REF_ARMS = isnothing(_ARMS_SEL) ? String[] : [a for a in _REF_ALL if a in _ARMS_SEL]
 const _DO_PB = isnothing(_ARMS_SEL) || (_ARM_PB in _ARMS_SEL)
-const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _REF_ARMS)
-isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$(join(_REF_ALL, ","))")
+# `pb_mt` is opt-in ONLY. It must never be implied by a bare run: it is a second full pass over every
+# cell (~86 min/box), and a run that quietly measured it would double the cost of the fast iteration path.
+const _DO_PB_MT = !isnothing(_ARMS_SEL) && (_ARM_PB_MT in _ARMS_SEL)
+const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[], _REF_ARMS)
+isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$_ARM_PB_MT,$(join(_REF_ALL, ","))")
+if _DO_PB_MT
+    Threads.nthreads() >= _MT_NT || error(
+        "arms=…,$_ARM_PB_MT needs at least $_MT_NT julia threads, got $(Threads.nthreads()). " *
+        "Run: taskset -c 0,2,4,6,8,10 julia --project=bench -t $_MT_NT bench/plots.jl …")
+    println(stderr, "▶ $_ARM_PB_MT arm ON at $_MT_NT threads — SCALING measurement, not a gate comparison")
+end
 
 # One measured arm of one cell, with ITS OWN provenance. Per-arm (not per-cell) timestamps are the whole
 # point: `arms=pb` rewrites only the pb record, so the reference records keep the date and commit at
@@ -221,12 +259,18 @@ end
 # `arms=pb` there IS no reference in this round (that is the point of the mode), so fall back to pb's
 # median time in µs — a bare NaN told you nothing, and the per-round time is exactly what you want to
 # eyeball for stability when iterating on the kernel. `_ROUNDLBL` says which you are looking at.
-const _ROUNDLBL = isempty(_REF_ARMS) ? "rounds (pb µs)" : "rounds"
+const _ROUNDLBL = !isempty(_REF_ARMS) ? "rounds" :
+    _DO_PB_MT ? "rounds (pb/pb_mt speedup)" : "rounds (pb µs)"
 function _round_med(qs::ArmData)
     haskey(qs, _ARM_PB) || return NaN
     for a in _REF_ARMS
         haskey(qs, a) && return median(_ratio(qs[a], qs[_ARM_PB]))
     end
+    # With the mt arm there is no reference, so the fallback below would print pb's microseconds and the
+    # pb_mt arm would be INVISIBLE for the whole sweep — ~86 min of flying blind, with no way to notice
+    # that the arm had silently degenerated to 1.00. Report the SPEEDUP instead: pb / pb_mt, so >1 means
+    # threading paid. Same orientation as the reference ratio above (bigger is better for PureBLAS).
+    (_DO_PB_MT && haskey(qs, _ARM_PB_MT)) && return median(_ratio(qs[_ARM_PB], qs[_ARM_PB_MT]))
     return median(qs[_ARM_PB]) * 1.0e6
 end
 # A THIRD, DERIVED view — not a reference arm. It divides by whichever of `_REF_ALL` is faster at each
@@ -463,7 +507,9 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
             arms = isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1)
             qs = Dict{String, Vector{Float64}}()
             for a in arms
-                w = a == _ARM_PB ? work_pb : (_use_ref!(a); work_ob)
+                # `pb_mt` runs work_pb like `pb` does — only the thread count differs, which is what
+                # makes this a PAIRED in-process A/B rather than two runs compared afterwards.
+                w = _is_pb_arm(a) ? (_use_pb!(a); work_pb) : (_use_ref!(a); work_ob)
                 # Bracket the window — see the note on the other measurement loop. THERE ARE TWO of
                 # them (this one drives L1/L2, the other the rep-pool levels) and instrumenting only
                 # one is why the first run with `flo|fhi` wrote EMPTY ranges for every L1/L2 cell:
@@ -529,7 +575,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
         for r in 1:rounds
             qs = ArmData()
             for a in (isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1))  # rotated (generalised ABBA); reference switch is outside the window
-                f = a == _ARM_PB ? pb1 : (_use_ref!(a); ob1)
+                f = _is_pb_arm(a) ? (_use_pb!(a); pb1) : (_use_ref!(a); ob1)   # see the note in `sweep`
                 # Bracket each arm's window with a clock sample. One sample AFTER the fact (what
                 # `_cell_khz()` alone gives) records the clock when we finished, not the clock the work
                 # actually ran at — fine while the box is pinned, wrong the moment it is not. Keeping
@@ -1798,7 +1844,27 @@ function run_cmplx_benchmarks()
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
-const CACHE = joinpath(@__DIR__, "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")   # v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to the rendered views
+# v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to
+# the rendered views.
+#
+# ── EXCEPT the pb_mt arm, which gets ITS OWN FILE, derived — not a new argument ──────────────────────
+# WHY THE GATE CACHE MUST NOT RECEIVE IT. `fleet_refresh.sh` pins the gate sweep to ONE core, on purpose:
+# an unpinned sweep let the scheduler migrate mid-measurement, and on galen (two 32 MiB L3s) a sweep
+# sharing a die with a GPU job moved 3.7% of cells. The `pb_mt` arm needs SIX cores, so `pb` and `pb_mt`
+# cannot share one invocation's affinity. Merging them into the gate cache would therefore REWRITE every
+# `pb` gate cell with a measurement taken at 6-core affinity instead of the sanctioned 1-core pinning —
+# changing the published gate's methodology silently, which is exactly the class of drift this file's
+# provenance machinery exists to make impossible.
+#
+# So the mt run writes `mt_data_…`, and that name is DELIBERATELY outside the `plots_data_*` glob that
+# fifteen scripts and `load_fleet()` use. It cannot leak into a rendered view, an artifact check, a
+# staleness audit or a gate verdict, because none of them can see it.
+#
+# Derived from `_DO_PB_MT` rather than taken as a `cache=` path: a path argument can be typo'd into the
+# gate cache, and the one thing this must guarantee is that asking for pb_mt can never overwrite the gate.
+const CACHE = joinpath(@__DIR__, _DO_PB_MT ?
+    "mt_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt" :
+    "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")
 # ── MACHINE-STATE PROVENANCE: `anchor=` and `freq=` ────────────────────────────────────────────────
 # WHY. A cached reference is compared against a PB arm measured in a DIFFERENT process, possibly days
 # later. Same-run ratios cancel machine state — thermal drift, clock, page placement — because both arms
@@ -2528,7 +2594,10 @@ else
         # `bench` measures no reference and would sail past this check straight into the 2026-08-06
         # failure it was written for. Condition on what was ACTUALLY measured, never on how it was
         # asked for.
-        if !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
+        # `_DO_PB_MT` is exempt: this guard exists to stop a partial run DESTROYING cached reference
+        # arms, and the mt cache has none by design (it is a separate file — see `CACHE`). There is
+        # nothing to lose there, so a full mt sweep is the intended shape rather than a refusal.
+        if !_DO_PB_MT && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
             error(
                 """
                 REFUSING to overwrite $CACHE with a partial arm set.
@@ -2536,7 +2605,13 @@ else
                 A full `bench` REPLACES the cache; only op=/group= merges per arm. Either
                   • add op=<op> or group=<LVL>  (merges, keeps the reference arms), or
                   • drop `arms=` to measure every arm (~3x longer), or
-                  • pass `force-arms` if a pb-only cache really is intended."""
+                  • pass `force-arms` if a pb-only cache really is intended.
+
+                MEASURING THE $_ARM_PB_MT ARM: use group=<LVL> runs, one per group. `$_ARM_PB_MT` is
+                additive — the per-arm merge writes it alongside the cached openblas/aocl records — but
+                a FULL run cannot express that, because a full run replaces rather than merges. Do NOT
+                reach for `force-arms` here: that is exactly the path that destroyed 2h45m of Zen5
+                reference arms on 2026-08-06."""
             )
         end
         g = measured
