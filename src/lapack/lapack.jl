@@ -480,7 +480,7 @@ end
 # where upper does not.
 #
 # ⛔ MEASURED AND FALSIFIED 2026-09-08 — DO NOT WIRE THIS IN, AND DO NOT REBUILD IT. Kept only as the
-# evidence. Zen3 (Zen3, rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
+# evidence. Zen3 (rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
 #     n        512    768   1000   1024   1500    2048
 #     halving 1028.7 3188.6 6982.7 7392.3 22632.9 56023.1     43.5-51.1 GF
 #     left-lk 1035.5 3261.6 7230.5 7803.5 25249.4 57537.1     43.2-49.8 GF
@@ -1307,7 +1307,7 @@ end
 # holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
 # `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
 #     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
-#     Zen3      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
+#     Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
 # invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
 #     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
@@ -1644,7 +1644,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # 200–4000)". That was measured under Julia 1.12 / LLVM 18 and INVERTED on 1.13.0-rc4 / LLVM 20 —
     # the same stale-provenance failure as gbtrf's nb step, on the same day.
     #
-    # MEASURED on Zen3 (Zen3, rc4, freq-locked, bench/probes/potrf_Zen3_n256.jl), panel vs the padded
+    # MEASURED on Zen3 (rc4, freq-locked, bench/probes/potrf_Zen3_n256.jl), panel vs the padded
     # hybrid, µs:
     #     n        256      320      384      512      768
     #     panel  223.77   466.79   816.06  1498.76  4018.71

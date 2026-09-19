@@ -259,7 +259,7 @@ end
 # measured Zen4 floor 8 · _NVREG 32): Zen4/Zen5 (32 regs) → floor 8, Zen3 (16 regs) → floor 16. Grow one
 # floor per L2-overflow of the matrix; cap 32 (µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs — the
 # BLAS-2 panel share ≈0.75·nb/n bites there; also = old flat value, so tall/large-m·n caps at 32 = no
-# regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 Zen3 (16→24→32),
+# regression, [[pureblas-getrf-campaign]]). MEASURED-VALIDATED Zen4 (8→16→32) + Zen3 (16→24→32),
 # formula reproduces both within ~5% (req#8b). Zen5 predicted = Zen4 (same NVREG/vw/L2) — needs confirm.
 #
 # FLAT nb = 4·_vwidth IS FALSIFIED ON BOTH BOXES — do not re-propose it. Branch `geqrf-nb-derived`

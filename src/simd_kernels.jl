@@ -762,8 +762,7 @@ end
     # values. AVX2 has 16 vector regs, AVX-512 has 32 — a hardcoded 4× put all 16 YMM into accumulators on
     # AVX2 and spilled (dotc/dotu small-n 0.75×).
     #
-    # RESERVE IS 4, MEASURED — it was 6, which is one register-pair too conservative on AVX2. Zen3 (Zen3,
-    # AVX2), plots.jl's L1-sweep regime, 40 samples, GB/s median, standalone kernels differing only in UNR:
+    # RESERVE IS 4, MEASURED — it was 6, which is one register-pair too conservative on AVX2. Zen3 (# AVX2), plots.jl's L1-sweep regime, 40 samples, GB/s median, standalone kernels differing only in UNR:
     #     n=1000   UNR 1/2/3/4 = 117.7 / 158.5 / 169.9 / 129.4     (shipped UNR=2 measured 155.5)
     #     n=3000               = 116.4 / 116.7 / 116.7 / 116.3
     #     n=10000              = 114.3 / 114.4 / 114.9 / 113.6
@@ -1291,7 +1290,7 @@ end
 # NB IS CHOSEN BY L2 RESIDENCY — PDM **Derive** tier, no knob, no preference, no runtime measurement.
 # Criterion: while the stream fits L2, load latency is low and two lines in flight cover it, so the
 # shorter loop (less per-iteration overhead, fewer live registers) wins; once the stream leaves L2 the
-# misses must be hidden by more outstanding lines, and 4 beats 2. Measured on Zen4 (Zen4, L2 = 1 MB,
+# misses must be hidden by more outstanding lines, and 4 beats 2. Measured on Zen4 (L2 = 1 MB,
 # freq-locked, plots.jl's own fresh-allocation regime, 90 samples, GB/s median) — NB=2 over NB=4:
 #     7 KB +12.7% | 23 KB +8.8% | 78 KB +5.1% | 234 KB +4.2% | 781 KB +4.2% | 1024 KB (=L2) +1.5%
 #     1562 KB −5.5% | 2343 KB −0.4% | 4.6 MB −7.6% | 7.6 MB −11.1% | 15 MB −9.5% | 30 MB −9.9%

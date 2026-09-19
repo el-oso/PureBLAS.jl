@@ -70,7 +70,7 @@ const _GBTRF_CMULT = @load_preference("gbtrf_cmult", 1)::Int
     #
     # Re-measured on all three boxes at rc4, at the GATE shapes (bench/probes/gbtrf_nb_fleet.jl, ms):
     #
-    #     n (kl)      live      Zen3 Zen3        Zen4 Zen4     Zen5 Zen5
+    #     n (kl)      live      Zen3        Zen4     Zen5
     #     512  (64)     8    0.250 → best 24        0.281 best         0.321 best
     #     1000 (125)    8    1.415 → 1.255 @16      1.441 → 1.388 @16  1.765 → 1.763 @16
     #     1024 (128)   16    1.336 → 1.147 @12      1.389 best         1.782 best

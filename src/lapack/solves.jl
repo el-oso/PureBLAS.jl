@@ -92,9 +92,9 @@ function getrs!(
         # Measured on ALL THREE boxes, gate-exact regime (fresh LU factors per sample,
         # `_reps_quadratic` reps in the timed core), full `getrs!` both ways, every arm verified
         # against `LAPACK.getrs!`, one size per PROCESS. trsv/trsm:
-        #   Zen4 Zen4  n=8 2.176  50 1.063  100 1.040  128 1.041  256 1.051  512 1.025  1024 1.009
-        #   Zen3      Zen3       —     50 1.090  100 1.050        —    256 1.034  512 1.013  1024 1.007
-        #   Zen5 Zen5      —     50 1.067  100 1.065        —    256 1.081  512 1.031  1024 1.016
+        #   Zen4  n=8 2.176  50 1.063  100 1.040  128 1.041  256 1.051  512 1.025  1024 1.009
+        #   Zen3       —     50 1.090  100 1.050        —    256 1.034  512 1.013  1024 1.007
+        #   Zen5      —     50 1.067  100 1.065        —    256 1.081  512 1.031  1024 1.016
         # Wins on every box at every size up to 1024 and ties at 2048; the gain decays monotonically
         # in n, as an overhead-amortisation story predicts.
         #

@@ -173,7 +173,7 @@ nothing new was written for the trailing update; the panel is the generic dgeqr2
 `_house_left!`, scalar on a Dual). Float32 and BigFloat were on the unblocked path too and are lifted by
 the same change.
 
-Zen3 (Zen3, core 6, freq-locked), `bench/probes/dual_geqrf_check.jl` — the probe §2's numbers came from,
+Zen3 (core 6, freq-locked), `bench/probes/dual_geqrf_check.jl` — the probe §2's numbers came from,
 Chairmarks median of 24, fresh operand per sample, PB / LinearAlgebra generic:
 
 | n | before | after |
@@ -334,7 +334,7 @@ panel (the crossover was never in play — both arms were unblocked), and that s
 after the change: unblocked 3.1 / 7.2 / 13.8 / 23.1 / 36.6 / 79.4 µs vs blocked 28.3 / 39.1 / 73.7 at n=40/48/64 —
 so for a pair the unblocked panel now wins to n≈48–56, past the shared `_QR_UNBLK_MAX = 32` (§9 row).
 
-### 10.3 Result (Zen3, Zen3, core 6, freq-locked; `bench/probes/dual_lp_ratios.jl`, the DLP probe shape, both arms same run)
+### 10.3 Result (Zen3, core 6, freq-locked; `bench/probes/dual_lp_ratios.jl`, the DLP probe shape, both arms same run)
 
 | n | `dsyev1` before | after | `dgeqrf1` before | after |
 |---|---|---|---|---|
@@ -383,7 +383,7 @@ the planar `_syev!` has no dual comparison left to leak through.
 Measured on the fleet under a verified lock (2794 / 3674 / 1972 MHz achieved under load), `arms=pb,generic`
 so both arms are recorded in the SAME run, as the dual groups require. Published geomean (worst cell):
 
-| row | Zen3 · Zen3 | Zen4 · Zen4 | Zen5 · Zen5 |
+| row | Zen3 | Zen4 | Zen5 |
 |---|---|---|---|
 | `dsyev1` | 1.15 (0.67) → **1.85 (1.69)** | 1.12 (0.66) → **1.92 (1.75)** | 1.13 (0.69) → **1.97 (1.72)** |
 | `dgeqrf1` | 2.08 (0.87) → **3.11 (2.09)** | 2.16 (0.82) → **2.69 (1.82)** | 2.24 (0.79) → **2.78 (1.77)** |

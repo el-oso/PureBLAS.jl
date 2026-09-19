@@ -6,7 +6,7 @@ prediction it says so.
 
 ## 0. Triage: what the generic scalar path achieves today
 
-Zen3 (Zen3, core 6, boost off, 3673 MHz), Julia 1.13.0, scratch env with ForwardDiff, through the public
+Zen3 (core 6, boost off, 3673 MHz), Julia 1.13.0, scratch env with ForwardDiff, through the public
 entries, plots.jl's CL2 regime (fresh operands per sample, `_L2REP(n)` dependent reps), Chairmarks median of 6
 rounds. Cell = complex-twin time ÷ dual time on identical bytes (1.0 = parity; 0.25 = dual is 4× slower).
 Probe: `bench/probes/dual_l23_triage.jl` (gitignored).
@@ -249,7 +249,7 @@ from this round** (sparring point 4): PureBLAS has no SIMD complex symv to tag e
 loop (`_symv!`), so the 0.83–0.88 "parity" in the triage is two scalar loops. Complex symv is an ungated gap of
 the same class `_scal_cmplx_simd!` was before `zscalc`; a symv kernel is separate work for both algebras.
 
-### Measured (Zen3, Zen3, same probe and regime as the triage; median of 6 rounds)
+### Measured (Zen3, same probe and regime as the triage; median of 6 rounds)
 
 Complex-twin time ÷ dual time on identical bytes, after tagging:
 

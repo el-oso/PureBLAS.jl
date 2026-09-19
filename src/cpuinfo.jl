@@ -217,7 +217,7 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # benchmarked — which is the whole point of req#7/#8.
 #
 # Verified against live CPUID on all three fleet boxes and public dumps for every Zen5 variant:
-#   Zen3 Zen3 0b0110 FP256 · Zen4 Zen4 0b0110 FP256 · Zen5 Krackan 0b0110 FP256
+#   Zen3 0b0110 FP256 · Zen4 0b0110 FP256 · Zen5 Krackan 0b0110 FP256
 #   Granite Ridge 0x0A FP512 · Turin 0x0A · Strix Halo 0x0A · Strix Point 0x06 · Krackan 0x06
 # Zen1 reads FP128, i.e. a 16 B datapath, which no one has ever tuned for and now falls out for free.
 #

@@ -4,7 +4,7 @@ Status: **implemented on branch `dual-l2l3` (2026-09-13); the design as sparred,
 
 ## 0. Triage: what the generic scalar path achieves today
 
-Zen3 (Zen3, core 6, boost off), plots.jl's CL3 regime (one call per sample on fresh operands), Chairmarks
+Zen3 (core 6, boost off), plots.jl's CL3 regime (one call per sample on fresh operands), Chairmarks
 median of 6 rounds. Cell = complex-twin time ÷ dual time on identical bytes; the complex twin's absolute time
 is given so the route it took is visible. Probe: `bench/probes/dual_l23_triage.jl` (gitignored).
 

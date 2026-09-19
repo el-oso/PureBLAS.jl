@@ -1168,7 +1168,7 @@ end
 # A Preference still overrides, for calibration or to A/B the formula on an unseen box.
 #
 # THE FLEET SPLIT — this is the D-vs-M decision made by measurement, not by preference. Running the
-# same sweep on Zen3 (Zen3, W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
+# same sweep on Zen3 (W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
 #
 #   sytrf F64, Zen3 PB/OB at the predicted nb:  1.44  1.47  1.37  1.24  1.17   (n=128…2048)
 #     gates at every size; argmax differs at n=128 (24: 1.58) and n=2048 (96: 1.19), worst loss 9%.

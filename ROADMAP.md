@@ -191,8 +191,8 @@ Measured wall-clock for a real refresh (`arms=pb`, one group per pass), which no
 
 | box | LP | DLP | note |
 |---|---|---|---|
-| Zen4 · Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
-| Zen3 · Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
+| Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
+| Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
 
 Two things fall out, and both belong in the knob review:
 
@@ -347,7 +347,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
 - [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 Zen3, Zen4/
       AVX-512 Zen4, Zen5/native-AVX-512 Zen5); boost-locked certification in "Fleet-gate
       certification" below. (Future M5 ARM box not yet acquired.)
-  - **Zen3 (Zen3, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
+  - **Zen3 (Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
     suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
     symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
     PASS except gemvN 0.80 / gbmvN 0.62, **all L3 FAIL (gemm 0.63, symm 0.58, syrk 0.59, syr2k 0.65,

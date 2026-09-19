@@ -227,7 +227,7 @@ gaps:
 The one genuinely complex-specific cell is **zaxpy@3e4** (Zen4 0.963, Zen5 0.834), which step 1
 targets.
 
-⚠ Zen5 (Zen5) is not gate-authoritative: its lock drops on power change, and it reads **FP256**
+⚠ Zen5 is not gate-authoritative: its lock drops on power change, and it reads **FP256**
 (`test/autotune_tests.jl:21-23` — Strix/Krackan, `fpw = 32`, double-pumped, lands with Zen4). Do not
 build a width argument on "Zen5 is native-512"; that is a retracted claim from an old family lookup.
 
