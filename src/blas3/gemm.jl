@@ -447,7 +447,7 @@ end
 # vector body, scalar remainder — around what should be one 32-byte move. Measured on the runtime-nr
 # signature: 28 `<4 x double>` but 31 `vector.body` / 8 `vector.ph` across 620 LLVM lines.
 #
-# Why it was worth chasing: the syrk phase decomposition (bench/probes/syrk_small_phasefrac.jl, galen
+# Why it was worth chasing: the syrk phase decomposition (bench/probes/syrk_small_phasefrac.jl, Zen3
 # 1875dad, in-situ Profile attribution, consistency 0.956-1.027) put pack B at 23.6% of syrk@50 and
 # 17.3% of syrk@100 — TWICE pack A's share for the same data volume, which is the tell that the cost is
 # scaffolding rather than traffic. Isolated A/B, byte-identical output (bench/probes/packb_val_ab.jl):
@@ -1475,7 +1475,7 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 # ALGEBRAIC, and the split/combine cost is O(n²) against O(n²·k) of product, which is exactly what the
 # MIN/MAX/KMIN window already bounds. So the width test was an artefact of only ever having measured
 # W=4, and removing it DELETES a datapath-gated literal rather than adding a knob.
-# Measured on Zen4 (Zen4, W=8, freq-locked, in-process ABBA, 3m/base — bench/probes/sk2_*.jl):
+# Measured on Zen4 (W=8, freq-locked, in-process ABBA, 3m/base — bench/probes/sk2_*.jl):
 #     n        32*     64      128     256     512     1024    2048    4096*
 #     zgemm    0.999   0.872   0.797   0.787   0.818   0.801   0.800   1.002
 # (* = window-edge CONTROLS, outside MIN=48 / MAX=2048; both tie with relerr exactly 0, which is what
@@ -1603,7 +1603,7 @@ const _STRASSEN_MAXDEPTH = @load_preference("strassen_maxdepth", 4)::Int
 # `_datapath_bytes(hw) >= 64 ? 256 : 1024`, and that predicate no longer exists — it was falsified and
 # replaced by `@inline _at_strassen_min(hw) = 256` (cpuinfo.jl:517), flat on the whole fleet. So
 # `strassen_min` is 256 EVERYWHERE, including Zen4 and Zen3, and the "only reachable on native AVX-512"
-# conclusion below does not follow from it. Verified on wintermute (Zen4, datapath 32): the running
+# conclusion below does not follow from it. Verified on Zen4 (datapath 32): the running
 # value is 256, not 1024. Whether the pad arm is actually reached off AVX-512 is now an open question,
 # not a settled no-op — the gate table below was measured on Zen5 and still stands on its own terms.
 #
@@ -2991,7 +2991,7 @@ end
 # makes `gemm!`'s no-allocation proof honest (see `_ws_grow!` in workspace.jl).
 #
 # The cost of putting the fifteen O(n²) Winograd combines on `PtrMatrix` was MEASURED first, because the
-# note on `_gemm_real_dims!` above exists to protect exactly this codegen (galen, Zen3,
+# note on `_gemm_real_dims!` above exists to protect exactly this codegen (Zen3,
 # `bench/probes/ptrmat_broadcast_cost.jl`, PtrMatrix/Matrix): a plain `@. C = A + B` is 0.997–0.988 at
 # n=256…2048, and the fused `@. C = α*(A+B+C)` shape the epilogue actually writes is 0.50–0.82, i.e.
 # faster. It is not a tax.
@@ -3357,16 +3357,16 @@ end
 # is a pin — which is the user's tier, not the agent's. So this knob takes the tree's live shape: the
 # default is the one measurement on record, the candidates are named for a calibrator to duel.
 #
-# THE ONE MEASUREMENT ON RECORD (bench/probes/threading_forkjoin_cost.jl; wintermute, Zen4, 4 workers,
+# THE ONE MEASUREMENT ON RECORD (bench/probes/threading_forkjoin_cost.jl; Zen4, 4 workers,
 # freq-locked): a pool wake-to-join round trip of 616 ns under a 2796 MHz core clock. Both are HOST
 # FACTS recorded as such — neither is a tuning choice — and the default multiplies them back into the
-# core-cycles-per-join the formula consumes (1722; the retired literal rounded it to 1720). galen and
-# neuromancer have NOT confirmed it. What this leaves, and it is the USER'S decision, not a code edit:
+# core-cycles-per-join the formula consumes (1722; the retired literal rounded it to 1720). Zen3 and
+# Zen5 have NOT confirmed it. What this leaves, and it is the USER'S decision, not a code edit:
 #   * a `tune!()` calibrator for `gemm_mt_work` needs a THREADED measurement inside a harness whose gate
 #     runs single-threaded (bench/plots.jl pins `BLAS.set_num_threads(1)`) — a harness design question;
 #   * the trim build's pin list (juliac/build.jl) is the user's tier; no pin is added here. Unpinned,
 #     the shipped default is a plain const, so the `.so` is deterministic and trim-clean without one.
-# PDM: Measured — recorded fork-join round trip on wintermute (ns); feeds gemm_mt_work's shipped default | tune: via gemm_mt_work
+# PDM: Measured — recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default | tune: via gemm_mt_work
 const _MT_JOIN_NS_MEASURED = 616          # req8-ok: a recorded measurement, not a tuning choice; see the block above
 # PDM: Measured — the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) | tune: via gemm_mt_work
 const _MT_JOIN_CLOCK_MHZ_MEASURED = 2796  # req8-ok: a recorded measurement, not a tuning choice; see the block above
@@ -3384,7 +3384,7 @@ const _GEMM_MT_WORK_SHIPPED =
 # bracket is NOT derived — it spans the two measured protocol regimes (a spin wake at ~570 ns, a sleep
 # wake at ~4000 ns, same probe) and nothing detected bounds a fabric latency. Stated as such.
 const _GEMM_MT_WORK_CANDIDATES = ntuple(i -> (_GEMM_MT_WORK_SHIPPED >> 2) << (i - 1), 5)
-# PDM: Measured — the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (wintermute, 616 ns @ 2796 MHz). | tune: no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped
+# PDM: Measured — the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | tune: no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped
 const _GEMM_MT_WORK_PREF = @load_preference("gemm_mt_work", nothing)
 const _GEMM_MT_WORK = something(_GEMM_MT_WORK_PREF, _GEMM_MT_WORK_SHIPPED)::Int   # req8-ok: shipped default until tune!() moves it
 

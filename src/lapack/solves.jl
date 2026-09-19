@@ -48,11 +48,11 @@ function trtrs!(
     # MEASURED FOR THIS SHAPE, on all three boxes (bench/probes/trtrs_nrhs1.jl, gate-exact regime,
     # one size per PROCESS, both arms verified against `LAPACK.trtrs!`), trsv/trsm:
     #   n            100     128     256     1024    2048
-    #   wintermute   1.023   1.024   1.047   1.011   1.009 (tie)
-    #   galen        1.029   1.023   1.027   1.019     -
-    #   neuromancer  1.026   1.045   1.082   1.026     -
-    # Wins on every box at every size, tight CIs. Target cells: trtrs@100 0.879 wintermute / 0.883
-    # neuromancer, @128 0.954, @256 0.983, @1024 0.975, @2048 0.962 (the @32/@50 cells carry spreads
+    #   Zen4   1.023   1.024   1.047   1.011   1.009 (tie)
+    #   Zen3        1.029   1.023   1.027   1.019     -
+    #   Zen5  1.026   1.045   1.082   1.026     -
+    # Wins on every box at every size, tight CIs. Target cells: trtrs@100 0.879 Zen4 / 0.883
+    # Zen5, @128 0.954, @256 0.983, @1024 0.975, @2048 0.962 (the @32/@50 cells carry spreads
     # of 0.44-0.58 and are noise, not targets).
     #
     # trtrs's shape is NOT getrs's — one solve, uplo from the caller, versus L/unit then U — so it was
@@ -92,9 +92,9 @@ function getrs!(
         # Measured on ALL THREE boxes, gate-exact regime (fresh LU factors per sample,
         # `_reps_quadratic` reps in the timed core), full `getrs!` both ways, every arm verified
         # against `LAPACK.getrs!`, one size per PROCESS. trsv/trsm:
-        #   wintermute Zen4  n=8 2.176  50 1.063  100 1.040  128 1.041  256 1.051  512 1.025  1024 1.009
-        #   galen      Zen3       —     50 1.090  100 1.050        —    256 1.034  512 1.013  1024 1.007
-        #   neuromancer Zen5      —     50 1.067  100 1.065        —    256 1.081  512 1.031  1024 1.016
+        #   Zen4  n=8 2.176  50 1.063  100 1.040  128 1.041  256 1.051  512 1.025  1024 1.009
+        #   Zen3       —     50 1.090  100 1.050        —    256 1.034  512 1.013  1024 1.007
+        #   Zen5      —     50 1.067  100 1.065        —    256 1.081  512 1.031  1024 1.016
         # Wins on every box at every size up to 1024 and ties at 2048; the gain decays monotonically
         # in n, as an overhead-amortisation story predicts.
         #

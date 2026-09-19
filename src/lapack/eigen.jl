@@ -1228,7 +1228,7 @@ end
 # planar route on LAPACK (ForwardDiff/src/dual.jl `_eigvals`: `eigen` of the value plane, then
 # `diag(Q'·A_p·Q)` as two full gemms), while the dual-arithmetic path here ran the scalar generic
 # reduction (a `symv!` plus a rank-2 update per column, neither with a SIMD arm on a pair) — it fell from
-# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, galen).
+# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, Zen3).
 #
 # CLUSTERS. The simple-eigenvalue formula needs q_i determined, which it is not inside a cluster of
 # numerically equal eigenvalues: the computed basis of that eigenspace is an arbitrary rotation, and the

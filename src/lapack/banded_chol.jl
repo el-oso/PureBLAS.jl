@@ -229,7 +229,7 @@ const _PBTRF_UCROSS_PREF = @load_preference("pbtrf_u_native_kd", nothing)
     # signature of a CROSSOVER, not of a broken tuner: at the switch point the two kernels are within
     # ~1% of each other BY DEFINITION, so the argmin over rungs wanders while the loss is ~nothing.
     # Being one rung off therefore costs ~nothing, and the sibling formula is the principled place to
-    # sit. Galen measures 128 = exactly l2 ÷ 4096, agreeing with it outright.
+    # sit. Zen3 measures 128 = exactly l2 ÷ 4096, agreeing with it outright.
     @inline _pbtrf_ucross(::Type{ComplexF64}) = (f = _FKR_pbtrf_u_native_kd[]; f >= 0 ? f : _at_pbtrf_ucross(_HW))
 else
     @inline _pbtrf_ucross(::Type{<:BlasFloat}) = _fh_pbtrf_ucross_pref()::Int   # pinned (trim builds land here)

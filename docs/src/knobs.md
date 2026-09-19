@@ -233,7 +233,7 @@ Every `@load_preference` key in `src/` — 147 of them.
 | `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW)` | — |
 | `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW)` | — |
 | `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW)` | — |
-| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (wintermute, 616 ns @ 2796 MHz). | no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped |
+| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped |
 | `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW)` | — |
 | `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
@@ -370,5 +370,5 @@ on these, not on knobs.
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
 | `_MT_AMORTISE` | 32 | Literal | a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s |
 | `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
-| `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on wintermute (ns); feeds gemm_mt_work's shipped default |
+| `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |

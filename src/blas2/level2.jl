@@ -43,14 +43,14 @@ end
 # two-point curve fit). Calibrated by `bench/calibrate.jl`; default 8 until a host pins otherwise.
 #
 # WHY THE PREDICATE DIED. It was `_double_pumped ? 4 : 8`, justified by "Zen5 gemvN@256 was 0.86 at
-# MR=4" — but that measurement was taken on neuromancer, which reads FP256 and is therefore
+# MR=4" — but that measurement was taken on Zen5, which reads FP256 and is therefore
 # double-pumped, so the predicate handed the very box that measured MR=4 as WORSE exactly MR=4.
 #
 # FLEET TABLE (gate-exact regime, GB/s, freq-locked):
-#   Zen4 wintermute  MR=4 -> MR=8:  n=50 92.6->72.4 (-21.8%)  n=100 78.3->60.7 (-22.5%, a red cell)
+#   Zen4  MR=4 -> MR=8:  n=50 92.6->72.4 (-21.8%)  n=100 78.3->60.7 (-22.5%, a red cell)
 #                                   n=256 83.6->85.8 (+2.6%)  n=1000 62.3->58.0 (-7.0%)
-#   Zen5-mobile neuromancer: MR=4 measured 0.86 at gemvN@256, i.e. wants 8
-#   Zen3 galen: wants 8 (AVX2 re-exposes FMA latency; 8 accumulators cover it)
+#   Zen5-mobile: MR=4 measured 0.86 at gemvN@256, i.e. wants 8
+#   Zen3: wants 8 (AVX2 re-exposes FMA latency; 8 accumulators cover it)
 # So 8 is right on two of three boxes and Zen4's 4 is recoverable by calibration — which is the whole
 # contract of the Measure tier, and the only form that is also correct on silicon nobody has benchmarked.
 # PDM: Measured — the PANEL path's height; see `_gemvn_rowblock_mr` below, which DERIVES the row-block
@@ -75,17 +75,17 @@ const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 #
 # FLEET TABLE, gate-exact regime, in-process A/B of the SHIPPED kernel, non-overlapping CIs.
 # "law" = the height this function returns; ✓ = it is the measured winner.
-#   galen  Zen3 W=4:  m=32 ->8 ✓(1.87)  m=50 ->6 ✓(1.49)  m=64 ->8 ✓(2.03)                     3/3
+#   Zen3 W=4:  m=32 ->8 ✓(1.87)  m=50 ->6 ✓(1.49)  m=64 ->8 ✓(2.03)                     3/3
 #   neuro  Zen5 W=8:  32 ->4 ✓(1.23)  50 ->6 ✓(1.14)  64 ->8 ✓(1.42)  100 ->6 ✓(1.04)
 #                     128 ->8 ✓(1.02)  256 ->8 ✓(1.40)  448 ->8 ✓(1.11)                        7/7
 #   winter Zen4 W=8:  32 ->4 ✓(1.11)  50 ->6 ✓(1.15)  64 ->8 ✓(1.32)  100 ->6 ✗(MR=2 wins)
 #                     128 ->8 ✓(1.03)  256 ->8 ✓(1.74)  448 ->8 ✓(1.14)                        6/7
-# 16/17. The one miss (wintermute m=100) costs 5.8% against MR=2 there; against the SHIPPED MR=8 the
+# 16/17. The one miss (Zen4 m=100) costs 5.8% against MR=2 there; against the SHIPPED MR=8 the
 # rule still wins by 24% on Zen5 and 38% at m=32, so its bounded regret is far smaller than the
 # constant's. Ratios are vs MR=2 within each row, so read them across a row, never down a column.
 #
 # The PANEL path (n > `_gemvn_rb()`) is deliberately NOT covered: there the winner does not track the
-# remainder (measured: galen wants 8 almost everywhere, wintermute and neuromancer disagree size by
+# remainder (measured: Zen3 wants 8 almost everywhere, Zen4 and Zen5 disagree size by
 # size) and the whole spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
 @inline function _gemvn_rowblock_mr(m::Int, W::Int)
     best = 2
@@ -147,9 +147,9 @@ const _GEMVN_MINNER_PREF = @load_preference("gemvn_minner", nothing)
     #
     # FLEET TABLE — all three boxes freq-locked and VERIFIED before and after, quiet (the contention
     # guard refused and was re-run), gemvN, PB median µs, ratio minner=0 / minner=1:
-    #   Zen3 Zen3      m-inner WINS  gate 0.925 vs 0.901          -> datapath 32 -> true   (shipped)
-    #   Zen4 Zen4 m-inner WINS  gate 0.969 vs 0.953          -> datapath 32 -> true   (shipped)
-    #   Zen5 Zen5 m-inner LOSES n=512 0.916, n=1024 0.964,
+    #   Zen3      m-inner WINS  gate 0.925 vs 0.901          -> datapath 32 -> true   (shipped)
+    #   Zen4 m-inner WINS  gate 0.969 vs 0.953          -> datapath 32 -> true   (shipped)
+    #   Zen5 m-inner LOSES n=512 0.916, n=1024 0.964,
     #                    wins n=2048 1.043, flat elsewhere         -> datapath 64 -> false  (shipped)
     #
     # THE ZEN5 NEGATIVE IS NOW VALID. It previously rested on a run taken at 4841 MHz against a
@@ -807,7 +807,7 @@ end
 #                                  amortising x is the whole game again.
 #
 # DECISION (Measure, req#8b — a one-box derivation was caught here). Inside that window, per-column
-# beats blocked NC=4 by up to 1.35× on Zen4 (Zen4, 16 MB L3, mobile) and NEVER wins on Zen3
+# beats blocked NC=4 by up to 1.35× on Zen4 (16 MB L3, mobile) and NEVER wins on Zen3
 # (Zen3, 32 MB L3/CCX, desktop) — measured per-column ÷ blocked, GB/s:
 #     n=      128   256   512   768  1024  1536  2048  3072  4096
 #   Zen4     0.83  0.90  1.10  1.09  1.22  1.30  1.13  0.80  0.71   ⇒ window real
@@ -961,14 +961,14 @@ end
 # `bench/plots.jl bench op=gemvT` with PB+OpenBLAS+AOCL measured in the SAME run, forced through the
 # real entry path with `PUREBLAS_FORCE_gemvt_perscan`. Gate = min(vs OB, vs AOCL), pooled-quantile
 # median:
-#     Zen5 (Zen5)  n=  64     128    256    512    1024   2048   4096
+#     Zen5  n=  64     128    256    512    1024   2048   4096
 #       mode 0  ← ships     1.018  0.863  0.733  0.991  1.012  1.061  1.092
 #       mode 1              1.013  0.855  0.735  0.974  0.906  0.918  1.044
 #       mode 2              0.587  0.646  0.703  0.977  0.921  0.927  0.805
-#     Zen4 (Zen4)
+#     Zen4
 #       mode 1  ← ships     1.046  1.030  0.986  1.088  1.175  1.044  1.101
 #       mode 0              1.038  1.034  0.989  1.033  0.939  0.956  1.096
-#     Zen3 (Zen3)
+#     Zen3
 #       mode 0  ← ships     1.101  1.026  1.037  1.024  0.971  0.942  1.030
 #       mode 1              1.105  1.026  1.023  0.977  0.970  0.686  1.074
 #       mode 2              0.853  0.870  1.004  0.973  0.969  0.687  0.787
@@ -1099,7 +1099,7 @@ end
 # issues one per 4. That halving only pays while those x loads HIT IN L1, and x leaves L1 two ways —
 # by CAPACITY as m (the reduction length) grows, and by CONFLICT when the NC column streams sit a
 # whole L1 way period apart, which puts all 8 of them on the same sets.
-# Measured on wintermute 2026-09-11 (Zen4, freq-locked, 18 shapes, ONE SHAPE AND ONE ARM PER PROCESS,
+# Measured on Zen4 2026-09-11 (Zen4, freq-locked, 18 shapes, ONE SHAPE AND ONE ARM PER PROCESS,
 # forced through this real entry path; ratio = 8x4 ÷ NC=4, `bench/probes/gemvt_nc8u4_crossover.jl`):
 #     m     2100  2200  2350  2500 |2560| 2650  2800  3000 |3072| 3200 |3584| |4096| 4200 |9216|
 #   ratio   1.125 1.106 1.103 1.097|0.995|1.093 1.051 1.040|0.962|1.002|0.936| |0.920|0.961|0.890|
@@ -1111,7 +1111,7 @@ end
 #   • A pure-m (or pure x/L1) rule fitted it too. Killed by a REGISTERED PREDICTION: at fixed n=2100,
 #     m = 2560 -> 3000 -> 3072 -> 3200 alternates the alias bit and the ratios are NON-monotone
 #     (0.995, 1.040, 0.962, 1.002). A pure-m rule requires monotonicity.
-# CROSS-CHECKED on neuromancer (Zen5, 48 KiB/12-way L1 — note the way period is the SAME 4096 B, since
+# CROSS-CHECKED on Zen5 (48 KiB/12-way L1 — note the way period is the SAME 4096 B, since
 # 48K/12 = 32K/8, so the alias term transfers unchanged). Same probe, same regime, n=2100:
 #     m     2100 |3072| 3200  4000  4800
 #   ratio   1.071|0.990|1.009 1.023 1.033
@@ -1123,7 +1123,7 @@ end
 #     (byte-scaled here rather than via level3's doubles-only `_alias_ld`, which is included after this
 #     file and would also be wrong for F32).
 #   • CAPACITY: plain `x <= _L1_BYTES` — x must FIT in L1. An earlier `3/4 * _L1_BYTES`, fitted on
-#     wintermute alone between m=3000 (24000 B, 1.040) and m=3200 (25600 B, 1.002), was FALSIFIED by
+#     Zen4 alone between m=3000 (24000 B, 1.040) and m=3200 (25600 B, 1.002), was FALSIFIED by
 #     Zen5: m=4800 is x/L1 = 0.78 there and still WINS (1.033), so the bound is not an L1 fraction.
 #     Plain L1 captures strictly more wins with no regression on either box — on Zen4 it admits m=3200
 #     (1.002, a harmless neutral) and still excludes m=4200 (33600 B, 0.961). That Zen4 boundary is
@@ -1279,7 +1279,7 @@ end
         u0 = _gemvt_u(); pf0 = _gemvt_pf(); nc0 = _gemvt_nc()
         # `pf` does NOT gate the deep shape. It used to (`&& pf0 == 0`), so a `gemvt_pf` pin — which
         # `tune!()` writes from ONE size where the deep shape is not the incumbent — switched the deep
-        # shape off at every size. neuromancer pinned pf=128 and paid for it; paired A/B there, deep /
+        # shape off at every size. Zen5 pinned pf=128 and paid for it; paired A/B there, deep /
         # pf=128: 0.844 @64, 0.850 @128, 0.724 @256 (the gate cells were 0.855 / 0.737), while pf=128
         # wins where deep is ineligible, 1.025 @512, 1.044 @1024. So the prefetch distance applies only
         # to the non-deep kernel below (bench/probes: zen5_gemvt_pf.jl).
@@ -2104,7 +2104,7 @@ const _CGER_NP_MAX_HALF = _cger_np_max(true)
 # since the divisor can only alter behaviour inside [L3/2, L3):
 #     box                flipped cell        ratio    control band   verdict
 #     Zen4    n=1000 (15.3/16M)   0.9713   ±1.2%          -2.9%
-#     Zen3      Zen3    n=1024 (16/32M)     0.9711   ±1.7%          -2.9%
+#     Zen3    n=1024 (16/32M)     0.9711   ±1.7%          -2.9%
 #     Zen5   n=1000 (15.3/16M)   1.0029   ±2.3%          null (24 samples/arm)
 # Two µarchs gain 2.9% on DIFFERENT sizes — the rule reproducing, not a per-box fit — and the third is
 # unaffected. Zen5 needed 3 replicates/arm before its band was tight enough to adjudicate 3%; at 2
@@ -2552,10 +2552,10 @@ const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators i
 # regime, in which MR=2 is the better value on essentially every point of the fleet. MR=2 / MR=4,
 # gate-exact, ONE SIZE PER PROCESS, every MR verified against a dense symmetric reference:
 #     box            n=1024    n=2048    n=4096
-#     wintermute     1.0044    1.0453    1.0361
-#     galen          1.0063    1.0159    1.0015
-#     neuromancer    0.9892    1.0208    1.0002
-# Eight of nine points win or tie; the one loss is neuromancer n=1024 at -1.1%, where symv has no
+#     Zen4     1.0044    1.0453    1.0361
+#     Zen3          1.0063    1.0159    1.0015
+#     Zen5    0.9892    1.0208    1.0002
+# Eight of nine points win or tie; the one loss is Zen5 n=1024 at -1.1%, where symv has no
 # red cell. Bounded regret: worst -1.1%, best +4.5%, and the gains sit exactly on the out-of-L3
 # sizes that are red. That is a validated literal, not a per-µarch fit — the same value is best on
 # all three µarchs.
@@ -2569,7 +2569,7 @@ const _SYMV_NB = 8   # symv column-panel width (= # of gemv-T dot accumulators i
 # better" either — 2 and 4 are close and everything above them falls away.
 #
 # Also measured, for whoever picks symv up next: it is NOT bandwidth-bound. Against a same-bytes
-# `asum` read stream on wintermute, symv reaches 0.700 / 0.627 / 0.652 at n=1024 / 2048 / 4096. Part
+# `asum` read stream on Zen4, symv reaches 0.700 / 0.627 / 0.652 at n=1024 / 2048 / 4096. Part
 # of that is structural (8 strided column streams plus x and a y RMW, versus one contiguous stream),
 # but the gate only asks for AOCL's ~5%.
 const _SYMV_MR = 2
@@ -2715,18 +2715,18 @@ end
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
     #
     # ⛔ LOWERING NB IN THE DRAM REGIME: MEASURED AND FALSIFIED 2026-09-11. NB is monotonically
-    # best-at-the-cap, and by a wide margin — wintermute, gate-exact, all values verified against a
+    # best-at-the-cap, and by a wide margin — Zen4, gate-exact, all values verified against a
     # dense symmetric reference, relative to NB=8:
     #     n=2048   NB=1 0.408   NB=2 0.621   NB=4 0.813   NB=8 1.000
     #     n=4096   NB=1 0.453   NB=2 0.634   NB=4 0.830   NB=8 1.000
     # The motivating observation was real but its explanation was not: at n=4096, both out of L3,
-    # galen (NB=4) sits at 0.985 of a same-bytes `asum` read stream while wintermute (NB=8) sits at
+    # Zen3 (NB=4) sits at 0.985 of a same-bytes `asum` read stream while Zen4 (NB=8) sits at
     # 0.652, which looked like "fewer concurrent streams win out of L3"
-    # ([[pureblas-dram-stream-count]]). It is not causal — forcing NB=4 on wintermute makes it WORSE,
+    # ([[pureblas-dram-stream-count]]). It is not causal — forcing NB=4 on Zen4 makes it WORSE,
     # not better. NB is not merely a stream count: it is how many columns share one pass over x and y,
     # so halving it doubles the x/y loads per element of A. That traffic is L1/L2, which is why it is
     # invisible in a DRAM roofline comparison and yet dominates here.
-    # The galen-vs-wintermute gap therefore remains UNEXPLAINED, and both NB and MR are at their
+    # The Zen3-vs-Zen4 gap therefore remains UNEXPLAINED, and both NB and MR are at their
     # measured optima. Do not re-chase stream count.
     NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve A x y begin
@@ -3200,8 +3200,8 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # inside `_trmv_blk!` for the A/B that fixed the criterion at HALF L2:
 #     n <= NB || 2·n²·sizeof(T) <= _L2_BYTES   ⟺   n <= max(_TRI_NB, isqrt(_L2_BYTES ÷ (2·sizeof(T))))
 # (n integer ⇒ n² <= L2/(2s) ⟺ n² <= L2 ÷ (2s) ⟺ n <= isqrt(L2 ÷ (2s)); exact, no float.)
-# Fleet: L2 = 1 MiB ⇒ 257 for Float64 / 363 for Float32 (Zen4 Zen4, Zen5 Zen5);
-#        L2 = 512 KiB ⇒ 182 / 257 (Zen3 Zen3). `_TRI_NB` (=64 fleet-wide) is the floor.
+# Fleet: L2 = 1 MiB ⇒ 257 for Float64 / 363 for Float32 (Zen4, Zen5);
+#        L2 = 512 KiB ⇒ 182 / 257 (Zen3). `_TRI_NB` (=64 fleet-wide) is the floor.
 #
 # WHY IT IS A KNOB AND NOT JUST THE FORMULA: the A/B that validated this crossover (f552f13, 2026-07-31)
 # PREDATES `_trmv_fused8!` (447c46a, 2026-08-01). Below the threshold the loser was the OLD blocked

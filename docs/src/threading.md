@@ -20,10 +20,12 @@ arms**, which is six to eight hours per box and has not been done.
 
 ## How it is measured
 
-- **Six threads on every box**, pinned one per *physical* core. Galen has twelve and is capped to six so
-  the three boxes stay comparable. A second thread on a core shares the same FMA units, so pinning to
-  logical cores would measure contention rather than parallelism — and the sibling numbering differs per
-  box, which is a trap: `0,2,4,6,8,10` is six distinct cores on wintermute and only three on the others.
+- **Six threads on every box**, pinned one per *physical* core. The Zen3 part has twelve cores and is
+  capped to six so the three boxes stay comparable, and its six are taken from a single L3 so it matches
+  the single-CCX shape of the other two. A second thread on a core shares the same FMA units, so pinning
+  to logical cores would measure contention rather than parallelism — and the sibling numbering differs
+  between parts, which is a trap: `0,2,4,6,8,10` is six distinct cores on one of these boxes and only
+  three on the others.
 - **`pb` and `pb_mt` are measured in one process, in rotated rounds**, so a speedup divides two windows
   that saw the same machine state. It is a paired A/B, not two runs compared afterwards.
 - **A separate cache.** The gate sweep is pinned to ONE core on purpose; the mt arm needs six. Since the
@@ -85,7 +87,7 @@ Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode re
 
 Best speedup per operation, six threads against one, on each box.
 
-| op | galen (Zen3) | wintermute (Zen4) | neuromancer (Zen5) |
+| op | Zen3 · AVX2 | Zen4 · AVX-512 | Zen5 · AVX-512 |
 |---|---|---|---|
 | L3 `gemm` | 4.68× @512 | 4.42× @1000 | 5.34× @1000 |
 | L3 `symm` | 4.00× @4096 | 4.10× @1000 | 4.82× @1000 |
@@ -101,7 +103,7 @@ Best speedup per operation, six threads against one, on each box.
 | CL2 `ztrmv` | 1.01× @512 | 1.02× @512 | 1.07× @100 |
 | CLP `zheev` | 1.03× @2048 | 1.02× @1000 | 1.05× @2048 |
 
-### galen — Zen3, AVX2
+### Zen3 · AVX2
 
 Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
 
@@ -132,7 +134,7 @@ Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Proces
 | LP `gesvd` | 1024 | **0.89×** | 82% |
 | LP `syev` | 8 | **0.94×** | 7% |
 
-### wintermute — Zen4, AVX-512
+### Zen4 · AVX-512
 
 Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 2813 MHz with boost off.
 
@@ -162,7 +164,7 @@ Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M
 | LP `gesvd` | 1024 | **0.94×** | 26% |
 | LP `getrs` | 2048 | **0.94×** | 5% |
 
-### neuromancer — Zen5, AVX-512
+### Zen5 · AVX-512
 
 Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
@@ -200,9 +202,9 @@ microarchitectures — though not equally, which is itself a clue:
 
 | box | n=256 | n=512 | n=1000 | n=1024 | n=2048 |
 |---|---|---|---|---|---|
-| galen (Zen3) | 0.80× | 0.36× | 0.88× | 0.89× | 1.28× |
-| wintermute (Zen4) | 0.79× | 0.47× | 1.04× | 0.94× | 1.25× |
-| neuromancer (Zen5) | 0.92× | 0.70× | 1.70× | 1.50× | 1.62× |
+| Zen3 · AVX2 | 0.80× | 0.36× | 0.88× | 0.89× | 1.28× |
+| Zen4 · AVX-512 | 0.79× | 0.47× | 1.04× | 0.94× | 1.25× |
+| Zen5 · AVX-512 | 0.92× | 0.70× | 1.70× | 1.50× | 1.62× |
 
 The root cause is **not yet known**. Three plausible explanations have been measured and rejected:
 

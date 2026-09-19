@@ -60,7 +60,7 @@ note under `dupEven`.)
 ## Measured: where dual actually loses today
 
 Dual GB/s ÷ the complex twin's GB/s on identical bytes, through the real PureBLAS entries
-(wintermute, Julia 1.13.0, scratch env — adequate for an order-of-magnitude decision, **not** a gate
+(Zen4, Julia 1.13.0, scratch env — adequate for an order-of-magnitude decision, **not** a gate
 number):
 
 | op | n=1e3 | n=1e4 | n=1e5 | n=1e6 |
@@ -227,13 +227,13 @@ gaps:
 The one genuinely complex-specific cell is **zaxpy@3e4** (Zen4 0.963, Zen5 0.834), which step 1
 targets.
 
-⚠ Zen5 (neuromancer) is not gate-authoritative: its lock drops on power change, and it reads **FP256**
+⚠ Zen5 is not gate-authoritative: its lock drops on power change, and it reads **FP256**
 (`test/autotune_tests.jl:21-23` — Strix/Krackan, `fpw = 32`, double-pumped, lands with Zen4). Do not
 build a width argument on "Zen5 is native-512"; that is a retracted claim from an old family lookup.
 
 ## Implementation notes (steps 1 and 2, 2026-09-12)
 
-Measured after step 2, same method as the baseline table above (wintermute, Chairmarks median of 6
+Measured after step 2, same method as the baseline table above (Zen4, Chairmarks median of 6
 rounds, plots.jl regime, `bench/probes/dual_twins.jl`) — dual GB/s ÷ complex twin:
 
 ⚠ **READ THE ALPHA COLUMN BEFORE THE RATIO.** axpy/scal have two regimes and only one of them is
@@ -306,7 +306,7 @@ found) and a negative one (the histogram is not blind).
 Measured with a **dual alpha** (`bench/probes/dual_twins3.jl`: axpy `Dual(1.7, 0.3)` vs
 `1.7 + 0.3im`, scal `Dual(1.0000001, 1e‑7)` vs `1.0000001 + 1e‑7im`, so both arms run the tagged
 complex-layout kernel and neither takes the real-alpha bypass; Chairmarks median of 6 rounds,
-wintermute, dual GB/s ÷ complex twin, two samples):
+Zen4, dual GB/s ÷ complex twin, two samples):
 
 | op | n=1e3 | n=1e4 | n=1e5 | n=1e6 | before (generic loop) |
 |---|---|---|---|---|---|

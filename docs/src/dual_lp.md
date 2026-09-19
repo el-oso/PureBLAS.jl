@@ -173,7 +173,7 @@ nothing new was written for the trailing update; the panel is the generic dgeqr2
 `_house_left!`, scalar on a Dual). Float32 and BigFloat were on the unblocked path too and are lifted by
 the same change.
 
-galen (Zen3, core 6, freq-locked), `bench/probes/dual_geqrf_check.jl` — the probe §2's numbers came from,
+Zen3 (core 6, freq-locked), `bench/probes/dual_geqrf_check.jl` — the probe §2's numbers came from,
 Chairmarks median of 24, fresh operand per sample, PB / LinearAlgebra generic:
 
 | n | before | after |
@@ -205,7 +205,7 @@ which is the forward recursion (a) already performs. So (b) computes `Ṙ` and `
 run (a) for the reflector partials; it cannot replace it.
 
 And it would not be faster even if that recovery were free. `bench/probes/dual_qr_b_accounting.jl`
-(galen, same regime, median of 24) measures (b)'s optimistic bound — the value-plane Float64 QR plus one
+(Zen3, same regime, median of 24) measures (b)'s optimistic bound — the value-plane Float64 QR plus one
 `ormqr` plus one `trsm` plus one `trmm`, the recovery *excluded* — against (a):
 
 | n | (a) dual geqrf | = panel + trailing | (b) bound: F64 qr + ormqr + trsm + trmm | (a)/(b) |
@@ -288,7 +288,7 @@ applied.
 ### 10.1 The degradation and its cause
 
 DLP `dsyev1` fell monotonically with n on all three boxes (Zen4/Zen3/Zen5: 1.95/2.24/1.91 at n=32 → 0.66/0.67/0.69
-at 256). Decomposed on galen (`bench/probes/dual_syev_decomp.jl`, Chairmarks median of 10, fresh SPD operand per
+at 256). Decomposed on Zen3 (`bench/probes/dual_syev_decomp.jl`, Chairmarks median of 10, fresh SPD operand per
 sample, one call per sample — the DLP regime):
 
 | n | path | ref | `_syev!` | `_sytrd_lower!` | `_sytd2_lower!` | `_sterf!` | n × `symv!` |
@@ -322,7 +322,7 @@ diagonal of `Q'A_pQ` in whatever basis LAPACK picked: `[-0.99, -0.38, 0.22]` whe
 `[-2.73, 0.21, 1.37]` = the finite difference), so the test covers it against the block formula, not the oracle.
 Simple eigenvalues match ForwardDiff to 1e-13 (values and partials), eigenvector partials to 1e-12–1e-10.
 
-Planar accounting that justified it before writing (galen, `dual_syev_planar_bound.jl`, Float64): `_syev!('V')`
+Planar accounting that justified it before writing (Zen3, `dual_syev_planar_bound.jl`, Float64): `_syev!('V')`
 + `symm!` + n dots = 54 / 127 / 534 / 951 / **4783** µs at n=32/50/100/128/256, against the dual path's 48 / 149 /
 883 / 1713 / 12077 — a win everywhere but n=32, where the fixed cost of the vector solve loses 6 µs (12 %). Not
 worth a size knob; noted.
@@ -334,7 +334,7 @@ panel (the crossover was never in play — both arms were unblocked), and that s
 after the change: unblocked 3.1 / 7.2 / 13.8 / 23.1 / 36.6 / 79.4 µs vs blocked 28.3 / 39.1 / 73.7 at n=40/48/64 —
 so for a pair the unblocked panel now wins to n≈48–56, past the shared `_QR_UNBLK_MAX = 32` (§9 row).
 
-### 10.3 Result (galen, Zen3, core 6, freq-locked; `bench/probes/dual_lp_ratios.jl`, the DLP probe shape, both arms same run)
+### 10.3 Result (Zen3, core 6, freq-locked; `bench/probes/dual_lp_ratios.jl`, the DLP probe shape, both arms same run)
 
 | n | `dsyev1` before | after | `dgeqrf1` before | after |
 |---|---|---|---|---|
@@ -383,7 +383,7 @@ the planar `_syev!` has no dual comparison left to leak through.
 Measured on the fleet under a verified lock (2794 / 3674 / 1972 MHz achieved under load), `arms=pb,generic`
 so both arms are recorded in the SAME run, as the dual groups require. Published geomean (worst cell):
 
-| row | Zen3 · galen | Zen4 · wintermute | Zen5 · neuromancer |
+| row | Zen3 | Zen4 | Zen5 |
 |---|---|---|---|
 | `dsyev1` | 1.15 (0.67) → **1.85 (1.69)** | 1.12 (0.66) → **1.92 (1.75)** | 1.13 (0.69) → **1.97 (1.72)** |
 | `dgeqrf1` | 2.08 (0.87) → **3.11 (2.09)** | 2.16 (0.82) → **2.69 (1.82)** | 2.24 (0.79) → **2.78 (1.77)** |
@@ -430,7 +430,7 @@ container (`_str_like`) closes each world and one signature serves every level.
 **The first diagnosis — "depth 3 makes SubArray headers" — predicted the Matrix arm would leak too, and it
 measures 0 B.** That is why the A/B was run instead of the reading being shipped.
 
-Speed, per req#9, by controlled same-process A/B on galen (PB arm only, since nothing else changes; a
+Speed, per req#9, by controlled same-process A/B on Zen3 (PB arm only, since nothing else changes; a
 cross-run comparison against a cached `generic` arm would not be adjudicable):
 
 | n | before `779e4051` | after | ratio |

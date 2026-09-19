@@ -28,11 +28,15 @@ function mhz(s)
     return isnothing(m) ? String(s) : string(parse(Int, m.captures[1]) ÷ 1000, " MHz")
 end
 
+# A box is identified by its MICROARCHITECTURE, never its hostname. Hostnames are private to the fleet
+# and say nothing a reader needs: the thing that explains a number is the µarch, ISA and clock. The
+# cache header carries `host=`; this page deliberately does not print it.
+boxlabel(kv) = string(get(kv, "uarch", "?"), " · ", get(kv, "isa", "?"))
+
 function box_section(io, path)
     kv = mt_header(path)
     rows, st = mt_rows(path)
-    host = get(kv, "host", "?"); uarch = get(kv, "uarch", "?"); isa_ = get(kv, "isa", "?")
-    println(io, "### ", host, " — ", uarch, ", ", isa_)
+    println(io, "### ", boxlabel(kv))
     println(io)
     println(io, "Measured ", get(kv, "time", "?"), " at commit `", get(kv, "commit", "?"),
         "`, ", get(kv, "cpu", "?"), ", pinned at ", mhz(get(kv, "freq", "?")), " with boost off.")
@@ -101,7 +105,7 @@ function cross_box(io)
     println(io)
     print(io, "| op |")
     for (kv, _) in boxes
-        print(io, " ", get(kv, "host", "?"), " (", get(kv, "uarch", "?"), ") |")
+        print(io, " ", boxlabel(kv), " |")
     end
     println(io)
     print(io, "|---|")
@@ -147,10 +151,12 @@ arms**, which is six to eight hours per box and has not been done.
 
 ## How it is measured
 
-- **Six threads on every box**, pinned one per *physical* core. Galen has twelve and is capped to six so
-  the three boxes stay comparable. A second thread on a core shares the same FMA units, so pinning to
-  logical cores would measure contention rather than parallelism — and the sibling numbering differs per
-  box, which is a trap: `0,2,4,6,8,10` is six distinct cores on wintermute and only three on the others.
+- **Six threads on every box**, pinned one per *physical* core. The Zen3 part has twelve cores and is
+  capped to six so the three boxes stay comparable, and its six are taken from a single L3 so it matches
+  the single-CCX shape of the other two. A second thread on a core shares the same FMA units, so pinning
+  to logical cores would measure contention rather than parallelism — and the sibling numbering differs
+  between parts, which is a trap: `0,2,4,6,8,10` is six distinct cores on one of these boxes and only
+  three on the others.
 - **`pb` and `pb_mt` are measured in one process, in rotated rounds**, so a speedup divides two windows
   that saw the same machine state. It is a paired A/B, not two runs compared afterwards.
 - **A separate cache.** The gate sweep is pinned to ONE core on purpose; the mt arm needs six. Since the
@@ -228,7 +234,7 @@ microarchitectures — though not equally, which is itself a clue:
     for p in CACHES
         kv = mt_header(p); rows, _ = mt_rows(p)
         g = Dict(sz => s for (s, _, lvl, op, sz) in rows if op == "gesvd")
-        print(io, "| ", get(kv, "host", "?"), " (", get(kv, "uarch", "?"), ") |")
+        print(io, "| ", boxlabel(kv), " |")
         for n in (256, 512, 1000, 1024, 2048)
             haskey(g, n) ? @printf(io, " %s× |", fmt(g[n])) : print(io, " — |")
         end

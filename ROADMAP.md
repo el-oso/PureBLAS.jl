@@ -25,7 +25,7 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 - **M4 multithreading STARTED 2026-09-16** at user request; the old "do not start unless asked"
   deferral is lifted. Step 1 (per-thread scratch) is on master; step 2 (threaded gemm) is on branch
   `m4-threaded-gemm` pending ONE user decision — see the M4 section. Registration is still deferred.
-- **Zen5 is stale.** neuromancer's cache predates `ff5677ba` and its frequency lock has been dropping
+- **Zen5 is stale.** Zen5's cache predates `ff5677ba` and its frequency lock has been dropping
   (4841 MHz against a 2000 MHz pin). A setuid `pureblas-cpufreq` helper is built and staged there so the
   lock can be restored without the user present; it needs one `sudo install` and `fleet_freqlock.sh` is
   not yet wired to call it.
@@ -191,8 +191,8 @@ Measured wall-clock for a real refresh (`arms=pb`, one group per pass), which no
 
 | box | LP | DLP | note |
 |---|---|---|---|
-| wintermute · Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
-| galen · Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
+| Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
+| Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
 
 Two things fall out, and both belong in the knob review:
 
@@ -213,8 +213,8 @@ from one afternoon's inspection; the same question has never been asked of the o
 
 **3. Why this keeps costing time.** Every ETA I gave this session was wrong, in both directions, because
 there was no recorded per-group duration to estimate from and the obvious proxy (clock) is the wrong
-one — see galen above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
-FP256 double-pumped, so it behaves like galen at half the clock. Durations now recorded in
+one — see Zen3 above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
+FP256 double-pumped, so it behaves like Zen3 at half the clock. Durations now recorded in
 `kb/findings/sweep-wall-clock-reference.md` so the next session estimates from data.
 
 #### Update 2026-09-14 — the instrument matters more than the knobs
@@ -347,7 +347,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
 - [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 Zen3, Zen4/
       AVX-512 Zen4, Zen5/native-AVX-512 Zen5); boost-locked certification in "Fleet-gate
       certification" below. (Future M5 ARM box not yet acquired.)
-  - **Zen3 (Zen3, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
+  - **Zen3 (Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
     suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
     symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
     PASS except gemvN 0.80 / gbmvN 0.62, **all L3 FAIL (gemm 0.63, symm 0.58, syrk 0.59, syr2k 0.65,
@@ -1283,7 +1283,7 @@ unconditional notify, which cannot lose a wake.
 
 ### Still to do on the Julia side
 
-- The threshold `_MT_JOIN_CYCLES` is measured on wintermute ONLY — req#8(b) needs galen and neuromancer
+- The threshold `_MT_JOIN_CYCLES` is measured on Zen4 ONLY — req#8(b) needs Zen3 and Zen5
   before it is trusted to extrapolate.
 - **Scaling is 55% efficient at n=192 and 73% at n=1024, and chunk imbalance is NOT the reason.**
   Measured the actual split (`_NR = 8`, 5 workers): n=192 → 32/40/40/40/40 columns, 4% above ideal;
@@ -1464,14 +1464,14 @@ sparse Cholesky.
 ### Tooling backlog
 
 - **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
-  MEASURED on the 2026-09-03 fleet refresh: neuromancer, full rebuild (every arm interleaved). The rate
+  MEASURED on the 2026-09-03 fleet refresh: Zen5, full rebuild (every arm interleaved). The rate
   DECAYS through the sweep as it reaches larger `n` and the LAPACK ops, so quote an interval rate, never
   cells-done ÷ elapsed-since-launch:
     343 cells @ 10:23, 496 @ 11:42  ⇒  **1.94 cells/min over that interval**, vs ~4.0 averaged from the
     start — the early average overstates throughput by ~2× and understates the total by hours.
   At the interval rate the 930 cells take **~6-8 h** on that box. With 3 arms × 8 rounds a cell is ~24
   timing windows, so ~1.3 s per window at the later sizes. The `arms=pb` merge path is ~3× cheaper
-  (galen: 930 cells in ~86 min at a higher clock), but a *full* rebuild cannot use it — `plots.jl`
+  (Zen3: 930 cells in ~86 min at a higher clock), but a *full* rebuild cannot use it — `plots.jl`
   refuses a partial arm set on a full run, correctly, because it would drop the reference arms.
   The cost is real enough to discourage re-gating, which is the wrong incentive when the gate is the
   project's core contract. Directions, roughly by value:
@@ -1488,7 +1488,7 @@ sparse Cholesky.
      clock. A per-cell time budget would spend the sweep where the gate is actually in doubt.
   What NOT to do, both already established: do not parallelise within a box (a contended L3 skews the PB
   and reference windows unequally — the contention guard exists for this), and do not drop arms on a full
-  rebuild (that is the refusal above, and cross-run references are what made neuromancer's cache
+  rebuild (that is the refusal above, and cross-run references are what made Zen5's cache
   unusable in the first place).
 
 ### Wishlist

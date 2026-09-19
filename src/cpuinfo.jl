@@ -209,7 +209,7 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 #
 # WHY A CAPABILITY BIT AND NOT A FAMILY/MODEL TABLE. This was a family lookup (`family == 0x19`) until
 # 2026-09-09, when it was found WRONG: family 0x1A covers both native-512 parts (Granite Ridge desktop,
-# Turin server, Strix Halo) and double-pumped mobile ones (Strix Point, Krackan). neuromancer — a
+# Turin server, Strix Halo) and double-pumped mobile ones (Strix Point, Krackan). Zen5 — a
 # Krackan Ryzen AI 5 340 — was declared native and ran TEN arms off the wrong datapath; correcting just
 # `_at_gemvn_minner` was worth +24.8% on gemvN@2100, the fleet's worst gate cell. A model table would
 # not have fixed it either: AMD firmware can switch Turin between FP512 and FP256 mode on the SAME
@@ -217,7 +217,7 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # benchmarked — which is the whole point of req#7/#8.
 #
 # Verified against live CPUID on all three fleet boxes and public dumps for every Zen5 variant:
-#   galen Zen3 0b0110 FP256 · wintermute Zen4 0b0110 FP256 · neuromancer Krackan 0b0110 FP256
+#   Zen3 0b0110 FP256 · Zen4 0b0110 FP256 · Zen5 Krackan 0b0110 FP256
 #   Granite Ridge 0x0A FP512 · Turin 0x0A · Strix Halo 0x0A · Strix Point 0x06 · Krackan 0x06
 # Zen1 reads FP128, i.e. a 16 B datapath, which no one has ever tuned for and now falls out for free.
 #
@@ -318,7 +318,7 @@ const _GEMM_SPLIT_S = 2
 # On each box exactly ONE gate size changes routing; every other size routes identically in both arms
 # and reads flat, which is what makes the delta readable at all.
 #
-# GALEN IS THE REASON THIS FORMULA AND NOT A W=8 LITERAL. No formula can give 64 on W=8 while leaving
+# Zen3 IS THE REASON THIS FORMULA AND NOT A W=8 LITERAL. No formula can give 64 on W=8 while leaving
 # Zen3 at 28, because Zen3's `_MR` is 3 where W=8 has 2 — so any change here moves Zen3 too, from 28
 # to 32, which flips routing at its RED `gemm@32` (0.974). Measured: exactly neutral (1.0002). The
 # change is a real gain on both W=8 boxes and a no-op on AVX2, with no regression anywhere.
@@ -439,7 +439,7 @@ const _GEMM_SPLIT_S = 2
 # from `tune!()`, not another predicate. Reported, not fixed: the Pin tier is the user's.
 # DEFAULT 0, predicate DROPPED (2026-09-09). It was `_double_pumped(hw) ? 1 : 0`, i.e. mode 1 for Zen4.
 # Two reasons it goes:
-#  (1) The datapath fix would flip neuromancer (FP256) from 0 to 1 — and the notes above record mode 1
+#  (1) The datapath fix would flip Zen5 (FP256) from 0 to 1 — and the notes above record mode 1
 #      costing Zen5 2.0%. Keeping the predicate would ship a known regression on that box.
 #  (2) Mode 1 was never actually shipping anywhere. Zen4's derivation said 1, but this machine pins
 #      `gemvt_perscan = false` and `juliac/build.jl:123` pins it false for the trim build, so every
@@ -509,18 +509,18 @@ const _GEMM_SPLIT_S = 2
 # FALSIFIED PREDICATE, now a fleet-evidenced literal (2026-09-09). This was
 # `_datapath_bytes(hw) >= 64 ? 256 : 1024`, justified as "Zen3 and Zen4 measured FLAT while Zen5 wants
 # very different values". That reasoning died with the datapath fix: the box that supplied the "Zen5
-# native-512" optimum is neuromancer, which reads FP256 — a 32 B datapath, the SAME side as Zen3/Zen4.
+# native-512" optimum is Zen5, which reads FP256 — a 32 B datapath, the SAME side as Zen3/Zen4.
 # So the real fleet evidence is: FLAT on two boxes (zen3, zen4 — see test/autotune_tests.jl), and 256
 # WINS on the third (freq-locked, 4 runs, 1.0155/1.0756/1.0625/1.0565/1.0000 at n=256..4096, no losing
 # cell). A value that is flat on two machines and wins on the third is a LITERAL with fleet evidence,
-# not a derivation — and keeping the predicate would now flip neuromancer to 1024, the arm it measured
+# not a derivation — and keeping the predicate would now flip Zen5 to 1024, the arm it measured
 # as WORSE. The mechanism prose was backwards on its face too: cheaper FMAs make Strassen's
 # flops-for-adds trade LESS attractive, not more.
 # PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
 @inline _at_strassen_min(hw) = 256
 # FALSIFIED PREDICATE, now a fleet-evidenced literal — same story as `_at_strassen_min` directly above.
-# Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on neuromancer
-# (2 locked runs: 1.0011/1.0813/1.0703 at n=256/512/1024) — and neuromancer is a 32 B datapath, so the
+# Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on Zen5
+# (2 locked runs: 1.0011/1.0813/1.0703 at n=256/512/1024) — and Zen5 is a 32 B datapath, so the
 # predicate would now hand it 448, the arm it measured as worse.
 # PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
 @inline _at_trmm_rpack(hw) = 1792
@@ -596,7 +596,7 @@ const _GEMM_SPLIT_S = 2
 @inline _at_gbtrf_cross(hw, ::Type{ComplexF32}) = 16
 # pbtrf_cross F64: flips on ALL THREE boxes, so this is a MODAL-of-modals — the weakest thing shipped
 # in this campaign. Zen4 32 (5/6), Zen5 32 (4/6), Zen3 36 (4/6). The modals do split by
-# width, which is the only reason it is here rather than left to the tuner. Galen's candidates (36,40)
+# width, which is the only reason it is here rather than left to the tuner. Zen3's candidates (36,40)
 # are not even in the same set as the other two boxes' (24,32), so do not read 32-vs-36 as one
 # crossover measured noisily — the ladders differ. Re-measure before trusting this on a new µarch.
 @inline _at_pbtrf_cross(hw, ::Type{Float64}) = _wide_simd(hw) ? 32 : 36
@@ -677,7 +677,7 @@ end
 # copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
 # packed symmetric kernel at EVERY measured Zen3 n (the packed path is dead weight on AVX2), and the only
 # thing that can kill it is the O(n²) copy evicting the gemm's resident A-block from L2 — i.e. when the
-# materialized n×n copy no longer fits L2. Threshold = side of a square that fills L2: n = √(L2/sizeof). Galen
+# materialized n×n copy no longer fits L2. Threshold = side of a square that fills L2: n = √(L2/sizeof). Zen3
 # measured a mat≈pack TIE at exactly n=256 = √(512K/8), pinning the fraction at 1. This lifts the cut off the
 # mistuned 96 (which routed n=112–192 to the slower packed path, the AOCL misses) up to 256, routing the whole
 # gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on Zen4). req#8.
@@ -1102,10 +1102,10 @@ end
 # BLAS-2 streams several columns of A at once, `lda*sizeof(T)` bytes apart, so with 4 KiB pages each
 # inner iteration touches as many distinct pages as there are concurrent column streams. That is a
 # TLB-walk rate the hardware cannot hide once A leaves L3, and it is the whole of symv's AVX-512
-# plateau: counters on neuromancer at n=8192 show the SAME cycles (1.05x) and instructions (1.07x)
+# plateau: counters on Zen5 at n=8192 show the SAME cycles (1.05x) and instructions (1.07x)
 # as an equivalent pure read stream but 2.60x the dTLB-load-misses.
 #
-# A 2 MiB page covers 256 KiB of column stride and collapses that rate. Measured on wintermute at
+# A 2 MiB page covers 256 KiB of column stride and collapses that rate. Measured on Zen4 at
 # n=4096, madvise alone, no kernel change (bench/probes/thp_sweep.jl):
 #     symv +38.6% · gemvT +18.5% · gemvN +17.2% · ger +9.7% · syrk 0.0% · gemm 0.0%
 # BLAS-3 is flat BECAUSE it packs its operands into contiguous panels — it already has the locality

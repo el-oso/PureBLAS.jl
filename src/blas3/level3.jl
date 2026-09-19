@@ -3002,7 +3002,7 @@ end
 # KC-ng..KC-1 and the ragged tail takes 0..KC-1-ng.
 #
 # WHY IT EXISTS: routing `rev` to the scalar pack first (the cheap first cut) measured a 7-63% residual
-# against the no-trans leaf on galen — pack+unpack is 2·KC·n elements against KC²·n of solve, i.e. ~2/KC
+# against the no-trans leaf on Zen3 — pack+unpack is 2·KC·n elements against KC²·n of solve, i.e. ~2/KC
 # of the work, so a scalar pack an order slower than this one lands right on that residual. The "~1%"
 # estimate that justified the scalar cut assumed the per-element cost stayed comparable; it does not.
 @inline function _fused_packP_tr4!(
@@ -3663,9 +3663,9 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
             # `!rev` on the 8-wide pack but NOT the 4-wide one below, because that is where they MEASURED
             # differently — potrfU native arm, µs, after the reversed packs landed:
             #     n            512     768    1000
-            #     galen  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
+            #     Zen3  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
             #     neuro  W=8  lever 1709.7  5536.7 11996.1   native 2126.0  6759.3 14666.8   (−24/−22/−22%)
-            # and neuromancer's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
+            # and Zen5's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
             # reversal made it worse, not better. Hypothesis (not verified): reversing 8 f64 lanes is a full
             # cross-lane vpermpd per vector — 16 per block across pack+unpack, on top of `_tr8x8`'s own
             # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
@@ -7067,7 +7067,7 @@ end
 # the flagship gemm. DERIVED (req#8) via `_at_symm_mat_max` = √(L2/sizeof): a DIFFERENT criterion from the
 # rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured Zen3 n (packed
 # is dead weight on AVX2), and the only thing that unseats it is the O(n²) copy evicting the gemm's resident
-# L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Galen measured a mat≈pack
+# L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Zen3 measured a mat≈pack
 # tie at EXACTLY n=256=√(512K/8) (they converge for all n≥256), pinning the fraction at 1. This lifts the cut
 # off the mistuned 96 (which routed n=112–192 to the slower packed path → the Zen3 AOCL misses) to 256.
 # Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).

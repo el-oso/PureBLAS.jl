@@ -19,7 +19,7 @@
     zen5 = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32)   # Zen5 DESKTOP/SERVER (Granite Ridge,
     #                                                                 Turin): FP512, genuinely native
     # Zen5 MOBILE (Strix/Krackan) — reads FP256, so it must land with zen4 on every datapath-keyed knob.
-    # This is neuromancer (Ryzen AI 5 340, family 0x1A model 0x60); the old family lookup called it native.
+    # This is Zen5 (Ryzen AI 5 340, family 0x1A model 0x60); the old family lookup called it native.
     zen5m = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32; fpw = 32)
     tigerlake = hw(64, 48 * 1024, 1280 * 1024, 12 * 1024^2, :Intel, 0x06, 32)  # never benchmarked — prediction
     #                                                        (no Fn8000_001A on Intel ⇒ fpw = simd)
@@ -150,7 +150,7 @@
     #  (1) the datapath correction would have flipped Zen5-MOBILE (FP256 ⇒ double-pumped) from 0 to 1,
     #      and mode 1 is recorded as costing that box ~10% @1024 — a known regression, shipped by
     #      derivation;
-    #  (2) mode 1 was never actually reaching any box: wintermute pins `gemvt_perscan = false` and
+    #  (2) mode 1 was never actually reaching any box: Zen4 pins `gemvt_perscan = false` and
     #      juliac/build.jl:123 pins it false for the trim build.
     # Zen4's win (percol 1.113 @512, 1.25 @1024) is real but is now recovered by a PIN, not a predicate
     # — the same contract `gemv_mr` moved to. The `gemvt_perscan` preference already exists for that.
@@ -205,10 +205,10 @@
 # ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
 # These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
 # while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
-# "Zen5" box supplying the native-512 optimum is neuromancer, which reads FP256 from CPUID
+# "Zen5" box supplying the native-512 optimum is Zen5, which reads FP256 from CPUID
 # Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
 # "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
-# hand neuromancer the arm it measured as WORSE.
+# hand Zen5 the arm it measured as WORSE.
 @test P._datapath_bytes(zen3) == 32
 @test P._datapath_bytes(zen4) == 32
 @test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native

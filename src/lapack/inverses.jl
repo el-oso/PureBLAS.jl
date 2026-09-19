@@ -236,9 +236,9 @@ end
 # FLEET TABLE (`bench/probes/getri_nb_sweep.jl`, gate-exact regime, one size per PROCESS, every
 # candidate width verified against `LAPACK.getri!`), best nb and its gain over the `_lu_nb` default:
 #   n            128    256      384     448     512      768     1000            2048
-#   wintermute   32     32+8.3%  32+7.1% 32+6.0% 192+2.8% 192+1.1% 192+2.6%       192+2.6%
-#   galen         —     80+1.9%   —       —       —        —       192+1.0%        —
-#   neuromancer   —     32+9.5%   —       —      192+2.8%  —       192+1.7%       192+3.3%
+#   Zen4   32     32+8.3%  32+7.1% 32+6.0% 192+2.8% 192+1.1% 192+2.6%       192+2.6%
+#   Zen3         —     80+1.9%   —       —       —        —       192+1.0%        —
+#   Zen5   —     32+9.5%   —       —      192+2.8%  —       192+1.7%       192+3.3%
 #
 # n >= 512 wants 192 on EVERY box and size measured, and `_lu_nb` can never reach it (it caps at
 # 128). The crossover is sharp: at n=448 nb=32 beats 192 by 7.3%, at n=512 nb=192 beats 32 by 9.0%.
@@ -247,10 +247,10 @@ end
 # const traced so far, and it is µarch-INVARIANT across Zen3/Zen4/Zen5, which is what makes shipping
 # it as a literal defensible rather than a per-box fit. req8-ok: fleet table above.
 #
-# ⚠ THE SMALL-n HALF IS DELIBERATELY LEFT ALONE. Below the crossover the boxes DISAGREE — wintermute
-# and neuromancer want 32 (+8.3%, +9.5% at n=256) while galen wants 80 (+1.9%) — so there is no
-# fleet-invariant value, and the only red cell down there (galen @256, 0.940) is not closed by
-# galen's own optimum anyway (0.940 -> ~0.958). Changing it would be a per-µarch fit for cells that
+# ⚠ THE SMALL-n HALF IS DELIBERATELY LEFT ALONE. Below the crossover the boxes DISAGREE — Zen4
+# and Zen5 want 32 (+8.3%, +9.5% at n=256) while Zen3 wants 80 (+1.9%) — so there is no
+# fleet-invariant value, and the only red cell down there (Zen3 @256, 0.940) is not closed by
+# Zen3's own optimum anyway (0.940 -> ~0.958). Changing it would be a per-µarch fit for cells that
 # already pass on two boxes. Left as `_lu_nb` until there is a reason and a rule.
 @inline _getri_nb(n::Int) = n >= 512 ? 192 : _lu_nb(n)
 # PUBLIC ENTRY: positional only. The block width hook lives on the internal `_getri!` below, NOT as a
@@ -277,7 +277,7 @@ function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int)
     # `gemm!`/`trsm!` arguments, and `getri!` returns `A`.
     #
     # ⛔ SMALL-n UNBLOCKED PATH: MEASURED AND REJECTED (2026-09-10). `getri@8` is this routine's worst
-    # cell everywhere (0.694 galen, 0.806 wintermute; AOCL ~1.47x ahead), and at n <= nb there is only
+    # cell everywhere (0.694 Zen3, 0.806 Zen4; AOCL ~1.47x ahead), and at n <= nb there is only
     # ONE block column, so the W scratch, the arena and the side-R trsm are all fixed cost around a
     # single tiny solve. LAPACK's unblocked dgetri inner loop — a length-n work VECTOR and one gemv
     # per column, no scratch matrix, no trsm, no arena — looked like the obvious answer. It is not:

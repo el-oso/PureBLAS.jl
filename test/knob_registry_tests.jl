@@ -71,7 +71,7 @@ end
 # in bench/plots.jl treats any active pin that is NOT in `_TUNABLE_KEYS` as evidence the box is in an
 # unrecognised hand-pinned state, and `save_cache` then refuses to write. On 2026-09-10 `tune!()`
 # pinned `gemvt_percol_amin` and `gemvt_perscan` — both written by its own calibrators, neither
-# listed — so a full 8-group wintermute sweep measured for ~2 h and produced no cache at all.
+# listed — so a full 8-group Zen4 sweep measured for ~2 h and produced no cache at all.
 #
 # Static scan, deliberately: calibrate.jl lives in the `bench` env and must not be loaded here. The
 # keys it can emit are `"name" => value` literals in `Pair{String, Any}[...]` returns, which is the

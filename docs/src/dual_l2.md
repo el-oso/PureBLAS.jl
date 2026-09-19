@@ -6,7 +6,7 @@ prediction it says so.
 
 ## 0. Triage: what the generic scalar path achieves today
 
-galen (Zen3, core 6, boost off, 3673 MHz), Julia 1.13.0, scratch env with ForwardDiff, through the public
+Zen3 (core 6, boost off, 3673 MHz), Julia 1.13.0, scratch env with ForwardDiff, through the public
 entries, plots.jl's CL2 regime (fresh operands per sample, `_L2REP(n)` dependent reps), Chairmarks median of 6
 rounds. Cell = complex-twin time ÷ dual time on identical bytes (1.0 = parity; 0.25 = dual is 4× slower).
 Probe: `bench/probes/dual_l23_triage.jl` (gitignored).
@@ -231,7 +231,7 @@ Answered in §2.4: rides the tagged gemv/axpy/dot; the diagonal is one scalar pa
   unblocked `n ≤ _TRI_C_BLK_MIN = 256` on AVX2, `:3034`, needs only the BLAS-1 tags). ger is second (it is
   one constant substitution). symv is last.
 
-## 6. Measurement plan (galen, `taskset -c 6`, Chairmarks median, same probe as the triage)
+## 6. Measurement plan (Zen3, `taskset -c 6`, Chairmarks median, same probe as the triage)
 
 1. Baseline capture on the pre-edit tree: `dual_l23_native.jl` writes one normalised `code_native` per complex
    body/driver/entry (both `Float64`/`Float32`, every `NC`/`NP`/`HALF`/`CJ` arm the ladders can select).
@@ -249,7 +249,7 @@ from this round** (sparring point 4): PureBLAS has no SIMD complex symv to tag e
 loop (`_symv!`), so the 0.83–0.88 "parity" in the triage is two scalar loops. Complex symv is an ungated gap of
 the same class `_scal_cmplx_simd!` was before `zscalc`; a symv kernel is separate work for both algebras.
 
-### Measured (galen, Zen3, same probe and regime as the triage; median of 6 rounds)
+### Measured (Zen3, same probe and regime as the triage; median of 6 rounds)
 
 Complex-twin time ÷ dual time on identical bytes, after tagging:
 
@@ -315,7 +315,7 @@ kernel already works this way. Splitting x into planes does not remove it: the t
 A's value lane, which is interleaved by definition. The two-source zero-unpack is that one shuffle with no
 lane ever multiplied by zero (an Inf in the discarded `Σ a_p·c_p` lane cannot reach the value), and LLVM picks
 the ISA form itself from the one `shufflevector(zero, q, pat)` source; on AVX2 it is `vunpcklpd`. The AVX-512
-lowering (a zero-masked permute) is unverified: galen is the only box this work may touch.
+lowering (a zero-masked permute) is unverified: Zen3 is the only box this work may touch.
 
 ### trsv: the reciprocal IS hoisted, through the complex buffer
 
@@ -330,4 +330,4 @@ methods of both helpers inline to the previous expressions).
 every uplo/trans/diag, dual α and a zero-value β), "ε²-leak and infinite-partial hygiene + ForwardDiff
 derivatives through the entries", and the `:checks` item "BLAS-2 dual strict contract" (`@test_noalloc` /
 `@test_typestable` on the five entries). The BLAS-1 iamax item indexed past `n` on AVX2 (`4W = 16`; the tie
-positions were fixed at 10/20/30) — found running the suite on galen, fixed in its own commit.
+positions were fixed at 10/20/30) — found running the suite on Zen3, fixed in its own commit.

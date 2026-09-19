@@ -4,7 +4,7 @@
 # For the panel column at offset j, dlabrd runs TWO gemvs over the whole remaining trailing block (one
 # for the Y column, one for the X column), and summing over all n columns that is ~(2/3)·n³ ELEMENTS
 # touched — a term that does not depend on the panel width nb, which is why no nb retunes it away.
-# MEASURED on wintermute Zen4 (bench/probes/gebrd_roofline.jl), n=1000: gebrd moves ≈6.7 GB in 148.7 ms
+# MEASURED on Zen4 (bench/probes/gebrd_roofline.jl), n=1000: gebrd moves ≈6.7 GB in 148.7 ms
 # = 44.7 GB/s, against a bare gemv of the same shape at 66-72 GB/s and gemm at 42.6 GF/s. LAPACK's own
 # dgebrd lands in the same place (152.1 ms), so this is NOT a cell where the reference demonstrates the
 # silicon can do better — one-stage is near its own floor.

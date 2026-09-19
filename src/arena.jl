@@ -296,7 +296,7 @@ end
 # 2026-09-04: 580k borrows, RSS unchanged at 580 MB). The MAPPINGS used not to be: each released borrow
 # left VMAs behind (~0.069 permanently retained per borrow at the 29-borrows-per-scope shape
 # `_dtgex2_big!` has — 580k borrows took the map count 334 → 40389), against a `vm.max_map_count` of
-# 1048576 on wintermute but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
+# 1048576 on Zen4 but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
 # ends the run INSIDE THE SANITIZER rather than in the code under test. `_syl_dlasy2` alone is ~4k calls ×
 # 4 borrows at n=64, so a fenced full-suite run was not obviously under the stock limit and the
 # "fence everything" hatch was hollow. `_ARENA_FENCE_QUARANTINE` (below) fixes that: releases are held
@@ -597,7 +597,7 @@ end
 # ── Early-return rewriting, which is what `finally` was doing for free ───────────────────────────────
 # `try …  finally` releases the arena on THREE exit paths: falling off the end, `return`, and a throw.
 # `@leafscope` drops the handler, so it must reproduce the first two itself — and forgetting the second is
-# not a subtle bug. Measured on galen 2026-09-05: a prototype that released only on the tail path left
+# not a subtle bug. Measured on Zen3 2026-09-05: a prototype that released only on the tail path left
 # `_trsm_right!`'s pad arm (which `return`s from inside the block) never rewinding, so every call bumped
 # further, `_arena_grow!` took a fresh 140 KiB slab each time, and `trsmR@128` went 0.708 -> 0.408 — worse
 # than the bug it was meant to fix, because the benchmark was then timing page faults.

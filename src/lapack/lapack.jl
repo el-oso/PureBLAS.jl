@@ -409,7 +409,7 @@ end
 #
 # Native vs lever, all three boxes on 1.13.0-rc4, freq-locked, gain of native (µs measured, see
 # bench/probes/potrfU_native_vs_lever.jl):
-#     n        galen W=4    wintermute W=8   neuromancer W=8
+#     n        Zen3 W=4    Zen4 W=8   Zen5 W=8
 #     512        +5.6%          −0.2%            −0.7%
 #     768        +6.9%          +2.3%            −1.9%
 #     1000      +10.6%          +0.7%            +0.7%
@@ -440,16 +440,16 @@ end
 # RE-CHECKED 2026-09-08 on 1.13.0-rc4/LLVM 20 — because both inputs to the verdict above had changed
 # (the toolchain, and the LEVER's inner lower path, which got 29-43% faster on AVX2 at 0f1cc14). The
 # DIRECTION inverted; the MAGNITUDE does not justify moving anything. Gain of native over lever, µs:
-#     n        galen        wintermute      neuromancer
+#     n        Zen3        Zen4      Zen5
 #     512     −0.7%          +0.6%           −0.8%
 #     768     +1.4%          −0.3%           +1.2%
 #     1000    +1.4%          +3.8%           −0.2%
 #     1500    +6.5%          (both native)   (both native)
-# At the BINDING cells (n=1000 on galen and neuromancer) that is +1.4% and −0.2% — inside this fleet's
+# At the BINDING cells (n=1000 on Zen3 and Zen5) that is +1.4% and −0.2% — inside this fleet's
 # ~1-2% run-to-run floor. So the conclusion stands on magnitude even though its 2026-08-28 supporting
 # numbers (lever 0.922 vs native 0.891) no longer reproduce. Still do not re-chase it.
 #
-# AND THE REAL BAR IS NOT THE ARM CHOICE. Per-arm times, galen n=1000 (µs, from the v3 cache):
+# AND THE REAL BAR IS NOT THE ARM CHOICE. Per-arm times, Zen3 n=1000 (µs, from the v3 cache):
 #     potrf  (lower)   aocl 7950.7   openblas 7629.4   pb 7103.6  -> 1.074 PASS
 #     potrfU (upper)   aocl 6749.9   openblas 7781.0   pb 7710.9  -> 0.875 FAIL
 # AOCL's UPPER is 15% faster than AOCL's own LOWER, while OpenBLAS's upper is slightly slower than its
@@ -480,14 +480,14 @@ end
 # where upper does not.
 #
 # ⛔ MEASURED AND FALSIFIED 2026-09-08 — DO NOT WIRE THIS IN, AND DO NOT REBUILD IT. Kept only as the
-# evidence. galen (Zen3, rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
+# evidence. Zen3 (rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
 #     n        512    768   1000   1024   1500    2048
 #     halving 1028.7 3188.6 6982.7 7392.3 22632.9 56023.1     43.5-51.1 GF
 #     left-lk 1035.5 3261.6 7230.5 7803.5 25249.4 57537.1     43.2-49.8 GF
 #     ll/hv    0.993  0.978  0.966  0.947   0.896   0.974
 # It loses at every size with the derived nb. An nb sweep at n=1000 shows the derivation is part of it
 # (it picks 64; 96-128 is the optimum at 6840.6 µs), and at nb=96 left-looking does edge ahead by 2.1%
-# — which would move potrfU on galen from 0.932 to ~0.952, still nowhere near the 0.995 gate.
+# — which would move potrfU on Zen3 from 0.932 to ~0.952, still nowhere near the 0.995 gate.
 #
 # THE PREMISE IS WHAT DIED, and it is the useful part. The argument was "move ~80% of the flops from
 # trsm/syrk into gemm". But the two drivers run at the SAME RATE — 43.5-51.1 GF against 43.2-49.8 — so
@@ -497,7 +497,7 @@ end
 # upper actually does differently, not by restructuring ours again.
 #
 # ⚠ THE PAYOFF IS NOT ESTABLISHED. The whole argument is "move flops from trsm/syrk into gemm", so it
-# only pays if gemm is faster than what those already achieve. MEASURED on galen at the panel shape
+# only pays if gemm is faster than what those already achieve. MEASURED on Zen3 at the panel shape
 # (bench/probes/gemm_tn_skinny.jl): gemm('T','N') runs 51.2 GF at M=64 and 54.6 at M=128, against the
 # fused trsm's 50.3 GF at k=500 and the lower path's 46.9 GF whole-factorization average. That is a
 # COIN FLIP against the ~53 GF this needs, and the orientation half of the hypothesis was REFUTED for
@@ -1307,7 +1307,7 @@ end
 # holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
 # `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
 #     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
-#     Zen3      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
+#     Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
 # invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
 #     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
@@ -1644,7 +1644,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # 200–4000)". That was measured under Julia 1.12 / LLVM 18 and INVERTED on 1.13.0-rc4 / LLVM 20 —
     # the same stale-provenance failure as gbtrf's nb step, on the same day.
     #
-    # MEASURED on galen (Zen3, rc4, freq-locked, bench/probes/potrf_galen_n256.jl), panel vs the padded
+    # MEASURED on Zen3 (rc4, freq-locked, bench/probes/potrf_galen_n256.jl), panel vs the padded
     # hybrid, µs:
     #     n        256      320      384      512      768
     #     panel  223.77   466.79   816.06  1498.76  4018.71
@@ -1654,7 +1654,7 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # arena path does not), so the real margin is wider.
     #
     # The symptom in the gate was a CLIFF, not a po2 dip: PB holds 44–45 GF/s and beats OpenBLAS
-    # 1.54–1.58× for n ≤ `_chol_rl_max` (=224 on galen), then falls to ~24 GF/s the moment n crosses into
+    # 1.54–1.58× for n ≤ `_chol_rl_max` (=224 on Zen3), then falls to ~24 GF/s the moment n crosses into
     # the panel driver — 0.845 @240, 0.767 @256, 0.618 @384. Two paths, one of them half the speed of the
     # other, with the crossover in the middle of the gate ladder.
     #

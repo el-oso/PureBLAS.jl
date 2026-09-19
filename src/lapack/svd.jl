@@ -714,7 +714,7 @@ end
 # the L1 quarter-way stride those column walks collapse onto a few cache sets, exactly as they do in
 # `gehrd` (`_gehrd_needs_pad`, hessenberg.jl) and `potrf`. Same predicate, same remedy.
 #
-# MEASURED (wintermute Zen4, bench/probes/gebrd_po2_pad.jl, GF/s of (8/3)n³): PB holds 17.6-18.0 GF at
+# MEASURED (Zen4, bench/probes/gebrd_po2_pad.jl, GF/s of (8/3)n³): PB holds 17.6-18.0 GF at
 # every non-po2 n from 832 to 1152 and drops to 14.65 @1024, 13.47 @1536, 10.06 @2048. Padding the
 # CALLER'S A recovers +12.4% / +4.3% / +19.2%; padding the `gebrd_X`/`gebrd_Y` workspace instead is a
 # null (−1.5% / −0.1% / +10.1%) and "both" is indistinguishable from "A padded". So it is A's stride,
