@@ -58,6 +58,29 @@ per-thread workspaces safe, so the flatness is a deliberate trade, not an oversi
 The dual (`ForwardDiff.Dual`) groups carry no `pb_mt` arm at all: their reference is LinearAlgebra's
 generic fallback, which replaces the arm list, and dual element types cannot reach the threaded path.
 
+## Plots
+
+One panel per operation, one curve per microarchitecture, against problem size. The dashed line is
+1.00× — **no gain** — so a curve above it means threading paid and a curve below it means threading
+cost. The band is the q10–q90 spread of the pooled per-round ratios.
+
+Read the SHAPE, not just the peak. A curve that climbs with `n` is a routine amortising the fork-join
+correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — `syrk`,
+`syr2k`, `trsm`, `trmmR`, every Level-1 and Level-2 panel — are the controls described above, and they
+are supposed to be flat.
+
+![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
+![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
+![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
+![BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l2.svg)
+![Complex BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl1.svg)
+![Complex BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl2.svg)
+![Complex BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl3.svg)
+![Complex LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_clapack.svg)
+
+Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
+`perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.
+
 ## Results
 
 Best speedup per operation, six threads against one, on each box.
