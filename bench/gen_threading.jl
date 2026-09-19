@@ -215,8 +215,32 @@ the plan and is not started.
 `gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
 per-thread workspaces safe, so the flatness is a deliberate trade, not an oversight.
 
-The dual (`ForwardDiff.Dual`) groups carry no `pb_mt` arm at all: their reference is LinearAlgebra's
-generic fallback, which replaces the arm list, and dual element types cannot reach the threaded path.
+### Why `Dual` gets nothing — and why that is wiring, not a law
+
+The dual groups carry no `pb_mt` arm at all, because their reference is LinearAlgebra's generic
+fallback, which replaces the arm list. But the interesting part is what would happen if they did.
+
+**A dual gemm is already three REAL `Float64` gemms.** `_gemm_dual3!` splits the operands into value
+and partial planes and computes `P1 = Av·Bv`, `P2 = Av·Bp`, `P2 += Ap·Bv`, then combines. Those three
+products are ordinary real gemms of the same shape as the original — exactly the kind of call that
+threads well. So there is no type-level reason a `Dual` gemm cannot be threaded.
+
+Two concrete things block it today, and neither is fundamental:
+
+1. **It calls `_gemm_core!` directly**, which sits *below* the split point — the same structural reason
+   `syrk` and `syr2k` inherit nothing. The guard in `gemm!` never even runs for these.
+2. **The plane scratch is per-THREAD and held across all three products.** The buffers come from
+   `L3Workspace`, whose owner is safe today only because it is claimed *inside* a chunk body, which
+   never yields. A driver holding it across a threaded join is precisely the shape that made concurrent
+   `getrf!` return wrong answers 20 times in 96 — it would need the same per-task conversion `symm`
+   received.
+
+There is also a parallel opportunity the column split does not reach: `P1` and the `P2` pair are
+**independent products**, so they could run concurrently as whole gemms rather than being split
+internally. That is task-level parallelism on the same three-plane structure.
+
+None of this is scheduled. It belongs with Phase 4, and it is recorded here so the absence reads as a
+decision rather than an oversight.
 
 ## Plots
 
