@@ -12,10 +12,21 @@
 # value into non-inlined kernels with no heap box, and their getindex/setindex are unsafe_load/store, so
 # the whole call graph stays trim-clean.
 #
-# STAGE 1 (2026-09-04): the 37 FIXED-SIZE small roles are converted — `_dlaexc!`, `_syl_dlasy2`,
-# `_hgeqz!`, `_tgs_tgsy2!` and `_dtgex2_big!` now open a `@scope` and borrow; their nine accessors and
-# the 37 fields are deleted (L3Workspace: 180 → 143 fields). Everything that GROWS with n is still
-# field-owned. Conversion continues staged, riskiest last.
+# WHERE THE CONVERSION ACTUALLY ENDED. Stage 1 (2026-09-04) took the 37 fixed-size small roles and
+# left 143 fields, and this note used to stop there, saying "conversion continues staged, riskiest
+# last" — which reads as work in progress. It is not: **173 of the original 180 fields are now
+# arena-borrowed and `L3Workspace` is down to SEVEN.**
+#
+# Those seven are not leftovers, they are a decision, recorded in workspace.jl: they are the gemm and
+# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `m3`, `str`, `strbt`). They stay because they are
+# touched on EVERY `gemm!` call — the one frequency at which a bump-allocate could cost more than a
+# const-dispatched field load — because they are genuinely shared allocator state rather than
+# per-routine scratch, and because `str` is a pool whose disjointness is slot-index arithmetic across
+# seven recursive Winograd children, which this file's scope model cannot express.
+#
+# Converting them has NOT been decided and would need its own gate run. One thing to know if it ever
+# is: `m3` is held by the driver ACROSS all three plane products of a dual/3M gemm, so threading that
+# path requires a per-task owner FIRST — see the threading note further down.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
@@ -108,20 +119,34 @@ struct ArenaScope
 end
 
 # GKH ownership: one const owner, resolved at compile time, no runtime lookup.
-# Multithreading is deferred by standing rule, and the per-task swap is deliberately NOT taken here: it is
-# one line later (`_arena() = _ARENA_TASK()` over a `Base.OncePerTask`), but it measures 9-12 ns per entry,
-# and workspace.jl:58-61 records +7.5 ns being REJECTED as 7.4% of trmm! at n=8. Buying thread safety we
-# cannot yet use, at a price the gate already refused, is the wrong trade today.
-# BUT STATE THE COST HONESTLY: `_l3ws` is process-global too, so this is not a regression in KIND — it is
-# one in DEGREE. Interleave two tasks and the arena's failure is unbounded where the struct's was bounded:
-# B enters (off=0), A enters (off=0), A borrows 0→128, B borrows 128→256, B EXITS and rewinds off to 0,
-# A borrows again and is handed bytes 0..128 — aliasing its own live handle. With a named field the same
-# race corrupts that one role; here it is arbitrary cross-role aliasing. The per-task owner is therefore a
-# PRECONDITION of enabling threads, not an optimisation to weigh against 9-12 ns.
-# ONE ARENA PER THREAD. A scope records a position and restores it, so two callers sharing one arena
-# would restore each other's positions and hand out overlapping borrows. `OncePerThread` is correct while
-# no scope contains a task-switch point (`test/yield_lint.jl` enforces that); `OncePerTask` is the drop-in
-# if a scope ever has to survive a yield — one line, at a measured 9-21 ns per scope instead of 2-4.
+#
+# ── THREADS ARE ENABLED NOW, AND THIS OWNER DID NOT CHANGE ──────────────────────────────────────────
+# This block used to say multithreading was "deferred by standing rule", that per-task ownership was
+# "thread safety we cannot yet use", and — the claim worth correcting — that the per-task owner is
+# "a PRECONDITION of enabling threads, not an optimisation". M4 shipped opt-in threading
+# (`PureBLAS.set_num_threads`) and `_ARENA` is STILL `OncePerThread`, so that precondition was not
+# met and not needed: a different mechanism took its place. Leaving the old text would tell the next
+# reader the shipped library is unsafe.
+#
+# THE HAZARD IS REAL AND UNCHANGED. Interleave two tasks on one arena and the failure is unbounded
+# where a named field's was bounded: B enters (off=0), A enters (off=0), A borrows 0→128, B borrows
+# 128→256, B EXITS and rewinds off to 0, A borrows again and is handed bytes 0..128 — aliasing its own
+# live handle. With a named field the same race corrupts that one role; here it is arbitrary cross-role
+# aliasing.
+#
+# WHAT ACTUALLY PREVENTS IT, both parts required:
+#   (a) NO SCOPE CONTAINS A TASK-SWITCH POINT (`test/yield_lint.jl` enforces it). Two tasks therefore
+#       cannot interleave *inside* scopes on one thread — the scenario above needs A to yield while
+#       holding borrows, and it cannot.
+#   (b) A THREADED `gemm!` REFUSES TO RUN WHILE ANY SCOPE IS LIVE (`iszero(_arena().depth)`, gemm.jl).
+#       This is the part that replaced the per-task swap. Without it a driver could enter a scope on
+#       thread t1, yield in the fork-join, resume on t3, and keep using t1's arena while t1 is free
+#       for another task — measured consequence before the guard: concurrent `getrf!` 20/96 wrong.
+#
+# So the cost never had to be paid: per-task entry measures 9-12 ns against 2-4, and workspace.jl
+# records +7.5 ns being REJECTED as 7.4% of `trmm!` at n=8. `OncePerTask` remains the one-line drop-in
+# if a scope ever has to survive a yield — but note that (b) is what makes (a) sufficient, so removing
+# either one puts this owner back on the critical path.
 const _ARENA = Base.OncePerThread{Arena}(Arena)
 @inline _arena() = _ARENA()
 
