@@ -18,15 +18,21 @@
 # arena-borrowed and `L3Workspace` is down to SEVEN.**
 #
 # Those seven are not leftovers, they are a decision, recorded in workspace.jl: they are the gemm and
-# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `m3`, `str`, `strbt`). They stay because they are
+# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `str`, `strbt` — `m3` left for `_m3ws`, see the
+# threading note in workspace.jl). They stay because they are
 # touched on EVERY `gemm!` call — the one frequency at which a bump-allocate could cost more than a
 # const-dispatched field load — because they are genuinely shared allocator state rather than
 # per-routine scratch, and because `str` is a pool whose disjointness is slot-index arithmetic across
 # seven recursive Winograd children, which this file's scope model cannot express.
 #
-# Converting them has NOT been decided and would need its own gate run. One thing to know if it ever
-# is: `m3` is held by the driver ACROSS all three plane products of a dual/3M gemm, so threading that
-# path requires a per-task owner FIRST — see the threading note further down.
+# Converting the SIX that remain has NOT been decided and would need its own gate run.
+#
+# The seventh, `m3`, was NOT a deliberate hold — it was a live hazard and is now fixed. `_trmm_dual!`
+# and `_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes; public `trmm!`
+# threads and its join yields, and there is no arena scope on that path, so the depth guard could not
+# help. A per-thread buffer held across that join is the shape that measured `getrf!` wrong 20/96. It
+# is now `_m3ws`, a per-task owner split OUT of `L3Workspace` so the pack buffers keep their cheap
+# per-thread lookup. See the threading note in workspace.jl.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
@@ -134,19 +140,44 @@ end
 # live handle. With a named field the same race corrupts that one role; here it is arbitrary cross-role
 # aliasing.
 #
-# WHAT ACTUALLY PREVENTS IT, both parts required:
-#   (a) NO SCOPE CONTAINS A TASK-SWITCH POINT (`test/yield_lint.jl` enforces it). Two tasks therefore
-#       cannot interleave *inside* scopes on one thread — the scenario above needs A to yield while
-#       holding borrows, and it cannot.
-#   (b) A THREADED `gemm!` REFUSES TO RUN WHILE ANY SCOPE IS LIVE (`iszero(_arena().depth)`, gemm.jl).
-#       This is the part that replaced the per-task swap. Without it a driver could enter a scope on
-#       thread t1, yield in the fork-join, resume on t3, and keep using t1's arena while t1 is free
-#       for another task — measured consequence before the guard: concurrent `getrf!` 20/96 wrong.
+# WHAT ACTUALLY PREVENTS IT, all three parts required:
+#   (a) EXACTLY ONE TASK-SWITCH POINT EXISTS INSIDE A SCOPE (`test/yield_lint.jl` enforces it): the
+#       driver's join in `_gemm_threaded!` (gemm.jl). By any other route two tasks cannot interleave
+#       *inside* scopes on one thread — the scenario above needs A to yield while holding borrows.
+#   (b) THE DRIVER IS PINNED TO ITS THREAD FOR THAT JOIN (`Task.sticky`, set and restored inside
+#       `_gemm_threaded!`). Unpinned, a yielded task usually resumes on a DIFFERENT thread — measured
+#       78% of yields — and would keep using thread t1's arena from t3 while t1 is free for another
+#       task: measured consequence, concurrent `getrf!` 20/96 wrong. Pinned, it resumes on t1, and the
+#       borrows it holds are still t1's. Base honours the bit at the yield itself (`enq_work` pushes a
+#       sticky task onto its own thread's queue), and bench/probes/sticky_across_join.jl measured it on
+#       the real shape — a task yielding in a loop under competing load — before this was written.
+#       This REPLACED an admission guard, `iszero(_arena().depth)`, that refused to thread inside ANY
+#       live scope. That guard was sound but it silently serialised 16 routines that open a scope and
+#       then call a public L3 entry (gels!, getri!, trtri!, potri!, lauum, gehrd, pbtrf, gbtrf, …),
+#       which measured as near-flat threaded cells misfiled as "nothing threads them".
+#   (c) EVERY OTHER SCOPE ON THAT THREAD IS A NESTED INTERVAL, so the bump stack stays LIFO. While the
+#       driver D is yielded at its join, another task E may run on t1 and open a scope on the SAME
+#       arena. E enters at depth d+1 and borrows ABOVE D's live offset, so nothing of D's is handed
+#       out. And E cannot itself be suspended inside its scope: the pool is ONE claim (`p.busy`), D
+#       holds it, so E's own `gemm!` loses the claim and runs serial, and nothing else inside a scope
+#       yields (a). E therefore runs to its scope exit — which restores `cur`/`off`/`depth` ABSOLUTELY
+#       to what D left — before D can resume. A worker chunk is the same case: a chunk never yields,
+#       so a scope it opens on any thread, including t1 on top of D's, is a nested interval too. At
+#       most ONE task in the whole process is ever suspended mid-scope, and (b) keeps it where its
+#       arena is.
 #
 # So the cost never had to be paid: per-task entry measures 9-12 ns against 2-4, and workspace.jl
 # records +7.5 ns being REJECTED as 7.4% of `trmm!` at n=8. `OncePerTask` remains the one-line drop-in
-# if a scope ever has to survive a yield — but note that (b) is what makes (a) sufficient, so removing
-# either one puts this owner back on the critical path.
+# if any part above stops holding — in particular (c) rests on the SINGLE pool claim; per-caller pools
+# would let two tasks sit suspended mid-scope on one thread, and then only a per-task arena is sound.
+#
+# NOTE the mechanism is only for the ARENA, whose borrows nest. A wholesale-claimed ROLE handed to the
+# workers as an operand (`_m3ws`, the symm materialize twin) is NOT covered by (c): a task landing on
+# t1 during D's yield claims the same role and overwrites D's live operand. Those stay per-task.
+# THE PER-TASK ALTERNATIVE WAS PRICED, NOT ASSUMED (2026-09-19, bench/probes/arena_owner_ab.jl, Zen4,
+# paired ABBA in one process): `OncePerTask` here costs trmm! n=8 3.5% (B/A 1.0346, SE 0.0041, 72
+# rounds, ~+22 ns/call) and is a null on trmm 32/64, trsm 8/32/64 and gemm 8/32/64. Under the 7.4% bar
+# above, but a real regression on the one cell the bar guards, and the pin costs that cell nothing.
 const _ARENA = Base.OncePerThread{Arena}(Arena)
 @inline _arena() = _ARENA()
 
@@ -632,7 +663,7 @@ end
 # under. A nested `@scope`/`@leafscope` is likewise left alone — it emits its own release.
 _arena_nested_scope(ex) =
     ex isa Expr && ex.head === :macrocall && !isempty(ex.args) &&
-        (_arena_is_scope_macro(ex.args[1]) || _arena_is_leafscope_macro(ex.args[1]))
+    (_arena_is_scope_macro(ex.args[1]) || _arena_is_leafscope_macro(ex.args[1]))
 
 function _arena_rewrite_returns(ex, s::Symbol, rv::Symbol, exitf)
     ex isa Expr || return ex

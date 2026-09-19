@@ -113,8 +113,11 @@ by construction rather than by measurement.
 
 Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
 `syrk`, `syr2k`, `trsm`, `trmmR` and `potrf` sit on 1.00 next to `gemm` climbing to ~5×. They reach
-`_gemm_core!` *below* the split point, or refuse to thread inside an arena scope. Seeing them flat in
-the same picture is what shows the measurement discriminates rather than flattering everything.
+`_gemm_core!` *below* the split point — or, when these plots were last rendered, were refused threading
+because their `gemm!` sat inside a live arena scope; that admission guard is gone (the driver pins itself
+to its thread for the join instead, see `arena.md`), so the scope-blocked curves are due a re-render.
+Seeing flat curves in the same picture is what shows the measurement discriminates rather than
+flattering everything.
 
 Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
 `perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.

@@ -194,9 +194,10 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     # `@scope`, NOT `@leafscope`. This leaf's only scope is its own — none of its five callers
     # (`trmm!` 1310/1312, `_trmm_left!` 753, `_trmm_right!` 938, `_trmm_right_recur!` 986) opens one —
     # and arena.jl's rule for that case is explicit: a `@leafscope` with no `@scope` above it leaks
-    # `depth` on a throw, since it has no handler and `_arena_exit!` never runs. A stuck `depth` is now
-    # WORSE than a leaked block: `gemm!`'s M4 threading guard reads `iszero(_arena().depth)`, so a
-    # thread that once threw through here would refuse to thread for the rest of the process.
+    # `depth` on a throw, since it has no handler and `_arena_exit!` never runs. A stuck `depth` means
+    # `_arena_exit!`'s coalesce (gated on `depth == 0`) never runs again on that thread, so a slab chain
+    # left by a growing call would persist for the life of the process — a leak, not a wrong answer,
+    # since the threading admission no longer reads `depth` (the driver pins itself instead, gemm.jl).
     # The handler is affordable HERE, unlike `_trsm_rl_fused_drv!` where it cost 59 spills: every caller
     # reaches this only at `k <= _TRMM_BASE`. ⚠ AVX2 (Zen3) small-k trmm unconfirmed — measure before merge.
     @scope arn begin          # inlines the trmm microkernel — see `_trsm_fused_L!`
@@ -7141,13 +7142,14 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     end
     # Decide threading BEFORE choosing the buffer: a threaded call must materialize into the PER-TASK
     # twin, because the buffer is handed to workers and the driver's join yields (see `_symm_scr_mt`).
-    # `iszero(_arena().depth)` mirrors `gemm!`'s guard — if a caller holds a live arena scope, threading
-    # here would expose ITS borrows to the same migration hazard.
+    # No `iszero(_arena().depth)` admission here, for the same reason `gemm!` dropped it: the join is
+    # `_gemm_threaded!`'s, and that function pins the driver to its thread for its duration, so a
+    # caller's live arena borrows stay on the thread that holds them (arena.jl, threading note).
     T = eltype(C)
     # `eltype(B) === T` because `_gemm_threaded!` takes three `PtrMatrix{T}`; `Ad` is built at `T`, but a
     # mixed-type B would be a MethodError where `_gemm_core!` promotes. (`gemm!` guards the same way.)
     nw = (T === Float64 || T === Float32) && eltype(B) === T &&
-        _strided1(B) && _strided1(C) && iszero(_arena().depth) ?
+        _strided1(B) && _strided1(C) ?
         _gemm_workers(size(C, 1), size(C, 2), n) : 1
     Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)

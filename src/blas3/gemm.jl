@@ -3538,6 +3538,7 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
             end
         end
     end
+    return
 end
 
 # One pool per element type, created on first threaded use. `@noinline` with a single call site so the
@@ -3665,6 +3666,35 @@ the same result, whenever the pool is already in use — see the claim below.
     # self-sent SIGINT that was then thrown exactly at `sigatomic_end`, and a task holding the region
     # migrated across five threads without error. What it does NOT stop: a FORCED interrupt (repeated
     # Ctrl-C) or a `throwto` into this task — those still unwind, and the poison rule below is for them.
+    #
+    # PIN THIS TASK TO ITS THREAD FOR THE JOIN. The `yield()` in the join is the one task-switch point
+    # that can sit inside a live arena scope (arena.jl, threading note, parts (a)-(c)), and a yielded
+    # task normally resumes on a DIFFERENT thread — measured 78% of yields. With `_ARENA` per-thread
+    # that would leave the caller's live borrows on the thread it left. `Task.sticky` makes Base's
+    # `enq_work` requeue this task on its own thread instead (measured on the join's shape by
+    # bench/probes/sticky_across_join.jl, 6 threads: 0 of 200000 yields migrated pinned, 151919
+    # unpinned; and bench/probes/arena_pin_control.jl FORCED the unpinned failure — the driver's scope
+    # exit ran on another thread and the next borrow on its old thread overlapped a live one, 131064
+    # elements — while the pinned arm could not exit under the occupying task at all). Restored in the
+    # `finally` so a `@spawn`ed caller goes back to migrating once the join is over; a caller that was
+    # already sticky (the main task, an `@async`) stays sticky. This is what let the
+    # `iszero(_arena().depth)` admission guard go, and with it the 16 routines it serialised.
+    # `_symm!` has no join of its own — it calls this function — so the pin covers it too.
+    #
+    # WHAT THE PIN CHANGES ABOUT THE YIELD BELOW, stated because it bit a probe: a sticky task that
+    # yields is pushed onto its OWN thread's queue, and the scheduler pops that queue BEFORE the
+    # multiqueue, so this task is re-picked at once unless another sticky task is already queued on
+    # this thread. A `@spawn`ed task — a worker, a host task — can therefore no longer take this
+    # thread mid-join; it runs on any other thread whose sticky queue is empty, which the pool's
+    # `nw <= nthreads` cap leaves available. The yield keeps its anti-deadlock role for sticky
+    # tasks queued here (an `@async`, a `@threads :static` iteration). A host that spins WITHOUT
+    # yielding on every other thread while waiting for this call would now starve the workers where
+    # it did not before; that host is already hostile to the scheduler, and it is noted, not solved.
+    # It is also why the per-thread ROLE owners (`_LU_PAD`, the symm twin, `_m3ws`) stay per-task:
+    # a sticky interloper on this thread during the join still claims the same role.
+    ct = current_task()
+    was_sticky = ct.sticky
+    ct.sticky = true
     Base.sigatomic_begin()
     joined = false
     try
@@ -3724,6 +3754,7 @@ the same result, whenever the pool is already in use — see the claim below.
         # correct and merely slower. A chunk that THROWS is not this path — its join still runs to
         # completion, `joined` is true, and the pool is released before the error propagates.
         joined && (@atomic p.busy = false)
+        ct.sticky = was_sticky
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
     return nothing
@@ -3763,29 +3794,24 @@ function gemm!(
         # M4: split the columns across a parked pool when the call is big enough to pay for the join.
         # Restricted to the real strided path because the pool carries POINTERS (see `GemmPool`), and
         # that is where every gemm large enough to want a thread already lives.
-        # ── REFUSE TO THREAD INSIDE A LIVE ARENA SCOPE ──────────────────────────────────────────────
-        # The join below YIELDS, and a yielded task usually resumes on a DIFFERENT THREAD — measured on
-        # this box, 39863 of 48000 yields migrated, and `OncePerThread` returned a different object after
-        # every one. So a driver that entered holding thread t1's scratch typically finishes on t3 while
-        # t1 is free for any other task to claim the same buffer. That is not two tasks interleaving on
-        # one thread, which the "a chunk never yields, so a worker runs as a nested interval" argument
-        # covered; it is two tasks on two threads writing one buffer at once. Measured consequence before
-        # this guard: concurrent `getrf!` 20/96 wrong (some NaN), `geqrf!` 17/96, against 0/96 serial.
+        # ── THREADING INSIDE A LIVE ARENA SCOPE IS ALLOWED ──────────────────────────────────────────
+        # This predicate used to carry `iszero(_arena().depth)`: the join yields, a yielded task usually
+        # resumes on a DIFFERENT thread (39863 of 48000 yields on this box), and a driver holding thread
+        # t1's borrows would finish on t3 while t1's arena was free for another task — measured before
+        # the guard: concurrent `getrf!` 20/96 wrong (some NaN), `geqrf!` 17/96. The guard cured that by
+        # refusing to thread inside any scope, and in doing so silently serialised the 16 routines whose
+        # `gemm!` sits inside their own `@scope` (getri!, trtri!, potri!, gels!, …). `_gemm_threaded!`
+        # now PINS the driver to its thread for the join instead, and arena.jl's threading note gives the
+        # full argument for why a pinned driver plus the single pool claim keeps the bump stack LIFO.
         #
-        # 23 internal `gemm!` call sites sit inside a held owner or a live `@scope`, and in every one the
-        # held object is a gemm OPERAND. Rather than audit them one at a time and hope, this asks the
-        # arena directly: if ANY scope is live on this thread, at any nesting depth, run serial. It is
-        # mechanical, it cannot be forgotten by a future caller, and it costs one field load — paid only
-        # by calls already large enough to have considered threading, so n=8..64 is untouched.
-        #
-        # Per-thread Refs that are NOT arena scopes (`_LU_PAD`, `_QR_WS`, the SVD/eigen pools) are not
-        # covered by this and are per-TASK owners instead; see their definitions.
+        # Owners that are NOT arena scopes but ARE handed to workers as operands (`_LU_PAD`, `_QR_WS`,
+        # the SVD/eigen pools, the symm twin) are per-TASK and stay so; see their definitions.
         # `eltype(A) === T === eltype(B)` for the same reason the dual branch below tests it: `T` is C's
         # element type, and `_gemm_threaded!` takes three `PtrMatrix{T}`. A mixed-type call (`Float32` A
         # into a `Float64` C, which `_gemm_core!` promotes happily) would hand it a `PtrMatrix{Float32}`
         # and raise a MethodError where the serial path computed an answer.
         nw = (T === Float64 || T === Float32) && eltype(A) === T && eltype(B) === T &&
-            _strided1(A) && _strided1(B) && iszero(_arena().depth) ?
+            _strided1(A) && _strided1(B) ?
             _gemm_workers(m, n, k) : 1
         if nw > 1
             rA = _root(A); rB = _root(B); rC = _root(C)
