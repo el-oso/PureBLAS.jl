@@ -92,13 +92,50 @@ end
 # LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
 # reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
 # single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
-ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these at init, before any forward
+# BLIS reads these at init, before any forward — so they are set HERE, above `using AOCL_jll`, and
+# cannot be changed afterwards by `BLAS.set_num_threads`.
+#
+# RESPECT AN EXPLICIT LAUNCH SETTING. This used to assign "1" unconditionally, which silently undid the
+# environment a threaded-reference run must be launched with: `aocl_mt` would then record a
+# SINGLE-threaded AOCL under a threaded arm name, and every verdict built on it would be wrong in
+# PureBLAS's favour. A caller who set it to >1 has done so deliberately (see `_REF_MT`), and the arm
+# guard below refuses the run if it is too low. Default is still 1: a gate sweep is single-threaded,
+# and forgetting the variable must not silently produce a threaded reference either.
+for _v in ("BLIS_NUM_THREADS", "OMP_NUM_THREADS")
+    ENV[_v] = string(max(1, tryparse(Int, get(ENV, _v, "1")) === nothing ? 1 : tryparse(Int, get(ENV, _v, "1"))))
+end
+# Remember what BLIS was actually initialised with; the arm guard reads this, not the live ENV.
+const _BLIS_INIT_NT = parse(Int, ENV["BLIS_NUM_THREADS"])
 @eval using AOCL_jll
 
 # Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
 # state — the failure mode where you measure AOCL's BLAS against OpenBLAS's LAPACK and never notice.
+# ── THREADED REFERENCE ARMS ─────────────────────────────────────────────────────────────────────────
+# `openblas_mt` / `aocl_mt` are the SAME libraries at `_MT_NT` threads. They exist so a threaded gate is
+# possible at all: `pb_mt` against a single-threaded OpenBLAS is flattery, and the only honest
+# comparison is threaded-against-threaded.
+#
+# ⚠ AOCL'S THREAD COUNT IS FIXED BY THE PROCESS ENVIRONMENT, NOT BY US. BLIS reads BLIS_NUM_THREADS /
+# OMP_NUM_THREADS at init — which is why the header of this file pins them to 1 BEFORE `using AOCL_jll`.
+# A later `BLAS.set_num_threads` cannot undo that. So a threaded-reference run MUST be launched with
+# those set, and the guard below refuses rather than silently measuring a single-threaded AOCL and
+# publishing it as a threaded reference:
+#
+#   BLIS_NUM_THREADS=6 OMP_NUM_THREADS=6 taskset -c 0,1,2,3,4,5 \
+#       julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt,openblas_mt,aocl_mt nodraw
+#
+# Verified before use by `bench/probes/mt_reference_witness.jl`, which times a 2048 dgemm at 1 and N
+# threads and requires >1.5x. Measured on Zen4: OpenBLAS 4.72x, AOCL 3.32x.
+const _REF_MT = Dict("openblas_mt" => "openblas", "aocl_mt" => "aocl")
+_is_mt_ref(a::AbstractString) = haskey(_REF_MT, a)
+
 function _use_ref!(name::AbstractString)
+    if _is_mt_ref(name)
+        _use_ref!(_REF_MT[name])          # forward the library, which also re-asserts 1 thread …
+        BLAS.set_num_threads(_MT_NT)      # … then ask for N. OpenBLAS honours this; BLIS took it at init.
+        return name
+    end
     # DL1's reference is NOT a BLAS library. `Dual` is not a `BlasFloat`, so LinearAlgebra's generic
     # fallback never reaches BLAS at all — there is nothing to forward, and forwarding would be a lie
     # about what ran. This arm is deliberately kept OUT of `_REF_ALL` (hence out of `_VIEWS`) so the
@@ -139,7 +176,29 @@ const _DO_PB = isnothing(_ARMS_SEL) || (_ARM_PB in _ARMS_SEL)
 # `pb_mt` is opt-in ONLY. It must never be implied by a bare run: it is a second full pass over every
 # cell (~86 min/box), and a run that quietly measured it would double the cost of the fast iteration path.
 const _DO_PB_MT = !isnothing(_ARMS_SEL) && (_ARM_PB_MT in _ARMS_SEL)
-const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[], _REF_ARMS)
+# Threaded reference arms, opt-in only and never implied. Measuring a reference at all needs the user's
+# explicit per-run authorisation; measuring one THREADED is a second, larger ask (it doubles the sweep).
+const _REF_MT_ARMS = isnothing(_ARMS_SEL) ? String[] :
+    [a for a in ("openblas_mt", "aocl_mt") if a in _ARMS_SEL]
+const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
+    _REF_ARMS, _REF_MT_ARMS)
+# ANY threaded arm puts this run in the mt family, and that has to be true for the REFERENCE arms too,
+# not just `pb_mt`. Keying the cache on `_DO_PB_MT` alone meant `arms=openblas_mt,aocl_mt` — a run with
+# no `pb_mt` at all — selected the GATE cache and would have written threaded references into the
+# single-threaded gate. Caught before it ran; the whole point of the separate file is that this cannot
+# happen, so the predicate must cover every threaded arm.
+const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
+# REFUSE rather than measure a lie. BLIS fixes its thread count at init from the environment, so if the
+# process was not launched with it, `aocl_mt` would be a single-threaded AOCL recorded under a threaded
+# name — and every downstream verdict built on it would be wrong in PureBLAS's favour.
+if "aocl_mt" in _REF_MT_ARMS
+    _BLIS_INIT_NT >= _MT_NT || error("""
+        aocl_mt requested but BLIS initialised with BLIS_NUM_THREADS=$_BLIS_INIT_NT (need >= $_MT_NT).
+        BLIS reads it at INIT — `BLAS.set_num_threads` cannot fix it later, so this run would record a
+        SINGLE-THREADED AOCL under a threaded arm name. Relaunch as:
+          BLIS_NUM_THREADS=$_MT_NT OMP_NUM_THREADS=$_MT_NT taskset -c … julia --project=bench -t $_MT_NT …
+        Verify first with bench/probes/mt_reference_witness.jl.""")
+end
 isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$_ARM_PB_MT,$(join(_REF_ALL, ","))")
 if _DO_PB_MT
     Threads.nthreads() >= _MT_NT || error(
@@ -1862,7 +1921,7 @@ end
 #
 # Derived from `_DO_PB_MT` rather than taken as a `cache=` path: a path argument can be typo'd into the
 # gate cache, and the one thing this must guarantee is that asking for pb_mt can never overwrite the gate.
-const CACHE = joinpath(@__DIR__, _DO_PB_MT ?
+const CACHE = joinpath(@__DIR__, _ANY_MT ?
     "mt_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt" :
     "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")
 # ── MACHINE-STATE PROVENANCE: `anchor=` and `freq=` ────────────────────────────────────────────────
@@ -2564,7 +2623,16 @@ else
     _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3, "DLP" => dlp)
-    subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
+    # AN MT RUN MERGES WHENEVER ITS CACHE EXISTS, even as a FULL run, because the mt cache ACCUMULATES
+    # ARMS ACROSS RUNS by design: `pb`/`pb_mt` come from one sweep and the threaded references from
+    # another (they cannot share a launch — BLIS fixes its thread count at init, so the reference run
+    # must be started with BLIS_NUM_THREADS set, which would also change what `pb` sees).
+    #
+    # Without this, `arms=openblas_mt,aocl_mt` as a full run would REPLACE the mt cache and delete the
+    # pb/pb_mt arms already in it — the exact 2026-08-06 shape the refusal below was written for, just
+    # aimed at the other cache. The comment there said "the mt cache has none by design"; that was true
+    # when only pb/pb_mt existed and is not true any more.
+    subset = !isnothing(_SELOP) || !isnothing(_SELGRP) || (_ANY_MT && isfile(CACHE))
     if subset
         # subset re-measure: MERGE the measured op(s) into the existing (v2) cache, leaving the rest intact.
         isfile(CACHE) || error("subset re-measure (op=/group=) needs an existing full cache at $CACHE — run a full `bench` first")
@@ -2606,10 +2674,10 @@ else
         # `bench` measures no reference and would sail past this check straight into the 2026-08-06
         # failure it was written for. Condition on what was ACTUALLY measured, never on how it was
         # asked for.
-        # `_DO_PB_MT` is exempt: this guard exists to stop a partial run DESTROYING cached reference
-        # arms, and the mt cache has none by design (it is a separate file — see `CACHE`). There is
-        # nothing to lose there, so a full mt sweep is the intended shape rather than a refusal.
-        if !_DO_PB_MT && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
+        # `_ANY_MT` is exempt, and ONLY reaches here when the mt cache does NOT yet exist — once it
+        # does, the merge branch above takes the run instead, so nothing can be destroyed. A first mt
+        # sweep writing a fresh file has nothing to lose, which is the case this exemption covers.
+        if !_ANY_MT && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
             error(
                 """
                 REFUSING to overwrite $CACHE with a partial arm set.
