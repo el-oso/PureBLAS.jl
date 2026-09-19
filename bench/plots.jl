@@ -2354,10 +2354,14 @@ _ulabel(meta) = meta.uarch != "?" ? "$(meta.uarch) · $(meta.isa)" :
 
 # Load every fleet cache (plots_data_<host>.txt) → [(meta, groups), …]. In lite mode loads only *_lite; in
 # full mode only full caches. Skips MKL. Refuses stale-version caches via load_cache.
-function load_fleet()
+# `prefix` selects WHICH family of caches to draw. It defaults to the gate caches, so every existing
+# call is unchanged; `mt_data_` draws the multi-threaded sweep instead. The two families are separate
+# files precisely so an mt run can never touch a gate cell (see `CACHE`), and this is the one place
+# that needs to know both names.
+function load_fleet(prefix::AbstractString = "plots_data_")
     fleet = Tuple{NamedTuple, Dict{String, Vector{OpData}}}[]
     for f in sort(readdir(@__DIR__))
-        (startswith(f, "plots_data_") && endswith(f, ".txt")) || continue
+        (startswith(f, prefix) && endswith(f, ".txt")) || continue
         # v3: no reference filter. One cache per host carries every arm, and `_series` picks the arm for
         # the view being rendered — so the "never mix baselines" rule is now enforced by construction
         # (each ratio divides two arms measured in the SAME round) rather than by filename discipline.
@@ -2407,6 +2411,14 @@ function _series(g, gk, op, ref::AbstractString = REFBK)
                 (isnothing(best) || median(v) < median(best)) && (best = v)
             end
             isnothing(best) || push!(out, (s, best))
+        elseif ref == _ARM_PB_MT
+            # THE MT VIEW IS INVERTED RELATIVE TO EVERY OTHER ONE, on purpose. Elsewhere the numerator
+            # is the REFERENCE and the denominator PureBLAS, so "higher is better" means PB is faster.
+            # Here both arms are PureBLAS and the question is what threads BOUGHT, so the single-thread
+            # arm is the numerator: pb / pb_mt. Same reading — above the line is a win — which is the
+            # point; a plot that silently flipped its sense against its neighbours would be a trap.
+            haskey(cell, _ARM_PB_MT) || continue
+            push!(out, (s, _ratio(cell[_ARM_PB].q, cell[_ARM_PB_MT].q)))
         else
             haskey(cell, ref) || continue
             push!(out, (s, _ratio(cell[ref].q, cell[_ARM_PB].q)))
@@ -2623,6 +2635,36 @@ adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : 
 tdir = isnothing(_OUTDIR) ? (@__DIR__) : _OUTDIR
 # Draw the whole FLEET (every host cache on disk) as cross-µarch panel grids: 8 SVGs, NO per-host suffix
 # (a 3-line panel IS the per-host view). One SVG per group. `nodraw` skips this (fleet boxes measure only).
+# ── DRAW THE MULTI-THREADED SWEEP AND STOP ──────────────────────────────────────────────────────────
+# `mtdraw` is a RENDER-ONLY mode over the `mt_data_*` caches: it measures nothing, touches no gate
+# artifact, and writes its own `perf_mt_*.svg` set. It exits before the gate rendering below, so an mt
+# render can never overwrite a gate SVG even by accident — which matters because the gate artifacts are
+# byte-compared against a fresh rebuild by `check_artifacts_current.sh`.
+#
+#   julia --project=bench bench/plots.jl mtdraw
+if "mtdraw" in ARGS
+    mtfleet = load_fleet("mt_data_")
+    if isempty(mtfleet)
+        println("no mt_data_* caches on disk — run: … bench/plots.jl bench arms=pb,pb_mt nodraw")
+    else
+        adir0 = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR
+        mkpath(adir0)
+        for (gk, base, ttl) in (
+                ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+                ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
+                ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
+                ("CLP", "clapack", "Complex LAPACK"),
+            )
+            p = joinpath(adir0, "perf_mt_$(base).svg")
+            svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread (SCALING, not the gate)",
+                mtfleet, gk, _ARM_PB_MT)
+            println("  ", relpath(p))
+        end
+        println("mt panels written — these are SCALING curves; the gate is single-threaded.")
+    end
+    exit(0)
+end
+
 fleet = _NODRAW ? [] : load_fleet()
 if isempty(fleet)
     println("no fleet caches on disk to plot")
