@@ -31,8 +31,23 @@
 #     express it, and rewriting Strassen's slot allocation is a separate change.
 # Converting them is a decision that has NOT been taken. If it is, it needs its own gate run.
 #
-# Single global instance per hot type ⇒ single-thread only (the project's current mode; multithreading is
-# deferred). M4 threading swaps _l3ws for a per-task/per-thread owner — the ~4 lines below, nothing else.
+# ── THREADING: WHAT ACTUALLY HAPPENED, vs what this note used to predict ────────────────────────────
+# This said "single-thread only (multithreading is deferred). M4 threading swaps _l3ws for a
+# per-task/per-thread owner — the ~4 lines below, nothing else." M4 HAS landed and that swap was NOT
+# made: `_l3ws` is still `OncePerThread`. The prediction was wrong about which change M4 needed.
+#
+# WHY IT IS SAFE ANYWAY, and the argument is narrower than "it is per-thread". These seven buffers are
+# claimed INSIDE `_gemm_core!` — i.e. inside a worker's chunk body — and a chunk never yields
+# (`test/yield_lint.jl` is the guard). So they are per-CHUNK in practice, and a task cannot migrate
+# while holding one. That is the one place the "a worker runs as a nested interval" argument genuinely
+# holds; `test/perthread_lint_baseline.txt` records it as the reviewed reason these stay per-thread.
+#
+# WHAT WOULD BREAK IT. Any caller that holds one of these ACROSS a threaded `gemm!` — which is what a
+# threaded dual/3M path would do, since `_gemm_3m_scratch` (the `m3` field) is held by the driver across
+# all three plane products. That is the same shape that made concurrent `getrf!` return wrong answers
+# 20 times in 96 before its owner became per-task. Threading the 3M/dual planes therefore requires
+# converting this owner FIRST, not as an afterthought (docs/src/threading.md records the same).
+#
 # NOTE the arena has the SAME precondition, and more sharply: see the standing caveat in arena.jl.
 
 # NB×NB diagonal-block scratch side; caps trmm/syrk materialize (the _trmm_small! `_mat_tri!` M tile is
