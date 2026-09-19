@@ -185,3 +185,49 @@ end
         P.set_num_threads(1)
     end
 end
+
+# The flop-balanced triangular chunker. Two properties matter and they are checked separately, because
+# one is a CORRECTNESS invariant and the other is the point of the thing.
+#
+# PARTITION (correctness). The chunks must tile [0, n) exactly: no gap, and above all NO OVERLAP. Two
+# workers sharing a column of a triangular C is a write race, not a slow chunk — it would produce a
+# silently wrong answer of the same family as the ones M4 already had to fix. Checked exhaustively over
+# a size/worker grid rather than sampled.
+#
+# BALANCE (the purpose). Equal-WIDTH chunks of a triangle are imbalanced ~2:1 across the pair of
+# extreme workers, and a fork-join waits for the slowest. The flop-balanced split must beat that by a
+# wide margin at gate sizes. The bound asserted here is deliberately loose (1.25) because rounding to
+# `_NR` costs up to one block per worker and that share grows as n shrinks; the equal-width comparison
+# in the same testset is what shows the improvement is real rather than the bound being generous.
+@testitem "triangular chunker: exact partition, and flop-balanced" begin
+    using PureBLAS
+    const P = PureBLAS
+    tri_work(j0, len, n, up) = sum(up ? (j + 1) : (n - j) for j in j0:(j0 + len - 1); init = 0)
+
+    @testset "partition is exact (no gap, NO OVERLAP)" begin
+        for n in (8, 17, 64, 100, 128, 512, 1000, 1024, 2048), nw in 1:8, up in (false, true)
+            cov = zeros(Int, n)
+            for i in 1:nw
+                j0, len = P._tri_chunk(n, nw, i, up)
+                @test len >= 0
+                @test j0 >= 0 && j0 + len <= n
+                for j in (j0 + 1):(j0 + len)
+                    cov[j] += 1
+                end
+            end
+            @test all(isone, cov)            # every column covered exactly once
+        end
+    end
+
+    @testset "flops are balanced, and beat an equal-width split" begin
+        for n in (512, 1024, 2048), nw in (2, 4, 6), up in (false, true)
+            tot = tri_work(0, n, n, up)
+            act = [tri_work(P._tri_chunk(n, nw, i, up)..., n, up) for i in 1:nw]
+            @test sum(act) == tot                                   # nothing lost or double-counted
+            @test maximum(act) / (tot / nw) <= 1.25                 # worst worker near the mean
+            # the equal-width split this replaces, on the same cells
+            eq = [tri_work(P._gemm_chunk(n, nw, i)..., n, up) for i in 1:nw]
+            @test maximum(act) < maximum(eq)                        # strictly better than what it replaces
+        end
+    end
+end
