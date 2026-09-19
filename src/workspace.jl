@@ -72,7 +72,9 @@ mutable struct L3Workspace{T}
     gpackB::Vector{T}     # _gemm_scratch:      packed B panel
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
-    m3::NTuple{9, Vector{T}}   # _gemm_3m_scratch:    Karatsuba 3M buffers (Ar/Ai/As, Br/Bi/Bs, P1/P2/P3)
+    # `m3` WAS HERE and is now `_m3ws`, a per-TASK owner — it is the one role held across a threaded
+    # join (`_trmm_dual!`/`_trsm_dual!` call public `trmm!` while holding it). Removed rather than left
+    # dead so nobody re-points an accessor at a per-thread copy. See `_m3ws` above for the full reason.
     str::Vector{Vector{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
     strbt::Vector{T}      # _strassen_bt: transB route Bᵀ, k×n viewed over a flat slot. Deliberately NOT
     # a `str` slot — the nested Winograd recursion owns that whole pool, so sharing would alias.
@@ -89,7 +91,6 @@ L3Workspace{T}() where {T} = L3Workspace{T}(
     T[],                                         # gpackB
     (T[], T[], T[], T[]),                        # cg
     (T[], T[], T[], T[]),                        # s2
-    (T[], T[], T[], T[], T[], T[], T[], T[], T[]), # m3
     Vector{T}[],                                 # str
     T[],                                         # strbt
 )
@@ -112,15 +113,48 @@ const _L3WS_OTHER = Base.OncePerThread{IdDict{DataType, L3Workspace}}(IdDict{Dat
 @inline _l3ws(::Type{ComplexF32}) = _L3WS_C32()
 _l3ws(::Type{T}) where {T} = get!(() -> L3Workspace{T}(), _L3WS_OTHER(), T)::L3Workspace{T}
 
+# ── THE 3M / DUAL PLANES ARE PER-TASK, AND THEY ARE THE ONE ROLE THAT HAS TO BE ─────────────────────
+# Every other role in `L3Workspace` is claimed INSIDE a non-yielding region — `_gemm_core!` and the
+# packed trmm/syrk bodies make no public L3 call while holding one — so per-thread ownership is sound
+# for them and costs one thread-local lookup instead of ~13 ns.
+#
+# `m3` IS DIFFERENT, and not hypothetically. `_trmm_dual!` and `_trsm_dual!` (gemm.jl) claim these nine
+# buffers, view the value/partial planes over them, and then call the PUBLIC `trmm!`/`trsm!` on those
+# planes. Public `trmm!` threads — measured 2.24-3.58x at n=4096 — and its fork-join YIELDS. The
+# driver is pinned to its thread across that join (gemm.jl), but pinning protects only the ARENA,
+# whose borrows nest: `m3` is a wholesale-claimed ROLE, and any other task scheduled onto the pinned
+# driver's thread during the yield claims the SAME nine buffers and overwrites the planes the workers
+# are still reading. (Before the pin the driver also usually resumed on a different thread — 78% of
+# yields — which is the shape that first exposed the class.)
+#
+# That is exactly the shape that measured concurrent `getrf!` wrong 20 times in 96 (some NaN) before
+# `_LU_PAD` became per-task — a SILENT wrong answer, not a crash. It needs threads on and two tasks in
+# a dual or 3M call at once, which is narrow, but threading is a shipped feature now and the failure is
+# undetectable from the result.
+#
+# PER-TASK, NOT PER-WORKER: the planes are the DRIVER's operands and no worker ever touches `m3`, so
+# per-worker copies would duplicate nine buffers for a reader that does not exist. Cost is the
+# `OncePerTask` lookup (~13 ns against ~1.5 ns) on calls that are already doing three L3 products.
+#
+# It is split OUT of `L3Workspace` rather than converting the whole struct, deliberately: the pack
+# buffers are touched on EVERY `gemm!` call, and this file records +7.5 ns being REJECTED there as
+# 7.4% of `trmm!` at n=8. Paying it only where it is needed keeps that verdict intact.
+#
+# `@noinline`, AND REGISTERED AS AN ALLOCATION BARRIER by test/strictmode_tests.jl's `gemm!` proof.
+# `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`, so inlined it exposes
+# the task-local IdDict's grow paths plus the nine empty `Vector`s of the initializer — 17 allocation
+# sites, all the ONE-OFF first touch of a new task — to the static all-paths proof, which failed on
+# dual `gemm!` (2026-09-19, 30069 passed / 1 errored) the first time this owner was split out. As the
+# old `L3Workspace` field it was covered by `_ws_grow!`. The barrier states something true: after the
+# first touch every byte here grows through `_ws_grow!`, exactly like the other pools.
+const _M3_F64 = Base.OncePerTask{NTuple{9, Vector{Float64}}}(() -> ntuple(_ -> Float64[], 9))
+const _M3_F32 = Base.OncePerTask{NTuple{9, Vector{Float32}}}(() -> ntuple(_ -> Float32[], 9))
+const _M3_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
+@noinline _m3ws(::Type{Float64}) = _M3_F64()
+@noinline _m3ws(::Type{Float32}) = _M3_F32()
+@noinline _m3ws(::Type{T}) where {T} = get!(() -> ntuple(_ -> T[], 9), _M3_OTHER(), T)::NTuple{9, Vector{T}}
+
 # Per-role accessors. Each returns/grows one owned field.
-
-
-
-
-
-
-
-
 
 
 # Both blocked band-Cholesky kernels need two dense scratches per call: the corner work array W
@@ -178,8 +212,6 @@ function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
 end
 
 
-
-
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
     ws = _l3ws(T)
     _ws_grow!(ws.gpackA, lenA)                    # through the one growth point, so ONE barrier covers it
@@ -210,7 +242,7 @@ end
 # strided access (measured: zgemm/ztrsm at n=128 tank 1.16→0.57 once the buffer is grown to 2048). Grow-
 # only avoids the MB-realloc churn of exact-sizing under ztrsm's varying recursion shapes.
 function _gemm_3m_scratch(::Type{Tr}, lenA::Int, lenB::Int, lenC::Int) where {Tr}
-    t = _l3ws(Tr).m3
+    t = _m3ws(Tr)                  # PER-TASK — held across a threaded trmm!/trsm! join; see `_m3ws`
     _ws_grow!(t[1], lenA); _ws_grow!(t[2], lenA); _ws_grow!(t[3], lenA)
     _ws_grow!(t[4], lenB); _ws_grow!(t[5], lenB); _ws_grow!(t[6], lenB)
     _ws_grow!(t[7], lenC); _ws_grow!(t[8], lenC); _ws_grow!(t[9], lenC)
@@ -264,19 +296,6 @@ end
 # owner object from the element-typed buffers, so a routine holding both can never alias them.
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Grow-on-demand helper for the accessors below ───────────────────────────────────────────────────
 # The 30-odd roles added for the eigen/QZ/LSQ families all want the same three lines the older accessors
 # spell out by hand (`too small ⇒ fresh, else keep`). One helper, two methods, so a new role is a
@@ -290,20 +309,11 @@ end
 # ── Non-symmetric eigenproblem ──────────────────────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
 # STAGE 1: `_laexc_work` and `_dlasy2_work` are gone. Both handed out only FIXED-size buffers, so their
 # bodies became `borrow!`s at their single call sites — `_dlaexc!` (trsen.jl) and `_syl_dlasy2`
 # (trsyl.jl) — inside the `@scope` each of those now opens. The reasoning moved with them: D is borrowed
 # EXACTLY nd×nd (the dnorm loop is `for x in D`, so an oversized 4×4 at nd==3 would fold stale elements
 # into the `thresh` rejection test), and t16 keeps its load-bearing fill!.
-
-
 
 
 # ── Bunch–Kaufman inverse ───────────────────────────────────────────────────────────────────────────
@@ -316,8 +326,6 @@ end
 # the entry's live claim) evaporates with the field: a borrow is per-scope, not per-role.
 
 
-
-
 # STAGE 1: `_tgsy2_work` and the four `_tgex2_*` fixed-size accessors (blocks / qr / mul / copies / rot)
 # are gone. Every buffer they handed out was FIXED (m ≤ 4, nz ≤ 8), so their bodies are now `borrow!`s at
 # their single call sites in tgsen.jl — `_tgs_tgsy2!` for the Kronecker system, `_dtgex2_big!` for the
@@ -325,26 +333,10 @@ end
 # IR, QL2 and IR2 are each `fill!`ed at their borrow, for the reasons still written at those sites.
 
 
-
-
 # ── ggsvd! ──────────────────────────────────────────────────────────────────────────────────────────
-
-
-
-
-
 
 
 # ── Least squares ───────────────────────────────────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
 # ── Symmetric-tridiagonal eigen (stebz.jl) ──────────────────────────────────────────────────────────
-
-

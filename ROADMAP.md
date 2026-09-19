@@ -95,8 +95,11 @@ after). `L3Workspace` paid that at module load instead.
 
 **Standing caveat:** the arena is a process-global bump allocator, exactly as `_l3ws` is a process-global
 struct. That is not a regression in kind but it is one in degree — interleave two tasks and the failure
-is arbitrary cross-role aliasing where the struct's was bounded to one role. **A per-task owner is a
-precondition of enabling threads (M4), not an optimisation to weigh against its 9–12 ns.**
+is arbitrary cross-role aliasing where the struct's was bounded to one role. This paragraph used to
+conclude "a per-task owner is a precondition of enabling threads (M4)". **It was not** (2026-09-19):
+threads shipped with the arena still per-thread, first behind an admission guard and then behind a
+pinned driver — see M4 "Arena threading repair" below. The per-task owner was PRICED rather than
+assumed: trmm! n=8 **+3.5%** (8 SE), null elsewhere; the pin costs that cell nothing.
 
 **THE ARENA IS A PREREQUISITE FOR M4, AND REVERTING IT IS NOT AN OPTION (user, 2026-09-05.)** This
 governs how a stage-4 regression may be resolved: it must be FIXED, never reverted to fields, however
@@ -1280,6 +1283,30 @@ shared a thread); a stale event could make a worker **re-run the previous chunk 
 (fixed by waiting in a loop around the generation, never on the wake); and a `sleeping`-flag
 optimisation that woke only announced workers **hung at `gen=524 done=0`** — deleted in favour of an
 unconditional notify, which cannot lose a wake.
+
+### Arena threading repair DONE (2026-09-19) — pin the driver, drop the depth guard
+
+`gemm!`/`_symm!` used to refuse to thread while any arena scope was live (`iszero(_arena().depth)`),
+which silently serialised the 16 routines whose L3 call sits inside their own `@scope` (gels!, getri!,
+trtri!, potri!, lauum, gehrd, pbtrf, gbtrf, …). Now `_gemm_threaded!` sets `Task.sticky` for the join
+and restores it; the arena stays per-thread. Decided by measurement, all on Zen4, `-t 6`:
+- `Task.sticky` across the join's shape: **0 of 200 000** yields migrated (unpinned control 151 919).
+- The alternative, `_ARENA` as `OncePerTask`: trmm! n=8 **+3.5%** (B/A 1.0346, SE 0.0041), null on
+  trmm 32/64, trsm 8/32/64, gemm 8/32/64 — so the pin wins on cost too.
+- The arena hazard had never been observed before; `bench/probes/arena_pin_control.jl` **forces** it:
+  pin OFF → the driver's scope exit ran on another thread and the next borrow on its old thread
+  overlapped a live one (131 064 elements); pin ON → 0, and the driver could not exit under the
+  occupying task (the LIFO property, observed).
+- Concurrency check under the pin, 24 tasks × 4 rounds vs serial: symm/gemm/getrf/geqrf/potrf and the
+  unblocked getri/trtri/potri/gels/dual trmm/dual trsm all **0/96**, with a forced positive control.
+- `m3` left `L3Workspace` for the per-task `_m3ws` (held across a public threaded `trmm!` by the dual
+  path — a role hazard the guard could never see); `_m3ws` is `@noinline` and a registered alloc
+  barrier so the static `gemm!` proof still holds.
+Side effect to know: a pinned task's yield hands its thread only to STICKY tasks queued there, so a
+`@spawn`ed task can no longer take the driver's thread mid-join (the old probabilistic race control
+went blind for exactly this reason and was replaced by a forced one). Per-thread ROLE owners stay
+per-task. Full write-up: `kb/findings/pureblas-arena-threading-driver-pin.md`.
+**Threaded ratios of the unblocked routines: see the targeted `pb_mt` cells recorded with this change.**
 
 ### Still to do on the Julia side
 

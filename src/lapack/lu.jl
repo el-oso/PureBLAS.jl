@@ -367,8 +367,10 @@ end
 # DIFFERENT thread (measured on Zen4: 39863 of 48000 yields migrated), so a per-thread owner hands the
 # resumed driver a different buffer while the original thread is free for another task to claim the one
 # it is still using. Measured before this change: 24 concurrent `getrf!` calls gave **20/96 wrong
-# results, some NaN**, against 0/96 serial. `_arena().depth` guards the scopes in `gemm!`; a plain Ref
-# owner like this one is not a scope, so it must be per-task instead.
+# results, some NaN**, against 0/96 serial. The driver is now pinned to its thread across that join
+# (gemm.jl), which is what makes the nesting ARENA safe — but a plain Ref owner like this one is a
+# single role, and another task landing on the pinned thread during the yield would claim the same Ref
+# while the workers still read it; so it stays per-task.
 # Cost is nil here: `_lu_needs_pad` requires m >= 512, so the extra ~13 ns lookup lands only on calls
 # already in the millisecond range.
 const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))

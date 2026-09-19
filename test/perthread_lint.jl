@@ -13,9 +13,14 @@
 #
 # THE TWO SAFE SHAPES, and every baselined owner must be one of them:
 #   (a) the buffer can never be live across a threaded call — the routine holding it never reaches the
-#       public `gemm!`, or `gemm!` refuses to thread while it is held (`iszero(_arena().depth)`);
+#       public `gemm!`;
 #   (b) the buffer is claimed INSIDE a chunk body, which never yields (`test/yield_lint.jl` is the
-#       guard), so it is per-chunk in practice and cannot outlive a migration.
+#       guard), so it is per-chunk in practice and cannot outlive a migration;
+#   (c) the ARENA only: its borrows NEST, the driver is pinned to its thread across the one yield that
+#       can sit inside a scope (`Task.sticky` in `_gemm_threaded!`), and the single pool claim means at
+#       most one task in the process is ever suspended mid-scope — src/arena.jl's threading note. This
+#       argument does NOT transfer to a wholesale-claimed role (a `Ref`, a fixed buffer): another task
+#       on the pinned thread claims the same role during the yield and overwrites live operands.
 # Anything else must be `Base.OncePerTask`, which ties the buffer to the task — the thing that does not
 # move — at a measured ~13 ns extra per lookup.
 #

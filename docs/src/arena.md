@@ -157,18 +157,22 @@ For a thrown error, the `@scope` above it gives the memory back. That works beca
 ## Threads
 
 There is one arena per THREAD (`_ARENA` is a `Base.OncePerThread`), and that is safe only because of
-the rule in the next paragraph.
+the three facts in the next paragraph.
 
-**A threaded `gemm!` refuses to run while any scope is live.** `gemm!` and `_symm!` thread only when
-`iszero(_arena().depth)`. The reason is task migration: the threaded driver yields in its join, and a
-yielded task usually resumes on a DIFFERENT thread — measured on Zen 4, 7491 of 9600 yields moved. A
-routine that entered holding thread `t1`'s borrow therefore finishes on `t3` while `t1`'s arena is free
-for any other task to claim the same bytes. The guard asks the arena directly instead of auditing the
-23 internal call sites one at a time, it cannot be forgotten by a future caller, and it costs one field
-load — paid only by calls already large enough to have considered threading.
+**The threaded driver is pinned to its thread for the join.** The join in `_gemm_threaded!` yields,
+and a yielded task usually resumes on a DIFFERENT thread — measured on Zen 4, 7491 of 9600 yields
+moved. A routine that entered holding thread `t1`'s borrow would then finish on `t3` while `t1`'s arena
+was free for any other task to claim the same bytes. So the driver sets `Task.sticky` for the join and
+restores it after; Base requeues a sticky task on its own thread. That join is the only task-switch
+point inside a scope (`test/yield_lint.jl`), and the pool is one claim, so at most one task in the
+process is ever suspended mid-scope. Any other task scheduled onto the pinned thread during the yield
+opens a scope ABOVE the driver's live offset, cannot itself be suspended (its own `gemm!` loses the
+claim and runs serial), and rewinds to exactly the driver's state before the driver resumes — the bump
+stack stays LIFO. The full argument is the threading note in `src/arena.jl`.
 
-The consequence to know about: a routine that wraps its body in `@scope` gets no threading inside it.
-`trsm!` is the case in point.
+An earlier version refused to thread while any scope was live (`iszero(_arena().depth)`). That was
+sound, and it silently serialised every routine whose `gemm!` sits inside its own `@scope` — `gels!`,
+`getri!`, `trtri!`, `potri!`, `lauum`, `gehrd`, `pbtrf`, `gbtrf` and eight more. Pinning replaced it.
 
 ### Workspaces that are NOT the arena
 

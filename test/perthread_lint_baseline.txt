@@ -6,9 +6,12 @@
 # must be `Base.OncePerTask` instead (~13 ns more per lookup, which is nothing on a call large enough
 # to have considered threading).
 #
-#   arena.jl  — `_ARENA` is the arena itself, and `gemm!`/`_symm!` refuse to thread while any scope is
-#               live (`iszero(_arena().depth)`). That guard is what covers the 17 internal `gemm!` call
-#               sites that sit inside an `@scope`, mechanically rather than by audit.
+#   arena.jl  — `_ARENA` is the arena itself: a bump STACK whose scopes nest. `_gemm_threaded!` pins the
+#               driver task to its thread for the join (the only yield inside a scope), so its live
+#               borrows stay on the thread that holds them; any other task scheduled onto that thread
+#               opens a NESTED scope above the driver's offset and cannot itself be suspended (the pool
+#               is one claim, held by the driver). Full argument: src/arena.jl threading note (a)-(c).
+#               The earlier `iszero(_arena().depth)` admission guard is gone; it serialised 16 routines.
 #
 #   workspace.jl — the L3 pack pools are claimed INSIDE `_gemm_core!`, i.e. inside a chunk body, and a
 #               chunk never yields (`test/yield_lint.jl` is the guard). They are per-chunk in practice,
