@@ -3442,6 +3442,42 @@ mutable struct GemmPool{T}
     ldc::Int; lda::Int; ldb::Int
     alpha::T; beta::T
     tA::Bool; tB::Bool; cA::Bool; cB::Bool
+    # ── which KIND of job, and the triangle it writes ──────────────────────────────────────────────
+    # `kind` is an ORDINARY field, deliberately NOT packed into the generation word beside `nw`. That
+    # packing exists for one reason — `nw` must arrive in the SAME atomic load as the generation, or a
+    # surplus worker can act on a job it was never dispatched for (the bug that corrupted C earlier in
+    # M4) — and the invariant recorded there already covers everything else: every other job field is
+    # read only AFTER `i < nw` is established from that load, at which point the driver of THAT
+    # generation is waiting on this worker's `done` and cannot let a field change. `kind` is exactly
+    # such a field, so widening the word would add risk to the one thing that must not break, for no
+    # safety we do not already have.
+    kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK`
+    up::Bool                         # syrk/syr2k: which triangle of C is written
+    sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
+end
+# PDM: Exempt — job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about
+# a cache size, a vector width or a µarch could change them, and a Preference over them would be
+# meaningless. Same class as a sentinel.
+const _MT_KIND_GEMM = 0
+const _MT_KIND_SYRK = 1
+
+"""
+    _syrk_workers(n, k) -> Int
+
+Workers for a triangular rank-k update, or `1` for serial. Same amortisation floor as `_gemm_workers`
+— the fork-join price is the same price — but the flop count is the TRIANGLE's, `n·(n+1)·k`, not the
+full `2·n·n·k`. Using gemm's count would admit calls at half the real work and pay a join the work
+cannot cover.
+
+Capped by `cld(n, _NR)` for the same reason as gemm: a worker that cannot be given a whole `_NR`-wide
+column block runs a ragged microkernel, which costs more than the thread saves.
+"""
+@inline function _syrk_workers(n::Int, k::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = n * (n + 1) * k
+    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
 end
 
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
@@ -3454,6 +3490,42 @@ end
     return j0, min(n, b1 * _NR) - j0
 end
 
+# ── FLOP-BALANCED COLUMN SPLIT FOR A TRIANGULAR OUTPUT (syrk / syr2k / herk / her2k) ────────────────
+# `_gemm_chunk`'s equal-WIDTH split is wrong for a triangle. Column j of a lower-triangular C has n − j
+# live rows, so equal widths hand the first worker ~2x the work of the last: at P=6 the measured ratio
+# between the busiest and idlest chunk is 11:1 for the extreme pair, and the join waits for the slowest.
+#
+# THIS IS NOT A KNOB — it is the exact solution of the equal-area equation, so there is nothing to tune
+# and no PDM tier applies. Work in columns [0, j) of a LOWER triangle is the trapezoid
+#     w(j) = n·j − j²/2
+# Setting w(j_i) = (i/P)·w(n) = (i/P)·n²/2 and solving the quadratic gives
+#     j_i = n·(1 − sqrt(1 − i/P))
+# For an UPPER triangle the heights increase instead (column j has j+1 live rows), so w(j) = j²/2 and
+#     j_i = n·sqrt(i/P)
+# Both are exact in the continuum; the only approximation is the rounding below.
+#
+# ROUNDING. Boundaries snap to `_NR`, the microkernel's column granularity — a chunk that is not a whole
+# number of `_NR` blocks runs a ragged edge kernel, which costs more than the imbalance it fixes. After
+# rounding, the worst-case imbalance is one `_NR` block per worker, which at n=1024 and _NR=8 is 0.8%.
+#
+# DEGENERATION, by construction rather than by special case:
+#   * P = 1            → returns [0, n), the whole triangle.
+#   * small n          → several boundaries round to the same multiple of `_NR`; those workers get
+#                        zero-length chunks and skip, exactly as `_gemm_run_chunk` already does on
+#                        `len == 0`. So the split silently uses fewer workers rather than making ragged
+#                        ones, which is the right answer when there is not enough work to go round.
+#   * monotonicity     → `max` against the previous boundary, so a rounding wobble can never emit a
+#                        negative length or let two workers overlap. Overlap would be a WRITE RACE on C,
+#                        not merely a slow chunk, so this is a correctness guard and not tidiness.
+@inline function _tri_chunk(n::Int, nw::Int, i::Int, up::Bool)
+    nw <= 1 && return 0, n
+    f(t) = up ? sqrt(t) : 1 - sqrt(1 - t)
+    b(t) = min(n, _NR * round(Int, (n * f(t)) / _NR))
+    j0 = b((i - 1) / nw)
+    j1 = i == nw ? n : max(j0, b(i / nw))      # last worker always closes the triangle exactly
+    return j0, j1 - j0
+end
+
 # op(B)'s column slice. With `tB`, B is stored n×k and op(B)[:,jr] is B[jr,:] — a ROW slice, which is
 # the same leading dimension at an element offset, not a column offset. Both cases are one PtrMatrix.
 @inline function _gemm_bchunk(p::GemmPool{T}, j0::Int, len::Int) where {T}
@@ -3464,11 +3536,72 @@ end
 # `nw` is an ARGUMENT, decoded from the same atomic load as the generation (worker) or the driver's own
 # local — never a field read, so the chunk geometry cannot come from a later job than the one dispatched.
 @inline function _gemm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    p.kind == _MT_KIND_SYRK && return _syrk_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
     Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
     _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB)
+    return nothing
+end
+
+# ── SYRK / SYR2K CHUNK ─────────────────────────────────────────────────────────────────────────────
+# A column range of a triangular C, sized by `_tri_chunk` so the FLOPS are balanced rather than the
+# widths. The body is the ordinary serial packed-triangular kernel restricted to `[j0, j0+len)`: column
+# blocks of C are write-disjoint, and the triangle is resolved inside `_trgemm_tiles!` from the
+# absolute indices, so a worker computes exactly the tiles it owns.
+#
+# `sym2` IS A CORRECTNESS REQUIREMENT, not an optimisation. syr2k is C := αABᵀ + αBAᵀ + βC, i.e. TWO
+# rank-k passes over the SAME C. Splitting them across workers — one worker per pass — would have two
+# workers writing one column range, a plain data race. Running both passes inside ONE chunk on ONE
+# column range keeps every write owned: worker i writes columns [j0, j0+len) and nothing else, twice.
+# The per-worker packing is unchanged; only the column bound differs from the serial call.
+#
+# Both operands come from the pool's `Ap`/`Bp`. For syrk they are the same array (X = Y = A), which is
+# why `Bp` is set to `Ap` by the dispatcher rather than left null.
+# The whole triangle on this thread, for a caller that LOST the pool claim. Same body the chunk runs,
+# with the full column range — so a loser computes exactly what the serial entry would have.
+@inline function _syrk_serial_fallback!(
+        C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T}, alpha::T, tA::Bool, up::Bool, sym2::Bool
+    ) where {T}
+    k = tA ? A.m : A.n
+    if sym2 && _unified_ok(T)                      # same kernel choice as the chunk — see `_syrk_run_chunk`
+        _trgemm_packed2_u!(up, alpha, A, tA, B, tA, C, k)
+        return nothing
+    end
+    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, B, !tA, C, k)
+    sym2 && _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, B, tA, A, !tA, C, k)
+    return nothing
+end
+
+@inline function _syrk_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    j0, len = _tri_chunk(p.n, nw, i, p.up)
+    len > 0 || return nothing
+    # BOTH operands take their shape from `tA`. In syrk X and Y are the SAME array; in syr2k they are A
+    # and B, which the BLAS requires to have the same orientation. What differs between the two passes
+    # is the transpose FLAG handed to the kernel (`tA` then `!tA`), never the storage shape — reading
+    # Y's shape from `tB` would transpose one operand's dimensions and silently read out of bounds.
+    X = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.n, p.tA ? p.n : p.k, p.lda)
+    Y = PtrMatrix{T}(p.Bp, p.tA ? p.k : p.n, p.tA ? p.n : p.k, p.ldb)
+    C = PtrMatrix{T}(p.Cp, p.n, p.n, p.ldc)
+    # WHICH KERNEL: exactly the one the SERIAL path would pick for this call, or the threaded and
+    # serial answers diverge. `_unified_ok` selects the fused two-product kernel — one pass, each C
+    # tile written once — and on this fleet it is TRUE for Float64, so it is the live route, not a
+    # fallback. The 2-pass route below is reached only where the fused one is unavailable.
+    if p.sym2 && _unified_ok(T)
+        _trgemm_packed2_u!(p.up, p.alpha, X, p.tA, Y, p.tA, C, p.k, j0, j0 + len)
+        return nothing
+    end
+    _trgemm_packed!(
+        Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, X, p.tA, Y, !p.tA, C, p.k,
+        Val(false), j0, j0 + len
+    )
+    # syr2k's second pass on the 2-pass route: the transposed product, SAME column range, SAME worker.
+    # Splitting the passes across workers would put two of them on one range — a data race.
+    p.sym2 && _trgemm_packed!(
+        Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, Y, p.tA, X, !p.tA, C, p.k,
+        Val(false), j0, j0 + len
+    )
     return nothing
 end
 
@@ -3555,7 +3688,8 @@ end
     p = GemmPool{T}(
         0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
-        zero(T), zero(T), false, false, false, false
+        zero(T), zero(T), false, false, false, false,
+        _MT_KIND_GEMM, false, false
     )
     return _gemm_pool_start!(p)
 end
@@ -3640,7 +3774,8 @@ the same result, whenever the pool is already in use — see the claim below.
 # runtime dispatch, and `test/dual_tests.jl`'s `@assert_typestable` dogfood caught it.
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
-        alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int
+        alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
+        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false
     ) where {T}
     p = _gemm_pool(T)
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
@@ -3653,7 +3788,21 @@ the same result, whenever the pool is already in use — see the claim below.
     # BOTH paths — otherwise this function's return type is a union and the instability propagates into
     # every caller's inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
     if !won
-        _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB)
+        # THE FALLBACK MUST MATCH THE JOB KIND. This ran `_gemm_core!` unconditionally, which is right
+        # for a gemm and CATASTROPHIC for a syrk: it computes a full rectangular A·Bᵀ over the whole
+        # matrix instead of a triangular rank-k update — wrong triangle, wrong values, and β already
+        # consumed by the caller's `_syrk_scaleC!`. Measured when syrk was first routed here: 87 of 96
+        # concurrent callers wrong, while gemm under the identical harness was 0 of 96, because only
+        # the losers took this branch.
+        #
+        # The lesson, recorded because it generalises to the next job kind: adding a kind means
+        # following EVERY path out of this driver, not only the happy one. The claim is lost often —
+        # with 24 concurrent callers it is the common case, not the rare one.
+        if kind == _MT_KIND_SYRK
+            _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+        else
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB)
+        end
         return nothing
     end
     # SIGNALS ARE DEFERRED FOR THE WHOLE THREADED BODY. The join below is the `finally` of the chunk,
@@ -3704,6 +3853,7 @@ the same result, whenever the pool is already in use — see the claim below.
         p.m = C.m; p.n = C.n; p.k = tA ? A.m : A.n
         p.alpha = alpha; p.beta = beta
         p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
+        p.kind = kind; p.up = up; p.sym2 = sym2
         @atomic p.done = 0
         @atomic p.failed = false
         # ONE atomic store publishes the worker count together with the generation (see `GemmPool`)

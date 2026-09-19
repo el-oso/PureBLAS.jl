@@ -5306,9 +5306,18 @@ end
 
 # General triangular-C gemm: C[uplo-triangle] += α·op(X)·op(Y) (X→A-operand, Y→B-operand), n×n result.
 # The reusable core behind syrk (Y=X) and syr2k (two passes). Real only; α folded into packed X.
+# `jlo`/`jhi` restrict the work to COLUMNS [jlo, jhi) of C, defaulting to the whole matrix so every
+# existing call is unchanged. This is the seam the threaded syrk splits on, and it is the whole of the
+# plumbing: column blocks of a triangular C are WRITE-DISJOINT, and the triangle is resolved inside
+# `_trgemm_tiles!` (from the absolute `ic`/`jc` it is handed), not by the column loop. So a worker that
+# runs this body over its own column range computes exactly the tiles it owns and touches no other
+# worker's output — nothing about the kernel, the packing or the β handling changes.
+#
+# `n` stays the FULL matrix order. It must: `mc`/`nc` are sized from it, and `_trgemm_tiles!` needs
+# absolute column indices to know where the diagonal is. Only the loop bounds move.
 function _trgemm_packed!(
         ::Val{MR}, ::Val{NR}, up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
-        ::Val{OV} = Val(false)
+        ::Val{OV} = Val(false), jlo::Int = 0, jhi::Int = size(C, 1)
     ) where {T <: BlasReal, MR, NR, OV}
     n = size(C, 1); W = _vwidth(T); mr = MR * W; nr = NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
@@ -5317,9 +5326,13 @@ function _trgemm_packed!(
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # CLAMP TO `jhi`, NOT `n`. With a column range this one token is the difference between a
+            # partition and a WRITE RACE: the last block of a worker's range would otherwise run a full
+            # `nc` wide and overwrite columns the next worker is computing. Unthreaded it is a no-op,
+            # because `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc)
                 b0 = OV && pc == 0             # overwrite C on the FIRST k-block (β=0 fast path), else add
@@ -6116,7 +6129,15 @@ end
 
 # Unified single-pack syr2k: pack A and B ONCE each (W-row panels); the two products read them in
 # swapped roles (A·Bᵀ: packA-rows·packB-cols; B·Aᵀ: packB-rows·packA-cols). 2 packs, not 4.
-function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::Int) where {T <: BlasReal}
+# `jlo`/`jhi` restrict this to COLUMNS [jlo, jhi) of C — the same seam `_trgemm_packed!` has, and the
+# one the threaded syr2k splits on. This is the FUSED two-product kernel: it holds both products in
+# registers and writes each C tile ONCE, so unlike the 2-pass route there is no second pass to keep on
+# the same worker — a column range is simply owned end to end. `n` stays the full order because the
+# `skip` test below needs absolute row/column indices to find the diagonal.
+function _trgemm_packed2_u!(
+        up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::Int,
+        jlo::Int = 0, jhi::Int = size(C, 1)
+    ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -6125,9 +6146,11 @@ function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C packA packB begin
         Cp0 = pointer(C); PA = pointer(packA); PB = pointer(packB)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # Clamp to `jhi`, not `n` — otherwise a worker's last block runs a full `nc` wide and
+            # overwrites the next worker's columns. No-op unthreaded, where `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
@@ -6477,9 +6500,36 @@ function syrk!(
         return C
     end
     _syrk_scaleC!(C, up, beta)
+    # ── M4 PHASE 4: SPLIT THE TRIANGLE ACROSS THE POOL ─────────────────────────────────────────────
+    # β is already applied by `_syrk_scaleC!` above, so every worker's chunk is a pure accumulate into
+    # its own write-disjoint column range — no β ordering between workers to get wrong.
+    #
+    # Restricted to the REAL PACKED path, which is the one `_trgemm_packed!`'s `jlo/jhi` seam was
+    # verified on (64 partitions exact, positive control detects an omitted chunk). Complex, the
+    # unpacked small-n route and the recursive fallback keep the serial driver: complex cannot reach a
+    # threaded kernel at all today, and the others are below the amortisation floor anyway.
+    #
+    # `_strided1` on BOTH operands because the pool carries POINTERS, and `eltype(A) === T` for the
+    # reason `gemm!` tests it — the chunk builds `PtrMatrix{T}` from `p.Ap`, so a mixed-type operand
+    # would be reinterpreted rather than converted.
+    T = eltype(C)
+    nw = (T === Float64 || T === Float32) && eltype(A) === T && !herk_hermitian(false) &&
+        _strided1(A) && _strided1(C) && size(C, 1) > _fh_syrk_pack_cut() && k > 0 ?
+        _syrk_workers(size(C, 1), k) : 1
+    if nw > 1
+        rA = _root(A); rC = _root(C)
+        GC.@preserve rA rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(A), convert(T, alpha), zero(T),
+            trans != 'N', trans == 'N', false, false, nw, _MT_KIND_SYRK, up, false
+        )
+        return C
+    end
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
     return C
 end
+# syrk is never Hermitian; herk is. Spelled as a function so the `nw` predicate above reads the same in
+# both entries and the difference is impossible to miss when editing one of them.
+@inline herk_hermitian(h::Bool) = h
 function herk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Real = true, beta::Real = false
@@ -7312,6 +7362,35 @@ function syr2k!(
         return syr2k!(C, parent(A), parent(Bm); uplo, trans = 'T', alpha, beta)
     end
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
+    # ── M4 PHASE 4: SPLIT THE TRIANGLE ─────────────────────────────────────────────────────────────
+    # `_syrk_run_chunk` picks the SAME kernel the serial path would — the fused `_trgemm_packed2_u!`
+    # when `_unified_ok`, else the two-pass route — so threaded and serial cannot disagree.
+    #
+    # A FIRST ATTEMPT GATED THIS ON THE TWO-PASS ROUTE AND WAS DEAD CODE: on this fleet `_unified_ok`
+    # is true for Float64 and `_SYR2K_2PASS` is `typemax(Int)`, so syr2k ALWAYS takes the fused route.
+    # The dispatch witness caught it — sixteen clean rows with `dispatch: 0`, every one vacuous. That
+    # is the whole reason the witness runs before the table.
+    #
+    # BOTH PASSES STAY ON ONE WORKER (`sym2`). syr2k is C := αABᵀ + αBAᵀ + βC — two rank-k updates over
+    # the SAME C. Handing one pass to each worker would put two workers on one column range: a plain
+    # data race. The fused kernel sidesteps it by writing each tile once; the 2-pass route needs the
+    # single-owner rule, and gets it.
+    #
+    # β is applied here, so each chunk is a pure accumulate and no worker has to sequence against β.
+    Tr = eltype(C)
+    nw2 = (Tr === Float64 || Tr === Float32) && eltype(A) === Tr && eltype(Bm) === Tr &&
+        _strided1(A) && _strided1(Bm) && _strided1(C) &&
+        n > _fh_syr2k_pack_cut() && k > 0 ?
+        _syrk_workers(n, 2 * k) : 1        # 2k: syr2k does TWO rank-k passes, so twice the flops
+    if nw2 > 1
+        _syrk_scaleC!(C, up, convert(Tr, beta))
+        rA = _root(A); rB = _root(Bm); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(Bm), convert(Tr, alpha), zero(Tr),
+            trans != 'N', trans != 'N', false, false, nw2, _MT_KIND_SYRK, up, true
+        )
+        return C
+    end
     if eltype(C) <: BlasReal && n > _fh_syr2k_pack_cut() && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && trans == 'N' && _strided1(A) && _strided1(Bm) &&
