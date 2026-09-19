@@ -13,7 +13,23 @@
 include(joinpath(@__DIR__, "mt_summary.jl"))     # cells / roundratios / med / mt_rows / mt_header
 
 const DOC = joinpath(@__DIR__, "..", "docs", "src", "threading.md")
-const FLAT_BAND = 0.05
+
+# ── WHAT THIS PAGE SHOWS, AND WHY IT IS A SUBSET ────────────────────────────────────────────────────
+# Only operations that threading can actually reach. Two filters, both derived rather than chosen:
+#
+# 1. TYPE. `gemm!` refuses to thread unless `T === Float64 || T === Float32`, so every complex and dual
+#    cell is provably unthreadable. Listing them would be 1038 rows of noise presented as a result.
+#    They are not silently dropped — they are the NOISE SAMPLE that sets the threshold below.
+#
+# 2. MOVEMENT beyond that measured noise. Across the three boxes those 1038 unthreadable cells scatter
+#    with |ratio − 1| of 0.1% median, 1.5% at p95, **3.7% at p99** and 12.2% at worst. So 3.7% is not a
+#    taste literal: it is this harness's own p99 under a condition where the true answer is known to be
+#    exactly 1.00. An op is listed when its best cell moves further than that on at least one box.
+#    13 of 60 real-typed ops qualify; the other 47 are flat because nothing threads them.
+const NOISE_P99 = 0.037        # measured, see above — regenerate this page after any harness change
+const FLAT_BAND = NOISE_P99
+const THREADABLE = ("L1", "L2", "L3", "LP")     # real element types only; see filter 1
+_threadable(lvl) = lvl in THREADABLE
 # Ops whose cells are all flat are not listed one by one — the page would be 900 rows of 1.00. They are
 # summarised as a count, and the ones that are flat BY DESIGN are named in prose.
 const CACHES = sort(filter(f -> startswith(basename(f), "mt_data_") && endswith(f, ".txt"),
@@ -41,10 +57,11 @@ function box_section(io, path)
     println(io, "Measured ", get(kv, "time", "?"), " at commit `", get(kv, "commit", "?"),
         "`, ", get(kv, "cpu", "?"), ", pinned at ", mhz(get(kv, "freq", "?")), " with boost off.")
     println(io)
-    @printf(io, "%d cells, %d off-lock, %d flat within %.0f%% of 1.00, %d with no `pb_mt` arm.\n",
-        st.cells, st.offlock, st.flat, 100 * FLAT_BAND, st.no_mt)
+    @printf(io, "%d cells measured, %d off-lock. Listed below: the threadable ops whose best cell moves further than the %.1f%% noise floor.\n",
+        st.cells, st.offlock, 100 * NOISE_P99)
     println(io)
 
+    rows = [r for r in rows if _threadable(r[3])]        # drop what cannot thread — see NOISE_P99
     movers = [r for r in rows if r[1] > 1 + FLAT_BAND]
     losers = [r for r in rows if r[1] < 1 - FLAT_BAND]
 
@@ -87,6 +104,7 @@ function best_per_op(path)
     rows, _ = mt_rows(path)
     best = Dict{String, Tuple{Float64, Int}}()
     for (s, _, lvl, op, sz) in rows
+        _threadable(lvl) || continue
         k = string(lvl, " ", op)
         (!haskey(best, k) || s > best[k][1]) && (best[k] = (s, sz))
     end
@@ -177,12 +195,21 @@ julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 
 ## What is threaded, and what is deliberately not
 
-`gemm` has the only splitter. `symm` routes its materialised product through it. `getrf`, `geqrf` and
-`trmm` inherit it through their trailing updates.
+**There is exactly ONE splitter, in `gemm!`.** No other routine contains threading code. `_symm!` is
+the only other place that calls the threaded driver, and it does so by routing its already-materialised
+product through that same splitter. Everything else that speeds up — `getrf`, `geqrf`, `trmm` — does so
+because it *calls* `gemm!`; not a line was written for them.
+
+That is why this page lists 13 operations and not 60. Of the real-typed ops measured, 47 do not move
+beyond the noise floor, because nothing threads them.
 
 Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `tbsv`, `tpsv`, `copy`,
 `asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
 is wrong with the measurement rather than right with the library.
+
+`syrk`, `syr2k`, `hemm` and the rest of Level-3 inherit nothing for a structural reason worth knowing:
+they reach `_gemm_core!` **directly**, which sits *below* the split point. Threading them is Phase 4 of
+the plan and is not started.
 
 `trsm` is also flat, but for a different reason: it wraps its body in an arena scope, and a threaded
 `gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
@@ -204,12 +231,15 @@ are supposed to be flat.
 
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
-![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
-![BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l2.svg)
-![Complex BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl1.svg)
-![Complex BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl2.svg)
-![Complex BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl3.svg)
-![Complex LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_clapack.svg)
+
+Only Level-3 and LAPACK are plotted, because they are the only groups anything threads. Level-1 and
+Level-2 have no splitter, and complex and dual cannot reach one — so their panels would be flat lines
+by construction rather than by measurement.
+
+Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
+`syrk`, `syr2k`, `trsm`, `trmmR` and `potrf` sit on 1.00 next to `gemm` climbing to ~5×. They reach
+`_gemm_core!` *below* the split point, or refuse to thread inside an arena scope. Seeing them flat in
+the same picture is what shows the measurement discriminates rather than flattering everything.
 
 Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
 `perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.
