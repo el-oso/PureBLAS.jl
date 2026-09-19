@@ -615,8 +615,15 @@ const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no swe
 # m<n transpose staging — lives here as a concrete field, grown on demand and reused across calls. So a
 # warm `gesvd!` into caller-provided U/S/Vt allocates NOTHING. gesvd is Float64-ONLY (no s/c/z SVD kernel),
 # so unlike L3Workspace there is NO per-type dispatch and NO IdDict fallback: one module-level const,
-# reached by a bare field load (unconditionally trim-safe). Single global ⇒ single-thread only (project's
-# current mode); MT swaps _svdws() for a per-task owner, nothing else.
+# reached by a bare field load (unconditionally trim-safe).
+#
+# THREADING: this note used to say "single global ⇒ single-thread only (project's current mode); MT
+# swaps _svdws() for a per-task owner, nothing else." M4 landed and that swap WAS taken — the owners
+# below are `Base.OncePerTask`. It was not optional: `gesvd!` holds this workspace across `gemm!`
+# calls that thread, and the driver's join yields, after which the task usually resumes on a DIFFERENT
+# thread (measured 78% of yields). A per-THREAD owner there hands the same buffer to two live tasks;
+# the same shape measured concurrent `getrf!` wrong 20 times in 96 before its owner was converted.
+# Cost is ~13 ns per lookup, which is nothing against an O(n³) factorization.
 mutable struct SVDWorkspace{T}
     d::Vector{T}; e::Vector{T}; tauq::Vector{T}; taup::Vector{T}   # bidiagonal + reflector scalars
     gebrd_X::Matrix{T}; gebrd_Y::Matrix{T}                         # dlabrd panels
