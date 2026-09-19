@@ -46,12 +46,21 @@ julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 
 ## What is threaded, and what is deliberately not
 
-`gemm` has the only splitter. `symm` routes its materialised product through it. `getrf`, `geqrf` and
-`trmm` inherit it through their trailing updates.
+**There is exactly ONE splitter, in `gemm!`.** No other routine contains threading code. `_symm!` is
+the only other place that calls the threaded driver, and it does so by routing its already-materialised
+product through that same splitter. Everything else that speeds up — `getrf`, `geqrf`, `trmm` — does so
+because it *calls* `gemm!`; not a line was written for them.
+
+That is why this page lists 13 operations and not 60. Of the real-typed ops measured, 47 do not move
+beyond the noise floor, because nothing threads them.
 
 Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `tbsv`, `tpsv`, `copy`,
 `asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
 is wrong with the measurement rather than right with the library.
+
+`syrk`, `syr2k`, `hemm` and the rest of Level-3 inherit nothing for a structural reason worth knowing:
+they reach `_gemm_core!` **directly**, which sits *below* the split point. Threading them is Phase 4 of
+the plan and is not started.
 
 `trsm` is also flat, but for a different reason: it wraps its body in an arena scope, and a threaded
 `gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
@@ -73,12 +82,15 @@ are supposed to be flat.
 
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
-![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
-![BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l2.svg)
-![Complex BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl1.svg)
-![Complex BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl2.svg)
-![Complex BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_cl3.svg)
-![Complex LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_clapack.svg)
+
+Only Level-3 and LAPACK are plotted, because they are the only groups anything threads. Level-1 and
+Level-2 have no splitter, and complex and dual cannot reach one — so their panels would be flat lines
+by construction rather than by measurement.
+
+Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
+`syrk`, `syr2k`, `trsm`, `trmmR` and `potrf` sit on 1.00 next to `gemm` climbing to ~5×. They reach
+`_gemm_core!` *below* the split point, or refuse to thread inside an arena scope. Seeing them flat in
+the same picture is what shows the measurement discriminates rather than flattering everything.
 
 Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
 `perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.
@@ -100,14 +112,13 @@ Best speedup per operation, six threads against one, on each box.
 | LP `syev` | 1.08× @2048 | 1.09× @2048 | 1.16× @1000 |
 | LP `getrs` | 1.00× @100 | 1.00× @8 | 1.13× @1000 |
 | LP `trtri` | 1.12× @2048 | 1.00× @32 | 1.00× @32 |
-| CL2 `ztrmv` | 1.01× @512 | 1.02× @512 | 1.07× @100 |
-| CLP `zheev` | 1.03× @2048 | 1.02× @1000 | 1.05× @2048 |
+| LP `getri` | 1.05× @2048 | 1.00× @32 | 1.01× @8 |
 
 ### Zen3 · AVX2
 
 Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
 
-1104 cells, 0 off-lock, 887 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
 **Where threading pays.** Best cell per operation:
 
@@ -123,6 +134,7 @@ Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Proces
 | LP `potri` | **1.16×** | 2048 | 4% |
 | LP `trtri` | **1.12×** | 2048 | 5% |
 | LP `syev` | **1.08×** | 2048 | 3% |
+| LP `getri` | **1.05×** | 2048 | 2% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
@@ -138,7 +150,7 @@ Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Proces
 
 Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 2813 MHz with boost off.
 
-1104 cells, 0 off-lock, 893 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
 **Where threading pays.** Best cell per operation:
 
@@ -160,7 +172,6 @@ Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M
 | LP `gesvd` | 256 | **0.79×** | 9% |
 | LP `pstrfU` | 4096 | **0.90×** | 13% |
 | LP `gelsd` | 1000 | **0.90×** | 12% |
-| CL2 `zhemv` | 2100 | **0.93×** | 24% |
 | LP `gesvd` | 1024 | **0.94×** | 26% |
 | LP `getrs` | 2048 | **0.94×** | 5% |
 
@@ -168,7 +179,7 @@ Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M
 
 Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
-1104 cells, 0 off-lock, 883 flat within 5% of 1.00, 167 with no `pb_mt` arm.
+1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
 **Where threading pays.** Best cell per operation:
 
@@ -183,17 +194,13 @@ Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840
 | LP `gelsd` | **1.17×** | 1000 | 1% |
 | LP `syev` | **1.16×** | 1000 | 0% |
 | LP `getrs` | **1.13×** | 1000 | 3% |
-| CL2 `ztrmv` | **1.07×** | 100 | 38% |
-| CLP `zheev` | **1.05×** | 2048 | 0% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
 | LP `gesvd` | 512 | **0.70×** | 88% |
-| CL1 `zdotc` | 1000000 | **0.88×** | 38% |
 | LP `gesvd` | 256 | **0.92×** | 28% |
-| CL1 `zscal` | 1000000 | **0.95×** | 59% |
 
 ## Open: `gesvd` gets slower with threads
 
