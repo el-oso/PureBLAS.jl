@@ -3184,8 +3184,29 @@ end
     return C
 end
 
-@inline function _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool) where {T}
+# `nroute` — THE COLUMN COUNT THE ROUTE IS CHOSEN FROM, which is not always the column count computed.
+#
+# A worker computes a column slice of C, so its own `n` is the slice width. Every size-keyed predicate
+# below reads `n`, so a narrow slice can take a different route than the whole problem: `_use_unpacked`
+# is keyed on `max(m, n, k)`, and the unpacked and blocked routes do not agree bit for bit — one folds α
+# into the pack and pre-scales C by β, the other stores `fma(β, C, α·acc)`, and the blocked route
+# accumulates per `kc` block where the unpacked one keeps a single k-long chain. Measured, Strassen
+# forced off, m=k=256 n=2048 against six workers: 486012 elements differ at α=2.5, 465613 at k=400,
+# 14200 at β=-0.3, and 0 at α=1, β=0, k=256 — the one case where the two routes coincide.
+#
+# So a partitioned call passes the FULL problem's column count here and computes on its slice. The
+# route is then a function of the whole problem and the worker count cannot change it.
+#
+# Strassen is NOT covered by this: its recursion halves `n`, so choosing a depth from the full width and
+# running it on a slice computes the wrong thing. A partitioned caller passes `strassen=false` and takes
+# the classical route; reproducible threaded Strassen needs each worker to run the identical recursion
+# over its own closed column group, which this parameter cannot express.
+@inline function _gemm_core!(
+        C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
+        nroute::Int = -1, strassen::Bool = true
+    ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
+    nrt = nroute < 0 ? n : nroute
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
     # quick-return already; the tiny, Strassen and 3M routes did NOT, and would compute the product
@@ -3199,10 +3220,10 @@ end
         return _gemm_scale_only!(C, m, n, beta)   # @noinline: keep `_gemm_core!`'s inlined body small
     end
     if T <: BlasReal && _strided1(C)
-        if max(m, n, k) <= _GEMM_TINY && !cA && !cB
+        if max(m, nrt, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
-        if _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
+        if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, nrt, k) > 0
             if !tB
                 return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
             elseif T === Float64
@@ -3238,7 +3259,7 @@ end
                 return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
             end
         end
-        if _strided1(A) && _strided1(B) && _use_unpacked(m, n, k)
+        if _strided1(A) && _strided1(B) && _use_unpacked(m, nrt, k)
             # NORMALIZE the container types here (see `_pm`/`_root` in ptrmat.jl). Every operand is
             # already known `_strided1` on this branch, so the conversion is information-preserving —
             # `_strided1(::PtrMatrix)` is `true` and nothing downstream consumes anything but
@@ -3592,7 +3613,13 @@ end
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
     Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
-    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB)
+    # ROUTE FROM THE WHOLE PROBLEM, COMPUTE ON THE SLICE. `p.n` is the full column count; `len` is this
+    # worker's share. Passing `p.n` keeps every size-keyed predicate answering what it answers serially,
+    # so the worker count cannot change which route runs and therefore cannot change the result. See the
+    # `nroute` note on `_gemm_core!`. Strassen is declined here because its recursion halves the column
+    # count and a slice is not a closed column group; a partitioned Strassen has to run the identical
+    # recursion per worker, which this call cannot express.
+    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB, p.n, false)
     return nothing
 end
 
