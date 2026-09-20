@@ -83,12 +83,14 @@ end
 # Register-blocked microkernel for a FULL mr×nr tile. @generated so the mr/nr fan-out is
 # straight-line (literal indices — never index a tuple with a runtime var; that boxes/allocates).
 # The k loop stays a runtime loop; its body is fully unrolled over (MR vectors)×(NR cols).
-@generated function _microkernel!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
-    ) where {T, MR, NR, B0}
+# Body of both `_microkernel!` arities. `SC` emits the scaled store, which multiplies the panel
+# accumulator by α in the same form `_microkernel_u!` uses. The form is load-bearing, not cosmetic:
+# a separate multiply and add in place of the fused one rounds differently, so a scaled multi-pack
+# tile would stop agreeing bit for bit with a unified tile computing the same product.
+function _mk_full_body(::Type{T}, MR::Int, NR::Int, B0::Bool, SC::Bool) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    SC && push!(body.args, :(av = $V(alpha)))
     # prefetch the C output tile (NR columns) so the cold read-modify-write at the end overlaps the
     # k-loop — matters at large n where C doesn't fit cache.
     for j in 1:NR
@@ -122,7 +124,8 @@ end
         push!(body.args, :(colp = C + $(j - 1) * ldc * $sz))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
-            st = B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q))
+            st = SC ? (B0 ? :(vstore(av * $cs, q)) : :(vstore(muladd(av, $cs, vload($V, q)), q))) :
+                (B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q)))
             push!(
                 body.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -136,17 +139,29 @@ end
     return body
 end
 
+@generated function _microkernel!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
+    ) where {T, MR, NR, B0}
+    _mk_full_body(T, MR, NR, B0, false)
+end
+
+@generated function _microkernel!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
+        ::Val{MR}, ::Val{NR}, ::Val{B0}
+    ) where {T, MR, NR, B0}
+    _mk_full_body(T, MR, NR, B0, true)
+end
+
 # Clip kernel: a W-aligned partial row-tile (mre = VR·W < mr) reads the SAME mr-strided packed panel
 # (PMR = _MR vectors per k-step) but computes/stores only the VR live row-vectors — clean, no mask, no
 # wasted trailing-vector FMA. Closes the misaligned-m penalty (measured: aligned m ≈ 1.14× OB, m=32 with
 # an 8-row=2·W remainder ≈ 0.97; the masked kernel computed _MR vectors to use VR and paid masked stores).
 # Only for full columns (nre==nr); a column remainder still routes to the masked kernel.
-@generated function _microkernel_clip!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{PMR}, ::Val{VR}, ::Val{NR}, ::Val{B0} = Val(false)
-    ) where {T, PMR, VR, NR, B0}
+function _mk_clip_body(::Type{T}, PMR::Int, VR::Int, NR::Int, B0::Bool, SC::Bool) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    SC && push!(body.args, :(av = $V(alpha)))
     for j in 1:NR
         push!(body.args, :(_prefetch(C + $(j - 1) * ldc * $sz)))
     end
@@ -175,7 +190,8 @@ end
         push!(body.args, :(colp = C + $(j - 1) * ldc * $sz))
         for mi in 1:VR
             cs = Symbol(:c, mi, :_, j)
-            st = B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q))
+            st = SC ? (B0 ? :(vstore(av * $cs, q)) : :(vstore(muladd(av, $cs, vload($V, q)), q))) :
+                (B0 ? :(vstore($cs, q)) : :(vstore(vload($V, q) + $cs, q)))
             push!(
                 body.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -189,17 +205,29 @@ end
     return body
 end
 
+@generated function _microkernel_clip!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        ::Val{PMR}, ::Val{VR}, ::Val{NR}, ::Val{B0} = Val(false)
+    ) where {T, PMR, VR, NR, B0}
+    _mk_clip_body(T, PMR, VR, NR, B0, false)
+end
+
+@generated function _microkernel_clip!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
+        ::Val{PMR}, ::Val{VR}, ::Val{NR}, ::Val{B0}
+    ) where {T, PMR, VR, NR, B0}
+    _mk_clip_body(T, PMR, VR, NR, B0, true)
+end
+
 # Vectorized edge kernel for partial blocked tiles. The packed panels are zero-padded to mr×nr, so
 # the FULL MR×NR compute is correct (padded rows/cols give zero accumulators); we only mask the
 # accumulating store — rows via a SIMD mask (mre), columns via a guard (nre). Same register blocking
 # as the full kernel; far faster than the old scalar fallback (which tanked non-multiple sizes,
 # e.g. n=100 was 0.40× OpenBLAS).
-@generated function _microkernel_masked!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
-    ) where {T, MR, NR, B0}
+function _mk_masked_body(::Type{T}, MR::Int, NR::Int, B0::Bool, SC::Bool) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    SC && push!(body.args, :(av = $V(alpha)))
     lanetuple = Expr(:tuple, (0:(W - 1))...)
     push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
     for mi in 1:MR
@@ -231,7 +259,9 @@ end
         push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j); mk = Symbol(:msk, mi)
-            st = B0 ? :(vstore($cs, q, $mk)) : :(vstore(vload($V, q, $mk) + $cs, q, $mk))
+            st = SC ?
+                (B0 ? :(vstore(av * $cs, q, $mk)) : :(vstore(muladd(av, $cs, vload($V, q, $mk)), q, $mk))) :
+                (B0 ? :(vstore($cs, q, $mk)) : :(vstore(vload($V, q, $mk) + $cs, q, $mk)))
             push!(
                 stores.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -250,6 +280,20 @@ end
     end
     push!(body.args, :(return nothing))
     return body
+end
+
+@generated function _microkernel_masked!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
+    ) where {T, MR, NR, B0}
+    _mk_masked_body(T, MR, NR, B0, false)
+end
+
+@generated function _microkernel_masked!(
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
+        mre::Int, nre::Int, ::Val{MR}, ::Val{NR}, ::Val{B0}
+    ) where {T, MR, NR, B0}
+    _mk_masked_body(T, MR, NR, B0, true)
 end
 
 # SIMD pack for tA='N', dense unit-column-stride A: each full mr-row panel column is a contiguous
@@ -3459,6 +3503,8 @@ end
 # a cache size, a vector width or a µarch could change them, and a Preference over them would be
 # meaningless. Same class as a sentinel.
 const _MT_KIND_GEMM = 0
+# PDM: Exempt — job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only,
+# so one comment above a pair leaves the second listed as Unaudited in the knob registry.)
 const _MT_KIND_SYRK = 1
 
 """
@@ -3469,8 +3515,13 @@ Workers for a triangular rank-k update, or `1` for serial. Same amortisation flo
 full `2·n·n·k`. Using gemm's count would admit calls at half the real work and pay a join the work
 cannot cover.
 
-Capped by `cld(n, _NR)` for the same reason as gemm: a worker that cannot be given a whole `_NR`-wide
-column block runs a ragged microkernel, which costs more than the thread saves.
+Capped by `cld(n, _NR)`, but note what that cap does and does not buy. For gemm's EQUAL-width split it
+guarantees every worker gets a whole `_NR` block. For the flop-balanced triangular split it does NOT:
+the chunks are deliberately unequal, so at `nw = cld(n, _NR)` a quarter of them come out zero-length
+(measured exhaustively, n ∈ 1:1200 × nw ∈ 1:64). Zero-length chunks skip correctly, so the only cost
+is an idle worker — and within the range this admission actually allows (`nw ≤ 6` here) it is 0.3% of
+chunks, all at n < 50, below any `k` the flop floor lets through. Left as-is deliberately; tightening
+the cap would trade a rare idle worker for narrower chunks everywhere.
 """
 @inline function _syrk_workers(n::Int, k::Int)
     nt = _MT_NTHREADS[]
@@ -3565,12 +3616,14 @@ end
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T}, alpha::T, tA::Bool, up::Bool, sym2::Bool
     ) where {T}
     k = tA ? A.m : A.n
-    if sym2 && _unified_ok(T)                      # same kernel choice as the chunk — see `_syrk_run_chunk`
+    # Matches THE CHUNK, not the serial entry — a lost-claim caller must compute what the threaded
+    # path would have, or the same call returns different last bits depending on who won a race. See
+    # the kernel-choice note in `_syrk_run_chunk` for why the chunk does not use the serial kernel.
+    if sym2
         _trgemm_packed2_u!(up, alpha, A, tA, B, tA, C, k)
         return nothing
     end
-    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, B, !tA, C, k)
-    sym2 && _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, B, tA, A, !tA, C, k)
+    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
     return nothing
 end
 
@@ -3584,11 +3637,34 @@ end
     X = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.n, p.tA ? p.n : p.k, p.lda)
     Y = PtrMatrix{T}(p.Bp, p.tA ? p.k : p.n, p.tA ? p.n : p.k, p.ldb)
     C = PtrMatrix{T}(p.Cp, p.n, p.n, p.ldc)
-    # WHICH KERNEL: exactly the one the SERIAL path would pick for this call, or the threaded and
-    # serial answers diverge. `_unified_ok` selects the fused two-product kernel — one pass, each C
-    # tile written once — and on this fleet it is TRUE for Float64, so it is the live route, not a
-    # fallback. The 2-pass route below is reached only where the fused one is unavailable.
-    if p.sym2 && _unified_ok(T)
+    # ── WHICH KERNEL, AND WHY IT IS DELIBERATELY NOT THE SERIAL ONE ───────────────────────────────
+    # For syrk the serial entry picks `_trgemm_packed_u!` when `_syrk_use_unified` (true for Float64 on
+    # AVX-512); this chunk picks `_trgemm_packed!` instead. That is a MEASURED choice, not an
+    # oversight, and an earlier comment here wrongly claimed the two matched.
+    #
+    # The unified kernel packs A FULL-HEIGHT for every column block. Serially that is one pass and it
+    # wins by 3-12%. Split six ways, each worker repacks the whole of A for each of its blocks, and the
+    # redundancy swamps the gain. Both kernels measured on the same box, same operands, 6 threads:
+    #
+    #        n     serial    threaded multi-pack    threaded unified
+    #     1024    6.99 ms            2.00 ms             2.76 ms
+    #     2048   56.1  ms           14.19 ms            17.92 ms
+    #     4096  444    ms           98.96 ms           112.01 ms
+    #
+    # So the kernel that is SLOWER serially is faster threaded, by 11-38%. Absolute time is what the
+    # caller gets, so the chunk keeps the multi-pack kernel.
+    #
+    # Running a different kernel here does NOT change the result. Both kernels pack unscaled and
+    # apply α at the store in the same form, so a chunk and the serial entry agree bit for bit at
+    # every α — which requirement 11 requires and `test/gemm_tests.jl` asserts with `===`, not a
+    # tolerance. Folding α into the pack instead computes Σ(α·a)·b against the store form's
+    # Σ α·(a·b), and those differ for any α that is not ±2ʲ; that is why the pack here is unscaled
+    # even though scaling A is the cheaper place to do it.
+    #
+    # If the pack redundancy is ever fixed (a shared cooperative pack — the gemm pool wants it too),
+    # re-measure this table: the unified kernel would then win on both counts and this comment is the
+    # trigger to switch.
+    if p.sym2
         _trgemm_packed2_u!(p.up, p.alpha, X, p.tA, Y, p.tA, C, p.k, j0, j0 + len)
         return nothing
     end
