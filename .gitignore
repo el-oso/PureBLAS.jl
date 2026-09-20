@@ -48,3 +48,7 @@ bench/probes/*.bak
 # EXCEPTION: cited as evidence from a src/ comment (src/blas3/gemm.jl), so it is documentation, not a
 # disposable probe. A probe referenced from shipped source must stay tracked or the comment dangles.
 !bench/probes/zgemm32_k_scaling.jl
+
+# local build output and scratch logs
+bench/tools/build/
+scratchpad/
