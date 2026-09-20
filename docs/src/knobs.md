@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 147 of them.
+Every `@load_preference` key in `src/` — 146 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 147 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 70 Derived · 10 Measured · 51 Literal · 16 Exempt.
-**Default form** (mechanical): 64 formula · 22 delegates · 5 sibling · 47 literal · 5 flag · 4 other.
+**Tier:** 69 Derived · 10 Measured · 51 Literal · 16 Exempt.
+**Default form** (mechanical): 63 formula · 22 delegates · 5 sibling · 47 literal · 5 flag · 4 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -99,7 +99,6 @@ Every `@load_preference` key in `src/` — 147 of them.
 | `ctrsm_rec_l` | literal | Literal | recursion cut for complex trsm side-L; per-box. | candidate |
 | `gemmtrsm_mr` | formula | Derived | formula over detected consts: `min(8, (_GT_NREG - _GT_NRV - 2) ÷ _GT_NRV` | — |
 | `gemmtrsm_nrv` | formula | Derived | formula over detected consts: `_GT_NREG >= 32 ? 3 : 2` | — |
-| `symm_pack_cut` | formula | Derived | formula over detected consts: `_at_symm_mat_max(_HW)` | — |
 | `syr2k_2pass` | formula | Literal | AVX2-ONLY by construction: the default is typemax(Int) on AVX-512, which disables the branch. Zen3-only evidence is COMPLETE. | n/a off AVX2 |
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |

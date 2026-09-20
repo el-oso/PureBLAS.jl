@@ -47,3 +47,24 @@ blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:Threads.@spawn _gemm_pool_worker(p, i)
 blas3/gemm.jl:(@atomic p.done) < nw - 1 && yield()
 blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
+
+# --- 2026-09-20, cooperative barriers. `_pool_barrier` yields, and it is reached from INSIDE a chunk
+#              body — the one place the note above says never yields. The remedy that note prescribes
+#              was applied rather than skipped: every buffer live across the barrier moved off the
+#              per-thread owner.
+#                * `gpackA`/`gpackB` → `_gpackws`, per TASK (workspace.jl). Cooperative A-packing
+#                  meets the other workers while the packed B panel is live; a per-thread buffer
+#                  could be taken by a task landing on that thread during the yield. The direct-B
+#                  route never touches `gpackB`, so the measured sizes did not expose it; a
+#                  transposed B would have.
+#              The shared A-pack buffer the barrier exists to share is shared ON PURPOSE: its blocks
+#              are written by disjoint workers and read only after the barrier.
+#
+#              WHY THE YIELD IS NOT OPTIONAL: a barrier has to block, and every blocking primitive
+#              yields. A bare spin deadlocks when a worker has not been scheduled yet — the same
+#              failure the driver's join entry above records at 399% CPU.
+#
+#              `test/perthread_lint.jl` is what actually adjudicates this: it reads the ownership
+#              rather than the text, and it passes. Revert any owner above to per-thread and that
+#              check fails even though this line stays baselined.
+blas3/gemm.jl:GC.safepoint(); Base.yield()

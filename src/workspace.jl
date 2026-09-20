@@ -68,8 +68,10 @@ const _L3_NB = @load_preference("l3_nb", clamp(_round_dn(isqrt(_L2_BYTES ÷ 32),
 const _STEIN_SEED0 = 0x2545f4914f6cdd1d
 
 mutable struct L3Workspace{T}
-    gpackA::Vector{T}     # _gemm_scratch:      packed A panel
-    gpackB::Vector{T}     # _gemm_scratch:      packed B panel
+    # `gpackA`/`gpackB` WERE HERE and are now `_gpackws`, a per-TASK owner: cooperative A-packing
+    # meets the other workers at a barrier while the packed B panel is live, and a per-thread buffer
+    # can be taken by a task that lands on the thread during that yield. Removed rather than left
+    # dead so nobody re-points an accessor at a per-thread copy — same reasoning as `m3` below.
     cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
     # `m3` WAS HERE and is now `_m3ws`, a per-TASK owner — it is the one role held across a threaded
@@ -87,8 +89,6 @@ end
 # the stage-1 conversion mis-aligned it by two — shipping `BoundsError: 0×0 Matrix at [1:6,1:6]`.
 # The tags are the guard rail: they must read in the same order as the struct above.
 L3Workspace{T}() where {T} = L3Workspace{T}(
-    T[],                                         # gpackA
-    T[],                                         # gpackB
     (T[], T[], T[], T[]),                        # cg
     (T[], T[], T[], T[]),                        # s2
     Vector{T}[],                                 # str
@@ -212,11 +212,30 @@ function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
 end
 
 
+# PER-TASK, NOT PER-THREAD, and this moved for the same reason `m3` did.
+#
+# A chunk body used to hold these without ever yielding, which is what made a per-thread owner sound
+# (`test/yield_lint.jl` states that invariant). Cooperative A-packing breaks it: the worker meets the
+# others at a barrier, which yields, while `gpackB` holds this `pc` panel's packed B. A task landing
+# on that thread meanwhile — a serial `gemm!` that lost the pool claim — would write the same buffer
+# and corrupt the worker's panel. The direct-B route leaves `gpackB` untouched, so the sizes measured
+# so far never exposed it; a transposed B would.
+#
+# The yield lint's own closing instruction is to switch the owner rather than baseline the yield, and
+# `_m3ws` above is the precedent: one role, split out of the shared struct, per task. ~13 ns more per
+# lookup, and the lookup is once per `_gemm_blocked!` call against milliseconds of kernel.
+const _GPK_F64 = Base.OncePerTask{NTuple{2, Vector{Float64}}}(() -> (Float64[], Float64[]))
+const _GPK_F32 = Base.OncePerTask{NTuple{2, Vector{Float32}}}(() -> (Float32[], Float32[]))
+const _GPK_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
+@noinline _gpackws(::Type{Float64}) = _GPK_F64()
+@noinline _gpackws(::Type{Float32}) = _GPK_F32()
+@noinline _gpackws(::Type{T}) where {T} = get!(() -> (T[], T[]), _GPK_OTHER(), T)::NTuple{2, Vector{T}}
+
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
-    ws = _l3ws(T)
-    _ws_grow!(ws.gpackA, lenA)                    # through the one growth point, so ONE barrier covers it
-    _ws_grow!(ws.gpackB, lenB)
-    return ws.gpackA, ws.gpackB
+    gA, gB = _gpackws(T)
+    _ws_grow!(gA, lenA)                           # through the one growth point, so ONE barrier covers it
+    _ws_grow!(gB, lenB)
+    return gA, gB
 end
 
 function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
@@ -272,6 +291,27 @@ end
 # reason `PtrMatrix`'s own header calls `GC.@preserve parent(A)` a safe no-op. What DOES matter is that
 # no live handle is invalidated by a later grow: each level fits all ten of its slots before using any,
 # and deeper levels take disjoint slot indices.
+
+# ── SHARED blocked-gemm A pack ─────────────────────────────────────────────────────────────────────
+# The packed A block depends on `(ic, pc)` and NOT on which columns of C a worker owns, so a
+# column-split threaded gemm has every worker pack the whole of A — six times the work, once per
+# worker. Measured on Zen4 at n=1024 by stubbing `_pack_A!`: 0.91 ms of the 2.98 ms that threaded
+# classical gemm loses against perfect scaling, and 4.16 ms of 18.54 ms at n=2048.
+#
+# Here the `ic` blocks of one `pc` panel are dealt out across the workers, written into ONE buffer,
+# and read by everyone after a barrier. A PROCESS GLOBAL IS SOUND for it: the gemm pool admits one job
+# at a time (`p.busy`), the driver sizes the buffer inside that claim, and workers only ever write
+# blocks they own.
+const _GPKSH_F64 = Base.OncePerProcess{Vector{Vector{Float64}}}(() -> Vector{Float64}[])
+const _GPKSH_F32 = Base.OncePerProcess{Vector{Vector{Float32}}}(() -> Vector{Float32}[])
+@inline _gpack_shared_pool(::Type{Float64}) = _GPKSH_F64()
+@inline _gpack_shared_pool(::Type{Float32}) = _GPKSH_F32()
+
+# One flat slot holding `nblk` packed blocks of `blk` elements each.
+@inline function _gpack_shared(::Type{Tr}, nblk::Int, blk::Int) where {Tr}
+    return _ws_slot!(_gpack_shared_pool(Tr), 1, nblk * blk)
+end
+
 function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
     p = _l3ws(Tr).str
     return _str_fit!(p, 1, mp, kp), _str_fit!(p, 2, kp, np), _str_fit!(p, 3, mp, np)

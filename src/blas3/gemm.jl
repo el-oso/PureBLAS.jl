@@ -379,7 +379,11 @@ end
 # (op(A) rows), W contraction-rows at a time, transpose the W×W register block, and store the transposed
 # rows into Ap. Partial panels / contraction tail stay scalar (zero-padded).
 @inline function _pack_A_simd_T!(
-        Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int,
+        # `AbstractVector`, matching `_pack_A_simd!` above. A concrete `Vector` here excluded the
+        # contiguous `view` that cooperative packing hands each worker for its own block, which showed
+        # up as a MethodError inside a worker — and only on the transposed path, since the untransposed
+        # pack was already wide enough to take it.
+        Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int,
         kce::Int, alpha::T, mr::Int
     ) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2)
@@ -731,19 +735,51 @@ end
 function _blocked_pc_sweep!(
         ::Val{B0}, ::Val{DB}, Cp0::Ptr{T}, App::Ptr{T}, Bpp::Ptr{T}, Bp0::Ptr{T},
         Ap, A, jc::Int, pc::Int, m::Int, nce::Int, kce::Int, mc::Int, mr::Int, nr::Int, W::Int,
-        ldc::Int, ldb::Int, sz::Int, tA::Bool, alpha::T
+        ldc::Int, ldb::Int, sz::Int, tA::Bool, alpha::T, kcmax::Int = 0, nw::Int = 1, wi::Int = 1
     ) where {T, B0, DB}
+    # COOPERATIVE A-PACK. A packed block is a function of `(ic, pc)` and of nothing else — not of the
+    # columns of C a worker owns — so a column-split threaded gemm has every worker pack all of A.
+    # Measured by stubbing `_pack_A!`: 0.91 ms of the 2.98 ms that threaded classical gemm loses
+    # against perfect scaling at n=1024, and 4.16 ms of 18.54 ms at n=2048.
+    #
+    # So deal the `ic` blocks of this `pc` panel out across the workers, into one shared buffer, and
+    # meet once before anyone reads it. Every worker then sweeps its own columns over ALL blocks.
+    # Lock-step is free here: each worker's `jc` loop runs exactly once (its `nc` is capped at its own
+    # slice width), so they already walk the same `(pc, ic)` sequence and arrive at the same barriers.
+    #
+    # The shared slot hangs off a `const` pool and is therefore permanently reachable, the same reason
+    # `_str_fit!`'s handles need no `GC.@preserve`.
+    # STRIDE FROM THE MAX k-BLOCK, not this panel's. The transposed pack writes whole vectors and
+    # runs past the logical end of a short final panel — harmless in the old oversized private buffer,
+    # out of bounds in an exactly-sized view, which is why only `tA=T` failed. Matches `_gpack_prefit!`.
+    blk = cld(mc, mr) * mr * max(kcmax, kce)
+    nblk = cld(m, mc)
+    coop = nw > 1
+    shp = App
+    if coop
+        sh = _gpack_shared(T, nblk, blk)
+        b = wi - 1
+        while b < nblk
+            icb = b * mc
+            _pack_A!(view(sh, (b * blk + 1):((b + 1) * blk)), A, icb, pc, min(mc, m - icb), kce, tA, alpha, mr)
+            b += nw
+        end
+        _pool_barrier(_gemm_pool(T), nw) || return nothing
+        shp = pointer(sh)
+    end
     ic = 0
+    blkno = 0
     while ic < m
         mce = min(mc, m - ic)
-        _pack_A!(Ap, A, ic, pc, mce, kce, tA, alpha, mr)
+        Apb = coop ? shp + blkno * blk * sz : App
+        coop || _pack_A!(Ap, A, ic, pc, mce, kce, tA, alpha, mr)
         jr = 0
         while jr < nce
             nre = min(nr, nce - jr)
             ir = 0
             while ir < mce
                 mre = min(mr, mce - ir)
-                Apanel = App + (div(ir, mr) * mr * kce) * sz
+                Apanel = Apb + (div(ir, mr) * mr * kce) * sz
                 Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
                 if DB
                     Bc = Bp0 + (pc + (jc + jr) * ldb) * sz   # B[pc, jc+jr]
@@ -812,15 +848,33 @@ function _blocked_pc_sweep!(
             end
             jr += nr
         end
-        ic += mc
+        ic += mc; blkno += 1
     end
+    # MEET BEFORE LEAVING. The shared buffer is reused by the NEXT `pc` panel, and without this a
+    # worker that finished its columns starts packing panel p+1 over data another worker is still
+    # multiplying against. Measured as a WRONG ANSWER, not a rounding difference: threaded against
+    # serial at m=n=k=512 differed by 90.6 absolute, at 1024 by 177.8.
+    coop && _pool_barrier(_gemm_pool(T), nw)
     return nothing
 end
 
 # Blocked real GEMM (the optimized path). C must have unit column stride (pointer + vstore).
+# Size the shared A-pack slot, with the SAME `mc`/`kc` formulas `_gemm_blocked!` uses three lines
+# below — if those drift apart a worker writes past its block. The driver calls this inside the pool
+# claim: `_ws_slot!` grows the pool vector, and growing it from a worker is a race on the vector.
+@inline function _gpack_prefit!(::Type{T}, m::Int, k::Int) where {T <: BlasReal}
+    W = _vwidth(T); mr = _MR * W
+    kc = min(_KC, k)
+    mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
+    _gpack_shared(T, cld(m, mc), cld(mc, mr) * mr * kc)
+    return nothing
+end
+
+# `nw`/`wi` say which of a threaded call's workers this is, so the `ic` blocks of each `pc` panel can
+# be dealt out across them instead of every worker packing all of A. Both default to the serial call.
 function _gemm_blocked!(
         tA::Bool, tB::Bool, m::Int, n::Int, k::Int,
-        alpha::T, A, B, beta::T, C
+        alpha::T, A, B, beta::T, C, nw::Int = 1, wi::Int = 1
     ) where {T <: BlasReal}
     if iszero(alpha) || k == 0
         _scale_C!(C, m, n, beta)   # nothing to accumulate ⇒ C := βC (or 0)
@@ -851,24 +905,24 @@ function _gemm_blocked!(
                     if b0
                         _blocked_pc_sweep!(
                             Val(true), Val(true), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
-                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha, kc, nw, wi
                         )
                     else
                         _blocked_pc_sweep!(
                             Val(false), Val(true), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
-                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha, kc, nw, wi
                         )
                     end
                 else
                     if b0
                         _blocked_pc_sweep!(
                             Val(true), Val(false), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
-                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha, kc, nw, wi
                         )
                     else
                         _blocked_pc_sweep!(
                             Val(false), Val(false), Cp0, App, Bpp, Bp0, Ap, A, jc, pc,
-                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha
+                            m, nce, kce, mc, mr, nr, W, ldc, ldb, sz, tA, alpha, kc, nw, wi
                         )
                     end
                 end
@@ -1701,6 +1755,17 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 # req8-ok: fleet table above, two boxes, paired instrument, one -0.6% cell accepted against +2.1/+3.8%
 const _STRASSEN_BASE = @load_preference("strassen_base", 192)::Int
 @inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
+# Will this call be served by the Strassen recursion? Asked by every site that would otherwise column-
+# split above `_gemm_core!`, so that no such site has to spell the conditions itself — a split site
+# with its own copy is how a threaded path silently starts running a different algorithm than the
+# serial one.
+#
+# `tB` is deliberately absent: the transB route materializes Bᵀ and runs the SAME recursion, so it
+# owns the call just as the NN route does. What it costs to be wrong here is not a slowdown but a
+# thread-count-dependent answer, so the predicate errs toward claiming the call.
+@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B) where {T} =
+    T <: BlasReal && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
+
 @inline function _strassen_depth(m::Int, n::Int, k::Int)
     d = 0; s = min(m, n, k)
     # `d == 0 ||` keeps level 1 on the original criterion, so every n < 512 routes EXACTLY as before —
@@ -2778,11 +2843,16 @@ end
 # Matrix×PtrMatrix combinations alive and collect roughly half the specialization collapse.
 # `_strassen_rec!`'s broadcast combines (`@. TA = A21 + A22`) keep operating on plain `Matrix` — this
 # converts only at the driver call, so that codegen and its large-n gate behaviour are untouched.
-@inline function _gemm_real_dims!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::T, beta::T, A, B, C) where {T}
+# `nroute` is the column count the route is chosen from, for a caller computing a slice of a wider
+# problem; see the note on `_gemm_core!`. Default `-1` means "my own `n`", the ordinary case.
+@inline function _gemm_real_dims!(
+        tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::T, beta::T, A, B, C, nroute::Int = -1
+    ) where {T}
+    nrt = nroute < 0 ? n : nroute
     if _strided1(A) && _strided1(B) && _strided1(C)
         rA = _root(A); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC begin
-            if !tA && _use_unpacked(m, n, k)
+            if !tA && _use_unpacked(m, nrt, k)
                 _gemm_unpacked!(
                     tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
                     m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C)
@@ -2791,7 +2861,7 @@ end
                 _gemm_blocked!(tA, tB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
             end
         end
-    elseif !tA && _use_unpacked(m, n, k)
+    elseif !tA && _use_unpacked(m, nrt, k)
         _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C)
     else
         _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)   # blocked also covers the transpose case
@@ -3197,13 +3267,23 @@ end
 # So a partitioned call passes the FULL problem's column count here and computes on its slice. The
 # route is then a function of the whole problem and the worker count cannot change it.
 #
-# Strassen is NOT covered by this: its recursion halves `n`, so choosing a depth from the full width and
-# running it on a slice computes the wrong thing. A partitioned caller passes `strassen=false` and takes
-# the classical route; reproducible threaded Strassen needs each worker to run the identical recursion
-# over its own closed column group, which this parameter cannot express.
+# `strassen` — OFF BY DEFAULT, because a CHUNK must never take that route.
+#
+# The classical column split gives every element of C its whole k chain on one worker, in an order that
+# `kc = min(_KC, k)` fixes independently of how many workers there are, so its result is bit-identical
+# at any thread count. The Strassen recursion is the one construct that breaks that: it halves `n`, so a
+# worker holding a column slice picks a different depth and computes something else entirely.
+#
+# The default is off so that the chunk body and the lost-claim fallback — the two paths a worker count
+# can reach — cannot take it by omission. Whole-problem callers pass `true` explicitly, and the sites
+# that do (`gemm!`, `_symm!`, `_trmm_split_L!`) all ask `_strassen_owns` first and decline to column-
+# split when it answers yes, so a Strassen call runs serially at every thread count.
+#
+# Strassen is NOT optional for performance: forcing it off costs gemm@4096 1.297 -> 0.949, gemm@2048
+# 1.192 -> 0.974 and symm@4096 1.211 -> 0.942, all measured against the cached reference arms.
 @inline function _gemm_core!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = true
+        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     nrt = nroute < 0 ? n : nroute
@@ -3289,7 +3369,7 @@ end
                 end
             end
         else
-            _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)
+            _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C, nw, wi)
         end
     elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _fh_cgemm_tiny()
         # `_strided1(A)/(B)` is REQUIRED, not defensive: `_split3!` honours an arbitrary COLUMN stride via
@@ -3519,6 +3599,15 @@ mutable struct GemmPool{T}
     kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK`
     up::Bool                         # syrk/syr2k: which triangle of C is written
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
+    # ── COOPERATIVE BARRIER ───────────────────────────────────────────────────────────────────────
+    # A packed A block is a function of `(ic, pc)` and not of which columns of C a worker owns, so a
+    # column-split gemm would have every worker pack the whole of A. Workers deal those blocks out
+    # among themselves into one shared buffer and meet here before any of them reads it.
+    #
+    # `bar` counts arrivals for the WHOLE job and is never reset mid-job, so the same field serves
+    # every barrier: a worker's arrival ordinal says which barrier it is in and what count releases
+    # it. See `_pool_barrier` for why the resetting form deadlocks.
+    @atomic bar::Int
 end
 # PDM: Exempt — job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about
 # a cache size, a vector width or a µarch could change them, and a Preference over them would be
@@ -3619,8 +3708,46 @@ end
     # `nroute` note on `_gemm_core!`. Strassen is declined here because its recursion halves the column
     # count and a slice is not a closed column group; a partitioned Strassen has to run the identical
     # recursion per worker, which this call cannot express.
-    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB, p.n, false)
+    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB, p.n, false, nw, i)
     return nothing
+end
+
+# Meet every other worker on this job. Returns `false` if the job has failed, so a caller unwinds
+# instead of waiting for a worker that will never arrive.
+#
+# TWO WAYS THIS HANGS, both designed out rather than tested for. A worker that took a different path
+# would arrive a different number of times: `_strassen_workers` caps the worker count at the number of
+# whole `_NR` blocks of base indices, so no worker gets an empty range and every worker walks the
+# identical recursion. And a worker that throws would leave the rest here forever: the wait watches
+# `failed`, which the worker loop sets before it stops.
+@inline function _pool_barrier(p::GemmPool{T}, nw::Int) where {T}
+    nw <= 1 && return true
+    # A MONOTONIC COUNTER, NOT A COUNTER THAT RESETS. Resetting it and then flipping a sense is the
+    # textbook shape and it deadlocks here: between the reset and the flip, a worker released from
+    # THIS barrier can reach the NEXT one and increment, and the reset then erases that arrival, so
+    # the next barrier never reaches its target. Measured as a hang on the first threaded run.
+    #
+    # Counting arrivals for the whole job instead has nothing to race. A worker's ordinal tells it
+    # which barrier it is in and what count releases that one. No worker can lap another, because
+    # none passes a barrier until every worker has arrived at it.
+    c = @atomic p.bar += 1
+    target = ((c - 1) ÷ nw + 1) * nw
+    (@atomic p.bar) >= target && return true
+    # SPIN BEFORE YIELDING, the same shape as the worker park loop. Yielding on the first miss hands
+    # the thread to the scheduler at every barrier, and there are 2·nodes of them per call — 16 at
+    # depth 2. Measured with the yield-first form: a 5.85 ms fixed per-worker cost remained after the
+    # A-side combines were split, about 270 ns per barrier per worker more than the spin form.
+    # The waits here are short by construction: every worker holds an equal row band, so the spread
+    # across arrivals is the imbalance of one elementwise pass, not of a product.
+    while (@atomic p.bar) < target
+        (@atomic p.failed) && return false
+        for _ in 1:_MT_SPINS
+            (@atomic p.bar) >= target && return true
+            Base.Threads.atomic_fence()
+        end
+        GC.safepoint(); Base.yield()
+    end
+    return true
 end
 
 # ── SYRK / SYR2K CHUNK ─────────────────────────────────────────────────────────────────────────────
@@ -3792,7 +3919,7 @@ end
         0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
-        _MT_KIND_GEMM, false, false
+        _MT_KIND_GEMM, false, false, 0
     )
     return _gemm_pool_start!(p)
 end
@@ -3904,10 +4031,18 @@ the same result, whenever the pool is already in use — see the claim below.
         if kind == _MT_KIND_SYRK
             _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
         else
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB)
+            # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
         end
         return nothing
     end
+    # SIZE THE SHARED BUFFER HERE — AFTER THE CLAIM, NOT BEFORE IT. The pool grows by
+    # `push!`/`resize!`, and doing that before winning `busy` lets two large callers race on the same
+    # vector: they collide exactly at a new high-water mark, which is when two large calls arrive
+    # together, and a loser's `resize!` can move storage the winner's workers already hold pointers
+    # into. Inside the claim only one caller is ever here, so the workers that follow do nothing but
+    # read the outer vector.
+    kind == _MT_KIND_GEMM && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
     # SIGNALS ARE DEFERRED FOR THE WHOLE THREADED BODY. The join below is the `finally` of the chunk,
     # and its `yield()` is a safepoint where a Ctrl-C on the main thread lands as an InterruptException.
     # Unwinding from there would abandon the join, release `busy`, return to the caller, and end its
@@ -3957,6 +4092,9 @@ the same result, whenever the pool is already in use — see the claim below.
         p.alpha = alpha; p.beta = beta
         p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
         p.kind = kind; p.up = up; p.sym2 = sym2
+        # A job that failed inside a barrier leaves arrivals counted. Clearing here rather than on the
+        # way out keeps the next job from releasing its first barrier early on a stale count.
+        @atomic p.bar = 0
         @atomic p.done = 0
         @atomic p.failed = false
         # ONE atomic store publishes the worker count together with the generation (see `GemmPool`)
@@ -4066,13 +4204,30 @@ function gemm!(
         nw = (T === Float64 || T === Float32) && eltype(A) === T && eltype(B) === T &&
             _strided1(A) && _strided1(B) ?
             _gemm_workers(m, n, k) : 1
-        if nw > 1
+        # A STRASSEN CALL IS NOT COLUMN-SPLIT, AND THAT IS WHAT KEEPS gemm REPRODUCIBLE.
+        #
+        # The classical split partitions n only, with `kc = min(_KC, k)` independent of worker count,
+        # so every element of C accumulates its k chain in one order at any thread count. Strassen
+        # cannot be split that way: the recursion halves n, so a worker holding a slice would choose a
+        # different depth and run a different algorithm than a serial call. Splitting it anyway — which
+        # is what passing `strassen = false` to the workers amounts to — makes the SAME call return
+        # different bits at 1 thread and at 6.
+        #
+        # So a Strassen-eligible call runs the recursion, serially, whatever the pool holds. The
+        # recursion's depth is a function of `(m, n, k)` alone, so the bits are the same at every
+        # thread count by construction.
+        #
+        # THE PRICE IS THREADED SCALING AT LARGE n, NOT THE GATE. The gate is single-threaded, and
+        # serially this is the same code that ran before. Dropping Strassen to keep the column split
+        # was measured instead and is far worse: gemm@4096 1.297 -> 0.949, gemm@2048 1.192 -> 0.974,
+        # symm@4096 1.211 -> 0.942.
+        if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B)
             rA = _root(A); rB = _root(B); rC = _root(C)
             GC.@preserve rA rB rC _gemm_threaded!(
                 _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
             )
         else
-            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C')
+            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', -1, true)
         end
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()
