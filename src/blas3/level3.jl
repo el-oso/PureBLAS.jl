@@ -4962,11 +4962,12 @@ end
 # d0=c0-r0; upper keeps local row ≤ d0+j, lower keeps row ≥ d0+j (j = 0-based column). Accumulates into
 # C, so K-accumulation across the gemm pc-loop stays correct (no temp needed).
 @generated function _microkernel_tri!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
         mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
     ) where {T, MR, NR, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    push!(body.args, :(av = $V(alpha)))
     push!(body.args, :(lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...)))))
     for mi in 1:MR, j in 1:NR
         push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V)))
@@ -4993,7 +4994,7 @@ end
         push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz)); push!(stores.args, :(thr = d0 + $(j - 1)))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
-            st = B0 ? :(vstore($cs, q, mk)) : :(vstore(vload($V, q, mk) + $cs, q, mk))
+            st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
             push!(
                 stores.args, :(
                     let base = $((mi - 1) * W), q = colp + $((mi - 1) * W * sz)
@@ -5213,7 +5214,7 @@ end
 # `Bool` — six leaves became twelve `b0 ? … : …` call sites and took that loop nest to depth 11.
 # `B0` is a type parameter here, so each case is written once and the choice costs nothing.
 @inline function _trgemm_tile!(
-        ::Val{MR}, ::Val{NR}, ::Val{B0}, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, α::T, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
         kce::Int, mre::Int, nre::Int, full::Bool, off::Int, up::Bool
     ) where {T <: BlasReal, MR, NR, B0}
     # DERIVE W from T, never take it as an `::Int` argument. `_vwidth(T)` const-folds, so `MR * W`
@@ -5222,7 +5223,7 @@ end
     # emitted 6 `idiv` when W was an argument, 0 when derived.
     W = _vwidth(T)
     if full && mre == MR * W && nre == NR
-        _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(NR), Val(B0))
+        _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(NR), Val(B0))
     elseif full && nre == NR && rem(mre, W) == 0
         # W-ALIGNED PARTIAL ROWS → CLIP, don't mask. `_microkernel_masked!` is fully vectorized but
         # masks only the STORES: it runs all MR row-vectors through the whole k-loop and retires
@@ -5255,16 +5256,16 @@ end
         # masked kernel. That is where the next attempt should go.
         vr = div(mre, W)
         if vr == 1
-            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(1), Val(NR), Val(B0))
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(1), Val(NR), Val(B0))
         elseif vr == 2
-            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(2), Val(NR), Val(B0))
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(2), Val(NR), Val(B0))
         else
-            _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+            _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, Val(MR), Val(NR), Val(B0))
         end
     elseif full
-        _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+        _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, Val(MR), Val(NR), Val(B0))
     else
-        _microkernel_tri!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, off, up, Val(MR), Val(NR), Val(B0))
+        _microkernel_tri!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, off, up, Val(MR), Val(NR), Val(B0))
     end
     return nothing
 end
@@ -5275,7 +5276,7 @@ end
 # constant for the whole panel, so the caller resolves it once and passes it as a type parameter.
 # It used to be a runtime `Bool` re-tested at every micro-tile, inside the innermost of five loops.
 function _trgemm_tiles!(
-        ::Val{MR}, ::Val{NR}, ::Val{B0}, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, α::T, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
         ldc::Int, sz::Int, ic::Int, jc::Int, mce::Int, nce::Int, kce::Int
     ) where {T <: BlasReal, MR, NR, B0}
     # See `_trgemm_tile!`: W is DERIVED, not passed, so `mr`/`nr` stay compile-time and the
@@ -5293,7 +5294,7 @@ function _trgemm_tiles!(
                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                 _trgemm_tile!(
-                    Val(MR), Val(NR), Val(B0), Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                    Val(MR), Val(NR), Val(B0), α, Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
                     kce, mre, nre, full, c0 - r0, up
                 )
             end
@@ -5340,11 +5341,15 @@ function _trgemm_packed!(
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic)
-                    _pack_A!(Ap, X, ic, pc, mce, kce, tXp, α, mr)
+                    # PACK UNSCALED, APPLY α AT THE STORE, matching `_trgemm_packed_u!`. Folding α
+                    # into the pack computes Σ(α·a)·b where the store form computes Σ α·(a·b); the
+                    # two round differently for any α that is not ±2ʲ. Both kernels serve syrk and
+                    # which one runs depends on size, ISA and thread count, so they must agree.
+                    _pack_A!(Ap, X, ic, pc, mce, kce, tXp, one(T), mr)
                     # β-mode resolved ONCE per panel, not once per micro-tile. See `_trgemm_tiles!`.
                     b0 ?
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce) :
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce)
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), α, up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce) :
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), α, up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce)
                     ic += mc
                 end
                 pc += kc
@@ -5631,8 +5636,16 @@ const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) 
 const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
+# WHICH SYRK KERNEL — the ONE place that decides, shared by the serial entry and the threaded chunk.
+# It was spelled out inline here and re-spelled in `_syrk_run_chunk`, and the two drifted: on AVX-512
+# `_unified_ok(Float64)` is true, so serial ran the unified kernel while every threaded worker ran the
+# multi-pack one — 3-12% slower, on the gate box, for nothing. Re-spelling a dispatch rule in a second
+# place is the bug; a predicate both callers ask is the fix.
+@inline _syrk_use_unified(::Type{T}, n::Int) where {T <: BlasReal} =
+    _unified_ok(T) || (_unified_layout_ok(T) && n <= _fh_syrk_unified_max())
+
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T <: BlasReal} =
-    (_unified_ok(T) || (_unified_layout_ok(T) && size(C, 1) <= _fh_syrk_unified_max())) ?
+    _syrk_use_unified(T, size(C, 1)) ?
     _trgemm_packed_u!(up, α, A, tr, C, k) :
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
 
@@ -6098,7 +6111,13 @@ end
 # Unified single-pack syrk: pack A ONCE into W-row panels; the A-operand (vector load, panel ir) and
 # the B-operand (scalar broadcast, panel jr) both read that one buffer. 8×8 tile (MR=1) so both packs'
 # layouts coincide; α applied at the store (shared buffer ⇒ can't fold α into the pack).
-function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <: BlasReal}
+# `jlo`/`jhi`: the same column-range seam the other two triangular kernels have, defaulting to the
+# whole matrix. This one matters most on AVX-512, where `_unified_ok(Float64)` is TRUE and this is the
+# kernel the SERIAL syrk actually runs — the threaded path used to call `_trgemm_packed!` instead and
+# paid 3-12% for a kernel the serial entry would never have chosen.
+function _trgemm_packed_u!(
+        up::Bool, α::T, A, tAp::Bool, C, k::Int, jlo::Int = 0, jhi::Int = size(C, 1)
+    ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -6107,9 +6126,11 @@ function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <:
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C packA begin
         Cp0 = pointer(C); PA = pointer(packA)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # Clamp to `jhi`, not `n` — otherwise a worker's last block runs a full `nc` wide and
+            # overwrites the next worker's columns. No-op unthreaded, where `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
@@ -6513,7 +6534,7 @@ function syrk!(
     # reason `gemm!` tests it — the chunk builds `PtrMatrix{T}` from `p.Ap`, so a mixed-type operand
     # would be reinterpreted rather than converted.
     T = eltype(C)
-    nw = (T === Float64 || T === Float32) && eltype(A) === T && !herk_hermitian(false) &&
+    nw = (T === Float64 || T === Float32) && eltype(A) === T &&
         _strided1(A) && _strided1(C) && size(C, 1) > _fh_syrk_pack_cut() && k > 0 ?
         _syrk_workers(size(C, 1), k) : 1
     if nw > 1
@@ -6527,9 +6548,9 @@ function syrk!(
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
     return C
 end
-# syrk is never Hermitian; herk is. Spelled as a function so the `nw` predicate above reads the same in
-# both entries and the difference is impossible to miss when editing one of them.
-@inline herk_hermitian(h::Bool) = h
+# NOTE `herk!` (the Hermitian, complex sibling) is NOT threaded and still calls `_syrk_blocked!`
+# directly. That is a gap, not an oversight: complex cannot reach a threaded kernel at all today
+# (`gemm!`'s guard is `Float64 || Float32`), so there is nothing for it to route to.
 function herk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Real = true, beta::Real = false

@@ -231,3 +231,61 @@ end
         end
     end
 end
+
+# Threaded syrk/syr2k. NONE of this phase's behaviour was reachable from `Pkg.test()` before: the
+# concurrency runs, the lost-claim fallback and the syr2k `sym2` route all lived in probes, which are
+# gitignored. Two bugs in this phase were found only by running those probes — a lost-claim caller
+# computing a full rectangular product for a syrk (87 of 96 wrong), and a syr2k gating condition that
+# was dead code so the threaded path never ran at all. Both would have shipped silently.
+#
+# ASSERTS THE WITNESS FIRST. `_syrk_workers(n, k) > 1` is checked before any comparison, because a
+# "threaded == serial" result from a call that never threaded is the exact shape of the dead-code bug.
+#
+# BITWISE, not a tolerance. Thread count must not change a single bit of the result, so the
+# comparison is on the bit patterns. A tolerance cannot enforce that: the α-placement divergence this
+# guards against is ~1e-13 relative, which any sane tolerance admits.
+#
+# The α list must contain a value that is not ±2ʲ. Scaling by a power of two is exact, so α ∈ {1, 2,
+# 0.5, -4} agree whichever kernel runs and whichever place α is applied — a test written only at
+# those values passes without exercising anything.
+@testitem "threaded syrk/syr2k: matches serial, and the pool's lost-claim path does too" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: @spawn, nthreads
+    const P = PureBLAS
+    n, k = 256, 96
+    # RAISE THE POOL BEFORE READING THE WITNESS. `_syrk_workers` reports the CONFIGURED pool size,
+    # which is 1 until `set_num_threads` raises it. Read first and it answers 1 whatever the shape,
+    # the guard below takes the skip branch, and the item reports success having run nothing.
+    nthreads() >= 2 && P.set_num_threads(nthreads())
+    if nthreads() < 2 || !(P._syrk_workers(n, k) > 1)
+        P.set_num_threads(1)
+        @test_skip "needs ≥2 julia threads and a shape the amortisation floor admits"
+    else
+        @test P._syrk_workers(n, k) > 1            # the witness: this shape really does thread
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        for up in ('L', 'U'), tr in ('N', 'T'), a in (1.0, 0.75, 2.5)
+            A = tr == 'T' ? randn(k, n) : randn(n, k)
+            B = tr == 'T' ? randn(k, n) : randn(n, k)
+            P.set_num_threads(1)
+            r1 = zeros(n, n); P.syrk!(r1, A; uplo = up, trans = tr, alpha = a)
+            r2 = zeros(n, n); P.syr2k!(r2, A, B; uplo = up, trans = tr, alpha = a)
+            P.set_num_threads(nthreads())
+            g1 = zeros(n, n); P.syrk!(g1, A; uplo = up, trans = tr, alpha = a)
+            g2 = zeros(n, n); P.syr2k!(g2, A, B; uplo = up, trans = tr, alpha = a)
+            @test bitsame(g1, r1)
+            @test bitsame(g2, r2)
+        end
+        # CONCURRENT callers: most LOSE the pool claim and take the serial fallback, which is the path
+        # that silently ran a rectangular gemm. With this many callers, losing is the common case.
+        P.set_num_threads(1)
+        As = [randn(n, k) for _ in 1:8]
+        want = [(C = zeros(n, n); P.syrk!(C, As[i]; uplo = 'L'); C) for i in 1:8]
+        P.set_num_threads(nthreads())
+        got = [zeros(n, n) for _ in 1:8]
+        foreach(wait, [@spawn P.syrk!(got[i], As[i]; uplo = 'L') for i in 1:8])
+        for i in 1:8
+            @test bitsame(got[i], want[i])
+        end
+        P.set_num_threads(1)
+    end
+end

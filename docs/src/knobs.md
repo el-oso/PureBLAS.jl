@@ -263,7 +263,7 @@ they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the a
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 4 Exempt · 2 Unaudited.
+**Tier:** 2 Measured · 31 Literal · 5 Exempt · 1 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -372,5 +372,5 @@ on these, not on knobs.
 | `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
 | `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |
 | `_MT_KIND_GEMM` | 0 | Exempt | job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about |
-| `_MT_KIND_SYRK` | 1 | Unaudited | — |
+| `_MT_KIND_SYRK` | 1 | Exempt | job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only, |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
