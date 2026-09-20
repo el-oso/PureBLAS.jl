@@ -29,12 +29,12 @@
 #     findings. Triple-quoted literals are now skipped wherever they sit; only a column-0 `"""`/`raw"""`
 #     stops attribution.
 
-# --- gemm packing: `_gemm_core!`'s gpackA/gpackB claim is `_gemm_scratch(T, m*k, 0)` in the `tA` arm of
-# `if _strided1(A) && _strided1(B) && _use_unpacked(m,n,k)` (gemm.jl:2828/2844); `_gemm_blocked!` is that
-# `if`'s ELSE arm (:2858). Never both on one path. `_gemm_blocked!` is a pack+microkernel loop, not a
-# nested claimant.
-L3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
-L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
+# --- gemm packing: these entries are GONE, and by a change of MECHANISM rather than a re-judgement.
+# `gpackA`/`gpackB` are no longer `L3Workspace` fields: cooperative A-packing meets the other workers
+# at a barrier while the packed B panel is live, so a per-thread owner could be taken by a task that
+# lands on the thread during that yield. They moved to `_gpackws`, a per-TASK owner (workspace.jl),
+# which is what `test/yield_lint.jl` prescribes instead of baselining a yielding kernel. A field-keyed
+# lint has nothing left to pair, so the pairs are not merely unused — they cannot be written.
 
 # --- 2026-09-04, stage 2 of the arena conversion: the three
 #       L3Workspace.lacn2{s,v,x}  _lacn2_estimate -> _lacn2_estimate

@@ -1259,14 +1259,27 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     h = k ÷ 2
     A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):k, (h + 1):k)
     off = up ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)     # upper→A12, lower→A21
-    Bt = view(B, 1:h, :); Bb = view(B, (h + 1):k, :); ta = tr ? 'T' : 'N'
+    Bt = view(B, 1:h, :); Bb = view(B, (h + 1):k, :)
+    o = one(T)
+    # THE ONE CALLER THAT ASKS FOR STRASSEN, and it goes through `_gemm_core!` rather than `gemm!` to
+    # do it — `gemm!`'s default is off, because a Strassen route is not thread-count reproducible and
+    # the public entry has to be (see the note on `_gemm_core!`'s `strassen`).
+    #
+    # This call site cannot break that guarantee, because it is below the threading entry and so runs
+    # serially at every thread count. What it costs is threading this one update, which trmm never had
+    # a gate number for; the column split over B that Phase 3 wants sits ABOVE this and is reproducible.
+    #
+    # It is kept because it is measured, not inherited. Zen4, recursion forced off with the split left
+    # armed: n=4096 is 10.7% slower and n=2048 2.2%, which takes trmm@4096 from 1.052 to 0.950 — a
+    # passing cell to a failing one. The gate's own gemm cells are flat under the same switch, because
+    # they allocate cold operands per sample; trmm's B is warm from the solve that just wrote it.
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        gemm!(Bt, off, Bb; transA = ta, alpha = true, beta = true)   # Bt += op(off)·Bb  (Strassen)
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true)   # Bt += op(off)·Bb
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        gemm!(Bb, off, Bt; transA = ta, alpha = true, beta = true)   # Bb += op(off)·Bt  (Strassen)
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true)   # Bb += op(off)·Bt
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -6787,45 +6800,10 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     end
     return Ad
 end
-# Symmetric A-pack for a diagonal-straddling panel (real symm). BRANCHLESS (OpenBLAS-style): per column
-# the stored/mirror split is a single crossing, so each column packs a contiguous STORED run (reads A's
-# column gp, stride 1) then a MIRROR run (reads A's row gp, stride lda) — no per-element `i≤j` branch in
-# the hot loop. Off-diagonal panels use plain _pack_A! (stored: tA=false SIMD; mirror: tA=true).
-function _pack_A_sym!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, up::Bool, alpha::T, mr::Int) where {T}
-    np = cld(mce, mr)
-    @inbounds for pi in 0:(np - 1)
-        base = pi * mr * kce; pbase = pi * mr
-        rhi = min(mr, mce - pbase)                 # valid rows r ∈ [0,rhi); r ≥ rhi → pad zero
-        for p in 0:(kce - 1)
-            gp = pc + p; o = base + p * mr; ls = gp - ic - pbase    # local diagonal crossing (in r)
-            if up                                  # stored r ∈ [0,st_end) (gi≤gp), mirror r ∈ [st_end,rhi)
-                st_end = clamp(ls + 1, 0, rhi)
-                for r in 0:(st_end - 1)
-                    Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]
-                end
-                for r in st_end:(rhi - 1)
-                    Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]
-                end
-            else                                   # stored r ∈ [st_start,rhi) (gi≥gp), mirror r ∈ [0,st_start)
-                st_start = clamp(ls, 0, rhi)
-                for r in 0:(st_start - 1)
-                    Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]
-                end
-                for r in st_start:(rhi - 1)
-                    Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]
-                end
-            end
-            for r in rhi:(mr - 1)
-                Ap[o + r + 1] = zero(T)
-            end     # pad rows beyond mce
-        end
-    end
-    return
-end
 # Complex HERMITIAN A-pack (split re/im) for a diagonal-straddling OR full-mirror panel (hemm side-L):
 # per panel-column the stored run reads A[i,gp] direct; the MIRROR run reads A[gp,i] CONJUGATED
-# (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store). Mirrors _pack_A_sym! + the
-# conj that makes it Hermitian. Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
+# (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store).
+# Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
 # `HERM` is the ONLY difference between the Hermitian and complex-symmetric packs: the mirrored half
 # takes conj(A[j,i]) for Hermitian and A[j,i] unchanged for symmetric. It is a compile-time `Val` so the
 # sign folds away rather than costing a branch per element, and so complex symm can share this path
@@ -6976,176 +6954,7 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
     end
     return C
 end
-# Symmetric B-pack for a diagonal-straddling panel (real symm side R): the symmetric matrix is the
-# gemm's RIGHT operand. Stored side reads A[gp,gj], mirror side A[gj,gp]. Off-diagonal panels use
-# plain _pack_B! (stored: tB=false; mirror: tB=true). No α here — α rides on the left operand's pack.
-function _pack_B_sym!(Bp::Vector{T}, A, pc::Int, jc::Int, kce::Int, nce::Int, up::Bool, nr::Int) where {T}
-    np = cld(nce, nr)                              # branchless (OpenBLAS-style): stored/mirror = one crossing
-    @inbounds for ji in 0:(np - 1)
-        base = ji * nr * kce; cbase = ji * nr
-        chi = min(nr, nce - cbase)                 # valid cols c ∈ [0,chi); c ≥ chi → pad zero
-        for p in 0:(kce - 1)
-            gp = pc + p; o = base + p * nr; ls = gp - jc - cbase
-            if up                                  # stored gj≥gp: c ∈ [st,chi) (A row gp, strided); mirror c<st (A col gp)
-                st = clamp(ls, 0, chi)
-                for c in 0:(st - 1)
-                    Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]
-                end
-                for c in st:(chi - 1)
-                    Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]
-                end
-            else                                   # stored gj≤gp: c ∈ [0,st) (A row gp, strided); mirror c≥st (A col gp)
-                st = clamp(ls + 1, 0, chi)
-                for c in 0:(st - 1)
-                    Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]
-                end
-                for c in st:(chi - 1)
-                    Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]
-                end
-            end
-            for c in chi:(nr - 1)
-                Bp[o + c + 1] = zero(T)
-            end
-        end
-    end
-    return
-end
 
-# Single-pass packed symm (side L, real): C := α·A_sym·B + β·C as one gemm, packing A's symmetric
-# panels directly (no n² materialize). M=n, N=m, K=n; classify each A-panel: stored / mirror / straddle.
-function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T <: BlasReal}
-    n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
-    b0first || _scale_C!(C, n, m, β)
-    ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < m
-            nce = min(nc, m - jc); pc = 0
-            while pc < n
-                kce = min(kc, n - pc)
-                _pack_B!(Bp, B, pc, jc, kce, nce, false, nr)
-                b0 = b0first && pc == 0
-                ic = 0
-                while ic < n
-                    mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
-                    stored = up ? (a_hi <= pc) : (ic >= p_hi)
-                    mirror = up ? (ic > p_hi) : (a_hi < pc)
-                    stored ? _pack_A!(Ap, A, ic, pc, mce, kce, false, α, mr) :
-                        mirror ? _pack_A!(Ap, A, ic, pc, mce, kce, true, α, mr) :
-                        _pack_A_sym!(Ap, A, ic, pc, mce, kce, up, α, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                            Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
-                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
-                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
-                            # Val(b0) — trim-safe, as at gemm.jl:707.
-                            if mre == mr && nre == nr
-                                b0 ?
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
-                            else
-                                b0 ?
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
-                    ic += mc
-                end
-                pc += kc
-            end
-            jc += nc
-        end
-    end
-    return C
-end
-
-# Single-pass packed symm (side R, real): C := α·B·A_sym + β·C. A_sym is the gemm's RIGHT operand.
-# M=size(C,1), N=K=n; classify each A_sym panel (pc..K, jc..N): stored / mirror / straddle.
-function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T <: BlasReal}
-    M = size(C, 1); n = size(A, 1); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(M, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
-    b0first || _scale_C!(C, M, n, β)
-    ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); j_hi = jc + nce - 1; pc = 0
-            while pc < n
-                kce = min(kc, n - pc); p_hi = pc + kce - 1
-                stored = up ? (p_hi <= jc) : (pc >= j_hi)
-                mirror = up ? (pc > j_hi) : (p_hi < jc)
-                stored ? _pack_B!(Bp, A, pc, jc, kce, nce, false, nr) :
-                    mirror ? _pack_B!(Bp, A, pc, jc, kce, nce, true, nr) :
-                    _pack_B_sym!(Bp, A, pc, jc, kce, nce, up, nr)
-                b0 = b0first && pc == 0
-                ic = 0
-                while ic < M
-                    mce = min(mc, M - ic)
-                    _pack_A!(Ap, B, ic, pc, mce, kce, false, α, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                            Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
-                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
-                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
-                            # Val(b0) — trim-safe, as at gemm.jl:707.
-                            if mre == mr && nre == nr
-                                b0 ?
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
-                            else
-                                b0 ?
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
-                    ic += mc
-                end
-                pc += kc
-            end
-            jc += nc
-        end
-    end
-    return C
-end
-
-# n above which symm uses the single-pass packed kernel vs materialize (O(n²) dense copy of the triangle) +
-# the flagship gemm. DERIVED (req#8) via `_at_symm_mat_max` = √(L2/sizeof): a DIFFERENT criterion from the
-# rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured Zen3 n (packed
-# is dead weight on AVX2), and the only thing that unseats it is the O(n²) copy evicting the gemm's resident
-# L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Zen3 measured a mat≈pack
-# tie at EXACTLY n=256=√(512K/8) (they converge for all n≥256), pinning the fraction at 1. This lifts the cut
-# off the mistuned 96 (which routed n=112–192 to the slower packed path → the Zen3 AOCL misses) to 256.
-# Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
-# Overridable "symm_pack_cut".
-# PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW)`
-const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW))::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
 # conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
 # the materialize path routes to _gemm_core!'s Karatsuba-3M at mid-n — the SAME path complex symm already
@@ -7179,32 +6988,20 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             return _hemm_3m_L!(up, herm, α, β, A, B, C)
         end
     end
-    # UPPER BOUND ON THE PACKED PATH (2026-08-17). symm has the SAME flop count as gemm (2·n²·m) —
-    # symmetry saves A-traffic, not arithmetic — so symm should run at gemm's speed. It did not:
+    # REAL symm ALWAYS MATERIALIZES, and the packed symmetric kernel is not on its route at all.
+    # symm has the SAME flop count as gemm (2·n²·m) — symmetry saves A-traffic, not arithmetic — so it
+    # should run at gemm's speed, and on the packed kernel it did not:
     #
     #     Zen4   n=2048   PB gemm 0.3552s   PB symm 0.4150s   (symm 16.8% SLOWER, same flops)
     #                  n=4096   PB gemm 2.5319s   PB symm 3.3013s   (symm 30.4% SLOWER)
     #     AOCL for contrast     n=2048   its gemm 0.4530  its symm 0.4014  (theirs is FASTER than gemm)
     #
-    # The whole deficit is that gemm rides Strassen (1.26-1.28x AOCL there) and the packed path cannot:
-    # it never reaches `_gemm_core!` at all. The fall-through below ALREADY materializes the symmetric
-    # operand and calls `_gemm_core!(…, false, false, …)` — an NN product, i.e. Strassen-eligible — so
-    # the fix is not new code, it is declining the packed path once Strassen can pay.
+    # Measured again 2026-09-20 on the gate itself, packed against materialize: 1.041 at n=1024, 1.133
+    # at 2048, 1.278 at 4096, all in packed's favour to lose. The materialize is O(n²) against an O(n³)
+    # product — ~33.5 MB at n=2048, ~0.7 ms at ~50 GB/s, against a 415 ms call, i.e. 0.16%.
     #
-    # The materialize is O(n²) against an O(n³) saving: ~33.5 MB at n=2048, ~0.7 ms at ~50 GB/s,
-    # against a 415 ms call — 0.16% — to buy a ~25% flop cut.
-    #
-    # `_strassen_depth > 0` is the exact predicate `_gemm_core!` will apply, so the two cannot disagree
-    # (a hand-written `n >= _STRASSEN_MIN` here could drift from the depth rule and silently route to a
-    # classical path with the materialize tax still paid — the worst of both).
-    strassen_pays = _STRASSEN && eltype(C) <: BlasReal && !herm &&
-        _strided1(A) && _strided1(B) && _strided1(C) &&
-        _strassen_depth(size(C, 1), size(C, 2), n) > 0
-    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT && !strassen_pays
-        return side_left ?
-            _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
-            _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
-    elseif herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
+    # Complex still has packed paths of its own below; the real ones are gone.
+    if herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
             _strided1(B) && _strided1(C)                     # packed Hermitian (no materialize, triangle once)
         return _hemm_packed_L!(up, α, β, A, B, C, Val(true))
     elseif !herm && eltype(C) <: BlasComplex && side_left && n > _CSYMM_PACK_CUT &&
@@ -7243,7 +7040,14 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # unrelated task on the vacated thread takes the buffer the workers are still reading. Measured
     # before the twin: 5/96 concurrent `symm!` results wrong, worst relative error 1.65, against 0/96
     # serial. The `GC.@preserve` roots the storage; it never protected the CONTENTS.
-    if nw > 1
+    # AND IT STAYS BELOW THE RECURSION. A Strassen-eligible product is not column-split, because the
+    # recursion halves n and a worker holding a slice would run a different algorithm than a serial
+    # call — see the note at the same decision in `gemm!`. Asked through `_strassen_owns` so this site
+    # cannot drift from the conditions `_gemm_core!` will actually apply.
+    #
+    # `aT`/`bT` here are the converted α and β, not transpose flags — both operands go in untransposed.
+    Xd, Yd = side_left ? (Ad, B) : (B, Ad)
+    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd)
         rA = _root(Ad); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC begin
             side_left ?
@@ -7251,8 +7055,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
                 _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
         end
     else
-        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false) :  # complex — skip the kwarg layer
-            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false)
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true)
     end
     return C
 end

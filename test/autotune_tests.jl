@@ -75,15 +75,10 @@
     # tigerlake is AVX-512, so it takes the UNIFIED branch and the split must not move it: the 2W arm is
     # reachable only on multi-pack. This is the out-of-fleet guard that the split changed nothing but AVX2.
     @test P._at_syrk_pack_cut(tigerlake) == P._at_rank_k_pack_cut(tigerlake) == 8
-    @test P._at_symm_mat_max(zen3) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
-    @test P._at_symm_mat_max(zen4) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
-    @test P._at_symm_mat_max(zen5) == 362
-    @test P._at_symm_mat_max(tigerlake) == 404        # isqrt(1280K/8) — out-of-fleet auto-size, no crash
     # live wired consts equal the formula applied to the detected _HW
     @test P._GEMM_UNPACK_MAX == P._at_gemm_unpack_max(P._HW)
     @test P._SYRK_PACK_CUT == P._at_syrk_pack_cut(P._HW)
     @test P._SYR2K_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
-    @test P._SYMM_PACK_CUT == P._at_symm_mat_max(P._HW)
 
     # ── Out-of-fleet auto-sizing (no crash, sane values) — the whole point of the mandate ─────────────
     @test P._at_cpotf2_mr(tigerlake) == 1    # Intel native-512

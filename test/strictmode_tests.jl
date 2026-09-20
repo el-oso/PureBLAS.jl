@@ -630,6 +630,9 @@ end
 # `_m3ws` joined the list when the 3M/dual planes left `L3Workspace` for a per-TASK owner: its only
 # allocation is a new task's first touch (`OncePerTask`'s task-local IdDict entry + nine empty vectors),
 # after which every byte grows through `_ws_grow!` like the rest — see its definition in workspace.jl.
+# `_gpackws` joined it for the same reason and by the same mechanism: cooperative A-packing yields at a
+# barrier while the packed B panel is live, so the gemm pack buffers had to leave the per-THREAD owner
+# (see `test/yield_lint_baseline.txt`). Its only allocation is likewise a new task's first touch.
 #
 # The registration is session-wide and keyed on function identity, so this item UNREGISTERS afterwards:
 # left in place it would exempt those functions from every other `@test_noalloc` in the same worker.
@@ -642,7 +645,7 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws)
+        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws)
             StrictMode.register_alloc_barrier!(f)
         end
         try
@@ -670,7 +673,7 @@ end
             end
             @test threw
         finally
-            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws)
+            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws)
                 delete!(StrictMode._ALLOC_BARRIERS, f)         # internal: no public unregister exists
             end
             StrictMode.clear_cache!()                          # the registration cached verdicts

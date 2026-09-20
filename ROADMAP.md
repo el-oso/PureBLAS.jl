@@ -783,6 +783,12 @@ needs masking). Until then trmm dispatches to the recursion (no regression); `_t
 - **symm/hemm** — killed the n² materialize: pack the symmetric A panels directly inside a single-pass
   gemm (`_pack_A_sym!` side-L / `_pack_B_sym!` side-R, `_symm_packed_L!`/`_symm_packed_R!`). 0.95 →
   side-L 0.97–0.98×, side-R 0.98–1.00×.
+  **Superseded 2026-09-20: real symm no longer has a packed path.** Its route condition required
+  `n > symm_pack_cut` (362 on Zen4) AND Strassen not paying, and Strassen pays from `min(m,n,k) ≥ 256`,
+  so the two could not both hold and the kernel had become unreachable. Measured against materialize
+  it also loses — 1.04 / 1.13 / 1.28 at n=1024 / 2048 / 4096. Both kernels, both packers,
+  `_at_symm_mat_max` and the `symm_pack_cut` knob are removed; real symm always materializes and calls
+  `_gemm_core!`. The complex packed paths (`_hemm_packed_L!`) are unaffected.
 - **syrk + syr2k — unified single-pack redesign.** OpenBLAS packs A once and reuses it for BOTH operand
   roles; we couldn't because mr=16≠nr=8 → packed A twice (syrk) / four panels (syr2k), amortizing
   packing over only the triangle. Fix: switch the triangular path to an **8×8 tile** (mr==nr==W, F64/

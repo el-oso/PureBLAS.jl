@@ -673,15 +673,6 @@ end
     W = _lanes(hw, T)
     return (W >= 8 && W == _at_gemm_nr(hw, T)) ? W : 2 * W   # unified single-pack vs AVX2 multi-pack
 end
-# symm is a DIFFERENT criterion: its re-stream alternative is materialize-then-gemm (a one-shot O(n²) dense
-# copy of the symmetric triangle + the flagship gemm), not a strided microkernel. Materialize+gemm beats the
-# packed symmetric kernel at EVERY measured Zen3 n (the packed path is dead weight on AVX2), and the only
-# thing that can kill it is the O(n²) copy evicting the gemm's resident A-block from L2 — i.e. when the
-# materialized n×n copy no longer fits L2. Threshold = side of a square that fills L2: n = √(L2/sizeof). Zen3
-# measured a mat≈pack TIE at exactly n=256 = √(512K/8), pinning the fraction at 1. This lifts the cut off the
-# mistuned 96 (which routed n=112–192 to the slower packed path, the AOCL misses) up to 256, routing the whole
-# gate mid-range to materialize. Predicts Zen4/Zen5 362 (DOWN from the 448 placeholder — validate on Zen4). req#8.
-@inline _at_symm_mat_max(hw, ::Type{T} = Float64) where {T} = Base.isqrt(hw.l2 ÷ sizeof(T))
 
 # ── PDM "Measure" tier: the estimator ───────────────────────────────────────────────────────────────
 # Measure-tier knobs run a real timing loop ON THE HOST, once per process, to pick a kernel variant or a
