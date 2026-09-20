@@ -289,3 +289,55 @@ end
         P.set_num_threads(1)
     end
 end
+
+# THE THREAD-COUNT REPRODUCIBILITY GATE. `gemm!` and `symm!` must return bit-identical results at
+# every thread count on one build and one machine — a project requirement, not a nicety, and the one
+# property that cannot be checked by reading the code because it turns on which algorithm each worker
+# picks rather than on what any single routine computes.
+#
+# TWO SHAPES, AND THE SECOND IS WHY THIS ITEM IS NOT VACUOUS. `_strassen_owns` declines the column
+# split whenever the recursion claims the call, so the large square shape runs serially at any thread
+# count and would agree without a worker ever starting. The k-thin shape falls under Strassen's floor,
+# takes the classical split, and really is computed by the pool. Both witnesses are asserted.
+#
+# α = ±2^j is exact, so an α-placement divergence is invisible there; 2.5 is what catches it. The
+# comparison is on bit patterns, not a tolerance — a 1e-13 divergence is a divergence.
+@testitem "gemm/symm: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    n, kbig, kthin = 512, 384, 96
+    nthreads() >= 2 && P.set_num_threads(nthreads())
+    if nthreads() < 2 || !(P._gemm_workers(n, n, kthin) > 1)
+        P.set_num_threads(1)
+        @test_skip "needs ≥2 julia threads and a shape the amortisation floor admits"
+    else
+        Abig = randn(n, kbig); Bbig = randn(kbig, n)
+        Athin = randn(n, kthin); Bthin = randn(kthin, n)
+        # Witnesses: the first shape is the recursion's, the second the pool's.
+        @test P._strassen_owns(Float64, n, n, kbig, false, Abig, Bbig)
+        @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin)
+        @test P._gemm_workers(n, n, kthin) > 1
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        S = randn(n, n); Bs = randn(n, n)
+        for α in (1.0, -1.0, 2.5), β in (0.0, 0.5)
+            for (A, B) in ((Abig, Bbig), (Athin, Bthin))
+                P.set_num_threads(1)
+                r = randn(n, n); g = copy(r)
+                P.gemm!(r, A, B; alpha = α, beta = β)
+                P.set_num_threads(nthreads())
+                P.gemm!(g, A, B; alpha = α, beta = β)
+                @test bitsame(g, r)
+            end
+            for side in ('L', 'R'), up in ('L', 'U')
+                P.set_num_threads(1)
+                r = randn(n, n); g = copy(r)
+                P.symm!(r, S, Bs; side, uplo = up, alpha = α, beta = β)
+                P.set_num_threads(nthreads())
+                P.symm!(g, S, Bs; side, uplo = up, alpha = α, beta = β)
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end

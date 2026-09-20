@@ -201,6 +201,43 @@ Both modes share ONE set of low-level kernels. Source map:
    claiming any allocation is justified.** A non-zero result on a `!` entry is a DEFECT TO FIX, never
    an exemption to document.
 
+11. **BITWISE REPRODUCIBLE ACROSS THREAD COUNTS. (HARD RULE, with a test gate.)** One build, one
+   machine, one input: `PureBLAS.set_num_threads(n)` must not change a single bit of the result, for
+   any `n`. Scope is thread count only — NOT across microarchitectures, NOT across versions. It is
+   always on; there is no opt-in mode, because a mode is a promise nobody can rely on by default.
+
+   **The rule that makes it hold: the reduction TREE must be thread-count independent, not merely the
+   schedule static.** Partition `m` and `n` freely; never let worker count reach `k`. The classical
+   column split already satisfies this — it splits `n` only, and `kc = min(_KC, k)` is a function of
+   the problem — so every element of C accumulates its whole `k` chain on one worker in one order.
+   Two things break it and both have bitten:
+   - **A size-keyed predicate read from a chunk's own slice.** `_use_unpacked` is keyed on
+     `max(m, n, k)`, and the unpacked and blocked routes differ in α placement, β handling and `kc`
+     chunking, so a narrow chunk silently computes by different arithmetic. Hence `_gemm_core!`'s
+     `nroute`: a partitioned caller passes the WHOLE problem's column count and computes on its slice.
+     Any new size-keyed branch reachable from a chunk body must take its size from `nroute`.
+   - **An algorithm a worker cannot run.** Strassen chooses its depth from the width it is handed, so
+     a worker holding a slice runs a different algorithm entirely. It is therefore never column-split:
+     `gemm!`, `_symm!` and `_trmm_split_L!` ask `_strassen_owns` and run the recursion serially when it
+     answers yes. `_gemm_core!`'s `strassen` defaults to `false` so the chunk body and the lost-claim
+     fallback — the two paths a worker count can reach — cannot take the route by omission.
+
+   **Every path a worker count can reach must agree, including the ones that are not the happy one.**
+   A caller that loses the pool claim runs the serial fallback; if that fallback takes a different
+   route than the winner's workers, the same call returns different bits depending on a race with an
+   unrelated thread. That shipped once (`6940a2d3`).
+
+   **Forward constraint:** if `dot`/`nrm2` are ever threaded they break this by construction unless
+   their reduction tree is fixed independently of worker count. The standing decision not to thread
+   them is load-bearing.
+
+   **The gate** is `test/gemm_tests.jl` "gemm/symm: bit-identical at every thread count" and its
+   syrk/syr2k sibling. Both compare `reinterpret(UInt64, …)` patterns, never a tolerance — a 1e-13
+   divergence is a divergence. Both assert a **witness** first, because a shape Strassen claims runs
+   serially at any thread count and would pass without a worker ever starting; and both include an
+   α that is not a power of two, because scaling by `±2^j` is exact and hides an α-placement
+   difference. CI sets `JULIA_NUM_THREADS`, without which these items skip and report green.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
