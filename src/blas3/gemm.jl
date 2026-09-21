@@ -1758,26 +1758,43 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 # narrow and the column split runs ragged: each of six workers gets `leaf/6` columns, and the measured
 # efficiency falls off with the blocks-per-worker it leaves them.
 #
-# GATE-MEASURED on Zen4, freq-locked, `arms=pb` against the cached reference arms, plus the threaded
-# self-speedup from `bench/probes/strassen_serial_cost.jl` in the same state:
+# GATE-MEASURED on all three boxes, freq-locked, `arms=pb` against the cached reference arms, both
+# arms forced so neither could write a cache. Gate ratios at the cells the base moves:
 #
-#   base   gemm@2048  gemm@4096  |  threaded 1024^3   2048^3   4096^3   leaf
-#   192      1.156      1.251    |      2.16x         1.94x     ~1.9x    256
-#   512      1.154      1.258    |      3.26x         2.94x     2.89x    512
-#   1024     1.091      1.189    |      3.27x         3.95x     3.62x   1024
+#            Zen4 (wintermute)      Zen3 (galen)         Zen5 (neuromancer)
+#   cell     192    512    1024     192   512   1024     192   512   1024
+#   gemm@1000 0.998 0.973  0.973    1.046 1.059 1.057    1.085 1.023 1.026
+#   gemm@2048 1.156 1.154  1.091    1.136 1.140 1.071    1.243 1.165 1.095
+#   gemm@4096 1.251 1.258  1.189    1.279 1.279 1.196    1.387 1.309 1.229
+#   symm@1024 1.011 0.985  0.980    1.012 1.018 1.016    1.121 1.042 1.046
+#   symm@2048 1.084 1.082  1.024    1.120 1.122 1.052    1.217 1.137 1.073
+#   symm@4096 1.239 1.207  1.135    1.261 1.266 1.191    1.384 1.299 1.222
 #
-# 512 takes ~50% more threaded throughput for a gate movement inside noise at large n, because the
-# deeper levels were not buying time there anyway — their extra O(n^2) traffic already cancelled the
-# flop cut, which is why 192 and 512 measure the same serially. 1024 is where the serial side starts
-# to pay for it.
+# Threaded self-speedup in the same state (`bench/probes/strassen_serial_cost.jl`, 6 workers), which
+# is what the value is chosen for:
 #
-# WHAT IT COSTS, stated because it is not free: depth falls from 2 to 1 at n≈1000-1024, worth ~2%
-# there, and two cells that sat on the threshold cross it — `gemm@1000` 0.998 -> 0.973 and
-# `symm@1024` 1.011 -> 0.985. They are a 2-3% classical-kernel gap at that size, recorded as open.
+#            Zen4                        Zen3
+#   base     1024^3  2048^3  4096^3      1024^3  2048^3  4096^3    leaf
+#   192       2.16x   1.94x   ~1.9x        —       —       —        256
+#   512       3.26x   2.94x   2.89x      2.60x   3.07x   2.28x      512
+#   1024      3.27x   3.95x   3.62x      2.91x   4.50x   3.40x     1024
+#
+# 1024 is worth 15-21% of threaded wall clock on Zen4 and 28-29% on Zen3 over 512, for 6% of serial.
+# 512 was shipped first and was the wrong call: it protected gate margin that the fleet then showed
+# did not need protecting, and forfeited most of the available threading.
+#
+# 2048 IS NOT BETTER AND WAS CHECKED. The base caps levels >= 2 only (`d == 0 ||` in the depth loop),
+# so at n=2048 it gives the same depth 1, and at n=4096 it trades depth 2 for depth 1: serial 3012 vs
+# 2695 ms with the threaded time about equal. 1024 is the optimum, not merely the largest tried.
+#
+# WHAT IT COSTS, stated because it is not free: depth falls from 2 to 1 at n≈1000-1024, and two Zen4
+# cells that sat on the threshold cross it — `gemm@1000` 0.998 -> 0.973 and `symm@1024` 1.011 -> 0.980.
+# ONLY Zen4: both cells IMPROVE on Zen3 and pass on Zen5, so this is a Zen4 cache behaviour at that
+# size and a 2-3% classical-kernel gap, not a structural cost of the shallower depth. Open work.
 #
 # PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: no calibrator yet (needs a threaded harness, same blocker as gemm_mt_work); candidates _NR*2^j over 128..2048
-# req8-ok: two measured tables above — the serial one on Zen4+Zen3, the threading one Zen4-only, which Zen3/Zen5 must confirm before this extrapolates
-const _STRASSEN_BASE = @load_preference("strassen_base", 512)::Int
+# req8-ok: three-box gate table and a two-box threading table above; 2048 checked and rejected
+const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 @inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
 # Will this call be served by the Strassen recursion? Asked by every site that would otherwise column-
 # split above `_gemm_core!`, so that no such site has to spell the conditions itself — a split site
