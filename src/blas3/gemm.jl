@@ -1750,10 +1750,34 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 #
 # Base 192-256 wins every cell on both boxes except Zen3 at n=512 (-0.6%). 192 is the floor because it
 # is the smallest base that won anywhere (n=1536, n=3072) while 128 lost at n=1024/2048 on both boxes.
-# PDM: Literal — the BAND is measured (fleet table above); no detected const predicts it. The L2
-# candidate `sqrt(L2/(3*sizeof(T)))` = 209 fits Zen4 and FAILS Zen5 at identical L2.
-# req8-ok: fleet table above, two boxes, paired instrument, one -0.6% cell accepted against +2.1/+3.8%
-const _STRASSEN_BASE = @load_preference("strassen_base", 192)::Int
+#
+# ── RAISED 192 -> 512 (2026-09-21): THE BASE IS ALSO THE THREADED LEAF WIDTH ───────────────────────
+# A second criterion now binds this constant, and it is the one that decides the value. The leaf of
+# the recursion is what gets threaded (`_strassen_leaf!` hands it to the classical column split), and
+# a leaf is `n / 2^depth` wide, so the base IS the narrowest leaf the recursion will produce. Too
+# narrow and the column split runs ragged: each of six workers gets `leaf/6` columns, and the measured
+# efficiency falls off with the blocks-per-worker it leaves them.
+#
+# GATE-MEASURED on Zen4, freq-locked, `arms=pb` against the cached reference arms, plus the threaded
+# self-speedup from `bench/probes/strassen_serial_cost.jl` in the same state:
+#
+#   base   gemm@2048  gemm@4096  |  threaded 1024^3   2048^3   4096^3   leaf
+#   192      1.156      1.251    |      2.16x         1.94x     ~1.9x    256
+#   512      1.154      1.258    |      3.26x         2.94x     2.89x    512
+#   1024     1.091      1.189    |      3.27x         3.95x     3.62x   1024
+#
+# 512 takes ~50% more threaded throughput for a gate movement inside noise at large n, because the
+# deeper levels were not buying time there anyway — their extra O(n^2) traffic already cancelled the
+# flop cut, which is why 192 and 512 measure the same serially. 1024 is where the serial side starts
+# to pay for it.
+#
+# WHAT IT COSTS, stated because it is not free: depth falls from 2 to 1 at n≈1000-1024, worth ~2%
+# there, and two cells that sat on the threshold cross it — `gemm@1000` 0.998 -> 0.973 and
+# `symm@1024` 1.011 -> 0.985. They are a 2-3% classical-kernel gap at that size, recorded as open.
+#
+# PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: no calibrator yet (needs a threaded harness, same blocker as gemm_mt_work); candidates _NR*2^j over 128..2048
+# req8-ok: two measured tables above — the serial one on Zen4+Zen3, the threading one Zen4-only, which Zen3/Zen5 must confirm before this extrapolates
+const _STRASSEN_BASE = @load_preference("strassen_base", 512)::Int
 @inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
 # Will this call be served by the Strassen recursion? Asked by every site that would otherwise column-
 # split above `_gemm_core!`, so that no such site has to spell the conditions itself — a split site
