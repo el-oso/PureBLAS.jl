@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 146 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 69 Derived · 10 Measured · 51 Literal · 16 Exempt.
+**Tier:** 69 Derived · 11 Measured · 50 Literal · 16 Exempt.
 **Default form** (mechanical): 63 formula · 22 delegates · 5 sibling · 47 literal · 5 flag · 4 other.
 
 
@@ -238,7 +238,7 @@ Every `@load_preference` key in `src/` — 146 of them.
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
-| `strassen_base` | literal | Literal | the BAND is measured (fleet table above); no detected const predicts it. The L2 | — |
+| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | no calibrator yet (needs a threaded harness, same blocker as gemm_mt_work); candidates _NR*2^j over 128..2048 |
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
