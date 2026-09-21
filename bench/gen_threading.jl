@@ -189,7 +189,9 @@ arms**, which is six to eight hours per box and has not been done.
 Reproduce with:
 
 ```bash
-taskset -c 0,1,2,3,4,5 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt nodraw
+# The mask is one CPU per physical core PLUS one spare for the runtime threads, and CPU numbering
+# differs per box — `bench/plots.jl`'s `_ARM_PB_MT` comment carries the mask for each.
+taskset -c 0,2,4,6,8,10,1 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt nodraw
 julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 ```
 

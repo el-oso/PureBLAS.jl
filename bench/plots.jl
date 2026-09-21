@@ -64,8 +64,23 @@ const _ARM_PB_MT = "pb_mt"
 # Threads for the `pb_mt` arm. 6 on every box BY DECISION, not by detection: wintermute and neuromancer
 # have 6 physical cores and galen has 12, and capping galen to 6 is what keeps the three boxes
 # comparable. Pin one CPU per PHYSICAL core when running it — a second thread on a core shares the same
-# FMA units, so logical-core scaling measures contention, not parallelism:
-#   taskset -c 0,2,4,6,8,10 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
+# FMA units, so logical-core scaling measures contention, not parallelism.
+#
+# THE MASK NEEDS ONE CPU MORE THAN THE THREAD COUNT. `julia -t 6` runs 19 OS threads: 6 workers plus
+# the GC, interactive and libuv threads. Masked to exactly 6 CPUs those runtime threads displace a
+# worker mid-join, and the gemm pool's spin-then-yield join stalls behind them. Measured on Zen4,
+# getrf@2048 threaded speedup: 6 CPUs gives 0.12-0.80 (bimodal against a flat serial arm), 6 physical
+# cores + 1 spare CPU gives 2.32-2.35, no mask at all gives 2.08-2.29. The spare slot is where the
+# runtime lands, so the workers keep their cores.
+#
+# CPU NUMBERING IS NOT THE SAME ON EVERY BOX — read `lscpu -p=CPU,CORE` before assuming a mask. On
+# wintermute the two CPUs of a core are adjacent (0,1 = core 0), on galen and neuromancer the siblings
+# are the whole second half (galen CPU 12 = core 0; neuromancer CPU 6 = core 0). So `0,2,4,6,8,10`
+# selects six distinct cores on wintermute and only three, doubled up, on neuromancer.
+#
+#   wintermute   taskset -c 0,2,4,6,8,10,1   julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
+#   galen        taskset -c 6,7,8,9,10,11,18 julia --project=bench -t 6 …   # CCD1, its own 32 MiB L3
+#   neuromancer  taskset -c 0,1,2,3,4,5,6    julia --project=bench -t 6 …
 # `mt=` overrides for a scaling curve; it is a harness setting, not a shipped tuning knob, so no PDM tier.
 const _MT_NT = let i = findfirst(a -> startswith(a, "mt="), ARGS)
     isnothing(i) ? 6 : parse(Int, ARGS[i][4:end])
@@ -122,7 +137,7 @@ const _BLIS_INIT_NT = parse(Int, ENV["BLIS_NUM_THREADS"])
 # those set, and the guard below refuses rather than silently measuring a single-threaded AOCL and
 # publishing it as a threaded reference:
 #
-#   BLIS_NUM_THREADS=6 OMP_NUM_THREADS=6 taskset -c 0,1,2,3,4,5 \
+#   BLIS_NUM_THREADS=6 OMP_NUM_THREADS=6 taskset -c <this box's mask, see _ARM_PB_MT> \
 #       julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt,openblas_mt,aocl_mt nodraw
 #
 # Verified before use by `bench/probes/mt_reference_witness.jl`, which times a 2048 dgemm at 1 and N
@@ -203,7 +218,7 @@ isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) sele
 if _DO_PB_MT
     Threads.nthreads() >= _MT_NT || error(
         "arms=…,$_ARM_PB_MT needs at least $_MT_NT julia threads, got $(Threads.nthreads()). " *
-        "Run: taskset -c 0,2,4,6,8,10 julia --project=bench -t $_MT_NT bench/plots.jl …")
+        "Run with -t $_MT_NT under this box's mask — see the _ARM_PB_MT comment for the per-box masks.")
     println(stderr, "▶ $_ARM_PB_MT arm ON at $_MT_NT threads — SCALING measurement, not a gate comparison")
 end
 
