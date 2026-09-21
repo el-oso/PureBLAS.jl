@@ -3109,9 +3109,39 @@ end
 # `bench/probes/ptrmat_broadcast_cost.jl`, PtrMatrix/Matrix): a plain `@. C = A + B` is 0.997–0.988 at
 # n=256…2048, and the fused `@. C = α*(A+B+C)` shape the epilogue actually writes is 0.50–0.82, i.e.
 # faster. It is not a tax.
-function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) where {T}
+# A Strassen LEAF, computed by the threaded classical path when there are workers to use.
+#
+# THIS IS WHERE THE RECURSION GETS ITS PARALLELISM, and the reason it is here rather than at the node
+# is leaf SIZE. A leaf is `n / 2^depth` wide: at depth 4 and n=4096 that is 256, too narrow to split
+# six ways, which is the 2.2x that leaf threading first measured. At depth 2 it is 1024, which the
+# column split handles at full efficiency. Depth is a function of (m,n,k) alone, so which regime a
+# call lands in does not depend on the worker count.
+#
+# REPRODUCIBLE BY THE PROPERTY ALREADY ESTABLISHED: the classical column split partitions n only and
+# `kc = min(_KC, k)` does not depend on worker count, so a threaded leaf is bit-identical to a serial
+# one. Every combine around it is elementwise. So the whole recursion returns the same bits at any
+# thread count, including 1.
+#
+# Parallelising the NODES instead was built and measured and is worse: seven subtrees at once need
+# seven private scratch pools, and the resulting working set saturates memory bandwidth at 2.3x with
+# no improvement from four workers to seven. Here only one leaf is live at a time and the workers
+# share its packed A panel.
+@inline function _strassen_leaf!(C, A, Bm, alpha::T, beta::T, nw::Int) where {T}
+    m = size(C, 1); n = size(C, 2); k = size(A, 2)
+    if nw > 1 && _strided1(A) && _strided1(Bm) && _strided1(C) && _gemm_workers(m, n, k) > 1
+        rA = _root(A); rB = _root(Bm); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(Bm), alpha, beta, false, false, false, false,
+            min(nw, _gemm_workers(m, n, k))
+        )
+        return C
+    end
+    return _gemm_real_dims!(false, false, m, n, k, alpha, beta, A, Bm, C)
+end
+
+function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T, nw::Int = 1) where {T}
     if depth == 0
-        return _gemm_real_dims!(false, false, size(C, 1), size(C, 2), size(A, 2), alpha, beta, A, Bm, C)
+        return _strassen_leaf!(C, A, Bm, alpha, beta, nw)
     end
     m = size(C, 1); n = size(C, 2); k = size(A, 2); mh = m ÷ 2; nh = n ÷ 2; kh = k ÷ 2
     A11 = @view A[1:mh, 1:kh]; A12 = @view A[1:mh, (kh + 1):k]; A21 = @view A[(mh + 1):m, 1:kh]; A22 = @view A[(mh + 1):m, (kh + 1):k]
@@ -3119,13 +3149,13 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
     TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
-    @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z)   # S1,T1 → P5
-    @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z)   # S2,T2 → P6
-    @. TB = TB - B21;                     _strassen_rec!(P4, A22, TB, dm, lv, o, z)  # T4 → P4
-    @. TA = A12 - TA;                     _strassen_rec!(P3, TA, B22, dm, lv, o, z)  # S4 → P3
-    @. TA = A11 - A21; @. TB = B22 - B12; _strassen_rec!(P7, TA, TB, dm, lv, o, z)   # S3,T3 → P7
-    _strassen_rec!(P1, A11, B11, dm, lv, o, z)
-    _strassen_rec!(P2, A12, B21, dm, lv, o, z)
+    @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z, nw)   # S1,T1 → P5
+    @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z, nw)   # S2,T2 → P6
+    @. TB = TB - B21;                     _strassen_rec!(P4, A22, TB, dm, lv, o, z, nw)  # T4 → P4
+    @. TA = A12 - TA;                     _strassen_rec!(P3, TA, B22, dm, lv, o, z, nw)  # S4 → P3
+    @. TA = A11 - A21; @. TB = B22 - B12; _strassen_rec!(P7, TA, TB, dm, lv, o, z, nw)   # S3,T3 → P7
+    _strassen_rec!(P1, A11, B11, dm, lv, o, z, nw)
+    _strassen_rec!(P2, A12, B21, dm, lv, o, z, nw)
     @. U = P1 + P6                                                                   # U1
     if iszero(beta)
         @. C11 = alpha * (P1 + P2); @. C12 = alpha * (U + P5 + P3)
@@ -3137,7 +3167,7 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T) whe
     return C
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
-function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
+function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C, nw::Int = 1)
     T = eltype(C); D = _strassen_depth(m, n, k)
     # PAD-VS-DEPTH. When a dimension is not a multiple of 2^D the else-branch below pads: three scratch
     # slots, two `fill!`s, two operand copies and a copy-back — three extra O(n^2) DRAM passes. Spending
@@ -3162,12 +3192,12 @@ function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C)
     GC.@preserve rA rB rC begin
         pA = _pm(A); pB = _pm(B); pC = _pm(C)
         if mp == m && np == n && kp == k                   # already clean — recurse in place (β applied at top)
-            _strassen_rec!(pC, pA, pB, D, 0, a, b)
+            _strassen_rec!(pC, pA, pB, D, 0, a, b, nw)
         else                                               # odd/awkward: pad to even^D with zeros, copy back
             Ap, Bp, Cp = _strassen_pad_scratch(T, mp, kp, np)
             fill!(Ap, zero(T)); @inbounds @views Ap[1:m, 1:k] .= pA
             fill!(Bp, zero(T)); @inbounds @views Bp[1:k, 1:n] .= pB
-            _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T))
+            _strassen_rec!(Cp, Ap, Bp, D, 0, one(T), zero(T), nw)
             Cv = @view Cp[1:m, 1:n]
             iszero(b) ? (@inbounds @. pC = a * Cv) : (@inbounds @. pC = a * Cv + b * pC)
         end
@@ -3305,7 +3335,7 @@ end
         end
         if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, nrt, k) > 0
             if !tB
-                return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
+                return _gemm_strassen!(m, n, k, alpha, A, B, beta, C, nw)   # large-n real: 7-mult recursion beats OB
             elseif T === Float64
                 # transB route (recovered from branch `transb-strassen`, 2026-08-17). WHY IT MATTERS:
                 # the triangular/symmetric ops cannot satisfy `!tA && !tB`, so none of them could ride
@@ -3336,7 +3366,7 @@ end
                 # path — which is the whole reason this takes the pointer explicitly.)
                 Bt = _strassen_bt(Float64, k, n)
                 _transpose_dense!(PtrVector(pointer(Bt), k * n), B, k, n)
-                return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C)
+                return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C, nw)
             end
         end
         if _strided1(A) && _strided1(B) && _use_unpacked(m, nrt, k)
@@ -4221,13 +4251,21 @@ function gemm!(
         # serially this is the same code that ran before. Dropping Strassen to keep the column split
         # was measured instead and is far worse: gemm@4096 1.297 -> 0.949, gemm@2048 1.192 -> 0.974,
         # symm@4096 1.211 -> 0.942.
+        # WHICH PARALLEL FORM, NOT WHETHER TO HAVE ONE. Both branches thread; the shape picks between
+        # them and the worker count never does, which is what keeps the result thread-count invariant.
+        #
+        # A Strassen-eligible call cannot be column-split — the recursion halves n, so a worker with a
+        # slice would choose a different depth and compute something else. It threads INSIDE instead:
+        # the recursion runs once, and each of its leaves is a classical product handed to the column
+        # split (`_strassen_leaf!`). A leaf is bit-identical threaded or serial, so the whole recursion
+        # is too.
         if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B)
             rA = _root(A); rB = _root(B); rC = _root(C)
             GC.@preserve rA rB rC _gemm_threaded!(
                 _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
             )
         else
-            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', -1, true)
+            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', -1, true, nw)
         end
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()

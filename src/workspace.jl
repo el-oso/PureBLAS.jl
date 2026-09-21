@@ -77,9 +77,10 @@ mutable struct L3Workspace{T}
     # `m3` WAS HERE and is now `_m3ws`, a per-TASK owner — it is the one role held across a threaded
     # join (`_trmm_dual!`/`_trsm_dual!` call public `trmm!` while holding it). Removed rather than left
     # dead so nobody re-points an accessor at a per-thread copy. See `_m3ws` above for the full reason.
-    str::Vector{Vector{T}}     # _strassen scratch:   pad (1-3) + per-level Winograd buffers (10/level)
-    strbt::Vector{T}      # _strassen_bt: transB route Bᵀ, k×n viewed over a flat slot. Deliberately NOT
-    # a `str` slot — the nested Winograd recursion owns that whole pool, so sharing would alias.
+    # `str`/`strbt` WERE HERE and are now `_strws`, a per-TASK owner: the Winograd recursion yields at
+    # its leaves now (each is handed to the threaded classical path), and it holds its level slots
+    # across that yield. Removed rather than left dead so nobody re-points an accessor at a
+    # per-thread copy — same reasoning as `m3` and the gemm pack buffers above.
 end
 # ONE ARGUMENT PER LINE, TAGGED WITH ITS FIELD. The list is positional, and it was ~180 entries long
 # when the arena conversion started; the stage-1 pass mis-aligned it by two and shipped a
@@ -91,8 +92,6 @@ end
 L3Workspace{T}() where {T} = L3Workspace{T}(
     (T[], T[], T[], T[]),                        # cg
     (T[], T[], T[], T[]),                        # s2
-    Vector{T}[],                                 # str
-    T[],                                         # strbt
 )
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
 # four BLAS element types s/d/c/z. The IdDict fallback is ONLY for the open-ended non-gated set
@@ -205,9 +204,31 @@ end
 # k·n elements gives both — while a persistent max-sized MATRIX would not: it would hand a small-n call
 # after a large-n one a huge leading dim, which is the measured cache hazard recorded on
 # `_gemm_3m_scratch` below (zgemm/ztrsm n=128 1.16 → 0.57). Same shape as that pool, for that reason.
+# PER-TASK, NOT PER-THREAD, and for the same reason `gpackA`/`gpackB` moved.
+#
+# The Winograd recursion used never to yield, which is what made a per-thread owner sound. It does
+# now: each leaf is handed to the threaded classical path (`_strassen_leaf!`), and the driver's join
+# yields while every level of the recursion above it still holds its `str` slots. A task that lands
+# on the vacated thread meanwhile — a serial `gemm!` that loses the pool claim and runs the recursion
+# itself — would take the SAME per-thread slots and write over a live node, silently, or leave the
+# outer level holding a handle its own `resize!` has moved.
+#
+# The driver is pinned for the join, so the task cannot migrate; what it cannot stop is another
+# sticky task queued on that thread running while it waits. `test/yield_lint.jl` flagged exactly this
+# edge when the leaf call was added, and its closing instruction is to switch the owner rather than
+# baseline the yield — `_gpackws` and `_m3ws` are the precedents.
+const _STR_F64 = Base.OncePerTask{Tuple{Vector{Vector{Float64}}, Vector{Float64}}}(
+    () -> (Vector{Float64}[], Float64[]))
+const _STR_F32 = Base.OncePerTask{Tuple{Vector{Vector{Float32}}, Vector{Float32}}}(
+    () -> (Vector{Float32}[], Float32[]))
+const _STR_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
+@noinline _strws(::Type{Float64}) = _STR_F64()
+@noinline _strws(::Type{Float32}) = _STR_F32()
+@noinline _strws(::Type{T}) where {T} =
+    get!(() -> (Vector{T}[], T[]), _STR_OTHER(), T)::Tuple{Vector{Vector{T}}, Vector{T}}
+
 function _strassen_bt(::Type{T}, k::Int, n::Int) where {T}
-    ws = _l3ws(T)
-    bt = _ws_grow!(ws.strbt, k * n)
+    bt = _ws_grow!(_strws(T)[2], k * n)
     return PtrMatrix(pointer(bt), k, n, k)
 end
 
@@ -313,11 +334,11 @@ const _GPKSH_F32 = Base.OncePerProcess{Vector{Vector{Float32}}}(() -> Vector{Flo
 end
 
 function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
-    p = _l3ws(Tr).str
+    p = _strws(Tr)[1]
     return _str_fit!(p, 1, mp, kp), _str_fit!(p, 2, kp, np), _str_fit!(p, 3, mp, np)
 end
 function _strassen_lvl_scratch(::Type{Tr}, level::Int, mh::Int, nh::Int, kh::Int) where {Tr}
-    p = _l3ws(Tr).str; b = 3 + level * 10
+    p = _strws(Tr)[1]; b = 3 + level * 10
     TA = _str_fit!(p, b + 1, mh, kh); TB = _str_fit!(p, b + 2, kh, nh)
     P1 = _str_fit!(p, b + 3, mh, nh); P2 = _str_fit!(p, b + 4, mh, nh)
     P3 = _str_fit!(p, b + 5, mh, nh); P4 = _str_fit!(p, b + 6, mh, nh)
