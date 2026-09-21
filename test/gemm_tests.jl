@@ -341,3 +341,40 @@ end
         P.set_num_threads(1)
     end
 end
+
+# THE OTHER HALF OF THE THREADING CONTRACT: the pool must ACTUALLY BE USED.
+#
+# The reproducibility item above is satisfied perfectly by a library that ignores every thread it is
+# given. A change that routed large real `gemm!` to a serial recursion passed it, passed the whole
+# suite, and passed the gate — the gate is single-threaded — while leaving a 1024^3 product at 1.00x
+# on six cores. An invariant gate needs a liveness gate beside it, one that the do-nothing
+# implementation of that invariant fails, or the pair certifies a library that does nothing.
+#
+# WITNESS, NOT A CLOCK. `p.gen` is bumped once per dispatched job and by the driver only, so reading
+# it either side of a call says whether the pool ran, with no timing and nothing to be flaky about on
+# a loaded runner. It catches any veto between `_gemm_workers` saying yes and the pool being used —
+# including one nobody has written yet, which a check against a named predicate would not.
+@testitem "threaded gemm/symm: the pool is actually used" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        for (m, n, k) in ((512, 512, 512), (1024, 1024, 1024), (1024, 1024, 128), (2048, 1024, 512))
+            P._gemm_workers(m, n, k) > 1 || continue
+            A = randn(m, k); B = randn(k, n); C = zeros(m, n)
+            @test ran(() -> P.gemm!(C, A, B))
+        end
+        n = 1024
+        if P._gemm_workers(n, n, n) > 1
+            S = randn(n, n); Bs = randn(n, n); C = zeros(n, n)
+            @test ran(() -> P.symm!(C, S, Bs; side = 'L', uplo = 'L'))
+        end
+        P.set_num_threads(1)
+    end
+end

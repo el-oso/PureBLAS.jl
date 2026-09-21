@@ -7046,6 +7046,9 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # cannot drift from the conditions `_gemm_core!` will actually apply.
     #
     # `aT`/`bT` here are the converted α and β, not transpose flags — both operands go in untransposed.
+    # Both branches thread; the shape picks between them, never the worker count. A Strassen-eligible
+    # product threads inside the recursion instead of being column-split — see the same decision in
+    # `gemm!`, and `_strassen_leaf!` for why that is still bit-identical.
     Xd, Yd = side_left ? (Ad, B) : (B, Ad)
     if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd)
         rA = _root(Ad); rB = _root(B); rC = _root(C)
@@ -7055,8 +7058,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
                 _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
         end
     else
-        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true) :
-            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true)
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true, nw) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true, nw)
     end
     return C
 end
