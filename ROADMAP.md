@@ -459,8 +459,39 @@ The ecosystem's current answer is "call AppleAccelerate.jl" — i.e. shell out t
    * **Mode 2 (native AD-traceable Julia API, JIT): still blocked.** The JIT SIGILLs even with
      `JULIA_CPU_TARGET` set — so it is genuinely the missing SME ABI pass, not just the TargetMachine.
 
-   Next: write a real SME `dgemm` microkernel for the AOT path and measure what fraction of Accelerate's
-   ~469 GFLOP/s is actually reachable. Note the shipped `.so` would then need `JULIA_CPU_TARGET` pinned
+   **✅ MEASURED — the microkernel runs at SME PEAK (2026-09-22).** A 16x16 FP64 block held in four
+   8x8 ZA tiles (`za0..za3`), accumulating over k, written as pure `llvmcall` IR and built through
+   juliac. The emitted inner loop is textbook:
+
+       ld1d  { z0.d }, p0/z, [x0]              ; A vec 0
+       ld1d  { z1.d }, p0/z, [x0, x8, lsl #3]  ; A vec 1
+       ld1d  { z2.d }, p0/z, [x1]              ; B vec 0
+       ld1d  { z3.d }, p0/z, [x1, x8, lsl #3]  ; B vec 1
+       fmopa za0.d / za1.d / za2.d / za3.d     ; 4 x (8x8 outer product)
+       add x0,#0x80 / add x1,#0x80 / subs / b.ne
+
+   Correctness exact (`max_err = 0` vs a scalar reference). Throughput, three runs, C host:
+
+       SME microkernel        533 / 549 / 549 GFLOP/s
+       Accelerate dgemm n=4000 (1 thread)  469 GFLOP/s
+       OpenBLAS  dgemm n=4000 (1 thread)    66 GFLOP/s
+       NEON FP64 roofline (measured)        60.4 GFLOP/s
+
+   ~4 cycles per iteration for 4 `fmopa` = **1 fmopa/cycle, the architectural peak** (128 flops/fmopa
+   at ~4.3 GHz = ~550 GFLOP/s). So **9.1x the NEON roofline** and **8.3x OpenBLAS**.
+
+   **READ THE 1.17x-vs-Accelerate NUMBER HONESTLY: it is not a win over Accelerate.** 549 is a
+   MICROKERNEL upper bound — L2-resident panels, no packing, no edge cases, one 16x16 block. 469 is
+   Accelerate's *full dgemm* at n=4000 with all real-world overhead included. That Accelerate sustains
+   85% of microkernel peak in a complete dgemm is a sane ratio, and it cross-validates both figures.
+   The honest reading is: **the compute engine is fully reachable from Julia; whether a PureBLAS SME
+   dgemm lands near 469 now depends entirely on the blocking/packing around it** — which is ordinary
+   BLAS engineering, not a hardware or toolchain question.
+
+   Remaining before any of this ships: `JULIA_CPU_TARGET` must be pinned in `juliac/build.jl` (a BUILD
+   decision, the Pin tier's legitimate home); the SVL=512b assumption in the IR offsets should be
+   derived from `llvm.vscale` rather than hardcoded; and streaming mode changes vector register state,
+   so a ZA region must not allocate, yield, or hit a GC safepoint. Note the shipped `.so` would then need `JULIA_CPU_TARGET` pinned
    in `juliac/build.jl` — which is a BUILD decision (the Pin tier's legitimate home), not a user pin.
 3. Inline asm — **ruled out by the user**: it is the same portability line the x86 residuals were not
    allowed to cross. A working asm proof-of-concept exists in the session history (exact 8x8 FP64 ZA
