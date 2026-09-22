@@ -27,7 +27,7 @@ using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); 
 # SEPARATE baseline from OpenBLAS: its SVGs/tables carry an `_aocl` suffix and never mix with OpenBLAS's.
 # NOTE: the v3 cache holds BOTH reference arms and the render emits BOTH views every time (see `_VIEWS`),
 # so `aocl` no longer selects which view is drawn — it is inert except under `mkl`.
-const REFBK = "aocl" in ARGS ? "aocl" : "mkl" in ARGS ? "mkl" : "openblas"
+const REFBK = "aocl" in ARGS ? "aocl" : "mkl" in ARGS ? "mkl" : "accelerate" in ARGS ? "accelerate" : "openblas"
 REFBK == "mkl" && @eval using MKL
 
 # ══ v3 ARMS ═══════════════════════════════════════════════════════════════════════════════════════
@@ -63,8 +63,29 @@ end
 # LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
 # reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
 # single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
-ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these at init, before any forward
-@eval using AOCL_jll
+# x86_64-only: AOCL_jll has no aarch64-apple-darwin artifact, and `bench/apple/Project.toml` (the
+# environment this file runs under on Apple Silicon) does not even list it as a dependency — so this
+# whole block must not execute there. Mirrors the existing `REFBK == "mkl" && @eval using MKL` pattern.
+const _ONX86 = Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+if _ONX86
+    ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these at init, before any forward
+    @eval using AOCL_jll
+end
+
+# Accelerate = Apple's system BLAS/LAPACK (vecLib, inside the Accelerate umbrella framework — no package,
+# no artifact, it ships with the OS). Forwarded by raw dylib path exactly like OpenBLAS/AOCL above. Two
+# interfaces live in the SAME binary behind different symbol manglings: the legacy LP64 (32-bit int) path
+# that `lbt_forward` autodetects by default, and a newer ILP64 path Apple added in macOS 13.3
+# ("$NEWLAPACK$ILP64"-suffixed symbols, e.g. `dgemm$NEWLAPACK$ILP64` — note NO trailing underscore before
+# the `$`, unlike the classic Fortran mangling). Julia's own BLAS entry points are ILP64
+# (`dgemm_64_`, req'd since PureBLAS's own ABI is ILP64 too — see CLAUDE.md), so the LP64 default is the
+# wrong interface: forwarding without a suffix hint leaves the ILP64 slot empty and every call errors
+# "no BLAS/LAPACK library loaded for dgemm_64_()". The working incantation (confirmed empirically here,
+# and matching JuliaLinearAlgebra/AppleAccelerate.jl's `load_accelerate`) needs a LEADING \x1a (0x1A, ASCII
+# SUB) byte before the suffix text — `lbt_forward`'s suffix autodetection otherwise tries the hint as a
+# plain appended suffix (`dgemm_$NEWLAPACK$ILP64`, which does not exist) and silently falls back to LP64.
+const _ACCELERATE_PATH = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
+const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
 
 # Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
@@ -83,6 +104,10 @@ function _use_ref!(name::AbstractString)
         LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # LAPACK → libflame.so
     elseif name == "openblas"
         LinearAlgebra.BLAS.lbt_forward(OpenBLAS_jll.libopenblas_path; clear = true)
+    elseif name == "accelerate"
+        # ONE forward covers both BLAS and LAPACK — Accelerate ships them in the same umbrella binary,
+        # unlike AOCL's separate blis/flame .so files.
+        LinearAlgebra.BLAS.lbt_forward(_ACCELERATE_PATH; clear = true, suffix_hint = _ACCELERATE_SUFFIX)
     else
         error("unknown reference backend $name")
     end
@@ -92,7 +117,11 @@ end
 
 # Reference arms available this run. `_REF_ARMS` is what gets measured; PureBLAS is always measured
 # unless the cache already holds it and only references were asked for.
-const _REF_ALL = REFBK == "mkl" ? ["mkl"] : ["openblas", "aocl"]
+# Default DUAL-reference set is architecture-dependent: AOCL is AMD-only (no aarch64-apple-darwin build,
+# not even a dependency of `bench/apple/Project.toml`), so an Apple Silicon run's honest second reference
+# is Accelerate instead — the platform's own vendor BLAS, exactly the AOCL/AMD relationship's ARM analogue.
+const _REF_ALL = REFBK == "mkl" ? ["mkl"] : REFBK == "accelerate" ? ["accelerate"] :
+    _ONX86 ? ["openblas", "aocl"] : ["openblas", "accelerate"]
 # ⚠ REFERENCE ARMS ARE CACHE-ONLY BY DEFAULT. Omitting `arms=` used to mean "measure every arm", so
 # forgetting the flag silently re-ran OpenBLAS and AOCL — which is the whole reason the v3 cache stores
 # them. The default is now PB ONLY; re-measuring a reference is an explicit, typed-out request.
@@ -233,8 +262,9 @@ end
 # cell (see `_series`), so it draws the gate itself. It is NOT in `_VIEWS`: nothing is measured against
 # it and it has no gen_table of its own (the coverage table already reports this exact number).
 const _GATE_VIEW = "gate"
-_refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" :
-    r == "generic" ? "LinearAlgebra generic" : r == _GATE_VIEW ? "faster of OpenBLAS and AOCL" : "OpenBLAS"
+_refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : r == "accelerate" ? "Accelerate" :
+    r == "generic" ? "LinearAlgebra generic" :
+    r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -380,11 +410,22 @@ end
 const _SELGRP = let i = findfirst(a -> startswith(a, "group="), ARGS)
     isnothing(i) ? nothing : ARGS[i][7:end]
 end
+# `maxsize=<n>` caps every op's size ladder at n, full methodology otherwise (unlike `lite`, which ALSO
+# cuts rounds/samples). For scoping a first-pass run's wall-clock (e.g. a new, unlocked, un-fleeted box)
+# without touching measurement quality on the sizes that ARE run. Never set by the AMD fleet scripts.
+const _MAXSZ = let i = findfirst(a -> startswith(a, "maxsize="), ARGS)
+    isnothing(i) ? nothing : parse(Int, ARGS[i][9:end])
+end
 _want(lvl, nm) = (isnothing(_SELOP) && isnothing(_SELGRP)) || _SELOP == nm || _SELGRP == lvl
 _cap(szs, maxn) = Tuple(s for s in szs if s <= maxn)   # per-op size cap (e.g. skip 4096 for slow ops)
 # lite caps sizes at 1024 (drops the expensive 2048/4096 tail) — keeps the meaningful mid-n range while
 # skipping the O(n³) large-n sink that dominates wall time. Guarded so a cap never yields an empty tuple.
-_sizes(szs) = _LITE ? (t = Tuple(s for s in szs if s <= 1024); isempty(t) ? szs[1:1] : t) : szs
+function _sizes(szs)
+    t = szs
+    _LITE && (t = Tuple(s for s in t if s <= 1024))
+    isnothing(_MAXSZ) || (t = Tuple(s for s in t if s <= _MAXSZ))
+    return isempty(t) ? szs[1:1] : t
+end
 
 # Repeated rounds reject the one-unlucky-window failure (gemm n=32 read 0.83 in a single window vs 1.01
 # true). Keyed on SIZE, deterministic (never on measured duration → identical protocol on every host).
@@ -2487,9 +2528,21 @@ else
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3, "DLP" => dlp)
     subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
+    # A scoped run (op=/group=) against a SLUG that has never been cached at all is not a merge — there is
+    # nothing to merge into and nothing previously-measured to lose. Fall through to the full-run branch
+    # below, which just writes `measured` as-is; `_want` already restricted it to the requested op/group,
+    # so the resulting cache is a legitimately PARTIAL first cache for a new box, expandable later by the
+    # normal merge path once it exists. This is how a new box's first pass can be scoped in wall-clock
+    # (fewer groups/ops, via `group=`/`op=`, or fewer sizes via `maxsize=`) without a full-coverage run.
+    if subset && !isfile(CACHE)
+        println(
+            "no existing cache at $CACHE — this scoped run becomes the FIRST (partial) cache for slug " *
+                "\"$SLUG\": other groups/ops read as unmeasured (\"–\") until a later op=/group= run adds them."
+        )
+        subset = false
+    end
     if subset
         # subset re-measure: MERGE the measured op(s) into the existing (v2) cache, leaving the rest intact.
-        isfile(CACHE) || error("subset re-measure (op=/group=) needs an existing full cache at $CACHE — run a full `bench` first")
         g, meta = load_cache(CACHE)   # load_cache refuses a non-v2 cache
         meta.slug == SLUG || error("subset slug ($SLUG) ≠ cache slug ($(meta.slug)) — merging would relabel the µarch; re-run full `bench`")
         # PER-ARM, PER-CELL merge. v2 replaced a whole op, which was fine when a run always measured both

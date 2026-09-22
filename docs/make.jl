@@ -37,6 +37,7 @@ makedocs(;
         ],
         "Performance" => [
             "Benchmarks" => "performance.md",
+            "Apple Silicon" => "performance_apple.md",
             "LAPACK/BLAS Coverage" => "coverage.md",
             "Methodology & Provenance" => "methodology.md",
             "Performance Notes" => "notes.md",
