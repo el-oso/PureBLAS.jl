@@ -1370,15 +1370,24 @@ function _gemm_unpacked_split!(
     return C
 end
 
+# `nroute` IS THE WHOLE PROBLEM'S COLUMN COUNT, and the two predicates below are why it has to reach
+# this far down. Both select an ALGORITHM, not a block size, so a caller holding a COLUMN BAND of a
+# larger problem — a trsm worker, whose leaves call this — takes a different kernel from the one the
+# unsplit call takes, and the two return different bits.
+#
+# Measured: threaded `trsm` inside `getrf` failed thread-count invariance at exactly the band widths
+# that land on 64, which is `_gemm_split_max()`. Bands of 320 and 152 agreed; bands of 64 did not.
+# `_gemm_core!` already carried the token for `_use_unpacked`; it stopped one layer above here.
 function _gemm_unpacked!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
-        alpha::T, A, B, beta::T, C
+        alpha::T, A, B, beta::T, C, nroute::Int = -1
     ) where {T <: BlasReal, TB, B0}
+    nrt = nroute < 0 ? n : nroute
     if iszero(alpha) || k == 0
         _scale_C!(C, m, n, beta)   # C := beta·C (or 0); no contraction to do
         return C
     end
-    if max(m, n, k) <= _GEMM_MR1_MAX
+    if max(m, nrt, k) <= _GEMM_MR1_MAX
         return _gemm_unpacked_mr1!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     # Short-k split path: small-n window where the wide tile under-fills (needs ≥1 full tall row-tile so the
@@ -1388,7 +1397,7 @@ function _gemm_unpacked!(
     # that could not be done at all while the value was a load-time const: an env A/B ran three
     # identical builds and the witness printed 48 every time. The accessor reads one const-resolved Ref
     # (the GKH-owned shape, not a keyed lookup) and const-folds to the derived value when unforced.
-    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, n, k) <= _gemm_split_max()
+    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, nrt, k) <= _gemm_split_max()
         return _gemm_unpacked_split!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
@@ -2896,14 +2905,14 @@ end
             if !tA && _use_unpacked(m, nrt, k)
                 _gemm_unpacked!(
                     tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C)
+                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
                 )
             else
                 _gemm_blocked!(tA, tB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
             end
         end
     elseif !tA && _use_unpacked(m, nrt, k)
-        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C)
+        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C, nrt)
     else
         _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)   # blocked also covers the transpose case
     end
@@ -3452,7 +3461,7 @@ end
                 if !tA
                     _gemm_unpacked!(
                         tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C)
+                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
                     )
                 else
                     At, _ = _gemm_scratch(T, m * k, 0)
@@ -3463,7 +3472,7 @@ end
                         Am = PtrMatrix{T}(pointer(At), m, k, m)
                         _gemm_unpacked!(
                             tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                            m, n, k, alpha, Am, _pm(B), beta, _pm(C)
+                            m, n, k, alpha, Am, _pm(B), beta, _pm(C), nrt
                         )
                     end
                 end

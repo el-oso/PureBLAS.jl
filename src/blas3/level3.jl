@@ -1486,8 +1486,13 @@ end
 # The copy-back is spelled as an explicit loop rather than `copyto!` because `PtrMatrix` is
 # `IndexCartesian`; this is the same column-loop shape the rest of this file uses for a scratch → B pass.
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
-function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` reaches here for the same reason it reaches `_gemm_unpacked!`: this leaf's product is the
+# band's, and the kernel that product takes is chosen from `max(m, n, k)`. At a leaf `nb` is at most
+# `_trsm_base` (32 by default), so a 64-wide band lands on `_gemm_split_max()` and takes the split
+# kernel while the unsplit solve does not.
+function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
+    nrt = nroute < 0 ? n : nroute
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape — ld stays _L3_NB, as before
         iv = view(ivM, 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
@@ -1496,9 +1501,11 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
         # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
         # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
         if tr
-            gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
+            # `_gemm_core!`, not `gemm!`: the public entry routes from its own operands and has no
+            # place to take the route token, which a column band must carry.
+            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, nrt)
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -4192,7 +4199,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int
             # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B, tr)
         elseif k <= _trsm_base()
-            return _trsm_base_invL!(up, tr, unit, A, B)
+            return _trsm_base_invL!(up, tr, unit, A, B, nrt)
         end
     elseif eltype(B) <: BlasComplex                       # complex base (else fall through → gemm-blocked split)
         # nrhs is invariant under the row-split → decide the base once. Wide B: trtri-on-inverse base (its
