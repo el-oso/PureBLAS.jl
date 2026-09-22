@@ -59,9 +59,39 @@ catch
     false
 end
 
+# Darwin cache geometry, read from sysctl AT PRECOMPILE TIME and folded into the consts below.
+#
+# WHY THIS EXISTS (measured 2026-09-22, Apple M6). `CPUSummary.cache_size` reported **L2 = 3 MiB** on a
+# part whose real per-core L2 is **20 MiB** — a 6.7x under-detection, and `_L2_BYTES` feeds
+# `_at_gemm_mc` (A-block ≤ 30% L2) plus every other residency formula, so the whole L3 blocking stack
+# was sized for a cache a seventh of the real one.
+#
+# THE TRAP THE OLD COMMENT ALREADY WARNED ABOUT, now acted on: the UNPREFIXED Darwin keys
+# (`hw.l1dcachesize`, `hw.l2cachesize`) do NOT describe the fastest cores. On this M6 they read
+# 96 KiB / 8 MiB, which is the **Efficiency** tier; the `perflevel0` ("Super") cores are 128 KiB / 20 MiB.
+# Benchmarks and real workloads run on the fast tier, so `perflevel0` is the authoritative one — and this
+# chip has THREE tiers (`hw.nperflevels` = 3: Super / Performance / Efficiency), not the usual two.
+#
+# Trim-safe: the `ccall` runs at precompile time inside a `const` initializer and folds to a literal,
+# exactly as the `CpuId` cpuid calls do — no runtime syscall on any code path (req#4).
+function _sysctl_int(name::String)
+    Sys.isapple() || return 0
+    return try
+        out = Ref{Int64}(0)
+        sz = Ref{Csize_t}(sizeof(Int64))
+        rc = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+                   name, out, sz, C_NULL, 0)
+        rc == 0 ? Int(out[]) : 0
+    catch
+        0
+    end
+end
+
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the
 # bandwidth-bound Level-1 kernels, but L2/L3 blocking for the M2 dgemm will read these.
-const _L1_BYTES = let s = Int(cache_size(Val(1)))
+# Darwin: prefer the fast-tier `perflevel0` figure over CPUSummary (see `_sysctl_int` above).
+const _L1_BYTES = let d = _sysctl_int("hw.perflevel0.l1dcachesize")
+    s = d > 0 ? d : Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
 
@@ -123,7 +153,8 @@ const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
-const _L2_BYTES = let s = Int(cache_size(Val(2)))
+const _L2_BYTES = let d = _sysctl_int("hw.perflevel0.l2cachesize")
+    s = d > 0 ? d : Int(cache_size(Val(2)))
     s > 0 ? s : 512 * 1024
 end
 

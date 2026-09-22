@@ -339,6 +339,60 @@ and shape of that heuristic is unknown. Every Accelerate cell measured before th
 re-measured from scratch rather than patched, since there was no way to know in advance which cells the
 leak touched materially.
 
+### ⚠ APPLE SILICON: the Accelerate gap is SME2, and **Julia can reach it** (2026-09-22)
+
+Two findings from the first Apple Silicon pass, one closed and one opened.
+
+**1. `_L2_BYTES` was under-detected 6.7x on Apple Silicon — FIXED.** `CPUSummary.cache_size(Val(2))`
+reported **3 MiB** on an M6 whose fast-tier L2 is **20 MiB**. That value feeds `_at_gemm_mc` and every
+other residency formula, so the entire L3 blocking stack was sized for a cache a seventh of the real
+one (MC=112 where the corrected value is 768; NC 248 -> 640). `cpuinfo.jl` now reads
+`hw.perflevel0.l{1d,2}cachesize` via a precompile-time `sysctl` `ccall` (folds to a const, trim-safe,
+same pattern as the `CpuId` calls). **THE TRAP, and it is why the unprefixed keys must not be used:**
+this part has **THREE** perf tiers (`hw.nperflevels` = 3 — Super 2 cores / Performance 4 / Efficiency 6),
+and the unprefixed `hw.l2cachesize` reports the **Efficiency** tier (8 MiB), not the cores anything is
+benchmarked on. Measured payoff: gemm vs OpenBLAS **+2-3% at n>=512** (0.663 -> 0.684 at n=2048). Real,
+but it is NOT the bulk of the PB-vs-OpenBLAS gap — that remains open and is microkernel-side.
+
+**2. The 7x vs Accelerate is SME2, not a software-quality gap — and it is REACHABLE FROM JULIA.**
+
+The gap was measured at ~469 GFLOP/s (Accelerate) vs ~66 (OpenBLAS) FP64 `dgemm`, single-threaded.
+That looked impossible, and for a same-ISA comparison it is. It is not a same-ISA comparison:
+
+- **Empirical NEON FP64 roofline on this machine: 60.4 GFLOP/s** (16 independent register-resident FMA
+  chains, no memory traffic; ~3.8 FMA/cycle x 2 lanes x 2 flops). **OpenBLAS at 66 GFLOP/s is AT the
+  roofline.** Nothing using NEON goes faster here, PureBLAS included.
+- Accelerate's 469 GFLOP/s is **7.8x the entire NEON ceiling** — arithmetically impossible with 128-bit
+  FMAs. The chip says why: `FEAT_SME2p1 = 1`, **`FEAT_SME_F64F64 = 1`**, `sme_max_svl_b = 64`. An FP64
+  ZA outer product at SVL=512b is 8x8 = 64 FMA = **128 flops/instruction** vs NEON's 16 flops/cycle —
+  exactly the observed ratio.
+
+So the gate as currently defined on this box compares **NEON code against SME hardware**. That is not
+the AOCL-vs-OpenBLAS situation (both contend for the same vector units); it is a different execution
+unit, and no amount of NEON tuning closes it.
+
+**But it is reachable, and that is verified, not asserted:**
+
+| probe | result |
+|---|---|
+| `Vec{8,Float64}` codegen, default AND `-C apple-m1,+sme,+sme2` | 4x 128-bit NEON `fmla`, **zero `z` regs** — LLVM never auto-generates SME |
+| `smstart za` / `smstop za` via `llvmcall` inline asm | **assembles and executes** |
+| `fmopa za0.d` (FP64 outer product) via `llvmcall` | **executes and computes numerically exact results** |
+| `rdsvl` inside streaming mode | **SVL = 64 bytes = 512 bits = 8 FP64 lanes** — full width available |
+
+The route is `Base.llvmcall` with `attributes #0 = { "target-features"="+sme,+sme2,+sme-f64f64" }`, and
+`smstart`/`smstop` bracketing ZA tile ops. Note `smstart za` alone is **not** enough — it enables ZA but
+leaves PSTATE.SM=0, and `fmopa` on `z` registers then traps SIGILL; plain `smstart` enables both.
+(`Sys.CPU_NAME` reports `apple-m1` regardless of `-C` — LLVM 20.1.8 has no M6 model — so the features
+must be forced per-function in the llvmcall IR, which works.)
+
+**What this costs, and why it is the user's call, not an agent's.** An SME microkernel is **inline
+assembly**, which is the same line the x86 residuals were deliberately not allowed to cross ("Closing it
+fully would need x86 inline-asm (crosses the portability line)", Open residuals above). The ARM case is
+the exact analogue and deserves the same deliberation. Unresolved before anyone writes one: trim-safety
+of `llvmcall` inline asm; and streaming mode changes vector register state, so a ZA region must not
+allocate, yield, or hit a GC safepoint — the interaction with Julia's runtime is untested.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
