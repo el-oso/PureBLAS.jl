@@ -238,6 +238,36 @@ Both modes share ONE set of low-level kernels. Source map:
    α that is not a power of two, because scaling by `±2^j` is exact and hides an α-placement
    difference. CI sets `JULIA_NUM_THREADS`, without which these items skip and report green.
 
+12. **A SWEEP IS SCOPED TO THE GROUPS THE CHANGE CAN REACH — PROVE THE SCOPE BEFORE LAUNCHING.
+    (HARD RULE.)** A fleet sweep costs hours of box time on three machines and cannot be interrupted
+    without discarding it, so the scope is a decision that has to be made and defended BEFORE the
+    launch, never rationalised after. State, in the launch message: which groups the change can
+    reach, by what mechanism, and why the rest cannot move. A group survives that argument only if a
+    source file the change touched is on its call path.
+
+    **The cheap proof already exists in the cache.** Every arm record carries its raw samples, so a
+    damaged regime is visible as a sample SPREAD the comparison arm does not have. Query the cache
+    before deciding, not after:
+
+        awk -F'\t' 'NR>1{g=$1; for(i=4;i<=NF;i++){split($i,a,"|");
+          m=split(a[8],s,","); if(m<3) continue; lo=hi=s[1];
+          for(j=1;j<=m;j++){if(s[j]+0<lo+0)lo=s[j]; if(s[j]+0>hi+0)hi=s[j]}
+          k=g"|"a[1]; if(hi/lo>mx[k])mx[k]=hi/lo}}
+          END{for(k in mx) printf "%-12s worst spread %6.2fx\n", k, mx[k]}' bench/mt_data_*.txt | sort
+
+    **Measured, and it is why this rule exists.** 2026-09-21: the `pb_mt` mask starved the gemm
+    pool's join, and all eight groups were re-swept to repair it. The query above, run afterwards,
+    showed the damage confined to **L3 and LP** — worst threaded spread 7.43x and 4.87x against
+    serial arms at 1.59x and 2.25x — while the other six groups' threaded and serial arms agreed to
+    within 0.05x. They agreed because they do not thread: threading exists only in `gemm`, `symm`,
+    `syrk`, `syr2k` and the LAPACK routines that call them. 329 of 937 cells, about 50 minutes per
+    box on three boxes, bought nothing.
+
+    **The one standing exception is anchor coherence**, and it must be argued, not assumed: refreshing
+    part of a cache leaves the rest at an older machine state, and a partial refresh has twice left
+    most of a cache anchor-mismatched. When that is the reason for a wider scope, say so at launch
+    and name the cells it protects — it does not license a full sweep by default.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).
