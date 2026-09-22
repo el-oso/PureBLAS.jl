@@ -528,6 +528,28 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
 end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
+# `cold` forces reps=1 on the L1 sweep -- no repeated-call reuse of the SAME operand buffer within one
+# timed window. WHY: `_L1REP` amortizes timer overhead for cheap ops by calling `reps` times on one
+# `setup()`-allocated buffer; at large n that buffer can be small enough to stay resident in L2/SLC
+# across the whole reps loop, so a nominally "bandwidth-bound" cell ends up measuring repeated-access-
+# to-a-warm-buffer throughput rather than genuine cold/DRAM-streaming throughput -- and a library whose
+# inner loop pipelines especially well against a HOT buffer can look disproportionately faster than it
+# actually is on real, once-through data.
+#
+# CONFIRMED 2026-09-22 on Apple Silicon (M6): the reps-amortized cache read Accelerate's axpy as ~4.3x
+# OpenBLAS at n=1e6 (PB/openblas=1.00, PB/accelerate=0.23); genuinely cold single-shot calls (fresh
+# arrays, ONE call, no reuse) at unambiguously DRAM-scale sizes (10M-50M elements, 240MB-1.2GB, far past
+# any on-chip cache) read only 1.06-1.36x -- the physically plausible number for a per-core DRAM-
+# bandwidth edge. `evals=1` already re-runs `setup()` fresh per Chairmarks SAMPLE (see `sweep`'s own
+# comment), so reps=1 removes exactly the one remaining reuse path (the inner `for _ in 1:reps` loop)
+# without touching anything else about the methodology.
+#
+# NEVER the default -- an explicit, opt-in re-measure mode. Changes nothing for the AMD fleet's existing
+# methodology or caches unless someone passes `cold` there too. Whether the SAME artifact inflates
+# large-n L1 numbers on Zen3 (32 MiB L3 -- n=1e6's 16 MB working set fits) is unconfirmed; this was
+# diagnosed on one Apple Silicon box, not validated on the fleet.
+const _COLD = "cold" in ARGS
+_l1_repfn(base) = _COLD ? (_ -> 1) : base
 
 _reps_cubic(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)
 # QUADRATIC sibling — for LP entries whose work is O(n²), not O(n³): a solve against an ALREADY
@@ -734,7 +756,7 @@ function run_benchmarks()
                     ),
                 ),
             )
-            _meas!(l1, "L1", nm, () -> sweep(s -> (randn(s), randn(s)), _sizes(L1SZ), ob, pb, _L1REP))
+            _meas!(l1, "L1", nm, () -> sweep(s -> (randn(s), randn(s)), _sizes(L1SZ), ob, pb, _l1_repfn(_L1REP)))
         end
     end
 

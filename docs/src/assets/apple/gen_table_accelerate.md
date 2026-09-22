@@ -4,12 +4,12 @@ PB / Accelerate speed ratio, median (worst cell) per op per µarch. Provenance: 
 
 | op | ARM · NEON |
 |---|---|
-| `dot` | 0.18 (0.14) |
-| `axpy` | 0.23 (0.22) |
-| `nrm2` | 1.97 (1.88) |
-| `asum` | 0.56 (0.45) |
-| `scal` | 0.29 (0.28) |
-| `iamax` | 0.94 (0.94) |
+| `dot` | 1.12 (0.43) |
+| `axpy` | 1.19 (0.56) |
+| `nrm2` | 1.95 (1.67) |
+| `asum` | 1.00 (0.53) |
+| `scal` | 0.92 (0.35) |
+| `iamax` | 0.93 (0.90) |
 | `gemvN` | 0.17 (0.10) |
 | `gemvT` | 0.34 (0.16) |
 | `ger` | 0.37 (0.24) |

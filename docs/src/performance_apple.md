@@ -19,32 +19,63 @@ are **not frequency-locked** — read them as directional, not gate verdicts.
 
 ## Headline
 
-Of the 29 real (Float64) cells measured, **1 gates** (`nrm2`, where OpenBLAS's always-scaled algorithm is
-slow on every platform PureBLAS has been measured on). PureBLAS is competitive with **OpenBLAS** on this
-first pass — roughly at parity on BLAS-1/2 and trailing modestly on BLAS-3/LAPACK (0.7-1.6×, median) — but
-well behind **Accelerate** almost everywhere, especially on BLAS-3 (0.08-0.3×). That gap tracks Accelerate
-routing through Apple's AMX matrix coprocessor, which pure-Julia NEON code (128-bit, 2 Float64 lanes) has
-no access to; closing it is a tuning/architecture question for a future session, not something this
-data-generation pass attempts.
+Of the 29 real (Float64) cells measured, **1 gates outright** (`nrm2`, where OpenBLAS's always-scaled
+algorithm is slow on every platform PureBLAS has been measured on) — but the gate figure (worst-cell)
+understates BLAS-1: on the **median**, PureBLAS now *beats* Accelerate on `dot` (1.12×) and `axpy` (1.19×),
+and sits near parity on `asum`/`scal`. See [Measurement artifact](#measurement-artifact-large-n-blas-1)
+below — the first pass here read those four ops as losing to Accelerate by 3-5×, which was wrong.
 
-**Widening L1 mattered.** At n=1000 alone, `dot`/`axpy`/`scal` looked competitive with Accelerate
-(1.04×/0.41×/0.57×); across the full 1e3..1e6 ladder the picture is starker (0.18×/0.23×/0.29× median) —
-Accelerate's advantage grows with problem size on bandwidth-bound ops too.
+PureBLAS is roughly at parity with **OpenBLAS** overall (0.5-2.1× across BLAS-1/2, 0.7-1.6× on BLAS-3/
+LAPACK), and trails **Accelerate** substantially on BLAS-2/3/LAPACK (0.1-0.3× on most of BLAS-3). That
+part of the gap is *not* a measurement artifact — it holds at genuinely DRAM/compute-bound sizes — and
+most plausibly tracks Accelerate routing through Apple's AMX matrix coprocessor (confirmed at ~550
+GFLOP/s single-core `dgemm`, single-threaded — see below), which pure-Julia NEON code (128-bit, 2 Float64
+lanes) has no access to. Closing that is a tuning/architecture question for a future session.
+
+## Measurement artifact: large-n BLAS-1
+
+**The first pass through this page reported `dot`/`axpy`/`asum`/`scal` losing to Accelerate by 3-5× at
+large n. That number was inflated by a benchmark-harness artifact, not a real hardware gap.**
+
+`bench/plots.jl`'s `_L1REP(s) = clamp(8_000_000 ÷ s, 30, 20000)` amortizes per-call timer overhead by
+running `reps` calls back-to-back **on the same operand buffer** inside one timed window. At n=1e6 that
+buffer is 16MB (`x`+`y`) — small enough to plausibly stay resident in L2/SLC across all `reps=30` calls,
+so the measurement can end up reading repeated-access-to-a-warm-buffer throughput rather than genuine
+cold/DRAM-streaming throughput. A library whose inner loop pipelines especially well against a *hot*
+buffer looks disproportionately faster than it is on real, once-through data.
+
+Verified directly: with genuinely cold, single-shot, freshly-allocated arrays at sizes far too large for
+any cache (10M-50M elements, 240MB-1.2GB), Accelerate's real advantage over OpenBLAS on `axpy` is only
+**1.06-1.36×** — physically consistent with a modest per-core DRAM-bandwidth edge — not the ~4.3× the
+reps-amortized measurement implied (`PB/openblas≈1.00`, `PB/accelerate≈0.23` ⟹ implied `accelerate/
+openblas≈4.3×`).
+
+**Fix, applied here:** `bench/plots.jl` gained a `cold` flag (opt-in, off by default) that forces
+`reps=1` on the L1 sweep — `evals=1` already re-runs `setup()` fresh per Chairmarks sample, so `reps=1`
+removes the one remaining reuse path. The table below reflects the `cold` re-measurement for all six L1
+ops. This is **not the default** and changes nothing for the AMD fleet's existing methodology or caches.
+
+**Open question, not yet answered:** whether the same artifact inflates large-n L1 numbers on the AMD
+fleet. Zen3's 32 MiB L3 is large enough that n=1e6's 16MB working set would fit there too, by the same
+argument that applies here. This was diagnosed on one Apple Silicon box; it has not been checked against
+the AMD fleet's own caches or re-measured there with `cold`.
 
 ## vs OpenBLAS and Accelerate, per op
 
 Ratio is PB / reference, **median (worst cell)** across the measured size ladder (capped at n=2048 for
-BLAS-2/3/LAPACK; full 1e3..1e6 for BLAS-1). Gate is PB / max(OpenBLAS, Accelerate) — the same
-two-significant-digit rounding rule as the [main fleet](methodology.md#the-gate) (`bench/gatecrit.jl`).
+BLAS-2/3/LAPACK; full 1e3..1e6 for BLAS-1, L1 measured `cold` — see above). Gate is PB / max(OpenBLAS,
+Accelerate) — the same two-significant-digit rounding rule as the
+[main fleet](methodology.md#the-gate) (`bench/gatecrit.jl`). The gate is a **worst-cell** figure, so a
+FAIL can still have a winning median — true for `dot`/`axpy`/`asum` below.
 
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
-| L1 | `dot` | 1.01 (0.98) | 0.18 (0.14) | 0.138 | FAIL |
-| L1 | `axpy` | 1.00 (0.97) | 0.23 (0.22) | 0.225 | FAIL |
-| L1 | `nrm2` | 8.26 (7.89) | 1.97 (1.88) | 1.882 | **PASS** |
-| L1 | `asum` | 1.01 (0.99) | 0.56 (0.45) | 0.447 | FAIL |
-| L1 | `scal` | 0.99 (0.98) | 0.29 (0.28) | 0.280 | FAIL |
-| L1 | `iamax` | 0.45 (0.43) | 0.94 (0.94) | 0.427 | FAIL |
+| L1 | `dot` | 1.00 (1.00) | **1.12** (0.43) | 0.427 | FAIL |
+| L1 | `axpy` | 1.01 (1.00) | **1.19** (0.56) | 0.556 | FAIL |
+| L1 | `nrm2` | 8.42 (7.00) | 1.95 (1.67) | 1.672 | **PASS** |
+| L1 | `asum` | 1.01 (1.00) | **1.00** (0.53) | 0.533 | FAIL |
+| L1 | `scal` | 0.99 (0.99) | 0.92 (0.35) | 0.355 | FAIL |
+| L1 | `iamax` | 0.50 (0.49) | 0.93 (0.90) | 0.491 | FAIL |
 | L2 | `gemvN` | 1.52 (0.84) | 0.17 (0.10) | 0.102 | FAIL |
 | L2 | `gemvT` | 1.51 (0.94) | 0.34 (0.16) | 0.162 | FAIL |
 | L2 | `ger` | 1.00 (0.92) | 0.37 (0.24) | 0.241 | FAIL |
@@ -93,7 +124,7 @@ spread). "gate" divides by whichever reference is faster at each point.
 ## Reproduce
 
 ```
-julia --project=bench/apple bench/plots.jl bench group=L1 arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench/apple bench/plots.jl bench group=L1 arms=pb,openblas,accelerate cold nodraw
 julia --project=bench/apple bench/plots.jl bench group=L2 arms=pb,openblas,accelerate maxsize=2048 nodraw
 julia --project=bench/apple bench/plots.jl bench group=L3 arms=pb,openblas,accelerate maxsize=2048 nodraw
 julia --project=bench/apple bench/plots.jl bench op=potrf arms=pb,openblas,accelerate maxsize=2048 nodraw

@@ -4,12 +4,12 @@ PB / OpenBLAS speed ratio, median (worst cell) per op per µarch. Provenance: [`
 
 | op | ARM · NEON |
 |---|---|
-| `dot` | 1.01 (0.98) |
-| `axpy` | 1.00 (0.97) |
-| `nrm2` | 8.26 (7.89) |
-| `asum` | 1.01 (0.99) |
-| `scal` | 0.99 (0.98) |
-| `iamax` | 0.45 (0.43) |
+| `dot` | 1.00 (1.00) |
+| `axpy` | 1.01 (1.00) |
+| `nrm2` | 8.42 (7.00) |
+| `asum` | 1.01 (1.00) |
+| `scal` | 0.99 (0.99) |
+| `iamax` | 0.50 (0.49) |
 | `gemvN` | 1.52 (0.84) |
 | `gemvT` | 1.51 (0.94) |
 | `ger` | 1.00 (0.92) |

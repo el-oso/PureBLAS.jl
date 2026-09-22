@@ -237,6 +237,55 @@ day's conclusions the wrong way. Two consequences worth carrying:
 This does not retire the review above: it is about comparing two PB arms, while the coverage tables
 divide PB by a cached reference and cannot be paired that way.
 
+### ⚠ METHODOLOGY FINDING (2026-09-22) — `_L1REP`'s reps-loop can measure a warm buffer, not DRAM streaming
+
+Diagnosed on the first Apple Silicon pass ([Apple Silicon](docs/src/performance_apple.md)), and it
+bears on **every** L1 cell on **every** box, not just that one — flagging it here rather than only in the
+Apple-specific page.
+
+**The mechanism.** `_L1REP(s) = clamp(8_000_000 ÷ s, 30, 20000)` amortizes per-call timer overhead by
+running `reps` calls back-to-back **on the same `setup()`-allocated operand buffer** inside one timed
+window (`for _ in 1:reps; f(c); end`, same `c` every iteration). That is fine while the buffer is much
+bigger than any cache — genuinely fresh DRAM traffic every call regardless of reuse. It stops being fine
+once the buffer is *small enough to stay resident* across the whole reps loop: from the second call on,
+you are measuring repeated-access-to-a-warm-buffer throughput, not cold/streaming throughput — and a
+library whose inner loop pipelines especially well against a HOT buffer (more so than it does against
+cold DRAM) reads disproportionately faster than it actually is on real, once-through data.
+
+**How big a difference this made.** On the Apple M6, `_L1REP`-amortized `axpy` at n=1e6 (16MB working
+set, `reps=30`) read `PB/openblas≈1.00`, `PB/accelerate≈0.18` — implying Accelerate is ~5.5× OpenBLAS.
+Genuinely cold, single-shot, freshly-allocated arrays at sizes far too large for any cache (10M-50M
+elements, 240MB-1.2GB, one call each, no reuse) read Accelerate at only **1.06-1.36×** OpenBLAS — the
+physically plausible number for a per-core DRAM-bandwidth edge. Forcing `reps=1` on the existing L1 sweep
+(`_l1_repfn`/`cold` flag, `bench/plots.jl`) reproduced that correction in-harness: `dot`/`axpy` flipped
+from PB *losing* to Accelerate by 3-5× to PB *beating* it on the median (1.12×/1.19×), and `asum`/`scal`
+moved to near parity. `nrm2`/`iamax` were unaffected (not bandwidth-bound the same way; `iamax`'s
+reduction has a data-dependent branch that already limits reuse benefit).
+
+**What this does NOT touch.** Anything whose operand is already far larger than any cache regardless of
+`reps` — BLAS-3/LAPACK (n²/n³-sized matrices, typically hundreds of MB at the sizes that matter) — is
+unaffected. The Apple-Silicon gemm/potrf/etc. numbers, and the fleet's own L2/L3/LAPACK numbers, do not
+have this failure mode.
+
+**What's still open — THIS IS THE PART THAT NEEDS THE FLEET, NOT ONE BOX.** Whether this inflates the
+AMD fleet's own published large-n L1 cells is UNCONFIRMED. Zen3 ships a 32 MiB L3; n=1e6's 16MB working
+set fits inside it by the same argument that applies on the Apple box. Zen4/Zen5 have smaller L3s
+(16 MiB) but the argument is the same in kind. Concretely un-checked:
+- whether OpenBLAS/AOCL benefit from L1REP's buffer-reuse as asymmetrically as Accelerate apparently does
+  (if all arms benefit equally, the RATIO is still fair even though the absolute GB/s is not "DRAM
+  bandwidth" — asymmetric benefit is what actually breaks a ratio, and that has not been checked on x86);
+- whether any currently-published L1 gate cells (PASS or FAIL) would move under `cold` re-measurement;
+- whether the fix belongs in `_L1REP` itself (e.g. cap `reps` once the buffer exceeds some fraction of
+  `_L1_BYTES`/`_L2_BYTES`, rather than a separate opt-in flag) — that is a shared-methodology change and
+  needs the same care the `sweep_heavy` review above asks for, not a unilateral edit.
+
+**The fix shipped so far is deliberately narrow and non-default.** `bench/plots.jl` gained `cold` (opt-in,
+off unless passed) forcing `reps=1` on the L1 sweep only; `evals=1` already re-runs `setup()` fresh per
+Chairmarks sample, so `reps=1` removes the one remaining reuse path. Nothing about the AMD fleet's
+existing methodology, caches, or published numbers changed. Re-measuring the fleet with `cold` (or
+deciding whether/how to fold a residency cap into `_L1REP`'s default) is the next step, and it is a
+methodology decision, not something to make unilaterally from one box's data.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
