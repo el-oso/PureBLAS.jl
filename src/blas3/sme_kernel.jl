@@ -304,14 +304,13 @@ end
 # is much WORSE — 0.24x at n=4096 — because the panel is re-read once per column panel and the
 # packed copy is what keeps it cache- and TLB-resident.
 function _sme_pack_A!(
-        Ap::AbstractVector{Float64}, A::Ptr{Float64}, lda::Int,
+        Ap::Ptr{Float64}, A::Ptr{Float64}, lda::Int,
         ic::Int, pc::Int, mce::Int, kce::Int, kpad::Int, alpha::Float64
     )
     MR = _SME_MR
     np = cld(mce, MR)
     one_alpha = alpha == 1.0
-    GC.@preserve Ap begin
-        pa = pointer(Ap)
+    let pa = Ap
         @inbounds for ip in 0:(np - 1)
             base = ip * kpad * MR
             i0 = ip * MR
@@ -343,13 +342,12 @@ end
 # Scalar B pack with zero fill, for blocks whose edges the ZA transpose cannot read: it works in
 # whole LxL blocks and would run off the end of B on a ragged column or depth remainder.
 function _sme_pack_B_edge!(
-        Bp::AbstractVector{Float64}, B::Ptr{Float64}, ldb::Int,
+        Bp::Ptr{Float64}, B::Ptr{Float64}, ldb::Int,
         pc::Int, jc::Int, kce::Int, nce::Int, kpad::Int
     )
     NR = _SME_NR
     npn = cld(nce, NR)
-    GC.@preserve Bp begin
-        pb = pointer(Bp)
+    let pb = Bp
         @inbounds for jp in 0:(npn - 1)
             base = jp * kpad * NR
             j0 = jp * NR
@@ -405,7 +403,7 @@ end
 function _sme_gemm!(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
         m::Int, n::Int, k::Int, alpha::Float64, beta::Float64,
-        Ap::AbstractVector{Float64}, Bp::AbstractVector{Float64}, Cs::AbstractVector{Float64},
+        Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64},
         MC::Int, NC::Int, KC::Int
     )
     MR = _SME_MR
@@ -433,9 +431,7 @@ function _sme_gemm!(
             kpad = cld(kce, _SME_L) * _SME_L
             # The ZA transpose works in whole LxL blocks and would read past B on a ragged edge.
             if kce == kpad && nce == npad
-                GC.@preserve Bp begin
-                    _sme_packb!(pointer(Bp), B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
-                end
+                _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
             else
                 _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
             end
@@ -460,8 +456,8 @@ end
 # that would overhang goes through a contiguous MRxNR scratch tile and is copied back live-part
 # only.
 function _sme_macro_edges!(
-        C::Ptr{Float64}, ldc::Int, Ap::AbstractVector{Float64}, Bp::AbstractVector{Float64},
-        Cs::AbstractVector{Float64}, ic::Int, jc::Int, mce::Int, nce::Int,
+        C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
+        Cs::Ptr{Float64}, ic::Int, jc::Int, mce::Int, nce::Int,
         mpad::Int, npad::Int, kpad::Int, m::Int, n::Int
     )
     MR = _SME_MR
@@ -470,10 +466,7 @@ function _sme_macro_edges!(
     njp = npad ÷ NR
     full_i = (mce % MR == 0)
     full_j = (nce % NR == 0)
-    GC.@preserve Ap Bp Cs begin
-        pa = pointer(Ap)
-        pb = pointer(Bp)
-        pcs = pointer(Cs)
+    let pa = Ap, pb = Bp, pcs = Cs
         if full_i && full_j
             _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kpad, false)
             return nothing
@@ -517,4 +510,88 @@ end
     apad = cld(min(MC, m), _SME_MR) * _SME_MR
     bpad = cld(min(NC, n), _SME_NR) * _SME_NR
     return (apad * kpad, bpad * kpad, _SME_MR * _SME_NR, MC, NC, KC)
+end
+
+# ── Entry point from `_gemm_core!` ─────────────────────────────────────────────────────────────
+# Float64, op(A)=A, op(B)=B, unit row stride on all three. Scratch comes from the shared Level-3
+# workspace: the MRxNR edge tile is carved off the tail of the A slot so no new workspace field is
+# needed (that struct's constructor is a long positional list and adding to it has shipped a bug).
+#
+# Below `_SME_MIN` the problem is too small for the packed panels to pay for themselves and the
+# existing SIMD routes are better. The value is a MEASURED crossover, not a residency formula --
+# it depends on packing throughput against kernel throughput, neither of which is predictable
+# from a cache size -- so it is a Measure-tier default with a Preferences override.
+const _SME_MIN = @load_preference("sme_min", 4 * _SME_MR)::Int
+
+# THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
+#
+# A function holding ZA state needs the streaming vector length to size its stack frame, which
+# lowers to `rdsvl`. A package image is generated for a GENERIC CPU, where that instruction cannot
+# be selected at all (`LLVM ERROR: Cannot select: AArch64ISD::RDSVL`), so this code can only ever
+# be compiled for the host. Precompilation reaches it by INFERENCE, not by execution -- the
+# workload multiplies 8x8 matrices and never takes the branch -- and inference walks straight
+# through a call boundary, so `@noinline` does not stop it.
+#
+# The barrier is a function pointer resolved at load time: inference sees an opaque `Ptr`, the
+# trampoline (and hence the kernel) is compiled on the host, and the `ccall` through it has
+# concrete argument types so nothing is boxed and nothing is allocated.
+const _SME_TRAMPOLINE = Ref{Any}(nothing)      # roots the closure against collection
+const _SME_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _sme_entry_cabi(
+        C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
+        m::Int, n::Int, k::Int, alpha::Float64, beta::Float64,
+        Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64}, MC::Int, NC::Int, KC::Int
+    )
+    _sme_gemm!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, Ap, Bp, Cs, MC, NC, KC)
+    return nothing
+end
+
+# Called from `__init__`. The target is fetched by NAME at run time, so inference sees only `Any`
+# and never reaches the streaming kernel.
+function _sme_init!()
+    _SME_F64 || return nothing
+    # `__init__` also runs inside the PRECOMPILE process, whose codegen targets the generic image
+    # CPU. Building the trampoline there compiles the kernel into the image and fails on `rdsvl`.
+    ccall(:jl_generating_output, Cint, ()) == 0 || return nothing
+    try
+        # `getfield(@__MODULE__, :name)` is NOT opaque -- module and symbol are both constants, so
+        # inference folds it back to the concrete function and walks into the kernel anyway.
+        # `inferencebarrier` forces the value to `Any`, which is what actually stops it.
+        f = Base.inferencebarrier(_sme_entry_cabi)
+        cf = @cfunction($f, Cvoid,
+            (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
+             Int, Int, Int, Float64, Float64,
+             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+        _SME_TRAMPOLINE[] = cf
+        _SME_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, cf)
+    catch
+        # A machine that advertises the feature but cannot build the kernel keeps the SIMD path.
+        _SME_ENTRY[] = C_NULL
+    end
+    return nothing
+end
+
+@inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
+    T === Float64 && _SME_F64 && !tA && !tB && !cA && !cB &&
+        _strided1(C) && _strided1(A) && _strided1(B) &&
+        max(m, n, k) >= _SME_MIN && _SME_ENTRY[] !== C_NULL
+
+@noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int)
+    asz, bsz, csz, MC, NC, KC = _sme_scratch_sizes(m, n, k)
+    Ap, Bp = _gemm_scratch(Float64, asz + csz, bsz)
+    ldc = stride(C, 2); lda = stride(A, 2); ldb = stride(B, 2)
+    GC.@preserve C A B Ap Bp begin
+        pap = pointer(Ap)
+        ccall(
+            _SME_ENTRY[], Cvoid,
+            (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
+             Int, Int, Int, Float64, Float64,
+             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int),
+            pointer(C), ldc, pointer(A), lda, pointer(B), ldb,
+            m, n, k, alpha, beta,
+            pap, pointer(Bp), pap + asz * sizeof(Float64), MC, NC, KC
+        )
+    end
+    return C
 end

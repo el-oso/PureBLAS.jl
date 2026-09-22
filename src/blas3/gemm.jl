@@ -3158,6 +3158,13 @@ end
         if max(m, n, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
+        # Apple SME, ahead of Strassen ON PURPOSE. Strassen trades a 7/8 flop cut per level for
+        # extra additions; SME executes the flops on a unit that is ~8x faster than NEON, so the
+        # unit wins outright here and the recursion would only route work away from it. Measured
+        # single-thread on an M6: SME 514 GFLOP/s at n=2048 against OpenBLAS 64.
+        if _sme_eligible(T, m, n, k, tA, tB, cA, cB, C, A, B)
+            return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k)
+        end
         if _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k) > 0
             if !tB
                 return _gemm_strassen!(m, n, k, alpha, A, B, beta, C)   # large-n real: 7-mult recursion beats OB
