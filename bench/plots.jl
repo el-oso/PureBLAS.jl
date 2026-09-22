@@ -2619,6 +2619,49 @@ else
     save_cache(CACHE, [lvl => get(g, lvl, OpData[]) for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP", "DL1", "DL2", "DL3", "DLP")])
 end
 
+# `export=<path>` dumps per-size ratios (the exact numbers `svg_panels`/`gen_table` draw from -- calls
+# the SAME `_series`/`gatestat`, no re-derivation) as JSON, for building a chart outside this file's own
+# hand-rolled SVG renderer. One record per (level, op, size): {level, op, size, ob, acc} where ob/acc are
+# the per-size median ratio (PB/reference) against whichever refs are in `_REF_ALL`.
+let i = findfirst(a -> startswith(a, "export="), ARGS)
+    if !isnothing(i)
+        path = ARGS[i][8:end]
+        io = IOBuffer()
+        print(io, "[")
+        first_rec = true
+        for lvl in ("L1", "L2", "L3", "LP", "CL1", "CL2", "CL3", "CLP")
+            for op in _opsin([(nothing, g)], lvl)
+                sizes = Set{Int}()
+                for ref in _REF_ALL
+                    ps = _series(g, lvl, op, ref)
+                    isnothing(ps) || for (s, _) in ps
+                        push!(sizes, s)
+                    end
+                end
+                for s in sort(collect(sizes))
+                    vals = Dict{String, Union{Float64, Nothing}}()
+                    for ref in _REF_ALL
+                        ps = _series(g, lvl, op, ref)
+                        cell = isnothing(ps) ? nothing : findfirst(p -> p[1] == s, ps)
+                        vals[ref] = isnothing(cell) ? nothing : median(ps[cell][2])
+                    end
+                    first_rec || print(io, ",")
+                    first_rec = false
+                    print(
+                        io, "{\"level\":\"", lvl, "\",\"op\":\"", op, "\",\"size\":", s,
+                        (isnothing(get(vals, "openblas", nothing)) ? "" : ",\"openblas\":$(vals["openblas"])"),
+                        (isnothing(get(vals, "accelerate", nothing)) ? "" : ",\"accelerate\":$(vals["accelerate"])"),
+                        (isnothing(get(vals, "aocl", nothing)) ? "" : ",\"aocl\":$(vals["aocl"])"), "}"
+                    )
+                end
+            end
+        end
+        print(io, "]")
+        write(path, String(take!(io)))
+        println("wrote ", path)
+    end
+end
+
 adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR; mkpath(adir)
 tdir = isnothing(_OUTDIR) ? (@__DIR__) : _OUTDIR
 # Draw the whole FLEET (every host cache on disk) as cross-µarch panel grids: 8 SVGs, NO per-host suffix
