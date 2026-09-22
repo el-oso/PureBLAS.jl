@@ -86,6 +86,19 @@ end
 # plain appended suffix (`dgemm_$NEWLAPACK$ILP64`, which does not exist) and silently falls back to LP64.
 const _ACCELERATE_PATH = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
 const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
+# `LinearAlgebra.BLAS.set_num_threads(1)` (called after every forward, below) does NOT constrain
+# Accelerate — confirmed empirically (2026-09-22): a `dgemm` at n=4000 pinned at ~190-200% CPU (ps,
+# sampled continuously across a 14 s / 60-call window) despite `set_num_threads(1)` having been called.
+# vecLib reads `VECLIB_MAXIMUM_THREADS` at its OWN first-use initialization, independent of LBT's thread
+# knob, and (like BLIS/OMP_NUM_THREADS above) that read happens ONCE — setting the env var later in the
+# same process, after Accelerate has already been forwarded/called once, has no effect (confirmed: doing
+# so gave ~same 2-core timing). Setting it here, at file load, before `_use_ref!` can ever reach
+# Accelerate for the first time, is required for a real single-thread measurement. Verified fix: with
+# this set before first use, the SAME `dgemm` pins at a clean ~99-100% CPU for the whole window
+# (272.7 ms/call vs the uncontrolled run's 234.6 ms/call — i.e. the "second core" bought only ~16%,
+# consistent with AMX being a per-core resource a second software thread can't usefully double up on,
+# not with real 2x general-purpose parallelism).
+ENV["VECLIB_MAXIMUM_THREADS"] = "1"
 
 # Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK

@@ -149,3 +149,16 @@ AOCL's separate `libblis-mt`/`libflame`). Verified empirically on this machine: 
 reports `[ILP64] Accelerate` after the forward, `dgemm` and `potrf` reconstruction errors sit at Float64
 noise floor (~1e-12–1e-14), and `dgemm` runs at a clearly distinct, much faster wall-clock than OpenBLAS —
 consistent with Accelerate's AMX-backed kernels.
+
+**Threading — the part that is easy to get wrong.** `LinearAlgebra.BLAS.set_num_threads(1)`, which pins
+every other reference (OpenBLAS/AOCL/MKL) to one thread, does **not** constrain Accelerate. vecLib reads
+`VECLIB_MAXIMUM_THREADS` at its own first-use initialization, independent of LBT's thread knob — set it
+too late (including from within the same process, after Accelerate has already been forwarded once) and
+it has no effect. `bench/plots.jl` sets `ENV["VECLIB_MAXIMUM_THREADS"] = "1"` at file load, before
+`_use_ref!` can ever reach Accelerate for the first time, mirroring the `BLIS_NUM_THREADS`/
+`OMP_NUM_THREADS` pattern already used for AOCL above. Without it, a `dgemm` at n=4000 silently runs on
+~2 threads (confirmed: process CPU% pinned at a sustained ~190-200%, `ps -o %cpu=` sampled continuously
+across a 14 s / 60-call window) despite `set_num_threads(1)` having been called — and the effect is
+routine-dependent: BLAS-3 (`gemm` and siblings) picked up ~2 threads by default; LAPACK factorizations
+(`potrf` checked directly at n=2048, 400 calls) stayed single-threaded either way. Full incident writeup:
+`ROADMAP.md`, "`set_num_threads(1)` does NOT constrain Accelerate".

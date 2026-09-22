@@ -286,6 +286,59 @@ existing methodology, caches, or published numbers changed. Re-measuring the fle
 deciding whether/how to fold a residency cap into `_L1REP`'s default) is the next step, and it is a
 methodology decision, not something to make unilaterally from one box's data.
 
+### ⚠ METHODOLOGY FINDING (2026-09-22) — `BLAS.set_num_threads(1)` does NOT constrain Accelerate
+
+More serious than the one above: this one silently gave every `vs Accelerate` cell an uncontrolled
+thread-count advantage, on every op, for the whole time the Accelerate backend existed (from its first
+landing earlier the same day) until fixed. Root-caused after the user refused to believe a ~550 GFLOP/s
+single-core `dgemm` figure — correctly; it was not single-core.
+
+**The mechanism.** `_use_ref!` calls `LinearAlgebra.BLAS.set_num_threads(1)` after every backend forward
+(the one call `bench/plots.jl` relies on for every reference — OpenBLAS, AOCL, MKL, and now Accelerate —
+to be single-threaded). It works for OpenBLAS/AOCL/MKL. It does **not** work for Accelerate: vecLib reads
+its own thread-pool size from `VECLIB_MAXIMUM_THREADS` at its OWN first-use initialization, independent
+of whatever LBT's generic thread-count knob does, and that env var is never set anywhere in
+`bench/plots.jl`. The result: Accelerate silently ran on however many threads its own heuristic picked
+(confirmed 2, at n=4000 `dgemm` — process CPU% pinned at a sustained ~190-200%, sampled continuously
+across a full 14 s / 60-call window, `ps -o %cpu=` every 0.6 s), while PureBLAS and every other reference
+correctly ran on one.
+
+**Verified, not asserted.** Setting `VECLIB_MAXIMUM_THREADS=1` in the process environment BEFORE the
+first Accelerate forward (at the shell level, or in-process as long as it precedes first use — setting it
+AFTER first use has no effect, confirmed by testing both) pins CPU% at a clean, sustained ~99-100%
+throughout the same workload, both via a raw timing loop and via Chairmarks `@be` (`bench/plots.jl`'s
+actual measurement path) — so the fix is confirmed effective under the real harness, not just a toy
+script.
+
+**How much this actually moved the numbers — smaller than the discovery made it sound.** The corrected
+(genuinely single-thread) `dgemm` at n=4000 is ~469 GFLOP/s, not ~550 — the "second thread" was buying
+Accelerate only ~16% (272.7 ms/call single-thread vs 234.6 ms/call with the leak), not the ~2x true
+parallelism would predict. Consistent with AMX being a per-core matrix unit a second software thread
+can't usefully double up on, not with real general-purpose 2x parallelism. Re-measuring `gemm`'s full
+`bench/plots.jl` cell (all sizes, real methodology) with the fix moved PureBLAS's ratio against Accelerate
+by **+2% to +15%, growing with n** (largest at n≥1000) — a real, consistent, correctly-signed correction,
+but not the dramatic reversal a "PB was being compared against 2 cores" headline would suggest. The
+dominant ~7x single-core gap on `gemm` (AMX access neither OpenBLAS nor PureBLAS has) is real and stands;
+it is now on verified single-thread footing rather than an assumed one.
+
+**Fix shipped:** `ENV["VECLIB_MAXIMUM_THREADS"] = "1"` set at `bench/plots.jl` load time, before
+`_use_ref!` can ever reach Accelerate for the first time — mirrors the existing
+`ENV["BLIS_NUM_THREADS"]`/`ENV["OMP_NUM_THREADS"]` pattern already there for AOCL/BLIS. Harmless on any
+other platform (the var is simply unused where vecLib doesn't exist).
+
+**LAPACK checked separately and confirmed clean.** `potrf` at n=2048 (400 calls, `ps -o %cpu=` sampled
+continuously) stayed at a sustained ~99-100% CPU *both* before and after the fix — Accelerate's LAPACK
+factorizations were never affected, unlike its BLAS-3 routines. That is why the full re-measurement left
+`potrf`/`getrf`/`geqrf`/`gesvd` numerically unchanged from the pre-fix run: there was nothing to fix
+there, not a remaining leak. Whether that holds at every LAPACK size, or is specific to n=2048, is
+untested.
+
+**What's still open.** Whether Accelerate's BLAS-3 thread count is size-dependent (the correction grows
+with n — 32-512 moved 2-7%, 1000-2048 moved 11-15%) was observed, not characterized; the exact threshold
+and shape of that heuristic is unknown. Every Accelerate cell measured before this fix landed was
+re-measured from scratch rather than patched, since there was no way to know in advance which cells the
+leak touched materially.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
