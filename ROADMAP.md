@@ -386,12 +386,61 @@ leaves PSTATE.SM=0, and `fmopa` on `z` registers then traps SIGILL; plain `smsta
 (`Sys.CPU_NAME` reports `apple-m1` regardless of `-C` — LLVM 20.1.8 has no M6 model — so the features
 must be forced per-function in the llvmcall IR, which works.)
 
-**What this costs, and why it is the user's call, not an agent's.** An SME microkernel is **inline
-assembly**, which is the same line the x86 residuals were deliberately not allowed to cross ("Closing it
-fully would need x86 inline-asm (crosses the portability line)", Open residuals above). The ARM case is
-the exact analogue and deserves the same deliberation. Unresolved before anyone writes one: trim-safety
-of `llvmcall` inline asm; and streaming mode changes vector register state, so a ZA region must not
-allocate, yield, or hit a GC safepoint — the interaction with Julia's runtime is untested.
+**THE BLOCKER IS JULIA'S JIT, NOT LLVM AND NOT THE TARGET NAME. Proven, not inferred (2026-09-22).**
+Two earlier claims in this investigation were WRONG and are corrected here, both caught by the user
+refusing them:
+
+* ~~"LLVM cannot generate SME"~~ — **false.** LLVM generates it cleanly from ACLE intrinsics; clang
+  emits a textbook `fmopa` loop (`ldr z0 / ldr z1 / fmopa za0.d, p0/m, p0/m, z0.d, z1.d`). What LLVM
+  does NOT do is *auto-vectorize* into SME: a plain loop inside `__arm_locally_streaming` falls back to
+  **scalar `fmadd`**, which is WORSE than NEON (NEON is illegal in streaming mode). Auto-vectorization
+  and intrinsic lowering are different claims; conflating them is what produced the wrong conclusion.
+* ~~"`Sys.CPU_NAME = apple-m1` blocks SME"~~ — **false.** `llc -mcpu=apple-m1` emits SME fine; the
+  function-level `"target-features"` carry it. The M1 target name costs a scheduling model, not SME.
+
+**The decisive experiment.** Hand `llc` the EXACT IR Julia is handed:
+
+    define void @svcopy(ptr %src, ptr %dst) #0 {
+      %v = load <vscale x 2 x double>, ptr %src, align 16
+      store <vscale x 2 x double> %v, ptr %dst, align 16
+      ret void }
+    attributes #0 = { noinline "aarch64_pstate_sm_body" "target-features"="+sme,+sme2,+sve,+neon" }
+
+`llc -mcpu=apple-m1` produces exactly what is wanted — `smstart sm` / `ldr z0` / `str z0` / `smstop sm`.
+The same IR through `Base.llvmcall` **SIGILLs**. Julia's module dump confirms it *preserves* the
+attribute verbatim on the outlined function, so the IR reaches LLVM intact — but Julia's JIT never runs
+the **AArch64 SME ABI pass** that lowers `aarch64_pstate_sm_body` into streaming-mode transitions, so
+the z-register code executes with PSTATE.SM=0 and traps. Adding the features via `-C` does not help
+(that sets the TargetMachine, not the missing pass).
+
+**Hardware facts learned, both of which bite immediately:**
+* This part has **NO non-streaming SVE** (`FEAT_SVE` is not even a valid sysctl oid while `FEAT_SME`=1).
+  `z` registers are legal ONLY inside streaming mode — that is what makes the missing pass fatal rather
+  than merely suboptimal.
+* For `.d` elements the ZA slice-offset immediate is limited to **[0,1]**; the slice index must come
+  from the `Ws` register (`mov w12, #r` + `st1d { za0h.d[w12, 0] }`), not a large immediate.
+
+**Corroboration that the ~7x is real and not an artifact of this harness:** `AppleAccelerate.jl`'s own
+published figure is **6-14x faster GEMM than OpenBLAS on Apple Silicon**. The 7.1x measured here sits
+inside that range. Julia's gap on this hardware is a known, open ecosystem issue — JuliaLang/julia#40308
+(scalable-vector/SVE support; it records exactly our failure mode, that fixed `<8 x double>` lowers to
+NEON and `<vscale x 2 x double>` is what is actually needed) and #42312 (access to the matrix hardware).
+The ecosystem's current answer is "call AppleAccelerate.jl" — i.e. shell out to Apple's library
+*precisely because* Julia cannot generate this code today.
+
+**Routes, in the order they should be tried — none of which ships inline asm:**
+1. **Fix/filethe Julia JIT gap.** The snippet above is a complete, minimal reproducer: llc-correct,
+   JIT-SIGILL. That is the real fix and it is upstream work, not a PureBLAS knob.
+2. **The AOT path may already work.** `juliac`/`--output-o` emit through `addPassesToEmitFile`, which
+   DOES run the target's IR passes — so the trim-built `libpureblas.so` could get correct SME while the
+   JIT cannot. **UNTESTED**: the attempt here aborted on sysimage-invocation mechanics, not on anything
+   SME-related. This is the highest-value thing to try next and it fits a build this project already has.
+3. Inline asm — **ruled out by the user**: it is the same portability line the x86 residuals were not
+   allowed to cross. A working asm proof-of-concept exists in the session history (exact 8x8 FP64 ZA
+   outer product, `max|SME-Julia| = 0.0`) and is kept ONLY as evidence that the hardware path is real.
+
+Also still unresolved whenever a kernel does land: streaming mode changes vector register state, so a ZA
+region must not allocate, yield, or hit a GC safepoint.
 
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
