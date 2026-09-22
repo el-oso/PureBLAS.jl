@@ -378,3 +378,51 @@ end
         P.set_num_threads(1)
     end
 end
+
+@testitem "threaded gemm: every element type the driver admits is reproducible" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    # THE TYPE LIST IS READ FROM THE DRIVER'S SIGNATURE, NEVER WRITTEN HERE. `_gemm_threaded!` is
+    # declared `where {T <: BlasReal}` because three things in its body exist only for the real types:
+    # the pool registry, the shared-pack prefit, and the `nroute` discipline that keeps a column slice
+    # on the whole problem's route. Widening that bound to admit complex therefore widens THIS test in
+    # the same edit, and it fails until complex is genuinely reproducible — which is the point. A list
+    # of types spelled out here would have gone on passing while the driver silently grew a type it
+    # cannot split correctly.
+    bounds = Any[]
+    for mm in methods(P._gemm_threaded!)
+        s = mm.sig
+        while s isa UnionAll
+            push!(bounds, s.var.ub)
+            s = s.body
+        end
+    end
+    admitted = filter(T -> any(b -> T <: b, bounds), [Float64, Float32, ComplexF64, ComplexF32])
+    # Liveness: if the signature walk ever stops finding types, this test would pass by testing
+    # nothing. Two real types are admitted today, so anything less means the extraction broke.
+    @test length(admitted) >= 2
+
+    n, k = 512, 96
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        for T in admitted
+            Random.seed!(20261)
+            A = randn(T, n, k); B = randn(T, k, n)
+            P.set_num_threads(nthreads())
+            # Witness per type: a shape that does NOT reach the pool would make bit-identity vacuous.
+            @test P._gemm_workers(n, n, k) > 1
+            for α in (one(T), -one(T), T(2.5)), β in (zero(T), T(0.5))
+                C0 = randn(T, n, n)
+                P.set_num_threads(1);          r = copy(C0)
+                P.gemm!(r, A, B; alpha = α, beta = β)
+                P.set_num_threads(nthreads()); g = copy(C0)
+                P.gemm!(g, A, B; alpha = α, beta = β)
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
