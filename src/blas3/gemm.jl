@@ -2996,9 +2996,9 @@ function _gemm_dual3!(tA::Bool, tB::Bool, m::Int, n::Int, k::Int, alpha::P, A, B
         Av = w(1, ra, ca); Ap = w(2, ra, ca); Bv = w(4, rb, cb); Bp = w(5, rb, cb); P1 = w(7, m, n); P2 = w(8, m, n)
         _split2!(Av, Ap, A, ra, ca); _split2!(Bv, Bp, B, rb, cb)
         o = one(Tr); z = zero(Tr)
-        _gemm_core!(P1, Av, Bv, o, z, tA, tB, false, false)
-        _gemm_core!(P2, Av, Bp, o, z, tA, tB, false, false)
-        _gemm_core!(P2, Ap, Bv, o, o, tA, tB, false, false)
+        _gemm_core_out!(P1, Av, Bv, o, z, tA, tB, false, false)
+        _gemm_core_out!(P2, Av, Bp, o, z, tA, tB, false, false)
+        _gemm_core_out!(P2, Ap, Bv, o, o, tA, tB, false, false)
         αv, αp = _parts(alpha); βv, βp = _parts(beta)
         _combine_dual!(C, P1, P2, αv, αp, βv, βp, iszero(βv) && iszero(βp), m, n)   # both parts: β = 0 + ε·b reads C
     end
@@ -3352,9 +3352,38 @@ end
 #
 # Strassen is NOT optional for performance: forcing it off costs gemm@4096 1.297 -> 0.949, gemm@2048
 # 1.192 -> 0.974 and symm@4096 1.211 -> 0.942, all measured against the cached reference arms.
-@inline function _gemm_core!(
+# TWO ENTRIES, ONE BODY, SPLIT ON THE ELEMENT TYPE — and the split is a compile-budget fix, not style.
+#
+# The body below is the whole routing tree. Inlining it is right for the BLAS types: the tree const-
+# folds to one route, and the call boundary is measurable at the smallest gate cell (gemm@8, measured
+# 0.0537 us inlined against 0.0581 outlined — 8.2%, five rounds each, 0.0% round spread).
+#
+# For every other element type it is wrong. `ForwardDiff.Dual` has no gemm of its own: the dual planes
+# decompose into REAL operands and call back through here, so a dual `gemm!` frame already contains
+# this tree, Strassen, the worker pool and everything they reach. That frame sits at the optimiser's
+# effort budget, and any function added anywhere it can reach tips it over — reported as
+# `OptimizationFailureReport in _gemm_core!` and gated by `test/dual_tests.jl`'s `@test_typestable`.
+# Measured: a single UNUSED parameter added to `_trsm!` was enough.
+#
+# Splitting on `T` rather than on a branch inside the body is what makes this work. A barrier placed
+# on the body's generic branch is inert, because the dual path does not take that branch — it takes
+# the real one. The outlined entry gives the whole tree its own frame instead.
+@inline _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
+        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+
+# THE SAME PRODUCT, IN ITS OWN FRAME. For a caller that issues SEVERAL `_gemm_core!` calls, inlining
+# multiplies the routing tree by the number of calls in one frame, and `_gemm_dual3!` — three plane
+# products — is large enough that the optimiser abandons it. Each such call is a whole gemm, so a
+# call boundary is free at every size that reaches here; the inlined entry above is kept for the
+# single-product callers, where it is worth 8.2% at the smallest gate cell (gemm@8).
+@noinline _gemm_core_out!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
+        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+
+@inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1
+        nroute::Int, strassen::Bool, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     nrt = nroute < 0 ? n : nroute
@@ -3667,9 +3696,10 @@ mutable struct GemmPool{T}
     # generation is waiting on this worker's `done` and cannot let a field change. `kind` is exactly
     # such a field, so widening the word would add risk to the one thing that must not break, for no
     # safety we do not already have.
-    kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK`
-    up::Bool                         # syrk/syr2k: which triangle of C is written
+    kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK` | `_MT_KIND_TRSM`
+    up::Bool                         # syrk/syr2k: which triangle of C is written; trsm: A's triangle
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
+    unit::Bool                       # trsm: A has an implicit unit diagonal
     # ── COOPERATIVE BARRIER ───────────────────────────────────────────────────────────────────────
     # A packed A block is a function of `(ic, pc)` and not of which columns of C a worker owns, so a
     # column-split gemm would have every worker pack the whole of A. Workers deal those blocks out
@@ -3687,6 +3717,9 @@ const _MT_KIND_GEMM = 0
 # PDM: Exempt — job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only,
 # so one comment above a pair leaves the second listed as Unaudited in the knob registry.)
 const _MT_KIND_SYRK = 1
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_TRSM = 2
 
 """
     _syrk_workers(n, k) -> Int
@@ -3769,6 +3802,9 @@ end
 # local — never a field read, so the chunk geometry cannot come from a later job than the one dispatched.
 @inline function _gemm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
     p.kind == _MT_KIND_SYRK && return _syrk_run_chunk(p, nw, i)
+    # `_trsm_run_chunk` is defined in level3.jl, which is included after this file — the call resolves
+    # when it first runs, by which time both exist.
+    p.kind == _MT_KIND_TRSM && return _trsm_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -3990,7 +4026,7 @@ end
         0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
-        _MT_KIND_GEMM, false, false, 0
+        _MT_KIND_GEMM, false, false, false, 0
     )
     return _gemm_pool_start!(p)
 end
@@ -4067,6 +4103,26 @@ get_num_threads() = _MT_NTHREADS[]
 Run one gemm across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with
 the same result, whenever the pool is already in use — see the claim below.
 """
+# EVERY OTHER ELEMENT TYPE LANDS HERE, and this method exists for inference, not for callers. Each of
+# the six call sites decides `nw` from a VALUE (`_gemm_workers` returns 1 when the type guard fails),
+# so inference cannot prove the call unreachable for a `ForwardDiff.Dual` even though the guard makes
+# it so at run time. With no applicable method the call becomes a MethodError node and the whole
+# enclosing frame is reported as a runtime dispatch — `test/dual_tests.jl`'s `@test_typestable`
+# dogfood fails on exactly that. Throwing keeps the diagnosis a caller wants: a type guard widened to
+# admit a type the pool has no registry for fails immediately, with a message, and BEFORE the claim.
+@noinline function _gemm_threaded!(::PtrMatrix{T}, args...) where {T}
+    throw(ArgumentError("threaded Level-3 supports Float32 and Float64 only, got $T. The pool " *
+        "registry, the shared-pack prefit and the `nroute` route discipline are all real-only; see " *
+        "the `where {T <: BlasReal}` method below."))
+end
+
+# `T <: BlasReal` IS A REQUIREMENT OF THE BODY, NOT A CONVENIENCE. Three things below exist only for
+# the real types: `_gemm_poolvec`, `_gpack_prefit!`/`_gpack_shared_pool`, and the `nroute` discipline
+# that keeps a column slice on the same route as the whole problem (the complex route predicates read
+# their own width instead). Declaring `where {T}` and relying on callers to check would put the first
+# complex call inside the pool claim before it failed; stating the bound here makes widening a
+# caller's type guard a dispatch error at the call site instead.
+#
 # The operands are NORMALIZED to `PtrMatrix` by the caller, and the signature says so on purpose. It
 # gives the whole threaded path exactly ONE specialization per element type instead of one per
 # container combination — the same reason the unpacked route normalizes (see `_pm`/`_root` above, and
@@ -4076,8 +4132,8 @@ the same result, whenever the pool is already in use — see the claim below.
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
-        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false
-    ) where {T}
+        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false
+    ) where {T <: BlasReal}
     p = _gemm_pool(T)
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
     # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
@@ -4101,6 +4157,10 @@ the same result, whenever the pool is already in use — see the claim below.
         # with 24 concurrent callers it is the common case, not the rare one.
         if kind == _MT_KIND_SYRK
             _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+        elseif kind == _MT_KIND_TRSM
+            # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
+            # own column count IS the routing width. `C` and `B` are the same matrix here.
+            _trsm!(true, up, tA, cA, unit, alpha, A, C)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
@@ -4113,7 +4173,6 @@ the same result, whenever the pool is already in use — see the claim below.
     # together, and a loser's `resize!` can move storage the winner's workers already hold pointers
     # into. Inside the claim only one caller is ever here, so the workers that follow do nothing but
     # read the outer vector.
-    kind == _MT_KIND_GEMM && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
     # SIGNALS ARE DEFERRED FOR THE WHOLE THREADED BODY. The join below is the `finally` of the chunk,
     # and its `yield()` is a safepoint where a Ctrl-C on the main thread lands as an InterruptException.
     # Unwinding from there would abandon the join, release `busy`, return to the caller, and end its
@@ -4155,14 +4214,26 @@ the same result, whenever the pool is already in use — see the claim below.
     ct.sticky = true
     Base.sigatomic_begin()
     joined = false
+    # TWO FLAGS, BECAUSE THE CLAIM HAS TWO RELEASE CONDITIONS. `joined` says the join finished, so no
+    # worker holds `C.ptr` any more. `published` says a job generation was stored, which is the instant
+    # a worker can start: before it, the pool holds nobody and the claim is safe to hand back; after
+    # it, an unwound driver must leave the pool claimed (see the `finally`). Without the second flag
+    # every throw between the claim and the join poisons the pool for the life of the process, and the
+    # region below allocates, so that is not a hypothetical path.
+    published = false
     try
+        # SIZE THE SHARED BUFFER UNDER THE CLAIM, and before the job is published. The pool grows by
+        # `push!`/`resize!`, and doing that outside the claim lets two large callers race on the same
+        # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
+        # storage the winner's workers already hold pointers into.
+        kind == _MT_KIND_GEMM && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
         p.Cp = C.ptr; p.ldc = C.ld
         p.Ap = A.ptr; p.lda = A.ld
         p.Bp = B.ptr; p.ldb = B.ld
         p.m = C.m; p.n = C.n; p.k = tA ? A.m : A.n
         p.alpha = alpha; p.beta = beta
         p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
-        p.kind = kind; p.up = up; p.sym2 = sym2
+        p.kind = kind; p.up = up; p.sym2 = sym2; p.unit = unit
         # A job that failed inside a barrier leaves arrivals counted. Clearing here rather than on the
         # way out keeps the next job from releasing its first barrier early on a stale count.
         @atomic p.bar = 0
@@ -4171,6 +4242,9 @@ the same result, whenever the pool is already in use — see the claim below.
         # ONE atomic store publishes the worker count together with the generation (see `GemmPool`)
         # and, being sequentially consistent, every plain field written above. Only the driver writes
         # `gen`, and only under `busy`, so read-modify-write here needs no CAS.
+        # Set BEFORE the store, not after: the conservative direction is to poison when unsure, and a
+        # throw between the two lines would otherwise release a pool whose workers had been released.
+        published = true
         @atomic p.gen = _mt_gen_next((@atomic p.gen), nw)
         # Notify UNCONDITIONALLY. The earlier version had each worker announce a `sleeping` flag and woke
         # only those that had announced, to save a notify on the hot path. It deadlocked: with 4 workers
@@ -4207,15 +4281,25 @@ the same result, whenever the pool is already in use — see the claim below.
         end
         (@atomic p.failed) && _throw_gemm_worker()
     finally
-        # RELEASE THE POOL ONLY IF THE JOIN COMPLETED. `joined` is set on the one line that follows the
-        # join loop, so it is false on exactly one path: something unwound OUT of that loop — which,
-        # with signals deferred, is a forced interrupt or a `throwto`, never a plain Ctrl-C. On that
-        # path workers may still hold `C.ptr`, and releasing `busy` would let the NEXT call publish a
-        # job over a pool with live workers. So the pool stays claimed for the life of the process
-        # ("poisoned"): every later `gemm!` loses the `@atomicreplace` above and runs serially, which is
-        # correct and merely slower. A chunk that THROWS is not this path — its join still runs to
-        # completion, `joined` is true, and the pool is released before the error propagates.
-        joined && (@atomic p.busy = false)
+        # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
+        # flags answer it between them.
+        #
+        # `joined` is set on the line after the join loop, so it is false on one path: something
+        # unwound OUT of that loop — which, with signals deferred, is a forced interrupt or a
+        # `throwto`, never a plain Ctrl-C. There workers may still hold `C.ptr`, and releasing `busy`
+        # would let the NEXT call publish a job over a pool with live workers. So the pool stays
+        # claimed for the life of the process ("poisoned"): every later `gemm!` loses the
+        # `@atomicreplace` above and runs serially, which is correct and merely slower.
+        #
+        # `!published` covers the opposite case: nothing unwound out of a join because no job was ever
+        # published, so no worker can have started and the claim is safe to hand back. The setup above
+        # allocates, so a throw there is reachable, and without this term it would poison the pool
+        # silently and permanently — killing threading for the process while every call still returns
+        # a correct answer, which is the hardest kind of failure to notice.
+        #
+        # A chunk that THROWS is neither path: its join still runs to completion, `joined` is true, and
+        # the pool is released before the error propagates.
+        (joined || !published) && (@atomic p.busy = false)
         ct.sticky = was_sticky
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
