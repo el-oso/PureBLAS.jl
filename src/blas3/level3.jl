@@ -1384,8 +1384,8 @@ end
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
 @inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
     _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
-@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool) =                                # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj)
+@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, nroute)
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1515,7 +1515,9 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
 end
 # side R base: B := B·op(A)⁻¹ = B·op(inv(A)). tmp := B·op(iv) via the unpacked path (transB=op is a free
 # Val{TB}; skewed shape m wide, n=k=nb tiny → same unpacked win as invL).
-function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` is the WHOLE problem's row count. `_gemm_unpacked!` keys its kernel on `max(m, n, k)`
+# and takes the larger of the local `m` and this, so a row band routes as the unsplit solve does.
+function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); m = size(B, 1); T = eltype(B)
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape
@@ -1524,9 +1526,9 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
         # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
         # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
         if tr
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -4507,7 +4509,17 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
 end
 
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
-function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+# `nroute` IS THE WHOLE PROBLEM'S ROW COUNT — the side-R mirror of `_trsm_left!`'s column count.
+# A threaded caller hands each worker a ROW band of B, and the predicates below select an algorithm,
+# so a worker reading its own shorter height would take a route the unsplit solve does not.
+#
+# Unlike side L, no shape has yet been found where this changes the ANSWER: a row split was measured
+# bit-identical to the whole across k in {32,64,128,512,1024} x m in {128,256,1024,2048} with the
+# token both supplied and withheld. It is kept because the predicates select algorithms rather than
+# block sizes, which is the property that made the side-L equivalent a real defect; a future base or
+# crossover moves the boundary without touching this file.
+function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
+    mrt = nroute < 0 ? size(B, 1) : nroute
     k = size(A, 1)
     # Lower real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
     # `_trsm_rl_split_f64!`, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no trtri, no
@@ -4532,8 +4544,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
     # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
     if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
-            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _trsm_ncut_r()) &&
-            (size(B, 1) > _trsm_ncut_r() || (k > _trsm_dbase() && size(B, 1) >= _trsm_r_mfloor(k)))
+            (tr || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
+            (mrt > _trsm_ncut_r() || (k > _trsm_dbase() && mrt >= _trsm_r_mfloor(k)))
         # (No `Ar = A` seed here any more: it was dead once every arm gained its own `return`, and while
         # dead it still gave the `Ar` slot a second type, which is the whole cause of the boxing below.)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
@@ -4635,10 +4647,10 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
         # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
-        if size(B, 1) <= _trsm_ncut_r()
+        if mrt <= _trsm_ncut_r()
             k <= _trsm_dbase() && return _trsm_dense_R!(up, tr, unit, A, B)
         elseif k <= _trsm_base()
-            return _trsm_base_invR!(up, tr, unit, A, B)
+            return _trsm_base_invR!(up, tr, unit, A, B, mrt)
         end
     elseif eltype(B) <: BlasComplex
         # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse),
@@ -4659,14 +4671,14 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, :, 1:h); B2 = view(B, :, (h + 1):k)
     if up != tr                                       # solve B1, then B2 -= B1·off, then solve B2
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
-        _gemm_subR!(B2, B1, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_subR!(B2, B1, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
     else                                              # solve B2, then B1 -= B2·off, then solve B1
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
-        _gemm_subR!(B1, B2, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_subR!(B1, B2, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
     end
     return B
 end
@@ -4709,6 +4721,42 @@ end
 # One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
 # where `C` and `B` are the same matrix: trsm solves in place, so the pool's output and RHS coincide.
 # `p.m` is B's row count, which for side 'L' is also A's dimension.
+# ── THREADED trsm, side 'R' ────────────────────────────────────────────────────────────────────────
+# The mirror of side L: `X·op(A) = B` makes every ROW of B an independent solve, so a row band is a
+# whole problem and the bands are write-disjoint. This is the shape `potrf` needs — its lower
+# factorization solves `A21·L11⁻ᵀ` with A21 tall and narrow, so the rows are the long dimension.
+#
+# Bands round to whole `_MR·W` blocks, the microkernel's ROW granularity, for the same reason the
+# column split rounds to `_NR`: a band that is not a whole number of blocks runs a ragged edge kernel,
+# which costs more than the imbalance it fixes.
+@inline function _trsm_rchunk(m::Int, nw::Int, i::Int, ::Type{T}) where {T}
+    mr = _MR * _vwidth(T)
+    blocks = cld(m, mr)
+    b0 = ((i - 1) * blocks) ÷ nw
+    b1 = (i * blocks) ÷ nw
+    i0 = b0 * mr
+    return i0, min(m, b1 * mr) - i0
+end
+
+@inline function _trsm_workers_r(k::Int, m::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * m
+    (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
+end
+
+@noinline function _trsmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _trsm_rchunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.n, p.n, p.lda)          # A is n×n for side R
+    Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    # `p.m`, not `len`: route from the whole problem's ROW count.
+    _trsm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.m)
+    return nothing
+end
+
 @inline function _trsm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
@@ -5001,6 +5049,20 @@ function trsm!(
     # `BlasReal`, not `BlasFloat`: the pool exists only for the two real types, and the route
     # predicates on the complex path read their own width rather than `nroute`, so a complex column
     # split would not be reproducible even once a pool existed.
+    # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
+    # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
+    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
+        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        if nwr > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, transA == 'C', false, nwr,
+                _MT_KIND_TRSMR, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
     if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
         nw = _trsm_workers(k, size(B, 2))
         if nw > 1
