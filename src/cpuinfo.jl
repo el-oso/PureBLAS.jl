@@ -205,6 +205,32 @@ const _L3_BYTES = @load_preference(
     end
 )::Int
 
+# ── SME (Scalable Matrix Extension) ────────────────────────────────────────────────────────────
+# On Apple Silicon the unit that does fast FP64 matrix work is SME, not NEON: `fmopa za.d` is an
+# 8x8 FP64 outer product, 128 flops in one instruction, against NEON's 16 flops/cycle. Measured on
+# an M6: NEON FP64 roofline 60.4 GFLOP/s (OpenBLAS sits at 66, i.e. already there), SME microkernel
+# 549. No NEON tuning reaches those numbers — it is a different execution unit.
+#
+# `_SME_F64` gates the Float64 gemm path: SME2 plus FEAT_SME_F64F64, which is the feature that
+# makes the double-precision outer product legal. SME without F64F64 is useless here.
+#
+# `_SME_LANES` is the FP64 lane count of a streaming vector, read from the OS rather than assumed:
+# `sme_max_svl_b` is the streaming vector length in BYTES (64 on this M6 = 512 bits = 8 lanes), and
+# a ZA tile is `_SME_LANES` x `_SME_LANES`. Kernel tile geometry derives from it, so a machine with
+# a different vector length gets different code rather than wrong results.
+const _SME_F64 = @load_preference(
+    "sme_f64",
+    _sysctl_int("hw.optional.arm.FEAT_SME2") == 1 &&
+        _sysctl_int("hw.optional.arm.FEAT_SME_F64F64") == 1
+)::Bool
+
+const _SME_LANES = @load_preference(
+    "sme_lanes",
+    let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
+        b > 0 ? b ÷ sizeof(Float64) : 0
+    end
+)::Int
+
 # ── AutoTune (req#8): derive machine-dependent tuning from detected cache + ISA + µarch, NOT hardcoded
 # per-µarch literals. Julia JITs to the host, so we COMPUTE block sizes for the ACTUAL machine (incl. CPUs
 # never benchmarked) — the structural advantage over static C/Rust BLAS. Every formula is a pure function
