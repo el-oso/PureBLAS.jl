@@ -3709,6 +3709,23 @@ mutable struct GemmPool{T}
     up::Bool                         # syrk/syr2k: which triangle of C is written; trsm: A's triangle
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
     unit::Bool                       # trsm: A has an implicit unit diagonal
+    # ── LOOK-AHEAD PANEL (getrf) ──────────────────────────────────────────────────────────────────
+    # A heterogeneous job: worker 1 factors the NEXT panel while the others apply the CURRENT panel's
+    # update to the trailing block. The two write disjoint memory — the panel writes its own columns
+    # and `ipiv`, the update writes the block to the right of them — so one dispatch covers both and
+    # the pool's publish/join stays exactly as it is.
+    lap::Ptr{T}                      # panel base
+    lald::Int                        # panel leading dimension
+    lam::Int                         # panel rows
+    lanb::Int                        # panel columns
+    laipiv::Ptr{Int}                 # pivot vector base
+    laroff::Int                      # row offset the panel's pivots are recorded against
+    laioff::Int                      # offset into `ipiv`
+    # The FULL trailing width, which is wider than this job's `n`: look-ahead splits the update into a
+    # narrow part (the next panel's columns) and a wide remainder, and both must route from the whole
+    # so the pair is bit-identical to the single update it replaces.
+    lanroute::Int
+    lainfo::Int                      # the look-ahead panel's `info`: the row of a zero pivot, or 0
     # ── COOPERATIVE BARRIER ───────────────────────────────────────────────────────────────────────
     # A packed A block is a function of `(ic, pc)` and not of which columns of C a worker owns, so a
     # column-split gemm would have every worker pack the whole of A. Workers deal those blocks out
@@ -3729,6 +3746,9 @@ const _MT_KIND_SYRK = 1
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_TRSM = 2
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_LUAHEAD = 3
 
 """
     _syrk_workers(n, k) -> Int
@@ -3814,6 +3834,7 @@ end
     # `_trsm_run_chunk` is defined in level3.jl, which is included after this file — the call resolves
     # when it first runs, by which time both exist.
     p.kind == _MT_KIND_TRSM && return _trsm_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -3824,7 +3845,61 @@ end
     # `nroute` note on `_gemm_core!`. Strassen is declined here because its recursion halves the column
     # count and a slice is not a closed column group; a partitioned Strassen has to run the identical
     # recursion per worker, which this call cannot express.
-    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB, p.n, false, nw, i)
+    # `lanroute` overrides the route token when the caller is splitting a LARGER problem into several
+    # dispatches — getrf's look-ahead issues the trailing update as a narrow call plus a wide one, and
+    # both must route from the full trailing width or the pair is not the single update it replaces.
+    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
+        p.lanroute >= 0 ? p.lanroute : p.n, false, nw, i)
+    return nothing
+end
+
+# The next panel, as ONE isbits value. Seven separate parameters on `_gemm_threaded!` would be seven
+# more entries in a signature whose size already matters: a single added parameter on `_trsm!` was
+# enough to push the ForwardDiff `gemm!` frame past the optimiser's budget (see `_gemm_core_out!`).
+struct LuPanel{T}
+    ptr::Ptr{T}
+    ld::Int
+    m::Int
+    nb::Int
+    ipiv::Ptr{Int}
+    roff::Int
+    ioff::Int
+    nroute::Int
+end
+@inline _lupanel_none(::Type{T}) where {T} = LuPanel{T}(Ptr{T}(0), 1, 0, 0, Ptr{Int}(0), 0, 0, -1)
+
+# ── LOOK-AHEAD CHUNK (getrf) ───────────────────────────────────────────────────────────────────────
+# Worker 1 factors the NEXT panel; workers 2..nw apply the CURRENT panel's update to the trailing
+# block, split `nw - 1` ways. One dispatch, two different bodies, no barrier: the panel writes its own
+# columns and `ipiv`, the update writes the block to their right, and the two never touch the same
+# element. The driver takes the last chunk, which is an update chunk as usual.
+#
+# THE ARITHMETIC IS THE SERIAL ARITHMETIC. The next panel may be factored only after the current
+# panel's update has reached ITS columns, which the caller guarantees by issuing that narrow update
+# before this dispatch — the same precondition the un-overlapped loop enforces. Every trailing element
+# still receives its rank-nb updates in panel order. The column split runs over `nw - 1` workers
+# rather than `nw`, which is safe for the reason the split is safe at all: it partitions n only, never
+# k, so an element's k chain has one order at any worker count.
+#
+# `_getf2!` dispatches to `_getf2_blocked!` for a wide panel, which calls `trsm!` and `gemm!`. The pool
+# is already claimed here, so those lose the claim and run serially — which is what a panel wants. The
+# lost-claim path is what makes that safe, and it is why adding a job kind means checking every path
+# out of the driver rather than only the happy one.
+@noinline function _luahead_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    if i == 1
+        Ap = PtrMatrix{T}(p.lap, p.lam, p.lanb, p.lald)
+        ipv = PtrVector{Int}(p.laipiv, p.laioff + p.lanb)
+        p.lainfo = _getf2!(Ap, p.lam, p.lanb, p.laroff, ipv, p.laioff)
+        return nothing
+    end
+    # `nw - 1` workers over the update, and `i - 1` is this worker's index among them.
+    j0, len = _gemm_chunk(p.n, nw - 1, i - 1)
+    len > 0 || return nothing
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
+    Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
+    # `p.n` is the whole update's width: route from the problem, compute on the slice.
+    _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
+        p.lanroute, false, nw - 1, i - 1)
     return nothing
 end
 
@@ -4035,7 +4110,9 @@ end
         0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
-        _MT_KIND_GEMM, false, false, false, 0
+        _MT_KIND_GEMM, false, false, false,
+        Ptr{T}(0), 1, 0, 0, Ptr{Int}(0), 0, 0, -1, 0,
+        0
     )
     return _gemm_pool_start!(p)
 end
@@ -4141,7 +4218,8 @@ end
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
-        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false
+        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
+        lup::LuPanel{T} = _lupanel_none(T)
     ) where {T <: BlasReal}
     p = _gemm_pool(T)
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
@@ -4166,6 +4244,13 @@ end
         # with 24 concurrent callers it is the common case, not the rare one.
         if kind == _MT_KIND_SYRK
             _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+        elseif kind == _MT_KIND_LUAHEAD
+            # Both halves, serially, in this order. They write disjoint memory so the order cannot
+            # change the bits; doing the panel first matches the worker numbering, which is what a
+            # reader comparing the two paths will expect.
+            _getf2!(PtrMatrix{T}(lup.ptr, lup.m, lup.nb, lup.ld), lup.m, lup.nb, lup.roff,
+                PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff)
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
@@ -4235,7 +4320,7 @@ end
         # `push!`/`resize!`, and doing that outside the claim lets two large callers race on the same
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
         # storage the winner's workers already hold pointers into.
-        kind == _MT_KIND_GEMM && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
+        (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
         p.Cp = C.ptr; p.ldc = C.ld
         p.Ap = A.ptr; p.lda = A.ld
         p.Bp = B.ptr; p.ldb = B.ld
@@ -4243,6 +4328,9 @@ end
         p.alpha = alpha; p.beta = beta
         p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
         p.kind = kind; p.up = up; p.sym2 = sym2; p.unit = unit
+        p.lap = lup.ptr; p.lald = lup.ld; p.lam = lup.m; p.lanb = lup.nb
+        p.laipiv = lup.ipiv; p.laroff = lup.roff; p.laioff = lup.ioff; p.lanroute = lup.nroute
+        p.lainfo = 0
         # A job that failed inside a barrier leaves arrivals counted. Clearing here rather than on the
         # way out keeps the next job from releasing its first barrier early on a stale count.
         @atomic p.bar = 0
