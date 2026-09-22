@@ -1217,7 +1217,22 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
         if m > 0
             p10 = _cvptr(p, j + bs + 1, j + 1, ld); p11 = _cvptr(p, j + bs + 1, j + bs + 1, ld)
             _trsm_right_lower_f64!(_cvptr(p, j + 1, j + 1, ld), p10, bs, m, ld)
-            _syrk_lower_f64!(p11, p10, m, bs, ld)
+            # THE TRAILING UPDATE GOES THROUGH THE PUBLIC `syrk!`, WHICH THREADS. This driver owns
+            # every size at or below `_chol_faer_base`, so a private kernel here means potrf does not
+            # thread at all there — 1.00x at n=1024 on AVX-512, against 2.73x on AVX2, whose smaller
+            # base sends the same size through this same public path. The fleet was already running
+            # both designs and the public one won.
+            #
+            # It costs nothing serially: the private kernel it replaces measured 1.00-1.06x of this
+            # one on Zen4 and 0.95-1.03x on Zen5, at the shapes issued here and at the padded leading
+            # dimension `_chol_pad` gives them. (Measured at a power-of-two `ld` the private kernel
+            # looks 21-30% worse, but potrf never runs at one.)
+            #
+            # The trsm above KEEPS its private kernel: that one measures 1.14-1.25x of the public
+            # `trsm!` on Zen4, and it is 11-20% of the work here against syrk's 80-89%, so routing it
+            # too would spend ~2.4% of the serial budget to thread a fifth of the work.
+            syrk!(PtrMatrix{T}(p11, m, m, ld), PtrMatrix{T}(p10, m, bs, ld);
+                uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
         end
         j += bs
     end
