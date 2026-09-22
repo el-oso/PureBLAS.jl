@@ -408,18 +408,27 @@ function _sme_gemm!(
     )
     MR = _SME_MR
     NR = _SME_NR
-    # beta pass: after this, every depth block accumulates into C.
-    if beta == 0.0
-        @inbounds for j in 0:(n - 1), i in 0:(m - 1)
-            unsafe_store!(C + (i + j * ldc) * 8, 0.0)
-        end
-    elseif beta != 1.0
+    # beta == 0 is handled by ZEROING ZA on the first depth block instead of zeroing C here.
+    # The whole point of this path is that C traffic dominates once compute is ~8x faster, so an
+    # extra full pass over C costs real throughput -- 134 MB of pointless writes at n = 4096.
+    # Any other beta needs one scaling pass, after which every block accumulates.
+    if beta != 0.0 && beta != 1.0
         @inbounds for j in 0:(n - 1), i in 0:(m - 1)
             p = C + (i + j * ldc) * 8
             unsafe_store!(p, beta * unsafe_load(p))
         end
     end
-    (m == 0 || n == 0 || k == 0 || alpha == 0.0) && return nothing
+    if m == 0 || n == 0 || k == 0 || alpha == 0.0
+        # No product to add. C still needs beta applied, including the beta == 0 case that the
+        # block loop would otherwise have handled.
+        if beta == 0.0
+            @inbounds for j in 0:(n - 1), i in 0:(m - 1)
+                unsafe_store!(C + (i + j * ldc) * 8, 0.0)
+            end
+        end
+        return nothing
+    end
+    overwrite_first = beta == 0.0
 
     jc = 0
     while jc < n
@@ -441,7 +450,8 @@ function _sme_gemm!(
                 mpad = cld(mce, MR) * MR
                 _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
                 _sme_macro_edges!(
-                    C, ldc, Ap, Bp, Cs, ic, jc, mce, nce, mpad, npad, kpad, m, n
+                    C, ldc, Ap, Bp, Cs, ic, jc, mce, nce, mpad, npad, kpad,
+                    overwrite_first && pc == 0
                 )
                 ic += MC
             end
@@ -458,7 +468,7 @@ end
 function _sme_macro_edges!(
         C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
         Cs::Ptr{Float64}, ic::Int, jc::Int, mce::Int, nce::Int,
-        mpad::Int, npad::Int, kpad::Int, m::Int, n::Int
+        mpad::Int, npad::Int, kpad::Int, over::Bool
     )
     MR = _SME_MR
     NR = _SME_NR
@@ -468,14 +478,14 @@ function _sme_macro_edges!(
     full_j = (nce % NR == 0)
     let pa = Ap, pb = Bp, pcs = Cs
         if full_i && full_j
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kpad, false)
+            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kpad, over)
             return nothing
         end
         # Interior tiles in one call, then the ragged last row/column tile by tile.
         nip_full = mce ÷ MR
         njp_full = nce ÷ NR
         if nip_full > 0 && njp_full > 0
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip_full, njp_full, kpad, false)
+            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip_full, njp_full, kpad, over)
         end
         for jp in 0:(njp - 1), ip in 0:(nip - 1)
             (ip < nip_full && jp < njp_full) && continue
@@ -487,7 +497,7 @@ function _sme_macro_edges!(
             # Scratch tile is contiguous with leading dimension MR; seed it with the live C so
             # the accumulate is exact, and zero the dead part.
             for j in 0:(NR - 1), i in 0:(MR - 1)
-                v = (i < rows && j < cols) ?
+                v = (!over && i < rows && j < cols) ?
                     unsafe_load(C + ((ic + ip * MR + i) + (jc + jp * NR + j) * ldc) * 8) : 0.0
                 unsafe_store!(pcs + (i + j * MR) * 8, v)
             end
