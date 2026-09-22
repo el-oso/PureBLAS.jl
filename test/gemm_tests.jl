@@ -426,3 +426,53 @@ end
         P.set_num_threads(1)
     end
 end
+
+@testitem "LAPACK drivers: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    # THE SHAPES ARE THE DRIVERS' OWN, NOT SHAPES CHOSEN HERE. A threaded Level-3 routine is split
+    # into column bands, and a band can land on a width that selects a different KERNEL from the one
+    # the unsplit call takes — `_gemm_split_max()` is such a width. Whether a band lands there is a
+    # function of the driver's blocking, so only the driver's real call sequence exercises it.
+    #
+    # This item exists because the gemm/symm item above passed while `getrf` was broken: its shapes
+    # were square and wide, and every band came out wider than the kernel switch. The bands `getrf`
+    # actually produces at n=1024 and n=2048 come out at exactly 64, and there the threaded result
+    # differed from the serial one — correct to 1e-14, identical pivots, wrong bits.
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        for n in (512, 1024, 2048)
+            Random.seed!(4242 + n)
+            A0 = randn(n, n)
+            # Witness FIRST, and under the threaded setting: `_trsm_workers` reads the live thread
+            # count, so asking it while threads are set to 1 always answers 1 and the bit-identity
+            # below would pass by never threading at all.
+            nb = P._lu_nb(n)
+            P.set_num_threads(nthreads())
+            @test P._trsm_workers(nb, n - nb) > 1
+            P.set_num_threads(1)
+            r = copy(A0); ipr = Vector{Int}(undef, n); P.getrf!(r, ipr)
+            for nw in (2, nthreads())
+                P.set_num_threads(nw)
+                g = copy(A0); ipg = Vector{Int}(undef, n); P.getrf!(g, ipg)
+                @test bitsame(g, r)
+                @test ipg == ipr
+            end
+        end
+        for n in (512, 1024)
+            Random.seed!(99 + n)
+            S = randn(n, n); S = S * S' + n * I
+            P.set_num_threads(1)
+            r = copy(S); P.potrf!(r; uplo = 'L')
+            for nw in (2, nthreads())
+                P.set_num_threads(nw)
+                g = copy(S); P.potrf!(g; uplo = 'L')
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
