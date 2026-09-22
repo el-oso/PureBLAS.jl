@@ -431,10 +431,37 @@ The ecosystem's current answer is "call AppleAccelerate.jl" — i.e. shell out t
 **Routes, in the order they should be tried — none of which ships inline asm:**
 1. **Fix/filethe Julia JIT gap.** The snippet above is a complete, minimal reproducer: llc-correct,
    JIT-SIGILL. That is the real fix and it is upstream work, not a PureBLAS knob.
-2. **The AOT path may already work.** `juliac`/`--output-o` emit through `addPassesToEmitFile`, which
-   DOES run the target's IR passes — so the trim-built `libpureblas.so` could get correct SME while the
-   JIT cannot. **UNTESTED**: the attempt here aborted on sysimage-invocation mechanics, not on anything
-   SME-related. This is the highest-value thing to try next and it fits a build this project already has.
+2. **✅ THE AOT PATH WORKS — SME IS REACHABLE TODAY, WITH NO ASM (verified end-to-end 2026-09-22).**
+   A `juliac --trim=safe --compile-ccallable` build of a module whose kernel is pure `llvmcall` IR
+   (`<vscale x 2 x double>` + `"aarch64_pstate_sm_body"`, **no inline asm**) emits exactly the right
+   thing into the shipped library:
+
+       smstart sm
+       ld1d    { z0.d }, p0/z, [x0]
+       st1d    { z0.d }, p0, [x1]
+       smstop  sm
+
+   and it RUNS: called from a C host (the `juliac/ctest.c` pattern — a juliac `.so` cannot be called
+   from inside live Julia, that is the documented double-init abort), it moved **8/8 FP64 lanes**, i.e.
+   the full 512-bit SVL.
+
+   **THE MISSING INGREDIENT IS `JULIA_CPU_TARGET`, AND IT IS NOT OPTIONAL.** Without it the AOT build
+   does not merely produce slow code, it FAILS HARD with `LLVM ERROR: Scalarization of scalable vectors
+   is not supported` — Julia's TargetMachine has no SVE/SME, so `<vscale x 2 x double>` is an illegal
+   type and the legalizer tries to scalarize it. With
+   `JULIA_CPU_TARGET='apple-m1,+sme,+sme2,+sme-f64f64,+sve,+sve2'` it compiles clean. That error is also
+   the best diagnostic in this whole investigation: the JIT's silent SIGILL and the AOT's hard error are
+   the SAME root cause (function-level `target-features` do not select the subtarget), but only the AOT
+   path says so out loud.
+
+   **This maps exactly onto the project's two modes, and splits them:**
+   * **Mode 1 (`libpureblas.so`, juliac AOT, the LBT drop-in + non-Julia hosts): SME is available NOW.**
+   * **Mode 2 (native AD-traceable Julia API, JIT): still blocked.** The JIT SIGILLs even with
+     `JULIA_CPU_TARGET` set — so it is genuinely the missing SME ABI pass, not just the TargetMachine.
+
+   Next: write a real SME `dgemm` microkernel for the AOT path and measure what fraction of Accelerate's
+   ~469 GFLOP/s is actually reachable. Note the shipped `.so` would then need `JULIA_CPU_TARGET` pinned
+   in `juliac/build.jl` — which is a BUILD decision (the Pin tier's legitimate home), not a user pin.
 3. Inline asm — **ruled out by the user**: it is the same portability line the x86 residuals were not
    allowed to cross. A working asm proof-of-concept exists in the session history (exact 8x8 FP64 ZA
    outer product, `max|SME-Julia| = 0.0`) and is kept ONLY as evidence that the hardware path is real.
