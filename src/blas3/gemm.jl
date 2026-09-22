@@ -3749,6 +3749,9 @@ const _MT_KIND_TRSM = 2
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_LUAHEAD = 3
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_TRSMR = 4
 
 """
     _syrk_workers(n, k) -> Int
@@ -3835,6 +3838,7 @@ end
     # when it first runs, by which time both exist.
     p.kind == _MT_KIND_TRSM && return _trsm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4255,6 +4259,8 @@ end
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
             _trsm!(true, up, tA, cA, unit, alpha, A, C)
+        elseif kind == _MT_KIND_TRSMR
+            _trsm!(false, up, tA, cA, unit, alpha, A, C)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)

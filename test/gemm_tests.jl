@@ -462,14 +462,23 @@ end
                 @test ipg == ipr
             end
         end
-        for n in (512, 1024)
+        # potrf needs n = 2048 to be worth testing at all: below `_chol_faer_base` it issues NO
+        # Level-3 call and runs entirely inside a scalar kernel, so a smaller size would compare two
+        # serial runs and pass no matter what. The witness is the pool's generation counter rather
+        # than a worker-count predicate, because it catches any veto between "the predicate says
+        # yes" and the pool actually running — including one nobody has written yet.
+        p = P._gemm_pool(Float64)
+        for n in (1024, 2048)
             Random.seed!(99 + n)
             S = randn(n, n); S = S * S' + n * I
             P.set_num_threads(1)
             r = copy(S); P.potrf!(r; uplo = 'L')
             for nw in (2, nthreads())
                 P.set_num_threads(nw)
-                g = copy(S); P.potrf!(g; uplo = 'L')
+                g = copy(S)
+                g0 = @atomic p.gen
+                P.potrf!(g; uplo = 'L')
+                n >= 2048 && @test (@atomic p.gen) != g0
                 @test bitsame(g, r)
             end
         end
