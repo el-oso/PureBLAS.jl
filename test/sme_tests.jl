@@ -84,3 +84,33 @@ end
     @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
                            zeros(small, small), rand(small, small), rand(small, small))
 end
+
+@testitem "SME does not disturb Mode 2 differentiability" begin
+    using PureBLAS, ForwardDiff, LinearAlgebra
+    const P = PureBLAS
+    # Mode 2 differentiates by running `Dual` through the real kernels as an interleaved pair,
+    # not through a reverse rule. The SME path is Float64-only, so `Dual` operands must keep
+    # taking the generic path -- at a size where Float64 WOULD be routed to SME, to catch a
+    # future eligibility test that forgets to check the element type.
+    n = max(96, P._SME_MIN + 16)
+    A0 = randn(n, n); B0 = randn(n, n)
+    @test !P._sme_eligible(eltype(ForwardDiff.Dual{Nothing, Float64, 1}[]), n, n, n,
+                           false, false, false, false, A0, A0, B0) skip = false
+
+    # d/dt tr(A(t) * B) at t = 0 with A(t) = A0 + t*E is tr(E * B), computed independently.
+    E = randn(n, n)
+    f(t) = begin
+        A = A0 .+ t .* E
+        C = zeros(typeof(t), n, n)
+        PureBLAS.gemm!(C, A, Matrix{typeof(t)}(B0); alpha = one(t), beta = zero(t))
+        tr(C)
+    end
+    got = ForwardDiff.derivative(f, 0.0)
+    want = tr(E * B0)
+    @test got ≈ want rtol = 1.0e-10
+
+    # And the value at t = 0 still matches the Float64 product, which DOES take the SME path.
+    C64 = zeros(n, n)
+    PureBLAS.gemm!(C64, A0, B0; alpha = 1.0, beta = 0.0)
+    @test tr(C64) ≈ tr(A0 * B0) rtol = 1.0e-12
+end
