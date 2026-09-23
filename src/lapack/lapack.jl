@@ -1256,7 +1256,24 @@ end
 # W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
 # give ~317). 128 is µarch-invariant across the AVX-512 fleet (Zen4+Zen5 both gate potrf with it) → kept flat.
 @inline _chol_rl_max(::Type{T}) where {T} = _NVREG == 32 ? 128 : round(Int, sqrt(_L2_BYTES / sizeof(T)) * (7 / 8))
-@inline _chol_faer_base(::Type{T}) where {T} = _NVREG == 32 ? 1024 : _chol_rl_max(T)
+# ≤ this → the faer right-looking kernels own the whole problem; above it → halving, with the O(n³)
+# trailing work going through the cache-blocked `trsm!`/`syrk!`.
+#
+# ONE VALUE FOR EVERY ISA. The AVX-512 arm used to be 1024, so a 32-register box handed everything up
+# to n=1024 to the faer leaf. That was measured and true when the leaf's own syrk was the faster one;
+# it is not any more. A/B at the shipped base against 64, three boxes, six workers and one:
+#
+#            n=256   n=512   n=1024   n=2048      (halving / faer, >1 means halving wins)
+#   Zen4 1t   1.02    1.03     1.02     1.01
+#   Zen4 6t   1.07    1.16     1.06     1.02
+#   Zen5 1t   1.01    1.03     1.02     1.00
+#   Zen5 6t   1.34    1.24     1.11     1.02
+#   Zen3      1.00    1.00     1.00     1.00      (already at 224; barely reaches the leaf)
+#
+# Halving is never slower and is up to 34% faster, because the trailing work it hands off is threaded
+# and cache-blocked while the leaf's is neither. Zen3 is flat precisely because its base was already
+# small — the two boxes that used the leaf are the two that lost by it.
+@inline _chol_faer_base(::Type{T}) where {T} = _chol_rl_max(T)
 # Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =
 # quarter-period (4 cols/set) — both thrash L1. But the pad is an n² copy round-trip, so it only wins
