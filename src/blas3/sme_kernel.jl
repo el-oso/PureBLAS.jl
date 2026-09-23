@@ -405,6 +405,7 @@ end
 # So KC is made as large as a packed-panel memory budget allows (minimizing C passes) rather than
 # sized for L1 residency, and NC spans the whole of n so A is packed exactly once. MC then sets
 # the A-panel working set against L2.
+# PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: sweep
 const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024)::Int
 
 @inline function _sme_blocks(m::Int, n::Int, k::Int)
@@ -582,6 +583,7 @@ end
 # existing SIMD routes are better. The value is a MEASURED crossover, not a residency formula --
 # it depends on packing throughput against kernel throughput, neither of which is predictable
 # from a cache size -- so it is a Measure-tier default with a Preferences override.
+# PDM: Measured — the crossover below which the packed panels do not pay for themselves; it depends on packing throughput against kernel throughput, neither predictable from a cache size. | tune: sweep
 const _SME_MIN = @load_preference("sme_min", 4 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
