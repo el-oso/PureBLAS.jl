@@ -18,24 +18,50 @@
 # Not a replacement for `fleet_freqlock.sh verify`, which is still the only pre-run check. This is the
 # post-hoc one that gates a publish.
 #
-#   bench/check_arm_clocks.sh [tol_pct]      # default 3; every bench/plots_data_*.txt
+# THE SECOND SIGNAL, and it is not cross-arm at all: each cell also records the MINIMUM clock seen
+# inside its own timing windows (`flo`). A box can hold its lock at every arm boundary and still spend
+# half a cell throttled — six cores under load reach a package power limit one core never does, and the
+# pin is not what gives way. Cross-arm cannot see it, because `flo|fhi` is stamped once per cell and
+# both arms of a same-run pair therefore carry the identical range and agree perfectly.
+#
+#   bench/check_arm_clocks.sh [tol_pct]      # default 3; every plots_data_* AND mt_data_* cache
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-3}
-mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
 bad=0
 for f in "${files[@]}"; do
     printf '── %s\n' "$(basename "$f" .txt | sed 's/^plots_data_//')"
     out=$(awk -F'\t' -v TOL="$tol" '
+        /^#pbbench/ { if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0; next }
         /^#/ { next }
         NF >= 4 {
             pb = 0; ref = 0; refname = ""
             for (i = 4; i <= NF; i++) {
                 n = split($i, a, "|")
                 if (n < 6) continue
-                fq = a[n-1] + 0
+                # Fields are indexed FROM THE FRONT: arm|time|commit|anchor|freq|flo|fhi|samples.
+                # Counting from the end lands on `fhi`, the in-window MAXIMUM — the one clock field a
+                # throttle cannot move, so a cell that ran at half speed reads as perfectly locked.
+                fq = a[5] + 0
+                # In-window MINIMUM against this box own base clock. Restricted to the PB arms because
+                # those are the only ones a re-measure can repair; a cached vendor arm carries the state
+                # of the epoch it was measured in and is never re-run.
+                if (base > 0 && n >= 8 && (a[1] == "pb" || a[1] == "pb_mt")) {
+                    flo = a[6] + 0
+                    if (flo > 0) {
+                        lotot++
+                        dl = (base - flo) / base * 100
+                        if (dl > TOL) {
+                            looff++
+                            if (looff <= 3) printf "   %s/%s@%s  %s fell to %.0fMHz of %.0fMHz base (-%.0f%%)\n", $1, $2, $3, a[1], flo / 1000, base / 1000, dl
+                            badop[$1 "/" $2] = 1; badgrp[$1] = 1
+                            if (dl > loworst) loworst = dl
+                        }
+                    }
+                }
                 if (fq <= 0) continue
                 # A VENDOR whitelist, not "the first arm that is not pb". This check exists to say
                 # whether a PB window and a REFERENCE window ran at the same clock — a cross-epoch
@@ -44,7 +70,7 @@ for f in "${files[@]}"; do
                 # either land in `ref` reports a same-run pair as a verified cross-epoch comparison
                 # that never happened — and for `pb_mt` it would always read ~0% and look reassuring.
                 if (a[1] == "pb") pb = fq
-                else if (ref == 0 && (a[1] == "openblas" || a[1] == "aocl" || a[1] == "mkl")) { ref = fq; refname = a[1] }
+                else if (ref == 0 && (a[1] == "openblas" || a[1] == "aocl" || a[1] == "mkl" || a[1] == "openblas_mt" || a[1] == "aocl_mt" || a[1] == "mkl_mt")) { ref = fq; refname = a[1] }
             }
             if (pb > 0 && ref > 0) {
                 d = (pb - ref) / ref * 100; if (d < 0) d = -d
@@ -58,9 +84,14 @@ for f in "${files[@]}"; do
             }
         }
         END {
-            if (tot == 0) { print "   no cells carry both a pb and a reference clock — cannot check"; exit 0 }
-            if (off == 0) { printf "   => all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst; exit 0 }
-            printf "   => %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%)\n", off, tot, ok, worst, TOL
+            if (lotot > 0) {
+                if (looff == 0) printf "   => in-window clock: all %d PB cells held base (tolerance %s%%)\n", lotot, TOL
+                else            printf "   => in-window clock: %d/%d PB cells fell below base, worst -%.0f%% (tolerance %s%%)\n", looff, lotot, loworst, TOL
+            }
+            if (tot == 0 && looff == 0) { print "   no cells carry both a pb and a reference clock — cross-arm check skipped"; exit 0 }
+            if (tot > 0 && off == 0) printf "   => cross-arm: all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst
+            if (off > 0) printf "   => cross-arm: %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%)\n", off, tot, ok, worst, TOL
+            if (off == 0 && looff == 0) exit 0
             # THE POINT OF THE PER-CELL CLOCK: re-measure ONLY what is broken. A lock that floats
             # part-way through a sweep leaves most cells VALID; condemning the whole cache and
             # re-sweeping it wastes hours and is what this field exists to prevent.
