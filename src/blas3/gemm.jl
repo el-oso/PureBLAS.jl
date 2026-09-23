@@ -3412,6 +3412,17 @@ end
         if max(m, nrt, k) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
+        # Apple SME, ahead of Strassen. Strassen trades a 7/8 flop cut per level for extra
+        # additions; SME runs the flops on a coprocessor an order of magnitude faster than NEON,
+        # so the recursion would only route work away from it.
+        #
+        # THIS BODY IS REACHED ONCE PER THREADED CHUNK, not once per call: `_gemm_threaded!`
+        # arrives here through `_gemm_run_chunk`. `_sme_owns` at the threaded entry is what keeps
+        # a split call off the coprocessor, because by this point the split has already happened.
+        # Routing uses `nrt`, the whole problem's n, so a chunk routes as its parent did.
+        if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
+            return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
+        end
         if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, nrt, k) > 0
             if !tB
                 return _gemm_strassen!(m, n, k, alpha, A, B, beta, C, nw)   # large-n real: 7-mult recursion beats OB
@@ -4487,7 +4498,8 @@ function gemm!(
         # the recursion runs once, and each of its leaves is a classical product handed to the column
         # split (`_strassen_leaf!`). A leaf is bit-identical threaded or serial, so the whole recursion
         # is too.
-        if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B)
+        if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B) &&
+                !_sme_owns(T, m, n, k, tA, tB, transA == 'C', transB == 'C', C, A, B)
             rA = _root(A); rB = _root(B); rC = _root(C)
             GC.@preserve rA rB rC _gemm_threaded!(
                 _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw

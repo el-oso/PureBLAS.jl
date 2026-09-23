@@ -317,9 +317,14 @@ end
 
     PureBLAS.wy_t!(Tm, V, tau, G)                    # warm up
     PureBLAS.wy_apply!('T', C, V, Tm, ws)
-    @test (@allocated PureBLAS.wy_t!(Tm, V, tau, G)) == 0
-    @test (@allocated PureBLAS.wy_apply!('T', C, V, Tm, ws)) == 0
-    @test (@allocated PureBLAS.wy_apply!('N', C, V, Tm, ws)) == 0
+    # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed and
+    # the first compile of each such call site caches a method instance, which reports as allocation
+    # a caller passing concrete types never pays. `wy_apply!` reaches gemm, whose SME route is behind
+    # a function pointer (one dynamic dispatch), so this call site is where that shows.
+    steady(f, args...) = (f(args...); @allocated f(args...))
+    @test steady(PureBLAS.wy_t!, Tm, V, tau, G) == 0
+    @test steady(PureBLAS.wy_apply!, 'T', C, V, Tm, ws) == 0
+    @test steady(PureBLAS.wy_apply!, 'N', C, V, Tm, ws) == 0
 end
 
 @testitem "getrf (LU) vs LAPACK — square/tall/wide, factor + ipiv + P·A=L·U" begin

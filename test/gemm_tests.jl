@@ -85,15 +85,20 @@ end
 
 @testitem "GEMM steady-state is allocation-free (driver level)" begin
     using PureBLAS
+    # Measured through a function barrier so the operands arrive with concrete types, as they do
+    # from LinearAlgebra and LBT. At module scope the call is `Any`-typed, and the first compile of
+    # each such call site caches a method instance — dispatch state that scales with the number of
+    # call sites, not with the number of calls, and that no warmup removes. The SME path is the only
+    # one that shows it, because its portability barrier is a function pointer (one dynamic dispatch);
+    # measuring it as steady-state allocation reports a cost no caller pays.
+    steady(f, args...; kw...) = (f(args...; kw...); @allocated f(args...; kw...))
     # unpacked (small, max dim ≤ 96) path — no buffers at all
     A = randn(48, 48); B = randn(48, 48); C = zeros(48, 48)
-    PureBLAS.gemm!(C, A, B; alpha = 1.0, beta = 0.0)            # warmup/compile
-    @test (@allocated PureBLAS.gemm!(C, A, B; alpha = 1.0, beta = 0.0)) == 0
-    @test (@allocated PureBLAS.gemm!(C, A, B; alpha = 2.0, beta = 1.0)) == 0  # beta≠0 branch
+    @test steady(PureBLAS.gemm!, C, A, B; alpha = 1.0, beta = 0.0) == 0
+    @test steady(PureBLAS.gemm!, C, A, B; alpha = 2.0, beta = 1.0) == 0  # beta≠0 branch
     # blocked (large) path — scratch allocated on first call, then reused → 0 thereafter
     Al = randn(300, 300); Bl = randn(300, 300); Cl = zeros(300, 300)
-    PureBLAS.gemm!(Cl, Al, Bl; beta = 0.0)                       # warmup (allocates scratch)
-    @test (@allocated PureBLAS.gemm!(Cl, Al, Bl; beta = 0.0)) == 0
+    @test steady(PureBLAS.gemm!, Cl, Al, Bl; beta = 0.0) == 0
     # COMPLEX, and specifically INSIDE the Karatsuba-3M window (_CGEMM_3M_MIN=48 ≤ max(m,n,k) ≤ 2048,
     # min ≥ _CGEMM_3M_KMIN=16). This case had NO allocation coverage at any size, which is how
     # `_gemm_3m!` shipped building nine `unsafe_wrap(Array, …)` headers per call — ~1 KB of steady-state
@@ -103,15 +108,13 @@ end
     # so the pair also pins the routing, not just the total.
     for nc in (32, 128)
         Az = randn(ComplexF64, nc, nc); Bz = randn(ComplexF64, nc, nc); Cz = zeros(ComplexF64, nc, nc)
-        PureBLAS.gemm!(Cz, Az, Bz; alpha = one(ComplexF64), beta = zero(ComplexF64))   # warmup + pool growth
-        @test (@allocated PureBLAS.gemm!(Cz, Az, Bz; alpha = one(ComplexF64), beta = zero(ComplexF64))) == 0
+        @test steady(PureBLAS.gemm!, Cz, Az, Bz;
+                     alpha = one(ComplexF64), beta = zero(ComplexF64)) == 0
     end
     # complex rank-k rides the same buffers through `_ctrgemm_3m!` (n ≥ _CSYRK_3M_MIN)
     As = randn(ComplexF64, 300, 300); Cs = zeros(ComplexF64, 300, 300)
-    PureBLAS.syrk!(Cs, As; uplo = 'U', trans = 'N', alpha = true, beta = false)
-    @test (@allocated PureBLAS.syrk!(Cs, As; uplo = 'U', trans = 'N', alpha = true, beta = false)) == 0
-    PureBLAS.herk!(Cs, As; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
-    @test (@allocated PureBLAS.herk!(Cs, As; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)) == 0
+    @test steady(PureBLAS.syrk!, Cs, As; uplo = 'U', trans = 'N', alpha = true, beta = false) == 0
+    @test steady(PureBLAS.herk!, Cs, As; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0) == 0
 end
 
 @testitem "GEMM dimension mismatch is caught" begin
@@ -151,10 +154,16 @@ end
         end
         # req#10 holds on the threaded path too: the pool is built once, so a warm call allocates
         # nothing even when it wakes four workers.
+        #
+        # Measured through a function barrier so the operands arrive with concrete types, as they do
+        # from LinearAlgebra and LBT. At module scope the call is `Any`-typed, and the first compile
+        # of each such call site caches a method instance — state that scales with the number of call
+        # sites, not with the number of calls, so no amount of warming removes it. Only the SME route
+        # shows it, because its portability barrier is a function pointer (one dynamic dispatch).
+        steady(f, args...; kw...) = (f(args...; kw...); @allocated f(args...; kw...))
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
-        P.gemm!(C, A, B); P.gemm!(C, A, B)
-        @test (@allocated P.gemm!(C, A, B)) == 0
+        @test steady(P.gemm!, C, A, B) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
     end
@@ -364,7 +373,17 @@ end
     else
         P.set_num_threads(nt)
         p = P._gemm_pool(Float64)
-        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        # LIVENESS IS "A FAST UNIT RAN", NOT "THE POOL RAN". Where a machine has a matrix
+        # coprocessor, `_sme_owns` keeps an eligible call off the column split on purpose: the unit is
+        # shared by the cluster, so splitting queues the workers behind it rather than dividing the
+        # work (measured on an M6 at n=4096: 503 GFLOP/s owned, 301 split, 177 for the threaded NEON
+        # path the guard declines). Demanding the pool there would demand the slower of the two.
+        #
+        # Both witnesses are counters a driver bumps once per dispatched job, so this keeps the
+        # property the pool check was written for: an implementation that quietly does neither fails,
+        # and so does one that routes to a serial NEON recursion — that bumps nothing.
+        ran(f) = (g0 = @atomic p.gen; s0 = P._SME_CALLS[]; f();
+                  (@atomic p.gen) != g0 || P._SME_CALLS[] != s0)
         for (m, n, k) in ((512, 512, 512), (1024, 1024, 1024), (1024, 1024, 128), (2048, 1024, 512))
             P._gemm_workers(m, n, k) > 1 || continue
             A = randn(m, k); B = randn(k, n); C = zeros(m, n)
