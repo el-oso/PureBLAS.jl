@@ -1243,10 +1243,11 @@ end
 # ~1.3–1.5× slower at n≥512). When A's stride is a po2, factor in a padded (ld+8) scratch and copy
 # back — bit-identical, ld is pure addressing. Reusable buffer via _chol_pad (single-thread; MT deferred).
 # _chol_faer_base: ≤ this → faer rl kernels; above → hybrid halving routing the O(n³) trailing through the
-# cache-blocked gating syrk!/trsm!. AVX-512 (32 regs) rides the faer syrk to 1024 (n=1024 0.70→0.87,
-# n=2048 0.85→0.91 on the hybrid; W=8 stays off the AVX2 panel driver). AVX2 (16 regs) never halves — its
-# large-n path is the fused panel driver (n>_CHOL_RL_MAX), so its base = _CHOL_RL_MAX (all n≤224 → rl32).
-# AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
+# cache-blocked gating syrk!/trsm!. EVERY ISA uses the same base, `_chol_rl_max`, whose derivation is
+# below; the faer leaf is the right kernel where the halving recursion's per-level overhead would
+# dominate, and measurably wrong above that (20% better than halving at n=64, 4% at n=128, and never
+# ahead past 256 — pushing the base higher costs up to 34% threaded, see `_chol_faer_base`).
+# The rl32 block-small argument that fixes the value:
 # until the trailing submatrix outgrows L2 — measured Zen3 crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
 # 7⁄8 of that ≈ 224 → √(_L2_BYTES/8)·7⁄8 (Zen3 512 KB L2 → 224 EXACT). NB: the 7⁄8 is a ONE-POINT FIT to
@@ -1691,7 +1692,12 @@ function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
     # other, with the crossover in the middle of the gate ladder.
     #
     # AVX2 now falls through to the same hybrid (padded where the stride needs it) that AVX-512 uses.
-    # `_chol_panel_f64!` is retained, unreferenced, pending a re-measure on a box still on LLVM 18.
+    # `_chol_panel_f64!` is retained, unreferenced, and stays that way. Re-measured on Zen4 under
+    # 1.13/LLVM 20: it is 2-3% FASTER than this hybrid at n=256-1024 single-threaded — the Zen3
+    # inversion above does not hold here — but it threads to only 1.65x at n=1024 and 2.70x at
+    # n=2048 against the hybrid's 2.49x and 3.18x, because its trailing work stays inside the faer
+    # kernels rather than reaching the pool. A driver that wins 3% serially and loses 25% threaded is
+    # not a driver to reinstate. Kept as a reference implementation, not as a candidate.
     # (The line that used to sit here — "AVX2 reaches here only for n ≤ _CHOL_RL_MAX" — is no longer
     # true now that the panel-driver early return is gone; AVX2 reaches here at every n. What survives
     # of it is the rl32 pad exemption, restated on the condition above.)
