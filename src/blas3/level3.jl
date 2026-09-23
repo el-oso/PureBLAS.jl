@@ -1382,10 +1382,10 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
-@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool) =                                    # C -= op(A)·B
-    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false)
-@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool) =                                # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj)
+@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
+    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
+@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, nroute)
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1486,8 +1486,13 @@ end
 # The copy-back is spelled as an explicit loop rather than `copyto!` because `PtrMatrix` is
 # `IndexCartesian`; this is the same column-loop shape the rest of this file uses for a scratch → B pass.
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
-function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` reaches here for the same reason it reaches `_gemm_unpacked!`: this leaf's product is the
+# band's, and the kernel that product takes is chosen from `max(m, n, k)`. At a leaf `nb` is at most
+# `_trsm_base` (32 by default), so a 64-wide band lands on `_gemm_split_max()` and takes the split
+# kernel while the unsplit solve does not.
+function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
+    nrt = nroute < 0 ? n : nroute
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape — ld stays _L3_NB, as before
         iv = view(ivM, 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
@@ -1496,9 +1501,11 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
         # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
         # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
         if tr
-            gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
+            # `_gemm_core!`, not `gemm!`: the public entry routes from its own operands and has no
+            # place to take the route token, which a column band must carry.
+            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, nrt)
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -1508,7 +1515,9 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
 end
 # side R base: B := B·op(A)⁻¹ = B·op(inv(A)). tmp := B·op(iv) via the unpacked path (transB=op is a free
 # Val{TB}; skewed shape m wide, n=k=nb tiny → same unpacked win as invL).
-function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` is the WHOLE problem's row count. `_gemm_unpacked!` keys its kernel on `max(m, n, k)`
+# and takes the larger of the local `m` and this, so a row band routes as the unsplit solve does.
+function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); m = size(B, 1); T = eltype(B)
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape
@@ -1517,9 +1526,9 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
         # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
         # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
         if tr
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -4153,12 +4162,19 @@ const _TRSM_FULLPACK_MIN = @load_preference(
 )::Int
 
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
-function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+#
+# `nroute` IS THE WHOLE PROBLEM'S COLUMN COUNT, not this call's. A threaded caller hands each worker a
+# column band of B, and every predicate below that keys on `size(B, 2)` selects an ALGORITHM — a
+# different base, a different recursion floor — so a worker reading its own narrower width would take a
+# route the serial solve does not and return different bits. Routing from `nroute` keeps the route a
+# function of the problem instead of the worker count. `-1` means "not split": read the width from B.
+function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
     k = size(A, 1)
+    nrt = nroute < 0 ? size(B, 2) : nroute
     if eltype(B) <: BlasReal && !cj
         # narrow B → dense base (few axpy calls); wide B → invL base (gemm-efficient). n is invariant under
         # the side-L row split, so the choice is consistent through the recursion.
-        if size(B, 2) <= _trsm_ncut()
+        if nrt <= _trsm_ncut()
             # Narrow B. Prefer the fused gemmtrsm leaf for eligible mid-k (_TRSM_FUSED_MIN ≤ k ≤ _TRSM_FUSED_BASE):
             # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
             # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
@@ -4185,7 +4201,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B, tr)
         elseif k <= _trsm_base()
-            return _trsm_base_invL!(up, tr, unit, A, B)
+            return _trsm_base_invL!(up, tr, unit, A, B, nrt)
         end
     elseif eltype(B) <: BlasComplex                       # complex base (else fall through → gemm-blocked split)
         # nrhs is invariant under the row-split → decide the base once. Wide B: trtri-on-inverse base (its
@@ -4202,7 +4218,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         if !up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
             return _trsm_cgt_L!(Val(true), unit, k, A, B)
         end
-        recbase = size(B, 2) <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
+        recbase = nrt <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
                 _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
@@ -4218,14 +4234,14 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, 1:h, :); B2 = view(B, (h + 1):k, :)
     if up != tr                                       # solve B2, then B1 -= off·B2, then solve B1
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trsm_left!(up, tr, cj, unit, A22, B2)
-        _gemm_sub!(B1, off, B2, tr, cj)
-        _trsm_left!(up, tr, cj, unit, A11, B1)
+        _trsm_left!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_sub!(B1, off, B2, tr, cj, nroute)
+        _trsm_left!(up, tr, cj, unit, A11, B1, nroute)
     else                                              # solve B1, then B2 -= off·B1, then solve B2
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trsm_left!(up, tr, cj, unit, A11, B1)
-        _gemm_sub!(B2, off, B1, tr, cj)
-        _trsm_left!(up, tr, cj, unit, A22, B2)
+        _trsm_left!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_sub!(B2, off, B1, tr, cj, nroute)
+        _trsm_left!(up, tr, cj, unit, A22, B2, nroute)
     end
     return B
 end
@@ -4493,7 +4509,17 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
 end
 
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
-function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+# `nroute` IS THE WHOLE PROBLEM'S ROW COUNT — the side-R mirror of `_trsm_left!`'s column count.
+# A threaded caller hands each worker a ROW band of B, and the predicates below select an algorithm,
+# so a worker reading its own shorter height would take a route the unsplit solve does not.
+#
+# Unlike side L, no shape has yet been found where this changes the ANSWER: a row split was measured
+# bit-identical to the whole across k in {32,64,128,512,1024} x m in {128,256,1024,2048} with the
+# token both supplied and withheld. It is kept because the predicates select algorithms rather than
+# block sizes, which is the property that made the side-L equivalent a real defect; a future base or
+# crossover moves the boundary without touching this file.
+function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
+    mrt = nroute < 0 ? size(B, 1) : nroute
     k = size(A, 1)
     # Lower real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
     # `_trsm_rl_split_f64!`, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no trtri, no
@@ -4518,8 +4544,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
     # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
     if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
-            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _trsm_ncut_r()) &&
-            (size(B, 1) > _trsm_ncut_r() || (k > _trsm_dbase() && size(B, 1) >= _trsm_r_mfloor(k)))
+            (tr || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
+            (mrt > _trsm_ncut_r() || (k > _trsm_dbase() && mrt >= _trsm_r_mfloor(k)))
         # (No `Ar = A` seed here any more: it was dead once every arm gained its own `return`, and while
         # dead it still gave the `Ar` slot a second type, which is the whole cause of the boxing below.)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
@@ -4621,10 +4647,10 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
         # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
-        if size(B, 1) <= _trsm_ncut_r()
+        if mrt <= _trsm_ncut_r()
             k <= _trsm_dbase() && return _trsm_dense_R!(up, tr, unit, A, B)
         elseif k <= _trsm_base()
-            return _trsm_base_invR!(up, tr, unit, A, B)
+            return _trsm_base_invR!(up, tr, unit, A, B, mrt)
         end
     elseif eltype(B) <: BlasComplex
         # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse),
@@ -4645,14 +4671,14 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, :, 1:h); B2 = view(B, :, (h + 1):k)
     if up != tr                                       # solve B1, then B2 -= B1·off, then solve B2
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
-        _gemm_subR!(B2, B1, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_subR!(B2, B1, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
     else                                              # solve B2, then B1 -= B2·off, then solve B1
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
-        _gemm_subR!(B1, B2, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_subR!(B1, B2, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
     end
     return B
 end
@@ -4670,6 +4696,84 @@ function _trsm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::N
     isone(α) || _scal_all!(B, α)
     side_left ? _trsm_left!(up, tr, cj, unit, A, B) : _trsm_right!(up, tr, cj, unit, A, B)
     return B
+end
+
+# ── THREADED trsm, side 'L' ────────────────────────────────────────────────────────────────────────
+# EVERY COLUMN OF B IS AN INDEPENDENT SOLVE. `trsm!` already contains a per-column `trsv!` sweep for
+# narrow B, and that loop is the proof: splitting B's columns cannot change any column's arithmetic,
+# because no column reads another. A is read-only for every worker and the column bands of B are
+# write-disjoint, so unlike the gemm chunk this one needs no barrier and no shared buffer.
+#
+# What the split MUST NOT change is which route each band takes — hence `nroute`, threaded from here
+# through the whole recursion (see `_trsm_left!`).
+#
+# Workers, on the same amortisation floor as gemm because the fork-join price is the same price. The
+# flop count is the triangular solve's `k²·n`, not a product's `2·m·n·k`; using gemm's count would
+# admit calls at a fraction of the real work and pay a join the work cannot cover.
+@inline function _trsm_workers(k::Int, n::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * n
+    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+end
+
+# One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
+# where `C` and `B` are the same matrix: trsm solves in place, so the pool's output and RHS coincide.
+# `p.m` is B's row count, which for side 'L' is also A's dimension.
+# ── THREADED trsm, side 'R' ────────────────────────────────────────────────────────────────────────
+# The mirror of side L: `X·op(A) = B` makes every ROW of B an independent solve, so a row band is a
+# whole problem and the bands are write-disjoint. This is the shape `potrf` needs — its lower
+# factorization solves `A21·L11⁻ᵀ` with A21 tall and narrow, so the rows are the long dimension.
+#
+# Bands round to whole `_MR·W` blocks, the microkernel's ROW granularity, for the same reason the
+# column split rounds to `_NR`: a band that is not a whole number of blocks runs a ragged edge kernel,
+# which costs more than the imbalance it fixes.
+@inline function _trsm_rchunk(m::Int, nw::Int, i::Int, ::Type{T}) where {T}
+    mr = _MR * _vwidth(T)
+    blocks = cld(m, mr)
+    b0 = ((i - 1) * blocks) ÷ nw
+    b1 = (i * blocks) ÷ nw
+    i0 = b0 * mr
+    return i0, min(m, b1 * mr) - i0
+end
+
+@inline function _trsm_workers_r(k::Int, m::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * m
+    (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
+end
+
+@noinline function _trsmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _trsm_rchunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.n, p.n, p.lda)          # A is n×n for side R
+    Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    # `p.m`, not `len`: route from the whole problem's ROW count.
+    _trsm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.m)
+    return nothing
+end
+
+@inline function _trsm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.m, p.m, p.lda)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)
+    # `_trsm!`'s two steps are open-coded here rather than called, and that is NOT a style choice.
+    # Giving `_trsm!` a ninth parameter — with or without a default — pushes `_gemm_core!` past the
+    # optimiser's effort budget on the ForwardDiff path, reported as an `OptimizationFailureReport`
+    # and caught by `test/dual_tests.jl`'s `@test_typestable` dogfood. `_trsm_left!` takes the extra
+    # argument without that cost; `_trsm!` does not. Measured by bisection, one parameter at a time.
+    #
+    # α scales B elementwise, so applying it per band is exact. α = 0 cannot arrive here: the entry
+    # in `trsm!` declines to split it, because the whole call is then a fill.
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    # `p.n`, not `len`: route from the whole problem.
+    _trsm_left!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.n)
+    return nothing
 end
 
 # When A's leading dim is a pure power of 2 (≥512), packing its triangular sub-views thrashes one cache
@@ -4939,6 +5043,38 @@ function trsm!(
     # Whatever aliasing motivated it is evidently already handled inside `_trsm!`'s own blocking; the
     # pad was paying a second time for it. `_l3_apad`/`L3Workspace.apad` are now unused by trsm and
     # kept only so the buffer and its rationale survive in one place if a future shape needs them.
+    # THREADED SIDE-L: split B's columns. Placed here, below every staging branch above, because each
+    # of those either returns or rewrites the operands — a split above them would hand workers a B the
+    # serial path would not have solved. Below this point the operands are final.
+    # `BlasReal`, not `BlasFloat`: the pool exists only for the two real types, and the route
+    # predicates on the complex path read their own width rather than `nroute`, so a complex column
+    # split would not be reproducible even once a pool existed.
+    # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
+    # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
+    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
+        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        if nwr > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, transA == 'C', false, nwr,
+                _MT_KIND_TRSMR, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
+    if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
+        nw = _trsm_workers(k, size(B, 2))
+        if nw > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, transA == 'C', false, nw,
+                _MT_KIND_TRSM, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
     _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, B)
     return B
 end
