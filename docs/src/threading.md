@@ -132,14 +132,14 @@ Best speedup per operation, six threads against one, on each box.
 
 | op | Zen3 · AVX2 | Zen4 · AVX-512 | Zen5 · AVX-512 |
 |---|---|---|---|
-| L3 `trsm` | 5.64× @4096 | 4.90× @2100 | 1.00× @100 |
-| L3 `syrk` | 5.45× @4096 | 4.80× @4096 | 5.37× @2100 |
-| L3 `syr2k` | 2.87× @4096 | 4.29× @4096 | 5.24× @4096 |
+| L3 `trsm` | 5.64× @4096 | 4.90× @2100 | 5.88× @2100 |
+| L3 `trsmR` | 5.18× @4096 | 4.61× @4096 | 5.57× @4096 |
+| L3 `syrk` | 5.45× @4096 | 4.80× @4096 | 5.30× @2100 |
+| L3 `syr2k` | 2.87× @4096 | 4.29× @4096 | 5.25× @4096 |
 | LP `potrfU` | 5.17× @4096 | 4.30× @4096 | 5.24× @4096 |
-| L3 `trsmR` | 5.18× @4096 | 4.61× @4096 | 1.00× @100 |
-| L3 `gemm` | 4.75× @2100 | 4.01× @2100 | 5.04× @2100 |
+| L3 `gemm` | 4.75× @2100 | 4.01× @2100 | 5.06× @2100 |
 | LP `potrf` | 4.53× @4096 | 3.94× @4096 | 4.89× @4096 |
-| L3 `symm` | 4.50× @2100 | 3.74× @2100 | 4.84× @2100 |
+| L3 `symm` | 4.50× @2100 | 3.74× @2100 | 4.83× @2100 |
 | LP `getrf` | 3.89× @2100 | 3.45× @4096 | 4.25× @4096 |
 | LP `pptrfL` | 2.54× @2048 | 3.20× @2048 | 4.09× @2048 |
 | LP `pptrfU` | 2.52× @2048 | 3.10× @2048 | 4.00× @2048 |
@@ -260,7 +260,7 @@ Measured 2026-09-23T12:53 at commit `157895df`, AMD Ryzen 5 7640U w/ Radeon 760M
 
 ### Zen5 · AVX-512
 
-Measured 2026-09-23T13:00 at commit `157895df`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+Measured 2026-09-23T15:08 at commit `3b594f39`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
 1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -268,12 +268,14 @@ Measured 2026-09-23T13:00 at commit `157895df`, AMD Ryzen AI 5 340 w/ Radeon 840
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
-| L3 `syrk` | **5.37×** | 2100 | 0% |
-| L3 `syr2k` | **5.24×** | 4096 | 2% |
+| L3 `trsm` | **5.88×** | 2100 | 0% |
+| L3 `trsmR` | **5.57×** | 4096 | 1% |
+| L3 `syrk` | **5.30×** | 2100 | 1% |
+| L3 `syr2k` | **5.25×** | 4096 | 2% |
 | LP `potrfU` | **5.24×** | 4096 | 0% |
-| L3 `gemm` | **5.04×** | 2100 | 1% |
+| L3 `gemm` | **5.06×** | 2100 | 1% |
 | LP `potrf` | **4.89×** | 4096 | 0% |
-| L3 `symm` | **4.84×** | 2100 | 1% |
+| L3 `symm` | **4.83×** | 2100 | 1% |
 | LP `getrf` | **4.25×** | 4096 | 0% |
 | LP `pptrfL` | **4.09×** | 2048 | 0% |
 | LP `pptrfU` | **4.00×** | 2048 | 0% |
@@ -303,7 +305,6 @@ Measured 2026-09-23T13:00 at commit `157895df`, AMD Ryzen AI 5 340 w/ Radeon 840
 | LP `potrsU` | 256 | **0.93×** | 3% |
 | LP `potrsL` | 1000 | **0.94×** | 8% |
 | LP `potrsL` | 2048 | **0.95×** | 4% |
-| L3 `gemm` | 8 | **0.96×** | 28% |
 
 ## Open: `gesvd` gets slower with threads
 
