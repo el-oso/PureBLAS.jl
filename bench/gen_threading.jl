@@ -149,8 +149,9 @@ function page(io)
     println(io, """
 # Multi-threading
 
-PureBLAS threads `gemm` — one split, over the columns of C, across a parked worker pool. Routines that
-call `gemm!` inherit it for free. Threading is **off** until you ask for it:
+PureBLAS threads `gemm`, `symm`, `syrk`, `syr2k`, both sides of `trsm`, and — through them —
+`getrf` and `potrf`. Threading is **off** until you ask for it:
+
 
 ```julia
 PureBLAS.set_num_threads(6)     # opt in; same shape as openblas_set_num_threads
@@ -209,13 +210,17 @@ Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `t
 `asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
 is wrong with the measurement rather than right with the library.
 
-`syrk`, `syr2k`, `hemm` and the rest of Level-3 inherit nothing for a structural reason worth knowing:
-they reach `_gemm_core!` **directly**, which sits *below* the split point. Threading them is Phase 4 of
-the plan and is not started.
+`syrk`, `syr2k` and `symm` reach `_gemm_core!` **directly**, below the public split point, so they
+carry their own job kinds in the pool rather than inheriting gemm's: a triangular output needs a
+flop-balanced column split, since equal widths hand the first worker roughly twice the work of the
+last.
 
-`trsm` is also flat, but for a different reason: it wraps its body in an arena scope, and a threaded
-`gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
-per-thread workspaces safe, so the flatness is a deliberate trade, not an oversight.
+`trsm` threads on both sides — columns of B for side L, rows for side R — and each band is a whole
+problem, so the bands need no barrier between them. What a band DOES need is to route from the
+unsplit problem's dimensions: several kernel choices key on `max(m, n, k)`, and a band that lands on
+one of those constants takes a different kernel from the call it is part of. That is not a slower
+answer, it is a different one, and it broke `getrf`'s thread-count invariance until the route token
+reached the kernel switches themselves.
 
 ### Why `Dual` gets nothing — and why that is wiring, not a law
 
@@ -251,8 +256,8 @@ One panel per operation, one curve per microarchitecture, against problem size. 
 cost. The band is the q10–q90 spread of the pooled per-round ratios.
 
 Read the SHAPE, not just the peak. A curve that climbs with `n` is a routine amortising the fork-join
-correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — `syrk`,
-`syr2k`, `trsm`, `trmmR`, every Level-1 and Level-2 panel — are the controls described above, and they
+correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — every
+Level-1 and Level-2 panel, and `trmmR` — are the controls described above, and they
 are supposed to be flat.
 
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
@@ -263,8 +268,8 @@ Level-2 have no splitter, and complex and dual cannot reach one — so their pan
 by construction rather than by measurement.
 
 Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
-`syrk`, `syr2k`, `trsm`, `trmmR` and `potrf` sit on 1.00 next to `gemm` climbing to ~5×. They reach
-`_gemm_core!` *below* the split point, or refuse to thread inside an arena scope. Seeing them flat in
+`trmmR` and the Level-1/Level-2 panels sit on 1.00 next to `gemm` and `trsm` climbing past 4.9×.
+They have no splitter at all, or no reference threads them either. Seeing them flat in
 the same picture is what shows the measurement discriminates rather than flattering everything.
 
 Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
