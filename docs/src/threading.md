@@ -1,7 +1,8 @@
 # Multi-threading
 
-PureBLAS threads `gemm` — one split, over the columns of C, across a parked worker pool. Routines that
-call `gemm!` inherit it for free. Threading is **off** until you ask for it:
+PureBLAS threads `gemm`, `symm`, `syrk`, `syr2k`, both sides of `trsm`, and — through them —
+`getrf` and `potrf`. Threading is **off** until you ask for it:
+
 
 ```julia
 PureBLAS.set_num_threads(6)     # opt in; same shape as openblas_set_num_threads
@@ -40,7 +41,9 @@ arms**, which is six to eight hours per box and has not been done.
 Reproduce with:
 
 ```bash
-taskset -c 0,1,2,3,4,5 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt nodraw
+# The mask is one CPU per physical core PLUS one spare for the runtime threads, and CPU numbering
+# differs per box — `bench/plots.jl`'s `_ARM_PB_MT` comment carries the mask for each.
+taskset -c 0,2,4,6,8,10,1 julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt nodraw
 julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 ```
 
@@ -58,13 +61,17 @@ Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `t
 `asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
 is wrong with the measurement rather than right with the library.
 
-`syrk`, `syr2k`, `hemm` and the rest of Level-3 inherit nothing for a structural reason worth knowing:
-they reach `_gemm_core!` **directly**, which sits *below* the split point. Threading them is Phase 4 of
-the plan and is not started.
+`syrk`, `syr2k` and `symm` reach `_gemm_core!` **directly**, below the public split point, so they
+carry their own job kinds in the pool rather than inheriting gemm's: a triangular output needs a
+flop-balanced column split, since equal widths hand the first worker roughly twice the work of the
+last.
 
-`trsm` is also flat, but for a different reason: it wraps its body in an arena scope, and a threaded
-`gemm` refuses to run while any scope is live (see [the arena](arena.md)). That guard is what makes
-per-thread workspaces safe, so the flatness is a deliberate trade, not an oversight.
+`trsm` threads on both sides — columns of B for side L, rows for side R — and each band is a whole
+problem, so the bands need no barrier between them. What a band DOES need is to route from the
+unsplit problem's dimensions: several kernel choices key on `max(m, n, k)`, and a band that lands on
+one of those constants takes a different kernel from the call it is part of. That is not a slower
+answer, it is a different one, and it broke `getrf`'s thread-count invariance until the route token
+reached the kernel switches themselves.
 
 ### Why `Dual` gets nothing — and why that is wiring, not a law
 
@@ -100,8 +107,8 @@ One panel per operation, one curve per microarchitecture, against problem size. 
 cost. The band is the q10–q90 spread of the pooled per-round ratios.
 
 Read the SHAPE, not just the peak. A curve that climbs with `n` is a routine amortising the fork-join
-correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — `syrk`,
-`syr2k`, `trsm`, `trmmR`, every Level-1 and Level-2 panel — are the controls described above, and they
+correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — every
+Level-1 and Level-2 panel, and `trmmR` — are the controls described above, and they
 are supposed to be flat.
 
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
@@ -112,12 +119,9 @@ Level-2 have no splitter, and complex and dual cannot reach one — so their pan
 by construction rather than by measurement.
 
 Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
-`syrk`, `syr2k`, `trsm`, `trmmR` and `potrf` sit on 1.00 next to `gemm` climbing to ~5×. They reach
-`_gemm_core!` *below* the split point — or, when these plots were last rendered, were refused threading
-because their `gemm!` sat inside a live arena scope; that admission guard is gone (the driver pins itself
-to its thread for the join instead, see `arena.md`), so the scope-blocked curves are due a re-render.
-Seeing flat curves in the same picture is what shows the measurement discriminates rather than
-flattering everything.
+`trmmR` and the Level-1/Level-2 panels sit on 1.00 next to `gemm` and `trsm` climbing past 4.9×.
+They have no splitter at all, or no reference threads them either. Seeing them flat in
+the same picture is what shows the measurement discriminates rather than flattering everything.
 
 Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
 `perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.
@@ -128,22 +132,37 @@ Best speedup per operation, six threads against one, on each box.
 
 | op | Zen3 · AVX2 | Zen4 · AVX-512 | Zen5 · AVX-512 |
 |---|---|---|---|
-| L3 `gemm` | 4.68× @512 | 4.42× @1000 | 5.34× @1000 |
-| L3 `symm` | 4.00× @4096 | 4.10× @1000 | 4.82× @1000 |
-| LP `getrf` | 2.12× @4096 | 3.05× @4096 | 3.96× @4096 |
-| L3 `trmm` | 2.24× @4096 | 2.86× @4096 | 3.58× @4096 |
-| LP `geqrf` | 3.23× @2048 | 1.55× @4096 | 1.87× @512 |
-| LP `gesvd` | 1.28× @2048 | 1.25× @2048 | 1.70× @1000 |
-| LP `gelsd` | 1.25× @1000 | 1.00× @256 | 1.17× @1000 |
-| LP `potri` | 1.16× @2048 | 1.00× @512 | 1.00× @50 |
-| LP `syev` | 1.08× @2048 | 1.09× @2048 | 1.16× @1000 |
-| LP `getrs` | 1.00× @100 | 1.00× @8 | 1.13× @1000 |
-| LP `trtri` | 1.12× @2048 | 1.00× @32 | 1.00× @32 |
-| LP `getri` | 1.05× @2048 | 1.00× @32 | 1.01× @8 |
+| L3 `trsm` | 5.64× @4096 | 4.90× @2100 | 1.00× @100 |
+| L3 `syrk` | 5.45× @4096 | 4.80× @4096 | 5.37× @2100 |
+| L3 `syr2k` | 2.87× @4096 | 4.29× @4096 | 5.24× @4096 |
+| LP `potrfU` | 5.17× @4096 | 4.30× @4096 | 5.24× @4096 |
+| L3 `trsmR` | 5.18× @4096 | 4.61× @4096 | 1.00× @100 |
+| L3 `gemm` | 4.75× @2100 | 4.01× @2100 | 5.04× @2100 |
+| LP `potrf` | 4.53× @4096 | 3.94× @4096 | 4.89× @4096 |
+| L3 `symm` | 4.50× @2100 | 3.74× @2100 | 4.84× @2100 |
+| LP `getrf` | 3.89× @2100 | 3.45× @4096 | 4.25× @4096 |
+| LP `pptrfL` | 2.54× @2048 | 3.20× @2048 | 4.09× @2048 |
+| LP `pptrfU` | 2.52× @2048 | 3.10× @2048 | 4.00× @2048 |
+| LP `geqrf` | 3.52× @4096 | 1.57× @4096 | 1.73× @512 |
+| LP `getri` | 2.44× @2048 | 1.98× @2048 | 2.60× @2048 |
+| LP `pstrf` | 2.16× @2100 | 1.76× @2100 | 2.15× @2100 |
+| LP `pstrfU` | 1.85× @2100 | 1.62× @2100 | 2.12× @2100 |
+| LP `syev` | 1.67× @2048 | 1.74× @2048 | 2.07× @2048 |
+| LP `pbtrfL` | 1.39× @384 | 1.55× @384 | 2.00× @384 |
+| LP `gesvd` | 1.81× @2048 | 1.54× @2048 | 1.95× @2048 |
+| LP `pbtrfU` | 1.00× @32 | 1.44× @384 | 1.82× @384 |
+| LP `gels` | 1.39× @1024 | 1.39× @512 | 1.67× @512 |
+| LP `getrs` | 1.01× @256 | 1.00× @50 | 1.58× @1024 |
+| LP `potrsU` | 1.40× @1000 | 1.00× @50 | 1.00× @50 |
+| LP `potrsL` | 1.40× @1000 | 1.00× @512 | 1.17× @1024 |
+| LP `syevN` | 1.17× @1000 | 1.14× @2048 | 1.31× @2048 |
+| LP `gelsd` | 1.25× @1000 | 1.05× @1000 | 1.17× @1000 |
+| LP `potri` | 1.14× @1000 | 1.16× @2048 | 1.23× @2048 |
+| LP `geev` | 1.13× @1000 | 1.09× @1000 | 1.21× @1000 |
 
 ### Zen3 · AVX2
 
-Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
+Measured 2026-09-23T12:44 at commit `157895df`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
 
 1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -151,31 +170,47 @@ Measured 2026-09-18T18:27 at commit `c1e0222e`, AMD Ryzen 9 5900X 12-Core Proces
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
-| L3 `gemm` | **4.68×** | 512 | 46% |
-| L3 `symm` | **4.00×** | 4096 | 0% |
-| LP `geqrf` | **3.23×** | 2048 | 4% |
-| L3 `trmm` | **2.24×** | 4096 | 8% |
-| LP `getrf` | **2.12×** | 4096 | 6% |
-| LP `gesvd` | **1.28×** | 2048 | 9% |
+| L3 `trsm` | **5.64×** | 4096 | 1% |
+| L3 `syrk` | **5.45×** | 4096 | 1% |
+| L3 `trsmR` | **5.18×** | 4096 | 0% |
+| LP `potrfU` | **5.17×** | 4096 | 5% |
+| L3 `gemm` | **4.75×** | 2100 | 0% |
+| LP `potrf` | **4.53×** | 4096 | 7% |
+| L3 `symm` | **4.50×** | 2100 | 0% |
+| LP `getrf` | **3.89×** | 2100 | 1% |
+| LP `geqrf` | **3.52×** | 4096 | 1% |
+| L3 `syr2k` | **2.87×** | 4096 | 0% |
+| LP `pptrfL` | **2.54×** | 2048 | 4% |
+| LP `pptrfU` | **2.52×** | 2048 | 18% |
+| LP `getri` | **2.44×** | 2048 | 0% |
+| LP `pstrf` | **2.16×** | 2100 | 0% |
+| LP `pstrfU` | **1.85×** | 2100 | 0% |
+| LP `gesvd` | **1.81×** | 2048 | 0% |
+| LP `syev` | **1.67×** | 2048 | 6% |
+| LP `potrsU` | **1.40×** | 1000 | 11% |
+| LP `potrsL` | **1.40×** | 1000 | 2% |
+| LP `gels` | **1.39×** | 1024 | 1% |
+| LP `pbtrfL` | **1.39×** | 384 | 0% |
 | LP `gelsd` | **1.25×** | 1000 | 0% |
-| LP `potri` | **1.16×** | 2048 | 4% |
-| LP `trtri` | **1.12×** | 2048 | 5% |
-| LP `syev` | **1.08×** | 2048 | 3% |
-| LP `getri` | **1.05×** | 2048 | 2% |
+| LP `syevN` | **1.17×** | 1000 | 0% |
+| LP `potri` | **1.14×** | 1000 | 3% |
+| LP `geev` | **1.13×** | 1000 | 2% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `gesvd` | 512 | **0.36×** | 9% |
-| LP `gesvd` | 256 | **0.80×** | 6% |
-| LP `gesvd` | 1000 | **0.88×** | 86% |
-| LP `gesvd` | 1024 | **0.89×** | 82% |
-| LP `syev` | 8 | **0.94×** | 7% |
+| LP `getrs` | 1024 | **0.79×** | 38% |
+| LP `getrs` | 2048 | **0.83×** | 10% |
+| LP `pbtrfU` | 384 | **0.84×** | 2% |
+| LP `getrs` | 1000 | **0.88×** | 17% |
+| LP `trtri` | 32 | **0.94×** | 25% |
+| LP `pbtrfU` | 256 | **0.95×** | 1% |
+| LP `trtrs` | 50 | **0.95×** | 77% |
 
 ### Zen4 · AVX-512
 
-Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 2813 MHz with boost off.
+Measured 2026-09-23T12:53 at commit `157895df`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 2813 MHz with boost off.
 
 1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -183,28 +218,49 @@ Measured 2026-09-18T16:12 at commit `c1e0222e`, AMD Ryzen 5 7640U w/ Radeon 760M
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
-| L3 `gemm` | **4.42×** | 1000 | 3% |
-| L3 `symm` | **4.10×** | 1000 | 0% |
-| LP `getrf` | **3.05×** | 4096 | 1% |
-| L3 `trmm` | **2.86×** | 4096 | 1% |
-| LP `geqrf` | **1.55×** | 4096 | 1% |
-| LP `gesvd` | **1.25×** | 2048 | 4% |
-| LP `syev` | **1.09×** | 2048 | 5% |
+| L3 `trsm` | **4.90×** | 2100 | 0% |
+| L3 `syrk` | **4.80×** | 4096 | 5% |
+| L3 `trsmR` | **4.61×** | 4096 | 1% |
+| LP `potrfU` | **4.30×** | 4096 | 2% |
+| L3 `syr2k` | **4.29×** | 4096 | 0% |
+| L3 `gemm` | **4.01×** | 2100 | 1% |
+| LP `potrf` | **3.94×** | 4096 | 0% |
+| L3 `symm` | **3.74×** | 2100 | 2% |
+| LP `getrf` | **3.45×** | 4096 | 1% |
+| LP `pptrfL` | **3.20×** | 2048 | 2% |
+| LP `pptrfU` | **3.10×** | 2048 | 4% |
+| LP `getri` | **1.98×** | 2048 | 5% |
+| LP `pstrf` | **1.76×** | 2100 | 1% |
+| LP `syev` | **1.74×** | 2048 | 4% |
+| LP `pstrfU` | **1.62×** | 2100 | 0% |
+| LP `geqrf` | **1.57×** | 4096 | 1% |
+| LP `pbtrfL` | **1.55×** | 384 | 2% |
+| LP `gesvd` | **1.54×** | 2048 | 1% |
+| LP `pbtrfU` | **1.44×** | 384 | 1% |
+| LP `gels` | **1.39×** | 512 | 4% |
+| LP `potri` | **1.16×** | 2048 | 0% |
+| LP `syevN` | **1.14×** | 2048 | 2% |
+| LP `geev` | **1.09×** | 1000 | 4% |
+| LP `gelsd` | **1.05×** | 1000 | 1% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `gesvd` | 512 | **0.47×** | 115% |
-| LP `gesvd` | 256 | **0.79×** | 9% |
-| LP `pstrfU` | 4096 | **0.90×** | 13% |
-| LP `gelsd` | 1000 | **0.90×** | 12% |
-| LP `gesvd` | 1024 | **0.94×** | 26% |
-| LP `getrs` | 2048 | **0.94×** | 5% |
+| L2 `trmv` | 2048 | **0.78×** | 73% |
+| LP `potrsU` | 2048 | **0.89×** | 1% |
+| LP `potrsL` | 1000 | **0.91×** | 12% |
+| LP `potrsU` | 1024 | **0.92×** | 3% |
+| LP `potrsL` | 1024 | **0.93×** | 2% |
+| LP `potrsU` | 256 | **0.93×** | 13% |
+| LP `potrsU` | 1000 | **0.93×** | 4% |
+| LP `pptrfU` | 256 | **0.94×** | 2% |
+| LP `potrsL` | 2048 | **0.95×** | 3% |
+| LP `pstrf` | 256 | **0.96×** | 6% |
 
 ### Zen5 · AVX-512
 
-Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+Measured 2026-09-23T13:00 at commit `157895df`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
 1104 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -212,22 +268,42 @@ Measured 2026-09-18T22:01 at commit `c1e0222e`, AMD Ryzen AI 5 340 w/ Radeon 840
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
-| L3 `gemm` | **5.34×** | 1000 | 1% |
-| L3 `symm` | **4.82×** | 1000 | 0% |
-| LP `getrf` | **3.96×** | 4096 | 0% |
-| L3 `trmm` | **3.58×** | 4096 | 1% |
-| LP `geqrf` | **1.87×** | 512 | 2% |
-| LP `gesvd` | **1.70×** | 1000 | 3% |
-| LP `gelsd` | **1.17×** | 1000 | 1% |
-| LP `syev` | **1.16×** | 1000 | 0% |
-| LP `getrs` | **1.13×** | 1000 | 3% |
+| L3 `syrk` | **5.37×** | 2100 | 0% |
+| L3 `syr2k` | **5.24×** | 4096 | 2% |
+| LP `potrfU` | **5.24×** | 4096 | 0% |
+| L3 `gemm` | **5.04×** | 2100 | 1% |
+| LP `potrf` | **4.89×** | 4096 | 0% |
+| L3 `symm` | **4.84×** | 2100 | 1% |
+| LP `getrf` | **4.25×** | 4096 | 0% |
+| LP `pptrfL` | **4.09×** | 2048 | 0% |
+| LP `pptrfU` | **4.00×** | 2048 | 0% |
+| LP `getri` | **2.60×** | 2048 | 0% |
+| LP `pstrf` | **2.15×** | 2100 | 0% |
+| LP `pstrfU` | **2.12×** | 2100 | 0% |
+| LP `syev` | **2.07×** | 2048 | 3% |
+| LP `pbtrfL` | **2.00×** | 384 | 1% |
+| LP `gesvd` | **1.95×** | 2048 | 1% |
+| LP `pbtrfU` | **1.82×** | 384 | 0% |
+| LP `geqrf` | **1.73×** | 512 | 9% |
+| LP `gels` | **1.67×** | 512 | 14% |
+| LP `getrs` | **1.58×** | 1024 | 14% |
+| LP `syevN` | **1.31×** | 2048 | 1% |
+| LP `potri` | **1.23×** | 2048 | 0% |
+| LP `geev` | **1.21×** | 1000 | 3% |
+| LP `potrsL` | **1.17×** | 1024 | 3% |
+| LP `gelsd` | **1.17×** | 1000 | 0% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `gesvd` | 512 | **0.70×** | 88% |
-| LP `gesvd` | 256 | **0.92×** | 28% |
+| LP `potrsU` | 2048 | **0.87×** | 2% |
+| LP `potrsU` | 1000 | **0.92×** | 9% |
+| LP `potrsU` | 1024 | **0.93×** | 2% |
+| LP `potrsU` | 256 | **0.93×** | 3% |
+| LP `potrsL` | 1000 | **0.94×** | 8% |
+| LP `potrsL` | 2048 | **0.95×** | 4% |
+| L3 `gemm` | 8 | **0.96×** | 28% |
 
 ## Open: `gesvd` gets slower with threads
 
@@ -236,9 +312,9 @@ microarchitectures — though not equally, which is itself a clue:
 
 | box | n=256 | n=512 | n=1000 | n=1024 | n=2048 |
 |---|---|---|---|---|---|
-| Zen3 · AVX2 | 0.80× | 0.36× | 0.88× | 0.89× | 1.28× |
-| Zen4 · AVX-512 | 0.79× | 0.47× | 1.04× | 0.94× | 1.25× |
-| Zen5 · AVX-512 | 0.92× | 0.70× | 1.70× | 1.50× | 1.62× |
+| Zen3 · AVX2 | 1.13× | 1.35× | 1.58× | 1.41× | 1.81× |
+| Zen4 · AVX-512 | 1.08× | 1.26× | 1.50× | 1.45× | 1.54× |
+| Zen5 · AVX-512 | 1.17× | 1.46× | 1.86× | 1.80× | 1.95× |
 
 The root cause is **not yet known**. Three plausible explanations have been measured and rejected:
 
