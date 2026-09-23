@@ -73,16 +73,43 @@ end
     n = max(128, P._SME_MIN)
     C = zeros(n, n); A = rand(n, n); B = rand(n, n)
     elig(tA, tB, cA, cB) = P._sme_eligible(Float64, n, n, n, tA, tB, cA, cB, C, A, B)
-    # The packers read untransposed, unit-row-stride, real Float64 operands only; everything
-    # else must fall through to the SIMD path rather than produce a wrong answer.
-    @test !elig(true, false, false, false)
-    @test !elig(false, true, false, false)
+    # Transposed operands ARE handled: the packers read either orientation, which is what lets the
+    # triangular and symmetric routines reach this path at all -- `_rank_k` always issues one
+    # transposed operand, and symm issues `(false, tr)`.
+    @test elig(true, false, false, false)
+    @test elig(false, true, false, false)
+    @test elig(true, true, false, false)
+    # Conjugation is not: the kernel is real Float64, so a conjugated operand must fall through to
+    # the SIMD path rather than produce a wrong answer.
+    @test !elig(false, false, true, false)
+    @test !elig(false, false, false, true)
     @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
                            zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
     # Below the crossover the packed panels do not pay for themselves.
     small = P._SME_MIN - 1
     @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
                            zeros(small, small), rand(small, small), rand(small, small))
+end
+
+@testitem "SME computes every transpose combination correctly" begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    if !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "no SME F64 on this machine"
+    else
+        # Ragged as well as square: the edge macrokernel handles the m/n/k remainders, and a shape
+        # that divides the block sizes exercises none of it.
+        for (m, n, k) in ((300, 300, 300), (257, 193, 129), (512, 128, 320), (129, 512, 97))
+            for ta in ('N', 'T'), tb in ('N', 'T')
+                A = ta == 'N' ? randn(m, k) : randn(k, m)
+                B = tb == 'N' ? randn(k, n) : randn(n, k)
+                C = zeros(m, n)
+                P.gemm!(C, A, B; transA = ta, transB = tb, alpha = 1.0, beta = 0.0)
+                R = (ta == 'N' ? A : transpose(A)) * (tb == 'N' ? B : transpose(B))
+                @test maximum(abs, C .- R) / maximum(abs, R) < 1e-13
+            end
+        end
+    end
 end
 
 @testitem "SME does not disturb Mode 2 differentiability" begin

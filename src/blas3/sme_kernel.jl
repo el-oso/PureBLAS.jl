@@ -28,6 +28,26 @@
 # took 3.3 ms against a 225 ms kernel loop) rather than landing inside one. Verified over 82,442
 # calls under a continuous allocate-and-collect storm with every value exact.
 
+# WHERE THIS CODE BELONGS. This file is the one place hand-written LLVM IR lives in PureBLAS —
+# roughly 100 lines of it, emitted by Julia functions that interpolate the detected tile geometry,
+# so changing `_SME_LANES` changes the kernel. Everything else about SME is two detection constants
+# in `cpuinfo.jl`, one dispatch line in `gemm.jl`, and one `__init__` hook in `lbt.jl`.
+#
+# The long-term aim is to find every extension and kernel this hardware needs, then upstream the lot
+# to SIMD.jl — which already generates LLVM IR itself (49 `llvmcall` sites and a whole
+# `LLVM_intrinsics.jl`), so generated IR is not the obstacle. The obstacle is a TYPE:
+# `<vscale x 2 x double>` is a SCALABLE vector with no Julia representation, while `Vec{N,T}` is
+# fixed-width by construction. Hosting this needs a new type concept, not a new function.
+# That work can come LATER: no scalable type crosses the Julia boundary here — every entry point
+# takes `Ptr` and `Int` — so these kernels are shippable exactly as they stand.
+#
+# A package extension was evaluated and REJECTED. It works mechanically: a package may appear in
+# both `[deps]` and `[weakdeps]`, and the extension fires when the user loads the trigger — verified,
+# including that it does NOT fire when the trigger merely arrives as a transitive dependency. It is
+# wrong here because the `--trim` build does not load extensions, so `libpureblas.so` (Mode 1, the
+# C-host drop-in) would silently lose SME and fall back to NEON. Mode 1 needs the matrix unit, so
+# the kernel stays in `src/`.
+
 # ZA holds the C tile as four 8x8 FP64 tiles:
 #     za0 = rows 0-7,  cols 0-7      za1 = rows 0-7,  cols 8-15
 #     za2 = rows 8-15, cols 0-7      za3 = rows 8-15, cols 8-15
@@ -364,6 +384,16 @@ function _sme_pack_B_edge!(
     return nothing
 end
 
+# Scales a packed panel in place. Needed only when alpha must ride a panel built by the ZA
+# transpose, which has no scaling form; the panel is cache-resident at this point.
+function _sme_scale_panel!(P::Ptr{Float64}, len::Int, s::Float64)
+    for i in 0:(len - 1)
+        q = P + i * 8
+        unsafe_store!(q, s * unsafe_load(q))
+    end
+    return nothing
+end
+
 # ── Block sizes ────────────────────────────────────────────────────────────────────────────────
 # Derived, per req#8, but from a criterion the SIMD path does not have: C RE-STREAMING.
 #
@@ -402,7 +432,7 @@ end
 # and the live part copied back — the extra cost falls only on the edges.
 function _sme_gemm!(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
-        m::Int, n::Int, k::Int, alpha::Float64, beta::Float64,
+        m::Int, n::Int, k::Int, alpha::Float64, beta::Float64, tA::Bool, tB::Bool,
         Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64},
         MC::Int, NC::Int, KC::Int
     )
@@ -418,6 +448,10 @@ function _sme_gemm!(
             unsafe_store!(p, beta * unsafe_load(p))
         end
     end
+    # alpha folds into whichever panel is built by the scaling (contiguous) packer. The ZA
+    # transpose cannot scale, so when A is transposed alpha rides B -- and B is packed once per
+    # (jc, pc) rather than once per (jc, pc, ic), which is the cheaper side anyway.
+    bscale = tA ? alpha : 1.0
     if m == 0 || n == 0 || k == 0 || alpha == 0.0
         # No product to add. C still needs beta applied, including the beta == 0 case that the
         # block loop would otherwise have handled.
@@ -438,17 +472,34 @@ function _sme_gemm!(
         while pc < k
             kce = min(KC, k - pc)
             kpad = cld(kce, _SME_L) * _SME_L
-            # The ZA transpose works in whole LxL blocks and would read past B on a ragged edge.
-            if kce == kpad && nce == npad
+            # Which side needs transposing follows from the storage, not from preference:
+            #   op(A)=A  -- A is m x k, so MR rows of a column are already contiguous
+            #   op(A)=A2 -- A is k x m, so that run is strided and needs a transpose
+            #   op(B)=B  -- B is k x n, so the run is strided and needs a transpose
+            #   op(B)=B2 -- B is n x k, so the run is contiguous
+            # So N,T needs no transpose at all and T,N needs two. The ZA transpose works in whole
+            # LxL blocks and would read past the operand on a ragged edge, hence the scalar
+            # fallback there.
+            if tB
+                _sme_pack_A!(Bp, B, ldb, jc, pc, nce, kce, kpad, bscale)
+            elseif kce == kpad && nce == npad
                 _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
+                bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
             else
                 _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
+                bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
             end
             ic = 0
             while ic < m
                 mce = min(MC, m - ic)
                 mpad = cld(mce, MR) * MR
-                _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
+                if !tA
+                    _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
+                elseif kce == kpad && mce == mpad
+                    _sme_packb!(Ap, A + (pc + ic * lda) * 8, lda, kpad, mpad ÷ _SME_L)
+                else
+                    _sme_pack_B_edge!(Ap, A, lda, pc, ic, kce, mce, kpad)
+                end
                 _sme_macro_edges!(
                     C, ldc, Ap, Bp, Cs, ic, jc, mce, nce, mpad, npad, kpad,
                     overwrite_first && pc == 0
@@ -550,10 +601,11 @@ const _SME_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _sme_entry_cabi(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
-        m::Int, n::Int, k::Int, alpha::Float64, beta::Float64,
+        m::Int, n::Int, k::Int, alpha::Float64, beta::Float64, tA::Int, tB::Int,
         Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64}, MC::Int, NC::Int, KC::Int
     )
-    _sme_gemm!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, Ap, Bp, Cs, MC, NC, KC)
+    _sme_gemm!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, tA != 0, tB != 0,
+               Ap, Bp, Cs, MC, NC, KC)
     return nothing
 end
 
@@ -571,7 +623,7 @@ function _sme_init!()
         f = Base.inferencebarrier(_sme_entry_cabi)
         cf = @cfunction($f, Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
-             Int, Int, Int, Float64, Float64,
+             Int, Int, Int, Float64, Float64, Int, Int,
              Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
         _SME_TRAMPOLINE[] = cf
         _SME_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, cf)
@@ -583,12 +635,35 @@ function _sme_init!()
 end
 
 @inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
-    T === Float64 && _SME_F64 && !tA && !tB && !cA && !cB &&
+    T === Float64 && _SME_F64 && !cA && !cB &&
         _strided1(C) && _strided1(A) && _strided1(B) &&
         max(m, n, k) >= _SME_MIN && _SME_ENTRY[] !== C_NULL
 
-@noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int)
+# AN SME-ELIGIBLE CALL IS NOT COLUMN-SPLIT, for the same reason a Strassen call is not: splitting it
+# does not divide the work between units, it queues the workers behind one of them. The coprocessor
+# is SHARED BY THE CLUSTER, so `nw` chunks that each route back into `_gemm_core_body!` all contend
+# for the same hardware. Measured on an M6 at n=4096, Float64: 503 GFLOP/s with this guard against
+# 301 without it (six workers, one unit) and 177 for the threaded NEON path that the guard declines.
+#
+# The threaded entry is the ONLY place this can be decided. A guard inside `_gemm_core_body!` is too
+# late — `_gemm_threaded!` reaches that body once per chunk through `_gemm_run_chunk`, so by then the
+# split has already happened.
+@inline _sme_owns(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
+    _sme_eligible(T, m, n, k, tA, tB, cA, cB, C, A, B)
+
+# Bumped once per SME gemm, and read by the threading liveness gate: a call this guard takes away
+# from the pool has to show that the coprocessor ran instead. Once per call against milliseconds of
+# kernel, so it costs nothing measurable; it is the SME counterpart of the pool's `gen` word.
+const _SME_CALLS = Threads.Atomic{Int}(0)
+
+@noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
+                             tA::Bool, tB::Bool)
+    Threads.atomic_add!(_SME_CALLS, 1)
     asz, bsz, csz, MC, NC, KC = _sme_scratch_sizes(m, n, k)
+    # The pack buffers are per-TASK (`_gemm_scratch` -> `_gpackws`), not per-thread: cooperative
+    # A-packing meets the other workers at a barrier while the packed B panel is live. Going
+    # through `_gemm_scratch` keeps both growths at the one growth point, so a single barrier
+    # covers them. The C scratch is carved off the tail of the A buffer.
     Ap, Bp = _gemm_scratch(Float64, asz + csz, bsz)
     ldc = stride(C, 2); lda = stride(A, 2); ldb = stride(B, 2)
     GC.@preserve C A B Ap Bp begin
@@ -596,10 +671,10 @@ end
         ccall(
             _SME_ENTRY[], Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
-             Int, Int, Int, Float64, Float64,
+             Int, Int, Int, Float64, Float64, Int, Int,
              Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int),
             pointer(C), ldc, pointer(A), lda, pointer(B), ldb,
-            m, n, k, alpha, beta,
+            m, n, k, alpha, beta, tA ? 1 : 0, tB ? 1 : 0,
             pap, pointer(Bp), pap + asz * sizeof(Float64), MC, NC, KC
         )
     end
