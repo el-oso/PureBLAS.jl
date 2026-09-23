@@ -378,3 +378,110 @@ end
         P.set_num_threads(1)
     end
 end
+
+@testitem "threaded gemm: every element type the driver admits is reproducible" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    # THE TYPE LIST IS READ FROM THE DRIVER'S SIGNATURE, NEVER WRITTEN HERE. `_gemm_threaded!` is
+    # declared `where {T <: BlasReal}` because three things in its body exist only for the real types:
+    # the pool registry, the shared-pack prefit, and the `nroute` discipline that keeps a column slice
+    # on the whole problem's route. Widening that bound to admit complex therefore widens THIS test in
+    # the same edit, and it fails until complex is genuinely reproducible — which is the point. A list
+    # of types spelled out here would have gone on passing while the driver silently grew a type it
+    # cannot split correctly.
+    bounds = Any[]
+    for mm in methods(P._gemm_threaded!)
+        s = mm.sig
+        while s isa UnionAll
+            push!(bounds, s.var.ub)
+            s = s.body
+        end
+    end
+    admitted = filter(T -> any(b -> T <: b, bounds), [Float64, Float32, ComplexF64, ComplexF32])
+    # Liveness: if the signature walk ever stops finding types, this test would pass by testing
+    # nothing. Two real types are admitted today, so anything less means the extraction broke.
+    @test length(admitted) >= 2
+
+    n, k = 512, 96
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        for T in admitted
+            Random.seed!(20261)
+            A = randn(T, n, k); B = randn(T, k, n)
+            P.set_num_threads(nthreads())
+            # Witness per type: a shape that does NOT reach the pool would make bit-identity vacuous.
+            @test P._gemm_workers(n, n, k) > 1
+            for α in (one(T), -one(T), T(2.5)), β in (zero(T), T(0.5))
+                C0 = randn(T, n, n)
+                P.set_num_threads(1);          r = copy(C0)
+                P.gemm!(r, A, B; alpha = α, beta = β)
+                P.set_num_threads(nthreads()); g = copy(C0)
+                P.gemm!(g, A, B; alpha = α, beta = β)
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
+@testitem "LAPACK drivers: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    # THE SHAPES ARE THE DRIVERS' OWN, NOT SHAPES CHOSEN HERE. A threaded Level-3 routine is split
+    # into column bands, and a band can land on a width that selects a different KERNEL from the one
+    # the unsplit call takes — `_gemm_split_max()` is such a width. Whether a band lands there is a
+    # function of the driver's blocking, so only the driver's real call sequence exercises it.
+    #
+    # This item exists because the gemm/symm item above passed while `getrf` was broken: its shapes
+    # were square and wide, and every band came out wider than the kernel switch. The bands `getrf`
+    # actually produces at n=1024 and n=2048 come out at exactly 64, and there the threaded result
+    # differed from the serial one — correct to 1e-14, identical pivots, wrong bits.
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        for n in (512, 1024, 2048)
+            Random.seed!(4242 + n)
+            A0 = randn(n, n)
+            # Witness FIRST, and under the threaded setting: `_trsm_workers` reads the live thread
+            # count, so asking it while threads are set to 1 always answers 1 and the bit-identity
+            # below would pass by never threading at all.
+            nb = P._lu_nb(n)
+            P.set_num_threads(nthreads())
+            @test P._trsm_workers(nb, n - nb) > 1
+            P.set_num_threads(1)
+            r = copy(A0); ipr = Vector{Int}(undef, n); P.getrf!(r, ipr)
+            for nw in (2, nthreads())
+                P.set_num_threads(nw)
+                g = copy(A0); ipg = Vector{Int}(undef, n); P.getrf!(g, ipg)
+                @test bitsame(g, r)
+                @test ipg == ipr
+            end
+        end
+        # potrf needs n = 2048 to be worth testing at all: below `_chol_faer_base` it issues NO
+        # Level-3 call and runs entirely inside a scalar kernel, so a smaller size would compare two
+        # serial runs and pass no matter what. The witness is the pool's generation counter rather
+        # than a worker-count predicate, because it catches any veto between "the predicate says
+        # yes" and the pool actually running — including one nobody has written yet.
+        p = P._gemm_pool(Float64)
+        for n in (1024, 2048)
+            Random.seed!(99 + n)
+            S = randn(n, n); S = S * S' + n * I
+            P.set_num_threads(1)
+            r = copy(S); P.potrf!(r; uplo = 'L')
+            for nw in (2, nthreads())
+                P.set_num_threads(nw)
+                g = copy(S)
+                g0 = @atomic p.gen
+                P.potrf!(g; uplo = 'L')
+                n >= 2048 && @test (@atomic p.gen) != g0
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
