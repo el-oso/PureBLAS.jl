@@ -9,15 +9,12 @@ PureBLAS.set_num_threads(6)     # opt in; same shape as openblas_set_num_threads
 PureBLAS.get_num_threads()
 ```
 
-## These numbers are NOT the gate
+## What these numbers are
 
-The gate is `PB ≥ max(OpenBLAS, AOCL)`, **single-threaded**, and nothing on this page changes it. Every
-figure here is a **scaling** measurement: the same PureBLAS, on the same box, in the same process, with
-six threads instead of one.
+A **scaling** measurement: the same PureBLAS, on the same box, in the same process, with six threads
+instead of one. The gate is a separate, single-threaded criterion and this page does not speak to it.
 
-A threaded PureBLAS compared against a single-threaded OpenBLAS would be flattery, not parity, so that
-comparison is not made anywhere here. A real threaded gate needs freshly measured **threaded reference
-arms**, which is six to eight hours per box and has not been done.
+A threaded gate would need freshly measured threaded reference arms, six to eight hours per box.
 
 ## How it is measured
 
@@ -47,84 +44,40 @@ taskset -c 0,2,4,6,8,10,1 julia --project=bench -t 6 bench/plots.jl bench arms=p
 julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 ```
 
-## What is threaded, and what is deliberately not
+## What is threaded
 
-**There is exactly ONE splitter, in `gemm!`.** No other routine contains threading code. `_symm!` is
-the only other place that calls the threaded driver, and it does so by routing its already-materialised
-product through that same splitter. Everything else that speeds up — `getrf`, `geqrf`, `trmm` — does so
-because it *calls* `gemm!`; not a line was written for them.
-
-That is why this page lists 13 operations and not 60. Of the real-typed ops measured, 47 do not move
-beyond the noise floor, because nothing threads them.
-
-Flat at 1.00 **by design**, because no reference threads them either: `trsv`, `tbsv`, `tpsv`, `copy`,
-`asum`, `iamax`, and gemm's k-loop. Their cells are a control — if one ever moves off 1.00, something
-is wrong with the measurement rather than right with the library.
-
-`syrk`, `syr2k` and `symm` reach `_gemm_core!` **directly**, below the public split point, so they
-carry their own job kinds in the pool rather than inheriting gemm's: a triangular output needs a
+The worker pool runs five kinds of job. `gemm` splits the columns of C. `syrk`, `syr2k` and `symm`
+reach the kernel below that split point, so they carry their own kind: a triangular output needs a
 flop-balanced column split, since equal widths hand the first worker roughly twice the work of the
-last.
+last. `trsm` splits the columns of B on side L and its rows on side R — every column of one and
+every row of the other is an independent solve, so the bands are write-disjoint and need no barrier.
+`getrf` adds one more: it factors the next panel on one worker while the rest apply the current
+panel's update.
 
-`trsm` threads on both sides — columns of B for side L, rows for side R — and each band is a whole
-problem, so the bands need no barrier between them. What a band DOES need is to route from the
-unsplit problem's dimensions: several kernel choices key on `max(m, n, k)`, and a band that lands on
-one of those constants takes a different kernel from the call it is part of. That is not a slower
-answer, it is a different one, and it broke `getrf`'s thread-count invariance until the route token
-reached the kernel switches themselves.
+`getrf` and `potrf` reach the pool through those, and `potrf` reaches it at every size — its leaf
+routes its trailing update through the public `syrk!` rather than a private kernel.
 
-### Why `Dual` gets nothing — and why that is wiring, not a law
-
-The dual groups carry no `pb_mt` arm at all, because their reference is LinearAlgebra's generic
-fallback, which replaces the arm list. But the interesting part is what would happen if they did.
-
-**A dual gemm is already three REAL `Float64` gemms.** `_gemm_dual3!` splits the operands into value
-and partial planes and computes `P1 = Av·Bv`, `P2 = Av·Bp`, `P2 += Ap·Bv`, then combines. Those three
-products are ordinary real gemms of the same shape as the original — exactly the kind of call that
-threads well. So there is no type-level reason a `Dual` gemm cannot be threaded.
-
-Two concrete things block it today, and neither is fundamental:
-
-1. **It calls `_gemm_core!` directly**, which sits *below* the split point — the same structural reason
-   `syrk` and `syr2k` inherit nothing. The guard in `gemm!` never even runs for these.
-2. **The plane scratch is per-THREAD and held across all three products.** The buffers come from
-   `L3Workspace`, whose owner is safe today only because it is claimed *inside* a chunk body, which
-   never yields. A driver holding it across a threaded join is precisely the shape that made concurrent
-   `getrf!` return wrong answers 20 times in 96 — it would need the same per-task conversion `symm`
-   received.
-
-There is also a parallel opportunity the column split does not reach: `P1` and the `P2` pair are
-**independent products**, so they could run concurrently as whole gemms rather than being split
-internally. That is task-level parallelism on the same three-plane structure.
-
-None of this is scheduled. It belongs with Phase 4, and it is recorded here so the absence reads as a
-decision rather than an oversight.
+**A band must route from the unsplit problem's dimensions.** Several kernel choices key on
+`max(m, n, k)`, so a band whose width lands on one of those constants would take a different kernel
+from the call it belongs to. That is not a slower answer, it is a different one, and it is why the
+route token reaches the kernel switches themselves — `getrf` lost its thread-count invariance until
+it did.
 
 ## Plots
 
 One panel per operation, one curve per microarchitecture, against problem size. The dashed line is
-1.00× — **no gain** — so a curve above it means threading paid and a curve below it means threading
-cost. The band is the q10–q90 spread of the pooled per-round ratios.
+1.00×, the band is the q10–q90 spread of the pooled per-round ratios. A panel appears when its
+routine reaches at least 1.25× somewhere on the fleet, which is well clear of the harness's own
+3.7% noise floor.
 
-Read the SHAPE, not just the peak. A curve that climbs with `n` is a routine amortising the fork-join
-correctly; one that falls is a routine that is not. The flat lines sitting exactly on 1.00 — every
-Level-1 and Level-2 panel, and `trmmR` — are the controls described above, and they
-are supposed to be flat.
+Read the SHAPE, not just the peak: a curve that climbs with `n` is a routine amortising the
+fork-join correctly.
 
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
 
-Only Level-3 and LAPACK are plotted, because they are the only groups anything threads. Level-1 and
-Level-2 have no splitter, and complex and dual cannot reach one — so their panels would be flat lines
-by construction rather than by measurement.
-
-Within these two panels the flat curves ARE informative, and they are kept for exactly that reason:
-`trmmR` and the Level-1/Level-2 panels sit on 1.00 next to `gemm` and `trsm` climbing past 4.9×.
-They have no splitter at all, or no reference threads them either. Seeing them flat in
-the same picture is what shows the measurement discriminates rather than flattering everything.
-
-Regenerate them with `julia --project=bench bench/plots.jl mtdraw`. That mode renders only
-`perf_mt_*.svg` and exits before the gate rendering, so it cannot touch a gate artifact.
+Regenerate them with `julia --project=bench bench/plots.jl mtdraw`, which writes `perf_mt_*.svg`
+and exits before the gate rendering.
 
 ## Results
 
