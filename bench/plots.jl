@@ -48,6 +48,50 @@ REFBK == "mkl" && @eval using MKL
 # per-backend benchmark code exists.
 using OpenBLAS_jll
 const _ARM_PB = "pb"
+# ── THE MULTI-THREADED PureBLAS ARM ────────────────────────────────────────────────────────────────
+# `pb_mt` runs the SAME `work_pb` closure as `pb`, with `PureBLAS.set_num_threads(_MT_NT)` instead of 1.
+# It is an ARM NAME, deliberately NOT a member of `_REF_ALL`/`_VIEWS`: adding it there would multiply
+# the SVG set, break `check_view_pairing.sh`, and need new image references or the docs build hard-fails.
+# As an arm it is purely additive — the per-arm merge writes one more record per cell and every existing
+# artifact stays byte-identical, so NO cache version bump.
+#
+# ⚠ THIS IS A SCALING MEASUREMENT, NOT A GATE. A threaded PureBLAS against a single-threaded OpenBLAS is
+# flattery, not parity. The gate stays `PB ≥ max(OB, AOCL)` single-threaded. A real threaded gate needs
+# fresh THREADED reference arms — 6-8 h per box, three boxes — and the standing rule is that measuring a
+# reference at all needs the user's explicit per-run authorisation. Everything downstream that adjudicates
+# must therefore skip this arm; `_is_vendor_ref` below is the single place that decides.
+const _ARM_PB_MT = "pb_mt"
+# Threads for the `pb_mt` arm. 6 on every box BY DECISION, not by detection: wintermute and neuromancer
+# have 6 physical cores and galen has 12, and capping galen to 6 is what keeps the three boxes
+# comparable. Pin one CPU per PHYSICAL core when running it — a second thread on a core shares the same
+# FMA units, so logical-core scaling measures contention, not parallelism.
+#
+# THE MASK NEEDS ONE CPU MORE THAN THE THREAD COUNT. `julia -t 6` runs 19 OS threads: 6 workers plus
+# the GC, interactive and libuv threads. Masked to exactly 6 CPUs those runtime threads displace a
+# worker mid-join, and the gemm pool's spin-then-yield join stalls behind them. Measured on Zen4,
+# getrf@2048 threaded speedup: 6 CPUs gives 0.12-0.80 (bimodal against a flat serial arm), 6 physical
+# cores + 1 spare CPU gives 2.32-2.35, no mask at all gives 2.08-2.29. The spare slot is where the
+# runtime lands, so the workers keep their cores.
+#
+# CPU NUMBERING IS NOT THE SAME ON EVERY BOX — read `lscpu -p=CPU,CORE` before assuming a mask. On
+# wintermute the two CPUs of a core are adjacent (0,1 = core 0), on galen and neuromancer the siblings
+# are the whole second half (galen CPU 12 = core 0; neuromancer CPU 6 = core 0). So `0,2,4,6,8,10`
+# selects six distinct cores on wintermute and only three, doubled up, on neuromancer.
+#
+#   wintermute   taskset -c 0,2,4,6,8,10,1   julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
+#   galen        taskset -c 6,7,8,9,10,11,18 julia --project=bench -t 6 …   # CCD1, its own 32 MiB L3
+#   neuromancer  taskset -c 0,1,2,3,4,5,6    julia --project=bench -t 6 …
+# `mt=` overrides for a scaling curve; it is a harness setting, not a shipped tuning knob, so no PDM tier.
+const _MT_NT = let i = findfirst(a -> startswith(a, "mt="), ARGS)
+    isnothing(i) ? 6 : parse(Int, ARGS[i][4:end])
+end
+# Is this arm a VENDOR reference — i.e. may it appear on the other side of a gate comparison? `pb` and
+# `pb_mt` are both PureBLAS, and `generic` is LinearAlgebra's own fallback. Everything that adjudicates
+# or audits a PB-vs-reference pair must ask THIS, never `a != "pb"`.
+_is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl"
+_is_pb_arm(a::AbstractString) = a == _ARM_PB || a == _ARM_PB_MT
+# Set PureBLAS's thread count for the arm about to be timed. Called BETWEEN windows, never inside one.
+_use_pb!(a::AbstractString) = (PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
 # `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
 # iteration path; it is also the one that can silently go stale, which is why every arm carries its own
 # timestamp+commit and the table reports reference age rather than hiding it.
@@ -64,11 +108,25 @@ end
 # reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
 # single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
 # x86_64-only: AOCL_jll has no aarch64-apple-darwin artifact, and `bench/apple/Project.toml` (the
-# environment this file runs under on Apple Silicon) does not even list it as a dependency — so this
-# whole block must not execute there. Mirrors the existing `REFBK == "mkl" && @eval using MKL` pattern.
+# environment this file runs under on Apple Silicon) does not even list it as a dependency — so the
+# `using` must not execute there. Mirrors the existing `REFBK == "mkl" && @eval using MKL` pattern.
 const _ONX86 = Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+
+# BLIS reads these at init, before any forward — so they are set HERE, above `using AOCL_jll`, and
+# cannot be changed afterwards by `BLAS.set_num_threads`.
+#
+# RESPECT AN EXPLICIT LAUNCH SETTING. This used to assign "1" unconditionally, which silently undid the
+# environment a threaded-reference run must be launched with: `aocl_mt` would then record a
+# SINGLE-threaded AOCL under a threaded arm name, and every verdict built on it would be wrong in
+# PureBLAS's favour. A caller who set it to >1 has done so deliberately (see `_REF_MT`), and the arm
+# guard below refuses the run if it is too low. Default is still 1: a gate sweep is single-threaded,
+# and forgetting the variable must not silently produce a threaded reference either.
+for _v in ("BLIS_NUM_THREADS", "OMP_NUM_THREADS")
+    ENV[_v] = string(max(1, tryparse(Int, get(ENV, _v, "1")) === nothing ? 1 : tryparse(Int, get(ENV, _v, "1"))))
+end
+# Remember what BLIS was actually initialised with; the arm guard reads this, not the live ENV.
+const _BLIS_INIT_NT = parse(Int, ENV["BLIS_NUM_THREADS"])
 if _ONX86
-    ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"   # BLIS reads these at init, before any forward
     @eval using AOCL_jll
 end
 
@@ -96,14 +154,38 @@ const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
 # Accelerate for the first time, is required for a real single-thread measurement. Verified fix: with
 # this set before first use, the SAME `dgemm` pins at a clean ~99-100% CPU for the whole window
 # (272.7 ms/call vs the uncontrolled run's 234.6 ms/call — i.e. the "second core" bought only ~16%,
-# consistent with AMX being a per-core resource a second software thread can't usefully double up on,
-# not with real 2x general-purpose parallelism).
+# consistent with the matrix unit being a shared resource a second software thread can't usefully
+# double up on, not with real 2x general-purpose parallelism).
 ENV["VECLIB_MAXIMUM_THREADS"] = "1"
 
 # Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
 # state — the failure mode where you measure AOCL's BLAS against OpenBLAS's LAPACK and never notice.
+# ── THREADED REFERENCE ARMS ─────────────────────────────────────────────────────────────────────────
+# `openblas_mt` / `aocl_mt` are the SAME libraries at `_MT_NT` threads. They exist so a threaded gate is
+# possible at all: `pb_mt` against a single-threaded OpenBLAS is flattery, and the only honest
+# comparison is threaded-against-threaded.
+#
+# ⚠ AOCL'S THREAD COUNT IS FIXED BY THE PROCESS ENVIRONMENT, NOT BY US. BLIS reads BLIS_NUM_THREADS /
+# OMP_NUM_THREADS at init — which is why the header of this file pins them to 1 BEFORE `using AOCL_jll`.
+# A later `BLAS.set_num_threads` cannot undo that. So a threaded-reference run MUST be launched with
+# those set, and the guard below refuses rather than silently measuring a single-threaded AOCL and
+# publishing it as a threaded reference:
+#
+#   BLIS_NUM_THREADS=6 OMP_NUM_THREADS=6 taskset -c <this box's mask, see _ARM_PB_MT> \
+#       julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt,openblas_mt,aocl_mt nodraw
+#
+# Verified before use by `bench/probes/mt_reference_witness.jl`, which times a 2048 dgemm at 1 and N
+# threads and requires >1.5x. Measured on Zen4: OpenBLAS 4.72x, AOCL 3.32x.
+const _REF_MT = Dict("openblas_mt" => "openblas", "aocl_mt" => "aocl")
+_is_mt_ref(a::AbstractString) = haskey(_REF_MT, a)
+
 function _use_ref!(name::AbstractString)
+    if _is_mt_ref(name)
+        _use_ref!(_REF_MT[name])          # forward the library, which also re-asserts 1 thread …
+        BLAS.set_num_threads(_MT_NT)      # … then ask for N. OpenBLAS honours this; BLIS took it at init.
+        return name
+    end
     # DL1's reference is NOT a BLAS library. `Dual` is not a `BlasFloat`, so LinearAlgebra's generic
     # fallback never reaches BLAS at all — there is nothing to forward, and forwarding would be a lie
     # about what ran. This arm is deliberately kept OUT of `_REF_ALL` (hence out of `_VIEWS`) so the
@@ -149,8 +231,39 @@ const _REF_ALL = REFBK == "mkl" ? ["mkl"] : REFBK == "accelerate" ? ["accelerate
 # instruction is that this needs their explicit authorisation, per-run — it is not an agent decision.
 const _REF_ARMS = isnothing(_ARMS_SEL) ? String[] : [a for a in _REF_ALL if a in _ARMS_SEL]
 const _DO_PB = isnothing(_ARMS_SEL) || (_ARM_PB in _ARMS_SEL)
-const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _REF_ARMS)
-isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$(join(_REF_ALL, ","))")
+# `pb_mt` is opt-in ONLY. It must never be implied by a bare run: it is a second full pass over every
+# cell (~86 min/box), and a run that quietly measured it would double the cost of the fast iteration path.
+const _DO_PB_MT = !isnothing(_ARMS_SEL) && (_ARM_PB_MT in _ARMS_SEL)
+# Threaded reference arms, opt-in only and never implied. Measuring a reference at all needs the user's
+# explicit per-run authorisation; measuring one THREADED is a second, larger ask (it doubles the sweep).
+const _REF_MT_ARMS = isnothing(_ARMS_SEL) ? String[] :
+    [a for a in ("openblas_mt", "aocl_mt") if a in _ARMS_SEL]
+const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
+    _REF_ARMS, _REF_MT_ARMS)
+# ANY threaded arm puts this run in the mt family, and that has to be true for the REFERENCE arms too,
+# not just `pb_mt`. Keying the cache on `_DO_PB_MT` alone meant `arms=openblas_mt,aocl_mt` — a run with
+# no `pb_mt` at all — selected the GATE cache and would have written threaded references into the
+# single-threaded gate. Caught before it ran; the whole point of the separate file is that this cannot
+# happen, so the predicate must cover every threaded arm.
+const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
+# REFUSE rather than measure a lie. BLIS fixes its thread count at init from the environment, so if the
+# process was not launched with it, `aocl_mt` would be a single-threaded AOCL recorded under a threaded
+# name — and every downstream verdict built on it would be wrong in PureBLAS's favour.
+if "aocl_mt" in _REF_MT_ARMS
+    _BLIS_INIT_NT >= _MT_NT || error("""
+        aocl_mt requested but BLIS initialised with BLIS_NUM_THREADS=$_BLIS_INIT_NT (need >= $_MT_NT).
+        BLIS reads it at INIT — `BLAS.set_num_threads` cannot fix it later, so this run would record a
+        SINGLE-THREADED AOCL under a threaded arm name. Relaunch as:
+          BLIS_NUM_THREADS=$_MT_NT OMP_NUM_THREADS=$_MT_NT taskset -c … julia --project=bench -t $_MT_NT …
+        Verify first with bench/probes/mt_reference_witness.jl.""")
+end
+isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$_ARM_PB_MT,$(join(_REF_ALL, ","))")
+if _DO_PB_MT
+    Threads.nthreads() >= _MT_NT || error(
+        "arms=…,$_ARM_PB_MT needs at least $_MT_NT julia threads, got $(Threads.nthreads()). " *
+        "Run with -t $_MT_NT under this box's mask — see the _ARM_PB_MT comment for the per-box masks.")
+    println(stderr, "▶ $_ARM_PB_MT arm ON at $_MT_NT threads — SCALING measurement, not a gate comparison")
+end
 
 # One measured arm of one cell, with ITS OWN provenance. Per-arm (not per-cell) timestamps are the whole
 # point: `arms=pb` rewrites only the pb record, so the reference records keep the date and commit at
@@ -263,12 +376,18 @@ end
 # `arms=pb` there IS no reference in this round (that is the point of the mode), so fall back to pb's
 # median time in µs — a bare NaN told you nothing, and the per-round time is exactly what you want to
 # eyeball for stability when iterating on the kernel. `_ROUNDLBL` says which you are looking at.
-const _ROUNDLBL = isempty(_REF_ARMS) ? "rounds (pb µs)" : "rounds"
+const _ROUNDLBL = !isempty(_REF_ARMS) ? "rounds" :
+    _DO_PB_MT ? "rounds (pb/pb_mt speedup)" : "rounds (pb µs)"
 function _round_med(qs::ArmData)
     haskey(qs, _ARM_PB) || return NaN
     for a in _REF_ARMS
         haskey(qs, a) && return median(_ratio(qs[a], qs[_ARM_PB]))
     end
+    # With the mt arm there is no reference, so the fallback below would print pb's microseconds and the
+    # pb_mt arm would be INVISIBLE for the whole sweep — ~86 min of flying blind, with no way to notice
+    # that the arm had silently degenerated to 1.00. Report the SPEEDUP instead: pb / pb_mt, so >1 means
+    # threading paid. Same orientation as the reference ratio above (bigger is better for PureBLAS).
+    (_DO_PB_MT && haskey(qs, _ARM_PB_MT)) && return median(_ratio(qs[_ARM_PB], qs[_ARM_PB_MT]))
     return median(qs[_ARM_PB]) * 1.0e6
 end
 # A THIRD, DERIVED view — not a reference arm. It divides by whichever of `_REF_ALL` is faster at each
@@ -517,7 +636,9 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
             arms = isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1)
             qs = Dict{String, Vector{Float64}}()
             for a in arms
-                w = a == _ARM_PB ? work_pb : (_use_ref!(a); work_ob)
+                # `pb_mt` runs work_pb like `pb` does — only the thread count differs, which is what
+                # makes this a PAIRED in-process A/B rather than two runs compared afterwards.
+                w = _is_pb_arm(a) ? (_use_pb!(a); work_pb) : (_use_ref!(a); work_ob)
                 # Bracket the window — see the note on the other measurement loop. THERE ARE TWO of
                 # them (this one drives L1/L2, the other the rep-pool levels) and instrumenting only
                 # one is why the first run with `flo|fhi` wrote EMPTY ranges for every L1/L2 cell:
@@ -605,7 +726,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
         for r in 1:rounds
             qs = ArmData()
             for a in (isnothing(armlist) ? _round_arms(r) : circshift(armlist, r - 1))  # rotated (generalised ABBA); reference switch is outside the window
-                f = a == _ARM_PB ? pb1 : (_use_ref!(a); ob1)
+                f = _is_pb_arm(a) ? (_use_pb!(a); pb1) : (_use_ref!(a); ob1)   # see the note in `sweep`
                 # Bracket each arm's window with a clock sample. One sample AFTER the fact (what
                 # `_cell_khz()` alone gives) records the clock when we finished, not the clock the work
                 # actually ran at — fine while the box is pinned, wrong the moment it is not. Keeping
@@ -1874,7 +1995,27 @@ function run_cmplx_benchmarks()
 end
 
 # ── cache: one line per op  «level⟶TAB⟶name⟶TAB⟶ s1=r,r,…;s2=r,r,… » ─────────────────────────────
-const CACHE = joinpath(@__DIR__, "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")   # v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to the rendered views
+# v3: ONE cache per host holds EVERY arm (no _aocl/_mkl split); the reference suffix now applies only to
+# the rendered views.
+#
+# ── EXCEPT the pb_mt arm, which gets ITS OWN FILE, derived — not a new argument ──────────────────────
+# WHY THE GATE CACHE MUST NOT RECEIVE IT. `fleet_refresh.sh` pins the gate sweep to ONE core, on purpose:
+# an unpinned sweep let the scheduler migrate mid-measurement, and on galen (two 32 MiB L3s) a sweep
+# sharing a die with a GPU job moved 3.7% of cells. The `pb_mt` arm needs SIX cores, so `pb` and `pb_mt`
+# cannot share one invocation's affinity. Merging them into the gate cache would therefore REWRITE every
+# `pb` gate cell with a measurement taken at 6-core affinity instead of the sanctioned 1-core pinning —
+# changing the published gate's methodology silently, which is exactly the class of drift this file's
+# provenance machinery exists to make impossible.
+#
+# So the mt run writes `mt_data_…`, and that name is DELIBERATELY outside the `plots_data_*` glob that
+# fifteen scripts and `load_fleet()` use. It cannot leak into a rendered view, an artifact check, a
+# staleness audit or a gate verdict, because none of them can see it.
+#
+# Derived from `_DO_PB_MT` rather than taken as a `cache=` path: a path argument can be typo'd into the
+# gate cache, and the one thing this must guarantee is that asking for pb_mt can never overwrite the gate.
+const CACHE = joinpath(@__DIR__, _ANY_MT ?
+    "mt_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt" :
+    "plots_data_$(SLUG)_$(gethostname())$(_LITE ? "_lite" : "").txt")
 # ── MACHINE-STATE PROVENANCE: `anchor=` and `freq=` ────────────────────────────────────────────────
 # WHY. A cached reference is compared against a PB arm measured in a DIFFERENT process, possibly days
 # later. Same-run ratios cancel machine state — thermal drift, clock, page placement — because both arms
@@ -2364,10 +2505,14 @@ _ulabel(meta) = meta.uarch != "?" ? "$(meta.uarch) · $(meta.isa)" :
 
 # Load every fleet cache (plots_data_<host>.txt) → [(meta, groups), …]. In lite mode loads only *_lite; in
 # full mode only full caches. Skips MKL. Refuses stale-version caches via load_cache.
-function load_fleet()
+# `prefix` selects WHICH family of caches to draw. It defaults to the gate caches, so every existing
+# call is unchanged; `mt_data_` draws the multi-threaded sweep instead. The two families are separate
+# files precisely so an mt run can never touch a gate cell (see `CACHE`), and this is the one place
+# that needs to know both names.
+function load_fleet(prefix::AbstractString = "plots_data_")
     fleet = Tuple{NamedTuple, Dict{String, Vector{OpData}}}[]
     for f in sort(readdir(@__DIR__))
-        (startswith(f, "plots_data_") && endswith(f, ".txt")) || continue
+        (startswith(f, prefix) && endswith(f, ".txt")) || continue
         # v3: no reference filter. One cache per host carries every arm, and `_series` picks the arm for
         # the view being rendered — so the "never mix baselines" rule is now enforced by construction
         # (each ratio divides two arms measured in the SAME round) rather than by filename discipline.
@@ -2417,6 +2562,14 @@ function _series(g, gk, op, ref::AbstractString = REFBK)
                 (isnothing(best) || median(v) < median(best)) && (best = v)
             end
             isnothing(best) || push!(out, (s, best))
+        elseif ref == _ARM_PB_MT
+            # THE MT VIEW IS INVERTED RELATIVE TO EVERY OTHER ONE, on purpose. Elsewhere the numerator
+            # is the REFERENCE and the denominator PureBLAS, so "higher is better" means PB is faster.
+            # Here both arms are PureBLAS and the question is what threads BOUGHT, so the single-thread
+            # arm is the numerator: pb / pb_mt. Same reading — above the line is a win — which is the
+            # point; a plot that silently flipped its sense against its neighbours would be a trap.
+            haskey(cell, _ARM_PB_MT) || continue
+            push!(out, (s, _ratio(cell[_ARM_PB].q, cell[_ARM_PB_MT].q)))
         else
             haskey(cell, ref) || continue
             push!(out, (s, _ratio(cell[ref].q, cell[_ARM_PB].q)))
@@ -2562,7 +2715,16 @@ else
     _lock_exit_check()              # catches a lock that came off DURING the run
     _contention_exit_check()        # before save_cache — it stamps `busy=` into the header
     measured = Dict("L1" => l1, "L2" => l2, "L3" => l3, "LP" => lp, "CL1" => cl1, "CL2" => cl2, "CL3" => cl3, "CLP" => clp, "DL1" => dl1, "DL2" => dl2, "DL3" => dl3, "DLP" => dlp)
-    subset = !isnothing(_SELOP) || !isnothing(_SELGRP)
+    # AN MT RUN MERGES WHENEVER ITS CACHE EXISTS, even as a FULL run, because the mt cache ACCUMULATES
+    # ARMS ACROSS RUNS by design: `pb`/`pb_mt` come from one sweep and the threaded references from
+    # another (they cannot share a launch — BLIS fixes its thread count at init, so the reference run
+    # must be started with BLIS_NUM_THREADS set, which would also change what `pb` sees).
+    #
+    # Without this, `arms=openblas_mt,aocl_mt` as a full run would REPLACE the mt cache and delete the
+    # pb/pb_mt arms already in it — the exact 2026-08-06 shape the refusal below was written for, just
+    # aimed at the other cache. The comment there said "the mt cache has none by design"; that was true
+    # when only pb/pb_mt existed and is not true any more.
+    subset = !isnothing(_SELOP) || !isnothing(_SELGRP) || (_ANY_MT && isfile(CACHE))
     # A scoped run (op=/group=) against a SLUG that has never been cached at all is not a merge — there is
     # nothing to merge into and nothing previously-measured to lose. Fall through to the full-run branch
     # below, which just writes `measured` as-is; `_want` already restricted it to the requested op/group,
@@ -2616,7 +2778,10 @@ else
         # `bench` measures no reference and would sail past this check straight into the 2026-08-06
         # failure it was written for. Condition on what was ACTUALLY measured, never on how it was
         # asked for.
-        if !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
+        # `_ANY_MT` is exempt, and ONLY reaches here when the mt cache does NOT yet exist — once it
+        # does, the merge branch above takes the run instead, so nothing can be destroyed. A first mt
+        # sweep writing a fresh file has nothing to lose, which is the case this exemption covers.
+        if !_ANY_MT && !issubset(_REF_ALL, _ACTIVE_ARMS) && !("force-arms" in ARGS)
             error(
                 """
                 REFUSING to overwrite $CACHE with a partial arm set.
@@ -2624,7 +2789,13 @@ else
                 A full `bench` REPLACES the cache; only op=/group= merges per arm. Either
                   • add op=<op> or group=<LVL>  (merges, keeps the reference arms), or
                   • drop `arms=` to measure every arm (~3x longer), or
-                  • pass `force-arms` if a pb-only cache really is intended."""
+                  • pass `force-arms` if a pb-only cache really is intended.
+
+                MEASURING THE $_ARM_PB_MT ARM: use group=<LVL> runs, one per group. `$_ARM_PB_MT` is
+                additive — the per-arm merge writes it alongside the cached openblas/aocl records — but
+                a FULL run cannot express that, because a full run replaces rather than merges. Do NOT
+                reach for `force-arms` here: that is exactly the path that destroyed 2h45m of Zen5
+                reference arms on 2026-08-06."""
             )
         end
         g = measured
@@ -2679,6 +2850,36 @@ adir = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : 
 tdir = isnothing(_OUTDIR) ? (@__DIR__) : _OUTDIR
 # Draw the whole FLEET (every host cache on disk) as cross-µarch panel grids: 8 SVGs, NO per-host suffix
 # (a 3-line panel IS the per-host view). One SVG per group. `nodraw` skips this (fleet boxes measure only).
+# ── DRAW THE MULTI-THREADED SWEEP AND STOP ──────────────────────────────────────────────────────────
+# `mtdraw` is a RENDER-ONLY mode over the `mt_data_*` caches: it measures nothing, touches no gate
+# artifact, and writes its own `perf_mt_*.svg` set. It exits before the gate rendering below, so an mt
+# render can never overwrite a gate SVG even by accident — which matters because the gate artifacts are
+# byte-compared against a fresh rebuild by `check_artifacts_current.sh`.
+#
+#   julia --project=bench bench/plots.jl mtdraw
+if "mtdraw" in ARGS
+    mtfleet = load_fleet("mt_data_")
+    if isempty(mtfleet)
+        println("no mt_data_* caches on disk — run: … bench/plots.jl bench arms=pb,pb_mt nodraw")
+    else
+        adir0 = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR
+        mkpath(adir0)
+        for (gk, base, ttl) in (
+                ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+                ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
+                ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
+                ("CLP", "clapack", "Complex LAPACK"),
+            )
+            p = joinpath(adir0, "perf_mt_$(base).svg")
+            svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread (SCALING, not the gate)",
+                mtfleet, gk, _ARM_PB_MT)
+            println("  ", relpath(p))
+        end
+        println("mt panels written — these are SCALING curves; the gate is single-threaded.")
+    end
+    exit(0)
+end
+
 fleet = _NODRAW ? [] : load_fleet()
 if isempty(fleet)
     println("no fleet caches on disk to plot")

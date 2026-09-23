@@ -19,7 +19,7 @@
     zen5 = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32)   # Zen5 DESKTOP/SERVER (Granite Ridge,
     #                                                                 Turin): FP512, genuinely native
     # Zen5 MOBILE (Strix/Krackan) — reads FP256, so it must land with zen4 on every datapath-keyed knob.
-    # This is neuromancer (Ryzen AI 5 340, family 0x1A model 0x60); the old family lookup called it native.
+    # This is Zen5 (Ryzen AI 5 340, family 0x1A model 0x60); the old family lookup called it native.
     zen5m = hw(64, 48 * 1024, 1024^2, 16 * 1024^2, :AMD, 0x1A, 32; fpw = 32)
     tigerlake = hw(64, 48 * 1024, 1280 * 1024, 12 * 1024^2, :Intel, 0x06, 32)  # never benchmarked — prediction
     #                                                        (no Fn8000_001A on Intel ⇒ fpw = simd)
@@ -75,15 +75,10 @@
     # tigerlake is AVX-512, so it takes the UNIFIED branch and the split must not move it: the 2W arm is
     # reachable only on multi-pack. This is the out-of-fleet guard that the split changed nothing but AVX2.
     @test P._at_syrk_pack_cut(tigerlake) == P._at_rank_k_pack_cut(tigerlake) == 8
-    @test P._at_symm_mat_max(zen3) == 256            # √(512K/8) ; measured mat≈pack tie exactly here
-    @test P._at_symm_mat_max(zen4) == 362       # √(1M/8) — predicted (down from the 448 placeholder)
-    @test P._at_symm_mat_max(zen5) == 362
-    @test P._at_symm_mat_max(tigerlake) == 404        # isqrt(1280K/8) — out-of-fleet auto-size, no crash
     # live wired consts equal the formula applied to the detected _HW
     @test P._GEMM_UNPACK_MAX == P._at_gemm_unpack_max(P._HW)
     @test P._SYRK_PACK_CUT == P._at_syrk_pack_cut(P._HW)
     @test P._SYR2K_PACK_CUT == P._at_rank_k_pack_cut(P._HW)
-    @test P._SYMM_PACK_CUT == P._at_symm_mat_max(P._HW)
 
     # ── Out-of-fleet auto-sizing (no crash, sane values) — the whole point of the mandate ─────────────
     @test P._at_cpotf2_mr(tigerlake) == 1    # Intel native-512
@@ -150,7 +145,7 @@
     #  (1) the datapath correction would have flipped Zen5-MOBILE (FP256 ⇒ double-pumped) from 0 to 1,
     #      and mode 1 is recorded as costing that box ~10% @1024 — a known regression, shipped by
     #      derivation;
-    #  (2) mode 1 was never actually reaching any box: wintermute pins `gemvt_perscan = false` and
+    #  (2) mode 1 was never actually reaching any box: Zen4 pins `gemvt_perscan = false` and
     #      juliac/build.jl:123 pins it false for the trim build.
     # Zen4's win (percol 1.113 @512, 1.25 @1024) is real but is now recovered by a PIN, not a predicate
     # — the same contract `gemv_mr` moved to. The `gemvt_perscan` preference already exists for that.
@@ -205,10 +200,10 @@
 # ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
 # These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
 # while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
-# "Zen5" box supplying the native-512 optimum is neuromancer, which reads FP256 from CPUID
+# "Zen5" box supplying the native-512 optimum is Zen5, which reads FP256 from CPUID
 # Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
 # "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
-# hand neuromancer the arm it measured as WORSE.
+# hand Zen5 the arm it measured as WORSE.
 @test P._datapath_bytes(zen3) == 32
 @test P._datapath_bytes(zen4) == 32
 @test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native

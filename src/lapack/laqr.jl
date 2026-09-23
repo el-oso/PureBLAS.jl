@@ -4,7 +4,7 @@
 # explicitly out of scope"; this is that follow-up.
 #
 # WHY IT IS THE WHOLE CELL NOW. After the blocked `gehrd!` (hessenberg.jl, commit 367aec2) the
-# eigenvalues-only `geev!` the gate benchmarks decomposes, measured on wintermute/Zen4, as:
+# eigenvalues-only `geev!` the gate benchmarks decomposes, measured on Zen4/Zen4, as:
 #   n=256   gebal 0.8%   gehrd 42.4%   hseqr 54.2%    total ref/pb 0.446
 #   n=512   gebal 0.6%   gehrd 16.9%   hseqr 83.0%    total ref/pb 0.379
 #   n=1024  gebal 0.3%   gehrd  5.8%   hseqr 91.1%    total ref/pb 0.181

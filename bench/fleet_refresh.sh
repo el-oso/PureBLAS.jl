@@ -61,6 +61,16 @@ esac
 # Both were repaired by a FULL-ARMS sweep, which is the documented exception to "never re-measure a
 # reference": the rule protects reference arms from pointless churn, not from a state mismatch that has
 # already invalidated them. Verify with `bench/check_arm_anchors.sh` after either mode.
+# THE MULTI-THREADED ARM. `pb_mt` needs julia started with threads and a CPU mask wide enough to hold
+# the runtime threads as well as the workers, so it comes in through JL_FLAGS + BENCH_CORE. The mask is
+# one CPU per physical core PLUS one spare, and CPU numbering differs per box — `bench/plots.jl`'s
+# `_ARM_PB_MT` comment carries the mask and the measurement behind the spare slot.
+#
+#   BENCH_CORE=0,2,4,6,8,10,1 JL_FLAGS="-t 6" SWEEP_ARMS="arms=pb,pb_mt" \
+#       SWEEP_GROUPS="L1 L2 L3 LP CL1 CL2 CL3 CLP" bench/fleet_refresh.sh
+#
+# The dual groups have no `pb_mt` arm — their reference is LinearAlgebra's generic fallback, which is
+# single-threaded — so they stay out of the group list.
 MODE="${1:-pb}"
 # SWEEP_ARMS overrides the arms string for this invocation. Its one intended use is the DUAL groups
 # (DL1/DL2/DL3/DLP), whose reference is not a vendor BLAS but LinearAlgebra's generic fallback, recorded
@@ -146,7 +156,8 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
         # how the silent partial refresh happened in the first place.
         # shellcheck disable=SC2086  # ARMSARG is deliberately unquoted: empty must expand to NO argument
         # shellcheck disable=SC2086  # SWEEP_EXTRA is deliberately unquoted: empty must expand to NO argument
-        out=$(taskset -c "$CORE" "$JL" --project=bench bench/plots.jl bench group=$g $ARMSARG ${SWEEP_EXTRA:-} nodraw 2>&1)
+        # shellcheck disable=SC2086  # JL_FLAGS is deliberately unquoted: empty must expand to NO argument
+        out=$(taskset -c "$CORE" "$JL" ${JL_FLAGS:-} --project=bench bench/plots.jl bench group=$g $ARMSARG ${SWEEP_EXTRA:-} nodraw 2>&1)
         st=$?
         printf '%s\n' "$out" | tail -4
         if [ $st -eq 0 ]; then ok=1; break; fi
@@ -161,7 +172,7 @@ echo "=== POST-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
 if [ -n "$FAILED" ]; then
     echo "=== REFRESH INCOMPLETE — these groups did NOT land:$FAILED"
     echo "    Their cells still carry the PREVIOUS commit. Re-run them before publishing:"
-    for g in $FAILED; do echo "      taskset -c $CORE $JL --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw"; done
+    for g in $FAILED; do echo "      taskset -c $CORE $JL ${JL_FLAGS:-} --project=bench bench/plots.jl bench group=$g $ARMSARG nodraw"; done
     echo "    Then confirm with: bench/cache_staleness.sh"
     exit 1
 fi

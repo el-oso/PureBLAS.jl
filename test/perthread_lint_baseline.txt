@@ -1,0 +1,50 @@
+# Reviewed `OncePerThread` owners. Each line is a claim that THIS buffer can never be live across a
+# threaded call — see test/perthread_lint.jl for why that is the only thing that makes per-thread
+# ownership safe, and what it cost when it was not true (getrf! 20/96 wrong, some NaN).
+#
+# Add a line here ONLY with one of the two arguments below, written out. If neither applies, the owner
+# must be `Base.OncePerTask` instead (~13 ns more per lookup, which is nothing on a call large enough
+# to have considered threading).
+#
+#   arena.jl  — `_ARENA` is the arena itself: a bump STACK whose scopes nest. `_gemm_threaded!` pins the
+#               driver task to its thread for the join (the only yield inside a scope), so its live
+#               borrows stay on the thread that holds them; any other task scheduled onto that thread
+#               opens a NESTED scope above the driver's offset and cannot itself be suspended (the pool
+#               is one claim, held by the driver). Full argument: src/arena.jl threading note (a)-(c).
+#               The earlier `iszero(_arena().depth)` admission guard is gone; it serialised 16 routines.
+#
+#   workspace.jl — the L3 pack pools are claimed INSIDE `_gemm_core!`, i.e. inside a chunk body, and a
+#               chunk never yields (`test/yield_lint.jl` is the guard). They are per-chunk in practice,
+#               so no migration can occur while one is held. This is the ONE case where the original
+#               "a worker runs as a nested interval" argument actually holds.
+#
+#   blas2/level2.jl — the trsv reciprocal caches. trsv is Level-2 and never calls `gemm!`, so nothing on
+#               that path can thread or yield.
+#
+#   blas3/level3.jl `_TRMM_BPF*` — the packed-trmm B buffer. VERIFIED: `_trmm_packed!` and
+#               `_trmm_packedR!` contain ZERO public `gemm!` calls, so the buffer cannot be held across
+#               a threaded join. This is the hot one — a per-task lookup here would be measurable — and
+#               it is the one that needed no change.
+#
+#   blas3/level3.jl `_SYMM_SCR*` — the SERIAL symm path only. When `_symm!` threads it materializes into
+#               the per-TASK twin `_symm_scr_mt` instead (see its definition). Kept per-thread because
+#               the IdDict/Ref lookup was measured at ~130 ns dominating tiny symm, and the serial path
+#               never yields, so it pays nothing and risks nothing.
+arena.jl:_ARENA
+blas2/level2.jl:_TRSV_RRCP64
+blas2/level2.jl:_TRSV_RRCP32
+blas2/level2.jl:_TRSV_RCP64
+blas2/level2.jl:_TRSV_RCP32
+blas3/level3.jl:_TRMM_BPF
+blas3/level3.jl:_TRMM_BPF_F64
+blas3/level3.jl:_TRMM_BPF_F32
+blas3/level3.jl:_SYMM_SCR
+blas3/level3.jl:_SYMM_SCR_F64
+blas3/level3.jl:_SYMM_SCR_F32
+blas3/level3.jl:_SYMM_SCR_C64
+blas3/level3.jl:_SYMM_SCR_C32
+workspace.jl:_L3WS_F64
+workspace.jl:_L3WS_F32
+workspace.jl:_L3WS_C64
+workspace.jl:_L3WS_C32
+workspace.jl:_L3WS_OTHER

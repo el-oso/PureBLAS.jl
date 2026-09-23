@@ -201,6 +201,73 @@ Both modes share ONE set of low-level kernels. Source map:
    claiming any allocation is justified.** A non-zero result on a `!` entry is a DEFECT TO FIX, never
    an exemption to document.
 
+11. **BITWISE REPRODUCIBLE ACROSS THREAD COUNTS. (HARD RULE, with a test gate.)** One build, one
+   machine, one input: `PureBLAS.set_num_threads(n)` must not change a single bit of the result, for
+   any `n`. Scope is thread count only — NOT across microarchitectures, NOT across versions. It is
+   always on; there is no opt-in mode, because a mode is a promise nobody can rely on by default.
+
+   **The rule that makes it hold: the reduction TREE must be thread-count independent, not merely the
+   schedule static.** Partition `m` and `n` freely; never let worker count reach `k`. The classical
+   column split already satisfies this — it splits `n` only, and `kc = min(_KC, k)` is a function of
+   the problem — so every element of C accumulates its whole `k` chain on one worker in one order.
+   Two things break it and both have bitten:
+   - **A size-keyed predicate read from a chunk's own slice.** `_use_unpacked` is keyed on
+     `max(m, n, k)`, and the unpacked and blocked routes differ in α placement, β handling and `kc`
+     chunking, so a narrow chunk silently computes by different arithmetic. Hence `_gemm_core!`'s
+     `nroute`: a partitioned caller passes the WHOLE problem's column count and computes on its slice.
+     Any new size-keyed branch reachable from a chunk body must take its size from `nroute`.
+   - **An algorithm a worker cannot run.** Strassen chooses its depth from the width it is handed, so
+     a worker holding a slice runs a different algorithm entirely. It is therefore never column-split:
+     `gemm!`, `_symm!` and `_trmm_split_L!` ask `_strassen_owns` and run the recursion serially when it
+     answers yes. `_gemm_core!`'s `strassen` defaults to `false` so the chunk body and the lost-claim
+     fallback — the two paths a worker count can reach — cannot take the route by omission.
+
+   **Every path a worker count can reach must agree, including the ones that are not the happy one.**
+   A caller that loses the pool claim runs the serial fallback; if that fallback takes a different
+   route than the winner's workers, the same call returns different bits depending on a race with an
+   unrelated thread. That shipped once (`6940a2d3`).
+
+   **Forward constraint:** if `dot`/`nrm2` are ever threaded they break this by construction unless
+   their reduction tree is fixed independently of worker count. The standing decision not to thread
+   them is load-bearing.
+
+   **The gate** is `test/gemm_tests.jl` "gemm/symm: bit-identical at every thread count" and its
+   syrk/syr2k sibling. Both compare `reinterpret(UInt64, …)` patterns, never a tolerance — a 1e-13
+   divergence is a divergence. Both assert a **witness** first, because a shape Strassen claims runs
+   serially at any thread count and would pass without a worker ever starting; and both include an
+   α that is not a power of two, because scaling by `±2^j` is exact and hides an α-placement
+   difference. CI sets `JULIA_NUM_THREADS`, without which these items skip and report green.
+
+12. **A SWEEP IS SCOPED TO THE GROUPS THE CHANGE CAN REACH — PROVE THE SCOPE BEFORE LAUNCHING.
+    (HARD RULE.)** A fleet sweep costs hours of box time on three machines and cannot be interrupted
+    without discarding it, so the scope is a decision that has to be made and defended BEFORE the
+    launch, never rationalised after. State, in the launch message: which groups the change can
+    reach, by what mechanism, and why the rest cannot move. A group survives that argument only if a
+    source file the change touched is on its call path.
+
+    **The cheap proof already exists in the cache.** Every arm record carries its raw samples, so a
+    damaged regime is visible as a sample SPREAD the comparison arm does not have. Query the cache
+    before deciding, not after:
+
+        awk -F'\t' 'NR>1{g=$1; for(i=4;i<=NF;i++){split($i,a,"|");
+          m=split(a[8],s,","); if(m<3) continue; lo=hi=s[1];
+          for(j=1;j<=m;j++){if(s[j]+0<lo+0)lo=s[j]; if(s[j]+0>hi+0)hi=s[j]}
+          k=g"|"a[1]; if(hi/lo>mx[k])mx[k]=hi/lo}}
+          END{for(k in mx) printf "%-12s worst spread %6.2fx\n", k, mx[k]}' bench/mt_data_*.txt | sort
+
+    **Measured, and it is why this rule exists.** 2026-09-21: the `pb_mt` mask starved the gemm
+    pool's join, and all eight groups were re-swept to repair it. The query above, run afterwards,
+    showed the damage confined to **L3 and LP** — worst threaded spread 7.43x and 4.87x against
+    serial arms at 1.59x and 2.25x — while the other six groups' threaded and serial arms agreed to
+    within 0.05x. They agreed because they do not thread: threading exists only in `gemm`, `symm`,
+    `syrk`, `syr2k` and the LAPACK routines that call them. 329 of 937 cells, about 50 minutes per
+    box on three boxes, bought nothing.
+
+    **The one standing exception is anchor coherence**, and it must be argued, not assumed: refreshing
+    part of a cache leaves the rest at an older machine state, and a partial refresh has twice left
+    most of a cache anchor-mismatched. When that is the reason for a wider scope, say so at launch
+    and name the cells it protects — it does not license a full sweep by default.
+
 ## ABI conventions (Mode 1)
 
 - Symbols are the **ILP64** reference-BLAS names Julia resolves: trailing `64_` (e.g. `daxpy_64_`).

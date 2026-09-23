@@ -138,6 +138,8 @@ flowchart TD
 
 For a thrown error, the `@scope` above it gives the memory back. That works because each block sets the position back to an exact recorded value. This is why a `@leafscope` needs a `@scope` above it.
 
+**Since threading, a missing `@scope` above a `@leafscope` costs more than leaked bytes.** A thrown error leaves `depth` above zero, and a threaded `gemm!` refuses to run while `depth` is above zero (see [Threads](#Threads) below). So that thread would stop threading for the rest of the program. `_trmm_small!` was the one leaf whose only scope was its own; it now uses `@scope`, which it can afford because every one of its five callers reaches it only at `k <= _TRMM_BASE`.
+
 ## Fast-path checks on borrowed operands
 
 **To check whether an operand can take a fast path, use `_strided1(A)` for a matrix and `_dense1(x)` for a vector** (`src/ptrmat.jl`).
@@ -154,7 +156,39 @@ For a thrown error, the `@scope` above it gives the memory back. That works beca
 
 ## Threads
 
-There is one arena for the whole process.
+There is one arena per THREAD (`_ARENA` is a `Base.OncePerThread`), and that is safe only because of
+the three facts in the next paragraph.
 
-- Before threads are enabled, each task must get its own arena.
-- That change is one line: `_arena() = _ARENA_TASK()` over a `Base.OncePerTask`.
+**The threaded driver is pinned to its thread for the join.** The join in `_gemm_threaded!` yields,
+and a yielded task usually resumes on a DIFFERENT thread — measured on Zen 4, 7491 of 9600 yields
+moved. A routine that entered holding thread `t1`'s borrow would then finish on `t3` while `t1`'s arena
+was free for any other task to claim the same bytes. So the driver sets `Task.sticky` for the join and
+restores it after; Base requeues a sticky task on its own thread. That join is the only task-switch
+point inside a scope (`test/yield_lint.jl`), and the pool is one claim, so at most one task in the
+process is ever suspended mid-scope. Any other task scheduled onto the pinned thread during the yield
+opens a scope ABOVE the driver's live offset, cannot itself be suspended (its own `gemm!` loses the
+claim and runs serial), and rewinds to exactly the driver's state before the driver resumes — the bump
+stack stays LIFO. The full argument is the threading note in `src/arena.jl`.
+
+An earlier version refused to thread while any scope was live (`iszero(_arena().depth)`). That was
+sound, and it silently serialised every routine whose `gemm!` sits inside its own `@scope` — `gels!`,
+`getri!`, `trtri!`, `potri!`, `lauum`, `gehrd`, `pbtrf`, `gbtrf` and eight more. Pinning replaced it.
+
+### Workspaces that are NOT the arena
+
+The pools that are not scopes — `_LU_PAD`, `_QR_WS`, the SVD / eigen / tridiagonal pools, the symm
+materialize twin — are keyed on the TASK (`Base.OncePerTask`), not the thread, for the same migration
+reason. Before that change, concurrent callers measured `getrf!` 20 of 96 results wrong (some `NaN`),
+`geqrf!` 17 of 96 and `symm!` 5 of 96, against 0 of 96 serial.
+
+**The cost is a one-off per task, not a tax per call.** A brand-new task touches those pools cold and
+allocates its own copies; under thread ownership it inherited whatever its thread already held. The
+second call in the same task allocates nothing. Same shape as the arena's own growth note above, and
+measured the same way — see `bench/probes/m4_trsm_and_task_cost.jl`. So a program that spawns many
+short-lived tasks each doing one large factorization pays this repeatedly; one that reuses a task pool
+pays it once per worker.
+
+Lookup cost is ~14.7 ns per task-keyed fetch against ~1.51 ns per thread-keyed one. That is why the
+hot small-op owners (`_TRMM_BPF`, the trsv reciprocal caches, the serial `_SYMM_SCR`) stayed
+thread-keyed: they are provably never live across a threaded call, and `test/perthread_lint.jl` holds
+each of those claims in a reviewed baseline.

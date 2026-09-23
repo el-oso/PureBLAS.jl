@@ -191,7 +191,16 @@ function _trmm_small!(side_left::Bool, up::Bool, tr::Bool, unit::Bool, A, B)
     # regression). The exact borrows below make `lde` a property of THIS call: _L3_NB side-L, mr side-R.
     # The block keeps its original indentation — re-indenting 140 lines of a gated kernel to add three
     # would bury the change (same convention as `_trsm_fused_L!`'s stripe loop below).
-    @leafscope arn begin      # inlines the trmm microkernel — see `_trsm_fused_L!`
+    # `@scope`, NOT `@leafscope`. This leaf's only scope is its own — none of its five callers
+    # (`trmm!` 1310/1312, `_trmm_left!` 753, `_trmm_right!` 938, `_trmm_right_recur!` 986) opens one —
+    # and arena.jl's rule for that case is explicit: a `@leafscope` with no `@scope` above it leaks
+    # `depth` on a throw, since it has no handler and `_arena_exit!` never runs. A stuck `depth` means
+    # `_arena_exit!`'s coalesce (gated on `depth == 0`) never runs again on that thread, so a slab chain
+    # left by a growing call would persist for the life of the process — a leak, not a wrong answer,
+    # since the threading admission no longer reads `depth` (the driver pins itself instead, gemm.jl).
+    # The handler is affordable HERE, unlike `_trsm_rl_fused_drv!` where it cost 59 spills: every caller
+    # reaches this only at `k <= _TRMM_BASE`. ⚠ AVX2 (Zen3) small-k trmm unconfirmed — measure before merge.
+    @scope arn begin          # inlines the trmm microkernel — see `_trsm_fused_L!`
         M = borrow!(arn, T, _L3_NB, _L3_NB)                  # `diag`'s FIXED shape: ldM = _L3_NB, no view
         _mat_tri!(M, A, k, up, tr, unit)
         if side_left                                         # B(k×n) := M·B, IN PLACE, dependency-ordered:
@@ -1250,14 +1259,27 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     h = k ÷ 2
     A11 = view(A, 1:h, 1:h); A22 = view(A, (h + 1):k, (h + 1):k)
     off = up ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)     # upper→A12, lower→A21
-    Bt = view(B, 1:h, :); Bb = view(B, (h + 1):k, :); ta = tr ? 'T' : 'N'
+    Bt = view(B, 1:h, :); Bb = view(B, (h + 1):k, :)
+    o = one(T)
+    # THE ONE CALLER THAT ASKS FOR STRASSEN, and it goes through `_gemm_core!` rather than `gemm!` to
+    # do it — `gemm!`'s default is off, because a Strassen route is not thread-count reproducible and
+    # the public entry has to be (see the note on `_gemm_core!`'s `strassen`).
+    #
+    # This call site cannot break that guarantee, because it is below the threading entry and so runs
+    # serially at every thread count. What it costs is threading this one update, which trmm never had
+    # a gate number for; the column split over B that Phase 3 wants sits ABOVE this and is reproducible.
+    #
+    # It is kept because it is measured, not inherited. Zen4, recursion forced off with the split left
+    # armed: n=4096 is 10.7% slower and n=2048 2.2%, which takes trmm@4096 from 1.052 to 0.950 — a
+    # passing cell to a failing one. The gate's own gemm cells are flat under the same switch, because
+    # they allocate cold operands per sample; trmm's B is warm from the solve that just wrote it.
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        gemm!(Bt, off, Bb; transA = ta, alpha = true, beta = true)   # Bt += op(off)·Bb  (Strassen)
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true)   # Bt += op(off)·Bb
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        gemm!(Bb, off, Bt; transA = ta, alpha = true, beta = true)   # Bb += op(off)·Bt  (Strassen)
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true)   # Bb += op(off)·Bt
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -1360,10 +1382,10 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
-@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool) =                                    # C -= op(A)·B
-    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false)
-@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool) =                                # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj)
+@inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
+    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
+@inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, nroute)
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1464,8 +1486,13 @@ end
 # The copy-back is spelled as an explicit loop rather than `copyto!` because `PtrMatrix` is
 # `IndexCartesian`; this is the same column-loop shape the rest of this file uses for a scratch → B pass.
 # side L base: B := op(A)⁻¹·B = op(inv(A))·B (gemm with transA=op into temp, copy back).
-function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` reaches here for the same reason it reaches `_gemm_unpacked!`: this leaf's product is the
+# band's, and the kernel that product takes is chosen from `max(m, n, k)`. At a leaf `nb` is at most
+# `_trsm_base` (32 by default), so a 64-wide band lands on `_gemm_split_max()` and takes the split
+# kernel while the unsplit solve does not.
+function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); n = size(B, 2); T = eltype(B)
+    nrt = nroute < 0 ? n : nroute
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape — ld stays _L3_NB, as before
         iv = view(ivM, 1:nb, 1:nb); _trtri!(iv, A, nb, up, unit)
@@ -1474,9 +1501,11 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
         # B-pack, no scaleC zero-pass, Val{B0}=overwrite) beats the packed gemm here (measured 0.72× its time
         # at nb=32,n=256; the k=nb pack traffic ≈ the compute). tr='T' needs iv transposed → keep packed gemm.
         if tr
-            gemm!(tmp, iv, B; alpha = true, beta = false, transA = 'T')
+            # `_gemm_core!`, not `gemm!`: the public entry routes from its own operands and has no
+            # place to take the route token, which a column band must carry.
+            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, nrt)
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -1486,7 +1515,9 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B)
 end
 # side R base: B := B·op(A)⁻¹ = B·op(inv(A)). tmp := B·op(iv) via the unpacked path (transB=op is a free
 # Val{TB}; skewed shape m wide, n=k=nb tiny → same unpacked win as invL).
-function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
+# `nroute` is the WHOLE problem's row count. `_gemm_unpacked!` keys its kernel on `max(m, n, k)`
+# and takes the larger of the local `m` and this, so a row band routes as the unsplit solve does.
+function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1)
     nb = size(A, 1); m = size(B, 1); T = eltype(B)
     @scope arn begin
         ivM = borrow!(arn, T, _L3_NB, _L3_NB)   # `diag`'s FIXED shape
@@ -1495,9 +1526,9 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B)
         # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
         # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
         if tr
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp)
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -1935,6 +1966,7 @@ const _ZGT_ON = (_ZGT_W == 8 || _ZGT_W == 4)
 # fine); A's panel is, and NR=4 doubles the number of A re-reads on AVX2. `min` with the stripe bound
 # keeps a hypothetical huge-L2 box from blowing L1. The real path learned the same lesson the same way
 # (_TRSM_FUSED_BASE keeps a literal 128 on non-AVX-512 because a bigger base REGRESSES n=256).
+# PDM: Derived — formula over detected consts: L2 residency of A's KC×KC panel, `isqrt(_L2_BYTES ÷ sizeof(ComplexF64))`, min'd with the L1 stripe bound; fleet-validated on Zen4+Zen3
 const _ZGT_BASE = @load_preference(
     "ztrsm_gt_base",
     min(
@@ -2289,6 +2321,7 @@ end
 # Measured: the un-rounded 5 left a 4-column tail per call and regressed ztrsmR@512 0.979→0.965 (spread
 # 0.001, so 14× the noise) while helping the sizes whose base call happened to divide evenly.
 # (the register count is spelled out rather than reusing `_GT_NREG`, which this file defines further down)
+# PDM: Derived — formula over detected consts: `prevpow(2, √(KC/2))` from the load-vs-fma balance at the base size, clamped by the register file `(nreg - 4) ÷ 2`
 const _ZRT_NC = @load_preference(
     "ztrsm_zrt_nc",
     clamp(prevpow(2, max(2, isqrt(_fh_ctrsm_rec_l() ÷ 2))), 2, ((_SIMD_BYTES >= 64 ? 32 : 16) - 4) ÷ 2)
@@ -2512,6 +2545,7 @@ const _GT_TRANSPOSE = (_GT_W == 8)
 # warm-micro MIS-TUNE — full-L1 nets +1.5–5.8pt on Zen4 (n=32 0.918→0.976, n≥512 +1.5–3.6pt), Zen5 INSENSITIVE
 # (safe). Non-AVX-512: keep the 128 literal — Zen3/AVX2 optimum (measured; a bigger base REGRESSES it, n=256
 # 0.996→0.85). req#8 Preferences-override "trsm_fused_base" still applies for calibration.
+# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; the non-AVX-512 arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
 const _TRSM_FUSED_BASE = @load_preference(
     "trsm_fused_base",
     _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
@@ -2991,7 +3025,7 @@ end
 # KC-ng..KC-1 and the ragged tail takes 0..KC-1-ng.
 #
 # WHY IT EXISTS: routing `rev` to the scalar pack first (the cheap first cut) measured a 7-63% residual
-# against the no-trans leaf on galen — pack+unpack is 2·KC·n elements against KC²·n of solve, i.e. ~2/KC
+# against the no-trans leaf on Zen3 — pack+unpack is 2·KC·n elements against KC²·n of solve, i.e. ~2/KC
 # of the work, so a scalar pack an order slower than this one lands right on that residual. The "~1%"
 # estimate that justified the scalar cut assumed the per-element cost stayed comparable; it does not.
 @inline function _fused_packP_tr4!(
@@ -3652,9 +3686,9 @@ function _trsm_fused_L!(unit::Bool, A, B, rev::Bool = false)
             # `!rev` on the 8-wide pack but NOT the 4-wide one below, because that is where they MEASURED
             # differently — potrfU native arm, µs, after the reversed packs landed:
             #     n            512     768    1000
-            #     galen  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
+            #     Zen3  W=4  lever 1084.9  3377.5  7700.6   native 1021.2  3187.4  6975.9   (+6.2/+6.0/+10.4%)
             #     neuro  W=8  lever 1709.7  5536.7 11996.1   native 2126.0  6759.3 14666.8   (−24/−22/−22%)
-            # and neuromancer's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
+            # and Zen5's native at n=1000 was 12059.8 with the SCALAR pack before this, so the 8-wide
             # reversal made it worse, not better. Hypothesis (not verified): reversing 8 f64 lanes is a full
             # cross-lane vpermpd per vector — 16 per block across pack+unpack, on top of `_tr8x8`'s own
             # shuffles — where the 4-lane reversal is cheap. AVX-512 therefore keeps the scalar pack for rev,
@@ -4121,18 +4155,26 @@ const _TRSM_FULLPACK_MAX = isqrt(_L3_BYTES ÷ sizeof(Float64))
 # P from L2, erasing the recursion's small-leaf L1 locality edge, so its lower overhead takes over): k ≥
 # 2·L1/(NR·sizeof). Measured Zen4 crossover is 256<k≤384; the formula gives ≈342. EMPIRICAL crossover —
 # req#8 debt (derive+fleet-validate), Preferences-overridable. Measured net: 512 0.889→0.90, 1024 0.94→0.97.
+# PDM: Derived — formula over detected consts: `cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64))`, the k at which the P-stripe outgrows 2·L1 (Zen4 measured 256<k≤384, formula 342; fleet validation still owed)
 const _TRSM_FULLPACK_MIN = @load_preference(
     "trsm_fullpack_min",
     cld(2 * _L1_BYTES, _GT_NR * sizeof(Float64))
 )::Int
 
 # side 'L': B := op(A)⁻¹·B, A k×k (k=size(B,1)), unscaled.
-function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+#
+# `nroute` IS THE WHOLE PROBLEM'S COLUMN COUNT, not this call's. A threaded caller hands each worker a
+# column band of B, and every predicate below that keys on `size(B, 2)` selects an ALGORITHM — a
+# different base, a different recursion floor — so a worker reading its own narrower width would take a
+# route the serial solve does not and return different bits. Routing from `nroute` keeps the route a
+# function of the problem instead of the worker count. `-1` means "not split": read the width from B.
+function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
     k = size(A, 1)
+    nrt = nroute < 0 ? size(B, 2) : nroute
     if eltype(B) <: BlasReal && !cj
         # narrow B → dense base (few axpy calls); wide B → invL base (gemm-efficient). n is invariant under
         # the side-L row split, so the choice is consistent through the recursion.
-        if size(B, 2) <= _trsm_ncut()
+        if nrt <= _trsm_ncut()
             # Narrow B. Prefer the fused gemmtrsm leaf for eligible mid-k (_TRSM_FUSED_MIN ≤ k ≤ _TRSM_FUSED_BASE):
             # it beats BOTH the scalar dense base (k≤32) AND the ½-split recursion that k>32 would otherwise fall
             # to — the `n≤_TRSM_NCUT` guard was intercepting square k=48/64 into that recursion, whose leaves are
@@ -4159,7 +4201,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
             # AVX-512 was already unrestricted via _GT_TRANSPOSE, so this only changes AVX2).
             return _trsm_fused_L!(unit, A, B, tr)
         elseif k <= _trsm_base()
-            return _trsm_base_invL!(up, tr, unit, A, B)
+            return _trsm_base_invL!(up, tr, unit, A, B, nrt)
         end
     elseif eltype(B) <: BlasComplex                       # complex base (else fall through → gemm-blocked split)
         # nrhs is invariant under the row-split → decide the base once. Wide B: trtri-on-inverse base (its
@@ -4176,7 +4218,7 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         if !up && !tr && k <= _ZGT_BASE && _cgt_ok(A, B)
             return _trsm_cgt_L!(Val(true), unit, k, A, B)
         end
-        recbase = size(B, 2) <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
+        recbase = nrt <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE
         if k <= recbase
             return _strided1(B) ? _trsm_cmplx_small_L!(up, tr, cj, unit, k, A, B) :
                 _trsm_cmplx_base_L!(up, tr, cj, unit, k, A, B)
@@ -4192,14 +4234,14 @@ function _trsm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, 1:h, :); B2 = view(B, (h + 1):k, :)
     if up != tr                                       # solve B2, then B1 -= off·B2, then solve B1
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trsm_left!(up, tr, cj, unit, A22, B2)
-        _gemm_sub!(B1, off, B2, tr, cj)
-        _trsm_left!(up, tr, cj, unit, A11, B1)
+        _trsm_left!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_sub!(B1, off, B2, tr, cj, nroute)
+        _trsm_left!(up, tr, cj, unit, A11, B1, nroute)
     else                                              # solve B1, then B2 -= off·B1, then solve B2
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trsm_left!(up, tr, cj, unit, A11, B1)
-        _gemm_sub!(B2, off, B1, tr, cj)
-        _trsm_left!(up, tr, cj, unit, A22, B2)
+        _trsm_left!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_sub!(B2, off, B1, tr, cj, nroute)
+        _trsm_left!(up, tr, cj, unit, A22, B2, nroute)
     end
     return B
 end
@@ -4467,7 +4509,17 @@ function _trsm_rl_fused_drv!(Ar, B, k::Int, revB::Bool, scratch::Bool)
 end
 
 # side 'R': B := B·op(A)⁻¹, A k×k (k=size(B,2)), unscaled.
-function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+# `nroute` IS THE WHOLE PROBLEM'S ROW COUNT — the side-R mirror of `_trsm_left!`'s column count.
+# A threaded caller hands each worker a ROW band of B, and the predicates below select an algorithm,
+# so a worker reading its own shorter height would take a route the unsplit solve does not.
+#
+# Unlike side L, no shape has yet been found where this changes the ANSWER: a row split was measured
+# bit-identical to the whole across k in {32,64,128,512,1024} x m in {128,256,1024,2048} with the
+# token both supplied and withheld. It is kept because the predicates select algorithms rather than
+# block sizes, which is the property that made the side-L equivalent a real defect; a future base or
+# crossover moves the boundary without touching this file.
+function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
+    mrt = nroute < 0 ? size(B, 1) : nroute
     k = size(A, 1)
     # Lower real-f64 fused base: the fused 12-acc substitution (the potrf panel kernel
     # `_trsm_rl_split_f64!`, MC row-chunked — verified relerr ~1e-15 across 56 variants) — no trtri, no
@@ -4492,8 +4544,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
     # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
     if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
-            (tr || k * k * sizeof(Float64) <= _L1_BYTES || size(B, 1) > _trsm_ncut_r()) &&
-            (size(B, 1) > _trsm_ncut_r() || (k > _trsm_dbase() && size(B, 1) >= _trsm_r_mfloor(k)))
+            (tr || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
+            (mrt > _trsm_ncut_r() || (k > _trsm_dbase() && mrt >= _trsm_r_mfloor(k)))
         # (No `Ar = A` seed here any more: it was dead once every arm gained its own `return`, and while
         # dead it still gave the `Ar` slot a second type, which is the whole cause of the boxing below.)
         # _EXP10 — A-SIDE de-aliasing. At transA='T' the `!tr` branch below does NOT fire, so A is handed
@@ -4595,10 +4647,10 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant
         # under the side-R column split. (Same dense/gemm split as side L, routed by _TRSM_NCUT_R.)
-        if size(B, 1) <= _trsm_ncut_r()
+        if mrt <= _trsm_ncut_r()
             k <= _trsm_dbase() && return _trsm_dense_R!(up, tr, unit, A, B)
         elseif k <= _trsm_base()
-            return _trsm_base_invR!(up, tr, unit, A, B)
+            return _trsm_base_invR!(up, tr, unit, A, B, mrt)
         end
     elseif eltype(B) <: BlasComplex
         # Non-trans: k≤64 uses the trtri-free direct base (beats OB; fixes the universal small-n collapse),
@@ -4619,14 +4671,14 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, :, 1:h); B2 = view(B, :, (h + 1):k)
     if up != tr                                       # solve B1, then B2 -= B1·off, then solve B2
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
-        _gemm_subR!(B2, B1, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_subR!(B2, B1, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
     else                                              # solve B2, then B1 -= B2·off, then solve B1
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trsm_right!(up, tr, cj, unit, A22, B2)
-        _gemm_subR!(B1, B2, off, tr, cj)
-        _trsm_right!(up, tr, cj, unit, A11, B1)
+        _trsm_right!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_subR!(B1, B2, off, tr, cj, nroute)
+        _trsm_right!(up, tr, cj, unit, A11, B1, nroute)
     end
     return B
 end
@@ -4644,6 +4696,84 @@ function _trsm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::N
     isone(α) || _scal_all!(B, α)
     side_left ? _trsm_left!(up, tr, cj, unit, A, B) : _trsm_right!(up, tr, cj, unit, A, B)
     return B
+end
+
+# ── THREADED trsm, side 'L' ────────────────────────────────────────────────────────────────────────
+# EVERY COLUMN OF B IS AN INDEPENDENT SOLVE. `trsm!` already contains a per-column `trsv!` sweep for
+# narrow B, and that loop is the proof: splitting B's columns cannot change any column's arithmetic,
+# because no column reads another. A is read-only for every worker and the column bands of B are
+# write-disjoint, so unlike the gemm chunk this one needs no barrier and no shared buffer.
+#
+# What the split MUST NOT change is which route each band takes — hence `nroute`, threaded from here
+# through the whole recursion (see `_trsm_left!`).
+#
+# Workers, on the same amortisation floor as gemm because the fork-join price is the same price. The
+# flop count is the triangular solve's `k²·n`, not a product's `2·m·n·k`; using gemm's count would
+# admit calls at a fraction of the real work and pay a join the work cannot cover.
+@inline function _trsm_workers(k::Int, n::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * n
+    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+end
+
+# One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
+# where `C` and `B` are the same matrix: trsm solves in place, so the pool's output and RHS coincide.
+# `p.m` is B's row count, which for side 'L' is also A's dimension.
+# ── THREADED trsm, side 'R' ────────────────────────────────────────────────────────────────────────
+# The mirror of side L: `X·op(A) = B` makes every ROW of B an independent solve, so a row band is a
+# whole problem and the bands are write-disjoint. This is the shape `potrf` needs — its lower
+# factorization solves `A21·L11⁻ᵀ` with A21 tall and narrow, so the rows are the long dimension.
+#
+# Bands round to whole `_MR·W` blocks, the microkernel's ROW granularity, for the same reason the
+# column split rounds to `_NR`: a band that is not a whole number of blocks runs a ragged edge kernel,
+# which costs more than the imbalance it fixes.
+@inline function _trsm_rchunk(m::Int, nw::Int, i::Int, ::Type{T}) where {T}
+    mr = _MR * _vwidth(T)
+    blocks = cld(m, mr)
+    b0 = ((i - 1) * blocks) ÷ nw
+    b1 = (i * blocks) ÷ nw
+    i0 = b0 * mr
+    return i0, min(m, b1 * mr) - i0
+end
+
+@inline function _trsm_workers_r(k::Int, m::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * m
+    (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
+end
+
+@noinline function _trsmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _trsm_rchunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.n, p.n, p.lda)          # A is n×n for side R
+    Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    # `p.m`, not `len`: route from the whole problem's ROW count.
+    _trsm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.m)
+    return nothing
+end
+
+@inline function _trsm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.m, p.m, p.lda)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)
+    # `_trsm!`'s two steps are open-coded here rather than called, and that is NOT a style choice.
+    # Giving `_trsm!` a ninth parameter — with or without a default — pushes `_gemm_core!` past the
+    # optimiser's effort budget on the ForwardDiff path, reported as an `OptimizationFailureReport`
+    # and caught by `test/dual_tests.jl`'s `@test_typestable` dogfood. `_trsm_left!` takes the extra
+    # argument without that cost; `_trsm!` does not. Measured by bisection, one parameter at a time.
+    #
+    # α scales B elementwise, so applying it per band is exact. α = 0 cannot arrive here: the entry
+    # in `trsm!` declines to split it, because the whole call is then a fill.
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    # `p.n`, not `len`: route from the whole problem.
+    _trsm_left!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.n)
+    return nothing
 end
 
 # When A's leading dim is a pure power of 2 (≥512), packing its triangular sub-views thrashes one cache
@@ -4913,6 +5043,38 @@ function trsm!(
     # Whatever aliasing motivated it is evidently already handled inside `_trsm!`'s own blocking; the
     # pad was paying a second time for it. `_l3_apad`/`L3Workspace.apad` are now unused by trsm and
     # kept only so the buffer and its rationale survive in one place if a future shape needs them.
+    # THREADED SIDE-L: split B's columns. Placed here, below every staging branch above, because each
+    # of those either returns or rewrites the operands — a split above them would hand workers a B the
+    # serial path would not have solved. Below this point the operands are final.
+    # `BlasReal`, not `BlasFloat`: the pool exists only for the two real types, and the route
+    # predicates on the complex path read their own width rather than `nroute`, so a complex column
+    # split would not be reproducible even once a pool existed.
+    # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
+    # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
+    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
+        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        if nwr > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, transA == 'C', false, nwr,
+                _MT_KIND_TRSMR, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
+    if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
+        nw = _trsm_workers(k, size(B, 2))
+        if nw > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, transA == 'C', false, nw,
+                _MT_KIND_TRSM, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
     _trsm!(sl, uplo == 'U', transA != 'N', transA == 'C', diag == 'U', alpha, A, B)
     return B
 end
@@ -4949,11 +5111,12 @@ end
 # d0=c0-r0; upper keeps local row ≤ d0+j, lower keeps row ≥ d0+j (j = 0-based column). Accumulates into
 # C, so K-accumulation across the gemm pc-loop stays correct (no temp needed).
 @generated function _microkernel_tri!(
-        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
+        C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int, alpha::T,
         mre::Int, nre::Int, d0::Int, upper::Bool, ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
     ) where {T, MR, NR, B0}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    push!(body.args, :(av = $V(alpha)))
     push!(body.args, :(lanes = Vec{$W, Int}($(Expr(:tuple, (0:(W - 1))...)))))
     for mi in 1:MR, j in 1:NR
         push!(body.args, :($(Symbol(:c, mi, :_, j)) = zero($V)))
@@ -4980,7 +5143,7 @@ end
         push!(stores.args, :(colp = C + $(j - 1) * ldc * $sz)); push!(stores.args, :(thr = d0 + $(j - 1)))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j)
-            st = B0 ? :(vstore($cs, q, mk)) : :(vstore(vload($V, q, mk) + $cs, q, mk))
+            st = B0 ? :(vstore(av * $cs, q, mk)) : :(vstore(muladd(av, $cs, vload($V, q, mk)), q, mk))
             push!(
                 stores.args, :(
                     let base = $((mi - 1) * W), q = colp + $((mi - 1) * W * sz)
@@ -5200,7 +5363,7 @@ end
 # `Bool` — six leaves became twelve `b0 ? … : …` call sites and took that loop nest to depth 11.
 # `B0` is a type parameter here, so each case is written once and the choice costs nothing.
 @inline function _trgemm_tile!(
-        ::Val{MR}, ::Val{NR}, ::Val{B0}, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, α::T, Cblk::Ptr{T}, ldc::Int, Apanel::Ptr{T}, Bpanel::Ptr{T},
         kce::Int, mre::Int, nre::Int, full::Bool, off::Int, up::Bool
     ) where {T <: BlasReal, MR, NR, B0}
     # DERIVE W from T, never take it as an `::Int` argument. `_vwidth(T)` const-folds, so `MR * W`
@@ -5209,7 +5372,7 @@ end
     # emitted 6 `idiv` when W was an argument, 0 when derived.
     W = _vwidth(T)
     if full && mre == MR * W && nre == NR
-        _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(NR), Val(B0))
+        _microkernel!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(NR), Val(B0))
     elseif full && nre == NR && rem(mre, W) == 0
         # W-ALIGNED PARTIAL ROWS → CLIP, don't mask. `_microkernel_masked!` is fully vectorized but
         # masks only the STORES: it runs all MR row-vectors through the whole k-loop and retires
@@ -5242,16 +5405,16 @@ end
         # masked kernel. That is where the next attempt should go.
         vr = div(mre, W)
         if vr == 1
-            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(1), Val(NR), Val(B0))
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(1), Val(NR), Val(B0))
         elseif vr == 2
-            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, Val(MR), Val(2), Val(NR), Val(B0))
+            _microkernel_clip!(Cblk, ldc, Apanel, Bpanel, kce, α, Val(MR), Val(2), Val(NR), Val(B0))
         else
-            _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+            _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, Val(MR), Val(NR), Val(B0))
         end
     elseif full
-        _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, Val(MR), Val(NR), Val(B0))
+        _microkernel_masked!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, Val(MR), Val(NR), Val(B0))
     else
-        _microkernel_tri!(Cblk, ldc, Apanel, Bpanel, kce, mre, nre, off, up, Val(MR), Val(NR), Val(B0))
+        _microkernel_tri!(Cblk, ldc, Apanel, Bpanel, kce, α, mre, nre, off, up, Val(MR), Val(NR), Val(B0))
     end
     return nothing
 end
@@ -5262,7 +5425,7 @@ end
 # constant for the whole panel, so the caller resolves it once and passes it as a type parameter.
 # It used to be a runtime `Bool` re-tested at every micro-tile, inside the innermost of five loops.
 function _trgemm_tiles!(
-        ::Val{MR}, ::Val{NR}, ::Val{B0}, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
+        ::Val{MR}, ::Val{NR}, ::Val{B0}, α::T, up::Bool, App::Ptr{T}, Bpp::Ptr{T}, Cp0::Ptr{T},
         ldc::Int, sz::Int, ic::Int, jc::Int, mce::Int, nce::Int, kce::Int
     ) where {T <: BlasReal, MR, NR, B0}
     # See `_trgemm_tile!`: W is DERIVED, not passed, so `mr`/`nr` stay compile-time and the
@@ -5280,7 +5443,7 @@ function _trgemm_tiles!(
                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                 _trgemm_tile!(
-                    Val(MR), Val(NR), Val(B0), Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
+                    Val(MR), Val(NR), Val(B0), α, Cblk, ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel),
                     kce, mre, nre, full, c0 - r0, up
                 )
             end
@@ -5293,9 +5456,18 @@ end
 
 # General triangular-C gemm: C[uplo-triangle] += α·op(X)·op(Y) (X→A-operand, Y→B-operand), n×n result.
 # The reusable core behind syrk (Y=X) and syr2k (two passes). Real only; α folded into packed X.
+# `jlo`/`jhi` restrict the work to COLUMNS [jlo, jhi) of C, defaulting to the whole matrix so every
+# existing call is unchanged. This is the seam the threaded syrk splits on, and it is the whole of the
+# plumbing: column blocks of a triangular C are WRITE-DISJOINT, and the triangle is resolved inside
+# `_trgemm_tiles!` (from the absolute `ic`/`jc` it is handed), not by the column loop. So a worker that
+# runs this body over its own column range computes exactly the tiles it owns and touches no other
+# worker's output — nothing about the kernel, the packing or the β handling changes.
+#
+# `n` stays the FULL matrix order. It must: `mc`/`nc` are sized from it, and `_trgemm_tiles!` needs
+# absolute column indices to know where the diagonal is. Only the loop bounds move.
 function _trgemm_packed!(
         ::Val{MR}, ::Val{NR}, up::Bool, α::T, X, tXp::Bool, Y, tYp::Bool, C, k::Int,
-        ::Val{OV} = Val(false)
+        ::Val{OV} = Val(false), jlo::Int = 0, jhi::Int = size(C, 1)
     ) where {T <: BlasReal, MR, NR, OV}
     n = size(C, 1); W = _vwidth(T); mr = MR * W; nr = NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
@@ -5304,9 +5476,13 @@ function _trgemm_packed!(
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # CLAMP TO `jhi`, NOT `n`. With a column range this one token is the difference between a
+            # partition and a WRITE RACE: the last block of a worker's range would otherwise run a full
+            # `nc` wide and overwrite columns the next worker is computing. Unthreaded it is a no-op,
+            # because `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc)
                 b0 = OV && pc == 0             # overwrite C on the FIRST k-block (β=0 fast path), else add
@@ -5314,11 +5490,15 @@ function _trgemm_packed!(
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic)
-                    _pack_A!(Ap, X, ic, pc, mce, kce, tXp, α, mr)
+                    # PACK UNSCALED, APPLY α AT THE STORE, matching `_trgemm_packed_u!`. Folding α
+                    # into the pack computes Σ(α·a)·b where the store form computes Σ α·(a·b); the
+                    # two round differently for any α that is not ±2ʲ. Both kernels serve syrk and
+                    # which one runs depends on size, ISA and thread count, so they must agree.
+                    _pack_A!(Ap, X, ic, pc, mce, kce, tXp, one(T), mr)
                     # β-mode resolved ONCE per panel, not once per micro-tile. See `_trgemm_tiles!`.
                     b0 ?
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce) :
-                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce)
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(true), α, up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce) :
+                        _trgemm_tiles!(Val(MR), Val(NR), Val(false), α, up, App, Bpp, Cp0, ldc, sz, ic, jc, mce, nce, kce)
                     ic += mc
                 end
                 pc += kc
@@ -5605,8 +5785,16 @@ const _SYRK_UNIFIED_MAX = @load_preference("syrk_unified_max", _vwidth(Float64) 
 const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _tri_mr(::Type{T}) where {T} = _vwidth(T) == 4 ? _SYRK_MR : _MR
 # syrk = one triangular-C gemm (Y = X = A). syr2k = two (A·Bᴴ + B·Aᴴ); real ⇒ both use α.
+# WHICH SYRK KERNEL — the ONE place that decides, shared by the serial entry and the threaded chunk.
+# It was spelled out inline here and re-spelled in `_syrk_run_chunk`, and the two drifted: on AVX-512
+# `_unified_ok(Float64)` is true, so serial ran the unified kernel while every threaded worker ran the
+# multi-pack one — 3-12% slower, on the gate box, for nothing. Re-spelling a dispatch rule in a second
+# place is the bug; a predicate both callers ask is the fix.
+@inline _syrk_use_unified(::Type{T}, n::Int) where {T <: BlasReal} =
+    _unified_ok(T) || (_unified_layout_ok(T) && n <= _fh_syrk_unified_max())
+
 @inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T <: BlasReal} =
-    (_unified_ok(T) || (_unified_layout_ok(T) && size(C, 1) <= _fh_syrk_unified_max())) ?
+    _syrk_use_unified(T, size(C, 1)) ?
     _trgemm_packed_u!(up, α, A, tr, C, k) :
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
 
@@ -6072,7 +6260,13 @@ end
 # Unified single-pack syrk: pack A ONCE into W-row panels; the A-operand (vector load, panel ir) and
 # the B-operand (scalar broadcast, panel jr) both read that one buffer. 8×8 tile (MR=1) so both packs'
 # layouts coincide; α applied at the store (shared buffer ⇒ can't fold α into the pack).
-function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <: BlasReal}
+# `jlo`/`jhi`: the same column-range seam the other two triangular kernels have, defaulting to the
+# whole matrix. This one matters most on AVX-512, where `_unified_ok(Float64)` is TRUE and this is the
+# kernel the SERIAL syrk actually runs — the threaded path used to call `_trgemm_packed!` instead and
+# paid 3-12% for a kernel the serial entry would never have chosen.
+function _trgemm_packed_u!(
+        up::Bool, α::T, A, tAp::Bool, C, k::Int, jlo::Int = 0, jhi::Int = size(C, 1)
+    ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -6081,9 +6275,11 @@ function _trgemm_packed_u!(up::Bool, α::T, A, tAp::Bool, C, k::Int) where {T <:
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C packA begin
         Cp0 = pointer(C); PA = pointer(packA)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # Clamp to `jhi`, not `n` — otherwise a worker's last block runs a full `nc` wide and
+            # overwrites the next worker's columns. No-op unthreaded, where `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
@@ -6103,7 +6299,15 @@ end
 
 # Unified single-pack syr2k: pack A and B ONCE each (W-row panels); the two products read them in
 # swapped roles (A·Bᵀ: packA-rows·packB-cols; B·Aᵀ: packB-rows·packA-cols). 2 packs, not 4.
-function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::Int) where {T <: BlasReal}
+# `jlo`/`jhi` restrict this to COLUMNS [jlo, jhi) of C — the same seam `_trgemm_packed!` has, and the
+# one the threaded syr2k splits on. This is the FUSED two-product kernel: it holds both products in
+# registers and writes each C tile ONCE, so unlike the 2-pass route there is no second pass to keep on
+# the same worker — a column range is simply owned end to end. `n` stays the full order because the
+# `skip` test below needs absolute row/column indices to find the diagonal.
+function _trgemm_packed2_u!(
+        up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::Int,
+        jlo::Int = 0, jhi::Int = size(C, 1)
+    ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
@@ -6112,9 +6316,11 @@ function _trgemm_packed2_u!(up::Bool, α::T, A, tAp::Bool, Bm, tBp::Bool, C, k::
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C packA packB begin
         Cp0 = pointer(C); PA = pointer(packA); PB = pointer(packB)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        jc = jlo
+        while jc < jhi
+            # Clamp to `jhi`, not `n` — otherwise a worker's last block runs a full `nc` wide and
+            # overwrites the next worker's columns. No-op unthreaded, where `jhi == n`.
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
@@ -6464,9 +6670,36 @@ function syrk!(
         return C
     end
     _syrk_scaleC!(C, up, beta)
+    # ── M4 PHASE 4: SPLIT THE TRIANGLE ACROSS THE POOL ─────────────────────────────────────────────
+    # β is already applied by `_syrk_scaleC!` above, so every worker's chunk is a pure accumulate into
+    # its own write-disjoint column range — no β ordering between workers to get wrong.
+    #
+    # Restricted to the REAL PACKED path, which is the one `_trgemm_packed!`'s `jlo/jhi` seam was
+    # verified on (64 partitions exact, positive control detects an omitted chunk). Complex, the
+    # unpacked small-n route and the recursive fallback keep the serial driver: complex cannot reach a
+    # threaded kernel at all today, and the others are below the amortisation floor anyway.
+    #
+    # `_strided1` on BOTH operands because the pool carries POINTERS, and `eltype(A) === T` for the
+    # reason `gemm!` tests it — the chunk builds `PtrMatrix{T}` from `p.Ap`, so a mixed-type operand
+    # would be reinterpreted rather than converted.
+    T = eltype(C)
+    nw = (T === Float64 || T === Float32) && eltype(A) === T &&
+        _strided1(A) && _strided1(C) && size(C, 1) > _fh_syrk_pack_cut() && k > 0 ?
+        _syrk_workers(size(C, 1), k) : 1
+    if nw > 1
+        rA = _root(A); rC = _root(C)
+        GC.@preserve rA rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(A), convert(T, alpha), zero(T),
+            trans != 'N', trans == 'N', false, false, nw, _MT_KIND_SYRK, up, false
+        )
+        return C
+    end
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
     return C
 end
+# NOTE `herk!` (the Hermitian, complex sibling) is NOT threaded and still calls `_syrk_blocked!`
+# directly. That is a gap, not an oversight: complex cannot reach a threaded kernel at all today
+# (`gemm!`'s guard is `Float64 || Float32`), so there is nothing for it to route to.
 function herk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Real = true, beta::Real = false
@@ -6512,6 +6745,33 @@ const _SYMM_SCR_F64 = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> R
 const _SYMM_SCR_F32 = Base.OncePerThread{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
 const _SYMM_SCR_C64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
 const _SYMM_SCR_C32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+# PER-TASK TWINS, fetched ONLY when the call is about to thread. `_symm!` hands the materialized operand
+# to the threaded gemm, whose join YIELDS, and a yielded task usually resumes on a DIFFERENT thread
+# (measured: 39863 of 48000 yields migrated). A per-THREAD buffer can then be claimed by another task
+# while the workers are still reading it — measured 5/96 concurrent `symm!` results wrong, 0/96 serial.
+# Why a twin rather than converting the owners above: the comment above records the IdDict lookup at
+# ~130 ns DOMINATING tiny symm/hemm, and a per-task lookup costs ~13 ns more than a per-thread one. The
+# threaded branch is by construction a call large enough for 13 ns to be invisible; the serial branch
+# never yields, so it keeps the cheap per-thread owner and pays nothing.
+const _SYMM_SCR_MT_F64 = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+const _SYMM_SCR_MT_F32 = Base.OncePerTask{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
+@inline function _symm_scr_mt(::Type{Float64}, n::Int)
+    r = _SYMM_SCR_MT_F64()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); r[] = m)
+    return m
+end
+@inline function _symm_scr_mt(::Type{Float32}, n::Int)
+    r = _SYMM_SCR_MT_F32()
+    m = r[]
+    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
+    return m
+end
+# Only the two real types ever thread (`_gemm_workers` is gated on them), so every other element type
+# resolves to the per-thread owner and this method is never reached from a threaded call. It exists so
+# the call site stays ONE type-stable expression instead of a branch inference has to prove unreachable.
+@inline _symm_scr_mt(::Type{T}, n::Int) where {T} = _symm_scr(T, n)
+
 @inline function _symm_scr(::Type{Float64}, n::Int)
     r = _SYMM_SCR_F64()
     m = r[]
@@ -6676,45 +6936,10 @@ function _symm_materialize!(Ad, up::Bool, herm::Bool, A, n::Int)
     end
     return Ad
 end
-# Symmetric A-pack for a diagonal-straddling panel (real symm). BRANCHLESS (OpenBLAS-style): per column
-# the stored/mirror split is a single crossing, so each column packs a contiguous STORED run (reads A's
-# column gp, stride 1) then a MIRROR run (reads A's row gp, stride lda) — no per-element `i≤j` branch in
-# the hot loop. Off-diagonal panels use plain _pack_A! (stored: tA=false SIMD; mirror: tA=true).
-function _pack_A_sym!(Ap::Vector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int, up::Bool, alpha::T, mr::Int) where {T}
-    np = cld(mce, mr)
-    @inbounds for pi in 0:(np - 1)
-        base = pi * mr * kce; pbase = pi * mr
-        rhi = min(mr, mce - pbase)                 # valid rows r ∈ [0,rhi); r ≥ rhi → pad zero
-        for p in 0:(kce - 1)
-            gp = pc + p; o = base + p * mr; ls = gp - ic - pbase    # local diagonal crossing (in r)
-            if up                                  # stored r ∈ [0,st_end) (gi≤gp), mirror r ∈ [st_end,rhi)
-                st_end = clamp(ls + 1, 0, rhi)
-                for r in 0:(st_end - 1)
-                    Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]
-                end
-                for r in st_end:(rhi - 1)
-                    Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]
-                end
-            else                                   # stored r ∈ [st_start,rhi) (gi≥gp), mirror r ∈ [0,st_start)
-                st_start = clamp(ls, 0, rhi)
-                for r in 0:(st_start - 1)
-                    Ap[o + r + 1] = alpha * A[gp + 1, ic + pbase + r + 1]
-                end
-                for r in st_start:(rhi - 1)
-                    Ap[o + r + 1] = alpha * A[ic + pbase + r + 1, gp + 1]
-                end
-            end
-            for r in rhi:(mr - 1)
-                Ap[o + r + 1] = zero(T)
-            end     # pad rows beyond mce
-        end
-    end
-    return
-end
 # Complex HERMITIAN A-pack (split re/im) for a diagonal-straddling OR full-mirror panel (hemm side-L):
 # per panel-column the stored run reads A[i,gp] direct; the MIRROR run reads A[gp,i] CONJUGATED
-# (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store). Mirrors _pack_A_sym! + the
-# conj that makes it Hermitian. Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
+# (A_herm[i,gp] = conj(A[gp,i])). No α (applied at the microkernel store).
+# Full-stored panels use the SIMD _pack_A_cmplx! (tA=false) instead.
 # `HERM` is the ONLY difference between the Hermitian and complex-symmetric packs: the mirrored half
 # takes conj(A[j,i]) for Hermitian and A[j,i] unchanged for symmetric. It is a compile-time `Val` so the
 # sign folds away rather than costing a branch per element, and so complex symm can share this path
@@ -6865,176 +7090,7 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
     end
     return C
 end
-# Symmetric B-pack for a diagonal-straddling panel (real symm side R): the symmetric matrix is the
-# gemm's RIGHT operand. Stored side reads A[gp,gj], mirror side A[gj,gp]. Off-diagonal panels use
-# plain _pack_B! (stored: tB=false; mirror: tB=true). No α here — α rides on the left operand's pack.
-function _pack_B_sym!(Bp::Vector{T}, A, pc::Int, jc::Int, kce::Int, nce::Int, up::Bool, nr::Int) where {T}
-    np = cld(nce, nr)                              # branchless (OpenBLAS-style): stored/mirror = one crossing
-    @inbounds for ji in 0:(np - 1)
-        base = ji * nr * kce; cbase = ji * nr
-        chi = min(nr, nce - cbase)                 # valid cols c ∈ [0,chi); c ≥ chi → pad zero
-        for p in 0:(kce - 1)
-            gp = pc + p; o = base + p * nr; ls = gp - jc - cbase
-            if up                                  # stored gj≥gp: c ∈ [st,chi) (A row gp, strided); mirror c<st (A col gp)
-                st = clamp(ls, 0, chi)
-                for c in 0:(st - 1)
-                    Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]
-                end
-                for c in st:(chi - 1)
-                    Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]
-                end
-            else                                   # stored gj≤gp: c ∈ [0,st) (A row gp, strided); mirror c≥st (A col gp)
-                st = clamp(ls + 1, 0, chi)
-                for c in 0:(st - 1)
-                    Bp[o + c + 1] = A[gp + 1, jc + cbase + c + 1]
-                end
-                for c in st:(chi - 1)
-                    Bp[o + c + 1] = A[jc + cbase + c + 1, gp + 1]
-                end
-            end
-            for c in chi:(nr - 1)
-                Bp[o + c + 1] = zero(T)
-            end
-        end
-    end
-    return
-end
 
-# Single-pass packed symm (side L, real): C := α·A_sym·B + β·C as one gemm, packing A's symmetric
-# panels directly (no n² materialize). M=n, N=m, K=n; classify each A-panel: stored / mirror / straddle.
-function _symm_packed_L!(up::Bool, α::T, β::T, A, B, C) where {T <: BlasReal}
-    n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
-    b0first || _scale_C!(C, n, m, β)
-    ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < m
-            nce = min(nc, m - jc); pc = 0
-            while pc < n
-                kce = min(kc, n - pc)
-                _pack_B!(Bp, B, pc, jc, kce, nce, false, nr)
-                b0 = b0first && pc == 0
-                ic = 0
-                while ic < n
-                    mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
-                    stored = up ? (a_hi <= pc) : (ic >= p_hi)
-                    mirror = up ? (ic > p_hi) : (a_hi < pc)
-                    stored ? _pack_A!(Ap, A, ic, pc, mce, kce, false, α, mr) :
-                        mirror ? _pack_A!(Ap, A, ic, pc, mce, kce, true, α, mr) :
-                        _pack_A_sym!(Ap, A, ic, pc, mce, kce, up, α, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                            Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
-                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
-                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
-                            # Val(b0) — trim-safe, as at gemm.jl:707.
-                            if mre == mr && nre == nr
-                                b0 ?
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
-                            else
-                                b0 ?
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
-                    ic += mc
-                end
-                pc += kc
-            end
-            jc += nc
-        end
-    end
-    return C
-end
-
-# Single-pass packed symm (side R, real): C := α·B·A_sym + β·C. A_sym is the gemm's RIGHT operand.
-# M=size(C,1), N=K=n; classify each A_sym panel (pc..K, jc..N): stored / mirror / straddle.
-function _symm_packed_R!(up::Bool, α::T, β::T, B, A, C) where {T <: BlasReal}
-    M = size(C, 1); n = size(A, 1); W = _vwidth(T); mr = _MR * W; nr = _NR
-    kc = min(_KC, n); mc = _at_mc_kc(_HW, T, kc, mr, cld(M, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
-    Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
-    b0first = iszero(β)                    # β=0 ⇒ overwrite on the first k-block, no pre-scale pass
-    b0first || _scale_C!(C, M, n, β)
-    ldc = stride(C, 2); sz = sizeof(T)
-    GC.@preserve C Ap Bp begin
-        Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); j_hi = jc + nce - 1; pc = 0
-            while pc < n
-                kce = min(kc, n - pc); p_hi = pc + kce - 1
-                stored = up ? (p_hi <= jc) : (pc >= j_hi)
-                mirror = up ? (pc > j_hi) : (p_hi < jc)
-                stored ? _pack_B!(Bp, A, pc, jc, kce, nce, false, nr) :
-                    mirror ? _pack_B!(Bp, A, pc, jc, kce, nce, true, nr) :
-                    _pack_B_sym!(Bp, A, pc, jc, kce, nce, up, nr)
-                b0 = b0first && pc == 0
-                ic = 0
-                while ic < M
-                    mce = min(mc, M - ic)
-                    _pack_A!(Ap, B, ic, pc, mce, kce, false, α, mr)
-                    jr = 0
-                    while jr < nce
-                        nre = min(nr, nce - jr); ir = 0
-                        while ir < mce
-                            mre = min(mr, mce - ir)
-                            Apanel = App + (div(ir, mr) * mr * kce) * sz
-                            Bpanel = Bpp + (div(jr, nr) * nr * kce) * sz
-                            Cblk = Cp0 + ((ic + ir) + (jc + jr) * ldc) * sz
-                            # β=0 ⇒ overwrite on the first k-block instead of pre-scaling C. The same
-                            # drift fixed in the complex packed path (1d83669): `_microkernel!` has had
-                            # a Val{B0} slot all along and this path never used it. Literal Vals, never
-                            # Val(b0) — trim-safe, as at gemm.jl:707.
-                            if mre == mr && nre == nr
-                                b0 ?
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, Val(_MR), Val(_NR), Val(false))
-                            else
-                                b0 ?
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(true)) :
-                                    _microkernel_masked!(Ptr{T}(Cblk), ldc, Ptr{T}(Apanel), Ptr{T}(Bpanel), kce, mre, nre, Val(_MR), Val(_NR), Val(false))
-                            end
-                            ir += mr
-                        end
-                        jr += nr
-                    end
-                    ic += mc
-                end
-                pc += kc
-            end
-            jc += nc
-        end
-    end
-    return C
-end
-
-# n above which symm uses the single-pass packed kernel vs materialize (O(n²) dense copy of the triangle) +
-# the flagship gemm. DERIVED (req#8) via `_at_symm_mat_max` = √(L2/sizeof): a DIFFERENT criterion from the
-# rank-k register cut — materialize+gemm beats the packed symmetric kernel at every measured Zen3 n (packed
-# is dead weight on AVX2), and the only thing that unseats it is the O(n²) copy evicting the gemm's resident
-# L2 A-block, i.e. when the materialized n×n copy no longer fits L2 (see cpuinfo.jl). Galen measured a mat≈pack
-# tie at EXACTLY n=256=√(512K/8) (they converge for all n≥256), pinning the fraction at 1. This lifts the cut
-# off the mistuned 96 (which routed n=112–192 to the slower packed path → the Zen3 AOCL misses) to 256.
-# Predicts Zen4/Zen5 362 (DOWN from the _GEMM_UNPACK_MAX=448 placeholder — validate on the AVX-512 boxes).
-# Overridable "symm_pack_cut".
-# PDM: Derived — formula over detected consts: `_at_symm_mat_max(_HW)`
-const _SYMM_PACK_CUT = @load_preference("symm_pack_cut", _at_symm_mat_max(_HW))::Int
 # n above which complex hemm side-L uses the packed Hermitian kernel (reads the triangle once, on-the-fly
 # conj-mirror pack). The packed path is the OLD classic-4M kernel (measured 0.85-0.90 at n=64-128 AVX2);
 # the materialize path routes to _gemm_core!'s Karatsuba-3M at mid-n — the SAME path complex symm already
@@ -7068,43 +7124,79 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
             return _hemm_3m_L!(up, herm, α, β, A, B, C)
         end
     end
-    # UPPER BOUND ON THE PACKED PATH (2026-08-17). symm has the SAME flop count as gemm (2·n²·m) —
-    # symmetry saves A-traffic, not arithmetic — so symm should run at gemm's speed. It did not:
+    # REAL symm ALWAYS MATERIALIZES, and the packed symmetric kernel is not on its route at all.
+    # symm has the SAME flop count as gemm (2·n²·m) — symmetry saves A-traffic, not arithmetic — so it
+    # should run at gemm's speed, and on the packed kernel it did not:
     #
     #     Zen4   n=2048   PB gemm 0.3552s   PB symm 0.4150s   (symm 16.8% SLOWER, same flops)
     #                  n=4096   PB gemm 2.5319s   PB symm 3.3013s   (symm 30.4% SLOWER)
     #     AOCL for contrast     n=2048   its gemm 0.4530  its symm 0.4014  (theirs is FASTER than gemm)
     #
-    # The whole deficit is that gemm rides Strassen (1.26-1.28x AOCL there) and the packed path cannot:
-    # it never reaches `_gemm_core!` at all. The fall-through below ALREADY materializes the symmetric
-    # operand and calls `_gemm_core!(…, false, false, …)` — an NN product, i.e. Strassen-eligible — so
-    # the fix is not new code, it is declining the packed path once Strassen can pay.
+    # Measured again 2026-09-20 on the gate itself, packed against materialize: 1.041 at n=1024, 1.133
+    # at 2048, 1.278 at 4096, all in packed's favour to lose. The materialize is O(n²) against an O(n³)
+    # product — ~33.5 MB at n=2048, ~0.7 ms at ~50 GB/s, against a 415 ms call, i.e. 0.16%.
     #
-    # The materialize is O(n²) against an O(n³) saving: ~33.5 MB at n=2048, ~0.7 ms at ~50 GB/s,
-    # against a 415 ms call — 0.16% — to buy a ~25% flop cut.
-    #
-    # `_strassen_depth > 0` is the exact predicate `_gemm_core!` will apply, so the two cannot disagree
-    # (a hand-written `n >= _STRASSEN_MIN` here could drift from the depth rule and silently route to a
-    # classical path with the materialize tax still paid — the worst of both).
-    strassen_pays = _STRASSEN && eltype(C) <: BlasReal && !herm &&
-        _strided1(A) && _strided1(B) && _strided1(C) &&
-        _strassen_depth(size(C, 1), size(C, 2), n) > 0
-    if !herm && eltype(C) <: BlasReal && n > _SYMM_PACK_CUT && !strassen_pays
-        return side_left ?
-            _symm_packed_L!(up, convert(eltype(C), α), convert(eltype(C), β), A, B, C) :
-            _symm_packed_R!(up, convert(eltype(C), α), convert(eltype(C), β), B, A, C)
-    elseif herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
+    # Complex still has packed paths of its own below; the real ones are gone.
+    if herm && eltype(C) <: BlasComplex && side_left && n > _CHEMM_PACK_CUT &&
             _strided1(B) && _strided1(C)                     # packed Hermitian (no materialize, triangle once)
         return _hemm_packed_L!(up, α, β, A, B, C, Val(true))
     elseif !herm && eltype(C) <: BlasComplex && side_left && n > _CSYMM_PACK_CUT &&
             _strided1(B) && _strided1(C)                 # packed complex-symmetric: no materialize
         return _hemm_packed_L!(up, α, β, A, B, C, Val(false))
     end
-    Ad = view(_symm_scr(eltype(C), n), 1:n, 1:n)
+    # Decide threading BEFORE choosing the buffer: a threaded call must materialize into the PER-TASK
+    # twin, because the buffer is handed to workers and the driver's join yields (see `_symm_scr_mt`).
+    # No `iszero(_arena().depth)` admission here, for the same reason `gemm!` dropped it: the join is
+    # `_gemm_threaded!`'s, and that function pins the driver to its thread for its duration, so a
+    # caller's live arena borrows stay on the thread that holds them (arena.jl, threading note).
+    T = eltype(C)
+    # `eltype(B) === T` because `_gemm_threaded!` takes three `PtrMatrix{T}`; `Ad` is built at `T`, but a
+    # mixed-type B would be a MethodError where `_gemm_core!` promotes. (`gemm!` guards the same way.)
+    nw = (T === Float64 || T === Float32) && eltype(B) === T &&
+        _strided1(B) && _strided1(C) ?
+        _gemm_workers(size(C, 1), size(C, 2), n) : 1
+    Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
-    T = eltype(C); aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
-    side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false) :  # complex — skip the kwarg layer
-        _gemm_core!(C, B, Ad, aT, bT, false, false, false, false)
+    aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
+    # ── M4: SPLIT THIS, BECAUSE IT IS A GEMM ────────────────────────────────────────────────────────
+    # Once the symmetric operand is materialized, this call is an ordinary NN product — the block above
+    # says exactly that, which is why Strassen is allowed to claim it — so it deserves the same column
+    # split `gemm!` has. It did not have one: `_gemm_core!` sits BELOW the split point (gemm.jl), and
+    # "skip the kwarg layer" predates M4. symm is the safest of the six L3 ops to split: the output is a
+    # FULL matrix (no triangle ⇒ no write conflict), there is no recursion, and the symmetric operand is
+    # read-only for every worker.
+    #
+    # THE SPLIT STAYS BELOW `_symm_materialize!`. Above it, every worker would build its own n×n copy of
+    # A — O(n²) duplicated per worker, and on side-L each worker needs ALL of A, not a slice.
+    #
+    # `Ad` is handed to the workers as an OPERAND, which is why it comes from the PER-TASK twin whenever
+    # `nw > 1` (chosen above, before the materialize). An earlier version of this comment argued the
+    # per-thread buffer was safe because a WORKER landing on the driver's thread never claims
+    # `_SYMM_SCR`. That is true and beside the point: the driver's join yields, the task migrates, and an
+    # unrelated task on the vacated thread takes the buffer the workers are still reading. Measured
+    # before the twin: 5/96 concurrent `symm!` results wrong, worst relative error 1.65, against 0/96
+    # serial. The `GC.@preserve` roots the storage; it never protected the CONTENTS.
+    # AND IT STAYS BELOW THE RECURSION. A Strassen-eligible product is not column-split, because the
+    # recursion halves n and a worker holding a slice would run a different algorithm than a serial
+    # call — see the note at the same decision in `gemm!`. Asked through `_strassen_owns` so this site
+    # cannot drift from the conditions `_gemm_core!` will actually apply.
+    #
+    # `aT`/`bT` here are the converted α and β, not transpose flags — both operands go in untransposed.
+    # Both branches thread; the shape picks between them, never the worker count. A Strassen-eligible
+    # product threads inside the recursion instead of being column-split — see the same decision in
+    # `gemm!`, and `_strassen_leaf!` for why that is still bit-identical.
+    Xd, Yd = side_left ? (Ad, B) : (B, Ad)
+    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd)
+        rA = _root(Ad); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC begin
+            side_left ?
+                _gemm_threaded!(_pm(C), _pm(Ad), _pm(B), aT, bT, false, false, false, false, nw) :
+                _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
+        end
+    else
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true, nw) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true, nw)
+    end
     return C
 end
 function _symm_check(side_left, A, B, C)
@@ -7234,6 +7326,35 @@ function syr2k!(
         return syr2k!(C, parent(A), parent(Bm); uplo, trans = 'T', alpha, beta)
     end
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
+    # ── M4 PHASE 4: SPLIT THE TRIANGLE ─────────────────────────────────────────────────────────────
+    # `_syrk_run_chunk` picks the SAME kernel the serial path would — the fused `_trgemm_packed2_u!`
+    # when `_unified_ok`, else the two-pass route — so threaded and serial cannot disagree.
+    #
+    # A FIRST ATTEMPT GATED THIS ON THE TWO-PASS ROUTE AND WAS DEAD CODE: on this fleet `_unified_ok`
+    # is true for Float64 and `_SYR2K_2PASS` is `typemax(Int)`, so syr2k ALWAYS takes the fused route.
+    # The dispatch witness caught it — sixteen clean rows with `dispatch: 0`, every one vacuous. That
+    # is the whole reason the witness runs before the table.
+    #
+    # BOTH PASSES STAY ON ONE WORKER (`sym2`). syr2k is C := αABᵀ + αBAᵀ + βC — two rank-k updates over
+    # the SAME C. Handing one pass to each worker would put two workers on one column range: a plain
+    # data race. The fused kernel sidesteps it by writing each tile once; the 2-pass route needs the
+    # single-owner rule, and gets it.
+    #
+    # β is applied here, so each chunk is a pure accumulate and no worker has to sequence against β.
+    Tr = eltype(C)
+    nw2 = (Tr === Float64 || Tr === Float32) && eltype(A) === Tr && eltype(Bm) === Tr &&
+        _strided1(A) && _strided1(Bm) && _strided1(C) &&
+        n > _fh_syr2k_pack_cut() && k > 0 ?
+        _syrk_workers(n, 2 * k) : 1        # 2k: syr2k does TWO rank-k passes, so twice the flops
+    if nw2 > 1
+        _syrk_scaleC!(C, up, convert(Tr, beta))
+        rA = _root(A); rB = _root(Bm); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(Bm), convert(Tr, alpha), zero(Tr),
+            trans != 'N', trans != 'N', false, false, nw2, _MT_KIND_SYRK, up, true
+        )
+        return C
+    end
     if eltype(C) <: BlasReal && n > _fh_syr2k_pack_cut() && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && trans == 'N' && _strided1(A) && _strided1(Bm) &&

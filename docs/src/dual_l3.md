@@ -4,7 +4,7 @@ Status: **implemented on branch `dual-l2l3` (2026-09-13); the design as sparred,
 
 ## 0. Triage: what the generic scalar path achieves today
 
-galen (Zen3, core 6, boost off), plots.jl's CL3 regime (one call per sample on fresh operands), Chairmarks
+Zen3 (core 6, boost off), plots.jl's CL3 regime (one call per sample on fresh operands), Chairmarks
 median of 6 rounds. Cell = complex-twin time ÷ dual time on identical bytes; the complex twin's absolute time
 is given so the route it took is visible. Probe: `bench/probes/dual_l23_triage.jl` (gitignored).
 
@@ -145,7 +145,7 @@ lines), one interleaved `_combine_dual!` per shape class (full, triangular; dual
 * **trsm division:** §2.4 — eliminated, not vectorised.
 * **hemm / herk / her2k on dual:** collapse to the symmetric op (identity conjugation; `dual_l2.md` §4.2).
 
-## 4. Measurement plan (galen, `taskset -c 6`, Chairmarks median)
+## 4. Measurement plan (Zen3, `taskset -c 6`, Chairmarks median)
 
 1. Correctness before speed: dual gemm/syrk/trmm/trsm vs the generic loop on awkward `(m, n, k)`, all
    `trans`/`side`/`uplo`/`diag`, dual α with zero value, β = 0/1/dual; `ForwardDiff.jacobian` of `A*B`,
@@ -201,7 +201,7 @@ lines), one interleaved `_combine_dual!` per shape class (full, triangular; dual
 
 Dual gemm is three real gemms with no cancellation and no window; complex 3M is three real gemms plus a sum
 plane per operand and a cancelling combine. The sub-gemms go through `_gemm_core!` (not `_gemm_real_dims!`),
-so they take Strassen where real gemm does. Measured on galen (median of 4 rounds, plots.jl's CL3 regime),
+so they take Strassen where real gemm does. Measured on Zen3 (median of 4 rounds, plots.jl's CL3 regime),
 zgemm ÷ dual on identical bytes, with dgemm for scale:
 
 | n | dual ms | zgemm ms | dgemm ms | zgemm/dual | dual/(3·dgemm) |
@@ -239,7 +239,7 @@ that remain real: the pool never shrinks (a process that once ran a 4096² dual 
 complex 3M has the same property at 288 MB), and paneling would cap it at the price of losing Strassen on the
 panels. Unpaneled is what shipped; the panel loop is the upgrade path if the footprint is objected to.
 
-### The compositions (galen, complex twin ÷ dual, side L, median of 6)
+### The compositions (Zen3, complex twin ÷ dual, side L, median of 6)
 
 | op | n=32 | n=128 | n=512 | n=1024 |
 |---|---|---|---|---|

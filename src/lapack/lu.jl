@@ -361,7 +361,19 @@ end
 
 # Reusable padded scratch (like Cholesky): a po2 / stride%512==0 leading dim aliases cache sets, slowing
 # the panel + laswp at large n; factor in an ld=m+8 buffer and copy back.
-const _LU_PAD = Base.OncePerThread{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+#
+# PER TASK, NOT PER THREAD — and this one is load-bearing, not tidiness. `getrf!` holds this buffer
+# across its trailing `gemm!`, which THREADS, and whose join yields. A yielded task usually resumes on a
+# DIFFERENT thread (measured on Zen4: 39863 of 48000 yields migrated), so a per-thread owner hands the
+# resumed driver a different buffer while the original thread is free for another task to claim the one
+# it is still using. Measured before this change: 24 concurrent `getrf!` calls gave **20/96 wrong
+# results, some NaN**, against 0/96 serial. The driver is now pinned to its thread across that join
+# (gemm.jl), which is what makes the nesting ARENA safe — but a plain Ref owner like this one is a
+# single role, and another task landing on the pinned thread during the yield would claim the same Ref
+# while the workers still read it; so it stays per-task.
+# Cost is nil here: `_lu_needs_pad` requires m >= 512, so the extra ~13 ns lookup lands only on calls
+# already in the millisecond range.
+const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 @inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
@@ -392,6 +404,18 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         pad = _LU_PAD()
         b = pad[]
         (size(b, 1) < R || size(b, 2) < n) && (b = pad[] = Matrix{Float64}(undef, R, n))
+        # The buffer is REUSED whenever it is already big enough, so after a larger call it is WIDER
+        # than m+8 — and `Mw` below strides by `size(b, 1)`, not by `R`. Copying at stride `R` then
+        # writes the columns to different addresses than `_getrf_core!` reads them from: a SILENT wrong
+        # factorization (measured: 1024 then 512 in one task gave relerr 140 on ‖PLU − A‖). Take the
+        # buffer's true leading dimension so the two can never disagree. Reallocating down to exactly
+        # `m+8` on every descent would also be correct, and would throw the buffer away each time.
+        # ponytail: a REUSED width is some earlier `m'+8`, and that is 512-aliased when `m' ≡ 504 (mod
+        # 512)` — reachable only from a view whose row count is not its leading dimension, since the
+        # predicate keys on `stride(A,2)`. That shape loses the pad's de-aliasing (perf, not
+        # correctness) and is equally reachable on a FIRST call, so it is pre-existing, not new here.
+        # Fix by choosing a pad that is never aliased if a gate cell ever lands on it.
+        R = size(b, 1)
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(eltype(A))
         info = GC.@preserve A b begin
@@ -422,13 +446,95 @@ end
 # BOTH loops in `_getrf_core!` must use this — the deferred laswp replays the same partition.
 @inline _lu_pb(rem::Int, nb::Int, ::Type{T}) where {T} = rem < nb + _vwidth(T) ? rem : nb
 
+"""
+    _getrf_lookahead!(A, ipiv, m, n, k, pc, pb, jt0, nb) -> Int
+
+Apply panel `pc`'s trailing update and, where it pays, factor the NEXT panel alongside it. Returns
+that panel's `info`, or `-1` when it did not factor one and the caller must.
+
+The update is split by COLUMNS into the next panel's own columns and the remainder. The narrow half
+runs first, because the next panel cannot be factored until its columns carry this update — the same
+precondition the unsplit loop enforced by finishing the whole update before the next `_getf2!`. The
+remainder is then dispatched together with that factorization as one pool job: worker 1 takes the
+panel, the rest take the columns.
+
+WHY THE SPLIT IS BIT-IDENTICAL TO THE SINGLE UPDATE IT REPLACES. A column split leaves every
+element's k chain untouched, so narrow-then-wide computes what one wide call computes, PROVIDED both
+halves take the same route — hence `wid`, the full trailing width, passed as the route token to both.
+Without it the narrow half would route on its own width and could pick a different algorithm.
+
+AND WHY THE ONE-THREAD PATH TAKES IT TOO. At `nw == 1` this still issues narrow-then-wide, not one
+call. The serial path must be the threaded call structure with the worker count set to one, or the
+two differ in bits and the thread-count invariance gate (req#11) fails on the very first size where
+look-ahead engages.
+"""
+function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt0::Int, nb::Int)
+    T = eltype(A)
+    wid = n - jt0 + 1                                   # the full trailing width, the route token
+    L21 = view(A, (pc + pb):m, pc:(pc + pb - 1))
+    C = view(A, (pc + pb):m, jt0:n)
+    U12 = view(A, pc:(pc + pb - 1), jt0:n)
+    pb2 = jt0 <= k ? _lu_pb(k - jt0 + 1, nb, T) : 0     # the next panel's width, 0 if there is none
+    mo = -one(T); bo = one(T)
+    # THE CALL STRUCTURE IS THE SAME AT EVERY WORKER COUNT, and that is what this shape is for. The
+    # worker count decides only whether the WIDE half runs threaded and whether the next panel rides
+    # along with it — never how many gemm calls there are, nor which route they take. Choosing one
+    # `gemm!` at one thread and two `_gemm_core!`s at six put Strassen on one side and the classical
+    # kernel on the other, and the same call then returned different bits at different thread counts:
+    # correct to 1e-14, identical pivots, and a reproducibility failure all the same.
+    splittable = pb2 > 0 && wid > pb2 && T <: BlasReal && _strided1(A) && jt0 + pb2 <= n
+    if !splittable
+        _gemm_core!(C, L21, U12, mo, bo, false, false, false, false, wid)
+        return -1
+    end
+    # The narrow half: the next panel's own columns, routed from the whole width. It is threaded in
+    # its own right — it is a full rank-`pb` update of `m-pc-pb+1` rows and running it on one worker
+    # costs more than the panel it exists to uncover.
+    Cn = view(C, :, 1:pb2); Un = view(U12, :, 1:pb2)
+    nwn = _gemm_workers(m - pc - pb + 1, pb2, pb)
+    if nwn > 1
+        rAn = _root(L21); rUn = _root(Un); rCn = _root(Cn)
+        GC.@preserve rAn rUn rCn begin
+            lupn = LuPanel{T}(Ptr{T}(0), 1, 0, 0, Ptr{Int}(0), 0, 0, wid)
+            _gemm_threaded!(_pm(Cn), _pm(L21), _pm(Un), mo, bo, false, false, false, false,
+                nwn, _MT_KIND_GEMM, false, false, false, lupn)
+        end
+    else
+        _gemm_core!(Cn, L21, Un, mo, bo, false, false, false, false, wid)
+    end
+    Cw = view(C, :, (pb2 + 1):wid)
+    Uw = view(U12, :, (pb2 + 1):wid)
+    nw = _gemm_workers(m - pc - pb + 1, wid - pb2, pb)
+    if nw <= 1
+        _gemm_core!(Cw, L21, Uw, mo, bo, false, false, false, false, wid)
+        return -1
+    end
+    # The wide half, fused with the next panel's factorization.
+    Pn = view(A, jt0:m, jt0:(jt0 + pb2 - 1))
+    rA = _root(A); rU = _root(Uw); rC = _root(Cw); rP = _root(Pn)
+    GC.@preserve rA rU rC rP ipiv begin
+        lup = LuPanel{T}(pointer(Pn), stride(Pn, 2), m - jt0 + 1, pb2,
+            pointer(ipiv), jt0 - 1, jt0 - 1, wid)
+        _gemm_threaded!(_pm(Cw), _pm(L21), _pm(Uw), mo, bo, false, false, false, false,
+            nw, _MT_KIND_LUAHEAD, false, false, false, lup)
+    end
+    return _gemm_pool(T).lainfo
+end
+
 function _getrf_core!(A, ipiv, nb::Int)
     m, n = size(A); k = min(m, n)
     nb = clamp(nb, 1, k)
     info = 0; pc = 1
+    # `ahead` is the `info` of a panel the PREVIOUS iteration already factored, or `-1` when this
+    # iteration must factor its own. Look-ahead factors panel k+1 inside iteration k's update, so
+    # without this the panel would be factored twice — the second time on rows that already carry
+    # their own L and U, which is not merely wasted work but a different factorization.
+    ahead = -1
     @inbounds while pc <= k
         pb = _lu_pb(k - pc + 1, nb, eltype(A)); mp = m - pc + 1
-        pinfo = _getf2!(view(A, pc:m, pc:(pc + pb - 1)), mp, pb, pc - 1, ipiv, pc - 1)
+        pinfo = ahead >= 0 ? ahead :
+            _getf2!(view(A, pc:m, pc:(pc + pb - 1)), mp, pb, pc - 1, ipiv, pc - 1)
+        ahead = -1
         (info == 0 && pinfo != 0) && (info = pinfo)
         jt0 = pc + pb
         if jt0 <= n
@@ -438,10 +544,18 @@ function _getrf_core!(A, ipiv, nb::Int)
                 side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = true
             )   # U12 = L11⁻¹ A12
             if pc + pb <= m
-                gemm!(
-                    view(A, (pc + pb):m, jt0:n), view(A, (pc + pb):m, pc:(pc + pb - 1)), view(A, pc:(pc + pb - 1), jt0:n);
-                    alpha = -1, beta = true
-                )                       # A22 −= L21 U12
+                # A22 −= L21·U12, SPLIT so the next panel can be factored while the rest is updated.
+                #
+                # The split is by COLUMNS into the next panel's own columns and the remainder. Both
+                # halves route from the FULL trailing width, so the pair computes exactly what the
+                # single update computed: each element's k chain is untouched by a column split, and
+                # routing from the whole keeps both halves on the same algorithm. `_getrf_lookahead!`
+                # then factors the next panel on one worker while the rest apply the remainder.
+                #
+                # The narrow half must land FIRST. The next panel cannot be factored until its own
+                # columns carry this panel's update, which is the same precondition the unsplit loop
+                # enforced by doing the whole update before the next iteration's `_getf2!`.
+                ahead = _getrf_lookahead!(A, ipiv, m, n, k, pc, pb, jt0, nb)
             end
         end
         pc += pb
@@ -463,8 +577,8 @@ end
 # row-swaps + trsm/gemm view reads. MEASURED (Zen3): a sharp dip at n=256 (0.94 vs 1.02 at n=252/260) and
 # n=1024 (0.97 vs 1.10 at n=1020/1028) — exactly the po2 sizes; the non-po2 neighbours gate. Factor in an
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
-const _CLU_PAD64 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
-const _CLU_PAD32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+const _CLU_PAD64 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
+const _CLU_PAD32 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
 @inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64()
 @inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32()
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
@@ -522,6 +636,7 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
         pref = _clu_pad(T); b = pref[]
         (size(b, 1) < R || size(b, 2) < n) && (b = pref[] = Matrix{T}(undef, R, n))
+        R = size(b, 1)                                     # true width of the REUSED buffer — see the real twin
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(T)
         info = GC.@preserve A b begin

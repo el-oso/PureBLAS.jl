@@ -11,16 +11,21 @@ non-Julia hosts). See `README.md` / `CHANGELOG.md`.
 **Where the work is now, in one line each:**
 - **Coverage: DONE.** OpenBLAS fallthrough is **zero** and ratchet-enforced (`test/lbt_forward_tests.jl`);
   the north-star worklist below is complete. What remains there is performance, not routing.
-- **Performance: the open front.** 376 of 2800 fleet cells sit below the gate (Zen3 118 / Zen4 128 /
-  Zen5 130), last published at `ef76dac2`. Read that number with care — a large share of cells sit within
-  a few percent of parity, and per-cell noise reaches **~4% at n=2048**, so the count swings between
-  refreshes. Judge a change by its targeted cells and its controls, never by a count delta.
+- **Performance: the open front.** **330 of 2790** fleet cells sit below the gate — Zen3 113 / Zen4 108
+  / Zen5 112 — recounted from the caches on disk on 2026-09-17 with `bench/gate_gaps.jl` (no
+  re-measurement; the arms are the cached ones and `gate_gaps` stamps each row with the commit that
+  measured it). The previous figure here, 376 at `ef76dac2`, was stale. Read the number with care:
+  **98 of the 330 are within their own round spread**, a large share sit within a few percent of
+  parity, and per-cell noise reaches ~4% at n=2048, so the count swings between refreshes. Judge a
+  change by its targeted cells and its controls, never by a count delta.
 - **ForwardDiff duals are a gated element type**, not just a thing that compiles — four groups
   (DL1/DL2/DL3/DLP) divide by LinearAlgebra's generic fallback. See the dual section below.
 - **Every `!` entry is allocation-free at steady state** (req#10), and `gemm!` now carries a *static*
   `@test_noalloc` on both Float64 and Dual.
-- **Deferred by standing decision:** M4 multithreading (do not start unless asked), registration.
-- **Zen5 is stale.** neuromancer's cache predates `ff5677ba` and its frequency lock has been dropping
+- **M4 multithreading STARTED 2026-09-16** at user request; the old "do not start unless asked"
+  deferral is lifted. Step 1 (per-thread scratch) is on master; step 2 (threaded gemm) is on branch
+  `m4-threaded-gemm` pending ONE user decision — see the M4 section. Registration is still deferred.
+- **Zen5 is stale.** Zen5's cache predates `ff5677ba` and its frequency lock has been dropping
   (4841 MHz against a 2000 MHz pin). A setuid `pureblas-cpufreq` helper is built and staged there so the
   lock can be restored without the user present; it needs one `sudo install` and `fleet_freqlock.sh` is
   not yet wired to call it.
@@ -90,8 +95,11 @@ after). `L3Workspace` paid that at module load instead.
 
 **Standing caveat:** the arena is a process-global bump allocator, exactly as `_l3ws` is a process-global
 struct. That is not a regression in kind but it is one in degree — interleave two tasks and the failure
-is arbitrary cross-role aliasing where the struct's was bounded to one role. **A per-task owner is a
-precondition of enabling threads (M4), not an optimisation to weigh against its 9–12 ns.**
+is arbitrary cross-role aliasing where the struct's was bounded to one role. This paragraph used to
+conclude "a per-task owner is a precondition of enabling threads (M4)". **It was not** (2026-09-19):
+threads shipped with the arena still per-thread, first behind an admission guard and then behind a
+pinned driver — see M4 "Arena threading repair" below. The per-task owner was PRICED rather than
+assumed: trmm! n=8 **+3.5%** (8 SE), null elsewhere; the pin costs that cell nothing.
 
 **THE ARENA IS A PREREQUISITE FOR M4, AND REVERTING IT IS NOT AN OPTION (user, 2026-09-05.)** This
 governs how a stage-4 regression may be resolved: it must be FIXED, never reverted to fields, however
@@ -186,8 +194,8 @@ Measured wall-clock for a real refresh (`arms=pb`, one group per pass), which no
 
 | box | LP | DLP | note |
 |---|---|---|---|
-| wintermute · Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
-| galen · Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
+| Zen4 · 2799 MHz · W=8 | **34m58s** | **3m19s** | |
+| Zen3 · 3701 MHz · W=4 | **47m48s** | **2m37s** | 32% HIGHER clock, 37% LONGER |
 
 Two things fall out, and both belong in the knob review:
 
@@ -208,8 +216,8 @@ from one afternoon's inspection; the same question has never been asked of the o
 
 **3. Why this keeps costing time.** Every ETA I gave this session was wrong, in both directions, because
 there was no recorded per-group duration to estimate from and the obvious proxy (clock) is the wrong
-one — see galen above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
-FP256 double-pumped, so it behaves like galen at half the clock. Durations now recorded in
+one — see Zen3 above, where LP duration tracks VECTOR WIDTH, not MHz. Zen5-mobile is W=8 but reads
+FP256 double-pumped, so it behaves like Zen3 at half the clock. Durations now recorded in
 `kb/findings/sweep-wall-clock-reference.md` so the next session estimates from data.
 
 #### Update 2026-09-14 — the instrument matters more than the knobs
@@ -605,7 +613,7 @@ Done & verified (426/426 tests passing as of 2026-06-28):
 - [x] Re-run the gate per-machine on the fleet — **DONE for all 3 AMD boxes** (Zen3/AVX2 Zen3, Zen4/
       AVX-512 Zen4, Zen5/native-AVX-512 Zen5); boost-locked certification in "Fleet-gate
       certification" below. (Future M5 ARM box not yet acquired.)
-  - **Zen3 (Zen3, Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
+  - **Zen3 (Ryzen 9 5900X, native AVX2, W=4) — measured 2026-07-02:** CORRECTNESS ✅ full
     suite **7213/7213** (native AVX2 — the real-hardware confirmation of the fallback path, incl. the
     symv NB≤W kernel). PERFORMANCE ❌ below gate on L3/LAPACK: L1 mostly PASS (iamax 0.81 FAIL), L2
     PASS except gemvN 0.80 / gbmvN 0.62, **all L3 FAIL (gemm 0.63, symm 0.58, syrk 0.59, syr2k 0.65,
@@ -1038,6 +1046,12 @@ needs masking). Until then trmm dispatches to the recursion (no regression); `_t
 - **symm/hemm** — killed the n² materialize: pack the symmetric A panels directly inside a single-pass
   gemm (`_pack_A_sym!` side-L / `_pack_B_sym!` side-R, `_symm_packed_L!`/`_symm_packed_R!`). 0.95 →
   side-L 0.97–0.98×, side-R 0.98–1.00×.
+  **Superseded 2026-09-20: real symm no longer has a packed path.** Its route condition required
+  `n > symm_pack_cut` (362 on Zen4) AND Strassen not paying, and Strassen pays from `min(m,n,k) ≥ 256`,
+  so the two could not both hold and the kernel had become unreachable. Measured against materialize
+  it also loses — 1.04 / 1.13 / 1.28 at n=1024 / 2048 / 4096. Both kernels, both packers,
+  `_at_symm_mat_max` and the `symm_pack_cut` knob are removed; real symm always materializes and calls
+  `_gemm_core!`. The complex packed paths (`_hemm_packed_L!`) are unaffected.
 - **syrk + syr2k — unified single-pack redesign.** OpenBLAS packs A once and reuses it for BOTH operand
   roles; we couldn't because mr=16≠nr=8 → packed A twice (syrk) / four panels (syr2k), amortizing
   packing over only the triangle. Fix: switch the triangular path to an **8×8 tile** (mr==nr==W, F64/
@@ -1386,14 +1400,201 @@ harness inflates SMALL-n cells — it measured the reference at 3.71 µs for ptt
 process measures 2.00 µs, because it times six ops sequentially per size (memory
 `adhoc-tridiag-harness-inflates-small-n`). Its large-n cells agree with plots.jl to ~0.5%.
 
-## M4 — multithreading (DEFERRED by user — do not start until explicitly requested)
+## M4 — multithreading (STARTED 2026-09-16 at user request; the old defer instruction is lifted)
 
 Parallelize the gemm jj-loop, threshold-gated (small sizes stay serial). Per-host tuning. This is
 for **absolute throughput / scaling across cores** — NOT for closing an OpenBLAS gap: single-thread
 `dgemm` is already at parity (geomean 0.999×). (Earlier note claimed large-n was "single-thread
 L2-bandwidth-bound, needs threading" — that was wrong; it was scalar packing, fixed by SIMD pack_A.)
-**Standing instruction (2026-06-28): defer ALL multithreading requests until later — keep everything
-single-threaded for now.**
+
+**Requirement (user, 2026-09-16): threading must also be available OUTSIDE Julia**, i.e. through the
+trimmed `libpureblas.so`, not only in-process.
+
+### Step 1 DONE — scratch is owned per thread (`5c960578`)
+
+11 process-global scratch owners became `Base.OncePerThread`. Measured lookup 1.51 ns, against
+14.71 ns per-task and 0.01 ns for the old global const. Full suite green at `JULIA_NUM_THREADS=4`.
+
+### The `.so` half is BLOCKED UPSTREAM — do not attempt a local fix (user, 2026-09-17)
+
+A juliac shared library is built `handle-signals=no` + `threads=1` **by default**, and Julia stops
+threads for garbage collection by protecting a page and catching the resulting fault. With no handler
+installed, the second thread that reaches a collection point dies. Step 1 exposed this because
+`OncePerThread` can allocate, so kernels gained a collection point the old `const` owners never had.
+Measured: old library 8/8 pass, `5c960578` 3/3 segfault, `5c960578` built with
+`--jl-option handle-signals=yes` 11/11 pass. Full write-up and the three falsified hypotheses:
+`kb/findings/juliac-so-handle-signals-off-breaks-threads.md`.
+
+**We are NOT shipping the flag and NOT patching around it.** The real fix is upstream and in progress:
+
+- [JuliaLang/julia#50278](https://github.com/JuliaLang/julia/issues/50278) — this exact fault; open,
+  and it notes that refusing multiple threads is only a partial fix "since foreign threads may become
+  adopted nonetheless", which is our case.
+- [JuliaLang/julia#61319](https://github.com/JuliaLang/julia/issues/61319) — the umbrella "Julia as a
+  library, multi-threading readiness". Lists our blockers by name, including that **ephemeral threads
+  do not reuse thread storage or heaps** (we measured this: 31 adopted threads, never a reused id).
+  The planned answer is a third mode, **`--handle-signals=minimal`**, which installs Julia's handler
+  and forwards everything else to the host's. Unix and Windows in progress, macOS not started.
+  **Verified absent in Julia 1.13.0** — `--handle-signals=minimal` is rejected.
+- [JuliaLang/JuliaC.jl#152](https://github.com/JuliaLang/JuliaC.jl/issues/152) — runtime thread count
+  for a compiled library; open, no solution.
+
+**When `minimal` lands**, this becomes one word in `juliac/build.jl` plus a rebuild, plus a
+`pureblas_set_num_threads` `@ccallable` wrapping `set_num_threads` so a C host can drive it the way it
+drives `openblas_set_num_threads`. Until then the `.so` stays single-threaded, which is correct and
+unbroken: `Threads.nthreads()` is 1 there, so `set_num_threads` clamps to 1 and never creates a pool.
+Verified after the refactor — the trimmed library builds and runs from a C host.
+
+**Design consequence to keep:** the worker pool must be **parked and long-lived**, never created and
+joined per call — upstream states ephemeral adopted threads leak their storage and heap.
+
+### Step 2 DONE — threaded gemm on a parked pool (Julia side)
+
+**Mechanism chosen by measurement, not by preference.** `bench/probes/threading_forkjoin_cost.jl`, Zen4,
+4 workers, pure fork-join cost: `@spawn`+`fetch` 3049 ns · spin pool 570 ns · blocking pool ~4000 ns ·
+**hybrid spin-then-sleep 1336 ns**. The deciding number is not the wake but the idle tax — a spin pool
+makes an unrelated workload in the same process **3.1-3.4× slower while doing nothing**, hybrid and
+blocking cost it nothing. `@spawn` is separately disqualified: it allocates per call, which fails
+`gemm!`'s static no-allocation proof (req#10). Full table + the falsified options (Polyester, Octavian,
+OhMyThreads — all fail trim or are unmaintained) in `kb/findings/pureblas-m4-fork-join-wake-mechanism.md`.
+
+**Shape.** One split, in one place: the COLUMNS of C, above `_gemm_core!`, so every route below it
+(tiny, Strassen, unpacked, blocked) runs unchanged and no borrow is live across the join. Workers
+spin-then-sleep; the driver spins with a yield escape (it is inside a blocking call, and `wait`
+allocates). One process-wide pool per element type with a single atomic claim: a second concurrent
+caller runs serially rather than sharing the pool, which is what keeps it composable.
+
+**`PureBLAS.set_num_threads(n)` / `get_num_threads()`, and threading is OFF until asked.** This is the
+`openblas_set_num_threads` shape the user asked for, and it is also load-bearing for the design: the
+pool is created by `set_num_threads`, never on the gemm path, so `gemm!` reads exactly one atomic
+integer to decide. A `Base.OncePerProcess` on the gemm path would take a lock on first call — see the
+JET item below for why that is not survivable.
+
+### ⚠ OPEN DECISION — this is why the work is on branch `m4-threaded-gemm` and NOT on master
+
+`test/dual_tests.jl`'s `@assert_typestable` dogfood on `trmm!`/`trsm!` **fails** with a threaded gemm
+reachable from them. It is a JET artifact, not a real instability, and this repo had already diagnosed
+the identical thing: `test/Project.toml` records that a lock reachable from a kernel "descends through
+`yield()`/`wait()` into Base's `OncePerThread{Task}` scheduler — which JET reports as 'failed to
+optimize due to recursion'. **Nothing in PureBLAS is unstable there.**"
+
+Measured, not assumed — three bisects, each one full dogfood run:
+
+| variant | dual dogfood |
+|---|---|
+| master (no threading) | passes |
+| definitions present, call site removed from `gemm!` | **passes** |
+| full threading | fails (2 JET reports) |
+| full threading with `notify` and `yield` deleted | **passes** |
+
+So the cause is exactly those two scheduler calls, and every threading design has them. The repo's
+established remedy is to make the scheduler unreachable, which here would mean not threading at all.
+
+**The blast radius is wider than one item.** The full suite on this branch fails in exactly two places,
+both the same artifact with the same "2 JET report(s)" signature, and nothing else:
+
+- `test/dual_tests.jl:487` — `trmm!`/`trsm!` on `ForwardDiff.Dual`;
+- `test/strictmode_tests.jl:379` — the eigen family's `test_signatures`, 4 findings: `gehrd!`,
+  `ormhr!` and two more, all of which reach `gemm!` for their block updates.
+
+Everything else in the suite passes, including the new threaded-gemm items and the `:checks` dogfood.
+So the decision below is not about one awkward test; it is about whether a threaded `gemm!` may be
+reachable from routines that carry JET-backed type-stability guarantees.
+
+Three ways forward, and **the choice is the user's** because each one changes either a shipped
+guarantee or the milestone's shape:
+
+1. **Thread only at the public `gemm!` boundary** — route the 29 internal `gemm!` call sites in
+   `level3.jl` and `lapack/*` to `_gemm_core!`, which several already do deliberately. The dogfood
+   stays intact and threading becomes a decision each routine makes explicitly.
+   **Now priced, and it is expensive** (`bench/probes/lapack_thread_effect.jl`, frequency-locked, one
+   binary with `set_num_threads` as the only difference between arms, so the A/B is paired):
+
+   | op | n=256 | n=512 | n=1024 | n=2048 |
+   |---|---|---|---|---|
+   | potrf | 1.00 | 1.02 | 1.00 | 1.00 |
+   | getrf | 1.07 | 1.28 | 1.38 | **2.22** |
+   | geqrf | 1.00 | 1.40 | 1.24 | **1.45** |
+
+   Nothing regresses (worst cell 1.00), so this option would GIVE UP getrf 2.22× and geqrf 1.45× at
+   n=2048 to keep a lint clean about an artifact the repo already calls harmless. Note also that
+   **potrf gains nothing at any size** — it does not route its trailing update through `gemm!`, so it
+   needs its own splitter (syrk/trsm) regardless of which option is chosen.
+2. **Narrow the dogfood** for `trmm!`/`trsm!`, citing the recorded artifact. Cheapest, and it weakens
+   a real guarantee on a real routine — not something to do unilaterally.
+3. **Compile threading out unless a preference is pinned.** Matches the repo's existing pattern for
+   this artifact exactly, but the pin tier is the user's, and a default of "off at compile time" makes
+   the feature unreachable for anyone who does not pin.
+
+**Measured** (`bench/probes/gemm_thread_check.jl`, 5 threads on 5 physical cores, serial arm is
+`_gemm_core!` called directly in the same process — paired, not cross-run):
+
+| n | workers | speedup | | n | workers | speedup |
+|---|---|---|---|---|---|---|
+| 48 | 1 | 1.00 | | 384 | 5 | 2.67 |
+| 64 | 1 | 1.00 | | 512 | 5 | 3.36 |
+| 96 | 2 | 1.95 | | 768 | 5 | 3.67 |
+| 128 | 4 | 2.85 | | 1024 | 5 | **3.79** |
+| 192 | 5 | 2.60 | | 1536 | 5 | 3.13 |
+| 256 | 5 | 2.94 | | | | |
+
+Correctness 20/20 shapes (both transpose flags), and **0 B allocated** warm, threaded or not.
+
+**The mid sizes are NOT adjudicable from a single run.** Five runs of identical code, frequency-locked:
+n=128 spans 2.71–2.94, n=192 spans 2.50–2.97, n=256 spans 2.73–2.97, n=384 spans 2.67–3.04 — a **±10%
+band**, wide enough to bracket any plausible change. n≥512 is tight (512: 3.41–3.42, 768: 3.67–3.74,
+1024: 3.61–3.86). So judge a threading change on n≥512 and on the serial control, never on one
+mid-size reading; a "regression" at n=256 from a single pair of runs means nothing.
+
+**Three bugs found and fixed while building it**, all recorded because each is a trap anyone would hit:
+a bare spin barrier **deadlocked at 399% CPU** (`@spawn` gives no placement guarantee, two workers
+shared a thread); a stale event could make a worker **re-run the previous chunk over live output**
+(fixed by waiting in a loop around the generation, never on the wake); and a `sleeping`-flag
+optimisation that woke only announced workers **hung at `gen=524 done=0`** — deleted in favour of an
+unconditional notify, which cannot lose a wake.
+
+### Arena threading repair DONE (2026-09-19) — pin the driver, drop the depth guard
+
+`gemm!`/`_symm!` used to refuse to thread while any arena scope was live (`iszero(_arena().depth)`),
+which silently serialised the 16 routines whose L3 call sits inside their own `@scope` (gels!, getri!,
+trtri!, potri!, lauum, gehrd, pbtrf, gbtrf, …). Now `_gemm_threaded!` sets `Task.sticky` for the join
+and restores it; the arena stays per-thread. Decided by measurement, all on Zen4, `-t 6`:
+- `Task.sticky` across the join's shape: **0 of 200 000** yields migrated (unpinned control 151 919).
+- The alternative, `_ARENA` as `OncePerTask`: trmm! n=8 **+3.5%** (B/A 1.0346, SE 0.0041), null on
+  trmm 32/64, trsm 8/32/64, gemm 8/32/64 — so the pin wins on cost too.
+- The arena hazard had never been observed before; `bench/probes/arena_pin_control.jl` **forces** it:
+  pin OFF → the driver's scope exit ran on another thread and the next borrow on its old thread
+  overlapped a live one (131 064 elements); pin ON → 0, and the driver could not exit under the
+  occupying task (the LIFO property, observed).
+- Concurrency check under the pin, 24 tasks × 4 rounds vs serial: symm/gemm/getrf/geqrf/potrf and the
+  unblocked getri/trtri/potri/gels/dual trmm/dual trsm all **0/96**, with a forced positive control.
+- `m3` left `L3Workspace` for the per-task `_m3ws` (held across a public threaded `trmm!` by the dual
+  path — a role hazard the guard could never see); `_m3ws` is `@noinline` and a registered alloc
+  barrier so the static `gemm!` proof still holds.
+Side effect to know: a pinned task's yield hands its thread only to STICKY tasks queued there, so a
+`@spawn`ed task can no longer take the driver's thread mid-join (the old probabilistic race control
+went blind for exactly this reason and was replaced by a forced one). Per-thread ROLE owners stay
+per-task. Full write-up: `kb/findings/pureblas-arena-threading-driver-pin.md`.
+**Threaded ratios of the unblocked routines: see the targeted `pb_mt` cells recorded with this change.**
+
+### Still to do on the Julia side
+
+- The threshold `_MT_JOIN_CYCLES` is measured on Zen4 ONLY — req#8(b) needs Zen3 and Zen5
+  before it is trusted to extrapolate.
+- **Scaling is 55% efficient at n=192 and 73% at n=1024, and chunk imbalance is NOT the reason.**
+  Measured the actual split (`_NR = 8`, 5 workers): n=192 → 32/40/40/40/40 columns, 4% above ideal;
+  n=256 → 48/48/56/48/56, 9%; n=1024 and n=1536 → 1.6%. Nowhere near the 45% shortfall, so imbalance
+  is excluded. Fork-join is excluded too by arithmetic: 1.3 µs against 65 µs of per-worker work at
+  n=192 is 2%. The remaining candidate, NOT yet measured, is that a column split has **every worker
+  read and pack the whole of A** — at n=192 that is five copies of a 295 KB panel. A two-dimensional
+  split (m as well as n) is what would reduce it, and that is a build, not a tweak.
+- **Every blocked LAPACK driver now threads for free, and NONE of that is measured.** `potrf!`,
+  `getrf!`, `geqrf!` and the rest call `gemm!` for their trailing updates, so on a threaded process
+  those updates now split. That may be a large win or a loss to fork-join churn on small trailing
+  blocks; the pool claim makes it SAFE either way, but safe is not the same as good. Measure before
+  claiming anything about threaded LAPACK.
+- trsm/potrf: same splitter, different loop. Not started.
+- The gate (`bench/plots.jl`) is single-threaded by construction; threaded numbers need their own view.
 
 ## M5 — complex SIMD + multi-ISA dispatch (IN PROGRESS)
 
@@ -1559,14 +1760,14 @@ sparse Cholesky.
 ### Tooling backlog
 
 - **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
-  MEASURED on the 2026-09-03 fleet refresh: neuromancer, full rebuild (every arm interleaved). The rate
+  MEASURED on the 2026-09-03 fleet refresh: Zen5, full rebuild (every arm interleaved). The rate
   DECAYS through the sweep as it reaches larger `n` and the LAPACK ops, so quote an interval rate, never
   cells-done ÷ elapsed-since-launch:
     343 cells @ 10:23, 496 @ 11:42  ⇒  **1.94 cells/min over that interval**, vs ~4.0 averaged from the
     start — the early average overstates throughput by ~2× and understates the total by hours.
   At the interval rate the 930 cells take **~6-8 h** on that box. With 3 arms × 8 rounds a cell is ~24
   timing windows, so ~1.3 s per window at the later sizes. The `arms=pb` merge path is ~3× cheaper
-  (galen: 930 cells in ~86 min at a higher clock), but a *full* rebuild cannot use it — `plots.jl`
+  (Zen3: 930 cells in ~86 min at a higher clock), but a *full* rebuild cannot use it — `plots.jl`
   refuses a partial arm set on a full run, correctly, because it would drop the reference arms.
   The cost is real enough to discourage re-gating, which is the wrong incentive when the gate is the
   project's core contract. Directions, roughly by value:
@@ -1583,7 +1784,7 @@ sparse Cholesky.
      clock. A per-cell time budget would spend the sweep where the gate is actually in doubt.
   What NOT to do, both already established: do not parallelise within a box (a contended L3 skews the PB
   and reference windows unequally — the contention guard exists for this), and do not drop arms on a full
-  rebuild (that is the refusal above, and cross-run references are what made neuromancer's cache
+  rebuild (that is the refusal above, and cross-run references are what made Zen5's cache
   unusable in the first place).
 
 ### Wishlist

@@ -160,10 +160,10 @@ function _trd_grow!(ws::_TRDWork{T, R}, n::Int, nb::Int) where {T, R}
 end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
-const _TRDWS_F64 = Base.OncePerThread{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})
-const _TRDWS_F32 = Base.OncePerThread{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
-const _TRDWS_C64 = Base.OncePerThread{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
-const _TRDWS_C32 = Base.OncePerThread{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
+const _TRDWS_F64 = Base.OncePerTask{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})
+const _TRDWS_F32 = Base.OncePerTask{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
+const _TRDWS_C64 = Base.OncePerTask{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
+const _TRDWS_C32 = Base.OncePerTask{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
 @inline _trdws(::Type{Float64}) = _TRDWS_F64()
 @inline _trdws(::Type{Float32}) = _TRDWS_F32()
 @inline _trdws(::Type{ComplexF64}) = _TRDWS_C64()
@@ -1228,7 +1228,7 @@ end
 # planar route on LAPACK (ForwardDiff/src/dual.jl `_eigvals`: `eigen` of the value plane, then
 # `diag(Q'·A_p·Q)` as two full gemms), while the dual-arithmetic path here ran the scalar generic
 # reduction (a `symv!` plus a rank-2 update per column, neither with a SIMD arm on a pair) — it fell from
-# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, galen).
+# 2.14× at n=32 to 0.68× at n=256 against it (bench/probes/dual_syev_decomp.jl, Zen3).
 #
 # CLUSTERS. The simple-eigenvalue formula needs q_i determined, which it is not inside a cluster of
 # numerically equal eigenvalues: the computed basis of that eigenspace is an arbitrary rotation, and the

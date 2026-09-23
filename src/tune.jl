@@ -24,7 +24,7 @@ function _tuning_fingerprint()
         # THE TOOLCHAIN IS PART OF THE MACHINE, for tuning purposes. Every pinned value is a
         # MEASURED crossover, and a crossover is a property of the emitted code as much as of
         # the silicon — change the compiler and the value can move while the hardware has not.
-        # Found 2026-09-12: the fleet went 1.13.0-rc4 -> 1.13.0 (LLVM 20.1.8), and wintermute's
+        # Found 2026-09-12: the fleet went 1.13.0-rc4 -> 1.13.0 (LLVM 20.1.8), and Zen4's
         # five pins kept reporting `is_tuned() = true` because the fingerprint saw only cache
         # sizes. The pins were stale and nothing said so. Julia's minor version and the LLVM
         # version are the two that move codegen; the patch level is deliberately excluded so a
@@ -90,7 +90,7 @@ const _TUNABLE_KEYS = (
     "brd_nb", "sytrf_cmult",
     # written by bench/calibrate.jl's KNOBS but previously unlisted here:
     "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
-    # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole wintermute sweep.
+    # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole Zen4 sweep.
     # `gemvt_percol_window` above is the KNOB's name in `KNOBS`, not a preference
     # key — that calibrator writes `gemvt_percol_amin`/`gemvt_percol_xmax`, and the
     # perscan calibrator writes `gemvt_perscan`. None of those three were listed, so
@@ -266,7 +266,7 @@ function tune!(;
         # plus a stale fingerprint makes `bench/plots.jl`'s `save_cache` refuse EVERY write, and
         # re-running tune!() can never clear it because it pins nothing again.
         #
-        # That deadlock happened on wintermute 2026-09-12: five pins from an earlier tune, the
+        # That deadlock happened on Zen4 2026-09-12: five pins from an earlier tune, the
         # fingerprint extended with the toolchain (jl/LLVM), tune!() re-run, every knob tied, so
         # `tuned_for` kept its pre-toolchain value. A CL1 sweep then printed "merged 56 cells" and
         # `save_cache` silently refused with "CACHE NOT WRITTEN — tuned_for is STALE". The measurement

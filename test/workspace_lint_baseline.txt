@@ -29,12 +29,12 @@
 #     findings. Triple-quoted literals are now skipped wherever they sit; only a column-0 `"""`/`raw"""`
 #     stops attribution.
 
-# --- gemm packing: `_gemm_core!`'s gpackA/gpackB claim is `_gemm_scratch(T, m*k, 0)` in the `tA` arm of
-# `if _strided1(A) && _strided1(B) && _use_unpacked(m,n,k)` (gemm.jl:2828/2844); `_gemm_blocked!` is that
-# `if`'s ELSE arm (:2858). Never both on one path. `_gemm_blocked!` is a pack+microkernel loop, not a
-# nested claimant.
-L3Workspace.gpackA  _gemm_core! -> _gemm_blocked!
-L3Workspace.gpackB  _gemm_core! -> _gemm_blocked!
+# --- gemm packing: these entries are GONE, and by a change of MECHANISM rather than a re-judgement.
+# `gpackA`/`gpackB` are no longer `L3Workspace` fields: cooperative A-packing meets the other workers
+# at a barrier while the packed B panel is live, so a per-thread owner could be taken by a task that
+# lands on the thread during that yield. They moved to `_gpackws`, a per-TASK owner (workspace.jl),
+# which is what `test/yield_lint.jl` prescribes instead of baselining a yielding kernel. A field-keyed
+# lint has nothing left to pair, so the pairs are not merely unused — they cannot be written.
 
 # --- 2026-09-04, stage 2 of the arena conversion: the three
 #       L3Workspace.lacn2{s,v,x}  _lacn2_estimate -> _lacn2_estimate
@@ -106,10 +106,16 @@ SVDWorkspace.labrd_tmp  gesvd_vals! -> _svals_core!
 # borrows in three scopes are three disjoint bump ranges whether or not they are simultaneous, which is
 # the property the whole conversion buys. RE-DERIVE THIS, do not re-read it, if `padf` ever returns.
 
-# --- Strassen pool: `str` is ONE field holding a POOL of matrices, and the re-entrancy is BY DESIGN.
-# `_gemm_strassen!` (gemm.jl:2669) holds pad slots 1-3 via `_strassen_pad_scratch` across
-# `_strassen_rec!`, which takes ten slots at base `3 + level*10` (`_strassen_lvl_scratch`,
-# workspace.jl:417) across seven recursive calls at level+1. Disjointness is the slot-index arithmetic in
-# `_str_fit!` (workspace.jl:406), not the field split, so a field-keyed lint cannot adjudicate it and must
-# not try. If that indexing changes, this baseline entry is NOT evidence of anything — read it again.
-L3Workspace.str  _gemm_strassen! -> _strassen_rec!
+
+# --- Strassen pool: the entry `L3Workspace.str  _gemm_strassen! -> _strassen_rec!` is GONE, and by a
+# change of MECHANISM rather than a re-judgement. `str`/`strbt` are no longer `L3Workspace` fields:
+# the recursion hands each leaf to the threaded classical path and so YIELDS while holding its level
+# slots, which a per-thread owner cannot survive — a task landing on the vacated thread and losing
+# the pool claim runs the same recursion off the same slots. They moved to `_strws`, a per-TASK owner
+# (workspace.jl), which is what `test/yield_lint.jl` prescribes instead of baselining a yield. A
+# field-keyed lint has nothing left to pair, so the entry is not merely unused — it cannot be written.
+#
+# The re-entrancy it recorded is unchanged and still by design: `_gemm_strassen!` holds pad slots 1-3
+# across `_strassen_rec!`, which takes ten slots at base `3 + level*10` across seven recursive calls.
+# Disjointness is the slot-index arithmetic in `_str_fit!`, not the ownership — read that if the
+# indexing ever changes.

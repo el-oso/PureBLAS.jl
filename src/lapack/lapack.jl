@@ -409,7 +409,7 @@ end
 #
 # Native vs lever, all three boxes on 1.13.0-rc4, freq-locked, gain of native (µs measured, see
 # bench/probes/potrfU_native_vs_lever.jl):
-#     n        galen W=4    wintermute W=8   neuromancer W=8
+#     n        Zen3 W=4    Zen4 W=8   Zen5 W=8
 #     512        +5.6%          −0.2%            −0.7%
 #     768        +6.9%          +2.3%            −1.9%
 #     1000      +10.6%          +0.7%            +0.7%
@@ -421,7 +421,7 @@ end
 # This is a Derive-tier re-argument (a premise was falsified, so the criterion changed), NOT a threshold
 # nudge — the old comment's "do not re-chase the crossover" was right about nudging it, and the two
 # force-hook checks before the trsm fix both confirmed the lever won. What changed is the code beneath.
-@inline _potrf_unative_min(::Type{T}) where {T} = _chol_faer_base(T)
+@inline _potrf_unative_min(::Type{T}) where {T} = _chol_rl_max(T)
 # Forceable — and the first thing the hook bought was a FALSIFICATION of the suspicion that prompted it.
 #
 # The worry: on Zen3 L3=32MiB puts the switch at 2048, so potrfU@1000 takes the LEVER and reads 0.921
@@ -440,16 +440,16 @@ end
 # RE-CHECKED 2026-09-08 on 1.13.0-rc4/LLVM 20 — because both inputs to the verdict above had changed
 # (the toolchain, and the LEVER's inner lower path, which got 29-43% faster on AVX2 at 0f1cc14). The
 # DIRECTION inverted; the MAGNITUDE does not justify moving anything. Gain of native over lever, µs:
-#     n        galen        wintermute      neuromancer
+#     n        Zen3        Zen4      Zen5
 #     512     −0.7%          +0.6%           −0.8%
 #     768     +1.4%          −0.3%           +1.2%
 #     1000    +1.4%          +3.8%           −0.2%
 #     1500    +6.5%          (both native)   (both native)
-# At the BINDING cells (n=1000 on galen and neuromancer) that is +1.4% and −0.2% — inside this fleet's
+# At the BINDING cells (n=1000 on Zen3 and Zen5) that is +1.4% and −0.2% — inside this fleet's
 # ~1-2% run-to-run floor. So the conclusion stands on magnitude even though its 2026-08-28 supporting
 # numbers (lever 0.922 vs native 0.891) no longer reproduce. Still do not re-chase it.
 #
-# AND THE REAL BAR IS NOT THE ARM CHOICE. Per-arm times, galen n=1000 (µs, from the v3 cache):
+# AND THE REAL BAR IS NOT THE ARM CHOICE. Per-arm times, Zen3 n=1000 (µs, from the v3 cache):
 #     potrf  (lower)   aocl 7950.7   openblas 7629.4   pb 7103.6  -> 1.074 PASS
 #     potrfU (upper)   aocl 6749.9   openblas 7781.0   pb 7710.9  -> 0.875 FAIL
 # AOCL's UPPER is 15% faster than AOCL's own LOWER, while OpenBLAS's upper is slightly slower than its
@@ -467,87 +467,6 @@ end
 # level's borrow at once (arena.jl's hole (b), measured 98 KB → 3.05 MB over 16 levels). The leaves are
 # reached STRICTLY SEQUENTIALLY, each finishing before the next begins, so ONE `base`-sized pad serves
 # all of them; the caller sizes it for the largest possible leaf.
-# ── Left-looking blocked native-upper Cholesky (netlib dpotrf('U') structure) ───────────────────────
-# WHY THIS SHAPE. The halving D&C driver below splits its flops roughly 50/50 between trsm and syrk;
-# left-looking puts ~80% of them in ONE gemm. Per block column j of width jb, netlib does
-#     syrk('U','T')  A(j:j+jb, j:j+jb) -= A(1:j-1, j:j+jb)ᵀ·A(1:j-1, j:j+jb)
-#     factor the jb×jb diagonal block
-#     gemm('T','N')  A(j:j+jb, j+jb:n) -= A(1:j-1, j:j+jb)ᵀ·A(1:j-1, j+jb:n)
-#     trsm('L','U','T')  A(j:j+jb, j+jb:n) = R11⁻ᵀ·(that)
-# and in COLUMN-MAJOR every one of those operands is a contiguous column panel — which is the half of
-# the AOCL-asymmetry hypothesis that survived: AOCL's upper is 15% faster than its own lower on Zen3
-# while OpenBLAS's upper is slightly SLOWER, and left-looking lower would need stride-lda row strips
-# where upper does not.
-#
-# ⛔ MEASURED AND FALSIFIED 2026-09-08 — DO NOT WIRE THIS IN, AND DO NOT REBUILD IT. Kept only as the
-# evidence. galen (Zen3, rc4, freq-locked), left-looking vs the shipped halving D&C driver, µs:
-#     n        512    768   1000   1024   1500    2048
-#     halving 1028.7 3188.6 6982.7 7392.3 22632.9 56023.1     43.5-51.1 GF
-#     left-lk 1035.5 3261.6 7230.5 7803.5 25249.4 57537.1     43.2-49.8 GF
-#     ll/hv    0.993  0.978  0.966  0.947   0.896   0.974
-# It loses at every size with the derived nb. An nb sweep at n=1000 shows the derivation is part of it
-# (it picks 64; 96-128 is the optimum at 6840.6 µs), and at nb=96 left-looking does edge ahead by 2.1%
-# — which would move potrfU on galen from 0.932 to ~0.952, still nowhere near the 0.995 gate.
-#
-# THE PREMISE IS WHAT DIED, and it is the useful part. The argument was "move ~80% of the flops from
-# trsm/syrk into gemm". But the two drivers run at the SAME RATE — 43.5-51.1 GF against 43.2-49.8 — so
-# the halving driver is already achieving gemm rate and there are no flops to rescue. AOCL's 15%
-# upper-over-lower advantage on Zen3 therefore does NOT come from this structure; whatever it is, it is
-# not "more of the work is in gemm". Anyone re-opening potrfU should start by finding out what AOCL's
-# upper actually does differently, not by restructuring ours again.
-#
-# ⚠ THE PAYOFF IS NOT ESTABLISHED. The whole argument is "move flops from trsm/syrk into gemm", so it
-# only pays if gemm is faster than what those already achieve. MEASURED on galen at the panel shape
-# (bench/probes/gemm_tn_skinny.jl): gemm('T','N') runs 51.2 GF at M=64 and 54.6 at M=128, against the
-# fused trsm's 50.3 GF at k=500 and the lower path's 46.9 GF whole-factorization average. That is a
-# COIN FLIP against the ~53 GF this needs, and the orientation half of the hypothesis was REFUTED for
-# our gemm — ('N','T') at the lower panel shape runs 51.4-53.1 GF, indistinguishable from ('T','N'), so
-# nothing is inherited from operand contiguity alone. Gate this against the halving driver before
-# wiring it into dispatch; it is written to be measured, not assumed.
-#
-# `nb` PDM: Derive — panel residency. The live panel A(1:j-1, j:j+jb) is (j-1)×jb and is re-read by
-# both the syrk and the gemm, so it wants to sit in L2: jb·n·sizeof(T) ≤ _L2_BYTES. Clamped below by
-# the register tile (a panel narrower than MR wastes the microkernel) and above by the faer base, past
-# which the diagonal-block leaf stops being the cheap case.
-@inline function _chol_ll_nb(::Type{T}, n::Int) where {T}
-    fit = _L2_BYTES ÷ (max(n, 1) * sizeof(T))
-    return clamp(fit & ~7, 8, min(_chol_faer_base(T), 128))
-end
-
-# Returns 0, or the (global, 1-based) index of the leading minor that is not positive definite.
-function _chol_ll_upper_f64!(A, n::Int, pad, nb::Int = _chol_ll_nb(Float64, n))
-    j = 1
-    @inbounds while j <= n
-        jb = min(nb, n - j + 1)
-        d = view(A, j:(j + jb - 1), j:(j + jb - 1))
-        if j > 1                                     # trailing-panel updates (k = j-1 columns above)
-            syrk!(d, view(A, 1:(j - 1), j:(j + jb - 1)); uplo = 'U', trans = 'T', alpha = -1, beta = 1)
-        end
-        f = 0                                        # factor the diagonal block via the lever leaf
-        try
-            _potrf_upper_lever_real!(d, jb, pad)
-        catch e
-            e isa PosDefException || rethrow()
-            f = e.info
-        end
-        f == 0 || return j - 1 + f                   # lift to a global index
-        if j + jb <= n
-            R = view(A, j:(j + jb - 1), (j + jb):n)
-            if j > 1
-                # `_gemm_core!`, not `gemm!`: the public entry gates on `C isa StridedMatrix`, which a
-                # `PtrMatrix` (what an arena borrow hands back) is not, so it would silently drop to the
-                # generic kernel — the wire-the-fastest-path miss gbtrf.jl documents at its own gemm.
-                _gemm_core!(
-                    R, view(A, 1:(j - 1), j:(j + jb - 1)), view(A, 1:(j - 1), (j + jb):n),
-                    -1.0, 1.0, true, false, false, false
-                )
-            end
-            trsm!(R, d; side = 'L', uplo = 'U', transA = 'T', diag = 'N', alpha = true)
-        end
-        j += jb
-    end
-    return 0
-end
 
 function _chol_hyb_upper_f64!(M, n::Int, base::Int, pad)
     if n <= base
@@ -739,11 +658,11 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
         # handle reaches `_chol_hyb_upper_f64!` (which only forwards it down and into the lever),
         # `_potrf_upper_lever_real!`, and from there `_tri_upper_to_lowerT!`/`_tri_lowerT_to_upper!`
         # (raw pointer + ld) and `_potrf_f64_lower!(view(M,1:n,1:n))` — whose own callees
-        # (`_chol_panel_f64!`, `_chol_hyb_f64!`, `trsm!`, `syrk!`, `_chol_rl_f64!`) take pointers or
+        # (`_chol_hyb_f64!`, `trsm!`, `syrk!`, `_chol_rl_f64!`) take pointers or
         # pack into their own buffers and store no operand. Nothing is captured by a closure and no
         # handle is returned, so nothing outlives either block.
         if n >= _fh_potrf_unative_min(T)
-            fb = _chol_faer_base(T)
+            fb = _chol_rl_max(T)
             # ONE pad for every leaf: the halving recursion bottoms out at n ≤ fb and the leaves run
             # strictly one after another, so the largest leaf (min(n, fb)) sizes the borrow and each
             # leaf slices `view(pad, 1:n_leaf, 1:n_leaf)` out of it. ld stays `_offway_ld(·, T)`.
@@ -828,7 +747,6 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # moves n=1024…4096 potrf by <0.5% (noise; _CHOL_MC follows via the derived formula below). The large-n
 # residual is the structural panel-major streaming gap ([[pureblas-potrf-campaign]]), not the block size,
 # so 128 is a correct µarch-invariant (a formula would add spurious variation for zero gain). Knob-able.
-@inline _chol_block(::Type{T}) where {T} = 128   # µarch-invariant NB (byte-relative tuning deferred; knob-able)
 # Small-n (≤ _CHOL_FAER_BASE) block params. The left-looking base kernel is only ~24–31% of FMA peak
 # (vs BLASFEO's 45–56%: kb pureblas-potrf-campaign) — it's the small-n bottleneck. Blocking SMALL routes
 # the bulk through the FMA-efficient rank-k trailing (_trsm_right/_syrk) and confines the slow base to
@@ -1217,7 +1135,22 @@ function _chol_rl_f64!(p::Ptr{T}, n::Int, ld::Int, block_size::Int, threshold::I
         if m > 0
             p10 = _cvptr(p, j + bs + 1, j + 1, ld); p11 = _cvptr(p, j + bs + 1, j + bs + 1, ld)
             _trsm_right_lower_f64!(_cvptr(p, j + 1, j + 1, ld), p10, bs, m, ld)
-            _syrk_lower_f64!(p11, p10, m, bs, ld)
+            # THE TRAILING UPDATE GOES THROUGH THE PUBLIC `syrk!`, WHICH THREADS. This driver owns
+            # every size at or below `_chol_rl_max`, so a private kernel here means potrf does not
+            # thread at all there — 1.00x at n=1024 on AVX-512, against 2.73x on AVX2, whose smaller
+            # base sends the same size through this same public path. The fleet was already running
+            # both designs and the public one won.
+            #
+            # It costs nothing serially: the private kernel it replaces measured 1.00-1.06x of this
+            # one on Zen4 and 0.95-1.03x on Zen5, at the shapes issued here and at the padded leading
+            # dimension `_chol_pad` gives them. (Measured at a power-of-two `ld` the private kernel
+            # looks 21-30% worse, but potrf never runs at one.)
+            #
+            # The trsm above KEEPS its private kernel: that one measures 1.14-1.25x of the public
+            # `trsm!` on Zen4, and it is 11-20% of the work here against syrk's 80-89%, so routing it
+            # too would spend ~2.4% of the serial budget to thread a fifth of the work.
+            syrk!(PtrMatrix{T}(p11, m, m, ld), PtrMatrix{T}(p10, m, bs, ld);
+                uplo = 'L', trans = 'N', alpha = -one(T), beta = one(T))
         end
         j += bs
     end
@@ -1227,11 +1160,12 @@ end
 # A power-of-two leading dimension aliases columns into the same cache sets (the LDA=2^k conflict,
 # ~1.3–1.5× slower at n≥512). When A's stride is a po2, factor in a padded (ld+8) scratch and copy
 # back — bit-identical, ld is pure addressing. Reusable buffer via _chol_pad (single-thread; MT deferred).
-# _chol_faer_base: ≤ this → faer rl kernels; above → hybrid halving routing the O(n³) trailing through the
-# cache-blocked gating syrk!/trsm!. AVX-512 (32 regs) rides the faer syrk to 1024 (n=1024 0.70→0.87,
-# n=2048 0.85→0.91 on the hybrid; W=8 stays off the AVX2 panel driver). AVX2 (16 regs) never halves — its
-# large-n path is the fused panel driver (n>_CHOL_RL_MAX), so its base = _CHOL_RL_MAX (all n≤224 → rl32).
-# AVX2: block-small rl32 (confined slow base + faer rank-k trailing) beats the cache-blocked panel driver
+# _chol_rl_max: ≤ this → faer rl kernels; above → hybrid halving routing the O(n³) trailing through the
+# cache-blocked gating syrk!/trsm!. EVERY ISA uses the same base, `_chol_rl_max`, whose derivation is
+# below; the faer leaf is the right kernel where the halving recursion's per-level overhead would
+# dominate, and measurably wrong above that (20% better than halving at n=64, 4% at n=128, and never
+# ahead past 256 — pushing the base higher costs up to 34% threaded, see the table at `_chol_rl_max`).
+# The rl32 block-small argument that fixes the value:
 # until the trailing submatrix outgrows L2 — measured Zen3 crossover 224 (rl 37.8 vs panel 33.6) → 256
 # (rl 28.2 vs panel 34.5). Bound: n² · 8 ≲ L2 ⇒ n ≲ √(L2/8) ≈ 256; the working panel needs headroom so
 # 7⁄8 of that ≈ 224 → √(_L2_BYTES/8)·7⁄8 (Zen3 512 KB L2 → 224 EXACT). NB: the 7⁄8 is a ONE-POINT FIT to
@@ -1240,8 +1174,24 @@ end
 # with ≠512K L2 before trusting the scaling (a bare literal 224 has the same epistemic content today).
 # W=8 is a DIFFERENT criterion — the hybrid-halving faer base (32-reg), not the √-L2 crossover (which would
 # give ~317). 128 is µarch-invariant across the AVX-512 fleet (Zen4+Zen5 both gate potrf with it) → kept flat.
+# ≤ this → the faer right-looking kernels own the whole problem; above it → halving, with the O(n³)
+# trailing work going through the cache-blocked `trsm!`/`syrk!`.
+#
+# ONE VALUE FOR EVERY ISA. The AVX-512 arm used to be 1024, so a 32-register box handed everything up
+# to n=1024 to the faer leaf. That was measured and true when the leaf's own syrk was the faster one;
+# it is not any more. A/B at the shipped base against 64, three boxes, six workers and one:
+#
+#            n=256   n=512   n=1024   n=2048      (halving / faer, >1 means halving wins)
+#   Zen4 1t   1.02    1.03     1.02     1.01
+#   Zen4 6t   1.07    1.16     1.06     1.02
+#   Zen5 1t   1.01    1.03     1.02     1.00
+#   Zen5 6t   1.34    1.24     1.11     1.02
+#   Zen3      1.00    1.00     1.00     1.00      (already at 224; barely reaches the leaf)
+#
+# Halving is never slower and is up to 34% faster, because the trailing work it hands off is threaded
+# and cache-blocked while the leaf's is neither. Zen3 is flat precisely because its base was already
+# small — the two boxes that used the leaf are the two that lost by it.
 @inline _chol_rl_max(::Type{T}) where {T} = _NVREG == 32 ? 128 : round(Int, sqrt(_L2_BYTES / sizeof(T)) * (7 / 8))
-@inline _chol_faer_base(::Type{T}) where {T} = _NVREG == 32 ? 1024 : _chol_rl_max(T)
 # Pad when columns alias L1 sets: Zen L1 = 64 sets × 64 B, so stride·8 a multiple of 64·64=4096 B
 # (stride % 512 == 0) maps every column to the same sets. %256 = half-period (2 cols/set), %128 =
 # quarter-period (4 cols/set) — both thrash L1. But the pad is an n² copy round-trip, so it only wins
@@ -1307,7 +1257,7 @@ end
 # holds MR·NC accumulators (12) plus NC + NC(NC−1)/2 = 10 loop-invariant broadcasts (`vd0..vd3`,
 # `vl10..vl32`) = 22 live vectors against 16 ymm, so AVX2 spills where AVX-512 (32 zmm) does not:
 #     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
-#     Zen3      Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
+#     Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
 # invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
 #     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
@@ -1561,108 +1511,20 @@ end
 # dimensions were always the point (an ld that cannot collide in an L1 set), and they are reproduced
 # EXACTLY at each borrow; what changes is that the ld is now a property of THIS call instead of of
 # whatever size an earlier, larger call grew the field to.
-# _chol_mc: trsm row chunk — the mc×NB T slab the k-repasses re-read stays L2-resident (slab ≤ L2/2).
-@inline _chol_mc(::Type{T}) where {T} = max(_vwidth(T), (_L2_BYTES ÷ 2) ÷ (_chol_block(T) * sizeof(T)))
 
-# ARENA ESCAPE AUDIT for `Tb` (was `_chol_t(T, R)`) and `D` (was `_chol_d(T)`). Both are borrowed ONCE,
-# at this driver's entry and ABOVE its panel `while` loop — the loop is the reason the borrows cannot sit
-# where the work is: one per panel would consume Σ(panels) of arena for a buffer that is loop-invariant.
-# The scope spans the whole factorization. `Tb`/`D` reach only: `unsafe_copyto!` and the fused leaves
-# `_chol_rl_f64!`, `_trsm_rl_split_f64!`, `_syrk_lower_split_f64!` — all four take RAW POINTERS (`pT`,
-# `pD`) plus an ld and never see the handle at all — and `syrk!(view(A, …), view(Tb, 1:m, 1:bs))` on the
-# big-trailing arm, where `view(::PtrMatrix, r, r)` stays a `PtrMatrix` and the packing path copies out
-# of it. Nothing stores either handle, nothing captures them, neither is returned. `A` is the caller's
-# matrix and is untouched by the arena.
-#
-# THE TWO LEADING DIMENSIONS, REPRODUCED:
-#   ldT = R, computed HERE exactly as before — `(n+8)%128==0 ? n+16 : n+8`. Left as the in-place literal
-#     rather than swapped for `_offway_ld(n, T)`: the two agree identically at Float64 ((n+8)*8 % 1024 == 0
-#     ⟺ (n+8) % 128 == 0) but NOT at Float32, and this driver is on the gated spotrf AVX2 path, so the
-#     helper would be an unmeasured ld change there. What the borrow DOES fix is that `ldT` used to be
-#     `size(_chol_t(…), 1)` — the GROWN field's row count — so a call following a larger one ran at that
-#     call's ld and silently lost the alias-free property this line exists to provide. `ldT = R` now.
-#   ldD = _chol_block + 8, the field's exact shape ((nb+8)×nb); nb is a compile-time constant, so this
-#     one never grew and the borrow is byte-for-byte the old buffer.
-function _chol_panel_f64!(A, n::Int, blk::Int = _chol_block(eltype(A)))
-    T = eltype(A)
-    lda = stride(A, 2)
-    nb = _chol_block(T)
-    R = (n + 8) % 128 == 0 ? n + 16 : n + 8                    # keep ldT itself alias-free
-    @scope arn begin
-        Tb = borrow!(arn, T, R, nb); ldT = R                   # panel workspace, R×NB
-        D = borrow!(arn, T, nb + 8, nb); ldD = nb + 8          # diag block scratch
-        GC.@preserve A Tb D begin
-            pa = pointer(A); pT = pointer(Tb); pD = pointer(D)
-            j = 0
-            @inbounds while j < n
-                bs = min(blk, n - j)
-                pjj = _cvptr(pa, j + 1, j + 1, lda)
-                for c in 0:(bs - 1)                               # diag block lower triangle → D (L1/L2)
-                    unsafe_copyto!(pD + (c * ldD + c) * sizeof(T), pjj + (c * lda + c) * sizeof(T), bs - c)
-                end
-                let f = _chol_rl_f64!(pD, bs, ldD, _chol_sb(T), _chol_sth(T))
-                    f == 0 || throw(PosDefException(j + f))    # j = 0-based block offset, f = column within it
-                end
-                for c in 0:(bs - 1)                               # factored diag back (tiny)
-                    unsafe_copyto!(pjj + (c * lda + c) * sizeof(T), pD + (c * ldD + c) * sizeof(T), bs - c)
-                end
-                m = n - j - bs
-                if m > 0
-                    p21 = _cvptr(pa, j + bs + 1, j + 1, lda)
-                    i0 = 0                                    # fused panel solve → T, MC row chunks
-                    while i0 < m
-                        mc = min(_chol_mc(T), m - i0)
-                        _trsm_rl_split_f64!(pD, ldD, p21 + i0 * sizeof(T), lda, pT + i0 * sizeof(T), ldT, bs, mc)
-                        i0 += mc
-                    end
-                    p22 = _cvptr(pa, j + bs + 1, j + bs + 1, lda)
-                    if m * bs * sizeof(T) <= _L2_BYTES ÷ 2   # T slab L2-resident: fused inline syrk
-                        _syrk_lower_split_f64!(p22, lda, pT, ldT, m, bs)
-                    else                                      # big trailing: cache-blocked syrk! reads T
-                        syrk!(
-                            view(A, (j + bs + 1):n, (j + bs + 1):n), view(Tb, 1:m, 1:bs);
-                            uplo = 'L', trans = 'N', alpha = -1, beta = 1
-                        )
-                    end
-                    for c in 0:(bs - 1)                           # stream the factor back to A21 ONCE
-                        unsafe_copyto!(p21 + c * lda * sizeof(T), pT + c * ldT * sizeof(T), m)
-                    end
-                end
-                j += bs
-            end
-        end
-    end
-    return A
-end
-
-function _potrf_f64_lower!(A, base::Int = _chol_faer_base(eltype(A)))
+function _potrf_f64_lower!(A, base::Int = _chol_rl_max(eltype(A)))
     T = eltype(A)
     n = size(A, 1)
     n == 0 && return A
-    # ⚠ THE AVX2 EARLY RETURN TO `_chol_panel_f64!` LIVED HERE AND WAS REMOVED 2026-09-08. Its comment
-    # claimed "the fused panel driver beats the hybrid/whole-pad path at EVERY size (measured Zen3,
-    # 200–4000)". That was measured under Julia 1.12 / LLVM 18 and INVERTED on 1.13.0-rc4 / LLVM 20 —
-    # the same stale-provenance failure as gbtrf's nb step, on the same day.
-    #
-    # MEASURED on galen (Zen3, rc4, freq-locked, bench/probes/potrf_galen_n256.jl), panel vs the padded
-    # hybrid, µs:
-    #     n        256      320      384      512      768
-    #     panel  223.77   466.79   816.06  1498.76  4018.71
-    #     hybrid 158.54   265.75   474.99  1025.26  3438.43
-    #     panel   −29.2%   −43.1%   −41.8%   −31.6%   −14.4%
-    # and the hybrid arm was HANDICAPPED (it allocated its scratch inside the timed region, which the
-    # arena path does not), so the real margin is wider.
-    #
-    # The symptom in the gate was a CLIFF, not a po2 dip: PB holds 44–45 GF/s and beats OpenBLAS
-    # 1.54–1.58× for n ≤ `_chol_rl_max` (=224 on galen), then falls to ~24 GF/s the moment n crosses into
-    # the panel driver — 0.845 @240, 0.767 @256, 0.618 @384. Two paths, one of them half the speed of the
-    # other, with the crossover in the middle of the gate ladder.
-    #
-    # AVX2 now falls through to the same hybrid (padded where the stride needs it) that AVX-512 uses.
-    # `_chol_panel_f64!` is retained, unreferenced, pending a re-measure on a box still on LLVM 18.
-    # (The line that used to sit here — "AVX2 reaches here only for n ≤ _CHOL_RL_MAX" — is no longer
-    # true now that the panel-driver early return is gone; AVX2 reaches here at every n. What survives
-    # of it is the rl32 pad exemption, restated on the condition above.)
+    # EVERY ISA REACHES THIS HYBRID AT EVERY n. A second driver — a fused panel factorization —
+    # used to take AVX2 above `_chol_rl_max`, on a measurement that did not survive its toolchain:
+    # under 1.12/LLVM 18 it beat the hybrid at every size, and under 1.13/LLVM 20 it lost to it by
+    # 14-43% on Zen3. The gate symptom was a CLIFF rather than a po2 dip — 44-45 GF/s up to
+    # `_chol_rl_max`, then ~24 GF/s the moment the other driver took over, 0.845 at n=240 and 0.618
+    # at n=384. Two paths, one half the speed of the other, crossing in the middle of the gate
+    # ladder. It was unwired in September and deleted once the threaded numbers made the case final:
+    # on Zen4 it is 2-3% faster than this hybrid single-threaded, and threads to 1.65x at n=1024
+    # against this one's 2.49x, because its trailing work never reaches the pool.
     # ARENA ESCAPE AUDIT for `Mw` (was `_chol_pad(T, R, n)` + `view(b, 1:n, 1:n)`). Borrowed ONCE in this
     # branch — the only place it is needed — and the scope spans the copy-in, the factorization and the
     # copy-back. `_potrf_f64_lower!` is not recursive; its callers are `potrf!` and

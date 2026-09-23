@@ -12,10 +12,27 @@
 # value into non-inlined kernels with no heap box, and their getindex/setindex are unsafe_load/store, so
 # the whole call graph stays trim-clean.
 #
-# STAGE 1 (2026-09-04): the 37 FIXED-SIZE small roles are converted — `_dlaexc!`, `_syl_dlasy2`,
-# `_hgeqz!`, `_tgs_tgsy2!` and `_dtgex2_big!` now open a `@scope` and borrow; their nine accessors and
-# the 37 fields are deleted (L3Workspace: 180 → 143 fields). Everything that GROWS with n is still
-# field-owned. Conversion continues staged, riskiest last.
+# WHERE THE CONVERSION ACTUALLY ENDED. Stage 1 (2026-09-04) took the 37 fixed-size small roles and
+# left 143 fields, and this note used to stop there, saying "conversion continues staged, riskiest
+# last" — which reads as work in progress. It is not: **173 of the original 180 fields are now
+# arena-borrowed and `L3Workspace` is down to SEVEN.**
+#
+# Those seven are not leftovers, they are a decision, recorded in workspace.jl: they are the gemm and
+# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `str`, `strbt` — `m3` left for `_m3ws`, see the
+# threading note in workspace.jl). They stay because they are
+# touched on EVERY `gemm!` call — the one frequency at which a bump-allocate could cost more than a
+# const-dispatched field load — because they are genuinely shared allocator state rather than
+# per-routine scratch, and because `str` is a pool whose disjointness is slot-index arithmetic across
+# seven recursive Winograd children, which this file's scope model cannot express.
+#
+# Converting the SIX that remain has NOT been decided and would need its own gate run.
+#
+# The seventh, `m3`, was NOT a deliberate hold — it was a live hazard and is now fixed. `_trmm_dual!`
+# and `_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes; public `trmm!`
+# threads and its join yields, and there is no arena scope on that path, so the depth guard could not
+# help. A per-thread buffer held across that join is the shape that measured `getrf!` wrong 20/96. It
+# is now `_m3ws`, a per-task owner split OUT of `L3Workspace` so the pack buffers keep their cheap
+# per-thread lookup. See the threading note in workspace.jl.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
@@ -108,20 +125,59 @@ struct ArenaScope
 end
 
 # GKH ownership: one const owner, resolved at compile time, no runtime lookup.
-# Multithreading is deferred by standing rule, and the per-task swap is deliberately NOT taken here: it is
-# one line later (`_arena() = _ARENA_TASK()` over a `Base.OncePerTask`), but it measures 9-12 ns per entry,
-# and workspace.jl:58-61 records +7.5 ns being REJECTED as 7.4% of trmm! at n=8. Buying thread safety we
-# cannot yet use, at a price the gate already refused, is the wrong trade today.
-# BUT STATE THE COST HONESTLY: `_l3ws` is process-global too, so this is not a regression in KIND — it is
-# one in DEGREE. Interleave two tasks and the arena's failure is unbounded where the struct's was bounded:
-# B enters (off=0), A enters (off=0), A borrows 0→128, B borrows 128→256, B EXITS and rewinds off to 0,
-# A borrows again and is handed bytes 0..128 — aliasing its own live handle. With a named field the same
-# race corrupts that one role; here it is arbitrary cross-role aliasing. The per-task owner is therefore a
-# PRECONDITION of enabling threads, not an optimisation to weigh against 9-12 ns.
-# ONE ARENA PER THREAD. A scope records a position and restores it, so two callers sharing one arena
-# would restore each other's positions and hand out overlapping borrows. `OncePerThread` is correct while
-# no scope contains a task-switch point (`test/yield_lint.jl` enforces that); `OncePerTask` is the drop-in
-# if a scope ever has to survive a yield — one line, at a measured 9-21 ns per scope instead of 2-4.
+#
+# ── THREADS ARE ENABLED NOW, AND THIS OWNER DID NOT CHANGE ──────────────────────────────────────────
+# This block used to say multithreading was "deferred by standing rule", that per-task ownership was
+# "thread safety we cannot yet use", and — the claim worth correcting — that the per-task owner is
+# "a PRECONDITION of enabling threads, not an optimisation". M4 shipped opt-in threading
+# (`PureBLAS.set_num_threads`) and `_ARENA` is STILL `OncePerThread`, so that precondition was not
+# met and not needed: a different mechanism took its place. Leaving the old text would tell the next
+# reader the shipped library is unsafe.
+#
+# THE HAZARD IS REAL AND UNCHANGED. Interleave two tasks on one arena and the failure is unbounded
+# where a named field's was bounded: B enters (off=0), A enters (off=0), A borrows 0→128, B borrows
+# 128→256, B EXITS and rewinds off to 0, A borrows again and is handed bytes 0..128 — aliasing its own
+# live handle. With a named field the same race corrupts that one role; here it is arbitrary cross-role
+# aliasing.
+#
+# WHAT ACTUALLY PREVENTS IT, all three parts required:
+#   (a) EXACTLY ONE TASK-SWITCH POINT EXISTS INSIDE A SCOPE (`test/yield_lint.jl` enforces it): the
+#       driver's join in `_gemm_threaded!` (gemm.jl). By any other route two tasks cannot interleave
+#       *inside* scopes on one thread — the scenario above needs A to yield while holding borrows.
+#   (b) THE DRIVER IS PINNED TO ITS THREAD FOR THAT JOIN (`Task.sticky`, set and restored inside
+#       `_gemm_threaded!`). Unpinned, a yielded task usually resumes on a DIFFERENT thread — measured
+#       78% of yields — and would keep using thread t1's arena from t3 while t1 is free for another
+#       task: measured consequence, concurrent `getrf!` 20/96 wrong. Pinned, it resumes on t1, and the
+#       borrows it holds are still t1's. Base honours the bit at the yield itself (`enq_work` pushes a
+#       sticky task onto its own thread's queue), and bench/probes/sticky_across_join.jl measured it on
+#       the real shape — a task yielding in a loop under competing load — before this was written.
+#       This REPLACED an admission guard, `iszero(_arena().depth)`, that refused to thread inside ANY
+#       live scope. That guard was sound but it silently serialised 16 routines that open a scope and
+#       then call a public L3 entry (gels!, getri!, trtri!, potri!, lauum, gehrd, pbtrf, gbtrf, …),
+#       which measured as near-flat threaded cells misfiled as "nothing threads them".
+#   (c) EVERY OTHER SCOPE ON THAT THREAD IS A NESTED INTERVAL, so the bump stack stays LIFO. While the
+#       driver D is yielded at its join, another task E may run on t1 and open a scope on the SAME
+#       arena. E enters at depth d+1 and borrows ABOVE D's live offset, so nothing of D's is handed
+#       out. And E cannot itself be suspended inside its scope: the pool is ONE claim (`p.busy`), D
+#       holds it, so E's own `gemm!` loses the claim and runs serial, and nothing else inside a scope
+#       yields (a). E therefore runs to its scope exit — which restores `cur`/`off`/`depth` ABSOLUTELY
+#       to what D left — before D can resume. A worker chunk is the same case: a chunk never yields,
+#       so a scope it opens on any thread, including t1 on top of D's, is a nested interval too. At
+#       most ONE task in the whole process is ever suspended mid-scope, and (b) keeps it where its
+#       arena is.
+#
+# So the cost never had to be paid: per-task entry measures 9-12 ns against 2-4, and workspace.jl
+# records +7.5 ns being REJECTED as 7.4% of `trmm!` at n=8. `OncePerTask` remains the one-line drop-in
+# if any part above stops holding — in particular (c) rests on the SINGLE pool claim; per-caller pools
+# would let two tasks sit suspended mid-scope on one thread, and then only a per-task arena is sound.
+#
+# NOTE the mechanism is only for the ARENA, whose borrows nest. A wholesale-claimed ROLE handed to the
+# workers as an operand (`_m3ws`, the symm materialize twin) is NOT covered by (c): a task landing on
+# t1 during D's yield claims the same role and overwrites D's live operand. Those stay per-task.
+# THE PER-TASK ALTERNATIVE WAS PRICED, NOT ASSUMED (2026-09-19, bench/probes/arena_owner_ab.jl, Zen4,
+# paired ABBA in one process): `OncePerTask` here costs trmm! n=8 3.5% (B/A 1.0346, SE 0.0041, 72
+# rounds, ~+22 ns/call) and is a null on trmm 32/64, trsm 8/32/64 and gemm 8/32/64. Under the 7.4% bar
+# above, but a real regression on the one cell the bar guards, and the pin costs that cell nothing.
 const _ARENA = Base.OncePerThread{Arena}(Arena)
 @inline _arena() = _ARENA()
 
@@ -296,7 +352,7 @@ end
 # 2026-09-04: 580k borrows, RSS unchanged at 580 MB). The MAPPINGS used not to be: each released borrow
 # left VMAs behind (~0.069 permanently retained per borrow at the 29-borrows-per-scope shape
 # `_dtgex2_big!` has — 580k borrows took the map count 334 → 40389), against a `vm.max_map_count` of
-# 1048576 on wintermute but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
+# 1048576 on Zen4 but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
 # ends the run INSIDE THE SANITIZER rather than in the code under test. `_syl_dlasy2` alone is ~4k calls ×
 # 4 borrows at n=64, so a fenced full-suite run was not obviously under the stock limit and the
 # "fence everything" hatch was hollow. `_ARENA_FENCE_QUARANTINE` (below) fixes that: releases are held
@@ -597,7 +653,7 @@ end
 # ── Early-return rewriting, which is what `finally` was doing for free ───────────────────────────────
 # `try …  finally` releases the arena on THREE exit paths: falling off the end, `return`, and a throw.
 # `@leafscope` drops the handler, so it must reproduce the first two itself — and forgetting the second is
-# not a subtle bug. Measured on galen 2026-09-05: a prototype that released only on the tail path left
+# not a subtle bug. Measured on Zen3 2026-09-05: a prototype that released only on the tail path left
 # `_trsm_right!`'s pad arm (which `return`s from inside the block) never rewinding, so every call bumped
 # further, `_arena_grow!` took a fresh 140 KiB slab each time, and `trsmR@128` went 0.708 -> 0.408 — worse
 # than the bug it was meant to fix, because the benchmark was then timing page faults.
@@ -607,7 +663,7 @@ end
 # under. A nested `@scope`/`@leafscope` is likewise left alone — it emits its own release.
 _arena_nested_scope(ex) =
     ex isa Expr && ex.head === :macrocall && !isempty(ex.args) &&
-        (_arena_is_scope_macro(ex.args[1]) || _arena_is_leafscope_macro(ex.args[1]))
+    (_arena_is_scope_macro(ex.args[1]) || _arena_is_leafscope_macro(ex.args[1]))
 
 function _arena_rewrite_returns(ex, s::Symbol, rv::Symbol, exitf)
     ex isa Expr || return ex

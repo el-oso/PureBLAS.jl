@@ -615,8 +615,15 @@ const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no swe
 # m<n transpose staging — lives here as a concrete field, grown on demand and reused across calls. So a
 # warm `gesvd!` into caller-provided U/S/Vt allocates NOTHING. gesvd is Float64-ONLY (no s/c/z SVD kernel),
 # so unlike L3Workspace there is NO per-type dispatch and NO IdDict fallback: one module-level const,
-# reached by a bare field load (unconditionally trim-safe). Single global ⇒ single-thread only (project's
-# current mode); MT swaps _svdws() for a per-task owner, nothing else.
+# reached by a bare field load (unconditionally trim-safe).
+#
+# THREADING: this note used to say "single global ⇒ single-thread only (project's current mode); MT
+# swaps _svdws() for a per-task owner, nothing else." M4 landed and that swap WAS taken — the owners
+# below are `Base.OncePerTask`. It was not optional: `gesvd!` holds this workspace across `gemm!`
+# calls that thread, and the driver's join yields, after which the task usually resumes on a DIFFERENT
+# thread (measured 78% of yields). A per-THREAD owner there hands the same buffer to two live tasks;
+# the same shape measured concurrent `getrf!` wrong 20 times in 96 before its owner was converted.
+# Cost is ~13 ns per lookup, which is nothing against an O(n³) factorization.
 mutable struct SVDWorkspace{T}
     d::Vector{T}; e::Vector{T}; tauq::Vector{T}; taup::Vector{T}   # bidiagonal + reflector scalars
     gebrd_X::Matrix{T}; gebrd_Y::Matrix{T}                         # dlabrd panels
@@ -640,7 +647,7 @@ function SVDWorkspace{T}() where {T}
 end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
-const _SVDWS = Base.OncePerThread{SVDWorkspace{Float64}}(SVDWorkspace{Float64})
+const _SVDWS = Base.OncePerTask{SVDWorkspace{Float64}}(SVDWorkspace{Float64})
 @inline _svdws() = _SVDWS()
 # Type-keyed form of the owner, so generic code can write `_svdws(T)` for real AND complex alike
 # (GKH ownership: resolved at compile time per type, never a runtime lookup).
@@ -648,8 +655,8 @@ const _SVDWS = Base.OncePerThread{SVDWorkspace{Float64}}(SVDWorkspace{Float64})
 # Complex SVD values path: a separate owned workspace. Only the blocked-bidiag panels (gebrd_X/Y,
 # labrd_arow/tmp) are ever grown/used here — the singular-VECTOR buffers stay empty (vectors are the
 # follow-up). d,e stay real (local to the values entry), so they don't live in this complex workspace.
-const _SVDWS_C = Base.OncePerThread{SVDWorkspace{ComplexF64}}(SVDWorkspace{ComplexF64})
-const _SVDWS_C32 = Base.OncePerThread{SVDWorkspace{ComplexF32}}(SVDWorkspace{ComplexF32})
+const _SVDWS_C = Base.OncePerTask{SVDWorkspace{ComplexF64}}(SVDWorkspace{ComplexF64})
+const _SVDWS_C32 = Base.OncePerTask{SVDWorkspace{ComplexF32}}(SVDWorkspace{ComplexF32})
 @inline _svdws(::Type{ComplexF64}) = _SVDWS_C()
 @inline _svdws(::Type{ComplexF32}) = _SVDWS_C32()
 
@@ -714,7 +721,7 @@ end
 # the L1 quarter-way stride those column walks collapse onto a few cache sets, exactly as they do in
 # `gehrd` (`_gehrd_needs_pad`, hessenberg.jl) and `potrf`. Same predicate, same remedy.
 #
-# MEASURED (wintermute Zen4, bench/probes/gebrd_po2_pad.jl, GF/s of (8/3)n³): PB holds 17.6-18.0 GF at
+# MEASURED (Zen4, bench/probes/gebrd_po2_pad.jl, GF/s of (8/3)n³): PB holds 17.6-18.0 GF at
 # every non-po2 n from 832 to 1152 and drops to 14.65 @1024, 13.47 @1536, 10.06 @2048. Padding the
 # CALLER'S A recovers +12.4% / +4.3% / +19.2%; padding the `gebrd_X`/`gebrd_Y` workspace instead is a
 # null (−1.5% / −0.1% / +10.1%) and "both" is indistinguishable from "A padded". So it is A's stride,

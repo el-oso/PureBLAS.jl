@@ -1168,7 +1168,7 @@ end
 # A Preference still overrides, for calibration or to A/B the formula on an unseen box.
 #
 # THE FLEET SPLIT — this is the D-vs-M decision made by measurement, not by preference. Running the
-# same sweep on Zen3 (Zen3, W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
+# same sweep on Zen3 (W=4) CONFIRMED the shape for REAL and FALSIFIED it for COMPLEX:
 #
 #   sytrf F64, Zen3 PB/OB at the predicted nb:  1.44  1.47  1.37  1.24  1.17   (n=128…2048)
 #     gates at every size; argmax differs at n=128 (24: 1.58) and n=2048 (96: 1.19), worst loss 9%.
@@ -1220,7 +1220,7 @@ const _SYTRF_CMULT_PREF = @load_preference("sytrf_cmult", nothing)
     #
     # THE PREVIOUS JUSTIFICATION FOR 2 WAS FALSIFIED. The `catch` above returns 2 with the comment
     # "the safer default: 1 MISSES on Zen3", and that was cited as the reason 2 was both safe and modal.
-    # Galen IS Zen3 and cmult=1 reads 1.087 PASS there — it does not miss. The comment is stale.
+    # Zen3 IS Zen3 and cmult=1 reads 1.087 PASS there — it does not miss. The comment is stale.
     #
     # AND THE DUEL NEVER PICKED 3. It resolved 2 in 16 of 18 samples across two boxes, and the deleted
     # duel could only ever return its own candidates. Modal agreement across processes measures the

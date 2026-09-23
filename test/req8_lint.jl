@@ -42,9 +42,16 @@ function _bare_int_rhs(rhs::AbstractString)
     return false
 end
 
+# RECURSIVE. Until 2026-09-17 this was `readdir(_SRCDIR)`, which never descended, so nothing under
+# `src/blas2/`, `src/blas3/` or `src/lapack/` was scanned — the lint was checking the wrappers and
+# missing every kernel. Making it recursive surfaced 32 pre-existing literals in those directories;
+# they are listed in the baseline under their own header, unreviewed, so the debt is NAMED rather than
+# hidden by a scan that could not see it.
+_req8_files() = sort!(reduce(vcat, [joinpath(r, f) for (r, _, fs) in walkdir(_SRCDIR) for f in fs]; init = String[]))
+
 function req8_scan()
     viols = String[]
-    for f in sort(readdir(_SRCDIR; join = true))
+    for f in _req8_files()
         endswith(f, ".jl") || continue
         lines = readlines(f)
         for (i, ln) in enumerate(lines)

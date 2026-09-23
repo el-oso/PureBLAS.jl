@@ -30,11 +30,17 @@ jobs:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
+      # `-t 4`: the threading items guard on `Threads.nthreads() >= 2` and skip below it, so a
+      # single-threaded runner reports them green having run nothing — including the thread-count
+      # reproducibility gate, which is the one check that cannot be replaced by reading the code.
+      # 4 rather than the runner's full count: `_gemm_workers` needs enough workers to split, and the
+      # hosted runners are small enough that oversubscribing slows the suite without covering more.
       - uses: julia-actions/julia-runtest@v1
         env:
           PUREBLAS_TEST_GROUP: main
           PUREBLAS_SHARD: ${{ matrix.shard }}
           PUREBLAS_NSHARDS: '2'
+          JULIA_NUM_THREADS: '4'
       - uses: julia-actions/julia-processcoverage@v1
       - name: Upload coverage to Coveralls (parallel)
         uses: coverallsapp/github-action@v2

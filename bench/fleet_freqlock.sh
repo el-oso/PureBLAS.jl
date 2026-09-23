@@ -42,6 +42,14 @@
 # NEVER trusts the sysfs node readings — every lock is VERIFIED by measuring the real achieved frequency of
 # the benchmark core under actual load (perf `cycles`, or scaling_cur_freq sampled under load as fallback).
 #
+# NO SUDO NEEDED where the setuid helper is installed (bench/tools/README.md):
+#       bench/fleet_freqlock.sh lock
+# `lock`, `pin` and `restore` route every privileged write through /usr/local/sbin/pureblas-cpufreq when
+# it is present and we are not root. Two things it cannot do, and the script says so when it hits them:
+# stopping power-profiles-daemon/tuned (the helper never execs anything, by design) and the grub edit.
+# Override the path with PUREBLAS_CPUFREQ_HELPER=<path>. Install it with:
+#       sudo install -o root -g root -m 4755 bench/tools/build/pureblas-cpufreq /usr/local/sbin/
+#
 # Usage (run on the target box):
 #   sudo bench/fleet_freqlock.sh lock      # ← THE canonical gate state: passive + boost OFF + base clock + verify
 #   sudo bench/fleet_freqlock.sh pin 1800  # passive + hard-pin ≤ base (boost off, verified); >base is REFUSED
@@ -55,7 +63,38 @@ STATUS=/sys/devices/system/cpu/amd_pstate/status
 BOOST=/sys/devices/system/cpu/cpufreq/boost
 CORE="${CORE:-8}"
 cpus() { for d in /sys/devices/system/cpu/cpu[0-9]*; do [ -d "$d/cpufreq" ] && echo "$d/cpufreq"; done; }
-need_root() { [ "$(id -u)" -eq 0 ] || { echo "!! needs root: sudo $0 $*"; exit 1; }; }
+# ── THE SETUID HELPER ───────────────────────────────────────────────────────────────────────────────
+# `bench/tools/pureblas-cpufreq` (see bench/tools/README.md) is a small root-owned setuid binary that
+# does exactly the privileged writes below and nothing else — no exec, no environment, no shell, one
+# verb from a fixed table plus at most one validated integer. When it is installed, this script needs
+# no sudo at all, which is the difference between "ask a human and wait" and "relock the box and carry
+# on" for an agent mid-sweep.
+#
+# It does NOT cover `systemctl stop power-profiles-daemon` or the grub edit. Those still need root, and
+# the lock path below says so out loud rather than silently producing a pin that PPD will revert.
+HELPER=${PUREBLAS_CPUFREQ_HELPER:-/usr/local/sbin/pureblas-cpufreq}
+have_helper() { [ -x "$HELPER" ]; }
+is_root() { [ "$(id -u)" -eq 0 ]; }
+# Privileged writes, each routed through the helper when we are not root. `|| true` throughout because
+# `set -e` is on and a knob that does not exist on this platform is not a failure of the lock.
+priv_pstate()   { if is_root; then echo "$1" > "$STATUS" 2>/dev/null || true; else "$HELPER" pstate "$1" >/dev/null 2>&1 || true; fi; }
+priv_boost()    { if is_root; then echo "$1" > "$BOOST"  2>/dev/null || true; else "$HELPER" boost  "$1" >/dev/null 2>&1 || true; fi; }
+priv_governor() { if is_root; then for f in $(cpus); do echo "$1" > "$f/scaling_governor" 2>/dev/null || true; done
+                  else "$HELPER" governor "$1" >/dev/null 2>&1 || true; fi; }
+priv_unpin()    { if is_root; then for f in $(cpus); do echo "$(cat "$f/cpuinfo_min_freq")" > "$f/scaling_min_freq" 2>/dev/null || true
+                                                        echo "$(cat "$f/cpuinfo_max_freq")" > "$f/scaling_max_freq" 2>/dev/null || true; done
+                  else "$HELPER" unpin >/dev/null 2>&1 || true; fi; }
+priv_pin_raw()  { if is_root; then for f in $(cpus); do echo "$1" > "$f/scaling_max_freq"; echo "$1" > "$f/scaling_min_freq"; done
+                  else "$HELPER" pin "$1" >/dev/null 2>&1 || true; fi; }
+
+# Root OR the helper is enough. Only the two things the helper cannot do still demand real root.
+need_priv() {
+    is_root && return 0
+    have_helper && return 0
+    echo "!! needs root (or the setuid helper at $HELPER — see bench/tools/README.md): sudo $0 $*"
+    exit 1
+}
+need_root() { is_root || { echo "!! needs root: sudo $0 $*"; exit 1; }; }
 
 # Real achieved MHz of $1 under load — perf counts actual CPU cycles over ~1 s (immune to the sysfs lies).
 achieved_mhz() {
@@ -96,7 +135,16 @@ quiesce_ppd() {
     command -v systemctl >/dev/null 2>&1 || return 0
     for svc in power-profiles-daemon tuned; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            systemctl stop "$svc" 2>/dev/null && echo "  stopped $svc (was re-asserting scaling_max_freq)" || true
+            if systemctl stop "$svc" 2>/dev/null; then
+                echo "  stopped $svc (was re-asserting scaling_max_freq)"
+            else
+                # The setuid helper deliberately cannot do this — it never execs anything. So on the
+                # helper-only path a live PPD/tuned can still revert the pin AFTER we verify. Say so:
+                # a silent failure here is how a run that verified once drifts later.
+                echo "  ⚠ could NOT stop $svc (needs real root; the setuid helper does not exec)."
+                echo "    It may re-assert scaling_max_freq and undo this pin mid-sweep."
+                echo "    Re-run 'sudo $0 lock' for a fully quiesced box, or re-verify between groups."
+            fi
         fi
     done
 }
@@ -106,7 +154,7 @@ ensure_passive() {
     [ -e "$STATUS" ] || { echo "  (no amd_pstate — plain cpufreq box; boost node should work directly)"; return 3; }
     local m; m=$(cat "$STATUS")
     [ "$m" = passive ] && { echo "  amd_pstate already passive"; return 0; }
-    echo passive > "$STATUS" 2>/dev/null || true
+    priv_pstate passive
     m=$(cat "$STATUS")
     [ "$m" = passive ] && { echo "  amd_pstate: active → passive (runtime)"; return 0; }
     return 1
@@ -128,13 +176,27 @@ persist_grub() {
 }
 
 # Hard-pin every core to $1 kHz (min=max) under the performance governor.
+#
+# UNPIN FIRST, and that is not tidiness — it is the fix for a box that reads locked and is not.
+# MEASURED on neuromancer (Zen5 mobile, 2026-09-18), mid-sweep: every readable knob said locked —
+# `amd_pstate=passive`, `boost=0`, `min=max=2000000`, and `cpuinfo_max=2000000` — while the core
+# achieved 4772 MHz under load. Re-asserting `boost 0` in place: still 4795 MHz. Toggling
+# `pstate active`→`passive` in place: no effect either. Only releasing the clamp and re-applying it
+# worked: 1975 MHz against the 2000 MHz pin.
+#
+# The mechanism is that `cpuinfo_max` is DYNAMIC here: it advertises 2000000 kHz with boost off and
+# 4900000 with boost on. So in the broken state every node is SELF-CONSISTENT and correct, there is
+# nothing for cpufreq to fix, and an in-place re-assert is a no-op by construction. Releasing the pin
+# expands the policy range back to 4.9 GHz and the fresh pin then actually takes.
+#
+# Consequence for anyone reading a lock state: on this fleet, `boost=0` plus `min=max` is NOT evidence
+# of a lock. Only `achieved_mhz` under real load is. That is why `verify_or_die` exists and why nothing
+# here trusts sysfs.
 pin_khz() {
     local khz="$1"
-    for f in $(cpus); do
-        echo performance > "$f/scaling_governor" 2>/dev/null || true
-        echo "$khz" > "$f/scaling_max_freq"
-        echo "$khz" > "$f/scaling_min_freq"
-    done
+    priv_unpin                                   # release first — an in-place re-pin does NOT stick
+    priv_governor performance
+    priv_pin_raw "$khz"
 }
 
 # Assert the measured freq is within 12% of target $1 (MHz), else FAIL loudly (don't ship a boosting run).
@@ -152,11 +214,12 @@ verify_or_die() {
 
 case "${1:-verify}" in
   lock)
-    need_root lock
+    need_priv lock
+    have_helper && ! is_root && echo "  using the setuid helper at $HELPER (no sudo needed)"
     echo "Locking $(hostname) to its highest VERIFIED-SUSTAINABLE clock (boost off)…"
     quiesce_ppd                                               # stop PPD/tuned so they can't revert the pin
     if ensure_passive; then
-        echo 0 > "$BOOST" 2>/dev/null || true                 # passive honors this → cpuinfo_max drops to base
+        priv_boost 0                                          # passive honors this → cpuinfo_max drops to base
         base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))
         pin_khz $(( base * 1000 ))
         got=$(achieved_mhz "$CORE")                           # does the box actually HOLD base under load?
@@ -180,11 +243,11 @@ case "${1:-verify}" in
         exit 3
     fi ;;
   pin)
-    need_root pin
+    need_priv pin
     mhz="${2:?usage: sudo $0 pin <MHz>  (MHz must be ≤ base clock; use 'lock' for the canonical base-clock state)}"
     quiesce_ppd                                               # stop PPD/tuned so they can't revert the pin
     ensure_passive || { echo "  passive needed for a hard pin; persisting boot param:"; persist_grub; echo ">>> reboot, reconnect, re-run."; exit 3; }
-    echo 0 > "$BOOST" 2>/dev/null || true                     # a hard pin MUST kill boost, else it floats above the pin
+    priv_boost 0                                              # a hard pin MUST kill boost, else it floats above the pin
     base=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))   # boost-off cpuinfo_max = base
     if [ "$mhz" -gt "$base" ]; then
         echo "❌ requested ${mhz} MHz > base ${base} MHz. Boost frequencies do NOT lock (they float above"
@@ -195,16 +258,18 @@ case "${1:-verify}" in
     pin_khz $(( mhz * 1000 ))
     verify_or_die "$mhz" ;;
   restore)
-    need_root restore
-    echo active > "$STATUS" 2>/dev/null || true
-    echo 1 > "$BOOST" 2>/dev/null || true
+    need_priv restore
+    priv_pstate active
+    priv_boost 1
     if command -v systemctl >/dev/null 2>&1; then             # bring PPD/tuned back (undo quiesce_ppd)
         for svc in power-profiles-daemon tuned; do systemctl start "$svc" 2>/dev/null || true; done
     fi
-    for f in $(cpus); do
-        echo "$(cat "$f/cpuinfo_max_freq")" > "$f/scaling_max_freq" 2>/dev/null || true
-        echo "$(cat "$f/cpuinfo_min_freq")" > "$f/scaling_min_freq" 2>/dev/null || true
-    done
+    # `unpin` restores each core to its OWN cpuinfo_min/max, which is what the loop here used to do by
+    # hand. Note the ORDER matters: boost is re-enabled first, because `cpuinfo_max` is dynamic (2.0 GHz
+    # with boost off, 4.9 GHz with it on — measured on neuromancer), so unpinning while boost is still
+    # off would restore the range to base rather than to the full range.
+    priv_unpin
+    priv_governor powersave
     echo "Restored: amd_pstate=$(cat "$STATUS" 2>/dev/null||echo n/a), boost on, full range." ;;
   verify)
     echo "amd_pstate=$(cat "$STATUS" 2>/dev/null || echo n/a)  boost=$(cat "$BOOST" 2>/dev/null || echo n/a)"

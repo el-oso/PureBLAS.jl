@@ -516,7 +516,7 @@ end
 # POWER-OF-TWO `lda` CACHE-SET ALIASING, and it is the dominant effect at the sizes the gate measures.
 # `_lahr2!` walks COLUMNS of the trailing matrix with `_gemv!`; at a power-of-two `lda` those addresses
 # collapse onto a couple of L1 sets, so an 8-way L1 holds a handful of lines of the column and every pass
-# conflict-misses. Measured on wintermute/Zen4, `gehrd!` alone, ms/n³ (×1e-9) which is FLAT for a pure
+# conflict-misses. Measured on Zen4/Zen4, `gehrd!` alone, ms/n³ (×1e-9) which is FLAT for a pure
 # size effect:
 #     n=254  309 | n=255  311 | n=256 1786 | n=257  313 | n=258  295
 #     n=511  245 | n=512 1123 | n=513  238
