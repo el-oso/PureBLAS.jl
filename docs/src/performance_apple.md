@@ -16,8 +16,9 @@ rather than averaging into one figure.
 **Caveat that does not apply to the AMD fleet:** macOS has no equivalent of the Linux
 `cpufreq`/`taskset` locking [Methodology](methodology.md) treats as mandatory for a gate-quality
 measurement. These numbers are **not frequency-locked** — read them as directional, not gate verdicts.
-Measured round-to-round spread on this box is nonetheless small: 0.14% on the anchor workload and
-0.14-1.34% on `gemm` cells across eight rounds (`bench/probes/apple_unlocked_spread.jl`).
+Measured round-to-round spread on this box is nonetheless small: across eight rounds the q10-q90
+band is 0.04% on the anchor workload and 0.3-1.7% on `gemm` cells
+(`bench/probes/apple_unlocked_spread.jl`).
 
 **Machine:** Apple M6 (`_vwidth(Float64)=2`, `sme_max_svl_b=64` ⇒ 8 FP64 lanes in a ZA tile), unlocked
 clock, commit `e8932f1e`, measured 2026-09-24. Full provenance:

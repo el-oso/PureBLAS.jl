@@ -249,7 +249,7 @@ Every `@load_preference` key in `src/` — 150 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `sme_min` | literal | Measured | the crossover below which the packed panels do not pay for themselves; it depends on packing throughput against kernel throughput, neither predictable from a cache size. | sweep |
+| `sme_min` | literal | Measured | a periodic crossover in `_SME_MR`, set at the smallest multiple above which every size wins; depends on edge-panel occupancy against kernel throughput, which no cache size predicts. | sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
 
 ## workspace

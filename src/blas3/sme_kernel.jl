@@ -580,11 +580,22 @@ end
 # needed (that struct's constructor is a long positional list and adding to it has shipped a bug).
 #
 # Below `_SME_MIN` the problem is too small for the packed panels to pay for themselves and the
-# existing SIMD routes are better. The value is a MEASURED crossover, not a residency formula --
-# it depends on packing throughput against kernel throughput, neither of which is predictable
-# from a cache size -- so it is a Measure-tier default with a Preferences override.
-# PDM: Measured — the crossover below which the packed panels do not pay for themselves; it depends on packing throughput against kernel throughput, neither predictable from a cache size. | tune: sweep
-const _SME_MIN = @load_preference("sme_min", 4 * _SME_MR)::Int
+# existing SIMD routes are better. It is a MEASURED crossover, not a residency formula: it depends on
+# packing throughput against kernel throughput, neither predictable from a cache size.
+#
+# THE CROSSOVER IS NOT A THRESHOLD, IT IS PERIODIC IN `_SME_MR`, which is why the cut sits where it
+# does. Square Float64, SME against the SIMD path it displaces, measured in one process on one set of
+# operands (`bench/probes/sme_min_crossover.jl`):
+#
+#     n       16    20    24    28    32    40    48    56    64    80    96
+#     ratio  1.10  0.15  0.26  0.23  1.07  0.79  2.51  1.39  3.40  4.40  5.60
+#
+# Every win is a multiple of `_SME_MR` (16 here) and every loss is not: a remainder row-panel is
+# packed and run at a fraction of tile occupancy, and at small n that edge work is most of the call.
+# 3*MR is the smallest cut above which EVERY size wins, multiple or not — 2*MR would admit n=40 at
+# 0.79. The old 4*MR left n=48 (2.51x) and n=56 (1.39x) on the SIMD path for nothing.
+# PDM: Measured — a periodic crossover in `_SME_MR`, set at the smallest multiple above which every size wins; depends on edge-panel occupancy against kernel throughput, which no cache size predicts. | tune: sweep
+const _SME_MIN = @load_preference("sme_min", 3 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
 #
@@ -636,10 +647,24 @@ function _sme_init!()
     return nothing
 end
 
+# BOTH C DIMENSIONS MUST CARRY AT LEAST TWO TILES, and `k` is not part of that test. The kernel
+# computes an `_SME_MR` x `_SME_NR` output tile; when C is narrower than a tile, most of ZA is
+# written and thrown away, and no amount of `k` recovers it. Measured against the SIMD path it
+# displaces (`bench/probes/sme_min_crossover.jl`), same operands, same process:
+#
+#     (m,n,k)        SME/SIMD        (m,n,k)        SME/SIMD
+#     (64,64,8)        2.97          (8,8,64)         0.14
+#     (32,32,64)       1.68          (64,8,8)         0.14
+#     (64,64,64)       3.41          (2048,8,8)       0.34
+#
+# A thin `k` is fine — (64,64,8) is the fastest relative win in that table — so the criterion is
+# `min(m, n)`, not `min(m, n, k)`, and testing `max(m, n, k)` admits exactly the shapes whose only
+# large dimension is the one that does not help.
 @inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
     T === Float64 && _SME_F64 && !cA && !cB &&
         _strided1(C) && _strided1(A) && _strided1(B) &&
-        max(m, n, k) >= _SME_MIN && _SME_ENTRY[] !== C_NULL
+        min(m, n) >= 2 * _SME_MR && max(m, n, k) >= _SME_MIN &&
+        _SME_ENTRY[] !== C_NULL
 
 # AN SME-ELIGIBLE CALL IS NOT COLUMN-SPLIT, for the same reason a Strassen call is not: splitting it
 # does not divide the work between units, it queues the workers behind one of them. The coprocessor
