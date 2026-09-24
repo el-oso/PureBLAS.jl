@@ -1,41 +1,56 @@
 # Apple Silicon
 
-First-pass results on Apple Silicon (arm64/NEON), comparing PureBLAS against **OpenBLAS** and
-**Accelerate** (Apple's own vecLib BLAS/LAPACK, forwarded via `libblastrampoline`'s ILP64
-`$NEWLAPACK$ILP64` interface — see [Methodology](methodology.md#accelerate-on-apple-silicon)).
-This is the first time PureBLAS has been benchmarked on this architecture; it is not yet part of the
+Results on Apple Silicon (arm64), comparing PureBLAS against **OpenBLAS** and **Accelerate** (Apple's
+own vecLib BLAS/LAPACK, forwarded via `libblastrampoline`'s ILP64 `$NEWLAPACK$ILP64` interface — see
+[Methodology](methodology.md#accelerate-on-apple-silicon)). This architecture is not part of the
 [main fleet](performance.md), which stays AMD-only.
 
-**Scope, deliberately limited for this first pass:** BLAS-1, BLAS-2, BLAS-3, and the four core LAPACK
-factorizations (`potrf`, `getrf`, `geqrf`, `gesvd`), Float64 only, sizes capped at 2048. Complex,
-ForwardDiff-dual, and the rest of LAPACK are not yet covered here.
+Float64 `gemm` runs on **SME**, the Scalable Matrix Extension — a published Arm extension, not an
+Apple-proprietary one, implemented on M4 and later. Everything else runs on NEON, whose Float64
+vector is 2 lanes wide. The two paths behave differently enough that the ratios below split by size
+rather than averaging into one figure.
 
-**Caveat that does not apply to the AMD fleet:** macOS has no equivalent of the Linux `cpufreq`/`taskset`
-locking [Methodology](methodology.md) treats as mandatory for a gate-quality measurement. These numbers
-are **not frequency-locked** — read them as directional, not gate verdicts.
+**Scope:** BLAS-1, BLAS-2, BLAS-3 and the four core LAPACK factorizations (`potrf`, `getrf`, `geqrf`,
+`gesvd`), Float64 only. Complex, ForwardDiff-dual and the rest of LAPACK are not covered here.
 
-**Machine:** Apple M6 (ARM · NEON, `_vwidth(Float64)=2`), unlocked clock, commit `76cac7b6`, measured
-2026-09-22. Full provenance: [`provenance.md`](assets/apple/provenance.md).
+**Caveat that does not apply to the AMD fleet:** macOS has no equivalent of the Linux
+`cpufreq`/`taskset` locking [Methodology](methodology.md) treats as mandatory for a gate-quality
+measurement. These numbers are **not frequency-locked** — read them as directional, not gate verdicts.
+Measured round-to-round spread on this box is nonetheless small: 0.14% on the anchor workload and
+0.14-1.34% on `gemm` cells across eight rounds (`bench/probes/apple_unlocked_spread.jl`).
 
-**Two real measurement bugs were found and fixed while building this page** — both caught by pushing
-back on results that didn't pass a physical-plausibility check, not by anything in the harness itself.
-Both are written up below and in `ROADMAP.md`; the table and plots reflect the numbers *after* both
-fixes.
+**Machine:** Apple M6 (`_vwidth(Float64)=2`, `sme_max_svl_b=64` ⇒ 8 FP64 lanes in a ZA tile), unlocked
+clock, commit `e8932f1e`, measured 2026-09-24. Full provenance:
+[`provenance.md`](assets/apple/provenance.md).
 
 ## Headline
 
-Of the 29 real (Float64) cells measured, **1 gates outright** (`nrm2`, where OpenBLAS's always-scaled
-algorithm is slow on every platform PureBLAS has been measured on) — but the gate figure (worst-cell)
-understates BLAS-1: on the **median**, PureBLAS *beats* Accelerate on `dot` (1.09×) and `axpy` (1.19×),
-and sits near parity on `asum`/`scal`.
+**Float64 `gemm` beats Accelerate above n = 2048** — 1.07x at n = 2048 and 1.10x at n = 4096 — and
+runs **7.4-7.9x OpenBLAS** from n = 512 upward. Before the SME kernel the same cells read 0.09x
+Accelerate and 0.70x OpenBLAS.
 
-PureBLAS is roughly at parity with **OpenBLAS** overall (0.5-2.1× across BLAS-1/2, 0.7-1.6× on BLAS-3/
-LAPACK), and trails **Accelerate** substantially on BLAS-2/3/LAPACK (0.08-0.3× on most of BLAS-3). That
-part of the gap is real — it holds under genuinely cold, genuinely single-threaded measurement — and
-most plausibly tracks Accelerate routing through Apple's AMX matrix coprocessor (~469 GFLOP/s single-core
-`dgemm`, verified single-threaded — see below), which pure-Julia NEON code (128-bit, 2 Float64 lanes) has
-no access to. Closing that is a tuning/architecture question for a future session — `tune!()`'s existing
-Measure-tier calibrator does not cover it (see [Tuning](#tuning-tune-and-its-limits) below).
+The win is size-dependent, and the page reports both ends rather than one number:
+
+| n | vs Accelerate | vs OpenBLAS |
+|---|---|---|
+| 32-50 | 0.16-0.28 | 0.70-0.95 |
+| 128-256 | 0.62-0.82 | 4.4-5.8 |
+| 512-1024 | 0.88-0.94 | 7.4-7.6 |
+| **2048-4096** | **1.07-1.10** | **7.9** |
+
+Below `_SME_MIN` (64) the packed panels do not pay for themselves and the call stays on NEON, so the
+smallest cells are unchanged from the pre-SME measurement — they are the NEON path, measured twice.
+
+**`syrk` and `syr2k` did not move at all** (0.13x and 0.14x Accelerate, before and after). They take a
+private packed path above a size cutoff and never reach `gemm`, so no kernel change can reach them
+through it. That cutoff was derived when `gemm` ran at 44 GFLOP/s; it now runs at 500, and the trade
+has not been re-derived. That is routing work, not kernel work.
+
+On BLAS-1 the gate figure (worst cell) understates the picture: on the **median** PureBLAS beats
+Accelerate on `dot` (1.09x) and `axpy` (1.19x) and sits near parity on `asum`/`scal`. BLAS-2 remains
+the largest open gap — `gemvN` at 0.17x median is bandwidth-bound work that SME can reach in
+principle but does not yet.
+
 
 ## Measurement bug #1: large-n BLAS-1 was reading a warm buffer, not DRAM streaming
 
@@ -78,7 +93,8 @@ same workload then pins at a clean, sustained ~99-100% CPU, both via a raw timin
 
 **How much this actually moved the numbers — smaller than the discovery made it sound.** The corrected
 single-thread `dgemm` is ~469 GFLOP/s, not ~550 (the "second thread" bought only ~16%, not 2×, consistent
-with AMX being a per-core resource a second software thread can't usefully double up on). Re-measuring
+with the matrix unit being a resource a second software thread cannot usefully double up on -- it is
+SME on this chip, one unit per cluster, not a per-core datapath). Re-measuring
 `gemm` with the fix moved its ratio against Accelerate by **+2% to +15%, growing with n** — real and
 correctly signed, not a dramatic reversal. **LAPACK was unaffected** — `potrf` tested directly at
 n=2048 (400 calls, continuous CPU sampling) stayed clean single-threaded *both* before and after the fix;
@@ -128,18 +144,18 @@ FAIL can still have a winning median — true for `dot`/`axpy`/`asum` below.
 | L2 | `spmv` | 1.55 (1.05) | 1.05 (0.67) | 0.669 | FAIL |
 | L2 | `gbmvN` | 0.49 (0.47) | 0.46 (0.40) | 0.402 | FAIL |
 | L2 | `sbmv` | 3.08 (3.03) | 0.78 (0.69) | 0.689 | FAIL |
-| L3 | `gemm` | 0.70 (0.66) | 0.10 (0.08) | 0.084 | FAIL |
-| L3 | `symm` | 0.81 (0.67) | 0.12 (0.08) | 0.084 | FAIL |
-| L3 | `syrk` | 0.94 (0.83) | 0.13 (0.11) | 0.112 | FAIL |
-| L3 | `syr2k` | 0.92 (0.81) | 0.13 (0.12) | 0.120 | FAIL |
-| L3 | `trmm` | 0.76 (0.61) | 0.13 (0.09) | 0.091 | FAIL |
-| L3 | `trmmR` | 0.70 (0.51) | 0.14 (0.08) | 0.085 | FAIL |
-| L3 | `trsm` | 0.93 (0.68) | 0.24 (0.13) | 0.127 | FAIL |
-| L3 | `trsmR` | 1.15 (0.93) | 0.29 (0.18) | 0.176 | FAIL |
-| LP | `potrf` | 1.58 (0.98) | 0.51 (0.17) | 0.173 | FAIL |
-| LP | `getrf` | 0.93 (0.71) | 0.61 (0.19) | 0.194 | FAIL |
-| LP | `geqrf` | 1.29 (0.78) | 0.98 (0.18) | 0.180 | FAIL |
-| LP | `gesvd` | 1.04 (0.97) | 0.80 (0.23) | 0.225 | FAIL |
+| L3 | `gemm` | **6.54** (0.70) | 0.90 (0.17) | 0.165 | FAIL |
+| L3 | `symm` | **4.20** (0.71) | 0.75 (0.19) | 0.189 | FAIL |
+| L3 | `syrk` | 0.99 (0.84) | 0.13 (0.11) | 0.115 | FAIL |
+| L3 | `syr2k` | 0.96 (0.80) | 0.14 (0.12) | 0.123 | FAIL |
+| L3 | `trmm` | 1.07 (0.56) | 0.24 (0.13) | 0.126 | FAIL |
+| L3 | `trmmR` | 0.88 (0.45) | 0.27 (0.09) | 0.095 | FAIL |
+| L3 | `trsm` | 1.53 (1.02) | 0.47 (0.27) | 0.265 | FAIL |
+| L3 | `trsmR` | 1.82 (1.27) | 0.57 (0.32) | 0.316 | FAIL |
+| LP | `potrf` | 1.52 (1.11) | 0.55 (0.22) | 0.221 | FAIL |
+| LP | `getrf` | **2.14** (0.83) | **1.45** (0.62) | 0.617 | FAIL |
+| LP | `geqrf` | 1.29 (1.04) | 0.87 (0.28) | 0.279 | FAIL |
+| LP | `gesvd` | 1.56 (0.95) | 0.98 (0.52) | 0.522 | FAIL |
 
 Full machine-readable tables: [`gen_table.md`](assets/apple/gen_table.md) (vs OpenBLAS),
 [`gen_table_accelerate.md`](assets/apple/gen_table_accelerate.md) (vs Accelerate).

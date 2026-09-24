@@ -21,18 +21,49 @@ PB / OpenBLAS speed ratio, median (worst cell) per op per µarch. Provenance: [`
 | `spmv` | 1.55 (1.05) |
 | `gbmvN` | 0.49 (0.47) |
 | `sbmv` | 3.08 (3.03) |
-| `gemm` | 0.70 (0.66) |
-| `symm` | 0.81 (0.67) |
-| `syrk` | 0.94 (0.83) |
-| `syr2k` | 0.92 (0.81) |
-| `trmm` | 0.76 (0.61) |
-| `trmmR` | 0.70 (0.51) |
-| `trsm` | 0.93 (0.68) |
-| `trsmR` | 1.15 (0.93) |
-| `potrf` | 1.58 (0.98) |
-| `getrf` | 0.93 (0.71) |
-| `geqrf` | 1.29 (0.78) |
-| `gesvd` | 1.04 (0.97) |
+| `gemm` | 6.54 (0.70) |
+| `symm` | 4.20 (0.71) |
+| `syrk` | 0.99 (0.84) |
+| `syr2k` | 0.96 (0.80) |
+| `trmm` | 1.07 (0.56) |
+| `trmmR` | 0.88 (0.45) |
+| `trsm` | 1.53 (1.02) |
+| `trsmR` | 1.82 (1.27) |
+| `potrf` | 1.52 (1.11) |
+| `getrf` | 2.14 (0.83) |
+| `geqrf` | 1.29 (1.04) |
+| `gesvd` | 1.56 (0.95) |
+| `potrfU` | – |
+| `getrs` | – |
+| `potrsL` | – |
+| `potrsU` | – |
+| `trtrs` | – |
+| `sytrf` | – |
+| `sytrs` | – |
+| `potri` | – |
+| `trtri` | – |
+| `getri` | – |
+| `sytri` | – |
+| `gelsy` | – |
+| `gelsd` | – |
+| `geev` | – |
+| `gbtrf` | – |
+| `geqp3` | – |
+| `gels` | – |
+| `pstrf` | – |
+| `pstrfU` | – |
+| `syev` | – |
+| `syevN` | – |
+| `gtsv` | – |
+| `gttrf` | – |
+| `gttrs` | – |
+| `pttrf` | – |
+| `pttrs` | – |
+| `ptsv` | – |
+| `pbtrfL` | – |
+| `pbtrfU` | – |
+| `pptrfL` | – |
+| `pptrfU` | – |
 
 
 ### Complex
