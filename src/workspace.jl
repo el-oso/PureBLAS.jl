@@ -333,6 +333,22 @@ const _GPKSH_F32 = Base.OncePerProcess{Vector{Vector{Float32}}}(() -> Vector{Flo
     return _ws_slot!(_gpack_shared_pool(Tr), 1, nblk * blk)
 end
 
+# ── PER-WORKER PACK SLOT FOR THREADED trmm SIDE R ──────────────────────────────────────────────────
+# Slot `wi` of the pool above, one whole buffer per worker rather than one buffer in blocks: a side-R
+# band packs op(A) for its own rows and shares nothing, so there is no barrier and no handoff.
+#
+# The slots come from the blocked-gemm pool because the two can never be live together — the gemm pool
+# admits one job at a time under `p.busy`, a side-R job never reaches `_gemm_blocked!`, and a serial
+# gemm takes its private buffer rather than this one (`coop = nw > 1`).
+#
+# THE DRIVER MUST SIZE THESE BEFORE PUBLISHING THE JOB. A chunk body that grows a buffer allocates
+# inside the published job, and an allocation there stalls the pool: the driver and the idle workers
+# are in spin/wait loops, so a GC triggered by one worker has nowhere to progress from. The symptom is
+# not deterministic — the same call gives a swallowed worker exception or a silent hang, by
+# interleaving — which is why the sizing is the driver's job and not the worker's.
+@inline _trmmr_pack(::Type{Tr}, wi::Int, blk::Int) where {Tr} =
+    _ws_slot!(_gpack_shared_pool(Tr), wi, blk)
+
 function _strassen_pad_scratch(::Type{Tr}, mp::Int, kp::Int, np::Int) where {Tr}
     p = _strws(Tr)[1]
     return _str_fit!(p, 1, mp, kp), _str_fit!(p, 2, kp, np), _str_fit!(p, 3, mp, np)
