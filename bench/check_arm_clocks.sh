@@ -34,7 +34,10 @@ mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null |
 bad=0
 for f in "${files[@]}"; do
     printf '── %s\n' "$(basename "$f" .txt | sed 's/^plots_data_//')"
-    out=$(awk -F'\t' -v TOL="$tol" '
+    # A threaded cache: its PB arms ran on workers, so the per-cell clock samples a core that was not
+    # doing the work. The in-window check below stands down for those; the cross-arm check does not.
+    mt=0; case "$f" in *mt_data_*) mt=1 ;; esac
+    out=$(awk -F'\t' -v TOL="$tol" -v MT="$mt" '
         /^#pbbench/ { if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0; next }
         /^#/ { next }
         NF >= 4 {
@@ -46,10 +49,21 @@ for f in "${files[@]}"; do
                 # Counting from the end lands on `fhi`, the in-window MAXIMUM — the one clock field a
                 # throttle cannot move, so a cell that ran at half speed reads as perfectly locked.
                 fq = a[5] + 0
-                # In-window MINIMUM against this box own base clock. Restricted to the PB arms because
-                # those are the only ones a re-measure can repair; a cached vendor arm carries the state
-                # of the epoch it was measured in and is never re-run.
-                if (base > 0 && n >= 8 && (a[1] == "pb" || a[1] == "pb_mt")) {
+                # In-window MINIMUM against this box own base clock.
+                #
+                # SERIAL ARMS ONLY, and that is a correctness limit rather than a scoping preference.
+                # `_cell_khz`/`_khz_range!` read `/proc/self/stat` field 39 — the MAIN thread current
+                # CPU. For a serial arm the main thread IS the work, so the reading is the work clock.
+                # For a threaded arm the workers are on other cores and the driver spins then yields,
+                # so the sampled core can report its IDLE frequency while every worker runs at base.
+                # Measured: galen `trsmR@512` records flo = 1066 MHz against a 3701 MHz base while
+                # every arm in that cell posts full throughput, and `trsm@1000` records 1714 MHz while
+                # OpenBLAS and AOCL post the HIGHEST figures of their ladder. A real drop would slow
+                # every arm in the window; these slow none of them.
+                #
+                # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
+                # arm carries the state of the epoch it was measured in and is never re-run.
+                if (base > 0 && n >= 8 && a[1] == "pb" && !MT) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++
