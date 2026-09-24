@@ -3804,6 +3804,9 @@ const _MT_KIND_TRSMR = 4
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_TRMMR = 5
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_TRMML = 6
 
 """
     _syrk_workers(n, k) -> Int
@@ -3892,6 +3895,7 @@ end
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRMML && return _trmml_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4322,6 +4326,11 @@ end
             # serial buffer, because a loser is not one of the published job's workers. α is applied
             # after the product, as `trmm!` applies it.
             _trmm_right!(up, tA, cA, unit, A, C)
+            isone(alpha) || _scal_all!(C, alpha)
+        elseif kind == _MT_KIND_TRMML
+            # `nroute` stays -1 for the same reason as gemm's and trsm's: a loser multiplies the whole
+            # of B, so its own column count IS the routing width.
+            _trmm_left!(up, tA, cA, unit, A, C)
             isone(alpha) || _scal_all!(C, alpha)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
