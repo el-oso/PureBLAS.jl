@@ -1265,21 +1265,33 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     # do it — `gemm!`'s default is off, because a Strassen route is not thread-count reproducible and
     # the public entry has to be (see the note on `_gemm_core!`'s `strassen`).
     #
-    # This call site cannot break that guarantee, because it is below the threading entry and so runs
-    # serially at every thread count. What it costs is threading this one update, which trmm never had
-    # a gate number for; the column split over B that Phase 3 wants sits ABOVE this and is reproducible.
-    #
     # It is kept because it is measured, not inherited. Zen4, recursion forced off with the split left
     # armed: n=4096 is 10.7% slower and n=2048 2.2%, which takes trmm@4096 from 1.052 to 0.950 — a
     # passing cell to a failing one. The gate's own gemm cells are flat under the same switch, because
     # they allocate cold operands per sample; trmm's B is warm from the solve that just wrote it.
+    #
+    # THE UPDATE THREADS ONLY WHERE THE RECURSION OWNS IT. `_gemm_core!`'s `nw` declares "I am worker
+    # `wi` of `nw`" — it does NOT request workers. The classical route passes the pair straight to
+    # `_gemm_blocked!`, so a lone caller announcing companions that never arrive waits at their barrier
+    # forever; only the Strassen route spawns the workers it is told about. The count is therefore
+    # passed exactly when `_strassen_owns` answers yes, which requires `!tA` — so an update with a
+    # transposed A runs serially and says so by carrying 1.
+    #
+    # Reproducibility is not at risk on the route that does thread: a Strassen leaf is a classical
+    # product whose arithmetic is fixed by `(m, n, k)` alone, so the recursion returns the same bits at
+    # every worker count. The worker count comes from the update's OWN shape, because the shape halves
+    # at each level and a count fit to the root would over-subscribe the leaves. The diagonal halves
+    # stay serial: they bottom out in `_trmm_packed!`, which has no split of its own.
+    n = size(B, 2)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true)   # Bt += op(off)·Bb
+        nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb) ? _gemm_workers(h, n, k - h) : 1
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true)   # Bb += op(off)·Bt
+        nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt) ? _gemm_workers(k - h, n, h) : 1
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
