@@ -583,19 +583,24 @@ end
 # existing SIMD routes are better. It is a MEASURED crossover, not a residency formula: it depends on
 # packing throughput against kernel throughput, neither predictable from a cache size.
 #
-# THE CROSSOVER IS NOT A THRESHOLD, IT IS PERIODIC IN `_SME_MR`, which is why the cut sits where it
-# does. Square Float64, SME against the SIMD path it displaces, measured in one process on one set of
-# operands (`bench/probes/sme_min_crossover.jl`):
+# THE CROSSOVER IS NOT A THRESHOLD IN n, IT IS GOVERNED BY TILE OCCUPANCY, so there are two cuts
+# below and a predicate that uses both. Square Float64, SME against the SIMD path it displaces,
+# measured at EVERY n in one process on one set of operands (`bench/probes/sme_min_crossover.jl`):
 #
-#     n       16    20    24    28    32    40    48    56    64    80    96
-#     ratio  1.10  0.15  0.26  0.23  1.07  0.79  2.51  1.39  3.40  4.40  5.60
+#     rem = n % MR       n=47   48   49   63   64   65   79   80   81   95   96   97
+#     ratio             0.62 2.57 0.44 0.96 3.39 0.67 1.40 4.57 0.96 1.83 5.51 1.24
 #
-# Every win is a multiple of `_SME_MR` (16 here) and every loss is not: a remainder row-panel is
-# packed and run at a fraction of tile occupancy, and at small n that edge work is most of the call.
-# 3*MR is the smallest cut above which EVERY size wins, multiple or not — 2*MR would admit n=40 at
-# 0.79. The old 4*MR left n=48 (2.51x) and n=56 (1.39x) on the SIMD path for nothing.
-# PDM: Measured — a periodic crossover in `_SME_MR`, set at the smallest multiple above which every size wins; depends on edge-panel occupancy against kernel throughput, which no cache size predicts. | tune: sweep
-const _SME_MIN = @load_preference("sme_min", 3 * _SME_MR)::Int
+# An exact multiple wins from 3*MR up and keeps winning. Everything else packs a remainder row-panel
+# and runs it at a fraction of tile occupancy, and the worst remainder — 1 — still LOSES at n=81.
+# So a single cut cannot be both safe and small: 4*MR admits n=65 at 0.67 and n=81 at 0.96, and
+# 3*MR admits n=49 at 0.44. Only at 6*MR does every remainder finally pay.
+#
+# Sampling every OTHER n hides this: a 2-step sweep reads 48, 56, 64 and concludes 3*MR is safe,
+# which regressed gemm@50 by 38% (1142 -> 1582 us) before the dense sweep found 49, 51, 53.
+# PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: sweep
+const _SME_MIN = @load_preference("sme_min", 6 * _SME_MR)::Int
+# Exact multiples of the row-panel carry no remainder and win from here up; see the table above.
+const _SME_MIN_EXACT = @load_preference("sme_min_exact", 3 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
 #
@@ -658,13 +663,22 @@ end
 #     (64,64,64)       3.41          (2048,8,8)       0.34
 #
 # A thin `k` is fine — (64,64,8) is the fastest relative win in that table — so the criterion is
-# `min(m, n)`, not `min(m, n, k)`, and testing `max(m, n, k)` admits exactly the shapes whose only
-# large dimension is the one that does not help.
+# `min(m, n)`, not `min(m, n, k)`, and testing `max(m, n, k)` alone admits exactly the shapes whose
+# only large dimension is the one that does not help.
+#
+# THE SIZE CUT HAS TWO ARMS because the cost is tile occupancy, not size (see `_SME_MIN`): a shape
+# that divides the panel exactly pays from `_SME_MIN_EXACT`, everything else has to reach `_SME_MIN`
+# before its remainder panel is amortized.
+@inline function _sme_tile_ok(m, n)
+    min(m, n) >= 2 * _SME_MR || return false
+    (m % _SME_MR == 0 && n % _SME_NR == 0) ?
+        max(m, n) >= _SME_MIN_EXACT : max(m, n) >= _SME_MIN
+end
+
 @inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
     T === Float64 && _SME_F64 && !cA && !cB &&
         _strided1(C) && _strided1(A) && _strided1(B) &&
-        min(m, n) >= 2 * _SME_MR && max(m, n, k) >= _SME_MIN &&
-        _SME_ENTRY[] !== C_NULL
+        _sme_tile_ok(m, n) && _SME_ENTRY[] !== C_NULL
 
 # AN SME-ELIGIBLE CALL IS NOT COLUMN-SPLIT, for the same reason a Strassen call is not: splitting it
 # does not divide the work between units, it queues the workers behind one of them. The coprocessor

@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 150 of them.
+Every `@load_preference` key in `src/` — 151 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,11 @@ Every `@load_preference` key in `src/` — 150 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 69 Derived · 13 Measured · 50 Literal · 18 Exempt.
-**Default form** (mechanical): 64 formula · 22 delegates · 5 sibling · 49 literal · 5 flag · 5 other.
+**Tier:** 69 Derived · 13 Measured · 50 Literal · 18 Exempt · **1 Unaudited**.
+**Default form** (mechanical): 64 formula · 22 delegates · 5 sibling · 50 literal · 5 flag · 5 other.
+
+⚠ **1 knob(s) carry no `# PDM:` marker.** That is debt, not a verdict — the
+suite fails while any remain. Add a marker: `# PDM: <Tier> — <one line> | tune: <cost>`.
 
 
 ## BLAS-1 SIMD kernels
@@ -249,7 +252,8 @@ Every `@load_preference` key in `src/` — 150 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `sme_min` | literal | Measured | a periodic crossover in `_SME_MR`, set at the smallest multiple above which every size wins; depends on edge-panel occupancy against kernel throughput, which no cache size predicts. | sweep |
+| `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
+| `sme_min_exact` | literal | Unaudited | — | — |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
 
 ## workspace

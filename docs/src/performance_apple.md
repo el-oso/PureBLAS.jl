@@ -39,8 +39,10 @@ The win is size-dependent, and the page reports both ends rather than one number
 | 512-1024 | 0.88-0.94 | 7.4-7.6 |
 | **2048-4096** | **1.07-1.10** | **7.9** |
 
-Below `_SME_MIN` (64) the packed panels do not pay for themselves and the call stays on NEON, so the
-smallest cells are unchanged from the pre-SME measurement — they are the NEON path, measured twice.
+Whether a call takes SME is governed by TILE OCCUPANCY, not size alone: a shape that divides the
+16-row panel exactly pays from n = 48, and anything with a remainder has to reach n = 96 before that
+remainder panel amortizes. Sizes the predicate declines stay on NEON and are unchanged from the
+pre-SME measurement — the same path, measured twice.
 
 **`syrk` and `syr2k` did not move at all** (0.13x and 0.14x Accelerate, before and after). They take a
 private packed path above a size cutoff and never reach `gemm`, so no kernel change can reach them
