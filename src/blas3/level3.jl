@@ -6134,7 +6134,8 @@ end
 function _trgemm_packed2!(
         up::Bool, α::T, X1, tX1::Bool, Y1, tY1::Bool,
         X2, tX2::Bool, Y2, tY2::Bool, C, k::Int, ::Val{MRV} = Val(_MR),
-        ::Val{NRV} = Val(_NR), ::Val{OV} = Val(false)
+        ::Val{NRV} = Val(_NR), ::Val{OV} = Val(false),
+        jlo::Int = 0, jhi::Int = size(C, 1)
     ) where {T <: BlasReal, MRV, NRV, OV}
     n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = NRV
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
@@ -6143,9 +6144,12 @@ function _trgemm_packed2!(
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap1 Bp1 Ap2 Bp2 begin
         Cp0 = pointer(C); A1p = pointer(Ap1); B1p = pointer(Bp1); A2p = pointer(Ap2); B2p = pointer(Bp2)
-        jc = 0
-        while jc < n
-            nce = min(nc, n - jc); pc = 0
+        # CLAMP TO `jhi`, NOT `n` — the same seam `_trgemm_packed!` carries, and for the same reason:
+        # with a column range, a last block sized against `n` would run past the range and write
+        # columns another worker owns.
+        jc = jlo
+        while jc < jhi
+            nce = min(nc, jhi - jc); pc = 0
             while pc < k
                 kce = min(kc, k - pc)
                 b0 = OV && pc == 0             # overwrite C on the first k-block (β=0), else accumulate
@@ -6376,30 +6380,66 @@ const _SYR2K_NR = @load_preference("syr2k_nr", _NR)::Int
 # keeps the fused unified path (32 regs, not starved). Overridable "syr2k_2pass".
 # PDM: Literal — AVX2-ONLY by construction: the default is typemax(Int) on AVX-512, which disables the branch. Zen3-only evidence is COMPLETE. | tune: n/a off AVX2
 const _SYR2K_2PASS = @load_preference("syr2k_2pass", _vwidth(Float64) == 4 ? 128 : typemax(Int))::Int
-# Handles β internally: the two-pass path can OVERWRITE C on its first pass when β=0 (skipping the
-# separate scaleC zero-pass — measured the whole n=256 gate gap, since scaleC + 2 adds is 3 C-touches at
-# the L2-resonant size). The fused/unified paths ADD, so they need C β-pre-scaled (zeroed if β=0).
-@inline function _syr2k_packed!(up::Bool, tr::Bool, α::T, β::T, A, Bm, C, k::Int) where {T <: BlasReal}
-    if _unified_ok(T)
-        _syrk_scaleC!(C, up, β)
-        return _trgemm_packed2_u!(up, α, A, tr, Bm, tr, C, k)
-    elseif size(C, 1) > _SYR2K_2PASS      # C = α·op(A)·op(B)ᵀ + α·op(B)·op(A)ᵀ (+β·C) — two triangular gemms
-        β0 = iszero(β)
-        β0 || _syrk_scaleC!(C, up, β)      # β≠0: pre-scale; β=0: pass 1 overwrites (Val(true))
-        X1, tX1, Y1, tY1, X2, tX2, Y2, tY2 = tr ? (A, true, Bm, false, Bm, true, A, false) :
-            (A, false, Bm, true, Bm, false, A, true)
-        β0 ? _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(true)) :
-            _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(false))
-        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X2, tX2, Y2, tY2, C, k)
+# WHICH SYR2K KERNEL — the ONE place that decides, asked by the serial entry, the threaded chunk and
+# the pool's lost-claim fallback alike.
+#
+# The rule was spelled in all three, and the copies did not agree. The chunk and the fallback ran
+# `_trgemm_packed2_u!` unconditionally, which is wrong twice over:
+#   * `_trgemm_packed2_u!` packs A in `_vwidth(T)`-row panels while its microkernel reads B as an
+#     `_NR`-wide panel, so it is only CORRECT when `_vwidth(T) == _NR` (`_unified_layout_ok`). Where
+#     that fails the threaded answer was wrong, not merely differently rounded.
+#   * Fused and two-pass are not bit-identical at any α, 1.0 included: the fused microkernel carries
+#     both products in one accumulator per k-step and applies α once at the store — C + α·Σ(ab⊕ef) —
+#     while two passes compute (C + α·Σab) + α·Σef. Requirement 11 compares bit patterns, so a chunk
+#     on a different route than serial breaks it even when both answers are good to 1e-15.
+# Within the fused family `_u` and non-`_u` ARE interchangeable: same `_microkernel2!`, same per-element
+# k order, same unscaled packs, α at the store. That is the only sense in which a chunk may run a
+# different kernel than serial.
+#
+# `n` MUST be the whole problem's order, never a chunk width, or two workers pick different routes.
+@inline function _syr2k_route(::Type{T}, n::Int) where {T <: BlasReal}
+    _unified_ok(T) && return :unified
+    n > _SYR2K_2PASS && return :twopass
+    return :fused
+end
+
+# One column range [jlo, jhi) of a syr2k accumulation. C must already carry its β scaling, except on
+# the two-pass route with β=0, where `β0` lets the first pass overwrite instead (worth the whole n=256
+# gate gap: scaleC plus two adds is three C-touches at the L2-resonant size).
+@inline function _syr2k_accumulate!(
+        route::Symbol, up::Bool, tr::Bool, α::T, A, Bm, C, k::Int,
+        jlo::Int, jhi::Int, β0::Bool
+    ) where {T <: BlasReal}
+    if route === :unified
+        _trgemm_packed2_u!(up, α, A, tr, Bm, tr, C, k, jlo, jhi)
         return C
     end
-    β0 = iszero(β)
-    β0 || _syrk_scaleC!(C, up, β)          # fused kernel writes each C-tile ONCE → overwrite when β=0
+    # Both operands take their shape from `tr`; what differs between the passes is the transpose FLAG.
     X1, tX1, Y1, tY1, X2, tX2, Y2, tY2 = tr ? (A, true, Bm, false, Bm, true, A, false) :
         (A, false, Bm, true, Bm, false, A, true)
-    return β0 ?
-        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(true)) :
-        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(false))
+    if route === :twopass
+        β0 ? _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(true), jlo, jhi) :
+            _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X1, tX1, Y1, tY1, C, k, Val(false), jlo, jhi)
+        # SAME column range, SAME worker: handing one pass to each worker would put two of them on one
+        # range, a plain write race.
+        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, X2, tX2, Y2, tY2, C, k, Val(false), jlo, jhi)
+        return C
+    end
+    ov = β0 && jlo == 0 && jhi == size(C, 1)   # only a whole-matrix call may overwrite
+    return ov ?
+        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(true), jlo, jhi) :
+        _trgemm_packed2!(up, α, X1, tX1, Y1, tY1, X2, tX2, Y2, tY2, C, k, Val(_SYR2K_MR), Val(_SYR2K_NR), Val(false), jlo, jhi)
+end
+
+@inline function _syr2k_packed!(up::Bool, tr::Bool, α::T, β::T, A, Bm, C, k::Int) where {T <: BlasReal}
+    n = size(C, 1)
+    route = _syr2k_route(T, n)
+    β0 = iszero(β)
+    # The two-pass route can overwrite on its first pass when β=0; the fused routes add into C, so
+    # they need it pre-scaled (zeroed if β=0).
+    (β0 && route === :twopass) || _syrk_scaleC!(C, up, β)
+    _syr2k_accumulate!(route, up, tr, α, A, Bm, C, k, 0, n, β0)
+    return C
 end
 
 # Recursive blocked syrk/herk (the gate path): split into 2×2; the two diagonal blocks recurse and the
@@ -7327,8 +7367,8 @@ function syr2k!(
     end
     n, k = _syr2k_dims(C, A, Bm, trans); up = uplo == 'U'
     # ── M4 PHASE 4: SPLIT THE TRIANGLE ─────────────────────────────────────────────────────────────
-    # `_syrk_run_chunk` picks the SAME kernel the serial path would — the fused `_trgemm_packed2_u!`
-    # when `_unified_ok`, else the two-pass route — so threaded and serial cannot disagree.
+    # `_syrk_run_chunk` asks `_syr2k_route` — the same predicate this entry asks — so threaded and
+    # serial run the same route by construction rather than by two copies of a rule agreeing.
     #
     # A FIRST ATTEMPT GATED THIS ON THE TWO-PASS ROUTE AND WAS DEAD CODE: on this fleet `_unified_ok`
     # is true for Float64 and `_SYR2K_2PASS` is `typemax(Int)`, so syr2k ALWAYS takes the fused route.

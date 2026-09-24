@@ -3969,7 +3969,10 @@ end
     # path would have, or the same call returns different last bits depending on who won a race. See
     # the kernel-choice note in `_syrk_run_chunk` for why the chunk does not use the serial kernel.
     if sym2
-        _trgemm_packed2_u!(up, alpha, A, tA, B, tA, C, k)
+        # C already carries its β scaling (the driver applied it and passes β=0), so this is a pure
+        # accumulate over the whole matrix. The ROUTE is the serial entry's, asked of the one
+        # predicate rather than re-spelled here.
+        _syr2k_accumulate!(_syr2k_route(T, C.n), up, tA, alpha, A, B, C, k, 0, C.n, false)
         return nothing
     end
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
@@ -4014,17 +4017,16 @@ end
     # re-measure this table: the unified kernel would then win on both counts and this comment is the
     # trigger to switch.
     if p.sym2
-        _trgemm_packed2_u!(p.up, p.alpha, X, p.tA, Y, p.tA, C, p.k, j0, j0 + len)
+        # ROUTE FROM THE WHOLE PROBLEM (`p.n`), not this chunk's width: `_syr2k_route` keys on n, so a
+        # chunk asking with `len` would pick a different kernel than serial and than its siblings.
+        # C already carries its β scaling — the driver applied it and passes β=0 — so this is a pure
+        # accumulate and `β0` is false.
+        _syr2k_accumulate!(_syr2k_route(T, p.n), p.up, p.tA, p.alpha, X, Y, C, p.k,
+                           j0, j0 + len, false)
         return nothing
     end
     _trgemm_packed!(
         Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, X, p.tA, Y, !p.tA, C, p.k,
-        Val(false), j0, j0 + len
-    )
-    # syr2k's second pass on the 2-pass route: the transposed product, SAME column range, SAME worker.
-    # Splitting the passes across workers would put two of them on one range — a data race.
-    p.sym2 && _trgemm_packed!(
-        Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, Y, p.tA, X, !p.tA, C, p.k,
         Val(false), j0, j0 + len
     )
     return nothing
