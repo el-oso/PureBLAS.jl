@@ -3390,6 +3390,44 @@ end
         nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
 
+"""
+    _gemm_trailing!(C, A, B, alpha, beta, tA, tB; nroute = -1) -> C
+
+A blocked LAPACK driver's trailing update, threaded when the shape earns it.
+
+WHY THIS EXISTS. A driver cannot reach the pool through `gemm!`: that entry gates on whether `C` is a
+strided matrix, which a `PtrMatrix` is not, so a Mode-1 or `.so` caller would silently take the
+generic kernel (`bunchkaufman.jl:499`, `banded_chol.jl:517` both record the trap). Calling
+`_gemm_core!` directly avoids it and was what every driver did — but `_gemm_core!`'s `nw` declares
+"I am worker `wi` of `nw`", it does not REQUEST workers, so those updates ran on one thread whatever
+the pool held. `sytrf`, `geqp3`, `gelsy` and `gbtrf` all read a 1.00x self-speedup for that reason.
+
+Reproducibility comes from the pair being the same computation, not from the split being avoided:
+both arms decline Strassen, and the threaded arm routes every chunk from the whole column count
+(`p.n`), so each element of C accumulates its entire `k` chain on one worker in an order fixed by
+`kc = min(_KC, k)` — a function of the problem, never of the worker count.
+
+`nroute` is for a caller that has already divided a LARGER update into several dispatches and needs
+every piece to route from the undivided width; a caller whose `C` is the whole update leaves it at -1.
+"""
+@inline function _gemm_trailing!(
+        C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cB::Bool = false; nroute::Int = -1
+    ) where {T}
+    m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
+    # `T <: BlasReal` and `!cB`: the pool exists only for the two real types, and a conjugated operand
+    # is a complex-only shape. Both fall through to the serial call, which is what they did before.
+    nw = (T <: BlasReal && !cB) ? _gemm_workers(m, nroute < 0 ? n : nroute, k) : 1
+    if nw > 1 && _strided1(C) && _strided1(A) && _strided1(B)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), alpha, beta, tA, tB, false, false, nw
+        )
+        return C
+    end
+    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, nroute)
+    return C
+end
+
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
         nroute::Int, strassen::Bool, nw::Int, wi::Int
