@@ -91,7 +91,18 @@ end
 _is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl" || a == "accelerate"
 _is_pb_arm(a::AbstractString) = a == _ARM_PB || a == _ARM_PB_MT
 # Set PureBLAS's thread count for the arm about to be timed. Called BETWEEN windows, never inside one.
-_use_pb!(a::AbstractString) = (PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
+#
+# QUIET THE VENDOR BACKEND TOO, and it is not a formality. `_use_ref!` leaves OpenBLAS at `_MT_NT`
+# after a threaded reference arm, and OpenBLAS's idle threads SPIN-WAIT — so without this line a PB arm
+# measured next in the rotation competes for its own cores with N spinners.
+#
+# The damage is confined to a call SHAPE rather than to an op, which is why it hid: measured at 6
+# PureBLAS threads with OpenBLAS at 1 against 6, a single large Level-3 call is unmoved (gemm, symm and
+# syrk at n=512/1024/2048 all read 0.90-1.02x), while `getri` — a driver issuing many SMALL threaded
+# calls, where worker wake latency dominates and contention multiplies it — reads 0.686 ms against
+# 11.526 ms at n=256. That is 16x, and it inverts the verdict: `getri` reads 0.06x "slower threaded"
+# contaminated, against a true 1.77x faster at n=1024.
+_use_pb!(a::AbstractString) = (BLAS.set_num_threads(1); PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
 # `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
 # iteration path; it is also the one that can silently go stale, which is why every arm carries its own
 # timestamp+commit and the table reports reference age rather than hiding it.
