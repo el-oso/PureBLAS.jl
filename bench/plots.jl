@@ -88,7 +88,7 @@ end
 # Is this arm a VENDOR reference — i.e. may it appear on the other side of a gate comparison? `pb` and
 # `pb_mt` are both PureBLAS, and `generic` is LinearAlgebra's own fallback. Everything that adjudicates
 # or audits a PB-vs-reference pair must ask THIS, never `a != "pb"`.
-_is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl"
+_is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl" || a == "accelerate"
 _is_pb_arm(a::AbstractString) = a == _ARM_PB || a == _ARM_PB_MT
 # Set PureBLAS's thread count for the arm about to be timed. Called BETWEEN windows, never inside one.
 _use_pb!(a::AbstractString) = (PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
@@ -107,10 +107,6 @@ end
 # LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
 # reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
 # single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
-# x86_64-only: AOCL_jll has no aarch64-apple-darwin artifact, and `bench/apple/Project.toml` (the
-# environment this file runs under on Apple Silicon) does not even list it as a dependency — so the
-# `using` must not execute there. Mirrors the existing `REFBK == "mkl" && @eval using MKL` pattern.
-const _ONX86 = Sys.ARCH === :x86_64 || Sys.ARCH === :i686
 
 # BLIS reads these at init, before any forward — so they are set HERE, above `using AOCL_jll`, and
 # cannot be changed afterwards by `BLAS.set_num_threads`.
@@ -126,22 +122,29 @@ for _v in ("BLIS_NUM_THREADS", "OMP_NUM_THREADS")
 end
 # Remember what BLIS was actually initialised with; the arm guard reads this, not the live ENV.
 const _BLIS_INIT_NT = parse(Int, ENV["BLIS_NUM_THREADS"])
-if _ONX86
-    @eval using AOCL_jll
-end
+# AOCL_jll ships no aarch64-apple-darwin artifact, so loading it unconditionally would fail to
+# precompile on Apple silicon. Apple silicon uses Accelerate (vecLib) as its vendor reference
+# instead — see the `accelerate` branch of `_use_ref!` below.
+const _IS_APPLE = Sys.isapple()
+_IS_APPLE || @eval using AOCL_jll
 
 # Accelerate = Apple's system BLAS/LAPACK (vecLib, inside the Accelerate umbrella framework — no package,
-# no artifact, it ships with the OS). Forwarded by raw dylib path exactly like OpenBLAS/AOCL above. Two
-# interfaces live in the SAME binary behind different symbol manglings: the legacy LP64 (32-bit int) path
-# that `lbt_forward` autodetects by default, and a newer ILP64 path Apple added in macOS 13.3
-# ("$NEWLAPACK$ILP64"-suffixed symbols, e.g. `dgemm$NEWLAPACK$ILP64` — note NO trailing underscore before
-# the `$`, unlike the classic Fortran mangling). Julia's own BLAS entry points are ILP64
-# (`dgemm_64_`, req'd since PureBLAS's own ABI is ILP64 too — see CLAUDE.md), so the LP64 default is the
-# wrong interface: forwarding without a suffix hint leaves the ILP64 slot empty and every call errors
-# "no BLAS/LAPACK library loaded for dgemm_64_()". The working incantation (confirmed empirically here,
-# and matching JuliaLinearAlgebra/AppleAccelerate.jl's `load_accelerate`) needs a LEADING \x1a (0x1A, ASCII
-# SUB) byte before the suffix text — `lbt_forward`'s suffix autodetection otherwise tries the hint as a
-# plain appended suffix (`dgemm_$NEWLAPACK$ILP64`, which does not exist) and silently falls back to LP64.
+# no artifact, it ships with the OS). Forwarded by raw dylib path exactly like OpenBLAS/AOCL above.
+#
+# FORWARD THE UMBRELLA FRAMEWORK WITH A SUFFIX, NOT vecLib's `libBLAS.dylib`. Two interfaces live in
+# the same binary behind different symbol manglings: the legacy LP64 (32-bit int) path that
+# `lbt_forward` autodetects by default, and the ILP64 path Apple added in macOS 13.3
+# ("$NEWLAPACK$ILP64"-suffixed symbols, e.g. `dgemm$NEWLAPACK$ILP64` — note NO trailing underscore
+# before the `$`, unlike the classic Fortran mangling). Julia's own entry points are ILP64
+# (`dgemm_64_`, required since PureBLAS's ABI is ILP64 too — see CLAUDE.md), so forwarding
+# `libBLAS.dylib` without a suffix hint leaves the ILP64 slot EMPTY: `A*B` then prints "no BLAS/LAPACK
+# library loaded for dgemm_64_" and returns zeros — a wrong NUMBER, not an exception, which is exactly
+# what would land in a cache and be published as a reference measurement.
+#
+# The working incantation (confirmed empirically here, and matching
+# JuliaLinearAlgebra/AppleAccelerate.jl's `load_accelerate`) needs a LEADING \x1a (0x1A, ASCII SUB)
+# byte before the suffix text; without it `lbt_forward`'s suffix autodetection tries the hint as a
+# plain appended suffix (`dgemm_$NEWLAPACK$ILP64`, which does not exist) and falls back to LP64.
 const _ACCELERATE_PATH = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
 const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
 # `LinearAlgebra.BLAS.set_num_threads(1)` (called after every forward, below) does NOT constrain
@@ -154,7 +157,7 @@ const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
 # Accelerate for the first time, is required for a real single-thread measurement. Verified fix: with
 # this set before first use, the SAME `dgemm` pins at a clean ~99-100% CPU for the whole window
 # (272.7 ms/call vs the uncontrolled run's 234.6 ms/call — i.e. the "second core" bought only ~16%,
-# consistent with the matrix unit being a shared resource a second software thread can't usefully
+# consistent with the matrix unit being a shared resource a second software thread cannot usefully
 # double up on, not with real 2x general-purpose parallelism).
 ENV["VECLIB_MAXIMUM_THREADS"] = "1"
 
@@ -197,12 +200,15 @@ function _use_ref!(name::AbstractString)
     if name == "aocl"
         LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # BLAS   → libblis-mt.so
         LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # LAPACK → libflame.so
-    elseif name == "openblas"
-        LinearAlgebra.BLAS.lbt_forward(OpenBLAS_jll.libopenblas_path; clear = true)
     elseif name == "accelerate"
         # ONE forward covers both BLAS and LAPACK — Accelerate ships them in the same umbrella binary,
-        # unlike AOCL's separate blis/flame .so files.
+        # unlike AOCL's separate blis/flame .so files, and the suffix hint is what selects the ILP64
+        # interface. Forwarding vecLib's `libBLAS.dylib`/`libLAPACK.dylib` instead registers LP64 and
+        # leaves the `_64_` slot empty, which returns ZEROS rather than raising — see the constants
+        # above for the full account and why the leading \x1a byte is required.
         LinearAlgebra.BLAS.lbt_forward(_ACCELERATE_PATH; clear = true, suffix_hint = _ACCELERATE_SUFFIX)
+    elseif name == "openblas"
+        LinearAlgebra.BLAS.lbt_forward(OpenBLAS_jll.libopenblas_path; clear = true)
     else
         error("unknown reference backend $name")
     end
@@ -212,11 +218,11 @@ end
 
 # Reference arms available this run. `_REF_ARMS` is what gets measured; PureBLAS is always measured
 # unless the cache already holds it and only references were asked for.
-# Default DUAL-reference set is architecture-dependent: AOCL is AMD-only (no aarch64-apple-darwin build,
-# not even a dependency of `bench/apple/Project.toml`), so an Apple Silicon run's honest second reference
-# is Accelerate instead — the platform's own vendor BLAS, exactly the AOCL/AMD relationship's ARM analogue.
+# Default DUAL-reference set is architecture-dependent: AOCL is AMD-only (no aarch64-apple-darwin
+# build, not even a dependency of `bench/apple/Project.toml`), so an Apple Silicon run's honest second
+# reference is Accelerate — the platform's own vendor BLAS, the AOCL/AMD relationship's ARM analogue.
 const _REF_ALL = REFBK == "mkl" ? ["mkl"] : REFBK == "accelerate" ? ["accelerate"] :
-    _ONX86 ? ["openblas", "aocl"] : ["openblas", "accelerate"]
+    _IS_APPLE ? ["openblas", "accelerate"] : ["openblas", "aocl"]
 # ⚠ REFERENCE ARMS ARE CACHE-ONLY BY DEFAULT. Omitting `arms=` used to mean "measure every arm", so
 # forgetting the flag silently re-ran OpenBLAS and AOCL — which is the whole reason the v3 cache stores
 # them. The default is now PB ONLY; re-measuring a reference is an explicit, typed-out request.
@@ -2592,8 +2598,12 @@ function _ref_age(g, ref::AbstractString = REFBK)
     return (minimum(stamps), maximum(stamps))
 end
 
-function svg_panels(path, title, fleet, gk, ref::AbstractString = REFBK)
+function svg_panels(path, title, fleet, gk, ref::AbstractString = REFBK; only = nothing)
     ops = _opsin(fleet, gk)
+    # `only` keeps a panel to the operations the reader came for. The mt panels use it: a curve
+    # that is flat because nothing splits that routine is not a result, and a page of them buries
+    # the ones that are.
+    isnothing(only) || (ops = [o for o in ops if o in only])
     # A GROUP WITH NO CELLS STILL WRITES A FILE. This used to `return` silently, which breaks the docs
     # build rather than the plot: `docs/src/performance.md` references each panel by name, Documenter
     # downgrades a missing image to a WARNING, and then vitepress hard-fails on the unresolved import
@@ -2860,22 +2870,38 @@ tdir = isnothing(_OUTDIR) ? (@__DIR__) : _OUTDIR
 if "mtdraw" in ARGS
     mtfleet = load_fleet("mt_data_")
     if isempty(mtfleet)
-        println("no mt_data_* caches on disk — run: … bench/plots.jl bench arms=pb,pb_mt nodraw")
+        println("no mt_data_* caches on disk — run: … bench/plots.jl bench arms=pb,pb_mt")
     else
         adir0 = isnothing(_OUTDIR) ? joinpath(@__DIR__, "..", "docs", "src", "assets") : _OUTDIR
         mkpath(adir0)
-        for (gk, base, ttl) in (
-                ("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
-                ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "Complex BLAS-1"),
-                ("CL2", "cl2", "Complex BLAS-2"), ("CL3", "cl3", "Complex BLAS-3"),
-                ("CLP", "clapack", "Complex LAPACK"),
-            )
+        # ONLY THE GROUPS AND OPERATIONS THAT THREAD. A routine with no splitter draws a flat line
+        # at 1.00, which reports the harness rather than the library; eight panels of them hid the
+        # six curves worth reading. `_MT_PLOT_MIN` is the harness noise floor measured on the cells
+        # whose true answer is known to be 1.00 (`NOISE_P99`, bench/gen_threading.jl), so a curve that
+        # appears here is threaded rather than merely noisy.
+        _MT_PLOT_MIN = 1.25
+        function _movers(fleet, gk)
+            keep = String[]
+            for op in _opsin(fleet, gk)
+                best = 0.0
+                for (_, g) in fleet
+                    s = _series(g, gk, op, _ARM_PB_MT)
+                    isnothing(s) && continue
+                    for (_, rs) in s
+                        isempty(rs) || (best = max(best, median(rs)))
+                    end
+                end
+                best >= _MT_PLOT_MIN && push!(keep, op)
+            end
+            return keep
+        end
+        for (gk, base, ttl) in (("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
             p = joinpath(adir0, "perf_mt_$(base).svg")
-            svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread (SCALING, not the gate)",
-                mtfleet, gk, _ARM_PB_MT)
+            svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread", mtfleet, gk, _ARM_PB_MT;
+                only = _movers(mtfleet, gk))
             println("  ", relpath(p))
         end
-        println("mt panels written — these are SCALING curves; the gate is single-threaded.")
+        println("mt panels written — scaling curves for the routines that thread.")
     end
     exit(0)
 end
