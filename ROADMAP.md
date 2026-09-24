@@ -1801,3 +1801,117 @@ sparse Cholesky.
   *now* wherever a Fable-mapped technique measurably closes a gate on locked HW; the broader systematic
   port (or a dedicated panel-major sibling package for the embedded-optimization use case) is a future
   project. Reference-only — never a C/asm dependency (pure-Julia). See the Fable BLASFEO technique-map.
+
+## SME across the full surface (Apple Silicon)
+
+**Target:** median ratio ≥ 0.9, per op. Medians, not worst cells — the worst cell is almost always a
+size below `_SME_MIN`, where SME cannot apply at all and the deficit is per-call overhead, a
+different project. Full gating is a second round.
+
+**The reference is chosen PER CELL, by whether SME applies to that cell:**
+
+| cell | reference |
+|---|---|
+| SME eligible | `max(OpenBLAS_mt, Accelerate)` |
+| SME declines | `max(OpenBLAS_1t, Accelerate)` |
+
+A cell SME cannot take runs single-threaded NEON, and holding that to a twelve-core reference
+measures the absence of a kernel rather than the quality of one. A cell SME DOES take is a fair
+fight against every core the box has, because one coprocessor is what it is spending. The ratio is
+computed per cell against its own reference; the median is then taken over cells, so one op can span
+both regimes — `gemm` is SME above n=96 and NEON below n=48, and each of its cells is judged
+against what it actually competes with.
+
+This is not the shipped gate (`bench/gatecrit.jl`), which is worst-cell against one reference set.
+It is a campaign target, and the two must not be conflated in any published table.
+
+**Three mechanisms, and which one a routine wants decides the work:**
+
+| mechanism | rate (M6) | suits |
+|---|---|---|
+| `fmopa` outer product | 549 GFLOP/s | rank-k updates — Level 3 |
+| `fmla` into ZA | 1013 GB/s | a small result held in ZA while a large operand streams — Level 2 |
+| ZA transpose | 80 GB/s | packing (already used by the gemm packer) |
+
+SME is Float64-only (`FEAT_SME_F64F64`). That is not a limit on the complex and dual phases: both
+decompose into REAL products — `_gemm_3m!` into three, `_gemm_dual3!` into three planes — so they
+inherit SME if and only if those products reach an SME-eligible call. Those phases are expected to be
+routing, not kernels.
+
+### Step 0 — make the target computable
+
+Neither reference set is computable today: the Apple cache holds a single-threaded OpenBLAS arm and
+no threaded one. Measure `openblas_mt` across every group before anything else — the per-cell rule
+above needs BOTH arms present, since a single op draws on each depending on the size.
+
+Measured for gemm already, and it sets expectations: OpenBLAS on 12 cores reaches 309-370 GFLOP/s
+(a 4.7-5.7x self-speedup, not 12x), against 504 for one SME unit. Accelerate is the binding
+reference for gemm at every size. Where SME does NOT apply, the threaded arm will bind instead, and
+that is where this target is harder than the single-threaded one it replaces.
+
+### Phase 1 — real: L1, L2, L3, LP
+
+Current medians vs Accelerate (single thread; the bar moves once step 0 lands):
+
+    L3   gemm 0.90   symm 0.77   trsmR 0.57   trsm 0.46   trmmR 0.27   trmm 0.23
+         syrk 0.13   syr2k 0.14
+    LP   getrf 1.41  gesvd 0.99  geqrf 0.99   potrf 0.55
+    L2   symv 1.15   spmv 1.05   trsv 0.95    sbmv 0.78    trmv 0.67
+         gbmvN 0.46  ger 0.37    gemvT 0.34   gemvN 0.17
+    L1   nrm2 1.96   axpy 1.19   dot 1.09     asum 1.00    iamax 0.93   scal 0.83
+
+1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
+     not wired in. Needs transposed operands, strides, beta handling and the portability guards the
+     gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.
+
+1.2  **Re-derive the Level-3 pack cutoffs.** `syrk` and `syr2k` did not move at all when gemm went
+     from 44 to 500 GFLOP/s — 0.13 and 0.14 before and after. They take a private packed path above a
+     size cutoff and never reach gemm. `_symm!` documents the same trade in its own comment: it chose
+     the packed path because materialize-plus-gemm was slower, which was true at 44 GFLOP/s.
+     No new kernel. Re-derive, then measure.
+
+1.3  **Port the ZA-accumulate kernel to `symv` and `trmv`.** Same mechanism as gemv, one kernel
+     covering both. symv is already 1.15 so the work is trmv 0.67 and holding symv.
+
+1.4  **Measure before writing** for `ger` (0.37), the banded ops, and L1. `ger` reads AND writes A,
+     so it is memory-bound both ways and ZA may not help; `dot`/`nrm2`/`asum` accumulate and are the
+     only L1 candidates. `axpy`/`scal`/`copy`/`swap` hold nothing in ZA and are out of scope.
+
+1.5  **LP routing.** `getrf` is already 1.41 and `geqrf`/`gesvd` 0.99, all inherited through gemm.
+     `potrf` at 0.55 has private leaf kernels — the same class of problem as syrk.
+
+**Exit:** L3 and LP medians ≥ 0.9; gemv/symv/trmv ≥ 0.9; L1 and ger reported with evidence either
+way, including a negative result.
+
+→ Fable adversarial review → fix
+
+### Phase 2 — complex: CL1, CL2, CL3, CLP
+
+Test the hypothesis before writing anything: does `_gemm_3m!` already reach an SME-eligible call?
+Its three real products are ordinary gemms. If they do, complex inherits SME today and the phase is
+verification; if they do not, the fix is a predicate.
+
+→ Fable adversarial review → fix
+
+### Phase 3 — dual: DL1, DL2, DL3, DLP
+
+Same hypothesis for `_gemm_dual3!`'s three plane products. The constraint is Mode 2: `sme_tests.jl`
+currently ASSERTS that Dual keeps taking the generic path, so admitting it means rewriting that
+contract deliberately rather than discovering it broke.
+
+→ Fable adversarial review
+
+### Rules this campaign binds itself to
+
+Each came from a defect shipped earlier in this work, not from principle.
+
+1. **Sample every n before deriving a cut, not every other one.** `_SME_MIN = 3*MR` was derived from
+   a 2-step sweep that read 48, 56, 64 and concluded every size above 48 wins. It regressed gemm@50
+   by 38%. The dense sweep found 49 at 0.44, and that the old `4*MR` was unsafe too (n=65 at 0.67).
+
+2. **Routing before kernels.** Every large miss found so far has been a predicate, not arithmetic:
+   `syrk` bypassing gemm, thin shapes at 0.14x because `max(m,n,k)` admitted them, threaded `syr2k`
+   returning a WRONG ANSWER because a chunk hardcoded a kernel instead of asking serial's route.
+
+3. **When you fix a cost, re-test the workarounds built around it.** Every cutoff derived against a
+   44 GFLOP/s gemm is suspect now, and `_symm!`'s comment says so in as many words.
