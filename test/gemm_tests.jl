@@ -119,6 +119,23 @@ end
     @test_throws DimensionMismatch PureBLAS.gemm!(zeros(3, 3), zeros(3, 4), zeros(5, 3))
 end
 
+# LIVENESS GATE FOR EVERY THREADING ITEM BELOW.
+#
+# Each of them takes a skip branch under two threads, and a skipped guarantee is indistinguishable in
+# the summary from a passing one — so a single-threaded run reports green having started no worker and
+# verified no bit-identity. This item fails on exactly that process, which turns a silent gap into a
+# named one.
+#
+# The fix when it fires is to give the process threads, never to weaken the gate:
+#     JULIA_NUM_THREADS=4 julia --project=. -e 'using Pkg; Pkg.test()'
+# CI does this per job; the threading items are `:checks`-tagged, so it is the `checks` job that needs
+# it and not only `main`, whose filter excludes them.
+@testitem "threading guarantees actually ran" tags = [:checks] begin
+    using Base.Threads: nthreads
+    threading_items_can_run = nthreads() >= 2
+    @test threading_items_can_run
+end
+
 @testitem "threaded gemm: same answer as the serial path, and still 0 B" tags = [:checks] begin
     using PureBLAS, Base.Threads
     P = PureBLAS

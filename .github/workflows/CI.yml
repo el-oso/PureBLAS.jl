@@ -30,11 +30,12 @@ jobs:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
-      # `-t 4`: the threading items guard on `Threads.nthreads() >= 2` and skip below it, so a
-      # single-threaded runner reports them green having run nothing — including the thread-count
-      # reproducibility gate, which is the one check that cannot be replaced by reading the code.
-      # 4 rather than the runner's full count: `_gemm_workers` needs enough workers to split, and the
-      # hosted runners are small enough that oversubscribing slows the suite without covering more.
+      # `-t 4`: any item that reaches a threaded kernel needs workers to reach it at all, and below two
+      # threads the pool never forms. The bit-identity and threaded-correctness items are NOT here —
+      # they are tagged `:checks` and this group's filter excludes them — so the same setting is
+      # repeated on the `checks` job, which is where those run. 4 rather than the runner's full count:
+      # `_gemm_workers` needs enough workers to split, and the hosted runners are small enough that
+      # oversubscribing slows the suite without covering more.
       - uses: julia-actions/julia-runtest@v1
         env:
           PUREBLAS_TEST_GROUP: main
@@ -78,11 +79,20 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       # Inference/trim-safety dogfood — no line coverage (these exercise the SAME kernels the `test` job
       # already covers functionally; they assert type-stability/no-alloc/trim-safety, not new surface).
+      #
+      # `-t 4` BELONGS HERE, because this is the job that runs the threading items: they are tagged
+      # `:checks`, and the `main` group's filter is `!(:checks in tags)`. Below two threads every one of
+      # them takes its skip branch, so the thread-count reproducibility gate — the one check that cannot
+      # be replaced by reading the code — reports green having run nothing. 4 rather than the runner's
+      # full count: `_gemm_workers` needs enough workers to split, and the hosted runners are small
+      # enough that oversubscribing slows the suite without covering more. The item "threading
+      # guarantees actually ran" fails if this is ever dropped again.
       - uses: julia-actions/julia-runtest@v1
         with:
           coverage: false
         env:
           PUREBLAS_TEST_GROUP: checks
+          JULIA_NUM_THREADS: '4'
 
   # AUTHORITATIVE trim gate: actually build libpureblas.so via juliac --trim=safe. The `checks` job's
   # StrictModeTest @test_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
