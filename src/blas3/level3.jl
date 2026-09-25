@@ -6563,9 +6563,34 @@ end
 
 # Large real syrk → single-pass packed (gate); complex syrk/herk → unpacked-tri (small trans='N') or
 # packed-tri; small → recursion.
+# ABOVE THIS THE RECURSIVE ROUTE WINS, BECAUSE IT REACHES gemm AND THE PACKED PATH DOES NOT.
+#
+# `_syrk_packed!` is a single-product triangular kernel on the SIMD unit. `_syrk_rec!` splits the
+# triangle and hands its off-diagonal blocks to `_gemm_core!`, which on a machine with SME runs an
+# order of magnitude faster. The packed cut below was derived when gemm ran at 44 GFLOP/s on this
+# box; it now runs at 500, and the trade inverts. Measured, same operands, one process
+# (`bench/probes/sme_syrk_route.jl`):
+#
+#     n          128    256    384    512   1024   2048
+#     packed    50.9   56.2   59.4   60.2   61.3   59.6   GFLOP/s   (flat: the NEON roofline)
+#     via gemm  46.8   80.7  121.4  138.4  203.0  226.5
+#     ratio     0.92   1.44   2.04   2.30   3.31   3.80
+#
+# The packed path is flat because it cannot reach the coprocessor at all. Below the cut the split
+# is noisy and sometimes loses (n=144 at 0.68, n=272 at 0.97), so this sits where every measured
+# point wins by at least 1.7x rather than at the first point that wins at all.
+#
+# APPLIES ONLY WHERE SME IS PRESENT. Off it, `_SME_F64` is false and the packed path keeps every
+# size, which is the measured-correct behaviour on the AMD fleet.
+# PDM: Measured — the size at which a route that reaches the coprocessor overtakes one that cannot; it turns on the ratio between two kernels' throughput, which no cache size predicts. | tune: sweep
+const _SYRK_SME_MIN = @load_preference("syrk_sme_min", 24 * _SME_MR)::Int
+
+@inline _syrk_prefer_packed(::Type{T}, n::Int) where {T} =
+    n > _fh_syrk_pack_cut() && !(_SME_F64 && T === Float64 && n >= _SYRK_SME_MIN)
+
 function _syrk_blocked!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int)
     T = eltype(C)
-    if !herm && T <: BlasReal && size(C, 1) > _fh_syrk_pack_cut() && k > 0
+    if !herm && T <: BlasReal && _syrk_prefer_packed(T, size(C, 1)) && k > 0
         return _syrk_packed!(up, tr, convert(T, α), A, C, k)
     elseif T <: Union{ComplexF64, ComplexF32} && k > 0
         n = size(C, 1)
@@ -6684,7 +6709,7 @@ function syrk!(
     # would be reinterpreted rather than converted.
     T = eltype(C)
     nw = (T === Float64 || T === Float32) && eltype(A) === T &&
-        _strided1(A) && _strided1(C) && size(C, 1) > _fh_syrk_pack_cut() && k > 0 ?
+        _strided1(A) && _strided1(C) && _syrk_prefer_packed(eltype(C), size(C, 1)) && k > 0 ?
         _syrk_workers(size(C, 1), k) : 1
     if nw > 1
         rA = _root(A); rC = _root(C)
@@ -7317,6 +7342,20 @@ const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_
 # PDM: Literal — never swept: the retired ternary had two identical arms. Validated by gate only. | tune: unswept
 const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", 8)::Int   # req8-ok: see above
 @inline _fh_csyr2k_pack_cut() = (f = _FKR_csyr2k_pack_cut[]; f >= 0 ? f : _CSYR2K_PACK_CUT)
+# The syr2k counterpart of `_syrk_prefer_packed`, with its OWN measured cut: the two-product fused
+# kernel and the single-product one do not cross over at the same place. Same operands, one process
+# (`bench/probes/sme_syrk_route.jl` with the syr2k arm):
+#
+#     n          112    144    176    192    256    512   1024   2048
+#     ratio     0.90   0.77   0.84   1.73   1.97   2.90   3.91   4.19    (via gemm / packed)
+#
+# Every n at or above 12*MR wins; below it the split is noisy and loses as far down as 0.77.
+# PDM: Measured — the size at which the recursive route's reach into the coprocessor overtakes the packed kernel that cannot reach it; a ratio between two kernels' throughput, not a residency criterion. | tune: sweep
+const _SYR2K_SME_MIN = @load_preference("syr2k_sme_min", 12 * _SME_MR)::Int
+
+@inline _syr2k_prefer_packed(::Type{T}, n::Int) where {T} =
+    n > _fh_syr2k_pack_cut() && !(_SME_F64 && T === Float64 && n >= _SYR2K_SME_MIN)
+
 function syr2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false
@@ -7344,7 +7383,7 @@ function syr2k!(
     Tr = eltype(C)
     nw2 = (Tr === Float64 || Tr === Float32) && eltype(A) === Tr && eltype(Bm) === Tr &&
         _strided1(A) && _strided1(Bm) && _strided1(C) &&
-        n > _fh_syr2k_pack_cut() && k > 0 ?
+        _syr2k_prefer_packed(Tr, n) && k > 0 ?
         _syrk_workers(n, 2 * k) : 1        # 2k: syr2k does TWO rank-k passes, so twice the flops
     if nw2 > 1
         _syrk_scaleC!(C, up, convert(Tr, beta))
@@ -7355,7 +7394,7 @@ function syr2k!(
         )
         return C
     end
-    if eltype(C) <: BlasReal && n > _fh_syr2k_pack_cut() && k > 0
+    if eltype(C) <: BlasReal && _syr2k_prefer_packed(eltype(C), n) && k > 0
         _syr2k_packed!(up, trans != 'N', convert(eltype(C), alpha), convert(eltype(C), beta), A, Bm, C, k)
     elseif eltype(C) <: BlasComplex && trans == 'N' && _strided1(A) && _strided1(Bm) &&
             0 < n <= _CSYRK_UNPACK_MAX && k > 0 && !_ctrk_3m_ok(n, k)

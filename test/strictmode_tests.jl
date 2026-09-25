@@ -158,8 +158,10 @@ end
             @test (@allocated P._trsm_fused_full_L!(false, Auf, BFF)) == 0
         end
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
-        P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)            # warm the pack buffers
-        @test (@allocated P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)) == 0
+        # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
+        # the SME path and its function pointer -- hence the barrier here too, same as below.
+        steady0(f, args...) = (f(args...); @allocated f(args...))
+        @test steady0(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
         # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
         # and the first compile of each such call site caches a method instance, which reports as

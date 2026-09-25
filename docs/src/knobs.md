@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 152 of them.
+Every `@load_preference` key in `src/` — 154 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 152 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 70 Derived · 14 Measured · 50 Literal · 18 Exempt.
-**Default form** (mechanical): 65 formula · 22 delegates · 5 sibling · 50 literal · 5 flag · 5 other.
+**Tier:** 70 Derived · 16 Measured · 50 Literal · 18 Exempt.
+**Default form** (mechanical): 65 formula · 22 delegates · 5 sibling · 52 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -103,10 +103,12 @@ Every `@load_preference` key in `src/` — 152 of them.
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
+| `syr2k_sme_min` | literal | Measured | the size at which the recursive route's reach into the coprocessor overtakes the packed kernel that cannot reach it; a ratio between two kernels' throughput, not a residency criterion. | sweep |
 | `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (Zen3 n=128) does not replicate (2026-08-21) |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_syrk_pack_cut(_HW)` | — |
+| `syrk_sme_min` | literal | Measured | the size at which a route that reaches the coprocessor overtakes one that cannot; it turns on the ratio between two kernels' throughput, which no cache size predicts. | sweep |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
