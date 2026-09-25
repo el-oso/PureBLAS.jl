@@ -158,15 +158,19 @@ end
             @test (@allocated P._trsm_fused_full_L!(false, Auf, BFF)) == 0
         end
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
-        P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)            # warm the pack buffers
-        @test (@allocated P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)) == 0
+        # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
+        # the SME path and its function pointer -- hence the barrier here too, same as below.
+        steady0(f, args...) = (f(args...); @allocated f(args...))
+        @test steady0(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
-        P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)
-        @test (@allocated P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)) == 0
-        P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
-        @test (@allocated P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)) == 0
-        P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
-        @test (@allocated P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)) == 0
+        # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
+        # and the first compile of each such call site caches a method instance, which reports as
+        # allocation a caller passing concrete types never pays. `_symm!` reaches gemm, whose SME
+        # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
+        steady(f, args...) = (f(args...); @allocated f(args...))
+        @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
+        @test steady(P._syr2k_packed!, false, false, 0.8, 0.3, As, Bs, Cs, 512) == 0
+        @test steady(P._symm!, true, false, false, 0.8, 0.3, As, Bs, Cs) == 0
         # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
         # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
         # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.

@@ -122,3 +122,43 @@ OpenBLAS, AOCL-BLIS `dgemm` matches it and AOCL-libFLAME `potrf`/`geqrf` meet or
 vs 30 GFlops). It is a *mixed* competitor rather than uniformly tougher — its `geqrf` beats OpenBLAS
 while its `getrf` trails it — and it is tuned first for multi-threaded EPYC, so on these single-thread
 Zen parts it is a fair-but-not-dominant baseline.
+
+## Accelerate on Apple Silicon
+
+AOCL is AMD-only, so on arm64 [`bench/plots.jl`](performance_apple.md) uses Apple's Accelerate framework
+(vecLib) as the second reference instead — the platform's own vendor BLAS/LAPACK, the same role AOCL
+plays on the AMD fleet. Accelerate ships two calling interfaces in one binary: the legacy LP64 (32-bit
+int) symbols `lbt_forward` finds by default, and a newer ILP64 interface Apple added in macOS 13.3, whose
+symbols are suffixed `$NEWLAPACK$ILP64` (e.g. `dgemm$NEWLAPACK$ILP64` — no trailing underscore before the
+`$`, unlike classic Fortran mangling). Julia's BLAS entry points are ILP64
+(`dgemm_64_`), matching PureBLAS's own ABI, so the LP64 default is the wrong interface — it leaves the
+ILP64 forwarding slots empty and every call errors `no BLAS/LAPACK library loaded for dgemm_64_()`.
+
+The working forward needs a `suffix_hint` carrying a leading `\x1a` (ASCII SUB, 0x1A) byte before the
+suffix text, matching `JuliaLinearAlgebra/AppleAccelerate.jl`'s own `load_accelerate`:
+
+```julia
+LinearAlgebra.BLAS.lbt_forward(
+    "/System/Library/Frameworks/Accelerate.framework/Accelerate";
+    clear = true, suffix_hint = "\x1a\$NEWLAPACK\$ILP64",
+)
+```
+
+One forward call covers both BLAS and LAPACK (Accelerate ships them in the same umbrella binary, unlike
+AOCL's separate `libblis-mt`/`libflame`). Verified empirically on this machine: `LinearAlgebra.BLAS.lbt_get_config()`
+reports `[ILP64] Accelerate` after the forward, `dgemm` and `potrf` reconstruction errors sit at Float64
+noise floor (~1e-12–1e-14), and `dgemm` runs at a clearly distinct, much faster wall-clock than OpenBLAS —
+consistent with Accelerate's AMX-backed kernels.
+
+**Threading — the part that is easy to get wrong.** `LinearAlgebra.BLAS.set_num_threads(1)`, which pins
+every other reference (OpenBLAS/AOCL/MKL) to one thread, does **not** constrain Accelerate. vecLib reads
+`VECLIB_MAXIMUM_THREADS` at its own first-use initialization, independent of LBT's thread knob — set it
+too late (including from within the same process, after Accelerate has already been forwarded once) and
+it has no effect. `bench/plots.jl` sets `ENV["VECLIB_MAXIMUM_THREADS"] = "1"` at file load, before
+`_use_ref!` can ever reach Accelerate for the first time, mirroring the `BLIS_NUM_THREADS`/
+`OMP_NUM_THREADS` pattern already used for AOCL above. Without it, a `dgemm` at n=4000 silently runs on
+~2 threads (confirmed: process CPU% pinned at a sustained ~190-200%, `ps -o %cpu=` sampled continuously
+across a 14 s / 60-call window) despite `set_num_threads(1)` having been called — and the effect is
+routine-dependent: BLAS-3 (`gemm` and siblings) picked up ~2 threads by default; LAPACK factorizations
+(`potrf` checked directly at n=2048, 400 calls) stayed single-threaded either way. Full incident writeup:
+`ROADMAP.md`, "`set_num_threads(1)` does NOT constrain Accelerate".

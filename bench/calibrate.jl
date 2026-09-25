@@ -473,7 +473,8 @@ steady || @warn "did not reach steady state; results may be biased by a moving c
 # driver was not honouring the cap (it needs amd_pstate=passive), so the requested state and the real
 # clock disagreed by 2.4x. This is exactly why bench/fleet_freqlock.sh VERIFIES under load instead of
 # trusting what it wrote, and the tuner must do the same.
-let cap = tryparse(Int, strip(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", String)))
+let capfile = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
+    cap = isfile(capfile) ? tryparse(Int, strip(read(capfile, String))) : nothing   # no cpufreq (e.g. macOS/ARM) -- nothing to sanity-check against, same "unchecked" degradation as FreqLock.lock_state
     if !isnothing(cap) && khz > 1.05 * cap
         @error "REFUSING TO TUNE — achieved $(round(Int, khz/1000)) MHz against a requested cap of " *
                "$(cap ÷ 1000) MHz. The cpufreq SETTINGS look locked but the clock is floating; the " *

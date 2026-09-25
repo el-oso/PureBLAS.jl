@@ -45,6 +45,9 @@ function __init__()
     # compiles no env access into `__init__` at all. Each Ref is pre-seeded with its no-env default, so
     # ordering here is not load-bearing — this only ever overrides.
     _init_force_knobs!()
+    # Builds the SME trampoline on the host. It cannot live in the package image: a function
+    # holding ZA state needs `rdsvl` to size its frame, which a generic-CPU image cannot select.
+    _sme_init!()
     return
 end
 

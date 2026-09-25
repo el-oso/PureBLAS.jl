@@ -59,9 +59,39 @@ catch
     false
 end
 
+# Darwin cache geometry, read from sysctl AT PRECOMPILE TIME and folded into the consts below.
+#
+# WHY THIS EXISTS (measured 2026-09-22, Apple M6). `CPUSummary.cache_size` reported **L2 = 3 MiB** on a
+# part whose real per-core L2 is **20 MiB** — a 6.7x under-detection, and `_L2_BYTES` feeds
+# `_at_gemm_mc` (A-block ≤ 30% L2) plus every other residency formula, so the whole L3 blocking stack
+# was sized for a cache a seventh of the real one.
+#
+# THE TRAP THE OLD COMMENT ALREADY WARNED ABOUT, now acted on: the UNPREFIXED Darwin keys
+# (`hw.l1dcachesize`, `hw.l2cachesize`) do NOT describe the fastest cores. On this M6 they read
+# 96 KiB / 8 MiB, which is the **Efficiency** tier; the `perflevel0` ("Super") cores are 128 KiB / 20 MiB.
+# Benchmarks and real workloads run on the fast tier, so `perflevel0` is the authoritative one — and this
+# chip has THREE tiers (`hw.nperflevels` = 3: Super / Performance / Efficiency), not the usual two.
+#
+# Trim-safe: the `ccall` runs at precompile time inside a `const` initializer and folds to a literal,
+# exactly as the `CpuId` cpuid calls do — no runtime syscall on any code path (req#4).
+function _sysctl_int(name::String)
+    Sys.isapple() || return 0
+    return try
+        out = Ref{Int64}(0)
+        sz = Ref{Csize_t}(sizeof(Int64))
+        rc = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+                   name, out, sz, C_NULL, 0)
+        rc == 0 ? Int(out[]) : 0
+    catch
+        0
+    end
+end
+
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the
 # bandwidth-bound Level-1 kernels, but L2/L3 blocking for the M2 dgemm will read these.
-const _L1_BYTES = let s = Int(cache_size(Val(1)))
+# Darwin: prefer the fast-tier `perflevel0` figure over CPUSummary (see `_sysctl_int` above).
+const _L1_BYTES = let d = _sysctl_int("hw.perflevel0.l1dcachesize")
+    s = d > 0 ? d : Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
 
@@ -124,7 +154,8 @@ const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
-const _L2_BYTES = let s = Int(cache_size(Val(2)))
+const _L2_BYTES = let d = _sysctl_int("hw.perflevel0.l2cachesize")
+    s = d > 0 ? d : Int(cache_size(Val(2)))
     s > 0 ? s : 512 * 1024
 end
 
@@ -173,6 +204,37 @@ const _L3_BYTES = @load_preference(
             0
         end
         max(s > 0 ? s : 8 * 1024 * 1024, _L2_BYTES)
+    end
+)::Int
+
+# ── SME (Scalable Matrix Extension) ────────────────────────────────────────────────────────────
+# On Apple Silicon the unit that does fast FP64 matrix work is SME, not NEON: `fmopa za.d` is an
+# 8x8 FP64 outer product, 128 flops in one instruction, against NEON's 16 flops/cycle. Measured on
+# an M6: NEON FP64 roofline 60.4 GFLOP/s (OpenBLAS sits at 66, i.e. already there), SME microkernel
+# 549. No NEON tuning reaches those numbers — it is a different execution unit.
+#
+# `_SME_F64` gates the Float64 gemm path: SME2 plus FEAT_SME_F64F64, which is the feature that
+# makes the double-precision outer product legal. SME without F64F64 is useless here.
+#
+# `_SME_LANES` is the FP64 lane count of a streaming vector, read from the OS rather than assumed:
+# `sme_max_svl_b` is the streaming vector length in BYTES (64 on this M6 = 512 bits = 8 lanes), and
+# a ZA tile is `_SME_LANES` x `_SME_LANES`. Kernel tile geometry derives from it, so a machine with
+# a different vector length gets different code rather than wrong results.
+# THE ARCH TERM LEADS THE PREFERENCE, not the other way round: the override exists for cross-compile
+# and trim builds, and `sme_f64 = true` set on an x86 box would otherwise have this file emit aarch64
+# IR there. A preference may relax a detection result; it may not contradict the instruction set.
+# PDM: Exempt — the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _SME_F64 = Sys.ARCH === :aarch64 && @load_preference(
+    "sme_f64",
+    _sysctl_int("hw.optional.arm.FEAT_SME2") == 1 &&
+        _sysctl_int("hw.optional.arm.FEAT_SME_F64F64") == 1
+)::Bool
+
+# PDM: Exempt — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _SME_LANES = @load_preference(
+    "sme_lanes",
+    let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
+        b > 0 ? b ÷ sizeof(Float64) : 0
     end
 )::Int
 

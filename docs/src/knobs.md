@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 146 of them.
+Every `@load_preference` key in `src/` — 154 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 146 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 69 Derived · 11 Measured · 50 Literal · 16 Exempt.
-**Default form** (mechanical): 63 formula · 22 delegates · 5 sibling · 47 literal · 5 flag · 4 other.
+**Tier:** 70 Derived · 16 Measured · 50 Literal · 18 Exempt.
+**Default form** (mechanical): 65 formula · 22 delegates · 5 sibling · 52 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -103,10 +103,12 @@ Every `@load_preference` key in `src/` — 146 of them.
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
+| `syr2k_sme_min` | literal | Measured | the size at which the recursive route's reach into the coprocessor overtakes the packed kernel that cannot reach it; a ratio between two kernels' throughput, not a residency criterion. | sweep |
 | `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (Zen3 n=128) does not replicate (2026-08-21) |
 | `syrk_dbase` | literal | Literal | diagonal-block base; larger pushes work into efficient off-diagonal gemms. | candidate |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_syrk_pack_cut(_HW)` | — |
+| `syrk_sme_min` | literal | Measured | the size at which a route that reaches the coprocessor overtakes one that cannot; it turns on the ratio between two kernels' throughput, which no cache size predicts. | sweep |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
@@ -137,6 +139,8 @@ Every `@load_preference` key in `src/` — 146 of them.
 | `l3_bytes` | formula | Exempt | the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `madvise_hugepages` | flag | Exempt | a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable. | — |
 | `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_f64` | other | Exempt | the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_lanes` | formula | Exempt | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 
 ## LAPACK · banded_chol
 
@@ -242,6 +246,15 @@ Every `@load_preference` key in `src/` — 146 of them.
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
+
+## sme_kernel
+
+| Knob | Default | Tier | Why | `tune!()` |
+|---|---|---|---|---|
+| `sme_gemv_minwork` | formula | Derived | formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream. | — |
+| `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
+| `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
+| `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
 
 ## workspace
 
