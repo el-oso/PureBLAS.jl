@@ -284,6 +284,15 @@ Both modes share ONE set of low-level kernels. Source map:
   `test/Manifest.toml` (which must not exist) and it strips every comment from `test/Project.toml`.
   Fresh deps: `julia --project=. -e 'using Pkg; Pkg.Registry.update()'`. One item:
   `Pkg.test(test_args=["<name regex>"])`, ANDed with the group/shard filter.
+- **NAME THE BLAST RADIUS — a bare `Pkg.test()` is a PR-time gate, not an iteration step.** Filter to
+  the items the change can reach: measured **16m59 for the full suite against ~2m** for a filter
+  covering the same changed files. `JULIA_NUM_THREADS` must be set either way, or every threading item
+  skips and reports green (see the `checks` CI job and the item "threading guarantees actually ran").
+  `julia-guard.sh` blocks the bare form; the PR-time run is explicit:
+  `PB_FULL=1 julia --project=. -e 'using Pkg; Pkg.test()'`.
+  **The tell that generalises past what a hook can see** (a sweep, fleet time): you are about to spend
+  minutes of box time and cannot name the single question it answers. A targeted run answers a named
+  question; a full run answers "did I break anything", which is a question for submission time.
 - Shared oracle helpers go in `@testmodule Name begin … end` (TestItemRunner; ReTestItems'
   `@testsetup module` is not recognized). ReTestItems can't run on 1.13 and isn't coming back — see
   kb `julia-113-test-toolchain-and-env-discipline`.
@@ -335,9 +344,21 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
-- **ITERATE PROBES IN THE HOT REVISE SESSION (`bench/hot.jl`) — never relaunch `julia` per probe, and
-  never restart it just to pick up a `src/` edit.** A fresh launch pays a full pkgimage precompile
-  (**200–311 s** measured); a correctly configured Revise applies a method-body edit in **~3 s**.
+- **ITERATE PROBES THROUGH `bench/probe.sh` — never relaunch `julia` per probe, and never restart the
+  session just to pick up a `src/` edit.** A fresh launch pays a full pkgimage precompile (**200–311 s**
+  measured, 6m33 end to end on this box); a correctly configured Revise applies a method-body edit in
+  **~3 s**. Measured on the same probe: **6m33 cold vs 9s warm, 43×**.
+  ```bash
+  bench/probe.sh bench/probes/some_probe.jl   # starts the session if needed, then reuses it
+  bench/probe.sh --status                     # is one up?
+  bench/probe.sh --restart                    # only after an include-graph change
+  ```
+  The wrapper owns the fifo, the per-box CPU mask, the thread count and the completion marker, so
+  "run a probe" is one command that is never cold. It reads only the log its own run appends — a
+  `<<<HOT-DONE>>>` from an earlier probe would otherwise report a probe finished before it started.
+  `julia-guard.sh` blocks a cold `bench/probes/` launch while a session is live (escape hatch
+  `JULIA_GUARD=off`), because rule 3's allow-list exempts `bench/` and never caught this shape.
+  The raw form below is what the wrapper does, kept because the failure mode under it is subtle:
   ```bash
   mkfifo /tmp/pbhot.fifo
   julia --project=bench bench/hot.jl /tmp/pbhot.fifo > /tmp/pbhot.log 2>&1 &   # await <<<HOT-READY>>>
