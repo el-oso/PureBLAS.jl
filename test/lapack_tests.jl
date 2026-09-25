@@ -1245,7 +1245,15 @@ end
         # first draft and was a 286× rubber stamp.
         nrmA = opnorm(A, Inf); nrmB = norm(B, Inf)
         @test maximum(abs, A * pB - B) / (nrmA * norm(pB, Inf) + nrmB) < 16 * eps(real(T))
-        @test maximum(abs, pB - rB) < tol
+        # NO SOLUTION-VS-SOLUTION COMPARISON HERE, for the reason the residual assertion above
+        # already gives, applied to the line that used to follow it. The `pivot` tag builds a
+        # diagonal of 1e-3, and in Float32 that is cond(A) 6.6e6 at n=40 and 1.2e7 at n=129, so
+        # cond*eps is of order one and two backward-stable solvers are ENTITLED to differ by O(1)
+        # in the answer itself. Measured on this grid: backward error 1.5e-8 for PureBLAS against
+        # 3.8e-9 for the reference at n=40, both far inside eps; and at n=129 PureBLAS is the
+        # CLOSER of the two to the exact solution, 3.86 against 5.11. `maximum(abs, pB - rB) < tol`
+        # failed the better answer for disagreeing with the worse one, and no tolerance fixes that
+        # — the quantity is not bounded. Backward error is, and it is asserted above.
         @test maximum(abs, pd - rd) < tol
         n > 1 && @test maximum(abs, pdu - rdu) < tol
         n > 2 && @test maximum(abs, pdl[1:(n - 2)] - rdl[1:(n - 2)]) < tol

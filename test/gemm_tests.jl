@@ -340,8 +340,15 @@ end
     else
         Abig = randn(n, kbig); Bbig = randn(kbig, n)
         Athin = randn(n, kthin); Bthin = randn(kthin, n)
-        # Witnesses: the first shape is the recursion's, the second the pool's.
-        @test P._strassen_owns(Float64, n, n, kbig, false, Abig, Bbig)
+        # Witnesses: the first shape is the recursion's, the second the pool's. Strassen is unavailable
+        # at vector widths whose packing path does not implement it (`_STRASSEN`), and there the big
+        # shape takes the column split like the thin one -- the bit-identity below is the same
+        # property either way, so the invariant is still tested and only the witness is skipped.
+        if P._STRASSEN
+            @test P._strassen_owns(Float64, n, n, kbig, false, Abig, Bbig)
+        else
+            @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
+        end
         @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin)
         @test P._gemm_workers(n, n, kthin) > 1
         bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
