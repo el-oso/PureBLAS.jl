@@ -68,3 +68,56 @@ blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
 #              rather than the text, and it passes. Revert any owner above to per-thread and that
 #              check fails even though this line stays baselined.
 blas3/gemm.jl:GC.safepoint(); Base.yield()
+
+# --- 2026-09-24, the SME IR generators. `sme_kernel.jl` is a kernel file, and these 22 lines are the
+#              only `print`/`println` in it, so read the reason before adding a twenty-third.
+#
+#              They are not in a kernel. They are the LLVM IR *generator*: Julia functions that build
+#              the kernel's ~100 lines of IR as text, interpolating the detected tile geometry, and
+#              they write to an in-memory `IOBuffer` — no file, no terminal, no IO lock, so no task
+#              switch is reachable through them. Each runs once while the module is being loaded and
+#              the trampoline built (`_sme_init!`), before any kernel exists to hold scratch.
+#
+#              None of them holds an `@scope`: the generators take no arena borrow at all. The SME
+#              kernel's own scratch comes from `_gemm_scratch` (per TASK, `_gpackws`) at call time,
+#              which is a different function entirely and contains no printing.
+blas3/sme_kernel.jl:print(io, """
+blas3/sme_kernel.jl:print(io, _SME_ATTRS)
+blas3/sme_kernel.jl:print(io, _SME_DECLS)
+blas3/sme_kernel.jl:println(io, "  %c$jj = add nsw i64 %colbase, $jj")
+blas3/sme_kernel.jl:println(io, "  %cs$jj = mul nsw i64 %c$jj, %ldb")
+blas3/sme_kernel.jl:println(io, "  %do$i = add nsw i64 %dstbase, %rn$i")
+blas3/sme_kernel.jl:println(io, "  %dp$i = getelementptr inbounds double, ptr %bp, i64 %do$i")
+blas3/sme_kernel.jl:println(io, "  %lo$n = mul nsw i64 %ldc, $col")
+blas3/sme_kernel.jl:println(io, "  %lp$n = getelementptr inbounds double, ptr %ci, i64 %lo$n")
+blas3/sme_kernel.jl:println(io, "  %lq$n = getelementptr inbounds double, ptr %lp$n, i64 $row")
+blas3/sme_kernel.jl:println(io, "  %r$i = add nsw i64 %p0, $i")
+blas3/sme_kernel.jl:println(io, "  %rn$i = mul nsw i64 %r$i, $(_SME_NR)")
+blas3/sme_kernel.jl:println(io, "  %so$jj = add nsw i64 %p0, %cs$jj")
+blas3/sme_kernel.jl:println(io, "  %so$n = mul nsw i64 %ldc, $col")
+blas3/sme_kernel.jl:println(io, "  %sp$jj = getelementptr inbounds double, ptr %b, i64 %so$jj")
+blas3/sme_kernel.jl:println(io, "  %sp$n = getelementptr inbounds double, ptr %ci, i64 %so$n")
+blas3/sme_kernel.jl:println(io, "  %sq$n = getelementptr inbounds double, ptr %sp$n, i64 $row")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %lq$n, i32 $tile, i32 $sl)")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sp$jj, i32 0, i32 $jj)")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1> splat (i1 true), ptr %dp$i, i32 0, i32 $i)")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sq$n, i32 $tile, i32 $sl)")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
+
+# --- 2026-09-25, the SME gemv IR generator. Same reason as the gemm generator above: these are
+#              `print`/`println` into an in-memory `IOBuffer` while the kernel text is built,
+#              once, before the trampoline exists. No file, no terminal, no IO lock, no arena
+#              borrow, and nothing that runs inside a kernel.
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %w$(g)_0, <vscale x 2 x double> %w$(g)_1,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %w$(g)_2, <vscale x 2 x double> %w$(g)_3, <vscale x 2 x double> %bc)")
+blas3/sme_kernel.jl:println(io, "  %o$g = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
+blas3/sme_kernel.jl:println(io, "  %p$g = getelementptr inbounds double, ptr %cp, i64 $(4 * L * g)")
+blas3/sme_kernel.jl:println(io, "  %r$g = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %p$g)")
+blas3/sme_kernel.jl:println(io, "  %w$(g)_$k = extractvalue $T4 %r$g, $k")
+blas3/sme_kernel.jl:println(io, "  %yp$(g)_$k = getelementptr inbounds double, ptr %yblk, i64 $off")
+blas3/sme_kernel.jl:println(io, "  %ys$(g)_$k = fadd <vscale x 2 x double> %yv$(g)_$k, %z$(g)_$k")
+blas3/sme_kernel.jl:println(io, "  %yv$(g)_$k = load <vscale x 2 x double>, ptr %yp$(g)_$k, align 8")
+blas3/sme_kernel.jl:println(io, "  %z$(g)_$k = extractvalue $T4 %o$g, $k")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
+blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %ys$(g)_$k, ptr %yp$(g)_$k, align 8")
+blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %z$(g)_$k, ptr %yp$(g)_$k, align 8")

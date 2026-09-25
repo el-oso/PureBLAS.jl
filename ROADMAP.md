@@ -245,6 +245,269 @@ day's conclusions the wrong way. Two consequences worth carrying:
 This does not retire the review above: it is about comparing two PB arms, while the coverage tables
 divide PB by a cached reference and cannot be paired that way.
 
+### ⚠ METHODOLOGY FINDING (2026-09-22) — `_L1REP`'s reps-loop can measure a warm buffer, not DRAM streaming
+
+Diagnosed on the first Apple Silicon pass ([Apple Silicon](docs/src/performance_apple.md)), and it
+bears on **every** L1 cell on **every** box, not just that one — flagging it here rather than only in the
+Apple-specific page.
+
+**The mechanism.** `_L1REP(s) = clamp(8_000_000 ÷ s, 30, 20000)` amortizes per-call timer overhead by
+running `reps` calls back-to-back **on the same `setup()`-allocated operand buffer** inside one timed
+window (`for _ in 1:reps; f(c); end`, same `c` every iteration). That is fine while the buffer is much
+bigger than any cache — genuinely fresh DRAM traffic every call regardless of reuse. It stops being fine
+once the buffer is *small enough to stay resident* across the whole reps loop: from the second call on,
+you are measuring repeated-access-to-a-warm-buffer throughput, not cold/streaming throughput — and a
+library whose inner loop pipelines especially well against a HOT buffer (more so than it does against
+cold DRAM) reads disproportionately faster than it actually is on real, once-through data.
+
+**How big a difference this made.** On the Apple M6, `_L1REP`-amortized `axpy` at n=1e6 (16MB working
+set, `reps=30`) read `PB/openblas≈1.00`, `PB/accelerate≈0.18` — implying Accelerate is ~5.5× OpenBLAS.
+Genuinely cold, single-shot, freshly-allocated arrays at sizes far too large for any cache (10M-50M
+elements, 240MB-1.2GB, one call each, no reuse) read Accelerate at only **1.06-1.36×** OpenBLAS — the
+physically plausible number for a per-core DRAM-bandwidth edge. Forcing `reps=1` on the existing L1 sweep
+(`_l1_repfn`/`cold` flag, `bench/plots.jl`) reproduced that correction in-harness: `dot`/`axpy` flipped
+from PB *losing* to Accelerate by 3-5× to PB *beating* it on the median (1.12×/1.19×), and `asum`/`scal`
+moved to near parity. `nrm2`/`iamax` were unaffected (not bandwidth-bound the same way; `iamax`'s
+reduction has a data-dependent branch that already limits reuse benefit).
+
+**What this does NOT touch.** Anything whose operand is already far larger than any cache regardless of
+`reps` — BLAS-3/LAPACK (n²/n³-sized matrices, typically hundreds of MB at the sizes that matter) — is
+unaffected. The Apple-Silicon gemm/potrf/etc. numbers, and the fleet's own L2/L3/LAPACK numbers, do not
+have this failure mode.
+
+**What's still open — THIS IS THE PART THAT NEEDS THE FLEET, NOT ONE BOX.** Whether this inflates the
+AMD fleet's own published large-n L1 cells is UNCONFIRMED. Zen3 ships a 32 MiB L3; n=1e6's 16MB working
+set fits inside it by the same argument that applies on the Apple box. Zen4/Zen5 have smaller L3s
+(16 MiB) but the argument is the same in kind. Concretely un-checked:
+- whether OpenBLAS/AOCL benefit from L1REP's buffer-reuse as asymmetrically as Accelerate apparently does
+  (if all arms benefit equally, the RATIO is still fair even though the absolute GB/s is not "DRAM
+  bandwidth" — asymmetric benefit is what actually breaks a ratio, and that has not been checked on x86);
+- whether any currently-published L1 gate cells (PASS or FAIL) would move under `cold` re-measurement;
+- whether the fix belongs in `_L1REP` itself (e.g. cap `reps` once the buffer exceeds some fraction of
+  `_L1_BYTES`/`_L2_BYTES`, rather than a separate opt-in flag) — that is a shared-methodology change and
+  needs the same care the `sweep_heavy` review above asks for, not a unilateral edit.
+
+**The fix shipped so far is deliberately narrow and non-default.** `bench/plots.jl` gained `cold` (opt-in,
+off unless passed) forcing `reps=1` on the L1 sweep only; `evals=1` already re-runs `setup()` fresh per
+Chairmarks sample, so `reps=1` removes the one remaining reuse path. Nothing about the AMD fleet's
+existing methodology, caches, or published numbers changed. Re-measuring the fleet with `cold` (or
+deciding whether/how to fold a residency cap into `_L1REP`'s default) is the next step, and it is a
+methodology decision, not something to make unilaterally from one box's data.
+
+### ⚠ METHODOLOGY FINDING (2026-09-22) — `BLAS.set_num_threads(1)` does NOT constrain Accelerate
+
+More serious than the one above: this one silently gave every `vs Accelerate` cell an uncontrolled
+thread-count advantage, on every op, for the whole time the Accelerate backend existed (from its first
+landing earlier the same day) until fixed. Root-caused after the user refused to believe a ~550 GFLOP/s
+single-core `dgemm` figure — correctly; it was not single-core.
+
+**The mechanism.** `_use_ref!` calls `LinearAlgebra.BLAS.set_num_threads(1)` after every backend forward
+(the one call `bench/plots.jl` relies on for every reference — OpenBLAS, AOCL, MKL, and now Accelerate —
+to be single-threaded). It works for OpenBLAS/AOCL/MKL. It does **not** work for Accelerate: vecLib reads
+its own thread-pool size from `VECLIB_MAXIMUM_THREADS` at its OWN first-use initialization, independent
+of whatever LBT's generic thread-count knob does, and that env var is never set anywhere in
+`bench/plots.jl`. The result: Accelerate silently ran on however many threads its own heuristic picked
+(confirmed 2, at n=4000 `dgemm` — process CPU% pinned at a sustained ~190-200%, sampled continuously
+across a full 14 s / 60-call window, `ps -o %cpu=` every 0.6 s), while PureBLAS and every other reference
+correctly ran on one.
+
+**Verified, not asserted.** Setting `VECLIB_MAXIMUM_THREADS=1` in the process environment BEFORE the
+first Accelerate forward (at the shell level, or in-process as long as it precedes first use — setting it
+AFTER first use has no effect, confirmed by testing both) pins CPU% at a clean, sustained ~99-100%
+throughout the same workload, both via a raw timing loop and via Chairmarks `@be` (`bench/plots.jl`'s
+actual measurement path) — so the fix is confirmed effective under the real harness, not just a toy
+script.
+
+**How much this actually moved the numbers — smaller than the discovery made it sound.** The corrected
+(genuinely single-thread) `dgemm` at n=4000 is ~469 GFLOP/s, not ~550 — the "second thread" was buying
+Accelerate only ~16% (272.7 ms/call single-thread vs 234.6 ms/call with the leak), not the ~2x true
+parallelism would predict. Consistent with AMX being a per-core matrix unit a second software thread
+can't usefully double up on, not with real general-purpose 2x parallelism. Re-measuring `gemm`'s full
+`bench/plots.jl` cell (all sizes, real methodology) with the fix moved PureBLAS's ratio against Accelerate
+by **+2% to +15%, growing with n** (largest at n≥1000) — a real, consistent, correctly-signed correction,
+but not the dramatic reversal a "PB was being compared against 2 cores" headline would suggest. The
+dominant ~7x single-core gap on `gemm` (AMX access neither OpenBLAS nor PureBLAS has) is real and stands;
+it is now on verified single-thread footing rather than an assumed one.
+
+**Fix shipped:** `ENV["VECLIB_MAXIMUM_THREADS"] = "1"` set at `bench/plots.jl` load time, before
+`_use_ref!` can ever reach Accelerate for the first time — mirrors the existing
+`ENV["BLIS_NUM_THREADS"]`/`ENV["OMP_NUM_THREADS"]` pattern already there for AOCL/BLIS. Harmless on any
+other platform (the var is simply unused where vecLib doesn't exist).
+
+**LAPACK checked separately and confirmed clean.** `potrf` at n=2048 (400 calls, `ps -o %cpu=` sampled
+continuously) stayed at a sustained ~99-100% CPU *both* before and after the fix — Accelerate's LAPACK
+factorizations were never affected, unlike its BLAS-3 routines. That is why the full re-measurement left
+`potrf`/`getrf`/`geqrf`/`gesvd` numerically unchanged from the pre-fix run: there was nothing to fix
+there, not a remaining leak. Whether that holds at every LAPACK size, or is specific to n=2048, is
+untested.
+
+**What's still open.** Whether Accelerate's BLAS-3 thread count is size-dependent (the correction grows
+with n — 32-512 moved 2-7%, 1000-2048 moved 11-15%) was observed, not characterized; the exact threshold
+and shape of that heuristic is unknown. Every Accelerate cell measured before this fix landed was
+re-measured from scratch rather than patched, since there was no way to know in advance which cells the
+leak touched materially.
+
+### ⚠ APPLE SILICON: the Accelerate gap is SME2, and **Julia can reach it** (2026-09-22)
+
+Two findings from the first Apple Silicon pass, one closed and one opened.
+
+**1. `_L2_BYTES` was under-detected 6.7x on Apple Silicon — FIXED.** `CPUSummary.cache_size(Val(2))`
+reported **3 MiB** on an M6 whose fast-tier L2 is **20 MiB**. That value feeds `_at_gemm_mc` and every
+other residency formula, so the entire L3 blocking stack was sized for a cache a seventh of the real
+one (MC=112 where the corrected value is 768; NC 248 -> 640). `cpuinfo.jl` now reads
+`hw.perflevel0.l{1d,2}cachesize` via a precompile-time `sysctl` `ccall` (folds to a const, trim-safe,
+same pattern as the `CpuId` calls). **THE TRAP, and it is why the unprefixed keys must not be used:**
+this part has **THREE** perf tiers (`hw.nperflevels` = 3 — Super 2 cores / Performance 4 / Efficiency 6),
+and the unprefixed `hw.l2cachesize` reports the **Efficiency** tier (8 MiB), not the cores anything is
+benchmarked on. Measured payoff: gemm vs OpenBLAS **+2-3% at n>=512** (0.663 -> 0.684 at n=2048). Real,
+but it is NOT the bulk of the PB-vs-OpenBLAS gap — that remains open and is microkernel-side.
+
+**2. The 7x vs Accelerate is SME2, not a software-quality gap — and it is REACHABLE FROM JULIA.**
+
+The gap was measured at ~469 GFLOP/s (Accelerate) vs ~66 (OpenBLAS) FP64 `dgemm`, single-threaded.
+That looked impossible, and for a same-ISA comparison it is. It is not a same-ISA comparison:
+
+- **Empirical NEON FP64 roofline on this machine: 60.4 GFLOP/s** (16 independent register-resident FMA
+  chains, no memory traffic; ~3.8 FMA/cycle x 2 lanes x 2 flops). **OpenBLAS at 66 GFLOP/s is AT the
+  roofline.** Nothing using NEON goes faster here, PureBLAS included.
+- Accelerate's 469 GFLOP/s is **7.8x the entire NEON ceiling** — arithmetically impossible with 128-bit
+  FMAs. The chip says why: `FEAT_SME2p1 = 1`, **`FEAT_SME_F64F64 = 1`**, `sme_max_svl_b = 64`. An FP64
+  ZA outer product at SVL=512b is 8x8 = 64 FMA = **128 flops/instruction** vs NEON's 16 flops/cycle —
+  exactly the observed ratio.
+
+So the gate as currently defined on this box compares **NEON code against SME hardware**. That is not
+the AOCL-vs-OpenBLAS situation (both contend for the same vector units); it is a different execution
+unit, and no amount of NEON tuning closes it.
+
+**But it is reachable, and that is verified, not asserted:**
+
+| probe | result |
+|---|---|
+| `Vec{8,Float64}` codegen, default AND `-C apple-m1,+sme,+sme2` | 4x 128-bit NEON `fmla`, **zero `z` regs** — LLVM never auto-generates SME |
+| `smstart za` / `smstop za` via `llvmcall` inline asm | **assembles and executes** |
+| `fmopa za0.d` (FP64 outer product) via `llvmcall` | **executes and computes numerically exact results** |
+| `rdsvl` inside streaming mode | **SVL = 64 bytes = 512 bits = 8 FP64 lanes** — full width available |
+
+The route is `Base.llvmcall` with `attributes #0 = { "target-features"="+sme,+sme2,+sme-f64f64" }`, and
+`smstart`/`smstop` bracketing ZA tile ops. Note `smstart za` alone is **not** enough — it enables ZA but
+leaves PSTATE.SM=0, and `fmopa` on `z` registers then traps SIGILL; plain `smstart` enables both.
+(`Sys.CPU_NAME` reports `apple-m1` regardless of `-C` — LLVM 20.1.8 has no M6 model — so the features
+must be forced per-function in the llvmcall IR, which works.)
+
+**THE BLOCKER IS JULIA'S JIT, NOT LLVM AND NOT THE TARGET NAME. Proven, not inferred (2026-09-22).**
+Two earlier claims in this investigation were WRONG and are corrected here, both caught by the user
+refusing them:
+
+* ~~"LLVM cannot generate SME"~~ — **false.** LLVM generates it cleanly from ACLE intrinsics; clang
+  emits a textbook `fmopa` loop (`ldr z0 / ldr z1 / fmopa za0.d, p0/m, p0/m, z0.d, z1.d`). What LLVM
+  does NOT do is *auto-vectorize* into SME: a plain loop inside `__arm_locally_streaming` falls back to
+  **scalar `fmadd`**, which is WORSE than NEON (NEON is illegal in streaming mode). Auto-vectorization
+  and intrinsic lowering are different claims; conflating them is what produced the wrong conclusion.
+* ~~"`Sys.CPU_NAME = apple-m1` blocks SME"~~ — **false.** `llc -mcpu=apple-m1` emits SME fine; the
+  function-level `"target-features"` carry it. The M1 target name costs a scheduling model, not SME.
+
+**The decisive experiment.** Hand `llc` the EXACT IR Julia is handed:
+
+    define void @svcopy(ptr %src, ptr %dst) #0 {
+      %v = load <vscale x 2 x double>, ptr %src, align 16
+      store <vscale x 2 x double> %v, ptr %dst, align 16
+      ret void }
+    attributes #0 = { noinline "aarch64_pstate_sm_body" "target-features"="+sme,+sme2,+sve,+neon" }
+
+`llc -mcpu=apple-m1` produces exactly what is wanted — `smstart sm` / `ldr z0` / `str z0` / `smstop sm`.
+The same IR through `Base.llvmcall` **SIGILLs**. Julia's module dump confirms it *preserves* the
+attribute verbatim on the outlined function, so the IR reaches LLVM intact — but Julia's JIT never runs
+the **AArch64 SME ABI pass** that lowers `aarch64_pstate_sm_body` into streaming-mode transitions, so
+the z-register code executes with PSTATE.SM=0 and traps. Adding the features via `-C` does not help
+(that sets the TargetMachine, not the missing pass).
+
+**Hardware facts learned, both of which bite immediately:**
+* This part has **NO non-streaming SVE** (`FEAT_SVE` is not even a valid sysctl oid while `FEAT_SME`=1).
+  `z` registers are legal ONLY inside streaming mode — that is what makes the missing pass fatal rather
+  than merely suboptimal.
+* For `.d` elements the ZA slice-offset immediate is limited to **[0,1]**; the slice index must come
+  from the `Ws` register (`mov w12, #r` + `st1d { za0h.d[w12, 0] }`), not a large immediate.
+
+**Corroboration that the ~7x is real and not an artifact of this harness:** `AppleAccelerate.jl`'s own
+published figure is **6-14x faster GEMM than OpenBLAS on Apple Silicon**. The 7.1x measured here sits
+inside that range. Julia's gap on this hardware is a known, open ecosystem issue — JuliaLang/julia#40308
+(scalable-vector/SVE support; it records exactly our failure mode, that fixed `<8 x double>` lowers to
+NEON and `<vscale x 2 x double>` is what is actually needed) and #42312 (access to the matrix hardware).
+The ecosystem's current answer is "call AppleAccelerate.jl" — i.e. shell out to Apple's library
+*precisely because* Julia cannot generate this code today.
+
+**Routes, in the order they should be tried — none of which ships inline asm:**
+1. **Fix/filethe Julia JIT gap.** The snippet above is a complete, minimal reproducer: llc-correct,
+   JIT-SIGILL. That is the real fix and it is upstream work, not a PureBLAS knob.
+2. **✅ THE AOT PATH WORKS — SME IS REACHABLE TODAY, WITH NO ASM (verified end-to-end 2026-09-22).**
+   A `juliac --trim=safe --compile-ccallable` build of a module whose kernel is pure `llvmcall` IR
+   (`<vscale x 2 x double>` + `"aarch64_pstate_sm_body"`, **no inline asm**) emits exactly the right
+   thing into the shipped library:
+
+       smstart sm
+       ld1d    { z0.d }, p0/z, [x0]
+       st1d    { z0.d }, p0, [x1]
+       smstop  sm
+
+   and it RUNS: called from a C host (the `juliac/ctest.c` pattern — a juliac `.so` cannot be called
+   from inside live Julia, that is the documented double-init abort), it moved **8/8 FP64 lanes**, i.e.
+   the full 512-bit SVL.
+
+   **THE MISSING INGREDIENT IS `JULIA_CPU_TARGET`, AND IT IS NOT OPTIONAL.** Without it the AOT build
+   does not merely produce slow code, it FAILS HARD with `LLVM ERROR: Scalarization of scalable vectors
+   is not supported` — Julia's TargetMachine has no SVE/SME, so `<vscale x 2 x double>` is an illegal
+   type and the legalizer tries to scalarize it. With
+   `JULIA_CPU_TARGET='apple-m1,+sme,+sme2,+sme-f64f64,+sve,+sve2'` it compiles clean. That error is also
+   the best diagnostic in this whole investigation: the JIT's silent SIGILL and the AOT's hard error are
+   the SAME root cause (function-level `target-features` do not select the subtarget), but only the AOT
+   path says so out loud.
+
+   **This maps exactly onto the project's two modes, and splits them:**
+   * **Mode 1 (`libpureblas.so`, juliac AOT, the LBT drop-in + non-Julia hosts): SME is available NOW.**
+   * **Mode 2 (native AD-traceable Julia API, JIT): still blocked.** The JIT SIGILLs even with
+     `JULIA_CPU_TARGET` set — so it is genuinely the missing SME ABI pass, not just the TargetMachine.
+
+   **✅ MEASURED — the microkernel runs at SME PEAK (2026-09-22).** A 16x16 FP64 block held in four
+   8x8 ZA tiles (`za0..za3`), accumulating over k, written as pure `llvmcall` IR and built through
+   juliac. The emitted inner loop is textbook:
+
+       ld1d  { z0.d }, p0/z, [x0]              ; A vec 0
+       ld1d  { z1.d }, p0/z, [x0, x8, lsl #3]  ; A vec 1
+       ld1d  { z2.d }, p0/z, [x1]              ; B vec 0
+       ld1d  { z3.d }, p0/z, [x1, x8, lsl #3]  ; B vec 1
+       fmopa za0.d / za1.d / za2.d / za3.d     ; 4 x (8x8 outer product)
+       add x0,#0x80 / add x1,#0x80 / subs / b.ne
+
+   Correctness exact (`max_err = 0` vs a scalar reference). Throughput, three runs, C host:
+
+       SME microkernel        533 / 549 / 549 GFLOP/s
+       Accelerate dgemm n=4000 (1 thread)  469 GFLOP/s
+       OpenBLAS  dgemm n=4000 (1 thread)    66 GFLOP/s
+       NEON FP64 roofline (measured)        60.4 GFLOP/s
+
+   ~4 cycles per iteration for 4 `fmopa` = **1 fmopa/cycle, the architectural peak** (128 flops/fmopa
+   at ~4.3 GHz = ~550 GFLOP/s). So **9.1x the NEON roofline** and **8.3x OpenBLAS**.
+
+   **READ THE 1.17x-vs-Accelerate NUMBER HONESTLY: it is not a win over Accelerate.** 549 is a
+   MICROKERNEL upper bound — L2-resident panels, no packing, no edge cases, one 16x16 block. 469 is
+   Accelerate's *full dgemm* at n=4000 with all real-world overhead included. That Accelerate sustains
+   85% of microkernel peak in a complete dgemm is a sane ratio, and it cross-validates both figures.
+   The honest reading is: **the compute engine is fully reachable from Julia; whether a PureBLAS SME
+   dgemm lands near 469 now depends entirely on the blocking/packing around it** — which is ordinary
+   BLAS engineering, not a hardware or toolchain question.
+
+   Remaining before any of this ships: `JULIA_CPU_TARGET` must be pinned in `juliac/build.jl` (a BUILD
+   decision, the Pin tier's legitimate home); the SVL=512b assumption in the IR offsets should be
+   derived from `llvm.vscale` rather than hardcoded; and streaming mode changes vector register state,
+   so a ZA region must not allocate, yield, or hit a GC safepoint. Note the shipped `.so` would then need `JULIA_CPU_TARGET` pinned
+   in `juliac/build.jl` — which is a BUILD decision (the Pin tier's legitimate home), not a user pin.
+3. Inline asm — **ruled out by the user**: it is the same portability line the x86 residuals were not
+   allowed to cross. A working asm proof-of-concept exists in the session history (exact 8x8 FP64 ZA
+   outer product, `max|SME-Julia| = 0.0`) and is kept ONLY as evidence that the hardware path is real.
+
+Also still unresolved whenever a kernel does land: streaming mode changes vector register state, so a ZA
+region must not allocate, yield, or hit a GC safepoint.
+
 ## Release — tagged through **v0.1.2**, unregistered by choice
 
 **Tagged:** `v0.1.0`, `v0.1.1`, `v0.1.2` ("Reachable", 2026-08-29). Annotated and pushed; **not
@@ -1538,3 +1801,117 @@ sparse Cholesky.
   *now* wherever a Fable-mapped technique measurably closes a gate on locked HW; the broader systematic
   port (or a dedicated panel-major sibling package for the embedded-optimization use case) is a future
   project. Reference-only — never a C/asm dependency (pure-Julia). See the Fable BLASFEO technique-map.
+
+## SME across the full surface (Apple Silicon)
+
+**Target:** median ratio ≥ 0.9, per op. Medians, not worst cells — the worst cell is almost always a
+size below `_SME_MIN`, where SME cannot apply at all and the deficit is per-call overhead, a
+different project. Full gating is a second round.
+
+**The reference is chosen PER CELL, by whether SME applies to that cell:**
+
+| cell | reference |
+|---|---|
+| SME eligible | `max(OpenBLAS_mt, Accelerate)` |
+| SME declines | `max(OpenBLAS_1t, Accelerate)` |
+
+A cell SME cannot take runs single-threaded NEON, and holding that to a twelve-core reference
+measures the absence of a kernel rather than the quality of one. A cell SME DOES take is a fair
+fight against every core the box has, because one coprocessor is what it is spending. The ratio is
+computed per cell against its own reference; the median is then taken over cells, so one op can span
+both regimes — `gemm` is SME above n=96 and NEON below n=48, and each of its cells is judged
+against what it actually competes with.
+
+This is not the shipped gate (`bench/gatecrit.jl`), which is worst-cell against one reference set.
+It is a campaign target, and the two must not be conflated in any published table.
+
+**Three mechanisms, and which one a routine wants decides the work:**
+
+| mechanism | rate (M6) | suits |
+|---|---|---|
+| `fmopa` outer product | 549 GFLOP/s | rank-k updates — Level 3 |
+| `fmla` into ZA | 1013 GB/s | a small result held in ZA while a large operand streams — Level 2 |
+| ZA transpose | 80 GB/s | packing (already used by the gemm packer) |
+
+SME is Float64-only (`FEAT_SME_F64F64`). That is not a limit on the complex and dual phases: both
+decompose into REAL products — `_gemm_3m!` into three, `_gemm_dual3!` into three planes — so they
+inherit SME if and only if those products reach an SME-eligible call. Those phases are expected to be
+routing, not kernels.
+
+### Step 0 — make the target computable
+
+Neither reference set is computable today: the Apple cache holds a single-threaded OpenBLAS arm and
+no threaded one. Measure `openblas_mt` across every group before anything else — the per-cell rule
+above needs BOTH arms present, since a single op draws on each depending on the size.
+
+Measured for gemm already, and it sets expectations: OpenBLAS on 12 cores reaches 309-370 GFLOP/s
+(a 4.7-5.7x self-speedup, not 12x), against 504 for one SME unit. Accelerate is the binding
+reference for gemm at every size. Where SME does NOT apply, the threaded arm will bind instead, and
+that is where this target is harder than the single-threaded one it replaces.
+
+### Phase 1 — real: L1, L2, L3, LP
+
+Current medians vs Accelerate (single thread; the bar moves once step 0 lands):
+
+    L3   gemm 0.90   symm 0.77   trsmR 0.57   trsm 0.46   trmmR 0.27   trmm 0.23
+         syrk 0.13   syr2k 0.14
+    LP   getrf 1.41  gesvd 0.99  geqrf 0.99   potrf 0.55
+    L2   symv 1.15   spmv 1.05   trsv 0.95    sbmv 0.78    trmv 0.67
+         gbmvN 0.46  ger 0.37    gemvT 0.34   gemvN 0.17
+    L1   nrm2 1.96   axpy 1.19   dot 1.09     asum 1.00    iamax 0.93   scal 0.83
+
+1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
+     not wired in. Needs transposed operands, strides, beta handling and the portability guards the
+     gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.
+
+1.2  **Re-derive the Level-3 pack cutoffs.** `syrk` and `syr2k` did not move at all when gemm went
+     from 44 to 500 GFLOP/s — 0.13 and 0.14 before and after. They take a private packed path above a
+     size cutoff and never reach gemm. `_symm!` documents the same trade in its own comment: it chose
+     the packed path because materialize-plus-gemm was slower, which was true at 44 GFLOP/s.
+     No new kernel. Re-derive, then measure.
+
+1.3  **Port the ZA-accumulate kernel to `symv` and `trmv`.** Same mechanism as gemv, one kernel
+     covering both. symv is already 1.15 so the work is trmv 0.67 and holding symv.
+
+1.4  **Measure before writing** for `ger` (0.37), the banded ops, and L1. `ger` reads AND writes A,
+     so it is memory-bound both ways and ZA may not help; `dot`/`nrm2`/`asum` accumulate and are the
+     only L1 candidates. `axpy`/`scal`/`copy`/`swap` hold nothing in ZA and are out of scope.
+
+1.5  **LP routing.** `getrf` is already 1.41 and `geqrf`/`gesvd` 0.99, all inherited through gemm.
+     `potrf` at 0.55 has private leaf kernels — the same class of problem as syrk.
+
+**Exit:** L3 and LP medians ≥ 0.9; gemv/symv/trmv ≥ 0.9; L1 and ger reported with evidence either
+way, including a negative result.
+
+→ Fable adversarial review → fix
+
+### Phase 2 — complex: CL1, CL2, CL3, CLP
+
+Test the hypothesis before writing anything: does `_gemm_3m!` already reach an SME-eligible call?
+Its three real products are ordinary gemms. If they do, complex inherits SME today and the phase is
+verification; if they do not, the fix is a predicate.
+
+→ Fable adversarial review → fix
+
+### Phase 3 — dual: DL1, DL2, DL3, DLP
+
+Same hypothesis for `_gemm_dual3!`'s three plane products. The constraint is Mode 2: `sme_tests.jl`
+currently ASSERTS that Dual keeps taking the generic path, so admitting it means rewriting that
+contract deliberately rather than discovering it broke.
+
+→ Fable adversarial review
+
+### Rules this campaign binds itself to
+
+Each came from a defect shipped earlier in this work, not from principle.
+
+1. **Sample every n before deriving a cut, not every other one.** `_SME_MIN = 3*MR` was derived from
+   a 2-step sweep that read 48, 56, 64 and concluded every size above 48 wins. It regressed gemm@50
+   by 38%. The dense sweep found 49 at 0.44, and that the old `4*MR` was unsafe too (n=65 at 0.67).
+
+2. **Routing before kernels.** Every large miss found so far has been a predicate, not arithmetic:
+   `syrk` bypassing gemm, thin shapes at 0.14x because `max(m,n,k)` admitted them, threaded `syr2k`
+   returning a WRONG ANSWER because a chunk hardcoded a kernel instead of asking serial's route.
+
+3. **When you fix a cost, re-test the workarounds built around it.** Every cutoff derived against a
+   44 GFLOP/s gemm is suspect now, and `_symm!`'s comment says so in as many words.

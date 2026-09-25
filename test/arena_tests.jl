@@ -32,12 +32,17 @@
         P.@scope s begin
             A = P.borrow!(s, T, 33, 3)
             B = P.borrow!(s, T, 5, 5)
-            @test UInt(pointer(A)) % 64 == 0
-            @test UInt(pointer(B)) % 64 == 0
+            # THE ALIGNMENT UNIT IS DETECTED, NOT 64. `_ARENA_ALIGN` is `max(_SIMD_BYTES, _CACHELINE)`
+            # and Apple Silicon has a 128-byte line, so a literal 64 here asserts an x86 cache
+            # geometry rather than this arena's.
+            @test UInt(pointer(A)) % P._ARENA_ALIGN == 0
+            @test UInt(pointer(B)) % P._ARENA_ALIGN == 0
+            sz = 33 * 3 * sizeof(T)
             # B must start at or after A's end — the overlap bug the prototype had at Float32.
-            @test UInt(pointer(B)) >= UInt(pointer(A)) + 33 * 3 * sizeof(T)
-            # ...and no more than one alignment gap past it, or the arena is wasting space.
-            @test UInt(pointer(B)) < UInt(pointer(A)) + 33 * 3 * sizeof(T) + 64
+            @test UInt(pointer(B)) >= UInt(pointer(A)) + sz
+            # ...and no more than one alignment gap past it, plus the anti-aliasing nudge when this
+            # borrow's size lands on the quarter-way stride, or the arena is wasting space.
+            @test UInt(pointer(B)) < UInt(pointer(A)) + sz + P._ARENA_ALIGN + P._arena_offway(sz)
         end
     end
 
