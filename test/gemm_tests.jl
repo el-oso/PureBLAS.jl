@@ -169,25 +169,31 @@ end
                 @test Ct ≈ Cs rtol = 1e-12
             end
         end
-        # req#10 holds on the threaded path too: the pool is built once, so a warm call allocates
-        # nothing even when it wakes four workers.
+        # req#10 on the threaded path. THIS MEASURES A PROCESS, NOT A CALL, and the assertion is
+        # shaped around that: `@allocated` reads `jl_gc_get_total_bytes`, which sums EVERY thread.
+        # Measured on x86 with a 12.6 ms non-allocating function and one allocating task alongside
+        # it: 1.49 MB charged to a function that allocates nothing. So a single window reading
+        # non-zero says "something in this process allocated", not "gemm! allocated" — and in a test
+        # process with a runner and other items' leftovers in it, that is not gemm!'s to answer for.
         #
-        # Measured through a function barrier so the operands arrive with concrete types, as they do
-        # from LinearAlgebra and LBT. At module scope the call is `Any`-typed, and the first compile
-        # of each such call site caches a method instance — state that scales with the number of call
-        # sites, not with the number of calls, so no amount of warming removes it. Only the SME route
-        # shows it, because its portability barrier is a function pointer (one dynamic dispatch).
-        # `@allocated` GOES INSIDE THE BARRIER. Measuring from outside puts the untyped globals back
-        # into the window: the call to the barrier is itself a dynamic dispatch and reports 224 B for
-        # a gemm that allocates nothing. Inside, the arguments are already concrete.
+        # THE MINIMUM OVER SEVERAL WINDOWS IS THE HONEST STATISTIC, and it is not a weakening: a
+        # per-call leak allocates on EVERY call, so no window can come back clean, while a foreign
+        # allocation lands in some windows and not others. (This is the one place a minimum is right;
+        # timing still reduces through the median, because there the contamination is not one-sided.)
         #
-        # And the barrier takes THREE NAMED ARGUMENTS, never a varargs one: splatting a tuple through
-        # `f(args...)` allocates here even when the call it wraps does not, which makes the barrier
-        # the thing being measured.
-        gemm3(Cx, Ax, Bx) = (P.gemm!(Cx, Ax, Bx); @allocated P.gemm!(Cx, Ax, Bx))
+        # `@allocated` also sits INSIDE a compiled barrier taking three named arguments: at module
+        # scope the call is interpreted over `Any`-typed globals and the window then measures the
+        # interpreter's own method lookup, and a varargs barrier allocates through the splat.
+        #
+        # The warm-up covers both paths the measured call can take. The route is one; the pool's
+        # sleep/wake handoff is the other, and the shapes above miss it because they run back-to-back
+        # and leave the workers inside their `_MT_SPINS` window rather than parked.
+        gemm1(Cx, Ax, Bx) = @allocated P.gemm!(Cx, Ax, Bx)
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
-        @test gemm3(C, A, B) == 0
+        P.gemm!(C, A, B)                 # the route
+        sleep(0.05); P.gemm!(C, A, B)    # and a wake from a real park, not from the spin window
+        @test minimum(gemm1(C, A, B) for _ in 1:8) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
     end
