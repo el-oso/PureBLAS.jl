@@ -177,15 +177,17 @@ end
         # of each such call site caches a method instance — state that scales with the number of call
         # sites, not with the number of calls, so no amount of warming removes it. Only the SME route
         # shows it, because its portability barrier is a function pointer (one dynamic dispatch).
-        # A CONCRETE THREE-ARGUMENT WRAPPER, not a varargs one: splatting a tuple through `f(args...)`
-        # allocates here even when the call it wraps does not, which turns the barrier into the thing
-        # being measured. Measured on x86: the varargs form reported 224 B for a call that is
-        # allocation-free.
-        gemm3(Cx, Ax, Bx) = P.gemm!(Cx, Ax, Bx)
+        # `@allocated` GOES INSIDE THE BARRIER. Measuring from outside puts the untyped globals back
+        # into the window: the call to the barrier is itself a dynamic dispatch and reports 224 B for
+        # a gemm that allocates nothing. Inside, the arguments are already concrete.
+        #
+        # And the barrier takes THREE NAMED ARGUMENTS, never a varargs one: splatting a tuple through
+        # `f(args...)` allocates here even when the call it wraps does not, which makes the barrier
+        # the thing being measured.
+        gemm3(Cx, Ax, Bx) = (P.gemm!(Cx, Ax, Bx); @allocated P.gemm!(Cx, Ax, Bx))
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
-        gemm3(C, A, B)
-        @test @allocated(gemm3(C, A, B)) == 0
+        @test gemm3(C, A, B) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
     end
@@ -492,16 +494,21 @@ end
         @test_skip "needs >= 2 julia threads"
     else
         bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        # Witness FIRST, and under the threaded setting: `_trsm_workers` reads the live thread count,
+        # so asking it while threads are set to 1 always answers 1 and the bit-identity below would
+        # pass by never threading at all.
+        #
+        # The witness is that SOME size in the ladder threads, not that every one does. The predicate
+        # prices the fork-join against `_GEMM_MT_WORK`, which scales with the host's FMA rate, and at
+        # n=512 the work clears that floor by only ~4% — so a machine with a wider datapath answers 1
+        # there and reddens the item without anything being wrong. n=2048 clears it by more than an
+        # order of magnitude on any host, so the ladder as a whole cannot pass vacuously.
+        P.set_num_threads(nthreads())
+        @test count(n -> P._trsm_workers(P._lu_nb(n), n - P._lu_nb(n)) > 1, (512, 1024, 2048)) > 0
+        P.set_num_threads(1)
         for n in (512, 1024, 2048)
             Random.seed!(4242 + n)
             A0 = randn(n, n)
-            # Witness FIRST, and under the threaded setting: `_trsm_workers` reads the live thread
-            # count, so asking it while threads are set to 1 always answers 1 and the bit-identity
-            # below would pass by never threading at all.
-            nb = P._lu_nb(n)
-            P.set_num_threads(nthreads())
-            @test P._trsm_workers(nb, n - nb) > 1
-            P.set_num_threads(1)
             r = copy(A0); ipr = Vector{Int}(undef, n); P.getrf!(r, ipr)
             for nw in (2, nthreads())
                 P.set_num_threads(nw)
