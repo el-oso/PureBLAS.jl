@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 151 of them.
+Every `@load_preference` key in `src/` — 152 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,11 +14,8 @@ Every `@load_preference` key in `src/` — 151 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 69 Derived · 13 Measured · 50 Literal · 18 Exempt · **1 Unaudited**.
-**Default form** (mechanical): 64 formula · 22 delegates · 5 sibling · 50 literal · 5 flag · 5 other.
-
-⚠ **1 knob(s) carry no `# PDM:` marker.** That is debt, not a verdict — the
-suite fails while any remain. Add a marker: `# PDM: <Tier> — <one line> | tune: <cost>`.
+**Tier:** 70 Derived · 14 Measured · 50 Literal · 18 Exempt.
+**Default form** (mechanical): 65 formula · 22 delegates · 5 sibling · 50 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -252,8 +249,9 @@ suite fails while any remain. Add a marker: `# PDM: <Tier> — <one line> | tune
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
+| `sme_gemv_minwork` | formula | Derived | formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream. | — |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
-| `sme_min_exact` | literal | Unaudited | — | — |
+| `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
 
 ## workspace

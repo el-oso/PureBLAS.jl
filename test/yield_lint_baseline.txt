@@ -103,3 +103,21 @@ blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1> splat (i1 true), ptr %dp$i, i32 0, i32 $i)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sq$n, i32 $tile, i32 $sl)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
+
+# --- 2026-09-25, the SME gemv IR generator. Same reason as the gemm generator above: these are
+#              `print`/`println` into an in-memory `IOBuffer` while the kernel text is built,
+#              once, before the trampoline exists. No file, no terminal, no IO lock, no arena
+#              borrow, and nothing that runs inside a kernel.
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %w$(g)_0, <vscale x 2 x double> %w$(g)_1,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %w$(g)_2, <vscale x 2 x double> %w$(g)_3, <vscale x 2 x double> %bc)")
+blas3/sme_kernel.jl:println(io, "  %o$g = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
+blas3/sme_kernel.jl:println(io, "  %p$g = getelementptr inbounds double, ptr %cp, i64 $(32g)")
+blas3/sme_kernel.jl:println(io, "  %r$g = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %p$g)")
+blas3/sme_kernel.jl:println(io, "  %w$(g)_$k = extractvalue $T4 %r$g, $k")
+blas3/sme_kernel.jl:println(io, "  %yp$(g)_$k = getelementptr inbounds double, ptr %yblk, i64 $off")
+blas3/sme_kernel.jl:println(io, "  %ys$(g)_$k = fadd <vscale x 2 x double> %yv$(g)_$k, %z$(g)_$k")
+blas3/sme_kernel.jl:println(io, "  %yv$(g)_$k = load <vscale x 2 x double>, ptr %yp$(g)_$k, align 8")
+blas3/sme_kernel.jl:println(io, "  %z$(g)_$k = extractvalue $T4 %o$g, $k")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
+blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %ys$(g)_$k, ptr %yp$(g)_$k, align 8")
+blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %z$(g)_$k, ptr %yp$(g)_$k, align 8")

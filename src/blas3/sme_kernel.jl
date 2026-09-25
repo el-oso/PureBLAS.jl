@@ -599,7 +599,7 @@ end
 # which regressed gemm@50 by 38% (1142 -> 1582 us) before the dense sweep found 49, 51, 53.
 # PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: sweep
 const _SME_MIN = @load_preference("sme_min", 6 * _SME_MR)::Int
-# Exact multiples of the row-panel carry no remainder and win from here up; see the table above.
+# PDM: Measured — the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | tune: sweep
 const _SME_MIN_EXACT = @load_preference("sme_min_exact", 3 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
@@ -649,6 +649,18 @@ function _sme_init!()
         # A machine that advertises the feature but cannot build the kernel keeps the SIMD path.
         _SME_ENTRY[] = C_NULL
     end
+    # Same barrier, same reason: `inferencebarrier` is what actually stops inference folding the
+    # symbol back to the concrete function and walking into the kernel. A `getfield` by name does
+    # NOT -- module and symbol are both constants, so it const-folds.
+    try
+        g = Base.inferencebarrier(_sme_gemv_cabi)
+        gf = @cfunction($g, Cvoid,
+            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+        _SME_GEMV_TRAMPOLINE[] = gf
+        _SME_GEMV_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, gf)
+    catch
+        _SME_GEMV_ENTRY[] = C_NULL
+    end
     return nothing
 end
 
@@ -695,6 +707,283 @@ end
 # Bumped once per SME gemm, and read by the threading liveness gate: a call this guard takes away
 # from the pool has to show that the coprocessor ran instead. Once per call against milliseconds of
 # kernel, so it costs nothing measurable; it is the SME counterpart of the pool's `gen` word.
+
+# ══ GEMV ═══════════════════════════════════════════════════════════════════════════════════════
+# y = alpha*A*x + beta*y, A column-major Float64.
+#
+# A DIFFERENT MECHANISM FROM THE GEMM ABOVE, found by elimination. The coprocessor is fast only
+# when it accumulates into ZA and slow at ordinary vector arithmetic. Measured on an M6, one
+# buffer, four independent chains throughout:
+#
+#     fadd into z registers ........   66.6 GB/s   (UNCHANGED by 4x wider loads)
+#     NEON, 8 accumulators .........  136
+#     fmla into ZA, ONE slice group .  256.7
+#     fmla into ZA, FOUR groups ..... 1013         (Accelerate reaches 977)
+#
+# The decisive row is the second: quadrupling bytes per instruction moved the result by 0.1 GB/s,
+# which proves the 66.6 wall is the ADD, not the load port. `fmopa` cannot serve here either — it
+# reads at most 64 B per instruction, so at one per cycle its ceiling is ~250 GB/s.
+#
+# So `y` LIVES in ZA while the columns of A stream past: one round trip through the unit instead
+# of one per column. Four independent slice groups rather than one is worth 4x, because every
+# `fmla` into the same slice is a serial dependency chain.
+#
+# ⚠ THE vg1x4 SLICE ARGUMENT IS A GROUP SELECTOR, NOT A VECTOR INDEX. Passing `4g` happens to work
+# at four groups — those values are distinct and in range — and silently produces WRONG RESULTS at
+# eight and sixteen. Consecutive indices 0..NG-1 are correct.
+function _gemv_ir(ng::Int, acc::Bool = true)
+    q = Char(34)
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    rb = 32 * ng                      # rows of y per block
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
+declare void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %n, double %alpha, i64 %nb) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %n, double %alpha, i64 %nb)
+  ret void
+}
+
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %n, double %alpha, i64 %nb) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  %anyb = icmp sgt i64 %nb, 0
+  br i1 %anyb, label %blk, label %fin
+
+blk:
+  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
+  %boff = mul nsw i64 %b, $rb
+  %ablk = getelementptr inbounds double, ptr %a, i64 %boff
+  %yblk = getelementptr inbounds double, ptr %y, i64 %boff
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %anyc = icmp sgt i64 %n, 0
+  br i1 %anyc, label %col, label %rd
+
+col:
+  %j = phi i64 [ 0, %blk ], [ %jn, %col ]
+  %xp = getelementptr inbounds double, ptr %x, i64 %j
+  %xs = load double, ptr %xp, align 8
+  %xa = fmul double %xs, %alpha
+  %e0 = insertelement <vscale x 2 x double> poison, double %xa, i32 0
+  %bc = shufflevector <vscale x 2 x double> %e0, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %co = mul nsw i64 %j, %lda
+  %cp = getelementptr inbounds double, ptr %ablk, i64 %co
+""")
+    for g in 0:(ng-1)
+        println(io, "  %p$g = getelementptr inbounds double, ptr %cp, i64 $(32g)")
+        println(io, "  %r$g = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %p$g)")
+        for k in 0:3
+            println(io, "  %w$(g)_$k = extractvalue $T4 %r$g, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
+        println(io, "    <vscale x 2 x double> %w$(g)_0, <vscale x 2 x double> %w$(g)_1,")
+        println(io, "    <vscale x 2 x double> %w$(g)_2, <vscale x 2 x double> %w$(g)_3, <vscale x 2 x double> %bc)")
+    end
+    print(io, """
+  %jn = add nuw nsw i64 %j, 1
+  %cdone = icmp eq i64 %jn, %n
+  br i1 %cdone, label %rd, label %col
+
+rd:
+""")
+    for g in 0:(ng-1)
+        println(io, "  %o$g = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
+        for k in 0:3
+            off = 32g + 8k
+            println(io, "  %z$(g)_$k = extractvalue $T4 %o$g, $k")
+            println(io, "  %yp$(g)_$k = getelementptr inbounds double, ptr %yblk, i64 $off")
+            if acc
+                println(io, "  %yv$(g)_$k = load <vscale x 2 x double>, ptr %yp$(g)_$k, align 8")
+                println(io, "  %ys$(g)_$k = fadd <vscale x 2 x double> %yv$(g)_$k, %z$(g)_$k")
+                println(io, "  store <vscale x 2 x double> %ys$(g)_$k, ptr %yp$(g)_$k, align 8")
+            else
+                # beta == 0: ZA already holds exactly alpha*A*x for these rows, so store it. The
+                # accumulate form costs a y-load and an fadd per vector -- both z-register ops at
+                # ~4 cycles -- and forces a fill!(y, 0) pass beforehand.
+                println(io, "  store <vscale x 2 x double> %z$(g)_$k, ptr %yp$(g)_$k, align 8")
+            end
+        end
+    end
+    print(io, """
+  br label %bend
+
+bend:
+  %bn = add nuw nsw i64 %b, 1
+  %bdone = icmp eq i64 %bn, %nb
+  br i1 %bdone, label %fin, label %blk
+
+fin:
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+
+attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body"
+  "target-features"="+sme,+sme2,+sme-f64f64" }
+""")
+    return String(take!(io))
+end
+
+# One kernel per group count, each looping over its own row blocks internally so streaming mode is
+# entered ONCE per call rather than once per block. The remainder is handled by SMALLER ZA blocks,
+# not a scalar loop: the scalar tail was the dominant cost whenever m was not a multiple of the
+# block (0.08x Accelerate at m=256, 0.17x at m=768) and only a scrap below one vector group stays
+# scalar now.
+#
+# Built even where SME is absent — the strings are constructed, never executed; every entry point
+# is gated on `_SME_F64`, exactly as the gemm IR above.
+const _SME_GEMV_IR = Dict{Tuple{Int, Bool}, String}(
+    (ng, acc) => _gemv_ir(ng, acc) for ng in (1, 2, 4, 8, 16), acc in (true, false)
+)
+
+for ng in (1, 2, 4, 8, 16), acc in (true, false)
+    nm = Symbol(acc ? "_sme_gemv_acc" : "_sme_gemv_sto", 32 * ng)
+    ir = _SME_GEMV_IR[(ng, acc)]
+    @eval @inline $nm(y, a, l, x, n, al, nb) = Base.llvmcall(($ir, "entry"), Cvoid,
+        Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
+        y, a, Int64(l), x, Int64(n), al, Int64(nb))
+end
+
+@inline function _sme_gemv_run(rb::Int, y, a, l, x, n, al, nb, store::Bool)
+    if store
+        rb == 512 ? _sme_gemv_sto512(y, a, l, x, n, al, nb) :
+        rb == 256 ? _sme_gemv_sto256(y, a, l, x, n, al, nb) :
+        rb == 128 ? _sme_gemv_sto128(y, a, l, x, n, al, nb) :
+        rb ==  64 ? _sme_gemv_sto64( y, a, l, x, n, al, nb) :
+                    _sme_gemv_sto32( y, a, l, x, n, al, nb)
+    else
+        rb == 512 ? _sme_gemv_acc512(y, a, l, x, n, al, nb) :
+        rb == 256 ? _sme_gemv_acc256(y, a, l, x, n, al, nb) :
+        rb == 128 ? _sme_gemv_acc128(y, a, l, x, n, al, nb) :
+        rb ==  64 ? _sme_gemv_acc64( y, a, l, x, n, al, nb) :
+                    _sme_gemv_acc32( y, a, l, x, n, al, nb)
+    end
+    return nothing
+end
+
+# Rows per ZA vector group: four vectors of `_SME_L` doubles, the smallest block the kernel emits.
+const _SME_GEMV_BLK = 4 * _SME_L
+
+# The work below which a ZA-resident y costs more than it saves. The cost is the ZA fill and the
+# readback, both O(m) and both paid whatever n is, against a stream of m*n elements — so the
+# criterion is the PRODUCT, not either dimension. Measured against the SIMD column-panel kernel it
+# displaces, forced SME arm, one process (`bench/probes/sme_gemv_min_crossover.jl`):
+#
+#     m \ n      4      8     16     32     64    128    256    512
+#       32    0.09   0.19   0.30   0.48   0.75   1.12   1.46   1.77
+#       96    0.17   0.31   0.55   0.94   1.49   2.02   3.49   3.46
+#      128    0.37   0.67   1.09   1.70   2.63   3.18   6.52   7.50
+#      512    0.90   1.49   2.32   4.07   8.69  11.77   9.51   8.82
+#     1024    1.37   2.12   3.69   7.60  10.40  10.62  12.45   8.77
+#
+# Every cell at or above 8192 elements wins and every loser is below it, and 8192 doubles is half of
+# this machine's L1 — the panel has to be at least that before the fixed ZA cost disappears into it.
+# DERIVING THIS ON ONE n WOULD HAVE BEEN WRONG: an m-only sweep at n=512 put the cut at 96 rows, and
+# that admitted 35 shapes at n=64 that run as slow as 0.82 of the path they displaced.
+# PDM: Derived — formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream.
+const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
+    _L1_BYTES ÷ (2 * sizeof(Float64)))::Int
+
+# EXACT MULTIPLES OF THE BLOCK ONLY, which is conservative on purpose. A remainder below one vector
+# group falls to a scalar loop, and that loop is the dominant cost long before it is a small
+# fraction of the rows: m=40 (8 scalar rows of 40) runs at 0.45 of the SIMD path, m=72 at 0.87,
+# m=144 at 0.90, while every exact multiple with enough work wins from one block up. A fitted
+# remainder-fraction threshold would admit some of those and is not derived from anything.
+#
+# The fix is a masked ZA block for the tail rather than a better predicate; until that exists this
+# declines shapes the kernel could serve (m=104 at 1.14, m=300 at 2.88) in exchange for never
+# running slower than the path it replaces.
+@inline _sme_gemv_shape_ok(m, n) =
+    m % _SME_GEMV_BLK == 0 && m * n >= _SME_GEMV_MINWORK
+
+# The kernel reads y and A as raw column-major Float64 with unit row stride, and x contiguously.
+@inline _sme_gemv_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy) where {T} =
+    T === Float64 && _SME_F64 && !trans && !cj && incx == 1 && incy == 1 &&
+        eltype(x) === Float64 && eltype(y) === Float64 &&
+        _strided1(A) && _dense1(x) && _dense1(y) &&
+        _sme_gemv_shape_ok(m, n) && _SME_GEMV_ENTRY[] !== C_NULL
+
+
+# THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and a runtime guard cannot achieve that: codegen
+# happens when the caller is COMPILED, not when it runs, so a concrete call from `level2.jl` is
+# enough to make the precompile process emit SME2 intrinsics for a generic image CPU and abort with
+# `Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`. Measured, not feared.
+#
+# So gemv takes the same barrier the gemm path uses: the body is reached only through a function
+# POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
+# `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
+function _sme_gemv_cabi(
+        y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
+        m::Int, n::Int, alpha::Float64, store::Int
+    )
+    st = store != 0
+    ib = 0
+    rb = 512
+    # LARGEST BLOCK FIRST, HALVING. An earlier version capped this at half the rows because a lone
+    # block seemed to have nothing to overlap against. What it was overlapping WAS the readback, and
+    # once that became a direct store the rule was pure cost: removing it took m=512 from 0.96 to
+    # 1.05 of Accelerate and m=768 from 0.99 to 1.04.
+    while rb >= 32
+        nb = (m - ib) ÷ rb
+        if nb > 0
+            _sme_gemv_run(rb, y + ib * 8, a + ib * 8, lda, x, n, alpha, nb, st)
+            ib += nb * rb
+        end
+        rb >>= 1
+    end
+    if ib < m                            # fewer than 32 rows: below one ZA vector group
+        if st
+            for i in ib:(m - 1)
+                unsafe_store!(y + i * 8, 0.0)
+            end
+        end
+        for j in 0:(n - 1)
+            s = alpha * unsafe_load(x + j * 8)
+            aj = a + j * lda * 8
+            for i in ib:(m - 1)
+                q = y + i * 8
+                unsafe_store!(q, muladd(s, unsafe_load(aj + i * 8), unsafe_load(q)))
+            end
+        end
+    end
+    return nothing
+end
+
+const _SME_GEMV_TRAMPOLINE = Ref{Any}(nothing)     # roots the closure against collection
+const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
+
+# Mode 1 hands `x` and `y` as RAW POINTERS (`cabi_l2.jl` wraps only A, as a `PtrMatrix`), and
+# `_dense1` admits those by design, so the operands here are `Ptr` or `Vector` depending on which
+# mode called. `pointer` covers the array cases; the `Ptr` identity covers the C ABI.
+@inline _sme_p(v::Ptr{Float64}) = v
+@inline _sme_p(v) = pointer(v)
+
+@noinline function _sme_gemv!(m::Int, n::Int, alpha::Float64, A, x, beta::Float64, y)
+    lda = stride(A, 2)
+    GC.@preserve y A x begin
+        py = _sme_p(y)
+        if !iszero(beta) && !isone(beta)
+            for i in 0:(m - 1)
+                q = py + i * 8
+                unsafe_store!(q, beta * unsafe_load(q))
+            end
+        end
+        ccall(
+            _SME_GEMV_ENTRY[], Cvoid,
+            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int),
+            py, _sme_p(A), lda, _sme_p(x), m, n, alpha, iszero(beta) ? 1 : 0
+        )
+    end
+    return y
+end
+
 const _SME_CALLS = Threads.Atomic{Int}(0)
 
 @noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
