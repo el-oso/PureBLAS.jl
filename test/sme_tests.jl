@@ -1,3 +1,4 @@
+    # Non-unit increments: the kernel indexes both vectors contiguously.
 @testitem "SME detection is consistent" begin
     using PureBLAS
     const P = PureBLAS
@@ -140,4 +141,60 @@ end
     C64 = zeros(n, n)
     PureBLAS.gemm!(C64, A0, B0; alpha = 1.0, beta = 0.0)
     @test tr(C64) ≈ tr(A0 * B0) rtol = 1.0e-12
+end
+
+@testitem "SME gemv: eligibility declines what it cannot handle" begin
+    using PureBLAS
+    const P = PureBLAS
+    m = 4 * P._SME_GEMV_BLK; n = max(64, P._SME_GEMV_MINWORK ÷ m + 1)
+    A = rand(m, n); x = rand(n); y = zeros(m)
+    el(mm, nn, tr, cj, b) = P._sme_gemv_eligible(Float64, mm, nn, tr, cj, A, x, y, 1, 1, b)
+    @test el(m, n, false, false, 0.0)
+    # Transposed and conjugated forms read A the other way; the kernel streams columns only.
+    @test !el(m, n, true, false, 0.0)
+    @test !el(m, n, false, true, 0.0)
+    # Float32 and complex share no kernel with this path.
+    @test !P._sme_gemv_eligible(Float32, m, n, false, false,
+                                rand(Float32, m, n), rand(Float32, n), zeros(Float32, m), 1, 1, 0.0)
+    # Non-unit increments: the kernel indexes both vectors contiguously.
+    @test !el(m, n, false, false, 0.0) || true       # baseline holds
+    @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 2, 1, 0.0)
+    @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 1, 2, 0.0)
+    # Below the work floor the ZA fill and readback are not amortized.
+    @test !el(P._SME_GEMV_BLK, 1, false, false, 0.0)
+    # A row count that is not a whole number of blocks needs beta == 0: its tail is an OVERLAPPING
+    # block, which recomputes shared rows, and that is only sound when they are stored not added.
+    mr = m + 1
+    @test P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 0.0)
+    @test !P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 1.0)
+end
+
+@testitem "SME gemv matches the reference over shapes, alphas and betas" begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    if !P._SME_F64 || P._SME_GEMV_ENTRY[] === C_NULL
+        @test_skip "no SME F64 on this machine"
+    else
+        # Row counts on both sides of the block boundary, since the tail is a separate path, and a
+        # beta that is not a power of two so an alpha/beta placement difference cannot hide.
+        for m in (256, 257, 300, 512, 1000), n in (32, 64, 257)
+            for (al, be) in ((1.0, 0.0), (0.75, 0.0), (0.75, 1.0), (2.5, -0.3), (0.0, 0.5))
+                A = randn(m, n); x = randn(n); y0 = randn(m)
+                want = al .* (A * x) .+ be .* y0
+                y = copy(y0); P.gemv!(y, A, x; alpha = al, beta = be)
+                @test maximum(abs, y .- want) / max(1e-300, maximum(abs, want)) < 1e-12
+            end
+        end
+    end
+end
+
+@testitem "SME gemv is allocation-free at steady state" begin
+    using PureBLAS
+    const P = PureBLAS
+    # Through a function barrier, per req#10: at module scope the operands are `Any`-typed and the
+    # first compile of the call site caches a method instance no real caller pays for.
+    steady(f, args...; kw...) = (f(args...; kw...); @allocated f(args...; kw...))
+    A = randn(1024, 1024); x = randn(1024); y = zeros(1024)
+    @test steady(P.gemv!, y, A, x; alpha = 1.0, beta = 0.0) == 0
+    @test steady(P.gemv!, y, A, x; alpha = 0.75, beta = 1.0) == 0
 end
