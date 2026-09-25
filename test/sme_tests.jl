@@ -157,7 +157,6 @@ end
     @test !P._sme_gemv_eligible(Float32, m, n, false, false,
                                 rand(Float32, m, n), rand(Float32, n), zeros(Float32, m), 1, 1, 0.0)
     # Non-unit increments: the kernel indexes both vectors contiguously.
-    @test !el(m, n, false, false, 0.0) || true       # baseline holds
     @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 2, 1, 0.0)
     @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 1, 2, 0.0)
     # Below the work floor the ZA fill and readback are not amortized.
