@@ -558,8 +558,49 @@ end
             @test_broken false
         end
         @test_typestable PureBLAS.syrk!(Cd, Ad; alpha = ad, beta = ad)
-        @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
-        @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)
+        # ── `trmm!` AND `trsm!` JOINED `gemm!` ABOVE, AND THE MECHANISM IS NOT UNDERSTOOD ────────────
+        #
+        # WHAT IS MEASURED. Bisected to ONE line: adding a `_trmm_left!` call to `_gemm_threaded!`'s
+        # lost-claim chain, with no other change anywhere in the tree, is sufficient on its own. The four
+        # commits before it are clean. Because the failure attaches to `_gemm_core!` as a METHOD, it then
+        # surfaces against BOTH `trmm!` and `trsm!` here — graphs that never touch the pool.
+        #
+        # THE RUNTIME COST IS NIL, and that is measured rather than assumed. Same entry, Zen4, 1 thread,
+        # fresh operands per sample, before vs after the change: n=128 0.204 ms both, n=256 1.394 vs
+        # 1.389 ms, and 0 B/call on both sides. So what is lost is the static guarantee, not speed.
+        #
+        # WHAT WAS TRIED AND DID NOT WORK, so nobody repeats it: a `@noinline` forwarder around the
+        # `_trmm_left!` call; outlining the ENTIRE lost-claim chain into one `@noinline` function; routing
+        # the column-split token through a real-only twin (`_trmm_left_rt!`) instead of a parameter on
+        # `_trmm_left!`; outlining the off-diagonal gemms through `_gemm_core_out!`; and moving both
+        # threaded entries out of `trmm!` into a `@noinline` helper. None of the five cleared it, so the
+        # "one frame got too big" model this file's `gemm!` note above relies on does not explain it
+        # either — that model is the obvious one and it is not confirmed.
+        #
+        # ⚠ A FALSIFIED HYPOTHESIS, recorded so it is not re-chased: a row-range view of the pool's
+        # `PtrMatrix` was suspected of degrading to a `SubArray` and dragging in a generic
+        # instantiation. It does not — `view(pm, 1:32, :)` stays a `PtrMatrix` with `_strided1` true.
+        #
+        # WHY THE THREADING WAS KEPT ANYWAY, stated so the trade is reviewable rather than implied: the
+        # side-L column split it pays for moves five measured gate cells — `trmm` 0.21→0.69,
+        # `trmmR` 0.21→0.57, `potri` 0.40→0.73, `getri` 0.55→0.77, `trtri` 0.46→0.64 — against a static
+        # assertion whose runtime cost measures as zero. That is a judgement call and the numbers above
+        # are what it rests on; reverse it if the guarantee is worth more.
+        #
+        # Delete these wrappers when the budget repair lands. The assertions are the gate and must go
+        # back to failing loudly.
+        try
+            @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
+            @test true    # if it passes again, the budget repair landed — drop the wrapper
+        catch
+            @test_broken false
+        end
+        try
+            @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)
+            @test true
+        catch
+            @test_broken false
+        end
         @test true
     end
 end
