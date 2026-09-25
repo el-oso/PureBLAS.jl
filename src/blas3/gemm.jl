@@ -3390,6 +3390,44 @@ end
         nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
 
+"""
+    _gemm_trailing!(C, A, B, alpha, beta, tA, tB; nroute = -1) -> C
+
+A blocked LAPACK driver's trailing update, threaded when the shape earns it.
+
+WHY THIS EXISTS. A driver cannot reach the pool through `gemm!`: that entry gates on whether `C` is a
+strided matrix, which a `PtrMatrix` is not, so a Mode-1 or `.so` caller would silently take the
+generic kernel (`bunchkaufman.jl:499`, `banded_chol.jl:517` both record the trap). Calling
+`_gemm_core!` directly avoids it and was what every driver did — but `_gemm_core!`'s `nw` declares
+"I am worker `wi` of `nw`", it does not REQUEST workers, so those updates ran on one thread whatever
+the pool held. `sytrf`, `geqp3`, `gelsy` and `gbtrf` all read a 1.00x self-speedup for that reason.
+
+Reproducibility comes from the pair being the same computation, not from the split being avoided:
+both arms decline Strassen, and the threaded arm routes every chunk from the whole column count
+(`p.n`), so each element of C accumulates its entire `k` chain on one worker in an order fixed by
+`kc = min(_KC, k)` — a function of the problem, never of the worker count.
+
+`nroute` is for a caller that has already divided a LARGER update into several dispatches and needs
+every piece to route from the undivided width; a caller whose `C` is the whole update leaves it at -1.
+"""
+@inline function _gemm_trailing!(
+        C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cB::Bool = false; nroute::Int = -1
+    ) where {T}
+    m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
+    # `T <: BlasReal` and `!cB`: the pool exists only for the two real types, and a conjugated operand
+    # is a complex-only shape. Both fall through to the serial call, which is what they did before.
+    nw = (T <: BlasReal && !cB) ? _gemm_workers(m, nroute < 0 ? n : nroute, k) : 1
+    if nw > 1 && _strided1(C) && _strided1(A) && _strided1(B)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), alpha, beta, tA, tB, false, false, nw
+        )
+        return C
+    end
+    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, nroute)
+    return C
+end
+
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
         nroute::Int, strassen::Bool, nw::Int, wi::Int
@@ -3763,6 +3801,9 @@ const _MT_KIND_LUAHEAD = 3
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_TRSMR = 4
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_TRMMR = 5
 
 """
     _syrk_workers(n, k) -> Int
@@ -3850,6 +3891,7 @@ end
     p.kind == _MT_KIND_TRSM && return _trsm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4274,6 +4316,13 @@ end
             _trsm!(true, up, tA, cA, unit, alpha, A, C)
         elseif kind == _MT_KIND_TRSMR
             _trsm!(false, up, tA, cA, unit, alpha, A, C)
+        elseif kind == _MT_KIND_TRMMR
+            # A loser multiplies the whole of B. `_trmm_right!` routes on `size(A, 1)`, which the row
+            # split leaves alone, so this reaches the kernel the winner's bands do — with `wi = 0`, the
+            # serial buffer, because a loser is not one of the published job's workers. α is applied
+            # after the product, as `trmm!` applies it.
+            _trmm_right!(up, tA, cA, unit, A, C)
+            isone(alpha) || _scal_all!(C, alpha)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
@@ -4340,6 +4389,12 @@ end
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
         # storage the winner's workers already hold pointers into.
         (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
+        # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
+        # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
+        # and with more at stake: a worker that grew its own slot would allocate inside the published
+        # job, and the driver and idle workers are then in spin/wait loops with nowhere for a GC to
+        # progress from. That failed as a swallowed worker exception or a silent hang, by interleaving.
+        kind == _MT_KIND_TRMMR && _trmmr_prefit!(T, A.n, nw)
         p.Cp = C.ptr; p.ldc = C.ld
         p.Ap = A.ptr; p.lda = A.ld
         p.Bp = B.ptr; p.ldb = B.ld

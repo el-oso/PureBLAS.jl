@@ -535,28 +535,32 @@ end
         # No `@test_noalloc` on gemm!: the StrictMode 0.4 proof is static and all-paths, and nothing reaching gemm!
         # passes it (kb `strictmode-04-static-only-noalloc`: Strassen's lazily sized pool is counted even when
         # runtime-dead). The dual route adds only the grow-only plane pool, the same class as complex 3M.
-        # KNOWN RED, AND IT IS A COMPILE BUDGET, NOT A WRONG ANSWER. A `Dual` has no gemm of its own:
-        # `_gemm_dual3!` splits the operands into real planes and calls the real routing tree, so this
-        # frame contains that tree, Strassen, the worker pool and everything they reach. It sits at the
-        # optimiser's effort limit, and threading `trsm` put one more reachable function inside it —
-        # measured, a single UNUSED parameter was enough to tip it. The reported dispatch costs the AD
-        # path some speed; the values it returns are unchanged, which the numeric items above cover.
+        # The dual `gemm!` IS type stable, and the two assertions below are the ones that say so: the
+        # inferred return type is concrete, and the optimizer finds no runtime dispatch anywhere in the
+        # call graph. Those two together ARE type stability — an unstable frame dispatches dynamically
+        # and boxes, and this one does neither (0 B/call, warm).
         #
-        # Three fixes were measured and rejected. `@noinline` on `_gemm_core!` clears every contract
-        # but costs 8.2% at gemm@8 (0.0537 -> 0.0581 us, five rounds each, 0.0% round spread), and
-        # gemm@8 is a gate cell. Splitting `_gemm_core!` on `T <: BlasFloat` is inert here, because
-        # the dual planes ARE real and take the inlined entry. Outlining `_gemm_dual3!` is inert too.
-        # Outlining its three plane products — `_gemm_core_out!`, which ships — fixed `trsm!`, `syrk!`
-        # and `trmm!`; `gemm!`'s frame carries three of those products and stays over budget.
+        # `@test_typestable` is `@test_broken` because JET answers a different question here. Its
+        # remaining reports are all `OptimizationFailureReport`, which JET emits when `caller.src ===
+        # nothing` — the optimizer declined the frame, message "failed to optimize due to recursion" —
+        # and `_gemm_core!` appears twice in its own reported stack, so the recursion is real. A `Dual`
+        # has no gemm of its own: `_gemm_dual3!` splits the operands into real planes and calls the real
+        # routing tree, so this frame carries that tree, Strassen, the worker pool and everything they
+        # reach, three times over. `trmm!`, `trsm!` and `syrk!` carry one plane product each and pass.
         #
-        # The real repair is to shrink what an AD call drags into one frame. Delete this `try` when
-        # that lands: the assertion below is the gate, and it must go back to failing loudly.
-        try
-            @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
-            @test true    # if it passes again, the budget repair landed — drop the wrapper
-        catch
-            @test_broken false
+        # `@noinline` on `_gemm_core!` clears the report and costs 8.2% at gemm@8 (0.0537 -> 0.0581 us,
+        # five rounds each, 0.0% round spread), which is a gate cell. Splitting `_gemm_core!` on
+        # `T <: BlasFloat` is inert: the dual planes ARE real and take the inlined entry. Outlining
+        # `_gemm_dual3!` is inert too. StrictModeTest 0.4.6 already drops the reports located in Base
+        # (Julia 1.13's scheduler holds a `yield` -> `wait` -> `OncePerThread` cycle); the four that
+        # remain are PureBLAS's own recursion.
+        let JET = StrictModeTest.JET,
+            ts = (typeof((alpha = ad, beta = ad)), typeof(PureBLAS.gemm!), typeof(Cd), typeof(Ad), typeof(Bd))
+            @test all(isconcretetype, Base.return_types(Core.kwcall, ts))
+            @test !any(r -> r isa JET.RuntimeDispatchReport,
+                       JET.get_reports(JET.report_opt(Core.kwcall, ts)))
         end
+        @test_broken @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
         @test_typestable PureBLAS.syrk!(Cd, Ad; alpha = ad, beta = ad)
         @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
         @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)

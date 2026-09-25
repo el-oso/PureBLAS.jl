@@ -870,11 +870,24 @@ function _pack_B_triR!(
     end
     return
 end
-function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {T <: BlasReal}
+# Elements of op(A) pack scratch this driver needs. A function of `k` alone — `kc` is capped by `k`
+# and the panel count divides `k` — so a row band needs exactly what the whole problem does, which is
+# what lets the pool size every worker's slot from the unsplit dimensions.
+@inline _trmmr_blk(::Type{T}, k::Int) where {T} = cld(k, _NR) * _NR * min(_fh_trmm_rkc(), k)
+
+# `wi` is this call's worker index, or 0 for a serial call. A worker takes its own pre-sized slot; a
+# serial call keeps the per-task buffer, so the serial path is unchanged. See `_trmmr_pack`.
+function _trmm_packedR!(
+        up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}, wi::Int = 0
+    ) where {T <: BlasReal}
     m, k = size(B); W = _vwidth(T); mr = _MR * W; nr = _NR
     upM = (up != tr)
     kc = min(_fh_trmm_rkc(), k); mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
-    _, Bp = _gemm_scratch(T, 0, cld(k, nr) * nr * kc)
+    Bp = if wi > 0
+        _trmmr_pack(T, wi, _trmmr_blk(T, k))
+    else
+        _, b = _gemm_scratch(T, 0, _trmmr_blk(T, k)); b
+    end
     # Pre-pack ALL of B (the gemm A-operand) up front, before any C write — B IS C here, so packing it
     # once both captures the input (no separate copy pass; ~2% of runtime at 1024) and feeds the whole
     # sweep. Slot layout: (pc-block, ic-block) → a fixed-size mr-panel group.
@@ -940,13 +953,16 @@ function _trmm_packedR!(up::Bool, tr::Bool, unit::Bool, A, B, ::Type{T}) where {
     end
     return B
 end
-function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+# `wi` is the caller's worker index, or 0 when serial. It reaches only `_trmm_packedR!`, which is the
+# one route below here that a threaded side-R call may take — see the entry in `trmm!`, which arms the
+# row split exactly where this branch owns the call.
+function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 0)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
     elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack()
-        return _trmm_packedR!(up, tr, unit, A, B, Float64)
+        return _trmm_packedR!(up, tr, unit, A, B, Float64, wi)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
         # STORED rectangular A-view (transB carries op; no materialize) + a diagonal solved by the
@@ -1265,21 +1281,33 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     # do it — `gemm!`'s default is off, because a Strassen route is not thread-count reproducible and
     # the public entry has to be (see the note on `_gemm_core!`'s `strassen`).
     #
-    # This call site cannot break that guarantee, because it is below the threading entry and so runs
-    # serially at every thread count. What it costs is threading this one update, which trmm never had
-    # a gate number for; the column split over B that Phase 3 wants sits ABOVE this and is reproducible.
-    #
     # It is kept because it is measured, not inherited. Zen4, recursion forced off with the split left
     # armed: n=4096 is 10.7% slower and n=2048 2.2%, which takes trmm@4096 from 1.052 to 0.950 — a
     # passing cell to a failing one. The gate's own gemm cells are flat under the same switch, because
     # they allocate cold operands per sample; trmm's B is warm from the solve that just wrote it.
+    #
+    # THE UPDATE THREADS ONLY WHERE THE RECURSION OWNS IT. `_gemm_core!`'s `nw` declares "I am worker
+    # `wi` of `nw`" — it does NOT request workers. The classical route passes the pair straight to
+    # `_gemm_blocked!`, so a lone caller announcing companions that never arrive waits at their barrier
+    # forever; only the Strassen route spawns the workers it is told about. The count is therefore
+    # passed exactly when `_strassen_owns` answers yes, which requires `!tA` — so an update with a
+    # transposed A runs serially and says so by carrying 1.
+    #
+    # Reproducibility is not at risk on the route that does thread: a Strassen leaf is a classical
+    # product whose arithmetic is fixed by `(m, n, k)` alone, so the recursion returns the same bits at
+    # every worker count. The worker count comes from the update's OWN shape, because the shape halves
+    # at each level and a count fit to the root would over-subscribe the leaves. The diagonal halves
+    # stay serial: they bottom out in `_trmm_packed!`, which has no split of its own.
+    n = size(B, 2)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true)   # Bt += op(off)·Bb
+        nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb) ? _gemm_workers(h, n, k - h) : 1
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true)   # Bb += op(off)·Bt
+        nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt) ? _gemm_workers(k - h, n, h) : 1
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -1322,6 +1350,33 @@ function trmm!(
         trmm!(Bc, A; side, uplo, transA, diag, alpha)
         copyto!(B, Bc)
         return B
+    end
+    # THREADED SIDE-R: split B's rows. Placed below the staging branches above, because each of those
+    # either returns or rewrites the operands, and a split above them would hand workers a B the serial
+    # path would not have multiplied.
+    #
+    # `k > _fh_trmm_rpack()` IS THE REPRODUCIBILITY CONDITION, not a performance cutoff. Above it
+    # `_trmm_packedR!` owns the call and drives `_microkernel!` directly, with a `kc` fixed by `k` and
+    # no size-keyed branch below; beneath it the flat panel loop issues `_gemm_core!` calls whose
+    # kernel switch reads `max(m, nroute, k)`, where `m` is the band's own row count — so a band would
+    # take a different route than the serial call and return different bits. `Float64` for the same
+    # reason: `_trmm_packedR!` is the Float64 path and F32 falls back to the flat loop.
+    #
+    # The worker count rides `_trsm_workers_r`: the amortisation floor and the `_MR·W` row granularity
+    # are the same, and its `k²·m` overstates trmm's flops by 2x, which only makes it more conservative
+    # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
+    if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
+            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack()
+        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        if nwr > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, false, false, nwr,
+                _MT_KIND_TRMMR, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
     end
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
@@ -4754,6 +4809,39 @@ end
     isone(p.alpha) || _scal_all!(Bc, p.alpha)
     # `p.m`, not `len`: route from the whole problem's ROW count.
     _trsm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.m)
+    return nothing
+end
+
+# Grow every worker's op(A) pack slot before the job is published. Called from the driver, inside the
+# claim — never from a chunk body, which must not allocate.
+@inline function _trmmr_prefit!(::Type{T}, k::Int, nw::Int) where {T <: BlasReal}
+    blk = _trmmr_blk(T, k)
+    for wi in 1:nw
+        _trmmr_pack(T, wi, blk)
+    end
+    return nothing
+end
+_trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds never take this job
+
+# ── THREADED trmm, side 'R' ────────────────────────────────────────────────────────────────────────
+# `X := α·B·op(A)` reads B along its rows and writes them back in place, so a row band is a whole
+# problem and the bands are write-disjoint — the mirror of the side-R solve above, and the same
+# `_MR·W` granularity so every band but the last drives full microkernel tiles.
+#
+# NO ROUTE TOKEN, AND THAT IS A CONSTRAINT ON WHERE THIS MAY BE ARMED rather than an omission.
+# `_trmm_right!` routes on `size(A, 1)`, which a row split leaves alone, but its flat panel loop then
+# issues `_gemm_core!` calls whose kernel switch reads `max(m, nroute, k)` — and `m` there IS the
+# band's row count, so a band would take a different route than the serial call. `nroute` substitutes
+# only `n`; there is no `m` counterpart to thread. The entry therefore arms this only above
+# `_fh_trmm_rpack()`, where `_trmm_packedR!` owns the call and drives `_microkernel!` directly, with a
+# `kc` fixed by `k` and no size-keyed branch anywhere below.
+@noinline function _trmmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _trsm_rchunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.n, p.n, p.lda)          # A is n×n for side R
+    Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
+    _trmm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, i)  # `i`: this worker's own pre-sized pack slot
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)          # α after the product, as `trmm!` applies it
     return nothing
 end
 

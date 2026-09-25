@@ -16,12 +16,12 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - main (shard ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
-    # The suite uses TrimCheck (Julia 1.12 `Compiler` stdlib), JET, StrictMode, ForwardDiff — pinned to
-    # 1.12 (nightly dropped: compiler-internals churn broke it and it added no signal).
+    # The suite uses TrimCheck (the `Compiler` stdlib), JET, StrictMode, ForwardDiff — pinned to the
+    # single supported release (nightly dropped: compiler-internals churn broke it and it added no signal).
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.12']
+        version: ['1.13']
         shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
@@ -68,13 +68,13 @@ jobs:
           fail-on-error: false
 
   checks:
-    name: Julia 1.12 - trim/strict/aqua checks
+    name: Julia 1.13 - trim/strict/aqua checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1.12'
+          version: '1.13'
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       # Inference/trim-safety dogfood — no line coverage (these exercise the SAME kernels the `test` job
@@ -98,15 +98,16 @@ jobs:
   # StrictModeTest @test_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
   # reachability-limit union-splits juliac catches (a green suite once shipped a non-building .so — the
   # complex-F32 LAPACK variants union-split geqrf!'s muladd). This is the only check that proves the .so
-  # links for non-Julia hosts (req #4). Runs on 1.12 (juliac --trim is a 1.12 Compiler-stdlib feature).
+  # links for non-Julia hosts (req #4). The driver is the JuliaC.jl package, pinned in `juliac/toolenv`;
+  # Julia itself ships no juliac entry point.
   trim-so:
-    name: Julia 1.12 - juliac --trim .so build (authoritative)
+    name: Julia 1.13 - juliac --trim .so build (authoritative)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1.12'
+          version: '1.13'
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)

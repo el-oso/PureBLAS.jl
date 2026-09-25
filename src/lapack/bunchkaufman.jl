@@ -496,12 +496,14 @@ function _lasyf_lower!(
             _lasyf_diag!(view(A, j:(j + jb - 1), j:(j + jb - 1)),
                 view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb), false)  # up=false
             if j + jb <= n
-                # `_gemm_core!`, not the kwarg `gemm!`: the latter gates on `C isa StridedMatrix`,
+                # `_gemm_trailing!`, not the kwarg `gemm!`: the latter gates on `C isa StridedMatrix`,
                 # which PtrMatrix is NOT, so a Mode-1 / .so caller would silently take the generic
-                # kernel (banded_chol.jl:517-521 documents the same trap).
-                _gemm_core!(view(A, (j + jb):n, j:(j + jb - 1)),
+                # kernel (banded_chol.jl:517-521 documents the same trap). It threads when the shape
+                # earns it; a bare `_gemm_core!` cannot, because its `nw` says which worker the caller
+                # IS rather than asking for any.
+                _gemm_trailing!(view(A, (j + jb):n, j:(j + jb - 1)),
                     view(A, (j + jb):n, 1:kb), view(W, j:(j + jb - 1), 1:kb),
-                    -one(T), one(T), false, true, false, false)
+                    -one(T), one(T), false, true, false)
             end
             j += jb
         end
@@ -694,9 +696,9 @@ function _lahef_lower!(
                 view(A, j:(j + jb - 1), 1:kb), view(W, j:(j + jb - 1), 1:kb);
                 uplo = 'L', trans = 'N', alpha = -one(T) / 2, beta = one(Tr))
             if j + jb <= n
-                _gemm_core!(view(A, (j + jb):n, j:(j + jb - 1)),
+                _gemm_trailing!(view(A, (j + jb):n, j:(j + jb - 1)),
                     view(A, (j + jb):n, 1:kb), view(W, j:(j + jb - 1), 1:kb),
-                    -one(T), one(T), false, true, false, true)      # cB=true ⇒ Wᴴ
+                    -one(T), one(T), false, true, true)             # cB=true ⇒ Wᴴ
             end
             j += jb
         end
@@ -859,10 +861,10 @@ function _lasyf_upper!(
                     view(A, j:(j + jb - 1), (k + 1):n),
                     view(W, j:(j + jb - 1), (kw + 1):nb), true)
                 if j > 1
-                    _gemm_core!(view(A, 1:(j - 1), j:(j + jb - 1)),
+                    _gemm_trailing!(view(A, 1:(j - 1), j:(j + jb - 1)),
                         view(A, 1:(j - 1), (k + 1):n),
                         view(W, j:(j + jb - 1), (kw + 1):nb),
-                        -one(T), one(T), false, true, false, false)
+                        -one(T), one(T), false, true, false)
                 end
             end
             j -= nb
@@ -1081,10 +1083,10 @@ function _lahef_upper!(
                     view(W, j:(j + jb - 1), (kw + 1):nb);
                     uplo = 'U', trans = 'N', alpha = -one(T) / 2, beta = one(Tr))
                 if j > 1
-                    _gemm_core!(view(A, 1:(j - 1), j:(j + jb - 1)),
+                    _gemm_trailing!(view(A, 1:(j - 1), j:(j + jb - 1)),
                         view(A, 1:(j - 1), (k + 1):n),
                         view(W, j:(j + jb - 1), (kw + 1):nb),
-                        -one(T), one(T), false, true, false, true)   # cB=true ⇒ Wᴴ
+                        -one(T), one(T), false, true, true)          # cB=true ⇒ Wᴴ
                 end
             end
             j -= nb
