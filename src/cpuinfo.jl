@@ -220,8 +220,11 @@ const _L3_BYTES = @load_preference(
 # `sme_max_svl_b` is the streaming vector length in BYTES (64 on this M6 = 512 bits = 8 lanes), and
 # a ZA tile is `_SME_LANES` x `_SME_LANES`. Kernel tile geometry derives from it, so a machine with
 # a different vector length gets different code rather than wrong results.
+# THE ARCH TERM LEADS THE PREFERENCE, not the other way round: the override exists for cross-compile
+# and trim builds, and `sme_f64 = true` set on an x86 box would otherwise have this file emit aarch64
+# IR there. A preference may relax a detection result; it may not contradict the instruction set.
 # PDM: Exempt — the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
-const _SME_F64 = @load_preference(
+const _SME_F64 = Sys.ARCH === :aarch64 && @load_preference(
     "sme_f64",
     _sysctl_int("hw.optional.arm.FEAT_SME2") == 1 &&
         _sysctl_int("hw.optional.arm.FEAT_SME_F64F64") == 1

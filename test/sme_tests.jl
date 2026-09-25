@@ -197,3 +197,51 @@ end
     @test steady(P.gemv!, y, A, x; alpha = 1.0, beta = 0.0) == 0
     @test steady(P.gemv!, y, A, x; alpha = 0.75, beta = 1.0) == 0
 end
+
+@testitem "SME IR adapts to the streaming vector length" begin
+    using PureBLAS
+    const P = PureBLAS
+    # Runs on EVERY machine, SME or not: the generators are pure string building and the geometry is
+    # an argument. This is the only check of the 256- and 1024-bit shapes that needs no such
+    # hardware, and it is where a hardcoded offset shows up -- the gemv IR carried the 8-lane
+    # geometry as literals (`32*g`, `8*k`) while the gemm IR interpolated it, so a machine with a
+    # different vector length would have addressed half the stride and returned wrong numbers.
+    for L in (4, 8, 16)
+        ngmax = 2L                      # ZA holds 8L vectors; a vgx4 group index is reduced mod 2L
+        ir = P._gemv_ir(ngmax, true, L)
+        # Last group's column pointer and last readback slot must both scale with L.
+        @test occursin("i64 $(4L * (ngmax - 1))", ir)
+        @test occursin("i64 $(4L * (ngmax - 1) + 3L)", ir)
+        # One group per `fmla`, addressed consecutively from zero — NOT strided by four, which is
+        # the wrap this bound exists to prevent.
+        for g in 0:(ngmax - 1)
+            @test occursin("fmla.single.vg1x4.nxv2f64(i32 $g,", ir)
+        end
+        # A group count above what ZA can address must be refused, not silently aliased.
+        @test_throws ArgumentError P._gemv_ir(2 * ngmax, true, L)
+    end
+    # The ladder itself is derived, not a literal list.
+    @test P._SME_GEMV_NGMAX == 2 * P._SME_L
+    @test P._SME_GEMV_BLK == 4 * P._SME_L
+    @test all(<=(P._SME_GEMV_NGMAX), P._SME_GEMV_NGS)
+    @test P._SME_GEMV_NGMAX in P._SME_GEMV_NGS
+end
+
+@testitem "SME self-test runs and can fail" begin
+    using PureBLAS
+    const P = PureBLAS
+    if !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "no SME F64 on this machine"
+    else
+        # `_sme_init!` runs this before publishing the pointers; a kernel that builds is not a
+        # kernel that is correct, and a wrong geometry produces numbers rather than an exception.
+        @test P._sme_selftest() < 1e-12
+        # POSITIVE CONTROL: the comparison must be able to see a row permutation, which is what
+        # asymmetric `i + 1000j` data is for. Symmetric data hides it entirely.
+        m = P._SME_GEMV_BLK * 3; n = 7
+        A = [i + 1000.0 * j for i in 1:m, j in 1:n]; x = [1.0 + 0.25j for j in 1:n]
+        want = A * x
+        swapped = copy(want); swapped[1], swapped[2] = swapped[2], swapped[1]
+        @test maximum(abs, swapped .- want) / maximum(abs, want) > 1e-12
+    end
+end

@@ -629,6 +629,68 @@ end
 
 # Called from `__init__`. The target is fetched by NAME at run time, so inference sees only `Any`
 # and never reaches the streaming kernel.
+# A KERNEL THAT BUILDS IS NOT A KERNEL THAT IS CORRECT, and nothing else here checks the difference.
+# The guards above cover a machine that lacks the feature and a build that raises; neither covers a
+# geometry assumption that is wrong for this streaming vector length, which produces WRONG NUMBERS
+# and no symptom. (Nor can the `try` above catch an instruction-selection failure: `Cannot select`
+# is `report_fatal_error`, a process abort, not a Julia exception.)
+#
+# So both kernels answer a known question before their pointers are published. The data is
+# ASYMMETRIC and row/column distinguishable -- `i + 1000j` -- because a transposed or row-permuted
+# geometry is invisible on symmetric input, which is exactly the bug class this is here to catch.
+# Shapes are chosen to reach the edge paths: a ragged gemm exercises the edge macrokernel and the
+# scalar B pack, and a gemv row count that is a sum of several ladder blocks plus a scrap exercises
+# the block halving and the overlapping tail.
+#
+# A MISMATCH THROWS. It means the hardware model in this file is wrong for this machine, which is a
+# bug to report rather than a condition to degrade around; falling back silently would leave a wrong
+# model undiscovered. `sme_f64 = false` in LocalPreferences is the escape hatch, and the message
+# names it.
+function _sme_selftest()
+    L = _SME_L
+    ref(m, n, k, a, b, A, B, C) = begin
+        R = copy(C)
+        for j in 1:n, i in 1:m
+            s = 0.0
+            for p in 1:k
+                s = muladd(A[i, p], B[p, j], s)
+            end
+            R[i, j] = a * s + b * R[i, j]
+        end
+        R
+    end
+    gen(m, n) = [i + 1000.0 * j for i in 1:m, j in 1:n]
+    worst = 0.0
+    for (m, n, k) in ((2 * _SME_MR, 2 * _SME_NR, L), (2 * _SME_MR + 1, 2 * _SME_NR + 3, L + 1))
+        A = gen(m, k); B = gen(k, n)
+        for a in (1.5,), b in (0.0, 0.5)
+            C = gen(m, n)
+            want = ref(m, n, k, a, b, A, B, C)
+            got = copy(C)
+            _gemm_sme!(got, A, B, a, b, m, n, k, false, false)
+            worst = max(worst, maximum(abs, got .- want) / maximum(abs, want))
+        end
+    end
+    # gemv: several ladder blocks plus a scrap below one group, and an accumulate form
+    for (m, bet) in ((_SME_GEMV_BLK * _SME_GEMV_NGMAX + _SME_GEMV_BLK * 2 + 5, 0.0),
+                     (_SME_GEMV_BLK * 3, 0.5))
+        n = 7
+        A = gen(m, n); x = [1.0 + 0.25 * j for j in 1:n]; y0 = gen(m, 1)[:, 1]
+        want = copy(y0)
+        for i in 1:m
+            s = 0.0
+            for j in 1:n
+                s = muladd(A[i, j], x[j], s)
+            end
+            want[i] = 1.25 * s + bet * want[i]
+        end
+        got = copy(y0)
+        _sme_gemv!(m, n, 1.25, A, x, bet, got)
+        worst = max(worst, maximum(abs, got .- want) / maximum(abs, want))
+    end
+    return worst
+end
+
 function _sme_init!()
     _SME_F64 || return nothing
     # `__init__` also runs inside the PRECOMPILE process, whose codegen targets the generic image
@@ -660,6 +722,24 @@ function _sme_init!()
         _SME_GEMV_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, gf)
     catch
         _SME_GEMV_ENTRY[] = C_NULL
+    end
+    # Both pointers are live now, so the kernels can be asked a question with a known answer.
+    if _SME_ENTRY[] !== C_NULL && _SME_GEMV_ENTRY[] !== C_NULL
+        err = try
+            _sme_selftest()
+        catch e
+            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL
+            rethrow(e)
+        end
+        if !(err < 1e-12)
+            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL
+            error("""
+                SME self-test failed: relative error $err against a scalar reference.
+                The kernels built and ran, so this is a geometry assumption that does not hold on
+                this machine -- lanes=$(_SME_LANES), L=$(_SME_L), MR=$(_SME_MR), NR=$(_SME_NR),
+                gemv blocks up to $(_SME_GEMV_BLK * _SME_GEMV_NGMAX) rows. Please report it.
+                Set `sme_f64 = false` in LocalPreferences.toml to keep the SIMD path meanwhile.""")
+        end
     end
     return nothing
 end
@@ -731,10 +811,16 @@ end
 # ⚠ THE vg1x4 SLICE ARGUMENT IS A GROUP SELECTOR, NOT A VECTOR INDEX. Passing `4g` happens to work
 # at four groups — those values are distinct and in range — and silently produces WRONG RESULTS at
 # eight and sixteen. Consecutive indices 0..NG-1 are correct.
-function _gemv_ir(ng::Int, acc::Bool = true)
+function _gemv_ir(ng::Int, acc::Bool = true, L::Int = _SME_L)
+    # ZA HOLDS 8L VECTORS AND A vgx4 GROUP INDEX IS REDUCED MOD 2L BY THE HARDWARE, so a group count
+    # above 2L aliases onto low groups and silently sums the wrong rows into y. That is the same
+    # wrap the slice-argument note above records, reached the other way. Refuse it here rather than
+    # let a machine with a narrower streaming vector build a kernel that returns wrong answers.
+    ng <= 2 * L || throw(ArgumentError(
+        "SME gemv: $ng slice groups exceeds the $(2L) that ZA can address at $L lanes"))
     q = Char(34)
     T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
-    rb = 32 * ng                      # rows of y per block
+    rb = 4 * L * ng                   # rows of y per block: ng groups of four L-lane vectors
     io = IOBuffer()
     print(io, """
 declare void @llvm.aarch64.sme.za.enable()
@@ -778,7 +864,7 @@ col:
   %cp = getelementptr inbounds double, ptr %ablk, i64 %co
 """)
     for g in 0:(ng-1)
-        println(io, "  %p$g = getelementptr inbounds double, ptr %cp, i64 $(32g)")
+        println(io, "  %p$g = getelementptr inbounds double, ptr %cp, i64 $(4 * L * g)")
         println(io, "  %r$g = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %p$g)")
         for k in 0:3
             println(io, "  %w$(g)_$k = extractvalue $T4 %r$g, $k")
@@ -797,7 +883,7 @@ rd:
     for g in 0:(ng-1)
         println(io, "  %o$g = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
         for k in 0:3
-            off = 32g + 8k
+            off = 4 * L * g + L * k
             println(io, "  %z$(g)_$k = extractvalue $T4 %o$g, $k")
             println(io, "  %yp$(g)_$k = getelementptr inbounds double, ptr %yblk, i64 $off")
             if acc
@@ -839,37 +925,45 @@ end
 #
 # Built even where SME is absent — the strings are constructed, never executed; every entry point
 # is gated on `_SME_F64`, exactly as the gemm IR above.
+# Rows per ZA vector group: four vectors of `_SME_L` doubles, the smallest block the kernel emits.
+const _SME_GEMV_BLK = 4 * _SME_L
+
+# THE LADDER IS BOUNDED BY WHAT ZA CAN ADDRESS, NOT BY A LITERAL. ZA holds 8L vectors and a vgx4
+# group index is reduced MOD 2L, so `2L` groups is the largest kernel that addresses distinct rows;
+# above it the groups alias and rows are summed into the wrong place, silently. At the 512-bit
+# streaming length of an M4-class chip L is 8 and this is 16 groups of 32 rows — the 512-row block
+# the ladder used to name as a literal. On a 256-bit part it is 8 groups, and the literal would have
+# been wrong by a factor of two with no symptom but bad numbers.
+const _SME_GEMV_NGMAX = 2 * _SME_L
+const _SME_GEMV_NGS = Tuple(1 << i for i in 0:(ndigits(_SME_GEMV_NGMAX, base = 2) - 1))
+
 const _SME_GEMV_IR = Dict{Tuple{Int, Bool}, String}(
-    (ng, acc) => _gemv_ir(ng, acc) for ng in (1, 2, 4, 8, 16), acc in (true, false)
+    (ng, acc) => _gemv_ir(ng, acc) for ng in _SME_GEMV_NGS, acc in (true, false)
 )
 
-for ng in (1, 2, 4, 8, 16), acc in (true, false)
-    nm = Symbol(acc ? "_sme_gemv_acc" : "_sme_gemv_sto", 32 * ng)
+for ng in _SME_GEMV_NGS, acc in (true, false)
+    nm = Symbol(acc ? "_sme_gemv_acc" : "_sme_gemv_sto", ng)
     ir = _SME_GEMV_IR[(ng, acc)]
     @eval @inline $nm(y, a, l, x, n, al, nb) = Base.llvmcall(($ir, "entry"), Cvoid,
         Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
         y, a, Int64(l), x, Int64(n), al, Int64(nb))
 end
 
-@inline function _sme_gemv_run(rb::Int, y, a, l, x, n, al, nb, store::Bool)
-    if store
-        rb == 512 ? _sme_gemv_sto512(y, a, l, x, n, al, nb) :
-        rb == 256 ? _sme_gemv_sto256(y, a, l, x, n, al, nb) :
-        rb == 128 ? _sme_gemv_sto128(y, a, l, x, n, al, nb) :
-        rb ==  64 ? _sme_gemv_sto64( y, a, l, x, n, al, nb) :
-                    _sme_gemv_sto32( y, a, l, x, n, al, nb)
-    else
-        rb == 512 ? _sme_gemv_acc512(y, a, l, x, n, al, nb) :
-        rb == 256 ? _sme_gemv_acc256(y, a, l, x, n, al, nb) :
-        rb == 128 ? _sme_gemv_acc128(y, a, l, x, n, al, nb) :
-        rb ==  64 ? _sme_gemv_acc64( y, a, l, x, n, al, nb) :
-                    _sme_gemv_acc32( y, a, l, x, n, al, nb)
-    end
+# Dispatch on the GROUP COUNT, which is what the kernel is parameterised by; the caller converts a
+# row block to groups. A chain of `==` over the detected set keeps this a compile-time ladder rather
+# than a dynamic lookup, and it cannot drift from `_SME_GEMV_NGS` because it is generated from it.
+@eval @inline function _sme_gemv_run_ng(ng::Int, y, a, l, x, n, al, nb, store::Bool)
+    $(Expr(:block, (quote
+        if ng == $g
+            return store ? $(Symbol("_sme_gemv_sto", g))(y, a, l, x, n, al, nb) :
+                           $(Symbol("_sme_gemv_acc", g))(y, a, l, x, n, al, nb)
+        end
+    end for g in _SME_GEMV_NGS)...))
     return nothing
 end
 
-# Rows per ZA vector group: four vectors of `_SME_L` doubles, the smallest block the kernel emits.
-const _SME_GEMV_BLK = 4 * _SME_L
+@inline _sme_gemv_run(rb::Int, y, a, l, x, n, al, nb, store::Bool) =
+    _sme_gemv_run_ng(rb ÷ _SME_GEMV_BLK, y, a, l, x, n, al, nb, store)
 
 # The work below which a ZA-resident y costs more than it saves. The cost is the ZA fill and the
 # readback, both O(m) and both paid whatever n is, against a stream of m*n elements — so the
