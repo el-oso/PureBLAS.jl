@@ -133,11 +133,12 @@ for _v in ("BLIS_NUM_THREADS", "OMP_NUM_THREADS")
 end
 # Remember what BLIS was actually initialised with; the arm guard reads this, not the live ENV.
 const _BLIS_INIT_NT = parse(Int, ENV["BLIS_NUM_THREADS"])
-# AOCL_jll ships no aarch64-apple-darwin artifact, so loading it unconditionally would fail to
-# precompile on Apple silicon. Apple silicon uses Accelerate (vecLib) as its vendor reference
-# instead — see the `accelerate` branch of `_use_ref!` below.
-const _IS_APPLE = Sys.isapple()
-_IS_APPLE || @eval using AOCL_jll
+# WHICH VENDOR BLAS A BOX CARRIES IS ASKED, NEVER INFERRED FROM THE OS. AOCL_jll loads on every
+# platform but holds an artifact only where AMD builds one, and Accelerate is a macOS framework with
+# no package at all. An aarch64 Linux box (Graviton, Grace) has NEITHER, so a test that reads "not
+# Apple, therefore AOCL" would forward LBT at a library that is not on the machine.
+using AOCL_jll
+const _HAS_AOCL = AOCL_jll.is_available()
 
 # Accelerate = Apple's system BLAS/LAPACK (vecLib, inside the Accelerate umbrella framework — no package,
 # no artifact, it ships with the OS). Forwarded by raw dylib path exactly like OpenBLAS/AOCL above.
@@ -158,6 +159,14 @@ _IS_APPLE || @eval using AOCL_jll
 # plain appended suffix (`dgemm_$NEWLAPACK$ILP64`, which does not exist) and falls back to LP64.
 const _ACCELERATE_PATH = "/System/Library/Frameworks/Accelerate.framework/Accelerate"
 const _ACCELERATE_SUFFIX = "\x1a\$NEWLAPACK\$ILP64"
+# Accelerate ships with every macOS, so the OS test IS the availability test here — unlike AOCL,
+# whose presence depends on an artifact and must be asked of the JLL.
+#
+# DO NOT "verify" the path instead. `isfile` on it is FALSE: macOS keeps system frameworks in the
+# dyld shared cache, and the path resolves only through `dlopen`. And `dlopen` is not usable here
+# either — it would initialize vecLib at this line, before `VECLIB_MAXIMUM_THREADS` is set below,
+# which is the one moment that setting can still take effect.
+const _HAS_ACCELERATE = Sys.isapple()
 # `LinearAlgebra.BLAS.set_num_threads(1)` (called after every forward, below) does NOT constrain
 # Accelerate — confirmed empirically (2026-09-22): a `dgemm` at n=4000 pinned at ~190-200% CPU (ps,
 # sampled continuously across a 14 s / 60-call window) despite `set_num_threads(1)` having been called.
@@ -229,11 +238,12 @@ end
 
 # Reference arms available this run. `_REF_ARMS` is what gets measured; PureBLAS is always measured
 # unless the cache already holds it and only references were asked for.
-# Default DUAL-reference set is architecture-dependent: AOCL is AMD-only (no aarch64-apple-darwin
-# build, not even a dependency of `bench/apple/Project.toml`), so an Apple Silicon run's honest second
-# reference is Accelerate — the platform's own vendor BLAS, the AOCL/AMD relationship's ARM analogue.
+# The second reference is whichever vendor BLAS the box actually carries — AOCL on AMD, Accelerate on
+# Apple silicon, each the platform's own. A box with neither publishes against OpenBLAS alone rather
+# than naming an arm it cannot run; `_VIEWS` follows `_REF_ALL`, so such a box renders one view.
+const _VENDOR_ARM = _HAS_AOCL ? "aocl" : _HAS_ACCELERATE ? "accelerate" : nothing
 const _REF_ALL = REFBK == "mkl" ? ["mkl"] : REFBK == "accelerate" ? ["accelerate"] :
-    _IS_APPLE ? ["openblas", "accelerate"] : ["openblas", "aocl"]
+    isnothing(_VENDOR_ARM) ? ["openblas"] : ["openblas", _VENDOR_ARM]
 # ⚠ REFERENCE ARMS ARE CACHE-ONLY BY DEFAULT. Omitting `arms=` used to mean "measure every arm", so
 # forgetting the flag silently re-ran OpenBLAS and AOCL — which is the whole reason the v3 cache stores
 # them. The default is now PB ONLY; re-measuring a reference is an explicit, typed-out request.

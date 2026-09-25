@@ -184,16 +184,17 @@ spread). "gate" divides by whichever reference is faster at each point.
 ## Reproduce
 
 ```
-julia --project=bench/apple bench/plots.jl bench group=L1 arms=pb,openblas,accelerate cold nodraw
-julia --project=bench/apple bench/plots.jl bench group=L2 arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl bench group=L3 arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl bench op=potrf arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl bench op=getrf arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl bench op=geqrf arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl bench op=gesvd arms=pb,openblas,accelerate maxsize=2048 nodraw
-julia --project=bench/apple bench/plots.jl outdir=docs/src/assets/apple
+julia --project=bench bench/plots.jl bench group=L1 arms=pb,openblas,accelerate cold nodraw
+julia --project=bench bench/plots.jl bench group=L2 arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl bench group=L3 arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl bench op=potrf arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl bench op=getrf arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl bench op=geqrf arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl bench op=gesvd arms=pb,openblas,accelerate maxsize=2048 nodraw
+julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
 ```
 
-`bench/apple/Project.toml` is a separate bench environment from `bench/Project.toml`: it drops
-`AOCL`/`AOCL_jll` (AMD-only, no aarch64-apple-darwin build) since Accelerate needs no package at all — it
-is an OS framework, forwarded by raw dylib path exactly like OpenBLAS.
+`bench/Project.toml` is the one bench environment on every box, Apple included. Accelerate needs no
+package at all — it is an OS framework, forwarded by raw dylib path exactly like OpenBLAS — and
+`AOCL_jll` resolves everywhere, reporting `is_available() == false` where AMD ships no artifact, so
+the `aocl` arm simply is not offered on Apple silicon.
