@@ -177,10 +177,15 @@ end
         # of each such call site caches a method instance — state that scales with the number of call
         # sites, not with the number of calls, so no amount of warming removes it. Only the SME route
         # shows it, because its portability barrier is a function pointer (one dynamic dispatch).
-        steady(f, args...; kw...) = (f(args...; kw...); @allocated f(args...; kw...))
+        # A CONCRETE THREE-ARGUMENT WRAPPER, not a varargs one: splatting a tuple through `f(args...)`
+        # allocates here even when the call it wraps does not, which turns the barrier into the thing
+        # being measured. Measured on x86: the varargs form reported 224 B for a call that is
+        # allocation-free.
+        gemm3(Cx, Ax, Bx) = P.gemm!(Cx, Ax, Bx)
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
-        @test steady(P.gemm!, C, A, B) == 0
+        gemm3(C, A, B)
+        @test @allocated(gemm3(C, A, B)) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
     end
