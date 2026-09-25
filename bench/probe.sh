@@ -22,7 +22,9 @@ NT=${PBHOT_THREADS:-6}
 TIMEOUT=${PBHOT_TIMEOUT:-1800}
 
 # One CPU per physical core plus one spare, matching `bench/fleet_refresh.sh` and the mask recorded on
-# `_ARM_PB_MT`. An unknown host runs unpinned rather than guessing a topology.
+# `_ARM_PB_MT`. An unknown host runs unpinned rather than guessing a topology — as does every macOS
+# host, which has no CPU affinity API at all (`taskset` does not exist and `thread_policy_set` is
+# inert on Apple silicon; QoS is the only scheduler steer there).
 case "$(hostname)" in
     wintermute)  MASK=0,2,4,6,8,10,1 ;;
     galen)       MASK=6,7,8,9,10,11,18 ;;
@@ -32,10 +34,15 @@ esac
 
 # `pgrep -x julia` matches the interpreter ONLY, never this wrapper — a `pgrep -f bench/hot.jl` also
 # matches the shell running this script, which makes the session look alive when it is not.
+#
+# The command line comes from `ps`, not from `/proc/<pid>/cmdline`: macOS has no `/proc`, so the
+# read fails for every candidate, `hotpid` reports no session, and the wrapper starts a second one
+# and then declares it dead. `ps -ww -o command=` prints the full, untruncated command line on both
+# BSD and GNU `ps`.
 hotpid() {
     local p
     for p in $(pgrep -x julia 2>/dev/null); do
-        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'bench/hot\.jl'; then
+        if ps -ww -o command= -p "$p" 2>/dev/null | grep -q 'bench/hot\.jl'; then
             echo "$p"; return 0
         fi
     done
