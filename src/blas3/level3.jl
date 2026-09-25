@@ -82,8 +82,8 @@ const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) 
 
 # off-diagonal update C += op(A)·B — straight to the dispatch core (skip gemm!'s kwarg/check layer;
 # the recursion guarantees the shapes).
-@inline _gemm_acc!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =
-    _gemm_core!(C, A, B, one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
+@inline _gemm_acc!(C, A, B, tr::Bool, cj::Bool) =
+    _gemm_core!(C, A, B, one(eltype(C)), one(eltype(C)), tr, false, cj, false)
 
 # ── trmm side='L':  B := op(A)·B,  A k×k triangular (k=size(B,1)), unscaled ──────────────────────
 # NOTE: trmm! routes large real side-L to the single-pass `_trmm_packed!` (the proven-fastest path); a
@@ -755,12 +755,7 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     return B
 end
 
-# `nroute` is the UNSPLIT column count of B, or -1 for a whole-problem call. A column band must route
-# its off-diagonal updates from the width the serial call saw: `_gemm_core!`'s kernel switch reads
-# `max(m, nroute, k)`, and `m` and `k` are both the triangular dimension here, which a column split
-# leaves alone. Every branch below keys on `k`, so the routing above this line is already invariant —
-# this token carries the property down into the updates.
-function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
+function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up, tr, unit, A, B) :
@@ -783,14 +778,14 @@ function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int
     # transA carries op. Verified against all four (uplo×trans) cases.
     if up != tr
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trmm_left!(up, tr, cj, unit, A11, B1, nroute)
-        _gemm_acc!(B1, off, B2, tr, cj, nroute)
-        _trmm_left!(up, tr, cj, unit, A22, B2, nroute)
+        _trmm_left!(up, tr, cj, unit, A11, B1)
+        _gemm_acc!(B1, off, B2, tr, cj)
+        _trmm_left!(up, tr, cj, unit, A22, B2)
     else
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trmm_left!(up, tr, cj, unit, A22, B2, nroute)
-        _gemm_acc!(B2, off, B1, tr, cj, nroute)
-        _trmm_left!(up, tr, cj, unit, A11, B1, nroute)
+        _trmm_left!(up, tr, cj, unit, A22, B2)
+        _gemm_acc!(B2, off, B1, tr, cj)
+        _trmm_left!(up, tr, cj, unit, A11, B1)
     end
     return B
 end
@@ -1370,24 +1365,6 @@ function trmm!(
     # The worker count rides `_trsm_workers_r`: the amortisation floor and the `_MR·W` row granularity
     # are the same, and its `k²·m` overstates trmm's flops by 2x, which only makes it more conservative
     # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
-    # THREADED SIDE-L below the pack threshold: split B's columns. `k > _TRMM_BASE` because at or below
-    # it the entry answers from a base kernel above this point and never reaches `_trmm_left!`, and
-    # `k <= _TRMM_PACK_MIN + _EXPINT[2]` because above that the entry takes `_trmm_split_L!`, which asks
-    # for Strassen and so cannot be column-split — it threads inside its own off-diagonal update.
-    if sl && eltype(B) <: BlasReal && transA != 'C' && !iszero(alpha) &&
-            _strided1(A) && _strided1(B) && size(B, 1) == k &&
-            k > _TRMM_BASE && k <= _TRMM_PACK_MIN + _EXPINT[2]
-        nwl = _trsm_workers(k, size(B, 2))
-        if nwl > 1
-            rA = _root(A); rB = _root(B)
-            GC.@preserve rA rB _gemm_threaded!(
-                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
-                transA != 'N', false, false, false, nwl,
-                _MT_KIND_TRMML, uplo == 'U', false, diag == 'U'
-            )
-            return B
-        end
-    end
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
             _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack()
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
@@ -4865,28 +4842,6 @@ _trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds n
     Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
     _trmm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, i)  # `i`: this worker's own pre-sized pack slot
     isone(p.alpha) || _scal_all!(Bc, p.alpha)          # α after the product, as `trmm!` applies it
-    return nothing
-end
-
-# ── THREADED trmm, side 'L' ────────────────────────────────────────────────────────────────────────
-# `X := α·op(A)·B` gives every COLUMN of B an independent product — no column reads another — so a
-# column band is a whole problem and the bands are write-disjoint. A is read-only for every worker.
-#
-# This is the band BELOW `_TRMM_PACK_MIN`, where the entry routes side L to `_trmm_left!` rather than
-# to `_trmm_split_L!`. The two drivers need different treatment and the reason is Strassen, not shape:
-# `_trmm_split_L!` asks `_gemm_core!` for Strassen explicitly, and a Strassen route picks its depth
-# from the width it is handed, so a worker holding a column band would run a different algorithm than
-# a serial call. It therefore threads INSIDE its off-diagonal update instead. `_trmm_left!` accumulates
-# through `_gemm_acc!`, which never asks for Strassen, so the column split is open here and hands the
-# workers the whole driver rather than half of it.
-@noinline function _trmml_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
-    len > 0 || return nothing
-    Ac = PtrMatrix{T}(p.Ap, p.m, p.m, p.lda)          # A is m×m for side L
-    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)
-    # `p.n`, not `len`: route from the whole problem's COLUMN count.
-    _trmm_left!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.n)
-    isone(p.alpha) || _scal_all!(Bc, p.alpha)         # α after the product, as `trmm!` applies it
     return nothing
 end
 
