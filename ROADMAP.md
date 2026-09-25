@@ -518,7 +518,7 @@ hard dependency for a dev-only tool), CHANGELOG, clean Project.toml ([deps]/[com
 via the Preferences API in `juliac/build.jl`, not shipped), `libpureblas.so` builds under
 `juliac --trim` and is verified through the C-ABI on every push (`ctest.c`, incl. dgesvd — the job
 dlopens the artifact the `trim-so` job already built, so a library that compiles but is unusable cannot
-ship green). CI pinned to Julia 1.12 (trim is 1.12-specific).
+ship green). CI pinned to Julia 1.13, the single supported release.
 
 **Suite:** 25433 pass / 0 fail / 1 error / 1 broken. The one error is a known `gelsy` trim-compatibility
 site (`Base._str_sizehint` + `Base.print` at `gelsy.jl:255`, string formatting the juliac verifier
