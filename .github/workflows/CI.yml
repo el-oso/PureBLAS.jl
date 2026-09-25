@@ -178,3 +178,33 @@ jobs:
         run: julia --project=benchmark benchmark/judge_ci.jl
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
+
+  # TEMPORARY (diagnostic branch only): draw many ubuntu-latest runners at once and run the
+  # allocation item on whichever one is Intel. Non-Intel jobs exit in seconds, so a whole sweep
+  # costs almost nothing; sequential re-runs of the full suite cost ~25 minutes per draw.
+  hunt:
+    name: hunt-${{ matrix.i }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        i: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    steps:
+      - id: cpu
+        run: |
+          m=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')
+          echo "HUNT CPU: $m"
+          if echo "$m" | grep -qi intel; then echo "intel=yes" >> "$GITHUB_OUTPUT"; else echo "intel=no" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.cpu.outputs.intel == 'yes'
+        uses: actions/checkout@v4
+      - if: steps.cpu.outputs.intel == 'yes'
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.13'
+      - if: steps.cpu.outputs.intel == 'yes'
+        uses: julia-actions/julia-buildpkg@v1
+      - if: steps.cpu.outputs.intel == 'yes'
+        run: julia --project=. -t 4 -e 'using Pkg; Pkg.test("PureBLAS", test_args=["threaded gemm: same answer"])'
+        env:
+          PUREBLAS_TEST_GROUP: checks
+          JULIA_NUM_THREADS: '4'
