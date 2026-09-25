@@ -91,7 +91,18 @@ end
 _is_vendor_ref(a::AbstractString) = a == "openblas" || a == "aocl" || a == "mkl" || a == "accelerate"
 _is_pb_arm(a::AbstractString) = a == _ARM_PB || a == _ARM_PB_MT
 # Set PureBLAS's thread count for the arm about to be timed. Called BETWEEN windows, never inside one.
-_use_pb!(a::AbstractString) = (PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
+#
+# QUIET THE VENDOR BACKEND TOO, and it is not a formality. `_use_ref!` leaves OpenBLAS at `_MT_NT`
+# after a threaded reference arm, and OpenBLAS's idle threads SPIN-WAIT — so without this line a PB arm
+# measured next in the rotation competes for its own cores with N spinners.
+#
+# The damage is confined to a call SHAPE rather than to an op, which is why it hid: measured at 6
+# PureBLAS threads with OpenBLAS at 1 against 6, a single large Level-3 call is unmoved (gemm, symm and
+# syrk at n=512/1024/2048 all read 0.90-1.02x), while `getri` — a driver issuing many SMALL threaded
+# calls, where worker wake latency dominates and contention multiplies it — reads 0.686 ms against
+# 11.526 ms at n=256. That is 16x, and it inverts the verdict: `getri` reads 0.06x "slower threaded"
+# contaminated, against a true 1.77x faster at n=1024.
+_use_pb!(a::AbstractString) = (BLAS.set_num_threads(1); PureBLAS.set_num_threads(a == _ARM_PB_MT ? _MT_NT : 1); a)
 # `arms=pb` measures ONLY PureBLAS and reuses each reference arm already in the cache. That is the fast
 # iteration path; it is also the one that can silently go stale, which is why every arm carries its own
 # timestamp+commit and the table reports reference age rather than hiding it.
@@ -1219,7 +1230,10 @@ function run_benchmarks()
         # operand the allocation-free way, with `copyto!` into a preallocated buffer.
         # Every other row here (sytrs, gbtrf, geqp3, …) already passed `c` straight through; these
         # eight were the outliers. KEEP IT THAT WAY — `bench/check_sweep_noalloc.jl` asserts it.
-        _cholfac(s) = (A = _hpd(Float64, s); LinearAlgebra.LAPACK.potrf!(LP, A); A)
+        # FACTOR WITH PureBLAS, NOT WITH LAPACK — see the note on `_lufac2` below. A setup that calls a
+        # foreign BLAS immediately before the timed window leaves that library's threads spinning
+        # through the measurement, and the cost scales with PureBLAS's worker count.
+        _cholfac(s) = (A = _hpd(Float64, s); PureBLAS.potrf!(A; uplo = LP); A)
         addh(
             "potri", _cholfac,
             c -> (LinearAlgebra.LAPACK.potri!(LP, c); c[1, 1]),
@@ -1233,10 +1247,29 @@ function run_benchmarks()
         )
         # `\` on a general matrix and `inv(A)` both land here through LBT. mk returns the LU factors so
         # the timed core is the inversion, not the factorization.
+        # A SETUP MUST NOT CALL A FOREIGN BLAS, and this one did (`LinearAlgebra.LAPACK.getrf!`).
+        #
+        # OpenBLAS's worker threads spin for a timeout after each call rather than blocking, so a
+        # foreign factorization run immediately before every sample leaves them hot through the timed
+        # window. Setting `BLAS.set_num_threads(1)` does not help — the pool already exists and is
+        # already spinning. Measured at n=256, Zen4, BLAS pinned to 1 throughout, on two inputs that
+        # are numerically the same matrix (max|diff| 2.3e-13, identical ipiv, both the identity):
+        #
+        #     PureBLAS workers     1       2       3       4       6
+        #     LAPACK-factored   0.898   4.037   6.959   7.723   8.606  ms
+        #     PureBLAS-factored 0.694   0.641   0.678   0.677   0.677  ms
+        #
+        # The cost scales with PureBLAS's worker count, which is contention and not a property of the
+        # data: copying the PureBLAS factors into brand-new arrays reproduces the fast column exactly.
+        # Uncorrected it read `getri` as 0.06x "slower threaded" against a true 1.77x faster.
+        #
+        # `_lufac` and `_sytrfac` above already factor with PureBLAS; this is the same rule, and the
+        # comparison stays fair either way because BOTH arms invert the same matrix.
         function _lufac2(s)
             F = Matrix{Float64}(randn(Float64, s, s) + s * LinearAlgebra.I)
-            Fa, ip, _ = LinearAlgebra.LAPACK.getrf!(F)
-            return (Fa, ip)
+            ip = Vector{Int}(undef, s)
+            PureBLAS.getrf!(F, ip)
+            return (F, ip)
         end
         addh(
             "getri", _lufac2,

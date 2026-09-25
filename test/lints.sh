@@ -37,7 +37,7 @@ run() {                                   # run <name> <script...>
 }
 
 echo "cheap static checks:"
-for l in estimator expint fastpath generated_meta perthread pin probe_refblas probe_regime req8 workspace yield; do
+for l in armstate estimator expint fastpath generated_meta perthread pin probe_refblas probe_regime req8 workspace yield; do
     f="test/${l}_lint.jl"
     [[ -f $f ]] && run "$l" "$f"
 done
