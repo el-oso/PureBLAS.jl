@@ -140,7 +140,7 @@ end
 end
 
 @testitem "threaded gemm: same answer as the serial path, and still 0 B" tags = [:checks] begin
-    using PureBLAS, Base.Threads
+    using PureBLAS, Base.Threads, Profile
     P = PureBLAS
     # The split is by COLUMNS of C, so the shapes that matter are the ones where a chunk boundary can
     # land badly: n not a multiple of the register tile, n smaller than the worker count, and both
@@ -187,6 +187,35 @@ end
         gemm3(Cx, Ax, Bx) = (P.gemm!(Cx, Ax, Bx); @allocated P.gemm!(Cx, Ax, Bx))
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
+        let
+            println("DIAG cpu=", Sys.cpu_info()[1].model,
+                    " W64=", P._W64, " MR=", P._MR, " NR=", P._NR,
+                    " unpack_max=", P._GEMM_UNPACK_MAX, " mt_work=", P._GEMM_MT_WORK,
+                    " strassen_owns512=", P._strassen_owns(Float64, 512, 512, 512, false, A, B),
+                    " use_unpacked256=", P._use_unpacked(256, 256, 256),
+                    " workers512=", P._gemm_workers(512, 512, 512),
+                    " workers256=", P._gemm_workers(256, 256, 256))
+            # Profiled INSIDE a compiled barrier, exactly as `gemm3` measures. At module scope the
+            # call is interpreted over `Any`-typed globals, and the profile then shows the
+            # interpreter's own method lookup instead of anything the kernel does.
+            function diag(Cx, Ax, Bx)
+                P.gemm!(Cx, Ax, Bx)
+                P.gemm!(Cx, Ax, Bx)
+                Profile.Allocs.clear()
+                Profile.Allocs.@profile sample_rate = 1 P.gemm!(Cx, Ax, Bx)
+                return @allocated P.gemm!(Cx, Ax, Bx)
+            end
+            println("DIAG after-profile @allocated=", diag(C, A, B))
+            r = Profile.Allocs.fetch()
+            println("DIAG profiled ", length(r.allocs), " allocs / ",
+                    sum(x -> x.size, r.allocs; init = 0), " B")
+            for a in r.allocs
+                println("DIAG ALLOC ", a.size, " B  ", a.type)
+                for fr in a.stacktrace
+                    println("DIAG     ", fr.func, " @ ", basename(string(fr.file)), ":", fr.line)
+                end
+            end
+        end
         @test gemm3(C, A, B) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
@@ -194,7 +223,7 @@ end
 end
 
 @testitem "threaded gemm: a concurrent caller falls back to serial, not to a shared pool" tags = [:checks] begin
-    using PureBLAS, Base.Threads
+    using PureBLAS, Base.Threads, Profile
     P = PureBLAS
     if Threads.nthreads() < 2
         @test_skip Threads.nthreads() >= 2

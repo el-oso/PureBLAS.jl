@@ -1,5 +1,7 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+# Test-only, diagnostic: Profile.Allocs names the type and stack of a steady-state allocation.
+Profile = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 # Test-only. FixedSizeArray is the concrete case for "a dense array that is not `Array`": it is
 # `<: DenseArray`, so it must ride the same strided fast path Array does, and `_root` must peel it
 # without recursing forever. Pure Julia, one small dependency (Collects).
