@@ -92,10 +92,11 @@ function cells(paths)
             _p = split(g, "|"); a, csv = _p[1], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
-        haskey(d, "pb") || continue
-        rr(q) = (n = min(length(q), length(d["pb"])) ÷ QN;
-            n == 0 ? NaN : med([med([q[(r - 1) * QN + i] / d["pb"][(r - 1) * QN + i] for i in 1:QN]) for r in 1:n]))
-        rs = [rr(d[r]) for r in ("openblas", "aocl") if haskey(d, r)]
+        pba, refs = arm_pair(d)                # serial or threaded, read from the cell — gatecrit.jl
+        haskey(d, pba) || continue
+        rr(q) = (n = min(length(q), length(d[pba])) ÷ QN;
+            n == 0 ? NaN : med([med([q[(r - 1) * QN + i] / d[pba][(r - 1) * QN + i] for i in 1:QN]) for r in 1:n]))
+        rs = [rr(d[r]) for r in refs]
         rs = filter(isfinite, rs)
         isempty(rs) && continue
         push!(get!(out, String(f[2]), Tuple{Int, Float64}[]), (parse(Int, f[3]), minimum(rs)))
@@ -115,10 +116,11 @@ function refstats(paths, ref)
             _p = split(g, "|"); a, csv = _p[1], _p[end]
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
-        (haskey(d, "pb") && haskey(d, ref)) || continue
-        n = min(length(d[ref]), length(d["pb"])) ÷ QN
+        pba = first(arm_pair(d))               # "pb", or "pb_mt" on a threaded cache — gatecrit.jl
+        (haskey(d, pba) && haskey(d, ref)) || continue
+        n = min(length(d[ref]), length(d[pba])) ÷ QN
         n == 0 && continue
-        r = med([med([d[ref][(k - 1) * QN + i] / d["pb"][(k - 1) * QN + i] for i in 1:QN]) for k in 1:n])
+        r = med([med([d[ref][(k - 1) * QN + i] / d[pba][(k - 1) * QN + i] for i in 1:QN]) for k in 1:n])
         isfinite(r) && push!(get!(out, String(f[2]), Float64[]), r)
     end
     return out
@@ -167,6 +169,15 @@ function uarch_of(path)
 end
 
 function main()
+    # REFUSE A THREADED CACHE — this generator REWRITES docs/src/coverage.md in place, and that
+    # document publishes the single-threaded gate. Handed an `mt_data_*` file it rewrote 21 routing
+    # rows with threaded ratios and said only "rewrote 21 routing rows from cache"; the corruption
+    # was visible to `git diff` and to nothing else. See the matching guard in coverage_ops.jl.
+    for p in ARGS
+        is_mt_cache(p) && error("coverage_routing: $(basename(p)) is a THREADED cache, and this \
+            script REWRITES docs/src/coverage.md. That table publishes the single-threaded gate. \
+            Pass plots_data_*.txt.")
+    end
     paths = ARGS
     isempty(paths) && error("usage: coverage_routing.jl <cache> [more…]  (one per microarchitecture)")
     # ⚠ ONE COLUMN PER BOX — NOT one pooled verdict over several caches. The earlier version of this

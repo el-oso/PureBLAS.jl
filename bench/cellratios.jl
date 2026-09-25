@@ -6,6 +6,7 @@
 #
 #   julia --project=bench bench/cellratios.jl <cache.txt> <op> [op...]
 using Statistics
+include(joinpath(@__DIR__, "gatecrit.jl"))   # arm_pair — which arms this cell's tier compares
 const CACHE = ARGS[1]
 const OPS = ARGS[2:end]
 for ln in readlines(CACHE)
@@ -21,12 +22,14 @@ for ln in readlines(CACHE)
         _p = split(f, "|"); a, s = _p[1], _p[end]
         d[a] = parse.(Float64, split(s, ","))
     end
-    haskey(d, "pb") || continue
+    pba, refs = arm_pair(d)                    # serial or threaded, read from the cell — gatecrit.jl
+    (haskey(d, pba) && !isempty(refs)) || continue
     # estimator-ok: `median` IS the sanctioned gate estimator; this only reduces stored samples.
-    r = Dict(a => median(d[a] ./ d["pb"]) for a in ("openblas", "aocl") if haskey(d, a))
-    isempty(r) && continue
+    r = Dict(a => median(d[a] ./ d[pba]) for a in refs)
     lo = argmin(r)
+    col(rs...) = (i = findfirst(x -> haskey(r, x), rs); isnothing(i) ? "-" : round(r[rs[i]]; digits = 3))
     println(rpad(p[2], 8), rpad(p[3], 6), " gate=", round(r[lo]; digits = 3), " (vs ", lo, ")",
-            "   ob=", haskey(r, "openblas") ? round(r["openblas"]; digits = 3) : "-",
-            " aocl=", haskey(r, "aocl") ? round(r["aocl"]; digits = 3) : "-")
+            "   ob=", col("openblas", "openblas_mt"),
+            " aocl=", col("aocl", "aocl_mt"),
+            " acc=", col("accelerate", "accelerate_mt"))
 end
