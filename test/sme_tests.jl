@@ -71,25 +71,33 @@ end
 @testitem "SME eligibility declines what it cannot handle" begin
     using PureBLAS
     const P = PureBLAS
-    n = max(128, P._SME_MIN)
-    C = zeros(n, n); A = rand(n, n); B = rand(n, n)
-    elig(tA, tB, cA, cB) = P._sme_eligible(Float64, n, n, n, tA, tB, cA, cB, C, A, B)
-    # Transposed operands ARE handled: the packers read either orientation, which is what lets the
-    # triangular and symmetric routines reach this path at all -- `_rank_k` always issues one
-    # transposed operand, and symm issues `(false, tr)`.
-    @test elig(true, false, false, false)
-    @test elig(false, true, false, false)
-    @test elig(true, true, false, false)
-    # Conjugation is not: the kernel is real Float64, so a conjugated operand must fall through to
-    # the SIMD path rather than produce a wrong answer.
-    @test !elig(false, false, true, false)
-    @test !elig(false, false, false, true)
-    @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
-                           zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
-    # Below the crossover the packed panels do not pay for themselves.
-    small = P._SME_MIN - 1
-    @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
-                           zeros(small, small), rand(small, small), rand(small, small))
+    # THE POSITIVE CASES NEED THE HARDWARE. Off SME, `_SME_F64` is a compile-time false and every
+    # predicate here correctly answers `false`, so `@test elig(...)` asserts the opposite of what
+    # the machine can do. The negative cases would still hold, but they prove nothing once the
+    # guard they are meant to exercise has already short-circuited.
+    if !P._SME_F64
+        @test_skip "no SME F64 on this machine ($(Sys.ARCH))"
+    else
+        n = max(128, P._SME_MIN)
+        C = zeros(n, n); A = rand(n, n); B = rand(n, n)
+        elig(tA, tB, cA, cB) = P._sme_eligible(Float64, n, n, n, tA, tB, cA, cB, C, A, B)
+        # Transposed operands ARE handled: the packers read either orientation, which is what lets the
+        # triangular and symmetric routines reach this path at all -- `_rank_k` always issues one
+        # transposed operand, and symm issues `(false, tr)`.
+        @test elig(true, false, false, false)
+        @test elig(false, true, false, false)
+        @test elig(true, true, false, false)
+        # Conjugation is not: the kernel is real Float64, so a conjugated operand must fall through to
+        # the SIMD path rather than produce a wrong answer.
+        @test !elig(false, false, true, false)
+        @test !elig(false, false, false, true)
+        @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
+                               zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
+        # Below the crossover the packed panels do not pay for themselves.
+        small = P._SME_MIN - 1
+        @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
+                               zeros(small, small), rand(small, small), rand(small, small))
+    end
 end
 
 @testitem "SME computes every transpose combination correctly" begin
@@ -146,26 +154,34 @@ end
 @testitem "SME gemv: eligibility declines what it cannot handle" begin
     using PureBLAS
     const P = PureBLAS
-    m = 4 * P._SME_GEMV_BLK; n = max(64, P._SME_GEMV_MINWORK ÷ m + 1)
-    A = rand(m, n); x = rand(n); y = zeros(m)
-    el(mm, nn, tr, cj, b) = P._sme_gemv_eligible(Float64, mm, nn, tr, cj, A, x, y, 1, 1, b)
-    @test el(m, n, false, false, 0.0)
-    # Transposed and conjugated forms read A the other way; the kernel streams columns only.
-    @test !el(m, n, true, false, 0.0)
-    @test !el(m, n, false, true, 0.0)
-    # Float32 and complex share no kernel with this path.
-    @test !P._sme_gemv_eligible(Float32, m, n, false, false,
-                                rand(Float32, m, n), rand(Float32, n), zeros(Float32, m), 1, 1, 0.0)
-    # Non-unit increments: the kernel indexes both vectors contiguously.
-    @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 2, 1, 0.0)
-    @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 1, 2, 0.0)
-    # Below the work floor the ZA fill and readback are not amortized.
-    @test !el(P._SME_GEMV_BLK, 1, false, false, 0.0)
-    # A row count that is not a whole number of blocks needs beta == 0: its tail is an OVERLAPPING
-    # block, which recomputes shared rows, and that is only sound when they are stored not added.
-    mr = m + 1
-    @test P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 0.0)
-    @test !P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 1.0)
+    # THE POSITIVE CASES NEED THE HARDWARE. Off SME, `_SME_F64` is a compile-time false and every
+    # predicate here correctly answers `false`, so `@test elig(...)` asserts the opposite of what
+    # the machine can do. The negative cases would still hold, but they prove nothing once the
+    # guard they are meant to exercise has already short-circuited.
+    if !P._SME_F64
+        @test_skip "no SME F64 on this machine ($(Sys.ARCH))"
+    else
+        m = 4 * P._SME_GEMV_BLK; n = max(64, P._SME_GEMV_MINWORK ÷ m + 1)
+        A = rand(m, n); x = rand(n); y = zeros(m)
+        el(mm, nn, tr, cj, b) = P._sme_gemv_eligible(Float64, mm, nn, tr, cj, A, x, y, 1, 1, b)
+        @test el(m, n, false, false, 0.0)
+        # Transposed and conjugated forms read A the other way; the kernel streams columns only.
+        @test !el(m, n, true, false, 0.0)
+        @test !el(m, n, false, true, 0.0)
+        # Float32 and complex share no kernel with this path.
+        @test !P._sme_gemv_eligible(Float32, m, n, false, false,
+                                    rand(Float32, m, n), rand(Float32, n), zeros(Float32, m), 1, 1, 0.0)
+        # Non-unit increments: the kernel indexes both vectors contiguously.
+        @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 2, 1, 0.0)
+        @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 1, 2, 0.0)
+        # Below the work floor the ZA fill and readback are not amortized.
+        @test !el(P._SME_GEMV_BLK, 1, false, false, 0.0)
+        # A row count that is not a whole number of blocks needs beta == 0: its tail is an OVERLAPPING
+        # block, which recomputes shared rows, and that is only sound when they are stored not added.
+        mr = m + 1
+        @test P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 0.0)
+        @test !P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 1.0)
+    end
 end
 
 @testitem "SME gemv matches the reference over shapes, alphas and betas" begin
