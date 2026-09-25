@@ -891,24 +891,21 @@ const _SME_GEMV_BLK = 4 * _SME_L
 const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
     _L1_BYTES ÷ (2 * sizeof(Float64)))::Int
 
-# EXACT MULTIPLES OF THE BLOCK ONLY, which is conservative on purpose. A remainder below one vector
-# group falls to a scalar loop, and that loop is the dominant cost long before it is a small
-# fraction of the rows: m=40 (8 scalar rows of 40) runs at 0.45 of the SIMD path, m=72 at 0.87,
-# m=144 at 0.90, while every exact multiple with enough work wins from one block up. A fitted
-# remainder-fraction threshold would admit some of those and is not derived from anything.
-#
-# The fix is a masked ZA block for the tail rather than a better predicate; until that exists this
-# declines shapes the kernel could serve (m=104 at 1.14, m=300 at 2.88) in exchange for never
-# running slower than the path it replaces.
-@inline _sme_gemv_shape_ok(m, n) =
-    m % _SME_GEMV_BLK == 0 && m * n >= _SME_GEMV_MINWORK
+# A NON-MULTIPLE IS ADMISSIBLE ONLY WITH beta == 0. Its trailing rows are covered by an overlapping
+# full block, which recomputes rows it shares with the previous one -- sound when those rows are
+# STORED with the value they already hold, and wrong when they are accumulated into, because the
+# overlap would add alpha*A*x twice. The scalar loop that served the tail before dominated the call
+# long before it was a small fraction of the rows (m=40 at 0.45 of the SIMD path, m=144 at 0.90).
+@inline _sme_gemv_shape_ok(m, n, beta) =
+    m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK &&
+        (m % _SME_GEMV_BLK == 0 || iszero(beta))
 
 # The kernel reads y and A as raw column-major Float64 with unit row stride, and x contiguously.
-@inline _sme_gemv_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy) where {T} =
+@inline _sme_gemv_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy, beta) where {T} =
     T === Float64 && _SME_F64 && !trans && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
         _strided1(A) && _dense1(x) && _dense1(y) &&
-        _sme_gemv_shape_ok(m, n) && _SME_GEMV_ENTRY[] !== C_NULL
+        _sme_gemv_shape_ok(m, n, beta) && n > 0 && _SME_GEMV_ENTRY[] !== C_NULL
 
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and a runtime guard cannot achieve that: codegen
@@ -938,18 +935,26 @@ function _sme_gemv_cabi(
         end
         rb >>= 1
     end
-    if ib < m                            # fewer than 32 rows: below one ZA vector group
+    if ib < m
+        # THE TAIL IS AN OVERLAPPING BLOCK, NOT A SCALAR LOOP. A remainder below one vector group
+        # used to run scalar, and that loop dominated the call long before it was a small fraction
+        # of the rows: m=40 measured 0.45 of the SIMD path, m=72 0.87, m=144 0.90.
+        #
+        # Instead run one more full block at `m - BLK`, which recomputes the rows it overlaps. That
+        # is only sound in STORE mode, where a row is written with the value it already holds; in
+        # accumulate mode the overlap would add alpha*A*x to those rows twice, which is why
+        # `_sme_gemv_eligible` requires beta == 0 for a shape that is not an exact multiple.
         if st
-            for i in ib:(m - 1)
-                unsafe_store!(y + i * 8, 0.0)
-            end
-        end
-        for j in 0:(n - 1)
-            s = alpha * unsafe_load(x + j * 8)
-            aj = a + j * lda * 8
-            for i in ib:(m - 1)
-                q = y + i * 8
-                unsafe_store!(q, muladd(s, unsafe_load(aj + i * 8), unsafe_load(q)))
+            _sme_gemv_run(_SME_GEMV_BLK, y + (m - _SME_GEMV_BLK) * 8,
+                          a + (m - _SME_GEMV_BLK) * 8, lda, x, n, alpha, 1, true)
+        else
+            for j in 0:(n - 1)
+                s = alpha * unsafe_load(x + j * 8)
+                aj = a + j * lda * 8
+                for i in ib:(m - 1)
+                    q = y + i * 8
+                    unsafe_store!(q, muladd(s, unsafe_load(aj + i * 8), unsafe_load(q)))
+                end
             end
         end
     end
