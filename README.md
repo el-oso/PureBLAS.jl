@@ -7,7 +7,7 @@ can link — so the same kernels serve both worlds. It is part of the Pure Julia
 pure-Julia replacements for Julia's non-Julia default libraries (sibling:
 [PureFFT.jl](https://github.com/el-oso/PureFFT.jl)).
 
-Requires Julia 1.12. MIT licensed.
+Requires Julia 1.13. MIT licensed.
 
 ## Why bother
 
@@ -111,8 +111,8 @@ use it as its BLAS backend. CI builds it on every push and then calls into it fr
 that compiles but does not actually work would otherwise sail through. See
 [`juliac/ctest.c`](juliac/ctest.c).
 
-It builds and it works today, but `juliac --trim` is experimental and tied to Julia 1.12, so this is
-promising rather than something to put in production. The same `@ccallable` symbols serve both the
+It builds and it works today, but `juliac --trim` is experimental, so this is promising rather than
+something to put in production. The same `@ccallable` symbols serve both the
 shared library and the in-process reroute above, which keeps the C entry points exercised instead of
 quietly rotting.
 

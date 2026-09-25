@@ -117,16 +117,21 @@ end
 
 # THE BLAS-3 STEP: A[r0:r0+nr-1, c0:c0+nc-1] -= A[r0:r0+nr-1, 1:kb] · F[c0:c0+nc-1, 1:kb]ᵀ
 # One rank-kb gemm replacing kb rank-1 updates over the whole trailing block — the entire point of the
-# blocked algorithm. `_gemm_core!` (positional) and NOT the kwarg `gemm!`: a SubArray is not a
+# blocked algorithm. `_gemm_trailing!` (positional) and NOT the kwarg `gemm!`: a SubArray is not a
 # StridedMatrix, so `gemm!` would silently fall to the generic kernel and hand back the BLAS-2 cost.
+#
+# It threads, and this is the shape that earns it: the update spans the WHOLE trailing block, so it is
+# `nr x nc` over a rank of `kb` — about 2016 x 2016 x 32 at n=2048 — rather than the thin rank-`nb`
+# panel a factorization's own trailing update is. `_gemm_workers` declines the thin ones on the
+# amortisation floor by itself, so a caller never has to know which it has.
 @inline function _qp_gemm_sub!(A, r0::Int, c0::Int, nr::Int, nc::Int, kb::Int, F)
     (nr <= 0 || nc <= 0 || kb <= 0) && return
     T = eltype(A)
-    _gemm_core!(
+    _gemm_trailing!(
         view(A, r0:(r0 + nr - 1), c0:(c0 + nc - 1)),
         view(A, r0:(r0 + nr - 1), 1:kb),
         view(F, c0:(c0 + nc - 1), 1:kb),
-        -one(T), one(T), false, true, false, false
+        -one(T), one(T), false, true
     )
     return
 end
