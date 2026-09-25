@@ -179,7 +179,13 @@ const _HAS_ACCELERATE = Sys.isapple()
 # (272.7 ms/call vs the uncontrolled run's 234.6 ms/call — i.e. the "second core" bought only ~16%,
 # consistent with the matrix unit being a shared resource a second software thread cannot usefully
 # double up on, not with real 2x general-purpose parallelism).
-ENV["VECLIB_MAXIMUM_THREADS"] = "1"
+#
+# THE TWO ACCELERATE ARMS CANNOT SHARE A PROCESS, and that is this same read, not a policy: once
+# vecLib has initialised at one thread count, nothing in the process can move it. So the value pinned
+# here is decided by the arm selection — `accelerate_mt` asks for `_MT_NT`, everything else for 1 —
+# and requesting both in one run is refused below rather than silently recording one of them wrong.
+const _VECLIB_NT = (!isnothing(_ARMS_SEL) && "accelerate_mt" in _ARMS_SEL) ? _MT_NT : 1
+ENV["VECLIB_MAXIMUM_THREADS"] = string(_VECLIB_NT)
 
 # Forward LBT to one backend. Called between timed windows, never inside one. `clear=true` on the BLAS
 # forward drops the previous backend's symbols so a partial forward can never leave a mixed BLAS/LAPACK
@@ -200,7 +206,13 @@ ENV["VECLIB_MAXIMUM_THREADS"] = "1"
 #
 # Verified before use by `bench/probes/mt_reference_witness.jl`, which times a 2048 dgemm at 1 and N
 # threads and requires >1.5x. Measured on Zen4: OpenBLAS 4.72x, AOCL 3.32x.
-const _REF_MT = Dict("openblas_mt" => "openblas", "aocl_mt" => "aocl")
+#
+# `accelerate_mt` is the Apple member of the same family, and it is the one whose thread count this
+# file cannot change after the fact: vecLib takes `VECLIB_MAXIMUM_THREADS` at its first use, so the
+# count is fixed by `_VECLIB_NT` above, before any forward. `BLAS.set_num_threads` below is a no-op
+# for it — harmless, and left in place because the arm is otherwise identical to the others.
+const _REF_MT = Dict("openblas_mt" => "openblas", "aocl_mt" => "aocl",
+                     "accelerate_mt" => "accelerate")
 _is_mt_ref(a::AbstractString) = haskey(_REF_MT, a)
 
 function _use_ref!(name::AbstractString)
@@ -264,7 +276,7 @@ const _DO_PB_MT = !isnothing(_ARMS_SEL) && (_ARM_PB_MT in _ARMS_SEL)
 # Threaded reference arms, opt-in only and never implied. Measuring a reference at all needs the user's
 # explicit per-run authorisation; measuring one THREADED is a second, larger ask (it doubles the sweep).
 const _REF_MT_ARMS = isnothing(_ARMS_SEL) ? String[] :
-    [a for a in ("openblas_mt", "aocl_mt") if a in _ARMS_SEL]
+    [a for a in ("openblas_mt", "aocl_mt", "accelerate_mt") if a in _ARMS_SEL]
 const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
     _REF_ARMS, _REF_MT_ARMS)
 # ANY threaded arm puts this run in the mt family, and that has to be true for the REFERENCE arms too,
@@ -276,6 +288,19 @@ const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
 # REFUSE rather than measure a lie. BLIS fixes its thread count at init from the environment, so if the
 # process was not launched with it, `aocl_mt` would be a single-threaded AOCL recorded under a threaded
 # name — and every downstream verdict built on it would be wrong in PureBLAS's favour.
+#
+# The Accelerate pair is refused for the same reason, one step earlier: vecLib fixes its thread count
+# at first use, so a run holding both arms would measure ONE of them at the other's count and record
+# it under the wrong name. They are separate runs, and the cache merge is what joins them.
+if "accelerate_mt" in _REF_MT_ARMS && "accelerate" in _REF_ARMS
+    error("""
+        accelerate and accelerate_mt cannot be measured in the same process. vecLib reads
+        VECLIB_MAXIMUM_THREADS at its FIRST USE and ignores `BLAS.set_num_threads` thereafter, so one
+        of the two arms would be recorded at the other's thread count. Run them separately — the
+        cache merge joins them:
+          julia --project=bench bench/plots.jl bench arms=pb,accelerate …
+          julia --project=bench -t $_MT_NT bench/plots.jl bench mt=$_MT_NT arms=pb_mt,accelerate_mt …""")
+end
 if "aocl_mt" in _REF_MT_ARMS
     _BLIS_INIT_NT >= _MT_NT || error("""
         aocl_mt requested but BLIS initialised with BLIS_NUM_THREADS=$_BLIS_INIT_NT (need >= $_MT_NT).
@@ -284,7 +309,8 @@ if "aocl_mt" in _REF_MT_ARMS
           BLIS_NUM_THREADS=$_MT_NT OMP_NUM_THREADS=$_MT_NT taskset -c … julia --project=bench -t $_MT_NT …
         Verify first with bench/probes/mt_reference_witness.jl.""")
 end
-isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: $_ARM_PB,$_ARM_PB_MT,$(join(_REF_ALL, ","))")
+isempty(_ACTIVE_ARMS) && error("arms=$(join(something(_ARMS_SEL, []), ",")) selected nothing; valid: " *
+    "$_ARM_PB,$_ARM_PB_MT,$(join(_REF_ALL, ",")),$(join((r * "_mt" for r in _REF_ALL if r != "mkl"), ","))")
 if _DO_PB_MT
     Threads.nthreads() >= _MT_NT || error(
         "arms=…,$_ARM_PB_MT needs at least $_MT_NT julia threads, got $(Threads.nthreads()). " *
@@ -2506,6 +2532,13 @@ function load_cache(path)
         lvl, nm, ssz = String(parts[1]), String(parts[2]), parse(Int, parts[3])
         cell = CellData()
         for f in parts[4:end]
+            # An EMPTY record field is a cell that was swept with no arm that applies to it, and the
+            # row was still written with its separator. The dual groups do it by construction: DL*'s
+            # reference is LinearAlgebra's generic fallback, not a BLAS library, so a run selecting
+            # only reference arms records nothing for them. Skipping is what makes such a cache
+            # readable at all — without it the split below indexes a one-element vector and every
+            # threaded run on the host dies in `load_cache` rather than reporting a missing arm.
+            isempty(f) && continue
             # 4-field (pre-anchor), 5-field (anchor) and 6-field (anchor+freq) records coexist in one
             # file — see the writer note. The times are ALWAYS last, so index from both ends rather than
             # assuming a field count; that invariant is what lets a field be appended without a version
