@@ -6546,7 +6546,28 @@ end
 # Before the arena that misconfiguration threw a `BoundsError` at the slice; the clamp plus the restored
 # `@boundscheck` on `view(::PtrMatrix, …)` (ptrmat.jl) are the two halves of keeping it loud.
 # The clamp is repeated inside the live-knob hook because `_FKR_syrk_dbase[]` bypasses the const entirely.
-const _SYRK_DBASE = min(@load_preference("syrk_dbase", 32)::Int, _L3_NB)
+#
+# PDM: Derived — the leaf fills the scratch the arena already reserves for it. `_syrk_rec!` slices
+# `view(scr, 1:n, 1:n)` out of a FIXED `_L3_NB × _L3_NB` borrow, so any base below `_L3_NB` leaves
+# that buffer under-used AND multiplies the off-diagonal blocks, each of which becomes its own
+# kernel call. `_L3_NB` is itself derived from cache residency, so this adapts to an unseen machine
+# rather than encoding one.
+#
+# Measured on an M6, Float64 syrk at one thread, GFLOP/s by base (the recursion is only reached
+# above `_SYRK_SME_MIN`; below it the packed path runs and the base does nothing, which is why
+# n ≤ 256 is flat):
+#
+#     n      32      64      96     128
+#   256    56.2    56.2    56.2    56.2   (packed — base unreachable)
+#   384   127.0   177.3   188.7   188.7
+#   512   137.4   223.4   223.3   238.9
+#   768   190.4   269.0   287.6   287.7
+#  1024   198.6   290.1   290.0   306.6
+#  2048   226.1   273.0   273.4   283.5
+#
+# The clamp stays: it is now a no-op for the default, and still guards a user pin larger than the
+# borrow, which would slice past its end.
+const _SYRK_DBASE = min(@load_preference("syrk_dbase", _L3_NB)::Int, _L3_NB)
 @inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? min(f, _L3_NB) : _SYRK_DBASE)
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
