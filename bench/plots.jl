@@ -328,6 +328,21 @@ struct ArmRec
     # 0,0 for records written before this field existed (treated as "unknown", never as 0 Hz).
     flo::Int
     fhi::Int
+    # WHICH SAMPLER produced `flo`/`fhi`, and therefore whether they can be checked for a threaded
+    # throttle. `"core"` is the main thread's core alone — the core under test for a serial window, an
+    # idling spectator for a threaded one, since the pool driver spins then yields while its workers
+    # work. `"threads"` is the min/max over the RUNNING cores of this process's own threads, so the
+    # minimum is a working core.
+    #
+    # PER ARM, NOT PER HEADER, and that is the whole point of this field. A header stamp is rewritten by
+    # any targeted `op=`/`group=` merge while the file's other cells keep their old ranges, so it would
+    # claim a sensitivity those cells do not have — the same per-row provenance hazard
+    # `coverage_ops.jl` documents for `julia=`/`llvm=`. Per arm, a cache can hold both kinds honestly
+    # and each consumer decides per record.
+    #
+    # `"core"` for every record written before this field existed, which is the correct reading: those
+    # ranges ARE single-core samples.
+    span::String
     q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
 end
 const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
@@ -343,7 +358,8 @@ function _stamp(acc::ArmData)
     lo, hi = _khz_range!()          # observed across THIS cell's windows; resets for the next cell
     return CellData(
         a => ArmRec(
-            Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi, q
+            Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi,
+            _ANY_MT ? "threads" : "core", q
         ) for (a, q) in acc
     )
 end
@@ -2516,20 +2532,9 @@ function save_cache(path, groups)
             # ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its
             # base clock. See `_lock_state`.
             "\tanchor=$(round(anc * 1.0e6; digits = 3))us\tfreq=$(khz)kHz",
-            # WHICH SAMPLER wrote `flo|fhi`. `core` is the main thread's core only, which for a threaded
-            # window is an idling spectator — a cache stamped `core` cannot be checked for a threaded
-            # throttle and `check_arm_clocks.sh` stands its in-window check down. `threads` means the
-            # range spans the RUNNING cores of this process's own threads, so the minimum is a working
-            # core and the check applies. Absent = `core`, i.e. every cache written before this existed.
-            #
-            # ⚠ THIS IS A HEADER FIELD AND THE SAMPLER IS PER RUN, so a targeted `op=`/`group=` merge
-            # stamps `threads` over a file whose OTHER cells still carry `core` ranges — the same
-            # per-row provenance hazard `coverage_ops.jl` documents for `julia=`/`llvm=`. The error is
-            # conservative (an under-sensitive old range can only under-report a dip, and a spurious
-            # flag costs a re-measure rather than a wrong number), but the in-window column is only
-            # fully trustworthy once every pb_mt cell in the file has been measured by this sampler.
-            # Making it a per-ARM field is the real fix and is a format change, not a patch.
-            "\tkhzspan=$(_ANY_MT ? "threads" : "core")",
+            # (Which sampler produced `flo|fhi` is recorded PER ARM, in `ArmRec.span`, not here — a
+            # header stamp is rewritten by every targeted merge while the file's other cells keep their
+            # old ranges, so it would claim a sensitivity those cells do not have.)
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
@@ -2555,7 +2560,7 @@ function save_cache(path, groups)
             # rather than `limit = 4`. That invariant is the extension mechanism — append before the
             # csv, never after it.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(rec.span)|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -2606,8 +2611,13 @@ function load_cache(path)
             # unknown as "cannot verify the window was pinned", which is exactly what those cells are.
             flo = length(p) >= 8 ? something(tryparse(Int, p[6]), 0) : 0
             fhi = length(p) >= 8 ? something(tryparse(Int, p[7]), 0) : 0
-            cell[String(a)] =
-                ArmRec(String(tstamp), String(cmt), anc, khz, flo, fhi, parse.(Float64, split(csv, ",")))
+            # 9-field records name the SAMPLER that produced flo/fhi. An 8-field record's p[8] is the
+            # csv, so the check is `>= 9` and not `>= 8`; anything older is a single-core sample, which
+            # is what "core" means — not a missing value to be guessed at.
+            span = length(p) >= 9 ? String(p[8]) : "core"
+            cell[String(a)] = ArmRec(
+                String(tstamp), String(cmt), anc, khz, flo, fhi, span, parse.(Float64, split(csv, ","))
+            )
         end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)

@@ -45,15 +45,7 @@ for f in "${files[@]}"; do
     # doing the work. The in-window check below stands down for those; the cross-arm check does not.
     mt=0; case "$f" in *mt_data_*) mt=1 ;; esac
     out=$(awk -F'\t' -v TOL="$tol" -v MT="$mt" '
-        /^#pbbench/ {
-            if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0
-            # `khzspan=threads` means flo|fhi span every core this process threads sat on, so the
-            # MINIMUM is a working core and the in-window check below is meaningful even for pb_mt.
-            # Absent or `core` means the range is the main thread only — an idling spectator during a
-            # threaded window — and the check stands down. See `_cell_khz_span` in plots.jl.
-            if ($0 ~ /khzspan=threads/) span_threads = 1
-            next
-        }
+        /^#pbbench/ { if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0; next }
         /^#/ { next }
         NF >= 4 {
             pb = 0; ref = 0; refname = ""
@@ -78,10 +70,16 @@ for f in "${files[@]}"; do
                 #
                 # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
                 # arm carries the state of the epoch it was measured in and is never re-run.
-                # The in-window check runs for the serial `pb` arm always, and for `pb_mt` only once the
-                # range spans the working cores (`khzspan=threads`). A threaded cache written by the
-                # old single-core sampler still stands down.
-                if (base > 0 && n >= 8 && ((a[1] == "pb" && !MT) || (a[1] == "pb_mt" && MT && span_threads))) {
+                # WHICH SAMPLER wrote this range, read PER ARM: field 8 of a 9-field record. In an
+                # 8-field record field 8 is the csv, so the test is `n >= 9`; anything older is a
+                # single-core sample, which is what "core" means.
+                # (No apostrophes in this block: the awk program is single-quoted and one would end it.)
+                span = (n >= 9) ? a[8] : "core"
+                # The in-window check runs for the serial `pb` arm always, and for `pb_mt` only when
+                # THAT RECORD carries a range spanning the working cores. A pb_mt record written by the
+                # old single-core sampler stands down on its own merits, even inside a file where other
+                # cells were re-measured — which a header stamp could not express.
+                if (base > 0 && n >= 8 && ((a[1] == "pb" && !MT) || (a[1] == "pb_mt" && MT && span == "threads"))) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++
