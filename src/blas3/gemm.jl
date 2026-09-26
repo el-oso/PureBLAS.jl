@@ -3712,6 +3712,82 @@ ways: by the threads that exist, by the amortisation floor above, and by `n` —
 given a whole `_NR`-wide column block is a worker whose microkernel runs ragged, which costs more than
 the thread saves.
 """
+# ── BLAS-1 THREADING: A DIFFERENT AMORTISATION UNIT, NOT A SMALLER NUMBER ───────────────────────────
+# `_GEMM_MT_WORK` is a FLOP floor, because a gemm is compute-bound and its cost is flops over the FMA
+# rate. BLAS-1 is BYTE-bound: an axpy at n=30000 does 60000 flops, two orders of magnitude below that
+# floor, and a flop test would therefore refuse to thread the exact cells OpenBLAS threads for a
+# measured 1.98x. The floor has to be in bytes.
+#
+# PDM: DERIVE — a residency criterion over a detected const, no new knob. The criterion: extra cores add
+# usable bandwidth only once the data stops fitting in the private per-core cache. Inside L2 one core
+# already streams at the cache's rate, so a second core adds a join and nothing else; beyond L2 the
+# operands come from L3 or memory, where per-core bandwidth is a fraction of aggregate and cores do add.
+#
+# ⚠ RESIDENCY COUNTS EVERY LIVE STREAM, which `_axpy_simd!` learned the expensive way a few hundred
+# lines below: axpy reads `x` and read-modify-writes `y`, so its working set is 2·n·sizeof(T). The
+# caller passes the byte count; this const is the threshold it is compared against.
+#
+# MEASURED HEADROOM this is aimed at (OpenBLAS self-speedup 1→6 threads, Zen4, freq-locked):
+#   axpy  n≤10000 1.00x (OB declines to thread) · 30000 1.98x · 100000 2.40x · 300000 1.80x · 1e6 1.82x
+#   dot   n≤10000 1.00x                         · 30000 2.37x · 100000 3.27x · 300000 1.89x · 1e6 1.69x
+# PureBLAS is at 0.99–1.08 of OpenBLAS SERIALLY at every one of those sizes, so the whole threaded
+# deficit is the missing split rather than any kernel gap.
+# TWO THRESHOLDS, BECAUSE THERE ARE TWO QUESTIONS, and conflating them was measured wrong: using one
+# constant for both capped the worker count at `bytes ÷ floor`, which is 1 for a 1.6 MB call against a
+# 1 MiB floor — so n=100000 admitted exactly one worker and gained 1.00x.
+#
+#   `_L1_MT_MIN`  — is this call worth splitting at all? At least two workers must each clear the
+#                   per-worker floor, or the join is not amortised.
+#   `_L1_MT_SLICE` — the per-worker floor: a slice whose operands fit in the PRIVATE L1 is a slice
+#                   smaller than the cost of waking a core for it. That is the same physical statement
+#                   `_MT_AMORTISE` makes for gemm, in the unit BLAS-1 is bound by: on this box the
+#                   measured join is 568 ns and a core streams ~57 GB/s, so the break-even slice is
+#                   ~32 KB, which is `_L1_BYTES`. Derived rather than fitted, and the agreement is the
+#                   reason to trust the form rather than the number.
+# PDM: Derived — per-worker floor from private-L1 residency: a slice whose operands fit in L1 is smaller than the cost of waking a core for it. Cross-checked against the measured join (568 ns) times a core's streaming bandwidth (~57 GB/s) = ~32 KB = _L1_BYTES.
+const _L1_MT_SLICE = _L1_BYTES
+# PDM: Derived — admission: at least two workers must each clear the per-worker floor, or the join is not amortised. The factor 2 is the minimum worker count, not a tuning choice.
+const _L1_MT_MIN = 2 * _L1_MT_SLICE
+
+"""
+    _l1_workers(bytes, n, ::Type{T}) -> Int
+
+Workers to split a BLAS-1 call across; `1` means "run it serially on the calling thread". `bytes` is the
+call's whole working set across every live stream. Capped by the threads that exist, by the byte floor,
+and by giving each worker at least one whole vector's worth of elements — a worker with a partial vector
+is a worker running the scalar tail, which costs more than the thread saves.
+"""
+@inline function _l1_workers(bytes::Int, n::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1                       # the single atomic read that keeps the serial entry cheap
+    # The pool exists for Float64 and Float32 only (`_gemm_poolvec`), and this test const-folds, so a
+    # complex or Dual entry never reaches the compare below.
+    (T === Float64 || T === Float32) || return 1
+    W = _vwidth(T)
+    (bytes < _L1_MT_MIN || n < 2 * W) && return 1
+    return max(1, min(nt, bytes ÷ _L1_MT_SLICE, n ÷ W))
+end
+
+"""
+    _l1_chunk(n, nw, i, ::Type{T}) -> (i0, len)
+
+Worker `i`'s contiguous element range, zero-based start. Boundaries are whole vector widths so every
+chunk's SIMD body starts where a serial one would; the last chunk carries the ragged tail.
+
+Elementwise BLAS-1 is bitwise invariant under ANY partition — each element's arithmetic depends only on
+its own inputs — so unlike `_tri_chunk` this needs no flop balancing and unlike `_gemm_chunk` no route
+alignment. What it must NOT do is overlap, which would be a write race.
+"""
+@inline function _l1_chunk(n::Int, nw::Int, i::Int, ::Type{T}) where {T}
+    W = _vwidth(T)
+    nv = n ÷ W                               # whole vectors to deal out; the remainder rides the last
+    per = cld(nv, nw)
+    i0 = (i - 1) * per * W
+    i0 >= n && return (0, 0)
+    len = i == nw ? n - i0 : min(per * W, n - i0)
+    return (i0, max(0, len))
+end
+
 @inline function _gemm_workers(m::Int, n::Int, k::Int)
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
@@ -3817,6 +3893,11 @@ const _MT_KIND_TRSMR = 4
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_TRMMR = 5
+# BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is the
+# WHOLE vector length (which is also the route width) and `n` is 1.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_AXPY = 6
 
 """
     _syrk_workers(n, k) -> Int
@@ -3905,6 +3986,7 @@ end
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4042,6 +4124,21 @@ end
         return nothing
     end
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
+    return nothing
+end
+
+# `y .+= a .* x` over this worker's element range. Nothing is packed, nothing is shared and no barrier is
+# taken: the ranges are disjoint and every element's result depends only on its own inputs.
+#
+# `p.m`, NOT `len`, is handed to the kernel as the route width. That is req#11: `_axpy_simd!` picks its
+# arm from two size-keyed predicates whose arms are not bitwise equivalent, so a chunk routing from its
+# own length would compute different last bits than the serial call. Compute on the slice, route from the
+# whole.
+@noinline function _axpy_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _axpy_simd!(len, p.alpha, p.Ap + off, p.Cp + off, 0, p.m)
     return nothing
 end
 
@@ -4329,6 +4426,11 @@ end
             _trsm!(true, up, tA, cA, unit, alpha, A, C)
         elseif kind == _MT_KIND_TRSMR
             _trsm!(false, up, tA, cA, unit, alpha, A, C)
+        elseif kind == _MT_KIND_AXPY
+            # A loser does the whole vector, so its own length IS the route width — `nroute` stays -1,
+            # the same reasoning as gemm's and trsm's fallbacks. This reaches the identical kernel arm
+            # the winner's chunks reach, because they route from `p.m` which equals this `m`.
+            _axpy_simd!(C.m, alpha, A.ptr, C.ptr)
         elseif kind == _MT_KIND_TRMMR
             # A loser multiplies the whole of B. `_trmm_right!` routes on `size(A, 1)`, which the row
             # split leaves alone, so this reaches the kernel the winner's bands do — with `wi = 0`, the
@@ -4488,6 +4590,30 @@ end
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
     return nothing
+end
+
+# ── THREADED BLAS-1 ENTRY ───────────────────────────────────────────────────────────────────────────
+# A vector rides the pool as an n×1 `PtrMatrix`: `Cp` is y, `Ap` is x, `m` is the whole length. The job
+# struct needs no new field, and `m` doubles as the route width because an element range is described by
+# a length alone.
+#
+# `@noinline` and OUT OF LINE on purpose. `_axpy!` is `@inline` and that is a measured gate lever worth
+# 28.7 ns at n=1e4 (see its own note); the serial path must pay one atomic read and one compare for this,
+# never a second body to inline.
+#
+# TWO METHODS, because `_simd2` admits exactly two operand shapes: raw pointers (the C-ABI boundary and
+# the reinterpreted complex/dual buffers, where the CALLER already holds the GC root) and dense arrays
+# (the native API, where the root is the array itself).
+@noinline function _axpy_threaded!(n::Int, a::T, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        a, zero(T), false, false, false, false, nw, _MT_KIND_AXPY
+    )
+    return y
+end
+@noinline function _axpy_threaded!(n::Int, a::T, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _axpy_threaded!(n, a, pointer(x), pointer(y), nw)
+    return y
 end
 
 function gemm!(

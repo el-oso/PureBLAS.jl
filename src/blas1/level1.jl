@@ -85,7 +85,17 @@ end
 # concrete call site every one of those tests const-folds to the single surviving branch.
 @inline function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        ac = convert(_et(x), a)
+        # THREADING IS ONE ATOMIC READ ON THE SERIAL PATH. `_l1_workers` returns 1 after `_MT_NTHREADS[]`
+        # alone when threading is off, which is the default, so this entry keeps the shape the `@inline`
+        # note above is about: the whole branch chain const-folds at a concrete call site and the 28.7 ns
+        # the public wrapper used to give back stays gone. The threaded call is `@noinline` and out of
+        # line, so it costs the serial path nothing but the compare.
+        nw = _l1_workers(2 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _axpy_threaded!(Int(n), ac, x, y, nw)
+        return _axpy_simd!(Int(n), ac, x, y)
+    end
     if incx == 1 && incy == 1 && _cplx2(x, y)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vecs = real axpy over 2n

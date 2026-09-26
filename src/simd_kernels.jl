@@ -257,7 +257,18 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
 # dynamic `Val(u)` in the hot path, so this stays allocation-free and StrictMode-clean).
-@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T <: BlasReal}
+# `nroute` — THE ROUTE WIDTH, when a caller has split this axpy across workers. Defaults to `-1`,
+# meaning "route from `n`", which is every serial call and keeps them byte-identical to before.
+#
+# WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation: the two predicates below are
+# size-keyed, and the arms they choose are NOT bitwise equivalent — `_axpy_phase!` splits the vector
+# into phases and `_axpy_unrolled!(Val(u))` carries u independent chains, so where the scalar tail
+# falls and which lane holds which element both move with the length. A worker handed its own `len`
+# would route to a different arm than the serial call and return different last bits, which is exactly
+# the `_use_unpacked` failure `_gemm_core!`'s `nroute` exists for. So a partitioned caller passes the
+# WHOLE problem's length and computes on its slice.
+@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0, nroute::Int = -1) where {T <: BlasReal}
+    nrt = nroute < 0 ? n : nroute
     # THE KNOB ONLY GOVERNS WHERE IT WAS MEASURED. `_measure_axpy_unroll` probes past L1, so its answer
     # applies past L1 and nowhere else — the probe-regime rule, and here it is not academic. Measured on
     # Zen4 (freq-locked, plots.jl) with the tuned value applied at EVERY size, against the fixed 4:
@@ -267,7 +278,7 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # new n=1e4 miss. The optimum is size-dependent as well as machine-dependent, so the residency split
     # is part of the knob, not a detail.
     # Short calls (complex `ger` per column, tails) also skip the OncePerProcess lookup entirely.
-    (n < 4 * _UNROLL * _vwidth(T) || n * sizeof(T) <= _L1_BYTES) &&
+    (nrt < 4 * _UNROLL * _vwidth(T) || nrt * sizeof(T) <= _L1_BYTES) &&
         return _axpy_unrolled!(Val(_UNROLL), n, a, x, y, pf)
     # `pf > 0` (ger's prefetching caller) stays on the interleaved body: its prefetch distance is tuned
     # against that step, and the phase bodies do not carry the prefetch block.
@@ -300,7 +311,7 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # PDM: DERIVE tier — a residency criterion over a detected const, no new knob.
     # (Line ~324's L1 cutoff has the same one-stream shape. Left alone deliberately: every cell it
     # governs gates ≥ 1.0, so changing it would be an unmeasured edit to working code.)
-    u = 2 * n * sizeof(T) >= _L3_BYTES ? _axpy_dram() : _axpy_band()
+    u = 2 * nrt * sizeof(T) >= _L3_BYTES ? _axpy_dram() : _axpy_band()
     W = _vwidth(T)
     return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
         u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
