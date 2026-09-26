@@ -990,6 +990,23 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # STORED with the value they already hold, and wrong when they are accumulated into, because the
 # overlap would add alpha*A*x twice. The scalar loop that served the tail before dominated the call
 # long before it was a small fraction of the rows (m=40 at 0.45 of the SIMD path, m=144 at 0.90).
+#
+# THEREFORE THIS KERNEL MAY NEVER BE GIVEN A PARTITIONED ROW RANGE. The overlap is sound only
+# because the rows it recomputes already hold the value being rewritten, which is a statement about
+# the WHOLE call: two row bands that each extend their own trailing block overlap each other's rows
+# and both write them, and nothing about `beta == 0` makes that ordering safe. A threaded gemv-N
+# splits rows — that is its write-disjoint axis, since rows of A map to elements of y — so the split
+# and this kernel are mutually exclusive by construction.
+#
+# The rule that keeps them apart is the one `_sme_owns` states for gemm: decide SME ownership at the
+# threaded ENTRY, before any split, and run an owned call serially. It is also the faster answer on
+# this hardware — one coprocessor shared by the cluster, measured 503 owned vs 301 split at n=4096 —
+# so there is no case where splitting an eligible call is worth reopening this.
+#
+# Two size-keyed terms below would ALSO misroute a chunk if one ever reached them: `m * n` can fall
+# under `_SME_GEMV_MINWORK` for a slice of a call that clears it whole, and `m % _SME_GEMV_BLK`
+# flips with the band height. Both are moot under the entry rule above, and neither is worth a route
+# parameter — an unused argument on a hot predicate is not free (see `_trsm!`'s ninth-parameter note).
 @inline _sme_gemv_shape_ok(m, n, beta) =
     m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK &&
         (m % _SME_GEMV_BLK == 0 || iszero(beta))
