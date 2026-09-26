@@ -93,9 +93,14 @@ const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) 
 # DELIBERATELY NOT `_trsplit` ITSELF: that one is shared with `_trmm_left!`, `_trmm_right_recur!`,
 # `_trsm_left!` and `_trsm_right!`, whose blocks feed different kernels with different granularity,
 # and whose behaviour on the AMD fleet is not what this measurement covers.
+# The non-SME arm DELEGATES to `_trsplit` rather than repeating `k ÷ 2`. The two are the same
+# expression today, so this is inert — but it is what keeps them the same tomorrow: if `_trsplit`
+# ever aligns, syrk and syr2k inherit it instead of becoming the only rank-k routines left on the
+# bare halving. Measured on Zen, rounding h to a whole `_MR·W` and holding k fixed: 0.9714 mean over
+# 72 ragged points, best 0.893 at k=120, against a control of 20 already-aligned points at 1.0005.
 @inline function _rksplit(k::Int)
     h = k ÷ 2
-    (_SME_F64 && h >= 2 * _SME_MR) || return h
+    (_SME_F64 && h >= 2 * _SME_MR) || return _trsplit(k)
     hg = (h ÷ _SME_MR) * _SME_MR
     return hg >= _SME_MR ? hg : h
 end
@@ -6568,7 +6573,7 @@ end
 # `@boundscheck` on `view(::PtrMatrix, …)` (ptrmat.jl) are the two halves of keeping it loud.
 # The clamp is repeated inside the live-knob hook because `_FKR_syrk_dbase[]` bypasses the const entirely.
 #
-# PDM: Derived — the leaf fills the scratch the arena already reserves for it. `_syrk_rec!` slices
+# THE LEAF FILLS THE SCRATCH THE ARENA ALREADY RESERVES FOR IT. `_syrk_rec!` slices
 # `view(scr, 1:n, 1:n)` out of a FIXED `_L3_NB × _L3_NB` borrow, so any base below `_L3_NB` leaves
 # that buffer under-used AND multiplies the off-diagonal blocks, each of which becomes its own
 # kernel call. `_L3_NB` is itself derived from cache residency, so this adapts to an unseen machine
@@ -6588,6 +6593,7 @@ end
 #
 # The clamp stays: it is now a no-op for the default, and still guards a user pin larger than the
 # borrow, which would slice past its end.
+# PDM: Derived — the leaf is bounded by the scratch the arena already reserves for it: `_L3_NB`. | tune: n/a, follows the borrow
 const _SYRK_DBASE = min(@load_preference("syrk_dbase", _L3_NB)::Int, _L3_NB)
 @inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? min(f, _L3_NB) : _SYRK_DBASE)
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
