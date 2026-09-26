@@ -127,18 +127,28 @@ println("cells=", length(rows), "  below gate (round2sig < 1.00)=", length(fails
 # FREQUENCY PROVENANCE, printed unconditionally — a report that says nothing about the clock reads as
 # "the clock was fine", which is precisely the claim a backfilled cache cannot support.
 for (f, ref, bf) in FREQMETA
-    # A THREADED cache earns no clock guarantee here, and saying nothing would read as one. The
-    # per-cell clock is sampled from /proc/self/stat field 39 — the MAIN thread's CPU — which spins
-    # then yields while the workers do the work, so the sample describes an idle core. The check
-    # flags clocks ABOVE the reference, and an idle core is below it: measured on this cache, 0 of
-    # 937 pb_mt cells could ever be flagged (min 2760348 kHz, max 2813000, header 2813000). So it
-    # excludes nothing wrongly, and it detects nothing either.
+    # THIS FILE'S off-lock check cannot judge a threaded cache, and saying nothing would read as a
+    # clean bill of health. `_freq_offlock` flags clocks ABOVE the header, and the pb_mt sample comes
+    # from /proc/self/stat field 39 — the MAIN thread's CPU, which spins then yields while the
+    # workers work, so it reads at or below the lock. Measured here: 0 of 937 pb_mt cells can ever be
+    # flagged (min 2760348 kHz, max 2813000, header 2813000).
+    #
+    # That is NOT the same as "a threaded cache carries no clock evidence", and the cells below can be
+    # badly wrong for a clock reason this tool will not show. The arms timed in one window SHARE a
+    # clock sample, and the threaded reference window can fall far below the lock while the PB window
+    # holds it — L1/axpy@1000000 on wintermute: aocl_mt/openblas_mt 2013 MHz against pb/pb_mt 2795,
+    # a 28% gap, because PB does not thread axpy and ran one core. 204 of 937 cells on that box are
+    # mismatched this way, worst 45.9%, and the error FLATTERS PureBLAS. `bench/check_arm_clocks.sh`
+    # is the cross-arm check that finds them and `bench/audit_mt.sh` runs it; read that before
+    # treating any number here as a verdict.
     println("  freq ref ", rpad(replace(f, "plots_data_" => "", "mt_data_" => "", ".txt" => ""), 22),
-        is_mt_cache(f) ? "THREADED CACHE — per-cell clock is the idle main thread; no off-lock detection" :
+        is_mt_cache(f) ? "THREADED — no in-window check (idle main thread); run bench/audit_mt.sh for " *
+            "the cross-arm clock check, which DOES fire on these caches" :
         ref == 0 ? "(none in header — no cell can be judged off-lock)" :
         string(ref, "kHz", bf ? "  BACKFILLED from the run header: per-cell clocks are NOT measured " *
             "samples, so no cell in this cache can be flagged" : "  (header achieved clock; cells >1% above it are excluded)"))
 end
+
 # BOTH REFERENCES ARE PRINTED, not just the binding one. The `ratio`/`vs` columns are the gate (worst
 # against the faster reference) — but reporting only that HIDES WHICH LIBRARY BINDS, and that is the
 # fact which tells you whether a caller inherits its callee's gap. Measured 2026-08-06, Zen3 n=32:

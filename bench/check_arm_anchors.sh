@@ -49,13 +49,30 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-5}
-mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+shift 2>/dev/null || true
+# Explicit caches may follow the tolerance; with none, audit the SERIAL caches. The threaded caches
+# are NOT in the default set: `bench/audit_mt.sh` runs this chain over them, and keeping the two sets
+# apart is what stops a threaded anchor problem from blocking a serial publish.
+files=("$@")
+if [ ${#files[@]} -eq 0 ]; then
+    mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
 bad=0
 for f in "${files[@]}"; do
-    printf '── %s\n' "$(basename "$f" .txt | sed 's/^plots_data_//')"
-    out=$(awk -F'\t' -v TOL="$tol" '
+    printf '── %s\n' "$(basename "$f" .txt | sed -e 's/^plots_data_//' -e 's/^mt_data_//')"
+    # A THREADED cache carries pb, pb_mt, openblas_mt and aocl_mt together, so the arm NAMES have to
+    # follow the file. Comparing serial `pb` against the threaded vendors would be comparing two
+    # different thread counts' anchors, and taking `pb` with no whitelisted reference present — which
+    # is what this script did — reports "cannot check" on a cache that has every arm it needs.
+    case "$f" in *mt_data_*) mt=1 ;; *) mt=0 ;; esac
+    out=$(awk -F'\t' -v TOL="$tol" -v MT="$mt" '
+        function pbname() { return MT ? "pb_mt" : "pb" }
+        function isref(n) {
+            if (MT) return (n == "openblas_mt" || n == "aocl_mt" || n == "accelerate_mt")
+            return (n == "openblas" || n == "aocl" || n == "mkl" || n == "accelerate")
+        }
         /^#/ { next }
         NF >= 4 {
             # EVERY reference, not just the first. The original took `else if (ref == 0)`, i.e. whichever
@@ -75,8 +92,8 @@ for f in "${files[@]}"; do
                 # not references: `pb_mt` in particular is measured in the SAME run as `pb`, so it would
                 # always read ~0% drift and could MASK a genuinely stale openblas/aocl anchor by
                 # winning the "worst reference" comparison below with a reassuring number.
-                if (a[1] == "pb") pb = fq
-                else if (a[1] == "openblas" || a[1] == "aocl" || a[1] == "mkl") { nref++; rfq[nref] = fq; rnm[nref] = a[1] }
+                if (a[1] == pbname()) pb = fq
+                else if (isref(a[1])) { nref++; rfq[nref] = fq; rnm[nref] = a[1] }
             }
             if (pb > 0 && nref > 0) {
                 worstd = -1
@@ -90,7 +107,7 @@ for f in "${files[@]}"; do
                 tot++
                 if (d > TOL) {
                     off++
-                    if (off <= 3) printf "   %s/%s@%s  pb=%.1fus vs %s=%.1fus  (%.1f%%)\n", $1, $2, $3, pb, refname, ref, d
+                    if (off <= 3) printf "   %s/%s@%s  %s=%.1fus vs %s=%.1fus  (%.1f%%)\n", $1, $2, $3, pbname(), pb, refname, ref, d
                     badop[$1 "/" $2] = 1; badgrp[$1] = 1     # scope for a TARGETED re-measure
                 } else ok++
                 if (d > worst) { worst = d }

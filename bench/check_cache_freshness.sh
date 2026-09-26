@@ -27,7 +27,12 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 SELF="$(hostname)"
-mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+# Explicit caches may be passed; with none, audit the SERIAL set. The threaded caches are not in the
+# default set — `bench/audit_mt.sh` runs the chain over those.
+files=("$@")
+if [ ${#files[@]} -eq 0 ]; then
+    mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
 stale=0; unver=0; ok=0; local_=0

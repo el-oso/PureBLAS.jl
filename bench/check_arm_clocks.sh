@@ -28,7 +28,14 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-3}
-mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+shift 2>/dev/null || true
+# Explicit caches may follow the tolerance. With none, BOTH tiers are audited — unlike the other
+# checks, this one has always scanned `mt_data_*` too, because the cross-arm comparison is the only
+# throttle evidence a threaded cache carries and it must not be opt-in.
+files=("$@")
+if [ ${#files[@]} -eq 0 ]; then
+    mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
 bad=0
