@@ -1870,8 +1870,40 @@ Current medians vs Accelerate (single thread; the bar moves once step 0 lands):
      the packed path because materialize-plus-gemm was slower, which was true at 44 GFLOP/s.
      No new kernel. Re-derive, then measure.
 
-1.3  **Port the ZA-accumulate kernel to `symv` and `trmv`.** Same mechanism as gemv, one kernel
-     covering both. symv is already 1.15 so the work is trmv 0.67 and holding symv.
+1.3  **ROUTE `trmv`'s off-diagonal to the ZA-accumulate kernel — do not port a second one.**
+     Amended 2026-09-26 after measuring; the original read "port the ZA-accumulate kernel to `symv`
+     and `trmv`", and routing turns out to be the cheaper half again. Measured, pb/accelerate:
+
+         n      128   256   512  1000  1024  2048  4096
+         ratio 1.81  0.68  0.24  0.17  0.16  0.40  0.70     gate 0.158 at n=1024
+
+     The hole is n = 512…2048 and it is CACHE-RESIDENT — A is 8 MB at n=1024, inside this chip's
+     20 MB L2 — so it is not a DRAM roofline. Our `_trmv_fused8!` peaks at 110 GB/s where the SME
+     kernel's own measured `fmla`-into-ZA figure is 1013 and Accelerate reaches 977.
+
+     THE OFF-DIAGONAL SCATTER IS NOT REACHABLE FROM trmv-N, and the source says so already —
+     `_trmv_blk!`'s own comment records that the "diagonal + tall-scatter structure no longer
+     exists on the N path". Real trmv-N takes `_trmv_fused8!` at every n, and
+     `PUREBLAS_FORCE_trmv_fused_min` selects `_trmv_simd!` versus fused8, never the blocked
+     structure. `_tri_scat!`'s live caller is `_trsv_blk!`, not trmv. So a routing change to the
+     scatter lands on trsv — which currently PASSES — and does nothing for the red routine.
+
+     What IS established: SME gemv beats `_gemv_n_paneldrv!` by 5–9x at the shapes a scatter
+     issues (512x64 → 0.19, 960x64 → 0.19, 1024x512 → 0.12). The kernel is worth reaching; the
+     question is which caller can reach it.
+
+     BEFORE ANY FURTHER A/B HERE, GIVE `_sme_gemv!` AN EXECUTION WITNESS. `_SME_CALLS` is bumped
+     only inside `_gemm_sme!`, so the gemv kernel has none and a dead branch reads as a null
+     result. This was caught by a control — a plain `gemv!` also reported zero SME calls, which is
+     impossible if the counter covered gemv.
+
+     A constraint that will apply whenever a caller is found: a scatter accumulates (β = 1), and
+     `_sme_gemv_shape_ok` admits a non-multiple row count only when β = 0, because the trailing
+     rows are covered by an overlapping block. So its `m` must be a whole multiple of
+     `_SME_GEMV_BLK` = 32.
+
+     `symv` is already 1.15 and is only to be HELD, not improved — and it is on the MT campaign's
+     threading list, so coordinate before touching it.
 
 1.4  **Measure before writing** for `ger` (0.37), the banded ops, and L1. `ger` reads AND writes A,
      so it is memory-bound both ways and ZA may not help; `dot`/`nrm2`/`asum` accumulate and are the
