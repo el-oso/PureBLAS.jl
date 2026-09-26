@@ -3927,6 +3927,12 @@ const _MT_KIND_TRMMR = 5
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_AXPY = 6
+# BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each worker
+# reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver folds them in
+# index order afterwards. The fold is the driver's, not a worker's, which is what keeps the order fixed.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_DOT = 7
 
 """
     _syrk_workers(n, k) -> Int
@@ -4016,6 +4022,7 @@ end
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4163,6 +4170,56 @@ end
 # arm from two size-keyed predicates whose arms are not bitwise equivalent, so a chunk routing from its
 # own length would compute different last bits than the serial call. Compute on the slice, route from the
 # whole.
+# ── THE REDUCTION PARTIALS BUFFER ───────────────────────────────────────────────────────────────────
+# A PROCESS GLOBAL IS SOUND for it, by the same argument `_GPKSH_F64` records: the pool admits one job at
+# a time under `p.busy`, the driver sizes this inside that claim, and each worker writes only the block
+# indices it owns. Nothing here is held across a yield by a caller, so it needs no task ownership.
+#
+# A bare `const` Vector rather than a `OncePerProcess`: an owner reachable from a kernel takes a `lock()`
+# whose first call descends through `yield()`/`wait()` into Base's `OncePerThread{Task}` scheduler, which
+# the optimiser cannot get through — see the note at `_gemm_poolvec`.
+const _REDP_F64 = Float64[]
+const _REDP_F32 = Float32[]
+@inline _red_partials(::Type{Float64}) = _REDP_F64
+@inline _red_partials(::Type{Float32}) = _REDP_F32
+
+# Grow the partials buffer before the job is published. CALLED FROM THE DRIVER, INSIDE THE CLAIM — never
+# from a chunk body, which must not allocate: the driver and every idle worker are in spin/wait loops
+# with nowhere for a GC to progress from, and the symptom is a swallowed worker exception or a silent
+# hang depending on the interleaving. Same rule as `_gpack_prefit!`.
+@inline function _red_prefit!(::Type{T}, nblk::Int) where {T}
+    v = _red_partials(T)
+    length(v) < nblk && resize!(v, nblk)
+    return nothing
+end
+
+# One worker's share of the BLOCK GRID — block indices, not elements. Contiguous so each worker streams,
+# and it is the grid that the fold order follows, so this decides only WHO computes a partial.
+@inline function _red_chunk(nblk::Int, nw::Int, i::Int)
+    per = cld(nblk, nw)
+    b0 = (i - 1) * per + 1
+    b0 > nblk && return (1, 0)
+    return (b0, min(per, nblk - b0 + 1))
+end
+
+@noinline function _dot_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    @inbounds for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        # The UNCHANGED kernel on this block. Its length is the block's, never the worker's share — a
+        # block is the unit the fold order is defined over, so a worker computing several of them must
+        # still reduce each one separately or the grouping changes with `nw`.
+        prt[b] = _dot_simd(len, p.Ap + off * sz, p.Bp + off * sz, T)
+    end
+    return nothing
+end
+
 @noinline function _axpy_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _l1_chunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -4455,6 +4512,15 @@ end
             _trsm!(true, up, tA, cA, unit, alpha, A, C)
         elseif kind == _MT_KIND_TRSMR
             _trsm!(false, up, tA, cA, unit, alpha, A, C)
+        elseif kind == _MT_KIND_DOT
+            # A loser reduces the WHOLE vector LOCALLY and returns it, touching no shared state. The
+            # blocked form uses the same grid and the same index-order fold the winner's workers and
+            # driver would have, so the two agree bit-for-bit.
+            #
+            # IT MUST NOT USE THE PARTIALS BUFFER. That buffer is the pool's, shared, and sized only
+            # under the claim — a loser writing it would race the winner's workers, and with 24
+            # concurrent callers losing is the common case, not the rare one.
+            return _dot_blocked(A.m, A.ptr, B.ptr, T)
         elseif kind == _MT_KIND_AXPY
             # A loser does the whole vector, so its own length IS the route width — `nroute` stays -1,
             # the same reasoning as gemm's and trsm's fallbacks. This reaches the identical kernel arm
@@ -4471,7 +4537,7 @@ end
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
         end
-        return nothing
+        return zero(T)
     end
     # SIZE THE SHARED BUFFER HERE — AFTER THE CLAIM, NOT BEFORE IT. The pool grows by
     # `push!`/`resize!`, and doing that before winning `busy` lets two large callers race on the same
@@ -4520,6 +4586,7 @@ end
     ct.sticky = true
     Base.sigatomic_begin()
     joined = false
+    red = zero(T)                # a reduction kind folds into this inside the claim; see the join below
     # TWO FLAGS, BECAUSE THE CLAIM HAS TWO RELEASE CONDITIONS. `joined` says the join finished, so no
     # worker holds `C.ptr` any more. `published` says a job generation was stored, which is the instant
     # a worker can start: before it, the pool holds nobody and the claim is safe to hand back; after
@@ -4533,6 +4600,9 @@ end
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
         # storage the winner's workers already hold pointers into.
         (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
+        # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
+        # inside a published job, and a loser that grew it could move storage a winner is writing.
+        kind == _MT_KIND_DOT && _red_prefit!(T, cld(A.m, _red_block(T)))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -4595,6 +4665,24 @@ end
             joined = true
         end
         (@atomic p.failed) && _throw_gemm_worker()
+        # FOLD A REDUCTION HERE, INSIDE THE CLAIM. It cannot wait until after the `finally` below: that
+        # releases `busy`, and the next caller's driver resizes and rewrites the very slots this fold
+        # reads. Here the job is joined (no worker is writing) and the claim is still held (no other
+        # caller can be), which is the only window where both are true.
+        #
+        # The fold is the DRIVER's, over block INDEX, sequentially — never a worker's. That is what makes
+        # the worker count decide who computes a partial and never how the partials combine, which is the
+        # whole of req#11 for a reduction.
+        if kind == _MT_KIND_DOT
+            blk = _red_block(T)                 # NOT `B` — that is this function's third argument
+            nblk = cld(A.m, blk)
+            prt = _red_partials(T)
+            s = zero(T)
+            @inbounds for b in 1:nblk
+                s += prt[b]
+            end
+            red = s
+        end
     finally
         # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
         # flags answer it between them.
@@ -4618,7 +4706,7 @@ end
         ct.sticky = was_sticky
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
-    return nothing
+    return red
 end
 
 # ── THREADED BLAS-1 ENTRY ───────────────────────────────────────────────────────────────────────────
@@ -4643,6 +4731,19 @@ end
 @noinline function _axpy_threaded!(n::Int, a::T, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x y _axpy_threaded!(n, a, pointer(x), pointer(y), nw)
     return y
+end
+
+# THREADED REDUCTION. The driver returns the fold, computed inside the claim — see the note at the join
+# for why it cannot be done by the caller after the driver returns. Both operands ride as n×1
+# `PtrMatrix`; `A` is x and `B` is y, and `A.m` is the length the block grid is cut from.
+@noinline function _dot_threaded(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(y, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_DOT
+    )
+end
+@noinline function _dot_threaded(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x y _dot_threaded(n, pointer(x), pointer(y), nw)
 end
 
 function gemm!(

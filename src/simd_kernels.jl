@@ -1099,6 +1099,19 @@ worker count, which is the entire point; see the note above for why the unblocke
 @inline function _dot_blocked(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
     B = _red_block(T)
     n <= B && return _dot_simd(n, x, y, T)      # one block: the unchanged kernel, no fold at all
+    # THREAD IT if the pool is on and there is work for two workers. One atomic read and a compare when
+    # threading is off, as at `_axpy!`. The threaded path folds the SAME block grid in the SAME index
+    # order as the loop below, so the two are bit-identical — which req#11 requires of n = 1 against any
+    # other n. Two streams, so the working set is 2·n·sizeof(T).
+    # ⚠ EACH WORKER NEEDS AT LEAST TWO BLOCKS, or the RAGGED LAST BLOCK sets the critical path. The block
+    # grid is coarse by design (B is large so the per-block fold is under 1%), so at small n the tail is a
+    # large fraction of a block and one worker finishes long before another. Measured at n = 10000, where
+    # the grid is exactly two blocks of 8192 and 1808: the long block is 82% of the work, which caps the
+    # speedup at 1.22x before the join is paid, and the cell measured 0.85x — turning a PASSING gate cell
+    # (1.004) into a failing one. `nblk ÷ 2` declines that case and costs nothing above it.
+    let nblk = cld(n, B), nw = min(_l1_workers(2 * n * sizeof(T), n, T), nblk ÷ 2)
+        nw > 1 && return _dot_threaded(n, x, y, nw)
+    end
     s = zero(T)
     i = 0
     GC.@preserve x y begin
