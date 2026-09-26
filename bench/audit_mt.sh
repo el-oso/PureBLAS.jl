@@ -10,18 +10,34 @@
 # independently. Widening the default glob would couple them, and the first coupled failure would be
 # read as a serial regression. So the scripts take explicit files, and this is the file list.
 #
-# THROTTLE DETECTION DOES EXIST HERE, and step 3 is the whole reason this chain matters. Six cores
-# running a memory-bound kernel pull the package clock DOWN, which one core never does — and that is
-# not a hypothetical. Measured on `mt_data_avx512_wintermute`, L1/axpy@1000000:
+# THROTTLE DETECTION DOES EXIST HERE, and step 3 is the whole reason this chain matters. Measured on
+# `mt_data_avx512_wintermute`, L1/axpy@1000000:
 #
 #     aocl_mt / openblas_mt   2013 MHz   (in-window 1917 … 2675)
 #     pb / pb_mt              2795 MHz   (in-window 2794 … 2795)
 #
-# The clock sample is shared by the arms timed in one window, so the THREADED reference window fell
-# 28% below the lock while the PB window held it — PB does not thread `axpy`, so it ran one core. The
-# ratio at that cell therefore compares two machine states, which the frequency rule calls INVALID
-# rather than noisy. Fleet-wide: 204/937 cells on wintermute (worst 45.9%), 7/937 on galen, 0 on
-# neuromancer. The error FLATTERS PureBLAS — a throttled reference is a slower reference.
+# The clock sample is shared by the arms timed in one window, so the THREADED reference window ran 28%
+# below the lock while the PB window held it — PB does not thread `axpy`, so it ran one core. The ratio
+# at that cell compares two machine states, which the frequency rule calls INVALID rather than noisy.
+# Fleet-wide: 204/937 cells on wintermute (worst 45.9%), 7/937 on galen, 0 on neuromancer. The error
+# FLATTERS PureBLAS — a throttled reference is a slower reference.
+#
+# THE MECHANISM IS CACHE-RESIDENT POWER, NOT MEMORY TRAFFIC. Reproduced with a plain 6-thread Julia
+# axpy on this box, minimum over the working cores against a 2813000 kHz setpoint:
+#
+#     L1-resident   32 KB   2632366   -6.4%
+#     L2-resident  512 KB   2726951   -3.1%
+#     L3-resident    8 MB   2299687   -18.2%     <- axpy@1e6 is 8 MB: this cell
+#     DRAM         640 MB   2793602   -0.7%
+#
+# A DRAM-bound loop is memory-STALLED and draws little power, so it barely moves the clock; a
+# cache-resident one retires work continuously on six cores and does. Two alternatives were tested and
+# FALSIFIED: an idle or blocked core reporting low (it reports the SETPOINT — measured 2813000 while
+# the main thread slept and workers spun), and DRAM-bound traffic (0.7%). Do not re-chase either.
+#
+# FORWARD CONSEQUENCE for the campaign: once PureBLAS threads `axpy`/`dot`, ITS window will throttle
+# the same way, and the comparison becomes fair. Today it is a throttled reference against an
+# unthrottled serial PB.
 #
 # What is genuinely absent is the per-cell IN-WINDOW check for the pb_mt arm: its clock is sampled
 # from /proc/self/stat field 39, the MAIN thread's CPU, which spins then yields while the workers
