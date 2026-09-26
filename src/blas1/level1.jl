@@ -136,7 +136,7 @@ end
 
 # Unconjugated dot (BLAS ?dot / ?dotu).
 @inline function _dotu(n::Integer, x, incx::Integer, y, incy::Integer)
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_blocked(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(false))
     # Dual vectors (ForwardDiff extension loaded): the complex dot body under the dual multiply rule; it hands
     # back (value, partial) and `_mkpair` builds the Dual with x's own tag. dotc is the same (no conj on a Real).
@@ -146,7 +146,7 @@ end
 
 # Conjugated dot (BLAS ?dotc). For real T this equals `_dotu`.
 @inline function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_blocked(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(true))
     (incx == 1 && incy == 1 && _pair2(x, y)) && return _mkpair(_et(x), _dot_pair_simd(Val(:dual), Int(n), x, y, _pairv(x), Val(false))...)
     return _dot_generic(n, x, incx, y, incy, true)

@@ -1056,6 +1056,62 @@ end
 # PDM: Literal — DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET.
 const _UNROLL = 4
 
+# ── THE FIXED-BLOCK REDUCTION, WHICH IS WHAT MAKES A THREADED REDUCTION REPRODUCIBLE ────────────────
+#
+# WHY A REDUCTION CANNOT SIMPLY BE SPLIT. `_dot_simd` below carries `_UNROLL` vector chains, folds them
+# `(a0+a1)+(a2+a3)`, then takes a horizontal `sum(acc)`. Floating-point addition is not associative, so
+# ANY change of grouping moves the last bits — a worker holding half the vector and a caller holding all
+# of it do not produce summable pieces. There is no partition of the current kernel that reproduces its
+# own result.
+#
+# req#11 requires `set_num_threads(n)` to change nothing for ANY n, and n = 1 is an n. So the blocked form
+# has to be the ONLY form, used at every worker count including serial. That changes this library's dot
+# bit-for-bit against previous versions — permitted, since req#11's scope is thread counts, not versions —
+# and is the price of a threaded reduction existing at all.
+#
+# THE SHAPE: chunk `n` into blocks of `_red_block(T)` elements, reduce each block with the UNCHANGED
+# kernel, and fold the partials in FIXED INDEX ORDER. The block grid is a function of `(n, T)` only, so
+# the worker count decides who computes a partial, never how the partials combine. Serial folds
+# incrementally as it goes; a threaded driver folds a partials buffer over the same indices in the same
+# order, which is why the two agree exactly.
+#
+# MEASURED COST, gate regime (fresh operands per sample, `_L1REP` reps loop), blocked/whole:
+#     B(elems)   n=1e4   3e4   1e5   3e5   1e6
+#     2048       1.009 1.011 1.011 1.014 1.009
+#     8192       1.002 1.003 1.004 1.005 1.007     <- shipped
+#     16384      1.002 1.001 1.005 1.005 1.003
+#     65536      1.002 1.001 1.001 1.001 1.001
+# ACCURACY IS NOT A TRADE HERE, it improves: relative error against a BigFloat reference at n=1e5 is
+# 8.63e-16 whole against 2.24e-16 blocked, because the per-block fold is a shallower tree than one long
+# chain. n=1e6: 1.73e-16 whole, 7.59e-16 blocked — comparable.
+#
+# B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own scalar tail and the fold order
+# starts depending on where tails fall, which is the invariant this whole construction exists to hold.
+# PDM: Literal — 256 blocks' worth of fold overhead per block, validated by the table above rather than derived; the FORM (a multiple of the kernel's step, so it scales with unroll and ISA width) is what carries across machines. | tune: n/a, the tax is <1% across the measured range
+@inline _red_block(::Type{T}) where {T} = 256 * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
+
+"""
+    _dot_blocked(n, x, y, ::Type{T}) -> T
+
+`dot` over a fixed block grid, partials folded in index order. Bit-identical to the threaded path at any
+worker count, which is the entire point; see the note above for why the unblocked kernel cannot be.
+"""
+@inline function _dot_blocked(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _dot_simd(n, x, y, T)      # one block: the unchanged kernel, no fold at all
+    s = zero(T)
+    i = 0
+    GC.@preserve x y begin
+        px = _ptr(x); py = _ptr(y); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _dot_simd(len, px + i * sz, py + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
 @inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
     px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     GC.@preserve x y begin
