@@ -78,6 +78,27 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 # PDM: Derived — 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | tune: n/a, follows gemm
 const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) ÷ 2)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
+
+# The rank-k split, for `_syrk_rec!` and `_syr2k_acc!` ONLY. It rounds the halving DOWN to a whole
+# SME tile, because an off-diagonal block that is not tile-exact is judged by `_sme_tile_ok`'s ragged
+# arm, whose floor is `_SME_MIN` rather than `_SME_MIN_EXACT` — so a block can be large enough to
+# want the coprocessor and still be sent to NEON purely for being an odd width. Measured on an M6:
+# n=144 halves to 72, which is not a multiple of 16 and sits under the 96 ragged floor, and the
+# recursion then LOST to the packed path by 1.43x at that one size while winning 1.2-2.9x at every
+# neighbouring size. Rounding gives 64+80, both tile-exact, and the anomaly goes.
+#
+# The two halves become unequal by less than one tile, which the recursion already tolerates — it
+# splits `n - h` independently and never assumes balance.
+#
+# DELIBERATELY NOT `_trsplit` ITSELF: that one is shared with `_trmm_left!`, `_trmm_right_recur!`,
+# `_trsm_left!` and `_trsm_right!`, whose blocks feed different kernels with different granularity,
+# and whose behaviour on the AMD fleet is not what this measurement covers.
+@inline function _rksplit(k::Int)
+    h = k ÷ 2
+    (_SME_F64 && h >= 2 * _SME_MR) || return h
+    hg = (h ÷ _SME_MR) * _SME_MR
+    return hg >= _SME_MR ? hg : h
+end
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
 # off-diagonal update C += op(A)·B — straight to the dispatch core (skip gemm!'s kwarg/check layer;
@@ -6725,14 +6746,36 @@ end
 #     via gemm  46.8   80.7  121.4  138.4  203.0  226.5
 #     ratio     0.92   1.44   2.04   2.30   3.31   3.80
 #
-# The packed path is flat because it cannot reach the coprocessor at all. Below the cut the split
-# is noisy and sometimes loses (n=144 at 0.68, n=272 at 0.97), so this sits where every measured
-# point wins by at least 1.7x rather than at the first point that wins at all.
+# The packed path is flat because it cannot reach the coprocessor at all.
+#
+# THE CUT IS THE GEOMETRY OF THE FIRST SPLIT, not a fitted size. `_rksplit` halves n onto a whole
+# SME tile, so the first off-diagonal block is tile-exact and `_sme_tile_ok` judges it by
+# `_SME_MIN_EXACT`; the block is `max(h, n-h)`, which clears that floor exactly when
+# `n >= 2 * _SME_MIN_EXACT`. Below it the recursion's own first product cannot reach the
+# coprocessor and there is nothing for the route to win with.
+#
+# Measured on an M6, recursion time / packed time, one thread — lower is better, and the boundary
+# is where the derivation puts it:
+#
+#     n        64    80    96   112   128   144   160   192   224   256   272   320
+#     rec/pack 0.81  0.67  0.61  0.55  0.52  0.53  0.50  0.44  0.40  0.38  0.36  0.34
+#
+# The 24x cut this replaces was derived before two fixes that changed the trade: the leaf now fills
+# its borrow (`_SYRK_DBASE`), and the split lands on a tile (`_rksplit`). The n=144 and n=272
+# anomalies its comment recorded were the unaligned split, not noise — they reproduced to two
+# decimals and disappeared when the split was aligned.
+#
+# WHAT THIS DOES NOT REACH, so nobody re-derives it expecting more: aligning `h` does not align
+# `n - h`, so a RAGGED n still hands its first block a ragged width and that block is judged by the
+# `_SME_MIN` floor again. n=100 splits 48+52 and misses, where n=128 splits 64+64 and does not.
+# Measured against Accelerate, pb/accel: n=128 went 0.13 -> 0.26 and n=256 0.15 -> 0.41, while
+# n=100 moved only 0.13 -> 0.14. Nothing regressed, so the low cut is safe; closing the ragged
+# sizes needs a kernel that takes a non-tile-multiple shape, not another cutoff.
 #
 # APPLIES ONLY WHERE SME IS PRESENT. Off it, `_SME_F64` is false and the packed path keeps every
 # size, which is the measured-correct behaviour on the AMD fleet.
-# PDM: Measured — the size at which a route that reaches the coprocessor overtakes one that cannot; it turns on the ratio between two kernels' throughput, which no cache size predicts. | tune: sweep
-const _SYRK_SME_MIN = @load_preference("syrk_sme_min", 24 * _SME_MR)::Int
+# PDM: Derived — the first split's off-diagonal block must clear the tile-exact floor: 2 x _SME_MIN_EXACT. | tune: n/a, follows the tile
+const _SYRK_SME_MIN = @load_preference("syrk_sme_min", 2 * _SME_MIN_EXACT)::Int
 
 @inline _syrk_prefer_packed(::Type{T}, n::Int) where {T} =
     n > _fh_syrk_pack_cut() && !(_SME_F64 && T === Float64 && n >= _SYRK_SME_MIN)
@@ -6803,7 +6846,7 @@ function _syrk_rec!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int, scr, off::
         _add_tri!(view(C, (off + 1):(off + n), (off + 1):(off + n)), tmp, up, herm, n)
         return C
     end
-    h = _trsplit(n)
+    h = _rksplit(n)
     _syrk_rec!(up, tr, herm, α, A, C, k, scr, off, h)
     _syrk_rec!(up, tr, herm, α, A, C, k, scr, off + h, n - h)
     Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
@@ -7432,7 +7475,7 @@ function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr, o
         end
         return C           # NOT `return _add_tri!(...)`: that returns the SubArray, making the
     end                    # recursion's return type Union{Matrix,SubArray} — boxes at every level
-    h = _trsplit(n)
+    h = _rksplit(n)
     _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off, h)
     _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off + h, n - h)
     Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
