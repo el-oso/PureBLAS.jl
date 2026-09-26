@@ -112,7 +112,12 @@ lvlof(l) = l in ("L1", "CL1") ? "BLAS-1" : l in ("L2", "CL2") ? "BLAS-2" : l in 
 # It is also why DL1 gets its OWN section rather than extra rows under BLAS-1: a Dual ratio is measured
 # against a different, much weaker bar, and putting it in the same table as the vendor-BLAS rows would
 # read as a gate verdict it is not.
-_refarms(l) = startswith(l, "DL") ? ("generic",) : ("openblas", "aocl")
+#
+# The non-DL arm list also has to follow the THREAD TIER, for the same reason: a `mt_data_*` cell
+# carries `pb_mt` against `openblas_mt`/`aocl_mt` and none of the serial names, so a fixed literal
+# would skip every threaded cell exactly as it once skipped every DL1 cell. `arm_pair` reads the
+# tier off the cell (gatecrit.jl) and returns only the references that cell actually holds.
+_refarms(l, d) = startswith(l, "DL") ? ("generic",) : Tuple(last(arm_pair(d)))
 
 # ONE COLUMN PER MICROARCHITECTURE. A single pooled verdict answers "does this routine gate SOMEWHERE",
 # which is the wrong question — the gate is per box. Pooling also makes progress invisible in exactly the
@@ -121,6 +126,17 @@ _refarms(l) = startswith(l, "DL") ? ("generic",) : ("openblas", "aocl")
 # is readable straight off the row.
 cells = Dict{Tuple{String, String, String}, Vector{Tuple{Int, Float64}}}()  # (level, op, uarch) => [(size, gate)]
 const UARCH = String[]                                    # column order = the order caches were given
+# REFUSE A THREADED CACHE. Both coverage generators feed docs/src/coverage.md — this one through a
+# stdout splice, coverage_routing.jl by rewriting the file in place — and that document publishes the
+# SINGLE-THREADED gate. Handed an `mt_data_*` file, coverage_routing.jl silently rewrote 21 routing
+# rows with threaded ratios; nothing in its output said which tier the numbers came from. A threaded
+# table is a separate artifact with a separate chain, so this is a hard refusal rather than a warning.
+for p in ARGS
+    is_mt_cache(p) && error("coverage_ops: $(basename(p)) is a THREADED cache. docs/src/coverage.md \
+        publishes the single-threaded gate; a threaded table needs its own generator and its own \
+        audit chain. Pass plots_data_*.txt.")
+end
+
 for path in ARGS
     ua = "?"
     fref = 0
@@ -156,7 +172,8 @@ for path in ARGS
             _freq_offlock(_freq_of(_p), fref) && push!(drift, String(a) => _freq_of(_p))
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
-        haskey(d, "pb") || continue
+        pba = first(arm_pair(d))               # "pb", or "pb_mt" on a threaded cache — gatecrit.jl
+        haskey(d, pba) || continue
         # PROVENANCE: the commit the `pb` arm of THIS cell was measured at. Field layout per arm is
         # `arm|timestamp|commit|freq|…|csv`, so the commit is element 3. Collected per (level, op, uarch)
         # so the table can state, per row, the revision its numbers describe — which is the whole point
@@ -164,7 +181,7 @@ for path in ARGS
         # can see which is which instead of assuming the table is uniform.
         for f in p[4:end]
             _q = split(f, "|")
-            if _q[1] == "pb" && length(_q) >= 3
+            if _q[1] == pba && length(_q) >= 3
                 push!(get!(COMMITS, (lvlof(lvl), op, ua), String[]), String(_q[3]))
             end
         end
@@ -180,11 +197,11 @@ for path in ARGS
         # n=1e3 flipped verdict outright (round-pooled <1.0, gate 1.007). A published coverage table
         # that can say 🐢 where the gate says PASS is worse than no table.
         rs = Float64[]
-        for r in _refarms(lvl)
+        for r in _refarms(lvl, d)
             haskey(d, r) || continue
-            m = min(length(d[r]), length(d["pb"]))
+            m = min(length(d[r]), length(d[pba]))
             m == 0 && continue
-            push!(rs, med([d[r][i] / d["pb"][i] for i in 1:m]))
+            push!(rs, med([d[r][i] / d[pba][i] for i in 1:m]))
         end
         isempty(rs) && continue
         push!(get!(cells, (lvlof(lvl), op, ua), Tuple{Int, Float64}[]), (sz, minimum(rs)))  # vs the FASTER ref

@@ -11,6 +11,7 @@
 #
 #   julia bench/failing.jl bench/plots_data_avx512_wintermute.txt [more caches...]
 using Statistics
+include(joinpath(@__DIR__, "gatecrit.jl"))   # arm_pair — which arms this cell's tier compares
 for path in ARGS
     cells = Tuple{String, String, Int, Float64, String, Bool}[]
     host = "?"
@@ -24,20 +25,20 @@ for path in ARGS
             _p = split(fld, '|'); a, ts, s = _p[1], _p[2], _p[end]
             d[a] = parse.(Float64, split(s, ',')); stamps[a] = ts
         end
-        haskey(d, "pb") || continue
-        tp = median(d["pb"])
-        rs = [(r, median(d[r]) / tp) for r in ("openblas", "aocl") if haskey(d, r)]
-        isempty(rs) && continue
+        pba, refs = arm_pair(d)                # serial or threaded, read from the cell — gatecrit.jl
+        (haskey(d, pba) && !isempty(refs)) || continue
+        tp = median(d[pba])
+        rs = [(r, median(d[r]) / tp) for r in refs]
         r, g = rs[argmin(last.(rs))]
         g < 1.0 || continue
-        crossrun = any(stamps[a] != stamps["pb"] for a in keys(stamps))
+        crossrun = any(stamps[a] != stamps[pba] for a in keys(stamps))
         push!(cells, (p[1], p[2], parse(Int, p[3]), g, r, crossrun))
     end
     sort!(cells; by = c -> c[4])
     println("\n", "="^88, "\n", host, " — ", length(cells), " failing cells (worst first; `~` = arms measured across runs)\n", "="^88)
     for (lvl, op, n, g, r, xr) in cells
         println(rpad(lvl, 5), rpad(op, 11), rpad("n=$n", 11), rpad(round(g; digits = 3), 8),
-                "vs ", rpad(r, 10), xr ? "~" : "")
+                "vs ", rpad(r, 14), xr ? "~" : "")
     end
     byop = Dict{String, Float64}()
     for (_, op, _, g, _, _) in cells

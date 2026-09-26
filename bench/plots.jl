@@ -354,6 +354,21 @@ struct ArmRec
     # 0,0 for records written before this field existed (treated as "unknown", never as 0 Hz).
     flo::Int
     fhi::Int
+    # WHICH SAMPLER produced `flo`/`fhi`, and therefore whether they can be checked for a threaded
+    # throttle. `"core"` is the main thread's core alone — the core under test for a serial window, an
+    # idling spectator for a threaded one, since the pool driver spins then yields while its workers
+    # work. `"threads"` is the min/max over the RUNNING cores of this process's own threads, so the
+    # minimum is a working core.
+    #
+    # PER ARM, NOT PER HEADER, and that is the whole point of this field. A header stamp is rewritten by
+    # any targeted `op=`/`group=` merge while the file's other cells keep their old ranges, so it would
+    # claim a sensitivity those cells do not have — the same per-row provenance hazard
+    # `coverage_ops.jl` documents for `julia=`/`llvm=`. Per arm, a cache can hold both kinds honestly
+    # and each consumer decides per record.
+    #
+    # `"core"` for every record written before this field existed, which is the correct reading: those
+    # ranges ARE single-core samples.
+    span::String
     q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
 end
 const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
@@ -369,7 +384,8 @@ function _stamp(acc::ArmData)
     lo, hi = _khz_range!()          # observed across THIS cell's windows; resets for the next cell
     return CellData(
         a => ArmRec(
-            Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi, q
+            Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi,
+            _ANY_MT ? "threads" : "core", q
         ) for (a, q) in acc
     )
 end
@@ -409,6 +425,79 @@ function _cell_khz()
     catch
         0
     end
+end
+
+# THE THREADED SAMPLER. `_cell_khz` reads the core the MAIN thread is on, which is the core under test
+# for a serial window and an idling spectator for a threaded one: the pool driver spins then yields
+# while its workers do the work. So a threaded `pb_mt` window records the lock and can never be flagged
+# — measured on mt_data_avx512_wintermute, 0 of 937 cells.
+#
+# The workers are threads of THIS process, and so are OpenBLAS's and AOCL's, so `/proc/self/task/*/stat`
+# field 39 names every core actually in use. Reading each one's `scaling_cur_freq` and keeping the
+# EXTREMES gives a range that a package power limit shows up in.
+#
+# ONLY THREADS IN STATE `R` COUNT, and that filter is the difference between a signal and noise. A
+# PARKED thread's core reads LOW, not the setpoint, so a minimum over every thread reports a throttle on
+# a serial arm that cannot possibly have one — measured in a live `arms=pb,pb_mt` run, the serial `pb`
+# arm recorded flo 2475745 against a 2813000 setpoint, 12% down, with one thread doing the work.
+# Filtering `/proc/<tid>/stat` field 3 to `R` separates them cleanly, same box, axpy over 8 MB:
+#
+#                       every thread        RUNNING only
+#     serial            2784997  -1.0%      2793382  -0.7%
+#     6 threads         2083225 -25.9%      2261582 -19.6%
+#
+# (An earlier control claimed a blocked core reads the SETPOINT. It does — but only while its siblings
+# are SPINNING and keeping the package awake. Genuinely parked threads are the case that matters and
+# they read low. Do not re-derive that the unfiltered minimum is usable.)
+#
+# WHAT IT CATCHES, reproduced with a 6-thread Julia axpy against a 2813000 kHz setpoint: L1-resident
+# 32 KB -6.4%, L2-resident 512 KB -3.1%, L3-resident 8 MB -18.2%, DRAM 640 MB -0.7%. The signal is
+# cache-resident POWER, not memory traffic — a DRAM-bound loop is memory-stalled and draws little. The
+# single-core sampler reads -0.6% for every one of those, i.e. it sees none of it.
+#
+# COST, and why this is gated rather than universal: 522us against 33us for the single-core read, 16x.
+# Two samples per arm window over a full sweep is ~31s a box, which is 0.6% of a ~90 minute run — but
+# it also touches 15 files between windows, and a tiny-n cell's timing is cache-sensitive enough that
+# perturbing the serial gate for data it does not need would be the wrong trade. Threaded runs pay it;
+# serial runs keep the single read and are byte-for-byte unaffected.
+function _cell_khz_span()
+    lo = typemax(Int); hi = 0
+    try
+        seen = Set{Int}()
+        for d in readdir("/proc/self/task")
+            fs = try
+                split(read("/proc/self/task/$(d)/stat", String))
+            catch
+                continue                         # thread exited between readdir and read — normal
+            end
+            length(fs) >= 39 || continue
+            fs[3] == "R" || continue             # RUNNING only — a parked thread's core reads low
+            c = something(tryparse(Int, fs[39]), -1)
+            c < 0 && continue
+            c in seen && continue
+            push!(seen, c)
+            f = "/sys/devices/system/cpu/cpu$(c)/cpufreq/scaling_cur_freq"
+            isfile(f) || continue
+            v = something(tryparse(Int, strip(read(f, String))), 0)
+            v > 0 || continue
+            lo = min(lo, v); hi = max(hi, v)
+        end
+    catch
+        return (0, 0)                            # no cpufreq (ARM) — degrades to "unknown", never off-lock
+    end
+    return hi == 0 ? (0, 0) : (lo, hi)
+end
+
+# The one call the measurement loops make. A threaded run widens the observed range to every core its
+# own threads sat on; a serial run keeps the single-core read it has always taken.
+function _khz_sample!()
+    if _ANY_MT
+        lo, hi = _cell_khz_span()
+        _khz_obs!(lo); _khz_obs!(hi)
+    else
+        _khz_obs!(_cell_khz())
+    end
+    return nothing
 end
 # Measured ONCE per run, lazily, on the first cell stamped — not at save time. Save time is the END of a
 # sweep that can run for hours, and the point of the field is to describe the machine while the arms were
@@ -698,9 +787,9 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
                 # the field was present, the samples were never taken, and `cellcycles.jl` correctly
                 # reported `wobble ?` for cells that had in fact just been measured. If a third
                 # measurement path is ever added it needs these two calls too.
-                _khz_obs!(_cell_khz())
+                _khz_sample!()
                 b = @be mk(s) (c -> w(c, reps)) evals = 1 samples = samples seconds = seconds
-                _khz_obs!(_cell_khz())
+                _khz_sample!()
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
@@ -787,7 +876,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                 # range, so a cell that drifted mid-measurement says so instead of silently reporting a
                 # single number that was never true. Two /sys reads per arm-round against a ≥0.5 s
                 # window is unmeasurable overhead.
-                _khz_obs!(_cell_khz())
+                _khz_sample!()
                 b = @be [mk(s) for _ in 1:reps] (
                     cs -> (
                         v = 0.0; for c in cs
@@ -795,7 +884,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                         end; v
                     )
                 ) evals = 1 samples = samples seconds = secs
-                _khz_obs!(_cell_khz())
+                _khz_sample!()
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
@@ -2469,6 +2558,9 @@ function save_cache(path, groups)
             # ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its
             # base clock. See `_lock_state`.
             "\tanchor=$(round(anc * 1.0e6; digits = 3))us\tfreq=$(khz)kHz",
+            # (Which sampler produced `flo|fhi` is recorded PER ARM, in `ArmRec.span`, not here — a
+            # header stamp is rewritten by every targeted merge while the file's other cells keep their
+            # old ranges, so it would claim a sensitivity those cells do not have.)
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
@@ -2494,7 +2586,7 @@ function save_cache(path, groups)
             # rather than `limit = 4`. That invariant is the extension mechanism — append before the
             # csv, never after it.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(rec.span)|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -2552,8 +2644,13 @@ function load_cache(path)
             # unknown as "cannot verify the window was pinned", which is exactly what those cells are.
             flo = length(p) >= 8 ? something(tryparse(Int, p[6]), 0) : 0
             fhi = length(p) >= 8 ? something(tryparse(Int, p[7]), 0) : 0
-            cell[String(a)] =
-                ArmRec(String(tstamp), String(cmt), anc, khz, flo, fhi, parse.(Float64, split(csv, ",")))
+            # 9-field records name the SAMPLER that produced flo/fhi. An 8-field record's p[8] is the
+            # csv, so the check is `>= 9` and not `>= 8`; anything older is a single-core sample, which
+            # is what "core" means — not a missing value to be guessed at.
+            span = length(p) >= 9 ? String(p[8]) : "core"
+            cell[String(a)] = ArmRec(
+                String(tstamp), String(cmt), anc, khz, flo, fhi, span, parse.(Float64, split(csv, ","))
+            )
         end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)

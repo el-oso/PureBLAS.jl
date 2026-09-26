@@ -96,20 +96,28 @@ function roundratios(qref, qpb)
     return [med([qref[(r - 1) * QN + i] / qpb[(r - 1) * QN + i] for i in 1:QN]) for r in 1:n]
 end
 
+# THE ARM PAIR COMES FROM gatecrit.jl, keyed on whether this cache is threaded. A `mt_data_*` file
+# carries `pb_mt` against `openblas_mt`/`aocl_mt` and none of the serial arms, so the names cannot be
+# spelled here — hardcoding them is exactly why this tool reported zero cells on a threaded cache
+# whose three arms were all present.
 rows = []
-for path in ARGS, (lvl, op, sz, d, com) in cells(path)
-    haskey(d, "pb") || continue
-    refs = [r for r in ("openblas", "aocl") if haskey(d, r)]
-    isempty(refs) && continue
-    best = ""; worst = Inf; spread = 0.0
-    per = Dict{String, Float64}()              # EVERY reference, not just the binding one — see below
-    for r in refs                              # the gate is vs the FASTER reference at THIS cell
-        rr = roundratios(d[r], d["pb"]); isempty(rr) && continue
-        m = med(rr); per[r] = m
-        m < worst && (worst = m; best = r; spread = (maximum(rr) - minimum(rr)) / m)
+for path in ARGS
+    mt = is_mt_cache(path)
+    pba = pb_arm(mt)
+    for (lvl, op, sz, d, com) in cells(path)
+        haskey(d, pba) || continue
+        refs = [r for r in ref_arms(mt) if haskey(d, r)]
+        isempty(refs) && continue
+        best = ""; worst = Inf; spread = 0.0
+        per = Dict{String, Float64}()          # EVERY reference, not just the binding one — see below
+        for r in refs                          # the gate is vs the FASTER reference at THIS cell
+            rr = roundratios(d[r], d[pba]); isempty(rr) && continue
+            m = med(rr); per[r] = m
+            m < worst && (worst = m; best = r; spread = (maximum(rr) - minimum(rr)) / m)
+        end
+        pbc = get(com, pba, "?")
+        isfinite(worst) && push!(rows, (worst, spread, lvl, op, sz, best, basename(path), per, pbc))
     end
-    pbc = get(com, "pb", "?")
-    isfinite(worst) && push!(rows, (worst, spread, lvl, op, sz, best, basename(path), per, pbc))
 end
 
 sort!(rows; by = first)
@@ -119,11 +127,28 @@ println("cells=", length(rows), "  below gate (round2sig < 1.00)=", length(fails
 # FREQUENCY PROVENANCE, printed unconditionally — a report that says nothing about the clock reads as
 # "the clock was fine", which is precisely the claim a backfilled cache cannot support.
 for (f, ref, bf) in FREQMETA
-    println("  freq ref ", rpad(replace(f, "plots_data_" => "", ".txt" => ""), 22),
+    # THIS FILE'S off-lock check cannot judge a threaded cache, and saying nothing would read as a
+    # clean bill of health. `_freq_offlock` flags clocks ABOVE the header, and the pb_mt sample comes
+    # from /proc/self/stat field 39 — the MAIN thread's CPU, which spins then yields while the
+    # workers work, so it reads at or below the lock. Measured here: 0 of 937 pb_mt cells can ever be
+    # flagged (min 2760348 kHz, max 2813000, header 2813000).
+    #
+    # That is NOT the same as "a threaded cache carries no clock evidence", and the cells below can be
+    # badly wrong for a clock reason this tool will not show. The arms timed in one window SHARE a
+    # clock sample, and the threaded reference window can fall far below the lock while the PB window
+    # holds it — L1/axpy@1000000 on wintermute: aocl_mt/openblas_mt 2013 MHz against pb/pb_mt 2795,
+    # a 28% gap, because PB does not thread axpy and ran one core. 204 of 937 cells on that box are
+    # mismatched this way, worst 45.9%, and the error FLATTERS PureBLAS. `bench/check_arm_clocks.sh`
+    # is the cross-arm check that finds them and `bench/audit_mt.sh` runs it; read that before
+    # treating any number here as a verdict.
+    println("  freq ref ", rpad(replace(f, "plots_data_" => "", "mt_data_" => "", ".txt" => ""), 22),
+        is_mt_cache(f) ? "THREADED — no in-window check (idle main thread); run bench/audit_mt.sh for " *
+            "the cross-arm clock check, which DOES fire on these caches" :
         ref == 0 ? "(none in header — no cell can be judged off-lock)" :
         string(ref, "kHz", bf ? "  BACKFILLED from the run header: per-cell clocks are NOT measured " *
             "samples, so no cell in this cache can be flagged" : "  (header achieved clock; cells >1% above it are excluded)"))
 end
+
 # BOTH REFERENCES ARE PRINTED, not just the binding one. The `ratio`/`vs` columns are the gate (worst
 # against the faster reference) — but reporting only that HIDES WHICH LIBRARY BINDS, and that is the
 # fact which tells you whether a caller inherits its callee's gap. Measured 2026-08-06, Zen3 n=32:
@@ -137,16 +162,19 @@ end
 # winner did not, which changes what "close this cell" even means.
 println("HEAD=$HEAD   (STALE(c) = the pb arm was measured at c, and src/ has changed since. Check the \
 legend below:\n             if nothing in that file list can reach this op, the number still stands.)")
-println("\n  gap    ratio  spread  cell                          vs        vs_OB   vs_AOCL  cache")
+println("\n  gap    ratio  spread  cell                          vs           vs_OB   vs_AOCL vs_ACC   cache")
 for (ratio, spread, lvl, op, sz, ref, f, per, pbc) in fails
     # a miss smaller than the cell's own round-to-round spread is not distinguishable from noise
     tag = (1.0 - ratio) <= spread ? "  <- within spread" : ""
     srcmoved(pbc) && (tag *= "  <- STALE($pbc)")
-    fmt(r) = haskey(per, r) ? rpad(round(per[r]; digits = 3), 8) : rpad("—", 8)
+    # One column per vendor, serial or threaded — a cell carries one tier or the other, never both.
+    col(rs...) = (i = findfirst(r -> haskey(per, r), rs);
+        isnothing(i) ? rpad("—", 8) : rpad(round(per[rs[i]]; digits = 3), 8))
     println(rpad(string(round(100 * (1 - ratio); digits = 1), "%"), 7),
         rpad(round(ratio; digits = 3), 7), rpad(round(spread; digits = 3), 8),
-        rpad("$lvl $op@$sz", 30), rpad(ref, 10), fmt("openblas"), fmt("aocl"),
-        replace(f, "plots_data_" => "", ".txt" => ""), tag)
+        rpad("$lvl $op@$sz", 30), rpad(ref, 13),
+        col("openblas", "openblas_mt"), col("aocl", "aocl_mt"), col("accelerate", "accelerate_mt"),
+        replace(f, "plots_data_" => "", "mt_data_" => "", ".txt" => ""), tag)
 end
 nnoise = count(r -> (1.0 - r[1]) <= r[2], fails)
 println("\n$(length(fails) - nnoise) of $(length(fails)) misses exceed their own round spread; ",
@@ -158,7 +186,7 @@ if !isempty(OFFLOCK)
     frequency lock\nwas floating and are NOT ADJUDICABLE. Re-measure them (`op=`/`group=`) and merge; the \
     rest of the\nsweep stands.")
     for (f, lvl, op, sz, drift) in OFFLOCK
-        println("  ", rpad("$lvl $op@$sz", 30), rpad(replace(f, "plots_data_" => "", ".txt" => ""), 22),
+        println("  ", rpad("$lvl $op@$sz", 30), rpad(replace(f, "plots_data_" => "", "mt_data_" => "", ".txt" => ""), 22),
             join(("$a=$(k)kHz" for (a, k) in drift), " "))
     end
 end
