@@ -1801,7 +1801,7 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 # ONLY Zen4: both cells IMPROVE on Zen3 and pass on Zen5, so this is a Zen4 cache behaviour at that
 # size and a 2-3% classical-kernel gap, not a structural cost of the shallower depth. Open work.
 #
-# PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: no calibrator yet (needs a threaded harness, same blocker as gemm_mt_work); candidates _NR*2^j over 128..2048
+# PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: no calibrator yet. The threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048
 # req8-ok: three-box gate table and a two-box threading table above; 2048 checked and rejected
 const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 @inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
@@ -3660,15 +3660,28 @@ end
 # is a pin — which is the user's tier, not the agent's. So this knob takes the tree's live shape: the
 # default is the one measurement on record, the candidates are named for a calibrator to duel.
 #
-# THE ONE MEASUREMENT ON RECORD (bench/probes/threading_forkjoin_cost.jl; Zen4, 4 workers,
-# freq-locked): a pool wake-to-join round trip of 616 ns under a 2796 MHz core clock. Both are HOST
-# FACTS recorded as such — neither is a tuning choice — and the default multiplies them back into the
-# core-cycles-per-join the formula consumes (1722; the retired literal rounded it to 1720). Zen3 and
-# Zen5 have NOT confirmed it. What this leaves, and it is the USER'S decision, not a code edit:
-#   * a `tune!()` calibrator for `gemm_mt_work` needs a THREADED measurement inside a harness whose gate
-#     runs single-threaded (bench/plots.jl pins `BLAS.set_num_threads(1)`) — a harness design question;
-#   * the trim build's pin list (juliac/build.jl) is the user's tier; no pin is added here. Unpinned,
-#     the shipped default is a plain const, so the `.so` is deterministic and trim-clean without one.
+# THE SHIPPED DEFAULT'S MEASUREMENT (Zen4, 4 workers, freq-locked): a pool wake-to-join round trip of
+# 616 ns under a 2796 MHz core clock. Both are HOST FACTS recorded as such — neither is a tuning choice
+# — and the default multiplies them back into the core-cycles-per-join the formula consumes (1722; the
+# retired literal rounded it to 1720).
+#
+# A CALIBRATOR NOW EXISTS: `calibrate_gemm_mt_work` in bench/calibrate.jl, reached by `tune!()`. It is
+# the only knob there that needs a THREADED process, and it DECLINES rather than guessing when given a
+# single-threaded one — which is why this knob shipped without one. It does not duel the candidate
+# ladder: it measures the fork-join round trip on THIS host with its own parked pool, mirroring the
+# protocol below, and feeds it through the same formula, because only the join is a host fact (the
+# amortisation ratio is policy, the FMA rate is detected). Cross-checked on the box the 616 ns came
+# from: 568 ns at 2791 MHz, 0.92x the shipped floor. A result outside the candidate bracket is REPORTED
+# rather than pinned — that bracket spans the spin-wake and sleep-wake regimes, so a join beyond it
+# means the measurement caught something other than the pool.
+#
+# It carries its OWN pool rather than including the probe that produced 616 ns because
+# `bench/probes/*.jl` is gitignored: that probe is not in the repository, so the single measurement the
+# shipped floor rests on cannot be reproduced from a checkout.
+#
+# STILL OPEN, and the USER'S decision rather than a code edit: Zen3 and Zen5 have not confirmed the
+# shipped number, and the trim build's pin list (juliac/build.jl) is the user's tier — no pin is added
+# here. Unpinned, the shipped default is a plain const, so the `.so` is deterministic and trim-clean.
 # PDM: Measured — recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default | tune: via gemm_mt_work
 const _MT_JOIN_NS_MEASURED = 616          # req8-ok: a recorded measurement, not a tuning choice; see the block above
 # PDM: Measured — the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) | tune: via gemm_mt_work
@@ -3687,7 +3700,7 @@ const _GEMM_MT_WORK_SHIPPED =
 # bracket is NOT derived — it spans the two measured protocol regimes (a spin wake at ~570 ns, a sleep
 # wake at ~4000 ns, same probe) and nothing detected bounds a fabric latency. Stated as such.
 const _GEMM_MT_WORK_CANDIDATES = ntuple(i -> (_GEMM_MT_WORK_SHIPPED >> 2) << (i - 1), 5)
-# PDM: Measured — the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | tune: no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped
+# PDM: Measured — the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | tune: calibrate_gemm_mt_work measures the fork-join round trip on host and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside the ¼×…4× bracket
 const _GEMM_MT_WORK_PREF = @load_preference("gemm_mt_work", nothing)
 const _GEMM_MT_WORK = something(_GEMM_MT_WORK_PREF, _GEMM_MT_WORK_SHIPPED)::Int   # req8-ok: shipped default until tune!() moves it
 

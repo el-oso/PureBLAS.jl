@@ -422,7 +422,115 @@ function calibrate_gemv_mr(::Type{T} = Float64) where {T}
     return Pair{String, Any}["gemv_mr" => name]
 end
 
+# ── gemm_mt_work: the amortisation floor below which threading cannot pay ───────────────────────────
+# NOT AN A/B DUEL, and the difference is the point. Every other calibrator here races candidate arms and
+# keeps the winner. This knob is a DERIVATION over one measured host fact — the pool fork-join round
+# trip — fed through the formula `src/blas3/gemm.jl` already ships:
+#
+#     floor_flops = (join_ns × clock_MHz ÷ 1000) × _MT_AMORTISE × _mt_flops_per_cycle(Float64)
+#                    └─ the join in core cycles ─┘   └ policy ┘    └─ detected FMA rate ─┘
+#
+# Only the join is a host measurement; the amortisation ratio is policy and the FMA rate is detected. So
+# racing floors would be racing a number we can compute from something directly measurable, and would
+# need a gemm size ladder straddling each candidate to tell them apart at all.
+#
+# WHY THIS CALIBRATOR HAS TO EXIST. The shipped default is ONE recording — Zen4, 616 ns at 2796 MHz —
+# and `gemm.jl` says plainly that Zen3 and Zen5 have not confirmed it. Worse, the probe that produced it
+# (`bench/probes/threading_forkjoin_cost.jl`) is NOT tracked: `bench/probes/*.jl` is gitignored, so the
+# single measurement the floor rests on cannot be reproduced from a checkout. Hence a self-contained
+# pool below rather than an include.
+#
+# WHAT IT MEASURES: the mechanism PureBLAS actually implements — a parked pool woken by a generation
+# word, workers spinning then waiting on an Event, the driver spinning then yielding on an atomic
+# arrival count. Zero work per worker, so the figure is the fixed price a threaded driver pays per call.
+# It deliberately does NOT drive `gemm!`: a real gemm cannot be made to thread at a size where compute
+# is negligible without pinning this very knob first.
+mutable struct _CalPool
+    @atomic gen::Int
+    @atomic done::Int
+    const evs::Vector{Threads.Event}
+end
+function _calpool_worker(p::_CalPool, i::Int, spins::Int)
+    seen = 0
+    while true
+        g = @atomic p.gen
+        t = 0
+        while g == seen && t < spins
+            t += 1
+            g = @atomic p.gen
+        end
+        g == seen && (wait(p.evs[i]); g = @atomic p.gen)
+        g < 0 && return nothing              # shutdown
+        seen = g
+        @atomic p.done += 1                  # the job is empty: this IS the round trip
+    end
+end
+function _calpool_join!(p::_CalPool, nw::Int, spins::Int)
+    @atomic p.done = 0
+    @atomic p.gen = (@atomic p.gen) + 1
+    for i in 1:nw
+        notify(p.evs[i])
+    end
+    t = 0
+    while (@atomic p.done) < nw
+        t += 1
+        t > spins && (yield(); t = 0)
+    end
+    return nothing
+end
+
+function calibrate_gemm_mt_work(::Type{T} = Float64) where {T}
+    nt = Threads.nthreads()
+    if nt < 2
+        println("  gemm_mt_work: DECLINED — a fork-join cost cannot be measured in a single-threaded " *
+                "process (Threads.nthreads()=$(nt)). Re-run `julia -t N`; this knob is the only one here " *
+                "that needs threads, which is why it had no calibrator.")
+        return Pair{String, Any}[]
+    end
+    nw = min(nt - 1, 5)                      # workers BESIDES the driver, capped as the pool caps itself
+    spins = 2048                             # PureBLAS `_MT_SPINS`
+    p = _CalPool(0, 0, [Threads.Event(true) for _ in 1:nw])
+    ws = [Threads.@spawn _calpool_worker(p, i, spins) for i in 1:nw]
+    _calpool_join!(p, nw, spins)             # warm: first wake pays task start-up
+    # estimator-ok: `median` IS the sanctioned estimator; Measure.tstat is for ARM ratios, and this is a
+    # single absolute latency with no arm to divide by.
+    join_s = median([median(@be _calpool_join!(p, nw, spins) seconds = 0.2).time for _ in 1:5])
+    khz = Measure._khz()
+    @atomic p.gen = -1                       # shut the workers down
+    foreach(i -> notify(p.evs[i]), 1:nw)
+    foreach(wait, ws)
+
+    if khz <= 0
+        println("  gemm_mt_work: DECLINED — no cpufreq reading, so the join cannot be priced in cycles.")
+        return Pair{String, Any}[]
+    end
+    join_ns = join_s * 1e9
+    mhz = khz / 1000
+    cycles = round(Int, join_ns * mhz / 1000)
+    fpc = PureBLAS._mt_flops_per_cycle(Float64)
+    floor_flops = cycles * PureBLAS._MT_AMORTISE * fpc
+    shipped = PureBLAS._GEMM_MT_WORK_SHIPPED
+    @printf("  gemm_mt_work: join %.0fns over %d worker(s) at %.0fMHz ⇒ %d cycles ⇒ floor %d flops\n",
+            join_ns, nw, mhz, cycles, floor_flops)
+    @printf("    shipped default %d (Zen4, 616ns @ 2796MHz) — this host is %.2fx that\n",
+            shipped, floor_flops / shipped)
+    # BOUNDED AGAINST THE SHIPPED LADDER, and a value outside it is REPORTED rather than pinned. The
+    # ladder spans the two measured protocol regimes (a spin wake ~570ns, a sleep wake ~4000ns); a join
+    # outside that bracket means the measurement caught something other than the mechanism — a busy box,
+    # a migrating driver — and pinning it would bake that in.
+    lo, hi = extrema(PureBLAS._GEMM_MT_WORK_CANDIDATES)
+    if !(lo <= floor_flops <= hi)
+        @printf("    ⇒ NOT PINNED: %d is outside the candidate bracket [%d, %d]. That bracket spans the \
+                spin-wake and sleep-wake regimes, so a join beyond it means this measured something \
+                other than the pool. Re-run on an idle, frequency-locked box.\n", floor_flops, lo, hi)
+        return Pair{String, Any}[]
+    end
+    @printf("    ⇒ WINNER gemm_mt_work=%d\n", floor_flops)
+    return Pair{String, Any}["gemm_mt_work" => floor_flops]
+end
+
 const KNOBS = (
+    (name = "gemm_mt_work", fn = calibrate_gemm_mt_work),
     (name = "gemv_mr", fn = calibrate_gemv_mr),
     (name = "ger_panel_np", fn = calibrate_ger_np),
     (name = "gemvt_percol_window", fn = calibrate_gemvt_window),
