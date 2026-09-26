@@ -1096,22 +1096,12 @@ const _UNROLL = 4
 `dot` over a fixed block grid, partials folded in index order. Bit-identical to the threaded path at any
 worker count, which is the entire point; see the note above for why the unblocked kernel cannot be.
 """
-@inline function _dot_blocked(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+# THE SERIAL CORE, SEPARATE ON PURPOSE. A pool job's lost-claim branch reduces the whole vector itself,
+# and if it called the threading entry below it would try to claim again, lose again, and recurse —
+# spinning until the pool happened to free. Splitting the two makes that impossible rather than unlikely.
+@inline function _dot_blocked_serial(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
     B = _red_block(T)
     n <= B && return _dot_simd(n, x, y, T)      # one block: the unchanged kernel, no fold at all
-    # THREAD IT if the pool is on and there is work for two workers. One atomic read and a compare when
-    # threading is off, as at `_axpy!`. The threaded path folds the SAME block grid in the SAME index
-    # order as the loop below, so the two are bit-identical — which req#11 requires of n = 1 against any
-    # other n. Two streams, so the working set is 2·n·sizeof(T).
-    # ⚠ EACH WORKER NEEDS AT LEAST TWO BLOCKS, or the RAGGED LAST BLOCK sets the critical path. The block
-    # grid is coarse by design (B is large so the per-block fold is under 1%), so at small n the tail is a
-    # large fraction of a block and one worker finishes long before another. Measured at n = 10000, where
-    # the grid is exactly two blocks of 8192 and 1808: the long block is 82% of the work, which caps the
-    # speedup at 1.22x before the join is paid, and the cell measured 0.85x — turning a PASSING gate cell
-    # (1.004) into a failing one. `nblk ÷ 2` declines that case and costs nothing above it.
-    let nblk = cld(n, B), nw = min(_l1_workers(2 * n * sizeof(T), n, T), nblk ÷ 2)
-        nw > 1 && return _dot_threaded(n, x, y, nw)
-    end
     s = zero(T)
     i = 0
     GC.@preserve x y begin
@@ -1123,6 +1113,99 @@ worker count, which is the entire point; see the note above for why the unblocke
         end
     end
     return s
+end
+
+@inline function _dot_blocked(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+    # THREAD IT if the pool is on and there is work for two workers. One atomic read and a compare when
+    # threading is off, as at `_axpy!`. The threaded path folds the SAME block grid in the SAME index
+    # order as the serial core, so the two are bit-identical — which req#11 requires of n = 1 against any
+    # other n. Two streams, so the working set is 2·n·sizeof(T).
+    #
+    # ⚠ EACH WORKER NEEDS AT LEAST TWO BLOCKS, or the RAGGED LAST BLOCK sets the critical path. The block
+    # grid is coarse by design (B is large so the per-block fold is under 1%), so at small n the tail is a
+    # large fraction of a block and one worker finishes long before another. Measured at n = 10000, where
+    # the grid is exactly two blocks of 8192 and 1808: the long block is 82% of the work, which caps the
+    # speedup at 1.22x before the join is paid, and the cell measured 0.85x — turning a PASSING gate cell
+    # (1.004) into a failing one. `nblk ÷ 2` declines that case and costs nothing above it.
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(2 * n * sizeof(T), n, T), nblk ÷ 2)
+        nw > 1 && return _dot_threaded(n, x, y, nw)
+    end
+    return _dot_blocked_serial(n, x, y, T)
+end
+
+"""
+    _sumsq_blocked(n, x, ::Type{T}) -> T
+
+Σxᵢ² over the shared block grid — `nrm2`'s fast path. `_sumsq_simd` has the same four-chain shape as
+`_dot_simd`, so the same argument applies: a split changes the grouping, therefore one grid at every
+worker count.
+
+`_nrm2`'s overflow guard (`isfinite(ss) && !iszero(ss)`) is unaffected: a fold of finite partials that
+reaches Inf is still caught, and a block being smaller than the whole vector can only make the fast path
+survive where one long accumulator overflowed — a better answer under the same contract. The grid is
+fixed, so WHICH path runs cannot vary with the worker count.
+"""
+@inline function _sumsq_blocked_serial(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _sumsq_simd(n, x, T)
+    s = zero(T)
+    i = 0
+    GC.@preserve x begin
+        px = _ptr(x); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _sumsq_simd(len, px + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
+@inline function _sumsq_blocked(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(n * sizeof(T), n, T), nblk ÷ 2)
+        nw > 1 && return _sumsq_threaded(n, x, nw)
+    end
+    return _sumsq_blocked_serial(n, x, T)
+end
+
+"""
+    _asum_blocked(n, x, ::Type{T}) -> T
+
+`asum` over the same fixed block grid as `_dot_blocked`, for the same reason: `_asum_simd` carries EIGHT
+chains and folds them `((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7))`, so a split changes the grouping. One grid
+serves both — `_red_block` is a multiple of `8·_vwidth(T)` as well as of `_UNROLL·_vwidth(T)`, so no block
+of either kernel grows its own tail.
+"""
+@inline function _asum_blocked_serial(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _asum_simd(n, x, T)
+    s = zero(T)
+    i = 0
+    GC.@preserve x begin
+        px = _ptr(x); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _asum_simd(len, px + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
+@inline function _asum_blocked(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(n * sizeof(T), n, T), nblk ÷ 2)   # ONE stream here, unlike dot's two
+        nw > 1 && return _asum_threaded(n, x, nw)
+    end
+    return _asum_blocked_serial(n, x, T)
 end
 
 @inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}

@@ -3933,6 +3933,30 @@ const _MT_KIND_AXPY = 6
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_DOT = 7
+# Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_ASUM = 8
+# Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
+#
+# THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently: `_nrm2`
+# takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite block partials can
+# still reach Inf, which the guard catches; and a block is smaller than the whole vector, so a value that
+# overflowed one long accumulator may now stay finite and take the fast path. That is a more accurate
+# answer, not a different contract. Crucially the grid is fixed, so WHICH path runs cannot vary with the
+# worker count, which is what req#11 asks of it.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SUMSQ = 9
+# x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SCAL = 10
+
+# The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
+# adding an unrelated kind cannot silently join the set.
+@inline _is_reduction(kind::Int) =
+    kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
 
 """
     _syrk_workers(n, k) -> Int
@@ -4023,6 +4047,9 @@ end
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SUMSQ && return _sumsq_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SCAL && return _scal_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4217,6 +4244,45 @@ end
         # still reduce each one separately or the grouping changes with `nw`.
         prt[b] = _dot_simd(len, p.Ap + off * sz, p.Bp + off * sz, T)
     end
+    return nothing
+end
+
+@noinline function _asum_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    @inbounds for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        prt[b] = _asum_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+@noinline function _sumsq_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    @inbounds for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        prt[b] = _sumsq_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+# `x .*= a` over this worker's element range. Elementwise, so bitwise invariant under any partition, and
+# `_scal_simd!` has no size-keyed branch — so unlike axpy this needs no route token.
+@noinline function _scal_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    _scal_simd!(len, p.alpha, p.Cp + i0 * sizeof(T))
     return nothing
 end
 
@@ -4520,7 +4586,14 @@ end
             # IT MUST NOT USE THE PARTIALS BUFFER. That buffer is the pool's, shared, and sized only
             # under the claim — a loser writing it would race the winner's workers, and with 24
             # concurrent callers losing is the common case, not the rare one.
-            return _dot_blocked(A.m, A.ptr, B.ptr, T)
+            return _dot_blocked_serial(A.m, A.ptr, B.ptr, T)
+        elseif kind == _MT_KIND_ASUM
+            return _asum_blocked_serial(A.m, A.ptr, T)   # same reasoning as the dot branch above
+        elseif kind == _MT_KIND_SUMSQ
+            return _sumsq_blocked_serial(A.m, A.ptr, T)
+        elseif kind == _MT_KIND_SCAL
+            # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
+            _scal_simd!(C.m, alpha, C.ptr)
         elseif kind == _MT_KIND_AXPY
             # A loser does the whole vector, so its own length IS the route width — `nroute` stays -1,
             # the same reasoning as gemm's and trsm's fallbacks. This reaches the identical kernel arm
@@ -4602,7 +4675,7 @@ end
         (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
         # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
         # inside a published job, and a loser that grew it could move storage a winner is writing.
-        kind == _MT_KIND_DOT && _red_prefit!(T, cld(A.m, _red_block(T)))
+        _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -4673,7 +4746,7 @@ end
         # The fold is the DRIVER's, over block INDEX, sequentially — never a worker's. That is what makes
         # the worker count decide who computes a partial and never how the partials combine, which is the
         # whole of req#11 for a reduction.
-        if kind == _MT_KIND_DOT
+        if _is_reduction(kind)
             blk = _red_block(T)                 # NOT `B` — that is this function's third argument
             nblk = cld(A.m, blk)
             prt = _red_partials(T)
@@ -4744,6 +4817,41 @@ end
 end
 @noinline function _dot_threaded(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x y _dot_threaded(n, pointer(x), pointer(y), nw)
+end
+
+# `asum` takes ONE operand. It still rides as two `PtrMatrix` because the job struct has two pointers and
+# the chunk body reads only `Ap`; passing x twice is cheaper than a second struct shape.
+@noinline function _asum_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_ASUM
+    )
+end
+@noinline function _asum_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _asum_threaded(n, pointer(x), nw)
+end
+
+@noinline function _sumsq_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_SUMSQ
+    )
+end
+@noinline function _sumsq_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _sumsq_threaded(n, pointer(x), nw)
+end
+
+# `x .*= a`. `C` is the operand the chunk writes, so x goes in the C slot.
+@noinline function _scal_threaded!(n::Int, a::T, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        a, zero(T), false, false, false, false, nw, _MT_KIND_SCAL
+    )
+    return x
+end
+@noinline function _scal_threaded!(n::Int, a::T, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x _scal_threaded!(n, a, pointer(x), nw)
+    return x
 end
 
 function gemm!(

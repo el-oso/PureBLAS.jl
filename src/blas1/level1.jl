@@ -44,7 +44,14 @@ end
 # x .*= a
 @inline function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
-    (incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
+    if incx == 1 && _simd1(x)
+        ac = convert(_et(x), a)
+        # One atomic read and a compare on the serial path, as at `_axpy!`. Elementwise, so the partition
+        # cannot change a bit; ONE stream, so the working set is n·sizeof(T) rather than axpy's 2n.
+        nw = _l1_workers(Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _scal_threaded!(Int(n), ac, x, nw)
+        return _scal_simd!(Int(n), ac, x)
+    end
     if incx == 1 && _cplx_re(x)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vec = real scal over 2n
@@ -159,7 +166,7 @@ end
     R = real(_et(x))
     n <= 0 && return zero(R)
     if incx == 1 && _simd1(x)
-        ss = _sumsq_simd(Int(n), x, _et(x))
+        ss = _sumsq_blocked(Int(n), x, _et(x))
         (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
         # ss is Inf (overflow) or 0 (all-zero, or underflow of tiny values) → use safe path
     elseif incx == 1 && _cplx_re(x)
@@ -217,7 +224,7 @@ end
 @inline function _asum(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
-    (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
+    (incx == 1 && _simd1(x)) && return _asum_blocked(Int(n), x, _et(x))
     (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
         (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
     if incx == 1 && _pairalg(x)                            # Dual: Σ|x_v| with partial Σ flipsign(x_p, x_v)
