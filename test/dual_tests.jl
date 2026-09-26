@@ -553,14 +553,18 @@ end
         # `T <: BlasFloat` is inert: the dual planes ARE real and take the inlined entry. Outlining
         # `_gemm_dual3!` is inert too. StrictModeTest 0.4.6 already drops the reports located in Base
         # (Julia 1.13's scheduler holds a `yield` -> `wait` -> `OncePerThread` cycle); the four that
-        # remain are PureBLAS's own recursion.
+        # remain are PureBLAS's own recursion — and since 0.4.8 those are reported as INFORMATION,
+        # "the types are known; this costs optimization, not type stability", which is the correct
+        # reading of a recursive cycle that produced no optimized IR. What used to be marked broken
+        # here was the classification, not this code; the `let` block below states the property
+        # directly and has always passed.
         let JET = StrictModeTest.JET,
             ts = (typeof((alpha = ad, beta = ad)), typeof(PureBLAS.gemm!), typeof(Cd), typeof(Ad), typeof(Bd))
             @test all(isconcretetype, Base.return_types(Core.kwcall, ts))
             @test !any(r -> r isa JET.RuntimeDispatchReport,
                        JET.get_reports(JET.report_opt(Core.kwcall, ts)))
         end
-        @test_broken @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
+        @test_typestable PureBLAS.gemm!(Cd, Ad, Bd; alpha = ad, beta = ad)
         @test_typestable PureBLAS.syrk!(Cd, Ad; alpha = ad, beta = ad)
         @test_typestable PureBLAS.trmm!(Cd, Ad; alpha = ad)
         @test_typestable PureBLAS.trsm!(Cd, Ad; alpha = ad)
