@@ -93,7 +93,18 @@ esac
 
 echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
 [ "$MODE" = full ] && echo "=== FULL ARMS: all three arms per cell in one machine state (anchors match by construction) ==="
-echo "=== PRE-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
+# PRE-LOCK MUST PASS, not merely be readable. The per-group check below compares each reading against
+# the OPENING one, so it catches a lock that lets go mid-sweep but not a box that was never locked: an
+# unlocked box reads a stable boost clock and drifts 0%. neuromancer opened a sweep at 4774 MHz against
+# its 2000 MHz pin and the group measured to completion. Only the verify verdict distinguishes the two.
+echo "=== PRE-LOCK ==="
+_pre=$(bash bench/fleet_freqlock.sh verify 2>&1)
+printf '%s\n' "$_pre" | tail -2
+if ! printf '%s' "$_pre" | grep -q '✅'; then
+    echo "=== ABORT: the box is not locked. Run 'bench/fleet_freqlock.sh lock' first — a gate"
+    echo "    measurement taken off the base-clock pin is INVALID, not merely noisy. ==="
+    exit 2
+fi
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
