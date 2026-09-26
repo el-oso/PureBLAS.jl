@@ -78,6 +78,32 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 # PDM: Derived — 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | tune: n/a, follows gemm
 const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) ÷ 2)::Int
 @inline _trsplit(k::Int) = (k ÷ 2)                 # 2×2 split point
+
+# The rank-k split, for `_syrk_rec!` and `_syr2k_acc!` ONLY. It rounds the halving DOWN to a whole
+# SME tile, because an off-diagonal block that is not tile-exact is judged by `_sme_tile_ok`'s ragged
+# arm, whose floor is `_SME_MIN` rather than `_SME_MIN_EXACT` — so a block can be large enough to
+# want the coprocessor and still be sent to NEON purely for being an odd width. Measured on an M6:
+# n=144 halves to 72, which is not a multiple of 16 and sits under the 96 ragged floor, and the
+# recursion then LOST to the packed path by 1.43x at that one size while winning 1.2-2.9x at every
+# neighbouring size. Rounding gives 64+80, both tile-exact, and the anomaly goes.
+#
+# The two halves become unequal by less than one tile, which the recursion already tolerates — it
+# splits `n - h` independently and never assumes balance.
+#
+# DELIBERATELY NOT `_trsplit` ITSELF: that one is shared with `_trmm_left!`, `_trmm_right_recur!`,
+# `_trsm_left!` and `_trsm_right!`, whose blocks feed different kernels with different granularity,
+# and whose behaviour on the AMD fleet is not what this measurement covers.
+# The non-SME arm DELEGATES to `_trsplit` rather than repeating `k ÷ 2`. The two are the same
+# expression today, so this is inert — but it is what keeps them the same tomorrow: if `_trsplit`
+# ever aligns, syrk and syr2k inherit it instead of becoming the only rank-k routines left on the
+# bare halving. Measured on Zen, rounding h to a whole `_MR·W` and holding k fixed: 0.9714 mean over
+# 72 ragged points, best 0.893 at k=120, against a control of 20 already-aligned points at 1.0005.
+@inline function _rksplit(k::Int)
+    h = k ÷ 2
+    (_SME_F64 && h >= 2 * _SME_MR) || return _trsplit(k)
+    hg = (h ÷ _SME_MR) * _SME_MR
+    return hg >= _SME_MR ? hg : h
+end
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
 # off-diagonal update C += op(A)·B — straight to the dispatch core (skip gemm!'s kwarg/check layer;
@@ -6546,7 +6572,29 @@ end
 # Before the arena that misconfiguration threw a `BoundsError` at the slice; the clamp plus the restored
 # `@boundscheck` on `view(::PtrMatrix, …)` (ptrmat.jl) are the two halves of keeping it loud.
 # The clamp is repeated inside the live-knob hook because `_FKR_syrk_dbase[]` bypasses the const entirely.
-const _SYRK_DBASE = min(@load_preference("syrk_dbase", 32)::Int, _L3_NB)
+#
+# THE LEAF FILLS THE SCRATCH THE ARENA ALREADY RESERVES FOR IT. `_syrk_rec!` slices
+# `view(scr, 1:n, 1:n)` out of a FIXED `_L3_NB × _L3_NB` borrow, so any base below `_L3_NB` leaves
+# that buffer under-used AND multiplies the off-diagonal blocks, each of which becomes its own
+# kernel call. `_L3_NB` is itself derived from cache residency, so this adapts to an unseen machine
+# rather than encoding one.
+#
+# Measured on an M6, Float64 syrk at one thread, GFLOP/s by base (the recursion is only reached
+# above `_SYRK_SME_MIN`; below it the packed path runs and the base does nothing, which is why
+# n ≤ 256 is flat):
+#
+#     n      32      64      96     128
+#   256    56.2    56.2    56.2    56.2   (packed — base unreachable)
+#   384   127.0   177.3   188.7   188.7
+#   512   137.4   223.4   223.3   238.9
+#   768   190.4   269.0   287.6   287.7
+#  1024   198.6   290.1   290.0   306.6
+#  2048   226.1   273.0   273.4   283.5
+#
+# The clamp stays: it is now a no-op for the default, and still guards a user pin larger than the
+# borrow, which would slice past its end.
+# PDM: Derived — the leaf is bounded by the scratch the arena already reserves for it: `_L3_NB`. | tune: n/a, follows the borrow
+const _SYRK_DBASE = min(@load_preference("syrk_dbase", _L3_NB)::Int, _L3_NB)
 @inline _fh_syrk_dbase() = (f = _FKR_syrk_dbase[]; f >= 0 ? min(f, _L3_NB) : _SYRK_DBASE)
 # n above which the single-pass packed syrk beats the gemm→temp recursion (the recursion base's 2×-flop
 # diagonal waste + split overhead is why rank-k packs slightly EARLIER than gemm). DERIVED (req#8) via
@@ -6704,14 +6752,36 @@ end
 #     via gemm  46.8   80.7  121.4  138.4  203.0  226.5
 #     ratio     0.92   1.44   2.04   2.30   3.31   3.80
 #
-# The packed path is flat because it cannot reach the coprocessor at all. Below the cut the split
-# is noisy and sometimes loses (n=144 at 0.68, n=272 at 0.97), so this sits where every measured
-# point wins by at least 1.7x rather than at the first point that wins at all.
+# The packed path is flat because it cannot reach the coprocessor at all.
+#
+# THE CUT IS THE GEOMETRY OF THE FIRST SPLIT, not a fitted size. `_rksplit` halves n onto a whole
+# SME tile, so the first off-diagonal block is tile-exact and `_sme_tile_ok` judges it by
+# `_SME_MIN_EXACT`; the block is `max(h, n-h)`, which clears that floor exactly when
+# `n >= 2 * _SME_MIN_EXACT`. Below it the recursion's own first product cannot reach the
+# coprocessor and there is nothing for the route to win with.
+#
+# Measured on an M6, recursion time / packed time, one thread — lower is better, and the boundary
+# is where the derivation puts it:
+#
+#     n        64    80    96   112   128   144   160   192   224   256   272   320
+#     rec/pack 0.81  0.67  0.61  0.55  0.52  0.53  0.50  0.44  0.40  0.38  0.36  0.34
+#
+# The 24x cut this replaces was derived before two fixes that changed the trade: the leaf now fills
+# its borrow (`_SYRK_DBASE`), and the split lands on a tile (`_rksplit`). The n=144 and n=272
+# anomalies its comment recorded were the unaligned split, not noise — they reproduced to two
+# decimals and disappeared when the split was aligned.
+#
+# WHAT THIS DOES NOT REACH, so nobody re-derives it expecting more: aligning `h` does not align
+# `n - h`, so a RAGGED n still hands its first block a ragged width and that block is judged by the
+# `_SME_MIN` floor again. n=100 splits 48+52 and misses, where n=128 splits 64+64 and does not.
+# Measured against Accelerate, pb/accel: n=128 went 0.13 -> 0.26 and n=256 0.15 -> 0.41, while
+# n=100 moved only 0.13 -> 0.14. Nothing regressed, so the low cut is safe; closing the ragged
+# sizes needs a kernel that takes a non-tile-multiple shape, not another cutoff.
 #
 # APPLIES ONLY WHERE SME IS PRESENT. Off it, `_SME_F64` is false and the packed path keeps every
 # size, which is the measured-correct behaviour on the AMD fleet.
-# PDM: Measured — the size at which a route that reaches the coprocessor overtakes one that cannot; it turns on the ratio between two kernels' throughput, which no cache size predicts. | tune: sweep
-const _SYRK_SME_MIN = @load_preference("syrk_sme_min", 24 * _SME_MR)::Int
+# PDM: Derived — the first split's off-diagonal block must clear the tile-exact floor: 2 x _SME_MIN_EXACT. | tune: n/a, follows the tile
+const _SYRK_SME_MIN = @load_preference("syrk_sme_min", 2 * _SME_MIN_EXACT)::Int
 
 @inline _syrk_prefer_packed(::Type{T}, n::Int) where {T} =
     n > _fh_syrk_pack_cut() && !(_SME_F64 && T === Float64 && n >= _SYRK_SME_MIN)
@@ -6782,7 +6852,7 @@ function _syrk_rec!(up::Bool, tr::Bool, herm::Bool, α, A, C, k::Int, scr, off::
         _add_tri!(view(C, (off + 1):(off + n), (off + 1):(off + n)), tmp, up, herm, n)
         return C
     end
-    h = _trsplit(n)
+    h = _rksplit(n)
     _syrk_rec!(up, tr, herm, α, A, C, k, scr, off, h)
     _syrk_rec!(up, tr, herm, α, A, C, k, scr, off + h, n - h)
     Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
@@ -7411,7 +7481,7 @@ function _syr2k_acc!(up::Bool, tr::Bool, herm::Bool, α, A, B, C, k::Int, scr, o
         end
         return C           # NOT `return _add_tri!(...)`: that returns the SubArray, making the
     end                    # recursion's return type Union{Matrix,SubArray} — boxes at every level
-    h = _trsplit(n)
+    h = _rksplit(n)
     _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off, h)
     _syr2k_acc!(up, tr, herm, α, A, B, C, k, scr, off + h, n - h)
     Co = up ? view(C, (off + 1):(off + h), (off + h + 1):(off + n)) :   # same SubArray type both
