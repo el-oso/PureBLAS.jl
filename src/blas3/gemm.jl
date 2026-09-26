@@ -3757,17 +3757,25 @@ the thread saves.
 # only decides admission between roughly n = 2000 and 10000 and the regret there is bounded.
 # PDM: Derived — break-even of the pool fork-join against one core's stream rate; `_L1_BYTES` is a measured coincidence used as the proxy, not the mechanism. See the falsification test above.
 const _L1_MT_SLICE = _L1_BYTES
-# ADMISSION CARRIES A 2× MARGIN OVER BREAK-EVEN, AND THE MARGIN IS MEASURED, NOT TASTE. Break-even
-# admission is 2 × slice (two workers each paying the join out of a halved share). At exactly that
-# boundary threading LOSES: n = 4096 on this box is a 64 KiB working set and measures 0.94× cold.
+# ADMISSION CARRIES A 2× MARGIN OVER BREAK-EVEN, AND IT IS THERE FOR THE SINGLE-SHOT CALLER, not for the
+# benchmark. Break-even admission is 2 × slice (two workers each paying the join out of a halved share).
 #
-# The reason is that 568 ns is the BACK-TO-BACK fork-join. Measured on this box, a threaded call after an
-# idle gap costs far more, because parked workers' cores drop into deep idle and a C-state exit is tens
-# of microseconds:
+# 568 ns is the BACK-TO-BACK fork-join. A call made after the pool has sat idle costs far more, because
+# parked workers' cores drop into deep idle and a C-state exit is tens of microseconds — measured here:
 #     back-to-back 0.72 µs · after 1 ms 63.7 µs (88×) · after 5 ms 78.8 µs (109×) · after 20 ms 79.4 µs
-# A library cannot know which regime its caller is in, so the floor is set from the warm join and carries
-# a margin. 4 × slice excludes the measured loss at 64 KiB and admits 128 KiB, which measures 1.06×.
-# PDM: Derived — 2× margin over the 2-worker break-even, because the effective fork-join is up to 110× the back-to-back one when the pool has been parked and the library cannot detect which regime applies.
+#
+# A caller in a loop never sees that: consecutive calls keep the workers hot, and the published gate
+# amortises it over `_L1REP` = 30…20000 back-to-back calls per sample, where threaded axpy measures
+# 1.27×/2.11×/3.13×/1.75×/2.20× across n = 10⁴…10⁶ with nothing regressing. A caller making ONE axpy per
+# millisecond — a Krylov iteration with a serial matvec between the vector ops — pays the full 79 µs
+# every time, and at the bare break-even boundary loses: n = 4096 is a 64 KiB working set and measures
+# 0.94× that way. The library cannot tell the two callers apart, so the floor protects the worse one at a
+# cost of nothing at any gate size.
+#
+# ⚠ COUPLED TO THE SPIN-BEFORE-PARK DECISION (declined 2026-09-26; kb
+# `pool-spin-before-park-declined-2026-09-26.md`). If workers ever spin before parking, the 79 µs goes
+# away and this margin should come back down to 2×. The two move together.
+# PDM: Derived — 2× margin over the 2-worker break-even, because the effective fork-join is up to 110× the back-to-back one when the pool has been parked and the library cannot detect which caller it has.
 const _L1_MT_MIN = 4 * _L1_MT_SLICE
 
 """
