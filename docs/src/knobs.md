@@ -236,13 +236,13 @@ Every `@load_preference` key in `src/` — 154 of them.
 | `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW)` | — |
 | `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW)` | — |
 | `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW)` | — |
-| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | no calibrator yet (needs a threaded harness); candidates ¼×…4× shipped |
+| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | calibrate_gemm_mt_work measures the fork-join round trip on host and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside the ¼×…4× bracket |
 | `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW)` | — |
 | `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
-| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | no calibrator yet (needs a threaded harness, same blocker as gemm_mt_work); candidates _NR*2^j over 128..2048 |
+| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | no calibrator yet. The threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |

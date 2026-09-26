@@ -90,6 +90,10 @@ const _TUNABLE_KEYS = (
     "brd_nb", "sytrf_cmult",
     # written by bench/calibrate.jl's KNOBS but previously unlisted here:
     "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
+    # The threading amortisation floor. Its calibrator is the only one that needs a THREADED process, so
+    # it DECLINES on `julia` with one thread rather than pinning a number it could not measure — which is
+    # why the knob shipped with no calibrator at all and one Zen4 recording behind it.
+    "gemm_mt_work",
     # 2026-09-10: THE DRIFT WAS STILL THERE, and it cost a whole Zen4 sweep.
     # `gemvt_percol_window` above is the KNOB's name in `KNOBS`, not a preference
     # key — that calibrator writes `gemvt_percol_amin`/`gemvt_percol_xmax`, and the

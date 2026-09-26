@@ -28,7 +28,14 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-3}
-mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+shift 2>/dev/null || true
+# Explicit caches may follow the tolerance. With none, BOTH tiers are audited — unlike the other
+# checks, this one has always scanned `mt_data_*` too, because the cross-arm comparison is the only
+# throttle evidence a threaded cache carries and it must not be opt-in.
+files=("$@")
+if [ ${#files[@]} -eq 0 ]; then
+    mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
 bad=0
@@ -63,7 +70,16 @@ for f in "${files[@]}"; do
                 #
                 # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
                 # arm carries the state of the epoch it was measured in and is never re-run.
-                if (base > 0 && n >= 8 && a[1] == "pb" && !MT) {
+                # WHICH SAMPLER wrote this range, read PER ARM: field 8 of a 9-field record. In an
+                # 8-field record field 8 is the csv, so the test is `n >= 9`; anything older is a
+                # single-core sample, which is what "core" means.
+                # (No apostrophes in this block: the awk program is single-quoted and one would end it.)
+                span = (n >= 9) ? a[8] : "core"
+                # The in-window check runs for the serial `pb` arm always, and for `pb_mt` only when
+                # THAT RECORD carries a range spanning the working cores. A pb_mt record written by the
+                # old single-core sampler stands down on its own merits, even inside a file where other
+                # cells were re-measured — which a header stamp could not express.
+                if (base > 0 && n >= 8 && ((a[1] == "pb" && !MT) || (a[1] == "pb_mt" && MT && span == "threads"))) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++

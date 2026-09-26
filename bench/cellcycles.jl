@@ -25,6 +25,7 @@
 #   * "who does less work". A ratio says we are 1.36x slower; cycles say AOCL spends 8.6 kcyc where we
 #     spend 11.7 kcyc, which is a budget you can decompose against a roofline.
 using Statistics
+include(joinpath(@__DIR__, "gatecrit.jl"))   # arm_pair — which arms this cell's tier compares
 const CACHE = ARGS[1]
 const SEL = ARGS[2:end]
 const ALL = "--all" in SEL
@@ -76,10 +77,12 @@ println("         so that cell's cycle figures carry that much uncertainty. `?` 
 println(rpad("lvl", 5), rpad("op", 12), lpad("n", 7), lpad("PB", 10), lpad("OB", 10),
         lpad("AOCL", 10), lpad("OB/PB", 8), lpad("AOCL/PB", 9), lpad("Δclk", 7), lpad("wobble", 8))
 for (lvl, op, n, arms) in sort(rows, by = r -> (r[2], r[3]))
-    haskey(arms, "pb") || continue
-    pbc = cyc(arms["pb"])
-    obc = haskey(arms, "openblas") ? cyc(arms["openblas"]) : NaN
-    aoc = haskey(arms, "aocl") ? cyc(arms["aocl"]) : NaN
+    pba, _ = arm_pair(arms)                    # serial or threaded, read from the cell — gatecrit.jl
+    haskey(arms, pba) || continue
+    pbc = cyc(arms[pba])
+    pick(rs...) = (i = findfirst(r -> haskey(arms, r), rs); isnothing(i) ? NaN : cyc(arms[rs[i]]))
+    obc = pick("openblas", "openblas_mt")
+    aoc = pick("aocl", "aocl_mt")
     ks = [a[2] for a in values(arms) if !isnan(a[2]) && a[2] > 0]
     dclk = isempty(ks) ? NaN : 100 * (maximum(ks) - minimum(ks)) / minimum(ks)
     sp = [a[3] for a in values(arms) if !isnan(a[3])]
