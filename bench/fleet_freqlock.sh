@@ -272,7 +272,27 @@ case "${1:-verify}" in
     priv_governor powersave
     echo "Restored: amd_pstate=$(cat "$STATUS" 2>/dev/null||echo n/a), boost on, full range." ;;
   verify)
-    echo "amd_pstate=$(cat "$STATUS" 2>/dev/null || echo n/a)  boost=$(cat "$BOOST" 2>/dev/null || echo n/a)"
-    echo "core$CORE achieved under load = $(achieved_mhz "$CORE") MHz" ;;
+    # `verify` RENDERS THE VERDICT, it does not merely print readings. Rule 1 of this file's header is
+    # "never benchmark unless verify reports ✅", so the ✅ has to come from here — a caller that
+    # reassembles the criterion from the raw numbers will get it wrong, and one did: a sweep driver that
+    # read only the MHz line opened a run at 4774 MHz against a 2000 MHz pin and measured a whole group.
+    #
+    # Three conditions, because no two of them suffice (see the pin_khz comment above): boost off, the
+    # policy range collapsed to a point, AND the achieved clock inside that point's 12% band — the same
+    # band verify_or_die uses. A stale pin that silently expands the range back to the boost ceiling
+    # fails the second; a box left boosting fails the third.
+    _b=$(cat "$BOOST" 2>/dev/null || echo n/a)
+    _lo=$(( $(cat /sys/devices/system/cpu/cpu$CORE/cpufreq/scaling_min_freq 2>/dev/null || echo 0) / 1000 ))
+    _hi=$(( $(cat /sys/devices/system/cpu/cpu$CORE/cpufreq/scaling_max_freq 2>/dev/null || echo 0) / 1000 ))
+    _got=$(achieved_mhz "$CORE")
+    echo "amd_pstate=$(cat "$STATUS" 2>/dev/null || echo n/a)  boost=$_b  pin=${_lo}-${_hi} MHz"
+    echo "core$CORE achieved under load = ${_got} MHz"
+    if [ "$_b" = 0 ] && [ "$_lo" = "$_hi" ] && [ "$_hi" -gt 0 ] &&
+       [ "$_got" -ge $(( _hi * 88 / 100 )) ] && [ "$_got" -le $(( _hi * 112 / 100 )) ]; then
+        echo "✅ locked at ${_hi} MHz — safe to benchmark."
+    else
+        echo "❌ NOT locked — do not benchmark. Run '$0 lock'."
+        exit 2
+    fi ;;
   *) echo "usage: sudo $0 {lock|pin <MHz>|restore|verify}"; exit 1 ;;
 esac
