@@ -691,33 +691,24 @@ function _sme_selftest()
     return worst
 end
 
+
 function _sme_init!()
     _SME_F64 || return nothing
     # `__init__` also runs inside the PRECOMPILE process, whose codegen targets the generic image
     # CPU. Building the trampoline there compiles the kernel into the image and fails on `rdsvl`.
     ccall(:jl_generating_output, Cint, ()) == 0 || return nothing
+    # Both trampolines come from the builders at the end of this file, which carry the barrier or
+    # drop it according to the compiling process's own target — see the block comment there.
     try
-        # `getfield(@__MODULE__, :name)` is NOT opaque -- module and symbol are both constants, so
-        # inference folds it back to the concrete function and walks into the kernel anyway.
-        # `inferencebarrier` forces the value to `Any`, which is what actually stops it.
-        f = Base.inferencebarrier(_sme_entry_cabi)
-        cf = @cfunction($f, Cvoid,
-            (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
-             Int, Int, Int, Float64, Float64, Int, Int,
-             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+        cf = _sme_entry_cf()
         _SME_TRAMPOLINE[] = cf
         _SME_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, cf)
     catch
         # A machine that advertises the feature but cannot build the kernel keeps the SIMD path.
         _SME_ENTRY[] = C_NULL
     end
-    # Same barrier, same reason: `inferencebarrier` is what actually stops inference folding the
-    # symbol back to the concrete function and walking into the kernel. A `getfield` by name does
-    # NOT -- module and symbol are both constants, so it const-folds.
     try
-        g = Base.inferencebarrier(_sme_gemv_cabi)
-        gf = @cfunction($g, Cvoid,
-            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+        gf = _sme_gemv_cf()
         _SME_GEMV_TRAMPOLINE[] = gf
         _SME_GEMV_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, gf)
     catch
@@ -733,12 +724,14 @@ function _sme_init!()
         end
         if !(err < 1e-12)
             _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL
-            error("""
-                SME self-test failed: relative error $err against a scalar reference.
-                The kernels built and ran, so this is a geometry assumption that does not hold on
-                this machine -- lanes=$(_SME_LANES), L=$(_SME_L), MR=$(_SME_MR), NR=$(_SME_NR),
-                gemv blocks up to $(_SME_GEMV_BLK * _SME_GEMV_NGMAX) rows. Please report it.
-                Set `sme_f64 = false` in LocalPreferences.toml to keep the SIMD path meanwhile.""")
+            # The message carries NO interpolated value and prints nothing. `__init__` is in the
+            # trim graph, where `error("...$x...")` lowers to `print_to_string` over a
+            # `Vararg{Any}` tuple and `--trim=safe` rejects it as an unresolved call; and IO here
+            # would be a task-switch point in a kernel file, which `test/yield_lint.jl` guards.
+            # The measured error is not lost — `_sme_selftest()` returns it, and the message says
+            # so. An error PATH is where a dynamic `string(...)` is easiest to write and hardest to
+            # notice: it never runs, so nothing but a linter ever objects.
+            error(_SME_SELFTEST_MSG)
         end
     end
     return nothing
@@ -1125,4 +1118,79 @@ const _SME_CALLS = Threads.Atomic{Int}(0)
         )
     end
     return C
+end
+
+# The self-test's failure text, built at PRECOMPILE from consts rather than interpolated where it is
+# thrown. Every value in it is a compile-time constant, so there is nothing to defer; and `__init__`
+# is in the trim graph, where an interpolated `error("...$x...")` lowers to `print_to_string` over a
+# `Vararg{Any}` tuple and `--trim=safe` rejects it as an unresolved call. It lives at the END of the
+# file because a `const` is evaluated where it is written, and the gemv geometry below `_sme_init!`
+# would not exist yet at that point; `_sme_init!` only reads it when `__init__` runs, by which time
+# the module is fully loaded.
+const _SME_SELFTEST_MSG = """
+    SME self-test failed against a scalar reference. Call `PureBLAS._sme_selftest()` for the
+    measured relative error. The kernels built and ran, so this is a geometry assumption that
+    does not hold on this machine -- lanes=$(_SME_LANES), L=$(_SME_L), MR=$(_SME_MR), NR=$(_SME_NR), gemv blocks up
+    to $(_SME_GEMV_BLK * _SME_GEMV_NGMAX) rows. Please report it.
+    Set `sme_f64 = false` in LocalPreferences.toml to keep the SIMD path meanwhile."""
+
+# ══ TRAMPOLINE CONSTRUCTION — TWO FORMS, CHOSEN BY THE COMPILING PROCESS'S OWN TARGET ═══════════
+#
+# The barrier below exists because AOT codegen OVERRIDES a function's own `target-features` with the
+# process `-C` target, while the JIT leaves them alone. So the kernel's `+sme` survives in a normal
+# session and is stripped in an ahead-of-time one, where `rdsvl` then has no pattern and the build
+# aborts. `inferencebarrier` hides the callee so the kernel is never reached at all.
+#
+# That barrier is also why `--trim=safe` rejects the build: `Compiler/src/verifytrim.jl` resolves a
+# `:cfunction` purely from the INFERRED TYPE of its target, and the barrier is what erases it. The
+# two requirements are the same property seen twice, and no annotation squares them.
+#
+# What squares them is noticing the barrier is only needed when the target LACKS `+sme`. juliac runs
+# two processes: `Pkg.precompile()` with the features stripped, then `--output-o` with the full
+# target and `--output-incremental=no`, which makes it evaluate this source fresh rather than load
+# the first one's image. So each process can take the form it needs.
+#
+# Measured on an M6: with `-C apple-m1,+sme,+sme2,+sme-f64f64` the constant form compiles the kernel
+# INTO the image and the built dylib carries the `_jlcapi_` adapters, 20 `fmopa` and 36
+# `smstart`/`smstop` pairs; with the default target the same source aborts on
+# `Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`.
+#
+# These live after `_sme_gemv_cabi` because the CONSTANT form resolves its callee when the enclosing
+# method is DEFINED, not when it runs — placed earlier they are an `UndefVarError` at load.
+const _SME_STATIC = _SME_F64 && let p = Base.JLOptions().cpu_target   # C_NULL / "native" when no -C
+    p != C_NULL && occursin("+sme", unsafe_string(p))
+end
+
+@static if !_SME_F64
+    # OFF SME HARDWARE THESE MUST NOT EXIST IN ANY FORM. `_sme_init!` returns at its first line
+    # there, so they are unreachable — but a top-level definition is still INFERRED, and inferring
+    # `inferencebarrier(_sme_entry_cabi)` + `@cfunction` drags the cabi entry and `_gemm_core!`
+    # behind it. That is not hypothetical: hoisting these out of `_sme_init!`'s dead body, where
+    # they had been compiled away, is what made two StrictMode dogfood items report
+    # `OptimizationFailureReport in PureBLAS._gemm_core!` on x86.
+    _sme_entry_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
+elseif _SME_STATIC
+    _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
+        (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
+         Int, Int, Int, Float64, Float64, Int, Int,
+         Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+    _sme_gemv_cf() = @cfunction(_sme_gemv_cabi, Cvoid,
+        (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+else
+    # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
+    # inference folds it back to the concrete function and walks into the kernel anyway.
+    # `inferencebarrier` forces the value to `Any`, which is what actually stops it.
+    function _sme_entry_cf()
+        f = Base.inferencebarrier(_sme_entry_cabi)
+        return @cfunction($f, Cvoid,
+            (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
+             Int, Int, Int, Float64, Float64, Int, Int,
+             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+    end
+    function _sme_gemv_cf()
+        g = Base.inferencebarrier(_sme_gemv_cabi)
+        return @cfunction($g, Cvoid,
+            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+    end
 end
