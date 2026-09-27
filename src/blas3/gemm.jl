@@ -3794,6 +3794,20 @@ is a worker running the scalar tail, which costs more than the thread saves.
     (T === Float64 || T === Float32) || return 1
     W = _vwidth(T)
     (bytes < _L1_MT_MIN || n < 2 * W) && return 1
+    # ⚠ A `nw <= nthreads() - 1` CAP WAS TRIED HERE AND REVERTED — do not re-add it without a measurement
+    # that reproduces. The argument for it is sound on paper: the pool holds `nthreads() - 1` workers and
+    # the DRIVER runs the last chunk, so `nw == nthreads()` gives every thread a task and leaves the GC and
+    # libuv threads nowhere, which a microsecond-scale call cannot amortise. wintermute at `nw = 6` under
+    # `-t 6` does read pathologically (469 µs at n=3e5 against 25.7 at nw=5, threads pinned, 16 rounds).
+    #
+    # It was reverted because the numbers do not reproduce. `nw = 5` is UNCHANGED by such a cap, and across
+    # two runs of identical code on a quiet, verified-locked box it read 25.69 µs and then 172.50 µs — a 7x
+    # move with nothing to attribute it to. So run-to-run variation at this cell exceeds the effect the cap
+    # was meant to fix, and shipping it would have been a behavioural change resting on noise.
+    #
+    # Level 3 would have needed excluding anyway, and that part IS reproducible: `gemm` n=512 is BEST at
+    # nw=6 (84.6 GFLOP/s, spread 1.17x, against 82.3 at nw=5) because a millisecond call amortises the
+    # round-trip. See kb/findings/threaded-l1-arm-is-bimodal-above-four-workers.md.
     return max(1, min(nt, bytes ÷ _L1_MT_SLICE, n ÷ W))
 end
 
