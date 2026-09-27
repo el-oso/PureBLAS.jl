@@ -97,10 +97,18 @@ end
         @test !elig(false, false, false, true)
         @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
                                zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
-        # Below the crossover the packed panels do not pay for themselves.
-        small = P._SME_MIN - 1
+        # Below the crossover the packed panels do not pay for themselves. The crossover is
+        # `_SME_MIN_EXACT` for EVERY operand, ragged or not: a ragged block is padded to whole
+        # tiles and issued as one call (`_sme_cpad_cap`), so it no longer pays a prologue per edge
+        # tile and no longer needs a higher floor. Measured at the sizes that separates — n=40
+        # loses 0.81x and stays out, n=50 wins 1.25x and comes in.
+        small = P._SME_MIN_EXACT - 1
         @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
                                zeros(small, small), rand(small, small), rand(small, small))
+        # A shape too NARROW for the tile geometry is still declined however large its other side:
+        # `min >= 2*_SME_MR` is a geometry bound, not a crossover, and padding does not lift it.
+        @test !P._sme_eligible(Float64, 8, 4096, 4096, false, false, false, false,
+                               zeros(8, 4096), rand(8, 4096), rand(4096, 4096))
     end
 end
 

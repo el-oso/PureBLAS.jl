@@ -545,6 +545,24 @@ function _sme_macro_edges!(
             _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kpad, over)
             return nothing
         end
+        # PAD THE BLOCK, NOT THE TILE, when it fits. The per-tile path below pays a macrokernel
+        # prologue for every edge tile, and that prologue is most of what an edge tile costs:
+        # measured at n=100, 0.26 us per tile of which 0.037 is the copy. Rounding the block up to
+        # whole tiles makes it ONE call. Measured against the per-tile path, whole-gemm times:
+        # n=50 6.64 -> ~2.4 us, n=100 14.7 -> ~7.5, n=132 26.4 -> ~16.8.
+        if mpad * npad <= _sme_cpad_cap()
+            for j in 0:(npad - 1), i in 0:(mpad - 1)
+                v = (!over && i < mce && j < nce) ?
+                    unsafe_load(C + ((ic + i) + (jc + j) * ldc) * 8) : 0.0
+                unsafe_store!(pcs + (i + j * mpad) * 8, v)
+            end
+            _sme_macro!(pcs, mpad, pa, pb, nip, njp, kpad, false)
+            for j in 0:(nce - 1), i in 0:(mce - 1)
+                unsafe_store!(C + ((ic + i) + (jc + j) * ldc) * 8,
+                              unsafe_load(pcs + (i + j * mpad) * 8))
+            end
+            return nothing
+        end
         # Interior tiles in one call, then the ragged last row/column tile by tile.
         nip_full = mce ÷ MR
         njp_full = nce ÷ NR
@@ -578,12 +596,24 @@ function _sme_macro_edges!(
 end
 
 # Scratch sizes for a given problem, so callers can size workspace without replaying the loop.
+# How large a PADDED C BLOCK the edge path may materialise, in elements. A ragged block costs one
+# macrokernel call per edge tile today, and that call's prologue dominates its work: measured at
+# n=100, 13 edge tiles at 0.26 us each of which only 0.037 is the scratch copy. Rounding the whole
+# block up to whole tiles turns those 13 calls into ONE, at the price of a copy in and out.
+#
+# Bounded by L1 because the padded block is written, read by the kernel, and read back immediately:
+# beyond L1 the copy stops being cheap and the per-tile path is the better of the two. At 128 KiB
+# that covers a square block to n = 128, which is exactly the range where the whole matrix is one
+# ragged block and the per-call overhead is the entire cost.
+@inline _sme_cpad_cap() = max(_SME_MR * _SME_NR, _L1_BYTES ÷ sizeof(Float64))
+
 @inline function _sme_scratch_sizes(m::Int, n::Int, k::Int)
     MC, NC, KC = _sme_blocks(m, n, k)
     kpad = cld(min(KC, k), _SME_L) * _SME_L
     apad = cld(min(MC, m), _SME_MR) * _SME_MR
     bpad = cld(min(NC, n), _SME_NR) * _SME_NR
-    return (apad * kpad, bpad * kpad, _SME_MR * _SME_NR, MC, NC, KC)
+    csz = max(_SME_MR * _SME_NR, min(apad * bpad, _sme_cpad_cap()))
+    return (apad * kpad, bpad * kpad, csz, MC, NC, KC)
 end
 
 # ── Entry point from `_gemm_core!` ─────────────────────────────────────────────────────────────
@@ -766,10 +796,19 @@ end
 # THE SIZE CUT HAS TWO ARMS because the cost is tile occupancy, not size (see `_SME_MIN`): a shape
 # that divides the panel exactly pays from `_SME_MIN_EXACT`, everything else has to reach `_SME_MIN`
 # before its remainder panel is amortized.
+# ONE FLOOR, NOT TWO. A ragged operand used to need a much higher floor than a tile-exact one,
+# because its edge tiles each cost a separate macrokernel call — measured at 0.26 us apiece, of
+# which only 0.037 was the scratch copy, the rest a prologue paid for ~0.05 us of work. Padding the
+# whole block to whole tiles turns those calls into one (see `_sme_cpad_cap`), so the reason for the
+# second, higher floor is gone with it.
+#
+# Measured on an M6 at the sizes the old ragged floor rejected, forced SME against the path taken
+# today: n=40 0.81x (loses), n=50 1.25x, n=72 1.92x, n=88 2.52x. The wins begin at 50 and n=40 is
+# still excluded by `_SME_MIN_EXACT` = 48, so the surviving floor is the one that separates them.
+# Tile-exact sizes already on SME are unchanged: n=64 0.99, n=80 1.00, n=96 1.04.
 @inline function _sme_tile_ok(m, n)
     min(m, n) >= 2 * _SME_MR || return false
-    (m % _SME_MR == 0 && n % _SME_NR == 0) ?
-        max(m, n) >= _SME_MIN_EXACT : max(m, n) >= _SME_MIN
+    return max(m, n) >= _SME_MIN_EXACT
 end
 
 @inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
