@@ -31,6 +31,13 @@ case "$(hostname)" in
     neuromancer) MASK=0,1,2,3,4,5,6 ;;
     *)           MASK="" ;;
 esac
+# `PBHOT_MASK` overrides it, and `PBHOT_MASK=none` runs unpinned. The mask is itself a subject of
+# investigation — the per-box default puts SEVEN CPUs over SIX physical cores, so one core always holds
+# two of the process's threads, and whether those two are both pool WORKERS is a question the default
+# cannot be used to answer. Changing it requires a restart, which is why this exists rather than a flag.
+if [ -n "${PBHOT_MASK:-}" ]; then
+    [ "$PBHOT_MASK" = none ] && MASK="" || MASK="$PBHOT_MASK"
+fi
 
 # `pgrep -x julia` matches the interpreter ONLY, never this wrapper — a `pgrep -f bench/hot.jl` also
 # matches the shell running this script, which makes the session look alive when it is not.
