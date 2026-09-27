@@ -285,6 +285,82 @@ const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT
 # single-threaded gate. Caught before it ran; the whole point of the separate file is that this cannot
 # happen, so the predicate must cover every threaded arm.
 const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
+
+# ── PIN ONE JULIA THREAD PER PHYSICAL CORE, FOR A THREADED RUN ───────────────────────────────────────
+# WITHOUT THIS A THREADED CELL IS A LOTTERY DRAW. Julia's tasks float anywhere inside the process
+# affinity mask, so two of them can occupy the two SMT siblings of ONE physical core; that halves a
+# worker, the join waits for it, and the placement persists for a stretch. The result is a genuinely
+# bimodal arm, and a median of per-round medians — what this file reduces to — reports whichever mode the
+# run happened to sit in. Measured 2026-09-27, `dot` n=3e5, 6 threads, lock verified before and after:
+#
+#     unpinned   per-round medians  16.4 16.0 33.6 33.4 33.4 16.3 33.3 16.0 …   spread 2.14x, 6/16 slow
+#     pinned                        16.0 15.9 15.9 15.6 16.0 15.9 15.9 15.8 …   spread 1.07x, 0/16 slow
+#
+# The SERIAL arm is stable either way (1.02x), and OpenBLAS — which pins its own threads — is stable
+# either way too (1.09x). That contrast is what proved the instability was PureBLAS's floating threads
+# rather than this harness, the fresh-operand regime, or the working set.
+#
+# It is the same argument `_ARM_PB_MT` already makes one level down about CPUs ("the mask needs one CPU
+# more than the thread count"), applied to threads rather than to CPUs.
+#
+# THREADED RUNS ONLY, deliberately: the single-threaded gate has one compute thread and nothing to
+# displace, so pinning cannot change its numbers — and leaving it alone keeps every existing
+# `plots_data_*` cell comparable with new ones. A threaded cache is stamped `pinned=` so it is
+# self-identifying, and its absence on an `mt_data_*` file means those cells predate this.
+#
+# ⚠ NOT A COMPLETE FIX, and the header stamp must not be read as one. It cleaned neuromancer and did NOT
+# clean wintermute, where `nw = 6` under `-t 6` leaves no thread for the runtime (the pool spawns
+# `nthreads()-1` workers and the driver runs the last chunk) and reads 13x worse than `nw = 2`. Pinning
+# removes the SMT-sibling mode; it does not create a spare thread.
+const _PINNED_AT = Ref("")
+# One CPU per physical core, read from sysfs rather than assumed — siblings are adjacent on wintermute and
+# the whole second half on galen and neuromancer, so either hardcoded layout is wrong somewhere — and
+# restricted to CPUs this process is actually allowed to use, so it composes with `taskset`.
+function _core_cpus()
+    allowed = Int[]
+    m = try
+        match(r"Cpus_allowed_list:\s*(\S+)", read("/proc/self/status", String))
+    catch
+        nothing
+    end
+    isnothing(m) && return allowed
+    for part in split(m.captures[1], ',')
+        if occursin('-', part)
+            a, b = split(part, '-')
+            append!(allowed, parse(Int, a):parse(Int, b))
+        else
+            push!(allowed, parse(Int, part))
+        end
+    end
+    seen = Set{Int}()
+    out = Int[]
+    for c in allowed
+        f = "/sys/devices/system/cpu/cpu$(c)/topology/core_id"
+        id = isfile(f) ? something(tryparse(Int, strip(read(f, String))), c) : c
+        id in seen && continue
+        push!(seen, id)
+        push!(out, c)
+    end
+    return out
+end
+# `:static` is what makes this a per-THREAD operation: it guarantees iteration i runs on thread i, and
+# `sched_setaffinity(0, …)` pins the calling thread. A thread beyond the core count is left floating on
+# purpose — that is the spare the runtime needs.
+function _pin_threads!()
+    (Sys.islinux() && Threads.nthreads() > 1) || return nothing
+    cpus = _core_cpus()
+    isempty(cpus) && return nothing
+    Threads.@threads :static for i in 1:Threads.nthreads()
+        if i <= length(cpus)
+            mask = zeros(UInt64, 16)
+            mask[cpus[i] ÷ 64 + 1] = UInt64(1) << (cpus[i] % 64)
+            ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask)
+        end
+    end
+    _PINNED_AT[] = join(cpus, ",")
+    return nothing
+end
+_ANY_MT && _pin_threads!()
 # REFUSE rather than measure a lie. BLIS fixes its thread count at init from the environment, so if the
 # process was not launched with it, `aocl_mt` would be a single-threaded AOCL recorded under a threaded
 # name — and every downstream verdict built on it would be wrong in PureBLAS's favour.
@@ -2564,6 +2640,11 @@ function save_cache(path, groups)
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
+            # `pinned=` — the CPUs this run nailed its julia threads to, one per physical core. Present only
+            # on a threaded run, and its ABSENCE on one means the cells in it were measured with the threads
+            # floating, which for a threaded arm is a lottery draw rather than a measurement (see
+            # `_pin_threads!`). A reader must diff this before diffing any threaded ratio.
+            isempty(_PINNED_AT[]) ? "" : "\tpinned=$(_PINNED_AT[])",
             # `tuned=` — present ONLY when this cache describes a legitimately tuned box (see
             # `_tuned_pins_ok`). Its absence means the shipped defaults were measured. A reader comparing
             # two caches must diff this before diffing any ratio: a tuned and an untuned cache of the same
