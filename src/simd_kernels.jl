@@ -260,13 +260,15 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 # `nroute` — THE ROUTE WIDTH, when a caller has split this axpy across workers. Defaults to `-1`,
 # meaning "route from `n`", which is every serial call and keeps them byte-identical to before.
 #
-# WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation: the two predicates below are
-# size-keyed, and the arms they choose are NOT bitwise equivalent — `_axpy_phase!` splits the vector
-# into phases and `_axpy_unrolled!(Val(u))` carries u independent chains, so where the scalar tail
-# falls and which lane holds which element both move with the length. A worker handed its own `len`
-# would route to a different arm than the serial call and return different last bits, which is exactly
-# the `_use_unpacked` failure `_gemm_core!`'s `nroute` exists for. So a partitioned caller passes the
-# WHOLE problem's length and computes on its slice.
+# WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation. Every arm below writes
+# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and scalar tail alike — so the arms
+# carry no cross-element accumulation and agree bitwise AS LONG AS `muladd` contracts the same way in
+# each. That proviso is the gap: `muladd` is licensed to fuse or not at LLVM's discretion, and the arms
+# move which elements land in a vector lane and which in the scalar tail, so a length-dependent arm
+# choice puts the guarantee in the compiler's hands rather than the source's. req#11 does not allow
+# that — any size-keyed branch a chunk body can reach takes its size from the route, not from the
+# slice. So a partitioned caller passes the WHOLE problem's length and computes on its slice, and
+# test/level1_tests.jl pins the result bitwise at several thread counts and several tail shapes.
 @inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0, nroute::Int = -1) where {T <: BlasReal}
     nrt = nroute < 0 ? n : nroute
     # THE KNOB ONLY GOVERNS WHERE IT WAS MEASURED. `_measure_axpy_unroll` probes past L1, so its answer
@@ -321,7 +323,15 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
         _axpy_unrolled!(Val(4), n, a, x, y, 0)  # req8-ok: candidate arm, literal required for specialization
 end
 
-@inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
+# `nroute` — THE ROUTE WIDTH, as on `_axpy_simd!` above and for the same req#11 reason: the L1-residency
+# predicate below is size-keyed, so a worker routing from its own slice length can take the hand-unrolled
+# arm where the unsplit call takes the `@simd ivdep` one. Both arms write one `a * x[i]` per element, with
+# no cross-element accumulation, so they agree bitwise; but which elements land in a vector lane and which
+# in the scalar tail moves between them, and that is the compiler's rounding to decide once `muladd`-class
+# contraction is in play. Route from the whole, compute on the slice. Defaults to `-1` = "route from `n`",
+# which is every serial call.
+@inline function _scal_simd!(n::Int, a::T, x, nroute::Int = -1) where {T <: BlasReal}
+    nrt = nroute < 0 ? n : nroute
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     xc = _carrier_arr(x)   # `x` itself when the caller passed an array; nothing for a Ptr segment
     GC.@preserve x begin
@@ -444,7 +454,7 @@ end
         # formed against), and ROTATE arm order per round like the gate does (plots.jl:252-255) rather
         # than merely putting the duplicate last. First-in-last-slot bounds only maximal-separation
         # drift — conservative, and its failure mode is calling a resolvable cell unresolvable.
-        if n * sizeof(T) > _L1_BYTES
+        if nrt * sizeof(T) > _L1_BYTES   # `nrt`, not `n`: route from the whole problem (see the header)
             # `@simd ivdep` must stay: hand-unrolling was measured WORSE past L1 (see above). `_stcb!`
             # is a plain store in release, so the vectorizer sees the same loop.
             @inbounds @simd ivdep for j in 1:n

@@ -4214,9 +4214,20 @@ const _REDP_F32 = Float32[]
 # from a chunk body, which must not allocate: the driver and every idle worker are in spin/wait loops
 # with nowhere for a GC to progress from, and the symptom is a swallowed worker exception or a silent
 # hang depending on the interleaving. Same rule as `_gpack_prefit!`.
+#
+# GROWTH GOES THROUGH `_ws_grow!`, the one registered `@noinline` growth barrier, rather than a bare
+# `resize!` — the same convention every other pool here follows, and it costs nothing: `_ws_grow!`'s body
+# IS `length(v) < n && resize!(v, n)`.
+#
+# It is a convention, not a repair, and the difference was measured. `kind` is a runtime argument of a
+# `@noinline` callee, so this branch looks live on a GEMM call and an unregistered `resize!` here ought to
+# break `gemm!`'s all-paths allocation proof. It does not: that proof is barrier-exempted for `gemm!`
+# either way, and StrictModeTest falls back to a steady-state IR scan for it. A/B'd against the bare
+# `resize!` form, `test/strictmode_tests.jl`'s "statically allocation-free" item is byte-identical in
+# verdict and in its exemption notice. So registering the site buys correctness IF that exemption is ever
+# lifted, and nothing today — do not cite it as the reason the proof holds.
 @inline function _red_prefit!(::Type{T}, nblk::Int) where {T}
-    v = _red_partials(T)
-    length(v) < nblk && resize!(v, nblk)
+    _ws_grow!(_red_partials(T), nblk)
     return nothing
 end
 
@@ -4236,7 +4247,7 @@ end
     cnt > 0 || return nothing
     prt = _red_partials(T)
     sz = sizeof(T)
-    @inbounds for b in b0:(b0 + cnt - 1)
+    for b in b0:(b0 + cnt - 1)
         off = (b - 1) * B
         len = min(B, p.m - off)
         # The UNCHANGED kernel on this block. Its length is the block's, never the worker's share — a
@@ -4254,7 +4265,7 @@ end
     cnt > 0 || return nothing
     prt = _red_partials(T)
     sz = sizeof(T)
-    @inbounds for b in b0:(b0 + cnt - 1)
+    for b in b0:(b0 + cnt - 1)
         off = (b - 1) * B
         len = min(B, p.m - off)
         prt[b] = _asum_simd(len, p.Ap + off * sz, T)
@@ -4269,7 +4280,7 @@ end
     cnt > 0 || return nothing
     prt = _red_partials(T)
     sz = sizeof(T)
-    @inbounds for b in b0:(b0 + cnt - 1)
+    for b in b0:(b0 + cnt - 1)
         off = (b - 1) * B
         len = min(B, p.m - off)
         prt[b] = _sumsq_simd(len, p.Ap + off * sz, T)
@@ -4277,12 +4288,13 @@ end
     return nothing
 end
 
-# `x .*= a` over this worker's element range. Elementwise, so bitwise invariant under any partition, and
-# `_scal_simd!` has no size-keyed branch — so unlike axpy this needs no route token.
+# `x .*= a` over this worker's element range. Elementwise, so no accumulation crosses the partition —
+# but `_scal_simd!` does carry an L1-residency branch, so `p.m` is handed over as the route width for the
+# same reason axpy does it: compute on the slice, route from the whole.
 @noinline function _scal_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _l1_chunk(p.m, nw, i, T)
     len > 0 || return nothing
-    _scal_simd!(len, p.alpha, p.Cp + i0 * sizeof(T))
+    _scal_simd!(len, p.alpha, p.Cp + i0 * sizeof(T), p.m)
     return nothing
 end
 
@@ -4505,10 +4517,14 @@ Threads PureBLAS's threaded kernels may use; `1` means threading is off. See [`s
 get_num_threads() = _MT_NTHREADS[]
 
 """
-    _gemm_threaded!(C, A, B, alpha, beta, tA, tB, cA, cB, nw) -> nothing
+    _gemm_threaded!(C, A, B, alpha, beta, tA, tB, cA, cB, nw, kind) -> T
 
-Run one gemm across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with
-the same result, whenever the pool is already in use — see the claim below.
+Run one job across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with the
+same result, whenever the pool is already in use — see the claim below.
+
+Returns `zero(T)` for the in-place kinds, whose result is in `C`, and the folded scalar for the
+reduction kinds (`dot`, `asum`, `sumsq`), which have nowhere else to put it. The return type is `T` on
+every path, never a union: a union here propagates into every caller's inference.
 """
 # EVERY OTHER ELEMENT TYPE LANDS HERE, and this method exists for inference, not for callers. Each of
 # the six call sites decides `nw` from a VALUE (`_gemm_workers` returns 1 when the type guard fails),
@@ -4549,9 +4565,10 @@ end
     # ponytail: a single global claim, not a work-stealing scheduler. Upgrade to per-caller pools only
     # if a measurement shows nested callers starving, which needs a nested-parallel benchmark first.
     _, won = @atomicreplace p.busy false => true
-    # `_gemm_core!` returns different things on different routes, so discard it and return `nothing` on
-    # BOTH paths — otherwise this function's return type is a union and the instability propagates into
-    # every caller's inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
+    # `_gemm_core!` returns different things on different routes, so its value is discarded and every path
+    # here returns a `T` instead — `zero(T)` where the result is in `C`, the fold for a reduction. What
+    # matters is that the type is the SAME on both paths: a union return propagates into every caller's
+    # inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
     if !won
         # THE FALLBACK MUST MATCH THE JOB KIND. This ran `_gemm_core!` unconditionally, which is right
         # for a gemm and CATASTROPHIC for a syrk: it computes a full rectangular A·Bᵀ over the whole
@@ -4746,12 +4763,16 @@ end
         # The fold is the DRIVER's, over block INDEX, sequentially — never a worker's. That is what makes
         # the worker count decide who computes a partial and never how the partials combine, which is the
         # whole of req#11 for a reduction.
+        # `A.m` is the element count `_red_prefit!` sized the buffer from, and the chunks block over
+        # `p.m`. The two agree because every reduction entry passes ONE n×1 `PtrMatrix` as both `C` and
+        # `A`, and `p.m = C.m`. The loop is bounds-CHECKED so that a future path where they diverge
+        # raises here instead of reading past the partials — a caught error, not a wrong reduction.
         if _is_reduction(kind)
             blk = _red_block(T)                 # NOT `B` — that is this function's third argument
             nblk = cld(A.m, blk)
             prt = _red_partials(T)
             s = zero(T)
-            @inbounds for b in 1:nblk
+            for b in 1:nblk
                 s += prt[b]
             end
             red = s
