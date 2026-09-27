@@ -24,7 +24,11 @@ end
         @test 0 < NC
         @test 0 < KC <= k
         @test MC % P._SME_MR == 0
-        @test KC % P._SME_L == 0
+        # KC is lane-aligned ONLY when it is a genuine split. A single block takes the true k, and
+        # rounding it there would turn any `k % _SME_L != 0` into two blocks — a second pack, a
+        # second pass over C, and every ragged edge tile again. The pack zero-fills `kce` to `kpad`,
+        # so an unrounded single block is exact; k=53 here is the case that must NOT be rounded.
+        @test KC == k || KC % P._SME_L == 0
         # NC spans n so A is packed exactly once -- the reason this path beats the SIMD blocking.
         @test NC >= n
         # The packed B panel stays inside the budget that bounds C re-streaming.
