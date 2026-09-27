@@ -102,7 +102,26 @@ const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) 
     h = k ÷ 2
     (_SME_F64 && h >= 2 * _SME_MR) || return _trsplit(k)
     hg = (h ÷ _SME_MR) * _SME_MR
-    return hg >= _SME_MR ? hg : h
+    hg >= _SME_MR || return h
+    # ROUNDING `h` ONTO A TILE DOES NOT ALIGN `k - h`, and when `k` itself is not a tile multiple
+    # the remainder is the ragged one. `_sme_tile_ok` then judges the off-diagonal block by
+    # `_SME_MIN` rather than `_SME_MIN_EXACT`, and a remainder under that floor takes the whole
+    # block off the coprocessor. Measured on an M6: k=132 splits 64+68, 68 < 96, and syrk drops to
+    # 42.7 GFLOP/s where k=128 (64+64, exact) reaches 97.7 and k=144 (64+80, exact) 100.2.
+    #
+    # When that happens, align the REMAINDER instead: the larger side carries the flops, so it is
+    # the side worth making tile-exact. k=132 becomes 36+96 — `min = 36` still clears the `2*MR`
+    # floor and `max = 96` clears the ragged one, so the off-diagonal is eligible again.
+    #
+    # The guard is `min >= 2*_SME_MR`, and it is what stops this going too far: k=132 as 4+128
+    # would make the remainder a perfect 128 and fail anyway, because 4 is below the tile floor.
+    # Where no admissible alignment exists the balanced split stands.
+    _sme_tile_ok(hg, k - hg) && return hg
+    # The largest tile multiple that still leaves the small side above `2*_SME_MR`: making the
+    # remainder as large as the floor allows is what gets it over `_SME_MIN`. k=132 gives 36+96.
+    g = (((k - 2 * _SME_MR) ÷ _SME_MR) * _SME_MR)
+    hr = k - g
+    (hr >= 2 * _SME_MR && _sme_tile_ok(hr, g)) ? hr : hg
 end
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
