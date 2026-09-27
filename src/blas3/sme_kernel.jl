@@ -1075,6 +1075,7 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 @inline _sme_p(v) = pointer(v)
 
 @noinline function _sme_gemv!(m::Int, n::Int, alpha::Float64, A, x, beta::Float64, y)
+    Threads.atomic_add!(_SME_GEMV_CALLS, 1)
     lda = stride(A, 2)
     GC.@preserve y A x begin
         py = _sme_p(y)
@@ -1094,6 +1095,15 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 end
 
 const _SME_CALLS = Threads.Atomic{Int}(0)
+
+# The gemv kernel's own witness, separate from `_SME_CALLS` so the threading liveness gate that
+# reads that one is not perturbed by a gemv.
+#
+# IT EXISTS BECAUSE A ROUTE WITH NO WITNESS CANNOT BE A/B'd: a predicate that silently declines and
+# a kernel that is genuinely no faster produce the same null result. Asking `_SME_CALLS` about a
+# gemv answers zero whatever happens, and a control is the only thing that catches that — a plain
+# `gemv!` reports zero there too, which is impossible if the counter covered it.
+const _SME_GEMV_CALLS = Threads.Atomic{Int}(0)
 
 @noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
                              tA::Bool, tB::Bool)
