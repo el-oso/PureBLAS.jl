@@ -171,7 +171,34 @@ function bare_rows()
                 pending_tier = String(mp.captures[1]); pending, pending_at = String(mp.captures[2]), i
                 continue
             end
+            # TWO WAYS IN, and the second is the one that matters for an audit. A bare integer or boolean
+            # RHS is tracked whether or not anyone marked it, because an unmarked literal is exactly the
+            # debt this scan exists to name. A const with ANY other RHS is tracked when a `# PDM:` marker
+            # sits above it — the marker is what declares it a tuning constant, so it is the honest
+            # predicate, and it keeps out the several hundred `const _X = Cint(0)` / `Ptr{UInt8}[]` /
+            # `Sys.PAGESIZE` lines that a widened RHS pattern would drag in.
+            #
+            # WHY IT WAS NEEDED: `_L1_MT_SLICE = _L1_BYTES` and `_L1_MT_MIN = 4 * _L1_MT_SLICE` carried PDM
+            # markers and were invisible to BOTH scanners — not preference keys, not bare integers. One of
+            # them was tagged `Derived` while its own comment said the honest tier was Measure, and nothing
+            # could see the contradiction. `@load_preference` consts are deliberately still skipped here:
+            # `pref_rows` already covers them, and listing them twice would double-count the registry.
+            # `i - pending_at == 1` — the marker must be the line IMMEDIATELY above, not merely within the
+            # 12-line window the bare-integer path allows. Tried at 12 first and it mis-attributed: a
+            # `Val(ntuple(...))` table and a random-seed constant inherited the justification of a knob
+            # further up, so the registry gained rows whose "Why" described a different constant. A wrong
+            # attribution is worse than the gap, because the registry is what an audit trusts.
             m = match(r"^const (_[A-Z][A-Z_0-9]{2,})\s*=\s*(-?\d+|true|false)\s*(?:#.*)?$", ln)
+            if isnothing(m) && !isempty(pending) && i - pending_at == 1
+                mx = match(r"^const (_[A-Z][A-Z_0-9]{2,})\s*=\s*(.+?)\s*(?:#.*)?$", ln)
+                if !isnothing(mx) && !occursin("@load_preference", ln)
+                    push!(rows, (; name = String(mx.captures[1]),
+                                 value = first(String(mx.captures[2]), 40),
+                                 family = _kr_family(rel), tier = pending_tier, pdm = pending))
+                    pending, pending_at, pending_tier = "", 0, ""
+                    continue
+                end
+            end
             isnothing(m) && continue
             near = !isempty(pending) && i - pending_at <= 12
             push!(rows, (; name = String(m.captures[1]), value = String(m.captures[2]),

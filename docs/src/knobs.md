@@ -269,13 +269,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-50 `const _X = <literal>` values in `src/` with no `@load_preference`.
+54 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 16 Exempt · 1 Unaudited.
+**Tier:** 1 Derived · 3 Measured · 33 Literal · 16 Exempt · 1 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -284,6 +284,7 @@ on these, not on knobs.
 |---|---|---|---|
 | `_IAMAX_NB_STREAM` | 4 | Literal | DERIVABLE, not yet derived: ILP chain count, ISA-invariant by the latency x throughput argument. |
 | `_UNROLL` | 4 | Literal | DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET. |
+| `_ZAXPY_PHASE_U` | min(8, (_NVREG - 4) ÷ 3) | Derived | formula over `_NVREG`; the fleet table is in bench/probes/zaxpy_phase_u.jl (Zen4). |
 
 ### BLAS-2 (gemv/ger/trmv/trsv)
 
@@ -292,6 +293,7 @@ on these, not on knobs.
 | `_CGEMV_NP` | 8 | Literal | DERIVABLE, not yet derived: complex gemv-N panel width, same register argument as _GEMV_NP. |
 | `_GEMVN_MINNER_U` | 4 | Literal | row-unroll paired with the gemvn_minner knob; moves with it, not independently. |
 | `_GEMVT_NC_DEEP` | 8 | Literal | DERIVABLE, not yet derived: one x-load per 8 FMAs, the load:FMA ratio clearing the MLP plateau; _NVREG-guarded. |
+| `_GEMVT_PERSCAN_PREF` | ( | Measured | every pair of boxes disagrees at some size; L1, L2, L3 and width all falsified. |
 | `_GEMVT_U_DEEP` | 4 | Literal | DERIVABLE, not yet derived: 4 lines per stream, so NC*U = 32 lines named — enough to cover L2. |
 | `_GEMV_NP` | 8 | Literal | DERIVABLE, not yet derived: gemv-N panel width; the comment already reasons in MR and register pressure. |
 | `_GER_PANEL_U` | 4 | Literal | its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one. |
@@ -380,6 +382,8 @@ on these, not on knobs.
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
+| `_L1_MT_MIN` | 4 * _L1_MT_SLICE | Literal | 2× margin over the 2-worker break-even of a literal floor, because the effective fork-join is up to 110× the back-to-back one once the pool has parked and the library cannot tell which caller it has. |
+| `_L1_MT_SLICE` | _L1_BYTES | Literal | break-even of the pool fork-join against one core's stream rate, neither of which is a detected const; 32 KB validated on one box and spelled as `_L1_BYTES`, which is a coincidence rather than the mechanism. Falsification test above, UNRUN. |
 | `_MT_AMORTISE` | 32 | Literal | a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s |
 | `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
 | `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |

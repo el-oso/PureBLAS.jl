@@ -3753,10 +3753,23 @@ the thread saves.
 # operands are never reused, so L1 residency has no causal role in an axpy. The falsification: L1D is
 # 32 KB on Zen3/Zen4, 48 KB on Zen5, 128 KB on Apple silicon — if `T_forkjoin × BW_core` does not track
 # those to within ~30%, this proxy is a date in disguise and the constant must be written as the product.
-# Neither term is a detected const, so the honest tier is Measure; the proxy is used because the floor
-# only decides admission between roughly n = 2000 and 10000 and the regret there is bounded.
-# PDM: Derived — break-even of the pool fork-join against one core's stream rate; `_L1_BYTES` is a measured coincidence used as the proxy, not the mechanism. See the falsification test above.
-const _L1_MT_SLICE = _L1_BYTES
+# Neither term is a detected const, so this is NOT Derived however it is written. It was tagged Derived
+# while this same paragraph said the honest tier was Measure — a contradiction inside one comment block,
+# and the tag is what an audit reads. There is no on-host auto-tune either, so it is not Measure: it is a
+# LITERAL, 32 KB, spelled `_L1_BYTES`, validated on one box and carrying the falsification test above.
+#
+# ⚠ THE FALSIFICATION TEST IS STILL UNRUN, and running it has a regime trap in it. `T_forkjoin × BW_core`
+# needs the fork-join measured PER BOX (568 ns is wintermute's only) and the per-core stream rate AT THE
+# SLICE SIZE IN QUESTION — a ~32 KB slice is L1-resident, where a core streams far faster than the
+# ~57 GB/s figure the estimate above uses, which is a DRAM-regime rate. Measuring the rate at n = 3e5
+# (74 / 49 / 99 GB/s on wintermute / neuromancer / galen) and multiplying would compare two different
+# regimes and "falsify" the proxy for the wrong reason. Get both terms in the slice's own regime, or the
+# test says nothing.
+#
+# Kept as it is because the regret is bounded and named: the floor only decides admission between roughly
+# n = 2000 and 10000, and every cell outside that band is governed by something else.
+# PDM: Literal — break-even of the pool fork-join against one core's stream rate, neither of which is a detected const; 32 KB validated on one box and spelled as `_L1_BYTES`, which is a coincidence rather than the mechanism. Falsification test above, UNRUN.
+const _L1_MT_SLICE = _L1_BYTES   # req8-ok: validated literal, mechanism and falsification test above
 # ADMISSION CARRIES A 2× MARGIN OVER BREAK-EVEN, AND IT IS THERE FOR THE SINGLE-SHOT CALLER, not for the
 # benchmark. Break-even admission is 2 × slice (two workers each paying the join out of a halved share).
 #
@@ -3775,8 +3788,12 @@ const _L1_MT_SLICE = _L1_BYTES
 # ⚠ COUPLED TO THE SPIN-BEFORE-PARK DECISION (declined 2026-09-26; kb
 # `pool-spin-before-park-declined-2026-09-26.md`). If workers ever spin before parking, the 79 µs goes
 # away and this margin should come back down to 2×. The two move together.
-# PDM: Derived — 2× margin over the 2-worker break-even, because the effective fork-join is up to 110× the back-to-back one when the pool has been parked and the library cannot detect which caller it has.
-const _L1_MT_MIN = 4 * _L1_MT_SLICE
+# Tier follows `_L1_MT_SLICE`: a multiple of a validated literal is a validated literal, not a derivation.
+# The 2× itself IS argued from a measurement — the parked-pool fork-join is up to 110× the back-to-back
+# one, so the margin buys the single-shot caller a floor it cannot otherwise get — but the thing it
+# multiplies is not derived from any detected const, so the product cannot be either.
+# PDM: Literal — 2× margin over the 2-worker break-even of a literal floor, because the effective fork-join is up to 110× the back-to-back one once the pool has parked and the library cannot tell which caller it has.
+const _L1_MT_MIN = 4 * _L1_MT_SLICE   # req8-ok: validated literal, see `_L1_MT_SLICE` above
 
 """
     _l1_workers(bytes, n, ::Type{T}) -> Int
