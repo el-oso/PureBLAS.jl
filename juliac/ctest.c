@@ -2,9 +2,11 @@
  * self-initializes its embedded Julia runtime on first @ccallable call (via
  * ijl_autoinit_and_adopt_thread), so a plain C program can use PureBLAS as a BLAS library.
  *
- *   julia juliac/build.jl                      # produce juliac/build/libpureblas.so
- *   gcc juliac/ctest.c -o /tmp/ctest -ldl && /tmp/ctest
+ *   julia juliac/build.jl                      # produce juliac/build/libpureblas.{so,dylib}
+ *   cc juliac/ctest.c -o /tmp/ctest -lm $(uname -s | grep -q Linux && echo -ldl) && /tmp/ctest
  *   # expect: daxpy: 12.0 24.0 36.0 48.0 / dnrm2: 5.4772
+ *
+ * `-ldl` is Linux-only: macOS puts dlopen in libc and has no libdl to link.
  *
  * NOTE: forwarding this .so via BLAS.lbt_forward from INSIDE a running Julia process aborts
  * (double-init of the shared libjulia) — a current juliac limitation. Use the native API
@@ -31,8 +33,19 @@ typedef void (*dgesvd_t)(char *, char *, int64_t *, int64_t *, double *, int64_t
                          double *, int64_t *, double *, int64_t *, double *, int64_t *, int64_t *,
                          long, long);
 
+/* The extension is the platform's, matching `build.jl`'s own `DLEXT`. Hardcoding `.so` made this
+ * test unrunnable on macOS, where the artifact is a `.dylib` — which went unnoticed because the
+ * trim gate runs on ubuntu only. */
+#if defined(__APPLE__)
+#  define PB_LIB "juliac/build/libpureblas.dylib"
+#elif defined(_WIN32)
+#  define PB_LIB "juliac/build/libpureblas.dll"
+#else
+#  define PB_LIB "juliac/build/libpureblas.so"
+#endif
+
 int main(void) {
-    void *h = dlopen("juliac/build/libpureblas.so", RTLD_NOW | RTLD_GLOBAL);
+    void *h = dlopen(PB_LIB, RTLD_NOW | RTLD_GLOBAL);
     if (!h) { printf("dlopen fail: %s\n", dlerror()); return 1; }
     daxpy_t daxpy = (daxpy_t)dlsym(h, "daxpy_64_");
     dnrm2_t dnrm2 = (dnrm2_t)dlsym(h, "dnrm2_64_");

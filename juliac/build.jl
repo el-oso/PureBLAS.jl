@@ -21,6 +21,22 @@ const ENTRY = joinpath(@__DIR__, "entry.jl")
 const JCFLAGS = `--output-lib $OUT --experimental --trim=safe --compile-ccallable --verbose`
 @info "juliac: JuliaC.jl from $TOOLENV"
 run(`$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV -e "using Pkg; Pkg.instantiate()"`)
+# GIVE THE AOT TARGET `+sme` ON APPLE SILICON, or the SME kernels cannot be in the artifact at all.
+# AOT codegen overrides a function's own `target-features` with the process `-C` target (the JIT does
+# not), so without this the kernel's `+sme` is stripped, `rdsvl` has no pattern, and the build aborts
+# — which is why the trampolines carry an inference barrier in a normal session. That barrier is in
+# turn what `--trim=safe` rejects, since `verifytrim.jl` resolves a `:cfunction` from the INFERRED
+# TYPE of its target. Naming the feature here lets `_SME_STATIC` take the constant form instead, and
+# the two requirements stop being in conflict. JuliaC reads this when no `--cpu-target` is given, and
+# passes only the FIRST comma group to its precompile step, so that step still sees the barrier form.
+#
+# Verified on an M6: the built dylib carries the `_jlcapi_` adapters, 20 `fmopa` and 36
+# `smstart`/`smstop` pairs. Off Apple silicon this is not set and nothing changes.
+if Sys.isapple() && Sys.ARCH === :aarch64 && !haskey(ENV, "JULIA_CPU_TARGET")
+    ENV["JULIA_CPU_TARGET"] = "apple-m1,+sme,+sme2,+sme-f64f64"
+    @info "PureBLAS: AOT target carries +sme so the coprocessor kernels reach the artifact" target =
+        ENV["JULIA_CPU_TARGET"]
+end
 cmd = `$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV
        -e "using JuliaC; JuliaC.main(ARGS)" -- --project=$ROOT $JCFLAGS $ENTRY`
 
