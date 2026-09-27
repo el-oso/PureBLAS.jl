@@ -413,8 +413,20 @@ const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024):
     # Depth block: as deep as the budget allows, so C is re-streamed as few times as possible.
     kb = max(_SME_L, (_SME_PANEL_BUDGET ÷ sizeof(Float64)) ÷ max(NC, 1))
     KC = min(k, kb)
-    KC -= KC % _SME_L
-    KC = max(KC, _SME_L)
+    # ROUND ONLY A KC THAT IS ACTUALLY A SPLIT. Rounding down to a whole `_SME_L` keeps a depth
+    # block's pack aligned, but applying it when `KC == k` turns any k not divisible by the lane
+    # count into TWO blocks — 96 + 4 at k=100 — and the tail block pays a second pack, a second
+    # full pass over C, and every ragged edge tile again. The pack already zero-fills `kce` up to
+    # `kpad`, so a single block of the true k needs no rounding at all.
+    #
+    # Measured on an M6, driver KC against KC = k, output bitwise identical:
+    #   n,k = 100,100 -> 1.31x   128,100 -> 1.20x   256,250 -> 1.10x
+    #         500,500 -> 1.07x  2100,2100 -> 1.04x
+    # It costs every SME caller at every `k % _SME_L != 0`, and n=100 is a gate cell.
+    if KC < k
+        KC -= KC % _SME_L
+        KC = max(KC, _SME_L)
+    end
     # Row block: the A panel (MC x KC) is the operand re-read per column panel, so hold it to a
     # share of L2 the way the SIMD path holds its own A block.
     mb = max(_SME_MR, ((_L2_BYTES * 3) ÷ 10) ÷ (KC * sizeof(Float64)))
