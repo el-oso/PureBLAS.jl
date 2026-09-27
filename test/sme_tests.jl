@@ -261,3 +261,39 @@ end
         @test maximum(abs, swapped .- want) / maximum(abs, want) > 1e-12
     end
 end
+
+# A ROUTE WITH NO WITNESS CANNOT BE A/B'd. A predicate that silently declines and a kernel that is
+# genuinely no faster produce the same null result, so a timing comparison over the gemv path means
+# nothing without a counter that says the coprocessor ran. `_SME_CALLS` does NOT serve: it is bumped
+# only inside `_gemm_sme!`, and asking it about a gemv answers zero whatever happens.
+#
+# The negative case is the control, and it is the half that matters. A witness that fires for
+# everything is worthless evidence, and one that fires for nothing reads exactly like a route that
+# is never taken — which is how the missing counter cost a day of trmv measurement.
+@testitem "SME gemv carries its own execution witness" tags = [:checks] begin
+    using PureBLAS
+    P = PureBLAS
+    if !P._SME_F64
+        @test P._SME_GEMV_CALLS[] == 0                 # off SME the kernel does not exist to run
+    else
+        n = 1024
+        A = randn(n, n); x = randn(n); y = zeros(n)
+        P.gemv!(y, A, x)                               # warm, and prove the route is reachable
+        b = P._SME_GEMV_CALLS[]
+        P.gemv!(y, A, x)
+        @test P._SME_GEMV_CALLS[] == b + 1             # POSITIVE: an eligible shape bumps it once
+
+        # NEGATIVE control: transposed is outside `_sme_gemv_eligible` (the kernel reads columns of
+        # A directly), so the counter must NOT move. Without this the positive case above would
+        # still pass if the counter were bumped unconditionally somewhere upstream.
+        At = collect(transpose(A))
+        P.gemv!(y, At, x; trans = 'T')
+        b2 = P._SME_GEMV_CALLS[]
+        P.gemv!(y, At, x; trans = 'T')
+        @test P._SME_GEMV_CALLS[] == b2                # NEGATIVE: an ineligible shape does not
+
+        # And the witness agrees with the predicate rather than being a second opinion.
+        @test P._sme_gemv_eligible(Float64, n, n, false, false, A, x, y, 1, 1, 0.0)
+        @test !P._sme_gemv_eligible(Float64, n, n, true, false, At, x, y, 1, 1, 0.0)
+    end
+end
