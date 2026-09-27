@@ -3952,6 +3952,14 @@ const _MT_KIND_SUMSQ = 9
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_SCAL = 10
+# y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_COPY = 11
+# x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SWAP = 12
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4050,6 +4058,8 @@ end
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SUMSQ && return _sumsq_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SCAL && return _scal_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_COPY && return _copy_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4303,6 +4313,27 @@ end
     len > 0 || return nothing
     off = i0 * sizeof(T)
     _axpy_simd!(len, p.alpha, p.Ap + off, p.Cp + off, 0, p.m)
+    return nothing
+end
+
+# NO ROUTE TOKEN, and that is checked rather than assumed: `_copy_simd!` and `_swap_simd!` are a single
+# unrolled loop plus a scalar tail with no size-keyed predicate — no `_L1_BYTES` cut, no unroll knob — so
+# there is no branch for a worker's own length to steer. They also perform no arithmetic: copy moves
+# bytes and swap exchanges them, so no partition can change a bit and req#11 holds trivially rather than
+# by construction.
+@noinline function _copy_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _copy_simd!(len, p.Ap + off, p.Cp + off)
+    return nothing
+end
+
+@noinline function _swap_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _swap_simd!(len, p.Ap + off, p.Cp + off)
     return nothing
 end
 
@@ -4873,6 +4904,33 @@ end
 @noinline function _scal_threaded!(n::Int, a::T, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x _scal_threaded!(n, a, pointer(x), nw)
     return x
+end
+
+# `y .= x` and `x, y = y, x`. Both take two operands and write elementwise, so `A` is the source-ish one
+# and `C` the destination-ish one; swap reads and writes both, which the chunk body handles by passing the
+# two pointers straight to the kernel. `alpha` is unused by either and is set to one for the pool's sake.
+@noinline function _copy_threaded!(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_COPY
+    )
+    return y
+end
+@noinline function _copy_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _copy_threaded!(n, pointer(x), pointer(y), nw)
+    return y
+end
+
+@noinline function _swap_threaded!(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_SWAP
+    )
+    return nothing
+end
+@noinline function _swap_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _swap_threaded!(n, pointer(x), pointer(y), nw)
+    return nothing
 end
 
 function gemm!(

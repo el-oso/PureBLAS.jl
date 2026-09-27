@@ -7,7 +7,13 @@
 # y .= x
 @inline function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _copy_simd!(Int(n), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        # One atomic read and a compare on the serial path, as at `_axpy!`. TWO streams — x read, y
+        # written — so the working set is 2n·sizeof(T), the same as axpy's.
+        nw = _l1_workers(2 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _copy_threaded!(Int(n), x, y, nw)
+        return _copy_simd!(Int(n), x, y)
+    end
     # Complex and Dual vectors are contiguous 2n-real buffers and copy involves no arithmetic, so the real
     # SIMD kernel serves them as-is. LLVM does NOT vectorize the scalar loop below for ComplexF64 — it emits
     # a `memmove` call (bench/probes/cplx_copy_vec.jl: `_vectorized=false`), 1.9x slower than `_copy_simd!`
@@ -26,7 +32,13 @@ end
 # x ⇄ y
 @inline function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return nothing
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _swap_simd!(Int(n), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        # FOUR streams, not two: swap reads AND writes both vectors, so the working set is 2n·sizeof(T)
+        # of traffic in each direction. The admission floor is in bytes moved, so it takes 4n.
+        nw = _l1_workers(4 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _swap_threaded!(Int(n), x, y, nw)
+        return _swap_simd!(Int(n), x, y)
+    end
     # Same reasoning as `_copy!`; here the scalar loop lowers to memcpy+memmove through a temporary and runs
     # 2.4-3.1x slower than `_swap_simd!` at every size measured (n=1e3..1e5, same probe).
     if incx == 1 && incy == 1 && (_cplx2(x, y) || _pair2(x, y))

@@ -227,9 +227,19 @@ Both modes share ONE set of low-level kernels. Source map:
    route than the winner's workers, the same call returns different bits depending on a race with an
    unrelated thread. That shipped once (`6940a2d3`).
 
-   **Forward constraint:** if `dot`/`nrm2` are ever threaded they break this by construction unless
-   their reduction tree is fixed independently of worker count. The standing decision not to thread
-   them is load-bearing.
+   **REDUCTIONS HOLD IT BY A FIXED BLOCK GRID.** `dot`, `asum` and `nrm2` are threaded, and the earlier
+   note here — that not threading them was load-bearing — no longer describes the code. The mechanism is
+   `_red_block(T)` in `src/simd_kernels.jl`: `n` is cut into `cld(n, _red_block(T))` blocks whose size is
+   a function of `(n, T)` alone, each block is reduced by the unchanged serial kernel, and the DRIVER
+   folds the partials in index order after the join and before `busy` is released. So a worker count
+   decides who computes a partial and never how the partials combine. The blocked form is the ONLY form,
+   used at one thread too — which changes results against earlier versions of this library, permitted
+   because req#11's scope is thread counts and not versions. The gate is
+   `test/level1_tests.jl` "L1 real: bit-identical at every thread count", whose size ladder is derived
+   FROM `_red_block` so it keeps testing the boundaries if that constant moves, plus a liveness witness,
+   a concurrent lost-claim item and a steady-state allocation item beside it.
+
+   `iamax` is NOT threaded: its result is an index rather than a value, and `_gemm_threaded!` returns `T`.
 
    **The gate** is `test/gemm_tests.jl` "gemm/symm: bit-identical at every thread count" and its
    syrk/syr2k sibling. Both compare `reinterpret(UInt64, …)` patterns, never a tolerance — a 1e-13

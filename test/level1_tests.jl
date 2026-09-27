@@ -429,6 +429,12 @@ end
                 r_nrm2 = P.nrm2(x)
                 r_axpy = (t = copy(y); P.axpy!(t, α, x); t)
                 r_scal = (t = copy(x); P.scal!(β, t); t)
+                # `blascopy!` and `swap!` move bytes and compute nothing, so no partition can change a
+                # value — but the SPLIT still has to cover the vector exactly once, which is what these
+                # catch: an off-by-one in `_l1_chunk` leaves a stale element behind and shows up here.
+                r_cp = (t = similar(y); P.blascopy!(t, x); t)
+                r_swx = copy(y)                              # after swap!(x, y), x holds y's values
+                r_swy = copy(x)
                 for nw in (2, nt)
                     P.set_num_threads(nw)
                     @test bitsame(P.dot(x, y), r_dot)
@@ -436,6 +442,12 @@ end
                     @test bitsame(P.nrm2(x), r_nrm2)
                     @test bitsame((t = copy(y); P.axpy!(t, α, x); t), r_axpy)
                     @test bitsame((t = copy(x); P.scal!(β, t); t), r_scal)
+                    @test bitsame((t = similar(y); P.blascopy!(t, x); t), r_cp)
+                    let a = copy(x), b = copy(y)
+                        P.swap!(a, b)
+                        @test bitsame(a, r_swx)
+                        @test bitsame(b, r_swy)
+                    end
                 end
                 P.set_num_threads(1)
             end
@@ -478,6 +490,8 @@ end
         @test ran(() -> P.nrm2(x))
         @test ran(() -> P.axpy!(copy(y), 0.75, x))
         @test ran(() -> P.scal!(2.5, copy(x)))
+        @test ran(() -> P.blascopy!(similar(y), x))
+        @test ran(() -> P.swap!(copy(x), copy(y)))
         P.set_num_threads(1)
     end
 end
