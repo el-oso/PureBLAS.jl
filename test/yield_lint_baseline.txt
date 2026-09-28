@@ -173,3 +173,7 @@ blas1/sme_l1.jl:println(io, "    <vscale x 2 x double> %av$(j)_2, <vscale x 2 x 
 blas1/sme_l1.jl:println(io, "    <vscale x 2 x double> %xv$(j)_0, <vscale x 2 x double> %xv$(j)_1,")
 blas1/sme_l1.jl:println(io, "    <vscale x 2 x double> %xv$(j)_2, <vscale x 2 x double> %xv$(j)_3,")
 blas1/sme_l1.jl:println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $j,")
+blas1/sme_l1.jl:print(io, _SME_AXPY_ATTRS)
+blas1/sme_l1.jl:println(io, "  %r$(k) = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %av, <vscale x 2 x double> %xv$(k), <vscale x 2 x double> %yv$(k))")
+blas1/sme_l1.jl:println(io, "  %xv$(k) = extractvalue $T4 %xr, $k")
+blas1/sme_l1.jl:println(io, "  %yv$(k) = extractvalue $T4 %yr, $k")

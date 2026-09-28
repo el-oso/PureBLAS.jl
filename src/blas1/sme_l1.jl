@@ -234,3 +234,111 @@ end
     end
     return s
 end
+
+# ── axpy: y += a*x ──────────────────────────────────────────────────────────────────────────────
+#
+# NOT a reduction, so ZA does not enter: there is nothing to accumulate, only a stream to widen.
+# What this buys over the NEON kernel is purely the vector width — 512-bit streaming loads and
+# stores moving four vectors per instruction instead of one 128-bit register.
+#
+# ⚠ THE CEILING HERE IS THE WRITE PATH, NOT THE READ PATH, which is why the gains are modest next to
+# `dot`'s: measured on this part, a pure read reaches 107 GB/s, a pure write 150, and memcpy 263
+# combined. `dot` went 7.4x because its wall was a dependency chain; axpy's is traffic.
+const _SME_AXPY_ATTRS = """
+attributes #0 = { noinline "aarch64_pstate_sm_body"
+  "target-features"="+sme,+sme2,+sme-f64f64" }
+"""
+
+function _sme_axpy_ir()
+    q = Char(34)
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    io = IOBuffer()
+    print(io, """
+declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
+declare void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, target($(q)aarch64.svcount$(q)), ptr)
+declare <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare i64 @llvm.vscale.i64()
+
+define void @entry(ptr %y, ptr %x, double %a, i64 %nb) {
+  call void @k(ptr %y, ptr %x, double %a, i64 %nb)
+  ret void
+}
+define internal void @k(ptr %y, ptr %x, double %a, i64 %nb) #0 {
+entry:
+  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  %vs = call i64 @llvm.vscale.i64()
+  %w = shl i64 %vs, 3
+  %e0 = insertelement <vscale x 2 x double> poison, double %a, i32 0
+  %av = shufflevector <vscale x 2 x double> %e0, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %go = icmp sgt i64 %nb, 0
+  br i1 %go, label %loop, label %done
+loop:
+  %b = phi i64 [ 0, %entry ], [ %bn, %loop ]
+  %o = mul nsw i64 %b, %w
+  %px = getelementptr inbounds double, ptr %x, i64 %o
+  %py = getelementptr inbounds double, ptr %y, i64 %o
+  %xr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %px)
+  %yr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %py)
+""")
+    for k in 0:3
+        println(io, "  %xv$(k) = extractvalue $T4 %xr, $k")
+        println(io, "  %yv$(k) = extractvalue $T4 %yr, $k")
+        println(io, "  %r$(k) = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %av, <vscale x 2 x double> %xv$(k), <vscale x 2 x double> %yv$(k))")
+    end
+    print(io, """
+  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %r0, <vscale x 2 x double> %r1, <vscale x 2 x double> %r2, <vscale x 2 x double> %r3, target($(q)aarch64.svcount$(q)) %pn, ptr %py)
+  %bn = add nuw nsw i64 %b, 1
+  %d = icmp eq i64 %bn, %nb
+  br i1 %d, label %done, label %loop
+done:
+  ret void
+}
+""")
+    print(io, _SME_AXPY_ATTRS)
+    return String(take!(io))
+end
+
+const _SME_AXPY_IR = _sme_axpy_ir()
+@inline _sme_axpy_k(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, nb::Int) =
+    Base.llvmcall((_SME_AXPY_IR, "entry"), Cvoid,
+                  Tuple{Ptr{Float64}, Ptr{Float64}, Float64, Int64}, y, x, a, Int64(nb))
+
+const _SME_AXPY_CALLS = Threads.Atomic{Int}(0)
+const _SME_AXPY_TRAMPOLINE = Ref{Any}(nothing)
+const _SME_AXPY_ENTRY      = Ref{Ptr{Cvoid}}(C_NULL)
+
+function _sme_axpy_cabi(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, nb::Int)
+    _sme_axpy_k(y, x, a, nb)
+    return nothing
+end
+
+# Measured cold with the gate's operand shape, SME against the NEON kernel it displaces:
+#
+#     n        16384  32768  65536  100000  300000  1000000
+#     SME/SIMD  0.71   0.80   0.98    1.18    1.28     1.29
+#
+# so it turns just above 65536, where it is still level. The floor sits one step past that rather
+# than on it.
+# PDM: Measured — where the wider streaming store overtakes the NEON kernel, in the operand shape and regime the sweep uses; a ratio between two kernels, not a residency criterion. | tune: sweep n
+const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 98304)::Int  # req8-ok: measured crossover, table above
+
+@inline _sme_axpy_ok(::Type{T}, n::Int, x, y) where {T} =
+    T === Float64 && _SME_F64 && n >= _SME_AXPY_MIN &&
+        _dense1(x) && _dense1(y) && _SME_AXPY_ENTRY[] !== C_NULL
+
+@noinline function _sme_axpy!(n::Int, a::Float64, x, y)
+    Threads.atomic_add!(_SME_AXPY_CALLS, 1)
+    nb = n ÷ _SME_L1_BLK
+    m = nb * _SME_L1_BLK
+    GC.@preserve x y begin
+        py = _sme_p(y); px = _sme_p(x)
+        nb > 0 && ccall(_SME_AXPY_ENTRY[], Cvoid,
+                        (Ptr{Float64}, Ptr{Float64}, Float64, Int), py, px, a, nb)
+        for i in m:(n - 1)
+            q = py + i * 8
+            unsafe_store!(q, muladd(a, unsafe_load(px + i * 8), unsafe_load(q)))
+        end
+    end
+    return y
+end

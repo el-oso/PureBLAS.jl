@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 163 of them.
+Every `@load_preference` key in `src/` — 164 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 163 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 75 Derived · 19 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 57 literal · 5 flag · 5 other.
+**Tier:** 75 Derived · 20 Measured · 51 Literal · 18 Exempt.
+**Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 58 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -267,6 +267,7 @@ Every `@load_preference` key in `src/` — 163 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | sweep n |
+| `sme_axpy_min` | literal | Measured | where the wider streaming store overtakes the NEON kernel, in the operand shape and regime the sweep uses; a ratio between two kernels, not a residency criterion. | sweep n |
 | `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | sweep n |
 | `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | candidate, (1,2,4,8) |
 

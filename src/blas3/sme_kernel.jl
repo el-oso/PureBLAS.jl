@@ -922,6 +922,13 @@ function _sme_init!()
     catch
         _SME_ASUM_ENTRY[] = C_NULL
     end
+    try
+        xf = _sme_axpy_cf()
+        _SME_AXPY_TRAMPOLINE[] = xf
+        _SME_AXPY_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, xf)
+    catch
+        _SME_AXPY_ENTRY[] = C_NULL
+    end
     # Both pointers are live now, so the kernels can be asked a question with a known answer.
     if _SME_ENTRY[] !== C_NULL && _SME_GEMV_ENTRY[] !== C_NULL && _SME_GEMVT_ENTRY[] !== C_NULL
         err = try
@@ -1661,6 +1668,7 @@ end
     _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_dot_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_asum_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_axpy_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
@@ -1674,6 +1682,8 @@ elseif _SME_STATIC
         (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
     _sme_asum_cf() = @cfunction(_sme_asum_cabi, Cvoid,
         (Ptr{Float64}, Ptr{Float64}, Int))
+    _sme_axpy_cf() = @cfunction(_sme_axpy_cabi, Cvoid,
+        (Ptr{Float64}, Ptr{Float64}, Float64, Int))
 else
     # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
     # inference folds it back to the concrete function and walks into the kernel anyway.
@@ -1702,5 +1712,9 @@ else
     function _sme_asum_cf()
         e = Base.inferencebarrier(_sme_asum_cabi)
         return @cfunction($e, Cvoid, (Ptr{Float64}, Ptr{Float64}, Int))
+    end
+    function _sme_axpy_cf()
+        p = Base.inferencebarrier(_sme_axpy_cabi)
+        return @cfunction($p, Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int))
     end
 end

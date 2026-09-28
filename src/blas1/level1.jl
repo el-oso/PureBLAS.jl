@@ -85,6 +85,8 @@ end
 # concrete call site every one of those tests const-folds to the single surviving branch.
 @inline function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
+    (incx == 1 && incy == 1 && _sme_axpy_ok(_et(x), Int(n), x, y)) &&
+        return _sme_axpy!(Int(n), Float64(a), x, y)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
     if incx == 1 && incy == 1 && _cplx2(x, y)
         ac = convert(_et(x), a)
