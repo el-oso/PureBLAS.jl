@@ -1860,6 +1860,25 @@ Current medians vs Accelerate (single thread; the bar moves once step 0 lands):
          gbmvN 0.46  ger 0.37    gemvT 0.34   gemvN 0.17
     L1   nrm2 1.96   axpy 1.19   dot 1.09     asum 1.00    iamax 0.93   scal 0.83
 
+Moved since that table was taken (re-measured with every arm in one run, so the cells are
+adjudicable; the other rows are older and were not re-measured with it):
+
+    L3   gemm  median 0.90 -> 0.94   worst cell 0.19 -> 0.24
+
+1.0  **✅ READ A IN PLACE INSTEAD OF PACKING IT (2026-09-28).** For `op(A) = A` a packed A panel is a
+     pure strided copy of the operand, so the macrokernel reads A itself once its four address
+     strides are runtime arguments — which costs nothing (0.994-1.018 against the constant-stride
+     IR, bit-identical). Packing A was 17% of the gemm at n=128 and its panel writes also evicted B
+     and C, so removing it is worth far more than the copy: packed/in-place 2.08 at n=64, 1.42 at
+     n=128, 1.20 at n=100. Capped at four L1-fuls of A block, sized under a worst-case stride.
+     The kernel's depth COUNT and a panel's depth STRIDE are now separate, so a ragged k runs `kce`
+     steps rather than `kpad` — that admits the route at any k and drops the padding `fmopa`s from
+     the packed route too. See `kb/findings/sme-read-a-in-place-instead-of-packing.md`: the
+     crossover is ADDRESS ALIASING rather than block size, and `_alias_ld` cannot express it here
+     because `_L1D_ASSOC` reads a CPUID leaf aarch64 does not have.
+     Still open: the same trick for B in the N,T form (syrk/syr2k), where B is n x k and its NR-run
+     is contiguous. `bjp`/`bks` are already runtime arguments.
+
 1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
      not wired in. Needs transposed operands, strides, beta handling and the portability guards the
      gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.
