@@ -446,6 +446,7 @@ end
 # at blocks of 5-30 L1-fuls is recorded above rather than claimed.
 # req8-ok: a coefficient over the DETECTED L1 with the falsifying table above, not a fitted magic
 # number — the criterion is A-block residency and the coefficient is where it was measured to flip.
+# PDM: Derived — A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a few L1-fuls, and the coefficient is where that was measured to flip under a worst-case stride. | tune: n/a, follows _L1_BYTES
 const _SME_INPLACE_MAX =
     @load_preference("sme_inplace_max", 4 * (_L1_BYTES ÷ sizeof(Float64)))::Int
 
