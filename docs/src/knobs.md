@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 158 of them.
+Every `@load_preference` key in `src/` — 160 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 158 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 74 Derived · 16 Measured · 50 Literal · 18 Exempt.
-**Default form** (mechanical): 66 formula · 22 delegates · 7 sibling · 53 literal · 5 flag · 5 other.
+**Tier:** 74 Derived · 17 Measured · 51 Literal · 18 Exempt.
+**Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 54 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -55,6 +55,8 @@ Every `@load_preference` key in `src/` — 158 of them.
 | `gemvt_pf` | delegates | Measured | prefetch distance depends on L2 hit latency and the hw streamer, neither detected; bounds derived, choice measured. | candidate, 0/2/4/8 lines |
 | `gemvt_u` | delegates | Derived | row unroll capped by the register file: NC*U + U + 2 <= _NVREG. | n/a |
 | `ger_panel_np` | delegates | Measured | optimum 8/4/1 on boxes that agree on L2/L3/width; tracks DRAM write streams. | 22 s |
+| `symv_sme_min` | sibling | Measured | where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | sweep n |
+| `symv_sme_nb` | literal | Literal | a block width for a decomposition, not a hardware knob: it sets how many columns share one pass over x and y in the split, and 128 measured best or tied at every size swept. | candidate, (32,64,128,256) |
 | `tri_c_blk_min` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 256 : 1024` | — |
 | `tri_c_t_unb` | literal | Literal | complex transpose unblocked/blocked crossover. | candidate |
 | `tri_nb` | formula | Derived | formula over detected consts: `clamp(_round_dn(isqrt(_L1_BYTES ÷ 8), 16), 16, 64` | — |

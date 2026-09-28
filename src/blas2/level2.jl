@@ -2773,10 +2773,72 @@ end
 end
 
 # y := α·A·x + β·y, A symmetric (`up` ⇒ upper triangle stored). Real dense → fused SIMD; else generic.
+# ── symv by blocks, so the off-diagonal can reach the matrix unit ───────────────────────────────
+#
+# THIS ONE IS A TRADE, NOT A ROUTING OVERSIGHT, and that is worth stating because the two look alike.
+# `_symv_simd!` reads each stored element ONCE and accumulates both directions from it — the classic
+# symmetric structure, and the reason its traffic is already minimal. Splitting an off-diagonal block
+# into a gemv-N and a gemv-T so both can reach SME reads that block TWICE. It wins anyway, because
+# the bandwidth it unlocks is worth more than the second pass:
+#
+#     n            192    256    320    384    512    768   1000   1024
+#     split/simd  0.94x  1.03x  1.15x  1.40x  1.77x  2.52x  2.92x  2.97x
+#
+# Only the OFF-DIAGONAL is split. The diagonal block stays on `_symv_simd!`: it is symmetric, so a
+# gemv of it would be wrong, and it is small enough that the fused kernel is the right tool.
+#
+#   upper, column block J:  rows above are I = 1:jb     lower:  rows below are I = jb+w+1:n
+#     y[I] += a*A[I,J] *x[J]   (gemv-N)     y[J] += a*A[I,J]'*x[I]   (gemv-T)
+#
+# `_tri_scat!`/`_tri_scatT!` ask SME and keep their SIMD drivers as the fallback, so a block the
+# predicate declines is still computed — just on the path it would have used anyway.
+function _symv_split!(up::Bool, n::Int, α::Float64, A, x, y)
+    nb = _SYMV_SME_NB
+    @inbounds begin
+        jb = 0
+        while jb < n
+            w = min(nb, n - jb)
+            J = (jb + 1):(jb + w)
+            if up
+                if jb > 0
+                    I = 1:jb
+                    Av = view(A, I, J)
+                    _tri_scat!(view(y, I), Av, view(x, J), α)
+                    _tri_scatT!(view(y, J), Av, view(x, I), α)
+                end
+            else
+                if jb + w < n
+                    I = (jb + w + 1):n
+                    Av = view(A, I, J)
+                    _tri_scat!(view(y, I), Av, view(x, J), α)
+                    _tri_scatT!(view(y, J), Av, view(x, I), α)
+                end
+            end
+            _symv_simd!(up, w, α, view(A, J, J), view(x, J), view(y, J))
+            jb += w
+        end
+    end
+    return y
+end
+
+# Block width for the split above. Measured at n=1000, best of (32, 64, 128, 256) at every size from
+# 192 up; 128 wins or ties everywhere, and it is also the width at which an off-diagonal block is
+# tall enough for the gemv predicates to admit it early.
+# PDM: Literal — a block width for a decomposition, not a hardware knob: it sets how many columns share one pass over x and y in the split, and 128 measured best or tied at every size swept. | tune: candidate, (32,64,128,256)
+const _SYMV_SME_NB = @load_preference("symv_sme_nb", 128)::Int   # req8-ok: swept, see the table above
+# The n below which the fused single-pass kernel still beats the split. Placed one step above the
+# measured break-even (256 ties, 320 wins by 15%) so a caller with its own cache traffic does not
+# land on the crossing — the same margin lesson the SME in-place cap records. INERT without SME.
+# PDM: Measured — where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | tune: sweep n
+const _SYMV_SME_MIN = @load_preference("symv_sme_min", _SME_F64 ? 384 : typemax(Int))::Int
+
 function _symv!(up::Bool, n::Integer, α::Number, A, x, incx::Integer, β::Number, y, incy::Integer)
     _scale_y!(Int(n), β, y, incy)
     iszero(α) && return y
     if _l2_simd_ok(A, x, y, incx, incy)
+        if eltype(A) === Float64 && Int(n) >= _SYMV_SME_MIN
+            return _symv_split!(up, Int(n), Float64(α), A, x, y)
+        end
         return _symv_simd!(up, Int(n), convert(eltype(A), α), A, x, y)
     end
     sx = _start(Int(n), incx); sy = _start(Int(n), incy)
