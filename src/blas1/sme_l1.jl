@@ -50,6 +50,8 @@ declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)),
 declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
   <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
   <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
 declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
 declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
 declare <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double>)
@@ -86,19 +88,26 @@ loop:
             end
         else
             for k in 0:3
-                println(io, "  %av$(j)_$(k) = call <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double> %xv$(j)_$(k))")
+                # FALSIFIED 2026-09-28: replacing this with a bitwise sign-bit clear (bitcast, AND with
+            # 0x7fff..., bitcast back) measured WORSE — gate 0.847 against 0.877 — so LLVM already
+            # lowers `fabs` to the right thing and the FP pipeline is not the contention. Removing
+            # the operation ENTIRELY runs 2.44x faster at n=100000, which prices the load-to-ZA
+            # dependency, not the absolute value. Do not retry the bitwise form.
+            println(io, "  %av$(j)_$(k) = call <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double> %xv$(j)_$(k))")
             end
         end
-        lhs = dotform ? "xv" : "av"
-        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $j,")
-        println(io, "    <vscale x 2 x double> %$(lhs)$(j)_0, <vscale x 2 x double> %$(lhs)$(j)_1,")
-        println(io, "    <vscale x 2 x double> %$(lhs)$(j)_2, <vscale x 2 x double> %$(lhs)$(j)_3,")
         if dotform
+            println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $j,")
+            println(io, "    <vscale x 2 x double> %xv$(j)_0, <vscale x 2 x double> %xv$(j)_1,")
+            println(io, "    <vscale x 2 x double> %xv$(j)_2, <vscale x 2 x double> %xv$(j)_3,")
             println(io, "    <vscale x 2 x double> %yv$(j)_0, <vscale x 2 x double> %yv$(j)_1,")
             println(io, "    <vscale x 2 x double> %yv$(j)_2, <vscale x 2 x double> %yv$(j)_3)")
         else
-            println(io, "    <vscale x 2 x double> %one, <vscale x 2 x double> %one,")
-            println(io, "    <vscale x 2 x double> %one, <vscale x 2 x double> %one)")
+            # Plain add-to-ZA: no ones vector and no multiply, which is four fewer operand
+            # registers and one less op per step than the fmla form this replaced.
+            println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $j,")
+            println(io, "    <vscale x 2 x double> %av$(j)_0, <vscale x 2 x double> %av$(j)_1,")
+            println(io, "    <vscale x 2 x double> %av$(j)_2, <vscale x 2 x double> %av$(j)_3)")
         end
     end
     print(io, """
@@ -160,7 +169,7 @@ const _SME_ASUM_CALLS = Threads.Atomic{Int}(0)
 # PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
 const _SME_DOT_MIN  = @load_preference("sme_dot_min", 65536)::Int   # req8-ok: measured crossover, table above
 # PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: sweep n
-const _SME_ASUM_MIN = @load_preference("sme_asum_min", 131072)::Int  # req8-ok: measured crossover, table above
+const _SME_ASUM_MIN = @load_preference("sme_asum_min", 65536)::Int  # req8-ok: measured crossover, table above
 
 const _SME_DOT_TRAMPOLINE  = Ref{Any}(nothing)
 const _SME_DOT_ENTRY       = Ref{Ptr{Cvoid}}(C_NULL)
