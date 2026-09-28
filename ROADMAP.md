@@ -1861,16 +1861,24 @@ Current medians vs Accelerate (single thread; the bar moves once step 0 lands):
     L1   nrm2 1.96   axpy 1.19   dot 1.09     asum 1.00    iamax 0.93   scal 0.83
 
 Moved since that table was taken (re-measured with every arm in one run, so the cells are
-adjudicable; the other rows are older and were not re-measured with it):
+adjudicable; the other rows are older and were not re-measured with it). Note the table above is
+headed "medians" but its `syrk 0.13` is a WORST CELL — syrk's median was 0.52 at that point — so the
+two sets of figures are not comparable row by row:
 
-    L3   gemm  median 0.90 -> 0.94   worst cell 0.19 -> 0.24
+    L3   gemm  median 0.90 -> 0.92   worst cell 0.19 -> 0.248
+         syrk  median 0.52 -> 0.56   worst cell 0.155 -> 0.149 (flat, inside a 0.066 spread)
+         trsm  median 0.46 -> 0.52   worst cell 0.264 -> 0.270
 
 1.0  **✅ READ A IN PLACE INSTEAD OF PACKING IT (2026-09-28).** For `op(A) = A` a packed A panel is a
      pure strided copy of the operand, so the macrokernel reads A itself once its four address
      strides are runtime arguments — which costs nothing (0.994-1.018 against the constant-stride
      IR, bit-identical). Packing A was 17% of the gemm at n=128 and its panel writes also evicted B
      and C, so removing it is worth far more than the copy: packed/in-place 2.08 at n=64, 1.42 at
-     n=128, 1.20 at n=100. Capped at four L1-fuls of A block, sized under a worst-case stride.
+     n=128, 1.20 at n=100. Capped at TWO L1-fuls of A block: four sat on the 1.05-1.06 edge of its
+     own table and `symm` at n=256 measured 0.936 there against 1.006 one step in. A cut validated
+     on SQUARE problems locks block area and stride together (`lda == n`) and never tests the narrow
+     window into a wide matrix that a recursion actually hands the kernel — sweep a cut against its
+     real callers, not only the routine it was written for.
      The kernel's depth COUNT and a panel's depth STRIDE are now separate, so a ragged k runs `kce`
      steps rather than `kpad` — that admits the route at any k and drops the padding `fmopa`s from
      the packed route too. See `kb/findings/sme-read-a-in-place-instead-of-packing.md`: the
