@@ -53,7 +53,9 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-5}
 
-mapfile -t files < <(ls bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+# while-read, not mapfile: macOS ships bash 3.2, where that builtin does not exist.
+files=()
+while IFS= read -r _ln; do [ -n "$_ln" ] && files+=("$_ln"); done < <(ls bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
 [ ${#files[@]} -eq 0 ] && { echo "no threaded cache files found (bench/mt_data_*.txt)"; exit 2; }
 
 echo "threaded caches under audit:"
