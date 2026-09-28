@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 154 of them.
+Every `@load_preference` key in `src/` — 155 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 154 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 72 Derived · 15 Measured · 49 Literal · 18 Exempt.
-**Default form** (mechanical): 65 formula · 22 delegates · 6 sibling · 51 literal · 5 flag · 5 other.
+**Tier:** 73 Derived · 15 Measured · 49 Literal · 18 Exempt.
+**Default form** (mechanical): 66 formula · 22 delegates · 6 sibling · 51 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -252,6 +252,7 @@ Every `@load_preference` key in `src/` — 154 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream. | — |
+| `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
 | `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
