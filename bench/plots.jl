@@ -1107,6 +1107,37 @@ function run_benchmarks()
                         end; s
                     ),
                 ),
+                (
+                    "blascopy", (c, m) -> (
+                        for _ in 1:m
+                            B.blascopy!(length(c[1]), c[1], 1, c[2], 1)
+                        end; c[2][1]
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            PureBLAS.blascopy!(c[2], c[1])
+                        end; c[2][1]
+                    ),
+                ),
+                (
+                    # Julia's stdlib has no `swap!` wrapper, so the reference is a direct ILP64 ccall
+                    # through LBT — the same library `ref=aocl` re-points, so this row honours the AOCL
+                    # comparison like every other.
+                    "swap", (c, m) -> (
+                        for _ in 1:m
+                            ccall(
+                                (:dswap_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                                (Ref{Int64}, Ptr{Float64}, Ref{Int64}, Ptr{Float64}, Ref{Int64}),
+                                Int64(length(c[1])), c[1], Int64(1), c[2], Int64(1)
+                            )
+                        end; c[1][1]
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            PureBLAS.swap!(c[1], c[2])
+                        end; c[1][1]
+                    ),
+                ),
             )
             _meas!(l1, "L1", nm, () -> sweep(s -> (randn(s), randn(s)), _sizes(L1SZ), ob, pb, _l1_repfn(_L1REP)))
         end
