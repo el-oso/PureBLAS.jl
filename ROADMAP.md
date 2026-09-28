@@ -1887,6 +1887,19 @@ two sets of figures are not comparable row by row:
      Still open: the same trick for B in the N,T form (syrk/syr2k), where B is n x k and its NR-run
      is contiguous. `bjp`/`bks` are already runtime arguments.
 
+1.0b **⛔ FALSIFIED: "cut the ~13% driver overhead at n=128" — there is no driver overhead.** Measured
+     layer by layer (`bench/probes/sme_driver_overhead.jl`, each row calling one layer directly),
+     `gemm!`'s kwarg entry, its argument checks and `_gemm_core!`'s routing together cost **-0.18 us
+     at n=128** — nothing outside noise. The 13% was the B PACK attributed to "driver", and in the
+     N,N form that pack cannot be removed the way A's was: `fmopa` needs NR values along B's n
+     direction at one k, and those are strided in column-major B whatever ZA slice orientation is
+     used. Against a 0.88 us gap to Accelerate at n=128 the budget is: B pack 1.60, tile grid above
+     the 1-fmopa/cycle floor 1.69, workspace+ccall 0.32, entry ~0. Holding the grid at 8x8 tiles and
+     moving only `kce` shows the grid's deficit is NOT a fixed prologue (per-tile overhead grows,
+     15.7 ns at kce=8 to 53.8 at kce=512) — it is ~1.3 us of C stores at ~98 GB/s, which is
+     irreducible, plus ~7% per depth step. Counting the C write, the grid sits 0.4 us off its true
+     floor. **The remaining target at this cell is the B pack, not the driver and not the kernel.**
+
 1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
      not wired in. Needs transposed operands, strides, beta handling and the portability guards the
      gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.

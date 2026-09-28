@@ -41,6 +41,32 @@ function explint_used(pat::Regex)
     return idx
 end
 
+"""
+Slots the REGISTRY comments describe as free, as `slot => the line that says so`.
+
+A registry line is `#   _EXPn  <description>` (or `_EXPINT[n]`), and it is read as an offer of a free
+slot when the description opens with the word "free". Ranges like `_EXPINT[2..4]  free` count for
+every slot they name.
+"""
+function explint_claimed_free(name::AbstractString)
+    free = Dict{Int, String}()
+    re = name == "_EXPINT" ?
+        r"^#\s*_EXPINT\[(\d+)(?:\.\.(\d+))?\]\s+(\w+)" :
+        r"^#\s*_EXP(\d+)\s+(\w+)"
+    for f in _explint_files(), ln in eachline(f)
+        m = match(re, ln)
+        isnothing(m) && continue
+        word = lowercase(m.captures[end])
+        word == "free" || continue
+        lo = parse(Int, m.captures[1])
+        hi = (name == "_EXPINT" && !isnothing(m.captures[2])) ? parse(Int, m.captures[2]) : lo
+        for k in lo:hi
+            free[k] = strip(ln)
+        end
+    end
+    return free
+end
+
 "Returns a vector of human-readable violations; empty means clean."
 function expint_scan()
     v = String[]
@@ -59,6 +85,20 @@ function expint_scan()
                 "this is an OUT-OF-BOUNDS READ rather than a bounds error. Grow the array IN THE SAME " *
                 "COMMIT as the new index."
         )
+        # A SLOT THE REGISTRY CALLS FREE WHILE src/ READS IT. The bounds check above cannot see this:
+        # the index is in range and the collision is silent, because the new experiment and the
+        # shipping arm it lands on share one boolean. Three slots were in that state at once
+        # (_EXP9 gating trmm's packed path, _EXP10 the side-R pad, _EXP11 complex rank-k 3M) — each
+        # entry said "free again" from an earlier campaign and the later reuse never updated it, so
+        # an A/B built on that word silently rerouted an unrelated routine mid-measurement.
+        used = explint_used(pat)
+        for (k, line) in sort!(collect(explint_claimed_free(name)); by = first)
+            k in used && push!(
+                v, "$name slot $k: the registry calls it FREE but src/ reads it. A claim on that " *
+                    "word collides with a shipping arm instead of conflicting visibly — correct the " *
+                    "registry line, or claim a different slot.\n      registry says: $line"
+            )
+        end
     end
     return v
 end
