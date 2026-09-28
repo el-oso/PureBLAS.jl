@@ -105,17 +105,22 @@ function _sme_macro_ir(overwrite::Bool)
     L = _SME_L
     io = IOBuffer()
     print(io, _SME_DECLS)
+    # The four operand strides are RUNTIME arguments, which is what lets the kernel read an operand
+    # IN PLACE instead of from a packed panel — a packed panel and a column-major operand differ in
+    # nothing else (see `_sme_pack_A!`'s layout and `_sme_unpacked_a`). Making them dynamic costs
+    # nothing: LLVM strength-reduces both loops to add chains either way, measured 0.994-1.018
+    # against the constant-stride form at n=64..1024 with bit-identical output.
+    args = "ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce, " *
+        "i64 %aip, i64 %aks, i64 %bjp, i64 %bks"
     print(io, """
-define void @entry(ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce) {
-  call void @macro(ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce)
+define void @entry($args) {
+  call void @macro($args)
   ret void
 }
 
-define internal void @macro(ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce) #0 {
+define internal void @macro($args) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
-  %kcmr = mul nsw i64 %kce, $(_SME_MR)
-  %kcnr = mul nsw i64 %kce, $(_SME_NR)
   %ldcnr = mul nsw i64 %ldc, $(_SME_NR)
   %anyi = icmp sgt i64 %nip, 0
   %anyj = icmp sgt i64 %njp, 0
@@ -124,7 +129,7 @@ entry:
 
 jploop:
   %jp = phi i64 [ 0, %entry ], [ %jpn, %jpend ]
-  %bo = mul nsw i64 %jp, %kcnr
+  %bo = mul nsw i64 %jp, %bjp
   %bpj = getelementptr inbounds double, ptr %bp, i64 %bo
   %co = mul nsw i64 %jp, %ldcnr
   %cj = getelementptr inbounds double, ptr %c, i64 %co
@@ -132,7 +137,7 @@ jploop:
 
 iploop:
   %ip = phi i64 [ 0, %jploop ], [ %ipn, %ipend ]
-  %ao = mul nsw i64 %ip, %kcmr
+  %ao = mul nsw i64 %ip, %aip
   %api = getelementptr inbounds double, ptr %ap, i64 %ao
   %cio = mul nsw i64 %ip, $(_SME_MR)
   %ci = getelementptr inbounds double, ptr %cj, i64 %cio
@@ -153,8 +158,8 @@ iploop:
 
 kloop:
   %kk = phi i64 [ 0, %iploop ], [ %kkn, %kloop ]
-  %aoff = mul nsw i64 %kk, $(_SME_MR)
-  %boff = mul nsw i64 %kk, $(_SME_NR)
+  %aoff = mul nsw i64 %kk, %aks
+  %boff = mul nsw i64 %kk, %bks
   %pa0 = getelementptr inbounds double, ptr %api, i64 %aoff
   %pa1 = getelementptr inbounds double, ptr %pa0, i64 $L
   %pb0 = getelementptr inbounds double, ptr %bpj, i64 %boff
@@ -204,25 +209,36 @@ end
 const _SME_MACRO_ACC = _sme_macro_ir(false)
 const _SME_MACRO_OVER = _sme_macro_ir(true)
 
+# `aip`/`bjp` step one panel-row / panel-column block; `aks`/`bks` step one depth position. A PACKED
+# panel and an operand read IN PLACE differ only in these four numbers — see `_sme_panel_strides`.
 @inline function _sme_macro!(
         C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
-        nip::Int, njp::Int, kce::Int, overwrite::Bool
+        nip::Int, njp::Int, kce::Int, aip::Int, aks::Int, bjp::Int, bks::Int, overwrite::Bool
     )
+    T = Tuple{
+        Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64,
+        Int64, Int64, Int64, Int64,
+    }
     if overwrite
         Base.llvmcall(
-            (_SME_MACRO_OVER, "entry"), Cvoid,
-            Tuple{Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64},
-            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce)
+            (_SME_MACRO_OVER, "entry"), Cvoid, T,
+            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks)
         )
     else
         Base.llvmcall(
-            (_SME_MACRO_ACC, "entry"), Cvoid,
-            Tuple{Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64},
-            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce)
+            (_SME_MACRO_ACC, "entry"), Cvoid, T,
+            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks)
         )
     end
     return nothing
 end
+
+# Strides for a PACKED panel of `kpad` depth positions: a row block is `kpad*MR` apart, a depth
+# position `MR` apart. The unpacked forms are in `_sme_panel_strides`.
+@inline _sme_packed_a_strides(kpad::Int) = (kpad * _SME_MR, _SME_MR)
+@inline _sme_packed_b_strides(kpad::Int) = (kpad * _SME_NR, _SME_NR)
 
 # ── B packing by ZA transpose ──────────────────────────────────────────────────────────────────
 # The kernel wants _SME_NR contiguous B values per k-step, i.e. a ROW of a column-major B. A ZA
@@ -384,6 +400,76 @@ function _sme_pack_B_edge!(
     return nothing
 end
 
+# ── Reading A in place instead of packing it ────────────────────────────────────────────────────
+# A packed A panel holds `Ap[ip*kpad*MR + p*MR + i] = A[ic + ip*MR + i, pc + p]`, so for op(A) = A
+# the pack is a PURE STRIDED COPY: the kernel can read A itself by taking `aks = lda` for its depth
+# step and `aip = MR` for its row-block step (`_sme_macro!`). A whole pass over A disappears — 17%
+# of the gemm at n=128, 28% counting both operands.
+#
+# The two routes are BITWISE EQUAL, and that is load-bearing, not incidental: the kernel sees the
+# same values in the same order either way, so which route a block takes cannot perturb a result.
+# Threading splits columns, so `mce` — and hence the choice — is the same for every worker anyway.
+#
+# It is not free, and the cost grows with the block. A packed panel is one contiguous stream the
+# hardware prefetcher covers; read in place, each depth step touches MR doubles — two whole cache
+# lines at MR=16, so no bytes are wasted — but the next step is `lda` away, which puts consecutive
+# steps on few L1 sets when `lda` is unlucky.
+#
+# Three preconditions, all structural:
+#   - op(A) = A. When A is transposed its MR-run is strided, not contiguous, and a copy is the only
+#     way to give the kernel what it loads.
+#   - alpha == 1. Scaling happens inside the contiguous packer; with no copy there is nowhere for it
+#     to ride. Routing it onto B instead would add a pass over the B panel, which is the cost this
+#     is removing.
+#   - The block is a whole number of tiles in m. An in-place read has no zero-filled remainder, so a
+#     padded ROW would read past the operand. Depth needs no such condition: the kernel's depth
+#     COUNT (`kce`) and a panel's depth STRIDE (`kpad`) are separate arguments, so a ragged k runs
+#     exactly `kce` steps and the padding is simply never reached.
+#
+# THE CUT IS SIZED FOR THE WORST `lda`, because the caller's is not ours to choose. Square Float64
+# through `gemm!`, A a view of a power-of-two-wide parent so the stride always aliases, packed
+# against in place (`bench/probes/sme_inplace_worstcase.jl`, _EXP9 A/B in one process):
+#
+#     A block / L1  0.25   0.56   1.00   1.56   2.25   3.06   4.00   5.06   6.25   9.00  16.00
+#     packed/inplc  1.939  1.599  1.418  1.111  1.102  1.053  1.057  0.968  0.982  0.959  0.949
+#
+# so in place pays up to four L1-fuls and loses beyond five. With a FRIENDLY stride (the same sizes
+# at lda+1) it wins everywhere measured, 1.14-1.91, and `sme_inplace_alias.jl` isolates that to the
+# stride alone: at n=512 the ratio is 0.967 at lda=512 and 1.143 at lda=513, nothing else changed.
+#
+# THE CUT KEEPS MARGIN, AND THAT IS NOT CAUTION — IT IS A MEASURED REQUIREMENT. The table above is
+# gemm walking its own operand; a caller that drives more traffic through the same cache tips the
+# same block negative. `symm` at n=256 measures 0.936 under a four-L1-ful cut and 1.006 under a
+# two-L1-ful one (`bench/probes/sme_inplace_regress.jl`, three independent probes agreeing), which is
+# exactly the 1.05-1.06 edge of the table giving way. Two L1-fuls costs gemm@256 5.7% and syrk@512
+# 10.2% — neither is a binding cell, and neither gate moves — and buys no regression anywhere
+# measured, which is the better resting state for a route every BLAS-3 routine reaches.
+#
+# WHY THE CUT IS RESIDENCY AND NOT AN ALIASING PREDICATE. `_alias_ld` exists for this class of
+# problem, but its period is `_L1_WAY_D` = L1 ÷ associativity, and associativity comes from a CPUID
+# leaf that does not exist on aarch64 — `_L1D_ASSOC` is the fallback 8 here, not a detected value. So
+# `_alias_ld` is false for every stride that actually loses on this machine (lda = 256, 512, 768,
+# 1024), and a set-conflict criterion cannot be founded on a number we are guessing. A residency cut
+# holds for any stride; widening it to admit friendly strides is left open, and the 7-20% it gives up
+# at blocks of 5-30 L1-fuls is recorded above rather than claimed.
+# req8-ok: a coefficient over the DETECTED L1 with the falsifying tables above, not a fitted magic
+# number — the criterion is A-block residency, and the coefficient sits one step inside the measured
+# flip so a caller with its own cache traffic does not land on the edge.
+# PDM: Derived — A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | tune: n/a, follows _L1_BYTES
+const _SME_INPLACE_MAX =
+    @load_preference("sme_inplace_max", 2 * (_L1_BYTES ÷ sizeof(Float64)))::Int
+
+@inline function _sme_inplace_cap()
+    ov = @inbounds _EXPINT[4]           # sweep override; 0 = the shipped cut
+    return ov > 0 ? ov : _SME_INPLACE_MAX
+end
+
+@inline function _sme_inplace_a(mce::Int, kce::Int, alpha::Float64, tA::Bool)
+    (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP9])) || return false
+    mce % _SME_MR == 0 || return false
+    return mce * kce <= _sme_inplace_cap()
+end
+
 # Scales a packed panel in place. Needed only when alpha must ride a panel built by the ZA
 # transpose, which has no scaling form; the panel is cache-resident at this point.
 function _sme_scale_panel!(P::Ptr{Float64}, len::Int, s::Float64)
@@ -502,20 +588,33 @@ function _sme_gemm!(
                 _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
                 bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
             end
+            bjp = kpad * NR
+            bks = NR
             ic = 0
             while ic < m
                 mce = min(MC, m - ic)
                 mpad = cld(mce, MR) * MR
-                if !tA
-                    _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
-                elseif kce == kpad && mce == mpad
-                    _sme_packb!(Ap, A + (pc + ic * lda) * 8, lda, kpad, mpad ÷ _SME_L)
+                local pa::Ptr{Float64}, aip::Int, aks::Int
+                if _sme_inplace_a(mce, kce, alpha, tA)
+                    # A itself IS the panel: the kernel walks it at `lda` and no copy happens.
+                    pa = A + (ic + pc * lda) * 8
+                    aip = MR
+                    aks = lda
                 else
-                    _sme_pack_B_edge!(Ap, A, lda, pc, ic, kce, mce, kpad)
+                    if !tA
+                        _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
+                    elseif kce == kpad && mce == mpad
+                        _sme_packb!(Ap, A + (pc + ic * lda) * 8, lda, kpad, mpad ÷ _SME_L)
+                    else
+                        _sme_pack_B_edge!(Ap, A, lda, pc, ic, kce, mce, kpad)
+                    end
+                    pa = Ap
+                    aip = kpad * MR
+                    aks = MR
                 end
                 _sme_macro_edges!(
-                    C, ldc, Ap, Bp, Cs, ic, jc, mce, nce, mpad, npad, kpad,
-                    overwrite_first && pc == 0
+                    C, ldc, pa, Bp, Cs, ic, jc, mce, nce, mpad, npad, kce, kpad,
+                    aip, aks, bjp, bks, overwrite_first && pc == 0
                 )
                 ic += MC
             end
@@ -529,10 +628,15 @@ end
 # Runs the macrokernel over a packed block. Whole tiles that fit inside C go straight in; a tile
 # that would overhang goes through a contiguous MRxNR scratch tile and is copied back live-part
 # only.
+#
+# `Ap`/`Bp` may be a packed panel or the operand itself; `aip`/`aks`/`bjp`/`bks` say which. An
+# operand read in place has no zero-filled remainder, so the caller only ever hands one to a block
+# whose own dimension is a whole number of tiles — every path below that runs PADDED tiles
+# (`mpad`>`mce`, `npad`>`nce`) is therefore reached only with packed panels on the padded side.
 function _sme_macro_edges!(
         C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
         Cs::Ptr{Float64}, ic::Int, jc::Int, mce::Int, nce::Int,
-        mpad::Int, npad::Int, kpad::Int, over::Bool
+        mpad::Int, npad::Int, kce::Int, kpad::Int, aip::Int, aks::Int, bjp::Int, bks::Int, over::Bool
     )
     MR = _SME_MR
     NR = _SME_NR
@@ -542,7 +646,8 @@ function _sme_macro_edges!(
     full_j = (nce % NR == 0)
     let pa = Ap, pb = Bp, pcs = Cs
         if full_i && full_j
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kpad, over)
+            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kce,
+                        aip, aks, bjp, bks, over)
             return nothing
         end
         # PAD THE BLOCK, NOT THE TILE, when it fits. The per-tile path below pays a macrokernel
@@ -556,7 +661,7 @@ function _sme_macro_edges!(
                     unsafe_load(C + ((ic + i) + (jc + j) * ldc) * 8) : 0.0
                 unsafe_store!(pcs + (i + j * mpad) * 8, v)
             end
-            _sme_macro!(pcs, mpad, pa, pb, nip, njp, kpad, false)
+            _sme_macro!(pcs, mpad, pa, pb, nip, njp, kce, aip, aks, bjp, bks, false)
             for j in 0:(nce - 1), i in 0:(mce - 1)
                 unsafe_store!(C + ((ic + i) + (jc + j) * ldc) * 8,
                               unsafe_load(pcs + (i + j * mpad) * 8))
@@ -567,15 +672,16 @@ function _sme_macro_edges!(
         nip_full = mce ÷ MR
         njp_full = nce ÷ NR
         if nip_full > 0 && njp_full > 0
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip_full, njp_full, kpad, over)
+            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip_full, njp_full, kce,
+                        aip, aks, bjp, bks, over)
         end
         for jp in 0:(njp - 1), ip in 0:(nip - 1)
             (ip < nip_full && jp < njp_full) && continue
             rows = min(MR, mce - ip * MR)
             cols = min(NR, nce - jp * NR)
             (rows <= 0 || cols <= 0) && continue
-            api = pa + ip * kpad * MR * 8
-            bpj = pb + jp * kpad * NR * 8
+            api = pa + ip * aip * 8
+            bpj = pb + jp * bjp * 8
             # Scratch tile is contiguous with leading dimension MR; seed it with the live C so
             # the accumulate is exact, and zero the dead part.
             for j in 0:(NR - 1), i in 0:(MR - 1)
@@ -583,7 +689,7 @@ function _sme_macro_edges!(
                     unsafe_load(C + ((ic + ip * MR + i) + (jc + jp * NR + j) * ldc) * 8) : 0.0
                 unsafe_store!(pcs + (i + j * MR) * 8, v)
             end
-            _sme_macro!(pcs, MR, api, bpj, 1, 1, kpad, false)
+            _sme_macro!(pcs, MR, api, bpj, 1, 1, kce, aip, aks, bjp, bks, false)
             for j in 0:(cols - 1), i in 0:(rows - 1)
                 unsafe_store!(
                     C + ((ic + ip * MR + i) + (jc + jp * NR + j) * ldc) * 8,
