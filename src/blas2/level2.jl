@@ -2003,6 +2003,16 @@ function _gemv!(
         if iszero(α)
             _scale_y!(Int(n), β, y, incy); return y
         end
+        # Apple SME, ahead of the SIMD path — the mirror of the untransposed branch above. The
+        # columns of A stream past exactly as they do there; what differs is that each column
+        # reduces to one element of `y` instead of scaling into all of them, so the accumulators
+        # live in ZA slices and fold at the end of a column group. The SIMD path it displaces runs
+        # at DRAM speed while A is still in L2, which is the whole gap: measured 3.7-3.9x from
+        # m=512 up, and the predicate declines the small m where the per-group fold does not
+        # amortise.
+        if _sme_gemvt_eligible(eltype(A), Int(m), Int(n), trans, cj, A, x, y, incx, incy)
+            return _sme_gemvt!(Int(m), Int(n), Float64(α), A, x, Float64(β), y)
+        end
         if _l2_simd_ok(A, x, y, incx, incy)
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
             return iszero(β) ? _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(true)) :
@@ -3196,10 +3206,41 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 #     a "small PB-self gain" reading of a whole-op sweep) is therefore a small REGRESSION here, and the
 #     scatter is 56–58% of blocked trsv's runtime, so it is not free. Shape matters more than the
 #     residency window: measure the kernel at the shape the CALLER issues, not at a square one.
-@inline _tri_scat!(yv, Av, xv, α) = _gemv_n_paneldrv!(size(Av, 1), size(Av, 2), α, Av, xv, yv, one(α), Val(false))
+#
+# ASK SME FIRST. Calling a panel driver directly is what kept this scatter OFF the matrix unit: the
+# SME predicate lives in `_gemv!`, one level above, so neither SME gemv could ever be reached from
+# trmv/trsv however fast they became. That is the same shape as the route-token failure the arena
+# and threading notes record — a capability that reaches one dispatch level and stops above the
+# switch that decides.
+#
+# The direct call stays as the fallback, for the reasons above; only the SME question is added in
+# front of it. And the win is larger HERE than on the square shapes the kernel was tuned on, which
+# is why the scatter's own shape had to be measured rather than assumed — shipping scatter against
+# SME at the same shape, NB columns by m rows:
+#
+#     NB=64      m=512   1024   2048   4096   8192
+#       N form   5.61x  6.36x  8.03x  8.09x  8.46x     (657 -> 819 GB/s)
+#       T form   2.73x  3.88x  4.90x  5.17x  5.63x     (349 -> 551 GB/s)
+#
+# `one(α)` is the beta the predicate is asked about: β=1 is an ACCUMULATE, and the N kernel's
+# overlapping tail block is only sound when it stores, so a height that is not a whole number of
+# blocks declines there by construction.
+@inline function _tri_scat!(yv, Av, xv, α)
+    m = size(Av, 1); n = size(Av, 2)
+    if _sme_gemv_eligible(eltype(Av), m, n, false, false, Av, xv, yv, 1, 1, one(α))
+        return _sme_gemv!(m, n, Float64(α), Av, xv, 1.0, yv)
+    end
+    return _gemv_n_paneldrv!(m, n, α, Av, xv, yv, one(α), Val(false))
+end
 # T-form off-diagonal: gemv-T kernel directly (no backend kwarg layer — ~200 ns/call dominated the
-# few off-diagonal calls at mid n). y_I += α·Avᵀ·xv  (β=1 accumulate).
-@inline _tri_scatT!(yv, Av, xv, α) = _gemv_t_simd!(size(Av, 1), size(Av, 2), α, Av, xv, one(α), yv, Val(false))
+# few off-diagonal calls at mid n). y_I += α·Avᵀ·xv  (β=1 accumulate). SME first, same as above.
+@inline function _tri_scatT!(yv, Av, xv, α)
+    m = size(Av, 1); n = size(Av, 2)
+    if _sme_gemvt_eligible(eltype(Av), m, n, true, false, Av, xv, yv, 1, 1)
+        return _sme_gemvt!(m, n, Float64(α), Av, xv, 1.0, yv)
+    end
+    return _gemv_t_simd!(m, n, α, Av, xv, one(α), yv, Val(false))
+end
 
 # ── real trmv: the n at which `_trmv_simd!` hands over (to `_trmv_fused8!` for N, blocked for T) ─────
 # DERIVE tier (cache residency), and BYTE-IDENTICAL to the predicate it replaces — see the block comment
@@ -3261,6 +3302,26 @@ end
     return 1
 end
 
+# The n at which real trmv-N stops taking the fused panel sweep and takes the blocked structure, so
+# its tall off-diagonal scatter can go to the SME gemv. Below it the fused sweep still wins: it holds
+# eight accumulators across the panel and never materialises a scatter at all, which is cheaper than
+# an offload while the triangle is small.
+#
+# INERT WITHOUT SME by construction — `typemax` leaves every other machine on the byte-identical path
+# it has today, so this carries no fleet risk and needs no fleet validation.
+#
+# Measured on an M6, `_trmv_fused8!` against the blocked structure at the shipped `_TRI_NB`, upper/N,
+# both checked against A*x (`bench/probes/sme_trmv_blocked.jl`):
+#
+#     n          256    512   1000   1024   2048   4096
+#     blocked/fused   0.84x  1.07x  1.63x  1.70x  1.71x  1.66x
+#
+# so 256 loses and everything from 512 up wins. req8-ok: a measured crossover with its table — where
+# a register-blocked fused sweep stops beating a matrix-unit offload is not readable off a cache size,
+# and the two paths are structurally different kernels rather than one knob.
+# PDM: Measured — where a register-blocked fused sweep stops beating a matrix-unit offload; the two arms are structurally different kernels, not one knob, and no cache size predicts the crossing. Inert (typemax) without SME. | tune: sweep n, upper/N
+const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 512 : typemax(Int))::Int
+
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # Block only once the triangle outgrows L2. Blocking exists to stop the per-column kernel
@@ -3287,7 +3348,12 @@ end
     n < _trmv_fused_min(eltype(A)) && return _trmv_simd!(up, tr, unit, n, A, x)
     # N forms: the fused F=8 panel sweep (see `_trmv_fused8!`) replaces the blocked
     # diagonal + tall-scatter structure. Requires unit-stride columns for the vector loads.
-    if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
+    #
+    # ...BUT ONLY BELOW `_TRMV_SME_MIN`. This early return is what kept real trmv-N off the matrix
+    # unit entirely: it returns before the blocked structure below, so `_tri_scat!` — and with it the
+    # SME gemv it now asks for — was unreachable for exactly the form the gate measures. Witnessed
+    # rather than reasoned: trmv-N made ZERO SME calls at every size while trmv-T made 4 to 60.
+    if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x) && n < _TRMV_SME_MIN
         return _trmv_fused8!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).

@@ -3418,7 +3418,7 @@ end
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
 const _EXPINT = fill(0, 9)
-const _EXPFLAG = fill(false, 18)
+const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
 # Adding a named const per knob DEFEATS the table and costs a full restart each time: Revise declares a
@@ -3427,7 +3427,7 @@ const _EXPFLAG = fill(false, 18)
 # recompilation lands inside timed rounds (measured A/A sigma 0.008 -> 0.139). Do not add names below.
 const _EXP1, _EXP2, _EXP3, _EXP4, _EXP5, _EXP6, _EXP7, _EXP8 = 1, 2, 3, 4, 5, 6, 7, 8
 const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11, 12, 13, 14, 15, 16
-const _EXP17, _EXP18 = 17, 18
+const _EXP17, _EXP18, _EXP19 = 17, 18, 19
 # REGISTRY — update these COMMENTS, never the const list above:
 #   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
 #   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
@@ -3531,6 +3531,9 @@ const _EXP17, _EXP18 = 17, 18
 #          `_sme_inplace_cap()`.
 #   _EXP18 INVERTED: set true to DISABLE the SME in-place-B route (`_sme_inplace_b`), the mirror of
 #          _EXP17 for the other operand. In place SHIPS ON under `_sme_inplace_cap()`.
+#   _EXP19 INVERTED: set true to DISABLE the SME gemv-T route (`_sme_gemvt_eligible`) so the kernel
+#          and the SIMD path it displaces can be compared in ONE process. SHIPS ON above
+#          `_SME_GEMVT_MINM`.
 #   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
