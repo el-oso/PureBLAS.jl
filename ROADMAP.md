@@ -1907,9 +1907,14 @@ two sets of figures are not comparable row by row:
      irreducible, plus ~7% per depth step. Counting the C write, the grid sits 0.4 us off its true
      floor. **The remaining target at this cell is the B pack, not the driver and not the kernel.**
 
-1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
-     not wired in. Needs transposed operands, strides, beta handling and the portability guards the
-     gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.
+1.1  **~~Integrate the gemv prototype~~ — ALREADY DONE, and this item was stale.** The SME gemv is
+     live: `level2.jl:1968` asks `_sme_gemv_eligible` and calls `_sme_gemv!`, landed 2026-09-25 in
+     #2. The item said "it is not wired in", which was true when written and had not been revisited.
+     **The gemvN/gemvT figures quoted anywhere above are older than the integration** — the L2 cells
+     were measured 2026-09-22 at `76cac7b6`, three days before it landed, so `gemvN 0.17` and
+     `gemvT 0.34` describe code that no longer runs. L2 needs re-measuring before any gemv gap is
+     ranked or worked on. (`bench/cache_staleness.sh` reports this now that it runs on macOS at all;
+     it was silently answering "no cache files found" on this box until #19.)
 
 1.2  **Re-derive the Level-3 pack cutoffs.** `syrk` and `syr2k` did not move at all when gemm went
      from 44 to 500 GFLOP/s — 0.13 and 0.14 before and after. They take a private packed path above a
