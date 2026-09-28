@@ -858,6 +858,23 @@ function _sme_selftest()
         _sme_gemv!(m, n, 1.25, A, x, bet, got)
         worst = max(worst, maximum(abs, got .- want) / maximum(abs, want))
     end
+    # gemv-T: a row count that is NOT a multiple of the group height and a column count that is not
+    # a multiple of NC, so both tails run, plus an accumulate form.
+    for (m, n, bet) in ((_SME_GEMVT_MINM + 4 * _SME_L + 5, _SME_GEMVT_NC * 3 + 1, 0.0),
+                        (_SME_GEMVT_MINM, _SME_GEMVT_NC * 2, 0.5))
+        A = gen(m, n); x = [1.0 + 0.25 * i for i in 1:m]; y0 = gen(n, 1)[:, 1]
+        want = copy(y0)
+        for j in 1:n
+            s = 0.0
+            for i in 1:m
+                s = muladd(A[i, j], x[i], s)
+            end
+            want[j] = 1.25 * s + bet * want[j]
+        end
+        got = copy(y0)
+        _sme_gemvt!(m, n, 1.25, A, x, bet, got)
+        worst = max(worst, maximum(abs, got .- want) / maximum(abs, want))
+    end
     return worst
 end
 
@@ -884,16 +901,23 @@ function _sme_init!()
     catch
         _SME_GEMV_ENTRY[] = C_NULL
     end
+    try
+        tf = _sme_gemvt_cf()
+        _SME_GEMVT_TRAMPOLINE[] = tf
+        _SME_GEMVT_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, tf)
+    catch
+        _SME_GEMVT_ENTRY[] = C_NULL
+    end
     # Both pointers are live now, so the kernels can be asked a question with a known answer.
-    if _SME_ENTRY[] !== C_NULL && _SME_GEMV_ENTRY[] !== C_NULL
+    if _SME_ENTRY[] !== C_NULL && _SME_GEMV_ENTRY[] !== C_NULL && _SME_GEMVT_ENTRY[] !== C_NULL
         err = try
             _sme_selftest()
         catch e
-            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL
+            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL; _SME_GEMVT_ENTRY[] = C_NULL
             rethrow(e)
         end
         if !(err < 1e-12)
-            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL
+            _SME_ENTRY[] = C_NULL; _SME_GEMV_ENTRY[] = C_NULL; _SME_GEMVT_ENTRY[] = C_NULL
             # The message carries NO interpolated value and prints nothing. `__init__` is in the
             # trim graph, where `error("...$x...")` lowers to `print_to_string` over a
             # `Vararg{Any}` tuple and `--trim=safe` rejects it as an unresolved call; and IO here
@@ -934,8 +958,26 @@ end
 # today: n=40 0.81x (loses), n=50 1.25x, n=72 1.92x, n=88 2.52x. The wins begin at 50 and n=40 is
 # still excluded by `_SME_MIN_EXACT` = 48, so the surviving floor is the one that separates them.
 # Tile-exact sizes already on SME are unchanged: n=64 0.99, n=80 1.00, n=96 1.04.
+# A TILE-EXACT SHAPE HAS ITS OWN, LOWER FLOOR — it pays no remainder panel at all, so the only cost
+# it carries above two whole tiles is the kernel's own prologue. `_SME_MIN_EXACT` is the floor for a
+# RAGGED shape, which must also amortise the padded block; that separation is what the surviving
+# floor above was measuring, and re-running the crossover dense (every n, not every other, for the
+# reason the `_SME_MIN` note records) puts the exact floor two tiles down:
+#
+#     n         16    24    32    33    40    47    48    49    64    80    96
+#     SME/NEON 1.42  0.29  4.92  0.66  0.93  1.43  6.84  1.36  7.15  9.00  9.42
+#
+# Exact multiples of MR win from 32 — n=32 measures 4.92x the path it was declining to — while
+# ragged shapes do not turn until ~47, which `_SME_MIN_EXACT` = 3*MR already separates. Lowering the
+# single floor to 32 instead would admit n=33 at 0.66 and n=40 at 0.93.
+#
+# ⚠ Those ragged figures were 0.44 / 0.67 / 0.96 at n=49 / 65 / 81 when the floor was last set. They
+# moved because gemm now reads its operands in place; see the stale-calibration note in
+# `_SYR2K_SME_MIN`. This predicate is the same kind of frozen comparison and wants re-running
+# whenever the kernel under it changes.
 @inline function _sme_tile_ok(m, n)
     min(m, n) >= 2 * _SME_MR || return false
+    (m % _SME_MR == 0 && n % _SME_MR == 0) && return true
     return max(m, n) >= _SME_MIN_EXACT
 end
 
@@ -1247,6 +1289,219 @@ end
 const _SME_GEMV_TRAMPOLINE = Ref{Any}(nothing)     # roots the closure against collection
 const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 
+# ══ gemv-T: y += alpha*A'x ══════════════════════════════════════════════════════════════════════
+#
+# THE TWO FORMS STREAM A IDENTICALLY — column by column, contiguous — and differ only in the
+# arithmetic. gemv-N multiplies a column by a BROADCAST SCALAR and accumulates into a vector
+# (`fmla.single.vg1x4`); gemv-T multiplies a column by a VECTOR and accumulates into a scalar, so it
+# takes the multi-vector `fmla.vg1x4` and reduces at the end. Because the traffic is the same, the
+# bandwidth the N form reaches is available here too, and it is bandwidth that this routine wants:
+# without it gemvT sits at DRAM speed while its operand is in L2.
+#
+# `NC` COLUMNS ARE IN FLIGHT AT ONCE, each owning one vg1x4 group of four ZA slices. That buys three
+# things at once: `x` is loaded once per 4L rows and reused NC times, the horizontal reduction is
+# paid once per NC columns rather than once per column, and there are 4*NC independent accumulator
+# chains — the quantity the N form measured as decisive (256.7 GB/s at one slice group, 1013 at
+# four). It costs NC concurrent A streams, which is why the widest NC is not the fastest.
+#
+# ACCUMULATES into y, as the N form does, so `beta` is applied by the caller before the call.
+function _gemvt_ir(nc::Int)
+    nc <= 2 * _SME_L || throw(ArgumentError(
+        "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
+    L = _SME_L
+    q = Char(34)
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
+declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
+
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk)
+  ret void
+}
+
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  %anyb = icmp sgt i64 %nblk, 0
+  br i1 %anyb, label %blk, label %fin
+
+blk:
+  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
+  %jb = mul nsw i64 %b, $nc
+  %yblk = getelementptr inbounds double, ptr %y, i64 %jb
+  %aoff = mul nsw i64 %jb, %lda
+  %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %anyr = icmp sgt i64 %m, 0
+  br i1 %anyr, label %row, label %rd
+
+row:
+  %i = phi i64 [ 0, %blk ], [ %in, %row ]
+  %xp = getelementptr inbounds double, ptr %x, i64 %i
+  %xr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xp)
+  %xv0 = extractvalue $T4 %xr, 0
+  %xv1 = extractvalue $T4 %xr, 1
+  %xv2 = extractvalue $T4 %xr, 2
+  %xv3 = extractvalue $T4 %xr, 3
+""")
+    for c in 0:(nc - 1)
+        println(io, "  %co$c = mul nsw i64 %lda, $c")
+        println(io, "  %cb$c = getelementptr inbounds double, ptr %ablk, i64 %co$c")
+        println(io, "  %ap$c = getelementptr inbounds double, ptr %cb$c, i64 %i")
+        println(io, "  %ar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %ap$c)")
+        for k in 0:3
+            println(io, "  %av$(c)_$k = extractvalue $T4 %ar$c, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+        println(io, "    <vscale x 2 x double> %av$(c)_0, <vscale x 2 x double> %av$(c)_1,")
+        println(io, "    <vscale x 2 x double> %av$(c)_2, <vscale x 2 x double> %av$(c)_3,")
+        println(io, "    <vscale x 2 x double> %xv0, <vscale x 2 x double> %xv1,")
+        println(io, "    <vscale x 2 x double> %xv2, <vscale x 2 x double> %xv3)")
+    end
+    print(io, """
+  %in = add nuw nsw i64 %i, $(4 * L)
+  %rdone = icmp sge i64 %in, %m
+  br i1 %rdone, label %rd, label %row
+
+rd:
+""")
+    for c in 0:(nc - 1)
+        println(io, "  %o$c = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $c)")
+        for k in 0:3
+            println(io, "  %zv$(c)_$k = extractvalue $T4 %o$c, $k")
+        end
+        # The four slice vectors of a group are partial sums of ONE column, so folding them and the
+        # lanes is a reduction of that column's dot product; `reassoc` lets it be a tree rather than
+        # the sequential FADDA, which is the whole point of holding four chains.
+        println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
+        println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
+        println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
+        println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
+        println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
+        println(io, "  %yo$c = load double, ptr %yp$c, align 8")
+        println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
+        println(io, "  store double %r$c, ptr %yp$c, align 8")
+    end
+    print(io, """
+  br label %bend
+
+bend:
+  %bn = add nuw nsw i64 %b, 1
+  %bdone = icmp eq i64 %bn, %nblk
+  br i1 %bdone, label %fin, label %blk
+
+fin:
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+
+declare double @llvm.fmuladd.f64(double, double, double)
+""")
+    print(io, _SME_ATTRS)
+    return String(take!(io))
+end
+
+# Column groups in flight. Bounded above by the vg1x4 groups ZA can address; the useful range is
+# narrower and is chosen per call by `_sme_gemvt_nc`.
+const _SME_GEMVT_NCS = (2, 4, 8)
+const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc) for nc in _SME_GEMVT_NCS)
+
+for nc in _SME_GEMVT_NCS
+    @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb) =
+        Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid,
+            Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
+            y, a, Int64(l), x, Int64(m), al, Int64(nb))
+end
+
+@inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb)
+    nc == 2 && return _sme_gemvt2(y, a, l, x, m, al, nb)
+    nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb)
+    return _sme_gemvt8(y, a, l, x, m, al, nb)
+end
+
+# Measured on square Float64 through `gemv!`, best NC per size (bench/probes/sme_gemvt_proto.jl):
+#     n        128   256   512  1024  2048
+#     NC=2    1.00  2.69  3.79  4.14  1.94
+#     NC=4    1.00  2.64  3.93  4.30  2.05
+#     NC=8    0.99  2.31  2.78  3.53  1.99
+# Four is the best or within noise of it everywhere, and eight is worse at every size — the extra
+# concurrent A streams cost more than the x traffic they save. So NC is not swept per call.
+# PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (2,4,8)
+const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
+
+# THE FLOOR IS ON m, NOT ON m*n, and that is the whole difference from the N form's cut. The fixed
+# cost here is per COLUMN BLOCK — zero ZA, read four slices back, fold and reduce — and the work a
+# block does is proportional to m, so the overhead ratio falls as 1/(NC*m) and does not care how
+# many columns follow. Measured through `gemv!`, prototype against the SIMD path it displaces:
+#
+#     m          64    100    128    256    512   1000   1024   2048
+#     speedup  0.47   0.28   0.99   2.69   3.89   3.68   3.90   1.94
+#
+# so it LOSES below m = 128 and pays from 256 up. An `m*n` cut of the N form's shape would have
+# admitted m=n=100 at 10000 elements and shipped a 3.6x regression there.
+# PDM: Derived — the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | tune: sweep m at fixed n
+const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 2 * _SME_GEMV_BLK * 4)::Int
+
+# y += alpha*A'x. Bulk columns and whole 4L-row groups run on ZA; the two tails are scalar, and both
+# are bounded: the row tail is under 4L rows of every column, the column tail under NC whole columns.
+function _sme_gemvt_cabi(
+        y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
+        m::Int, n::Int, alpha::Float64
+    )
+    nc = _SME_GEMVT_NC
+    rb = 4 * _SME_L
+    mb = (m ÷ rb) * rb                    # rows the kernel covers
+    nb = (n ÷ nc) * nc                    # columns the kernel covers
+    if mb > 0 && nb > 0
+        _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
+    end
+    # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
+    if mb < m
+        for j in 0:(nb - 1)
+            aj = a + j * lda * 8
+            s = 0.0
+            for i in mb:(m - 1)
+                s = muladd(unsafe_load(aj + i * 8), unsafe_load(x + i * 8), s)
+            end
+            q = y + j * 8
+            unsafe_store!(q, muladd(alpha, s, unsafe_load(q)))
+        end
+    end
+    # Column tail: whole columns past the last group.
+    for j in nb:(n - 1)
+        aj = a + j * lda * 8
+        s = 0.0
+        for i in 0:(m - 1)
+            s = muladd(unsafe_load(aj + i * 8), unsafe_load(x + i * 8), s)
+        end
+        q = y + j * 8
+        unsafe_store!(q, muladd(alpha, s, unsafe_load(q)))
+    end
+    return nothing
+end
+
+const _SME_GEMVT_TRAMPOLINE = Ref{Any}(nothing)    # roots the closure against collection
+const _SME_GEMVT_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
+
+# `y` is n long and `x` is m long here — the mirror of the N form — and the kernel reads A as raw
+# column-major Float64 with unit row stride.
+@inline _sme_gemvt_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy) where {T} =
+    T === Float64 && _SME_F64 && trans && !cj && !(@inbounds _EXPFLAG[_EXP19]) && incx == 1 && incy == 1 &&
+        eltype(x) === Float64 && eltype(y) === Float64 &&
+        _strided1(A) && _dense1(x) && _dense1(y) &&
+        m >= _SME_GEMVT_MINM && n > 0 && _SME_GEMVT_ENTRY[] !== C_NULL
+
 # Mode 1 hands `x` and `y` as RAW POINTERS (`cabi_l2.jl` wraps only A, as a `PtrMatrix`), and
 # `_dense1` admits those by design, so the operands here are `Ptr` or `Vector` depending on which
 # mode called. `pointer` covers the array cases; the `Ptr` identity covers the C ABI.
@@ -1283,6 +1538,36 @@ const _SME_CALLS = Threads.Atomic{Int}(0)
 # gemv answers zero whatever happens, and a control is the only thing that catches that — a plain
 # `gemv!` reports zero there too, which is impossible if the counter covered it.
 const _SME_GEMV_CALLS = Threads.Atomic{Int}(0)
+
+# The transposed kernel's own witness, for the same reason the N form has one: a predicate that
+# silently declines and a kernel that is genuinely no faster produce the same null result.
+const _SME_GEMVT_CALLS = Threads.Atomic{Int}(0)
+
+# y := alpha*A'x + beta*y. The kernel ACCUMULATES, so beta is applied here first — over `n` elements,
+# which is the short side, so the extra pass is negligible against the m*n stream.
+@noinline function _sme_gemvt!(m::Int, n::Int, alpha::Float64, A, x, beta::Float64, y)
+    Threads.atomic_add!(_SME_GEMVT_CALLS, 1)
+    lda = stride(A, 2)
+    GC.@preserve y A x begin
+        py = _sme_p(y)
+        if iszero(beta)
+            for j in 0:(n - 1)
+                unsafe_store!(py + j * 8, 0.0)
+            end
+        elseif !isone(beta)
+            for j in 0:(n - 1)
+                q = py + j * 8
+                unsafe_store!(q, beta * unsafe_load(q))
+            end
+        end
+        ccall(
+            _SME_GEMVT_ENTRY[], Cvoid,
+            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64),
+            py, _sme_p(A), lda, _sme_p(x), m, n, alpha
+        )
+    end
+    return y
+end
 
 @noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
                              tA::Bool, tB::Bool)
@@ -1359,6 +1644,7 @@ end
     # `OptimizationFailureReport in PureBLAS._gemm_core!` on x86.
     _sme_entry_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
@@ -1366,6 +1652,8 @@ elseif _SME_STATIC
          Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
     _sme_gemv_cf() = @cfunction(_sme_gemv_cabi, Cvoid,
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+    _sme_gemvt_cf() = @cfunction(_sme_gemvt_cabi, Cvoid,
+        (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
 else
     # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
     # inference folds it back to the concrete function and walks into the kernel anyway.
@@ -1381,5 +1669,10 @@ else
         g = Base.inferencebarrier(_sme_gemv_cabi)
         return @cfunction($g, Cvoid,
             (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
+    end
+    function _sme_gemvt_cf()
+        h = Base.inferencebarrier(_sme_gemvt_cabi)
+        return @cfunction($h, Cvoid,
+            (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
     end
 end

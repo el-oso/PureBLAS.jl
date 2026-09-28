@@ -121,3 +121,28 @@ blas3/sme_kernel.jl:println(io, "  %z$(g)_$k = extractvalue $T4 %o$g, $k")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
 blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %ys$(g)_$k, ptr %yp$(g)_$k, align 8")
 blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %z$(g)_$k, ptr %yp$(g)_$k, align 8")
+
+# --- 2026-09-28, the gemv-T IR generator (`_gemvt_ir`). Same class as the 2026-09-24 block above and
+#              for the same reason: an LLVM IR *generator* interpolating tile geometry into an
+#              in-memory `IOBuffer`, run once at module load while the trampoline is built, holding
+#              no `@scope` and reaching no IO lock. Read that note before adding more.
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %av$(c)_0, <vscale x 2 x double> %av$(c)_1,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %av$(c)_2, <vscale x 2 x double> %av$(c)_3,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %xv0, <vscale x 2 x double> %xv1,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %xv2, <vscale x 2 x double> %xv3)")
+blas3/sme_kernel.jl:println(io, "  %ap$c = getelementptr inbounds double, ptr %cb$c, i64 %i")
+blas3/sme_kernel.jl:println(io, "  %ar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %ap$c)")
+blas3/sme_kernel.jl:println(io, "  %av$(c)_$k = extractvalue $T4 %ar$c, $k")
+blas3/sme_kernel.jl:println(io, "  %cb$c = getelementptr inbounds double, ptr %ablk, i64 %co$c")
+blas3/sme_kernel.jl:println(io, "  %co$c = mul nsw i64 %lda, $c")
+blas3/sme_kernel.jl:println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
+blas3/sme_kernel.jl:println(io, "  %o$c = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $c)")
+blas3/sme_kernel.jl:println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
+blas3/sme_kernel.jl:println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
+blas3/sme_kernel.jl:println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
+blas3/sme_kernel.jl:println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
+blas3/sme_kernel.jl:println(io, "  %yo$c = load double, ptr %yp$c, align 8")
+blas3/sme_kernel.jl:println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
+blas3/sme_kernel.jl:println(io, "  %zv$(c)_$k = extractvalue $T4 %o$c, $k")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+blas3/sme_kernel.jl:println(io, "  store double %r$c, ptr %yp$c, align 8")
