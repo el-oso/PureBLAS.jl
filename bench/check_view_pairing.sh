@@ -8,13 +8,19 @@
 #
 #   git diff --name-only base head | bench/check_view_pairing.sh
 set -u
-mapfile -t changed
-declare -A seen
+# while-read and a delimited string, not mapfile and `declare -A`: macOS ships bash 3.2, which has
+# neither. `|` is a safe delimiter here because every key is a repository path.
+changed=()
+while IFS= read -r _ln; do [ -n "$_ln" ] && changed+=("$_ln"); done
+keys=()
+seen="|"
 for f in "${changed[@]}"; do
-    case "$f" in docs/src/assets/perf_*.svg) seen["$f"]=1 ;; esac
+    case "$f" in docs/src/assets/perf_*.svg)
+        case "$seen" in *"|$f|"*) ;; *) seen="$seen$f|"; keys+=("$f") ;; esac ;;
+    esac
 done
 rc=0
-for f in "${!seen[@]}"; do
+for f in "${keys[@]}"; do
     case "$f" in
         *_lite.svg) continue ;;                       # gitignored smoke artifacts; never committed
         # DUAL groups (DL1/DL2/DL3/DLP) have ONE view and always will: their reference arm is
@@ -33,7 +39,7 @@ for f in "${!seen[@]}"; do
     # beside it about the same fleet.
     for other in "$base.svg" "${base}_aocl.svg" "${base}_gate.svg"; do
         [ "$other" = "$f" ] && continue
-        [ -n "${seen[$other]:-}" ] && continue
+        case "$seen" in *"|$other|"*) continue ;; esac
         echo "UNPAIRED: $f changed but $other did not"
         rc=1
     done
