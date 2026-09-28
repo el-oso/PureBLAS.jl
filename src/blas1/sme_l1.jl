@@ -144,14 +144,23 @@ const _SME_ASUM_IR = _sme_l1_ir(_SME_L1_G, :asum)
 const _SME_DOT_CALLS  = Threads.Atomic{Int}(0)
 const _SME_ASUM_CALLS = Threads.Atomic{Int}(0)
 
-# Measured crossovers against the kernels these displace, both warm and resident: `dot` turns at
-# n = 1024 (1.20x) and `asum` at n = 2048 (0.98x, i.e. still level there). Each floor sits one step
-# above its own crossing so a caller with its own cache traffic does not land on it.
+# THE FLOOR IS A COLD CROSSING, NOT A WARM ONE, and that distinction is the whole of it. Warm, the
+# ZA prologue amortizes over repeated passes and the route turns at n = 1024; cold it is paid once,
+# on a single pass, which is what BLAS-1 is graded on. Measured cold, ZA against the kernel it
+# displaces (`bench/probes/l1_za_cold_floor.jl`):
+#
+#     n         4096   8192  16384  32768  65536  131072  262144  976000
+#     dot       0.36   0.70   0.84   0.92   1.75    3.23    3.28    1.41
+#     asum      0.21   0.33   0.59   0.66   0.77    1.22    1.46    1.43
+#
+# so dot turns near 65536 and asum near 131072 — 32x and 16x above where the warm crossings sit.
+# Floors placed one step above each, because a floor set from the wrong regime is what put dot
+# at 0.842 of OpenBLAS on the first attempt.
 # PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
 # PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
-const _SME_DOT_MIN  = @load_preference("sme_dot_min", 2048)::Int   # req8-ok: measured crossover, table above
+const _SME_DOT_MIN  = @load_preference("sme_dot_min", 65536)::Int   # req8-ok: measured crossover, table above
 # PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: sweep n
-const _SME_ASUM_MIN = @load_preference("sme_asum_min", 4096)::Int  # req8-ok: measured crossover, table above
+const _SME_ASUM_MIN = @load_preference("sme_asum_min", 131072)::Int  # req8-ok: measured crossover, table above
 
 const _SME_DOT_TRAMPOLINE  = Ref{Any}(nothing)
 const _SME_DOT_ENTRY       = Ref{Ptr{Cvoid}}(C_NULL)
