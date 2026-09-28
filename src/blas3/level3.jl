@@ -3392,7 +3392,9 @@ end
 #   _EXPINT[1]  extra Float64 slots between P and the U pack — workspace alignment (see the buf note)
 #               FALSIFIED 2026-08-10: flat over a full L1-way period on both boxes. Kept inert (0) so the
 #               negative result stays reproducible.
-#   _EXPINT[2..4]  free
+#   _EXPINT[2]  shifts gemm's unpacked/blocked cut (`_use_unpacked`) and trmm's `_TRMM_PACK_MIN`
+#   _EXPINT[3]  complex-microkernel NR arm (`nrsel`)
+#   _EXPINT[4]  SME in-place-A block cap in elements (0 = derived default) — see `_sme_inplace_cap`
 # WITNESS SLOTS exist because of the F1 failure on 2026-08-10: a pad sweep produced a clean, well-behaved,
 # entirely believable null while the knob's branch was never in the call graph for that shape at all
 # (square B at n=32 on AVX2 routes to `_trsm_dense_L!`). Reasoning about routing from the source is what
@@ -3435,7 +3437,10 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
 #   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
 #          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
-#   _EXP9  free again. It briefly held a HALF-LIVE load schedule for the 8×8 transpose pack: issue the
+#   _EXP9  INVERTED: set true to DISABLE the SME in-place-A route (`_sme_inplace_a`) and pack A the
+#          way the other cases do, so the two can be compared in one process. In place SHIPS ON for
+#          blocks under `_sme_inplace_cap()`.
+#          Previously it held a HALF-LIVE load schedule for the 8×8 transpose pack: issue the
 #          eight B loads as two batches of four with `_tr8x8`'s first stage between, so only four
 #          po2-aliased lines are live at once — the pattern Zen3's four-column pack runs and does not
 #          suffer from. FALSIFIED, and the reason is worth keeping: +0.5% at n=512 against a +4.6%
