@@ -437,6 +437,14 @@ end
 # at lda+1) it wins everywhere measured, 1.14-1.91, and `sme_inplace_alias.jl` isolates that to the
 # stride alone: at n=512 the ratio is 0.967 at lda=512 and 1.143 at lda=513, nothing else changed.
 #
+# THE CUT KEEPS MARGIN, AND THAT IS NOT CAUTION — IT IS A MEASURED REQUIREMENT. The table above is
+# gemm walking its own operand; a caller that drives more traffic through the same cache tips the
+# same block negative. `symm` at n=256 measures 0.936 under a four-L1-ful cut and 1.006 under a
+# two-L1-ful one (`bench/probes/sme_inplace_regress.jl`, three independent probes agreeing), which is
+# exactly the 1.05-1.06 edge of the table giving way. Two L1-fuls costs gemm@256 5.7% and syrk@512
+# 10.2% — neither is a binding cell, and neither gate moves — and buys no regression anywhere
+# measured, which is the better resting state for a route every BLAS-3 routine reaches.
+#
 # WHY THE CUT IS RESIDENCY AND NOT AN ALIASING PREDICATE. `_alias_ld` exists for this class of
 # problem, but its period is `_L1_WAY_D` = L1 ÷ associativity, and associativity comes from a CPUID
 # leaf that does not exist on aarch64 — `_L1D_ASSOC` is the fallback 8 here, not a detected value. So
@@ -444,11 +452,12 @@ end
 # 1024), and a set-conflict criterion cannot be founded on a number we are guessing. A residency cut
 # holds for any stride; widening it to admit friendly strides is left open, and the 7-20% it gives up
 # at blocks of 5-30 L1-fuls is recorded above rather than claimed.
-# req8-ok: a coefficient over the DETECTED L1 with the falsifying table above, not a fitted magic
-# number — the criterion is A-block residency and the coefficient is where it was measured to flip.
-# PDM: Derived — A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a few L1-fuls, and the coefficient is where that was measured to flip under a worst-case stride. | tune: n/a, follows _L1_BYTES
+# req8-ok: a coefficient over the DETECTED L1 with the falsifying tables above, not a fitted magic
+# number — the criterion is A-block residency, and the coefficient sits one step inside the measured
+# flip so a caller with its own cache traffic does not land on the edge.
+# PDM: Derived — A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | tune: n/a, follows _L1_BYTES
 const _SME_INPLACE_MAX =
-    @load_preference("sme_inplace_max", 4 * (_L1_BYTES ÷ sizeof(Float64)))::Int
+    @load_preference("sme_inplace_max", 2 * (_L1_BYTES ÷ sizeof(Float64)))::Int
 
 @inline function _sme_inplace_cap()
     ov = @inbounds _EXPINT[4]           # sweep override; 0 = the shipped cut

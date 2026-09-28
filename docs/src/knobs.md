@@ -252,7 +252,7 @@ Every `@load_preference` key in `src/` — 155 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream. | — |
-| `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a few L1-fuls, and the coefficient is where that was measured to flip under a worst-case stride. | n/a, follows _L1_BYTES |
+| `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
 | `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
