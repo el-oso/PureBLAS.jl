@@ -470,6 +470,18 @@ end
     return mce * kce <= _sme_inplace_cap()
 end
 
+# The same trick on the other operand, and the transpose condition is the MIRROR of A's: the kernel
+# wants NR contiguous values of B per depth step, which is a row of column-major B — strided when B
+# is k x n and contiguous when B is n x k. So in place needs `op(B) = B'` where A needed `op(A) = A`,
+# and it is the N,T form that gets both (`_syrk_gemm!` at trans='N', `_gemm_accR!` at transA='T').
+# `bscale`, not `alpha`: which panel carries the scaling is decided by `tA` in the driver, and the
+# condition is that this panel carries none.
+@inline function _sme_inplace_b(nce::Int, kce::Int, bscale::Float64, tB::Bool)
+    (tB && bscale == 1.0 && !(@inbounds _EXPFLAG[_EXP18])) || return false
+    nce % _SME_NR == 0 || return false
+    return nce * kce <= _sme_inplace_cap()
+end
+
 # Scales a packed panel in place. Needed only when alpha must ride a panel built by the ZA
 # transpose, which has no scaling form; the panel is cache-resident at this point.
 function _sme_scale_panel!(P::Ptr{Float64}, len::Int, s::Float64)
@@ -579,17 +591,27 @@ function _sme_gemm!(
             # So N,T needs no transpose at all and T,N needs two. The ZA transpose works in whole
             # LxL blocks and would read past the operand on a ragged edge, hence the scalar
             # fallback there.
-            if tB
-                _sme_pack_A!(Bp, B, ldb, jc, pc, nce, kce, kpad, bscale)
-            elseif kce == kpad && nce == npad
-                _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
-                bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
+            local pb::Ptr{Float64}, bjp::Int, bks::Int
+            if _sme_inplace_b(nce, kce, bscale, tB)
+                # B itself IS the panel — the op(B)=B2 row of the table above is the contiguous case,
+                # so this is the same trick `_sme_inplace_a` plays on the other operand.
+                pb = B + (jc + pc * ldb) * 8
+                bjp = NR
+                bks = ldb
             else
-                _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
-                bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
+                if tB
+                    _sme_pack_A!(Bp, B, ldb, jc, pc, nce, kce, kpad, bscale)
+                elseif kce == kpad && nce == npad
+                    _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
+                    bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
+                else
+                    _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
+                    bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
+                end
+                pb = Bp
+                bjp = kpad * NR
+                bks = NR
             end
-            bjp = kpad * NR
-            bks = NR
             ic = 0
             while ic < m
                 mce = min(MC, m - ic)
@@ -613,7 +635,7 @@ function _sme_gemm!(
                     aks = MR
                 end
                 _sme_macro_edges!(
-                    C, ldc, pa, Bp, Cs, ic, jc, mce, nce, mpad, npad, kce, kpad,
+                    C, ldc, pa, pb, Cs, ic, jc, mce, nce, mpad, npad, kce, kpad,
                     aip, aks, bjp, bks, overwrite_first && pc == 0
                 )
                 ic += MC

@@ -3529,7 +3529,8 @@ const _EXP17, _EXP18 = 17, 18
 #   _EXP17 INVERTED: set true to DISABLE the SME in-place-A route (`_sme_inplace_a`) and pack A the
 #          way the other cases do, so the two compare in one process. In place SHIPS ON under
 #          `_sme_inplace_cap()`.
-#   _EXP18 free
+#   _EXP18 INVERTED: set true to DISABLE the SME in-place-B route (`_sme_inplace_b`), the mirror of
+#          _EXP17 for the other operand. In place SHIPS ON under `_sme_inplace_cap()`.
 #   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
