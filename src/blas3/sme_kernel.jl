@@ -958,8 +958,26 @@ end
 # today: n=40 0.81x (loses), n=50 1.25x, n=72 1.92x, n=88 2.52x. The wins begin at 50 and n=40 is
 # still excluded by `_SME_MIN_EXACT` = 48, so the surviving floor is the one that separates them.
 # Tile-exact sizes already on SME are unchanged: n=64 0.99, n=80 1.00, n=96 1.04.
+# A TILE-EXACT SHAPE HAS ITS OWN, LOWER FLOOR — it pays no remainder panel at all, so the only cost
+# it carries above two whole tiles is the kernel's own prologue. `_SME_MIN_EXACT` is the floor for a
+# RAGGED shape, which must also amortise the padded block; that separation is what the surviving
+# floor above was measuring, and re-running the crossover dense (every n, not every other, for the
+# reason the `_SME_MIN` note records) puts the exact floor two tiles down:
+#
+#     n         16    24    32    33    40    47    48    49    64    80    96
+#     SME/NEON 1.42  0.29  4.92  0.66  0.93  1.43  6.84  1.36  7.15  9.00  9.42
+#
+# Exact multiples of MR win from 32 — n=32 measures 4.92x the path it was declining to — while
+# ragged shapes do not turn until ~47, which `_SME_MIN_EXACT` = 3*MR already separates. Lowering the
+# single floor to 32 instead would admit n=33 at 0.66 and n=40 at 0.93.
+#
+# ⚠ Those ragged figures were 0.44 / 0.67 / 0.96 at n=49 / 65 / 81 when the floor was last set. They
+# moved because gemm now reads its operands in place; see the stale-calibration note in
+# `_SYR2K_SME_MIN`. This predicate is the same kind of frozen comparison and wants re-running
+# whenever the kernel under it changes.
 @inline function _sme_tile_ok(m, n)
     min(m, n) >= 2 * _SME_MR || return false
+    (m % _SME_MR == 0 && n % _SME_MR == 0) && return true
     return max(m, n) >= _SME_MIN_EXACT
 end
 
