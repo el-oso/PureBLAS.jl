@@ -1884,8 +1884,15 @@ two sets of figures are not comparable row by row:
      the packed route too. See `kb/findings/sme-read-a-in-place-instead-of-packing.md`: the
      crossover is ADDRESS ALIASING rather than block size, and `_alias_ld` cannot express it here
      because `_L1D_ASSOC` reads a CPUID leaf aarch64 does not have.
-     Still open: the same trick for B in the N,T form (syrk/syr2k), where B is n x k and its NR-run
-     is contiguous. `bjp`/`bks` are already runtime arguments.
+1.0a **✅ AND THE SAME FOR B, ON THE N,T FORM (2026-09-28).** The transpose condition mirrors: the
+     kernel wants NR contiguous values of B per depth step, a ROW of column-major B, which is
+     strided when B is k x n and contiguous when B is n x k. So B needs `op(B) = B'` where A needed
+     `op(A) = A`, and the N,T form gets both — that is what `_syrk_gemm!` issues at trans='N' and
+     `_gemm_accR!` at transA='T'. B is the cheaper side to pack (once per (jc,pc) against once per
+     (jc,pc,ic)), so the win is smaller but not small: gemm N,T 2.37/1.40/1.34 at n=64/128/160,
+     syrk N 1.37/1.55/1.31 at n=128/160/256. Nothing regresses. It moves NO gate — syrk binds at
+     n=50 where `50 % NR != 0` declines the route — but syrk@128 went 0.295 -> 0.402 and syrk@256
+     0.447 -> 0.601.
 
 1.0b **⛔ FALSIFIED: "cut the ~13% driver overhead at n=128" — there is no driver overhead.** Measured
      layer by layer (`bench/probes/sme_driver_overhead.jl`, each row calling one layer directly),
@@ -1900,9 +1907,14 @@ two sets of figures are not comparable row by row:
      irreducible, plus ~7% per depth step. Counting the C write, the grid sits 0.4 us off its true
      floor. **The remaining target at this cell is the B pack, not the driver and not the kernel.**
 
-1.1  **Integrate the gemv prototype.** Measured at 1.07x Accelerate, 9.3x the shipping kernel; it is
-     not wired in. Needs transposed operands, strides, beta handling and the portability guards the
-     gemm path already carries. Closes gemvN 0.17 and gemvT 0.34, the two largest gaps.
+1.1  **~~Integrate the gemv prototype~~ — ALREADY DONE, and this item was stale.** The SME gemv is
+     live: `level2.jl:1968` asks `_sme_gemv_eligible` and calls `_sme_gemv!`, landed 2026-09-25 in
+     #2. The item said "it is not wired in", which was true when written and had not been revisited.
+     **The gemvN/gemvT figures quoted anywhere above are older than the integration** — the L2 cells
+     were measured 2026-09-22 at `76cac7b6`, three days before it landed, so `gemvN 0.17` and
+     `gemvT 0.34` describe code that no longer runs. L2 needs re-measuring before any gemv gap is
+     ranked or worked on. (`bench/cache_staleness.sh` reports this now that it runs on macOS at all;
+     it was silently answering "no cache files found" on this box until #19.)
 
 1.2  **Re-derive the Level-3 pack cutoffs.** `syrk` and `syr2k` did not move at all when gemm went
      from 44 to 500 GFLOP/s — 0.13 and 0.14 before and after. They take a private packed path above a
