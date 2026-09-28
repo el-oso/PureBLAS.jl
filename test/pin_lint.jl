@@ -72,13 +72,123 @@ function pin_scan()
     return missing_pins
 end
 
+# ── PIN-SET DRIFT ───────────────────────────────────────────────────────────────────────────────────
+# `pin_scan` above answers "is every Measure knob pinned for the .so?". It says nothing about the OTHER
+# pin set: `test/Project.toml`'s `[preferences.PureBLAS]`, which exists so the AllocCheck dogfood items
+# can prove all paths — an unpinned Measure knob keeps a `OncePerProcess` reachable, and its one-time
+# init allocates, so one live tuner reddens a whole item.
+#
+# Two ways that set goes wrong, and both had happened before this check existed:
+#
+# DRIFT — a knob pinned in one file and not the other. The test env then exercises a configuration the
+# shipped library does not have, which is the opposite of what pinning the dogfood is for. This is the
+# rule that catches `zaxpy_narrow`: juliac/build.jl dropped its pin when the knob became a derivation
+# over `_datapath_bytes`, `test/Project.toml` kept it, and the pin forced the narrow arm on precisely
+# the native-512 datapath the formula exists to get right. Its `@load_preference` default is still
+# `nothing`, so only the disagreement between the two files exposed it.
+#
+# OVERRIDE — a knob pinned although its `@load_preference` default is not `nothing`. A non-`nothing`
+# default is a Derive or Exempt tier: there is no tuner to compile out, so the pin buys no proof and
+# only overrides the formula.
+#
+# Baselined like the other lints here: the current set is recorded with its reasoning, a NEW finding
+# fails, and a baseline line whose finding is gone is stale and also fails, so the list shrinks.
+const _TESTPROJ = joinpath(@__DIR__, "Project.toml")
+const _PIN_BASELINE = joinpath(@__DIR__, "pin_lint_baseline.txt")
+
+"""
+    pin_defaults() -> Dict{String, Bool}
+
+Every `@load_preference` key in `src/`, mapped to whether its default is `nothing` (Measure tier, so a
+pin removes a runtime tuner) rather than a value (Derive/Exempt, so a pin only overrides a formula).
+"""
+function pin_defaults()
+    d = Dict{String, Bool}()
+    for f in _jlfiles(_SRC), ln in readlines(f)
+        for m in eachmatch(r"@load_preference\(\s*\"([A-Za-z0-9_]+)\"\s*,\s*([^\n]*)", split(ln, '#')[1])
+            d[m.captures[1]] = startswith(strip(m.captures[2]), "nothing")
+        end
+    end
+    return d
+end
+
+_build_pins() = Set{String}(
+    m.captures[1] for ln in (isfile(_BUILD) ? readlines(_BUILD) : String[])
+    for m in eachmatch(r"set_preferences!\(\s*PUREBLAS_UUID\s*,\s*\"([A-Za-z0-9_]+)\"\s*=>", split(ln, '#')[1])
+)
+
+# Hand-parsed rather than via TOML so this file keeps its zero-dependency, run-standalone property:
+# read the `[preferences.PureBLAS]` table's bare `key = value` lines until the next section header.
+function _test_pins()
+    out = Set{String}()
+    isfile(_TESTPROJ) || return out
+    inblk = false
+    for ln in readlines(_TESTPROJ)
+        s = strip(split(ln, '#')[1])
+        if startswith(s, "[")
+            inblk = s == "[preferences.PureBLAS]"
+            continue
+        end
+        inblk || continue
+        m = match(r"^([A-Za-z0-9_]+)\s*=", s)
+        isnothing(m) || push!(out, m.captures[1])
+    end
+    return out
+end
+
+"""
+    pin_drift_scan() -> Vector{String}
+
+One stable line per finding: a knob pinned in only one of the two pin sets, or pinned anywhere though
+its src default is a value rather than `nothing`.
+"""
+function pin_drift_scan()
+    b, t, defs = _build_pins(), _test_pins(), pin_defaults()
+    hits = String[]
+    for n in sort!(collect(setdiff(t, b)))
+        push!(hits, "DRIFT    $n  pinned in test/Project.toml, not in juliac/build.jl")
+    end
+    for n in sort!(collect(setdiff(b, t)))
+        push!(hits, "DRIFT    $n  pinned in juliac/build.jl, not in test/Project.toml")
+    end
+    for (n, where) in vcat([(n, "test/Project.toml") for n in sort!(collect(t))],
+        [(n, "juliac/build.jl") for n in sort!(collect(b))])
+        get(defs, n, true) && continue          # `nothing` default, or a key src does not read
+        push!(hits, "OVERRIDE $n  pinned in $where though its src default is a formula, not `nothing`")
+    end
+    return hits
+end
+
+_pin_baseline() = isfile(_PIN_BASELINE) ?
+    Set(filter(l -> !isempty(l) && !startswith(l, "#"), strip.(readlines(_PIN_BASELINE)))) : Set{String}()
+
+"""
+    pin_drift() -> (new = …, stale = …)
+
+`new`: a drift or override nobody has reasoned about — align the two files, drop the pin, or baseline
+it with the argument. `stale`: a baselined finding that no longer holds — delete the entry.
+"""
+function pin_drift()
+    got = Set(pin_drift_scan())
+    base = _pin_baseline()
+    return (new = sort!(collect(setdiff(got, base))), stale = sort!(collect(setdiff(base, got))))
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    v = pin_scan()
-    if isempty(v)
-        println("pin lint: PASS (every Measure-tier knob is pinned for the trim build)")
+    if "--baseline" in ARGS
+        foreach(println, pin_drift_scan())
     else
-        println("pin lint: FAIL — $(length(v)) Measure-tier knob(s) missing a juliac/build.jl pin:")
-        foreach(x -> println("  ", x), v)
-        exit(1)
+        v = pin_scan()
+        r = pin_drift()
+        ok = isempty(v) && isempty(r.new) && isempty(r.stale)
+        if ok
+            println("pin lint: PASS (every Measure-tier knob is pinned for the trim build; pin sets agree)")
+        else
+            println("pin lint: FAIL")
+            foreach(x -> println("  ", x), v)
+            foreach(x -> println("  NEW   ", x), r.new)
+            foreach(x -> println("  STALE ", x), r.stale)
+            exit(1)
+        end
     end
 end
