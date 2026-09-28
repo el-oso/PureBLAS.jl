@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 160 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 74 Derived · 17 Measured · 51 Literal · 18 Exempt.
+**Tier:** 75 Derived · 16 Measured · 51 Literal · 18 Exempt.
 **Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 54 literal · 5 flag · 5 other.
 
 
@@ -106,7 +106,7 @@ Every `@load_preference` key in `src/` — 160 of them.
 | `syr2k_mr` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 2 : _MR` | — |
 | `syr2k_nr` | sibling | Literal | drives its own microkernel, borrows gemm's _NR as a prior; unvalidated here. | candidate |
 | `syr2k_pack_cut` | formula | Derived | formula over detected consts: `_at_rank_k_pack_cut(_HW)` | — |
-| `syr2k_sme_min` | literal | Measured | the size at which the recursive route's reach into the coprocessor overtakes the packed kernel that cannot reach it; a ratio between two kernels' throughput, not a residency criterion. | sweep |
+| `syr2k_sme_min` | literal | Derived | the first split's off-diagonal block must clear the tile-exact floor, 2 x _SME_MIN_EXACT; the same criterion as `_SYRK_SME_MIN`, with the table above as its falsification of the old 12*MR literal. | n/a, follows the tile |
 | `syrk_base` | literal | Literal | syrk recursion base before the off-diagonal gemm. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | FLAT — 16..96 within noise on all 3 uarchs; largest cell +0.8% (Zen3 n=128) does not replicate (2026-08-21) |
 | `syrk_dbase` | sibling | Derived | the leaf is bounded by the scratch the arena already reserves for it: `_L3_NB`. | n/a, follows the borrow |
 | `syrk_mr` | literal | Literal | AVX2-ONLY by construction: `_tri_mr(T) = _vwidth(T)==4 ? _SYRK_MR : _MR`, so AVX-512 uses gemm's derived _MR. Zen3-only evidence is COMPLETE, not a gap. | n/a off AVX2 |

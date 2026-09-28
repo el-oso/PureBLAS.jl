@@ -7578,16 +7578,32 @@ const _SYR2K_PACK_CUT = @load_preference("syr2k_pack_cut", _at_rank_k_pack_cut(_
 # PDM: Literal — never swept: the retired ternary had two identical arms. Validated by gate only. | tune: unswept
 const _CSYR2K_PACK_CUT = @load_preference("csyr2k_pack_cut", 8)::Int   # req8-ok: see above
 @inline _fh_csyr2k_pack_cut() = (f = _FKR_csyr2k_pack_cut[]; f >= 0 ? f : _CSYR2K_PACK_CUT)
-# The syr2k counterpart of `_syrk_prefer_packed`, with its OWN measured cut: the two-product fused
-# kernel and the single-product one do not cross over at the same place. Same operands, one process
-# (`bench/probes/sme_syrk_route.jl` with the syr2k arm):
+# The syr2k counterpart of `_syrk_prefer_packed`. It once had its OWN cut at 12*MR = 192, because the
+# recursive route measured WORSE below that:
 #
 #     n          112    144    176    192    256    512   1024   2048
-#     ratio     0.90   0.77   0.84   1.73   1.97   2.90   3.91   4.19    (via gemm / packed)
+#     was       0.90   0.77   0.84   1.73   1.97   2.90   3.91   4.19    (via gemm / packed)
 #
-# Every n at or above 12*MR wins; below it the split is noisy and loses as far down as 0.77.
-# PDM: Measured — the size at which the recursive route's reach into the coprocessor overtakes the packed kernel that cannot reach it; a ratio between two kernels' throughput, not a residency criterion. | tune: sweep
-const _SYR2K_SME_MIN = @load_preference("syr2k_sme_min", 12 * _SME_MR)::Int
+# THAT MEASUREMENT WAS CORRECT AND IS NOW WRONG, because the arm it lost to has moved: gemm since
+# reads operand A, and then B, in place rather than through a packed panel, and those land hardest at
+# exactly these sizes (gemm@128 went 0.68 to 0.918 against Accelerate). Re-measured, same probe
+# shape, both arms in one process (`bench/probes/sme_syr2k_route_recheck.jl`):
+#
+#     n          112    128    144    160    176    320
+#     now       5.14   5.63   5.83   6.22   6.37   1.07    (via gemm / packed)
+#     GF/s pkd  50.7   51.6   53.1   53.7   54.6    322
+#     GF/s gemm  260    291    310    334    348    344
+#
+# The packed kernel is pinned near 50 GF/s across that whole window — NEON speed — while the route it
+# was preferred over now reaches the matrix unit. So the cut collapses onto syrk's, which is the
+# same criterion stated once: the first split's off-diagonal block must clear the tile-exact floor.
+#
+# ⚠ THE GENERAL HAZARD THIS RECORDS: a Measured cut between two kernels is only as current as the
+# SLOWER arm. Improving gemm silently invalidates every routing decision that was calibrated against
+# it, and nothing in the build notices — the cut keeps choosing what used to be faster. When gemm
+# moves, re-run this probe.
+# PDM: Derived — the first split's off-diagonal block must clear the tile-exact floor, 2 x _SME_MIN_EXACT; the same criterion as `_SYRK_SME_MIN`, with the table above as its falsification of the old 12*MR literal. | tune: n/a, follows the tile
+const _SYR2K_SME_MIN = @load_preference("syr2k_sme_min", 2 * _SME_MIN_EXACT)::Int
 
 @inline _syr2k_prefer_packed(::Type{T}, n::Int) where {T} =
     n > _fh_syr2k_pack_cut() && !(_SME_F64 && T === Float64 && n >= _SYR2K_SME_MIN)
