@@ -908,6 +908,20 @@ function _sme_init!()
     catch
         _SME_GEMVT_ENTRY[] = C_NULL
     end
+    try
+        df = _sme_dot_cf()
+        _SME_DOT_TRAMPOLINE[] = df
+        _SME_DOT_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, df)
+    catch
+        _SME_DOT_ENTRY[] = C_NULL
+    end
+    try
+        af = _sme_asum_cf()
+        _SME_ASUM_TRAMPOLINE[] = af
+        _SME_ASUM_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, af)
+    catch
+        _SME_ASUM_ENTRY[] = C_NULL
+    end
     # Both pointers are live now, so the kernels can be asked a question with a known answer.
     if _SME_ENTRY[] !== C_NULL && _SME_GEMV_ENTRY[] !== C_NULL && _SME_GEMVT_ENTRY[] !== C_NULL
         err = try
@@ -1645,6 +1659,8 @@ end
     _sme_entry_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_dot_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_asum_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
@@ -1654,6 +1670,10 @@ elseif _SME_STATIC
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
     _sme_gemvt_cf() = @cfunction(_sme_gemvt_cabi, Cvoid,
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
+    _sme_dot_cf() = @cfunction(_sme_dot_cabi, Cvoid,
+        (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
+    _sme_asum_cf() = @cfunction(_sme_asum_cabi, Cvoid,
+        (Ptr{Float64}, Ptr{Float64}, Int))
 else
     # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
     # inference folds it back to the concrete function and walks into the kernel anyway.
@@ -1674,5 +1694,13 @@ else
         h = Base.inferencebarrier(_sme_gemvt_cabi)
         return @cfunction($h, Cvoid,
             (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
+    end
+    function _sme_dot_cf()
+        d = Base.inferencebarrier(_sme_dot_cabi)
+        return @cfunction($d, Cvoid, (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
+    end
+    function _sme_asum_cf()
+        e = Base.inferencebarrier(_sme_asum_cabi)
+        return @cfunction($e, Cvoid, (Ptr{Float64}, Ptr{Float64}, Int))
     end
 end
