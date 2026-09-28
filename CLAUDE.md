@@ -417,9 +417,18 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   partial `git add`, and is the only artifact check that runs in GitHub CI — the caches are gitignored.
 
 - **READ `../kb/findings/` BEFORE any perf diagnosis or gate campaign — before measuring, not after.**
-  The sibling `kb/` is the cross-session knowledge hub: 25 digests of diagnostics, decisions, measured
-  results, and **disproven hypotheses so nobody re-chases a dead end**. Start at
-  `../kb/wiki/index.md`, then grep by routine (`grep -rli syrk ../kb/findings/`).
+  **`../kb/wiki/index.md` now opens with a STANDING RULES block — read that block first; it is four
+  short paragraphs and each one was re-derived from scratch at least once because it was findable
+  only by already knowing what to search for.** The Apple SME one alone cost six experiments on
+  2026-09-28: a kernel accumulating into z REGISTERS is capped near 105-150 GB/s however it is
+  written (the wall is the ACCUMULATE, not the load port), and wider vectors, multi-vector loads,
+  more streams, software prefetch and more z-register chains are all MEASURED DEAD on that part.
+  Grepping by routine name does not surface a rule that is stated in terms of a mechanism.
+  The sibling `kb/` is the cross-session knowledge hub: 130+ digests of diagnostics, decisions,
+  measured results, and **disproven hypotheses so nobody re-chases a dead end**. Start at
+  `../kb/wiki/index.md`, then grep by routine (`grep -rli syrk ../kb/findings/`) — but note that
+  grepping by routine is what MISSED the SME rule above, which is stated as a mechanism and lives
+  under a gemv filename.
   This rule exists because it was violated: on 2026-07-30 a session re-measured all of BLAS 1–3 and
   reported the po2-ld L3 cells (syrk 0.95, syr2k 0.96, trmm 0.97) as new findings, then started
   diagnosing syrk from scratch — all of it already root-caused in

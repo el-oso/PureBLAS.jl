@@ -85,6 +85,8 @@ end
 # concrete call site every one of those tests const-folds to the single surviving branch.
 @inline function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
+    (incx == 1 && incy == 1 && _sme_axpy_ok(_et(x), Int(n), x, y)) &&
+        return _sme_axpy!(Int(n), Float64(a), x, y)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
     if incx == 1 && incy == 1 && _cplx2(x, y)
         ac = convert(_et(x), a)
@@ -136,6 +138,9 @@ end
 
 # Conjugated dot (BLAS ?dotc). For real T this equals `_dotu`.
 @inline function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
+    # SME first: the reduction accumulates into ZA rather than a z register, which is the whole of
+    # the difference — see blas1/sme_l1.jl. Declines everything it cannot read directly.
+    (incx == 1 && incy == 1 && _sme_dot_ok(_et(x), Int(n), x, y)) && return _sme_dot(Int(n), x, y)
     (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(true))
     (incx == 1 && incy == 1 && _pair2(x, y)) && return _mkpair(_et(x), _dot_pair_simd(Val(:dual), Int(n), x, y, _pairv(x), Val(false))...)
@@ -207,6 +212,8 @@ end
 @inline function _asum(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
+    # SME first, same reason as `_dotc` above.
+    (incx == 1 && _sme_asum_ok(_et(x), Int(n), x)) && return _sme_asum(Int(n), x)
     (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
     (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
         (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
