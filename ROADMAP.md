@@ -1884,8 +1884,15 @@ two sets of figures are not comparable row by row:
      the packed route too. See `kb/findings/sme-read-a-in-place-instead-of-packing.md`: the
      crossover is ADDRESS ALIASING rather than block size, and `_alias_ld` cannot express it here
      because `_L1D_ASSOC` reads a CPUID leaf aarch64 does not have.
-     Still open: the same trick for B in the N,T form (syrk/syr2k), where B is n x k and its NR-run
-     is contiguous. `bjp`/`bks` are already runtime arguments.
+1.0a **✅ AND THE SAME FOR B, ON THE N,T FORM (2026-09-28).** The transpose condition mirrors: the
+     kernel wants NR contiguous values of B per depth step, a ROW of column-major B, which is
+     strided when B is k x n and contiguous when B is n x k. So B needs `op(B) = B'` where A needed
+     `op(A) = A`, and the N,T form gets both — that is what `_syrk_gemm!` issues at trans='N' and
+     `_gemm_accR!` at transA='T'. B is the cheaper side to pack (once per (jc,pc) against once per
+     (jc,pc,ic)), so the win is smaller but not small: gemm N,T 2.37/1.40/1.34 at n=64/128/160,
+     syrk N 1.37/1.55/1.31 at n=128/160/256. Nothing regresses. It moves NO gate — syrk binds at
+     n=50 where `50 % NR != 0` declines the route — but syrk@128 went 0.295 -> 0.402 and syrk@256
+     0.447 -> 0.601.
 
 1.0b **⛔ FALSIFIED: "cut the ~13% driver overhead at n=128" — there is no driver overhead.** Measured
      layer by layer (`bench/probes/sme_driver_overhead.jl`, each row calling one layer directly),
