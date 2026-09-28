@@ -3418,7 +3418,7 @@ end
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
 const _EXPINT = fill(0, 9)
-const _EXPFLAG = fill(false, 16)
+const _EXPFLAG = fill(false, 18)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
 # Adding a named const per knob DEFEATS the table and costs a full restart each time: Revise declares a
@@ -3427,6 +3427,7 @@ const _EXPFLAG = fill(false, 16)
 # recompilation lands inside timed rounds (measured A/A sigma 0.008 -> 0.139). Do not add names below.
 const _EXP1, _EXP2, _EXP3, _EXP4, _EXP5, _EXP6, _EXP7, _EXP8 = 1, 2, 3, 4, 5, 6, 7, 8
 const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11, 12, 13, 14, 15, 16
+const _EXP17, _EXP18 = 17, 18
 # REGISTRY — update these COMMENTS, never the const list above:
 #   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
 #   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
@@ -3437,10 +3438,12 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #   _EXP7  INVERTED: set true to DISABLE the interleaved pair (A/B arm). Pair ships ON.
 #   _EXP8  INVERTED: set true to DISABLE paired adjacent stripes. Pairing SHIPS ON for
 #          KC <= _TRSM_DBASE only — FALSIFIED at larger KC (6.2/4.2/2.6% slower at k=128/256/512).
-#   _EXP9  INVERTED: set true to DISABLE the SME in-place-A route (`_sme_inplace_a`) and pack A the
-#          way the other cases do, so the two can be compared in one process. In place SHIPS ON for
-#          blocks under `_sme_inplace_cap()`.
-#          Previously it held a HALF-LIVE load schedule for the 8×8 transpose pack: issue the
+#   _EXP9  LIVE — gates `_trmm!`'s packed side-L path (search `_TRMM_PACK_MIN`). NOT FREE, whatever
+#          the rest of this entry once said: the note below describing it as "free again" survived a
+#          later reuse, and a slot claimed on that word collides with a shipping arm rather than
+#          conflicting visibly. `test/expint_lint.jl` now fails on exactly that — a slot this
+#          registry calls free while src/ reads it.
+#          It also once held a HALF-LIVE load schedule for the 8×8 transpose pack: issue the
 #          eight B loads as two batches of four with `_tr8x8`'s first stage between, so only four
 #          po2-aliased lines are live at once — the pattern Zen3's four-column pack runs and does not
 #          suffer from. FALSIFIED, and the reason is worth keeping: +0.5% at n=512 against a +4.6%
@@ -3465,7 +3468,9 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          load-schedule split, staged copy). The aliasing is real and worth 4.5% at n=512 / 2.0% at
 #          n=1024, but capturing it requires a microkernel whose B access is not eight aliased columns —
 #          i.e. a genuine row-lane family, not an edit to the pack. Do not attempt another pack variant.
-#   _EXP10 free again. It briefly lifted the `KC <= _TRSM_DBASE` cap on paired adjacent stripes, to test
+#   _EXP10 LIVE — INVERTED, gates the side-R de-aliasing pad in `_trsm_right!` (search `_potrf_needs_pad`).
+#          NOT FREE; see the _EXP9 entry for why this line used to say otherwise.
+#          It also once lifted the `KC <= _TRSM_DBASE` cap on paired adjacent stripes, to test
 #          whether pairing fails at KC=128 only because 2·MR·NRV = 48 accumulators spill against 32
 #          registers — under a pinned NRV=2 a pair needs exactly 32 and cannot spill. FALSIFIED, and it
 #          falsified the register explanation with it: lifting the cap costs −6.6/−5.7/−2.5% at
@@ -3482,7 +3487,8 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          m=128, ONLY A's lda moving:
 #          128 (shipped) 41.59 GF | 129 49.14 | 130 48.57 | 132 50.11 | 136 48.81 | 144 49.75
 #          => any non-po2 lda is +11.5..15.1%; control bs=96 (already non-po2) +1.5..2.9% = the floor.
-#   _EXP11 free again. It briefly restored the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!` (the
+#   _EXP11 LIVE — INVERTED, gates complex rank-k 3M (`_ctrk_3m_ok`). NOT FREE; see _EXP9.
+#          It also once restored the ALWAYS-MASKED arm of `_trmm_cmplx_small_L!`/`_R!` (the
 #          9th Val of `_uker_cmplx!`, FULL, hardwired false on every branch) so the full-height-tile
 #          dispatch could be A/B'd IN ONE PROCESS. It was needed because the pre/post comparison was
 #          otherwise cross-run on both sides and the two disagreed: a probe read +5.2% at ztrmm n=32 on
@@ -3520,6 +3526,10 @@ const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11,
 #          not because it lost, but because it compiled to a BYTE-IDENTICAL loop: LLVM already emits
 #          vfnmadd there (that kernel's negated splat is used TWICE, `_zrt_tile!`'s was used once).
 #          See the `_zgt_slab!` header. Do not re-run the sibling audit on this kernel.
+#   _EXP17 INVERTED: set true to DISABLE the SME in-place-A route (`_sme_inplace_a`) and pack A the
+#          way the other cases do, so the two compare in one process. In place SHIPS ON under
+#          `_sme_inplace_cap()`.
+#   _EXP18 free
 #   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).

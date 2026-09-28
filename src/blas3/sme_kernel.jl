@@ -428,7 +428,7 @@ end
 #
 # THE CUT IS SIZED FOR THE WORST `lda`, because the caller's is not ours to choose. Square Float64
 # through `gemm!`, A a view of a power-of-two-wide parent so the stride always aliases, packed
-# against in place (`bench/probes/sme_inplace_worstcase.jl`, _EXP9 A/B in one process):
+# against in place (`bench/probes/sme_inplace_worstcase.jl`, _EXP17 A/B in one process):
 #
 #     A block / L1  0.25   0.56   1.00   1.56   2.25   3.06   4.00   5.06   6.25   9.00  16.00
 #     packed/inplc  1.939  1.599  1.418  1.111  1.102  1.053  1.057  0.968  0.982  0.959  0.949
@@ -465,7 +465,7 @@ const _SME_INPLACE_MAX =
 end
 
 @inline function _sme_inplace_a(mce::Int, kce::Int, alpha::Float64, tA::Bool)
-    (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP9])) || return false
+    (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP17])) || return false
     mce % _SME_MR == 0 || return false
     return mce * kce <= _sme_inplace_cap()
 end
