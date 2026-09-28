@@ -28,7 +28,9 @@ cd "$(dirname "$0")/.." || exit 2
 TOL=${CLOCK_TOL_PCT:-3}          # same tolerance check_arm_clocks.sh uses between arms of one cell
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-    mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+    # while-read, not mapfile: macOS ships bash 3.2, where that builtin does not exist.
+    files=()
+    while IFS= read -r _ln; do [ -n "$_ln" ] && files+=("$_ln"); done < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
 fi
 rc=0
 for f in "${files[@]}"; do

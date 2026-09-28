@@ -34,7 +34,9 @@ shift 2>/dev/null || true
 # throttle evidence a threaded cache carries and it must not be opt-in.
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-    mapfile -t files < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+    # while-read, not mapfile: macOS ships bash 3.2, where that builtin does not exist.
+    files=()
+    while IFS= read -r _ln; do [ -n "$_ln" ] && files+=("$_ln"); done < <(ls bench/plots_data_*.txt bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
 fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 

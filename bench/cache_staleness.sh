@@ -26,7 +26,9 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-    mapfile -t files < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
+    # while-read, not mapfile: macOS ships bash 3.2, where that builtin does not exist.
+    files=()
+    while IFS= read -r _ln; do [ -n "$_ln" ] && files+=("$_ln"); done < <(ls bench/plots_data_*.txt 2>/dev/null | grep -v _lite)
 fi
 [ ${#files[@]} -eq 0 ] && { echo "no cache files found"; exit 2; }
 
@@ -38,15 +40,20 @@ echo "HEAD=$HEAD_SHA   (a cell is STALE iff src/ changed between its pb arm's co
 # a full re-sweep or `--force` — and --force also waves through the real staleness this gate exists to
 # catch. bench/src_semantic_diff.jl compares Expr trees; see its header for why it is conservative.
 # Memoized: the same commit recurs across all three caches, and each check forks git per changed file.
-declare -A _SEMCACHE
+# A delimited string, not `declare -A`: macOS ships bash 3.2, which has no associative arrays. Keys
+# are commit SHAs, so `|` and `=` cannot occur in one and the encoding is unambiguous.
+_SEMCACHE="|"
 semantic_only() {                      # returns 0 when the src/ diff since $1 is comments/formatting
-    local c=$1
-    if [ -z "${_SEMCACHE[$c]:-}" ]; then
+    local c=$1 hit rc
+    hit=${_SEMCACHE##*"|$c="}
+    if [ "$hit" = "$_SEMCACHE" ]; then                 # unchanged ⇒ no entry for this commit
         julia --startup-file=no bench/src_semantic_diff.jl "$c" >/dev/null 2>&1
         # A missing/broken julia exits non-zero here, which reads as "real change" — the safe side.
-        _SEMCACHE[$c]=$?
+        rc=$?
+        _SEMCACHE="$_SEMCACHE$c=$rc|"
+        return "$rc"
     fi
-    return "${_SEMCACHE[$c]}"
+    return "${hit%%|*}"
 }
 rc=0
 for f in "${files[@]}"; do

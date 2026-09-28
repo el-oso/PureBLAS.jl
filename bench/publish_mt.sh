@@ -22,7 +22,9 @@ cd "$(dirname "$0")/.." || exit 2
 FORCE=""
 [ "${1:-}" = "--force" ] && FORCE=1
 
-mapfile -t caches < <(ls bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
+# while-read, not mapfile: macOS ships bash 3.2, where that builtin does not exist.
+caches=()
+while IFS= read -r _ln; do [ -n "$_ln" ] && caches+=("$_ln"); done < <(ls bench/mt_data_*.txt 2>/dev/null | grep -v _lite)
 [ ${#caches[@]} -eq 0 ] && { echo "no threaded caches (bench/mt_data_*.txt) — nothing to publish"; exit 2; }
 
 DOC=docs/src/threading.md
