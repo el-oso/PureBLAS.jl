@@ -1648,34 +1648,41 @@ end
 # multiply-add per element, read and written. That is the shape `_sme_rmw_ir` already serves in
 # BLAS-1, and it is capped the same way — a streaming-mode copy of a resident buffer runs 404 GB/s
 # and one `fmul` per vector in z registers drops it to 138, so the wall is z-register arithmetic and
-# ZA is what removes it. Measured against the per-column SIMD driver it displaces, GB/s over 2n^2
-# bytes, with Accelerate on the same operand:
+# ZA is what removes it.
 #
-#     n            128   256   512  1024  2048
-#     SIMD         183   142   141   141   137
-#     ZA           441   450   447   422   183
-#     Accelerate   493   544   560   562   233
+# ⚠ THE GROUPS GO ACROSS COLUMNS, NOT DOWN ROWS, and that is the whole design. Splitting the rows of
+# ONE column across G groups looks natural and fails on short matrices: a column shorter than `4L*G`
+# leaves the main loop with no trips, every block falls to a single-group tail, and `zero {za}` is
+# still paid once per column. Measured, that arrangement took ger@50 from 0.99 to 0.096 and ger@100
+# from 0.65 to 0.146 while helping only n >= 128. Giving each group its OWN COLUMN of the same row
+# block instead makes the parallelism independent of `m`, amortizes one `zero {za}` over G columns,
+# and loads the block of `x` once for all G of them rather than once per column.
 #
 # THE WHOLE MATRIX LIVES IN ONE STREAMING REGION. Calling the BLAS-1 `axpy` kernel once per column
 # would pay the ~50 ns function-pointer barrier and a ZA prologue n times over, which at n=1024 costs
 # more than the entire operation; and ordinary floating-point work between streaming calls carries
-# its own ~50 ns whichever side it sits on. So the column loop is INSIDE the kernel, and each column
-# is covered to its last element by the same three phases the BLAS-1 kernel uses: G groups over the
-# blocks they cover, a single-group loop over the blocks past that, and a `whilelt`-predicated loop
-# over the scrap below one block.
+# its own ~50 ns whichever side it sits on.
 #
-# `alpha*y[j]` is hoisted and applied as one fused multiply-add, which is exactly what
-# `_ger_simd!` does through `_axpy_simd!`, so the result is bit-for-bit the shipped arithmetic.
+# `alpha*y[j]` is hoisted and applied as one fused multiply-add, which is exactly what `_ger_simd!`
+# does through `_axpy_simd!`, so the result is bit-for-bit the shipped arithmetic.
 function _sme_ger_ir(G::Int)
     q = Char(34)
     SC = "target($(q)aarch64.svcount$(q))"
     T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
     io = IOBuffer()
-    # One whole block of column j through ZA group `g`, at the block index named by `bexpr`.
-    blk = function (g, bexpr, sfx)
-        println(io, "  %o$sfx = mul nsw i64 $bexpr, %w")
-        println(io, "  %pa$sfx = getelementptr inbounds double, ptr %acol, i64 %o$sfx")
-        println(io, "  %px$sfx = getelementptr inbounds double, ptr %x, i64 %o$sfx")
+    # `alpha*y[j]` broadcast for the column named by `jexpr`.
+    bcast = function (jexpr, sfx)
+        println(io, "  %yp$sfx = getelementptr inbounds double, ptr %y, i64 $jexpr")
+        println(io, "  %ys$sfx = load double, ptr %yp$sfx, align 8")
+        println(io, "  %ya$sfx = fmul double %ys$sfx, %alpha")
+        println(io, "  %be$sfx = insertelement <vscale x 2 x double> poison, double %ya$sfx, i32 0")
+        println(io, "  %bc$sfx = shufflevector <vscale x 2 x double> %be$sfx, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer")
+        println(io, "  %cf$sfx = mul nsw i64 $jexpr, %lda")
+        println(io, "  %ac$sfx = getelementptr inbounds double, ptr %a, i64 %cf$sfx")
+    end
+    # One whole block of column `sfx` through ZA group `g`, with the block of x already in %xv*.
+    blk = function (g, sfx, off)
+        println(io, "  %pa$sfx = getelementptr inbounds double, ptr %ac$sfx, i64 $off")
         println(io, "  %ra$sfx = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %pa$sfx)")
         for k in 0:3
             println(io, "  %av$(sfx)_$k = extractvalue $T4 %ra$sfx, $k")
@@ -1683,13 +1690,9 @@ function _sme_ger_ir(G::Int)
         println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
         println(io, "    <vscale x 2 x double> %av$(sfx)_0, <vscale x 2 x double> %av$(sfx)_1,")
         println(io, "    <vscale x 2 x double> %av$(sfx)_2, <vscale x 2 x double> %av$(sfx)_3, <vscale x 2 x double> %one)")
-        println(io, "  %rx$sfx = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %px$sfx)")
-        for k in 0:3
-            println(io, "  %xv$(sfx)_$k = extractvalue $T4 %rx$sfx, $k")
-        end
         println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
-        println(io, "    <vscale x 2 x double> %xv$(sfx)_0, <vscale x 2 x double> %xv$(sfx)_1,")
-        println(io, "    <vscale x 2 x double> %xv$(sfx)_2, <vscale x 2 x double> %xv$(sfx)_3, <vscale x 2 x double> %bc)")
+        println(io, "    <vscale x 2 x double> %xv0, <vscale x 2 x double> %xv1,")
+        println(io, "    <vscale x 2 x double> %xv2, <vscale x 2 x double> %xv3, <vscale x 2 x double> %bc$sfx)")
         println(io, "  %z$sfx = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
         for k in 0:3
             println(io, "  %q$(sfx)_$k = extractvalue $T4 %z$sfx, $k")
@@ -1726,66 +1729,89 @@ entry:
   %e1 = insertelement <vscale x 2 x double> poison, double 1.0, i32 0
   %one = shufflevector <vscale x 2 x double> %e1, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
   %nb = sdiv i64 %m, %w
-  %whole = mul nsw i64 %nb, %w
-  %cb = sdiv i64 %nb, $G
-  %cov = mul nsw i64 %cb, $G
-  %anyc = icmp sgt i64 %n, 0
-  br i1 %anyc, label %col, label %fin
-col:
-  %j = phi i64 [ 0, %entry ], [ %jn, %cend ]
-  %yp = getelementptr inbounds double, ptr %y, i64 %j
-  %ys = load double, ptr %yp, align 8
-  %ya = fmul double %ys, %alpha
-  %e0 = insertelement <vscale x 2 x double> poison, double %ya, i32 0
-  %bc = shufflevector <vscale x 2 x double> %e0, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
-  %cof = mul nsw i64 %j, %lda
-  %acol = getelementptr inbounds double, ptr %a, i64 %cof
-  %go = icmp sgt i64 %cb, 0
-  br i1 %go, label %row, label %tailchk
-row:
-  %b = phi i64 [ 0, %col ], [ %bn, %row ]
-  call void @llvm.aarch64.sme.zero(i32 255)
+  %hasrow = icmp sgt i64 %nb, 0
+  %cg = sdiv i64 %n, $G
+  %cov = mul nsw i64 %cg, $G
+  %anyg = icmp sgt i64 %cg, 0
+  br i1 %anyg, label %cgrp, label %ctailchk
+cgrp:
+  %jg = phi i64 [ 0, %entry ], [ %jgn, %cgend ]
+  %j0 = mul nsw i64 %jg, $G
 """)
     for g in 0:(G - 1)
-        println(io, "  %m$g = mul nsw i64 %cb, $g")
-        println(io, "  %s$g = add nsw i64 %b, %m$g")
-        blk(g, "%s$g", "g$g")
+        println(io, "  %jj$g = add nsw i64 %j0, $g")
+        bcast("%jj$g", "m$g")
+    end
+    print(io, """
+  br i1 %hasrow, label %row, label %cgend
+row:
+  %b = phi i64 [ 0, %cgrp ], [ %bn, %row ]
+  %ro = mul nsw i64 %b, %w
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %pxb = getelementptr inbounds double, ptr %x, i64 %ro
+  %rxb = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %pxb)
+  %xv0 = extractvalue $T4 %rxb, 0
+  %xv1 = extractvalue $T4 %rxb, 1
+  %xv2 = extractvalue $T4 %rxb, 2
+  %xv3 = extractvalue $T4 %rxb, 3
+""")
+    for g in 0:(G - 1)
+        blk(g, "m$g", "%ro")
     end
     print(io, """
   %bn = add nuw nsw i64 %b, 1
-  %ld = icmp eq i64 %bn, %cb
-  br i1 %ld, label %tailchk, label %row
-tailchk:
-  %hastail = icmp slt i64 %cov, %nb
-  br i1 %hastail, label %tail, label %scrapchk
-tail:
-  %t = phi i64 [ %cov, %tailchk ], [ %tn, %tail ]
-  call void @llvm.aarch64.sme.zero(i32 255)
+  %bd = icmp eq i64 %bn, %nb
+  br i1 %bd, label %cgend, label %row
 """)
-    blk(0, "%t", "t")
     print(io, """
-  %tn = add nuw nsw i64 %t, 1
-  %td = icmp eq i64 %tn, %nb
-  br i1 %td, label %scrapchk, label %tail
-scrapchk:
-  %hasscrap = icmp slt i64 %whole, %m
-  br i1 %hasscrap, label %scrap, label %cend
-scrap:
-  %i = phi i64 [ %whole, %scrapchk ], [ %in, %scrap ]
-  %pg = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 %i, i64 %m)
-  %sa = getelementptr inbounds double, ptr %acol, i64 %i
-  %sx = getelementptr inbounds double, ptr %x, i64 %i
-  %sav = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %pg, ptr %sa)
-  %sxv = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %pg, ptr %sx)
-  %sr = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %bc, <vscale x 2 x double> %sxv, <vscale x 2 x double> %sav)
-  call void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double> %sr, <vscale x 2 x i1> %pg, ptr %sa)
-  %in = add nsw i64 %i, %lanes
-  %sd = icmp slt i64 %in, %m
-  br i1 %sd, label %scrap, label %cend
-cend:
-  %jn = add nuw nsw i64 %j, 1
-  %jd = icmp eq i64 %jn, %n
-  br i1 %jd, label %fin, label %col
+cgend:
+  %jgn = add nuw nsw i64 %jg, 1
+  %jgd = icmp eq i64 %jgn, %cg
+  br i1 %jgd, label %ctailchk, label %cgrp
+ctailchk:
+  %hastailc = icmp slt i64 %cov, %n
+  br i1 %hastailc, label %ctail, label %fin
+ctail:
+  %jt = phi i64 [ %cov, %ctailchk ], [ %jtn, %ctend ]
+""")
+    bcast("%jt", "t")
+    print(io, """
+  br i1 %hasrow, label %trow, label %ctend
+trow:
+  %tb = phi i64 [ 0, %ctail ], [ %tbn, %trow ]
+  %tro = mul nsw i64 %tb, %w
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %tpx = getelementptr inbounds double, ptr %x, i64 %tro
+  %trx = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %tpx)
+  %xv0t = extractvalue $T4 %trx, 0
+  %xv1t = extractvalue $T4 %trx, 1
+  %xv2t = extractvalue $T4 %trx, 2
+  %xv3t = extractvalue $T4 %trx, 3
+  %tpa = getelementptr inbounds double, ptr %act, i64 %tro
+  %tra = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %tpa)
+  %tav0 = extractvalue $T4 %tra, 0
+  %tav1 = extractvalue $T4 %tra, 1
+  %tav2 = extractvalue $T4 %tra, 2
+  %tav3 = extractvalue $T4 %tra, 3
+  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 0,
+    <vscale x 2 x double> %tav0, <vscale x 2 x double> %tav1,
+    <vscale x 2 x double> %tav2, <vscale x 2 x double> %tav3, <vscale x 2 x double> %one)
+  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 0,
+    <vscale x 2 x double> %xv0t, <vscale x 2 x double> %xv1t,
+    <vscale x 2 x double> %xv2t, <vscale x 2 x double> %xv3t, <vscale x 2 x double> %bct)
+  %tz = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 0)
+  %tq0 = extractvalue $T4 %tz, 0
+  %tq1 = extractvalue $T4 %tz, 1
+  %tq2 = extractvalue $T4 %tz, 2
+  %tq3 = extractvalue $T4 %tz, 3
+  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %tq0, <vscale x 2 x double> %tq1, <vscale x 2 x double> %tq2, <vscale x 2 x double> %tq3, $SC %pn, ptr %tpa)
+  %tbn = add nuw nsw i64 %tb, 1
+  %tbd = icmp eq i64 %tbn, %nb
+  br i1 %tbd, label %ctend, label %trow
+ctend:
+  %jtn = add nuw nsw i64 %jt, 1
+  %jtd = icmp eq i64 %jtn, %n
+  br i1 %jtd, label %fin, label %ctail
 fin:
   call void @llvm.aarch64.sme.za.disable()
   ret void
@@ -1794,28 +1820,11 @@ fin:
     print(io, _SME_ATTRS)
     return String(take!(io))
 end
-
-# Groups the rows of a column are split across. Each carries its own load, its own pair of ZA
-# accumulates and its own store, so groups buy independent memory streams as well as independent
-# dependency chains — the same dimension `_SME_RMW_G` names for the BLAS-1 form, measured here on
-# the rank-1 update itself (GB/s over 2n^2 bytes):
-#
-#     n          128   256   512  1024
-#     G=1        240   240   240   240
-#     G=2        378   381   381   380
-#     G=4        441   450   447   422
-#     G=8          -   479   402   435
-#
-# Four is the best or within noise of it at every size, and the ladder is flat from there. It is not
-# `_SME_RMW_G` itself only because that constant lives in `blas1/sme_l1.jl`, which is included after
-# this file.
 # PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
 const _SME_GER_G = @load_preference("sme_ger_groups", 4)::Int   # req8-ok: swept, see the table above
 
-# ⚠ THE GROUP COUNT MUST FOLLOW THE ROWS. A column shorter than `4L*G` leaves the main loop with
-# zero trips, so every block falls to the single-group tail and the kernel runs at its narrowest
-# while still paying a full `zero {za}` per column: shipping G=4 alone took ger@50 from 0.99 to
-# 0.096 and ger@100 from 0.65 to 0.146. The driver picks the widest power of two the rows support.
+# The groups span COLUMNS, so a matrix narrower than G needs a narrower kernel; the driver picks the
+# widest power of two the columns support from this ladder.
 const _SME_GER_GS = Tuple(1 << i for i in 0:Int(log2(_SME_GER_G)))
 const _SME_GER_IRS = Dict{Int, String}(g => _sme_ger_ir(g) for g in _SME_GER_GS)
 
@@ -1843,26 +1852,36 @@ const _SME_GER_ENTRY      = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _sme_ger_cabi(a::Ptr{Float64}, lda::Int, x::Ptr{Float64}, y::Ptr{Float64},
                        m::Int, n::Int, alpha::Float64)
-    nb = m ÷ (4 * _SME_L)
     g = 1
-    while 2 * g <= nb && 2 * g <= _SME_GER_G
+    while 2 * g <= n && 2 * g <= _SME_GER_G
         g *= 2
     end
     _sme_ger_run(g, a, lda, x, y, m, n, alpha)
     return nothing
 end
 
-# The rank-1 update touches m*n elements for one pass over each of x and y, so the fixed ZA cost is
-# amortized over the whole matrix rather than over a vector: the crossing is far below any size the
-# gate measures, and the floor only has to keep out shapes with too few rows to fill a block.
-# PDM: Derived — formula over detected consts: one whole ZA block of rows, `4 * _SME_L`, below which the kernel has nothing but its predicated scrap to run.
+# ⛔ WHOLE ZA BLOCKS OF ROWS ONLY, AND THE REMAINDER IS AN OPEN PROBLEM.
+#
+# Rows below a whole block have to be finished somehow, and every way of doing it separately costs
+# ONE PASS PER COLUMN, which is fatal here: at n=100 a 4-row remainder is 4% of the elements and
+# roughly half the run time, because n small per-column calls at a few ns each rival the whole
+# operation (Accelerate does the entire n=100 update in 0.57 us). Measured, m=100 against m=96:
+# 83 GB/s with a NEON per-column remainder, 62 with a scalar one, 475 with none.
+#
+# Fusing it into the column body instead needs a PARTIAL `whilelt` predicate, and those are what
+# collapse: with the remainder a whole number of vectors the kernel is fine (m=120, a 24-row
+# remainder, 335 GB/s), with a partial one it is not (m=100 62, m=97 49, m=129 85).
+#
+# So the route is taken only where it leaves nothing behind. That covers every gate size that is a
+# multiple of the block and leaves n=50 and n=100 on the SIMD path at 0.99 and 0.65.
+# PDM: Derived — formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run.
 const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 
 @inline _sme_ger_eligible(::Type{T}, m, n, cj, A, x, y, incx, incy) where {T} =
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
         _strided1(A) && _dense1(x) && _dense1(y) &&
-        m >= _SME_GER_MINM && n > 0 && _SME_GER_ENTRY[] !== C_NULL
+        m >= _SME_GER_MINM && m % (4 * _SME_L) == 0 && n > 0 && _SME_GER_ENTRY[] !== C_NULL
 
 @noinline function _sme_ger!(m::Int, n::Int, alpha::Float64, x, y, A)
     Threads.atomic_add!(_SME_GER_CALLS, 1)
@@ -1876,7 +1895,6 @@ const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
     end
     return A
 end
-
 
 @noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
                              tA::Bool, tB::Bool)
