@@ -54,7 +54,8 @@
 #   sudo bench/fleet_freqlock.sh lock      # ← THE canonical gate state: passive + boost OFF + base clock + verify
 #   sudo bench/fleet_freqlock.sh pin 1800  # passive + hard-pin ≤ base (boost off, verified); >base is REFUSED
 #   sudo bench/fleet_freqlock.sh restore   # back to active/epp, boost on, full range (daily-use state)
-#        bench/fleet_freqlock.sh verify     # (no sudo) measure achieved freq of the bench core under load
+#        bench/fleet_freqlock.sh verify     # (no sudo) achieved freq of the bench core, ONE core, integer load
+#        bench/fleet_freqlock.sh verify-mt  # (no sudo) does the pin HOLD under a threaded gemm on every core?
 # Env: CORE=<n> selects the core to verify (default 8, neuromancer's `taskset -c 8` bench core).
 #      (wintermute bench core = 2, galen = 6, neuromancer = 8 — pass CORE=<n> to match the box.)
 
@@ -294,5 +295,61 @@ case "${1:-verify}" in
         echo "❌ NOT locked — do not benchmark. Run '$0 lock'."
         exit 2
     fi ;;
-  *) echo "usage: sudo $0 {lock|pin <MHz>|restore|verify}"; exit 1 ;;
+  verify-mt)
+    # THE ALL-CORE VERIFY. `verify` above loads ONE core with an INTEGER loop, and neither part is
+    # enough to prove a pin a THREADED sweep can hold. Measured on wintermute at a 2813 MHz pin and a
+    # 60 W supply: one core held 2795 MHz indefinitely and six cores oscillated 2332-2804 MHz, at
+    # 52-58 C, so the ✅ from `verify` certified a clock the box could not sustain and every threaded
+    # sweep ran under it. Integer loops are not enough either — six of those also held the pin. It
+    # takes sustained VECTOR FP on every core to draw the power, which is exactly what a threaded BLAS
+    # sweep does, so that is what this runs.
+    #
+    #   bench/fleet_freqlock.sh verify-mt          # 6 threads (the fleet's sweep width)
+    #   NT=12 bench/fleet_freqlock.sh verify-mt    # other widths
+    #
+    # Needs julia and this project, unlike `verify` — so it says so and REFUSES rather than passing
+    # silently when they are absent. A check that cannot run is not a check that passed.
+    _nt="${NT:-6}"
+    command -v julia >/dev/null 2>&1 || {
+        echo "verify-mt needs julia on PATH (it drives a real threaded gemm); not found — cannot verify."
+        exit 2; }
+    _hi=$(( $(cat /sys/devices/system/cpu/cpu$CORE/cpufreq/scaling_max_freq 2>/dev/null || echo 0) / 1000 ))
+    [ "$_hi" -gt 0 ] || { echo "no pin readable on core $CORE — run '$0 lock' first."; exit 2; }
+    _root="$(cd "$(dirname "$0")/.." && pwd)"
+    _ld="$(mktemp)"; trap 'rm -f "$_ld"' EXIT
+    cat > "$_ld" <<'JL'
+using PureBLAS, LinearAlgebra
+BLAS.set_num_threads(1); PureBLAS.set_num_threads(parse(Int, ARGS[1]))
+A = randn(1024, 1024); B = randn(1024, 1024); C = zeros(1024, 1024)
+PureBLAS.gemm!(C, A, B)                       # warm, so the timed window is steady state
+t0 = time(); while time() - t0 < parse(Float64, ARGS[2]); PureBLAS.gemm!(C, A, B); end
+JL
+    julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
+    _jp=$!
+    sleep 8                                    # past load+compile, into the sustained window
+    # SAMPLE EVERY CORE, not one: a package power limit does not fall evenly, and the MINIMUM across
+    # cores is what a join waits for.
+    _min=99999; _max=0
+    for _r in 1 2 3 4 5 6; do
+        for _d in $(cpus); do
+            _f=$(( $(cat "$_d/scaling_cur_freq" 2>/dev/null || echo 0) / 1000 ))
+            [ "$_f" -gt 0 ] || continue
+            [ "$_f" -lt "$_min" ] && _min=$_f
+            [ "$_f" -gt "$_max" ] && _max=$_f
+        done
+        sleep 2
+    done
+    kill "$_jp" 2>/dev/null || true; wait "$_jp" 2>/dev/null || true
+    echo "pin=${_hi} MHz   under ${_nt}-thread gemm: min=${_min} MHz  max=${_max} MHz"
+    # Same 12% band as `verify`, applied to the WORST core — and a spread test, because an oscillating
+    # clock can average inside the band while never holding it.
+    if [ "$_min" -ge $(( _hi * 88 / 100 )) ] && [ "$(( _max * 100 / _min ))" -le 108 ]; then
+        echo "✅ ${_nt} cores HOLD ${_hi} MHz — safe to benchmark threaded."
+    else
+        echo "❌ ${_nt} cores do NOT hold ${_hi} MHz (worst ${_min}, spread $(( _max * 100 / _min ))%)."
+        echo "   A threaded sweep here measures the power limit, not the library. Either fit a larger"
+        echo "   supply or pin lower — both are the user's call, and the pin tier is theirs."
+        exit 2
+    fi ;;
+  *) echo "usage: sudo $0 {lock|pin <MHz>|restore|verify|verify-mt}"; exit 1 ;;
 esac
