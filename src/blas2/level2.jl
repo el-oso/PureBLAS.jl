@@ -2508,6 +2508,8 @@ end
 function _ger!(cj::Bool, m::Integer, n::Integer, α::Number, x, incx::Integer, y, incy::Integer, A)
     iszero(α) && return A
     if _l2_simd_ok(A, x, y, incx, incy)
+        _sme_ger_eligible(eltype(A), Int(m), Int(n), cj, A, x, y, incx, incy) &&
+            return _sme_ger!(Int(m), Int(n), Float64(α), x, y, A)
         return _ger_simd!(Int(m), Int(n), convert(eltype(A), α), x, y, A)
     end
     if _l2c_ok(A, x, y, incx, incy)

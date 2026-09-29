@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 166 of them.
+Every `@load_preference` key in `src/` — 168 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 166 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 75 Derived · 22 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 60 literal · 5 flag · 5 other.
+**Tier:** 76 Derived · 23 Measured · 51 Literal · 18 Exempt.
+**Default form** (mechanical): 66 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -257,6 +257,8 @@ Every `@load_preference` key in `src/` — 166 of them.
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: a quarter of L1 in elements, `_L1_BYTES ÷ (4 * sizeof(Float64))`, the panel size at which the per-block ZA fill and readback disappear into the stream. | — |
 | `sme_gemvt_minm` | literal | Derived | the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | sweep m at fixed n |
 | `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (2,4,8) |
+| `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
+| `sme_ger_minm` | literal | Derived | formula over detected consts: one whole ZA block of rows, `4 * _SME_L`, below which the kernel has nothing but its predicated scrap to run. | — |
 | `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
 | `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
