@@ -87,12 +87,20 @@ MODE="${1:-pb}"
 # per-run authorisation exactly as before.
 case "$MODE" in
     pb)   ARMSARG="${SWEEP_ARMS:-arms=pb}" ;;
-    full) ARMSARG="" ;;
+    # `full` MUST NAME THE ARMS. It used to pass an empty string, because omitting `arms=` once meant
+    # "measure every arm" — plots.jl flipped that default to PB-ONLY on 2026-09-12 so that forgetting
+    # the flag could not silently re-run the vendors, and this branch was not updated with it. The
+    # result was a mode that printed "all three arms per cell" and measured one: on 2026-09-29 a
+    # wintermute re-sweep ran four groups that way, writing FRESH PureBLAS arms at a new 3501 MHz pin
+    # against vendor arms still cached from 2793 MHz — a 24% error in PureBLAS's own favour, which is
+    # the exact defect the re-sweep existed to remove. The banner below now prints the real string, so
+    # the claim and the argument cannot drift apart again.
+    full) ARMSARG="arms=pb,${SWEEP_REFS:-openblas,aocl}" ;;
     *)    echo "usage: $0 [pb|full]   (pb = reuse cached reference arms; full = re-measure all arms)"; exit 2 ;;
 esac
 
 echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
-[ "$MODE" = full ] && echo "=== FULL ARMS: all three arms per cell in one machine state (anchors match by construction) ==="
+[ "$MODE" = full ] && echo "=== FULL ARMS: passing '$ARMSARG' — every named arm measured per cell in one machine state ==="
 # PRE-LOCK MUST PASS, not merely be readable. The per-group check below compares each reading against
 # the OPENING one, so it catches a lock that lets go mid-sweep but not a box that was never locked: an
 # unlocked box reads a stable boost clock and drifts 0%. neuromancer opened a sweep at 4774 MHz against
