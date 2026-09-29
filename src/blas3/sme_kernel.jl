@@ -1699,6 +1699,20 @@ function _sme_ger_ir(G::Int)
         end
         println(io, "  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %q$(sfx)_0, <vscale x 2 x double> %q$(sfx)_1, <vscale x 2 x double> %q$(sfx)_2, <vscale x 2 x double> %q$(sfx)_3, $SC %pn, ptr %pa$sfx)")
     end
+    # Rows below one whole block, for column `sfx`, predicated.
+    scrap = function (sfx, lbl, pred)
+        println(io, "$lbl:")
+        println(io, "  %si$sfx = phi i64 [ %whole, %$pred ], [ %sn$sfx, %$lbl ]")
+        println(io, "  %sg$sfx = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 %si$sfx, i64 %m)")
+        println(io, "  %sa$sfx = getelementptr inbounds double, ptr %ac$sfx, i64 %si$sfx")
+        println(io, "  %sx$sfx = getelementptr inbounds double, ptr %x, i64 %si$sfx")
+        println(io, "  %sav$sfx = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %sg$sfx, ptr %sa$sfx)")
+        println(io, "  %sxv$sfx = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %sg$sfx, ptr %sx$sfx)")
+        println(io, "  %sr$sfx = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %bc$sfx, <vscale x 2 x double> %sxv$sfx, <vscale x 2 x double> %sav$sfx)")
+        println(io, "  call void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double> %sr$sfx, <vscale x 2 x i1> %sg$sfx, ptr %sa$sfx)")
+        println(io, "  %sn$sfx = add nsw i64 %si$sfx, %lanes")
+        println(io, "  %sd$sfx = icmp slt i64 %sn$sfx, %m")
+    end
     print(io, """
 declare void @llvm.aarch64.sme.za.enable()
 declare void @llvm.aarch64.sme.za.disable()
@@ -1729,7 +1743,9 @@ entry:
   %e1 = insertelement <vscale x 2 x double> poison, double 1.0, i32 0
   %one = shufflevector <vscale x 2 x double> %e1, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
   %nb = sdiv i64 %m, %w
+  %whole = mul nsw i64 %nb, %w
   %hasrow = icmp sgt i64 %nb, 0
+  %hasscrap = icmp slt i64 %whole, %m
   %cg = sdiv i64 %n, $G
   %cov = mul nsw i64 %cg, $G
   %anyg = icmp sgt i64 %cg, 0
@@ -1743,7 +1759,7 @@ cgrp:
         bcast("%jj$g", "m$g")
     end
     print(io, """
-  br i1 %hasrow, label %row, label %cgend
+  br i1 %hasrow, label %row, label %mscrapchk
 row:
   %b = phi i64 [ 0, %cgrp ], [ %bn, %row ]
   %ro = mul nsw i64 %b, %w
@@ -1761,8 +1777,18 @@ row:
     print(io, """
   %bn = add nuw nsw i64 %b, 1
   %bd = icmp eq i64 %bn, %nb
-  br i1 %bd, label %cgend, label %row
+  br i1 %bd, label %mscrapchk, label %row
+mscrapchk:
+  br i1 %hasscrap, label %mscrap0, label %cgend
 """)
+    for g in 0:(G - 1)
+        lbl = "mscrap$g"
+        pred = g == 0 ? "mscrapchk" : "mscrap$(g)chk"
+        g > 0 && println(io, "$pred:\n  br label %$lbl")
+        scrap("m$g", lbl, pred)
+        nxt = g == G - 1 ? "cgend" : "mscrap$(g+1)chk"
+        println(io, "  br i1 %sdm$g, label %$lbl, label %$nxt")
+    end
     print(io, """
 cgend:
   %jgn = add nuw nsw i64 %jg, 1
@@ -1776,7 +1802,7 @@ ctail:
 """)
     bcast("%jt", "t")
     print(io, """
-  br i1 %hasrow, label %trow, label %ctend
+  br i1 %hasrow, label %trow, label %tscrapchk
 trow:
   %tb = phi i64 [ 0, %ctail ], [ %tbn, %trow ]
   %tro = mul nsw i64 %tb, %w
@@ -1807,7 +1833,13 @@ trow:
   call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %tq0, <vscale x 2 x double> %tq1, <vscale x 2 x double> %tq2, <vscale x 2 x double> %tq3, $SC %pn, ptr %tpa)
   %tbn = add nuw nsw i64 %tb, 1
   %tbd = icmp eq i64 %tbn, %nb
-  br i1 %tbd, label %ctend, label %trow
+  br i1 %tbd, label %tscrapchk, label %trow
+tscrapchk:
+  br i1 %hasscrap, label %tscrap, label %ctend
+""")
+    scrap("t", "tscrap", "tscrapchk")
+    print(io, """
+  br i1 %sdt, label %tscrap, label %ctend
 ctend:
   %jtn = add nuw nsw i64 %jt, 1
   %jtd = icmp eq i64 %jtn, %n
@@ -1820,6 +1852,17 @@ fin:
     print(io, _SME_ATTRS)
     return String(take!(io))
 end
+# Columns handled at once, one ZA group each. Every group carries its own load, its own pair of ZA
+# accumulates and its own store, so groups buy independent memory streams as well as independent
+# dependency chains. Measured on the rank-1 update, GB/s over 2n^2 bytes:
+#
+#     n          128   256   512  1024
+#     G=1        240   240   240   240
+#     G=2        378   381   381   380
+#     G=4        441   450   447   422
+#     G=8          -   479   402   435
+#
+# Four is the best or within noise of it at every size and the ladder is flat from there.
 # PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
 const _SME_GER_G = @load_preference("sme_ger_groups", 4)::Int   # req8-ok: swept, see the table above
 
@@ -1872,8 +1915,11 @@ end
 # collapse: with the remainder a whole number of vectors the kernel is fine (m=120, a 24-row
 # remainder, 335 GB/s), with a partial one it is not (m=100 62, m=97 49, m=129 85).
 #
-# So the route is taken only where it leaves nothing behind. That covers every gate size that is a
-# multiple of the block and leaves n=50 and n=100 on the SIMD path at 0.99 and 0.65.
+# So the route is taken only where every predicate it issues is FULL, which means `m` a whole number
+# of vectors. Rows below a whole ZA block are finished by the kernel's own vector loop, and that
+# costs little when there are few of them (m=1000 leaves exactly one vector), which is why the
+# condition is `_SME_L` and not the block. n=50 and n=100 are not whole vectors and stay on the SIMD
+# path at 0.98 and 0.64.
 # PDM: Derived — formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run.
 const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 
@@ -1881,7 +1927,7 @@ const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
         _strided1(A) && _dense1(x) && _dense1(y) &&
-        m >= _SME_GER_MINM && m % (4 * _SME_L) == 0 && n > 0 && _SME_GER_ENTRY[] !== C_NULL
+        m >= _SME_GER_MINM && m % _SME_L == 0 && n > 0 && _SME_GER_ENTRY[] !== C_NULL
 
 @noinline function _sme_ger!(m::Int, n::Int, alpha::Float64, x, y, A)
     Threads.atomic_add!(_SME_GER_CALLS, 1)
