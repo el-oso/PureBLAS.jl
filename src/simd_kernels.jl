@@ -1586,6 +1586,22 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # _SIMD_BYTES=32 (both 4) but are 2 vs 8 at 64, so passing NB_TREE here would change form AND width on
 # AVX-512 — and widening the resident band was already measured much worse (NB=8 threshold: 0.822 at
 # n=1e3). Keeping the width fixed makes this one variable on every ISA.
+#
+# AARCH64 TAKES THE TREE AT ONE WIDTH AND DOES NOT BAND-SWITCH. The three-way routing above turns on
+# two crossings that were derived and validated on AVX2/AVX-512; neither reproduces here. Measured on
+# an M6 (median of repeated sweeps in the L1 rep-loop regime, GB/s read):
+#
+#     n          1000  3000  10000  30000  100000  300000  1000000  10000000
+#     4-chain    56.4  56.9   57.3   57.5    42.6    57.7     57.2      55.6
+#     tree, 8    84.7  89.0   90.5   91.4    90.5    92.2     92.3      74.3
+#     tree, 16   80.8  87.6   91.2   91.4    92.7    93.0     93.0      84.8
+#     thresh, 4  84.2  86.1   86.6   69.0    88.1    88.8     87.5      82.3
+#
+# The 4-chain is beaten at every size by both widths and both forms, by 45-62%. The two
+# tree widths differ by at most 5% and swap rank around n=5000, which is inside the L1 band and so
+# not a residency crossing — there is no criterion to split them on, and a fitted one would be a
+# req#8 violation. `_IAMAX_NB_TREE` is the register-bounded width, which is the binding constraint
+# on this ISA, and it is what the single rule uses.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
     (
@@ -1593,6 +1609,7 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
         n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
         _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)
     ) :
+    Sys.ARCH === :aarch64 ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
     _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
