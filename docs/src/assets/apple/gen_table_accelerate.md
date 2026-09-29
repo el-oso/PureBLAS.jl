@@ -12,7 +12,7 @@ PB / Accelerate speed ratio, median (worst cell) per op per µarch. Provenance: 
 | `iamax` | 1.85 (1.00) |
 | `gemvN` | 0.86 (0.48) |
 | `gemvT` | 0.74 (0.34) |
-| `ger` | 0.37 (0.25) |
+| `ger` | 0.95 (0.64) |
 | `symv` | 1.59 (0.94) |
 | `trmv` | 0.72 (0.24) |
 | `trsv` | 0.92 (0.69) |
