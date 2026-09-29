@@ -1330,6 +1330,27 @@ const _IAMAX_NB_STREAM = 4
 # registers and ONE mask-free compare, which is exactly what our width-8 attempt could not do. If iamax
 # n=1e4..1e5 is attacked again, that is the design to port — not another NB value.
 
+# The tree's fold node. WHICH SPELLING IS ONE INSTRUCTION IS INVERTED BETWEEN ISAs, so the choice is
+# keyed on the architecture rather than written once and assumed portable. Lowerings read off this
+# build:
+#
+#     aarch64   max(a, b)                 -> fmaxnm                                    (1 insn)
+#               vifelse(!(b > a), a, b)   -> fcmgt + bif                               (2)
+#     x86-64    vifelse(!(b > a), a, b)   -> vmaxpd                                    (1)
+#               max(a, b)                 -> vmaxpd + vcmpunordpd + masked mov         (3)
+#
+# At NB=8 the tree has 7 nodes, so the wrong spelling costs 7 extra instructions per 8 blocks.
+#
+# THE TWO FORMS DIFFER ON NaN AND THAT IS SAFE HERE. `fmaxnm` is IEEE maxNum: it returns the non-NaN
+# operand, so a NaN never reaches the root; `vifelse(!(b > a), a, b)` keeps `a` unless `b` is strictly
+# greater, so a NaN can reach it. The root only decides whether to ENTER the per-block walk, and it
+# decides on real values either way — a block holding a NaN beside a new maximum still sends that
+# maximum to the root. Inside the walk nothing changes: the per-block guard is unordered, so it fires
+# on NaN regardless, and the lane scan uses a strict `>` that skips NaN. Neither spelling can select a
+# NaN as the answer, which is the netlib contract.
+@inline _vmaxfold(a::Vec{W, T}, b::Vec{W, T}) where {W, T} =
+    Sys.ARCH === :aarch64 ? max(a, b) : vifelse(!(b > a), a, b)
+
 # MAX-REDUCTION-TREE scan — the structural port of AOCL's `bli_damaxv_zen_int_avx512`, which is the
 # reference that binds `iamax` in the L2-resident band on Zen4 (OpenBLAS is at ~2x, we beat it).
 #
@@ -1381,7 +1402,7 @@ const _IAMAX_NB_STREAM = 4
     bal(items) = length(items) == 1 ? items[1] :
         (
             m = length(items) ÷ 2; a = bal(items[1:m]); b = bal(items[(m + 1):end]);
-            :(vifelse(!($b > $a), $a, $b))
+            :(_vmaxfold($a, $b))
         )
     tree = bal(Any[vs...])
     walks = [
@@ -1591,17 +1612,20 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # two crossings that were derived and validated on AVX2/AVX-512; neither reproduces here. Measured on
 # an M6 (median of repeated sweeps in the L1 rep-loop regime, GB/s read):
 #
-#     n          1000  3000  10000  30000  100000  300000  1000000  10000000
-#     4-chain    56.4  56.9   57.3   57.5    42.6    57.7     57.2      55.6
-#     tree, 8    84.7  89.0   90.5   91.4    90.5    92.2     92.3      74.3
-#     tree, 16   80.8  87.6   91.2   91.4    92.7    93.0     93.0      84.8
-#     thresh, 4  84.2  86.1   86.6   69.0    88.1    88.8     87.5      82.3
+#     n          1000  3000  10000  100000  1000000
+#     4-chain    56.4  56.9   57.3    42.6     57.2   GB/s
+#     thresh, 4  87.9  86.1   87.0    89.0     90.1
+#     tree, 4   111.6 106.8  112.3   112.6    114.6
+#     tree, 8   121.9 122.4  126.6   125.9    123.6
+#     tree, 16  123.6 125.1  133.2   134.3    124.8
+#     tree, 32  116.5 124.9  139.1   117.1    114.9
 #
-# The 4-chain is beaten at every size by both widths and both forms, by 45-62%. The two
-# tree widths differ by at most 5% and swap rank around n=5000, which is inside the L1 band and so
-# not a residency crossing — there is no criterion to split them on, and a fitted one would be a
-# req#8 violation. `_IAMAX_NB_TREE` is the register-bounded width, which is the binding constraint
-# on this ISA, and it is what the single rule uses.
+# with OpenBLAS at 96 / 115 / 96 / 116 / 115 on the same ladder. The tree beats the threshold form
+# at every size, so neither of the two crossings the routing above turns on reproduces here, and
+# aarch64 takes one form at one width. That width is `_IAMAX_NB_RESIDENT` — two cache lines in
+# flight, 16 vectors on this ISA, which leaves 18 of 32 NEON registers live counting the root and
+# `thr`. `_IAMAX_NB_TREE` clamps to `_NVREG ÷ 4`, a bound written for AVX-512's register budget that
+# costs width here for no reason this ISA has.
 @inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
     (
@@ -1609,7 +1633,7 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
         n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
         _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)
     ) :
-    Sys.ARCH === :aarch64 ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
+    Sys.ARCH === :aarch64 ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
     _iamax_chain4!(n, xp)
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
