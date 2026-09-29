@@ -324,21 +324,36 @@ A = randn(1024, 1024); B = randn(1024, 1024); C = zeros(1024, 1024)
 PureBLAS.gemm!(C, A, B)                       # warm, so the timed window is steady state
 t0 = time(); while time() - t0 < parse(Float64, ARGS[2]); PureBLAS.gemm!(C, A, B); end
 JL
-    julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
+    # PIN ONE THREAD PER PHYSICAL CORE, AND SAMPLE ONLY THOSE CORES. Without this the check is a
+    # lottery and reports a power limit that is not there: `nt` unpinned threads float across the SMT
+    # siblings, two can land on one physical core, and the core they left then reads its IDLE clock.
+    # Measured on neuromancer — 6 threads over 12 CPUs gave min=1246 MHz against a 2000 MHz pin, which
+    # reads exactly like the wintermute power limit this subcommand exists to catch. An idle core is
+    # not a throttled core. Frequency is per PHYSICAL core on these parts, so one CPU per core is both
+    # necessary and sufficient to sample.
+    _cores=""; _seen=" "
+    for _d in /sys/devices/system/cpu/cpu[0-9]*; do
+        [ -d "$_d/cpufreq" ] || continue
+        _n=${_d##*/cpu}
+        _id=$(cat "$_d/topology/core_id" 2>/dev/null || echo "$_n")
+        case "$_seen" in *" $_id "*) continue ;; esac
+        _seen="$_seen$_id "; _cores="${_cores:+$_cores,}$_n"
+    done
+    [ -n "$_cores" ] || _cores=0
+    taskset -c "$_cores" julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
     _jp=$!
     sleep 8                                    # past load+compile, into the sustained window
-    # SAMPLE EVERY CORE, not one: a package power limit does not fall evenly, and the MINIMUM across
-    # cores is what a join waits for.
     _min=99999; _max=0
     for _r in 1 2 3 4 5 6; do
-        for _d in $(cpus); do
-            _f=$(( $(cat "$_d/scaling_cur_freq" 2>/dev/null || echo 0) / 1000 ))
+        for _c in $(printf '%s' "$_cores" | tr ',' ' '); do
+            _f=$(( $(cat "/sys/devices/system/cpu/cpu$_c/cpufreq/scaling_cur_freq" 2>/dev/null || echo 0) / 1000 ))
             [ "$_f" -gt 0 ] || continue
             [ "$_f" -lt "$_min" ] && _min=$_f
             [ "$_f" -gt "$_max" ] && _max=$_f
         done
         sleep 2
     done
+    echo "loaded+sampled cores: $_cores"
     kill "$_jp" 2>/dev/null || true; wait "$_jp" 2>/dev/null || true
     echo "pin=${_hi} MHz   under ${_nt}-thread gemm: min=${_min} MHz  max=${_max} MHz"
     # Same 12% band as `verify`, applied to the WORST core — and a spread test, because an oscillating
