@@ -44,7 +44,8 @@ end
 # x .*= a
 @inline function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
-    (incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
+    (incx == 1 && _sme_scal_ok(_et(x), Int(n), x)) && return _sme_scal!(Int(n), Float64(a), x)
+(incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
     if incx == 1 && _cplx_re(x)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vec = real scal over 2n
