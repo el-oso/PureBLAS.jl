@@ -1812,13 +1812,30 @@ end
 # PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
 const _SME_GER_G = @load_preference("sme_ger_groups", 4)::Int   # req8-ok: swept, see the table above
 
-const _SME_GER_IR = _sme_ger_ir(_SME_GER_G)
+# ⚠ THE GROUP COUNT MUST FOLLOW THE ROWS. A column shorter than `4L*G` leaves the main loop with
+# zero trips, so every block falls to the single-group tail and the kernel runs at its narrowest
+# while still paying a full `zero {za}` per column: shipping G=4 alone took ger@50 from 0.99 to
+# 0.096 and ger@100 from 0.65 to 0.146. The driver picks the widest power of two the rows support.
+const _SME_GER_GS = Tuple(1 << i for i in 0:Int(log2(_SME_GER_G)))
+const _SME_GER_IRS = Dict{Int, String}(g => _sme_ger_ir(g) for g in _SME_GER_GS)
 
-@inline _sme_ger_k(a::Ptr{Float64}, lda::Int, x::Ptr{Float64}, y::Ptr{Float64},
-                   m::Int, n::Int, alpha::Float64) =
-    Base.llvmcall((_SME_GER_IR, "entry"), Cvoid,
-                  Tuple{Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Float64},
-                  a, Int64(lda), x, y, Int64(m), Int64(n), alpha)
+for g in _SME_GER_GS
+    @eval @inline $(Symbol("_sme_ger_k", g))(a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
+            y::Ptr{Float64}, m::Int, n::Int, alpha::Float64) =
+        Base.llvmcall(($(_SME_GER_IRS[g]), "entry"), Cvoid,
+                      Tuple{Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Float64},
+                      a, Int64(lda), x, y, Int64(m), Int64(n), alpha)
+end
+
+# A compile-time ladder over the detected set, generated from it so the two cannot drift.
+@eval @inline function _sme_ger_run(g::Int, a, lda, x, y, m, n, alpha)
+    $(Expr(:block, (quote
+        if g == $gg
+            return $(Symbol("_sme_ger_k", gg))(a, lda, x, y, m, n, alpha)
+        end
+    end for gg in _SME_GER_GS)...))
+    return nothing
+end
 
 const _SME_GER_CALLS = Threads.Atomic{Int}(0)
 const _SME_GER_TRAMPOLINE = Ref{Any}(nothing)
@@ -1826,7 +1843,12 @@ const _SME_GER_ENTRY      = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _sme_ger_cabi(a::Ptr{Float64}, lda::Int, x::Ptr{Float64}, y::Ptr{Float64},
                        m::Int, n::Int, alpha::Float64)
-    _sme_ger_k(a, lda, x, y, m, n, alpha)
+    nb = m ÷ (4 * _SME_L)
+    g = 1
+    while 2 * g <= nb && 2 * g <= _SME_GER_G
+        g *= 2
+    end
+    _sme_ger_run(g, a, lda, x, y, m, n, alpha)
     return nothing
 end
 
