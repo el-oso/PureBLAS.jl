@@ -612,9 +612,16 @@ end
 # cell (see `_series`), so it draws the gate itself. It is NOT in `_VIEWS`: nothing is measured against
 # it and it has no gen_table of its own (the coverage table already reports this exact number).
 const _GATE_VIEW = "gate"
+# THE THREADED GATE — the criterion req#1 states, with threads on: PureBLAS at `_MT_NT` threads against
+# whichever THREADED vendor is faster in that cell. `_GATE_VIEW` cannot serve: it divides by the SERIAL
+# `_ARM_PB`, so on a threaded cache it would compare a threaded vendor against single-thread PureBLAS.
+# Distinct from the `_ARM_PB_MT` view, which asks what threads bought us and never mentions a vendor.
+const _MT_GATE_VIEW = "gate_mt"
+const _REF_MT_ALL = ["openblas_mt", "aocl_mt", "accelerate_mt"]
 _refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : r == "accelerate" ? "Accelerate" :
     r == "generic" ? "LinearAlgebra generic" :
-    r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") : "OpenBLAS"
+    r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") :
+    r == _MT_GATE_VIEW ? "faster of threaded OpenBLAS and AOCL" : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -2853,6 +2860,19 @@ function _series(g, gk, op, ref::AbstractString = REFBK)
                 (isnothing(best) || median(v) < median(best)) && (best = v)
             end
             isnothing(best) || push!(out, (s, best))
+        elseif ref == _MT_GATE_VIEW
+            # Same construction as `_GATE_VIEW` above — divide by whichever reference is FASTER, chosen
+            # per cell so one panel may switch references along its x-axis — but both arms threaded.
+            # A cell with no threaded reference is DROPPED rather than falling back to a serial one:
+            # a threaded PB arm over a single-thread vendor is not the gate and must not be drawn as it.
+            haskey(cell, _ARM_PB_MT) || continue
+            best = nothing
+            for r in _REF_MT_ALL
+                haskey(cell, r) || continue
+                v = _ratio(cell[r].q, cell[_ARM_PB_MT].q)
+                (isnothing(best) || median(v) < median(best)) && (best = v)
+            end
+            isnothing(best) || push!(out, (s, best))
         elseif ref == _ARM_PB_MT
             # THE MT VIEW IS INVERTED RELATIVE TO EVERY OTHER ONE, on purpose. Elsewhere the numerator
             # is the REFERENCE and the denominator PureBLAS, so "higher is better" means PB is faster.
@@ -3180,13 +3200,28 @@ if "mtdraw" in ARGS
             end
             return keep
         end
-        for (gk, base, ttl) in (("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
+        # L1 is here because it threads: `dot`, `asum` and `nrm2` on the fixed-block reduction tree,
+        # `axpy`, `scal`, `blascopy` and `swap` elementwise. L2 and the complex groups have no splitter
+        # yet, so they would draw the flat lines the `_movers` filter exists to keep out.
+        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
             p = joinpath(adir0, "perf_mt_$(base).svg")
             svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread", mtfleet, gk, _ARM_PB_MT;
                 only = _movers(mtfleet, gk))
             println("  ", relpath(p))
         end
-        println("mt panels written — scaling curves for the routines that thread.")
+        # THE GATE PANELS — every group, no `_movers` filter. Scaling is only interesting where
+        # something splits, but the gate is the criterion everywhere: a group that does not thread
+        # still has to be measured against a vendor that does, and that gap IS the finding for L2 and
+        # the complex groups. Above 1.00 is a pass, as on every other gate plot in this file.
+        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+            ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "complex BLAS-1"), ("CL2", "cl2", "complex BLAS-2"),
+            ("CL3", "cl3", "complex BLAS-3"), ("CLP", "clapack", "complex LAPACK"))
+            p = joinpath(adir0, "perf_mtgate_$(base).svg")
+            svg_panels(p, "$ttl — PureBLAS $_MT_NT threads / $(_refname(_MT_GATE_VIEW))",
+                mtfleet, gk, _MT_GATE_VIEW)
+            println("  ", relpath(p))
+        end
+        println("mt panels written — scaling curves for the routines that thread, and the threaded gate.")
     end
     exit(0)
 end
