@@ -88,11 +88,24 @@ loop:
             end
         else
             for k in 0:3
-                # FALSIFIED 2026-09-28: replacing this with a bitwise sign-bit clear (bitcast, AND with
-            # 0x7fff..., bitcast back) measured WORSE — gate 0.847 against 0.877 — so LLVM already
-            # lowers `fabs` to the right thing and the FP pipeline is not the contention. Removing
-            # the operation ENTIRELY runs 2.44x faster at n=100000, which prices the load-to-ZA
-            # dependency, not the absolute value. Do not retry the bitwise form.
+                # THIS ONE OPERATION IS asum's WHOLE DEFICIT against `dot`, which reaches 998 GB/s
+            # on the same ZA machinery doing no z-register arithmetic at all. Priced by deleting it
+            # (`bench/probes/asum_fabs_cost_za.jl` — the wrong answer, timed only to cost the op):
+            #
+            #     n            65536  262144  1000000  4000000
+            #     with fabs      204     204      204      157   GB/s
+            #     without        514     512      511      157
+            #
+            # 2.5x while the operand is L2-resident and NOTHING past L2, where the memory rate binds
+            # instead. Both of asum's failing gate cells (n=100000, n=1000000) sit in the resident
+            # band, so they are bound by this.
+            #
+            # FALSIFIED: a bitwise sign-bit clear (bitcast, AND with 0x7fff..., bitcast back)
+            # measured WORSE — gate 0.847 against 0.877 — so LLVM already lowers `fabs` to the right
+            # thing and the FP pipeline is not the contention. Do not retry the bitwise form. ZA
+            # group count is falsified too (flat 174-198 across 1/2/4/8). This LLVM exposes no
+            # multi-vector `fabs` and no multi-vector `fminnm`, so the identity
+            # `sum|x| = sum(x) - 2*sum(min(x,0))` has no cheaper form here either.
             println(io, "  %av$(j)_$(k) = call <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double> %xv$(j)_$(k))")
             end
         end
