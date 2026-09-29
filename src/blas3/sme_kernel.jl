@@ -1674,6 +1674,20 @@ const _SME_SELFTEST_MSG = """
     to $(_SME_GEMV_BLK * _SME_GEMV_NGMAX) rows. Please report it.
     Set `sme_f64 = false` in LocalPreferences.toml to keep the SIMD path meanwhile."""
 
+# ⛔ THE BARRIER COSTS ~50 ns PER CALL AND CANNOT BE SKIPPED BY TESTING THE `-C` TARGET.
+#
+# Measured on `gemv`, the same kernel reached both ways: 607 against 794 GB/s at n=128, 845 against
+# 918 at n=256, 1007 against 1032 at n=512 — a flat ~50 ns, which is 30% of the call at n=128 and is
+# what holds gemv's small-n cells under the gate. It is not the call itself (an empty Julia cfunction
+# is 3.3 ns, and an empty streaming body through one costs 7.6 ns more than reached directly), so it
+# is the boundary into a kernel that holds ZA.
+#
+# The obvious escape does not work. `Base.JLOptions().cpu_target == C_NULL` looks like it means "this
+# host", which would let an ordinary session call the kernel directly and leave the barrier to
+# juliac's stripped pass. It does not: an ordinary `Pkg.precompile()` ALSO compiles for a generic
+# image CPU, and routing `_sme_gemv!` straight at `_sme_gemv_cabi` under that test aborts the package
+# build with `Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`. Tried 2026-09-30.
+
 # ══ TRAMPOLINE CONSTRUCTION — TWO FORMS, CHOSEN BY THE COMPILING PROCESS'S OWN TARGET ═══════════
 #
 # The barrier below exists because AOT codegen OVERRIDES a function's own `target-features` with the
