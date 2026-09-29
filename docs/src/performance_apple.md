@@ -31,8 +31,8 @@ agreeing to within 5% (`bench/check_arm_anchors.sh`). Full provenance:
 ## Headline
 
 **The median and the worst cell tell opposite stories here, and the gate reports the worst cell.**
-On the median PureBLAS beats Accelerate on `symv` (1.59x), `iamax` (1.42x), `getrf` (1.42x),
-`gesvd` (1.22x), `axpy` (1.21x), `dot` (1.19x), `spmv` (1.05x), `trsvLT` (1.04x) and `nrm2`
+On the median PureBLAS beats Accelerate on `symv` (1.59x), `iamax` (1.43x), `getrf` (1.42x),
+`gesvd` (1.22x), `axpy` (1.22x), `dot` (1.19x), `spmv` (1.05x), `trsvLT` (1.04x) and `nrm2`
 (1.92x), and beats OpenBLAS on the median of every BLAS-3 and LAPACK op measured. `dot` and `nrm2`
 pass the gate; every other op has at least one size where it does not.
 
@@ -133,11 +133,11 @@ FAIL can still have a winning median — true for `axpy`, `asum`, `scal`, `symv`
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
 | L1 | `dot` | 1.10 (1.00) | **1.19** (1.02) | 1.000 | **PASS** |
-| L1 | `axpy` | **1.16** (1.00) | **1.21** (0.95) | 0.952 | FAIL |
+| L1 | `axpy` | **1.17** (1.00) | **1.22** (0.98) | 0.979 | FAIL |
 | L1 | `nrm2` | **8.29** (7.00) | **1.92** (1.67) | 1.672 | **PASS** |
 | L1 | `asum` | 1.10 (1.00) | **1.03** (0.87) | 0.866 | FAIL |
-| L1 | `scal` | 1.00 (0.84) | **1.02** (0.83) | 0.834 | FAIL |
-| L1 | `iamax` | 0.79 (0.50) | **1.42** (0.75) | 0.497 | FAIL |
+| L1 | `scal` | 1.00 (0.99) | 0.98 (0.83) | 0.834 | FAIL |
+| L1 | `iamax` | 0.79 (0.50) | **1.43** (0.75) | 0.497 | FAIL |
 | L2 | `gemvN` | **7.50** (1.91) | 0.80 (0.31) | 0.312 | FAIL |
 | L2 | `gemvT` | **2.15** (1.83) | 0.74 (0.34) | 0.338 | FAIL |
 | L2 | `ger` | 1.00 (0.97) | 0.37 (0.25) | 0.248 | FAIL |
