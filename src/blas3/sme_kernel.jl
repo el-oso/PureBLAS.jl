@@ -1219,13 +1219,25 @@ end
 #      512    0.90   1.49   2.32   4.07   8.69  11.77   9.51   8.82
 #     1024    1.37   2.12   3.69   7.60  10.40  10.62  12.45   8.77
 #
-# Every cell at or above 8192 elements wins and every loser is below it, and 8192 doubles is half of
-# this machine's L1 — the panel has to be at least that before the fixed ZA cost disappears into it.
 # DERIVING THIS ON ONE n WOULD HAVE BEEN WRONG: an m-only sweep at n=512 put the cut at 96 rows, and
 # that admitted 35 shapes at n=64 that run as slow as 0.82 of the path they displaced.
-# PDM: Derived — formula over detected consts: half of L1 in elements, `_L1_BYTES ÷ (2 * sizeof(Float64))`, the panel size at which the O(m) ZA fill and readback disappear into the stream.
+#
+# ⚠ THE CUT MOVES WITH THE DRIVER ABOVE IT, and that is why it is a QUARTER of L1 rather than the half
+# the table above implies. The fixed cost this cut is paying for is per BLOCK, not per call, so a
+# driver that covers a ragged `m` in two blocks instead of six has a different crossing from one that
+# does not. Re-measured on square shapes in the gate's own methodology, SME against the SIMD path it
+# displaces:
+#
+#     n           32    40    48    56    64    80    96   112   128
+#     m*n       1024  1600  2304  3136  4096  6400  9216 12544 16384
+#     SME/SIMD  0.46  0.59  0.64  1.31  1.55  1.38  1.83  2.24  4.05
+#
+# so the crossing is between 2304 and 3136 elements. A quarter of L1 is 4096, the first power of two
+# clear of it, and it admits every square shape from n=64 up. ⚠ If the row driver or the trampoline
+# cost changes again, this cut is a frozen comparison against the arm as it stood — re-derive it.
+# PDM: Derived — formula over detected consts: a quarter of L1 in elements, `_L1_BYTES ÷ (4 * sizeof(Float64))`, the panel size at which the per-block ZA fill and readback disappear into the stream.
 const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
-    _L1_BYTES ÷ (2 * sizeof(Float64)))::Int
+    _L1_BYTES ÷ (4 * sizeof(Float64)))::Int
 
 # A NON-MULTIPLE IS ADMISSIBLE ONLY WITH beta == 0. Its trailing rows are covered by an overlapping
 # full block, which recomputes rows it shares with the previous one -- sound when those rows are
@@ -1275,18 +1287,44 @@ function _sme_gemv_cabi(
     )
     st = store != 0
     ib = 0
-    rb = 512
-    # LARGEST BLOCK FIRST, HALVING. An earlier version capped this at half the rows because a lone
-    # block seemed to have nothing to overlap against. What it was overlapping WAS the readback, and
-    # once that became a direct store the rule was pure cost: removing it took m=512 from 0.96 to
-    # 1.05 of Accelerate and m=768 from 0.99 to 1.04.
-    while rb >= 32
-        nb = (m - ib) ÷ rb
-        if nb > 0
-            _sme_gemv_run(rb, y + ib * 8, a + ib * 8, lda, x, n, alpha, nb, st)
-            ib += nb * rb
+    # ONE BLOCK SIZE, THEN ONE OVERLAPPING BLOCK — not a halving ladder, whenever the rows are being
+    # STORED. A ladder covers a ragged `m` with progressively narrower blocks, and a narrow block is
+    # slow twice over: its group count is its memory-level parallelism (measured 230 GB/s at two
+    # groups, 608 at four, 845 at eight, 1009 at sixteen), and every extra block pays another ZA
+    # prologue. At m=1000 the ladder issued SIX blocks (512+256+128+64+32+overlap) and at m=100 three
+    # (64+32+overlap); the widest block plus one overlapping copy of itself covers either in TWO, at
+    # the widest group count throughout. Measured against the ladder, same kernels, no other change:
+    # m=100 1.71x, m=1000 1.28x, m=64 2.64x, and unchanged where the ladder already issued one block.
+    #
+    # Sound only in STORE mode, for the same reason the tail below is: the overlapped rows are
+    # rewritten with the value they already hold. Accumulate mode keeps the ladder, where `m` is a
+    # multiple of the block anyway because `_sme_gemv_shape_ok` demands it once beta is nonzero.
+    if st
+        ng = 1
+        while 2 * ng * _SME_GEMV_BLK <= m && 2 * ng <= _SME_GEMV_NGMAX
+            ng *= 2
         end
-        rb >>= 1
+        rb = ng * _SME_GEMV_BLK
+        nb = m ÷ rb
+        if nb > 0
+            _sme_gemv_run(rb, y, a, lda, x, n, alpha, nb, true)
+            ib = nb * rb
+        end
+        if ib < m
+            off = m - rb
+            _sme_gemv_run(rb, y + off * 8, a + off * 8, lda, x, n, alpha, 1, true)
+            ib = m
+        end
+    else
+        rb = _SME_GEMV_BLK * _SME_GEMV_NGMAX
+        while rb >= _SME_GEMV_BLK
+            nb = (m - ib) ÷ rb
+            if nb > 0
+                _sme_gemv_run(rb, y + ib * 8, a + ib * 8, lda, x, n, alpha, nb, false)
+                ib += nb * rb
+            end
+            rb >>= 1
+        end
     end
     if ib < m
         # THE TAIL IS AN OVERLAPPING BLOCK, NOT A SCALAR LOOP. A remainder below one vector group
