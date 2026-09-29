@@ -235,110 +235,235 @@ end
     return s
 end
 
-# ── axpy: y += a*x ──────────────────────────────────────────────────────────────────────────────
+# ── scal and axpy: ZA AS AN ARITHMETIC UNIT, NOT AS AN ACCUMULATOR ──────────────────────────────
 #
-# NOT a reduction, so ZA does not enter: there is nothing to accumulate, only a stream to widen.
-# What this buys over the NEON kernel is purely the vector width — 512-bit streaming loads and
-# stores moving four vectors per instruction instead of one 128-bit register.
+# `x .*= a` and `y .+= a.*x` accumulate nothing, so the reduction argument above does not apply to
+# them — and they are still capped by the same wall. Measured on an 8 MB resident buffer, a
+# streaming-mode COPY of it runs 404 GB/s and adding ONE `fmul` per vector in z registers drops it
+# to 138 (`bench/probes/rmw_ceiling.jl`). The 2.9x is arithmetic that moves no extra bytes: the wall
+# is z-register FP throughput in streaming mode, which is what `apple-sme-gemv-za-accumulate` says
+# it is. There is no multi-vector `fmul` in this LLVM, so ZA is the only way to get the multiply out
+# of z registers, and it works on a non-accumulating kernel too:
 #
-# ⚠ THE CEILING HERE IS THE WRITE PATH, NOT THE READ PATH, which is why the gains are modest next to
-# `dot`'s: measured on this part, a pure read reaches 107 GB/s, a pure write 150, and memcpy 263
-# combined. `dot` went 7.4x because its wall was a dependency chain; axpy's is traffic.
-const _SME_AXPY_ATTRS = """
-attributes #0 = { noinline "aarch64_pstate_sm_body"
-  "target-features"="+sme,+sme2,+sme-f64f64" }
-"""
+#     `zero {za}` the group, `fmla.single` lands `a*x` in it, read the group back, store it.
+#
+#     n            1000  3000  10000  30000  100000  300000  1000000
+#     scal NEON     288   272    275    164     167     168      167   GB/s
+#     scal ZA       236   509    547    558     553     550      563
+#     Accelerate    496   541    554    559     549     543      556
+#     axpy NEON     294   294    171    173     213     214      213
+#     axpy ZA       344   622    662    668     669     727      303
+#
+# which is where the floors below come from. `axpy` seeds the cleared
+# group with `y` at weight one and then accumulates `a*x` into it, so both operands arrive through
+# the same fused multiply-add the NEON kernel uses and the result is bit-for-bit `muladd(a, x, y)`.
+#
+# ⛔ THE KERNEL COVERS THE WHOLE VECTOR, DOWN TO THE LAST ELEMENT, and that is a performance
+# requirement, not tidiness. Ordinary floating-point work in a function that also calls a
+# streaming-mode kernel costs ~50 ns whichever side of the call it sits on: a 16-element remainder
+# loop is 50 ns of stall for 2.8 ns of work, which at n=10000 is the whole difference between 1.01x
+# and 0.81x of Accelerate. A remainder loop that runs ZERO iterations costs nothing, so the penalty
+# is the mixing, not the branch. Hence three phases inside ONE streaming
+# region: G groups over the blocks they cover, a single-group loop over the blocks past that, and a
+# `whilelt`-predicated loop over the scrap below one block.
+#
+# GROUP COUNT is not the same optimum as `dot`'s, because each group here carries a load AND a
+# store, so groups buy independent memory streams rather than only independent dependency chains:
+# scal reads 477 / 563 / 550 GB/s at two / four / eight groups, axpy 561 / 727 / 671.
+# PDM: Measured — each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
+const _SME_RMW_G = @load_preference("sme_rmw_groups", 4)::Int   # req8-ok: swept, see the rates above
 
-function _sme_axpy_ir()
+# `kind` is `:scal` (`y = a*x`, called in place) or `:axpy` (`y = y + a*x`).
+function _sme_rmw_ir(G::Int, kind::Symbol)
+    axpy = kind === :axpy
     q = Char(34)
+    SC = "target($(q)aarch64.svcount$(q))"
     T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
     io = IOBuffer()
+    # One whole block through ZA group `g`, at the block index named by `bexpr`.
+    blk = function (g, bexpr, sfx)
+        println(io, "  %o$sfx = mul nsw i64 $bexpr, %w")
+        println(io, "  %px$sfx = getelementptr inbounds double, ptr %x, i64 %o$sfx")
+        println(io, "  %py$sfx = getelementptr inbounds double, ptr %y, i64 %o$sfx")
+        if axpy
+            println(io, "  %ry$sfx = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %py$sfx)")
+            for k in 0:3
+                println(io, "  %yv$(sfx)_$k = extractvalue $T4 %ry$sfx, $k")
+            end
+            println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
+            println(io, "    <vscale x 2 x double> %yv$(sfx)_0, <vscale x 2 x double> %yv$(sfx)_1,")
+            println(io, "    <vscale x 2 x double> %yv$(sfx)_2, <vscale x 2 x double> %yv$(sfx)_3, <vscale x 2 x double> %one)")
+        end
+        println(io, "  %r$sfx = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC %pn, ptr %px$sfx)")
+        for k in 0:3
+            println(io, "  %v$(sfx)_$k = extractvalue $T4 %r$sfx, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32 $g,")
+        println(io, "    <vscale x 2 x double> %v$(sfx)_0, <vscale x 2 x double> %v$(sfx)_1,")
+        println(io, "    <vscale x 2 x double> %v$(sfx)_2, <vscale x 2 x double> %v$(sfx)_3, <vscale x 2 x double> %av)")
+        println(io, "  %z$sfx = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $g)")
+        for k in 0:3
+            println(io, "  %q$(sfx)_$k = extractvalue $T4 %z$sfx, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %q$(sfx)_0, <vscale x 2 x double> %q$(sfx)_1, <vscale x 2 x double> %q$(sfx)_2, <vscale x 2 x double> %q$(sfx)_3, $SC %pn, ptr %py$sfx)")
+    end
     print(io, """
-declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
-declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
-declare void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, target($(q)aarch64.svcount$(q)), ptr)
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare $SC @llvm.aarch64.sve.ptrue.c64()
+declare <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64, i64)
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64($SC, ptr)
+declare void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, $SC, ptr)
+declare <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1>, ptr)
+declare void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double>, <vscale x 2 x i1>, ptr)
+declare void @llvm.aarch64.sme.fmla.single.vg1x4.nxv2f64(i32, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
 declare <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
 declare i64 @llvm.vscale.i64()
 
-define void @entry(ptr %y, ptr %x, double %a, i64 %nb) {
-  call void @k(ptr %y, ptr %x, double %a, i64 %nb)
+define void @entry(ptr %y, ptr %x, double %a, i64 %n) {
+  call void @k(ptr %y, ptr %x, double %a, i64 %n)
   ret void
 }
-define internal void @k(ptr %y, ptr %x, double %a, i64 %nb) #0 {
+define internal void @k(ptr %y, ptr %x, double %a, i64 %n) #0 {
 entry:
-  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  call void @llvm.aarch64.sme.za.enable()
+  %pn = call $SC @llvm.aarch64.sve.ptrue.c64()
   %vs = call i64 @llvm.vscale.i64()
+  %lanes = shl i64 %vs, 1
   %w = shl i64 %vs, 3
   %e0 = insertelement <vscale x 2 x double> poison, double %a, i32 0
   %av = shufflevector <vscale x 2 x double> %e0, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
-  %go = icmp sgt i64 %nb, 0
-  br i1 %go, label %loop, label %done
+  %e1 = insertelement <vscale x 2 x double> poison, double 1.0, i32 0
+  %one = shufflevector <vscale x 2 x double> %e1, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %nb = sdiv i64 %n, %w
+  %whole = mul nsw i64 %nb, %w
+  %cb = sdiv i64 %nb, $G
+  %cov = mul nsw i64 %cb, $G
+  %go = icmp sgt i64 %cb, 0
+  br i1 %go, label %loop, label %tailchk
 loop:
   %b = phi i64 [ 0, %entry ], [ %bn, %loop ]
-  %o = mul nsw i64 %b, %w
-  %px = getelementptr inbounds double, ptr %x, i64 %o
-  %py = getelementptr inbounds double, ptr %y, i64 %o
-  %xr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %px)
-  %yr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %py)
+  call void @llvm.aarch64.sme.zero(i32 255)
 """)
-    for k in 0:3
-        println(io, "  %xv$(k) = extractvalue $T4 %xr, $k")
-        println(io, "  %yv$(k) = extractvalue $T4 %yr, $k")
-        println(io, "  %r$(k) = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %av, <vscale x 2 x double> %xv$(k), <vscale x 2 x double> %yv$(k))")
+    for g in 0:(G - 1)
+        println(io, "  %m$g = mul nsw i64 %cb, $g")
+        println(io, "  %s$g = add nsw i64 %b, %m$g")
+        blk(g, "%s$g", "g$g")
     end
     print(io, """
-  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %r0, <vscale x 2 x double> %r1, <vscale x 2 x double> %r2, <vscale x 2 x double> %r3, target($(q)aarch64.svcount$(q)) %pn, ptr %py)
   %bn = add nuw nsw i64 %b, 1
-  %d = icmp eq i64 %bn, %nb
-  br i1 %d, label %done, label %loop
+  %ld = icmp eq i64 %bn, %cb
+  br i1 %ld, label %tailchk, label %loop
+tailchk:
+  %hastail = icmp slt i64 %cov, %nb
+  br i1 %hastail, label %tail, label %scrapchk
+tail:
+  %j = phi i64 [ %cov, %tailchk ], [ %jn, %tail ]
+  call void @llvm.aarch64.sme.zero(i32 255)
+""")
+    blk(0, "%j", "t")
+    print(io, """
+  %jn = add nuw nsw i64 %j, 1
+  %td = icmp eq i64 %jn, %nb
+  br i1 %td, label %scrapchk, label %tail
+scrapchk:
+  %hasscrap = icmp slt i64 %whole, %n
+  br i1 %hasscrap, label %scrap, label %done
+scrap:
+  %i = phi i64 [ %whole, %scrapchk ], [ %in, %scrap ]
+  %pg = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 %i, i64 %n)
+  %sx = getelementptr inbounds double, ptr %x, i64 %i
+  %sy = getelementptr inbounds double, ptr %y, i64 %i
+  %sv = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %pg, ptr %sx)
+""")
+    if axpy
+        print(io, """
+  %syv = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %pg, ptr %sy)
+  %sr = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %av, <vscale x 2 x double> %sv, <vscale x 2 x double> %syv)
+""")
+    else
+        println(io, "  %sr = fmul <vscale x 2 x double> %sv, %av")
+    end
+    print(io, """
+  call void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double> %sr, <vscale x 2 x i1> %pg, ptr %sy)
+  %in = add nsw i64 %i, %lanes
+  %sd = icmp slt i64 %in, %n
+  br i1 %sd, label %scrap, label %done
 done:
+  call void @llvm.aarch64.sme.za.disable()
   ret void
 }
 """)
-    print(io, _SME_AXPY_ATTRS)
+    print(io, _SME_ATTRS)
     return String(take!(io))
 end
 
-const _SME_AXPY_IR = _sme_axpy_ir()
-@inline _sme_axpy_k(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, nb::Int) =
-    Base.llvmcall((_SME_AXPY_IR, "entry"), Cvoid,
-                  Tuple{Ptr{Float64}, Ptr{Float64}, Float64, Int64}, y, x, a, Int64(nb))
+const _SME_SCAL_IR = _sme_rmw_ir(_SME_RMW_G, :scal)
+const _SME_AXPY_IR = _sme_rmw_ir(_SME_RMW_G, :axpy)
 
+@inline _sme_scal_k(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, n::Int) =
+    Base.llvmcall((_SME_SCAL_IR, "entry"), Cvoid,
+                  Tuple{Ptr{Float64}, Ptr{Float64}, Float64, Int64}, y, x, a, Int64(n))
+@inline _sme_axpy_k(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, n::Int) =
+    Base.llvmcall((_SME_AXPY_IR, "entry"), Cvoid,
+                  Tuple{Ptr{Float64}, Ptr{Float64}, Float64, Int64}, y, x, a, Int64(n))
+
+const _SME_SCAL_CALLS = Threads.Atomic{Int}(0)
 const _SME_AXPY_CALLS = Threads.Atomic{Int}(0)
+const _SME_SCAL_TRAMPOLINE = Ref{Any}(nothing)
+const _SME_SCAL_ENTRY      = Ref{Ptr{Cvoid}}(C_NULL)
 const _SME_AXPY_TRAMPOLINE = Ref{Any}(nothing)
 const _SME_AXPY_ENTRY      = Ref{Ptr{Cvoid}}(C_NULL)
 
-function _sme_axpy_cabi(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, nb::Int)
-    _sme_axpy_k(y, x, a, nb)
+function _sme_scal_cabi(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, n::Int)
+    _sme_scal_k(y, x, a, n)
+    return nothing
+end
+function _sme_axpy_cabi(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, n::Int)
+    _sme_axpy_k(y, x, a, n)
     return nothing
 end
 
-# Measured cold with the gate's operand shape, SME against the NEON kernel it displaces:
+# Where the ZA route overtakes the NEON kernel it displaces, measured in the gate's own L1 setup —
+# `randn(n)` per sample, then `clamp(8_000_000/n, 30, 20000)` calls on that buffer
+# (`bench/probes/l1_za_rmw_floor.jl`), ZA / shipped:
 #
-#     n        16384  32768  65536  100000  300000  1000000
-#     SME/SIMD  0.71   0.80   0.98    1.18    1.28     1.29
+#     n       512   768  1024  1536  2048  3072  4096   8192  32768
+#     scal   0.42  0.63  0.87  1.36  1.79  1.90  1.89   1.99   3.41
+#     axpy   0.62  0.97  1.31  1.89  2.07  2.12  2.16   2.20   3.65
 #
-# so it turns just above 65536, where it is still level. The floor sits one step past that rather
-# than on it.
-# PDM: Measured — where the wider streaming store overtakes the NEON kernel, in the operand shape and regime the sweep uses; a ratio between two kernels, not a residency criterion. | tune: sweep n
-const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 98304)::Int  # req8-ok: measured crossover, table above
+# so scal turns between 1024 and 1536 and axpy between 768 and 1024. Each floor is the first power
+# of two on the winning side of its own crossing — they are different numbers because `scal` moves
+# two streams to `axpy`'s three, so the same fixed cost buys less.
+# PDM: Measured — where the ZA prologue and its group-clear disappear into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
+const _SME_SCAL_MIN = @load_preference("sme_scal_min", 2048)::Int   # req8-ok: measured crossover, table above
+# PDM: Measured — the same crossing for the three-stream form, which turns earlier because each call carries more work per unit of fixed cost. | tune: sweep n
+const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 1024)::Int   # req8-ok: measured crossover, table above
 
+@inline _sme_scal_ok(::Type{T}, n::Int, x) where {T} =
+    T === Float64 && _SME_F64 && n >= _SME_SCAL_MIN &&
+        _dense1(x) && _SME_SCAL_ENTRY[] !== C_NULL
 @inline _sme_axpy_ok(::Type{T}, n::Int, x, y) where {T} =
     T === Float64 && _SME_F64 && n >= _SME_AXPY_MIN &&
         _dense1(x) && _dense1(y) && _SME_AXPY_ENTRY[] !== C_NULL
 
+@noinline function _sme_scal!(n::Int, a::Float64, x)
+    Threads.atomic_add!(_SME_SCAL_CALLS, 1)
+    GC.@preserve x begin
+        p = _sme_p(x)
+        ccall(_SME_SCAL_ENTRY[], Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int), p, p, a, n)
+    end
+    return x
+end
+
 @noinline function _sme_axpy!(n::Int, a::Float64, x, y)
     Threads.atomic_add!(_SME_AXPY_CALLS, 1)
-    nb = n ÷ _SME_L1_BLK
-    m = nb * _SME_L1_BLK
     GC.@preserve x y begin
-        py = _sme_p(y); px = _sme_p(x)
-        nb > 0 && ccall(_SME_AXPY_ENTRY[], Cvoid,
-                        (Ptr{Float64}, Ptr{Float64}, Float64, Int), py, px, a, nb)
-        for i in m:(n - 1)
-            q = py + i * 8
-            unsafe_store!(q, muladd(a, unsafe_load(px + i * 8), unsafe_load(q)))
-        end
+        ccall(_SME_AXPY_ENTRY[], Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int),
+              _sme_p(y), _sme_p(x), a, n)
     end
     return y
 end
