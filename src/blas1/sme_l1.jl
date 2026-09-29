@@ -427,21 +427,24 @@ function _sme_axpy_cabi(y::Ptr{Float64}, x::Ptr{Float64}, a::Float64, n::Int)
     return nothing
 end
 
-# Where the ZA route overtakes the NEON kernel it displaces, measured in the gate's own L1 setup —
-# `randn(n)` per sample, then `clamp(8_000_000/n, 30, 20000)` calls on that buffer
-# (`bench/probes/l1_za_rmw_floor.jl`), ZA / shipped:
+# ⚠ THE FLOOR IS A COLD CROSSING, AND WARM IT SITS 64x LOWER. Warm, with a rep loop over one
+# buffer, the ZA route already wins at n=1536 for `scal` and n=1024 for `axpy` (1.36x and 1.31x).
+# BLAS-1 on this machine is graded cold — one call per freshly allocated operand — and there the ZA
+# route carries a fixed cost of roughly 700 ns per call that a rep loop amortizes away and a single
+# pass pays in full. Gate cells, PB / max(OpenBLAS, Accelerate), with the route open at every size:
 #
-#     n       512   768  1024  1536  2048  3072  4096   8192  32768
-#     scal   0.42  0.63  0.87  1.36  1.79  1.90  1.89   1.99   3.41
-#     axpy   0.62  0.97  1.31  1.89  2.07  2.12  2.16   2.20   3.65
+#     n        1000   3000  10000  30000  100000  300000  1000000
+#     scal     1.00   0.22   0.64   0.87    0.98    1.03     0.97
+#     axpy     1.00   0.25   0.62   0.83    0.99    1.38     0.97
 #
-# so scal turns between 1024 and 1536 and axpy between 768 and 1024. Each floor is the first power
-# of two on the winning side of its own crossing — they are different numbers because `scal` moves
-# two streams to `axpy`'s three, so the same fixed cost buys less.
-# PDM: Measured — where the ZA prologue and its group-clear disappear into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
-const _SME_SCAL_MIN = @load_preference("sme_scal_min", 2048)::Int   # req8-ok: measured crossover, table above
-# PDM: Measured — the same crossing for the three-stream form, which turns earlier because each call carries more work per unit of fixed cost. | tune: sweep n
-const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 1024)::Int   # req8-ok: measured crossover, table above
+# Below 65536 that fixed cost is most of the call and the NEON kernel is far better; above it the
+# 3.3x streaming rate dominates. Both floors land on the same crossing as `dot`'s and `asum`'s, and
+# for the same reason — it is the size at which a fixed ZA prologue disappears into the stream, not
+# a property of any one operation.
+# PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: sweep n
+const _SME_SCAL_MIN = @load_preference("sme_scal_min", 65536)::Int   # req8-ok: measured crossover, table above
+# PDM: Measured — the same cold crossing for the three-stream form. | tune: sweep n
+const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 65536)::Int   # req8-ok: measured crossover, table above
 
 @inline _sme_scal_ok(::Type{T}, n::Int, x) where {T} =
     T === Float64 && _SME_F64 && n >= _SME_SCAL_MIN &&

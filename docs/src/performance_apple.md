@@ -31,10 +31,10 @@ agreeing to within 5% (`bench/check_arm_anchors.sh`). Full provenance:
 ## Headline
 
 **The median and the worst cell tell opposite stories here, and the gate reports the worst cell.**
-On the median PureBLAS beats Accelerate on `symv` (1.59x), `getrf` (1.42x), `gesvd` (1.22x),
-`axpy` (1.14x), `dot` (1.07x), `spmv` (1.05x), `trsvLT` (1.04x) and `nrm2` (1.92x), and beats
-OpenBLAS on the median of every BLAS-3 and LAPACK op measured. Only `nrm2` passes the gate, because
-every other op has at least one size where it does not.
+On the median PureBLAS beats Accelerate on `symv` (1.59x), `iamax` (1.42x), `getrf` (1.42x),
+`gesvd` (1.22x), `axpy` (1.21x), `dot` (1.19x), `spmv` (1.05x), `trsvLT` (1.04x) and `nrm2`
+(1.92x), and beats OpenBLAS on the median of every BLAS-3 and LAPACK op measured. `dot` and `nrm2`
+pass the gate; every other op has at least one size where it does not.
 
 Where the remaining gap lives, by op family:
 
@@ -128,16 +128,16 @@ Ratio is PB / reference, **median (worst cell)** across the measured size ladder
 BLAS-2/3/LAPACK; full 1e3..1e6 for BLAS-1, L1 measured `cold` — see above). Gate is PB / max(OpenBLAS,
 Accelerate) — the same two-significant-digit rounding rule as the
 [main fleet](methodology.md#the-gate) (`bench/gatecrit.jl`). The gate is a **worst-cell** figure, so a
-FAIL can still have a winning median — true for `dot`, `axpy`, `asum`, `symv`, `getrf` and `gesvd` below.
+FAIL can still have a winning median — true for `axpy`, `asum`, `scal`, `symv`, `getrf` and `gesvd` below.
 
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
-| L1 | `dot` | 1.00 (0.98) | **1.07** (0.41) | 0.406 | FAIL |
-| L1 | `axpy` | 1.00 (0.97) | **1.14** (0.53) | 0.529 | FAIL |
+| L1 | `dot` | 1.10 (1.00) | **1.19** (1.02) | 1.000 | **PASS** |
+| L1 | `axpy` | **1.16** (1.00) | **1.21** (0.95) | 0.952 | FAIL |
 | L1 | `nrm2` | **8.29** (7.00) | **1.92** (1.67) | 1.672 | **PASS** |
-| L1 | `asum` | 1.01 (1.00) | **1.00** (0.54) | 0.538 | FAIL |
-| L1 | `scal` | 0.99 (0.96) | 0.83 (0.39) | 0.389 | FAIL |
-| L1 | `iamax` | 0.50 (0.49) | 0.93 (0.90) | 0.491 | FAIL |
+| L1 | `asum` | 1.10 (1.00) | **1.03** (0.87) | 0.866 | FAIL |
+| L1 | `scal` | 1.00 (0.84) | **1.02** (0.83) | 0.834 | FAIL |
+| L1 | `iamax` | 0.79 (0.50) | **1.42** (0.75) | 0.497 | FAIL |
 | L2 | `gemvN` | **7.50** (1.91) | 0.80 (0.31) | 0.312 | FAIL |
 | L2 | `gemvT` | **2.15** (1.83) | 0.74 (0.34) | 0.338 | FAIL |
 | L2 | `ger` | 1.00 (0.97) | 0.37 (0.25) | 0.248 | FAIL |

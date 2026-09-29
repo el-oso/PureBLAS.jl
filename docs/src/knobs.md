@@ -267,11 +267,11 @@ Every `@load_preference` key in `src/` — 166 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | sweep n |
-| `sme_axpy_min` | literal | Measured | the same crossing for the three-stream form, which turns earlier because each call carries more work per unit of fixed cost. | sweep n |
+| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | sweep n |
 | `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | sweep n |
 | `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | candidate, (1,2,4,8) |
 | `sme_rmw_groups` | literal | Measured | each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
-| `sme_scal_min` | literal | Measured | where the ZA prologue and its group-clear disappear into the stream; a ratio between two kernels, not a residency criterion. | sweep n |
+| `sme_scal_min` | literal | Measured | where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | sweep n |
 
 ## workspace
 
