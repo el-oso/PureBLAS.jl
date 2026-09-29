@@ -429,18 +429,23 @@ end
 
 # ⚠ THE FLOOR IS A COLD CROSSING, AND WARM IT SITS 64x LOWER. Warm, with a rep loop over one
 # buffer, the ZA route already wins at n=1536 for `scal` and n=1024 for `axpy` (1.36x and 1.31x).
-# BLAS-1 on this machine is graded cold — one call per freshly allocated operand — and there the ZA
-# route carries a fixed cost of roughly 700 ns per call that a rep loop amortizes away and a single
-# pass pays in full. Gate cells, PB / max(OpenBLAS, Accelerate), with the route open at every size:
+# BLAS-1 on this machine is graded COLD — one call per freshly allocated operand — and in that shape
+# the ZA route carries several hundred ns of cost per call that a rep loop does not. Gate cells,
+# PB / max(OpenBLAS, Accelerate), with the route open at every size:
 #
 #     n        1000   3000  10000  30000  100000  300000  1000000
 #     scal     1.00   0.22   0.64   0.87    0.98    1.03     0.97
 #     axpy     1.00   0.25   0.62   0.83    0.99    1.38     0.97
 #
-# Below 65536 that fixed cost is most of the call and the NEON kernel is far better; above it the
-# 3.3x streaming rate dominates. Both floors land on the same crossing as `dot`'s and `asum`'s, and
-# for the same reason — it is the size at which a fixed ZA prologue disappears into the stream, not
-# a property of any one operation.
+# Below 65536 that cost is most of the call and the NEON kernel is far better; above it the 3.3x
+# streaming rate dominates. Both floors land on the same crossing as `dot`'s and `asum`'s, which is
+# a property of the ZA route rather than of any one operation.
+#
+# ⛔ THE MECHANISM IS NOT IDENTIFIED, so do not tune against a model of it. Ruled out by measurement:
+# the `@cfunction` trampoline, `za.enable` (1 ns), `za.disable`, the GC, and the kernel's own
+# instruction mix — a staged kernel (copy / +zero / +fmla / +read) called once per sample on a
+# REUSED buffer shows no penalty at any stage. It appears only with a freshly allocated operand per
+# call, which is what the gate does and what a real caller streaming over new data does.
 # PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: sweep n
 const _SME_SCAL_MIN = @load_preference("sme_scal_min", 65536)::Int   # req8-ok: measured crossover, table above
 # PDM: Measured — the same cold crossing for the three-stream form. | tune: sweep n
