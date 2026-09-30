@@ -2068,8 +2068,21 @@ const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 # `lda > m`, which costs it more than the rows it skipped. `_sme_ger!(96, 100, ...)` on a 100-column
 # matrix takes 997 ns where `ger!` on a 96x96 matrix takes 383 — a 4-element gap between columns is
 # enough, because the group of G columns no longer streams contiguously. Any row split pays this.
-# The remaining route is a predicated scrap INSIDE the streaming region, the shape `_sme_rmw_ir`
-# already uses for BLAS-1.
+#
+# ⛔ AND THE KERNEL'S OWN PREDICATED SCRAP IS NOT THE ANSWER EITHER — it already exists (`mscrap0`..
+# `mscrapG` below), it is CORRECT at every m, and it is slower than NEON everywhere it would be used:
+#
+#     n        100   101   132   156   255   300   500  1001
+#     SME/NEON 0.56  0.45  0.63  0.43  0.44  0.55  0.56  0.66
+#
+# so relaxing the predicate is not a one-line win. The scrap runs once per COLUMN GROUP: at m=100 it
+# adds 555 ns over the same call truncated to 96 rows, for 400 elements — 1.4 ns per element against
+# 0.02 on the whole-vector path, about 7 cycles per predicated operation. That is the per-column
+# remainder cost this file documents for gemv-T and `_sme_ger_ir`, and it is architectural.
+#
+# ⛔ AN OVERLAPPING FINAL VECTOR CANNOT RESCUE IT, unlike the N-form gemv store path. ger ACCUMULATES
+# into A, so a last vector placed at `m - L` re-applies the update to the `L - m % L` rows it overlaps.
+# Overlap is only sound when the kernel STORES.
 @inline _sme_ger_eligible(::Type{T}, m, n, cj, A, x, y, incx, incy) where {T} =
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
