@@ -1627,6 +1627,43 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 
 
 #
+# ⚠ THIS KERNEL IS FMA-ISSUE-BOUND, AND THE INSTRUCTION IT MUST USE RUNS AT HALF RATE. That is the
+# whole of the 1.9x against gemv-N, and it is not a tuning deficit. Measured with one load feeding K
+# INDEPENDENT `fmla`s into K distinct ZA groups, so chain count and throughput can be told apart:
+#
+#     K chains             1      2      4      8     16
+#     fmla.single.vg1x4   68    133    262    261    255  GF/s   (x4 by a BROADCAST — gemv-N's form)
+#     fmla.vg1x4          66    138    131    131    131  GF/s   (x4 by x4 — this kernel's form)
+#     ratio             1.03   0.97   2.00   1.99   1.95
+#
+# Both forms PLATEAU at four chains and neither moves at eight or sixteen, so this is a throughput
+# limit and not accumulator latency: `fmla.vg1x4` retires one per two cycles, `fmla.single.vg1x4` one
+# per cycle. (The broadcast form needs four chains to get there and the multi-by-multi form only two,
+# which is why the K=2 column looks inverted.)
+#
+# ⛔ AT K=1 THEY LOOK IDENTICAL. That arm is load-bound and hides the difference entirely; a first
+# attempt measured 257 GB/s for both and concluded the forms were equal. Do not price these with one
+# FMA per load.
+#
+# The ceiling follows directly. One `fmla.vg1x4` per two cycles covers 4 vectors x L lanes = 32
+# Float64, so 16 elements per cycle, 128 B/cycle, 549 GB/s at this clock — and gemv-T measures 514,
+# 94% of it. The broadcast form gives 256 B/cycle, 1098 GB/s — and gemv-N measures 988, 90% of it.
+# Both kernels are already where their instruction stream puts them.
+#
+# ⛔ SO THE ONLY WAY UP IS THE BROADCAST FORM, WHICH NEEDS ROWS OF A. y[j] = sum_i A[i,j]*x[i] is
+# elementwise in A and x, so multi-by-multi is forced. Reaching the broadcast form means accumulating
+# y += x[i] * A[i,:], which wants ROWS of a column-major A. Transposing tiles through ZA (`mova` by
+# vertical slices, read back horizontal) costs 8 moves in and 8 out per 8x8 Float64 tile — 64 elements
+# for about 32 instructions against 32 elements per 2-cycle instruction today — so it loses by roughly
+# 4x even before the second ZA tile it needs, and the SME2 vg2/vg4 `mova` forms only halve that.
+# `fmopa` does not help: ZA[r,c] += A[i+r,j]*x[i+c] fills a tile to use its diagonal, 8x waste at this
+# vector length. The indexed `fmla` forms broadcast one LANE, which is still a row of A.
+#
+# ⚠ AND ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It reaches
+# about 747 GB/s on the same shape SINGLE-THREADED — `bench/plots.jl` pins `VECLIB_MAXIMUM_THREADS` to
+# 1 for the `accelerate` arm — against the 549 GB/s `fmla.vg1x4` allows. Whatever it uses for gemv-T,
+# we cannot emit it from LLVM, so this cell is not closable by tuning this kernel.
+#
 # ⛔ MORE ZA GROUPS PER COLUMN DOES NOT LIFT THIS KERNEL'S RATE, AND THE gemv-N TABLE DOES NOT TRANSFER.
 # gemv-T at n=1024 reaches 514 GB/s where gemv-N reaches 988 on the same bytes, and the obvious read of
 # the note above `_sme_gemv_eligible` — group count IS memory-level parallelism, 230 GB/s at two groups
