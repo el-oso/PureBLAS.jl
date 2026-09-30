@@ -1626,6 +1626,28 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # Removing it means predicating the tail rows inside the main kernel so A is read once.
 
 
+#
+# ⛔ MORE ZA GROUPS PER COLUMN DOES NOT LIFT THIS KERNEL'S RATE, AND THE gemv-N TABLE DOES NOT TRANSFER.
+# gemv-T at n=1024 reaches 514 GB/s where gemv-N reaches 988 on the same bytes, and the obvious read of
+# the note above `_sme_gemv_eligible` — group count IS memory-level parallelism, 230 GB/s at two groups
+# rising to 1009 at sixteen — says to give each column more than one. It measures the other way.
+# Prototyped as nc columns x G ZA row-groups, row step 4L*G, against the shipped kernel:
+#
+#     n        nc4 G1  nc4 G2  nc4 G4  nc2 G8  nc8 G2
+#      256       0.79    0.66    0.42    0.23    0.60
+#      512       0.85    0.69    0.47    0.24    0.61
+#     1024       0.98    0.80    0.58    0.22    0.71
+#
+# The load count per element is IDENTICAL across G — G x-loads and 4G A-loads cover 4L*G rows of nc
+# columns either way — so this is not traffic. The live set is what changes: G=4 at nc=4 needs sixteen
+# x vectors and sixteen A vectors live per iteration, which is the whole register file.
+#
+# What the gemv-N table actually measures is CONTIGUITY PER COLUMN, not ZA groups: more groups there
+# means a taller row block, so more consecutive bytes are read from each column. In the T form the
+# columns are already swept whole, so there is nothing for extra groups to make more contiguous.
+#
+# The 1.9x against gemv-N is therefore still unexplained. A quarter of it is accounted: the T form
+# re-reads x once per column block, which at nc=4 is m*n/4 elements — 2 MB against A's 8.4 at n=1024.
 # Measured on square Float64 through `gemv!`, best NC per size (bench/probes/sme_gemvt_proto.jl):
 #     n        128   256   512  1024  2048
 #     NC=2    1.00  2.69  3.79  4.14  1.94
