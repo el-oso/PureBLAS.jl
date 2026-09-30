@@ -24,20 +24,24 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
 TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 
-# The only bound here, and the only one that was missing anywhere: the main Project.toml already
-# constrains StrictMode, but StrictModeTest appears in no other manifest, so without this a future
-# breaking release would resolve silently into `Pkg.test()`. The remaining test deps are left
-# unbounded as they have always been.
-# TrimCheck upstream v0.1.4 looks for juliac's trim helpers at the 1.12 path
-# (`share/julia/juliac/juliac-trim-base.jl`), which does not exist on 1.13 — so `@validate` could not
-# run and `trim_tests.jl` skipped itself with a `@test_broken`. This fork fixes the path resolution.
-# Kept as a [sources] entry rather than a compat bound because the fix is not upstream yet; drop it
-# once it is released.
-[sources]
-TrimCheck = {url = "https://github.com/el-oso/TrimCheck.jl", rev = "julia-1.13"}
-
+# The main Project.toml constrains StrictMode, but StrictModeTest appears in no other manifest, so
+# without a bound here a future breaking release would resolve silently into `Pkg.test()`.
+# TrimCheck must be >= 0.1.5: from that release `@validate` locates juliac's trim helpers through
+# JuliaC.jl, while 0.1.4 and earlier hard-code the in-tree 1.12 path
+# (`share/julia/juliac/juliac-trim-base.jl`), which does not exist on 1.13.
+# The remaining test deps are left unbounded.
 [compat]
-StrictModeTest = "0.4"
+# >= 0.4.8, not just 0.4: from that release an `OptimizationFailureReport` is classified as
+# INFORMATION rather than a failure — "the types are known; this costs optimization, not type
+# stability". Two dogfood items depend on that reading and ERROR without it, the dual BLAS-3 contract
+# and the eigen family, because dual `gemm!` carries the real routing tree, Strassen and the worker
+# pool three times over and JET declines the frame as recursive. `test/dual_tests.jl` states the
+# property directly beside them — concrete inferred return through `Core.kwcall`, no
+# `RuntimeDispatchReport` anywhere — and those assertions pass on every version; it is only the
+# classification that needed the newer release. Measured here: 242 pass / 2 errored on 0.4.6 against
+# 245 pass / 0 errored on 0.4.9.
+StrictModeTest = "0.4.8"
+TrimCheck = "0.1.5"
 
 # `analysis = "full"` and `fail_mode = "error"` were removed here in the 0.4 migration: 0.4 deleted
 # both keys (one analysis engine per package; throw-vs-warn is now a property of each guarantee).
@@ -86,8 +90,10 @@ gemvn_minner = false
 # here, or its one-time init (jl_set_precompile_field_replace) stays reachable and reddens any
 # all-paths AllocCheck proof that can reach it. Nine were missing, and they are exactly why three
 # dogfood items were erroring: `cgemvt_cfg` (BLAS-2, via complex gemv-T) and the LAPACK set below.
-# Values are the SAME ones juliac/build.jl already pins for the trim build, so the dogfood exercises
-# the shipping configuration rather than an invented one. test/req8_lint.jl guards the list.
+# Most values match what juliac/build.jl pins for the trim build, so the dogfood exercises the
+# shipping configuration rather than an invented one. `test/pin_lint.jl` reports where the two lists
+# disagree: a knob pinned in one and not the other is listed as DRIFT, and a knob whose src default is
+# a derivation rather than a `OncePerProcess` must not be pinned in either.
 cgemvt_cfg = 4
 brd_nb = 8
 gbtrf_cross = 16
@@ -98,10 +104,11 @@ pbtrf_u_native_kd = 256
 potrf_upper_direct_max = 12
 pptrf_spr_min = 8
 
-# Same again for the complex-axpy width decision: its OncePerProcess probe allocates a calibration
-# buffer, which reddens the same all-paths noalloc proof. `true` = the narrow arm (the Zen4 optimum and
-# the shipping path here); the dogfood checks alloc-freeness, not perf.
-zaxpy_narrow = true
+# `zaxpy_narrow` is NOT pinned here, and must not be. It became a compile-time derivation
+# (`_at_zaxpy_narrow(_HW) = _datapath_bytes(hw) <= 32`), and unpinned it resolves to a const `Ref`
+# seeded from that formula — no OncePerProcess, so nothing to compile out and nothing to allocate.
+# A pin would force the narrow arm on a native-512 datapath, which is the case the derivation exists
+# to get right. juliac/build.jl dropped its pin for the same reason.
 # The two REAL-axpy shape knobs, `axpy_unroll` and `axpy_dram`, USED to be pinned here — each was a
 # Measure-tier OncePerProcess whose one-time init provably allocates, and `trmv!` reaches `_axpy_simd!`
 # per column (level2.jl), so leaving them unpinned reddened the BLAS-2 all-paths noalloc proof.

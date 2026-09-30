@@ -18,6 +18,19 @@ const DLEXT = Sys.iswindows() ? "dll" : (Sys.isapple() ? "dylib" : "so")
 const OUT = joinpath(OUTDIR, "libpureblas." * DLEXT)
 const ENTRY = joinpath(@__DIR__, "entry.jl")
 
+# ⚠ THIS BUILD RUNS WITH StrictMode CHECKS ENABLED, AND ONLY GETS AWAY WITH IT BY ACCIDENT OF WHICH
+# MACRO THE SOURCE USES. `--trim=safe` wants `checks_enabled = false` in the environment it builds from:
+# upstream measured ONE reachable `@strict` call site producing 248 verifier errors with checks on, and
+# a clean build with them off (per-call allocation is 0 B either way, so it buys nothing at runtime).
+#
+# `checks_enabled()` is TRUE in `$ROOT`, the project this build uses. What saves it is that `src/` uses
+# `@strict_contract` — a contract DECLARATION — and contains no bare `@strict` call site, and that
+# `entry.jl` reaches the `@ccallable` kernels without touching `src/verify.jl`, whose probes are the
+# only thing near that shape.
+#
+# So adding a bare `@strict` anywhere reachable from the entry will break this build with 248 errors
+# that name the verifier rather than the cause. The fix then is a `checks_enabled = false` preference
+# for the build environment, which is a PIN and therefore the user's decision, not a code edit.
 const JCFLAGS = `--output-lib $OUT --experimental --trim=safe --compile-ccallable --verbose`
 @info "juliac: JuliaC.jl from $TOOLENV"
 run(`$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV -e "using Pkg; Pkg.instantiate()"`)

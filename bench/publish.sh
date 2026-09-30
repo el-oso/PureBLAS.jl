@@ -78,6 +78,23 @@ if ! bench/check_cache_freshness.sh; then
 fi
 
 echo
+echo "══ 1a3  did a foreign process share the box with the sweep?"
+# The contention guard in plots.jl is START-ONLY: it refuses a run that begins on a busy box, and records
+# `busy=<pid>:<pct>` when a contender appears later. Nothing read that field, so a contaminated sweep
+# published as a result. Measured 2026-09-26 on a threaded cache: a process at 97.2% CPU turned a healthy
+# 3.7x self-speedup into a recorded 1.13x, and the shape was indistinguishable from a kernel defect.
+if ! bench/check_cache_busy.sh bench/plots_data_*.txt; then
+    if [ -n "$FORCE" ]; then
+        echo "(--force given: publishing numbers measured alongside another process)"
+    else
+        echo
+        echo "REFUSING TO PUBLISH — a cache records a foreign process during its sweep. Re-sweep the"
+        echo "affected groups on a quiet box, or --force if the contender shared no cache with the sweep."
+        exit 1
+    fi
+fi
+
+echo
 echo "══ 1c  pb arm vs its reference arms: same MACHINE STATE?"
 # 1b asks whether the arms ran at the same CLOCK. This asks whether they ran in the same machine state
 # at all, which the clock cannot see: a box can hold its clock perfectly while its memory system, page

@@ -285,6 +285,82 @@ const _ACTIVE_ARMS = vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT
 # single-threaded gate. Caught before it ran; the whole point of the separate file is that this cannot
 # happen, so the predicate must cover every threaded arm.
 const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
+
+# ── PIN ONE JULIA THREAD PER PHYSICAL CORE, FOR A THREADED RUN ───────────────────────────────────────
+# WITHOUT THIS A THREADED CELL IS A LOTTERY DRAW. Julia's tasks float anywhere inside the process
+# affinity mask, so two of them can occupy the two SMT siblings of ONE physical core; that halves a
+# worker, the join waits for it, and the placement persists for a stretch. The result is a genuinely
+# bimodal arm, and a median of per-round medians — what this file reduces to — reports whichever mode the
+# run happened to sit in. Measured 2026-09-27, `dot` n=3e5, 6 threads, lock verified before and after:
+#
+#     unpinned   per-round medians  16.4 16.0 33.6 33.4 33.4 16.3 33.3 16.0 …   spread 2.14x, 6/16 slow
+#     pinned                        16.0 15.9 15.9 15.6 16.0 15.9 15.9 15.8 …   spread 1.07x, 0/16 slow
+#
+# The SERIAL arm is stable either way (1.02x), and OpenBLAS — which pins its own threads — is stable
+# either way too (1.09x). That contrast is what proved the instability was PureBLAS's floating threads
+# rather than this harness, the fresh-operand regime, or the working set.
+#
+# It is the same argument `_ARM_PB_MT` already makes one level down about CPUs ("the mask needs one CPU
+# more than the thread count"), applied to threads rather than to CPUs.
+#
+# THREADED RUNS ONLY, deliberately: the single-threaded gate has one compute thread and nothing to
+# displace, so pinning cannot change its numbers — and leaving it alone keeps every existing
+# `plots_data_*` cell comparable with new ones. A threaded cache is stamped `pinned=` so it is
+# self-identifying, and its absence on an `mt_data_*` file means those cells predate this.
+#
+# ⚠ NOT A COMPLETE FIX, and the header stamp must not be read as one. It cleaned neuromancer and did NOT
+# clean wintermute, where `nw = 6` under `-t 6` leaves no thread for the runtime (the pool spawns
+# `nthreads()-1` workers and the driver runs the last chunk) and reads 13x worse than `nw = 2`. Pinning
+# removes the SMT-sibling mode; it does not create a spare thread.
+const _PINNED_AT = Ref("")
+# One CPU per physical core, read from sysfs rather than assumed — siblings are adjacent on wintermute and
+# the whole second half on galen and neuromancer, so either hardcoded layout is wrong somewhere — and
+# restricted to CPUs this process is actually allowed to use, so it composes with `taskset`.
+function _core_cpus()
+    allowed = Int[]
+    m = try
+        match(r"Cpus_allowed_list:\s*(\S+)", read("/proc/self/status", String))
+    catch
+        nothing
+    end
+    isnothing(m) && return allowed
+    for part in split(m.captures[1], ',')
+        if occursin('-', part)
+            a, b = split(part, '-')
+            append!(allowed, parse(Int, a):parse(Int, b))
+        else
+            push!(allowed, parse(Int, part))
+        end
+    end
+    seen = Set{Int}()
+    out = Int[]
+    for c in allowed
+        f = "/sys/devices/system/cpu/cpu$(c)/topology/core_id"
+        id = isfile(f) ? something(tryparse(Int, strip(read(f, String))), c) : c
+        id in seen && continue
+        push!(seen, id)
+        push!(out, c)
+    end
+    return out
+end
+# `:static` is what makes this a per-THREAD operation: it guarantees iteration i runs on thread i, and
+# `sched_setaffinity(0, …)` pins the calling thread. A thread beyond the core count is left floating on
+# purpose — that is the spare the runtime needs.
+function _pin_threads!()
+    (Sys.islinux() && Threads.nthreads() > 1) || return nothing
+    cpus = _core_cpus()
+    isempty(cpus) && return nothing
+    Threads.@threads :static for i in 1:Threads.nthreads()
+        if i <= length(cpus)
+            mask = zeros(UInt64, 16)
+            mask[cpus[i] ÷ 64 + 1] = UInt64(1) << (cpus[i] % 64)
+            ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask)
+        end
+    end
+    _PINNED_AT[] = join(cpus, ",")
+    return nothing
+end
+_ANY_MT && _pin_threads!()
 # REFUSE rather than measure a lie. BLIS fixes its thread count at init from the environment, so if the
 # process was not launched with it, `aocl_mt` would be a single-threaded AOCL recorded under a threaded
 # name — and every downstream verdict built on it would be wrong in PureBLAS's favour.
@@ -536,9 +612,16 @@ end
 # cell (see `_series`), so it draws the gate itself. It is NOT in `_VIEWS`: nothing is measured against
 # it and it has no gen_table of its own (the coverage table already reports this exact number).
 const _GATE_VIEW = "gate"
+# THE THREADED GATE — the criterion req#1 states, with threads on: PureBLAS at `_MT_NT` threads against
+# whichever THREADED vendor is faster in that cell. `_GATE_VIEW` cannot serve: it divides by the SERIAL
+# `_ARM_PB`, so on a threaded cache it would compare a threaded vendor against single-thread PureBLAS.
+# Distinct from the `_ARM_PB_MT` view, which asks what threads bought us and never mentions a vendor.
+const _MT_GATE_VIEW = "gate_mt"
+const _REF_MT_ALL = ["openblas_mt", "aocl_mt", "accelerate_mt"]
 _refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : r == "accelerate" ? "Accelerate" :
     r == "generic" ? "LinearAlgebra generic" :
-    r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") : "OpenBLAS"
+    r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") :
+    r == _MT_GATE_VIEW ? "faster of threaded OpenBLAS and AOCL" : "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -1029,6 +1112,37 @@ function run_benchmarks()
                         s = 0; for _ in 1:m
                             s += PureBLAS.iamax(c[1])
                         end; s
+                    ),
+                ),
+                (
+                    "blascopy", (c, m) -> (
+                        for _ in 1:m
+                            B.blascopy!(length(c[1]), c[1], 1, c[2], 1)
+                        end; c[2][1]
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            PureBLAS.blascopy!(c[2], c[1])
+                        end; c[2][1]
+                    ),
+                ),
+                (
+                    # Julia's stdlib has no `swap!` wrapper, so the reference is a direct ILP64 ccall
+                    # through LBT — the same library `ref=aocl` re-points, so this row honours the AOCL
+                    # comparison like every other.
+                    "swap", (c, m) -> (
+                        for _ in 1:m
+                            ccall(
+                                (:dswap_64_, LinearAlgebra.BLAS.libblastrampoline), Cvoid,
+                                (Ref{Int64}, Ptr{Float64}, Ref{Int64}, Ptr{Float64}, Ref{Int64}),
+                                Int64(length(c[1])), c[1], Int64(1), c[2], Int64(1)
+                            )
+                        end; c[1][1]
+                    ),
+                    (c, m) -> (
+                        for _ in 1:m
+                            PureBLAS.swap!(c[1], c[2])
+                        end; c[1][1]
                     ),
                 ),
             )
@@ -2564,6 +2678,11 @@ function save_cache(path, groups)
             (ls = _lock_state(); "\tbase=$(ls[2])kHz\tboost=$(ls[3])"),
             isempty(_LOCK_CHANGED) ? "" : "\tlockchg=$(_LOCK_CHANGED)",
             isempty(_BUSY_AT_EXIT) ? "" : "\tbusy=$(_BUSY_AT_EXIT)",
+            # `pinned=` — the CPUs this run nailed its julia threads to, one per physical core. Present only
+            # on a threaded run, and its ABSENCE on one means the cells in it were measured with the threads
+            # floating, which for a threaded arm is a lottery draw rather than a measurement (see
+            # `_pin_threads!`). A reader must diff this before diffing any threaded ratio.
+            isempty(_PINNED_AT[]) ? "" : "\tpinned=$(_PINNED_AT[])",
             # `tuned=` — present ONLY when this cache describes a legitimately tuned box (see
             # `_tuned_pins_ok`). Its absence means the shipped defaults were measured. A reader comparing
             # two caches must diff this before diffing any ratio: a tuned and an untuned cache of the same
@@ -2738,6 +2857,19 @@ function _series(g, gk, op, ref::AbstractString = REFBK)
             for r in _REF_ALL
                 haskey(cell, r) || continue
                 v = _ratio(cell[r].q, cell[_ARM_PB].q)
+                (isnothing(best) || median(v) < median(best)) && (best = v)
+            end
+            isnothing(best) || push!(out, (s, best))
+        elseif ref == _MT_GATE_VIEW
+            # Same construction as `_GATE_VIEW` above — divide by whichever reference is FASTER, chosen
+            # per cell so one panel may switch references along its x-axis — but both arms threaded.
+            # A cell with no threaded reference is DROPPED rather than falling back to a serial one:
+            # a threaded PB arm over a single-thread vendor is not the gate and must not be drawn as it.
+            haskey(cell, _ARM_PB_MT) || continue
+            best = nothing
+            for r in _REF_MT_ALL
+                haskey(cell, r) || continue
+                v = _ratio(cell[r].q, cell[_ARM_PB_MT].q)
                 (isnothing(best) || median(v) < median(best)) && (best = v)
             end
             isnothing(best) || push!(out, (s, best))
@@ -3068,13 +3200,28 @@ if "mtdraw" in ARGS
             end
             return keep
         end
-        for (gk, base, ttl) in (("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
+        # L1 is here because it threads: `dot`, `asum` and `nrm2` on the fixed-block reduction tree,
+        # `axpy`, `scal`, `blascopy` and `swap` elementwise. L2 and the complex groups have no splitter
+        # yet, so they would draw the flat lines the `_movers` filter exists to keep out.
+        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
             p = joinpath(adir0, "perf_mt_$(base).svg")
             svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread", mtfleet, gk, _ARM_PB_MT;
                 only = _movers(mtfleet, gk))
             println("  ", relpath(p))
         end
-        println("mt panels written — scaling curves for the routines that thread.")
+        # THE GATE PANELS — every group, no `_movers` filter. Scaling is only interesting where
+        # something splits, but the gate is the criterion everywhere: a group that does not thread
+        # still has to be measured against a vendor that does, and that gap IS the finding for L2 and
+        # the complex groups. Above 1.00 is a pass, as on every other gate plot in this file.
+        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"), ("L3", "l3", "BLAS-3"),
+            ("LP", "lapack", "LAPACK"), ("CL1", "cl1", "complex BLAS-1"), ("CL2", "cl2", "complex BLAS-2"),
+            ("CL3", "cl3", "complex BLAS-3"), ("CLP", "clapack", "complex LAPACK"))
+            p = joinpath(adir0, "perf_mtgate_$(base).svg")
+            svg_panels(p, "$ttl — PureBLAS $_MT_NT threads / $(_refname(_MT_GATE_VIEW))",
+                mtfleet, gk, _MT_GATE_VIEW)
+            println("  ", relpath(p))
+        end
+        println("mt panels written — scaling curves for the routines that thread, and the threaded gate.")
     end
     exit(0)
 end
