@@ -1524,6 +1524,22 @@ const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: fals
 # so it LOSES below m = 128 and pays from 256 up. An `m*n` cut of the N form's shape would have
 # admitted m=n=100 at 10000 elements and shipped a 3.6x regression there.
 # PDM: Derived — the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | tune: sweep m at fixed n
+# ⚠ THIS KERNEL IS SENSITIVE TO `m % 4L`, NOT TO `m`, because its row tail is SCALAR and runs once
+# per COLUMN. Measured against the SIMD path it displaces, forced below the floor:
+#
+#     m           128   136   144   152   160   176
+#     m % 4L        0     8    16    24     0    16
+#     SME/SIMD   0.73  0.42  0.49  0.56  1.18  0.78
+#
+# The two multiples of 4L are the two good points and everything between them is half speed — the
+# same per-column-remainder cost that `_sme_ger_ir` documents, where finishing leftover rows outside
+# the vectorised sweep costs one pass per column and swamps the work it completes.
+#
+# ⛔ SO DO NOT DERIVE THIS FLOOR FROM A SWEEP THAT HAPPENS TO LAND ON MULTIPLES. Reading only
+# n=128 and n=160 says the crossing is at 160 and that the floor should come down from 256; reading
+# n=136..152 says the arm is losing throughout that band. The floor stays where it is until the
+# scalar row tail is gone, and the gate sizes it binds (128 and 256) are multiples anyway, so they
+# are limited by the kernel's rate and not by the tail.
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 2 * _SME_GEMV_BLK * 4)::Int
 
 # y += alpha*A'x. Bulk columns and whole 4L-row groups run on ZA; the two tails are scalar, and both
