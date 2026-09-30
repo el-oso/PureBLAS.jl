@@ -31,7 +31,16 @@ TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 # (`share/julia/juliac/juliac-trim-base.jl`), which does not exist on 1.13.
 # The remaining test deps are left unbounded.
 [compat]
-StrictModeTest = "0.4"
+# >= 0.4.8, not just 0.4: from that release an `OptimizationFailureReport` is classified as
+# INFORMATION rather than a failure — "the types are known; this costs optimization, not type
+# stability". Two dogfood items depend on that reading and ERROR without it, the dual BLAS-3 contract
+# and the eigen family, because dual `gemm!` carries the real routing tree, Strassen and the worker
+# pool three times over and JET declines the frame as recursive. `test/dual_tests.jl` states the
+# property directly beside them — concrete inferred return through `Core.kwcall`, no
+# `RuntimeDispatchReport` anywhere — and those assertions pass on every version; it is only the
+# classification that needed the newer release. Measured here: 242 pass / 2 errored on 0.4.6 against
+# 245 pass / 0 errored on 0.4.9.
+StrictModeTest = "0.4.8"
 TrimCheck = "0.1.5"
 
 # `analysis = "full"` and `fail_mode = "error"` were removed here in the 0.4 migration: 0.4 deleted
