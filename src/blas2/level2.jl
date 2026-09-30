@@ -3378,6 +3378,13 @@ end
 #
 # T forms stay blocked. Their diagonal is a column dot, which is not the slow kernel, and the same
 # split measured 0.98-1.08x there — not worth a second scratch path.
+#
+# WHAT IS LEFT. At the binding size n=512 the cover runs 1.88 us (489 GB/s) and the diagonal 1.93 us
+# — 128 KB at 68 GB/s — against Accelerate 2.31 us for the whole operation. The diagonal alone is
+# most of that budget, so the next step is not a better cover but a triangular kernel that reaches
+# the matrix unit: `_trmv_fused8!` is NEON and latency-bound on the carried dependency, and base
+# blocks of 16 and 32 measured worse than 64 because they pay more per off-diagonal call than they
+# save on the diagonal.
 
 # Recursive halving cover. Splits land on a multiple of `nb` so every leftover diagonal block is
 # exactly `nb` wide, and the off-diagonal blocks come out square rather than tall and narrow.
