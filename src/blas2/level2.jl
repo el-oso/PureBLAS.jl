@@ -3222,6 +3222,24 @@ const _TRSV_RRCP64 = Base.OncePerThread{Vector{Float64}}(() -> Vector{Float64}(u
 const _TRSV_RRCP32 = Base.OncePerThread{Vector{Float32}}(() -> Vector{Float32}(undef, _TRSV_RRCP_N))
 @inline _trsv_rrcpbuf(::Type{Float64}) = _TRSV_RRCP64()
 @inline _trsv_rrcpbuf(::Type{Float32}) = _TRSV_RRCP32()
+# ── trmv-N's two sweeps: the accumulator, the block size, and the cover crossover ───────────────────
+# `_trmv_split!` owns these; the reasoning for the structure is above that function.
+# One buffer per thread, grow-only through `_ws_grow!`, so the path allocates only on a thread's
+# first call — same ownership and the same barrier as the L3 pools.
+const _TRMV_ACC64 = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
+const _TRMV_ACC32 = Base.OncePerThread{Vector{Float32}}(() -> Float32[])
+@inline _trmv_accbuf(::Type{Float64}) = _TRMV_ACC64()
+@inline _trmv_accbuf(::Type{Float32}) = _TRMV_ACC32()
+# The diagonal block edge is `_TRI_NB` — the same role it plays in `_trmv_blk!`, an edge that keeps
+# one triangular block L1-resident. Measured here: 64 (its value on this machine) beats 128 by 7% at
+# n=1024, 12.90 us against 13.83, and both beat 16 and 32, which pay more per off-diagonal call than
+# they save on the diagonal.
+# Which cover to use. The recursive halving reads the triangle out of order, which costs nothing while
+# it is cache-resident and costs 12-20% once it is not; the ascending staircase reads columns in order
+# and wins there. Measured: n=2100 recursive 1.56x against staircase 1.37x, n=2560 recursive 1.08x
+# against staircase 1.17x. The crossover sits between, at twice L2.
+# PDM: Derived — formula over detected consts: `2 * _L2_BYTES`
+const _TRMV_SPLIT_RECMAX = @load_preference("trmv_split_recmax", 2 * _L2_BYTES)::Int
 # COMPLEX tri unblocked threshold. The blocked off-diagonal scatter goes through the complex gemv; on
 # AVX-512 its per-call/shuffle overhead made per-column faster ≤1024. On AVX2 the scatter now uses the
 # fast OB-structure ri gemv (see _tri_scat_cmplx!), so blocking wins earlier — the unblocked column-axpy
@@ -3344,6 +3362,82 @@ end
     return _gemv_t_simd!(m, n, α, Av, xv, one(α), yv, Val(false))
 end
 
+# ── trmv-N as two independent sweeps ───────────────────────────────────────────────────────────────
+# x := A·x on a triangular A is the sum of two contributions that BOTH read the original x: the
+# diagonal blocks, x_J := A_JJ·x_J, and the strictly-triangular part, a sum of rectangular gemv-N
+# blocks. Neither reads the other's output, so the strictly-triangular part can be accumulated into
+# a scratch vector in ANY block order and added at the end.
+#
+# The scratch vector is what buys that freedom, and it is why this does not run in place: an
+# off-diagonal block writing into x_J must follow the diagonal block that produced x_J, so in place
+# the two kernels have to alternate. Alternating costs 300-660 ns per swap here (n=1024, block edge
+# 32 through 256) — at n=1024 the same phases run 22.0 us interleaved and 17.6 us back to back.
+# Separating them also lets the diagonal use `_trmv_fused8!`, 1.5-1.7x the column-axpy kernel on
+# blocks of 64 and up, and lets the cover use square blocks instead of tall narrow panels.
+# Together against the blocked structure: 1.75x at n=512, 1.83x at n=1024, 1.09x at n=4096.
+#
+# T forms stay blocked. Their diagonal is a column dot, which is not the slow kernel, and the same
+# split measured 0.98-1.08x there — not worth a second scratch path.
+
+# Recursive halving cover. Splits land on a multiple of `nb` so every leftover diagonal block is
+# exactly `nb` wide, and the off-diagonal blocks come out square rather than tall and narrow.
+function _trmv_cover_rec!(up::Bool, y, A, x, i0::Int, len::Int, nb::Int)
+    len <= nb && return
+    h = nb * (cld(len, nb) ÷ 2)
+    lo = i0:(i0 + h - 1); hi = (i0 + h):(i0 + len - 1)
+    α = one(eltype(A))
+    if up
+        _tri_scat!(view(y, lo), view(A, lo, hi), view(x, hi), α)
+    else
+        _tri_scat!(view(y, hi), view(A, hi, lo), view(x, lo), α)
+    end
+    _trmv_cover_rec!(up, y, A, x, i0, h, nb)
+    _trmv_cover_rec!(up, y, A, x, i0 + h, len - h, nb)
+    return
+end
+
+# Column-ordered cover: fixed-width panels walking the triangle in memory order. Past L2 the
+# in-order read is what decides, and this beats the recursive cover there.
+function _trmv_cover_stair!(up::Bool, y, A, x, n::Int, nb::Int)
+    α = one(eltype(A))
+    ib = nb
+    while ib < n
+        if up
+            C = (ib + 1):min(ib + nb, n)
+            _tri_scat!(view(y, 1:ib), view(A, 1:ib, C), view(x, C), α)
+        else
+            C = (ib - nb + 1):ib
+            _tri_scat!(view(y, (ib + 1):n), view(A, (ib + 1):n, C), view(x, C), α)
+        end
+        ib += nb
+    end
+    return
+end
+
+function _trmv_split!(up::Bool, unit::Bool, n::Int, A, x)
+    T = eltype(A)
+    y = _ws_grow!(_trmv_accbuf(T), n)
+    @inbounds for i in 1:n
+        y[i] = zero(T)
+    end
+    nb = _TRI_NB                                 # the diagonal block edge, shared with `_trmv_blk!`
+    if n * n * sizeof(T) <= _TRMV_SPLIT_RECMAX
+        _trmv_cover_rec!(up, y, A, x, 1, n, nb)
+    else
+        _trmv_cover_stair!(up, y, A, x, n, nb)
+    end
+    ib = 0
+    while ib < n
+        m = min(nb, n - ib); J = (ib + 1):(ib + m)
+        _trmv_fused8!(up, unit, m, view(A, J, J), view(x, J))
+        ib += nb
+    end
+    @inbounds for i in 1:n
+        x[i] += y[i]
+    end
+    return x
+end
+
 # ── real trmv: the n at which `_trmv_simd!` hands over (to `_trmv_fused8!` for N, blocked for T) ─────
 # DERIVE tier (cache residency), and BYTE-IDENTICAL to the predicate it replaces — see the block comment
 # inside `_trmv_blk!` for the A/B that fixed the criterion at HALF L2:
@@ -3457,6 +3551,12 @@ const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 512 : typemax(
     # rather than reasoned: trmv-N made ZERO SME calls at every size while trmv-T made 4 to 60.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x) && n < _TRMV_SME_MIN
         return _trmv_fused8!(up, unit, n, A, x)
+    end
+    # At and above that threshold the N form runs as two sweeps over a scratch accumulator rather
+    # than the interleaved blocked structure below — see `_trmv_split!`. Float64/Float32 only: the
+    # accumulator is a per-thread buffer of a concrete element type.
+    if !tr && (eltype(A) === Float64 || eltype(A) === Float32) && _strided1(A) && _dense1(x)
+        return _trmv_split!(up, unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N: J ascending; tall scatter UP then diag
