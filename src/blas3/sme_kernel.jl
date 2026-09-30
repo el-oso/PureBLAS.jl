@@ -1605,6 +1605,19 @@ const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: fals
 # these sizes the leading dimension is a small multiple of a page and the operands alias. Every
 # number in the table above is a median of five, taken in-process against a same-array control, and
 # it reproduced across two runs.
+#
+# ⛔ m=128 IS AT THE NEON CEILING AND THE MATRIX UNIT CANNOT REACH IT. This is the cell that binds
+# gemv-T's gate, so read this before trying to move it. The NEON path runs 128 KB in 844 ns, which is
+# 155 GB/s — ABOVE what any other load-and-reduce kernel here reaches on L1-resident data:
+#
+#     dot 32 KB x2  168 GB/s    dot 128 KB x2  146    asum 64 KB  146    asum 128 KB  146
+#
+# so the displaced path is not leaving anything on the table. The SME arm cannot take the cell either,
+# and the reason is structural rather than tunable: one ZA drain per column is irreducible, it costs
+# about 7.8 ns, and at 128 rows a column's own stream is only 4 KB. Narrowing the drain from four ZA
+# groups to one would remove three folds out of five ops and still land above the NEON time.
+# Accelerate reaches about 457 GB/s here, which is matrix-unit throughput at a per-column cost this
+# kernel shape does not have. Moving this cell needs a different decomposition, not a better constant.
 # PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
