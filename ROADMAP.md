@@ -347,6 +347,37 @@ and shape of that heuristic is unknown. Every Accelerate cell measured before th
 re-measured from scratch rather than patched, since there was no way to know in advance which cells the
 leak touched materially.
 
+### ⚠ OPEN — `scal`'s ZA floor is calibrated on the BENCHMARK'S DATA GENERATOR (2026-09-30)
+
+Our ZA `scal` **matches Accelerate to 1.00x across n=10000..65536**, where the kernel shipped in that
+band runs at 0.31-0.57 of it. One call per sample, quiet setup, GB/s over 2n bytes:
+
+    n          10000  20000  30000  50000  65536
+    ZA           479    512    523    519    514
+    NEON         274    167    165    164    166
+    Accelerate   480    512    523    519    524
+
+`_SME_SCAL_MIN` is 65536 anyway, because under the L1 sweep's setup — a fresh `randn(n)` before every
+timed call — ZA ranks BELOW NEON there. **`randn` is the sole trigger**: the same array filled by
+`fill!` or by `copyto!` of random values leaves ZA 2.0-2.1x AHEAD (1375 ns against 2917), while
+`randn!` puts it at 0.82x (3542 ns). Falsified as causes: fresh allocation, dirty cache lines,
+elapsed time (200 us after `randn` does not clear it; 200 us after `fill!` makes ZA *faster*, 3.04x),
+FP arithmetic in the gap, the `@cfunction` trampoline, `za.enable`/`za.disable`, the GC, and the data
+itself. Accelerate pays a version of it too — 480 GB/s quiet against 116 under the sweep's setup, so
+it is a property of the coprocessor path rather than of our kernel. Mechanism UNKNOWN.
+
+Three ways to tackle it, none taken:
+
+1. **Lower the floor to ~10000.** Real callers go 0.31-0.57 → 1.00 in the band; the published cells
+   at n=10000/30000 fall from 0.834/0.903 to roughly 0.72/0.82. Faster library, worse gate.
+2. **Change the L1 sweep's setup** to fill operands from a pre-made pool rather than calling `randn`
+   per sample, so measurement and reality agree. Re-bases published numbers across many BLAS-1 ops —
+   a methodology decision, not a kernel one.
+3. **Find the mechanism.** It would also explain the ~50 ns cost of mixing ordinary work with a
+   streaming call and the ~50 ns `@cfunction` boundary, which look like one effect seen three ways.
+
+Evidence: `bench/probes/l1_rmw_cold_floor.jl`, and the kb finding `sme-za-as-arithmetic-unit`.
+
 ### ⚠ APPLE SILICON: the Accelerate gap is SME2, and **Julia can reach it** (2026-09-22)
 
 Two findings from the first Apple Silicon pass, one closed and one opened.

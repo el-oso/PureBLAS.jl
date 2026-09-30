@@ -14,6 +14,10 @@
 # masked loads); wider band → per-column axpy (reads AB once, re-streams cache-resident y). On W=8 the
 # masked conv wins up to band 48; on AVX2 (W=4) the masked-load conv loses to axpy above band ~17
 # (measured crossover conv 1.05→axpy 1.09 at band 25, stable across n=256…4096). Overridable per machine.
+# ⚠ THE FORMULA HAS NO BRANCH FOR W=2 and lands such a machine in the wide-vector case by default.
+# Checked on an M6 rather than left to chance: at band 33 the convolution runs 27-32 GB/s and the
+# per-column axpy 4.6-5.2, a 6x margin, because a 33-element axpy per column is nearly all call
+# overhead. So the default is right here too, for a different reason than it is right at W=8.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 20 : 48`
 const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ? 20 : 48)::Int
 
@@ -32,8 +36,41 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
             mm = min(W, m - i0); orow = lanes < mm
             acc = vload(V, yp + i0 * sz, orow)              # pre-scaled y-block (β·y)
             jlo = max(1, i0 + 1 - kl); jhi = min(n, i0 + mm + ku)
-            for j in jlo:jhi
+            # ⚠ THE LANE MASK IS COMPLETE FOR ALMOST EVERY COLUMN, so it is not rebuilt for them.
+            # With `r1 = ku + i0 + 2 - j` the mask covers every lane exactly while `1 <= r1 <= b-W+1`,
+            # and over the j range that reaches one output block r1 sweeps 0..b — so only the two ends
+            # need masking and the b-W+1 columns between them do not. Rebuilding it throughout costs
+            # two compares and two ANDs on a `Vec{W,Int}` per column, amortized over W elements: on a
+            # 512-bit machine that is cheap and on a 128-bit one it is most of the work. Splitting the
+            # sweep into masked head, unmasked middle and masked tail measured 1.77x on an M6
+            # (26.6 -> 46.9 GB/s at n=2048, band 33, W=2), bit-identical.
+            #
+            # The middle's unmasked `vload` is in bounds by the same inequality that makes the mask
+            # full: `1 <= r1` puts its first row at or after the top of the band column, and
+            # `r1 <= b-W+1` puts its last at or before the bottom.
+            #
+            # The m-tail block keeps `orow` partial, so it takes the masked path throughout.
+            # ⚠ THE THREE RANGES MUST PARTITION, NEVER OVERLAP. Unclamped the full-mask window is
+            # [ku+i0+1-b+W, ku+i0+1], which runs BACKWARDS when the band is narrower than the vector:
+            # at b < W-1 its start passes its end, the head then reaches beyond where the tail begins,
+            # and the shared columns are accumulated TWICE. Float64 cannot reach it (W=2 would need
+            # b<1) but Float32 can — kl=ku=0 at W=4 gives b=1 — and it is wrong answers, not a
+            # slowdown. Clamping `hi2` up to `lo2-1` makes the middle empty instead.
+            lo2 = mm == W ? min(max(jlo, ku + i0 + 2 - (b - W + 1)), jhi + 1) : jhi + 1
+            hi2 = mm == W ? max(lo2 - 1, min(jhi, ku + i0 + 1)) : jhi
+            for j in jlo:(lo2 - 1)
                 r1 = ku + i0 + 2 - j                        # AB row (1-based) for output row i0+1
+                msk = orow & (lanes >= (1 - r1)) & (lanes <= (b - r1))
+                av = vload(V, Ap + ((r1 - 1) + (j - 1) * ldb) * sz, msk)
+                acc = muladd(V(α * unsafe_load(xp, j)), av, acc)
+            end
+            for j in lo2:hi2
+                r1 = ku + i0 + 2 - j
+                av = vload(V, Ap + ((r1 - 1) + (j - 1) * ldb) * sz)
+                acc = muladd(V(α * unsafe_load(xp, j)), av, acc)
+            end
+            for j in (hi2 + 1):jhi
+                r1 = ku + i0 + 2 - j
                 msk = orow & (lanes >= (1 - r1)) & (lanes <= (b - r1))
                 av = vload(V, Ap + ((r1 - 1) + (j - 1) * ldb) * sz, msk)
                 acc = muladd(V(α * unsafe_load(xp, j)), av, acc)
