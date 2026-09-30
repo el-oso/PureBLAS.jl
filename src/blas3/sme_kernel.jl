@@ -1502,6 +1502,35 @@ end
     nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb)
     return _sme_gemvt8(y, a, l, x, m, al, nb)
 end
+# ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND NEITHER WAY OUT PAYS.
+#
+# Each column block ends with one `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`.
+# Holding one column block and sweeping m separates the three costs: about 150 ns per call, about
+# 40 ns per NC=4 block, of which only 14 ns is the column stream itself at 583 GB/s. Replacing the
+# reduce with a lane-0 extract — wrong answer, timing only — prices it:
+#
+#     m = n          256    512   1024  |  m=256, n=64
+#     with faddv    2608   6017  17541  |       811 ns
+#     without       1366   4244  16666  |       349 ns
+#     ratio         1.91   1.42   1.05  |      2.33
+#
+#   * PAIRWISE ADDS DO NOT REDUCE A VECTOR. SVE `faddp` is SEGMENT-WISE: it pairs lanes inside each
+#     128-bit segment and never crosses one, so three of them leave four partial sums in a 512-bit
+#     vector rather than one total. The variant measures 1.05-1.62x and returns the wrong answer;
+#     that timing is a floor for any correct cross-segment sequence, not a result.
+#   * DEFERRING THE REDUCTION WINS ONLY IN A BAND. Fold the four slices in the kernel as now, store
+#     the folded vector into an n*L scratch instead of reducing, and sum the L lanes per column
+#     outside streaming mode. Correct to 3e-16, and against the shipped `gemv!`: m=192 1.53x, 224
+#     1.84x, 256 1.27x, 300 1.52x, 512 1.16x — but 0.94x at m=1024, where the scratch traffic and
+#     the second pass outweigh a reduce already amortized over a long column, and 0.61x at m=128.
+#     So it needs a second kernel and a second floor, and it moves NO gate cell: the binding cells
+#     are m=128, which is below `_SME_GEMVT_MINM` and runs on NEON, and m=256, which would go from
+#     0.338 to 0.43 while 128 stays where it is.
+#
+# ⚠ TAKE NO m=128 NUMBER FROM A SINGLE PROCESS. One run of the deferred prototype read 518 ns there
+# and three later runs read 1385 ns for the same code. At m=128 the leading dimension is 1024 B, so
+# four columns span exactly one page and the scratch can alias them.
+
 
 # Measured on square Float64 through `gemv!`, best NC per size (bench/probes/sme_gemvt_proto.jl):
 #     n        128   256   512  1024  2048
