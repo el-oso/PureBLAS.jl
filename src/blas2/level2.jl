@@ -3426,11 +3426,23 @@ end
 #     1024     0.85    0.99    0.85    0.76
 #     2048     0.88    0.97    0.91    0.90
 #
-# WHAT IS LEFT. At n=512 the cover moves 918 KB in 3.24 us, which is 283 GB/s where a plain gemv of
-# comparable footprint reaches 883, and it spends about 1.05 us of that in seven SME entries at
-# ~150 ns each. Accelerate does the whole operation in 2.5 us. So the next step is one fused kernel
-# that walks the whole triangle in a single streaming region, replacing seven cover calls and eight
-# diagonal calls — not a better constant, and not the diagonal.
+# ⛔ AND THE FUSED KERNEL IS WORTH 3%, NOT THE 2x THE CALL COUNT SUGGESTS. It was PROTOTYPED, not
+# reasoned about: the SME gemv-N kernel already loops row blocks outside and columns inside, so making
+# it triangular is three lines of IR — start row block b's column loop at `(b+1)*rb` instead of 0, and
+# guard for the last block having nothing to its right. That covers the whole strictly-upper part in
+# ONE streaming region, replacing every cover call. Correct to 1e-15, and measured against this
+# routine, three runs at n=512: 1.03x, 1.03x, 1.04x.
+#
+# THE CALL OVERHEAD IS REAL AND THE LOCALITY PAYS IT BACK. Seven entries at ~113 ns is about 1.05 us
+# of the cover's 3.24, but a fused kernel's row blocks are `rb` rows tall — 64 of them, so 512 B out
+# of a 16 KB column stride at n=2048 — while the recursive cover's top block is n/2 rows and reads
+# 8 KB per column. Wider row blocks trade that back against a larger diagonal: ng=1 (rb=32) measures
+# 0.52-0.93x, ng=2 (rb=64) 0.85-1.11x, ng=4 (rb=128) 0.93-1.02x, all worse as n grows. A hybrid that
+# recurses while the block is large and fuses only the small triangles reproduces at 1.03-1.04x too.
+#
+# So the seven entries are not the headroom they look like, and one fused triangular kernel does not
+# pay for its own knob. What is actually left at n=512 is the cover's 283 GB/s against the 883 a plain
+# gemv of that footprint reaches, and that gap is NOT the entries — it survives removing them.
 
 # Recursive halving cover. Splits land on a multiple of `nb` so every leftover diagonal block is
 # exactly `nb` wide, and the off-diagonal blocks come out square rather than tall and narrow.
