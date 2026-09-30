@@ -257,7 +257,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 |---|---|---|---|---|
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: a quarter of L1 in elements, `_L1_BYTES ÷ (4 * sizeof(Float64))`, the panel size at which the per-block ZA fill and readback disappear into the stream. | — |
 | `sme_gemvt_defer_max` | literal | Literal | a falsified-derivation literal: the criterion would be "both costs are per column and m-independent, so the crossover is m-independent", which the table above contradicts. | candidate, sweep m at fixed n |
-| `sme_gemvt_minm` | literal | Derived | the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | sweep m at fixed n |
+| `sme_gemvt_minm` | literal | Derived | the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | sweep m at fixed n |
 | `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (2,4,8) |
 | `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
 | `sme_ger_minm` | literal | Derived | formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run. | — |

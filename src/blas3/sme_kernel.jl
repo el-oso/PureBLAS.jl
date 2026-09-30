@@ -1580,33 +1580,33 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
 
 # THE FLOOR IS ON m, NOT ON m*n, and that is the whole difference from the N form's cut. The fixed
-# cost here is per COLUMN BLOCK — zero ZA, read four slices back, fold and reduce — and the work a
-# block does is proportional to m, so the overhead ratio falls as 1/(NC*m) and does not care how
-# many columns follow. Measured through `gemv!`, prototype against the SIMD path it displaces:
+# cost here is per COLUMN — zero ZA, read four slices back, fold — and the work a column does is
+# proportional to m, so the overhead ratio falls as 1/m and does not care how many columns follow.
 #
-#     m          64    100    128    256    512   1000   1024   2048
-#     speedup  0.47   0.28   0.99   2.69   3.89   3.68   3.90   1.94
+# Measured in ONE process, both arms on the same arrays, `_sme_gemvt!` (every tail included) against
+# the `_gemv_t_simd!` NEON path it displaces. Two runs, Float64 square:
 #
-# so it LOSES below m = 128 and pays from 256 up. An `m*n` cut of the N form's shape would have
-# admitted m=n=100 at 10000 elements and shipped a 3.6x regression there.
-# ⚠ THIS KERNEL IS SENSITIVE TO `m % 4L`, NOT TO `m`, because its row tail is SCALAR and runs once
-# per COLUMN. Measured against the SIMD path it displaces, forced below the floor:
+#     m          136   144   152  |  160   168   176   184   192   200   208   216   224   232   256
+#     m % 4L       8    16    24  |    0     8    16    24     0     8    16    24     0     8     0
+#     SME/NEON  0.69  0.78  0.80  | 1.10  1.19  1.26  1.17  1.60  1.70  1.63  1.52  1.90  1.92  2.23
 #
-#     m           128   136   144   152   160   176
-#     m % 4L        0     8    16    24     0    16
-#     SME/SIMD   0.73  0.42  0.49  0.56  1.18  0.78
+# so it loses below 160 and wins at EVERY m from 160 up, and the floor sits at the break.
 #
-# The two multiples of 4L are the two good points and everything between them is half speed — the
-# same per-column-remainder cost that `_sme_ger_ir` documents, where finishing leftover rows outside
-# the vectorised sweep costs one pass per column and swamps the work it completes.
+# ⚠ THE BAND USED TO BE HALF SPEED AT EVERY NON-MULTIPLE OF 4L, and it is not any more. The row tail
+# is still scalar and still runs once per column, but it was never the dominant term: the streaming
+# `faddv` was, and `_SME_GEMVT_DEFER_MAX` removes it below 640. With that gone the tail is visible as
+# a dip (216 and 248 sag against their neighbours) rather than as a cliff, and 168, 200, 232 — all
+# non-multiples — win by 1.19x to 1.92x. The floor moved because the reduction moved, NOT because
+# the tail was fixed; vectorising the tail was tried and measured neutral-to-worse, see the note
+# above `_SME_GEMVT_SCR`.
 #
-# ⛔ SO DO NOT DERIVE THIS FLOOR FROM A SWEEP THAT HAPPENS TO LAND ON MULTIPLES. Reading only
-# n=128 and n=160 says the crossing is at 160 and that the floor should come down from 256; reading
-# n=136..152 says the arm is losing throughout that band. The floor stays where it is until the
-# scalar row tail is gone, and the gate sizes it binds (128 and 256) are multiples anyway, so they
-# are limited by the kernel's rate and not by the tail.
-# PDM: Derived — the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | tune: sweep m at fixed n
-const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 2 * _SME_GEMV_BLK * 4)::Int
+# ⛔ STILL DO NOT SET THIS FLOOR FROM A SWEEP THAT ONLY LANDS ON MULTIPLES OF 4L, and do not set it
+# from one process. The same prototype read m=160 at 1475 ns in one run and 621 ns in the next; at
+# these sizes the leading dimension is a small multiple of a page and the operands alias. Every
+# number in the table above is a median of five, taken in-process against a same-array control, and
+# it reproduced across two runs.
+# PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
+const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
 # The m below which the deferred epilogue wins. Both what it removes (one `faddv` per column) and what
 # it adds (`_SME_L` doubles of scratch, written then read) are per COLUMN and O(1) in m, so the
