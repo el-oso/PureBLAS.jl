@@ -1378,7 +1378,7 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # four). It costs NC concurrent A streams, which is why the widest NC is not the fastest.
 #
 # ACCUMULATES into y, as the N form does, so `beta` is applied by the caller before the call.
-function _gemvt_ir(nc::Int)
+function _gemvt_ir(nc::Int, defer::Bool)
     nc <= 2 * _SME_L || throw(ArgumentError(
         "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
     L = _SME_L
@@ -1460,11 +1460,21 @@ rd:
         println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
         println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
         println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
-        println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
-        println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
-        println(io, "  %yo$c = load double, ptr %yp$c, align 8")
-        println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
-        println(io, "  store double %r$c, ptr %yp$c, align 8")
+        if defer
+            # DEFERRED: store the folded vector and let the caller sum its lanes outside streaming
+            # mode. `faddv` here is two thirds of the per-column cost (see `_SME_GEMVT_DEFER_MAX`),
+            # and `alpha` is applied by the caller along with the lane sum.
+            println(io, "  %sb$c = mul nsw i64 %jb, $L")
+            println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
+            println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
+            println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
+        else
+            println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
+            println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
+            println(io, "  %yo$c = load double, ptr %yp$c, align 8")
+            println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
+            println(io, "  store double %r$c, ptr %yp$c, align 8")
+        end
     end
     print(io, """
   br label %bend
@@ -1488,13 +1498,20 @@ end
 # Column groups in flight. Bounded above by the vg1x4 groups ZA can address; the useful range is
 # narrower and is chosen per call by `_sme_gemvt_nc`.
 const _SME_GEMVT_NCS = (2, 4, 8)
-const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc) for nc in _SME_GEMVT_NCS)
+const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SME_GEMVT_NCS)
+# Same kernel, epilogue deferred: it stores each column's folded vector into a scratch strip instead
+# of reducing it in streaming mode. See `_SME_GEMVT_DEFER_MAX` for when that is the faster shape.
+const _SME_GEMVT_DEFER_IR = Dict{Int, String}(nc => _gemvt_ir(nc, true) for nc in _SME_GEMVT_NCS)
 
 for nc in _SME_GEMVT_NCS
     @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb) =
         Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid,
             Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
             y, a, Int64(l), x, Int64(m), al, Int64(nb))
+    @eval @inline $(Symbol("_sme_gemvtd", nc))(s, a, l, x, m, al, nb) =
+        Base.llvmcall(($(_SME_GEMVT_DEFER_IR[nc]), "entry"), Cvoid,
+            Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
+            s, a, Int64(l), x, Int64(m), al, Int64(nb))
 end
 
 @inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb)
@@ -1502,34 +1519,54 @@ end
     nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb)
     return _sme_gemvt8(y, a, l, x, m, al, nb)
 end
-# ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND NEITHER WAY OUT PAYS.
+
+# Deferred arm. `s` is the scratch strip, `nb * _SME_L` doubles, NOT y.
+@inline function _sme_gemvt_drun(nc::Int, s, a, l, x, m, al, nb)
+    nc == 2 && return _sme_gemvtd2(s, a, l, x, m, al, nb)
+    nc == 4 && return _sme_gemvtd4(s, a, l, x, m, al, nb)
+    return _sme_gemvtd8(s, a, l, x, m, al, nb)
+end
+
+# One scratch strip per thread, grow-only through `_ws_grow!`, so the deferred arm allocates only on a
+# thread's first call through it. `_sme_gemvt_cabi` claims it and drops it within the same call and
+# makes no public Level-3 call, so it cannot be live across a threaded join — the same argument the
+# trsv reciprocal caches carry in `test/perthread_lint_baseline.txt`.
+const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
+# ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND IT IS WHY THERE ARE TWO ARMS.
 #
-# Each column block ends with one `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`.
-# Holding one column block and sweeping m separates the three costs: about 150 ns per call, about
-# 40 ns per NC=4 block, of which only 14 ns is the column stream itself at 583 GB/s. Replacing the
-# reduce with a lane-0 extract — wrong answer, timing only — prices it:
+# Each column block ends with a fold of the four ZA slices plus, in the fused arm, one
+# `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`. Holding one column block and
+# sweeping m separates the three costs a square sweep leaves entangled: about 150 ns per call, about
+# 40 ns per NC=4 block, of which only 14 ns is the column stream itself at 583 GB/s. Pricing the
+# reduce by replacing it with a lane-0 extract — wrong answer, timing only:
 #
 #     m = n          256    512   1024  |  m=256, n=64
 #     with faddv    2608   6017  17541  |       811 ns
 #     without       1366   4244  16666  |       349 ns
 #     ratio         1.91   1.42   1.05  |      2.33
 #
-#   * PAIRWISE ADDS DO NOT REDUCE A VECTOR. SVE `faddp` is SEGMENT-WISE: it pairs lanes inside each
-#     128-bit segment and never crosses one, so three of them leave four partial sums in a 512-bit
-#     vector rather than one total. The variant measures 1.05-1.62x and returns the wrong answer;
-#     that timing is a floor for any correct cross-segment sequence, not a result.
-#   * DEFERRING THE REDUCTION WINS ONLY IN A BAND. Fold the four slices in the kernel as now, store
-#     the folded vector into an n*L scratch instead of reducing, and sum the L lanes per column
-#     outside streaming mode. Correct to 3e-16, and against the shipped `gemv!`: m=192 1.53x, 224
-#     1.84x, 256 1.27x, 300 1.52x, 512 1.16x — but 0.94x at m=1024, where the scratch traffic and
-#     the second pass outweigh a reduce already amortized over a long column, and 0.61x at m=128.
-#     So it needs a second kernel and a second floor, and it moves NO gate cell: the binding cells
-#     are m=128, which is below `_SME_GEMVT_MINM` and runs on NEON, and m=256, which would go from
-#     0.338 to 0.43 while 128 stays where it is.
+# THE DEFERRED ARM takes that out of streaming mode: fold the four slices as before, store the folded
+# vector into a per-column strip of `_SME_GEMVT_SCR`, and sum its `_SME_L` lanes in the caller. It is
+# correct to 3e-16 and it is what `_SME_GEMVT_DEFER_MAX` selects.
 #
-# ⚠ TAKE NO m=128 NUMBER FROM A SINGLE PROCESS. One run of the deferred prototype read 518 ns there
-# and three later runs read 1385 ns for the same code. At m=128 the leading dimension is 1024 B, so
-# four columns span exactly one page and the scratch can alias them.
+# ⛔ SVE `faddp` IS NOT AN ALTERNATIVE, and the shape of the failure is worth keeping: pairwise adds
+# are SEGMENT-WISE — they pair lanes inside each 128-bit segment and never cross one — so three of
+# them leave four partial sums in a 512-bit vector instead of one total. The variant measures
+# 1.05-1.62x and returns the wrong answer. That timing is a floor on what a correct cross-segment
+# sequence would have to beat, not a result.
+#
+# ⚠ TAKE NO m=128 NUMBER FROM A SINGLE PROCESS. One run of the deferred arm read 518 ns there and
+# three later runs read 1385 ns for the same code. At m=128 the leading dimension is 1024 B, so four
+# columns span exactly one page and the scratch can alias them. m=128 is below `_SME_GEMVT_MINM`
+# either way: the deferred arm is 0.61x of the NEON path there, so neither arm lowers that floor.
+#
+# ⛔ AND VECTORISING THE SCALAR ROW TAIL IS NOT THE WIN IT LOOKS LIKE. The tail runs once per COLUMN
+# and costs 28% of the call at m=1016 against m=992 (9875 ns against 7729), which reads like a
+# scalar-arithmetic problem. It is not. Replacing it with `_dot_simd` per column, and then with ONE
+# blocked `_gemv_t_simd!` over the whole tail block, both measure NEUTRAL-TO-WORSE in a single-session
+# A/B: m=1000 n=1000 went 16833 -> 17625 ns blocked. The cost is a second, scattered pass over A —
+# one short strided chunk per column — so it is memory-bound and no arithmetic rewrite reaches it.
+# Removing it means predicating the tail rows inside the main kernel so A is read once.
 
 
 # Measured on square Float64 through `gemv!`, best NC per size (bench/probes/sme_gemvt_proto.jl):
@@ -1571,6 +1608,17 @@ const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: fals
 # PDM: Derived — the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | tune: sweep m at fixed n
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 2 * _SME_GEMV_BLK * 4)::Int
 
+# The m below which the deferred epilogue wins. Both what it removes (one `faddv` per column) and what
+# it adds (`_SME_L` doubles of scratch, written then read) are per COLUMN and O(1) in m, so the
+# crossover should not depend on m at all. It does, monotonically, which falsifies that criterion:
+#
+#     m = n      192   256   320   384   448   512   640   768   896  1024  1280
+#     deferred  1.16  1.26  1.25  1.23  1.17  1.17  1.02  1.02  0.94  0.97  0.91
+#
+# so the cut goes at the end of the winning band, below the neutral pair at 640 and 768.
+# PDM: Literal — a falsified-derivation literal: the criterion would be "both costs are per column and m-independent, so the crossover is m-independent", which the table above contradicts. | tune: candidate, sweep m at fixed n
+const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", 640)::Int   # req8-ok: falsified-derivation literal, see table above
+
 # y += alpha*A'x. Bulk columns and whole 4L-row groups run on ZA; the two tails are scalar, and both
 # are bounded: the row tail is under 4L rows of every column, the column tail under NC whole columns.
 function _sme_gemvt_cabi(
@@ -1582,7 +1630,25 @@ function _sme_gemvt_cabi(
     mb = (m ÷ rb) * rb                    # rows the kernel covers
     nb = (n ÷ nc) * nc                    # columns the kernel covers
     if mb > 0 && nb > 0
-        _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
+        if mb < _SME_GEMVT_DEFER_MAX
+            # Deferred epilogue: the kernel writes one `_SME_L`-lane strip per column into scratch and
+            # the lane sums, with alpha, are applied here — outside streaming mode.
+            scr = _ws_grow!(_SME_GEMVT_SCR(), nb * _SME_L)
+            GC.@preserve scr begin
+                _sme_gemvt_drun(nc, pointer(scr), a, lda, x, mb, alpha, nb ÷ nc)
+            end
+            @inbounds for j in 0:(nb - 1)
+                b = j * _SME_L
+                s0 = 0.0; s1 = 0.0
+                for k in 1:2:_SME_L
+                    s0 += scr[b + k]; s1 += scr[b + k + 1]
+                end
+                q = y + j * 8
+                unsafe_store!(q, muladd(alpha, s0 + s1, unsafe_load(q)))
+            end
+        else
+            _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
+        end
     end
     # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
     if mb < m

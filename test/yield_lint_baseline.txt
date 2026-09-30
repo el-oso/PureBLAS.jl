@@ -228,3 +228,11 @@ blas3/sme_kernel.jl:println(io, "  br i1 %sdm$g, label %$lbl, label %$nxt")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double> %sr$sfx, <vscale x 2 x i1> %sg$sfx, ptr %sa$sfx)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %q$(sfx)_0, <vscale x 2 x double> %q$(sfx)_1, <vscale x 2 x double> %q$(sfx)_2, <vscale x 2 x double> %q$(sfx)_3, $SC %pn, ptr %pa$sfx)")
 blas3/sme_kernel.jl:println(io, "$lbl:")
+
+# --- 2026-09-30, the gemv-T generator's DEFERRED epilogue (`_gemvt_ir(nc, true)`). Same generator,
+#              same class as the 2026-09-28 block above: `println` into an in-memory `IOBuffer` at
+#              module load, no `@scope`, no IO lock.
+blas3/sme_kernel.jl:println(io, "  %sb$c = mul nsw i64 %jb, $L")
+blas3/sme_kernel.jl:println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
+blas3/sme_kernel.jl:println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
+blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")

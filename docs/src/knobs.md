@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 169 of them.
+Every `@load_preference` key in `src/` — 170 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 169 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 77 Derived · 23 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 67 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 5 other.
+**Tier:** 77 Derived · 23 Measured · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 67 formula · 22 delegates · 8 sibling · 63 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -256,6 +256,7 @@ Every `@load_preference` key in `src/` — 169 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: a quarter of L1 in elements, `_L1_BYTES ÷ (4 * sizeof(Float64))`, the panel size at which the per-block ZA fill and readback disappear into the stream. | — |
+| `sme_gemvt_defer_max` | literal | Literal | a falsified-derivation literal: the criterion would be "both costs are per column and m-independent, so the crossover is m-independent", which the table above contradicts. | candidate, sweep m at fixed n |
 | `sme_gemvt_minm` | literal | Derived | the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | sweep m at fixed n |
 | `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (2,4,8) |
 | `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
