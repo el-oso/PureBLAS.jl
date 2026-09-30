@@ -1309,57 +1309,42 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
 # `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
 #
-#
-# ⚠ WHAT THAT BARRIER COSTS, MEASURED: ~90-110 ns, and almost NONE of it is ZA. Calling
-# `_sme_gemv_cabi` DIRECTLY — the same Julia body, the same kernels, only without the `ccall`, and with
-# every argument a runtime value on both arms so nothing constant-folds:
+# ⚠ THE CROSSING COSTS ~90-110 ns, AND IT IS THE C ABI MEETING A BODY THAT USES ZA. Calling
+# `_sme_gemv_cabi` directly — same body, same kernels, every argument a runtime value so nothing folds:
 #
 #     m, n            64,64   256,256
-#     through pointer  181.7     736.1 ns
-#     called directly   72.3     593.8
+#     through pointer  169.7     684.8 ns
+#     called directly   67.5     594.6
 #
-# A streaming region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, reached as a
-# direct `llvmcall`, measures 12.5 ns, so the ZA prologue is nearly free and the crossing is the cost.
+# A bare `za.enable` + `ptrue.c64` + `za.disable` region as a direct `llvmcall` is 12.5 ns, so ZA
+# itself is nearly free. What costs is crossing INTO a body that then uses it: a `@cfunction` over a
+# body with no ZA work costs +8 ns, and over a body with ONE real kernel +97. Six candidates are
+# eliminated — do not re-run them:
 #
-# ⛔ FOUR EXPLANATIONS FOR IT ARE ELIMINATED, and the mechanism is still NOT known. Do not assume one:
+#   * NOT constant folding: runtime versus literal args moves the direct arm 2 ns.
+#   * NOT inlining: `_sme_gemv_cabi` marked `@noinline` still measures 67.5 direct against 169.7.
+#   * NOT argument count: +8 ns at one argument and +8 at eight.
+#   * NOT the signature: a trivial body under the real mixed signature costs +8.3.
+#   * NOT the number of streaming regions: one reachable kernel costs +96.9, all ten +95.7.
+#   * NOT the witness counter alone — but it is a SECOND ~95 ns cost that OVERLAPS this one. A
+#     `Threads.atomic_add!` on a counter the kernel's stream has evicted costs +69 to +135 ns; a plain
+#     `Ref{Int}` increment costs 0. Removing EITHER cost alone changes nothing end to end, because each
+#     hides the other; both must go.
 #
-#   * NOT constant folding. Passing m, n, alpha and store as runtime values instead of literals moves
-#     the direct arm by 2 ns (72.3 against 74.5).
-#   * NOT inlining. An `@noinline` wrapper around the same direct call measures 72.7.
-#   * NOT argument count. A `@cfunction` over a bare streaming region costs +8 ns at ONE argument and
-#     +8 ns at EIGHT (21.0, 21.1, 21.3, 21.5 ns for 1, 2, 4, 8).
-#   * NOT the mixed signature. The same trivial body under the REAL signature — three pointers, four
-#     Ints and a Float64 — also costs +8.3, identical to an all-pointer control.
+# ⛔ AND BOTH WAYS OUT ARE BLOCKED, BY DIFFERENT PARTS OF THE BUILD. Measured, not assumed:
 #
-# So a trivial body pays 8 ns to cross and this body pays 90-110, with the same signature and the same
-# arity. Whatever the property is, it belongs to the body, and naming it is the open question.
+#   * A DIRECT call is what inference resolves, and precompilation then codegens the kernel for the
+#     generic image CPU: `LLVM ERROR: Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`. A
+#     `Ref{typeof(f)}` is the same thing — its eltype is a singleton, so `code_typed` shows one static
+#     `:invoke` — and aborts identically.
+#   * A DYNAMIC call through a `Ref{Any}` precompiles fine and is as fast as a direct one, and with the
+#     arguments written into ONE preallocated per-thread struct it allocates nothing. With both costs
+#     removed that way, gemv-N at m=n=64 measured 168 -> 71 ns and n=128 261 -> 180. But
+#     `juliac --trim` cannot resolve a dynamic dispatch and the authoritative build fails.
 #
-# ⚠ TWO ROUTES RECOVER IT, AND BOTH ARE BLOCKED — for DIFFERENT reasons, so check which one you are
-# about to re-invent:
-#
-#   * `Ref{Any}` / `Ref{Function}` (ABSTRACT eltype). Measures 80.7 ns against the pointer's 168.6,
-#     within 6 ns of a direct call, and it DOES keep the deferral: inference cannot see the callee, so
-#     nothing is codegen'd at precompile. But the call is dynamic, it boxes its arguments, and it
-#     ALLOCATES 64 B — which the Level-2 `@strict_contract` forbids.
-#   * `Ref{typeof(_sme_gemv_cabi)}` (CONCRETE eltype). Measures 74.7 ns and allocates NOTHING, which
-#     looks like the answer. It is not: the eltype is a singleton, so inference resolves the callee
-#     exactly — `code_typed` on such a call site shows one static `:invoke` and zero dynamic `:call`.
-#     That is a direct call with extra steps, and it loses the deferral the trampoline exists for.
-#     VERIFIED, not assumed: replacing the `ccall` below with `_sme_gemv_cabi(...)` and precompiling
-#     from a cleared cache aborts with `LLVM ERROR: Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`.
-#
-# So the two properties are in tension: anything inference can resolve gets codegen'd for the generic
-# image CPU and aborts, and anything it cannot resolve boxes. A fix needs a typed, allocation-free call
-# through a pointer whose callee inference does not know — which is what the `@cfunction` already is.
-# The open question is therefore not HOW to call it but why THIS body costs 90-110 ns to cross when a
-# trivial one costs 8.
-# THE PRIZE IS SPENT AT EVERY SME CALL SITE. At m=n=64 a gemv-N moves 32 KB, 34 ns of stream, inside a
-# 177 ns call; `_trmv_split!`'s cover pays it seven times at n=512. gemv-N at n=64 gates 0.48 and the
-# direct-call time would put it near 1.0.
-#
-# ⛔ AND IT IS STILL NOT REMOVABLE BY CALLING THE KERNEL DIRECTLY: a direct call site is compiled during
-# PRECOMPILATION, for a generic image CPU, and aborts. The trampoline exists to defer that to load time
-# on the real host, so any fix has to keep the deferral without paying a dynamic call's boxing.
+# So the prize is ~2.4x on every small-n SME call — gemv-N at n=64 gates 0.48 and would gate above 1 —
+# and taking it needs a call that inference cannot resolve at precompile time but `--trim` can resolve
+# at build time. That is a toolchain problem, not a kernel one.
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
