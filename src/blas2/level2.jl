@@ -3436,7 +3436,13 @@ function _trmv_split!(up::Bool, unit::Bool, n::Int, A, x)
     ib = 0
     while ib < n
         m = min(nb, n - ib); J = (ib + 1):(ib + m)
-        _trmv_fused8!(up, unit, m, view(A, J, J), view(x, J))
+        # NARROW panel, not the `_trmv_fused8!` default. That default picks the wide panel because it
+        # touches x fewer times, and switches to `_TRMV_F_DRAM` past 2*L3 where the stream count binds
+        # instead. A diagonal block of edge `_TRI_NB` is the OTHER case with no x-traffic advantage to
+        # win: its x slice is `_TRI_NB` elements and L1-resident whatever the panel width, so only the
+        # ragged-block overhead is left, and the narrow panel carries less of it. Measured on this
+        # sweep, b=64: F=4 1823 ns against F=8 2092 at n=512, and 3809 against 4368 at n=1024.
+        _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, m, view(A, J, J), view(x, J))
         ib += nb
     end
     @inbounds for i in 1:n
