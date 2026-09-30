@@ -14,7 +14,7 @@ PB / OpenBLAS speed ratio, median (worst cell) per op per µarch. Provenance: [`
 | `gemvT` | 2.14 (1.76) |
 | `ger` | 2.54 (0.99) |
 | `symv` | 1.16 (0.74) |
-| `trmv` | 2.00 (1.73) |
+| `trmv` | 2.49 (1.75) |
 | `trsv` | 1.63 (1.37) |
 | `trsvLN` | 1.43 (1.30) |
 | `trsvLT` | 2.13 (1.32) |
