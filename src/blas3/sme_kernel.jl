@@ -2063,11 +2063,26 @@ const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 #
 # ⛔ DO NOT FIX IT BY SPLITTING THE ROWS. Running the kernel over `(m ÷ L) * L` rows and finishing the
 # scrap with a separate `_ger_simd!` measures WORSE than NEON on the whole matrix at every size that
-# needs it: n=100 0.45x, 132 0.60x, 156 0.69x, 300 0.66x, 500 0.65x. Two reasons, and the second is
-# the one that surprises: the scrap pass is short per column, AND the truncated kernel call now has
-# `lda > m`, which costs it more than the rows it skipped. `_sme_ger!(96, 100, ...)` on a 100-column
-# matrix takes 997 ns where `ger!` on a 96x96 matrix takes 383 — a 4-element gap between columns is
-# enough, because the group of G columns no longer streams contiguously. Any row split pays this.
+# needs it: n=100 0.45x, 132 0.60x, 156 0.69x, 300 0.66x, 500 0.65x. The scrap pass is short per
+# column, and the truncated call still carries the FULL matrix's leading dimension — which at exactly
+# the sizes this route exists to serve is not a multiple of `_SME_L`, and that is the cliff below.
+#
+# ⚠ `stride(A, 2) % _SME_L == 0` IS A SEPARATE REQUIREMENT FROM `m % _SME_L == 0`, and it is only the
+# same thing by accident. A plain `Matrix` has `lda == m`, so the row test covers the stride test and
+# the second one looks redundant — until the operand is a VIEW. Scanned at m=n=96 against lda=96,
+# every lda from 96 to 200:
+#
+#     lda % _SME_L == 0    1.00x        (96, 104, 112, 120, 128, 160, 176, 184, 192)
+#     otherwise            2.4x - 3.1x  (91 of the 105 values tested)
+#
+# The kernel loads and STORES whole 512-bit vectors down each column, so a column stride that is not a
+# whole number of them puts every column's writes at a different offset inside the line. Reads barely
+# notice — the same scan through `_sme_gemv!` costs 4-16%, and through `_sme_gemvt!` 13-18% — but ger
+# writes A, and that is the whole difference.
+#
+# It was reachable: `ger!` on `view(B, 1:96, 1:96)` with `B` 100x100 took the SME path at 153 GB/s
+# where the plain 96x96 matrix runs 388, and at lda=129 it fell to 123, BELOW the NEON path it
+# displaced. With the stride test in place those route to NEON: 963 -> 812 ns and 1196 -> 833.
 #
 # ⛔ AND THE KERNEL'S OWN PREDICATED SCRAP IS NOT THE ANSWER EITHER — it already exists (`mscrap0`..
 # `mscrapG` below), it is CORRECT at every m, and it is slower than NEON everywhere it would be used:
@@ -2087,7 +2102,8 @@ const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
         _strided1(A) && _dense1(x) && _dense1(y) &&
-        m >= _SME_GER_MINM && m % _SME_L == 0 && n > 0 && _SME_GER_ENTRY[] !== C_NULL
+        m >= _SME_GER_MINM && m % _SME_L == 0 && stride(A, 2) % _SME_L == 0 &&
+        n > 0 && _SME_GER_ENTRY[] !== C_NULL
 
 @noinline function _sme_ger!(m::Int, n::Int, alpha::Float64, x, y, A)
     Threads.atomic_add!(_SME_GER_CALLS, 1)
