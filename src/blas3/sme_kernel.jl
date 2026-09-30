@@ -1308,6 +1308,22 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # So gemv takes the same barrier the gemm path uses: the body is reached only through a function
 # POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
 # `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
+#
+# ⚠ WHAT THAT BARRIER COSTS, MEASURED IN PARTS: ~85-95 ns, and almost NONE of it is ZA. A streaming
+# region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, called as a DIRECT
+# `llvmcall`, measures 12.5 ns. The same kernels reached the shipped way — `ccall` through the
+# function pointer — cost 97.9 ns for `_sme_gemv!` and 107.4 ns for `_sme_gemvt!` at their minimum
+# work. So the function pointer is the whole of it, and the ZA prologue is nearly free.
+#
+# THAT IS A BIGGER PRIZE THAN THE "~50 ns" FIGURE ELSEWHERE IN THIS FILE SUGGESTS, and it is spent at
+# every SME call site. At m=n=64 a gemv-N moves 32 KB, which is 34 ns of stream, inside a 177 ns call;
+# `_trmv_split!`'s cover pays it seven times at n=512. Removing it would move cells that no kernel
+# change can: gemv-N at n=64 gates 0.48 and would sit near 0.9.
+#
+# ⛔ IT IS STILL NOT REMOVABLE BY CALLING THE KERNEL DIRECTLY, and the reason is above: a direct call
+# site is compiled during PRECOMPILATION, for a generic image CPU, and aborts. The trampoline exists
+# to defer that compilation to load time on the real host. A fix has to keep that deferral — it is a
+# build-time problem, not a kernel one, and the 12.5 ns figure says the kernel side has nothing to give.
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
