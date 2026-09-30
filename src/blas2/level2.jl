@@ -2727,6 +2727,23 @@ end
     return body
 end
 
+# ⛔ SPLITTING symv INTO SME gemv-N AND gemv-T OVER A BLOCK COVER IS A WASH. It is the obvious move
+# once trmv has `_trmv_split!`: every off-diagonal block `A[R,C]` feeds y twice — `y[R] += A[R,C]·x[C]`
+# and `y[C] += A[R,C]ᵀ·x[R]` — all contributions read the original x, so any order is legal and no
+# accumulator is needed. Correct to 1e-15, and measured against this kernel, best block edge per size:
+#
+#     n        128   200   256   512  1000  1024  2048
+#     cover   0.58  0.93  1.06  0.95  0.92  0.91
+#
+# Three things cancel the rate gain, and the first is the one that decides it: the cover reads each
+# block TWICE, once per direction, because the two kernels are separate calls. That doubles the bytes
+# at exactly the rate SME buys back. On top of that the gemv-T half of a block sits below
+# `_SME_GEMVT_MINM` whenever the block is small, so it runs on NEON, and the diagonal blocks stay on
+# this kernel whatever the edge — their work is `n * edge / 2` and a smaller edge only moves the cost
+# into more cover calls.
+#
+# So the route needs ONE kernel that reads a block and produces both products, not two calls over it.
+# Until that exists, this fused per-column form is the faster shape.
 @inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP}
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
