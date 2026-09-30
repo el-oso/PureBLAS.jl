@@ -4188,7 +4188,7 @@ end
     # across arrivals is the imbalance of one elementwise pass, not of a product.
     while (@atomic p.bar) < target
         (@atomic p.failed) && return false
-        for _ in 1:_mt_spins()
+        for _ in 1:_MT_SPINS
             (@atomic p.bar) >= target && return true
             Base.Threads.atomic_fence()
         end
@@ -4441,10 +4441,6 @@ end
 # THREAD_TIMEOUT. No detected const predicts it because the criterion is the HOST's behaviour, not the
 # hardware's.
 const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570 ns spin-wake … 4000 ns sleep-wake), not a perf tuning
-# `_EXPINT[5]` overrides the spin budget for an A/B; 0 is the shipped value. The band above is wide but
-# it is not unbounded: a worker that runs out of spins between two back-to-back calls sleeps, and the
-# next call pays the sleep-wake instead of the spin-wake.
-@inline _mt_spins() = (@inbounds(_EXPINT[5]) > 0 ? @inbounds(_EXPINT[5]) : _MT_SPINS)
 
 @noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
 
@@ -4461,7 +4457,7 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
         # results, and a `done` count that runs ahead of the driver.
         while (@atomic p.gen) == seen
             spun = false
-            for _ in 1:_mt_spins()
+            for _ in 1:_MT_SPINS
                 if (@atomic p.gen) != seen
                     spun = true
                     break
@@ -4812,7 +4808,7 @@ end
             # two workers can share a thread, and a bare spin here then waits on a worker that can never
             # be scheduled. That exact deadlock cost this session a probe run at 399% CPU.
             while (@atomic p.done) < nw - 1
-                for _ in 1:_mt_spins()
+                for _ in 1:_MT_SPINS
                     (@atomic p.done) >= nw - 1 && break
                     Base.Threads.atomic_fence()
                 end

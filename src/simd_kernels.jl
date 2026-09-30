@@ -1098,10 +1098,7 @@ const _UNROLL = 4
 # B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own scalar tail and the fold order
 # starts depending on where tails fall, which is the invariant this whole construction exists to hold.
 # PDM: Literal — 256 blocks' worth of fold overhead per block, validated by the table above rather than derived; the FORM (a multiple of the kernel's step, so it scales with unroll and ISA width) is what carries across machines. | tune: n/a, the tax is <1% across the measured range
-@inline _red_block(::Type{T}) where {T} = _red_mult() * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
-# `_EXPINT[6]` overrides the multiplier for an A/B; 0 is the shipped 256. It scales the block in units of
-# the kernel's step, so the multiple-of-`_UNROLL * _vwidth(T)` invariant above holds for any value.
-@inline _red_mult() = (@inbounds(_EXPINT[6]) > 0 ? @inbounds(_EXPINT[6]) : 256)
+@inline _red_block(::Type{T}) where {T} = 256 * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
 
 """
     _dot_blocked(n, x, y, ::Type{T}) -> T
