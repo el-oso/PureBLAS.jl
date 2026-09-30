@@ -3289,18 +3289,26 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # `one(α)` is the beta the predicate is asked about: β=1 is an ACCUMULATE, and the N kernel's
 # overlapping tail block is only sound when it stores, so a height that is not a whole number of
 # blocks declines there by construction.
-# ⛔ THE TRIANGULAR SWEEP CAPS NEAR 210 GB/s AND NOBODY HAS FOUND WHY. Read this before
-# restructuring trmv; four plausible causes are already dead.
 #
-# trmv-N upper runs 178 GB/s at n=1024 against Accelerate's 696. Switching each phase off IN SITU —
-# not timing the parts separately, which keeps every panel warm and hides the traversal, and which
-# is what pointed the previous investigation at the wrong phase — puts the cost here:
+# ⛔ WHERE trmv's TIME GOES. Read this before restructuring trmv; the obvious targets are dead.
 #
-#     n        total   scatters   diagonal
-#     1024    26.0 us    18.1       3.7      (scatters 70%)
-#     2048   143.6 us   127.3      13.0      (scatters 89%)
+# trmv-N upper runs 178 GB/s at n=1024 against Accelerate's 696. The cost divides between the
+# diagonal blocks and the off-diagonal scatter, and which half dominates depends on whether the
+# matrix still fits in L2. Switching each phase off inside the blocked loop, Float64, NB=128:
 #
-# The scatters move 3.93 MB in 18.1 us at n=1024, which is 217 GB/s. Falsified as the cause:
+#     n        diagonal   scatter     both  |  plain gemv on the same matrix
+#      512        4.6 us      1.3      8.5  |     2.4 us   883 GB/s    (2.1 MB)
+#     1024       10.8         5.3     22.0  |     9.1      924         (8.4 MB)
+#     2048       23.9        81.5    123.1  |   250.1      134        (33.6 MB)
+#     4096       45.3       463.4    555.8  |  1209.2      111       (134.2 MB)
+#
+# The right-hand column is the roofline. Above L2 the machine delivers 110-135 GB/s to a plain
+# gemv, so the scatter's 210 GB/s at n=2048 already beats streaming the whole matrix once and
+# there is nothing left there to take. Below L2 the scatter is the cheaper half and the DIAGONAL
+# is the target: `_trmv_simd!` walks one column at a time with a carried dependency, which is the
+# constraint described above `_trmv_fused_min`.
+#
+# Dead ends for the scatter, recorded so they are not re-run:
 #
 #   * ACCUMULATE MODE. beta=1 against beta=0 on the same panels: 0.91-1.12x. Not it.
 #   * PANEL NARROWNESS. A single 960x64 panel runs 631 GB/s and a 960x256 one 770. Not it.
@@ -3309,12 +3317,15 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 #   * BLOCK SHAPE. The recursive split T(m) = T(m/2), square (m/2)² gemv, T(m/2) makes every
 #     off-diagonal block square instead of tall and narrow, and measured 189 GB/s against the
 #     blocked structure's 180 at n=1024 — 5%, and worse at n=256 and n=512. Not it.
+#   * A RESIDENT PANEL IS NOT THE COMPARISON. Re-reading one panel reaches 584-770 GB/s, but its
+#     working set is about 1 MB and stays in cache; the sweep reads the triangle once from DRAM.
 #
-# What IS established: the same bytes read from ONE resident panel run 584 GB/s and the moving
-# window 214, so it is the traversal rather than the bytes; and widening the window raises the
-# scatter rate (437 -> 635 GB/s at n=1024) but moves work onto the slow diagonal, which is why
-# `_TRI_NB` = 128 is worth only 3-12% end to end (n=512 10.2 -> 9.0 us, n=1024 23.5 -> 22.7,
-# n=2048 123.6 -> 119.2) and is not taken.
+# Widening the window raises the scatter rate (437 -> 635 GB/s at n=1024) but moves work onto the
+# slow diagonal, which is why `_TRI_NB` = 128 is worth only 3-12% end to end (n=512 10.2 -> 9.0
+# us, n=1024 23.5 -> 22.7, n=2048 123.6 -> 119.2) and is not taken.
+#
+# The phases do not sum: 10.8 + 5.3 against 22.0 measured together at n=1024. Each phase alone
+# owns L2, so part of the difference is cache; how much is interleaving is not established.
 
 @inline function _tri_scat!(yv, Av, xv, α)
     m = size(Av, 1); n = size(Av, 2)
