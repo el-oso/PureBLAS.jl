@@ -3554,11 +3554,21 @@ end
 #     n          256    512   1000   1024   2048   4096
 #     blocked/fused   0.84x  1.07x  1.63x  1.70x  1.71x  1.66x
 #
-# so 256 loses and everything from 512 up wins. req8-ok: a measured crossover with its table — where
-# a register-blocked fused sweep stops beating a matrix-unit offload is not readable off a cache size,
-# and the two paths are structurally different kernels rather than one knob.
-# PDM: Measured — where a register-blocked fused sweep stops beating a matrix-unit offload; the two arms are structurally different kernels, not one knob, and no cache size predicts the crossing. Inert (typemax) without SME. | tune: sweep n, upper/N
-const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 512 : typemax(Int))::Int
+# ⚠ THAT TABLE PRICED AN ARM THAT NO LONGER EXISTS. The structure above this threshold is now
+# `_trmv_split!`, not the interleaved blocked one, and it wins at 256 where the old arm lost. Measured
+# the same way, `_trmv_split!` against `_trmv_fused8!` on the whole matrix, two runs:
+#
+#     n        200   208   216   224   232   240   248  |  256   264   272   320   384   448
+#     split   0.64  0.67  0.68  0.74  0.73  0.93  0.75  | 1.12  1.14  1.04  1.24  1.40  1.55
+#
+# The break is sharp and it sits at 4*`_TRI_NB`: that is the first n whose cover has a block big enough
+# to be worth an SME entry, with four diagonal blocks under it. Below it the cover is one or two small
+# panels and the entries cost more than the structure saves.
+# req8-ok: a measured crossover with its table — where a register-blocked fused sweep stops beating a
+# matrix-unit offload is not readable off a cache size, and the two paths are structurally different
+# kernels rather than one knob.
+# PDM: Derived — the first n whose two-sweep cover carries a block worth an SME entry, 4*_TRI_NB, with four diagonal blocks beneath it; the arm above is `_trmv_split!`. Inert (typemax) without SME. | tune: sweep n, upper/N
+const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 4 * _TRI_NB : typemax(Int))::Int
 
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB

@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 77 Derived · 23 Measured · 52 Literal · 18 Exempt.
+**Tier:** 78 Derived · 22 Measured · 52 Literal · 18 Exempt.
 **Default form** (mechanical): 67 formula · 22 delegates · 8 sibling · 63 literal · 5 flag · 5 other.
 
 
@@ -64,7 +64,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `trmv_f_dram` | literal | Derived | majority criterion: switch once tri > 2*L3. The 2 IS the 1/2. | n/a |
 | `trmv_f_switch` | literal | Derived | NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | n/a — Derived |
 | `trmv_fused_min` | delegates | Literal | the L2-residency crossover was tried and falsified; fused8 wins at every n, all 3 boxes. | candidate |
-| `trmv_sme_min` | sibling | Measured | where a register-blocked fused sweep stops beating a matrix-unit offload; the two arms are structurally different kernels, not one knob, and no cache size predicts the crossing. Inert (typemax) without SME. | sweep n, upper/N |
+| `trmv_sme_min` | sibling | Derived | the first n whose two-sweep cover carries a block worth an SME entry, 4*_TRI_NB, with four diagonal blocks beneath it; the arm above is `_trmv_split!`. Inert (typemax) without SME. | sweep n, upper/N |
 | `trmv_split_recmax` | formula | Derived | formula over detected consts: `2 * _L2_BYTES` | — |
 | `trsv_reg_max` | formula | Derived | formula over detected consts: `_SCALAR_FPREGS - 4` | — |
 | `zhemv_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
