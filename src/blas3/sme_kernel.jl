@@ -2047,6 +2047,29 @@ end
 # PDM: Derived — formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run.
 const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 
+# ⚠ `m % _SME_L == 0` IS WHY ger's WORST CELL IS WORST, AND SPLITTING THE ROWS DOES NOT FIX IT.
+# The predicate below sends every m that is not a whole number of vectors to the NEON path, and the
+# two rates are far apart. Measured square, Float64, alpha tiny so A stays stable, no copy in the
+# timed body, traffic counted as one read plus one write of A:
+#
+#     n          96   100   104   120   128   132   160   200   256   300
+#     n % 8       0     4     0     0     0     4     0     0     0     4
+#     GB/s      385   184   336   298   426   150   444   366   458   140
+#     path      SME  NEON   SME   SME   SME  NEON   SME   SME   SME  NEON
+#
+# For scale, `scal` on the same read-modify-write traffic reaches 262-264 GB/s at 72-156 KB, so the
+# SME arm is above that roofline and the NEON arm is well under it. ger@100 gates 0.638 while its
+# neighbours at 128 and 256 gate 0.961 and 0.942 — the cell is not small-n overhead, it is this cut.
+#
+# ⛔ DO NOT FIX IT BY SPLITTING THE ROWS. Running the kernel over `(m ÷ L) * L` rows and finishing the
+# scrap with a separate `_ger_simd!` measures WORSE than NEON on the whole matrix at every size that
+# needs it: n=100 0.45x, 132 0.60x, 156 0.69x, 300 0.66x, 500 0.65x. Two reasons, and the second is
+# the one that surprises: the scrap pass is short per column, AND the truncated kernel call now has
+# `lda > m`, which costs it more than the rows it skipped. `_sme_ger!(96, 100, ...)` on a 100-column
+# matrix takes 997 ns where `ger!` on a 96x96 matrix takes 383 — a 4-element gap between columns is
+# enough, because the group of G columns no longer streams contiguously. Any row split pays this.
+# The remaining route is a predicated scrap INSIDE the streaming region, the shape `_sme_rmw_ir`
+# already uses for BLAS-1.
 @inline _sme_ger_eligible(::Type{T}, m, n, cj, A, x, y, incx, incy) where {T} =
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
