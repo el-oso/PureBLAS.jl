@@ -3379,6 +3379,20 @@ end
 # T forms stay blocked. Their diagonal is a column dot, which is not the slow kernel, and the same
 # split measured 0.98-1.08x there — not worth a second scratch path.
 #
+#
+# ⚠ DO NOT ATTRIBUTE THIS ROUTINE'S TIME BY TIMING THE TWO SWEEPS SEPARATELY. At n=512 the cover
+# measures 1.74 us alone and the diagonal 1.74 us alone, which sums to 3.5 against 5.6 measured
+# together, and the missing time is neither the entry path nor the function structure: `trmv!` and
+# `_trmv_split!` differ by 0.02 us, and moving each sweep behind its own `@noinline` barrier measures
+# 1.00x. It is cache. The diagonal sweep's working set is `n * _TRI_NB / 2` elements — 128 KB at
+# n=512, which is exactly L1 — so it runs at L1 speed only when nothing else is streaming, and the
+# cover pushes a megabyte through L1 first.
+#
+# ⛔ AND INTERLEAVING THE SWEEPS TO RECOVER THAT LOCALITY IS 0.55x. The panel above block J and block
+# J's own diagonal read the SAME columns of A, so taking them together visits that column range once,
+# and the accumulator makes every order legal. It still loses badly — n=512 0.56x, n=1024 0.55x,
+# n=2048 0.75x — because alternating the two kernels costs 300-660 ns per swap, which is the whole
+# reason this routine groups them. Locality is not the binding constraint here; the swap is.
 # WHAT IS LEFT. At the binding size n=512 the cover runs 1.88 us (489 GB/s) and the diagonal 1.93 us
 # — 128 KB at 68 GB/s — against Accelerate 2.31 us for the whole operation. The diagonal alone is
 # most of that budget, so the next step is not a better cover but a triangular kernel that reaches
