@@ -1309,21 +1309,33 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
 # `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
 #
-# ⚠ WHAT THAT BARRIER COSTS, MEASURED IN PARTS: ~85-95 ns, and almost NONE of it is ZA. A streaming
-# region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, called as a DIRECT
-# `llvmcall`, measures 12.5 ns. The same kernels reached the shipped way — `ccall` through the
-# function pointer — cost 97.9 ns for `_sme_gemv!` and 107.4 ns for `_sme_gemvt!` at their minimum
-# work. So the function pointer is the whole of it, and the ZA prologue is nearly free.
+# ⚠ WHAT THAT BARRIER COSTS, MEASURED IN PARTS: 58-95 ns, and almost NONE of it is ZA. Calling
+# `_sme_gemv_cabi` DIRECTLY — the same Julia body, the same kernels, only without the `ccall` — against
+# reaching it through the pointer:
 #
-# THAT IS A BIGGER PRIZE THAN THE "~50 ns" FIGURE ELSEWHERE IN THIS FILE SUGGESTS, and it is spent at
-# every SME call site. At m=n=64 a gemv-N moves 32 KB, which is 34 ns of stream, inside a 177 ns call;
-# `_trmv_split!`'s cover pays it seven times at n=512. Removing it would move cells that no kernel
-# change can: gemv-N at n=64 gates 0.48 and would sit near 0.9.
+#     m, n            32,1     64,64   256,256
+#     through pointer  112.6     169.0     684.3 ns
+#     called directly   54.5      73.8     593.8
+#     difference        58.1      95.2      90.5
+#
+# and a streaming region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, reached as a
+# direct `llvmcall`, measures 12.5 ns. So the ZA prologue is nearly free and the crossing is the cost.
+#
+# ⚠ IT IS NOT THE INDIRECTION ALONE, so do not go looking for a cheaper pointer. A minimal
+# `@cfunction` taking two arguments and wrapping that same bare streaming region costs 21.1 ns against
+# 12.2 called directly — nine nanoseconds. The 58-95 ns appears at the real entry, which crosses the
+# boundary with eight arguments into a body that then enters streaming mode. Reaching it through a
+# `Ref{Any}` or `Ref{Function}` instead measures 15.9 ns on that same minimal case, so a Julia-side
+# indirection is not obviously worse than the `@cfunction` and has not been tried at the real entry.
+#
+# THE PRIZE IS BIG AND IT IS SPENT AT EVERY SME CALL SITE. At m=n=64 a gemv-N moves 32 KB, 34 ns of
+# stream, inside a 177 ns call; `_trmv_split!`'s cover pays it seven times at n=512. gemv-N at n=64
+# gates 0.48 and the direct-call time would put it near 1.0.
 #
 # ⛔ IT IS STILL NOT REMOVABLE BY CALLING THE KERNEL DIRECTLY, and the reason is above: a direct call
 # site is compiled during PRECOMPILATION, for a generic image CPU, and aborts. The trampoline exists
-# to defer that compilation to load time on the real host. A fix has to keep that deferral — it is a
-# build-time problem, not a kernel one, and the 12.5 ns figure says the kernel side has nothing to give.
+# to defer that compilation to load time on the real host. A fix has to keep that deferral, and the
+# 12.5 ns figure says the kernel side has nothing to give — it is a build-time problem.
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
