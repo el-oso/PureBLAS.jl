@@ -3379,26 +3379,41 @@ end
 # T forms stay blocked. Their diagonal is a column dot, which is not the slow kernel, and the same
 # split measured 0.98-1.08x there — not worth a second scratch path.
 #
+# ⚠ ATTRIBUTE THIS ROUTINE'S TIME BY REMOVING A SWEEP IN SITU, NEVER BY TIMING THE SWEEPS SEPARATELY.
+# Timed on their own the two sweeps read 1.74 us each at n=512, which sums to 3.5 against 5.1
+# measured together, and the difference is not real: it is the sweeps being warm in a loop that runs
+# only one of them. Switching each off inside the body instead — `both - diagonal-only` for the cover
+# and `both - cover-only` for the diagonal:
 #
-# ⚠ DO NOT ATTRIBUTE THIS ROUTINE'S TIME BY TIMING THE TWO SWEEPS SEPARATELY. At n=512 the cover
-# measures 1.74 us alone and the diagonal 1.74 us alone, which sums to 3.5 against 5.6 measured
-# together, and the missing time is neither the entry path nor the function structure: `trmv!` and
-# `_trmv_split!` differ by 0.02 us, and moving each sweep behind its own `@noinline` barrier measures
-# 1.00x. It is cache. The diagonal sweep's working set is `n * _TRI_NB / 2` elements — 128 KB at
-# n=512, which is exactly L1 — so it runs at L1 speed only when nothing else is streaming, and the
-# cover pushes a megabyte through L1 first.
+#     n        both   cover   diagonal   fill+add+copy
+#      512   5.11 us   3.24      1.19        0.10
+#     1024  11.79      7.85      2.96        0.20
+#     2048  88.67     79.50      4.46        0.42
 #
-# ⛔ AND INTERLEAVING THE SWEEPS TO RECOVER THAT LOCALITY IS 0.55x. The panel above block J and block
-# J's own diagonal read the SAME columns of A, so taking them together visits that column range once,
-# and the accumulator makes every order legal. It still loses badly — n=512 0.56x, n=1024 0.55x,
-# n=2048 0.75x — because alternating the two kernels costs 300-660 ns per swap, which is the whole
-# reason this routine groups them. Locality is not the binding constraint here; the swap is.
-# WHAT IS LEFT. At the binding size n=512 the cover runs 1.88 us (489 GB/s) and the diagonal 1.93 us
-# — 128 KB at 68 GB/s — against Accelerate 2.31 us for the whole operation. The diagonal alone is
-# most of that budget, so the next step is not a better cover but a triangular kernel that reaches
-# the matrix unit: `_trmv_fused8!` is NEON and latency-bound on the carried dependency, and base
-# blocks of 16 and 32 measured worse than 64 because they pay more per off-diagonal call than they
-# save on the diagonal.
+# THE COVER IS THE COST, and increasingly so with n — 63% at n=512 and 90% at n=2048. The diagonal is
+# the smaller half at every size. It is also not the entry path (`trmv!` and `_trmv_split!` differ by
+# 0.02 us) and not the function structure (each sweep behind its own `@noinline` barrier measures
+# 1.00x, so the grouping below buys its win through ORDER alone).
+#
+# ⛔ INTERLEAVING THE SWEEPS IS 0.55x. The panel above block J and block J's own diagonal read the
+# SAME columns of A, so taking them together visits that column range once, and the accumulator makes
+# every order legal. It still loses badly — n=512 0.56x, n=1024 0.55x, n=2048 0.75x — because
+# alternating the two kernels costs 300-660 ns per swap. The swap binds, not locality.
+#
+# ⛔ AND A WIDER BLOCK EDGE DOES NOT BUY THE COVER BACK. Fewer, larger cover blocks against a larger
+# diagonal is the obvious trade once the cover is known to dominate, and it loses at every size —
+# re-swept with the narrow-panel diagonal in place, against `_TRI_NB` = 64:
+#
+#     n        b=96   b=128   b=192   b=256
+#      512     0.86    0.89    0.87    0.73
+#     1024     0.85    0.99    0.85    0.76
+#     2048     0.88    0.97    0.91    0.90
+#
+# WHAT IS LEFT. At n=512 the cover moves 918 KB in 3.24 us, which is 283 GB/s where a plain gemv of
+# comparable footprint reaches 883, and it spends about 1.05 us of that in seven SME entries at
+# ~150 ns each. Accelerate does the whole operation in 2.5 us. So the next step is one fused kernel
+# that walks the whole triangle in a single streaming region, replacing seven cover calls and eight
+# diagonal calls — not a better constant, and not the diagonal.
 
 # Recursive halving cover. Splits land on a multiple of `nb` so every leftover diagonal block is
 # exactly `nb` wide, and the off-diagonal blocks come out square rather than tall and narrow.
