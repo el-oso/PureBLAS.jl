@@ -1664,6 +1664,30 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # 1 for the `accelerate` arm — against the 549 GB/s `fmla.vg1x4` allows. Whatever it uses for gemv-T,
 # we cannot emit it from LLVM, so this cell is not closable by tuning this kernel.
 #
+# ⚠ AND THE MEMORY PATTERN CONTRIBUTES NOTHING — the control that proves it is worth keeping. This
+# kernel reads nc columns of A concurrently in 4L-element chunks, which looks like the obvious suspect
+# next to gemv-N's single column read in rb-element runs. Call it with `lda = 0` and all nc streams
+# collapse onto ONE set of cache lines: same instruction stream, same count, one stream instead of four.
+# The result is garbage and the timing is valid:
+#
+#     m=n=1024, lda=1024   15.5 us   541 GB/s
+#     m=n=1024, lda=0      15.5 us   540 GB/s      1.00x
+#
+# So there is nothing to win by rearranging the reads. An L1-resident panel says the same thing from
+# the other side: m=1024 n=4 is 32 KB and measures 164 GB/s, BELOW the 516 of the 8 MB case, because at
+# that size the call is almost entirely the entry cost — small and slow here means overhead, not memory.
+#
+# ⚠ THIS ALSO REINTERPRETS THE GROUP TABLE ABOVE `_sme_gemv_eligible`, which reads 230 GB/s at two
+# groups rising to 1009 at sixteen. Two effects are stacked in it. Below four groups it is CHAIN COUNT:
+# `fmla.single.vg1x4` needs four independent chains to reach its issue rate (68, 133, 262 GF/s at one,
+# two, four), and gemv-N forced to ng=2 reproduces ~230 GB/s even on an L1-RESIDENT 32 KB panel, where
+# no contiguity argument applies. Above four groups the FMA is already saturated — 262, 261, 255 GF/s at
+# four, eight, sixteen — so the continued rise to 1009 is the taller row block: fewer row blocks, fewer
+# ZA drains, longer runs per column.
+#
+# That is why more groups per column cannot help THIS kernel: at nc=4 it already holds the four chains
+# its instruction needs, and everything above that is register pressure. See the note below.
+#
 # ⛔ MORE ZA GROUPS PER COLUMN DOES NOT LIFT THIS KERNEL'S RATE, AND THE gemv-N TABLE DOES NOT TRANSFER.
 # gemv-T at n=1024 reaches 514 GB/s where gemv-N reaches 988 on the same bytes, and the obvious read of
 # the note above `_sme_gemv_eligible` — group count IS memory-level parallelism, 230 GB/s at two groups
