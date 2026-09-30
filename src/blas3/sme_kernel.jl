@@ -1273,6 +1273,26 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
         (m % _SME_GEMV_BLK == 0 || iszero(beta))
 
 # The kernel reads y and A as raw column-major Float64 with unit row stride, and x contiguously.
+# ⚠ THIS KERNEL'S RATE IS GOVERNED BY ROWS, NOT BY TOTAL WORK, AND THE FLOOR ABOVE DOES NOT SAY SO.
+# Measured through `_sme_gemv!`, Float64, β=1, every block resident, GB/s of A:
+#
+#     rows \ cols      64    128    256    512   1024
+#         32           75    123    165    198    229
+#         64          225    175    261    475    510
+#        128          126    218    336    503    629
+#        256          511    672    783    862    908
+#        512          647    790    891    953    986
+#
+# So m >= 256 is where it performs, and below that it gives up 2-5x however many columns follow. Two
+# consequences worth knowing before tuning anything that calls it:
+#
+#   * A SMALL-n SQUARE gemv IS NOT SLOW BECAUSE IT IS SMALL. At m=n=64 the kernel reaches 225 GB/s and
+#     at m=n=512 it reaches 953 — the same kernel, the same residency, four times the rows.
+#   * NO TRIANGULAR COVER ESCAPES IT. A block of the strictly-upper triangle with m >= 256 must sit in
+#     the top-right corner, so the blocks nearest the diagonal are short BY CONSTRUCTION. That is why
+#     `_trmv_split!`'s cover aggregates 283 GB/s out of blocks that individually reach 725: at n=512 the
+#     recursive cover is one 256x256 at 783 plus two 128x128 at 218 and four 64x64 at 225, and the
+#     staircase alternative is worse (its panels are 64 columns wide, and narrow costs rows).
 @inline _sme_gemv_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy, beta) where {T} =
     T === Float64 && _SME_F64 && !trans && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
