@@ -67,18 +67,23 @@ step() {
     "$@" || rc=1
 }
 
-step "1/5  cell staleness — do these cells predate the code they describe?" \
+step "1/6  cell staleness — do these cells predate the code they describe?" \
     bash bench/cache_staleness.sh "${files[@]}"
-step "2/5  arm anchors — pb_mt against the threaded vendors (ADVISORY, see that script's header)" \
+step "2/6  arm anchors — pb_mt against the threaded vendors (ADVISORY, see that script's header)" \
     bash bench/check_arm_anchors.sh "$tol" "${files[@]}"
 # THE STEP THAT MATTERS MOST for a threaded cache, and the reason this is a HARD failure: a cell whose
 # PB window and reference window ran at different clocks is not adjudicable at all.
-step "3/5  arm clocks — did the PB window and the reference window run at the same clock? (HARD)" \
+step "3/6  arm clocks — did the PB window and the reference window run at the same clock? (HARD)" \
     bash bench/check_arm_clocks.sh 3 "${files[@]}"
-step "4/5  clock outliers — cells whose stamped clock sits apart from the rest of their own cache" \
+step "4/6  clock outliers — cells whose stamped clock sits apart from the rest of their own cache" \
     bash bench/check_clock_outliers.sh "${files[@]}"
-step "5/5  cache freshness — is a remote box's cache newer than the copy here?" \
+step "5/6  cache freshness — is a remote box's cache newer than the copy here?" \
     bash bench/check_cache_freshness.sh "${files[@]}"
+# FIRST for a threaded cache in importance, last in order only because it is the cheapest. A co-tenant
+# costs a threaded arm more than a serial one — it competes for every core the pool wants, not for one —
+# so contention shows up as exactly the shape a scaling defect has.
+step "6/6  contention — did a foreign process share the box with the sweep? (HARD)" \
+    bash bench/check_cache_busy.sh "${files[@]}"
 
 printf '\n'
 if [ "$rc" -eq 0 ]; then

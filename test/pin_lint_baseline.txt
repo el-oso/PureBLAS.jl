@@ -1,0 +1,29 @@
+# Recorded pin-set findings. Each line is a disagreement between `test/Project.toml`'s
+# `[preferences.PureBLAS]` and `juliac/build.jl`, or a pin sitting on a knob whose default is already a
+# formula. See test/pin_lint.jl for what each kind means and why neither is harmless.
+#
+# THIS LIST IS A REVIEW WORKLIST, NOT A SET OF APPROVALS. Nothing below has been argued through to
+# "correct"; they are the state as measured when the check was added, kept so that NEW drift fails
+# while the existing set is decided. The pin tier is the user's, so a line leaves this file by the
+# user removing or adding a pin — not by an agent.
+#
+# What each one is, as far as the source says:
+#
+# cgemvt_cfg      `@load_preference("cgemvt_cfg", _CGEMVT_CFG_BIG)` — the default is already a complete
+#                 `_NVREG` derivation, so the pin overrides a formula and removes no tuner.
+# gemvt_nc        default `nothing`, and level2.jl runs a `OncePerProcess`, so the pin does remove a
+#                 tuner — but juliac/build.jl does not pin it, so the .so and the dogfood differ.
+# pptrf_spr_min   default `0`, documented as an unset SENTINEL rather than a size. Pinning it to 8
+#                 selects a route where 0 means "not selected".
+# cgemvn_nc_big   default `3 * _vwidth(Float64) ÷ 2` — a formula. Pinned in the build only; legitimate
+#                 for a cross-compile, which is a build-tier decision.
+# gbtrf_nb        default `nothing` with a live tuner. Pinned for the .so but NOT in the test env, so a
+#                 test item reaching the banded LU can still run the tuner and allocate.
+DRIFT    cgemvt_cfg  pinned in test/Project.toml, not in juliac/build.jl
+DRIFT    gemvt_nc  pinned in test/Project.toml, not in juliac/build.jl
+DRIFT    pptrf_spr_min  pinned in test/Project.toml, not in juliac/build.jl
+DRIFT    cgemvn_nc_big  pinned in juliac/build.jl, not in test/Project.toml
+DRIFT    gbtrf_nb  pinned in juliac/build.jl, not in test/Project.toml
+OVERRIDE cgemvt_cfg  pinned in test/Project.toml though its src default is a formula, not `nothing`
+OVERRIDE pptrf_spr_min  pinned in test/Project.toml though its src default is a formula, not `nothing`
+OVERRIDE cgemvn_nc_big  pinned in juliac/build.jl though its src default is a formula, not `nothing`

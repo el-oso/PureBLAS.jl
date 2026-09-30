@@ -10,13 +10,6 @@
 
 @testitem "TrimCheck trim-safety (C-ABI entry points)" tags = [:checks] begin
     using TrimCheck
-    # TrimCheck upstream v0.1.4 hard-codes the IN-TREE juliac helper path (TrimCheck.jl:305/308,
-    # `share/julia/juliac/juliac-trim-{base,stdlib}.jl`). Julia 1.13 removed that directory — the same
-    # files now live under `share/julia/test/trimming/` — so on 1.13 this testitem used to die before
-    # running a single check, and carried a guard that skipped it with a `@test_broken`.
-    # RESOLVED 2026-09-11: `test/Project.toml` pins TrimCheck to the `julia-1.13` branch of
-    # github.com/el-oso/TrimCheck.jl via [sources], which resolves both paths. The guard is gone and
-    # `@validate` runs on 1.13 again. Drop the [sources] entry once the fix is upstream.
     @validate(
         init = begin
             using PureBLAS
