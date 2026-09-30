@@ -1334,10 +1334,25 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # So a trivial body pays 8 ns to cross and this body pays 90-110, with the same signature and the same
 # arity. Whatever the property is, it belongs to the body, and naming it is the open question.
 #
-# ⚠ ONE ROUTE RECOVERS IT AND IS NOT FREE: reaching `_sme_gemv_cabi` through a `Ref{Any}` measures
-# 72.4 ns against the pointer's 171.0 — within 6 ns of the direct call — but a dynamic call boxes its
-# arguments and ALLOCATES 48 B, which the Level-2 `@strict_contract` forbids.
+# ⚠ TWO ROUTES RECOVER IT, AND BOTH ARE BLOCKED — for DIFFERENT reasons, so check which one you are
+# about to re-invent:
 #
+#   * `Ref{Any}` / `Ref{Function}` (ABSTRACT eltype). Measures 80.7 ns against the pointer's 168.6,
+#     within 6 ns of a direct call, and it DOES keep the deferral: inference cannot see the callee, so
+#     nothing is codegen'd at precompile. But the call is dynamic, it boxes its arguments, and it
+#     ALLOCATES 64 B — which the Level-2 `@strict_contract` forbids.
+#   * `Ref{typeof(_sme_gemv_cabi)}` (CONCRETE eltype). Measures 74.7 ns and allocates NOTHING, which
+#     looks like the answer. It is not: the eltype is a singleton, so inference resolves the callee
+#     exactly — `code_typed` on such a call site shows one static `:invoke` and zero dynamic `:call`.
+#     That is a direct call with extra steps, and it loses the deferral the trampoline exists for.
+#     VERIFIED, not assumed: replacing the `ccall` below with `_sme_gemv_cabi(...)` and precompiling
+#     from a cleared cache aborts with `LLVM ERROR: Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`.
+#
+# So the two properties are in tension: anything inference can resolve gets codegen'd for the generic
+# image CPU and aborts, and anything it cannot resolve boxes. A fix needs a typed, allocation-free call
+# through a pointer whose callee inference does not know — which is what the `@cfunction` already is.
+# The open question is therefore not HOW to call it but why THIS body costs 90-110 ns to cross when a
+# trivial one costs 8.
 # THE PRIZE IS SPENT AT EVERY SME CALL SITE. At m=n=64 a gemv-N moves 32 KB, 34 ns of stream, inside a
 # 177 ns call; `_trmv_split!`'s cover pays it seven times at n=512. gemv-N at n=64 gates 0.48 and the
 # direct-call time would put it near 1.0.
