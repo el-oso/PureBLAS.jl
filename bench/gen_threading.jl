@@ -215,18 +215,57 @@ it did.
 ## Plots
 
 One panel per operation, one curve per microarchitecture, against problem size. The dashed line is
-1.00×, the band is the q10–q90 spread of the pooled per-round ratios. A panel appears when its
-routine reaches at least 1.25× somewhere on the fleet, which is well clear of the harness's own
-3.7% noise floor.
+1.00×, the band is the q10–q90 spread of the pooled per-round ratios.
+
+### The gate, with threads on
+
+This is the criterion of req#1 measured threaded: **PureBLAS at N threads over whichever THREADED
+vendor is faster in that cell**, `max(OpenBLAS, AOCL)`, chosen per size — so one curve may switch
+references along its own x-axis, exactly as the gate does. Above 1.00× is a pass.
+
+Every group appears here, including the ones that do not thread at all. That is deliberate: a group
+with no splitter still has to be measured against a vendor that has one, and that gap IS the finding
+for BLAS-2 and for the complex groups.
+
+A cell with no threaded reference arm is DROPPED rather than compared against a serial one — a
+threaded PureBLAS arm over a single-thread vendor is not the gate and must not be drawn as if it were.
+
+!!! warning "The Zen4 curve is not yet adjudicable"
+    That box is a laptop mainboard with no battery, and it was running on a supply that could not hold
+    its pin once every core was busy: one core held 2795 MHz indefinitely while six oscillated
+    2332–2804 MHz, at 52–58 °C, far below any thermal limit. 1208 of its cached arms are stamped
+    below the pin and 413 cells compare two power states rather than two libraries. The error runs in
+    PureBLAS's favour, because a throttled reference is a slower reference. A larger supply has since
+    moved its sustainable pin to 3501 MHz and `fleet_freqlock.sh verify-mt` confirms six cores hold
+    it, so those cells are being re-measured with both arms in one machine state; until then read the
+    Zen3 and Zen5 curves, whose cross-arm clocks agree on 929 of 937 and 951 of 951 cells.
+
+![BLAS-1 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l1.svg)
+![BLAS-2 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l2.svg)
+![BLAS-3 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l3.svg)
+![LAPACK — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_lapack.svg)
+![complex BLAS-1 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_cl1.svg)
+![complex BLAS-2 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_cl2.svg)
+![complex BLAS-3 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_cl3.svg)
+![complex LAPACK — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_clapack.svg)
+
+### What threading bought
+
+The panels below ask a different question and are NOT the gate: both arms are PureBLAS, so they show
+N threads over 1 thread — what the pool won, with no vendor in it. A panel appears when its routine
+reaches at least 1.25× somewhere on the fleet, which is well clear of the harness's own 3.7% noise
+floor; a routine with no splitter would draw a flat line at 1.00× and reports the harness rather than
+the library.
 
 Read the SHAPE, not just the peak: a curve that climbs with `n` is a routine amortising the
 fork-join correctly.
 
+![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
 
-Regenerate them with `julia --project=bench bench/plots.jl mtdraw`, which writes `perf_mt_*.svg`
-and exits before the gate rendering.
+Regenerate both sets with `julia --project=bench bench/plots.jl mtdraw`, which writes
+`perf_mtgate_*.svg` and `perf_mt_*.svg` and exits before the gate rendering.
 
 ## Results
 """)
