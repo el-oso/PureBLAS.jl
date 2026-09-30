@@ -1309,33 +1309,42 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
 # `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
 #
-# ⚠ WHAT THAT BARRIER COSTS, MEASURED IN PARTS: 58-95 ns, and almost NONE of it is ZA. Calling
-# `_sme_gemv_cabi` DIRECTLY — the same Julia body, the same kernels, only without the `ccall` — against
-# reaching it through the pointer:
 #
-#     m, n            32,1     64,64   256,256
-#     through pointer  112.6     169.0     684.3 ns
-#     called directly   54.5      73.8     593.8
-#     difference        58.1      95.2      90.5
+# ⚠ WHAT THAT BARRIER COSTS, MEASURED: ~90-110 ns, and almost NONE of it is ZA. Calling
+# `_sme_gemv_cabi` DIRECTLY — the same Julia body, the same kernels, only without the `ccall`, and with
+# every argument a runtime value on both arms so nothing constant-folds:
 #
-# and a streaming region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, reached as a
-# direct `llvmcall`, measures 12.5 ns. So the ZA prologue is nearly free and the crossing is the cost.
+#     m, n            64,64   256,256
+#     through pointer  181.7     736.1 ns
+#     called directly   72.3     593.8
 #
-# ⚠ IT IS NOT THE INDIRECTION ALONE, so do not go looking for a cheaper pointer. A minimal
-# `@cfunction` taking two arguments and wrapping that same bare streaming region costs 21.1 ns against
-# 12.2 called directly — nine nanoseconds. The 58-95 ns appears at the real entry, which crosses the
-# boundary with eight arguments into a body that then enters streaming mode. Reaching it through a
-# `Ref{Any}` or `Ref{Function}` instead measures 15.9 ns on that same minimal case, so a Julia-side
-# indirection is not obviously worse than the `@cfunction` and has not been tried at the real entry.
+# A streaming region that does nothing but `za.enable`, `ptrue.c64` and `za.disable`, reached as a
+# direct `llvmcall`, measures 12.5 ns, so the ZA prologue is nearly free and the crossing is the cost.
 #
-# THE PRIZE IS BIG AND IT IS SPENT AT EVERY SME CALL SITE. At m=n=64 a gemv-N moves 32 KB, 34 ns of
-# stream, inside a 177 ns call; `_trmv_split!`'s cover pays it seven times at n=512. gemv-N at n=64
-# gates 0.48 and the direct-call time would put it near 1.0.
+# ⛔ FOUR EXPLANATIONS FOR IT ARE ELIMINATED, and the mechanism is still NOT known. Do not assume one:
 #
-# ⛔ IT IS STILL NOT REMOVABLE BY CALLING THE KERNEL DIRECTLY, and the reason is above: a direct call
-# site is compiled during PRECOMPILATION, for a generic image CPU, and aborts. The trampoline exists
-# to defer that compilation to load time on the real host. A fix has to keep that deferral, and the
-# 12.5 ns figure says the kernel side has nothing to give — it is a build-time problem.
+#   * NOT constant folding. Passing m, n, alpha and store as runtime values instead of literals moves
+#     the direct arm by 2 ns (72.3 against 74.5).
+#   * NOT inlining. An `@noinline` wrapper around the same direct call measures 72.7.
+#   * NOT argument count. A `@cfunction` over a bare streaming region costs +8 ns at ONE argument and
+#     +8 ns at EIGHT (21.0, 21.1, 21.3, 21.5 ns for 1, 2, 4, 8).
+#   * NOT the mixed signature. The same trivial body under the REAL signature — three pointers, four
+#     Ints and a Float64 — also costs +8.3, identical to an all-pointer control.
+#
+# So a trivial body pays 8 ns to cross and this body pays 90-110, with the same signature and the same
+# arity. Whatever the property is, it belongs to the body, and naming it is the open question.
+#
+# ⚠ ONE ROUTE RECOVERS IT AND IS NOT FREE: reaching `_sme_gemv_cabi` through a `Ref{Any}` measures
+# 72.4 ns against the pointer's 171.0 — within 6 ns of the direct call — but a dynamic call boxes its
+# arguments and ALLOCATES 48 B, which the Level-2 `@strict_contract` forbids.
+#
+# THE PRIZE IS SPENT AT EVERY SME CALL SITE. At m=n=64 a gemv-N moves 32 KB, 34 ns of stream, inside a
+# 177 ns call; `_trmv_split!`'s cover pays it seven times at n=512. gemv-N at n=64 gates 0.48 and the
+# direct-call time would put it near 1.0.
+#
+# ⛔ AND IT IS STILL NOT REMOVABLE BY CALLING THE KERNEL DIRECTLY: a direct call site is compiled during
+# PRECOMPILATION, for a generic image CPU, and aborts. The trampoline exists to defer that to load time
+# on the real host, so any fix has to keep the deferral without paying a dynamic call's boxing.
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
