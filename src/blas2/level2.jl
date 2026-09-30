@@ -3289,6 +3289,33 @@ const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
 # `one(α)` is the beta the predicate is asked about: β=1 is an ACCUMULATE, and the N kernel's
 # overlapping tail block is only sound when it stores, so a height that is not a whole number of
 # blocks declines there by construction.
+# ⛔ THE TRIANGULAR SWEEP CAPS NEAR 210 GB/s AND NOBODY HAS FOUND WHY. Read this before
+# restructuring trmv; four plausible causes are already dead.
+#
+# trmv-N upper runs 178 GB/s at n=1024 against Accelerate's 696. Switching each phase off IN SITU —
+# not timing the parts separately, which keeps every panel warm and hides the traversal, and which
+# is what pointed the previous investigation at the wrong phase — puts the cost here:
+#
+#     n        total   scatters   diagonal
+#     1024    26.0 us    18.1       3.7      (scatters 70%)
+#     2048   143.6 us   127.3      13.0      (scatters 89%)
+#
+# The scatters move 3.93 MB in 18.1 us at n=1024, which is 217 GB/s. Falsified as the cause:
+#
+#   * ACCUMULATE MODE. beta=1 against beta=0 on the same panels: 0.91-1.12x. Not it.
+#   * PANEL NARROWNESS. A single 960x64 panel runs 631 GB/s and a 960x256 one 770. Not it.
+#   * PARTIAL COLUMNS. A gemv over the first 512 of 1024 rows — half of every column — runs 907
+#     GB/s, the same as the full matrix. Not it.
+#   * BLOCK SHAPE. The recursive split T(m) = T(m/2), square (m/2)² gemv, T(m/2) makes every
+#     off-diagonal block square instead of tall and narrow, and measured 189 GB/s against the
+#     blocked structure's 180 at n=1024 — 5%, and worse at n=256 and n=512. Not it.
+#
+# What IS established: the same bytes read from ONE resident panel run 584 GB/s and the moving
+# window 214, so it is the traversal rather than the bytes; and widening the window raises the
+# scatter rate (437 -> 635 GB/s at n=1024) but moves work onto the slow diagonal, which is why
+# `_TRI_NB` = 128 is worth only 3-12% end to end (n=512 10.2 -> 9.0 us, n=1024 23.5 -> 22.7,
+# n=2048 123.6 -> 119.2) and is not taken.
+
 @inline function _tri_scat!(yv, Av, xv, α)
     m = size(Av, 1); n = size(Av, 2)
     if _sme_gemv_eligible(eltype(Av), m, n, false, false, Av, xv, yv, 1, 1, one(α))
