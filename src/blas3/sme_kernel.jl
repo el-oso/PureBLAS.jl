@@ -1683,7 +1683,31 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # THE TRANSPOSE IS NOT FREE FOR THEM EITHER: their gemv-T is 1.48x slower than their own gemv-N (13246
 # against 8970 ns at n=1024), so they give up about 42% of the broadcast form's 1098 GB/s to get there.
 # But 634 beats 514, and `llvm.aarch64.sme.ld1d.horiz` is already declared in `_SME_DECLS` here, so the
-# route is open and unexplored. Build it before concluding anything else about this kernel's ceiling.
+# route looked open, so it was BUILT and measured — see below.
+#
+# ⛔ AND THE ZA TRANSPOSE ROUTE IS NOW MEASURED, NOT ESTIMATED: IT IS FOUR TIMES TOO SLOW. The mechanism
+# works — `ld1d` into a tile's HORIZONTAL slices followed by `st1d` from its VERTICAL slices transposes
+# an 8x8 Float64 block exactly (verified against `transpose(A)`) — but the rate is nowhere near enough:
+#
+#     8x8 blocks        128     256     512
+#     GB/s of A         100     115      51
+#     cycles per instr  1.37    1.19    2.72
+#
+# Sixteen instructions per 64 elements at about 1.2 cycles each is 3.2 elements per cycle, so roughly
+# 110 GB/s — against the 514 GB/s this kernel already reaches with the half-rate FMA and no transpose
+# at all. A transposing gemv-T cannot win, and the earlier paper estimate of "about 4x worse" was right.
+#
+# ⚠ WHICH LEAVES ACCELERATE'S ADVANTAGE UNEXPLAINED, AND THE INSTRUCTION COUNTS DO NOT SETTLE IT. Its
+# `libBLAS` holds 3406 broadcast-form f64 FMLAs and zero multi-by-multi ones, but it holds only 108
+# `ld1d` horizontal loads in 7.65 MB — a handful of call sites, not a hot loop — so those FMLAs are
+# most likely dgemm's microkernel and say nothing about dgemv-T.
+#
+# ⚠ AND THE SIZE OF THE GAP IS WITHIN REACH OF THE MEASUREMENT. Deriving the multi-form issue rate from
+# this machine rather than from an assumed clock: the broadcast form measures 262 GF/s and the multi form
+# 131, so 2.05 G instructions per second, 32 Float64 each, which is 525 GB/s — and gemv-T measures 514,
+# 98% of it. Accelerate's 634 GB/s is 21% above that. But that number is a CROSS-RUN comparison: its arm
+# is cached from a different session and the harness itself warns of 5% machine-state drift. Settling
+# whether it really exceeds this instruction's rate needs both arms timed in ONE run.
 #
 # ⚠ AND THE MEMORY PATTERN CONTRIBUTES NOTHING — the control that proves it is worth keeping. This
 # kernel reads nc columns of A concurrently in 4L-element chunks, which looks like the obvious suspect
