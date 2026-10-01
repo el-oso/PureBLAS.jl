@@ -1659,10 +1659,31 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # `fmopa` does not help: ZA[r,c] += A[i+r,j]*x[i+c] fills a tile to use its diagonal, 8x waste at this
 # vector length. The indexed `fmla` forms broadcast one LANE, which is still a row of A.
 #
-# ⚠ AND ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It reaches
+# ⚠ ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It reaches
 # about 747 GB/s on the same shape SINGLE-THREADED — `bench/plots.jl` pins `VECLIB_MAXIMUM_THREADS` to
-# 1 for the `accelerate` arm — against the 549 GB/s `fmla.vg1x4` allows. Whatever it uses for gemv-T,
-# we cannot emit it from LLVM, so this cell is not closable by tuning this kernel.
+# 1 for the `accelerate` arm — against the 549 GB/s `fmla.vg1x4` allows. What it uses instead is below.
+#
+# ⚠ AND THE "ONLY WAY UP NEEDS ROWS, SO IT IS CLOSED" CONCLUSION IS WRONG — ACCELERATE TAKES THAT WAY.
+# Counted directly in Accelerate's `libBLAS.dylib` __text (7.65 MB, control: 1981 `ret`), by matching
+# instruction encodings derived from assembling two register variants of each form:
+#
+#     fmla za.d vgx4, SINGLE (multi x broadcast)   3406
+#     fmla za.d vgx4, MULTI  (multi x multi)          0      <- the half-rate form, never used
+#     fmopa za.d (outer product)                    450
+#     mova {z...} <- za                            5192
+#     ld1d {za..h} (load INTO a horizontal slice)    108
+#     smstart sm / smstart za                  262 / 238
+#
+# So it is on SME, and it NEVER issues the form this kernel is built on. It reaches the full-rate
+# broadcast form instead, and the way is visible in the counts: `ld1d` into a HORIZONTAL ZA slice puts
+# column-major memory into ZA rows, `mova` reads it back out, and ZA is the transpose engine. The
+# estimate above that transposing costs about 4x was never measured — it is an instruction count done
+# on paper — and Accelerate's 634 GB/s at n=1024 against this kernel's 514 is the counterexample.
+#
+# THE TRANSPOSE IS NOT FREE FOR THEM EITHER: their gemv-T is 1.48x slower than their own gemv-N (13246
+# against 8970 ns at n=1024), so they give up about 42% of the broadcast form's 1098 GB/s to get there.
+# But 634 beats 514, and `llvm.aarch64.sme.ld1d.horiz` is already declared in `_SME_DECLS` here, so the
+# route is open and unexplored. Build it before concluding anything else about this kernel's ceiling.
 #
 # ⚠ AND THE MEMORY PATTERN CONTRIBUTES NOTHING — the control that proves it is worth keeping. This
 # kernel reads nc columns of A concurrently in 4L-element chunks, which looks like the obvious suspect
