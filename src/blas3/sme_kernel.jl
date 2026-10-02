@@ -1504,6 +1504,14 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # four). It costs NC concurrent A streams, which is why the widest NC is not the fastest.
 #
 # ACCUMULATES into y, as the N form does, so `beta` is applied by the caller before the call.
+#
+# ⛔ TWO NEUTRAL-OR-WORSE REWRITES OF THIS LOOP, both measured as an in-process A/B against the other:
+#   * Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
+#     quads instead of one reused quad (verified in the emitted assembly). It measures 1.00x at every
+#     size — this core renames the write-after-read away, so the interleaved order costs nothing.
+#   * Folding the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so
+#     CROSSES the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
+#     0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
 function _gemvt_ir(nc::Int, defer::Bool)
     nc <= 2 * _SME_L || throw(ArgumentError(
         "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
@@ -1714,18 +1722,18 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # 1.05-1.62x and returns the wrong answer. That timing is a floor on what a correct cross-segment
 # sequence would have to beat, not a result.
 #
-# ⚠ TAKE NO m=128 NUMBER FROM A SINGLE PROCESS. One run of the deferred arm read 518 ns there and
-# three later runs read 1385 ns for the same code. At m=128 the leading dimension is 1024 B, so four
-# columns span exactly one page and the scratch can alias them. m=128 is below `_SME_GEMVT_MINM`
-# either way: the deferred arm is 0.61x of the NEON path there, so neither arm lowers that floor.
+# ⚠ TAKE NO SMALL-m NUMBER FROM A SINGLE PROCESS. One run of the deferred arm read 518 ns at m=128 and
+# three later runs read 1385 ns for the same code. Below about m=256 the per-call cost dominates and
+# the readings do not reproduce: the same m=144 shape measures the SME route at 0.81x of NEON at n=64
+# and 2.04x at n=256, and pricing the ragged-row window there gives 0.0% at four row windows and 9% at
+# five, which no cost model fits. Tune the floor from a multi-process sweep, not from one session.
 #
-# ⛔ AND VECTORISING THE SCALAR ROW TAIL IS NOT THE WIN IT LOOKS LIKE. The tail runs once per COLUMN
-# and costs 28% of the call at m=1016 against m=992 (9875 ns against 7729), which reads like a
-# scalar-arithmetic problem. It is not. Replacing it with `_dot_simd` per column, and then with ONE
-# blocked `_gemv_t_simd!` over the whole tail block, both measure NEUTRAL-TO-WORSE in a single-session
-# A/B: m=1000 n=1000 went 16833 -> 17625 ns blocked. The cost is a second, scattered pass over A —
-# one short strided chunk per column — so it is memory-bound and no arithmetic rewrite reaches it.
-# Removing it means predicating the tail rows inside the main kernel so A is read once.
+# ⛔ THE CALLER-SIDE LANE SUM IS NOT WHERE THE DEFERRED ARM COSTS ITS OVERHEAD. Timed on its own over a
+# pre-filled scratch it is 0.41-0.45 ns per column, flat from nb=64 to nb=1024 — 56 ns at n=128, 106 ns
+# at n=256. Any larger figure for it comes from subtracting two whole-call timings, and at these sizes
+# that difference is dominated by a per-call cost near 390 ns (fitted from the measured SME/NEON
+# crossover over n=128..512, with a per-column drain near 1.5 ns). Spelling the lane sum as a
+# whole-vector `sum(Vec{_SME_L,Float64})` measures 1.00x — LLVM already emits that.
 
 
 #
@@ -1761,9 +1769,9 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # `fmopa` does not help: ZA[r,c] += A[i+r,j]*x[i+c] fills a tile to use its diagonal, 8x waste at this
 # vector length. The indexed `fmla` forms broadcast one LANE, which is still a row of A.
 #
-# ⚠ ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It reaches
-# about 747 GB/s on the same shape SINGLE-THREADED — `bench/plots.jl` pins `VECLIB_MAXIMUM_THREADS` to
-# 1 for the `accelerate` arm — against the 549 GB/s `fmla.vg1x4` allows. What it uses instead is below.
+# ⚠ ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It sustains
+# 580-820 GB/s from n=256 to n=1024 SINGLE-THREADED against the 549 GB/s `fmla.vg1x4` allows; the table
+# is below, measured with both arms in dedicated runs rather than as a cached quotient.
 #
 # ⚠ AND THE "ONLY WAY UP NEEDS ROWS, SO IT IS CLOSED" CONCLUSION IS WRONG — ACCELERATE TAKES THAT WAY.
 # Counted directly in Accelerate's `libBLAS.dylib` __text (7.65 MB, control: 1981 `ret`), by matching
@@ -1807,9 +1815,35 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # ⚠ AND THE SIZE OF THE GAP IS WITHIN REACH OF THE MEASUREMENT. Deriving the multi-form issue rate from
 # this machine rather than from an assumed clock: the broadcast form measures 262 GF/s and the multi form
 # 131, so 2.05 G instructions per second, 32 Float64 each, which is 525 GB/s — and gemv-T measures 514,
-# 98% of it. Accelerate's 634 GB/s is 21% above that. But that number is a CROSS-RUN comparison: its arm
-# is cached from a different session and the harness itself warns of 5% machine-state drift. Settling
-# whether it really exceeds this instruction's rate needs both arms timed in ONE run.
+# 98% of it.
+#
+# ⛔ SETTLED: ACCELERATE REALLY DOES EXCEED THIS INSTRUCTION'S RATE. Measured in a dedicated process
+# with `VECLIB_MAXIMUM_THREADS=1` set before vecLib initializes, square `BLAS.gemv!('T', ...)`, so no
+# cross-run quotient is involved:
+#
+#     n              256   320   352   384   416   512   640  1024  2048  4096
+#     Accelerate     579   755   820   762   809   593   758   581   150   144  GB/s
+#     this kernel    496   -     -     504   -     507   -     512   136   -
+#
+# It sustains 580-820 GB/s from n=256 to n=1024 against the 549 this instruction allows, so the half-rate
+# multi-by-multi form is not what it runs. Both arms collapse to the DRAM roofline near 145 GB/s at
+# n >= 2048, where this kernel is at parity. The reachable gap is therefore n=256..1024 only.
+#
+# ⛔ AND THE BROADCAST FORM IS UNREACHABLE WITHOUT THE TRANSPOSE — MEASURED. The form itself fits gemv-T
+# if the four vectors of its MULTI operand are 8 rows of four DIFFERENT columns and its SINGLE operand is
+# the matching 8 entries of x: ZA slice j then accumulates column j, and the drain is unchanged. Built
+# and verified to 1e-15, it is LOAD-bound and loses badly, because four columns at 8 rows each is four
+# separate 64 B loads where this kernel issues one contiguous 256 B `ld1.pn.x4`:
+#
+#     n                        128   256   384   512  1024
+#     broadcast, 1 ZA group    319   261   259   256   262  GB/s
+#     broadcast, 4 ZA groups   228   195   216   203   204
+#     this kernel (multi)      353   496   504   507   523
+#
+# More ZA groups make it worse, which is the load port and not the chains. So both ways to the full-rate
+# form are closed: feeding it from ordinary memory is load-bound at ~260 GB/s, and feeding it through a
+# ZA transpose is transpose-bound at ~110 GB/s (above). This kernel's 549 GB/s ceiling stands, and
+# Accelerate's mechanism for exceeding it is NOT identified.
 #
 # ⚠ AND THE MEMORY PATTERN CONTRIBUTES NOTHING — the control that proves it is worth keeping. This
 # kernel reads nc columns of A concurrently in 4L-element chunks, which looks like the obvious suspect
