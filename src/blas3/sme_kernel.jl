@@ -1917,6 +1917,30 @@ function _sme_gemvt_cabi(
             _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
         end
     end
+#
+# ⚠ THE ROW TAIL COSTS 25% AT THE SHAPE A REAL SOLVER ISSUES, AND THE FIX HAS TO BE INSIDE THE COLUMN
+# BLOCK. PureQP's QR working set issues gemv-T at m=629, n=2186 for 90% of its gemv-T work, and
+# 629 % 4L = 21. Measured, n=2186 throughout:
+#
+#     m        608    629    640
+#     m % 4L     0     21      0
+#     GB/s     441    351    424      (ceiling for this instruction is 525)
+#
+# So 21 rows out of 629 — 3.3% of the data — cost 25% of the call. The tail is `_gemv_t_simd!` over a
+# 21 x 2186 block, which is 2186 SHORT dots, one per column, and short-per-column is this kernel's
+# recurring defeat.
+#
+# ⛔ AN OVERLAPPING CHUNK AS A SECOND CALL DOES NOT WORK, and the reason names the real constraint.
+# Covering the tail with one FULL 4L-row chunk at row `m - 4L`, with the already-counted entries of x
+# zeroed in a 4L scratch so the overlap contributes nothing, is CORRECT — verified to 3.9e-16 — and
+# SLOWER: 0.92x at m=629 n=2186, 0.63x at n=160. A second call re-traverses every column and therefore
+# pays n MORE per-column ZA drains, and 2186 extra drains cost more than the short dots they replace.
+#
+# So the overlapping-chunk idea is right but its place is wrong: it belongs INSIDE the row loop, as one
+# extra `fmla` per column reading a zeroed-prefix x scratch, issued before the drain rather than in a
+# second pass. That is one extra chunk per column (about 1.5 us at this shape) against the tail's
+# 7.26 us, which would put the dominant shape near 430 GB/s — past the 411 Accelerate reaches there.
+# It needs an extra pointer argument on the kernel and one unrolled iteration after the row loop.
     # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
     # ONE blocked gemv-T over the whole tail block, not a scalar dot per column. Worth 1-6% and never
     # worse, measured in-session across six shapes: m=1016 n=512 9.89 -> 9.35 us, m=2186 n=629 (a real
