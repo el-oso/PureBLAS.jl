@@ -2780,10 +2780,6 @@ end
     _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_ger_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_dot_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_asum_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_axpy_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_scal_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
@@ -2795,14 +2791,6 @@ elseif _SME_STATIC
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
     _sme_ger_cf() = @cfunction(_sme_ger_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Int, Float64))
-    _sme_dot_cf() = @cfunction(_sme_dot_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
-    _sme_asum_cf() = @cfunction(_sme_asum_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Int))
-    _sme_axpy_cf() = @cfunction(_sme_axpy_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Float64, Int))
-    _sme_scal_cf() = @cfunction(_sme_scal_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Float64, Int))
 else
     # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
     # inference folds it back to the concrete function and walks into the kernel anyway.
@@ -2828,21 +2816,5 @@ else
         gr = Base.inferencebarrier(_sme_ger_cabi)
         return @cfunction($gr, Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Int, Float64))
-    end
-    function _sme_dot_cf()
-        d = Base.inferencebarrier(_sme_dot_cabi)
-        return @cfunction($d, Cvoid, (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
-    end
-    function _sme_asum_cf()
-        e = Base.inferencebarrier(_sme_asum_cabi)
-        return @cfunction($e, Cvoid, (Ptr{Float64}, Ptr{Float64}, Int))
-    end
-    function _sme_axpy_cf()
-        p = Base.inferencebarrier(_sme_axpy_cabi)
-        return @cfunction($p, Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int))
-    end
-    function _sme_scal_cf()
-        r = Base.inferencebarrier(_sme_scal_cabi)
-        return @cfunction($r, Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int))
     end
 end

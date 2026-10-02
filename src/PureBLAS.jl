@@ -24,6 +24,8 @@ include("native.jl")        # bare native API → default backend
 include("workspace.jl")     # L3Workspace: owned per-type Level-3/LAPACK scratch (replaces global caches)
 include("blas3/sme_kernel.jl")    # Level-3 GEMM: Apple SME Float64 path (Float64 only; NEON elsewhere)
 include("blas1/sme_l1.jl")      # BLAS-1 reductions on SME: dot/asum accumulate into ZA
+# MUST follow sme_l1.jl: a constant `@cfunction` binds its callee when the enclosing method is defined.
+include("blas1/sme_l1_cf.jl")   # @cfunction trampolines for the BLAS-1 SME kernels
 include("blas3/gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
 include("blas3/level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
 include("lapack/lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3
