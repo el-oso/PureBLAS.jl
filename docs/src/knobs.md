@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 170 of them.
+Every `@load_preference` key in `src/` — 171 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 22 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 67 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 6 other.
+**Tier:** 80 Derived · 22 Measured · 51 Literal · 18 Exempt.
+**Default form** (mechanical): 68 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 6 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -259,6 +259,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `sme_gemvt_defer_max` | other | Derived | both arms' costs are per column and m-independent, so the crossover is m-independent; measured, the deferred arm wins at every m, so the bound is "always". | candidate, sweep m at fixed n |
 | `sme_gemvt_minm` | literal | Derived | the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | sweep m at fixed n |
 | `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (4,8) |
+| `sme_gemvt_resident_max` | formula | Derived | L2 residency of A, m*n*8 <= 3/4 * _L2_BYTES; the quarter left over is x (re-read per column block), y, the deferred strips and the core's own lines; measured crossover 15 MB of 20. | candidate, sweep m*n at fixed m across _L2_BYTES |
 | `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
 | `sme_ger_minm` | literal | Derived | formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run. | — |
 | `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |

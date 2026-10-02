@@ -1681,6 +1681,163 @@ declare double @llvm.fmuladd.f64(double, double, double)
     return String(take!(io))
 end
 
+# ── gemv-T, DRAM regime: the multi x multi form ─────────────────────────────────────────────────
+#
+# Same traffic, same ZA layout as the N form's mirror: column c owns one vg1x4 group whose four
+# slices are the four row phases, fed by one contiguous `ld1.pn.x4` of A and the multi x multi
+# `fmla.vg1x4` (four vectors by four vectors, one per TWO cycles). That caps it at 525-549 GB/s
+# from L2, where the strided kernel above runs 600-730 — but ONCE A NO LONGER FITS IN L2 THIS LOOP
+# WINS, because it is plain IR: LLVM schedules its loads freely and keeps more of them in flight
+# against DRAM latency, where the asm loop's fixed sequence cannot. Measured in one process, same
+# buffers, medians of three 1-1.5 s windows (N = 4-18k one-call samples), this kernel fused against
+# the strided kernel's deferred arm:
+#
+#     A MB      8    10    12    14    15    16    18    20    24.5   32 (2048^2)   134 (4096^2)
+#     ratio  0.83  0.84  0.89  0.91  1.06  1.03  1.18  1.17   1.10      1.13           1.04
+#
+# `_SME_GEMVT_RESIDENT_MAX` routes on that crossover. Only the fused epilogue exists here: in the
+# DRAM regime the deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
+# ties elsewhere), so there is nothing to defer.
+#
+# ⛔ Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
+# quads instead of one reused quad (verified in the emitted assembly). It measures 1.00x at every
+# size — this core renames the write-after-read away, so the interleaved order costs nothing.
+function _gemvt_mm_ir(nc::Int)
+    nc <= 2 * _SME_L || throw(ArgumentError(
+        "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
+    L = _SME_L
+    q = Char(34)
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
+declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
+
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
+  ret void
+}
+
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  %anyb = icmp sgt i64 %nblk, 0
+  br i1 %anyb, label %blk, label %fin
+
+blk:
+  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
+  %jb = mul nsw i64 %b, $nc
+  %yblk = getelementptr inbounds double, ptr %y, i64 %jb
+  %aoff = mul nsw i64 %jb, %lda
+  %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %anyr = icmp sgt i64 %m, 0
+  br i1 %anyr, label %row, label %tailchk
+
+row:
+  %i = phi i64 [ 0, %blk ], [ %in, %row ]
+  %xp = getelementptr inbounds double, ptr %x, i64 %i
+  %xr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xp)
+  %xv0 = extractvalue $T4 %xr, 0
+  %xv1 = extractvalue $T4 %xr, 1
+  %xv2 = extractvalue $T4 %xr, 2
+  %xv3 = extractvalue $T4 %xr, 3
+""")
+    for c in 0:(nc - 1)
+        println(io, "  %co$c = mul nsw i64 %lda, $c")
+        println(io, "  %cb$c = getelementptr inbounds double, ptr %ablk, i64 %co$c")
+        println(io, "  %ap$c = getelementptr inbounds double, ptr %cb$c, i64 %i")
+        println(io, "  %ar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %ap$c)")
+        for k in 0:3
+            println(io, "  %av$(c)_$k = extractvalue $T4 %ar$c, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+        println(io, "    <vscale x 2 x double> %av$(c)_0, <vscale x 2 x double> %av$(c)_1,")
+        println(io, "    <vscale x 2 x double> %av$(c)_2, <vscale x 2 x double> %av$(c)_3,")
+        println(io, "    <vscale x 2 x double> %xv0, <vscale x 2 x double> %xv1,")
+        println(io, "    <vscale x 2 x double> %xv2, <vscale x 2 x double> %xv3)")
+    end
+    print(io, """
+  %in = add nuw nsw i64 %i, $(4 * L)
+  %rdone = icmp sge i64 %in, %m
+  br i1 %rdone, label %tailchk, label %row
+
+tailchk:
+  %notl = icmp eq ptr %atl, null
+  br i1 %notl, label %rd, label %tail
+
+tail:
+  %atlblk = getelementptr double, ptr %atl, i64 %aoff
+  %xtr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xt)
+  %txv0 = extractvalue $T4 %xtr, 0
+  %txv1 = extractvalue $T4 %xtr, 1
+  %txv2 = extractvalue $T4 %xtr, 2
+  %txv3 = extractvalue $T4 %xtr, 3
+""")
+    # The ragged rows ride in the SAME ZA accumulators as the full-window rows, exactly as in the
+    # strided kernel: one extra 4L-row window per column, `%xt` zero over the overlap.
+    for c in 0:(nc - 1)
+        println(io, "  %tco$c = mul nsw i64 %lda, $c")
+        println(io, "  %tcb$c = getelementptr inbounds double, ptr %atlblk, i64 %tco$c")
+        println(io, "  %tar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %tcb$c)")
+        for k in 0:3
+            println(io, "  %tav$(c)_$k = extractvalue $T4 %tar$c, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_0, <vscale x 2 x double> %tav$(c)_1,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_2, <vscale x 2 x double> %tav$(c)_3,")
+        println(io, "    <vscale x 2 x double> %txv0, <vscale x 2 x double> %txv1,")
+        println(io, "    <vscale x 2 x double> %txv2, <vscale x 2 x double> %txv3)")
+    end
+    print(io, """
+  br label %rd
+
+rd:
+""")
+    for c in 0:(nc - 1)
+        println(io, "  %o$c = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $c)")
+        for k in 0:3
+            println(io, "  %zv$(c)_$k = extractvalue $T4 %o$c, $k")
+        end
+        # The four slice vectors of a group are partial sums of ONE column, so folding them and the
+        # lanes is a reduction of that column's dot product; `reassoc` lets it be a tree.
+        println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
+        println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
+        println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
+        println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
+        println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
+        println(io, "  %yo$c = load double, ptr %yp$c, align 8")
+        println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
+        println(io, "  store double %r$c, ptr %yp$c, align 8")
+    end
+    print(io, """
+  br label %bend
+
+bend:
+  %bn = add nuw nsw i64 %b, 1
+  %bdone = icmp eq i64 %bn, %nblk
+  br i1 %bdone, label %fin, label %blk
+
+fin:
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+
+declare double @llvm.fmuladd.f64(double, double, double)
+""")
+    print(io, _SME_ATTRS)
+    return String(take!(io))
+end
+
 # Column groups in flight: multiples of four, because one strided-register load tuple spans four
 # columns, and bounded above by the vg1x4 groups ZA can address. `_SME_GEMVT_NC` picks one.
 const _SME_GEMVT_NCS = (4, 8)
@@ -1688,6 +1845,8 @@ const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SM
 # Same kernel, epilogue deferred: it stores each column's folded vector into a scratch strip instead
 # of reducing it in streaming mode. See `_SME_GEMVT_DEFER_MAX` for when that is the faster shape.
 const _SME_GEMVT_DEFER_IR = Dict{Int, String}(nc => _gemvt_ir(nc, true) for nc in _SME_GEMVT_NCS)
+# The multi x multi loop for the DRAM regime (`_gemvt_mm_ir`), fused epilogue only.
+const _SME_GEMVT_MM_IR = Dict{Int, String}(nc => _gemvt_mm_ir(nc) for nc in _SME_GEMVT_NCS)
 
 const _SME_GEMVT_ARGT = Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64,
                               Ptr{Float64}, Ptr{Float64}}
@@ -1699,11 +1858,20 @@ for nc in _SME_GEMVT_NCS
     @eval @inline $(Symbol("_sme_gemvtd", nc))(s, a, l, x, m, al, nb, atl, xt) =
         Base.llvmcall(($(_SME_GEMVT_DEFER_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
             s, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
+    @eval @inline $(Symbol("_sme_gemvtm", nc))(y, a, l, x, m, al, nb, atl, xt) =
+        Base.llvmcall(($(_SME_GEMVT_MM_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
+            y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
 end
 
 @inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb, atl, xt)
     nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb, atl, xt)
     return _sme_gemvt8(y, a, l, x, m, al, nb, atl, xt)
+end
+
+# DRAM-regime arm: the multi x multi loop, fused epilogue. Selected by `_SME_GEMVT_RESIDENT_MAX`.
+@inline function _sme_gemvt_mrun(nc::Int, y, a, l, x, m, al, nb, atl, xt)
+    nc == 4 && return _sme_gemvtm4(y, a, l, x, m, al, nb, atl, xt)
+    return _sme_gemvtm8(y, a, l, x, m, al, nb, atl, xt)
 end
 
 # Deferred arm. `s` is the scratch strip, `nb * _SME_L` doubles, NOT y.
@@ -1985,6 +2153,22 @@ const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::I
 # PDM: Derived — both arms' costs are per column and m-independent, so the crossover is m-independent; measured, the deferred arm wins at every m, so the bound is "always". | tune: candidate, sweep m at fixed n
 const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", typemax(Int))::Int
 
+# Bytes of A up to which the strided kernel runs; above it the multi x multi loop (`_gemvt_mm_ir`)
+# does. The criterion is L2 RESIDENCY of the column stream: the strided loop is issue-bound and wins
+# while A is served from L2, and loses once A streams from DRAM, where its fixed asm sequence keeps
+# fewer loads in flight than the IR loop LLVM schedules. A alone does not get the whole L2 — x is
+# re-read per column block, y and the deferred strips are written, and the core keeps other lines —
+# so the crossover sits below the cache size. Measured in one process, same buffers, medians of three
+# 1 s windows (N = 5-52k one-call samples), strided deferred over multi x multi fused, `_L2_BYTES` =
+# 20 MB on the measuring part:
+#
+#     A MB     8.0   10.0   12.0   12.5   14.0   14.0   15.0   15.1   16.0   18.0   20.0   32.0
+#     ratio   1.21   1.19   1.12   1.12   1.09   1.11   1.07   0.94   0.97   0.85   0.85   0.88
+#
+# The transition is at three quarters of L2, and that is the fraction the default carries.
+# PDM: Derived — L2 residency of A, m*n*8 <= 3/4 * _L2_BYTES; the quarter left over is x (re-read per column block), y, the deferred strips and the core's own lines; measured crossover 15 MB of 20. | tune: candidate, sweep m*n at fixed m across _L2_BYTES
+const _SME_GEMVT_RESIDENT_MAX = @load_preference("sme_gemvt_resident_max", (3 * _L2_BYTES) ÷ 4)::Int
+
 # y += alpha*A'x. Columns run on ZA in groups of NC; rows run in 4L-row windows, and a ragged row
 # count is absorbed by one extra overlapping window inside the kernel rather than a separate pass.
 # Only the column tail — under NC whole columns — is scalar.
@@ -2013,7 +2197,9 @@ function _sme_gemvt_cabi(
     nb = (n ÷ nc) * nc                    # columns the kernel covers
     kern = mb > 0 && nb > 0
     if kern
-        defer = mb < _SME_GEMVT_DEFER_MAX
+        # Strided kernel while A is L2-resident, multi x multi loop (fused) once it streams from DRAM.
+        resident = m * n * 8 <= _SME_GEMVT_RESIDENT_MAX
+        defer = resident && mb < _SME_GEMVT_DEFER_MAX
         # Scratch is one block: `nb * _SME_L` deferred-epilogue strips, when that arm runs, followed by
         # the `rb`-element x window the ragged-row chunk reads.
         ns = defer ? nb * _SME_L : 0
@@ -2046,8 +2232,10 @@ function _sme_gemvt_cabi(
                     q = y + j * 8
                     unsafe_store!(q, muladd(alpha, s0 + s1, unsafe_load(q)))
                 end
-            else
+            elseif resident
                 _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+            else
+                _sme_gemvt_mrun(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
             end
         end
     end
