@@ -1491,44 +1491,96 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # ══ gemv-T: y += alpha*A'x ══════════════════════════════════════════════════════════════════════
 #
 # THE TWO FORMS STREAM A IDENTICALLY — column by column, contiguous — and differ only in the
-# arithmetic. gemv-N multiplies a column by a BROADCAST SCALAR and accumulates into a vector
-# (`fmla.single.vg1x4`); gemv-T multiplies a column by a VECTOR and accumulates into a scalar, so it
-# takes the multi-vector `fmla.vg1x4` and reduces at the end. Because the traffic is the same, the
-# bandwidth the N form reaches is available here too, and it is bandwidth that this routine wants:
-# without it gemvT sits at DRAM speed while its operand is in L2.
+# arithmetic. gemv-N multiplies a column by a BROADCAST SCALAR and accumulates into a vector; gemv-T
+# multiplies a column by a VECTOR of x and accumulates into a per-column partial sum that is reduced
+# at the end. Because the traffic is the same, the bandwidth the N form reaches is available here
+# too, and it is bandwidth that this routine wants: without it gemvT sits at DRAM speed while its
+# operand is in L2.
 #
-# `NC` COLUMNS ARE IN FLIGHT AT ONCE, each owning one vg1x4 group of four ZA slices. That buys three
+# THE INNER LOOP IS `fmla.single.vg1x4` FED BY STRIDED-REGISTER LOADS, and that pairing is the whole
+# kernel. The single form multiplies four vectors by ONE vector and issues one per cycle on this unit;
+# the multi x multi `fmla.vg1x4` (four vectors by four vectors) issues one per TWO cycles, which caps
+# any kernel built on it at 525-549 GB/s. The single form fits gemv-T only if its four vectors are
+# the SAME rows of four DIFFERENT columns, with the one vector the matching rows of x — then ZA
+# slice j accumulates column j. Loading that layout vector by vector is four 64-byte loads per
+# `fmla` and measures 256-264 GB/s, load-issue bound. The strided-register multi-vector load
+#
+#     ld1d { z16.d, z20.d, z24.d, z28.d }, pn8/z, [col0]      (one contiguous 256-byte run)
+#     ld1d { z17.d, z21.d, z25.d, z29.d }, pn8/z, [col1]
+#     ld1d { z18.d, z22.d, z26.d, z30.d }, pn8/z, [col2]
+#     ld1d { z19.d, z23.d, z27.d, z31.d }, pn8/z, [col3]
+#
+# reads each column as one 256-byte run and leaves { z16-z19 } holding rows 0-7 of columns 0-3,
+# { z20-z23 } rows 8-15, and so on: the single form's operands, assembled by the load. One load and
+# one `fmla` per 256 bytes of A, both at about one per cycle, and the kernel runs 600-730 GB/s where
+# the multi x multi form ran 490-510. (This is also what Accelerate's dgemv-T hot loop does.)
+#
+# ⛔ THE LOOP IS INLINE ASSEMBLY BECAUSE THE ALLOCATOR CANNOT FORM THOSE TUPLES. LLVM selects the
+# strided load from plain intrinsics (four `ld1.pn.x4` results consumed one element each by
+# `fmla.single.vg1x4`), but with AArch64 subregister-liveness tracking off — LLVM 20's default — it
+# treats each strided tuple as live until its last element is used, sees the contiguous tuple as
+# interfering, and copies three of every four tuples through { z4-z7 }: twelve `mov z` per window,
+# measured 264-285 GB/s for the same instruction sequence. The one fix on the LLVM side is the
+# process-global, experimental `-aarch64-enable-subreg-liveness-tracking=true` (623 GB/s with it),
+# which this package must not impose on every function in a session. Fewer tuples in flight and a
+# reversed `fmla` order measure 272 and the two-vector form 229, so no pure-intrinsic shape reaches
+# the rate. Upstream enables the tracking for streaming functions in LLVM 22; the asm can go once
+# the bundled LLVM has it. The asm block is the row loop ONLY — pointer setup, ZA zero, the drain
+# and the epilogue stay in IR, and the block declares every z and p register and the scratch x
+# registers it touches so nothing of LLVM's is live across it.
+#
+# `NC` COLUMNS ARE IN FLIGHT AT ONCE in quads of four: quad q's four row phases (rows 8k..8k+7 of a
+# 32-row window) own ZA vector groups 4q..4q+3, and slice j of each is column 4q+j. That buys three
 # things at once: `x` is loaded once per 4L rows and reused NC times, the horizontal reduction is
-# paid once per NC columns rather than once per column, and there are 4*NC independent accumulator
-# chains — the quantity the N form measured as decisive (256.7 GB/s at one slice group, 1013 at
-# four). It costs NC concurrent A streams, which is why the widest NC is not the fastest.
+# paid once per NC columns rather than once per column, and there are NC independent accumulator
+# chains. It costs NC concurrent A streams, which is why the widest NC is not the fastest.
 #
 # ACCUMULATES into y, as the N form does, so `beta` is applied by the caller before the call.
 #
-# ⛔ TWO NEUTRAL-OR-WORSE REWRITES OF THIS LOOP, both measured as an in-process A/B against the other:
-#   * Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
-#     quads instead of one reused quad (verified in the emitted assembly). It measures 1.00x at every
-#     size — this core renames the write-after-read away, so the interleaved order costs nothing.
-#   * Folding the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so
-#     CROSSES the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
-#     0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
+# ⛔ A NEUTRAL-OR-WORSE REWRITE OF THE DRAIN, measured as an in-process A/B against the other: folding
+# the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so CROSSES
+# the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
+# 0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
 function _gemvt_ir(nc::Int, defer::Bool)
+    nc % 4 == 0 || throw(ArgumentError(
+        "SME gemv-T: NC=$nc must be a multiple of 4: the strided-register load tuple spans four columns"))
     nc <= 2 * _SME_L || throw(ArgumentError(
         "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
     L = _SME_L
-    q = Char(34)
+    nq = nc ÷ 4
     T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    # One 4L-row window of NC columns. Operands: $0 column block, $1 lda in bytes, $2 x; x9 holds the
+    # row offset in elements, x10 walks the columns, w8/w11 are the ZA group bases 0 and 8.
+    win = String[]
+    push!(win, "mov x10, \$0", "ld1d {z0.d - z3.d}, pn8/z, [\$2, x9, lsl #3]")
+    for qq in 0:(nq - 1)
+        for j in 0:3
+            push!(win, "ld1d {z$(16 + j).d, z$(20 + j).d, z$(24 + j).d, z$(28 + j).d}, pn8/z, [x10, x9, lsl #3]",
+                       "add x10, x10, \$1")
+        end
+        for k in 0:3
+            g = 4qq + k
+            push!(win, "fmla za.d[$(g < 8 ? "w8" : "w11"), $(g % 8), vgx4], {z$(16 + 4k).d - z$(19 + 4k).d}, z$k.d")
+        end
+    end
+    setup = ("ptrue pn8.d", "mov w8, #0", "mov w11, #8", "mov x9, #0")
+    loop = join((setup..., "1:", win..., "add x9, x9, #$(4L)", "cmp x9, \$3", "b.lt 1b"), "\\0A")
+    tailw = join((setup..., win...), "\\0A")
+    # ⚠ The blocks WRITE ZA and the constraint string cannot say so: AArch64 inline asm has no `~{za}`
+    # clobber. Their order against `llvm.aarch64.sme.zero` before them and `read.vg1x4` after them
+    # rests on `sideeffect` plus `~{memory}` here and on those intrinsics being side-effecting calls
+    # themselves — LLVM then keeps all three in program order. Drop `sideeffect` or `~{memory}` and
+    # the zero or the reads may legally move across the loop, and nothing would report it.
+    clob = join(("~{z$i}" for i in 0:31), ",") * "," * join(("~{p$i}" for i in 0:15), ",") *
+           ",~{x8},~{x9},~{x10},~{x11},~{memory},~{cc}"
     io = IOBuffer()
     print(io, """
 declare void @llvm.aarch64.sme.za.enable()
 declare void @llvm.aarch64.sme.za.disable()
 declare void @llvm.aarch64.sme.zero(i32)
-declare target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
-declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)), ptr)
-declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
-  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
-  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
 declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
 declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
 
 define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
@@ -1539,7 +1591,7 @@ define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 
 define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
-  %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
+  %ldab = shl i64 %lda, 3
   %anyb = icmp sgt i64 %nblk, 0
   br i1 %anyb, label %blk, label %fin
 
@@ -1554,32 +1606,8 @@ blk:
   br i1 %anyr, label %row, label %tailchk
 
 row:
-  %i = phi i64 [ 0, %blk ], [ %in, %row ]
-  %xp = getelementptr inbounds double, ptr %x, i64 %i
-  %xr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xp)
-  %xv0 = extractvalue $T4 %xr, 0
-  %xv1 = extractvalue $T4 %xr, 1
-  %xv2 = extractvalue $T4 %xr, 2
-  %xv3 = extractvalue $T4 %xr, 3
-""")
-    for c in 0:(nc - 1)
-        println(io, "  %co$c = mul nsw i64 %lda, $c")
-        println(io, "  %cb$c = getelementptr inbounds double, ptr %ablk, i64 %co$c")
-        println(io, "  %ap$c = getelementptr inbounds double, ptr %cb$c, i64 %i")
-        println(io, "  %ar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %ap$c)")
-        for k in 0:3
-            println(io, "  %av$(c)_$k = extractvalue $T4 %ar$c, $k")
-        end
-        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
-        println(io, "    <vscale x 2 x double> %av$(c)_0, <vscale x 2 x double> %av$(c)_1,")
-        println(io, "    <vscale x 2 x double> %av$(c)_2, <vscale x 2 x double> %av$(c)_3,")
-        println(io, "    <vscale x 2 x double> %xv0, <vscale x 2 x double> %xv1,")
-        println(io, "    <vscale x 2 x double> %xv2, <vscale x 2 x double> %xv3)")
-    end
-    print(io, """
-  %in = add nuw nsw i64 %i, $(4 * L)
-  %rdone = icmp sge i64 %in, %m
-  br i1 %rdone, label %tailchk, label %row
+  call void asm sideeffect "$loop", "r,r,r,r,$clob"(ptr %ablk, i64 %ldab, ptr %x, i64 %m)
+  br label %tailchk
 
 tailchk:
   %notl = icmp eq ptr %atl, null
@@ -1587,59 +1615,51 @@ tailchk:
 
 tail:
   %atlblk = getelementptr double, ptr %atl, i64 %aoff
-  %xtr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xt)
-  %txv0 = extractvalue $T4 %xtr, 0
-  %txv1 = extractvalue $T4 %xtr, 1
-  %txv2 = extractvalue $T4 %xtr, 2
-  %txv3 = extractvalue $T4 %xtr, 3
+  call void asm sideeffect "$tailw", "r,r,r,$clob"(ptr %atlblk, i64 %ldab, ptr %xt)
+  br label %rd
+
+rd:
 """)
     # The ragged rows ride in the SAME ZA accumulators as the full-window rows, so the drain below
     # covers them too — one extra 4L-row window per column instead of a second pass over every
     # column, which would double the per-column drain count. `%xt` carries zeros wherever the window
     # overlaps rows the loop above already accumulated, so the overlap contributes nothing.
-    for c in 0:(nc - 1)
-        println(io, "  %tco$c = mul nsw i64 %lda, $c")
-        println(io, "  %tcb$c = getelementptr inbounds double, ptr %atlblk, i64 %tco$c")
-        println(io, "  %tar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %tcb$c)")
-        for k in 0:3
-            println(io, "  %tav$(c)_$k = extractvalue $T4 %tar$c, $k")
+    #
+    # Drain: column 4q+j is slice j of the four groups 4q..4q+3, one per row phase. The four phases
+    # are partial sums of ONE dot product, so adding them is a reduction and its order is free. They
+    # are folded IN ZA — three group adds, then one group read back per quad — rather than read out
+    # and added in z registers (four reads and twelve `fadd` per quad): ZA is the arithmetic unit on
+    # this part, and the z-register fold measures 0.87-0.90x of this at m=128, 0.95-0.98x at 256-384
+    # and within noise above (in-process A/B, deferred arm).
+    for qq in 0:(nq - 1)
+        for (src, dst) in ((4qq + 1, 4qq), (4qq + 3, 4qq + 2), (4qq + 2, 4qq))
+            println(io, "  %f$(src) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $src)")
+            for k in 0:3
+                println(io, "  %fv$(src)_$k = extractvalue $T4 %f$src, $k")
+            end
+            println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $dst,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_0, <vscale x 2 x double> %fv$(src)_1,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_2, <vscale x 2 x double> %fv$(src)_3)")
         end
-        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
-        println(io, "    <vscale x 2 x double> %tav$(c)_0, <vscale x 2 x double> %tav$(c)_1,")
-        println(io, "    <vscale x 2 x double> %tav$(c)_2, <vscale x 2 x double> %tav$(c)_3,")
-        println(io, "    <vscale x 2 x double> %txv0, <vscale x 2 x double> %txv1,")
-        println(io, "    <vscale x 2 x double> %txv2, <vscale x 2 x double> %txv3)")
-    end
-    print(io, """
-  br label %rd
-
-rd:
-""")
-    for c in 0:(nc - 1)
-        println(io, "  %o$c = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $c)")
-        for k in 0:3
-            println(io, "  %zv$(c)_$k = extractvalue $T4 %o$c, $k")
-        end
-        # The four slice vectors of a group are partial sums of ONE column, so folding them and the
-        # lanes is a reduction of that column's dot product; `reassoc` lets it be a tree rather than
-        # the sequential FADDA, which is the whole point of holding four chains.
-        println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
-        println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
-        println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
-        if defer
-            # DEFERRED: store the folded vector and let the caller sum its lanes outside streaming
-            # mode. `faddv` here is two thirds of the per-column cost (see `_SME_GEMVT_DEFER_MAX`),
-            # and `alpha` is applied by the caller along with the lane sum.
-            println(io, "  %sb$c = mul nsw i64 %jb, $L")
-            println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
-            println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
-            println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
-        else
-            println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
-            println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
-            println(io, "  %yo$c = load double, ptr %yp$c, align 8")
-            println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
-            println(io, "  store double %r$c, ptr %yp$c, align 8")
+        println(io, "  %o$(qq) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $(4qq))")
+        for j in 0:3
+            c = 4qq + j
+            println(io, "  %s$(c)_c = extractvalue $T4 %o$(qq), $j")
+            if defer
+                # DEFERRED: store the folded vector and let the caller sum its lanes outside streaming
+                # mode. `faddv` here is two thirds of the per-column cost (see `_SME_GEMVT_DEFER_MAX`),
+                # and `alpha` is applied by the caller along with the lane sum.
+                println(io, "  %sb$c = mul nsw i64 %jb, $L")
+                println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
+                println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
+                println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
+            else
+                println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
+                println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
+                println(io, "  %yo$c = load double, ptr %yp$c, align 8")
+                println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
+                println(io, "  store double %r$c, ptr %yp$c, align 8")
+            end
         end
     end
     print(io, """
@@ -1661,9 +1681,9 @@ declare double @llvm.fmuladd.f64(double, double, double)
     return String(take!(io))
 end
 
-# Column groups in flight. Bounded above by the vg1x4 groups ZA can address; the useful range is
-# narrower and is chosen per call by `_sme_gemvt_nc`.
-const _SME_GEMVT_NCS = (2, 4, 8)
+# Column groups in flight: multiples of four, because one strided-register load tuple spans four
+# columns, and bounded above by the vg1x4 groups ZA can address. `_SME_GEMVT_NC` picks one.
+const _SME_GEMVT_NCS = (4, 8)
 const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SME_GEMVT_NCS)
 # Same kernel, epilogue deferred: it stores each column's folded vector into a scratch strip instead
 # of reducing it in streaming mode. See `_SME_GEMVT_DEFER_MAX` for when that is the faster shape.
@@ -1682,14 +1702,12 @@ for nc in _SME_GEMVT_NCS
 end
 
 @inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb, atl, xt)
-    nc == 2 && return _sme_gemvt2(y, a, l, x, m, al, nb, atl, xt)
     nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb, atl, xt)
     return _sme_gemvt8(y, a, l, x, m, al, nb, atl, xt)
 end
 
 # Deferred arm. `s` is the scratch strip, `nb * _SME_L` doubles, NOT y.
 @inline function _sme_gemvt_drun(nc::Int, s, a, l, x, m, al, nb, atl, xt)
-    nc == 2 && return _sme_gemvtd2(s, a, l, x, m, al, nb, atl, xt)
     nc == 4 && return _sme_gemvtd4(s, a, l, x, m, al, nb, atl, xt)
     return _sme_gemvtd8(s, a, l, x, m, al, nb, atl, xt)
 end
@@ -1897,8 +1915,16 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 #     NC=8    0.99  2.31  2.78  3.53  1.99
 # Four is the best or within noise of it everywhere, and eight is worse at every size — the extra
 # concurrent A streams cost more than the x traffic they save. So NC is not swept per call.
-# PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (2,4,8)
+# Two is no longer admissible: one strided-register load tuple spans four columns, so NC is a multiple
+# of four (`_SME_GEMVT_NCS`).
+# PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (4,8)
 const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
+# A pinned value outside the candidate set must fail HERE, at load: `_sme_gemvt_run`/`_sme_gemvt_drun`
+# dispatch on NC without a fallback branch, so an unserved value would run the NC=8 kernel while
+# `_sme_gemvt_cabi` sized its blocks and scratch for the pinned one — out-of-bounds stores, silently.
+_SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
+    "preference sme_gemvt_nc=$(_SME_GEMVT_NC) is not one of $(_SME_GEMVT_NCS): the SME gemv-T kernel " *
+    "exists only for those column counts"))
 
 # THE FLOOR IS ON m, NOT ON m*n, and that is the whole difference from the N form's cut. The fixed
 # cost here is per COLUMN — zero ZA, read four slices back, fold — and the work a column does is
@@ -1942,16 +1968,22 @@ const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: fals
 # PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
-# The m below which the deferred epilogue wins. Both what it removes (one `faddv` per column) and what
-# it adds (`_SME_L` doubles of scratch, written then read) are per COLUMN and O(1) in m, so the
-# crossover should not depend on m at all. It does, monotonically, which falsifies that criterion:
+# The m below which the deferred epilogue runs. Both what it removes (one streaming-mode `faddv` per
+# column) and what it adds (`_SME_L` doubles of scratch, written then read) are per COLUMN and O(1)
+# in m, so the choice should not depend on m, and with this kernel it does not: the deferred arm wins
+# at every m, in-process A/B at n=256, same buffers, medians of ~1e4 one-call samples:
 #
-#     m = n      192   256   320   384   448   512   640   768   896  1024  1280
-#     deferred  1.16  1.26  1.25  1.23  1.17  1.17  1.02  1.02  0.94  0.97  0.91
+#     m           512   640   768  1024  1536  2048  3072  4096
+#     fused GB/s  302   367   367   415   469   500   557   582
+#     deferred    520   594   553   573   603   624   642   640
+#     ratio      1.72  1.62  1.51  1.38  1.29  1.25  1.15  1.10
 #
-# so the cut goes at the end of the winning band, below the neutral pair at 640 and 768.
-# PDM: Literal — a falsified-derivation literal: the criterion would be "both costs are per column and m-independent, so the crossover is m-independent", which the table above contradicts. | tune: candidate, sweep m at fixed n
-const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", 640)::Int   # req8-ok: falsified-derivation literal, see table above
+# The ratio falls toward 1 as the per-column cost amortizes over m and has not crossed it by the
+# DRAM regime, so there is no m to cut at: the default admits every m. The fused arm stays as the
+# knob's other setting. A crossover near 640 belongs to a kernel whose `faddv` costs less relative
+# to its stream (the multi x multi form, 490-510 GB/s); do not re-cut this one from that table.
+# PDM: Derived — both arms' costs are per column and m-independent, so the crossover is m-independent; measured, the deferred arm wins at every m, so the bound is "always". | tune: candidate, sweep m at fixed n
+const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", typemax(Int))::Int
 
 # y += alpha*A'x. Columns run on ZA in groups of NC; rows run in 4L-row windows, and a ragged row
 # count is absorbed by one extra overlapping window inside the kernel rather than a separate pass.
