@@ -1345,6 +1345,64 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # So the prize is ~2.4x on every small-n SME call — gemv-N at n=64 gates 0.48 and would gate above 1 —
 # and taking it needs a call that inference cannot resolve at precompile time but `--trim` can resolve
 # at build time. That is a toolchain problem, not a kernel one.
+
+# ── STORE-MODE ROW BLOCK WIDTH: WASTE AGAINST WIDTH ─────────────────────────────────────────────────
+# The overlapping-block scheme below covers a ragged `m` by running the WIDEST block twice, so the rows
+# actually streamed are `ceil(m/rb)*rb` and the redundancy is worst when m sits just above a block
+# boundary. Measured at n=160, store mode, rows actually run against m:
+#
+#     m        512   544   629   700  1024  1100  1536  2048  2186
+#     at rb=512 1.00  1.88  1.63  1.46  1.00  1.40  1.00  1.00  1.17
+#
+# m=629 streams 1024 rows to compute 629. Taking the widest rb unconditionally pays that, and width is
+# not worth 1.6x of redundant work: the same shape at rb=128 runs 1.02x the rows and measures 1.24x
+# faster END TO END through `gemv!`. So the width is chosen to minimise `rows * weight(ng)` instead.
+#
+# The weights are 100/(relative rate) by group count, measured through `_sme_gemv_run` at m=2048,
+# n=160 — a shape with NO overlap waste, so width is the only variable:
+#
+#     ng        1     2     4     8    16
+#     rb       32    64   128   256   512
+#     us    10.28  5.62  3.33  2.86  2.71
+#     weight  379   207   123   106   100
+#
+# That rule reproduces the measured best width at ALL TWELVE m values swept (100, 200, 300, 512, 544,
+# 629, 700, 1024, 1100, 1536, 2048, 2186) — it keeps rb=512 wherever m is a whole number of blocks and
+# narrows only where the waste pays for it. Gains through `gemv!`: 1.18-1.28x for m in 300..700, 1.09x
+# at 1100, and nothing (by construction) at 512, 1024, 1536, 2048.
+# PDM: Measured — relative cost of a row block by group count; it is the rate curve of this kernel's memory-level parallelism and no formula over cache sizes predicts it. | tune: sweep rb at an m with no overlap waste
+const _SME_GEMV_RBW = (379, 207, 123, 106, 100)   # req8-ok: measured rate curve, table above
+
+# Widest-is-not-best: minimise streamed rows weighted by the width's own cost. The widest width stays
+# the DEFAULT and a narrower one has to beat it by a MARGIN. The weights are fitted at one n, and
+# without the margin two near-ties flipped the wrong way and cost 4% each — m=2186 n=629, and square
+# n=2100 where A is past L2 and the wider block streams better than the weights predict.
+@inline function _sme_gemv_store_rb(m::Int)
+    ng = 1
+    while 2 * ng * _SME_GEMV_BLK <= m && 2 * ng <= _SME_GEMV_NGMAX
+        ng *= 2
+    end
+    wide = ng * _SME_GEMV_BLK
+    nbw = m ÷ wide
+    wide_c = (nbw * wide + (nbw * wide < m ? wide : 0)) * _SME_GEMV_RBW[1 + trailing_zeros(ng)]
+    best_rb = wide
+    g = 1
+    i = 1
+    while g <= _SME_GEMV_NGMAX && i <= length(_SME_GEMV_RBW)
+        rb = g * _SME_GEMV_BLK
+        if rb <= m && rb != wide
+            nb = m ÷ rb
+            c = (nb * rb + (nb * rb < m ? rb : 0)) * _SME_GEMV_RBW[i]
+            if c * 10 < wide_c * 9
+                wide_c = c * 10 ÷ 9
+                best_rb = rb
+            end
+        end
+        g <<= 1
+        i += 1
+    end
+    return best_rb
+end
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
@@ -1364,11 +1422,7 @@ function _sme_gemv_cabi(
     # rewritten with the value they already hold. Accumulate mode keeps the ladder, where `m` is a
     # multiple of the block anyway because `_sme_gemv_shape_ok` demands it once beta is nonzero.
     if st
-        ng = 1
-        while 2 * ng * _SME_GEMV_BLK <= m && 2 * ng <= _SME_GEMV_NGMAX
-            ng *= 2
-        end
-        rb = ng * _SME_GEMV_BLK
+        rb = _sme_gemv_store_rb(m)
         nb = m ÷ rb
         if nb > 0
             _sme_gemv_run(rb, y, a, lda, x, n, alpha, nb, true)
