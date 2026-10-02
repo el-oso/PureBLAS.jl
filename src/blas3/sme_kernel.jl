@@ -1849,16 +1849,16 @@ function _sme_gemvt_cabi(
         end
     end
     # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
+    # ONE blocked gemv-T over the whole tail block, not a scalar dot per column. Worth 1-6% and never
+    # worse, measured in-session across six shapes: m=1016 n=512 9.89 -> 9.35 us, m=2186 n=629 (a real
+    # solver shape) 22.62 -> 22.33, m=1000 n=1000 16.83 -> 16.54, m=2100 n=2100 unchanged.
+    # ⚠ AN EARLIER NOTE HERE CALLED THIS NEUTRAL-TO-WORSE. That came from comparing across runs; the
+    # in-session A/B says otherwise. It does NOT recover the whole tail cost — a tail-free m still beats
+    # a ragged one by 6-11% — because most of that is a second strided pass over A, not the arithmetic.
     if mb < m
-        for j in 0:(nb - 1)
-            aj = a + j * lda * 8
-            s = 0.0
-            for i in mb:(m - 1)
-                s = muladd(unsafe_load(aj + i * 8), unsafe_load(x + i * 8), s)
-            end
-            q = y + j * 8
-            unsafe_store!(q, muladd(alpha, s, unsafe_load(q)))
-        end
+        mt = m - mb
+        At = PtrMatrix{Float64}(a + mb * 8, mt, nb, lda)
+        _gemv_t_simd!(mt, nb, alpha, At, x + mb * 8, 1.0, y, Val(false), true)
     end
     # Column tail: whole columns past the last group.
     for j in nb:(n - 1)
