@@ -1268,9 +1268,23 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # under `_SME_GEMV_MINWORK` for a slice of a call that clears it whole, and `m % _SME_GEMV_BLK`
 # flips with the band height. Both are moot under the entry rule above, and neither is worth a route
 # parameter — an unused argument on a hot predicate is not free (see `_trsm!`'s ninth-parameter note).
+# ⚠ THE `m % _SME_GEMV_BLK` TERM WAS A 10x CLIFF ON ACCUMULATE, AND IT IS GONE. It used to read
+# `(m % _SME_GEMV_BLK == 0 || iszero(beta))`, so any `y += A*x` whose row count was not a whole number
+# of blocks left SME entirely for the SIMD path. Measured, m=629 (629 % 32 = 21), beta=1 against beta=0:
+#
+#     n        128     160    2186
+#     beta=0  1.09    1.34   16.06 us   (SME)
+#     beta=1 10.35   13.42   99.42 us   (SIMD)
+#     ratio   9.5x   10.0x    6.2x
+#
+# At m=640 there is no cliff at all (0.99 against 0.91 us), so this was purely the row-count term.
+# The accumulate path never needed it: it uses the DESCENDING LADDER below, which does not overlap, and
+# its scalar row tail accumulates — both already correct for a ragged m. Only STORE mode needs whole
+# blocks, and store mode is the `iszero(beta)` branch that the term already admitted.
+# Found because a real solver (PureQP, a QR working set) issues `y += A*x` at m=629 on nearly every
+# call and was taking the SIMD path on all of them.
 @inline _sme_gemv_shape_ok(m, n, beta) =
-    m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK &&
-        (m % _SME_GEMV_BLK == 0 || iszero(beta))
+    m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK
 
 # The kernel reads y and A as raw column-major Float64 with unit row stride, and x contiguously.
 # ⚠ THIS KERNEL'S RATE IS GOVERNED BY ROWS, NOT BY TOTAL WORK, AND THE FLOOR ABOVE DOES NOT SAY SO.
@@ -1451,8 +1465,9 @@ function _sme_gemv_cabi(
         #
         # Instead run one more full block at `m - BLK`, which recomputes the rows it overlaps. That
         # is only sound in STORE mode, where a row is written with the value it already holds; in
-        # accumulate mode the overlap would add alpha*A*x to those rows twice, which is why
-        # `_sme_gemv_eligible` requires beta == 0 for a shape that is not an exact multiple.
+        # accumulate mode the overlap would add alpha*A*x to those rows twice, so accumulate takes the
+        # SCALAR branch below instead. That branch is what lets `_sme_gemv_shape_ok` admit a ragged m
+        # with beta != 0 at all; requiring an exact multiple there cost 4-7x (see its note).
         if st
             _sme_gemv_run(_SME_GEMV_BLK, y + (m - _SME_GEMV_BLK) * 8,
                           a + (m - _SME_GEMV_BLK) * 8, lda, x, n, alpha, 1, true)
