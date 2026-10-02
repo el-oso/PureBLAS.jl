@@ -1523,12 +1523,12 @@ declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
 declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
 declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
 
-define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) {
-  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk)
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
   ret void
 }
 
-define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) #0 {
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
   %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
@@ -1543,7 +1543,7 @@ blk:
   %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
   call void @llvm.aarch64.sme.zero(i32 255)
   %anyr = icmp sgt i64 %m, 0
-  br i1 %anyr, label %row, label %rd
+  br i1 %anyr, label %row, label %tailchk
 
 row:
   %i = phi i64 [ 0, %blk ], [ %in, %row ]
@@ -1571,7 +1571,39 @@ row:
     print(io, """
   %in = add nuw nsw i64 %i, $(4 * L)
   %rdone = icmp sge i64 %in, %m
-  br i1 %rdone, label %rd, label %row
+  br i1 %rdone, label %tailchk, label %row
+
+tailchk:
+  %notl = icmp eq ptr %atl, null
+  br i1 %notl, label %rd, label %tail
+
+tail:
+  %atlblk = getelementptr double, ptr %atl, i64 %aoff
+  %xtr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xt)
+  %txv0 = extractvalue $T4 %xtr, 0
+  %txv1 = extractvalue $T4 %xtr, 1
+  %txv2 = extractvalue $T4 %xtr, 2
+  %txv3 = extractvalue $T4 %xtr, 3
+""")
+    # The ragged rows ride in the SAME ZA accumulators as the full-window rows, so the drain below
+    # covers them too — one extra 4L-row window per column instead of a second pass over every
+    # column, which would double the per-column drain count. `%xt` carries zeros wherever the window
+    # overlaps rows the loop above already accumulated, so the overlap contributes nothing.
+    for c in 0:(nc - 1)
+        println(io, "  %tco$c = mul nsw i64 %lda, $c")
+        println(io, "  %tcb$c = getelementptr inbounds double, ptr %atlblk, i64 %tco$c")
+        println(io, "  %tar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %tcb$c)")
+        for k in 0:3
+            println(io, "  %tav$(c)_$k = extractvalue $T4 %tar$c, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_0, <vscale x 2 x double> %tav$(c)_1,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_2, <vscale x 2 x double> %tav$(c)_3,")
+        println(io, "    <vscale x 2 x double> %txv0, <vscale x 2 x double> %txv1,")
+        println(io, "    <vscale x 2 x double> %txv2, <vscale x 2 x double> %txv3)")
+    end
+    print(io, """
+  br label %rd
 
 rd:
 """)
@@ -1629,28 +1661,29 @@ const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SM
 # of reducing it in streaming mode. See `_SME_GEMVT_DEFER_MAX` for when that is the faster shape.
 const _SME_GEMVT_DEFER_IR = Dict{Int, String}(nc => _gemvt_ir(nc, true) for nc in _SME_GEMVT_NCS)
 
+const _SME_GEMVT_ARGT = Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64,
+                              Ptr{Float64}, Ptr{Float64}}
+
 for nc in _SME_GEMVT_NCS
-    @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb) =
-        Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid,
-            Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
-            y, a, Int64(l), x, Int64(m), al, Int64(nb))
-    @eval @inline $(Symbol("_sme_gemvtd", nc))(s, a, l, x, m, al, nb) =
-        Base.llvmcall(($(_SME_GEMVT_DEFER_IR[nc]), "entry"), Cvoid,
-            Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
-            s, a, Int64(l), x, Int64(m), al, Int64(nb))
+    @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb, atl, xt) =
+        Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
+            y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
+    @eval @inline $(Symbol("_sme_gemvtd", nc))(s, a, l, x, m, al, nb, atl, xt) =
+        Base.llvmcall(($(_SME_GEMVT_DEFER_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
+            s, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
 end
 
-@inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb)
-    nc == 2 && return _sme_gemvt2(y, a, l, x, m, al, nb)
-    nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb)
-    return _sme_gemvt8(y, a, l, x, m, al, nb)
+@inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb, atl, xt)
+    nc == 2 && return _sme_gemvt2(y, a, l, x, m, al, nb, atl, xt)
+    nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb, atl, xt)
+    return _sme_gemvt8(y, a, l, x, m, al, nb, atl, xt)
 end
 
 # Deferred arm. `s` is the scratch strip, `nb * _SME_L` doubles, NOT y.
-@inline function _sme_gemvt_drun(nc::Int, s, a, l, x, m, al, nb)
-    nc == 2 && return _sme_gemvtd2(s, a, l, x, m, al, nb)
-    nc == 4 && return _sme_gemvtd4(s, a, l, x, m, al, nb)
-    return _sme_gemvtd8(s, a, l, x, m, al, nb)
+@inline function _sme_gemvt_drun(nc::Int, s, a, l, x, m, al, nb, atl, xt)
+    nc == 2 && return _sme_gemvtd2(s, a, l, x, m, al, nb, atl, xt)
+    nc == 4 && return _sme_gemvtd4(s, a, l, x, m, al, nb, atl, xt)
+    return _sme_gemvtd8(s, a, l, x, m, al, nb, atl, xt)
 end
 
 # One scratch strip per thread, grow-only through `_ws_grow!`, so the deferred arm allocates only on a
@@ -1886,69 +1919,75 @@ const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::I
 # PDM: Literal — a falsified-derivation literal: the criterion would be "both costs are per column and m-independent, so the crossover is m-independent", which the table above contradicts. | tune: candidate, sweep m at fixed n
 const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", 640)::Int   # req8-ok: falsified-derivation literal, see table above
 
-# y += alpha*A'x. Bulk columns and whole 4L-row groups run on ZA; the two tails are scalar, and both
-# are bounded: the row tail is under 4L rows of every column, the column tail under NC whole columns.
+# y += alpha*A'x. Columns run on ZA in groups of NC; rows run in 4L-row windows, and a ragged row
+# count is absorbed by one extra overlapping window inside the kernel rather than a separate pass.
+# Only the column tail — under NC whole columns — is scalar.
+#
+# ⚠ THE RAGGED ROWS MUST STAY INSIDE THE COLUMN BLOCK. A separate pass over the leftover rows is a
+# gemv-T of its own over a (m mod 4L) x n block, i.e. n SHORT dots, and short-per-column is this
+# kernel's worst shape. At the dominant shape of a real QR solve (m=629, n=2186; 629 mod 4L = 21) the
+# 21 leftover rows are 3.3% of the data and cost 25% of the call:
+#
+#     m        608    629    640
+#     m % 4L     0     21      0
+#     GB/s     441    351    424      (this instruction's issue-rate ceiling is 525)
+#
+# ⛔ THE OVERLAPPING WINDOW AS A SECOND CALL IS CORRECT BUT SLOWER — do not reintroduce it. Calling the
+# kernel again for one window at row `m - 4L`, x zeroed over the overlap, verifies to 3.9e-16 and
+# measures 0.92x at m=629 n=2186 and 0.63x at n=160: a second call re-traverses every column and so
+# pays n more per-column ZA drains, which outweigh the short dots it removes. Inside the row loop the
+# same window costs one `fmla` per column and no extra drain.
 function _sme_gemvt_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64
     )
     nc = _SME_GEMVT_NC
     rb = 4 * _SME_L
-    mb = (m ÷ rb) * rb                    # rows the kernel covers
+    mb = (m ÷ rb) * rb                    # rows the kernel's row loop covers
     nb = (n ÷ nc) * nc                    # columns the kernel covers
-    if mb > 0 && nb > 0
-        if mb < _SME_GEMVT_DEFER_MAX
-            # Deferred epilogue: the kernel writes one `_SME_L`-lane strip per column into scratch and
-            # the lane sums, with alpha, are applied here — outside streaming mode.
-            scr = _ws_grow!(_SME_GEMVT_SCR(), nb * _SME_L)
-            GC.@preserve scr begin
-                _sme_gemvt_drun(nc, pointer(scr), a, lda, x, mb, alpha, nb ÷ nc)
-            end
-            @inbounds for j in 0:(nb - 1)
-                b = j * _SME_L
-                s0 = 0.0; s1 = 0.0
-                for k in 1:2:_SME_L
-                    s0 += scr[b + k]; s1 += scr[b + k + 1]
+    kern = mb > 0 && nb > 0
+    if kern
+        defer = mb < _SME_GEMVT_DEFER_MAX
+        # Scratch is one block: `nb * _SME_L` deferred-epilogue strips, when that arm runs, followed by
+        # the `rb`-element x window the ragged-row chunk reads.
+        ns = defer ? nb * _SME_L : 0
+        scr = _ws_grow!(_SME_GEMVT_SCR(), ns + rb)
+        GC.@preserve scr begin
+            atl = Ptr{Float64}(C_NULL)
+            xt = Ptr{Float64}(C_NULL)
+            if mb < m
+                # The chunk is a WHOLE rb-row window ending at row m, so it re-reads the `rb - (m - mb)`
+                # rows the loop already accumulated; zeroing those entries of x makes them contribute
+                # nothing. Requires m >= rb, which `_SME_GEMVT_MINM` guarantees.
+                r0 = m - rb
+                ndone = mb - r0
+                @inbounds for k in 1:rb
+                    scr[ns + k] = k <= ndone ? 0.0 : unsafe_load(x + (r0 + k - 1) * 8)
                 end
-                q = y + j * 8
-                unsafe_store!(q, muladd(alpha, s0 + s1, unsafe_load(q)))
+                atl = a + r0 * 8
+                xt = pointer(scr, ns + 1)
             end
-        else
-            _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
+            if defer
+                # Deferred epilogue: the kernel writes one `_SME_L`-lane strip per column into scratch
+                # and the lane sums, with alpha, are applied here — outside streaming mode.
+                _sme_gemvt_drun(nc, pointer(scr), a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+                @inbounds for j in 0:(nb - 1)
+                    b = j * _SME_L
+                    s0 = 0.0; s1 = 0.0
+                    for k in 1:2:_SME_L
+                        s0 += scr[b + k]; s1 += scr[b + k + 1]
+                    end
+                    q = y + j * 8
+                    unsafe_store!(q, muladd(alpha, s0 + s1, unsafe_load(q)))
+                end
+            else
+                _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+            end
         end
     end
-#
-# ⚠ THE ROW TAIL COSTS 25% AT THE SHAPE A REAL SOLVER ISSUES, AND THE FIX HAS TO BE INSIDE THE COLUMN
-# BLOCK. PureQP's QR working set issues gemv-T at m=629, n=2186 for 90% of its gemv-T work, and
-# 629 % 4L = 21. Measured, n=2186 throughout:
-#
-#     m        608    629    640
-#     m % 4L     0     21      0
-#     GB/s     441    351    424      (ceiling for this instruction is 525)
-#
-# So 21 rows out of 629 — 3.3% of the data — cost 25% of the call. The tail is `_gemv_t_simd!` over a
-# 21 x 2186 block, which is 2186 SHORT dots, one per column, and short-per-column is this kernel's
-# recurring defeat.
-#
-# ⛔ AN OVERLAPPING CHUNK AS A SECOND CALL DOES NOT WORK, and the reason names the real constraint.
-# Covering the tail with one FULL 4L-row chunk at row `m - 4L`, with the already-counted entries of x
-# zeroed in a 4L scratch so the overlap contributes nothing, is CORRECT — verified to 3.9e-16 — and
-# SLOWER: 0.92x at m=629 n=2186, 0.63x at n=160. A second call re-traverses every column and therefore
-# pays n MORE per-column ZA drains, and 2186 extra drains cost more than the short dots they replace.
-#
-# So the overlapping-chunk idea is right but its place is wrong: it belongs INSIDE the row loop, as one
-# extra `fmla` per column reading a zeroed-prefix x scratch, issued before the drain rather than in a
-# second pass. That is one extra chunk per column (about 1.5 us at this shape) against the tail's
-# 7.26 us, which would put the dominant shape near 430 GB/s — past the 411 Accelerate reaches there.
-# It needs an extra pointer argument on the kernel and one unrolled iteration after the row loop.
-    # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
-    # ONE blocked gemv-T over the whole tail block, not a scalar dot per column. Worth 1-6% and never
-    # worse, measured in-session across six shapes: m=1016 n=512 9.89 -> 9.35 us, m=2186 n=629 (a real
-    # solver shape) 22.62 -> 22.33, m=1000 n=1000 16.83 -> 16.54, m=2100 n=2100 unchanged.
-    # ⚠ AN EARLIER NOTE HERE CALLED THIS NEUTRAL-TO-WORSE. That came from comparing across runs; the
-    # in-session A/B says otherwise. It does NOT recover the whole tail cost — a tail-free m still beats
-    # a ragged one by 6-11% — because most of that is a second strided pass over A, not the arithmetic.
-    if mb < m
+    # Row tail for the kernel's columns, used only when the kernel did not run at all (m below one
+    # row window, or n below one column group). When it did, the ragged rows rode in its accumulators.
+    if !kern && mb < m && nb > 0
         mt = m - mb
         At = PtrMatrix{Float64}(a + mb * 8, mt, nb, lda)
         _gemv_t_simd!(mt, nb, alpha, At, x + mb * 8, 1.0, y, Val(false), true)
