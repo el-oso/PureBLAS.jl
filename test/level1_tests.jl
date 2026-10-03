@@ -483,15 +483,31 @@ end
         P.set_num_threads(nt)
         p = P._gemm_pool(Float64)
         ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        n = 2 * nt * P._red_block(Float64) + 3
+        # SIZE FROM BOTH CONSTANTS THAT GATE THREADING, or this witness and the two items below it
+        # prove nothing. `_red_block` only buys enough blocks to divide between workers; `_l1_workers`
+        # refuses to thread at all below `_L1_MT_MIN` bytes, and that floor scales with the machine.
+        # On an M6 it is 512 KB against the 128 KB `_red_block` alone picks, so every op here declined
+        # the pool: this item failed six of seven assertions there while passing in CI, and the
+        # lost-claim and allocation items below PASSED VACUOUSLY on a path that never threaded.
+        # Single-stream ops (asum, nrm2, scal!, blascopy!) set the requirement; two-stream ones clear
+        # it with room to spare.
+        n = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
         x = randn(n); y = randn(n)
-        @test ran(() -> P.dot(x, y))
-        @test ran(() -> P.asum(x))
-        @test ran(() -> P.nrm2(x))
-        @test ran(() -> P.axpy!(copy(y), 0.75, x))
-        @test ran(() -> P.scal!(2.5, copy(x)))
-        @test ran(() -> P.blascopy!(similar(y), x))
-        @test ran(() -> P.swap!(copy(x), copy(y)))
+        # AN SME-ELIGIBLE CALL MUST DECLINE THE POOL, so assert the route rather than assuming the
+        # pool always wins. `blas1/level1.jl` takes the SME path BEFORE the pool is consulted, and
+        # deliberately: the matrix unit is shared by the cluster, so splitting a call that could own
+        # it loses — 503 GFLOP/s owned against 177 threaded-NEON at n=4096 on an M6. The four ops with
+        # an SME route therefore use the pool exactly when SME declines them, and the three without
+        # one always use it. Off SME hardware every predicate is false and all seven thread, which is
+        # the arrangement CI sees.
+        pooled(f, sme) = ran(f) == !sme
+        @test pooled(() -> P.dot(x, y),               P._sme_dot_ok(Float64, n, x, y))
+        @test pooled(() -> P.asum(x),                 P._sme_asum_ok(Float64, n, x))
+        @test pooled(() -> P.nrm2(x),                 false)
+        @test pooled(() -> P.axpy!(copy(y), 0.75, x), P._sme_axpy_ok(Float64, n, x, y))
+        @test pooled(() -> P.scal!(2.5, copy(x)),     P._sme_scal_ok(Float64, n, x))
+        @test pooled(() -> P.blascopy!(similar(y), x), false)
+        @test pooled(() -> P.swap!(copy(x), copy(y)), false)
         P.set_num_threads(1)
     end
 end
@@ -508,7 +524,7 @@ end
     if nt < 2
         @test_skip "needs >=2 julia threads"
     else
-        n = 2 * nt * P._red_block(Float64) + 3
+        n = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
         xs = [randn(n) for _ in 1:(4 * nt)]
         P.set_num_threads(1)
         want = [P.dot(xs[i], xs[i]) for i in eachindex(xs)]
@@ -546,7 +562,7 @@ end
         @test_skip "needs >=2 julia threads"
     else
         P.set_num_threads(nt)
-        n = 2 * nt * P._red_block(Float64) + 3
+        n = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
         x = randn(n); y = randn(n)
         a_dot(u, v) = @allocated P.dot(u, v)
         a_asum(u) = @allocated P.asum(u)
