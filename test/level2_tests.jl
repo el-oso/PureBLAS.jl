@@ -378,3 +378,105 @@ end
         P.set_num_threads(1)
     end
 end
+
+# ── req#11 FOR gemv-N: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# UNLIKE ger, THIS ONE IS A REAL CORRECTNESS GATE, and the sizes are chosen to make it bite. gemv-N
+# splits ROWS, and two of its route decisions are keyed on the A byte count `m * n * sizeof(T)`:
+#
+#   * `_gemvn_minner() && m*n*sizeof(T) <= _GEMVN_MINNER_MAXA` picks between the minner driver (panel
+#     width from `_gemvn_minner_np`) and the old one (a flat `_GEMV_NP`). Different column chunking,
+#     so each `y[i]` accumulates its n-chain in a different ORDER.
+#   * inside minner, `_gemvn_minner_np` itself flips NARROW/WIDE at `2 * _L2_BYTES` — again a panel
+#     width, again the n-chain's grouping.
+#
+# A row band holds 1/nw of the bytes, so without the `mroute` token a worker flips either predicate
+# and returns different bits from the undivided problem. The two "flip" sizes below sit JUST ABOVE
+# each threshold, so the whole problem is on one side and every band is on the other — which is
+# exactly the case that fails if the token is dropped. The row-block size is there because
+# `n <= _gemvn_rb()` is keyed on `n`, which a row split does NOT move: it must keep working, and
+# `_gemvn_rowblock_mr` picking a different block height per band must stay bit-neutral.
+#
+# β is swept because each band pre-scales its OWN rows. Two workers double-scaling, or a band
+# skipping the scale, shows up here and nowhere else.
+@testitem "gemv-N: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            sz = sizeof(T)
+            # Just past `2 * _L2_BYTES` with a modest `n`, so the undivided problem is WIDE and every
+            # band is NARROW.
+            n_np = 160
+            m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
+            # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
+            # every band would re-enter it. One allocation of a little over 4·L3 is the price of
+            # covering this predicate at all; there is no smaller shape that straddles it.
+            n_mx = 1024
+            m_mx = (P._GEMVN_MINNER_MAXA ÷ (n_mx * sz)) + 64
+            cases = (
+                ("rowblock n<=rb", 8192, min(64, P._gemvn_rb())),
+                ("np narrow/wide flip", m_np, n_np),
+                ("minner/paneldrv flip", m_mx, n_mx),
+            )
+            @testset "$nm m=$m n=$n" for (nm, m, n) in cases
+                A = randn(T, m, n)
+                x = randn(T, n)
+                y0 = randn(T, m)
+                α = T(0.75)                                  # NOT a power of two
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness plus the lost-claim path, as for ger. The extra assertion here is that `trmv` must NOT
+# reach the pool: `_tri_scat!` calls `_gemv_n_paneldrv!` directly precisely so the `_TRMV_ACC*` and
+# `_TRSV_*` per-thread owners in `test/perthread_lint_baseline.txt` stay un-forked, and that
+# justification is now load-bearing rather than incidental.
+@testitem "gemv-N: the pool runs, trmv stays out of it, and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        m, n = 8192, 512
+        A = randn(m, n); x = randn(n); y0 = randn(m)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5))
+        # trmv over a matrix big enough that a threaded gemv-N WOULD have been admitted. If this ever
+        # reports true, the four per-thread baseline entries lost their justification.
+        Tri = randn(2048, 2048) + 2048I
+        v = randn(2048)
+        @test !ran(() -> P.trmv!(Tri, copy(v)))
+        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach the
+        # same route as the winner's chunks.
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end

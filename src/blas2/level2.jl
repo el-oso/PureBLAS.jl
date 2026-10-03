@@ -519,10 +519,19 @@ end
     return
 end
 
-@inline function _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
+@inline _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Val{B0}) where {T <: BlasReal, B0} =
+    _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, b0, m)
+
+# `mroute` is the UNDIVIDED row count, and here it is a req#11 REQUIREMENT rather than a tuning
+# nicety. `_gemvn_minner_np` returns the PANEL WIDTH — the number of columns that share one pass —
+# so it re-chunks the n-chain, and a row-band worker seeing 1/nw of the bytes would pick a different
+# width and accumulate each `y[i]` in a different order. Row-band callers pass the whole `m`.
+@inline function _gemv_n_paneldrv_minner!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+    ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
-        np = _gemvn_minner_np(m, n, lda, T)      # regime-selected panel width (consts → Val below is static)
+        np = _gemvn_minner_np(mroute, n, lda, T) # regime-selected panel width (consts → Val below is static)
         i0 = 0
         while i0 < m
             mb = min(_gemvn_mb(), m - i0)
@@ -549,7 +558,28 @@ end
     return y
 end
 
-@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
+# THE PUBLIC gemv-N DISPATCHER, and the threading seam. Threading belongs HERE and not one level down
+# in `_gemv_n_paneldrv!`, because `_tri_scat!` — the trmv/trsv scatter — calls that driver DIRECTLY to
+# dodge the row-block path and the kwarg layer. Four `test/perthread_lint_baseline.txt` entries
+# (`_TRSV_RRCP*`, `_TRSV_RCP*`, `_TRMV_ACC*`) are justified by exactly that: "`_tri_scat!` reaches
+# `_sme_gemv!` or `_gemv_n_paneldrv!` DIRECTLY, not the public `gemv!`, and neither those kernels nor
+# anything else in blas2/level2.jl forks a task." Putting the pool in the paneldrv would make those
+# per-thread owners reachable across a fork and silently invalidate all four. The cost is that
+# trmv/trsv do NOT inherit gemv-N's threading; that is the trade, and it is deliberate.
+@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Val{B0}) where {T <: BlasReal, B0}
+    nw = _gemvn_workers(m, n, T)
+    if nw > 1
+        GC.@preserve A x y _gemvn_threaded!(
+            m, n, α, pointer(A), stride(A, 2), _ptr(x), _ptr(y), β, B0, nw
+        )
+        return y
+    end
+    return _gemv_n_simd!(m, n, α, A, x, y, β, b0, m)
+end
+
+@inline function _gemv_n_simd!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+    ) where {T <: BlasReal, B0}
     if n <= _gemvn_rb()
         # Per-call row-block height (see `_gemvn_rowblock_mr`). A pin disables the derivation, and
         # `isnothing(_GEMV_MR_PREF)` is a load-time const so the pinned build folds this away and
@@ -569,8 +599,11 @@ end
         else
             _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(_GEMV_MR))
         end
-    elseif _gemvn_minner() && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
-        _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
+    # `mroute`, NOT `m`: this predicate selects between two drivers whose n-chunking differs — minner
+    # uses `_gemvn_minner_np` columns per panel, the old path a flat `_GEMV_NP` — so a row band that
+    # flipped it would accumulate `y[i]` in a different order. req#11, not tuning.
+    elseif _gemvn_minner() && mroute * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
+        _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0), mroute)
     else
         _gemv_n_paneldrv!(m, n, α, A, x, y, β, Val(B0))
     end

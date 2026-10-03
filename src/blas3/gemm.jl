@@ -4002,6 +4002,12 @@ const _MT_KIND_IAMAX = 13
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GER = 14
+# gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in their
+# natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read, not
+# written, which is a slot convention and not a claim about the op.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GEMVN = 15
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4049,8 +4055,34 @@ blocks leaves some of them with nothing to do and the join waits for a round tri
 nothing.
 """
 @inline function _ger_workers(m::Int, n::Int, ::Type{T}) where {T}
+    # THE EARLY-OUTS COME BEFORE THE DIVIDE, for the reason `_gemm_workers` records: this sits on the
+    # entry of every `ger`, including the ones that take tens of nanoseconds, and `cld` is a ~20-40
+    # cycle integer divide. One atomic read ends it on a single-threaded process, and `_l1_workers`
+    # itself reaches a decision with multiplies and compares only.
+    _MT_NTHREADS[] > 1 || return 1
     nw = _l1_workers(2 * m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
     return max(1, min(nw, cld(n, _NR)))
+end
+
+"""
+    _gemvn_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a row-band `gemv-N`. A is read once and dominates the traffic — `x` is one vector of
+`n` and `y` one of `m` beside an m×n matrix — so its byte count is the admission floor's input.
+
+Capped by the number of whole ROW BLOCKS, because a band shorter than one `_GEMV_MR`-high block runs
+entirely in the masked remainder kernel: the band would be all tail and no body, which is the shape
+`_gemvn_rowblock_mr` exists to avoid. `min` with 0 is why the `max(1, …)` is there.
+"""
+@inline function _gemvn_workers(m::Int, n::Int, ::Type{T}) where {T}
+    # Early-outs before the divide, and here it matters more than for `ger`: LAPACK panel loops call
+    # `gemv` thousands of times on shapes far too small to thread, so the declining path must cost one
+    # atomic read and a few multiplies. Same discipline as `_gemm_workers`.
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, m ÷ (_GEMV_MR * _vwidth(T))))
 end
 
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
@@ -4125,6 +4157,7 @@ end
     p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
     p.kind == _MT_KIND_IAMAX && return _iamax_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4427,6 +4460,31 @@ end
         p.m, len, p.alpha, p.Ap, p.Bp + j0 * sz,
         PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc), p.n
     )
+    return nothing
+end
+
+# gemv-N over this worker's ROW BAND. A row band of a column-major matrix is a pointer bump and
+# nothing else — the leading dimension is unchanged — so the band is a `PtrMatrix` over the same
+# storage. `x` is whole, because every row needs all of it; `y` is offset, and each `y[i]` keeps its
+# entire n-chain on one worker, so there is no partial to fold and nothing to combine after the join.
+#
+# β IS THE BAND'S OWN, and that is safe without any extra care because both panel drivers pre-scale
+# the y-block they are about to accumulate into, right where they start. Two workers therefore cannot
+# double-scale: each one touches only its own rows.
+#
+# `p.m` is the route token, and `p.up` carries `B0` — see `_gemvn_threaded!` for why it is passed
+# rather than re-derived from `β`.
+@noinline function _gemvn_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Ab = PtrMatrix{T}(p.Cp + i0 * sz, len, p.n, p.ldc)
+    yb = p.Bp + i0 * sz
+    if p.up
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(true), p.m)
+    else
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(false), p.m)
+    end
     return nothing
 end
 
@@ -4782,6 +4840,14 @@ end
             # so it reaches the same arm the winner's chunks reach — they route from `p.n`, which is
             # this `C.n`.
             _ger_simd!(C.m, C.n, alpha, A.ptr, B.ptr, C, C.n)
+        elseif kind == _MT_KIND_GEMVN
+            # A loser does the whole gemv-N itself, so its own row count IS the route width and it
+            # reaches the arm the winner's chunks reach — they route from `p.m`, which is this `C.m`.
+            # `C` is the matrix for this kind, hence its appearance in the operand position, and `up`
+            # is `B0`, read here from the argument rather than the pool because nothing was published.
+            up ?
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(true), C.m) :
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(false), C.m)
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -5081,6 +5147,23 @@ end
     _gemm_threaded!(
         PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
         α, zero(T), false, false, false, false, nw, _MT_KIND_GER
+    )
+    return nothing
+end
+
+# gemv-N: `C` is the m×n matrix, `A` is x (length n) and `B` is y (length m).
+#
+# `B0` RIDES IN THE `up` FIELD rather than being re-derived from `β`. At the public entry B0 is always
+# `iszero(β)`, so a chunk could infer it — but that is an invariant held by one caller rather than by
+# the data, and `up` is already an unused Bool for this kind. Carrying it explicitly means a future
+# caller that pairs `Val(true)` with a nonzero β gets the same answer threaded as serially instead of
+# a silently different one.
+@noinline function _gemvn_threaded!(
+        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, m, 1, m),
+        α, β, false, false, false, false, nw, _MT_KIND_GEMVN, b0
     )
     return nothing
 end
