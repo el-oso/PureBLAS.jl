@@ -1549,7 +1549,7 @@ const _IAMAX_NB_STREAM = 4
 #   * WALK is unchanged: per block, guarded by its own recomputed unordered test, then a strict `>` scan
 #     lane 1..W in block order 0..NB-1, so first-occurrence on ties holds and NaN is skipped by `>`.
 #     Recomputing the guard against an ALREADY-UPDATED `thr` mid-walk can only skip more blocks.
-@generated function _iamax_tree!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
+@generated function _iamax_tree!(::Val{NB}, n::Int, xp::Ptr{T}, seed::T) where {NB, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     vs = [Symbol(:v, j) for j in 0:(NB - 1)]
     loads = [:($(vs[j + 1]) = abs(vload($V, xp + (o + $(j * W)) * $sz))) for j in 0:(NB - 1)]
@@ -1592,7 +1592,11 @@ const _IAMAX_NB_STREAM = 4
     return quote
         $(Expr(:meta, :inline))
         step = $(NB * W)
-        gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = $V(gmax); o = 0
+        # `bi = 0` means NOTHING in this range strictly exceeded `seed`. The caller supplies the seed
+        # and interprets the zero; `_iamax_simd!` passes |x[1]| and maps 0 back to 1, which is the
+        # netlib contract. A blocked caller passes the WHOLE vector's |x[1]| to every block, so a
+        # block that finds nothing better is simply skipped by the fold.
+        gmax = seed; bi = 0; thr = $V(seed); o = 0
         @inbounds while o + step <= n
             $(loads...)
             m = $tree                                  # log-depth vmaxpd fold, NO masks
@@ -1619,7 +1623,7 @@ const _IAMAX_NB_STREAM = 4
     end
 end
 
-@generated function _iamax_thresh!(::Val{NB}, n::Int, xp::Ptr{T}) where {NB, T <: BlasReal}
+@generated function _iamax_thresh!(::Val{NB}, n::Int, xp::Ptr{T}, seed::T) where {NB, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     vs = [Symbol(:v, j) for j in 0:(NB - 1)]
     cs = [Symbol(:c, j) for j in 0:(NB - 1)]
@@ -1664,7 +1668,10 @@ end
         # accounted for up front instead of via the first compare — and it can only REDUCE cold-path entries,
         # since the starting threshold is now a real element rather than typemin.
         # `_iamax_simd_try` gates on n >= 4W, so x[1] always exists here.
-        gmax = abs(unsafe_load(xp, 1)); bi = 1; thr = $V(gmax); o = 0
+        # The seed is the CALLER's, for the reason given at `_iamax_tree!`: `bi = 0` reports "nothing
+        # here beat the seed", which is what lets a blocked caller seed every block from the whole
+        # vector's |x[1]| and keep these semantics exactly.
+        gmax = seed; bi = 0; thr = $V(seed); o = 0
         @inbounds while o + step <= n                 # dependency-free: NB independent compares vs `thr`
             $(loads...)
             # FALSIFIED 2026-07-31: rescanning ONLY the blocks whose mask is non-empty via a small closure
@@ -1799,15 +1806,101 @@ const _IAMAX_NB_TREE = clamp(8 * _CACHELINE ÷ _SIMD_BYTES, 4, _NVREG ÷ 4)
 # flight, 16 vectors on this ISA, which leaves 18 of 32 NEON registers live counting the root and
 # `thr`. `_IAMAX_NB_TREE` clamps to `_NVREG ÷ 4`, a bound written for AVX-512's register budget that
 # costs width here for no reason this ISA has.
-@inline _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal} =
+#
+# `nroute` IS THE ROUTE TOKEN, and it is separate from `n` for the same reason `_gemm_core!` carries
+# one: the three arms below are keyed on a working-set size, so a caller holding a BLOCK of a longer
+# vector would pick a different arm than the undivided problem does. The arms do not all agree on
+# NaN-free data either — the threshold form is the past-L2 winner and the tree form is not — so a
+# block-keyed route would both change the answer's provenance and throw away the arm the size was
+# supposed to select. Blocked callers pass the whole vector's length here and the block's length as
+# `n`; `_iamax_simd!` passes the same value twice, which is the undivided case.
+@inline _iamax_route!(nroute::Int, n::Int, xp::Ptr{T}, seed::T) where {T <: BlasReal} =
     _SIMD_BYTES >= 32 ?
     (
-        n * sizeof(T) <= _L1_BYTES ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
-        n * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp) :
-        _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp)
+        nroute * sizeof(T) <= _L1_BYTES ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp, seed) :
+        nroute * sizeof(T) <= _L2_BYTES ? _iamax_tree!(Val(_IAMAX_NB_TREE), n, xp, seed) :
+        _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, xp, seed)
     ) :
-    Sys.ARCH === :aarch64 ? _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp) :
-    _iamax_chain4!(n, xp)
+    _iamax_tree!(Val(_IAMAX_NB_RESIDENT), n, xp, seed)
+
+# The netlib entry: seed from |x[1]| and map "nothing beat the seed" back to index 1. Element 1 is
+# accounted for by the seed rather than by a first compare, so a NaN at position 1 makes every later
+# compare false and 1 is returned — see the note at `_iamax_thresh!` for why that is required.
+@inline function _iamax_simd!(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    (_SIMD_BYTES < 32 && Sys.ARCH !== :aarch64) && return _iamax_chain4!(n, xp)
+    v = _iamax_route!(n, n, xp, abs(unsafe_load(xp, 1)))
+    return iszero(v) ? 1 : v
+end
+
+"""
+    _iamax_blocked_serial(n, xp) -> Int
+
+`iamax` over the same fixed block grid `_dot_blocked` uses, folded in block order. Bit-identical to
+the threaded path at any worker count, and — unlike the reductions — also to the UNBLOCKED kernel,
+because an argmax fold loses no precision.
+
+WHY EVERY BLOCK IS SEEDED FROM THE SAME `g = |x[1]|`, which is the whole trick. Netlib's scan starts
+its running maximum at `|x[1]|` and only ever advances it on a strict `>`. A block seeded from `g`
+reports the index of its own maximum when that maximum exceeds `g`, and 0 otherwise; the fold then
+advances across blocks on a strict `>`, in block order. A block may therefore propose a candidate
+that an earlier block has already beaten — the fold rejects it, exactly as the sequential scan's
+higher running maximum would have. Ties resolve to the lower index at both levels: inside a block by
+the kernel's strict-`>` lane walk, across blocks by the fold's strict `>`.
+
+Seeding each block from its OWN first element instead would be wrong, and silently: a block whose
+first element is NaN would report that element with a NaN maximum, the fold would reject it on the
+unordered compare, and a genuine maximum later in that block would be lost. Seeding from `g` keeps
+netlib's NaN contract whole — a NaN anywhere but position 1 is skipped by `>`, and a NaN AT position
+1 makes `g` itself NaN so every block reports 0 and the answer is 1.
+"""
+@inline function _iamax_blocked_serial(n::Int, xp::Ptr{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _iamax_simd!(n, xp)        # one block: the unchanged kernel, no fold at all
+    g = abs(unsafe_load(xp, 1))
+    best = g; bi = 1; sz = sizeof(T); off = 0
+    while off < n
+        len = min(B, n - off)
+        v = _iamax_route!(n, len, xp + off * sz, g)
+        if !iszero(v)
+            a = abs(unsafe_load(xp, off + v))   # the block's maximum; reloading it is exact
+            a > best && (best = a; bi = off + v)
+        end
+        off += len
+    end
+    return bi
+end
+
+# THE POOL RETURNS `T`, so the winning index travels home as a float and has to round-trip exactly.
+# `maxintfloat` is that bound: 2^53 for Float64, which no vector reaches, and 2^24 = 16777216 for
+# Float32, which a 64 MB vector does. Past it the blocked SERIAL path still runs, so the cap costs
+# correctness nothing — it only declines the pool.
+@inline _iamax_mt_nmax(::Type{T}) where {T <: BlasReal} = Int(maxintfloat(T))
+
+"""
+    _iamax_blocked(n, x, ::Type{T}) -> Int
+
+Threading entry for `iamax`. Same admission shape as `_dot_blocked`, including its `nblk ÷ 2` floor:
+the block grid is coarse, so one worker holding only a ragged tail sets the critical path.
+"""
+@inline function _iamax_blocked(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    # A 16-byte-datapath x86 box keeps its old path entirely. `_iamax_chain4!` carries its own
+    # lane-wise seed and has no seeded form, so there is nothing for the grid to fold; routing it to
+    # the tree kernel instead would be a silent behaviour change on a platform the fleet cannot test.
+    (_SIMD_BYTES < 32 && Sys.ARCH !== :aarch64) && return GC.@preserve x _iamax_simd!(n, _ptr(x))
+    B = _red_block(T)
+    # ONE `GC.@preserve` over both exits, and the pointer taken once. The threaded driver joins
+    # before it returns, so the operand is live for every worker; going through the `Ptr` method
+    # also means a stride-1 `SubArray` reaches the pool, which the `DenseArray` method would miss.
+    GC.@preserve x begin
+        xp = _ptr(x)
+        if n > B && n <= _iamax_mt_nmax(T)
+            nblk = cld(n, B)
+            nw = min(_l1_workers(n * sizeof(T), n, T), nblk ÷ 2)
+            nw > 1 && return _iamax_threaded(n, xp, nw)
+        end
+        return _iamax_blocked_serial(n, xp)
+    end
+end
 
 # Complex iamax (icamax/izamax): 1-based index of the first element with maximal |re|+|im|. Same 4-chain
 # argmax machinery as the real kernel, but each Vec{2W} load is W complex elements — deinterleave → re/im,

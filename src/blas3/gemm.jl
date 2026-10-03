@@ -3991,11 +3991,22 @@ const _MT_KIND_COPY = 11
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_SWAP = 12
+# iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's fold
+# is a strict-`>` scan rather than a sum. `Ap` is x.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_IAMAX = 13
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
 @inline _is_reduction(kind::Int) =
     kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
+
+# The argmax kinds, which have their OWN post-join fold. Separate from `_is_reduction` because the two
+# folds share nothing: a sum accumulates every partial, an argmax selects one and must see the block
+# order to break ties. Keeping them apart also keeps `_is_reduction`'s buffer contract intact — that
+# one sizes `_red_partials`, this one sizes `_REDI`.
+@inline _is_argmax(kind::Int) = kind == _MT_KIND_IAMAX
 
 """
     _syrk_workers(n, k) -> Int
@@ -4091,6 +4102,7 @@ end
     p.kind == _MT_KIND_SCAL && return _scal_run_chunk(p, nw, i)
     p.kind == _MT_KIND_COPY && return _copy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_IAMAX && return _iamax_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4251,6 +4263,15 @@ const _REDP_F32 = Float32[]
 @inline _red_partials(::Type{Float64}) = _REDP_F64
 @inline _red_partials(::Type{Float32}) = _REDP_F32
 
+# The ARGMAX partials: one BLOCK INDEX per block, so a single `Int` buffer serves every element type.
+# Soundness is the argument above verbatim — one job at a time under `p.busy`, the driver sizes it
+# inside the claim, each worker writes only the block slots it owns, nothing is held across a yield.
+# It is deliberately NOT a second `Vector{T}` with the index stored as a float: the chunk needs no
+# float round-trip and the only conversion left is the driver's single return, which `_iamax_mt_nmax`
+# bounds.
+const _REDI = Int[]
+@inline _redi_partials() = _REDI
+
 # Grow the partials buffer before the job is published. CALLED FROM THE DRIVER, INSIDE THE CLAIM — never
 # from a chunk body, which must not allocate: the driver and every idle worker are in spin/wait loops
 # with nowhere for a GC to progress from, and the symptom is a swallowed worker exception or a silent
@@ -4269,6 +4290,22 @@ const _REDP_F32 = Float32[]
 # lifted, and nothing today — do not cite it as the reason the proof holds.
 @inline function _red_prefit!(::Type{T}, nblk::Int) where {T}
     _ws_grow!(_red_partials(T), nblk)
+    return nothing
+end
+
+# Same contract, same call site, for the argmax buffer. The slots are ZEROED here rather than in the
+# chunks: a worker writes only the blocks it owns, and `_red_chunk` hands out every block, but a
+# chunk that threw would leave a stale index from an earlier, longer job behind — which the fold
+# would then read as a live candidate pointing outside this vector. The driver re-throws before it
+# folds, so this is belt-and-braces; it costs one pass over at most a few hundred `Int`s.
+@inline function _redi_prefit!(nblk::Int)
+    v = _redi_partials()
+    _ws_grow!(v, nblk)
+    # A plain loop, not `fill!(view(v, 1:nblk), 0)`: the `SubArray` is a heap object unless the
+    # optimiser elides it, and this runs on a path an all-paths allocation proof reaches.
+    @inbounds for b in 1:nblk
+        v[b] = 0
+    end
     return nothing
 end
 
@@ -4325,6 +4362,33 @@ end
         off = (b - 1) * B
         len = min(B, p.m - off)
         prt[b] = _sumsq_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+# iamax over this worker's share of the block grid. Writes a 1-based index into the WHOLE vector, or 0
+# for "nothing in this block beat the seed"; the driver's fold selects among them.
+#
+# `g` is recomputed per worker rather than carried in a pool field. It is one scalar load of the same
+# element for everybody, and every worker must agree on it — see `_iamax_blocked_serial` for why the
+# shared seed is what preserves netlib's NaN and tie semantics across the grid.
+#
+# `p.m` is the route token, exactly as `_scal_run_chunk` passes it: compute on the block, route from
+# the whole. `_iamax_route!`'s three arms are keyed on a working-set size, so routing from `len` would
+# put every block on the mid-size tree form and lose the past-L2 arm the undivided size selects.
+@noinline function _iamax_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    idx = _redi_partials()
+    sz = sizeof(T)
+    g = abs(unsafe_load(p.Ap, 1))
+    for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        v = _iamax_route!(p.m, len, p.Ap + off * sz, g)
+        idx[b] = iszero(v) ? 0 : off + v
     end
     return nothing
 end
@@ -4670,6 +4734,12 @@ end
             return _asum_blocked_serial(A.m, A.ptr, T)   # same reasoning as the dot branch above
         elseif kind == _MT_KIND_SUMSQ
             return _sumsq_blocked_serial(A.m, A.ptr, T)
+        elseif kind == _MT_KIND_IAMAX
+            # A loser scans the WHOLE vector locally, over the same grid, seeded the same way, folded
+            # in the same block order — so it returns the same index the winner would have. It must
+            # not touch `_REDI` for the reason stated in the dot branch. The index leaves as `T`
+            # because that is this function's return type; `_iamax_mt_nmax` bounds the conversion.
+            return T(_iamax_blocked_serial(A.m, A.ptr))
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -4755,6 +4825,7 @@ end
         # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
         # inside a published job, and a loser that grew it could move storage a winner is writing.
         _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
+        _is_argmax(kind) && _redi_prefit!(cld(A.m, _red_block(T)))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -4839,6 +4910,28 @@ end
             end
             red = s
         end
+        # THE ARGMAX FOLD, in the same window and for the same reasons: joined, so no worker is
+        # writing `_REDI`, and still claimed, so no other caller can resize it.
+        #
+        # A strict `>` scan in BLOCK ORDER. That is what makes the worker count decide only who
+        # computed a candidate: a later block must beat the running maximum outright to displace an
+        # earlier one, so ties go to the lower index at any `nw`, matching the sequential kernel.
+        # Re-loading `|x[idx]|` here is exact — it is the same element the chunk already compared —
+        # and it is why no second float buffer is needed.
+        if _is_argmax(kind)
+            nblk = cld(A.m, _red_block(T))
+            idx = _redi_partials()
+            bi = 1
+            best = abs(unsafe_load(A.ptr, 1))
+            for b in 1:nblk
+                j = idx[b]
+                iszero(j) && continue
+                a = abs(unsafe_load(A.ptr, j))
+                a > best && (best = a; bi = j)
+            end
+            # The index leaves as a `T`; `_iamax_mt_nmax` is the admission cap that keeps this exact.
+            red = T(bi)
+        end
     finally
         # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
         # flags answer it between them.
@@ -4922,6 +5015,20 @@ end
 end
 @noinline function _sumsq_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _sumsq_threaded(n, pointer(x), nw)
+end
+
+# iamax rides the same one-operand shape as asum. The pool's return type is `T`, so the winning index
+# comes home as a float and is converted once here; `_iamax_blocked` declines the pool past
+# `_iamax_mt_nmax(T)` so that conversion is always exact.
+@noinline function _iamax_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    v = _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_IAMAX
+    )
+    return Int(v)
+end
+@noinline function _iamax_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _iamax_threaded(n, pointer(x), nw)
 end
 
 # `x .*= a`. `C` is the operand the chunk writes, so x goes in the C slot.

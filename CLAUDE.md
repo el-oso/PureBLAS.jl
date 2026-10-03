@@ -239,7 +239,22 @@ Both modes share ONE set of low-level kernels. Source map:
    FROM `_red_block` so it keeps testing the boundaries if that constant moves, plus a liveness witness,
    a concurrent lost-claim item and a steady-state allocation item beside it.
 
-   `iamax` is NOT threaded: its result is an index rather than a value, and `_gemm_threaded!` returns `T`.
+   **`iamax` IS THREADED, over the same grid but with a DIFFERENT fold.** Its result is an index, not
+   a value, so the chunks write block indices to `_REDI` and the driver selects with a strict `>` scan
+   in block order instead of summing. Two things make that equal the sequential kernel rather than
+   merely stable across worker counts. Every block is seeded from the SAME `|x[1]|`, which is what
+   preserves netlib's NaN contract: a NaN anywhere but position 1 is skipped by `>`, and a NaN AT
+   position 1 poisons the seed so every block reports "nothing beat it" and the answer is 1. Seeding a
+   block from its own first element instead would let a NaN there mask a genuine maximum later in that
+   same block. And the strict `>` at both levels — the kernel's lane walk and the driver's fold —
+   resolves ties to the lower index. The route comes from the UNDIVIDED length (`_iamax_route!`'s
+   `nroute`), because its three arms are keyed on a working-set size and do not agree on which element
+   they report first. `_gemm_threaded!` still returns `T`, so the index travels home as a float and
+   `_iamax_mt_nmax(T) = Int(maxintfloat(T))` declines the pool where that would not round-trip —
+   2^24 for `Float32`, which a 64 MB vector reaches; the blocked serial path still runs there. Gated
+   by the "tie across blocks" and "NaN …" cases in `test/level1_tests.jl` "L1 real: bit-identical at
+   every thread count", each checked against the netlib oracle at one thread AND for invariance across
+   worker counts.
 
    **The gate** is `test/gemm_tests.jl` "gemm/symm: bit-identical at every thread count" and its
    syrk/syr2k sibling. Both compare `reinterpret(UInt64, …)` patterns, never a tolerance — a 1e-13
