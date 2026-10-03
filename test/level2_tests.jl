@@ -480,3 +480,96 @@ end
         P.set_num_threads(1)
     end
 end
+
+# ── req#11 FOR gemv-T: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# The mirror of the gemv-N item. gemv-T splits COLUMNS, and two decisions read the A byte count that a
+# column split shrinks:
+#
+#   * `_gemvt_perscan` — `m*n*sizeof(T) > _GEMVT_PERCOL_AMIN` chooses per-column over NC-blocked, and
+#     the two reduce each `y[j]` by different arithmetic, not merely at a different speed;
+#   * `_gemvt_deep` — `m*n*sizeof(T) <= _L2_BYTES` switches the ACCUMULATOR COUNT
+#     (`_GEMVT_NC_DEEP`/`_GEMVT_U_DEEP`), which is a different fold tree.
+#
+# The sizes sit JUST ABOVE each threshold so the undivided problem is on one side and every band on
+# the other. Both predicates also carry an m-only term (`m*sizeof(T) <= _GEMVT_PERCOL_XMAX`,
+# `_gemvt_x_l1_resident(T, m, lda)`) which a column split does not move — so `m` is kept inside those
+# bounds, otherwise the case is decided by the m term and the n flip is never reached.
+#
+# A µarch where `_gemvt_perscan_mode() != 1` makes the first predicate constant, and a pinned
+# `gemvt_deep = false` does the same for the second. The item still asserts invariance there; it just
+# stops being the test that would catch a dropped token. That is why BOTH are present.
+@testitem "gemv-T: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            sz = sizeof(T)
+            # Keep m under _GEMVT_PERCOL_XMAX so the perscan decision turns on the n term.
+            m_ps = min(4096, P._GEMVT_PERCOL_XMAX ÷ sz)
+            n_ps = max(2 * P._NR, (5 * P._GEMVT_PERCOL_AMIN) ÷ (4 * m_ps * sz))
+            # Just past L2, so the undivided problem leaves `_gemvt_deep`'s size branch and every band
+            # re-enters it.
+            m_dp = 2048
+            n_dp = max(2 * P._NR, (5 * P._L2_BYTES) ÷ (4 * m_dp * sz))
+            cases = (("perscan flip", m_ps, n_ps), ("deep flip", m_dp, n_dp))
+            @testset "$nm m=$m n=$n" for (nm, m, n) in cases
+                A = randn(T, m, n)
+                x = randn(T, m)            # gemv-T consumes m and produces n
+                y0 = randn(T, n)
+                α = T(0.75)
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness, the trmv exclusion, and the lost-claim path — as for gemv-N. The trmv assertion matters
+# MORE here than there: `_tri_scatT!` calls `_gemv_t_simd!` itself, so the thread seam had to go one
+# level up into `_gemv!`. If that ever slips back down, this is what notices.
+@testitem "gemv-T: the pool runs, trmv-T stays out, and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        m, n = 4096, 1024
+        A = randn(m, n); x = randn(m); y0 = randn(n)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5, trans = 'T'))
+        # trmv with trans='T' routes through `_tri_scatT!`, which calls `_gemv_t_simd!` directly. It
+        # must not reach the pool, or the `_TRMV_ACC*` / `_TRSV_*` per-thread owners in
+        # test/perthread_lint_baseline.txt lose the justification they are listed under.
+        Tri = randn(2048, 2048) + 2048I
+        v = randn(2048)
+        @test !ran(() -> P.trmv!(Tri, copy(v); trans = 'T'))
+        @test !ran(() -> P.trsv!(Tri, copy(v); trans = 'T'))
+        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5, trans = 'T'); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end

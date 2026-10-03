@@ -1236,8 +1236,21 @@ end
     return j
 end
 
+@inline _gemv_t_simd!(
+    m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}, blk::Bool
+) where {T <: BlasReal, B0} = _gemv_t_simd!(m, n, α, A, x, β, y, b0, blk, n)
+
+# `nroute` is the UNDIVIDED COLUMN COUNT — gemv-T's mirror of gemv-N's `mroute`, and a req#11
+# requirement for the same reason. gemv-T splits COLUMNS (each `y[j]` owns its whole m-chain and the
+# bands are write-disjoint), and two decisions read the A byte count that a column split shrinks:
+# `_gemvt_perscan`, which chooses per-column against NC-blocked, and `_gemvt_deep` below, which
+# switches the ACCUMULATOR COUNT (`_GEMVT_NC_DEEP`/`_GEMVT_U_DEEP`) and so the fold tree. A band that
+# flipped either would reduce each `y[j]` by different arithmetic.
+#
+# The m-only checks beside them need nothing: `m * sizeof(T) <= _GEMVT_PERCOL_XMAX` and
+# `_gemvt_x_l1_resident(T, m, lda)` are keyed on `m`, which a column split does not move.
 @inline function _gemv_t_simd!(
-        m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
+        m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool, nroute::Int
     ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
@@ -1316,7 +1329,8 @@ end
         # pf=128: 0.844 @64, 0.850 @128, 0.724 @256 (the gate cells were 0.855 / 0.737), while pf=128
         # wins where deep is ineligible, 1.025 @512, 1.044 @1024. So the prefetch distance applies only
         # to the non-deep kernel below (bench/probes: zen5_gemvt_pf.jl).
-        if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1
+        # `nroute`, NOT `n`: the deep shape changes the accumulator count, hence the fold tree.
+        if _gemvt_deep(T, m, nroute, lda) && nc0 == 4 && u0 == 1
             jd = !blk ? 0 : _gemvt_cols!(
                     Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
                     yptr, Aptr, xptr, lda, m, n, α, β, sz
@@ -2048,6 +2062,21 @@ function _gemv!(
         end
         if _l2_simd_ok(A, x, y, incx, incy)
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
+            # THE gemv-T THREAD SEAM IS HERE, one level ABOVE `_gemv_t_simd!` — and that is the
+            # opposite of gemv-N, deliberately. `_tri_scat!` bypasses `_gemv_n_simd!` by calling the
+            # paneldrv directly, so gemv-N could take the pool inside its dispatcher; `_tri_scatT!`
+            # does NOT bypass `_gemv_t_simd!` — it calls that very entry (see its definition). The
+            # four `_TRSV_*`/`_TRMV_ACC*` entries in `test/perthread_lint_baseline.txt` are justified
+            # by trmv/trsv never forking a task, so the pool has to go where only the public gemv
+            # reaches it. That is this branch: `_gemv!` is the public and C-ABI entry, and the trmv
+            # scatters never call it.
+            nw = _gemvt_workers(Int(m), Int(n), eltype(A))
+            if nw > 1
+                GC.@preserve A x y _gemvt_threaded!(
+                    Int(m), Int(n), αT, pointer(A), stride(A, 2), _ptr(x), _ptr(y), βT, iszero(β), nw
+                )
+                return y
+            end
             return iszero(β) ? _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(true)) :
                 _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(false))
         end

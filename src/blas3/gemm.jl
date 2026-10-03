@@ -4008,6 +4008,11 @@ const _MT_KIND_GER = 14
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GEMVN = 15
+# gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap` (whole),
+# y in `Bp` (offset per band). `up` carries `B0`.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GEMVT = 16
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4085,6 +4090,20 @@ entirely in the masked remainder kernel: the band would be all tail and no body,
     return max(1, min(nw, m ÷ (_GEMV_MR * _vwidth(T))))
 end
 
+"""
+    _gemvt_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a column-band `gemv-T`. Same traffic argument as `_gemvn_workers` — A dominates —
+but capped by COLUMN blocks, because this is the transpose split: a worker owns whole columns of A
+and the matching entries of y.
+"""
+@inline function _gemvt_workers(m::Int, n::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, cld(n, _NR)))
+end
+
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
 # every worker but the last drives full-width microkernel tiles.
 @inline function _gemm_chunk(n::Int, nw::Int, i::Int)
@@ -4158,6 +4177,7 @@ end
     p.kind == _MT_KIND_IAMAX && return _iamax_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4484,6 +4504,30 @@ end
         _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(true), p.m)
     else
         _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(false), p.m)
+    end
+    return nothing
+end
+
+# gemv-T over this worker's COLUMN BAND. A column band is a pointer bump of `j0 * ldc`, and y is
+# offset to match: each `y[j]` keeps its entire m-chain on one worker, so the bands are
+# write-disjoint and nothing is folded after the join.
+#
+# `blk` is computed from `p.n` — the UNDIVIDED column count — not from `len`. That mirrors what the
+# 8-argument `_gemv_t_simd!` does for an unsplit call, and it is the first half of the route token;
+# `p.n` is passed again as `nroute` so `_gemvt_deep` reads it too. Deriving `blk` from `len` would
+# let a band take the per-column kernel where the whole problem is NC-blocked, which is a different
+# accumulation, not just a different speed.
+@noinline function _gemvt_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Ab = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
+    yb = p.Bp + j0 * sz
+    blk = !_gemvt_perscan(p.m, p.n, T)
+    if p.up
+        _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(true), blk, p.n)
+    else
+        _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(false), blk, p.n)
     end
     return nothing
 end
@@ -4848,6 +4892,13 @@ end
             up ?
                 _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(true), C.m) :
                 _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(false), C.m)
+        elseif kind == _MT_KIND_GEMVT
+            # As above, transposed: the loser's own column count IS the route width, and `blk` comes
+            # from it for the same reason the chunks take theirs from `p.n`.
+            blk = !_gemvt_perscan(C.m, C.n, T)
+            up ?
+                _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(true), blk, C.n) :
+                _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(false), blk, C.n)
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -5164,6 +5215,18 @@ end
     _gemm_threaded!(
         PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, m, 1, m),
         α, β, false, false, false, false, nw, _MT_KIND_GEMVN, b0
+    )
+    return nothing
+end
+
+# gemv-T: `C` is the m×n matrix, `A` is x (length m) and `B` is y (length n) — the transpose of
+# gemv-N's operand lengths, same slots.
+@noinline function _gemvt_threaded!(
+        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
+        α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0
     )
     return nothing
 end
