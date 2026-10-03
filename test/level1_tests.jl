@@ -381,3 +381,188 @@ end
         end
     end
 end
+
+# ── req#11 FOR LEVEL 1: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# `dot`, `asum`, `nrm2`, `axpy!` and `scal!` partition `n` across workers. The three reductions hold
+# the property by a FIXED-BLOCK grid: `n` is cut into `cld(n, _red_block(T))` blocks whose size does
+# not depend on the worker count, each block is reduced by the serial kernel, and the partials are
+# folded in index order. So a worker count changes which task computes a partial and nothing about how
+# the partials combine. These items are what makes that claim checkable rather than asserted.
+#
+# THE LADDER IS DERIVED FROM THE BLOCK SIZE, not written as numbers. A literal ladder stops testing the
+# boundaries the moment `_red_block` changes, and silently: every case would still pass, in the
+# interior. `nblk ÷ 2` workers is the admission rule, so 4 blocks is the smallest n that threads at
+# all, and `2 * nt` blocks is the smallest that reaches every worker.
+@testitem "L1 real: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        # Compare BIT PATTERNS, never a tolerance: a 1e-16 divergence is a divergence.
+        bits(v::Real) = bitstring(v)
+        bitsame(X::AbstractArray, Y::AbstractArray) =
+            length(X) == length(Y) && all(i -> bits(X[i]) == bits(Y[i]), eachindex(X))
+        bitsame(a::Real, b::Real) = bits(a) == bits(b)
+        @testset "$T" for T in (Float64, Float32)
+            B = P._red_block(T)
+            W = P._vwidth(T)
+            # The asum kernel folds 8 chains before the horizontal sum, so a block must be a whole
+            # number of 8-wide steps or the last block reduces by a different tree than the others.
+            @test B % (8 * W) == 0
+            ns = (B ÷ 2,            # below admission: must not thread, and must still be right
+                  4B,               # smallest threaded n; exact multiple, no ragged block
+                  4B + 1,           # ragged final block, scalar tail of one
+                  4B + W,           # ragged final block, one whole vector step
+                  2 * nt * B + 3)   # every worker busy, ragged
+            @testset "n=$n" for n in ns
+                x = randn(T, n)
+                y = randn(T, n)
+                α = T(0.75)                    # NOT a power of two: 2^j scaling is exact and would
+                β = T(2.5)                     # hide an alpha-placement difference between paths.
+                P.set_num_threads(1)
+                r_dot = P.dot(x, y)
+                r_asum = P.asum(x)
+                r_nrm2 = P.nrm2(x)
+                r_axpy = (t = copy(y); P.axpy!(t, α, x); t)
+                r_scal = (t = copy(x); P.scal!(β, t); t)
+                # `blascopy!` and `swap!` move bytes and compute nothing, so no partition can change a
+                # value — but the SPLIT still has to cover the vector exactly once, which is what these
+                # catch: an off-by-one in `_l1_chunk` leaves a stale element behind and shows up here.
+                r_cp = (t = similar(y); P.blascopy!(t, x); t)
+                r_swx = copy(y)                              # after swap!(x, y), x holds y's values
+                r_swy = copy(x)
+                for nw in (2, nt)
+                    P.set_num_threads(nw)
+                    @test bitsame(P.dot(x, y), r_dot)
+                    @test bitsame(P.asum(x), r_asum)
+                    @test bitsame(P.nrm2(x), r_nrm2)
+                    @test bitsame((t = copy(y); P.axpy!(t, α, x); t), r_axpy)
+                    @test bitsame((t = copy(x); P.scal!(β, t); t), r_scal)
+                    @test bitsame((t = similar(y); P.blascopy!(t, x); t), r_cp)
+                    let a = copy(x), b = copy(y)
+                        P.swap!(a, b)
+                        @test bitsame(a, r_swx)
+                        @test bitsame(b, r_swy)
+                    end
+                end
+                P.set_num_threads(1)
+            end
+            # nrm2's SCALED path (lassq) triggers on data, not on size, so it is reachable at any
+            # thread count and needs its own case: the squares overflow, so every block returns a
+            # (scale, ssq) pair rather than a plain sum, and the combine rule is what must be
+            # worker-count independent.
+            let n = 2 * nt * B + 3, big = T(1.0e30) * (T === Float64 ? T(1.0e130) : one(T))
+                x = fill(big, n); x[2] = big / 2; x[n] = big / 4
+                P.set_num_threads(1)
+                want = P.nrm2(x)
+                for nw in (2, nt)
+                    P.set_num_threads(nw)
+                    @test bitsame(P.nrm2(x), want)
+                end
+                P.set_num_threads(1)
+            end
+        end
+    end
+end
+
+# The invariant item above is satisfied perfectly by a library that ignores every thread it is given,
+# so it needs a liveness gate beside it. `p.gen` is bumped once per dispatched job and by the driver
+# only, so reading it either side of a call says whether the pool ran — no timing, nothing flaky.
+@testitem "L1 real: the pool is actually used" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        n = 2 * nt * P._red_block(Float64) + 3
+        x = randn(n); y = randn(n)
+        @test ran(() -> P.dot(x, y))
+        @test ran(() -> P.asum(x))
+        @test ran(() -> P.nrm2(x))
+        @test ran(() -> P.axpy!(copy(y), 0.75, x))
+        @test ran(() -> P.scal!(2.5, copy(x)))
+        @test ran(() -> P.blascopy!(similar(y), x))
+        @test ran(() -> P.swap!(copy(x), copy(y)))
+        P.set_num_threads(1)
+    end
+end
+
+# THE LOST-CLAIM PATH IS A PATH A THREAD COUNT CAN REACH. One caller wins the pool claim and splits;
+# every other caller runs the serial fallback. If that fallback reduced by a different grid, the same
+# call would return different bits depending on a race with an unrelated thread — which shipped once
+# for gemm (6940a2d3). With this many concurrent callers, losing is the common case.
+@testitem "L1 real: concurrent callers that lose the claim still agree bitwise" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @threads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        n = 2 * nt * P._red_block(Float64) + 3
+        xs = [randn(n) for _ in 1:(4 * nt)]
+        P.set_num_threads(1)
+        want = [P.dot(xs[i], xs[i]) for i in eachindex(xs)]
+        wantn = [P.nrm2(xs[i]) for i in eachindex(xs)]
+        P.set_num_threads(nt)
+        got = similar(want)
+        gotn = similar(wantn)
+        @threads for i in eachindex(xs)
+            got[i] = P.dot(xs[i], xs[i])
+            gotn[i] = P.nrm2(xs[i])
+        end
+        for i in eachindex(xs)
+            @test bitstring(got[i]) == bitstring(want[i])
+            @test bitstring(gotn[i]) == bitstring(wantn[i])
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# req#10 on the threaded L1 path. Shaped exactly like the gemm item in test/gemm_tests.jl and for the
+# same reasons: `@allocated` reads a PROCESS counter that sums every thread, so the minimum over
+# several windows is the honest statistic (a per-call leak allocates in every window; a foreign
+# allocation lands in some and not others), and the window must sit inside a compiled barrier over
+# named arguments or it measures the interpreter's own lookup over `Any`-typed globals.
+#
+# The partials buffer legitimately grows on the FIRST threaded call of a given block count, so the
+# warm-up has to cover that as well as both handoffs — a back-to-back call leaves the workers inside
+# their spin window, which is not the same path as a wake from a real park.
+@testitem "L1 real: threaded entries are allocation-free at steady state" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        n = 2 * nt * P._red_block(Float64) + 3
+        x = randn(n); y = randn(n)
+        a_dot(u, v) = @allocated P.dot(u, v)
+        a_asum(u) = @allocated P.asum(u)
+        a_nrm2(u) = @allocated P.nrm2(u)
+        a_axpy(v, c, u) = @allocated P.axpy!(v, c, u)
+        a_scal(c, u) = @allocated P.scal!(c, u)
+        for warm in 1:2
+            P.dot(x, y); P.asum(x); P.nrm2(x); P.axpy!(y, 0.75, x); P.scal!(2.5, x)
+            warm == 1 && sleep(0.05)      # second pass wakes the workers from a real park
+        end
+        @test minimum(a_dot(x, y) for _ in 1:8) == 0
+        @test minimum(a_asum(x) for _ in 1:8) == 0
+        @test minimum(a_nrm2(x) for _ in 1:8) == 0
+        @test minimum(a_axpy(y, 0.75, x) for _ in 1:8) == 0
+        @test minimum(a_scal(1.0, x) for _ in 1:8) == 0
+        P.set_num_threads(1)
+        @test P.get_num_threads() == 1
+    end
+end

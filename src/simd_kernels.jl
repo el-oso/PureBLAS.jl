@@ -257,7 +257,20 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 
 # Static ladder: runtime knob -> compile-time `Val`, one branch, each arm statically dispatched (no
 # dynamic `Val(u)` in the hot path, so this stays allocation-free and StrictMode-clean).
-@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0) where {T <: BlasReal}
+# `nroute` — THE ROUTE WIDTH, when a caller has split this axpy across workers. Defaults to `-1`,
+# meaning "route from `n`", which is every serial call and keeps them byte-identical to before.
+#
+# WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation. Every arm below writes
+# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and scalar tail alike — so the arms
+# carry no cross-element accumulation and agree bitwise AS LONG AS `muladd` contracts the same way in
+# each. That proviso is the gap: `muladd` is licensed to fuse or not at LLVM's discretion, and the arms
+# move which elements land in a vector lane and which in the scalar tail, so a length-dependent arm
+# choice puts the guarantee in the compiler's hands rather than the source's. req#11 does not allow
+# that — any size-keyed branch a chunk body can reach takes its size from the route, not from the
+# slice. So a partitioned caller passes the WHOLE problem's length and computes on its slice, and
+# test/level1_tests.jl pins the result bitwise at several thread counts and several tail shapes.
+@inline function _axpy_simd!(n::Int, a::T, x, y, pf::Int = 0, nroute::Int = -1) where {T <: BlasReal}
+    nrt = nroute < 0 ? n : nroute
     # THE KNOB ONLY GOVERNS WHERE IT WAS MEASURED. `_measure_axpy_unroll` probes past L1, so its answer
     # applies past L1 and nowhere else — the probe-regime rule, and here it is not academic. Measured on
     # Zen4 (freq-locked, plots.jl) with the tuned value applied at EVERY size, against the fixed 4:
@@ -267,7 +280,7 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # new n=1e4 miss. The optimum is size-dependent as well as machine-dependent, so the residency split
     # is part of the knob, not a detail.
     # Short calls (complex `ger` per column, tails) also skip the OncePerProcess lookup entirely.
-    (n < 4 * _UNROLL * _vwidth(T) || n * sizeof(T) <= _L1_BYTES) &&
+    (nrt < 4 * _UNROLL * _vwidth(T) || nrt * sizeof(T) <= _L1_BYTES) &&
         return _axpy_unrolled!(Val(_UNROLL), n, a, x, y, pf)
     # `pf > 0` (ger's prefetching caller) stays on the interleaved body: its prefetch distance is tuned
     # against that step, and the phase bodies do not carry the prefetch block.
@@ -300,7 +313,7 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
     # PDM: DERIVE tier — a residency criterion over a detected const, no new knob.
     # (Line ~324's L1 cutoff has the same one-stream shape. Left alone deliberately: every cell it
     # governs gates ≥ 1.0, so changing it would be an unmeasured edit to working code.)
-    u = 2 * n * sizeof(T) >= _L3_BYTES ? _axpy_dram() : _axpy_band()
+    u = 2 * nrt * sizeof(T) >= _L3_BYTES ? _axpy_dram() : _axpy_band()
     W = _vwidth(T)
     return u == 2 ? _axpy_unrolled!(Val(2), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
         u == 8 ? _axpy_unrolled!(Val(8), n, a, x, y, 0) :  # req8-ok: candidate arm, literal required for specialization
@@ -310,7 +323,15 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
         _axpy_unrolled!(Val(4), n, a, x, y, 0)  # req8-ok: candidate arm, literal required for specialization
 end
 
-@inline function _scal_simd!(n::Int, a::T, x) where {T <: BlasReal}
+# `nroute` — THE ROUTE WIDTH, as on `_axpy_simd!` above and for the same req#11 reason: the L1-residency
+# predicate below is size-keyed, so a worker routing from its own slice length can take the hand-unrolled
+# arm where the unsplit call takes the `@simd ivdep` one. Both arms write one `a * x[i]` per element, with
+# no cross-element accumulation, so they agree bitwise; but which elements land in a vector lane and which
+# in the scalar tail moves between them, and that is the compiler's rounding to decide once `muladd`-class
+# contraction is in play. Route from the whole, compute on the slice. Defaults to `-1` = "route from `n`",
+# which is every serial call.
+@inline function _scal_simd!(n::Int, a::T, x, nroute::Int = -1) where {T <: BlasReal}
+    nrt = nroute < 0 ? n : nroute
     px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
     xc = _carrier_arr(x)   # `x` itself when the caller passed an array; nothing for a Ptr segment
     GC.@preserve x begin
@@ -433,7 +454,7 @@ end
         # formed against), and ROTATE arm order per round like the gate does (plots.jl:252-255) rather
         # than merely putting the duplicate last. First-in-last-slot bounds only maximal-separation
         # drift — conservative, and its failure mode is calling a resolvable cell unresolvable.
-        if n * sizeof(T) > _L1_BYTES
+        if nrt * sizeof(T) > _L1_BYTES   # `nrt`, not `n`: route from the whole problem (see the header)
             # `@simd ivdep` must stay: hand-unrolling was measured WORSE past L1 (see above). `_stcb!`
             # is a plain store in release, so the vectorizer sees the same loop.
             @inbounds @simd ivdep for j in 1:n
@@ -1044,6 +1065,158 @@ end
 # sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then a scalar tail.
 # PDM: Literal — DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET.
 const _UNROLL = 4
+
+# ── THE FIXED-BLOCK REDUCTION, WHICH IS WHAT MAKES A THREADED REDUCTION REPRODUCIBLE ────────────────
+#
+# WHY A REDUCTION CANNOT SIMPLY BE SPLIT. `_dot_simd` below carries `_UNROLL` vector chains, folds them
+# `(a0+a1)+(a2+a3)`, then takes a horizontal `sum(acc)`. Floating-point addition is not associative, so
+# ANY change of grouping moves the last bits — a worker holding half the vector and a caller holding all
+# of it do not produce summable pieces. There is no partition of the current kernel that reproduces its
+# own result.
+#
+# req#11 requires `set_num_threads(n)` to change nothing for ANY n, and n = 1 is an n. So the blocked form
+# has to be the ONLY form, used at every worker count including serial. That changes this library's dot
+# bit-for-bit against previous versions — permitted, since req#11's scope is thread counts, not versions —
+# and is the price of a threaded reduction existing at all.
+#
+# THE SHAPE: chunk `n` into blocks of `_red_block(T)` elements, reduce each block with the UNCHANGED
+# kernel, and fold the partials in FIXED INDEX ORDER. The block grid is a function of `(n, T)` only, so
+# the worker count decides who computes a partial, never how the partials combine. Serial folds
+# incrementally as it goes; a threaded driver folds a partials buffer over the same indices in the same
+# order, which is why the two agree exactly.
+#
+# MEASURED COST, gate regime (fresh operands per sample, `_L1REP` reps loop), blocked/whole:
+#     B(elems)   n=1e4   3e4   1e5   3e5   1e6
+#     2048       1.009 1.011 1.011 1.014 1.009
+#     8192       1.002 1.003 1.004 1.005 1.007     <- shipped
+#     16384      1.002 1.001 1.005 1.005 1.003
+#     65536      1.002 1.001 1.001 1.001 1.001
+# ACCURACY IS NOT A TRADE HERE, it improves: relative error against a BigFloat reference at n=1e5 is
+# 8.63e-16 whole against 2.24e-16 blocked, because the per-block fold is a shallower tree than one long
+# chain. n=1e6: 1.73e-16 whole, 7.59e-16 blocked — comparable.
+#
+# B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own scalar tail and the fold order
+# starts depending on where tails fall, which is the invariant this whole construction exists to hold.
+# PDM: Literal — 256 blocks' worth of fold overhead per block, validated by the table above rather than derived; the FORM (a multiple of the kernel's step, so it scales with unroll and ISA width) is what carries across machines. | tune: n/a, the tax is <1% across the measured range
+@inline _red_block(::Type{T}) where {T} = 256 * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
+
+"""
+    _dot_blocked(n, x, y, ::Type{T}) -> T
+
+`dot` over a fixed block grid, partials folded in index order. Bit-identical to the threaded path at any
+worker count, which is the entire point; see the note above for why the unblocked kernel cannot be.
+"""
+# THE SERIAL CORE, SEPARATE ON PURPOSE. A pool job's lost-claim branch reduces the whole vector itself,
+# and if it called the threading entry below it would try to claim again, lose again, and recurse —
+# spinning until the pool happened to free. Splitting the two makes that impossible rather than unlikely.
+@inline function _dot_blocked_serial(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _dot_simd(n, x, y, T)      # one block: the unchanged kernel, no fold at all
+    s = zero(T)
+    i = 0
+    GC.@preserve x y begin
+        px = _ptr(x); py = _ptr(y); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _dot_simd(len, px + i * sz, py + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
+@inline function _dot_blocked(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+    # THREAD IT if the pool is on and there is work for two workers. One atomic read and a compare when
+    # threading is off, as at `_axpy!`. The threaded path folds the SAME block grid in the SAME index
+    # order as the serial core, so the two are bit-identical — which req#11 requires of n = 1 against any
+    # other n. Two streams, so the working set is 2·n·sizeof(T).
+    #
+    # ⚠ EACH WORKER NEEDS AT LEAST TWO BLOCKS, or the RAGGED LAST BLOCK sets the critical path. The block
+    # grid is coarse by design (B is large so the per-block fold is under 1%), so at small n the tail is a
+    # large fraction of a block and one worker finishes long before another. Measured at n = 10000, where
+    # the grid is exactly two blocks of 8192 and 1808: the long block is 82% of the work, which caps the
+    # speedup at 1.22x before the join is paid, and the cell measured 0.85x — turning a PASSING gate cell
+    # (1.004) into a failing one. `nblk ÷ 2` declines that case and costs nothing above it.
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(2 * n * sizeof(T), n, T), nblk ÷ 2)
+        nw > 1 && return _dot_threaded(n, x, y, nw)
+    end
+    return _dot_blocked_serial(n, x, y, T)
+end
+
+"""
+    _sumsq_blocked(n, x, ::Type{T}) -> T
+
+Σxᵢ² over the shared block grid — `nrm2`'s fast path. `_sumsq_simd` has the same four-chain shape as
+`_dot_simd`, so the same argument applies: a split changes the grouping, therefore one grid at every
+worker count.
+
+`_nrm2`'s overflow guard (`isfinite(ss) && !iszero(ss)`) is unaffected: a fold of finite partials that
+reaches Inf is still caught, and a block being smaller than the whole vector can only make the fast path
+survive where one long accumulator overflowed — a better answer under the same contract. The grid is
+fixed, so WHICH path runs cannot vary with the worker count.
+"""
+@inline function _sumsq_blocked_serial(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _sumsq_simd(n, x, T)
+    s = zero(T)
+    i = 0
+    GC.@preserve x begin
+        px = _ptr(x); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _sumsq_simd(len, px + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
+@inline function _sumsq_blocked(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(n * sizeof(T), n, T), nblk ÷ 2)
+        nw > 1 && return _sumsq_threaded(n, x, nw)
+    end
+    return _sumsq_blocked_serial(n, x, T)
+end
+
+"""
+    _asum_blocked(n, x, ::Type{T}) -> T
+
+`asum` over the same fixed block grid as `_dot_blocked`, for the same reason: `_asum_simd` carries EIGHT
+chains and folds them `((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7))`, so a split changes the grouping. One grid
+serves both — `_red_block` is a multiple of `8·_vwidth(T)` as well as of `_UNROLL·_vwidth(T)`, so no block
+of either kernel grows its own tail.
+"""
+@inline function _asum_blocked_serial(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    n <= B && return _asum_simd(n, x, T)
+    s = zero(T)
+    i = 0
+    GC.@preserve x begin
+        px = _ptr(x); sz = sizeof(T)
+        while i < n
+            len = min(B, n - i)
+            s += _asum_simd(len, px + i * sz, T)
+            i += len
+        end
+    end
+    return s
+end
+
+@inline function _asum_blocked(n::Int, x, ::Type{T}) where {T <: BlasReal}
+    B = _red_block(T)
+    if n > B
+        nblk = cld(n, B)
+        nw = min(_l1_workers(n * sizeof(T), n, T), nblk ÷ 2)   # ONE stream here, unlike dot's two
+        nw > 1 && return _asum_threaded(n, x, nw)
+    end
+    return _asum_blocked_serial(n, x, T)
+end
 
 @inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
     px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W

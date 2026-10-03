@@ -7,7 +7,13 @@
 # y .= x
 @inline function _copy!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _copy_simd!(Int(n), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        # One atomic read and a compare on the serial path, as at `_axpy!`. TWO streams — x read, y
+        # written — so the working set is 2n·sizeof(T), the same as axpy's.
+        nw = _l1_workers(2 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _copy_threaded!(Int(n), x, y, nw)
+        return _copy_simd!(Int(n), x, y)
+    end
     # Complex and Dual vectors are contiguous 2n-real buffers and copy involves no arithmetic, so the real
     # SIMD kernel serves them as-is. LLVM does NOT vectorize the scalar loop below for ComplexF64 — it emits
     # a `memmove` call (bench/probes/cplx_copy_vec.jl: `_vectorized=false`), 1.9x slower than `_copy_simd!`
@@ -26,7 +32,13 @@ end
 # x ⇄ y
 @inline function _swap!(n::Integer, x, incx::Integer, y, incy::Integer)
     n <= 0 && return nothing
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _swap_simd!(Int(n), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        # FOUR streams, not two: swap reads AND writes both vectors, so the working set is 2n·sizeof(T)
+        # of traffic in each direction. The admission floor is in bytes moved, so it takes 4n.
+        nw = _l1_workers(4 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _swap_threaded!(Int(n), x, y, nw)
+        return _swap_simd!(Int(n), x, y)
+    end
     # Same reasoning as `_copy!`; here the scalar loop lowers to memcpy+memmove through a temporary and runs
     # 2.4-3.1x slower than `_swap_simd!` at every size measured (n=1e3..1e5, same probe).
     if incx == 1 && incy == 1 && (_cplx2(x, y) || _pair2(x, y))
@@ -44,8 +56,19 @@ end
 # x .*= a
 @inline function _scal!(n::Integer, a::Number, x, incx::Integer)
     n <= 0 && return x
+    # SME FIRST, AND IT MUST STAY FIRST: an SME-eligible call has to decline the pool. The matrix unit
+    # is shared by the cluster, so splitting a call that could own it LOSES — M6 n=4096 Float64 reads
+    # 503 GFLOP/s owned against 177 threaded-NEON. Taking the SME path before the pool is consulted
+    # makes that true by construction rather than by a predicate someone has to remember.
     (incx == 1 && _sme_scal_ok(_et(x), Int(n), x)) && return _sme_scal!(Int(n), Float64(a), x)
-(incx == 1 && _simd1(x)) && return _scal_simd!(Int(n), convert(_et(x), a), x)
+    if incx == 1 && _simd1(x)
+        ac = convert(_et(x), a)
+        # One atomic read and a compare on the serial path, as at `_axpy!`. Elementwise, so the partition
+        # cannot change a bit; ONE stream, so the working set is n·sizeof(T) rather than axpy's 2n.
+        nw = _l1_workers(Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _scal_threaded!(Int(n), ac, x, nw)
+        return _scal_simd!(Int(n), ac, x)
+    end
     if incx == 1 && _cplx_re(x)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vec = real scal over 2n
@@ -86,9 +109,21 @@ end
 # concrete call site every one of those tests const-folds to the single surviving branch.
 @inline function _axpy!(n::Integer, a::Number, x, incx::Integer, y, incy::Integer)
     n <= 0 && return y
+    # SME first, and it must stay first — see `_scal!` above for why an SME-eligible call declines
+    # the pool rather than being split across it.
     (incx == 1 && incy == 1 && _sme_axpy_ok(_et(x), Int(n), x, y)) &&
         return _sme_axpy!(Int(n), Float64(a), x, y)
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _axpy_simd!(Int(n), convert(_et(x), a), x, y)
+    if incx == 1 && incy == 1 && _simd2(x, y)
+        ac = convert(_et(x), a)
+        # THREADING IS ONE ATOMIC READ ON THE SERIAL PATH. `_l1_workers` returns 1 after `_MT_NTHREADS[]`
+        # alone when threading is off, which is the default, so this entry keeps the shape the `@inline`
+        # note above is about: the whole branch chain const-folds at a concrete call site and the 28.7 ns
+        # the public wrapper used to give back stays gone. The threaded call is `@noinline` and out of
+        # line, so it costs the serial path nothing but the compare.
+        nw = _l1_workers(2 * Int(n) * sizeof(_et(x)), Int(n), _et(x))
+        nw > 1 && return _axpy_threaded!(Int(n), ac, x, y, nw)
+        return _axpy_simd!(Int(n), ac, x, y)
+    end
     if incx == 1 && incy == 1 && _cplx2(x, y)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vecs = real axpy over 2n
@@ -129,7 +164,7 @@ end
 
 # Unconjugated dot (BLAS ?dot / ?dotu).
 @inline function _dotu(n::Integer, x, incx::Integer, y, incy::Integer)
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_blocked(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(false))
     # Dual vectors (ForwardDiff extension loaded): the complex dot body under the dual multiply rule; it hands
     # back (value, partial) and `_mkpair` builds the Dual with x's own tag. dotc is the same (no conj on a Real).
@@ -140,9 +175,10 @@ end
 # Conjugated dot (BLAS ?dotc). For real T this equals `_dotu`.
 @inline function _dotc(n::Integer, x, incx::Integer, y, incy::Integer)
     # SME first: the reduction accumulates into ZA rather than a z register, which is the whole of
-    # the difference — see blas1/sme_l1.jl. Declines everything it cannot read directly.
+    # the difference — see blas1/sme_l1.jl. Declines everything it cannot read directly, and taking it
+    # ahead of `_dot_blocked` is what keeps an SME-eligible call off the pool.
     (incx == 1 && incy == 1 && _sme_dot_ok(_et(x), Int(n), x, y)) && return _sme_dot(Int(n), x, y)
-    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_simd(Int(n), x, y, _et(x))
+    (incx == 1 && incy == 1 && _simd2(x, y)) && return _dot_blocked(Int(n), x, y, _et(x))
     (incx == 1 && incy == 1 && _cplx2(x, y)) && return _dot_cmplx_simd(Int(n), x, y, real(_et(x)), Val(true))
     (incx == 1 && incy == 1 && _pair2(x, y)) && return _mkpair(_et(x), _dot_pair_simd(Val(:dual), Int(n), x, y, _pairv(x), Val(false))...)
     return _dot_generic(n, x, incx, y, incy, true)
@@ -155,7 +191,7 @@ end
     R = real(_et(x))
     n <= 0 && return zero(R)
     if incx == 1 && _simd1(x)
-        ss = _sumsq_simd(Int(n), x, _et(x))
+        ss = _sumsq_blocked(Int(n), x, _et(x))
         (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
         # ss is Inf (overflow) or 0 (all-zero, or underflow of tiny values) → use safe path
     elseif incx == 1 && _cplx_re(x)
@@ -215,7 +251,7 @@ end
     n <= 0 && return zero(R)
     # SME first, same reason as `_dotc` above.
     (incx == 1 && _sme_asum_ok(_et(x), Int(n), x)) && return _sme_asum(Int(n), x)
-    (incx == 1 && _simd1(x)) && return _asum_simd(Int(n), x, _et(x))
+    (incx == 1 && _simd1(x)) && return _asum_blocked(Int(n), x, _et(x))
     (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
         (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
     if incx == 1 && _pairalg(x)                            # Dual: Σ|x_v| with partial Σ flipsign(x_p, x_v)
