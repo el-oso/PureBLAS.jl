@@ -29,6 +29,17 @@ for f in "${keys[@]}"; do
         # fails every dual publish demanding a file that is not supposed to exist — which is exactly
         # what it did on ef76dac2, the first commit to move perf_dl3/perf_dlp on their own.
         docs/src/assets/perf_dl*.svg) continue ;;
+        # THREADED panels have no reference PAIR to keep in step either, for two different reasons.
+        # `perf_mt_*` is PureBLAS at N threads over PureBLAS at one — both arms are ours, no vendor
+        # appears in it at all. `perf_mtgate_*` is ALREADY the per-cell faster-of-the-two view
+        # (`_MT_GATE_VIEW`), so there is no separate OpenBLAS rendering and AOCL rendering that could
+        # drift apart. Both sets are written by `plots.jl mtdraw` in ONE invocation, which exits before
+        # the gate rendering, so the hazard this check exists for — one view re-rendered while its
+        # sibling stays behind — has no counterpart here. Without these two lines the check demands
+        # `perf_mt_l1_aocl.svg` and `perf_mtgate_l1_gate.svg`, files that are not supposed to exist,
+        # and fails every threaded publish. Same shape as the dual exemption above.
+        docs/src/assets/perf_mt_*.svg) continue ;;
+        docs/src/assets/perf_mtgate_*.svg) continue ;;
         *_aocl.svg) base="${f%_aocl.svg}" ;;
         *_gate.svg) base="${f%_gate.svg}" ;;
         *)          base="${f%.svg}" ;;

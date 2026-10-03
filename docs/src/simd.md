@@ -200,5 +200,16 @@ What is *not* guaranteed — for PureBLAS, and typically not for any BLAS — is
 and the generic scalar fallback agree to the last bit: they sum in a different order, so `nrm2` of a
 plain `Vector` (SIMD path) can differ by a ULP or two from `nrm2` of an offset view (scalar path).
 That is the normal fast-path/fallback split, not a reproducibility bug. Cross-*machine* reproducibility
-is likewise not guaranteed (a different vector width builds a different reduction tree), and adding
-multithreading would require a fixed reduction tree to preserve run-to-run identity.
+is likewise not guaranteed (a different vector width builds a different reduction tree).
+
+Across **thread counts**, identity IS guaranteed, and it is a hard requirement rather than a hope:
+`PureBLAS.set_num_threads(n)` does not change a bit of `dot`, `asum` or `nrm2` for any `n`, including
+`n = 1`. The mechanism is a fixed block grid. `n` is cut into `cld(n, _red_block(T))` blocks whose size
+depends only on `(n, T)`; each block is reduced by exactly the serial kernel above; and the driver folds
+the block partials in index order once every worker has finished. A worker count therefore decides *who*
+computes a partial and never *how* the partials combine. Because the blocked form is the only form, it is
+also what a single-threaded call runs — so these three functions changed results against earlier versions
+of PureBLAS, which the requirement permits: its scope is thread counts, not versions. The blocked fold is
+in fact slightly more accurate than one long chain, being a shallower tree.
+
+`iamax` is not threaded.

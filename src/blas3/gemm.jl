@@ -3712,6 +3712,142 @@ ways: by the threads that exist, by the amortisation floor above, and by `n` —
 given a whole `_NR`-wide column block is a worker whose microkernel runs ragged, which costs more than
 the thread saves.
 """
+# ── BLAS-1 THREADING: A DIFFERENT AMORTISATION UNIT, NOT A SMALLER NUMBER ───────────────────────────
+# `_GEMM_MT_WORK` is a FLOP floor, because a gemm is compute-bound and its cost is flops over the FMA
+# rate. BLAS-1 is BYTE-bound: an axpy at n=30000 does 60000 flops, two orders of magnitude below that
+# floor, and a flop test would therefore refuse to thread the exact cells OpenBLAS threads for a
+# measured 1.98x. The floor has to be in bytes.
+#
+# PDM: DERIVE — a residency criterion over a detected const, no new knob. The criterion: extra cores add
+# usable bandwidth only once the data stops fitting in the private per-core cache. Inside L2 one core
+# already streams at the cache's rate, so a second core adds a join and nothing else; beyond L2 the
+# operands come from L3 or memory, where per-core bandwidth is a fraction of aggregate and cores do add.
+#
+# ⚠ RESIDENCY COUNTS EVERY LIVE STREAM, which `_axpy_simd!` learned the expensive way a few hundred
+# lines below: axpy reads `x` and read-modify-writes `y`, so its working set is 2·n·sizeof(T). The
+# caller passes the byte count; this const is the threshold it is compared against.
+#
+# MEASURED HEADROOM this is aimed at (OpenBLAS self-speedup 1→6 threads, Zen4, freq-locked):
+#   axpy  n≤10000 1.00x (OB declines to thread) · 30000 1.98x · 100000 2.40x · 300000 1.80x · 1e6 1.82x
+#   dot   n≤10000 1.00x                         · 30000 2.37x · 100000 3.27x · 300000 1.89x · 1e6 1.69x
+# PureBLAS is at 0.99–1.08 of OpenBLAS SERIALLY at every one of those sizes, so the whole threaded
+# deficit is the missing split rather than any kernel gap.
+# TWO THRESHOLDS, BECAUSE THERE ARE TWO QUESTIONS, and conflating them was measured wrong: using one
+# constant for both capped the worker count at `bytes ÷ floor`, which is 1 for a 1.6 MB call against a
+# 1 MiB floor — so n=100000 admitted exactly one worker and gained 1.00x.
+#
+#   `_L1_MT_MIN`  — is this call worth splitting at all? At least two workers must each clear the
+#                   per-worker floor, or the join is not amortised.
+#   `_L1_MT_SLICE` — the per-worker floor: a slice whose operands fit in the PRIVATE L1 is a slice
+#                   smaller than the cost of waking a core for it. That is the same physical statement
+#                   `_MT_AMORTISE` makes for gemm, in the unit BLAS-1 is bound by: on this box the
+#                   measured join is 568 ns and a core streams ~57 GB/s, so the break-even slice is
+#                   ~32 KB, which is `_L1_BYTES`. Derived rather than fitted, and the agreement is the
+#                   reason to trust the form rather than the number.
+# THE MECHANISM IS THE FORK-JOIN AGAINST ONE CORE'S STREAM RATE: break-even bytes =
+# T_forkjoin × BW_core × p/(p−1). On this box that is 568 ns × ~57 GB/s ≈ 32 KB at p = 2, which
+# COINCIDES with `_L1_BYTES` and is written in terms of it as a PROXY, not as the physics.
+#
+# ⚠ `_L1_BYTES` IS NOT THE CAUSE, and the distinction is testable rather than pedantic: make the pool
+# wake twice as fast and break-even halves while an L1-residency rationale does not move. Streaming
+# operands are never reused, so L1 residency has no causal role in an axpy. The falsification: L1D is
+# 32 KB on Zen3/Zen4, 48 KB on Zen5, 128 KB on Apple silicon — if `T_forkjoin × BW_core` does not track
+# those to within ~30%, this proxy is a date in disguise and the constant must be written as the product.
+# Neither term is a detected const, so this is NOT Derived however it is written. It was tagged Derived
+# while this same paragraph said the honest tier was Measure — a contradiction inside one comment block,
+# and the tag is what an audit reads. There is no on-host auto-tune either, so it is not Measure: it is a
+# LITERAL, 32 KB, spelled `_L1_BYTES`, validated on one box and carrying the falsification test above.
+#
+# ⚠ THE FALSIFICATION TEST IS STILL UNRUN, and running it has a regime trap in it. `T_forkjoin × BW_core`
+# needs the fork-join measured PER BOX (568 ns is wintermute's only) and the per-core stream rate AT THE
+# SLICE SIZE IN QUESTION — a ~32 KB slice is L1-resident, where a core streams far faster than the
+# ~57 GB/s figure the estimate above uses, which is a DRAM-regime rate. Measuring the rate at n = 3e5
+# (74 / 49 / 99 GB/s on wintermute / neuromancer / galen) and multiplying would compare two different
+# regimes and "falsify" the proxy for the wrong reason. Get both terms in the slice's own regime, or the
+# test says nothing.
+#
+# Kept as it is because the regret is bounded and named: the floor only decides admission between roughly
+# n = 2000 and 10000, and every cell outside that band is governed by something else.
+# PDM: Literal — break-even of the pool fork-join against one core's stream rate, neither of which is a detected const; 32 KB validated on one box and spelled as `_L1_BYTES`, which is a coincidence rather than the mechanism. Falsification test above, UNRUN.
+const _L1_MT_SLICE = _L1_BYTES   # req8-ok: validated literal, mechanism and falsification test above
+# ADMISSION CARRIES A 2× MARGIN OVER BREAK-EVEN, AND IT IS THERE FOR THE SINGLE-SHOT CALLER, not for the
+# benchmark. Break-even admission is 2 × slice (two workers each paying the join out of a halved share).
+#
+# 568 ns is the BACK-TO-BACK fork-join. A call made after the pool has sat idle costs far more, because
+# parked workers' cores drop into deep idle and a C-state exit is tens of microseconds — measured here:
+#     back-to-back 0.72 µs · after 1 ms 63.7 µs (88×) · after 5 ms 78.8 µs (109×) · after 20 ms 79.4 µs
+#
+# A caller in a loop never sees that: consecutive calls keep the workers hot, and the published gate
+# amortises it over `_L1REP` = 30…20000 back-to-back calls per sample, where threaded axpy measures
+# 1.27×/2.11×/3.13×/1.75×/2.20× across n = 10⁴…10⁶ with nothing regressing. A caller making ONE axpy per
+# millisecond — a Krylov iteration with a serial matvec between the vector ops — pays the full 79 µs
+# every time, and at the bare break-even boundary loses: n = 4096 is a 64 KiB working set and measures
+# 0.94× that way. The library cannot tell the two callers apart, so the floor protects the worse one at a
+# cost of nothing at any gate size.
+#
+# ⚠ COUPLED TO THE SPIN-BEFORE-PARK DECISION (declined 2026-09-26; kb
+# `pool-spin-before-park-declined-2026-09-26.md`). If workers ever spin before parking, the 79 µs goes
+# away and this margin should come back down to 2×. The two move together.
+# Tier follows `_L1_MT_SLICE`: a multiple of a validated literal is a validated literal, not a derivation.
+# The 2× itself IS argued from a measurement — the parked-pool fork-join is up to 110× the back-to-back
+# one, so the margin buys the single-shot caller a floor it cannot otherwise get — but the thing it
+# multiplies is not derived from any detected const, so the product cannot be either.
+# PDM: Literal — 2× margin over the 2-worker break-even of a literal floor, because the effective fork-join is up to 110× the back-to-back one once the pool has parked and the library cannot tell which caller it has.
+const _L1_MT_MIN = 4 * _L1_MT_SLICE   # req8-ok: validated literal, see `_L1_MT_SLICE` above
+
+"""
+    _l1_workers(bytes, n, ::Type{T}) -> Int
+
+Workers to split a BLAS-1 call across; `1` means "run it serially on the calling thread". `bytes` is the
+call's whole working set across every live stream. Capped by the threads that exist, by the byte floor,
+and by giving each worker at least one whole vector's worth of elements — a worker with a partial vector
+is a worker running the scalar tail, which costs more than the thread saves.
+"""
+@inline function _l1_workers(bytes::Int, n::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1                       # the single atomic read that keeps the serial entry cheap
+    # The pool exists for Float64 and Float32 only (`_gemm_poolvec`), and this test const-folds, so a
+    # complex or Dual entry never reaches the compare below.
+    (T === Float64 || T === Float32) || return 1
+    W = _vwidth(T)
+    (bytes < _L1_MT_MIN || n < 2 * W) && return 1
+    # ⚠ A `nw <= nthreads() - 1` CAP WAS TRIED HERE AND REVERTED — do not re-add it without a measurement
+    # that reproduces. The argument for it is sound on paper: the pool holds `nthreads() - 1` workers and
+    # the DRIVER runs the last chunk, so `nw == nthreads()` gives every thread a task and leaves the GC and
+    # libuv threads nowhere, which a microsecond-scale call cannot amortise. wintermute at `nw = 6` under
+    # `-t 6` does read pathologically (469 µs at n=3e5 against 25.7 at nw=5, threads pinned, 16 rounds).
+    #
+    # It was reverted because the numbers do not reproduce. `nw = 5` is UNCHANGED by such a cap, and across
+    # two runs of identical code on a quiet, verified-locked box it read 25.69 µs and then 172.50 µs — a 7x
+    # move with nothing to attribute it to. So run-to-run variation at this cell exceeds the effect the cap
+    # was meant to fix, and shipping it would have been a behavioural change resting on noise.
+    #
+    # Level 3 would have needed excluding anyway, and that part IS reproducible: `gemm` n=512 is BEST at
+    # nw=6 (84.6 GFLOP/s, spread 1.17x, against 82.3 at nw=5) because a millisecond call amortises the
+    # round-trip. See kb/findings/threaded-l1-arm-is-bimodal-above-four-workers.md.
+    return max(1, min(nt, bytes ÷ _L1_MT_SLICE, n ÷ W))
+end
+
+"""
+    _l1_chunk(n, nw, i, ::Type{T}) -> (i0, len)
+
+Worker `i`'s contiguous element range, zero-based start. Boundaries are whole vector widths so every
+chunk's SIMD body starts where a serial one would; the last chunk carries the ragged tail.
+
+Elementwise BLAS-1 is bitwise invariant under ANY partition — each element's arithmetic depends only on
+its own inputs — so unlike `_tri_chunk` this needs no flop balancing and unlike `_gemm_chunk` no route
+alignment. What it must NOT do is overlap, which would be a write race.
+"""
+@inline function _l1_chunk(n::Int, nw::Int, i::Int, ::Type{T}) where {T}
+    W = _vwidth(T)
+    nv = n ÷ W                               # whole vectors to deal out; the remainder rides the last
+    per = cld(nv, nw)
+    i0 = (i - 1) * per * W
+    i0 >= n && return (0, 0)
+    len = i == nw ? n - i0 : min(per * W, n - i0)
+    return (i0, max(0, len))
+end
+
 @inline function _gemm_workers(m::Int, n::Int, k::Int)
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
@@ -3817,6 +3953,49 @@ const _MT_KIND_TRSMR = 4
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_TRMMR = 5
+# BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is the
+# WHOLE vector length (which is also the route width) and `n` is 1.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_AXPY = 6
+# BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each worker
+# reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver folds them in
+# index order afterwards. The fold is the driver's, not a worker's, which is what keeps the order fixed.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_DOT = 7
+# Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_ASUM = 8
+# Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
+#
+# THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently: `_nrm2`
+# takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite block partials can
+# still reach Inf, which the guard catches; and a block is smaller than the whole vector, so a value that
+# overflowed one long accumulator may now stay finite and take the fast path. That is a more accurate
+# answer, not a different contract. Crucially the grid is fixed, so WHICH path runs cannot vary with the
+# worker count, which is what req#11 asks of it.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SUMSQ = 9
+# x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SCAL = 10
+# y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_COPY = 11
+# x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SWAP = 12
+
+# The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
+# adding an unrelated kind cannot silently join the set.
+@inline _is_reduction(kind::Int) =
+    kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
 
 """
     _syrk_workers(n, k) -> Int
@@ -3905,6 +4084,13 @@ end
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SUMSQ && return _sumsq_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SCAL && return _scal_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_COPY && return _copy_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4042,6 +4228,143 @@ end
         return nothing
     end
     _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
+    return nothing
+end
+
+# `y .+= a .* x` over this worker's element range. Nothing is packed, nothing is shared and no barrier is
+# taken: the ranges are disjoint and every element's result depends only on its own inputs.
+#
+# `p.m`, NOT `len`, is handed to the kernel as the route width. That is req#11: `_axpy_simd!` picks its
+# arm from two size-keyed predicates whose arms are not bitwise equivalent, so a chunk routing from its
+# own length would compute different last bits than the serial call. Compute on the slice, route from the
+# whole.
+# ── THE REDUCTION PARTIALS BUFFER ───────────────────────────────────────────────────────────────────
+# A PROCESS GLOBAL IS SOUND for it, by the same argument `_GPKSH_F64` records: the pool admits one job at
+# a time under `p.busy`, the driver sizes this inside that claim, and each worker writes only the block
+# indices it owns. Nothing here is held across a yield by a caller, so it needs no task ownership.
+#
+# A bare `const` Vector rather than a `OncePerProcess`: an owner reachable from a kernel takes a `lock()`
+# whose first call descends through `yield()`/`wait()` into Base's `OncePerThread{Task}` scheduler, which
+# the optimiser cannot get through — see the note at `_gemm_poolvec`.
+const _REDP_F64 = Float64[]
+const _REDP_F32 = Float32[]
+@inline _red_partials(::Type{Float64}) = _REDP_F64
+@inline _red_partials(::Type{Float32}) = _REDP_F32
+
+# Grow the partials buffer before the job is published. CALLED FROM THE DRIVER, INSIDE THE CLAIM — never
+# from a chunk body, which must not allocate: the driver and every idle worker are in spin/wait loops
+# with nowhere for a GC to progress from, and the symptom is a swallowed worker exception or a silent
+# hang depending on the interleaving. Same rule as `_gpack_prefit!`.
+#
+# GROWTH GOES THROUGH `_ws_grow!`, the one registered `@noinline` growth barrier, rather than a bare
+# `resize!` — the same convention every other pool here follows, and it costs nothing: `_ws_grow!`'s body
+# IS `length(v) < n && resize!(v, n)`.
+#
+# It is a convention, not a repair, and the difference was measured. `kind` is a runtime argument of a
+# `@noinline` callee, so this branch looks live on a GEMM call and an unregistered `resize!` here ought to
+# break `gemm!`'s all-paths allocation proof. It does not: that proof is barrier-exempted for `gemm!`
+# either way, and StrictModeTest falls back to a steady-state IR scan for it. A/B'd against the bare
+# `resize!` form, `test/strictmode_tests.jl`'s "statically allocation-free" item is byte-identical in
+# verdict and in its exemption notice. So registering the site buys correctness IF that exemption is ever
+# lifted, and nothing today — do not cite it as the reason the proof holds.
+@inline function _red_prefit!(::Type{T}, nblk::Int) where {T}
+    _ws_grow!(_red_partials(T), nblk)
+    return nothing
+end
+
+# One worker's share of the BLOCK GRID — block indices, not elements. Contiguous so each worker streams,
+# and it is the grid that the fold order follows, so this decides only WHO computes a partial.
+@inline function _red_chunk(nblk::Int, nw::Int, i::Int)
+    per = cld(nblk, nw)
+    b0 = (i - 1) * per + 1
+    b0 > nblk && return (1, 0)
+    return (b0, min(per, nblk - b0 + 1))
+end
+
+@noinline function _dot_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        # The UNCHANGED kernel on this block. Its length is the block's, never the worker's share — a
+        # block is the unit the fold order is defined over, so a worker computing several of them must
+        # still reduce each one separately or the grouping changes with `nw`.
+        prt[b] = _dot_simd(len, p.Ap + off * sz, p.Bp + off * sz, T)
+    end
+    return nothing
+end
+
+@noinline function _asum_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        prt[b] = _asum_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+@noinline function _sumsq_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    prt = _red_partials(T)
+    sz = sizeof(T)
+    for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        prt[b] = _sumsq_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+# `x .*= a` over this worker's element range. Elementwise, so no accumulation crosses the partition —
+# but `_scal_simd!` does carry an L1-residency branch, so `p.m` is handed over as the route width for the
+# same reason axpy does it: compute on the slice, route from the whole.
+@noinline function _scal_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    _scal_simd!(len, p.alpha, p.Cp + i0 * sizeof(T), p.m)
+    return nothing
+end
+
+@noinline function _axpy_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _axpy_simd!(len, p.alpha, p.Ap + off, p.Cp + off, 0, p.m)
+    return nothing
+end
+
+# NO ROUTE TOKEN, and that is checked rather than assumed: `_copy_simd!` and `_swap_simd!` are a single
+# unrolled loop plus a scalar tail with no size-keyed predicate — no `_L1_BYTES` cut, no unroll knob — so
+# there is no branch for a worker's own length to steer. They also perform no arithmetic: copy moves
+# bytes and swap exchanges them, so no partition can change a bit and req#11 holds trivially rather than
+# by construction.
+@noinline function _copy_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _copy_simd!(len, p.Ap + off, p.Cp + off)
+    return nothing
+end
+
+@noinline function _swap_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    off = i0 * sizeof(T)
+    _swap_simd!(len, p.Ap + off, p.Cp + off)
     return nothing
 end
 
@@ -4256,10 +4579,14 @@ Threads PureBLAS's threaded kernels may use; `1` means threading is off. See [`s
 get_num_threads() = _MT_NTHREADS[]
 
 """
-    _gemm_threaded!(C, A, B, alpha, beta, tA, tB, cA, cB, nw) -> nothing
+    _gemm_threaded!(C, A, B, alpha, beta, tA, tB, cA, cB, nw, kind) -> T
 
-Run one gemm across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with
-the same result, whenever the pool is already in use — see the claim below.
+Run one job across `nw` workers by splitting the columns of `C`. Falls back to the serial path, with the
+same result, whenever the pool is already in use — see the claim below.
+
+Returns `zero(T)` for the in-place kinds, whose result is in `C`, and the folded scalar for the
+reduction kinds (`dot`, `asum`, `sumsq`), which have nowhere else to put it. The return type is `T` on
+every path, never a union: a union here propagates into every caller's inference.
 """
 # EVERY OTHER ELEMENT TYPE LANDS HERE, and this method exists for inference, not for callers. Each of
 # the six call sites decides `nw` from a VALUE (`_gemm_workers` returns 1 when the type guard fails),
@@ -4300,9 +4627,10 @@ end
     # ponytail: a single global claim, not a work-stealing scheduler. Upgrade to per-caller pools only
     # if a measurement shows nested callers starving, which needs a nested-parallel benchmark first.
     _, won = @atomicreplace p.busy false => true
-    # `_gemm_core!` returns different things on different routes, so discard it and return `nothing` on
-    # BOTH paths — otherwise this function's return type is a union and the instability propagates into
-    # every caller's inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
+    # `_gemm_core!` returns different things on different routes, so its value is discarded and every path
+    # here returns a `T` instead — `zero(T)` where the result is in `C`, the fold for a reduction. What
+    # matters is that the type is the SAME on both paths: a union return propagates into every caller's
+    # inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
     if !won
         # THE FALLBACK MUST MATCH THE JOB KIND. This ran `_gemm_core!` unconditionally, which is right
         # for a gemm and CATASTROPHIC for a syrk: it computes a full rectangular A·Bᵀ over the whole
@@ -4329,6 +4657,27 @@ end
             _trsm!(true, up, tA, cA, unit, alpha, A, C)
         elseif kind == _MT_KIND_TRSMR
             _trsm!(false, up, tA, cA, unit, alpha, A, C)
+        elseif kind == _MT_KIND_DOT
+            # A loser reduces the WHOLE vector LOCALLY and returns it, touching no shared state. The
+            # blocked form uses the same grid and the same index-order fold the winner's workers and
+            # driver would have, so the two agree bit-for-bit.
+            #
+            # IT MUST NOT USE THE PARTIALS BUFFER. That buffer is the pool's, shared, and sized only
+            # under the claim — a loser writing it would race the winner's workers, and with 24
+            # concurrent callers losing is the common case, not the rare one.
+            return _dot_blocked_serial(A.m, A.ptr, B.ptr, T)
+        elseif kind == _MT_KIND_ASUM
+            return _asum_blocked_serial(A.m, A.ptr, T)   # same reasoning as the dot branch above
+        elseif kind == _MT_KIND_SUMSQ
+            return _sumsq_blocked_serial(A.m, A.ptr, T)
+        elseif kind == _MT_KIND_SCAL
+            # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
+            _scal_simd!(C.m, alpha, C.ptr)
+        elseif kind == _MT_KIND_AXPY
+            # A loser does the whole vector, so its own length IS the route width — `nroute` stays -1,
+            # the same reasoning as gemm's and trsm's fallbacks. This reaches the identical kernel arm
+            # the winner's chunks reach, because they route from `p.m` which equals this `m`.
+            _axpy_simd!(C.m, alpha, A.ptr, C.ptr)
         elseif kind == _MT_KIND_TRMMR
             # A loser multiplies the whole of B. `_trmm_right!` routes on `size(A, 1)`, which the row
             # split leaves alone, so this reaches the kernel the winner's bands do — with `wi = 0`, the
@@ -4340,7 +4689,7 @@ end
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
         end
-        return nothing
+        return zero(T)
     end
     # SIZE THE SHARED BUFFER HERE — AFTER THE CLAIM, NOT BEFORE IT. The pool grows by
     # `push!`/`resize!`, and doing that before winning `busy` lets two large callers race on the same
@@ -4389,6 +4738,7 @@ end
     ct.sticky = true
     Base.sigatomic_begin()
     joined = false
+    red = zero(T)                # a reduction kind folds into this inside the claim; see the join below
     # TWO FLAGS, BECAUSE THE CLAIM HAS TWO RELEASE CONDITIONS. `joined` says the join finished, so no
     # worker holds `C.ptr` any more. `published` says a job generation was stored, which is the instant
     # a worker can start: before it, the pool holds nobody and the claim is safe to hand back; after
@@ -4402,6 +4752,9 @@ end
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
         # storage the winner's workers already hold pointers into.
         (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
+        # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
+        # inside a published job, and a loser that grew it could move storage a winner is writing.
+        _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -4464,6 +4817,28 @@ end
             joined = true
         end
         (@atomic p.failed) && _throw_gemm_worker()
+        # FOLD A REDUCTION HERE, INSIDE THE CLAIM. It cannot wait until after the `finally` below: that
+        # releases `busy`, and the next caller's driver resizes and rewrites the very slots this fold
+        # reads. Here the job is joined (no worker is writing) and the claim is still held (no other
+        # caller can be), which is the only window where both are true.
+        #
+        # The fold is the DRIVER's, over block INDEX, sequentially — never a worker's. That is what makes
+        # the worker count decide who computes a partial and never how the partials combine, which is the
+        # whole of req#11 for a reduction.
+        # `A.m` is the element count `_red_prefit!` sized the buffer from, and the chunks block over
+        # `p.m`. The two agree because every reduction entry passes ONE n×1 `PtrMatrix` as both `C` and
+        # `A`, and `p.m = C.m`. The loop is bounds-CHECKED so that a future path where they diverge
+        # raises here instead of reading past the partials — a caught error, not a wrong reduction.
+        if _is_reduction(kind)
+            blk = _red_block(T)                 # NOT `B` — that is this function's third argument
+            nblk = cld(A.m, blk)
+            prt = _red_partials(T)
+            s = zero(T)
+            for b in 1:nblk
+                s += prt[b]
+            end
+            red = s
+        end
     finally
         # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
         # flags answer it between them.
@@ -4487,6 +4862,105 @@ end
         ct.sticky = was_sticky
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
+    return red
+end
+
+# ── THREADED BLAS-1 ENTRY ───────────────────────────────────────────────────────────────────────────
+# A vector rides the pool as an n×1 `PtrMatrix`: `Cp` is y, `Ap` is x, `m` is the whole length. The job
+# struct needs no new field, and `m` doubles as the route width because an element range is described by
+# a length alone.
+#
+# `@noinline` and OUT OF LINE on purpose. `_axpy!` is `@inline` and that is a measured gate lever worth
+# 28.7 ns at n=1e4 (see its own note); the serial path must pay one atomic read and one compare for this,
+# never a second body to inline.
+#
+# TWO METHODS, because `_simd2` admits exactly two operand shapes: raw pointers (the C-ABI boundary and
+# the reinterpreted complex/dual buffers, where the CALLER already holds the GC root) and dense arrays
+# (the native API, where the root is the array itself).
+@noinline function _axpy_threaded!(n::Int, a::T, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        a, zero(T), false, false, false, false, nw, _MT_KIND_AXPY
+    )
+    return y
+end
+@noinline function _axpy_threaded!(n::Int, a::T, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _axpy_threaded!(n, a, pointer(x), pointer(y), nw)
+    return y
+end
+
+# THREADED REDUCTION. The driver returns the fold, computed inside the claim — see the note at the join
+# for why it cannot be done by the caller after the driver returns. Both operands ride as n×1
+# `PtrMatrix`; `A` is x and `B` is y, and `A.m` is the length the block grid is cut from.
+@noinline function _dot_threaded(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(y, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_DOT
+    )
+end
+@noinline function _dot_threaded(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x y _dot_threaded(n, pointer(x), pointer(y), nw)
+end
+
+# `asum` takes ONE operand. It still rides as two `PtrMatrix` because the job struct has two pointers and
+# the chunk body reads only `Ap`; passing x twice is cheaper than a second struct shape.
+@noinline function _asum_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_ASUM
+    )
+end
+@noinline function _asum_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _asum_threaded(n, pointer(x), nw)
+end
+
+@noinline function _sumsq_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    return _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_SUMSQ
+    )
+end
+@noinline function _sumsq_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _sumsq_threaded(n, pointer(x), nw)
+end
+
+# `x .*= a`. `C` is the operand the chunk writes, so x goes in the C slot.
+@noinline function _scal_threaded!(n::Int, a::T, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        a, zero(T), false, false, false, false, nw, _MT_KIND_SCAL
+    )
+    return x
+end
+@noinline function _scal_threaded!(n::Int, a::T, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x _scal_threaded!(n, a, pointer(x), nw)
+    return x
+end
+
+# `y .= x` and `x, y = y, x`. Both take two operands and write elementwise, so `A` is the source-ish one
+# and `C` the destination-ish one; swap reads and writes both, which the chunk body handles by passing the
+# two pointers straight to the kernel. `alpha` is unused by either and is set to one for the pool's sake.
+@noinline function _copy_threaded!(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_COPY
+    )
+    return y
+end
+@noinline function _copy_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _copy_threaded!(n, pointer(x), pointer(y), nw)
+    return y
+end
+
+@noinline function _swap_threaded!(n::Int, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_SWAP
+    )
+    return nothing
+end
+@noinline function _swap_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    GC.@preserve x y _swap_threaded!(n, pointer(x), pointer(y), nw)
     return nothing
 end
 

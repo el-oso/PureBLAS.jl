@@ -31,6 +31,55 @@ case "$(hostname)" in
     neuromancer) MASK=0,1,2,3,4,5,6 ;;
     *)           MASK="" ;;
 esac
+# `PBHOT_MASK` overrides it, and `PBHOT_MASK=none` runs unpinned. The mask is itself a subject of
+# investigation — the per-box default puts SEVEN CPUs over SIX physical cores, so one core always holds
+# two of the process's threads, and whether those two are both pool WORKERS is a question the default
+# cannot be used to answer. Changing it requires a restart, which is why this exists rather than a flag.
+if [ -n "${PBHOT_MASK:-}" ]; then
+    [ "$PBHOT_MASK" = none ] && MASK="" || MASK="$PBHOT_MASK"
+fi
+
+# ── CHECK THE CLOCK BEFORE MEASURING, AND RELOCK IF THE BOX LETS US ─────────────────────────────────
+# A probe that informs a decision is a measurement, and a measurement off the base-clock pin is INVALID
+# rather than merely noisy. `fleet_refresh.sh` already refuses to sweep an unlocked box; a probe had no
+# such check, so it was left to whoever remembered.
+#
+# It was not remembered. neuromancer — a LAPTOP, where things happen around it — dropped its pin three
+# times in one session, reporting `boost=0` and `pin=2000-2000` while running at 4763 MHz, because the
+# SETTINGS look locked and only the achieved-under-load figure sees it. One whole probe was measured at
+# 2.4x the pinned clock and had to be discarded.
+#
+# `CORE` MATTERS: the default in fleet_freqlock.sh is 8, which is neuromancer's bench core, so verifying
+# on another box without setting it measures a core the work does not run on. One per box, matching
+# `MASK` above and `fleet_refresh.sh`.
+#
+# RELOCKING NEEDS NO SUDO ON NEUROMANCER ONLY, via the root-owned setuid helper at
+# /usr/local/sbin/pureblas-cpufreq (built from bench/tools, Go, installed there and nowhere else). That is
+# the difference between "ask a human and wait" and "relock the box and carry on" mid-session — so where
+# the helper exists this relocks and continues, and where it does not it says what to run and refuses.
+#
+# `PBHOT_NOLOCK=1` skips it, for a probe that is not a measurement (a correctness check, a code dump).
+case "$(hostname)" in
+    wintermute)  VCORE=2 ;;
+    galen)       VCORE=6 ;;
+    neuromancer) VCORE=8 ;;
+    *)           VCORE="" ;;
+esac
+_lockok() { CORE="${VCORE:-8}" bash "$(dirname "$0")/fleet_freqlock.sh" verify 2>&1 | grep -q '✅'; }
+if [ -z "${PBHOT_NOLOCK:-}" ] && [ -n "$VCORE" ] && [ -r /sys/devices/system/cpu/amd_pstate/status ]; then
+    if ! _lockok; then
+        echo "[probe.sh] clock NOT locked on $(hostname) (bench core $VCORE) — relocking" >&2
+        CORE="$VCORE" bash "$(dirname "$0")/fleet_freqlock.sh" lock >&2 2>&1 || true
+        if ! _lockok; then
+            echo "[probe.sh] STILL not locked. A probe measured off the base-clock pin is INVALID, not" >&2
+            echo "           noisy — refusing. Run: sudo bench/fleet_freqlock.sh lock" >&2
+            echo "           (no sudo needed only where the setuid helper is installed.)" >&2
+            echo "           Set PBHOT_NOLOCK=1 if this probe is not a measurement." >&2
+            exit 2
+        fi
+        echo "[probe.sh] relocked." >&2
+    fi
+fi
 
 # `pgrep -x julia` matches the interpreter ONLY, never this wrapper — a `pgrep -f bench/hot.jl` also
 # matches the shell running this script, which makes the session look alive when it is not.

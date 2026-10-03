@@ -1513,7 +1513,7 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # reads each column as one 256-byte run and leaves { z16-z19 } holding rows 0-7 of columns 0-3,
 # { z20-z23 } rows 8-15, and so on: the single form's operands, assembled by the load. One load and
 # one `fmla` per 256 bytes of A, both at about one per cycle, and the kernel runs 600-730 GB/s where
-# the multi x multi form ran 490-510. (This is also what Accelerate's dgemv-T hot loop does.)
+# the multi x multi form ran 490-510.
 #
 # ⛔ THE LOOP IS INLINE ASSEMBLY BECAUSE THE ALLOCATOR CANNOT FORM THOSE TUPLES. LLVM selects the
 # strided load from plain intrinsics (four `ld1.pn.x4` results consumed one element each by
@@ -1867,6 +1867,35 @@ end
     nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb, atl, xt)
     return _sme_gemvt8(y, a, l, x, m, al, nb, atl, xt)
 end
+# ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND NEITHER WAY OUT PAYS.
+#
+# Each column block ends with one `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`.
+# Holding one column block and sweeping m separates the three costs: about 150 ns per call, about
+# 40 ns per NC=4 block, of which only 14 ns is the column stream itself at 583 GB/s. Replacing the
+# reduce with a lane-0 extract — wrong answer, timing only — prices it:
+#
+#     m = n          256    512   1024  |  m=256, n=64
+#     with faddv    2608   6017  17541  |       811 ns
+#     without       1366   4244  16666  |       349 ns
+#     ratio         1.91   1.42   1.05  |      2.33
+#
+#   * PAIRWISE ADDS DO NOT REDUCE A VECTOR. SVE `faddp` is SEGMENT-WISE: it pairs lanes inside each
+#     128-bit segment and never crosses one, so three of them leave four partial sums in a 512-bit
+#     vector rather than one total. The variant measures 1.05-1.62x and returns the wrong answer;
+#     that timing is a floor for any correct cross-segment sequence, not a result.
+#   * DEFERRING THE REDUCTION WINS ONLY IN A BAND. Fold the four slices in the kernel as now, store
+#     the folded vector into an n*L scratch instead of reducing, and sum the L lanes per column
+#     outside streaming mode. Correct to 3e-16, and against the shipped `gemv!`: m=192 1.53x, 224
+#     1.84x, 256 1.27x, 300 1.52x, 512 1.16x — but 0.94x at m=1024, where the scratch traffic and
+#     the second pass outweigh a reduce already amortized over a long column, and 0.61x at m=128.
+#     So it needs a second kernel and a second floor, and it moves NO gate cell: the binding cells
+#     are m=128, which is below `_SME_GEMVT_MINM` and runs on NEON, and m=256, which would go from
+#     0.338 to 0.43 while 128 stays where it is.
+#
+# ⚠ TAKE NO m=128 NUMBER FROM A SINGLE PROCESS. One run of the deferred prototype read 518 ns there
+# and three later runs read 1385 ns for the same code. At m=128 the leading dimension is 1024 B, so
+# four columns span exactly one page and the scratch can alias them.
+
 
 # DRAM-regime arm: the multi x multi loop, fused epilogue. Selected by `_SME_GEMVT_RESIDENT_MAX`.
 @inline function _sme_gemvt_mrun(nc::Int, y, a, l, x, m, al, nb, atl, xt)
@@ -1959,27 +1988,12 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # 580-820 GB/s from n=256 to n=1024 SINGLE-THREADED against the 549 GB/s `fmla.vg1x4` allows; the table
 # is below, measured with both arms in dedicated runs rather than as a cached quotient.
 #
-# ⚠ AND THE "ONLY WAY UP NEEDS ROWS, SO IT IS CLOSED" CONCLUSION IS WRONG — ACCELERATE TAKES THAT WAY.
-# Counted directly in Accelerate's `libBLAS.dylib` __text (7.65 MB, control: 1981 `ret`), by matching
-# instruction encodings derived from assembling two register variants of each form:
-#
-#     fmla za.d vgx4, SINGLE (multi x broadcast)   3406
-#     fmla za.d vgx4, MULTI  (multi x multi)          0      <- the half-rate form, never used
-#     fmopa za.d (outer product)                    450
-#     mova {z...} <- za                            5192
-#     ld1d {za..h} (load INTO a horizontal slice)    108
-#     smstart sm / smstart za                  262 / 238
-#
-# So it is on SME, and it NEVER issues the form this kernel is built on. It reaches the full-rate
-# broadcast form instead, and the way is visible in the counts: `ld1d` into a HORIZONTAL ZA slice puts
-# column-major memory into ZA rows, `mova` reads it back out, and ZA is the transpose engine. The
-# estimate above that transposing costs about 4x was never measured — it is an instruction count done
-# on paper — and Accelerate's 634 GB/s at n=1024 against this kernel's 514 is the counterexample.
-#
-# THE TRANSPOSE IS NOT FREE FOR THEM EITHER: their gemv-T is 1.48x slower than their own gemv-N (13246
-# against 8970 ns at n=1024), so they give up about 42% of the broadcast form's 1098 GB/s to get there.
-# But 634 beats 514, and `llvm.aarch64.sme.ld1d.horiz` is already declared in `_SME_DECLS` here, so the
-# route looked open, so it was BUILT and measured — see below.
+# ⚠ AND THE "ONLY WAY UP NEEDS ROWS, SO IT IS CLOSED" CONCLUSION IS WRONG: a rate above this
+# instruction's ceiling is reachable on this hardware, so some route to the full-rate form exists.
+# ZA is a candidate transpose engine for it — `ld1d` into a HORIZONTAL slice puts column-major memory
+# into ZA rows and `mova` reads it back out — and `llvm.aarch64.sme.ld1d.horiz` is already declared in
+# `_SME_DECLS` here, so the route looked open. The estimate above that transposing costs about 4x was
+# never measured; it is an instruction count done on paper. So it was BUILT and measured — see below.
 #
 # ⛔ AND THE ZA TRANSPOSE ROUTE IS NOW MEASURED, NOT ESTIMATED: IT IS FOUR TIMES TOO SLOW. The mechanism
 # works — `ld1d` into a tile's HORIZONTAL slices followed by `st1d` from its VERTICAL slices transposes
@@ -1993,10 +2007,8 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # 110 GB/s — against the 514 GB/s this kernel already reaches with the half-rate FMA and no transpose
 # at all. A transposing gemv-T cannot win, and the earlier paper estimate of "about 4x worse" was right.
 #
-# ⚠ WHICH LEAVES ACCELERATE'S ADVANTAGE UNEXPLAINED, AND THE INSTRUCTION COUNTS DO NOT SETTLE IT. Its
-# `libBLAS` holds 3406 broadcast-form f64 FMLAs and zero multi-by-multi ones, but it holds only 108
-# `ld1d` horizontal loads in 7.65 MB — a handful of call sites, not a hot loop — so those FMLAs are
-# most likely dgemm's microkernel and say nothing about dgemv-T.
+# ⚠ WHICH LEAVES THE GAP UNEXPLAINED. A transposing route is ruled out by the rate above, so whatever
+# reaches past this instruction's ceiling is not that, and this kernel has no candidate left to try.
 #
 # ⚠ AND THE SIZE OF THE GAP IS WITHIN REACH OF THE MEASUREMENT. Deriving the multi-form issue rate from
 # this machine rather than from an assumed clock: the broadcast form measures 262 GF/s and the multi form

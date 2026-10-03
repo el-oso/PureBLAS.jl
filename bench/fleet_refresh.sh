@@ -87,13 +87,47 @@ MODE="${1:-pb}"
 # per-run authorisation exactly as before.
 case "$MODE" in
     pb)   ARMSARG="${SWEEP_ARMS:-arms=pb}" ;;
-    full) ARMSARG="" ;;
+    # `full` MUST NAME THE ARMS. It used to pass an empty string, because omitting `arms=` once meant
+    # "measure every arm" — plots.jl flipped that default to PB-ONLY on 2026-09-12 so that forgetting
+    # the flag could not silently re-run the vendors, and this branch was not updated with it. The
+    # result was a mode that printed "all three arms per cell" and measured one: on 2026-09-29 a
+    # wintermute re-sweep ran four groups that way, writing FRESH PureBLAS arms at a new 3501 MHz pin
+    # against vendor arms still cached from 2793 MHz — a 24% error in PureBLAS's own favour, which is
+    # the exact defect the re-sweep existed to remove. The banner below now prints the real string, so
+    # the claim and the argument cannot drift apart again.
+    full) ARMSARG="arms=pb,${SWEEP_REFS:-openblas,aocl}" ;;
     *)    echo "usage: $0 [pb|full]   (pb = reuse cached reference arms; full = re-measure all arms)"; exit 2 ;;
 esac
 
 echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
-[ "$MODE" = full ] && echo "=== FULL ARMS: all three arms per cell in one machine state (anchors match by construction) ==="
-echo "=== PRE-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
+[ "$MODE" = full ] && echo "=== FULL ARMS: passing '$ARMSARG' — every named arm measured per cell in one machine state ==="
+# PRE-LOCK MUST PASS, not merely be readable. The per-group check below compares each reading against
+# the OPENING one, so it catches a lock that lets go mid-sweep but not a box that was never locked: an
+# unlocked box reads a stable boost clock and drifts 0%. neuromancer opened a sweep at 4774 MHz against
+# its 2000 MHz pin and the group measured to completion. Only the verify verdict distinguishes the two.
+echo "=== PRE-LOCK ==="
+_pre=$(bash bench/fleet_freqlock.sh verify 2>&1)
+printf '%s\n' "$_pre" | tail -2
+if ! printf '%s' "$_pre" | grep -q '✅'; then
+    echo "=== ABORT: the box is not locked. Run 'bench/fleet_freqlock.sh lock' first — a gate"
+    echo "    measurement taken off the base-clock pin is INVALID, not merely noisy. ==="
+    exit 2
+fi
+# AND, FOR A THREADED SWEEP, THAT THE PIN HOLDS WITH EVERY CORE BUSY. `verify` above loads ONE core
+# with an integer loop, which is not the workload a threaded sweep runs and cannot see a PACKAGE power
+# limit. wintermute passed it at a 2813 MHz pin while six cores oscillated 2332-2804 MHz on a 60 W
+# supply, and every threaded sweep since ran under that ✅ — 1208 of its cached arms are stamped below
+# the pin, and 413 cells compare two power states rather than two libraries.
+if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | grep -q 'pb_mt'; then
+    echo "=== PRE-LOCK (all cores) ==="
+    _premt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+    printf '%s\n' "$_premt" | tail -3
+    if ! printf '%s' "$_premt" | grep -q '✅'; then
+        echo "=== ABORT: the pin does not hold with every core loaded, so a THREADED sweep here"
+        echo "    measures the power limit rather than the library. ==="
+        exit 2
+    fi
+fi
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
