@@ -2145,6 +2145,25 @@ _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
 # groups to one would remove three folds out of five ops and still land above the NEON time.
 # Accelerate reaches about 457 GB/s here, which is matrix-unit throughput at a per-column cost this
 # kernel shape does not have. Moving this cell needs a different decomposition, not a better constant.
+#
+# ⛔ THE FLOOR IS NOT WHAT HOLDS THE GATE'S BINDING CELL DOWN, AND LOWERING IT MAKES THINGS WORSE.
+# The square n=128 is gemv-T's worst gate cell, it sits below this floor, and the obvious move is to
+# let SME have it. Measured whole-call, five INDEPENDENT PROCESSES, GB/s, every case verified against
+# OpenBLAS:
+#
+#     n        NEON          SME        SME/NEON
+#     128   158-165        103.0-103.7   0.62-0.66
+#     100   171-179         64.8-64.9    0.36-0.38
+#      64   168-174        117.9-119.4   0.68-0.71
+#
+# SME is 1.4-2.8x SLOWER at every one of them, and the five processes agree to within 2%. The floor is
+# correct as it stands.
+#
+# ⚠ AND A SINGLE-PROCESS READING SAYS THE OPPOSITE, which is why this table is cross-process. In one
+# session the same n=128 cell read SME 184 GB/s against NEON 154 — a 1.20x WIN — and the SME whole
+# call there has also measured 374, 727, 1042 and 1300 ns in four different harnesses in one sitting.
+# Anything cut against one of those is fitted to noise. The cell's own instability is recorded above;
+# this is the second time it has produced a confident wrong answer, so take the cross-process form.
 # PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
