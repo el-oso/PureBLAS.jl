@@ -2270,13 +2270,34 @@ end
         _ger_panel_driver!(m, n, α, x, y, A, Val(8))
 end
 
+# THE THREADING ENTRY. It sits here rather than in `_ger!` so that `_sme_ger_eligible` keeps its
+# position AHEAD of the pool without a second guard: `_ger!` asks SME first and only falls through to
+# this. That ordering is required, not incidental — the matrix unit is shared by the cluster, so an
+# SME-eligible call that took the pool would trade one fast engine for several slow ones.
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T <: BlasReal}
+    nw = _ger_workers(m, n, T)
+    if nw > 1
+        GC.@preserve A x y _ger_threaded!(m, n, α, _ptr(x), _ptr(y), pointer(A), stride(A, 2), nw)
+        return A
+    end
+    return _ger_simd!(m, n, α, x, y, A, n)
+end
+
+# `nroute` IS THE UNDIVIDED COLUMN COUNT, and for `ger` it is a PERFORMANCE token rather than a req#11
+# one — which is worth stating, because every other route token in this library is a correctness
+# device. The two arms below are bit-for-bit identical: each folds α into `y[j]` first (`ayj` here,
+# `ay$c` in `_ger_panel!`) and each `A[i,j]` is written exactly once, so there is no accumulation
+# order for a partition to change. What a column-split worker WOULD get wrong is the arm: holding
+# 1/nw of the columns it sees 1/nw of the bytes and takes the cache-resident per-column path where
+# the whole problem wants the DRAM panel. Threaded callers pass the whole `n`; everyone else passes
+# their own, which is the undivided case.
+@inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A, nroute::Int) where {T <: BlasReal}
     # DRAM-bound (A > L3) → m-inner panel with a per-box stream count (`_ger_np()`: Preference or auto-measured). The optimal number
     # of concurrent wide-SIMD write-streams is an intrinsic per-core property with NO derivable formula and
     # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
     # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
     # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
-    m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
+    m * nroute * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest

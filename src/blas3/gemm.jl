@@ -3996,6 +3996,12 @@ const _MT_KIND_SWAP = 12
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_IAMAX = 13
+# ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in the
+# library where the split needs no correctness argument at all: there is no accumulation chain, each
+# `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GER = 14
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4030,6 +4036,21 @@ the cap would trade a rare idle worker for narrower chunks everywhere.
     flops = n * (n + 1) * k
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
     return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+end
+
+"""
+    _ger_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a column-split `ger`. `A` is read AND written, so its traffic is 2 bytes per element
+and that is what the admission floor should see — `x` and `y` are one vector each beside an m×n
+matrix. Capped by the COLUMN block count rather than the element count: a worker owns whole columns
+and `_gemm_chunk` hands them out in `_NR`-wide blocks, so asking for more workers than there are
+blocks leaves some of them with nothing to do and the join waits for a round trip that bought
+nothing.
+"""
+@inline function _ger_workers(m::Int, n::Int, ::Type{T}) where {T}
+    nw = _l1_workers(2 * m * n * sizeof(T), m * n, T)
+    return max(1, min(nw, cld(n, _NR)))
 end
 
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
@@ -4103,6 +4124,7 @@ end
     p.kind == _MT_KIND_COPY && return _copy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
     p.kind == _MT_KIND_IAMAX && return _iamax_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4390,6 +4412,21 @@ end
         v = _iamax_route!(p.m, len, p.Ap + off * sz, g)
         idx[b] = iszero(v) ? 0 : off + v
     end
+    return nothing
+end
+
+# ger over this worker's columns. `x` is handed over WHOLE — every column of the rank-1 update needs
+# all of it — while `y` and `A` are offset to the worker's column range. `p.n` goes in as the route
+# token so the arm matches the undivided problem's; see `_ger_simd!` for why that is a performance
+# concern here and not a correctness one.
+@noinline function _ger_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    _ger_simd!(
+        p.m, len, p.alpha, p.Ap, p.Bp + j0 * sz,
+        PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc), p.n
+    )
     return nothing
 end
 
@@ -4740,6 +4777,11 @@ end
             # not touch `_REDI` for the reason stated in the dot branch. The index leaves as `T`
             # because that is this function's return type; `_iamax_mt_nmax` bounds the conversion.
             return T(_iamax_blocked_serial(A.m, A.ptr))
+        elseif kind == _MT_KIND_GER
+            # A loser does the whole rank-1 update itself. Its own column count IS the route width,
+            # so it reaches the same arm the winner's chunks reach — they route from `p.n`, which is
+            # this `C.n`.
+            _ger_simd!(C.m, C.n, alpha, A.ptr, B.ptr, C, C.n)
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -5029,6 +5071,18 @@ end
 end
 @noinline function _iamax_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _iamax_threaded(n, pointer(x), nw)
+end
+
+# ger: `C` is the m×n matrix the chunks write, `A` is x and `B` is y. The caller holds the
+# `GC.@preserve`, so this takes bare pointers and never a container.
+@noinline function _ger_threaded!(
+        m::Int, n::Int, α::T, xp::Ptr{T}, yp::Ptr{T}, Ap::Ptr{T}, lda::Int, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_GER
+    )
+    return nothing
 end
 
 # `x .*= a`. `C` is the operand the chunk writes, so x goes in the C slot.

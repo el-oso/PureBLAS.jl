@@ -290,3 +290,91 @@ end
         @test norm(Ap .- Ar) / max(norm(Ar), eps(Float64)) < tol(real(T))
     end
 end
+
+# ── req#11 FOR ger: bitwise reproducibility across thread counts ───────────────────────────────────
+#
+# ger is the one threaded op whose invariance needs no argument about accumulation order: there is no
+# reduction anywhere, every `A[i,j]` is written exactly once, and both route arms fold α into `y[j]`
+# before touching `x`, so a column partition cannot change a single bit. The test still earns its
+# place, because the things that CAN go wrong are not about arithmetic:
+#
+#   * a column split that overlaps (a write race) or leaves a gap (a stale element), which is what
+#     `_gemm_chunk`'s `_NR` rounding has to get right at the ragged end;
+#   * the ROUTE, which is keyed on the A byte count and so moves under a split — bits are safe either
+#     way, but the sizes below straddle `_L3_BYTES` deliberately so both arms are exercised;
+#   * the lost-claim fallback, which must reach the same arm as the winner's chunks.
+#
+# Sizes: `n` large enough that `_ger_workers` admits every worker, and an `n` that is NOT a multiple
+# of `_NR` so the last chunk is ragged.
+@testitem "ger: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            L3 = P._L3_BYTES
+            # One shape comfortably inside L3 (the per-column arm) and one past it (the panel arm),
+            # each in a square-ish and a ragged-n variant.
+            # `s` is the square side whose A is exactly L3, so `s ÷ 2` is a quarter of L3 — safely on
+            # the per-column arm — and `s` itself trips the `>= _L3_BYTES` panel predicate. Kept AT
+            # the boundary rather than a multiple past it: four copies of a 4x-L3 matrix is half a
+            # gigabyte and buys no coverage the boundary shape does not already give.
+            mns = let s = isqrt(L3 ÷ sizeof(T))
+                ((s ÷ 2, s ÷ 2), (s ÷ 2, s ÷ 2 + 7), (s, s), (s, s + 7))
+            end
+            @testset "m=$m n=$n" for (m, n) in mns
+                A0 = randn(T, m, n)
+                x = randn(T, m)
+                y = randn(T, n)
+                α = T(0.75)                      # NOT a power of two
+                P.set_num_threads(1)
+                want = (t = copy(A0); P.ger!(α, x, y, t); t)
+                for nw in (2, nt)
+                    P.set_num_threads(nw)
+                    @test bitsame((t = copy(A0); P.ger!(α, x, y, t); t), want)
+                end
+                P.set_num_threads(1)
+            end
+        end
+    end
+end
+
+# The invariant item above passes for a library that ignores every thread it is given, so it needs a
+# liveness gate — the same `p.gen` witness the L1 items use — and a concurrent exercise of the
+# lost-claim path, which is the branch a worker count can reach that is NOT the happy one.
+@testitem "ger: the pool runs, and losing the claim gives the same answer" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        # AT the L3 boundary, with a ragged `n`: enough to admit every worker and to take the panel
+        # arm, while keeping one copy near L3 rather than a multiple of it. The concurrent block
+        # below holds `nt + 1` copies live at once, so the per-copy footprint is the binding cost.
+        s = isqrt(P._L3_BYTES ÷ sizeof(Float64))
+        m, n = s, s + 7
+        A0 = randn(m, n); x = randn(m); y = randn(n)
+        g0 = @atomic p.gen
+        A1 = copy(A0); P.ger!(0.75, x, y, A1)
+        @test (@atomic p.gen) != g0                    # the pool was actually dispatched
+        P.set_num_threads(1)
+        A2 = copy(A0); P.ger!(0.75, x, y, A2)          # serial reference
+        @test A1 == A2
+        # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
+        # Every result must equal the serial one, which is what pins the fallback to the same arm.
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(A0); P.ger!(0.75, x, y, t); t) for _ in 1:(nt + 1)]
+        for t in tasks
+            @test fetch(t) == A2
+        end
+        P.set_num_threads(1)
+    end
+end

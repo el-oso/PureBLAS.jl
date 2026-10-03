@@ -537,6 +537,7 @@ end
         @test ran(() -> P.scal!(2.5, copy(x)))
         @test ran(() -> P.blascopy!(similar(y), x))
         @test ran(() -> P.swap!(copy(x), copy(y)))
+        @test ran(() -> P.iamax(x))
         P.set_num_threads(1)
     end
 end
