@@ -306,6 +306,7 @@ Read the SHAPE, not just the peak: a curve that climbs with `n` is a routine amo
 fork-join correctly.
 
 ![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
+![BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l2.svg)
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
 
