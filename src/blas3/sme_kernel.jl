@@ -1541,145 +1541,6 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so CROSSES
 # the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
 # 0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
-function _gemvt_ir(nc::Int, defer::Bool)
-    nc % 4 == 0 || throw(ArgumentError(
-        "SME gemv-T: NC=$nc must be a multiple of 4: the strided-register load tuple spans four columns"))
-    nc <= 2 * _SME_L || throw(ArgumentError(
-        "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
-    L = _SME_L
-    nq = nc ÷ 4
-    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
-    # One 4L-row window of NC columns. Operands: $0 column block, $1 lda in bytes, $2 x; x9 holds the
-    # row offset in elements, x10 walks the columns, w8/w11 are the ZA group bases 0 and 8.
-    win = String[]
-    push!(win, "mov x10, \$0", "ld1d {z0.d - z3.d}, pn8/z, [\$2, x9, lsl #3]")
-    for qq in 0:(nq - 1)
-        for j in 0:3
-            push!(win, "ld1d {z$(16 + j).d, z$(20 + j).d, z$(24 + j).d, z$(28 + j).d}, pn8/z, [x10, x9, lsl #3]",
-                       "add x10, x10, \$1")
-        end
-        for k in 0:3
-            g = 4qq + k
-            push!(win, "fmla za.d[$(g < 8 ? "w8" : "w11"), $(g % 8), vgx4], {z$(16 + 4k).d - z$(19 + 4k).d}, z$k.d")
-        end
-    end
-    setup = ("ptrue pn8.d", "mov w8, #0", "mov w11, #8", "mov x9, #0")
-    loop = join((setup..., "1:", win..., "add x9, x9, #$(4L)", "cmp x9, \$3", "b.lt 1b"), "\\0A")
-    tailw = join((setup..., win...), "\\0A")
-    # ⚠ The blocks WRITE ZA and the constraint string cannot say so: AArch64 inline asm has no `~{za}`
-    # clobber. Their order against `llvm.aarch64.sme.zero` before them and `read.vg1x4` after them
-    # rests on `sideeffect` plus `~{memory}` here and on those intrinsics being side-effecting calls
-    # themselves — LLVM then keeps all three in program order. Drop `sideeffect` or `~{memory}` and
-    # the zero or the reads may legally move across the loop, and nothing would report it.
-    clob = join(("~{z$i}" for i in 0:31), ",") * "," * join(("~{p$i}" for i in 0:15), ",") *
-           ",~{x8},~{x9},~{x10},~{x11},~{memory},~{cc}"
-    io = IOBuffer()
-    print(io, """
-declare void @llvm.aarch64.sme.za.enable()
-declare void @llvm.aarch64.sme.za.disable()
-declare void @llvm.aarch64.sme.zero(i32)
-declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
-declare void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32,
-  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
-declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
-
-define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
-  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
-  ret void
-}
-
-define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
-entry:
-  call void @llvm.aarch64.sme.za.enable()
-  %ldab = shl i64 %lda, 3
-  %anyb = icmp sgt i64 %nblk, 0
-  br i1 %anyb, label %blk, label %fin
-
-blk:
-  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
-  %jb = mul nsw i64 %b, $nc
-  %yblk = getelementptr inbounds double, ptr %y, i64 %jb
-  %aoff = mul nsw i64 %jb, %lda
-  %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
-  call void @llvm.aarch64.sme.zero(i32 255)
-  %anyr = icmp sgt i64 %m, 0
-  br i1 %anyr, label %row, label %tailchk
-
-row:
-  call void asm sideeffect "$loop", "r,r,r,r,$clob"(ptr %ablk, i64 %ldab, ptr %x, i64 %m)
-  br label %tailchk
-
-tailchk:
-  %notl = icmp eq ptr %atl, null
-  br i1 %notl, label %rd, label %tail
-
-tail:
-  %atlblk = getelementptr double, ptr %atl, i64 %aoff
-  call void asm sideeffect "$tailw", "r,r,r,$clob"(ptr %atlblk, i64 %ldab, ptr %xt)
-  br label %rd
-
-rd:
-""")
-    # The ragged rows ride in the SAME ZA accumulators as the full-window rows, so the drain below
-    # covers them too — one extra 4L-row window per column instead of a second pass over every
-    # column, which would double the per-column drain count. `%xt` carries zeros wherever the window
-    # overlaps rows the loop above already accumulated, so the overlap contributes nothing.
-    #
-    # Drain: column 4q+j is slice j of the four groups 4q..4q+3, one per row phase. The four phases
-    # are partial sums of ONE dot product, so adding them is a reduction and its order is free. They
-    # are folded IN ZA — three group adds, then one group read back per quad — rather than read out
-    # and added in z registers (four reads and twelve `fadd` per quad): ZA is the arithmetic unit on
-    # this part, and the z-register fold measures 0.87-0.90x of this at m=128, 0.95-0.98x at 256-384
-    # and within noise above (in-process A/B, deferred arm).
-    for qq in 0:(nq - 1)
-        for (src, dst) in ((4qq + 1, 4qq), (4qq + 3, 4qq + 2), (4qq + 2, 4qq))
-            println(io, "  %f$(src) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $src)")
-            for k in 0:3
-                println(io, "  %fv$(src)_$k = extractvalue $T4 %f$src, $k")
-            end
-            println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $dst,")
-            println(io, "    <vscale x 2 x double> %fv$(src)_0, <vscale x 2 x double> %fv$(src)_1,")
-            println(io, "    <vscale x 2 x double> %fv$(src)_2, <vscale x 2 x double> %fv$(src)_3)")
-        end
-        println(io, "  %o$(qq) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $(4qq))")
-        for j in 0:3
-            c = 4qq + j
-            println(io, "  %s$(c)_c = extractvalue $T4 %o$(qq), $j")
-            if defer
-                # DEFERRED: store the folded vector and let the caller sum its lanes outside streaming
-                # mode. `faddv` here is two thirds of the per-column cost (see `_SME_GEMVT_DEFER_MAX`),
-                # and `alpha` is applied by the caller along with the lane sum.
-                println(io, "  %sb$c = mul nsw i64 %jb, $L")
-                println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
-                println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
-                println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
-            else
-                println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
-                println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
-                println(io, "  %yo$c = load double, ptr %yp$c, align 8")
-                println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
-                println(io, "  store double %r$c, ptr %yp$c, align 8")
-            end
-        end
-    end
-    print(io, """
-  br label %bend
-
-bend:
-  %bn = add nuw nsw i64 %b, 1
-  %bdone = icmp eq i64 %bn, %nblk
-  br i1 %bdone, label %fin, label %blk
-
-fin:
-  call void @llvm.aarch64.sme.za.disable()
-  ret void
-}
-
-declare double @llvm.fmuladd.f64(double, double, double)
-""")
-    print(io, _SME_ATTRS)
-    return String(take!(io))
-end
 
 # ══ gemv-T, ZA-internal drain ═══════════════════════════════════════════════════════════════════
 #
@@ -2008,10 +1869,6 @@ end
 # Column groups in flight: multiples of four, because one strided-register load tuple spans four
 # columns, and bounded above by the vg1x4 groups ZA can address. `_SME_GEMVT_NC` picks one.
 const _SME_GEMVT_NCS = (4, 8)
-const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SME_GEMVT_NCS)
-# Same kernel, epilogue deferred: it stores each column's folded vector into a scratch strip instead
-# of reducing it in streaming mode. See `_SME_GEMVT_DEFER_MAX` for when that is the faster shape.
-const _SME_GEMVT_DEFER_IR = Dict{Int, String}(nc => _gemvt_ir(nc, true) for nc in _SME_GEMVT_NCS)
 # The multi x multi loop for the DRAM regime (`_gemvt_mm_ir`), fused epilogue only.
 const _SME_GEMVT_MM_IR = Dict{Int, String}(nc => _gemvt_mm_ir(nc) for nc in _SME_GEMVT_NCS)
 
@@ -2028,21 +1885,11 @@ const _SME_GEMVT_ARGT = Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, I
                               Ptr{Float64}, Ptr{Float64}}
 
 for nc in _SME_GEMVT_NCS
-    @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb, atl, xt) =
-        Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
-            y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
-    @eval @inline $(Symbol("_sme_gemvtd", nc))(s, a, l, x, m, al, nb, atl, xt) =
-        Base.llvmcall(($(_SME_GEMVT_DEFER_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
-            s, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
     @eval @inline $(Symbol("_sme_gemvtm", nc))(y, a, l, x, m, al, nb, atl, xt) =
         Base.llvmcall(($(_SME_GEMVT_MM_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
             y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
 end
 
-@inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb, atl, xt)
-    nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb, atl, xt)
-    return _sme_gemvt8(y, a, l, x, m, al, nb, atl, xt)
-end
 # ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND NEITHER WAY OUT PAYS.
 #
 # Each column block ends with one `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`.
@@ -2079,11 +1926,6 @@ end
     return _sme_gemvtm8(y, a, l, x, m, al, nb, atl, xt)
 end
 
-# Deferred arm. `s` is the scratch strip, `nb * _SME_L` doubles, NOT y.
-@inline function _sme_gemvt_drun(nc::Int, s, a, l, x, m, al, nb, atl, xt)
-    nc == 4 && return _sme_gemvtd4(s, a, l, x, m, al, nb, atl, xt)
-    return _sme_gemvtd8(s, a, l, x, m, al, nb, atl, xt)
-end
 
 # One scratch strip per thread, grow-only through `_ws_grow!`, so the deferred arm allocates only on a
 # thread's first call through it. `_sme_gemvt_cabi` claims it and drops it within the same call and
@@ -2105,7 +1947,7 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 #
 # THE DEFERRED ARM takes that out of streaming mode: fold the four slices as before, store the folded
 # vector into a per-column strip of `_SME_GEMVT_SCR`, and sum its `_SME_L` lanes in the caller. It is
-# correct to 3e-16 and it is what `_SME_GEMVT_DEFER_MAX` selects.
+# correct to 3e-16. Superseded by the ZA-internal drain, which needs neither the scratch nor a caller pass.
 #
 # ⛔ SVE `faddp` IS NOT AN ALTERNATIVE, and the shape of the failure is worth keeping: pairwise adds
 # are SEGMENT-WISE — they pair lanes inside each 128-bit segment and never cross one — so three of
@@ -2275,7 +2117,7 @@ const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # of four (`_SME_GEMVT_NCS`).
 # PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (4,8)
 const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
-# A pinned value outside the candidate set must fail HERE, at load: `_sme_gemvt_run`/`_sme_gemvt_drun`
+# A pinned value outside the candidate set must fail HERE, at load: the DRAM arm's dispatch
 # dispatch on NC without a fallback branch, so an unserved value would run the NC=8 kernel while
 # `_sme_gemvt_cabi` sized its blocks and scratch for the pinned one — out-of-bounds stores, silently.
 _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
@@ -2297,7 +2139,7 @@ _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
 #
 # ⚠ THE BAND USED TO BE HALF SPEED AT EVERY NON-MULTIPLE OF 4L, and it is not any more. The row tail
 # is still scalar and still runs once per column, but it was never the dominant term: the streaming
-# `faddv` was, and `_SME_GEMVT_DEFER_MAX` removes it below 640. With that gone the tail is visible as
+# `faddv` was, and the ZA-internal drain removes it entirely. With that gone the tail is visible as
 # a dip (216 and 248 sag against their neighbours) rather than as a cliff, and 168, 200, 232 — all
 # non-multiples — win by 1.19x to 1.92x. The floor moved because the reduction moved, NOT because
 # the tail was fixed; vectorising the tail was tried and measured neutral-to-worse, see the note
@@ -2343,22 +2185,6 @@ _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
 # PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
 const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
-# The m below which the deferred epilogue runs. Both what it removes (one streaming-mode `faddv` per
-# column) and what it adds (`_SME_L` doubles of scratch, written then read) are per COLUMN and O(1)
-# in m, so the choice should not depend on m, and with this kernel it does not: the deferred arm wins
-# at every m, in-process A/B at n=256, same buffers, medians of ~1e4 one-call samples:
-#
-#     m           512   640   768  1024  1536  2048  3072  4096
-#     fused GB/s  302   367   367   415   469   500   557   582
-#     deferred    520   594   553   573   603   624   642   640
-#     ratio      1.72  1.62  1.51  1.38  1.29  1.25  1.15  1.10
-#
-# The ratio falls toward 1 as the per-column cost amortizes over m and has not crossed it by the
-# DRAM regime, so there is no m to cut at: the default admits every m. The fused arm stays as the
-# knob's other setting. A crossover near 640 belongs to a kernel whose `faddv` costs less relative
-# to its stream (the multi x multi form, 490-510 GB/s); do not re-cut this one from that table.
-# PDM: Derived — both arms' costs are per column and m-independent, so the crossover is m-independent; measured, the deferred arm wins at every m, so the bound is "always". | tune: candidate, sweep m at fixed n
-const _SME_GEMVT_DEFER_MAX = @load_preference("sme_gemvt_defer_max", typemax(Int))::Int
 
 # Bytes of A up to which the strided kernel runs; above it the multi x multi loop (`_gemvt_mm_ir`)
 # does. The criterion is L2 RESIDENCY of the column stream: the strided loop is issue-bound and wins

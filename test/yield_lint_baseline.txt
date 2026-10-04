@@ -133,12 +133,9 @@ blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %fv$(src)_2, <vscale 
 blas3/sme_kernel.jl:println(io, "  %f$(src) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $src)")
 blas3/sme_kernel.jl:println(io, "  %fv$(src)_$k = extractvalue $T4 %f$src, $k")
 blas3/sme_kernel.jl:println(io, "  %h$c = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> %s$(c)_c)")
-blas3/sme_kernel.jl:println(io, "  %o$(qq) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $(4qq))")
 blas3/sme_kernel.jl:println(io, "  %r$c = call double @llvm.fmuladd.f64(double %h$c, double %alpha, double %yo$c)")
-blas3/sme_kernel.jl:println(io, "  %s$(c)_c = extractvalue $T4 %o$(qq), $j")
 blas3/sme_kernel.jl:println(io, "  %yo$c = load double, ptr %yp$c, align 8")
 blas3/sme_kernel.jl:println(io, "  %yp$c = getelementptr inbounds double, ptr %yblk, i64 $c")
-blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $dst,")
 blas3/sme_kernel.jl:println(io, "  store double %r$c, ptr %yp$c, align 8")
 
 # --- 2026-10-02, the gemv-T DRAM-regime generator (`_gemvt_mm_ir`): the multi x multi loop with its
@@ -249,14 +246,6 @@ blas3/sme_kernel.jl:println(io, "  br i1 %sdm$g, label %$lbl, label %$nxt")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sve.st1.nxv2f64(<vscale x 2 x double> %sr$sfx, <vscale x 2 x i1> %sg$sfx, ptr %sa$sfx)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sve.st1.pn.x4.nxv2f64(<vscale x 2 x double> %q$(sfx)_0, <vscale x 2 x double> %q$(sfx)_1, <vscale x 2 x double> %q$(sfx)_2, <vscale x 2 x double> %q$(sfx)_3, $SC %pn, ptr %pa$sfx)")
 blas3/sme_kernel.jl:println(io, "$lbl:")
-
-# --- 2026-09-30, the gemv-T generator's DEFERRED epilogue (`_gemvt_ir(nc, true)`). Same generator,
-#              same class as the 2026-09-28 block above: `println` into an in-memory `IOBuffer` at
-#              module load, no `@scope`, no IO lock.
-blas3/sme_kernel.jl:println(io, "  %sb$c = mul nsw i64 %jb, $L")
-blas3/sme_kernel.jl:println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
-blas3/sme_kernel.jl:println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
-blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
 
 # --- 2026-10-04, the gemv-T ZA-internal drain generator (`_gemvt_za_ir`). Same generator class as the
 #              blocks above: `println` into an in-memory `IOBuffer` at module load while the kernel IR
