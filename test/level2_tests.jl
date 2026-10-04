@@ -664,3 +664,85 @@ end
         P.set_num_threads(1)
     end
 end
+
+# ── req#11 FOR gbmv-N: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# The cheapest threaded op in BLAS-2, and the item records WHY so the next reader does not reach for
+# symv's machinery. gbmv-N splits OUTPUT ROW BANDS. A band of a BANDED matrix needs only the columns
+# within `kl + ku` of its own rows — not a strided sweep of whole rows, which is what made row bands
+# wrong for symv — so the bands are write-disjoint in `y`, every `y[i]` keeps its whole column chain
+# on one worker in ascending column order, and there is no partial, no fold and no route token.
+#
+# Two arms must both be covered, because the kernel picks between them on `kl + ku + 1` against
+# `_GBMV_CONV_MAX` (48 on AVX-512, 20 on AVX2): the row-blocked convolution for a narrow band and the
+# per-column axpy for a wide one. The benched band of 33 is CONV on AVX-512 and AXPY on AVX2, so a
+# test that pinned one width would silently cover only one arm on each box.
+#
+# Sizes: `n` past the pool's admission floor — with band `b` the traffic is `n*b*sizeof(T)` against
+# `_L1_MT_MIN` — and an `m` that is not a multiple of the vector width so the masked tail block runs.
+@testitem "gbmv-N: bit-identical at every thread count, both band arms" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            cmax = P._GBMV_CONV_MAX
+            # One band comfortably inside the conv cutoff, one comfortably outside it.
+            @testset "band=$(2k + 1) arm=$arm" for (k, arm) in ((max(1, (cmax - 1) ÷ 4), "conv"),
+                                                                (cmax, "axpy"))
+                b = 2k + 1
+                @test (b <= cmax) == (arm == "conv")      # the intended arm is really taken
+                # Past `_L1_MT_MIN` for this band, and m deliberately off a vector-width multiple.
+                n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(T)))
+                m = n + 3
+                AB = randn(T, b, n); x = randn(T, n); y0 = randn(T, m)
+                α = T(0.75)
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness plus the lost-claim path. gbmv-N has no partial buffer, so the fallback is simply the
+# unsplit kernel over `[0, m)` — the assertion here is that this really does equal the banded result,
+# which is the property that lets the fallback stay that simple.
+@testitem "gbmv-N: the pool runs and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        k = 16; b = 2k + 1
+        n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(Float64)))
+        m = n + 3
+        AB = randn(b, n); x = randn(n); y0 = randn(m)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, k, k; alpha = 0.75, beta = 2.5))
+        y1 = copy(y0); P.gbmv!(y1, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gbmv!(y2, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end

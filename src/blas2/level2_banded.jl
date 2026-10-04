@@ -25,15 +25,31 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
 # re-stream, unlike per-column which re-reads the overlapping window ~band times). For each column
 # touching the block, FMA a contiguous masked AB-segment scaled by x[j]. Best for narrow/medium band
 # (A is re-read ~band/W times — cheap there; per-column wins once band ≫ W). y must be pre-scaled by β.
-@inline function _gbmv_conv!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal}
+@inline _gbmv_conv!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal} =
+    _gbmv_conv!(m, n, kl, ku, α, AB, x, y, 0, m)
+
+# `[ib0, ib1)` IS THE OUTPUT ROW BAND, and this kernel was already shaped for one: the `i0` loop
+# sweeps output blocks of W rows, each loading its own pre-scaled `y` slice, accumulating every column
+# that reaches it, then storing back. A band therefore only moves where that loop starts and stops —
+# every block's column sweep, masks included, is exactly what the unsplit call performs. So a row-band
+# split is BIT-IDENTICAL with no partial buffer and nothing to fold, which is what makes banded
+# gbmv-N cheap to thread where `symv` was not: a band of a BANDED matrix needs only the columns within
+# `kl + ku` of its own rows, not a strided sweep of whole rows.
+#
+# `m` stays the WHOLE row count, because `jlo`/`jhi` and the lane masks are expressed against it. And
+# the conv-versus-axpy choice in `_gbmv_n_simd!` keys on `kl + ku + 1` alone, which a row split cannot
+# move — so unlike the gemv pair this op needs no route token at all.
+@inline function _gbmv_conv!(
+        m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y, ib0::Int, ib1::Int
+    ) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); b = kl + ku + 1
     lanes = Vec{W, Int}(ntuple(l -> l - 1, Val(W)))
     yc = _carrier(y)      # `nothing` in release — see the register-pressure note on `_gbt_one!`
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2)
-        i0 = 0
-        @inbounds while i0 < m
-            mm = min(W, m - i0); orow = lanes < mm
+        i0 = ib0
+        @inbounds while i0 < ib1
+            mm = min(W, ib1 - i0); orow = lanes < mm
             acc = vload(V, yp + i0 * sz, orow)              # pre-scaled y-block (β·y)
             jlo = max(1, i0 + 1 - kl); jhi = min(n, i0 + mm + ku)
             # ⚠ THE LANE MASK IS COMPLETE FOR ALMOST EVERY COLUMN, so it is not rebuilt for them.
@@ -86,12 +102,26 @@ end
 # 4-accumulator + horizontal-sum-of-zeros that's pure overhead for a sub-W dot; letting LLVM size the
 # reduction to the (tiny) band — scalar, no horizontal sum — is faster. (Wider band → `_dot_simd`.)
 # gbmv-N (y pre-scaled by β): conv kernel for narrow band, per-column axpy for wide.
-@inline function _gbmv_n_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal}
-    (kl + ku + 1) <= _GBMV_CONV_MAX && return _gbmv_conv!(m, n, kl, ku, α, AB, x, y)
+@inline _gbmv_n_simd!(m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y) where {T <: BlasReal} =
+    _gbmv_n_simd!(m, n, kl, ku, α, AB, x, y, 0, m)
+
+# Row band `[ib0, ib1)`, one-based rows `ib0+1 … ib1`. The wide-band arm is a COLUMN loop, so the band
+# is applied by clamping each column's output extent rather than by bounding the loop: column `j`
+# writes rows `[max(1, j-ku), min(m, j+kl)]`, and this worker keeps only the part inside its own band.
+# Each `y[i]` therefore still accumulates over the same columns in the same ascending order as the
+# unsplit sweep — bit-identical — and the bands are write-disjoint, so no partial is needed.
+#
+# A worker does walk columns whose extent misses its band entirely and skips them; the cost is the
+# `kl + ku` columns of overlap at each boundary, which is negligible against a band block many
+# thousands of columns wide. The arm choice reads `kl + ku + 1` only, so it cannot move under a split.
+@inline function _gbmv_n_simd!(
+        m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y, ib0::Int, ib1::Int
+    ) where {T <: BlasReal}
+    (kl + ku + 1) <= _GBMV_CONV_MAX && return _gbmv_conv!(m, n, kl, ku, α, AB, x, y, ib0, ib1)
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         @inbounds for j in 1:n
-            ilo = max(1, j - ku); ihi = min(m, j + kl); len = ihi - ilo + 1
+            ilo = max(max(1, j - ku), ib0 + 1); ihi = min(min(m, j + kl), ib1); len = ihi - ilo + 1
             len <= 0 && continue
             # SEGMENT VALIDATION (2026-08-17). Both operands are built here and handed to a shared
             # kernel as raw Ptrs — `_axpy_simd!` cannot see past them, which is why the per-store
@@ -270,6 +300,18 @@ function _gbmv!(tr::Bool, cj::Bool, m::Integer, n::Integer, kl::Integer, ku::Int
             return _gbmv_t_simd!(m, n, kl, ku, αT, AB, x, βT, y)         # β fused (no pre-scale pass)
         else
             _scale_y!(ylen, βT, y, 1); iszero(α) && return y
+            # β is already applied, so the threaded bands only ACCUMULATE and are write-disjoint in
+            # `y`. Each `y[i]` keeps its whole column chain on one worker in the same ascending order
+            # the unsplit sweep uses, so this is bit-identical at any worker count with no partial,
+            # no fold and no route token — the arm choice reads `kl + ku + 1`, which a row split
+            # cannot move.
+            nw = _gbmvn_workers(m, n, kl, ku, eltype(AB))
+            if nw > 1
+                GC.@preserve AB x y _gbmvn_threaded!(
+                    m, n, kl, ku, αT, pointer(AB), stride(AB, 2), _ptr(x), _ptr(y), nw
+                )
+                return y
+            end
             return _gbmv_n_simd!(m, n, kl, ku, αT, AB, x, y)            # y pre-scaled, kernel accumulates
         end
     elseif !tr && !cj && _l2c_simd_ok(AB, x, y, incx, incy)              # complex non-trans → complex axpy band
