@@ -66,7 +66,11 @@ esac
 # one CPU per physical core PLUS one spare, and CPU numbering differs per box — `bench/plots.jl`'s
 # `_ARM_PB_MT` comment carries the mask and the measurement behind the spare slot.
 #
-#   BENCH_CORE=0,2,4,6,8,10,1 JL_FLAGS="-t 6" SWEEP_ARMS="arms=pb,pb_mt" \
+# ⚠ `-t` IS THE JULIA THREAD COUNT AND IT IS NOT THE POOL SIZE. It must EXCEED the physical core
+# count, because `plots.jl` pins one thread per core and the runtime needs an unpinned slot; the pool
+# size goes in separately as `mt=`. The guard below refuses `-t <= ncores`. On a 6-core box:
+#
+#   BENCH_CORE=0,2,4,6,8,10,1 JL_FLAGS="-t 7" SWEEP_EXTRA="mt=6" SWEEP_ARMS="arms=pb,pb_mt" \
 #       SWEEP_GROUPS="L1 L2 L3 LP CL1 CL2 CL3 CLP" bench/fleet_refresh.sh
 #
 # The dual groups have no `pb_mt` arm — their reference is LinearAlgebra's generic fallback, which is
@@ -119,6 +123,25 @@ fi
 # supply, and every threaded sweep since ran under that ✅ — 1208 of its cached arms are stamped below
 # the pin, and 413 cells compare two power states rather than two libraries.
 if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | grep -q 'pb_mt'; then
+    # THE JULIA THREAD COUNT MUST EXCEED THE PHYSICAL CORE COUNT, and this refuses rather than
+    # measuring a handicapped pool. `bench/plots.jl`'s `_pin_threads!` pins one thread per physical
+    # core and leaves anything beyond that floating, because the runtime needs a slot it can schedule
+    # on; with `-t <ncores>` there is nothing left over and the pool's join waits on a pinned thread
+    # that cannot move. The pool size is a SEPARATE number — pass it as `mt=<ncores>` through
+    # SWEEP_EXTRA. Measured on wintermute (6 cores), gemm n=1000, pb_mt over pb: `-t 6` gave 0.36x,
+    # `-t 7` gave 1.38x under the old one-hyperthread pin, and 3.61x once the pin was corrected to
+    # cover the whole core. The 2026-10-03 sweep ran `-t 6` and its entire pb_mt arm was unusable.
+    # DISTINCT (socket, core) pairs — not a line count. `lscpu -p` prints one row per LOGICAL cpu, so
+    # counting rows gives the SMT-inflated number (12 where this box has 6) and the guard then demands
+    # a thread count it never needed. Socket is included because core ids restart per socket.
+    _ncore=$(lscpu -p=Socket,Core 2>/dev/null | grep -v '^#' | sort -u | grep -c . || echo 0)
+    _jlnt=$(printf '%s' "${JL_FLAGS:-}" | sed -n 's/.*-t[ =]*\([0-9]\+\).*/\1/p')
+    if [ -n "$_jlnt" ] && [ "$_ncore" -gt 0 ] && [ "$_jlnt" -le "$_ncore" ]; then
+        echo "=== ABORT: JL_FLAGS has -t $_jlnt on a $_ncore-core box. A threaded sweep needs at"
+        echo "    least -t $((_ncore + 1)) so one thread stays unpinned for the runtime; set the POOL"
+        echo "    size separately with SWEEP_EXTRA=\"mt=$_ncore\". See the note above. ==="
+        exit 2
+    fi
     echo "=== PRE-LOCK (all cores) ==="
     _premt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
     printf '%s\n' "$_premt" | tail -3
@@ -128,6 +151,29 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
         exit 2
     fi
 fi
+
+# PRE-WARM THE PACKAGE BEFORE THE FIRST GROUP, ONCE, OUTSIDE THE RETRY LOOP.
+#
+# A changed `src/` (or anything that invalidates the bench env's cache) makes the first group's julia
+# precompile PureBLAS — minutes of multi-core work, orphaned at PPID 1, pegging a core. The
+# contention guard inside plots.jl then correctly REFUSES to benchmark against it, and the group burns
+# retries waiting for the sweep's own precompile to get out of its way. Observed twice: six retries at
+# 90 s is just enough headroom, which means it is one slow box away from aborting a sweep for no
+# reason at all.
+#
+# Doing it here is free when the cache is warm (a few seconds of load) and turns the cold case into
+# one silent wait instead of a retry storm. It is deliberately NOT inside the group loop: the cost
+# must be paid once, and a second invocation proves nothing.
+# `Pkg.precompile()` AND NOT `using PureBLAS`. The first version warmed PureBLAS only, and the first
+# group still spawned its own precompile at 99.9% CPU: `bench/plots.jl` loads the whole bench env —
+# AOCL_jll, Chairmarks, ForwardDiff and the rest — and any one of those being stale is enough. The
+# env is what has to be warm, not one package in it.
+echo "=== PRE-WARM (precompile the bench env before the first timed group) ==="
+"$JL" --project=bench -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1 || {
+    echo "=== ABORT: the bench env does not precompile — fix that before sweeping. ==="
+    exit 2
+}
+echo "    bench env is warm"
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not

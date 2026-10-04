@@ -346,6 +346,47 @@ end
 # `:static` is what makes this a per-THREAD operation: it guarantees iteration i runs on thread i, and
 # `sched_setaffinity(0, …)` pins the calling thread. A thread beyond the core count is left floating on
 # purpose — that is the spare the runtime needs.
+#
+# PIN TO THE CORE, NOT TO ONE HYPERTHREAD. The mask is every SMT sibling of the chosen core, so a
+# thread still cannot migrate BETWEEN cores — which is the whole purpose — while the scheduler keeps
+# one degree of freedom inside the core, and a worker can be woken on either sibling instead of
+# waiting for one specific CPU to drain.
+#
+# MEASURED, and the single-CPU form was costing a factor of two. gemm n=1000 on wintermute, one
+# process, one reused operand set (so the window allocates nothing and no GC can run inside it),
+# `pb_mt` over `pb`, four rounds each — the pin applied mid-process was the only change:
+#
+#   unpinned            190.2 190.3 194.5 193.3 GFLOP/s   3.71-3.80x   stable
+#   sibling PAIR        125.3 125.2 125.6 127.8           2.43-2.49x   stable to 1%
+#   one logical CPU      73.2  84.5  94.3  97.8           1.43-1.91x   unstable, still climbing
+#
+# `nt=1` reads 51.2-51.5 in all three, so the single-CPU pin did not hurt serial code — it damaged the
+# POOL specifically, and it was also the least reproducible of the three, which is the opposite of
+# what a pin is for. [[threaded-sweep-needs-a-spare-thread]] has the surrounding campaign; note that
+# [[threaded-l1-gate-is-unreadable]]'s "pinned is the honest number" (2.14x unpinned against 1.07x
+# pinned) was recorded under the single-CPU form, so that conclusion rests on this defect and should
+# be re-derived rather than cited.
+#
+# STILL OPEN, and it is not fixed here: this pins JULIA's threads only. OpenBLAS and BLIS spawn their
+# own pthreads, so a threaded gate compares a pinned PureBLAS against unpinned vendors. The sibling
+# pair narrows that bias; it does not remove it.
+# Every logical CPU sharing a physical core with `cpu`, from the kernel's own topology rather than an
+# assumed numbering: siblings are adjacent pairs on this fleet (0-1, 2-3, …) but are the two halves of
+# the CPU list on other parts, and guessing wrong is how a "6 distinct cores" mask becomes 3.
+# Falls back to the CPU itself where the topology file is absent (containers, non-Linux).
+function _core_siblings(cpu::Int)
+    f = "/sys/devices/system/cpu/cpu$(cpu)/topology/thread_siblings_list"
+    isfile(f) || return (cpu,)
+    out = Int[]
+    for part in split(strip(read(f, String)), ',')
+        ends = split(part, '-')
+        for c in parse(Int, ends[1]):parse(Int, ends[end])
+            push!(out, c)
+        end
+    end
+    return isempty(out) ? (cpu,) : out
+end
+
 function _pin_threads!()
     (Sys.islinux() && Threads.nthreads() > 1) || return nothing
     cpus = _core_cpus()
@@ -353,7 +394,9 @@ function _pin_threads!()
     Threads.@threads :static for i in 1:Threads.nthreads()
         if i <= length(cpus)
             mask = zeros(UInt64, 16)
-            mask[cpus[i] ÷ 64 + 1] = UInt64(1) << (cpus[i] % 64)
+            for c in _core_siblings(cpus[i])
+                mask[c ÷ 64 + 1] |= UInt64(1) << (c % 64)
+            end
             ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask)
         end
     end
