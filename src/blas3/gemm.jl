@@ -3924,13 +3924,12 @@ mutable struct GemmPool{T}
     # so the pair is bit-identical to the single update it replaces.
     lanroute::Int
     lainfo::Int                      # the look-ahead panel's `info`: the row of a zero pivot, or 0
-    # ── BAND HALF-WIDTHS (gbmv) ───────────────────────────────────────────────────────────────────
-    # `gbmvN` needs four shape numbers — m, n, kl, ku — and the first two already have fields. These
-    # are their own rather than borrowed from the look-ahead set: a reused `lanb` would read as a
-    # panel width at every other call site and is exactly the kind of overload that misleads later.
-    # Two `Int`s on a struct allocated once per element type.
-    bkl::Int
-    bku::Int
+    # ⛔ NO FIELDS FOR gbmv's BAND HALF-WIDTHS, AND NO EXTRA DRIVER ARGUMENTS FOR THEM. Two trailing
+    # `bkl::Int = 0, bku::Int = 0` defaults on `_gemm_threaded!` were tried and REVERTED: they put 112
+    # BYTES on every `gemm!` call, which is req#10 on the one op that must never allocate, and
+    # `test/gemm_tests.jl` "threaded gemm: … and still 0 B" caught it. Bisected — the commit with
+    # `symv` but without those two parameters allocates 0.
+    # `gbmvN` carries `kl`/`ku` in the `A` SLOT's own dimensions instead; see `_gbmvn_threaded!`.
     # ── COOPERATIVE BARRIER ───────────────────────────────────────────────────────────────────────
     # A packed A block is a function of `(ic, pc)` and not of which columns of C a worker owns, so a
     # column-split gemm would have every worker pack the whole of A. Workers deal those blocks out
@@ -4030,7 +4029,7 @@ const _MT_KIND_SYMV = 17
 # gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
 # BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial, no
 # fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the half-widths ride
-# in `bkl`/`bku`. β is already applied — the kernel accumulates.
+# in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the kernel accumulates.
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GBMVN = 18
@@ -4795,7 +4794,6 @@ end
         zero(T), zero(T), false, false, false, false,
         _MT_KIND_GEMM, false, false, false,
         Ptr{T}(0), 1, 0, 0, Ptr{Int}(0), 0, 0, -1, 0,
-        0, 0,                                            # bkl, bku — gbmv band half-widths
         0
     )
     return _gemm_pool_start!(p)
@@ -4907,9 +4905,8 @@ end
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
         kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
-        lup::LuPanel{T} = _lupanel_none(T),
-        bkl::Int = 0, bku::Int = 0                 # gbmv band half-widths; AFTER `lup` so every
-    ) where {T <: BlasReal}                        # existing positional caller is unaffected
+        lup::LuPanel{T} = _lupanel_none(T)
+    ) where {T <: BlasReal}
     p = _gemm_pool(T)
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
     # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
@@ -4998,7 +4995,7 @@ end
             # A loser does the whole output. Its band IS `[0, m)`, which is what the unsplit kernel
             # already runs, and the arm choice reads `kl + ku + 1` only — so there is nothing to route
             # and nothing that can differ from the winner's bands.
-            _gbmv_n_simd!(C.m, C.n, bkl, bku, alpha, C, A.ptr, B.ptr, 0, C.m)
+            _gbmv_n_simd!(C.m, C.n, A.n, A.ld, alpha, C, A.ptr, B.ptr, 0, C.m)
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -5108,7 +5105,6 @@ end
         p.lap = lup.ptr; p.lald = lup.ld; p.lam = lup.m; p.lanb = lup.nb
         p.laipiv = lup.ipiv; p.laroff = lup.roff; p.laioff = lup.ioff; p.lanroute = lup.nroute
         p.lainfo = 0
-        p.bkl = bkl; p.bku = bku
         # A job that failed inside a barrier leaves arrivals counted. Clearing here rather than on the
         # way out keeps the next job from releasing its first barrier early on a stale count.
         @atomic p.bar = 0
@@ -5386,8 +5382,13 @@ end
 @noinline function _gbmvn_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _l1_chunk(p.m, nw, i, T)
     len > 0 || return nothing
-    ABm = PtrMatrix{T}(p.Cp, p.bkl + p.bku + 1, p.n, p.ldc)
-    _gbmv_n_simd!(p.m, p.n, p.bkl, p.bku, p.alpha, ABm, p.Ap, p.Bp, i0, i0 + len)
+    # `kl` AND `ku` RIDE IN THE `A` SLOT'S DIMENSIONS — `p.k` is `A.n` and `p.lda` is `A.ld`, both
+    # published for every kind. `_gbmvn_threaded!` encodes them there precisely so this kind needs no
+    # pool field and no extra driver parameter; two such parameters cost 112 bytes on every `gemm!`
+    # call and were reverted. `A.ptr` is still x, which is all the kernel reads from that slot.
+    kl = p.k; ku = p.lda
+    ABm = PtrMatrix{T}(p.Cp, kl + ku + 1, p.n, p.ldc)
+    _gbmv_n_simd!(p.m, p.n, kl, ku, p.alpha, ABm, p.Ap, p.Bp, i0, i0 + len)
     return nothing
 end
 
@@ -5395,18 +5396,24 @@ end
 # NOT passed — the caller has pre-scaled `y` and this kernel accumulates, which is also what makes the
 # row bands write-disjoint with nothing to fold.
 #
-# ⚠ `C`'s `m` IS THE OUTPUT ROW COUNT, NOT AB's `kl+ku+1`. The driver publishes `p.m = C.m`, and `m`
-# is the number the chunks must split; AB's own row count is reconstructed from `bkl + bku + 1`, which
-# travels in its own fields. Nothing reads `C.m` as a band height, so this costs nothing — but it is
-# the kind of thing that reads wrong later, hence the sign.
+# ⚠ TWO DELIBERATE SLOT CHOICES, BOTH SIGNED BECAUSE THEY READ WRONG OTHERWISE.
+#
+# `C`'s `m` is the OUTPUT ROW COUNT, not AB's `kl+ku+1`. The driver publishes `p.m = C.m` and `m` is
+# what the chunks split; AB's own height is rebuilt from the half-widths.
+#
+# `kl` AND `ku` RIDE IN THE `A` SLOT'S DIMENSIONS — `A.n` and `A.ld` — because `p.k = A.n` and
+# `p.lda = A.ld` are published for every kind, so this needs no pool field and no extra driver
+# parameter. That is not tidiness: two trailing `bkl`/`bku` defaults on `_gemm_threaded!` were tried
+# and put 112 BYTES on every `gemm!` call, breaking req#10 on the one op that must never allocate
+# (`test/gemm_tests.jl` "threaded gemm: … and still 0 B"; bisected against the commit before them).
+# Only `A.ptr` is read as x, so `A.m` is free and `A.n`/`A.ld` carry the band.
 @noinline function _gbmvn_threaded!(
         m::Int, n::Int, kl::Int, ku::Int, α::T, ABp::Ptr{T}, ldb::Int,
         xp::Ptr{T}, yp::Ptr{T}, nw::Int
     ) where {T <: BlasReal}
     _gemm_threaded!(
-        PtrMatrix{T}(ABp, m, n, ldb), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, m, 1, m),
-        α, zero(T), false, false, false, false, nw, _MT_KIND_GBMVN, false, false, false,
-        _lupanel_none(T), kl, ku
+        PtrMatrix{T}(ABp, m, n, ldb), PtrMatrix{T}(xp, n, kl, ku), PtrMatrix{T}(yp, m, 1, m),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_GBMVN
     )
     return nothing
 end
