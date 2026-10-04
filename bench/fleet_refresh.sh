@@ -152,6 +152,25 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
     fi
 fi
 
+# PRE-WARM THE PACKAGE BEFORE THE FIRST GROUP, ONCE, OUTSIDE THE RETRY LOOP.
+#
+# A changed `src/` (or anything that invalidates the bench env's cache) makes the first group's julia
+# precompile PureBLAS — minutes of multi-core work, orphaned at PPID 1, pegging a core. The
+# contention guard inside plots.jl then correctly REFUSES to benchmark against it, and the group burns
+# retries waiting for the sweep's own precompile to get out of its way. Observed twice: six retries at
+# 90 s is just enough headroom, which means it is one slow box away from aborting a sweep for no
+# reason at all.
+#
+# Doing it here is free when the cache is warm (a few seconds of load) and turns the cold case into
+# one silent wait instead of a retry storm. It is deliberately NOT inside the group loop: the cost
+# must be paid once, and a second invocation proves nothing.
+echo "=== PRE-WARM (precompile before the first timed group) ==="
+"$JL" --project=bench -e 'using PureBLAS' >/dev/null 2>&1 || {
+    echo "=== ABORT: 'using PureBLAS' failed in the bench env — fix that before sweeping. ==="
+    exit 2
+}
+echo "    package loads"
+
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
 # julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: wintermute's L1 group
