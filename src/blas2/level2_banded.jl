@@ -66,6 +66,20 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
             # `r1 <= b-W+1` puts its last at or before the bottom.
             #
             # The m-tail block keeps `orow` partial, so it takes the masked path throughout.
+            #
+            # ⚠ 44-46 GB/s IS THE W=2 CEILING FOR THIS SHAPE, NOT A TUNING DEFICIT. The rate is FLAT
+            # across n — 46 GB/s at n=128 through 44 at n=2048, band 33 — which is what a
+            # structure-bound loop looks like, and it is 0.56-0.61x of a two-stream `_dot_simd` on the
+            # same byte count. The loop is not wasting bandwidth: each band element is vloaded exactly
+            # once (33 vloads of W elements per output block of W, against 33*n*W/W useful elements),
+            # so there is no line amplification to recover. At n=2048 the 33792 vector operations take
+            # 12.35 us, which is 1.57 cycles each, or 1.27 elements per cycle at W=2 — the limit for
+            # 128-bit lanes with this dependency structure. Consecutive output blocks are independent,
+            # which is what lets the machine reach it despite the 33-deep accumulator chain.
+            #
+            # So the next step for this op is WIDER LANES, not a better sweep: eight doubles per
+            # operation instead of two, with one ZA drain per output block. Nothing in the masking or
+            # the blocking is worth another pass.
             # ⚠ THE THREE RANGES MUST PARTITION, NEVER OVERLAP. Unclamped the full-mask window is
             # [ku+i0+1-b+W, ku+i0+1], which runs BACKWARDS when the band is narrower than the vector:
             # at b < W-1 its start passes its end, the head then reaches beyond where the tail begins,

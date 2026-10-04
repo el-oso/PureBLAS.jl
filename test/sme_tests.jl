@@ -188,11 +188,13 @@ end
         @test !P._sme_gemv_eligible(Float64, m, n, false, false, A, x, y, 1, 2, 0.0)
         # Below the work floor the ZA fill and readback are not amortized.
         @test !el(P._SME_GEMV_BLK, 1, false, false, 0.0)
-        # A row count that is not a whole number of blocks needs beta == 0: its tail is an OVERLAPPING
-        # block, which recomputes shared rows, and that is only sound when they are stored not added.
+        # A row count that is not a whole number of blocks is admitted for EITHER beta. Store mode
+        # finishes with an overlapping block, which recomputes shared rows and is sound only because
+        # it writes them; accumulate mode finishes with a scalar pass that adds each leftover row once.
+        # Requiring beta == 0 here used to cost 4-7x on `y += A*x` at a ragged m — see the predicate.
         mr = m + 1
         @test P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 0.0)
-        @test !P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 1.0)
+        @test P._sme_gemv_eligible(Float64, mr, n, false, false, A, x, y, 1, 1, 1.0)
     end
 end
 

@@ -309,6 +309,29 @@ Both modes share ONE set of low-level kernels. Source map:
   `test/Manifest.toml` (which must not exist) and it strips every comment from `test/Project.toml`.
   Fresh deps: `julia --project=. -e 'using Pkg; Pkg.Registry.update()'`. One item:
   `Pkg.test(test_args=["<name regex>"])`, ANDed with the group/shard filter.
+- **A PR TOUCHING APPLE SILICON NEEDS TWO GREENS, AND EACH COVERS WHAT THE OTHER CANNOT.** The split
+  is: **the local run on the Apple machine is the only place the SME routes execute at all** — there
+  is no such hardware in CI, the pipeline skips the Apple-silicon subset, and `_SME_F64` is false on
+  the runners so those routes do not exist there. **CI's job is to confirm x64 is not broken.**
+  Neither substitutes for the other, and **a skipped item reports green** — the same hazard this file
+  flags for the threading items — so "CI is green" is never a sufficient answer for an SME change.
+  State which half you ran.
+
+  **The local half must include the trim build**, which is gated off by default and is the ONLY check
+  that compiles the `_SME_STATIC` branch:
+
+      PB_FULL=1 JULIA_NUM_THREADS=4 julia --project=. -e 'using Pkg; Pkg.test()'
+      PUREBLAS_JULIAC_BUILD=1 julia --project=. -e 'using Pkg; Pkg.test(test_args=["juliac"])'
+
+  **This is not belt-and-braces; the two halves disagree in practice.** A `--trim` build broken by an
+  include order shipped because the defect lives behind `@static if _SME_STATIC`, true only when the
+  CPU target names `+sme`: no ordinary session compiled it, StrictMode had no code to inspect, and
+  CI's own `juliac --trim` job runs on `ubuntu-latest` where the branch does not exist. The same blind
+  spot hides a second defect right now — `test/level1_tests.jl` "L1 real: the pool is actually used"
+  fails six of seven assertions on this machine and passes in CI, because the SME routes take those
+  calls before the threaded BLAS-1 path and the pool never runs. **A green checkmark on a PR touching
+  SME means the x86 half passed. Say which half you ran.**
+
 - **NAME THE BLAST RADIUS — a bare `Pkg.test()` is a PR-time gate, not an iteration step.** Filter to
   the items the change can reach: measured **16m59 for the full suite against ~2m** for a filter
   covering the same changed files. `JULIA_NUM_THREADS` must be set either way, or every threading item
