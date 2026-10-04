@@ -2727,6 +2727,23 @@ end
     return body
 end
 
+# ⛔ SPLITTING symv INTO SME gemv-N AND gemv-T OVER A BLOCK COVER IS A WASH. It is the obvious move
+# once trmv has `_trmv_split!`: every off-diagonal block `A[R,C]` feeds y twice — `y[R] += A[R,C]·x[C]`
+# and `y[C] += A[R,C]ᵀ·x[R]` — all contributions read the original x, so any order is legal and no
+# accumulator is needed. Correct to 1e-15, and measured against this kernel, best block edge per size:
+#
+#     n        128   200   256   512  1000  1024  2048
+#     cover   0.58  0.93  1.06  0.95  0.92  0.91
+#
+# Three things cancel the rate gain, and the first is the one that decides it: the cover reads each
+# block TWICE, once per direction, because the two kernels are separate calls. That doubles the bytes
+# at exactly the rate SME buys back. On top of that the gemv-T half of a block sits below
+# `_SME_GEMVT_MINM` whenever the block is small, so it runs on NEON, and the diagonal blocks stay on
+# this kernel whatever the edge — their work is `n * edge / 2` and a smaller edge only moves the cost
+# into more cover calls.
+#
+# So the route needs ONE kernel that reads a block and produces both products, not two calls over it.
+# Until that exists, this fused per-column form is the faster shape.
 @inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP}
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
@@ -3379,12 +3396,53 @@ end
 # T forms stay blocked. Their diagonal is a column dot, which is not the slow kernel, and the same
 # split measured 0.98-1.08x there — not worth a second scratch path.
 #
-# WHAT IS LEFT. At the binding size n=512 the cover runs 1.88 us (489 GB/s) and the diagonal 1.93 us
-# — 128 KB at 68 GB/s — against Accelerate 2.31 us for the whole operation. The diagonal alone is
-# most of that budget, so the next step is not a better cover but a triangular kernel that reaches
-# the matrix unit: `_trmv_fused8!` is NEON and latency-bound on the carried dependency, and base
-# blocks of 16 and 32 measured worse than 64 because they pay more per off-diagonal call than they
-# save on the diagonal.
+# ⚠ ATTRIBUTE THIS ROUTINE'S TIME BY REMOVING A SWEEP IN SITU, NEVER BY TIMING THE SWEEPS SEPARATELY.
+# Timed on their own the two sweeps read 1.74 us each at n=512, which sums to 3.5 against 5.1
+# measured together, and the difference is not real: it is the sweeps being warm in a loop that runs
+# only one of them. Switching each off inside the body instead — `both - diagonal-only` for the cover
+# and `both - cover-only` for the diagonal:
+#
+#     n        both   cover   diagonal   fill+add+copy
+#      512   5.11 us   3.24      1.19        0.10
+#     1024  11.79      7.85      2.96        0.20
+#     2048  88.67     79.50      4.46        0.42
+#
+# THE COVER IS THE COST, and increasingly so with n — 63% at n=512 and 90% at n=2048. The diagonal is
+# the smaller half at every size. It is also not the entry path (`trmv!` and `_trmv_split!` differ by
+# 0.02 us) and not the function structure (each sweep behind its own `@noinline` barrier measures
+# 1.00x, so the grouping below buys its win through ORDER alone).
+#
+# ⛔ INTERLEAVING THE SWEEPS IS 0.55x. The panel above block J and block J's own diagonal read the
+# SAME columns of A, so taking them together visits that column range once, and the accumulator makes
+# every order legal. It still loses badly — n=512 0.56x, n=1024 0.55x, n=2048 0.75x — because
+# alternating the two kernels costs 300-660 ns per swap. The swap binds, not locality.
+#
+# ⛔ AND A WIDER BLOCK EDGE DOES NOT BUY THE COVER BACK. Fewer, larger cover blocks against a larger
+# diagonal is the obvious trade once the cover is known to dominate, and it loses at every size —
+# re-swept with the narrow-panel diagonal in place, against `_TRI_NB` = 64:
+#
+#     n        b=96   b=128   b=192   b=256
+#      512     0.86    0.89    0.87    0.73
+#     1024     0.85    0.99    0.85    0.76
+#     2048     0.88    0.97    0.91    0.90
+#
+# ⛔ AND THE FUSED KERNEL IS WORTH 3%, NOT THE 2x THE CALL COUNT SUGGESTS. It was PROTOTYPED, not
+# reasoned about: the SME gemv-N kernel already loops row blocks outside and columns inside, so making
+# it triangular is three lines of IR — start row block b's column loop at `(b+1)*rb` instead of 0, and
+# guard for the last block having nothing to its right. That covers the whole strictly-upper part in
+# ONE streaming region, replacing every cover call. Correct to 1e-15, and measured against this
+# routine, three runs at n=512: 1.03x, 1.03x, 1.04x.
+#
+# THE CALL OVERHEAD IS REAL AND THE LOCALITY PAYS IT BACK. Seven entries at ~113 ns is about 1.05 us
+# of the cover's 3.24, but a fused kernel's row blocks are `rb` rows tall — 64 of them, so 512 B out
+# of a 16 KB column stride at n=2048 — while the recursive cover's top block is n/2 rows and reads
+# 8 KB per column. Wider row blocks trade that back against a larger diagonal: ng=1 (rb=32) measures
+# 0.52-0.93x, ng=2 (rb=64) 0.85-1.11x, ng=4 (rb=128) 0.93-1.02x, all worse as n grows. A hybrid that
+# recurses while the block is large and fuses only the small triangles reproduces at 1.03-1.04x too.
+#
+# So the seven entries are not the headroom they look like, and one fused triangular kernel does not
+# pay for its own knob. What is actually left at n=512 is the cover's 283 GB/s against the 883 a plain
+# gemv of that footprint reaches, and that gap is NOT the entries — it survives removing them.
 
 # Recursive halving cover. Splits land on a multiple of `nb` so every leftover diagonal block is
 # exactly `nb` wide, and the off-diagonal blocks come out square rather than tall and narrow.
@@ -3436,7 +3494,13 @@ function _trmv_split!(up::Bool, unit::Bool, n::Int, A, x)
     ib = 0
     while ib < n
         m = min(nb, n - ib); J = (ib + 1):(ib + m)
-        _trmv_fused8!(up, unit, m, view(A, J, J), view(x, J))
+        # NARROW panel, not the `_trmv_fused8!` default. That default picks the wide panel because it
+        # touches x fewer times, and switches to `_TRMV_F_DRAM` past 2*L3 where the stream count binds
+        # instead. A diagonal block of edge `_TRI_NB` is the OTHER case with no x-traffic advantage to
+        # win: its x slice is `_TRI_NB` elements and L1-resident whatever the panel width, so only the
+        # ragged-block overhead is left, and the narrow panel carries less of it. Measured on this
+        # sweep, b=64: F=4 1823 ns against F=8 2092 at n=512, and 3809 against 4368 at n=1024.
+        _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, m, view(A, J, J), view(x, J))
         ib += nb
     end
     @inbounds for i in 1:n
@@ -3519,11 +3583,21 @@ end
 #     n          256    512   1000   1024   2048   4096
 #     blocked/fused   0.84x  1.07x  1.63x  1.70x  1.71x  1.66x
 #
-# so 256 loses and everything from 512 up wins. req8-ok: a measured crossover with its table — where
-# a register-blocked fused sweep stops beating a matrix-unit offload is not readable off a cache size,
-# and the two paths are structurally different kernels rather than one knob.
-# PDM: Measured — where a register-blocked fused sweep stops beating a matrix-unit offload; the two arms are structurally different kernels, not one knob, and no cache size predicts the crossing. Inert (typemax) without SME. | tune: sweep n, upper/N
-const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 512 : typemax(Int))::Int
+# ⚠ THAT TABLE PRICED AN ARM THAT NO LONGER EXISTS. The structure above this threshold is now
+# `_trmv_split!`, not the interleaved blocked one, and it wins at 256 where the old arm lost. Measured
+# the same way, `_trmv_split!` against `_trmv_fused8!` on the whole matrix, two runs:
+#
+#     n        200   208   216   224   232   240   248  |  256   264   272   320   384   448
+#     split   0.64  0.67  0.68  0.74  0.73  0.93  0.75  | 1.12  1.14  1.04  1.24  1.40  1.55
+#
+# The break is sharp and it sits at 4*`_TRI_NB`: that is the first n whose cover has a block big enough
+# to be worth an SME entry, with four diagonal blocks under it. Below it the cover is one or two small
+# panels and the entries cost more than the structure saves.
+# req8-ok: a measured crossover with its table — where a register-blocked fused sweep stops beating a
+# matrix-unit offload is not readable off a cache size, and the two paths are structurally different
+# kernels rather than one knob.
+# PDM: Derived — the first n whose two-sweep cover carries a block worth an SME entry, 4*_TRI_NB, with four diagonal blocks beneath it; the arm above is `_trmv_split!`. Inert (typemax) without SME. | tune: sweep n, upper/N
+const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 4 * _TRI_NB : typemax(Int))::Int
 
 @inline function _trmv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB

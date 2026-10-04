@@ -21,6 +21,10 @@
 #   blas2/level2.jl — the trsv reciprocal caches. trsv is Level-2 and never calls `gemm!`, so nothing on
 #               that path can thread or yield.
 #
+#   blas3/sme_kernel.jl `_SME_GEMVT_SCR` — the gemv-T deferred-epilogue scratch strip. Claimed and
+#               released inside ONE `_sme_gemvt_cabi` call, which makes no public Level-3 call and so
+#               cannot hold it across a threaded join; blas3/sme_kernel.jl forks no task at all.
+#
 #   blas2/level2.jl `_TRMV_ACC*` — the trmv-N accumulator. `_trmv_split!` holds it across its
 #               `_tri_scat!` and `_trmv_fused8!` calls, so the no-yield claim has to cover those too:
 #               `_tri_scat!` reaches `_sme_gemv!` or `_gemv_n_paneldrv!` DIRECTLY, not the public
@@ -41,6 +45,7 @@ blas2/level2.jl:_TRSV_RRCP64
 blas2/level2.jl:_TRSV_RRCP32
 blas2/level2.jl:_TRSV_RCP64
 blas2/level2.jl:_TRSV_RCP32
+blas3/sme_kernel.jl:_SME_GEMVT_SCR
 blas2/level2.jl:_TRMV_ACC64
 blas2/level2.jl:_TRMV_ACC32
 blas3/level3.jl:_TRMM_BPF

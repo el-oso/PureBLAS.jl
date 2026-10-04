@@ -12,7 +12,10 @@
 @testitem "juliac --trim build + C-host LBT (authoritative; gated PUREBLAS_JULIAC_BUILD=1)" tags = [:juliac] begin
     using PureBLAS
     root = pkgdir(PureBLAS)
-    juliac = normpath(joinpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl"))
+    # The driver is the JuliaC.jl PACKAGE, pinned in `juliac/toolenv` — Julia ships none of its own, as
+    # `juliac/build.jl` says in its header. Probing `share/julia/juliac/juliac.jl` instead silently
+    # skipped this item on every Julia that has ever run it, which is how a broken `--trim` build shipped.
+    juliac = joinpath(root, "juliac", "toolenv", "Project.toml")
     dlext = Sys.iswindows() ? "dll" : (Sys.isapple() ? "dylib" : "so")
     so = joinpath(root, "juliac", "build", "libpureblas." * dlext)
 
@@ -20,7 +23,7 @@
         @info "juliac build check SKIPPED — set PUREBLAS_JULIAC_BUILD=1 to run (slow full --trim build)"
         @test_skip true
     elseif !isfile(juliac)
-        @info "juliac.jl not found (needs Julia ≥ 1.12) — skipping build check" juliac
+        @info "JuliaC.jl toolenv not found — skipping build check" juliac
         @test_skip true
     else
         # Build the .so. A nonzero exit means a trim-verifier error (the regression class @validate misses)

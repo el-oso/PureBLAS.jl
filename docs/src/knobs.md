@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 169 of them.
+Every `@load_preference` key in `src/` — 170 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 169 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 77 Derived · 23 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 67 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 5 other.
+**Tier:** 79 Derived · 22 Measured · 51 Literal · 18 Exempt.
+**Default form** (mechanical): 68 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -64,7 +64,7 @@ Every `@load_preference` key in `src/` — 169 of them.
 | `trmv_f_dram` | literal | Derived | majority criterion: switch once tri > 2*L3. The 2 IS the 1/2. | n/a |
 | `trmv_f_switch` | literal | Derived | NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | n/a — Derived |
 | `trmv_fused_min` | delegates | Literal | the L2-residency crossover was tried and falsified; fused8 wins at every n, all 3 boxes. | candidate |
-| `trmv_sme_min` | sibling | Measured | where a register-blocked fused sweep stops beating a matrix-unit offload; the two arms are structurally different kernels, not one knob, and no cache size predicts the crossing. Inert (typemax) without SME. | sweep n, upper/N |
+| `trmv_sme_min` | sibling | Derived | the first n whose two-sweep cover carries a block worth an SME entry, 4*_TRI_NB, with four diagonal blocks beneath it; the arm above is `_trmv_split!`. Inert (typemax) without SME. | sweep n, upper/N |
 | `trmv_split_recmax` | formula | Derived | formula over detected consts: `2 * _L2_BYTES` | — |
 | `trsv_reg_max` | formula | Derived | formula over detected consts: `_SCALAR_FPREGS - 4` | — |
 | `zhemv_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
@@ -256,8 +256,9 @@ Every `@load_preference` key in `src/` — 169 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `sme_gemv_minwork` | formula | Derived | formula over detected consts: a quarter of L1 in elements, `_L1_BYTES ÷ (4 * sizeof(Float64))`, the panel size at which the per-block ZA fill and readback disappear into the stream. | — |
-| `sme_gemvt_minm` | literal | Derived | the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | sweep m at fixed n |
-| `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (2,4,8) |
+| `sme_gemvt_minm` | literal | Derived | the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | sweep m at fixed n |
+| `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (4,8) |
+| `sme_gemvt_resident_max` | formula | Derived | L2 residency of A, m*n*8 <= 3/4 * _L2_BYTES; the quarter left over is x (re-read per column block), y, the deferred strips and the core's own lines; measured crossover 15 MB of 20. | candidate, sweep m*n at fixed m across _L2_BYTES |
 | `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
 | `sme_ger_minm` | literal | Derived | formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run. | — |
 | `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
@@ -289,13 +290,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-50 `const _X = <literal>` values in `src/` with no `@load_preference`.
+51 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 16 Exempt · 1 Unaudited.
+**Tier:** 2 Measured · 31 Literal · 16 Exempt · 2 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -417,3 +418,9 @@ on these, not on knobs.
 | `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSMR` | 4 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
+
+### sme_kernel
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_SME_GEMVT_ZA_NC` | 8 | Unaudited | — |

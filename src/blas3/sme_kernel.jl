@@ -1268,11 +1268,45 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # under `_SME_GEMV_MINWORK` for a slice of a call that clears it whole, and `m % _SME_GEMV_BLK`
 # flips with the band height. Both are moot under the entry rule above, and neither is worth a route
 # parameter — an unused argument on a hot predicate is not free (see `_trsm!`'s ninth-parameter note).
+# ⚠ THE `m % _SME_GEMV_BLK` TERM WAS A 10x CLIFF ON ACCUMULATE, AND IT IS GONE. It used to read
+# `(m % _SME_GEMV_BLK == 0 || iszero(beta))`, so any `y += A*x` whose row count was not a whole number
+# of blocks left SME entirely for the SIMD path. Measured, m=629 (629 % 32 = 21), beta=1 against beta=0:
+#
+#     n        128     160    2186
+#     beta=0  1.09    1.34   16.06 us   (SME)
+#     beta=1 10.35   13.42   99.42 us   (SIMD)
+#     ratio   9.5x   10.0x    6.2x
+#
+# At m=640 there is no cliff at all (0.99 against 0.91 us), so this was purely the row-count term.
+# The accumulate path never needed it: it uses the DESCENDING LADDER below, which does not overlap, and
+# its scalar row tail accumulates — both already correct for a ragged m. Only STORE mode needs whole
+# blocks, and store mode is the `iszero(beta)` branch that the term already admitted.
+# Found because a real solver (PureQP, a QR working set) issues `y += A*x` at m=629 on nearly every
+# call and was taking the SIMD path on all of them.
 @inline _sme_gemv_shape_ok(m, n, beta) =
-    m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK &&
-        (m % _SME_GEMV_BLK == 0 || iszero(beta))
+    m * n >= _SME_GEMV_MINWORK && m >= _SME_GEMV_BLK
 
 # The kernel reads y and A as raw column-major Float64 with unit row stride, and x contiguously.
+# ⚠ THIS KERNEL'S RATE IS GOVERNED BY ROWS, NOT BY TOTAL WORK, AND THE FLOOR ABOVE DOES NOT SAY SO.
+# Measured through `_sme_gemv!`, Float64, β=1, every block resident, GB/s of A:
+#
+#     rows \ cols      64    128    256    512   1024
+#         32           75    123    165    198    229
+#         64          225    175    261    475    510
+#        128          126    218    336    503    629
+#        256          511    672    783    862    908
+#        512          647    790    891    953    986
+#
+# So m >= 256 is where it performs, and below that it gives up 2-5x however many columns follow. Two
+# consequences worth knowing before tuning anything that calls it:
+#
+#   * A SMALL-n SQUARE gemv IS NOT SLOW BECAUSE IT IS SMALL. At m=n=64 the kernel reaches 225 GB/s and
+#     at m=n=512 it reaches 953 — the same kernel, the same residency, four times the rows.
+#   * NO TRIANGULAR COVER ESCAPES IT. A block of the strictly-upper triangle with m >= 256 must sit in
+#     the top-right corner, so the blocks nearest the diagonal are short BY CONSTRUCTION. That is why
+#     `_trmv_split!`'s cover aggregates 283 GB/s out of blocks that individually reach 725: at n=512 the
+#     recursive cover is one 256x256 at 783 plus two 128x128 at 218 and four 64x64 at 225, and the
+#     staircase alternative is worse (its panels are 64 columns wide, and narrow costs rows).
 @inline _sme_gemv_eligible(::Type{T}, m, n, trans, cj, A, x, y, incx, incy, beta) where {T} =
     T === Float64 && _SME_F64 && !trans && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
@@ -1288,6 +1322,101 @@ const _SME_GEMV_MINWORK = @load_preference("sme_gemv_minwork",
 # So gemv takes the same barrier the gemm path uses: the body is reached only through a function
 # POINTER resolved at load time, which inference sees as an opaque `Ptr`. Every argument is
 # `Ptr`/`Int`/`Float64`, so the `ccall` boxes nothing.
+#
+# ⚠ THE CROSSING COSTS ~90-110 ns, AND IT IS THE C ABI MEETING A BODY THAT USES ZA. Calling
+# `_sme_gemv_cabi` directly — same body, same kernels, every argument a runtime value so nothing folds:
+#
+#     m, n            64,64   256,256
+#     through pointer  169.7     684.8 ns
+#     called directly   67.5     594.6
+#
+# A bare `za.enable` + `ptrue.c64` + `za.disable` region as a direct `llvmcall` is 12.5 ns, so ZA
+# itself is nearly free. What costs is crossing INTO a body that then uses it: a `@cfunction` over a
+# body with no ZA work costs +8 ns, and over a body with ONE real kernel +97. Six candidates are
+# eliminated — do not re-run them:
+#
+#   * NOT constant folding: runtime versus literal args moves the direct arm 2 ns.
+#   * NOT inlining: `_sme_gemv_cabi` marked `@noinline` still measures 67.5 direct against 169.7.
+#   * NOT argument count: +8 ns at one argument and +8 at eight.
+#   * NOT the signature: a trivial body under the real mixed signature costs +8.3.
+#   * NOT the number of streaming regions: one reachable kernel costs +96.9, all ten +95.7.
+#   * NOT the witness counter alone — but it is a SECOND ~95 ns cost that OVERLAPS this one. A
+#     `Threads.atomic_add!` on a counter the kernel's stream has evicted costs +69 to +135 ns; a plain
+#     `Ref{Int}` increment costs 0. Removing EITHER cost alone changes nothing end to end, because each
+#     hides the other; both must go.
+#
+# ⛔ AND BOTH WAYS OUT ARE BLOCKED, BY DIFFERENT PARTS OF THE BUILD. Measured, not assumed:
+#
+#   * A DIRECT call is what inference resolves, and precompilation then codegens the kernel for the
+#     generic image CPU: `LLVM ERROR: Cannot select: intrinsic llvm.aarch64.sve.ptrue.c64`. A
+#     `Ref{typeof(f)}` is the same thing — its eltype is a singleton, so `code_typed` shows one static
+#     `:invoke` — and aborts identically.
+#   * A DYNAMIC call through a `Ref{Any}` precompiles fine and is as fast as a direct one, and with the
+#     arguments written into ONE preallocated per-thread struct it allocates nothing. With both costs
+#     removed that way, gemv-N at m=n=64 measured 168 -> 71 ns and n=128 261 -> 180. But
+#     `juliac --trim` cannot resolve a dynamic dispatch and the authoritative build fails.
+#
+# So the prize is ~2.4x on every small-n SME call — gemv-N at n=64 gates 0.48 and would gate above 1 —
+# and taking it needs a call that inference cannot resolve at precompile time but `--trim` can resolve
+# at build time. That is a toolchain problem, not a kernel one.
+
+# ── STORE-MODE ROW BLOCK WIDTH: WASTE AGAINST WIDTH ─────────────────────────────────────────────────
+# The overlapping-block scheme below covers a ragged `m` by running the WIDEST block twice, so the rows
+# actually streamed are `ceil(m/rb)*rb` and the redundancy is worst when m sits just above a block
+# boundary. Measured at n=160, store mode, rows actually run against m:
+#
+#     m        512   544   629   700  1024  1100  1536  2048  2186
+#     at rb=512 1.00  1.88  1.63  1.46  1.00  1.40  1.00  1.00  1.17
+#
+# m=629 streams 1024 rows to compute 629. Taking the widest rb unconditionally pays that, and width is
+# not worth 1.6x of redundant work: the same shape at rb=128 runs 1.02x the rows and measures 1.24x
+# faster END TO END through `gemv!`. So the width is chosen to minimise `rows * weight(ng)` instead.
+#
+# The weights are 100/(relative rate) by group count, measured through `_sme_gemv_run` at m=2048,
+# n=160 — a shape with NO overlap waste, so width is the only variable:
+#
+#     ng        1     2     4     8    16
+#     rb       32    64   128   256   512
+#     us    10.28  5.62  3.33  2.86  2.71
+#     weight  379   207   123   106   100
+#
+# That rule reproduces the measured best width at ALL TWELVE m values swept (100, 200, 300, 512, 544,
+# 629, 700, 1024, 1100, 1536, 2048, 2186) — it keeps rb=512 wherever m is a whole number of blocks and
+# narrows only where the waste pays for it. Gains through `gemv!`: 1.18-1.28x for m in 300..700, 1.09x
+# at 1100, and nothing (by construction) at 512, 1024, 1536, 2048.
+# PDM: Measured — relative cost of a row block by group count; it is the rate curve of this kernel's memory-level parallelism and no formula over cache sizes predicts it. | tune: sweep rb at an m with no overlap waste
+const _SME_GEMV_RBW = (379, 207, 123, 106, 100)   # req8-ok: measured rate curve, table above
+
+# Widest-is-not-best: minimise streamed rows weighted by the width's own cost. The widest width stays
+# the DEFAULT and a narrower one has to beat it by a MARGIN. The weights are fitted at one n, and
+# without the margin two near-ties flipped the wrong way and cost 4% each — m=2186 n=629, and square
+# n=2100 where A is past L2 and the wider block streams better than the weights predict.
+@inline function _sme_gemv_store_rb(m::Int)
+    ng = 1
+    while 2 * ng * _SME_GEMV_BLK <= m && 2 * ng <= _SME_GEMV_NGMAX
+        ng *= 2
+    end
+    wide = ng * _SME_GEMV_BLK
+    nbw = m ÷ wide
+    wide_c = (nbw * wide + (nbw * wide < m ? wide : 0)) * _SME_GEMV_RBW[1 + trailing_zeros(ng)]
+    best_rb = wide
+    g = 1
+    i = 1
+    while g <= _SME_GEMV_NGMAX && i <= length(_SME_GEMV_RBW)
+        rb = g * _SME_GEMV_BLK
+        if rb <= m && rb != wide
+            nb = m ÷ rb
+            c = (nb * rb + (nb * rb < m ? rb : 0)) * _SME_GEMV_RBW[i]
+            if c * 10 < wide_c * 9
+                wide_c = c * 10 ÷ 9
+                best_rb = rb
+            end
+        end
+        g <<= 1
+        i += 1
+    end
+    return best_rb
+end
 function _sme_gemv_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64, store::Int
@@ -1307,11 +1436,7 @@ function _sme_gemv_cabi(
     # rewritten with the value they already hold. Accumulate mode keeps the ladder, where `m` is a
     # multiple of the block anyway because `_sme_gemv_shape_ok` demands it once beta is nonzero.
     if st
-        ng = 1
-        while 2 * ng * _SME_GEMV_BLK <= m && 2 * ng <= _SME_GEMV_NGMAX
-            ng *= 2
-        end
-        rb = ng * _SME_GEMV_BLK
+        rb = _sme_gemv_store_rb(m)
         nb = m ÷ rb
         if nb > 0
             _sme_gemv_run(rb, y, a, lda, x, n, alpha, nb, true)
@@ -1340,8 +1465,9 @@ function _sme_gemv_cabi(
         #
         # Instead run one more full block at `m - BLK`, which recomputes the rows it overlaps. That
         # is only sound in STORE mode, where a row is written with the value it already holds; in
-        # accumulate mode the overlap would add alpha*A*x to those rows twice, which is why
-        # `_sme_gemv_eligible` requires beta == 0 for a shape that is not an exact multiple.
+        # accumulate mode the overlap would add alpha*A*x to those rows twice, so accumulate takes the
+        # SCALAR branch below instead. That branch is what lets `_sme_gemv_shape_ok` admit a ragged m
+        # with beta != 0 at all; requiring an exact multiple there cost 4-7x (see its note).
         if st
             _sme_gemv_run(_SME_GEMV_BLK, y + (m - _SME_GEMV_BLK) * 8,
                           a + (m - _SME_GEMV_BLK) * 8, lda, x, n, alpha, 1, true)
@@ -1365,20 +1491,246 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # ══ gemv-T: y += alpha*A'x ══════════════════════════════════════════════════════════════════════
 #
 # THE TWO FORMS STREAM A IDENTICALLY — column by column, contiguous — and differ only in the
-# arithmetic. gemv-N multiplies a column by a BROADCAST SCALAR and accumulates into a vector
-# (`fmla.single.vg1x4`); gemv-T multiplies a column by a VECTOR and accumulates into a scalar, so it
-# takes the multi-vector `fmla.vg1x4` and reduces at the end. Because the traffic is the same, the
-# bandwidth the N form reaches is available here too, and it is bandwidth that this routine wants:
-# without it gemvT sits at DRAM speed while its operand is in L2.
+# arithmetic. gemv-N multiplies a column by a BROADCAST SCALAR and accumulates into a vector; gemv-T
+# multiplies a column by a VECTOR of x and accumulates into a per-column partial sum that is reduced
+# at the end. Because the traffic is the same, the bandwidth the N form reaches is available here
+# too, and it is bandwidth that this routine wants: without it gemvT sits at DRAM speed while its
+# operand is in L2.
 #
-# `NC` COLUMNS ARE IN FLIGHT AT ONCE, each owning one vg1x4 group of four ZA slices. That buys three
+# THE INNER LOOP IS `fmla.single.vg1x4` FED BY STRIDED-REGISTER LOADS, and that pairing is the whole
+# kernel. The single form multiplies four vectors by ONE vector and issues one per cycle on this unit;
+# the multi x multi `fmla.vg1x4` (four vectors by four vectors) issues one per TWO cycles, which caps
+# any kernel built on it at 525-549 GB/s. The single form fits gemv-T only if its four vectors are
+# the SAME rows of four DIFFERENT columns, with the one vector the matching rows of x — then ZA
+# slice j accumulates column j. Loading that layout vector by vector is four 64-byte loads per
+# `fmla` and measures 256-264 GB/s, load-issue bound. The strided-register multi-vector load
+#
+#     ld1d { z16.d, z20.d, z24.d, z28.d }, pn8/z, [col0]      (one contiguous 256-byte run)
+#     ld1d { z17.d, z21.d, z25.d, z29.d }, pn8/z, [col1]
+#     ld1d { z18.d, z22.d, z26.d, z30.d }, pn8/z, [col2]
+#     ld1d { z19.d, z23.d, z27.d, z31.d }, pn8/z, [col3]
+#
+# reads each column as one 256-byte run and leaves { z16-z19 } holding rows 0-7 of columns 0-3,
+# { z20-z23 } rows 8-15, and so on: the single form's operands, assembled by the load. One load and
+# one `fmla` per 256 bytes of A, both at about one per cycle, and the kernel runs 600-730 GB/s where
+# the multi x multi form ran 490-510.
+#
+# ⛔ THE LOOP IS INLINE ASSEMBLY BECAUSE THE ALLOCATOR CANNOT FORM THOSE TUPLES. LLVM selects the
+# strided load from plain intrinsics (four `ld1.pn.x4` results consumed one element each by
+# `fmla.single.vg1x4`), but with AArch64 subregister-liveness tracking off — LLVM 20's default — it
+# treats each strided tuple as live until its last element is used, sees the contiguous tuple as
+# interfering, and copies three of every four tuples through { z4-z7 }: twelve `mov z` per window,
+# measured 264-285 GB/s for the same instruction sequence. The one fix on the LLVM side is the
+# process-global, experimental `-aarch64-enable-subreg-liveness-tracking=true` (623 GB/s with it),
+# which this package must not impose on every function in a session. Fewer tuples in flight and a
+# reversed `fmla` order measure 272 and the two-vector form 229, so no pure-intrinsic shape reaches
+# the rate. Upstream enables the tracking for streaming functions in LLVM 22; the asm can go once
+# the bundled LLVM has it. The asm block is the row loop ONLY — pointer setup, ZA zero, the drain
+# and the epilogue stay in IR, and the block declares every z and p register and the scratch x
+# registers it touches so nothing of LLVM's is live across it.
+#
+# `NC` COLUMNS ARE IN FLIGHT AT ONCE in quads of four: quad q's four row phases (rows 8k..8k+7 of a
+# 32-row window) own ZA vector groups 4q..4q+3, and slice j of each is column 4q+j. That buys three
 # things at once: `x` is loaded once per 4L rows and reused NC times, the horizontal reduction is
-# paid once per NC columns rather than once per column, and there are 4*NC independent accumulator
-# chains — the quantity the N form measured as decisive (256.7 GB/s at one slice group, 1013 at
-# four). It costs NC concurrent A streams, which is why the widest NC is not the fastest.
+# paid once per NC columns rather than once per column, and there are NC independent accumulator
+# chains. It costs NC concurrent A streams, which is why the widest NC is not the fastest.
 #
 # ACCUMULATES into y, as the N form does, so `beta` is applied by the caller before the call.
-function _gemvt_ir(nc::Int)
+#
+# ⛔ A NEUTRAL-OR-WORSE REWRITE OF THE DRAIN, measured as an in-process A/B against the other: folding
+# the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so CROSSES
+# the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
+# 0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
+
+# ══ gemv-T, ZA-internal drain ═══════════════════════════════════════════════════════════════════
+#
+# ⚠ THE DEFERRED ARM'S SCRATCH READBACK COSTS UP TO ~7 ns PER LINE, AND IT IS A PAGE EFFECT. That arm
+# writes one `_SME_L`-lane strip per column from streaming mode and the caller sums the lanes in
+# normal mode. Reading those lines back is cheap or expensive depending on how many of the most
+# recently written strips share a 16 KB page: measured at n=128 (8 KB of strips), scratch offsets
+# 0-8192 within the page cost ~912 ns beyond kernel plus lane-sum, offsets 9216-14336 cost 40-100.
+# It is not latency — inserting a 0.2-5 us gap leaves it, and a prefetch loop of independent
+# one-per-line loads absorbs none of it. It is in the shipped path at every n >= 128: about 900 ns of
+# the 1.86 us call at n=256, and about a microsecond of 1.29 at n=128 against a 321 ns kernel.
+#
+# ⛔ IT IS ALSO WHY SMALL-m CELLS DO NOT REPRODUCE ACROSS PROCESSES. The per-thread scratch's page
+# offset decides which state a process lands in, so the same shape has measured 374, 727, 1042 and
+# 1300 ns in four harnesses. Any knob fitted against those numbers is fitted against a page map —
+# which is what `_SME_GEMVT_NC` and `_SME_GEMVT_MINM` were, so both need re-deriving from here.
+#
+# THIS KERNEL REMOVES THE ROUND TRIP by reducing the lanes INSIDE ZA and storing y directly. ZA's
+# two-dimensional addressing is what makes it possible, and it costs no transpose:
+#
+#   * A vg1x4 group `g` addresses ZA vectors {g, g+16, g+32, g+48}; vector v is tile `v mod 8`, row
+#     `v div 8`. So group 0 is tile0 rows {0,2,4,6} and group 8 is tile0 rows {1,3,5,7} — TOGETHER
+#     THEY ARE THE WHOLE OF TILE 0, with no copy.
+#   * So the two column quads accumulate into groups 0-3 and 8-11 rather than 0-7, and each quad's
+#     four row phases fold into its base group as before. Loading quad 0 as columns c, c+2, c+4, c+6
+#     and quad 1 as c+1, c+3, c+5, c+7 then puts column c+r in tile row r, in natural order.
+#   * `read.ver` reads a tile VERTICALLY. Vertical slice j of tile 0 is then `[col c lane j, col c+1
+#     lane j, …, col c+7 lane j]`, so summing the eight vertical slices elementwise gives the eight
+#     columns' dot products in one vector — the transpose is the read, not an operation.
+#
+# The drain is `zero {za1.d}`, two `read.ver.vg4`, two `add.za64` into tile 1, one `read.vg1x4`, three
+# `fadd`, then one load of y, one `fmla` by alpha and one store: 8 columns of y per block, against the
+# deferred arm's 8 scratch lines per block plus a caller pass over them.
+#
+# NC IS FIXED AT 8 HERE and the generator enforces it: the layout above is a statement about where a
+# vg1x4 group sits inside a tile, and it only lands on tile 0 for the pair of groups {0, 8}.
+function _gemvt_za_ir(nc::Int)
+    nc == 8 || throw(ArgumentError(
+        "SME gemv-T ZA drain: NC must be 8, not $nc — groups 0 and 8 are what tile 0 is made of"))
+    L = _SME_L
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    q = Char(34)
+    # One 4L-row window of 8 columns. $0 column block, $1 lda in bytes, $2 x, $3 row count.
+    # x9 row offset in elements, x10 walks columns, x12 = 2*lda, w8/w11 the ZA group bases 0 and 8.
+    win = String[]
+    push!(win, "ld1d {z0.d - z3.d}, pn8/z, [\$2, x9, lsl #3]")
+    for qq in 0:1
+        push!(win, qq == 0 ? "mov x10, \$0" : "add x10, \$0, \$1")
+        for j in 0:3
+            push!(win, "ld1d {z$(16 + j).d, z$(20 + j).d, z$(24 + j).d, z$(28 + j).d}, pn8/z, [x10, x9, lsl #3]",
+                       "add x10, x10, x12")
+        end
+        for k in 0:3
+            g = 8qq + k
+            push!(win, "fmla za.d[$(g < 8 ? "w8" : "w11"), $(g % 8), vgx4], {z$(16 + 4k).d - z$(19 + 4k).d}, z$k.d")
+        end
+    end
+    setup = ("ptrue pn8.d", "mov w8, #0", "mov w11, #8", "mov x9, #0", "lsl x12, \$1, #1")
+    loop = join((setup..., "1:", win..., "add x9, x9, #$(4L)", "cmp x9, \$3", "b.lt 1b"), "\\0A")
+    tailw = join((setup..., win...), "\\0A")
+    clob = join(("~{z$i}" for i in 0:31), ",") * "," * join(("~{p$i}" for i in 0:15), ",") *
+           ",~{x8},~{x9},~{x10},~{x11},~{x12},~{memory},~{cc}"
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32, i32)
+declare void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
+  ret void
+}
+
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  %ldab = shl i64 %lda, 3
+  %av = insertelement <vscale x 2 x double> poison, double %alpha, i64 0
+  %asplat = shufflevector <vscale x 2 x double> %av, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %anyb = icmp sgt i64 %nblk, 0
+  br i1 %anyb, label %blk, label %fin
+
+blk:
+  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
+  %jb = mul nsw i64 %b, $nc
+  %yblk = getelementptr inbounds double, ptr %y, i64 %jb
+  %aoff = mul nsw i64 %jb, %lda
+  %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %anyr = icmp sgt i64 %m, 0
+  br i1 %anyr, label %row, label %tailchk
+
+row:
+  call void asm sideeffect "$loop", "r,r,r,r,$clob"(ptr %ablk, i64 %ldab, ptr %x, i64 %m)
+  br label %tailchk
+
+tailchk:
+  %notl = icmp eq ptr %atl, null
+  br i1 %notl, label %rd, label %tail
+
+tail:
+  %atlblk = getelementptr double, ptr %atl, i64 %aoff
+  call void asm sideeffect "$tailw", "r,r,r,$clob"(ptr %atlblk, i64 %ldab, ptr %xt)
+  br label %rd
+
+rd:
+""")
+    # Fold each quad's four row phases into its base group, exactly as the other arms do.
+    for (base, g1, g2, g3) in ((0, 1, 2, 3), (8, 9, 10, 11))
+        for src in (g1, g2, g3)
+            println(io, "  %f$(src) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $src)")
+            for k in 0:3
+                println(io, "  %fv$(src)_$k = extractvalue $T4 %f$src, $k")
+            end
+            println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $base,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_0, <vscale x 2 x double> %fv$(src)_1,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_2, <vscale x 2 x double> %fv$(src)_3)")
+        end
+    end
+    print(io, """
+  call void @llvm.aarch64.sme.zero(i32 2)
+  %v0 = call $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32 0, i32 0)
+  %v4 = call $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32 0, i32 4)
+""")
+    for (nm, v) in (("v0", "v0"), ("v4", "v4"))
+        for k in 0:3
+            println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 1,")
+        println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
+        println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")
+    end
+    print(io, """
+  %t = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 1)
+  %t0 = extractvalue $T4 %t, 0
+  %t1 = extractvalue $T4 %t, 1
+  %t2 = extractvalue $T4 %t, 2
+  %t3 = extractvalue $T4 %t, 3
+  %s01 = fadd reassoc <vscale x 2 x double> %t0, %t1
+  %s23 = fadd reassoc <vscale x 2 x double> %t2, %t3
+  %sum = fadd reassoc <vscale x 2 x double> %s01, %s23
+  %yold = load <vscale x 2 x double>, ptr %yblk, align 8
+  %scaled = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %sum, <vscale x 2 x double> %asplat, <vscale x 2 x double> %yold)
+  store <vscale x 2 x double> %scaled, ptr %yblk, align 8
+  br label %bend
+
+bend:
+  %bn = add nuw nsw i64 %b, 1
+  %bdone = icmp eq i64 %bn, %nblk
+  br i1 %bdone, label %fin, label %blk
+
+fin:
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+
+declare <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+
+attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body"
+  "target-features"="+sme,+sme2,+sme-f64f64" }
+""")
+    return String(take!(io))
+end
+
+# ── gemv-T, DRAM regime: the multi x multi form ─────────────────────────────────────────────────
+#
+# Same traffic, same ZA layout as the N form's mirror: column c owns one vg1x4 group whose four
+# slices are the four row phases, fed by one contiguous `ld1.pn.x4` of A and the multi x multi
+# `fmla.vg1x4` (four vectors by four vectors, one per TWO cycles). That caps it at 525-549 GB/s
+# from L2, where the strided kernel above runs 600-730 — but ONCE A NO LONGER FITS IN L2 THIS LOOP
+# WINS, because it is plain IR: LLVM schedules its loads freely and keeps more of them in flight
+# against DRAM latency, where the asm loop's fixed sequence cannot. Measured in one process, same
+# buffers, medians of three 1-1.5 s windows (N = 4-18k one-call samples), this kernel fused against
+# the strided kernel's deferred arm:
+#
+#     A MB      8    10    12    14    15    16    18    20    24.5   32 (2048^2)   134 (4096^2)
+#     ratio  0.83  0.84  0.89  0.91  1.06  1.03  1.18  1.17   1.10      1.13           1.04
+#
+# `_SME_GEMVT_RESIDENT_MAX` routes on that crossover. Only the fused epilogue exists here: in the
+# DRAM regime the deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
+# ties elsewhere), so there is nothing to defer.
+#
+# ⛔ Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
+# quads instead of one reused quad (verified in the emitted assembly). It measures 1.00x at every
+# size — this core renames the write-after-read away, so the interleaved order costs nothing.
+function _gemvt_mm_ir(nc::Int)
     nc <= 2 * _SME_L || throw(ArgumentError(
         "SME gemv-T: $nc column groups exceeds the $(2 * _SME_L) that ZA can address at $(_SME_L) lanes"))
     L = _SME_L
@@ -1397,12 +1749,12 @@ declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
 declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
 declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
 
-define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) {
-  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk)
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
   ret void
 }
 
-define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk) #0 {
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
   %pn = call target($(q)aarch64.svcount$(q)) @llvm.aarch64.sve.ptrue.c64()
@@ -1417,7 +1769,7 @@ blk:
   %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
   call void @llvm.aarch64.sme.zero(i32 255)
   %anyr = icmp sgt i64 %m, 0
-  br i1 %anyr, label %row, label %rd
+  br i1 %anyr, label %row, label %tailchk
 
 row:
   %i = phi i64 [ 0, %blk ], [ %in, %row ]
@@ -1445,7 +1797,37 @@ row:
     print(io, """
   %in = add nuw nsw i64 %i, $(4 * L)
   %rdone = icmp sge i64 %in, %m
-  br i1 %rdone, label %rd, label %row
+  br i1 %rdone, label %tailchk, label %row
+
+tailchk:
+  %notl = icmp eq ptr %atl, null
+  br i1 %notl, label %rd, label %tail
+
+tail:
+  %atlblk = getelementptr double, ptr %atl, i64 %aoff
+  %xtr = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %xt)
+  %txv0 = extractvalue $T4 %xtr, 0
+  %txv1 = extractvalue $T4 %xtr, 1
+  %txv2 = extractvalue $T4 %xtr, 2
+  %txv3 = extractvalue $T4 %xtr, 3
+""")
+    # The ragged rows ride in the SAME ZA accumulators as the full-window rows, exactly as in the
+    # strided kernel: one extra 4L-row window per column, `%xt` zero over the overlap.
+    for c in 0:(nc - 1)
+        println(io, "  %tco$c = mul nsw i64 %lda, $c")
+        println(io, "  %tcb$c = getelementptr inbounds double, ptr %atlblk, i64 %tco$c")
+        println(io, "  %tar$c = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(q)aarch64.svcount$(q)) %pn, ptr %tcb$c)")
+        for k in 0:3
+            println(io, "  %tav$(c)_$k = extractvalue $T4 %tar$c, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $c,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_0, <vscale x 2 x double> %tav$(c)_1,")
+        println(io, "    <vscale x 2 x double> %tav$(c)_2, <vscale x 2 x double> %tav$(c)_3,")
+        println(io, "    <vscale x 2 x double> %txv0, <vscale x 2 x double> %txv1,")
+        println(io, "    <vscale x 2 x double> %txv2, <vscale x 2 x double> %txv3)")
+    end
+    print(io, """
+  br label %rd
 
 rd:
 """)
@@ -1455,8 +1837,7 @@ rd:
             println(io, "  %zv$(c)_$k = extractvalue $T4 %o$c, $k")
         end
         # The four slice vectors of a group are partial sums of ONE column, so folding them and the
-        # lanes is a reduction of that column's dot product; `reassoc` lets it be a tree rather than
-        # the sequential FADDA, which is the whole point of holding four chains.
+        # lanes is a reduction of that column's dot product; `reassoc` lets it be a tree.
         println(io, "  %s$(c)_a = fadd reassoc <vscale x 2 x double> %zv$(c)_0, %zv$(c)_1")
         println(io, "  %s$(c)_b = fadd reassoc <vscale x 2 x double> %zv$(c)_2, %zv$(c)_3")
         println(io, "  %s$(c)_c = fadd reassoc <vscale x 2 x double> %s$(c)_a, %s$(c)_b")
@@ -1485,23 +1866,30 @@ declare double @llvm.fmuladd.f64(double, double, double)
     return String(take!(io))
 end
 
-# Column groups in flight. Bounded above by the vg1x4 groups ZA can address; the useful range is
-# narrower and is chosen per call by `_sme_gemvt_nc`.
-const _SME_GEMVT_NCS = (2, 4, 8)
-const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc) for nc in _SME_GEMVT_NCS)
+# Column groups in flight: multiples of four, because one strided-register load tuple spans four
+# columns, and bounded above by the vg1x4 groups ZA can address. `_SME_GEMVT_NC` picks one.
+const _SME_GEMVT_NCS = (4, 8)
+# The multi x multi loop for the DRAM regime (`_gemvt_mm_ir`), fused epilogue only.
+const _SME_GEMVT_MM_IR = Dict{Int, String}(nc => _gemvt_mm_ir(nc) for nc in _SME_GEMVT_NCS)
+
+# The resident arm's drain. NC is 8 and not a knob: the layout is a statement about which ZA vectors a
+# vg1x4 group occupies, and only the pair {0, 8} makes up a whole tile, which is what the vertical read
+# needs. `_SME_GEMVT_NC` still chooses the DRAM arm's block.
+const _SME_GEMVT_ZA_NC = 8   # req8-ok: not tuning — a vg1x4 group occupies ZA vectors {g, g+16, g+32, g+48}, so only the pair {0, 8} spans a whole tile, which is what the vertical read needs
+const _SME_GEMVT_ZA_IR = _gemvt_za_ir(_SME_GEMVT_ZA_NC)
+@eval @inline _sme_gemvt_za(y, a, l, x, m, al, nb, atl, xt) =
+    Base.llvmcall(($_SME_GEMVT_ZA_IR, "entry"), Cvoid, _SME_GEMVT_ARGT,
+        y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
+
+const _SME_GEMVT_ARGT = Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64,
+                              Ptr{Float64}, Ptr{Float64}}
 
 for nc in _SME_GEMVT_NCS
-    @eval @inline $(Symbol("_sme_gemvt", nc))(y, a, l, x, m, al, nb) =
-        Base.llvmcall(($(_SME_GEMVT_IR[nc]), "entry"), Cvoid,
-            Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64},
-            y, a, Int64(l), x, Int64(m), al, Int64(nb))
+    @eval @inline $(Symbol("_sme_gemvtm", nc))(y, a, l, x, m, al, nb, atl, xt) =
+        Base.llvmcall(($(_SME_GEMVT_MM_IR[nc]), "entry"), Cvoid, _SME_GEMVT_ARGT,
+            y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
 end
 
-@inline function _sme_gemvt_run(nc::Int, y, a, l, x, m, al, nb)
-    nc == 2 && return _sme_gemvt2(y, a, l, x, m, al, nb)
-    nc == 4 && return _sme_gemvt4(y, a, l, x, m, al, nb)
-    return _sme_gemvt8(y, a, l, x, m, al, nb)
-end
 # ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND NEITHER WAY OUT PAYS.
 #
 # Each column block ends with one `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`.
@@ -1532,6 +1920,192 @@ end
 # four columns span exactly one page and the scratch can alias them.
 
 
+# DRAM-regime arm: the multi x multi loop, fused epilogue. Selected by `_SME_GEMVT_RESIDENT_MAX`.
+@inline function _sme_gemvt_mrun(nc::Int, y, a, l, x, m, al, nb, atl, xt)
+    nc == 4 && return _sme_gemvtm4(y, a, l, x, m, al, nb, atl, xt)
+    return _sme_gemvtm8(y, a, l, x, m, al, nb, atl, xt)
+end
+
+
+# One scratch strip per thread, grow-only through `_ws_grow!`, so the deferred arm allocates only on a
+# thread's first call through it. `_sme_gemvt_cabi` claims it and drops it within the same call and
+# makes no public Level-3 call, so it cannot be live across a threaded join — the same argument the
+# trsv reciprocal caches carry in `test/perthread_lint_baseline.txt`.
+const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
+# ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND IT IS WHY THERE ARE TWO ARMS.
+#
+# Each column block ends with a fold of the four ZA slices plus, in the fused arm, one
+# `llvm.vector.reduce.fadd` per column — a streaming-mode `faddv`. Holding one column block and
+# sweeping m separates the three costs a square sweep leaves entangled: about 150 ns per call, about
+# 40 ns per NC=4 block, of which only 14 ns is the column stream itself at 583 GB/s. Pricing the
+# reduce by replacing it with a lane-0 extract — wrong answer, timing only:
+#
+#     m = n          256    512   1024  |  m=256, n=64
+#     with faddv    2608   6017  17541  |       811 ns
+#     without       1366   4244  16666  |       349 ns
+#     ratio         1.91   1.42   1.05  |      2.33
+#
+# THE DEFERRED ARM takes that out of streaming mode: fold the four slices as before, store the folded
+# vector into a per-column strip of `_SME_GEMVT_SCR`, and sum its `_SME_L` lanes in the caller. It is
+# correct to 3e-16. Superseded by the ZA-internal drain, which needs neither the scratch nor a caller pass.
+#
+# ⛔ SVE `faddp` IS NOT AN ALTERNATIVE, and the shape of the failure is worth keeping: pairwise adds
+# are SEGMENT-WISE — they pair lanes inside each 128-bit segment and never cross one — so three of
+# them leave four partial sums in a 512-bit vector instead of one total. The variant measures
+# 1.05-1.62x and returns the wrong answer. That timing is a floor on what a correct cross-segment
+# sequence would have to beat, not a result.
+#
+# ⚠ TAKE NO SMALL-m NUMBER FROM A SINGLE PROCESS. One run of the deferred arm read 518 ns at m=128 and
+# three later runs read 1385 ns for the same code. Below about m=256 the per-call cost dominates and
+# the readings do not reproduce: the same m=144 shape measures the SME route at 0.81x of NEON at n=64
+# and 2.04x at n=256, and pricing the ragged-row window there gives 0.0% at four row windows and 9% at
+# five, which no cost model fits. Tune the floor from a multi-process sweep, not from one session.
+#
+# ⛔ THE CALLER-SIDE LANE SUM IS NOT WHERE THE DEFERRED ARM COSTS ITS OVERHEAD. Timed on its own over a
+# pre-filled scratch it is 0.41-0.45 ns per column, flat from nb=64 to nb=1024 — 56 ns at n=128, 106 ns
+# at n=256. Any larger figure for it comes from subtracting two whole-call timings, and at these sizes
+# that difference is dominated by a per-call cost near 390 ns (fitted from the measured SME/NEON
+# crossover over n=128..512, with a per-column drain near 1.5 ns). Spelling the lane sum as a
+# whole-vector `sum(Vec{_SME_L,Float64})` measures 1.00x — LLVM already emits that.
+
+
+#
+# ⚠ THIS KERNEL IS FMA-ISSUE-BOUND, AND THE INSTRUCTION IT MUST USE RUNS AT HALF RATE. That is the
+# whole of the 1.9x against gemv-N, and it is not a tuning deficit. Measured with one load feeding K
+# INDEPENDENT `fmla`s into K distinct ZA groups, so chain count and throughput can be told apart:
+#
+#     K chains             1      2      4      8     16
+#     fmla.single.vg1x4   68    133    262    261    255  GF/s   (x4 by a BROADCAST — gemv-N's form)
+#     fmla.vg1x4          66    138    131    131    131  GF/s   (x4 by x4 — this kernel's form)
+#     ratio             1.03   0.97   2.00   1.99   1.95
+#
+# Both forms PLATEAU at four chains and neither moves at eight or sixteen, so this is a throughput
+# limit and not accumulator latency: `fmla.vg1x4` retires one per two cycles, `fmla.single.vg1x4` one
+# per cycle. (The broadcast form needs four chains to get there and the multi-by-multi form only two,
+# which is why the K=2 column looks inverted.)
+#
+# ⛔ AT K=1 THEY LOOK IDENTICAL. That arm is load-bound and hides the difference entirely; a first
+# attempt measured 257 GB/s for both and concluded the forms were equal. Do not price these with one
+# FMA per load.
+#
+# The ceiling follows directly. One `fmla.vg1x4` per two cycles covers 4 vectors x L lanes = 32
+# Float64, so 16 elements per cycle, 128 B/cycle, 549 GB/s at this clock — and gemv-T measures 514,
+# 94% of it. The broadcast form gives 256 B/cycle, 1098 GB/s — and gemv-N measures 988, 90% of it.
+# Both kernels are already where their instruction stream puts them.
+#
+# ⛔ SO THE ONLY WAY UP IS THE BROADCAST FORM, WHICH NEEDS ROWS OF A. y[j] = sum_i A[i,j]*x[i] is
+# elementwise in A and x, so multi-by-multi is forced. Reaching the broadcast form means accumulating
+# y += x[i] * A[i,:], which wants ROWS of a column-major A. Transposing tiles through ZA (`mova` by
+# vertical slices, read back horizontal) costs 8 moves in and 8 out per 8x8 Float64 tile — 64 elements
+# for about 32 instructions against 32 elements per 2-cycle instruction today — so it loses by roughly
+# 4x even before the second ZA tile it needs, and the SME2 vg2/vg4 `mova` forms only halve that.
+# `fmopa` does not help: ZA[r,c] += A[i+r,j]*x[i+c] fills a tile to use its diagonal, 8x waste at this
+# vector length. The indexed `fmla` forms broadcast one LANE, which is still a row of A.
+#
+# ⚠ ACCELERATE IS ABOVE THAT CEILING, WHICH MEANS IT IS NOT RUNNING THIS INSTRUCTION. It sustains
+# 580-820 GB/s from n=256 to n=1024 SINGLE-THREADED against the 549 GB/s `fmla.vg1x4` allows; the table
+# is below, measured with both arms in dedicated runs rather than as a cached quotient.
+#
+# ⚠ AND THE "ONLY WAY UP NEEDS ROWS, SO IT IS CLOSED" CONCLUSION IS WRONG: a rate above this
+# instruction's ceiling is reachable on this hardware, so some route to the full-rate form exists.
+# ZA is a candidate transpose engine for it — `ld1d` into a HORIZONTAL slice puts column-major memory
+# into ZA rows and `mova` reads it back out — and `llvm.aarch64.sme.ld1d.horiz` is already declared in
+# `_SME_DECLS` here, so the route looked open. The estimate above that transposing costs about 4x was
+# never measured; it is an instruction count done on paper. So it was BUILT and measured — see below.
+#
+# ⛔ AND THE ZA TRANSPOSE ROUTE IS NOW MEASURED, NOT ESTIMATED: IT IS FOUR TIMES TOO SLOW. The mechanism
+# works — `ld1d` into a tile's HORIZONTAL slices followed by `st1d` from its VERTICAL slices transposes
+# an 8x8 Float64 block exactly (verified against `transpose(A)`) — but the rate is nowhere near enough:
+#
+#     8x8 blocks        128     256     512
+#     GB/s of A         100     115      51
+#     cycles per instr  1.37    1.19    2.72
+#
+# Sixteen instructions per 64 elements at about 1.2 cycles each is 3.2 elements per cycle, so roughly
+# 110 GB/s — against the 514 GB/s this kernel already reaches with the half-rate FMA and no transpose
+# at all. A transposing gemv-T cannot win, and the earlier paper estimate of "about 4x worse" was right.
+#
+# ⚠ WHICH LEAVES THE GAP UNEXPLAINED. A transposing route is ruled out by the rate above, so whatever
+# reaches past this instruction's ceiling is not that, and this kernel has no candidate left to try.
+#
+# ⚠ AND THE SIZE OF THE GAP IS WITHIN REACH OF THE MEASUREMENT. Deriving the multi-form issue rate from
+# this machine rather than from an assumed clock: the broadcast form measures 262 GF/s and the multi form
+# 131, so 2.05 G instructions per second, 32 Float64 each, which is 525 GB/s — and gemv-T measures 514,
+# 98% of it.
+#
+# ⛔ SETTLED: ACCELERATE REALLY DOES EXCEED THIS INSTRUCTION'S RATE. Measured in a dedicated process
+# with `VECLIB_MAXIMUM_THREADS=1` set before vecLib initializes, square `BLAS.gemv!('T', ...)`, so no
+# cross-run quotient is involved:
+#
+#     n              256   320   352   384   416   512   640  1024  2048  4096
+#     Accelerate     579   755   820   762   809   593   758   581   150   144  GB/s
+#     this kernel    496   -     -     504   -     507   -     512   136   -
+#
+# It sustains 580-820 GB/s from n=256 to n=1024 against the 549 this instruction allows, so the half-rate
+# multi-by-multi form is not what it runs. Both arms collapse to the DRAM roofline near 145 GB/s at
+# n >= 2048, where this kernel is at parity. The reachable gap is therefore n=256..1024 only.
+#
+# ⛔ AND THE BROADCAST FORM IS UNREACHABLE WITHOUT THE TRANSPOSE — MEASURED. The form itself fits gemv-T
+# if the four vectors of its MULTI operand are 8 rows of four DIFFERENT columns and its SINGLE operand is
+# the matching 8 entries of x: ZA slice j then accumulates column j, and the drain is unchanged. Built
+# and verified to 1e-15, it is LOAD-bound and loses badly, because four columns at 8 rows each is four
+# separate 64 B loads where this kernel issues one contiguous 256 B `ld1.pn.x4`:
+#
+#     n                        128   256   384   512  1024
+#     broadcast, 1 ZA group    319   261   259   256   262  GB/s
+#     broadcast, 4 ZA groups   228   195   216   203   204
+#     this kernel (multi)      353   496   504   507   523
+#
+# More ZA groups make it worse, which is the load port and not the chains. So both ways to the full-rate
+# form are closed: feeding it from ordinary memory is load-bound at ~260 GB/s, and feeding it through a
+# ZA transpose is transpose-bound at ~110 GB/s (above). This kernel's 549 GB/s ceiling stands, and
+# Accelerate's mechanism for exceeding it is NOT identified.
+#
+# ⚠ AND THE MEMORY PATTERN CONTRIBUTES NOTHING — the control that proves it is worth keeping. This
+# kernel reads nc columns of A concurrently in 4L-element chunks, which looks like the obvious suspect
+# next to gemv-N's single column read in rb-element runs. Call it with `lda = 0` and all nc streams
+# collapse onto ONE set of cache lines: same instruction stream, same count, one stream instead of four.
+# The result is garbage and the timing is valid:
+#
+#     m=n=1024, lda=1024   15.5 us   541 GB/s
+#     m=n=1024, lda=0      15.5 us   540 GB/s      1.00x
+#
+# So there is nothing to win by rearranging the reads. An L1-resident panel says the same thing from
+# the other side: m=1024 n=4 is 32 KB and measures 164 GB/s, BELOW the 516 of the 8 MB case, because at
+# that size the call is almost entirely the entry cost — small and slow here means overhead, not memory.
+#
+# ⚠ THIS ALSO REINTERPRETS THE GROUP TABLE ABOVE `_sme_gemv_eligible`, which reads 230 GB/s at two
+# groups rising to 1009 at sixteen. Two effects are stacked in it. Below four groups it is CHAIN COUNT:
+# `fmla.single.vg1x4` needs four independent chains to reach its issue rate (68, 133, 262 GF/s at one,
+# two, four), and gemv-N forced to ng=2 reproduces ~230 GB/s even on an L1-RESIDENT 32 KB panel, where
+# no contiguity argument applies. Above four groups the FMA is already saturated — 262, 261, 255 GF/s at
+# four, eight, sixteen — so the continued rise to 1009 is the taller row block: fewer row blocks, fewer
+# ZA drains, longer runs per column.
+#
+# That is why more groups per column cannot help THIS kernel: at nc=4 it already holds the four chains
+# its instruction needs, and everything above that is register pressure. See the note below.
+#
+# ⛔ MORE ZA GROUPS PER COLUMN DOES NOT LIFT THIS KERNEL'S RATE, AND THE gemv-N TABLE DOES NOT TRANSFER.
+# gemv-T at n=1024 reaches 514 GB/s where gemv-N reaches 988 on the same bytes, and the obvious read of
+# the note above `_sme_gemv_eligible` — group count IS memory-level parallelism, 230 GB/s at two groups
+# rising to 1009 at sixteen — says to give each column more than one. It measures the other way.
+# Prototyped as nc columns x G ZA row-groups, row step 4L*G, against the shipped kernel:
+#
+#     n        nc4 G1  nc4 G2  nc4 G4  nc2 G8  nc8 G2
+#      256       0.79    0.66    0.42    0.23    0.60
+#      512       0.85    0.69    0.47    0.24    0.61
+#     1024       0.98    0.80    0.58    0.22    0.71
+#
+# The load count per element is IDENTICAL across G — G x-loads and 4G A-loads cover 4L*G rows of nc
+# columns either way — so this is not traffic. The live set is what changes: G=4 at nc=4 needs sixteen
+# x vectors and sixteen A vectors live per iteration, which is the whole register file.
+#
+# What the gemv-N table actually measures is CONTIGUITY PER COLUMN, not ZA groups: more groups there
+# means a taller row block, so more consecutive bytes are read from each column. In the T form the
+# columns are already swept whole, so there is nothing for extra groups to make more contiguous.
+#
+# The 1.9x against gemv-N is therefore still unexplained. A quarter of it is accounted: the T form
+# re-reads x once per column block, which at nc=4 is m*n/4 elements — 2 MB against A's 8.4 at n=1024.
 # Measured on square Float64 through `gemv!`, best NC per size (bench/probes/sme_gemvt_proto.jl):
 #     n        128   256   512  1024  2048
 #     NC=2    1.00  2.69  3.79  4.14  1.94
@@ -1539,62 +2113,159 @@ end
 #     NC=8    0.99  2.31  2.78  3.53  1.99
 # Four is the best or within noise of it everywhere, and eight is worse at every size — the extra
 # concurrent A streams cost more than the x traffic they save. So NC is not swept per call.
-# PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (2,4,8)
+# Two is no longer admissible: one strided-register load tuple spans four columns, so NC is a multiple
+# of four (`_SME_GEMVT_NCS`).
+# PDM: Literal — a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | tune: candidate, (4,8)
 const _SME_GEMVT_NC = @load_preference("sme_gemvt_nc", 4)::Int   # req8-ok: falsified-derivation literal, see table above
+# A pinned value outside the candidate set must fail HERE, at load: the DRAM arm's dispatch
+# dispatch on NC without a fallback branch, so an unserved value would run the NC=8 kernel while
+# `_sme_gemvt_cabi` sized its blocks and scratch for the pinned one — out-of-bounds stores, silently.
+_SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
+    "preference sme_gemvt_nc=$(_SME_GEMVT_NC) is not one of $(_SME_GEMVT_NCS): the SME gemv-T kernel " *
+    "exists only for those column counts"))
 
 # THE FLOOR IS ON m, NOT ON m*n, and that is the whole difference from the N form's cut. The fixed
-# cost here is per COLUMN BLOCK — zero ZA, read four slices back, fold and reduce — and the work a
-# block does is proportional to m, so the overhead ratio falls as 1/(NC*m) and does not care how
-# many columns follow. Measured through `gemv!`, prototype against the SIMD path it displaces:
+# cost here is per COLUMN — zero ZA, read four slices back, fold — and the work a column does is
+# proportional to m, so the overhead ratio falls as 1/m and does not care how many columns follow.
 #
-#     m          64    100    128    256    512   1000   1024   2048
-#     speedup  0.47   0.28   0.99   2.69   3.89   3.68   3.90   1.94
+# Measured in ONE process, both arms on the same arrays, `_sme_gemvt!` (every tail included) against
+# the `_gemv_t_simd!` NEON path it displaces. Two runs, Float64 square:
 #
-# so it LOSES below m = 128 and pays from 256 up. An `m*n` cut of the N form's shape would have
-# admitted m=n=100 at 10000 elements and shipped a 3.6x regression there.
-# ⚠ THIS KERNEL IS SENSITIVE TO `m % 4L`, NOT TO `m`, because its row tail is SCALAR and runs once
-# per COLUMN. Measured against the SIMD path it displaces, forced below the floor:
+#     m          136   144   152  |  160   168   176   184   192   200   208   216   224   232   256
+#     m % 4L       8    16    24  |    0     8    16    24     0     8    16    24     0     8     0
+#     SME/NEON  0.69  0.78  0.80  | 1.10  1.19  1.26  1.17  1.60  1.70  1.63  1.52  1.90  1.92  2.23
 #
-#     m           128   136   144   152   160   176
-#     m % 4L        0     8    16    24     0    16
-#     SME/SIMD   0.73  0.42  0.49  0.56  1.18  0.78
+# so it loses below 160 and wins at EVERY m from 160 up, and the floor sits at the break.
 #
-# The two multiples of 4L are the two good points and everything between them is half speed — the
-# same per-column-remainder cost that `_sme_ger_ir` documents, where finishing leftover rows outside
-# the vectorised sweep costs one pass per column and swamps the work it completes.
+# ⚠ THE BAND USED TO BE HALF SPEED AT EVERY NON-MULTIPLE OF 4L, and it is not any more. The row tail
+# is still scalar and still runs once per column, but it was never the dominant term: the streaming
+# `faddv` was, and the ZA-internal drain removes it entirely. With that gone the tail is visible as
+# a dip (216 and 248 sag against their neighbours) rather than as a cliff, and 168, 200, 232 — all
+# non-multiples — win by 1.19x to 1.92x. The floor moved because the reduction moved, NOT because
+# the tail was fixed; vectorising the tail was tried and measured neutral-to-worse, see the note
+# above `_SME_GEMVT_SCR`.
 #
-# ⛔ SO DO NOT DERIVE THIS FLOOR FROM A SWEEP THAT HAPPENS TO LAND ON MULTIPLES. Reading only
-# n=128 and n=160 says the crossing is at 160 and that the floor should come down from 256; reading
-# n=136..152 says the arm is losing throughout that band. The floor stays where it is until the
-# scalar row tail is gone, and the gate sizes it binds (128 and 256) are multiples anyway, so they
-# are limited by the kernel's rate and not by the tail.
-# PDM: Derived — the per-block ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; placed one step inside the measured break-even so a caller with its own cache traffic does not land on it. | tune: sweep m at fixed n
-const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 2 * _SME_GEMV_BLK * 4)::Int
+# ⛔ STILL DO NOT SET THIS FLOOR FROM A SWEEP THAT ONLY LANDS ON MULTIPLES OF 4L, and do not set it
+# from one process. The same prototype read m=160 at 1475 ns in one run and 621 ns in the next; at
+# these sizes the leading dimension is a small multiple of a page and the operands alias. Every
+# number in the table above is a median of five, taken in-process against a same-array control, and
+# it reproduced across two runs.
+#
+# ⛔ m=128 IS AT THE NEON CEILING AND THE MATRIX UNIT CANNOT REACH IT. This is the cell that binds
+# gemv-T's gate, so read this before trying to move it. The NEON path runs 128 KB in 844 ns, which is
+# 155 GB/s — ABOVE what any other load-and-reduce kernel here reaches on L1-resident data:
+#
+#     dot 32 KB x2  168 GB/s    dot 128 KB x2  146    asum 64 KB  146    asum 128 KB  146
+#
+# so the displaced path is not leaving anything on the table. The SME arm cannot take the cell either,
+# and the reason is structural rather than tunable: one ZA drain per column is irreducible, it costs
+# about 7.8 ns, and at 128 rows a column's own stream is only 4 KB. Narrowing the drain from four ZA
+# groups to one would remove three folds out of five ops and still land above the NEON time.
+# Accelerate reaches about 457 GB/s here, which is matrix-unit throughput at a per-column cost this
+# kernel shape does not have. Moving this cell needs a different decomposition, not a better constant.
+#
+# ⛔ THE FLOOR IS NOT WHAT HOLDS THE GATE'S BINDING CELL DOWN, AND LOWERING IT MAKES THINGS WORSE.
+# The square n=128 is gemv-T's worst gate cell, it sits below this floor, and the obvious move is to
+# let SME have it. Measured whole-call, five INDEPENDENT PROCESSES, GB/s, every case verified against
+# OpenBLAS:
+#
+#     n        NEON          SME        SME/NEON
+#     128   158-165        103.0-103.7   0.62-0.66
+#     100   171-179         64.8-64.9    0.36-0.38
+#      64   168-174        117.9-119.4   0.68-0.71
+#
+# SME is 1.4-2.8x SLOWER at every one of them, and the five processes agree to within 2%. The floor is
+# correct as it stands.
+#
+# ⚠ AND A SINGLE-PROCESS READING SAYS THE OPPOSITE, which is why this table is cross-process. In one
+# session the same n=128 cell read SME 184 GB/s against NEON 154 — a 1.20x WIN — and the SME whole
+# call there has also measured 374, 727, 1042 and 1300 ns in four different harnesses in one sitting.
+# Anything cut against one of those is fitted to noise. The cell's own instability is recorded above;
+# this is the second time it has produced a confident wrong answer, so take the cross-process form.
+# PDM: Derived — the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | tune: sweep m at fixed n
+const _SME_GEMVT_MINM = @load_preference("sme_gemvt_minm", 5 * _SME_GEMV_BLK)::Int
 
-# y += alpha*A'x. Bulk columns and whole 4L-row groups run on ZA; the two tails are scalar, and both
-# are bounded: the row tail is under 4L rows of every column, the column tail under NC whole columns.
+
+# Bytes of A up to which the strided kernel runs; above it the multi x multi loop (`_gemvt_mm_ir`)
+# does. The criterion is L2 RESIDENCY of the column stream: the strided loop is issue-bound and wins
+# while A is served from L2, and loses once A streams from DRAM, where its fixed asm sequence keeps
+# fewer loads in flight than the IR loop LLVM schedules. A alone does not get the whole L2 — x is
+# re-read per column block, y and the deferred strips are written, and the core keeps other lines —
+# so the crossover sits below the cache size. Measured in one process, same buffers, medians of three
+# 1 s windows (N = 5-52k one-call samples), strided deferred over multi x multi fused, `_L2_BYTES` =
+# 20 MB on the measuring part:
+#
+#     A MB     8.0   10.0   12.0   12.5   14.0   14.0   15.0   15.1   16.0   18.0   20.0   32.0
+#     ratio   1.21   1.19   1.12   1.12   1.09   1.11   1.07   0.94   0.97   0.85   0.85   0.88
+#
+# The transition is at three quarters of L2, and that is the fraction the default carries.
+# PDM: Derived — L2 residency of A, m*n*8 <= 3/4 * _L2_BYTES; the quarter left over is x (re-read per column block), y, the deferred strips and the core's own lines; measured crossover 15 MB of 20. | tune: candidate, sweep m*n at fixed m across _L2_BYTES
+const _SME_GEMVT_RESIDENT_MAX = @load_preference("sme_gemvt_resident_max", (3 * _L2_BYTES) ÷ 4)::Int
+
+# y += alpha*A'x. Columns run on ZA in groups of NC; rows run in 4L-row windows, and a ragged row
+# count is absorbed by one extra overlapping window inside the kernel rather than a separate pass.
+# Only the column tail — under NC whole columns — is scalar.
+#
+# ⚠ THE RAGGED ROWS MUST STAY INSIDE THE COLUMN BLOCK. A separate pass over the leftover rows is a
+# gemv-T of its own over a (m mod 4L) x n block, i.e. n SHORT dots, and short-per-column is this
+# kernel's worst shape. At the dominant shape of a real QR solve (m=629, n=2186; 629 mod 4L = 21) the
+# 21 leftover rows are 3.3% of the data and cost 25% of the call:
+#
+#     m        608    629    640
+#     m % 4L     0     21      0
+#     GB/s     441    351    424      (this instruction's issue-rate ceiling is 525)
+#
+# ⛔ THE OVERLAPPING WINDOW AS A SECOND CALL IS CORRECT BUT SLOWER — do not reintroduce it. Calling the
+# kernel again for one window at row `m - 4L`, x zeroed over the overlap, verifies to 3.9e-16 and
+# measures 0.92x at m=629 n=2186 and 0.63x at n=160: a second call re-traverses every column and so
+# pays n more per-column ZA drains, which outweigh the short dots it removes. Inside the row loop the
+# same window costs one `fmla` per column and no extra drain.
 function _sme_gemvt_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64
     )
-    nc = _SME_GEMVT_NC
     rb = 4 * _SME_L
-    mb = (m ÷ rb) * rb                    # rows the kernel covers
+    mb = (m ÷ rb) * rb                    # rows the kernel's row loop covers
+    # ⚠ THE ARM DECIDES THE BLOCK WIDTH, so `nb` cannot be computed before the route. The resident arm
+    # reduces inside ZA and is fixed at 8 columns by that layout; the DRAM arm keeps `_SME_GEMVT_NC`.
+    resident = m * n * 8 <= _SME_GEMVT_RESIDENT_MAX
+    nc = resident ? _SME_GEMVT_ZA_NC : _SME_GEMVT_NC
     nb = (n ÷ nc) * nc                    # columns the kernel covers
-    if mb > 0 && nb > 0
-        _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc)
-    end
-    # Row tail, for the columns the kernel handled. It ACCUMULATES, matching the kernel.
-    if mb < m
-        for j in 0:(nb - 1)
-            aj = a + j * lda * 8
-            s = 0.0
-            for i in mb:(m - 1)
-                s = muladd(unsafe_load(aj + i * 8), unsafe_load(x + i * 8), s)
+    kern = mb > 0 && nb > 0
+    if kern
+        # The only scratch either arm needs is the `rb`-element x window for the ragged-row chunk.
+        # The resident arm writes y directly from streaming mode, so there are no per-column strips and
+        # no caller pass over them — see `_gemvt_za_ir` for why that matters beyond the traffic.
+        xs = _ws_grow!(_SME_GEMVT_SCR(), rb)
+        GC.@preserve xs begin
+            atl = Ptr{Float64}(C_NULL)
+            xt = Ptr{Float64}(C_NULL)
+            if mb < m
+                # The chunk is a WHOLE rb-row window ending at row m, so it re-reads the `rb - (m - mb)`
+                # rows the loop already accumulated; zeroing those entries of x makes them contribute
+                # nothing. Requires m >= rb, which `_SME_GEMVT_MINM` guarantees.
+                r0 = m - rb
+                ndone = mb - r0
+                @inbounds for k in 1:rb
+                    xs[k] = k <= ndone ? 0.0 : unsafe_load(x + (r0 + k - 1) * 8)
+                end
+                atl = a + r0 * 8
+                xt = pointer(xs)
             end
-            q = y + j * 8
-            unsafe_store!(q, muladd(alpha, s, unsafe_load(q)))
+            if resident
+                _sme_gemvt_za(y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+            else
+                _sme_gemvt_mrun(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+            end
         end
+    end
+    # Row tail for the kernel's columns, used only when the kernel did not run at all (m below one
+    # row window). When it did, the ragged rows rode in its accumulators. Without this the column tail
+    # below starts at `nb` and columns 0..nb-1 would go uncomputed.
+    if !kern && mb < m && nb > 0
+        mt = m - mb
+        At = PtrMatrix{Float64}(a + mb * 8, mt, nb, lda)
+        _gemv_t_simd!(mt, nb, alpha, At, x + mb * 8, 1.0, y, Val(false), true)
     end
     # Column tail: whole columns past the last group.
     for j in nb:(n - 1)
@@ -1968,11 +2639,63 @@ end
 # PDM: Derived — formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run.
 const _SME_GER_MINM = @load_preference("sme_ger_minm", 4 * _SME_L)::Int
 
+# ⚠ `m % _SME_L == 0` IS WHY ger's WORST CELL IS WORST, AND SPLITTING THE ROWS DOES NOT FIX IT.
+# The predicate below sends every m that is not a whole number of vectors to the NEON path, and the
+# two rates are far apart. Measured square, Float64, alpha tiny so A stays stable, no copy in the
+# timed body, traffic counted as one read plus one write of A:
+#
+#     n          96   100   104   120   128   132   160   200   256   300
+#     n % 8       0     4     0     0     0     4     0     0     0     4
+#     GB/s      385   184   336   298   426   150   444   366   458   140
+#     path      SME  NEON   SME   SME   SME  NEON   SME   SME   SME  NEON
+#
+# For scale, `scal` on the same read-modify-write traffic reaches 262-264 GB/s at 72-156 KB, so the
+# SME arm is above that roofline and the NEON arm is well under it. ger@100 gates 0.638 while its
+# neighbours at 128 and 256 gate 0.961 and 0.942 — the cell is not small-n overhead, it is this cut.
+#
+# ⛔ DO NOT FIX IT BY SPLITTING THE ROWS. Running the kernel over `(m ÷ L) * L` rows and finishing the
+# scrap with a separate `_ger_simd!` measures WORSE than NEON on the whole matrix at every size that
+# needs it: n=100 0.45x, 132 0.60x, 156 0.69x, 300 0.66x, 500 0.65x. The scrap pass is short per
+# column, and the truncated call still carries the FULL matrix's leading dimension — which at exactly
+# the sizes this route exists to serve is not a multiple of `_SME_L`, and that is the cliff below.
+#
+# ⚠ `stride(A, 2) % _SME_L == 0` IS A SEPARATE REQUIREMENT FROM `m % _SME_L == 0`, and it is only the
+# same thing by accident. A plain `Matrix` has `lda == m`, so the row test covers the stride test and
+# the second one looks redundant — until the operand is a VIEW. Scanned at m=n=96 against lda=96,
+# every lda from 96 to 200:
+#
+#     lda % _SME_L == 0    1.00x        (96, 104, 112, 120, 128, 160, 176, 184, 192)
+#     otherwise            2.4x - 3.1x  (91 of the 105 values tested)
+#
+# The kernel loads and STORES whole 512-bit vectors down each column, so a column stride that is not a
+# whole number of them puts every column's writes at a different offset inside the line. Reads barely
+# notice — the same scan through `_sme_gemv!` costs 4-16%, and through `_sme_gemvt!` 13-18% — but ger
+# writes A, and that is the whole difference.
+#
+# It was reachable: `ger!` on `view(B, 1:96, 1:96)` with `B` 100x100 took the SME path at 153 GB/s
+# where the plain 96x96 matrix runs 388, and at lda=129 it fell to 123, BELOW the NEON path it
+# displaced. With the stride test in place those route to NEON: 963 -> 812 ns and 1196 -> 833.
+#
+# ⛔ AND THE KERNEL'S OWN PREDICATED SCRAP IS NOT THE ANSWER EITHER — it already exists (`mscrap0`..
+# `mscrapG` below), it is CORRECT at every m, and it is slower than NEON everywhere it would be used:
+#
+#     n        100   101   132   156   255   300   500  1001
+#     SME/NEON 0.56  0.45  0.63  0.43  0.44  0.55  0.56  0.66
+#
+# so relaxing the predicate is not a one-line win. The scrap runs once per COLUMN GROUP: at m=100 it
+# adds 555 ns over the same call truncated to 96 rows, for 400 elements — 1.4 ns per element against
+# 0.02 on the whole-vector path, about 7 cycles per predicated operation. That is the per-column
+# remainder cost this file documents for gemv-T and `_sme_ger_ir`, and it is architectural.
+#
+# ⛔ AN OVERLAPPING FINAL VECTOR CANNOT RESCUE IT, unlike the N-form gemv store path. ger ACCUMULATES
+# into A, so a last vector placed at `m - L` re-applies the update to the `L - m % L` rows it overlaps.
+# Overlap is only sound when the kernel STORES.
 @inline _sme_ger_eligible(::Type{T}, m, n, cj, A, x, y, incx, incy) where {T} =
     T === Float64 && _SME_F64 && !cj && incx == 1 && incy == 1 &&
         eltype(x) === Float64 && eltype(y) === Float64 &&
         _strided1(A) && _dense1(x) && _dense1(y) &&
-        m >= _SME_GER_MINM && m % _SME_L == 0 && n > 0 && _SME_GER_ENTRY[] !== C_NULL
+        m >= _SME_GER_MINM && m % _SME_L == 0 && stride(A, 2) % _SME_L == 0 &&
+        n > 0 && _SME_GER_ENTRY[] !== C_NULL
 
 @noinline function _sme_ger!(m::Int, n::Int, alpha::Float64, x, y, A)
     Threads.atomic_add!(_SME_GER_CALLS, 1)
@@ -2078,10 +2801,6 @@ end
     _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_ger_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_dot_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_asum_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_axpy_cf() = throw(AssertionError("SME trampoline requested without SME"))
-    _sme_scal_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
@@ -2093,14 +2812,6 @@ elseif _SME_STATIC
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64))
     _sme_ger_cf() = @cfunction(_sme_ger_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Int, Float64))
-    _sme_dot_cf() = @cfunction(_sme_dot_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
-    _sme_asum_cf() = @cfunction(_sme_asum_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Int))
-    _sme_axpy_cf() = @cfunction(_sme_axpy_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Float64, Int))
-    _sme_scal_cf() = @cfunction(_sme_scal_cabi, Cvoid,
-        (Ptr{Float64}, Ptr{Float64}, Float64, Int))
 else
     # `getfield(@__MODULE__, :name)` is NOT opaque — module and symbol are both constants, so
     # inference folds it back to the concrete function and walks into the kernel anyway.
@@ -2126,21 +2837,5 @@ else
         gr = Base.inferencebarrier(_sme_ger_cabi)
         return @cfunction($gr, Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Int, Float64))
-    end
-    function _sme_dot_cf()
-        d = Base.inferencebarrier(_sme_dot_cabi)
-        return @cfunction($d, Cvoid, (Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int))
-    end
-    function _sme_asum_cf()
-        e = Base.inferencebarrier(_sme_asum_cabi)
-        return @cfunction($e, Cvoid, (Ptr{Float64}, Ptr{Float64}, Int))
-    end
-    function _sme_axpy_cf()
-        p = Base.inferencebarrier(_sme_axpy_cabi)
-        return @cfunction($p, Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int))
-    end
-    function _sme_scal_cf()
-        r = Base.inferencebarrier(_sme_scal_cabi)
-        return @cfunction($r, Cvoid, (Ptr{Float64}, Ptr{Float64}, Float64, Int))
     end
 end
