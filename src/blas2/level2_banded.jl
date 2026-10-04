@@ -44,7 +44,14 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
     ) where {T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); b = kl + ku + 1
     lanes = Vec{W, Int}(ntuple(l -> l - 1, Val(W)))
-    yc = _carrier(y)      # `nothing` in release — see the register-pressure note on `_gbt_one!`
+    # `_carrier_arr`, NOT `_carrier`: `y` ARRIVES AS A RAW `Ptr` from a threaded chunk (and from the
+    # C-ABI entry), and a pointer carries no bounds to check — `_vstc!` would hand it to
+    # `checkbounds(::Ptr, ::UnitRange)`, which has no method. That is a MethodError inside a pool
+    # worker, so it surfaces as a dead worker and a driver stuck in its join; CI reported it as
+    # signal 11. Release builds never saw it because `_CHECKED` is false there and both helpers yield
+    # `nothing` — it is only reachable under `--check-bounds=yes`, which is exactly what CI runs.
+    # `_carrier_arr` is the existing helper for this: it is `nothing` whenever `y isa Ptr`.
+    yc = _carrier_arr(y)  # `nothing` in release — see the register-pressure note on `_gbt_one!`
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2)
         i0 = ib0

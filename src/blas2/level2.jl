@@ -2824,7 +2824,14 @@ end
 # arms agreeing to rel 3e-15 — the fleet evidence a Literal owes:
 #     nblk   32      16      8       4       2
 #     tax    1.0087  1.0079  1.0068  1.0051  1.0023
+# TWO ANNOTATIONS, TWO LINTS, AND THEY CANNOT SHARE A LINE. `# PDM:` feeds test/knob_registry.jl,
+# whose syntax is strictly `# PDM: <Tier> — <one line>` with the tier word standing alone;
+# `# req8-ok:` feeds test/req8_lint.jl, which looks only on the literal's own line or THE LINE
+# DIRECTLY ABOVE IT. `# PDM: Literal, req8-ok — …` satisfies NEITHER — not a parseable tier for the
+# first, not an annotation for the second — and each lint has now been broken once, in opposite
+# directions, by trying to say it in one place. Hence the ordering below: PDM first, req8-ok last.
 # PDM: Literal — one value suits every µarch: the shape bound 2/(nblk+1) is arithmetic, and the fold tax table above is flat across nblk on all three boxes. | tune: n/a — a gate margin, not measurable in-process
+# req8-ok: the criterion is a GATE MARGIN — not a detected hardware const and not measurable by an in-process probe; the shape bound is arithmetic and the fold-tax table above is the fleet evidence.
 const _SYMV_NBLK = 8
 
 """
