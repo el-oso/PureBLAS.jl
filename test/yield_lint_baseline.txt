@@ -257,3 +257,12 @@ blas3/sme_kernel.jl:println(io, "  %sb$c = mul nsw i64 %jb, $L")
 blas3/sme_kernel.jl:println(io, "  %si$c = add nsw i64 %sb$c, $(c * L)")
 blas3/sme_kernel.jl:println(io, "  %sp$c = getelementptr inbounds double, ptr %y, i64 %si$c")
 blas3/sme_kernel.jl:println(io, "  store <vscale x 2 x double> %s$(c)_c, ptr %sp$c, align 8")
+
+# --- 2026-10-04, the gemv-T ZA-internal drain generator (`_gemvt_za_ir`). Same generator class as the
+#              blocks above: `println` into an in-memory `IOBuffer` at module load while the kernel IR
+#              is built, holding no `@scope` and reaching no IO lock.
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $base,")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 1,")
+blas3/sme_kernel.jl:println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
+blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")

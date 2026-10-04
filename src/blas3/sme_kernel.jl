@@ -1681,6 +1681,173 @@ declare double @llvm.fmuladd.f64(double, double, double)
     return String(take!(io))
 end
 
+# ══ gemv-T, ZA-internal drain ═══════════════════════════════════════════════════════════════════
+#
+# ⚠ THE DEFERRED ARM'S SCRATCH READBACK COSTS UP TO ~7 ns PER LINE, AND IT IS A PAGE EFFECT. That arm
+# writes one `_SME_L`-lane strip per column from streaming mode and the caller sums the lanes in
+# normal mode. Reading those lines back is cheap or expensive depending on how many of the most
+# recently written strips share a 16 KB page: measured at n=128 (8 KB of strips), scratch offsets
+# 0-8192 within the page cost ~912 ns beyond kernel plus lane-sum, offsets 9216-14336 cost 40-100.
+# It is not latency — inserting a 0.2-5 us gap leaves it, and a prefetch loop of independent
+# one-per-line loads absorbs none of it. It is in the shipped path at every n >= 128: about 900 ns of
+# the 1.86 us call at n=256, and about a microsecond of 1.29 at n=128 against a 321 ns kernel.
+#
+# ⛔ IT IS ALSO WHY SMALL-m CELLS DO NOT REPRODUCE ACROSS PROCESSES. The per-thread scratch's page
+# offset decides which state a process lands in, so the same shape has measured 374, 727, 1042 and
+# 1300 ns in four harnesses. Any knob fitted against those numbers is fitted against a page map —
+# which is what `_SME_GEMVT_NC` and `_SME_GEMVT_MINM` were, so both need re-deriving from here.
+#
+# THIS KERNEL REMOVES THE ROUND TRIP by reducing the lanes INSIDE ZA and storing y directly. ZA's
+# two-dimensional addressing is what makes it possible, and it costs no transpose:
+#
+#   * A vg1x4 group `g` addresses ZA vectors {g, g+16, g+32, g+48}; vector v is tile `v mod 8`, row
+#     `v div 8`. So group 0 is tile0 rows {0,2,4,6} and group 8 is tile0 rows {1,3,5,7} — TOGETHER
+#     THEY ARE THE WHOLE OF TILE 0, with no copy.
+#   * So the two column quads accumulate into groups 0-3 and 8-11 rather than 0-7, and each quad's
+#     four row phases fold into its base group as before. Loading quad 0 as columns c, c+2, c+4, c+6
+#     and quad 1 as c+1, c+3, c+5, c+7 then puts column c+r in tile row r, in natural order.
+#   * `read.ver` reads a tile VERTICALLY. Vertical slice j of tile 0 is then `[col c lane j, col c+1
+#     lane j, …, col c+7 lane j]`, so summing the eight vertical slices elementwise gives the eight
+#     columns' dot products in one vector — the transpose is the read, not an operation.
+#
+# The drain is `zero {za1.d}`, two `read.ver.vg4`, two `add.za64` into tile 1, one `read.vg1x4`, three
+# `fadd`, then one load of y, one `fmla` by alpha and one store: 8 columns of y per block, against the
+# deferred arm's 8 scratch lines per block plus a caller pass over them.
+#
+# NC IS FIXED AT 8 HERE and the generator enforces it: the layout above is a statement about where a
+# vg1x4 group sits inside a tile, and it only lands on tile 0 for the pair of groups {0, 8}.
+function _gemvt_za_ir(nc::Int)
+    nc == 8 || throw(ArgumentError(
+        "SME gemv-T ZA drain: NC must be 8, not $nc — groups 0 and 8 are what tile 0 is made of"))
+    L = _SME_L
+    T4 = "{ <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double> }"
+    q = Char(34)
+    # One 4L-row window of 8 columns. $0 column block, $1 lda in bytes, $2 x, $3 row count.
+    # x9 row offset in elements, x10 walks columns, x12 = 2*lda, w8/w11 the ZA group bases 0 and 8.
+    win = String[]
+    push!(win, "ld1d {z0.d - z3.d}, pn8/z, [\$2, x9, lsl #3]")
+    for qq in 0:1
+        push!(win, qq == 0 ? "mov x10, \$0" : "add x10, \$0, \$1")
+        for j in 0:3
+            push!(win, "ld1d {z$(16 + j).d, z$(20 + j).d, z$(24 + j).d, z$(28 + j).d}, pn8/z, [x10, x9, lsl #3]",
+                       "add x10, x10, x12")
+        end
+        for k in 0:3
+            g = 8qq + k
+            push!(win, "fmla za.d[$(g < 8 ? "w8" : "w11"), $(g % 8), vgx4], {z$(16 + 4k).d - z$(19 + 4k).d}, z$k.d")
+        end
+    end
+    setup = ("ptrue pn8.d", "mov w8, #0", "mov w11, #8", "mov x9, #0", "lsl x12, \$1, #1")
+    loop = join((setup..., "1:", win..., "add x9, x9, #$(4L)", "cmp x9, \$3", "b.lt 1b"), "\\0A")
+    tailw = join((setup..., win...), "\\0A")
+    clob = join(("~{z$i}" for i in 0:31), ",") * "," * join(("~{p$i}" for i in 0:15), ",") *
+           ",~{x8},~{x9},~{x10},~{x11},~{x12},~{memory},~{cc}"
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32, i32)
+declare void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+
+define void @entry(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) {
+  call void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt)
+  ret void
+}
+
+define internal void @k(ptr %y, ptr %a, i64 %lda, ptr %x, i64 %m, double %alpha, i64 %nblk, ptr %atl, ptr %xt) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  %ldab = shl i64 %lda, 3
+  %av = insertelement <vscale x 2 x double> poison, double %alpha, i64 0
+  %asplat = shufflevector <vscale x 2 x double> %av, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %anyb = icmp sgt i64 %nblk, 0
+  br i1 %anyb, label %blk, label %fin
+
+blk:
+  %b = phi i64 [ 0, %entry ], [ %bn, %bend ]
+  %jb = mul nsw i64 %b, $nc
+  %yblk = getelementptr inbounds double, ptr %y, i64 %jb
+  %aoff = mul nsw i64 %jb, %lda
+  %ablk = getelementptr inbounds double, ptr %a, i64 %aoff
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %anyr = icmp sgt i64 %m, 0
+  br i1 %anyr, label %row, label %tailchk
+
+row:
+  call void asm sideeffect "$loop", "r,r,r,r,$clob"(ptr %ablk, i64 %ldab, ptr %x, i64 %m)
+  br label %tailchk
+
+tailchk:
+  %notl = icmp eq ptr %atl, null
+  br i1 %notl, label %rd, label %tail
+
+tail:
+  %atlblk = getelementptr double, ptr %atl, i64 %aoff
+  call void asm sideeffect "$tailw", "r,r,r,$clob"(ptr %atlblk, i64 %ldab, ptr %xt)
+  br label %rd
+
+rd:
+""")
+    # Fold each quad's four row phases into its base group, exactly as the other arms do.
+    for (base, g1, g2, g3) in ((0, 1, 2, 3), (8, 9, 10, 11))
+        for src in (g1, g2, g3)
+            println(io, "  %f$(src) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $src)")
+            for k in 0:3
+                println(io, "  %fv$(src)_$k = extractvalue $T4 %f$src, $k")
+            end
+            println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 $base,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_0, <vscale x 2 x double> %fv$(src)_1,")
+            println(io, "    <vscale x 2 x double> %fv$(src)_2, <vscale x 2 x double> %fv$(src)_3)")
+        end
+    end
+    print(io, """
+  call void @llvm.aarch64.sme.zero(i32 2)
+  %v0 = call $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32 0, i32 0)
+  %v4 = call $T4 @llvm.aarch64.sme.read.ver.vg4.nxv2f64(i32 0, i32 4)
+""")
+    for (nm, v) in (("v0", "v0"), ("v4", "v4"))
+        for k in 0:3
+            println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nxv2f64(i32 1,")
+        println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
+        println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")
+    end
+    print(io, """
+  %t = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 1)
+  %t0 = extractvalue $T4 %t, 0
+  %t1 = extractvalue $T4 %t, 1
+  %t2 = extractvalue $T4 %t, 2
+  %t3 = extractvalue $T4 %t, 3
+  %s01 = fadd reassoc <vscale x 2 x double> %t0, %t1
+  %s23 = fadd reassoc <vscale x 2 x double> %t2, %t3
+  %sum = fadd reassoc <vscale x 2 x double> %s01, %s23
+  %yold = load <vscale x 2 x double>, ptr %yblk, align 8
+  %scaled = call <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double> %sum, <vscale x 2 x double> %asplat, <vscale x 2 x double> %yold)
+  store <vscale x 2 x double> %scaled, ptr %yblk, align 8
+  br label %bend
+
+bend:
+  %bn = add nuw nsw i64 %b, 1
+  %bdone = icmp eq i64 %bn, %nblk
+  br i1 %bdone, label %fin, label %blk
+
+fin:
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+
+declare <vscale x 2 x double> @llvm.fma.nxv2f64(<vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+
+attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body"
+  "target-features"="+sme,+sme2,+sme-f64f64" }
+""")
+    return String(take!(io))
+end
+
 # ── gemv-T, DRAM regime: the multi x multi form ─────────────────────────────────────────────────
 #
 # Same traffic, same ZA layout as the N form's mirror: column c owns one vg1x4 group whose four
@@ -1847,6 +2014,15 @@ const _SME_GEMVT_IR = Dict{Int, String}(nc => _gemvt_ir(nc, false) for nc in _SM
 const _SME_GEMVT_DEFER_IR = Dict{Int, String}(nc => _gemvt_ir(nc, true) for nc in _SME_GEMVT_NCS)
 # The multi x multi loop for the DRAM regime (`_gemvt_mm_ir`), fused epilogue only.
 const _SME_GEMVT_MM_IR = Dict{Int, String}(nc => _gemvt_mm_ir(nc) for nc in _SME_GEMVT_NCS)
+
+# The resident arm's drain. NC is 8 and not a knob: the layout is a statement about which ZA vectors a
+# vg1x4 group occupies, and only the pair {0, 8} makes up a whole tile, which is what the vertical read
+# needs. `_SME_GEMVT_NC` still chooses the DRAM arm's block.
+const _SME_GEMVT_ZA_NC = 8   # req8-ok: not tuning — a vg1x4 group occupies ZA vectors {g, g+16, g+32, g+48}, so only the pair {0, 8} spans a whole tile, which is what the vertical read needs
+const _SME_GEMVT_ZA_IR = _gemvt_za_ir(_SME_GEMVT_ZA_NC)
+@eval @inline _sme_gemvt_za(y, a, l, x, m, al, nb, atl, xt) =
+    Base.llvmcall(($_SME_GEMVT_ZA_IR, "entry"), Cvoid, _SME_GEMVT_ARGT,
+        y, a, Int64(l), x, Int64(m), al, Int64(nb), atl, xt)
 
 const _SME_GEMVT_ARGT = Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Ptr{Float64}, Int64, Float64, Int64,
                               Ptr{Float64}, Ptr{Float64}}
@@ -2222,20 +2398,20 @@ function _sme_gemvt_cabi(
         y::Ptr{Float64}, a::Ptr{Float64}, lda::Int, x::Ptr{Float64},
         m::Int, n::Int, alpha::Float64
     )
-    nc = _SME_GEMVT_NC
     rb = 4 * _SME_L
     mb = (m ÷ rb) * rb                    # rows the kernel's row loop covers
+    # ⚠ THE ARM DECIDES THE BLOCK WIDTH, so `nb` cannot be computed before the route. The resident arm
+    # reduces inside ZA and is fixed at 8 columns by that layout; the DRAM arm keeps `_SME_GEMVT_NC`.
+    resident = m * n * 8 <= _SME_GEMVT_RESIDENT_MAX
+    nc = resident ? _SME_GEMVT_ZA_NC : _SME_GEMVT_NC
     nb = (n ÷ nc) * nc                    # columns the kernel covers
     kern = mb > 0 && nb > 0
     if kern
-        # Strided kernel while A is L2-resident, multi x multi loop (fused) once it streams from DRAM.
-        resident = m * n * 8 <= _SME_GEMVT_RESIDENT_MAX
-        defer = resident && mb < _SME_GEMVT_DEFER_MAX
-        # Scratch is one block: `nb * _SME_L` deferred-epilogue strips, when that arm runs, followed by
-        # the `rb`-element x window the ragged-row chunk reads.
-        ns = defer ? nb * _SME_L : 0
-        scr = _ws_grow!(_SME_GEMVT_SCR(), ns + rb)
-        GC.@preserve scr begin
+        # The only scratch either arm needs is the `rb`-element x window for the ragged-row chunk.
+        # The resident arm writes y directly from streaming mode, so there are no per-column strips and
+        # no caller pass over them — see `_gemvt_za_ir` for why that matters beyond the traffic.
+        xs = _ws_grow!(_SME_GEMVT_SCR(), rb)
+        GC.@preserve xs begin
             atl = Ptr{Float64}(C_NULL)
             xt = Ptr{Float64}(C_NULL)
             if mb < m
@@ -2245,33 +2421,21 @@ function _sme_gemvt_cabi(
                 r0 = m - rb
                 ndone = mb - r0
                 @inbounds for k in 1:rb
-                    scr[ns + k] = k <= ndone ? 0.0 : unsafe_load(x + (r0 + k - 1) * 8)
+                    xs[k] = k <= ndone ? 0.0 : unsafe_load(x + (r0 + k - 1) * 8)
                 end
                 atl = a + r0 * 8
-                xt = pointer(scr, ns + 1)
+                xt = pointer(xs)
             end
-            if defer
-                # Deferred epilogue: the kernel writes one `_SME_L`-lane strip per column into scratch
-                # and the lane sums, with alpha, are applied here — outside streaming mode.
-                _sme_gemvt_drun(nc, pointer(scr), a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
-                @inbounds for j in 0:(nb - 1)
-                    b = j * _SME_L
-                    s0 = 0.0; s1 = 0.0
-                    for k in 1:2:_SME_L
-                        s0 += scr[b + k]; s1 += scr[b + k + 1]
-                    end
-                    q = y + j * 8
-                    unsafe_store!(q, muladd(alpha, s0 + s1, unsafe_load(q)))
-                end
-            elseif resident
-                _sme_gemvt_run(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
+            if resident
+                _sme_gemvt_za(y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
             else
                 _sme_gemvt_mrun(nc, y, a, lda, x, mb, alpha, nb ÷ nc, atl, xt)
             end
         end
     end
     # Row tail for the kernel's columns, used only when the kernel did not run at all (m below one
-    # row window, or n below one column group). When it did, the ragged rows rode in its accumulators.
+    # row window). When it did, the ragged rows rode in its accumulators. Without this the column tail
+    # below starts at `nb` and columns 0..nb-1 would go uncomputed.
     if !kern && mb < m && nb > 0
         mt = m - mb
         At = PtrMatrix{Float64}(a + mb * 8, mt, nb, lda)
