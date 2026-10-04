@@ -1,0 +1,181 @@
+function dotG_ir(G::Int)
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare target($(Q)aarch64.svcount$(Q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(Q)aarch64.svcount$(Q)), ptr)
+declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
+
+define void @entry(ptr %o, ptr %x, ptr %y, i64 %c) {
+  call void @k(ptr %o, ptr %x, ptr %y, i64 %c)
+  ret void
+}
+define internal void @k(ptr %o, ptr %x, ptr %y, i64 %c) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %pn = call target($(Q)aarch64.svcount$(Q)) @llvm.aarch64.sve.ptrue.c64()
+  %go = icmp sgt i64 %c, 0
+  br i1 %go, label %loop, label %rd
+loop:
+  %i = phi i64 [ 0, %entry ], [ %in, %loop ]
+""")
+    for j in 0:(G - 1)
+        println(io, "  %ox$(j) = mul nsw i64 %c, $j")
+        println(io, "  %qx$(j) = add nsw i64 %i, %ox$(j)")
+        println(io, "  %px$(j) = getelementptr inbounds double, ptr %x, i64 %qx$(j)")
+        println(io, "  %py$(j) = getelementptr inbounds double, ptr %y, i64 %qx$(j)")
+        println(io, "  %rx$(j) = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(Q)aarch64.svcount$(Q)) %pn, ptr %px$(j))")
+        println(io, "  %ry$(j) = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(Q)aarch64.svcount$(Q)) %pn, ptr %py$(j))")
+        for k in 0:3
+            println(io, "  %xv$(j)_$(k) = extractvalue $T4 %rx$(j), $k")
+            println(io, "  %yv$(j)_$(k) = extractvalue $T4 %ry$(j), $k")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $j,")
+        println(io, "    <vscale x 2 x double> %xv$(j)_0, <vscale x 2 x double> %xv$(j)_1,")
+        println(io, "    <vscale x 2 x double> %xv$(j)_2, <vscale x 2 x double> %xv$(j)_3,")
+        println(io, "    <vscale x 2 x double> %yv$(j)_0, <vscale x 2 x double> %yv$(j)_1,")
+        println(io, "    <vscale x 2 x double> %yv$(j)_2, <vscale x 2 x double> %yv$(j)_3)")
+    end
+    print(io, """
+  %in = add nuw nsw i64 %i, $(4 * P._SME_L)
+  %d = icmp sge i64 %in, %c
+  br i1 %d, label %rd, label %loop
+rd:
+""")
+    parts = String[]
+    for j in 0:(G - 1)
+        println(io, "  %g$(j) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $j)")
+        for k in 0:3
+            println(io, "  %z$(j)_$(k) = extractvalue $T4 %g$(j), $k")
+            push!(parts, "%z$(j)_$(k)")
+        end
+    end
+    prev = parts[1]
+    for (i, p) in enumerate(parts[2:end])
+        println(io, "  %s$(i) = fadd reassoc <vscale x 2 x double> $prev, $p")
+        prev = "%s$(i)"
+    end
+    println(io, "  %tot = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> $prev)")
+    print(io, """
+  store double %tot, ptr %o, align 8
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body" "target-features"="+sme,+sme2,+sme-f64f64" }
+""")
+    return String(take!(io))
+end
+
+for G in (1, 2, 4, 8)
+    @eval @inline $(Symbol("dg", G))(o::Ptr{Float64}, x::Ptr{Float64}, y::Ptr{Float64}, c::Int) =
+        Base.llvmcall(($(dotG_ir(G)), "entry"), Cvoid,
+                      Tuple{Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int64}, o, x, y, Int64(c))
+end
+
+
+
+@noinline function dot_simd(x, y)
+    s = 0.0
+    @inbounds @simd for i in eachindex(x, y); s = muladd(x[i], y[i], s); end
+    return s
+end
+@noinline function asum_simd(x)
+    s = 0.0
+    @inbounds @simd for i in eachindex(x); s += abs(x[i]); end
+    return s
+end
+function warm(f, bytes; secs = 0.4)
+    f(); t0 = time(); c = 0
+    while time() - t0 < secs; f(); c += 1; end
+    return bytes * c / (time() - t0) / 1e9
+end
+# asum: the same structure with ONE stream. ZA accumulation is multiply-add, so |x| is formed first
+# and multiplied by a ones vector — there is no plain add-to-ZA in this intrinsic family.
+function asumG_ir(G::Int)
+    io = IOBuffer()
+    print(io, """
+declare void @llvm.aarch64.sme.za.enable()
+declare void @llvm.aarch64.sme.za.disable()
+declare void @llvm.aarch64.sme.zero(i32)
+declare target($(Q)aarch64.svcount$(Q)) @llvm.aarch64.sve.ptrue.c64()
+declare $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(Q)aarch64.svcount$(Q)), ptr)
+declare void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>,
+  <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>, <vscale x 2 x double>)
+declare $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32)
+declare double @llvm.vector.reduce.fadd.nxv2f64(double, <vscale x 2 x double>)
+declare <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double>)
+
+define void @entry(ptr %o, ptr %x, i64 %c) {
+  call void @k(ptr %o, ptr %x, i64 %c)
+  ret void
+}
+define internal void @k(ptr %o, ptr %x, i64 %c) #0 {
+entry:
+  call void @llvm.aarch64.sme.za.enable()
+  call void @llvm.aarch64.sme.zero(i32 255)
+  %pn = call target($(Q)aarch64.svcount$(Q)) @llvm.aarch64.sve.ptrue.c64()
+  %oe = insertelement <vscale x 2 x double> poison, double 1.0, i32 0
+  %one = shufflevector <vscale x 2 x double> %oe, <vscale x 2 x double> poison, <vscale x 2 x i32> zeroinitializer
+  %go = icmp sgt i64 %c, 0
+  br i1 %go, label %loop, label %rd
+loop:
+  %i = phi i64 [ 0, %entry ], [ %in, %loop ]
+""")
+    for j in 0:(G - 1)
+        println(io, "  %ox$(j) = mul nsw i64 %c, $j")
+        println(io, "  %qx$(j) = add nsw i64 %i, %ox$(j)")
+        println(io, "  %px$(j) = getelementptr inbounds double, ptr %x, i64 %qx$(j)")
+        println(io, "  %rx$(j) = call $T4 @llvm.aarch64.sve.ld1.pn.x4.nxv2f64(target($(Q)aarch64.svcount$(Q)) %pn, ptr %px$(j))")
+        for k in 0:3
+            println(io, "  %xv$(j)_$(k) = extractvalue $T4 %rx$(j), $k")
+            println(io, "  %av$(j)_$(k) = call <vscale x 2 x double> @llvm.fabs.nxv2f64(<vscale x 2 x double> %xv$(j)_$(k))")
+        end
+        println(io, "  call void @llvm.aarch64.sme.fmla.vg1x4.nxv2f64(i32 $j,")
+        println(io, "    <vscale x 2 x double> %av$(j)_0, <vscale x 2 x double> %av$(j)_1,")
+        println(io, "    <vscale x 2 x double> %av$(j)_2, <vscale x 2 x double> %av$(j)_3,")
+        println(io, "    <vscale x 2 x double> %one, <vscale x 2 x double> %one,")
+        println(io, "    <vscale x 2 x double> %one, <vscale x 2 x double> %one)")
+    end
+    print(io, """
+  %in = add nuw nsw i64 %i, $(4 * P._SME_L)
+  %d = icmp sge i64 %in, %c
+  br i1 %d, label %rd, label %loop
+rd:
+""")
+    parts = String[]
+    for j in 0:(G - 1)
+        println(io, "  %g$(j) = call $T4 @llvm.aarch64.sme.read.vg1x4.nxv2f64(i32 $j)")
+        for k in 0:3
+            println(io, "  %z$(j)_$(k) = extractvalue $T4 %g$(j), $k")
+            push!(parts, "%z$(j)_$(k)")
+        end
+    end
+    prev = parts[1]
+    for (i, p) in enumerate(parts[2:end])
+        println(io, "  %s$(i) = fadd reassoc <vscale x 2 x double> $prev, $p")
+        prev = "%s$(i)"
+    end
+    println(io, "  %tot = call reassoc double @llvm.vector.reduce.fadd.nxv2f64(double 0.0, <vscale x 2 x double> $prev)")
+    print(io, """
+  store double %tot, ptr %o, align 8
+  call void @llvm.aarch64.sme.za.disable()
+  ret void
+}
+attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body" "target-features"="+sme,+sme2,+sme-f64f64" }
+""")
+    return String(take!(io))
+end
+
+for G in (1, 2, 4)
+    @eval @inline $(Symbol("ag", G))(o::Ptr{Float64}, x::Ptr{Float64}, c::Int) =
+        Base.llvmcall(($(asumG_ir(G)), "entry"), Cvoid,
+                      Tuple{Ptr{Float64}, Ptr{Float64}, Int64}, o, x, Int64(c))
+end
