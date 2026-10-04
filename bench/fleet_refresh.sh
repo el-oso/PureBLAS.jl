@@ -164,12 +164,16 @@ fi
 # Doing it here is free when the cache is warm (a few seconds of load) and turns the cold case into
 # one silent wait instead of a retry storm. It is deliberately NOT inside the group loop: the cost
 # must be paid once, and a second invocation proves nothing.
-echo "=== PRE-WARM (precompile before the first timed group) ==="
-"$JL" --project=bench -e 'using PureBLAS' >/dev/null 2>&1 || {
-    echo "=== ABORT: 'using PureBLAS' failed in the bench env — fix that before sweeping. ==="
+# `Pkg.precompile()` AND NOT `using PureBLAS`. The first version warmed PureBLAS only, and the first
+# group still spawned its own precompile at 99.9% CPU: `bench/plots.jl` loads the whole bench env —
+# AOCL_jll, Chairmarks, ForwardDiff and the rest — and any one of those being stale is enough. The
+# env is what has to be warm, not one package in it.
+echo "=== PRE-WARM (precompile the bench env before the first timed group) ==="
+"$JL" --project=bench -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1 || {
+    echo "=== ABORT: the bench env does not precompile — fix that before sweeping. ==="
     exit 2
 }
-echo "    package loads"
+echo "    bench env is warm"
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
