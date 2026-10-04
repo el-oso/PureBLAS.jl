@@ -573,3 +573,94 @@ end
         P.set_num_threads(1)
     end
 end
+
+# ── req#11 FOR symv: bitwise reproducibility across thread counts ──────────────────────────────────
+#
+# symv is the one threaded op whose PARALLEL form had to be pushed back onto the SERIAL path, and that
+# is what this item guards. It splits columns, but a column block writes `y` rows OUTSIDE its own
+# range (every column of a symmetric matrix scatters across the diagonal), so workers need private
+# `y` vectors — "notepads" — folded afterwards in BLOCK order.
+#
+# A notepad starts at ZERO, so the folded form computes `y0 + (0+c1+c2)` where an unblocked sweep
+# computes `((y0+c1)+c2)`. Different bits. A caller that LOSES the pool claim runs serially, so unless
+# the serial path is ALSO blocked-and-folded, the same call returns different bits depending on a race
+# — the defect `6940a2d3` shipped. Hence `_symv_blocked!` is the only form wherever `_symv_nblk > 1`,
+# at every thread count including one, and the lost-claim branch calls it with its own arena notepad.
+#
+# `_symv_nblk` returns 1 past about 2x L3, because the fold costs 0.2-0.9% and symv's SERIAL gate at
+# n=4096 is 0.995 on wintermute and 1.000 on galen — it cannot afford it. So the sizes below must
+# straddle that cut: one inside (grid live, notepads used, pool admitted) and one outside (grid
+# collapsed to 1, not a single notepad touched, byte-identical to the unblocked kernel).
+@testitem "symv: bit-identical at every thread count, both sides of the nblk cut" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            # `nin` sits inside the residency cut, `nout` beyond it. Derived from the same expression
+            # `_symv_nblk` uses, so the pair keeps straddling the cut if that constant ever moves.
+            ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(T))
+            nin = max(64, (ncut * 3) ÷ 4)
+            nout = ncut * 2
+            @test P._symv_nblk(nin, T) > 1        # the grid is live here …
+            @test P._symv_nblk(nout, T) == 1      # … and collapsed here
+            @testset "uplo=$ul n=$n" for ul in ('U', 'L'), n in (nin, nout)
+                A = randn(T, n, n)
+                x = randn(T, n)
+                y0 = randn(T, n)
+                α = T(0.75)                        # NOT a power of two
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.symv!(t, A, x; uplo = ul, alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.symv!(t, A, x; uplo = ul, alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness, plus the two properties that only hold if the nblk cut works: the pool IS dispatched
+# inside the cut, and it is NOT dispatched outside it — the latter being what protects the serial gate
+# cells at n=4096 that A-restricted exists to keep green.
+@testitem "symv: the pool runs inside the nblk cut and not outside it" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(Float64))
+        nin = (ncut * 3) ÷ 4
+        nout = ncut * 2
+        Ai = randn(nin, nin); xi = randn(nin); yi = randn(nin)
+        @test ran(() -> P.symv!(copy(yi), Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5))
+        # OUTSIDE the cut `_symv_nblk` is 1, so there is no grid to split and the pool must stay out.
+        # If this ever reports true, the fold is being paid at n=4096 and two serial gate cells go red.
+        Ao = randn(nout, nout); xo = randn(nout); yo = randn(nout)
+        @test !ran(() -> P.symv!(copy(yo), Ao, xo; uplo = 'L', alpha = 0.75, beta = 2.5))
+        # The threaded answer must equal the serial one, and the CONCURRENT case must too — all but
+        # one caller loses the claim and runs `_symv_blocked!` with its own arena notepad.
+        y1 = copy(yi); P.symv!(y1, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(yi); P.symv!(y2, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5); t) for _ in 1:(nt + 1)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end

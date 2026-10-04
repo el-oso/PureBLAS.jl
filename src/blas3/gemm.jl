@@ -4013,6 +4013,13 @@ const _MT_KIND_GEMVN = 15
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GEMVT = 16
+# symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
+# `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds where
+# it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1 goes
+# straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block order.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SYMV = 17
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4024,6 +4031,11 @@ const _MT_KIND_GEMVT = 16
 # order to break ties. Keeping them apart also keeps `_is_reduction`'s buffer contract intact — that
 # one sizes `_red_partials`, this one sizes `_REDI`.
 @inline _is_argmax(kind::Int) = kind == _MT_KIND_IAMAX
+
+# symv's fold is its own again: a block-ordered accumulate of private `y` vectors into the real one,
+# over only the rows each block can reach. Named separately for the same reason as the two above —
+# the three folds share no code and each sizes a different buffer.
+@inline _is_symv(kind::Int) = kind == _MT_KIND_SYMV
 
 """
     _syrk_workers(n, k) -> Int
@@ -4104,6 +4116,29 @@ and the matching entries of y.
     return max(1, min(nw, cld(n, _NR)))
 end
 
+# One notepad's stride, rounded UP to a whole cache line so block `b`'s tail and block `b+1`'s head
+# never share one. Unpadded it is only about two coherence misses per panel pass — measured
+# negligible — but the rounding costs at most one line per block and removes the question.
+@inline _symv_npad(n::Int, ::Type{T}) where {T} = cld(n * sizeof(T), _CACHELINE) * _CACHELINE ÷ sizeof(T)
+
+"""
+    _symv_workers(n, nblk, ::Type{T}) -> Int
+
+Worker count for a column-block `symv`. Traffic is the stored triangle, `n^2 * sizeof(T) / 2`.
+
+Capped by `nblk`, and that cap is the binding one: the grid is fixed by `(n, T)` so that the fold
+order cannot move, which means there is no way to make more blocks for more workers. A worker past
+`nblk` would get nothing and the join would still pay for it. Equal-width blocks of a triangle are
+also unequal in work — the heaviest is `2/(nblk+1)` — so the realised speedup is well under `nblk`;
+see `_SYMV_NBLK` for why eight is enough to cover six workers.
+"""
+@inline function _symv_workers(n::Int, nblk::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers((n * n * sizeof(T)) >> 1, n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, nblk))
+end
+
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
 # every worker but the last drives full-width microkernel tiles.
 @inline function _gemm_chunk(n::Int, nw::Int, i::Int)
@@ -4178,6 +4213,7 @@ end
     p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4528,6 +4564,40 @@ end
         _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(true), blk, p.n)
     else
         _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(false), blk, p.n)
+    end
+    return nothing
+end
+
+# symv over this worker's share of the FIXED column-block grid. Two destinations, and which one is
+# decided by the block index rather than by the worker: block 1 accumulates straight into `y` (nothing
+# else writes `y` during compute, and the driver's fold runs after the join), every other block zeroes
+# and fills its own notepad slot. A worker holding several blocks therefore does both.
+#
+# The zeroing lives HERE and not in the driver on purpose: it is per-block over exactly the rows
+# `_symv_rows` allows, which is what makes this identical to `_symv_blocked!`'s serial loop. Doing it
+# in the driver would sweep all of `n` per block and cost more than the fold.
+@noinline function _symv_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    n = p.m
+    nblk = _symv_nblk(n, T)
+    NB = min(_SYMV_NB, _vwidth(T))
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    part = _red_partials(T)
+    npad = _symv_npad(n, T)
+    Am = PtrMatrix{T}(p.Cp, n, n, p.ldc)
+    for b in b0:(b0 + cnt - 1)
+        j0, j1 = _symv_cols(b, nblk, n, NB)
+        j1 > j0 || continue
+        if isone(b)
+            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, p.Bp, j0, j1)
+        else
+            zp = pointer(part, (b - 1) * npad + 1)
+            lo, hi = _symv_rows(p.up, n, j0, j1)
+            @inbounds for k in lo:hi
+                unsafe_store!(zp, zero(T), k)
+            end
+            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, zp, j0, j1)
+        end
     end
     return nothing
 end
@@ -4899,6 +4969,14 @@ end
             up ?
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(true), blk, C.n) :
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(false), blk, C.n)
+        elseif kind == _MT_KIND_SYMV
+            # A loser runs the blocked form over the WHOLE grid with its OWN arena notepad, which is
+            # the one case where the fallback must not reuse the pool buffer and also must not skip
+            # the blocking: `_symv_blocked!` folds in the same block order the driver above does, so
+            # the two return the same bits. It opens its own `@scope`, so the scratch is a nested
+            # arena interval on this thread that exits before returning — `_gemm_threaded!` itself
+            # still holds none.
+            _symv_blocked!(up, C.m, alpha, C, A.ptr, B.ptr, _symv_nblk(C.m, T))
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -4985,6 +5063,13 @@ end
         # inside a published job, and a loser that grew it could move storage a winner is writing.
         _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
         _is_argmax(kind) && _redi_prefit!(cld(A.m, _red_block(T)))
+        # symv's notepads: `nblk` padded slots of length `n`, in the SAME process-global the
+        # reductions use (rung 2 — one buffer, one soundness argument: sized by the driver inside the
+        # claim, each worker writes only its own block's slots). Slot 1 is never written — block 1
+        # goes straight into `y` — and is left in the count so the index arithmetic is `b - 1` with no
+        # special case. NOT zeroed here: the chunks zero their own rows, which is what keeps them
+        # identical to `_symv_blocked!`.
+        _is_symv(kind) && _red_prefit!(T, _symv_nblk(C.m, T) * _symv_npad(C.m, T))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -5090,6 +5175,27 @@ end
             end
             # The index leaves as a `T`; `_iamax_mt_nmax` is the admission cap that keeps this exact.
             red = T(bi)
+        end
+        # THE symv FOLD, in the same window and for the same two reasons. Block order, starting from
+        # whatever block 1 already put in `y`, over only the rows each block can reach — the exact
+        # sequence `_symv_blocked!` performs serially, which is what makes the two agree bit for bit
+        # and what makes the worker count decide only WHO filled a notepad.
+        if _is_symv(kind)
+            n = C.m
+            nblk = _symv_nblk(n, T)
+            NB = min(_SYMV_NB, _vwidth(T))
+            part = _red_partials(T)
+            npad = _symv_npad(n, T)
+            yp = B.ptr
+            for b in 2:nblk
+                j0, j1 = _symv_cols(b, nblk, n, NB)
+                j1 > j0 || continue
+                lo, hi = _symv_rows(up, n, j0, j1)
+                zoff = (b - 1) * npad
+                @inbounds for k in lo:hi
+                    unsafe_store!(yp, unsafe_load(yp, k) + part[zoff + k], k)
+                end
+            end
         end
     finally
         # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
@@ -5227,6 +5333,19 @@ end
     _gemm_threaded!(
         PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
         α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0
+    )
+    return nothing
+end
+
+# symv: `C` is the n×n matrix, `A` is x and `B` is y. β is NOT passed — `_symv!` has already applied
+# it with `_scale_y!` before any of this, and the kernel is pure accumulate, which is what lets the
+# notepads start at zero. `up` keeps its original meaning here: the stored triangle.
+@noinline function _symv_threaded!(
+        up::Bool, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, nblk::Int, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, n, n, lda), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, n, 1, n),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_SYMV, up
     )
     return nothing
 end
