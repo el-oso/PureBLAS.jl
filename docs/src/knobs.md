@@ -290,13 +290,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-51 `const _X = <literal>` values in `src/` with no `@load_preference`.
+58 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 16 Exempt · 2 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 22 Exempt · 2 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -318,6 +318,7 @@ on these, not on knobs.
 | `_GER_PANEL_U` | 4 | Literal | its own comment calls it 'a genuine tuning knob'. TUNABLE, and never made one. |
 | `_SYMV_MR` | 2 | Unaudited | — |
 | `_SYMV_NB` | 8 | Literal | FLEET-VALIDATED 2026-08-21: a CAP, and the consumer's `min(_SYMV_NB, _vwidth(T))` is what makes it right (8 on AVX-512, 4 on AVX2). Halving NB costs 10-27% on all 3 boxes, so the cap binds and the value is not arbitrary. |
+| `_SYMV_NBLK` | 8 | Literal | one value suits every µarch: the shape bound 2/(nblk+1) is arithmetic, and the fold tax table above is flat across nblk on all three boxes. |
 | `_TRSV_T_F` | 8 | Literal | trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE. |
 
 ### CPU detection
@@ -408,11 +409,17 @@ on these, not on knobs.
 | `_MT_KIND_AXPY` | 6 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_COPY` | 11 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_DOT` | 7 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_GBMVN` | 18 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_GEMM` | 0 | Exempt | job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about |
+| `_MT_KIND_GEMVN` | 15 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_GEMVT` | 16 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_GER` | 14 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_IAMAX` | 13 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_LUAHEAD` | 3 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SCAL` | 10 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SUMSQ` | 9 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SWAP` | 12 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_SYMV` | 17 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SYRK` | 1 | Exempt | job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only, |
 | `_MT_KIND_TRMMR` | 5 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |

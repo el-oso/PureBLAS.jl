@@ -2810,17 +2810,21 @@ end
     return body
 end
 
-# PDM: Literal, req8-ok — and the tier matters, because the criterion is a GATE MARGIN. That is
-# neither a detected hardware const (so not Derive) nor something an in-process probe can measure
-# (so not Measure: there is no vendor reference in the process to compare against). What IS derivable
-# bounds the shape: equal-width column blocks of a triangle carry work shares nblk, nblk-1, …, 1, so
-# the heaviest is `2/(nblk+1)` — 22% at eight, which caps any speedup at 4.5x and therefore covers six
-# workers with room over. Beyond that a larger nblk buys nothing, because the ceiling is DRAM
-# bandwidth (the note at `_symv_simd_cols!` has 1-core symv at 0.65 of a same-bytes read stream, so
-# six cores reach the wall near 2-3x), and it costs more fold. Measured fold tax at n=4096,
-# blocked/plain, paired A-B-B-A, Chairmarks median of three rounds, arms agreeing to rel 3e-15:
+# THE TIER IS Literal AND THE CRITERION IS A GATE MARGIN, which is why it cannot be either of the
+# other two: a gate margin is not a detected hardware const (so not Derived) and no in-process probe
+# can measure it (so not Measured — there is no vendor reference in the process to compare against).
+#
+# What IS derivable bounds the shape: equal-width column blocks of a triangle carry work shares
+# nblk, nblk-1, …, 1, so the heaviest is `2/(nblk+1)` — 22% at eight, which caps any speedup at 4.5x
+# and therefore covers six workers with room over. Beyond that a larger nblk buys nothing, because
+# the ceiling is DRAM bandwidth (the note at `_symv_simd_cols!` has 1-core symv at 0.65 of a
+# same-bytes read stream, so six cores reach the wall near 2-3x), and it costs more fold.
+#
+# Measured fold tax at n=4096, blocked/plain, paired A-B-B-A, Chairmarks median of three rounds,
+# arms agreeing to rel 3e-15 — the fleet evidence a Literal owes:
 #     nblk   32      16      8       4       2
 #     tax    1.0087  1.0079  1.0068  1.0051  1.0023
+# PDM: Literal — one value suits every µarch: the shape bound 2/(nblk+1) is arithmetic, and the fold tax table above is flat across nblk on all three boxes. | tune: n/a — a gate margin, not measurable in-process
 const _SYMV_NBLK = 8
 
 """
