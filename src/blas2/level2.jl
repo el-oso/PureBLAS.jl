@@ -2847,7 +2847,14 @@ and `_gemvn_minner_np`'s `2 * _L2_BYTES`. n=2048 F64 is a 16.8 MiB triangle agai
 must stay IN; n=4096 is 67 MiB and must stay out.
 """
 @inline function _symv_nblk(n::Int, ::Type{T}) where {T}
-    (n * n * sizeof(T)) >> 1 <= 2 * _L3_BYTES || return 1
+    tri = (n * n * sizeof(T)) >> 1
+    # BOTH ENDS, and the lower one is the easier mistake. Below the pool's own admission floor no
+    # worker count can ever be granted, so a grid there is pure fold with nothing to pay for it — at
+    # n=64 the fold is ~224 elements against 2048 of work, an 11% tax on a kernel that will never
+    # thread. `_L1_MT_MIN` is the floor `_l1_workers` applies, and both it and `tri` are functions of
+    # `(n, T)`, so keying on it leaves the grid thread-count independent exactly as req#11 needs.
+    tri < _L1_MT_MIN && return 1
+    tri <= 2 * _L3_BYTES || return 1
     return _SYMV_NBLK
 end
 
