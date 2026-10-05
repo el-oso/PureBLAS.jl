@@ -455,27 +455,44 @@ end
     if nt < 2
         @test_skip "needs >=2 julia threads"
     else
-        P.set_num_threads(nt)
-        p = P._gemm_pool(Float64)
-        m, n = 8192, 512
-        A = randn(m, n); x = randn(n); y0 = randn(m)
-        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5))
-        # trmv over a matrix big enough that a threaded gemv-N WOULD have been admitted. If this ever
-        # reports true, the four per-thread baseline entries lost their justification.
-        Tri = randn(2048, 2048) + 2048I
-        v = randn(2048)
-        @test !ran(() -> P.trmv!(Tri, copy(v)))
-        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5)
-        P.set_num_threads(1)
-        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5)
-        @test y1 == y2
-        # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach the
-        # same route as the winner's chunks.
-        P.set_num_threads(nt)
-        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
-        for t in tasks
-            @test fetch(t) == y2
+        n = 512
+        ran(p, f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        # BOTH TYPES, because an SME-ELIGIBLE CALL MUST DECLINE THE POOL and the assertion is on the
+        # ROUTE rather than on the pool always winning: `_gemv!` reaches the SME kernel before the
+        # thread seam, deliberately — the matrix unit is shared by the cluster, so splitting a call
+        # that could own it trades one fast engine for several slow ones. There is no SME gemv for
+        # Float32, which is what keeps the pool, the trmv exclusion and the lost-claim path below
+        # covered on SME hardware; off it both predicates are false and both types thread, which is
+        # the arrangement CI sees.
+        @testset "$T" for T in (Float64, Float32)
+            P.set_num_threads(nt)
+            p = P._gemm_pool(T)
+            # SIZE FROM THE FLOOR THAT GATES THREADING: `_gemvn_workers` admits workers only once A
+            # clears `_L1_MT_MIN` bytes, that floor scales with the machine, and a Float32 A of the
+            # same shape carries half the bytes. The worker-count assertion is the fail-fast — a
+            # shape that stops admitting workers says so instead of making the next line vacuous.
+            m = max(8192, 2 * cld(P._L1_MT_MIN, n * sizeof(T)))
+            A = randn(T, m, n); x = randn(T, n); y0 = randn(T, m)
+            α = T(0.75); β = T(2.5)
+            @test P._gemvn_workers(m, n, T) > 1
+            sme = P._sme_gemv_eligible(T, m, n, false, false, A, x, y0, 1, 1, β)
+            @test ran(p, () -> P.gemv!(copy(y0), A, x; alpha = α, beta = β)) == !sme
+            # trmv over a matrix big enough that a threaded gemv-N WOULD have been admitted. If this
+            # ever reports true, the four per-thread baseline entries lost their justification.
+            Tri = randn(T, 2048, 2048) + 2048I
+            v = randn(T, 2048)
+            @test !ran(p, () -> P.trmv!(Tri, copy(v)))
+            y1 = copy(y0); P.gemv!(y1, A, x; alpha = α, beta = β)
+            P.set_num_threads(1)
+            y2 = copy(y0); P.gemv!(y2, A, x; alpha = α, beta = β)
+            @test y1 == y2
+            # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach
+            # the same route as the winner's chunks.
+            P.set_num_threads(nt)
+            tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t) for _ in 1:(2 * nt)]
+            for t in tasks
+                @test fetch(t) == y2
+            end
         end
         P.set_num_threads(1)
     end
@@ -548,27 +565,36 @@ end
     if nt < 2
         @test_skip "needs >=2 julia threads"
     else
-        P.set_num_threads(nt)
-        p = P._gemm_pool(Float64)
-        m, n = 4096, 1024
-        A = randn(m, n); x = randn(m); y0 = randn(n)
-        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5, trans = 'T'))
-        # trmv with trans='T' routes through `_tri_scatT!`, which calls `_gemv_t_simd!` directly. It
-        # must not reach the pool, or the `_TRMV_ACC*` / `_TRSV_*` per-thread owners in
-        # test/perthread_lint_baseline.txt lose the justification they are listed under.
-        Tri = randn(2048, 2048) + 2048I
-        v = randn(2048)
-        @test !ran(() -> P.trmv!(Tri, copy(v); trans = 'T'))
-        @test !ran(() -> P.trsv!(Tri, copy(v); trans = 'T'))
-        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
-        P.set_num_threads(1)
-        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
-        @test y1 == y2
-        P.set_num_threads(nt)
-        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5, trans = 'T'); t) for _ in 1:(2 * nt)]
-        for t in tasks
-            @test fetch(t) == y2
+        n = 1024
+        ran(p, f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        # BOTH TYPES, for the reason the gemv-N item above states: the SME route is taken before the
+        # thread seam, so the pool runs exactly when SME declines the call, and Float32 — which has no
+        # SME gemv — is what keeps everything below this line live on SME hardware.
+        @testset "$T" for T in (Float64, Float32)
+            P.set_num_threads(nt)
+            p = P._gemm_pool(T)
+            m = max(4096, 2 * cld(P._L1_MT_MIN, n * sizeof(T)))
+            A = randn(T, m, n); x = randn(T, m); y0 = randn(T, n)
+            α = T(0.75); β = T(2.5)
+            @test P._gemvt_workers(m, n, T) > 1
+            sme = P._sme_gemvt_eligible(T, m, n, true, false, A, x, y0, 1, 1)
+            @test ran(p, () -> P.gemv!(copy(y0), A, x; alpha = α, beta = β, trans = 'T')) == !sme
+            # trmv with trans='T' routes through `_tri_scatT!`, which calls `_gemv_t_simd!` directly.
+            # It must not reach the pool, or the `_TRMV_ACC*` / `_TRSV_*` per-thread owners in
+            # test/perthread_lint_baseline.txt lose the justification they are listed under.
+            Tri = randn(T, 2048, 2048) + 2048I
+            v = randn(T, 2048)
+            @test !ran(p, () -> P.trmv!(Tri, copy(v); trans = 'T'))
+            @test !ran(p, () -> P.trsv!(Tri, copy(v); trans = 'T'))
+            y1 = copy(y0); P.gemv!(y1, A, x; alpha = α, beta = β, trans = 'T')
+            P.set_num_threads(1)
+            y2 = copy(y0); P.gemv!(y2, A, x; alpha = α, beta = β, trans = 'T')
+            @test y1 == y2
+            P.set_num_threads(nt)
+            tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t) for _ in 1:(2 * nt)]
+            for t in tasks
+                @test fetch(t) == y2
+            end
         end
         P.set_num_threads(1)
     end
@@ -627,9 +653,10 @@ end
     end
 end
 
-# Liveness, plus the two properties that only hold if the nblk cut works: the pool IS dispatched
-# inside the cut, and it is NOT dispatched outside it — the latter being what protects the serial gate
-# cells at n=4096 that A-restricted exists to keep green.
+# Liveness, plus the two properties that only hold if the nblk cut works: inside the cut there is a
+# grid to split, so the pool is dispatched for every call the SME arm declines; outside it there is
+# not, so the pool stays out whatever the route — and that half is what protects the serial gate cells
+# at n=4096 that A-restricted exists to keep green.
 @testitem "symv: the pool runs inside the nblk cut and not outside it" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads, @spawn
@@ -638,28 +665,40 @@ end
     if nt < 2
         @test_skip "needs >=2 julia threads"
     else
-        P.set_num_threads(nt)
-        p = P._gemm_pool(Float64)
-        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(Float64))
-        nin = (ncut * 3) ÷ 4
-        nout = ncut * 2
-        Ai = randn(nin, nin); xi = randn(nin); yi = randn(nin)
-        @test ran(() -> P.symv!(copy(yi), Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5))
-        # OUTSIDE the cut `_symv_nblk` is 1, so there is no grid to split and the pool must stay out.
-        # If this ever reports true, the fold is being paid at n=4096 and two serial gate cells go red.
-        Ao = randn(nout, nout); xo = randn(nout); yo = randn(nout)
-        @test !ran(() -> P.symv!(copy(yo), Ao, xo; uplo = 'L', alpha = 0.75, beta = 2.5))
-        # The threaded answer must equal the serial one, and the CONCURRENT case must too — all but
-        # one caller loses the claim and runs `_symv_blocked!` with its own arena notepad.
-        y1 = copy(yi); P.symv!(y1, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
-        P.set_num_threads(1)
-        y2 = copy(yi); P.symv!(y2, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
-        @test y1 == y2
-        P.set_num_threads(nt)
-        tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5); t) for _ in 1:(nt + 1)]
-        for t in tasks
-            @test fetch(t) == y2
+        ran(p, f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        # BOTH TYPES, because inside the cut `_symv!` reaches `_symv_split!` before the thread seam
+        # wherever `Float64 && n >= _SYMV_SME_MIN` holds, and that split owns the matrix unit rather
+        # than dividing the call. So the pool runs inside the cut exactly when the SME arm declines,
+        # which for Float32 is always — and that is what keeps the grid, the lost-claim fallback and
+        # its arena notepad covered on SME hardware. `_SYMV_SME_MIN` is `typemax(Int)` without SME,
+        # so off it both types thread inside the cut.
+        @testset "$T" for T in (Float64, Float32)
+            P.set_num_threads(nt)
+            p = P._gemm_pool(T)
+            ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(T))
+            nin = (ncut * 3) ÷ 4
+            nout = ncut * 2
+            α = T(0.75); β = T(2.5)
+            Ai = randn(T, nin, nin); xi = randn(T, nin); yi = randn(T, nin)
+            @test P._symv_workers(nin, P._symv_nblk(nin, T), T) > 1
+            sme = T === Float64 && nin >= P._SYMV_SME_MIN
+            @test ran(p, () -> P.symv!(copy(yi), Ai, xi; uplo = 'L', alpha = α, beta = β)) == !sme
+            # OUTSIDE the cut `_symv_nblk` is 1, so there is no grid to split and the pool must stay
+            # out. If this ever reports true, the fold is being paid at n=4096 and two serial gate
+            # cells go red.
+            Ao = randn(T, nout, nout); xo = randn(T, nout); yo = randn(T, nout)
+            @test !ran(p, () -> P.symv!(copy(yo), Ao, xo; uplo = 'L', alpha = α, beta = β))
+            # The threaded answer must equal the serial one, and the CONCURRENT case must too — all
+            # but one caller loses the claim and runs `_symv_blocked!` with its own arena notepad.
+            y1 = copy(yi); P.symv!(y1, Ai, xi; uplo = 'L', alpha = α, beta = β)
+            P.set_num_threads(1)
+            y2 = copy(yi); P.symv!(y2, Ai, xi; uplo = 'L', alpha = α, beta = β)
+            @test y1 == y2
+            P.set_num_threads(nt)
+            tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = α, beta = β); t) for _ in 1:(nt + 1)]
+            for t in tasks
+                @test fetch(t) == y2
+            end
         end
         P.set_num_threads(1)
     end
